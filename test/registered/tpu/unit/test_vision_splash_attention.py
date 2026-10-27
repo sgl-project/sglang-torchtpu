@@ -3,17 +3,18 @@
 * On CPU, the inherited ``VisionTpuAttention.forward`` with the Pallas op swapped for a
   torch reference: ``segment_ids`` and ``cu_seqlens`` give per-segment attention,
   sequences pad to whole 1,024-token blocks with the pads as one more segment, KV
-  heads expand, and a padded batch keeps its rows apart.
+  heads expand, and a dense batch (bsz > 1) goes to the flash path unchanged.
 * On the JAX CPU device: the block map marks every block pair that holds a same-segment
-  query-key pair (and only overlapping ones), and the op's JAX body, splash in
-  interpret mode, equals the reference for contiguous and interleaved segments, for
-  full attention over a padded sequence (real tokens, then a pad tail), and for a
-  batch of two rows.
+  query-key pair (and only overlapping ones); a batch laid end to end keeps each q
+  block inside one row and rows apart (also with negative ids); block sizes reject
+  lengths off the 128 grid; and the op's JAX body, splash in interpret mode, equals
+  the reference for contiguous and interleaved segments, for full attention over a
+  padded sequence (real tokens, then a pad tail), and for batches of two rows.
 * On the TPU in bf16, the registered op through ``VisionTpuSplashAttention``, eager and
   compiled, against an fp32 CPU reference: tiles of a grid that is not a multiple of
   the tile size, in tile order and in row-major order, with pad tokens; lengths that
   are not multiples of 1,024 (16 to 3,200 tokens) at head dims 64, 72, 80 and 128; and
-  ``cu_seqlens`` and a padded batch of two.
+  ``cu_seqlens``; and a padded batch of two, bitwise equal to ``VisionTpuAttention``.
 """
 
 from sglang.test.ci.ci_register import register_tpu_ci
@@ -31,6 +32,7 @@ import unittest
 import torch
 from einops import rearrange
 
+from sglang.srt.layers.attention.vision import VisionTpuAttention
 from sglang.srt.utils import is_tpu
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.attention.vision_splash import VisionTpuSplashAttention
@@ -87,11 +89,18 @@ class _CpuSplashAttn(VisionTpuSplashAttention):
         self.scale = scale
         self.seen_ids = []
 
+        self.batched_calls = []
+
         def splash_op(q, k, v, ids):
             self.seen_ids.append(ids)
             return _ref_batch_attention(q, k, v, ids, scale).to(q.dtype)
 
+        def batched_attention(q, k, v, bsz, **kwargs):
+            self.batched_calls.append((bsz, kwargs))
+            return torch.zeros_like(q)
+
         self._flash_op = splash_op
+        self._batched_attention = batched_attention
 
 
 class TestVisionTpuSplashAttentionCpu(CustomTestCase):
@@ -144,23 +153,18 @@ class TestVisionTpuSplashAttentionCpu(CustomTestCase):
     def test_kv_heads_expand_to_query_heads(self):
         self._check(_segments([100, 60, 96]), h=4, kv_h=2, seed=3)
 
-    def test_padded_batch_keeps_rows_apart(self):
-        # A dense batch of two rows with 700 and 1,024 real tokens: real/pad ids per row.
-        torch.manual_seed(11)
-        lens, s, h, d = (700, 1024), 1024, 2, 16
-        q, k, v = (torch.randn(2 * s, h, d) for _ in range(3))
-        attn = _CpuSplashAttn(d, h, h, 0.25, flatten_batch=False)
-        cu = torch.tensor([0, lens[0], lens[0] + lens[1]], dtype=torch.int32)
-        out = attn.forward(q, k, v, bsz=2, cu_seqlens=cu)
-        for i, n in enumerate(lens):
-            seg = (torch.arange(s) >= n).to(torch.int32)
-            rows = slice(i * s, (i + 1) * s)
-            torch.testing.assert_close(
-                out[rows],
-                _ref_token_attention(q[rows], k[rows], v[rows], seg, 0.25),
-                atol=2e-5,
-                rtol=2e-5,
-            )
+    def test_dense_batch_keeps_the_flash_path(self):
+        # bsz > 1 goes to the parent's flash path with its arguments unchanged; the
+        # splash op is not called.
+        q = torch.randn(2 * 256, 2, 16)
+        attn = _CpuSplashAttn(16, 2, 2, 0.25, flatten_batch=False)
+        cu = torch.tensor([0, 200, 456], dtype=torch.int32)
+        attn.forward(q, q, q, bsz=2, cu_seqlens=cu)
+        self.assertEqual(len(attn.batched_calls), 1)
+        bsz, kwargs = attn.batched_calls[0]
+        self.assertEqual(bsz, 2)
+        self.assertIs(kwargs["cu_seqlens"], cu)
+        self.assertEqual(attn.seen_ids, [])
 
 
 class TestVisionSplashJax(CustomTestCase):
@@ -359,8 +363,9 @@ class TestVisionSplashOnTpu(CustomTestCase):
                     )
 
     def test_cu_seqlens_and_padded_batch(self):
-        # Three packed images by cu_seqlens; then a dense batch of two rows (700 and
-        # 1,000 real tokens of 1,000), padded per row and laid end to end in the op.
+        # Three packed images by cu_seqlens (splash); then a dense batch of two rows
+        # (700 and 1,000 real tokens of 1,000), which stays on the flash path: bitwise
+        # equal to VisionTpuAttention.
         attn = VisionTpuSplashAttention(
             self.HEAD_DIM, self.HEADS, self.HEADS, flatten_batch=True
         )
@@ -393,6 +398,15 @@ class TestVisionSplashOnTpu(CustomTestCase):
                     ref = _ref_token_attention(q[r], k[r], v[r], seg, attn.scale)
                     torch.testing.assert_close(
                         out[r], ref, atol=self.BF16_TOL, rtol=self.BF16_TOL
+                    )
+                if bsz > 1:
+                    flash = VisionTpuAttention(self.HEAD_DIM, self.HEADS, self.HEADS)
+                    cu_t = torch.tensor(cu, dtype=torch.int32)
+                    torch.testing.assert_close(
+                        out,
+                        flash(*dev, bsz, cu_seqlens=cu_t).float().cpu(),
+                        atol=0,
+                        rtol=0,
                     )
 
     def test_splash_op_matches_reference_eager_and_compiled(self):
