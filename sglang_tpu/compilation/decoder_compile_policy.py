@@ -1645,8 +1645,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         spec_info: SpecInput | None = None,
         attn_backend: Any | None = None,
         profile_prefix: int | None = None,
+        publish_dsa_topk: bool = False,
     ) -> PendingCall | float | None:
-        """Run one warmup, defer async execution, or time synchronous profiling."""
+        """Run one warmup, defer async execution, or time synchronous profiling.
+
+        publish_dsa_topk traces a draft forward that leaves its DSA top-k in
+        spec_info (forward_draft_rows' flag of the same name).
+        """
         self._compiled_extend_variants.add(variant)
         args, kwargs = self._make_warmup_inputs(
             num_tokens=num_tokens,
@@ -1666,6 +1671,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             else:
                 args = (*args[:2], prepared_batch, *args[3:])
             forward_batch = prepared_batch
+        if publish_dsa_topk:
+            forward_batch.reuse_dsa_topk_indices = True
         if profile_prefix is not None:
             from sglang_tpu.pp_profile import set_profile_inputs
 

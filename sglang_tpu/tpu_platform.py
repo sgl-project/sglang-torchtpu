@@ -498,6 +498,7 @@ def _validate_dsa(server_args) -> None:
     except Exception:
         # A model that cannot be loaded here fails later with its real error.
         return
+    _validate_mtp_index_share(cfg, hf_config)
     if not is_deepseek_dsa(hf_config):
         return
     if cfg.attention_backend != "pallas_tpu_mla_sparse":
@@ -526,6 +527,40 @@ def _validate_dsa(server_args) -> None:
         raise ValueError(
             "DSA on TPU needs --tpu-compile-tracer dynamo, got "
             f"{cfg.tpu_compile_tracer!r}."
+        )
+
+
+def _validate_mtp_index_share(cfg, hf_config) -> None:
+    """Reject the MTP index-sharing setups no TPU spec worker serves.
+
+    Only the experimental chain worker reuses the draft's DSA top-k across its
+    steps (TpuChainDraftWorker); core's workers would run their GPU paths.
+    """
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang_tpu.experimental import experimental_spec_enabled
+
+    # The raw flag: platform defaults run before NEXTN resolves to EAGLE.
+    if cfg.speculative_algorithm not in ("EAGLE", "NEXTN"):
+        return
+    if not getattr(hf_config, "index_share_for_mtp_iteration", False):
+        return
+    opt_out = (
+        "or keep a per-step indexer with --json-model-override-args "
+        "index_share_for_mtp_iteration=false"
+    )
+    if not is_deepseek_dsa(hf_config):
+        raise ValueError(
+            f"TPU shares the MTP draft's indexer top-k for DSA models only; {opt_out}."
+        )
+    if not experimental_spec_enabled():
+        raise ValueError(
+            "DSA index sharing on TPU runs on the experimental spec worker; unset "
+            f"SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=0 {opt_out}."
+        )
+    if cfg.disaggregation_mode != "null":
+        # A P/D decode would draft on seeds its prefill never sent.
+        raise NotImplementedError(
+            f"DSA index sharing on TPU does not support P/D disaggregation; {opt_out}."
         )
 
 

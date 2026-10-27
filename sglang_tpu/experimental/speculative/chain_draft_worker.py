@@ -30,7 +30,8 @@ from sglang_tpu.experimental.speculative.chain_draft_input import (
 from sglang_tpu.experimental.speculative.draft_worker import TpuDraftWorker
 
 # (forward_batch, carry, req_pool_indices, positions, cache_locs, seq_lens,
-#  temperatures, top_ks, uniforms) -> (drafts [pbs, N], dense logits [pbs, N, V] | None).
+#  temperatures, top_ks, uniforms, dsa_seed_topk_table)
+#  -> (drafts [pbs, N], dense logits [pbs, N, V] | None).
 FusedDraft = Callable[..., tuple[torch.Tensor, torch.Tensor | None]]
 
 
@@ -45,17 +46,21 @@ class TpuChainDraftWorker(TpuDraftWorker):
       carry_size: Width of the draft hidden carried between forwards.
       target_feature_size: Width of the target feature the draft reads on
         committed rows (MTP: the target final hidden; EAGLE3: its aux layers).
+      dsa_seed_topk_width: Columns of the DSA top-k rows the draft steps share
+        (MTP index sharing), or None when every draft forward runs its indexer.
       fused_draft_tensor_attrs: Non-parameter draft-model tensors the fused draft
         reads (direct_compile model_extra_tensor_attrs).
     """
 
     carry_size: int
     target_feature_size: int
+    dsa_seed_topk_width: int | None = None
     fused_draft_tensor_attrs: tuple[str, ...] = ()
 
     def __init__(self, target_runner: ModelRunner) -> None:
         super().__init__(target_runner)
         self._carry_table: torch.Tensor | None = None
+        self._dsa_seed_topk_table: torch.Tensor | None = None
         self._fused_draft: FusedDraft | None = None
         # Per batch bucket; the fused program overwrites it before the first draft forward.
         self._hidden_placeholders: dict[int, torch.Tensor] = {}
@@ -84,18 +89,50 @@ class TpuChainDraftWorker(TpuDraftWorker):
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
         assert req_to_token_pool is not None
+        num_rows = req_to_token_pool.req_to_token.shape[0]
         # Indexed by req pool row; padded rows read and write the reserved row 0.
         self._carry_table = torch.zeros(
-            (req_to_token_pool.req_to_token.shape[0], self.carry_size),
+            (num_rows, self.carry_size),
             dtype=self.model_runner.dtype,
             device=self.model_runner.device,
         )
+        if self.dsa_seed_topk_width is not None:
+            # -1 selects no key, as the indexer's rows for padded tokens do.
+            self._dsa_seed_topk_table = torch.full(
+                (num_rows, self.dsa_seed_topk_width),
+                -1,
+                dtype=torch.int32,
+                device=self.model_runner.device,
+            )
 
     @property
     def carry(self) -> torch.Tensor:
         """[req pool rows, carry_size] draft hidden of each request's last committed row."""
         assert self._carry_table is not None, "alloc_memory_pool has not run"
         return self._carry_table
+
+    @carry.setter
+    def carry(self, table: torch.Tensor) -> None:
+        # Commit rebinds the table its compiled carry write returns.
+        assert self._carry_table is not None, "alloc_memory_pool has not run"
+        assert table.shape == self._carry_table.shape, table.shape
+        self._carry_table = table
+
+    @property
+    def dsa_seed_topk_table(self) -> torch.Tensor | None:
+        """[req pool rows, dsa_seed_topk_width] int32 DSA top-k of each request's
+        last committed row, which its draft steps reuse; None without index sharing."""
+        if self.dsa_seed_topk_width is None:
+            return None
+        assert self._dsa_seed_topk_table is not None, "alloc_memory_pool has not run"
+        return self._dsa_seed_topk_table
+
+    @dsa_seed_topk_table.setter
+    def dsa_seed_topk_table(self, table: torch.Tensor) -> None:
+        # Commit rebinds the table its compiled seed write returns.
+        assert self._dsa_seed_topk_table is not None, "alloc_memory_pool has not run"
+        assert table.shape == self._dsa_seed_topk_table.shape, table.shape
+        self._dsa_seed_topk_table = table
 
     def precompile_draft(self) -> None:
         compile_policy = self._compile_policy()
@@ -106,6 +143,7 @@ class TpuChainDraftWorker(TpuDraftWorker):
         compile_policy.precompile_draft(
             self.model_runner.attn_backend,
             target_feature_size=self.target_feature_size,
+            dsa_seed_topk_width=self.dsa_seed_topk_width,
             fused_draft_warmup=self._warmup_fused_draft,
         )
 
@@ -191,6 +229,7 @@ class TpuChainDraftWorker(TpuDraftWorker):
                 temperatures,
                 top_ks,
                 uniforms,
+                self.dsa_seed_topk_table,
             )
 
     def _fused_draft_steps(
@@ -204,6 +243,7 @@ class TpuChainDraftWorker(TpuDraftWorker):
         temperatures: torch.Tensor | None,
         top_ks: torch.Tensor | None,
         uniforms: torch.Tensor | None,
+        dsa_seed_topk_table: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Traced once per (batch bucket, sampled): d_1 from the carry, then N - 1 draft forwards."""
         spec_info = forward_batch.spec_info
@@ -211,6 +251,14 @@ class TpuChainDraftWorker(TpuDraftWorker):
         model = self.model_runner.model
         hidden = carry.index_select(0, req_pool_indices)
         logits = self.first_draft_logits(hidden)
+        shares_dsa_topk = dsa_seed_topk_table is not None
+        if shares_dsa_topk:
+            # Every draft step attends over the indexer top-k of the last committed
+            # row instead of running the indexer, as EAGLEWorkerV2 seeds its steps.
+            spec_info.dsa_topk_indices = dsa_seed_topk_table.index_select(
+                0, req_pool_indices
+            )
+            forward_batch.reuse_dsa_topk_indices = True
         tokens: list[torch.Tensor] = []
         dense_logits: list[torch.Tensor] = []
         for step in range(self.num_drafts):
@@ -239,6 +287,9 @@ class TpuChainDraftWorker(TpuDraftWorker):
             if dense is not None:
                 dense_logits.append(dense)
         spec_info.rpa_draft_kv_lens = None
+        if shares_dsa_topk:
+            spec_info.dsa_topk_indices = None
+            forward_batch.reuse_dsa_topk_indices = False
         return (
             torch.stack(tokens, dim=1),
             torch.stack(dense_logits, dim=1) if dense_logits else None,

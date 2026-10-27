@@ -77,7 +77,7 @@ def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
     )
 
 
-def _validate_tpu_speculative_args(server_args: ServerArgs, model_config) -> None:
+def _validate_tpu_speculative_args(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     if cfg.device != "tpu":
         return
@@ -91,12 +91,6 @@ def _validate_tpu_speculative_args(server_args: ServerArgs, model_config) -> Non
         )
     if cfg.kv_canary != "none":
         raise ValueError("TPU speculative decoding does not support KV canary.")
-    if getattr(model_config.hf_config, "index_share_for_mtp_iteration", False):
-        raise ValueError(
-            "TPU speculative decoding does not support DSA index sharing. A NextN "
-            "draft with its own indexer can run without it: pass "
-            "--json-model-override-args with index_share_for_mtp_iteration=false."
-        )
 
 
 def _resolve_speculative_algorithm_alias(
@@ -1102,7 +1096,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "trtllm_mha backend only supports topk = 1 for speculative decoding."
             )
 
-    _validate_tpu_speculative_args(server_args, model_config)
+    _validate_tpu_speculative_args(server_args)
 
     # ROCm/HIP has no CUDA/MUSA sampling-verify kernels, so EAGLE verify would
     # otherwise fall back to greedy (argmax) and silently ignore temperature and
