@@ -245,7 +245,7 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
             tp_group=SimpleNamespace(cpu_group=object()),
             _drain_scheduler_embeddings=lambda: None,
             _sync_fail_info_across_tp=lambda request: None,
-            _hold_ready_requests=lambda statuses: False,
+            _hold_ready_requests=lambda statuses, receiving: False,
             create_req=lambda request: request,
         )
         dispatch_error = EncoderDispatchErrorReq(
@@ -394,7 +394,7 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
             tp_group=SimpleNamespace(cpu_group=object()),
             _drain_scheduler_embeddings=lambda: None,
             _sync_fail_info_across_tp=lambda request: None,
-            _hold_ready_requests=lambda statuses: False,
+            _hold_ready_requests=lambda statuses, receiving: False,
             create_req=lambda request: request,
         )
 
@@ -435,10 +435,12 @@ class TestEncodeDispatchWithoutEncoder(CustomTestCase):
 
 
 class TestHoldReadyRequests(CustomTestCase):
-    """Ready requests wait for pending batch-mates only while decode runs, and only for a bounded number of ticks."""
+    """Ready requests wait for batch-mates still receiving only while decode runs, and only for a bounded number of ticks."""
 
     @staticmethod
-    def _hold(statuses, held_ticks, *, decoding=True, max_ticks=4):
+    def _hold(statuses, held_ticks, *, receiving=None, decoding=True, max_ticks=4):
+        if receiving is None:
+            receiving = [s == WaitingMMRequestStatus.PENDING for s in statuses]
         receiver = SimpleNamespace(
             scheduler=SimpleNamespace(
                 running_batch=SimpleNamespace(is_empty=lambda: not decoding)
@@ -447,12 +449,21 @@ class TestHoldReadyRequests(CustomTestCase):
         )
         with envs.SGLANG_ENCODER_RECEIVER_COALESCE_TICKS.override(max_ticks):
             return MMReceiverBase._hold_ready_requests(
-                receiver, torch.tensor([int(x) for x in statuses], dtype=torch.int32)
+                receiver,
+                torch.tensor([int(x) for x in statuses], dtype=torch.int32),
+                torch.tensor(receiving),
             )
 
     def test_holds_ready_while_a_batch_mate_is_pending(self):
         S = WaitingMMRequestStatus
         self.assertTrue(self._hold([S.SUCCESS, S.PENDING], [0, 0]))
+
+    def test_releases_when_pending_mates_only_wait_for_pool_space(self):
+        """Held requests may be what fills the embedding pool; waiting on a pool-blocked request cannot help."""
+        S = WaitingMMRequestStatus
+        self.assertFalse(
+            self._hold([S.SUCCESS, S.PENDING], [0, 0], receiving=[False, False])
+        )
 
     def test_releases_once_nothing_is_pending(self):
         S = WaitingMMRequestStatus

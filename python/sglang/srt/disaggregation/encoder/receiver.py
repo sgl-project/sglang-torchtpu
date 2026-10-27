@@ -936,6 +936,12 @@ class WaitingMMRequestBase(ABC):
     def send_encode_request(self) -> None:
         """Kick off the transport-specific encode / receive flow."""
 
+    def still_receiving(self) -> bool:
+        """Pending on embedding parts that have not all arrived (not just on pool space)."""
+        return self.status == WaitingMMRequestStatus.PENDING and not (
+            self.recv_embedding_data is not None and self.recv_embedding_data.ready
+        )
+
     def _try_recv_mm_data(self):
         if self.status != WaitingMMRequestStatus.PENDING:
             return
@@ -2430,15 +2436,24 @@ class MMReceiverBase(ABC):
                 waiting_req.close_recv_socket()
             local_status.append(waiting_req.status)
 
-        local_status = torch.tensor(local_status, device="cpu", dtype=torch.int32)
-
+        # One MIN all-reduce carries both the statuses and, negated, whether any
+        # rank is still receiving each request's embedding parts.
+        num_waiting = len(self.waiting_list)
+        reduced = torch.tensor(
+            local_status
+            + [int(not req.still_receiving()) for req in self.waiting_list],
+            device="cpu",
+            dtype=torch.int32,
+        )
         torch.distributed.all_reduce(
-            local_status,
+            reduced,
             op=torch.distributed.ReduceOp.MIN,
             group=self.tp_group.cpu_group,
         )
+        local_status = reduced[:num_waiting]
+        receiving = reduced[num_waiting:] == 0
 
-        hold_ready = self._hold_ready_requests(local_status)
+        hold_ready = self._hold_ready_requests(local_status, receiving)
         new_waiting = []
         for i, waiting_req in enumerate(self.waiting_list):
             status_value = local_status[i].item()
@@ -2484,12 +2499,16 @@ class MMReceiverBase(ABC):
         self.waiting_list = new_waiting
         return new_recv_reqs, abort_reqs
 
-    def _hold_ready_requests(self, statuses: torch.Tensor) -> bool:
-        """Whether to keep ready requests back so pending batch-mates prefill with them.
+    def _hold_ready_requests(
+        self, statuses: torch.Tensor, receiving: torch.Tensor
+    ) -> bool:
+        """Whether to keep ready requests back so batch-mates still receiving prefill with them.
 
         Embeddings of one encoder batch reach the TP ranks over several ticks, and
-        each partial release would interrupt decode for its own prefill. Decided
-        from TP-reduced statuses and tick counts only, so every rank agrees.
+        each partial release would interrupt decode for its own prefill. A request
+        whose parts all arrived but waits for pool space is not waited for: held
+        requests may be what occupies the pool. Decided from TP-reduced values and
+        tick counts only, so every rank agrees.
         """
         max_ticks = envs.SGLANG_ENCODER_RECEIVER_COALESCE_TICKS.get()
         if (
@@ -2499,9 +2518,7 @@ class MMReceiverBase(ABC):
         ):
             return False
         ready = statuses == WaitingMMRequestStatus.SUCCESS
-        if not bool(ready.any()) or not bool(
-            (statuses == WaitingMMRequestStatus.PENDING).any()
-        ):
+        if not bool(ready.any()) or not bool(receiving.any()):
             return False
         oldest_held = max(
             req.held_ticks
