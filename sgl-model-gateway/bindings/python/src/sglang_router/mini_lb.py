@@ -3,6 +3,7 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 """
 
 import asyncio
+import contextlib
 import ipaddress
 import logging
 import random
@@ -15,15 +16,27 @@ from typing import Optional
 import aiohttp
 import orjson
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
-from sglang_router.router_args import RouterArgs
+from sglang_router.mini_lb_policy import (
+    EngineOverloaded,
+    LoadPoller,
+    SessionAffinityPolicy,
+)
+from sglang_router.router_args import MINI_LB_POLICY_CHOICES, RouterArgs
 
 logger = logging.getLogger(__name__)
+
+_CONNECT_TIMEOUT_SECS = 10.0
 
 AIOHTTP_STREAM_READ_CHUNK_SIZE = (
     1024 * 64
 )  # 64KB, to prevent aiohttp's "Chunk too big" error
+
+# A server's /health and /health_generate run a one-token generation by default
+# and give up after SGLANG_HEALTH_CHECK_TIMEOUT (20 s by default) with a 503;
+# wait a little longer so the server's own answer arrives.
+HEALTH_CHECK_TIMEOUT_SECS = 30
 
 
 def maybe_wrap_ipv6_address(address: str) -> str:
@@ -34,7 +47,13 @@ def maybe_wrap_ipv6_address(address: str) -> str:
         return address
 
 
+class _UpstreamConnectionError(aiohttp.ClientConnectionError):
+    """A connection failure recorded in the affinity load table."""
+
+
 class MiniLoadBalancer:
+    """Debug P/D router with opt-in prefill affinity and sampled load placement."""
+
     def __init__(
         self,
         router_args: RouterArgs,
@@ -50,16 +69,72 @@ class MiniLoadBalancer:
         self.test_external_dp_routing = router_args.test_external_dp_routing
         self.prefill_dp_size = None
         self.decode_dp_size = None
+        self.affinity_policy = (
+            SessionAffinityPolicy()
+            if router_args.mini_lb_policy == "session_affinity"
+            else None
+        )
+        self._load_poller = (
+            LoadPoller(
+                loads=self.affinity_policy.loads,
+                metric_names=self.affinity_policy.metric_names,
+                interval_secs=1.0,
+                timeout_secs=5.0,
+            )
+            if self.affinity_policy is not None
+            else None
+        )
+
+    def _client_timeout(self) -> aiohttp.ClientTimeout:
+        affinity = self.affinity_policy is not None
+        return aiohttp.ClientTimeout(
+            total=self.timeout,
+            # The total deadline already bounds affinity reads.
+            sock_read=None if affinity else self.timeout,
+            connect=_CONNECT_TIMEOUT_SECS if affinity else None,
+            sock_connect=_CONNECT_TIMEOUT_SECS if affinity else 300,
+        )
+
+    async def _engine_request(self, engine, operation, *args, **kwargs):
+        try:
+            return await operation(*args, **kwargs)
+        except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError) as error:
+            if self.affinity_policy is None:
+                raise
+            self.affinity_policy.loads.mark_unreachable(engine)
+            raise _UpstreamConnectionError(f"{engine}: {error!r}") from error
+
+    async def _gather_requests(self, *requests):
+        """Cancel and close the peer when affinity loses one upstream."""
+        if self.affinity_policy is None:
+            return await asyncio.gather(*requests)
+        tasks = [asyncio.ensure_future(request) for request in requests]
+        try:
+            return await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            for response in responses:
+                if isinstance(response, aiohttp.ClientResponse):
+                    response.close()
+            raise
 
     def _validate_router_args(self, router_args: RouterArgs):
         logger.warning(
-            "\x1b[33mMiniLB is only for debugging purposes, it only supports random policy!\033[0m"
+            "\x1b[33mMiniLB is for debugging only. "
+            "Routing policy comes from --mini-lb-policy.\033[0m"
         )
 
         # NOTE: too many arguments unsupported, just validate some important ones
         if router_args.policy != "random":
-            logger.warning("[MiniLB] Overriding policy to random")
+            logger.warning("[MiniLB] Ignoring --policy, see --mini-lb-policy")
             router_args.policy = "random"
+        if router_args.mini_lb_policy not in MINI_LB_POLICY_CHOICES:
+            raise ValueError(
+                f"Unknown MiniLB policy {router_args.mini_lb_policy!r}, "
+                f"expected one of {MINI_LB_POLICY_CHOICES}"
+            )
 
         if not router_args.pd_disaggregation:
             raise ValueError("MiniLB only supports PD disaggregation mode")
@@ -72,18 +147,42 @@ class MiniLoadBalancer:
     def start(self):
         global lb
         lb = self
+        if self.affinity_policy is not None:
+            logging.basicConfig(
+                level=logging.INFO,
+                format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+                force=True,
+            )
         uvicorn.run(app, host=self.host, port=self.port)
+
+    def start_load_polling(self) -> Optional[asyncio.Task]:
+        """Poll engine loads only when session affinity is enabled."""
+        if self._load_poller is None:
+            return None
+        return asyncio.create_task(
+            self._load_poller.run(lambda: self.prefill_urls + self.decode_urls)
+        )
 
     async def _ensure_dp_sizes(self):
         if self.prefill_dp_size is not None:
             return
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{self.prefill_urls[0]}/server_info") as resp:
-                info = await resp.json()
-                self.prefill_dp_size = len(info.get("internal_states", [1]))
-            async with session.get(f"{self.decode_urls[0]}/server_info") as resp:
-                info = await resp.json()
-                self.decode_dp_size = len(info.get("internal_states", [1]))
+        session_args = (
+            {"timeout": self._client_timeout()}
+            if self.affinity_policy is not None
+            else {}
+        )
+        async with aiohttp.ClientSession(**session_args) as session:
+            async with await self._engine_request(
+                self.prefill_urls[0], session.get, f"{self.prefill_urls[0]}/server_info"
+            ) as resp:
+                info = await self._engine_request(self.prefill_urls[0], resp.json)
+                prefill_dp_size = len(info.get("internal_states", [1]))
+            async with await self._engine_request(
+                self.decode_urls[0], session.get, f"{self.decode_urls[0]}/server_info"
+            ) as resp:
+                info = await self._engine_request(self.decode_urls[0], resp.json)
+                decode_dp_size = len(info.get("internal_states", [1]))
+        self.prefill_dp_size, self.decode_dp_size = prefill_dp_size, decode_dp_size
         logger.info(
             f"[MiniLB] DP sizes: prefill={self.prefill_dp_size}, decode={self.decode_dp_size}"
         )
@@ -100,16 +199,29 @@ class MiniLoadBalancer:
 
         return prefill_req, decode_req, d_rank
 
-    def select_pair(self):
-        assert len(self.prefill_urls) > 0, "No prefill servers available"
-        assert len(self.decode_urls) > 0, "No decode servers available"
-        pidx = random.randint(0, len(self.prefill_urls) - 1)
-        didx = random.randint(0, len(self.decode_urls) - 1)
-        return (
-            self.prefill_urls[pidx],
-            self.prefill_bootstrap_ports[pidx],
-            self.decode_urls[didx],
-        )
+    def select_pair(self, routing_key=None, room=None):
+        """Return a random or affinity-selected (prefill, bootstrap port, decode)."""
+        prefill_urls = self.prefill_urls
+        decode_urls = self.decode_urls
+        assert prefill_urls, "No prefill servers available"
+        assert decode_urls, "No decode servers available"
+        if self.affinity_policy is None:
+            prefill = prefill_urls[random.randint(0, len(prefill_urls) - 1)]
+            decode = decode_urls[random.randint(0, len(decode_urls) - 1)]
+        else:
+            decisions = self.affinity_policy.select(
+                prefill_urls=prefill_urls,
+                decode_urls=decode_urls,
+                routing_key=routing_key,
+            )
+            for decision in decisions:
+                logger.info(
+                    "[MiniLB] routing decision %s",
+                    decision.to_log_json(room=room, routing_key=routing_key),
+                )
+            prefill, decode = (decision.engine for decision in decisions)
+        pidx = self.prefill_urls.index(prefill)
+        return prefill, self.prefill_bootstrap_ports[pidx], decode
 
     def current_role_and_port(self, worker_url):
         """Return (role, bootstrap_port) of a registered server, or (None, None)
@@ -162,24 +274,32 @@ class MiniLoadBalancer:
             prefill_req = modified_request
             decode_req = modified_request
 
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(
-                total=self.timeout,
-                sock_read=self.timeout,
-                sock_connect=300,
-            )  # Add timeout for request reliability
-        ) as session:
+        async with aiohttp.ClientSession(timeout=self._client_timeout()) as session:
             tasks = [
-                session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
-                session.post(f"{decode_server}/{endpoint}", json=decode_req),
+                self._engine_request(
+                    prefill_server,
+                    session.post,
+                    f"{prefill_server}/{endpoint}",
+                    json=prefill_req,
+                ),
+                self._engine_request(
+                    decode_server,
+                    session.post,
+                    f"{decode_server}/{endpoint}",
+                    json=decode_req,
+                ),
             ]
 
             # Wait for both responses to complete. Prefill should end first.
-            prefill_response, decode_response = await asyncio.gather(*tasks)
+            prefill_response, decode_response = await self._gather_requests(*tasks)
 
             if "return_logprob" in modified_request:
-                prefill_json = await prefill_response.json()
-                ret_json = await decode_response.json()
+                prefill_json = await self._engine_request(
+                    prefill_server, prefill_response.json
+                )
+                ret_json = await self._engine_request(
+                    decode_server, decode_response.json
+                )
 
                 # merge `meta_info.input_token_logprobs` from prefill to decode
                 if "meta_info" in ret_json:
@@ -189,7 +309,9 @@ class MiniLoadBalancer:
                             + ret_json["meta_info"]["input_token_logprobs"]
                         )
             else:
-                ret_json = await decode_response.json()
+                ret_json = await self._engine_request(
+                    decode_server, decode_response.json
+                )
 
             if expected_decode_dp_rank is not None:
                 actual = ret_json.get("meta_info", {}).get("dp_rank")
@@ -215,13 +337,7 @@ class MiniLoadBalancer:
 
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
-        session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(
-                total=self.timeout,
-                sock_read=self.timeout,
-                sock_connect=300,
-            )  # Add timeout for request reliability
-        )
+        session = aiohttp.ClientSession(timeout=self._client_timeout())
         responses = []
 
         async def close_upstreams():
@@ -275,14 +391,24 @@ class MiniLoadBalancer:
             # Both servers answer the headers before any token is produced, so
             # a request either server rejects is known here, before the
             # streaming response (and its 200 status) is committed.
-            prefill_response, decode_response = await asyncio.gather(
-                session.post(f"{prefill_server}/{endpoint}", json=modified_request),
-                session.post(f"{decode_server}/{endpoint}", json=modified_request),
+            prefill_response, decode_response = await self._gather_requests(
+                self._engine_request(
+                    prefill_server,
+                    session.post,
+                    f"{prefill_server}/{endpoint}",
+                    json=modified_request,
+                ),
+                self._engine_request(
+                    decode_server,
+                    session.post,
+                    f"{decode_server}/{endpoint}",
+                    json=modified_request,
+                ),
             )
             responses.extend((prefill_response, decode_response))
-            for response in responses:
+            for response, engine in zip(responses, (prefill_server, decode_server)):
                 if response.status != 200:
-                    body = await response.read()
+                    body = await self._engine_request(engine, response.read)
                     return Response(
                         content=body,
                         status_code=response.status,
@@ -298,25 +424,80 @@ class MiniLoadBalancer:
                 await close_upstreams()
 
 
-app = FastAPI()
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    load_polling = lb.start_load_polling() if lb is not None else None
+    try:
+        yield
+    finally:
+        if load_polling is not None:
+            load_polling.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await load_polling
+
+
+app = FastAPI(lifespan=_lifespan)
 lb: Optional[MiniLoadBalancer] = None
+
+
+async def _probe_backends(path: str) -> Response:
+    """GET `path` on every registered server; 200 only if all answer 200.
+
+    MiniLB routes to every registered server and does not track their health,
+    so a single dead server already fails part of the traffic. This is stricter
+    than the Rust gateway's /readiness, which skips unhealthy workers.
+    """
+    timeout = HEALTH_CHECK_TIMEOUT_SECS
+
+    async def probe(session, server):
+        try:
+            async with session.get(f"{server}{path}") as response:
+                return response.status, None
+        except asyncio.TimeoutError:
+            return None, f"no answer in {timeout} s"
+        except aiohttp.ClientError as e:
+            return None, f"{type(e).__name__}: {e}"
+
+    roles = {"prefill": list(lb.prefill_urls), "decode": list(lb.decode_urls)}
+    backends = [(role, url) for role, urls in roles.items() for url in urls]
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=timeout)
+    ) as session:
+        results = await asyncio.gather(*(probe(session, url) for _, url in backends))
+    unhealthy = [
+        {"role": role, "url": url, "status": status, "error": error}
+        for (role, url), (status, error) in zip(backends, results)
+        if status != 200
+    ]
+    # A role switch can briefly leave a role with no registered server.
+    unhealthy += [
+        {"role": role, "url": None, "status": None, "error": "no server registered"}
+        for role, urls in roles.items()
+        if not urls
+    ]
+    if not unhealthy:
+        return Response(status_code=200)
+    logger.warning(f"[MiniLB] {path}: unhealthy backends {unhealthy}")
+    return ORJSONResponse(
+        content={"unhealthy": unhealthy},
+        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+    )
+
+
+@app.get("/liveness")
+async def liveness():
+    """200 while the MiniLB process serves requests; ignores the backends."""
+    return Response(status_code=200)
 
 
 @app.get("/health")
 async def health_check():
-    return Response(status_code=200)
+    return await _probe_backends("/health")
 
 
 @app.get("/health_generate")
 async def health_generate():
-    async with aiohttp.ClientSession() as session:
-        # Create the tasks
-        tasks = []
-        for server in chain(lb.prefill_urls, lb.decode_urls):
-            tasks.append(session.get(f"{server}/health_generate"))
-        for i, response in enumerate(asyncio.as_completed(tasks)):
-            await response
-    return Response(status_code=200)
+    return await _probe_backends("/health_generate")
 
 
 async def _post_role_switch(worker_url, body):
@@ -485,83 +666,75 @@ async def get_model_info():
 
 
 @app.post("/generate")
-async def handle_generate_request(request_data: dict):
-    prefill_server, bootstrap_port, decode_server = lb.select_pair()
+async def handle_generate_request(
+    request_data: dict, x_routing_key: Optional[str] = Header(default=None)
+):
+    return await _forward_to_backend(request_data, "generate", x_routing_key)
 
-    # Parse and transform prefill_server for bootstrap data
-    parsed_url = urllib.parse.urlparse(prefill_server)
-    hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
-    modified_request = request_data.copy()
 
-    batch_size = _get_request_batch_size(modified_request)
-    if batch_size is not None:
-        modified_request.update(
-            {
-                "bootstrap_host": [hostname] * batch_size,
-                "bootstrap_port": [bootstrap_port] * batch_size,
-                "bootstrap_room": [
-                    _generate_bootstrap_room() for _ in range(batch_size)
-                ],
-            }
+async def _forward_to_backend(
+    request_data: dict, endpoint_name: str, routing_key: Optional[str]
+):
+    batch_size = _get_request_batch_size(request_data)
+    bootstrap_rooms = [
+        _generate_bootstrap_room()
+        for _ in range(batch_size if batch_size is not None else 1)
+    ]
+    try:
+        prefill_server, bootstrap_port, decode_server = lb.select_pair(
+            routing_key=routing_key,
+            room=bootstrap_rooms[0] if bootstrap_rooms else None,
         )
-    else:
-        modified_request.update(
-            {
-                "bootstrap_host": hostname,
-                "bootstrap_port": bootstrap_port,
-                "bootstrap_room": _generate_bootstrap_room(),
-            }
+    except EngineOverloaded as error:
+        logger.warning(f"[MiniLB] POST /{endpoint_name} failed: {error}")
+        return ORJSONResponse(
+            content={"error": {"message": str(error)}},
+            status_code=HTTPStatus.TOO_MANY_REQUESTS,
         )
 
-    if request_data.get("stream", False):
-        return await lb.generate_stream(
-            modified_request, prefill_server, decode_server, "generate"
-        )
-    else:
-        return await lb.generate(
-            modified_request, prefill_server, decode_server, "generate"
-        )
-
-
-async def _forward_to_backend(request_data: dict, endpoint_name: str):
-    prefill_server, bootstrap_port, decode_server = lb.select_pair()
-
-    # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
     modified_request = request_data.copy()
     modified_request.update(
         {
-            "bootstrap_host": hostname,
-            "bootstrap_port": bootstrap_port,
-            "bootstrap_room": _generate_bootstrap_room(),
+            "bootstrap_host": (
+                [hostname] * batch_size if batch_size is not None else hostname
+            ),
+            "bootstrap_port": (
+                [bootstrap_port] * batch_size
+                if batch_size is not None
+                else bootstrap_port
+            ),
+            "bootstrap_room": (
+                bootstrap_rooms if batch_size is not None else bootstrap_rooms[0]
+            ),
         }
     )
-
-    if request_data.get("stream", False):
-        return await lb.generate_stream(
-            modified_request,
-            prefill_server,
-            decode_server,
-            endpoint=endpoint_name,
+    forward = lb.generate_stream if request_data.get("stream", False) else lb.generate
+    try:
+        return await forward(
+            modified_request, prefill_server, decode_server, endpoint=endpoint_name
         )
-    else:
-        return await lb.generate(
-            modified_request,
-            prefill_server,
-            decode_server,
-            endpoint=endpoint_name,
+    except _UpstreamConnectionError as error:
+        logger.warning("[MiniLB] upstream unreachable: %s", error)
+        return ORJSONResponse(
+            content={"error": {"message": f"upstream unreachable: {error}"}},
+            status_code=HTTPStatus.BAD_GATEWAY,
         )
 
 
 @app.post("/v1/chat/completions")
-async def handle_chat_completion_request(request_data: dict):
-    return await _forward_to_backend(request_data, "v1/chat/completions")
+async def handle_chat_completion_request(
+    request_data: dict, x_routing_key: Optional[str] = Header(default=None)
+):
+    return await _forward_to_backend(request_data, "v1/chat/completions", x_routing_key)
 
 
 @app.post("/v1/completions")
-async def handle_completion_request(request_data: dict):
-    return await _forward_to_backend(request_data, "v1/completions")
+async def handle_completion_request(
+    request_data: dict, x_routing_key: Optional[str] = Header(default=None)
+):
+    return await _forward_to_backend(request_data, "v1/completions", x_routing_key)
 
 
 def _generate_bootstrap_room():

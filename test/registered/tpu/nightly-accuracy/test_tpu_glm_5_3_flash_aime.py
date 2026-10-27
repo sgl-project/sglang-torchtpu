@@ -7,7 +7,7 @@ from sglang.test.tpu import GLM_5_3_FLASH, make_model_config, make_runner
 from sglang.test.tpu.utils.accuracy_base import AccuracyTestCase, gate_server_failures
 
 register_tpu_ci(
-    est_time=10800,
+    est_time=6200,
     suite="nightly-tpu-accuracy-glm-5-3-flash-aime",
     nightly=True,
     labels=["singlehost", "glm-5.3-flash", "accuracy"],

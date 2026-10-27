@@ -51,9 +51,11 @@ def apply_rotary_embedding_pair_swap(
 
     Rotates adjacent pairs as ``x * cos + (x @ R) * sin`` with R a signed pair
     swap. In bfloat16 each output of ``x @ R`` is a single +-1 product
-    accumulated in float32, so it is exact and the result matches the strided
-    form bit for bit on finite inputs. TPU float16 and float32 matmuls are not
-    exact; other dtypes keep the strided form. A non-finite input spreads NaN
+    accumulated in float32, so it is exact. The rotation itself runs in float32
+    with float32 tables and rounds once, as the CUDA kernel does; the bf16
+    strided form rounds the tables and each product (38% of outputs differ from
+    the CUDA kernel at Wan2.2-A14B shapes, against 0.002% here). TPU float16 and
+    float32 matmuls are not exact; other dtypes keep the strided form. A non-finite input spreads NaN
     (0 * inf) across its whole head through ``x @ R``, where the strided form
     touches only its pair.
     """
@@ -62,10 +64,10 @@ def apply_rotary_embedding_pair_swap(
     if interleaved and cos.shape[-1] == x.shape[-1]:
         cos = cos[..., ::2]
         sin = sin[..., ::2]
-    cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2).to(x.dtype)
-    sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2).to(x.dtype)
+    cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2).float()
+    sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2).float()
     rot = _pair_swap_matrix(x.shape[-1], x.dtype, x.device)
-    return x * cos + torch.matmul(x, rot) * sin
+    return (x.float() * cos + torch.matmul(x, rot).float() * sin).to(x.dtype)
 
 
 def install() -> None:

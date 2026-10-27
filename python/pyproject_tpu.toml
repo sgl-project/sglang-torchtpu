@@ -60,7 +60,7 @@ dependencies = [
   "torchao==0.9.0",
   "tqdm",
   "mistral_common>=1.11.0",
-  "transformers==5.8.1",
+  "transformers==5.17.0",
   "uvicorn",
   "uvloop",
   "zstandard",

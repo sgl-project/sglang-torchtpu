@@ -1095,6 +1095,33 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
         self.assertEqual(get_moe_runner_backend().name, "AUTO")
         self.assertFalse(is_tbo_enabled())
 
+    def test_uninitialized_backends_read_inside_compiled_forward(self):
+        # A dense model never runs initialize_moe_config, yet its FFN exit
+        # reads these flags inside the torch.compile'd forward
+        # (sglang-torchtpu#1268). The read must not write the flag group.
+        import torch
+
+        from sglang.srt.layers.moe.utils import (
+            get_moe_a2a_backend,
+            should_use_flashinfer_cutlass_moe_fp4_allgather,
+        )
+
+        reset_context()
+        torch._dynamo.reset()
+        self.addCleanup(torch._dynamo.reset)
+
+        def forward(x):
+            if should_use_flashinfer_cutlass_moe_fp4_allgather():
+                return x - 1
+            if get_moe_a2a_backend().is_none():
+                return x + 1
+            return x * 0
+
+        compiled = torch.compile(forward, backend="eager", fullgraph=True)
+        torch.testing.assert_close(compiled(torch.ones(2)), torch.full((2,), 2.0))
+        self.assertIsNone(get_flags().moe.a2a_backend)
+        self.assertIsNone(get_flags().moe.runner_backend)
+
     def test_initialize_materializes_group(self):
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend, is_tbo_enabled
 

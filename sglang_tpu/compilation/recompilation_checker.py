@@ -39,6 +39,7 @@ _FORWARD_COMPILE_WARN_MS = 100
 # Arbitrary, kept long so the line stays rare on a busy server.
 _SUMMARY_WINDOW_SEC = 300.0
 _SITE_FRAMES = 3
+MAX_RECORDED_EVENTS = 64
 
 # (site description, compiles at that site)
 _Sites = tuple[tuple[str, int], ...]
@@ -225,10 +226,24 @@ class RecompilationChecker:
         # Lifetime totals. A later snapshot_baseline() resets the window, not
         # these, so they span the lifetime of the process.
         self.serving_compiles: int = 0
+        self.heavy_serving_compiles: int = 0
+        self.eager_serving_compiles: int = 0
+        self.serving_cache_loads: int = 0
         self.serving_compile_ms: int = 0
         self.worst_compile_ms: int = 0
+        self.events: list[dict[str, Any]] = []
         self._site_tracer: _CompileSiteTracer | None = None
         self._pending_sites: collections.Counter[str] = collections.Counter()
+
+    def reset_counters(self) -> None:
+        """Reset cumulative serving counters and recorded events."""
+        self.serving_compiles = 0
+        self.heavy_serving_compiles = 0
+        self.eager_serving_compiles = 0
+        self.serving_cache_loads = 0
+        self.serving_compile_ms = 0
+        self.worst_compile_ms = 0
+        self.events = []
 
     @property
     def has_baseline(self) -> bool:
@@ -265,7 +280,11 @@ class RecompilationChecker:
             self._seen_misses,
         )
 
-    def check(self, *, context_fn: Callable[[], str]) -> RecompileEvent | None:
+    def check(
+        self,
+        *,
+        context_fn: Callable[[], str] = lambda: "get_internal_state",
+    ) -> RecompileEvent | None:
         """Report programs compiled since the last snapshot, if any."""
         if self._baseline is None:
             return None
@@ -313,9 +332,29 @@ class RecompilationChecker:
         self._window_events += 1
         self._window_compile_ms += event.total_ms
         self.serving_compiles += len(event.durations_ms)
+        heavy_count = sum(1 for d in event.durations_ms if d >= self._warn_ms)
+        self.heavy_serving_compiles += heavy_count
+        self.eager_serving_compiles += len(event.durations_ms) - heavy_count
+        self.serving_cache_loads += event.load_count
         self.serving_compile_ms += event.total_ms
         if event.durations_ms:
             self.worst_compile_ms = max(self.worst_compile_ms, event.durations_ms[0])
+        if len(self.events) < MAX_RECORDED_EVENTS and (
+            event.durations_ms or event.load_count > 0
+        ):
+            entry: dict[str, Any] = {
+                "context": event.context,
+                "compile_count": len(event.durations_ms),
+                "load_count": event.load_count,
+                "durations_ms": list(event.durations_ms),
+                "total_ms": event.total_ms,
+                "heavy": event.heavy,
+            }
+            if event.sites is not None:
+                entry["sites"] = [
+                    {"site": site, "count": count} for site, count in event.sites
+                ]
+            self.events.append(entry)
 
     def _maybe_report_window(self) -> None:
         elapsed = self._clock() - self._window_start
@@ -425,3 +464,50 @@ def maybe_enable_site_tracing() -> None:
         return
     checker.enable_site_tracing()
     logger.info("[recompilation checker] eager compile site tracing enabled.")
+
+
+def arm_recompilation_checker(
+    *,
+    reset_counters: bool = True,
+    overwrite_baseline: bool = True,
+) -> RecompilationChecker | None:
+    """Baseline the shared checker once all warmup has finished."""
+    checker = _shared_recompilation_checker()
+    if checker is None:
+        return None
+    if not overwrite_baseline and checker._baseline is not None:
+        return checker
+    if reset_counters:
+        checker.reset_counters()
+    checker.snapshot_baseline()
+    return checker
+
+
+def get_recompilation_counters(
+    *,
+    flush: bool = False,
+    context: str = "get_internal_state",
+) -> dict[str, Any]:
+    """Return a JSON-serializable snapshot of serving-time compilation counters."""
+    checker = _shared_recompilation_checker()
+    if checker is None or checker._baseline is None:
+        return {
+            "tpu_serving_compiles": 0,
+            "tpu_heavy_serving_compiles": 0,
+            "tpu_eager_serving_compiles": 0,
+            "tpu_serving_cache_loads": 0,
+            "tpu_serving_compile_ms": 0,
+            "tpu_worst_compile_ms": 0,
+            "tpu_recompile_events": [],
+        }
+    if flush:
+        checker.check(context_fn=lambda: context)
+    return {
+        "tpu_serving_compiles": checker.serving_compiles,
+        "tpu_heavy_serving_compiles": checker.heavy_serving_compiles,
+        "tpu_eager_serving_compiles": checker.eager_serving_compiles,
+        "tpu_serving_cache_loads": checker.serving_cache_loads,
+        "tpu_serving_compile_ms": checker.serving_compile_ms,
+        "tpu_worst_compile_ms": checker.worst_compile_ms,
+        "tpu_recompile_events": list(checker.events),
+    }
