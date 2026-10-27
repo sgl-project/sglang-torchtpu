@@ -976,6 +976,9 @@ def apply_tpu_patches() -> None:
     _patch_pd_decode_swa_hicache()
     _patch_hicache_write_back_copy_ahead()
     _patch_pd_decode_async_prefill_info()
+    from sglang_tpu.benchmark_batch_gate import install as install_benchmark_batch_gate
+
+    install_benchmark_batch_gate()
     _patch_host_heap_trim()
     _patch_profile_auto()
     _patch_scheduler_reject_prompt_logprob()

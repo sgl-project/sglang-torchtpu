@@ -19,7 +19,7 @@ from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import CompilePolicy
 from sglang.srt.environ import envs
 from sglang.srt.observability.compile_timing import CompileTimingRecorder
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.patches import _register_tpu_compile_backend
 
@@ -185,10 +185,11 @@ class VisionTpuCompilePolicy(CompilePolicy):
         _register_tpu_compile_backend()
         method = getattr(runner, self.method_name)
         self.eager_fn = method
-        server_args = self.model_runner.server_args
+        # Read off the runtime context: the EPD encoder installs with no ModelRunner.
+        graph_config = get_exec().graph
         use_bundle = (
-            server_args.unsafe_save_torch_compile_bundle is not None
-            or server_args.unsafe_load_torch_compile_bundle is not None
+            graph_config.unsafe_save_torch_compile_bundle is not None
+            or graph_config.unsafe_load_torch_compile_bundle is not None
         )
         self.compiled_fn = self._compile_method(method, use_bundle=use_bundle)
         setattr(runner, self.method_name, self.compiled_fn)
@@ -204,7 +205,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
 
     def _compile_method(self, method: Any, *, use_bundle: bool) -> Any:
         if (
-            self.model_runner.server_args.tpu_compile_tracer == "direct"
+            get_exec().graph.tpu_compile_tracer == "direct"
             and envs.SGLANG_DIRECT_COMPILE_ASYNC.get()
         ):
             model = self.get_compile_model()
