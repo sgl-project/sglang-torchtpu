@@ -618,6 +618,15 @@ def _register_attention_backends() -> None:
 
         return DSV4TPUAttnBackend(runner)
 
+    # Vision: opt in to block-skipping splash for the "tpu" backend.
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if tpu_envs.SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION.get():
+        from sglang.srt.layers.attention.vision import QKV_BACKEND_IMPL
+        from sglang_tpu.attention.vision_splash import VisionTpuSplashAttention
+
+        QKV_BACKEND_IMPL["tpu"] = VisionTpuSplashAttention
+
 
 def _register_models() -> None:
     """Add the model implementations that only this package provides to the registry."""
@@ -1470,7 +1479,9 @@ class TpuSRTPlatform(SRTPlatform):
         return torch.device("tpu", device_id)
 
     def set_device(self, device: torch.device) -> None:
-        torch.accelerator.set_device_index(device)
+        # The PJRT bootstrap binds each worker to one chiplet at local index 0
+        # and torch_tpu cannot switch it, so sglang's gpu_id is only a label.
+        torch.accelerator.set_device_index(0)
 
     def get_device_name(self, device_id: int = 0) -> str:
         try:

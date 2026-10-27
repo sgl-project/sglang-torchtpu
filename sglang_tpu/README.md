@@ -169,6 +169,22 @@ clearing, JAX cache clearing, CPU-backend release, garbage collection before
 freezing and startup heap trimming. File-cache release retains its separate
 opt-outs.
 
+## Fixed-cohort benchmark gate
+
+- Enable with `SGLANG_TPU_BENCHMARK_BATCH_SIZE=N` (default: `0`, disabled).
+- Send a native batch with base request ID `hourly-batch:<unique-cohort>`;
+  normalization appends `_0` through `_N-1`. Use `x-rid` if the router overrides
+  request IDs. Untagged requests bypass the gate.
+- Unified and P/D emit first tokens as ready. Decode waits for all first tokens
+  and, for P/D, KV transfers. Unified disables decode mixing during prefill.
+- Decode timing runs from the first decode forward to the last request completion.
+  Token counts exclude the prefill token and clip SBD output at the stop boundary.
+- `/server_info` exposes `benchmark_batch_gate`: cohort ID, decode duration,
+  decode output tokens, gate wait duration, and TPOT.
+- Requires DP1/attention-DP1/CP1/PP1, device-resident decoder KV, and capacity for
+  the full batch. Mixed cohorts, retraction, invalid completion, or timeout fail
+  the benchmark. `SGLANG_TPU_BENCHMARK_TIMEOUT_SEC` defaults to `600`.
+
 ## Diffusion (multimodal_gen)
 
 `multimodal_gen/` holds the diffusion TPU code. The `tpu_oot` entry point of
