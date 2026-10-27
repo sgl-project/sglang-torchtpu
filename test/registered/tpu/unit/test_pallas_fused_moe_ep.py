@@ -348,5 +348,92 @@ class TestFusedMoEExpertParallel(CustomTestCase):
                 )
 
 
+@unittest.skipUnless(_HAS_TPU, _SKIP)
+class TestNvfp4NativeEpOffset(CustomTestCase):
+    """Packed NVFP4 (block 512) at EP>1: the kernel's native expert window
+    (global ids + ``expert_group_offset``) matches the default local-id path
+    (ids rewritten to this rank's range, non-local slots -1 with weight 0)."""
+
+    HIDDEN = 512
+    INTERMEDIATE = 512
+    BLOCK = 512
+    LOCAL_EXPERTS = 8
+    EP_SIZE = 4
+    TOPK = 4
+
+    def _weights(self, key):
+        e, h, n, b = self.LOCAL_EXPERTS, self.HIDDEN, self.INTERMEDIATE, self.BLOCK
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+        # Every e2m1 code is finite, so random bytes are valid packed FP4.
+        w1 = jax.random.randint(k1, (e, h // 2, 2 * n), 0, 256).astype(jnp.uint8)
+        w2 = jax.random.randint(k2, (e, n // 2, h), 0, 256).astype(jnp.uint8)
+        w1_scale = jax.random.uniform(
+            k3, (e, h // b, 1, 2 * n), jnp.float32, 1e-3, 4e-3
+        )
+        w2_scale = jax.random.uniform(k4, (e, n // b, 1, h), jnp.float32, 1e-3, 4e-3)
+        return w1, w2, w1_scale, w2_scale
+
+    def _run(self, x, weights, topk_weights, topk_ids, **route_kw):
+        from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
+
+        w1, w2, w1_scale, w2_scale = weights
+        out = _fused_moe_jax(
+            x,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w1_bias=None,
+            w2_bias=None,
+            topk=self.TOPK,
+            activation_name="silu",
+            **route_kw,
+        )
+        return np.asarray(jax.block_until_ready(out).astype(jnp.float32))
+
+    def test_native_window_matches_local_ids(self):
+        global_experts = self.LOCAL_EXPERTS * self.EP_SIZE
+        weights = self._weights(jax.random.key(0))
+        for tokens in (1, 16, 256):
+            for rank in (0, self.EP_SIZE - 1):
+                with self.subTest(tokens=tokens, rank=rank):
+                    key = jax.random.key(100 * tokens + rank)
+                    k1, k2, k3 = jax.random.split(key, 3)
+                    x = jax.random.normal(k1, (tokens, self.HIDDEN), jnp.bfloat16)
+                    topk_weights = jax.nn.softmax(
+                        jax.random.normal(k2, (tokens, self.TOPK), jnp.float32), -1
+                    ).astype(jnp.bfloat16)
+                    topk_ids = jax.random.randint(
+                        k3, (tokens, self.TOPK), 0, global_experts
+                    ).astype(jnp.int32)
+                    offset = rank * self.LOCAL_EXPERTS
+                    # Slot 0 stays on this rank so every token has local work.
+                    topk_ids = topk_ids.at[:, 0].set(
+                        offset + topk_ids[:, 0] % self.LOCAL_EXPERTS
+                    )
+                    local = topk_ids - offset
+                    owned = (local >= 0) & (local < self.LOCAL_EXPERTS)
+
+                    native = self._run(
+                        x,
+                        weights,
+                        topk_weights,
+                        topk_ids,
+                        global_num_experts=global_experts,
+                        expert_group_offset=offset,
+                    )
+                    masked = self._run(
+                        x,
+                        weights,
+                        jnp.where(owned, topk_weights, 0).astype(jnp.bfloat16),
+                        jnp.where(owned, local, -1).astype(jnp.int32),
+                    )
+                    self.assertTrue(np.all(np.isfinite(native)))
+                    self.assertGreater(float(np.max(np.abs(masked))), 0.0)
+                    np.testing.assert_array_equal(native, masked)
+
+
 if __name__ == "__main__":
     unittest.main()

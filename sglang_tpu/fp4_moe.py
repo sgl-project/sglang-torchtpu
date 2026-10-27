@@ -20,6 +20,7 @@ from sglang.srt.layers.quantization.mxfp4_tpu_util import (
     _pad_last_axis,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.fp8_moe import _clear_replaced_param, _own_storage
 from sglang_tpu.fused_rs_sequence_parallel import (
     get_tpu_fused_rs_post_expert_norm_weight,
@@ -429,14 +430,21 @@ def apply_tpu_nvfp4_moe(
     topk_weights = topk_weights.to(x.dtype)
     topk_ids = topk_ids.to(torch.int32)
 
-    topk_weights, topk_ids = mask_tpu_moe_non_local_experts(
-        topk_weights,
-        topk_ids,
-        layer.num_local_experts,
-        layer.moe_ep_rank,
-    )
+    global_num_experts, expert_group_offset = 0, 0
+    if tpu_envs.SGLANG_TPU_FP4_MOE_NATIVE_EP_OFFSET.get() and layer.moe_ep_size > 1:
+        global_num_experts = layer.num_local_experts * layer.moe_ep_size
+        expert_group_offset = layer.moe_ep_rank * layer.num_local_experts
+    else:
+        topk_weights, topk_ids = mask_tpu_moe_non_local_experts(
+            topk_weights,
+            topk_ids,
+            layer.num_local_experts,
+            layer.moe_ep_rank,
+        )
 
     output = fused_moe_call(
+        global_num_experts=global_num_experts,
+        expert_group_offset=expert_group_offset,
         hidden_states=x,
         w1=layer.w13_weight,
         w2=layer.w2_weight,
