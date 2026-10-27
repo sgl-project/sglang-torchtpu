@@ -187,7 +187,9 @@ Every in-project job calls this workflow; its work is one shell step. In order:
 
 `admit_s = 21600 − wait_s − 1500`: time in the queue comes out of the same 6 hours, so a
 long job gets less of it. `est_time` therefore matters: it sizes the deadline, the wait
-and the admission budget.
+and the admission budget. `weekly-update-tpu-est-time.yml` keeps it (and a
+`timeout_per_file` that mirrors it) at p90 × 1.25 of the nightlies' passing runs; the
+upstream est_time bot has no TPU data.
 
 **Weights.** Jobs that need models mount a read-only PVC at `/weights`. The key
 `model-weights` maps to the claim named in `weights.yaml` (today the Filestore claim
@@ -248,6 +250,8 @@ and the admission budget.
 | `.github/tpu-ci/weights.yaml` | Weights key to PVC name |
 | `.github/tpu-ci/pvc-model-weights-filestore.yaml` | The weights PV and PVC (Filestore IP substituted when applied) |
 | `.github/tpu-ci/dashboard_aliases.json` | Dashboard series-id renames |
+| `.github/workflows/weekly-update-tpu-est-time.yml` | Mondays: opens a PR recalibrating TPU `est_time` |
+| `.github/tpu-ci/update_tpu_est_time.py` | Measures per-file runtimes from recent nightly logs and rewrites `est_time` |
 | `docker/tpu-base.Dockerfile`, `docker/tpu.Dockerfile` | Base image (dependencies) and final image (SGLang) |
 
 ## Deployment configuration

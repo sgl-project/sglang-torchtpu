@@ -99,6 +99,7 @@
     "pcp": "Prefill context parallel",
     "pp": "Pipeline parallel",
     "pd": "PD disaggregation",
+    "epd": "EPD (standalone vision encode server)",
     "tp-reshard": {
       "name": "PD TP resharding",
       "aliases": [

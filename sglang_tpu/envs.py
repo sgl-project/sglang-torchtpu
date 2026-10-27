@@ -17,6 +17,10 @@ EnvField._allow_set_name = True
 
 
 class TpuEnvs:
+    # Opt-in, request-tagged benchmark admission (benchmark_batch_gate.py).
+    # Zero preserves ordinary scheduling, including continuous batching.
+    SGLANG_TPU_BENCHMARK_BATCH_SIZE = EnvInt(0)
+    SGLANG_TPU_BENCHMARK_TIMEOUT_SEC = EnvFloat(600.0)
     SGLANG_TPU_RELEASE_CHECKPOINT_PAGE_CACHE = EnvBool(True)
     SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS = EnvBool(True)
     # Host heap (see host_heap_trim.py)
@@ -49,6 +53,9 @@ class TpuEnvs:
     # query-blocked kernel (attention/pallas/mla_sparse_qblock.py), which fetches
     # each block's union of selected pages once; False keeps the per-query kernel.
     SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL = EnvBool(False)
+    # Vision: run single-sequence "tpu" vision attention through block-skipping splash
+    # (attention/vision_splash.py); False keeps the segment-id flash op.
+    SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION = EnvBool(False)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.

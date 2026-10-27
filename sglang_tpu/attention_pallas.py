@@ -21,9 +21,16 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import jax
+import jax.numpy as jnp
 import torch
 from jax.experimental.pallas.ops.tpu.paged_attention.paged_attention_kernel import (
     paged_attention,
+)
+from jax.experimental.pallas.ops.tpu.splash_attention import (
+    splash_attention_kernel as splash,
+)
+from jax.experimental.pallas.ops.tpu.splash_attention import (
+    splash_attention_mask_info as splash_mask_info,
 )
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -504,4 +511,145 @@ def _get_vision_flash_op(sm_scale: float):
 
     op.register_fake(_fake_vision_flash)
     _VISION_FLASH_OPS[key] = op
+    return op
+
+
+# ---------------------------------------------------------------------------
+# Vision encoder: segment-ID attention with block skipping (splash)
+# ---------------------------------------------------------------------------
+_VISION_SPLASH_OPS: dict[float, object] = {}
+
+
+def _vision_splash_block_sizes(seq_len: int) -> tuple[int, int]:
+    """Splash (block_q, block_kv): the largest of 2048..128 (q) and 1024..128 (kv) dividing seq_len.
+
+    Large blocks keep the per-grid-step cost low; at 16,384 tokens with 1,024-token
+    segments, (2048, 1024) measured fastest of the sizes that fit a 24 MiB scoped VMEM,
+    and a 4,096-token q block does not compile under that limit. seq_len must be a
+    multiple of 128; ``VisionTpuSplashAttention`` pads to a multiple of 1,024 so the
+    smaller fallbacks are not hit.
+    """
+    if seq_len <= 0 or seq_len % 128:
+        raise ValueError(
+            f"TPU vision splash attention needs seq_len a positive multiple of 128; "
+            f"got {seq_len}"
+        )
+    block_q = next(b for b in (2048, 1024, 512, 256, 128) if seq_len % b == 0)
+    block_kv = next(b for b in (1024, 512, 256, 128) if seq_len % b == 0)
+    return block_q, block_kv
+
+
+def _vision_splash_block_map(segment_ids, block_q: int, block_kv: int):
+    """Splash block map for segment-ID attention: (block_mask, data_next), [1, nq, nkv].
+
+    A (q block, kv block) pair is live when the segment-id ranges of the two blocks
+    intersect. That holds whenever any query in the q block shares a segment with any
+    key in the kv block, so skipping the other pairs is exact for any token order. The
+    map is sparse only when the ids are non-decreasing in token order: contiguous
+    segments numbered out of order (e.g. ``0..., 5..., 1..., 4...``) give blocks with wide
+    id ranges that overlap everything, which is exact but dense. Renumbering inside the
+    op cannot fix that without losing exactness for a segment split across runs, so
+    callers number their segments in order. ``data_next`` is the kv block a grid
+    step fetches: the last live block so far (the first live one before it), so a
+    skipped step fetches nothing new.
+    """
+    q_ids = segment_ids.reshape(-1, block_q)
+    kv_ids = segment_ids.reshape(-1, block_kv)
+    live = (q_ids.min(1)[:, None] <= kv_ids.max(1)[None, :]) & (
+        kv_ids.min(1)[None, :] <= q_ids.max(1)[:, None]
+    )
+    kv_block = jnp.arange(live.shape[1], dtype=jnp.int32)
+    last_live = jax.lax.cummax(jnp.where(live, kv_block, -1), axis=1)
+    first_live = jnp.argmax(live, axis=1).astype(jnp.int32)
+    data_next = jnp.where(last_live >= 0, last_live, first_live[:, None])
+    block_mask = jnp.where(live, 2, 0).astype(jnp.int32)
+    return block_mask[None], data_next[None]
+
+
+def _vision_splash_attention(q, k, v, segment_ids, *, sm_scale: float, interpret=False):
+    """Segment-ID attention with block skipping; the JAX body of the splash op.
+
+    q, k, v: [1, num_heads, seq_len, head_dim]; segment_ids: [1, seq_len], the layout
+    of the segment-ID flash op with batch 1 (one sequence; ``VisionTpuSplashAttention``
+    hands dense batches to the flash op). Runs splash attention with the block map of
+    ``_vision_splash_block_map`` and the segment ids as the in-block mask. Splash takes
+    no softmax scale, so q is scaled first.
+    """
+    if q.shape[0] != 1:
+        raise ValueError(
+            "TPU vision splash attention runs one sequence (batch 1); "
+            f"got batch {q.shape[0]}"
+        )
+    segment_ids = segment_ids[0]
+    q, k, v = q[0], k[0], v[0]
+    block_q, block_kv = _vision_splash_block_sizes(q.shape[1])
+    block_mask, data_next = _vision_splash_block_map(segment_ids, block_q, block_kv)
+    mask_info = splash_mask_info.MaskInfo(
+        data_next=data_next,
+        mask_next=None,
+        block_mask=block_mask,
+        partial_mask_blocks=None,
+        q_sequence=None,
+        is_dynamic_mask=True,
+    )
+    kernel = splash.SplashAttentionKernel(
+        mask_info,
+        None,
+        None,
+        block_sizes=splash.BlockSizes(
+            block_q=block_q, block_kv=block_kv, block_kv_compute=block_kv
+        ),
+        is_mqa=False,
+        save_residuals=False,
+        mask_value=splash.DEFAULT_MASK_VALUE,
+        attn_logits_soft_cap=None,
+        residual_checkpoint_name=None,
+        mask_function=None,
+        interpret=interpret,
+    )
+    out = kernel(
+        q * sm_scale, k, v, segment_ids=splash.SegmentIds(q=segment_ids, kv=segment_ids)
+    )
+    return out[None]
+
+
+def _get_vision_splash_op(sm_scale: float):
+    """Return a cached pallas op for segment-ID vision attention with block skipping.
+
+    Same arguments as the segment-ID flash op above (``[1, h, s, d]`` q, k, v and
+    ``[1, s]`` segment ids), batch 1 only. For segments much shorter than the sequence (local windows
+    or tiles), the flash op computes every query-key block and masks most of them. This
+    op skips the blocks whose segments cannot meet, so with the ids non-decreasing in
+    token order (each segment contiguous, segments numbered in order) its cost scales
+    with the segment lengths rather than ``seq_len**2``. Any ids give exact results.
+    With one long segment and a padding tail (full attention over a padded sequence)
+    it runs dense over the real tokens; its KV blocks keep the VMEM footprint fixed,
+    where the flash op's single KV step outgrows a 24 MiB scoped limit above ~16k keys.
+    """
+    key = float(sm_scale)
+    op = _VISION_SPLASH_OPS.get(key)
+    if op is not None:
+        return op
+
+    from torch_tpu._internal import pallas
+
+    def _jax_vision_splash(q, k, v, segment_ids):
+        return _vision_splash_attention(q, k, v, segment_ids, sm_scale=sm_scale)
+
+    _jax_vision_splash.__annotations__ = {
+        "q": jax.Array,
+        "k": jax.Array,
+        "v": jax.Array,
+        "segment_ids": jax.Array,
+        "return": jax.Array,
+    }
+
+    op_name = f"sglang_tpu::vision_splash_s{key!r}".replace(".", "_").replace("-", "m")
+    op = pallas.jax_op(op_name, _jax_vision_splash)
+
+    def _fake_vision_splash(q, k, v, segment_ids):
+        return torch.empty_like(q)
+
+    op.register_fake(_fake_vision_splash)
+    _VISION_SPLASH_OPS[key] = op
     return op
