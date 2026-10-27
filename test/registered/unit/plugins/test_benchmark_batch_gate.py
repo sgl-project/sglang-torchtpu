@@ -339,3 +339,7 @@ def test_untagged_startup_bypasses_unified_gate(scheduler_classes):
     scheduler.next_plan = NS(batch_to_run=batch([], "extend"), running_batch=batch([]))
     assert scheduler.get_next_batch_to_run(batch([]), None) is scheduler.next_plan
     assert scheduler.mixed_seen is True
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
