@@ -529,6 +529,11 @@ def _vision_splash_block_sizes(seq_len: int) -> tuple[int, int]:
     multiple of 128; ``VisionTpuSplashAttention`` pads to a multiple of 1,024 so the
     smaller fallbacks are not hit.
     """
+    if seq_len <= 0 or seq_len % 128:
+        raise ValueError(
+            f"TPU vision splash attention needs seq_len a positive multiple of 128; "
+            f"got {seq_len}"
+        )
     block_q = next(b for b in (2048, 1024, 512, 256, 128) if seq_len % b == 0)
     block_kv = next(b for b in (1024, 512, 256, 128) if seq_len % b == 0)
     return block_q, block_kv
@@ -561,6 +566,24 @@ def _vision_splash_block_map(segment_ids, block_q: int, block_kv: int):
     return block_mask[None], data_next[None]
 
 
+def _vision_splash_layout(segment_ids):
+    """One splash sequence for a batch: (flat segment ids [batch * seq_len], block_q, block_kv).
+
+    Splash runs one sequence, so the batch rows are laid end to end and each row's ids
+    move into their own range: rows stay apart and the ids stay non-decreasing. Ids
+    may be negative, so they are shifted to start at 0 before the per-row offset. The
+    block sizes come from one row's length, so they divide it and no q block spans two
+    rows (a q block over two rows would make both rows' kv blocks live).
+    """
+    b, s = segment_ids.shape
+    block_q, block_kv = _vision_splash_block_sizes(s)
+    if b > 1:
+        segment_ids = segment_ids - segment_ids.min()
+        row = jnp.arange(b, dtype=jnp.int32)[:, None]
+        segment_ids = segment_ids + row * (segment_ids.max() + 1)
+    return segment_ids.reshape(b * s), block_q, block_kv
+
+
 def _vision_splash_attention(q, k, v, segment_ids, *, sm_scale: float, interpret=False):
     """Segment-ID attention with block skipping; the JAX body of the splash op.
 
@@ -570,14 +593,8 @@ def _vision_splash_attention(q, k, v, segment_ids, *, sm_scale: float, interpret
     no softmax scale, so q is scaled first.
     """
     b, h, s, d = q.shape
-    # Splash runs one sequence: lay the batch rows end to end and offset each row's
-    # ids past the previous row's, so rows stay apart and the ids stay non-decreasing.
-    if b > 1:
-        row = jnp.arange(b, dtype=jnp.int32)[:, None]
-        segment_ids = segment_ids + row * (segment_ids.max() + 1)
-    segment_ids = segment_ids.reshape(b * s)
+    segment_ids, block_q, block_kv = _vision_splash_layout(segment_ids)
     q, k, v = (x.transpose(1, 0, 2, 3).reshape(h, b * s, d) for x in (q, k, v))
-    block_q, block_kv = _vision_splash_block_sizes(b * s)
     block_mask, data_next = _vision_splash_block_map(segment_ids, block_q, block_kv)
     mask_info = splash_mask_info.MaskInfo(
         data_next=data_next,
