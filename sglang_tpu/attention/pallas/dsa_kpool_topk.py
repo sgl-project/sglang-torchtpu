@@ -8,8 +8,8 @@ tokens (upstream ``IndexerKPool``, CUDA only). Per indexer layer and forward:
    gate score (compress_gate(x), bf16) in the layer's raw cache.
 2. Every token that closes a pool (``pos % kpool == kpool - 1``) compresses it:
    per channel, a softmax over the pool's slots of ``gate + ape`` weights the
-   raw keys; the sum is rounded to bf16, Hadamard-rotated and quantized to
-   FP8 with a power-of-two scale. Pool ``p`` is stored at position
+   raw keys; the sum is rounded to bf16, Hadamard-rotated, rounded again and
+   quantized to FP8 with a power-of-two scale. Pool ``p`` is stored at position
    ``p`` of the request in the pooled cache (the GLM-5.2 index-key layout).
 3. Each query scores the closed pools before it,
    ``sum over heads of w_h * relu(q_h . k_pool) * scale``, keeps the top
@@ -130,9 +130,14 @@ def compress_pools(keys: jax.Array, gates: jax.Array, ape: jax.Array) -> jax.Arr
     keys [..., d] f32, rounded through bf16 as upstream's writer does."""
     score = gates.astype(jnp.float32) + ape.astype(jnp.float32)
     weight = jax.nn.softmax(score, axis=-2)
-    pooled = jnp.sum(weight * keys.astype(jnp.float32), axis=-2)
-    pooled = pooled.astype(jnp.bfloat16)
-    return hadamard_rotate(pooled).astype(jnp.bfloat16).astype(jnp.float32)
+    pooled = _round_bf16(jnp.sum(weight * keys.astype(jnp.float32), axis=-2))
+    return _round_bf16(hadamard_rotate(pooled))
+
+
+def _round_bf16(x: jax.Array) -> jax.Array:
+    # XLA's excess-precision pass may drop an f32->bf16->f32 convert pair;
+    # reduce_precision is always honored.
+    return jax.lax.reduce_precision(x, exponent_bits=8, mantissa_bits=7)
 
 
 def kpool_indexer_step(

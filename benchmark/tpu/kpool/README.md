@@ -22,8 +22,10 @@ use the grouped path. There is no Q=1 or batch=32 special case.
 
 Both schedules preserve partial destination blocks. Requests that update
 different records in a shared physical quad use ordered read/modify/write.
-Pooling retains BF16 rounding before rotation. Rotation and FP8 quantization
-use the frozen compiled reference's FP32 path, without an extra BF16 round trip.
+Pooling rounds to BF16 before rotation, and the rotated key is rounded to BF16
+again before FP8 quantization, as upstream's Triton writer does. The reference
+uses `lax.reduce_precision` for both roundings; an `astype` round trip can be
+removed by XLA's excess-precision pass.
 
 The serving custom op passes a static query bound from the attention metadata:
 uniform DECODE uses `decode_query_size`; mixed prefill and verification use the

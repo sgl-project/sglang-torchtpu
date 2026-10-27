@@ -2,6 +2,7 @@
 """Frozen step-2 oracle from dsa_kpool_topk.py at ab8861d5bac88f2e7010c8e808e61088dc8191a1.
 
 Kept independent of the candidate and serving imports for module validation.
+BF16 roundings use reduce_precision so the compiled oracle keeps both of them.
 """
 
 import jax
@@ -100,8 +101,11 @@ def compress_pools(keys: jax.Array, gates: jax.Array, ape: jax.Array) -> jax.Arr
     score = gates.astype(jnp.float32) + ape.astype(jnp.float32)
     weight = jax.nn.softmax(score, axis=-2)
     pooled = jnp.sum(weight * keys.astype(jnp.float32), axis=-2)
-    pooled = pooled.astype(jnp.bfloat16)
-    return hadamard_rotate(pooled).astype(jnp.bfloat16).astype(jnp.float32)
+    # reduce_precision, not an astype round trip: XLA's excess-precision pass
+    # drops f32->bf16->f32 pairs, which silently removed the second rounding.
+    pooled = jax.lax.reduce_precision(pooled, exponent_bits=8, mantissa_bits=7)
+    rotated = hadamard_rotate(pooled)
+    return jax.lax.reduce_precision(rotated, exponent_bits=8, mantissa_bits=7)
 
 
 def computation(
