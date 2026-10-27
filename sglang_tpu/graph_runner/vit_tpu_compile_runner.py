@@ -477,7 +477,16 @@ class _Qwen3VLRunContext:
 
 
 class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
-    """Compile policy for compiled Qwen3-VL ViT blocks."""
+    """Compile policy for compiled Qwen3-VL ViT blocks.
+
+    ``spmd_safe``: the ViT is replicated and its only rank-dependent value
+    (``dist.get_rank()`` in the attention path) is lifted by ``lift_rank``.
+    Verified with ``VERIFY_SPMD_SAFE=1`` on the Qwen3-VL-30B-A3B recipes
+    (#1623); re-verify before enabling ``--use-spmd-compile`` for another
+    model that reuses this policy.
+    """
+
+    spmd_safe = True
 
     def __init__(
         self, vit: Any | None = None, *, name: str = "qwen3_vl_vit_encoder", **kwargs

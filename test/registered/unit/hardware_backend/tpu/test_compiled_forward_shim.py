@@ -60,7 +60,6 @@ from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
 )
-from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 # Pure-logic tests: CPU tensors only, and the shim's import chain is
@@ -180,10 +179,7 @@ class TestHostStagedPrefillInputs(CustomTestCase):
         self.assertIsNone(batch.prefill_input_ids_cpu)
 
     def test_mixed_and_speculative_batches_keep_the_device_contract(self):
-        with (
-            get_context().override_server_args(enable_torch_compile=True),
-            tpu_envs.SGLANG_TPU_HOST_PADDING.override(True),
-        ):
+        with get_context().override_server_args(enable_torch_compile=True):
             allocator = TpuPagedTokenToKVPoolAllocator(
                 size=32,
                 page_size=4,
@@ -214,8 +210,6 @@ class TestHostStagedPrefillInputs(CustomTestCase):
             )
             platform = TpuSRTPlatform()
             self.assertEqual(platform.get_batch_input_device(batch), "cpu")
-            with tpu_envs.SGLANG_TPU_HOST_PADDING.override(False):
-                self.assertIsNone(platform.get_batch_input_device(batch))
             with get_schedule().override(enable_mixed_chunk=True):
                 self.assertIsNone(platform.get_batch_input_device(batch))
             batch.spec_algorithm = SpeculativeAlgorithm.EAGLE
@@ -248,7 +242,6 @@ class TestHostStagedPrefillInputs(CustomTestCase):
         with (
             get_context().override_server_args(),
             get_parallel().override(attn_dcp_size=1),
-            tpu_envs.SGLANG_TPU_HOST_PADDING.override(True),
             patch(
                 "sglang.srt.managers.schedule_batch.SamplingBatchInfo.from_schedule_batch",
                 return_value=None,
@@ -981,6 +974,25 @@ class TestCompiledForwardShim(CustomTestCase):
         self.assertEqual(out.hidden_states.shape, (4, 5))
         self.assertTrue(torch.equal(out.next_token_logits, padded_logits[:2]))
         self.assertTrue(torch.equal(out.hidden_states, padded_hidden[:4]))
+
+        # When real_b == pad_b and real_q == pad_q, trim_next_token_outputs
+        # must not materialize a no-op slice view.
+        exact_logits = torch.zeros(4, 10)
+        exact_hidden = torch.zeros(8, 5)
+        shim_exact = CompiledForwardShim(
+            MagicMock(
+                return_value=LogitsProcessorOutput(
+                    next_token_logits=exact_logits,
+                    hidden_states=exact_hidden,
+                )
+            ),
+            policy=DecoderTpuCompilePolicy(),
+        )
+        out_exact = shim_exact(
+            None, None, self._forward_batch(_tpu_real_q=8, _tpu_real_b=4)
+        )
+        self.assertIs(out_exact.next_token_logits, exact_logits)
+        self.assertIs(out_exact.hidden_states, exact_hidden)
 
     def test_defers_output_unpadding_for_chained_forwards(self):
         padded = LogitsProcessorOutput(

@@ -468,8 +468,8 @@ def hook_specs():
         ),
     ]
     if experimental_spec_enabled():
-        # Hot paths every spec batch takes; registered only with the flag on so
-        # the default path runs no extra wrappers.
+        # Hot paths every spec batch takes (non-spec batches return immediately);
+        # skipped when SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=0 at import time.
         hooks += [
             (
                 "sglang.srt.speculative.spec_utils.spec_prepare_for_decode",

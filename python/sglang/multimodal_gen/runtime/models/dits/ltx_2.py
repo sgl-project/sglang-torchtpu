@@ -346,7 +346,12 @@ def apply_split_rotary_emb(
     if x.ndim != 4 and cos.ndim == 4:
         b = x.shape[0]
         _, h, t, _ = cos.shape
-        x = x.reshape(b, t, h, -1).swapaxes(1, 2)
+        # Rotate in x's own [b, t, h, d] order and move the small cos/sin
+        # instead: the final reshape of a transposed x is traced as a view, and
+        # torch_tpu does not keep the transposed strides across the graph's
+        # collective splits (the view then fails at run time).
+        x = x.reshape(b, t, h, -1)
+        cos, sin = cos.swapaxes(1, 2), sin.swapaxes(1, 2)
         needs_reshape = True
 
     last = x.shape[-1]
@@ -371,7 +376,7 @@ def apply_split_rotary_emb(
 
     out = out.reshape(*out.shape[:-2], last)
     if needs_reshape:
-        out = out.swapaxes(1, 2).reshape(b, t, -1)
+        out = out.reshape(b, t, -1)
     return out.to(dtype=x_dtype)
 
 

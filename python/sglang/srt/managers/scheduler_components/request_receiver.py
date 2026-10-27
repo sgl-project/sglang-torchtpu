@@ -33,6 +33,10 @@ from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
 )
+from sglang.srt.managers.scheduler_components.node_fanout import (
+    get_node_fanout,
+    node_fanout_enabled,
+)
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_RECV_REQUESTS,
     SchedulerStageMetricsRecorder,
@@ -167,6 +171,8 @@ class SchedulerRequestReceiver:
         sharing one waiting queue; the control channel fans out from global
         rank 0 and would overwrite every DP group's aborts but the first.
         """
+        # Check before branching so unsupported TP1/DP configurations also warn.
+        use_node_fanout = node_fanout_enabled()
         local_reqs = local_reqs or []
         if get_parallel().attn_dp_enabled:
             if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
@@ -203,12 +209,17 @@ class SchedulerRequestReceiver:
                 recv_reqs = [*recv_reqs, *local_reqs]
             if get_parallel().tp_size != 1:
                 tp_group = get_parallel().tp_group
-                recv_reqs = broadcast_pyobj(
-                    recv_reqs,
-                    tp_group.rank,
-                    tp_group.cpu_group,
-                    src=tp_group.ranks[0],
-                )
+                if use_node_fanout:
+                    recv_reqs = get_node_fanout(
+                        tp_group, get_parallel().nnodes
+                    ).broadcast(recv_reqs)
+                else:
+                    recv_reqs = broadcast_pyobj(
+                        recv_reqs,
+                        tp_group.rank,
+                        tp_group.cpu_group,
+                        src=tp_group.ranks[0],
+                    )
         return recv_reqs
 
     def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:

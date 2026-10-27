@@ -4,11 +4,17 @@
 
 def install_runtime_patches() -> None:
     """Patch a worker; call after ``torch_tpu`` is imported."""
+    import torch
+
     from sglang_tpu.multimodal_gen import rope, sdpa_mask
     from sglang_tpu.patches import _register_aten_fallbacks
 
     # sglang_tpu's kernels for ATen ops torch_tpu lacks (e.g. logaddexp).
     _register_aten_fallbacks()
+    # torch_tpu runs float32 matmuls and convolutions as a single bf16 pass
+    # ("medium", 2.3e-3 relative error); CUDA runs them in float32. Keep the
+    # float32 paths (VAE decode, embeddings) float32.
+    torch.set_float32_matmul_precision("highest")
     rope.install()
     sdpa_mask.install()
 

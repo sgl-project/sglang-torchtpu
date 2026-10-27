@@ -502,18 +502,24 @@ def initialize_moe_config():
     )
 
 
+# The two readers below run inside compiled forwards (dense FFN exits ask
+# them whether the post-FFN all-reduce can be deferred), so they must not
+# write: a dense model never runs initialize_moe_config, and a lazy default
+# written here would mutate the flag group under Dynamo tracing. The defaults
+# are module globals because Dynamo in torch 2.11 can fail to call a method
+# such as ``is_none()`` on an enum member reached as ``MoeA2ABackend.NONE``.
+_DEFAULT_MOE_A2A_BACKEND = MoeA2ABackend.NONE
+_DEFAULT_MOE_RUNNER_BACKEND = MoeRunnerBackend.AUTO
+
+
 def get_moe_a2a_backend() -> MoeA2ABackend:
-    moe = get_flags().moe
-    if moe.a2a_backend is None:
-        moe.a2a_backend = MoeA2ABackend.NONE
-    return moe.a2a_backend
+    backend = get_flags().moe.a2a_backend
+    return _DEFAULT_MOE_A2A_BACKEND if backend is None else backend
 
 
 def get_moe_runner_backend() -> MoeRunnerBackendLike:
-    moe = get_flags().moe
-    if moe.runner_backend is None:
-        moe.runner_backend = MoeRunnerBackend.AUTO
-    return moe.runner_backend
+    backend = get_flags().moe.runner_backend
+    return _DEFAULT_MOE_RUNNER_BACKEND if backend is None else backend
 
 
 def get_speculative_moe_runner_backend() -> MoeRunnerBackendLike:

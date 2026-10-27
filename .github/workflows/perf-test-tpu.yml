@@ -22,7 +22,7 @@ on:
         default: all
         type: choice
         options: [all, gpt-oss-120b, gpt-oss-20b, deepseek-r1-0528, deepseek-v3-1, kimi-k26, gemma4-31b,
-          gemma4-26b-a4b, qwen3-5-397b]
+          gemma4-26b-a4b, qwen3-5-397b, glm-5-3-flash]
       update-dashboard:
         description: "Publish this run's results to the dashboard (main only)"
         required: false
@@ -104,6 +104,8 @@ jobs:
           {"suite": "nightly-tpu-perf-gemma4-26b-a4b", "run_name": "perf-gemma4-26b-a4b", "timeout": 3600, "weights_pvc": "model-weights"}]'))
           || (inputs.model == 'qwen3-5-397b' && fromJSON('[
           {"suite": "nightly-tpu-perf-qwen3-5-397b", "run_name": "perf-qwen3-5-397b", "timeout": 3600, "weights_pvc": "model-weights"}]'))
+          || (inputs.model == 'glm-5-3-flash' && fromJSON('[
+          {"suite": "nightly-tpu-perf-glm-5-3-flash-mtp-mk", "run_name": "perf-glm-5-3-flash-mtp-mk", "timeout": 3600, "weights_pvc": "model-weights"}]'))
           || fromJSON('[
           {"suite": "nightly-tpu-perf-gpt-oss-120b", "run_name": "perf-gpt-oss-120b", "timeout": 1800, "weights_pvc": "model-weights"},
           {"suite": "nightly-tpu-perf-gpt-oss-120b-c64", "run_name": "perf-gpt-oss-120b-c64", "timeout": 2400, "weights_pvc": "model-weights"},
@@ -115,7 +117,8 @@ jobs:
           {"suite": "nightly-tpu-perf-kimi-k26", "run_name": "perf-kimi-k26", "timeout": 7200, "weights_pvc": "model-weights"},
           {"suite": "nightly-tpu-perf-gemma4-31b", "run_name": "perf-gemma4-31b", "timeout": 3600, "weights_pvc": "model-weights"},
           {"suite": "nightly-tpu-perf-gemma4-26b-a4b", "run_name": "perf-gemma4-26b-a4b", "timeout": 3600, "weights_pvc": "model-weights"},
-          {"suite": "nightly-tpu-perf-qwen3-5-397b", "run_name": "perf-qwen3-5-397b", "timeout": 3600, "weights_pvc": "model-weights"}]') }}
+          {"suite": "nightly-tpu-perf-qwen3-5-397b", "run_name": "perf-qwen3-5-397b", "timeout": 3600, "weights_pvc": "model-weights"},
+          {"suite": "nightly-tpu-perf-glm-5-3-flash-mtp-mk", "run_name": "perf-glm-5-3-flash-mtp-mk", "timeout": 3600, "weights_pvc": "model-weights"}]') }}
     name: ${{ matrix.entry.suite }}
     uses: ./.github/workflows/_tpu-test.yml
     with:

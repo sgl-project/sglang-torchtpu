@@ -1,7 +1,7 @@
 """PD decode prefix cache with host-RAM offload for sliding-window models.
 
 Upstream keeps the PD decode prefix cache of sliding-window models such as
-GPT-OSS in HBM only. On TPU with raiden HiCache, this module also offloads it
+GPT-OSS in HBM only. On TPU with TPU DMA HiCache, this module also offloads it
 to host RAM:
 
 - Only full-attention KV goes to RAM. Sliding-window (SWA) KV stays on device,
@@ -57,9 +57,11 @@ from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_disagg, get_memory
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode, HiCacheDraftPlan
-from sglang_tpu.raiden_hybrid_cache_controller import (
-    TpuRaidenHybridCacheController,
+from sglang_tpu.tpu_dma_hicache import (
+    is_tpu_dma_hicache_backend,
+    tpu_dma_hicache_backends,
 )
+from sglang_tpu.tpu_dma_hybrid_cache_controller import TpuDMAHybridCacheController
 
 logger = logging.getLogger(__name__)
 
@@ -137,8 +139,9 @@ def _validate_full_only_host_cache_config(
     memory = get_memory()
     requirements = (
         (
-            memory.hicache_io_backend == "raiden",
-            "--hicache-io-backend must be raiden",
+            is_tpu_dma_hicache_backend(memory.hicache_io_backend),
+            "--hicache-io-backend must be one of "
+            + ", ".join(tpu_dma_hicache_backends()),
         ),
         (
             memory.hicache_host_memory_mode == "cache",
@@ -545,13 +548,13 @@ def _commit_hicache_local_restore_to_req(
 
 
 def _gate_decode_restores(cache: Any) -> None:
-    """Register a raiden PD decode prefix cache for the restore hold."""
+    """Register a TPU DMA PD decode prefix cache for the restore hold."""
     disagg = get_disagg()
     if (
         disagg.disaggregation_mode == "decode"
         and disagg.disaggregation_decode_enable_radix_cache
         and isinstance(cache, UnifiedRadixCache)
-        and isinstance(cache.cache_controller, TpuRaidenHybridCacheController)
+        and isinstance(cache.cache_controller, TpuDMAHybridCacheController)
     ):
         _restore_gated_caches.add(cache)
         _load_device_pages[cache.cache_controller] = {}
@@ -559,13 +562,13 @@ def _gate_decode_restores(cache: Any) -> None:
 
 def _controller_load(
     upstream: Callable,
-    controller: TpuRaidenHybridCacheController,
+    controller: TpuDMAHybridCacheController,
     host_indices: torch.Tensor,
     priority: Optional[int] = None,
     node_id: int = -1,
     extra_pools: Optional[list] = None,
 ) -> Optional[torch.Tensor]:
-    """Wraps the raiden controller's ``load``: remember which device pages it fills."""
+    """Wraps the hybrid controller's ``load``: remember which device pages it fills."""
     device_indices = upstream(
         controller,
         host_indices=host_indices,
@@ -686,7 +689,7 @@ def _patch_targets() -> tuple[tuple[Any, str, Callable], ...]:
             _process_hicache_local_restores,
         ),
         # Record the device pages each restore fills, for the hold above.
-        (TpuRaidenHybridCacheController, "load", _controller_load),
+        (TpuDMAHybridCacheController, "load", _controller_load),
     )
 
 

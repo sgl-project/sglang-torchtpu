@@ -365,7 +365,9 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         manager.cuda_vmm_feature_transport = transport
 
         with (
-            patch.object(tokenizer_manager, "wrap_shm_features", lambda obj: obj),
+            patch.object(
+                tokenizer_manager, "wrap_shm_features", lambda obj, *, force=False: obj
+            ),
             self.assertRaisesRegex(RuntimeError, "send failed"),
         ):
             asyncio.run(manager._send_one_request(tokenized_obj))
@@ -403,7 +405,9 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         manager.cuda_vmm_feature_transport = transport
 
         with (
-            patch.object(tokenizer_manager, "wrap_shm_features", lambda obj: obj),
+            patch.object(
+                tokenizer_manager, "wrap_shm_features", lambda obj, *, force=False: obj
+            ),
             self.assertRaisesRegex(RuntimeError, "bookkeeping failed"),
         ):
             asyncio.run(manager._send_one_request(tokenized_obj))

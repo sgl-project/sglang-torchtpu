@@ -290,6 +290,10 @@ class SRTPlatform(DeviceMixin):
         """
         return None
 
+    def get_recompilation_counters(self) -> dict[str, Any]:
+        """Return platform-specific serving-time compilation counters for internal state readback."""
+        return {}
+
     # TODO(yinlin09): needs an upstream seam issue; carry it as a sglang_tpu/hooks/
     # entry until the seam PR merges upstream.
     def prepare_model_parallel_groups(self) -> None:
