@@ -602,6 +602,15 @@ class Platform:
         return vae
 
     @classmethod
+    def drain_device_queue_after_request(cls) -> bool:
+        """Whether every rank drains its device queue when a request finishes.
+
+        For platforms where queued collectives can otherwise reach into the
+        next request, so a host-to-device copy there waits on a peer.
+        """
+        return False
+
+    @classmethod
     def fusion_barrier(cls, x: torch.Tensor) -> torch.Tensor:
         """Pass ``x`` through a point the graph compiler may not fuse across.
 

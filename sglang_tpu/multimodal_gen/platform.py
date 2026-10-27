@@ -170,6 +170,14 @@ class TpuOOTPlatform(TpuPlatform):
         return False
 
     @classmethod
+    def drain_device_queue_after_request(cls) -> bool:
+        # Without it Wan2.2-A14B hangs in its second warmup request: 7 of 8
+        # ranks block in a host-to-device copy behind collectives one rank
+        # never queued (4 of 4 runs, torch_tpu 0.2.0rc4 and 0.2.0). Output
+        # and warm latency are unchanged.
+        return True
+
+    @classmethod
     def fusion_barrier(cls, x: torch.Tensor) -> torch.Tensor:
         # Only a compiled XLA program fuses; in eager the barrier would copy x.
         if x.device.type != "tpu" or not torch.compiler.is_compiling():
