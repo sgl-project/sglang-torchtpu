@@ -141,6 +141,51 @@ def compress_pools(keys: jax.Array, gates: jax.Array, ape: jax.Array) -> jax.Arr
     return _round_bf16(hadamard_rotate(pooled))
 
 
+def _store_closed_pools(
+    raw_cache,
+    pooled_cache,
+    ape,
+    kv_lens,
+    page_indices,
+    cu_q_lens,
+    distribution,
+    *,
+    num_tokens: int,
+    decode_query_size: int,
+    max_query_length: int | None,
+):
+    """Fused pooling with the tightest query bound the batch allows.
+
+    A graph built for verify width W > 1 can also run ragged batches, so the
+    W bound is taken only when every live request has at most W new tokens.
+    """
+
+    def store(cache, bound):
+        return compress_and_store(
+            raw_cache,
+            cache,
+            ape,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            num_tokens,
+            max_query_length=bound,
+        )
+
+    bound = max_query_length or num_tokens
+    if not 1 < decode_query_size < bound:
+        return store(pooled_cache, max_query_length)
+    live = jnp.arange(kv_lens.shape[0]) < distribution[2]
+    fits = jnp.all(~live | (jnp.diff(cu_q_lens) <= decode_query_size))
+    return jax.lax.cond(
+        fits,
+        lambda cache: store(cache, decode_query_size),
+        lambda cache: store(cache, bound),
+        pooled_cache,
+    )
+
+
 def _round_bf16(x: jax.Array) -> jax.Array:
     # XLA's excess-precision pass may drop an f32->bf16->f32 convert pair;
     # reduce_precision is always honored.
@@ -222,7 +267,7 @@ def kpool_indexer_step(
     if fused:
         # Keep the native cache layout through the update. A generic scatter
         # can introduce full-pool layout conversions even for a few new pools.
-        pooled_cache = compress_and_store(
+        pooled_cache = _store_closed_pools(
             raw_cache,
             pooled_cache,
             ape,
@@ -230,7 +275,8 @@ def kpool_indexer_step(
             page_indices,
             cu_q_lens,
             distribution,
-            num_tokens,
+            num_tokens=num_tokens,
+            decode_query_size=decode_query_size,
             max_query_length=max_query_length,
         )
     else:
