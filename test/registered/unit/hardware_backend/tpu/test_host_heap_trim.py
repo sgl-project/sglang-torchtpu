@@ -1,8 +1,10 @@
 """Unit tests for the TPU patch that returns freed host heap pages after warmup."""
 
 import gc
+import importlib.util
 import logging
 import os
+import sys
 import threading
 import unittest
 import weakref
@@ -11,13 +13,14 @@ from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.runtime_context import get_context, get_parallel
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope
 from sglang_tpu import host_heap_trim as tpu
 from sglang_tpu import page_cache
 from sglang_tpu.envs import envs as tpu_envs
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_tpu_ci(est_time=2, suite="stage-a-test-tpu-unit", chips=1)
 
 
 class _Scheduler:
@@ -83,6 +86,9 @@ class TestTrimHostHeap(CustomTestCase):
 
 class TestInstall(CustomTestCase):
     def setUp(self):
+        self.jax = MagicMock()
+        enter_scope(self, patch.dict(sys.modules, {"jax": self.jax}))
+        enter_scope(self, patch.object(tpu, "_release_cpu_backend"))
         directory = enter_scope(self, TemporaryDirectory())
         (Path(directory) / "weights.safetensors").write_bytes(b"payload")
         enter_scope(self, get_context().override_server_args(model_path=directory))
@@ -113,7 +119,7 @@ class TestInstall(CustomTestCase):
             ),
             patch.object(tpu, "trim_host_heap", side_effect=scheduler.calls.append),
             patch.object(
-                tpu.jax,
+                self.jax,
                 "clear_caches",
                 side_effect=lambda: scheduler.calls.append("clear JAX"),
             ),
@@ -158,7 +164,7 @@ class TestInstall(CustomTestCase):
     def test_env_turns_startup_compiler_cleanup_and_trim_off(self):
         with (
             patch.object(tpu, "trim_host_heap") as trim,
-            patch.object(tpu.jax, "clear_caches") as clear_jax,
+            patch.object(self.jax, "clear_caches") as clear_jax,
             patch.object(tpu, "_release_cpu_backend") as release_cpu,
             patch.object(tpu.gc, "collect") as collect,
             tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(False),
@@ -223,9 +229,12 @@ class _Backend:
         self.platform = platform
 
 
+@unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
 class TestCpuBackendRelease(CustomTestCase):
     def setUp(self):
-        self.bridge = tpu.xla_bridge
+        from jax._src import xla_bridge
+
+        self.bridge = xla_bridge
         self.tpu_backend = _Backend("tpu")
         enter_scope(
             self,
@@ -241,9 +250,12 @@ class TestCpuBackendRelease(CustomTestCase):
         enter_scope(
             self,
             patch.object(
-                self.bridge, "_get_backend_uncached", tpu._jax_get_backend_uncached
+                self.bridge,
+                "_get_backend_uncached",
+                self.bridge._get_backend_uncached,
             ),
         )
+        enter_scope(self, patch.object(tpu, "_jax_get_backend_uncached", None))
         enter_scope(self, self.bridge.config.jax_platforms("tpu,cpu"))
         self.init = enter_scope(
             self,

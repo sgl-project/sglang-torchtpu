@@ -29,9 +29,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
-import jax
 import msgspec
-from jax._src import xla_bridge
 from torch.compiler._cache import CacheArtifactManager
 
 from sglang.srt.runtime_context import get_parallel
@@ -47,7 +45,7 @@ _MEMORY_CURRENT = Path("/sys/fs/cgroup/memory.current")
 
 _periodic_thread: Optional[threading.Thread] = None
 _periodic_stop = threading.Event()
-_jax_get_backend_uncached = xla_bridge._get_backend_uncached
+_jax_get_backend_uncached: Optional[Callable] = None
 
 Release = Tuple[str, Callable[[], object]]
 
@@ -167,6 +165,8 @@ def _stop_periodic() -> None:
 
 
 def _get_backend_with_cpu_reinit(platform=None):
+    from jax._src import xla_bridge
+
     # JAX skips backend initialization while any backend remains registered.
     if platform is None or isinstance(platform, str):
         requested = (
@@ -176,6 +176,7 @@ def _get_backend_with_cpu_reinit(platform=None):
             with xla_bridge._backend_lock:
                 if xla_bridge._backends and "cpu" not in xla_bridge._backends:
                     xla_bridge._backends["cpu"] = xla_bridge._init_backend("cpu")
+    assert _jax_get_backend_uncached is not None
     return _jax_get_backend_uncached(platform)
 
 
@@ -186,10 +187,15 @@ def _release_cpu_backend() -> bool:
     arrays or executables keep their clients alive. Preserve CPU when it is the
     default backend, and never initialize a backend just to release it.
     """
+    from jax._src import xla_bridge
+
+    global _jax_get_backend_uncached
     with xla_bridge._backend_lock:
         backend = xla_bridge._backends.get("cpu")
         if backend is None or backend is xla_bridge._default_backend:
             return False
+        if _jax_get_backend_uncached is None:
+            _jax_get_backend_uncached = xla_bridge._get_backend_uncached
         xla_bridge._get_backend_uncached = _get_backend_with_cpu_reinit
         del xla_bridge._backends["cpu"]
         xla_bridge.get_backend.cache_clear()
@@ -199,6 +205,8 @@ def _release_cpu_backend() -> bool:
 def _before_freeze() -> None:
     release_startup_page_cache()
     if tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.get():
+        import jax
+
         CacheArtifactManager.clear()
         # Serving executables are owned by TorchTPU; discard JAX tracing caches.
         jax.clear_caches()

@@ -1,8 +1,8 @@
 """Tests for the TPU block-128/256/512 NVFP4 MoE weight contract.
 
 The assertions are pure torch, but importing `fp4_moe` pulls in the Pallas MoE
-package, which imports JAX and TorchTPU eagerly. Register both lanes and skip
-when either dependency is absent, matching `test_pallas_export.py`.
+package, which imports JAX eagerly. Register both lanes and skip on hosts
+without JAX, matching `test_pallas_export.py`.
 """
 
 import importlib.util
@@ -94,10 +94,7 @@ def _make_block512_layer(
     return layer
 
 
-@unittest.skipUnless(
-    importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
-    "requires JAX and TorchTPU",
-)
+@unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
 class TestNvfp4Block512Contract(CustomTestCase):
     def test_block512_layout_and_cleanup(self):
         from sglang_tpu.fp4_moe import (
@@ -1249,10 +1246,7 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
             self.assertNotIn(name, layer._parameters)
 
 
-@unittest.skipUnless(
-    importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
-    "requires JAX and TorchTPU",
-)
+@unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
 class TestNvfp4FusedRsGateTiming(CustomTestCase):
     """The fused-RS decision must outlive `FusedMoE.__init__`.
 

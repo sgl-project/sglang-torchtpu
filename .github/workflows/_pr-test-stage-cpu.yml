@@ -82,14 +82,14 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.10'
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
       # This stage compiled the workspace too - 7+ minutes per partition on
       # billable hosted minutes. rust-ext-build's modules need an older glibc than
-      # this runner has, which is the safe direction; the artifact includes Python 3.12.
+      # this runner has, which is the safe direction, and both pin Python 3.10.
       - uses: ./.github/actions/download-rust-ext
         id: rust_ext
         with:
@@ -120,8 +120,6 @@ jobs:
         run: |
           uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
           uv pip install --no-deps -e .
-          # Match the JAX APIs used by the TPU tests (python/pyproject_tpu.toml).
-          uv pip install "jax[cpu]==0.10.2"
 
       # Hosted runners are ephemeral, so models are re-fetched every run and the
       # Hub occasionally returns 429s. Persist the HF cache in GitHub's cache
