@@ -23,14 +23,8 @@ from sglang_tpu.hooks.draft_kv_pool import (
 )
 from sglang_tpu.hooks.dsa_kv_pool import size_tpu_dsa_kv_pool
 from sglang_tpu.hooks.dsv4 import (
-    build_tpu_dsv4_kv_pool,
-    forward_tpu_dsv4_compressor,
-    get_tpu_dsv4_bytes_per_full_token,
-    get_tpu_dsv4_bytes_per_swa_token,
-    get_tpu_dsv4_c128_state_fixed_bytes,
-    get_tpu_dsv4_fixed_c4_state_bytes,
+    hook_specs as dsv4_hooks,
     register_tpu_dsv4_resolution_hooks,
-    skip_tpu_dsv4_ape_hotfix,
 )
 from sglang_tpu.hooks.encoder import (
     bootstrap_encoder_worker,
@@ -300,41 +294,6 @@ HOOKS: list[tuple] = [
         HookType.AFTER,
     ),
     (
-        "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._build_dsv4_kv_pool",
-        build_tpu_dsv4_kv_pool,
-        HookType.AROUND,
-    ),
-    (
-        "sglang.srt.model_executor.pool_configurator.DSV4PoolConfigurator._get_bytes_per_swa_token",
-        get_tpu_dsv4_bytes_per_swa_token,
-        HookType.AROUND,
-    ),
-    (
-        "sglang.srt.model_executor.pool_configurator.DSV4PoolConfigurator._get_bytes_per_full_token",
-        get_tpu_dsv4_bytes_per_full_token,
-        HookType.AROUND,
-    ),
-    (
-        "sglang.srt.model_executor.pool_configurator.DSV4PoolConfigurator._get_c128_state_fixed_bytes",
-        get_tpu_dsv4_c128_state_fixed_bytes,
-        HookType.AROUND,
-    ),
-    (
-        "sglang.srt.model_executor.pool_configurator.DSV4PoolConfigurator._fixed_c4_state_bytes",
-        get_tpu_dsv4_fixed_c4_state_bytes,
-        HookType.AROUND,
-    ),
-    (
-        "sglang.srt.layers.attention.dsv4.compressor.Compressor._apply_ape_hotfix",
-        skip_tpu_dsv4_ape_hotfix,
-        HookType.AROUND,
-    ),
-    (
-        "sglang.srt.layers.attention.dsv4.compressor.Compressor.forward_native",
-        forward_tpu_dsv4_compressor,
-        HookType.AROUND,
-    ),
-    (
         "sglang.srt.speculative.dflash_utils.dflash_draft_cell_size_per_token",
         draft_cell_size_per_token,
         HookType.AROUND,
@@ -345,6 +304,8 @@ HOOKS: list[tuple] = [
         HookType.AROUND,
     ),
 ]
+
+HOOKS.extend(dsv4_hooks())
 
 HOOKS.extend(host_padding_hooks())
 

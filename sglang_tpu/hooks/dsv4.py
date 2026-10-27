@@ -32,12 +32,67 @@ skip_tpu_dsv4_ape_hotfix, forward_tpu_dsv4_compressor
   Upstream PR or issue: sgl-project/sglang-torchtpu#1119.
   Remove when: Compressor delegates APE layout and forward_compress dispatch
        through a platform-agnostic CompressorBackendMixin contract.
+
+forward_tpu_dsv4_hash_topk_torch, forward_tpu_dsv4_hash_topk
+  Why: HashTopK._forward_torch gathers router scores with int32 indices, whereas
+       torch_tpu (aten.gather) requires int64 indices, and returns router-dtype
+       weights unless _is_hip or _is_npu. HashTopK.forward defaults to the CUDA
+       JIT hash_topk kernel when SGLANG_OPT_USE_FUSED_HASH_TOPK is enabled and
+       masks padded tokens with in-place dynamic boolean indexing
+       (_mask_topk_ids_padded_region), which breaks torch.compile(fullgraph=True)
+       on TPU and does not zero padded topk_weights.
+  How: AROUND HashTopK._forward_torch casts gather indices to int64 and returns
+       float32 topk_weights. AROUND HashTopK.forward overrides
+       SGLANG_OPT_USE_FUSED_HASH_TOPK to False, runs original with
+       num_token_non_padded=None to bypass in-place boolean indexing, and masks
+       padded topk_ids (-1) and topk_weights (0.0) out-of-place via torch.where.
+  Upstream PR or issue: sgl-project/sglang-torchtpu#1119.
+  Remove when: HashTopK uses int64 gather indices, float32 topk_weights, and
+       static-shape torch.where padded-token masking upstream.
+
+tpu_dsv4_silu_and_mul_clamp
+  Why: sglang.kernels.ops.moe.dsv4.silu_and_mul_clamp dispatches to sgl_kernel
+       on XPU or a CUDA JIT kernel otherwise, which cannot compile or run on TPU.
+  How: AROUND sglang.kernels.ops.moe.dsv4.silu_and_mul_clamp and
+       sglang.srt.models.deepseek_v2.silu_and_mul_clamp computes clamped SwiGLU
+       in float32 PyTorch ops and copies the result into output.
+  Upstream PR or issue: sgl-project/sglang-torchtpu#1119.
+  Remove when: silu_and_mul_clamp is converted to a BaseFusedOp with a
+       forward_native fallback.
+
+tpu_dsv4_current_mhc_post_fusion
+  Why: sglang.srt.layers.moe.mhc_post_fusion.current_mhc_post_fusion reads a
+       ContextVar that causes a Dynamo graph break under torch.compile(fullgraph=True)
+       on TPU, and CUDA/HIP stream-overlap MHC post-fusion is unused on TPU.
+  How: AROUND sglang.srt.layers.moe.mhc_post_fusion.current_mhc_post_fusion
+       returns None when torch.compiler.is_compiling().
+  Upstream PR or issue: sgl-project/sglang-torchtpu#1119.
+  Remove when: current_mhc_post_fusion is marked constant or skipped when
+       compiling without MHC post-fusion enabled.
+
+disable_tpu_dsv4_wo_a_fp8_gemm, get_tpu_dsv4_kernel_num_heads,
+skip_tpu_dsv4_prewarm_mhc_kernels
+  Why: deepseek_v4.wo_a_fp8_gemm_enabled reads module-import-time _FP8_WO_A_GEMM
+       for a DeepGEMM/aiter FP8 absorb GEMM not supported on TPU;
+       MqaAttentionBase._kernel_num_heads pads n_local_heads <= 64 to 64 for
+       CUDA FlashMLA when attn_tp_size > 1, whereas TPU Pallas attention kernels
+       take unpadded n_local_heads; DeepseekV4ForCausalLM._prewarm_mhc_kernels
+       prewarms CUDA TileLang MHC kernels.
+  How: AROUND wo_a_fp8_gemm_enabled (in deepseek_v4 and deepseek_v4_nextn)
+       returns False; AROUND MqaAttentionBase._kernel_num_heads returns
+       attn.n_local_heads; AROUND DeepseekV4ForCausalLM._prewarm_mhc_kernels
+       marks _mhc_prewarmed_at_load = True and returns.
+  Upstream PR or issue: sgl-project/sglang-torchtpu#1119.
+  Remove when: wo_a_fp8_gemm_enabled, _kernel_num_heads, and _prewarm_mhc_kernels
+       query platform capabilities or attention backend properties.
 """
 
 from __future__ import annotations
 
 from typing import Any
 from unittest.mock import patch
+
+import torch
 
 
 def build_tpu_dsv4_kv_pool(original, kvc, *args, **kwargs):
@@ -124,6 +179,110 @@ def forward_tpu_dsv4_compressor(
     return backend.forward_compress(compressor, x, forward_batch)
 
 
+def forward_tpu_dsv4_hash_topk_torch(
+    original, topk_layer, router_logits: torch.Tensor, input_ids: torch.Tensor
+):
+    if topk_layer.num_fused_shared_experts == 1:
+        topk_weights, topk_ids = original(topk_layer, router_logits, input_ids)
+        return topk_weights.to(torch.float32), topk_ids
+    from sglang.srt.layers.moe.topk import _RENORMALIZE_SUM_EPSILON
+
+    if topk_layer.score_func == "softmax":
+        scores = router_logits.softmax(dim=-1)
+    elif topk_layer.score_func == "sigmoid":
+        scores = router_logits.sigmoid()
+    else:
+        scores = torch.nn.functional.softplus(router_logits).sqrt()
+    topk_ids = topk_layer.tid2eid[input_ids].to(torch.int32)
+    topk_weights = scores.gather(1, topk_ids.to(torch.int64))
+    if topk_layer.score_func != "softmax":
+        topk_weights = topk_weights / (
+            topk_weights.sum(dim=-1, keepdim=True) + _RENORMALIZE_SUM_EPSILON
+        )
+    return topk_weights.to(torch.float32), topk_ids
+
+
+def forward_tpu_dsv4_hash_topk(
+    original,
+    topk_layer,
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    num_token_non_padded: torch.Tensor | None = None,
+    expert_location_dispatch_info: Any = None,
+):
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
+        with envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False):
+            topk_output = original(
+                topk_layer,
+                hidden_states,
+                router_logits,
+                input_ids,
+                None,
+                expert_location_dispatch_info,
+            )
+    else:
+        topk_output = original(
+            topk_layer,
+            hidden_states,
+            router_logits,
+            input_ids,
+            None,
+            expert_location_dispatch_info,
+        )
+    if num_token_non_padded is not None:
+        topk_ids = topk_output.topk_ids
+        topk_weights = topk_output.topk_weights
+        valid = (
+            torch.arange(topk_ids.shape[0], device=topk_ids.device).unsqueeze(1)
+            < num_token_non_padded
+        )
+        topk_ids = torch.where(valid, topk_ids, torch.full_like(topk_ids, -1))
+        topk_weights = torch.where(
+            valid, topk_weights, torch.zeros_like(topk_weights)
+        )
+        topk_output = topk_output._replace(
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        )
+    return topk_output
+
+
+def tpu_dsv4_silu_and_mul_clamp(
+    original, input: torch.Tensor, output: torch.Tensor, swiglu_limit: float
+) -> None:
+    del original
+    limit = float(swiglu_limit)
+    gate, up = input.float().chunk(2, dim=-1)
+    res = torch.nn.functional.silu(gate.clamp(max=limit)) * up.clamp(
+        min=-limit, max=limit
+    )
+    output.copy_(res.to(output.dtype))
+
+
+def tpu_dsv4_current_mhc_post_fusion(original):
+    if torch.compiler.is_compiling():
+        return None
+    return original()
+
+
+def disable_tpu_dsv4_wo_a_fp8_gemm(original, quant_config) -> bool:
+    del original, quant_config
+    return False
+
+
+def get_tpu_dsv4_kernel_num_heads(original, attn, num_tokens: int) -> int:
+    del original, num_tokens
+    return attn.n_local_heads
+
+
+def skip_tpu_dsv4_prewarm_mhc_kernels(original, model) -> None:
+    del original
+    model._mhc_prewarmed_at_load = True
+
+
 def _tpu_deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     """Declare TPU DeepSeek-V4 ServerArgs defaults via register_model_override."""
     del hf_config
@@ -190,6 +349,8 @@ def hook_specs():
     kvc = "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator"
     cfg = "sglang.srt.model_executor.pool_configurator.DSV4PoolConfigurator"
     comp = "sglang.srt.layers.attention.dsv4.compressor.Compressor"
+    htk = "sglang.srt.layers.moe.hash_topk.HashTopK"
+    dsv4 = "sglang.srt.models.deepseek_v4"
     return [
         (
             f"{kvc}._build_dsv4_kv_pool",
@@ -224,6 +385,51 @@ def hook_specs():
         (
             f"{comp}.forward_native",
             forward_tpu_dsv4_compressor,
+            HookType.AROUND,
+        ),
+        (
+            f"{htk}._forward_torch",
+            forward_tpu_dsv4_hash_topk_torch,
+            HookType.AROUND,
+        ),
+        (
+            f"{htk}.forward",
+            forward_tpu_dsv4_hash_topk,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.kernels.ops.moe.dsv4.silu_and_mul_clamp",
+            tpu_dsv4_silu_and_mul_clamp,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.models.deepseek_v2.silu_and_mul_clamp",
+            tpu_dsv4_silu_and_mul_clamp,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.moe.mhc_post_fusion.current_mhc_post_fusion",
+            tpu_dsv4_current_mhc_post_fusion,
+            HookType.AROUND,
+        ),
+        (
+            f"{dsv4}.wo_a_fp8_gemm_enabled",
+            disable_tpu_dsv4_wo_a_fp8_gemm,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.models.deepseek_v4_nextn.wo_a_fp8_gemm_enabled",
+            disable_tpu_dsv4_wo_a_fp8_gemm,
+            HookType.AROUND,
+        ),
+        (
+            f"{dsv4}.MqaAttentionBase._kernel_num_heads",
+            get_tpu_dsv4_kernel_num_heads,
+            HookType.AROUND,
+        ),
+        (
+            f"{dsv4}.DeepseekV4ForCausalLM._prewarm_mhc_kernels",
+            skip_tpu_dsv4_prewarm_mhc_kernels,
             HookType.AROUND,
         ),
     ]

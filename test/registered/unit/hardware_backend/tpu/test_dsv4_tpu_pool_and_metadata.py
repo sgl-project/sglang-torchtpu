@@ -714,6 +714,93 @@ class TestDSV4TPUPatches(CustomTestCase):
             self.assertFalse(envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get())
             self.assertTrue(envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get())
 
+    def test_dsv4_tpu_moe_mhc_and_model_hooks(self):
+        from unittest.mock import patch
+
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.hash_topk import HashTopK
+        from sglang.srt.layers.moe.mhc_post_fusion import (
+            MhcPostFusion,
+            current_mhc_post_fusion,
+            use_mhc_post_fusion,
+        )
+        from sglang_tpu.hooks.dsv4 import (
+            disable_tpu_dsv4_wo_a_fp8_gemm,
+            forward_tpu_dsv4_hash_topk,
+            forward_tpu_dsv4_hash_topk_torch,
+            get_tpu_dsv4_kernel_num_heads,
+            skip_tpu_dsv4_prewarm_mhc_kernels,
+            tpu_dsv4_current_mhc_post_fusion,
+            tpu_dsv4_silu_and_mul_clamp,
+        )
+
+        # 1. HashTopK hooks: int64 gather, float32 weights, out-of-place padded row mask
+        topk = HashTopK(
+            topk=2,
+            num_experts=8,
+            num_fused_shared_experts=0,
+            vocab_size=16,
+            scoring_func="sqrtsoftplus",
+        )
+        hidden = torch.zeros((4, 8), dtype=torch.bfloat16)
+        logits = torch.randn((4, 8), dtype=torch.bfloat16)
+        input_ids = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+        non_padded = torch.tensor([2], dtype=torch.int32)
+
+        with (
+            envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(True),
+            patch.object(
+                HashTopK,
+                "_forward_torch",
+                lambda self, r, i, _orig=HashTopK._forward_torch: forward_tpu_dsv4_hash_topk_torch(
+                    _orig, self, r, i
+                ),
+            ),
+        ):
+            out = forward_tpu_dsv4_hash_topk(
+                HashTopK.forward,
+                topk,
+                hidden,
+                logits,
+                input_ids,
+                num_token_non_padded=non_padded,
+            )
+        self.assertEqual(out.topk_weights.dtype, torch.float32)
+        self.assertEqual(out.topk_ids.dtype, torch.int32)
+        self.assertTrue(torch.all(out.topk_ids[:2] >= 0))
+        self.assertTrue(torch.all(out.topk_ids[2:] == -1))
+        self.assertTrue(torch.all(out.topk_weights[2:] == 0.0))
+
+        # 2. silu_and_mul_clamp hook
+        x_in = torch.tensor([[10.0, -10.0, 20.0, -20.0]], dtype=torch.bfloat16)
+        x_out = torch.empty((1, 2), dtype=torch.bfloat16)
+        tpu_dsv4_silu_and_mul_clamp(None, x_in, x_out, swiglu_limit=7.0)
+        g_ref = torch.tensor([[7.0, -10.0]], dtype=torch.float32)
+        u_ref = torch.tensor([[7.0, -7.0]], dtype=torch.float32)
+        expected = (torch.nn.functional.silu(g_ref) * u_ref).to(torch.bfloat16)
+        torch.testing.assert_close(x_out, expected)
+
+        # 3. current_mhc_post_fusion hook
+        dummy_state = MhcPostFusion(
+            residual=torch.zeros(1), post=None, comb=None, stats_stream=None
+        )
+        with use_mhc_post_fusion(dummy_state):
+            self.assertIs(
+                tpu_dsv4_current_mhc_post_fusion(current_mhc_post_fusion), dummy_state
+            )
+            with patch("torch.compiler.is_compiling", return_value=True):
+                self.assertIsNone(
+                    tpu_dsv4_current_mhc_post_fusion(current_mhc_post_fusion)
+                )
+
+        # 4. deepseek_v4 model hooks
+        self.assertFalse(disable_tpu_dsv4_wo_a_fp8_gemm(None, object()))
+        attn_stub = SimpleNamespace(n_local_heads=16, attn_tp_size=8, n_heads=128)
+        self.assertEqual(get_tpu_dsv4_kernel_num_heads(None, attn_stub, 4), 16)
+        model_stub = SimpleNamespace(_mhc_prewarmed_at_load=False)
+        skip_tpu_dsv4_prewarm_mhc_kernels(None, model_stub)
+        self.assertTrue(model_stub._mhc_prewarmed_at_load)
+
 
 if __name__ == "__main__":
     unittest.main()
