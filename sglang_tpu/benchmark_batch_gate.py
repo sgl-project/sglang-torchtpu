@@ -53,12 +53,16 @@ class BenchmarkBatchGate:
             )
 
     def ready(self, reqs):
-        return len(reqs) == self.size and {r.rid for r in reqs} == self.requests.keys()
+        return (
+            len(reqs) == self.size
+            and {r.rid for r in reqs} == self.requests.keys()
+            and all(len(r.output_ids) == 1 for r in reqs)
+        )
 
     def begin(self, reqs, now):
         if not self.requests or self.start is not None:
             return
-        if not self.ready(reqs) or any(len(r.output_ids) != 1 for r in reqs):
+        if not self.ready(reqs):
             raise RuntimeError("First decode must contain the full prefilled batch")
         self.start = now
 
@@ -157,47 +161,35 @@ def install():
             state.add(req, time.perf_counter())
         return original_add(self, req, is_retracted)
 
-    def plan_with_decode_gate(self, planner, *args):
-        state = gate(self)
-        state.check(time.perf_counter())
-        state.held_batch = None
-        plan = planner(self, *args)
-        if state.held_batch is not None:
-            plan.running_batch = state.held_batch
+    def wrap_planner(planner, *, unified=False):
+        def plan(self, running_batch, *args):
+            state = gate(self)
+            state.check(time.perf_counter())
+            if not state.requests:
+                return planner(self, running_batch, *args)
+            if unified and len(state.requests) != size:
+                return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
+            if unified:
+                # Preserve chunked prefill without mixing held decode requests.
+                mixed = self.is_mixed_chunk
+                self.is_mixed_chunk = False
             state.held_batch = None
+            try:
+                # P/D processes prebuilt results and emits first tokens here.
+                result = planner(self, running_batch, *args)
+            finally:
+                if unified:
+                    self.is_mixed_chunk = mixed
+            if state.held_batch is not None:
+                result.running_batch = state.held_batch
+                state.held_batch = None
+            return result
+
         return plan
-
-    def pd_batch(self, running_batch):
-        # Keep prebuilt processing/first-token emission ahead of the decode gate.
-        return plan_with_decode_gate(self, original_pd, running_batch)
-
-    def unified_batch(self, running_batch, last_batch):
-        state = gate(self)
-        state.check(time.perf_counter())
-        if not state.requests:
-            return original_unified(self, running_batch, last_batch)
-        if len(state.requests) != size:
-            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
-        # Keep the existing chunked-prefill planner, with decode mixing disabled.
-        mixed = self.is_mixed_chunk
-        self.is_mixed_chunk = False
-        try:
-            return plan_with_decode_gate(
-                self, original_unified, running_batch, last_batch
-            )
-        finally:
-            self.is_mixed_chunk = mixed
 
     def update_running_batch(self, batch):
         state = gate(self)
-        if (
-            state.requests
-            and state.start is None
-            and (
-                not state.ready(batch.reqs)
-                or any(len(req.output_ids) != 1 for req in batch.reqs)
-            )
-        ):
+        if state.requests and state.start is None and not state.ready(batch.reqs):
             # Hold before prepare_for_decode allocates KV and advances positions.
             # Let the planner see an empty batch, then restore the live batch.
             state.held_batch = batch
@@ -219,8 +211,10 @@ def install():
         return result
 
     Scheduler._add_request_to_queue = add
-    SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run = pd_batch
-    Scheduler.get_next_batch_to_run = unified_batch
+    SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run = (
+        wrap_planner(original_pd)
+    )
+    Scheduler.get_next_batch_to_run = wrap_planner(original_unified, unified=True)
     Scheduler.update_running_batch = update_running_batch
     Scheduler.run_batch = run_batch
     Scheduler.get_internal_state = internal_state
