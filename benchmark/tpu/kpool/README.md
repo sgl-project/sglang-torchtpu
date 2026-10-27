@@ -2,7 +2,8 @@
 
 Compare the standalone fused K4/D128 kernel with the frozen JAX reference.
 The GLM-5.3-Flash pooled indexer uses this kernel by default for K=4, D=128,
-128-token pages, and BF16 raw data. Other shapes keep the generic JAX path.
+page sizes that are a multiple of 16, and BF16 raw data. Other shapes keep the
+generic JAX path and log a warning.
 The exact-byte gate below checks both updated records and untouched cache bytes.
 The final kernel at `3f37bebe2f` passed all 414 cases on TPU, plus 31 selected
 cases using the default conservative query bound, with the versions below.

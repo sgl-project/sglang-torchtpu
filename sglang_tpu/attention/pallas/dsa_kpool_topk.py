@@ -254,17 +254,6 @@ def kpool_indexer_step(
         and supports_page_size(page_size)
         and raw_cache.dtype == jnp.bfloat16
     )
-    if not fused:
-        # Logged at trace time, once per compiled shape.
-        logger.warning(
-            "kpool indexer: kpool=%d, head_dim=%d, page_size=%d, raw dtype=%s has "
-            "no fused pooling kernel; using the generic scatter, which can copy "
-            "the whole pooled cache per step.",
-            kpool,
-            d,
-            page_size,
-            raw_cache.dtype,
-        )
     if fused:
         # Keep the native cache layout through the update. A generic scatter
         # can introduce full-pool layout conversions even for a few new pools.
@@ -281,6 +270,16 @@ def kpool_indexer_step(
             max_query_length=max_query_length,
         )
     else:
+        # Logged at trace time, once per compiled shape.
+        logger.warning(
+            "kpool indexer: kpool=%d, head_dim=%d, page_size=%d, raw dtype=%s has "
+            "no fused pooling kernel; using the generic scatter, which can copy "
+            "the whole pooled cache per step.",
+            kpool,
+            d,
+            page_size,
+            raw_cache.dtype,
+        )
         closing = valid & (pos % kpool == kpool - 1)
         first = pos - (kpool - 1)
         member = first[:, None] + jnp.arange(kpool, dtype=jnp.int32)[None, :]
