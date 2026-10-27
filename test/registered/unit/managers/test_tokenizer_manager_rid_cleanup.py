@@ -1023,7 +1023,7 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
 
     @patch(
         "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
-        side_effect=lambda obj: obj,
+        side_effect=lambda obj, *, force=False: obj,
     )
     def test_cancel_after_dispatch_sends_abort_and_keeps_state(self, _wrap_shm):
         tm = _make_tm_for_generate(self)
@@ -1125,7 +1125,7 @@ class TestAbortBeforeDispatchIsResent(CustomTestCase):
 
     @patch(
         "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
-        side_effect=lambda obj: obj,
+        side_effect=lambda obj, *, force=False: obj,
     )
     def test_abort_during_tokenization_follows_the_request(self, _wrap_shm):
         tm = _make_tm_for_generate(self)

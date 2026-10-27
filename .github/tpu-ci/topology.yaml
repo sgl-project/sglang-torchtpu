@@ -1,24 +1,18 @@
-# The slice for a given (lane, host count). A suite or launch group declares only a lane and
-# a host count; topology, pool and queue are looked up here.
+# CI slice shapes. A CI node pool is any pool whose nodes carry a ci-tpu-pool label (unique
+# per pool); its shape is its cloud.google.com/gke-tpu-topology label. Every lane may run on
+# every pool of a shape: reconcile_quota.py gives each lane one ClusterQueue per shape, all
+# in the shape's Kueue cohort, and splits the shape's live slices between them.
 #
-#   topology : cloud.google.com/gke-tpu-topology node label
-#   pools    : ci-tpu-pool node labels -- one pool per multi-host slice. A list because a
-#              (lane, hosts) can own several interchangeable slices; Kueue picks one via its
-#              ResourceFlavor, and the pod's nodeAffinity restricts it to this set, which is
-#              what keeps CI off the dev pools when Kueue is not managing the JobSet.
-#              A FLOOR, not the whole truth: discover_pools.py unions this with every pool
-#              labelled ci-tpu-lane=<lane> of the same slice shape, so a new slice needs no
-#              edit here. Label a new pool with BOTH ci-tpu-pool (unique) and ci-tpu-lane.
-#              Listing a pool that no longer exists is harmless; omitting a live one that
-#              lacks ci-tpu-lane is not, which is why this stays a floor rather than a cache.
-#   queue    : Kueue LocalQueue in tpu-ci (kueue-tpu.yaml). One per (lane, hosts): a 2-host
-#              job's 8 chips would satisfy a single-host flavor's quota while being
-#              unschedulable, so the shapes must not share a ClusterQueue.
-lanes:
-  pr-gate:
-    1: { topology: 2x2x1, pools: [pr-gate],             queue: tpu-prgate-1h }   # 2 nodes = 2 slices
-    2: { topology: 2x2x2, pools: [pr-gate-2h],          queue: tpu-prgate-2h }   # 1 slice = 2 hosts
-  nightly:
-    1: { topology: 2x2x1, pools: [nightly-1h],          queue: tpu-nightly-1h }  # 3 nodes = 3 slices
-    2: { topology: 2x2x2, pools: [nightly, nightly-b],  queue: tpu-nightly-2h }  # 2 slices x 2 hosts
-    4: { topology: 2x2x4, pools: [nightly-4h],          queue: tpu-nightly-4h }  # 1 slice = 4 hosts
+#   lanes     : one queue per lane and shape, tpu-<lane without dashes>-<hosts>h.
+#   priority  : holds every slice no lane reserves, gets freed slices first, and lends them
+#               to the other lanes while idle. Running jobs are never preempted.
+#   shapes    : topology -> hosts per slice, and min_hosts per lane: hosts that lane always
+#               keeps and never lends. A whole number of slices.
+#
+# A new pool of a listed shape needs no edit here (label it ci-tpu-pool=<unique name>); a
+# new shape is one line under `shapes`.
+lanes: [pr-gate, nightly]
+priority: nightly
+shapes:
+  2x2x1: { hosts: 1, min_hosts: { pr-gate: 5 } }
+  2x2x2: { hosts: 2 }

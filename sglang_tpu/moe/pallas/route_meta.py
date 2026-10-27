@@ -17,13 +17,13 @@ from jax.experimental.pallas import tpu as pltpu
 def _route_meta_kernel(
     ids_ref,
     w_ref,
+    offset_ref,
     ws_ref,
     gs_ref,
     cur_ref,
     *,
     k: int,
     n: int,
-    offset: int,
     num_experts: int,
 ) -> None:
     def zero_rows(r, carry):
@@ -36,6 +36,7 @@ def _route_meta_kernel(
 
     lax.fori_loop(0, n, zero_rows, 0)
     lax.fori_loop(0, num_experts, zero_groups, 0)
+    offset = offset_ref[0]
 
     def local_id(i):
         e = ids_ref[0, i] - offset
@@ -73,13 +74,13 @@ def _route_meta_kernel(
     lax.fori_loop(0, k, place, 0, unroll=True)
 
 
-@functools.partial(jax.jit, static_argnames=("n", "offset", "num_experts"))
+@functools.partial(jax.jit, static_argnames=("n", "num_experts"))
 def single_token_route_meta(
     topk_ids: jax.Array,
     topk_weights: jax.Array,
     *,
     n: int,
-    offset: int,
+    offset: int | jax.Array,
     num_experts: int,
 ) -> tuple[jax.Array, jax.Array]:
     """Expert-major metadata for the routed rows of one token.
@@ -92,16 +93,15 @@ def single_token_route_meta(
     """
     k = topk_ids.shape[1]
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
+    offset_arr = jnp.asarray(offset, dtype=jnp.int32).reshape(1)
     return pl.pallas_call(
-        functools.partial(
-            _route_meta_kernel, k=k, n=n, offset=offset, num_experts=num_experts
-        ),
+        functools.partial(_route_meta_kernel, k=k, n=n, num_experts=num_experts),
         out_shape=(
             jax.ShapeDtypeStruct((n,), jnp.float32),
             jax.ShapeDtypeStruct((num_experts,), jnp.int32),
         ),
-        in_specs=[smem, smem],
+        in_specs=[smem, smem, smem],
         out_specs=(smem, smem),
         scratch_shapes=[pltpu.SMEM((num_experts,), jnp.int32)],
         name=f"moe_route_meta_{k}_{n}_{num_experts}",
-    )(topk_ids.astype(jnp.int32), topk_weights.astype(jnp.float32))
+    )(topk_ids.astype(jnp.int32), topk_weights.astype(jnp.float32), offset_arr)

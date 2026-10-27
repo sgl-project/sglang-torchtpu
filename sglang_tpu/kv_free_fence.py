@@ -3,7 +3,7 @@
 Under overlap scheduling, the scheduler processes result N-1 while forward N
 still runs. A request that finished at N-1 is still in forward N's batch, so
 its last pages are freed while forward N is still writing them. DMAs such as
-raiden's H2D loads and KV arriving on a PD decode server are not ordered
+HiCache engine H2D loads and KV arriving on a PD decode server are not ordered
 against device compute, so a DMA into one of those pages can land before
 forward N's write and be overwritten.
 
@@ -275,18 +275,16 @@ class _DeferredDmaEvent:
 
 
 def fence_hicache_backups(controller, fence: KVFreeFence) -> None:
-    """Defer the tree's raiden HiCache backups behind in-flight forwards. Only
+    """Defer the tree's HiCache engine backups behind in-flight forwards. Only
     the tree's controller backs up pages a running forward can still write;
     other controllers (e.g. the decode offload manager's) read finished KV and
     stay unfenced. ``controller`` is None when the tree has no HiCache
     controller (external linker)."""
-    from sglang.srt.hardware_backend.tpu.raiden_hybrid_cache_controller import (
-        TpuRaidenHybridCacheController,
-    )
+    from sglang_tpu.tpu_dma_hybrid_cache_controller import TpuDMAHybridCacheController
 
     if controller is None:
         return
-    assert isinstance(controller, TpuRaidenHybridCacheController), type(
+    assert isinstance(controller, TpuDMAHybridCacheController), type(
         controller
     ).__name__
     controller.kv_free_fence = fence

@@ -27,8 +27,9 @@ class SpecState(NamedTuple):
       seq_lens: [pbs] committed prefix length n; r sits at position n. 0 on padded rows.
       req_pool_indices: [pbs] handle to the per-request KV. 0 (reserved) on padded rows.
       draft_carry: Draft conditioning not held in a KV cache, as a NamedTuple of
-        row-aligned [pbs, ...] tensors, e.g. EAGLE3's first draft token and draft
-        hidden state. None when the draft context lives in draft KV (DSpark).
+        row-aligned [pbs, ...] tensors or absent fields, e.g. EAGLE3's first
+        draft token and draft hidden state. None when the draft context lives
+        in draft KV (DSpark).
     """
 
     bonus_tokens: torch.Tensor
@@ -53,7 +54,11 @@ class CommitResult(NamedTuple):
 def map_carry(carry: Any, fn: Callable[[torch.Tensor], torch.Tensor]) -> Any:
     """Apply fn to every row-aligned tensor of a draft_carry NamedTuple."""
     # A list, not a generator: Dynamo cannot reconstruct a generator in pad_state_rows.
-    return None if carry is None else carry._make([fn(t) for t in carry])
+    return (
+        None
+        if carry is None
+        else carry._make([fn(t) if t is not None else None for t in carry])
+    )
 
 
 class BucketState(NamedTuple):
@@ -184,8 +189,8 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
     """Addressing for one verify step; the scheduler's plan already padded it to the bucket.
 
     Attributes:
-      verify_cache_candidates: [pbs, 2 * (N + 1)] device int64 KV slots of
-        [base, base + 2 * (N + 1)); the verify rows are picked without a D2H sync.
+      verify_cache_candidates: [pbs, 2 * capacity] device int64 KV slots of
+        [base, base + 2 * capacity); active verify rows are picked without a D2H sync.
       committed_lens: [pbs] device int64 committed base.
       req_pool_indices: [pbs] device pool rows. 0 (reserved) marks padded rows
         in all three device fields.
@@ -222,6 +227,9 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
                 "TpuSpecWorker needs the verify window (overlap schedule, "
                 "host-resident req_to_token, no grammar/logprob/LoRA)."
             )
+        verify_window_rows = candidates.shape[1] // 2
+        if not 0 < num_verify_rows <= verify_window_rows:
+            raise ValueError("Active verification width exceeds the reserved KV window")
         req_pool_indices_cpu = batch.req_pool_indices_cpu
         seq_lens_cpu = batch.seq_lens_cpu
         if not isinstance(req_pool_indices_cpu, torch.Tensor) or not isinstance(
@@ -234,8 +242,10 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
         assert seq_lens_cpu.device.type == "cpu", seq_lens_cpu.device
         assert req_pool_indices.device.type == "cpu", req_pool_indices.device
         # With the window the host mirror holds the committed base, one unread
-        # commit (<= N + 1 tokens) behind the device length. The plan stays on
-        # host until the forward fixes its bucket; 0 is the reserved row and slot.
+        # commit behind the device length. Its bound is the reserved capacity,
+        # since an adaptive worker may have just switched to a shorter step.
+        # The plan stays on host until the forward fixes its bucket;
+        # 0 is the reserved row and slot.
         return cls(
             verify_cache_candidates=padded_h2d(candidates, padded_bs, batch.device),
             committed_lens=padded_h2d(committed_lens, padded_bs, batch.device),
@@ -243,14 +253,14 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
             req_pool_indices_cpu=pad_rows(req_pool_indices_cpu, padded_bs),
             seq_lens_cpu=seq_lens_cpu,
             host_len_slack=(
-                num_verify_rows if draft_input.tpu_host_seq_lens_is_committed else 0
+                verify_window_rows if draft_input.tpu_host_seq_lens_is_committed else 0
             ),
             future_indices=draft_input.future_indices,
         )
 
     @classmethod
     def idle(
-        cls, *, num_verify_rows: int, padded_bs: int, device: str
+        cls, *, verify_window_rows: int, padded_bs: int, device: str
     ) -> TpuSpecVerifyInput:
         """All-padding addressing for a DP-attention rank with no requests.
 
@@ -259,7 +269,7 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
         zeros = torch.zeros((padded_bs,), dtype=torch.int64)
         return cls(
             verify_cache_candidates=torch.zeros(
-                (padded_bs, 2 * num_verify_rows), dtype=torch.int64
+                (padded_bs, 2 * verify_window_rows), dtype=torch.int64
             ).to(device, non_blocking=True),
             committed_lens=zeros.to(device, non_blocking=True),
             req_pool_indices=zeros.to(device, non_blocking=True),

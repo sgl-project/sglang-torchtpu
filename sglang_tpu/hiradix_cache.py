@@ -46,11 +46,6 @@ from sglang.srt.mem_cache.memory_pool import (
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
 )
-
-# Upstream relocated MHATokenToKVPoolHost/MLATokenToKVPoolHost into the
-# mem_cache.pool_host package; TpuFusedMHATokenToKVPoolHost is the fork's own
-# class and still lives in memory_pool_host.
-from sglang.srt.mem_cache.memory_pool_host import TpuFusedMHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import (
@@ -74,6 +69,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_serving,
 )
+from sglang_tpu.kv_pool_host import TpuFusedMHATokenToKVPoolHost
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams

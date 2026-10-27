@@ -95,6 +95,7 @@ class ExpertParamStager:
     def flush_all(self) -> None:
         for param, _ in list(self._staged.values()):
             self.flush(param)
+        self._pool.clear()
 
 
 def get_expert_stager() -> ExpertParamStager | None:

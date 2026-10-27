@@ -19,7 +19,6 @@ from sglang_tpu.allocator_tpu import (
     TpuPagedTokenToKVPoolAllocator,
     host_return_allocators,
 )
-from sglang_tpu.envs import envs
 from sglang_tpu.kv_free_fence import install_kv_free_fence
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 
@@ -336,7 +335,6 @@ class TestHostExtendAllocation(CustomTestCase):
         page_size, size = 4, 32
         with (
             get_context().override_server_args(enable_torch_compile=True),
-            envs.SGLANG_TPU_HOST_PADDING.override(True),
             patch.object(swa, "_is_tpu", True),
             patch.object(swa, "current_platform", TpuSRTPlatform()),
             patch.object(

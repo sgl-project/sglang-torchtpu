@@ -9,7 +9,11 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import (
+    get_server_args,
+    get_spec,
+    max_speculative_num_draft_tokens,
+)
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import allocate_and_assign_decode_cache
 from sglang_tpu.dflash_utils_tpu import gather_dflash_candidate_window
@@ -54,10 +58,12 @@ class HostPaddedDraftInput(SpecInput):
             raise RuntimeError("TpuSpecWorker needs a host-resident req_to_token pool.")
         batch.maybe_evict_swa()
 
-        num_verify_rows = int(get_spec().speculative_num_draft_tokens)
+        # The previous, not-yet-copied commit may be wider than the next step.
+        # Reserve both windows at capacity so either adaptive transition fits.
+        verify_window_rows = int(max_speculative_num_draft_tokens())
         cur_kv_lens, nxt_kv_lens, num_needed_tokens = page_aligned_decode_alloc_lens(
             batch.reqs,
-            reserve=2 * num_verify_rows,
+            reserve=2 * verify_window_rows,
             page_size=batch.token_to_kv_pool_allocator.page_size,
         )
         nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32)
@@ -89,7 +95,7 @@ class HostPaddedDraftInput(SpecInput):
         self._plan_verify_window(
             batch,
             bs=bs,
-            block_size=num_verify_rows,
+            block_size=verify_window_rows,
             committed_lens_cpu=committed_lens_cpu,
         )
 
@@ -143,11 +149,12 @@ class HostPaddedDraftInput(SpecInput):
         keep_cpu = new_indices_cpu if new_indices_cpu is not None else new_indices.cpu()
         for name in self.RELAYED_FIELDS:
             value = getattr(self, name)
-            setattr(
-                self,
-                name,
-                value[keep_cpu if value.device.type == "cpu" else new_indices],
-            )
+            if value is not None:
+                setattr(
+                    self,
+                    name,
+                    value[keep_cpu if value.device.type == "cpu" else new_indices],
+                )
 
     def merge_batch(self, spec_info, *, future_indices=None):
         assert type(spec_info) is type(self), (type(self), type(spec_info))
@@ -173,9 +180,12 @@ class HostPaddedDraftInput(SpecInput):
             )
             return
         for name in self.RELAYED_FIELDS:
-            setattr(
-                self, name, torch.cat([getattr(self, name), getattr(spec_info, name)])
-            )
+            left, right = getattr(self, name), getattr(spec_info, name)
+            if left is None and right is None:
+                continue
+            if left is None or right is None:
+                raise ValueError(f"Cannot merge missing relay field {name}")
+            setattr(self, name, torch.cat([left, right]))
 
 
 def _verify_window_eligible(batch: ScheduleBatch) -> bool:
@@ -186,7 +196,12 @@ def _verify_window_eligible(batch: ScheduleBatch) -> bool:
         batch.enable_overlap
         and isinstance(batch.req_pool_indices_cpu, torch.Tensor)
         and get_spec().speculative_draft_window_size is None
-        and not batch.return_logprob
+        and (
+            not batch.return_logprob
+            # Use the worker's request capability even for draft inputs built
+            # directly by the PD handoff, before the worker has run a step.
+            or batch.spec_algorithm.create_worker(get_server_args()).supports_logprobs
+        )
         and not batch.has_grammar
         and all(req.lora_id is None for req in batch.reqs)
     )

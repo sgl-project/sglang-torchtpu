@@ -244,6 +244,7 @@ NIGHTLY_SUITES = {
         "nightly-tpu-perf-gemma4-31b",
         "nightly-tpu-perf-gemma4-26b-a4b",
         "nightly-tpu-perf-qwen3-5-397b",
+        "nightly-tpu-perf-glm-5-3-flash-mtp-mk",
         # One suite per quality eval so each gets an independent TPU slice.
         "nightly-tpu-accuracy-gpt-oss-20b",
         "nightly-tpu-accuracy-gemma4-31b-aime",
