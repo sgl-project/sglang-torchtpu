@@ -62,6 +62,26 @@ class TestPallasHelpers(CustomTestCase):
         for n in (1, 33, 64, 65, 130, 257, 1000):
             self.assertGreaterEqual(_bucket_kv_len(n), n)
 
+    def test_vision_flash_block_q_off_keeps_default_blocks(self):
+        from sglang_tpu.attention_pallas import _vision_flash_block_sizes
+
+        self.assertIsNone(_vision_flash_block_sizes(0, 4096, 4096, 4096))
+
+    def test_vision_flash_block_q_keeps_one_k_step(self):
+        from sglang_tpu.attention_pallas import _vision_flash_block_sizes
+
+        blocks = _vision_flash_block_sizes(256, 4096, 4096, 4096)
+        self.assertEqual(blocks.block_q, 256)
+        self.assertEqual(blocks.block_k, 4096)
+        self.assertEqual(blocks.block_k_major, 4096)
+        # q shorter than the tile: the tile shrinks to q.
+        self.assertEqual(_vision_flash_block_sizes(256, 4096, 128, 128).block_q, 128)
+
+    def test_vision_flash_block_q_stops_above_max_seq(self):
+        from sglang_tpu.attention_pallas import _vision_flash_block_sizes
+
+        self.assertIsNone(_vision_flash_block_sizes(256, 4096, 8192, 8192))
+
     def test_maybe_expand_kv_heads(self):
         import torch
 
@@ -210,6 +230,49 @@ class TestFlashKernelNumerics(CustomTestCase):
 
     def test_decode_single_query(self):
         self._check(H=8, Sq=1, Skv=40, D=128, causal=False)
+
+
+@unittest.skipIf(_skip_if_no_tpu(), "torch_tpu not available")
+class TestVisionFlashBlockQNumerics(CustomTestCase):
+    """SGLANG_TPU_VISION_FLASH_BLOCK_Q vs a float32 segment-masked SDPA
+    reference; block_q 256 is bit-exact with the default blocks and larger
+    tiles stay within one bf16 ulp of them."""
+
+    def _vision_flash(self, q, k, v, seg, scale, block_q):
+        from sglang_tpu.attention_pallas import _get_vision_flash_op
+        from sglang_tpu.envs import envs as tpu_envs
+
+        with tpu_envs.SGLANG_TPU_VISION_FLASH_BLOCK_Q.override(block_q):
+            op = _get_vision_flash_op(scale)
+        return op(q.to("tpu"), k.to("tpu"), v.to("tpu"), seg.to("tpu")).to("cpu")
+
+    def test_block_q_is_bit_exact_and_matches_reference(self):
+        import torch
+
+        H, D = 4, 128
+        scale = 1.0 / math.sqrt(D)
+        for lens in ((600, 424), (128,), (1000, 1000, 48)):
+            S = sum(lens)
+            with self.subTest(lens=lens):
+                torch.manual_seed(S)
+                q, k, v = (
+                    torch.randn(1, H, S, D, dtype=torch.bfloat16) for _ in range(3)
+                )
+                seg = torch.cat(
+                    [torch.full((n,), i, dtype=torch.int32) for i, n in enumerate(lens)]
+                )[None]
+                mask = seg[0][:, None] == seg[0][None, :]
+                ref = torch.nn.functional.scaled_dot_product_attention(
+                    q.float(), k.float(), v.float(), attn_mask=mask, scale=scale
+                )
+                default = self._vision_flash(q, k, v, seg, scale, 0)
+                self.assertLess((default.float() - ref).abs().max().item(), 3e-2)
+                tiled = self._vision_flash(q, k, v, seg, scale, 256)
+                self.assertTrue(torch.equal(tiled, default))
+                for block_q in (512, 1024):
+                    tiled = self._vision_flash(q, k, v, seg, scale, block_q)
+                    self.assertLess((tiled.float() - ref).abs().max().item(), 3e-2)
+                    torch.testing.assert_close(tiled, default, atol=1e-3, rtol=8e-3)
 
 
 @unittest.skipIf(_skip_if_no_tpu(), "torch_tpu not available")
