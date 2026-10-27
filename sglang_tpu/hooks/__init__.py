@@ -64,6 +64,9 @@ from sglang_tpu.hooks.moe_topk import (
     biased_topk,
     register_router_topk,
 )
+from sglang_tpu.hooks.padded_logits_sampling import (
+    hook_specs as padded_logits_sampling_hooks,
+)
 from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
     skip_spec_op_precompile_without_draft,
@@ -308,6 +311,8 @@ HOOKS.extend(hicache_swa_metrics_hooks())
 HOOKS.extend(swa_miss_metrics_hooks())
 
 HOOKS.extend(hook_specs())
+
+HOOKS.extend(padded_logits_sampling_hooks())
 
 _registered = False
 
