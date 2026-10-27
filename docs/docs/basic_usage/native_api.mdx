@@ -106,8 +106,8 @@ print_highlight(response.text)
 ```
 
 ## Health Check
-- `/health`: Check the health of the server.
-- `/health_generate`: Check the health of the server by generating one token.
+- `/health`: liveness. Is the server process up and are its scheduler ranks and detokenizer still iterating. Use it for a Kubernetes `livenessProbe` (restart on failure) and `startupProbe` (covers model load, warm-up and compile). With `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=1` (the default) it also runs the one-token probe below.
+- `/health_generate`: readiness. Can the engine serve a request now. It generates one token through the real request path, and on a P/D decode it also reflects the outcome of recent KV transfers: 503 with a JSON reason once transfers keep failing, 200 again on probation. Use it for a Kubernetes `readinessProbe` (removed from the Service on failure, never restarted) and for router health checks.
 
 ```python Example
 url = f"http://localhost:{port}/health_generate"

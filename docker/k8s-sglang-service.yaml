@@ -73,19 +73,28 @@ spec:
             - name: localtime
               mountPath: /etc/localtime
               readOnly: true
+          # Startup covers model load, warm-up and compile; liveness and
+          # readiness are not evaluated until it passes once.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 30000
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 120
+          # Liveness: is the process still iterating. Restarts the container.
           livenessProbe:
             httpGet:
               path: /health
               port: 30000
-            initialDelaySeconds: 120
             periodSeconds: 15
             timeoutSeconds: 10
             failureThreshold: 3
+          # Readiness: can the engine serve. Removes the pod from the Service.
           readinessProbe:
             httpGet:
               path: /health_generate
               port: 30000
-            initialDelaySeconds: 120
             periodSeconds: 15
             timeoutSeconds: 10
             failureThreshold: 3
