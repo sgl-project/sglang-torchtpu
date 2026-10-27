@@ -319,6 +319,9 @@ _SHAPES = [
     ),
     # Kimi-Linear-48B's 32 heads use a different triangular sub-block (8).
     ("kimi_linear_heads", [192, 64], [0, 0], [0, 2, 2], dict(n_v=32)),
+    # GLM-5.3-Flash on one chip: 64 heads. The default 64-token tile does not
+    # fit in VMEM there, so the wrapper halves it to 32 (and the sub-block is 4).
+    ("glm53_flash_tp1_heads", [256], [0], [0, 1, 1], dict(n_v=64)),
 ]
 
 # Kimi-Linear sets no bound; Kimi-K3 sets -5.0.
@@ -397,6 +400,36 @@ class TestGDNAttentionV3KDA(CustomTestCase):
             kernel_size=kernel_size,
             gate_lower_bound=gate_lower_bound,
         )
+
+    def test_mixed_tile_fits_vmem(self):
+        """The 64-token prefill tile is kept where it fits and halved where it
+        does not (GLM-5.3-Flash's KDA heads per chip: 8 at TP8, 32 at TP2, 64
+        at TP1)."""
+        from jax.experimental.pallas import tpu as pltpu
+
+        from sglang_tpu.attention.pallas.gdn import config, tiling
+
+        limit = int(
+            config.GDNConfig.DEFAULT_VMEM_FRACTION
+            * pltpu.get_tpu_info().vmem_capacity_bytes
+        )
+        for n_v, expected in ((8, 64), (32, 64), (64, 32)):
+            with self.subTest(n_v=n_v):
+                tile = tiling.fit_mixed_tile_size(
+                    64,
+                    n_kq=n_v,
+                    n_v=n_v,
+                    d_k=self.D_K,
+                    d_v=self.D_V,
+                    kernel_size=self.KERNEL_SIZE,
+                    conv_state_dim_size=n_v * (2 * self.D_K + self.D_V),
+                    act_out_dtype=jnp.bfloat16,
+                    recurrent_state_dtype=jnp.float32,
+                    num_lanes=pltpu.get_tpu_info().num_lanes,
+                    vmem_limit_bytes=limit,
+                    attention_mode=config.AttentionMode.KDA,
+                )
+                self.assertEqual(tile, expected)
 
     def test_kda_matches_the_recurrence(self):
         from sglang_tpu.attention.pallas.gdn import config

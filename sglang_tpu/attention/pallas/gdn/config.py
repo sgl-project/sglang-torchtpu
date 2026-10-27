@@ -174,12 +174,18 @@ class GDNConfig:
         moves work from MXU to XLU. More value heads already means more
         XLU work, hence the smaller blocks there.
         """
-        # TODO(alynie): create a better heuristic to tune this value.
-        if self.num_v_heads == 64:
-            return 2
-        if self.num_v_heads == 32:
-            return 8
-        return 16
+        # From vllm-torchtpu#1422. KDA tiles Aqk and L into O(1 / B^2) sub-block
+        # matmuls per token, so B^2 scales inversely with the head groups
+        # (head_groups * B**2 <= 16**2). Only the KDA solve reads this; the GDN
+        # solve inverts in fixed INVERT_BLOCK blocks.
+        # On TPU7x at an 8192-token prefill this is 6-15% faster than the old
+        # table at 12, 16 and 64 heads, and the same at 8 and 32. At 64 heads
+        # (GLM-5.3-Flash on one chip) the old B = 2 spilled registers past VMEM.
+        head_groups = pl.cdiv(self.num_v_heads, 8)
+        for b in (16, 8, 4):
+            if head_groups * b * b <= 256:
+                return b
+        return 2
 
     @property
     def use_recurrent(self) -> bool:
@@ -234,9 +240,11 @@ class GDNConfig:
 
     # Fraction of VMEM the kernel may use. A multi-token window holds one
     # state checkpoint per position in VMEM, so for large-head models the
-    # default 0.7 budget is not enough; those get a higher limit and the
-    # wrapper sizes the tile against the same factor.
-    DEFAULT_VMEM_FRACTION = 0.7
+    # default 0.8 budget is not enough; those get a higher limit and the
+    # wrapper sizes the tile against the same factor. 0.8 is upstream's
+    # default: at 0.7, a 32-token prefill tile of 64 KDA heads with f32
+    # activations did not compile.
+    DEFAULT_VMEM_FRACTION = 0.8
     WINDOWED_VMEM_FRACTION = 0.9
 
     def get_vmem_limit_bytes(self) -> int:

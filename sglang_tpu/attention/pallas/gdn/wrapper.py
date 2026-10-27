@@ -16,7 +16,8 @@
 # Source: src/vllm_torchtpu/kernels/gdn/v3/wrapper.py
 # SGLang changes: packed SMEM metadata and packed KDA weights operands, the
 # plain-decode compact path (no f32 copy, no row padding), and the batch
-# padding to lcm(packing, INVERT_BLOCK) with mixed_tile_size capped by it.
+# padding to lcm(packing, INVERT_BLOCK) with mixed_tile_size capped by it and
+# halved until its VMEM estimate fits (tiling.py, from vllm-torchtpu#1999).
 # Synced with vllm-project/vllm-torchtpu#1927 (split state in/out windows).
 
 import dataclasses
@@ -35,6 +36,7 @@ from sglang_tpu.attention.pallas.gdn import (
     config,
     memory_ref,
     metadata,
+    tiling,
     vmem_ldst,
 )
 from sglang_tpu.kda_layout import kda_packed_weights_shape
@@ -604,7 +606,25 @@ def fused_conv1d_gdn(
     batch_align = 1 if decode_only else math.lcm(packing, compute_gdn.INVERT_BLOCK)
     padded_batch_size = pl.cdiv(batch_size, batch_align) * batch_align
     decode_tile_size = min(decode_tile_size, batch_size)
-    mixed_tile_size = min(mixed_tile_size, padded_batch_size)
+    mixed_tile_size = tiling.fit_mixed_tile_size(
+        min(mixed_tile_size, padded_batch_size),
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        conv_state_dim_size=dim if conv_state is None else conv_state.shape[-1],
+        act_out_dtype=act_out_dtype,
+        recurrent_state_dtype=(
+            jnp.float32 if recurrent_state is None else recurrent_state.dtype
+        ),
+        num_lanes=num_lanes,
+        vmem_limit_bytes=int(
+            config.GDNConfig.DEFAULT_VMEM_FRACTION
+            * pltpu.get_tpu_info().vmem_capacity_bytes
+        ),
+        attention_mode=attention_mode,
+    )
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
 
     # Each sequence holds 1 input state slot plus `window` output checkpoint
