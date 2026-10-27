@@ -2,14 +2,14 @@
 
 import unittest
 import weakref
-from contextlib import nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+import torch_tpu  # noqa: F401
 from jax import tree_util
-from torch_tpu._internal.device_utils.annotations import LayoutContext, TpuLayout
 
 from sglang.srt.compilation.compiled_op import compiled_op, warmup_compiled_op
 from sglang.srt.environ import envs
@@ -42,14 +42,14 @@ from sglang_tpu.compilation.warmup_queue import collect_warmups
 
 register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
 
-_COMPILE_RESULT = SimpleNamespace(executable="executable")
 _TPU_AVAILABLE = hasattr(torch, "accelerator") and torch.accelerator.is_available()
+_TRACE_CONTEXT = torch.tpu.compiler.trace_context
 
 
 def _make_artifact(traced_shapes):
     """A minimal single-input artifact reading its tensor from args[0][0]."""
     return direct_compile._CompiledArtifact(
-        executable=object(),
+        executable=MagicMock(return_value=[]),
         model_inputs=(),
         kv_pool=None,
         tensor_inputs_key_paths=((tree_util.SequenceKey(0), tree_util.SequenceKey(0)),),
@@ -57,6 +57,119 @@ def _make_artifact(traced_shapes):
         output_treespec=tree_util.tree_structure(()),
         output_count=0,
     )
+
+
+def _mock(spec):
+    key = (
+        "side_effect"
+        if callable(spec) or isinstance(spec, (list, tuple))
+        else "return_value"
+    )
+    return MagicMock(**{key: spec})
+
+
+class _FakeTraceContext:
+    """CPU test double for ``torch.tpu.compiler.trace_context``.
+
+    ``prepare_inputs`` returns CPU copies of the inputs, and ``compile`` returns
+    ``executable``, a mock ``CompiledCallable`` whose result is ``outputs``.
+    The ``with`` block runs inside a real ``trace_context``, so the traced
+    function sees ``torch.compiler.is_compiling()`` and autograd as in
+    production.
+    """
+
+    def __init__(self, *, outputs=None, export_mlir=None):
+        self.executable = _mock(outputs)
+        self.prepare_inputs = MagicMock(
+            side_effect=lambda inputs, record_layouts=True: [
+                tensor.detach().clone() for tensor in inputs
+            ]
+        )
+        self.export_mlir = (
+            MagicMock(
+                side_effect=lambda *_, portable=False, **__: (
+                    _pruning_mlir_artifact() if portable else ""
+                )
+            )
+            if export_mlir is None
+            else _mock(export_mlir)
+        )
+        self.compile = MagicMock(return_value=self.executable)
+        self._scope = None
+
+    def __call__(self, *, uses_rng=False, device=None):
+        return self
+
+    def __enter__(self):
+        self._scope = _TRACE_CONTEXT()
+        self._scope.__enter__()
+        return self
+
+    def __exit__(self, *exc_info):
+        return self._scope.__exit__(*exc_info)
+
+
+@contextmanager
+def _spy_tpu_trace_context(*, on_call=None):
+    """Spies on the real ``torch.tpu.compiler.trace_context``.
+
+    Yields mocks that record each tensor whose layout ``prepare_inputs`` records
+    (``layout``), each ``export_mlir`` call, and the inputs of each call to a
+    ``CompiledCallable`` returned by ``compile`` or ``compile_async``
+    (``executable``). ``on_call(compiled, inputs)`` runs before each such call.
+    """
+    cls = torch.tpu.compiler.trace_context
+    real_prepare, real_export, real_compile, real_async = (
+        cls.prepare_inputs,
+        cls.export_mlir,
+        cls.compile,
+        cls.compile_async,
+    )
+    export_mlir_spy, executable_spy, layout_spy = MagicMock(), MagicMock(), MagicMock()
+
+    def _prepare_inputs(self, inputs, *, record_layouts=True):
+        if record_layouts:
+            for tensor in inputs:
+                layout_spy(tensor)
+        return real_prepare(self, inputs, record_layouts=record_layouts)
+
+    def _wrap(compiled):
+        def _call(inputs):
+            if on_call is not None:
+                on_call(compiled, inputs)
+            executable_spy(inputs)
+            return compiled(inputs)
+
+        return _call
+
+    def _compile_async(self, *args, **kwargs):
+        fut = real_async(self, *args, **kwargs)
+        orig = fut.result
+        fut.result = lambda timeout=None: _wrap(orig(timeout=timeout))
+        return fut
+
+    with (
+        patch.object(cls, "prepare_inputs", autospec=True, side_effect=_prepare_inputs),
+        patch.object(
+            cls,
+            "export_mlir",
+            autospec=True,
+            side_effect=lambda self, *a, **kw: (
+                export_mlir_spy(*a, **kw),
+                real_export(self, *a, **kw),
+            )[1],
+        ),
+        patch.object(
+            cls,
+            "compile",
+            autospec=True,
+            side_effect=lambda self, *a, **kw: _wrap(real_compile(self, *a, **kw)),
+        ),
+        patch.object(cls, "compile_async", autospec=True, side_effect=_compile_async),
+    ):
+        yield SimpleNamespace(
+            export_mlir=export_mlir_spy, executable=executable_spy, layout=layout_spy
+        )
 
 
 @tree_util.register_dataclass
@@ -411,7 +524,8 @@ class TestDirectCompile(CustomTestCase):
                     specialization_key=lambda value: tuple(value.shape),
                 )
                 artifact = _make_artifact(((2,),))
-                future = MagicMock()
+                executable = artifact.executable
+                future = MagicMock(result=MagicMock(return_value=executable))
                 if asynchronous:
                     artifact.executable = None
                     artifact.pending_compile = future
@@ -424,12 +538,7 @@ class TestDirectCompile(CustomTestCase):
                     self.assertIsNone(graph)
                     return artifact
 
-                with (
-                    patch.object(compiled, "_compile", compile_helper),
-                    patch.object(
-                        direct_compile.tpu_torch_compile, "execute"
-                    ) as execute,
-                ):
+                with patch.object(compiled, "_compile", compile_helper):
                     inputs = torch.ones(2)
                     reference = weakref.ref(inputs)
                     with collect_warmups() as queue:
@@ -438,10 +547,10 @@ class TestDirectCompile(CustomTestCase):
                         )
                         del inputs
                         self.assertIsNone(reference())
-                        future.get.assert_not_called()
+                        future.result.assert_not_called()
                     self.assertIsNone(artifact.pending_compile)
-                    self.assertEqual(future.get.call_count, int(asynchronous))
-                    execute.assert_not_called()
+                    self.assertEqual(future.result.call_count, int(asynchronous))
+                    executable.assert_not_called()
 
     def test_async_precompile_keeps_keyword_order(self):
         """Serving calls must find the graph warmed with the same keywords."""
@@ -455,14 +564,10 @@ class TestDirectCompile(CustomTestCase):
             orders.append(list(kwargs))
             return MagicMock()
 
+        trace_ctx = _FakeTraceContext()
         with (
             patch.object(direct_compile, "_is_tpu_tensor", return_value=True),
-            patch.object(direct_compile, "synchronize"),
-            patch.object(
-                direct_compile.tpu_torch_compile,
-                "placeholder_like",
-                side_effect=lambda value: value,
-            ),
+            patch.object(torch.tpu.compiler, "trace_context", trace_ctx),
             patch.object(compiled, "_get_artifact", get_artifact),
         ):
             compiled.precompile(
@@ -470,6 +575,9 @@ class TestDirectCompile(CustomTestCase):
             )
 
         self.assertEqual(orders, [["b", "a"]])
+        self.assertEqual(
+            trace_ctx.prepare_inputs.call_args.kwargs, {"record_layouts": False}
+        )
 
     def test_compiled_helper_inlines_inside_outer_dynamo_graph(self):
         @compiled_op()
@@ -631,13 +739,13 @@ class TestDirectCompile(CustomTestCase):
             kv_pool=pool,
         )
         values = [torch.full((bs, 2), float(bs), device="tpu") for bs in (1, 2, 4)]
-        compiler = direct_compile.tpu_torch_compile
         with (
             torch.no_grad(),
-            patch.object(compiler, "execute", wraps=compiler.execute) as execute,
+            _spy_tpu_trace_context() as spy,
         ):
+            executable = spy.executable
             pending = [compiled.warmup_async(value) for value in values]
-            execute.assert_not_called()
+            executable.assert_not_called()
             self.assertEqual(len(compiled.cache), 3)
             self.assertEqual(callbacks, [])
             self.assertIs(pool.value, original_pool)
@@ -658,7 +766,7 @@ class TestDirectCompile(CustomTestCase):
                 torch.equal(compiled(replacement).cpu(), torch.full((2, 2), 10.0))
             )
             self.assertEqual(len(compiled.cache), 3)
-            self.assertEqual(execute.call_count, 4)
+            self.assertEqual(executable.call_count, 4)
             self.assertEqual(len(callbacks), 4)
             self.assertTrue(torch.equal(pool.value.cpu(), expected_pool + 14))
             self.assertTrue(
@@ -722,20 +830,11 @@ class TestDirectCompile(CustomTestCase):
                 ):
                     op = compiled_op(uses_rng=True)(draw)
                     before = torch.tpu.get_rng_state()
-                    compiler = direct_compile.tpu_torch_compile
-                    with (
-                        patch.object(
-                            compiler, "execute", wraps=compiler.execute
-                        ) as execute,
-                        patch.object(
-                            compiler,
-                            "get_device_layout_if_materialized",
-                            wraps=compiler.get_device_layout_if_materialized,
-                        ) as layout,
-                    ):
+                    with _spy_tpu_trace_context() as spy:
+                        executable, layout = spy.executable, spy.layout
                         with collect_warmups():
                             warmup_compiled_op(op, value)
-                        execute.assert_not_called()
+                        executable.assert_not_called()
                         if asynchronous:
                             self.assertTrue(layout.called)
                             self.assertTrue(
@@ -811,39 +910,40 @@ class TestDirectCompile(CustomTestCase):
 
     def test_native_async_failure_propagates_before_execution(self):
         artifact = _make_artifact(((2,),))
+        executable = artifact.executable
         artifact.pending_compile = MagicMock()
-        artifact.pending_compile.get.side_effect = RuntimeError("native compile failed")
-        with patch.object(direct_compile.tpu_torch_compile, "execute") as execute:
-            complete = MagicMock()
-            with self.assertRaisesRegex(RuntimeError, "native compile failed"):
-                with collect_warmups() as queue:
-                    queue.calls.append(PendingCall(artifact.wait_for_compile))
-                    queue.completions.append(complete)
-            complete.assert_not_called()
-            with self.assertRaisesRegex(RuntimeError, "native compile failed"):
-                artifact(((torch.ones(2),), {}))
-            execute.assert_not_called()
+        artifact.pending_compile.result.side_effect = RuntimeError(
+            "native compile failed"
+        )
+        complete = MagicMock()
+        with self.assertRaisesRegex(RuntimeError, "native compile failed"):
+            with collect_warmups() as queue:
+                queue.calls.append(PendingCall(artifact.wait_for_compile))
+                queue.completions.append(complete)
+        complete.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "native compile failed"):
+            artifact(((torch.ones(2),), {}))
+        executable.assert_not_called()
 
     @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
     def test_preserves_model_and_argument_layouts(self):
         """Compile against live buffer layouts, not placeholder defaults."""
+        LayoutContext, TpuLayout = torch.tpu.LayoutContext, torch.tpu.TpuLayout
         cache_cpu = torch.arange(256 * 64, dtype=torch.float32).reshape(256, 64)
         values_cpu = cache_cpu * 2
-        compiler = direct_compile.tpu_torch_compile
-        execute = compiler.execute
 
-        def execute_with_layout_check(executable, inputs):
+        def check_layouts(compiled_callable, inputs):
             input_layouts = [
-                compiler.get_device_layout_if_materialized(tensor) for tensor in inputs
+                torch.tpu.get_device_layout_if_materialized(tensor) for tensor in inputs
             ]
             self.assertTrue(all(layout is not None for layout in input_layouts))
             # Inspect the real executable before launching it: a silently ignored
             # layout must fail even if execution would relayout the inputs.
+            # CompiledCallable has no public accessor for its parameter layouts.
             self.assertEqual(
-                executable.get_parameter_layouts(),
+                compiled_callable._tpu_executable.parameter_layouts,
                 input_layouts,
             )
-            return execute(executable, inputs)
 
         # Swap the layouts without changing the graph. An unconstrained compiler
         # cannot accidentally choose the required layouts for both cases.
@@ -854,7 +954,7 @@ class TestDirectCompile(CustomTestCase):
                 with LayoutContext(TpuLayout(minor_to_major=values_order)):
                     values = values_cpu.to("tpu")
                 for tensor, order in ((cache, cache_order), (values, values_order)):
-                    layout = compiler.get_device_layout_if_materialized(tensor)
+                    layout = torch.tpu.get_device_layout_if_materialized(tensor)
                     self.assertIsNotNone(layout)
                     self.assertEqual(layout[0], order)
                 model = torch.nn.Module()
@@ -867,9 +967,7 @@ class TestDirectCompile(CustomTestCase):
                 compiled = direct_compile.direct_compile(
                     fn, model=model, specialization_key=lambda positions, values: ()
                 )
-                with patch.object(
-                    compiler, "execute", side_effect=execute_with_layout_check
-                ):
+                with _spy_tpu_trace_context(on_call=check_layouts):
                     for indices in ([0, 127, 128, 255], [255, 128, 0, 255]):
                         positions = torch.tensor(indices)
                         expected = (cache_cpu + values_cpu).index_select(0, positions)
@@ -909,9 +1007,10 @@ class TestDirectCompile(CustomTestCase):
                 "object_state.weight_alias",
             ),
         )
-        compiler = direct_compile.tpu_torch_compile
         value = torch.zeros(2)
         result = torch.full((2,), 6.0)
+        trace_ctx = _FakeTraceContext(outputs=[[result]])
+        executable = trace_ctx.executable
         with (
             patch.object(
                 direct_compile,
@@ -919,20 +1018,9 @@ class TestDirectCompile(CustomTestCase):
                 side_effect=lambda item: isinstance(item, torch.Tensor),
             ),
             patch.object(
-                direct_compile.execution_mode,
-                "set_eager_mode",
-                return_value=nullcontext(),
-            ),
-            patch.object(
-                compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
-            ),
-            patch.object(
                 direct_compile, "_live_model_input_indices", return_value=(0, 1)
             ),
-            patch.object(
-                compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
-            ),
-            patch.object(compiler, "execute", return_value=[result]) as execute,
+            patch.object(torch.tpu.compiler, "trace_context", trace_ctx),
         ):
             output = compiled(value)
 
@@ -943,7 +1031,7 @@ class TestDirectCompile(CustomTestCase):
         self.assertIs(traced_alias, traced_weight)
         self.assertIs(model.object_state.value, original_value)
         self.assertIs(model.object_state.weight_alias, original_alias)
-        runtime_inputs = execute.call_args.args[1]
+        runtime_inputs = executable.call_args.args[0]
         self.assertEqual(len(runtime_inputs), 3)
         self.assertIs(runtime_inputs[0], model.weight)
         self.assertIs(runtime_inputs[1], original_value)
@@ -985,38 +1073,24 @@ class TestDirectCompile(CustomTestCase):
             lambda forward_batch: forward_batch.forced_routing_ids,
             specialization_key=lambda forward_batch: forward_batch.batch_size,
         )
-        compiler = direct_compile.tpu_torch_compile
+        trace_ctx = _FakeTraceContext(outputs=lambda inputs: [inputs[-1]])
+        compile_fn, executable = trace_ctx.compile, trace_ctx.executable
         with (
             patch.object(
                 direct_compile,
                 "_is_tpu_tensor",
                 side_effect=lambda item: isinstance(item, torch.Tensor),
             ),
-            patch.object(
-                direct_compile.execution_mode,
-                "set_eager_mode",
-                return_value=nullcontext(),
-            ),
-            patch.object(
-                compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
-            ),
-            patch.object(
-                compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
-            ) as compile_fn,
-            patch.object(
-                compiler,
-                "execute",
-                side_effect=lambda _executable, inputs: [inputs[-1]],
-            ) as execute,
+            patch.object(torch.tpu.compiler, "trace_context", trace_ctx),
             torch.compiler.set_stance("fail_on_recompile"),
         ):
             for routing in routing_inputs:
                 output = compiled(replace(batch, forced_routing_ids=routing))
                 self.assertIs(output, routing)
-                self.assertIs(execute.call_args.args[1][-1], routing)
+                self.assertIs(executable.call_args.args[0][-1], routing)
 
         compile_fn.assert_called_once()
-        self.assertEqual(execute.call_count, len(routing_inputs))
+        self.assertEqual(executable.call_count, len(routing_inputs))
 
     def test_registered_tensor_aliases_are_traced(self):
         model = _ModelWithRegisteredAlias()
@@ -1033,8 +1107,9 @@ class TestDirectCompile(CustomTestCase):
             specialization_key=lambda value: tuple(value.shape),
             model=model,
         )
-        compiler = direct_compile.tpu_torch_compile
         result = torch.full((2,), 3.0)
+        trace_ctx = _FakeTraceContext(outputs=[[result]])
+        executable = trace_ctx.executable
         with (
             patch.object(
                 direct_compile,
@@ -1042,20 +1117,9 @@ class TestDirectCompile(CustomTestCase):
                 side_effect=lambda value: isinstance(value, torch.Tensor),
             ),
             patch.object(
-                direct_compile.execution_mode,
-                "set_eager_mode",
-                return_value=nullcontext(),
-            ),
-            patch.object(
-                compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
-            ),
-            patch.object(
                 direct_compile, "_live_model_input_indices", return_value=(0,)
             ),
-            patch.object(
-                compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
-            ),
-            patch.object(compiler, "execute", return_value=[result]) as execute,
+            patch.object(torch.tpu.compiler, "trace_context", trace_ctx),
         ):
             output = compiled(torch.zeros(2))
 
@@ -1063,7 +1127,7 @@ class TestDirectCompile(CustomTestCase):
         self.assertIsNot(traced_state[0][0], model.weight)
         self.assertIs(traced_state[0][0], traced_state[0][1])
         self.assertIs(traced_state[0][0], traced_state[0][2])
-        runtime_inputs = execute.call_args.args[1]
+        runtime_inputs = executable.call_args.args[0]
         self.assertIs(runtime_inputs[0], model.weight)
         self.assertEqual(len(runtime_inputs), 2)
 
@@ -1107,9 +1171,8 @@ class TestDirectCompile(CustomTestCase):
         compiled = _make_pruning_function(
             model, kv_pool, callback_values, **compile_options
         )
-        compiler = direct_compile.tpu_torch_compile
 
-        def execute(_executable, inputs):
+        def run(inputs):
             if prune_unused_inputs:
                 weight, kv_bias, callback_bias, kv, value, _unused_runtime = inputs
             else:
@@ -1125,6 +1188,12 @@ class TestDirectCompile(CustomTestCase):
                 ) = inputs
             return [value + weight + weight, kv + kv_bias, value + callback_bias]
 
+        trace_ctx = _FakeTraceContext(outputs=run)
+        export_mlir, compile_fn, executable = (
+            trace_ctx.export_mlir,
+            trace_ctx.compile,
+            trace_ctx.executable,
+        )
         with (
             patch.object(
                 direct_compile,
@@ -1132,28 +1201,11 @@ class TestDirectCompile(CustomTestCase):
                 side_effect=lambda value: isinstance(value, torch.Tensor),
             ),
             patch.object(
-                direct_compile.execution_mode,
-                "set_eager_mode",
-                return_value=nullcontext(),
-            ),
-            patch.object(
-                compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
-            ),
-            patch.object(
                 direct_compile,
                 "_live_model_input_indices",
                 wraps=direct_compile._live_model_input_indices,
             ) as prune,
-            patch.object(compiler, "build_mlir", return_value=object()) as lower,
-            patch.object(
-                compiler,
-                "serialize_mlir_portable_artifact",
-                side_effect=lambda _: _pruning_mlir_artifact(),
-            ) as serialize,
-            patch.object(
-                compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
-            ) as traverse,
-            patch.object(compiler, "execute", side_effect=execute) as run,
+            patch.object(torch.tpu.compiler, "trace_context", trace_ctx),
         ):
             for step, value in enumerate((2.0, 7.0), start=1):
                 result = compiled(torch.full((2,), value), torch.zeros(2))
@@ -1168,21 +1220,25 @@ class TestDirectCompile(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "tensor input changed shape"):
                 compiled(torch.ones(2), torch.zeros(3))
 
-        traverse.assert_called_once()
-        self.assertEqual(run.call_count, 2)
-        retained_graph_inputs = traverse.call_args.args[1]
+        compile_fn.assert_called_once()
+        self.assertEqual(executable.call_count, 2)
+        retained_graph_inputs = compile_fn.call_args.args[1]
         if prune_unused_inputs:
             prune.assert_called_once()
-            self.assertEqual(lower.call_count, 2)
-            serialize.assert_called_once()
-            original_graph_inputs = lower.call_args_list[0].args[1]
+            self.assertEqual(
+                [call.kwargs for call in export_mlir.call_args_list],
+                [{"portable": True}, {}],
+            )
+            original_graph_inputs = export_mlir.call_args_list[0].args[1]
             self.assertEqual(len(original_graph_inputs), 8)
             expected_indices = (0, 3, 4, 5, 6, 7)
             self.assertEqual(len(retained_graph_inputs), len(expected_indices))
             for tensor, index in zip(retained_graph_inputs, expected_indices):
                 self.assertIs(tensor, original_graph_inputs[index])
             for tensor, validated in zip(
-                retained_graph_inputs, lower.call_args_list[1].args[1], strict=True
+                retained_graph_inputs,
+                export_mlir.call_args_list[1].args[1],
+                strict=True,
             ):
                 self.assertIs(tensor, validated)
             expected_model_inputs = (
@@ -1192,8 +1248,7 @@ class TestDirectCompile(CustomTestCase):
             )
         else:
             prune.assert_not_called()
-            lower.assert_not_called()
-            serialize.assert_not_called()
+            export_mlir.assert_not_called()
             self.assertEqual(len(retained_graph_inputs), 8)
             expected_model_inputs = (
                 model.weight,
@@ -1203,8 +1258,8 @@ class TestDirectCompile(CustomTestCase):
                 model.object_state.value,
             )
         self.assertEqual(
-            traverse.call_args.kwargs["argument_layouts"],
-            [[]] * len(retained_graph_inputs),
+            compile_fn.call_args.kwargs,
+            {"donated_inputs": [3 if prune_unused_inputs else 5]},
         )
         model_inputs = next(iter(compiled.cache.values())).model_inputs
         self.assertEqual(len(model_inputs), len(expected_model_inputs))
@@ -1215,46 +1270,50 @@ class TestDirectCompile(CustomTestCase):
         self.assertIs(kv_pool.value, pool_input)
 
     def test_model_input_pruning_checks_exported_signature(self):
-        compiler = direct_compile.tpu_torch_compile
-        with patch.object(compiler, "build_mlir") as lower:
-            self.assertEqual(direct_compile._live_model_input_indices([], [], 0), ())
-        lower.assert_not_called()
-
-        with (
-            patch.object(compiler, "build_mlir", return_value=object()),
-            patch.object(
-                compiler,
-                "serialize_mlir_portable_artifact",
-                return_value=_pruning_mlir_artifact(),
-            ),
-            self.assertRaisesRegex(RuntimeError, "expected 7, got 8"),
-        ):
-            direct_compile._live_model_input_indices([], [torch.zeros(2)] * 7, 5)
-
-    def test_model_input_pruning_preserves_dependencies_discarded_by_lowering(self):
-        compiler = direct_compile.tpu_torch_compile
-        value = compiler.placeholder([2], torch.int64, False)
-        with direct_compile.execution_mode.set_eager_mode(
-            direct_compile.execution_mode.EagerMode._INTERNAL_COMPILE_FX_GRAPH
-        ):
-            result = torch.isnan(value)
-
-        # Integer isnan exports a constant false, so its MLIR argument has no
-        # uses. The original deferred graph still needs that argument to lower.
+        trace_ctx = _FakeTraceContext(export_mlir=_pruning_mlir_artifact())
         self.assertEqual(
-            direct_compile._live_model_input_indices([result], [value], 1), (0,)
+            direct_compile._live_model_input_indices([], [], 0, trace=trace_ctx), ()
+        )
+        trace_ctx.export_mlir.assert_not_called()
+
+        with self.assertRaisesRegex(RuntimeError, "expected 7, got 8"):
+            direct_compile._live_model_input_indices(
+                [], [torch.zeros(2)] * 7, 5, trace=trace_ctx
+            )
+        self.assertEqual(
+            direct_compile._live_model_input_indices(
+                [], [torch.zeros(2)] * 7, 5, trace=trace_ctx, uses_rng=True
+            ),
+            (0, 3, 4),
         )
 
+    @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
+    def test_model_input_pruning_preserves_dependencies_discarded_by_lowering(self):
+        value = torch.ones([2], dtype=torch.int64, device="tpu")
+        with torch.tpu.compiler.trace_context() as trace:
+            (value,) = trace.prepare_inputs([value])
+            result = torch.isnan(value)
+
+            # Integer isnan exports a constant false, so its MLIR argument has no
+            # uses. The original deferred graph still needs that argument to lower.
+            self.assertEqual(
+                direct_compile._live_model_input_indices(
+                    [result], [value], 1, trace=trace
+                ),
+                (0,),
+            )
+
+    @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
     def test_model_input_pruning_with_native_topk_export(self):
-        compiler = direct_compile.tpu_torch_compile
         for stable in (False, True):
             with self.subTest(stable=stable):
-                unused = compiler.placeholder([2, 8], torch.float32, False)
-                weight = compiler.placeholder([2, 8], torch.float32, False)
-                value = compiler.placeholder([2, 8], torch.float32, False)
-                with direct_compile.execution_mode.set_eager_mode(
-                    direct_compile.execution_mode.EagerMode._INTERNAL_COMPILE_FX_GRAPH
-                ):
+                unused = torch.ones([2, 8], dtype=torch.float32, device="tpu")
+                weight = torch.ones([2, 8], dtype=torch.float32, device="tpu")
+                value = torch.ones([2, 8], dtype=torch.float32, device="tpu")
+                with torch.tpu.compiler.trace_context() as trace:
+                    unused, weight, value = trace.prepare_inputs(
+                        [unused, weight, value]
+                    )
                     scores = value + weight
                     outputs = (
                         torch.sort(scores, stable=True)
@@ -1262,31 +1321,26 @@ class TestDirectCompile(CustomTestCase):
                         else torch.topk(scores, 2)
                     )
 
-                # Exercise TorchTPU's real exporter and JAXlib's real reader:
-                # a fixture produced by JAXlib cannot catch CHLO version skew.
-                self.assertEqual(
-                    direct_compile._live_model_input_indices(
-                        list(outputs), [unused, weight, value], 2
-                    ),
-                    (1,),
-                )
+                    # Exercise TorchTPU's real exporter and JAXlib's real reader:
+                    # a fixture produced by JAXlib cannot catch CHLO version skew.
+                    self.assertEqual(
+                        direct_compile._live_model_input_indices(
+                            list(outputs), [unused, weight, value], 2, trace=trace
+                        ),
+                        (1,),
+                    )
 
     def test_model_input_pruning_propagates_unrelated_export_errors(self):
-        compiler = direct_compile.tpu_torch_compile
-        with (
-            patch.object(
-                compiler,
-                "build_mlir",
-                side_effect=[object(), RuntimeError("unrelated lowering failure")],
-            ),
-            patch.object(
-                compiler,
-                "serialize_mlir_portable_artifact",
-                return_value=_pruning_mlir_artifact(),
-            ),
-            self.assertRaisesRegex(RuntimeError, "unrelated lowering failure"),
-        ):
-            direct_compile._live_model_input_indices([], [torch.zeros(2)] * 8, 5)
+        trace_ctx = _FakeTraceContext(
+            export_mlir=[
+                _pruning_mlir_artifact(),
+                RuntimeError("unrelated lowering failure"),
+            ]
+        )
+        with self.assertRaisesRegex(RuntimeError, "unrelated lowering failure"):
+            direct_compile._live_model_input_indices(
+                [], [torch.zeros(2)] * 8, 5, trace=trace_ctx
+            )
 
     @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
     def test_pruned_topk_model_on_tpu(self):
@@ -1351,12 +1405,9 @@ class TestDirectCompile(CustomTestCase):
         compiled = _make_pruning_function(
             model, kv_pool, callback_values, **compile_options
         )
-        compiler = direct_compile.tpu_torch_compile
 
-        with (
-            patch.object(compiler, "build_mlir", wraps=compiler.build_mlir) as lower,
-            patch.object(compiler, "execute", wraps=compiler.execute) as run,
-        ):
+        with _spy_tpu_trace_context() as spy:
+            export_mlir, executable = spy.export_mlir, spy.executable
             for step, rows in enumerate((2, 4, 2), start=1):
                 value = torch.full((rows, 2), float(step), device="tpu")
                 result = compiled(value, torch.zeros(2, device="tpu"))
@@ -1370,21 +1421,21 @@ class TestDirectCompile(CustomTestCase):
                     callback_values[-1].cpu(), torch.full((rows, 2), float(step + 3))
                 )
 
-        self.assertEqual(lower.call_count, 4 if prune_unused_inputs else 0)
+        self.assertEqual(export_mlir.call_count, 4 if prune_unused_inputs else 0)
         self.assertEqual(len(compiled.cache), 2)
         self.assertIs(kv_pool.value, pool_input)
         for artifact in compiled.cache.values():
             self.assertEqual(
                 len(artifact.model_inputs), 3 if prune_unused_inputs else 5
             )
-        for call in run.call_args_list:
-            self.assertEqual(len(call.args[1]), 6 if prune_unused_inputs else 8)
+        for call in executable.call_args_list:
+            self.assertEqual(len(call.args[0]), 6 if prune_unused_inputs else 8)
             self.assertEqual(
-                any(t is model.unused_buffer for t in call.args[1]),
+                any(t is model.unused_buffer for t in call.args[0]),
                 not prune_unused_inputs,
             )
             self.assertEqual(
-                any(t is model.unused_weight for t in call.args[1]),
+                any(t is model.unused_weight for t in call.args[0]),
                 not prune_unused_inputs,
             )
 
@@ -1414,25 +1465,14 @@ class TestDirectCompile(CustomTestCase):
         )
         result = torch.full((2,), 3.0)
         callback_output = torch.full((2,), 4.0)
-        compiler = direct_compile.tpu_torch_compile
+        trace_ctx = _FakeTraceContext(outputs=[[result, callback_output]])
         with (
             patch.object(
                 direct_compile,
                 "_is_tpu_tensor",
                 side_effect=lambda value: isinstance(value, torch.Tensor),
             ),
-            patch.object(
-                direct_compile.execution_mode,
-                "set_eager_mode",
-                return_value=nullcontext(),
-            ),
-            patch.object(
-                compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
-            ),
-            patch.object(
-                compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
-            ),
-            patch.object(compiler, "execute", return_value=[result, callback_output]),
+            patch.object(torch.tpu.compiler, "trace_context", trace_ctx),
         ):
             output = compiled(torch.zeros(2))
 
@@ -1492,7 +1532,13 @@ class TestDirectCompile(CustomTestCase):
         first_callback_output = torch.full((2,), 14.0)
         second_callback_output = torch.full((2,), 24.0)
 
-        compiler = direct_compile.tpu_torch_compile
+        trace_ctx = _FakeTraceContext(
+            outputs=(
+                [first_result, first_pool, first_callback_output],
+                [second_result, second_pool, second_callback_output],
+            )
+        )
+        executable = trace_ctx.executable
         with (
             patch.object(
                 direct_compile,
@@ -1506,27 +1552,9 @@ class TestDirectCompile(CustomTestCase):
                 ),
             ),
             patch.object(
-                direct_compile.execution_mode,
-                "set_eager_mode",
-                return_value=nullcontext(),
-            ),
-            patch.object(
-                compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
-            ),
-            patch.object(
                 direct_compile, "_live_model_input_indices", return_value=(0, 1)
             ),
-            patch.object(
-                compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
-            ),
-            patch.object(
-                compiler,
-                "execute",
-                side_effect=(
-                    [first_result, first_pool, first_callback_output],
-                    [second_result, second_pool, second_callback_output],
-                ),
-            ) as execute,
+            patch.object(torch.tpu.compiler, "trace_context", trace_ctx),
         ):
             output = compiled(inputs=first)
             self.assertFalse(torch.compiler.is_compiling())
@@ -1544,7 +1572,7 @@ class TestDirectCompile(CustomTestCase):
             torch.equal(captured_callback_values[1], second_callback_output)
         )
 
-        runtime_inputs = execute.call_args_list[1].args[1]
+        runtime_inputs = executable.call_args_list[1].args[0]
         self.assertEqual(len(runtime_inputs), 4)
         self.assertIs(runtime_inputs[0], model.state.weight)
         self.assertIs(runtime_inputs[1], model.state.bias)
@@ -1588,33 +1616,22 @@ class TestDirectCompile(CustomTestCase):
             kv_pool=kv_pool,
         )
         pool_output = torch.full((2,), 5.0)
-
-        compiler = direct_compile.tpu_torch_compile
+        trace_ctx = _FakeTraceContext(outputs=[[pool_output]])
+        compile_fn = trace_ctx.compile
         with (
             patch.object(
                 direct_compile,
                 "_is_tpu_tensor",
                 side_effect=lambda value: isinstance(value, torch.Tensor),
             ),
-            patch.object(
-                direct_compile.execution_mode,
-                "set_eager_mode",
-                return_value=nullcontext(),
-            ),
-            patch.object(
-                compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
-            ),
-            patch.object(
-                compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
-            ) as traverse,
-            patch.object(compiler, "execute", return_value=[pool_output]),
+            patch.object(torch.tpu.compiler, "trace_context", trace_ctx),
         ):
             output = compiled(value=torch.ones(2))
 
         self.assertIsNone(output)
         self.assertIs(kv_pool.value, pool_input)
         self.assertTrue(torch.equal(kv_pool.value, pool_output))
-        self.assertEqual(len(traverse.call_args.args[0]), 1)
+        self.assertEqual(len(compile_fn.call_args.args[0]), 1)
 
     def test_rejects_function_with_neither_outputs_nor_mutations(self):
         """Negative branch: without a KV pool, a fn returning None traces an
@@ -1623,23 +1640,14 @@ class TestDirectCompile(CustomTestCase):
             lambda value: None,
             specialization_key=lambda value: tuple(value.shape),
         )
-
+        trace_ctx = _FakeTraceContext()
         with (
             patch.object(
                 direct_compile,
                 "_is_tpu_tensor",
                 side_effect=lambda value: isinstance(value, torch.Tensor),
             ),
-            patch.object(
-                direct_compile.execution_mode,
-                "set_eager_mode",
-                return_value=nullcontext(),
-            ),
-            patch.object(
-                direct_compile.tpu_torch_compile,
-                "placeholder_like",
-                side_effect=lambda tensor: tensor.clone(),
-            ),
+            patch.object(torch.tpu.compiler, "trace_context", trace_ctx),
             self.assertRaisesRegex(
                 TypeError, "TPU tensor outputs or KV-pool mutations"
             ),
@@ -1676,15 +1684,9 @@ class TestDirectCompile(CustomTestCase):
         raise (a guard degraded to always-raise would pass the case above)."""
         artifact = _make_artifact(traced_shapes=((2,),))
         executed = []
+        artifact.executable = lambda inputs: executed.append(inputs) or []
 
-        with (
-            patch.object(direct_compile, "_is_tpu_tensor", return_value=True),
-            patch.object(
-                direct_compile.tpu_torch_compile,
-                "execute",
-                side_effect=lambda _executable, inputs: executed.append(inputs) or [],
-            ),
-        ):
+        with patch.object(direct_compile, "_is_tpu_tensor", return_value=True):
             artifact(((torch.ones(2),), {}))
 
         self.assertEqual(len(executed), 1)

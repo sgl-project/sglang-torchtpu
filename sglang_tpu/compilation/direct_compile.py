@@ -15,13 +15,11 @@ from enum import Enum
 from typing import Any, Iterator, Protocol
 
 import torch
+import torch_tpu  # noqa: F401
 from jax import tree_util
 from torch._dynamo import eval_frame
 from torch._dynamo.utils import dynamo_timed
 from torch.nn.utils.stateless import _reparametrize_module
-from torch_tpu._internal import execution_mode, sync
-from torch_tpu._internal.compile import tpu_torch_compile
-from torch_tpu._internal.sync.sync import synchronize
 
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -360,15 +358,11 @@ class CompiledFunction:
                 if _is_tpu_tensor(value)
             ]
             if tensors:
-                # Submit eager input preparation without waiting for buffers.
                 # Symbolic arguments keep layout queries from blocking compilation.
-                synchronize(tensors, wait=False)
+                with torch.tpu.compiler.trace_context() as trace:
+                    symbolic = iter(trace.prepare_inputs(tensors, record_layouts=False))
                 args, placeholders = tree_util.tree_map(
-                    lambda value: (
-                        tpu_torch_compile.placeholder_like(value)
-                        if _is_tpu_tensor(value)
-                        else value
-                    ),
+                    lambda value: next(symbolic) if _is_tpu_tensor(value) else value,
                     (args, kwargs),
                 )
                 # tree_map sorts dict keys; keep the caller's keyword order.
@@ -537,7 +531,7 @@ class CompiledFunction:
         flat_inputs = [*model_inputs, *kv_pool_inputs]
         flat_inputs.extend(path_leaves[index][1] for index in tensor_leaf_indices)
         if spmd_compiler is not None:
-            sync.synchronize(flat_inputs)
+            torch.accelerator.synchronize()
 
         binding_input_digest = None
         interface = None
@@ -594,10 +588,8 @@ class CompiledFunction:
                     for tensor in selected:
                         layout = None
                         if tensor.device.type == "tpu":
-                            layout = (
-                                tpu_torch_compile.get_device_layout_if_materialized(
-                                    tensor
-                                )
+                            layout = torch.tpu.get_device_layout_if_materialized(
+                                tensor
                             )
                         layouts.append(layout[0] if layout is not None else [])
                     local_specs = _tensor_specs(selected)
@@ -628,218 +620,184 @@ class CompiledFunction:
 
         # Step 2: We've figured out all of our args. Now, we can create
         # placeholders for them. These will all be inputs to the MLIR graph.
-        graph_inputs = [tpu_torch_compile.placeholder_like(t) for t in flat_inputs]
-        trace_inputs = list(graph_inputs)
-        trace_leaves = [leaf for _, leaf in path_leaves]
-
-        # Clone mutated KV inputs; XLA will optimize these away.
-        # The strategy for these is that during runtime, we will copy_ the
-        # updated values back into the original Tensors. copy_ doesn't launch a
-        # kernel, it just swizzles some metadata around (the KV pool buffers
-        # are base tensors of their storage dtype; see kv_pool._zeros_kv_buffer).
-        for input_index in range(kv_pool_input_start, kv_pool_input_stop):
-            trace_inputs[input_index] = graph_inputs[input_index].clone()
-        kv_pool_trace_inputs = trace_inputs[kv_pool_input_start:kv_pool_input_stop]
-        for input_index, leaf_index in enumerate(
-            tensor_leaf_indices, start=kv_pool_input_stop
-        ):
-            trace_leaves[leaf_index] = trace_inputs[input_index]
-
-        rng_device = flat_inputs[0].device if self._uses_rng else None
-        rng_output = None
-
         # Step 3: Lower to MLIR via literally running the function against the
         # placeholders. The goal is to get a flat list of output Tensors.
-        with (
-            dynamo_timed("direct_compile_trace"),
-            execution_mode.set_eager_mode(
-                execution_mode.EagerMode._INTERNAL_COMPILE_FX_GRAPH
-            ),
-            ExitStack() as stack,
-        ):
-            if rng_device is not None:
-                generator = torch.tpu.default_generators[rng_device.index or 0]
-                trace_generator = tpu_torch_compile.make_export_mode_device_generator(
-                    generator
-                )
-                tpu_torch_compile.set_export_mode_default_device_generator(
-                    trace_generator
-                )
-                stack.callback(
-                    tpu_torch_compile.clear_export_mode_default_device_generators
-                )
-                graph_inputs.append(
-                    tpu_torch_compile.get_device_state_tensor(trace_generator)
-                )
+        with torch.tpu.compiler.trace_context(
+            uses_rng=self._uses_rng,
+            device=flat_inputs[0].device if (self._uses_rng and flat_inputs) else None,
+        ) as trace:
+            graph_inputs = trace.prepare_inputs(flat_inputs)
+            trace_inputs = list(graph_inputs)
+            trace_leaves = [leaf for _, leaf in path_leaves]
 
-            # Respect torch.compiler.is_compiling() during tracing by returning True.
-            previous_is_compiling = torch.compiler._is_compiling_flag
-            torch.compiler._is_compiling_flag = True
-            stack.callback(
-                setattr,
-                torch.compiler,
-                "_is_compiling_flag",
-                previous_is_compiling,
-            )
-            if rank_input_index is not None:
-                stack.enter_context(trace_rank(graph_inputs[rank_input_index]))
-            if self._model is not None:
-                parameters_and_buffers = {
-                    name: graph_inputs[input_index]
-                    for name, input_index in registered_model_inputs
-                }
-                # Need to temporarily yeet the placeholder params/buffers onto
-                # the nn.Modules
-                # Restore in LIFO order so shared module aliases do not retain
-                # placeholders.
-                stack.enter_context(
-                    _reparametrize_module(
-                        self._model,
-                        parameters_and_buffers,
-                        tie_weights=True,
-                        stack_weights=True,
+            # Clone mutated KV inputs; XLA will optimize these away.
+            # The strategy for these is that during runtime, we will copy_ the
+            # updated values back into the original Tensors. copy_ doesn't launch a
+            # kernel, it just swizzles some metadata around (the KV pool buffers
+            # are base tensors of their storage dtype; see kv_pool._zeros_kv_buffer).
+            for input_index in range(kv_pool_input_start, kv_pool_input_stop):
+                trace_inputs[input_index] = graph_inputs[input_index].clone()
+            kv_pool_trace_inputs = trace_inputs[kv_pool_input_start:kv_pool_input_stop]
+            for input_index, leaf_index in enumerate(
+                tensor_leaf_indices, start=kv_pool_input_stop
+            ):
+                trace_leaves[leaf_index] = trace_inputs[input_index]
+
+            with (
+                dynamo_timed("direct_compile_trace"),
+                ExitStack() as stack,
+            ):
+                if rank_input_index is not None:
+                    stack.enter_context(trace_rank(graph_inputs[rank_input_index]))
+                if self._model is not None:
+                    parameters_and_buffers = {
+                        name: graph_inputs[input_index]
+                        for name, input_index in registered_model_inputs
+                    }
+                    # Need to temporarily yeet the placeholder params/buffers onto
+                    # the nn.Modules
+                    # Restore in LIFO order so shared module aliases do not retain
+                    # placeholders.
+                    stack.enter_context(
+                        _reparametrize_module(
+                            self._model,
+                            parameters_and_buffers,
+                            tie_weights=True,
+                            stack_weights=True,
+                        )
                     )
-                )
-                # We can't pass these directly to _reparametrize_module because
-                # it requires every intermediate dotted-path component to be an
-                # nn.Module. Explicit extras may live on ordinary helper objects,
-                # so swap those attributes directly and restore them before
-                # registered model state.
-                for parent, attr_name, input_index in extra_model_inputs:
-                    previous_value = getattr(parent, attr_name)
-                    setattr(parent, attr_name, graph_inputs[input_index])
-                    stack.callback(setattr, parent, attr_name, previous_value)
-            if self._kv_pool is not None:
-                previous_state = self._kv_pool.get_state()
-                self._kv_pool.set_state(kv_pool_trace_inputs)
-                stack.callback(self._kv_pool.set_state, previous_state)
-            trace_arguments = tree_util.tree_unflatten(input_treespec, trace_leaves)
-            with _collect_callbacks() as inserted_callbacks:
-                outputs = self.fn(*trace_arguments[0], **trace_arguments[1])
-            if rng_device is not None:
-                rng_output = tpu_torch_compile.get_device_state_tensor(trace_generator)
+                    # We can't pass these directly to _reparametrize_module because
+                    # it requires every intermediate dotted-path component to be an
+                    # nn.Module. Explicit extras may live on ordinary helper objects,
+                    # so swap those attributes directly and restore them before
+                    # registered model state.
+                    for parent, attr_name, input_index in extra_model_inputs:
+                        previous_value = getattr(parent, attr_name)
+                        setattr(parent, attr_name, graph_inputs[input_index])
+                        stack.callback(setattr, parent, attr_name, previous_value)
+                if self._kv_pool is not None:
+                    previous_state = self._kv_pool.get_state()
+                    self._kv_pool.set_state(kv_pool_trace_inputs)
+                    stack.callback(self._kv_pool.set_state, previous_state)
+                trace_arguments = tree_util.tree_unflatten(input_treespec, trace_leaves)
+                with _collect_callbacks() as inserted_callbacks:
+                    outputs = self.fn(*trace_arguments[0], **trace_arguments[1])
 
-        output_leaves, output_treespec = tree_util.tree_flatten(outputs)
-        if not all(_is_tpu_tensor(leaf) for leaf in output_leaves):
-            raise TypeError("All direct_compile output leaves must be TPU tensors")
-        result_tensors = output_leaves + kv_pool_trace_inputs
-        # Forward hooks see Torch tensors here, not JAX values, and JAX export
-        # cannot serialize host callbacks. Preserve callback values as extra
-        # executable outputs, then invoke their Python callbacks after execute.
-        result_tensors.extend(entry.tensor for entry in inserted_callbacks)
-        if rng_output is not None:
-            result_tensors.append(rng_output)
-        # A mutation-only fn (the DFlash draft KV appender) returns None and has
-        # no output leaves; the KV-pool copy-back is then the graph's only effect.
-        if not result_tensors:
-            raise TypeError(
-                "direct_compile requires TPU tensor outputs or KV-pool mutations"
-            )
-
-        live_model_indices = tuple(range(model_input_count))
-        if self._prune_unused_inputs:
-            # Only immutable model state can be dropped. Keep every explicit input
-            # (and its runtime shape check), KV input/output, and callback output.
-            # Compute liveness after collecting all three kinds of graph roots.
-            with dynamo_timed("direct_compile_prune_model_inputs"):
-                live_model_indices = _live_model_input_indices(
-                    result_tensors, graph_inputs, model_input_count
+            output_leaves, output_treespec = tree_util.tree_flatten(outputs)
+            if not all(_is_tpu_tensor(leaf) for leaf in output_leaves):
+                raise TypeError("All direct_compile output leaves must be TPU tensors")
+            result_tensors = output_leaves + kv_pool_trace_inputs
+            # Forward hooks see Torch tensors here, not JAX values, and JAX export
+            # cannot serialize host callbacks. Preserve callback values as extra
+            # executable outputs, then invoke their Python callbacks after execute.
+            result_tensors.extend(entry.tensor for entry in inserted_callbacks)
+            # A mutation-only fn (the DFlash draft KV appender) returns None and has
+            # no output leaves; the KV-pool copy-back is then the graph's only effect.
+            if not result_tensors:
+                raise TypeError(
+                    "direct_compile requires TPU tensor outputs or KV-pool mutations"
                 )
-            retained_indices = (
-                *live_model_indices,
-                *range(model_input_count, len(graph_inputs)),
-            )
-            model_inputs = [model_inputs[index] for index in live_model_indices]
-            graph_inputs = [graph_inputs[index] for index in retained_indices]
-            flat_inputs = [
-                flat_inputs[index]
-                for index in retained_indices
-                if index < len(flat_inputs)
-            ]
+
+            live_model_indices = tuple(range(model_input_count))
+            if self._prune_unused_inputs:
+                # Only immutable model state can be dropped. Keep every explicit input
+                # (and its runtime shape check), KV input/output, and callback output.
+                # Compute liveness after collecting all three kinds of graph roots.
+                with dynamo_timed("direct_compile_prune_model_inputs"):
+                    live_model_indices = _live_model_input_indices(
+                        result_tensors,
+                        graph_inputs,
+                        model_input_count,
+                        trace,
+                        uses_rng=self._uses_rng,
+                    )
+                retained_indices = (
+                    *live_model_indices,
+                    *range(model_input_count, len(graph_inputs)),
+                )
+                model_inputs = [model_inputs[index] for index in live_model_indices]
+                graph_inputs = [graph_inputs[index] for index in retained_indices]
+                flat_inputs = [flat_inputs[index] for index in retained_indices]
+                logger.info(
+                    "[direct_compile] retained %d/%d model inputs",
+                    len(model_inputs),
+                    model_input_count,
+                )
+
+            # Step 4: Finish lowering to MLIR, then compile it.
             logger.info(
-                "[direct_compile] retained %d/%d model inputs",
-                len(model_inputs),
-                model_input_count,
+                "[direct_compile] lowering %d inputs, %d outputs, %d mutations, "
+                "and %d callbacks",
+                len(graph_inputs),
+                len(output_leaves),
+                len(kv_pool_inputs),
+                len(inserted_callbacks),
             )
-
-        # Step 4: Finish lowering to MLIR, then compile it.
-        logger.info(
-            "[direct_compile] lowering %d inputs, %d outputs, %d mutations, "
-            "and %d callbacks",
-            len(graph_inputs),
-            len(output_leaves),
-            len(kv_pool_inputs),
-            len(inserted_callbacks),
-        )
-        # Placeholders do not retain the physical layout of their buffers.
-        argument_layouts = []
-        for tensor in flat_inputs:
-            layout = None
-            if tensor.device.type == "tpu":
-                layout = tpu_torch_compile.get_device_layout_if_materialized(tensor)
-            argument_layouts.append(layout[0] if layout is not None else [])
-        if rng_device is not None:
-            argument_layouts.append([])
-        callbacks = tuple(entry.callback for entry in inserted_callbacks)
-        if spmd_compiler is not None and not spmd_compiler.verify_spmd_safe:
-            factories = tuple(entry.callback_factory for entry in inserted_callbacks)
-            if any(factory is None for factory in factories):
-                raise ValueError(
-                    "Shared TPU callbacks require a callback_factory for local binding"
+            callbacks = tuple(entry.callback for entry in inserted_callbacks)
+            factories = None
+            if spmd_compiler is not None:
+                argument_layouts = []
+                for tensor in flat_inputs:
+                    layout = None
+                    if tensor.device.type == "tpu":
+                        layout = torch.tpu.get_device_layout_if_materialized(tensor)
+                    argument_layouts.append(layout[0] if layout is not None else [])
+                if not spmd_compiler.verify_spmd_safe:
+                    factories = tuple(
+                        entry.callback_factory for entry in inserted_callbacks
+                    )
+                    if any(factory is None for factory in factories):
+                        raise ValueError(
+                            "Shared TPU callbacks require a callback_factory for local binding"
+                        )
+                    # Fail during tracing, before interface collectives, if a factory
+                    # accidentally captures an unpicklable recorder or local closure.
+                    callback_factories = pickle.dumps(factories)
+                    interface = ExecutableInterface(
+                        input_digest=binding_input_digest,
+                        input_specs=_tensor_specs(flat_inputs),
+                        argument_layouts=argument_layouts,
+                        model_indices=live_model_indices,
+                        output_treespec=output_treespec,
+                        callback_factories=callback_factories,
+                    )
+            pending_compile = None
+            executable = None
+            donated_inputs = list(
+                range(len(model_inputs), len(model_inputs) + len(kv_pool_inputs))
+            )
+            start = time.perf_counter()
+            if async_compile:
+                with dynamo_timed("direct_compile_async_submit"):
+                    if spmd_compiler is None:
+                        pending_compile = trace.compile_async(
+                            result_tensors, graph_inputs, donated_inputs=donated_inputs
+                        )
+                    else:
+                        pending_compile = spmd_compiler.compile(
+                            trace,
+                            result_tensors,
+                            graph_inputs,
+                            argument_layouts=argument_layouts,
+                            interface=interface,
+                            graph=graph,
+                            donated_inputs=donated_inputs,
+                        )
+                logger.info(
+                    "[direct_compile] native async submission %.3fs",
+                    time.perf_counter() - start,
                 )
-            # Fail during tracing, before interface collectives, if a factory
-            # accidentally captures an unpicklable recorder or local closure.
-            callback_factories = pickle.dumps(factories)
+            else:
+                with dynamo_timed("direct_compile_traverse_and_compile"):
+                    executable = trace.compile(
+                        result_tensors, graph_inputs, donated_inputs=donated_inputs
+                    )
+                logger.info(
+                    "[direct_compile] synchronous compilation %.3fs",
+                    time.perf_counter() - start,
+                )
+        if factories is not None:
             callbacks = tuple(factory(self._model) for factory in factories)
-            interface = ExecutableInterface(
-                input_digest=binding_input_digest,
-                input_specs=_tensor_specs(flat_inputs),
-                argument_layouts=argument_layouts,
-                model_indices=live_model_indices,
-                output_treespec=output_treespec,
-                callback_factories=callback_factories,
-            )
-        pending_compile = None
-        executable = None
-        donated_inputs = list(
-            range(len(model_inputs), len(model_inputs) + len(kv_pool_inputs))
-        )
-        start = time.perf_counter()
-        if async_compile:
-            with dynamo_timed("direct_compile_async_submit"):
-                if spmd_compiler is None:
-                    pending_compile = tpu_torch_compile.async_traverse_and_compile(
-                        result_tensors,
-                        graph_inputs,
-                        argument_layouts=argument_layouts,
-                        donated_inputs=donated_inputs,
-                    )
-                else:
-                    pending_compile = spmd_compiler.compile(
-                        result_tensors,
-                        graph_inputs,
-                        argument_layouts=argument_layouts,
-                        interface=interface,
-                        graph=graph,
-                        donated_inputs=donated_inputs,
-                    )
-            logger.info(
-                "[direct_compile] native async submission %.3fs",
-                time.perf_counter() - start,
-            )
-        else:
-            with dynamo_timed("direct_compile_traverse_and_compile"):
-                compile_result = tpu_torch_compile.traverse_and_compile(
-                    result_tensors,
-                    graph_inputs,
-                    argument_layouts=argument_layouts,
-                    donated_inputs=donated_inputs,
-                )
-            executable = compile_result.executable
-            logger.info(
-                "[direct_compile] synchronous compilation %.3fs",
-                time.perf_counter() - start,
-            )
         return _CompiledArtifact(
             executable=executable,
             model_inputs=tuple(model_inputs),
@@ -852,7 +810,6 @@ class CompiledFunction:
             output_count=len(output_leaves),
             callbacks=callbacks,
             pending_compile=pending_compile,
-            rng_device=rng_device,
         )
 
 
@@ -882,12 +839,11 @@ class _CompiledArtifact:
     output_count: int
     callbacks: tuple[Callable[[torch.Tensor], None], ...] = ()
     pending_compile: Any | None = None
-    rng_device: torch.device | None = None
 
     def wait_for_compile(self) -> None:
         if self.pending_compile is not None:
             start = time.perf_counter()
-            self.executable = self.pending_compile.get()
+            self.executable = self.pending_compile.result()
             self.pending_compile = None
             logger.info(
                 "[direct_compile] native async resolution %.3fs",
@@ -934,15 +890,7 @@ class _CompiledArtifact:
                 )
             inputs.append(value)
 
-        if self.rng_device is None:
-            outputs = tpu_torch_compile.execute(self.executable, inputs)
-        else:
-            generator = torch.tpu.default_generators[self.rng_device.index or 0]
-            with tpu_torch_compile.MultiGeneratorLocker([generator]):
-                inputs.append(tpu_torch_compile.get_device_state_tensor(generator))
-                outputs = tpu_torch_compile.execute(self.executable, inputs)
-                tpu_torch_compile.set_device_state_tensor(generator, outputs[-1])
-                outputs = outputs[:-1]
+        outputs = self.executable(inputs)
 
         # Copy updated KV state back into the live pool tensors.
         with torch.no_grad():
@@ -969,6 +917,9 @@ def _live_model_input_indices(
     result_tensors: list[torch.Tensor],
     graph_inputs: list[torch.Tensor],
     model_input_count: int,
+    trace: torch.tpu.compiler.trace_context,
+    *,
+    uses_rng: bool = False,
 ) -> tuple[int, ...]:
     """Find model arguments used by the deferred graph, once per specialization.
 
@@ -986,18 +937,20 @@ def _live_model_input_indices(
     from jaxlib.mlir import ir
     from jaxlib.mlir.dialects import stablehlo
 
-    lowered = tpu_torch_compile.build_mlir(result_tensors, graph_inputs)
     # TorchTPU and JAXlib can embed different MLIR/CHLO versions. Native
     # bytecode is not a portable interchange format (e.g. top_k's is_stable
     # property changed its encoding). TorchTPU's versioned export legalizes
     # CHLO before serializing; deserialize it into JAXlib's own dialect version.
-    bytecode = tpu_torch_compile.serialize_mlir_portable_artifact(lowered)
-    del lowered
+    bytecode = trace.export_mlir(result_tensors, graph_inputs, portable=True)
     with mlir.make_ir_context() as context:
         module = stablehlo.deserialize_portable_artifact(context, bytecode)
         entry = ir.SymbolTable(module.operation)["main"]
         arguments = entry.regions[0].blocks[0].arguments
-        if len(arguments) != len(graph_inputs):
+        if not (
+            len(graph_inputs)
+            <= len(arguments)
+            <= len(graph_inputs) + int(uses_rng)
+        ):
             raise RuntimeError(
                 "TorchTPU MLIR input count changed during model-input pruning: "
                 f"expected {len(graph_inputs)}, got {len(arguments)}"
@@ -1015,7 +968,7 @@ def _live_model_input_indices(
         # For example, integer isnan lowers to a constant but its deferred node
         # still references the integer input. Validate before traverse_and_compile,
         # whose argument validation can abort the process on a missing dependency.
-        lowered = tpu_torch_compile.build_mlir(result_tensors, compact_inputs)
+        trace.export_mlir(result_tensors, compact_inputs)
     except RuntimeError as error:
         if "identified an argument that was not provided" not in str(error):
             raise
@@ -1025,7 +978,6 @@ def _live_model_input_indices(
             model_input_count,
         )
         return tuple(range(model_input_count))
-    del lowered
     return live_model_indices
 
 

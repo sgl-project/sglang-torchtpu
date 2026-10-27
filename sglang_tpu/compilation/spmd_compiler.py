@@ -6,6 +6,7 @@ import gzip
 import importlib.metadata
 import math
 import os
+import pickle
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -18,7 +19,6 @@ import torch
 import torch.distributed as dist
 import zstandard
 from jax import tree_util
-from torch_tpu._internal.compile import tpu_torch_compile as tc
 from torch_tpu._internal.distributed import device_mesh
 
 from sglang_tpu._logging import get_logger
@@ -82,7 +82,7 @@ class Submission:
     executable: Any = None
     """Locally compiled or loaded executable available after distribution."""
 
-    def get(self) -> Any:
+    def result(self) -> Any:
         if self.executable is None:
             raise RuntimeError("Shared compilation must finish before graph execution")
         return self.executable
@@ -92,13 +92,13 @@ def _prepare_executable(
     submission: Submission, serialize: bool
 ) -> tuple[Any, bytes | None]:
     try:
-        executable = submission.pending.get()
+        executable = submission.pending.result()
     finally:
         submission.pending = None
     serialized = None
     if serialize:
         serialized = zstandard.ZstdCompressor(level=1).compress(
-            tc.serialize_executable(executable)
+            pickle.dumps(executable, protocol=pickle.HIGHEST_PROTOCOL)
         )
     return executable, serialized
 
@@ -234,6 +234,7 @@ class SPMDCompiler:
 
     def compile(
         self,
+        trace,
         outputs,
         inputs,
         *,
@@ -244,8 +245,9 @@ class SPMDCompiler:
     ) -> Submission | SPMDCompiler:
         """Capture MLIR/layouts for verification or submit the owner's compilation."""
         if self.verify_spmd_safe:
-            module = tc.build_mlir(outputs, inputs)
-            self.mlirs[graph] = tc.serialize_mlir_text(module, enable_debug_info=False)
+            self.mlirs[graph] = trace.export_mlir(
+                outputs, inputs, portable=False, enable_debug_info=False
+            )
             self.argument_layouts[graph] = argument_layouts
             return self
         submission = self.submissions[graph]
@@ -254,15 +256,12 @@ class SPMDCompiler:
         if submission.owner != self.rank:
             raise ValueError(f"Invalid TPU compile owner: {graph}")
         submission.interface = interface
-        submission.pending = tc.async_traverse_and_compile(
-            outputs,
-            inputs,
-            argument_layouts=interface.argument_layouts,
-            donated_inputs=donated_inputs,
+        submission.pending = trace.compile_async(
+            outputs, inputs, donated_inputs=donated_inputs
         )
         return submission
 
-    def get(self) -> Any:
+    def result(self) -> Any:
         """Raise if an async caller tries to retrieve a verification executable.
 
         ``finish`` must exit or raise before the warmup queue waits on its calls.
@@ -404,17 +403,15 @@ class SPMDCompiler:
                     header[0] = (
                         True,
                         len(serialized) if serialized is not None else None,
-                        executable.subslice_origin(),
                     )
                 except Exception as caught:
                     header[0] = (
                         False,
                         f"{type(caught).__name__}: {str(caught)[:512]}",
-                        None,
                     )
             source = dist.get_global_rank(self.group, item.owner)
             dist.broadcast_object_list(header, src=source, group=self.group)
-            success, length, subslice_origin = header[0]
+            success, length = header[0]
             with self.coordinate_errors("preparing transfer"):
                 if not success:
                     raise RuntimeError(length)
@@ -428,13 +425,11 @@ class SPMDCompiler:
                 dist.broadcast(buffer, src=source, group=self.group)
             with self.coordinate_errors("loading executable"):
                 if executable is None:
-                    # Serialized bytes omit the TPU subslice's chip coordinates.
-                    # Preserve the owner's origin when loading on its TP peers.
-                    executable = tc.load_serialized_executable(
+                    # Pickled executables keep the owner's TPU subslice origin.
+                    executable = pickle.loads(
                         zstandard.ZstdDecompressor().decompress(
                             buffer.numpy().tobytes()
                         ),
-                        subslice_origin=subslice_origin,
                     )
                 item.executable = executable
 
@@ -448,7 +443,7 @@ class SPMDCompiler:
         for item in self.submissions.values():
             if item.pending is not None:
                 try:
-                    item.pending.get()
+                    item.pending.result()
                 except Exception:
                     logger.exception("TPU compilation failed during cleanup")
             item.pending = item.bind = item.interface = None
