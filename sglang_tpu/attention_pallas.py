@@ -515,18 +515,18 @@ def _get_vision_flash_op(sm_scale: float):
 
 
 # ---------------------------------------------------------------------------
-# Vision encoder: segment-local attention with block skipping (splash)
+# Vision encoder: segment-ID attention with block skipping (splash)
 # ---------------------------------------------------------------------------
-_VISION_LOCAL_OPS: dict[float, object] = {}
+_VISION_SPLASH_OPS: dict[float, object] = {}
 
 
-def _vision_local_block_sizes(seq_len: int) -> tuple[int, int]:
+def _vision_splash_block_sizes(seq_len: int) -> tuple[int, int]:
     """Splash (block_q, block_kv): the largest of 2048..128 (q) and 1024..128 (kv) dividing seq_len.
 
     Large blocks keep the per-grid-step cost low; at 16,384 tokens with 1,024-token
     segments, (2048, 1024) measured fastest of the sizes that fit a 24 MiB scoped VMEM,
     and a 4,096-token q block does not compile under that limit. seq_len must be a
-    multiple of 128; ``VisionTpuLocalAttention`` pads to a multiple of 1,024 so the
+    multiple of 128; ``VisionTpuSplashAttention`` pads to a multiple of 1,024 so the
     smaller fallbacks are not hit.
     """
     block_q = next(b for b in (2048, 1024, 512, 256, 128) if seq_len % b == 0)
@@ -534,8 +534,8 @@ def _vision_local_block_sizes(seq_len: int) -> tuple[int, int]:
     return block_q, block_kv
 
 
-def _vision_local_block_map(segment_ids, block_q: int, block_kv: int):
-    """Splash block map for segment-local attention: (block_mask, data_next), [1, nq, nkv].
+def _vision_splash_block_map(segment_ids, block_q: int, block_kv: int):
+    """Splash block map for segment-ID attention: (block_mask, data_next), [1, nq, nkv].
 
     A (q block, kv block) pair is live when the segment-id ranges of the two blocks
     intersect. That holds whenever any query in the q block shares a segment with any
@@ -561,15 +561,24 @@ def _vision_local_block_map(segment_ids, block_q: int, block_kv: int):
     return block_mask[None], data_next[None]
 
 
-def _vision_local_attention(q, k, v, segment_ids, *, sm_scale: float, interpret=False):
-    """Segment-local attention with block skipping; the JAX body of the local op.
+def _vision_splash_attention(q, k, v, segment_ids, *, sm_scale: float, interpret=False):
+    """Segment-ID attention with block skipping; the JAX body of the splash op.
 
-    q, k, v: [seq_len, num_heads, head_dim], token-major; segment_ids: [seq_len]. Runs
-    splash attention with the block map of ``_vision_local_block_map`` and the segment
-    ids as the in-block mask. Splash takes no softmax scale, so q is scaled first.
+    q, k, v: [batch, num_heads, seq_len, head_dim]; segment_ids: [batch, seq_len], the
+    layout of the segment-ID flash op. Runs splash attention with the block map of
+    ``_vision_splash_block_map`` and the segment ids as the in-block mask. Splash takes
+    no softmax scale, so q is scaled first.
     """
-    block_q, block_kv = _vision_local_block_sizes(q.shape[0])
-    block_mask, data_next = _vision_local_block_map(segment_ids, block_q, block_kv)
+    b, h, s, d = q.shape
+    # Splash runs one sequence: lay the batch rows end to end and offset each row's
+    # ids past the previous row's, so rows stay apart and the ids stay non-decreasing.
+    if b > 1:
+        row = jnp.arange(b, dtype=jnp.int32)[:, None]
+        segment_ids = segment_ids + row * (segment_ids.max() + 1)
+    segment_ids = segment_ids.reshape(b * s)
+    q, k, v = (x.transpose(1, 0, 2, 3).reshape(h, b * s, d) for x in (q, k, v))
+    block_q, block_kv = _vision_splash_block_sizes(b * s)
+    block_mask, data_next = _vision_splash_block_map(segment_ids, block_q, block_kv)
     mask_info = splash_mask_info.MaskInfo(
         data_next=data_next,
         mask_next=None,
@@ -594,37 +603,35 @@ def _vision_local_attention(q, k, v, segment_ids, *, sm_scale: float, interpret=
         interpret=interpret,
     )
     out = kernel(
-        (q * sm_scale).transpose(1, 0, 2),
-        k.transpose(1, 0, 2),
-        v.transpose(1, 0, 2),
-        segment_ids=splash.SegmentIds(q=segment_ids, kv=segment_ids),
+        q * sm_scale, k, v, segment_ids=splash.SegmentIds(q=segment_ids, kv=segment_ids)
     )
-    return out.transpose(1, 0, 2)
+    return out.reshape(h, b, s, d).transpose(1, 0, 2, 3)
 
 
-def _get_vision_local_op(sm_scale: float):
+def _get_vision_splash_op(sm_scale: float):
     """Return a cached pallas op for segment-ID vision attention with block skipping.
 
-    For segments much shorter than the sequence (local windows or tiles), the
-    segment-ID op above computes every query-key block and masks most of them. This
+    Same arguments as the segment-ID flash op above (``[b, h, s, d]`` q, k, v and
+    ``[b, s]`` segment ids). For segments much shorter than the sequence (local windows
+    or tiles), the flash op computes every query-key block and masks most of them. This
     op skips the blocks whose segments cannot meet, so with the ids non-decreasing in
     token order (each segment contiguous, segments numbered in order) its cost scales
-    with the segment lengths rather than ``seq_len**2``. Any ids give exact results. With one long
-    segment and a padding tail (full attention over a padded sequence) it runs dense
-    over the real tokens; its KV blocks keep the VMEM footprint fixed, where the
-    segment-ID op's single KV step outgrows a 24 MiB scoped limit above ~16k keys.
+    with the segment lengths rather than ``seq_len**2``. Any ids give exact results.
+    With one long segment and a padding tail (full attention over a padded sequence)
+    it runs dense over the real tokens; its KV blocks keep the VMEM footprint fixed,
+    where the flash op's single KV step outgrows a 24 MiB scoped limit above ~16k keys.
     """
     key = float(sm_scale)
-    op = _VISION_LOCAL_OPS.get(key)
+    op = _VISION_SPLASH_OPS.get(key)
     if op is not None:
         return op
 
     from torch_tpu._internal import pallas
 
-    def _jax_vision_local(q, k, v, segment_ids):
-        return _vision_local_attention(q, k, v, segment_ids, sm_scale=sm_scale)
+    def _jax_vision_splash(q, k, v, segment_ids):
+        return _vision_splash_attention(q, k, v, segment_ids, sm_scale=sm_scale)
 
-    _jax_vision_local.__annotations__ = {
+    _jax_vision_splash.__annotations__ = {
         "q": jax.Array,
         "k": jax.Array,
         "v": jax.Array,
@@ -632,12 +639,12 @@ def _get_vision_local_op(sm_scale: float):
         "return": jax.Array,
     }
 
-    op_name = f"sglang_tpu::vision_local_s{key!r}".replace(".", "_").replace("-", "m")
-    op = pallas.jax_op(op_name, _jax_vision_local)
+    op_name = f"sglang_tpu::vision_splash_s{key!r}".replace(".", "_").replace("-", "m")
+    op = pallas.jax_op(op_name, _jax_vision_splash)
 
-    def _fake_vision_local(q, k, v, segment_ids):
+    def _fake_vision_splash(q, k, v, segment_ids):
         return torch.empty_like(q)
 
-    op.register_fake(_fake_vision_local)
-    _VISION_LOCAL_OPS[key] = op
+    op.register_fake(_fake_vision_splash)
+    _VISION_SPLASH_OPS[key] = op
     return op
