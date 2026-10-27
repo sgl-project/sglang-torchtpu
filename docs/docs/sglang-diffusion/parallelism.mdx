@@ -88,7 +88,7 @@ mis-mapped layout stays numerically correct and silently loses the performance
   the local shard first while the gather runs, and needs no merge pass;
   rank-dependent shard choices reach the kernel as device data. Every device
   then holds the ring group's whole K/V (memory traded for not needing p2p).
-  TPU ring attention is non-causal only. Which TPU path a layer takes: plain
+  Which TPU path a layer takes: plain
   and tail-padded attention (Wan, LTX-2) use this all-gather ring; the
   replicated-prefix/-suffix paths (FLUX.2, Z-Image) still use the templated
   ring with an LSE merge.
