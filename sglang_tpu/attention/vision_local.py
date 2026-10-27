@@ -7,9 +7,10 @@ every query-key block of the whole sequence, so a local layer costs as much as
 full attention. ``VisionTpuLocalAttention`` additionally takes
 ``local_segment_ids=``: the same per-token segment ids, run through splash
 attention with a block map that skips every query-key block whose segments
-cannot meet (``_get_vision_local_op``). The result is exact for any token
-order; it is fast when each segment is contiguous, so callers should order the
-tokens segment by segment (and undo the order after the encoder). Full-attention
+cannot meet (``_get_vision_local_op``). The result is exact for any ids; it is
+fast only when the ids are non-decreasing in token order, so callers should order
+the tokens segment by segment, number the segments in that order, and undo the
+order after the encoder. Full-attention
 layers over a padded sequence (one segment for the real tokens, one for the pad
 tail) can use it too: it then runs dense over the real tokens, and unlike the
 segment-ID op it fits a 24 MiB scoped VMEM at long sequences.
@@ -56,7 +57,10 @@ class VisionTpuLocalAttention(VisionTpuAttention):
         local_segment_ids: torch.Tensor | None = None,
         **kwargs,
     ):
-        """``local_segment_ids``: [1, seq_len] int32, the segment of each token."""
+        """``local_segment_ids``: [1, seq_len] int32, the segment of each token.
+
+        Exact for any ids; blocks are skipped only when the ids are non-decreasing.
+        """
         if local_segment_ids is None:
             return super().forward(
                 q,

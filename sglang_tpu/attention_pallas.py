@@ -538,8 +538,12 @@ def _vision_local_block_map(segment_ids, block_q: int, block_kv: int):
 
     A (q block, kv block) pair is live when the segment-id ranges of the two blocks
     intersect. That holds whenever any query in the q block shares a segment with any
-    key in the kv block, so skipping the other pairs is exact for any token order; the
-    map is sparse when each segment is contiguous. ``data_next`` is the kv block a grid
+    key in the kv block, so skipping the other pairs is exact for any token order. The
+    map is sparse only when the ids are non-decreasing in token order: contiguous
+    segments numbered out of order (e.g. ``0..., 5..., 1..., 4...``) give blocks with wide
+    id ranges that overlap everything, which is exact but dense. Renumbering inside the
+    op cannot fix that without losing exactness for a segment split across runs, so
+    callers number their segments in order. ``data_next`` is the kv block a grid
     step fetches: the last live block so far (the first live one before it), so a
     skipped step fetches nothing new.
     """
@@ -602,8 +606,9 @@ def _get_vision_local_op(sm_scale: float):
 
     For segments much shorter than the sequence (local windows or tiles), the
     segment-ID op above computes every query-key block and masks most of them. This
-    op skips the blocks whose segments cannot meet, so with each segment contiguous
-    its cost scales with the segment lengths rather than ``seq_len**2``. With one long
+    op skips the blocks whose segments cannot meet, so with the ids non-decreasing in
+    token order (each segment contiguous, segments numbered in order) its cost scales
+    with the segment lengths rather than ``seq_len**2``. Any ids give exact results. With one long
     segment and a padding tail (full attention over a padded sequence) it runs dense
     over the real tokens; its KV blocks keep the VMEM footprint fixed, where the
     segment-ID op's single KV step outgrows a 24 MiB scoped limit above ~16k keys.

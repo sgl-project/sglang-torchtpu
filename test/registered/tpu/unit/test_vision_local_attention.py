@@ -193,6 +193,18 @@ class TestVisionLocalJax(CustomTestCase):
                         else:
                             self.assertEqual(mask[i, nxt[i, j]], 2)
 
+    def test_out_of_order_segments_are_exact_but_denser(self):
+        # Contiguous segments numbered out of order: q block 0 holds ids {0, 5}, an id
+        # range that meets every kv block. Numbered in order, each q block meets only
+        # its own two kv blocks.
+        out_of_order = torch.tensor([0, 5, 1, 4], dtype=torch.int32)
+        in_order = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+        dense, _ = self._block_map(out_of_order.repeat_interleave(1024), 2048, 1024)
+        sparse, _ = self._block_map(in_order.repeat_interleave(1024), 2048, 1024)
+        self.assertEqual(int((dense > 0).sum()), 4 + 2)
+        self.assertEqual(int((sparse > 0).sum()), 2 + 2)
+        self._check_body(out_of_order.repeat_interleave(1024), h=1, d=16, seed=9)
+
     def test_block_map_is_sparse_for_contiguous_segments(self):
         mask, _ = self._block_map(_segments([1024] * 16), 2048, 1024)
         # Each 2048-token q block holds two segments, i.e. two of 16 kv blocks.
