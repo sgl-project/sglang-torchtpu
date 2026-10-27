@@ -54,10 +54,10 @@ from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang_tpu import pd_spill_flags
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 from sglang_tpu.disaggregation.raiden.prefix_pull import DecodePrefixPuller
 from sglang_tpu.disaggregation.raiden.serde import VictimAck
-from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.pd_host_cache import (
     _anchor_host_pool,
     _host_pages,
@@ -916,7 +916,7 @@ def _decode_add(
                 and not queue.tree_cache.tree_core.has_swa_host_pool
             ):
                 raise ValueError(
-                    "Victim SWA prefix caching requires SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS > 0"
+                    "Victim SWA prefix caching requires SGLANG_TPU_PD_SWA_HOST_WINDOWS > 0"
                 )
             req.skip_radix_cache_insert = True
     return upstream(queue, req, *args, **kwargs)
@@ -1073,7 +1073,7 @@ def _wrap(owner: Any, name: str, impl: Callable) -> None:
 
 def install() -> None:
     global _is_installed
-    if _is_installed or not tpu_envs.SGLANG_DISAGG_PREFIX_VICTIM_PUSH.get():
+    if _is_installed or not pd_spill_flags.victim_push_enabled():
         return
     _is_installed = True
     for owner, name, impl in _patch_targets():

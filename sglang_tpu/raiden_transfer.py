@@ -18,9 +18,10 @@ import os
 import time
 from typing import TYPE_CHECKING, Any, List, Literal
 
+from sglang.srt.utils.network import get_free_port
+from sglang_tpu import pd_spill_flags
 from sglang_tpu.envs import envs
 from sglang_tpu.tpu_dma_hicache import NOOP_EVENT, page_major_tensors
-from sglang.srt.utils.network import get_free_port
 
 if TYPE_CHECKING:
     from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
@@ -139,7 +140,7 @@ class RaidenKVTransfer:
         # transfers need a positive control port on the existing HiCache pool;
         # allocating another manager would serve different host memory.
         self._host_control_port = (
-            get_free_port() if envs.SGLANG_DISAGG_PREFIX_VICTIM_PUSH.get() else 0
+            get_free_port() if pd_spill_flags.victim_push_enabled() else 0
         )
         self._host_transfers: dict[str, HostTransferStatus | None] = {}
         self._parallelism = parallelism

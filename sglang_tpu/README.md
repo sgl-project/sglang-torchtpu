@@ -124,17 +124,23 @@ prompt, cache salts and adapter namespaces keep independent ownership.
 
 Enable HiCache on both roles with `--enable-hierarchical-cache
 --hicache-io-backend raiden` and decode radix caching with
-`--disaggregation-decode-enable-radix-cache`, then set on both roles:
+`--disaggregation-decode-enable-radix-cache`, then make the decode's DRAM the
+prefill's KV offload tier with one switch on both roles:
 
 ```bash
-SGLANG_DISAGG_PREFILL_PULL_DECODE_PREFIX=1
-SGLANG_DISAGG_PREFIX_VICTIM_PUSH=1
+SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM=1
 ```
 
-For hybrid SWA models also set `SGLANG_TPU_ENABLE_PD_PREFILL_SWA_PATH_END_BACKUP=1`
-on prefill and `SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS=128` on decode (a window
-count, sized together with the decode's full-KV host budget; zero keeps the
-full-only host tier). Requirements: the Python unified radix tree, matching P/D
+The switch stands for the component flags below, which remain available for
+partial setups and keep any value set explicitly:
+
+| Flag | Role | What it enables |
+|---|---|---|
+| `SGLANG_DISAGG_PREFIX_VICTIM_PUSH=1` | both | export cold cached branches to the decode's host pools |
+| `SGLANG_DISAGG_PREFILL_PULL_DECODE_PREFIX=1` | both | recall decode-held prefixes on a prefill miss |
+| `SGLANG_TPU_PD_SWA_HOST_WINDOWS=<count>` | both | hybrid SWA models: a host tier of SWA windows on each role, one per cached path, so the window travels with a pushed victim and comes back with a recalled prefix (the switch defaults it to 128; size it with the host budget; zero keeps the full-only host tiers) |
+
+Requirements: the Python unified radix tree, matching P/D
 attention-TP and context-parallel geometry, equal page sizes and layouts, no
 pipeline or GDN/Mamba state transfer, and session affinity when several
 decodes serve one prefill.

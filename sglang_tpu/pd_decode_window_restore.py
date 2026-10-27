@@ -27,12 +27,12 @@ from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import HiCacheRestoreResult
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang_tpu import pd_spill_flags
 from sglang_tpu.disaggregation.raiden.prefix_offer import (
     deepest_device_window_prefix,
     offer_limit,
     prefix_radix_key,
 )
-from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.pd_decode_swa_hicache import (
     _swa_host_window_pages,
     swa_window_restore,
@@ -76,7 +76,7 @@ def _offer_resident_prefixes(
     of this step's offers. The restore lock is released in the step the offer
     locks the path, so the path stays locked throughout.
     """
-    if tpu_envs.SGLANG_DISAGG_PREFIX_VICTIM_PUSH.get():
+    if pd_spill_flags.victim_push_enabled():
         from sglang_tpu.pd_host_prefix_recall import offer_host_prefixes
 
         if offer_host_prefixes(queue, decode_reqs):

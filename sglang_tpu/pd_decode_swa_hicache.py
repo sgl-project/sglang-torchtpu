@@ -8,12 +8,12 @@ to host RAM:
   and prefill sends each request's SWA window fresh.
 - Decode cache hits stop where the SWA window starts, so prefill always sends
   the window and the new tokens.
-- With SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS > 0, RAM also keeps the last SWA
+- With SGLANG_TPU_PD_SWA_HOST_WINDOWS > 0, RAM also keeps the last SWA
   window of each cached path. Victim recall serves it from RAM; device-based
   prefix offers restore it before remote reads.
 - With a draft (EAGLE3, DFlash, or DSpark on the experimental worker), the draft
   KV goes to RAM together with the full-attention KV.
-- With SGLANG_TPU_ENABLE_PD_PREFILL_SWA_PATH_END_BACKUP, a PD prefill's RAM also
+- With the same SGLANG_TPU_PD_SWA_HOST_WINDOWS > 0, a PD prefill's RAM also
   keeps only the last SWA window of each path.
 
 For every raiden PD decode prefix cache, sliding-window or not, a request that
@@ -63,7 +63,7 @@ from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_disagg, get_memory
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode, HiCacheDraftPlan
-from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu import pd_spill_flags
 from sglang_tpu.tpu_dma_hicache import (
     is_tpu_dma_hicache_backend,
     tpu_dma_hicache_backends,
@@ -198,6 +198,17 @@ def _validate_full_only_host_cache_config(
             ),
             "EAGLE3, DFlash and DSpark draft KV must use the HiCache draft sidecar",
         ),
+        # The victim push and the host recall move FULL and SWA pages only;
+        # load-back derives DRAFT/DRAFT_SWA reads from the same host slots, so a
+        # transferred prefix would feed untransferred draft bytes to the draft
+        # model. Refuse the combination until sidecars travel with the pages.
+        (
+            hicache_draft_plan is None or not pd_spill_flags.victim_push_enabled(),
+            "the KV offload to decode DRAM does not transfer HiCache draft "
+            "sidecars yet; run the draft without a sidecar or turn the offload "
+            "off (SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM / "
+            "SGLANG_DISAGG_PREFIX_VICTIM_PUSH)",
+        ),
         # A packed draft lives inside the full KV pool, which this build does
         # not lay out for.
         (
@@ -256,7 +267,7 @@ def _build_kv_cache(
     logger.info(
         "PD decode SWA HiCache: requests restore full-attention KV from RAM, "
         "their SWA window comes from prefill. Host SWA windows: %d.",
-        tpu_envs.SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS.get(),
+        pd_spill_flags.decode_swa_host_windows(),
     )
     # Upstream rejects decode SWA radix + HiCache before it builds the tree.
     # _create_tree_cache turns HiCache back on for this build.
@@ -487,7 +498,7 @@ def _build_full_swa_host_stack(
 
 class _FullOnlySwaStrategy(hybrid_pool_assembler.StackStrategy):
     """Host stack of a full-only decode cache: full-attention KV, plus SWA
-    windows when SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS > 0.
+    windows when SGLANG_TPU_PD_SWA_HOST_WINDOWS > 0.
 
     ``install()`` registers it ahead of the built-in strategies. It matches only
     while ``_build_kv_cache`` builds a full-only cache, so every other cache keeps
@@ -530,7 +541,7 @@ class _FullOnlySwaStrategy(hybrid_pool_assembler.StackStrategy):
             model_name=model_name,
             enable_storage_metrics=enable_storage_metrics,
         )
-        num_windows = tpu_envs.SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS.get()
+        num_windows = pd_spill_flags.decode_swa_host_windows()
         if num_windows <= 0:
             return _build_full_only_host_stack(
                 cache=cache, kvcache=kvcache, params=params, **controller_kwargs
@@ -825,14 +836,14 @@ def _gate_decode_restores(cache: Any) -> None:
 def _maybe_enable_prefill_path_end_backup(cache: Any) -> None:
     """Register a PD prefill cache with a host SWA pool for path-end-only SWA backup."""
     if (
-        not tpu_envs.SGLANG_TPU_ENABLE_PD_PREFILL_SWA_PATH_END_BACKUP.get()
+        not pd_spill_flags.prefill_swa_path_end_backup_enabled()
         or get_disagg().disaggregation_mode != "prefill"
         or not isinstance(cache, UnifiedRadixCache)
     ):
         return
     if not cache.tree_core.has_swa_host_pool:
         logger.warning(
-            "SGLANG_TPU_ENABLE_PD_PREFILL_SWA_PATH_END_BACKUP has no effect: "
+            "SGLANG_TPU_PD_SWA_HOST_WINDOWS has no effect on this prefill: "
             "this prefill cache has no host SWA pool."
         )
         return

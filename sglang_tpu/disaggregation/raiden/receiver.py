@@ -21,6 +21,7 @@ import zmq
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver, KVTransferError
 from sglang.srt.environ import envs
+from sglang_tpu import pd_spill_flags
 from sglang_tpu.disaggregation.raiden.chunk_plan import chunk_pull_window
 from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
 from sglang_tpu.disaggregation.raiden.prefix_offer import lock_window_prefix
@@ -43,7 +44,6 @@ from sglang_tpu.disaggregation.raiden.serde import (
     VictimPush,
     write_aux_blob,
 )
-from sglang_tpu.envs import envs as tpu_envs
 
 if TYPE_CHECKING:
     from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
@@ -1668,10 +1668,7 @@ class RaidenKVReceiver(CommonKVReceiver):
             )
             # Reverse prefix reads cannot use the forward path's resharding.
             allow_prefix_offer = allow_prefix_offer and matching_geometry
-            if (
-                tpu_envs.SGLANG_DISAGG_PREFIX_VICTIM_PUSH.get()
-                and not matching_geometry
-            ):
+            if pd_spill_flags.victim_push_enabled() and not matching_geometry:
                 self.kv_mgr.record_failure(
                     self.bootstrap_room,
                     "Victim prefix caching requires matching P/D attention TP/CP sizes and PP=1",

@@ -358,6 +358,24 @@ class TestCacheConstruction(CustomTestCase):
         register_draft.assert_called_once_with(tree_cache=cache, draft_plan=draft_plan)
         self.assertIsNone(tpu._building_draft_plan)
 
+    def test_draft_sidecar_is_refused_while_the_victim_push_is_on(self):
+        # The push and the recall move FULL and SWA pages only; load-back would
+        # feed untransferred draft bytes to the draft model.
+        ctx = make_ctx()
+        draft_plan = SimpleNamespace(mode=HiCacheDraftMode.SIDECAR)
+        with (
+            patch(TPU + ".get_disagg", return_value=disagg()),
+            patch(TPU + ".get_memory", return_value=memory()),
+            tpu_envs.SGLANG_DISAGG_PREFIX_VICTIM_PUSH.override(True),
+            self.assertRaisesRegex(ValueError, "draft sidecars"),
+        ):
+            tpu._build_kv_cache(
+                lambda **kwargs: self.fail("the build must not start"),
+                **build_kwargs(
+                    spec_algorithm=spec(eagle3=True), hicache_draft_plan=draft_plan
+                ),
+            )
+
     def test_full_only_build_requires_the_full_only_stack(self):
         # E.g. a cache type the SWA host strategy does not build.
         def upstream_build(**kwargs):
@@ -564,7 +582,7 @@ class TestFullOnlyStrategy(CustomTestCase):
         host_pools = {"full": MagicMock(), "swa": MagicMock()}
         with (
             installed_patches(),
-            tpu_envs.SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS.override(num_windows),
+            tpu_envs.SGLANG_TPU_PD_SWA_HOST_WINDOWS.override(num_windows),
             patch(TPU + ".get_memory", return_value=memory()),
             patch(
                 ASSEMBLER + ".build_kv_host_pool",

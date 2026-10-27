@@ -54,6 +54,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.runtime_context import get_disagg, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
+from sglang_tpu import pd_spill_flags
 from sglang_tpu.disaggregation.raiden.common import (
     CHUNK_ANNOUNCE_TOKENS,
     DEFAULT_KV_PORT,
@@ -235,8 +236,7 @@ class RaidenKVManager(
         # Decode-held prefix pull (prefix_pull.py): the decode offers the
         # prompt prefix it holds and the prefill pulls what it lacks.
         self.prefix_pull_enabled = (
-            tpu_envs.SGLANG_DISAGG_PREFILL_PULL_DECODE_PREFIX.get()
-            and not self._pipeline_enabled
+            pd_spill_flags.decode_prefix_pull_enabled() and not self._pipeline_enabled
         )
         # Each rank reserves control+data ports for full KV, SWA KV and GDN
         # state. The
@@ -1324,7 +1324,7 @@ class RaidenKVManager(
         )
 
     def create_decode_prefix_puller(self, scheduler):
-        victim_push = tpu_envs.SGLANG_DISAGG_PREFIX_VICTIM_PUSH.get()
+        victim_push = pd_spill_flags.victim_push_enabled()
         if (
             self._prefill is not None
             and victim_push

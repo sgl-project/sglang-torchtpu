@@ -13,9 +13,9 @@ import importlib
 import os
 from collections.abc import Sequence
 
+from sglang_tpu import pd_spill_flags
 from sglang_tpu._logging import get_logger
 from sglang_tpu.envs import envs
-from sglang_tpu.envs import envs as tpu_envs
 
 logger = get_logger(__name__)
 
@@ -920,11 +920,12 @@ def _patch_pd_victim_push() -> None:
     Remove when: equivalent lifecycle callbacks are available upstream.
     """
     # Off: not even the module's imports.
-    if not tpu_envs.SGLANG_DISAGG_PREFIX_VICTIM_PUSH.get():
+    if not pd_spill_flags.victim_push_enabled():
         return
-    if not tpu_envs.SGLANG_DISAGG_PREFILL_PULL_DECODE_PREFIX.get():
+    if not pd_spill_flags.decode_prefix_pull_enabled():
         raise ValueError(
-            "Victim prefix caching requires SGLANG_DISAGG_PREFILL_PULL_DECODE_PREFIX=1"
+            "Victim prefix caching requires SGLANG_DISAGG_PREFILL_PULL_DECODE_PREFIX=1 "
+            "(or SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM=1 for the whole feature)"
         )
     from sglang_tpu import pd_victim_push
 

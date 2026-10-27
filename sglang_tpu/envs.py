@@ -365,15 +365,14 @@ class TpuEnvs:
     # of the next eviction victims kept copied to host. Unset: four chunked-prefill
     # chunks. 0: evictions back up their victims synchronously, as upstream does.
     SGLANG_TPU_HICACHE_WRITE_BACK_COPY_AHEAD_TOKENS = EnvInt(None)
-    # PD decode radix cache of a hybrid SWA model (see pd_decode_swa_hicache.py):
-    # host RAM for this many sliding windows, the last window of each cached path,
-    # so a prefill can pull a RAM-resident prefix. 0: the host tier holds full KV
-    # only. 64 windows take about 3 GB per rank for Muse Spark with fp8 KV.
-    SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS = EnvInt(0)
-    # PD prefill radix cache of a hybrid SWA model with HiCache: back up only the
-    # last SWA window of each path to host RAM, as the decode does, so the host
-    # SWA pool holds one window per cached path.
-    SGLANG_TPU_ENABLE_PD_PREFILL_SWA_PATH_END_BACKUP = EnvBool(False)
+    # P/D radix caches of a hybrid SWA model (see pd_decode_swa_hicache.py),
+    # one value on both roles. Decode: host RAM for this many sliding windows,
+    # the last window of each cached path, so a prefill can pull a RAM-resident
+    # prefix. Prefill: back up only the last SWA window of each path to host
+    # RAM, so the window can travel with a pushed victim. 0: the host tiers
+    # hold full KV only. 64 windows take about 3 GB per rank for Muse Spark
+    # with fp8 KV.
+    SGLANG_TPU_PD_SWA_HOST_WINDOWS = EnvInt(0)
 
     # TPU PD KV transfer (disaggregation/tpu/conn.py)
     # Transfers between logged latency summaries; 0 disables.
@@ -513,6 +512,11 @@ class TpuEnvs:
     SGLANG_DISAGG_PREFIX_PULL_MAX_POOL_FRACTION = EnvFloat(0.5)
     SGLANG_DISAGG_PREFIX_PULL_MIN_FREE_FRACTION = EnvFloat(0.25)
     SGLANG_DISAGG_PREFIX_VICTIM_PUSH = EnvBool(False)
+    # Use the decode's DRAM as the KV offload tier below the prefill's own RAM,
+    # one switch on both roles: the victim push, the decode-prefix pull and, on
+    # hybrid SWA models, a host tier of 128 SWA windows per role. Component
+    # flags set explicitly keep their value (see pd_spill_flags.py).
+    SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:
