@@ -169,7 +169,7 @@ clearing, JAX cache clearing, CPU-backend release, garbage collection before
 freezing and startup heap trimming. File-cache release retains its separate
 opt-outs.
 
-## Fixed-cohort benchmark gate (draft)
+## Fixed-cohort benchmark gate
 
 Set `SGLANG_TPU_BENCHMARK_BATCH_SIZE=N` to enable the opt-in gate for unified
 or P/D decode scheduling. Zero (the default) preserves ordinary scheduling.
@@ -178,20 +178,23 @@ normalization appends `_0` through `_N-1`. When using a router that overrides
 IDs, supply the same base ID in its `x-rid` header. Startup/health requests
 without the tag do not activate the gate.
 
-P/D keeps preallocation and transfer polling active, then admits all requests
-once every KV transfer has committed. Unified keeps its chunked-prefill planner,
-with decode mixing disabled, and holds decode until every request has produced
-its prefill token. The first decode forward must contain the whole batch.
+P/D keeps preallocation, transfer polling, and prebuilt result processing active.
+Each first token is emitted as soon as it is ready, preserving client TTFT.
+Decode waits until the complete KV-ready batch has emitted its first tokens.
+Unified keeps its chunked-prefill planner with decode mixing disabled and holds
+decode until every request has produced its prefill token. The first decode
+forward must contain the whole batch.
 
 One scheduler `perf_counter` start before the first decode forward and existing
 request completion timestamps define the timing window. No per-token completion
 hook or finish-time map is needed. `/server_info` internal state exposes the
 completed batch's summary under `benchmark_batch_gate`, including its cohort ID,
 decode duration, decoder output tokens, gate wait duration, and TPOT. Output
-throughput excludes the token supplied by prefill. A later metadata read does
-not extend the measurement interval.
+throughput excludes the token supplied by prefill. Output counts use the tokens
+emitted through the stop boundary, allowing SBD to overshoot internally. A later
+metadata read does not extend the measurement interval.
 
-This draft requires DP1/attention-DP1/CP1/PP1, device-resident decoder KV, and
+The gate requires DP1/attention-DP1/CP1/PP1, device-resident decoder KV, and
 full request capacity. Mixed cohorts, retraction, invalid completion, or a
 600-second prefill/KV wait invalidate the benchmark (override
 `SGLANG_TPU_BENCHMARK_TIMEOUT_SEC`).

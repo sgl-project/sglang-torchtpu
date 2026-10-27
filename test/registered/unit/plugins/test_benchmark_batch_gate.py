@@ -1,4 +1,4 @@
-"""Host checks for unified and P/D batch admission (no device runtime claim)."""
+"""Host checks for batch admission and scheduler-clock metrics; no TPU claim."""
 
 import sys
 from enum import Enum
@@ -13,10 +13,17 @@ from sglang_tpu.benchmark_batch_gate import BenchmarkBatchGate
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+class Request(NS):
+    @property
+    def output_ids_through_stop(self):
+        return self.output_ids[: self.finished_len]
+
+
 def request(index, *, cohort="batch", tokens=5):
-    req = NS(
+    req = Request(
         rid=f"hourly-batch:{cohort}_{index}",
         output_ids=[1],
+        finished_len=None,
         sampling_params=NS(max_new_tokens=tokens),
         done=False,
         time_stats=NS(completion_time=0),
@@ -52,6 +59,18 @@ def test_wait_for_full_batch_and_use_existing_completion_times(monkeypatch):
     gate.add(request(0, cohort="next"), 1001)
     assert not gate.ready([])
     assert gate.start is None
+
+
+def test_sbd_overshoot_counts_only_emitted_tokens():
+    gate = BenchmarkBatchGate(1, 10)
+    req = request(0, tokens=1024)
+    gate.add(req, 1)
+    gate.begin([req], 2)
+    req.done, req.output_ids, req.finished_len = True, [1] * 1027, 1024
+    req.time_stats.completion_time = 3
+    summary = gate.report()
+    assert summary["decode_output_tokens"] == 1023
+    assert summary["tpot_ms"] == [1000 / 1023]
 
 
 def test_missing_arrival_or_kv_times_out():
@@ -99,7 +118,7 @@ def test_invalid_completions_are_rejected(invalid):
     req.done, req.output_ids = True, [1] * 5
     req.time_stats.completion_time = 3
     if invalid == "length":
-        req.output_ids.pop()
+        req.finished_len = 4
     else:
         req.time_stats.completion_time = float("nan")
     with pytest.raises(RuntimeError):
@@ -131,6 +150,18 @@ def scheduler_classes(monkeypatch):
 
         def process_decode_queue(self):
             self.waiting_queue.append(self.transfers.pop(0))
+
+        def get_next_disagg_decode_batch_to_run(self, running):
+            prebuilt = self._get_new_prebuilt_batch(running)
+            if prebuilt.reqs:
+                self.output_streamer.stream_output(prebuilt.reqs, False)
+                running = batch(running.reqs + prebuilt.reqs)
+            if running.reqs:
+                running = self.update_running_batch(running)
+            return NS(
+                batch_to_run=running if running.reqs else None,
+                running_batch=running,
+            )
 
     class Scheduler(Mixin):
         def _add_request_to_queue(self, req, is_retracted=False):
@@ -203,29 +234,63 @@ def scheduler_classes(monkeypatch):
         scheduler.is_mixed_chunk = True
         scheduler.decode_preparations = 0
         scheduler.req_to_token_pool, scheduler.max_running_requests = NS(size=2), 2
+        scheduler.first_tokens = {}
+
+        def stream_output(reqs, return_logprob):
+            for req in reqs:
+                if req.output_ids:
+                    scheduler.first_tokens.setdefault(
+                        int(req.rid.rpartition("_")[2]), now[0]
+                    )
+
+        scheduler.output_streamer = NS(stream_output=stream_output)
         return scheduler
 
     return create, now
 
 
-def test_pd_keeps_polling_until_full_transfer(scheduler_classes):
+@pytest.mark.parametrize("defer_second_admission", [False, True])
+def test_pd_emits_first_tokens_before_waiting_for_full_decode(
+    scheduler_classes, defer_second_admission
+):
     create, now = scheduler_classes
     scheduler = create(Mode.DECODE)
     a, b = request(0), request(1)
     scheduler._add_request_to_queue(a)
-    scheduler._add_request_to_queue(b)
-    scheduler.process_decode_queue()
-    assert scheduler._get_new_prebuilt_batch(batch([])) is None
-    scheduler.process_decode_queue()
-    selected = scheduler._get_new_prebuilt_batch(batch([]))
+    if not defer_second_admission:
+        scheduler._add_request_to_queue(b)
     now[0] = 2
-    scheduler.run_batch(selected)
+    scheduler.process_decode_queue()
+    held = scheduler.get_next_disagg_decode_batch_to_run(batch([]))
+    assert held.batch_to_run is None
+    assert held.running_batch.reqs == [a]
+    assert scheduler.first_tokens.get(0) == 2
+    assert scheduler.first_tokens.get(1) is None
+    assert scheduler.decode_preparations == 0
+    assert scheduler.forward_sizes == []
+    # Another scheduler iteration preserves the held batch without re-emitting.
+    now[0] = 3
+    held = scheduler.get_next_disagg_decode_batch_to_run(held.running_batch)
+    assert held.batch_to_run is None and held.running_batch.reqs == [a]
+    assert scheduler.first_tokens.get(0) == 2
+    if defer_second_admission:
+        scheduler._add_request_to_queue(b)
+    now[0] = 5
+    scheduler.process_decode_queue()
+    plan = scheduler.get_next_disagg_decode_batch_to_run(held.running_batch)
+    assert plan.batch_to_run.reqs == [a, b]
+    assert scheduler.first_tokens.get(1) == 5
+    assert scheduler.decode_preparations == 1
+    now[0] = 6
+    scheduler.run_batch(plan.batch_to_run)
     for req in [a, b]:
         req.done, req.output_ids = True, [1] * 5
-        req.time_stats.completion_time = 6
+        req.time_stats.completion_time = 10
     now[0] = 100
     summary = scheduler.get_internal_state(None).internal_state["benchmark_batch_gate"]
     assert summary["decode_duration"] == 4
+    assert summary["tpot_ms"] == [1000, 1000]
+    assert [scheduler.first_tokens.get(i) for i in range(2)] == [2, 5]
     assert scheduler.forward_sizes == [2]
 
 

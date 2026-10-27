@@ -67,8 +67,10 @@ class BenchmarkBatchGate:
             return self.last_result
         self.check(time.perf_counter())
         reqs = list(self.requests.values())
+        # SBD can overshoot internally; measure the tokens actually emitted.
         if self.start is None or any(
-            len(r.output_ids) != r.sampling_params.max_new_tokens for r in reqs
+            len(r.output_ids_through_stop) != r.sampling_params.max_new_tokens
+            for r in reqs
         ):
             raise RuntimeError("Benchmark did not complete the requested decode")
         ends = [r.time_stats.completion_time for r in reqs]
@@ -78,10 +80,12 @@ class BenchmarkBatchGate:
             "cohort": self.cohort,
             "batch_size": self.size,
             "decode_duration": max(ends) - self.start,
-            "decode_output_tokens": sum(len(r.output_ids) - 1 for r in reqs),
+            "decode_output_tokens": sum(
+                len(r.output_ids_through_stop) - 1 for r in reqs
+            ),
             "gate_wait_duration": self.start - self.arrival,
             "tpot_ms": [
-                (end - self.start) * 1000 / (len(req.output_ids) - 1)
+                (end - self.start) * 1000 / (len(req.output_ids_through_stop) - 1)
                 for req, end in zip(reqs, ends)
             ],
         }
@@ -113,7 +117,7 @@ def install():
         return scheduler.__dict__["_benchmark_batch_gate"]
 
     original_add = Scheduler._add_request_to_queue
-    original_pd = SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch
+    original_pd = SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run
     original_unified = Scheduler.get_next_batch_to_run
     original_update = Scheduler.update_running_batch
     original_run = Scheduler.run_batch
@@ -153,15 +157,19 @@ def install():
             state.add(req, time.perf_counter())
         return original_add(self, req, is_retracted)
 
-    def pd_batch(self, running_batch):
+    def plan_with_decode_gate(self, planner, *args):
         state = gate(self)
         state.check(time.perf_counter())
-        if state.requests and state.start is None:
-            if not running_batch.is_empty():
-                raise RuntimeError("Decode started before all benchmark KV was ready")
-            if not state.ready(self.waiting_queue):
-                return None
-        return original_pd(self, running_batch)
+        state.held_batch = None
+        plan = planner(self, *args)
+        if state.held_batch is not None:
+            plan.running_batch = state.held_batch
+            state.held_batch = None
+        return plan
+
+    def pd_batch(self, running_batch):
+        # Keep prebuilt processing/first-token emission ahead of the decode gate.
+        return plan_with_decode_gate(self, original_pd, running_batch)
 
     def unified_batch(self, running_batch, last_batch):
         state = gate(self)
@@ -171,17 +179,14 @@ def install():
         if len(state.requests) != size:
             return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
         # Keep the existing chunked-prefill planner, with decode mixing disabled.
-        state.held_batch = None
         mixed = self.is_mixed_chunk
         self.is_mixed_chunk = False
         try:
-            plan = original_unified(self, running_batch, last_batch)
+            return plan_with_decode_gate(
+                self, original_unified, running_batch, last_batch
+            )
         finally:
             self.is_mixed_chunk = mixed
-        if state.held_batch is not None:
-            plan.running_batch = state.held_batch
-            state.held_batch = None
-        return plan
 
     def update_running_batch(self, batch):
         state = gate(self)
@@ -214,7 +219,7 @@ def install():
         return result
 
     Scheduler._add_request_to_queue = add
-    SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch = pd_batch
+    SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run = pd_batch
     Scheduler.get_next_batch_to_run = unified_batch
     Scheduler.update_running_batch = update_running_batch
     Scheduler.run_batch = run_batch
