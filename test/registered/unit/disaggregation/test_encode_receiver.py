@@ -224,6 +224,9 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
             def _try_recv_mm_data(self):
                 pass
 
+            def still_receiving(self):
+                return False
+
             def _fail_and_release(self, error_msg, error_code=None):
                 self.error_msg = error_msg
                 self.error_code = error_code
@@ -378,6 +381,9 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
 
             def _try_recv_mm_data(self):
                 pass
+
+            def still_receiving(self):
+                return False
 
             def release_resources(self):
                 self.released = True
