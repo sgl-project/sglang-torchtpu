@@ -507,6 +507,7 @@ def _fused_moe_jax(
     permute_dense_threshold=0,
     w1_channel_scale=None,
     w2_channel_scale=None,
+    expert_group_offset_tensor=None,
 ):
     """Production fused-MoE kernel body. Exported by ``_build_fused_moe_op``.
 
@@ -529,6 +530,11 @@ def _fused_moe_jax(
     m, hidden_size = hidden_states.shape
     num_experts = w1.shape[0]
     out_dtype = hidden_states.dtype
+    if expert_group_offset_tensor is not None:
+        # Rank-lifted EP window offset (see _resolve_expert_group_offset): a
+        # traced scalar that every use below consumes through jnp ops, so the
+        # MLIR is the same on every EP rank.
+        expert_group_offset = expert_group_offset_tensor.astype(jnp.int32).reshape(())
 
     # One token with combine (bs=1 decode) on packed MXFP4: one kernel that
     # streams only the hit experts (single_token_moe.py) replaces route
@@ -813,7 +819,7 @@ def _fused_moe_jax(
             topk_ids_flat, route_num_experts, dtype=jnp.int32
         ).sum(axis=0)
         group_offset = (
-            jnp.array([expert_group_offset], dtype=jnp.int32)
+            jnp.asarray(expert_group_offset, dtype=jnp.int32).reshape(1)
             if use_group_offset
             else None
         )
@@ -1040,6 +1046,7 @@ def _build_fused_moe_op():
         permute_dense_threshold: int = 0,
         w1_channel_scale: Optional[jax.Array] = None,
         w2_channel_scale: Optional[jax.Array] = None,
+        expert_group_offset_tensor: Optional[jax.Array] = None,
     ) -> jax.Array:
         return _fused_moe_jax(
             hidden_states,
@@ -1061,6 +1068,7 @@ def _build_fused_moe_op():
             permute_dense_threshold,
             w1_channel_scale,
             w2_channel_scale,
+            expert_group_offset_tensor,
         )
 
     custom_op = jax_op(op_name, _wrapped)
@@ -1085,6 +1093,7 @@ def _build_fused_moe_op():
         permute_dense_threshold: int = 0,
         w1_channel_scale: Optional[torch.Tensor] = None,
         w2_channel_scale: Optional[torch.Tensor] = None,
+        expert_group_offset_tensor: Optional[torch.Tensor] = None,
     ):
         if no_combine:
             return hidden_states.new_empty(
@@ -1099,6 +1108,33 @@ def _build_fused_moe_op():
 
     _PALLAS_MOE_OP = custom_op
     return custom_op
+
+
+def _resolve_expert_group_offset(
+    expert_group_offset: int,
+    global_num_experts: int,
+    num_local_experts: int,
+) -> tuple[int, Optional[torch.Tensor]]:
+    """Lift the EP rank's expert window offset into a tensor input under
+    ``trace_rank`` so every EP rank traces identical MLIR (``spmd_safe``).
+
+    Outside a rank-parameterized trace (eager, dynamo, EP=1) the offset stays a
+    static int and the op signature is unchanged. The lift relies on
+    ``moe_ep_rank == world_rank % ep_size``: ``direct_compile`` only enables
+    ``lift_rank`` when the TP group is the whole world, so the EP group is a
+    contiguous slice of it, and ``traced_rank`` raises if that ever breaks.
+    """
+    if global_num_experts <= num_local_experts:
+        # EP=1: no window, and no new op input so the trace is unchanged.
+        return expert_group_offset, None
+    from sglang_tpu.rank_local import traced_rank
+
+    ep_size = global_num_experts // num_local_experts
+    ep_rank = expert_group_offset // num_local_experts
+    rank = traced_rank(ep_rank, group_size=ep_size)
+    if rank is None:
+        return expert_group_offset, None
+    return 0, (rank * num_local_experts).to(dtype=torch.int32).reshape(1)
 
 
 def fused_moe_call(
@@ -1152,6 +1188,11 @@ def fused_moe_call(
         envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get()
         and routed_rows >= envs.SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS.get()
     )
+    expert_group_offset_int, expert_group_offset_tensor = _resolve_expert_group_offset(
+        expert_group_offset,
+        global_num_experts,
+        int(w1.shape[0]),
+    )
     return op(
         hidden_states,
         w1,
@@ -1166,10 +1207,11 @@ def fused_moe_call(
         activation,
         no_combine,
         global_num_experts,
-        expert_group_offset,
+        expert_group_offset_int,
         use_sc_gather,
         w_quant_bits,
         int(envs.SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD.get()),
         w1_channel_scale,
         w2_channel_scale,
+        expert_group_offset_tensor,
     )

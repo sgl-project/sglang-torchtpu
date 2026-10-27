@@ -44,7 +44,6 @@ _CONFIG["server_args"].update(
 _CONFIG["runtime_env"].update(
     {
         "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
-        "SGLANG_TPU_HOST_PADDING": "1",
         "SGLANG_SPEC_TP_SYNC": "rng",
         "SGLANG_RAGGED_VERIFY_MODE": "static",
         # Logs every XLA program compiled after warmup, with its source line.

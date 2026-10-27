@@ -153,8 +153,11 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
 
 
 def resolve_layout_io_compatibility(server_args: Any):
+    from sglang_tpu.tpu_dma_hicache import is_tpu_dma_hicache_backend
+
     cfg = resolving_view(server_args)
-    if cfg.hicache_io_backend in ("torch_tpu", "raiden"):
+    tpu_dma = is_tpu_dma_hicache_backend(cfg.hicache_io_backend)
+    if cfg.hicache_io_backend == "torch_tpu" or tpu_dma:
         # The TPU fused host pool (torch_tpu) and raiden both mirror the fused
         # device pool, which only supports the "page_first_fused" layout.
         if cfg.hicache_mem_layout != "page_first_fused":
@@ -234,10 +237,10 @@ def resolve_layout_io_compatibility(server_args: Any):
                 "--enable-hierarchical-cache."
             )
 
-    if cfg.hicache_io_backend == "raiden" and cfg.hicache_storage_backend is not None:
+    if tpu_dma and cfg.hicache_storage_backend is not None:
         raise ValueError(
-            "raiden io backend supports only L2 (TPU<->host) offload and has "
-            "no L3 storage path. Remove --hicache-storage-backend "
+            f"{cfg.hicache_io_backend} io backend supports only L2 (TPU<->host) "
+            "offload and has no L3 storage path. Remove --hicache-storage-backend "
             f"({cfg.hicache_storage_backend!r}) or choose a different "
             "--hicache-io-backend."
         )

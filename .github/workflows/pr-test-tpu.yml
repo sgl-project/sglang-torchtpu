@@ -58,6 +58,9 @@ jobs:
             tpu:
               - 'sglang_tpu/**'
               - 'pyproject.toml'
+              # Shared runtime TPU serves through. Keep this guard on all TPU CI
+              # until the OOT refactor is done. Not mirrored in labeler.yml.
+              - 'python/sglang/srt/**'
               # Re-export shims left by the plugin move.
               - 'python/sglang/srt/hardware_backend/tpu/**'
               - 'python/sglang/srt/layers/attention/pallas/**'

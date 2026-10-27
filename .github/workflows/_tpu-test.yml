@@ -39,8 +39,8 @@ on:
         required: false
         type: number
         default: 1
-      # Which lane's pools to use (topology.yaml). Both lanes own 1- and 2-host slices, so
-      # host count alone no longer picks a pool. nightly-test-tpu.yml passes `nightly`.
+      # Which lane's Kueue queue to use (topology.yaml); every lane shares every CI pool of
+      # a shape. nightly-test-tpu.yml passes `nightly`.
       lane:
         required: false
         type: string
@@ -170,13 +170,10 @@ jobs:
           JOB_CEILING_S=21600        # 360m, the GitHub cap
           suite="$IN_SUITE"
           python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
-          # Resolve pools before rendering, because the pod's nodeAffinity is baked in at
-          # render time. Unions topology.yaml's list with any pool labelled
-          # ci-tpu-lane=<lane> of this slice shape, and registers a new pool's Kueue flavor,
-          # so adding a slice needs no code change. Fails open to topology.yaml.
-          pools="$(python3 .github/tpu-ci/discover_pools.py \
-                     --lane "$IN_LANE" --hosts "$IN_HOSTS" --sync)"
-          echo "pools for lane=${IN_LANE} hosts=${IN_HOSTS}: ${pools}"
+          # Bring the Kueue flavors, queues and quotas in line with topology.yaml and the
+          # live CI pools, right when admission is decided. Any error fails the job: a stale
+          # quota admits onto chips that do not exist, or leaves live chips idle.
+          python3 .github/tpu-ci/reconcile_quota.py
           python3 .github/tpu-ci/render_jobset.py \
             --image "$IN_IMAGE" \
             --suite "$IN_SUITE" \
@@ -186,7 +183,6 @@ jobs:
             --exec "$IN_EXEC_CMD" \
             --hosts "$IN_HOSTS" \
             --lane "$IN_LANE" \
-            --pools "${pools}" \
             --pd-prefill-hosts "$IN_PD_PREFILL_HOSTS" \
             --pd-decode-hosts "$IN_PD_DECODE_HOSTS" \
             --weights-pvc "$IN_WEIGHTS_PVC" \
@@ -200,15 +196,6 @@ jobs:
             ${IN_NIGHTLY_FLAG:+"$IN_NIGHTLY_FLAG"} > /tmp/job.yaml
           echo "== rendered (key fields) =="
           grep -nE 'completions:|gke-tpu-topology:|ci-tpu-pool:|claimName:|bash "benchmark|for f in|run_suite.py' /tmp/job.yaml | head
-          # Quota tracks live capacity, checked here rather than on a timer: it only has to
-          # be right at the moment admission is decided. Fails open -- a stale quota is
-          # survivable (waitForPodsReady evicts and requeues), a blocked test is not.
-          # A (lane, hosts) can own several interchangeable slices, so reconcile each of its
-          # pools: --pool drives the one-slice-per-pool guard, and a resized multi-host pool
-          # must fail the job that would have straddled it.
-          for p in $(grep -o '^# ci-tpu-pools: .*' /tmp/job.yaml | cut -d' ' -f3-); do
-            python3 .github/tpu-ci/reconcile_quota.py --pool="$p"
-          done
 
           name="$(kubectl -n tpu-ci create -f /tmp/job.yaml -o name)"
           echo "Created ${name}"

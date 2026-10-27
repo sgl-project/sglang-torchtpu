@@ -40,9 +40,6 @@ CONFIG["server_args"].update(
 CONFIG["runtime_env"].update(
     {
         "FORCE_SINGLE_HOST": "1",
-        # Pad prefill token tensors on the host; padding on the TPU compiles a
-        # program per distinct prompt length.
-        "SGLANG_TPU_HOST_PADDING": "1",
         # The measured configuration also keeps the SparseCore all-gather offload off.
         "LIBTPU_INIT_ARGS": " ".join(
             LIBTPU_FLAGS

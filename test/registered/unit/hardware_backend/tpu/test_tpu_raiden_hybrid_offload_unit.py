@@ -35,13 +35,13 @@ from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.kv_free_fence import KVFreeFence, fence_hicache_backups
 from sglang_tpu.kv_pool_host import (
-    RAIDEN_LAYOUT,
-    TpuRaidenHostKVCache,
-)
-from sglang_tpu.raiden_hybrid_cache_controller import (
-    TpuRaidenHybridCacheController,
+    TPU_DMA_LAYOUT,
+    TpuDMAHostKVPool,
 )
 from sglang_tpu.raiden_transfer import RaidenKVTransfer
+from sglang_tpu.tpu_dma_hybrid_cache_controller import (
+    TpuDMAHybridCacheController,
+)
 
 
 class _FakeFuture:
@@ -100,8 +100,8 @@ class _FakeGroup:
             self.entry_map[entry.name] = entry
 
 
-def _make_controller() -> TpuRaidenHybridCacheController:
-    ctrl = object.__new__(TpuRaidenHybridCacheController)
+def _make_controller() -> TpuDMAHybridCacheController:
+    ctrl = object.__new__(TpuDMAHybridCacheController)
     full_pool = _FakeHostPool()
     swa_pool = _FakeHostPool()
     anchor = _FakeEntry(PoolName.KV, full_pool, device_pool=object())
@@ -385,11 +385,11 @@ class _FakeRaidenManager:
 
 def _raiden_host_pool(mgr: _FakeRaidenManager, page_size: int):
     """A real raiden host pool and transfer driving ``mgr``."""
-    pool = object.__new__(TpuRaidenHostKVCache)
+    pool = object.__new__(TpuDMAHostKVPool)
     pool.page_size = page_size
     pool.page_num = mgr.host.shape[1]
     pool.size = pool.page_num * page_size
-    pool.layout = RAIDEN_LAYOUT
+    pool.layout = TPU_DMA_LAYOUT
     pool.device = "cpu"
     pool.size_per_token = 1
     pool.lock = threading.RLock()
@@ -595,7 +595,7 @@ class TestKVFreeFenceCoverage(CustomTestCase):
 
         with patch.object(HybridCacheController, "__init__", init_base):
             with self.assertRaises(NotImplementedError):
-                TpuRaidenHybridCacheController()
+                TpuDMAHybridCacheController()
 
     def test_load_inside_forward_write_target_is_rejected(self):
         """A raiden load inside forward_write_target() could be given a page an
@@ -655,10 +655,10 @@ class TestDraftSidecarPlatformHook(CustomTestCase):
 class TestDispatch(CustomTestCase):
     def test_raiden_io_backend_selects_tpu_hybrid_controller(self):
         with patch.object(
-            TpuRaidenHybridCacheController, "__init__", return_value=None
+            TpuDMAHybridCacheController, "__init__", return_value=None
         ) as init:
             ctrl = HybridCacheController.create_for_backend(io_backend="raiden")
-        self.assertIsInstance(ctrl, TpuRaidenHybridCacheController)
+        self.assertIsInstance(ctrl, TpuDMAHybridCacheController)
         init.assert_called_once()
 
 

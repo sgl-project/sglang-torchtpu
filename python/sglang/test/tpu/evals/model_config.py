@@ -169,6 +169,7 @@ _GATE_PASSTHROUGH = {
     "top_k",
     "api",
     "spec_accept_length_threshold",
+    "fail_on_recompile",
     "runner",
     "report_only",
 }

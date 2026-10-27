@@ -1,16 +1,16 @@
-"""Raiden-backed hybrid HiCache controller for TPU (full + SWA pools).
+"""Hybrid HiCache controller for TPU (full + SWA pools) over a TPU DMA backend.
 
 Hybrid sliding-window models run under the unified cache with a
 ``HostPoolGroup`` of two host pools: the full-attention pool (anchor,
 ``PoolName.KV``) and the SWA pool (``PoolName.SWA``), each mirroring its own
-device sub-pool with its own page-id space. Each ``TpuRaidenHostKVCache``
-owns a raiden engine over just its sub-pool's layers, so a transfer issues
-one all-layer raiden DMA per pool.
+device sub-pool with its own page-id space. Each ``TpuDMAHostKVPool`` owns a
+``TpuDMAKVTransfer`` engine over just its sub-pool's layers, so a transfer
+issues one all-layer engine copy per pool.
 
 torch_tpu has no real device streams or events, so the CUDA
 ``HybridCacheController`` data path (side streams, per-layer load loop,
-recorded events) is replaced the same way ``TpuRaidenHiCacheController``
-replaces the single-pool path: raiden issues every copy on its own background
+recorded events) is replaced the same way ``TpuDMAHiCacheController``
+replaces the single-pool path: the engine issues every copy off the scheduler
 thread and returns poll-only future-events, which serve as the acks and feed a
 ``BatchDoneCounter`` gating the whole forward instead of a per-layer
 ``LayerDoneCounter``; index tensors stay host-resident throughout
@@ -35,11 +35,7 @@ from sglang_tpu.kv_free_fence import (
     assert_not_forward_write_target,
     deferred_dma_read,
 )
-from sglang_tpu.raiden_transfer import (
-    NOOP_EVENT,
-    CombinedFutureEvent,
-    RaidenFutureEvent,
-)
+from sglang_tpu.tpu_dma_hicache import NOOP_EVENT, CombinedFutureEvent, TransferEvent
 
 logger = logging.getLogger(__name__)
 
@@ -53,13 +49,13 @@ _KV_PAGE_POOLS = frozenset(
 def _check_kv_page_pool(name: PoolName) -> None:
     if name not in _KV_PAGE_POOLS:
         raise NotImplementedError(
-            f"The TPU raiden hybrid HiCache path does not offload the {name.value} pool."
+            f"The TPU hybrid HiCache path does not offload the {name.value} pool."
         )
 
 
-class TpuRaidenHybridCacheController(HybridCacheController):
-    """Hybrid (multi-pool) HiCache controller whose transfers go through
-    raiden DMA, one all-layer call per pool entry."""
+class TpuDMAHybridCacheController(HybridCacheController):
+    """Hybrid (multi-pool) HiCache controller whose transfers go through a
+    TPU DMA backend, one all-layer call per pool entry."""
 
     # Set by the scheduler for the tree's controller; see fence_hicache_backups.
     kv_free_fence: Optional[KVFreeFence] = None
@@ -68,7 +64,7 @@ class TpuRaidenHybridCacheController(HybridCacheController):
         super().__init__(*args, **kwargs)
         for entry in self.mem_pool_host.entries:
             _check_kv_page_pool(entry.name)
-        # raiden gates the whole forward at once (no per-layer device streams).
+        # The engine gates the whole forward at once (no per-layer device streams).
         # Swap the per-layer LayerDoneCounter for a BatchDoneCounter and
         # re-register it on the device pool wrapper (SWAKVPool holds the
         # counter itself; its sub-pools carry None), so CompiledForwardShim's
@@ -89,7 +85,7 @@ class TpuRaidenHybridCacheController(HybridCacheController):
 
     def set_mtp_draft_pools(self, mtp_draft_device_pools):
         raise NotImplementedError(
-            "MTP draft KV offload is not supported on the TPU raiden hybrid path."
+            "MTP draft KV offload is not supported on the TPU hybrid HiCache path."
         )
 
     # ----- sidecar registration ----------------------------------------------
@@ -109,7 +105,7 @@ class TpuRaidenHybridCacheController(HybridCacheController):
 
     def reset(self):
         # Drain outstanding DMAs before the base clears the ack queues and the
-        # cache frees pages: a page raiden is still copying must not return to
+        # cache frees pages: a page the engine is still copying must not return to
         # a free list mid-DMA.
         for ack in list(self.ack_write_queue) + list(self.ack_load_queue):
             ack.finish_event.synchronize()
@@ -119,7 +115,7 @@ class TpuRaidenHybridCacheController(HybridCacheController):
     # ----- index handling -----------------------------------------------------
 
     def move_indices(self, host_indices, device_indices):
-        # raiden addresses whole pages; the token->page conversion happens in
+        # Engines address whole pages; the token->page conversion happens in
         # each host pool. Keep index tensors as-is: no stream moves, no
         # host/device relocation.
         return host_indices, device_indices
@@ -156,10 +152,8 @@ class TpuRaidenHybridCacheController(HybridCacheController):
 
     # ----- transfers ----------------------------------------------------------
 
-    def _issue_pool_dmas(
-        self, op: CacheOperation, load: bool
-    ) -> List[RaidenFutureEvent]:
-        """One all-layer raiden DMA per pool entry of the merged operation.
+    def _issue_pool_dmas(self, op: CacheOperation, load: bool) -> List[TransferEvent]:
+        """One all-layer engine copy per pool entry of the merged operation.
 
         The ``HostPoolGroup`` transfer methods discard the returned
         future-events, so the child host pools are driven directly.
@@ -260,7 +254,7 @@ class TpuRaidenHybridCacheController(HybridCacheController):
         side effects. The cache runs ``loading_check`` after a True answer.
 
         Each ``BatchDoneCounter`` slot holds the load's combined future-event
-        itself, or ``None`` before the slot's first load. A raiden DMA can
+        itself, or ``None`` before the slot's first load. An engine copy can
         finish at different times on different ranks, while the cache's
         ``loading_check`` issues collectives. ``all_reduce`` combines the local
         results over the cache's rank groups, so every rank makes the same

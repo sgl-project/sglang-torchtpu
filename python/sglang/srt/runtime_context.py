@@ -531,7 +531,8 @@ class MoeFlags(_FlagGroupBase):
     ``disable_fp4_allgather`` are the ACTIVE values: the speculative contexts
     in ``layers.moe.utils`` swap them around draft-model forwards. Values are
     the parsed enums from ``layers.moe.utils``; ``None`` means "not
-    initialized yet" and the accessors fall back lazily.
+    initialized yet" and the accessors fall back to a default. The ACTIVE
+    accessors return it without writing, since compiled forwards call them.
     """
 
     a2a_backend: Any = None

@@ -82,7 +82,6 @@ def _kernel(
     hit_w_ref,
     *,
     k: int,
-    offset: int,
     num_experts: int,
     k_dim: int,
     h_out: int,
@@ -95,7 +94,8 @@ def _kernel(
     num_hits_ref[0] = 0
 
     def compact(i, carry):
-        e = ids_ref[i] - offset
+        # ids are already local (the wrapper subtracts the EP window offset).
+        e = ids_ref[i]
 
         # Non-local ids and TopK's -1 for padded tokens fall outside the range.
         @pl.when((e >= 0) & (e < num_experts))
@@ -220,7 +220,7 @@ def single_token_moe(
     topk_ids,
     topk_weights,
     *,
-    offset: int,
+    offset: int | jax.Array,
     act: str,
     hidden_size: int,
 ):
@@ -238,11 +238,15 @@ def single_token_moe(
     # eligible() guarantees a bf16 activation exactly k_dim wide.
     x = jnp.pad(hidden_states[:1], ((0, _ROWS - 1), (0, 0)))
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    # Subtract the EP window offset outside the kernel: it may be a traced
+    # scalar (rank-lifted under spmd_safe), and the kernel only sees local ids.
+    local_ids = topk_ids[0].astype(jnp.int32) - jnp.asarray(
+        offset, dtype=jnp.int32
+    ).reshape(())
     out = pl.pallas_call(
         functools.partial(
             _kernel,
             k=k,
-            offset=offset,
             num_experts=num_experts,
             k_dim=k_dim,
             h_out=h_out,
@@ -266,7 +270,7 @@ def single_token_moe(
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=_VMEM_LIMIT),
         name=f"single_token_moe_e{num_experts}_n{n}",
     )(
-        topk_ids[0].astype(jnp.int32),
+        local_ids,
         topk_weights[0].astype(jnp.float32),
         x,
         w1,

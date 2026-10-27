@@ -55,8 +55,10 @@ _COMMON_CONFIG = {
         # The ViT and decoder graph captures outlast the 300s default.
         "watchdog_timeout": 3600,
         # As in the single-host recipe: direct tracing compiles the ViT and
-        # decoder warmups concurrently instead of one after another.
+        # decoder warmups concurrently instead of one after another, and
+        # use_spmd_compile shares compiled executables across the TP group.
         "tpu_compile_tracer": "direct",
+        "use_spmd_compile": True,
         # The sampler every TPU P/D gate pins (pd_reshard_harness.py notes the
         # distributed top-k crash behind it). Greedy decoding picks the argmax
         # token with either sampler.
