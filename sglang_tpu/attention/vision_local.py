@@ -33,6 +33,12 @@ import torch.nn.functional as F
 from sglang.srt.layers.attention.vision import VisionTpuAttention
 from sglang_tpu.attention_pallas import _get_vision_local_op
 
+# Pad the local path to whole 1,024-token blocks. Padding only to 128 leaves odd
+# multiples of 128 (e.g. 3,200 = 25 x 128) on 128-token splash blocks, which is up to
+# ~16x slower; whole 1,024 blocks were the fastest or within ~13% of it at every
+# length measured, including sequences shorter than 1,024.
+_PAD_MULTIPLE = 1024
+
 
 class VisionTpuLocalAttention(VisionTpuAttention):
     """``VisionTpuAttention`` that also runs segment-local attention with block skipping.
@@ -99,9 +105,9 @@ class VisionTpuLocalAttention(VisionTpuAttention):
             k = k.repeat_interleave(repeats, dim=1)
             v = v.repeat_interleave(repeats, dim=1)
         ids = local_segment_ids.to(device=q.device, dtype=torch.int32)[0]
-        # Pad to the kernel block size like the segment-id path; pads form one more
-        # segment at the end, so the segments stay contiguous.
-        pad = (-s) % self._BLOCK_SIZE
+        # Pads form one more segment at the end: the ids stay non-decreasing, and
+        # blocks that are all padding skip the real-token blocks.
+        pad = (-s) % _PAD_MULTIPLE
         if pad > 0:
             q, k, v = (F.pad(x, (0, 0, 0, 0, 0, pad)) for x in (q, k, v))
             ids = torch.cat([ids, (ids.max() + 1).expand(pad)])

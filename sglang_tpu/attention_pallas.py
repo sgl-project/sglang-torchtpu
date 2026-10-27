@@ -525,8 +525,9 @@ def _vision_local_block_sizes(seq_len: int) -> tuple[int, int]:
 
     Large blocks keep the per-grid-step cost low; at 16,384 tokens with 1,024-token
     segments, (2048, 1024) measured fastest of the sizes that fit a 24 MiB scoped VMEM,
-    and a 4,096-token q block does not compile under that limit. Callers pad seq_len to a
-    multiple of 128.
+    and a 4,096-token q block does not compile under that limit. seq_len must be a
+    multiple of 128; ``VisionTpuLocalAttention`` pads to a multiple of 1,024 so the
+    smaller fallbacks are not hit.
     """
     block_q = next(b for b in (2048, 1024, 512, 256, 128) if seq_len % b == 0)
     block_kv = next(b for b in (1024, 512, 256, 128) if seq_len % b == 0)

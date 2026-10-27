@@ -9,7 +9,8 @@
   for full attention over a padded sequence (real tokens, then a pad tail).
 * On the TPU in bf16, the registered op through ``VisionTpuLocalAttention``, eager and
   compiled, against an fp32 CPU reference: tiles of a grid that is not a multiple of
-  the tile size, in tile order and in row-major order, with pad tokens.
+  the tile size, in tile order and in row-major order, with pad tokens; and lengths
+  that are not multiples of 1,024 at head dims 72 and 128.
 """
 
 from sglang.test.ci.ci_register import register_tpu_ci
@@ -108,11 +109,13 @@ class TestVisionTpuLocalAttentionCpu(CustomTestCase):
     def test_interleaved_segments(self):
         self._check(_tiles(32, 32, 16), seed=1)
 
-    def test_pads_to_the_block_size_as_one_more_segment(self):
-        attn = self._check(_segments([60, 40]), seed=2)
-        (ids,) = attn.seen_ids
-        self.assertEqual(ids.shape[0], 128)
-        self.assertTrue(bool((ids[100:] == 2).all()))
+    def test_pads_to_whole_1024_blocks_as_one_more_segment(self):
+        for lengths, padded in (([60, 40], 1024), ([2000, 1200], 4096)):
+            with self.subTest(seq_len=sum(lengths)):
+                attn = self._check(_segments(lengths), seed=2)
+                (ids,) = attn.seen_ids
+                self.assertEqual(ids.shape[0], padded)
+                self.assertTrue(bool((ids[sum(lengths) :] == 2).all()))
 
     def test_kv_heads_expand_to_query_heads(self):
         self._check(_segments([100, 60, 96]), h=4, kv_h=2, seed=3)
@@ -271,6 +274,31 @@ class TestVisionLocalOnTpu(CustomTestCase):
 
         _register_attention_backends()
         self.assertIs(QKV_BACKEND_IMPL["tpu"], VisionTpuLocalAttention)
+
+    def test_unaligned_lengths_and_head_dims(self):
+        # Lengths that are not multiples of 1,024 (padded inside forward) and a head
+        # dim that is not a multiple of 32; one segment, and three packed segments.
+        for n, d in ((1000, 72), (3200, 72), (3200, 128)):
+            for name, seg in (
+                ("dense", _segments([n])),
+                ("packed", _segments([n // 2, n // 3, n - n // 2 - n // 3])),
+            ):
+                with self.subTest(seq_len=n, head_dim=d, pattern=name):
+                    attn = VisionTpuLocalAttention(d, 2, 2)
+                    g = torch.Generator().manual_seed(n + d)
+                    q, k, v = (
+                        torch.randn(n, 2, d, generator=g).bfloat16() for _ in range(3)
+                    )
+                    ref = _ref_token_attention(q, k, v, seg, attn.scale)
+                    out = attn(
+                        *(x.to("tpu") for x in (q, k, v)),
+                        1,
+                        local_segment_ids=seg[None].to("tpu"),
+                    )
+                    self.assertEqual(tuple(out.shape), (n, 2, d))
+                    torch.testing.assert_close(
+                        out.float().cpu(), ref, atol=self.BF16_TOL, rtol=self.BF16_TOL
+                    )
 
     def test_local_op_matches_reference_eager_and_compiled(self):
         # 32x32 tiles of a 60x68 grid (full, 32x4, 28x32 and 28x4 tiles): 4,080
