@@ -512,6 +512,8 @@ class RaidenSenderMixin:
                 offer.prefix_tokens,
                 list(offer.blocks),
             )
+            if offer.source == "host":
+                self._prefill.prefix_host_offers.add(offer.room)
             if offer.swa_blocks:
                 self._prefill.prefix_swa_offers[offer.room] = (
                     offer.swa_first_page,
@@ -542,6 +544,16 @@ class RaidenSenderMixin:
                 ready.swa_first_page,
                 ready.swa_num_pages,
             )
+            if ready.source == "host":
+                self._prefill.prefix_host_ready.add(ready.room)
+
+    def prefix_offer_is_host(self, room: int) -> bool:
+        with self._state_lock:
+            return room in self._prefill.prefix_host_offers
+
+    def prefix_ready_is_host(self, room: int) -> bool:
+        with self._state_lock:
+            return room in self._prefill.prefix_host_ready
 
     def prefix_offer_available(self, room: int) -> bool:
         with self._state_lock:
@@ -829,6 +841,8 @@ class RaidenSenderMixin:
                 return "done"
             if req_id in self._native_failed:
                 return "failed"
+            if req_id in getattr(self, "_prefix_host_reads", {}):
+                return "pending"
             # The window read shares its full read's staging admission.
             room = self._room_of(req_id)
             if (

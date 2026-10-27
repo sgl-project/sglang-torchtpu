@@ -26,8 +26,9 @@ back, no staging slot on either side.
   offers all of them received, allocate host pages and start host reads.
   Native receive completion and VICTIM_DONE gate host-only insertion.
 
-Sticky routing sends the session's next turn to the same decode, whose prefix
-offer lets the prefill pull it back. TP/CP ranks agree on identity, content
+Sticky routing sends the session's next turn to the same decode, whose host
+prefix offer lets prefill recall it into DRAM before ordinary HBM admission.
+TP/CP ranks agree on identity, content
 and outcome before changing a tree. Hybrid models transfer full-attention KV
 and the page-aligned trailing SWA window through their separate host pools.
 """
@@ -48,20 +49,28 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeTransferQueue
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
-from sglang.srt.mem_cache.hicache_storage import (
-    PoolName,
-    PoolTransfer,
-    PoolTransferResult,
-)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.mem_cache.unified_cache.components.base import CacheTransferPhase
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 from sglang_tpu.disaggregation.raiden.prefix_pull import DecodePrefixPuller
 from sglang_tpu.disaggregation.raiden.serde import VictimAck
 from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.pd_host_cache import (
+    _anchor_host_pool,
+    _host_pages,
+    _swa_host_pool,
+    _window_tokens,
+    insert_host_prefix,
+)
+from sglang_tpu.pd_host_prefix_recall import (
+    HostPrefixPuller,
+    host_offers_pending,
+    progress_host_offers,
+    reset_host_offers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -161,59 +170,6 @@ def _path_tokens(root: Any, leaf: Any) -> List[int]:
     for part in reversed(parts):
         tokens.extend(part[1:] if tokens and leaf.key.is_bigram else part)
     return tokens
-
-
-def _host_pages(
-    root: Any, host_pool: Any, leaf: Any, *, component=_FULL, tail_tokens=None
-) -> Optional[List[int]]:
-    """Read a host-backed path (or its trailing window), in token order.
-
-    A window may start inside a radix node; only its intersecting suffix is
-    exported. Pending backups cannot serve either component yet.
-    """
-    segments = []
-    remaining = tail_tokens
-    node = leaf
-    while node is not root and (remaining is None or remaining > 0):
-        data = node.component_data[component]
-        if data.host_value is None or node.write_through_pending_id is not None:
-            return None
-        count = len(node.key) if remaining is None else min(remaining, len(node.key))
-        segments.append(host_pool._to_page_ids(data.host_value[-count:]))
-        if remaining is not None:
-            remaining -= count
-        node = node.parent
-    if remaining:
-        return None
-    return [int(p) for segment in reversed(segments) for p in segment]
-
-
-def _swa_host_pool(cache: Any) -> Any:
-    if not cache.supports_swa():
-        return None
-    return cache.host_pool_group.get_pool(PoolName.SWA)
-
-
-def _window_tokens(cache: Any, page_size: int) -> int:
-    if not cache.supports_swa():
-        return 0
-    window = cache.components[_SWA].sliding_window_size
-    return -(-window // page_size) * page_size
-
-
-def _page_hashes(tokens: List[int], page_size: int) -> List[str]:
-    try:
-        from sglang.srt.mem_cache.utils import get_hash_str
-
-        hashes = get_hash_str(tokens, None, page_size)
-        return [hashes] if isinstance(hashes, str) else list(hashes)
-    except Exception:  # noqa: BLE001 - hashes only feed storage and events
-        return [""] * (len(tokens) // page_size)
-
-
-def _anchor_host_pool(cache: Any) -> Any:
-    """The HiCache host pool that holds full KV, and its raiden manager."""
-    return cache.cache_controller.mem_pool_host.anchor_entry.host_pool
 
 
 def _maybe_log(stats: Dict[str, int], role: str, last: List[float]) -> None:
@@ -880,9 +836,8 @@ class DecodeReceiver:
         self._forget_landing(landing)
         push = landing.push
         num_tokens = len(push.tokens) - int(push.is_eagle)
-        core = self._cache.tree_core
-        result = core.insert_host(
-            core.root_node.id,
+        result = insert_host_prefix(
+            self._cache,
             RadixKey(
                 array("q", push.tokens),
                 extra_key=push.extra_key,
@@ -890,48 +845,23 @@ class DecodeReceiver:
                 is_bigram=push.is_eagle,
             ),
             landing.indices,
-            _page_hashes(list(push.tokens[:num_tokens]), self._page_size),
+            landing.swa_indices,
+            self._page_size,
         )
-        self._cache._apply_cache_actions(result.cache_actions)
         if result.host_insert_dropped or result.inserted_host_node is None:
-            self._free_landing(landing)
             self.stats["dropped"] += 1
             return
-        # Pages the tree already held for the shared prefix are duplicates.
-        if result.prefix_len > 0:
-            self._host_pool.free(landing.indices[: result.prefix_len])
-        if landing.swa_indices is not None:
-            # Use the existing prefetch commit: it splits the window boundary,
-            # fills SWA tombstones and releases duplicate window slices.
-            actions = []
-            core.commit_hicache_transfers(
-                core.root_node.id,
-                CacheTransferPhase.PREFETCH,
-                {
-                    _SWA: [
-                        PoolTransfer(
-                            name=PoolName.SWA, host_indices=landing.swa_indices
-                        )
-                    ]
-                },
-                cache_actions=actions,
-                insert_result=result,
-                pool_storage_result=PoolTransferResult(
-                    kv_hit_pages=len(push.blocks),
-                    extra_pool_hit_pages={PoolName.SWA: len(push.swa_blocks)},
-                ),
-            )
-            self._cache._apply_cache_actions(actions)
         self.stats["landed"] += 1
         self.stats["landed_tokens"] += num_tokens - result.prefix_len
 
 
-class VictimPrefixPuller(DecodePrefixPuller):
+class VictimPrefixPuller(HostPrefixPuller):
     """Prefill orchestration selected by Raiden's existing backend factory."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.pusher = PrefillPusher(self)
+        self.pusher._recall = weakref.ref(self)
 
     def commit(self, req):
         super().commit(req)
@@ -1010,6 +940,7 @@ def _resolve_deferred_releases(upstream: Callable, queue: DecodeTransferQueue) -
     """Wraps ``DecodeTransferQueue.resolve_deferred_releases``, which every rank
     runs each decode iteration: drive the receiver."""
     result = upstream(queue)
+    progress_host_offers(queue)
     receiver = _receiver(queue)
     if receiver is not None:
         receiver.step()
@@ -1023,7 +954,65 @@ def _has_pending_deferred_releases(
     landing pages sit outside the tree by design too, so the idle pool leak
     check waits for them as for deferred releases."""
     receiver = _receivers.get(queue)
-    return upstream(queue) or (receiver is not None and receiver.holds_pages())
+    return (
+        upstream(queue)
+        or host_offers_pending(queue)
+        or (receiver is not None and receiver.holds_pages())
+    )
+
+
+def _is_fully_idle(
+    upstream: Callable,
+    scheduler: Any,
+    for_health_check: bool = False,
+    ignore_waiting: bool = False,
+) -> bool:
+    """Wraps ``Scheduler.is_fully_idle``: a decode that still owns offered or
+    landing prefix pages outside its tree is not idle for a cache flush. The
+    reset would otherwise pull those pages from under the prefill's read; the
+    flush is refused like any other pending work and retried by the caller."""
+    idle = upstream(
+        scheduler, for_health_check=for_health_check, ignore_waiting=ignore_waiting
+    )
+    if (
+        idle
+        and not for_health_check
+        and scheduler.disaggregation_mode == DisaggregationMode.DECODE
+    ):
+        queue = getattr(scheduler, "disagg_decode_transfer_queue", None)
+        if queue is not None and queue.has_pending_deferred_releases():
+            return False
+    return idle
+
+
+def _evict_device_leaf(upstream: Callable, cache: Any, node_id: Any, tracker: Any):
+    """Wraps ``UnifiedRadixCache._evict_device_leaf``: skip a leaf the walk
+    already deleted, and an unbacked leaf whose deletion would orphan a
+    host-only child (a host copy reclaimed for a recall landing). Reclaiming a host copy for a recall landing leaves a
+    device leaf without a backup, which write-through eviction deletes
+    outright; the FULL walk can then yield that leaf a second time (once
+    from its start-of-walk snapshot, once as the parent of a leaf it took
+    after), and the second visit raised KeyError and ended the scheduler."""
+    try:
+        node = cache.tree_core.node_by_id(node_id)
+    except KeyError:
+        return None
+    if (
+        not cache.is_write_back
+        and not node.backuped
+        and any(
+            child.component_data[ComponentType.FULL].value is None
+            for child in node.children.values()
+        )
+    ):
+        # Write-through eviction would delete this unbacked node and orphan
+        # its host-only child; keep it on the device until that child is gone.
+        # Under write_back the upstream step backs the node up before the
+        # demote, so the child keeps a backed ancestor; skipping there would
+        # leave every session's leaf on the device (a landed recall makes it
+        # the path's device leaf) and the walk could free nothing.
+        return None
+    return upstream(cache, node_id, tracker)
 
 
 def _checkpoint(upstream, cache, req, **kwargs):
@@ -1039,20 +1028,30 @@ def _reset_cache(upstream, cache):
     ref = _pushers_by_cache.get(cache)
     pusher = ref() if ref is not None else None
     if pusher is not None:
-        pusher.release_all()
+        recall = getattr(pusher, "_recall", lambda: None)()
+        if recall is not None:
+            recall.release_all()
+        else:
+            pusher.release_all()
         pusher._routes.clear()
         pusher._pushed_len.clear()
     for receiver in list(_receivers.values()):
         if receiver._cache is cache:
             receiver.drain()
+    reset_host_offers(cache)
     return upstream(cache)
 
 
 def _patch_targets() -> tuple[tuple[Any, str, Callable], ...]:
+    # Imported here: the scheduler module is heavy and installs run early.
+    from sglang.srt.managers.scheduler import Scheduler
+
     return (
         (UnifiedRadixCache, "reset", _reset_cache),
         (UnifiedRadixCache, "checkpoint", _checkpoint),
+        (UnifiedRadixCache, "_evict_device_leaf", _evict_device_leaf),
         (DecodePreallocQueue, "add", _decode_add),
+        (Scheduler, "is_fully_idle", _is_fully_idle),
         (DecodeTransferQueue, "resolve_deferred_releases", _resolve_deferred_releases),
         (
             DecodeTransferQueue,

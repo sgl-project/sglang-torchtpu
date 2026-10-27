@@ -1531,6 +1531,10 @@ class TestDecodeHoldsTheOfferLock(CustomTestCase):
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
         queue.enable_staging = False
         queue.enable_deferred_kv_release = False
+        queue._offer_pins_pending = {}
+        queue._kv_mgr = None
+        queue.gloo_group = None
+        queue._deferred_releases = []
         queue.req_to_metadata_buffer_idx_allocator = Mock()
         queue.tp_rank = 0
         queue.tree_cache = Mock()
@@ -1566,6 +1570,76 @@ class TestDecodeHoldsTheOfferLock(CustomTestCase):
         queue.tree_cache.dec_lock_ref.assert_called_once_with("node", "receipt")
         self.assertIsNone(decode_req.prefix_offer_lock)
         self.assertEqual(receiver.window_offers, [8])
+
+    def test_offer_lock_outlives_the_queue_while_the_prefill_reads(self):
+        # The prefill's native read of the offered pages can outlive the room
+        # (a pull it timed out of and recomputed around); the pin follows the
+        # read's terminal report, not the request.
+        queue, decode_req, receiver = self._queue([KVPoll.Transferring, KVPoll.Failed])
+        active = {"io": True}
+        receiver.kv_mgr = SimpleNamespace(
+            room_has_active_io=lambda room: active["io"], _drain_engine=lambda: None
+        )
+        with patch("sglang.srt.disaggregation.decode.prepare_abort"):
+            queue.pop_transferred()
+            queue.pop_transferred()
+        self.assertEqual(queue.queue, [])
+        queue.tree_cache.dec_lock_ref.assert_not_called()
+        self.assertIsNone(decode_req.prefix_offer_lock)
+        self.assertTrue(queue.has_pending_deferred_releases())
+        queue.resolve_deferred_releases()
+        queue.tree_cache.dec_lock_ref.assert_not_called()
+        active["io"] = False
+        queue.resolve_deferred_releases()
+        queue.tree_cache.dec_lock_ref.assert_called_once_with("node", "receipt")
+        self.assertFalse(queue.has_pending_deferred_releases())
+
+
+class TestRetiredPrefixReadRecords(CustomTestCase):
+    """A prefix read's terminal report that arrives after its room was cleared
+    leaves no record behind (the room's cleanup ran first and nothing will read
+    it), whether the read failed, was served from a device source or from a
+    host source."""
+
+    def _offered_and_pulled(self):
+        mgr = _decode_manager()
+        _register(mgr, decode_prefix_len=8)
+        mgr.offer_resident_prefix(ROOM, [3, 4])
+        mgr._dispatch(PrefixPull(room=ROOM, first_page=0, num_pages=2).to_frames())
+        return mgr
+
+    def test_a_source_registration_failing_after_clear_room_is_forgotten(self):
+        # The prefill refused the landing and computed; the decode retired the
+        # room; the unused registration then expired.
+        mgr = self._offered_and_pulled()
+        mgr.clear_room(ROOM)
+        mgr._engine.poll_stats_with_details.return_value = _polled(failed=[PX])
+        mgr._drain_engine()
+        self.assertNotIn(PX, mgr._native_failed)
+        mgr._engine.poll_stats_with_details.return_value = _polled(sent=["999#px"])
+        mgr._drain_engine()
+        self.assertNotIn(PX, mgr._native_failed)
+
+    def test_a_host_source_settling_after_clear_room_is_forgotten(self):
+        for outcome in ("sent", "failed"):
+            with self.subTest(outcome=outcome):
+                mgr = self._offered_and_pulled()
+                transfer = Mock()
+                transfer.poll_transfer.return_value = outcome
+                mgr._prefix_host_reads = {PX: transfer}
+                mgr.clear_room(ROOM)
+                mgr._drain_engine()
+                transfer.forget_transfer.assert_called_once_with(PX)
+                self.assertEqual(mgr._prefix_host_reads, {})
+                self.assertNotIn(PX, mgr._completed_send)
+                self.assertNotIn(PX, mgr._native_failed)
+
+    def test_a_live_room_keeps_its_records(self):
+        mgr = self._offered_and_pulled()
+        mgr.request_status[ROOM] = KVPoll.WaitingForInput
+        mgr._engine.poll_stats_with_details.return_value = _polled(failed=[PX])
+        mgr._drain_engine()
+        self.assertIn(PX, mgr._native_failed)
 
 
 class TestDecodeServesTheWindow(CustomTestCase):

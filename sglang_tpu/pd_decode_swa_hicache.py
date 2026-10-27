@@ -9,7 +9,8 @@ to host RAM:
 - Decode cache hits stop where the SWA window starts, so prefill always sends
   the window and the new tokens.
 - With SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS > 0, RAM also keeps the last SWA
-  window of each cached path; prefix offers restore it before remote reads.
+  window of each cached path. Victim recall serves it from RAM; device-based
+  prefix offers restore it before remote reads.
 - With a draft (EAGLE3, DFlash, or DSpark on the experimental worker), the draft
   KV goes to RAM together with the full-attention KV.
 - With SGLANG_TPU_ENABLE_PD_PREFILL_SWA_PATH_END_BACKUP, a PD prefill's RAM also

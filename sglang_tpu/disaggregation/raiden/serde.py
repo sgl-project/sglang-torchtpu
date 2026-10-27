@@ -9,7 +9,7 @@ from __future__ import annotations
 import ctypes
 import enum
 import struct
-from typing import ClassVar, List, Optional
+from typing import ClassVar, List, Literal, Optional
 
 import msgspec
 
@@ -96,7 +96,7 @@ class PullReq(WireMessage):
 
 
 class PrefixOffer(WireMessage):
-    """Name the decode's device-resident prefix pages; empty blocks withdraw."""
+    """Name the decode's prefix pages in ``source``; empty blocks withdraw."""
 
     TAG: ClassVar[bytes] = MessageTag.PREFIX_OFFER
     room: int
@@ -106,6 +106,7 @@ class PrefixOffer(WireMessage):
     # pages [swa_first_page, len(blocks)) of the offer; empty on full-only models.
     swa_first_page: int = 0
     swa_blocks: list[int] = []
+    source: Literal["device", "host"] = "device"
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
@@ -151,6 +152,7 @@ class PrefixReady(WireMessage):
     swa_endpoint: str = ""
     swa_first_page: int = 0
     swa_num_pages: int = 0
+    source: Literal["device", "host"] = "device"
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")

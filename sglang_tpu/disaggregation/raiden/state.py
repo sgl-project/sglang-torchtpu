@@ -82,6 +82,9 @@ class PrefillState:
     )
     prefix_pull_reads: Dict[int, str] = field(default_factory=dict)
     prefix_resolved: Set[int] = field(default_factory=set)
+    # Host offers/registrations use the HiCache managers, not device staging.
+    prefix_host_offers: Set[int] = field(default_factory=set)
+    prefix_host_ready: Set[int] = field(default_factory=set)
     # Hybrid sliding-window models: the offer's (swa_first_page, window page
     # ids) and READY's (swa_req_id, swa_uuid, swa_endpoint, first, pages).
     prefix_swa_offers: Dict[int, Tuple[int, List[int]]] = field(default_factory=dict)
@@ -149,6 +152,7 @@ class DecodeState:
     prefill_addr: Dict[int, str] = field(default_factory=dict)
     # Hybrid sliding-window models: (swa_first_page, window page ids) offered.
     prefix_swa_blocks: Dict[int, Tuple[int, List[int]]] = field(default_factory=dict)
+    prefix_host_offers: Set[int] = field(default_factory=set)
     # Victim push: offers and done notices received and not yet taken,
     # by (prefill, seq).
     victim_pushes: Dict[Tuple[str, int], Any] = field(default_factory=dict)

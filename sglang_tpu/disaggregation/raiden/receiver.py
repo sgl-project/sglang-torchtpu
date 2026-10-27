@@ -381,6 +381,7 @@ class RaidenReceiverMixin:
         *,
         swa_first_page: int = 0,
         swa_page_ids: Sequence[int] = (),
+        source: str = "device",
     ) -> None:
         """Name the room's device-resident prefix pages to the prefill, once;
         no pages withdraws the offer promised in PULL_REQ. A hybrid model's
@@ -400,9 +401,14 @@ class RaidenReceiverMixin:
             addr = self._decode.prefill_addr.get(room)
             if blocks:
                 self._decode.prefix_blocks[room] = blocks
+                if source == "host":
+                    tokens = len(blocks) * int(self.kv_args.page_size)
+                    self._decode.prefix_host_offers.add(room)
         if addr is None:
             return
-        offer = PrefixOffer(room=room, prefix_tokens=tokens, blocks=blocks)
+        offer = PrefixOffer(
+            room=room, prefix_tokens=tokens, blocks=blocks, source=source
+        )
         if swa_blocks:
             offer = PrefixOffer(
                 room=room,
@@ -410,6 +416,7 @@ class RaidenReceiverMixin:
                 blocks=blocks,
                 swa_first_page=swa_first_page,
                 swa_blocks=swa_blocks,
+                source=source,
             )
         self._send_prefix_message(room, addr, offer.to_frames())
 
@@ -445,6 +452,7 @@ class RaidenReceiverMixin:
             swa_first, swa_blocks = self._decode.prefix_swa_blocks.get(room, (0, []))
             addr = self._decode.prefill_addr.get(room)
             aborted = room in self._aborted
+            host = room in self._decode.prefix_host_offers
         if addr is None:
             return
         wanted = [] if aborted or blocks is None else blocks[req.first_page :]
@@ -484,8 +492,19 @@ class RaidenReceiverMixin:
                     (False, req_id, uuid, wanted),
                     (True, swa_req_id, swa_uuid, swa_wanted),
                 ],
+                host=host,
             ):
                 wanted, swa_wanted, uuid, swa_uuid = [], [], 0, 0
+        endpoint = self.raiden_endpoint or ""
+        swa_endpoint = (self.swa_raiden_endpoint or "") if swa_wanted else ""
+        if host:
+            endpoint = self._prefix_host_pools[0].transfer.host_control_address(
+                self.local_ip
+            )
+            if swa_wanted:
+                swa_endpoint = self._prefix_host_pools[1].transfer.host_control_address(
+                    self.local_ip
+                )
         self._send_prefix_message(
             room,
             addr,
@@ -493,23 +512,29 @@ class RaidenReceiverMixin:
                 room=room,
                 req_id=req_id,
                 uuid=uuid,
-                endpoint=self.raiden_endpoint or "",
+                endpoint=endpoint,
                 first_page=req.first_page,
                 num_pages=len(wanted),
                 swa_req_id=swa_req_id,
                 swa_uuid=swa_uuid,
-                swa_endpoint=(self.swa_raiden_endpoint or "") if swa_wanted else "",
+                swa_endpoint=swa_endpoint,
                 swa_first_page=req.swa_first_page,
                 swa_num_pages=len(swa_wanted),
+                source="host" if host else "device",
             ).to_frames(),
         )
 
     def _register_prefix_reads(
-        self, *, room: int, reads: List[Tuple[bool, str, int, List[int]]]
+        self,
+        *,
+        room: int,
+        reads: List[Tuple[bool, str, int, List[int]]],
+        host: bool = False,
     ) -> bool:
         """Publish the decode's prefix pages for the prefill's read, as
         (on the SWA engine, req_id, uuid, pages) reads, holding a lease like a
-        chunk read. All or none: False (and no lease) if raiden refuses any."""
+        chunk read. A refusal advertises no pages. Accepted host registrations
+        still retain native ownership until their terminal reports arrive."""
         registered = []
         for swa, req_id, uuid, blocks in reads:
             if not blocks:
@@ -519,10 +544,25 @@ class RaidenReceiverMixin:
                     break
                 self._send_reads.setdefault(room, set()).add(req_id)
             try:
-                engine = self._swa_engine if swa else self._ensure_engine()
-                accepted = engine is not None and bool(
-                    engine.register_read(req_id, uuid, blocks)
-                )
+                if host:
+                    # Serialize registration with abort/room cleanup. A False
+                    # return can consume an early ACK; native completion still
+                    # owns the source pages, as in the victim export path.
+                    with self._state_lock:
+                        if (
+                            room in self._aborted
+                            or room not in self._decode.prefix_host_offers
+                        ):
+                            raise RuntimeError("Host prefix offer was released")
+                        transfer = self._prefix_host_pools[int(swa)].transfer
+                        transfer.register_read(req_id, uuid, blocks, source="host")
+                        self._prefix_host_reads[req_id] = transfer
+                    accepted = True
+                else:
+                    engine = self._swa_engine if swa else self._ensure_engine()
+                    accepted = engine is not None and bool(
+                        engine.register_read(req_id, uuid, blocks)
+                    )
             except Exception as exc:
                 logger.error(
                     "RaidenKVManager rank%d room %s: prefix register_read %s "

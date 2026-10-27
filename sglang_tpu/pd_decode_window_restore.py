@@ -1,4 +1,6 @@
-"""Restore a host-only SWA window before the decode offers its prefix.
+"""Restore a host-only SWA window for device-based prefix offers.
+
+Victim mode offers HiCache host pages directly and bypasses this restore.
 
 A hybrid SWA model's prefix offer (``prefix_offer.lock_window_prefix``) names
 only a prefix whose full KV and last sliding window are on device. With host SWA
@@ -30,6 +32,7 @@ from sglang_tpu.disaggregation.raiden.prefix_offer import (
     offer_limit,
     prefix_radix_key,
 )
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.pd_decode_swa_hicache import (
     _swa_host_window_pages,
     swa_window_restore,
@@ -73,6 +76,11 @@ def _offer_resident_prefixes(
     of this step's offers. The restore lock is released in the step the offer
     locks the path, so the path stays locked throughout.
     """
+    if tpu_envs.SGLANG_DISAGG_PREFIX_VICTIM_PUSH.get():
+        from sglang_tpu.pd_host_prefix_recall import offer_host_prefixes
+
+        if offer_host_prefixes(queue, decode_reqs):
+            return
     if not uses_window_host_cache(queue.tree_cache):
         return upstream(queue, decode_reqs)
     restores = _restores.setdefault(queue, {})
@@ -90,6 +98,9 @@ def _release_prefix_offer_lock(
     """Wraps ``_release_prefix_offer_lock``: an aborted or finished request also
     drops its restore lock as it leaves the transfer queue."""
     upstream(queue, decode_req)
+    from sglang_tpu.pd_host_prefix_recall import release_host_offer
+
+    release_host_offer(queue, decode_req)
     _release_restore(queue=queue, decode_req=decode_req)
 
 

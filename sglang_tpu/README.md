@@ -117,7 +117,9 @@ Prefill stays the primary prefix cache. Before host pressure discards a cold
 cached branch, prefill exports its FULL KV and ending SWA window to the decode
 that served the branch; the decode keeps pushed victims and does not cache its
 own generation requests. When the branch returns and misses on prefill, prefill
-pulls it back through the Raiden prefix exchange. Branches of a shared system
+recalls the FULL KV and its window directly from decode DRAM into its own host
+pages through the Raiden prefix exchange; normal admission then loads them into
+HBM, with no decode HBM restore or device staging. Branches of a shared system
 prompt, cache salts and adapter namespaces keep independent ownership.
 
 Enable HiCache on both roles with `--enable-hierarchical-cache
@@ -194,6 +196,12 @@ PY
 The native extension must come from the same build. Each victim-enabled
 host-pool manager opens a control port (port zero means cache-only), and offers
 publish that control endpoint rather than the block-data endpoint.
+
+FULL pages and the trailing window move through their own host pools under one
+producer-owned UUID. A victim is inserted only when every rank has received
+both and the producer reported success; failed transfers release both landings
+once accepted native reads settle, and shared-prefix insertions release
+duplicate FULL and SWA pages independently.
 
 ## Muse Spark multimodal
 

@@ -213,7 +213,9 @@ class RaidenKVTransfer:
         needed = bool(
             self._mgr.register_read(req_id, uuid, list(block_ids), source=source)
         )
-        self._host_transfers[req_id] = None if block_ids else "sent"
+        # Another request's poll may have cached this registration's report
+        # while the native call released the GIL on the control listener.
+        self._host_transfers.setdefault(req_id, None if block_ids else "sent")
         return needed
 
     def start_read(
@@ -242,7 +244,7 @@ class RaidenKVTransfer:
             ),
             destination=destination,
         )
-        self._host_transfers[req_id] = None
+        self._host_transfers.setdefault(req_id, None)
 
     def poll_transfer(self, req_id: str) -> HostTransferStatus | None:
         """One owner drains native reports and retains every request's result.
