@@ -566,35 +566,23 @@ def _vision_splash_block_map(segment_ids, block_q: int, block_kv: int):
     return block_mask[None], data_next[None]
 
 
-def _vision_splash_layout(segment_ids):
-    """One splash sequence for a batch: (flat segment ids [batch * seq_len], block_q, block_kv).
-
-    Splash runs one sequence, so the batch rows are laid end to end and each row's ids
-    move into their own range: rows stay apart and the ids stay non-decreasing. Ids
-    may be negative, so they are shifted to start at 0 before the per-row offset. The
-    block sizes come from one row's length, so they divide it and no q block spans two
-    rows (a q block over two rows would make both rows' kv blocks live).
-    """
-    b, s = segment_ids.shape
-    block_q, block_kv = _vision_splash_block_sizes(s)
-    if b > 1:
-        segment_ids = segment_ids - segment_ids.min()
-        row = jnp.arange(b, dtype=jnp.int32)[:, None]
-        segment_ids = segment_ids + row * (segment_ids.max() + 1)
-    return segment_ids.reshape(b * s), block_q, block_kv
-
-
 def _vision_splash_attention(q, k, v, segment_ids, *, sm_scale: float, interpret=False):
     """Segment-ID attention with block skipping; the JAX body of the splash op.
 
-    q, k, v: [batch, num_heads, seq_len, head_dim]; segment_ids: [batch, seq_len], the
-    layout of the segment-ID flash op. Runs splash attention with the block map of
+    q, k, v: [1, num_heads, seq_len, head_dim]; segment_ids: [1, seq_len], the layout
+    of the segment-ID flash op with batch 1 (one sequence; ``VisionTpuSplashAttention``
+    hands dense batches to the flash op). Runs splash attention with the block map of
     ``_vision_splash_block_map`` and the segment ids as the in-block mask. Splash takes
     no softmax scale, so q is scaled first.
     """
-    b, h, s, d = q.shape
-    segment_ids, block_q, block_kv = _vision_splash_layout(segment_ids)
-    q, k, v = (x.transpose(1, 0, 2, 3).reshape(h, b * s, d) for x in (q, k, v))
+    if q.shape[0] != 1:
+        raise ValueError(
+            "TPU vision splash attention runs one sequence (batch 1); "
+            f"got batch {q.shape[0]}"
+        )
+    segment_ids = segment_ids[0]
+    q, k, v = q[0], k[0], v[0]
+    block_q, block_kv = _vision_splash_block_sizes(q.shape[1])
     block_mask, data_next = _vision_splash_block_map(segment_ids, block_q, block_kv)
     mask_info = splash_mask_info.MaskInfo(
         data_next=data_next,
@@ -622,14 +610,14 @@ def _vision_splash_attention(q, k, v, segment_ids, *, sm_scale: float, interpret
     out = kernel(
         q * sm_scale, k, v, segment_ids=splash.SegmentIds(q=segment_ids, kv=segment_ids)
     )
-    return out.reshape(h, b, s, d).transpose(1, 0, 2, 3)
+    return out[None]
 
 
 def _get_vision_splash_op(sm_scale: float):
     """Return a cached pallas op for segment-ID vision attention with block skipping.
 
-    Same arguments as the segment-ID flash op above (``[b, h, s, d]`` q, k, v and
-    ``[b, s]`` segment ids). For segments much shorter than the sequence (local windows
+    Same arguments as the segment-ID flash op above (``[1, h, s, d]`` q, k, v and
+    ``[1, s]`` segment ids), batch 1 only. For segments much shorter than the sequence (local windows
     or tiles), the flash op computes every query-key block and masks most of them. This
     op skips the blocks whose segments cannot meet, so with the ids non-decreasing in
     token order (each segment contiguous, segments numbered in order) its cost scales

@@ -5,11 +5,11 @@
   sequences pad to whole 1,024-token blocks with the pads as one more segment, KV
   heads expand, and a dense batch (bsz > 1) goes to the flash path unchanged.
 * On the JAX CPU device: the block map marks every block pair that holds a same-segment
-  query-key pair (and only overlapping ones); a batch laid end to end keeps each q
-  block inside one row and rows apart (also with negative ids); block sizes reject
-  lengths off the 128 grid; and the op's JAX body, splash in interpret mode, equals
-  the reference for contiguous and interleaved segments, for full attention over a
-  padded sequence (real tokens, then a pad tail), and for batches of two rows.
+  query-key pair (and only overlapping ones); block sizes reject lengths off the 128
+  grid; the op rejects a batch of more than one sequence; and the op's JAX body,
+  splash in interpret mode, equals the reference for contiguous and interleaved
+  segments and for full attention over a padded sequence (real tokens, then a pad
+  tail).
 * On the TPU in bf16, the registered op through ``VisionTpuSplashAttention``, eager and
   compiled, against an fp32 CPU reference: tiles of a grid that is not a multiple of
   the tile size, in tile order and in row-major order, with pad tokens; lengths that
@@ -219,34 +219,6 @@ class TestVisionSplashJax(CustomTestCase):
         self.assertEqual(int((sparse > 0).sum()), 2 + 2)
         self._check_body(out_of_order.repeat_interleave(1024), h=1, d=16, seed=9)
 
-    def test_batch_layout_keeps_q_blocks_within_a_row(self):
-        # Block sizes from the batch length would give 2,048-token q blocks here: over
-        # two 1,024-token rows, or across the middle of two 3,072-token rows, making
-        # both rows' kv blocks live. Block sizes from one row keep every q block
-        # inside its row, so only each row's own block pairs are live.
-        import jax.numpy as jnp
-        import numpy as np
-
-        from sglang_tpu.attention_pallas import (
-            _vision_splash_block_map,
-            _vision_splash_layout,
-        )
-
-        for rows, s in ((4, 1024), (2, 3072)):
-            with self.subTest(rows=rows, seq_len=s):
-                seg = torch.zeros(rows, s, dtype=torch.int32)
-                with self._cpu():
-                    flat, block_q, block_kv = _vision_splash_layout(
-                        jnp.asarray(seg.numpy())
-                    )
-                    mask, _ = _vision_splash_block_map(flat, block_q, block_kv)
-                flat, mask = np.asarray(flat), np.asarray(mask)[0]
-                row_of_q_block = flat.reshape(-1, block_q)
-                self.assertTrue(bool((row_of_q_block == row_of_q_block[:, :1]).all()))
-                self.assertEqual(
-                    int((mask > 0).sum()), rows * (s // block_q) * (s // block_kv)
-                )
-
     def test_block_sizes_reject_lengths_off_the_128_grid(self):
         from sglang_tpu.attention_pallas import _vision_splash_block_sizes
 
@@ -255,22 +227,36 @@ class TestVisionSplashJax(CustomTestCase):
                 with self.assertRaises(ValueError):
                     _vision_splash_block_sizes(bad)
 
+    def test_op_runs_one_sequence(self):
+        # Dense batches never reach splash (VisionTpuSplashAttention hands them to the
+        # flash op), so the op takes batch 1 only.
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention_pallas import _vision_splash_attention
+
+        q = jnp.zeros((2, 1, 1024, 16), jnp.float32)
+        with self._cpu():
+            with self.assertRaises(ValueError):
+                _vision_splash_attention(
+                    q, q, q, jnp.zeros((2, 1024), jnp.int32), sm_scale=0.25
+                )
+
     def test_block_map_is_sparse_for_contiguous_segments(self):
         mask, _ = self._block_map(_segments([1024] * 16), 2048, 1024)
         # Each 2048-token q block holds two segments, i.e. two of 16 kv blocks.
         self.assertEqual(int((mask > 0).sum()), 8 * 2)
 
     def _check_body(self, seg, h, d, seed):
-        """seg: [s] for one row, or [b, s]; q, k, v in the op layout [b, h, s, d]."""
+        """seg: [s]; q, k, v in the op layout [1, h, s, d]."""
         import jax.numpy as jnp
         import numpy as np
 
         from sglang_tpu.attention_pallas import _vision_splash_attention
 
         torch.manual_seed(seed)
-        seg = seg.reshape(-1, seg.shape[-1])
+        seg = seg[None]
         scale = 1.0 / math.sqrt(d)
-        q, k, v = (torch.randn(seg.shape[0], h, seg.shape[1], d) for _ in range(3))
+        q, k, v = (torch.randn(1, h, seg.shape[1], d) for _ in range(3))
         with self._cpu():
             out = _vision_splash_attention(
                 *(jnp.asarray(x.numpy()) for x in (q, k, v)),
@@ -291,18 +277,6 @@ class TestVisionSplashJax(CustomTestCase):
 
     def test_splash_body_interleaved_segments(self):
         self._check_body(_tiles(64, 64, 32), h=1, d=16, seed=6)
-
-    def test_splash_body_batch_rows_stay_apart(self):
-        # Two rows with the same ids (real 0, pad 1): laid end to end, the second row's
-        # ids are offset, so no query attends to the other row.
-        seg = torch.stack([_segments([700, 324]), _segments([1000, 24])])
-        self._check_body(seg, h=2, d=16, seed=12)
-
-    def test_splash_body_batch_rows_stay_apart_with_negative_ids(self):
-        # Ids -1 and 0 in both rows: offsetting by max + 1 alone would turn the second
-        # row's -1 into 0 and let it attend to the first row's 0 tokens.
-        seg = torch.stack([_segments([600, 424]) - 1, _segments([300, 724]) - 1])
-        self._check_body(seg, h=2, d=16, seed=13)
 
     def test_splash_body_full_attention_with_a_pad_tail(self):
         # Dense: the 3,500 real tokens reach into every q and kv block (2 x 4 live).
