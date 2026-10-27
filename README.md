@@ -24,7 +24,7 @@ SGLang-TorchTPU brings [SGLang](https://github.com/sgl-project/sglang) to Google
 
 **PyTorch-native TPU serving.** Develop with familiar PyTorch workflows and deploy on TPU7x (Ironwood), with `torch.compile` and direct compilation. Tensor, expert, data, pipeline, and context parallelism cover a range of serving configurations.
 
-**Efficient inference at scale.** Combine prefix caching, HiCache KV offload to host memory, and disaggregated prefill/decode with TP resharding. Low-precision inference includes FP8, MXFP4, INT4 W4A16, and FP8 KV cache.
+**Efficient inference at scale.** Combine prefix caching, HiCache KV offload to host memory, disaggregated prefill/decode with TP resharding, and encoder disaggregation for vision-language models. Low-precision inference includes FP8, MXFP4, INT4 W4A16, and FP8 KV cache.
 
 **Speculative decoding.** Explore EAGLE3, DFlash, DFlash2, DSPark, and MTP for supported model configurations. The speculative decoding developer guide below covers worker selection and model-specific requirements.
 
@@ -97,6 +97,7 @@ Development and testing focus on **TPU7x (Ironwood)**, from a single host to mul
 | Single host | 4 chips, 8 TensorCores; TP up to 8 |
 | Multi-host | 2 hosts; TP 16 |
 | Disaggregated serving | 4 hosts; 2 prefill + 2 decode |
+| Encoder disaggregation | Vision encoder on its own host or chips; sized independently of the language model |
 
 ## Models and features
 
@@ -115,6 +116,22 @@ Selected model integrations include the following. Recipe availability and test 
 See the [full support guide](SUPPORT.md) for support tiers, model-specific requirements, and experimental capabilities.
 
 Explore [model recipes](benchmark/tpu/recipe/README.md), [TPU benchmarks](benchmark/tpu/README.md), and the [CI support matrix](SUPPORT_MATRIX.md) for configurations and test coverage.
+
+## Encoder disaggregation (EPD)
+
+Qwen3-VL (8B, 235B-A22B) can run its vision encoder in a separate encode server that sends image embeddings to a language-only server ([#665](https://github.com/sgl-project/sglang-torchtpu/pull/665)).
+
+- **Latency.** At the same request rate, TPOT drops 4-30% on 8B and 5-24% on 235B-A22B, and TTFT stays low as load rises: at 5 req/s on 235B-A22B, 392 ms vs 2091 ms with the encoder on the same host.
+- **HBM.** The language server no longer compiles or runs the encoder, so after warmup it uses about 2 GB less HBM per TensorCore (8B and 235B-A22B alike).
+- **Independent topology.** The encoder and the language model pick their own TP size and hosts: for example, a TP8/EP8 235B-A22B language server with a TP8 encoder on a second host. Scale the encoder by adding encode servers or TP; encoder data parallelism is not supported on TPU.
+
+```bash
+# Encode server (requires --enable-torch-compile on TPU)
+sglang serve --model-path $MODEL --device tpu --tp-size 8 --enable-torch-compile --encoder-only
+# Language server; without a registered encoder it returns 503 for image requests
+sglang serve --model-path $MODEL --device tpu --tp-size 8 --enable-torch-compile --language-only \
+  --encoder-urls http://$ENCODER_HOST:$ENCODER_PORT
+```
 
 ## Part of the SGLang ecosystem
 
