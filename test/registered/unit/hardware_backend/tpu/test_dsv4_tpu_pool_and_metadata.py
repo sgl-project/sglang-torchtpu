@@ -59,9 +59,7 @@ def _make_dsv4_tpu_pool(
 ) -> DSV4TPUTokenToKVPool:
     from sglang.srt.runtime_context import get_context
 
-    override = get_context().override_server_args(
-        dsv4_attn_backend="tpu_dsv4", page_size=256
-    )
+    override = get_context().override_server_args(page_size=256)
     override.install()
     testcase.addCleanup(override.restore)
 
@@ -313,9 +311,7 @@ class TestDSV4TPUMemoryPool(CustomTestCase):
         """
         from sglang.srt.runtime_context import get_context
 
-        override = get_context().override_server_args(
-            dsv4_attn_backend="tpu_dsv4", page_size=256
-        )
+        override = get_context().override_server_args(page_size=256)
         override.install()
         self.addCleanup(override.restore)
 
@@ -625,6 +621,98 @@ class TestDSV4TPUPatches(CustomTestCase):
         req_to_token_pool.register_on_alloc_rows.assert_called_once_with(
             pool.clear_c4_req_states
         )
+
+    def test_dsv4_tpu_compressor_and_resolution_hooks(self):
+        from unittest.mock import MagicMock
+
+        from sglang.srt.arg_groups import model_override_base, resolution_hooks
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang_tpu.hooks.dsv4 import (
+            _tpu_deepseek_v4_env_adjustments,
+            _tpu_deepseek_v4_overrides,
+            forward_tpu_dsv4_compressor,
+            register_tpu_dsv4_resolution_hooks,
+            skip_tpu_dsv4_ape_hotfix,
+        )
+
+        # 1. Verify skip_tpu_dsv4_ape_hotfix leaves ape untouched and sets ape_converted
+        ape = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+        ape_orig = ape.clone()
+        comp = SimpleNamespace(ape=ape, ape_converted=False, head_dim=8)
+        skip_tpu_dsv4_ape_hotfix(
+            lambda c: self.fail("original _apply_ape_hotfix should not run"), comp
+        )
+        self.assertTrue(comp.ape_converted)
+        self.assertTrue(torch.equal(comp.ape, ape_orig))
+
+        # 2. Verify forward_tpu_dsv4_compressor handles idle and non-idle forward batches
+        idle_fb = SimpleNamespace(forward_mode=ForwardMode.IDLE)
+        empty_x = torch.empty((0, 16), dtype=torch.bfloat16)
+        out_idle = forward_tpu_dsv4_compressor(None, comp, empty_x, idle_fb)
+        self.assertEqual(tuple(out_idle.shape), (0, 8))
+
+        active_fb = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        x = torch.ones((4, 16), dtype=torch.bfloat16)
+        attn_backend = MagicMock()
+        sentinel = object()
+        attn_backend.forward_compress.return_value = sentinel
+        out_active = forward_tpu_dsv4_compressor(
+            None, comp, x, active_fb, attn_backend=attn_backend
+        )
+        self.assertIs(out_active, sentinel)
+        attn_backend.forward_compress.assert_called_once_with(comp, x, active_fb)
+
+        # 3. Verify idempotent registration and TPU-only behavior of config/env hooks
+        register_tpu_dsv4_resolution_hooks()
+        register_tpu_dsv4_resolution_hooks()
+        fns = model_override_base._MODEL_OVERRIDE_FNS.get("DeepseekV4ForCausalLM", [])
+        self.assertEqual(fns.count(_tpu_deepseek_v4_overrides), 1)
+        res_hooks = resolution_hooks._HOOKS.get("handle_model_specific_adjustments", [])
+        self.assertEqual(res_hooks.count(_tpu_deepseek_v4_env_adjustments), 1)
+
+        hf = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+        self.assertEqual(
+            _tpu_deepseek_v4_overrides(SimpleNamespace(device="cuda"), hf), {}
+        )
+        self.assertEqual(
+            _tpu_deepseek_v4_overrides(SimpleNamespace(device="tpu"), hf),
+            {
+                "prefill_attention_backend": "dsv4",
+                "decode_attention_backend": "dsv4",
+                "disable_shared_experts_fusion": True,
+            },
+        )
+
+        server_args = SimpleNamespace(
+            device="tpu",
+            model_path="/tmp/fake-dsv4",
+            _model_config=SimpleNamespace(hf_config=hf),
+            _model_config_built_from="/tmp/fake-dsv4",
+        )
+        prev_called = []
+        with (
+            envs.SGLANG_OPT_FP8_WO_A_GEMM.override(True),
+            envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(True),
+            envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.override(True),
+            envs.SGLANG_OPT_USE_TILELANG_MHC_POST.override(True),
+            envs.SGLANG_OPT_FUSE_MHC_POST_PRE.override(True),
+            envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.override(True),
+            envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(True),
+            envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.override(False),
+        ):
+            _tpu_deepseek_v4_env_adjustments(
+                server_args, lambda sa: prev_called.append(sa)
+            )
+            self.assertEqual(prev_called, [server_args])
+            self.assertFalse(envs.SGLANG_OPT_FP8_WO_A_GEMM.get())
+            self.assertFalse(envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get())
+            self.assertFalse(envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get())
+            self.assertFalse(envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get())
+            self.assertFalse(envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get())
+            self.assertFalse(envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get())
+            self.assertFalse(envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get())
+            self.assertTrue(envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get())
 
 
 if __name__ == "__main__":

@@ -24,10 +24,13 @@ from sglang_tpu.hooks.draft_kv_pool import (
 from sglang_tpu.hooks.dsa_kv_pool import size_tpu_dsa_kv_pool
 from sglang_tpu.hooks.dsv4 import (
     build_tpu_dsv4_kv_pool,
+    forward_tpu_dsv4_compressor,
     get_tpu_dsv4_bytes_per_full_token,
     get_tpu_dsv4_bytes_per_swa_token,
     get_tpu_dsv4_c128_state_fixed_bytes,
     get_tpu_dsv4_fixed_c4_state_bytes,
+    register_tpu_dsv4_resolution_hooks,
+    skip_tpu_dsv4_ape_hotfix,
 )
 from sglang_tpu.hooks.encoder import (
     bootstrap_encoder_worker,
@@ -322,6 +325,16 @@ HOOKS: list[tuple] = [
         HookType.AROUND,
     ),
     (
+        "sglang.srt.layers.attention.dsv4.compressor.Compressor._apply_ape_hotfix",
+        skip_tpu_dsv4_ape_hotfix,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.layers.attention.dsv4.compressor.Compressor.forward_native",
+        forward_tpu_dsv4_compressor,
+        HookType.AROUND,
+    ),
+    (
         "sglang.srt.speculative.dflash_utils.dflash_draft_cell_size_per_token",
         draft_cell_size_per_token,
         HookType.AROUND,
@@ -368,6 +381,7 @@ def register() -> None:
     )
 
     register_muse_spark_processor()
+    register_tpu_dsv4_resolution_hooks()
 
     from sglang.srt.plugins.hook_registry import HookRegistry
 
