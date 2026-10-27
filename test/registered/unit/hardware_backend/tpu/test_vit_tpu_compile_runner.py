@@ -416,17 +416,7 @@ class TestViTTpuCompileRunner(unittest.TestCase):
             _supports_segment_ids=True, forward=lambda x, cu, cos, sin, seg: x
         )
         vit.graph_runners = runner
-        policy = Qwen3VLVisionTpuCompilePolicy(
-            vit,
-            owner=vit,
-            model_runner=SimpleNamespace(
-                server_args=SimpleNamespace(
-                    tpu_compile_tracer="direct",
-                    unsafe_save_torch_compile_bundle=None,
-                    unsafe_load_torch_compile_bundle=None,
-                )
-            ),
-        )
+        policy = Qwen3VLVisionTpuCompilePolicy(vit, owner=vit)
         events = []
 
         def compile_artifact(args, kwargs, **options):
@@ -442,6 +432,7 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         with (
             envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True),
             envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.override(False),
+            _graph_config(tpu_compile_tracer="direct"),
             patch.object(vit_runner, "_precompiled_max_patch_count", None),
             patch.object(vit_runner, "tpu_sync") as sync,
             patch.object(
