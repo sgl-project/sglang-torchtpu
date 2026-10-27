@@ -6,8 +6,6 @@ text encoder, the highest TPU clock and a 65536 KiB scoped-VMEM limit for XLA fu
 64 MiB of per-core VMEM on tpu7x (3% faster denoise on Z-Image-Turbo than without it); see `launch.sh`. The Wan
 recipes compile per transformer block (`--regional-compile`), which keeps each block's collectives inside its program,
 and run Ulysses across the two cores of a chip with a K/V all-gather ring across chips.
-That placement relies on Ulysses groups being contiguous ranks (ring groups are strided, see `parallelism.mdx`) and on
-ranks 2k and 2k+1 being the two cores of one chip, as in the default `--num-gpus 8` device order.
 
 | Recipe | Model | Cores | Parallelism |
 | :--- | :--- | :---: | :--- |
@@ -29,10 +27,7 @@ e.g. `./ltx2.sh --warmup-resolutions 1280x720`.
 
 tpu7x 2x2x1, steady-state request (the first request compiles), seed 42. E2E and peak HBM come from a default run;
 denoise step and VAE decode from a run with `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1`, which synchronizes the device at
-stage boundaries (otherwise queued denoising work is counted in the decode stage). Shapes whose token count does not
-divide by the sequence-parallel size (the two I2V rows) pad the sequence; attention masks the padding.
-Workers run float32 matmuls and convolutions at full float32 precision, as CUDA does (torch_tpu's default is a
-single bf16 pass), so the float32 Wan VAE decode costs about 1.7x what it did in bf16.
+stage boundaries (otherwise queued denoising work is counted in the decode stage).
 
 | Model | Request | Cores | E2E | Denoise step | VAE decode | Peak HBM / core |
 | :--- | :--- | :---: | ---: | ---: | ---: | ---: |

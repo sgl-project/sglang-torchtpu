@@ -104,11 +104,11 @@ All kernels are tuned for TPU7x. The Pallas kernels check for TPU v4 or newer, b
 | Kimi-K2.5 | INT4 | shares the K2.6 path | **Experimental** | MoonViT vision tower compiled per image. No K2.5-specific test. |
 | Kimi-K3 / K3-Linear | bf16 | 1 host (tiny config) | **Experimental** | Largest per-model TPU code path (KDA attention). Only a dummy-weight compile smoke runs; no real checkpoint served in CI. |
 | Gemma 4 (31B, 26B-A4B) | bf16 | 1 host | **Experimental** | Text and vision. Accuracy and perf suites registered; red at the time of writing. Moves to Supported when green. |
-| Wan2.2-TI2V-5B (diffusion) | bf16 | 1 chip; 1 host (CFG 2 x Ulysses 2 x ring 2); multi-host collectives | **Experimental** | Diffusion engine with the opt-in Pallas splash attention backend and per-block torch.compile; spatial-parallel VAE decode. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). External nightly only, no recent green. |
-| Wan2.2-T2V-A14B, Wan2.2-I2V-A14B (diffusion) | bf16 | 1 host (CFG 2 x Ulysses 2 x ring 2); 2 hosts (ring 4) | **Experimental** | As TI2V-5B, with both experts resident. No on-device e2e test. |
-| FLUX.2-klein-4B (diffusion) | bf16 | 1 chip; 1 host (Ulysses 4) | **Experimental** | Pallas splash attention, torch.compile. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). No on-device e2e test. |
-| Z-Image-Turbo (diffusion) | bf16 | 1 chip (Ulysses 2) | **Experimental** | Pallas splash attention, torch.compile. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). No on-device e2e test. |
-| LTX-2 (diffusion) | bf16 | 1 host (CFG 2 x Ulysses 4) | **Experimental** | Video and audio. Pallas splash attention, torch.compile. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). No on-device e2e test. |
+| Wan2.2-TI2V-5B (diffusion) | bf16 | 1 chip; 1 host (CFG 2 x Ulysses 2 x ring 2); multi-host collectives | **Experimental** | Diffusion engine with the opt-in Pallas splash attention backend and per-block torch.compile; spatial-parallel VAE decode. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
+| Wan2.2-T2V-A14B, Wan2.2-I2V-A14B (diffusion) | bf16 | 1 host (CFG 2 x Ulysses 2 x ring 2); 2 hosts (ring 4) | **Experimental** | As TI2V-5B, with both experts resident. |
+| FLUX.2-klein-4B (diffusion) | bf16 | 1 chip; 1 host (Ulysses 4) | **Experimental** | Pallas splash attention, torch.compile. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
+| Z-Image-Turbo (diffusion) | bf16 | 1 chip (Ulysses 2) | **Experimental** | Pallas splash attention, torch.compile. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
+| LTX-2 (diffusion) | bf16 | 1 host (CFG 2 x Ulysses 4) | **Experimental** | Video and audio. Pallas splash attention, torch.compile. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
 | Llama, Qwen3 dense (other sizes), Qwen3-MoE (other sizes), Kimi-Linear | — | — | **Experimental** | Generic TPU path with no model-specific test. |
 
 ## Features
