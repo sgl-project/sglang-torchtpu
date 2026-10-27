@@ -20,7 +20,6 @@ backend.
 from __future__ import annotations
 
 from sglang.srt.layers.attention.vision import VisionTpuAttention
-from sglang_tpu.attention_pallas import _get_vision_splash_op
 
 
 class VisionTpuSplashAttention(VisionTpuAttention):
@@ -36,5 +35,9 @@ class VisionTpuSplashAttention(VisionTpuAttention):
 
     def __init__(self, head_dim, num_heads, num_kv_heads, **kwargs):
         super().__init__(head_dim, num_heads, num_kv_heads, **kwargs)
+        # Imported here, not at module level: _register_attention_backends imports
+        # this module on hosts without JAX (CPU CI), and the class is only built on TPU.
+        from sglang_tpu.attention_pallas import _get_vision_splash_op
+
         # Same arguments as the flash op the parent's forward calls.
         self._flash_op = _get_vision_splash_op(float(self.scale))
