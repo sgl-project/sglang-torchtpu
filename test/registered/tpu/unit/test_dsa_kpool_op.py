@@ -47,7 +47,7 @@ class TestKpoolServingOp(unittest.TestCase):
                 after = [lens[r] + new[r] for r in range(2)]
                 distribution = [0, 0, 2] if step == 0 else [2, 2, 2]
                 # An independent reference for constant channels and zero gate:
-                # average four raw rows, round to BF16, rotate, round again, quantize.
+                # average four raw rows, round to BF16, rotate, and quantize.
                 for r in range(2):
                     for i in range(new[r]):
                         pos = lens[r] + i
@@ -57,7 +57,7 @@ class TestKpoolServingOp(unittest.TestCase):
                         page = int(pages[r * 4 + end // 128])
                         value = raw_cpu[page, end % 128 - 3 : end % 128 + 1, 0]
                         mean = value.float().mean().bfloat16().float()
-                        rotated = (mean * (128**0.5)).bfloat16().float()
+                        rotated = mean * (128**0.5)
                         exponent = torch.ceil(
                             torch.log2(rotated.abs().clamp_min(1e-4) / 448)
                         )

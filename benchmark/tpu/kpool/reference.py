@@ -2,7 +2,8 @@
 """Frozen step-2 oracle from dsa_kpool_topk.py at ab8861d5bac88f2e7010c8e808e61088dc8191a1.
 
 Kept independent of the candidate and serving imports for module validation.
-BF16 roundings use reduce_precision so the compiled oracle keeps both of them.
+The pooled sum is rounded with reduce_precision, which XLA cannot drop; the
+rotation is quantized from F32 without a second rounding.
 """
 
 import jax
@@ -97,15 +98,14 @@ def _pool_records(compressed: jax.Array, record_bytes: int) -> jax.Array:
 
 def compress_pools(keys: jax.Array, gates: jax.Array, ape: jax.Array) -> jax.Array:
     """keys / gates [..., kpool, d] (bf16), ape [kpool, d] f32 -> rotated pooled
-    keys [..., d] f32, rounded through bf16 as upstream's writer does."""
+    keys [..., d] f32; the pooled sum is rounded to bf16, the rotation is not."""
     score = gates.astype(jnp.float32) + ape.astype(jnp.float32)
     weight = jax.nn.softmax(score, axis=-2)
     pooled = jnp.sum(weight * keys.astype(jnp.float32), axis=-2)
     # reduce_precision, not an astype round trip: XLA's excess-precision pass
-    # drops f32->bf16->f32 pairs, which silently removed the second rounding.
+    # can drop f32->bf16->f32 pairs.
     pooled = jax.lax.reduce_precision(pooled, exponent_bits=8, mantissa_bits=7)
-    rotated = hadamard_rotate(pooled)
-    return jax.lax.reduce_precision(rotated, exponent_bits=8, mantissa_bits=7)
+    return hadamard_rotate(pooled)
 
 
 def computation(

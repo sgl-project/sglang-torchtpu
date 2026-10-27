@@ -32,11 +32,10 @@ def pool_rows(raw, ape):
 
 
 def pack_pools(pooled):
-    """Pool BF16 -> rotate F32 -> round BF16 -> FP8 keys and scale bytes."""
+    """Pool BF16 -> rotate F32 -> FP8 keys and scale bytes."""
     rotated = _hadamard128(pooled.astype(jnp.float32)) * (128**-0.5)
-    # Upstream's Triton writer and compress_pools round the rotated key to BF16
-    # before FP8 quantization; skipping it changes FP8 rounding near ties.
-    rotated = rotated.astype(jnp.bfloat16).astype(jnp.float32)
+    # Quantize the F32 rotation directly. Upstream's Triton writer rounds it to
+    # BF16 first; that lowered GLM-5.3-Flash MTP acceptance on TPU, so it is omitted.
     amax = jnp.maximum(jnp.max(jnp.abs(rotated), axis=1, keepdims=True), 1e-4)
     exponent = jnp.ceil(jnp.log2(amax / 448.0))
     q = jnp.clip(rotated / jnp.exp2(exponent), -448.0, 448.0).astype(jnp.float8_e4m3fn)
