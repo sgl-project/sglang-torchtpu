@@ -49,8 +49,6 @@ divide by the sequence-parallel size (the two I2V rows) pad the sequence; attent
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 17.0 s | 0.698 s | 1.2 s | 71.9 GB |
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 23.2 s | 0.433 s | 2.3 s | 60.6 GB |
 
-Known limit: Wan2.2-I2V-A14B at 720p-class sizes with 121 frames fails in VAE decode (one decode program needs about
-40.9 GB of HBM; about 35 GB per core is free).
 
 ## Example requests
 
