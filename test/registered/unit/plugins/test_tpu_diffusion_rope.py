@@ -39,7 +39,8 @@ def _rope_inputs(dtype, head_dim, interleaved):
 
 
 class TestRopePairSwap(CustomTestCase):
-    def test_bf16_pair_swap_matches_the_strided_form(self):
+    def test_bf16_pair_swap_matches_the_cuda_kernel(self):
+        # The CUDA kernel's contract: float32 tables and math, one rounding.
         torch.manual_seed(0)
         for head_dim in (64, 128):
             for interleaved in (False, True):
@@ -55,7 +56,9 @@ class TestRopePairSwap(CustomTestCase):
                             rope.apply_rotary_embedding_pair_swap(
                                 x, cos, sin, interleaved
                             ),
-                            apply_rotary_embedding_native(x, cos, sin, interleaved),
+                            apply_rotary_embedding_native(
+                                x.float(), cos, sin, interleaved
+                            ).to(x.dtype),
                         )
                     )
                     pair_swap_matrix.assert_called_once()
