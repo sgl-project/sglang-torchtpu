@@ -142,6 +142,10 @@ def test_compile_cache_disabled_skips(monkeypatch, tmp_path, caplog, env_name):
     monkeypatch.setattr(page_cache, "_CACHE_ROOT", tmp_path)
     monkeypatch.delenv("TORCH_TPU_TIER2_COMPILATION_CACHE", raising=False)
     monkeypatch.delenv("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE", raising=False)
+    # sglang defaults TORCHINDUCTOR_CACHE_DIR to ~/.cache/sglang/inductor, which
+    # exists on a runner where an earlier test compiled.
+    monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
+    monkeypatch.delenv("JAX_COMPILATION_CACHE_DIR", raising=False)
     monkeypatch.setenv(env_name, "disabled")
     monkeypatch.setattr(
         page_cache, "_filesystem_type", lambda _: pytest.fail("cache disabled")

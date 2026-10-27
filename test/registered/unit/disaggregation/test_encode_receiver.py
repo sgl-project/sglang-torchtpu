@@ -9,6 +9,8 @@ from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from fastapi import HTTPException
+
 from sglang.srt.disaggregation.encoder.receiver import (
     MMReceiverBase,
     WaitingMMRequestStatus,
@@ -260,7 +262,8 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
         self.assertEqual(other.status, WaitingMMRequestStatus.PENDING)
         self.assertEqual([req.rid for req, _, _ in abort_reqs], [owner.rid])
 
-    def test_extra_key_and_cache_salt_are_forwarded(self):
+    @staticmethod
+    def _create_req(input_ids):
         scheduler = SimpleNamespace(
             model_config=SimpleNamespace(hf_eos_token_id={2}, vocab_size=128),
             disaggregation_mode=DisaggregationMode.NULL,
@@ -273,7 +276,7 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
         recv_req = SimpleNamespace(
             rid="request-1",
             input_text="hello",
-            input_ids=array("q", [1, 2]),
+            input_ids=input_ids,
             sampling_params=SamplingParams(max_new_tokens=1),
             return_logprob=False,
             top_logprobs_num=0,
@@ -297,10 +300,19 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
             http_worker_ipc=None,
         )
 
-        req = MMReceiverBase.create_req(receiver, recv_req)
+        return MMReceiverBase.create_req(receiver, recv_req)
+
+    def test_extra_key_and_cache_salt_are_forwarded(self):
+        req = self._create_req(array("q", [1, 2]))
 
         self.assertEqual(req.extra_key, "classification")
         self.assertEqual(req.cache_salt, "tenant-a")
+
+    def test_abort_for_request_awaiting_encoder_has_input_ids(self):
+        """A failed encode aborts a request that has no input_ids yet; streaming that abort must not crash the scheduler."""
+        req = self._create_req(None)
+
+        self.assertEqual(len(req.origin_input_ids), 0)
 
     def test_rdma_worker_error_is_released_on_scheduler_thread(self):
         scheduler_thread = threading.get_ident()
@@ -393,6 +405,29 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
         self.assertTrue(waiting_req.released)
         self.assertTrue(waiting_req.closed)
         self.assertEqual(len(abort_reqs), 1)
+
+
+class TestEncodeDispatchWithoutEncoder(CustomTestCase):
+    """With no encoder registered, a multimodal request fails instead of encoding locally."""
+
+    @staticmethod
+    def _dispatch(mm_data):
+        receiver = SimpleNamespace(
+            encode_urls=[], _extract_url_data=lambda obj: mm_data
+        )
+        obj = SimpleNamespace(rid="request-1", need_wait_for_mm_inputs=True)
+        result = MMReceiverBase._send_encode_request(receiver, obj)
+        return obj, result
+
+    def test_rejects_mm_request(self):
+        with self.assertRaises(HTTPException) as raised:
+            self._dispatch(["http://example.invalid/a.png"])
+        self.assertEqual(raised.exception.status_code, HTTPStatus.SERVICE_UNAVAILABLE)
+
+    def test_text_only_request_passes_without_waiting(self):
+        obj, result = self._dispatch([])
+        self.assertIsNone(result)
+        self.assertFalse(obj.need_wait_for_mm_inputs)
 
 
 if __name__ == "__main__":

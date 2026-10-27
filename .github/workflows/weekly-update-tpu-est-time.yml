@@ -1,0 +1,81 @@
+name: Weekly Update TPU Est Time
+
+# weekly-update-est-time.yml calibrates from upstream's sglang-ci-stats, which has
+# no TPU data; this one measures the TPU nightlies' own passing runs.
+on:
+  schedule:
+    - cron: '0 1 * * 1'  # Monday 01:00 UTC, after the upstream est_time bot
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Recent scheduled runs to sample per TPU workflow"
+        required: false
+        default: "15"
+
+permissions:
+  actions: read
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-tpu-est-time:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Update TPU est_time values
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUNS: ${{ inputs.runs || '15' }}
+        run: |
+          python .github/tpu-ci/update_tpu_est_time.py \
+            --runs "$RUNS" \
+            --summary-file /tmp/tpu_est_time_summary.md
+
+      - name: Check for changes
+        id: changes
+        run: |
+          if git diff --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "No TPU est_time changes detected"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            git diff --stat
+          fi
+
+      - name: Create PR
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
+        run: |
+          git config user.name "sglang-bot"
+          git config user.email "sglang-bot@users.noreply.github.com"
+          BRANCH_NAME="bot/update-tpu-est-time-$(date +%Y%m%d)"
+          git checkout -b "$BRANCH_NAME"
+          git add -A
+          git commit -m "chore: update TPU CI est_time from recent nightly runs"
+          git push origin "$BRANCH_NAME"
+          {
+            echo "## Summary"
+            echo
+            echo "Recalibrates TPU \`est_time\` (and \`timeout_per_file\` where it mirrors \`est_time\`) from the TPU nightlies' own passing runs: p90 x 1.25 of each file's measured runtime, applied only for moves of at least 60s and 10%."
+            echo
+            echo "\`_tpu-test.yml\` books a job's runtime from these values and spends what is left of the runner's 6h queueing for a slice, so an over-stated estimate surfaces as NOT ADMITTED."
+            echo
+            cat /tmp/tpu_est_time_summary.md 2>/dev/null
+            echo
+            echo "🤖 Generated with GitHub Actions"
+          } > /tmp/pr_body.md
+          gh pr create \
+            --title "chore: update TPU CI est_time values" \
+            --body-file /tmp/pr_body.md \
+            --base main \
+            --head "$BRANCH_NAME"
