@@ -36,7 +36,11 @@ from sglang_tpu.attention.pallas.mla_sparse.kv_cache_utils import (
     KVCacheType,
     SparseMLAKVCacheSpec,
 )
-from sglang_tpu.attention.pallas.mla_sparse_qblock import sparse_mla_prefill_qblock
+from sglang_tpu.attention.pallas.mla_sparse_qblock import (
+    sparse_mla_prefill_qblock,
+    vmem_bytes,
+    vmem_limit_bytes,
+)
 
 # Query tokens per sparse-attention gather chunk under the q-block opt-in. The
 # kernel unrolls its chunk loop at trace time, one SparseCore gather program per
@@ -53,12 +57,10 @@ QBLOCK_MIN_TOKENS = 512
 # grows with the context. Measured at 80 pages (10k context); longer contexts
 # keep the per-query kernel until measured.
 QBLOCK_MAX_PAGES_PER_SEQ = 128
-# The query-blocked kernel keeps num_heads * query_block score rows in VMEM:
-# the query window, the f32 accumulator and the output take about 6.5 KiB per
-# row. 8192 rows fit: 32 heads per chip (attention TP2) with 256-query blocks.
-# 64 heads per chip (attention TP1) with 256-query blocks need 113 MiB, so
-# they take 128-query blocks. More heads keep the per-query kernel.
-QBLOCK_MAX_ROWS = 8192
+# Query blocks the query-blocked kernel may take, largest first. Its VMEM
+# grows with num_heads * query_block (mla_sparse_qblock.vmem_bytes): with
+# 128-token pages, 32 heads per chip (attention TP2) fit 256-query blocks,
+# and 64 heads per chip (attention TP1) need 113 MiB at 256, so they take 128.
 QBLOCK_QUERY_BLOCKS = (256, 128)
 
 # The sparse kernels only support these two sizes.
@@ -66,11 +68,32 @@ NOPE_DIM = 512
 ROPE_DIM = 64
 
 
-def qblock_query_block(num_heads: int) -> int | None:
+def qblock_query_block(
+    num_heads: int,
+    *,
+    q_width: int,
+    page_size: int,
+    pages_per_seq: int,
+    dtype: jnp.dtype,
+) -> int | None:
     """Queries per block of the query-blocked kernel for ``num_heads`` heads
-    per chip: the largest choice whose score rows fit, or None if none fits."""
+    per chip: the largest choice that fits in VMEM, or None if none fits."""
+    limit = vmem_limit_bytes()
     return next(
-        (qb for qb in QBLOCK_QUERY_BLOCKS if num_heads * qb <= QBLOCK_MAX_ROWS), None
+        (
+            qb
+            for qb in QBLOCK_QUERY_BLOCKS
+            if vmem_bytes(
+                num_heads,
+                qb,
+                q_width=q_width,
+                page_size=page_size,
+                pages_per_seq=pages_per_seq,
+                dtype=dtype,
+            )
+            <= limit
+        ),
+        None,
     )
 
 
@@ -148,7 +171,13 @@ def sparse_mla_attention_fused(
     )
 
     pages_per_seq = page_indices.shape[0] // (cu_q_lens.shape[0] - 1)
-    query_block = qblock_query_block(ql_nope.shape[1])
+    query_block = qblock_query_block(
+        ql_nope.shape[1],
+        q_width=ql_nope.shape[-1] + q_pe.shape[-1],
+        page_size=cache_nope.shape[1],
+        pages_per_seq=pages_per_seq,
+        dtype=ql_nope.dtype,
+    )
     if (
         qblock_kpool
         and query_block is not None

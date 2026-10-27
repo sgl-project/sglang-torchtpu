@@ -62,6 +62,44 @@ def _align(x: int, m: int) -> int:
     return _cdiv(x, m) * m
 
 
+def vmem_bytes(
+    num_heads: int,
+    query_block: int,
+    *,
+    q_width: int,
+    page_size: int,
+    pages_per_seq: int,
+    dtype: jnp.dtype,
+) -> int:
+    """VMEM the kernel needs, from the buffers its pallas_call declares.
+
+    Pallas keeps two copies of each blocked input and output, and one of each
+    scratch buffer. Most of the total is per score row (num_heads *
+    query_block): about 7 KiB at 128-token pages. On tpu7x the estimate is up
+    to 0.6 MiB above what the compiler reports, e.g. 113.6 vs 113.0 MiB at 64
+    heads with 256-query blocks.
+    """
+    itemsize = jnp.dtype(dtype).itemsize
+    per_row = (
+        2 * _align(q_width, 128) * itemsize  # query window
+        + 2 * NOPE_DIM * itemsize  # output
+        + NOPE_DIM * 4  # f32 accumulator
+        + 2 * 8 * 4  # f32 running max and sum; a [1, n] buffer takes 8 sublanes
+        + page_size * 4  # f32 scores of one page, [page_size, rows]
+    )
+    per_block = (
+        2 * _align(pages_per_seq, 8) * query_block * 4  # selection words
+        + 2 * 8 * query_block * 4  # query positions
+        + _NBUF * page_size * (4 * 128 + ROPE_LANES)  # key ring
+    )
+    return num_heads * query_block * per_row + per_block
+
+
+def vmem_limit_bytes() -> int:
+    """VMEM the kernel may use: its compile limit, or the chip's VMEM if less."""
+    return min(_VMEM_LIMIT_BYTES, pltpu.get_tpu_info().vmem_capacity_bytes)
+
+
 def _qblock_kernel(
     # Scalar prefetch
     num_live_ref,  # i32[1] blocks holding real queries; the rest are skipped
