@@ -50,6 +50,7 @@ mxfp4 path. ``"swiglu_oai"`` is supported for GPT-OSS, and
 # jax.Array`` at registration time; PEP 563 would turn those into
 # strings and validation would reject them.
 
+import dataclasses
 import logging
 import math
 from typing import TYPE_CHECKING, NamedTuple, Optional
@@ -263,10 +264,18 @@ def _gmm2_tile_source(lhs, w2, w2_scale, num_experts, *, w2_packed):
 
     Every other dtype keeps the kernel's own adaptive ``calculate_tiling``
     unless gmm_v2 was measured at its exact shape (``_tuned_or_calculated``).
+
+    ``SGLANG_TPU_FUSED_MOE_GMM2_TILE_N`` widens the packed lookup's tile_n when
+    it divides the output width (tile_m and tile_k, the accumulation order,
+    stay, so the results are bitwise identical).
     """
     if not w2_packed:
         return _tuned_or_calculated(lhs, w2, w2_scale, num_experts)
-    return _lookup_tile_info(lhs, w2, w2_scale, num_experts, packed_fp4=True)
+    tiles = _lookup_tile_info(lhs, w2, w2_scale, num_experts, packed_fp4=True)
+    tile_n = tpu_envs.SGLANG_TPU_FUSED_MOE_GMM2_TILE_N.get()
+    if tile_n and w2.shape[-1] % tile_n == 0:
+        tiles = dataclasses.replace(tiles, tile_n=tile_n)
+    return tiles
 
 
 def _tuned_or_calculated(lhs, rhs, rhs_scale, num_experts):

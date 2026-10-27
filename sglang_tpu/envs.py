@@ -90,6 +90,10 @@ class TpuEnvs:
     # MoE router: one Pallas kernel for the biased sigmoid top-k of decode-sized
     # batches (kernels/router_topk.py); False keeps the generic top-k.
     SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL = EnvBool(True)
+    # MoE: tile_n override for the packed-FP4 down projection (gmm2) when it
+    # divides the output width; 0 keeps the tuned table. tile_m/tile_k (the
+    # accumulation order) are unchanged, so results are bitwise identical.
+    SGLANG_TPU_FUSED_MOE_GMM2_TILE_N = EnvInt(0)
     # GLM-5.3-Flash: single-request target steps (the MTP verify, or decode
     # without speculation) as one Pallas call per device (glm_flash_megakernel/);
     # other steps run the model as usual. ..._MAX_LEN caps the request length the
