@@ -12,8 +12,8 @@
 * On the TPU in bf16, the registered op through ``VisionTpuSplashAttention``, eager and
   compiled, against an fp32 CPU reference: tiles of a grid that is not a multiple of
   the tile size, in tile order and in row-major order, with pad tokens; lengths that
-  are not multiples of 1,024 at head dims 72 and 128; and ``cu_seqlens`` and a
-  padded batch of two.
+  are not multiples of 1,024 (16 to 3,200 tokens) at head dims 64, 72, 80 and 128; and
+  ``cu_seqlens`` and a padded batch of two.
 """
 
 from sglang.test.ci.ci_register import register_tpu_ci
@@ -291,9 +291,10 @@ class TestVisionSplashOnTpu(CustomTestCase):
         self.assertIs(QKV_BACKEND_IMPL["tpu"], VisionTpuSplashAttention)
 
     def test_unaligned_lengths_and_head_dims(self):
-        # Lengths that are not multiples of 1,024 (padded inside forward) and a head
-        # dim that is not a multiple of 32; one segment, and three packed segments.
-        for n, d in ((1000, 72), (3200, 72), (3200, 128)):
+        # Lengths that are not multiples of 1,024 (padded inside forward), down to a
+        # few patches, and head dims that are not multiples of 32 or 128; one segment,
+        # and three packed segments.
+        for n, d in ((16, 64), (100, 80), (1000, 72), (3200, 72), (3200, 128)):
             for name, seg in (
                 ("dense", _segments([n])),
                 ("packed", _segments([n // 2, n // 3, n - n // 2 - n // 3])),
