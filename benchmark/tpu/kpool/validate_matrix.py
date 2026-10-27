@@ -51,12 +51,17 @@ def validation_cases(section="all"):
     return cases
 
 
-def make_inputs(case):
+def make_inputs(case, page_size=128):
     batch, q, edge = case["batch"], case["query_length"], case["edge"]
+    ps = page_size
     name = f"{case['mode']}_q{q}_b{batch}_{edge}"
     seed = int(hashlib.sha256(name.encode()).hexdigest()[:8], 16)
     rng = np.random.default_rng(seed)
-    starts = np.resize(np.array([3, 7, 11, 15, 127, 131, 255, 511], np.int32), batch)
+    # Page edge, one past it, the second page's end and the pooled-page edge 4P-1.
+    starts = np.resize(
+        np.array([3, 7, 11, 15, ps - 1, ps + 3, 2 * ps - 1, 4 * ps - 1], np.int32),
+        batch,
+    )
     if case["mode"] == "prefill":
         starts[:] = 0
     lengths = np.full(batch, q, np.int32)
@@ -65,13 +70,15 @@ def make_inputs(case):
     elif edge == "padding":
         lengths[:] = 0
     elif edge == "boundary":
-        starts = np.resize(np.array([124, 127, 508, 511], np.int32), batch)
+        starts = np.resize(
+            np.array([ps - 4, ps - 1, 4 * ps - 4, 4 * ps - 1], np.int32), batch
+        )
     elif edge == "shared":
         pair = (3, 7) if q == 1 else (1, 8) if q == 6 else (0, 4)
         starts = np.resize(np.array(pair, np.int32), batch)
     elif edge == "shared_nonadjacent":
         starts[0], starts[-1] = 3, 7
-    pages_per_request = max(8, (int(np.max(starts + lengths)) + 127) // 128 + 1)
+    pages_per_request = max(8, (int(np.max(starts + lengths)) + ps - 1) // ps + 1)
     pages = batch * pages_per_request + 1
     mapping = rng.permutation(np.arange(1, pages)).astype(np.int32)
     if edge == "shared":
@@ -79,7 +86,7 @@ def make_inputs(case):
             mapping[i * pages_per_request] = mapping[(i - 1) * pages_per_request]
     elif edge == "shared_nonadjacent":
         mapping[(batch - 1) * pages_per_request] = mapping[0]
-    raw = rng.normal(size=(pages, 128, 256)).astype(np.float32)
+    raw = rng.normal(size=(pages, ps, 256)).astype(np.float32)
     if edge == "zero":
         raw[..., :128] = 0
     elif edge == "tiny":
@@ -87,8 +94,8 @@ def make_inputs(case):
     elif edge == "nonfinite":
         for i, value in enumerate((np.nan, np.inf, -np.inf)):
             end = int(starts[i]) // 4 * 4 + 3
-            raw[mapping[i * pages_per_request + end // 128], end % 128 - 3, 0] = value
-    old = rng.integers(0, 256, (pages, 32, 4, 256), dtype=np.uint8)
+            raw[mapping[i * pages_per_request + end // ps], end % ps - 3, 0] = value
+    old = rng.integers(0, 256, (pages, ps // 4, 4, 256), dtype=np.uint8)
     cu = np.concatenate(([0], np.cumsum(lengths))).astype(np.int32)
     active = batch // 2 if edge == "inactive_tail" else batch
     distribution = (
@@ -114,11 +121,19 @@ def main():
     parser.add_argument("--queries", nargs="+", type=int)
     parser.add_argument("--batches", nargs="+", type=int)
     parser.add_argument(
+        "--page-size",
+        type=int,
+        default=128,
+        help="Raw page size P (a multiple of 16); the pooled cache is [pages, P//4, 4, 256]",
+    )
+    parser.add_argument(
         "--conservative-bound",
         action="store_true",
         help="Exercise the API fallback that uses total padded tokens as the bound",
     )
     opts = parser.parse_args()
+    if opts.page_size < 16 or opts.page_size % 16:
+        parser.error("Require a page size that is a positive multiple of 16")
     opts.output.mkdir(parents=True, exist_ok=True)
     candidate, digest = load_candidate(Path(__file__).resolve().parents[3])
     baseline = jax.jit(reference.computation, static_argnums=(7, 8))
@@ -144,8 +159,10 @@ def main():
             for name in ("jax", "jaxlib", "libtpu", "numpy")
         },
         "expected_cases": len(cases),
+        "page_size": opts.page_size,
         "selection": {
             "section": opts.section,
+            "page_size": opts.page_size,
             "queries": opts.queries,
             "batches": opts.batches,
             "conservative_bound": opts.conservative_bound,
@@ -157,7 +174,7 @@ def main():
     }
     print("MATRIX_ACCURACY_IDENTITY", json.dumps(result), flush=True)
     for case in cases:
-        name, args, old = make_inputs(case)
+        name, args, old = make_inputs(case, opts.page_size)
         print("MATRIX_ACCURACY_START", name, flush=True)
         fn = (
             candidate
@@ -165,7 +182,7 @@ def main():
             else partial(candidate, max_query_length=case["query_length"])
         )
         fused = jax.jit(fn, static_argnums=(7, 8), donate_argnums=(1,))
-        row = {**case, "name": name}
+        row = {**case, "name": name, "page_size": opts.page_size}
         try:
             expected = np.asarray(
                 baseline(args[0], jnp.asarray(old.copy()), *args[1:], case["tokens"], 4)
