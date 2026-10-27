@@ -1555,6 +1555,11 @@ class Envs:
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
+    # Chat requests with media: send the rendered chat template as the prompt
+    # instead of encode() + decode() of it; the MM processor tokenizes the text
+    # again anyway. Only when the text round trip is not lossy and there are no
+    # tools and no assistant prefix, where the round trip is the identity.
+    SGLANG_CHAT_MM_SKIP_PROMPT_REENCODE = EnvBool(False)
 
     # ===================================================================
     # Encoder pipeline and disaggregation
