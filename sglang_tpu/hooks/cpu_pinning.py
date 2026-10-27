@@ -34,6 +34,19 @@ def _core_of(cpu: int) -> set[int]:
     return cpus
 
 
+def bind_rank_cpu_set(original_fn, gpu_id: int):
+    """Why: TPU ranks bind one chip at index 0; all pass gpu_id 0 and share one CPU set.
+    How: AROUND set_gpu_proc_affinity; pass tp_rank modulo the TP ranks per host.
+    Upstream PR or issue: none.
+    Remove when: core keys SGLANG_SET_CPU_AFFINITY's set on the host-local rank.
+    """
+    from sglang.srt.runtime_context import get_parallel
+
+    parallel = get_parallel()
+    tp_size_per_node = parallel.tp_size // max(parallel.nnodes // parallel.pp_size, 1)
+    return original_fn(parallel.tp_rank % tp_size_per_node)
+
+
 def pin_scheduler_main_thread(scheduler, *args, **kwargs) -> None:
     from sglang_tpu.envs import envs as tpu_envs
 
