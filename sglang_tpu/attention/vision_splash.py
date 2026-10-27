@@ -20,7 +20,8 @@ flash at batch 16 (packing the same images as one sequence by ``cu_seqlens`` pad
 once and does not pay this).
 
 ``_register_attention_backends`` installs it as the ``"tpu"`` vision attention
-backend.
+backend when ``SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION=1`` (opt-in; off keeps
+``VisionTpuAttention``). Callers can also build it directly.
 """
 
 from __future__ import annotations

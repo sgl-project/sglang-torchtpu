@@ -47,6 +47,9 @@ class TpuEnvs:
     # query-blocked kernel (attention/pallas/mla_sparse_qblock.py), which fetches
     # each block's union of selected pages once; False keeps the per-query kernel.
     SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL = EnvBool(False)
+    # Vision: run single-sequence "tpu" vision attention through block-skipping splash
+    # (attention/vision_splash.py); False keeps the segment-id flash op.
+    SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION = EnvBool(False)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.

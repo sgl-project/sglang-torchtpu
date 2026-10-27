@@ -14,7 +14,8 @@
   compiled, against an fp32 CPU reference: tiles of a grid that is not a multiple of
   the tile size, in tile order and in row-major order, with pad tokens; lengths that
   are not multiples of 1,024 (16 to 3,200 tokens) at head dims 64, 72, 80 and 128; and
-  ``cu_seqlens``; and a padded batch of two, bitwise equal to ``VisionTpuAttention``.
+  ``cu_seqlens``; a padded batch of two, bitwise equal to ``VisionTpuAttention``; and
+  the ``"tpu"`` backend is splash only with ``SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION``.
 """
 
 from sglang.test.ci.ci_register import register_tpu_ci
@@ -28,6 +29,7 @@ register_tpu_ci(
 
 import math
 import unittest
+from unittest.mock import patch
 
 import torch
 from einops import rearrange
@@ -303,12 +305,23 @@ class TestVisionSplashOnTpu(CustomTestCase):
     # bf16 inputs and outputs against an fp32 reference of the same bf16 inputs.
     BF16_TOL = 2e-2
 
-    def test_backend_registration(self):
+    def test_backend_registration_is_opt_in(self):
         from sglang.srt.layers.attention.vision import QKV_BACKEND_IMPL
+        from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.tpu_platform import _register_attention_backends
 
-        _register_attention_backends()
-        self.assertIs(QKV_BACKEND_IMPL["tpu"], VisionTpuSplashAttention)
+        flag = tpu_envs.SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION
+        for enabled, expected in (
+            (False, VisionTpuAttention),
+            (True, VisionTpuSplashAttention),
+        ):
+            with (
+                self.subTest(enabled=enabled),
+                flag.override(enabled),
+                patch.dict(QKV_BACKEND_IMPL, {"tpu": VisionTpuAttention}),
+            ):
+                _register_attention_backends()
+                self.assertIs(QKV_BACKEND_IMPL["tpu"], expected)
 
     def test_unaligned_lengths_and_head_dims(self):
         # Lengths that are not multiples of 1,024 (padded inside forward), down to a
