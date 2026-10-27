@@ -401,9 +401,9 @@ def _eager_temb_table_slices(
     # One contiguous (B, S, D) tensor per slice, as the fused kernel writes.
     # Chunk views of the (B, S, 6, D) sum would cross the compiled graph's
     # collective splits, and torch_tpu re-lays such views out in every block.
-    # fp32 (1, D) + bf16 (B, S, D) promotes to fp32 exactly, without a
-    # (B, S, D) fp32 temporary per slice.
-    return tuple(table[:, j] + temb[:, :, j] for j in range(6))
+    # Widening the (1, D) row keeps the sum fp32 when the loader cast the table
+    # to bf16 (it does: param_dtype), without a (B, S, D) fp32 temporary.
+    return tuple(table[:, j].float() + temb[:, :, j] for j in range(6))
 
 
 def _wan_temb_table_slices(

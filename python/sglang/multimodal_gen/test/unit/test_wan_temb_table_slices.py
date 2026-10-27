@@ -65,6 +65,17 @@ class TestWanTembTableSlices(unittest.TestCase):
                     self.assertTrue(out.is_contiguous())
                     self.assertTrue(torch.equal(chunk.squeeze(2), out))
 
+    def test_eager_slices_are_fp32_for_a_bf16_table(self):
+        # The loader casts scale_shift_table to the DiT dtype, so serving sees bf16.
+        torch.manual_seed(5)
+        temb = torch.randn(2, 9, 6, 64, dtype=torch.bfloat16)
+        table = torch.randn(1, 6, 64, dtype=torch.bfloat16)
+        chunks = (table.unsqueeze(0) + temb.float()).chunk(6, dim=2)
+        for chunk, out in zip(chunks, _eager_temb_table_slices(table, temb)):
+            self.assertEqual(out.dtype, torch.float32)
+            self.assertTrue(out.is_contiguous())
+            self.assertTrue(torch.equal(chunk.squeeze(2), out))
+
     def test_cpu_falls_back_to_eager(self):
         torch.manual_seed(2)
         temb = torch.randn(1, 9, 6, 64, dtype=torch.bfloat16)
