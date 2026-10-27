@@ -376,13 +376,15 @@ class TestSparseIndexerKvLens(CustomTestCase):
         self.assertEqual(args[5:8], ("raw2", "index2", "draft"))
 
     def test_kpool_query_bound_tracks_the_compiled_metadata_mode(self):
-        # Verify/draft extension can share a compiled graph with ragged
-        # queries. Its decode width must not truncate newly completed pools.
+        # Decode and uniform verify/draft extend take their static per-request
+        # width; ragged extend (width 1 outside DECODE) must keep the token
+        # bucket, or pools closed by long requests would be dropped.
         for segments, width, tokens, bound in (
             ("decode", 1, 32, 1),
-            ("decode", 6, 192, 6),
+            ("all", 6, 192, 6),
+            ("all", 6, 4, 4),
             ("mixed", 1, 8192, 8192),
-            ("all", 6, 64, 64),
+            ("all", 1, 64, 64),
         ):
             with self.subTest(segments=segments, width=width):
                 backend = self._backend()

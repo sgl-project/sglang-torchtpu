@@ -30,9 +30,11 @@ reference rounds the pooled sum with `lax.reduce_precision`; an `astype` round
 trip can be removed by XLA's excess-precision pass.
 
 The serving custom op passes a static query bound from the attention metadata:
-uniform DECODE uses `decode_query_size`; mixed prefill and verification use the
-token bucket. This avoids a device-to-host metadata read and keeps the bound
-valid when ragged requests share a compiled graph.
+DECODE uses one row; target verify and draft extend use `decode_query_size`
+when it is above 1 (the backend reports it only for uniform-width batches, and
+it is already a compiled-graph constant); ragged prefill uses the token bucket.
+The bound and the batch size are static, so the schedule and tile heights are
+chosen when each bucket is compiled, with no device-to-host metadata read.
 
 ## Device timing
 

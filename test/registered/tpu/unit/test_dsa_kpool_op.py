@@ -33,11 +33,11 @@ class TestKpoolServingOp(unittest.TestCase):
             raw, pooled = raw_cpu.to("tpu"), pooled_cpu.to("tpu")
             lens = [0, 0]
             outputs = []
-            # Ragged prefill, uniform verify, ragged verify wider than the
-            # verify width, then decode. Verify steps pass the token bucket as
-            # serving does; only batches within the width take its tight bound.
+            # Ragged prefill (token-bucket bound), uniform verify (verify-width
+            # bound), then decode, as serving passes them. Verify closes pools
+            # containing raw rows from both this and the last call.
             for step, (new, decode_width, bound) in enumerate(
-                (((15, 7), 1, 32), ((6, 6), 6, 32), ((7, 2), 6, 32), ((1, 1), 1, 1))
+                (((15, 7), 1, 32), ((6, 6), 6, 6), ((1, 1), 1, 1))
             ):
                 tokens = 32
                 key = torch.zeros(tokens, 128, dtype=torch.bfloat16)
