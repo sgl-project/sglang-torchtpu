@@ -5364,6 +5364,11 @@ class Scheduler(
                 # Singleton PD polls no longer yield through a collective.
                 time.sleep(0)
             return
+        if self.enable_overlap and not use_mlx() and any(self.batch_record_buf):
+            # The last two keep-alive slots are never overwritten while idle.
+            # Drain device work before releasing their tensors and requests.
+            self.device_module.synchronize()
+            self.batch_record_buf[:] = [None, None]
         self.metrics_reporter.record_scheduler_idle()
 
         if self.forward_ct > 0 and not self.recompile_stance_set:
