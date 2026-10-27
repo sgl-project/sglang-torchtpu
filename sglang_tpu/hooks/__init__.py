@@ -22,8 +22,8 @@ from sglang_tpu.hooks.draft_kv_pool import (
     draft_mha_pool_class,
 )
 from sglang_tpu.hooks.dsa_kv_pool import size_tpu_dsa_kv_pool
+from sglang_tpu.hooks.dsv4 import hook_specs as dsv4_hooks
 from sglang_tpu.hooks.dsv4 import (
-    hook_specs as dsv4_hooks,
     register_tpu_dsv4_resolution_hooks,
 )
 from sglang_tpu.hooks.encoder import (

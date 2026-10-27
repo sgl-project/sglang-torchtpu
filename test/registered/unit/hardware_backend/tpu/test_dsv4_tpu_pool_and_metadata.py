@@ -752,8 +752,8 @@ class TestDSV4TPUPatches(CustomTestCase):
             patch.object(
                 HashTopK,
                 "_forward_torch",
-                lambda self, r, i, _orig=HashTopK._forward_torch: forward_tpu_dsv4_hash_topk_torch(
-                    _orig, self, r, i
+                lambda self, r, i, _orig=HashTopK._forward_torch: (
+                    forward_tpu_dsv4_hash_topk_torch(_orig, self, r, i)
                 ),
             ),
         ):

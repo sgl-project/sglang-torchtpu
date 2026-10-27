@@ -240,9 +240,7 @@ def forward_tpu_dsv4_hash_topk(
             < num_token_non_padded
         )
         topk_ids = torch.where(valid, topk_ids, torch.full_like(topk_ids, -1))
-        topk_weights = torch.where(
-            valid, topk_weights, torch.zeros_like(topk_weights)
-        )
+        topk_weights = torch.where(valid, topk_weights, torch.zeros_like(topk_weights))
         topk_output = topk_output._replace(
             topk_weights=topk_weights,
             topk_ids=topk_ids,
