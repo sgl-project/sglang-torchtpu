@@ -305,6 +305,7 @@ class Router:
         # Remove fields that shouldn't be passed to Rust Router constructor
         fields_to_remove = [
             "mini_lb",
+            "mini_lb_policy",
             "test_external_dp_routing",
             "oracle_wallet_path",
             "oracle_tns_alias",

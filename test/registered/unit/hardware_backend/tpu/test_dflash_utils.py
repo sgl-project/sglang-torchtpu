@@ -24,6 +24,7 @@ from sglang_tpu.dflash_utils_tpu import (
     gather_dflash_candidate_window,
     select_dflash_verify_cache_locs_tpu,
 )
+from sglang_tpu.experimental.speculative.spec_ops import select_verify_rows
 from sglang_tpu.overlap_utils_tpu import (
     resolve_device_accept_seq_lens_tpu,
 )
@@ -135,26 +136,33 @@ def _req_to_token(num_rows: int) -> torch.Tensor:
     )
 
 
-def test_window_selection_matches_direct_lookup_for_every_commit_length():
+@pytest.mark.parametrize("capacity, width", [(4, 4), (16, 8), (16, 16)])
+def test_window_selection_matches_direct_lookup_for_every_commit_length(
+    capacity, width
+):
     req_to_token = _req_to_token(3)
     rows = torch.tensor([2, 0, 1], dtype=torch.int64)
     base = torch.tensor([10, 7, 23], dtype=torch.int64)
-    candidates = gather_dflash_candidate_window(req_to_token, rows, base, BLOCK_SIZE)
-    assert candidates.shape == (3, 2 * BLOCK_SIZE)
+    candidates = gather_dflash_candidate_window(req_to_token, rows, base, capacity)
+    assert candidates.shape == (3, 2 * capacity)
 
-    # commit_lens is in [1, block_size]; 0 covers an extend/idle predecessor.
-    for commit in range(0, BLOCK_SIZE + 1):
+    # The preceding commit may use the full capacity before a shorter step.
+    # Zero covers an extend/idle predecessor.
+    for commit in range(0, capacity + 1):
         seq_lens = base + commit
         selected = select_dflash_verify_cache_locs_tpu(
-            candidates, seq_lens, base, BLOCK_SIZE
+            candidates, seq_lens, base, width
         )
         expected = torch.stack(
             [
-                req_to_token[row, start : start + BLOCK_SIZE]
+                req_to_token[row, start : start + width]
                 for row, start in zip(rows.tolist(), seq_lens.tolist())
             ]
         )
         torch.testing.assert_close(selected, expected)
+        verify = select_verify_rows(candidates, base, seq_lens, width)
+        assert torch.equal(verify.cache_locs, expected)
+        assert torch.equal(verify.positions, seq_lens[:, None] + torch.arange(width))
 
 
 def test_window_covers_the_reserved_two_block_span():

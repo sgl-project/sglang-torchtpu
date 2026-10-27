@@ -3,7 +3,7 @@
 
 Why: under ``--hicache-write-policy write_back`` the unified cache copies a
      victim's KV to host at eviction time and waits for the copy before it
-     frees the device pages. On TPU the raiden D2H is a background DMA that
+     frees the device pages. On TPU the engine D2H is a background DMA that
      is also fenced behind every in-flight forward, so each such eviction
      stalls the scheduler for a device sync plus the copy, on the allocation
      path of the batch being formed.
@@ -11,26 +11,31 @@ How: ``WriteBackCopyAhead`` keeps the next ``copy_ahead_tokens`` of KV in
      eviction order, the copy-ahead window, copied to host. Eviction still
      runs only when allocation needs pages, and the copied nodes stay on
      device until then. Once per scheduler step, after the cache's own ack
-     poll, it walks the order the eviction takes (FULL device leaves by
-     eviction priority, a parent once its last device child is covered, then
-     the SWA LRU) and issues a write-through style backup, locked until its
-     ack, for every victim in the window without a host copy. The per-step
-     poll reaps the acks and releases the locks, so an eviction demotes those
-     victims without waiting; a victim past the window takes the synchronous
-     path.
+     poll, it walks the two orders the eviction takes (FULL device leaves by
+     eviction priority, a parent once its last device child is covered; and,
+     with its own share of the window, the SWA LRU) and issues a
+     write-through style backup, locked until its ack, for every victim in
+     the window without a host copy. The per-step poll reaps the acks and
+     releases the locks, so an eviction demotes those victims without
+     waiting; a victim past the window takes the synchronous path, which
+     does not wait for window copies. An eviction that comes up short behind
+     window copies waits for them once and walks again.
      AFTER UnifiedRadixCache.init_hicache (attach the window), REPLACE
-     UnifiedRadixCache._evict (skip the trailing drain), AFTER
-     UnifiedRadixCache.check_hicache_events (refill the window), AROUND
-     UnifiedRadixCache._finish_write_through_ack (a window copy's lock release
-     leaves the write horizon alone). Only raiden write_back caches take the
-     new arms.
+     UnifiedRadixCache._evict (skip the trailing drain; retry once behind
+     window copies), AFTER UnifiedRadixCache.check_hicache_events (refill the
+     window), AROUND UnifiedRadixCache._finish_write_through_ack (a window
+     copy's lock release leaves the write horizon alone), AROUND
+     UnifiedRadixCache.writing_check and REPLACE
+     UnifiedRadixCache.backup_node_for_write_back (a synchronous write_back
+     wait skips window copies it does not depend on). Only TPU DMA write_back
+     caches take the new arms.
 Upstream PR or issue: not filed; the walk reads the Python tree core.
 Remove when: core backs up the eviction frontier asynchronously itself.
 
-Every host copy of a node inside the window is pinned, whoever made it, or host
-pressure would reclaim it as a duplicate and the next step would copy the same
-victim again. Outside the window it is an ordinary duplicate, so the host pins
-at most ``copy_ahead_tokens`` of duplicates. A window of 0 keeps the
+Every Full host copy of a node inside the window is pinned, whoever made it, or
+host pressure would reclaim it as a duplicate and the next step would copy the
+same victim again. Outside the window it is an ordinary duplicate, so the host
+pins at most ``copy_ahead_tokens`` of duplicates. A window of 0 keeps the
 synchronous policy.
 """
 
@@ -45,6 +50,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
     EvictResult,
+    IncLockRefResult,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.unified_cache.cache_action import BackupKV
@@ -69,6 +75,9 @@ logger = logging.getLogger(__name__)
 _COPY_AHEAD_CHUNKS = 4
 # Stands in for the chunk when chunked prefill is off.
 _DEFAULT_CHUNK_TOKENS = 4096
+# The SWA eviction order gets 1/_SWA_WINDOW_DIVISOR of the window. Arbitrary
+# starting point; no measurement behind it yet.
+_SWA_WINDOW_DIVISOR = 4
 
 
 def resolve_copy_ahead_tokens(
@@ -93,6 +102,11 @@ class WriteBackCopyAhead:
         self.copy_ahead_tokens = copy_ahead_tokens
         # ack id (= node id) -> tokens of a window copy not yet acked.
         self._pending: dict[int, int] = {}
+        # The pending copies the SWA order issued; each order has its own cap
+        # on copies in flight, keyed by whether it is the SWA order.
+        self._swa_pending: set[int] = set()
+        self._caps: dict[bool, int] = {False: copy_ahead_tokens, True: 0}
+        self._inflight_tokens: dict[bool, int] = {False: 0, True: 0}
         # node id -> host lock receipt, held while the copied node is on device
         # and inside the window.
         self._host_locks: dict[int, DecLockRefParams] = {}
@@ -106,6 +120,46 @@ class WriteBackCopyAhead:
     def owns_ack(self, ack_id: int) -> bool:
         return ack_id in self._pending
 
+    def forget_ack(self, ack_id: int) -> None:
+        # At the ack, not the next refill: the node's later synchronous backup
+        # reuses the ack id and must not look like a window copy.
+        tokens = self._pending.pop(ack_id, None)
+        if tokens is not None:
+            self._inflight_tokens[ack_id in self._swa_pending] -= tokens
+        self._swa_pending.discard(ack_id)
+
+    def window_ack_of(self, node_id: int) -> set[int]:
+        """The window ack ``node_id`` is pending under, if any; a barrier backup
+        marks only the node and unbacked ancestors below the first pending one."""
+        ack_id = self._cache.tree_core.node_by_id(node_id).write_through_pending_id
+        return {ack_id} if ack_id in self._pending else set()
+
+    def wait_for_acks(self, *, window_acks: set[int] = frozenset()) -> None:
+        """Finish every queued ack except those holding only window copies not
+        in ``window_acks``; the step's poll reaps the rest.
+
+        Rank-consistent: every rank queues the same acks and owns the same
+        window copies, so every rank removes the same entries.
+        """
+        cache = self._cache
+        controller = cache.cache_controller
+        controller.start_writing()
+        kept = []
+        for ack in controller.ack_write_queue:
+            if all(
+                ack_id in self._pending and ack_id not in window_acks
+                for ack_id in ack.node_ids
+            ):
+                kept.append(ack)
+                continue
+            ack.finish_event.synchronize()
+            for ack_id in ack.node_ids:
+                if ack_id in cache.ongoing_write_through:
+                    cache._finish_write_through_ack(ack_id)
+            cache._log_write_ack_metrics(ack)
+        controller.ack_write_queue.clear()
+        controller.ack_write_queue.extend(kept)
+
     def refill(self) -> None:
         """Keep the victims inside the window copied to host and pinned."""
         cache = self._cache
@@ -113,13 +167,22 @@ class WriteBackCopyAhead:
             return
         # Before the walk, so this step's copies can take the freed host slots.
         self._release_host_locks(window=None)
-        budget = self.copy_ahead_tokens - self._inflight_tokens()
+        core: UnifiedTreeCore = cache.tree_core
+        # The SWA order gets a reserved share: the Full order alone fills the
+        # window whenever many leaves are evictable.
+        swa_share = 0
+        if cache.is_swa_enabled and core.has_swa_host_pool:
+            swa_share = self.copy_ahead_tokens // _SWA_WINDOW_DIVISOR
+        self._prune_acked()
         window: set[int] = set()
-        if budget > 0:
-            core: UnifiedTreeCore = cache.tree_core
-            covered = self._cover_full(core=core, budget=budget, window=window)
-            if covered < budget and cache.is_swa_enabled and core.has_swa_host_pool:
-                self._cover_swa(core=core, budget=budget - covered, window=window)
+        # Copies in flight are locked, so neither walk sees them: subtract them.
+        self._caps = {False: self.copy_ahead_tokens - swa_share, True: swa_share}
+        full_budget = self._caps[False] - self._inflight(swa=False)
+        if full_budget > 0:
+            self._cover_full(core=core, budget=full_budget, window=window)
+        swa_budget = self._caps[True] - self._inflight(swa=True)
+        if swa_budget > 0:
+            self._cover_swa(core=core, budget=swa_budget, window=window)
         self._release_host_locks(window=window)
 
     def _release_host_locks(self, *, window: Optional[set[int]]) -> None:
@@ -141,15 +204,17 @@ class WriteBackCopyAhead:
                 self._cache.dec_host_lock_ref(node_id, params)
                 del self._host_locks[node_id]
 
-    def _inflight_tokens(self) -> int:
+    def _prune_acked(self) -> None:
         ongoing = self._cache.ongoing_write_through
         for ack_id in [a for a in self._pending if a not in ongoing]:
-            del self._pending[ack_id]
-        return sum(self._pending.values())
+            self.forget_ack(ack_id)
+
+    def _inflight(self, *, swa: bool) -> int:
+        return self._inflight_tokens[swa]
 
     def _cover_full(
         self, *, core: UnifiedTreeCore, budget: int, window: set[int]
-    ) -> int:
+    ) -> None:
         full = self._cache.components[BASE_COMPONENT_TYPE]
         full._ensure_eviction_strategy()
         priority = full.session_ref_eviction_strategy
@@ -166,8 +231,11 @@ class WriteBackCopyAhead:
             if value is None:
                 continue
             covered += len(value)
+            if covered > budget:
+                # Crossing the window's end: left to the synchronous backup.
+                break
             window.add(node.id)
-            self._keep_copied(node)
+            self._keep_copied(node, swa=False)
             # The parent is the next victim once its last device child is gone.
             parent = node.parent
             if (
@@ -182,36 +250,43 @@ class WriteBackCopyAhead:
                 )
             ):
                 heapq.heappush(heap, (priority(parent), parent))
-        return covered
 
     def _cover_swa(
         self, *, core: UnifiedTreeCore, budget: int, window: set[int]
     ) -> None:
-        # Mirrors SWAComponent._evict_device_next_node: a leaf goes with its
-        # Full KV, an internal node loses its window and needs the barrier backup.
+        # Mirrors SWAComponent._evict_device_next_node. Copied or pinned nodes
+        # count Full tokens; the rest, and candidates too large to fit, count SWA.
         ct = ComponentType.SWA
         lru = core.lru_lists[ct]
         covered = 0
         node = lru.get_lru_no_lock()
         while node is not None and covered < budget:
             cd = node.component_data[ct]
-            if cd.value is not None:
-                covered += len(cd.value)
-                window.add(node.id)
-                if node in core.evictable_device_leaves:
-                    self._keep_copied(node)
-                elif node.component_data[BASE_COMPONENT_TYPE].value is not None and (
-                    cd.host_value is not None or not node.backuped
-                ):
-                    self._keep_copied(node)
+            full_value = node.component_data[BASE_COMPONENT_TYPE].value
+            if cd.value is not None and full_value is not None:
+                candidate = (
+                    node in core.evictable_device_leaves
+                    or node.id in self._host_locks
+                    or (cd.host_value is None and not node.backuped)
+                )
+                if candidate and covered + len(full_value) <= budget:
+                    covered += len(full_value)
+                    window.add(node.id)
+                    self._keep_copied(node, swa=True)
+                else:
+                    covered += len(cd.value)
             node = lru.get_prev_no_lock(node)
 
-    def _keep_copied(self, node: UnifiedTreeNode) -> None:
-        """Pin ``node``'s host copy, copying it first if it has none."""
+    def _keep_copied(self, node: UnifiedTreeNode, *, swa: bool) -> None:
+        """Pin ``node``'s host copy, copying it first if it has none and the
+        order's copies in flight stay within its cap."""
         if node.id in self._host_locks or node.write_through_pending_id is not None:
             return
         cache = self._cache
         if not node.backuped:
+            full_tokens = len(node.component_data[BASE_COMPONENT_TYPE].value)
+            if self._inflight(swa=swa) + full_tokens > self._caps[swa]:
+                return
             if cache.is_swa_enabled and cache.tree_core.has_swa_host_pool:
                 self._reserve_swa_host(node)
             # Locked until the ack, like a write-through backup, so no eviction
@@ -222,11 +297,31 @@ class WriteBackCopyAhead:
             if written <= 0:
                 return
             self._pending[node.id] = written
+            self._inflight_tokens[swa] += written
+            if swa:
+                self._swa_pending.add(node.id)
             self.num_backups += 1
             self.num_tokens += written
         # Pinned while in the window: host pressure must not reclaim a copy the
         # next eviction is about to need.
-        self._host_locks[node.id] = cache.inc_host_lock_ref(node.id).to_dec_params()
+        self._host_locks[node.id] = self._pin_full_host(node)
+
+    def _pin_full_host(self, node: UnifiedTreeNode) -> DecLockRefParams:
+        # Full only: an SWA host lock would hold a window of ancestors off the
+        # SWA host LRU and steer SWA host eviction onto host leaves.
+        core = self._cache.tree_core
+        result = IncLockRefResult(
+            node_id=node.id,
+            skipped_lock_components=tuple(
+                c.component_type
+                for c in core.components
+                if c.component_type != BASE_COMPONENT_TYPE
+            ),
+        )
+        full = self._cache.components[BASE_COMPONENT_TYPE]
+        return full.acquire_component_lock(
+            node=node, result=result, lock_host=True
+        ).to_dec_params()
 
     def _reserve_swa_host(self, node: UnifiedTreeNode) -> None:
         cache = self._cache
@@ -243,15 +338,13 @@ class WriteBackCopyAhead:
 def attach_copy_ahead(
     *, cache: UnifiedRadixCache, chunked_prefill_size: Optional[int]
 ) -> None:
-    """Give a raiden write_back cache its copy-ahead window; others keep None."""
-    from sglang_tpu.raiden_hybrid_cache_controller import (
-        TpuRaidenHybridCacheController,
-    )
+    """Give a TPU DMA write_back cache a copy-ahead window; others get None."""
+    from sglang_tpu.tpu_dma_hybrid_cache_controller import TpuDMAHybridCacheController
 
     cache._write_back_copy_ahead = None
     controller = cache.cache_controller
     if (
-        not isinstance(controller, TpuRaidenHybridCacheController)
+        not isinstance(controller, TpuDMAHybridCacheController)
         or controller.write_policy != "write_back"
         or cache.host_memory_mode != "cache"
     ):
@@ -292,8 +385,16 @@ def evict_with_copy_ahead(
     cache._evict_components(
         request_by_type, tracker, available_size_targets=available_size_targets
     )
-    # No drain: a synchronous backup waits for its own ack inside the walk, and
-    # only the step's poll reaps window copies, so evictions never sync ranks.
+    # Short behind window copies' locks would retract a request: wait for them
+    # once and walk again with the same request (the tracker is cumulative).
+    copy_ahead = cache._write_back_copy_ahead
+    if copy_ahead.pending_node_ids and _is_short(
+        cache, request_by_type, tracker, available_size_targets
+    ):
+        copy_ahead.wait_for_acks(window_acks=copy_ahead.pending_node_ids)
+        cache._evict_components(
+            request_by_type, tracker, available_size_targets=available_size_targets
+        )
     cache.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
     return EvictResult(
         num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
@@ -302,8 +403,27 @@ def evict_with_copy_ahead(
     )
 
 
+def _is_short(
+    cache: UnifiedRadixCache,
+    request_by_type: dict[ComponentType, int],
+    tracker: dict[ComponentType, int],
+    available_size_targets,
+) -> bool:
+    for component_type in cache.tree_components:
+        requested = request_by_type.get(component_type, 0)
+        if requested <= 0 or tracker.get(component_type, 0) >= requested:
+            continue
+        target = (available_size_targets or {}).get(component_type)
+        if target is not None:
+            target_component, target_size = target
+            if cache._component_available_size(target_component) >= target_size:
+                continue
+        return True
+    return False
+
+
 def install(cache_cls: Optional[type] = None) -> None:
-    """Wrap ``UnifiedRadixCache`` so raiden write_back caches copy ahead."""
+    """Wrap ``UnifiedRadixCache`` so TPU DMA write_back caches copy ahead."""
     if cache_cls is None:
         from sglang.srt.mem_cache.unified_radix_cache import (
             UnifiedRadixCache as cache_cls,
@@ -315,6 +435,8 @@ def install(cache_cls: Optional[type] = None) -> None:
     orig_evict = cache_cls._evict
     orig_check_hicache_events = cache_cls.check_hicache_events
     orig_finish_ack = cache_cls._finish_write_through_ack
+    orig_writing_check = cache_cls.writing_check
+    orig_backup_node_for_write_back = cache_cls.backup_node_for_write_back
 
     def init_hicache(self, server_args, params):
         orig_init_hicache(self, server_args, params)
@@ -351,6 +473,29 @@ def install(cache_cls: Optional[type] = None) -> None:
         orig_finish_ack(self, ack_id)
         for node, horizon in saved:
             node.write_horizon = horizon
+        copy_ahead.forget_ack(ack_id)
+
+    def writing_check(self, write_back=False, finish_count=None):
+        copy_ahead = self._write_back_copy_ahead
+        if not write_back or copy_ahead is None:
+            return orig_writing_check(self, write_back, finish_count)
+        # A synchronous write_back wait skips the window's copies.
+        copy_ahead.wait_for_acks()
+
+    def backup_node_for_write_back(self, node_id):
+        copy_ahead = self._write_back_copy_ahead
+        if copy_ahead is None:
+            return orig_backup_node_for_write_back(self, node_id)
+        # Upstream drains every ack first in case one already covers this node;
+        # of the window copies, only the node's own can.
+        copy_ahead.wait_for_acks(window_acks=copy_ahead.window_ack_of(node_id))
+        written = self._execute_and_commit_kv_backup(
+            BackupKV(node_ids=[node_id]), write_back=True
+        )
+        if written == 0:
+            return False
+        copy_ahead.wait_for_acks()
+        return True
 
     init_hicache._tpu_write_back_copy_ahead = True
     # Caches that never attach HiCache keep the class default.
@@ -359,3 +504,5 @@ def install(cache_cls: Optional[type] = None) -> None:
     cache_cls._evict = _evict
     cache_cls.check_hicache_events = check_hicache_events
     cache_cls._finish_write_through_ack = _finish_write_through_ack
+    cache_cls.writing_check = writing_check
+    cache_cls.backup_node_for_write_back = backup_node_for_write_back

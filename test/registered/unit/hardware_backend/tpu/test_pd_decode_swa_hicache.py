@@ -61,7 +61,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import pd_decode_swa_hicache as tpu
-from sglang_tpu.raiden_hybrid_cache_controller import TpuRaidenHybridCacheController
+from sglang_tpu.tpu_dma_hybrid_cache_controller import TpuDMAHybridCacheController
 
 ASSEMBLER = "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler"
 BUILDER = "sglang.srt.mem_cache.kv_cache_builder"
@@ -807,7 +807,7 @@ class TestInflightLoadGate(CustomTestCase):
 class TestDenseRestoreGate(CustomTestCase):
     """Non-SWA models share the hazard: a restore publishes pages before they land."""
 
-    def dense_cache(self, controller_spec=TpuRaidenHybridCacheController):
+    def dense_cache(self, controller_spec=TpuDMAHybridCacheController):
         cache = MagicMock(spec=UnifiedRadixCache)
         cache.cache_controller = MagicMock(spec=controller_spec)
         cache.cache_controller.page_size = 64

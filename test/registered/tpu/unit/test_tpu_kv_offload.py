@@ -46,8 +46,8 @@ PAGE_SIZE = 16
 
 def _make_pools(size=256, layer_num=2, head_num=2, head_dim=64):
     """Build a (device_pool, host_pool) pair on TPU."""
-    from sglang.srt.mem_cache.memory_pool_host import TpuFusedMHATokenToKVPoolHost
     from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+    from sglang_tpu.kv_pool_host import TpuFusedMHATokenToKVPoolHost
 
     dev = TpuFusedMHATokenToKVPool(
         size=size,
@@ -165,8 +165,8 @@ class TestTpuFusedHostPool(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        from sglang.srt.mem_cache.memory_pool_host import TpuFusedMHATokenToKVPoolHost
         from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+        from sglang_tpu.kv_pool_host import TpuFusedMHATokenToKVPoolHost
 
         cls.device_pool = TpuFusedMHATokenToKVPool(
             size=cls.SIZE,

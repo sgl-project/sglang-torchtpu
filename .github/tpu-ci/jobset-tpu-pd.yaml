@@ -16,11 +16,10 @@
 #                        is what names this run's row on the CI dashboard
 #   ACTIVE_DEADLINE      per-Job runtime cap (seconds)
 #   PREFILL_HOSTS / DECODE_HOSTS           pods (= hosts) per slice
-#   PREFILL_TOPOLOGY / PREFILL_POOL        node labels for the prefill slice
-#   DECODE_TOPOLOGY / DECODE_POOL          node labels for the decode slice
+#   PREFILL_TOPOLOGY / DECODE_TOPOLOGY     slice shape of each role
+#   PREFILL_POOL_AFFINITY / DECODE_POOL_AFFINITY   CI-pool nodeAffinity blocks
 #   WEIGHTS_VOLUME / WEIGHTS_MOUNT         indented YAML blocks (may be empty)
-# Requires the target pools to hold one slice per role (two slices total).
-# ci-tpu-pools: ${POOL_LIST}
+# Needs one free slice per role (two slices total) in the shape's CI pools.
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
@@ -166,7 +165,7 @@ ${WEIGHTS_VOLUME}
                       google.com/tpu: "4"
                       cpu: "4"
                       memory: 32Gi
-                      # No ephemeral-storage here: kueue-tpu.yaml's coveredResources
+                      # No ephemeral-storage here: the CI ClusterQueues' coveredResources
                       # omit it, and Kueue silently never admits a workload asking
                       # for a resource the ClusterQueue does not cover.
                     limits:
@@ -279,7 +278,7 @@ ${WEIGHTS_VOLUME}
                       google.com/tpu: "4"
                       cpu: "4"
                       memory: 32Gi
-                      # No ephemeral-storage here: kueue-tpu.yaml's coveredResources
+                      # No ephemeral-storage here: the CI ClusterQueues' coveredResources
                       # omit it, and Kueue silently never admits a workload asking
                       # for a resource the ClusterQueue does not cover.
                     limits:

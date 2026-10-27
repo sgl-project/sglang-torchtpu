@@ -311,6 +311,11 @@ class Platform:
         return True
 
     @classmethod
+    def supports_safetensors_device_load(cls) -> bool:
+        """Whether safetensors can open tensors directly on this platform's device."""
+        return True
+
+    @classmethod
     def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
         return None
 

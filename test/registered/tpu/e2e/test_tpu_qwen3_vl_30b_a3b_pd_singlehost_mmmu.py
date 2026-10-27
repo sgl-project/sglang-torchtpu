@@ -152,6 +152,11 @@ def engine_configuration_failures(
                 f"{role} reports tpu_compile_tracer="
                 f"{info.get('tpu_compile_tracer')!r}, expected {COMPILE_TRACER!r}"
             )
+        if not info.get("use_spmd_compile"):
+            failures.append(
+                f"{role} reports use_spmd_compile="
+                f"{info.get('use_spmd_compile')!r}, expected True"
+            )
         if info.get("mm_process_config") != MM_PROCESS_CONFIG:
             failures.append(
                 f"{role} reports mm_process_config="
@@ -296,10 +301,12 @@ class TestPdSingleHostQwen3Vl30bA3bConfiguration(unittest.TestCase):
             self.assertEqual(json.loads(plan["command"][flag + 1]), MM_PROCESS_CONFIG)
 
     def test_both_engines_trace_with_direct_compile(self) -> None:
-        # The gate must exercise the tracer the recipes serve with; a dynamo
-        # engine would hide a direct-only compile failure behind a pass.
+        # The gate must exercise the tracer and SPMD sharing the recipes serve
+        # with; a dynamo or unshared engine would hide a compile regression.
         for plan in self.plans.values():
             self.assertEqual(plan["server_args"]["tpu_compile_tracer"], COMPILE_TRACER)
+            self.assertIs(plan["server_args"]["use_spmd_compile"], True)
+            self.assertIn("--use-spmd-compile", plan["command"])
 
     def test_bf16_checkpoint_is_served_unquantized(self) -> None:
         for plan in self.plans.values():

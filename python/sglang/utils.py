@@ -22,7 +22,6 @@ from typing import Any, Callable, List, Optional, Tuple, Type, Union
 import numpy as np
 import pybase64
 import requests
-from IPython.display import HTML, display
 from pydantic import BaseModel
 from tqdm import tqdm
 
@@ -382,6 +381,10 @@ class LazyImport:
     def __call__(self, *args, **kwargs):
         module = self._load()
         return module(*args, **kwargs)
+
+
+HTML = LazyImport("IPython.display", "HTML")
+display = LazyImport("IPython.display", "display")
 
 
 def download_and_cache_file(url: str, filename: Optional[str] = None):

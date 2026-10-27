@@ -51,6 +51,11 @@ class TpuOOTPlatform(TpuPlatform):
         return SPLASH_ATTN_BACKEND_NAME
 
     @classmethod
+    def supports_safetensors_device_load(cls) -> bool:
+        # safetensors rejects 'tpu:N'.
+        return False
+
+    @classmethod
     def get_attn_backend_cls_str(
         cls,
         selected_backend: AttentionBackendEnum | None,
