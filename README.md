@@ -119,7 +119,7 @@ Explore [model recipes](benchmark/tpu/recipe/README.md), [TPU benchmarks](benchm
 
 ## Encoder disaggregation (EPD)
 
-Qwen3-VL (8B, 235B-A22B) can run its vision encoder in a separate encode server that sends image embeddings to a language-only server ([#665](https://github.com/sgl-project/sglang-torchtpu/pull/665)).
+A vision-language model can run its vision encoder in a separate encode server that sends image embeddings to a language-only server ([#665](https://github.com/sgl-project/sglang-torchtpu/pull/665)). EPD is supported for the Qwen family and verified on Qwen3-VL-8B and Qwen3-VL-235B-A22B; other model families should work but are not verified.
 
 - **Latency.** At the same request rate, TPOT drops 4-30% on 8B and 5-24% on 235B-A22B, and TTFT stays low as load rises: at 5 req/s on 235B-A22B, 392 ms vs 2091 ms with the encoder on the same host.
 - **HBM.** The language server no longer compiles or runs the encoder, so after warmup it uses about 2 GB less HBM per TensorCore (8B and 235B-A22B alike).
