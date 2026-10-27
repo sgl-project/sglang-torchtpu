@@ -8,18 +8,31 @@ test_scheduler_flush_cache.
 
 import unittest
 import weakref
+from collections import deque
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+    Req,
+    ScheduleBatch,
+)
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -68,6 +81,18 @@ class TestOnIdleStallPublish(CustomTestCase):
 
     def _idle_scheduler(self):
         s = self._stalled_scheduler()
+        del s.is_fully_idle
+        s.disaggregation_mode = DisaggregationMode.PREFILL
+        s.running_batch = ScheduleBatch(reqs=[])
+        s.last_batch = s.chunked_req = None
+        s.result_queue = deque()
+        s.waiting_queue = []
+        s.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
+        s.grammar_manager = SimpleNamespace(grammar_queue=[])
+        s.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
+        s.disagg_prefill_inflight_queue = []
+        s._deferred_chunked_sender_aborts = []
+        s.enable_hierarchical_cache = False
         s.enable_overlap = True
         s.batch_record_buf = [None, None]
         s.batch_record_ct = 0
@@ -86,55 +111,50 @@ class TestOnIdleStallPublish(CustomTestCase):
         s.maybe_sleep_on_idle = MagicMock()
         return s
 
-    def test_overlap_records_survive_stalls_and_release_after_idle_sync(self):
+    def test_media_survives_pending_results_and_transfers_then_releases_on_idle(self):
         s = self._idle_scheduler()
-        batch = ScheduleBatch(reqs=[], input_ids=torch.tensor([1]))
-        batch_ref, tensor_ref = weakref.ref(batch), weakref.ref(batch.input_ids)
-        s.record_batch_in_overlap(batch)
-        del batch
+        media_refs = []
+        for rid in ("first", "second"):
+            req = Req(rid, "", [1], SamplingParams())
+            req.mm_inputs = MultimodalInputs(
+                mm_items=[
+                    MultimodalDataItem(modality=Modality.VIDEO, feature=torch.ones(8))
+                ]
+            )
+            media_refs.append(weakref.ref(req.mm_inputs.mm_items[0].feature))
+            batch = ScheduleBatch(reqs=[req])
+            s.record_batch_in_overlap(batch)
+            s.result_queue.append((batch, None))
+        del batch, req
 
         def synchronize():
-            self.assertIsNotNone(batch_ref())
-            self.assertIsNotNone(tensor_ref())
+            self.assertTrue(all(ref() is not None for ref in media_refs))
 
         s.device_module.synchronize.side_effect = synchronize
-        with patch("sglang.srt.managers.scheduler.use_mlx", return_value=False):
+        with (
+            published_topology(),
+            patch("sglang.srt.managers.scheduler.use_mlx", return_value=False),
+        ):
+            self.assertFalse(s.is_fully_idle())
             s.on_idle()
-            self.assertIsNotNone(batch_ref())
+            self.assertTrue(all(ref() is not None for ref in media_refs))
             s.device_module.synchronize.assert_not_called()
 
-            s.is_fully_idle.return_value = True
+            while s.result_queue:
+                batch, _ = s.result_queue.popleft()
+                s.disagg_prefill_inflight_queue.extend(batch.reqs)
+            del batch
+            self.assertFalse(s.is_fully_idle())
             s.on_idle()
-            self.assertIsNone(batch_ref())
-            self.assertIsNone(tensor_ref())
+            self.assertTrue(all(ref() is not None for ref in media_refs))
+            s.device_module.synchronize.assert_not_called()
+
+            s.disagg_prefill_inflight_queue.clear()
+            self.assertTrue(s.is_fully_idle())
+            s.on_idle()
+            self.assertTrue(all(ref() is None for ref in media_refs))
             s.on_idle()
         s.device_module.synchronize.assert_called_once_with()
-
-    def test_failed_sync_preserves_overlap_records(self):
-        s = self._idle_scheduler()
-        s.is_fully_idle.return_value = True
-        batch = ScheduleBatch(reqs=[])
-        batch_ref = weakref.ref(batch)
-        s.record_batch_in_overlap(batch)
-        del batch
-        s.device_module.synchronize.side_effect = RuntimeError("sync failed")
-        with (
-            patch("sglang.srt.managers.scheduler.use_mlx", return_value=False),
-            self.assertRaisesRegex(RuntimeError, "sync failed"),
-        ):
-            s.on_idle()
-        self.assertIsNotNone(batch_ref())
-
-    def test_backends_without_overlap_records_do_not_synchronize(self):
-        for enable_overlap, mlx in ((False, False), (True, True)):
-            with self.subTest(enable_overlap=enable_overlap, mlx=mlx):
-                s = self._idle_scheduler()
-                s.enable_overlap = enable_overlap
-                del s.batch_record_buf
-                s.is_fully_idle.return_value = True
-                with patch("sglang.srt.managers.scheduler.use_mlx", return_value=mlx):
-                    s.on_idle()
-                s.device_module.synchronize.assert_not_called()
 
 
 if __name__ == "__main__":

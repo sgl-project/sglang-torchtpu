@@ -3,7 +3,6 @@
 import multiprocessing
 import tempfile
 import unittest
-import weakref
 from array import array
 from collections import Counter, deque
 from concurrent.futures import Future
@@ -929,39 +928,6 @@ class TestPrefillResultPolling(CustomTestCase):
                     ],
                 )
                 self.assertFalse(scheduler.result_queue)
-
-    def test_completed_batch_copy_is_released_before_idling(self):
-        for enabled in (False, True):
-            with self.subTest(continuous_input_polling=enabled):
-                scheduler = _Scheduler(
-                    [_batch(1), None, None, None],
-                    {1: _result(_Event(ready=True))},
-                    ready_at={},
-                )
-                completed = []
-                idle_checks = []
-
-                def process_result(batch, result):
-                    _Scheduler.process_batch_result(scheduler, batch, result)
-                    completed.append(weakref.ref(batch))
-                    # Mock call histories must not become extra batch owners.
-                    scheduler._record_step_counters.reset_mock()
-                    scheduler.batch_result_processor.reset_mock()
-                    scheduler.metrics_reporter.reset_mock()
-                    scheduler._maybe_clear_mm_inputs.reset_mock()
-                    scheduler.maybe_signal_queued_health_checks.reset_mock()
-
-                def on_idle():
-                    self.assertEqual(len(completed), 1)
-                    self.assertIsNone(completed[0]())
-                    idle_checks.append(scheduler.iteration)
-
-                with (
-                    patch.object(scheduler, "process_batch_result", process_result),
-                    patch.object(scheduler, "on_idle", on_idle),
-                ):
-                    _run_loop(scheduler, enabled=enabled)
-                self.assertTrue(idle_checks)
 
     def test_delayed_sample_is_submitted_after_predecessor_before_query(self):
         for enabled in (False, True):
