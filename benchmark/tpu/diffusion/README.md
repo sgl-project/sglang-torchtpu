@@ -36,18 +36,20 @@ tpu7x 2x2x1, steady-state request (the first request compiles), seed 42. E2E and
 denoise step and VAE decode from a run with `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1`, which synchronizes the device at
 stage boundaries (otherwise queued denoising work is counted in the decode stage). Shapes whose token count does not
 divide by the sequence-parallel size (the two I2V rows) pad the sequence; attention masks the padding.
+Workers run float32 matmuls and convolutions at full float32 precision, as CUDA does (torch_tpu's default is a
+single bf16 pass), so the float32 Wan VAE decode costs about 1.7x what it did in bf16.
 
 | Model | Request | Cores | E2E | Denoise step | VAE decode | Peak HBM / core |
 | :--- | :--- | :---: | ---: | ---: | ---: | ---: |
-| FLUX.2-klein-4B | T2I 1024x1024, 4 steps | 1 | 0.90 s | 0.076 s | 0.33 s | 24.8 GB |
-| FLUX.2-klein-4B | T2I 1024x1024, 4 steps | 4 | 0.85 s | 0.044 s | 0.33 s | 19.2 GB |
-| Z-Image-Turbo | T2I 1024x1024, 9 steps | 1 | 1.36 s | 0.088 s | 0.33 s | 29.2 GB |
-| Z-Image-Turbo | T2I 1024x1024, 9 steps | 2 | 1.31 s | 0.069 s | 0.33 s | 25.2 GB |
-| Wan2.2-TI2V-5B | T2V 1280x704, 121 frames, 20 steps | 8 | 9.6 s | 0.272 s | 2.5 s | 31.1 GB |
-| Wan2.2-TI2V-5B | I2V 960x928 (from a square image), 121 frames, 20 steps | 8 | 11.8 s | 0.331 s | 2.6 s | 67.2 GB |
-| Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 20 steps | 8 | 58.8 s | 2.72 s | 2.2 s | 87.8 GB |
-| Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 17.0 s | 0.698 s | 1.2 s | 71.9 GB |
-| LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 23.2 s | 0.433 s | 2.3 s | 60.6 GB |
+| FLUX.2-klein-4B | T2I 1024x1024, 4 steps | 1 | 0.75 s | 0.076 s | 0.10 s | 24.8 GB |
+| FLUX.2-klein-4B | T2I 1024x1024, 4 steps | 4 | 0.69 s | 0.049 s | 0.10 s | 19.2 GB |
+| Z-Image-Turbo | T2I 1024x1024, 9 steps | 1 | 0.98 s | 0.090 s | 0.10 s | 29.2 GB |
+| Z-Image-Turbo | T2I 1024x1024, 9 steps | 2 | 0.84 s | 0.072 s | 0.10 s | 25.2 GB |
+| Wan2.2-TI2V-5B | T2V 1280x704, 121 frames, 20 steps | 8 | 10.2 s | 0.263 s | 4.0 s | 30.1 GB |
+| Wan2.2-TI2V-5B | I2V 960x928 (from a square image), 121 frames, 20 steps | 8 | 11.8 s | 0.316 s | 4.1 s | 64.3 GB |
+| Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 20 steps | 8 | 60.2 s | 2.77 s | 4.0 s | 68.8 GB |
+| Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.6 s | 0.731 s | 2.0 s | 64.3 GB |
+| LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
 
 
 ## Example requests
