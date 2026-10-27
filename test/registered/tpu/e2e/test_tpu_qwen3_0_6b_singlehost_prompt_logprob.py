@@ -23,6 +23,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    try_cached_model,
 )
 
 register_tpu_ci(
@@ -73,13 +74,15 @@ class TestTpuQwen306bSinglehostPromptLogprob(CustomTestCase):
         cls._env_stack.enter_context(
             envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(True)
         )
-        cls.model = MODEL
+        cls.model = try_cached_model(MODEL)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
+                "--served-model-name",
+                MODEL,
                 "--dtype",
                 "bfloat16",
                 "--device",
