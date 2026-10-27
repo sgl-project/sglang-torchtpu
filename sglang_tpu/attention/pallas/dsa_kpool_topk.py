@@ -23,12 +23,19 @@ Step 3 runs on the StreamIndex top-k kernel (DeepSeek-V4's compressed indexer)
 with a closed-pools-only causal mask.
 """
 
+import logging
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sglang_tpu.attention.pallas.kpool_compress import compress_and_store
+from sglang_tpu.attention.pallas.kpool_compress import (
+    compress_and_store,
+    supports_page_size,
+)
 from sglang_tpu.dsv4.streamindex_topk import KVLayout, streamindex_topk
+
+logger = logging.getLogger(__name__)
 
 _FP8_MAX = 448.0
 # The index-key record layout (dsa_index_topk.index_key_cache_shape): FP8 key
@@ -195,7 +202,24 @@ def kpool_indexer_step(
     raw_cache = raw_cache.at[page, slot].set(raw, mode="drop")
 
     # 2. Compress the pools this step closes, reading the cache just written.
-    if kpool == 4 and d == 128 and page_size == 128 and raw_cache.dtype == jnp.bfloat16:
+    fused = (
+        kpool == 4
+        and d == 128
+        and supports_page_size(page_size)
+        and raw_cache.dtype == jnp.bfloat16
+    )
+    if not fused:
+        # Logged at trace time, once per compiled shape.
+        logger.warning(
+            "kpool indexer: kpool=%d, head_dim=%d, page_size=%d, raw dtype=%s has "
+            "no fused pooling kernel; using the generic scatter, which can copy "
+            "the whole pooled cache per step.",
+            kpool,
+            d,
+            page_size,
+            raw_cache.dtype,
+        )
+    if fused:
         # Keep the native cache layout through the update. A generic scatter
         # can introduce full-pool layout conversions even for a few new pools.
         pooled_cache = compress_and_store(

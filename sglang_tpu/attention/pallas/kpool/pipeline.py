@@ -123,7 +123,7 @@ class LongQueryPipeline:
         def _page(i, slot):
             io.read(i).wait()
 
-            if tile_rows == 32:
+            if tile_rows <= 32:
                 pooled = pool_rows(raw_buf[slot], ape_ref[...])
             else:
                 # Retain the larger DMA while bounding pooling's register live
