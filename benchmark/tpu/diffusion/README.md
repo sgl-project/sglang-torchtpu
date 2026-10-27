@@ -7,19 +7,14 @@ text encoder, the highest TPU clock and a 65536 KiB scoped-VMEM limit for XLA fu
 
 | Recipe | Model | Cores | Parallelism |
 | :--- | :--- | :---: | :--- |
-| `flux2_klein_4b.sh` | `black-forest-labs/FLUX.2-klein-4B` | 1 or 4 (2 and 8 divide 24 heads; untested) | Ulysses = cores (24 heads) |
+| `flux2_klein_4b.sh` | `black-forest-labs/FLUX.2-klein-4B` | 1 or 4 | Ulysses = cores (24 heads) |
 | `zimage_turbo.sh` | `Tongyi-MAI/Z-Image-Turbo` | 1 or 2 | Ulysses = cores (30 heads) |
 | `ltx2.sh` | `Lightricks/LTX-2` | 8 | CFG 2 x Ulysses 4 |
 
 Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `HOST` (default `127.0.0.1`) or `PORT` from the environment
-(an empty `PARALLEL_ARGS`/`MODEL_ARGS` drops the recipe's flags). `ltx2.sh` fixes its parallel layout to 8 ranks, so
-override `NUM_GPUS` and `PARALLEL_ARGS` together there. Flags in `LIBTPU_INIT_ARGS` are kept; the clock and
+(an empty `PARALLEL_ARGS`/`MODEL_ARGS` drops the recipe's flags). Flags in `LIBTPU_INIT_ARGS` are kept; the clock and
 scoped-VMEM defaults are benchmark settings, added unless it sets them. Extra arguments are passed to the server,
 e.g. `./ltx2.sh --warmup-resolutions 1280x720`.
-
-LTX-2 under sequence parallelism skips attention masks only when no stream is padded: the latent frame count
-`(num_frames - 1) / 8 + 1` must divide by the SP degree (121 frames at SP 4 qualifies; 97 and 241 do not), and
-likewise the audio latent frames. A padded stream keeps the masked attention path.
 
 `bench_splash_attn.py` times the splash attention kernels against SDPA at one shape on one core
 (`PYTHONPATH=python:. python3 benchmark/tpu/diffusion/bench_splash_attn.py`).
