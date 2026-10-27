@@ -9,6 +9,7 @@ import zmq
 from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    FreezeGCReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     sock_recv,
@@ -27,12 +28,16 @@ class ScriptedTokenizerRecvProxy:
         self._underlying = underlying
         self._buffer: deque = deque()
         self.work_reqs_seen: int = 0
+        self.freeze_gc_reqs_seen: int = 0
 
     def recv_pyobj(self, flags: int = 0) -> Any:
         self._drain_underlying()
 
         if self._buffer:
-            return self._buffer.popleft()
+            req = self._buffer.popleft()
+            if isinstance(req, FreezeGCReq):
+                self.freeze_gc_reqs_seen += 1
+            return req
 
         if flags & zmq.NOBLOCK:
             raise zmq.ZMQError(zmq.EAGAIN, "Resource temporarily unavailable")
