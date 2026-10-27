@@ -123,7 +123,7 @@
 # Fork-wide default owners. CODEOWNERS is last-match-wins: this line sits below the
 # upstream block so upstream-only owners (no write access here) never shadow it, and
 # above the fork-specific TPU lines, which repeat this list on purpose.
-* @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yinlin09 @junyanxu @niehen6174 @jcc-google
+* @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD
 
 # ---- TPU area owners (fork-only, TPU-specific paths only). Keep below the upstream block; last match wins. ----
 
