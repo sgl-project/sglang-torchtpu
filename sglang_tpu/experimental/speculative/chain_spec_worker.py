@@ -23,6 +23,7 @@ capture and every draft step reuses. Not under PD: prefill does not ship it.
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Sequence
 
 import torch
@@ -556,10 +557,11 @@ class TpuChainSpecWorker(TpuSpecWorker):
     def _warmup_draft_ops(self) -> None:
         """Eager draft/commit ops around the compiled draft programs, per batch bucket."""
         drafter = self._chain_draft_worker
-        width = self.num_verify_rows
         with torch.no_grad():
-            for pbs in self._b_bucketer().buckets:
-                self._warmup_draft_chain(pbs)
+            for width, pbs in itertools.product(
+                self.verify_widths(), self._b_bucketer().buckets
+            ):
+                self._warmup_draft_chain(pbs, width)
                 rows = _dummy_verify_rows(pbs, width, self.device)
                 accept_tokens = torch.zeros(
                     (pbs, width), dtype=torch.int64, device=self.device
@@ -605,15 +607,16 @@ class TpuChainSpecWorker(TpuSpecWorker):
                         )
                     )
 
-    def _warmup_draft_chain(self, pbs: int) -> None:
+    def _warmup_draft_chain(self, pbs: int, width: int) -> None:
         """draft's eager prelude fuses with select_verify_rows' layout, so replay both."""
 
         def upload(*shape: int, dtype: torch.dtype = torch.int64) -> torch.Tensor:
             return torch.zeros(shape, dtype=dtype).to(self.device, non_blocking=True)
 
-        width = self.num_verify_rows
         seq_lens = upload(pbs)
-        rows = select_verify_rows(upload(pbs, 2 * width), upload(pbs), seq_lens)
+        rows = select_verify_rows(
+            upload(pbs, 2 * self.verify_window_rows), upload(pbs), seq_lens, width
+        )
         state = SpecState(
             bonus_tokens=upload(pbs), seq_lens=seq_lens, req_pool_indices=upload(pbs)
         )
@@ -675,16 +678,20 @@ class TpuChainSpecWorker(TpuSpecWorker):
 
     def _warmup_verify_mrope(self) -> None:
         """compute_spec_mrope_positions on the verify rows: text-only, then per-request deltas."""
-        width = self.num_verify_rows
 
         def upload(*shape: int) -> torch.Tensor:
             return torch.zeros(shape, dtype=torch.int64).to(self.device)
 
         with torch.no_grad():
-            for padded_bs in self._b_bucketer().buckets:
+            for width, padded_bs in itertools.product(
+                self.verify_widths(), self._b_bucketer().buckets
+            ):
                 # make_verify_input hands over select_verify_rows' flat positions.
                 rows = select_verify_rows(
-                    upload(padded_bs, 2 * width), upload(padded_bs), upload(padded_bs)
+                    upload(padded_bs, 2 * self.verify_window_rows),
+                    upload(padded_bs),
+                    upload(padded_bs),
+                    width,
                 )
                 positions = rows.flat_positions.view(padded_bs, -1)
                 positions.flatten().unsqueeze(0).repeat(3, 1).cpu()

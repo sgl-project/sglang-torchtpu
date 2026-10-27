@@ -244,6 +244,7 @@ NIGHTLY_SUITES = {
         "nightly-tpu-perf-gemma4-31b",
         "nightly-tpu-perf-gemma4-26b-a4b",
         "nightly-tpu-perf-qwen3-5-397b",
+        "nightly-tpu-perf-glm-5-3-flash-mtp-mk",
         # One suite per quality eval so each gets an independent TPU slice.
         "nightly-tpu-accuracy-gpt-oss-20b",
         "nightly-tpu-accuracy-gemma4-31b-aime",
@@ -260,6 +261,10 @@ NIGHTLY_SUITES = {
         "nightly-tpu-accuracy-gpt-oss-120b-gpqa",
         "nightly-tpu-accuracy-gpt-oss-120b-gsm8k",
         "nightly-tpu-accuracy-gpt-oss-120b-mmlupro",
+        "nightly-tpu-accuracy-muse-spark-aime",
+        "nightly-tpu-accuracy-muse-spark-gpqa",
+        "nightly-tpu-accuracy-muse-spark-gsm8k",
+        "nightly-tpu-accuracy-muse-spark-mmlupro",
         "nightly-tpu-accuracy-glm-5-3-flash-aime",
         # External tpu7x cluster (nightly-test-external-tpu.yml; see
         # .github/tpu-ci/external/README.md). 1host: single-host tests that launch

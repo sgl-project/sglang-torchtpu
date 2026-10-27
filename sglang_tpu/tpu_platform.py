@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Optional, Type
 
 import torch
 
+from sglang.srt.arg_groups.resolution_hooks import register_resolution_hook
 from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
@@ -31,6 +32,32 @@ logger = get_logger(__name__)
 # Platform discovery runs before worker bootstrap configures torch_tpu.
 rank_slice = LazyImport("sglang_tpu.rank_local", "rank_slice")
 traced_rank = LazyImport("sglang_tpu.rank_local", "traced_rank")
+# The resolving view imports the platform registry, which is still discovering us.
+_resolving_view = LazyImport("sglang.srt.arg_groups.overrides", "resolving_view")
+
+
+@register_resolution_hook("handle_other_validations")
+def _validate_startup_cleanup_control(server_args, previous):
+    previous(server_args)
+    cfg = _resolving_view(server_args)
+    if (
+        cfg.device == "tpu"
+        and cfg.dwdp_size <= 1
+        and (
+            cfg.ep_join_mode == "scale"
+            or (
+                cfg.attn_dp_size > 1 and cfg.enable_dp_attention_local_control_broadcast
+            )
+        )
+    ):
+        # Independent control polling can put one DP group in the cleanup
+        # barrier while another enters an MLP scheduling collective. DWDP skips
+        # those shared scheduling collectives.
+        raise ValueError(
+            "TPU startup cleanup requires global control broadcasts with attention DP. "
+            "Disable --enable-dp-attention-local-control-broadcast and elastic EP "
+            "scaling, which can enable local control automatically."
+        )
 
 
 # Default size for libtpu's premapped (pinned, DMA-mapped) host staging pool.
@@ -554,8 +581,8 @@ def _validate_mtp_index_share(cfg, hf_config) -> None:
         )
     if not experimental_spec_enabled():
         raise ValueError(
-            "DSA index sharing on TPU runs on the experimental spec worker; unset "
-            f"SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=0 {opt_out}."
+            "DSA index sharing on TPU runs on the experimental spec worker; set "
+            f"SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1 {opt_out}."
         )
     if cfg.disaggregation_mode != "null":
         # A P/D decode would draft on seeds its prefill never sent.
@@ -626,14 +653,22 @@ def _register_attention_backends() -> None:
 
         return DSV4TPUAttnBackend(runner)
 
+    # Vision: opt in to block-skipping splash for the "tpu" backend.
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if tpu_envs.SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION.get():
+        from sglang.srt.layers.attention.vision import QKV_BACKEND_IMPL
+        from sglang_tpu.attention.vision_splash import VisionTpuSplashAttention
+
+        QKV_BACKEND_IMPL["tpu"] = VisionTpuSplashAttention
+
 
 def _register_models() -> None:
     """Add the model implementations that only this package provides to the registry."""
     from sglang.srt.models.registry import ModelRegistry
 
-    # A module that fails to import is logged and skipped, so it can't take the
-    # other models down with it; an arch core already serves raises.
-    ModelRegistry.register("sglang_tpu.models")
+    # Preserve the external-model fast path without importing unused catalogs.
+    ModelRegistry.register_lazy("sglang_tpu.models")
 
 
 def _resolve_num_hidden_layers(server_args) -> int:
@@ -1229,11 +1264,8 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang.srt.layers.cp.base import get_cp_strategy
         from sglang.srt.utils.common import print_warning_once
         from sglang_tpu.allocator_tpu import host_return_allocators
-        from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.host_padding import _can_stage_forward_metadata
 
-        if not tpu_envs.SGLANG_TPU_HOST_PADDING.get():
-            return None
         # TBO, hisparse and beam search have no TPU path, so they need no opt-out.
         allocator = batch.token_to_kv_pool_allocator
         checks = (
@@ -1250,8 +1282,8 @@ class TpuSRTPlatform(SRTPlatform):
         for reason, ok in checks:
             if not ok:
                 print_warning_once(
-                    "SGLANG_TPU_HOST_PADDING is set, but prefill inputs upload at "
-                    f"the live length because {reason}. This may compile a program "
+                    "Prefill inputs upload at the live length instead of host-padded "
+                    f"because {reason}. This may compile a program "
                     "per prompt length."
                 )
                 return None
@@ -1482,7 +1514,9 @@ class TpuSRTPlatform(SRTPlatform):
         return torch.device("tpu", device_id)
 
     def set_device(self, device: torch.device) -> None:
-        torch.accelerator.set_device_index(device)
+        # The PJRT bootstrap binds each worker to one chiplet at local index 0
+        # and torch_tpu cannot switch it, so sglang's gpu_id is only a label.
+        torch.accelerator.set_device_index(0)
 
     def get_device_name(self, device_id: int = 0) -> str:
         try:

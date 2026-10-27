@@ -463,7 +463,10 @@ class TestTpuGraphRunner(CustomTestCase):
                 speculative_num_steps=3, speculative_algorithm="EAGLE3"
             ),
         )
-        with tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+        with (
+            tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
+            tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        ):
             cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
         self.assertTrue(issubclass(cls, Eagle3SpecDecodeCompilePolicyMixin))
         self.assertTrue(issubclass(cls, BaseSpecDecodeCompilePolicyMixin))
@@ -479,7 +482,10 @@ class TestTpuGraphRunner(CustomTestCase):
                 speculative_num_steps=3, speculative_algorithm="EAGLE"
             ),
         )
-        with tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+        with (
+            tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
+            tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        ):
             cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
         self.assertTrue(issubclass(cls, Eagle3SpecDecodeCompilePolicyMixin))
         self.assertTrue(issubclass(cls, BaseSpecDecodeCompilePolicyMixin))
@@ -496,7 +502,10 @@ class TestTpuGraphRunner(CustomTestCase):
                 speculative_num_steps=3, speculative_algorithm="DFLASH"
             ),
         )
-        with tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+        with (
+            tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
+            tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        ):
             cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
         self.assertTrue(issubclass(cls, DFlashSpecDecodeCompilePolicyMixin))
         self.assertFalse(issubclass(cls, TpuBlockSpecDecodeCompilePolicyMixin))

@@ -308,7 +308,10 @@ class TestEagle3PipelineParallelCompat(CustomTestCase):
                     core_check_pipeline_parallel_compat,
                     _compat_cfg(**{**cfg, "disaggregation_mode": "null"}),
                 )
-        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+        with (
+            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
+            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        ):
             # Core's DFlash worker builds its draft on every stage.
             with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):
                 check_pipeline_parallel_compat(

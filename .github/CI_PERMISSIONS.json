@@ -5,6 +5,12 @@
         "cooldown_interval_minutes": 0,
         "reason": "sglang-torchtpu maintainer listed in CODEOWNERS TPU area"
     },
+    "JamesBrianD": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "sglang-torchtpu TPU contributor"
+    },
     "alexnails": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -16,6 +22,12 @@
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
         "reason": "sglang-torchtpu maintainer listed in CODEOWNERS TPU area"
+    },
+    "cjx0709": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "sglang-torchtpu TPU contributor"
     },
     "hlFu": {
         "can_tag_run_ci_label": true,

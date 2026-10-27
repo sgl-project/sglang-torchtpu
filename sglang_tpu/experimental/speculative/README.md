@@ -115,6 +115,17 @@ policy mixin, and routes all three.
 - Accuracy: GSM8K with spec on matches spec off. Performance: A/B on identical
   server flags.
 
+## Adaptive worker warmup contract
+
+An adaptive plugin overrides `TpuSpecWorker.verify_widths()` with every reachable
+active verify width (draft count plus one). The default is the fixed active width.
+`verify_window_rows` is the maximum configured capacity: scheduler reservation,
+idle inputs and selector warmups must retain twice that many candidate columns
+even when the active width shrinks. The worker owns selector warmup because the
+generic spec-op context only knows the active width. Width-dependent worker
+warmups iterate the hook without changing runtime width state; the plugin still
+owns its adaptive policy and model compilation for those widths.
+
 ## DP attention
 
 Both families serve `--enable-dp-attention`. Drafts are greedy under DP attention,
