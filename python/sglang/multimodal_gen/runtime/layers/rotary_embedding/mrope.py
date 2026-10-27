@@ -5,6 +5,7 @@ import functools
 import torch
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 def _to_tuple(x: int | tuple[int, ...], dim: int = 2) -> tuple[int, ...]:
@@ -270,9 +271,23 @@ class OneDRotaryEmbedding(torch.nn.Module):
         This method is wrapped by an LRU cache.
         """
         device = torch.device(device_str)
+        if self.dtype != torch.float64 and not current_platform.is_float64_supported():
+            # The model asked for float64 tables; build them on the host and
+            # move the float32 result, so they match a float64-capable device.
+            return tuple(t.to(device) for t in self._host_float64_freqs(pos_tuple))
         pos = torch.as_tensor(pos_tuple, dtype=self.dtype, device=device)
         freqs_cos, freqs_sin = self.build_freqs_outer(pos, device)
         return freqs_cos, freqs_sin
+
+    def _host_float64_freqs(
+        self, pos_tuple: tuple
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        dtype, self.dtype = self.dtype, torch.float64
+        try:
+            pos = torch.as_tensor(pos_tuple, dtype=torch.float64)
+            return self.build_freqs_outer(pos, torch.device("cpu"))
+        finally:
+            self.dtype = dtype
 
 
 class NDRotaryEmbedding(torch.nn.Module):
