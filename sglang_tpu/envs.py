@@ -327,6 +327,13 @@ class TpuEnvs:
     # (likely 0.0.48).
     SGLANG_TPU_LIBTPU_WORKAROUND_FOR_ONLINE_QUANT_SCALE = EnvBool(True)
 
+    # Sampling
+    # Keep the repetition-penalty state padded to the power-of-two logits row
+    # bucket and run the scaling penalty and greedy argmax on the padded logits
+    # (sampling/padded_logits.py). Same per-row ops, so the same tokens. Opt-in:
+    # speculative decoding expands the penalties per request.
+    SGLANG_TPU_PADDED_LOGITS_SAMPLING = EnvBool(False)
+
     @classmethod
     def names(cls) -> list[str]:
         return sorted(
