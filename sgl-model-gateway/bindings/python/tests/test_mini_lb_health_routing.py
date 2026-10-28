@@ -3,6 +3,7 @@ it again once it recovers, and still route when a whole role is unhealthy."""
 
 import asyncio
 import logging
+import math
 import socket
 
 import pytest
@@ -67,7 +68,7 @@ def _refused_url():
     return f"http://127.0.0.1:{port}"
 
 
-def _lb(prefill_urls, decode_urls, policy="random"):
+def _lb(prefill_urls, decode_urls, policy="random", **health_args):
     return mini_lb.MiniLoadBalancer(
         RouterArgs(
             mini_lb_policy=policy,
@@ -75,6 +76,7 @@ def _lb(prefill_urls, decode_urls, policy="random"):
             prefill_urls=[(url, 8998 + i) for i, url in enumerate(prefill_urls)],
             decode_urls=list(decode_urls),
             request_timeout_secs=10,
+            **health_args,
         )
     )
 
@@ -268,12 +270,10 @@ async def _wait_for(predicate):
 
 @pytest.mark.unit
 def test_health_polling_runs_in_lifespan_and_stops_cleanly(monkeypatch):
-    monkeypatch.setenv("SGLANG_MINI_LB_HEALTH_POLL_INTERVAL_SECS", "0.01")
-
     async def test(backends, prefill_urls, decode_urls):
         healthy, sick = decode_urls
         backends.status[sick] = 503
-        load_balancer = _lb(prefill_urls, decode_urls)
+        load_balancer = _lb(prefill_urls, decode_urls, health_check_interval_secs=0.01)
         monkeypatch.setattr(mini_lb, "lb", load_balancer)
         tasks_before = asyncio.all_tasks()
 
@@ -289,23 +289,67 @@ def test_health_polling_runs_in_lifespan_and_stops_cleanly(monkeypatch):
 
 
 @pytest.mark.unit
-def test_health_polling_survives_an_unexpected_probe_error(monkeypatch):
-    monkeypatch.setenv("SGLANG_MINI_LB_HEALTH_POLL_INTERVAL_SECS", "0.01")
+def test_failing_backend_is_skipped_while_another_probe_hangs():
+    """A hung backend must not delay the verdict on a fast-failing one."""
 
+    async def test(backends, prefill_urls, decode_urls):
+        healthy, hung = decode_urls
+        backends.hung.add(hung)
+        refused = _refused_url()
+        load_balancer = _lb(prefill_urls, [healthy, hung, refused])
+
+        probe = asyncio.create_task(load_balancer.probe_backend_health())
+        try:
+            await _wait_for(lambda: refused not in _selected(load_balancer)[1])
+            assert not probe.done()
+        finally:
+            probe.cancel()
+            await asyncio.gather(probe, return_exceptions=True)
+
+    _run(test)
+
+
+@pytest.mark.unit
+def test_poller_reprobes_others_while_one_probe_hangs():
+    async def test(backends, prefill_urls, decode_urls):
+        healthy, sick = decode_urls
+        hung = (await backends.start(1))[0]
+        backends.hung.add(hung)
+        backends.status[sick] = 503
+        load_balancer = _lb(
+            prefill_urls,
+            [healthy, sick, hung],
+            health_check_interval_secs=0.01,
+        )
+        polling = load_balancer.start_health_polling()
+        try:
+            await _wait_for(lambda: sick not in _selected(load_balancer)[1])
+            backends.status[sick] = 200
+            await _wait_for(lambda: sick in _selected(load_balancer)[1])
+            assert backends.probes[hung] == 1
+        finally:
+            polling.cancel()
+            await asyncio.gather(polling, return_exceptions=True)
+
+    _run(test)
+
+
+@pytest.mark.unit
+def test_health_polling_survives_an_unexpected_probe_error(monkeypatch):
     async def test(backends, prefill_urls, decode_urls):
         healthy, sick = decode_urls
         backends.status[sick] = 503
-        load_balancer = _lb(prefill_urls, decode_urls)
-        real_probe = load_balancer.probe_backend_health
+        load_balancer = _lb(prefill_urls, decode_urls, health_check_interval_secs=0.01)
+        real_probe_status = mini_lb._probe_status
         calls = []
 
-        async def flaky_probe():
+        async def flaky_probe_status(*args):
             calls.append(None)
-            if len(calls) == 1:
+            if len(calls) <= 3:
                 raise RuntimeError("boom")
-            await real_probe()
+            return await real_probe_status(*args)
 
-        monkeypatch.setattr(load_balancer, "probe_backend_health", flaky_probe)
+        monkeypatch.setattr(mini_lb, "_probe_status", flaky_probe_status)
         polling = load_balancer.start_health_polling()
         try:
             await _wait_for(lambda: _selected(load_balancer)[1] == {healthy})
@@ -317,12 +361,59 @@ def test_health_polling_survives_an_unexpected_probe_error(monkeypatch):
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("interval", ["0", "-1"])
-def test_non_positive_interval_disables_health_polling(monkeypatch, interval):
-    monkeypatch.setenv("SGLANG_MINI_LB_HEALTH_POLL_INTERVAL_SECS", interval)
+def test_session_affinity_falls_back_to_reachable_not_dead_backend():
+    """D1 fails /health_generate but still serves; D2 is unreachable. Traffic
+    must go to D1, not collapse onto the dead D2."""
 
     async def test(backends, prefill_urls, decode_urls):
+        degraded, dead = decode_urls
+        backends.status[degraded] = 503
+        load_balancer = _lb(prefill_urls, decode_urls, "session_affinity")
+        load_balancer.affinity_policy.loads.mark_unreachable(dead)
+
+        await load_balancer.probe_backend_health()
+
+        assert _selected(load_balancer)[1] == {degraded}
+
+    _run(test)
+
+
+@pytest.mark.unit
+def test_session_affinity_prefers_healthy_and_reachable():
+    async def test(_backends, prefill_urls, decode_urls):
+        load_balancer = _lb(prefill_urls, decode_urls, "session_affinity")
+        load_balancer.affinity_policy.loads.mark_unreachable(decode_urls[1])
+
+        await load_balancer.probe_backend_health()
+
+        assert _selected(load_balancer)[1] == {decode_urls[0]}
+
+    _run(test)
+
+
+@pytest.mark.unit
+def test_emptied_role_does_not_log_recovery(caplog):
+    async def test(backends, prefill_urls, decode_urls):
+        for url in decode_urls:
+            backends.status[url] = 503
         load_balancer = _lb(prefill_urls, decode_urls)
+        await load_balancer.probe_backend_health()
+        load_balancer.select_pair()
+
+        for url in decode_urls:
+            load_balancer.remove_worker(url)
+        with caplog.at_level(logging.INFO, logger=mini_lb.logger.name):
+            with pytest.raises(AssertionError, match="No decode servers"):
+                load_balancer.select_pair()
+        assert not [r for r in caplog.records if "healthy backend again" in r.message]
+
+    _run(test)
+
+
+@pytest.mark.unit
+def test_disable_health_check_disables_polling():
+    async def test(backends, prefill_urls, decode_urls):
+        load_balancer = _lb(prefill_urls, decode_urls, disable_health_check=True)
         assert load_balancer.start_health_polling() is None
         assert sum(backends.probes.values()) == 0
 
@@ -330,8 +421,26 @@ def test_non_positive_interval_disables_health_polling(monkeypatch, interval):
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("interval", ["abc", "nan"])
-def test_invalid_interval_is_rejected(monkeypatch, interval):
-    monkeypatch.setenv("SGLANG_MINI_LB_HEALTH_POLL_INTERVAL_SECS", interval)
-    with pytest.raises(ValueError, match="SGLANG_MINI_LB_HEALTH_POLL_INTERVAL_SECS"):
-        _lb(["http://p:1"], ["http://d:1"])
+def test_default_interval_comes_from_router_args():
+    load_balancer = _lb(["http://p:1"], ["http://d:1"])
+    assert load_balancer.health_poll_interval_secs == (
+        RouterArgs.health_check_interval_secs
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("interval", [0, -1, math.inf, math.nan])
+def test_invalid_interval_is_rejected(interval):
+    with pytest.raises(ValueError, match="health-check-interval-secs"):
+        _lb(["http://p:1"], ["http://d:1"], health_check_interval_secs=interval)
+
+
+@pytest.mark.unit
+def test_invalid_interval_is_ignored_when_health_check_is_disabled():
+    load_balancer = _lb(
+        ["http://p:1"],
+        ["http://d:1"],
+        disable_health_check=True,
+        health_check_interval_secs=0,
+    )
+    assert load_balancer.start_health_polling() is None
