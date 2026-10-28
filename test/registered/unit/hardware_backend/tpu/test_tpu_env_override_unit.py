@@ -26,6 +26,24 @@ from sglang_tpu.env_override import (
 )
 
 
+class TestMallocArenaMaxOverride(CustomTestCase):
+    def _apply(self, initial: str | None) -> str | None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MALLOC_ARENA_MAX", None)
+            if initial is not None:
+                os.environ["MALLOC_ARENA_MAX"] = initial
+            apply_tpu_env_overrides()
+            return os.environ.get("MALLOC_ARENA_MAX")
+
+    def test_unset_arena_max_is_capped_for_spawned_ranks(self):
+        self.assertEqual(self._apply(None), "8")
+
+    def test_user_arena_max_wins(self):
+        for value in ("2", "64", ""):
+            with self.subTest(value=value):
+                self.assertEqual(self._apply(value), value)
+
+
 class TestLibtpuInitArgsOverrides(CustomTestCase):
     def _apply(
         self,
