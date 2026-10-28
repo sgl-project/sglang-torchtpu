@@ -288,5 +288,76 @@ class TestTpuHostPoolStoragePages(CustomTestCase):
         self.assertIsNone(TpuFusedMHATokenToKVPoolHost.storage_format_tag)
 
 
+class TestStorageFormatTagFromRealPools(CustomTestCase):
+    """Builds the real device pools on CPU and the host pool through its own
+    __init__, so the tag is checked against the live layout attributes rather
+    than the fake device pool above."""
+
+    @staticmethod
+    def _pools(pool_cls, dtype):
+        from sglang_tpu.kv_pool_host import TpuFusedMHATokenToKVPoolHost
+
+        # The seq-along-lane pool asks Pallas for the chip's sublane count,
+        # which needs a TPU; stand in tpu7x's 8 sublanes so the pool builds on
+        # CPU. The expected tag below is read back from the live buffer anyway.
+        def _head_dim_without_tpu(*, head_dim, kv_packing):
+            tile = 8 * kv_packing
+            return -(-head_dim // tile) * tile
+
+        with patch(
+            "sglang_tpu.kv_pool._seq_along_lane_head_dim", _head_dim_without_tpu
+        ):
+            dev = pool_cls(
+                size=4 * PAGE_SIZE,
+                page_size=PAGE_SIZE,
+                dtype=dtype,
+                head_num=2,
+                head_dim=128,
+                layer_num=LAYER_NUM,
+                device="cpu",
+                enable_memory_saver=False,
+            )
+        host = TpuFusedMHATokenToKVPoolHost(
+            dev,
+            host_to_device_ratio=1.0,
+            host_size=0,
+            page_size=PAGE_SIZE,
+            layout="page_first_fused",
+            device="cpu",
+        )
+        return dev, host
+
+    def test_tag_names_the_live_layout_dtype_and_dims(self):
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool, TpuSeqAlongLaneKVPool
+
+        cases = (
+            (TpuFusedMHATokenToKVPool, "token-major"),
+            (TpuSeqAlongLaneKVPool, "seq-along-lane"),
+        )
+        tags = set()
+        for pool_cls, layout in cases:
+            for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+                with self.subTest(pool=pool_cls.__name__, dtype=dtype):
+                    dev, host = self._pools(pool_cls, dtype)
+                    dims = "x".join(
+                        str(d) for d in dev.get_fused_kv_buffer(0).shape[1:]
+                    )
+                    dtype_tag = str(dtype).removeprefix("torch.")
+                    expected = (
+                        f"tpu-{layout}-hp{dev.kv_pack_heads}-p{dev.kv_packing}"
+                        f"-{dtype_tag}-{dims}"
+                    )
+                    self.assertEqual(host.storage_format_tag, expected)
+                    # bf16 packs 2 elements per 32-bit lane, fp8 packs 4.
+                    self.assertEqual(dev.kv_packing, 4 // dtype.itemsize)
+                    self.assertEqual(
+                        host.kv_buffer.shape[2:],
+                        tuple(dev.get_fused_kv_buffer(0).shape[1:]),
+                    )
+                    tags.add(host.storage_format_tag)
+                    host.destroy()
+        self.assertEqual(len(tags), 4)
+
+
 if __name__ == "__main__":
     unittest.main()
