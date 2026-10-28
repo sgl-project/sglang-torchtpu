@@ -31,6 +31,8 @@ class HostPaddedDraftInput(SpecInput):
     SPEC_INPUT_TYPE: ClassVar[SpecInputType]
     # Per-request tensors a subclass relays; filter/merge slice them before FutureMap owns the rows.
     RELAYED_FIELDS: ClassVar[tuple[str, ...]] = ("bonus_tokens", "new_seq_lens")
+    # Page-addressed attention can reserve KV without materializing token slots.
+    needs_verify_cache_locs: ClassVar[bool] = True
 
     bonus_tokens: torch.Tensor
     new_seq_lens: torch.Tensor
@@ -41,6 +43,7 @@ class HostPaddedDraftInput(SpecInput):
     tpu_verify_cache_candidates: torch.Tensor | None = None
     tpu_committed_lens: torch.Tensor | None = None
     tpu_req_pool_indices: torch.Tensor | None = None
+    tpu_verify_window_rows: int = 0
     # Device tensor read after the step's last KV write; the async result copy
     # copies it so the TPU KV free fence's copy_done covers every KV write.
     kv_fence_tail: torch.Tensor | None = None
@@ -105,9 +108,7 @@ class HostPaddedDraftInput(SpecInput):
         # Kept on host: TpuSpecVerifyInput.from_batch uploads it at the forward's
         # bucket, which DP attention only fixes after this point.
         if not _verify_window_eligible(batch):
-            self.tpu_verify_cache_candidates = None
-            self.tpu_committed_lens = None
-            self.tpu_req_pool_indices = None
+            self._drop_window()
             self.tpu_host_seq_lens_is_committed = False
             return
         # The 2 * block_size reservation above maps the whole window.
@@ -116,14 +117,19 @@ class HostPaddedDraftInput(SpecInput):
             for i, req in enumerate(batch.reqs)
         ), "TpuSpecWorker verify window needs two windows of reserved KV"
         req_pool_indices_cpu = batch.req_pool_indices_cpu[:bs].to(torch.int64)
-        self.tpu_verify_cache_candidates = gather_dflash_candidate_window(
-            batch.req_to_token_pool.req_to_token,
-            req_pool_indices_cpu,
-            committed_lens_cpu,
-            block_size,
-        ).to(torch.int64)
+        self.tpu_verify_cache_candidates = (
+            gather_dflash_candidate_window(
+                batch.req_to_token_pool.req_to_token,
+                req_pool_indices_cpu,
+                committed_lens_cpu,
+                block_size,
+            ).to(torch.int64)
+            if self.needs_verify_cache_locs
+            else None
+        )
         self.tpu_committed_lens = committed_lens_cpu
         self.tpu_req_pool_indices = req_pool_indices_cpu
+        self.tpu_verify_window_rows = block_size
         self.tpu_host_seq_lens_is_committed = True
 
     def _drop_window(self):
@@ -132,6 +138,7 @@ class HostPaddedDraftInput(SpecInput):
         self.tpu_verify_cache_candidates = None
         self.tpu_committed_lens = None
         self.tpu_req_pool_indices = None
+        self.tpu_verify_window_rows = 0
 
     def filter_batch(self, new_indices, new_indices_cpu=None, *, future_indices=None):
         self._drop_window()
