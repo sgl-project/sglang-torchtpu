@@ -311,6 +311,36 @@ class TestHostPadFieldSelection(CustomTestCase):
         self.assertEqual(batch.positions.tolist(), [13, 14, 51, 52, 7, 8, 0, 0])
         self.assertEqual(batch.mrope_positions.shape, (3, 8))
 
+    def test_restore_of_host_staged_tokens_never_slices_on_device(self):
+        """Bug regression (#1429): restoring host-staged prefill tokens sliced the
+        uploaded tensors on the TPU, compiling one program per prompt length."""
+        batch = self._extend_batch()
+        originals = {
+            name: getattr(batch, name)
+            for name in ("input_ids", "positions", "out_cache_loc", "mrope_positions")
+        }
+        policy = self._policy()
+        policy.model_runner.device = "meta"
+        policy.prepare_forward_batch(batch)
+        uploaded = {name: getattr(batch, name) for name in originals}
+        for name, value in uploaded.items():
+            self.assertEqual(value.device.type, "meta", name)
+
+        class RejectDeviceSlice(TorchDispatchMode):
+            def __torch_dispatch__(mode, func, types, args=(), kwargs=None):
+                if func in (torch.ops.aten.slice.Tensor, torch.ops.aten.narrow.default):
+                    if any(args[0] is value for value in uploaded.values()):
+                        raise AssertionError(f"{func} on an uploaded token field")
+                return func(*args, **(kwargs or {}))
+
+        with RejectDeviceSlice():
+            shim._restore_forward_batch_inputs(batch, real_q=5, real_b=2)
+
+        for name, original in originals.items():
+            restored = getattr(batch, name)
+            self.assertEqual(restored.device.type, "meta", name)
+            self.assertEqual(restored.shape, original.shape, name)
+
     def test_restore_trims_each_field_on_its_token_dim(self):
         # Fewer real tokens than MROPE rows, so trimming dim 0 would be wrong.
         batch = self._extend_batch()
