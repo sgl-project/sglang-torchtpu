@@ -28,7 +28,8 @@ class HostPaddingFutureMap(FutureMap):
             self.req_pool_size, self.req_pool_size + width, dtype=torch.int64
         )
         padded[: len(indices)].copy_(indices)
-        return padded.to(self.device, non_blocking=True)
+        # The temporary host buffer must survive until the upload completes.
+        return padded.to(self.device)
 
     def _store(self, buf, indices, values):
         if buf is not self.output_tokens_buf or indices.device.type != "cpu":
