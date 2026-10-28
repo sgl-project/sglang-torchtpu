@@ -42,21 +42,28 @@ LAYOUTS = (("token_major", TOKEN_MAJOR_PAGE), ("seq_along_lane", SEQ_ALONG_LANE_
 
 
 class _FakeDevicePool:
-    def __init__(self, page_shape, dtype):
+    def __init__(self, page_shape, dtype, layout="token-major", kv_pack_heads=1):
         self._fused = torch.empty((2,) + page_shape, dtype=dtype)
         self.layer_num = LAYER_NUM
         self.start_layer = 0
         # init_kv_buffer picks the host allocator by the DEVICE pool's device
         # ("tpu" -> alloc_tpu_host, plain unpinned CPU memory).
         self.device = "tpu"
+        self.KV_LAYOUT_NAME = layout
+        self.kv_pack_heads = kv_pack_heads
+        # Elements per 32-bit lane, as the real pools derive it from store_dtype.
+        self.kv_packing = 4 // dtype.itemsize
 
     def get_fused_kv_buffer(self, layer_id):
         return self._fused
 
+    def kv_layout_tag(self):
+        return f"{self.KV_LAYOUT_NAME}-hp{self.kv_pack_heads}-p{self.kv_packing}"
 
-def _host_pool(page_shape, dtype=torch.float32):
+
+def _host_pool(page_shape, dtype=torch.float32, **device_pool_kwargs):
     pool = TpuFusedMHATokenToKVPoolHost.__new__(TpuFusedMHATokenToKVPoolHost)
-    pool.device_pool = _FakeDevicePool(page_shape, dtype)
+    pool.device_pool = _FakeDevicePool(page_shape, dtype, **device_pool_kwargs)
     pool.page_size = PAGE_SIZE
     pool.dtype = dtype
     pool.page_num = PAGE_NUM
@@ -66,6 +73,8 @@ def _host_pool(page_shape, dtype=torch.float32):
     pool.size_per_token = pool.get_size_per_token()
     pool.kv_buffer = pool.init_kv_buffer()
     pool.kv_buffer.zero_()
+    # __init__ is bypassed above, so set the tag the way it does.
+    pool.storage_format_tag = pool._storage_format_tag()
     return pool
 
 
@@ -220,7 +229,9 @@ class TestTpuHostPoolStoragePages(CustomTestCase):
         # format tag in storage_model_name keeps one layout from reading back a
         # page persisted by the other or by a different store dtype.
         tm_bf16 = _host_pool(TOKEN_MAJOR_PAGE, dtype=torch.bfloat16)
-        sal_bf16 = _host_pool(SEQ_ALONG_LANE_PAGE, dtype=torch.bfloat16)
+        sal_bf16 = _host_pool(
+            SEQ_ALONG_LANE_PAGE, dtype=torch.bfloat16, layout="seq-along-lane"
+        )
         tm_fp8 = _host_pool(TOKEN_MAJOR_PAGE, dtype=torch.float8_e4m3fn)
 
         tags = {
@@ -246,6 +257,35 @@ class TestTpuHostPoolStoragePages(CustomTestCase):
             self.assertFalse(sal_store.exists("page-0"))
             self.assertFalse(fp8_store.exists("page-0"))
             self.assertFalse(untagged_store.exists("page-0"))
+
+    def test_storage_format_tag_names_the_layout_and_packing(self):
+        # Dims and dtype alone do not fix the bytes: the same page dims can
+        # come from another layout, or from heads packed side by side into one
+        # row. Both must land under their own storage key.
+        base = _host_pool(TOKEN_MAJOR_PAGE, dtype=torch.float8_e4m3fn)
+        other_layout = _host_pool(
+            TOKEN_MAJOR_PAGE, dtype=torch.float8_e4m3fn, layout="seq-along-lane"
+        )
+        packed_heads = _host_pool(
+            TOKEN_MAJOR_PAGE, dtype=torch.float8_e4m3fn, kv_pack_heads=4
+        )
+
+        self.assertEqual(
+            base.storage_format_tag, "tpu-token-major-hp1-p4-float8_e4m3fn-64x4x4x128"
+        )
+        self.assertEqual(
+            len(
+                {
+                    base.storage_format_tag,
+                    other_layout.storage_format_tag,
+                    packed_heads.storage_format_tag,
+                }
+            ),
+            3,
+        )
+        # The tag is fixed by __init__ (here: its helper), not by a class
+        # default, so a pool never reports a layout it was not built with.
+        self.assertIsNone(TpuFusedMHATokenToKVPoolHost.storage_format_tag)
 
 
 if __name__ == "__main__":

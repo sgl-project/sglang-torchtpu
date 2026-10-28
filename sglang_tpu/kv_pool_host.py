@@ -86,7 +86,6 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
     """
 
     device_pool: TpuFusedMHATokenToKVPool
-    storage_format_tag = "tpu-page-first-fused"
 
     def __init__(
         self,
@@ -118,6 +117,16 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
             allocator_type=allocator_type,
             pool_label=pool_label,
         )
+        self.storage_format_tag = self._storage_format_tag()
+
+    def _storage_format_tag(self) -> str:
+        """Storage-key tag for everything that fixes a page's bytes on this
+        pool: the device layout with its packing, the store dtype and the page
+        dims. A page written under another tag is a miss, never wrong KV. The
+        fp8 scales are per-layer model constants, keyed by the model name."""
+        shape_tag = "x".join(str(d) for d in self._device_page_shape())
+        dtype_tag = str(self.dtype).removeprefix("torch.")
+        return f"tpu-{self.device_pool.kv_layout_tag()}-{dtype_tag}-{shape_tag}"
 
     def _device_page_shape(self) -> tuple:
         """Per-page dims of the device's fused KV tensor, layout and all."""
@@ -136,14 +145,7 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
 
     def init_kv_buffer(self):
         # layout is asserted page_first_fused in __init__, so no re-check here.
-        page_shape = self._device_page_shape()
-        # Token-major and seq-along-lane have the same byte count per page; tag
-        # the storage key with the live shape and dtype so incompatible pages
-        # miss instead of loading or failing with a short read.
-        shape_tag = "x".join(str(d) for d in page_shape)
-        dtype_tag = str(self.dtype).removeprefix("torch.")
-        self.storage_format_tag = f"tpu-fused-{dtype_tag}-{shape_tag}"
-        dims = (self.page_num, self.layer_num) + page_shape
+        dims = (self.page_num, self.layer_num) + self._device_page_shape()
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
         return alloc_func(
             dims,
