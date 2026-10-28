@@ -25,16 +25,16 @@ e.g. `./ltx2.sh --warmup-resolutions 1280x720`.
 
 ## Performance
 
-tpu7x 2x2x1, steady-state request (the first request compiles), seed 42. E2E and peak HBM come from a default run;
+tpu7x 2x2x1, steady-state request (the first two requests compile and warm up), seed 42. E2E and peak HBM come from a default run;
 denoise step and VAE decode from a run with `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1`, which synchronizes the device at
 stage boundaries (otherwise queued denoising work is counted in the decode stage).
 
 | Model | Request | Cores | E2E | Denoise step | VAE decode | Peak HBM / core |
 | :--- | :--- | :---: | ---: | ---: | ---: | ---: |
-| FLUX.2-klein-4B | T2I 1024x1024, 4 steps | 1 | 0.75 s | 0.076 s | 0.10 s | 24.8 GB |
-| FLUX.2-klein-4B | T2I 1024x1024, 4 steps | 4 | 0.69 s | 0.049 s | 0.10 s | 19.2 GB |
-| Z-Image-Turbo | T2I 1024x1024, 9 steps | 1 | 0.98 s | 0.090 s | 0.10 s | 29.2 GB |
-| Z-Image-Turbo | T2I 1024x1024, 9 steps | 2 | 0.84 s | 0.072 s | 0.10 s | 25.2 GB |
+| FLUX.2-klein-4B | T2I 1024x1024, 4 steps | 1 | 0.44 s | 0.076 s | 0.10 s | 24.8 GB |
+| FLUX.2-klein-4B | T2I 1024x1024, 4 steps | 4 | 0.30 s | 0.044 s | 0.10 s | 19.2 GB |
+| Z-Image-Turbo | T2I 1024x1024, 9 steps | 1 | 0.93 s | 0.089 s | 0.10 s | 29.2 GB |
+| Z-Image-Turbo | T2I 1024x1024, 9 steps | 2 | 0.73 s | 0.067 s | 0.10 s | 25.2 GB |
 | Wan2.2-TI2V-5B | T2V 1280x704, 121 frames, 20 steps | 8 | 10.2 s | 0.263 s | 4.0 s | 30.1 GB |
 | Wan2.2-TI2V-5B | I2V 960x928 (from a square image), 121 frames, 20 steps | 8 | 11.8 s | 0.316 s | 4.1 s | 64.3 GB |
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 20 steps | 8 | 60.2 s | 2.77 s | 4.0 s | 68.8 GB |
