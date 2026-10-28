@@ -249,7 +249,13 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
         return cls(
             verify_cache_candidates=padded_h2d(candidates, padded_bs, batch.device),
             committed_lens=padded_h2d(committed_lens, padded_bs, batch.device),
-            req_pool_indices=padded_h2d(req_pool_indices, padded_bs, batch.device),
+            # The scheduler already owns device pool rows. Only padding needs
+            # another upload; exact buckets can reuse them across decode steps.
+            req_pool_indices=(
+                batch.req_pool_indices
+                if batch.req_pool_indices.shape[0] == padded_bs
+                else padded_h2d(req_pool_indices, padded_bs, batch.device)
+            ),
             req_pool_indices_cpu=pad_rows(req_pool_indices_cpu, padded_bs),
             seq_lens_cpu=seq_lens_cpu,
             host_len_slack=(

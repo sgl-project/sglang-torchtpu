@@ -95,6 +95,52 @@ def _state(rows):
 
 
 class TestExperimentalSpecHooks(CustomTestCase):
+    def test_bucket_view_preserves_host_bounds_unless_both_are_replaced(self):
+        original = dict(
+            multimodal_inputs=None,
+            seq_lens=torch.tensor([5]),
+            seq_lens_cpu=torch.tensor([5]),
+            seq_lens_sum=5,
+            orig_seq_lens=torch.tensor([5]),
+            req_pool_indices=torch.tensor([1]),
+            req_pool_indices_cpu=torch.tensor([1]),
+        )
+        state = SimpleNamespace(
+            seq_lens=torch.tensor([6, 0]), req_pool_indices=torch.tensor([1, 0])
+        )
+        bounds = torch.tensor([10, 0])
+        for overrides in (
+            {},
+            {"seq_lens_cpu": None},
+            {"seq_lens_cpu": None, "seq_lens_sum": None},
+        ):
+            with self.subTest(overrides=overrides):
+                batch = SimpleNamespace(**original)
+                addressing = SimpleNamespace(
+                    req_pool_indices_cpu=torch.tensor([1, 0]),
+                    padded_kv_lens_after_rows=MagicMock(return_value=(bounds, 10)),
+                )
+                with base_spec_worker.TpuSpecWorker._bucket_view(
+                    batch,
+                    bucket_state=state,
+                    verify_input=addressing,
+                    kv_rows=4,
+                    **overrides,
+                ):
+                    self.assertIs(
+                        batch.seq_lens_cpu, overrides.get("seq_lens_cpu", bounds)
+                    )
+                    self.assertEqual(
+                        batch.seq_lens_sum, overrides.get("seq_lens_sum", 10)
+                    )
+                    self.assertIs(batch.req_pool_indices, state.req_pool_indices)
+                for name, value in original.items():
+                    self.assertIs(getattr(batch, name), value)
+                if len(overrides) == 2:
+                    addressing.padded_kv_lens_after_rows.assert_not_called()
+                else:
+                    addressing.padded_kv_lens_after_rows.assert_called_once_with(4)
+
     def test_step_selects_rows_before_drafting_and_commits_after_verification(self):
         worker = object.__new__(TpuBlockSpecWorker)
         worker.num_verify_rows = 8
@@ -1410,9 +1456,18 @@ class TestExperimentalSpecHooks(CustomTestCase):
 
             # A shorter active step still trails a preceding full-width commit.
             batch.spec_info = draft
-            plan = TpuSpecVerifyInput.from_batch(batch, num_verify_rows=2, padded_bs=4)
-            self.assertEqual(plan.host_len_slack, num_draft_tokens)
-            self.assertEqual(plan.verify_cache_candidates.shape, (4, 6))
+            for padded_bs in (2, 4):
+                with self.subTest(padded_bs=padded_bs):
+                    plan = TpuSpecVerifyInput.from_batch(
+                        batch, num_verify_rows=2, padded_bs=padded_bs
+                    )
+                    self.assertEqual(plan.host_len_slack, num_draft_tokens)
+                    self.assertEqual(plan.verify_cache_candidates.shape, (padded_bs, 6))
+                    self.assertEqual(
+                        plan.req_pool_indices.tolist(), [1, 2] + [0] * (padded_bs - 2)
+                    )
+                    if padded_bs == 2:
+                        self.assertIs(plan.req_pool_indices, batch.req_pool_indices)
             with self.assertRaisesRegex(ValueError, "reserved KV window"):
                 TpuSpecVerifyInput.from_batch(batch, num_verify_rows=4, padded_bs=4)
 

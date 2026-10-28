@@ -1256,7 +1256,12 @@ class TpuSpecWorker(BaseSpecWorker):
         """
         padded_bs = bucket_state.seq_lens.shape[0]
         assert verify_input.req_pool_indices_cpu.shape[0] == padded_bs
-        seq_lens_cpu, seq_lens_sum = verify_input.padded_kv_lens_after_rows(kv_rows)
+        # Device-built attention metadata can replace both host bounds.
+        if "seq_lens_cpu" in overrides and "seq_lens_sum" in overrides:
+            seq_lens_cpu = overrides["seq_lens_cpu"]
+            seq_lens_sum = overrides["seq_lens_sum"]
+        else:
+            seq_lens_cpu, seq_lens_sum = verify_input.padded_kv_lens_after_rows(kv_rows)
         multimodal_inputs = batch.multimodal_inputs
         if multimodal_inputs is not None:
             # Spec M-RoPE positions read one entry per (bucket) row.
