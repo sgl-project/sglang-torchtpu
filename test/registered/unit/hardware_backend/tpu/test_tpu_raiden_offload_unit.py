@@ -301,7 +301,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         self.assertLess(pool.size, device_pool.size)
         self.assertIn("L2 cache effectiveness is reduced", logs.output[0])
         device_pool.get_fused_kv_buffer.assert_called_once_with(0)
-        transfer_cls.assert_called_once_with(device_pool, 5)
+        transfer_cls.assert_called_once_with(device_pool, 5, draft_pools=())
 
     def test_decode_kv_args_include_raiden_metadata(self):
         captured = {}

@@ -20,7 +20,10 @@ from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.utils import LazyImport
 from sglang_tpu._logging import get_logger
-from sglang_tpu.tpu_dma_hicache import is_tpu_dma_hicache_backend
+from sglang_tpu.tpu_dma_hicache import (
+    is_tpu_dma_hicache_backend,
+    tpu_dma_hicache_backends,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -362,6 +365,68 @@ def _mha_kv_pool_cls(backend: str | None) -> type:
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
     return MHATokenToKVPool
+
+
+# The MLA backend whose (split, page-major) pool a DMA engine copies page by page.
+_KV_OFFLOAD_MLA_BACKEND = "pallas_tpu_mla_sparse"
+
+
+def validate_kv_offload_pools(
+    *,
+    io_backend: str,
+    attention_backend: str | None,
+    attention_backends: tuple,
+    use_mla: bool,
+) -> None:
+    """Reject KV offload when the device pool or a backend reading it cannot
+    take ``io_backend``'s reloads."""
+    backends = tuple(dict.fromkeys((attention_backend, *attention_backends)))
+    if use_mla:
+        if is_tpu_dma_hicache_backend(io_backend) and backends == (
+            _KV_OFFLOAD_MLA_BACKEND,
+        ):
+            return
+        raise ValueError(
+            f"{io_backend} KV offloading supports only dense MHA models and "
+            f"{_KV_OFFLOAD_MLA_BACKEND} with a DMA io backend; this is an MLA "
+            "model, which has no fused TPU host pool. Disable "
+            "--enable-hierarchical-cache, or serve without the TPU KV-offload "
+            "io backend."
+        )
+
+    pool_cls = _mha_kv_pool_cls(attention_backend)
+    if io_backend not in getattr(pool_cls, "kv_offload_io_backends", ()):
+        raise ValueError(
+            f"{io_backend} KV offloading does not support the "
+            f"{pool_cls.__name__} KV pool of attention backend "
+            f"{attention_backend!r}: the pool does not list this io "
+            "backend in kv_offload_io_backends. Re-run with an attention "
+            "backend whose pool does (in-tree: pallas_tpu_rpa_v3 or "
+            "pallas_tpu_rpa_batched), or disable KV offload."
+        )
+
+    # Reloaded KV lands through the reload-commit hook in the shared RPA
+    # backend base, so every backend that reads the pool must be an RPA
+    # backend. It must also read the pool's layout: the pool is built for
+    # the base backend only, and split prefill/decode backends share it.
+    for backend in backends:
+        if _rpa_kernel_spec(backend) is None:
+            raise ValueError(
+                f"{io_backend} KV offloading does not support "
+                f"attention backend {backend!r}: it is not a Pallas RPA "
+                "backend, so it never runs the HiCache reload-commit hook. "
+                "Re-run with RPA attention backends, or disable KV offload."
+            )
+        backend_pool_cls = _mha_kv_pool_cls(backend)
+        if backend_pool_cls is not pool_cls:
+            raise ValueError(
+                f"{io_backend} KV offloading does not support "
+                f"attention backend {backend!r} with --attention-backend "
+                f"{attention_backend!r}: it reads "
+                f"{backend_pool_cls.__name__}, but "
+                f"the shared KV pool is {pool_cls.__name__}. Re-run with "
+                "backends that use the same KV pool, or disable KV offload."
+            )
 
 
 def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
@@ -1243,14 +1308,20 @@ class TpuSRTPlatform(SRTPlatform):
                 "extra_buffer_lazy is not supported for TPU GDN/KDA prefix caching. "
                 "Use --mamba-radix-cache-strategy extra_buffer."
             )
-        # Host and int8 stores expect stacked GPU-layout states; TPU owns
-        # independent kernel-layout tensors per layer.
-        for flag in ("enable_hierarchical_cache", "enable_int8_mamba_checkpoint"):
-            if getattr(view, flag):
-                raise ValueError(
-                    f"--{flag.replace('_', '-')} is not supported for TPU GDN/KDA prefix caching. "
-                    "Use device-resident, uncompressed Mamba states."
-                )
+        # The torch-copy host and int8 stores expect stacked GPU-layout states;
+        # TPU owns per-layer kernel-layout tensors, which only a DMA engine moves.
+        if view.enable_hierarchical_cache and not is_tpu_dma_hicache_backend(
+            view.hicache_io_backend
+        ):
+            raise ValueError(
+                "TPU GDN/KDA prefix caching offloads states to host only with a "
+                f"DMA --hicache-io-backend ({', '.join(tpu_dma_hicache_backends())})."
+            )
+        if view.enable_int8_mamba_checkpoint:
+            raise ValueError(
+                "--enable-int8-mamba-checkpoint is not supported for TPU GDN/KDA prefix caching. "
+                "Use device-resident, uncompressed Mamba states."
+            )
         if hf_config is not None:
             text_config = getattr(hf_config, "text_config", hf_config)
             assert getattr(text_config, "mamba_chunk_size", 64) == 64, (
