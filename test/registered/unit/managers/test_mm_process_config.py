@@ -66,6 +66,53 @@ class TestMmProcessConfigValidation(CustomTestCase):
         self.assertEqual(resolution_result(args, "mm_process_config"), config)
 
 
+class TestQwenVLImageSizeThroughTheProcessor(CustomTestCase):
+    """An image ``size`` in mm_process_config reaches the real HF processor.
+
+    The TPU image cap is written this way because the pinned transformers
+    ignores ``max_pixels``; this pins that the ``size`` path still shrinks.
+    """
+
+    CAP = {"size": {"longest_edge": 4900 * 16 * 16, "shortest_edge": 65536}}
+
+    def _grid(self, image_config):
+        from PIL import Image
+        from transformers import Qwen2VLImageProcessor
+
+        from sglang.srt.multimodal.media_artifacts.base import MediaArtifactInput
+        from sglang.srt.multimodal.processors import qwen_vl
+
+        hf_processor = Qwen2VLImageProcessor(
+            patch_size=16,
+            merge_size=2,
+            temporal_patch_size=2,
+            size={"longest_edge": 16777216, "shortest_edge": 65536},
+        )
+        processor = qwen_vl.QwenVLImageProcessor.__new__(qwen_vl.QwenVLImageProcessor)
+        processor.image_config = image_config
+        processor.disable_fast_image_processor = True
+        processor.mm_preprocess_cache = SimpleNamespace(enabled=False)
+        processor.mm_feature_transport = "cpu"
+        processor.precompute_hash_before_cpu_transfer = False
+        processor._resolve_processor = lambda _: (
+            SimpleNamespace(image_processor=hf_processor),
+            None,
+        )
+        entry = MediaArtifactInput(
+            content_digest="digest",
+            artifact_key="sha256:" + "0" * 64,
+            modality=None,
+            media=Image.new("RGB", (1920, 1080)),
+        )
+        [artifact] = processor.prepare_artifact_batch([entry])
+        return artifact.model_specific_data["image_grid_thw"][0].tolist()
+
+    def test_size_shrinks_a_1080p_image_to_the_cap(self):
+        # 1920x1080 is 68 x 120 = 8,160 patches; the cap brings it to 52 x 92.
+        self.assertEqual(self._grid({}), [1, 68, 120])
+        self.assertEqual(self._grid(self.CAP), [1, 52, 92])
+
+
 class TestBaseProcessorConfigExtraction(CustomTestCase):
     """Verify BaseMultimodalProcessor.__init__ extracts configs from server_args."""
 
