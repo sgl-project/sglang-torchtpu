@@ -76,25 +76,22 @@ def test_padded_cache_charges_a_shared_buffer_once():
     assert cache.current_size == 0
 
 
-def test_padded_cache_evicting_one_sharer_keeps_the_buffer_charged():
-    shared = torch.zeros(8, 4)
-    other = torch.zeros(8, 4)
+def test_padded_cache_recharges_a_shared_buffer_released_while_making_room():
+    # The new entry spans an already-charged buffer and a new one. Evicting the
+    # shared buffer's last other holder uncharges it, so room is needed for both.
+    shared, new, small = torch.zeros(8, 4), torch.zeros(8, 4), torch.zeros(1, 4)
     nbytes = shared.untyped_storage().nbytes()
-    cache = MultiModalStaticCache(nbytes)
+    cache = MultiModalStaticCache(2 * nbytes)
     assert cache.set(
         1, TpuEmbeddingResult(embedding=PaddedEmbedding((EmbeddingSpan(shared, 0, 4),)))
     )
     assert cache.set(
-        2, TpuEmbeddingResult(embedding=PaddedEmbedding((EmbeddingSpan(shared, 4, 4),)))
+        2, TpuEmbeddingResult(embedding=PaddedEmbedding.from_buffer(small, 1))
     )
-    # A new buffer needs room: both sharers go before the shared bytes are released.
-    assert cache.set(
-        3, TpuEmbeddingResult(embedding=PaddedEmbedding.from_buffer(other, 8))
-    )
-    assert cache.get_single(1) is None and cache.get_single(2) is None
-    assert cache.current_size == nbytes
-    cache.clear()
-    assert cache.current_size == 0
+    spans = (EmbeddingSpan(shared, 4, 4), EmbeddingSpan(new, 0, 8))
+    assert cache.set(3, TpuEmbeddingResult(embedding=PaddedEmbedding(spans)))
+    assert list(cache.mm_cache) == [3]
+    assert cache.current_size == 2 * nbytes
 
 
 def test_padded_cache_rejects_an_oversized_entry_without_evicting():

@@ -79,9 +79,11 @@ class EmbeddingResult:
         )
 
     def backing_buffers(self) -> dict[int, int]:
-        """Bytes of each buffer this entry keeps alive, keyed by buffer identity.
+        """Bytes of each buffer this entry keeps alive, keyed by ``id()`` of the buffer tensor.
 
-        The cache charges a buffer once however many entries share it.
+        The cache charges a buffer once however many entries hold the same tensor
+        object. Different views of one storage count as different buffers, which
+        over-counts but never under-counts.
         """
         return {id(self.embedding): self.storage_size()}
 
