@@ -1571,6 +1571,10 @@ class Envs:
     SGLANG_ENCODER_MAX_BATCH_SIZE = EnvInt(8)
     SGLANG_ENCODER_PREPROC_WORKERS = EnvInt(8)
     SGLANG_ENCODER_MM_LOAD_WORKERS = EnvInt(4)
+    # Scheduler ticks a ready multimodal request may wait for pending batch-mates
+    # while decode runs, so they prefill together; 0 releases each on arrival.
+    # Trades TTFT for fewer decode interruptions; 4 covers one encoder batch's sends.
+    SGLANG_ENCODER_RECEIVER_COALESCE_TICKS = EnvInt(0)
     # EncoderBootstrapServer health-check tuning.  Interval == 0 disables it.
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL = EnvFloat(10.0)
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT = EnvFloat(2.0)

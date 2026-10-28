@@ -207,6 +207,7 @@ class SPMDCompiler:
         argument_layouts: list[list[int]],
         interface: ExecutableInterface | None = None,
         graph: str,
+        donated_inputs: list[int] | None = None,
     ) -> Submission | SPMDCompiler:
         """Capture MLIR/layouts for verification or submit the owner's compilation."""
         if self.verify_spmd_safe:
@@ -221,7 +222,10 @@ class SPMDCompiler:
             raise ValueError(f"Invalid TPU compile owner: {graph}")
         submission.interface = interface
         submission.pending = tc.async_traverse_and_compile(
-            outputs, inputs, argument_layouts=interface.argument_layouts
+            outputs,
+            inputs,
+            argument_layouts=interface.argument_layouts,
+            donated_inputs=donated_inputs,
         )
         return submission
 
