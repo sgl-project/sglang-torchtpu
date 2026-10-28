@@ -34,6 +34,16 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang_tpu.attention.pallas.rpa_rel_bias import (
+    REL_LANES,
+    REL_MAX_BKV_CSZ,
+    add_rel_bias,
+    build_rel_window_table,
+    pack_rel_lanes,
+    ref_rel_bias,
+    rel_window_width,
+    token_sink_rows,
+)
 from sglang_tpu.attention.pallas.util import (
     align_to,
     cdiv,
@@ -109,6 +119,9 @@ def ref_ragged_paged_attention(
     v_scale: float | None = None,
     xai_temperature_len: float | None = None,
     attention_sink: jax.Array | float | None = None,
+    rel_r: jax.Array | None = None,  # [padded_num_tokens, num_q_heads, rel_dim]
+    rel_proj: jax.Array | None = None,  # [rel_dim, extent]
+    token_sink: jax.Array | None = None,  # [padded_num_tokens, num_q_heads]
 ):
     """Reference implementation for ragged paged attention."""
     if not causal and custom_mask is not None:
@@ -151,6 +164,13 @@ def ref_ragged_paged_attention(
         v = jnp.repeat(v, num_query_per_kv, axis=1)
         attn = jnp.einsum("qhd,khd->hqk", q, k, preferred_element_type=jnp.float32)
         attn *= sm_scale
+        if rel_proj is not None:
+            attn += ref_rel_bias(
+                rel_r[q_start:q_end],
+                rel_proj,
+                q_pos=(kv_len - q_len) + jnp.arange(q_len),
+                kv_len=kv_len,
+            )
         q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(jnp.int32, attn.shape, 1)
         kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
         if causal:
@@ -182,14 +202,17 @@ def ref_ragged_paged_attention(
             attn = attn * xai_temperature_reg[None, :, None]
 
         attn += jnp.where(mask, mask_value, 0.0)
-        if attention_sink is not None:
-            sink = jnp.asarray(attention_sink, dtype=jnp.float32)
-            if sink.ndim == 0:
-                sink = jnp.full((num_q_heads,), sink)
-            sink_logits = jnp.broadcast_to(
-                sink.reshape(num_q_heads, 1, 1),
-                (num_q_heads, q_len, 1),
-            )
+        if attention_sink is not None or token_sink is not None:
+            if token_sink is not None:
+                sink_logits = token_sink[q_start:q_end].astype(jnp.float32).T[..., None]
+            else:
+                sink = jnp.asarray(attention_sink, dtype=jnp.float32)
+                if sink.ndim == 0:
+                    sink = jnp.full((num_q_heads,), sink)
+                sink_logits = jnp.broadcast_to(
+                    sink.reshape(num_q_heads, 1, 1),
+                    (num_q_heads, q_len, 1),
+                )
             attn = jnp.concatenate([sink_logits, attn], axis=-1)
             attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
             attn = attn[..., 1:]
@@ -343,8 +366,10 @@ def _ragged_paged_attention_kernel_loop(
     custom_mask_ref,  # [flatten_total_kv_len, head_dim] or None
     zero_mask_ref,  # [bkv_sz, head_dim] or None
     attention_sink_ref,  # [actual_num_kv_heads, num_q_heads_per_kv_head, 128] or None
+    rel_table_ref,  # [REL_LANES, 2 * rel_window + rel_extent] bf16 or None
+    o_init_hbm_ref,  # o_hbm_ref alias in rel-lane mode, else None; never read
     # Output
-    o_hbm_ref,  # same shape as q_hbm_ref
+    o_hbm_ref,  # q_hbm_ref shape, last dim head_dim
     updated_kv_cache_hbm_ref,  # same shape as kv_cache_hbm_ref
     # Scratch
     bkvmask_ref,  # [2, bq_sz, bkv_sz, head_dim] or None
@@ -355,6 +380,8 @@ def _ragged_paged_attention_kernel_loop(
     l_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128]
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128]
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim]
+    rel_g_ref,  # [rel_window // 128, bq_csz * num_q_heads_per_kv_head, 128] f32 or None
+    rel_bias_ref,  # [cdiv(bkv_csz, 128), bq_csz * num_q_heads_per_kv_head, 128] f32 or None
     *,
     causal: bool = True,
     sm_scale: float,
@@ -372,10 +399,17 @@ def _ragged_paged_attention_kernel_loop(
     bkv_csz,  # bkv compute size
     case: RpaCase = RpaCase.MIXED,
     skip_kv_mask: bool = False,
+    rel_extent: int | None = None,
+    rel_window: int | None = None,
+    token_sink: bool = False,
     debug_mode: bool = False,
 ):
-    assert q_hbm_ref.shape == o_hbm_ref.shape
-    assert q_hbm_ref.shape[-1] == kv_cache_hbm_ref.shape[-1]
+    use_rel_lanes = rel_extent is not None or token_sink
+    head_dim = kv_cache_hbm_ref.shape[-1]
+    q_dim = q_hbm_ref.shape[-1]
+    assert q_dim == head_dim + (REL_LANES if use_rel_lanes else 0)
+    assert q_hbm_ref.shape[:-1] == o_hbm_ref.shape[:-1]
+    assert o_hbm_ref.shape[-1] == head_dim
 
     use_causal_mask = causal
     if case == RpaCase.DECODE and static_q_len == 1:
@@ -389,7 +423,7 @@ def _ragged_paged_attention_kernel_loop(
         max_num_tokens,
         num_q_heads_per_kv_head_per_packing,
         q_packing,
-        head_dim,
+        _,
     ) = q_hbm_ref.shape
     (
         total_num_pages,
@@ -404,6 +438,7 @@ def _ragged_paged_attention_kernel_loop(
     q_dtype = q_hbm_ref.dtype
     kv_dtype = kv_cache_hbm_ref.dtype
     assert o_hbm_ref.dtype == q_dtype
+    assert not (token_sink and attention_sink_ref is not None)
     assert get_dtype_packing(q_dtype) == q_packing
     assert get_dtype_packing(kv_dtype) == kv_packing
     assert head_dim % 128 == 0
@@ -448,6 +483,7 @@ def _ragged_paged_attention_kernel_loop(
         effective_kv_len,
         xai_temperature_reg=None,
         custom_mask_data=None,
+        rel_r=None,  # [actual_bq_csz * num_q_heads_per_kv_head, REL_LANES]
     ):
         assert len(q.shape) == 2
         assert q.shape[0] % num_q_heads_per_kv_head == 0
@@ -482,6 +518,21 @@ def _ragged_paged_attention_kernel_loop(
         # xai temperature scaling
         if xai_temperature_reg is not None:
             s = s * xai_temperature_reg[:, None]
+
+        if rel_extent is not None:
+            s = add_rel_bias(
+                s,
+                rel_r,
+                table_ref=rel_table_ref,
+                g_ref=rel_g_ref,
+                bias_ref=rel_bias_ref,
+                q_pos0=processed_q_len.astype(jnp.int32),
+                k_pos0=processed_kv_len.astype(jnp.int32),
+                abq=actual_bq_csz,
+                qpkv=num_q_heads_per_kv_head,
+                extent=rel_extent,
+                window=rel_window,
+            )
 
         if soft_cap is not None:
             s = soft_cap * jnp.tanh(s / soft_cap)
@@ -819,7 +870,7 @@ def _ragged_paged_attention_kernel_loop(
         q_ref = (
             bq_x2_ref.bitcast(jnp.uint32)
             .at[bq_sem_idx, kv_head_idx]
-            .reshape(bq_sz * num_q_heads_per_kv_head_per_packing, head_dim)
+            .reshape(bq_sz * num_q_heads_per_kv_head_per_packing, q_dim)
         )
         start *= num_q_heads_per_kv_head_per_packing
         sz *= num_q_heads_per_kv_head_per_packing
@@ -933,6 +984,10 @@ def _ragged_paged_attention_kernel_loop(
                     m_ref.at[kv_head_idx, pl.ds(lm_start, lm_size)][...] = (
                         sink_tiled.astype(out_dtype)
                     )
+            elif token_sink:
+                # m is seeded from the query lanes once this bq has arrived.
+                m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
+                l_ref[...] = jnp.full_like(l_ref, 1.0)
             else:
                 l_ref[...] = jnp.full_like(l_ref, 0.0)
                 m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
@@ -1012,6 +1067,13 @@ def _ragged_paged_attention_kernel_loop(
                 @pl.when(bkv_idx == start_bkv_idx)
                 def wait_cur_bq():
                     wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
+                    if token_sink:
+                        lm_size = actual_bq_sz * num_q_heads_per_kv_head
+                        for kv_head_idx in range(actual_num_kv_heads):
+                            rows = load_bq(bq_sem_idx, kv_head_idx, 0, actual_bq_sz)
+                            m_ref.at[kv_head_idx, pl.ds(0, lm_size)][...] = (
+                                token_sink_rows(rows[:, head_dim:]).astype(out_dtype)
+                            )
 
                 # Wait for cur bkv
                 offset, update_sz = wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
@@ -1091,6 +1153,10 @@ def _ragged_paged_attention_kernel_loop(
                                 bq_c = load_bq(
                                     bq_sem_idx, kv_head_idx, bq_start, actual_bq_csz
                                 )
+                                rel_r_c = None
+                                if use_rel_lanes:
+                                    rel_r_c = bq_c[:, head_dim:]
+                                    bq_c = bq_c[:, :head_dim]
 
                                 lm_slice_start = bq_start * num_q_heads_per_kv_head
                                 lm_slice_size = actual_bq_csz * num_q_heads_per_kv_head
@@ -1111,6 +1177,7 @@ def _ragged_paged_attention_kernel_loop(
                                         effective_kv_len=effective_kv_len,
                                         xai_temperature_reg=cur_xai_temp,
                                         custom_mask_data=cur_mask_data,
+                                        rel_r=rel_r_c,
                                     )
                                 )
                                 flash_attention_step2_pv(
@@ -1375,6 +1442,9 @@ def static_validate_inputs(
     vmem_limit_bytes: int | None = None,
     skip_kv_mask: bool = False,
     attention_sink=None,
+    rel_r=None,
+    rel_proj=None,
+    token_sink=None,
 ):
     """Validate inputs to the RPA kernel statically."""
     q, k, v = queries, keys, values
@@ -1479,6 +1549,30 @@ def static_validate_inputs(
     if vmem_limit_bytes is not None and vmem_limit_bytes <= 0:
         raise ValueError(f"{vmem_limit_bytes=} must be positive.")
 
+    if (rel_r is None) != (rel_proj is None):
+        raise ValueError("rel_r and rel_proj must be given together.")
+    if rel_proj is not None:
+        if rel_r.shape[:2] != q.shape[:2] or rel_r.shape[2] != rel_proj.shape[0]:
+            raise ValueError(f"Mismatched {rel_r.shape=}, {rel_proj.shape=}.")
+        if rel_proj.shape[1] % 128 != 0:
+            raise ValueError(f"{rel_proj.shape[1]=} (extent) must be a multiple of 128.")
+        if soft_cap is not None or xai_temperature_len is not None:
+            raise ValueError("rel bias does not compose with soft_cap or xai temperature.")
+        for name, block_sizes in (
+            ("decode", d_block_sizes),
+            ("prefill", p_block_sizes),
+            ("mixed", m_block_sizes),
+        ):
+            if block_sizes is not None and block_sizes[3] > REL_MAX_BKV_CSZ:
+                raise ValueError(
+                    f"{name} {block_sizes[3]=} (bkv_csz) exceeds {REL_MAX_BKV_CSZ} with rel bias."
+                )
+    if token_sink is not None:
+        if token_sink.shape != q.shape[:2]:
+            raise ValueError(f"Expected {token_sink.shape=} to be {q.shape[:2]}.")
+        if attention_sink is not None:
+            raise ValueError("token_sink and attention_sink are exclusive.")
+
     del sm_scale
     del mask_value
     del q_scale
@@ -1486,7 +1580,6 @@ def static_validate_inputs(
     del v_scale
     del xai_temperature_len
     del skip_kv_mask
-    del attention_sink
 
 
 def dynamic_validate_inputs(
@@ -1740,6 +1833,9 @@ def ragged_paged_attention(
     distribution: jax.Array,  # i32[3]
     custom_mask: jax.Array | None,
     attention_sink: jax.Array | None = None,
+    rel_r: jax.Array | None = None,  # [max_num_tokens, actual_num_q_heads, rel_dim]
+    rel_proj: jax.Array | None = None,  # [rel_dim, extent]
+    token_sink: jax.Array | None = None,  # [max_num_tokens, actual_num_q_heads]
     *,
     causal: int = 1,
     sm_scale: float = 1.0,
@@ -1775,6 +1871,12 @@ def ragged_paged_attention(
       distribution: (i, j, k) decode/prefill/mixed sequence ranges.
       custom_mask: custom attention mask for speculative decoding.
       attention_sink: per-head sink logits for streaming inference.
+      rel_r: per-token query features of a learned relative-position bias,
+        pre-multiplied by sm_scale; requires ``rel_proj``.
+      rel_proj: bias table ``[rel_dim, extent]``; distance ``d`` in
+        ``[0, extent)`` adds ``rel_r[i, h] . rel_proj[:, d]`` to the score.
+      token_sink: per-token, per-head sink logits; exclusive with
+        ``attention_sink``.
       causal: 1 for causal mask. 0 for non-causal: apply ``custom_mask`` when
         given, else attend bidirectionally (every query sees all ``kv_lens``
         keys, still subject to ``sliding_window``).
@@ -1832,13 +1934,22 @@ def ragged_paged_attention(
         vmem_limit_bytes=vmem_limit_bytes,
         skip_kv_mask=skip_kv_mask,
         attention_sink=attention_sink,
+        rel_r=rel_r,
+        rel_proj=rel_proj,
+        token_sink=token_sink,
     )
 
     actual_num_q_heads = q.shape[1]
     actual_head_dim = q.shape[2]
     actual_num_kv_heads = k.shape[1]
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
+    use_rel_lanes = rel_proj is not None or token_sink is not None
+    rel_extent = None if rel_proj is None else rel_proj.shape[1]
 
+    if use_rel_lanes:
+        # Pad the query to a 128-lane head before appending the rel lanes.
+        q = jnp.pad(q, ((0, 0), (0, 0), (0, align_to(actual_head_dim, 128) - actual_head_dim)))
+        q = pack_rel_lanes(q, rel_r, token_sink)
     q, kv, attention_sink = prepare_inputs(q, k, v, attention_sink)
     kv_cache_fused_processed = prepare_kv_cache_fused(kv_cache_fused)
 
@@ -1847,8 +1958,10 @@ def ragged_paged_attention(
         max_num_tokens,
         num_q_heads_per_kv_head_per_q_packing,
         q_packing,
-        head_dim,
+        q_dim,
     ) = q.shape
+    head_dim = kv_cache_fused_processed.shape[-1]
+    o_shape = (*q.shape[:-1], head_dim)
     page_size = kv_cache_fused_processed.shape[1]
     num_kv_heads_x2_per_kv_packing = kv_cache_fused_processed.shape[2]
     max_num_seqs = kv_lens.shape[0]
@@ -1889,6 +2002,7 @@ def ragged_paged_attention(
     def run_rpa_kernel(
         q,
         kv_cache,
+        o_init=None,  # rel-lane mode: previous output, aliased to this output
         *,
         bq_sz,
         bkv_sz,
@@ -1912,7 +2026,20 @@ def ragged_paged_attention(
                 if attention_sink is not None
                 else None
             ),  # attention_sink
+            (
+                pl.BlockSpec(memory_space=pltpu.VMEM)
+                if rel_extent is not None
+                else None
+            ),  # rel_table
+            (
+                pl.BlockSpec(memory_space=pltpu.HBM) if use_rel_lanes else None
+            ),  # o_init
         ]
+        rel_window = None
+        rel_table = None
+        if rel_extent is not None:
+            rel_window = rel_window_width(bkv_csz=bkv_csz, bq_csz=bq_csz)
+            rel_table = build_rel_window_table(rel_proj, window=rel_window)
 
         out_specs = [
             pl.BlockSpec(memory_space=pltpu.HBM),
@@ -1933,7 +2060,10 @@ def ragged_paged_attention(
             q.dtype,
         )
 
-        bo_double_buf = bq_double_buf
+        bo_double_buf = pltpu.VMEM(
+            (2, actual_num_kv_heads, bq_sz, *o_shape[2:]),
+            q.dtype,
+        )
 
         if not use_custom_mask:
             bkvmask_double_buf = None
@@ -1963,6 +2093,22 @@ def ragged_paged_attention(
             l_scratch,
             m_scratch,
             acc_scratch,
+            (
+                pltpu.VMEM(
+                    (rel_window // 128, bq_csz * num_q_heads_per_kv_head, 128),
+                    jnp.float32,
+                )
+                if rel_extent is not None
+                else None
+            ),  # rel_g, lane-fold-major
+            (
+                pltpu.VMEM(
+                    (cdiv(bkv_csz, 128), bq_csz * num_q_heads_per_kv_head, 128),
+                    jnp.float32,
+                )
+                if rel_extent is not None
+                else None
+            ),  # rel_bias, lane-fold-major
         ]
 
         scalar_prefetches = (
@@ -1975,6 +2121,10 @@ def ragged_paged_attention(
             init_sem_ids,
             init_bo_ids,
             init_bkv_update_ids,
+        )
+        # Alias indices count only the inputs actually passed (None is dropped).
+        o_init_input_idx = len(scalar_prefetches) + sum(
+            spec is not None for spec in in_specs[:-1]
         )
 
         scope_name = (
@@ -2002,6 +2152,9 @@ def ragged_paged_attention(
                 bkv_csz=bkv_csz,
                 case=case,
                 skip_kv_mask=skip_kv_mask,
+                rel_extent=rel_extent,
+                rel_window=rel_window,
+                token_sink=token_sink is not None,
                 debug_mode=debug_mode,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -2019,19 +2172,26 @@ def ragged_paged_attention(
             ),
             out_shape=(
                 [
-                    pltpu.HBM(shape=q.shape, dtype=q.dtype),
+                    pltpu.HBM(shape=o_shape, dtype=q.dtype),
                     pltpu.HBM(shape=kv_cache.shape, dtype=kv_cache.dtype),
                 ]
                 if tpu_version >= 7
                 else [
-                    jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
+                    jax.ShapeDtypeStruct(shape=o_shape, dtype=q.dtype),
                     jax.ShapeDtypeStruct(shape=kv_cache.shape, dtype=kv_cache.dtype),
                 ]
             ),
-            input_output_aliases={
-                9: 0,  # q -> output
-                11: 1,  # kv_cache -> updated_kv_cache
-            },
+            input_output_aliases=(
+                {
+                    o_init_input_idx: 0,  # o_init -> output; q is wider than it
+                    11: 1,  # kv_cache -> updated_kv_cache
+                }
+                if use_rel_lanes
+                else {
+                    9: 0,  # q -> output
+                    11: 1,  # kv_cache -> updated_kv_cache
+                }
+            ),
             name=scope_name,
         )
 
@@ -2040,7 +2200,7 @@ def ragged_paged_attention(
         if tpu_version >= 7:
 
             @jax.jit
-            def run(scalar_prefetches, q, kv, kv_cache):
+            def run(scalar_prefetches, q, kv, kv_cache, o_init):
                 return kernel(
                     *scalar_prefetches,
                     pltpu.with_memory_space_constraint(q, pltpu.HBM),
@@ -2053,11 +2213,17 @@ def ragged_paged_attention(
                     ),
                     zero_mask,
                     attention_sink,
+                    rel_table,
+                    (
+                        pltpu.with_memory_space_constraint(o_init, pltpu.HBM)
+                        if o_init is not None
+                        else o_init
+                    ),
                 )
 
         else:
 
-            def run(scalar_prefetches, q, kv, kv_cache):
+            def run(scalar_prefetches, q, kv, kv_cache, o_init):
                 return kernel(
                     *scalar_prefetches,
                     q,
@@ -2066,28 +2232,24 @@ def ragged_paged_attention(
                     custom_mask,
                     zero_mask,
                     attention_sink,
+                    rel_table,
+                    o_init,
                 )
 
-        return run(scalar_prefetches, q, kv, kv_cache)
+        return run(scalar_prefetches, q, kv, kv_cache, o_init)
+
+    def _cap_rel_bkv_csz(sizes):
+        # The bias window table grows with bkv_csz; keep a divisor of bkv_sz.
+        if rel_extent is None or sizes["bkv_csz"] <= REL_MAX_BKV_CSZ:
+            return sizes
+        bkv_csz = REL_MAX_BKV_CSZ
+        while sizes["bkv_sz"] % bkv_csz:
+            bkv_csz -= page_size
+        return {**sizes, "bkv_csz": bkv_csz}
 
     def _prepare_block_sizes(block_sizes, case):
         if block_sizes is None:
-            return get_default_block_sizes(
-                q.dtype,
-                kv_cache_fused_processed.dtype,
-                actual_num_q_heads,
-                actual_num_kv_heads,
-                head_dim,
-                page_size,
-                max_num_tokens,
-                max_num_seqs,
-                pages_per_seq,
-                case=case,
-                vmem_limit_bytes=vmem_limit_bytes,
-                use_custom_mask=use_custom_mask,
-                sliding_window=sliding_window,
-                decode_query_size=decode_query_size,
-            )
+            return _cap_rel_bkv_csz(_default_block_sizes(case))
 
         return {
             "bq_sz": block_sizes[0],
@@ -2095,6 +2257,24 @@ def ragged_paged_attention(
             "bq_csz": block_sizes[2],
             "bkv_csz": block_sizes[3],
         }
+
+    def _default_block_sizes(case):
+        return get_default_block_sizes(
+            q.dtype,
+            kv_cache_fused_processed.dtype,
+            actual_num_q_heads,
+            actual_num_kv_heads,
+            head_dim,
+            page_size,
+            max_num_tokens,
+            max_num_seqs,
+            pages_per_seq,
+            case=case,
+            vmem_limit_bytes=vmem_limit_bytes,
+            use_custom_mask=use_custom_mask,
+            sliding_window=sliding_window,
+            decode_query_size=decode_query_size,
+        )
 
     if decode_query_size > 1:
         # Static DECODE loop bounds are valid only when every active DECODE row
@@ -2112,35 +2292,32 @@ def ragged_paged_attention(
     if chunk_prefill_size is None:
         distribution = distribution.at[1].set(distribution[0])
 
-    # Decode-only
-    q, kv_cache_fused_processed = run_rpa_kernel(
-        q,
-        kv_cache_fused_processed,
-        **_prepare_block_sizes(d_block_sizes, RpaCase.DECODE),
-        static_q_len=decode_query_size,
-        case=RpaCase.DECODE,
-    )
-
+    cases = [(RpaCase.DECODE, d_block_sizes, decode_query_size)]
     if chunk_prefill_size is not None:
-        # Prefill-only
-        q, kv_cache_fused_processed = run_rpa_kernel(
+        cases.append((RpaCase.PREFILL, p_block_sizes, chunk_prefill_size))
+    cases.append((RpaCase.MIXED, m_block_sizes, None))
+
+    # Each case writes only its own sequences' rows; the output buffer is
+    # threaded through the calls. Without rel lanes, q itself is that buffer.
+    out = jnp.zeros(o_shape, q.dtype) if use_rel_lanes else None
+    for case, block_sizes, static_q_len in cases:
+        o, kv_cache_fused_processed = run_rpa_kernel(
             q,
             kv_cache_fused_processed,
-            **_prepare_block_sizes(p_block_sizes, RpaCase.PREFILL),
-            static_q_len=chunk_prefill_size,
-            case=RpaCase.PREFILL,
+            out,
+            **_prepare_block_sizes(block_sizes, case),
+            static_q_len=static_q_len,
+            case=case,
         )
-    # Mixed
-    q, kv_cache_fused_processed = run_rpa_kernel(
-        q,
-        kv_cache_fused_processed,
-        **_prepare_block_sizes(m_block_sizes, RpaCase.MIXED),
-        static_q_len=None,
-        case=RpaCase.MIXED,
-    )
+        if use_rel_lanes:
+            out = o
+        else:
+            q = o
+    if not use_rel_lanes:
+        out = q
 
     return (
-        prepare_outputs(q, actual_num_q_heads_per_kv_head, actual_head_dim),
+        prepare_outputs(out, actual_num_q_heads_per_kv_head, actual_head_dim),
         prepare_updated_kv_cache_fused(
             kv_cache_fused_processed, actual_num_kv_heads, actual_head_dim
         ),
