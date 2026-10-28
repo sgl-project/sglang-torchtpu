@@ -4,9 +4,9 @@
 
 The worker (test/manual/tpu/test_muse_megakernel_numerics.py) runs the compiled op on random
 serving-layout weights over fused-bf16, SAL-bf16 and SAL-fp8 KV pools, decode and verify
-steps, short and 20k contexts, and checks every layer's residual stream, the KV rows the step
-writes, the final norm, routing (near-ties excepted) and that exact-by-construction MKConfig
-flags leave the outputs bit-identical.
+steps, short, 20k and 70k (past the KV ring) contexts, and checks every layer's residual
+stream, the KV rows the step writes, the final norm, routing (near-ties excepted) and that
+exact-by-construction MKConfig flags leave the outputs bit-identical.
 """
 
 import os

@@ -362,7 +362,7 @@ class MuseMegakernel(torch.nn.Module):
             n_req=n_req,
             capture_layers=capture,
             compact_rows=4 if rows <= _COMPACT4_MAX_ROWS else 8,
-            topk_iter=8 < rows <= _BASE_STEP_MAX_ROWS,
+            topk_iter=_TOPK_ITER_MIN_ROWS <= rows <= _BASE_STEP_MAX_ROWS,
             fold_f=fold,
             fold_o=fold,
             # SEQ_ALONG_LANE pages are >= 256 tokens
@@ -600,6 +600,8 @@ _LARGE_CHUNK_BUDGET = int(2.5 * 2**20)
 # Measured device step (real geometry, random routing): the 8-row block-diag variant is
 # slower than the 4-row one at 8-24 rows and faster only at 48.
 _COMPACT4_MAX_ROWS = 24
+# Iterative router top-k from this many rows: 32-row verify steps 1.1 ms faster, 16 rows neutral.
+_TOPK_ITER_MIN_ROWS = 24
 
 
 # Both int32 page tables in SMEM: 16 requests at 1M context (512 KiB) read at SMEM speed, 24

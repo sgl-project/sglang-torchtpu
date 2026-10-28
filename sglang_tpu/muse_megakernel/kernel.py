@@ -201,8 +201,6 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     fold_attn_scale: bool = False
     # router top-k by k rounds of row max (_topk_iter) instead of per-row ranks
     topk_iter: bool = False
-    # an expert waits for its w13 slabs only, then for w2 just before the down projection
-    ex_split_wait: bool = True
     # refills of dense tiles consumed after the expert phase (the unpooler's and the next
     # layer's), due while pool / router stream, are held until the expert loop ends
     lazy_dense: bool = True
@@ -221,14 +219,9 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     fold_o: bool = False
     # ship each finished wo column tile to its reduce-scatter owner during the o-proj matvec
     o_rs_streamed: bool = True
-    # with o_rs_streamed: each device streams the wo column tiles from its next peer's block on,
-    # its own block last, so the last remote block leaves one tile before the matvec ends
-    o_rs_rotate: bool = True
     # peer order of a round's sends: "ring" (me+1, me+2, ...) or "xor" (me^1, me^2, ...; ring
     # unless tp is a power of two)
     coll_order: str = "xor"
-    # a round starts its remote copies before copying its own part into its pad
-    coll_local_last: bool = True
     vmem_limit_bytes: int = 60 * 2**20
 
     @property
@@ -365,10 +358,13 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
         )
         assert self.coll_order in ("ring", "xor")
         assert not (self.fold_f or self.fold_o) or fold_fits(self)
+        # with attn_pipe only the pipelined loop refills the ring: a window's chunks must fit it
+        cpt = self.chunk_pages * self.page_size
         assert not self.attn_pipe or (
             self.attn_unshifted
             and self.kv_sal
             and self.kv_ring >= 2 * self.attn_streams
+            and (self.window + cpt - 2) // cpt + 1 <= self.kv_ring
         )
         return self
 
@@ -451,7 +447,7 @@ def _topk_by_rank(scores, k, n_live, rank_ref, score_ref=None):
 def _topk_iter(scores, k):
     """Top-k as k rounds of a row max and its lowest index: the picks of _topk_by_rank (higher
     score first, ties to the lower id), a cost flat in the rows where the ranks pay one [E, E]
-    comparison per row (faster from 16 rows, slower at 8)."""
+    comparison per row."""
     R, E = scores.shape
     idx = jax.lax.broadcasted_iota(jnp.int32, (R, E), 1)
     ids, picks = [], []
@@ -786,11 +782,8 @@ class _WeightStream:
     in held the tile consumed just before it. Slots are u32 words, viewed as the tile's dtype.
     """
 
-    def __init__(self, W, buf, sems, tiles, depth, col_rot=None, k_rot=None):
+    def __init__(self, W, buf, sems, tiles, depth, k_rot=None):
         self.W, self.buf, self.sems = W, buf, sems
-        # name -> traced shift: column tile ni of that weight streams physical column
-        # (ni + shift) % n_cols (a per-device order)
-        self.col_rot = col_rot or {}
         # name -> (traced own block, blocks per group G, tiles per group s_per): logical K tile
         # j * s_per + s streams the physical tile of group (own // G) ^ j (fold arrival order)
         self.k_rot = k_rot or {}
@@ -812,8 +805,6 @@ class _WeightStream:
         name, ki, ni, tk, tn, dt = self.tiles[t]
         pack = _PACK[jnp.dtype(dt)]
         s_ = t % self.slots
-        col = self.phys_col(name, ni)
-        c0 = col * tn if isinstance(col, int) else pl.multiple_of(col * tn, LANE)
         pk = self.phys_k(name, ki)
         r0 = (
             pk * (tk // pack)
@@ -821,7 +812,9 @@ class _WeightStream:
             else pl.multiple_of(pk * (tk // pack), 8)
         )
         src = (
-            self.W[name].bitcast(jnp.uint32).at[l, pl.ds(r0, tk // pack), pl.ds(c0, tn)]
+            self.W[name]
+            .bitcast(jnp.uint32)
+            .at[l, pl.ds(r0, tk // pack), pl.ds(ni * tn, tn)]
         )
         return pltpu.make_async_copy(
             src, self.buf.at[s_, pl.ds(0, tk // pack), pl.ds(0, tn)], self.sems.at[s_]
@@ -896,16 +889,11 @@ class _WeightStream:
         for l, t, next_l in held:
             self.refill(l, t, next_l)
 
-    def phys_col(self, name, ni):
-        if name not in self.col_rot:
-            return ni
-        return jax.lax.rem(ni + self.col_rot[name], self.ranges[name][4])
-
     def prologue(self, l):
         for t in range(self.depth):
             self._copy(l, t).start()
 
-    def mv(self, x, l, name, next_l, sm=None, on_col=None, sm_ref=None):
+    def mv(self, x, l, name, next_l, sm=None, on_col=None):
         """``x [R, K]`` @ ``W_l[name]`` -> f32 ``[R, N]``; fp8 weights take their scale row from ``sm``.
         ``on_col(ni, col)`` gets each finished (scaled) column tile as soon as its last K tile is in."""
         assert name not in self.k_rot, "folded weights stream through mv_fold"
@@ -925,19 +913,10 @@ class _WeightStream:
             cols[ni] = part if cols[ni] is None else cols[ni] + part
             self.refill(l, t, next_l)
             if on_col is not None and ki == nk - 1:
-                col = self.phys_col(name, ni)
                 if is_fp8:
                     r = SMALL[name + "_s"]
-                    if isinstance(col, int):
-                        cols[ni] = cols[ni] * sm[r : r + 1, ni * tn : (ni + 1) * tn]
-                    else:  # a rotated column's scales: a dynamic lane window of the ref
-                        cols[ni] = (
-                            cols[ni]
-                            * sm_ref[
-                                r : r + 1, pl.ds(pl.multiple_of(col * tn, LANE), tn)
-                            ]
-                        )
-                on_col(col, cols[ni])
+                    cols[ni] = cols[ni] * sm[r : r + 1, ni * tn : (ni + 1) * tn]
+                on_col(ni, cols[ni])
         out = cols[0] if nn == 1 else jnp.concatenate(cols, axis=1)
         if is_fp8 and on_col is None:
             r = SMALL[name + "_s"]
@@ -956,25 +935,16 @@ class _Coll:
     result (its TP rank for column-parallel outputs, its mesh index otherwise).
     """
 
-    def __init__(
-        self, tp, me, axis, pads, ssems, rsems, order="ring", local_last=False
-    ):
+    def __init__(self, tp, me, axis, pads, ssems, rsems, order="ring"):
         self.tp, self.me, self.axis = tp, me, axis
         self.pads, self.ssems, self.rsems = pads, ssems, rsems
         self.kinds = {k: i for i, k in enumerate(pads)}
         self.order = order if tp & (tp - 1) == 0 else "ring"
-        self.local_last = local_last
 
     def _peer(self, d):
         if self.order == "xor":
             return jnp.bitwise_xor(self.me, d)
         return jax.lax.rem(self.me + d, self.tp)
-
-    def _local(self, fn, issued):
-        """The round's own-part copy: before its remote copies, or after them with
-        local_last (``issued`` False / True)."""
-        if self.local_last == issued:
-            fn()
 
     def _copy(self, kind, src, dst, peer):
         i = self.kinds[kind]
@@ -996,11 +966,7 @@ class _Coll:
         pad = self.pads[kind]
         if live is None:
             return self.all_gather_start(kind, src_ref, slot)()
-
-        def local():
-            pad[slot] = src_ref[...]
-
-        self._local(local, False)
+        pad[slot] = src_ref[...]
         cps = [
             self._copy(kind, src_ref, pad.at[slot], self._peer(d))
             for d in range(1, self.tp)
@@ -1010,12 +976,8 @@ class _Coll:
         def _():
             for c in cps:
                 c.start()
-            self._local(local, True)
             for c in cps:
                 c.wait_send()
-
-        if self.local_last:
-            pl.when(jnp.logical_not(live(self.me)))(local)
 
         for d, c in zip(range(1, self.tp), cps):
 
@@ -1042,18 +1004,13 @@ class _Coll:
     def all_gather_start(self, kind, src_ref, slot):
         """Issue ``all_gather``; returns the function that waits for it and returns the pad."""
         pad = self.pads[kind]
-
-        def local():
-            pad[slot] = src_ref[...]
-
-        self._local(local, False)
+        pad[slot] = src_ref[...]
         cps = [
             self._copy(kind, src_ref, pad.at[slot], self._peer(d))
             for d in range(1, self.tp)
         ]
         for c in cps:
             c.start()
-        self._local(local, True)
 
         def wait():
             for c in cps:
@@ -1075,15 +1032,9 @@ class _Coll:
     def all_gather_blocks_start(self, kind, src_ref, slot, rsems):
         """all_gather whose sends signal the receiver's rsems[slot], so a receiver can wait
         for one sender's block (all_gather_blocks_wait)."""
-        pad = self.pads[kind]
-
-        def local():
-            pad[slot] = src_ref[...]
-
-        self._local(local, False)
+        self.pads[kind][slot] = src_ref[...]
         for d in range(1, self.tp):
             self._block_copy_to(kind, src_ref, slot, rsems, self._peer(d)).start()
-        self._local(local, True)
 
     def all_gather_blocks_wait(self, kind, src_ref, slot, rsems):
         """(wait_block(k), finish()) of an all_gather_blocks_start: the first waits
@@ -1123,12 +1074,10 @@ class _Coll:
 
         my_live = self.me * rows_per < n_live
 
-        def local():
-            @pl.when(my_live)
-            def _():
-                pad[self.me] = rows(send_ref, self.me)[...]
+        @pl.when(my_live)
+        def _():
+            pad[self.me] = rows(send_ref, self.me)[...]
 
-        self._local(local, False)
         cps = []
         for d in range(1, self.tp):
             peer = self._peer(d)
@@ -1141,7 +1090,6 @@ class _Coll:
             def _(cp=cp):
                 cp.start()
 
-        self._local(local, True)
         for peer, cp in cps:
 
             @pl.when(peer * rows_per < n_live)
@@ -1192,32 +1140,32 @@ class _Coll:
 
         return pad
 
+    def reduce_scatter_cols(self, kind, src_ref, width):
+        """``src_ref [R, tp*width]`` f32: device m receives everyone's columns ``[m*width, ...)``."""
+        pad = self.pads[kind]
+        pad[self.me] = src_ref[:, pl.ds(pl.multiple_of(self.me * width, LANE), width)]
+        cps = []
+        for d in range(1, self.tp):
+            peer = self._peer(d)
+            cps.append(
+                self._copy(
+                    kind,
+                    src_ref.at[:, pl.ds(pl.multiple_of(peer * width, LANE), width)],
+                    pad.at[self.me],
+                    peer,
+                )
+            )
+        for c in cps:
+            c.start()
+        for c in cps:
+            c.wait()
+        return pad
+
     def _cols_copy(self, kind, src_ref, width, m):
         c0 = m * width if isinstance(m, int) else pl.multiple_of(m * width, LANE)
         return self._copy(
             kind, src_ref.at[:, pl.ds(c0, width)], self.pads[kind].at[self.me], m
         )
-
-    def reduce_scatter_cols(self, kind, src_ref, width):
-        """``src_ref [R, tp*width]`` f32: device m receives everyone's columns ``[m*width, ...)``."""
-        pad = self.pads[kind]
-
-        def local():
-            pad[self.me] = src_ref[
-                :, pl.ds(pl.multiple_of(self.me * width, LANE), width)
-            ]
-
-        self._local(local, False)
-        cps = [
-            self._cols_copy(kind, src_ref, width, self._peer(d))
-            for d in range(1, self.tp)
-        ]
-        for c in cps:
-            c.start()
-        self._local(local, True)
-        for c in cps:
-            c.wait()
-        return pad
 
     def reduce_scatter_cols_streamed(self, kind, src_ref, width):
         """``reduce_scatter_cols`` issued one column block at a time: ``send(m)`` once
@@ -1595,7 +1543,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             S["coll_ssems"],
             S["coll_rsems"],
             order=c.coll_order,
-            local_last=c.coll_local_last,
         )
         F = few_rows(c)
         few = c.single_row_coll and c.n_req * c.rows_per_req <= c.few_rows_max
@@ -1619,7 +1566,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             S["ring_sems"],
             dense_tiles(c),
             c.stream_depth,
-            col_rot={"wo": me + 1} if o_rs_streamed and c.o_rs_rotate else None,
             k_rot=k_rot,
         )
         msem = S["misc_sems"]
@@ -1953,24 +1899,11 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 )
 
                 def ship(m, col):
-                    c0 = (
-                        m * Hl // 2
-                        if isinstance(m, int)
-                        else pl.multiple_of(m * Hl // 2, LANE)
-                    )
-                    S["xpack"][:, pl.ds(c0, Hl // 2)] = _pack_bf16x2(col)
+                    S["xpack"][:, m * Hl // 2 : (m + 1) * Hl // 2] = _pack_bf16x2(col)
                     send(m)
 
                 with _scope("o_mv"):
-                    ws.mv(
-                        attn,
-                        l,
-                        "wo",
-                        nxt,
-                        sm=sm,
-                        on_col=ship,
-                        sm_ref=S["smalls"].at[l % 2],
-                    )
+                    ws.mv(attn, l, "wo", nxt, sm=sm, on_col=ship)
                 with _scope("o_allreduce"):
                     return allgather_sum(finish())
             with _scope("o_mv"):
@@ -2274,11 +2207,15 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 """Chunks [v0, v0 + NS) that exist into their ring slots: one walk over the global
                 layers' pools, its leaf a small loop."""
                 n = jnp.clip(n_ch - v0, 0, NS)
+                # pipelined chunks are a global layer's: its page table alone
+                geo_g = geo._replace(is_global=True)
 
                 def leaf(ref):
                     def one(u, carry):
                         v = v0 + u
-                        for pi, page in enumerate(chunk_pages_of(geo, j, first_ch + v)):
+                        for pi, page in enumerate(
+                            chunk_pages_of(geo_g, j, first_ch + v)
+                        ):
                             pltpu.make_async_copy(
                                 page_src(ref, page),
                                 chunk_dst(geo, v % KR, pi),
@@ -2335,21 +2272,24 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 i1 = i0 + 1
                 valid_b = i1 < n_ch
 
-                # entering group m >= 1: group m - 1's slots are free; fetch group m + 1
-                @pl.when(
-                    jnp.logical_and(
-                        jnp.logical_and(i0 % KG == 0, i0 >= KG), i0 + KG < n_ch
+                # entering group m >= 1: group m - 1's slots are free; fetch group m + 1. With
+                # attn_pipe these loops never pass the ring (code size: no layer walk here).
+                if not c.attn_pipe:
+
+                    @pl.when(
+                        jnp.logical_and(
+                            jnp.logical_and(i0 % KG == 0, i0 >= KG), i0 + KG < n_ch
+                        )
                     )
-                )
-                def _():
-                    issue_range(
-                        geo,
-                        l,
-                        j,
-                        first_ch + i0 + KG,
-                        (i0 + KG) % KR,
-                        jnp.minimum(KG, n_ch - i0 - KG),
-                    )
+                    def _():
+                        issue_range(
+                            geo,
+                            l,
+                            j,
+                            first_ch + i0 + KG,
+                            (i0 + KG) % KR,
+                            jnp.minimum(KG, n_ch - i0 - KG),
+                        )
 
                 with _scope("kv_wait"):
                     wait_chunk(geo, i0 % KR)
@@ -2777,8 +2717,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             def ex_refs(li):
                 return [EX[4 * li + j] for j in range(4)]
 
-            def copies(i, slot):
-                e = rget("uniq", i)
+            def copies(i, slot, e=None):
+                e = rget("uniq", i) if e is None else e
                 out = []
                 pack = FP4_PACK if kind == "fp4" else 4
                 kw13, kw2 = He // pack, Il // pack
@@ -2805,9 +2745,9 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     out.append((j, e, dst, sem, rows_, cols, is_scale))
                 return out
 
-            def expert_dmas(refs, i, slot):
+            def expert_dmas(refs, i, slot, e=None):
                 """The four slab DMAs of distinct expert ``i`` into ``slot``, from one layer's refs."""
-                for j, e, dst, sem, rows_, cols, is_scale in copies(i, slot):
+                for j, e, dst, sem, rows_, cols, is_scale in copies(i, slot, e):
                     src = refs[j] if is_scale else refs[j].bitcast(jnp.uint32)
                     pltpu.make_async_copy(
                         src.at[e, pl.ds(0, rows_), pl.ds(0, cols)],
@@ -2830,9 +2770,11 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     )
 
             def start_expert(i, slot):
-                for_layer(lambda refs: expert_dmas(refs, i, slot))
+                # expert id read before the walk: one SMEM load instead of one per layer leaf
+                e = rget("uniq", i)
+                for_layer(lambda refs: expert_dmas(refs, i, slot, e))
 
-            def wait_expert(slot, parts=(0, 1, 2, 3)):
+            def wait_expert(slot):
                 pack = FP4_PACK if kind == "fp4" else 4
                 kw13, kw2 = He // pack, Il // pack
                 tmpl = [
@@ -2865,8 +2807,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         3,
                     ),
                 ):
-                    if j not in parts:
-                        continue
                     src = tmpl[j] if j in (1, 3) else tmpl[j].bitcast(jnp.uint32)
                     pltpu.make_async_copy(
                         src.at[0, pl.ds(0, rows_), pl.ds(0, cols)],
@@ -2913,15 +2853,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 def _():
                     start_expert(i + depth, (i + depth) % nslot)
 
-                # split: the w2 slabs land behind w13 (FIFO), so the w13 dot starts before they do
                 with _scope("ex_wait"):
-                    wait_expert(slot, (0, 1) if c.ex_split_wait else (0, 1, 2, 3))
-
-                def w2_wait():
-                    if c.ex_split_wait:
-                        with _scope("ex_wait"):
-                            wait_expert(slot, (2, 3))
-
+                    wait_expert(slot)
                 e = rget("uniq", i)
 
                 def full_expert():
@@ -2947,7 +2880,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     if gscale:
                         gate, up = gate * S["gs_s"][0, e], up * S["gs_s"][0, Ep + e]
                     h = (gate * jax.nn.sigmoid(gate) * up).astype(jnp.bfloat16)
-                    w2_wait()
                     if kind == "fp4":
                         y = _fp4_dot(
                             h,
@@ -3000,16 +2932,14 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     if gscale:
                         gate, up = gate * S["gs_s"][0, e], up * S["gs_s"][0, Ep + e]
                     h = (gate * jax.nn.sigmoid(gate) * up).astype(jnp.bfloat16)
-                    w2_wait()
                     yc = _fp4_blockdiag_dot(
                         h, W2.at[slot], S["w2s"].at[slot], Il, He, c.blockdiag_kc
                     )
                     yp = _pack_bf16x2(yc * S["gs_s"][1, e] if gscale else yc)
+                    # a padded row repeats the last pair, so its write repeats that pair's
+                    # identical write: no branch per row (loop code size)
                     for j, p in enumerate(pairs):
-
-                        @pl.when(j < cnt)
-                        def _(j=j, p=p):
-                            S["ysend"].at[p // K][pl.ds(p % K, 1), :] = yp[j : j + 1]
+                        S["ysend"].at[p // K][pl.ds(p % K, 1), :] = yp[j : j + 1]
 
                 def compact_scoped(nrows):
                     with _scope(f"ex_c{nrows}"):
@@ -3021,15 +2951,26 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
 
                 if kind == "fp4" and c.compact_rows:
                     cnt = rget("ex_cnt", i)
-                    lo = 0
-                    for b in (1, 2, 4, 8):
-                        if b > c.compact_rows:
-                            break
-                        pl.when((cnt > lo) & (cnt <= b))(
-                            functools.partial(compact_scoped, b)
+                    # (bucket, variant) picked by a compare tree: one branch per level
+                    arms = [
+                        (b, functools.partial(compact_scoped, b))
+                        for b in (1, 2, 4, 8)
+                        if b <= c.compact_rows
+                    ]
+                    arms.append((None, full_scoped))
+
+                    def pick(arms):
+                        if len(arms) == 1:
+                            arms[0][1]()
+                            return
+                        mid = len(arms) // 2
+                        jax.lax.cond(
+                            cnt <= arms[mid - 1][0],
+                            lambda: pick(arms[:mid]),
+                            lambda: pick(arms[mid:]),
                         )
-                        lo = b
-                    pl.when(cnt > c.compact_rows)(full_scoped)
+
+                    pick(arms)
                 else:
                     full_scoped()
                 if c.y_early:
@@ -3046,21 +2987,27 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
 
                     jax.lax.fori_loop(0, S["dn_cnt"][i], send_row, 0)
                 elif c.y_block_send and c.tp > 1:
-                    # owner block b is final once its group's last expert is done (an empty
-                    # group fires with the group before it)
-                    for b in range(c.tp - 1):
+                    # carry: the next owner block to send. Block b is final once its group's
+                    # last expert is done (an empty group fires with the group before it); one
+                    # send site keeps the loop body small.
+                    def ready(b):
+                        end = rget("blk_end", jnp.minimum(b, c.tp - 2))
+                        return (b < c.tp - 1) & (end <= i + 1)
+
+                    def send_block(b):
                         owner = jax.lax.rem(me + 1 + b, c.tp)
+                        pl.when(owner * Rc < n_live)(
+                            coll.block_copy("y", S["ysend"], owner, Rc).start
+                        )
+                        return b + 1
 
-                        @pl.when((i + 1 == rget("blk_end", b)) & (owner * Rc < n_live))
-                        def _(owner=owner):
-                            coll.block_copy("y", S["ysend"], owner, Rc).start()
-
+                    return jax.lax.while_loop(ready, send_block, carry)
                 return carry
 
             if gscale:
                 gs_copy.wait()
             with _scope("experts"):
-                jax.lax.fori_loop(0, n_u, ebody, 0)
+                jax.lax.fori_loop(0, n_u, ebody, jnp.int32(0))
             ws.flush()
             # ---- token-sharded reduce of the per-rank partials, then norm + combine
             with _scope("y_rs"):

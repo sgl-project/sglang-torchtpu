@@ -78,6 +78,8 @@ CASES = {
         Case("salfp8_c1q1_s", "sal_fp8", 1, 1, (2100,)),
         Case("salfp8_c2q8_l", "sal_fp8", 2, 8, (20000, 13000)),
         Case("salfp8_c2q8_s", "sal_fp8", 2, 8, (1500, 3100)),
+        # past the 32-chunk (32k-token) KV ring: the pipelined loop refills it
+        Case("salfp8_c2q8_xl", "sal_fp8", 2, 8, (70000, 41000)),
     )
 }
 DEFAULT_CASES = tuple(CASES)
@@ -90,8 +92,7 @@ DEFAULT_EXACT = (
     ("fused_c2q8_s", "repeat"),
     ("fused_c2q8_s", "y_block_send=False"),
     ("fused_c2q8_s", "o_rs_streamed=False"),
-    ("fused_c2q8_s", "o_rs_rotate=False"),
-    ("fused_c2q8_s", "topk_iter=False"),
+    ("fused_c2q8_s", "topk_iter=True"),
     ("fused_c2q1_l", "coll_order='ring'"),
     ("salfp8_c2q8_l", "repeat"),
     ("salfp8_c2q8_l", "y_block_send=False"),
