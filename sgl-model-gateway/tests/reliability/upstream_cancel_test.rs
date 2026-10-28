@@ -2711,4 +2711,318 @@ mod upstream_cancel_tests {
 
         ctx.shutdown().await;
     }
+
+    // -------- PD decode-fails-first tests --------
+    //
+    // Prefill and decode are dispatched concurrently. A real prefill blocks
+    // until its paired decode pulls the KV cache (or the bootstrap timeout,
+    // 300 s by default, expires), so when decode rejects the request first
+    // the gateway must stop waiting for prefill, return decode's error, and
+    // charge only the decode breaker. The mock prefill below hangs for
+    // `PD_PREFILL_HANG_MS` to stand in for that bootstrap wait.
+
+    /// How long the mock prefill takes to answer in decode-fails-first tests.
+    const PD_PREFILL_HANG_MS: u64 = 5_000;
+
+    /// Upper bound for a fail-fast response. Well under `PD_PREFILL_HANG_MS`
+    /// so a router that waits for the hanging prefill fails the assertion.
+    const PD_FAIL_FAST_BUDGET: Duration = Duration::from_millis(2_000);
+
+    /// RAII cleanup for `set_fail_status_code`, so a failing assertion
+    /// cannot leak the override to a later test on the same port.
+    struct FailStatusGuard(u16);
+    impl Drop for FailStatusGuard {
+        fn drop(&mut self) {
+            clear_fail_status_code(self.0);
+        }
+    }
+
+    /// PD router config with a single attempt (no retries), so breaker
+    /// deltas and elapsed time reflect exactly one dual dispatch.
+    fn pd_single_attempt_config(
+        router_port: u16,
+        prefill_port: u16,
+        decode_port: u16,
+    ) -> RouterConfig {
+        use smg::config::RetryConfig;
+
+        RouterConfig::builder()
+            .prefill_decode_mode(
+                vec![(format!("http://127.0.0.1:{}", prefill_port), None)],
+                vec![format!("http://127.0.0.1:{}", decode_port)],
+            )
+            .round_robin_policy()
+            .host("127.0.0.1")
+            .port(router_port)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .retry_config(RetryConfig {
+                max_retries: 1,
+                initial_backoff_ms: 10,
+                max_backoff_ms: 50,
+                backoff_multiplier: 1.0,
+                jitter_factor: 0.0,
+            })
+            .build_unchecked()
+    }
+
+    /// Sends one `/generate` request, drains the body, and returns the
+    /// response status and the wall time until the body was fully read.
+    async fn send_pd_generate(app: axum::Router, stream: bool) -> (StatusCode, Duration) {
+        let payload = json!({ "text": "x", "stream": stream });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        let start = std::time::Instant::now();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let _ = resp.into_body().collect().await;
+        (status, start.elapsed())
+    }
+
+    /// Mock prefill worker that answers only after `PD_PREFILL_HANG_MS`.
+    fn hanging_prefill(port: u16) -> crate::common::mock_worker::MockWorkerConfig {
+        let mut p = TestWorkerConfig::prefill(port);
+        p.response_delay_ms = PD_PREFILL_HANG_MS;
+        p
+    }
+
+    /// Mock decode worker that rejects every `/generate` with `status`.
+    fn rejecting_decode(port: u16, status: u16) -> crate::common::mock_worker::MockWorkerConfig {
+        set_fail_status_code(port, status);
+        let mut d = TestWorkerConfig::decode(port);
+        d.fail_rate = 1.0;
+        d
+    }
+
+    /// Decode answers 503 while prefill is still pending: the client gets
+    /// decode's 503 without waiting for prefill, decode records one
+    /// failure, and the in-flight prefill's breaker is not touched.
+    async fn assert_pd_decode_5xx_fails_fast(
+        router_port: u16,
+        prefill_port: u16,
+        decode_port: u16,
+        stream: bool,
+    ) {
+        let _status_guard = FailStatusGuard(decode_port);
+        let config = pd_single_attempt_config(router_port, prefill_port, decode_port);
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                hanging_prefill(prefill_port),
+                rejecting_decode(decode_port, 503),
+            ],
+        )
+        .await;
+        let app = ctx.create_app().await;
+        let prefill = pin_worker(&ctx, &format!("http://127.0.0.1:{}", prefill_port));
+        let decode = pin_worker(&ctx, &format!("http://127.0.0.1:{}", decode_port));
+        let (s_pre_p, f_pre_p) = breaker_counts(&prefill);
+        let (s_pre_d, f_pre_d) = breaker_counts(&decode);
+
+        let (status, elapsed) = send_pd_generate(app, stream).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            elapsed < PD_FAIL_FAST_BUDGET,
+            "decode 503 must be returned without waiting for prefill \
+             (stream={}); took {:?}, prefill hangs {} ms",
+            stream,
+            elapsed,
+            PD_PREFILL_HANG_MS
+        );
+        let (s_post_d, f_post_d) = breaker_counts(&decode);
+        assert_eq!(
+            (s_post_d - s_pre_d, f_post_d - f_pre_d),
+            (0, 1),
+            "decode 503 must record exactly one decode failure (stream={})",
+            stream
+        );
+        let (s_post_p, f_post_p) = breaker_counts(&prefill);
+        assert_eq!(
+            (s_post_p - s_pre_p, f_post_p - f_pre_p),
+            (0, 0),
+            "cancelled prefill must not be charged for decode's 503 (stream={})",
+            stream
+        );
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_pd_decode_5xx_before_prefill_fails_fast_streaming() {
+        assert_pd_decode_5xx_fails_fast(4320, 20320, 20321, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_pd_decode_5xx_before_prefill_fails_fast_non_streaming() {
+        assert_pd_decode_5xx_fails_fast(4322, 20322, 20323, false).await;
+    }
+
+    /// Decode refuses the TCP connection while prefill is still pending:
+    /// the client gets a 502 without waiting for prefill, decode records
+    /// one failure, and prefill is not charged.
+    #[tokio::test]
+    async fn test_pd_decode_connect_failure_before_prefill_fails_fast() {
+        let prefill_port = 20324;
+        let decode_port = 20325;
+        let config = pd_single_attempt_config(4324, prefill_port, decode_port);
+        let mut ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                hanging_prefill(prefill_port),
+                TestWorkerConfig::decode(decode_port),
+            ],
+        )
+        .await;
+        let app = ctx.create_app().await;
+        let prefill = pin_worker(&ctx, &format!("http://127.0.0.1:{}", prefill_port));
+        let decode = pin_worker(&ctx, &format!("http://127.0.0.1:{}", decode_port));
+        // Stop only decode (index 1) so its connect is refused.
+        ctx.workers[1].stop().await;
+        let (s_pre_p, f_pre_p) = breaker_counts(&prefill);
+        let (s_pre_d, f_pre_d) = breaker_counts(&decode);
+
+        let (status, elapsed) = send_pd_generate(app, true).await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            elapsed < PD_FAIL_FAST_BUDGET,
+            "decode connect failure must be returned without waiting for \
+             prefill; took {:?}, prefill hangs {} ms",
+            elapsed,
+            PD_PREFILL_HANG_MS
+        );
+        let (s_post_d, f_post_d) = breaker_counts(&decode);
+        assert_eq!((s_post_d - s_pre_d, f_post_d - f_pre_d), (0, 1));
+        let (s_post_p, f_post_p) = breaker_counts(&prefill);
+        assert_eq!(
+            (s_post_p - s_pre_p, f_post_p - f_pre_p),
+            (0, 0),
+            "cancelled prefill must not be charged for decode's connect failure"
+        );
+
+        ctx.shutdown().await;
+    }
+
+    /// Decode answers 400 while prefill is still pending: decode will never
+    /// pull the KV cache either, so the client gets the 400 without waiting
+    /// for prefill. A 4xx is a client fault, so decode records a success
+    /// and prefill is not charged.
+    #[tokio::test]
+    async fn test_pd_decode_4xx_before_prefill_fails_fast() {
+        let prefill_port = 20330;
+        let decode_port = 20331;
+        let _status_guard = FailStatusGuard(decode_port);
+        let config = pd_single_attempt_config(4330, prefill_port, decode_port);
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                hanging_prefill(prefill_port),
+                rejecting_decode(decode_port, 400),
+            ],
+        )
+        .await;
+        let app = ctx.create_app().await;
+        let prefill = pin_worker(&ctx, &format!("http://127.0.0.1:{}", prefill_port));
+        let decode = pin_worker(&ctx, &format!("http://127.0.0.1:{}", decode_port));
+        let (s_pre_p, f_pre_p) = breaker_counts(&prefill);
+        let (s_pre_d, f_pre_d) = breaker_counts(&decode);
+
+        let (status, elapsed) = send_pd_generate(app, false).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            elapsed < PD_FAIL_FAST_BUDGET,
+            "decode 400 must be returned without waiting for prefill; took {:?}",
+            elapsed
+        );
+        let (s_post_d, f_post_d) = breaker_counts(&decode);
+        assert_eq!((s_post_d - s_pre_d, f_post_d - f_pre_d), (1, 0));
+        let (s_post_p, f_post_p) = breaker_counts(&prefill);
+        assert_eq!((s_post_p - s_pre_p, f_post_p - f_pre_p), (0, 0));
+
+        ctx.shutdown().await;
+    }
+
+    /// Regression guard: prefill fails while decode is still pending. The
+    /// existing prefill-fails-first path is unchanged: the client gets a
+    /// 5xx, prefill records one failure, decode is not charged.
+    #[tokio::test]
+    async fn test_pd_prefill_fails_before_decode_unchanged() {
+        let prefill_port = 20326;
+        let decode_port = 20327;
+        let config = pd_single_attempt_config(4326, prefill_port, decode_port);
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                {
+                    let mut p = TestWorkerConfig::prefill(prefill_port);
+                    p.fail_rate = 1.0;
+                    p
+                },
+                {
+                    let mut d = TestWorkerConfig::decode(decode_port);
+                    d.response_delay_ms = 2_000;
+                    d
+                },
+            ],
+        )
+        .await;
+        let app = ctx.create_app().await;
+        let prefill = pin_worker(&ctx, &format!("http://127.0.0.1:{}", prefill_port));
+        let decode = pin_worker(&ctx, &format!("http://127.0.0.1:{}", decode_port));
+        let (s_pre_p, f_pre_p) = breaker_counts(&prefill);
+        let (s_pre_d, f_pre_d) = breaker_counts(&decode);
+
+        let (status, _elapsed) = send_pd_generate(app, false).await;
+
+        assert!(status.is_server_error(), "expected 5xx, got {}", status);
+        let (s_post_p, f_post_p) = breaker_counts(&prefill);
+        assert_eq!((s_post_p - s_pre_p, f_post_p - f_pre_p), (0, 1));
+        let (s_post_d, f_post_d) = breaker_counts(&decode);
+        assert_eq!((s_post_d - s_pre_d, f_post_d - f_pre_d), (0, 0));
+
+        ctx.shutdown().await;
+    }
+
+    /// Regression guard: both workers succeed (non-streaming). Each breaker
+    /// records exactly one success. The streaming variant is covered by
+    /// the PD clean-stream breaker test above.
+    #[tokio::test]
+    async fn test_pd_both_succeed_non_streaming_records_success() {
+        let prefill_port = 20328;
+        let decode_port = 20329;
+        let config = pd_single_attempt_config(4328, prefill_port, decode_port);
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                TestWorkerConfig::prefill(prefill_port),
+                TestWorkerConfig::decode(decode_port),
+            ],
+        )
+        .await;
+        let app = ctx.create_app().await;
+        let prefill = pin_worker(&ctx, &format!("http://127.0.0.1:{}", prefill_port));
+        let decode = pin_worker(&ctx, &format!("http://127.0.0.1:{}", decode_port));
+        let (s_pre_p, f_pre_p) = breaker_counts(&prefill);
+        let (s_pre_d, f_pre_d) = breaker_counts(&decode);
+
+        let (status, _elapsed) = send_pd_generate(app, false).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let (s_post_p, f_post_p) = breaker_counts(&prefill);
+        assert_eq!((s_post_p - s_pre_p, f_post_p - f_pre_p), (1, 0));
+        let (s_post_d, f_post_d) = breaker_counts(&decode);
+        assert_eq!((s_post_d - s_pre_d, f_post_d - f_pre_d), (1, 0));
+
+        ctx.shutdown().await;
+    }
 }
