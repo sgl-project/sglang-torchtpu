@@ -124,6 +124,13 @@ class TpuEnvs:
     # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker and MTP
     # and EAGLE3 to TpuChainSpecWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
     SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(True)
+    # Every N verify steps, TP ranks compare a digest of their committed tokens and
+    # raise on mismatch: hash_uniforms replaces the accept broadcast. 0 disables.
+    # Steps, not seconds, so every rank joins the same all-gather; ~1 min at bs 1.
+    SGLANG_TPU_SPEC_RANK_CHECK_INTERVAL = EnvInt(8192)
+    # TpuBlockSpecWorker's candidate acceptance by block verification (Sun et al.
+    # 2024, Algorithm 2) instead of token-wise rejection; lossless either way.
+    SGLANG_TPU_SPEC_BLOCK_VERIFICATION = EnvBool(False)
     # DFLASH draft linears, including the DFlash2 conv kernel projections, as fp8
     # weight-only (fp8_weight_linear.py) for decode-sized calls; prefill-sized calls
     # keep the bf16 weights. Changes the draft's proposals, not verification.

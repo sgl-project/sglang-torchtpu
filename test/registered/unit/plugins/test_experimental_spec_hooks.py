@@ -100,7 +100,11 @@ class TestExperimentalSpecHooks(CustomTestCase):
         worker.num_verify_rows = 2
         worker._simulate_acc_len = 0
         worker._tp_sync = MagicMock()
-        logits = SimpleNamespace(next_token_logits=torch.zeros(2, 4))
+        worker._verify_top_k_width = None
+        worker._rank_check_interval = 0
+        logits = SimpleNamespace(
+            next_token_logits=torch.zeros(2, 4), has_next_token_global_top_k=False
+        )
         worker._target_worker = SimpleNamespace(
             forward_batch_generation=MagicMock(
                 return_value=SimpleNamespace(logits_output=logits)
@@ -125,12 +129,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 "_build_verify_batch",
                 return_value=SimpleNamespace(spec_info=metadata),
             ) as build,
-            patch.object(
-                base_spec_worker,
-                "accept_drafts_greedy",
-                return_value=(torch.tensor([1]), torch.tensor([2])),
-            ),
-            patch.object(base_spec_worker, "finalize_accept", return_value=accepted),
+            patch.object(base_spec_worker, "accept_greedy_step", return_value=accepted),
         ):
             result = worker.verify(batch, bucket, rows, draft, addressing)
         make.assert_called_once_with(
@@ -357,8 +356,11 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 compute_base_logits=lambda values: (values, None),
                 markov_head=SimpleNamespace(sample_block=sample_block),
             )
-            result = DSparkDraftModel.sample_draft_tokens_tpu(model, hidden, tokens)
+            result, lattice = DSparkDraftModel.sample_draft_tokens_tpu(
+                model, hidden, tokens
+            )
             torch.testing.assert_close(result, torch.full((2, 2), 3, dtype=torch.int64))
+            self.assertIsNone(lattice)
         with (
             envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
             envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
@@ -954,15 +956,21 @@ class TestExperimentalSpecHooks(CustomTestCase):
 
         worker = object.__new__(TpuBlockSpecWorker)
         greedy = torch.ones((4, 2), dtype=torch.int64)
-        worker._forward_draft_block = lambda **kwargs: (None, greedy)
+        worker._forward_draft_block = lambda **kwargs: (None, greedy, None)
         worker._sync_greedy_drafts = lambda tokens: tokens
-        worker._sample_draft_block = lambda *args: ("sampled", "logits")
+        worker._sample_draft_block = lambda *args, **kwargs: SimpleNamespace(
+            draft_tokens="sampled",
+            draft_logits="logits",
+            verify_tokens=None,
+            draft_candidates=None,
+        )
         worker._all_drafts = {4: None}
         bucket = SimpleNamespace(
             state=SimpleNamespace(seq_lens=torch.zeros(4), bonus_tokens=None),
             live_mask=None,
             temperatures=torch.ones(4),
             top_ks=torch.ones(4),
+            target_candidates=False,
         )
         results = {}
         for sampled in (True, False):

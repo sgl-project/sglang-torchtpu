@@ -76,6 +76,9 @@ class BucketState(NamedTuple):
       need_top_k: Some request restricts top_k; the target is filtered for it.
       need_top_p: Some request restricts top_p; the target is filtered for it.
       need_min_p: Some request restricts min_p; the target is filtered for it.
+      target_candidates: Every sampled row filters the target to top_k <=
+        spec_ops.TARGET_CANDIDATES and nothing else, so acceptance can run on
+        the target's top candidates instead of the whole vocabulary.
     """
 
     key: torch.Tensor
@@ -88,6 +91,7 @@ class BucketState(NamedTuple):
     need_top_k: bool = False
     need_top_p: bool = False
     need_min_p: bool = False
+    target_candidates: bool = False
 
     @property
     def need_filters(self) -> bool:
@@ -128,12 +132,15 @@ class DraftResult(NamedTuple):
         verified (DSpark budget). Equals N when no pruning applies.
       verify_tokens: Optional flat [pbs * (N + 1)] [r, d_1, ..., d_N] rows when
         the draft already built them; verify concatenates them otherwise.
+      draft_candidates: Optional (ids, logits), [pbs, N, K] each, when q is
+        supported on K candidates per draft; draft_logits is None then.
     """
 
     draft_tokens: torch.Tensor
     draft_logits: torch.Tensor | None
     num_verify_drafts: torch.Tensor
     verify_tokens: torch.Tensor | None = None
+    draft_candidates: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 class AcceptResult(NamedTuple):

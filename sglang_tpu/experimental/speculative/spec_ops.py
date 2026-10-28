@@ -7,6 +7,7 @@ the warmup needs model config.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -21,6 +22,7 @@ from sglang_tpu.experimental.speculative.spec_types import (
 )
 from sglang_tpu.sampling_mask import tpu_filter_probs
 from sglang_tpu.spec_op_warmup import SpecOpWarmupContext
+from sglang_tpu.top_k import tpu_top_k
 
 
 def sample_tokens(
@@ -34,7 +36,48 @@ def sample_tokens(
     greedy = torch.argmax(logits, dim=-1)
     temps = temperatures.float().clamp_min(1e-5)[:, None]
     probs = torch.softmax(logits.float() / temps, dim=-1)
-    return torch.where(top_ks <= 1, greedy, _exponential_race(probs))
+    u = torch.rand_like(probs, dtype=torch.float32)
+    return torch.where(top_ks <= 1, greedy, _exponential_race(probs, u))
+
+
+# Target candidates acceptance keeps per verify row; covers top_k up to this.
+TARGET_CANDIDATES = 64
+
+# hash_uniforms streams; one step's draft walk and acceptance share its rng_step.
+STREAM_DRAFT = 0
+_STREAM_ACCEPT = 1
+_STREAM_BONUS = 2
+
+
+def _u32(value: int) -> int:
+    """A uint32 constant as the int32 with the same bits."""
+    return value - (1 << 32) if value >= 1 << 31 else value
+
+
+def _fmix32(x: torch.Tensor) -> torch.Tensor:
+    # MurmurHash3's finalizer on int32 lanes holding uint32 bits: products wrap
+    # mod 2^32 and masked shifts are logical. int64 lanes are emulated on TPU.
+    x = x ^ ((x >> 16) & 0xFFFF)
+    x = x * _u32(0x85EBCA6B)
+    x = x ^ ((x >> 13) & 0x7FFFF)
+    x = x * _u32(0xC2B2AE35)
+    return x ^ ((x >> 16) & 0xFFFF)
+
+
+def hash_uniforms(
+    rng_step: torch.Tensor, stream: int, shape: tuple[int, ...]
+) -> torch.Tensor:
+    """Uniforms in [0, 1) hashed from (rng_step, stream, element index).
+
+    Every TP rank holds the same rng_step and inputs, so ranks draw identical
+    samples without broadcasting them; distinct streams decorrelate the draws
+    within one step.
+    """
+    step = rng_step.view(1).to(torch.int32)
+    key = _fmix32(step * _u32(0x9E3779B1) + _u32((stream * 0x7F4A7C15) & 0xFFFFFFFF))
+    index = torch.arange(math.prod(shape), dtype=torch.int32, device=rng_step.device)
+    bits = _fmix32(_fmix32(index * _u32(0x632BE5AB) + key) ^ key)
+    return (((bits >> 8) & 0xFFFFFF).to(torch.float32) * (1.0 / (1 << 24))).view(shape)
 
 
 @compiled_op()
@@ -86,6 +129,12 @@ def select_verify_rows(
 
 @compiled_op(warmup=lambda ctx: _verify_tokens_warmup_args(ctx))
 def build_verify_tokens(
+    bonus_tokens: torch.Tensor, draft_tokens: torch.Tensor
+) -> torch.Tensor:
+    return verify_tokens_of(bonus_tokens, draft_tokens)
+
+
+def verify_tokens_of(
     bonus_tokens: torch.Tensor, draft_tokens: torch.Tensor
 ) -> torch.Tensor:
     """Flat [pbs * (N + 1)] verify input [r, d_1, ..., d_N] per row."""
@@ -172,7 +221,6 @@ def _block_inputs(
     )
 
 
-@compiled_op(warmup=lambda ctx: _accept_warmup_args(ctx, sampled=False))
 def accept_drafts_greedy(
     target_logits: torch.Tensor,
     draft_tokens: torch.Tensor,
@@ -186,12 +234,21 @@ def accept_drafts_greedy(
     """
     bs, n = draft_tokens.shape
     target_argmax = torch.argmax(target_logits.view(bs, n + 1, -1), dim=-1)
+    return _accept_argmax(target_argmax, draft_tokens, num_verify_drafts)
+
+
+def _accept_argmax(
+    target_argmax: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    num_verify_drafts: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """accept_drafts_greedy on the [pbs, N + 1] target argmax."""
+    n = draft_tokens.shape[1]
     ok = (draft_tokens == target_argmax[:, :n]) & _verify_mask(num_verify_drafts, n)
-    num_correct_drafts = _leading_true(ok)
+    num_correct_drafts = _leading_true(ok).to(target_argmax.dtype)
     return num_correct_drafts, pick(target_argmax, num_correct_drafts)
 
 
-@compiled_op(warmup=lambda ctx: _accept_warmup_args(ctx, sampled=True), uses_rng=True)
 def accept_drafts_sampled(
     target_logits: torch.Tensor,
     draft_tokens: torch.Tensor,
@@ -199,6 +256,7 @@ def accept_drafts_sampled(
     draft_logits: torch.Tensor,
     temperatures: torch.Tensor,
     top_ks: torch.Tensor,
+    rng_step: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Lossless acceptance of a draft chain (Leviathan et al. 2023).
 
@@ -220,10 +278,10 @@ def accept_drafts_sampled(
         draft_tokens,
         num_verify_drafts,
         top_ks,
+        rng_step,
     )
 
 
-@compiled_op(uses_rng=True)
 def accept_drafts_sampled_filtered(
     target_logits: torch.Tensor,
     draft_tokens: torch.Tensor,
@@ -233,6 +291,7 @@ def accept_drafts_sampled_filtered(
     top_ks: torch.Tensor,
     top_ps: torch.Tensor,
     min_ps: torch.Tensor,
+    rng_step: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """accept_drafts_sampled against the target filtered like the target sampler.
 
@@ -253,6 +312,7 @@ def accept_drafts_sampled_filtered(
         draft_tokens,
         num_verify_drafts,
         top_ks,
+        rng_step,
     )
 
 
@@ -263,6 +323,7 @@ def _accept_drafts_rejection_sampling(
     draft_tokens: torch.Tensor,
     num_verify_drafts: torch.Tensor,
     top_ks: torch.Tensor,
+    rng_step: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rejection-sampling acceptance over p [bs, N + 1, V] and q [bs, N, V]; greedy rows where top_k <= 1.
 
@@ -281,7 +342,7 @@ def _accept_drafts_rejection_sampling(
     )
     p_draft = torch.where(vocab_onehot, p[:, :n], 0).sum(-1)
     q_draft = torch.where(vocab_onehot, q, 0).sum(-1)
-    u = torch.rand_like(p_draft)
+    u = hash_uniforms(rng_step, _STREAM_ACCEPT, tuple(p_draft.shape))
     # u <= p / q without dividing by q.
     sample_ok = (u * q_draft <= p_draft) & verify_mask
     sample_num_correct = _leading_true(sample_ok)
@@ -292,7 +353,10 @@ def _accept_drafts_rejection_sampling(
     # All-zero residual only arises from rounding when p == q; p is exact there.
     residual = torch.where(residual.sum(-1, keepdim=True) > 0, residual, p_at)
     rejected = (sample_num_correct < num_verify_drafts)[:, None]
-    sample_bonus = _exponential_race(torch.where(rejected, residual, p_at))
+    weights = torch.where(rejected, residual, p_at)
+    sample_bonus = _exponential_race(
+        weights, hash_uniforms(rng_step, _STREAM_BONUS, tuple(weights.shape))
+    )
 
     greedy = (top_ks <= 1).view(-1)
     return (
@@ -301,6 +365,136 @@ def _accept_drafts_rejection_sampling(
     )
 
 
+def accept_drafts_candidates(
+    top_logits: torch.Tensor,
+    top_ids: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    num_verify_drafts: torch.Tensor,
+    draft_ids: torch.Tensor,
+    draft_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    rng_step: torch.Tensor,
+    block_verification: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """accept_drafts_sampled_filtered for a top-k-only target and a q on K candidates.
+
+    The filtered p lives on each verify row's descending top TARGET_CANDIDATES
+    logits top_logits / ids top_ids [pbs * (N + 1), TARGET_CANDIDATES] and q on
+    draft_ids [bs, N, K] (logits draft_logits, before temperature), so the
+    whole rule runs on [bs, N + 1, TARGET_CANDIDATES] instead of the vocabulary.
+    Every sampled row must have top_k <= TARGET_CANDIDATES (target_candidates).
+    block_verification picks the prefix by block verification instead of token-wise
+    rejection; both are lossless.
+    """
+    bs, n = draft_tokens.shape
+    out_dtype = draft_tokens.dtype
+    # Ids and indices run as int32: int64 lanes are emulated on TPU.
+    top_logits = top_logits.view(bs, n + 1, -1).float()
+    top_ids = top_ids.view(bs, n + 1, -1).to(torch.int32)
+    draft_tokens = draft_tokens.to(torch.int32)
+    draft_ids = draft_ids.to(torch.int32)
+    temps = temperatures.view(-1).float().clamp_min(1e-5)[:, None, None]
+    rank = torch.arange(TARGET_CANDIDATES, dtype=torch.int32, device=top_ks.device)
+    kept = rank[None, None, :] < top_ks.view(-1, 1, 1)
+    p = torch.softmax(torch.where(kept, top_logits / temps, float("-inf")), dim=-1)
+    q = torch.softmax(draft_logits.float() / temps, dim=-1)
+    verify_mask = _verify_mask(num_verify_drafts, n)
+
+    target_argmax = top_ids[..., 0]
+    greedy_ok = (draft_tokens == target_argmax[:, :n]) & verify_mask
+    greedy_num_correct = _leading_true(greedy_ok).to(torch.int32)
+    greedy_bonus = pick(target_argmax, greedy_num_correct)
+
+    drafts = draft_tokens[..., None]
+    p_draft = torch.where(top_ids[:, :n] == drafts, p[:, :n], 0).sum(-1)
+    q_draft = torch.where(draft_ids == drafts, q, 0).sum(-1)
+    u = hash_uniforms(rng_step, _STREAM_ACCEPT, tuple(p_draft.shape))
+    if block_verification:
+        sample_num_correct, residual_scale = _block_verify_candidates(
+            p, q, top_ids, draft_ids, p_draft, q_draft, u, num_verify_drafts
+        )
+    else:
+        sample_ok = (u * q_draft <= p_draft) & verify_mask
+        sample_num_correct = _leading_true(sample_ok).to(torch.int32)
+        residual_scale = torch.ones((bs,), dtype=torch.float32, device=p.device)
+
+    p_at = pick(p, sample_num_correct)
+    ids_at = pick(top_ids, sample_num_correct)
+    rejected_slot = sample_num_correct.clamp_max(n - 1)
+    q_at = pick(q, rejected_slot)
+    q_ids_at = pick(draft_ids, rejected_slot)
+    # q on the target candidates; q's other tokens have p = 0, so no residual there.
+    q_on_p = torch.where(
+        ids_at[:, :, None] == q_ids_at[:, None, :], q_at[:, None, :], 0
+    ).sum(-1)
+    rejected = (sample_num_correct < num_verify_drafts.to(torch.int32))[:, None]
+    residual = (residual_scale[:, None] * p_at - q_on_p).clamp_min(0)
+    residual = torch.where(residual.sum(-1, keepdim=True) > 0, residual, p_at)
+    weights = torch.where(rejected, residual, p_at)
+    chosen = _exponential_race(
+        weights, hash_uniforms(rng_step, _STREAM_BONUS, tuple(weights.shape))
+    ).to(torch.int32)
+    sample_bonus = pick(ids_at, chosen)
+
+    greedy = (top_ks <= 1).view(-1)
+    return (
+        torch.where(greedy, greedy_num_correct, sample_num_correct).to(torch.int64),
+        torch.where(greedy, greedy_bonus, sample_bonus).to(out_dtype),
+    )
+
+
+def _block_verify_candidates(
+    p: torch.Tensor,
+    q: torch.Tensor,
+    top_ids: torch.Tensor,
+    draft_ids: torch.Tensor,
+    p_draft: torch.Tensor,
+    q_draft: torch.Tensor,
+    u: torch.Tensor,
+    num_verify_drafts: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Block verification (Sun et al. 2024, Algorithm 2) on the candidate supports.
+
+    r_i = min(1, r_(i-1) p(d_i) / q(d_i)); prefix i < nv is accepted with prob
+    h_i = m_i / (m_i + 1 - r_i), m_i = sum (r_i p_i - q_i)+ over row i, prefix nv
+    with r_nv, and the longest accepted prefix tau wins. Returns tau [pbs] int32
+    and r_tau [pbs] (1 at tau = 0), the scale of the correction (r_tau p - q)+.
+    """
+    bs, n = p_draft.shape
+    nv = num_verify_drafts.to(torch.int32)
+    ratio = p_draft / q_draft.clamp_min(torch.finfo(torch.float32).tiny)
+    prefix = torch.ones((bs,), dtype=torch.float32, device=p.device)
+    probs = []
+    for slot in range(n):
+        prefix = torch.clamp_max(prefix * ratio[:, slot], 1.0)
+        probs.append(prefix)
+    r = torch.stack(probs, dim=1)
+    # q of slot i on row i's target candidates; q elsewhere meets p = 0.
+    q_on_rows = torch.where(
+        top_ids[:, :n, :, None] == draft_ids[:, :, None, :], q[:, :, None, :], 0
+    ).sum(-1)
+    # Prefix i (column i - 1) scales row i and slot i; prefix n has no next row.
+    mass = (r[:, : n - 1, None] * p[:, 1:n] - q_on_rows[:, 1:n]).clamp_min(0).sum(-1)
+    mass = torch.cat([mass, torch.zeros_like(mass[:, :1])], dim=1)
+    lengths = torch.arange(1, n + 1, dtype=torch.int32, device=p.device)[None, :]
+    h = mass / (mass + 1 - r).clamp_min(torch.finfo(torch.float32).tiny)
+    exact = (lengths == nv[:, None]) | (r <= 0) | (r >= 1)
+    h = torch.where(exact, r, h)
+    ok = (u < h) & (lengths <= nv[:, None])
+    tau = torch.where(ok, lengths, 0).amax(dim=-1)
+    r_tau = torch.where(tau > 0, pick(r, (tau - 1).clamp_min(0)), 1.0)
+    return tau, r_tau
+
+
+def _top_k(values: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    # torch_tpu lowers aten::topk to a full sort; tpu_top_k is XLA's native TopK.
+    if values.device.type == "tpu":
+        return tpu_top_k(values, k)
+    return torch.topk(values, k)
+
+
+@compiled_op()
 def _filtered_target_probs(
     target_logits: torch.Tensor,
     temperatures: torch.Tensor,
@@ -331,7 +525,6 @@ def _filtered_target_probs(
     return kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
-@compiled_op(uses_rng=True)
 def accept_drafts_target_only(
     target_logits: torch.Tensor,
     draft_tokens: torch.Tensor,
@@ -342,6 +535,7 @@ def accept_drafts_target_only(
     min_ps: torch.Tensor,
     threshold_single: float,
     threshold_acc: float,
+    rng_step: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Lossless acceptance of a deterministic draft chain against the filtered target p.
 
@@ -366,7 +560,7 @@ def accept_drafts_target_only(
 
     vocab = torch.arange(p.shape[-1], device=draft_tokens.device)
     p_draft = torch.where(draft_tokens[..., None] == vocab, p[:, :n], 0).sum(-1)
-    u = torch.rand_like(p_draft)
+    u = hash_uniforms(rng_step, _STREAM_ACCEPT, tuple(p_draft.shape))
     sample_ok = (
         (u * threshold_acc <= p_draft) | (p_draft >= threshold_single)
     ) & verify_mask
@@ -379,7 +573,9 @@ def accept_drafts_target_only(
     residual = torch.where(rejected_mask, 0, p_at)
     # All-zero residual only arises from rounding when p_k(d_k) == 1.
     residual = torch.where(residual.sum(-1, keepdim=True) > 0, residual, p_at)
-    sample_bonus = _exponential_race(residual)
+    sample_bonus = _exponential_race(
+        residual, hash_uniforms(rng_step, _STREAM_BONUS, tuple(residual.shape))
+    )
 
     greedy = (top_ks <= 1).view(-1)
     return (
@@ -390,6 +586,19 @@ def accept_drafts_target_only(
 
 @compiled_op(warmup=lambda ctx: _finalize_warmup_args(ctx))
 def finalize_accept(
+    draft_tokens: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    bonus_tokens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    live_mask: torch.Tensor,
+) -> AcceptResult:
+    """_finalize on its own, for accept outcomes decided outside the step ops."""
+    return _finalize(
+        draft_tokens, num_correct_drafts, bonus_tokens, seq_lens, live_mask
+    )
+
+
+def _finalize(
     draft_tokens: torch.Tensor,
     num_correct_drafts: torch.Tensor,
     bonus_tokens: torch.Tensor,
@@ -422,6 +631,197 @@ def finalize_accept(
     )
 
 
+@compiled_op(warmup=lambda ctx: _accept_step_warmup_args(ctx, sampled=False))
+def accept_greedy_step(
+    target_logits: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    num_verify_drafts: torch.Tensor,
+    seq_lens: torch.Tensor,
+    live_mask: torch.Tensor,
+) -> AcceptResult:
+    """accept_drafts_greedy and _finalize in one program."""
+    num_correct, bonus = accept_drafts_greedy(
+        target_logits, draft_tokens, num_verify_drafts
+    )
+    return _finalize(draft_tokens, num_correct, bonus, seq_lens, live_mask)
+
+
+@compiled_op(warmup=lambda ctx: _accept_step_warmup_args(ctx, sampled=True))
+def accept_sampled_step(
+    target_logits: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    num_verify_drafts: torch.Tensor,
+    draft_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    seq_lens: torch.Tensor,
+    live_mask: torch.Tensor,
+    rng_step: torch.Tensor,
+) -> tuple[AcceptResult, torch.Tensor]:
+    """accept_drafts_sampled and _finalize in one program; also the next rng_step."""
+    num_correct, bonus = accept_drafts_sampled(
+        target_logits,
+        draft_tokens,
+        num_verify_drafts,
+        draft_logits,
+        temperatures,
+        top_ks,
+        rng_step,
+    )
+    accept = _finalize(draft_tokens, num_correct, bonus, seq_lens, live_mask)
+    return accept, rng_step + 1
+
+
+@compiled_op()
+def accept_sampled_filtered_step(
+    target_logits: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    num_verify_drafts: torch.Tensor,
+    draft_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    seq_lens: torch.Tensor,
+    live_mask: torch.Tensor,
+    rng_step: torch.Tensor,
+) -> tuple[AcceptResult, torch.Tensor]:
+    """accept_drafts_sampled_filtered and _finalize in one program; the owner warms it."""
+    num_correct, bonus = accept_drafts_sampled_filtered(
+        target_logits,
+        draft_tokens,
+        num_verify_drafts,
+        draft_logits,
+        temperatures,
+        top_ks,
+        top_ps,
+        min_ps,
+        rng_step,
+    )
+    accept = _finalize(draft_tokens, num_correct, bonus, seq_lens, live_mask)
+    return accept, rng_step + 1
+
+
+@compiled_op()
+def accept_target_only_step(
+    target_logits: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    num_verify_drafts: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    threshold_single: float,
+    threshold_acc: float,
+    seq_lens: torch.Tensor,
+    live_mask: torch.Tensor,
+    rng_step: torch.Tensor,
+) -> tuple[AcceptResult, torch.Tensor]:
+    """accept_drafts_target_only and _finalize in one program; the owner warms it."""
+    num_correct, bonus = accept_drafts_target_only(
+        target_logits,
+        draft_tokens,
+        num_verify_drafts,
+        temperatures,
+        top_ks,
+        top_ps,
+        min_ps,
+        threshold_single,
+        threshold_acc,
+        rng_step,
+    )
+    accept = _finalize(draft_tokens, num_correct, bonus, seq_lens, live_mask)
+    return accept, rng_step + 1
+
+
+@compiled_op()
+def accept_candidates_step(
+    target_logits: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    num_verify_drafts: torch.Tensor,
+    draft_ids: torch.Tensor,
+    draft_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    seq_lens: torch.Tensor,
+    live_mask: torch.Tensor,
+    rng_step: torch.Tensor,
+    block_verification: bool,
+) -> tuple[AcceptResult, torch.Tensor]:
+    """accept_drafts_candidates and _finalize in one program; the owner warms it."""
+    top_logits, top_ids = _top_k(target_logits, TARGET_CANDIDATES)
+    num_correct, bonus = accept_drafts_candidates(
+        top_logits,
+        top_ids,
+        draft_tokens,
+        num_verify_drafts,
+        draft_ids,
+        draft_logits,
+        temperatures,
+        top_ks,
+        rng_step,
+        block_verification=block_verification,
+    )
+    accept = _finalize(draft_tokens, num_correct, bonus, seq_lens, live_mask)
+    return accept, rng_step + 1
+
+
+@compiled_op()
+def accept_top_k_candidates_step(
+    top_logits: torch.Tensor,
+    top_ids: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    num_verify_drafts: torch.Tensor,
+    draft_ids: torch.Tensor,
+    draft_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    seq_lens: torch.Tensor,
+    live_mask: torch.Tensor,
+    rng_step: torch.Tensor,
+    block_verification: bool,
+) -> tuple[AcceptResult, torch.Tensor]:
+    """accept_candidates_step on the verify's distributed top-k; the owner warms it."""
+    num_correct, bonus = accept_drafts_candidates(
+        top_logits,
+        top_ids,
+        draft_tokens,
+        num_verify_drafts,
+        draft_ids,
+        draft_logits,
+        temperatures,
+        top_ks,
+        rng_step,
+        block_verification=block_verification,
+    )
+    accept = _finalize(draft_tokens, num_correct, bonus, seq_lens, live_mask)
+    return accept, rng_step + 1
+
+
+@compiled_op(warmup=lambda ctx: _greedy_top_k_warmup_args(ctx))
+def accept_greedy_top_k_step(
+    top_ids: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    num_verify_drafts: torch.Tensor,
+    seq_lens: torch.Tensor,
+    live_mask: torch.Tensor,
+) -> AcceptResult:
+    """accept_greedy_step on the verify's descending top-k ids; the owner warms it."""
+    bs, n = draft_tokens.shape
+    # int32 compares and picks: int64 lanes are emulated on TPU.
+    target_argmax = top_ids[:, 0].view(bs, n + 1).to(torch.int32)
+    num_correct, bonus = _accept_argmax(
+        target_argmax, draft_tokens.to(torch.int32), num_verify_drafts
+    )
+    return _finalize(
+        draft_tokens,
+        num_correct.to(torch.int64),
+        bonus.to(draft_tokens.dtype),
+        seq_lens,
+        live_mask,
+    )
+
+
 @compiled_op()
 def live_result_rows(
     accept_tokens: torch.Tensor, accept_lens: torch.Tensor, bs: int
@@ -435,7 +835,9 @@ def live_result_rows(
 
 
 def _verify_mask(num_verify_drafts: torch.Tensor, n: int) -> torch.Tensor:
-    steps = torch.arange(n, device=num_verify_drafts.device)
+    steps = torch.arange(
+        n, dtype=num_verify_drafts.dtype, device=num_verify_drafts.device
+    )
     return steps[None, :] < num_verify_drafts[:, None]
 
 
@@ -459,6 +861,29 @@ def _accept_warmup_args(
         torch.ones((bs,), dtype=torch.float32, device=ctx.device),
         torch.ones((bs,), dtype=torch.int32, device=ctx.device),
     )
+
+
+def _accept_step_warmup_args(
+    ctx: SpecOpWarmupContext, *, sampled: bool
+) -> tuple[torch.Tensor, ...]:
+    bs = ctx.physical_bs
+    tail = (
+        torch.zeros((bs,), dtype=torch.int64, device=ctx.device),
+        torch.ones((bs,), dtype=torch.bool, device=ctx.device),
+    )
+    if not sampled:
+        return _accept_warmup_args(ctx, sampled=False) + tail
+    rng_step = torch.zeros((1,), dtype=torch.int64, device=ctx.device)
+    return _accept_warmup_args(ctx, sampled=True) + tail + (rng_step,)
+
+
+def _greedy_top_k_warmup_args(ctx: SpecOpWarmupContext) -> tuple[torch.Tensor, ...]:
+    # The verify's distributed top-k ids are int32.
+    bs, rows = ctx.physical_bs, ctx.num_verify_tokens
+    top_ids = torch.zeros(
+        (bs * rows, TARGET_CANDIDATES), dtype=torch.int32, device=ctx.device
+    )
+    return (top_ids, *_accept_step_warmup_args(ctx, sampled=False)[1:])
 
 
 def _verify_tokens_warmup_args(
@@ -492,15 +917,14 @@ def _leading_true(mask: torch.Tensor) -> torch.Tensor:
 
 def pick(values: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
     """values[b, index[b], ...] via a one-hot mask, [bs, ...]."""
-    onehot = (
-        torch.arange(values.shape[1], device=values.device)[None, :] == index[:, None]
-    )
+    # Index and sum keep their dtypes: int64 lanes are emulated on TPU.
+    positions = torch.arange(values.shape[1], dtype=index.dtype, device=values.device)
+    onehot = positions[None, :] == index[:, None]
     onehot = onehot.view(onehot.shape + (1,) * (values.dim() - 2))
-    return torch.where(onehot, values, 0).sum(dim=1)
+    return torch.where(onehot, values, 0).sum(dim=1, dtype=values.dtype)
 
 
-def _exponential_race(weights: torch.Tensor) -> torch.Tensor:
-    """argmax(w / E), E = -log(u) ~ Exp(1)."""
-    u = torch.rand_like(weights, dtype=torch.float32)
+def _exponential_race(weights: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+    """argmax(w / E), E = -log(u) ~ Exp(1), for uniforms u shaped like weights."""
     noise = torch.log(u.clamp_min(torch.finfo(torch.float32).tiny)).neg_()
     return torch.argmax(weights / noise, dim=-1)

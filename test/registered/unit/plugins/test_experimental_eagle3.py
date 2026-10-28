@@ -40,9 +40,14 @@ from sglang_tpu.experimental.speculative.eagle3.eagle3_draft_worker import (
 )
 from sglang_tpu.experimental.speculative.spec_ops import (
     _filtered_target_probs,
+    accept_candidates_step,
+    accept_drafts_candidates,
     accept_drafts_sampled,
     accept_drafts_sampled_filtered,
     accept_drafts_target_only,
+    accept_greedy_step,
+    accept_greedy_top_k_step,
+    accept_top_k_candidates_step,
     finalize_accept,
 )
 from sglang_tpu.experimental.speculative.spec_types import (
@@ -315,6 +320,7 @@ class TestExperimentalEagle3(CustomTestCase):
                 top_ks=torch.full((rows,), 4, dtype=torch.int32),
                 threshold_single=1.0,
                 threshold_acc=1.0,
+                rng_step=torch.zeros(1, dtype=torch.int64),
                 **_unfiltered(rows),
             )
         first = torch.where(num_correct > 0, drafts[:, 0], bonus)
@@ -331,6 +337,7 @@ class TestExperimentalEagle3(CustomTestCase):
                 top_ks=torch.ones(2, dtype=torch.int32),
                 threshold_single=1.0,
                 threshold_acc=1.0,
+                rng_step=torch.zeros(1, dtype=torch.int64),
                 **_unfiltered(2),
             )
         self.assertEqual(greedy_correct.tolist(), [1, 0])
@@ -353,11 +360,196 @@ class TestExperimentalEagle3(CustomTestCase):
                 torch.ones(rows, dtype=torch.int32),
                 q_logits.expand(rows, 1, 4),
                 top_ks=torch.full((rows,), 2, dtype=torch.int32),
+                rng_step=torch.zeros(1, dtype=torch.int64),
                 **_unfiltered(rows),
             )
         first = torch.where(num_correct > 0, drafts[:, 0], bonus)
         freq = torch.bincount(first, minlength=4).float() / rows
         torch.testing.assert_close(freq, p0, atol=0.01, rtol=0)
+
+    def test_candidates_acceptance_is_the_filtered_full_vocab_rule(self):
+        """On a top-k-only target and a q on K candidates, the candidates rule
+        decides the same correct prefix as the full-vocabulary filtered rule
+        from the same uniforms, and its bonus keeps the first committed token on
+        the filtered p_0."""
+        torch.manual_seed(0)
+        bs, n, vocab, k_draft = 4, 3, 32, 5
+        logits = torch.randn(bs * (n + 1), vocab)
+        draft_ids = torch.stack(
+            [torch.randperm(vocab)[:k_draft] for _ in range(bs * n)]
+        ).view(bs, n, k_draft)
+        draft_logits = torch.randn(bs, n, k_draft)
+        drafts = draft_ids[..., 0]
+        dense_q = torch.full((bs, n, vocab), float("-inf")).scatter(
+            -1, draft_ids, draft_logits
+        )
+        args = dict(
+            draft_tokens=drafts,
+            num_verify_drafts=torch.full((bs,), n, dtype=torch.int32),
+            temperatures=torch.tensor([0.7, 1.0, 1.3, 1.0]),
+            top_ks=torch.tensor([4, 8, 2, 1], dtype=torch.int32),
+            rng_step=torch.tensor([3]),
+        )
+        with (
+            patch.object(spec_ops, "tpu_filter_probs", _cpu_joint_filter),
+            patch.object(spec_ops, "TARGET_CANDIDATES", 8),
+        ):
+            full_correct, _ = accept_drafts_sampled_filtered(
+                logits,
+                draft_logits=dense_q,
+                top_ps=torch.ones(bs),
+                min_ps=torch.zeros(bs),
+                **args,
+            )
+            cand_correct, cand_bonus = accept_drafts_candidates(
+                *torch.topk(logits, 8),
+                draft_ids=draft_ids,
+                draft_logits=draft_logits,
+                **args,
+            )
+        self.assertEqual(cand_correct.tolist(), full_correct.tolist())
+        # The greedy row (top_k 1) commits the raw argmax.
+        greedy_bonus = logits.view(bs, n + 1, -1)[3].argmax(-1)[cand_correct[3]]
+        self.assertEqual(cand_bonus[3].item(), greedy_bonus.item())
+
+        rows = 40000
+        target = torch.tensor([0.1, 0.4, 0.3, 0.2]).log()
+        p0 = torch.tensor([0.0, 4 / 7, 3 / 7, 0.0])  # top-k 2 of the target
+        q_ids = torch.tensor([0, 1, 3])
+        q_logits = torch.tensor([0.5, 0.3, 0.2]).log()
+        picks = torch.multinomial(q_logits.exp(), rows, replacement=True)
+        with patch.object(spec_ops, "TARGET_CANDIDATES", 4):
+            num_correct, bonus = accept_drafts_candidates(
+                *torch.topk(torch.stack([target, torch.zeros(4)]).repeat(rows, 1), 4),
+                q_ids[picks][:, None],
+                torch.ones(rows, dtype=torch.int32),
+                q_ids.expand(rows, 1, 3),
+                q_logits.expand(rows, 1, 3),
+                torch.ones(rows),
+                torch.full((rows,), 2, dtype=torch.int32),
+                torch.tensor([0]),
+            )
+        first = torch.where(num_correct > 0, q_ids[picks], bonus)
+        freq = torch.bincount(first, minlength=4).float() / rows
+        torch.testing.assert_close(freq, p0, atol=0.01, rtol=0)
+
+    def test_block_verification_is_lossless_and_accepts_more(self):
+        """With a context-free target p and draft q, block verification's output
+        stream has its first two tokens distributed p x p, and it accepts at least
+        as many drafts as token-wise rejection."""
+        # A q far from p: an unscaled correction (r_tau = 1) misses by ~0.007.
+        rows, n, vocab = 100000, 3, 4
+        p_row = torch.tensor([0.05, 0.6, 0.25, 0.1])
+        q_row = torch.tensor([0.5, 0.05, 0.15, 0.3])
+        gen = torch.Generator().manual_seed(0)
+        ids = torch.arange(vocab)
+
+        def step(rng_step, block_verification):
+            drafts = torch.multinomial(
+                q_row, rows * n, replacement=True, generator=gen
+            ).view(rows, n)
+            with patch.object(spec_ops, "TARGET_CANDIDATES", vocab):
+                correct, bonus = accept_drafts_candidates(
+                    p_row.log().expand(rows * (n + 1), vocab),
+                    ids.expand(rows * (n + 1), vocab).int(),
+                    drafts,
+                    torch.full((rows,), n, dtype=torch.int32),
+                    ids.expand(rows, n, vocab),
+                    q_row.log().expand(rows, n, vocab),
+                    torch.ones(rows),
+                    torch.full((rows,), vocab, dtype=torch.int32),
+                    torch.tensor([rng_step]),
+                    block_verification=block_verification,
+                )
+            stream = torch.cat([drafts, bonus[:, None]], dim=1)
+            # Committed: the correct drafts, then the bonus.
+            slots = torch.arange(n + 1)[None, :]
+            stream = torch.where(slots < correct[:, None], stream, bonus[:, None])
+            return correct, stream
+
+        token_correct, _ = step(1, False)
+        block_correct, first_step = step(2, True)
+        _, second_step = step(3, True)
+        first = first_step[:, 0]
+        second = torch.where(block_correct >= 1, first_step[:, 1], second_step[:, 0])
+        joint = torch.bincount(first * vocab + second, minlength=vocab * vocab)
+        torch.testing.assert_close(
+            joint.float().view(vocab, vocab) / rows,
+            torch.outer(p_row, p_row),
+            atol=0.004,
+            rtol=0,
+        )
+        self.assertGreater(
+            block_correct.float().mean().item(), token_correct.float().mean().item()
+        )
+
+    def test_hash_uniforms_match_the_uint32_reference(self):
+        """The int32-lane hash keeps MurmurHash3's uint32 bits (masked int64 reference)."""
+        mask = 0xFFFFFFFF
+
+        def fmix(x):
+            x = x ^ (x >> 16)
+            x = (x * 0x85EBCA6B) & mask
+            x = x ^ (x >> 13)
+            x = (x * 0xC2B2AE35) & mask
+            return x ^ (x >> 16)
+
+        for step in (0, 7, 2**30 + 3):
+            for stream in (0, 1, 2):
+                key = fmix((step * 0x9E3779B1 + stream * 0x7F4A7C15) & mask)
+                index = torch.arange(3 * 64, dtype=torch.int64)
+                bits = fmix(fmix((index * 0x632BE5AB + key) & mask) ^ key)
+                expected = ((bits >> 8).float() / (1 << 24)).view(3, 64)
+                got = spec_ops.hash_uniforms(torch.tensor([step]), stream, (3, 64))
+                self.assertTrue(torch.equal(got, expected))
+
+    def test_top_k_accept_steps_match_full_vocab_steps(self):
+        """The verify's distributed top-k (descending logits and ids) commits what
+        the full-vocabulary steps commit from the same rng_step."""
+        torch.manual_seed(1)
+        bs, n, vocab, k_draft, width = 3, 4, 50, 6, 8
+        logits = torch.randn(bs * (n + 1), vocab)
+        top_logits, top_ids = torch.topk(logits, width)
+        draft_ids = torch.stack(
+            [torch.randperm(vocab)[:k_draft] for _ in range(bs * n)]
+        ).view(bs, n, k_draft)
+        draft_tokens = draft_ids[..., 0]
+        num_verify_drafts = torch.full((bs,), n, dtype=torch.int32)
+        seq_lens = torch.tensor([10, 20, 30])
+        live_mask = torch.tensor([True, True, False])
+        sampled = (
+            draft_ids,
+            torch.randn(bs, n, k_draft),
+            torch.tensor([1.0, 0.8, 1.0]),
+            torch.tensor([width, 3, 1], dtype=torch.int32),
+            seq_lens,
+            live_mask,
+            torch.tensor([5]),
+        )
+        with patch.object(spec_ops, "TARGET_CANDIDATES", width):
+            full, full_step = accept_candidates_step(
+                logits, draft_tokens, num_verify_drafts, *sampled, False
+            )
+            top, top_step = accept_top_k_candidates_step(
+                top_logits,
+                top_ids.int(),
+                draft_tokens,
+                num_verify_drafts,
+                *sampled,
+                False,
+            )
+        for a, b in zip(full, top):
+            self.assertTrue(torch.equal(a, b))
+        self.assertEqual(full_step.item(), top_step.item())
+
+        greedy = accept_greedy_step(
+            logits, draft_tokens, num_verify_drafts, seq_lens, live_mask
+        )
+        greedy_top = accept_greedy_top_k_step(
+            top_ids.int(), draft_tokens, num_verify_drafts, seq_lens, live_mask
+        )
+        for a, b in zip(greedy, greedy_top):
+            self.assertTrue(torch.equal(a, b))
 
     def test_greedy_rows_in_a_sampled_batch_compare_raw_logits(self):
         """A greedy row (top_k = 1) sharing a batch with sampled rows takes the
@@ -370,6 +562,7 @@ class TestExperimentalEagle3(CustomTestCase):
             draft_logits=torch.zeros(1, 1, 2),
             temperatures=torch.tensor([1e9]),
             top_ks=torch.ones(1, dtype=torch.int32),
+            rng_step=torch.zeros(1, dtype=torch.int64),
         )
         with patch.object(spec_ops, "tpu_filter_probs", _cpu_joint_filter):
             filtered = accept_drafts_sampled_filtered(
@@ -398,11 +591,20 @@ class TestExperimentalEagle3(CustomTestCase):
                 )
             )
 
-        none = {"need_top_k": False, "need_top_p": False, "need_min_p": False}
+        none = {
+            "need_top_k": False,
+            "need_top_p": False,
+            "need_min_p": False,
+            "target_candidates": False,
+        }
         self.assertEqual(filters([1, 1 << 30]), none)
         self.assertEqual(filters([1, 1 << 30], top_ps=(0.5, 1.0)), none)
         self.assertEqual(filters([1, 8])["need_top_k"], True)
         self.assertEqual(filters([1, 1 << 30], min_ps=(0.0, 0.1))["need_min_p"], True)
+        # Candidates acceptance covers a top-k-only target within TARGET_CANDIDATES.
+        self.assertTrue(filters([1, 64])["target_candidates"])
+        self.assertFalse(filters([1, 65])["target_candidates"])
+        self.assertFalse(filters([1, 8], top_ps=(1.0, 0.9))["target_candidates"])
 
     def test_sampled_verify_filters_target_like_the_target_sampler(self):
         """Sampled verify keeps what the target sampler keeps: every cutoff on the
@@ -446,6 +648,7 @@ class TestExperimentalEagle3(CustomTestCase):
         )
         worker._all_drafts = {4: torch.full((4,), 2, dtype=torch.int32)}
         worker._accept_threshold_single = worker._accept_threshold_acc = 1.0
+        worker._rng_step = torch.zeros(1, dtype=torch.int64)
         calls = []
         with (
             patch.object(
