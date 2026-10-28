@@ -708,12 +708,16 @@ def _pad_token_fields(forward_batch: Any, pad_t: int, is_draft_extend_v2: bool) 
             "Prefill tokens reached padding on the device instead of the host, "
             "which may compile a program per prompt length."
         )
+    host_originals = {}
     for field in _TOKEN_FIELDS:
         val = getattr(forward_batch, field, None)
         dim = _TOKEN_FIELD_DIM.get(field, 0)
         if isinstance(val, torch.Tensor) and val.shape[dim] < pad_t:
+            if val.device.type == "cpu":
+                host_originals[field] = val
             val = _pad_tensor(val, pad_t, dim=dim)
             setattr(forward_batch, field, val)
+    forward_batch._tpu_token_fields_cpu = host_originals
 
     if is_draft_extend_v2:
         out_cache_loc = forward_batch.out_cache_loc
@@ -739,8 +743,22 @@ def _restore_forward_batch_inputs(forward_batch: Any, real_q: int, real_b: int) 
     Restore real token and batch shapes so downstream logits and sampling do
     not observe the compiled inner decoder's padded ghost slots.
     """
+    host_originals = getattr(forward_batch, "_tpu_token_fields_cpu", None) or {}
+    forward_batch._tpu_token_fields_cpu = None
     for field in _TOKEN_FIELDS:
         value = getattr(forward_batch, field, None)
+        dim = _TOKEN_FIELD_DIM.get(field, 0)
+        original = host_originals.get(field)
+        if (
+            original is not None
+            and isinstance(value, torch.Tensor)
+            and original.shape[dim] == real_q
+            and value.shape[dim] > real_q
+        ):
+            # A TPU slice to real_q compiles one program per prompt length;
+            # a host-to-device transfer of the unpadded copy compiles none.
+            setattr(forward_batch, field, original.to(value.device, non_blocking=True))
+            continue
         if (
             field == "mrope_positions"
             and isinstance(value, torch.Tensor)
