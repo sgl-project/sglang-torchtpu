@@ -3284,6 +3284,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             verify_out_cache_loc_2d=verify_out_cache_loc_2d,
             verify_swa_loc_2d=verify_swa_loc_2d,
             draft_tokens=draft_tokens,
+            verify_rule=verify_rule,
+            verify_width=verify_width,
+            verify_tokens_buf=verify_tokens_buf,
         )
 
     def _forward_mixed_verify(
@@ -3643,6 +3646,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_out_cache_loc_2d = ctx.verify_out_cache_loc_2d
         verify_swa_loc_2d = ctx.verify_swa_loc_2d
         draft_tokens = ctx.draft_tokens
+        verify_rule, verify_width = ctx.verify_rule, ctx.verify_width
+        verify_tokens_buf = ctx.verify_tokens_buf
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
