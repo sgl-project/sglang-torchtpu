@@ -708,12 +708,19 @@ def _pad_token_fields(forward_batch: Any, pad_t: int, is_draft_extend_v2: bool) 
             "Prefill tokens reached padding on the device instead of the host, "
             "which may compile a program per prompt length."
         )
+    originals = getattr(forward_batch, "_tpu_token_fields_cpu", None)
+    if originals is None:
+        originals = {}
     for field in _TOKEN_FIELDS:
         val = getattr(forward_batch, field, None)
         dim = _TOKEN_FIELD_DIM.get(field, 0)
-        if isinstance(val, torch.Tensor) and val.shape[dim] < pad_t:
-            val = _pad_tensor(val, pad_t, dim=dim)
-            setattr(forward_batch, field, val)
+        if isinstance(val, torch.Tensor):
+            if val.device.type == "cpu" and field not in originals:
+                originals[field] = val
+            if val.shape[dim] < pad_t:
+                val = _pad_tensor(val, pad_t, dim=dim)
+                setattr(forward_batch, field, val)
+    forward_batch._tpu_token_fields_cpu = originals
 
     if is_draft_extend_v2:
         out_cache_loc = forward_batch.out_cache_loc
@@ -739,6 +746,7 @@ def _restore_forward_batch_inputs(forward_batch: Any, real_q: int, real_b: int) 
     Restore real token and batch shapes so downstream logits and sampling do
     not observe the compiled inner decoder's padded ghost slots.
     """
+    token_originals = getattr(forward_batch, "_tpu_token_fields_cpu", None)
     for field in _TOKEN_FIELDS:
         value = getattr(forward_batch, field, None)
         if (
@@ -752,7 +760,19 @@ def _restore_forward_batch_inputs(forward_batch: Any, real_q: int, real_b: int) 
             continue
         dim = _TOKEN_FIELD_DIM.get(field, 0)
         if isinstance(value, torch.Tensor) and value.shape[dim] > real_q:
-            setattr(forward_batch, field, value.narrow(dim, 0, real_q))
+            orig = token_originals.get(field) if token_originals is not None else None
+            if isinstance(orig, torch.Tensor) and orig.shape[dim] >= real_q:
+                cpu_slice = (
+                    orig if orig.shape[dim] == real_q else orig.narrow(dim, 0, real_q)
+                )
+                setattr(
+                    forward_batch,
+                    field,
+                    cpu_slice.to(value.device, non_blocking=True),
+                )
+            else:
+                setattr(forward_batch, field, value.narrow(dim, 0, real_q))
+    forward_batch._tpu_token_fields_cpu = None
 
     for field in _BS_FIELDS:
         value = getattr(forward_batch, field, None)

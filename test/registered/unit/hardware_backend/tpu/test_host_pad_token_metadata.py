@@ -379,38 +379,88 @@ class TestHostPadFieldSelection(CustomTestCase):
             )
         return sliced
 
+    def _prepared_prompt_batch(self, prompt_len, **fields):
+        """A one-request prefill of prompt_len host tokens, padded and uploaded."""
+        batch = self._extend_batch()
+        batch.input_ids = torch.arange(prompt_len, dtype=torch.int64)
+        batch.positions = torch.arange(prompt_len, dtype=torch.int64)
+        batch.out_cache_loc = torch.arange(prompt_len, dtype=torch.int32)
+        batch.mrope_positions = torch.arange(3 * prompt_len).reshape(3, prompt_len)
+        batch.seq_lens = torch.tensor([prompt_len], dtype=torch.int32)
+        batch.extend_seq_lens = torch.tensor([prompt_len], dtype=torch.int32)
+        batch.extend_prefix_lens = torch.tensor([0], dtype=torch.int32)
+        batch.extend_start_loc = torch.tensor([0], dtype=torch.int32)
+        batch.extend_seq_lens_cpu = [prompt_len]
+        batch.extend_prefix_lens_cpu = [0]
+        batch.extend_logprob_start_lens_cpu = [0]
+        for name, value in fields.items():
+            setattr(batch, name, value)
+        policy = DecoderTpuCompilePolicy(
+            model_runner=SimpleNamespace(device="meta"),
+            t_bucketer=Bucketer(name="Token", buckets=[16]),
+            b_bucketer=Bucketer(name="Bs", buckets=[1, 4]),
+        )
+        policy.prepare_forward_batch(batch)
+        return batch
+
     def test_restore_of_host_staged_tokens_never_slices_on_device(self):
         # Regression for #1429: torch_tpu compiles a program for each slice
         # shape, so trimming uploaded tokens on the device after the forward
         # compiles new programs for every prompt length.
         for prompt_len in (1, 5, 9):
             with self.subTest(prompt_len=prompt_len):
-                batch = self._extend_batch()
-                batch.input_ids = torch.arange(prompt_len, dtype=torch.int64)
-                batch.positions = torch.arange(prompt_len, dtype=torch.int64)
-                batch.out_cache_loc = torch.arange(prompt_len, dtype=torch.int32)
-                batch.mrope_positions = torch.arange(3 * prompt_len).reshape(
-                    3, prompt_len
-                )
-                batch.seq_lens = torch.tensor([prompt_len], dtype=torch.int32)
-                batch.extend_seq_lens = torch.tensor([prompt_len], dtype=torch.int32)
-                batch.extend_prefix_lens = torch.tensor([0], dtype=torch.int32)
-                batch.extend_start_loc = torch.tensor([0], dtype=torch.int32)
-                batch.extend_seq_lens_cpu = [prompt_len]
-                batch.extend_prefix_lens_cpu = [0]
-                batch.extend_logprob_start_lens_cpu = [0]
-                policy = DecoderTpuCompilePolicy(
-                    model_runner=SimpleNamespace(device="meta"),
-                    t_bucketer=Bucketer(name="Token", buckets=[16]),
-                    b_bucketer=Bucketer(name="Bs", buckets=[1, 4]),
-                )
-                policy.prepare_forward_batch(batch)
+                batch = self._prepared_prompt_batch(prompt_len)
                 self.assertEqual(batch.input_ids.device.type, "meta")
                 self.assertEqual(batch.input_ids.shape, (16,))
 
                 sliced = self._restore_and_record_device_slices(batch)
 
                 self.assertEqual(sliced, [])
+                self.assertEqual(batch.input_ids.device.type, "meta")
+                self.assertEqual(batch.positions.device.type, "meta")
+                self.assertEqual(batch.out_cache_loc.device.type, "meta")
+                self.assertEqual(batch.mrope_positions.device.type, "meta")
+                self.assertEqual(batch.input_ids.shape, (prompt_len,))
+                self.assertEqual(batch.positions.shape, (prompt_len,))
+                self.assertEqual(batch.out_cache_loc.shape, (prompt_len,))
+                self.assertEqual(batch.mrope_positions.shape, (3, prompt_len))
+                self.assertEqual(batch.seq_lens.shape, (1,))
+                self.assertIsNone(batch._tpu_token_fields_cpu)
+
+    def test_restore_of_host_staged_tokens_preserves_values(self):
+        batch = self._extend_batch()
+        policy = self._policy()
+        policy.prepare_forward_batch(batch)
+        self.assertEqual(batch.input_ids.shape, (8,))
+
+        shim._restore_forward_batch_inputs(
+            batch,
+            getattr(batch, shim._REAL_Q_KEY),
+            getattr(batch, shim._REAL_B_KEY),
+        )
+
+        self.assertEqual(batch.input_ids.tolist(), [0, 1, 2, 3, 4])
+        self.assertEqual(batch.positions.tolist(), [11, 12, 13, 50, 51])
+        self.assertEqual(batch.out_cache_loc.tolist(), [0, 1, 2, 3, 4])
+        self.assertEqual(batch.mrope_positions.shape, (3, 5))
+        self.assertIsNone(batch._tpu_token_fields_cpu)
+
+    def test_restore_of_host_staged_tokens_slices_on_cpu_when_pre_padded(self):
+        # Under DP decode, prepare_mlp_sync_batch pre-pads host token fields to
+        # max_tokens_per_rank before _pad_token_fields runs, while real_q is
+        # real_local_tokens < max_tokens_per_rank.
+        batch = self._prepared_prompt_batch(8)
+        setattr(batch, shim._REAL_Q_KEY, 3)
+
+        sliced = self._restore_and_record_device_slices(batch)
+
+        self.assertEqual(sliced, [])
+        self.assertEqual(batch.input_ids.device.type, "meta")
+        self.assertEqual(batch.input_ids.shape, (3,))
+        self.assertEqual(batch.positions.shape, (3,))
+        self.assertEqual(batch.out_cache_loc.shape, (3,))
+        self.assertEqual(batch.mrope_positions.shape, (3, 3))
+        self.assertIsNone(batch._tpu_token_fields_cpu)
 
     def test_restore_still_trims_tokens_padded_on_device(self):
         batch = self._extend_batch()
@@ -421,9 +471,10 @@ class TestHostPadFieldSelection(CustomTestCase):
 
         sliced = self._restore_and_record_device_slices(batch)
 
-        self.assertIn("input_ids", sliced)
+        self.assertEqual(sliced, ["input_ids"])
         self.assertEqual(batch.input_ids.device.type, "meta")
         self.assertEqual(batch.input_ids.shape, (5,))
+        self.assertEqual(batch.positions.shape, (5,))
 
     def test_decode_keeps_device_pad(self):
         batch = self._decode_batch()
