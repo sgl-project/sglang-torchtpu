@@ -10,7 +10,7 @@ and run Ulysses across the two cores of a chip with a K/V all-gather ring across
 | Recipe | Model | Cores | Parallelism |
 | :--- | :--- | :---: | :--- |
 | `flux2_klein_4b.sh` | `black-forest-labs/FLUX.2-klein-4B` | 1 or 4 | Ulysses = cores (24 heads) |
-| `zimage_turbo.sh` | `Tongyi-MAI/Z-Image-Turbo` | 1 or 2 | Ulysses = cores (30 heads) |
+| `zimage_turbo.sh` | `Tongyi-MAI/Z-Image-Turbo` | 8 or 1 | Ulysses = cores (30 heads, padded to 32) |
 | `wan22_ti2v_5b.sh` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `wan22_a14b.sh` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `ltx2.sh` | `Lightricks/LTX-2` | 8 | CFG 2 x Ulysses 4 |
@@ -34,7 +34,7 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | FLUX.2-klein-4B | T2I 1024x1024, 4 steps | 1 | 0.44 s | 0.076 s | 0.10 s | 24.8 GB |
 | FLUX.2-klein-4B | T2I 1024x1024, 4 steps | 4 | 0.30 s | 0.044 s | 0.10 s | 19.2 GB |
 | Z-Image-Turbo | T2I 1024x1024, 9 steps | 1 | 0.93 s | 0.089 s | 0.10 s | 29.2 GB |
-| Z-Image-Turbo | T2I 1024x1024, 9 steps | 2 | 0.73 s | 0.067 s | 0.10 s | 25.2 GB |
+| Z-Image-Turbo | T2I 1024x1024, 9 steps | 8 | 0.36 s | 0.026 s | 0.10 s | 22.4 GB |
 | Wan2.2-TI2V-5B | T2V 1280x704, 121 frames, 20 steps | 8 | 10.2 s | 0.263 s | 4.0 s | 30.1 GB |
 | Wan2.2-TI2V-5B | I2V 960x928 (from a square image), 121 frames, 20 steps | 8 | 11.8 s | 0.316 s | 4.1 s | 64.3 GB |
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 20 steps | 8 | 60.2 s | 2.77 s | 4.0 s | 68.8 GB |
