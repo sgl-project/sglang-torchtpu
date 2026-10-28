@@ -993,17 +993,15 @@ def allgather_kv_ring_attn(
     (about ``2 * S_total * H_kv * D`` elements), and only the local shard's
     compute (1/R of the layer) can hide the gathers. Bytes on the wire equal a
     p2p ring's; this trades memory for not needing p2p, which TPU lacks.
-    Self-attention only: query and key shards have the same length.
+    Query and key shards may differ in length (cross-attention between two
+    sequence-sharded streams, e.g. LTX-2 video and audio); query rows past
+    ``kv_real_len`` are zeroed only for self-attention.
     """
     ring_pg = get_sp_group().ring_group
     assert ring_pg is not None, "Ring process group is not initialized."
     world_size = dist.get_world_size(group=ring_pg)
     batch, shard_len, kv_heads = key.shape[:3]
-    # Query rows are zeroed by key position below.
-    assert query.shape[1] == shard_len, (
-        f"all-gather ring needs equal query/key shards, got {query.shape[1]} "
-        f"and {shard_len}"
-    )
+    self_attention = query.shape[1] == shard_len
     padded = kv_real_len is not None and kv_real_len < world_size * shard_len
     if kv_real_len is None:
         kv_real_len = world_size * shard_len
@@ -1035,7 +1033,7 @@ def allgather_kv_ring_attn(
         out, carry = attn_impl.forward_ring_resume(
             query, keys, values, kv_info(peer_t, peer_t * batch * kv_heads), carry
         )
-    if padded:
+    if padded and self_attention:
         rows = rank_t * shard_len + torch.arange(shard_len, device=out.device)
         out = torch.where((rows < kv_real_len)[:, None], out, 0)
     return out.transpose(1, 2)

@@ -142,6 +142,25 @@ class TestAllGatherRingAttention(unittest.TestCase):
         )
         self.assertTrue(torch.all(out[:, real:] == 0))
 
+    def test_cross_attention_between_two_sharded_streams(self):
+        # LTX-2 audio-to-video: query and key streams differ in length.
+        world_size, q_shard, kv_shard = 2, 6, 3
+        torch.manual_seed(0)
+        q = torch.randn(2, q_shard * world_size, 4, 8)
+        k = torch.randn(2, kv_shard * world_size, 4, 8)
+        v = torch.randn(2, kv_shard * world_size, 4, 8)
+        expected = _reference(q, k, v)
+        outputs, _ = _run_ring(
+            world_size,
+            q.chunk(world_size, dim=1),
+            k.chunk(world_size, dim=1),
+            v.chunk(world_size, dim=1),
+            _ResumeAttention(),
+        )
+        torch.testing.assert_close(
+            torch.cat(outputs, dim=1), expected, rtol=1e-5, atol=1e-6
+        )
+
     def test_ranks_make_the_same_calls(self):
         # Ranks running collectives inside one compiled program must compile
         # the same program: the shard choice travels as data, never as Python
