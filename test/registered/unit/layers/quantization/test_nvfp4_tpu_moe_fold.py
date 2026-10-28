@@ -320,6 +320,14 @@ class TestNvfp4Block512Contract(CustomTestCase):
                     layer, group_size=BLOCK_SIZE, no_combine=False
                 )
             )
+            # Attention DP is accepted only from a model that gathers its rows.
+            parallel.attn_dp_size = 2
+            layer.tpu_fused_rs_dp_attention_layout = True
+            self.assertTrue(
+                can_use_tpu_nvfp4_fused_rs(
+                    layer, group_size=BLOCK_SIZE, no_combine=False
+                )
+            )
 
     def test_unmet_requirements_name_the_failing_contract(self):
         """A rejected opt-in must say why, not silently serve the stock path.

@@ -17,18 +17,21 @@ __all__ = [
     "DISABLED_FUSED_MOE_SEQUENCE_PARALLEL_PLAN",
     "FusedMoeSequenceParallelPlan",
     "PreparedFusedMoeSequenceParallelInput",
+    "fused_moe_entry_group",
     "get_tpu_fused_rs_post_expert_norm_weight",
     "get_fused_moe_sequence_parallel_plan",
     "has_tpu_fused_rs_post_expert_norm",
     "prepare_fused_moe_sequence_parallel_input",
     "prepare_tpu_fused_rs_post_expert_norm",
     "use_fused_moe_sequence_parallel_plan",
+    "uses_tpu_fused_rs_dp_attention_layout",
 ]
 
 _POST_EXPERT_NORM_CAPABILITY = "supports_tpu_fused_rs_post_expert_norm"
 _POST_EXPERT_NORM_WEIGHT_GETTER = "tpu_fused_rs_post_expert_norm_weight"
 _CACHED_POST_EXPERT_NORM_CAPABILITY = "_tpu_fused_rs_has_post_expert_norm"
 _CACHED_POST_EXPERT_NORM_WEIGHT = "_tpu_fused_rs_post_expert_norm_weight"
+_DP_ATTENTION_LAYOUT_CAPABILITY = "tpu_fused_rs_dp_attention_layout"
 
 
 class FusedMoeSequenceParallelPlan(NamedTuple):
@@ -53,6 +56,37 @@ DISABLED_FUSED_MOE_SEQUENCE_PARALLEL_PLAN = FusedMoeSequenceParallelPlan(
 def has_tpu_fused_rs_post_expert_norm(layer: torch.nn.Module) -> bool:
     """Whether fused-RS may own this layer's norm, combine, and reduction."""
     return bool(getattr(layer, _POST_EXPERT_NORM_CAPABILITY, False))
+
+
+def uses_tpu_fused_rs_dp_attention_layout(layer: torch.nn.Module) -> bool:
+    """Whether the model feeds DP-attention rows in the gathered fused-RS layout.
+
+    Under DP attention each group holds different rows, so the in-kernel
+    reduce-scatter is correct only when every attention-TP rank passes its own
+    share of its group's rows and the entry is gathered over the whole TP group.
+    """
+    return bool(getattr(layer, _DP_ATTENTION_LAYOUT_CAPABILITY, False))
+
+
+def fused_moe_entry_group():
+    """Return the group the fused-RS expert entry is gathered over."""
+    parallel = get_parallel()
+    # TP ranks are attention-DP-major, so a TP-group gather is group-major and
+    # output block r holds exactly the rows TP rank r passed.
+    if parallel.attn_dp_size > 1:
+        return parallel.tp_group
+    return parallel.attn_tp_group
+
+
+def _all_gather_topk_packed(group, topk_weights, topk_ids):
+    # One fp32 all-gather instead of two; expert IDs are exact in fp32.
+    top_k = topk_weights.shape[-1]
+    packed = torch.cat((topk_weights.float(), topk_ids.float()), dim=-1)
+    packed = group.all_gather(packed, dim=0)
+    return (
+        packed[:, :top_k].to(topk_weights.dtype).contiguous(),
+        packed[:, top_k:].to(topk_ids.dtype).contiguous(),
+    )
 
 
 def prepare_tpu_fused_rs_post_expert_norm(layer: torch.nn.Module) -> None:
@@ -173,7 +207,13 @@ def prepare_fused_moe_sequence_parallel_input(
         )
 
     parallel = get_parallel()
-    group = parallel.attn_tp_group
+    dp_attention = parallel.attn_dp_size > 1
+    if dp_attention and not uses_tpu_fused_rs_dp_attention_layout(layer):
+        raise RuntimeError(
+            "TPU fused-RS sequence parallelism under DP attention requires the "
+            "model's gathered DP-attention layout"
+        )
+    group = fused_moe_entry_group()
     tp_group = getattr(parallel, "tp_group", None)
     fused_rs_world_size = layer.moe_ep_size
     if group.world_size != fused_rs_world_size:
@@ -217,7 +257,11 @@ def prepare_fused_moe_sequence_parallel_input(
     if plan.gather_hidden_states:
         hidden_states = group.all_gather(hidden_states, dim=0).contiguous()
 
-    if plan.gather_topk:
+    if plan.gather_topk and dp_attention:
+        topk_weights, topk_ids = _all_gather_topk_packed(
+            group, topk_output.topk_weights, topk_output.topk_ids
+        )
+    elif plan.gather_topk:
         topk_weights = group.all_gather(topk_output.topk_weights, dim=0).contiguous()
         topk_ids = group.all_gather(topk_output.topk_ids, dim=0).contiguous()
     else:

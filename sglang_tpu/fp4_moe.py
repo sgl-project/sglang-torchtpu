@@ -26,6 +26,7 @@ from sglang_tpu.fused_rs_sequence_parallel import (
     has_tpu_fused_rs_post_expert_norm,
     prepare_fused_moe_sequence_parallel_input,
     prepare_tpu_fused_rs_post_expert_norm,
+    uses_tpu_fused_rs_dp_attention_layout,
 )
 from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
@@ -142,6 +143,7 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
 
     parallel = get_parallel()
     runner_config = layer.moe_runner_config
+    dp_attention_layout = uses_tpu_fused_rs_dp_attention_layout(layer)
     requirements = (
         (
             f"group_size in {TPU_NVFP4_SUPPORTED_GROUP_SIZES}",
@@ -161,7 +163,10 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
             ),
         ),
         ("layer allows backend reduction", layer.allow_backend_reduction),
-        ("attn_dp_size == 1", parallel.attn_dp_size == 1),
+        (
+            "attn_dp_size == 1, or the model's gathered DP-attention layout",
+            parallel.attn_dp_size == 1 or dp_attention_layout,
+        ),
         ("gated MoE", runner_config.is_gated),
         (
             "silu activation",
@@ -181,7 +186,10 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
         ),
         ("no fused shared experts", not layer.num_fused_shared_experts),
         ("standard token dispatcher", get_moe_a2a_backend().is_none()),
-        ("dp attention disabled", not parallel.attn_dp_enabled),
+        (
+            "dp attention disabled, or the model's gathered DP-attention layout",
+            not parallel.attn_dp_enabled or dp_attention_layout,
+        ),
         (
             "fused MoE sum all-reduce disabled",
             not get_exec().moe.enable_fused_moe_sum_all_reduce,
