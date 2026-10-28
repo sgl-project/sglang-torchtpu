@@ -150,6 +150,39 @@ def build_chain_block_inputs(
     )
 
 
+# One program per commit tail: at small batch the host's launches, not the chip,
+# bound decode, and pick run eagerly launches a program per op.
+@compiled_op()
+def commit_carry(
+    carry: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    rows_hidden: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    seed_table: torch.Tensor | None = None,
+    rows_topk: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """(carry, seed_table, last_hidden [pbs, H]) with each request's carry row set to
+    the draft hidden of its last accepted verify row and, under DSA index sharing,
+    its seed_table row to that row's top-k.
+
+    rows_hidden and rows_topk are the commit forward's [pbs * (N + 1), ...] rows.
+    """
+    padded_bs = num_correct_drafts.shape[0]
+    last_hidden = pick(
+        rows_hidden.view(padded_bs, -1, rows_hidden.shape[-1]), num_correct_drafts
+    )
+    carry = carry.index_copy(0, req_pool_indices, last_hidden)
+    if seed_table is not None:
+        assert rows_topk is not None, "A seed table needs the rows' top-k."
+        seeds = pick(
+            rows_topk.view(padded_bs, -1, rows_topk.shape[-1]), num_correct_drafts
+        )
+        # pick sums a one-hot mask, which widens int32 to int64.
+        seeds = seeds.to(seed_table.dtype)
+        seed_table = seed_table.index_copy(0, req_pool_indices, seeds)
+    return carry, seed_table, last_hidden
+
+
 def _block_inputs(
     tokens: torch.Tensor,
     rows: VerifyRows,

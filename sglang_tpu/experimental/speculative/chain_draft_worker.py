@@ -128,10 +128,13 @@ class TpuChainDraftWorker(TpuDraftWorker):
         return self._dsa_seed_topk_table
 
     @dsa_seed_topk_table.setter
-    def dsa_seed_topk_table(self, table: torch.Tensor) -> None:
-        # Commit rebinds the table its compiled seed write returns.
-        assert self._dsa_seed_topk_table is not None, "alloc_memory_pool has not run"
-        assert table.shape == self._dsa_seed_topk_table.shape, table.shape
+    def dsa_seed_topk_table(self, table: torch.Tensor | None) -> None:
+        # Commit rebinds the table its compiled seed write returns; None without sharing.
+        current = self.dsa_seed_topk_table
+        if current is None:
+            assert table is None, "This drafter keeps no seed table."
+            return
+        assert table is not None and table.shape == current.shape, table
         self._dsa_seed_topk_table = table
 
     def precompile_draft(self) -> None:
