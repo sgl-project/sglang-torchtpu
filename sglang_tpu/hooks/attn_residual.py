@@ -1,28 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 """Kimi-K3 attention-residual decode kernel (opt-in).
 
-register_attn_residual_ops, prepare_attn_residual_kernel, aggregate,
-aggregate_fused_add
-  Why: attn_residual picks its aggregation implementation with in-module
-       CUDA/HIP gates and has no backend seam, and the TPU Pallas decode kernel
-       (sglang_tpu.kimi_attn_residual) must stay out of core.
+register_attn_residual_ops, prepare_attn_residual_kernel
+  Why: the TPU Pallas decode kernel (sglang_tpu.kimi_attn_residual) must stay
+       out of core, and core has no pre-trace preparation call for it.
   How: AFTER KimiK3LinearModel.__init__ registers the kernel's custom ops
-       before torch.compile traces the model. AFTER
+       before torch.compile traces the model, and registers aggregate with
+       attn_residual.register_aggregate_impl. AFTER
        KimiK3LinearForCausalLM.post_load_weights builds the kernel's fp32
-       out-norm weights and refuses online weight updates. AROUND
-       attn_residual._aggregate and _aggregate_fused_add send decode-sized
-       calls to the kernel and the rest to the original. All four pass through
+       out-norm weights and refuses online weight updates. Both pass through
        unless SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL=1 when the model is built.
   Upstream PR or issue: sgl-project/sglang-torchtpu#1428.
-  Remove when: attn_residual dispatches aggregation through a backend registry
-       that sglang_tpu fills from init_backend() (#1428).
+  Remove when: the registered implementation gets a post-load prepare call
+       from core (#1428, part 2).
 """
 
 from __future__ import annotations
 
 import importlib
 from types import ModuleType
-from typing import Any, Callable
+from typing import Any
 
 _KERNEL_MODULE = "sglang_tpu.kimi_attn_residual"
 
@@ -43,9 +40,13 @@ def register_attn_residual_ops(result: None, model: Any, *args, **kwargs) -> Non
         return
     if model.config.attn_res_block_size is None:
         return
+    from sglang.srt.layers.attn_residual import register_aggregate_impl
+    from sglang.srt.platforms import current_platform
+
     kernel = importlib.import_module(_KERNEL_MODULE)
     kernel.register_kimi_attn_res_decode_ops()
     _kernel = kernel
+    register_aggregate_impl(current_platform.get_dispatch_key_name(), aggregate)
 
 
 def prepare_attn_residual_kernel(result: None, causal_lm: Any, *args, **kwargs) -> None:
@@ -74,9 +75,15 @@ def prepare_attn_residual_kernel(result: None, causal_lm: Any, *args, **kwargs) 
     )
 
 
-def _decode(prefix_a, prefix_b, bank, nvb, score_proj, score_norm, out_norm):
-    """One kernel call for the pending add, mix and output norm. Returns
-    (normed, prefix) with prefix = prefix_a + prefix_b (prefix_a if None)."""
+def aggregate(prefix_a, prefix_b, bank, nvb, score_proj, score_norm, out_norm):
+    """attn_residual's registered aggregation: decode-sized calls in one kernel
+    call for the pending add, mix and output norm. Returns (normed, prefix)
+    with prefix = prefix_a + prefix_b (prefix_a if None), or None to leave the
+    call to core."""
+    if _kernel is None or not _kernel.supports_attn_res_decode(
+        prefix_a, prefix_b, bank, score_norm, out_norm
+    ):
+        return None
     from sglang.srt.layers.attn_residual import get_cw
 
     return _kernel.attention_residual_decode_tpu(
@@ -89,62 +96,3 @@ def _decode(prefix_a, prefix_b, bank, nvb, score_proj, score_norm, out_norm):
         _kernel.get_norm_weight_f32(out_norm),
         out_norm.variance_epsilon,
     )
-
-
-def aggregate(
-    original: Callable,
-    prefix_sum,
-    bank,
-    nvb,
-    score_proj,
-    score_norm,
-    out_norm,
-    write_bank_row=False,
-):
-    """AROUND attn_residual._aggregate. A fused bank write runs the original:
-    the kernel has none, and the caller asks for one only on the CUDA/HIP fast
-    paths."""
-    if (
-        _kernel is None
-        or write_bank_row
-        or not _kernel.supports_attn_res_decode(
-            prefix_sum, None, bank, score_norm, out_norm
-        )
-    ):
-        return original(
-            prefix_sum, bank, nvb, score_proj, score_norm, out_norm, write_bank_row
-        )
-    return _decode(prefix_sum, None, bank, nvb, score_proj, score_norm, out_norm)[0]
-
-
-def aggregate_fused_add(
-    original: Callable,
-    prefix_a,
-    prefix_b,
-    bank,
-    nvb,
-    score_proj,
-    score_norm,
-    out_norm,
-    write_bank_row=False,
-):
-    """AROUND attn_residual._aggregate_fused_add, as aggregate with the pending
-    add in the kernel. Returns (normed, prefix) like the original."""
-    if (
-        _kernel is None
-        or write_bank_row
-        or not _kernel.supports_attn_res_decode(
-            prefix_a, prefix_b, bank, score_norm, out_norm
-        )
-    ):
-        return original(
-            prefix_a,
-            prefix_b,
-            bank,
-            nvb,
-            score_proj,
-            score_norm,
-            out_norm,
-            write_bank_row,
-        )
-    return _decode(prefix_a, prefix_b, bank, nvb, score_proj, score_norm, out_norm)
