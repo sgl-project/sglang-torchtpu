@@ -17,6 +17,7 @@ import os
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang_tpu.moe.activation import pallas_moe_activation
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
@@ -584,6 +585,7 @@ def apply_tpu_fp8_moe(
         if activation != "silu":
             raise ValueError("TPU clamped MoE requires silu activation")
         activation = f"silu_and_mul_clamp:{float(swiglu_limit)}"
+    activation = pallas_moe_activation(activation, layer)
     output = fused_moe_call(
         hidden_states=x,
         w1=layer.w13_weight,

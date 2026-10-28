@@ -1701,6 +1701,8 @@ class ModelConfig:
 
             {"quant_algo": "FP8", "quant_method": "modelopt", ...}
         """
+        if quant_config_dict.get("quant_method") == "inkling2":
+            return quant_config_dict
         json_quant_configs = unwrap_modelopt_quantization_config(quant_config_dict)
         if not json_quant_configs:
             return None

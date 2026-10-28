@@ -14,6 +14,7 @@ import os
 
 import torch
 
+from sglang_tpu.moe.activation import pallas_moe_activation
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang_tpu.fused_rs_sequence_parallel import (
     get_tpu_fused_rs_post_expert_norm_weight,
@@ -122,8 +123,8 @@ def fp8_fused_rs_unsupported_reason(
         return "DP attention and hybrid DP/TP attention are not supported"
     if not gated:
         return "the MoE activation must be gated"
-    if activation not in ("silu", "silu_and_mul_clamp"):
-        return f"the MoE activation must be silu, got {activation}"
+    if activation not in ("silu", "silu_and_mul_clamp", "situ"):
+        return f"the MoE activation must be silu or situ, got {activation}"
     if apply_router_weight_on_input:
         return "applying router weights on the expert input is not supported"
     if no_combine:
@@ -260,6 +261,7 @@ def _apply_fp8_fused_rs(
         if activation != "silu":
             raise ValueError("TPU clamped MoE requires silu activation")
         activation = f"silu_and_mul_clamp:{float(swiglu_limit)}"
+    activation = pallas_moe_activation(activation, layer)
     prepared_input = prepare_fused_moe_sequence_parallel_input(layer, dispatch_output)
     dispatch_output = prepared_input.dispatch_output
     keep_output_shard = prepared_input.plan.keep_output_shard

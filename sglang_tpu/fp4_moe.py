@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import torch
 
+from sglang_tpu.moe.activation import pallas_moe_activation
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.moe.tpu_moe_utils import mask_tpu_moe_non_local_experts
 from sglang.srt.layers.quantization.mxfp4_tpu_util import (
@@ -164,8 +165,8 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
         ("attn_dp_size == 1", parallel.attn_dp_size == 1),
         ("gated MoE", runner_config.is_gated),
         (
-            "silu activation",
-            runner_config.activation in ("silu", "silu_and_mul_clamp"),
+            "silu or situ activation",
+            runner_config.activation in ("silu", "silu_and_mul_clamp", "situ"),
         ),
         (
             "router weight not applied on input",
@@ -334,6 +335,7 @@ def apply_tpu_nvfp4_moe(
         if activation != "silu":
             raise ValueError("TPU clamped MoE requires silu activation")
         activation = f"silu_and_mul_clamp:{float(swiglu_limit)}"
+    activation = pallas_moe_activation(activation, layer)
 
     if use_fused_rs:
         from sglang_tpu.moe.pallas.fused_moe_rs_op import (

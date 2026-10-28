@@ -44,6 +44,7 @@ from sglang_tpu.hooks.k3_megakernel import (
     prepare_k3_capture_kernels,
     skip_k3_decoder_layers,
 )
+from sglang_tpu.hooks.inkling2 import inkling2_attn_backend, inkling2_swa_kv_pool
 from sglang_tpu.hooks.kda_weights import (
     bind_glm5_next_kda_weights,
     rehome_kimi_k3_kda_weights,
@@ -85,6 +86,16 @@ logger = logging.getLogger(__name__)
 # (target, hook, hook_type) triples.
 
 HOOKS: list[tuple] = [
+    (
+        "sglang.srt.layers.attention.attention_registry.attn_backend_wrapper",
+        inkling2_attn_backend,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._build_hybrid_swa_kv_pool",
+        inkling2_swa_kv_pool,
+        HookType.AROUND,
+    ),
     (
         "sglang.srt.managers.scheduler.Scheduler.run_event_loop",
         pin_scheduler_main_thread,

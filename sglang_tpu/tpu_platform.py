@@ -1080,6 +1080,10 @@ class TpuSRTPlatform(SRTPlatform):
             )
 
             return TpuModelOptMixedPrecisionConfig
+        if quantization == "inkling2":
+            from sglang_tpu.models.inkling2_quant import TpuInkling2QuantConfig
+
+            return TpuInkling2QuantConfig
         return None
 
     def get_mha_kv_pool_cls(self) -> type:
