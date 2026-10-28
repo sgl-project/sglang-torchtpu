@@ -191,6 +191,9 @@ def _place_mm_rows(
             continue
         if isinstance(embedding, PaddedEmbedding):
             embedding = embedding.to_host()
+        elif embedding.device.type != "cpu":
+            # Encoders may keep their output on the device; the buffer is host memory.
+            embedding = embedding.cpu()
         indices = mask.reshape(-1).nonzero(as_tuple=True)[0]
         if indices.numel() != embedding.shape[0]:
             raise ValueError(
