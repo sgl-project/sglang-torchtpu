@@ -353,6 +353,78 @@ class TestHostPadFieldSelection(CustomTestCase):
         shim._restore_forward_batch_inputs(batch, 7, 7)
         self.assertEqual(batch.mrope_positions.shape, (3, 7))
 
+    def _restore_and_record_device_slices(self, batch):
+        """Restore a prepared batch; return the token fields sliced on device."""
+        token_fields = ("input_ids", "positions", "out_cache_loc", "mrope_positions")
+        uploaded = {name: getattr(batch, name) for name in token_fields}
+        sliced = []
+
+        class RecordDeviceSlices(TorchDispatchMode):
+            def __torch_dispatch__(mode, func, types, args=(), kwargs=None):
+                if func in (
+                    torch.ops.aten.slice.Tensor,
+                    torch.ops.aten.narrow.default,
+                    torch.ops.aten.as_strided.default,
+                ):
+                    sliced.extend(
+                        name for name, value in uploaded.items() if args[0] is value
+                    )
+                return func(*args, **(kwargs or {}))
+
+        with RecordDeviceSlices():
+            shim._restore_forward_batch_inputs(
+                batch,
+                getattr(batch, shim._REAL_Q_KEY),
+                getattr(batch, shim._REAL_B_KEY),
+            )
+        return sliced
+
+    def test_restore_of_host_staged_tokens_never_slices_on_device(self):
+        # Regression for #1429: torch_tpu compiles a program for each slice
+        # shape, so trimming uploaded tokens on the device after the forward
+        # compiles new programs for every prompt length.
+        for prompt_len in (1, 5, 9):
+            with self.subTest(prompt_len=prompt_len):
+                batch = self._extend_batch()
+                batch.input_ids = torch.arange(prompt_len, dtype=torch.int64)
+                batch.positions = torch.arange(prompt_len, dtype=torch.int64)
+                batch.out_cache_loc = torch.arange(prompt_len, dtype=torch.int32)
+                batch.mrope_positions = torch.arange(3 * prompt_len).reshape(
+                    3, prompt_len
+                )
+                batch.seq_lens = torch.tensor([prompt_len], dtype=torch.int32)
+                batch.extend_seq_lens = torch.tensor([prompt_len], dtype=torch.int32)
+                batch.extend_prefix_lens = torch.tensor([0], dtype=torch.int32)
+                batch.extend_start_loc = torch.tensor([0], dtype=torch.int32)
+                batch.extend_seq_lens_cpu = [prompt_len]
+                batch.extend_prefix_lens_cpu = [0]
+                batch.extend_logprob_start_lens_cpu = [0]
+                policy = DecoderTpuCompilePolicy(
+                    model_runner=SimpleNamespace(device="meta"),
+                    t_bucketer=Bucketer(name="Token", buckets=[16]),
+                    b_bucketer=Bucketer(name="Bs", buckets=[1, 4]),
+                )
+                policy.prepare_forward_batch(batch)
+                self.assertEqual(batch.input_ids.device.type, "meta")
+                self.assertEqual(batch.input_ids.shape, (16,))
+
+                sliced = self._restore_and_record_device_slices(batch)
+
+                self.assertEqual(sliced, [])
+
+    def test_restore_still_trims_tokens_padded_on_device(self):
+        batch = self._extend_batch()
+        batch.input_ids = batch.input_ids.to("meta")
+        policy = self._policy()
+        policy.model_runner.device = "meta"
+        policy.prepare_forward_batch(batch)
+
+        sliced = self._restore_and_record_device_slices(batch)
+
+        self.assertIn("input_ids", sliced)
+        self.assertEqual(batch.input_ids.device.type, "meta")
+        self.assertEqual(batch.input_ids.shape, (5,))
+
     def test_decode_keeps_device_pad(self):
         batch = self._decode_batch()
 
