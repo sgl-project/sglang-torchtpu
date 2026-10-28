@@ -35,7 +35,7 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | FLUX.2-klein-4B | T2I 1024x1024, 4 steps | 4 | 0.30 s | 0.044 s | 0.10 s | 19.2 GB |
 | Z-Image-Turbo | T2I 1024x1024, 9 steps | 1 | 0.93 s | 0.089 s | 0.10 s | 29.2 GB |
 | Z-Image-Turbo | T2I 1024x1024, 9 steps | 8 | 0.36 s | 0.026 s | 0.10 s | 22.4 GB |
-| Wan2.2-TI2V-5B | T2V 1280x704, 121 frames, 20 steps | 8 | 10.2 s | 0.263 s | 4.0 s | 30.1 GB |
+| Wan2.2-TI2V-5B | T2V 1280x704, 121 frames, 20 steps | 8 | 10.1 s | 0.251 s | 3.9 s | 30.1 GB |
 | Wan2.2-TI2V-5B | I2V 960x928 (from a square image), 121 frames, 20 steps | 8 | 11.8 s | 0.316 s | 4.1 s | 64.3 GB |
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 20 steps | 8 | 60.2 s | 2.77 s | 4.0 s | 68.8 GB |
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.6 s | 0.731 s | 2.0 s | 64.3 GB |
