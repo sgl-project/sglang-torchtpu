@@ -50,12 +50,15 @@ from jax.experimental.pallas import tpu as pltpu
 NOPE_DIM = 512
 ROPE_LANES = 128  # RoPE row in the cache: 64 FP8 values, then zero padding
 _NBUF = 4  # DMA ring depth (prefetch distance NBUF - 1 pages)
-_WORD_BITS = 32  # pools per bitmap word, i.e. per page
+_WORD_DTYPE = jnp.int32  # a page's selection word: one bit per pool
+_WORD_BITS = jnp.iinfo(_WORD_DTYPE).bits  # pools per word, i.e. per page
+_POSITION_DTYPE = jnp.int32  # token positions
+# The kernel computes scores, and keeps the softmax's running max and sum and
+# the output accumulator, in this dtype.
+_ACCUMULATOR_DTYPE = jnp.float32
 _VMEM_LIMIT_BYTES = 64 * 1024 * 1024
 _LANES = 128  # width of a TPU vector register
 _SUBLANES = 8  # 32-bit rows of a vector register; a [1, n] buffer takes 8
-_F32_BYTES = jnp.dtype(jnp.float32).itemsize
-_I32_BYTES = jnp.dtype(jnp.int32).itemsize
 # Queries per block: the default is the one this kernel came with from
 # sglang-jax. Query positions sit on lanes, so a block is a whole number of
 # lanes and the smallest is one lane width.
@@ -84,23 +87,27 @@ def vmem_bytes(
 
     Pallas keeps two copies of each blocked input and output, and one of each
     scratch buffer. Most of the total is per score row (num_heads *
-    query_block): the query window, the output, the f32 accumulator and one
-    page of f32 scores. Where the kernel does not fit, the estimate is up to
+    query_block): the query window, the output, the output accumulator and
+    one page of scores. Where the kernel does not fit, the estimate is up to
     0.6 MiB above what the tpu7x compiler reports.
     """
     itemsize = jnp.dtype(dtype).itemsize
+    acc_bytes = jnp.dtype(_ACCUMULATOR_DTYPE).itemsize
     per_row = (
         2 * _align(q_width, _LANES) * itemsize  # query window
         + 2 * NOPE_DIM * itemsize  # output
-        + NOPE_DIM * _F32_BYTES  # accumulator
-        + 2 * _SUBLANES * _F32_BYTES  # running max and sum, [1, rows] each
-        + page_size * _F32_BYTES  # scores of one page, [page_size, rows]
+        + NOPE_DIM * acc_bytes  # output accumulator
+        + 2 * _SUBLANES * acc_bytes  # running max and sum, [1, rows] each
+        + page_size * acc_bytes  # scores of one page, [page_size, rows]
     )
     per_block = (
         # Selection words, [pages, query_block].
-        2 * _align(pages_per_seq, _SUBLANES) * query_block * _I32_BYTES
+        2
+        * _align(pages_per_seq, _SUBLANES)
+        * query_block
+        * jnp.dtype(_WORD_DTYPE).itemsize
         # Query positions, [1, query_block].
-        + 2 * _SUBLANES * query_block * _I32_BYTES
+        + 2 * _SUBLANES * query_block * jnp.dtype(_POSITION_DTYPE).itemsize
         # Key ring: one FP8 byte per NoPE value and per RoPE lane of a token.
         + _NBUF * page_size * (NOPE_DIM + ROPE_LANES)
     )
@@ -175,9 +182,9 @@ def _qblock_kernel(
                 for cp in copies(d, d):
                     cp.start()
 
-        m_ref[...] = jnp.full(m_ref.shape, -jnp.inf, jnp.float32)
-        l_ref[...] = jnp.zeros(l_ref.shape, jnp.float32)
-        acc_ref[...] = jnp.zeros(acc_ref.shape, jnp.float32)
+        m_ref[...] = jnp.full(m_ref.shape, -jnp.inf, _ACCUMULATOR_DTYPE)
+        l_ref[...] = jnp.zeros(l_ref.shape, _ACCUMULATOR_DTYPE)
+        acc_ref[...] = jnp.zeros(acc_ref.shape, _ACCUMULATOR_DTYPE)
 
         def unit(j, carry):
             g = units_ref[0, 0, j]  # request-relative page
@@ -206,7 +213,7 @@ def _qblock_kernel(
             )
             key_pos = g * page_size + rows
             attend = ((bits & 1) != 0) & (key_pos <= qpos)  # [page_size, QB]
-            bias = jnp.where(attend, 0.0, -jnp.inf).astype(jnp.float32)
+            bias = jnp.where(attend, 0.0, -jnp.inf).astype(_ACCUMULATOR_DTYPE)
             bias = jnp.concatenate([bias] * num_heads, axis=1)  # [page, rows]
 
             for cp in copies(j, slot):
@@ -225,13 +232,16 @@ def _qblock_kernel(
             q = q_ref[0]
             nt = (((1,), (1,)), ((), ()))
             s = lax.dot_general(
-                nope, q[:, :NOPE_DIM], nt, preferred_element_type=jnp.float32
+                nope,
+                q[:, :NOPE_DIM],
+                nt,
+                preferred_element_type=_ACCUMULATOR_DTYPE,
             )
             s += lax.dot_general(
                 rope,
                 q[:, NOPE_DIM : NOPE_DIM + ROPE_LANES],
                 nt,
-                preferred_element_type=jnp.float32,
+                preferred_element_type=_ACCUMULATOR_DTYPE,
             )
             s = s * scale + bias
 
@@ -247,7 +257,7 @@ def _qblock_kernel(
                 nope,
                 p.astype(jnp.bfloat16),
                 (((0,), (0,)), ((), ())),
-                preferred_element_type=jnp.float32,
+                preferred_element_type=_ACCUMULATOR_DTYPE,
             )
             m_ref[...] = m_new
             return carry
@@ -352,7 +362,7 @@ def sparse_mla_prefill_qblock(
         num_blocks=num_blocks,
         num_tokens=num_tokens,
     )
-    r = jnp.arange(qb, dtype=jnp.int32)
+    r = jnp.arange(qb, dtype=_POSITION_DTYPE)
     is_row = r[None, :] < count[:, None]  # [num_blocks, qb]
     tok = jnp.where(is_row, start[:, None] + r[None, :], 0)
     qpos = jnp.where(is_row, first_pos[:, None] + r[None, :], -1)
@@ -368,7 +378,7 @@ def sparse_mla_prefill_qblock(
     g = jnp.arange(pages_pad, dtype=jnp.int32)
     member = lax.reduce(
         jnp.where(page[:, None] == g[None, :, None, None], bit[:, None], 0),
-        np.int32(0),
+        np.dtype(_WORD_DTYPE).type(0),
         lax.bitwise_or,
         (3,),
     )  # [num_blocks, pages_pad, qb]
@@ -431,9 +441,9 @@ def sparse_mla_prefill_qblock(
             scratch_shapes=[
                 pltpu.VMEM((_NBUF, page_size * 4, 128), cache_nope.dtype),
                 pltpu.VMEM((_NBUF, page_size, ROPE_LANES), cache_rope.dtype),
-                pltpu.VMEM((1, rows), jnp.float32),
-                pltpu.VMEM((1, rows), jnp.float32),
-                pltpu.VMEM((NOPE_DIM, rows), jnp.float32),
+                pltpu.VMEM((1, rows), _ACCUMULATOR_DTYPE),
+                pltpu.VMEM((1, rows), _ACCUMULATOR_DTYPE),
+                pltpu.VMEM((NOPE_DIM, rows), _ACCUMULATOR_DTYPE),
                 pltpu.SemaphoreType.DMA((2, _NBUF)),
             ],
         ),
