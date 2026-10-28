@@ -75,7 +75,7 @@ dependencies = [
   # - jax and jaxlib must be compatible with libtpu.
   # - tpu-sync-torch's native extension links torch_tpu's per-torch-version
   #   glue library, so it must be upgraded and validated with torch_tpu.
-  "torch_tpu==0.2.0",
+  "torch_tpu==0.2.1.dev20261017000154",
   # PJRT raw-transfer / KV-cache DMA engine backing the raiden disaggregation
   # connector (sglang/srt/disaggregation/raiden/) and the raiden HiCache
   # transfer backend (sglang/srt/hardware_backend/tpu/raiden_transfer.py).
@@ -214,5 +214,12 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
+torch-tpu = { index = "torch-tpu-registry" }
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
+
+# TorchTPU nightlies are published to the Google Artifact Registry.
+[[tool.uv.index]]
+name = "torch-tpu-registry"
+url = "https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
+explicit = true
