@@ -173,10 +173,18 @@ def _pair_post_combine(
         if post_expert_norm_weight is not None:
             norm_size = post_expert_norm_weight.shape[0]
             y = y * (post_expert_norm_weight.astype(jnp.float32) + 1.0)[None, :]
-            y = y * jax.lax.rsqrt(jnp.sum(y * y, axis=-1, keepdims=True) / norm_size + 1e-8)
-        weighted = (y.astype(recv.dtype).astype(jnp.float32) * weight[:, None]).astype(recv.dtype)
-    scatter = (token[None, :] == jnp.arange(chunk_size, dtype=jnp.int32)[:, None]).astype(weighted.dtype)
-    return jnp.dot(scatter, weighted, preferred_element_type=jnp.float32).astype(out_dtype)
+            y = y * jax.lax.rsqrt(
+                jnp.sum(y * y, axis=-1, keepdims=True) / norm_size + 1e-8
+            )
+        weighted = (y.astype(recv.dtype).astype(jnp.float32) * weight[:, None]).astype(
+            recv.dtype
+        )
+    scatter = (
+        token[None, :] == jnp.arange(chunk_size, dtype=jnp.int32)[:, None]
+    ).astype(weighted.dtype)
+    return jnp.dot(scatter, weighted, preferred_element_type=jnp.float32).astype(
+        out_dtype
+    )
 
 
 # ============================================================================

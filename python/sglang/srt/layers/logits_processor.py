@@ -861,10 +861,14 @@ class LogitsProcessor(nn.Module):
                 back = torch.arange(
                     w - 1, -1, -1, dtype=last_index.dtype, device=last_index.device
                 )
-                start = last_index + 1 - logits_metadata.extend_seq_lens.to(
-                    last_index.dtype
+                start = (
+                    last_index
+                    + 1
+                    - logits_metadata.extend_seq_lens.to(last_index.dtype)
                 )
-                rows = torch.maximum(last_index[:, None] - back[None, :], start[:, None])
+                rows = torch.maximum(
+                    last_index[:, None] - back[None, :], start[:, None]
+                )
                 last_index = rows.clamp(0, hidden_states.shape[0] - 1).reshape(-1)
             pruned_states = hidden_states[last_index]
             if hidden_states_before_norm is not None:

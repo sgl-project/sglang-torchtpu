@@ -578,9 +578,13 @@ class FutureMap:
 
         # Gather on the table's device (host-resident on some backends).
         on_host = self.req_to_token.device.type == "cpu"
-        rows = (torch.as_tensor(batch.mix_running_indices_cpu) if on_host else idx).long()
+        rows = (
+            torch.as_tensor(batch.mix_running_indices_cpu) if on_host else idx
+        ).long()
         base = (fresh_cpu if on_host else fresh).long()
-        cols = base[:, None] + torch.arange(width, dtype=torch.int64, device=base.device)
+        cols = base[:, None] + torch.arange(
+            width, dtype=torch.int64, device=base.device
+        )
         out_cache_loc = batch.out_cache_loc.clone()
         out_cache_loc[-n * width :] = (
             self.req_to_token[rows[:, None], cols]

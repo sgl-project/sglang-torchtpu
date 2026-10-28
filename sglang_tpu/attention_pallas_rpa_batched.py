@@ -133,7 +133,9 @@ def _invoke_batched_kernel(
     out_verify, kv_cache_fused = run(
         kv_cache_fused,
         jnp.zeros_like(distribution).at[2].set(distribution[0]),
-        _verify_blocks(decode_query_size=decode_query_size, sliding_window=sliding_window),
+        _verify_blocks(
+            decode_query_size=decode_query_size, sliding_window=sliding_window
+        ),
     )
     out_rest, kv_cache_fused = run(kv_cache_fused, distribution.at[0].set(0))
     verify_rows = jnp.arange(queries.shape[0]) < cu_q_lens[distribution[0]]
@@ -188,9 +190,8 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
 
     def __init__(self, model_runner, speculative_step_id=0):
         super().__init__(model_runner, speculative_step_id)
-        from sglang.srt.runtime_context import get_parallel
-
         from sglang.srt.managers.schedule_batch import mixed_tail_width
+        from sglang.srt.runtime_context import get_parallel
 
         parallel = get_parallel()
         if (

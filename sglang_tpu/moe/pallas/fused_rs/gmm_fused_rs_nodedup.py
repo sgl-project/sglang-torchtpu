@@ -25,7 +25,6 @@ from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.envs import envs as tpu_envs
-
 from sglang_tpu.moe.pallas.fused_rs.gmm_v2_gather_scatter import (
     Dimensions,
     FusedDims,
@@ -1047,7 +1046,9 @@ def kernel_main_fused_rs(
             @pl.when(has)
             def _(b=b, off=off):
                 pltpu.make_async_remote_copy(
-                    src_ref=scatter_staging_3x_ref.at[stg_id, pl.ds(row0 + off, b), :, :],
+                    src_ref=scatter_staging_3x_ref.at[
+                        stg_id, pl.ds(row0 + off, b), :, :
+                    ],
                     dst_ref=pair_ring_ref.at[ring_slot, pl.ds(row0 + off, b), :, :],
                     send_sem=send_sems_ref.at[stg_id],
                     recv_sem=pair_recv_sem_ref.at[ring_slot],
@@ -1112,7 +1113,9 @@ def kernel_main_fused_rs(
                 @pl.when(jnp.logical_and(has, ~forward))
                 def _(b=b, off=off):
                     pltpu.make_async_remote_copy(
-                        src_ref=scatter_staging_3x_ref.at[stg, pl.ds(row0 + src_off + off, b), :, :],
+                        src_ref=scatter_staging_3x_ref.at[
+                            stg, pl.ds(row0 + src_off + off, b), :, :
+                        ],
                         dst_ref=out_buf_ref.at[pl.ds(dst0 + off, b), :, :],
                         send_sem=send_sems_ref.at[stg],
                         recv_sem=recv_sem_ref.at[0],
@@ -1123,7 +1126,9 @@ def kernel_main_fused_rs(
                 @pl.when(jnp.logical_and(has, forward))
                 def _(b=b, off=off):
                     pltpu.make_async_remote_copy(
-                        src_ref=pair_sum_ref.at[stg, pl.ds(row0 + src_off + off, b), :, :],
+                        src_ref=pair_sum_ref.at[
+                            stg, pl.ds(row0 + src_off + off, b), :, :
+                        ],
                         dst_ref=out_buf_ref.at[pl.ds(dst0 + off, b), :, :],
                         send_sem=send_sems_ref.at[stg],
                         recv_sem=recv_sem_ref.at[0],
@@ -1829,19 +1834,28 @@ def _pair_exchange_metadata(
     """
     tokens = local_idx // top_k if pack_indices else local_idx
     owner = tokens // chunk_size
-    onehot = (owner[:, None] == jnp.arange(ep_size, dtype=jnp.int32)[None, :]).astype(jnp.int32)
-    counts = jnp.concatenate([jnp.zeros((1, ep_size), jnp.int32), jnp.cumsum(onehot, axis=0)])
+    onehot = (owner[:, None] == jnp.arange(ep_size, dtype=jnp.int32)[None, :]).astype(
+        jnp.int32
+    )
+    counts = jnp.concatenate(
+        [jnp.zeros((1, ep_size), jnp.int32), jnp.cumsum(onehot, axis=0)]
+    )
     m_offset = group_start[4 + num_slots : 4 + 2 * num_slots + 1]
     run_rank = counts[m_offset[:num_slots]]
     run_len = counts[m_offset[1:]] - run_rank
     my_rank = group_offset[0] // size_group
     my_len = jnp.take(run_len, my_rank, axis=1)
-    pieces = sum(((my_len & b) != 0).astype(jnp.int32) for b in (512, 256, 128, 64, 32, 16, 8, 4, 2, 1))
+    pieces = sum(
+        ((my_len & b) != 0).astype(jnp.int32)
+        for b in (512, 256, 128, 64, 32, 16, 8, 4, 2, 1)
+    )
     total_recv = num_blocks * jnp.sum(pieces)
     head = group_start.at[2].set(total_recv.astype(jnp.int32))
     base = head.shape[0]
     stride = num_slots * ep_size
-    meta = jnp.concatenate([head, run_len.reshape(-1), run_rank.reshape(-1)]).astype(jnp.int32)
+    meta = jnp.concatenate([head, run_len.reshape(-1), run_rank.reshape(-1)]).astype(
+        jnp.int32
+    )
     return meta, base, stride
 
 
@@ -2479,7 +2493,8 @@ def gmm_v2_fused_rs(
         pack_indices=pack_indices,
         defer_writes=expert_tp or tpu_envs.SGLANG_TPU_FUSED_RS_EP_DEFER_WRITES.get(),
         # pair exchange writes every receive row exactly once
-        skip_out_zero=(skip_out_zero and expert_tp and not fp8_direct_write) or pair_exchange,
+        skip_out_zero=(skip_out_zero and expert_tp and not fp8_direct_write)
+        or pair_exchange,
         row_loop_unroll=row_loop_unroll,
         staging_slots=staging_slots,
         pair_exchange=pair_exchange,
@@ -2538,8 +2553,13 @@ def gmm_v2_fused_rs(
 
         def kernel_fn(*refs, _base=kernel_fn):
             *base, ring, pair_sum, pair_recv, credit = refs
-            _base(*base, pair_ring_ref=ring, pair_sum_ref=pair_sum,
-                  pair_recv_sem_ref=pair_recv, pair_credit_ref=credit)
+            _base(
+                *base,
+                pair_ring_ref=ring,
+                pair_sum_ref=pair_sum,
+                pair_recv_sem_ref=pair_recv,
+                pair_credit_ref=credit,
+            )
 
     result = pl.pallas_call(
         kernel_fn,

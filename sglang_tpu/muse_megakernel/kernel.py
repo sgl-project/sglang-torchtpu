@@ -3330,7 +3330,15 @@ def _kv_write_sal_pipelined_call(cfg: MKConfig):
                     ent = jnp.minimum(
                         j * cfg.pages_per_seq + pg_no, cfg.n_pages_entries - 1
                     )
-                    out.append((2 * j + side, j, pg_no, active, _page(tab, ent, cfg.packed_pages)))
+                    out.append(
+                        (
+                            2 * j + side,
+                            j,
+                            pg_no,
+                            active,
+                            _page(tab, ent, cfg.packed_pages),
+                        )
+                    )
             return out
 
         def write(l, s, page):

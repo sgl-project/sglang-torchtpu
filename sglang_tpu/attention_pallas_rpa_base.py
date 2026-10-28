@@ -1167,7 +1167,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             seq_order = order.seq_order
             query_lens = tuple(query_lens[i] for i in seq_order.tolist())
             kv_lens = kv_lens.index_select(
-                0, self._value_metadata(name="seq_order", value=seq_order, device=device)
+                0,
+                self._value_metadata(name="seq_order", value=seq_order, device=device),
             )
             row_perm = self._value_metadata(
                 name="row_perm", value=order.row_perm, device=device

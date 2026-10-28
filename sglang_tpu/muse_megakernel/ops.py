@@ -307,7 +307,13 @@ class MuseMegakernel(torch.nn.Module):
             gate_cols = attn.gate_proj.weight.shape[0]
             plan = (
                 (attn.qkv_proj, self.w_wqkvg, 0, qkv_cols, "wqkvg_s"),
-                (attn.gate_proj, self.w_wqkvg, qkv_cols, qkv_cols + gate_cols, "wqkvg_s"),
+                (
+                    attn.gate_proj,
+                    self.w_wqkvg,
+                    qkv_cols,
+                    qkv_cols + gate_cols,
+                    "wqkvg_s",
+                ),
                 (attn.o_proj, self.w_wo, 0, attn.o_proj.weight.shape[0], "wo_s"),
                 (
                     moe.pre_expert_proj,
@@ -421,7 +427,8 @@ class MuseMegakernel(torch.nn.Module):
             kv_packed=self.kv_packed and not kv_sal,
             kv_sal=kv_sal,
             kv_sal_fp8=kv_sal_fp8,
-            kv_write_pipelined=kv_sal and tpu_envs.SGLANG_TPU_MUSE_MK_KV_WRITE_PIPELINED.get(),
+            kv_write_pipelined=kv_sal
+            and tpu_envs.SGLANG_TPU_MUSE_MK_KV_WRITE_PIPELINED.get(),
             sal_fp8_dot=tpu_envs.SGLANG_TPU_MK_SAL_FP8_DOT.get() if kv_sal_fp8 else 0,
             scale_fp8=self.scale_fp8,
             # measured a loss at 32 rows, where the expert loop is compute-bound
