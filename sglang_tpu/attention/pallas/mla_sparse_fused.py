@@ -40,8 +40,8 @@ from sglang_tpu.attention.pallas.mla_sparse_qblock import (
     MIN_QUERY_BLOCK,
     QUERY_BLOCK,
     sparse_mla_prefill_qblock,
-    vmem_bytes,
     vmem_limit_bytes,
+    vmem_required_by_sparse_mla,
 )
 
 # Query tokens per sparse-attention gather chunk under the q-block opt-in. The
@@ -61,7 +61,8 @@ QBLOCK_MIN_TOKENS = 512
 QBLOCK_MAX_PAGES_PER_SEQ = 128
 # Query blocks the query-blocked kernel may take, largest first: its default
 # and its smallest. Its VMEM grows with num_heads * query_block, so the op
-# takes the largest whose estimate (mla_sparse_qblock.vmem_bytes) fits.
+# takes the largest whose VMEM estimate fits
+# (mla_sparse_qblock.vmem_required_by_sparse_mla).
 QBLOCK_QUERY_BLOCKS = (QUERY_BLOCK, MIN_QUERY_BLOCK)
 
 # The sparse kernels only support these two sizes.
@@ -84,7 +85,7 @@ def qblock_query_block(
         (
             qb
             for qb in QBLOCK_QUERY_BLOCKS
-            if vmem_bytes(
+            if vmem_required_by_sparse_mla(
                 num_heads,
                 qb,
                 q_width=q_width,

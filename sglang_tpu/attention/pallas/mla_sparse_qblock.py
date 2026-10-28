@@ -74,7 +74,7 @@ def _align(x: int, m: int) -> int:
     return _cdiv(x, m) * m
 
 
-def vmem_bytes(
+def vmem_required_by_sparse_mla(
     num_heads: int,
     query_block: int,
     *,

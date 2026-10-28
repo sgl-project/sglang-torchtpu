@@ -193,7 +193,8 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
         heads = max(
             h
             for h in range(1, 129)
-            if mq.vmem_bytes(h, mq.QUERY_BLOCK, **shape) <= mq.vmem_limit_bytes()
+            if mq.vmem_required_by_sparse_mla(h, mq.QUERY_BLOCK, **shape)
+            <= mq.vmem_limit_bytes()
         )
         pps, seqs, tokens = shape["pages_per_seq"], 4, 1024
         sd = jax.ShapeDtypeStruct
