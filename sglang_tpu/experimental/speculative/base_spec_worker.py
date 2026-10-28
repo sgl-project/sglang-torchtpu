@@ -886,9 +886,15 @@ class TpuSpecWorker(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         bucket: BucketState,
-        rows: VerifyRows,
         verify_input: TpuSpecVerifyInput,
     ) -> tuple[CommitResult, LogitsProcessorOutput, AcceptResult]:
+        # Algorithms that only need these rows after drafting can fuse their preparation.
+        rows = select_verify_rows(
+            verify_input.verify_cache_candidates,
+            verify_input.committed_lens,
+            bucket.state.seq_lens,
+            self.num_verify_rows,
+        )
         draft_result = self.draft(batch, bucket, rows, verify_input)
         logits_output, accept = self.verify(
             batch, bucket, rows, draft_result, verify_input
@@ -964,15 +970,7 @@ class TpuSpecWorker(BaseSpecWorker):
             batch, self.num_verify_rows, padded_bs
         )
         bucket = self._bucket_state(batch, padded_bs, verify_input)
-        # req_to_token is host-resident on TPU; the host gathered the candidate
-        # slot window, so the block is picked on device without a D2H sync.
-        rows = select_verify_rows(
-            verify_input.verify_cache_candidates,
-            verify_input.committed_lens,
-            bucket.state.seq_lens,
-            self.num_verify_rows,
-        )
-        committed, logits_output, accept = self.step(batch, bucket, rows, verify_input)
+        committed, logits_output, accept = self.step(batch, bucket, verify_input)
         next_state = committed.state
         # The scheduler stores this key as the next spec_info.future_indices.
         self._bucket = bucket._replace(key=batch.req_pool_indices, state=next_state)
