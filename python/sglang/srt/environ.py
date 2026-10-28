@@ -1407,6 +1407,11 @@ class Envs:
     # materializing the full-vocab log-softmax. Escape hatch only; the two
     # paths are mathematically identical.
     SGLANG_ENABLE_FAST_INPUT_LOGPROBS = EnvBool(True)
+    # Keep the repetition-penalty state at a power-of-two row count, so its
+    # [rows, vocab] filter and merge gathers have one shape per row-bucket pair
+    # instead of one per exact (old, new) batch-size pair. Helps backends that
+    # compile per input shape. Live rows keep their exact values.
+    SGLANG_BUCKETED_PENALTY_ROWS = EnvBool(False)
 
     # ===================================================================
     # Deterministic inference and all-reduce
