@@ -95,6 +95,48 @@ def _state(rows):
 
 
 class TestExperimentalSpecHooks(CustomTestCase):
+    def test_step_selects_rows_before_drafting_and_commits_after_verification(self):
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker.num_verify_rows = 8
+        worker._target_has_linear_attn = True
+        batch, rows, drafts, logits, accept, committed = [object() for _ in range(6)]
+        bucket = SimpleNamespace(state=SimpleNamespace(seq_lens=object()))
+        addressing = SimpleNamespace(
+            verify_cache_candidates=object(), committed_lens=object()
+        )
+        calls = MagicMock()
+        calls.select.return_value = rows
+        calls.draft.return_value = drafts
+        calls.verify.return_value = logits, accept
+        calls.commit.return_value = committed
+        with (
+            patch.object(base_spec_worker, "select_verify_rows", calls.select),
+            patch.object(worker, "draft", calls.draft),
+            patch.object(worker, "verify", calls.verify),
+            patch.object(worker, "_commit_linear_attn_states", calls.linear),
+            patch.object(worker, "commit", calls.commit),
+        ):
+            result = worker.step(batch, bucket, addressing)
+        self.assertEqual(result, (committed, logits, accept))
+        self.assertEqual(
+            [entry[0] for entry in calls.mock_calls],
+            ["select", "draft", "verify", "linear", "commit"],
+        )
+        calls.select.assert_called_once_with(
+            addressing.verify_cache_candidates,
+            addressing.committed_lens,
+            bucket.state.seq_lens,
+            8,
+        )
+        calls.draft.assert_called_once_with(batch, bucket, rows, addressing)
+        calls.verify.assert_called_once_with(batch, bucket, rows, drafts, addressing)
+        calls.linear.assert_called_once_with(
+            batch=batch, accept=accept, verify_input=addressing
+        )
+        calls.commit.assert_called_once_with(
+            batch, bucket.state, rows, addressing, logits, accept
+        )
+
     def test_verify_passes_current_draft_metadata_to_target(self):
         worker = object.__new__(TpuBlockSpecWorker)
         worker.num_verify_rows = 2
