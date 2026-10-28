@@ -9,6 +9,7 @@ from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalSta
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu import mm_schedule_tpu
 from sglang_tpu.mm_embedding import (
+    EmbeddingSpan,
     PaddedEmbedding,
     TpuEmbeddingResult,
 )
@@ -53,6 +54,46 @@ def test_padded_cache_charges_full_buffer_and_evicts_by_physical_size():
     assert cache.get_single(1) is None
     assert cache.current_size == 128
     cache.free(2, None)
+    assert cache.current_size == 0
+
+
+def test_padded_cache_charges_a_shared_buffer_once():
+    # Encoder DP returns every item of a round as a span of one gathered buffer.
+    buffer = torch.zeros(112 * 4, 4)
+    items = [PaddedEmbedding((EmbeddingSpan(buffer, 4 * i, 4),)) for i in range(112)]
+    nbytes = buffer.untyped_storage().nbytes()
+    cache = MultiModalStaticCache(nbytes)
+    for i, item in enumerate(items):
+        assert cache.set(i, TpuEmbeddingResult(embedding=item))
+    assert len(cache) == 112
+    assert cache.current_size == nbytes
+
+    # The buffer stays charged until its last entry goes.
+    for i in range(111):
+        cache.free(i, None)
+    assert cache.current_size == nbytes
+    cache.free(111, None)
+    assert cache.current_size == 0
+
+
+def test_padded_cache_evicting_one_sharer_keeps_the_buffer_charged():
+    shared = torch.zeros(8, 4)
+    other = torch.zeros(8, 4)
+    nbytes = shared.untyped_storage().nbytes()
+    cache = MultiModalStaticCache(nbytes)
+    assert cache.set(
+        1, TpuEmbeddingResult(embedding=PaddedEmbedding((EmbeddingSpan(shared, 0, 4),)))
+    )
+    assert cache.set(
+        2, TpuEmbeddingResult(embedding=PaddedEmbedding((EmbeddingSpan(shared, 4, 4),)))
+    )
+    # A new buffer needs room: both sharers go before the shared bytes are released.
+    assert cache.set(
+        3, TpuEmbeddingResult(embedding=PaddedEmbedding.from_buffer(other, 8))
+    )
+    assert cache.get_single(1) is None and cache.get_single(2) is None
+    assert cache.current_size == nbytes
+    cache.clear()
     assert cache.current_size == 0
 
 
