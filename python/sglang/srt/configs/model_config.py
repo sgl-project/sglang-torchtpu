@@ -563,6 +563,7 @@ class ModelConfig:
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
                 "InklingForConditionalGeneration",
+                "Inkling2ForConditionalGeneration",
                 "MuseSparkForConditionalGeneration",
             ]
             if (
@@ -1104,6 +1105,7 @@ class ModelConfig:
             "Gemma4ForConditionalGeneration",
             "InklingForConditionalGeneration",
             "InklingForConditionalGenerationMTP",
+            "Inkling2ForConditionalGeneration",
             "Gemma4UnifiedForConditionalGeneration",
             "DiffusionGemmaForBlockDiffusion",
         ]
@@ -1454,6 +1456,8 @@ class ModelConfig:
         # Use vision_vocab_size for lm_head, LogitsProcessor, and graph-mode logits buffers.
         if _hf_arch(self.hf_config) == "GlmImageForConditionalGeneration":
             self.vocab_size = self.hf_text_config.vision_vocab_size
+        if _hf_arch(self.hf_config) == "Inkling2ForConditionalGeneration":
+            self.vocab_size = self.hf_text_config.padded_vocab_size
 
     def _init_mla_scaling(self, rope_scaling: Optional[dict]) -> None:
         """Base MLA attention scale from the head dims, then the rope mscale."""
@@ -2513,6 +2517,7 @@ def is_hybrid_swa_model(
         "MuseGlimmerForConditionalGeneration",
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
+        "Inkling2ForConditionalGeneration",
         "UnlimitedOCRForCausalLM",
     }
     if any(arch in hybrid_swa_archs for arch in model_architectures):

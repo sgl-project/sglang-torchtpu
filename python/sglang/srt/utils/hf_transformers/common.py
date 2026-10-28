@@ -101,6 +101,8 @@ from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.utils import get_bool_env_var, logger, lru_cache_frozenset
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
+from sglang.tml.config import Inkling2MMConfig, Inkling2ModelConfig
+
 from ..hf_transformers_patches import normalize_rope_scaling_compat
 
 if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
@@ -184,6 +186,8 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         InklingAudioConfig,
         InklingVisionConfig,
         InklingMMConfig,
+        Inkling2MMConfig,
+        Inkling2ModelConfig,
         MiniMaxM3VLConfig,
         XllmConfig,
     ]
