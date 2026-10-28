@@ -191,7 +191,8 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
     Attributes:
       verify_cache_candidates: [pbs, 2 * capacity] device int64 KV slots of
         [base, base + 2 * capacity); active verify rows are picked without a D2H sync.
-      committed_lens: [pbs] device int64 committed base.
+        None when the algorithm does not need token-slot addressing.
+      committed_lens: [pbs] device int64 committed base, or None with no token slots.
       req_pool_indices: [pbs] device pool rows. 0 (reserved) marks padded rows
         in all three device fields.
       req_pool_indices_cpu: [pbs] host pool rows for host-built metadata.
@@ -201,8 +202,8 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
         first overlap relay.
     """
 
-    verify_cache_candidates: torch.Tensor
-    committed_lens: torch.Tensor
+    verify_cache_candidates: torch.Tensor | None
+    committed_lens: torch.Tensor | None
     req_pool_indices: torch.Tensor
     req_pool_indices_cpu: torch.Tensor
     seq_lens_cpu: torch.Tensor
@@ -222,12 +223,16 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
         candidates = draft_input.tpu_verify_cache_candidates
         committed_lens = draft_input.tpu_committed_lens
         req_pool_indices = draft_input.tpu_req_pool_indices
-        if candidates is None or committed_lens is None or req_pool_indices is None:
+        if (
+            (draft_input.needs_verify_cache_locs and candidates is None)
+            or committed_lens is None
+            or req_pool_indices is None
+        ):
             raise NotImplementedError(
                 "TpuSpecWorker needs the verify window (overlap schedule, "
                 "host-resident req_to_token, no grammar/logprob/LoRA)."
             )
-        verify_window_rows = candidates.shape[1] // 2
+        verify_window_rows = draft_input.tpu_verify_window_rows
         if not 0 < num_verify_rows <= verify_window_rows:
             raise ValueError("Active verification width exceeds the reserved KV window")
         req_pool_indices_cpu = batch.req_pool_indices_cpu
@@ -247,8 +252,16 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
         # The plan stays on host until the forward fixes its bucket;
         # 0 is the reserved row and slot.
         return cls(
-            verify_cache_candidates=padded_h2d(candidates, padded_bs, batch.device),
-            committed_lens=padded_h2d(committed_lens, padded_bs, batch.device),
+            verify_cache_candidates=(
+                padded_h2d(candidates, padded_bs, batch.device)
+                if draft_input.needs_verify_cache_locs
+                else None
+            ),
+            committed_lens=(
+                padded_h2d(committed_lens, padded_bs, batch.device)
+                if draft_input.needs_verify_cache_locs
+                else None
+            ),
             # The scheduler already owns device pool rows. Only padding needs
             # another upload; exact buckets can reuse them across decode steps.
             req_pool_indices=(

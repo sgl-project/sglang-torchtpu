@@ -24,7 +24,7 @@ from sglang.test.test_utils import CustomTestCase, enter_scope
 from sglang_tpu.envs import envs
 from sglang_tpu.experimental import register_host_batch_padder, uses_host_batch
 from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
-from sglang_tpu.experimental.speculative import base_spec_worker, draft_info
+from sglang_tpu.experimental.speculative import base_spec_worker, draft_info, spec_types
 from sglang_tpu.experimental.speculative.block_info import (
     HostPaddedBlockDraftInput,
 )
@@ -1470,6 +1470,36 @@ class TestExperimentalSpecHooks(CustomTestCase):
                         self.assertIs(plan.req_pool_indices, batch.req_pool_indices)
             with self.assertRaisesRegex(ValueError, "reserved KV window"):
                 TpuSpecVerifyInput.from_batch(batch, num_verify_rows=4, padded_bs=4)
+
+            # Page-addressed attention still reserves both windows and keeps
+            # the host slack, but has no token-slot gather or device addressing.
+            with (
+                patch.object(
+                    HostPaddedBlockDraftInput, "needs_verify_cache_locs", False
+                ),
+                patch.object(
+                    draft_info,
+                    "gather_dflash_candidate_window",
+                    side_effect=AssertionError("unused token-slot gather"),
+                ),
+                patch.object(
+                    spec_types,
+                    "padded_h2d",
+                    side_effect=AssertionError("unused addressing upload"),
+                ),
+            ):
+                draft.prepare_for_decode(batch)
+                plan = TpuSpecVerifyInput.from_batch(
+                    batch, num_verify_rows=2, padded_bs=2
+                )
+                self.assertIsNone(plan.verify_cache_candidates)
+                self.assertIsNone(plan.committed_lens)
+                self.assertIs(plan.req_pool_indices, batch.req_pool_indices)
+                self.assertEqual(plan.host_len_slack, num_draft_tokens)
+                self.assertEqual(plan.seq_lens_cpu.tolist(), [5, 10])
+                self.assertEqual([r.kv.kv_allocated_len for r in reqs], [12, 20])
+                self.assertTrue(draft.tpu_host_seq_lens_is_committed)
+                self.assertEqual(len(allocations), 1)
 
             # Request validation and KV planning use the selected worker's
             # capability, including an input constructed outside the worker.
