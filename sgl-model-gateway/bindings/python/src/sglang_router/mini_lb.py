@@ -4,16 +4,16 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 
 import asyncio
 import contextlib
+import functools
 import ipaddress
 import logging
 import math
-import os
 import random
 import urllib
 import warnings
 from http import HTTPStatus
 from itertools import chain
-from typing import FrozenSet, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import aiohttp
 import orjson
@@ -40,11 +40,13 @@ AIOHTTP_STREAM_READ_CHUNK_SIZE = (
 # wait a little longer so the server's own answer arrives.
 HEALTH_CHECK_TIMEOUT_SECS = 30
 
-# Seconds between the background /health_generate probes that decide which
-# backends receive traffic. A value <= 0 disables the probes, so MiniLB routes
-# to every registered backend.
-HEALTH_POLL_INTERVAL_ENV = "SGLANG_MINI_LB_HEALTH_POLL_INTERVAL_SECS"
-DEFAULT_HEALTH_POLL_INTERVAL_SECS = 10.0
+# The background health probe that decides which backends receive traffic
+# always GETs this path with HEALTH_CHECK_TIMEOUT_SECS. It ignores
+# --health-check-endpoint and --health-check-timeout-secs: their defaults
+# (/health, 5 s) suit the Rust gateway, but on a TPU engine /health can skip
+# the generation (SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0) and a 5 s timeout
+# would mark a server unhealthy before its own 20 s check answers.
+HEALTH_PROBE_PATH = "/health_generate"
 
 
 def maybe_wrap_ipv6_address(address: str) -> str:
@@ -59,18 +61,40 @@ class _UpstreamConnectionError(aiohttp.ClientConnectionError):
     """A connection failure recorded in the affinity load table."""
 
 
-def _health_poll_interval_secs() -> float:
-    raw = os.environ.get(HEALTH_POLL_INTERVAL_ENV)
-    if raw is None:
-        return DEFAULT_HEALTH_POLL_INTERVAL_SECS
-    error = ValueError(f"{HEALTH_POLL_INTERVAL_ENV} must be a number, got {raw!r}")
-    try:
-        interval = float(raw)
-    except ValueError:
-        raise error from None
-    if math.isnan(interval):
-        raise error
+def _health_poll_interval_secs(router_args: RouterArgs) -> Optional[float]:
+    """Seconds between health probes, or None for --disable-health-check."""
+    if router_args.disable_health_check:
+        return None
+    interval = router_args.health_check_interval_secs
+    if not (math.isfinite(interval) and interval > 0):
+        raise ValueError(
+            "--health-check-interval-secs must be a finite number > 0, "
+            f"got {interval!r} (use --disable-health-check to turn probes off)"
+        )
     return interval
+
+
+class _BackendHealth:
+    """Which backends failed their last health probe.
+
+    A backend that has not been probed since it was last (re)registered counts
+    as healthy.
+    """
+
+    def __init__(self):
+        self.unhealthy: Set[str] = set()
+        # Roles routing past unhealthy backends because none is healthy.
+        self.roles_failing_open: Set[str] = set()
+        # Bumped when a backend is (re)registered or removed, so a probe that
+        # started before that change can tell its result is stale.
+        self._epochs: Dict[str, int] = {}
+
+    def epoch(self, url: str) -> int:
+        return self._epochs.get(url, 0)
+
+    def forget(self, url: str) -> None:
+        self.unhealthy.discard(url)
+        self._epochs[url] = self.epoch(url) + 1
 
 
 async def _probe_status(
@@ -92,16 +116,6 @@ class MiniLoadBalancer:
     Routing skips backends whose last /health_generate probe failed. A backend
     that has not been probed yet counts as healthy.
     """
-
-    # Health state is replaced, never mutated, so these immutable class-level
-    # defaults are safe and also cover instances built without __init__.
-    # Backends whose last /health_generate probe failed.
-    _unhealthy: FrozenSet[str] = frozenset()
-    # Backends (re)registered while a probe was in flight; its result for them
-    # is stale and dropped.
-    _reregistered_during_probe: FrozenSet[str] = frozenset()
-    # Roles routing to all backends because none of them is healthy.
-    _roles_failing_open: FrozenSet[str] = frozenset()
 
     def __init__(
         self,
@@ -133,7 +147,13 @@ class MiniLoadBalancer:
             if self.affinity_policy is not None
             else None
         )
-        self.health_poll_interval_secs = _health_poll_interval_secs()
+        self.health_poll_interval_secs = _health_poll_interval_secs(router_args)
+
+    @functools.cached_property
+    def _health(self) -> _BackendHealth:
+        # Created on first use, which also covers instances built without
+        # __init__.
+        return _BackendHealth()
 
     def _client_timeout(self) -> aiohttp.ClientTimeout:
         affinity = self.affinity_policy is not None
@@ -214,72 +234,105 @@ class MiniLoadBalancer:
         )
 
     def start_health_polling(self) -> Optional[asyncio.Task]:
-        """Probe backend health in the background unless the interval is <= 0."""
-        if self.health_poll_interval_secs <= 0:
+        """Probe backend health in the background unless it is disabled."""
+        if self.health_poll_interval_secs is None:
             return None
         return asyncio.create_task(self._poll_health())
 
+    def _registered_urls(self) -> List[str]:
+        return list(dict.fromkeys(chain(self.prefill_urls, self.decode_urls)))
+
     async def _poll_health(self) -> None:
-        while True:
+        """Probe each backend every interval, like LoadPoller: a backend whose
+        probe is still in flight is skipped, so one hung backend does not delay
+        the others."""
+        probes: Dict[str, asyncio.Task] = {}
+        timeout = aiohttp.ClientTimeout(total=HEALTH_CHECK_TIMEOUT_SECS)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
-                await self.probe_backend_health()
-            except Exception:
-                logger.exception("[MiniLB] backend health probe failed")
-            await asyncio.sleep(self.health_poll_interval_secs)
+                while True:
+                    probes = {
+                        url: probe for url, probe in probes.items() if not probe.done()
+                    }
+                    for url in self._registered_urls():
+                        if url not in probes:
+                            probes[url] = asyncio.create_task(
+                                self._probe_health(session, url)
+                            )
+                    await asyncio.sleep(self.health_poll_interval_secs)
+            finally:
+                for probe in probes.values():
+                    probe.cancel()
+                await asyncio.gather(*probes.values(), return_exceptions=True)
 
     async def probe_backend_health(self) -> None:
-        """GET /health_generate on every registered backend once and route only
-        to those that answer 200.
+        """Probe every registered backend once; each verdict applies as soon as
+        that backend answers.
 
         Run one probe at a time: the background poller is the only caller.
         """
-        self._reregistered_during_probe = frozenset()
-        urls = list(dict.fromkeys(chain(self.prefill_urls, self.decode_urls)))
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=HEALTH_CHECK_TIMEOUT_SECS)
-        ) as session:
-            results = await asyncio.gather(
-                *(_probe_status(session, url, "/health_generate") for url in urls)
+        timeout = aiohttp.ClientTimeout(total=HEALTH_CHECK_TIMEOUT_SECS)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            await asyncio.gather(
+                *(self._probe_health(session, url) for url in self._registered_urls())
             )
-        registered = set(chain(self.prefill_urls, self.decode_urls))
-        failed = {
-            url: status if error is None else error
-            for url, (status, error) in zip(urls, results)
-            if status != 200
-            and url in registered
-            and url not in self._reregistered_during_probe
-        }
-        for url in failed.keys() - self._unhealthy:
+
+    async def _probe_health(self, session: aiohttp.ClientSession, url: str) -> None:
+        """GET HEALTH_PROBE_PATH on `url` and route to it only if it answers 200."""
+        health = self._health
+        epoch = health.epoch(url)
+        try:
+            status, error = await _probe_status(session, url, HEALTH_PROBE_PATH)
+        except Exception:
+            logger.exception("[MiniLB] health probe of %s failed", url)
+            return
+        if health.epoch(url) != epoch:
+            # Removed or re-registered while the probe was in flight.
+            return
+        if status == 200:
+            if url in health.unhealthy:
+                logger.info("[MiniLB] backend %s is healthy again", url)
+                health.unhealthy.discard(url)
+        elif url not in health.unhealthy:
             logger.warning(
-                "[MiniLB] backend %s failed /health_generate (%s), skipping it",
+                "[MiniLB] backend %s failed %s (%s), skipping it",
                 url,
-                failed[url],
+                HEALTH_PROBE_PATH,
+                status if error is None else error,
             )
-        for url in (self._unhealthy & registered) - failed.keys():
-            logger.info("[MiniLB] backend %s is healthy again", url)
-        self._unhealthy = frozenset(failed)
+            health.unhealthy.add(url)
 
     def _routable(self, role: str, urls: List[str]) -> List[str]:
-        """Healthy `urls` of `role`, or all of them when none is healthy."""
-        healthy = [url for url in urls if url not in self._unhealthy]
-        if healthy or not urls:
-            if role in self._roles_failing_open:
+        """Candidates of `role` for select_pair: healthy and reachable backends,
+        else the reachable ones, else all of them.
+
+        Reachability comes from the session affinity load table. The policy
+        fails open on it too, so passing it only healthy backends would let
+        it fall back to an unreachable subset instead of a reachable one.
+        """
+        if not urls:
+            return []
+        loads = self.affinity_policy.loads if self.affinity_policy else None
+        reachable = [url for url in urls if loads is None or loads.is_reachable(url)]
+        healthy = [url for url in reachable if url not in self._health.unhealthy]
+        failing_open = self._health.roles_failing_open
+        if healthy:
+            if role in failing_open:
                 logger.info("[MiniLB] %s has a healthy backend again", role)
-                self._roles_failing_open -= {role}
+                failing_open.discard(role)
             return healthy
-        if role not in self._roles_failing_open:
+        if role not in failing_open:
             logger.warning(
                 "[MiniLB] no healthy %s backend, routing to all %d of them",
                 role,
-                len(urls),
+                len(reachable or urls),
             )
-            self._roles_failing_open |= {role}
-        return list(urls)
+            failing_open.add(role)
+        return reachable or list(urls)
 
     def _forget_health(self, worker_url) -> None:
         """Treat `worker_url` as not probed yet."""
-        self._unhealthy -= {worker_url}
-        self._reregistered_during_probe |= {worker_url}
+        self._health.forget(worker_url)
 
     async def _ensure_dp_sizes(self):
         if self.prefill_dp_size is not None:
