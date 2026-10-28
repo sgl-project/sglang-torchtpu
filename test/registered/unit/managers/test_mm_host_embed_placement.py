@@ -9,6 +9,7 @@ rediscover the row mapping. These tests pin the equivalence that swap relies on.
 """
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -41,6 +42,22 @@ def _random_mask(num_set: int) -> torch.Tensor:
     mask = torch.zeros(ROWS, 1, dtype=torch.bool)
     mask[torch.randperm(ROWS)[:num_set]] = True
     return mask
+
+
+class _DeviceRows:
+    """Encoder rows that live on an accelerator: usable only after a host copy."""
+
+    device = SimpleNamespace(type="tpu")
+
+    def __init__(self, rows: torch.Tensor):
+        self._rows = rows
+        self.shape = rows.shape
+
+    def cpu(self) -> torch.Tensor:
+        return self._rows
+
+    def to(self, *args, **kwargs):
+        raise AssertionError("device rows were written to the host buffer")
 
 
 def _embed_only(**kwargs) -> torch.Tensor:
@@ -82,6 +99,26 @@ class TestHostEmbedPlacement(CustomTestCase):
                         got, _tpu_masked_scatter(dest, mask.expand_as(dest), src)
                     )
                 )
+
+    def test_device_encoder_output_is_placed_through_a_host_copy(self):
+        """Bug regression (#741): an encoder that returned its rows on the device
+        had them written straight into the host buffer instead of copied first."""
+        dest = torch.randn(ROWS, HIDDEN)
+        mask = _random_mask(5)
+        src = torch.randn(5, HIDDEN)
+
+        got = _embed_only(
+            input_embeds=dest,
+            modalities=[Modality.IMAGE],
+            embeddings=[_DeviceRows(src)],
+            masks=[mask],
+            deepstack_embeddings=[None],
+            use_deepstack={},
+        )
+
+        expected = dest.clone()
+        expected.masked_scatter_(mask.expand_as(expected), src)
+        self.assertTrue(torch.equal(got, expected))
 
     def test_modalities_merge_into_one_transfer(self):
         """Two modalities collapse to one matrix and one union mask.
