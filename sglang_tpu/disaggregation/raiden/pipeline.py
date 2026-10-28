@@ -428,6 +428,8 @@ class PipelineTransfer:
         # Producer: a room's early parts, and this stage's closing part.
         self.early: dict[int, dict] = {}
         self.stage: dict[int, dict] = {}
+        # A failed early part does not settle the closing transfer or its twin.
+        self.closing_settled: set[int] = set()
         self.fence_executor = (
             concurrent.futures.ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="raiden-stage-fence"
@@ -1597,7 +1599,7 @@ class PipelineTransfer:
                 parts = self.early.get(room, {}).get("parts", [])
                 entry = self.stage.get(room)
                 return (
-                    (room in self.sent and room not in self.done_send | self.failed)
+                    (room in self.sent and room not in self.retired)
                     or any(part["registered"] and not part["done"] for part in parts)
                     or (entry is not None and entry["registered"] and not entry["done"])
                 )
@@ -1752,7 +1754,9 @@ class PipelineTransfer:
                 for room, request in self.receives.items():
                     self._poll_receive(room, request)
             sent_rooms = {
-                str(room) for room in self.done_send if self._early_settled(room)
+                str(room)
+                for room in self.done_send
+                if room in self.retired and self._early_settled(room)
             }
             received_rooms = {
                 str(room)
@@ -1772,6 +1776,8 @@ class PipelineTransfer:
                 room, key = parse_req_id(mgr._norm_req_id(t.req_id))
                 if key is None:
                     done.add(room)
+                    if self.producer:
+                        self.closing_settled.add(room)
                     if room in self.receives:
                         self.receives[room].armed_until = 0.0
                 elif isinstance(key, tuple):
@@ -1782,6 +1788,8 @@ class PipelineTransfer:
             room, key = parse_req_id(mgr._norm_req_id(t.req_id))
             self.failed.add(room)
             if key is None:
+                if self.producer:
+                    self.closing_settled.add(room)
                 if room in self.receives:
                     self.receives[room].armed_until = 0.0
             elif isinstance(key, tuple):
@@ -1798,10 +1806,8 @@ class PipelineTransfer:
             if entry["done"] and entry["aux"] is not None:
                 self.done_send.add(room)
         for room in (self.done_send | self.failed) - self.retired:
-            if room in self.sent:
-                self.client.complete_request_blocks(str(room), room, self.unit)
-                pp_swa.complete_twin(self, str(room))
-            self.retired.add(room)
+            if self._complete_room(room):
+                self.retired.add(room)
         for room, item in self.sent.items():
             self._try_release(room)
             if room in self.done_send | self.failed:
@@ -1815,6 +1821,29 @@ class PipelineTransfer:
                     else:
                         self.failed.add(room)
                     self.retired.add(room)
+
+    def _complete_room(self, room: int) -> bool:
+        """Retire the closing registration once it cannot read any more KV.
+
+        Early close can register before decode claims the pages. Failure of
+        another part cancels an unclaimed closing pair; a claimed pair must
+        settle natively before either pool can be released.
+        """
+        item = self.sent.get(room)
+        if item is None or not item["registered"]:
+            return True
+        if room in self.failed and room not in self.closing_settled:
+            return pp_swa.cancel_unclaimed(
+                self, str(room), room, registered=item["registered"]
+            )
+        try:
+            self.client.complete_request_blocks(str(room), room, self.unit)
+            pp_swa.complete_twin(self, str(room))
+        except RuntimeError as error:
+            if _EARLY_COMPLETION not in str(error):
+                raise
+            return False
+        return True
 
     def _poll_receive(self, room, request) -> None:
         mgr = self.manager
@@ -1897,6 +1926,7 @@ class PipelineTransfer:
         if request is not None:
             self._release_all_admission(room, request)
         self.done_send.discard(room)
+        self.closing_settled.discard(room)
         self.done_recv.discard(room)
         self.failed.discard(room)
         self.retired.discard(room)

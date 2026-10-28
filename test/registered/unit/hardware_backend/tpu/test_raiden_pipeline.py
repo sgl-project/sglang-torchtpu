@@ -28,6 +28,7 @@ from sglang_tpu.disaggregation.raiden.pipeline import (
     legacy_mirror_slots,
     legacy_slot_host_bytes,
     materialized_storage_layout,
+    part_req_id,
     pool_manifest,
     warn_if_staging_exceeds_premapped,
 )
@@ -931,6 +932,67 @@ class TestPipelineLifetimes(unittest.TestCase):
         pipe._send.assert_called_once_with(
             "tcp://prefill:30002", [MessageTag.PIPELINE_RELEASE, b"7", b"1"]
         )
+
+    def test_failed_early_part_cancels_unclaimed_closing_registration(self):
+        pipe = transfer(producer=True)
+        pipe.sent[7] = sent()
+        pipe.client.complete_request_blocks.side_effect = RuntimeError(
+            "Only an empty producer registration may complete before the request block snapshot is claimed"
+        )
+        pipe.client.cancel_request_blocks_if_unclaimed.return_value = True
+        pipe.engine.poll_stats_with_details.return_value = _polled(
+            failed=[part_req_id(7, 0)]
+        )
+        _, _, failed = pipe.poll()
+        self.assertIn("7", failed)
+        self.assertIn(7, pipe.retired)
+        self.assertFalse(pipe.active(7))
+        pipe.client.cancel_request_blocks_if_unclaimed.assert_called_once_with("7", 7)
+        pipe.client.complete_request_blocks.assert_not_called()
+
+    def test_failed_early_part_keeps_claimed_closing_pages_until_settled(self):
+        for outcome in ("sent", "failed"):
+            with self.subTest(outcome=outcome):
+                pipe = transfer(producer=True)
+                pipe.sent[7] = sent()
+                pipe.client.cancel_request_blocks_if_unclaimed.return_value = False
+                pipe.engine.poll_stats_with_details.return_value = _polled(
+                    failed=[part_req_id(7, 0)]
+                )
+                pipe.poll()
+                self.assertTrue(pipe.active(7))
+                self.assertNotIn(7, pipe.retired)
+                pipe.client.complete_request_blocks.assert_not_called()
+                pipe.clear(7)
+                self.assertIn(7, pipe.sent)
+                pipe.engine.poll_stats_with_details.return_value = _polled(
+                    **{outcome: ["7"]}
+                )
+                pipe.poll()
+                self.assertFalse(pipe.active(7))
+                self.assertNotIn(7, pipe.sent)
+                pipe.client.complete_request_blocks.assert_called_once_with(
+                    "7", 7, pipe.unit
+                )
+
+    def test_finished_room_retries_unclaimed_completion_but_raises_other_errors(self):
+        pipe = transfer(producer=True)
+        pipe.sent[7] = sent()
+        pipe.done_send.add(7)
+        pipe.client.complete_request_blocks.side_effect = RuntimeError(
+            "Only an empty producer registration may complete before the request block snapshot is claimed"
+        )
+        pipe.poll()
+        self.assertNotIn(7, pipe.retired)
+        self.assertTrue(pipe.active(7))
+        pipe.client.cancel_request_blocks_if_unclaimed.assert_not_called()
+        pipe.client.complete_request_blocks.side_effect = RuntimeError("unreachable")
+        with self.assertRaisesRegex(RuntimeError, "unreachable"):
+            pipe.poll()
+        pipe.client.complete_request_blocks.side_effect = None
+        pipe.poll()
+        self.assertIn(7, pipe.retired)
+        self.assertFalse(pipe.active(7))
 
 
 class TestPipelineInitialization(unittest.TestCase):

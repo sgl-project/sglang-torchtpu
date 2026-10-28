@@ -104,6 +104,8 @@ class Domain:
                 )
 
             def complete_request_blocks(self, req_id, uuid, unit):
+                if req_id in domain.registered and req_id not in domain.claimed:
+                    raise RuntimeError(pl._EARLY_COMPLETION)
                 domain.completed.append((req_id, unit.data_replica_idx))
 
             def cancel_request_blocks_if_unclaimed(self, req_id, uuid):
@@ -740,10 +742,49 @@ def test_abort_after_the_claim_keeps_pages_until_both_halves_settled(world):
     assert not s.active(ROOM)
 
 
+def test_failed_early_part_cancels_both_unclaimed_closing_halves(world):
+    w = world
+    ask(w)
+    s = w.stages[0]
+    s.close_early(ROOM, list(range(10, 13)), [6, 4])
+    s.engine.failed.append(pl.part_req_id(ROOM, 0))
+    poll(s)
+    assert w.fa.cancelled == [str(ROOM)]
+    assert w.swa.cancelled == [f"swa:{ROOM}"]
+    assert not w.fa.completed and not w.swa.completed
+    assert ROOM in s.retired and not s.active(ROOM)
+
+
+def test_failed_early_part_keeps_claimed_closing_halves_until_both_settle(world):
+    w = world
+    w.fa.auto_land = w.swa.auto_land = False
+    ask(w)
+    for s in w.stages:
+        s.close_early(ROOM, list(range(10, 13)), [6, 4])
+    w.pump()
+    assert w.decodes[0].maybe_start_pull(ROOM)
+    s = w.stages[0]
+    s.engine.failed.append(pl.part_req_id(ROOM, 0))
+    poll(s)
+    assert s.active(ROOM) and ROOM not in s.retired
+    assert not w.fa.completed and not w.swa.completed
+    s.clear(ROOM)
+    assert ROOM in s.sent
+    w.fa.land(str(ROOM))
+    poll(s)
+    assert s.active(ROOM)
+    w.swa.land(f"swa:{ROOM}", failed=True)
+    poll(s)
+    assert not s.active(ROOM) and ROOM not in s.sent
+    assert (str(ROOM), 0) in w.fa.completed
+    assert (f"swa:{ROOM}", 0) in w.swa.completed
+
+
 @pytest.mark.parametrize("stage_parts", [False, True])
-def test_abort_cancels_an_unclaimed_half_beside_a_claimed_one(stage_parts):
+@pytest.mark.parametrize("failure", ["abort", "early_part"])
+def test_failure_cancels_an_unclaimed_half_beside_a_claimed_one(stage_parts, failure):
     """The decode claimed the window half, but its full-attention coordination
-    failed before claiming. The stage's abort still cancels the full-attention
+    failed before claiming. A failure still cancels the full-attention
     registration, and the transfer settles as failed once the window push
     lands, instead of holding the stage's pages until the claim expires."""
     w = build_world(tp_size=1, stage_parts=stage_parts)
@@ -758,7 +799,10 @@ def test_abort_cancels_an_unclaimed_half_beside_a_claimed_one(stage_parts):
     w.decodes[0].maybe_start_pull(ROOM)
     req_id = pl.stage_req_id(ROOM, 0) if stage_parts else str(ROOM)
     s = w.stages[0]
-    s.manager._aborted[ROOM] = time.time()
+    if failure == "abort":
+        s.manager._aborted[ROOM] = time.time()
+    else:
+        s.engine.failed.append(pl.part_req_id(ROOM, 0))
     poll(s)
     assert req_id in w.fa.cancelled and f"swa:{req_id}" not in w.swa.cancelled
     assert s.active(ROOM)  # the window push still reads the stage's pages
