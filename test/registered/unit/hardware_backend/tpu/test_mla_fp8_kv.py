@@ -328,6 +328,7 @@ class TestSparseIndexerKvLens(CustomTestCase):
                 cu_q_lens="cu_q_lens",
                 distribution="distribution",
                 decode_query_size=1,
+                segments="all",
             ),
             token_to_kv_pool=SimpleNamespace(
                 get_index_key_cache=lambda layer_id: f"index{layer_id}",
@@ -373,6 +374,38 @@ class TestSparseIndexerKvLens(CustomTestCase):
         )
         args = backend._index_topk_op.call_args.args
         self.assertEqual(args[5:8], ("raw2", "index2", "draft"))
+
+    def test_kpool_query_bound_tracks_the_compiled_metadata_mode(self):
+        # Decode and uniform verify/draft extend take their static per-request
+        # width; ragged extend (width 1 outside DECODE) must keep the token
+        # bucket, or pools closed by long requests would be dropped.
+        for segments, width, tokens, bound in (
+            ("decode", 1, 32, 1),
+            ("all", 6, 192, 6),
+            ("all", 6, 4, 4),
+            ("mixed", 1, 8192, 8192),
+            ("all", 1, 64, 64),
+        ):
+            with self.subTest(segments=segments, width=width):
+                backend = self._backend()
+                backend.forward_metadata.segments = segments
+                backend.forward_metadata.decode_query_size = width
+                t = torch.zeros(tokens, 1, 128)
+                TpuPallasSparseMlaAttnBackend.index_topk_kpool(
+                    backend,
+                    forward_batch=_forward_batch(),
+                    layer_id=2,
+                    query=t,
+                    key=t,
+                    gate=t,
+                    head_weights=t,
+                    ape=t,
+                    weight_scale=1.0,
+                    kpool=4,
+                )
+                self.assertEqual(
+                    backend._index_topk_op.call_args.args[-2:], (width, bound)
+                )
 
 
 if __name__ == "__main__":

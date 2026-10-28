@@ -8,10 +8,6 @@ on the prefill engine. The decode engine leaves hierarchical caching disabled.
 Prefill rank 0 launches the prefill engine, waits for decode, starts the mini-LB,
 validates a device -> host -> device cache round trip with speculative decoding
 active, and then runs GSM8K through the same cluster.
-
-Fills the gap between the no-spec 2P+2D gate (pd-mh-gpt-120b) and the
-single-host P/D EAGLE3 gate (pd-sh-gpt-120b-spec): this is the only gate that
-exercises 2P+2D with spec, prefix caching, and KV offload together.
 """
 
 import argparse

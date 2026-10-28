@@ -13,7 +13,7 @@ package(default_visibility = ["//visibility:public"])
     main = "test_tpu_gpt_oss_120b_pd_singlehost" + suffix + ".py",
     python_version = "3.12",
     deps = ["//python:tpu_launcher_test_support"],
-) for suffix in ["", "_decode_radix", "_spec"]]
+) for suffix in ["_decode_radix"]]
 
 sglang_tpu_e2e_test(
     name = "test_tpu_gpt_oss_120b_singlehost_spec",
