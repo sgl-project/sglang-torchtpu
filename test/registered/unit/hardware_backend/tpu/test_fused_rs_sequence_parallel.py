@@ -108,6 +108,48 @@ class TestFusedRsSequenceParallel(CustomTestCase):
         )
         self.assertIsNone(prepared.dispatch_output.topk_output.router_logits)
 
+    def test_cp_gathers_use_only_the_pipeline_stage_group(self):
+        local = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
+        weights = torch.ones(2, 1)
+        ids = torch.zeros(2, 1, dtype=torch.int32)
+        group = SimpleNamespace(
+            world_size=4,
+            ranks=(8, 9, 10, 11),
+            all_gather=Mock(side_effect=lambda value, dim: torch.cat([value] * 4, dim)),
+        )
+        dispatch = StandardDispatchOutput(
+            hidden_states=local,
+            hidden_states_scale=None,
+            topk_output=StandardTopKOutput(weights, ids, torch.ones(2, 8)),
+        )
+        parallel = SimpleNamespace(
+            attn_cp_group=group,
+            attn_tp_group=SimpleNamespace(world_size=1),
+            tp_group=SimpleNamespace(ranks=group.ranks),
+        )
+        with (
+            use_fused_moe_sequence_parallel_plan(
+                FusedMoeSequenceParallelPlan(True, True, True, "attn_cp")
+            ),
+            patch(
+                "sglang_tpu.fused_rs_sequence_parallel.get_parallel",
+                return_value=parallel,
+            ),
+        ):
+            prepared = prepare_fused_moe_sequence_parallel_input(
+                SimpleNamespace(moe_ep_size=4), dispatch
+            )
+            self.assertEqual(prepared.output_token_count, 2)
+            self.assertTrue(
+                torch.equal(prepared.dispatch_output.hidden_states, local.repeat(4, 1))
+            )
+            self.assertEqual(group.all_gather.call_count, 3)
+            parallel.tp_group.ranks = (0, 1, 2, 3)
+            with self.assertRaisesRegex(RuntimeError, "same rank order"):
+                prepare_fused_moe_sequence_parallel_input(
+                    SimpleNamespace(moe_ep_size=4), dispatch
+                )
+
 
 class TestFusedRsModelContract(CustomTestCase):
     def test_prepares_model_owned_post_expert_norm(self):

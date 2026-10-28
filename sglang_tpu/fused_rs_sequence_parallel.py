@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import torch
 
@@ -19,6 +19,7 @@ __all__ = [
     "PreparedFusedMoeSequenceParallelInput",
     "get_tpu_fused_rs_post_expert_norm_weight",
     "get_fused_moe_sequence_parallel_plan",
+    "get_fused_moe_sequence_parallel_group",
     "has_tpu_fused_rs_post_expert_norm",
     "prepare_fused_moe_sequence_parallel_input",
     "prepare_tpu_fused_rs_post_expert_norm",
@@ -37,6 +38,7 @@ class FusedMoeSequenceParallelPlan(NamedTuple):
     gather_hidden_states: bool
     gather_topk: bool
     keep_output_shard: bool
+    group: Literal["attn_tp", "attn_cp"] = "attn_tp"
 
 
 class PreparedFusedMoeSequenceParallelInput(NamedTuple):
@@ -48,6 +50,16 @@ class PreparedFusedMoeSequenceParallelInput(NamedTuple):
 DISABLED_FUSED_MOE_SEQUENCE_PARALLEL_PLAN = FusedMoeSequenceParallelPlan(
     False, False, False
 )
+
+
+def get_fused_moe_sequence_parallel_group(plan: FusedMoeSequenceParallelPlan):
+    """Resolve the model's token ownership group, within its pipeline stage."""
+    parallel = get_parallel()
+    if plan.group == "attn_tp":
+        return parallel.attn_tp_group
+    if plan.group == "attn_cp":
+        return parallel.attn_cp_group
+    raise ValueError(f"Unknown fused-MoE token group: {plan.group!r}")
 
 
 def has_tpu_fused_rs_post_expert_norm(layer: torch.nn.Module) -> bool:
@@ -173,12 +185,12 @@ def prepare_fused_moe_sequence_parallel_input(
         )
 
     parallel = get_parallel()
-    group = parallel.attn_tp_group
+    group = get_fused_moe_sequence_parallel_group(plan)
     tp_group = getattr(parallel, "tp_group", None)
     fused_rs_world_size = layer.moe_ep_size
     if group.world_size != fused_rs_world_size:
         raise RuntimeError(
-            "TPU fused-RS sequence parallelism requires matching attention-TP "
+            "TPU fused-RS sequence parallelism requires matching token "
             f"and fused-RS groups, got {group.world_size} and {fused_rs_world_size}"
         )
     attn_ranks = getattr(group, "ranks", None)
@@ -189,7 +201,7 @@ def prepare_fused_moe_sequence_parallel_input(
         and tuple(attn_ranks) != tuple(tp_ranks)
     ):
         raise RuntimeError(
-            "TPU fused-RS sequence parallelism requires attention-TP and TP "
+            "TPU fused-RS sequence parallelism requires token and TP "
             f"groups in the same rank order, got {attn_ranks} and {tp_ranks}"
         )
 
