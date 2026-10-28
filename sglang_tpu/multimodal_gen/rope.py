@@ -23,11 +23,10 @@ from sglang.kernels.ops.diffusion.common.fallback_torch import (
 
 
 def _build_pair_swap_matrix(dim: int, dtype: torch.dtype, device) -> Tensor:
-    idx = torch.arange(0, dim, 2, device=device)
-    rot = torch.zeros(dim, dim, dtype=dtype, device=device)
-    rot[idx + 1, idx] = -1
-    rot[idx, idx + 1] = 1
-    return rot
+    # Block diagonal of [[0, 1], [-1, 0]], from an identity and a product
+    # rather than scatters, so a compiled graph can fold it to a constant.
+    pair = torch.tensor([[0, 1], [-1, 0]], dtype=dtype, device=device)
+    return torch.kron(torch.eye(dim // 2, dtype=dtype, device=device), pair)
 
 
 _PAIR_SWAP_MATRICES: dict[tuple, Tensor] = {}
