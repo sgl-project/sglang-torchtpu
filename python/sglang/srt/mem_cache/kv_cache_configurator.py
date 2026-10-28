@@ -1821,6 +1821,8 @@ class KVCacheConfigurator:
                 device=self.device,
                 start_layer=self.layer_info.start_layer,
                 token_to_kv_pool_class=self._tpu_mha_pool_class(),
+                # Both kinds take the full-attention layers' mxint8 pool format.
+                pool_kwargs=self._mxint8_pool_kwargs(),
             )
         PoolCls = self._tpu_mha_pool_class()
         # This stage's own layers, not the model's: under PP the global lists

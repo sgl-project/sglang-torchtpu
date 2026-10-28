@@ -40,7 +40,6 @@ from sglang.srt.model_executor.pool_configurator import (
     MemoryPoolConfigurator,
     SWAChunkCapPoolConfigurator,
 )
-from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
 from sglang.srt.utils.common import get_num_new_pages
 from sglang_tpu.allocator_tpu import (
@@ -132,7 +131,9 @@ def _unsupported_reason(kvc: KVCacheConfigurator) -> Optional[str]:
         )
     if kvc.use_mla_backend or kvc.mambaish_config is not None:
         return "MLA or recurrent-state models (only MHA layers share one layout)"
-    pool_cls = current_platform.get_mha_kv_pool_cls()
+    # The class the configurator builds the pool from: an extension may serve a
+    # KV format (such as mxint8) with its own.
+    pool_cls = kvc._tpu_mha_pool_class()
     if not (
         issubclass(pool_cls, TpuFusedMHATokenToKVPool)
         and pool_cls.supports_unified_kv_pool
@@ -143,25 +144,30 @@ def _unsupported_reason(kvc: KVCacheConfigurator) -> Optional[str]:
             "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV, and pools that set "
             "supports_unified_kv_pool are supported)"
         )
-    if kvc.kv_cache_dtype_str == "mxint8":
-        return "the mxint8 KV cache"
     if kvc.page_size == 1:
         return "page_size 1 (the shared free list is paged)"
     model_config = kvc.model_config
     tp_size = get_parallel().attn_tp_size
-    # Merging sliding-window heads relies on the fused layout's page shape.
-    if pool_cls is not TpuFusedMHATokenToKVPool and (
+    same_kv_heads = (
         model_config.get_num_kv_heads(tp_size),
         model_config.head_dim,
         model_config.v_head_dim,
-    ) != (
+    ) == (
         model_config.get_swa_num_kv_heads(tp_size),
         model_config.swa_head_dim,
         model_config.swa_v_head_dim,
-    ):
+    )
+    # Merging sliding-window heads relies on the fused layout's page shape.
+    if pool_cls is not TpuFusedMHATokenToKVPool and not same_kv_heads:
         return (
             "sliding-window KV heads other than the full-attention ones in the "
             f"{pool_cls.__name__} KV pool"
+        )
+    # Both kinds take the full-attention layers' mxint8 pool format.
+    if kvc.kv_cache_dtype_str == "mxint8" and not same_kv_heads:
+        return (
+            "sliding-window KV heads other than the full-attention ones with the "
+            "mxint8 KV cache"
         )
     itemsize = kvc.kv_cache_dtype.itemsize
     full_page = _fused_page_shape(
@@ -371,7 +377,9 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
     through the two views. ``num_swa_groups`` page tables serve the
     sliding-window layers; the allocator records in ``swa_group_pages`` which
     page each further group uses alongside each group-0 sliding-window page.
-    The buffers and views take the layout of ``token_to_kv_pool_class``.
+    The buffers and views take the layout of ``token_to_kv_pool_class``, built
+    with ``pool_kwargs`` (such as its mxint8 format): the
+    full-attention layers' for both kinds.
     """
 
     def __init__(
@@ -390,7 +398,9 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
         device: str,
         start_layer: int,
         token_to_kv_pool_class: type = TpuFusedMHATokenToKVPool,
+        pool_kwargs: Optional[dict] = None,
     ):
+        pool_kwargs = pool_kwargs or {}
         num_full = len(full_attention_layer_ids)
         num_swa = len(swa_attention_layer_ids)
         self.num_swa_groups = num_swa_groups(
@@ -433,8 +443,9 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
             device=device,
             enable_memory_saver=False,
             allocation_label="Unified",
+            **pool_kwargs,
         )
-        view = functools.partial(view_cls, backing=self._backing)
+        view = functools.partial(view_cls, backing=self._backing, **pool_kwargs)
         super().__init__(
             size=size,
             size_swa=size,
@@ -1048,7 +1059,10 @@ class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
     """Sizes the unified pool from the static full and sliding-window pools.
 
     The shared pool gets the bytes the two static pools would get for the same
-    flags, and max_total_num_tokens stays their full-attention token count.
+    flags, and max_total_num_tokens stays their full-attention token count. A
+    shared token costs what a full-attention token costs per buffer, since the
+    buffers keep the full layers' page; a static sliding-window page may cost
+    a different number of bytes per token.
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
@@ -1098,9 +1112,13 @@ class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
         num_buffers = max(
             self._full_layers_num, _cdiv(self._swa_layers_num, self._swa_groups)
         )
+        # Bytes per token and layer of the static pools.
+        full_bytes = self._static._full_per_token
+        swa_bytes = self._static._swa_per_token
         shared_tokens = (
-            full_tokens * self._full_layers_num + swa_tokens * self._swa_layers_num
-        ) // num_buffers
+            full_tokens * self._full_layers_num * full_bytes
+            + swa_tokens * self._swa_layers_num * swa_bytes
+        ) // (num_buffers * full_bytes)
         align_tokens = page_size * _TPU_SWA_PAGE_ALIGNMENT
         shared_tokens = shared_tokens // align_tokens * align_tokens
         self._validate_shared_pool_size(shared_tokens, page_size)
