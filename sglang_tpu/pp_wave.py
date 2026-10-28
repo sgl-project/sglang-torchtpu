@@ -8,13 +8,14 @@ stage, one closed cycle per column. Stage 0 launches once per iteration while
 the wave is active and owes 2 * (stages - 2) zero launches after its last send;
 stage r > 0 launches up to stage 0's count plus min(r - 1, launches owed).
 
-Eagle3 also relays its capture slots, whose layers sit on different stages, to
-the draft on the last stage; PPAuxWave moves them as a second buffer of the same
+Eagle3 and DFlash/DSpark also relay their capture slots, whose layers sit on
+different stages, to the draft on the last stage; PPAuxWave moves them as a second buffer of the same
 permute, so the wave without them is unchanged.
 """
 
 import logging
 import os
+from collections.abc import Iterable
 from typing import Any, Callable
 
 import torch
@@ -33,7 +34,7 @@ _OPS: dict[tuple[int, ...], Any] = {}
 _PAIR_OP_NAME = "sglang_tpu::pp_permute_pair"
 _PAIR_OPS: dict[tuple[int, ...], Any] = {}
 
-# One launch's buffer: the activation sum, plus the Eagle3 slots on PPAuxWave.
+# One launch's buffer: the activation sum, plus the capture slots on PPAuxWave.
 Payload = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 
 
@@ -224,6 +225,21 @@ class PPWave:
             )
         return torch.cat([t, zero[n:]])
 
+    def warmup_tensors(self, rows: int) -> dict[str, torch.Tensor]:
+        """Fresh hand-off tensors of one forward bucket, as a forward returns them."""
+        return {
+            key: torch.zeros(
+                (rows, self.hidden), dtype=self.dtype, device=self.zero.device
+            )
+            for key in self.KEYS
+        }
+
+    def warmup_merge(self, row_buckets: Iterable[int]) -> None:
+        """Compile merge's sum and pad for every bucket a forward hands on."""
+        for rows in row_buckets:
+            if rows <= self.rows:
+                self.merge(self.warmup_tensors(rows))
+
     def merge(self, tensors: dict[str, torch.Tensor]) -> Payload:
         """The padded sum of a forward's outgoing hidden states and residual."""
         if set(tensors) != set(self.KEYS):
@@ -364,7 +380,7 @@ class PPWave:
 
 
 class PPAuxWave(PPWave):
-    """PPWave that also relays Eagle3's capture slots as [rows, num_aux * hidden].
+    """PPWave that also relays the aux capture slots as [rows, num_aux * hidden].
 
     The slots ride as a second buffer rather than columns or rows of the first:
     torch_tpu hands a view of a shared buffer to an executable as the buffer's
@@ -401,6 +417,12 @@ class PPAuxWave(PPWave):
         )
         self.zero_payload = (self.zero, self.aux_zero)
 
+    def warmup_tensors(self, rows: int) -> dict[str, torch.Tensor]:
+        aux = torch.zeros(
+            (rows, self.aux_width), dtype=self.dtype, device=self.zero.device
+        )
+        return super().warmup_tensors(rows) | {AUX_HIDDEN_STATES_PROXY_KEY: aux}
+
     def merge(self, tensors: dict[str, torch.Tensor]) -> Payload:
         if AUX_HIDDEN_STATES_PROXY_KEY not in tensors:
             raise ValueError(
@@ -432,16 +454,22 @@ class PPAuxWave(PPWave):
 
 
 def num_relayed_aux_slots(config: SpecAuxHiddenStateConfig, model: nn.Module) -> int:
-    """Eagle3 capture slots a pipeline stage hand-off carries; 0 when none."""
-    if not config.eagle_use_aux_hidden_state:
-        return 0
+    """Aux capture slots (Eagle3 or DFlash/DSpark) a pipeline stage hand-off carries; 0 when none."""
     if not getattr(model, "relays_pp_aux_hidden_states", False):
         return 0
-    layer_ids = config.eagle_aux_hidden_state_layer_ids
+    if config.eagle_use_aux_hidden_state:
+        layer_ids, field = (
+            config.eagle_aux_hidden_state_layer_ids,
+            "eagle_aux_hidden_state_layer_ids",
+        )
+    elif config.dflash_use_aux_hidden_state:
+        layer_ids, field = config.dflash_target_layer_ids, "dflash_target_layer_ids"
+    else:
+        return 0
     if layer_ids is None:
         raise NotImplementedError(
             "Pipeline parallelism sizes its stage hand-off from the draft's "
-            "eagle_aux_hidden_state_layer_ids, which this draft does not declare."
+            f"{field}, which this draft does not declare."
         )
     return len(layer_ids)
 
@@ -524,7 +552,7 @@ def build_pp_wave(
     )
     if num_aux:
         logger.info(
-            "pipeline wave stage %d: %d Eagle3 slot(s) as a second [%d, %d] buffer",
+            "pipeline wave stage %d: %d aux capture slot(s) as a second [%d, %d] buffer",
             rank,
             num_aux,
             rows,

@@ -37,6 +37,7 @@ from sglang_tpu.experimental.models.dflash2 import (
 from sglang_tpu.experimental.speculative.block_draft_worker import (
     DraftSampler,
     TpuBlockDraftWorker,
+    target_input_embedding,
 )
 
 
@@ -69,9 +70,9 @@ class TpuDflashDraftWorker(TpuBlockDraftWorker):
         target_model = cast(nn.Module, target_runner.model)
         # Nemotron 3.5 drafts embed with their own checkpoint table.
         if not draft_model.is_nemotron_35_draft:
-            draft_model.embed_tokens = unwrap_lora_layer(
-                target_model.get_input_embeddings()
-            )
+            embedding = target_input_embedding(target_model)
+            if embedding is not None:
+                draft_model.embed_tokens = embedding
         draft_model.lm_head = unwrap_lora_layer(target_model.lm_head)
 
     def sample_drafts(

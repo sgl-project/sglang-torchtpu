@@ -12,27 +12,45 @@ import logging
 
 from sglang.srt.plugins.hook_registry import HookType
 from sglang_tpu.hooks.attn_residual import (
-    aggregate,
-    aggregate_fused_add,
     prepare_attn_residual_kernel,
     register_attn_residual_ops,
 )
 from sglang_tpu.hooks.attn_tp import device_supports_input_scattered
-from sglang_tpu.hooks.cpu_pinning import pin_scheduler_main_thread
+from sglang_tpu.hooks.cpu_pinning import bind_rank_cpu_set, pin_scheduler_main_thread
 from sglang_tpu.hooks.draft_kv_pool import (
     draft_cell_size_per_token,
     draft_mha_pool_class,
 )
 from sglang_tpu.hooks.dsa_kv_pool import size_tpu_dsa_kv_pool
+from sglang_tpu.hooks.encoder import (
+    bootstrap_encoder_worker,
+    encode_indices_within_patch_budget,
+    install_encoder_vision_compile,
+    reject_encoder_dp,
+)
 from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.glm_flash_megakernel import (
     drop_freed_glm_flash_megakernel_request,
     route_glm_flash_megakernel,
 )
+from sglang_tpu.hooks.hicache_swa_metrics import hook_specs as hicache_swa_metrics_hooks
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
+from sglang_tpu.hooks.k3_megakernel import (
+    attach_k3_megakernel,
+    k3_megakernel_forward,
+    load_k3_non_layer_weights,
+    prepare_k3_capture_kernels,
+    skip_k3_decoder_layers,
+)
 from sglang_tpu.hooks.kda_weights import (
     bind_glm5_next_kda_weights,
     rehome_kimi_k3_kda_weights,
+)
+from sglang_tpu.hooks.kimi_k3_vision import (
+    attach_k3_vision_runner,
+    bind_k3_vision_runner,
+    encode_with_k3_vision_runner,
+    pass_through_projected_features,
 )
 from sglang_tpu.hooks.mhc import (
     hc_ffn_post_pre,
@@ -54,6 +72,7 @@ from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 from sglang_tpu.hooks.spec_tp_sync import broadcast_undeferred
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
 from sglang_tpu.hooks.static_fp8 import bind_kimi_k3_static_fp8
+from sglang_tpu.hooks.swa_miss_metrics import hook_specs as swa_miss_metrics_hooks
 from sglang_tpu.hooks.twolevel_allreduce import all_reduce as twolevel_all_reduce
 from sglang_tpu.hooks.twolevel_allreduce import (
     merged_moe_all_reduce as twolevel_merged_moe_all_reduce,
@@ -65,6 +84,11 @@ logger = logging.getLogger(__name__)
 
 HOOKS: list[tuple] = [
     (
+        "sglang.srt.utils.common.set_gpu_proc_affinity",
+        bind_rank_cpu_set,
+        HookType.AROUND,
+    ),
+    (
         "sglang.srt.managers.scheduler.Scheduler.run_event_loop",
         pin_scheduler_main_thread,
         HookType.BEFORE,
@@ -73,6 +97,31 @@ HOOKS: list[tuple] = [
         "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
         initialize_dense_moe_config,
         HookType.AFTER,
+    ),
+    (
+        "sglang.srt.disaggregation.encoder.server.MMEncoder.init_moe_gemm_config",
+        initialize_dense_moe_config,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.disaggregation.encoder.server.MMEncoder.__init__",
+        bootstrap_encoder_worker,
+        HookType.BEFORE,
+    ),
+    (
+        "sglang.srt.disaggregation.encoder.server.MMEncoder.__init__",
+        install_encoder_vision_compile,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.disaggregation.encoder.server.MMEncoder.encode_indices",
+        encode_indices_within_patch_budget,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.disaggregation.encoder.runtime.launch_dp_runtime",
+        reject_encoder_dp,
+        HookType.BEFORE,
     ),
     (
         "sglang.srt.arg_groups.validation_hook.check_pipeline_parallel_compat",
@@ -95,18 +144,58 @@ HOOKS: list[tuple] = [
         HookType.AFTER,
     ),
     (
+        "sglang.srt.models.kimi_k3.make_pp_layers",
+        skip_k3_decoder_layers,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.kimi_k3.KimiK3ForConditionalGeneration.load_weights",
+        load_k3_non_layer_weights,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.load_weights",
+        load_k3_non_layer_weights,
+        HookType.AROUND,
+    ),
+    (
         "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
         prepare_attn_residual_kernel,
         HookType.AFTER,
     ),
     (
-        "sglang.srt.layers.attn_residual._aggregate",
-        aggregate,
+        "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
+        attach_k3_megakernel,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.kimi_k3.KimiK3LinearModel.forward",
+        k3_megakernel_forward,
         HookType.AROUND,
     ),
     (
-        "sglang.srt.layers.attn_residual._aggregate_fused_add",
-        aggregate_fused_add,
+        "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.set_dspark_layers_to_capture",
+        prepare_k3_capture_kernels,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.kimi_k3_vl.MoonViT3dEncoder.__init__",
+        attach_k3_vision_runner,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.kimi_k3.KimiK3ForConditionalGeneration.__init__",
+        bind_k3_vision_runner,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.kimi_k3_vl.KimiK3VisionTower._forward_eager",
+        encode_with_k3_vision_runner,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.kimi_k3_vl.KimiK3MultiModalProjector.forward",
+        pass_through_projected_features,
         HookType.AROUND,
     ),
     (
@@ -214,6 +303,10 @@ HOOKS: list[tuple] = [
 
 HOOKS.extend(host_padding_hooks())
 
+HOOKS.extend(hicache_swa_metrics_hooks())
+
+HOOKS.extend(swa_miss_metrics_hooks())
+
 HOOKS.extend(hook_specs())
 
 _registered = False
@@ -236,6 +329,13 @@ def register() -> None:
     # Every host installs the plugin, so the entry points also run off TPU.
     if not current_platform.is_tpu():
         return
+
+    # Register the tokenizer adapter before tokenizer and worker processor loading.
+    from sglang_tpu.models.muse_spark_hf_processor import (
+        register_muse_spark_processor,
+    )
+
+    register_muse_spark_processor()
 
     from sglang.srt.plugins.hook_registry import HookRegistry
 

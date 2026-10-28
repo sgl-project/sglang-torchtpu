@@ -37,6 +37,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Sequence,
     Set,
     Tuple,
 )
@@ -146,11 +147,15 @@ class RaidenKVManager(
     _pipeline = None
     _pipeline_enabled = False
     _listener_start_read = False
-    # GDN state engine: one row per request, built only for linear-attention pools.
+    # State engine: one row per request for GDN, or multi-page request rings for DSV4.
     _state_engine: Optional[Any] = None
     _state_kv_caches: Tuple[Any, ...] = ()
+    _state_type: StateType = StateType.MAMBA
+    _state_max_blocks: int = 1
     _state_engine_max_blocks = 0
     _committed_state_row: Optional[Callable[[int], int]] = None
+    _read_state_meta: Optional[Callable[[Sequence[int]], bytes]] = None
+    _write_state_meta: Optional[Callable[[Sequence[int]], bytes]] = None
     state_raiden_endpoint: Optional[str] = None
 
     def __init__(
@@ -375,8 +380,16 @@ class RaidenKVManager(
         self._kv_caches = list(kv_caches.full)
         self._swa_kv_caches = list(kv_caches.swa)
         self._state_kv_caches = tuple(kv_caches.state)
+        self._state_type = kv_caches.state_type
+        self._state_max_blocks = kv_caches.state_max_blocks
         self._committed_state_row = kv_caches.committed_state_row
-        if self._state_kv_caches and self._committed_state_row is None:
+        self._read_state_meta = kv_caches.read_state_meta
+        self._write_state_meta = kv_caches.write_state_meta
+        if (
+            self._state_kv_caches
+            and self._state_type == StateType.MAMBA
+            and self._committed_state_row is None
+        ):
             raise RuntimeError("Raiden GDN state tensors need a committed-row mapping")
         if self._pipeline_enabled:
             if self._state_kv_caches:
@@ -458,23 +471,27 @@ class RaidenKVManager(
                 swa_pool_pages,
             )
         if self._state_kv_caches:
-            # A request owns one committed state row, so a slot is one row.
-            state_num_slots = self._num_slots(list(self._state_kv_caches), 1, engines)
+            state_max_blocks = self._state_max_blocks
+            state_num_slots = self._num_slots(
+                list(self._state_kv_caches), state_max_blocks, engines
+            )
             self.state_raiden_endpoint, self._state_engine = self._start_engine(
                 kv_caches=list(self._state_kv_caches),
                 port=self._control_port + STATE_PORT_OFFSET,
-                max_blocks=1,
+                max_blocks=state_max_blocks,
                 num_slots=state_num_slots,
             )
-            self._state_engine_max_blocks = 1
-            state_pool_pages = state_num_slots
+            self._state_engine_max_blocks = state_max_blocks
+            state_pool_pages = state_num_slots * state_max_blocks
             logger.info(
-                "RaidenKVManager rank%d GDN state engine up | endpoint=%s "
-                "layers=%d num_slots=%d",
+                "RaidenKVManager rank%d state engine up | endpoint=%s "
+                "layers=%d max_blocks=%d num_slots=%d pool_pages=%d",
                 self.attn_tp_rank,
                 self.state_raiden_endpoint,
                 len(self._state_kv_caches),
+                state_max_blocks,
                 state_num_slots,
+                state_pool_pages,
             )
         # Each engine's pool is handed out read by read, so the pages the
         # decode may hold in flight are the pages raiden reserved.
@@ -752,14 +769,16 @@ class RaidenKVManager(
     def _log_settled_transfers(
         self, *, sent: Iterable[str], received: Iterable[str]
     ) -> None:
+        # Per-transfer, per-rank lines are DEBUG: at INFO they dominate server
+        # logs (several lines per request on every rank). Failures stay ERROR.
         for rid in sent:
-            logger.info(
+            logger.debug(
                 "RaidenKVManager rank%d prefill read served | req_id=%s",
                 self.attn_tp_rank,
                 rid,
             )
         for rid in received:
-            logger.info(
+            logger.debug(
                 "RaidenKVManager rank%d decode pull done | req_id=%s",
                 self.attn_tp_rank,
                 rid,
@@ -1094,27 +1113,34 @@ class RaidenKVManager(
     def _state_rows_from_state_indices(
         self, state_indices: Optional[List]
     ) -> List[int]:
-        """The committed GDN state row of the request's single mamba slot."""
+        """The committed state row/pages of the request's state slot."""
         if self._state_engine is None:
             return []
         try:
-            index = self.kv_args.state_types.index(StateType.MAMBA)
+            index = self.kv_args.state_types.index(self._state_type)
         except ValueError as exc:
             raise RuntimeError(
-                "Raiden has GDN state tensors but StateType.MAMBA is not registered"
+                f"Raiden has state tensors but {self._state_type} is not registered"
             ) from exc
         if (
             state_indices is None
             or index >= len(state_indices)
             or state_indices[index] is None
         ):
-            raise RuntimeError("Raiden GDN state transfer is missing its slot")
+            raise RuntimeError("Raiden state transfer is missing its slot")
         slots = [int(x) for x in np.asarray(state_indices[index]).reshape(-1)]
-        if len(slots) != 1:
+        if self._state_type == StateType.MAMBA:
+            if len(slots) != 1:
+                raise RuntimeError(
+                    f"Raiden GDN state transfer expects one mamba slot, got {slots}"
+                )
+            return [self._committed_state_row(slots[0])]
+        expected = self._state_engine_max_blocks
+        if len(slots) != expected:
             raise RuntimeError(
-                f"Raiden GDN state transfer expects one mamba slot, got {slots}"
+                f"Raiden state transfer expects {expected} pages, got {len(slots)}"
             )
-        return [self._committed_state_row(slots[0])]
+        return slots
 
     @staticmethod
     def _monotonic() -> float:
@@ -1248,6 +1274,7 @@ class RaidenKVManager(
                     self._prefill.send_block_set,
                     self._prefill.send_swa_blocks,
                     self._prefill.send_state_rows,
+                    self._prefill.send_state_meta,
                     self._prefill.send_aux,
                     self._prefill.decode_addr,
                     self._prefill.reshard_req,

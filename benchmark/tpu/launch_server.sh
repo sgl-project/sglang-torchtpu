@@ -324,6 +324,13 @@ if [[ "$ENABLE_COMPILE_CACHE" == "1" ]]; then
     export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE="$TORCH_TPU_TIER2_NAME"
     export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT="$TORCH_TPU_TIER3_ROOT"
     export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_LOCAL_BACKUP_TASK=1
+else
+    # Not exporting a name is not enough: with no tier-2 name torch_tpu falls
+    # back to an implicit tier-2 cache, /dev/shm/torch_tpu_cache/default,
+    # whenever WORLD_SIZE > 1, so every TP>1 server would still read and write
+    # it. "disabled" is torch_tpu's sentinel for really off. An explicit value
+    # still wins.
+    export TORCH_TPU_TIER2_COMPILATION_CACHE="${TORCH_TPU_TIER2_COMPILATION_CACHE:-disabled}"
 fi
 
 # LIBTPU_INIT_ARGS (XLA/libtpu TP/EP serving tuning + DP-attention hardening) is

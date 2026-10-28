@@ -2245,7 +2245,7 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
             parallel_state.patch_tensor_parallel_group(group, owns_attention=True),
         ):
             self.assertEqual(get_parallel().attn_dp_size, 1)
-            policy._set_dp_attention_metadata(batch, 64, 4, ForwardMode.EXTEND)
+            policy.set_dp_attention_metadata(batch, 64, 4, ForwardMode.EXTEND)
 
         self.assertEqual(batch.global_num_tokens_cpu, [64] * 4)
         self.assertEqual(batch.global_num_tokens_gpu.tolist(), [64] * 4)

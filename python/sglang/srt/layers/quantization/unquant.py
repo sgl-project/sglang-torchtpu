@@ -665,6 +665,21 @@ def _empty_xpu_moe_expert_weight(
     return torch.empty(num_experts, n_dim, k_dim + pad, dtype=dtype)[:, :, :k_dim]
 
 
+# SGLang's (num_experts, n, k) <-> gmm_v2's (num_experts, k, n), for w13 and w2
+def _swap_expert_weight_layout(layer: torch.nn.Module) -> None:
+    for name in ("w13_weight", "w2_weight"):
+        old = getattr(layer, name).data
+        copy_or_rebind_param(layer, name, old.transpose(1, 2).contiguous())
+        # copy_or_rebind_param copies in place when the shape is unchanged, so a
+        # shape-preserving (square) transpose leaves the param on `old`'s storage;
+        # freeing it then would zero the live weight (e.g. w2 when intermediate == hidden).
+        if (
+            getattr(layer, name).data.untyped_storage().data_ptr()
+            != old.untyped_storage().data_ptr()
+        ):
+            old.untyped_storage().resize_(0)
+
+
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
     """MoE method without quantization."""
 
@@ -696,6 +711,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         **extra_weight_attrs,
     ):
         self.with_bias = with_bias
+        # TPU: the intermediate-dim padding while the experts are in gmm_v2's layout, None otherwise
+        layer.tpu_gmm_pad = None
 
         # XPU only: the sgl-kernel-xpu grouped GEMM honours the weights' row
         # stride, so it can be padded to dodge L3 set aliasing on unlucky K
@@ -758,6 +775,24 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             layer.register_parameter("w2_weight_bias", w2_weight_bias)
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        # TPU: the FusedMoE weight loader writes SGLang's (num_experts, n, k) layout, so a
+        # reload first undoes process_weights_after_loading's gmm_v2 layout and padding
+        pad = layer.tpu_gmm_pad
+        if pad is None:
+            return
+        _swap_expert_weight_layout(layer)
+        if pad:
+            inter = layer.w2_weight.shape[-1] - pad
+            gate, up = layer.w13_weight.data.split(inter + pad, dim=1)
+            copy_or_rebind_param(
+                layer, "w13_weight", torch.cat([gate[:, :inter], up[:, :inter]], dim=1)
+            )
+            copy_or_rebind_param(
+                layer, "w2_weight", layer.w2_weight.data[..., :inter].contiguous()
+            )
+        layer.tpu_gmm_pad = None
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # TPU: gmm_v2 expects (num_experts, k, n) but SGLang stores
         # (num_experts, n, k). Swap once at load time so the forward_tpu
@@ -778,20 +813,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 copy_or_rebind_param(layer, "w13_weight", w13)
                 w2 = _pad_last_axis(layer.w2_weight.data, pad)
                 copy_or_rebind_param(layer, "w2_weight", w2)
-            for name in ("w13_weight", "w2_weight"):
-                old = getattr(layer, name).data
-                new = old.transpose(1, 2).contiguous()
-                copy_or_rebind_param(layer, name, new)
-                # copy_or_rebind_param copies in place when the shape is
-                # unchanged, so a shape-preserving (square) transpose leaves the
-                # param pointing at `old`'s storage. Only free `old` when the
-                # param was actually rebound to a new storage; otherwise we would
-                # zero out the live weight (e.g. w2 when intermediate == hidden).
-                if (
-                    getattr(layer, name).data.untyped_storage().data_ptr()
-                    != old.untyped_storage().data_ptr()
-                ):
-                    old.untyped_storage().resize_(0)
+            else:
+                pad = 0
+            _swap_expert_weight_layout(layer)
+            layer.tpu_gmm_pad = pad
             return
 
         _should_use_aiter_moe = (

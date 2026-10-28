@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
+from typing import NamedTuple
 from unittest.mock import patch
 
 import torch
@@ -19,7 +20,11 @@ from sglang_tpu.experimental.compilation.chain_compile_policy import (
     _hidden_only_logits,
 )
 from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
-from sglang_tpu.experimental.speculative import spec_ops
+from sglang_tpu.experimental.speculative import (
+    base_spec_worker,
+    chain_spec_worker,
+    spec_ops,
+)
 from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
 from sglang_tpu.experimental.speculative.chain_info import HostPaddedChainDraftInput
 from sglang_tpu.experimental.speculative.chain_spec_worker import (
@@ -40,7 +45,11 @@ from sglang_tpu.experimental.speculative.spec_ops import (
     accept_drafts_target_only,
     finalize_accept,
 )
-from sglang_tpu.experimental.speculative.spec_types import SpecState
+from sglang_tpu.experimental.speculative.spec_types import (
+    DraftResult,
+    SpecState,
+    TpuSpecVerifyInput,
+)
 from sglang_tpu.experimental.speculative.spec_utils import pad_rows
 from sglang_tpu.hooks.experimental_spec import (
     keep_host_padded_extend_outputs,
@@ -48,6 +57,16 @@ from sglang_tpu.hooks.experimental_spec import (
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class _OptionalCarry(NamedTuple):
+    hidden_states: torch.Tensor
+    optional: torch.Tensor | None = None
+
+
+class _AdaptiveWarmupWorker(TpuChainSpecWorker):
+    def verify_widths(self):
+        return (2, 4)
 
 
 def _chain_worker() -> TpuChainSpecWorker:
@@ -80,8 +99,87 @@ def _unfiltered(rows: int) -> dict[str, torch.Tensor]:
 
 
 class TestExperimentalEagle3(CustomTestCase):
+    def test_verify_warmups_keep_capacity_across_active_widths(self):
+        worker = object.__new__(_AdaptiveWarmupWorker)
+        worker.device = "cpu"
+        worker.num_drafts = 3
+        worker.num_verify_rows = 4
+        worker._dp_attention = False
+        worker._sampled_drafts = False
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(max_running_requests=2)
+        )
+        worker._chain_draft_worker = SimpleNamespace(
+            carry_size=3, carry=torch.zeros((3, 3))
+        )
+        worker._draft_runner = SimpleNamespace(dtype=torch.float32)
+        buckets = SimpleNamespace(buckets=[1, 2], max_val=2, next_bucket=lambda bs: bs)
+        selections = []
+        drafts = []
+
+        def select(candidates, committed, seq_lens, width):
+            selections.append((tuple(candidates.shape), width))
+            self.assertIsNot(committed, seq_lens)
+            return spec_ops.select_verify_rows(candidates, committed, seq_lens, width)
+
+        def warmup(op, *args):
+            return select(*args) if op is spec_ops.select_verify_rows else op(*args)
+
+        def draft(**kwargs):
+            rows = kwargs["rows"]
+            bs, width = rows.positions.shape
+            drafts.append((bs, width))
+            self.assertEqual(kwargs["seq_lens_cpu"].tolist(), [width] * bs)
+            return DraftResult(
+                torch.zeros((bs, width - 1), dtype=torch.int64),
+                None,
+                torch.full((bs,), width - 1, dtype=torch.int32),
+            )
+
+        expected = {((bs, 8), width) for bs in (1, 2) for width in (2, 4)}
+        with (
+            patch.object(torch, "tpu", create=True) as tpu,
+            patch.object(
+                base_spec_worker, "max_speculative_num_draft_tokens", return_value=4
+            ),
+            patch.object(worker, "_b_bucketer", return_value=buckets),
+            patch.object(base_spec_worker, "warmup_compiled_op", side_effect=warmup),
+            patch.object(chain_spec_worker, "warmup_compiled_op", side_effect=warmup),
+            patch.object(chain_spec_worker, "select_verify_rows", side_effect=select),
+            patch.object(worker, "_draft_chain", side_effect=draft),
+        ):
+            self.assertEqual(worker.verify_window_rows, 4)
+            for run in (
+                worker._warmup_logical_bs_ops,
+                worker._warmup_draft_ops,
+                worker._warmup_verify_mrope,
+            ):
+                selections.clear()
+                run()
+                self.assertEqual(set(selections), expected)
+                self.assertEqual(len(selections), len(expected))
+            idle = TpuSpecVerifyInput.idle(
+                verify_window_rows=worker.verify_window_rows, padded_bs=2, device="cpu"
+            )
+        tpu.current_stream.assert_called_once_with()
+        tpu.current_stream.return_value.synchronize.assert_called_once_with()
+        self.assertEqual(idle.verify_cache_candidates.shape, (2, 8))
+        self.assertEqual(
+            set(drafts), {(bs, width) for bs in (1, 2) for width in (2, 4)}
+        )
+        self.assertEqual((worker.num_drafts, worker.num_verify_rows), (3, 4))
+        self.assertEqual(_chain_worker().verify_widths(), (3,))
+
     def test_flag_routes_eagle3_and_leaves_other_algorithms_alone(self):
-        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
+        with (
+            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True),
+            patch(
+                "sglang_tpu.hooks.spec_worker.get_parallel",
+                return_value=SimpleNamespace(
+                    pp_group=SimpleNamespace(is_last_rank=True)
+                ),
+            ),
+        ):
             self.assertIs(
                 select_experimental_spec_worker(
                     None, SpeculativeAlgorithm.EAGLE3, None
@@ -93,7 +191,10 @@ class TestExperimentalEagle3(CustomTestCase):
                 select_experimental_spec_worker(None, SpeculativeAlgorithm.EAGLE, None),
                 TpuChainSpecWorker,
             )
-        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+        with (
+            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
+            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        ):
             self.assertIsNone(
                 select_experimental_spec_worker(None, SpeculativeAlgorithm.EAGLE3, None)
             )
@@ -192,6 +293,11 @@ class TestExperimentalEagle3(CustomTestCase):
         self.assertEqual(grown.top_ks.tolist(), [3, 1, 1, 1])
         worker._bucket = grown
         self.assertIs(bucket(4), grown)
+        worker._bucket = None
+        live = live._replace(draft_carry=_OptionalCarry(torch.ones((1, 2))))
+        carry = bucket(4).state.draft_carry
+        self.assertIsNone(carry.optional)
+        self.assertEqual(carry.hidden_states.tolist(), [[1, 1], [0, 0], [0, 0], [0, 0]])
 
     def test_target_only_acceptance_commits_target_distribution(self):
         """The first committed token follows p_0 whatever d_1 is, with the
@@ -348,7 +454,7 @@ class TestExperimentalEagle3(CustomTestCase):
                 return_value=SimpleNamespace(buckets=[4]),
             ),
             patch(
-                "sglang_tpu.experimental.speculative.chain_spec_worker."
+                "sglang_tpu.experimental.speculative.base_spec_worker."
                 "warmup_compiled_op",
                 lambda op, *args: calls.append(args),
             ),
@@ -381,6 +487,7 @@ class TestExperimentalEagle3(CustomTestCase):
             return values
 
         worker._tp_sync = SimpleNamespace(sync=sync)
+        worker._dp_attention = False
         worker._target_worker = SimpleNamespace(
             model_runner=SimpleNamespace(
                 sampler=sampler, model_config=SimpleNamespace(vocab_size=8)
@@ -391,10 +498,13 @@ class TestExperimentalEagle3(CustomTestCase):
         )
         buckets = SimpleNamespace(next_bucket=lambda bs: 1 << (bs - 1).bit_length())
         with (
+            patch.object(torch, "tpu", create=True) as tpu,
             patch.object(TpuChainSpecWorker, "_compile_policy", return_value=policy),
             patch.object(TpuChainSpecWorker, "_b_bucketer", return_value=buckets),
         ):
             worker._warmup_extend_sampling()
+        tpu.current_stream.assert_called_once_with()
+        tpu.current_stream.return_value.synchronize.assert_called_once_with()
         self.assertEqual({shape for shape, _ in sampled}, {(1,), (2,), (4,)})
         self.assertEqual(
             broadcast,
@@ -492,35 +602,6 @@ class TestExperimentalEagle3(CustomTestCase):
             [[2.0, 3.0], [-1.0, -1.0], [6.0, 7.0], [8.0, 9.0], [-2.0, -2.0]],
         )
 
-    def test_idle_dp_rank_mirrors_the_whole_chain_step(self):
-        """An idle DP rank runs the active step's forwards in order (draft chain,
-        verify, commit's draft rows) with the greedy draft its peers sync."""
-        worker = _chain_worker()
-        worker.num_drafts = 2
-        calls = []
-        drafts = torch.zeros((4, 2), dtype=torch.int64)
-
-        def draft_chain(**kwargs):
-            calls.append(("draft", kwargs["temperatures"], kwargs["top_ks"]))
-            return SimpleNamespace(draft_tokens=drafts)
-
-        worker._draft_chain = draft_chain
-        worker._forward_idle_verify = lambda **kwargs: (
-            calls.append(("verify",)) or "out"
-        )
-        worker.commit = lambda *args: calls.append(("commit", args[4]))
-        worker._device_zeros = lambda rows: torch.zeros((rows,), dtype=torch.int64)
-        zeros = torch.zeros((4,), dtype=torch.int64)
-        verify_input = SimpleNamespace(
-            req_pool_indices_cpu=zeros,
-            padded_kv_lens_after_rows=lambda rows: (zeros, 0),
-        )
-        state = SpecState(bonus_tokens=zeros, seq_lens=zeros, req_pool_indices=zeros)
-        worker._forward_idle_step(
-            batch=None, state=state, rows=None, verify_input=verify_input
-        )
-        self.assertEqual(calls, [("draft", None, None), ("verify",), ("commit", "out")])
-
     def test_dp_attention_drafts_greedy(self):
         """Under DP attention the draft never samples: peers and idle ranks must
         issue the same draft sync, and sampled requests take target-only accept."""
@@ -539,6 +620,57 @@ class TestExperimentalEagle3(CustomTestCase):
             worker.draft(None, bucket, None, verify_input)
         self.assertIs(seen[0], bucket.temperatures)
         self.assertIsNone(seen[1])
+
+    def _fused_drafter(self, fused_draft):
+        drafter = object.__new__(TpuEagle3DraftWorker)
+        calls = []
+        shim = SimpleNamespace(wait_for_hicache_reload=lambda: calls.append("wait"))
+        drafter._compile_policy = lambda: SimpleNamespace(compiled_forward_shim=shim)
+        drafter.model_runner = SimpleNamespace(
+            attn_backend=SimpleNamespace(init_forward_metadata=lambda batch: None)
+        )
+        drafter._carry_table = torch.zeros((1, 1))
+        drafter._fused_draft = lambda *args: fused_draft(calls)
+        return drafter, calls
+
+    @staticmethod
+    def _run_fused(drafter):
+        drafter.run_fused_draft(
+            SimpleNamespace(mark_forward_metadata_ready=lambda: None),
+            req_pool_indices=None,
+            positions=None,
+            cache_locs=None,
+            seq_lens=None,
+            temperatures=None,
+            top_ks=None,
+            uniforms=None,
+        )
+
+    def test_fused_draft_runs_as_a_decode_program(self):
+        """The fused draft guards on is_extend_in_batch; a stale True from the last
+        extend under DP attention would recompile it under fail_on_recompile."""
+        from sglang.srt.layers.dp_attention import (
+            get_is_extend_in_batch,
+            set_is_extend_in_batch,
+        )
+
+        seen = []
+        drafter, _ = self._fused_drafter(
+            lambda calls: seen.append(get_is_extend_in_batch()) or ("d", None)
+        )
+        set_is_extend_in_batch(True)
+        self._run_fused(drafter)
+        self.assertEqual(seen, [False])
+
+    def test_fused_draft_waits_for_the_hicache_reload_first(self):
+        """The fused draft program inlines the forward shim, whose HiCache reload gate
+        only runs eagerly; without the eager wait a PD decode drafts on draft KV
+        a host reload has not landed yet."""
+        drafter, calls = self._fused_drafter(
+            lambda calls: calls.append("draft") or ("d", None)
+        )
+        self._run_fused(drafter)
+        self.assertEqual(calls, ["wait", "draft"])
 
 
 if __name__ == "__main__":

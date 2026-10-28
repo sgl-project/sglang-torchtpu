@@ -9,6 +9,9 @@ from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+from fastapi import HTTPException
+
 from sglang.srt.disaggregation.encoder.receiver import (
     MMReceiverBase,
     WaitingMMRequestStatus,
@@ -18,6 +21,7 @@ from sglang.srt.disaggregation.encoder.receiver import (
     _ReceiveRegistrationRunner,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import EncoderDispatchErrorReq
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -220,6 +224,9 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
             def _try_recv_mm_data(self):
                 pass
 
+            def still_receiving(self):
+                return False
+
             def _fail_and_release(self, error_msg, error_code=None):
                 self.error_msg = error_msg
                 self.error_code = error_code
@@ -241,6 +248,7 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
             tp_group=SimpleNamespace(cpu_group=object()),
             _drain_scheduler_embeddings=lambda: None,
             _sync_fail_info_across_tp=lambda request: None,
+            _hold_ready_requests=lambda statuses, receiving: False,
             create_req=lambda request: request,
         )
         dispatch_error = EncoderDispatchErrorReq(
@@ -260,7 +268,8 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
         self.assertEqual(other.status, WaitingMMRequestStatus.PENDING)
         self.assertEqual([req.rid for req, _, _ in abort_reqs], [owner.rid])
 
-    def test_extra_key_and_cache_salt_are_forwarded(self):
+    @staticmethod
+    def _create_req(input_ids):
         scheduler = SimpleNamespace(
             model_config=SimpleNamespace(hf_eos_token_id={2}, vocab_size=128),
             disaggregation_mode=DisaggregationMode.NULL,
@@ -273,7 +282,7 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
         recv_req = SimpleNamespace(
             rid="request-1",
             input_text="hello",
-            input_ids=array("q", [1, 2]),
+            input_ids=input_ids,
             sampling_params=SamplingParams(max_new_tokens=1),
             return_logprob=False,
             top_logprobs_num=0,
@@ -297,10 +306,19 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
             http_worker_ipc=None,
         )
 
-        req = MMReceiverBase.create_req(receiver, recv_req)
+        return MMReceiverBase.create_req(receiver, recv_req)
+
+    def test_extra_key_and_cache_salt_are_forwarded(self):
+        req = self._create_req(array("q", [1, 2]))
 
         self.assertEqual(req.extra_key, "classification")
         self.assertEqual(req.cache_salt, "tenant-a")
+
+    def test_abort_for_request_awaiting_encoder_has_input_ids(self):
+        """A failed encode aborts a request that has no input_ids yet; streaming that abort must not crash the scheduler."""
+        req = self._create_req(None)
+
+        self.assertEqual(len(req.origin_input_ids), 0)
 
     def test_rdma_worker_error_is_released_on_scheduler_thread(self):
         scheduler_thread = threading.get_ident()
@@ -364,6 +382,9 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
             def _try_recv_mm_data(self):
                 pass
 
+            def still_receiving(self):
+                return False
+
             def release_resources(self):
                 self.released = True
 
@@ -379,6 +400,7 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
             tp_group=SimpleNamespace(cpu_group=object()),
             _drain_scheduler_embeddings=lambda: None,
             _sync_fail_info_across_tp=lambda request: None,
+            _hold_ready_requests=lambda statuses, receiving: False,
             create_req=lambda request: request,
         )
 
@@ -393,6 +415,77 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
         self.assertTrue(waiting_req.released)
         self.assertTrue(waiting_req.closed)
         self.assertEqual(len(abort_reqs), 1)
+
+
+class TestEncodeDispatchWithoutEncoder(CustomTestCase):
+    """With no encoder registered, a multimodal request fails instead of encoding locally."""
+
+    @staticmethod
+    def _dispatch(mm_data):
+        receiver = SimpleNamespace(
+            encode_urls=[], _extract_url_data=lambda obj: mm_data
+        )
+        obj = SimpleNamespace(rid="request-1", need_wait_for_mm_inputs=True)
+        result = MMReceiverBase._send_encode_request(receiver, obj)
+        return obj, result
+
+    def test_rejects_mm_request(self):
+        with self.assertRaises(HTTPException) as raised:
+            self._dispatch(["http://example.invalid/a.png"])
+        self.assertEqual(raised.exception.status_code, HTTPStatus.SERVICE_UNAVAILABLE)
+
+    def test_text_only_request_passes_without_waiting(self):
+        obj, result = self._dispatch([])
+        self.assertIsNone(result)
+        self.assertFalse(obj.need_wait_for_mm_inputs)
+
+
+class TestHoldReadyRequests(CustomTestCase):
+    """Ready requests wait for batch-mates still receiving only while decode runs, and only for a bounded number of ticks."""
+
+    @staticmethod
+    def _hold(statuses, held_ticks, *, receiving=None, decoding=True, max_ticks=4):
+        if receiving is None:
+            receiving = [s == WaitingMMRequestStatus.PENDING for s in statuses]
+        receiver = SimpleNamespace(
+            scheduler=SimpleNamespace(
+                running_batch=SimpleNamespace(is_empty=lambda: not decoding)
+            ),
+            waiting_list=[SimpleNamespace(held_ticks=t) for t in held_ticks],
+        )
+        with envs.SGLANG_ENCODER_RECEIVER_COALESCE_TICKS.override(max_ticks):
+            return MMReceiverBase._hold_ready_requests(
+                receiver,
+                torch.tensor([int(x) for x in statuses], dtype=torch.int32),
+                torch.tensor(receiving),
+            )
+
+    def test_holds_ready_while_a_batch_mate_is_pending(self):
+        S = WaitingMMRequestStatus
+        self.assertTrue(self._hold([S.SUCCESS, S.PENDING], [0, 0]))
+
+    def test_releases_when_pending_mates_only_wait_for_pool_space(self):
+        """Held requests may be what fills the embedding pool; waiting on a pool-blocked request cannot help."""
+        S = WaitingMMRequestStatus
+        self.assertFalse(
+            self._hold([S.SUCCESS, S.PENDING], [0, 0], receiving=[False, False])
+        )
+
+    def test_releases_once_nothing_is_pending(self):
+        S = WaitingMMRequestStatus
+        self.assertFalse(self._hold([S.SUCCESS, S.SUCCESS], [2, 0]))
+
+    def test_releases_when_no_decode_would_be_interrupted(self):
+        S = WaitingMMRequestStatus
+        self.assertFalse(self._hold([S.SUCCESS, S.PENDING], [0, 0], decoding=False))
+
+    def test_releases_after_the_tick_budget(self):
+        S = WaitingMMRequestStatus
+        self.assertFalse(self._hold([S.SUCCESS, S.PENDING], [4, 0]))
+
+    def test_zero_ticks_disables_holding(self):
+        S = WaitingMMRequestStatus
+        self.assertFalse(self._hold([S.SUCCESS, S.PENDING], [0, 0], max_ticks=0))
 
 
 if __name__ == "__main__":

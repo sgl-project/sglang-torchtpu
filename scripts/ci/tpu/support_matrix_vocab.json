@@ -13,6 +13,9 @@
     "multihost": "Multi-host"
   },
   "models": {
+    "muse-spark-open-816b-a42b": {
+      "name": "Muse Spark Open 816B-A42B NVFP4"
+    },
     "gpt-oss-120b": {
       "name": "gpt-oss-120b"
     },
@@ -39,6 +42,9 @@
     },
     "qwen3-vl-8b": {
       "name": "Qwen3-VL-8B"
+    },
+    "qwen3-vl-30b-a3b": {
+      "name": "Qwen3-VL-30B-A3B"
     },
     "qwen3-8b": {
       "name": "Qwen3-8B"
@@ -70,6 +76,9 @@
     "gemma4-26b-a4b": {
       "name": "Gemma 4 26B-A4B"
     },
+    "glm-5.3-flash": {
+      "name": "GLM-5.3-Flash"
+    },
     "wan2.2-ti2v-5b": {
       "name": "Wan2.2-TI2V-5B"
     }
@@ -90,6 +99,7 @@
     "pcp": "Prefill context parallel",
     "pp": "Pipeline parallel",
     "pd": "PD disaggregation",
+    "epd": "EPD (standalone vision encode server)",
     "tp-reshard": {
       "name": "PD TP resharding",
       "aliases": [
@@ -105,6 +115,7 @@
     "compile-tracer": "Direct compile tracer",
     "agentic": "Agentic tool-call workload",
     "multimodal": "Multimodal",
+    "video": "Video input",
     "diffusion": "Diffusion",
     "collectives": "Multi-host collectives",
     "tpu-oot": "Out-of-tree plugin (mode B)",

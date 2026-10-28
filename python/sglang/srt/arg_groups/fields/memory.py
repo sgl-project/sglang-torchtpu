@@ -15,7 +15,10 @@ from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
 )
-from sglang.srt.arg_groups.choices import RADIX_EVICTION_POLICY_CHOICES
+from sglang.srt.arg_groups.choices import (
+    HICACHE_IO_BACKEND_CHOICES,
+    RADIX_EVICTION_POLICY_CHOICES,
+)
 
 
 class Memory(msgspec.Struct):
@@ -127,7 +130,7 @@ class Memory(msgspec.Struct):
         Arg(
             help="The IO backend for KV cache transfer between CPU and GPU "
             "('raiden' offloads TPU<->host via the raiden DMA engine)",
-            choices=["direct", "kernel", "kernel_ascend", "torch_tpu", "raiden"],
+            choices=HICACHE_IO_BACKEND_CHOICES,
         ),
     ] = "kernel"
     hicache_mem_layout: A[

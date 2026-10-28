@@ -20,13 +20,14 @@ import torch
 
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_disagg, get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang_tpu.experimental import (
     experimental_spec_enabled,
     get_host_batch_padder,
     is_experimental_chain,
     is_experimental_spec,
+    is_experimental_spec_worker,
     uses_host_batch,
 )
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
@@ -36,9 +37,12 @@ def initialize_host_batch(result, *args, **kwargs):
     # Every batch of a process a TpuSpecWorker serves is host padded, whatever the algorithm.
     padder = get_host_batch_padder()
     if padder is not None:
-        if not result.enable_overlap:
+        # Only decode relays through FutureMap; a PD prefill (PP runs it
+        # without overlap) never decodes.
+        if not result.enable_overlap and get_disagg().disaggregation_mode != "prefill":
             raise ValueError(
-                "The experimental TPU spec worker requires overlap scheduling"
+                "The experimental TPU spec worker requires overlap scheduling "
+                "outside --disaggregation-mode prefill"
             )
         result.host_pad_bs = padder
     return result
@@ -64,6 +68,11 @@ def sampling_from_batch(
     )
 
 
+def _relays_rows(batch) -> bool:
+    """Whether FutureMap owns batch's rows; a non-overlap PD prefill keeps core's."""
+    return uses_host_batch(batch) and batch.enable_overlap
+
+
 def _rebuild_relay_rows(batch):
     assert batch.enable_overlap and not batch.spec_algorithm.is_none()
     assert batch.input_ids is None
@@ -76,21 +85,34 @@ def _rebuild_relay_rows(batch):
 
 
 def filter_model_inputs(original, batch, keep_indices, keep_indices_device):
-    if not uses_host_batch(batch):
+    if not _relays_rows(batch):
         return original(batch, keep_indices, keep_indices_device)
     _rebuild_relay_rows(batch)
 
 
 def merge_model_inputs(original, batch, other):
     assert uses_host_batch(batch) == uses_host_batch(other)
-    if not uses_host_batch(batch):
+    if not _relays_rows(batch):
         return original(batch, other)
     assert other.input_ids is None
     _rebuild_relay_rows(batch)
 
 
+def _draft_state_on_host(spec_info: SpecInput | None) -> bool:
+    from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+    return (
+        isinstance(spec_info, EagleDraftInput)
+        and spec_info.bonus_tokens is not None
+        and spec_info.bonus_tokens.device.type == "cpu"
+    )
+
+
 def filter_spec_input(original, batch, keep_indices, keep_indices_device):
-    if not uses_host_batch(batch):
+    if not _relays_rows(batch):
+        if _draft_state_on_host(batch.spec_info):
+            # A PP PD prefill keeps the relayed draft state on host; index it there.
+            keep_indices_device = torch.tensor(keep_indices, dtype=torch.int64)
         return original(batch, keep_indices, keep_indices_device)
     from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 
@@ -103,7 +125,7 @@ def filter_spec_input(original, batch, keep_indices, keep_indices_device):
 
 
 def merge_spec_input(original, batch, other):
-    if not uses_host_batch(batch):
+    if not _relays_rows(batch):
         return original(batch, other)
     from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 
@@ -193,8 +215,8 @@ def _relay_disagg_seed(
 
 
 def _reset_pd_checkpoints(batch: ScheduleBatch) -> None:
-    # The transferred GDN state lands in checkpoint row 0 of each slot, but a
-    # reused decode slot keeps its previous read offset; prebuilt skips extend's clear.
+    # The transferred GDN state lands in each slot's own row, but a reused decode
+    # slot keeps its previous read offset; prebuilt skips extend's reset.
     from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
     from sglang_tpu.mamba_pool import TpuMambaPool
 
@@ -331,6 +353,15 @@ def supports_kv_free_fence(original, spec_algorithm, *, copies_draft_tail):
     return original(spec_algorithm, copies_draft_tail=copies_draft_tail)
 
 
+def supports_pd_decode_swa_hicache(original, spec_algorithm):
+    if is_experimental_spec_worker(spec_algorithm):
+        # The block draft's KV at i is projected from the target hidden at i and
+        # written for every prompt and committed token, so unigram radix keys and
+        # the full-anchored draft sidecar cover it; this extends DFlash to DSpark.
+        return True
+    return original(spec_algorithm)
+
+
 def need_topk(original, spec_algorithm):
     # HostPaddedDraftInput carries an empty topk placeholder; an EAGLE topk relay
     # would route it through the EAGLE device-accept resolve.
@@ -400,6 +431,11 @@ def hook_specs():
             HookType.AROUND,
         ),
         (
+            "sglang.srt.speculative.spec_info.SpeculativeAlgorithm.supports_pd_decode_swa_hicache",
+            supports_pd_decode_swa_hicache,
+            HookType.AROUND,
+        ),
+        (
             "sglang.srt.speculative.spec_info.SpeculativeAlgorithm.supports_tpu_direct_compile",
             supports_tpu_direct_compile,
             HookType.AROUND,
@@ -432,8 +468,8 @@ def hook_specs():
         ),
     ]
     if experimental_spec_enabled():
-        # Hot paths every spec batch takes; registered only with the flag on so
-        # the default path runs no extra wrappers.
+        # Hot paths every spec batch takes (non-spec batches return immediately);
+        # skipped when SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=0 at import time.
         hooks += [
             (
                 "sglang.srt.speculative.spec_utils.spec_prepare_for_decode",

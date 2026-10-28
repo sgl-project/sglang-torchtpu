@@ -19,6 +19,7 @@ decode writes it back into the table. Not ported yet: a draft sliding window.
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Sequence
 
 import torch
@@ -31,6 +32,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
+    PPProxyTensors,
 )
 from sglang.srt.runtime_context import get_disagg, get_spec, process_model_config
 from sglang.srt.server_args import ServerArgs
@@ -58,10 +60,7 @@ from sglang_tpu.experimental.speculative.mtp.mtp_draft_worker import (
     TpuMtpDraftWorker,
 )
 from sglang_tpu.experimental.speculative.spec_ops import (
-    accept_drafts_target_only,
     build_chain_block_inputs,
-    build_verify_tokens,
-    finalize_accept,
     pick,
     select_verify_rows,
 )
@@ -115,10 +114,6 @@ class TpuChainSpecWorker(TpuSpecWorker):
         self._draft_runner = draft_worker.model_runner
         self._target_vocab_size = target_runner.model_config.vocab_size
         self._target_is_multimodal = process_model_config().is_multimodal
-        # An idle DP rank mirrors its peers' draft syncs without knowing whether they
-        # sample; greedy drafts sync one [pbs, N] int64 either way, and sampled
-        # requests take the target-only accept, as TPU EAGLE does.
-        self._sampled_drafts = not self._dp_attention
         self._disagg_mode = get_disagg().disaggregation_mode
         if self._disagg_mode == "decode":
             register_pd_carry_seeder(self._seed_carry)
@@ -128,8 +123,6 @@ class TpuChainSpecWorker(TpuSpecWorker):
         # A PD prefill server never decodes.
         if self._disagg_mode != "prefill":
             self._warmup_draft_ops()
-            if not self._sampled_drafts:
-                self._warmup_target_only_accept()
         if self._disagg_mode == "decode":
             self._warmup_seed_carry()
         else:
@@ -287,11 +280,15 @@ class TpuChainSpecWorker(TpuSpecWorker):
         # The draft rows' forward writes the step's last KV; last_hidden is its output.
         return CommitResult(state=next_state, kv_fence_tail=last_hidden)
 
-    def extend(self, batch: ScheduleBatch) -> GenerationBatchResult:
+    def extend(
+        self, batch: ScheduleBatch, *, pp_proxy_tensors: PPProxyTensors | None
+    ) -> GenerationBatchResult:
         result = self.target_worker.forward_batch_generation(
-            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+            batch,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
-        self._tp_sync.sync(SpecTpSyncSite.SPEC_TARGET, result.next_token_ids)
+        result.next_token_ids = self.sync_target_tokens(result.next_token_ids)
         if not batch.reqs:
             # A DP-attention rank without prompts (DP padding relabels its batch)
             # still issues the draft prefill's collectives.
@@ -355,15 +352,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
             hidden_states=target_hidden, width=1
         )
         forward_batch.return_logprob = False
-        if forward_batch.global_num_tokens_cpu is not None:
-            # DP attention pads the batch to the synced live counts, but the tokens
-            # are already at the token bucket, and the draft (run in its
-            # attention-TP group) gathers nothing across DP ranks.
-            num_ranks = len(forward_batch.global_num_tokens_cpu)
-            forward_batch.global_num_tokens_cpu = [padded_tokens] * num_ranks
-            forward_batch.global_num_tokens_gpu = torch.full(
-                (num_ranks,), padded_tokens, dtype=torch.int64
-            ).to(self.device, non_blocking=True)
+        self._set_draft_prefill_dp_counts(forward_batch, padded_tokens=padded_tokens)
         with self._chain_draft_worker.draft_context(), torch.no_grad():
             if mm_input_embeds is not None:
                 assert mm_input_embeds.shape[0] == padded_tokens
@@ -454,59 +443,37 @@ class TpuChainSpecWorker(TpuSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.LAST,
             return_hidden_states_before_norm=False,
         )
+        idle_hidden = target_hidden[:0]
         forward_batch.spec_info = chain_draft_forward_input(
-            hidden_states=target_hidden[:0], width=1
+            hidden_states=idle_hidden, width=1
         )
         forward_batch.return_logprob = False
+        # The TPU forward relabels this idle rank DECODE; core's speculative decode
+        # unpadding then reads the hidden backup that only draft inputs set.
+        forward_batch.hidden_states_backup = idle_hidden
+        # Pad to the peers' token bucket so every rank runs the same draft program.
+        self._set_draft_prefill_dp_counts(
+            forward_batch, padded_tokens=target_hidden.shape[0]
+        )
         with self._chain_draft_worker.draft_context(), torch.no_grad():
             self._draft_runner.forward(forward_batch)
 
-    def _idle_extend_result(
-        self, result: GenerationBatchResult
-    ) -> GenerationBatchResult:
-        if result.logits_output is not None:
-            result.logits_output.hidden_states = None
-        idle = self._idle_result()
-        result.next_token_ids = idle.next_token_ids
-        result.new_seq_lens = idle.new_seq_lens
-        result.next_draft_input = idle.next_draft_input
-        return result
-
-    def _forward_idle_step(
-        self,
-        *,
-        batch: ScheduleBatch,
-        state: SpecState,
-        rows: VerifyRows,
-        verify_input: TpuSpecVerifyInput,
+    def _set_draft_prefill_dp_counts(
+        self, forward_batch: ForwardBatch, *, padded_tokens: int
     ) -> None:
-        # The active step's forwards in order: draft chain, verify, commit's draft rows.
-        seq_lens_cpu, _ = verify_input.padded_kv_lens_after_rows(self.num_drafts)
-        draft_result = self._draft_chain(
-            state=state,
-            rows=rows,
-            req_pool_indices_cpu=verify_input.req_pool_indices_cpu,
-            seq_lens_cpu=seq_lens_cpu,
-            temperatures=None,
-            top_ks=None,
-        )
-        logits_output = self._forward_idle_verify(
-            batch=batch,
-            state=state,
-            rows=rows,
-            verify_input=verify_input,
-            verify_tokens=build_verify_tokens(
-                state.bonus_tokens, draft_result.draft_tokens
-            ),
-        )
-        accept = finalize_accept(
-            draft_result.draft_tokens,
-            self._device_zeros(state.seq_lens.shape[0]),
-            state.bonus_tokens,
-            state.seq_lens,
-            state.req_pool_indices != 0,
-        )
-        self.commit(batch, state, rows, verify_input, logits_output, accept)
+        """DP counts for the draft prefill: every rank at the token bucket.
+
+        The synced counts are live tokens, but the draft runs at the token
+        bucket on every rank, active or idle; the attention-TP collectives it
+        picks depend on the count, so all ranks must see the same one.
+        """
+        if forward_batch.global_num_tokens_cpu is None:
+            return
+        num_ranks = len(forward_batch.global_num_tokens_cpu)
+        forward_batch.global_num_tokens_cpu = [padded_tokens] * num_ranks
+        forward_batch.global_num_tokens_gpu = torch.full(
+            (num_ranks,), padded_tokens, dtype=torch.int64
+        ).to(self.device, non_blocking=True)
 
     def make_verify_input(
         self, *, batch: ScheduleBatch, verify_tokens: torch.Tensor, rows: VerifyRows
@@ -541,10 +508,11 @@ class TpuChainSpecWorker(TpuSpecWorker):
     def _warmup_draft_ops(self) -> None:
         """Eager draft/commit ops around the compiled draft programs, per batch bucket."""
         drafter = self._chain_draft_worker
-        width = self.num_verify_rows
         with torch.no_grad():
-            for pbs in self._b_bucketer().buckets:
-                self._warmup_draft_chain(pbs)
+            for width, pbs in itertools.product(
+                self.verify_widths(), self._b_bucketer().buckets
+            ):
+                self._warmup_draft_chain(pbs, width)
                 rows = _dummy_verify_rows(pbs, width, self.device)
                 accept_tokens = torch.zeros(
                     (pbs, width), dtype=torch.int64, device=self.device
@@ -570,15 +538,16 @@ class TpuChainSpecWorker(TpuSpecWorker):
                 pool_rows = torch.zeros((pbs,), dtype=torch.int64).to(self.device)
                 drafter.carry.index_copy_(0, pool_rows, last)
 
-    def _warmup_draft_chain(self, pbs: int) -> None:
+    def _warmup_draft_chain(self, pbs: int, width: int) -> None:
         """draft's eager prelude fuses with select_verify_rows' layout, so replay both."""
 
         def upload(*shape: int, dtype: torch.dtype = torch.int64) -> torch.Tensor:
             return torch.zeros(shape, dtype=dtype).to(self.device, non_blocking=True)
 
-        width = self.num_verify_rows
         seq_lens = upload(pbs)
-        rows = select_verify_rows(upload(pbs, 2 * width), upload(pbs), seq_lens)
+        rows = select_verify_rows(
+            upload(pbs, 2 * self.verify_window_rows), upload(pbs), seq_lens, width
+        )
         state = SpecState(
             bonus_tokens=upload(pbs), seq_lens=seq_lens, req_pool_indices=upload(pbs)
         )
@@ -600,29 +569,6 @@ class TpuChainSpecWorker(TpuSpecWorker):
             if result.draft_logits is not None:
                 self._warmup_sampled_accept(
                     pbs, result.draft_tokens, result.draft_logits
-                )
-
-    def _warmup_target_only_accept(self) -> None:
-        """Target-only acceptance, target filter included, per batch bucket."""
-        vocab_size = self.target_worker.model_runner.model_config.vocab_size
-        with torch.no_grad():
-            for padded_bs in self._b_bucketer().buckets:
-                warmup_compiled_op(
-                    accept_drafts_target_only,
-                    torch.zeros(
-                        (padded_bs * self.num_verify_rows, vocab_size),
-                        dtype=torch.float32,
-                        device=self.device,
-                    ),
-                    torch.zeros(
-                        (padded_bs, self.num_drafts),
-                        dtype=torch.int64,
-                        device=self.device,
-                    ),
-                    self._all_drafts[padded_bs],
-                    *self._sampling_param_warmup_args(padded_bs),
-                    self._accept_threshold_single,
-                    self._accept_threshold_acc,
                 )
 
     def _warmup_multimodal_prefill(self) -> None:
@@ -663,16 +609,20 @@ class TpuChainSpecWorker(TpuSpecWorker):
 
     def _warmup_verify_mrope(self) -> None:
         """compute_spec_mrope_positions on the verify rows: text-only, then per-request deltas."""
-        width = self.num_verify_rows
 
         def upload(*shape: int) -> torch.Tensor:
             return torch.zeros(shape, dtype=torch.int64).to(self.device)
 
         with torch.no_grad():
-            for padded_bs in self._b_bucketer().buckets:
+            for width, padded_bs in itertools.product(
+                self.verify_widths(), self._b_bucketer().buckets
+            ):
                 # make_verify_input hands over select_verify_rows' flat positions.
                 rows = select_verify_rows(
-                    upload(padded_bs, 2 * width), upload(padded_bs), upload(padded_bs)
+                    upload(padded_bs, 2 * self.verify_window_rows),
+                    upload(padded_bs),
+                    upload(padded_bs),
+                    width,
                 )
                 positions = rows.flat_positions.view(padded_bs, -1)
                 positions.flatten().unsqueeze(0).repeat(3, 1).cpu()

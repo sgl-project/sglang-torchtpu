@@ -226,6 +226,25 @@ class TestWaveProtocol(CustomTestCase):
         self.assertEqual(ici.count, [3, 3])
 
 
+class TestWaveWarmup(CustomTestCase):
+    def test_warmup_merges_every_bucket_the_buffer_holds(self):
+        """Each forward bucket's sum and pad compiles at warmup, not on its first hand-off."""
+        for num_aux in (0, 2):
+            wave = _wave(0, 2, num_aux=num_aux)
+            seen = []
+            merge = wave.merge
+            wave.merge = lambda tensors: (
+                seen.append({k: tuple(v.shape) for k, v in tensors.items()})
+                or merge(tensors)
+            )
+            wave.warmup_merge({2, ROWS, ROWS + 4})
+            self.assertEqual(
+                sorted(rows["hidden_states"][0] for rows in seen), [2, ROWS]
+            )
+            for rows in seen:
+                self.assertEqual(len(rows), 2 + (num_aux > 0))
+
+
 class TestWaveGuards(CustomTestCase):
     def test_rejects_rows_above_the_buffer(self):
         wave = _wave(0, 2)

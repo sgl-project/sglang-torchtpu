@@ -13,13 +13,19 @@ from unittest.mock import patch
 import torch
 import torch.compiler.config as compiler_config
 
+from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.parallel_hook import handle_elastic_ep
+from sglang.srt.arg_groups.resolution_hooks import run_hook
+from sglang.srt.arg_groups.serving_hook import handle_other_validations
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
+    CudaGraphConfig,
     default_cuda_graph_config,
 )
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.runtime_context import get_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
@@ -30,6 +36,82 @@ from sglang_tpu.tpu_platform import (
 
 # CPU suite: mocks torch_tpu, so it runs on the CPU runners -- never a TPU node.
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestTpuStartupCleanupValidation(CustomTestCase):
+    def test_control_broadcast_compatibility(self):
+        for fields, rejected in (
+            ({}, False),
+            ({"attn_dp_size": 2}, False),
+            ({"enable_dp_attention_local_control_broadcast": True}, False),
+            (
+                {
+                    "attn_dp_size": 2,
+                    "enable_dp_attention_local_control_broadcast": True,
+                },
+                True,
+            ),
+            ({"attn_dp_size": 2, "ep_join_mode": "scale"}, True),
+            ({"attn_dp_size": 1, "ep_join_mode": "scale"}, True),
+            (
+                {
+                    "attn_dp_size": 2,
+                    "dwdp_size": 2,
+                    "enable_dp_attention_local_control_broadcast": True,
+                },
+                False,
+            ),
+            (
+                {
+                    "device": "cuda",
+                    "attn_dp_size": 2,
+                    "enable_dp_attention_local_control_broadcast": True,
+                },
+                False,
+            ),
+        ):
+            with self.subTest(fields=fields):
+                args = ServerArgs(model_path="dummy", **{"device": "tpu", **fields})
+                if rejected:
+                    with self.assertRaisesRegex(
+                        ValueError, "global control broadcasts"
+                    ):
+                        run_hook(handle_other_validations, args)
+                else:
+                    run_hook(handle_other_validations, args)
+
+        args = ServerArgs(model_path="dummy", default_chat_template_kwargs=[])
+        with self.assertRaisesRegex(ValueError, "must decode to a JSON object"):
+            run_hook(handle_other_validations, args)
+
+    def test_rejects_automatically_enabled_local_control(self):
+        args = ServerArgs(
+            model_path="dummy",
+            device="tpu",
+            tp_size=2,
+            attn_dp_size=2,
+            ep_size=2,
+            enable_dp_lm_head=True,
+            elastic_ep_backend="mooncake",
+            max_ep_size=4,
+            moe_a2a_backend="nixl",
+            load_balance_method="round_robin",
+            cuda_graph_config=CudaGraphConfig.from_dict(
+                {
+                    "decode": {"backend": Backend.DISABLED},
+                    "prefill": {"backend": Backend.DISABLED},
+                }
+            ),
+        )
+        self.assertFalse(
+            resolving_view(args).enable_dp_attention_local_control_broadcast
+        )
+        run_hook(handle_elastic_ep, args)
+        self.assertTrue(
+            resolving_view(args).enable_dp_attention_local_control_broadcast
+        )
+        with self.assertRaisesRegex(ValueError, "elastic EP"):
+            run_hook(handle_other_validations, args)
 
 
 class TestTpuPlatformIdentity(CustomTestCase):
@@ -174,7 +256,7 @@ class TestTpuPlatformInitialization(CustomTestCase):
             patch("sglang_tpu.tpu_platform.rank_slice._load"),
             patch("sglang_tpu.tpu_platform.traced_rank._load"),
             patch(
-                "sglang.srt.models.registry.ModelRegistry.register",
+                "sglang.srt.models.registry.ModelRegistry.register_lazy",
                 side_effect=register,
             ),
         ):
@@ -295,6 +377,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             optimistic_prefill_attempts=0,
             max_queued_requests=None,
             enable_priority_scheduling=False,
+            disaggregation_enable_kv_checksum=False,
             dcp_size=1,
             attn_cp_size=1,
             enable_prefill_cp=False,
@@ -368,6 +451,31 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         ):
             with self.subTest(**overrides):
                 self._apply(self._args(**overrides))
+
+    def test_rejects_kv_checksum(self):
+        """The KV checksum is CUDA-only. On TPU the prefill passed its health
+        checks and then every rank died on the first real request (#1177)."""
+        for mode in ("prefill", "decode", "null"):
+            with self.subTest(mode=mode):
+                args = self._args(
+                    disaggregation_mode=mode,
+                    disaggregation_transfer_backend="raiden",
+                    disaggregation_enable_kv_checksum=True,
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "--disaggregation-enable-kv-checksum is not supported on TPU",
+                ):
+                    self._apply(args)
+
+    def test_kv_checksum_off_allowed(self):
+        self._apply(
+            self._args(
+                disaggregation_mode="prefill",
+                disaggregation_transfer_backend="raiden",
+                disaggregation_enable_kv_checksum=False,
+            )
+        )
 
     def test_defaults_applied(self):
         args = self._args(enable_torch_compile=False)
@@ -490,6 +598,34 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             enable_dp_lm_head=False,
         )
         self._apply(args)
+
+    def test_shared_head_experimental_drafts_need_dp_lm_head_at_attn_tp_1(self):
+        """At attention TP 1 the target head shards over the full TP group, but these
+        drafts share it inside the attention-TP group: they would draft from one shard."""
+        from sglang_tpu.envs import envs as tpu_envs
+
+        for algorithm, enabled, error in (
+            ("DFLASH", True, True),
+            ("NEXTN", True, True),
+            ("EAGLE3", True, False),
+            ("DFLASH", False, False),
+        ):
+            args = self._args(
+                tp_size=8,
+                attn_dp_size=8,
+                enable_dp_lm_head=False,
+                speculative_algorithm=algorithm,
+            )
+            with (
+                self.subTest(algorithm=algorithm, enabled=enabled),
+                tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(enabled),
+                tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(enabled),
+            ):
+                if error:
+                    with self.assertRaisesRegex(ValueError, "--enable-dp-lm-head"):
+                        self._apply(args)
+                else:
+                    self._apply(args)
 
     def test_configures_export_mesh_from_tp_size(self):
         args = self._args(tp_size=16)
@@ -727,6 +863,7 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
             optimistic_prefill_attempts=0,
             max_queued_requests=None,
             enable_priority_scheduling=False,
+            disaggregation_enable_kv_checksum=False,
             enable_hierarchical_cache=False,
             dcp_comm_backend="ag_rs",
             dcp_replicate_q_proj=False,

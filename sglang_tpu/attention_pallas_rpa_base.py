@@ -803,8 +803,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             return cached
 
         dist = self._make_rpa_distribution_cpu(is_decode, non_empty_bs).to(device)
-        if not envs.SGLANG_TPU_HOST_PADDING.get():
-            dist.tolist()  # one-time blocking sync: wait until the H2D completes
         self._distribution_cache[key] = dist
         return dist
 

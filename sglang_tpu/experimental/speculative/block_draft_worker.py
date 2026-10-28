@@ -6,8 +6,12 @@ from abc import abstractmethod
 from collections.abc import Callable
 
 import torch
+from torch import nn
 
+from sglang.srt.layers.utils.common import PPMissingLayer
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.models.dflash import DFlashDraftModel
+from sglang.srt.runtime_context import get_disagg
 from sglang_tpu.dflash_draft_kv_write import dflash_write_draft_kv
 from sglang_tpu.experimental.compilation.block_compile_policy import (
     TpuBlockSpecDecodeCompilePolicyMixin,
@@ -121,3 +125,17 @@ class TpuBlockDraftWorker(TpuDraftWorker):
                 f"{type(compile_policy).__name__}."
             )
         return compile_policy
+
+
+def target_input_embedding(target_model: nn.Module) -> nn.Module | None:
+    """The target embedding the block draft embeds with; None on a PP stage without it."""
+    embedding = target_model.get_input_embeddings()
+    if not isinstance(embedding, PPMissingLayer):
+        return unwrap_lora_layer(embedding)
+    # Only the first PP stage holds it; a PD prefill only writes draft KV, never embeds.
+    if get_disagg().disaggregation_mode != "prefill":
+        raise NotImplementedError(
+            "The block draft needs the target embedding, which this pipeline "
+            "stage does not hold; PP serves block drafts on a PD prefill only."
+        )
+    return None

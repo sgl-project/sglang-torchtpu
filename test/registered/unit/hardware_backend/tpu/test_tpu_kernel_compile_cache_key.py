@@ -47,7 +47,9 @@ class TestKernelInputsDigest(CustomTestCase):
             "sglang/srt/layers/moe/tpu_moe_utils.py",
             "MODE = envs.SGLANG_TPU_INT4_MOE_MODE.get()\n",
         )
-        self.write("sglang/srt/models/model.py", "envs.SGLANG_TPU_HOST_PADDING.get()\n")
+        self.write(
+            "sglang/srt/models/model.py", "envs.SGLANG_TPU_HOST_PADDING_NO_D2H.get()\n"
+        )
         self.write(
             "sglang_tpu/monitor.py",
             "CHECK = envs.SGLANG_TPU_CHECK_RECOMPILATION.get()\n",
@@ -65,7 +67,7 @@ class TestKernelInputsDigest(CustomTestCase):
         enter_scope(self, envs.SGLANG_TPU_CHECK_RECOMPILATION.override(False))
         enter_scope(self, envs.SGLANG_TPU_FP8_MOE_FP32_SCALES.override(False))
         enter_scope(self, envs.SGLANG_TPU_INT4_MOE_MODE.override(None))
-        enter_scope(self, envs.SGLANG_TPU_HOST_PADDING.override(False))
+        enter_scope(self, tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False))
         self.versions = {"jax": "0.10.2", "jaxlib": "0.10.2", "libtpu": "0.0.47"}
         enter_scope(
             self,
@@ -185,7 +187,7 @@ class TestKernelInputsDigest(CustomTestCase):
         with envs.SGLANG_TPU_INT4_MOE_MODE.override("vmem-bf16"):
             self.assertNotEqual(self.digest(), self.base)
         # A knob read only outside the kernel sources reaches FX, not the digest.
-        with envs.SGLANG_TPU_HOST_PADDING.override(True):
+        with tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(True):
             self.assertEqual(self.digest(), self.base)
 
     def test_stack_versions_and_tpu_generation_change_the_digest(self):

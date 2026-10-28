@@ -13,15 +13,18 @@ import torch
 
 import sglang.srt.managers.overlap_utils as overlap_utils
 import sglang.srt.speculative.dflash_info_v2 as dflash_info_v2
+import sglang_tpu.dflash_utils_tpu as dflash_utils_tpu
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang_tpu.dflash_utils_tpu import (
     DeviceVerifyBlockSelector,
+    argmax_draft_tokens_tpu,
     build_dflash_draft_block,
     gather_dflash_candidate_window,
     select_dflash_verify_cache_locs_tpu,
 )
+from sglang_tpu.experimental.speculative.spec_ops import select_verify_rows
 from sglang_tpu.overlap_utils_tpu import (
     resolve_device_accept_seq_lens_tpu,
 )
@@ -133,26 +136,33 @@ def _req_to_token(num_rows: int) -> torch.Tensor:
     )
 
 
-def test_window_selection_matches_direct_lookup_for_every_commit_length():
+@pytest.mark.parametrize("capacity, width", [(4, 4), (16, 8), (16, 16)])
+def test_window_selection_matches_direct_lookup_for_every_commit_length(
+    capacity, width
+):
     req_to_token = _req_to_token(3)
     rows = torch.tensor([2, 0, 1], dtype=torch.int64)
     base = torch.tensor([10, 7, 23], dtype=torch.int64)
-    candidates = gather_dflash_candidate_window(req_to_token, rows, base, BLOCK_SIZE)
-    assert candidates.shape == (3, 2 * BLOCK_SIZE)
+    candidates = gather_dflash_candidate_window(req_to_token, rows, base, capacity)
+    assert candidates.shape == (3, 2 * capacity)
 
-    # commit_lens is in [1, block_size]; 0 covers an extend/idle predecessor.
-    for commit in range(0, BLOCK_SIZE + 1):
+    # The preceding commit may use the full capacity before a shorter step.
+    # Zero covers an extend/idle predecessor.
+    for commit in range(0, capacity + 1):
         seq_lens = base + commit
         selected = select_dflash_verify_cache_locs_tpu(
-            candidates, seq_lens, base, BLOCK_SIZE
+            candidates, seq_lens, base, width
         )
         expected = torch.stack(
             [
-                req_to_token[row, start : start + BLOCK_SIZE]
+                req_to_token[row, start : start + width]
                 for row, start in zip(rows.tolist(), seq_lens.tolist())
             ]
         )
         torch.testing.assert_close(selected, expected)
+        verify = select_verify_rows(candidates, base, seq_lens, width)
+        assert torch.equal(verify.cache_locs, expected)
+        assert torch.equal(verify.positions, seq_lens[:, None] + torch.arange(width))
 
 
 def test_window_covers_the_reserved_two_block_span():
@@ -497,3 +507,46 @@ def test_fused_draft_block_matches_the_step_by_step_prep():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_sharded_draft_argmax_outside_pallas_sizes_takes_the_global_best():
+    """A DP-attention draft on TP2/TP4 has a vocab-sharded head the Pallas TopK cannot
+    serve; drafting from the local shard alone would silently drop acceptance."""
+    # Rank 0 of TP2: tokens 0..3 here, 4..7 on rank 1.
+    weight = torch.eye(4)
+    lm_head = SimpleNamespace(
+        weight=weight,
+        quant_method=SimpleNamespace(apply=lambda head, hs: hs @ head.weight.T),
+        enable_tp=True,
+        num_embeddings=8,
+        num_embeddings_per_partition=4,
+        org_vocab_size=8,
+        shard_indices=SimpleNamespace(num_org_elements=4, org_vocab_start_index=0),
+    )
+    # Block of 3 rows; rows 1 and 2 draft: local best token 1 (5.0) and 2 (1.0).
+    hidden = torch.tensor(
+        [[0.0, 0.0, 0.0, 0.0], [0.0, 5.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]
+    )
+    # Rank 1's shard bests: 3.0 at token 6, 9.0 at token 7.
+    peer = {
+        torch.float32: torch.tensor([[3.0], [9.0]]),
+        torch.int64: torch.tensor([[6], [7]]),
+    }
+    group = SimpleNamespace(
+        world_size=2,
+        all_gather=lambda t, dim: torch.cat([t, peer[t.dtype]], dim=dim),
+    )
+    with (
+        patch.object(
+            dflash_utils_tpu, "model_parallel_is_initialized", return_value=True
+        ),
+        patch.object(
+            dflash_utils_tpu,
+            "get_parallel",
+            return_value=SimpleNamespace(tp_group=group),
+        ),
+    ):
+        tokens = argmax_draft_tokens_tpu(
+            lm_head=lm_head, hidden_states=hidden, block_size=3
+        )
+    assert tokens.tolist() == [[1, 7]]

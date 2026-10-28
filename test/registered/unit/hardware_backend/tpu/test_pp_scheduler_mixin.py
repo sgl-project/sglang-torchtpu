@@ -19,6 +19,9 @@ import torch  # noqa: E402
 
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors  # noqa: E402
+from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (  # noqa: E402
+    SpecAuxHiddenStateConfig,
+)
 from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 from sglang.test.test_utils import CustomTestCase  # noqa: E402
@@ -155,7 +158,7 @@ class TestWaveRows(CustomTestCase):
             model_runner=SimpleNamespace(
                 compile_policy=compile_policy,
                 model_config=SimpleNamespace(context_len=4096, hidden_size=16),
-                spec_aux_config=SimpleNamespace(eagle_use_aux_hidden_state=False),
+                spec_aux_config=SpecAuxHiddenStateConfig(),
                 model=SimpleNamespace(),
                 dtype=torch.bfloat16,
                 device="cpu",

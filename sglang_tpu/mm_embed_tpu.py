@@ -58,9 +58,10 @@ def scatter_mm_on_device(
 
     # Keep indices at the padded token count; only their values depend on
     # image lengths. The elementwise fallback scans tokens * hidden instead.
-    indices = (torch.cumsum(mask.reshape(-1), dim=0, dtype=torch.int32) - 1).clamp_(
-        min=0
-    )
+    flat = mask.reshape(-1)
+    indices = torch.cumsum(flat, dim=0, dtype=torch.int32) - 1
+    # Rows outside the mask read their own row; repeated indices slow the gather.
+    indices = torch.where(flat, indices, torch.arange(flat.numel(), dtype=torch.int32))
     _scatter_mm_rows(dest, src, indices, mask, merge_rows=merge_rows)
 
 
@@ -101,7 +102,8 @@ def _scatter_padded_embedding(
         if key not in placements:
             placements[key] = (
                 span.buffer,
-                torch.zeros(dest.shape[0], dtype=torch.int32),
+                # Inactive rows read their own row; repeated indices slow the gather.
+                torch.arange(dest.shape[0], dtype=torch.int32),
                 torch.zeros(dest.shape[0], 1, dtype=torch.bool),
             )
         _buffer, indices, active = placements[key]
@@ -116,6 +118,43 @@ def _scatter_padded_embedding(
         _scatter_mm_rows(dest, buffer, indices, active, merge_rows=merge_rows)
 
 
+class _HostRowBuffer:
+    """A reused [rows, hidden] host matrix that is zero outside the rows last written.
+
+    A fresh zeros() of the padded batch faults in every page on each prefill:
+    ~100 ms at 8192 x 12288 bf16, against ~10 ms for the scatter itself. Reuse
+    relies on torch_tpu copying pageable host memory before .to() returns.
+    """
+
+    def __init__(self, rows: int, hidden: int, dtype: torch.dtype):
+        self.matrix = torch.zeros((rows, hidden), dtype=dtype)
+        self._written = torch.empty(0, dtype=torch.long)
+
+    def reset(self) -> torch.Tensor:
+        self.matrix[self._written] = 0
+        self._written = torch.empty(0, dtype=torch.long)
+        return self.matrix
+
+    def write(self, indices: torch.Tensor, rows: torch.Tensor) -> None:
+        self.matrix[indices] = rows
+        self._written = torch.cat([self._written, indices])
+
+
+# Keyed by (slot, rows, hidden, dtype); slot keeps the embeds and deepstack
+# matrices of one batch apart when their shapes coincide.
+_host_row_buffers: Dict[Tuple[str, int, int, torch.dtype], _HostRowBuffer] = {}
+
+
+def _host_row_buffer(
+    slot: str, rows: int, hidden: int, dtype: torch.dtype
+) -> _HostRowBuffer:
+    key = (slot, rows, hidden, dtype)
+    buffer = _host_row_buffers.get(key)
+    if buffer is None:
+        buffer = _host_row_buffers[key] = _HostRowBuffer(rows, hidden, dtype)
+    return buffer
+
+
 def _place_mm_rows(
     *,
     masks: List[Optional[torch.Tensor]],
@@ -123,8 +162,12 @@ def _place_mm_rows(
     rows: int,
     hidden: int,
     dtype: torch.dtype,
+    slot: str,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Scatter host embeddings into a zero-filled [rows, hidden] host matrix.
+
+    The matrix is a reused buffer: it is valid until the next call with the same
+    slot and shape, so callers must copy it to the device before then.
 
     Args:
         masks: Per-modality host bool masks of shape [rows, 1]; None to skip.
@@ -156,9 +199,10 @@ def _place_mm_rows(
                 f"{indices.numel()} positions."
             )
         if out is None:
-            out = torch.zeros((rows, hidden), dtype=dtype)
+            buffer = _host_row_buffer(slot, rows, hidden, dtype)
+            out = buffer.reset()
             merged_mask = torch.zeros((rows, 1), dtype=torch.bool)
-        out[indices] = embedding.to(dtype)
+        buffer.write(indices, embedding.to(dtype))
         merged_mask |= mask
     if out is None:
         return None
@@ -206,6 +250,7 @@ def embed_mm_on_host(
         rows=rows,
         hidden=input_embeds.shape[-1],
         dtype=dtype,
+        slot="embeds",
     )
     if placed is not None:
         host_src, merged_mask = placed
@@ -225,6 +270,7 @@ def embed_mm_on_host(
         rows=rows,
         hidden=deepstack_shape[-1],
         dtype=dtype,
+        slot="deepstack",
     )
     if placed_deepstack is None:
         return input_embeds, torch.zeros(

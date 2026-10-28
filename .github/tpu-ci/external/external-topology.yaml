@@ -23,7 +23,9 @@ weights:
   # node-local file cache; every subsequent read hits local disk. See README.
   mount_options: "implicit-dirs,file-cache:max-size-mb:102400,file-cache:cache-file-for-range-read:true"
   ephemeral_storage_limit: 120Gi
-  default_extra_args: "--weight-loader-disable-mmap"
+  # Loaders mmap the checkpoint (page cache, reclaimable). --weight-loader-disable-mmap copied
+  # every shard into anonymous RSS and OOM-killed 480B loads on the host.
+  default_extra_args: ""
 
 # Suite name -> slice shape. The suite fixes hosts/topology; `nodepool_vars` lists the repo
 # secrets holding this shape's interchangeable slices (a GKE multi-host nodepool IS one
@@ -49,9 +51,6 @@ suites:
         cmd: env JAX_PLATFORMS=cpu TORCH_TPU_TOPOLOGY=2,2,2,2 python3 test/registered/e2e/hardware_backend/tpu/test_node_normalization.py -v
       - files: test/registered/tpu/e2e/test_diffusion_tpu_multihost_collectives.py
         cmd: python3 test/registered/tpu/e2e/test_diffusion_tpu_multihost_collectives.py
-      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py
-        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py integration
-        pd: {prefill_hosts: 2, decode_hosts: 2}
       - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_kv_offload_resharding.py
         cmd: env MODEL_PROFILE=gpt_oss_120b python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_kv_offload_resharding.py
         pd: {prefill_hosts: 2, decode_hosts: 2}
@@ -64,20 +63,20 @@ suites:
       - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_reshard.py
         cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_reshard.py integration
         pd: {prefill_hosts: 2, decode_hosts: 2}
-      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py
-        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py integration
+      - files: test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py
+        cmd: env MODEL_PROFILE=qwen3_coder_480b python3 test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py
         pd: {prefill_hosts: 2, decode_hosts: 2}
-      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py
-        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py integration
-        pd: {prefill_hosts: 1, decode_hosts: 1}
+      - files: test/registered/tpu/e2e/test_tpu_qwen3_vl_8b_pd_multihost_eagle3.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_qwen3_vl_8b_pd_multihost_eagle3.py integration
+        pd: {prefill_hosts: 2, decode_hosts: 2}
       - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py
         cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py integration
         pd: {prefill_hosts: 1, decode_hosts: 1}
-      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload.py
-        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload.py integration
-        pd: {prefill_hosts: 1, decode_hosts: 1}
       - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_spec.py
         cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_spec.py integration
+        pd: {prefill_hosts: 1, decode_hosts: 1}
+      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_dflash.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_dflash.py integration
         pd: {prefill_hosts: 1, decode_hosts: 1}
       # Issue #1066. bf16 KV until the TPU image ships the MXINT8 backend
       # extension (with the test's default mxint8 both engines refuse to start);
@@ -85,8 +84,20 @@ suites:
       - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_prefix_cache_kv_offload_spec_mxint8.py
         cmd: env PD_KV_CACHE_DTYPE=bfloat16 python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_prefix_cache_kv_offload_spec_mxint8.py integration
         pd: {prefill_hosts: 1, decode_hosts: 1}
-      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py
-        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py integration
+      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_recompile.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_recompile.py integration
+        pd: {prefill_hosts: 1, decode_hosts: 1}
+      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_pp_eagle3_perf.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_pp_eagle3_perf.py integration
+        pd: {prefill_hosts: 1, decode_hosts: 1}
+      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_pp_dflash_perf.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_pp_dflash_perf.py integration
+        pd: {prefill_hosts: 1, decode_hosts: 1}
+      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_pp_eagle3_dpa_perf.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_pp_eagle3_dpa_perf.py integration
+        pd: {prefill_hosts: 1, decode_hosts: 1}
+      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_pp_dflash_dpa_perf.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_pp_dflash_dpa_perf.py integration
         pd: {prefill_hosts: 1, decode_hosts: 1}
       - files: test/registered/tpu/e2e/test_tpu_qwen3_8b_pd_singlehost_dspark_recompile.py
         cmd: python3 test/registered/tpu/e2e/test_tpu_qwen3_8b_pd_singlehost_dspark_recompile.py integration

@@ -43,6 +43,14 @@ def _bailing_vl_decoder_policy() -> type[CompilePolicy]:
     return BailingVLDecoderTpuCompilePolicy
 
 
+def _kimi_k3_vision_policy() -> type[CompilePolicy]:
+    from sglang_tpu.graph_runner.kimi_k3_vit_tpu_compile_runner import (
+        KimiK3VisionTpuCompilePolicy,
+    )
+
+    return KimiK3VisionTpuCompilePolicy
+
+
 CORE_COMPILE_BOUNDARIES: tuple[_CoreCompileBoundary, ...] = (
     # The Qwen3-VL MoE decoder (Qwen3-VL-30B-A3B, 235B-A22B). qwen3_vl annotates
     # only the dense Qwen3LLMModel and the vision tower, and the vision tower's
@@ -64,6 +72,15 @@ CORE_COMPILE_BOUNDARIES: tuple[_CoreCompileBoundary, ...] = (
         module="sglang.srt.models.bailing_mm_v3",
         class_name="BailingMoeV3VLModel",
         policy=_bailing_vl_decoder_policy,
+    ),
+    # Kimi-K3's vision encoder. Its layer loop runs on the TPU runner the
+    # plugin attaches as graph_runners (sglang_tpu.hooks.kimi_k3_vision); this
+    # compiles that runner per padded patch bucket. The language model carries
+    # its own annotation, so this does not suppress the decoder's compile.
+    _CoreCompileBoundary(
+        module="sglang.srt.models.kimi_k3_vl",
+        class_name="MoonViT3dEncoder",
+        policy=_kimi_k3_vision_policy,
     ),
 )
 

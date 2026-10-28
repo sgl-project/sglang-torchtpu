@@ -116,6 +116,10 @@ spec:
                       # hub cache (weights/hf-hub, staged from huggingface.co).
                       [ -f /tmp/test.jsonl ] || cp /weights/datasets/gsm8k/test.jsonl /tmp/test.jsonl
                       export HF_HUB_CACHE=/weights/hf-hub HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+                      # load_dataset reads a prepared Arrow cache (weights/datasets/hf-datasets);
+                      # symlinked into /tmp because it writes lock files next to the data.
+                      [ -d /tmp/hf-datasets ] || cp -rs /weights/datasets/hf-datasets /tmp/hf-datasets
+                      export HF_DATASETS_CACHE=/tmp/hf-datasets HF_DATASETS_OFFLINE=1
                       # gpt-oss's harmony encoding loads its tiktoken vocab from here.
                       export TIKTOKEN_ENCODINGS_BASE=/weights/datasets/tiktoken
                       # A role smaller than its slice runs one single-host engine per pod:
@@ -278,6 +282,10 @@ spec:
                       # hub cache (weights/hf-hub, staged from huggingface.co).
                       [ -f /tmp/test.jsonl ] || cp /weights/datasets/gsm8k/test.jsonl /tmp/test.jsonl
                       export HF_HUB_CACHE=/weights/hf-hub HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+                      # load_dataset reads a prepared Arrow cache (weights/datasets/hf-datasets);
+                      # symlinked into /tmp because it writes lock files next to the data.
+                      [ -d /tmp/hf-datasets ] || cp -rs /weights/datasets/hf-datasets /tmp/hf-datasets
+                      export HF_DATASETS_CACHE=/tmp/hf-datasets HF_DATASETS_OFFLINE=1
                       # gpt-oss's harmony encoding loads its tiktoken vocab from here.
                       export TIKTOKEN_ENCODINGS_BASE=/weights/datasets/tiktoken
                       # A role smaller than its slice runs one single-host engine per pod:

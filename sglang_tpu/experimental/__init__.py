@@ -4,7 +4,6 @@ from typing import Callable
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang_tpu.envs import envs as tpu_envs
 
@@ -48,7 +47,7 @@ def experimental_spec_enabled() -> bool:
     """Either flag opts in: host-staged metadata without a D2H copy is what this worker serves."""
     return (
         tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.get()
-        or envs.SGLANG_TPU_HOST_PADDING_NO_D2H.get()
+        or tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.get()
     )
 
 

@@ -16,6 +16,7 @@ from sglang.srt.distributed.parallel_state import GroupCoordinator, P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.io_struct import FreezeGCReq
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -210,6 +211,7 @@ class SchedulerPPMixin:
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 self._pp_send_proxy(result if cur_batch else None)
+                self._pp_process_freeze_gc(recv_reqs)
 
                 self.pp_outputs = next_pp_outputs
 
@@ -240,6 +242,11 @@ class SchedulerPPMixin:
             return self._pp_recv_proxy_tensors()
         tensors = self._pp_wave.receive()
         return None if tensors is None else PPProxyTensors(tensors)
+
+    def _pp_process_freeze_gc(self: Scheduler, recv_reqs: List) -> None:
+        requests = [req for req in recv_reqs if isinstance(req, FreezeGCReq)]
+        if requests:
+            self.process_input_requests(requests)
 
     def _pp_send_proxy(
         self: Scheduler, result: Optional[GenerationBatchResult]
@@ -467,6 +474,7 @@ class SchedulerPPMixin:
                         control
                     )
                 self._pp_send_proxy(result if cur_batch else None)
+                self._pp_process_freeze_gc(recv_reqs)
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -700,6 +708,7 @@ class SchedulerPPMixin:
                         send_transfer_work,
                     ) = control
                 self._pp_send_proxy(result if has_forward else None)
+                self._pp_process_freeze_gc(recv_reqs)
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -1417,9 +1426,10 @@ class SchedulerPPMixin:
             )
             if key in pp_outputs.tensors
         }
-        if self._pp_wave is not None:
+        if self._pp_wave is not None and get_disagg().disaggregation_mode != "prefill":
             # The relayed outputs stay on the host, and pp_outputs is relayed on
             # as is; decode reads its input IDs and the draft state from device.
+            # A PD prefill only ships them, so they stay on the host there.
             next_token_ids = next_token_ids.to(batch.device, non_blocking=True)
             draft_state = {
                 key: value.to(batch.device, non_blocking=True)
@@ -1442,12 +1452,11 @@ class SchedulerPPMixin:
                 dsa_topk_indices=draft_state.get("draft_dsa_topk_indices"),
             )
             batch.spec_info = next_draft_input
-        elif batch.spec_algorithm.is_dspark():
-            from sglang.srt.speculative.dspark_components.dspark_draft import (
-                make_next_draft_input,
-            )
+        elif batch.spec_algorithm.is_dflash_family():
+            # DFlash (PP prefill on TPU) seeds only the bonus token, like DSpark.
+            from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 
-            next_draft_input = make_next_draft_input(
+            next_draft_input = make_draft_input_v2(
                 bonus_tokens=next_token_ids,
                 new_seq_lens=batch.seq_lens,
             )

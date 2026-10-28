@@ -83,9 +83,11 @@ class Blocks(WireMessage):
     swa_blocks: list[int]
     swa_endpoint: str
     aux_blob: bytes
-    # The prefill's committed GDN state row and its state engine endpoint.
+    # The prefill's committed state blocks and its state engine endpoint.
     state_blocks: list[int] = msgspec.field(default_factory=list)
     state_endpoint: str = ""
+    # Optional opaque host state metadata (e.g., DSV4 ring shifts).
+    state_meta: bytes = b""
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")

@@ -706,6 +706,20 @@ GPT_OSS_120B = {
     "config_module": "recipe/configs/gpt_oss_120b/accuracy.py",
 }
 
+MUSE_SPARK = {
+    "served_model_name": "meta-models/Muse-Spark-Open-816B-A42B-NVFP4",
+    "display_name": "Muse Spark Open 816B-A42B NVFP4",
+    "variant": "TP8+EP1-NVFP4-BF16-KV",
+    "config_module": "recipe/configs/muse_spark/accuracy.py",
+    "sampling": {
+        "max_tokens": 65536,
+        "num_threads": 8,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "chat_template_kwargs": {"reasoning_effort": "xhigh"},
+    },
+}
+
 # Shared by the entries below that differ only in checkpoint and recipe.
 _GEMMA4_SAMPLING = {
     "max_tokens": 32768,
@@ -778,6 +792,20 @@ GEMMA4_26B_A4B = {
     "variant": "TP8+EP8",
     "config_module": "recipe/configs/gemma4_26b_a4b/accuracy.py",
     "sampling": _GEMMA4_SAMPLING,
+}
+
+GLM_5_3_FLASH = {
+    "served_model_name": "zai-org/GLM-5.3-Flash",
+    "display_name": "GLM-5.3-Flash",
+    "variant": "TP8-DSA",
+    "config_module": "recipe/configs/glm_5_3_flash/accuracy.py",
+    # The model card's sampling; the template always thinks, with no toggle.
+    "sampling": {
+        "max_tokens": 290000,
+        "num_threads": 32,
+        "temperature": 1.0,
+        "top_p": 0.95,
+    },
 }
 
 

@@ -12,6 +12,7 @@ from sglang.srt.disaggregation.decode import alloc_for_decode_prealloc
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
+from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -111,7 +112,7 @@ def _scheduler(**overrides):
     attrs.update(overrides)
     scheduler = SimpleNamespace(**attrs)
     for name in (
-        "_uses_raiden_hicache",
+        "_uses_tpu_dma_hicache",
         "_needs_kv_free_fence",
         "maybe_init_kv_free_fence",
     ):
@@ -212,8 +213,11 @@ class TestPdDecodeFenceInstall(CustomTestCase):
                 mode=str(mode), **{k: str(v) for k, v in overrides.items()}
             ):
                 scheduler = _scheduler(disaggregation_mode=mode, **overrides)
-                scheduler._uses_raiden_hicache = lambda: True
-                with self.assertRaisesRegex(ValueError, "raiden HiCache"):
+                scheduler._uses_tpu_dma_hicache = lambda: True
+                with (
+                    get_context().override_server_args(hicache_io_backend="raiden"),
+                    self.assertRaisesRegex(ValueError, "--hicache-io-backend raiden"),
+                ):
                     scheduler.maybe_init_kv_free_fence()
                 self.assertIsNone(scheduler.kv_free_fence)
 
@@ -231,7 +235,7 @@ class TestHicacheBackupFence(CustomTestCase):
                     disaggregation_mode=mode,
                     tree_cache=SimpleNamespace(cache_controller=controller),
                 )
-                scheduler._uses_raiden_hicache = lambda: True
+                scheduler._uses_tpu_dma_hicache = lambda: True
                 with patch(
                     "sglang_tpu.kv_free_fence.fence_hicache_backups"
                 ) as fence_backups:

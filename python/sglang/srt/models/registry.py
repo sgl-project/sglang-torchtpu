@@ -21,31 +21,40 @@ class _ModelRegistry:
     # Keyed by model_arch
     models: Dict[str, Union[Type[nn.Module], str]] = field(default_factory=dict)
     _default_models_loaded: bool = True
+    _pending_packages: List[Tuple[str, bool]] = field(default_factory=list)
 
-    def _load_default_models(self):
-        if self._default_models_loaded:
-            return
+    def _load_models(self):
+        if not self._default_models_loaded:
+            self.models = import_model_classes("sglang.srt.models") | self.models
+            self._default_models_loaded = True
 
-        self.models = import_model_classes("sglang.srt.models") | self.models
-        self._default_models_loaded = True
+        while self._pending_packages:
+            package_name, strict = self._pending_packages[0]
+            self._register_classes(import_model_classes(package_name, strict=strict))
+            self._pending_packages.pop(0)
+
+    def register_lazy(self, package_name: str, strict: bool = False):
+        """Defer package imports and duplicate checks until catalog loading."""
+        self._pending_packages.append((package_name, strict))
 
     def register(
         self, package_name: str, overwrite: bool = False, strict: bool = False
     ):
-        self._load_default_models()
+        self._load_models()
         new_models = import_model_classes(package_name, strict=strict)
-        if overwrite:
-            self.models.update(new_models)
-        else:
-            for arch, cls in new_models.items():
+        self._register_classes(new_models, overwrite=overwrite)
+
+    def _register_classes(self, new_models, overwrite: bool = False):
+        if not overwrite:
+            for arch in new_models:
                 if arch in self.models:
                     raise ValueError(
                         f"Model architecture {arch} already registered. Set overwrite=True to replace."
                     )
-                self.models[arch] = cls
+        self.models.update(new_models)
 
     def get_supported_archs(self) -> AbstractSet[str]:
-        self._load_default_models()
+        self._load_models()
         return self.models.keys()
 
     def is_arch_supported(self, architecture: str) -> bool:
@@ -103,7 +112,7 @@ class _ModelRegistry:
             if model_cls is not None:
                 return model_cls, first_arch
 
-        self._load_default_models()
+        self._load_models()
         architectures = self._normalize_archs(architectures)
 
         for arch in architectures:
