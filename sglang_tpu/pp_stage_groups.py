@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Process groups of a pipeline stage that spans several devices.
 
-By default torch_tpu compiles the collectives of a process subgroup into
-programs for every device of the slice, which all subgroups launch together.
-Pipeline stages run their forwards at different times, so the collectives
-inside one stage (the tensor-parallel all-reduces, the context-parallel K/V
-all-gather and the last-token reduce) would wait for the devices of the other
-stages. A standalone subgroup compiles them for its own devices, which launch
-them alone. The stage hand-off stays one collective over the whole slice.
+Pipeline stages launch their collectives independently. TorchTPU #5299 makes
+this the default; older runtimes need the explicit standalone API. The stage
+hand-off stays one collective over the whole slice.
 """
 
 from __future__ import annotations
 
+from importlib.metadata import version
 from typing import TYPE_CHECKING, Callable
+
+from packaging.version import Version
 
 from sglang.srt.distributed import parallel_state
 from sglang_tpu._logging import get_logger
@@ -24,6 +23,10 @@ if TYPE_CHECKING:
     from sglang.srt.runtime_context import ParallelContext
 
 logger = get_logger(__name__)
+
+# First published build verified with automatic subgroup device assignments
+# in sglang-torchtpu #1459 (torch_tpu #5299 / cl/998330761).
+_AUTOMATIC_SUBGROUPS_VERSION = Version("0.2.1.dev20261015025303")
 
 
 def _stage_groups(stage_ranks: list[int]) -> list[GroupCoordinator]:
@@ -56,6 +59,9 @@ def make_stage_groups_standalone(parallel: ParallelContext) -> None:
     without the other stages; must run before the first collective of the
     groups. Nothing to do for one-device stages or a single stage."""
     if parallel.pp_size == 1 or parallel.tp_size == 1:
+        return
+    if Version(version("torch-tpu")) >= _AUTOMATIC_SUBGROUPS_VERSION:
+        logger.info("pipeline stage %d: automatic process subgroups", parallel.pp_rank)
         return
     make_standalone = _load_make_standalone()
     groups = _stage_groups(parallel.tp_group.ranks)
