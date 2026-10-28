@@ -81,6 +81,17 @@ _DECODE_CP_SPARSE_CORE_OVERRIDES = (
     "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false",
 )
 
+# glibc gives each thread that allocates its own malloc arena (up to 8 per
+# core). XLA compiles on a thread pool, so a cold start spreads its temporary
+# buffers over many arenas, and malloc_trim after warmup cannot return the
+# fragmented pages. On tpu7x TP=8 Qwen3-8B, each rank kept about 1.25 GiB more
+# RSS after a cold start than after a warm one (#1429). Capping the arenas at
+# 8 removed that gap with no measured throughput loss; a cap of 2 cost about
+# 10% throughput. Child processes read the variable when they start, so it
+# applies to every scheduler rank spawned after this override.
+_MALLOC_ARENA_MAX_ENV = "MALLOC_ARENA_MAX"
+_MALLOC_ARENA_MAX_DEFAULT = "8"
+
 # Smallest KV pool (in tokens) observed safe with the default prefetch depth
 # on the largest supported dense stack (36-layer gpt-oss at TP=8): 4096 pages
 # of 64 tokens. Pools at or above this never deadlocked; below it the first
@@ -124,6 +135,7 @@ def _set_renamed_compilation_cache_envs() -> list[str]:
 def apply_tpu_env_overrides() -> None:
     """Apply TPU env overrides."""
     os.environ.setdefault("TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS", "1")
+    os.environ.setdefault(_MALLOC_ARENA_MAX_ENV, _MALLOC_ARENA_MAX_DEFAULT)
     added = _set_renamed_compilation_cache_envs()
     if added:
         logger.info(
