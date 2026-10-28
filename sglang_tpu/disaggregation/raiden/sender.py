@@ -14,7 +14,7 @@ import errno
 import secrets
 import threading
 import time
-from typing import TYPE_CHECKING, Any, List, Optional, Set
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -30,6 +30,9 @@ from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
 from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
+    PrefixOffer,
+    PrefixPull,
+    PrefixReady,
     PullReq,
     ReshardBlocks,
     ReshardChunk,
@@ -37,6 +40,9 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardReady,
     ReshardReq,
     RoomFailed,
+    VictimAck,
+    VictimDone,
+    VictimPush,
     decode_text,
     read_aux_blob,
 )
@@ -89,6 +95,11 @@ class RaidenSenderMixin:
                 self._prefill.decode_addr[room] = (decode_ip, decode_port)
                 self._prefill.decode_pages[room] = decode_pages
                 self._prefill.decode_swa_pages[room] = decode_swa_pages
+                if req.prefix_offer and self.prefix_pull_active:
+                    # The room now waits for the decode's PREFIX_OFFER before
+                    # it may leave Bootstrapping (see finish_bootstrap_if_
+                    # decode_requested).
+                    self._prefill.prefix_offer_since[room] = time.time()
                 held = self._prefill.held_chunks.pop(room, [])
                 total_pages = self._prefill.send_total.get(room, 0)
         if failed_reason is not None:
@@ -461,9 +472,385 @@ class RaidenSenderMixin:
         with self._state_lock:
             if room in self._aborted or not self._decode_requested_locked(room):
                 return False
+            if self._prefix_pull_open_locked(room):
+                return False
             if self.request_status.get(room) == KVPoll.Bootstrapping:
                 self.update_status(room, KVPoll.WaitingForInput)
             return True
+
+    # ----- decode-held prefix pull (prefix_pull.py drives these) -------------
+
+    def _prefix_pull_open_locked(self, room: int) -> bool:
+        """Whether the room still waits on the decode-held prefix pull: an
+        offer was promised and the puller has not settled it. A pull that
+        makes no progress for the bootstrap timeout is given up on."""
+        since = self._prefill.prefix_offer_since.get(room)
+        if since is None or room in self._prefill.prefix_resolved:
+            return False
+        if time.time() - since > self.bootstrap_timeout:
+            logger.warning(
+                "RaidenKVManager rank%d room %s: decode prefix pull did not "
+                "settle in %.0fs, computing the prompt instead",
+                self.attn_tp_rank,
+                room,
+                self.bootstrap_timeout,
+            )
+            self._prefill.prefix_resolved.add(room)
+            return False
+        return True
+
+    def _on_prefix_offer(self, msg: List[bytes]) -> None:
+        offer = PrefixOffer.from_frames(msg)
+        with self._state_lock:
+            if (
+                offer.room in self._aborted
+                or offer.room not in self._prefill.prefix_offer_since
+            ):
+                return
+            self._prefill.prefix_offers[offer.room] = (
+                offer.prefix_tokens,
+                list(offer.blocks),
+            )
+            if offer.source == "host":
+                self._prefill.prefix_host_offers.add(offer.room)
+            if offer.swa_blocks:
+                self._prefill.prefix_swa_offers[offer.room] = (
+                    offer.swa_first_page,
+                    list(offer.swa_blocks),
+                )
+            if not offer.blocks:
+                self._prefill.prefix_resolved.add(offer.room)
+
+    def _on_prefix_ready(self, msg: List[bytes]) -> None:
+        ready = PrefixReady.from_frames(msg)
+        with self._state_lock:
+            if (
+                ready.room in self._aborted
+                or ready.room not in self._prefill.prefix_pull_asked
+            ):
+                return
+            self._prefill.prefix_ready[ready.room] = (
+                ready.req_id,
+                ready.uuid,
+                ready.endpoint,
+                ready.first_page,
+                ready.num_pages,
+            )
+            self._prefill.prefix_swa_ready[ready.room] = (
+                ready.swa_req_id,
+                ready.swa_uuid,
+                ready.swa_endpoint,
+                ready.swa_first_page,
+                ready.swa_num_pages,
+            )
+            if ready.source == "host":
+                self._prefill.prefix_host_ready.add(ready.room)
+
+    def prefix_offer_is_host(self, room: int) -> bool:
+        with self._state_lock:
+            return room in self._prefill.prefix_host_offers
+
+    def prefix_ready_is_host(self, room: int) -> bool:
+        with self._state_lock:
+            return room in self._prefill.prefix_host_ready
+
+    def prefix_offer_available(self, room: int) -> bool:
+        with self._state_lock:
+            return (
+                room in self._prefill.prefix_offers
+                and room not in self._prefill.prefix_offer_taken
+                and room not in self._prefill.prefix_resolved
+            )
+
+    # ----- victim push (pd_victim_push.py) -----------------------------------
+
+    def decode_peer(self, room: int) -> Optional[Tuple[str, int]]:
+        """(ip, port) of the decode rank whose PULL_REQ named the room."""
+        with self._state_lock:
+            return self._prefill.decode_addr.get(room)
+
+    def send_victim_push(
+        self,
+        *,
+        decode: Tuple[str, int],
+        seq: int,
+        tokens: List[int],
+        blocks: List[int],
+        swa_blocks: Optional[List[int]] = None,
+        uuid: int,
+        address: str,
+        swa_address: str = "",
+        extra_key=None,
+        cache_salt=None,
+        is_eagle=False,
+    ) -> bool:
+        """Offer registered host pages for decode to pull into its host pools."""
+        if not blocks:
+            return False
+        with self._state_lock:
+            self._prefill.victim_open.add(seq)
+        try:
+            self._send_multipart_locked(
+                _tcp_endpoint(ip=decode[0], port=decode[1]),
+                VictimPush(
+                    prefill=self.victim_namespace,
+                    seq=seq,
+                    ack_endpoint=_tcp_endpoint(ip=self.local_ip, port=self.rank_port),
+                    tokens=tokens,
+                    blocks=blocks,
+                    swa_blocks=list(swa_blocks or []),
+                    uuid=uuid,
+                    address=address,
+                    swa_address=swa_address,
+                    extra_key=extra_key,
+                    cache_salt=cache_salt,
+                    is_eagle=is_eagle,
+                ).to_frames(),
+            )
+        except Exception as exc:  # noqa: BLE001 - a lost offer is a declined push
+            logger.warning("Raiden victim push %d failed to send: %s", seq, exc)
+            return False
+        return True
+
+    def send_victim_done(self, *, decode: Tuple[str, int], seq: int, ok: bool) -> None:
+        """Report the all-rank outcome after the producer's native reads settle."""
+        try:
+            self._send_multipart_locked(
+                _tcp_endpoint(ip=decode[0], port=decode[1]),
+                VictimDone(prefill=self.victim_namespace, seq=seq, ok=ok).to_frames(),
+            )
+        except Exception as exc:  # noqa: BLE001 - the landing expires on its own
+            logger.warning("Raiden victim done %d failed to send: %s", seq, exc)
+
+    def _on_victim_ack(self, msg: List[bytes]) -> None:
+        ack = VictimAck.from_frames(msg)
+        with self._state_lock:
+            if ack.seq in self._prefill.victim_open:
+                self._prefill.victim_acks[ack.seq] = ack
+
+    def take_victim_ack(self, seq: int) -> Optional[VictimAck]:
+        """The decode's answer to push ``seq`` on this rank, handed out once."""
+        with self._state_lock:
+            return self._prefill.victim_acks.pop(seq, None)
+
+    def forget_victim(self, seq: int) -> None:
+        with self._state_lock:
+            self._prefill.victim_open.discard(seq)
+            self._prefill.victim_acks.pop(seq, None)
+
+    def take_prefix_offer(self, room: int) -> Optional[Tuple[int, List[int]]]:
+        """The decode's (prefix_tokens, page ids) offer, handed out once."""
+        with self._state_lock:
+            offer = self._prefill.prefix_offers.get(room)
+            if (
+                offer is None
+                or room in self._prefill.prefix_offer_taken
+                or room in self._prefill.prefix_resolved
+            ):
+                return None
+            self._prefill.prefix_offer_taken.add(room)
+            return offer
+
+    def prefix_swa_offer(self, room: int) -> Tuple[int, List[int]]:
+        """The offer's (swa_first_page, window page ids); (0, []) without one."""
+        with self._state_lock:
+            return self._prefill.prefix_swa_offers.get(room, (0, []))
+
+    def resolve_prefix_pull(self, room: int) -> None:
+        """The pull is settled, pulled or not; the room may leave Bootstrapping."""
+        with self._state_lock:
+            self._prefill.prefix_resolved.add(room)
+
+    def prefix_pull_resolved(self, room: int) -> bool:
+        with self._state_lock:
+            return room in self._prefill.prefix_resolved
+
+    def forget_prefix_pull(self, room: int) -> None:
+        """A dropped pull gives up its place in the host staging line."""
+        with self._state_lock:
+            if self._pulling is not None:
+                self._pulling.forget(self._prefix_req_id(room))
+
+    def ask_prefix_pull(
+        self,
+        room: int,
+        first_page: int,
+        num_pages: int,
+        *,
+        swa_first_page: int = 0,
+        swa_num_pages: int = 0,
+    ) -> bool:
+        """Ask the decode to register offered pages [first_page, +num_pages)
+        and window pages [swa_first_page, +swa_num_pages)."""
+        with self._state_lock:
+            addr = self._prefill.decode_addr.get(room)
+            if room in self._aborted or addr is None:
+                return False
+            self._prefill.prefix_pull_asked[room] = (first_page, num_pages)
+        endpoint = _tcp_endpoint(ip=addr[0], port=addr[1])
+        payload = PrefixPull(
+            room=room,
+            first_page=first_page,
+            num_pages=num_pages,
+            swa_first_page=swa_first_page,
+            swa_num_pages=swa_num_pages,
+        ).to_frames()
+        try:
+            self._send_multipart_locked(endpoint, payload)
+        except zmq.ZMQError as exc:
+            if exc.errno not in ROOM_SCOPED_SEND_ERRNOS:
+                raise
+            logger.error(
+                "RaidenKVManager rank%d room %s: PREFIX_PULL to %s failed "
+                "(errno %s): %s",
+                self.attn_tp_rank,
+                room,
+                endpoint,
+                exc.errno,
+                exc,
+            )
+            return False
+        return True
+
+    def prefix_pull_ready(self, room: int) -> Optional[Tuple[str, int, str, int, int]]:
+        """The decode's READY reply (req_id, uuid, endpoint, first, pages), if in."""
+        with self._state_lock:
+            return self._prefill.prefix_ready.get(room)
+
+    def prefix_swa_ready(self, room: int) -> Optional[Tuple[str, int, str, int, int]]:
+        """READY's window part (swa_req_id, swa_uuid, swa_endpoint, first, pages)."""
+        with self._state_lock:
+            return self._prefill.prefix_swa_ready.get(room)
+
+    def start_prefix_pull(
+        self,
+        room: int,
+        req_id: str,
+        uuid: int,
+        endpoint: str,
+        remote: List[int],
+        local: List[int],
+        *,
+        swa_req_id: str = "",
+        swa_uuid: int = 0,
+        swa_endpoint: str = "",
+        swa_remote: Sequence[int] = (),
+        swa_local: Sequence[int] = (),
+    ) -> str:
+        """Read the decode's pages ``remote`` into this rank's pages ``local``,
+        and its window pages ``swa_remote`` into ``swa_local`` on the SWA
+        engine under one staging admission.
+
+        Returns "started", "retry" (no host staging free yet; ask again next
+        step) or "failed". A read raiden rejects settles as failed here and
+        never fails the room: the prefill computes the prompt instead.
+        """
+        engine = self._ensure_engine()
+        pages, swa_pages = len(local), len(swa_local)
+        if pages == 0 or pages != len(remote) or swa_pages != len(swa_remote):
+            return "failed"
+        if swa_pages and self._swa_engine is None:
+            return "failed"
+        limits = [(pages, self._full_engine_max_blocks, "")]
+        if swa_pages:
+            limits.append((swa_pages, self._swa_engine_max_blocks, "window "))
+        for count, max_blocks, kind in limits:
+            if count > max_blocks:
+                logger.error(
+                    "RaidenKVManager rank%d room %s: prefix pull of %d %spages "
+                    "exceeds a host staging slot of %d pages",
+                    self.attn_tp_rank,
+                    room,
+                    count,
+                    kind,
+                    max_blocks,
+                )
+                return "failed"
+        cost = self._staging_cost(pages, self._full_engine_max_blocks)
+        swa_cost = (
+            self._staging_cost(swa_pages, self._swa_engine_max_blocks)
+            if swa_pages
+            else 0
+        )
+        with self._state_lock:
+            if room in self._aborted or self._pulling is None:
+                return "failed"
+            if req_id in self._pulling:
+                return "started"
+            if not self._pulling.admit(req_id, cost, swa_cost):
+                return "retry"
+            self._prefill.prefix_pull_reads[room] = req_id
+            self._prefill.prefix_ready.pop(room, None)
+            self._prefill.prefix_swa_ready.pop(room, None)
+        try:
+            engine.start_read(req_id, uuid, endpoint, remote, local)
+        except Exception as exc:
+            logger.error(
+                "RaidenKVManager rank%d room %s: prefix pull start_read %s raised: %s",
+                self.attn_tp_rank,
+                room,
+                req_id,
+                exc,
+            )
+            with self._state_lock:
+                self._native_failed.add(req_id)
+                if swa_pages:
+                    self._native_failed.add(swa_req_id)
+                self._release_pull_slots_locked()
+            return "failed"
+        if swa_pages:
+            try:
+                self._swa_engine.start_read(
+                    swa_req_id,
+                    swa_uuid,
+                    swa_endpoint,
+                    list(swa_remote),
+                    list(swa_local),
+                )
+            except Exception as exc:
+                # The full read is in flight; the pull settles as failed once
+                # it lands, and the prefill computes the prompt.
+                logger.error(
+                    "RaidenKVManager rank%d room %s: prefix pull window "
+                    "start_read %s raised: %s",
+                    self.attn_tp_rank,
+                    room,
+                    swa_req_id,
+                    exc,
+                )
+                with self._state_lock:
+                    self._native_failed.add(swa_req_id)
+        logger.debug(
+            "RaidenKVManager rank%d prefix pull started | room=%s req_id=%s "
+            "uuid=%d pages=%d from=%s",
+            self.attn_tp_rank,
+            room,
+            req_id,
+            uuid,
+            pages,
+            endpoint,
+        )
+        return "started"
+
+    def prefix_read_state(self, req_id: str) -> str:
+        """ "done", "failed", "pending" (raiden may still write the pages) or
+        "unknown" once the room's completion record is gone."""
+        with self._state_lock:
+            if req_id in self._completed_recv:
+                return "done"
+            if req_id in self._native_failed:
+                return "failed"
+            if req_id in getattr(self, "_prefix_host_reads", {}):
+                return "pending"
+            # The window read shares its full read's staging admission.
+            room = self._room_of(req_id)
+            if (
+                self._pulling is not None
+                and room is not None
+                and self._prefix_req_id(room) in self._pulling
+            ):
+                return "pending"
+            return "unknown"
 
     def awaiting_decode_since(self, room: int, since: float) -> Optional[float]:
         """When the prefill started waiting on the decode for ``room``.

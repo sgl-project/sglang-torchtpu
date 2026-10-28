@@ -9,7 +9,7 @@ from __future__ import annotations
 import ctypes
 import enum
 import struct
-from typing import ClassVar, List
+from typing import ClassVar, List, Literal, Optional
 
 import msgspec
 
@@ -45,6 +45,17 @@ class MessageTag(bytes, enum.Enum):
 
     ROOM_FAILED = b"RAIDEN_ROOM_FAILED"  # prefill -> decode: room already failed
 
+    # Decode-held prefix pull: the prefill reuses KV the decode already holds.
+    PREFIX_OFFER = b"RAIDEN_PREFIX_OFFER"  # decode -> prefill: resident prefix pages
+    PREFIX_PULL = b"RAIDEN_PREFIX_PULL"  # prefill -> decode: register this page range
+    PREFIX_READY = b"RAIDEN_PREFIX_READY"  # decode -> prefill: registered, pull now
+
+    # Victim push: the prefill hands a session it is about to evict to the decode
+    # that served it (sglang_tpu/pd_victim_push.py).
+    VICTIM_PUSH = b"RAIDEN_VICTIM_PUSH"  # prefill -> decode: host pages offered
+    VICTIM_ACK = b"RAIDEN_VICTIM_ACK"  # decode -> prefill: host-read admission
+    VICTIM_DONE = b"RAIDEN_VICTIM_DONE"  # prefill -> decode: pushed, insert (or free)
+
     # CommonKVReceiver owns this backend-independent positional message.
     ABORT = b"ABORT"  # decode -> prefill: room, decode ip, decode port
 
@@ -65,12 +76,129 @@ class PullReq(WireMessage):
     # Window pages the decode allocated for the room; the sender registers
     # only the window blocks it will read.
     decode_swa_pages: int = 0
+    # Prompt tokens the decode already holds (device or host), and whether a
+    # PREFIX_OFFER naming their pages follows once they are device-resident.
+    prefix_tokens: int = 0
+    prefix_offer: bool = False
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
         require_non_negative(self.decode_pages, "decode_pages")
         require_non_negative(self.decode_swa_pages, "decode_swa_pages")
+        require_non_negative(self.prefix_tokens, "prefix_tokens")
         _require_port(self.decode_port)
+
+
+class PrefixOffer(WireMessage):
+    """Name the decode's prefix pages in ``source``; empty blocks withdraw."""
+
+    TAG: ClassVar[bytes] = MessageTag.PREFIX_OFFER
+    room: int
+    prefix_tokens: int
+    blocks: list[int]
+    # Hybrid sliding-window models: the decode's window pages (SWA engine) for
+    # pages [swa_first_page, len(blocks)) of the offer; empty on full-only models.
+    swa_first_page: int = 0
+    swa_blocks: list[int] = []
+    source: Literal["device", "host"] = "device"
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+        require_non_negative(self.prefix_tokens, "prefix_tokens")
+        require_non_negative(self.swa_first_page, "swa_first_page")
+
+
+class PrefixPull(WireMessage):
+    """Ask the decode to register offered pages [first_page, first_page + num_pages)."""
+
+    TAG: ClassVar[bytes] = MessageTag.PREFIX_PULL
+    room: int
+    first_page: int
+    num_pages: int
+    # Window pages [swa_first_page, swa_first_page + swa_num_pages) on the SWA
+    # engine; none on full-only models.
+    swa_first_page: int = 0
+    swa_num_pages: int = 0
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+        require_non_negative(self.first_page, "first_page")
+        require_non_negative(self.swa_first_page, "swa_first_page")
+        require_non_negative(self.swa_num_pages, "swa_num_pages")
+        if self.num_pages < 1:
+            raise ValueError(f"invalid num_pages: expected >= 1, got {self.num_pages}")
+
+
+class PrefixReady(WireMessage):
+    """Confirm the requested prefix pages are registered for the prefill's read."""
+
+    TAG: ClassVar[bytes] = MessageTag.PREFIX_READY
+    room: int
+    req_id: str
+    uuid: int
+    endpoint: str
+    first_page: int
+    num_pages: int
+    # The window pages' registration on the decode's SWA engine; swa_num_pages
+    # is 0 on full-only models and whenever num_pages is (a refusal).
+    swa_req_id: str = ""
+    swa_uuid: int = 0
+    swa_endpoint: str = ""
+    swa_first_page: int = 0
+    swa_num_pages: int = 0
+    source: Literal["device", "host"] = "device"
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+        require_non_negative(self.uuid, "uuid")
+        require_non_negative(self.first_page, "first_page")
+        require_non_negative(self.num_pages, "num_pages")
+        require_non_negative(self.swa_uuid, "swa_uuid")
+        require_non_negative(self.swa_first_page, "swa_first_page")
+        require_non_negative(self.swa_num_pages, "swa_num_pages")
+
+
+class VictimPush(WireMessage):
+    """A host-resident session the prefill is about to evict.
+
+    ``tokens`` are the session's first ``len(blocks) * page_size`` token ids
+    and ``blocks`` the host page ids holding their full KV on this rank;
+    ``prefill`` and ``seq`` are the same on every rank of the prefill engine.
+    """
+
+    TAG: ClassVar[bytes] = MessageTag.VICTIM_PUSH
+    prefill: str
+    seq: int
+    ack_endpoint: str
+    tokens: list[int]
+    blocks: list[int]
+    # Page-aligned trailing SWA window in its independent host pool.
+    swa_blocks: list[int] = msgspec.field(default_factory=list)
+    # The registered producer UUID and control endpoints of its host pools.
+    uuid: int = 0
+    address: str = ""
+    swa_address: str = ""
+    source: str = "host"
+    extra_key: Optional[str] = None
+    cache_salt: Optional[str] = None
+    is_eagle: bool = False
+
+
+class VictimAck(WireMessage):
+    """Whether decode admitted the offered host reads into both host pools."""
+
+    TAG: ClassVar[bytes] = MessageTag.VICTIM_ACK
+    seq: int
+    stored: bool
+
+
+class VictimDone(WireMessage):
+    """All producer host reads settled successfully (``ok``) or failed."""
+
+    TAG: ClassVar[bytes] = MessageTag.VICTIM_DONE
+    prefill: str
+    seq: int
+    ok: bool
 
 
 class Blocks(WireMessage):

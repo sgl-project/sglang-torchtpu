@@ -372,6 +372,11 @@ class DecodeRequest:
     hicache_restore_lock_receipt: Optional[DecLockRefParams] = None
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
+    # The prefill was told which prefix pages this decode holds (or that none are).
+    prefix_offer_sent: bool = False
+    # Hybrid SWA: (node, receipt) tree lock on the offered prefix and window,
+    # held while the request is in the transfer queue.
+    prefix_offer_lock: Optional[Tuple[Any, DecLockRefParams]] = None
 
     @property
     def seqlen(self) -> int:
@@ -2735,14 +2740,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if not self.queue:
             return []
 
+        checked_reqs = [
+            decode_req
+            for decode_req in self.queue
+            if rids_to_check is None or decode_req.req.rid in rids_to_check
+        ]
         if self.scheduler.enable_decode_hicache:
-            self._process_hicache_local_restores(
-                [
-                    decode_req
-                    for decode_req in self.queue
-                    if rids_to_check is None or decode_req.req.rid in rids_to_check
-                ]
-            )
+            self._process_hicache_local_restores(checked_reqs)
+        self._offer_resident_prefixes(checked_reqs)
 
         if self.enable_staging:
             polls = self._poll_with_staging()
@@ -2878,6 +2883,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if i in deferred_indices:
                 # Held for deferred release; metadata buffer freed at resolve time.
                 continue
+            self._release_prefix_offer_lock(self.queue[i])
             if self.enable_staging and self.staging_handler.is_staging_room(
                 self.queue[i].req.bootstrap_room
             ):
@@ -2897,6 +2903,58 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         return transferred_reqs
 
+    def _offer_resident_prefixes(self, decode_reqs: List[DecodeRequest]) -> None:
+        """Name to the prefill the prompt prefix pages this decode holds in HBM,
+        once any host restore of them has landed, so the prefill can pull them.
+        Runs on every rank over the same requests, so tree locks agree."""
+        for decode_req in decode_reqs:
+            if decode_req.prefix_offer_sent:
+                continue
+            if not decode_req.kv_receiver.prefix_offer_pending:
+                continue
+            prefix_match = decode_req.prefix_match
+            if prefix_match is None:
+                decode_req.kv_receiver.offer_resident_prefix([])
+                decode_req.prefix_offer_sent = True
+                continue
+            if self.scheduler.enable_decode_hicache:
+                status = decode_req.hicache_restore_status
+                if status == HiCacheRestoreResult.PENDING:
+                    continue
+                if status == HiCacheRestoreResult.FAILED:
+                    decode_req.kv_receiver.offer_resident_prefix([])
+                    decode_req.prefix_offer_sent = True
+                    continue
+            if self.tree_cache.supports_swa():
+                decode_req.prefix_offer_lock = (
+                    decode_req.kv_receiver.offer_window_prefix(
+                        tree_cache=self.tree_cache,
+                        allocator=self.scheduler.token_to_kv_pool_allocator,
+                        req=decode_req.req,
+                        window_size=self.scheduler.sliding_window_size,
+                    )
+                )
+                decode_req.prefix_offer_sent = True
+                continue
+            indices = prefix_match.prefix_indices
+            if decode_req.hicache_restored_kv_indices is not None:
+                indices = torch.cat([indices, decode_req.hicache_restored_kv_indices])
+            page_size = self.scheduler.token_to_kv_pool_allocator.page_size
+            # The prefill matches and pulls whole pages, so a partial last page
+            # is left to its own compute.
+            resident_len = (prefix_match.decode_prefix_len // page_size) * page_size
+            resident = indices[: min(resident_len, len(indices))]
+            decode_req.kv_receiver.offer_resident_prefix(
+                kv_to_page_indices(resident, page_size).tolist()
+            )
+            decode_req.prefix_offer_sent = True
+
+    def _release_prefix_offer_lock(self, decode_req: DecodeRequest) -> None:
+        # Runs as the request leaves the queue, a step every rank agrees on.
+        if decode_req.prefix_offer_lock is not None:
+            self.tree_cache.dec_lock_ref(*decode_req.prefix_offer_lock)
+            decode_req.prefix_offer_lock = None
+
     def _defer_release(self, decode_req: DecodeRequest) -> None:
         start_time = time.monotonic()
         deadline = start_time + self.deferred_kv_release_timeout
@@ -2914,6 +2972,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
 
     def _do_release(self, decode_req: DecodeRequest, idx: int) -> None:
+        self._release_prefix_offer_lock(decode_req)
         room = decode_req.req.bootstrap_room
         if self.enable_staging and self.staging_handler.is_staging_room(room):
             self.staging_handler.unregister_decode_req(room)

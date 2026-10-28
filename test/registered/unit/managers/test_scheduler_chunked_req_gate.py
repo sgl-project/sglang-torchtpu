@@ -457,7 +457,9 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         scheduler.disagg_prefill_inflight_queue = []
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
-            queue=[], pop_bootstrapped=MagicMock(return_value=[])
+            queue=[],
+            pop_bootstrapped=MagicMock(return_value=[]),
+            decode_prefix_puller=None,
         )
         scheduler.enable_hisparse = False
         scheduler.enable_hierarchical_cache = False

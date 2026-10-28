@@ -111,6 +111,104 @@ input of `_tpu-test.yml`), so each test runs in one mode only: the PR gate
 (stage-a, stage-b) and the single-host nightly (`nightly-tpu-4-v7`) run mode B;
 the multi-host, P/D, accuracy, perf, combo and external lanes stay on mode A.
 
+## P/D victim prefix cache
+
+Prefill stays the primary prefix cache. Before host pressure discards a cold
+cached branch, prefill exports its FULL KV and ending SWA window to the decode
+that served the branch; the decode keeps pushed victims and does not cache its
+own generation requests. When the branch returns and misses on prefill, prefill
+recalls the FULL KV and its window directly from decode DRAM into its own host
+pages through the Raiden prefix exchange; normal admission then loads them into
+HBM, with no decode HBM restore or device staging. Branches of a shared system
+prompt, cache salts and adapter namespaces keep independent ownership.
+
+Enable HiCache on both roles with `--enable-hierarchical-cache
+--hicache-io-backend raiden` and decode radix caching with
+`--disaggregation-decode-enable-radix-cache`, then make the decode's DRAM the
+prefill's KV offload tier with one switch on both roles:
+
+```bash
+SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM=1
+```
+
+The switch stands for the component flags below, which remain available for
+partial setups and keep any value set explicitly:
+
+| Flag | Role | What it enables |
+|---|---|---|
+| `SGLANG_DISAGG_PREFIX_VICTIM_PUSH=1` | both | export cold cached branches to the decode's host pools |
+| `SGLANG_DISAGG_PREFILL_PULL_DECODE_PREFIX=1` | both | recall decode-held prefixes on a prefill miss |
+| `SGLANG_TPU_PD_SWA_HOST_WINDOWS=<count>` | both | hybrid SWA models: a host tier of SWA windows on each role, one per cached path, so the window travels with a pushed victim and comes back with a recalled prefix (the switch defaults it to 128; size it with the host budget; zero keeps the full-only host tiers) |
+
+Requirements: the Python unified radix tree, matching P/D
+attention-TP and context-parallel geometry, equal page sizes and layouts, no
+pipeline or GDN/Mamba state transfer, and session affinity when several
+decodes serve one prefill.
+
+A spill moves RAM to RAM through the HiCache host-pool managers: prefill
+registers its pinned host pages for a native host read and offers them; the
+decode reserves host pages, reads into them and inserts the victim as a
+host-only node. No HBM or staging slot is used, and at most four victims per
+engine are in flight. Every rank agrees on branch, namespace, length and
+outcome before allocation or insertion, and offers carry a per-prefill
+incarnation so restarts cannot alias. Source pins and destination pages stay
+reserved until the native transfer reports completion (bounded by
+`SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S`), also after a refused or expired
+offer; a cache reset or memory release waits for accepted reads to drain and
+can be retried.
+
+The native session deadline does not interrupt a blocked TCP operation and the
+socket I/O timeouts default to disabled, so set them on both roles (either role
+sends KV). This keeps existing values and otherwise gives each I/O 60 seconds:
+
+```bash
+for raiden_io_timeout in \
+  TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S \
+  TPU_RAIDEN_PREFILL_FINAL_ACK_READ_TIMEOUT_S \
+  TPU_RAIDEN_PREFILL_PAYLOAD_READ_TIMEOUT_S \
+  TPU_RAIDEN_PREFILL_HANDSHAKE_WRITE_TIMEOUT_S \
+  TPU_RAIDEN_PREFILL_PAYLOAD_WRITE_TIMEOUT_S \
+  TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S \
+  TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S \
+  TPU_RAIDEN_DECODE_ACK_WRITE_TIMEOUT_S \
+  TPU_RAIDEN_DECODE_PAYLOAD_WRITE_TIMEOUT_S
+do
+  export "${raiden_io_timeout}=${!raiden_io_timeout:-60}"
+done
+```
+
+These bound single stalled calls, not a slow transfer that keeps progressing.
+Pages are reused only after native completion, and memory-release APIs must
+wait until all native reads have drained and the scheduler is idle.
+
+Both roles need matching tpu-sync Python and native artifacts from the pinned
+[`ram2ram` fork branch](https://github.com/alisachen-google/h2h/tree/ram2ram)
+(see its [build instructions](https://github.com/alisachen-google/h2h/blob/ram2ram/README.md#option-2-building-from-source);
+`./build.sh torch` against the installed `torch_tpu` ABI). Select the checkout
+on both roles and check the API:
+
+```bash
+export TPU_SYNC_SRC=/path/to/tpu-sync
+export PYTHONPATH="$TPU_SYNC_SRC${PYTHONPATH:+:$PYTHONPATH}"
+python - <<'PY'
+import inspect
+from tpu_sync.api.torch import kv_cache_manager as k
+assert "source" in inspect.signature(k.KVCacheManager.register_read).parameters
+assert "destination" in inspect.signature(k.KVCacheManager.start_read).parameters
+assert "local_host_block_ids" in inspect.signature(k.KVCacheManager.start_read).parameters
+PY
+```
+
+The native extension must come from the same build. Each victim-enabled
+host-pool manager opens a control port (port zero means cache-only), and offers
+publish that control endpoint rather than the block-data endpoint.
+
+FULL pages and the trailing window move through their own host pools under one
+producer-owned UUID. A victim is inserted only when every rank has received
+both and the producer reported success; failed transfers release both landings
+once accepted native reads settle, and shared-prefix insertions release
+duplicate FULL and SWA pages independently.
+
 ## Muse Spark multimodal
 
 `models/muse_spark.py` is the text decoder; `models/muse_spark_omni.py` adds the

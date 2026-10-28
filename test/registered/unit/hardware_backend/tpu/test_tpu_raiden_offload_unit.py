@@ -1824,7 +1824,12 @@ class TestRaidenRoleStatePlacement(CustomTestCase):
                         other_key = (
                             f"{other}#0" if field.name == "announced_at" else other
                         )
-                        self.assertNotIn(key, value, field.name)
+                        if field.name.startswith("victim_"):
+                            # Victim sessions are independent of request rooms;
+                            # even a matching producer sequence must survive.
+                            self.assertIn(key, value, field.name)
+                        else:
+                            self.assertNotIn(key, value, field.name)
                         self.assertIn(other_key, value, field.name)
                 self.assertIn(room, mgr._aborted)
                 if mode == DisaggregationMode.PREFILL:

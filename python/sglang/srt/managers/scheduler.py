@@ -5475,6 +5475,10 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                puller = self.disagg_prefill_bootstrap_queue.decode_prefix_puller
+                if puller is not None:
+                    # Dropped reverse reads can still write reserved KV pages.
+                    idle &= not puller.has_pending_deferred_releases()
                 # Aborted senders may still own KV pages. Keep polling them
                 # before idle pool checks, sleep, or cache flush.
                 idle &= len(self._deferred_chunked_sender_aborts) == 0

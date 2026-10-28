@@ -16,15 +16,22 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import numpy.typing as npt
+import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver, KVTransferError
 from sglang.srt.environ import envs
+from sglang_tpu import pd_spill_flags
 from sglang_tpu.disaggregation.raiden.chunk_plan import chunk_pull_window
 from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
+from sglang_tpu.disaggregation.raiden.prefix_offer import lock_window_prefix
+from sglang_tpu.disaggregation.raiden.sender import ROOM_SCOPED_SEND_ERRNOS
 from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
+    PrefixOffer,
+    PrefixPull,
+    PrefixReady,
     PullReq,
     ReshardBlocks,
     ReshardChunk,
@@ -32,6 +39,9 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardReady,
     ReshardReq,
     RoomFailed,
+    VictimAck,
+    VictimDone,
+    VictimPush,
     write_aux_blob,
 )
 
@@ -208,6 +218,8 @@ class RaidenReceiverMixin:
         bootstrap_infos: List[dict],
         *,
         local_state_rows: Sequence[int] = (),
+        decode_prefix_len: int = 0,
+        allow_prefix_offer: bool = True,
     ) -> None:
         if self._pipeline is not None:
             self._pipeline.register_decode(
@@ -254,16 +266,293 @@ class RaidenReceiverMixin:
             self._decode.local_state_rows[room] = list(local_state_rows)
             if aux_index is not None:
                 self._decode.decode_aux_index[room] = aux_index
+            prefix_offer = allow_prefix_offer and self._promise_prefix_offer_locked(
+                room, decode_prefix_len, bootstrap_infos
+            )
         payload = PullReq(
             room=room,
             decode_ip=self.local_ip,
             decode_port=self.rank_port,
             decode_pages=len(local_blocks),
             decode_swa_pages=len(local_swa_blocks),
+            prefix_tokens=max(0, int(decode_prefix_len)),
+            prefix_offer=prefix_offer,
         ).to_frames()
         for info in bootstrap_infos:
             endpoint = _tcp_endpoint(ip=info["rank_ip"], port=info["rank_port"])
             self._send_multipart_locked(endpoint, payload)
+
+    # ----- decode-held prefix pull: the decode serves its resident prefix ---
+
+    def _promise_prefix_offer_locked(
+        self, room: int, decode_prefix_len: int, bootstrap_infos: List[dict]
+    ) -> bool:
+        """Whether ``room`` will get a PREFIX_OFFER: the pull is enabled and the
+        decode holds at least one full page of the prompt."""
+        if (
+            not self.prefix_pull_active
+            or decode_prefix_len < int(self.kv_args.page_size)
+            or len(bootstrap_infos) != 1
+        ):
+            return False
+        info = bootstrap_infos[0]
+        self._decode.prefix_tokens[room] = int(decode_prefix_len)
+        self._decode.prefix_offer_pending.add(room)
+        self._decode.prefill_addr[room] = _tcp_endpoint(
+            ip=info["rank_ip"], port=info["rank_port"]
+        )
+        return True
+
+    # ----- victim push (pd_victim_push.py) -----------------------------------
+
+    def _on_victim_push(self, msg: List[bytes]) -> None:
+        push = VictimPush.from_frames(msg)
+        with self._state_lock:
+            self._decode.victim_pushes[(push.prefill, push.seq)] = push
+
+    def _on_victim_done(self, msg: List[bytes]) -> None:
+        done = VictimDone.from_frames(msg)
+        with self._state_lock:
+            self._decode.victim_dones[(done.prefill, done.seq)] = done
+
+    def victim_pushes(self) -> Dict[Tuple[str, int], VictimPush]:
+        """Pushes received and not yet taken, by (prefill, seq)."""
+        with self._state_lock:
+            return dict(self._decode.victim_pushes)
+
+    def take_victim_push(self, key: Tuple[str, int]) -> Optional[VictimPush]:
+        with self._state_lock:
+            return self._decode.victim_pushes.pop(key, None)
+
+    def victim_dones(self) -> Dict[Tuple[str, int], VictimDone]:
+        """Done notices received and not yet taken, by (prefill, seq)."""
+        with self._state_lock:
+            return dict(self._decode.victim_dones)
+
+    def take_victim_done(self, key: Tuple[str, int]) -> Optional[VictimDone]:
+        with self._state_lock:
+            return self._decode.victim_dones.pop(key, None)
+
+    def send_victim_ack(self, *, endpoint: str, ack: VictimAck) -> None:
+        self._send_prefix_message(-1, endpoint, ack.to_frames())
+
+    def prefix_offer_owed(self, room: int) -> bool:
+        with self._state_lock:
+            return room in self._decode.prefix_offer_pending
+
+    def offer_resident_prefix(
+        self,
+        room: int,
+        page_ids: List[int],
+        *,
+        swa_first_page: int = 0,
+        swa_page_ids: Sequence[int] = (),
+        source: str = "device",
+    ) -> None:
+        """Name the room's device-resident prefix pages to the prefill, once;
+        no pages withdraws the offer promised in PULL_REQ. A hybrid model's
+        offer also names its window pages and covers exactly its pages."""
+        blocks = [int(x) for x in page_ids]
+        swa_blocks = [int(x) for x in swa_page_ids] if blocks else []
+        with self._state_lock:
+            if room not in self._decode.prefix_offer_pending:
+                return
+            self._decode.prefix_offer_pending.discard(room)
+            if room in self._aborted:
+                return
+            tokens = self._decode.prefix_tokens.get(room, 0)
+            if swa_blocks:
+                tokens = len(blocks) * int(self.kv_args.page_size)
+                self._decode.prefix_swa_blocks[room] = (swa_first_page, swa_blocks)
+            addr = self._decode.prefill_addr.get(room)
+            if blocks:
+                self._decode.prefix_blocks[room] = blocks
+                if source == "host":
+                    tokens = len(blocks) * int(self.kv_args.page_size)
+                    self._decode.prefix_host_offers.add(room)
+        if addr is None:
+            return
+        offer = PrefixOffer(
+            room=room, prefix_tokens=tokens, blocks=blocks, source=source
+        )
+        if swa_blocks:
+            offer = PrefixOffer(
+                room=room,
+                prefix_tokens=tokens,
+                blocks=blocks,
+                swa_first_page=swa_first_page,
+                swa_blocks=swa_blocks,
+                source=source,
+            )
+        self._send_prefix_message(room, addr, offer.to_frames())
+
+    def _send_prefix_message(self, room: int, addr: str, frames: List[bytes]) -> None:
+        """Send on the prefill's socket; a dead prefill only costs this room
+        its pull, the heartbeat fails the room itself."""
+        try:
+            self._send_multipart_locked(addr, frames)
+        except zmq.ZMQError as exc:
+            if exc.errno not in ROOM_SCOPED_SEND_ERRNOS:
+                raise
+            logger.warning(
+                "RaidenKVManager rank%d room %s: prefix message to %s failed "
+                "(errno %s): %s",
+                self.attn_tp_rank,
+                room,
+                addr,
+                exc.errno,
+                exc,
+            )
+
+    def _on_prefix_pull(self, msg: List[bytes]) -> None:
+        """Register the offered pages the prefill asked for, then let it pull.
+
+        Any refusal answers with no pages, so the prefill computes the prompt
+        at once instead of waiting out its timeout; a prefix read never fails
+        the decode's own room.
+        """
+        req = PrefixPull.from_frames(msg)
+        room = req.room
+        with self._state_lock:
+            blocks = self._decode.prefix_blocks.get(room)
+            swa_first, swa_blocks = self._decode.prefix_swa_blocks.get(room, (0, []))
+            addr = self._decode.prefill_addr.get(room)
+            aborted = room in self._aborted
+            host = room in self._decode.prefix_host_offers
+        if addr is None:
+            return
+        wanted = [] if aborted or blocks is None else blocks[req.first_page :]
+        wanted = wanted[: req.num_pages]
+        swa_offset = req.swa_first_page - swa_first
+        swa_wanted = swa_blocks[swa_offset:] if swa_offset >= 0 else []
+        swa_wanted = swa_wanted[: req.swa_num_pages]
+        uuid = swa_uuid = 0
+        req_id = self._prefix_req_id(room)
+        swa_req_id = self._prefix_swa_req_id(room) if req.swa_num_pages else ""
+        if len(wanted) != req.num_pages or len(swa_wanted) != req.swa_num_pages:
+            logger.warning(
+                "RaidenKVManager rank%d room %s: PREFIX_PULL for pages [%d, %d) "
+                "and window pages [%d, %d) cannot be served (offer=%s "
+                "window=%s+%d aborted=%s), refusing",
+                self.attn_tp_rank,
+                room,
+                req.first_page,
+                req.first_page + req.num_pages,
+                req.swa_first_page,
+                req.swa_first_page + req.swa_num_pages,
+                None if blocks is None else len(blocks),
+                swa_first,
+                len(swa_blocks),
+                aborted,
+            )
+            wanted, swa_wanted = [], []
+        else:
+            # Independent prefills share a decoder's native UUID map; zero
+            # means no transfer, as in _announce_chunk.
+            uuid = secrets.randbelow((1 << 63) - 1) + 1
+            if swa_wanted:
+                swa_uuid = secrets.randbelow((1 << 63) - 1) + 1
+            if not self._register_prefix_reads(
+                room=room,
+                reads=[
+                    (False, req_id, uuid, wanted),
+                    (True, swa_req_id, swa_uuid, swa_wanted),
+                ],
+                host=host,
+            ):
+                wanted, swa_wanted, uuid, swa_uuid = [], [], 0, 0
+        endpoint = self.raiden_endpoint or ""
+        swa_endpoint = (self.swa_raiden_endpoint or "") if swa_wanted else ""
+        if host:
+            endpoint = self._prefix_host_pools[0].transfer.host_control_address(
+                self.local_ip
+            )
+            if swa_wanted:
+                swa_endpoint = self._prefix_host_pools[1].transfer.host_control_address(
+                    self.local_ip
+                )
+        self._send_prefix_message(
+            room,
+            addr,
+            PrefixReady(
+                room=room,
+                req_id=req_id,
+                uuid=uuid,
+                endpoint=endpoint,
+                first_page=req.first_page,
+                num_pages=len(wanted),
+                swa_req_id=swa_req_id,
+                swa_uuid=swa_uuid,
+                swa_endpoint=swa_endpoint,
+                swa_first_page=req.swa_first_page,
+                swa_num_pages=len(swa_wanted),
+                source="host" if host else "device",
+            ).to_frames(),
+        )
+
+    def _register_prefix_reads(
+        self,
+        *,
+        room: int,
+        reads: List[Tuple[bool, str, int, List[int]]],
+        host: bool = False,
+    ) -> bool:
+        """Publish the decode's prefix pages for the prefill's read, as
+        (on the SWA engine, req_id, uuid, pages) reads, holding a lease like a
+        chunk read. A refusal advertises no pages. Accepted host registrations
+        still retain native ownership until their terminal reports arrive."""
+        registered = []
+        for swa, req_id, uuid, blocks in reads:
+            if not blocks:
+                continue
+            with self._state_lock:
+                if room in self._aborted:
+                    break
+                self._send_reads.setdefault(room, set()).add(req_id)
+            try:
+                if host:
+                    # Serialize registration with abort/room cleanup. A False
+                    # return can consume an early ACK; native completion still
+                    # owns the source pages, as in the victim export path.
+                    with self._state_lock:
+                        if (
+                            room in self._aborted
+                            or room not in self._decode.prefix_host_offers
+                        ):
+                            raise RuntimeError("Host prefix offer was released")
+                        transfer = self._prefix_host_pools[int(swa)].transfer
+                        transfer.register_read(req_id, uuid, blocks, source="host")
+                        self._prefix_host_reads[req_id] = transfer
+                    accepted = True
+                else:
+                    engine = self._swa_engine if swa else self._ensure_engine()
+                    accepted = engine is not None and bool(
+                        engine.register_read(req_id, uuid, blocks)
+                    )
+            except Exception as exc:
+                logger.error(
+                    "RaidenKVManager rank%d room %s: prefix register_read %s "
+                    "raised: %s",
+                    self.attn_tp_rank,
+                    room,
+                    req_id,
+                    exc,
+                )
+                accepted = False
+            if not accepted:
+                with self._state_lock:
+                    self._discard_sender_read_locked(room, req_id)
+                break
+            registered.append(req_id)
+        else:
+            return True
+        with self._state_lock:
+            for req_id in registered:
+                # Raiden cannot withdraw a registration, and the prefill is told
+                # to read nothing, so the lease goes and its expiry is ignored.
+                self._discard_sender_read_locked(room, req_id)
+                self._superseded_sender_reads.add(req_id)
+        return False
 
     @staticmethod
     def _pair_blocks(
@@ -285,7 +574,13 @@ class RaidenReceiverMixin:
         A whole-room read and the closing read of a chunked transfer carry the
         sliding-window pages on the second engine; earlier chunks do not.
         """
-        if self._swa_engine is None or "#" in key:
+        if self._swa_engine is None:
+            return None
+        room = self._room_of(key)
+        # A hybrid prefill's prefix pull reads its window alongside.
+        if room is not None and key == self._prefix_req_id(room):
+            return self._prefix_swa_req_id(room)
+        if "#" in key:
             return None
         return self._swa_req_id(int(key))
 
@@ -370,7 +665,7 @@ class RaidenReceiverMixin:
     def _start_read_or_fail(
         self,
         *,
-        room: int,
+        room: Optional[int],
         engine: Any,
         req_id: str,
         uuid: int,
@@ -396,7 +691,9 @@ class RaidenReceiverMixin:
             logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
             with self._state_lock:
                 self._native_failed.update((req_id, *unissued))
-                self._fail_room_locked(room, reason)
+                # A read of no room (a pushed session's) fails nothing else.
+                if room is not None:
+                    self._fail_room_locked(room, reason)
                 self._release_pull_slots_locked()
             return False
         logger.debug(
@@ -1323,9 +1620,28 @@ class RaidenKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        # False: never offer this request's resident prefix to the prefill.
+        allow_prefix_offer: bool = True,
     ):
         if self.conclude_state == KVPoll.Failed:
             return
+        peer = getattr(self, "prefill_info", None)
+        if peer is not None:
+            matching_geometry = (
+                peer.attn_tp_size == self.kv_mgr.attn_tp_size
+                and peer.attn_cp_size == self.kv_mgr.attn_cp_size
+                and peer.pp_size == self.kv_mgr.pp_size == 1
+            )
+            # Reverse prefix reads cannot use the forward path's resharding.
+            allow_prefix_offer = allow_prefix_offer and matching_geometry
+            if pd_spill_flags.victim_push_enabled() and not matching_geometry:
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    "Victim prefix caching requires matching P/D attention TP/CP sizes and PP=1",
+                )
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self.conclude_state = KVPoll.Failed
+                return
         self.kv_mgr.register_decode_request(
             self.bootstrap_room,
             [int(x) for x in kv_indices],
@@ -1333,11 +1649,38 @@ class RaidenKVReceiver(CommonKVReceiver):
             aux_index,
             self.bootstrap_infos,
             local_state_rows=self.kv_mgr._state_rows_from_state_indices(state_indices),
+            decode_prefix_len=int(decode_prefix_len or 0),
+            allow_prefix_offer=allow_prefix_offer,
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
         # The waiting timeout counts from here: the request is now known to
         # prefill and nothing else bounds how long its reply can take.
         self.init_time = time.time()
+
+    @property
+    def prefix_offer_pending(self) -> bool:
+        return self.kv_mgr.prefix_offer_owed(self.bootstrap_room)
+
+    def offer_resident_prefix(self, page_ids) -> None:
+        self.kv_mgr.offer_resident_prefix(self.bootstrap_room, page_ids)
+
+    def offer_window_prefix(self, *, tree_cache, allocator, req, window_size: int):
+        offer = lock_window_prefix(
+            tree_cache=tree_cache,
+            allocator=allocator,
+            req=req,
+            window_size=window_size,
+        )
+        if offer is None:
+            self.kv_mgr.offer_resident_prefix(self.bootstrap_room, [])
+            return None
+        self.kv_mgr.offer_resident_prefix(
+            self.bootstrap_room,
+            offer.blocks,
+            swa_first_page=offer.swa_first_page,
+            swa_page_ids=offer.swa_blocks,
+        )
+        return offer.lock_node, offer.lock_receipt
 
     def _check_waiting_timeout(self) -> Optional[KVPoll]:
         """Time out a room only after its prefill has gone quiet.

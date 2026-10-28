@@ -673,6 +673,8 @@ def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
         req=SimpleNamespace(bootstrap_room=room),
         kv_receiver=receiver,
         metadata_buffer_index=idx,
+        prefix_offer_sent=True,
+        prefix_offer_lock=None,
     )
 
 
@@ -889,6 +891,8 @@ def _make_failed_req(mgr, room, idx, abort_notified, notifiable=True):
         req=SimpleNamespace(bootstrap_room=room, rid=f"r{room}", return_logprob=False),
         kv_receiver=receiver,
         metadata_buffer_index=idx,
+        prefix_offer_sent=True,
+        prefix_offer_lock=None,
         hicache_restore_status=None,
         host_staged=False,
     )

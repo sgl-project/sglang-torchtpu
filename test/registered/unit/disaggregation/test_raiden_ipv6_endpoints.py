@@ -68,6 +68,7 @@ def _bare_manager(mode):
     mgr._send_reads = {}
     mgr.chunked_transfer = False
     mgr._transfer_parallelism = 4
+    mgr.prefix_pull_enabled = False
     return mgr
 
 
