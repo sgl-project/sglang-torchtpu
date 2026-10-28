@@ -226,7 +226,6 @@ def is_dsa_prefill_cp_interleave():
     return is_dsa_enable_prefill_cp() and get_parallel().cp_strategy == "interleave"
 
 
-
 # Structural surface where the graph DSA split-op dispatch (DSA indexer) and the
 # MLA BMM-into-attention fusion apply: a non-speculative extend (prefill) running
 # inside a piecewise/breakable CUDA graph. Both fusions are now on by default on
