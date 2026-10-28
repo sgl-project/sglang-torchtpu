@@ -143,10 +143,6 @@ def test_compile_cache_disabled_skips(monkeypatch, tmp_path, caplog, env_name):
     monkeypatch.delenv("TORCH_TPU_TIER2_COMPILATION_CACHE", raising=False)
     monkeypatch.delenv("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE", raising=False)
     monkeypatch.setenv(env_name, "disabled")
-    # sglang redirects the inductor/JAX caches under ~/.cache/sglang at import;
-    # on a runner that has compiled anything those dirs exist, and the
-    # third-party release loop would probe the filesystem even with the tier2
-    # cache disabled. Point them at paths that do not exist.
     monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "inductor"))
     monkeypatch.setenv("JAX_COMPILATION_CACHE_DIR", str(tmp_path / "jax"))
     monkeypatch.setattr(
