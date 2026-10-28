@@ -29,9 +29,19 @@ REL_TOL = 1e-2
 
 @unittest.skipUnless(_HAS_TPU, "requires a TPU backend")
 class TestSparseMlaPrefillQblock(CustomTestCase):
-    # GLM-5.3-Flash's q-block prefill: 512 + 64 query lanes, 128-token pages,
-    # and the most pages per request the op lets this kernel take.
-    _GLM_SHAPE = dict(q_width=576, page_size=PAGE, pages_per_seq=128, dtype="bfloat16")
+    @staticmethod
+    def _glm_shape():
+        # GLM-5.3-Flash's q-block prefill: NoPE + RoPE query lanes, the
+        # recipe's 128-token pages, and the most pages per request the op
+        # lets this kernel take.
+        from sglang_tpu.attention.pallas import mla_sparse_fused as fused
+
+        return dict(
+            q_width=fused.NOPE_DIM + fused.ROPE_DIM,
+            page_size=PAGE,
+            pages_per_seq=fused.QBLOCK_MAX_PAGES_PER_SEQ,
+            dtype=jnp.bfloat16,
+        )
 
     @classmethod
     def setUpClass(cls):
@@ -165,7 +175,7 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
         from sglang_tpu.attention.pallas.mla_sparse_fused import qblock_query_block
 
         def query_block(heads):
-            return qblock_query_block(heads, **self._GLM_SHAPE)
+            return qblock_query_block(heads, **self._glm_shape())
 
         self.assertEqual(query_block(8), 256)
         self.assertEqual(query_block(32), 256)
@@ -175,16 +185,17 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
         self._check(args, ref, 0.08, 0.75, query_block=query_block(64))
 
     def test_largest_shape_within_vmem_estimate_compiles(self):
-        # The op trusts the VMEM estimate, so the most heads it allows at
-        # 256-query blocks (35 on tpu7x) must compile.
+        # The op trusts the VMEM estimate, so the most heads it allows at the
+        # default query block (35 at 256 queries on tpu7x) must compile.
         from sglang_tpu.attention.pallas import mla_sparse_qblock as mq
 
+        shape = self._glm_shape()
         heads = max(
             h
             for h in range(1, 129)
-            if mq.vmem_bytes(h, 256, **self._GLM_SHAPE) <= mq.vmem_limit_bytes()
+            if mq.vmem_bytes(h, mq.QUERY_BLOCK, **shape) <= mq.vmem_limit_bytes()
         )
-        pps, seqs, tokens = self._GLM_SHAPE["pages_per_seq"], 4, 1024
+        pps, seqs, tokens = shape["pages_per_seq"], 4, 1024
         sd = jax.ShapeDtypeStruct
         mq.sparse_mla_prefill_qblock.lower(
             sd((tokens, heads, 512), jnp.bfloat16),
@@ -199,7 +210,7 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
             sm_scale=0.08,
             k_scale=0.75,
             kpool=KPOOL,
-            query_block=256,
+            query_block=mq.QUERY_BLOCK,
         ).compile()
 
 

@@ -52,6 +52,15 @@ ROPE_LANES = 128  # RoPE row in the cache: 64 FP8 values, then zero padding
 _NBUF = 4  # DMA ring depth (prefetch distance NBUF - 1 pages)
 _WORD_BITS = 32  # pools per bitmap word, i.e. per page
 _VMEM_LIMIT_BYTES = 64 * 1024 * 1024
+_LANES = 128  # width of a TPU vector register
+_SUBLANES = 8  # 32-bit rows of a vector register; a [1, n] buffer takes 8
+_F32_BYTES = jnp.dtype(jnp.float32).itemsize
+_I32_BYTES = jnp.dtype(jnp.int32).itemsize
+# Queries per block: the default is the one this kernel came with from
+# sglang-jax. Query positions sit on lanes, so a block is a whole number of
+# lanes and the smallest is one lane width.
+QUERY_BLOCK = 256
+MIN_QUERY_BLOCK = _LANES
 
 
 def _cdiv(a, b):
@@ -75,22 +84,25 @@ def vmem_bytes(
 
     Pallas keeps two copies of each blocked input and output, and one of each
     scratch buffer. Most of the total is per score row (num_heads *
-    query_block): about 7 KiB at 128-token pages. On tpu7x the estimate is up
-    to 0.6 MiB above what the compiler reports, e.g. 113.6 vs 113.0 MiB at 64
-    heads with 256-query blocks.
+    query_block): the query window, the output, the f32 accumulator and one
+    page of f32 scores. Where the kernel does not fit, the estimate is up to
+    0.6 MiB above what the tpu7x compiler reports.
     """
     itemsize = jnp.dtype(dtype).itemsize
     per_row = (
-        2 * _align(q_width, 128) * itemsize  # query window
+        2 * _align(q_width, _LANES) * itemsize  # query window
         + 2 * NOPE_DIM * itemsize  # output
-        + NOPE_DIM * 4  # f32 accumulator
-        + 2 * 8 * 4  # f32 running max and sum; a [1, n] buffer takes 8 sublanes
-        + page_size * 4  # f32 scores of one page, [page_size, rows]
+        + NOPE_DIM * _F32_BYTES  # accumulator
+        + 2 * _SUBLANES * _F32_BYTES  # running max and sum, [1, rows] each
+        + page_size * _F32_BYTES  # scores of one page, [page_size, rows]
     )
     per_block = (
-        2 * _align(pages_per_seq, 8) * query_block * 4  # selection words
-        + 2 * 8 * query_block * 4  # query positions
-        + _NBUF * page_size * (4 * 128 + ROPE_LANES)  # key ring
+        # Selection words, [pages, query_block].
+        2 * _align(pages_per_seq, _SUBLANES) * query_block * _I32_BYTES
+        # Query positions, [1, query_block].
+        + 2 * _SUBLANES * query_block * _I32_BYTES
+        # Key ring: one FP8 byte per NoPE value and per RoPE lane of a token.
+        + _NBUF * page_size * (NOPE_DIM + ROPE_LANES)
     )
     return num_heads * query_block * per_row + per_block
 
@@ -301,7 +313,7 @@ def sparse_mla_prefill_qblock(
     sm_scale: float,
     k_scale: float,
     kpool: int,
-    query_block: int = 256,
+    query_block: int = QUERY_BLOCK,
     interpret: bool = False,
 ) -> jax.Array:
     """Sparse MLA attention over pooled DSA selections, ``query_block`` at a time.
@@ -324,8 +336,10 @@ def sparse_mla_prefill_qblock(
             f"row width divisible by kpool (page_size={page_size}, kpool={kpool}, "
             f"width={topk_indices.shape[1]})"
         )
-    if qb % 128:
-        raise ValueError(f"query_block must be a multiple of 128, got {qb}")
+    if qb % MIN_QUERY_BLOCK:
+        raise ValueError(
+            f"query_block must be a multiple of {MIN_QUERY_BLOCK}, got {qb}"
+        )
 
     # Every block holds one request's queries, so a batch needs at most
     # sum(ceil(q_len / qb)) <= (num_tokens + seqs * (qb - 1)) / qb of them.
@@ -350,7 +364,7 @@ def sparse_mla_prefill_qblock(
     bit = jnp.where(sel >= 0, jnp.left_shift(1, sel % _WORD_BITS), 0)
     # member[b, g, q]: query q's selection word for page g. A compare-OR, not a
     # scatter (scatters with this many updates are slow on the TPU).
-    pages_pad = _align(pages_per_seq, 8)
+    pages_pad = _align(pages_per_seq, _SUBLANES)
     g = jnp.arange(pages_pad, dtype=jnp.int32)
     member = lax.reduce(
         jnp.where(page[:, None] == g[None, :, None, None], bit[:, None], 0),
@@ -374,7 +388,7 @@ def sparse_mla_prefill_qblock(
 
     # Queries in block layout, head-major rows, 128-aligned head dim.
     q = jnp.concatenate([ql_nope, q_pe], axis=-1)
-    head_dim = _align(q.shape[-1], 128)
+    head_dim = _align(q.shape[-1], _LANES)
     q = jnp.pad(q, ((0, 0), (0, 0), (0, head_dim - q.shape[-1])))
     q = jnp.where(is_row[..., None, None], q[tok], 0)  # [nb, qb, H, D]
     q = q.transpose(0, 2, 1, 3).reshape(num_blocks, num_heads * qb, head_dim)

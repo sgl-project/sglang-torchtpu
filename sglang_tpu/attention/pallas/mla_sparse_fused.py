@@ -37,6 +37,8 @@ from sglang_tpu.attention.pallas.mla_sparse.kv_cache_utils import (
     SparseMLAKVCacheSpec,
 )
 from sglang_tpu.attention.pallas.mla_sparse_qblock import (
+    MIN_QUERY_BLOCK,
+    QUERY_BLOCK,
     sparse_mla_prefill_qblock,
     vmem_bytes,
     vmem_limit_bytes,
@@ -57,11 +59,10 @@ QBLOCK_MIN_TOKENS = 512
 # grows with the context. Measured at 80 pages (10k context); longer contexts
 # keep the per-query kernel until measured.
 QBLOCK_MAX_PAGES_PER_SEQ = 128
-# Query blocks the query-blocked kernel may take, largest first. Its VMEM
-# grows with num_heads * query_block (mla_sparse_qblock.vmem_bytes): with
-# 128-token pages, 32 heads per chip (attention TP2) fit 256-query blocks,
-# and 64 heads per chip (attention TP1) need 113 MiB at 256, so they take 128.
-QBLOCK_QUERY_BLOCKS = (256, 128)
+# Query blocks the query-blocked kernel may take, largest first: its default
+# and its smallest. Its VMEM grows with num_heads * query_block, so the op
+# takes the largest whose estimate (mla_sparse_qblock.vmem_bytes) fits.
+QBLOCK_QUERY_BLOCKS = (QUERY_BLOCK, MIN_QUERY_BLOCK)
 
 # The sparse kernels only support these two sizes.
 NOPE_DIM = 512
