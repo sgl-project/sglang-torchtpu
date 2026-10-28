@@ -18,10 +18,11 @@ use tower::ServiceExt;
 
 use crate::common::{
     mock_worker::{
-        clear_fail_status_code, clear_slow_stream_chunks, clear_stream_error_after_chunks,
-        get_stream_tracking_state, reset_stream_tracker, set_fail_status_code,
-        set_slow_stream_chunks, set_stream_error_after_chunks, wait_for_stream_finish,
-        StreamTrackingState, MOCK_STREAM_BUFFER,
+        clear_fail_body_stall_ms, clear_fail_status_code, clear_slow_stream_chunks,
+        clear_stream_error_after_chunks, generate_cancelled_at, get_stream_tracking_state,
+        reset_generate_cancelled, reset_stream_tracker, set_fail_body_stall_ms,
+        set_fail_status_code, set_slow_stream_chunks, set_stream_error_after_chunks,
+        wait_for_stream_finish, StreamTrackingState, MOCK_STREAM_BUFFER,
     },
     AppTestContext, TestRouterConfig, TestWorkerConfig,
 };
@@ -2737,6 +2738,14 @@ mod upstream_cancel_tests {
         }
     }
 
+    /// RAII cleanup for `set_fail_body_stall_ms`.
+    struct FailBodyStallGuard(u16);
+    impl Drop for FailBodyStallGuard {
+        fn drop(&mut self) {
+            clear_fail_body_stall_ms(self.0);
+        }
+    }
+
     /// PD router config with a single attempt (no retries), so breaker
     /// deltas and elapsed time reflect exactly one dual dispatch.
     fn pd_single_attempt_config(
@@ -2912,21 +2921,25 @@ mod upstream_cancel_tests {
         ctx.shutdown().await;
     }
 
-    /// Decode answers 400 while prefill is still pending: decode will never
-    /// pull the KV cache either, so the client gets the 400 without waiting
-    /// for prefill. A 4xx is a client fault, so decode records a success
-    /// and prefill is not charged.
-    #[tokio::test]
-    async fn test_pd_decode_4xx_before_prefill_fails_fast() {
-        let prefill_port = 20330;
-        let decode_port = 20331;
+    /// Decode answers a 4xx while prefill is still pending: decode will never
+    /// pull the KV cache either, so the client gets decode's status unchanged
+    /// without waiting for prefill, and prefill is not charged. A 4xx is a
+    /// client fault (decode records a success) except 429, which means decode
+    /// is overloaded (decode records a failure).
+    async fn assert_pd_decode_4xx_fails_fast(
+        router_port: u16,
+        prefill_port: u16,
+        decode_port: u16,
+        decode_status: u16,
+        stream: bool,
+    ) {
         let _status_guard = FailStatusGuard(decode_port);
-        let config = pd_single_attempt_config(4330, prefill_port, decode_port);
+        let config = pd_single_attempt_config(router_port, prefill_port, decode_port);
         let ctx = AppTestContext::new_with_config(
             config,
             vec![
                 hanging_prefill(prefill_port),
-                rejecting_decode(decode_port, 400),
+                rejecting_decode(decode_port, decode_status),
             ],
         )
         .await;
@@ -2936,16 +2949,248 @@ mod upstream_cancel_tests {
         let (s_pre_p, f_pre_p) = breaker_counts(&prefill);
         let (s_pre_d, f_pre_d) = breaker_counts(&decode);
 
-        let (status, elapsed) = send_pd_generate(app, false).await;
+        let (status, elapsed) = send_pd_generate(app, stream).await;
 
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            status.as_u16(),
+            decode_status,
+            "decode's {} must reach the client unchanged (stream={})",
+            decode_status,
+            stream
+        );
         assert!(
             elapsed < PD_FAIL_FAST_BUDGET,
-            "decode 400 must be returned without waiting for prefill; took {:?}",
+            "decode {} must be returned without waiting for prefill (stream={}); took {:?}",
+            decode_status,
+            stream,
             elapsed
         );
+        let expected_decode = if decode_status == 429 { (0, 1) } else { (1, 0) };
         let (s_post_d, f_post_d) = breaker_counts(&decode);
-        assert_eq!((s_post_d - s_pre_d, f_post_d - f_pre_d), (1, 0));
+        assert_eq!(
+            (s_post_d - s_pre_d, f_post_d - f_pre_d),
+            expected_decode,
+            "decode {} breaker delta (successes, failures) (stream={})",
+            decode_status,
+            stream
+        );
+        let (s_post_p, f_post_p) = breaker_counts(&prefill);
+        assert_eq!(
+            (s_post_p - s_pre_p, f_post_p - f_pre_p),
+            (0, 0),
+            "cancelled prefill must not be charged for decode's {} (stream={})",
+            decode_status,
+            stream
+        );
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_pd_decode_400_before_prefill_fails_fast_non_streaming() {
+        assert_pd_decode_4xx_fails_fast(4330, 20330, 20331, 400, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_pd_decode_400_before_prefill_fails_fast_streaming() {
+        assert_pd_decode_4xx_fails_fast(4332, 20332, 20333, 400, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_pd_decode_422_before_prefill_fails_fast_non_streaming() {
+        assert_pd_decode_4xx_fails_fast(4334, 20334, 20335, 422, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_pd_decode_422_before_prefill_fails_fast_streaming() {
+        assert_pd_decode_4xx_fails_fast(4336, 20336, 20337, 422, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_pd_decode_429_before_prefill_fails_fast_non_streaming() {
+        assert_pd_decode_4xx_fails_fast(4338, 20338, 20339, 429, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_pd_decode_429_before_prefill_fails_fast_streaming() {
+        assert_pd_decode_4xx_fails_fast(4340, 20340, 20341, 429, true).await;
+    }
+
+    /// Decode sends 503 headers and then stalls its error body. The router
+    /// must close the prefill connection as soon as decode's status arrives,
+    /// not after it has finished reading decode's error body.
+    #[tokio::test]
+    async fn test_pd_decode_failure_cancels_prefill_before_reading_decode_body() {
+        let prefill_port = 20344;
+        let decode_port = 20345;
+        let decode_body_stall_ms = 3_000;
+        let _status_guard = FailStatusGuard(decode_port);
+        let _stall_guard = FailBodyStallGuard(decode_port);
+        reset_generate_cancelled(prefill_port);
+        set_fail_body_stall_ms(decode_port, decode_body_stall_ms);
+        let config = pd_single_attempt_config(4344, prefill_port, decode_port);
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                hanging_prefill(prefill_port),
+                rejecting_decode(decode_port, 503),
+            ],
+        )
+        .await;
+        let app = ctx.create_app().await;
+
+        let start = std::time::Instant::now();
+        let (status, _elapsed) = send_pd_generate(app, false).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        // The mock records the cancel when hyper notices the closed socket,
+        // which can land just after the gateway response; poll briefly.
+        let mut cancelled_at = generate_cancelled_at(prefill_port);
+        for _ in 0..40 {
+            if cancelled_at.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancelled_at = generate_cancelled_at(prefill_port);
+        }
+        let cancelled_at =
+            cancelled_at.expect("prefill /generate must be cancelled when decode fails first");
+        let cancel_delay = cancelled_at.duration_since(start);
+        assert!(
+            cancel_delay < Duration::from_millis(1_500),
+            "prefill must be cancelled before decode's {} ms error body is read; \
+             cancelled after {:?}",
+            decode_body_stall_ms,
+            cancel_delay
+        );
+
+        ctx.shutdown().await;
+    }
+
+    /// Streaming decode 503: the decode breaker failure must be recorded
+    /// before the response leaves the PD router, not later by a detached
+    /// stream task. The retry loop picks the next pair as soon as it gets
+    /// the response, so a deferred tick lets it reuse the broken decode.
+    #[tokio::test]
+    async fn test_pd_streaming_decode_5xx_records_breaker_before_response() {
+        let prefill_port = 20348;
+        let decode_port = 20349;
+        let _status_guard = FailStatusGuard(decode_port);
+        let config = pd_single_attempt_config(4348, prefill_port, decode_port);
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                hanging_prefill(prefill_port),
+                rejecting_decode(decode_port, 503),
+            ],
+        )
+        .await;
+        let app = ctx.create_app().await;
+        let decode = pin_worker(&ctx, &format!("http://127.0.0.1:{}", decode_port));
+        let (s_pre_d, f_pre_d) = breaker_counts(&decode);
+
+        let payload = json!({ "text": "x", "stream": true });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        // Read the breaker before touching the body or yielding, so no
+        // detached task has had a chance to run.
+        let (s_post_d, f_post_d) = breaker_counts(&decode);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            (s_post_d - s_pre_d, f_post_d - f_pre_d),
+            (0, 1),
+            "decode 503 must be recorded synchronously, before the response \
+             is returned"
+        );
+        let _ = resp.into_body().collect().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            breaker_counts(&decode),
+            (s_post_d, f_post_d),
+            "draining the error body must not record a second decode outcome"
+        );
+
+        ctx.shutdown().await;
+    }
+
+    /// Streaming decode 503 with retries enabled and a breaker that opens on
+    /// the first failure. The decode breaker must record the failure before
+    /// the response returns to the retry loop, so the retry does not pick
+    /// the tripped decode again: exactly one decode failure in total.
+    #[tokio::test]
+    async fn test_pd_streaming_decode_5xx_trips_breaker_before_retry() {
+        use smg::config::{CircuitBreakerConfig, RetryConfig};
+
+        let prefill_port = 20346;
+        let decode_port = 20347;
+        let _status_guard = FailStatusGuard(decode_port);
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(
+                vec![(format!("http://127.0.0.1:{}", prefill_port), None)],
+                vec![format!("http://127.0.0.1:{}", decode_port)],
+            )
+            .round_robin_policy()
+            .host("127.0.0.1")
+            .port(4346)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .retry_config(RetryConfig {
+                max_retries: 3,
+                initial_backoff_ms: 0,
+                max_backoff_ms: 0,
+                backoff_multiplier: 1.0,
+                jitter_factor: 0.0,
+            })
+            .circuit_breaker_config(CircuitBreakerConfig {
+                failure_threshold: 1,
+                success_threshold: 1,
+                timeout_duration_secs: 60,
+                window_duration_secs: 60,
+            })
+            .build_unchecked();
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                hanging_prefill(prefill_port),
+                rejecting_decode(decode_port, 503),
+            ],
+        )
+        .await;
+        let app = ctx.create_app().await;
+        let prefill = pin_worker(&ctx, &format!("http://127.0.0.1:{}", prefill_port));
+        let decode = pin_worker(&ctx, &format!("http://127.0.0.1:{}", decode_port));
+        let (s_pre_p, f_pre_p) = breaker_counts(&prefill);
+        let (s_pre_d, f_pre_d) = breaker_counts(&decode);
+
+        let (status, _elapsed) = send_pd_generate(app, true).await;
+        // Let any detached work settle so the counts below are final.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let (s_post_d, f_post_d) = breaker_counts(&decode);
+        assert_eq!(
+            (s_post_d - s_pre_d, f_post_d - f_pre_d),
+            (0, 1),
+            "retry must not dispatch to the decode whose breaker the first \
+             attempt tripped"
+        );
+        assert!(
+            !matches!(
+                decode.circuit_breaker().state(),
+                smg::core::CircuitState::Closed
+            ),
+            "decode breaker must be open after the 503"
+        );
         let (s_post_p, f_post_p) = breaker_counts(&prefill);
         assert_eq!((s_post_p - s_pre_p, f_post_p - f_pre_p), (0, 0));
 
