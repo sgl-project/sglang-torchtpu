@@ -960,6 +960,25 @@ class USPAttention(nn.Module):
         effective_skip_sp = (
             self.skip_sequence_parallel or skip_sequence_parallel_override
         )
+        head_pad = self._ulysses_head_pad(
+            q, k, attn_mask, effective_skip_sp, qkv_pre_all_to_all, q_prefix
+        )
+        if head_pad:
+            # Zero heads attend uniformly to zero values and are cut again.
+            pad = (0, 0, 0, head_pad)
+            out = self.forward(
+                torch.nn.functional.pad(q, pad),
+                torch.nn.functional.pad(k, pad),
+                torch.nn.functional.pad(v, pad),
+                attn_mask=attn_mask,
+                num_replicated_prefix=num_replicated_prefix,
+                num_replicated_suffix=num_replicated_suffix,
+                num_replicated_kv_prefix=num_replicated_kv_prefix,
+                skip_sequence_parallel_override=skip_sequence_parallel_override,
+                attn_mask_meta=attn_mask_meta,
+                seq_lens=seq_lens,
+            )
+            return out[:, :, : q.shape[2]]
         if seq_lens is not None:
             assert (
                 attn_mask is None
@@ -2026,6 +2045,36 @@ class USPAttention(nn.Module):
                 is_causal=False,
                 scale=self.softmax_scale,
             ).transpose(1, 2)
+
+    @staticmethod
+    def _ulysses_head_pad(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        attn_mask: torch.Tensor | None,
+        skip_sp: bool,
+        qkv_pre_all_to_all: bool,
+        q_prefix: torch.Tensor | None,
+    ) -> int:
+        """Zero heads to append so the head count divides by the Ulysses degree
+        (e.g. Z-Image's 30 heads at Ulysses 8); 0 where padding does not apply."""
+        # Ulysses degree; the same split the exchanges use (sp = ulysses x ring).
+        world_size = (
+            get_sequence_parallel_world_size() // get_ring_parallel_world_size()
+        )
+        if (
+            world_size <= 1
+            or skip_sp
+            or qkv_pre_all_to_all
+            or q_prefix is not None
+            or k.shape[2] != q.shape[2]
+            or (
+                attn_mask is not None
+                and attn_mask.dim() == 4
+                and attn_mask.shape[1] > 1
+            )
+        ):
+            return 0
+        return -q.shape[2] % world_size
 
     def forward_with_replicated_kv_prefix(
         self,
