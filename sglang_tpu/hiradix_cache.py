@@ -55,6 +55,8 @@ from sglang.srt.mem_cache.radix_cache import (
 )
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
+    last_hash_value,
+    prefix_hash_values,
     split_node_hash_value,
 )
 from sglang.srt.observability.metrics_collector import (
@@ -120,19 +122,10 @@ class HiTreeNode(TreeNode):
             raise RuntimeError("Host reference counter is already zero.")
 
     def get_last_hash_value(self) -> Optional[str]:
-        """The node's last page hash, or None when it was never hashed."""
-        if not self.hash_value:
-            return None
-        return self.hash_value[-1]
+        return last_hash_value(self)
 
-    @staticmethod
-    def get_prefix_hash_values(node: Optional[TreeNode]) -> List[str]:
-        """Page hashes of ``node`` and its ancestors, root-to-node order."""
-        chunks = []
-        while node is not None and node.hash_value is not None:
-            chunks.append(node.hash_value)
-            node = node.parent
-        return [value for chunk in reversed(chunks) for value in chunk]
+    def get_prefix_hash_values(self, node: Optional[TreeNode]) -> List[str]:
+        return prefix_hash_values(node)
 
 
 class HiRadixCache(RadixCache):
@@ -860,7 +853,7 @@ class HiRadixCache(RadixCache):
 
     def get_prefix_hash_values(self, node: HiTreeNode) -> List[str]:
         """Hash chain of the node's ancestors, root-to-parent order."""
-        return HiTreeNode.get_prefix_hash_values(node.parent)
+        return node.get_prefix_hash_values(node.parent)
 
     def release_host_resources(self) -> None:
         if self.token_to_kv_pool_host is not None:
