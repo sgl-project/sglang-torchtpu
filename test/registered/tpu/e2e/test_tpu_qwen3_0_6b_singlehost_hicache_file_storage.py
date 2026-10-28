@@ -29,7 +29,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 register_tpu_ci(
     est_time=360,
     suite="stage-b-test-tpu-4-v7",
-    labels=["singlehost", "qwen3-0.6b", "hicache", "l3-file"],
+    labels=["singlehost", "qwen3-0.6b", "kv-offload", "l3-file"],
 )
 
 import os
