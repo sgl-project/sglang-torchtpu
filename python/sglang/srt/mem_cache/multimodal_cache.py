@@ -127,6 +127,15 @@ class MultiModalStaticCache(MultimodalCache):
             return True
         tensor = embedding.embedding
         compact = embedding.storage_size() > embedding.cache_size()
+        total = (
+            embedding.cache_size()
+            if compact
+            else sum(embedding.backing_buffers().values())
+        )
+        # An entry larger than the whole cache must not evict useful entries on
+        # every chunk before it is rejected.
+        if total > self.max_size:
+            return False
         while True:
             # Recomputed after each eviction: evicting an entry that shares a
             # buffer with the new one leaves that buffer uncharged.

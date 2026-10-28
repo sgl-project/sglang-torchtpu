@@ -97,6 +97,20 @@ def test_padded_cache_evicting_one_sharer_keeps_the_buffer_charged():
     assert cache.current_size == 0
 
 
+def test_padded_cache_rejects_an_oversized_entry_without_evicting():
+    small = torch.zeros(2, 4)
+    cache = MultiModalStaticCache(small.untyped_storage().nbytes())
+    assert cache.set(
+        1, TpuEmbeddingResult(embedding=PaddedEmbedding.from_buffer(small, 2))
+    )
+    big = torch.zeros(16, 4)
+    assert not cache.set(
+        2, TpuEmbeddingResult(embedding=PaddedEmbedding.from_buffer(big, 1))
+    )
+    assert cache.get_single(1) is not None
+    assert cache.current_size == small.untyped_storage().nbytes()
+
+
 @pytest.mark.parametrize("entry_type", [EmbeddingResult, TpuEmbeddingResult])
 def test_tensor_cache_compacts_views_and_preserves_admission_and_eviction(entry_type):
     buffer = torch.arange(64).reshape(8, 8).float()
