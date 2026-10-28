@@ -785,12 +785,18 @@ class CompiledFunction:
             )
         pending_compile = None
         executable = None
+        donated_inputs = list(
+            range(len(model_inputs), len(model_inputs) + len(kv_pool_inputs))
+        )
         start = time.perf_counter()
         if async_compile:
             with dynamo_timed("direct_compile_async_submit"):
                 if spmd_compiler is None:
                     pending_compile = tpu_torch_compile.async_traverse_and_compile(
-                        result_tensors, graph_inputs, argument_layouts=argument_layouts
+                        result_tensors,
+                        graph_inputs,
+                        argument_layouts=argument_layouts,
+                        donated_inputs=donated_inputs,
                     )
                 else:
                     pending_compile = spmd_compiler.compile(
@@ -799,6 +805,7 @@ class CompiledFunction:
                         argument_layouts=argument_layouts,
                         interface=interface,
                         graph=graph,
+                        donated_inputs=donated_inputs,
                     )
             logger.info(
                 "[direct_compile] native async submission %.3fs",
@@ -807,7 +814,10 @@ class CompiledFunction:
         else:
             with dynamo_timed("direct_compile_traverse_and_compile"):
                 compile_result = tpu_torch_compile.traverse_and_compile(
-                    result_tensors, graph_inputs, argument_layouts=argument_layouts
+                    result_tensors,
+                    graph_inputs,
+                    argument_layouts=argument_layouts,
+                    donated_inputs=donated_inputs,
                 )
             executable = compile_result.executable
             logger.info(
