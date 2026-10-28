@@ -183,7 +183,11 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
             # Pre-install buckets are empty, so this is an identity pad and
             # the runner executes the blocks eagerly.
             features = [item.feature for item in items]
-            assert features, "TPU vision staging ran with no image items"
+            if not features or any(f is None for f in features):
+                raise ValueError(
+                    "TPU vision staging requires a precomputed feature on "
+                    "every image item"
+                )
             # The gateway renders one batch on one device, so the first
             # feature's device speaks for every item.
             if features[0].device.type == "tpu":

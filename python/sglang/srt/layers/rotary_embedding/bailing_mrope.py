@@ -13,11 +13,13 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_get_mscale_simple,
     yarn_linear_ramp_mask,
 )
-from sglang.srt.utils import is_cuda, is_xpu
+from sglang.srt.utils import is_cuda_alike, is_xpu
 
-# Module-level so a traced forward does not inline the is_cuda()/is_xpu()
-# probes (the same Dynamo constraint as _CUDA_ENABLED elsewhere).
-_TRITON_FUSED_MROPE = is_cuda() or is_xpu()
+# Module-level so a traced forward does not inline the lru_cache'd probes
+# (the same Dynamo constraint as _CUDA_ENABLED elsewhere). is_cuda_alike()
+# includes HIP: upstream MRotaryEmbedding routes ROCm through forward_cuda,
+# which calls the same Triton kernel, so ROCm belongs on the Triton path.
+_TRITON_FUSED_MROPE = is_cuda_alike() or is_xpu()
 
 
 class BailingMRotaryEmbedding(RotaryEmbedding):
@@ -155,24 +157,33 @@ class BailingMRotaryEmbedding(RotaryEmbedding):
             if query.ndim == 3:
                 query = query.reshape(query_shape[0], -1)
                 key = key.reshape(key_shape[0], -1)
-            if _TRITON_FUSED_MROPE:
-                triton_ernie45_rope_fused_inplace(
-                    query,
-                    key,
-                    self.cos_sin_cache,
-                    positions,
-                    self.mrope_section,
-                    self.head_size,
-                    self.rotary_dim,
-                    self.is_neox_style,
-                )
-            else:
-                self._ernie45_rope_fused_inplace_native(query, key, positions)
+            self._rope_qk_fused_inplace(query, key, positions)
             if query_shape != query.shape:
                 query = query.view(query_shape)
                 key = key.view(key_shape)
             return query, key
         return RotaryEmbedding.forward(self, positions, query, key)
+
+    def _rope_qk_fused_inplace(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """Triton fused mRoPE where a Triton driver exists, eager mirror else."""
+        if _TRITON_FUSED_MROPE:
+            triton_ernie45_rope_fused_inplace(
+                query,
+                key,
+                self.cos_sin_cache,
+                positions,
+                self.mrope_section,
+                self.head_size,
+                self.rotary_dim,
+                self.is_neox_style,
+            )
+        else:
+            self._ernie45_rope_fused_inplace_native(query, key, positions)
 
     def _ernie45_rope_fused_inplace_native(
         self,

@@ -237,13 +237,13 @@ _CUDA_ENABLED = is_cuda()
 # this surface (no feature flag); each adds its own extra carve-outs at its call
 # site (e.g. the indexer also excludes DSA prefill context parallelism).
 def is_graph_dsa_split_op_surface(forward_batch: "ForwardBatch") -> bool:
-    # The two graph predicates below are CUDA-only surfaces, so the folded
-    # bool is the whole device gate.
-    if not _CUDA_ENABLED:
-        return False
     return (
-        is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph()
-    ) and forward_batch.forward_mode.is_extend_without_speculative()
+        # The two graph predicates are CUDA-only surfaces, so the folded bool
+        # is the whole device gate (and short-circuits first).
+        _CUDA_ENABLED
+        and (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
+        and forward_batch.forward_mode.is_extend_without_speculative()
+    )
 
 
 def can_dsa_prefill_cp_interleave(forward_batch: "ForwardBatch"):
