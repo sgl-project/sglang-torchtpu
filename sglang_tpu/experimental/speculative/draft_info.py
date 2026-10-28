@@ -190,8 +190,9 @@ class HostPaddedDraftInput(SpecInput):
 
 def _verify_window_eligible(batch: ScheduleBatch) -> bool:
     # A verify commits at most one window, the single offset the plan enumerates.
-    # grammar_retained_tokens can commit less, and the compact draft cache maps
-    # its own window from host lengths.
+    # Grammar truncation only shortens finished rows: they are filtered before
+    # another window is planned, and the KV fence protects the in-flight step.
+    # The compact draft cache maps its own window from host lengths.
     return (
         batch.enable_overlap
         and isinstance(batch.req_pool_indices_cpu, torch.Tensor)
@@ -202,6 +203,9 @@ def _verify_window_eligible(batch: ScheduleBatch) -> bool:
             # directly by the PD handoff, before the worker has run a step.
             or batch.spec_algorithm.create_worker(get_server_args()).supports_logprobs
         )
-        and not batch.has_grammar
+        and (
+            not batch.has_grammar
+            or batch.spec_algorithm.create_worker(get_server_args()).supports_grammar
+        )
         and all(req.lora_id is None for req in batch.reqs)
     )
