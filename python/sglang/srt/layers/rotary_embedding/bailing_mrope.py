@@ -15,12 +15,6 @@ from sglang.srt.layers.rotary_embedding.yarn import (
 )
 from sglang.srt.utils import is_cuda_alike, is_xpu
 
-# Module-level so a traced forward does not inline the lru_cache'd probes
-# (the same Dynamo constraint as _CUDA_ENABLED elsewhere). is_cuda_alike()
-# includes HIP: upstream MRotaryEmbedding routes ROCm through forward_cuda,
-# which calls the same Triton kernel, so ROCm belongs on the Triton path.
-_TRITON_FUSED_MROPE = is_cuda_alike() or is_xpu()
-
 
 class BailingMRotaryEmbedding(RotaryEmbedding):
     """Bailing multimodal RoPE with centered height and width positions."""
@@ -170,8 +164,14 @@ class BailingMRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
-        """Triton fused mRoPE where a Triton driver exists, eager mirror else."""
-        if _TRITON_FUSED_MROPE:
+        """Triton fused mRoPE where a Triton driver exists, eager mirror else.
+
+        The device probe folds to a constant under Dynamo (verified with
+        torch.compile(fullgraph=True) on torch 2.11). is_cuda_alike()
+        includes HIP: upstream MRotaryEmbedding routes ROCm through
+        forward_cuda, which calls the same Triton kernel.
+        """
+        if is_cuda_alike() or is_xpu():
             triton_ernie45_rope_fused_inplace(
                 query,
                 key,
