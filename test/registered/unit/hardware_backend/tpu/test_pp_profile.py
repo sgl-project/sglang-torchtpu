@@ -9,6 +9,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.compilation import decoder_compile_policy
 from sglang_tpu.pp_profile import (
     profile_cache,
     set_profile_inputs,
@@ -170,8 +171,9 @@ class TestProfileInputs(CustomTestCase):
                     patch.dict(
                         sys.modules, {"torch_tpu._internal.sync.sync": sync_module}
                     ),
-                    patch(
-                        "sglang_tpu.compilation.decoder_compile_policy.max_extend_tokens",
+                    patch.object(
+                        decoder_compile_policy,
+                        "max_extend_tokens",
                         return_value=40,
                     ) as rows,
                 ):
