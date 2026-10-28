@@ -39,7 +39,6 @@ from sglang.srt.disaggregation.utils import (
     KVClassType,
     TransferBackend,
 )
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache import hicache_auto_size as sizing
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
 from sglang.srt.mem_cache.pool_host import base as host_base
@@ -64,6 +63,7 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardReq,
 )
 from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
+from sglang_tpu.envs import envs
 from sglang_tpu.kv_pool_host import (
     TPU_DMA_LAYOUT,
     TpuDMAHostKVPool,

@@ -744,36 +744,6 @@ class Envs:
     # (supports_deferred_decode_kv_release).
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
-    # Raiden: a DP or TP decode receives KV from a pipeline-parallel prefill.
-    SGLANG_RAIDEN_PIPELINE_TRANSFER = EnvBool(False)
-    # Raiden: stage each transfer (and reshard plan) in its own host-pool pages
-    # instead of fixed max-length slots; asymmetric attention TP needs it.
-    SGLANG_RAIDEN_DYNAMIC_HOST_STAGING = EnvBoolWithAlias(
-        True, deprecated_name="TPU_RAIDEN_DYNAMIC_HOST_STAGING"
-    )
-    # Raiden: a decode starts a room's next read as soon as the prefill
-    # announces it; 0 starts reads only on the next scheduler poll.
-    SGLANG_RAIDEN_LISTENER_START_READ = EnvBool(True)
-    # Raiden: deadline of each KV chunk transfer, not of the whole request; the
-    # closing read counts as a chunk, and a non-chunked transfer is one chunk.
-    # Counted from registration on the prefill and from start_read on the
-    # decode. Set the same on both.
-    SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S = EnvFloatWithAlias(
-        60.0, deprecated_name="SGLANG_RAIDEN_TIMEOUT_S"
-    )
-    # Pipeline prefill: move pages final before the prefill ends (cached prefix,
-    # finished chunks) as early transfers of at least PART_PAGES pages each.
-    SGLANG_RAIDEN_PIPELINE_EARLY_PARTS = EnvBool(False)
-    SGLANG_RAIDEN_PIPELINE_PART_PAGES = EnvInt(16)
-    # Pipeline prefill: each group of STAGE_GROUP consecutive stages moves its
-    # layers once its forwards of the final chunk complete, before sampling.
-    SGLANG_RAIDEN_PIPELINE_STAGE_PARTS = EnvBool(False)
-    SGLANG_RAIDEN_PIPELINE_STAGE_GROUP = EnvInt(1)
-    # Decode: threads coordinating pipeline transfers, one client each.
-    SGLANG_RAIDEN_PIPELINE_COORD_WORKERS = EnvInt(1)
-    # Pipeline prefill: each stage registers its share of the closing transfer
-    # at the final chunk's launch, the last stage once its tokens are copied.
-    SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE = EnvBool(False)
     SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_ENABLE_PERFETTO_TRACING"
     )
@@ -2016,11 +1986,6 @@ class Envs:
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)
     # xprof python tracer. Off by default: it dominates host busy time.
     SGLANG_TPU_PROFILE_PYTHON_TRACER = EnvBool(False)
-    # raiden KV-offload backend
-    # Seconds a raiden DMA may stay pending, from each blocking wait or, when
-    # polled, from issue. Past it the scheduler exits with TimeoutError, so keep
-    # it far above a healthy transfer.
-    SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S = EnvFloat(60.0)
     # Workaround for a TPU v7 warmup crash; disable to debug the root cause.
     SGLANG_TPU_ENABLE_CONTIGUOUS_FLOAT_LOGITS = EnvBool(True)
     # Read the RPA KV cache in the SEQ_ALONG_LANE layout (token index on the
