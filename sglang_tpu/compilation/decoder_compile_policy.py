@@ -966,8 +966,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         """The ``pp_proxy_tensors`` kwarg a non-first pipeline stage warms up with.
 
         The proxy carries the previous stage's hidden states and residual at the
-        padded token bucket, in the model dtype, on the device; the first stage
-        (and a non-pipelined model) gets no proxy.
+        padded token bucket, in the model's PP dtype (or its compute dtype by
+        default), on the device; the first stage gets no proxy.
         """
         pp_group = self.model_runner.pp_group
         if pp_group is None or pp_group.is_first_rank:
@@ -981,7 +981,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         def zeros(shape: tuple[int, int]) -> torch.Tensor:
             buffer = torch.zeros(
                 (rows, shape[1]),
-                dtype=self.model_runner.dtype,
+                dtype=getattr(
+                    self.model_runner.model,
+                    "pp_transfer_dtype",
+                    self.model_runner.dtype,
+                ),
                 device=self.model_runner.device,
             )
             return buffer[: shape[0]]

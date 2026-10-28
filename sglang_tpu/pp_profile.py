@@ -110,7 +110,9 @@ def set_profile_inputs(policy, batch, args, kwargs, tokens, prefix):
 
         def randn(cols: int) -> torch.Tensor:
             return torch.randn(
-                (rows, cols), generator=generator, dtype=runner.dtype
+                (rows, cols),
+                generator=generator,
+                dtype=getattr(runner.model, "pp_transfer_dtype", runner.dtype),
             ).to(device)
 
         proxy = {"hidden_states": randn(hidden), "residual": randn(hidden)}
