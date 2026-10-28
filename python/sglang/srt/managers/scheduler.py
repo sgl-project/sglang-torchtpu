@@ -263,6 +263,9 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
 )
+from sglang.srt.managers.scheduler_components.mm_feature_releaser import (
+    MM_FEATURE_RELEASER,
+)
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
@@ -2988,7 +2991,7 @@ class Scheduler(
             if req.session:
                 continue
             # For non-session requests, clear features and mm_inputs
-            mm_inputs.release_features()
+            MM_FEATURE_RELEASER.release(mm_inputs)
             req.multimodal_inputs = None
 
     def handle_generate_request(
@@ -5338,6 +5341,8 @@ class Scheduler(
     @scheduler_stage_method(SCHEDULER_STAGE_IDLE)
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
+        # Nothing is waiting on the device: drop parked multimodal features.
+        MM_FEATURE_RELEASER.drain_all()
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
