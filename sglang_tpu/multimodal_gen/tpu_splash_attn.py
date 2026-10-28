@@ -7,6 +7,13 @@ model for non-causal attention over at least 512 keys, and JAX's
 cross-attention to fewer than 512 aligned keys. Both run as ``cpu_export_jax_op`` torch ops; block sizes,
 padding and query scaling are resolved inside the jitted JAX function from the
 static shapes.
+
+Against stock ``make_splash_mha`` with its best of 9 tuned block sizes (one
+tpu7x core, 10 heads, bf16, non-causal; libtpu 0.0.50): 56.6 vs 97.1 ms at
+75600 tokens, 13.2 vs 18.5 ms at 32760, 0.98 vs 1.92 ms at 9680. Worth keeping
+across jax upgrades: the LLO scheduler flag (about a third of the gap), query
+blocks above splash's 2048-4096 that the VMEM model allows, and the softmax
+scale applied to the float32 scores inside an exp2 softmax.
 """
 
 import functools
@@ -377,6 +384,11 @@ def _flash_call(
                             real=real_keys - chunk_start,
                         )
 
+        elif kv_seq % block_kv == 0:
+            # Every KV block is whole: one body, not a second identical copy.
+            lax.fori_loop(
+                0, block_kv // block_kv_compute, compute_body, None, unroll=True
+            )
         else:
 
             @pl.when(j != grid_width - 1)
@@ -444,6 +456,8 @@ def _flash_call(
     ]
     compiler_params = pltpu.CompilerParams(
         dimension_semantics=("parallel", "parallel", "arbitrary"),
+        # Mosaic's LLO scheduler: 56.6 vs 87.4 ms at 75600 tokens, 13.2 vs
+        # 16.3 ms at 32760 (one tpu7x core, libtpu 0.0.50, identical output).
         flags={"XLA_TPU_FORCE_LP_LLO_SCHEDULER": True},
         # Autotuned score tiles exceed Mosaic's 32 MiB default.
         vmem_limit_bytes=vmem_capacity_bytes,
