@@ -753,8 +753,9 @@ def _apply_vit_max_pixels_default(server_args, cfg) -> None:
     )
     logger.info(
         "Capping images at %d pixels, the largest precompiled ViT bucket. Set an "
-        "image size in --mm-process-config to change it, or "
-        "SGLANG_TPU_ENABLE_VIT_IMAGE_SIZE_CAP=0 to turn it off.",
+        "image size in --mm-process-config to change it, "
+        "SGLANG_TPU_ENABLE_VIT_IMAGE_SIZE_CAP=0 to turn it off, or "
+        "SGLANG_LOG_IMAGE_DOWNSCALE=1 to log each image it shrinks.",
         size["longest_edge"],
     )
 

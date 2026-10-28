@@ -1491,6 +1491,8 @@ class Envs:
     # ===================================================================
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
+    # Debug: log each image the processor shrinks to fit its size limit.
+    SGLANG_LOG_IMAGE_DOWNSCALE = EnvBool(False)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
