@@ -8,9 +8,9 @@ roles are dispatched from the CI_PD_ROLE env plus the slice-local TPU worker env
 
 What each verification proves:
   * quality:    gsm8k through the LB must clear the model's accuracy floor,
-                and the cached fraction of its prefill tokens must dominate
-                (>= 0.5), so the score gates the cached prefill path rather
-                than cold traffic.
+                and the cached fraction of its prefill tokens (from the
+                prefill engine's /metrics) must dominate (>= 0.5), so the
+                score gates the cached prefill path rather than cold traffic.
   * cache hit:  an immediate resend of a long prompt must hit the device radix
                 cache (cached_tokens_details.device).
   * offload:    after churn evicts the device pool, a resend must reload the
@@ -386,6 +386,8 @@ def build_prefill_env(
                 # until that is fixed upstream.
                 "--sampling-backend",
                 "pytorch",
+                # test_02 reads its cache accounting from /metrics (#1360).
+                "--enable-metrics",
                 values.get("EXTRA_PREFILL_ARGS", ""),
             )
         ).strip(),
@@ -764,24 +766,35 @@ def _wait_http_200(url: str, secs: int, procs: Tuple = ()) -> None:
     raise TimeoutError(f"{url} not ready after {secs}s")
 
 
-PREFILL_BATCH_RE = re.compile(
-    r"Prefill batch.*?#new-token: (\d+), #cached-token: (\d+)"
+PREFILL_COUNTER_RE = re.compile(
+    r"^sglang:(num_requests|prompt_tokens|cached_tokens)_total(?:\{[^}]*\})? (\S+)$",
+    re.M,
 )
 
 
-def prefill_cache_coverage(log_text: str) -> Tuple[int, int, int]:
-    """Sum (batches, new tokens, cached tokens) over scheduler prefill lines.
+def prefill_token_counters(metrics_text: str) -> Tuple[int, int, int]:
+    """Sum (requests, prompt tokens, cached prompt tokens) from a /metrics page.
 
-    The scheduler's per-batch accounting is the only per-request cache-hit
-    signal that reaches the pod, so a traffic window's cache coverage is read
-    from the engine log rather than from HTTP responses.
+    Read over HTTP rather than from this pod's engine log: TPU node
+    normalization can make the other prefill pod node rank 0, and only that
+    pod's scheduler logs prefill batches. PREFILL_PORT here is forwarded to the
+    normalized leader, so /metrics always comes from the engine that served the
+    traffic (#1360).
     """
-    batches, new_tokens, cached_tokens = 0, 0, 0
-    for match in PREFILL_BATCH_RE.finditer(log_text):
-        batches += 1
-        new_tokens += int(match.group(1))
-        cached_tokens += int(match.group(2))
-    return batches, new_tokens, cached_tokens
+    totals = {"num_requests": 0.0, "prompt_tokens": 0.0, "cached_tokens": 0.0}
+    for name, value in PREFILL_COUNTER_RE.findall(metrics_text):
+        totals[name] += float(value)
+    return (
+        int(totals["num_requests"]),
+        int(totals["prompt_tokens"]),
+        int(totals["cached_tokens"]),
+    )
+
+
+def _prefill_counters() -> Tuple[int, int, int]:
+    url = f"http://127.0.0.1:{PREFILL_PORT}/metrics"
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        return prefill_token_counters(resp.read().decode(errors="replace"))
 
 
 def _assert_raiden_engaged(log_path: str) -> None:
@@ -877,7 +890,7 @@ class TestPdPrefixCachingKvOffload(unittest.TestCase):
         )
 
     def test_02_gsm8k_quality(self) -> None:
-        eval_log_offset = os.path.getsize(PREFILL_LOG)
+        before = _prefill_counters()
         score = run_gsm8k(
             base_url=f"http://127.0.0.1:{LB_PORT}",
             profile=self.profile,
@@ -895,24 +908,22 @@ class TestPdPrefixCachingKvOffload(unittest.TestCase):
         # shares the few-shot prefix, so the cached fraction of its prefill
         # tokens must dominate. A regression that silently disables caching
         # would otherwise leave the score gating cold traffic only.
-        with open(PREFILL_LOG, "rb") as f:
-            f.seek(eval_log_offset)
-            eval_log = f.read().decode(errors="replace")
-        batches, new_tokens, cached_tokens = prefill_cache_coverage(eval_log)
-        total = new_tokens + cached_tokens
+        requests, total, cached_tokens = (
+            a - b for a, b in zip(_prefill_counters(), before)
+        )
         if total < 100 * self.gsm8k_config.num_examples:
             raise AssertionError(
                 "gsm8k prefill accounting looks wrong: "
-                f"{batches} batches / {total} prompt tokens for "
+                f"{requests} requests / {total} prompt tokens for "
                 f"{self.gsm8k_config.num_examples} examples -- the eval did "
-                "not route through this prefill engine, or the scheduler's "
-                "batch log format changed"
+                "not route through this prefill engine, or its /metrics "
+                "counters changed"
             )
         coverage = cached_tokens / total
         dump_metric("gsm8k_prefill_cached_token_fraction", coverage, labels=labels)
         print(
             f"gsm8k prefill cache coverage={coverage:.3f} "
-            f"({cached_tokens}/{total} tokens over {batches} batches)"
+            f"({cached_tokens}/{total} tokens over {requests} requests)"
         )
         self.assertGreaterEqual(
             coverage,
@@ -1121,19 +1132,27 @@ class TestPdE2eConfiguration(unittest.TestCase):
             ).is_leader
         )
 
-    def test_prefill_cache_coverage_reads_scheduler_batch_lines(self) -> None:
-        # The regex mirrors the scheduler's batch-accounting line; decode
-        # batches carry no cache counters and must not match.
-        log = "\n".join(
+    def test_prefill_enables_metrics(self) -> None:
+        env = build_prefill_env(GPT_OSS_120B, 2, env={})
+        self.assertIn("--enable-metrics", env["EXTRA_ARGS"].split())
+
+    def test_prefill_token_counters_sum_every_label_set(self) -> None:
+        # Counters are split by is_streaming / cache_source; HELP, TYPE and
+        # _created lines and other metrics must not count.
+        page = "\n".join(
             (
-                "[2026-08-25 23:21:41 TP0 EP0] Prefill batch, #new-seq: 1, "
-                "#new-token: 2112, #cached-token: 0, full token usage: 0.00,",
-                "[2026-08-25 23:21:42 TP0 EP0] Prefill batch, #new-seq: 1, "
-                "#new-token: 64, #cached-token: 2048, full token usage: 0.00,",
-                "[2026-08-25 23:21:43 TP0 EP0] Decode batch, #running-req: 1,",
+                "# HELP sglang:prompt_tokens_total Number of prefill tokens processed.",
+                "# TYPE sglang:prompt_tokens_total counter",
+                'sglang:prompt_tokens_total{model_name="m",is_streaming="false"} 2112.0',
+                'sglang:prompt_tokens_total{model_name="m",is_streaming="true"} 64.0',
+                'sglang:prompt_tokens_created{model_name="m",is_streaming="false"} 1.7e+09',
+                'sglang:cached_tokens_total{model_name="m",cache_source="device"} 1024.0',
+                'sglang:cached_tokens_total{model_name="m",cache_source="host"} 1024.0',
+                'sglang:num_requests_total{model_name="m",is_streaming="false"} 2.0',
+                'sglang:generation_tokens_total{model_name="m",is_streaming="false"} 9.0',
             )
         )
-        self.assertEqual(prefill_cache_coverage(log), (2, 2176, 2048))
+        self.assertEqual(prefill_token_counters(page), (2, 2176, 2048))
 
 
 if __name__ == "__main__":
