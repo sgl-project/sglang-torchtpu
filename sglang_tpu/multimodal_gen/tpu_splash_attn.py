@@ -370,6 +370,11 @@ def _flash_call(
                             real=real_keys - chunk_start,
                         )
 
+        elif kv_seq % block_kv == 0:
+            # Every KV block is whole: one body, not a second identical copy.
+            lax.fori_loop(
+                0, block_kv // block_kv_compute, compute_body, None, unroll=True
+            )
         else:
 
             @pl.when(j != grid_width - 1)
