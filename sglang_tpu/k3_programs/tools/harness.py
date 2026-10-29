@@ -75,7 +75,7 @@ def topological_node(hosts: list[str], host_index: int) -> int:
     ranks ``8 * node .. 8 * node + 7``. Pod indices need not follow it."""
     from sglang_tpu.node_normalization import TopologyConfig, query_node_rank
 
-    config = TopologyConfig(hosts=tuple(hosts), topology=(2, 2, 4))
+    config = TopologyConfig(hosts=tuple(hosts), topology=(2, 2, 4, 2))
     return query_node_rank(config, host_index, timeout=600)
 
 
