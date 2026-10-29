@@ -138,7 +138,7 @@ class TestUnquantGlobalRouting(CustomTestCase):
             with (
                 self.subTest(sparsecore=sparsecore),
                 patch(
-                    "sglang.srt.layers.quantization.unquant.envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get",
+                    "sglang_tpu.envs.envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get",
                     return_value=sparsecore,
                 ),
             ):

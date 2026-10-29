@@ -198,7 +198,7 @@ class TpuSpecWorker(BaseSpecWorker):
             )
         self._target_worker = target_worker
         runner = target_worker.model_runner
-        self._bsearch_filtering = envs.SGLANG_TPU_ENABLE_BSEARCH_SAMPLING.get()
+        self._bsearch_filtering = tpu_envs.SGLANG_TPU_ENABLE_BSEARCH_SAMPLING.get()
         if not isinstance(runner.sampler, TpuSampler):
             # HOST_PADDED sampling params stay on host until TpuSampler uploads
             # them; with full logits it samples exactly like a plain Sampler

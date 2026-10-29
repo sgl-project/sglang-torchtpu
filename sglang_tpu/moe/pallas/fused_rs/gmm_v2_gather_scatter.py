@@ -10,7 +10,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang.srt.environ import envs
+from sglang_tpu.envs import envs
 from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, recover_quant_block_size
 
 # Hack to workaround libtpu bug in 0.0.46 and 0.0.47 that causes
