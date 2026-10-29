@@ -22,6 +22,12 @@ ROLES = ("prefill", "decode")
 DEFAULT_DSPARK_SCHEDULE = ((1, 4, 7), (5, 8, 3))
 
 
+def program_kv_cache_dtype(kv_cache_dtype: str | None) -> str:
+    """sglang's ``--kv-cache-dtype`` as the programs spell it."""
+    value = str(kv_cache_dtype or "auto")
+    return {"bf16": "bfloat16"}.get(value, value)
+
+
 def acceptance_length_to_rates(length: float, drafts: int) -> tuple[float, ...]:
     """A mean acceptance length (bonus token included) as per-position
     unconditional acceptance rates, by vLLM's minimum-variance rule
@@ -58,6 +64,7 @@ def engine_config(
     """
     if role not in ROLES:
         raise ValueError(f"the Kimi-K3 programs have roles {ROLES}, not {role!r}")
+    kv_cache_dtype = program_kv_cache_dtype(kv_cache_dtype)
     block_size = cache_layout(kv_cache_dtype).tokens_per_block
     spec_schedule = None
     by_width = None

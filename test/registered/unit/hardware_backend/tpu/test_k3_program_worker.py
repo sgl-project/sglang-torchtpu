@@ -8,20 +8,19 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs import sglang_bridge as bridge
 from sglang_tpu.k3_programs import sglang_worker as worker
 from sglang_tpu.k3_programs.kimi_k3 import pools
 from sglang_tpu.k3_programs.program import StepOutput
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 SCHEDULE = ((1, 4, 7), (5, 8, 3))
 STEP = 8192  # tokens per logical block (bf16)

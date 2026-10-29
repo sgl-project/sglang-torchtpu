@@ -798,6 +798,14 @@ def _validate_decode_context_parallel(server_args) -> None:
         )
 
 
+def _k3_program_selected() -> bool:
+    """Whether the Kimi-K3 megakernel programs serve (K3_PROGRAM)."""
+    from sglang.srt.runtime_context import get_spec
+    from sglang_tpu.k3_programs.sglang_worker import ALGORITHM
+
+    return str(get_spec().speculative_algorithm or "").upper() == ALGORITHM
+
+
 def _experimental_spec_enabled() -> bool:
     # Lazy: sglang_tpu.experimental imports spec_info, which loads after the platform.
     from sglang_tpu.experimental import experimental_spec_enabled
@@ -1146,6 +1154,11 @@ class TpuSRTPlatform(SRTPlatform):
             )
 
     def get_mamba_pool_cls(self) -> type:
+        if _k3_program_selected():
+            # Kimi-K3 programs: KDA state in the unified pools.
+            from sglang_tpu.k3_programs.sglang_pools import K3StatePool
+
+            return K3StatePool
         # Hybrid GDN models (Qwen3.5 / Qwen3-Next) store their recurrent state
         # in a TPU-native, Pallas-kernel-layout pool.
         from sglang_tpu.mamba_pool import TpuMambaPool
@@ -1189,6 +1202,11 @@ class TpuSRTPlatform(SRTPlatform):
         # upstream pool.
         from sglang.srt.runtime_context import get_exec
 
+        if _k3_program_selected():
+            # Kimi-K3 programs: the unified pools, MLA KV and KDA state.
+            from sglang_tpu.k3_programs.sglang_pools import K3UnifiedKVPool
+
+            return K3UnifiedKVPool
         if get_exec().kernel.attention_backend == "pallas_tpu_mla":
             from sglang_tpu.kv_pool import (
                 TpuFusedMLATokenToKVPool,

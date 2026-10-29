@@ -8,13 +8,9 @@ import unittest
 from types import SimpleNamespace
 
 import numpy as np
-import torch
-
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs import sglang_bridge as bridge
 from sglang_tpu.k3_programs import sglang_config
@@ -22,6 +18,8 @@ from sglang_tpu.k3_programs import sglang_step as step
 from sglang_tpu.k3_programs.kimi_k3 import pools
 from sglang_tpu.k3_programs.kimi_k3 import program as k3_program
 from sglang_tpu.k3_programs.kimi_k3.layout import KDA, MLA, NUM_LAYERS
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 PACKAGE = pathlib.Path(bridge.__file__).parent
 
@@ -43,7 +41,9 @@ class TestVendoredPrograms(CustomTestCase):
                 names = (
                     [a.name for a in node.names]
                     if isinstance(node, ast.Import)
-                    else [node.module or ""] if isinstance(node, ast.ImportFrom) else []
+                    else [node.module or ""]
+                    if isinstance(node, ast.ImportFrom)
+                    else []
                 )
                 for name in names:
                     with self.subTest(file=str(path.relative_to(PACKAGE)), name=name):
@@ -151,7 +151,7 @@ class TestTransferBuffers(CustomTestCase):
 
     def test_kv_pages(self):
         ptrs, lens, items = bridge.kv_buf_infos(self.caches, self.plan)
-        tensors = [self.caches[bridge.mla_layer_name(l)] for l in MLA]
+        tensors = [self.caches[bridge.mla_layer_name(layer)] for layer in MLA]
         tensors += pools.draft_raw_pools(self.caches)
         self.assertEqual(len(ptrs), len(MLA) + 5)
         for ptr, length, item, pool in zip(ptrs, lens, items, tensors):
