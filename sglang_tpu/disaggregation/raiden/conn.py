@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import functools
 import math
 import os
 import threading
@@ -84,6 +85,8 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardBlocks,
     ReshardChunk,
     ReshardChunkReady,
+    ReshardLandChunkReady,
+    ReshardLandReady,
     ReshardReady,
     ReshardReq,
     RoomFailed,
@@ -161,6 +164,9 @@ class RaidenKVManager(
     _swa_kv_head_nums: Tuple[int, ...] = ()
     _seq_along_lane = False
     _kv_pack_heads = 1
+    # Decode: the reshard landing arena's LandState (land.py), when the KV
+    # pool reserved one.
+    _land = None
 
     def __init__(
         self,
@@ -180,6 +186,8 @@ class RaidenKVManager(
             Chunk.TAG: self._on_chunk,
             ReshardChunk.TAG: self._on_reshard_chunk,
             ReshardChunkReady.TAG: self._on_reshard_chunk_ready,
+            ReshardLandReady.TAG: self._on_reshard_land_ready,
+            ReshardLandChunkReady.TAG: self._on_reshard_land_chunk_ready,
             RoomFailed.TAG: self._on_room_failed,
         }
 
@@ -456,27 +464,77 @@ class RaidenKVManager(
                 geom = self._make_geometry(src_attn_tp, dst_attn_tp, swa=swa)
             except (ValueError, RuntimeError) as e:
                 return f"{push_reshard_where(src_attn_tp, dst_attn_tp)}: {e}"
+            # The sliding-window group has no landing arena.
+            land_ok = not swa and self._land_ok()
             for shape, element_size, heads in layers:
                 reasons = []
+                hinted = None
                 for total in candidate_total_heads(heads, own_tp, peer_tp):
+                    check = functools.partial(
+                        push_reshard_refusal,
+                        geom,
+                        shape,
+                        element_size,
+                        total_heads=total,
+                        own_tp=own_tp,
+                        page_size=page_size,
+                        seq_along_lane=self._seq_along_lane,
+                    )
                     try:
-                        reason = push_reshard_refusal(
-                            geom,
-                            shape,
-                            element_size,
-                            total_heads=total,
-                            own_tp=own_tp,
-                            page_size=page_size,
-                            seq_along_lane=self._seq_along_lane,
-                        )
+                        reason = check(land_ok=land_ok)
                     except ValueError as e:
                         reason = f"{push_reshard_where(src_attn_tp, dst_attn_tp)}: {e}"
+                    if reason is not None and not swa and not land_ok:
+                        # The hint probe never replaces the refusal itself.
+                        try:
+                            if check(land_ok=True) is None:
+                                reason += self._land_hint()
+                                hinted = hinted or reason
+                        except ValueError:
+                            pass
                     if reason is None:
                         break
                     reasons.append(reason)
                 else:
-                    return reasons[0]
+                    # A count that would land names the fix; the prefill's
+                    # fp8 shape leaves several counts open.
+                    return hinted or reasons[0]
         return None
+
+    def _land_chunk_pages(self) -> int:
+        """Pages of the largest landing chunk: the prefill caps every chunk
+        of a landing room at one announcement (C)."""
+        return -(-CHUNK_ANNOUNCE_TOKENS // int(self.kv_args.page_size))
+
+    def _land_ok(self) -> bool:
+        """Whether this side can serve a push reshard that needs landing
+        (#829): a decode whose arena holds a whole chunk, or a prefill with
+        SGLANG_RAIDEN_RESHARD_LAND_ARENA set."""
+        if not tpu_envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.get():
+            return False
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            return True
+        land = self._land
+        return land is not None and land.arena.capacity >= self._land_chunk_pages()
+
+    def _land_hint(self) -> str:
+        """What would let a refused landing cell through on this side."""
+        if not tpu_envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.get():
+            return (
+                f" (or set {tpu_envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.name}=1 on the "
+                "prefill and the decode to land it in scratch blocks)"
+            )
+        land = self._land
+        if land is None:
+            return (
+                f" ({tpu_envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.name} is set, but this "
+                "decode's KV pool reserved no landing arena: it needs a token-major "
+                "fp8 --kv-cache-dtype)"
+            )
+        return (
+            f" (the landing arena holds {land.arena.capacity} blocks, under one "
+            f"{self._land_chunk_pages()}-page chunk)"
+        )
 
     def _check_reshard_bounds(
         self, req: Any, src_attn_tp: int, dst_attn_tp: int, *, swa: bool = False
@@ -551,6 +609,8 @@ class RaidenKVManager(
             from sglang_tpu.disaggregation.raiden.pipeline import PipelineTransfer
 
             pipeline = PipelineTransfer(self, kv_caches)
+            # The pipeline transfer never pushes a landing schedule.
+            self._land = None
             self._engine = pipeline.engine
             self.raiden_endpoint = pipeline.controller
             self.chunked_transfer = False
@@ -569,7 +629,153 @@ class RaidenKVManager(
             raise RuntimeError(
                 "Raiden requires at least one full-attention KV cache tensor"
             )
+        self._check_land_arena()
         self._build_engine()
+
+    # ----- reshard landing arena (#829, decode) -----------------------------
+
+    def attach_kv_pool(self, kv_pool: Any) -> None:
+        """Take the decode KV pool's landing arena, if it reserved one.
+        Called by decode.py/prefill.py before ``set_kv_caches``."""
+        if self.disaggregation_mode != DisaggregationMode.DECODE:
+            return
+        from sglang_tpu.disaggregation.raiden.land import LandState, ScratchArena
+
+        arena = ScratchArena.from_pool(kv_pool)
+        self._land = LandState(arena) if arena is not None else None
+
+    def _check_land_arena(self) -> None:
+        """Drop the arena unless every full-attention tensor raiden indexes
+        (draft layers included) ends with it: the merge and the pushes
+        address scratch blocks by id in each of them."""
+        land = self._land
+        if land is None:
+            return
+        end = land.arena.first_block + land.arena.capacity
+        sizes = sorted({int(t.shape[0]) for t in self._kv_caches})
+        if sizes != [end]:
+            logger.warning(
+                "RaidenKVManager rank%d: KV tensors have %s blocks, the landing "
+                "arena ends at block %d; landing reshards stay refused",
+                self.attn_tp_rank,
+                sizes,
+                end,
+            )
+            self._land = None
+
+    def _land_live_locked(self, room: int) -> bool:
+        """Whether a room may still have landed pages merged: it owns its
+        pages (registered, not cleared) and has not failed or aborted. A
+        failed room's pages can be handed back once its plans settle."""
+        return (
+            room in self._decode.reshard_meta
+            and room not in self._aborted
+            and not self._is_failed_locked(room)
+        )
+
+    def _land_layout(self, kv: Any) -> Any:
+        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
+            KVLayoutGeometry,
+        )
+
+        cache = self.__dict__.setdefault("_land_layouts", {})
+        key = (tuple(kv.shape), int(kv.element_size()))
+        if key not in cache:
+            shape = key[0]
+            # The heads the rows hold; only the kind and packing matter here.
+            cache[key] = KVLayoutGeometry.from_tensor(
+                shape,
+                key[1],
+                max(1, int(shape[2]) * int(shape[3]) // 2),
+                seq_along_lane=self._seq_along_lane,
+            )
+        return cache[key]
+
+    def land_merged(self, room: int) -> bool:
+        """Every landed page of the room is merged into its final page."""
+        if self._land is None:
+            return True
+        with self._state_lock:
+            return self._land.merged(room)
+
+    def land_prepass(self) -> None:
+        """Merge settled landing plans, free their scratch, and serve or
+        expire held takes. Runs on the scheduler thread once per decode round,
+        before the transfer queue polls, at the same program point on every
+        rank; it issues no collective."""
+        land = self._land
+        if land is None or self._pipeline is not None:
+            return
+        from sglang_tpu.disaggregation.raiden.land import device_sync, merge_pages
+
+        # Same-round settles; every other drain records them too.
+        self._drain_engine()
+        now = time.time()
+        with self._state_lock:
+            jobs = []
+            for key, plan in list(land.plans.items()):
+                if not plan.settled:
+                    continue
+                # A room that failed or was cleared since its settle gets no
+                # merge: its pages may already belong to another request.
+                if self._land_live_locked(plan.room):
+                    jobs.append((key, plan))
+                else:
+                    land.free(key)
+            expired = [h for h in land.holds if now >= h.deadline]
+            for hold in expired:
+                land.holds.remove(hold)
+        if jobs:
+            kv = self._kv_caches
+
+            def merge(js):
+                merge_pages(
+                    kv,
+                    [pair for _, p in js for pair in zip(p.final, p.scratch)],
+                    land.arena.capacity,
+                    self._land_layout,
+                )
+
+            failed: Dict[int, BaseException] = {}
+            # Orders the settled H2D before the gathers (H6).
+            device_sync(kv)
+            try:
+                merge(jobs)
+            except Exception:
+                # Attribute the error: re-merge room by room. The merge only
+                # rewrites final slots 2-3 from scratch, so redoing a room the
+                # batch already merged is harmless; only rooms that raise fail.
+                for room in sorted({p.room for _, p in jobs}):
+                    try:
+                        merge([(k, p) for k, p in jobs if p.room == room])
+                    except Exception as e:
+                        failed[room] = e
+            # Orders the merge before any later H2D into the freed scratch.
+            device_sync(kv)
+            for room, error in failed.items():
+                self._fail_reshard_room(room, error)
+            with self._state_lock:
+                for key, _ in jobs:
+                    land.free(key)
+        for hold in expired:
+            hold.expire()
+        # Serve holds in FIFO order while the arena covers the head.
+        while True:
+            with self._state_lock:
+                if not land.holds:
+                    break
+                head = land.holds[0]
+                if not self._land_live_locked(head.room):
+                    land.holds.popleft()
+                    continue
+                if land.arena.available < head.pages:
+                    break
+            head.retry()
+            with self._state_lock:
+                # A retry that took nothing (its room failed meanwhile) must
+                # not block the queue.
+                if land.holds and land.holds[0] is head:
+                    land.holds.popleft()
 
     def _build_engine(self) -> None:
         if self._engine is not None or self._kv_caches is None:
@@ -861,6 +1067,14 @@ class RaidenKVManager(
                     superseded -= norm_failed
                     self._native_failed.update(real_failed)
                     self._failed.update(real_failed)
+                    if self._land is not None:
+                        # Recorded here, at every drain: a settle consumed by
+                        # another caller must still reach the merge or free.
+                        self._land.settle(
+                            [self._norm_req_id(t.req_id) for t in done_recv],
+                            norm_failed,
+                            self._land_live_locked,
+                        )
                     failures, later_failures = self._record_native_failures_locked(
                         t for t in failed if self._norm_req_id(t.req_id) in real_failed
                     )
@@ -1419,7 +1633,9 @@ class RaidenKVManager(
                     self._prefill.chunk_seq,
                     self._prefill.reshard_chunks,
                     self._prefill.pending_offer,
+                    self._prefill.offered_end,
                     self._prefill.reshard_ready_pages,
+                    self._prefill.reshard_ready_scratch,
                     self._prefill.reshard_chunk_acked,
                     self._prefill.send_blocks,
                     self._prefill.send_block_set,
@@ -1470,6 +1686,8 @@ class RaidenKVManager(
                     self._decode.reshard_registered,
                 ):
                     table.discard(room)
+            if self._land is not None:
+                self._land.drop_room(room)
             if clear_failure_record:
                 # Failure publication takes _state_lock before failure_lock as
                 # well, so clear and publication have one total order.

@@ -14,7 +14,7 @@ import errno
 import secrets
 import threading
 import time
-from typing import TYPE_CHECKING, Any, List, Optional, Set
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -27,6 +27,7 @@ from sglang_tpu.disaggregation.raiden.chunk_plan import (
     whole_pull_registration,
 )
 from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
+from sglang_tpu.disaggregation.raiden.land import LAND_VERSION
 from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
@@ -34,6 +35,8 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardBlocks,
     ReshardChunk,
     ReshardChunkReady,
+    ReshardLandChunkReady,
+    ReshardLandReady,
     ReshardReady,
     ReshardReq,
     RoomFailed,
@@ -277,6 +280,7 @@ class RaidenSenderMixin:
             if room in self._aborted:
                 return
             self._prefill.send_total[room] = total_pages
+            self._prefill.offered_end[room] = start + len(block_ids)
             p_start, p_blocks = self._prefill.pending_offer.get(room, (start, []))
             p_blocks = p_blocks + list(block_ids)
             if len(p_blocks) < self._prefill.announce_pages:
@@ -775,49 +779,170 @@ class RaidenSenderMixin:
         waits until the decode has registered the chunk and asks for it.
         """
         with self._announce_lock:
-            with self._state_lock:
-                if (
-                    room in self._prefill.reshard_replied
-                    or room in self._aborted
-                    or room not in self._prefill.reshard_req
-                ):
-                    # The closing message is out (or the room is gone): these
-                    # pages travel with the closing transfer, whose span the
-                    # decode decides from the chunks that did arrive.
-                    return
-                req = self._prefill.reshard_req[room]
-                window = chunk_pull_window(
-                    start, len(block_ids), total_pages, len(req["decode_blocks"])
-                )
-                if not window:
-                    return
-                start += window.chunk_offset
-                block_ids = block_ids[
-                    window.chunk_offset : window.chunk_offset + window.length
-                ]
+            self._announce_reshard_chunk_locked(room, start, block_ids, total_pages)
+
+    def _announce_reshard_chunk_locked(
+        self, room: int, start: int, block_ids: List[int], total_pages: int
+    ) -> None:
+        """``_announce_reshard_chunk`` with ``_announce_lock`` held.
+
+        A landing room's chunks are cut to one announcement (C pages), the
+        most the decode's arena takes per plan. The cut is a function of the
+        room alone, so every source of a decode rank, direct or landing, cuts
+        the same spans; differing spans would fail the room.
+        """
+        with self._state_lock:
+            if (
+                room in self._prefill.reshard_replied
+                or room in self._aborted
+                or room not in self._prefill.reshard_req
+            ):
+                # The closing message is out (or the room is gone): these
+                # pages travel with the closing transfer, whose span the
+                # decode decides from the chunks that did arrive.
+                return
+            req = self._prefill.reshard_req[room]
+            window = chunk_pull_window(
+                start, len(block_ids), total_pages, len(req["decode_blocks"])
+            )
+            if not window:
+                return
+            start += window.chunk_offset
+            block_ids = block_ids[
+                window.chunk_offset : window.chunk_offset + window.length
+            ]
+            cap = len(block_ids)
+            if self._land_room(req.get("dst_attn_tp")):
+                cap = self._prefill.announce_pages
+            pieces = []
+            for lo in range(0, len(block_ids), cap):
                 index = self._prefill.chunk_seq.get(room, 0)
                 self._prefill.chunk_seq[room] = index + 1
-                self._prefill.reshard_chunks.setdefault(room, {})[index] = (
-                    start,
-                    block_ids,
-                )
-                addr = req["reply_addr"]
+                piece = (start + lo, block_ids[lo : lo + cap])
+                self._prefill.reshard_chunks.setdefault(room, {})[index] = piece
+                pieces.append((index, piece))
+            addr = req["reply_addr"]
+        endpoint = _tcp_endpoint(ip=addr[0], port=addr[1])
+        for index, (piece_start, piece_blocks) in pieces:
             payload = ReshardChunk(
                 room=room,
                 index=index,
-                start=start,
+                start=piece_start,
                 total_pages=total_pages,
-                blocks=block_ids,
+                blocks=piece_blocks,
                 src_rank=self._local_rank,
             ).to_frames()
-            endpoint = _tcp_endpoint(ip=addr[0], port=addr[1])
             self._send_multipart_locked(endpoint, payload)
+
+    def _land_kinds(self, dst_attn_tp: int) -> Tuple[bool, Tuple[bool, ...]]:
+        """For pushes to decode attention TP ``dst_attn_tp`` (#829): whether
+        any source of the room lands, and per decode rank whether its plan
+        has a landing source. All False without
+        SGLANG_RAIDEN_RESHARD_LAND_ARENA."""
+        cache = self.__dict__.setdefault("_land_kinds_cache", {})
+        if dst_attn_tp not in cache:
+            kinds: Tuple[bool, ...] = ()
+            if self._land_ok():
+                from sglang_tpu.disaggregation.raiden.reshard_schedule import (
+                    LandEntry,
+                    source_ranks_for,
+                )
+
+                try:
+                    geom = self._make_geometry(
+                        self.attn_tp_size, dst_attn_tp
+                    ).with_land()
+                    kinds = tuple(
+                        any(
+                            isinstance(geom.entry_bytes(p, d), LandEntry)
+                            for p in source_ranks_for(d, geom.ratio)
+                        )
+                        for d in range(dst_attn_tp)
+                    )
+                except ValueError:
+                    kinds = ()
+            cache[dst_attn_tp] = (any(kinds), kinds)
+        return cache[dst_attn_tp]
+
+    def _land_room(self, dst_attn_tp: Optional[int]) -> bool:
+        # The env check first: without it nothing here reads the geometry.
+        return (
+            self._land_ok()
+            and dst_attn_tp is not None
+            and self._land_kinds(dst_attn_tp)[0]
+        )
+
+    def _plan_lands(self, dst_attn_tp: int) -> bool:
+        """Whether the plan of the decode rank this rank pushes to lands."""
+        kinds = self._land_kinds(dst_attn_tp)[1]
+        d = self.attn_tp_rank * dst_attn_tp // self.attn_tp_size
+        return bool(kinds) and kinds[d]
+
+    def _land_ready_mismatch_locked(
+        self,
+        room: int,
+        *,
+        land_version: Optional[int],
+        scratch: Optional[List[int]],
+        pages: int,
+    ) -> Optional[str]:
+        """Why a READY does not fit the room's plan kind, or None. A plain
+        READY with pages for a landing plan, or a landing READY for a direct
+        one, means the two sides classified differently."""
+        if scratch is None and not self._land_ok():
+            return None
+        req = self._prefill.reshard_req.get(room)
+        if req is None or req.get("dst_attn_tp") is None:
+            return None
+        lands = self._land_ok() and self._plan_lands(req["dst_attn_tp"])
+        if scratch is None:
+            if lands and pages:
+                return (
+                    f"Raiden reshard: room {room}'s decode asked for a plain push "
+                    "of a plan this prefill lands (#829); is the decode missing "
+                    "SGLANG_RAIDEN_RESHARD_LAND_ARENA or on another release?"
+                )
+            return None
+        if land_version != LAND_VERSION:
+            return (
+                f"Raiden reshard: room {room}'s decode lands with version "
+                f"{land_version}, this prefill with {LAND_VERSION}"
+            )
+        if not lands:
+            return (
+                f"Raiden reshard: room {room}'s decode sent scratch blocks for "
+                "a plan this prefill pushes directly"
+            )
+        if len(scratch) != pages:
+            return (
+                f"Raiden reshard: room {room}'s decode sent {len(scratch)} "
+                f"scratch blocks for {pages} pages"
+            )
+        return None
 
     def _on_reshard_chunk_ready(self, msg: List[bytes]) -> None:
         req = ReshardChunkReady.from_frames(msg)
-        room = req.room
-        index = req.index
-        uuid = req.uuid
+        self._accept_reshard_chunk_ready(req.room, req.index, req.uuid)
+
+    def _on_reshard_land_chunk_ready(self, msg: List[bytes]) -> None:
+        req = ReshardLandChunkReady.from_frames(msg)
+        self._accept_reshard_chunk_ready(
+            req.room,
+            req.index,
+            req.uuid,
+            scratch=req.scratch,
+            land_version=req.land_version,
+        )
+
+    def _accept_reshard_chunk_ready(
+        self,
+        room: int,
+        index: int,
+        uuid: int,
+        *,
+        scratch: Optional[List[int]] = None,
+        land_version: Optional[int] = None,
+    ) -> None:
         with self._state_lock:
             if room in self._aborted:
                 return
@@ -830,6 +955,17 @@ class RaidenSenderMixin:
                     index,
                 )
                 return
+            reason = self._land_ready_mismatch_locked(
+                room, land_version=land_version, scratch=scratch, pages=len(chunk[1])
+            )
+            if reason is not None:
+                # As a refused RESHARD_REQ: the tombstone stops any later
+                # READY from pushing; the sender poll tells the decode.
+                logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+                self._mark_aborted_locked(room)
+                self._fail_room_locked(room, reason)
+                self.update_status(room, KVPoll.Failed)
+                return
             acked = self._prefill.reshard_chunk_acked.setdefault(room, set())
             if index in acked:
                 return
@@ -840,7 +976,12 @@ class RaidenSenderMixin:
             # The decode is making progress; time the wait for its next
             # message from here.
             self._prefill.reshard_replied_at[room] = time.time()
-        self._push_executor.submit(self._do_reshard_push, room, index, uuid)
+        if scratch is None:
+            self._push_executor.submit(self._do_reshard_push, room, index, uuid)
+        else:
+            self._push_executor.submit(
+                self._do_reshard_push, room, index, uuid, scratch
+            )
 
     def _maybe_reshard_reply(self, room: int) -> None:
         with self._state_lock:
@@ -862,6 +1003,26 @@ class RaidenSenderMixin:
             aux_blob = self._prefill.send_aux.get(room, b"")
         with self._announce_lock:
             with self._state_lock:
+                req = self._prefill.reshard_req.get(room)
+                flush = None
+                if req is not None and self._land_room(req.get("dst_attn_tp")):
+                    # A landing room announces every page no chunk carried --
+                    # the pending remainder and the last step, which send()
+                    # never offers -- as chunks of at most C pages, so the
+                    # closing plan holds only pages whose chunk lost a race
+                    # with this reply, never the whole tail. Every source has
+                    # the same pages and offers, so the cut is the room's.
+                    pending = self._prefill.pending_offer.pop(room, None)
+                    if pending is not None:
+                        start = pending[0]
+                    else:
+                        start = self._prefill.offered_end.get(room, 0)
+                    total_pages = self._prefill.send_total.get(room, len(blocks))
+                    if blocks[start:]:
+                        flush = (start, blocks[start:])
+            if flush is not None:
+                self._announce_reshard_chunk_locked(room, *flush, total_pages)
+            with self._state_lock:
                 if room not in self._prefill.reshard_req:
                     return
                 # Committed under the order lock: no announcement can follow.
@@ -879,13 +1040,38 @@ class RaidenSenderMixin:
 
     def _on_reshard_ready(self, msg: List[bytes]) -> None:
         req = ReshardReady.from_frames(msg)
-        room = req.room
-        pages = req.pages
+        self._accept_reshard_ready(req.room, req.pages)
+
+    def _on_reshard_land_ready(self, msg: List[bytes]) -> None:
+        req = ReshardLandReady.from_frames(msg)
+        self._accept_reshard_ready(
+            req.room, req.pages, scratch=req.scratch, land_version=req.land_version
+        )
+
+    def _accept_reshard_ready(
+        self,
+        room: int,
+        pages: List[int],
+        *,
+        scratch: Optional[List[int]] = None,
+        land_version: Optional[int] = None,
+    ) -> None:
         with self._state_lock:
             if room in self._aborted:
                 return
+            reason = self._land_ready_mismatch_locked(
+                room, land_version=land_version, scratch=scratch, pages=len(pages)
+            )
+            if reason is not None:
+                logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+                self._mark_aborted_locked(room)
+                self._fail_room_locked(room, reason)
+                self.update_status(room, KVPoll.Failed)
+                return
             self._prefill.reshard_ready.add(room)
             self._prefill.reshard_ready_pages[room] = pages
+            if scratch is not None:
+                self._prefill.reshard_ready_scratch[room] = scratch
         self._maybe_reshard_push(room)
 
     def _maybe_reshard_push(self, room: int) -> None:
@@ -905,12 +1091,19 @@ class RaidenSenderMixin:
         self._push_executor.submit(self._do_reshard_push, room)
 
     def _do_reshard_push(
-        self, room: int, chunk: Optional[int] = None, uuid: Optional[int] = None
+        self,
+        room: int,
+        chunk: Optional[int] = None,
+        uuid: Optional[int] = None,
+        scratch: Optional[List[int]] = None,
     ) -> None:
         # A push failure marks the room failed so the sender poll surfaces it
         # instead of the request hanging until the decode-side timeout.
         try:
-            self._run_reshard_push(room, chunk, uuid)
+            if scratch is None:
+                self._run_reshard_push(room, chunk, uuid)
+            else:
+                self._run_reshard_push(room, chunk, uuid, scratch)
         except Exception as e:
             logger.error("raiden reshard push failed for room %s: %s", room, e)
             with self._state_lock:
@@ -1081,11 +1274,19 @@ class RaidenSenderMixin:
                 self._completed_send.add(swa_req_id)
 
     def _run_reshard_push(
-        self, room: int, chunk: Optional[int] = None, uuid: Optional[int] = None
+        self,
+        room: int,
+        chunk: Optional[int] = None,
+        uuid: Optional[int] = None,
+        scratch: Optional[List[int]] = None,
     ) -> None:
+        """``scratch`` pairs with the chunk's decode pages when the decode
+        asked with RESHARD_LAND_CHUNK_READY; a closing push reads its pairing
+        from RESHARD_LAND_READY."""
         from tpu_sync.rpc import raiden_service_pb2 as pb2
 
         from sglang_tpu.disaggregation.raiden.reshard_schedule import (
+            _target_blocks,
             build_sender_request,
         )
 
@@ -1096,11 +1297,17 @@ class RaidenSenderMixin:
             if chunk is None:
                 prefill_blocks = list(self._prefill.send_blocks[room])
                 ready_pages = list(self._prefill.reshard_ready_pages.get(room, []))
+                scratch = self._prefill.reshard_ready_scratch.get(room)
                 swa_blocks = list(self._prefill.send_swa_blocks.get(room, []))
                 start = 0
             else:
                 start, prefill_blocks = self._prefill.reshard_chunks[room].pop(chunk)
-            total_pages = self._prefill.send_total.get(room, len(prefill_blocks))
+            # The room's page count, never the chunk's: a landing room's
+            # closing reply announces unoffered pages as chunks (no
+            # send_total yet) with this same fallback.
+            total_pages = self._prefill.send_total.get(
+                room, len(self._prefill.send_blocks.get(room, prefill_blocks))
+            )
 
         # The window rides on the closing push only, and has to go out even when
         # the closing full-attention push has nothing left to move: chunks can
@@ -1144,6 +1351,11 @@ class RaidenSenderMixin:
             if len(prefill_blocks) > n:
                 prefill_blocks = prefill_blocks[-n:]
         geom = self._make_geometry(self.attn_tp_size, dst_attn_tp)
+        if scratch is not None:
+            # The decode classified this plan as landing; so does this side
+            # (checked when the READY arrived), and a landing source writes
+            # the scratch blocks paired with its decode pages.
+            geom = geom.with_land()
         live = [self.kv_args.page_size] * n
 
         engine = self._ensure_engine()
@@ -1158,7 +1370,19 @@ class RaidenSenderMixin:
             src_block_ids=prefill_blocks,
             dst_block_ids=decode_blocks,
             live_tokens=live,
+            scratch_block_ids=scratch,
         )
+        if scratch is not None:
+            decode_blocks = list(
+                _target_blocks(
+                    geom.entry_bytes(
+                        self.attn_tp_rank % geom.src_tp,
+                        self.attn_tp_rank // geom.ratio,
+                    ),
+                    decode_blocks,
+                    scratch,
+                )
+            )
         logger.debug(
             "reshard push room=%s prefill_rank=%s decode_rank=%s peer=%s "
             "n=%d src[:4]=%s dst[:4]=%s",

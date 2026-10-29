@@ -43,6 +43,12 @@ class MessageTag(bytes, enum.Enum):
         b"RAIDEN_RESHARD_CHUNK_READY"  # decode -> prefill: chunk registered, push it
     )
 
+    # The READY variants of a plan with landing entries (#829): they add the
+    # scratch blocks the landing sources write. A prefill that predates them
+    # drops the unknown tag.
+    RESHARD_LAND_READY = b"RAIDEN_RESHARD_LAND_READY"
+    RESHARD_LAND_CHUNK_READY = b"RAIDEN_RESHARD_LAND_CHUNK_READY"
+
     ROOM_FAILED = b"RAIDEN_ROOM_FAILED"  # prefill -> decode: room already failed
 
     # CommonKVReceiver owns this backend-independent positional message.
@@ -186,6 +192,41 @@ class ReshardChunkReady(WireMessage):
     room: int
     index: int
     uuid: int
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+        require_non_negative(self.index, "index")
+        require_non_negative(self.uuid, "uuid")
+
+
+class ReshardLandReady(WireMessage):
+    """ReshardReady for a closing plan with landing entries.
+
+    ``scratch[i]`` is the decode scratch block that landing sources write for
+    ``pages[i]``; direct sources ignore it. ``land_version`` names the
+    classification both sides must share.
+    """
+
+    TAG: ClassVar[bytes] = MessageTag.RESHARD_LAND_READY
+    room: int
+    pages: list[int]
+    scratch: list[int]
+    land_version: int
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+
+
+class ReshardLandChunkReady(WireMessage):
+    """ReshardChunkReady for a chunk plan with landing entries; ``scratch``
+    has one block per page of the chunk's window, as in ReshardLandReady."""
+
+    TAG: ClassVar[bytes] = MessageTag.RESHARD_LAND_CHUNK_READY
+    room: int
+    index: int
+    uuid: int
+    scratch: list[int]
+    land_version: int
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")

@@ -456,6 +456,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "(e.g. GQA, MHA). MLA models should not set this flag."
             )
         self.kv_manager = self._init_kv_manager()
+        self.transfer_queue.kv_manager = self.kv_manager
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
 
@@ -2472,6 +2473,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     """
 
     enable_host_receive: bool = False
+    # Set by DecodePreallocQueue to the KV manager its receivers poll.
+    kv_manager = None
 
     def __init__(
         self,
@@ -2748,6 +2751,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     if rids_to_check is None or decode_req.req.rid in rids_to_check
                 ]
             )
+
+        # Backend device work owed before this round's polls (raiden: merge
+        # reshard landing pages, which gates the rooms' Success).
+        prepass = getattr(self.kv_manager, "land_prepass", None)
+        if prepass is not None:
+            prepass()
 
         if self.enable_staging:
             polls = self._poll_with_staging()
