@@ -444,6 +444,9 @@ def _common_launch_env(
         "TPU_TELEMETRY_INTERVAL_SEC": "86400",
         "TPU_DIAGNOSTIC_HARVESTER_INTERVAL_SEC": "86400",
         "PYTHON": PYTHON,
+        # Raiden's reshard push needs a host buffer per layer.
+        "SGLANG_TPU_RAIDEN_STAGING_LAYERS": "0",
+        "SGLANG_RAIDEN_HOST_POOL_GB": "128",
         **profile.extra_launch_env,
     }
 

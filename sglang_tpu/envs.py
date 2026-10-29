@@ -173,8 +173,13 @@ class TpuEnvs:
     # Threads pushing resharded KV off the listener thread.
     SGLANG_RAIDEN_PUSH_WORKERS = EnvInt(1)
 
-    # Host staging budget per node, split across local ranks and engines.
-    SGLANG_RAIDEN_HOST_POOL_GB = EnvFloat(128.0)
+    # Host staging budget per node, split across local ranks.
+    SGLANG_RAIDEN_HOST_POOL_GB = EnvFloat(24.0)
+    # Host layer buffers across full-attention and SWA engines, split by layer
+    # count with at least one each. 0 keeps full mirrors.
+    # More buffers, or 0, make each slot larger. Raise SGLANG_RAIDEN_HOST_POOL_GB
+    # with it to keep the slot count and concurrent transfers.
+    SGLANG_TPU_RAIDEN_STAGING_LAYERS = EnvInt(8)
     # Maximum pages per request. 0 derives the limit from the context/window.
     SGLANG_RAIDEN_MAX_BLOCKS = EnvInt(0)
     SGLANG_RAIDEN_SWA_MAX_BLOCKS = EnvInt(0)

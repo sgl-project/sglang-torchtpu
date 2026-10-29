@@ -143,6 +143,9 @@ EXTRA_LAUNCH_ENV: Dict[str, str] = {
     # decode rank is fed by more than one prefill rank, and raises rather than
     # falling back when it cannot -- so there is no silent symmetric path.
     "SGLANG_RAIDEN_RESHARD": "1",
+    # Raiden's reshard push needs a host buffer per layer.
+    "SGLANG_TPU_RAIDEN_STAGING_LAYERS": "0",
+    "SGLANG_RAIDEN_HOST_POOL_GB": "128",
 }
 
 # launch_server.sh turns DP_SIZE>1 into --dp-size + --enable-dp-attention (plus

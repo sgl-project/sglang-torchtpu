@@ -121,7 +121,8 @@ KV, decode prefix-cache reuse, `dst_tp > src_tp`.
 |-----|---------|---------|
 | `SGLANG_RAIDEN_PIPELINE_TRANSFER` | `0` | named layer pools for a PP producer and a DP, TP, or matching-PP consumer; set to `1` on a decode that is not itself a pipeline |
 | `SGLANG_RAIDEN_KV_PORT` | `31000` | base control port, kept clear of the default serving ports; local rank uses `base + 6*node_worker_rank` over every PP/CP/DP replica's TP ranks (data = `+1`, SWA engine control/data = `+2`/`+3`, GDN state engine control/data = `+4`/`+5`) |
-| `SGLANG_RAIDEN_HOST_POOL_GB` | `128` | host staging ceiling per node, split across local ranks and engines; each rank's pool is sized for at most one max-length transfer per running request and seats in-flight transfers page by page. Startup fails with the required and available sizes when not even one max-length transfer fits |
+| `SGLANG_RAIDEN_HOST_POOL_GB` | `24` | host staging budget in GiB per node, split across local ranks. Each rank sizes all of its engines together (see below). Startup fails with the required and available sizes when not even one max-length transfer fits |
+| `SGLANG_TPU_RAIDEN_STAGING_LAYERS` | `8` | host layer buffers across the full-attention and SWA engines, split by their layer counts with at least one each (`8` gives Muse Spark 2 + 6). `0` keeps full mirrors, which asymmetric-TP pushes on prefill need |
 | `SGLANG_RAIDEN_MAX_BLOCKS` | `0` (auto) | full-attention max pages/request; auto = `ceil(context_len/page_size)` |
 | `SGLANG_RAIDEN_SWA_MAX_BLOCKS` | `0` (auto) | SWA max pages/request; auto includes one page for an unaligned window start |
 | `SGLANG_RAIDEN_MAX_MODEL_LEN` | `8192` | fallback when `--context-length` is unset |
@@ -129,6 +130,26 @@ KV, decode prefix-cache reuse, `dst_tp > src_tp`.
 | `SGLANG_RAIDEN_LISTENER_START_READ` | `1` | decode only: the listener thread starts a request's next read as soon as the prefill announces it, instead of waiting for the next scheduler poll; `0` starts reads only on the poll. Admission is unchanged and completion is still detected by the poll. Pipeline and resharded transfers are unaffected |
 | `SGLANG_RAIDEN_DYNAMIC_HOST_STAGING` | `1` | raiden seats each transfer in its own pages of the pool pinned at startup; resharding stages each plan in its own host blocks instead of shadowing the device KV pool. Setting `0` keeps fixed slots, where every transfer takes a whole max-length slot, and rejects asymmetric resharding, which needs per-transfer staging. Passed to raiden as `TPU_RAIDEN_DYNAMIC_HOST_STAGING`; that old name still works but is deprecated |
 | `TPU_PREMAPPED_BUFFER_SIZE` | `4 GiB` (set by the TPU platform) | libtpu's premapped DMA buffer. Raiden builds that stage through libtpu's host allocator (full-mirror staging; tpu-sync before [49d29c0f](https://github.com/google/tpu-sync/commit/49d29c0fc07046bcda8640c3841c579665e93e24), including builds with PP pool resharding) carve each rank's host staging out of it, and staging past the buffer is DMA-mapped as each copy lands, which stalls the decode steps. Set it per rank above the rank's staging (`mirror_peak_bytes` in the `Raiden pipeline ready` line, about the rank's share of `SGLANG_RAIDEN_HOST_POOL_GB`; the pipeline warns when the buffer is smaller). Builds from 49d29c0f on DMA-map their staging when allocating it and do not draw on this buffer |
+
+Each rank's budget sizes all of its engines together:
+
+- The full-attention and SWA engines reuse the configured number of host layer
+  buffers, so each engine's share of the budget follows its full-mirror size.
+  GDN state engines keep full mirrors.
+- Fixed slots (`SGLANG_RAIDEN_DYNAMIC_HOST_STAGING=0`, both matched-TP roles)
+  take a whole slot in every engine, so the engines share one slot count.
+- Dynamic staging lets shorter transfers share full-attention pages, while
+  each still fills a whole window. SWA and state engines get eight slots per
+  full-attention slot.
+- Slot counts depend only on the budget and layer count, not on
+  `--max-running-requests`, so staging RAM matches the budget.
+- The `host staging` log line reports the plan, for example
+  `slots=[9, 72] layers=[2, 6] of [16, 46]` for Muse Spark at TP16 on two
+  hosts with the 24 GiB default budget and 8 layers.
+
+Pipeline, HiCache and block-major transfers keep full mirrors, so those deployments
+need a larger `SGLANG_RAIDEN_HOST_POOL_GB`. Asymmetric TP requires dynamic
+staging and full mirrors on prefill.
 
 A decode rank issues a pull only while its host staging pool has the pages for it; requests past that stay in the transfer queue, in order, and are retried as pages free, so the pool does not have to hold a max-length transfer per running request. A pull that does not fit waits at the head of the queue, so smaller pulls cannot starve it. A request that waits in that queue for longer than `SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S` fails with that reason: its KV is gone from the prefill by then, so the pull is never sent.
 

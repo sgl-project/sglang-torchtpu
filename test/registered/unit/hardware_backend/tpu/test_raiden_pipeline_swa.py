@@ -1026,6 +1026,7 @@ def _initialize(groups, *, bounded_staging=True, real_budget=False):
         return 4 if max_blocks == 3 else 6
 
     manager._num_slots = num_slots
+    manager._rank_budget_bytes = lambda: RaidenKVManager._rank_budget_bytes(manager)
 
     class Engine:
         def __init__(self, **kwargs):
