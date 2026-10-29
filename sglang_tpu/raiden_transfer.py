@@ -18,7 +18,7 @@ import os
 import time
 from typing import TYPE_CHECKING, List
 
-from sglang.srt.environ import envs
+from sglang_tpu.envs import envs
 from sglang_tpu.tpu_dma_hicache import NOOP_EVENT
 
 if TYPE_CHECKING:

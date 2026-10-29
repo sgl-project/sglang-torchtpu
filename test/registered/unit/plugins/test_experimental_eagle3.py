@@ -1,7 +1,8 @@
-"""CPU contracts for EAGLE3 on the experimental TPU spec worker."""
+"""CPU contracts for the chain drafters (EAGLE3, MTP) on the experimental TPU spec worker."""
 
 from __future__ import annotations
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 from typing import NamedTuple
@@ -9,6 +10,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -17,6 +19,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.envs import envs
 from sglang_tpu.experimental.compilation.chain_compile_policy import (
+    TpuChainSpecDecodeCompilePolicyMixin,
     _hidden_only_logits,
 )
 from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
@@ -26,6 +29,12 @@ from sglang_tpu.experimental.speculative import (
     spec_ops,
 )
 from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
+from sglang_tpu.experimental.speculative.chain_draft_input import (
+    chain_draft_forward_input,
+)
+from sglang_tpu.experimental.speculative.chain_draft_worker import (
+    TpuChainDraftWorker,
+)
 from sglang_tpu.experimental.speculative.chain_info import HostPaddedChainDraftInput
 from sglang_tpu.experimental.speculative.chain_spec_worker import (
     TpuChainSpecWorker,
@@ -40,9 +49,14 @@ from sglang_tpu.experimental.speculative.eagle3.eagle3_draft_worker import (
 )
 from sglang_tpu.experimental.speculative.spec_ops import (
     _filtered_target_probs,
+    accept_candidates_step,
+    accept_drafts_candidates,
     accept_drafts_sampled,
     accept_drafts_sampled_filtered,
     accept_drafts_target_only,
+    accept_greedy_step,
+    accept_greedy_top_k_step,
+    accept_top_k_candidates_step,
     finalize_accept,
 )
 from sglang_tpu.experimental.speculative.spec_types import (
@@ -110,7 +124,7 @@ class TestExperimentalEagle3(CustomTestCase):
             model_runner=SimpleNamespace(max_running_requests=2)
         )
         worker._chain_draft_worker = SimpleNamespace(
-            carry_size=3, carry=torch.zeros((3, 3))
+            carry_size=3, carry=torch.zeros((3, 3)), dsa_seed_topk_table=None
         )
         worker._draft_runner = SimpleNamespace(dtype=torch.float32)
         buckets = SimpleNamespace(buckets=[1, 2], max_val=2, next_bucket=lambda bs: bs)
@@ -315,6 +329,7 @@ class TestExperimentalEagle3(CustomTestCase):
                 top_ks=torch.full((rows,), 4, dtype=torch.int32),
                 threshold_single=1.0,
                 threshold_acc=1.0,
+                rng_step=torch.zeros(1, dtype=torch.int64),
                 **_unfiltered(rows),
             )
         first = torch.where(num_correct > 0, drafts[:, 0], bonus)
@@ -331,6 +346,7 @@ class TestExperimentalEagle3(CustomTestCase):
                 top_ks=torch.ones(2, dtype=torch.int32),
                 threshold_single=1.0,
                 threshold_acc=1.0,
+                rng_step=torch.zeros(1, dtype=torch.int64),
                 **_unfiltered(2),
             )
         self.assertEqual(greedy_correct.tolist(), [1, 0])
@@ -353,11 +369,196 @@ class TestExperimentalEagle3(CustomTestCase):
                 torch.ones(rows, dtype=torch.int32),
                 q_logits.expand(rows, 1, 4),
                 top_ks=torch.full((rows,), 2, dtype=torch.int32),
+                rng_step=torch.zeros(1, dtype=torch.int64),
                 **_unfiltered(rows),
             )
         first = torch.where(num_correct > 0, drafts[:, 0], bonus)
         freq = torch.bincount(first, minlength=4).float() / rows
         torch.testing.assert_close(freq, p0, atol=0.01, rtol=0)
+
+    def test_candidates_acceptance_is_the_filtered_full_vocab_rule(self):
+        """On a top-k-only target and a q on K candidates, the candidates rule
+        decides the same correct prefix as the full-vocabulary filtered rule
+        from the same uniforms, and its bonus keeps the first committed token on
+        the filtered p_0."""
+        torch.manual_seed(0)
+        bs, n, vocab, k_draft = 4, 3, 32, 5
+        logits = torch.randn(bs * (n + 1), vocab)
+        draft_ids = torch.stack(
+            [torch.randperm(vocab)[:k_draft] for _ in range(bs * n)]
+        ).view(bs, n, k_draft)
+        draft_logits = torch.randn(bs, n, k_draft)
+        drafts = draft_ids[..., 0]
+        dense_q = torch.full((bs, n, vocab), float("-inf")).scatter(
+            -1, draft_ids, draft_logits
+        )
+        args = dict(
+            draft_tokens=drafts,
+            num_verify_drafts=torch.full((bs,), n, dtype=torch.int32),
+            temperatures=torch.tensor([0.7, 1.0, 1.3, 1.0]),
+            top_ks=torch.tensor([4, 8, 2, 1], dtype=torch.int32),
+            rng_step=torch.tensor([3]),
+        )
+        with (
+            patch.object(spec_ops, "tpu_filter_probs", _cpu_joint_filter),
+            patch.object(spec_ops, "TARGET_CANDIDATES", 8),
+        ):
+            full_correct, _ = accept_drafts_sampled_filtered(
+                logits,
+                draft_logits=dense_q,
+                top_ps=torch.ones(bs),
+                min_ps=torch.zeros(bs),
+                **args,
+            )
+            cand_correct, cand_bonus = accept_drafts_candidates(
+                *torch.topk(logits, 8),
+                draft_ids=draft_ids,
+                draft_logits=draft_logits,
+                **args,
+            )
+        self.assertEqual(cand_correct.tolist(), full_correct.tolist())
+        # The greedy row (top_k 1) commits the raw argmax.
+        greedy_bonus = logits.view(bs, n + 1, -1)[3].argmax(-1)[cand_correct[3]]
+        self.assertEqual(cand_bonus[3].item(), greedy_bonus.item())
+
+        rows = 40000
+        target = torch.tensor([0.1, 0.4, 0.3, 0.2]).log()
+        p0 = torch.tensor([0.0, 4 / 7, 3 / 7, 0.0])  # top-k 2 of the target
+        q_ids = torch.tensor([0, 1, 3])
+        q_logits = torch.tensor([0.5, 0.3, 0.2]).log()
+        picks = torch.multinomial(q_logits.exp(), rows, replacement=True)
+        with patch.object(spec_ops, "TARGET_CANDIDATES", 4):
+            num_correct, bonus = accept_drafts_candidates(
+                *torch.topk(torch.stack([target, torch.zeros(4)]).repeat(rows, 1), 4),
+                q_ids[picks][:, None],
+                torch.ones(rows, dtype=torch.int32),
+                q_ids.expand(rows, 1, 3),
+                q_logits.expand(rows, 1, 3),
+                torch.ones(rows),
+                torch.full((rows,), 2, dtype=torch.int32),
+                torch.tensor([0]),
+            )
+        first = torch.where(num_correct > 0, q_ids[picks], bonus)
+        freq = torch.bincount(first, minlength=4).float() / rows
+        torch.testing.assert_close(freq, p0, atol=0.01, rtol=0)
+
+    def test_block_verification_is_lossless_and_accepts_more(self):
+        """With a context-free target p and draft q, block verification's output
+        stream has its first two tokens distributed p x p, and it accepts at least
+        as many drafts as token-wise rejection."""
+        # A q far from p: an unscaled correction (r_tau = 1) misses by ~0.007.
+        rows, n, vocab = 100000, 3, 4
+        p_row = torch.tensor([0.05, 0.6, 0.25, 0.1])
+        q_row = torch.tensor([0.5, 0.05, 0.15, 0.3])
+        gen = torch.Generator().manual_seed(0)
+        ids = torch.arange(vocab)
+
+        def step(rng_step, block_verification):
+            drafts = torch.multinomial(
+                q_row, rows * n, replacement=True, generator=gen
+            ).view(rows, n)
+            with patch.object(spec_ops, "TARGET_CANDIDATES", vocab):
+                correct, bonus = accept_drafts_candidates(
+                    p_row.log().expand(rows * (n + 1), vocab),
+                    ids.expand(rows * (n + 1), vocab).int(),
+                    drafts,
+                    torch.full((rows,), n, dtype=torch.int32),
+                    ids.expand(rows, n, vocab),
+                    q_row.log().expand(rows, n, vocab),
+                    torch.ones(rows),
+                    torch.full((rows,), vocab, dtype=torch.int32),
+                    torch.tensor([rng_step]),
+                    block_verification=block_verification,
+                )
+            stream = torch.cat([drafts, bonus[:, None]], dim=1)
+            # Committed: the correct drafts, then the bonus.
+            slots = torch.arange(n + 1)[None, :]
+            stream = torch.where(slots < correct[:, None], stream, bonus[:, None])
+            return correct, stream
+
+        token_correct, _ = step(1, False)
+        block_correct, first_step = step(2, True)
+        _, second_step = step(3, True)
+        first = first_step[:, 0]
+        second = torch.where(block_correct >= 1, first_step[:, 1], second_step[:, 0])
+        joint = torch.bincount(first * vocab + second, minlength=vocab * vocab)
+        torch.testing.assert_close(
+            joint.float().view(vocab, vocab) / rows,
+            torch.outer(p_row, p_row),
+            atol=0.004,
+            rtol=0,
+        )
+        self.assertGreater(
+            block_correct.float().mean().item(), token_correct.float().mean().item()
+        )
+
+    def test_hash_uniforms_match_the_uint32_reference(self):
+        """The int32-lane hash keeps MurmurHash3's uint32 bits (masked int64 reference)."""
+        mask = 0xFFFFFFFF
+
+        def fmix(x):
+            x = x ^ (x >> 16)
+            x = (x * 0x85EBCA6B) & mask
+            x = x ^ (x >> 13)
+            x = (x * 0xC2B2AE35) & mask
+            return x ^ (x >> 16)
+
+        for step in (0, 7, 2**30 + 3):
+            for stream in (0, 1, 2):
+                key = fmix((step * 0x9E3779B1 + stream * 0x7F4A7C15) & mask)
+                index = torch.arange(3 * 64, dtype=torch.int64)
+                bits = fmix(fmix((index * 0x632BE5AB + key) & mask) ^ key)
+                expected = ((bits >> 8).float() / (1 << 24)).view(3, 64)
+                got = spec_ops.hash_uniforms(torch.tensor([step]), stream, (3, 64))
+                self.assertTrue(torch.equal(got, expected))
+
+    def test_top_k_accept_steps_match_full_vocab_steps(self):
+        """The verify's distributed top-k (descending logits and ids) commits what
+        the full-vocabulary steps commit from the same rng_step."""
+        torch.manual_seed(1)
+        bs, n, vocab, k_draft, width = 3, 4, 50, 6, 8
+        logits = torch.randn(bs * (n + 1), vocab)
+        top_logits, top_ids = torch.topk(logits, width)
+        draft_ids = torch.stack(
+            [torch.randperm(vocab)[:k_draft] for _ in range(bs * n)]
+        ).view(bs, n, k_draft)
+        draft_tokens = draft_ids[..., 0]
+        num_verify_drafts = torch.full((bs,), n, dtype=torch.int32)
+        seq_lens = torch.tensor([10, 20, 30])
+        live_mask = torch.tensor([True, True, False])
+        sampled = (
+            draft_ids,
+            torch.randn(bs, n, k_draft),
+            torch.tensor([1.0, 0.8, 1.0]),
+            torch.tensor([width, 3, 1], dtype=torch.int32),
+            seq_lens,
+            live_mask,
+            torch.tensor([5]),
+        )
+        with patch.object(spec_ops, "TARGET_CANDIDATES", width):
+            full, full_step = accept_candidates_step(
+                logits, draft_tokens, num_verify_drafts, *sampled, False
+            )
+            top, top_step = accept_top_k_candidates_step(
+                top_logits,
+                top_ids.int(),
+                draft_tokens,
+                num_verify_drafts,
+                *sampled,
+                False,
+            )
+        for a, b in zip(full, top):
+            self.assertTrue(torch.equal(a, b))
+        self.assertEqual(full_step.item(), top_step.item())
+
+        greedy = accept_greedy_step(
+            logits, draft_tokens, num_verify_drafts, seq_lens, live_mask
+        )
+        greedy_top = accept_greedy_top_k_step(
+            top_ids.int(), draft_tokens, num_verify_drafts, seq_lens, live_mask
+        )
+        for a, b in zip(greedy, greedy_top):
+            self.assertTrue(torch.equal(a, b))
 
     def test_greedy_rows_in_a_sampled_batch_compare_raw_logits(self):
         """A greedy row (top_k = 1) sharing a batch with sampled rows takes the
@@ -370,6 +571,7 @@ class TestExperimentalEagle3(CustomTestCase):
             draft_logits=torch.zeros(1, 1, 2),
             temperatures=torch.tensor([1e9]),
             top_ks=torch.ones(1, dtype=torch.int32),
+            rng_step=torch.zeros(1, dtype=torch.int64),
         )
         with patch.object(spec_ops, "tpu_filter_probs", _cpu_joint_filter):
             filtered = accept_drafts_sampled_filtered(
@@ -398,11 +600,20 @@ class TestExperimentalEagle3(CustomTestCase):
                 )
             )
 
-        none = {"need_top_k": False, "need_top_p": False, "need_min_p": False}
+        none = {
+            "need_top_k": False,
+            "need_top_p": False,
+            "need_min_p": False,
+            "target_candidates": False,
+        }
         self.assertEqual(filters([1, 1 << 30]), none)
         self.assertEqual(filters([1, 1 << 30], top_ps=(0.5, 1.0)), none)
         self.assertEqual(filters([1, 8])["need_top_k"], True)
         self.assertEqual(filters([1, 1 << 30], min_ps=(0.0, 0.1))["need_min_p"], True)
+        # Candidates acceptance covers a top-k-only target within TARGET_CANDIDATES.
+        self.assertTrue(filters([1, 64])["target_candidates"])
+        self.assertFalse(filters([1, 65])["target_candidates"])
+        self.assertFalse(filters([1, 8], top_ps=(1.0, 0.9))["target_candidates"])
 
     def test_sampled_verify_filters_target_like_the_target_sampler(self):
         """Sampled verify keeps what the target sampler keeps: every cutoff on the
@@ -446,6 +657,7 @@ class TestExperimentalEagle3(CustomTestCase):
         )
         worker._all_drafts = {4: torch.full((4,), 2, dtype=torch.int32)}
         worker._accept_threshold_single = worker._accept_threshold_acc = 1.0
+        worker._rng_step = torch.zeros(1, dtype=torch.int64)
         calls = []
         with (
             patch.object(
@@ -671,6 +883,304 @@ class TestExperimentalEagle3(CustomTestCase):
         )
         self._run_fused(drafter)
         self.assertEqual(calls, ["wait", "draft"])
+
+
+class _IdentityChainDrafter(TpuChainDraftWorker):
+    """A chain drafter whose logits are its hidden, over the target vocab."""
+
+    def first_draft_logits(self, carry):
+        return carry
+
+    def target_tokens(self, draft_ids):
+        return draft_ids
+
+    def target_logits(self, draft_logits):
+        return draft_logits
+
+
+def _publish_topk(*, forward_mode, spec_info, topk, reuse_dsa_topk_indices=False):
+    """What the NextN model does with its indexer rows (DeepseekModelNextN.forward)."""
+    forward_batch = SimpleNamespace(
+        forward_mode=forward_mode,
+        spec_info=spec_info,
+        reuse_dsa_topk_indices=reuse_dsa_topk_indices,
+    )
+    share = IndexTopKShareState.from_mtp_carry(forward_batch)
+    share.update(topk)
+    share.publish()
+
+
+def _capture_layout(spec_info):
+    """(shape, dtype) of the DSA top-k capture and its row select, or None."""
+    return tuple(
+        None if t is None else (tuple(t.shape), t.dtype)
+        for t in (spec_info.dsa_seed_topk_capture, spec_info.dsa_seed_topk_select)
+    )
+
+
+class TestChainDsaIndexShare(CustomTestCase):
+    """MTP index sharing: draft steps reuse the indexer top-k of the last committed row."""
+
+    WIDTH = 4  # DSA top-k columns
+    HIDDEN = 2
+
+    def _seed_table(self, rows: int = 5) -> torch.Tensor:
+        return torch.full((rows, self.WIDTH), -1, dtype=torch.int32)
+
+    def _drafter(self, seed_table, rows: int = 5):
+        return SimpleNamespace(
+            draft_context=contextlib.nullcontext,
+            carry=torch.zeros((rows, self.HIDDEN)),
+            dsa_seed_topk_width=None if seed_table is None else self.WIDTH,
+            dsa_seed_topk_table=seed_table,
+        )
+
+    def _commit(self, *, seed_table, rows_topk, num_correct_drafts, req_pool_indices):
+        """TpuChainSpecWorker.commit around a draft forward whose indexer yields
+        rows_topk; returns the forward's spec_info, flag and hidden rows, and the
+        drafter's carry and seed table after commit."""
+        padded_bs = req_pool_indices.shape[0]
+        width = rows_topk.shape[0] // padded_bs
+        worker = object.__new__(TpuChainSpecWorker)
+        worker.device = "cpu"
+        worker.num_verify_rows = width
+        drafter = self._drafter(seed_table)
+        worker._chain_draft_worker = drafter
+        worker._draft_runner = worker._spec_algorithm = None
+        served = []
+
+        def forward_draft_rows(*, spec_info, publish_dsa_topk=False, **_):
+            _publish_topk(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                spec_info=spec_info,
+                topk=rows_topk,
+                reuse_dsa_topk_indices=publish_dsa_topk,
+            )
+            hidden = torch.arange(
+                rows_topk.shape[0] * self.HIDDEN, dtype=torch.float32
+            ).view(-1, self.HIDDEN)
+            served.append(
+                SimpleNamespace(
+                    spec_info=spec_info,
+                    publish_dsa_topk=publish_dsa_topk,
+                    rows_hidden=hidden,
+                )
+            )
+            return LogitsProcessorOutput(next_token_logits=None, hidden_states=hidden)
+
+        accept = SimpleNamespace(
+            window_tokens=None,
+            live_mask=None,
+            num_correct_drafts=num_correct_drafts,
+            bonus_tokens=torch.zeros(padded_bs, dtype=torch.int64),
+            next_seq_lens=torch.zeros(padded_bs, dtype=torch.int64),
+        )
+        state = SpecState(
+            bonus_tokens=accept.bonus_tokens,
+            seq_lens=accept.next_seq_lens,
+            req_pool_indices=req_pool_indices,
+        )
+        with (
+            patch.object(chain_spec_worker, "build_chain_block_inputs"),
+            patch.object(chain_spec_worker, "forward_draft_rows", forward_draft_rows),
+        ):
+            worker.commit(
+                None,
+                state,
+                None,
+                None,
+                SimpleNamespace(hidden_states=torch.zeros((rows_topk.shape[0], 1))),
+                accept,
+            )
+        (forward,) = served
+        forward.carry = drafter.carry
+        forward.seed_table = drafter.dsa_seed_topk_table
+        return forward
+
+    def _extend(self, *, seed_table, prompt_topk, extend_lens, req_pool_indices, cap):
+        """TpuChainSpecWorker._extend_draft around a draft forward that publishes prompt_topk."""
+        worker = object.__new__(TpuChainSpecWorker)
+        worker.device = "cpu"
+        worker._chain_draft_worker = self._drafter(seed_table)
+        worker._compile_policy = lambda: SimpleNamespace(
+            _extend_compile_cap=lambda: cap
+        )
+        worker._draft_prompt_ids = lambda batch, **_: None
+        served = []
+
+        def forward(forward_batch):
+            served.append(forward_batch.spec_info)
+            _publish_topk(
+                forward_mode=ForwardMode.EXTEND,
+                spec_info=forward_batch.spec_info,
+                topk=prompt_topk,
+            )
+            tail = torch.zeros((cap, self.HIDDEN))
+            return SimpleNamespace(
+                logits_output=SimpleNamespace(
+                    next_token_logits=tail, hidden_states=tail
+                )
+            )
+
+        worker._draft_runner = SimpleNamespace(forward=forward)
+        batch = SimpleNamespace(
+            extend_lens=extend_lens, req_pool_indices_cpu=req_pool_indices
+        )
+        init_new = lambda *args, **kwargs: SimpleNamespace(  # noqa: E731
+            forward_mode=ForwardMode.EXTEND, global_num_tokens_cpu=None
+        )
+        with patch.object(chain_spec_worker.ForwardBatch, "init_new", init_new):
+            worker._extend_draft(
+                batch,
+                target_hidden=torch.zeros((prompt_topk.shape[0], 1)),
+                bucket_tokens=None,
+                mm_input_embeds=None,
+            )
+        return served[0]
+
+    def test_draft_steps_attend_over_the_committed_row_topk(self):
+        """Every draft step hands the NextN layer the seed of its request's pool row
+        as the carried top-k, so the layer skips its indexer; a draft that does
+        not share (EAGLE3, or the flag off) keeps running its indexer each step."""
+        table = torch.arange(5 * self.WIDTH, dtype=torch.int32).view(5, self.WIDTH)
+        req_pool_indices = torch.tensor([2, 0])
+        for seed_table, expected in ((table, table[[2, 0]]), (None, None)):
+            seen = []
+
+            def forward(input_ids, positions, forward_batch):
+                del positions
+                share = IndexTopKShareState.from_mtp_carry(forward_batch)
+                seen.append(share.topk_indices)
+                logits = torch.zeros((input_ids.shape[0], self.HIDDEN))
+                return SimpleNamespace(next_token_logits=logits, hidden_states=logits)
+
+            drafter = object.__new__(_IdentityChainDrafter)
+            drafter.num_drafts = 3
+            drafter.model_runner = SimpleNamespace(
+                model=SimpleNamespace(forward=forward)
+            )
+            forward_batch = SimpleNamespace(
+                spec_info=chain_draft_forward_input(
+                    hidden_states=torch.zeros((2, self.HIDDEN)), width=1
+                ),
+                reuse_dsa_topk_indices=False,
+            )
+            with self.subTest(shares=seed_table is not None):
+                drafter._fused_draft_steps(
+                    forward_batch,
+                    torch.zeros((5, self.HIDDEN)),
+                    req_pool_indices,
+                    torch.zeros((2, 3), dtype=torch.int64),
+                    torch.zeros((2, 3), dtype=torch.int64),
+                    torch.zeros(2, dtype=torch.int64),
+                    None,
+                    None,
+                    None,
+                    seed_table,
+                )
+                # d_1 comes from the carry; the other two drafts run the layer.
+                self.assertEqual(len(seen), 2)
+                for topk in seen:
+                    if expected is None:
+                        self.assertIsNone(topk)
+                    else:
+                        self.assertTrue(torch.equal(topk, expected))
+
+    def test_commit_carries_and_seeds_the_last_accepted_row(self):
+        """Commit runs the draft over all N + 1 verify rows; each request's last
+        accepted row (num_correct_drafts) gives its carry and, with sharing, its
+        seed top-k, both written at its pool row. Without sharing no top-k is
+        published and the carry still moves."""
+        rows_topk = torch.arange(6 * self.WIDTH, dtype=torch.int32).view(6, self.WIDTH)
+        for seed_table in (self._seed_table(), None):
+            with self.subTest(shares=seed_table is not None):
+                served = self._commit(
+                    seed_table=seed_table,
+                    rows_topk=rows_topk,
+                    num_correct_drafts=torch.tensor([2, 0]),
+                    req_pool_indices=torch.tensor([3, 1]),
+                )
+                # Three verify rows per request: request 0 keeps row 2, request 1 row 3.
+                carry, hidden = served.carry, served.rows_hidden
+                self.assertEqual(carry[3].tolist(), hidden[2].tolist())
+                self.assertEqual(carry[1].tolist(), hidden[3].tolist())
+                self.assertTrue((carry[[0, 2, 4]] == 0).all())
+                self.assertEqual(served.publish_dsa_topk, seed_table is not None)
+                table = served.seed_table
+                if seed_table is None:
+                    self.assertIsNone(table)
+                    continue
+                self.assertEqual(table[3].tolist(), rows_topk[2].tolist())
+                self.assertEqual(table[1].tolist(), rows_topk[3].tolist())
+                self.assertTrue((table[[0, 2, 4]] == -1).all())
+
+    def test_extend_seeds_each_request_from_its_last_prompt_row(self):
+        """The draft prompt's seed is each request's last row (a chunk's last row
+        for a chunked request); padded slots land in the reserved pool row 0."""
+        table = self._seed_table()
+        prompt_topk = torch.arange(8 * self.WIDTH, dtype=torch.int32).view(
+            8, self.WIDTH
+        )
+        self._extend(
+            seed_table=table,
+            prompt_topk=prompt_topk,
+            extend_lens=[3, 2],
+            req_pool_indices=torch.tensor([4, 2]),
+            cap=4,
+        )
+        self.assertEqual(table[4].tolist(), prompt_topk[2].tolist())
+        self.assertEqual(table[2].tolist(), prompt_topk[4].tolist())
+        self.assertTrue((table[[1, 3]] == -1).all())
+
+    def test_warmup_traces_the_capture_serving_passes(self):
+        """Commit's draft forward publishes its top-k, extend's fills a top-k
+        capture; the warmup must trace the same flag and capture layout, or the
+        forward recompiles at serving time."""
+        padded_bs, width, cap = 2, 3, 4
+        served_commit = self._commit(
+            seed_table=self._seed_table(),
+            rows_topk=torch.zeros((padded_bs * width, self.WIDTH), dtype=torch.int32),
+            num_correct_drafts=torch.zeros(padded_bs, dtype=torch.int64),
+            req_pool_indices=torch.tensor([1, 0]),
+        )
+        served_extend = self._extend(
+            seed_table=self._seed_table(),
+            prompt_topk=torch.zeros((8, self.WIDTH), dtype=torch.int32),
+            extend_lens=[8],
+            req_pool_indices=torch.tensor([1]),
+            cap=cap,
+        )
+        policy = object.__new__(TpuChainSpecDecodeCompilePolicyMixin)
+        policy.draft_token_num = width
+        policy.b_bucketer = SimpleNamespace(buckets=[padded_bs])
+        policy.t_bucketer = SimpleNamespace(buckets=[8])
+        policy._target_is_multimodal = False
+        policy._extend_compile_cap = lambda: cap
+        policy.model_runner = SimpleNamespace(
+            device="cpu",
+            dtype=torch.float32,
+            spec_algorithm=SpeculativeAlgorithm.EAGLE,
+        )
+        policy._precompile_shapes = lambda desc, items, run: [run(i) for i in items]
+        warmed = []
+        policy._run_one = lambda **kwargs: warmed.append(kwargs)
+        policy._precompile_draft_rows(
+            None, target_feature_size=1, dsa_seed_topk_width=self.WIDTH
+        )
+        policy._precompile_draft_prompt_extend(1, dsa_seed_topk_width=self.WIDTH)
+        warm_commit, warm_extend = warmed
+        self.assertTrue(served_commit.publish_dsa_topk)
+        self.assertEqual(
+            warm_commit.get("publish_dsa_topk", False), served_commit.publish_dsa_topk
+        )
+        self.assertEqual(
+            _capture_layout(warm_commit["spec_info"]),
+            _capture_layout(served_commit.spec_info),
+        )
+        self.assertIsNotNone(served_extend.dsa_seed_topk_select)
+        self.assertEqual(
+            _capture_layout(warm_extend["spec_info"]), _capture_layout(served_extend)
+        )
 
 
 if __name__ == "__main__":

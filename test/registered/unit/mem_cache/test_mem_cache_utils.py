@@ -21,7 +21,9 @@ from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     get_hash_str,
     hash_str_to_int64,
+    last_hash_value,
     maybe_init_custom_mem_pool,
+    prefix_hash_values,
     split_node_hash_value,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -485,6 +487,43 @@ class TestSplitNodeHashValue(unittest.TestCase):
                     len(hash_values),
                     f"split_len={split_len}, page_size={page_size}",
                 )
+
+
+class TestNodeHashChain(unittest.TestCase):
+    """last_hash_value / prefix_hash_values only need hash_value and parent,
+    so every tree node type (TreeNode subclasses, UnifiedTreeNode) shares them."""
+
+    @staticmethod
+    def _chain(*hash_lists):
+        root = SimpleNamespace(parent=None, hash_value=None)
+        node = root
+        for hashes in hash_lists:
+            node = SimpleNamespace(parent=node, hash_value=hashes)
+        return root, node
+
+    def test_last_hash_value(self):
+        root, leaf = self._chain(["h1", "h2"], ["h3"])
+        self.assertIsNone(last_hash_value(root))
+        self.assertIsNone(last_hash_value(SimpleNamespace(hash_value=[])))
+        self.assertEqual(last_hash_value(leaf.parent), "h2")
+        self.assertEqual(last_hash_value(leaf), "h3")
+
+    def test_prefix_hash_values_walks_root_to_node(self):
+        root, leaf = self._chain(["h1", "h2"], ["h3"], ["h4", "h5"])
+        self.assertEqual(prefix_hash_values(None), [])
+        self.assertEqual(prefix_hash_values(root), [])
+        self.assertEqual(prefix_hash_values(leaf.parent), ["h1", "h2", "h3"])
+        self.assertEqual(prefix_hash_values(leaf), ["h1", "h2", "h3", "h4", "h5"])
+
+    def test_prefix_hash_values_stops_at_an_unhashed_ancestor(self):
+        _, leaf = self._chain(["h1"], None, ["h3"])
+        self.assertEqual(prefix_hash_values(leaf), ["h3"])
+
+    def test_prefix_hash_values_returns_a_fresh_list(self):
+        _, leaf = self._chain(["h1"], ["h2"])
+        first = prefix_hash_values(leaf)
+        first.append("junk")
+        self.assertEqual(prefix_hash_values(leaf), ["h1", "h2"])
 
 
 if __name__ == "__main__":

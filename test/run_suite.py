@@ -347,6 +347,19 @@ def registered_test_files() -> List[str]:
     ]
 
 
+def fails_on_all_skipped(hw: HWBackend, suites: List[str]) -> bool:
+    """Whether a file whose tests all skip fails the run instead of passing.
+
+    On for the TPU per-commit suites: while the CI pods pinned JAX to CPU,
+    kernel tests gated on jax.devices() skipped every case and reported green
+    (#413). Other backends keep the old behavior until someone
+    checks their suites for files that skip on purpose.
+    """
+    return hw == HWBackend.TPU and any(
+        suite in PER_COMMIT_SUITES[HWBackend.TPU] for suite in suites
+    )
+
+
 def validate_all_suites(all_tests: List[CIRegistry]):
     """Fail fast if any test is registered to a suite that doesn't belong to its backend."""
     valid_by_backend = _valid_suites_by_backend()
@@ -516,6 +529,7 @@ def run_a_suite(args):
         )
 
     pretty_print_tests(args, ci_tests, skipped_tests)
+    fail_on_all_skipped = fails_on_all_skipped(hw, suites)
 
     # None hands the per-file budget over to est_time (see run_unittest_files).
     timeout = None if args.timeout_from_est_time else args.timeout_per_file
@@ -535,6 +549,7 @@ def run_a_suite(args):
             timeout_per_file=timeout,
             derive_timeout=derive_timeout_per_file,
             continue_on_error=args.continue_on_error,
+            fail_on_all_skipped=fail_on_all_skipped,
         )
         # Handed to run_unittest_files so the suite still ends with one
         # TIMINGS block covering every file; the est_time model and the
@@ -557,6 +572,7 @@ def run_a_suite(args):
         max_attempts=args.max_attempts,
         retry_wait_seconds=args.retry_wait_seconds,
         fork_worker_batch_size=args.fork_worker_batch_size,
+        fail_on_all_skipped=fail_on_all_skipped,
     )
     return rest if pinned_ok else -1
 

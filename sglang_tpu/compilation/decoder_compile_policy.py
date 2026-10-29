@@ -966,8 +966,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         """The ``pp_proxy_tensors`` kwarg a non-first pipeline stage warms up with.
 
         The proxy carries the previous stage's hidden states and residual at the
-        padded token bucket, in the model dtype, on the device; the first stage
-        (and a non-pipelined model) gets no proxy.
+        padded token bucket, in the model's PP dtype (or its compute dtype by
+        default), on the device; the first stage gets no proxy.
         """
         pp_group = self.model_runner.pp_group
         if pp_group is None or pp_group.is_first_rank:
@@ -981,7 +981,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         def zeros(shape: tuple[int, int]) -> torch.Tensor:
             buffer = torch.zeros(
                 (rows, shape[1]),
-                dtype=self.model_runner.dtype,
+                dtype=getattr(
+                    self.model_runner.model,
+                    "pp_transfer_dtype",
+                    self.model_runner.dtype,
+                ),
                 device=self.model_runner.device,
             )
             return buffer[: shape[0]]
@@ -1635,8 +1639,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         spec_info: SpecInput | None = None,
         attn_backend: Any | None = None,
         profile_prefix: int | None = None,
+        publish_dsa_topk: bool = False,
     ) -> PendingCall | float | None:
-        """Run one warmup, defer async execution, or time synchronous profiling."""
+        """Run one warmup, defer async execution, or time synchronous profiling.
+
+        publish_dsa_topk traces a draft forward that leaves its DSA top-k in
+        spec_info (forward_draft_rows' flag of the same name).
+        """
         self._compiled_extend_variants.add(variant)
         args, kwargs = self._make_warmup_inputs(
             num_tokens=num_tokens,
@@ -1656,6 +1665,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             else:
                 args = (*args[:2], prepared_batch, *args[3:])
             forward_batch = prepared_batch
+        if publish_dsa_topk:
+            forward_batch.reuse_dsa_topk_indices = True
         if profile_prefix is not None:
             from sglang_tpu.pp_profile import set_profile_inputs
 

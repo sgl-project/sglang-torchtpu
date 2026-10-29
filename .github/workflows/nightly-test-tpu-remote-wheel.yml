@@ -15,8 +15,11 @@ name: Nightly Test (TPU - Remote Wheel)
 run-name: "Nightly Test (TPU - Remote Wheel)${{ inputs.update-dashboard && ' [publish]' || '' }}"
 
 on:
-  # Dispatch-only: run it against a candidate wheel before bumping the torch_tpu pin.
-  # A daily run replayed the whole nightly on the nightly slices it shares.
+  schedule:
+    # Mondays at 12:00 UTC (after the 08:00 UTC tpu-sync nightly wheel is on PyPI):
+    # validates the latest tpu-sync-torch pre-release wheel on a weekly cadence.
+    - cron: "0 12 * * 1"
+  # Manual dispatch: run it against a candidate wheel before bumping the torch_tpu or tpu-sync-torch pin.
   workflow_dispatch:
     inputs:
       ref:
@@ -167,7 +170,7 @@ jobs:
         env:
           CI_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
           BASE_IMAGE: ${{ needs.resolve-baseline.outputs.image }}
-          WHEEL: ${{ inputs.wheel_gcs_url || inputs.wheel || 'torch_tpu' }}
+          WHEEL: ${{ inputs.wheel_gcs_url || inputs.wheel || (github.event_name == 'schedule' && 'tpu-sync-torch') || 'torch_tpu' }}
           INPUT_REF: ${{ inputs.ref || 'main' }}
           TRIGGER_ACTOR: ${{ github.triggering_actor }}
           ORIGIN_ACTOR: ${{ github.actor }}

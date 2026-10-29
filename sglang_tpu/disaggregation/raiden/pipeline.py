@@ -18,7 +18,6 @@ import msgspec
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import NetworkAddress
 from sglang_tpu.disaggregation.raiden import pp_swa
@@ -48,6 +47,7 @@ from sglang_tpu.disaggregation.raiden.serde import (
     read_aux_blob,
     write_aux_blob,
 )
+from sglang_tpu.envs import envs
 
 logger = logging.getLogger(__name__)
 
@@ -560,11 +560,7 @@ class PipelineTransfer:
             manager.attn_cp_size,
             manager.pp_size,
         )
-        budget = (
-            float(os.environ.get("SGLANG_RAIDEN_HOST_POOL_GB", "128"))
-            * 1024**3
-            / local_ranks
-        )
+        budget = envs.SGLANG_RAIDEN_HOST_POOL_GB.get() * 1024**3 / local_ranks
         slots, mirror_peak = legacy_mirror_slots(
             pools=self.pools,
             slot_bytes=initial_slot_bytes,
