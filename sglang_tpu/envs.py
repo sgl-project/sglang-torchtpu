@@ -221,6 +221,13 @@ class TpuEnvs:
     # chunks. 0: evictions back up their victims synchronously, as upstream does.
     SGLANG_TPU_HICACHE_WRITE_BACK_COPY_AHEAD_TOKENS = EnvInt(None)
 
+    # Beam Pallas kernels behind the model's pluggable ops (see beam_kernels.py).
+    # False keeps every Beam op on its torch reference, for A/B and bisection.
+    SGLANG_TPU_BEAM_KERNELS = EnvBool(True)
+    # Comma-separated Beam ops kept on their torch reference while the rest use
+    # Pallas, to bisect a single kernel: sandwich, rmsnorm, qk_norm, topk.
+    SGLANG_DEBUG_TPU_BEAM_KERNELS_SKIP = EnvTuple(())
+
     @classmethod
     def names(cls) -> list[str]:
         return sorted(

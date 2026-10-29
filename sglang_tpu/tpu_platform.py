@@ -987,6 +987,7 @@ class TpuSRTPlatform(SRTPlatform):
 
         from sglang_tpu.env_override import (
             apply_decode_cp_sparse_core_override,
+            apply_fused_rs_sparse_core_override,
             apply_prefill_cp_sparse_core_override,
             apply_small_kv_pool_vmem_prefetch_override,
         )
@@ -996,6 +997,11 @@ class TpuSRTPlatform(SRTPlatform):
             num_hidden_layers=_resolve_num_hidden_layers(cfg),
         )
         apply_decode_cp_sparse_core_override(dcp_size=cfg.dcp_size)
+        apply_fused_rs_sparse_core_override(
+            sampling_backend=cfg.sampling_backend,
+            tp_size=cfg.tp_size,
+            moe_runner_backend=cfg.moe_runner_backend,
+        )
 
         if cfg.dtype is None or cfg.dtype == "auto":
             declare_resolution(
@@ -1179,17 +1185,19 @@ class TpuSRTPlatform(SRTPlatform):
         self, quantization: str
     ) -> Optional[Type[QuantizationConfig]]:
         if quantization == "modelopt_fp4":
-            from sglang.srt.layers.quantization.modelopt_quant import (
-                TpuModelOptCompatibleFp4Config,
-            )
+            from sglang_tpu.modelopt_fp4 import TpuModelOptFp4Config
 
-            return TpuModelOptCompatibleFp4Config
+            return TpuModelOptFp4Config
         if quantization == "modelopt_mixed":
             from sglang.srt.layers.quantization.modelopt_quant import (
                 TpuModelOptMixedPrecisionConfig,
             )
 
             return TpuModelOptMixedPrecisionConfig
+        if quantization == "compressed-tensors":
+            from sglang_tpu.compressed_tensors_fp8 import TpuCompressedTensorsConfig
+
+            return TpuCompressedTensorsConfig
         return None
 
     def get_mha_kv_pool_cls(self) -> type:
@@ -1488,6 +1496,9 @@ class TpuSRTPlatform(SRTPlatform):
             from sglang_tpu.fp8_linear import register_fp8_linear_small_m_op
 
             register_fp8_linear_small_m_op()
+        from sglang_tpu.beam_kernels import register_beam_kernels
+
+        register_beam_kernels()
         # Set before registering: importing the model registry imports model_runner,
         # which calls init_backend again on the OOT path.
         self._backend_initialized = True

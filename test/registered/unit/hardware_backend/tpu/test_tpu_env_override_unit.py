@@ -17,10 +17,12 @@ from unittest.mock import patch
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.env_override import (
     _DECODE_CP_SPARSE_CORE_OVERRIDES,
+    _FUSED_RS_SPARSE_CORE_OVERRIDES,
     _VMEM_PREFETCH_MIN_LAYERS,
     _VMEM_PREFETCH_OVERRIDES,
     _VMEM_PREFETCH_SAFE_MIN_TOKENS,
     apply_decode_cp_sparse_core_override,
+    apply_fused_rs_sparse_core_override,
     apply_small_kv_pool_vmem_prefetch_override,
     apply_tpu_env_overrides,
 )
@@ -108,6 +110,51 @@ class TestLibtpuInitArgsOverrides(CustomTestCase):
                     apply_decode_cp_sparse_core_override(dcp_size=dcp_size)
                     args = os.environ["LIBTPU_INIT_ARGS"].split()
                 for flag in _DECODE_CP_SPARSE_CORE_OVERRIDES:
+                    self.assertEqual(flag in args, expected)
+
+
+    def test_fused_rs_turns_off_sparse_core_offloads(self):
+        # libtpu 0.0.50 faults fused-RS EXTEND modules with the SparseCore
+        # collective offloads on (Beam-1.0-501B-A23B NVFP4, TP=8): a
+        # SparseCore halt in the distributed-top-k logits module, and a
+        # silent execute wedge in the FULL_VOCAB 256-token module -- so the
+        # offloads go off for fused-RS regardless of the top-k cutoff.
+        cases = [
+            # (moe_backend, sampling_backend, tp_size, min_batch_env, expected)
+            ("pallas_tpu_fused_rs", None, 8, None, True),
+            ("pallas_tpu_fused_rs", "tpu", 8, None, True),
+            ("pallas_tpu_fused_rs", "tpu", 16, None, True),
+            ("auto", "tpu", 8, None, False),
+            ("pallas_tpu_fused_rs", "pytorch", 8, None, False),
+            ("pallas_tpu_fused_rs", "tpu", 4, None, False),
+            ("pallas_tpu_fused_rs", "tpu", 8, "100000", True),
+            ("pallas_tpu_fused_rs", "tpu", 8, "optout", False),
+        ]
+        for moe_backend, backend, tp_size, min_batch, expected in cases:
+            with self.subTest(
+                moe_runner_backend=moe_backend,
+                sampling_backend=backend,
+                tp_size=tp_size,
+                min_batch=min_batch,
+            ):
+                env = {"LIBTPU_INIT_ARGS": ""}
+                if min_batch == "optout":
+                    env["SGLANG_TPU_FUSED_RS_SPARSE_CORE_OVERRIDE"] = "0"
+                    min_batch = None
+                if min_batch is not None:
+                    env["SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE"] = min_batch
+                with patch.dict(os.environ, env, clear=False):
+                    if min_batch is None:
+                        os.environ.pop(
+                            "SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE", None
+                        )
+                    apply_fused_rs_sparse_core_override(
+                        sampling_backend=backend,
+                        tp_size=tp_size,
+                        moe_runner_backend=moe_backend,
+                    )
+                    args = os.environ["LIBTPU_INIT_ARGS"].split()
+                for flag in _FUSED_RS_SPARSE_CORE_OVERRIDES:
                     self.assertEqual(flag in args, expected)
 
 
