@@ -47,7 +47,7 @@ from sglang_tpu.kv_free_fence import (
     deferred_dma_read,
 )
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=24, suite="base-a-test-cpu")
 
 
 class _StopLoop(Exception):
