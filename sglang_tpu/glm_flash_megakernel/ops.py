@@ -426,6 +426,7 @@ class GlmFlashMegakernel:
         caches = list(out[3:])
         self.dsa_caches, self.kda_caches = caches[:nd], caches[nd:]
         # A decode step on a radix track boundary snapshots the state it produced.
+        # On TPU the mask is a host tensor (TpuMambaPool keeps slot ids on CPU).
         mask = forward_batch.mamba_track_mask
         if (
             self.radix_snapshots
