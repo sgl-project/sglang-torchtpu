@@ -2760,6 +2760,14 @@ class TestRaidenFutureEvent(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "bad offsets"):
             RaidenFutureEvent(_FakeFuture(error="bad offsets")).synchronize()
 
+    def test_synchronize_raises_timeout_past_deadline(self):
+        """A future still pending at the deadline must raise instead of
+        spinning forever."""
+        ev = RaidenFutureEvent(_FakeFuture(ready_after=1000))
+        with patch.dict(os.environ, {"SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S": "0.01"}):
+            with self.assertRaisesRegex(TimeoutError, "did not complete within"):
+                ev.synchronize()
+
 
 class TestCombinedFutureEvent(CustomTestCase):
     def test_ready_only_when_all_events_ready(self):
