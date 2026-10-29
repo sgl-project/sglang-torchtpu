@@ -12,7 +12,12 @@ from benchmark.tpu.recipe.configs.glm_5_3_flash.server_mk import CONFIG as MK_CO
 
 CONFIG = deepcopy(MTP_CONFIG)
 CONFIG["server_args"].update(
-    {"max_running_requests": 1, "max_mamba_cache_size": 1, "scheduler_recv_interval": 8}
+    {
+        "max_running_requests": 1,
+        "max_mamba_cache_size": 1,
+        "scheduler_recv_interval": 8,
+        "disable_radix_cache": True,
+    }
 )
 CONFIG["runtime_env"].update(
     {k: v for k, v in MK_CONFIG["runtime_env"].items() if "GLM_FLASH_MEGAKERNEL" in k}

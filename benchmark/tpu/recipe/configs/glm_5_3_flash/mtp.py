@@ -32,8 +32,8 @@ _args.update(
         "speculative_eagle_topk": 1,
         "speculative_num_steps": NUM_STEPS,
         "speculative_num_draft_tokens": NUM_STEPS + 1,
-        # Linear-chain KDA speculation keeps one state slot per running request.
-        "max_mamba_cache_size": _args["max_running_requests"],
+        # Radix snapshot slots on top of one per running request; arbitrary.
+        "max_mamba_cache_size": 4 * _args["max_running_requests"] + 16,
         # Young-generation GC ~70x rarer: a collection on one TP rank stalls
         # every rank at the next all-reduce.
         "gc_threshold": [50000, 100, 100],
