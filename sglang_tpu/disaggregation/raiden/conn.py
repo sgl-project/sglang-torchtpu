@@ -216,7 +216,9 @@ class RaidenKVManager(
             tpu_envs.SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM.get()
         )
         if self._transfer_parallelism < 1:
-            raise ValueError("SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM must be >= 1")
+            raise ValueError(
+                f"{tpu_envs.SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM.name} must be >= 1"
+            )
         # Raiden reads its own TPU_RAIDEN_DYNAMIC_HOST_STAGING when the engine is
         # built in this process. Store the resolved value back so later reads
         # do not mistake the variable set here for the deprecated alias.
@@ -393,7 +395,8 @@ class RaidenKVManager(
                 raise NotImplementedError(
                     "Raiden pipeline transfer does not move GDN (linear-attention) "
                     "state yet; serve hybrid linear-attention models without "
-                    "pipeline parallelism or SGLANG_RAIDEN_PIPELINE_TRANSFER."
+                    "pipeline parallelism or "
+                    f"{tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.name}."
                 )
             from sglang_tpu.disaggregation.raiden.pipeline import PipelineTransfer
 
