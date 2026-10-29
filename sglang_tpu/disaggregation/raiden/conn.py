@@ -160,6 +160,7 @@ class RaidenKVManager(
     _kv_head_nums: Tuple[int, ...] = ()
     _swa_kv_head_nums: Tuple[int, ...] = ()
     _seq_along_lane = False
+    _kv_pack_heads = 1
 
     def __init__(
         self,
@@ -433,6 +434,13 @@ class RaidenKVManager(
                 "hybrid model state (GDN/Mamba linear-attention rows or DSV4 "
                 "compressor state); use equal attention TP on prefill and decode"
             )
+        if self._kv_pack_heads > 1:
+            # TODO(#829): plan the sub-granule head runs of a packed row.
+            return (
+                f"{push_reshard_where(src_attn_tp, dst_attn_tp)} does not support "
+                f"KV pools that pack {self._kv_pack_heads} heads per row; unset "
+                "SGLANG_TPU_KV_PACK_HEADS"
+            )
         own_tp = self.attn_tp_size
         peer_tp = dst_attn_tp if own_tp == src_attn_tp else src_attn_tp
         page_size = int(self.kv_args.page_size)
@@ -529,6 +537,7 @@ class RaidenKVManager(
         self._kv_head_nums = tuple(kv_caches.full_head_nums)
         self._swa_kv_head_nums = tuple(kv_caches.swa_head_nums)
         self._seq_along_lane = kv_caches.seq_along_lane
+        self._kv_pack_heads = kv_caches.kv_pack_heads
         if self._pipeline_enabled:
             if self._state_kv_caches:
                 raise NotImplementedError(

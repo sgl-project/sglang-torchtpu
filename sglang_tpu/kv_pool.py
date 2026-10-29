@@ -253,6 +253,9 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
                 raise NotImplementedError("packed KV heads need v_head_dim == head_dim")
             self.head_num, self.head_dim = 1, self.head_num * self.head_dim
             self.v_head_dim = self.head_dim
+            # A P/D layout of its own (see TpuSeqAlongLaneKVPool): a page holds
+            # other bytes than an unpacked pool's, even where the shapes match.
+            self.disagg_kv_layout = f"token_major_pack{self.kv_pack_heads}"
         if self.v_head_dim > self.head_dim:
             raise NotImplementedError(
                 "TpuFusedMHATokenToKVPool supports v_head_dim <= head_dim "
@@ -624,6 +627,9 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
     # torch_tpu's host pool reads its page shape from get_fused_kv_buffer, so it
     # mirrors this layout too.
     kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu"})
+    # Advertised to P/D peers as KVArgs.kv_layout; pools without it are
+    # token-major. Not ``kv_layout``: DSV4 pools use that for a KVLayout enum.
+    disagg_kv_layout: str = "seq_along_lane"
 
     @classmethod
     def kv_bytes_per_token_per_layer(
