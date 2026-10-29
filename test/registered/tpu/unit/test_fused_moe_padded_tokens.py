@@ -347,13 +347,22 @@ class TestFusedMoEPaddedTokens(CustomTestCase):
             ids, w = _routing(m, ROUTES[route_name], ep, rng)
             hidden = rng.standard_normal((m, H)).astype(np.float32)
             clean = run(hidden, ids, w)
-            with self.subTest(route=route_name, ep=ep):
-                bad_h = hidden.copy()
-                bad_h[poisoned] = np.nan
-                bad_h[poisoned, ::5] = np.inf
-                bad = run(bad_h, ids, w)
-                self.assertTrue(np.all(np.isfinite(bad[others])))
-                np.testing.assert_array_equal(bad[others], clean[others])
+            bad_h, bad_w = hidden.copy(), w.copy()
+            bad_h[poisoned] = np.nan
+            bad_h[poisoned, ::5] = np.inf
+            # The router derives the weights from the same hidden state, so in
+            # serving they are NaN too; poisoning them alone isolates the combine.
+            bad_w[poisoned] = np.nan
+            inputs = {
+                "hidden": (bad_h, w),
+                "hidden+weights": (bad_h, bad_w),
+                "weights": (hidden, bad_w),
+            }
+            for poison, (h, tw) in inputs.items():
+                with self.subTest(route=route_name, ep=ep, poison=poison):
+                    bad = run(h, ids, tw)
+                    self.assertTrue(np.all(np.isfinite(bad[others])))
+                    np.testing.assert_array_equal(bad[others], clean[others])
 
     def test_dense_permute_with_gather_unpermute(self):
         # m < threshold <= m * topk: one-hot permute, gather combine.
