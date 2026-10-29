@@ -256,6 +256,51 @@ class TestWanBlockInputsAreRankInvariant(unittest.TestCase):
             for rank, layout in enumerate(layouts):
                 self.assertEqual(layout, layouts[0], f"rank {rank}")
 
+    def test_padded_shards_feed_every_rank_the_same_program_inputs(self):
+        # 3 x 3 x 3 = 27 latent tokens at SP 4: 7 per rank, one pad token at
+        # the last rank's tail. Ulysses 4, and Ulysses 2 x ring 2.
+        world_size = 4
+        forward_batch = SimpleNamespace(
+            enable_sequence_shard=True, enable_teacache=False, enable_spectrum=False
+        )
+        context = SimpleNamespace(forward_batch=forward_batch, attn_metadata=None)
+        for ring_world_size, batch in ((1, 1), (2, 1), (2, 2)):
+            latents = torch.randn(batch, 4, 3, 6, 6)
+            text = torch.randn(batch, 5, 8)
+            timestep = torch.full((batch, 27), 500.0)
+            layouts, scalars = [], []
+            for rank in range(world_size):
+                case = dict(ring=ring_world_size, batch=batch, rank=rank)
+                # USPAttention rejects a ring at construction when the default
+                # backend cannot rotate K/V. The recorded blocks replace the
+                # attention blocks, so build Ulysses-only and run the ring.
+                with _sp_rank(rank, world_size):
+                    model = _tiny_wan()
+                with (
+                    self.subTest(**case),
+                    _sp_rank(rank, world_size, ring_world_size),
+                ):
+                    block = _RecordingBlock()
+                    model.blocks = nn.ModuleList([block])
+                    with (
+                        patch.object(
+                            wanvideo, "get_forward_context", return_value=context
+                        ),
+                        self.assertRaises(_Stop),
+                    ):
+                        model(latents, text, timestep)
+                    layouts.append(block.layouts)
+                    scalars.append(block.scalars)
+                    hidden_states, _, temb, _ = block.args
+                    for tensor in (hidden_states, temb):
+                        self.assertEqual(tensor.storage_offset(), 0)
+                        self.assertTrue(tensor.is_contiguous())
+            for rank in range(world_size):
+                self.assertEqual(layouts[rank], layouts[0], f"rank {rank}")
+                self.assertEqual(scalars[rank], scalars[0], f"rank {rank}")
+            # The global pad span is what the attention paths read.
+            self.assertEqual(scalars[0][1]["pad_start"], 27)
+
 
 if __name__ == "__main__":
     unittest.main()
