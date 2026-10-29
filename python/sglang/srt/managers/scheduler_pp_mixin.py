@@ -868,9 +868,7 @@ class SchedulerPPMixin:
         outputs = queued_outputs.tensors
         with self.pp_comm_stream_ctx:
             if ready_event is not None:
-                # Wait for this forward's recorded boundary, not later forwards
-                # already queued on the compute stream.
-                ready_event.synchronize()
+                self.device_module.current_stream().wait_event(ready_event)
             next_token_ids = outputs["next_token_ids"] = outputs["next_token_ids"].cpu()
         self._pp_send_deferred_output(mb_id)
         self.disagg_prefill_bootstrap_queue.kv_manager.on_outputs_copied(

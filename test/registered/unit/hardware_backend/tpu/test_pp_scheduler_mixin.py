@@ -73,7 +73,10 @@ class TestStreamFences(CustomTestCase):
         scheduler.last_rank_comm_queue = [
             (ready, PPProxyTensors({"next_token_ids": source}))
         ]
-        ready.synchronize.side_effect = lambda: order.append("wait-producer")
+        copy_stream = scheduler.device_module.current_stream.return_value
+        copy_stream.wait_event.side_effect = lambda event: order.append(
+            "wait-producer-on-stream"
+        )
         scheduler._pp_send_deferred_output = MagicMock(
             side_effect=lambda mb: order.append("send")
         )
@@ -89,13 +92,14 @@ class TestStreamFences(CustomTestCase):
             order,
             [
                 "enter-copy-stream",
-                "wait-producer",
+                "wait-producer-on-stream",
                 "copy-complete",
                 "leave-copy-stream",
                 "send",
             ],
         )
-        ready.synchronize.assert_called_once_with()
+        copy_stream.wait_event.assert_called_once_with(ready)
+        ready.synchronize.assert_not_called()
         manager.kv_manager.on_outputs_copied.assert_called_once_with(0, tokens)
         self.assertIs(
             scheduler.last_rank_comm_queue[0][1].tensors["next_token_ids"], tokens
