@@ -711,6 +711,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 except Exception:
                     forward_failed = True
                     raise
+                if current_platform.drain_device_queue_after_request():
+                    torch.accelerator.synchronize()
 
             # disagg roles return raw Req so callers can keep and transfer intermediate tensors
             # before converting it to OutputBatch
