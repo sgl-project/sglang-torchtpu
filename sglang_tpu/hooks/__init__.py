@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
+from sglang_tpu.hooks.all_gather_via_all_reduce import all_gather_into_tensor
 from sglang_tpu.hooks.attn_residual import (
     prepare_attn_residual_kernel,
     register_attn_residual_ops,
@@ -252,6 +253,11 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.distributed.parallel_state.GroupCoordinator.all_reduce",
         twolevel_all_reduce,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.distributed.parallel_state.GroupCoordinator.all_gather_into_tensor",
+        all_gather_into_tensor,
         HookType.AROUND,
     ),
     (
