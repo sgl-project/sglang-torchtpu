@@ -5,6 +5,7 @@ block, and KV pages map to logical blocks."""
 import ast
 import pathlib
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -13,8 +14,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs import sglang_bridge as bridge
+from sglang_tpu.k3_programs import sglang_step as step
 from sglang_tpu.k3_programs.kimi_k3 import pools
 from sglang_tpu.k3_programs.kimi_k3.layout import KDA, MLA, NUM_LAYERS
 
@@ -138,6 +141,61 @@ class TestMlaTable(CustomTestCase):
         )
         with self.assertRaisesRegex(ValueError, "cannot hold"):
             bridge.plan_pools(block * len(MLA) * 20, state_slots=8)
+
+
+class TestStepConversion(CustomTestCase):
+    def test_sampling_follows_sglang_encodings(self):
+        greedy = SimpleNamespace(
+            temperature=1.0, top_p=1.0, top_k=1, sampling_seed=None
+        )
+        spec = step.sampling_spec(greedy, "r1")
+        self.assertEqual((spec.temperature, spec.top_k), (0.0, 0))
+        sampled = SimpleNamespace(
+            temperature=0.7, top_p=0.9, top_k=TOP_K_ALL, sampling_seed=5
+        )
+        self.assertEqual(step.sampling_spec(sampled, "r1").as_tuple(), (0.7, 0.9, 0, 5))
+        topk = SimpleNamespace(temperature=1.0, top_p=1.0, top_k=20, sampling_seed=None)
+        # Unseeded: every rank derives the same seed from the request id.
+        a, b = step.sampling_spec(topk, "r9"), step.sampling_spec(topk, "r9")
+        self.assertEqual(a, b)
+        self.assertEqual(a.top_k, 20)
+
+    def test_request_input(self):
+        params = SimpleNamespace(
+            temperature=1.0, top_p=1.0, top_k=1, sampling_seed=None
+        )
+        tables = (np.zeros(4, np.int32),) * 4
+        req = step.request_input(
+            rid="r",
+            origin_input_ids=[1, 2, 3],
+            output_ids=[4],
+            computed=3,
+            scheduled=1,
+            block_tables=tables,
+            sampling_params=params,
+        )
+        self.assertEqual((req.end, req.num_tokens, req.num_prompt_tokens), (4, 4, 3))
+        self.assertEqual(req.token_ids.tolist(), [1, 2, 3, 4])
+        self.assertFalse(req.partial)
+        with self.assertRaisesRegex(ValueError, "exceed its 4 known tokens"):
+            step.request_input(
+                rid="r",
+                origin_input_ids=[1, 2, 3],
+                output_ids=[4],
+                computed=4,
+                scheduled=1,
+                block_tables=tables,
+                sampling_params=params,
+            )
+
+    def test_accepted_tokens(self):
+        tokens = np.array(
+            [[5, 6, 7, -1], [9, -1, -1, -1], [-1, -1, -1, -1], [1, 1, 1, 1]]
+        )
+        flat, lens = step.accepted(tokens, num_requests=3)
+        self.assertEqual((flat, lens), ([5, 6, 7, 9], [3, 1, 0]))
+        with self.assertRaisesRegex(ValueError, "not -1 padded"):
+            step.accepted(np.array([[-1, 4]]), num_requests=1)
 
 
 if __name__ == "__main__":
