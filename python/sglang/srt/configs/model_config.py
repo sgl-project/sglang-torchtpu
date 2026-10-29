@@ -1557,6 +1557,17 @@ class ModelConfig:
         kv_tensor_parallel_size = tensor_parallel_size // dcp_size
         return max(1, total_num_kv_heads // kv_tensor_parallel_size)
 
+    def get_total_swa_num_kv_heads(self) -> int:
+        """Global kv-head count of the sliding-window layers. Reads the same
+        attribute the TPU SWA sub-pool is sized from
+        (KVCacheConfigurator._build_tpu_swa_kv_pool); equals
+        get_total_num_kv_heads() when the model sets no SWA override."""
+        return getattr(
+            self.hf_text_config,
+            "swa_num_key_value_heads",
+            self.get_total_num_kv_heads(),
+        )
+
     def get_swa_num_kv_heads(self, tensor_parallel_size, dcp_size: int = 1) -> int:
         """Similar to get_num_kv_heads(), but for SWA."""
         if self.is_draft_model:

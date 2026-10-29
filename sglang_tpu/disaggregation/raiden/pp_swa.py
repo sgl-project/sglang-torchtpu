@@ -363,6 +363,7 @@ def register_twin(
                 swa,
                 dst_attn_tp,
                 int(transfer.manager.kv_args.total_kv_head_num),
+                int(transfer.manager.kv_args.total_swa_kv_head_num),
                 with_swa=True,
             ),
         )

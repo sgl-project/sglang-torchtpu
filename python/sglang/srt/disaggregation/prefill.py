@@ -324,6 +324,9 @@ class PrefillBootstrapQueue:
             kv_args.total_kv_head_num = (
                 self.scheduler.model_config.get_total_num_kv_heads()
             )
+            kv_args.total_swa_kv_head_num = (
+                self.scheduler.model_config.get_total_swa_num_kv_heads()
+            )
         kv_args.page_size = self.token_to_kv_pool.page_size
         kv_args.sliding_window_size = self.scheduler.sliding_window_size
 
