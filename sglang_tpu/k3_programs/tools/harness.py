@@ -69,14 +69,27 @@ def resolve_hosts(hosts: list[str], timeout: float = 1800.0) -> list[str]:
             time.sleep(10)
 
 
+def _topology(hosts: list[str]):
+    from sglang_tpu.node_normalization import TopologyConfig
+
+    return TopologyConfig(hosts=tuple(hosts), topology=(2, 2, 4, 2))
+
+
 def topological_node(hosts: list[str], host_index: int) -> int:
     """This pod's node rank in physical (z, y, x) host order, which device
     ids, and so the programs' kernel ranks, follow: its devices are kernel
     ranks ``8 * node .. 8 * node + 7``. Pod indices need not follow it."""
-    from sglang_tpu.node_normalization import TopologyConfig, query_node_rank
+    from sglang_tpu.node_normalization import query_node_rank
 
-    config = TopologyConfig(hosts=tuple(hosts), topology=(2, 2, 4, 2))
-    return query_node_rank(config, host_index, timeout=600)
+    return query_node_rank(_topology(hosts), host_index, timeout=600)
+
+
+def physical_host_order(hosts: list[str], host_index: int) -> list[int]:
+    """The pods in physical host order (all pods call it together), as
+    sglang's node normalization orders host ranks and SliceBuilder endpoints."""
+    from sglang_tpu.node_normalization import discover_host_order
+
+    return discover_host_order(_topology(hosts), host_index, timeout=600)
 
 
 def launch_pod(argv: list[str], extra_env: dict[str, str], per_host: int) -> int:
@@ -87,14 +100,15 @@ def launch_pod(argv: list[str], extra_env: dict[str, str], per_host: int) -> int
     hosts = os.environ["TPU_WORKER_HOSTNAMES"].split(",")
     if len(hosts) != 4:
         raise SystemExit(f"{len(hosts)} TPU hosts; the K3 programs need 4 (32 devices)")
-    node = int(os.environ.get("TPU_WORKER_ID", "0"))
-    if per_host == 1:
-        # Host-side tools (the pre-shard) name what they write by kernel rank.
-        pod = node
-        node = topological_node(hosts, pod)
-        log_host(
-            f"pod {pod} is topological node {node} (kernel ranks {8 * node}..{8 * node + 7})"
-        )
+    pod = int(os.environ.get("TPU_WORKER_ID", "0"))
+    # Host ranks follow physical host order: the pre-shard names its ranks by
+    # it, and torch_tpu's SliceBuilder endpoints must follow it.
+    order = physical_host_order(hosts, pod)
+    hosts = [hosts[i] for i in order]
+    node = order.index(pod)
+    log_host(
+        f"pod {pod} is topological node {node} (kernel ranks {8 * node}..{8 * node + 7})"
+    )
     env = dict(os.environ)
     env.update(extra_env)
     env.update(
