@@ -37,6 +37,8 @@ from sglang.srt.runtime_context import (
 from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_free_fence import HeldPages
+from sglang_tpu.kv_mxint8 import GROUP_SIZE as MXINT8_DEFAULT_GROUP_SIZE
+from sglang_tpu.kv_mxint8 import cache_bytes_per_token as mxint8_cache_bytes_per_token
 from sglang_tpu.kv_pool import (
     GB,
     TpuFusedMHATokenToKVPool,
@@ -161,6 +163,16 @@ def _kvc_unified_layout(kvc) -> UnifiedPageLayout:
     )
 
 
+def _mxint8_unified_bytes_per_token(kvc, layout: UnifiedPageLayout) -> int:
+    return mxint8_cache_bytes_per_token(
+        layout.page_head_num,
+        layout.page_head_dim,
+        kvc.pool_page_size,
+        group_size=kvc.kv_group_size or MXINT8_DEFAULT_GROUP_SIZE,
+        layout="blocked",
+    )
+
+
 def _unsupported_reason(kvc) -> Optional[str]:
     """Return a human-readable reason why ``kvc`` cannot use the TPU unified KV pool,
     or ``None`` when supported."""
@@ -225,10 +237,6 @@ def _unsupported_reason(kvc) -> Optional[str]:
             f"requires a TpuFusedMHATokenToKVPool subclass, got {pool_cls}.",
         ),
         (
-            kvc.kv_cache_dtype_str == "mxint8",
-            "does not support mxint8 KV cache.",
-        ),
-        (
             kvc.pool_page_size <= 1,
             f"requires page_size > 1, got {kvc.pool_page_size}.",
         ),
@@ -237,7 +245,9 @@ def _unsupported_reason(kvc) -> Optional[str]:
         if bad:
             return f"--enable-unified-memory on TPU {msg}"
     try:
-        _kvc_unified_layout(kvc)
+        layout = _kvc_unified_layout(kvc)
+        if kvc.kv_cache_dtype_str == "mxint8":
+            _mxint8_unified_bytes_per_token(kvc, layout)
     except (ValueError, NotImplementedError) as exc:
         return str(exc)
     return None
@@ -289,6 +299,7 @@ class TpuUnifiedSWAKVPool(BaseSWAKVPool):
         swa: AttnLayerSpec,
         device: str,
         token_to_kv_pool_class: type = TpuFusedMHATokenToKVPool,
+        pool_kwargs: Optional[dict] = None,
         start_layer: int = 0,
         enable_memory_saver: bool = False,
     ):
@@ -325,6 +336,9 @@ class TpuUnifiedSWAKVPool(BaseSWAKVPool):
             (max(0, self.layout.num_swa_groups - 1), num_blocks), dtype=torch.int32
         )
 
+        extra_kwargs = dict(pool_kwargs) if pool_kwargs else {}
+        if extra_kwargs.get("kv_cache_dtype_str") == "mxint8":
+            extra_kwargs["kv_layout"] = "blocked"
         self.kv_pool: TpuFusedMHATokenToKVPool = token_to_kv_pool_class(
             size=size,
             page_size=page_size,
@@ -335,7 +349,10 @@ class TpuUnifiedSWAKVPool(BaseSWAKVPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
             allocation_label="Unified",
+            **extra_kwargs,
         )
+        if "kv_layout" in extra_kwargs:
+            self.kv_layout = extra_kwargs["kv_layout"]
         self._swa_copy_kwargs = (
             {"allow_raiden_backup": False}
             if "allow_raiden_backup"
@@ -937,6 +954,8 @@ class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
 
     @staticmethod
     def _compute_full_per_token(kvc, layout: UnifiedPageLayout) -> int:
+        if kvc.kv_cache_dtype_str == "mxint8":
+            return _mxint8_unified_bytes_per_token(kvc, layout)
         return kvc._tpu_mha_pool_class().kv_bytes_per_token_per_layer(
             num_kv_heads=layout.page_head_num,
             head_dim=layout.page_head_dim,
@@ -1049,6 +1068,11 @@ def maybe_build_unified_kv_pool(
         ),
         device=kvc.device,
         token_to_kv_pool_class=kvc._tpu_mha_pool_class(),
+        pool_kwargs=(
+            (kvc._mxint8_pool_kwargs() or None)
+            if hasattr(kvc, "_mxint8_pool_kwargs")
+            else None
+        ),
         start_layer=kvc.layer_info.start_layer,
         enable_memory_saver=get_exec().features.enable_memory_saver,
     )
