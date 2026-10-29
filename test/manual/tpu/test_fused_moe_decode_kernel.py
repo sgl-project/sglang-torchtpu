@@ -20,7 +20,7 @@ from torch_tpu._internal.distributed import tpu_distributed  # noqa: F401
 
 import sglang_tpu.moe.pallas.fused_moe_decode.fused_moe_decode_op as fmd_op
 from sglang.srt.platforms import current_platform
-from sglang_tpu.moe.pallas.fused_moe_decode import (
+from sglang_tpu.moe.pallas.fused_moe_decode.fused_moe_decode_op import (
     apply_fused_moe_decode,
     prepare_moe_layer_for_fused_decode,
     should_use_fused_moe_decode,

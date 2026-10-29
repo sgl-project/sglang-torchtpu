@@ -1333,7 +1333,7 @@ class DeepseekV2MoE(nn.Module):
             and not use_vision_topk
             and not getattr(self, "is_hash", False)
         ):
-            from sglang_tpu.moe.pallas.fused_moe_decode import (
+            from sglang_tpu.moe.pallas.fused_moe_decode.fused_moe_decode_op import (
                 apply_fused_moe_decode,
                 should_use_fused_moe_decode,
             )
@@ -2892,7 +2892,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         _fmd_summed = False
         if _is_tpu and isinstance(self.mlp, DeepseekV2MoE):
-            from sglang_tpu.moe.pallas.fused_moe_decode import (
+            from sglang_tpu.moe.pallas.fused_moe_decode.fused_moe_decode_op import (
                 should_use_fused_moe_decode,
             )
 

@@ -1127,7 +1127,7 @@ class DefaultModelLoader(BaseModelLoader):
                 quant_method.process_weights_after_loading(module)
             _drain_device_transients_after_module_load()
         if target_device.type == "tpu":
-            from sglang_tpu.moe.pallas.fused_moe_decode import (
+            from sglang_tpu.moe.pallas.fused_moe_decode.fused_moe_decode_op import (
                 prepare_model_for_fused_moe_decode,
             )
 

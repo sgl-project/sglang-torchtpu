@@ -957,7 +957,7 @@ class Glm5NextDecoderLayer(nn.Module):
 
         _fmd_summed = False
         if isinstance(self.mlp, Glm5NextMoE) and hidden_states.device.type == "tpu":
-            from sglang_tpu.moe.pallas.fused_moe_decode import (
+            from sglang_tpu.moe.pallas.fused_moe_decode.fused_moe_decode_op import (
                 should_use_fused_moe_decode,
             )
 

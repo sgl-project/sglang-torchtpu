@@ -2677,7 +2677,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_mxfp8=self.use_mxfp8,
                 is_fp4_expert=self.is_fp4_expert,
             )
-            from sglang_tpu.moe.pallas.fused_moe_decode import (
+            from sglang_tpu.moe.pallas.fused_moe_decode.fused_moe_decode_op import (
                 prepare_fp8_fused_moe_decode,
             )
 
@@ -3044,7 +3044,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         moe_runner_config = self.moe_runner_config
 
         if _is_tpu:
-            from sglang_tpu.moe.pallas.fused_moe_decode import (
+            from sglang_tpu.moe.pallas.fused_moe_decode.fused_moe_decode_op import (
                 apply_routed_fused_moe_decode,
                 should_use_routed_fused_moe_decode,
             )
