@@ -364,12 +364,65 @@ class TestFusedMoEPaddedTokens(CustomTestCase):
                     self.assertTrue(np.all(np.isfinite(bad[others])))
                     np.testing.assert_array_equal(bad[others], clean[others])
 
-    def test_dense_permute_with_gather_unpermute(self):
-        # m < threshold <= m * topk: one-hot permute, gather combine.
-        for ep in (True, False):
-            for sc in (0, 1):
-                with self.subTest(ep=ep, sc=sc):
-                    self._check("bf16", "k3", 40, ep=ep, dense=True, sc=sc)
+    def test_permute_follows_the_gather_combine(self):
+        # m < threshold <= m * topk: the combine gathers, so the permute must
+        # too. A one-hot permute feeding the SparseCore combine gave wrong
+        # tokens on Kimi-K3 whenever moe_front or latent_up ran static fp8.
+        from sglang_tpu.moe.pallas import fused_moe_op
+
+        e_local, e_global, rank, topk, thr = ROUTES["k3"]
+        m = 40
+        self.assertLess(m, thr)
+        self.assertGreaterEqual(m * topk, thr)
+        w1, w2, kw, _ = self._weights_for("bf16", "k3")
+        rng = np.random.default_rng(m)
+        hidden = jnp.asarray(rng.standard_normal((m, H)), jnp.bfloat16)
+        for ep, sc in itertools.product((True, False), (0, 1)):
+            with self.subTest(ep=ep, sc=sc):
+                ids, w = _routing(m, ROUTES["k3"], ep, rng)
+                route_kw = (
+                    dict(
+                        global_num_experts=e_global, expert_group_offset=rank * e_local
+                    )
+                    if ep
+                    else {}
+                )
+
+                def run(threshold):
+                    # A fresh jit per call, so the spy sees the trace.
+                    fn = jax.jit(
+                        lambda h: fused_moe_op._fused_moe_jax(
+                            h,
+                            w1,
+                            w2,
+                            jnp.asarray(w, jnp.bfloat16),
+                            jnp.asarray(ids),
+                            kw["w1_scale"],
+                            kw["w2_scale"],
+                            None,
+                            None,
+                            topk,
+                            kw["act"],
+                            use_sc_gather=sc,
+                            w_quant_bits=kw["w_quant_bits"],
+                            permute_dense_threshold=threshold,
+                            **route_kw,
+                        )
+                    )
+                    with mock.patch.object(
+                        jax.nn, "one_hot", wraps=jax.nn.one_hot
+                    ) as one_hot:
+                        out = jax.block_until_ready(fn(hidden))
+                    classes = [call.args[1] for call in one_hot.call_args_list]
+                    return np.asarray(out.astype(jnp.float32)), classes
+
+                mixed, classes = run(thr)
+                # Traced (the group-size count is a one-hot over experts), with
+                # no one-hot over the m tokens.
+                self.assertTrue(classes)
+                self.assertNotIn(m, classes)
+                gather, _ = run(0)
+                np.testing.assert_array_equal(mixed, gather)
 
     def test_quantized_weights(self):
         cases = [
