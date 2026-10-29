@@ -418,9 +418,15 @@ async def _decode_dies_mid_stream(request):
 
 
 @pytest.mark.unit
-def test_decode_dying_mid_stream_reports_an_error(caplog):
+def test_decode_dying_mid_stream_reports_an_error(caplog, monkeypatch):
+    probed = []
+    monkeypatch.setattr(
+        MiniLoadBalancer, "request_health_probe", lambda self, url: probed.append(url)
+    )
     with caplog.at_level("ERROR", logger="sglang_router.mini_lb"):
         response, chunks, sessions = asyncio.run(_run(_stream, _decode_dies_mid_stream))
+    # Health routing re-checks the decode that broke, and only that one.
+    assert len(probed) == 1
     assert response.status_code == 200  # already committed when it broke
     body = b"".join(chunks)
     assert body.count(b'"text"') == 2
@@ -432,6 +438,7 @@ def test_decode_dying_mid_stream_reports_an_error(caplog):
     assert body.endswith(b"data: [DONE]\n\n")
     records = [r for r in caplog.records if r.name == "sglang_router.mini_lb"]
     assert len(records) == 1 and records[0].exc_info is None  # one line
+    assert probed[0] in records[0].getMessage()
     _assert_sessions_closed(sessions)
 
 

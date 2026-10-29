@@ -56,10 +56,11 @@ PREFILL_DRAIN_TIMEOUT_SECS = 60
 _background_tasks: set = set()
 
 
-def _spawn_background(coro) -> None:
+def _spawn_background(coro) -> asyncio.Task:
     task = asyncio.create_task(coro)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 async def _read_to_eof(response) -> None:
@@ -307,6 +308,29 @@ class MiniLoadBalancer:
             await asyncio.gather(
                 *(self._probe_health(session, url) for url in self._registered_urls())
             )
+
+    def request_health_probe(self, url: str) -> None:
+        """Probe `url` now instead of at the next poll.
+
+        Called when a backend breaks in the middle of a request, so routing
+        stops sending it traffic within one probe rather than one poll
+        interval. The probe decides, not the break: a transient error on a
+        healthy backend leaves it routable. No-op when health checks are off
+        or a requested probe of `url` is still in flight.
+        """
+        if getattr(self, "health_poll_interval_secs", None) is None:
+            return
+        # Kept in __dict__ so instances built without __init__ work too.
+        requested = self.__dict__.setdefault("_probes_requested", {})
+        probe = requested.get(url)
+        if probe is not None and not probe.done():
+            return
+        requested[url] = _spawn_background(self._probe_once(url))
+
+    async def _probe_once(self, url: str) -> None:
+        timeout = aiohttp.ClientTimeout(total=HEALTH_CHECK_TIMEOUT_SECS)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            await self._probe_health(session, url)
 
     async def _probe_health(self, session: aiohttp.ClientSession, url: str) -> None:
         """GET HEALTH_PROBE_PATH on `url` and route to it only if it answers 200."""
@@ -621,6 +645,8 @@ class MiniLoadBalancer:
                 # stream reports errors.
                 message = f"upstream {upstream} stream broke: {type(e).__name__}: {e}"
                 logger.error(f"[MiniLB] {message}")
+                # Let health routing (#1801) re-check this backend now.
+                self.request_health_probe(upstream)
                 yield _stream_error_event(message)
                 yield b"data: [DONE]\n\n"
             finally:
