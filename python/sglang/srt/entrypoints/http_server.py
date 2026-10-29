@@ -165,7 +165,11 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
-from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
+from sglang.srt.managers.tokenizer_manager import (
+    HealthCheckWaiter,
+    ServerStatus,
+    TokenizerManager,
+)
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.trace import (
     process_tracing_init,
@@ -767,9 +771,20 @@ async def health_generate(request: Request) -> Response:
             rid=rid, input_ids=[0], sampling_params=sampling_params, log_metrics=False
         )
 
+    tokenizer_manager = _global_state.tokenizer_manager
+    waiter = HealthCheckWaiter(event=asyncio.Event())
+    tokenizer_manager.health_check_waiters[rid] = waiter
+
     async def gen():
-        async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
-            break
+        try:
+            async for _ in tokenizer_manager.generate_request(gri, request):
+                break
+            waiter.resolve(True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Health check probe {rid} failed: {e}")
+            waiter.resolve(False)
 
     task = asyncio.create_task(gen())
     # A done callback, not an await: if the cancel below loses its race, the
@@ -777,28 +792,34 @@ async def health_generate(request: Request) -> Response:
     # awaiting it would add that to the probe's latency.
     task.add_done_callback(_retrieve_health_probe_outcome)
 
-    # As long as we receive any response from the detokenizer/scheduler, we consider the server is healthy.
+    # Healthy only when THIS probe is answered: its own first output, or the
+    # scheduler's HealthCheckOutput for its rid when the engine was busy. Another
+    # request's output or failure notification no longer counts.
     tic = time.time()
-    while time.time() < tic + HEALTH_CHECK_TIMEOUT:
-        await asyncio.sleep(1)
-        if _global_state.tokenizer_manager.last_receive_tstamp > tic:
-            task.cancel()
-            _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-            _global_state.tokenizer_manager.server_status = ServerStatus.Up
-            return Response(status_code=200)
+    try:
+        await asyncio.wait_for(waiter.event.wait(), timeout=HEALTH_CHECK_TIMEOUT)
+        healthy = waiter.ok
+    except asyncio.TimeoutError:
+        healthy = False
+    finally:
+        tokenizer_manager.health_check_waiters.pop(rid, None)
+        task.cancel()
+        tokenizer_manager.rid_to_state.pop(rid, None)
 
-    task.cancel()
+    if healthy:
+        tokenizer_manager.server_status = ServerStatus.Up
+        return Response(status_code=200)
+
     tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
     last_receive_time = time.strftime(
-        "%H:%M:%S", time.localtime(_global_state.tokenizer_manager.last_receive_tstamp)
+        "%H:%M:%S", time.localtime(tokenizer_manager.last_receive_tstamp)
     )
     logger.error(
-        f"Health check failed. Server couldn't get a response from detokenizer for last "
+        f"Health check failed. Probe {rid} got no answer of its own within "
         f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
-        f"last_heartbeat time: {last_receive_time}"
+        f"last message from the scheduler/detokenizer: {last_receive_time}"
     )
-    _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-    _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+    tokenizer_manager.server_status = ServerStatus.UnHealthy
     return Response(status_code=503)
 
 
