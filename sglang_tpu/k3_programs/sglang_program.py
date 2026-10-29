@@ -62,6 +62,19 @@ def install_kernel_config(text: str | None = None):
     return config.install(config.KernelConfig().replace(**fields))
 
 
+def parse_spec_schedule(text: str):
+    """``"1:8:7,9:16:3"`` as ``((1, 8, 7), (9, 16, 3))``; empty: the default."""
+    if not text.strip():
+        return sglang_config.DEFAULT_DSPARK_SCHEDULE
+    entries = []
+    for item in text.split(","):
+        parts = item.strip().split(":")
+        if len(parts) != 3:
+            raise ValueError(f"DSpark schedule entry {item!r} is not 'min:max:drafts'")
+        entries.append(tuple(int(p) for p in parts))
+    return tuple(entries)
+
+
 def _local_checkpoint(path: str) -> Path:
     """A checkpoint argument (directory or Hugging Face id) as its local
     directory, from the cache only."""
@@ -93,6 +106,9 @@ def server_engine_config():
         chunked_prefill_size=int(get_schedule().chunked_prefill_size),
         kv_cache_dtype=get_model().kv_cache_dtype,
         speculative_tokens=7 if role == "decode" else 0,
+        schedule=parse_spec_schedule(
+            tpu_envs.SGLANG_TPU_K3_PROGRAM_SPEC_SCHEDULE.get()
+        ),
         simulate_acc_lengths=parse_acc_lengths(
             tpu_envs.SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS.get()
         ),

@@ -94,6 +94,25 @@ class TestServerConfig(CustomTestCase):
             [w for w, _ in config.synthetic_acceptance_rates_by_width], [3, 7]
         )
 
+    def test_spec_schedule(self):
+        self.assertEqual(
+            sglang_program.parse_spec_schedule("1:8:7, 9:16:3"), ((1, 8, 7), (9, 16, 3))
+        )
+        self.assertEqual(sglang_program.parse_spec_schedule(""), ((1, 4, 7), (5, 8, 3)))
+        with self.assertRaisesRegex(ValueError, "min:max:drafts"):
+            sglang_program.parse_spec_schedule("1:8")
+        with (
+            _Patched(_server(max_running=16)),
+            tpu_envs.SGLANG_TPU_K3_PROGRAM_SPEC_SCHEDULE.override("1:8:7,9:16:3"),
+            tpu_envs.SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS.override(
+                "7:3.78,3:2.87"
+            ),
+        ):
+            config = sglang_program.server_engine_config()
+        self.assertEqual(
+            config.num_speculative_tokens_per_batch_size, ((1, 8, 7), (9, 16, 3))
+        )
+
     def test_server_settings_the_programs_need(self):
         with _Patched(_server(role="null")), self.assertRaisesRegex(ValueError, "P/D"):
             sglang_program.server_engine_config()

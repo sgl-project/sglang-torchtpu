@@ -131,6 +131,10 @@ class TpuEnvs:
     # prompt ends kept past their last full page, so a later prompt's radix match
     # continues inside the page. Each holds a KV block and a KDA state slot.
     SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS = EnvInt(0)
+    # The decode program's DSpark schedule, "min:max:drafts,..." per batch size
+    # (drafts 7 or 3 through batch 8, 3 through 16). Empty: 7 through four
+    # requests, 3 through eight.
+    SGLANG_TPU_K3_PROGRAM_SPEC_SCHEDULE = EnvStr("")
 
     # Host padding is unconditional; this routes speculative batches to the
     # experimental spec worker, which keeps their metadata on the host as well.
