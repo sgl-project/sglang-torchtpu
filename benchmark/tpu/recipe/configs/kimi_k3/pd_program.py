@@ -20,6 +20,8 @@ Environment:
                                     admits twice that, as vLLM-TorchTPU's AgentX
                                     sweep does
     K3_PROGRAM_CONTEXT              context length (default 1048576)
+    K3_PROGRAM_KV_DTYPE             fp8_e4m3 (default, as vLLM-TorchTPU's AgentX
+                                    sweep) or bf16
     SGLANG_TPU_K3_PROGRAM_PRESHARDED pre-sharded weights directory
 """
 
@@ -31,6 +33,9 @@ from benchmark.tpu.recipe.configs.kimi_k3.server import CONFIG as SERVER_CONFIG
 ROLE = os.environ.get("CI_PD_ROLE", "prefill")
 CONCURRENCY = int(os.environ.get("K3_PROGRAM_CONCURRENCY", "8"))
 CONTEXT_LENGTH = int(os.environ.get("K3_PROGRAM_CONTEXT", str(1 << 20)))
+KV_DTYPE = os.environ.get("K3_PROGRAM_KV_DTYPE") or "fp8_e4m3"
+# One logical block: 256 tokens on each of the 32 ranks in bf16, 512 in fp8.
+PAGE_SIZE = 32 * (512 if KV_DTYPE.startswith("fp8") else 256)
 # The decode admits twice the client concurrency; the prefill holds what it is
 # computing or transferring.
 RUNNING = max(4, 2 * CONCURRENCY) if ROLE == "decode" else max(4, CONCURRENCY)
@@ -56,8 +61,8 @@ server_args.update(
         "speculative_draft_model_path": "Inferact/Kimi-K3-DSpark",
         "disaggregation_mode": ROLE,
         "disaggregation_transfer_backend": "raiden",
-        # One logical block: 256 tokens on each of the 32 ranks (bf16 KV).
-        "page_size": 8192,
+        "kv_cache_dtype": KV_DTYPE,
+        "page_size": PAGE_SIZE,
         "context_length": CONTEXT_LENGTH,
         "chunked_prefill_size": PREFILL_CHUNK,
         "max_prefill_tokens": PREFILL_CHUNK,
