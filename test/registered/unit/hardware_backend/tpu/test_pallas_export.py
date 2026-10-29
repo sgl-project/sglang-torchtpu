@@ -362,6 +362,86 @@ class TestPallasExportEnvironment(CustomTestCase):
         self.assertNotEqual(native_keys[3], native_keys[4])
         self.assertEqual(len(registered), 3)
 
+    @unittest.skipUnless(
+        importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
+        "requires JAX and TorchTPU",
+    )
+    def test_export_stats_match_real_exports(self):
+        import jax
+        import torch
+
+        from sglang_tpu import pallas_export_stats, pallas_jax_op
+
+        def add_offset(value: jax.Array, offset: int) -> jax.Array:
+            return value + offset
+
+        def make_op(name):
+            wrapped = pallas_jax_op._CpuExportJaxCallable(
+                name=name,
+                jit_fn=jax.jit(add_offset, static_argnums=(1,)),
+                trace_key=name,
+                static_argnums=(1,),
+            )
+            wrapped.sglang_output_shardings = ()
+            wrapped.sglang_param_names = ("value", "offset")
+            return wrapped
+
+        env = patch.dict(
+            os.environ, {"SGLANG_TPU_PALLAS_EXPORT_STATIC_VARIANT_THRESHOLD": "4"}
+        )
+        env.start()
+        self.addCleanup(env.stop)
+        pallas_export_stats.reset_export_stats()
+        self.addCleanup(pallas_export_stats.reset_export_stats)
+        logger_name = pallas_export_stats.logger.name
+        registered = set()
+        value = torch.ones((8, 128), dtype=torch.float32)
+        native = pallas_jax_op.pallas_impl.tpu_torch_pallas
+        per_layer = make_op("sglang_tpu_test::per_layer_offset")
+        bounded = make_op("sglang_tpu_test::bounded_offset")
+        with (
+            patch.object(
+                pallas_export, "get_pallas_tpu_device_kind", return_value="TPU7x"
+            ),
+            patch.object(pallas_jax_op, "_torch_placeholder", return_value=value),
+            patch.object(
+                native,
+                "lookup_custom_kernel",
+                side_effect=lambda name, key: (name, key) in registered,
+            ),
+            patch.object(
+                native,
+                "register_custom_kernel",
+                side_effect=lambda name, key, **_: registered.add((name, key)),
+            ),
+            patch.object(native, "call_custom_kernel", return_value=[value]),
+            patch.object(
+                per_layer, "exported", wraps=per_layer.exported
+            ) as per_layer_export,
+            patch.object(bounded, "exported", wraps=bounded.exported) as bounded_export,
+        ):
+            # A layer-derived static: one export per layer, then hits.
+            with self.assertLogs(logger_name, level="WARNING") as logs:
+                for _ in range(2):
+                    for layer_index in range(6):
+                        per_layer(value, layer_index)
+            # A bounded schedule ID: the true variant count, then hits.
+            with self.assertNoLogs(logger_name, level="WARNING"):
+                for layer_index in range(6):
+                    bounded(value, layer_index % 2)
+
+        per_layer_stats = pallas_export_stats.get_export_stats(per_layer.name)
+        self.assertEqual((per_layer_stats.misses, per_layer_stats.hits), (6, 6))
+        self.assertEqual(per_layer_export.call_count, per_layer_stats.misses)
+        self.assertEqual(per_layer_stats.varying_static_args, {"offset": 6})
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("offset=5", logs.output[0])
+
+        bounded_stats = pallas_export_stats.get_export_stats(bounded.name)
+        self.assertEqual((bounded_stats.misses, bounded_stats.hits), (2, 4))
+        self.assertEqual(bounded_export.call_count, bounded_stats.misses)
+        self.assertEqual(bounded_stats.varying_static_args, {"offset": 2})
+
     @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
     def test_cpu_export_context_reports_and_restores_tpu_target(self):
         from jax._src.pallas.mosaic import tpu_info

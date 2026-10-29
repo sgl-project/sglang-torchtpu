@@ -36,6 +36,10 @@ class TpuEnvs:
     SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED = EnvBool(True)
     # Seconds between periodic trims. 0 turns the periodic trim off.
     SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC = EnvFloat(0.0)
+    # Warn once per cpu_export_jax_op op when one input shape exports more than
+    # this many static-arg variants (for example one per layer). 0 disables.
+    # Diagnostic only (see pallas_export_stats.py).
+    SGLANG_TPU_PALLAS_EXPORT_STATIC_VARIANT_THRESHOLD = EnvInt(16)
     # Kimi-K3: run these RMSNorm-fed dense decode GEMVs as fp8 W8A8 with a static
     # input scale (see kimi_k3/static_fp8.py). Comma-separated subset of
     # moe_front, latent_up, kda_qkvg, mla_qkv_a, or "all" (every validated part:
