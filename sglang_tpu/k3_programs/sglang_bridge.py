@@ -162,6 +162,13 @@ def mla_table_row(
             f"a req_to_token row of {len(req_to_token_row)} slots does not cover "
             f"{seq_len} tokens"
         )
+    if not pages.all():
+        # sglang never allocates page 0 (its padding page): these tokens have
+        # no KV slots, and the program would write them into the null block.
+        raise ValueError(
+            f"logical blocks {np.flatnonzero(pages == 0).tolist()} of the "
+            f"{seq_len} tokens are not allocated"
+        )
     row = np.zeros(width, np.int32)
     row[:used] = [plan.kv_block(int(p)) for p in pages]
     return row

@@ -50,12 +50,14 @@ def request_input(
     sampling_params: Any,
 ) -> RequestInput:
     """One request of a step: ``computed`` tokens already in the KV pools and
-    ``scheduled`` new ones (a decode step schedules one, the next token)."""
+    ``scheduled`` new ones. A decode step schedules the next token and the
+    batch's drafts: slots past the known tokens are draft slots, as vLLM pads
+    a decoding request to the speculative width."""
     token_ids = np.asarray([*origin_input_ids, *output_ids], dtype=np.int32)
-    if computed + scheduled > len(token_ids):
+    if scheduled and computed >= len(token_ids):
         raise ValueError(
-            f"request {rid}: {computed} computed + {scheduled} scheduled tokens "
-            f"exceed its {len(token_ids)} known tokens"
+            f"request {rid}: {computed} computed tokens leave none of its "
+            f"{len(token_ids)} known tokens to decode from"
         )
     return RequestInput(
         req_id=rid,

@@ -152,6 +152,9 @@ class TestMlaTable(CustomTestCase):
             bridge.mla_table_row(row, 2 * step + 1, plan, width=2)
         with self.assertRaisesRegex(ValueError, "does not cover"):
             bridge.mla_table_row(row[:step], 2 * step + 1, plan, width=4)
+        unallocated = np.concatenate([row, np.zeros(step, row.dtype)])
+        with self.assertRaisesRegex(ValueError, r"blocks \[3\] .* not allocated"):
+            bridge.mla_table_row(unallocated, 3 * step + 1, plan, width=4)
 
     def test_fp8_blocks_hold_twice_the_tokens(self):
         plan = bridge.UnifiedPoolPlan(40, 4, pools.cache_layout("fp8"))
@@ -204,7 +207,18 @@ class TestStepConversion(CustomTestCase):
         self.assertEqual((req.end, req.num_tokens, req.num_prompt_tokens), (4, 4, 3))
         self.assertEqual(req.token_ids.tolist(), [1, 2, 3, 4])
         self.assertFalse(req.partial)
-        with self.assertRaisesRegex(ValueError, "exceed its 4 known tokens"):
+        # Draft slots past the known tokens.
+        drafts = step.request_input(
+            rid="r",
+            origin_input_ids=[1, 2, 3],
+            output_ids=[4],
+            computed=3,
+            scheduled=8,
+            block_tables=tables,
+            sampling_params=params,
+        )
+        self.assertEqual((drafts.end, drafts.num_tokens), (11, 4))
+        with self.assertRaisesRegex(ValueError, "leave none of its 4 known"):
             step.request_input(
                 rid="r",
                 origin_input_ids=[1, 2, 3],
