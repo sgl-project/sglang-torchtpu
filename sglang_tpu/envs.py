@@ -115,6 +115,14 @@ class TpuEnvs:
     # Dev only: with the megakernel on, keep sglang's decoder layers (and its prefill path) for
     # A/B comparisons; the default lets the kernel own the decoder weights.
     SGLANG_TPU_K3_MEGAKERNEL_KEEP_SGLANG_WEIGHTS = EnvBool(False)
+    # Kimi-K3 programs (--speculative-algorithm K3_PROGRAM, sglang_tpu/k3_programs):
+    # the pre-sharded weights directory (python -m sglang_tpu.k3_programs.tools
+    # preshard k3 --output DIR), required.
+    SGLANG_TPU_K3_PROGRAM_PRESHARDED = EnvStr(None)
+    # Synthetic DSpark acceptance per draft width, "drafts:mean length,..." (bonus
+    # token included; InferenceX pins "7:3.78,3:2.87" for Kimi-K3). Empty
+    # verifies for real.
+    SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS = EnvStr("")
 
     # Host padding is unconditional; this routes speculative batches to the
     # experimental spec worker, which keeps their metadata on the host as well.

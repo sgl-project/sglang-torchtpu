@@ -21,6 +21,19 @@ k3_program_kv_layer_ids
        after the 93 layers) when that is the full-attention pool.
   Upstream PR or issue: <to be filed> (a pool-reported layer id list).
   Remove when: HybridLinearKVPool asks its full-attention pool for the ids.
+
+attach_k3_program
+  Why: the program owns the decoder weights (pre-sharded, read at load) and
+       must be resident before sglang sizes the KV pools from free HBM; the
+       model has no seam for a whole-model replacement.
+  How: AFTER KimiK3LinearForCausalLM.post_load_weights builds the program for
+       the server's P/D role and loads its weights (sglang_program). The
+       decoder layers are never built: hooks/k3_megakernel's weight
+       ownership covers K3_PROGRAM (skip_k3_decoder_layers,
+       load_k3_non_layer_weights).
+  Upstream PR or issue: <to be filed> (a model-level seam to replace a decoder
+       stack's layers and forward).
+  Remove when: that seam exists.
 """
 
 from __future__ import annotations
@@ -53,6 +66,31 @@ def k3_program_kv_layer_ids(original, pool: Any, *args, **kwargs) -> list[int]:
     return original(pool, *args, **kwargs)
 
 
+def k3_program_active() -> bool:
+    """Whether this server runs K3_PROGRAM (from the runtime context; no
+    published configuration, as before server arguments resolve: no)."""
+    from sglang.srt.runtime_context import get_context, get_spec
+    from sglang_tpu.k3_programs.sglang_worker import ALGORITHM
+
+    if not get_context().is_config_namespace_published("spec"):
+        return False
+    return str(get_spec().speculative_algorithm or "").upper() == ALGORITHM
+
+
+def attach_k3_program(result: None, causal_lm: Any, *args, **kwargs) -> None:
+    """AFTER KimiK3LinearForCausalLM.post_load_weights."""
+    if not k3_program_active():
+        return
+    from sglang_tpu.k3_programs.sglang_program import build_from_server
+
+    causal_lm.model._k3_program = build_from_server()
+    causal_lm.model._derived_weight_cache_error = (
+        "Online weight updates are not supported with K3_PROGRAM: the program "
+        "reads pre-sharded weights at load time. Restart the server to change "
+        "weights."
+    )
+
+
 def hook_specs() -> list[tuple]:
     from sglang.srt.plugins.hook_registry import HookType
 
@@ -66,5 +104,10 @@ def hook_specs() -> list[tuple]:
             "sglang.srt.mem_cache.memory_pool.HybridLinearKVPool.get_kv_layer_ids",
             k3_program_kv_layer_ids,
             HookType.AROUND,
+        ),
+        (
+            "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
+            attach_k3_program,
+            HookType.AFTER,
         ),
     ]

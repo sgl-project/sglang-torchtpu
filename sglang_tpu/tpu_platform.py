@@ -800,10 +800,9 @@ def _validate_decode_context_parallel(server_args) -> None:
 
 def _k3_program_selected() -> bool:
     """Whether the Kimi-K3 megakernel programs serve (K3_PROGRAM)."""
-    from sglang.srt.runtime_context import get_spec
-    from sglang_tpu.k3_programs.sglang_worker import ALGORITHM
+    from sglang_tpu.hooks.k3_program import k3_program_active
 
-    return str(get_spec().speculative_algorithm or "").upper() == ALGORITHM
+    return k3_program_active()
 
 
 def _experimental_spec_enabled() -> bool:

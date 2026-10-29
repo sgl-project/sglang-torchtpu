@@ -240,6 +240,9 @@ def register() -> None:
 
     if ALGORITHM in _REGISTRY:
         return
+    from sglang_tpu.k3_programs.sglang_program import build_decode_steps
+
+    K3ProgramWorker.build_steps = build_decode_steps
 
     @SpeculativeAlgorithm.register(ALGORITHM, spec_class=K3ProgramAlgo)
     def _factory(server_args):
