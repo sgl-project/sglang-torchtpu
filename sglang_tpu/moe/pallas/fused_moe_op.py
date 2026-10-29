@@ -723,9 +723,15 @@ def _fused_moe_jax(
             ragged_gather_v2,
         )
 
-        n_sorted = sorted_token_ids.shape[0]
-        gather_start = jnp.array([0], dtype=jnp.int32)
-        gather_end = jnp.array([n_sorted], dtype=jnp.int32)
+        if no_combine and use_group_offset:
+            gather_start, gather_end = row_start, row_end
+        elif no_combine:
+            # Dropped slots sort after every expert and are never read by GMM1.
+            gather_start = jnp.zeros((), dtype=jnp.int32)
+            gather_end = jnp.sum(topk_ids_flat < num_experts, dtype=jnp.int32)
+        else:
+            gather_start = jnp.array([0], dtype=jnp.int32)
+            gather_end = jnp.array([sorted_token_ids.shape[0]], dtype=jnp.int32)
         x_sorted = ragged_gather_v2(
             hidden_states,
             sorted_token_ids,
