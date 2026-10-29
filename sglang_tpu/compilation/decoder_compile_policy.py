@@ -1461,7 +1461,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         # the extend graph the backend has always compiled.
         extend_capture_hidden_mode = (
             CaptureHiddenMode.FULL
-            if envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
+            if tpu_envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
             else CaptureHiddenMode.NULL
         )
         logger.info(

@@ -17,13 +17,13 @@ import os
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import print_warning_once
+from sglang_tpu.envs import envs
 
 
 def _free_replaced_storage(old: torch.Tensor, new: torch.Tensor) -> None:

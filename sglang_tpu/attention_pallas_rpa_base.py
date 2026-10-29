@@ -40,7 +40,6 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
@@ -65,6 +64,7 @@ from sglang_tpu.cp_forward import (
     get_tpu_cp_layout,
 )
 from sglang_tpu.cp_layout import TpuCpHostLayout
+from sglang_tpu.envs import envs
 from sglang_tpu.host_metadata_cache import HostMetadataCache
 from sglang_tpu.kv_row_write import (
     get_write_rows_op,

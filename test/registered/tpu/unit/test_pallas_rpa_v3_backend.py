@@ -34,7 +34,6 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -48,6 +47,7 @@ from sglang_tpu.attention_pallas_rpa_v3 import (
     TpuPallasRpaV3AttnBackend,
     _invoke_v3_kernel,
 )
+from sglang_tpu.envs import envs
 from sglang_tpu.host_metadata_cache import HostMetadataCache
 
 

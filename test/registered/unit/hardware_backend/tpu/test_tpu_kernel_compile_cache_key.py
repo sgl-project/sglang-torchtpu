@@ -41,7 +41,7 @@ class TestKernelInputsDigest(CustomTestCase):
         self.write("sglang_tpu/attention/pallas/kernel.py", "block = 128\n")
         self.write(
             "sglang_tpu/moe/pallas/gmm.py",
-            "FP32 = envs.SGLANG_TPU_FP8_MOE_FP32_SCALES.get()\n",
+            "FP32 = tpu_envs.SGLANG_TPU_FP8_MOE_FP32_SCALES.get()\n",
         )
         self.write(
             "sglang/srt/layers/moe/tpu_moe_utils.py",
@@ -52,7 +52,7 @@ class TestKernelInputsDigest(CustomTestCase):
         )
         self.write(
             "sglang_tpu/monitor.py",
-            "CHECK = envs.SGLANG_TPU_CHECK_RECOMPILATION.get()\n",
+            "CHECK = tpu_envs.SGLANG_TPU_CHECK_RECOMPILATION.get()\n",
         )
         enter_scope(
             self,
@@ -64,8 +64,8 @@ class TestKernelInputsDigest(CustomTestCase):
                 },
             ),
         )
-        enter_scope(self, envs.SGLANG_TPU_CHECK_RECOMPILATION.override(False))
-        enter_scope(self, envs.SGLANG_TPU_FP8_MOE_FP32_SCALES.override(False))
+        enter_scope(self, tpu_envs.SGLANG_TPU_CHECK_RECOMPILATION.override(False))
+        enter_scope(self, tpu_envs.SGLANG_TPU_FP8_MOE_FP32_SCALES.override(False))
         enter_scope(self, envs.SGLANG_TPU_INT4_MOE_MODE.override(None))
         enter_scope(self, tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False))
         self.versions = {"jax": "0.10.2", "jaxlib": "0.10.2", "libtpu": "0.0.47"}
@@ -169,7 +169,7 @@ class TestKernelInputsDigest(CustomTestCase):
 
     def test_env_knobs_that_change_no_program_stay_out_of_the_digest(self):
         # The recompile monitor is read in a hashed file but is not keyed.
-        with envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True):
+        with tpu_envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True):
             self.assertEqual(self.digest(), self.base)
 
     def test_unkeyed_env_knobs_are_all_read_by_the_kernel_sources(self):
@@ -182,7 +182,7 @@ class TestKernelInputsDigest(CustomTestCase):
             self.assertTrue(hasattr(envs, name) or hasattr(tpu_envs, name), name)
 
     def test_env_knobs_read_by_kernel_sources_change_the_digest(self):
-        with envs.SGLANG_TPU_FP8_MOE_FP32_SCALES.override(True):
+        with tpu_envs.SGLANG_TPU_FP8_MOE_FP32_SCALES.override(True):
             self.assertNotEqual(self.digest(), self.base)
         with envs.SGLANG_TPU_INT4_MOE_MODE.override("vmem-bf16"):
             self.assertNotEqual(self.digest(), self.base)
