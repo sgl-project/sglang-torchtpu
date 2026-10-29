@@ -112,11 +112,14 @@ def _fill(layer, heads, sal=False):
     return raw[0].flatten(), live[0].flatten()
 
 
-def _replay(full_heads, swa_heads, src_tp, dst_tp, *, dtype, swa, sal=False):
+def _replay(
+    full_heads, swa_heads, src_tp, dst_tp, *, dtype, swa, sal=False, land=False
+):
     """Replay a push reshard byte for byte over real pool pages, each side
     building its geometry with _make_geometry. True when every decode rank
     holds exactly its own heads with no out-of-bounds copy; LandRequired when
-    no whole-granule schedule exists."""
+    no whole-granule schedule exists. With ``land``, LandEntry contributions
+    write a scratch page that land_merge folds into the final page."""
     total = swa_heads if swa else full_heads
     sender = _manager(dtype, full_heads, swa_heads, src_tp, sal=sal)
     receiver = _manager(dtype, full_heads, swa_heads, dst_tp, sal=sal)
@@ -127,26 +130,39 @@ def _replay(full_heads, swa_heads, src_tp, dst_tp, *, dtype, swa, sal=False):
 
     send_geom = sender._make_geometry(src_tp, dst_tp, swa=swa)
     recv_geom = receiver._make_geometry(src_tp, dst_tp, swa=swa)
+    if land:
+        send_geom, recv_geom = send_geom.with_land(), recv_geom.with_land()
     for dst_rank in range(dst_tp):
         want, live = _fill(
             layer(receiver).clone(), _rank_heads(total, dst_tp, dst_rank), sal
         )
         got = torch.full_like(want, 0xFF)
+        scratch = torch.full_like(want, 0xFF)
+        landed = False
         ratio = send_geom.ratio
         for src_rank in range(dst_rank * ratio, (dst_rank + 1) * ratio):
             src, _ = _fill(
                 layer(sender).clone(), _rank_heads(total, src_tp, src_rank), sal
             )
-            src_off, size, src_stride, _, _ = send_geom.entry_bytes(src_rank, dst_rank)
-            _, _, _, dst_off, dst_stride = recv_geom.entry_bytes(src_rank, dst_rank)
+            sent = send_geom.entry_bytes(src_rank, dst_rank)
+            recv = recv_geom.entry_bytes(src_rank, dst_rank)
+            if isinstance(sent, rs.LandEntry) != isinstance(recv, rs.LandEntry):
+                return False
+            src_off, size, src_stride, _, _ = sent
+            _, _, _, dst_off, dst_stride = recv
+            out = scratch if isinstance(recv, rs.LandEntry) else got
+            landed |= out is scratch
             count = send_geom.count_for(page)
             if recv_geom.count_for(page) != count:
                 return False
             for t in range(count):
                 a, b = src_off + t * src_stride, dst_off + t * dst_stride
-                if a + size > src.numel() or b + size > got.numel():
+                if a + size > src.numel() or b + size > out.numel():
                     return False
-                got[b : b + size] = src[a : a + size]
+                out[b : b + size] = src[a : a + size]
+        if landed:
+            shape = layer(receiver).shape[1:]
+            rs.land_merge(got.view(shape), scratch.view(shape), recv_geom.layout)
         if not torch.equal(got[live], want[live]):
             return False
     return True
@@ -373,6 +389,67 @@ class TestKVLayoutGeometry(unittest.TestCase):
         for src_rank in (0, 1):
             with self.assertRaises(LandRequired):
                 geom.entry_bytes(src_rank, 0)
+        # With landing, the second source lands its granule in scratch
+        # granule 0 and the first copies directly: its padding sits in final
+        # slots 2-3, which the merge overwrites.
+        land = ReshardGeometry.from_layout(8, 4, fp8, 8, land=True)
+        direct, landed = land.entry_bytes(0, 0), land.entry_bytes(1, 0)
+        self.assertNotIsInstance(direct, rs.LandEntry)
+        self.assertEqual(direct, (0, 512, 512, 0, 512))
+        self.assertEqual(landed, rs.LandEntry(0, 512, 512, 0, 512))
+        self.assertTrue(rs.land_plan_exact(land))
+        # 1 -> 4 (16 kv heads at TP16 -> TP4): head j lands in granule j // 2.
+        land = ReshardGeometry.from_layout(16, 4, fp8, 16, land=True)
+        self.assertEqual(
+            [land.entry_bytes(p, 0) for p in range(4)],
+            [(0, 512, 512, 0, 1024), rs.LandEntry(0, 512, 512, 0, 1024)]
+            + [(0, 512, 512, 512, 1024), rs.LandEntry(0, 512, 512, 512, 1024)],
+        )
+        self.assertTrue(rs.land_plan_exact(land))
+        # Landing does not change a cell that needs none.
+        for heads in (4, 16):
+            plain = ReshardGeometry.from_layout(8, 4, fp8, heads)
+            land = ReshardGeometry.from_layout(8, 4, fp8, heads, land=True)
+            self.assertEqual(
+                rs._typed(rs._schedule(land)), rs._typed(rs._schedule(plain))
+            )
+
+    def test_land_scope(self):
+        fp8 = KVLayoutGeometry(rs.TOKEN_MAJOR, 4, 1, 1, 128, 64)
+        # 3-head sources (24 kv heads at TP8 -> TP4) still need more than the
+        # merge's one slot move.
+        land = ReshardGeometry.from_layout(8, 4, fp8.with_heads(3), 24, land=True)
+        for src_rank in (0, 1):
+            with self.assertRaises(LandRequired):
+                land.entry_bytes(src_rank, 0)
+        self.assertFalse(rs.land_plan_exact(land))
+        # An odd decode head count leaves the last granule's slots 2-3 with
+        # no landed head (6 kv heads at TP6 -> TP2).
+        self.assertFalse(
+            rs.land_plan_exact(ReshardGeometry.from_layout(6, 2, fp8, 6, land=True))
+        )
+        # bf16 and SEQ_ALONG_LANE never land.
+        bf16 = KVLayoutGeometry(rs.TOKEN_MAJOR, 2, 2, 1, 128, 64)
+        self.assertFalse(
+            rs.land_plan_exact(ReshardGeometry.from_layout(8, 4, bf16, 8, land=True))
+        )
+        with self.assertRaises(ValueError):
+            rs.land_merge_slots(bf16)
+        self.assertEqual(rs.land_merge_slots(fp8), (slice(2, 4), slice(0, 2)))
+
+    def test_land_merge_moves_one_slot_pair_per_granule(self):
+        fp8 = KVLayoutGeometry(rs.TOKEN_MAJOR, 4, 1, 2, 128, 64)
+        final = np.arange(3 * 64 * 1 * 4 * 128).reshape(3, 64, 1, 4, 128)
+        scratch = -final
+        merged = rs.land_merge(final.copy(), scratch, fp8)
+        np.testing.assert_array_equal(merged[..., :2, :], final[..., :2, :])
+        np.testing.assert_array_equal(merged[..., 2:, :], scratch[..., :2, :])
+        pool = torch.arange(2 * 64 * 4 * 128, dtype=torch.int32).to(torch.uint8)
+        pool = pool.view(2, 64, 1, 4, 128)
+        want = pool.clone()
+        want[0, :, :, 2:4] = pool[1, :, :, 0:2]
+        rs.land_merge(pool[0], pool[1].clone(), fp8)
+        self.assertTrue(torch.equal(pool, want))
 
     def test_rpa_batched_page_floor(self):
         """The SEQ_ALONG_LANE cells allowed here assume pages are a multiple of
@@ -461,6 +538,28 @@ def _allowed(layout, itemsize, src_tp, dst_tp, held, geom_heads, head_dim, page)
     return True
 
 
+def _land_allowed(layout, itemsize, src_tp, dst_tp, held, geom_heads, head_dim, page):
+    """Both sides' push_reshard_refusal with land_ok, for a layer holding
+    ``held`` global heads under a geometry built for ``geom_heads``."""
+    for own_tp in (dst_tp, src_tp):
+        heads = max(1, held // own_tp)
+        t = _Tensor(_shape(layout, itemsize, heads, head_dim, page), itemsize)
+        geom = _side_geometry(layout, t, heads, src_tp, dst_tp, geom_heads, page)
+        reason = rs.push_reshard_refusal(
+            geom,
+            t.shape,
+            itemsize,
+            total_heads=held,
+            own_tp=own_tp,
+            page_size=page,
+            seq_along_lane=layout == "HND",
+            land_ok=True,
+        )
+        if reason is not None:
+            return False
+    return True
+
+
 def _global_heads(rank, tp, total):
     if total >= tp:
         return [rank * (total // tp) + i for i in range(total // tp)]
@@ -518,76 +617,150 @@ class _Tampered:
 
 
 def _push_correct(
-    layout, itemsize, src_tp, dst_tp, held, geom_heads, head_dim, page, tamper=None
+    layout,
+    itemsize,
+    src_tp,
+    dst_tp,
+    held,
+    geom_heads,
+    head_dim,
+    page,
+    tamper=None,
+    land=False,
+    merge=True,
+    scratch_pairs=None,
 ):
     """Replay the legacy push byte for byte: the sender sends at most its block
     of the entry's chunks, the receiver writes exactly what was sent. False
-    when no whole-granule schedule exists."""
+    when no whole-granule schedule exists. With ``land`` both sides classify
+    landing contributions, which go to a scratch block merged afterwards
+    (unless ``merge`` is False)."""
     s_h, d_h = max(1, held // src_tp), max(1, held // dst_tp)
     src_t = _Tensor(_shape(layout, itemsize, s_h, head_dim, page), itemsize)
     dst_t = _Tensor(_shape(layout, itemsize, d_h, head_dim, page), itemsize)
     gsrc = _side_geometry(layout, src_t, s_h, src_tp, dst_tp, geom_heads, page)
     gdst = _side_geometry(layout, dst_t, d_h, src_tp, dst_tp, geom_heads, page)
+    if land:
+        gsrc, gdst = gsrc.with_land(), gdst.with_land()
     if tamper is not None:
         gsrc, gdst = _Tampered(gsrc, tamper), _Tampered(gdst, tamper)
     try:
         return _replay_requests(
-            layout, itemsize, src_tp, dst_tp, held, head_dim, page, gsrc, gdst
+            layout,
+            itemsize,
+            src_tp,
+            dst_tp,
+            held,
+            head_dim,
+            page,
+            gsrc,
+            gdst,
+            merge=merge,
+            scratch_pairs=scratch_pairs,
         )
     except LandRequired:
         return False
 
 
+# Decode block ids per page: finals ascend, scratch descends, so pairing a
+# final with the wrong page's scratch block cannot pass by coincidence.
+_FINAL, _SCRATCH = (3, 9), (11, 7)
+_PAGE_LABEL = 1 << 40  # added to page i's nonzero labels, above any byte label
+
+
+def _paged(labels, i):
+    return np.where(labels != 0, labels + i * _PAGE_LABEL, 0)
+
+
 def _replay_requests(
-    layout, itemsize, src_tp, dst_tp, held, head_dim, page, gsrc, gdst
+    layout,
+    itemsize,
+    src_tp,
+    dst_tp,
+    held,
+    head_dim,
+    page,
+    gsrc,
+    gdst,
+    merge=True,
+    scratch_pairs=None,
 ):
+    """Replay built requests over len(_FINAL) pages: entries write the block
+    their dst_block_id names, read the source page their src_block_id names,
+    and a plan that wrote scratch is merged page by page with land_merge (the
+    device merge's CPU stand-in), final i with scratch_pairs[i] (default
+    _SCRATCH[i], the pairing land_prepass uses)."""
+    pages = len(_FINAL)
+    scratch_pairs = scratch_pairs or _SCRATCH
     ratio = rs.reshard_ratio(src_tp, dst_tp)
     s_h, d_h = max(1, held // src_tp), max(1, held // dst_tp)
     src_t = _Tensor(_shape(layout, itemsize, s_h, head_dim, page), itemsize)
     src_block = int(np.prod(src_t.shape[1:])) * itemsize
+    dst_shape = _shape(layout, itemsize, d_h, head_dim, page)
     for d in range(dst_tp):
-        expect = _labels(
+        base = _labels(
             layout, itemsize, d_h, _global_heads(d, dst_tp, held), head_dim, page
         )
-        got = np.zeros(expect.size * 8, dtype=np.int64)
+        size = base.size
+        blocks = {b: np.zeros(size * 8, np.int64) for b in _FINAL + _SCRATCH}
         srcs = rs.source_ranks_for(d, ratio)
         rreq = rs.build_receiver_request(
             _Pb2, uuid=1, req_id="x", peer="d", decode_rank=d, geom=gdst,
-            sources=[(p, [0]) for p in srcs], dst_block_ids=[0], live_tokens=[page],
+            sources=[(p, list(range(pages))) for p in srcs],
+            dst_block_ids=list(_FINAL), live_tokens=[page] * pages,
+            scratch_block_ids=list(_SCRATCH),
         )  # fmt: skip
         for p in srcs:
-            sent = _labels(
+            labels = _labels(
                 layout, itemsize, s_h, _global_heads(p, src_tp, held), head_dim, page
             )
-            sent = np.concatenate([sent, np.full(sent.size * 8, -1, np.int64)])
+            sent = [
+                np.concatenate([_paged(labels, i), np.full(labels.size * 8, -1)])
+                for i in range(pages)
+            ]
             sreq = rs.build_sender_request(
                 _Pb2, uuid=1, req_id="x", peer="d", prefill_rank=p, decode_rank=d,
-                geom=gsrc, src_block_ids=[0], dst_block_ids=[0], live_tokens=[page],
+                geom=gsrc, src_block_ids=list(range(pages)),
+                dst_block_ids=list(_FINAL), live_tokens=[page] * pages,
+                scratch_block_ids=list(_SCRATCH),
             )  # fmt: skip
-            sidx = np.concatenate(
-                [
-                    _chunks(
-                        e.src_offset_bytes, e.size_bytes, e.src_stride_bytes, e.count
-                    )
-                    for e in sreq.shard_push_schedules[0].entries
-                ]
-            )[:src_block]
-            didx = np.concatenate(
-                [
-                    _chunks(
-                        e.dst_offset_bytes, e.size_bytes, e.dst_stride_bytes, e.count
-                    )
-                    for e in rreq.shard_push_schedules[p].entries
-                ]
-            )
-            if didx.size < sidx.size:
+            sent_entries = sreq.shard_push_schedules[0].entries
+            recv_entries = rreq.shard_push_schedules[p].entries
+            # tpu-sync pairs a pushed chunk with the receiver entry of the same
+            # (dst block, src block).
+            if [(e.dst_block_id, e.src_block_id) for e in sent_entries] != [
+                (e.dst_block_id, e.src_block_id) for e in recv_entries
+            ]:
                 return False
-            got[didx[: sidx.size]] = sent[sidx]
-        if got[expect.size :].any():
+            for se, re in zip(sent_entries, recv_entries):
+                sidx = _chunks(
+                    se.src_offset_bytes, se.size_bytes, se.src_stride_bytes, se.count
+                )[:src_block]
+                didx = _chunks(
+                    re.dst_offset_bytes, re.size_bytes, re.dst_stride_bytes, re.count
+                )
+                if didx.size < sidx.size:
+                    return False
+                blocks[re.dst_block_id][didx[: sidx.size]] = sent[se.src_block_id][sidx]
+        if any(blocks[b][size:].any() for b in blocks):
             return False
-        mask = expect != 0
-        if not np.array_equal(got[: expect.size][mask], expect[mask]):
-            return False
+        landed = any(
+            e.dst_block_id in _SCRATCH
+            for s in rreq.shard_push_schedules.values()
+            for e in s.entries
+        )
+        for i, (f, s) in enumerate(zip(_FINAL, scratch_pairs)):
+            got = blocks[f]
+            if landed and merge:
+                rs.land_merge(
+                    got[:size].reshape(dst_shape[1:]),
+                    blocks[s][:size].reshape(dst_shape[1:]),
+                    gdst.layout,
+                )
+            expect = _paged(base, i)
+            mask = expect != 0
+            if not np.array_equal(got[:size][mask], expect[mask]):
+                return False
     return True
 
 
@@ -631,6 +804,20 @@ class TestPushReshardRefusal(unittest.TestCase):
         # 2 -> 4 fp8 heads per rank: each source fills whole granules.
         fp8_4 = _layer(_FP8, 4)
         self.assertIsNone(self._decode([fp8_4], [4], total_heads=16))
+        # 1 -> 2 fp8 heads per rank lands; the managers still refuse it.
+        mgr = _refusal_manager([fp8_2], [2], 4, total_heads=8)
+        kwargs = dict(total_heads=8, own_tp=4, page_size=64, seq_along_lane=False)
+        geom = mgr._make_geometry(8, 4)
+        refused = rs.push_reshard_refusal(geom, fp8_2.shape, 1, **kwargs)
+        self.assertEqual(refused, self._decode([fp8_2], [2], total_heads=8))
+        self.assertIn("landing buffer", refused)
+        self.assertEqual(
+            rs.push_reshard_refusal(geom, fp8_2.shape, 1, land_ok=False, **kwargs),
+            refused,
+        )
+        self.assertIsNone(
+            rs.push_reshard_refusal(geom, fp8_2.shape, 1, land_ok=True, **kwargs)
+        )
 
     def test_layout_and_limits(self):
         mla = torch.zeros(4, 64, 576, dtype=torch.bfloat16)
@@ -740,6 +927,13 @@ class TestPushReshardBytes(unittest.TestCase):
         ("NHD", 1, 8, 4, 8, 8, 128, 64, False),
         ("NHD", 1, 2, 1, 2, 2, 128, 64, False),
         ("NHD", 1, 16, 4, 16, 16, 128, 64, False),
+        # Issue #829 (jcc arm H): 4 kv heads at TP8 -> TP2, replicated sources.
+        ("NHD", 1, 8, 2, 4, 4, 128, 64, False),
+        ("NHD", 1, 8, 2, 4, 4, 128, 256, False),
+        # 480B shape: 8 kv heads at TP8 -> TP4, head_dim 64, page 256.
+        ("NHD", 1, 8, 4, 8, 8, 64, 256, False),
+        # 3-head sources: no single slot move places them.
+        ("NHD", 1, 8, 4, 24, 24, 128, 64, False),
         # Spec §3.2 counterexample: shape-only heads would allow it.
         ("NHD", 1, 8, 4, 8, 4, 128, 64, False),
         ("NHD", 2, 8, 4, 16, 8, 128, 64, False),
@@ -767,12 +961,110 @@ class TestPushReshardBytes(unittest.TestCase):
         ("HND", 2, 8, 4, 16, 8, 128, 256, False),
     ]
 
+    # CASES that a scratch block and land_merge make exact.
+    LANDS = {
+        ("NHD", 1, 8, 4, 8, 8, 128, 64),
+        ("NHD", 1, 2, 1, 2, 2, 128, 64),
+        ("NHD", 1, 16, 4, 16, 16, 128, 64),
+        ("NHD", 1, 8, 2, 4, 4, 128, 64),
+        ("NHD", 1, 8, 2, 4, 4, 128, 256),
+        ("NHD", 1, 8, 4, 8, 8, 64, 256),
+    }
+
     def test_verdict_matches_bytes(self):
         for case in self.CASES:
             *args, exact = case
             with self.subTest(case=case):
                 self.assertEqual(_push_correct(*args), exact)
                 self.assertEqual(_allowed(*args), exact)
+
+    def test_land_verdict_matches_merged_bytes(self):
+        """With landing allowed, the predicate allows a cell iff the replay
+        through scratch blocks and land_merge is exact; the managers (no
+        land_ok yet) keep refusing the landing cells."""
+        self.assertLessEqual(self.LANDS, {tuple(c[:-1]) for c in self.CASES})
+        for case in self.CASES:
+            *args, exact = case
+            want = exact or tuple(args) in self.LANDS
+            with self.subTest(case=case):
+                self.assertEqual(_push_correct(*args, land=True), want)
+                self.assertEqual(_land_allowed(*args), want)
+                if tuple(args) in self.LANDS:
+                    self.assertFalse(_allowed(*args))
+                    # Negative control: skipping the merge leaves source
+                    # padding on the odd heads.
+                    self.assertFalse(_push_correct(*args, land=True, merge=False))
+                    # Negative control: merging each final page with the
+                    # other page's scratch block crosses page labels.
+                    crossed = _SCRATCH[::-1]
+                    self.assertFalse(
+                        _push_correct(*args, land=True, scratch_pairs=crossed)
+                    )
+
+    def test_land_fp8_sweep(self):
+        """Every fp8 token-major fan-in cell: allowed with land_ok iff the
+        merged replay is exact, and allowed without it iff the plain replay
+        is; the landing class is exactly the one-head sources into an even
+        decode head count."""
+        landed = 0
+        for held, src_tp, dst_tp in itertools.product(
+            (1, 2, 4, 8, 16, 32), (2, 4, 8, 16), (1, 2, 4, 8)
+        ):
+            if src_tp <= dst_tp or src_tp % dst_tp:
+                continue
+            for head_dim, page in ((128, 64), (64, 256)):
+                args = ("NHD", 1, src_tp, dst_tp, held, held, head_dim, page)
+                with self.subTest(args=args):
+                    plain = _push_correct(*args)
+                    merged = _push_correct(*args, land=True)
+                    self.assertEqual(_allowed(*args), plain)
+                    self.assertEqual(_land_allowed(*args), merged)
+                    self.assertTrue(merged or not plain)
+                    one_to_even = held <= src_tp and max(1, held // dst_tp) % 2 == 0
+                    self.assertEqual(merged and not plain, one_to_even)
+                    landed += merged and not plain
+        self.assertGreater(landed, 0)
+
+    def test_requests_without_landing_are_unchanged(self):
+        """scratch_block_ids is ignored by plans with no LandEntry, and a
+        LandEntry without scratch ids is an error, not a misplaced push."""
+        for case in self.CASES:
+            layout, itemsize, src_tp, dst_tp, held, geom_heads, head_dim, page = case[
+                :-1
+            ]
+            d_h = max(1, held // dst_tp)
+            t = _Tensor(_shape(layout, itemsize, d_h, head_dim, page), itemsize)
+            geom = _side_geometry(layout, t, d_h, src_tp, dst_tp, geom_heads, page)
+            with self.subTest(case=case):
+                try:
+                    rs._schedule(geom)
+                except LandRequired:
+                    continue
+
+                def build(**extra):
+                    return rs.build_receiver_request(
+                        _Pb2, uuid=1, req_id="x", peer="d", decode_rank=0,
+                        geom=geom, sources=[(0, [4, 5]), (1, [6, 7])],
+                        dst_block_ids=[8, 9], live_tokens=[page, 3], **extra,
+                    )  # fmt: skip
+
+                def entries(req):
+                    return {
+                        k: [vars(e) for e in v.entries]
+                        for k, v in req.shard_push_schedules.items()
+                    }
+
+                self.assertEqual(
+                    entries(build()), entries(build(scratch_block_ids=[10, 11]))
+                )
+        land = _side_geometry(
+            "NHD", _Tensor(_shape("NHD", 1, 2, 128, 64), 1), 2, 8, 4, 8, 64
+        ).with_land()
+        with self.assertRaisesRegex(ValueError, "scratch_block_ids"):
+            rs.build_sender_request(
+                _Pb2, uuid=1, req_id="x", peer="d", prefill_rank=1, decode_rank=0,
+                geom=land, src_block_ids=[0], dst_block_ids=[1], live_tokens=[64],
+            )  # fmt: skip
 
     def test_half_count_geometry_is_no_longer_built(self):
         """fp8 layers holding twice the geometry's heads, even heads per rank.
@@ -870,6 +1162,42 @@ class TestRefusalWithSlidingWindow(unittest.TestCase):
                             )
                         )
                         self.assertEqual(allowed, exact)
+
+    def test_land_full_group_only(self):
+        """The policy commit (iii) wires: land_ok for the full-attention
+        group only. A cell is then allowed iff the full group's merged replay
+        and the SWA group's plain replay are exact, so SWA cells that need
+        landing stay refused."""
+        swa_land = 0
+        for full_heads, swa_heads in itertools.product((2, 4, 8, 16), repeat=2):
+            for src_tp, dst_tp in ((2, 1), (4, 2), (8, 4), (8, 2), (16, 4)):
+                cell = (full_heads, swa_heads, src_tp, dst_tp)
+                with self.subTest(cell=cell):
+                    full = _replay(*cell, dtype=_FP8, swa=False, land=True)
+                    try:
+                        swa = _replay(*cell, dtype=_FP8, swa=True)
+                    except LandRequired:
+                        swa = False
+                        swa_land += _replay(*cell, dtype=_FP8, swa=True, land=True)
+                    allowed = True
+                    for tp in (dst_tp, src_tp):
+                        mgr = _manager(_FP8, full_heads, swa_heads, tp)
+                        for group, heads in ((False, full_heads), (True, swa_heads)):
+                            t = (mgr._swa_kv_caches if group else mgr._kv_caches)[0]
+                            reason = rs.push_reshard_refusal(
+                                mgr._make_geometry(src_tp, dst_tp, swa=group),
+                                t.shape,
+                                1,
+                                total_heads=heads,
+                                own_tp=tp,
+                                page_size=PAGE,
+                                seq_along_lane=False,
+                                land_ok=not group,
+                            )
+                            allowed &= reason is None
+                    self.assertEqual(allowed, full and swa)
+        # Some refused SWA groups would have landed exactly.
+        self.assertGreater(swa_land, 0)
 
     def test_seq_along_lane_refusal_matches_both_groups_bytes(self):
         """The same over real SEQ_ALONG_LANE pools: every cell's whole head
