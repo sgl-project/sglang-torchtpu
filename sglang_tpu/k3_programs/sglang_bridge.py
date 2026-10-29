@@ -73,8 +73,11 @@ class UnifiedPoolPlan:
     """Block ranges of the unified pools on every rank."""
 
     num_blocks: int  # per pool, including the null block
-    state_slots: int  # S: sglang Mamba slots, blocks 1 .. 3S
+    state_slots: int  # S: sglang Mamba slots
     layout: KVLayout
+    # Prefix tails (sglang_tails): a KV block and a KDA state slot each, after
+    # the state blocks, outside sglang's allocators.
+    tail_slots: int = 0
 
     def __post_init__(self) -> None:
         if self.state_slots < 1 or self.kv_blocks < 1:
@@ -92,7 +95,34 @@ class UnifiedPoolPlan:
     @property
     def kv_blocks(self) -> int:
         """KV logical blocks: sglang's KV pages 1 .. kv_blocks."""
-        return self.num_blocks - 1 - self.state_blocks
+        return self.num_blocks - 1 - self.state_blocks - self.tail_blocks
+
+    @property
+    def tail_blocks(self) -> int:
+        """Blocks the prefix tails occupy: a KV block and three state blocks each."""
+        return (1 + KDA_PER_POOL) * self.tail_slots
+
+    def tail_kv_block(self, tail: int) -> int:
+        """Prefix tail ``tail``'s KV block (its partial logical block)."""
+        if not 0 <= tail < self.tail_slots:
+            raise ValueError(
+                f"prefix tail {tail} is outside 0 .. {self.tail_slots - 1}"
+            )
+        return self.state_base + self.state_blocks + tail
+
+    def tail_state_block(self, tail: int, group: int) -> int:
+        """Prefix tail ``tail``'s KDA state block for group ``group``."""
+        if not 0 <= tail < self.tail_slots:
+            raise ValueError(
+                f"prefix tail {tail} is outside 0 .. {self.tail_slots - 1}"
+            )
+        return (
+            self.state_base
+            + self.state_blocks
+            + self.tail_slots
+            + KDA_PER_POOL * tail
+            + group
+        )
 
     @property
     def state_base(self) -> int:

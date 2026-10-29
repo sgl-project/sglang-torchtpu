@@ -148,6 +148,24 @@ class TestDraftPools(CustomTestCase):
         )
 
 
+class TestPrefixTails(CustomTestCase):
+    def test_tail_blocks_follow_the_state_and_leave_kv_and_slots_alone(self):
+        plain = _plan(num_blocks=60, slots=4)
+        tails = bridge.UnifiedPoolPlan(60, 4, pools.cache_layout("auto"), tail_slots=2)
+        self.assertEqual(tails.tail_blocks, 8)
+        self.assertEqual(tails.kv_blocks, plain.kv_blocks - 8)
+        tail = {tails.tail_kv_block(t) for t in range(2)} | {
+            tails.tail_state_block(t, g) for t in range(2) for g in range(3)
+        }
+        kv = set(range(1, tails.kv_blocks + 1))
+        state = {tails.state_block(s, g) for s in range(1, 5) for g in range(3)}
+        self.assertEqual(len(tail), 8)
+        self.assertFalse(tail & kv or tail & state)
+        self.assertEqual(max(tail), tails.num_blocks - 1)
+        with self.assertRaisesRegex(ValueError, "prefix tail 2"):
+            tails.tail_kv_block(2)
+
+
 class TestTransferBuffers(CustomTestCase):
     """sglang's P/D transfer reaches page p / slot i at ptr + index * item_len."""
 

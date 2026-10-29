@@ -88,6 +88,10 @@ else:
     # AgentX turns extend the session's earlier prompt: the prefill keeps them
     # in its radix cache, the KV pages and a KDA checkpoint per page-aligned
     # chunk, and sizes the KV pool from what the checkpoints leave.
+    # Prompt ends past their last full page, for hits inside a page (sglang_tails).
+    CONFIG["runtime_env"]["SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS"] = os.environ.get(
+        "K3_PROGRAM_PREFIX_TAILS", "160"
+    )
     server_args.update(
         disable_radix_cache=False,
         mamba_radix_cache_strategy="extra_buffer",

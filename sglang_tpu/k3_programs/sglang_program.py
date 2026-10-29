@@ -171,8 +171,21 @@ def build_steps(target_worker):
     _program.bind_kv_caches(pool.caches, groups)
     _program.warmup()
     if _config.role == "prefill":
+        tails = None
+        if plan.tail_slots:
+            from sglang_tpu.k3_programs.sglang_tails import TailIndex
+
+            tails = TailIndex(
+                plan.tail_slots, plan.logical_block_tokens, plan.layout.tokens_per_block
+            )
         return PrefillSteps(
-            _program, plan, table_width=width, kda_width=int(groups[1].table_width)
+            _program,
+            plan,
+            table_width=width,
+            kda_width=int(groups[1].table_width),
+            tails=tails,
+            kv_pool=pool,
+            state_pool=pool.state_pool,
         )
     return DecodeSteps(
         _program,

@@ -29,6 +29,7 @@ so a request decodes from where the P/D transfer left it.
 
 from __future__ import annotations
 
+import collections
 import logging
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -243,7 +244,16 @@ class PrefillSteps:
     batch's chunks in, the first token of every prompt that finishes out. The
     program keeps a request's KDA state between its chunks and writes the
     state after each chunk into the request's slot blocks, its KV and the
-    draft's into its pages, for the P/D transfer."""
+    draft's into its pages, for the P/D transfer.
+
+    With prefix ``tails`` (:mod:`sglang_tails`), a prompt's last chunk is cut
+    at its last hit-aligned token past its last full page: the program
+    checkpoints the KDA state there into a tail slot (vLLM's ``align`` mode:
+    a step ending inside a block is folded into the next window, which writes
+    the state at its end into the blocks the step named), and the partial
+    page goes to the tail's KV block. A later prompt continuing it starts
+    there: its new page takes a copy of the tail's block, and its hit column
+    names the tail's state."""
 
     def __init__(
         self,
@@ -252,13 +262,50 @@ class PrefillSteps:
         *,
         table_width: int,
         kda_width: int = 1,
+        tails: Any = None,
+        kv_pool: Any = None,
+        state_pool: Any = None,
     ) -> None:
         self.program = program
         self.plan = plan
         self.table_width = table_width
         self.kda_width = kda_width
+        self.tails = tails
+        self.kv_pool, self.state_pool = kv_pool, state_pool
         self._live: set[str] = set()
         self._prompts = _Prompts()
+        self.stats = collections.Counter()
+
+    def _row(self, req, prompt, computed, end, starts, columns=()):
+        """The program's row for ``req`` computing ``[computed, end)``; each
+        of ``columns`` ``(column, tail)`` names a tail's state blocks in that
+        column of the KDA tables (the rest name the request's slot)."""
+        tables = bridge.block_tables(
+            starts[req.kv.req_pool_idx],
+            end,
+            int(req.kv.mamba_pool_idx.reshape(-1)[0]),
+            self.plan,
+            self.table_width,
+            self.kda_width,
+        )
+        if columns:
+            tables = list(tables)
+            for group in range(bridge.KDA_PER_POOL):
+                row = tables[1 + group].copy()
+                for column, tail in columns:
+                    row[column] = self.plan.tail_state_block(tail, group)
+                tables[1 + group] = row
+            tables = tuple(tables)
+        return sglang_step.request_input(
+            rid=req.rid,
+            token_ids=prompt,
+            num_tokens=len(prompt),
+            num_prompt_tokens=len(prompt),
+            computed=int(computed),
+            scheduled=int(end - computed),
+            block_tables=tables,
+            sampling_params=req.sampling_params,
+        )
 
     def step(
         self,
@@ -270,33 +317,85 @@ class PrefillSteps:
         """One extend batch, with the ``req_to_token`` rows'
         :func:`sglang_bridge.page_starts`: the ``[len(reqs)]`` int64 first
         tokens (0 for a request whose prompt continues in a later chunk)."""
-        requests = []
-        for req, computed, scheduled in zip(reqs, prefix_lens, extend_lens):
+        page, align = self.plan.logical_block_tokens, self.plan.layout.tokens_per_block
+        tails = self.tails
+        if tails is not None:
+            tails.begin_step()
+        first_rows, split_rows, split_index = [], [], []
+        hit_copies, tail_kv_copies, tail_state_copies = [], [], []
+        for i, (req, prefix, extend) in enumerate(zip(reqs, prefix_lens, extend_lens)):
             prompt = self._prompts.get(req)
-            requests.append(
-                sglang_step.request_input(
-                    rid=req.rid,
-                    token_ids=prompt,
-                    num_tokens=len(prompt),
-                    num_prompt_tokens=len(prompt),
-                    computed=int(computed),
-                    scheduled=int(scheduled),
-                    block_tables=bridge.block_tables(
-                        starts[req.kv.req_pool_idx],
-                        int(computed) + int(scheduled),
-                        int(req.kv.mamba_pool_idx.reshape(-1)[0]),
-                        self.plan,
-                        self.table_width,
-                        self.kda_width,
-                    ),
-                    sampling_params=req.sampling_params,
+            computed, end = int(prefix), int(prefix) + int(extend)
+            columns = []
+            if tails is not None and req.rid not in self._live:
+                limit = min(end - 1, len(prompt) - 1) // align * align
+                hit = tails.lookup(prompt, computed, limit)
+                if hit is not None:
+                    tail, tail_end = hit
+                    page_block = (
+                        int(starts[req.kv.req_pool_idx][computed // page]) // page
+                    )
+                    hit_copies.append((self.plan.tail_kv_block(tail), page_block))
+                    columns.append((tail_end // align - 1, tail))
+                    self.stats["tail_hit_tokens"] += tail_end - computed
+                    computed = tail_end
+            cut = None
+            if tails is not None and end == len(prompt):
+                tail_end = end // align * align
+                if tail_end > end // page * page and tail_end > computed:
+                    tail = tails.record(prompt, tail_end)
+                    if tail is not None:
+                        cut = (tail_end, tail)
+            if cut is None:
+                first_rows.append(
+                    self._row(req, prompt, computed, end, starts, columns)
                 )
+                continue
+            tail_end, tail = cut
+            page_block = int(starts[req.kv.req_pool_idx][tail_end // page]) // page
+            tail_kv_copies.append((page_block, self.plan.tail_kv_block(tail)))
+            if tail_end == end:
+                # The prompt ends on the alignment: its final state (the slot's)
+                # is the tail's too.
+                first_rows.append(
+                    self._row(req, prompt, computed, end, starts, columns)
+                )
+                slot = int(req.kv.mamba_pool_idx.reshape(-1)[0])
+                for group in range(bridge.KDA_PER_POOL):
+                    tail_state_copies.append(
+                        (
+                            self.plan.state_block(slot, group),
+                            self.plan.tail_state_block(tail, group),
+                        )
+                    )
+                continue
+            # Up to the tail's end, its state checkpointed into the tail's
+            # slot; then the rest of the prompt.
+            columns.append(((tail_end - 1) // align, tail))
+            first_rows.append(
+                self._row(req, prompt, computed, tail_end, starts, columns)
             )
+            split_rows.append(self._row(req, prompt, tail_end, end, starts))
+            split_index.append(i)
         current = {req.rid for req in reqs}
         finished, self._live = self._live - current, current
         self._prompts.drop(finished)
-        tokens = self.program.step(StepInput(requests, finished)).tokens
+        if hit_copies:
+            src, dst = zip(*hit_copies)
+            self.kv_pool.copy_blocks(src, dst)
+        tokens = self.program.step(StepInput(first_rows, finished)).tokens
         first = np.asarray(tokens[: len(reqs)].cpu(), dtype=np.int64)[:, 0]
+        if split_rows:
+            more = self.program.step(StepInput(split_rows)).tokens
+            more = np.asarray(more[: len(split_rows)].cpu(), dtype=np.int64)[:, 0]
+            for row, i in enumerate(split_index):
+                first[i] = more[row]
+        if tail_kv_copies:
+            src, dst = zip(*tail_kv_copies)
+            self.kv_pool.copy_blocks(src, dst)
+        if tail_state_copies:
+            src, dst = zip(*tail_state_copies)
+            self.state_pool.copy_blocks(src, dst)
         for i, (computed, scheduled) in enumerate(zip(prefix_lens, extend_lens)):
             finishes = computed + scheduled >= len(reqs[i].origin_input_ids)
             if finishes != (first[i] >= 0):

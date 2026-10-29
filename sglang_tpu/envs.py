@@ -127,6 +127,10 @@ class TpuEnvs:
     # sglang_tpu/k3_programs/kimi_k3/config.py KernelConfig, e.g.
     # "moe_reduce_dtype=bfloat16;prefill_expert_parallel=32"). Empty: the defaults.
     SGLANG_TPU_K3_PROGRAM_KERNEL_CONFIG = EnvStr("")
+    # Prefix tails on the K3_PROGRAM prefill (sglang_tpu/k3_programs/sglang_tails.py):
+    # prompt ends kept past their last full page, so a later prompt's radix match
+    # continues inside the page. Each holds a KV block and a KDA state slot.
+    SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS = EnvInt(0)
 
     # Host padding is unconditional; this routes speculative batches to the
     # experimental spec worker, which keeps their metadata on the host as well.

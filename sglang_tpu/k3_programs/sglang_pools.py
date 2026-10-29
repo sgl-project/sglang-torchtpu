@@ -42,6 +42,18 @@ def _block_bytes(kv_cache_dtype: str) -> int:
     return int(torch.Size(layout.block_shape).numel()) * itemsize
 
 
+def _prefix_tails() -> int:
+    from sglang_tpu.envs import envs as tpu_envs
+
+    return int(tpu_envs.SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS.get() or 0)
+
+
+def _copy_rows(tensors, src: torch.Tensor, dst: torch.Tensor) -> None:
+    for pool in tensors:
+        device_src, device_dst = src.to(pool.device), dst.to(pool.device)
+        pool.index_copy_(0, device_dst, pool.index_select(0, device_src))
+
+
 def _kv_cache_dtype() -> str:
     from sglang.srt.runtime_context import get_model
 
@@ -74,9 +86,20 @@ class K3StatePool:
 
     @classmethod
     def cache_bytes_per_request(cls, cache_params) -> int:
-        """A slot's share of the unified pools: three blocks of every pool."""
+        """A slot's share of the unified pools: three blocks of every pool,
+        and its share of the prefix tails' blocks (sglang sizes the state by
+        slot count, and the tails sit beside the slots)."""
+        from sglang.srt.runtime_context import get_schedule
+
         pools = len(MLA) + bridge.DSPARK_DRAFT_LAYERS
-        return bridge.KDA_PER_POOL * pools * _block_bytes(_kv_cache_dtype())
+        block = _block_bytes(_kv_cache_dtype())
+        slot_bytes = bridge.KDA_PER_POOL * pools * block
+        tails = _prefix_tails()
+        if not tails:
+            return slot_bytes
+        slots = int(get_schedule().max_mamba_cache_size or 1) + 1
+        tail_bytes = (1 + bridge.KDA_PER_POOL) * pools * block * tails
+        return slot_bytes + -(-tail_bytes // slots)
 
     def bind(self, plan: bridge.UnifiedPoolPlan, caches: dict[str, torch.Tensor]):
         self.plan, self.caches = plan, caches
@@ -106,9 +129,14 @@ class K3StatePool:
             raise ValueError(f"copy of {src.numel()} state rows into {dst.numel()}")
         if not src.numel():
             return
-        for pool in self.host_pools():
-            device_src, device_dst = src.to(pool.device), dst.to(pool.device)
-            pool.index_copy_(0, device_dst, pool.index_select(0, device_src))
+        _copy_rows(self.host_pools(), src, dst)
+
+    def copy_blocks(self, src_blocks, dst_blocks) -> None:
+        """Copy state blocks (a tail's slot) in every hosting pool."""
+        src = torch.as_tensor(src_blocks, dtype=torch.int64).reshape(-1).cpu()
+        dst = torch.as_tensor(dst_blocks, dtype=torch.int64).reshape(-1).cpu()
+        if src.numel():
+            _copy_rows(self.host_pools(), src, dst)
 
     def clear_slots(self, indices) -> None:
         """Nothing to clear: a request without a prefix hit starts from a zero
@@ -162,8 +190,16 @@ class K3UnifiedKVPool:
                 f"tokens), not {page_size}"
             )
         pages = -(-size // page_size)
-        num_blocks = 1 + bridge.KDA_PER_POOL * (state.size + 1) + pages
-        self.plan = bridge.UnifiedPoolPlan(num_blocks, state.size, layout)
+        tails = _prefix_tails()
+        num_blocks = (
+            1
+            + bridge.KDA_PER_POOL * (state.size + 1)
+            + pages
+            + (1 + bridge.KDA_PER_POOL) * tails
+        )
+        self.plan = bridge.UnifiedPoolPlan(
+            num_blocks, state.size, layout, tail_slots=tails
+        )
         self.caches = bridge.allocate_pools(
             self.plan, device, draft_layers=bridge.DSPARK_DRAFT_LAYERS
         )
@@ -202,6 +238,14 @@ class K3UnifiedKVPool:
         for tensor in self.caches.values():
             seen.setdefault(tensor.data_ptr(), tensor)
         return list(seen.values())
+
+    def copy_blocks(self, src_blocks, dst_blocks) -> None:
+        """Copy whole blocks of every pool (the 24 unified pools and the
+        draft's): a partial logical block into or out of a prefix tail."""
+        src = torch.as_tensor(src_blocks, dtype=torch.int64).reshape(-1).cpu()
+        dst = torch.as_tensor(dst_blocks, dtype=torch.int64).reshape(-1).cpu()
+        if src.numel():
+            _copy_rows(self.raw_pools(), src, dst)
 
     def get_kv_size_bytes(self) -> int:
         return sum(t.numel() * t.element_size() for t in self.raw_pools())
