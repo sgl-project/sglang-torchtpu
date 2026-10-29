@@ -19,6 +19,7 @@ from sglang.srt.plugins.hook_registry import HookRegistry, _propagate_patch
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope
 from sglang_tpu.envs import envs
@@ -1300,6 +1301,49 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertIsNone(payload.topk_p)
         self.assertIsNone(payload.hidden_states)
 
+    def test_decode_prep_accumulates_penalties_before_forward_snapshot(self):
+        batch = self.batch([0, 1], spec_algorithm=SpeculativeAlgorithm.EAGLE)
+        for req in batch.reqs:
+            req.origin_input_ids = [1]
+            req.output_ids = []
+            req.kv = SimpleNamespace(kv_committed_len=4, kv_allocated_len=32)
+            req.decode_batch_idx = 0
+        batch.reqs[0].sampling_params.presence_penalty = 0.5
+        batch.reqs[0].sampling_params.frequency_penalty = 0.25
+        batch.reqs[0].sampling_params.top_p = 0.9
+        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(batch, 32)
+        batch.req_to_token_pool = SimpleNamespace(host_resident=True)
+        batch.token_to_kv_pool_allocator = SimpleNamespace(page_size=1)
+        snapshots = []
+        with (
+            patch.object(batch, "maybe_evict_swa"),
+            patch.object(
+                draft_info, "max_speculative_num_draft_tokens", return_value=4
+            ),
+            patch.object(draft_info.HostPaddedDraftInput, "_plan_verify_window"),
+        ):
+            for tokens, repeated_penalty in (([2], -0.75), ([2], -1.0), ([4, 5], -1.0)):
+                batch.reqs[0].output_ids.extend(tokens)
+                batch.reqs[1].output_ids.extend(tokens)
+                spec_prepare_for_decode(batch)
+                expected = torch.zeros(2, 32)
+                expected[0, 2] = repeated_penalty
+                if tokens == [4, 5]:
+                    # Match EAGLE's relaxed policy: only the last emitted token
+                    # is accumulated for each speculative decode preparation.
+                    expected[0, 5] = -0.75
+                accumulated = torch.zeros_like(expected)
+                batch.sampling_info.penalizer_orchestrator.accumulate_additive_penalties(
+                    accumulated
+                )
+                self.assertTrue(torch.equal(accumulated, expected))
+                snapshot = batch.sampling_info.copy_for_forward()
+                self.assertTrue(torch.equal(snapshot.acc_additive_penalties, expected))
+                self.assertIsNone(snapshot.penalizer_orchestrator)
+                snapshots.append(snapshot)
+        self.assertEqual(snapshots[0].acc_additive_penalties[0, 2].item(), -0.75)
+        self.assertEqual(snapshots[0].acc_additive_penalties[0, 5].item(), 0.0)
+
     def test_decode_prep_reserves_two_windows_and_keeps_committed_host_lengths(self):
         """prepare_for_decode reserves 2 * N tokens past the committed length,
         plans the verify window on host from the committed lengths, and refuses
@@ -1330,7 +1374,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
             enable_overlap=True,
             return_logprob=False,
             has_grammar=False,
-            sampling_info=None,
+            sampling_info=self.batch([1, 2]).sampling_info,
             spec_algorithm=SimpleNamespace(create_worker=worker_factory),
         )
         allocations = []
@@ -1395,6 +1439,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
             # ordinary N + 1 token commit bound.
             worker_factory.return_value = _LogprobBlockSpecWorker
             worker = object.__new__(_LogprobBlockSpecWorker)
+            worker._bsearch_filtering = True
             worker._check_supported(batch=batch, pp_proxy_tensors=None)
             draft.prepare_for_decode(batch)
             self.assertTrue(draft.tpu_host_seq_lens_is_committed)
