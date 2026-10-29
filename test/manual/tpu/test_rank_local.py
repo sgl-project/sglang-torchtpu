@@ -6,11 +6,10 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 
-from sglang.srt.layers.moe.tpu_moe_utils import mask_tpu_moe_non_local_experts
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang_tpu.compilation.direct_compile import direct_compile
-from sglang_tpu.moe.ep_rank import traced_moe_ep_rank
+from sglang_tpu.moe.ep_rank import mask_tpu_moe_non_local_experts, traced_moe_ep_rank
 from sglang_tpu.rank_local import rank_slice
 
 

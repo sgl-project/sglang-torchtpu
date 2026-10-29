@@ -5,11 +5,10 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.moe.tpu_moe_utils import mask_tpu_moe_non_local_experts
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.moe.ep_rank import traced_moe_ep_rank
+from sglang_tpu.moe.ep_rank import mask_tpu_moe_non_local_experts, traced_moe_ep_rank
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

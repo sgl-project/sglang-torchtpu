@@ -1,4 +1,5 @@
-"""The MoE expert-parallel rank as a rank-lifted trace input."""
+"""The MoE expert-parallel rank as a rank-lifted trace input, and the expert
+mask that uses it."""
 
 from typing import Optional
 
@@ -27,3 +28,29 @@ def traced_moe_ep_rank() -> Optional[torch.Tensor]:
         parallel.tp_rank, group_size=parallel.tp_size
     )
     return tp_rank // parallel.moe_tp_size % parallel.moe_ep_size
+
+
+def mask_tpu_moe_non_local_experts(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_local_experts: int,
+    moe_ep_rank: int,
+    *,
+    traced_ep_rank: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Translate global expert IDs to this EP rank's local IDs and mask the rest.
+
+    The dispatcher hands the TPU runner global expert IDs
+    (skip_local_expert_mapping). The TPU Pallas fused-MoE kernel takes local
+    expert IDs here, so shift IDs into this rank's local range and mark the
+    rest -1 (dropped by the kernel) with zero routing weight. Inside a
+    rank-lifted trace, pass ``traced_ep_rank`` (from ``traced_moe_ep_rank``)
+    so the shift follows the rank input instead of the tracing rank's int.
+    """
+    rank = moe_ep_rank if traced_ep_rank is None else traced_ep_rank
+    local_ids = topk_ids - rank * num_local_experts
+    valid = (local_ids >= 0) & (local_ids < num_local_experts)
+    return (
+        topk_weights * valid.to(topk_weights.dtype),
+        torch.where(valid, local_ids, -1),
+    )
