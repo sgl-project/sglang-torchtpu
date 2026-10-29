@@ -234,7 +234,7 @@ class TestInstall(CustomTestCase):
                 "release_startup_page_cache",
                 side_effect=lambda **_: scheduler.calls.append("files"),
             ) as release_files,
-            patch.object(tpu.jax, "clear_caches"),
+            patch.object(self.jax, "clear_caches"),
             patch.object(tpu, "trim_host_heap", side_effect=scheduler.calls.append),
             patch.object(tpu.gc, "freeze") as freeze,
             tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(True),
