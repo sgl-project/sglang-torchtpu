@@ -181,6 +181,7 @@ class TestPallasRpaSlidingWindowAdapter(CustomTestCase):
             v_scale,
             decode_query_size=1,
             use_causal_mask=True,
+            layer_idx=None,
         ):
             captured["sliding_window"] = sliding_window
             captured["use_causal_mask"] = use_causal_mask
@@ -765,6 +766,7 @@ class TestFixedWidthAsDecode(CustomTestCase):
             v_scale,
             decode_query_size=1,
             use_causal_mask=True,
+            layer_idx=None,
         ):
             captured["width"] = decode_query_size
 

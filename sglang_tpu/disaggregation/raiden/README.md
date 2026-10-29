@@ -201,6 +201,16 @@ only once its twin has. By default the closing transfer and its twin move after
 the prefill finishes. Full-attention and window page lists remain independent,
 and a cached decode prefix is clipped from each layer's transfer.
 
+With `SGLANG_TPU_USE_BLOCK_MAJOR_KV=1` a worker holds one bundle per attention
+group, every layer of a page in one row, and registers it as a single pool
+`fa.l<first>+<count>` (`swa.l<first>+<count>`) so a page moves as one row. Such
+a pipeline pairs only with a decode pipeline of the same stage layout; a DP or
+TP decode of a pipeline prefill needs per-layer pools and refuses the flag at
+startup, and a peer in the other layout fails every transfer on the layout
+fingerprint. On the pull path every `CHUNK` and `BLOCKS` carries the prefill's
+layout, and a decode in the other layout fails the room with that reason.
+Push resharding (`dst_tp < src_tp`) slices per-layer heads and refuses a bundle.
+
 Three opt-in modes overlap the hand-off with the prefill; all are set on the
 prefill (`SGLANG_RAIDEN_PIPELINE_COORD_WORKERS` on the decode):
 

@@ -355,6 +355,7 @@ class RaidenSenderMixin:
                 total_pages=total_pages,
                 blocks=block_ids,
                 endpoint=self.raiden_endpoint or "",
+                kv_layout=self.kv_layout,
             ).to_frames()
             endpoint = _tcp_endpoint(ip=addr[0], port=addr[1])
             try:
@@ -684,6 +685,7 @@ class RaidenSenderMixin:
                 state_blocks=state_rows,
                 state_endpoint=self.state_raiden_endpoint or "",
                 state_meta=state_meta,
+                kv_layout=self.kv_layout,
             ).to_frames()
             try:
                 self._send_multipart_locked(endpoint, payload)
