@@ -1244,24 +1244,24 @@ class TpuSpecWorker(BaseSpecWorker):
         *,
         bucket_state: SpecState,
         verify_input: TpuSpecVerifyInput,
-        kv_rows: int,
+        host_kv_rows: int | None,
         **overrides: Any,
     ) -> contextlib.AbstractContextManager[ScheduleBatch]:
         """batch with its row fields at the bucket, restored on exit, for code that reads them.
 
         init_new snapshots these; feeding the bucket rows leaves the shim nothing
         to pad. Padded rows hold pool row 0 and host KV length 0, inactive in RPA;
-        seq_lens_cpu bounds the KV length once kv_rows rows past seq_lens are
-        written. overrides set (and restore) further batch fields.
+        host_kv_rows bounds the extra KV rows written past seq_lens; None skips
+        host bounds for device-built attention metadata. overrides set (and
+        restore) further batch fields.
         """
         padded_bs = bucket_state.seq_lens.shape[0]
         assert verify_input.req_pool_indices_cpu.shape[0] == padded_bs
-        # Device-built attention metadata can replace both host bounds.
-        if "seq_lens_cpu" in overrides and "seq_lens_sum" in overrides:
-            seq_lens_cpu = overrides["seq_lens_cpu"]
-            seq_lens_sum = overrides["seq_lens_sum"]
-        else:
-            seq_lens_cpu, seq_lens_sum = verify_input.padded_kv_lens_after_rows(kv_rows)
+        seq_lens_cpu, seq_lens_sum = (
+            (None, None)
+            if host_kv_rows is None
+            else verify_input.padded_kv_lens_after_rows(host_kv_rows)
+        )
         multimodal_inputs = batch.multimodal_inputs
         if multimodal_inputs is not None:
             # Spec M-RoPE positions read one entry per (bucket) row.
@@ -1297,7 +1297,7 @@ class TpuSpecWorker(BaseSpecWorker):
             batch,
             bucket_state=bucket_state,
             verify_input=verify_input,
-            kv_rows=self.num_verify_rows,
+            host_kv_rows=self.num_verify_rows,
         ) as view:
             return self._prepare_verify_forward_batch(view, spec_info)
 

@@ -95,7 +95,7 @@ def _state(rows):
 
 
 class TestExperimentalSpecHooks(CustomTestCase):
-    def test_bucket_view_preserves_host_bounds_unless_both_are_replaced(self):
+    def test_bucket_view_builds_host_bounds_only_when_requested(self):
         original = dict(
             multimodal_inputs=None,
             seq_lens=torch.tensor([5]),
@@ -109,12 +109,12 @@ class TestExperimentalSpecHooks(CustomTestCase):
             seq_lens=torch.tensor([6, 0]), req_pool_indices=torch.tensor([1, 0])
         )
         bounds = torch.tensor([10, 0])
-        for overrides in (
-            {},
-            {"seq_lens_cpu": None},
-            {"seq_lens_cpu": None, "seq_lens_sum": None},
+        for host_kv_rows, overrides in (
+            (4, {}),
+            (4, {"seq_lens_cpu": None}),
+            (None, {}),
         ):
-            with self.subTest(overrides=overrides):
+            with self.subTest(host_kv_rows=host_kv_rows, overrides=overrides):
                 batch = SimpleNamespace(**original)
                 addressing = SimpleNamespace(
                     req_pool_indices_cpu=torch.tensor([1, 0]),
@@ -124,19 +124,22 @@ class TestExperimentalSpecHooks(CustomTestCase):
                     batch,
                     bucket_state=state,
                     verify_input=addressing,
-                    kv_rows=4,
+                    host_kv_rows=host_kv_rows,
                     **overrides,
                 ):
                     self.assertIs(
-                        batch.seq_lens_cpu, overrides.get("seq_lens_cpu", bounds)
+                        batch.seq_lens_cpu,
+                        overrides.get(
+                            "seq_lens_cpu", bounds if host_kv_rows is not None else None
+                        ),
                     )
                     self.assertEqual(
-                        batch.seq_lens_sum, overrides.get("seq_lens_sum", 10)
+                        batch.seq_lens_sum, 10 if host_kv_rows is not None else None
                     )
                     self.assertIs(batch.req_pool_indices, state.req_pool_indices)
                 for name, value in original.items():
                     self.assertIs(getattr(batch, name), value)
-                if len(overrides) == 2:
+                if host_kv_rows is None:
                     addressing.padded_kv_lens_after_rows.assert_not_called()
                 else:
                     addressing.padded_kv_lens_after_rows.assert_called_once_with(4)
