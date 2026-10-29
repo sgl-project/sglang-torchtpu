@@ -132,6 +132,9 @@ PER_COMMIT_SUITES = {
     ],
     HWBackend.TPU: [
         "stage-a-test-tpu-unit",
+        # Kernel-vs-reference matrices; pr-test-tpu.yml runs them only when a
+        # kernel, its tests, or the image toolchain changes.
+        "stage-a-test-tpu-kernel",
         "stage-b-test-tpu-4-v7",
     ],
     HWBackend.XPU: [
