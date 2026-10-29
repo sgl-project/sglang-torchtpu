@@ -36,6 +36,7 @@ import numpy as np
 import torch
 
 from sglang_tpu.k3_programs.kimi_k3.layout import KDA, MLA, NUM_LAYERS, cache_layout
+from sglang_tpu.k3_programs.kimi_k3.pools import DRAFT_LAYER0
 from sglang_tpu.k3_programs.layout import KVLayout
 from sglang_tpu.k3_programs.program import KVGroup
 
@@ -43,6 +44,8 @@ TP_SIZE = 32
 # Kernel KDA layer ``k`` lives in pool ``k // KDA_PER_POOL`` (the last pool none),
 # and in KDA group ``k % KDA_PER_POOL``: a group's layers are in distinct pools.
 KDA_PER_POOL = 3
+# Kimi-K3 DSpark's MLA draft layers (``num_hidden_layers`` of its checkpoint).
+DSPARK_DRAFT_LAYERS = 5
 
 
 def mla_layer_name(layer: int) -> str:
@@ -51,6 +54,12 @@ def mla_layer_name(layer: int) -> str:
 
 def kda_layer_name(layer: int) -> str:
     return f"model.layers.{layer}.self_attn.kda"
+
+
+def draft_layer_name(index: int) -> str:
+    """The ``index``-th DSpark draft layer, numbered after the 93 target layers
+    as ``pools.draft_raw_pools`` reads them."""
+    return f"model.layers.{DRAFT_LAYER0 + index}.self_attn.attn"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -100,19 +109,27 @@ class UnifiedPoolPlan:
 
 
 def plan_pools(
-    pool_bytes: int, state_slots: int, kv_cache_dtype: str = "auto"
+    pool_bytes: int,
+    state_slots: int,
+    kv_cache_dtype: str = "auto",
+    draft_layers: int = 0,
 ) -> UnifiedPoolPlan:
-    """The plan for ``pool_bytes`` of HBM per rank over all 24 pools."""
+    """The plan for ``pool_bytes`` of HBM per rank over all 24 pools and the
+    ``draft_layers`` draft pools."""
     layout = cache_layout(kv_cache_dtype)
     itemsize = 2 if layout.dtype == "bfloat16" else 1  # float8_e4m3fn
     block_bytes = int(np.prod(layout.block_shape)) * itemsize
-    num_blocks = pool_bytes // (block_bytes * len(MLA))
+    num_blocks = pool_bytes // (block_bytes * (len(MLA) + draft_layers))
     return UnifiedPoolPlan(int(num_blocks), state_slots, layout)
 
 
-def allocate_pools(plan: UnifiedPoolPlan, device) -> dict[str, torch.Tensor]:
+def allocate_pools(
+    plan: UnifiedPoolPlan, device, draft_layers: int = 0
+) -> dict[str, torch.Tensor]:
     """The 24 raw pools, keyed by the layer names the programs bind: each MLA
-    layer's pool, shared by the three KDA layers ``3p .. 3p + 2`` it hosts."""
+    layer's pool, shared by the three KDA layers ``3p .. 3p + 2`` it hosts.
+    ``draft_layers``: also a pool per DSpark draft layer, shaped like the
+    target's, which a P/D transfer moves with the target's KV blocks."""
     dtype = getattr(torch, plan.layout.dtype)
     pools = [
         torch.zeros(
@@ -123,6 +140,8 @@ def allocate_pools(plan: UnifiedPoolPlan, device) -> dict[str, torch.Tensor]:
     caches = {mla_layer_name(layer): pools[p] for p, layer in enumerate(MLA)}
     for k, layer in enumerate(KDA):
         caches[kda_layer_name(layer)] = pools[k // KDA_PER_POOL]
+    for i in range(draft_layers):
+        caches[draft_layer_name(i)] = torch.zeros_like(pools[0])
     return caches
 
 
@@ -163,14 +182,16 @@ def kda_group_layers(group: int) -> tuple[int, ...]:
 
 
 def kv_groups(
-    plan: UnifiedPoolPlan, context_len: int, table_width: int
+    plan: UnifiedPoolPlan, context_len: int, table_width: int, draft_layers: int = 0
 ) -> list[KVGroup]:
-    """The groups the programs bind: the MLA layers' pages, then the three KDA
-    groups, each with one block spanning the context (column 0: the request's
-    state block for that group)."""
+    """The groups the programs bind: the MLA layers' pages (with the draft
+    layers', read through the same tables), then the three KDA groups, each
+    with one block spanning the context (column 0: the request's state block
+    for that group)."""
     return [
         KVGroup(
-            tuple(mla_layer_name(layer) for layer in MLA),
+            tuple(mla_layer_name(layer) for layer in MLA)
+            + tuple(draft_layer_name(i) for i in range(draft_layers)),
             plan.logical_block_tokens,
             table_width,
         ),
@@ -200,7 +221,7 @@ def block_tables(
 
 
 def layers_covered(groups: Sequence[KVGroup]) -> set[int]:
-    """Model layer indices the groups name (every one of the 93)."""
+    """Model layer indices the groups name (every one of the 93, then the draft's)."""
     from sglang_tpu.k3_programs.kimi_k3.pools import layer_index
 
     return {layer_index(name) for group in groups for name in group.layer_names}

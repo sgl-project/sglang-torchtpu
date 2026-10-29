@@ -113,6 +113,30 @@ class TestUnifiedPools(CustomTestCase):
         self.assertNotIn(0, state | kv)
 
 
+class TestDraftPools(CustomTestCase):
+    def test_draft_pools_follow_the_target_pools(self):
+        plan = _plan()
+        caches = bridge.allocate_pools(
+            plan, "cpu", draft_layers=bridge.DSPARK_DRAFT_LAYERS
+        )
+        draft = pools.draft_raw_pools(caches)
+        self.assertEqual(len(draft), bridge.DSPARK_DRAFT_LAYERS)
+        raw, *_ = pools.bind_raw_pools(caches)
+        for p in draft:
+            self.assertEqual((p.shape, p.dtype), (raw[0].shape, raw[0].dtype))
+            self.assertNotIn(p.data_ptr(), {r.data_ptr() for r in raw})
+        groups = bridge.kv_groups(
+            plan, 1 << 20, 8, draft_layers=bridge.DSPARK_DRAFT_LAYERS
+        )
+        self.assertEqual(
+            bridge.layers_covered(groups),
+            set(range(NUM_LAYERS + bridge.DSPARK_DRAFT_LAYERS)),
+        )
+        self.assertTrue(
+            all(bridge.draft_layer_name(i) in groups[0].layer_names for i in range(5))
+        )
+
+
 class TestMlaTable(CustomTestCase):
     def test_pages_map_to_logical_blocks(self):
         plan = _plan()
@@ -141,6 +165,9 @@ class TestMlaTable(CustomTestCase):
         )
         with self.assertRaisesRegex(ValueError, "cannot hold"):
             bridge.plan_pools(block * len(MLA) * 20, state_slots=8)
+        # The draft's five pools take their share of the same bytes.
+        plan = bridge.plan_pools(block * (len(MLA) + 5) * 50, 8, draft_layers=5)
+        self.assertEqual(plan.num_blocks, 50)
 
 
 class TestStepConversion(CustomTestCase):
