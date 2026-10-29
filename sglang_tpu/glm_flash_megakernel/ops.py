@@ -359,7 +359,8 @@ class GlmFlashMegakernel:
                     [ik[d].index_select(0, src), ig[d].index_select(0, src)], 1
                 )
                 pool.get_kpool_raw_cache(L).index_put_(idx, raw)
-        # Pools closed while the kernel held the request; pool p sits at position p.
+        # Pools closed while the kernel held the request; pool p sits in the page
+        # of its first token p * kp, record (slot // kp).
         p_lo, p_hi = self.start // kp, -(-hi // kp)
         for a in range(p_lo - p_lo % _CHUNK, p_hi, _CHUNK):
             pools = self._rows(a, device)
@@ -367,8 +368,9 @@ class GlmFlashMegakernel:
             valid = (
                 (end >= self.start) & (end < committed) & (pools * kp < self.max_len)
             )
-            locs = self._locs(pools, valid)
-            idx = (locs // ps, (locs % ps) // 4, locs % 4)
+            locs = self._locs(pools * kp, valid)
+            record = (locs % ps) // kp
+            idx = (locs // ps, record // 4, record % 4)
             src = pools.clamp(max=self.max_len // kp - 1).to(torch.int32)
             records = self.pool_records(ik, ig, self.smalls, src)[0]
             for d, L in enumerate(spec.dsa_layers):
