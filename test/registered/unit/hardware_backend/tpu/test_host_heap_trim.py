@@ -243,7 +243,9 @@ class TestInstall(CustomTestCase):
             scheduler.calls.append("allocate HiCache")
         self.assertIsNone(alive())
         freeze.assert_not_called()
-        release_files.assert_called_once_with(include_checkpoints=True)
+        release_files.assert_called_once_with(
+            include_checkpoints=True, synchronize=True
+        )
         self.clear.assert_called_once_with()
         self.assertEqual(
             scheduler.calls,
@@ -335,20 +337,24 @@ class TestInstall(CustomTestCase):
                 self.group.barrier.reset_mock()
                 scheduler = self.cls(enable_hierarchical_cache=hicache)
                 self.assertEqual(scheduler.init_model_worker(), "initialized")
-                early_cleanup = hicache and pp_size == 1
-                # The parent already synchronizes checkpoint readers before
-                # graph warmup; PP must not add either early-cleanup barrier.
+                # Preserve checkpoint-reader and compiler-writer barriers;
+                # only the final early-cleanup barrier is skipped under PP.
                 self.assertEqual(
-                    self.group.barrier.call_count, 3 if early_cleanup else 1
+                    self.group.barrier.call_count,
+                    1 + int(hicache) + int(hicache and pp_size == 1),
                 )
-                initial_cleanups = 2 if early_cleanup else 1
+                initial_cleanups = 2 if hicache else 1
                 self.assertEqual(scheduler.get_init_info(), {"status": "ready"})
                 self.assertEqual(advised.count(checkpoint_inode), 1)
                 self.assertEqual(
                     advised.count(artifact.stat().st_ino), initial_cleanups
                 )
                 artifact.write_bytes(b"HTTP warmup")
+                self.group.barrier.reset_mock()
                 self.assertEqual(scheduler.handle_freeze_gc("req"), "forwarded")
+                self.assertEqual(
+                    self.group.barrier.call_count, 2 if pp_size == 1 else 0
+                )
                 self.assertEqual(advised.count(checkpoint_inode), 1)
                 self.assertEqual(
                     advised.count(artifact.stat().st_ino), initial_cleanups + 1

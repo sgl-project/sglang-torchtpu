@@ -9,9 +9,9 @@ so each rank stays near its startup peak.
 handshake, including for offline Engine and Rust launches. It also wraps
 ``Scheduler.handle_freeze_gc`` to release pages created by subsequent warmup,
 clear export records and JAX caches, collect garbage before freezing GC,
-and return freed heap pages. With HiCache enabled and a single pipeline stage,
-model-worker initialization releases compiler state before the host KV pools
-are allocated; final cleanup still releases anything allocated later in startup.
+and return freed heap pages. With HiCache enabled, model-worker initialization
+releases compiler state before the host KV pools are allocated; final cleanup
+still releases anything allocated later in startup.
 
 A release goes through every allocator loaded in the process (tcmalloc,
 glibc) because the one serving ``malloc`` cannot be detected reliably, and
@@ -229,11 +229,12 @@ def _after_freeze() -> None:
 
 
 def release_before_hicache() -> None:
-    """Finish compilation cleanup on all ranks before host-pool admission."""
+    """Release compilation memory before allocating this rank's host pool."""
     _before_freeze(include_checkpoints=True, synchronize=True)
     if tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.get():
         trim_host_heap("before HiCache")
-    get_parallel().world_group.barrier()
+    if get_parallel().pp_size == 1:
+        get_parallel().world_group.barrier()
 
 
 def install(scheduler_cls: Optional[type] = None) -> None:
@@ -255,9 +256,7 @@ def install(scheduler_cls: Optional[type] = None) -> None:
 
     def init_model_worker(self, *args, **kwargs):
         result = init_worker(self, *args, **kwargs)
-        # Early shared-cache cleanup requires world barriers. Keep PP on the
-        # existing scheduler-ready cleanup path.
-        if self.enable_hierarchical_cache and get_parallel().pp_size == 1:
+        if self.enable_hierarchical_cache:
             release_before_hicache()
         return result
 
@@ -266,11 +265,9 @@ def install(scheduler_cls: Optional[type] = None) -> None:
     def get_init_info(self, *args, **kwargs):
         # Engine and Rust callers need no explicit freeze request for startup
         # file cleanup. All ranks reach this handshake before serving requests.
-        # Only non-PP HiCache initialization completed checkpoint eviction early.
+        # HiCache initialization already completed checkpoint eviction.
         release_startup_page_cache(
-            include_checkpoints=not (
-                self.enable_hierarchical_cache and get_parallel().pp_size == 1
-            )
+            include_checkpoints=not self.enable_hierarchical_cache
         )
         get_parallel().world_group.barrier()
         return orig_get_init_info(self, *args, **kwargs)
