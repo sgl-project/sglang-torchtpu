@@ -123,8 +123,9 @@ class _InMemoryKVCacheManager:
         num_slots: int,
         timeout_s: float = 30.0,
         parallelism: int = 1,
+        num_staging_layers: int | None = None,
     ) -> None:
-        del node_id, timeout_s, parallelism
+        del node_id, timeout_s, parallelism, num_staging_layers
         self.registry = registry
         self.kv_caches = list(kv_caches)
         self.port = int(local_control_port)
@@ -700,7 +701,11 @@ class TestDSV4RaidenDisaggregation(CustomTestCase):
         with (
             patch.dict(sys.modules, _fake_tpu_sync_modules(registry)),
             patch.dict("os.environ", {"SGLANG_RAIDEN_KV_PORT": str(port_base)}),
-            patch.object(RaidenKVManager, "_num_slots", return_value=3),
+            patch.object(
+                RaidenKVManager,
+                "_size_host_staging",
+                lambda self, engines, layers: [(3, n) for n in layers],
+            ),
         ):
             mgr = RaidenKVManager(kv_args, DisaggregationMode.DECODE, server_args)
             mgr.set_kv_caches(get_raiden_kv_caches(pool))
