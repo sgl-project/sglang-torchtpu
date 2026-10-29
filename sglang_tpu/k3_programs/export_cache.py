@@ -20,6 +20,7 @@ from typing import Any
 
 import jax
 import torch
+from sglang_tpu.k3_programs._support.torch_tpu_compat import compile_fx_graph_mode
 from torch_tpu._internal.pallas import pallas as pallas_impl
 
 from sglang_tpu.k3_programs._support.sharded_jax_op import _placeholder
@@ -240,9 +241,7 @@ def prepare_distributed(calls: Sequence[Any]) -> None:
             if index % world != rank:
                 continue
             inputs = tuple(tpu_torch_compile.placeholder_like(t) for t in call.operands)
-            with execution_mode.set_eager_mode(
-                execution_mode.EagerMode.INTERNAL_COMPILE_FX_GRAPH
-            ):
+            with execution_mode.set_eager_mode(compile_fx_graph_mode()):
                 call.op(*inputs)
     except Exception as exc:
         failure = exc
