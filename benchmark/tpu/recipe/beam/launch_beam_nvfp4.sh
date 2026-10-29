@@ -85,5 +85,9 @@ TPU_COMPILE_BS="${TPU_COMPILE_BS:-1 2 4 8 16 32 64}" \
 # OFF and make 4096 unbootable); the offloads stay off by default for
 # fused-RS everywhere else.
 export SGLANG_TPU_FUSED_RS_SPARSE_CORE_OVERRIDE="${SGLANG_TPU_FUSED_RS_SPARSE_CORE_OVERRIDE:-0}"
+# Keep the inductor compile cache (~6-9 GB per warmup) off container-local
+# storage: pods get evicted for ephemeral-storage pressure around 73 GB
+# written. Next to the checkpoint it is on NFS and survives pod restarts.
+export SGLANG_CACHE_DIR="${SGLANG_CACHE_DIR:-$(dirname "$MODEL")/.sglang_cache_nvfp4}"
 EXTRA_ARGS="--moe-runner-backend pallas_tpu_fused_rs --swa-full-tokens-ratio $SWA_FULL_TOKENS_RATIO --weight-loader-disable-mmap --weight-loader-drop-cache-after-load --tpu-compile-tokens 64 128 1024 4096 ${EXTRA_ARGS:-}" \
 exec ./launch_server.sh "$@"
