@@ -36,9 +36,10 @@ CONTEXT_LENGTH = int(os.environ.get("K3_PROGRAM_CONTEXT", str(1 << 20)))
 KV_DTYPE = os.environ.get("K3_PROGRAM_KV_DTYPE") or "fp8_e4m3"
 # One logical block: 256 tokens on each of the 32 ranks in bf16, 512 in fp8.
 PAGE_SIZE = 32 * (512 if KV_DTYPE.startswith("fp8") else 256)
-# The decode admits twice the client concurrency; the prefill holds what it is
-# computing or transferring.
-RUNNING = max(4, 2 * CONCURRENCY) if ROLE == "decode" else max(4, CONCURRENCY)
+# The decode admits twice the client concurrency, up to the 64 rows the
+# programs' plain decode is checked to (without attention DP); the prefill
+# holds what it is computing or transferring.
+RUNNING = min(64, max(4, 2 * CONCURRENCY)) if ROLE == "decode" else max(4, CONCURRENCY)
 # A prefill chunk is one page: every full chunk ends on a KDA checkpoint the
 # prefix cache keeps (the programs' windows split it as they need).
 PREFILL_CHUNK = PAGE_SIZE
