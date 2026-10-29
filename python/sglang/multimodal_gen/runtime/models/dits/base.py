@@ -27,11 +27,6 @@ class BaseDiT(nn.Module, ABC):
     # validated against platform and layer capabilities instead of this set.
     _fsdp_shard_conditions: list = []
     _compile_conditions: list = []
-    # True only if every SP rank runs each _compile_conditions region with the
-    # same shapes, strides and storage offsets: the platform may then keep a
-    # region's collectives in one compiled program (prepare_spmd_region_wrapper),
-    # which hangs or exchanges wrong data when the ranks' programs differ.
-    _compile_regions_spmd_safe: bool = False
     # Methods that drive a forward pass without going through __call__. FSDP2
     # only unshards around the wrapped module's own forward, so anything the
     # shard conditions left in the root group stays sharded unless the entry

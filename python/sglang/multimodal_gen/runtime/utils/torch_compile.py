@@ -104,19 +104,7 @@ def compile_matching_submodules(
             f"check {type(module).__name__}._compile_conditions"
         )
 
-    # Only for models whose ranks all run the same region graph.
-    wrap_region = (
-        current_platform.prepare_spmd_region_wrapper()
-        if getattr(module, "_compile_regions_spmd_safe", False)
-        else None
-    )
-    # The annotation covers a region only while it traces as one graph. It is
-    # not forced with fullgraph=True: under dynamic=False each new shape adds
-    # a graph, and past the recompile limit fullgraph raises instead of
-    # running the region eagerly.
     for submodule in matches:
-        if wrap_region is not None:
-            submodule.forward = wrap_region(submodule.forward)
         submodule.compile(**compile_kwargs)
     return len(matches)
 

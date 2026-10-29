@@ -41,11 +41,7 @@ The tables below are the short view. The sections that follow give per-row topol
 | Qwen3-Coder-30B-A3B | FP8 | 1 host | Experimental |
 | Qwen3.8-27B | bf16 | 1 host | Experimental |
 | DeepSeek-V4 | FP8 | — | Experimental |
-| Wan2.2-TI2V-5B (diffusion) | bf16 | 1 chip, 1 host | Experimental |
-| Wan2.2-T2V-A14B, Wan2.2-I2V-A14B (diffusion) | bf16 | 1 host, 2 hosts | Experimental |
-| FLUX.2-klein-4B (diffusion) | bf16 | 1 chip, 1 host | Experimental |
-| Z-Image-Turbo (diffusion) | bf16 | 1 chip | Experimental |
-| LTX-2 (diffusion) | bf16 | 1 host | Experimental |
+| Wan2.2-TI2V-5B (diffusion) | bf16 | 1 chip | Experimental |
 
 ### Features
 
@@ -70,7 +66,7 @@ The tables below are the short view. The sections that follow give per-row topol
 | Runtime | torch.compile with the TPU backend, compile bundles, direct tracer, overlap scheduling | Supported |
 | Runtime | Out-of-tree plugin mode, zero-recompile serving check | Experimental |
 | Multimodal | Vision-language models (Qwen3-VL, Qwen3.5-VL, Kimi MoonViT, Gemma 4 vision) | Supported |
-| Generation | Diffusion (Wan2.2, FLUX.2-klein, Z-Image-Turbo, LTX-2) | Experimental |
+| Generation | Diffusion (Wan2.2) | Experimental |
 | Serving | Prompt and input logprobs | Supported |
 | Serving | Structured output, function calling | Experimental |
 
@@ -104,11 +100,7 @@ All kernels are tuned for TPU7x. The Pallas kernels check for TPU v4 or newer, b
 | Kimi-K2.5 | INT4 | shares the K2.6 path | **Experimental** | MoonViT vision tower compiled per image. No K2.5-specific test. |
 | Kimi-K3 / K3-Linear | bf16 | 1 host (tiny config) | **Experimental** | Largest per-model TPU code path (KDA attention). Only a dummy-weight compile smoke runs; no real checkpoint served in CI. |
 | Gemma 4 (31B, 26B-A4B) | bf16 | 1 host | **Experimental** | Text and vision. Accuracy and perf suites registered; red at the time of writing. Moves to Supported when green. |
-| Wan2.2-TI2V-5B (diffusion) | bf16 | 1 chip; 1 host (CFG 2 x Ulysses 2 x ring 2); multi-host collectives | **Experimental** | Diffusion engine with the opt-in Pallas splash attention backend and per-block torch.compile; spatial-parallel VAE decode. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
-| Wan2.2-T2V-A14B, Wan2.2-I2V-A14B (diffusion) | bf16 | 1 host (CFG 2 x Ulysses 2 x ring 2); 2 hosts (ring 4) | **Experimental** | As TI2V-5B, with both experts resident. |
-| FLUX.2-klein-4B (diffusion) | bf16 | 1 chip; 1 host (Ulysses 4) | **Experimental** | Pallas splash attention, torch.compile. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
-| Z-Image-Turbo (diffusion) | bf16 | 1 chip (Ulysses 2) | **Experimental** | Pallas splash attention, torch.compile. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
-| LTX-2 (diffusion) | bf16 | 1 host (CFG 2 x Ulysses 4) | **Experimental** | Video and audio. Pallas splash attention, torch.compile. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
+| Wan2.2-TI2V-5B (diffusion) | bf16 | 1 chip; multi-host collectives | **Experimental** | Runs through the generic diffusion engine; external nightly only, no recent green. |
 | Llama, Qwen3 dense (other sizes), Qwen3-MoE (other sizes), Kimi-Linear | — | — | **Experimental** | Generic TPU path with no model-specific test. |
 
 ## Features
@@ -187,7 +179,7 @@ All kernels are tuned for TPU7x. The Pallas kernels check for TPU v4 or newer, b
 | Feature | Single-host | Multi-host | Tier | Notes |
 | --- | --- | --- | --- | --- |
 | Vision-language (Qwen3-VL, Qwen3.5-VL, Kimi MoonViT, Gemma 4 vision) | Nightly (Qwen3-VL, Qwen3.5) | Nightly (Qwen3-VL PD) | **Supported** | Compiled vision encoders with shape buckets; host-side embedding scatter by default. |
-| Diffusion (Wan2.2, FLUX.2-klein, Z-Image-Turbo, LTX-2) | Nightly (ext, Wan2.2-TI2V-5B) | Nightly (ext, collectives) | **Experimental** | Opt-in Pallas splash attention (`--attention-backend tpu_splash_attn`; the default stays SDPA), torch.compile with the `tpu` backend, Ulysses and K/V all-gather ring sequence parallelism, spatial-parallel Wan VAE decode. Launch scripts and tpu7x numbers: [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). The TPU unit suite covers the kernels and dispatch; no green e2e. |
+| Diffusion (Wan2.2) | Nightly (ext) | Nightly (ext, collectives) | **Experimental** | Generic diffusion engine; no TPU-specific kernels. |
 | Prompt and input logprobs | CI (0.6B) | — | **Supported** | Env-gated. Not under DP attention or PP. |
 | Structured output / grammar | — | — | **Experimental** | Works through the eager sampler path; excluded from the spec-decode fast path. No TPU test yet. |
 | Function calling | — | — | **Experimental** | Same as structured output. |
