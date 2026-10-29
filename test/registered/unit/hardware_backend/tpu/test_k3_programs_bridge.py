@@ -108,9 +108,19 @@ class TestUnifiedPools(CustomTestCase):
         }
         kv = {self.plan.kv_block(p) for p in range(1, self.plan.kv_blocks + 1)}
         self.assertEqual(len(state), 3 * self.plan.state_slots)
-        self.assertEqual(min(state), 3)
+        # KV page p is block p; the state follows, slot 1 after slot 0's three.
+        self.assertEqual(min(state), self.plan.state_base + 3)
+        self.assertEqual(max(state), self.plan.num_blocks - 1)
+        self.assertEqual(
+            [self.plan.kv_block(p) for p in (0, 1, self.plan.kv_blocks)],
+            [0, 1, self.plan.kv_blocks],
+        )
+        self.assertEqual(
+            self.plan.state_row(2),
+            self.plan.state_block(2, 0),
+        )
         self.assertFalse(state & kv)
-        self.assertEqual(max(kv), self.plan.num_blocks - 1)
+        self.assertEqual(max(kv), self.plan.kv_blocks)
         self.assertNotIn(0, state | kv)
 
 
@@ -172,8 +182,9 @@ class TestTransferBuffers(CustomTestCase):
             lo, hi = self._bounds(pool)
             self.assertEqual(item, 3 * self.block)
             self.assertGreaterEqual(ptr, lo)
-            # The state range ends where the KV pages begin.
-            self.assertEqual(ptr + length, lo + self.plan.state_blocks * self.block)
+            # The state range follows the KV pages to the end of the pool.
+            self.assertEqual(ptr, lo + (self.plan.state_base + k % 3) * self.block)
+            self.assertEqual(ptr + length, hi)
             for slot in range(1, self.plan.state_slots + 1):
                 address = ptr + slot * item
                 self.assertEqual(

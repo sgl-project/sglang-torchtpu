@@ -11,19 +11,20 @@ rank ``k % 32`` in logical block ``k // 32``, so one block-table entry covers
 sglang keeps KV pages and recurrent state in two allocators. This module
 places both in the same tensors, in disjoint block ranges:
 
-* blocks ``0 .. 3S + 2`` are KDA state blocks: three KDA layers share each
-  pool, so a request holds one state block per KDA group (group ``g``: the
-  ``g``-th KDA layer of every pool), and sglang's Mamba slot ``i`` owns blocks
-  ``3i + g``. sglang reserves slot 0, whose first block is the null block the
+* blocks ``0 .. K`` are KV logical blocks: sglang's KV allocator runs with
+  ``page_size`` = one logical block, and its page ``p`` is block ``p``. sglang
+  never allocates page 0, its padding page: block 0 is the null block the
   programs read for padding rows;
-* blocks ``3(S + 1) + 1 .. N - 1`` are KV logical blocks: sglang's KV allocator
-  runs with ``page_size`` = one logical block, and its page ``p`` (``p >= 1``;
-  page 0 is the padding page, never allocated) is block ``3(S + 1) + p``.
+* blocks ``K + 1 .. N - 1`` are KDA state blocks: three KDA layers share each
+  pool, so a request holds one state block per KDA group (group ``g``: the
+  ``g``-th KDA layer of every pool), and sglang's Mamba slot ``i`` (slot 0
+  reserved) owns the three consecutive blocks ``K + 1 + 3i + g``.
 
-Both are strides from a base inside each tensor, which is how sglang's P/D
-transfer addresses pages and state slots (``base + index * item_len``):
-:func:`kv_buf_infos` and :func:`state_buf_infos` describe them, identically on
-the prefill and the decode side.
+The TPU P/D transfer (Raiden) moves whole rows of the pool tensors by index:
+a page's row is its page id, a slot's are three rows from
+:meth:`UnifiedPoolPlan.state_row`. Pointer-based transfers address the same
+blocks as strides from a base inside each tensor (:func:`kv_buf_infos`,
+:func:`state_buf_infos`), identically on the prefill and the decode side.
 
 The programs see one MLA group (the block-table row of the request's KV
 pages) and three KDA groups whose ``block_size`` spans the whole context, so
@@ -94,6 +95,17 @@ class UnifiedPoolPlan:
         return self.num_blocks - 1 - self.state_blocks
 
     @property
+    def state_base(self) -> int:
+        """The first state block (slot 0's), after the KV blocks."""
+        return self.kv_blocks + 1
+
+    def state_row(self, slot: int) -> int:
+        """The first of Mamba slot ``slot``'s three consecutive state blocks."""
+        if not 0 <= slot <= self.state_slots:
+            raise ValueError(f"KDA slot {slot} is outside 0 .. {self.state_slots}")
+        return self.state_base + KDA_PER_POOL * slot
+
+    @property
     def logical_block_tokens(self) -> int:
         """Tokens one block-table entry covers: a page on each of the 32 ranks."""
         return TP_SIZE * self.layout.tokens_per_block
@@ -102,7 +114,7 @@ class UnifiedPoolPlan:
         """The pool block of sglang KV page ``page`` (0: the null block)."""
         if not 0 <= page <= self.kv_blocks:
             raise ValueError(f"KV page {page} is outside 0 .. {self.kv_blocks}")
-        return 0 if page == 0 else self.state_blocks + page
+        return page
 
     def state_block(self, slot: int, group: int) -> int:
         """KDA group ``group``'s pool block for sglang Mamba slot ``slot``
@@ -111,7 +123,7 @@ class UnifiedPoolPlan:
             raise ValueError(f"KDA slot {slot} is outside 0 .. {self.state_slots}")
         if not 0 <= group < KDA_PER_POOL:
             raise ValueError(f"KDA group {group} is outside 0 .. {KDA_PER_POOL - 1}")
-        return 0 if slot == 0 else KDA_PER_POOL * slot + group
+        return 0 if slot == 0 else self.state_row(slot) + group
 
 
 def plan_pools(
@@ -160,8 +172,7 @@ BufInfos = tuple[list[int], list[int], list[int]]  # (data ptrs, lengths, item l
 
 def kv_buf_infos(caches: dict[str, torch.Tensor], plan: UnifiedPoolPlan) -> BufInfos:
     """The KV pages as sglang's P/D transfer addresses them: per MLA pool, then
-    per draft pool, page ``p`` at ``ptr + p * item_len`` (block
-    ``3(S + 1) + p``; page 0, never allocated, is the block before page 1)."""
+    per draft pool, page ``p`` at ``ptr + p * item_len`` (block ``p``)."""
     from sglang_tpu.k3_programs.kimi_k3.pools import draft_raw_pools
 
     tensors = [caches[mla_layer_name(layer)] for layer in MLA]
@@ -169,7 +180,7 @@ def kv_buf_infos(caches: dict[str, torch.Tensor], plan: UnifiedPoolPlan) -> BufI
     ptrs, lens, items = [], [], []
     for pool in tensors:
         block = _block_bytes(pool)
-        ptrs.append(pool.data_ptr() + plan.state_blocks * block)
+        ptrs.append(pool.data_ptr())
         lens.append((plan.kv_blocks + 1) * block)
         items.append(block)
     return ptrs, lens, items
@@ -178,12 +189,12 @@ def kv_buf_infos(caches: dict[str, torch.Tensor], plan: UnifiedPoolPlan) -> BufI
 def state_buf_infos(caches: dict[str, torch.Tensor], plan: UnifiedPoolPlan) -> BufInfos:
     """The KDA state as sglang's P/D transfer addresses it: per kernel KDA
     layer (``KDA`` order), Mamba slot ``i`` at ``ptr + i * item_len`` (its
-    group's block ``3i + g`` of the layer's pool)."""
+    group's block ``state_row(i) + g`` of the layer's pool)."""
     ptrs, lens, items = [], [], []
     for k, layer in enumerate(KDA):
         pool = caches[kda_layer_name(layer)]
         block, group = _block_bytes(pool), k % KDA_PER_POOL
-        ptrs.append(pool.data_ptr() + group * block)
+        ptrs.append(pool.data_ptr() + (plan.state_base + group) * block)
         lens.append((plan.state_blocks - group) * block)
         items.append(KDA_PER_POOL * block)
     return ptrs, lens, items

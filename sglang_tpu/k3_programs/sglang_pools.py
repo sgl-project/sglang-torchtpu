@@ -50,7 +50,7 @@ def _kv_cache_dtype() -> str:
 
 class K3StatePool:
     """The Mamba pool's stand-in: slot ``i``'s KDA state is its three blocks of
-    the unified pools (``UnifiedPoolPlan.state_block``)."""
+    the unified pools (``UnifiedPoolPlan.state_row``)."""
 
     slot_allocator_device = "cpu"
 
@@ -101,7 +101,7 @@ class K3StatePool:
 
 class K3UnifiedKVPool:
     """The full-attention pool's stand-in: allocates the unified pools, KV
-    page ``p`` on block ``3(S + 1) + p``."""
+    page ``p`` on block ``p``."""
 
     def __init__(
         self,

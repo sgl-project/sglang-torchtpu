@@ -6,12 +6,17 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
 import torch
 
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.disaggregation.raiden.common import get_raiden_kv_caches
+from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 from sglang_tpu.hooks import k3_program as hooks
+from sglang_tpu.k3_programs import sglang_bridge as bridge
 from sglang_tpu.k3_programs import sglang_pools
 from sglang_tpu.k3_programs.kimi_k3 import pools
 from sglang_tpu.k3_programs.kimi_k3.layout import KDA, MLA, NUM_LAYERS
@@ -111,6 +116,77 @@ class TestUnifiedPoolClasses(CustomTestCase):
         self.assertEqual(len(ids), len(kv_ptrs))
         self.assertEqual(ids[-5:], list(range(NUM_LAYERS, NUM_LAYERS + 5)))
         self.assertEqual(ids[: len(MLA)], list(MLA))
+
+
+class TestRaidenGroups(CustomTestCase):
+    """Raiden moves rows of root tensors by index: a page's row is its page
+    id, a slot's three rows are the blocks the program reads its state from."""
+
+    def setUp(self):
+        with _model():
+            self.state, self.kv = _build(slots=4, pages=10)
+        self.hybrid = HybridLinearKVPool(
+            size=self.kv.size,
+            dtype=torch.bfloat16,
+            page_size=STEP,
+            head_num=1,
+            head_dim=576,
+            full_attention_layer_ids=list(MLA),
+            device="cpu",
+            mamba_pool=self.state,
+            use_mla=True,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            full_kv_pool=self.kv,
+        )
+
+    def test_groups(self):
+        groups = get_raiden_kv_caches(self.hybrid)
+        plan = self.kv.plan
+        self.assertEqual(len(groups.full), len(MLA) + 5)
+        self.assertEqual(groups.num_draft_full, 5)
+        self.assertEqual(
+            groups.full_layer_ids[-5:], list(range(NUM_LAYERS, NUM_LAYERS + 5))
+        )
+        self.assertTrue(all(not t._is_view() for t in groups.full + groups.state))
+        self.assertEqual(len(groups.state), len(KDA) // 3)
+        self.assertEqual(
+            {int(t.shape[0]) for t in groups.full + groups.state}, {plan.num_blocks}
+        )
+        self.assertEqual(groups.state_max_blocks, 3)
+        # The draft pools come after the target's, as Raiden's draft entries do.
+        self.assertEqual(
+            [t.data_ptr() for t in groups.full[-5:]],
+            [t.data_ptr() for t in pools.draft_raw_pools(self.kv.caches)],
+        )
+
+    def test_slot_rows_are_the_programs_state_blocks(self):
+        groups = get_raiden_kv_caches(self.hybrid)
+        manager = RaidenKVManager.__new__(RaidenKVManager)
+        manager._state_engine = object()
+        manager._state_type = StateType.MAMBA
+        manager.kv_args = SimpleNamespace(state_types=[StateType.MAMBA])
+        manager._committed_state_row = groups.committed_state_row
+        manager._state_engine_max_blocks = groups.state_max_blocks
+        plan = self.kv.plan
+        for slot in (1, 4):
+            rows = manager._state_rows_from_state_indices([[slot]])
+            self.assertEqual(rows, [plan.state_block(slot, g) for g in range(3)])
+            # KDA layer k reads its state from row state_block(slot, k % 3) of
+            # pool k // 3: one of the rows moved, in the pool registered for it.
+            tables = bridge.block_tables(
+                np.arange(STEP, 2 * STEP), STEP, slot, plan, table_width=4
+            )
+            groups_kv = bridge.kv_groups(plan, 1 << 20, 4)
+            of = {n: g for g, grp in enumerate(groups_kv) for n in grp.layer_names}
+            kda = [(of[bridge.kda_layer_name(layer)], 1 << 20) for layer in KDA]
+            blocks = pools.kda_blocks_at_length(tables, kda, 5)
+            for k, block in enumerate(blocks.tolist()):
+                self.assertIn(block, rows)
+                self.assertEqual(
+                    groups.state[k // 3].data_ptr(),
+                    self.kv.caches[bridge.kda_layer_name(KDA[k])].data_ptr(),
+                )
 
 
 class TestSpecCheckHook(CustomTestCase):
