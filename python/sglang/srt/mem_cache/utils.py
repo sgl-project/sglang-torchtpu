@@ -175,6 +175,26 @@ def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
     return hash_values
 
 
+def last_hash_value(node: Any) -> Optional[str]:
+    """The node's last page hash, or None when it was never hashed."""
+    if not node.hash_value:
+        return None
+    return node.hash_value[-1]
+
+
+def prefix_hash_values(node: Any) -> List[str]:
+    """Page hashes of ``node`` and its ancestors, in root-to-node order.
+
+    Follows ``parent`` links while the nodes carry hashes, so any tree node
+    type with ``hash_value`` and ``parent`` attributes can use it.
+    """
+    chunks = []
+    while node is not None and node.hash_value is not None:
+        chunks.append(node.hash_value)
+        node = node.parent
+    return [value for chunk in reversed(chunks) for value in chunk]
+
+
 def compute_node_event_hash_values(node: Any, page_size: int) -> List[str]:
     """Hash tokens with the legacy salt seed; omit extra_key."""
     namespace = (node.key.extra_key, node.key.cache_salt)

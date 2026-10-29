@@ -289,10 +289,10 @@ def distributed_top_k_for_batch(
 def select_logits_output_mode(forward_batch, model) -> LogitsOutputMode:
     """Select full-vocabulary logits or distributed TopK candidates."""
 
-    # Model capability negotiation uses a CPU collective, which speculative
-    # forwards never need because they require full-vocabulary logits.
+    # Speculative forwards keep the mode their worker set (FULL_VOCAB by default);
+    # a worker asking for candidates negotiated the width at init, outside any trace.
     if _is_speculative_batch(forward_batch):
-        return LogitsOutputMode.FULL_VOCAB
+        return forward_batch.logits_output_mode
     candidate_width = distributed_top_k_candidate_width_for_model(model)
     if candidate_width is None:
         return LogitsOutputMode.FULL_VOCAB

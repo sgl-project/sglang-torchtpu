@@ -12,8 +12,6 @@ import logging
 
 from sglang.srt.plugins.hook_registry import HookType
 from sglang_tpu.hooks.attn_residual import (
-    aggregate,
-    aggregate_fused_add,
     prepare_attn_residual_kernel,
     register_attn_residual_ops,
 )
@@ -198,16 +196,6 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.models.kimi_k3_vl.KimiK3MultiModalProjector.forward",
         pass_through_projected_features,
-        HookType.AROUND,
-    ),
-    (
-        "sglang.srt.layers.attn_residual._aggregate",
-        aggregate,
-        HookType.AROUND,
-    ),
-    (
-        "sglang.srt.layers.attn_residual._aggregate_fused_add",
-        aggregate_fused_add,
         HookType.AROUND,
     ),
     (

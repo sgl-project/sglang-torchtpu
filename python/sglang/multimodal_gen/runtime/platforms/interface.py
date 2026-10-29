@@ -52,6 +52,10 @@ class AttentionBackendEnum(enum.Enum):
     CUBE_SPARSE_ATTN = enum.auto()
     FP8_FA_SM120 = enum.auto()
     NO_ATTENTION = enum.auto()
+    # An out-of-tree platform's own backend: the platform names it
+    # (Platform.get_oot_attn_backend_name) and resolves its class. Appended so
+    # earlier members keep their auto() values.
+    OOT = enum.auto()
 
     def __str__(self):
         return self.name.lower()
@@ -291,6 +295,11 @@ class Platform:
         return True
 
     @classmethod
+    def supports_safetensors_device_load(cls) -> bool:
+        """Whether safetensors can open tensors directly on this platform's device."""
+        return True
+
+    @classmethod
     def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
         return None
 
@@ -319,6 +328,12 @@ class Platform:
     ) -> str:
         """Get the attention backend class of a device."""
         return ""
+
+    @classmethod
+    def get_oot_attn_backend_name(cls) -> str | None:
+        """The ``--attention-backend`` name of this platform's own backend
+        (``AttentionBackendEnum.OOT``), or None when it has none."""
+        return None
 
     @classmethod
     def get_device_capability(

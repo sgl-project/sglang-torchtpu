@@ -50,7 +50,6 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVManager,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_disagg, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
@@ -190,7 +189,7 @@ class RaidenKVManager(
         # decode opts in to consume from a pipeline prefill.
         self._pipeline_enabled = self.pp_size > 1 or (
             disaggregation_mode == DisaggregationMode.DECODE
-            and envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get()
+            and tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get()
         )
         self._pipeline_init_lock = threading.Lock()
         self._pipeline_messages = []
@@ -199,7 +198,7 @@ class RaidenKVManager(
         # rank counts every worker on the node -- attention-TP ranks of every
         # context-parallel, attention-DP, and system-DP replica -- so
         # replicas never share a port, an engine id, or a uuid namespace.
-        base_port = int(os.environ.get("SGLANG_RAIDEN_KV_PORT", str(DEFAULT_KV_PORT)))
+        base_port = tpu_envs.SGLANG_RAIDEN_KV_PORT.get()
         self._local_rank = node_worker_rank(
             self.attn_tp_rank,
             self.attn_tp_size,
@@ -212,17 +211,19 @@ class RaidenKVManager(
             self.pp_size,
         )
         self._control_port = base_port + PORTS_PER_RANK * self._local_rank
-        self._timeout_s = envs.SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S.get()
+        self._timeout_s = tpu_envs.SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S.get()
         self._transfer_parallelism = (
             tpu_envs.SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM.get()
         )
         if self._transfer_parallelism < 1:
-            raise ValueError("SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM must be >= 1")
+            raise ValueError(
+                f"{tpu_envs.SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM.name} must be >= 1"
+            )
         # Raiden reads its own TPU_RAIDEN_DYNAMIC_HOST_STAGING when the engine is
         # built in this process. Store the resolved value back so later reads
         # do not mistake the variable set here for the deprecated alias.
-        dynamic_host_staging = envs.SGLANG_RAIDEN_DYNAMIC_HOST_STAGING.get()
-        envs.SGLANG_RAIDEN_DYNAMIC_HOST_STAGING.set(dynamic_host_staging)
+        dynamic_host_staging = tpu_envs.SGLANG_RAIDEN_DYNAMIC_HOST_STAGING.get()
+        tpu_envs.SGLANG_RAIDEN_DYNAMIC_HOST_STAGING.set(dynamic_host_staging)
         os.environ["TPU_RAIDEN_DYNAMIC_HOST_STAGING"] = (
             "1" if dynamic_host_staging else "0"
         )
@@ -314,7 +315,7 @@ class RaidenKVManager(
             # Detects a prefill that stopped answering and fails its rooms.
             self._start_heartbeat_checker_thread()
             self._decode = DecodeState()
-            self._listener_start_read = envs.SGLANG_RAIDEN_LISTENER_START_READ.get()
+            self._listener_start_read = tpu_envs.SGLANG_RAIDEN_LISTENER_START_READ.get()
 
         # Native I/O tracking stays on the manager: it survives room cleanup.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -323,9 +324,7 @@ class RaidenKVManager(
             # _listen dispatch thread. raiden runs SyncPush unlocked, so
             # _reshard_push_lock serializes register+push across workers.
             self._push_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=max(
-                    1, int(os.environ.get("SGLANG_RAIDEN_PUSH_WORKERS", "1"))
-                ),
+                max_workers=max(1, tpu_envs.SGLANG_RAIDEN_PUSH_WORKERS.get()),
                 thread_name_prefix="raiden-reshard-push",
             )
             self._reshard_push_lock = threading.Lock()
@@ -396,7 +395,8 @@ class RaidenKVManager(
                 raise NotImplementedError(
                     "Raiden pipeline transfer does not move GDN (linear-attention) "
                     "state yet; serve hybrid linear-attention models without "
-                    "pipeline parallelism or SGLANG_RAIDEN_PIPELINE_TRANSFER."
+                    "pipeline parallelism or "
+                    f"{tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.name}."
                 )
             from sglang_tpu.disaggregation.raiden.pipeline import PipelineTransfer
 
@@ -528,16 +528,17 @@ class RaidenKVManager(
         return pages if self._dynamic_host_staging else max_blocks
 
     def _max_request_blocks(self) -> int:
-        override = int(os.environ.get("SGLANG_RAIDEN_MAX_BLOCKS", "0"))
+        override = tpu_envs.SGLANG_RAIDEN_MAX_BLOCKS.get()
         if override > 0:
             return override
-        max_len = self.server_args.context_length or int(
-            os.environ.get("SGLANG_RAIDEN_MAX_MODEL_LEN", "8192")
+        max_len = (
+            self.server_args.context_length
+            or tpu_envs.SGLANG_RAIDEN_MAX_MODEL_LEN.get()
         )
         return max(1, math.ceil(max_len / self.kv_args.page_size))
 
     def _swa_max_request_blocks(self) -> int:
-        override = int(os.environ.get("SGLANG_RAIDEN_SWA_MAX_BLOCKS", "0"))
+        override = tpu_envs.SGLANG_RAIDEN_SWA_MAX_BLOCKS.get()
         if override > 0:
             return override
         window_size = self.kv_args.sliding_window_size
@@ -582,7 +583,7 @@ class RaidenKVManager(
         shrinks the pool instead, and refuses to start when not even one slot
         fits the budget.
         """
-        budget = float(os.environ.get("SGLANG_RAIDEN_HOST_POOL_GB", "128")) * 1024**3
+        budget = tpu_envs.SGLANG_RAIDEN_HOST_POOL_GB.get() * 1024**3
         local_ranks = ranks_per_node(
             self.attn_tp_size,
             self.attn_dp_size,
