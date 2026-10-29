@@ -1,6 +1,8 @@
 """Compare Raiden reshard byte ranges with the actual fused KV pool layout."""
 
+import ast
 import itertools
+import pathlib
 import unittest
 from types import SimpleNamespace
 
@@ -12,8 +14,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.disaggregation.raiden import reshard_schedule as rs
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 from sglang_tpu.disaggregation.raiden.reshard_schedule import (
+    KVLayoutGeometry,
+    LandRequired,
     ReshardGeometry,
-    head_pair_bytes,
 )
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
@@ -22,13 +25,13 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 PAGE = 64
 
 
-def _layer(dtype, heads):
+def _layer(dtype, heads, head_dim=128):
     pool = TpuFusedMHATokenToKVPool(
         size=128,
         page_size=PAGE,
         dtype=dtype,
         head_num=heads,
-        head_dim=128,
+        head_dim=head_dim,
         layer_num=1,
         device="cpu",
         enable_memory_saver=False,
@@ -48,10 +51,13 @@ def _manager(dtype, full_heads, swa_heads, tp):
     """A RaidenKVManager holding one full and one SWA layer for an attention-TP
     rank of a model with the given global kv-head counts."""
     mgr = object.__new__(RaidenKVManager)
+    mgr.attn_tp_size = tp
     mgr._kv_caches = [_layer(dtype, max(1, full_heads // tp))]
     mgr._swa_kv_caches = [_layer(dtype, max(1, swa_heads // tp))]
     mgr.kv_args = SimpleNamespace(
-        total_kv_head_num=full_heads, total_swa_kv_head_num=swa_heads
+        total_kv_head_num=full_heads,
+        total_swa_kv_head_num=swa_heads,
+        page_size=PAGE,
     )
     return mgr
 
@@ -75,11 +81,11 @@ def _fill(layer, heads):
     return raw[0].flatten(), live[0].flatten()
 
 
-def _replay(full_heads, swa_heads, src_tp, dst_tp, *, dtype, swa, heads=None):
-    """Replay a push reshard byte for byte over real pool pages. Each side
-    builds its geometry from its own tensor: via _make_geometry, or with an
-    explicit kv-head count. True when every decode rank holds exactly its own
-    heads with no out-of-bounds copy."""
+def _replay(full_heads, swa_heads, src_tp, dst_tp, *, dtype, swa):
+    """Replay a push reshard byte for byte over real pool pages, each side
+    building its geometry with _make_geometry. True when every decode rank
+    holds exactly its own heads with no out-of-bounds copy; LandRequired when
+    no whole-granule schedule exists."""
     total = swa_heads if swa else full_heads
     sender = _manager(dtype, full_heads, swa_heads, src_tp)
     receiver = _manager(dtype, full_heads, swa_heads, dst_tp)
@@ -87,12 +93,8 @@ def _replay(full_heads, swa_heads, src_tp, dst_tp, *, dtype, swa, heads=None):
     def layer(mgr):
         return (mgr._swa_kv_caches if swa else mgr._kv_caches)[0]
 
-    def geometry(mgr):
-        if heads is None:
-            return mgr._make_geometry(src_tp, dst_tp, swa=swa)
-        return ReshardGeometry(src_tp, dst_tp, head_pair_bytes(layer(mgr)), heads)
-
-    send_geom, recv_geom = geometry(sender), geometry(receiver)
+    send_geom = sender._make_geometry(src_tp, dst_tp, swa=swa)
+    recv_geom = receiver._make_geometry(src_tp, dst_tp, swa=swa)
     for dst_rank in range(dst_tp):
         want, live = _fill(
             layer(receiver).clone(), _rank_heads(total, dst_tp, dst_rank)
@@ -126,6 +128,7 @@ class TestTpuReshardLayout(unittest.TestCase):
         destination = _layer(dtype, max(1, total_heads // dst_tp))
         mgr = object.__new__(RaidenKVManager)
         mgr.attn_tp_rank = 0
+        mgr.attn_tp_size = dst_tp
         mgr._kv_caches = [destination]
         mgr._swa_kv_caches = [destination] if swa else []
         mgr.kv_args = SimpleNamespace(
@@ -175,34 +178,30 @@ class TestTpuReshardLayout(unittest.TestCase):
 
     def test_equal_head_counts_keep_the_full_attention_geometry(self):
         """GPT-OSS-style models (SWA count == full count) get the same SWA
-        schedule as before total_swa_kv_head_num existed."""
+        schedule as full attention."""
         for dtype in (torch.bfloat16, torch.float8_e4m3fn):
             for heads, (src_tp, dst_tp) in ((8, (8, 4)), (8, (16, 8)), (4, (8, 2))):
                 with self.subTest(dtype=dtype, heads=heads, tp=(src_tp, dst_tp)):
                     mgr = _manager(dtype, heads, heads, dst_tp)
-                    old = ReshardGeometry(
-                        src_tp,
-                        dst_tp,
-                        head_pair_bytes(mgr._swa_kv_caches[0]),
-                        heads,
-                    )
-                    new = mgr._make_geometry(src_tp, dst_tp, swa=True)
+                    full = mgr._make_geometry(src_tp, dst_tp)
+                    swa = mgr._make_geometry(src_tp, dst_tp, swa=True)
                     for src_rank in range(src_tp):
-                        dst_rank = src_rank // new.ratio
-                        self.assertEqual(
-                            new.entry_bytes(src_rank, dst_rank),
-                            old.entry_bytes(src_rank, dst_rank),
-                        )
+                        dst_rank = src_rank // swa.ratio
+                        try:
+                            want = full.entry_bytes(src_rank, dst_rank)
+                        except LandRequired:
+                            with self.assertRaises(LandRequired):
+                                swa.entry_bytes(src_rank, dst_rank)
+                            continue
+                        self.assertEqual(swa.entry_bytes(src_rank, dst_rank), want)
 
-    def test_fp8_swa_allows_exactly_the_byte_correct_cells(self):
-        """At fp8 the head-pair granule spans two kv-heads (#829). A cell is
-        allowed iff some kv-head count places every byte correctly, and then
-        with that count; it is refused iff both the SWA and the full count are
-        wrong. The full count is correct by coincidence only where it equals
-        half the SWA count and every rank holds whole packs; those cells are
-        pinned below. TODO(#829): drop the coincidence cells with B1."""
+    def test_fp8_swa_geometry_uses_the_swa_head_count(self):
+        """At fp8 a granule spans two kv-heads (#829). The SWA geometry takes
+        the SWA count, and every whole-granule schedule it yields replays byte
+        for byte; the rest need a landing buffer. The cells that were correct
+        only by coincidence of the old head-pair unit stay correct."""
         fp8 = torch.float8_e4m3fn
-        coincidences = set()
+        correct = set()
         for full_heads, swa_heads in itertools.permutations((2, 4, 8, 16), 2):
             for src_tp, dst_tp in (
                 (2, 1),
@@ -215,25 +214,16 @@ class TestTpuReshardLayout(unittest.TestCase):
             ):
                 cell = (full_heads, swa_heads, src_tp, dst_tp)
                 with self.subTest(cell=cell):
-                    by_count = {
-                        heads: _replay(*cell, dtype=fp8, swa=True, heads=heads)
-                        for heads in (swa_heads, full_heads)
-                    }
                     mgr = _manager(fp8, full_heads, swa_heads, dst_tp)
+                    geom = mgr._make_geometry(src_tp, dst_tp, swa=True)
+                    self.assertEqual(geom.total_kv_heads, swa_heads)
                     try:
-                        heads = mgr._make_geometry(
-                            src_tp, dst_tp, swa=True
-                        ).total_kv_heads
-                    except ValueError as error:
-                        self.assertIn("sliding-window KV", str(error))
-                        self.assertFalse(any(by_count.values()))
+                        exact = _replay(*cell, dtype=fp8, swa=True)
+                    except LandRequired:
                         continue
-                    self.assertTrue(_replay(*cell, dtype=fp8, swa=True))
-                    self.assertTrue(by_count[heads])
-                    if heads != swa_heads:
-                        coincidences.add(cell)
-        self.assertEqual(
-            coincidences,
+                    self.assertTrue(exact)
+                    correct.add(cell)
+        self.assertLessEqual(
             {
                 (2, 4, 2, 1),
                 (4, 8, 2, 1),
@@ -245,10 +235,100 @@ class TestTpuReshardLayout(unittest.TestCase):
                 (8, 16, 8, 4),
                 (8, 16, 8, 2),
             },
+            correct,
         )
         # Full-attention geometry ignores the SWA count.
         mgr = _manager(fp8, 4, 8, 4)
         self.assertEqual(mgr._make_geometry(8, 4).total_kv_heads, 4)
+
+
+class TestKVLayoutGeometry(unittest.TestCase):
+    """The layout geometry against real pool tensors' strides."""
+
+    def test_token_major_matches_pool_strides(self):
+        for dtype, heads, head_dim in itertools.product(
+            (torch.bfloat16, _FP8), (1, 2, 4, 8), (64, 128)
+        ):
+            with self.subTest(dtype=dtype, heads=heads, head_dim=head_dim):
+                t = _layer(dtype, heads, head_dim)
+                es = t.element_size()
+                g = KVLayoutGeometry.from_tensor(
+                    t.shape, es, heads, seq_along_lane=False
+                )
+                self.assertEqual(g.granule_bytes, t.stride(2) * es)
+                self.assertEqual(g.row_bytes, t.stride(1) * es)
+                self.assertEqual(g.block_bytes, t.stride(0) * es)
+                self.assertEqual(g.granules_per_token, t.shape[2])
+                self.assertEqual(g.slots_per_granule, t.shape[3])
+                # B1: an fp8 head is half a granule, a bf16 head a whole one.
+                self.assertEqual(g.heads_per_granule, 2 if dtype == _FP8 else 1)
+                self.assertEqual(
+                    g.granule_bytes / g.heads_per_granule, 2 * t.shape[4] * es
+                )
+                self.assertEqual(g.head_bytes, 2 * t.shape[4] * es)
+
+    def test_fp8_head_count_is_not_read_from_the_shape(self):
+        # B4: one and two fp8 heads share a shape; the count is the caller's.
+        one, two = _layer(_FP8, 1), _layer(_FP8, 2)
+        self.assertEqual(one.shape, two.shape)
+        for heads in (1, 2):
+            g = KVLayoutGeometry.from_tensor(one.shape, 1, heads, seq_along_lane=False)
+            self.assertEqual(g.heads_per_rank, heads)
+        with self.assertRaisesRegex(ValueError, "does not hold 4 kv heads"):
+            KVLayoutGeometry.from_tensor(one.shape, 1, 4, seq_along_lane=False)
+
+    def test_seq_along_lane_granules_are_not_modeled(self):
+        g = KVLayoutGeometry.from_tensor(
+            _shape("HND", 1, 1, 128, 256), 1, 1, seq_along_lane=True, page_size=256
+        )
+        for name in ("granule_bytes", "block_bytes", "c_pad", "row_bytes"):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(NotImplementedError, "#829-P1a-HND"):
+                    getattr(g, name)
+        with self.assertRaises(NotImplementedError):
+            ReshardGeometry.from_layout(8, 4, g, 4)
+
+    def test_direct_and_land_contributions(self):
+        fp8 = KVLayoutGeometry.from_tensor(
+            _shape("NHD", 1, 2, 128, 64), 1, 2, seq_along_lane=False
+        )
+        # fp8 2 -> 4 heads per rank: prefill rank 1 fills granule 1.
+        geom = ReshardGeometry.from_layout(8, 4, fp8, 16)
+        self.assertEqual(geom.entry_bytes(1, 0), (0, 512, 512, 512, 1024))
+        # fp8 1 -> 1 head per rank (4 kv heads at TP8 -> TP4): one padded
+        # granule each, as before.
+        geom = ReshardGeometry.from_layout(8, 4, fp8, 4)
+        self.assertEqual(geom.entry_bytes(1, 0), (0, 512, 512, 0, 512))
+        # fp8 1 -> 2 heads per rank (8 kv heads at TP8 -> TP4): the second
+        # source's head starts mid-granule, and the first source's padding
+        # slots would cover it.
+        geom = ReshardGeometry.from_layout(8, 4, fp8, 8)
+        for src_rank in (0, 1):
+            with self.assertRaises(LandRequired):
+                geom.entry_bytes(src_rank, 0)
+
+    def test_rpa_batched_page_floor(self):
+        """The SEQ_ALONG_LANE cells allowed here assume pages are a multiple of
+        the 128-lane width and at least 128 (the HND padding audit); the
+        batched RPA backend enforces its floor at server-arg resolution."""
+        path = pathlib.Path(rs.__file__).parents[2] / "attention_pallas_rpa_batched.py"
+        tree = ast.parse(path.read_text())
+        floor = next(
+            node.value.value
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and [getattr(t, "id", None) for t in node.targets] == ["_MIN_PAGE_SIZE"]
+        )
+        self.assertGreaterEqual(floor, 128)
+        self.assertEqual(floor % 128, 0)
+        spec = next(
+            node.value
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and [getattr(t, "id", None) for t in node.targets] == ["RPA_BATCHED_SPEC"]
+        )
+        kw = {k.arg: k.value for k in spec.keywords}
+        self.assertEqual(getattr(kw["min_page_size"], "id", None), "_MIN_PAGE_SIZE")
 
 
 # ---- push-reshard refusal --------------------------------------------------
@@ -344,15 +424,58 @@ def _chunks(offset, size, stride, count):
     return (offset + stride * np.arange(count)[:, None] + np.arange(size)).ravel()
 
 
-def _push_correct(layout, itemsize, src_tp, dst_tp, held, geom_heads, head_dim, page):
+def _side_geometry(layout, t, heads, src_tp, dst_tp, geom_heads, page):
+    """The geometry _make_geometry builds from a side's tensor ``t``."""
+    lay = KVLayoutGeometry.from_tensor(
+        t.shape,
+        t.element_size(),
+        heads,
+        seq_along_lane=layout == "HND",
+        page_size=page,
+    )
+    if layout == "HND":
+        return rs.ReshardGeometry(src_tp, dst_tp, lay.legacy_row_bytes, geom_heads)
+    return rs.ReshardGeometry.from_layout(src_tp, dst_tp, lay, geom_heads)
+
+
+class _Tampered:
+    """A geometry whose entries pass through ``tamper``."""
+
+    def __init__(self, geom, tamper):
+        self._geom, self._tamper = geom, tamper
+        self.src_tp, self.dst_tp, self.ratio = geom.src_tp, geom.dst_tp, geom.ratio
+
+    def entry_bytes(self, p, d):
+        return self._tamper(self._geom.entry_bytes(p, d))
+
+
+def _push_correct(
+    layout, itemsize, src_tp, dst_tp, held, geom_heads, head_dim, page, tamper=None
+):
     """Replay the legacy push byte for byte: the sender sends at most its block
-    of the entry's chunks, the receiver writes exactly what was sent."""
-    ratio = rs.reshard_ratio(src_tp, dst_tp)
+    of the entry's chunks, the receiver writes exactly what was sent. False
+    when no whole-granule schedule exists."""
     s_h, d_h = max(1, held // src_tp), max(1, held // dst_tp)
     src_t = _Tensor(_shape(layout, itemsize, s_h, head_dim, page), itemsize)
     dst_t = _Tensor(_shape(layout, itemsize, d_h, head_dim, page), itemsize)
-    gsrc = rs.ReshardGeometry(src_tp, dst_tp, rs.head_pair_bytes(src_t), geom_heads)
-    gdst = rs.ReshardGeometry(src_tp, dst_tp, rs.head_pair_bytes(dst_t), geom_heads)
+    gsrc = _side_geometry(layout, src_t, s_h, src_tp, dst_tp, geom_heads, page)
+    gdst = _side_geometry(layout, dst_t, d_h, src_tp, dst_tp, geom_heads, page)
+    if tamper is not None:
+        gsrc, gdst = _Tampered(gsrc, tamper), _Tampered(gdst, tamper)
+    try:
+        return _replay_requests(
+            layout, itemsize, src_tp, dst_tp, held, head_dim, page, gsrc, gdst
+        )
+    except LandRequired:
+        return False
+
+
+def _replay_requests(
+    layout, itemsize, src_tp, dst_tp, held, head_dim, page, gsrc, gdst
+):
+    ratio = rs.reshard_ratio(src_tp, dst_tp)
+    s_h, d_h = max(1, held // src_tp), max(1, held // dst_tp)
+    src_t = _Tensor(_shape(layout, itemsize, s_h, head_dim, page), itemsize)
     src_block = int(np.prod(src_t.shape[1:])) * itemsize
     for d in range(dst_tp):
         expect = _labels(
@@ -437,8 +560,9 @@ class TestPushReshardRefusal(unittest.TestCase):
         self.assertIsNone(self._decode([bf16_2], [2], total_heads=8))
         self.assertIsNone(self._decode([fp8_1], [1], total_heads=4))
         self.assertIn("fp8", self._decode([fp8_2], [2], total_heads=8))
+        # 2 -> 4 fp8 heads per rank: each source fills whole granules.
         fp8_4 = _layer(_FP8, 4)
-        self.assertIsNotNone(self._decode([fp8_4], [4], total_heads=16))
+        self.assertIsNone(self._decode([fp8_4], [4], total_heads=16))
 
     def test_layout_and_limits(self):
         mla = torch.zeros(4, 64, 576, dtype=torch.bfloat16)
@@ -537,17 +661,21 @@ class TestPushReshardBytes(unittest.TestCase):
     CASES = [
         ("NHD", 2, 8, 4, 8, 8, 128, 64, True),
         ("NHD", 2, 4, 1, 8, 8, 64, 64, True),
+        ("NHD", 2, 8, 2, 8, 8, 128, 64, True),
         ("NHD", 1, 8, 4, 4, 4, 128, 64, True),
+        # fp8 sources holding whole granules (2 -> 4, 2 -> 8, 4 -> 16 heads).
+        ("NHD", 1, 4, 2, 8, 8, 128, 64, True),
+        ("NHD", 1, 8, 2, 16, 16, 128, 64, True),
+        ("NHD", 1, 4, 1, 16, 16, 64, 64, True),
+        # fp8 one head per source into more per decode rank needs a landing
+        # buffer (#829): 8 kv heads at TP8 -> TP4, 1 -> 2, 1 -> 4.
         ("NHD", 1, 8, 4, 8, 8, 128, 64, False),
-        ("NHD", 1, 4, 2, 8, 8, 128, 64, False),
-        # TODO(#829) coincidence: fp8 layers holding twice the geometry's heads
-        # with even heads per rank (sliding-window before #1076, draft).
-        ("NHD", 1, 4, 2, 8, 4, 128, 64, True),
-        ("NHD", 1, 8, 2, 16, 8, 128, 64, True),
+        ("NHD", 1, 2, 1, 2, 2, 128, 64, False),
+        ("NHD", 1, 16, 4, 16, 16, 128, 64, False),
         # Spec §3.2 counterexample: shape-only heads would allow it.
         ("NHD", 1, 8, 4, 8, 4, 128, 64, False),
         ("NHD", 2, 8, 4, 16, 8, 128, 64, False),
-        # TODO(#829) coincidence: SEQ_ALONG_LANE at one head per rank.
+        # TODO(#829-P1a-HND) coincidence: SEQ_ALONG_LANE at one head per rank.
         ("HND", 2, 8, 4, 4, 4, 128, 128, True),
         ("HND", 1, 8, 4, 4, 4, 128, 256, True),
         ("HND", 2, 8, 4, 4, 4, 256, 128, False),
@@ -562,13 +690,50 @@ class TestPushReshardBytes(unittest.TestCase):
                 self.assertEqual(_push_correct(*args), exact)
                 self.assertEqual(_allowed(*args), exact)
 
+    def test_half_count_geometry_is_no_longer_built(self):
+        """fp8 layers holding twice the geometry's heads, even heads per rank.
+        Before #829 the push path sized the sliding-window geometry from the
+        full count where the fp8 head-pair unit made that byte-correct
+        (swa_geometry_kv_heads), so these pushes were exact. _make_geometry now
+        sizes a token-major group from its own count, which gives the very
+        same entries; a half-count token-major geometry is never built, and
+        the predicate refuses it."""
+        for src_tp, dst_tp, held in ((4, 2, 8), (8, 2, 16)):
+            half = ("NHD", 1, src_tp, dst_tp, held, held // 2, 128, 64)
+            real = ("NHD", 1, src_tp, dst_tp, held, held, 128, 64)
+            with self.subTest(src_tp=src_tp, dst_tp=dst_tp, held=held):
+                self.assertFalse(_allowed(*half))
+                self.assertTrue(_allowed(*real))
+                self.assertTrue(_push_correct(*real))
+                layout = KVLayoutGeometry(rs.TOKEN_MAJOR, 4, 1, held // src_tp, 128, 64)
+                ratio = rs.reshard_ratio(src_tp, dst_tp)
+                legacy = ReshardGeometry(src_tp, dst_tp, 4 * 128, held // 2)
+                new = ReshardGeometry.from_layout(src_tp, dst_tp, layout, held)
+                for p in range(src_tp):
+                    self.assertEqual(
+                        new.entry_bytes(p, p // ratio),
+                        legacy.entry_bytes(p, p // ratio),
+                    )
+
+    def test_replay_rejects_a_misplaced_schedule(self):
+        """Negative control: the replay that passes the allowed fp8 2 -> 4
+        cell fails once its stride or offset is off by one granule."""
+        case = ("NHD", 1, 4, 2, 8, 8, 128, 64)
+        self.assertTrue(_push_correct(*case, tamper=lambda e: e))
+        for name, tamper in (
+            ("dst stride", lambda e: (*e[:4], e[4] + 512)),
+            ("dst offset", lambda e: (*e[:3], 0, e[4])),
+            ("src stride", lambda e: (e[0], e[1], e[2] + 512, e[3], e[4])),
+        ):
+            with self.subTest(tamper=name):
+                self.assertFalse(_push_correct(*case, tamper=tamper))
+
 
 class TestRefusalWithSlidingWindow(unittest.TestCase):
     def test_refusal_matches_both_groups_bytes(self):
         """reshard_refusal checks the full and the sliding-window group. Over
         real pools it allows a cell iff both groups land byte for byte, with
-        the SWA group sized by _make_geometry (#1076), including the fp8
-        cells where that keeps the full count."""
+        the SWA group sized by _make_geometry from its own head count."""
 
         def manager(dtype, full_heads, swa_heads, tp, mode):
             mgr = _manager(dtype, full_heads, swa_heads, tp)
@@ -586,10 +751,11 @@ class TestRefusalWithSlidingWindow(unittest.TestCase):
                     cell = (dtype, full_heads, swa_heads, src_tp, dst_tp)
                     with self.subTest(cell=cell):
                         heads = (full_heads, swa_heads, src_tp, dst_tp)
-                        exact = _replay(*heads, dtype=dtype, swa=False)
                         try:
-                            exact = exact and _replay(*heads, dtype=dtype, swa=True)
-                        except ValueError:
+                            exact = _replay(*heads, dtype=dtype, swa=False) and _replay(
+                                *heads, dtype=dtype, swa=True
+                            )
+                        except LandRequired:
                             exact = False
                         allowed = all(
                             manager(
