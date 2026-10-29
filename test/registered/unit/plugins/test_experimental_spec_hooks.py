@@ -24,7 +24,7 @@ from sglang.test.test_utils import CustomTestCase, enter_scope
 from sglang_tpu.envs import envs
 from sglang_tpu.experimental import register_host_batch_padder, uses_host_batch
 from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
-from sglang_tpu.experimental.speculative import base_spec_worker, draft_info
+from sglang_tpu.experimental.speculative import base_spec_worker, draft_info, spec_types
 from sglang_tpu.experimental.speculative.block_info import (
     HostPaddedBlockDraftInput,
 )
@@ -95,6 +95,97 @@ def _state(rows):
 
 
 class TestExperimentalSpecHooks(CustomTestCase):
+    def test_bucket_view_builds_host_bounds_only_when_requested(self):
+        original = dict(
+            multimodal_inputs=None,
+            seq_lens=torch.tensor([5]),
+            seq_lens_cpu=torch.tensor([5]),
+            seq_lens_sum=5,
+            orig_seq_lens=torch.tensor([5]),
+            req_pool_indices=torch.tensor([1]),
+            req_pool_indices_cpu=torch.tensor([1]),
+        )
+        state = SimpleNamespace(
+            seq_lens=torch.tensor([6, 0]), req_pool_indices=torch.tensor([1, 0])
+        )
+        bounds = torch.tensor([10, 0])
+        for host_kv_rows, overrides in (
+            (4, {}),
+            (4, {"seq_lens_cpu": None}),
+            (None, {}),
+        ):
+            with self.subTest(host_kv_rows=host_kv_rows, overrides=overrides):
+                batch = SimpleNamespace(**original)
+                addressing = SimpleNamespace(
+                    req_pool_indices_cpu=torch.tensor([1, 0]),
+                    padded_kv_lens_after_rows=MagicMock(return_value=(bounds, 10)),
+                )
+                with base_spec_worker.TpuSpecWorker._bucket_view(
+                    batch,
+                    bucket_state=state,
+                    verify_input=addressing,
+                    host_kv_rows=host_kv_rows,
+                    **overrides,
+                ):
+                    self.assertIs(
+                        batch.seq_lens_cpu,
+                        overrides.get(
+                            "seq_lens_cpu", bounds if host_kv_rows is not None else None
+                        ),
+                    )
+                    self.assertEqual(
+                        batch.seq_lens_sum, 10 if host_kv_rows is not None else None
+                    )
+                    self.assertIs(batch.req_pool_indices, state.req_pool_indices)
+                for name, value in original.items():
+                    self.assertIs(getattr(batch, name), value)
+                if host_kv_rows is None:
+                    addressing.padded_kv_lens_after_rows.assert_not_called()
+                else:
+                    addressing.padded_kv_lens_after_rows.assert_called_once_with(4)
+
+    def test_step_selects_rows_before_drafting_and_commits_after_verification(self):
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker.num_verify_rows = 8
+        worker._target_has_linear_attn = True
+        batch, rows, drafts, logits, accept, committed = [object() for _ in range(6)]
+        bucket = SimpleNamespace(state=SimpleNamespace(seq_lens=object()))
+        addressing = SimpleNamespace(
+            verify_cache_candidates=object(), committed_lens=object()
+        )
+        calls = MagicMock()
+        calls.select.return_value = rows
+        calls.draft.return_value = drafts
+        calls.verify.return_value = logits, accept
+        calls.commit.return_value = committed
+        with (
+            patch.object(base_spec_worker, "select_verify_rows", calls.select),
+            patch.object(worker, "draft", calls.draft),
+            patch.object(worker, "verify", calls.verify),
+            patch.object(worker, "_commit_linear_attn_states", calls.linear),
+            patch.object(worker, "commit", calls.commit),
+        ):
+            result = worker.step(batch, bucket, addressing)
+        self.assertEqual(result, (committed, logits, accept))
+        self.assertEqual(
+            [entry[0] for entry in calls.mock_calls],
+            ["select", "draft", "verify", "linear", "commit"],
+        )
+        calls.select.assert_called_once_with(
+            addressing.verify_cache_candidates,
+            addressing.committed_lens,
+            bucket.state.seq_lens,
+            8,
+        )
+        calls.draft.assert_called_once_with(batch, bucket, rows, addressing)
+        calls.verify.assert_called_once_with(batch, bucket, rows, drafts, addressing)
+        calls.linear.assert_called_once_with(
+            batch=batch, accept=accept, verify_input=addressing
+        )
+        calls.commit.assert_called_once_with(
+            batch, bucket.state, rows, addressing, logits, accept
+        )
+
     def test_verify_passes_current_draft_metadata_to_target(self):
         worker = object.__new__(TpuBlockSpecWorker)
         worker.num_verify_rows = 2
@@ -1376,11 +1467,50 @@ class TestExperimentalSpecHooks(CustomTestCase):
 
             # A shorter active step still trails a preceding full-width commit.
             batch.spec_info = draft
-            plan = TpuSpecVerifyInput.from_batch(batch, num_verify_rows=2, padded_bs=4)
-            self.assertEqual(plan.host_len_slack, num_draft_tokens)
-            self.assertEqual(plan.verify_cache_candidates.shape, (4, 6))
+            for padded_bs in (2, 4):
+                with self.subTest(padded_bs=padded_bs):
+                    plan = TpuSpecVerifyInput.from_batch(
+                        batch, num_verify_rows=2, padded_bs=padded_bs
+                    )
+                    self.assertEqual(plan.host_len_slack, num_draft_tokens)
+                    self.assertEqual(plan.verify_cache_candidates.shape, (padded_bs, 6))
+                    self.assertEqual(
+                        plan.req_pool_indices.tolist(), [1, 2] + [0] * (padded_bs - 2)
+                    )
+                    if padded_bs == 2:
+                        self.assertIs(plan.req_pool_indices, batch.req_pool_indices)
             with self.assertRaisesRegex(ValueError, "reserved KV window"):
                 TpuSpecVerifyInput.from_batch(batch, num_verify_rows=4, padded_bs=4)
+
+            # Page-addressed attention still reserves both windows and keeps
+            # the host slack, but has no token-slot gather or device addressing.
+            with (
+                patch.object(
+                    HostPaddedBlockDraftInput, "needs_verify_cache_locs", False
+                ),
+                patch.object(
+                    draft_info,
+                    "gather_dflash_candidate_window",
+                    side_effect=AssertionError("unused token-slot gather"),
+                ),
+                patch.object(
+                    spec_types,
+                    "padded_h2d",
+                    side_effect=AssertionError("unused addressing upload"),
+                ),
+            ):
+                draft.prepare_for_decode(batch)
+                plan = TpuSpecVerifyInput.from_batch(
+                    batch, num_verify_rows=2, padded_bs=2
+                )
+                self.assertIsNone(plan.verify_cache_candidates)
+                self.assertIsNone(plan.committed_lens)
+                self.assertIs(plan.req_pool_indices, batch.req_pool_indices)
+                self.assertEqual(plan.host_len_slack, num_draft_tokens)
+                self.assertEqual(plan.seq_lens_cpu.tolist(), [5, 10])
+                self.assertEqual([r.kv.kv_allocated_len for r in reqs], [12, 20])
+                self.assertTrue(draft.tpu_host_seq_lens_is_committed)
+                self.assertEqual(len(allocations), 1)
 
             # Request validation and KV planning use the selected worker's
             # capability, including an input constructed outside the worker.
