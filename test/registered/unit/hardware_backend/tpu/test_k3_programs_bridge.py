@@ -108,6 +108,7 @@ class TestUnifiedPools(CustomTestCase):
         }
         kv = {self.plan.kv_block(p) for p in range(1, self.plan.kv_blocks + 1)}
         self.assertEqual(len(state), 3 * self.plan.state_slots)
+        self.assertEqual(min(state), 3)
         self.assertFalse(state & kv)
         self.assertEqual(max(kv), self.plan.num_blocks - 1)
         self.assertNotIn(0, state | kv)
@@ -137,6 +138,51 @@ class TestDraftPools(CustomTestCase):
         )
 
 
+class TestTransferBuffers(CustomTestCase):
+    """sglang's P/D transfer reaches page p / slot i at ptr + index * item_len."""
+
+    def setUp(self):
+        self.plan = _plan()
+        self.caches = bridge.allocate_pools(self.plan, "cpu", draft_layers=5)
+        self.block = 128 * 2 * 640 * 2
+
+    def _bounds(self, tensor):
+        return tensor.data_ptr(), tensor.data_ptr() + tensor.numel() * 2
+
+    def test_kv_pages(self):
+        ptrs, lens, items = bridge.kv_buf_infos(self.caches, self.plan)
+        tensors = [self.caches[bridge.mla_layer_name(l)] for l in MLA]
+        tensors += pools.draft_raw_pools(self.caches)
+        self.assertEqual(len(ptrs), len(MLA) + 5)
+        for ptr, length, item, pool in zip(ptrs, lens, items, tensors):
+            self.assertEqual(item, self.block)
+            lo, hi = self._bounds(pool)
+            self.assertGreaterEqual(ptr, lo)
+            self.assertLessEqual(ptr + length, hi)
+            for page in (1, 7, self.plan.kv_blocks):
+                self.assertEqual(
+                    ptr + page * item, lo + self.plan.kv_block(page) * self.block
+                )
+
+    def test_state_slots(self):
+        ptrs, lens, items = bridge.state_buf_infos(self.caches, self.plan)
+        self.assertEqual(len(ptrs), len(KDA))
+        for k, (ptr, length, item) in enumerate(zip(ptrs, lens, items)):
+            pool = self.caches[bridge.kda_layer_name(KDA[k])]
+            lo, hi = self._bounds(pool)
+            self.assertEqual(item, 3 * self.block)
+            self.assertGreaterEqual(ptr, lo)
+            # The state range ends where the KV pages begin.
+            self.assertEqual(ptr + length, lo + self.plan.state_blocks * self.block)
+            for slot in range(1, self.plan.state_slots + 1):
+                address = ptr + slot * item
+                self.assertEqual(
+                    address,
+                    lo + self.plan.state_block(slot, k % 3) * self.block,
+                )
+                self.assertLessEqual(address + self.block, ptr + length)
+
+
 class TestMlaTable(CustomTestCase):
     def test_pages_map_to_logical_blocks(self):
         plan = _plan()
@@ -164,7 +210,7 @@ class TestMlaTable(CustomTestCase):
         block = 128 * 2 * 640 * 2
         plan = bridge.plan_pools(block * len(MLA) * 50, state_slots=8)
         self.assertEqual(
-            (plan.num_blocks, plan.state_blocks, plan.kv_blocks), (50, 24, 25)
+            (plan.num_blocks, plan.state_blocks, plan.kv_blocks), (50, 27, 22)
         )
         with self.assertRaisesRegex(ValueError, "cannot hold"):
             bridge.plan_pools(block * len(MLA) * 20, state_slots=8)
