@@ -88,6 +88,7 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
     bf16_gemm_dispatch,
@@ -125,6 +126,7 @@ from sglang.srt.models.utils import (
     fused_qk_gemma_rmsnorm_with_gate,
 )
 from sglang.srt.platforms import current_platform
+from sglang.srt.plugins.oot_classes import oot_base_class
 from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
@@ -280,7 +282,7 @@ if _is_npu:
 
 def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     quant_method = getattr(linear, "quant_method", None)
-    return quant_method.__class__.__name__ == "Fp8LinearMethod" and (
+    return oot_base_class(type(quant_method)) is Fp8LinearMethod and (
         getattr(quant_method, "block_quant", False)
         or getattr(quant_method, "use_mxfp8", False)
     )
