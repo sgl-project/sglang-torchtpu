@@ -1848,7 +1848,10 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         if is_mixed:
             # Mixed mode: Phase 2 runs STRIPED across both decode and prefill
             # sequences. Decode sequences attend stripe + new token on owner;
-            # prefill chunks attend cached prefix only.
+            # prefill chunks attend cached prefix only. The batched backend's
+            # extend distribution is [0, 0, n], so every row (decode rows
+            # included) sits in the MIXED range: run that kernel only and skip
+            # the empty DECODE launch.
             out_prefix, lse_prefix = self._dcp_op(
                 q_all,
                 k,
@@ -1870,7 +1873,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 False,  # skip_kv_write: owner writes decode token
                 cp,  # cp_group_size
                 3,  # attention_scope: STRIPED
-                0,  # rpa_cases: DECODE + MIXED
+                2,  # rpa_cases: MIXED only (DECODE range is empty)
             )
         else:
             out_prefix, lse_prefix = self._dcp_op(
