@@ -1,11 +1,13 @@
-"""Unit tests for the TPU xprof profiler wiring."""
+"""Unit tests for the TPU torch.profiler wiring."""
 
-import dataclasses
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components import (
@@ -13,40 +15,23 @@ from sglang.srt.managers.scheduler_components import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.profiler import (
-    _tpu_profile_options,
-    start_tpu_profile,
-    stop_tpu_profile,
-)
+from sglang.test.test_utils import CustomTestCase, enter_scope
+from sglang_tpu import profiler as tpu_profiler
+from sglang_tpu.profiler import start_tpu_profile, stop_tpu_profile
 
-# Pure-logic tests. torch_tpu is faked via sys.modules, so this runs on the
-# CPU CI runner (no TPU required).
+# Pure-logic tests. torch_tpu is faked via sys.modules and ProfilerActivity.TPU
+# is aliased to PrivateUse1 the way torch_tpu does it, so this runs on the CPU
+# CI runner (no TPU required).
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-
-@dataclasses.dataclass
-class _BaseProfileOptions:
-    """Mirrors torch_tpu's _impl.ProfileOptions: three levels, all unset."""
-
-    host_tracer_level: int | None = None
-    device_tracer_level: int | None = None
-    python_tracer_level: int | None = None
+_ProfilerActivity = torch.profiler.ProfilerActivity
 
 
-def _fake_torch_tpu(profile_options_cls=_BaseProfileOptions, calls=None):
-    """Fake torch_tpu's private profiler layout.
-
-    start_trace/stop_trace live in _impl; the package root exports only the
-    torch.profiler-facing names. A fake that puts them at the root would let a
-    regression to the wrong import path pass here.
-    """
+def _fake_torch_tpu(calls):
+    """Fake torch_tpu's legacy _impl.start_trace/stop_trace, recording calls."""
     impl = types.ModuleType("torch_tpu._internal.profiler._impl")
-    if profile_options_cls is not None:
-        impl.ProfileOptions = profile_options_cls
-    if calls is not None:
-        impl.start_trace = lambda d, o=None: calls.append(("start", d, o))
-        impl.stop_trace = lambda: calls.append(("stop",))
+    impl.start_trace = lambda *args, **kwargs: calls.append("start_trace")
+    impl.stop_trace = lambda *args, **kwargs: calls.append("stop_trace")
     profiler = types.ModuleType("torch_tpu._internal.profiler")
     profiler._impl = impl
     internal = types.ModuleType("torch_tpu._internal")
@@ -61,140 +46,99 @@ def _fake_torch_tpu(profile_options_cls=_BaseProfileOptions, calls=None):
     }
 
 
-class TestTpuProfileOptions(CustomTestCase):
-    def _options(
-        self,
-        *,
-        num_chips,
-        num_sparse_cores,
-        with_cpu=True,
-        profile_options_cls=_BaseProfileOptions,
-    ):
+class TestStartUsesNativeTorchProfiler(CustomTestCase):
+    """start_tpu_profile builds one torch.profiler with the TPU activity."""
+
+    def _start(self, *, with_cpu, python_tracer=False):
+        calls = []
+        output_dir = Path(enter_scope(self, tempfile.TemporaryDirectory())) / "r"
         with (
-            envs.SGLANG_TPU_PROFILE_NUM_CHIPS.override(num_chips),
-            envs.SGLANG_TPU_PROFILE_NUM_SPARSE_CORES.override(num_sparse_cores),
-            patch.dict(sys.modules, _fake_torch_tpu(profile_options_cls)),
+            envs.SGLANG_TPU_PROFILE_PYTHON_TRACER.override(python_tracer),
+            patch.dict(sys.modules, _fake_torch_tpu(calls)),
+            patch.object(
+                _ProfilerActivity, "TPU", _ProfilerActivity.PrivateUse1, create=True
+            ),
+            patch("torch.profiler.profile") as profile,
+            patch("torch.profiler.tensorboard_trace_handler") as handler,
         ):
-            return _tpu_profile_options(with_cpu=with_cpu)
+            trace = start_tpu_profile(output_dir=output_dir, with_cpu=with_cpu)
+        return trace, profile, handler, calls, output_dir
 
-    def test_limits_enabled(self):
-        options = self._options(num_chips=1, num_sparse_cores=2)
+    def test_cpu_and_tpu(self):
+        trace, profile, handler, calls, output_dir = self._start(with_cpu=True)
 
-        self.assertEqual(options.tpu_num_chips_to_profile_per_task, 1)
-        self.assertEqual(options.tpu_num_sparse_cores_to_trace, 2)
-        # Tile cap only kicks in at a single SparseCore; here 2 leaves it off.
-        self.assertIsNone(options.tpu_num_sparse_core_tiles_to_trace)
-        # Levels survive the narrowing subclass.
-        self.assertEqual(options.host_tracer_level, 2)
-        self.assertEqual(options.device_tracer_level, 1)
-
-    def test_single_sparse_core_narrows_to_one_tile(self):
-        options = self._options(num_chips=1, num_sparse_cores=1)
-
-        self.assertEqual(options.tpu_num_chips_to_profile_per_task, 1)
-        self.assertEqual(options.tpu_num_sparse_cores_to_trace, 1)
-        self.assertEqual(options.tpu_num_sparse_core_tiles_to_trace, 1)
-
-    def test_one_limit_disabled(self):
-        options = self._options(num_chips=4, num_sparse_cores=0)
-
-        self.assertEqual(options.tpu_num_chips_to_profile_per_task, 4)
-        self.assertIsNone(options.tpu_num_sparse_cores_to_trace)
-        self.assertIsNone(options.tpu_num_sparse_core_tiles_to_trace)
-
-    def test_both_limits_disabled_traces_everything(self):
-        # No narrowing fields at all, so start_trace sends the levels alone.
-        options = self._options(num_chips=0, num_sparse_cores=-1)
-
+        profile.assert_called_once()
+        kwargs = profile.call_args.kwargs
         self.assertEqual(
-            dataclasses.asdict(options),
-            {
-                "host_tracer_level": 2,
-                "device_tracer_level": 1,
-                "python_tracer_level": 0,
-            },
+            kwargs["activities"],
+            [_ProfilerActivity.CPU, _ProfilerActivity.PrivateUse1],
         )
+        self.assertFalse(kwargs["with_stack"])
+        handler.assert_called_once_with(str(output_dir), use_gzip=True)
+        self.assertIs(kwargs["on_trace_ready"], handler.return_value)
+        profile.return_value.start.assert_called_once_with()
+        self.assertIs(trace.profiler, profile.return_value)
+        self.assertEqual(trace.output_dir, output_dir)
+        self.assertTrue(output_dir.is_dir())
+        self.assertEqual(calls, [])  # the legacy _impl.start_trace is not used
 
-    def test_host_tracer_off_without_cpu(self):
-        # with_cpu was a no-op on the first cut of this PR: the levels went
-        # unset, and the backend default fills the host plane either way.
-        options = self._options(num_chips=1, num_sparse_cores=1, with_cpu=False)
+    def test_tpu_only(self):
+        _, profile, handler, calls, output_dir = self._start(with_cpu=False)
 
-        self.assertEqual(options.host_tracer_level, 0)
-        self.assertEqual(options.device_tracer_level, 1)
+        kwargs = profile.call_args.kwargs
+        self.assertEqual(kwargs["activities"], [_ProfilerActivity.PrivateUse1])
+        self.assertFalse(kwargs["with_stack"])
+        handler.assert_called_once_with(str(output_dir), use_gzip=True)
+        self.assertEqual(calls, [])
 
-    def test_python_tracer_off_by_default(self):
-        # torch_tpu's profile() sets python_tracer_level=1 whenever CPU
-        # activity is on, at 4.9 s of host busy time against 0.36 s.
-        options = self._options(num_chips=1, num_sparse_cores=1)
+    def test_python_tracer_on(self):
+        _, profile, _, calls, _ = self._start(with_cpu=True, python_tracer=True)
 
-        self.assertEqual(options.python_tracer_level, 0)
+        # with_stack=True is what turns on the plugin's python tracer.
+        self.assertTrue(profile.call_args.kwargs["with_stack"])
+        self.assertEqual(calls, [])
 
-    def test_python_tracer_opt_in(self):
-        with envs.SGLANG_TPU_PROFILE_PYTHON_TRACER.override(True):
-            options = self._options(num_chips=1, num_sparse_cores=1)
-
-        self.assertEqual(options.python_tracer_level, 1)
-
-    def test_non_dataclass_profile_options_degrades(self):
-        class _NotADataclass:
-            pass
-
-        # A torch_tpu that reshapes ProfileOptions must lose the narrowing, not
-        # break capture altogether.
-        self.assertIsNone(
-            self._options(
-                num_chips=1, num_sparse_cores=1, profile_options_cls=_NotADataclass
-            )
-        )
-
-    def test_missing_profile_options_degrades(self):
-        self.assertIsNone(
-            self._options(num_chips=1, num_sparse_cores=1, profile_options_cls=None)
-        )
+    def test_missing_tpu_activity_raises(self):
+        activities = types.SimpleNamespace(CPU=_ProfilerActivity.CPU)
+        with (
+            patch("torch.profiler.ProfilerActivity", activities),
+            patch("torch.profiler.profile") as profile,
+            self.assertRaisesRegex(RuntimeError, "ProfilerActivity.TPU"),
+        ):
+            start_tpu_profile(output_dir=Path("/nonexistent/unused"))
+        profile.assert_not_called()
 
 
-class TestStartStopUsesLibtpuTrace(CustomTestCase):
-    """The capture must reach _impl.start_trace with its options.
+class TestStop(CustomTestCase):
+    def test_stop_stops_the_profiler_not_stop_trace(self):
+        calls = []
+        profiler = MagicMock()
+        trace = tpu_profiler._TpuTrace(output_dir=Path("/unused"), profiler=profiler)
+        with patch.dict(sys.modules, _fake_torch_tpu(calls)):
+            stop_tpu_profile(trace)
 
-    torch_tpu renamed profiler_api -> _api between the 0817 and 0913 pins,
-    which is what broke the import this PR started from. _impl was untouched,
-    so these pin the capture to it -- and to the options going along with it,
-    since a capture with the wrong ones still succeeds.
+        profiler.stop.assert_called_once_with()
+        self.assertEqual(calls, [])  # the legacy _impl.stop_trace is not used
+
+
+class TestRealTorchProfilerOnCpu(CustomTestCase):
+    """End to end through the real torch.profiler on a CPU-only torch.
+
+    Without torch_tpu, PrivateUse1 is dropped, so this checks the API wiring and
+    the Kineto trace location, not TPU events.
     """
 
-    def test_start_calls_start_trace_with_output_dir(self):
-        calls = []
-        with (
-            envs.SGLANG_TPU_PROFILE_NUM_CHIPS.override(0),
-            envs.SGLANG_TPU_PROFILE_NUM_SPARSE_CORES.override(0),
-            patch.dict(sys.modules, _fake_torch_tpu(calls=calls)),
+    def test_cpu_trace_lands_in_output_dir(self):
+        tmpdir = Path(enter_scope(self, tempfile.TemporaryDirectory()))
+        output_dir = tmpdir / "profile-id-TP-0"
+        with patch.object(
+            _ProfilerActivity, "TPU", _ProfilerActivity.PrivateUse1, create=True
         ):
-            trace = start_tpu_profile(output_dir=Path("/tmp/xprof-unit-test"))
+            trace = start_tpu_profile(output_dir=output_dir, with_cpu=True)
+            torch.randn(8, 8) @ torch.randn(8, 8)
+            stop_tpu_profile(trace)
 
-        self.assertEqual([c[0] for c in calls], ["start"])
-        self.assertEqual(calls[0][1], "/tmp/xprof-unit-test")
-        self.assertEqual(trace.output_dir, Path("/tmp/xprof-unit-test"))
-
-    def test_start_forwards_narrowing_options(self):
-        calls = []
-        with (
-            envs.SGLANG_TPU_PROFILE_NUM_CHIPS.override(1),
-            envs.SGLANG_TPU_PROFILE_NUM_SPARSE_CORES.override(1),
-            patch.dict(sys.modules, _fake_torch_tpu(calls=calls)),
-        ):
-            start_tpu_profile(output_dir=Path("/tmp/xprof-unit-test"))
-
-        options = calls[0][2]
-        self.assertEqual(options.tpu_num_chips_to_profile_per_task, 1)
-        self.assertEqual(options.tpu_num_sparse_core_tiles_to_trace, 1)
-
-    def test_stop_calls_stop_trace(self):
-        calls = []
-        with patch.dict(sys.modules, _fake_torch_tpu(calls=calls)):
-            stop_tpu_profile(None)
-
-        self.assertEqual([c[0] for c in calls], ["stop"])
+        self.assertEqual(len(list(output_dir.glob("*.pt.trace.json.gz"))), 1)
 
 
 def _stopping_manager(tmp_path, trace):
