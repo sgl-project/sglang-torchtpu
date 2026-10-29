@@ -21,15 +21,14 @@ from sglang.srt.environ import envs
 from sglang.srt.observability.compile_timing import CompileTimingRecorder
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.graph_runner.vit_patch_buckets import (  # noqa: F401
+    _compute_patch_counts,
+    _validate_patch_buckets,
+    env_patch_buckets,
+)
 from sglang_tpu.patches import _register_tpu_compile_backend
 
 logger = logging.getLogger(__name__)
-
-# Unlike the upstream CUDA and NPU runners, TPU precompiles the vision encoder
-# for fixed patch counts. Real images are often non-square, so runtime pads them
-# to the nearest bucket. MMMU reached 3400 patches; 4900 = 70^2 leaves headroom
-# without warming a huge grid.
-_DEFAULT_MAX_PATCHES = 4900
 
 _precompiled_max_patch_count: int | None = None
 
@@ -47,36 +46,6 @@ def precompiled_max_patch_count() -> int:
     if explicit_sizes:
         return max(int(size) for size in explicit_sizes)
     return envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.get()
-
-
-def _compute_patch_counts(
-    merge_size: int, min_patches: int = 196, max_patches: int = _DEFAULT_MAX_PATCHES
-) -> list[int]:
-    """Compute square-image patch-count buckets aligned to merger windows."""
-    counts = []
-    min_grid = max(
-        merge_size, math.ceil(math.sqrt(min_patches) / merge_size) * merge_size
-    )
-    grid_dim = min_grid
-    while True:
-        patch_count = grid_dim * grid_dim
-        if patch_count > max_patches:
-            break
-        counts.append(patch_count)
-        grid_dim += merge_size
-    return counts
-
-
-def _validate_patch_buckets(buckets: list[int], merge_size: int) -> list[int]:
-    merge_sq = merge_size**2
-    for bucket in buckets:
-        grid = math.isqrt(bucket)
-        if bucket <= 0 or bucket % merge_sq != 0 or grid * grid != bucket:
-            raise ValueError(
-                "SGLANG_TPU_VIT_PRECOMPILE_SIZES entries must be positive "
-                f"perfect squares divisible by {merge_sq}; got {bucket}."
-            )
-    return buckets
 
 
 def _cu_seqlens_to_segment_ids(
@@ -529,18 +498,7 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
         return x_3d.shape[0]
 
     def compute_patch_buckets(self) -> list[int]:
-        merge_size = self.vit.spatial_merge_size
-        # Set but empty disables precompile: EnvTuple drops empty entries, so the
-        # override is (), which validates trivially and warms nothing.
-        if envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.is_set():
-            buckets = sorted(
-                {int(x) for x in envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.get()}
-            )
-            return _validate_patch_buckets(buckets, merge_size)
-        return _compute_patch_counts(
-            merge_size,
-            max_patches=envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.get(),
-        )
+        return env_patch_buckets(self.vit.spatial_merge_size)
 
     def get_compile_model(self) -> torch.nn.Module | None:
         # The compiled boundary (ViTTpuCompileRunner.forward) reads the blocks,

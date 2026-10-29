@@ -148,6 +148,31 @@ if _is_cpu and _is_cpu_amx_available:
         )
 
 
+def _log_downscaled_images(entries, image_kwargs, image_processor, image_grid_thw):
+    """Log each image the processor shrank to fit its ``longest_edge`` pixel limit."""
+    limit = (image_kwargs.get("size") or image_processor.size)["longest_edge"]
+    patch_size = image_processor.patch_size
+    for entry, (_, grid_h, grid_w) in zip(entries, image_grid_thw.tolist()):
+        media = entry.media
+        if isinstance(media, Image.Image):
+            width, height = media.size
+        elif isinstance(media, torch.Tensor) and media.ndim >= 2:
+            height, width = media.shape[-2:]
+        else:
+            continue
+        # Rounding to the patch grid alone never pushes an image past the limit.
+        if width * height > limit:
+            logger.warning(
+                "Downscaled a %dx%d image to %dx%d to fit the image size limit "
+                "of %d pixels.",
+                width,
+                height,
+                grid_w * patch_size,
+                grid_h * patch_size,
+                limit,
+            )
+
+
 def smart_resize(
     height: int,
     width: int,
@@ -826,6 +851,10 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             raise ValueError(
                 "Qwen-VL image processor returned an invalid image_grid_thw shape: "
                 f"{tuple(image_grid_thw.shape)}"
+            )
+        if envs.SGLANG_LOG_IMAGE_DOWNSCALE.get():
+            _log_downscaled_images(
+                entries, image_kwargs, processor.image_processor, image_grid_thw
             )
         feature_lengths = image_grid_thw.prod(dim=1).tolist()
         if sum(feature_lengths) != features.shape[0]:

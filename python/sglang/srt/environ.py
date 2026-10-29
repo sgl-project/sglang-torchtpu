@@ -1461,6 +1461,8 @@ class Envs:
     # ===================================================================
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
+    # Debug: log each image the processor shrinks to fit its size limit.
+    SGLANG_LOG_IMAGE_DOWNSCALE = EnvBool(False)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
@@ -1965,6 +1967,9 @@ class Envs:
     # Override the computed ladder's rung count, trading compiles against
     # padding waste. Unset leaves each encoder on the count it picked.
     SGLANG_TPU_VIT_NUM_PRECOMPILE_BUCKETS = EnvInt(None)
+    # Qwen3-VL under torch compile: shrink images past the top precompiled ViT
+    # bucket to fit it. Off keeps full resolution on the uncompiled fallback.
+    SGLANG_TPU_ENABLE_VIT_IMAGE_SIZE_CAP = EnvBool(True)
     # MoE: offload the gather in permute and unpermute to SparseCore.
     SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)
     # MoE: gather on the TensorCore below this many routed rows (tokens x topk);

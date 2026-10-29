@@ -66,6 +66,105 @@ class TestMmProcessConfigValidation(CustomTestCase):
         self.assertEqual(resolution_result(args, "mm_process_config"), config)
 
 
+class TestQwenVLImageDownscaleLog(CustomTestCase):
+    """SGLANG_LOG_IMAGE_DOWNSCALE names each image the processor shrank."""
+
+    QWEN3_VL_DEFAULT_SIZE = {"longest_edge": 16777216, "shortest_edge": 65536}
+
+    def _warnings(self, images, grids, image_kwargs=None):
+        from sglang.srt.multimodal.processors import qwen_vl
+
+        entries = [SimpleNamespace(media=image) for image in images]
+        image_processor = SimpleNamespace(
+            size=self.QWEN3_VL_DEFAULT_SIZE, patch_size=16
+        )
+        with patch.object(qwen_vl, "logger") as logger:
+            qwen_vl._log_downscaled_images(
+                entries, image_kwargs or {}, image_processor, torch.tensor(grids)
+            )
+        return [call.args[1:] for call in logger.warning.call_args_list]
+
+    def test_image_past_the_configured_limit_is_logged(self):
+        from PIL import Image
+
+        cap = {"size": {"longest_edge": 4900 * 16 * 16, "shortest_edge": 65536}}
+        warnings = self._warnings(
+            [Image.new("RGB", (1920, 1080))], [[1, 52, 92]], image_kwargs=cap
+        )
+        self.assertEqual(warnings, [(1920, 1080, 1472, 832, 4900 * 16 * 16)])
+
+    def test_rounding_to_the_patch_grid_is_not_a_downscale(self):
+        # 1000x1000 lands on a 992x992 grid; that is not the size limit at work.
+        from PIL import Image
+
+        self.assertEqual(
+            self._warnings([Image.new("RGB", (1000, 1000))], [[1, 62, 62]]), []
+        )
+
+    def test_tensor_images_and_the_processor_default_limit(self):
+        # No configured size: the processor's own longest_edge applies.
+        image = torch.zeros(3, 4500, 4000)
+        warnings = self._warnings([image], [[1, 256, 228]])
+        self.assertEqual(warnings, [(4000, 4500, 3648, 4096, 16777216)])
+
+
+class TestQwenVLImageSizeThroughTheProcessor(CustomTestCase):
+    """An image ``size`` in mm_process_config reaches the real HF processor.
+
+    The TPU image cap is written this way because the pinned transformers
+    ignores ``max_pixels``; this pins that the ``size`` path still shrinks.
+    """
+
+    CAP = {"size": {"longest_edge": 4900 * 16 * 16, "shortest_edge": 65536}}
+
+    def _grid(self, image_config):
+        from PIL import Image
+        from transformers import Qwen2VLImageProcessor
+
+        from sglang.srt.multimodal.media_artifacts.base import MediaArtifactInput
+        from sglang.srt.multimodal.processors import qwen_vl
+
+        hf_processor = Qwen2VLImageProcessor(
+            patch_size=16,
+            merge_size=2,
+            temporal_patch_size=2,
+            size={"longest_edge": 16777216, "shortest_edge": 65536},
+        )
+        processor = qwen_vl.QwenVLImageProcessor.__new__(qwen_vl.QwenVLImageProcessor)
+        processor.image_config = image_config
+        processor.disable_fast_image_processor = True
+        processor.mm_preprocess_cache = SimpleNamespace(enabled=False)
+        processor.mm_feature_transport = "cpu"
+        processor.precompute_hash_before_cpu_transfer = False
+        processor._resolve_processor = lambda _: (
+            SimpleNamespace(image_processor=hf_processor),
+            None,
+        )
+        entry = MediaArtifactInput(
+            content_digest="digest",
+            artifact_key="sha256:" + "0" * 64,
+            modality=None,
+            media=Image.new("RGB", (1920, 1080)),
+        )
+        [artifact] = processor.prepare_artifact_batch([entry])
+        return artifact.model_specific_data["image_grid_thw"][0].tolist()
+
+    def test_size_shrinks_a_1080p_image_to_the_cap(self):
+        # 1920x1080 is 68 x 120 = 8,160 patches; the cap brings it to 52 x 92.
+        self.assertEqual(self._grid({}), [1, 68, 120])
+        self.assertEqual(self._grid(self.CAP), [1, 52, 92])
+
+    def test_downscale_log_is_off_unless_asked_for(self):
+        from sglang.srt.multimodal.processors import qwen_vl
+
+        with patch.object(qwen_vl, "logger") as logger:
+            self._grid(self.CAP)
+            self.assertEqual(logger.warning.call_count, 0)
+            with envs.SGLANG_LOG_IMAGE_DOWNSCALE.override(True):
+                self._grid(self.CAP)
+            self.assertEqual(logger.warning.call_count, 1)
+
+
 class TestBaseProcessorConfigExtraction(CustomTestCase):
     """Verify BaseMultimodalProcessor.__init__ extracts configs from server_args."""
 
