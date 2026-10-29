@@ -299,17 +299,20 @@ class TestInstall(CustomTestCase):
         artifact = active / "graph.bin"
         artifact.write_bytes(b"initial warmup")
         checkpoint_inode = (self.directory / "weights.safetensors").stat().st_ino
-        for mode, hicache in (
-            ("serial", False),
-            ("overlap", False),
-            ("serial", True),
-            ("overlap", True),
+        for mode, hicache, pp_size in (
+            ("serial", False, 1),
+            ("overlap", False, 1),
+            ("serial", True, 1),
+            ("overlap", True, 1),
+            ("serial", True, 2),
+            ("overlap", True, 2),
         ):
             with (
-                self.subTest(mode=mode, hicache=hicache),
+                self.subTest(mode=mode, hicache=hicache, pp_size=pp_size),
                 get_context().override_server_args(
                     model_path=str(self.directory), startup_weight_load_mode=mode
                 ),
+                get_parallel().override(pp_size=pp_size),
                 tpu_envs.SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS.override(True),
                 tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(False),
                 tpu_envs.SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC.override(0),
@@ -329,9 +332,16 @@ class TestInstall(CustomTestCase):
                     os.fstat(fd).st_ino
                 )
                 self.join_writers.reset_mock()
+                self.group.barrier.reset_mock()
                 scheduler = self.cls(enable_hierarchical_cache=hicache)
                 self.assertEqual(scheduler.init_model_worker(), "initialized")
-                initial_cleanups = 2 if hicache else 1
+                early_cleanup = hicache and pp_size == 1
+                # The parent already synchronizes checkpoint readers before
+                # graph warmup; PP must not add either early-cleanup barrier.
+                self.assertEqual(
+                    self.group.barrier.call_count, 3 if early_cleanup else 1
+                )
+                initial_cleanups = 2 if early_cleanup else 1
                 self.assertEqual(scheduler.get_init_info(), {"status": "ready"})
                 self.assertEqual(advised.count(checkpoint_inode), 1)
                 self.assertEqual(

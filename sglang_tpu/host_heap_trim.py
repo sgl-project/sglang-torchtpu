@@ -9,9 +9,9 @@ so each rank stays near its startup peak.
 handshake, including for offline Engine and Rust launches. It also wraps
 ``Scheduler.handle_freeze_gc`` to release pages created by subsequent warmup,
 clear export records and JAX caches, collect garbage before freezing GC,
-and return freed heap pages. With HiCache enabled, model-worker initialization
-releases compiler state before the host KV pools are allocated; final cleanup
-still releases anything allocated later in startup.
+and return freed heap pages. With HiCache enabled and a single pipeline stage,
+model-worker initialization releases compiler state before the host KV pools
+are allocated; final cleanup still releases anything allocated later in startup.
 
 A release goes through every allocator loaded in the process (tcmalloc,
 glibc) because the one serving ``malloc`` cannot be detected reliably, and
@@ -255,7 +255,9 @@ def install(scheduler_cls: Optional[type] = None) -> None:
 
     def init_model_worker(self, *args, **kwargs):
         result = init_worker(self, *args, **kwargs)
-        if self.enable_hierarchical_cache:
+        # Early shared-cache cleanup requires world barriers. Keep PP on the
+        # existing scheduler-ready cleanup path.
+        if self.enable_hierarchical_cache and get_parallel().pp_size == 1:
             release_before_hicache()
         return result
 
@@ -264,9 +266,11 @@ def install(scheduler_cls: Optional[type] = None) -> None:
     def get_init_info(self, *args, **kwargs):
         # Engine and Rust callers need no explicit freeze request for startup
         # file cleanup. All ranks reach this handshake before serving requests.
-        # HiCache initialization already completed checkpoint eviction.
+        # Only non-PP HiCache initialization completed checkpoint eviction early.
         release_startup_page_cache(
-            include_checkpoints=not self.enable_hierarchical_cache
+            include_checkpoints=not (
+                self.enable_hierarchical_cache and get_parallel().pp_size == 1
+            )
         )
         get_parallel().world_group.barrier()
         return orig_get_init_info(self, *args, **kwargs)
