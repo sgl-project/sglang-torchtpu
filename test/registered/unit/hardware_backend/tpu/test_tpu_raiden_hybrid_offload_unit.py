@@ -650,22 +650,29 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
             ),
         )
 
-    def test_mla_offload_needs_a_dma_engine_and_the_split_pool_backend(self):
+    def test_mla_offload_needs_a_hybrid_model_dma_engine_and_split_pool(self):
         from sglang_tpu import tpu_platform
 
         cases = (
-            ("raiden", "pallas_tpu_mla_sparse", (), None),
-            ("torch_tpu", "pallas_tpu_mla_sparse", (), "MLA model"),
-            ("raiden", "pallas_tpu_mla", (), "MLA model"),
-            ("raiden", "pallas_tpu_mla_sparse", ("pallas_tpu_mla",), "MLA model"),
+            ("raiden", "pallas_tpu_mla_sparse", (), True, None),
+            ("raiden", "pallas_tpu_mla_sparse", (), False, "MLA model"),
+            ("torch_tpu", "pallas_tpu_mla_sparse", (), True, "MLA model"),
+            ("raiden", "pallas_tpu_mla", (), True, "MLA model"),
+            ("raiden", "pallas_tpu_mla_sparse", ("pallas_tpu_mla",), True, "MLA model"),
         )
-        for io_backend, backend, others, error in cases:
-            with self.subTest(io_backend=io_backend, backend=backend, others=others):
+        for io_backend, backend, others, hybrid_linear, error in cases:
+            with self.subTest(
+                io_backend=io_backend,
+                backend=backend,
+                others=others,
+                hybrid_linear=hybrid_linear,
+            ):
                 call = lambda: tpu_platform.validate_kv_offload_pools(
                     io_backend=io_backend,
                     attention_backend=backend,
                     attention_backends=others,
                     use_mla=True,
+                    hybrid_linear=hybrid_linear,
                 )
                 if error is None:
                     call()
@@ -685,6 +692,19 @@ class TestRecurrentStateGate(CustomTestCase):
         counter.set_consumer(0)
         counter.wait_until(3)
         event.synchronize.assert_called_once()
+
+    def test_layer_wait_is_skipped_inside_a_compiled_forward(self):
+        """In-graph KV accessors must not read the counter; the forward waited
+        before entering the graph."""
+        from sglang_tpu.tpu_dma_hybrid_cache_controller import BatchGateCounter
+
+        counter = BatchGateCounter()
+        event = MagicMock()
+        counter.set_event(0, event)
+        counter.set_consumer(0)
+        with patch("torch.compiler.is_compiling", return_value=True):
+            counter.wait_until(3)
+        event.synchronize.assert_not_called()
 
     def test_backend_state_read_never_touches_the_transfer_counter(self):
         """The compiled forward reads state through _layer_state; consulting the

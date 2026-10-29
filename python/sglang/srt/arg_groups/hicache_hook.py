@@ -13,6 +13,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.configs.hybrid_arch import mambaish_config
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +179,7 @@ def resolve_layout_io_compatibility(server_args: Any):
             attention_backend=cfg.attention_backend,
             attention_backends=attention_backends_of(cfg),
             use_mla=use_mla_backend(server_args),
+            hybrid_linear=mambaish_config(model_config_of(server_args)) is not None,
         )
 
         if (

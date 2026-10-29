@@ -63,6 +63,9 @@ class BatchGateCounter(BatchDoneCounter):
     def wait_until(self, threshold: int) -> None:
         # The whole batch lands at once; the TPU backends read state without it.
         del threshold
+        # CompiledForwardShim waited before the graph; branching here guards it.
+        if torch.compiler.is_compiling():
+            return
         self.wait()
 
 

@@ -367,7 +367,8 @@ def _mha_kv_pool_cls(backend: str | None) -> type:
     return MHATokenToKVPool
 
 
-# The MLA backend whose (split, page-major) pool a DMA engine copies page by page.
+# The MLA backend whose (split, page-major) pool a DMA engine copies page by page;
+# only the hybrid linear-attention host stack (TpuDmaMambaStrategy) builds its host pool.
 _KV_OFFLOAD_MLA_BACKEND = "pallas_tpu_mla_sparse"
 
 
@@ -377,19 +378,22 @@ def validate_kv_offload_pools(
     attention_backend: str | None,
     attention_backends: tuple,
     use_mla: bool,
+    hybrid_linear: bool,
 ) -> None:
     """Reject KV offload when the device pool or a backend reading it cannot
     take ``io_backend``'s reloads."""
     backends = tuple(dict.fromkeys((attention_backend, *attention_backends)))
     if use_mla:
-        if is_tpu_dma_hicache_backend(io_backend) and backends == (
-            _KV_OFFLOAD_MLA_BACKEND,
+        if (
+            hybrid_linear
+            and is_tpu_dma_hicache_backend(io_backend)
+            and backends == (_KV_OFFLOAD_MLA_BACKEND,)
         ):
             return
         raise ValueError(
             f"{io_backend} KV offloading supports only dense MHA models and "
-            f"{_KV_OFFLOAD_MLA_BACKEND} with a DMA io backend; this is an MLA "
-            "model, which has no fused TPU host pool. Disable "
+            f"hybrid linear-attention models on {_KV_OFFLOAD_MLA_BACKEND} with a "
+            "DMA io backend; this MLA model has no TPU host pool. Disable "
             "--enable-hierarchical-cache, or serve without the TPU KV-offload "
             "io backend."
         )
