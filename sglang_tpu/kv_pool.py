@@ -469,12 +469,10 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
                     (full_blocks.numel(), page, *rows.shape[1:]), dtype=rows.dtype
                 )
                 pages[full_page_pos, full_offsets] = rows[full_rows]
-                write_pages_torch(full_blocks, pages.to(device, non_blocking=True), dst)
+                write_pages_torch(full_blocks, pages.to(device), dst)
             if part_blocks.numel():
                 pages = dst[part_blocks]
-                pages[part_page_pos, part_offsets] = rows[~full_rows].to(
-                    device, non_blocking=True
-                )
+                pages[part_page_pos, part_offsets] = rows[~full_rows].to(device)
                 write_pages_torch(part_blocks, pages, dst)
         self._synchronize_device()
 
@@ -765,12 +763,10 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
                     (full_blocks.numel(), *rows.shape[1:], page), dtype=rows.dtype
                 )
                 pages[full_page_pos, ..., full_offsets] = rows[full_rows]
-                write_pages_torch(full_blocks, pages.to(device, non_blocking=True), dst)
+                write_pages_torch(full_blocks, pages.to(device), dst)
             if part_blocks.numel():
                 pages = dst[part_blocks]
-                pages[part_page_pos, ..., part_offsets] = rows[~full_rows].to(
-                    device, non_blocking=True
-                )
+                pages[part_page_pos, ..., part_offsets] = rows[~full_rows].to(device)
                 write_pages_torch(part_blocks, pages, dst)
         self._synchronize_device()
 
