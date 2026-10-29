@@ -1689,6 +1689,27 @@ def input_to_float8(
     return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
 
 
+def per_output_channel_quant_fp8(
+    weight: torch.Tensor, dtype: torch.dtype = fp8_dtype
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize an ``[N, K]`` weight to fp8 with one scale per output row.
+
+    Pure torch, for backends without a per-channel quant kernel. A per-row
+    scale depends only on that row, so rows replicated across TP ranks (kv
+    heads at tp > num_kv_heads) quantize to identical bytes on every rank,
+    which one per-tensor scale over each rank's shard does not guarantee.
+
+    Returns ``(qweight [N, K], weight_scale [N, 1] float32)``.
+    """
+    fp_max = torch.finfo(dtype).max
+    weight_f32 = weight.float()
+    weight_scale = torch.clamp(
+        weight_f32.abs().amax(dim=1, keepdim=True) / fp_max, min=1e-12
+    )
+    qweight = torch.clamp(weight_f32 / weight_scale, min=-fp_max, max=fp_max)
+    return qweight.to(dtype), weight_scale
+
+
 def block_quant_to_tensor_quant(
     x_q_block: torch.Tensor,
     x_s: torch.Tensor,

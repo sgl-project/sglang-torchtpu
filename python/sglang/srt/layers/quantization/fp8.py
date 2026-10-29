@@ -66,6 +66,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
+    per_output_channel_quant_fp8,
     requant_block_scale_ue8m0_for_deepgemm,
     resolve_block_fp8_mxfp8_backend,
     resolve_mxfp8_dense_gemm_backend,
@@ -1122,6 +1123,11 @@ class Fp8LinearMethod(LinearMethodBase):
                         self.use_per_token_if_dynamic = True
                         if use_aiter_bpreshuffle_gemm(qweight.shape[0]):
                             qweight = shuffle_weight(qweight.contiguous(), (16, 16))
+                elif _is_tpu:
+                    # Per-row scales keep TP-replicated kv heads byte-identical
+                    # across ranks, which the Raiden reshard relies on (#1767).
+                    # The TPU dense FP8 linear accepts an [N, 1] scale.
+                    qweight, weight_scale = per_output_channel_quant_fp8(layer.weight)
                 else:
                     # per-tensor quantization
                     qweight, weight_scale = input_to_float8(layer.weight)
