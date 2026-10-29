@@ -623,5 +623,54 @@ class TestReservedKindValues(CustomTestCase):
         )
 
 
+class TestRecompileGuardRatchet(CustomTestCase):
+    """Every TPU CI server keeps the scheduler's fail_on_recompile stance armed.
+
+    The stance arms only under torch.compile and is skipped for spec decoding
+    when SGLANG_TPU_ALLOW_SPEC_RECOMPILE is set, so either one silently drops a
+    test out of recompile checking. Existing opt-outs are listed; no new ones.
+    """
+
+    SCAN_ROOTS = (
+        REPO / "test" / "registered" / "tpu",
+        REPO / "test" / "registered" / "perf" / "tpu",
+        REPO / "test" / "registered" / "accuracy" / "tpu",
+        REPO / "test" / "registered" / "e2e" / "tpu",
+        REPO / "test" / "registered" / "e2e" / "hicache",
+        REPO / "benchmark" / "tpu",
+    )
+    # Spec compile grids bounded to dodge a host-RAM OOM; the hatch covers the tail.
+    ALLOWED_SPEC_RECOMPILE = {
+        "benchmark/tpu/recipe/bench_matrix/config.sh",
+        "test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_reshard.py",
+    }
+    COMPILE_OFF = re.compile(
+        r"ENABLE_TORCH_COMPILE['\"]?\s*[:=]\s*['\"]?0\b"
+        r"|['\"]enable_torch_compile['\"]\s*:\s*False"
+    )
+
+    def _sources(self):
+        for root in self.SCAN_ROOTS:
+            for path in sorted(root.rglob("*")):
+                if path.suffix in (".py", ".sh") and "__pycache__" not in path.parts:
+                    yield str(path.relative_to(REPO)), path.read_text(encoding="utf-8")
+
+    def test_no_new_spec_recompile_opt_out(self):
+        found = {
+            rel
+            for rel, text in self._sources()
+            if "SGLANG_TPU_ALLOW_SPEC_RECOMPILE" in text
+        }
+        self.assertEqual(found - self.ALLOWED_SPEC_RECOMPILE, set())
+        # A retired opt-out leaves the list too, so the ratchet only tightens.
+        self.assertEqual(self.ALLOWED_SPEC_RECOMPILE - found, set())
+
+    def test_torch_compile_stays_on(self):
+        offenders = [
+            rel for rel, text in self._sources() if self.COMPILE_OFF.search(text)
+        ]
+        self.assertFalse(offenders, f"torch.compile disabled in: {offenders}")
+
+
 if __name__ == "__main__":
     unittest.main()
