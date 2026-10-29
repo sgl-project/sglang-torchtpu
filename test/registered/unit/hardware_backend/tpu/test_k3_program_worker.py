@@ -97,7 +97,7 @@ class TestDecodeSteps(CustomTestCase):
         )
         r2t = _req_to_token(2, {1: [3, 6]})
         self.program.accepted = {"a": 4}
-        flat, lens = self.steps.step([req], r2t)
+        flat, lens = self.steps.step([req], r2t[:, ::STEP])
         (row,) = self.program.inputs[0].requests
         self.assertEqual((row.computed, row.scheduled), (STEP + 5, 8))
         self.assertEqual(row.token_ids[-1], 7)
@@ -119,27 +119,51 @@ class TestDecodeSteps(CustomTestCase):
             _req(rid, prompt=10, output=[1], committed=10, pool_idx=i + 1, slot=i + 1)
             for i, rid in enumerate("abc")
         )
-        self.steps.step([a, b, c], r2t)
+        self.steps.step([a, b, c], r2t[:, ::STEP])
         self.assertEqual(set(self.program.inputs[0].finished), set())
-        self.steps.step([a, c], r2t)
+        self.steps.step([a, c], r2t[:, ::STEP])
         self.assertEqual(set(self.program.inputs[1].finished), {"b"})
         self.steps.forget_all()
         self.assertEqual(set(self.program.inputs[2].finished), {"a", "c"})
         self.assertEqual(list(self.program.inputs[2].requests), [])
+
+    def test_a_tracked_request_reuses_its_prompt(self):
+        req = _req("a", prompt=10, output=[7], committed=10, pool_idx=1, slot=1)
+        r2t = _req_to_token(2, {1: [1]})[:, ::STEP]
+        self.steps.step([req], r2t)
+        first = self.program.inputs[0].requests[0]
+        self.assertEqual(first.token_ids.tolist(), list(range(10)) + [7])
+        req.output_ids += [8, 9]
+        req.kv.kv_committed_len = 12
+        self.steps.step([req], r2t)
+        second = self.program.inputs[1].requests[0]
+        # The program holds its next input: the cached prompt array, no copy.
+        self.assertIs(second.token_ids, self.steps._prompts.get(req))
+        self.assertEqual(len(second.token_ids), 10)
+        self.assertEqual(second.num_tokens, 13)
+
+    def test_a_resumed_request_is_rejected(self):
+        r2t = _req_to_token(3, {1: [1], 2: [2]})[:, ::STEP]
+        a = _req("a", prompt=10, output=[1], committed=10, pool_idx=1, slot=1)
+        b = _req("b", prompt=10, output=[1], committed=10, pool_idx=2, slot=2)
+        self.steps.step([a, b], r2t)
+        self.steps.step([a], r2t)  # b retracted
+        with self.assertRaisesRegex(RuntimeError, "came back after leaving"):
+            self.steps.step([a, b], r2t)
 
     def test_wide_batches_step_plain(self):
         reqs = [
             _req(str(i), prompt=10, output=[1], committed=10, pool_idx=1, slot=1)
             for i in range(9)
         ]
-        self.steps.step(reqs, _req_to_token(2, {1: [1]}))
+        self.steps.step(reqs, _req_to_token(2, {1: [1]})[:, ::STEP])
         self.assertEqual({r.scheduled for r in self.program.inputs[0].requests}, {1})
 
     def test_a_request_without_a_token_is_an_error(self):
         req = _req("a", prompt=10, output=[1], committed=10, pool_idx=1, slot=1)
         self.program.accepted = {"a": 0}
         with self.assertRaisesRegex(RuntimeError, r"\['a'\] took no token"):
-            self.steps.step([req], _req_to_token(2, {1: [1]}))
+            self.steps.step([req], _req_to_token(2, {1: [1]})[:, ::STEP])
 
 
 class StubPrefill:
@@ -167,7 +191,7 @@ class TestPrefillSteps(CustomTestCase):
         long = _req("long", prompt=3 * STEP, output=[], committed=0, pool_idx=1, slot=1)
         short = _req("short", prompt=100, output=[], committed=0, pool_idx=2, slot=2)
         r2t = _req_to_token(3, {1: [4, 5, 6], 2: [7]})
-        first = self.steps.step([long, short], [STEP, 0], [STEP, 100], r2t)
+        first = self.steps.step([long, short], [STEP, 0], [STEP, 100], r2t[:, ::STEP])
         self.assertEqual(first.tolist(), [0, 51])
         a, b = self.program.inputs[0].requests
         self.assertEqual(
@@ -180,7 +204,7 @@ class TestPrefillSteps(CustomTestCase):
         )
         self.assertEqual(b.block_tables[1].tolist(), [self.plan.state_block(2, 0)])
         # The short prompt is done; the long one goes on with its last chunk.
-        self.steps.step([long], [2 * STEP], [STEP], r2t)
+        self.steps.step([long], [2 * STEP], [STEP], r2t[:, ::STEP])
         self.assertEqual(set(self.program.inputs[1].finished), {"short"})
 
     def test_a_first_token_must_match_the_prompt_end(self):
@@ -189,7 +213,7 @@ class TestPrefillSteps(CustomTestCase):
             torch.full((1, 1), -1, dtype=torch.int32)
         )
         with self.assertRaisesRegex(RuntimeError, "finished its prompt without"):
-            self.steps.step([req], [0], [100], _req_to_token(2, {1: [1]}))
+            self.steps.step([req], [0], [100], _req_to_token(2, {1: [1]})[:, ::STEP])
 
 
 class TestRegisteredAlgorithm(CustomTestCase):

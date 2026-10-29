@@ -175,7 +175,7 @@ class TestRaidenGroups(CustomTestCase):
             # KDA layer k reads its state from row state_block(slot, k % 3) of
             # pool k // 3: one of the rows moved, in the pool registered for it.
             tables = bridge.block_tables(
-                np.arange(STEP, 2 * STEP), STEP, slot, plan, table_width=4
+                np.arange(STEP, 2 * STEP)[::STEP], STEP, slot, plan, table_width=4
             )
             groups_kv = bridge.kv_groups(plan, 1 << 20, 4)
             of = {n: g for g, grp in enumerate(groups_kv) for n in grp.layer_names}

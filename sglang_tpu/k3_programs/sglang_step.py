@@ -11,7 +11,6 @@ tokens and per-request accept lengths, which is what :func:`accepted` builds.
 from __future__ import annotations
 
 import zlib
-from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -42,8 +41,9 @@ def sampling_spec(params: Any, rid: str) -> SamplingSpec:
 def request_input(
     *,
     rid: str,
-    origin_input_ids: Sequence[int],
-    output_ids: Sequence[int],
+    token_ids: np.ndarray,
+    num_tokens: int,
+    num_prompt_tokens: int,
     computed: int,
     scheduled: int,
     block_tables: tuple[np.ndarray, ...],
@@ -52,20 +52,20 @@ def request_input(
     """One request of a step: ``computed`` tokens already in the KV pools and
     ``scheduled`` new ones. A decode step schedules the next token and the
     batch's drafts: slots past the known tokens are draft slots, as vLLM pads
-    a decoding request to the speculative width."""
-    token_ids = np.asarray([*origin_input_ids, *output_ids], dtype=np.int32)
-    if scheduled and computed >= len(token_ids):
+    a decoding request to the speculative width. ``token_ids``: the request's
+    known tokens (the programs read them only on its first step)."""
+    if scheduled and computed >= num_tokens:
         raise ValueError(
             f"request {rid}: {computed} computed tokens leave none of its "
-            f"{len(token_ids)} known tokens to decode from"
+            f"{num_tokens} known tokens to decode from"
         )
     return RequestInput(
         req_id=rid,
         computed=computed,
         scheduled=scheduled,
         token_ids=token_ids,
-        num_tokens=len(token_ids),
-        num_prompt_tokens=len(origin_input_ids),
+        num_tokens=num_tokens,
+        num_prompt_tokens=num_prompt_tokens,
         block_tables=block_tables,
         sampling=sampling_spec(sampling_params, rid),
     )

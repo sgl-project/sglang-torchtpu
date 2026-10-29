@@ -118,9 +118,32 @@ class K3ProgramAlgo(CustomSpecAlgo):
         return K3ProgramInput()
 
 
+class _Prompts:
+    """Each live request's prompt as an int32 array, built once (sglang keeps
+    token ids in Python lists; converting a 300k-token prompt every step costs
+    more host time than the program's whole decode step)."""
+
+    def __init__(self) -> None:
+        self._arrays: dict[str, np.ndarray] = {}
+
+    def get(self, req: Any) -> np.ndarray:
+        array = self._arrays.get(req.rid)
+        if array is None:
+            array = np.asarray(req.origin_input_ids, dtype=np.int32)
+            self._arrays[req.rid] = array
+        return array
+
+    def drop(self, rids) -> None:
+        for rid in rids:
+            self._arrays.pop(rid, None)
+
+
 class DecodeSteps:
     """A decode program's steps from sglang requests (no sglang objects
     beyond the requests' fields, so it runs on CPU against a stub program)."""
+
+    # Departed request ids remembered to reject a resumed one.
+    _DEPARTED_MEMORY = 4096
 
     def __init__(
         self,
@@ -135,35 +158,53 @@ class DecodeSteps:
         self.table_width = table_width
         self.schedule = schedule
         self._live: set[str] = set()
+        self._departed: dict[str, None] = {}
+        self._prompts = _Prompts()
 
-    def step(self, reqs: Sequence[Any], req_to_token: np.ndarray) -> tuple:
-        """One step for ``reqs`` (sglang ``Req``s, batch order) with host
-        ``req_to_token`` rows: the flat ``[len(reqs) * WIDTH]`` int64 tokens
-        and the ``[len(reqs)]`` int32 accept lengths."""
+    def step(self, reqs: Sequence[Any], starts: np.ndarray) -> tuple:
+        """One step for ``reqs`` (sglang ``Req``s, batch order) with their
+        ``req_to_token`` rows' :func:`sglang_bridge.page_starts`: the flat
+        ``[len(reqs) * WIDTH]`` int64 tokens and the ``[len(reqs)]`` int32
+        accept lengths."""
         scheduled = 1 + drafts_for(self.schedule, len(reqs))
         requests = []
         for req in reqs:
+            if req.rid in self._departed:
+                # The program dropped its KDA state when it left the batch; the
+                # slot block holds the prefill's, not the state after its outputs.
+                raise RuntimeError(
+                    f"K3 decode: request {req.rid} came back after leaving the "
+                    "batch (a retraction); the programs do not resume requests"
+                )
             computed = int(req.kv.kv_committed_len)
-            tables = bridge.block_tables(
-                req_to_token[req.kv.req_pool_idx],
-                computed + scheduled,
-                int(req.kv.mamba_pool_idx.reshape(-1)[0]),
-                self.plan,
-                self.table_width,
-            )
+            prompt = self._prompts.get(req)
+            num_tokens = len(prompt) + len(req.output_ids)
+            if req.rid in self._live:
+                token_ids = prompt  # the program holds its next input
+            else:
+                outputs = np.asarray(req.output_ids, dtype=np.int32)
+                token_ids = np.concatenate((prompt, outputs))
             requests.append(
                 sglang_step.request_input(
                     rid=req.rid,
-                    origin_input_ids=req.origin_input_ids,
-                    output_ids=req.output_ids,
+                    token_ids=token_ids,
+                    num_tokens=num_tokens,
+                    num_prompt_tokens=len(prompt),
                     computed=computed,
                     scheduled=scheduled,
-                    block_tables=tables,
+                    block_tables=bridge.block_tables(
+                        starts[req.kv.req_pool_idx],
+                        computed + scheduled,
+                        int(req.kv.mamba_pool_idx.reshape(-1)[0]),
+                        self.plan,
+                        self.table_width,
+                    ),
                     sampling_params=req.sampling_params,
                 )
             )
         current = {req.rid for req in reqs}
         finished, self._live = self._live - current, current
+        self._forget(finished)
         tokens = self.program.step(StepInput(requests, finished)).tokens
         rows = np.asarray(tokens[: len(reqs)].cpu(), dtype=np.int64)
         _, lens = sglang_step.accepted(rows, len(reqs))
@@ -172,11 +213,20 @@ class DecodeSteps:
             raise RuntimeError(f"K3 decode: requests {idle} took no token this step")
         return rows.reshape(-1), np.asarray(lens, np.int32)
 
+    def _forget(self, finished: set[str]) -> None:
+        self._prompts.drop(finished)
+        for rid in finished:
+            self._departed[rid] = None
+        while len(self._departed) > self._DEPARTED_MEMORY:
+            del self._departed[next(iter(self._departed))]
+
     def forget_all(self) -> None:
         """Drop every request's state (a cache flush)."""
         if self._live:
             self.program.step(StepInput((), set(self._live)))
+        self._prompts.drop(self._live)
         self._live = set()
+        self._departed.clear()
 
 
 class PrefillSteps:
@@ -197,38 +247,42 @@ class PrefillSteps:
         self.plan = plan
         self.table_width = table_width
         self._live: set[str] = set()
+        self._prompts = _Prompts()
 
     def step(
         self,
         reqs: Sequence[Any],
         prefix_lens: Sequence[int],
         extend_lens: Sequence[int],
-        req_to_token: np.ndarray,
+        starts: np.ndarray,
     ) -> np.ndarray:
-        """One extend batch: the ``[len(reqs)]`` int64 first tokens (0 for a
-        request whose prompt continues in a later chunk)."""
+        """One extend batch, with the ``req_to_token`` rows'
+        :func:`sglang_bridge.page_starts`: the ``[len(reqs)]`` int64 first
+        tokens (0 for a request whose prompt continues in a later chunk)."""
         requests = []
         for req, computed, scheduled in zip(reqs, prefix_lens, extend_lens):
-            tables = bridge.block_tables(
-                req_to_token[req.kv.req_pool_idx],
-                int(computed) + int(scheduled),
-                int(req.kv.mamba_pool_idx.reshape(-1)[0]),
-                self.plan,
-                self.table_width,
-            )
+            prompt = self._prompts.get(req)
             requests.append(
                 sglang_step.request_input(
                     rid=req.rid,
-                    origin_input_ids=req.origin_input_ids,
-                    output_ids=(),
+                    token_ids=prompt,
+                    num_tokens=len(prompt),
+                    num_prompt_tokens=len(prompt),
                     computed=int(computed),
                     scheduled=int(scheduled),
-                    block_tables=tables,
+                    block_tables=bridge.block_tables(
+                        starts[req.kv.req_pool_idx],
+                        int(computed) + int(scheduled),
+                        int(req.kv.mamba_pool_idx.reshape(-1)[0]),
+                        self.plan,
+                        self.table_width,
+                    ),
                     sampling_params=req.sampling_params,
                 )
             )
         current = {req.rid for req in reqs}
         finished, self._live = self._live - current, current
+        self._prompts.drop(finished)
         tokens = self.program.step(StepInput(requests, finished)).tokens
         first = np.asarray(tokens[: len(reqs)].cpu(), dtype=np.int64)[:, 0]
         for i, (computed, scheduled) in enumerate(zip(prefix_lens, extend_lens)):
@@ -244,6 +298,7 @@ class PrefillSteps:
     def forget_all(self) -> None:
         if self._live:
             self.program.step(StepInput((), set(self._live)))
+        self._prompts.drop(self._live)
         self._live = set()
 
 
@@ -298,10 +353,16 @@ class K3ProgramWorker(BaseSpecWorker):
             raise NotImplementedError(
                 "K3_PROGRAM serves without logprobs or structured outputs"
             )
-        req_to_token = self.req_to_token_pool.req_to_token.cpu().numpy()
+        # One slot per logical block of each row (a strided view of the host
+        # table; a device table copies only these).
+        starts = (
+            bridge.page_starts(self.req_to_token_pool.req_to_token, self.steps.plan)
+            .cpu()
+            .numpy()
+        )
         if prefill:
             first = self.steps.step(
-                batch.reqs, batch.prefix_lens, batch.extend_lens, req_to_token
+                batch.reqs, batch.prefix_lens, batch.extend_lens, starts
             )
             if on_publish is not None:
                 on_publish(batch.seq_lens)
@@ -312,7 +373,7 @@ class K3ProgramWorker(BaseSpecWorker):
                 next_draft_input=K3ProgramInput(),
                 speculative_num_draft_tokens=WIDTH,
             )
-        flat, lens = self.steps.step(batch.reqs, req_to_token)
+        flat, lens = self.steps.step(batch.reqs, starts)
         accept_lens = torch.from_numpy(lens)
         new_seq_lens = batch.seq_lens + accept_lens.to(batch.seq_lens.device)
         if on_publish is not None:

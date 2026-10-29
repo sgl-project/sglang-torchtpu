@@ -83,7 +83,7 @@ class TestUnifiedPools(CustomTestCase):
         for slot in (1, 3):
             # Every token on sglang KV page 1 (the slots need not be distinct here).
             tables = bridge.block_tables(
-                np.full(300_000, 8192), 300_000, slot, self.plan, table_width=64
+                np.full(300_000, 8192)[::8192], 300_000, slot, self.plan, table_width=64
             )
             got = pools.kda_blocks_at_length(tables, kda_groups, computed := 300_000)
             want = [
@@ -201,17 +201,20 @@ class TestMlaTable(CustomTestCase):
         self.assertEqual(step, 8192)
         # sglang pages 5, 2, 7 hold the first, second and third logical block.
         row = np.concatenate([np.arange(p * step, (p + 1) * step) for p in (5, 2, 7)])
-        table = bridge.mla_table_row(row, 2 * step + 1, plan, width=4)
+        table = bridge.mla_table_row(row[::step], 2 * step + 1, plan, width=4)
         self.assertEqual(
             table.tolist(), [plan.kv_block(5), plan.kv_block(2), plan.kv_block(7), 0]
         )
         with self.assertRaisesRegex(ValueError, "the table holds 2"):
-            bridge.mla_table_row(row, 2 * step + 1, plan, width=2)
+            bridge.mla_table_row(row[::step], 2 * step + 1, plan, width=2)
         with self.assertRaisesRegex(ValueError, "does not cover"):
-            bridge.mla_table_row(row[:step], 2 * step + 1, plan, width=4)
+            bridge.mla_table_row(row[:step:step], 2 * step + 1, plan, width=4)
         unallocated = np.concatenate([row, np.zeros(step, row.dtype)])
         with self.assertRaisesRegex(ValueError, r"blocks \[3\] .* not allocated"):
-            bridge.mla_table_row(unallocated, 3 * step + 1, plan, width=4)
+            bridge.mla_table_row(unallocated[::step], 3 * step + 1, plan, width=4)
+        # page_starts: one slot per logical block of every row.
+        table2d = np.stack([row, row])
+        self.assertEqual(bridge.page_starts(table2d, plan).shape, (2, 3))
 
     def test_fp8_blocks_hold_twice_the_tokens(self):
         plan = bridge.UnifiedPoolPlan(40, 4, pools.cache_layout("fp8"))
@@ -252,39 +255,28 @@ class TestStepConversion(CustomTestCase):
             temperature=1.0, top_p=1.0, top_k=1, sampling_seed=None
         )
         tables = (np.zeros(4, np.int32),) * 4
-        req = step.request_input(
-            rid="r",
-            origin_input_ids=[1, 2, 3],
-            output_ids=[4],
-            computed=3,
-            scheduled=1,
-            block_tables=tables,
-            sampling_params=params,
-        )
-        self.assertEqual((req.end, req.num_tokens, req.num_prompt_tokens), (4, 4, 3))
-        self.assertEqual(req.token_ids.tolist(), [1, 2, 3, 4])
-        self.assertFalse(req.partial)
-        # Draft slots past the known tokens.
-        drafts = step.request_input(
-            rid="r",
-            origin_input_ids=[1, 2, 3],
-            output_ids=[4],
-            computed=3,
-            scheduled=8,
-            block_tables=tables,
-            sampling_params=params,
-        )
-        self.assertEqual((drafts.end, drafts.num_tokens), (11, 4))
-        with self.assertRaisesRegex(ValueError, "leave none of its 4 known"):
-            step.request_input(
+        tokens = np.array([1, 2, 3, 4], np.int32)
+
+        def make(computed, scheduled):
+            return step.request_input(
                 rid="r",
-                origin_input_ids=[1, 2, 3],
-                output_ids=[4],
-                computed=4,
-                scheduled=1,
+                token_ids=tokens,
+                num_tokens=4,
+                num_prompt_tokens=3,
+                computed=computed,
+                scheduled=scheduled,
                 block_tables=tables,
                 sampling_params=params,
             )
+
+        req = make(3, 1)
+        self.assertEqual((req.end, req.num_tokens, req.num_prompt_tokens), (4, 4, 3))
+        self.assertFalse(req.partial)
+        # Draft slots past the known tokens.
+        drafts = make(3, 8)
+        self.assertEqual((drafts.end, drafts.num_tokens), (11, 4))
+        with self.assertRaisesRegex(ValueError, "leave none of its 4 known"):
+            make(4, 1)
 
     def test_accepted_tokens(self):
         tokens = np.array(

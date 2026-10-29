@@ -200,21 +200,28 @@ def state_buf_infos(caches: dict[str, torch.Tensor], plan: UnifiedPoolPlan) -> B
     return ptrs, lens, items
 
 
+def page_starts(req_to_token, plan: UnifiedPoolPlan):
+    """The ``req_to_token`` slot of every logical block's first token
+    (``[rows, blocks]``, a strided view): all a block-table row reads."""
+    return req_to_token[:, :: plan.logical_block_tokens]
+
+
 def mla_table_row(
-    req_to_token_row: np.ndarray, seq_len: int, plan: UnifiedPoolPlan, width: int
+    starts: np.ndarray, seq_len: int, plan: UnifiedPoolPlan, width: int
 ) -> np.ndarray:
-    """A request's MLA block-table row: the pool block of each logical block
-    its first ``seq_len`` tokens touch, 0-padded to ``width``."""
+    """A request's MLA block-table row from its :func:`page_starts` row: the
+    pool block of each logical block its first ``seq_len`` tokens touch,
+    0-padded to ``width``."""
     step = plan.logical_block_tokens
     used = -(-seq_len // step)
     if used > width:
         raise ValueError(
             f"{seq_len} tokens need {used} blocks; the table holds {width}"
         )
-    pages = np.asarray(req_to_token_row[: used * step : step], dtype=np.int64) // step
+    pages = np.asarray(starts[:used], dtype=np.int64) // step
     if len(pages) != used:
         raise ValueError(
-            f"a req_to_token row of {len(req_to_token_row)} slots does not cover "
+            f"a req_to_token row of {len(starts)} blocks does not cover "
             f"{seq_len} tokens"
         )
     if not pages.all():
@@ -224,8 +231,10 @@ def mla_table_row(
             f"logical blocks {np.flatnonzero(pages == 0).tolist()} of the "
             f"{seq_len} tokens are not allocated"
         )
+    if used and int(pages.max()) > plan.kv_blocks:
+        raise ValueError(f"KV pages {pages.tolist()} exceed {plan.kv_blocks}")
     row = np.zeros(width, np.int32)
-    row[:used] = [plan.kv_block(int(p)) for p in pages]
+    row[:used] = pages  # KV page p is block p
     return row
 
 
@@ -269,7 +278,7 @@ def kv_groups(
 
 
 def block_tables(
-    req_to_token_row: np.ndarray,
+    starts: np.ndarray,
     seq_len: int,
     slot: int,
     plan: UnifiedPoolPlan,
@@ -277,7 +286,7 @@ def block_tables(
 ) -> tuple[np.ndarray, ...]:
     """``RequestInput.block_tables`` for the four groups of :func:`kv_groups`."""
     return (
-        mla_table_row(req_to_token_row, seq_len, plan, table_width),
+        mla_table_row(starts, seq_len, plan, table_width),
         *kda_table_rows(slot, plan),
     )
 
