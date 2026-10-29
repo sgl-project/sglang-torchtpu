@@ -197,6 +197,20 @@ class TestInstall(CustomTestCase):
         self.assertIs(self.cls.handle_freeze_gc, wrapped)
         self.assertIs(self.cls.get_init_info, wrapped_init_info)
 
+    def test_pp_freeze_cleans_up_without_a_world_barrier(self):
+        # PP stages dispatch the freeze in different loop iterations.
+        with (
+            get_parallel().override(pp_size=2),
+            patch.object(page_cache, "release_compile_artifacts") as release,
+            patch.object(tpu, "trim_host_heap"),
+            tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(False),
+            tpu_envs.SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC.override(0),
+        ):
+            self.cls().handle_freeze_gc("req")
+        self.group.barrier.assert_not_called()
+        self.advise.assert_called_once()
+        release.assert_called_once_with(native_only=True)
+
     def test_startup_releases_files_without_a_freeze_request(self):
         scheduler = self.cls()
         self.assertEqual(scheduler.get_init_info(), {"status": "ready"})
