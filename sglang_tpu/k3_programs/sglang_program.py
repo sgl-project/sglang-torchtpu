@@ -108,6 +108,12 @@ def build_from_server():
             f"{bridge.DSPARK_DRAFT_LAYERS}"
         )
     config = server_engine_config()
+    # The program is a handful of whole-model custom ops per step: fusing the
+    # eager ops around them would compile a new device program for every
+    # distinct surrounding op sequence (vLLM-TorchTPU's runner does the same).
+    from torch_tpu._internal import execution_mode
+
+    execution_mode.eager_mode = execution_mode.EagerMode.DEFER_NEVER
     program = k3.build(
         config, Path(presharded), draft, tp_rank=int(get_parallel().tp_rank)
     )
