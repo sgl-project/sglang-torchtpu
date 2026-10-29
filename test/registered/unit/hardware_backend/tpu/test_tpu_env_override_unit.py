@@ -117,6 +117,7 @@ class TestLibtpuInitArgsOverrides(CustomTestCase):
             ("pallas_tpu_fused_rs", "pytorch", 8, None, False),
             ("pallas_tpu_fused_rs", "tpu", 4, None, False),
             ("pallas_tpu_fused_rs", "tpu", 8, "100000", True),
+            ("pallas_tpu_fused_rs", "tpu", 8, "optout", False),
         ]
         for moe_backend, backend, tp_size, min_batch, expected in cases:
             with self.subTest(
@@ -126,6 +127,9 @@ class TestLibtpuInitArgsOverrides(CustomTestCase):
                 min_batch=min_batch,
             ):
                 env = {"LIBTPU_INIT_ARGS": ""}
+                if min_batch == "optout":
+                    env["SGLANG_TPU_FUSED_RS_SPARSE_CORE_OVERRIDE"] = "0"
+                    min_batch = None
                 if min_batch is not None:
                     env["SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE"] = min_batch
                 with patch.dict(os.environ, env, clear=False):

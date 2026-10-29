@@ -76,5 +76,14 @@ MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}" \
 CHUNKED_PREFILL_SIZE="$CHUNK" MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-$CHUNK}" \
 TPU_COMPILE_TOKENS="${TPU_COMPILE_TOKENS:-64 128 256 512 1024 2048 4096}" \
 TPU_COMPILE_BS="${TPU_COMPILE_BS:-1 2 4 8 16 32 64}" \
-EXTRA_ARGS="--moe-runner-backend pallas_tpu_fused_rs --swa-full-tokens-ratio $SWA_FULL_TOKENS_RATIO --weight-loader-disable-mmap --weight-loader-drop-cache-after-load ${EXTRA_ARGS:-}" \
+# Compile only the EXTEND bucket shapes proven correct on libtpu 0.0.50 with
+# the SparseCore all-gather offload ON (base default): 256 wedges during
+# warmup, 512/2048 return corrupt logits at run time, and with the offload
+# OFF 2048/4096 halt (SparseCoreSequencer:0:0x1b). 64/128/1024/4096 are
+# correct; 129-4096-token prefills pad up to the next bucket. Keep the
+# offload ON here (opt out of the fused-RS override, which would turn it
+# OFF and make 4096 unbootable); the offloads stay off by default for
+# fused-RS everywhere else.
+export SGLANG_TPU_FUSED_RS_SPARSE_CORE_OVERRIDE="${SGLANG_TPU_FUSED_RS_SPARSE_CORE_OVERRIDE:-0}"
+EXTRA_ARGS="--moe-runner-backend pallas_tpu_fused_rs --swa-full-tokens-ratio $SWA_FULL_TOKENS_RATIO --weight-loader-disable-mmap --weight-loader-drop-cache-after-load --tpu-compile-tokens 64 128 1024 4096 ${EXTRA_ARGS:-}" \
 exec ./launch_server.sh "$@"

@@ -248,6 +248,14 @@ def apply_fused_rs_sparse_core_override(
         return
     if tp_size not in (8, 16):
         return
+    # Escape hatch: the offload faults are shape-dependent (Beam NVFP4 TP=8,
+    # libtpu 0.0.50): with the all-gather offload ON, buckets 256/512/2048
+    # wedge or compute corrupt logits; with it OFF, 2048/4096 halt at
+    # SparseCoreSequencer:0:0x1b. Recipes that only compile bucket shapes
+    # proven correct with the offload ON (e.g. 64/128/1024/4096) keep the
+    # offload by setting this to 0.
+    if os.environ.get("SGLANG_TPU_FUSED_RS_SPARSE_CORE_OVERRIDE", "1") == "0":
+        return
     appended = _override_libtpu_flags(_FUSED_RS_SPARSE_CORE_OVERRIDES)
     if appended:
         logger.info(
