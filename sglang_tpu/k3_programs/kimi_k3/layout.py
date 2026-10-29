@@ -20,7 +20,7 @@ also holds KDA layers ``3p .. 3p + 2`` (the last pool none). A block is
 
 import dataclasses
 
-from vllm_torchtpu.megakernel.layout import KVLayout, StateRegion
+from sglang_tpu.k3_programs.layout import KVLayout, StateRegion
 
 NUM_LAYERS = 93
 MLA = tuple(i for i in range(NUM_LAYERS) if i % 4 == 3 or i == NUM_LAYERS - 1)

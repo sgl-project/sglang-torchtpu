@@ -22,9 +22,9 @@ import numpy as np
 import torch
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.megakernel.bridge import hbm, register_op, upload
-from vllm_torchtpu.megakernel.kimi_k3.program import kernel_modules
+from sglang_tpu.k3_programs._support.logger import init_logger
+from sglang_tpu.k3_programs.bridge import hbm, register_op, upload
+from sglang_tpu.k3_programs.kimi_k3.program import kernel_modules
 
 logger = init_logger(__name__)
 

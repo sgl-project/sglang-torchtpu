@@ -22,8 +22,8 @@ import jax
 import torch
 from torch_tpu._internal.pallas import pallas as pallas_impl
 
-from vllm_torchtpu.distributed.sharded_jax_op import _placeholder
-from vllm_torchtpu.logger import init_logger
+from sglang_tpu.k3_programs._support.sharded_jax_op import _placeholder
+from sglang_tpu.k3_programs._support.logger import init_logger
 
 logger = init_logger(__name__)
 
@@ -36,10 +36,9 @@ def _source_fingerprint() -> str:
     if _SOURCE_FINGERPRINT is None:
         import importlib.metadata
 
-        import vllm_torchtpu
-
         digest = hashlib.blake2b(digest_size=16)
-        root = pathlib.Path(vllm_torchtpu.__file__).resolve().parent
+        # The vendored programs: an export is valid only for the code that made it.
+        root = pathlib.Path(__file__).resolve().parent
         for path in sorted(root.rglob("*.py")):
             digest.update(str(path.relative_to(root)).encode())
             digest.update(path.read_bytes())
@@ -280,13 +279,14 @@ def _cached_class(cls: type) -> type:
 def hook(export_key: str | None) -> Callable[[Any], None] | None:
     """The ``sharded_jax_op(configure_callable=...)`` hook that puts an op
     with ``export_key`` on the cache, or None when there is no key or no
-    cache path (only an explicitly set VLLM_XLA_CACHE_PATH: its default is a
-    home directory)."""
-    import vllm.envs as vllm_envs
+    cache path (only an explicitly set TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT,
+    the compilation cache root the TPU recipes already set)."""
+    import os
 
-    if not export_key or not vllm_envs.is_set("VLLM_XLA_CACHE_PATH"):
+    cache_root = os.environ.get("TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT")
+    if not export_key or not cache_root:
         return None
-    root = pathlib.Path(vllm_envs.VLLM_XLA_CACHE_PATH) / "k3_export"
+    root = pathlib.Path(cache_root) / "k3_export"
 
     def configure(op) -> None:
         exported = op.exported

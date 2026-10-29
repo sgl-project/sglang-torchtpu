@@ -34,7 +34,7 @@ import dataclasses
 import jax
 from jax.experimental import pallas as pl
 
-from vllm_torchtpu.megakernel.common import pool_alias
+from sglang_tpu.k3_programs.common import pool_alias
 
 ALIGN = 4096
 

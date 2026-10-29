@@ -37,16 +37,16 @@ import numpy as np
 import torch
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.megakernel.bridge import hbm, materialize, register_global_op
-from vllm_torchtpu.megakernel.config import MegakernelEngineConfig
-from vllm_torchtpu.megakernel.kimi_k3.decode_ops import (
+from sglang_tpu.k3_programs._support.logger import init_logger
+from sglang_tpu.k3_programs.bridge import hbm, materialize, register_global_op
+from sglang_tpu.k3_programs.config import MegakernelEngineConfig
+from sglang_tpu.k3_programs.kimi_k3.decode_ops import (
     GREEDY,
     Control,
     DecodeOps,
     dp_row_owners,
 )
-from vllm_torchtpu.megakernel.kimi_k3.pools import (
+from sglang_tpu.k3_programs.kimi_k3.pools import (
     KDA_LAYERS,
     KdaImporter,
     SlotMap,
@@ -54,7 +54,7 @@ from vllm_torchtpu.megakernel.kimi_k3.pools import (
     kda_blocks_at_length,
     tp_rank_permutation,
 )
-from vllm_torchtpu.megakernel.kimi_k3.program import (
+from sglang_tpu.k3_programs.kimi_k3.program import (
     DP_SPEC_BATCHES,
     SPEC_BATCHES,
     VOCAB,
@@ -62,7 +62,7 @@ from vllm_torchtpu.megakernel.kimi_k3.program import (
     spec_tokens_per_batch,
     supports_spec_tokens,
 )
-from vllm_torchtpu.megakernel.program import (
+from sglang_tpu.k3_programs.program import (
     KVGroup,
     RequestInput,
     StepInput,
@@ -919,7 +919,7 @@ class KimiDecoder:
         if self._compiled_layout != self.layout.key():
             from torch_tpu._internal.sync import synchronize
 
-            from vllm_torchtpu.megakernel.compilation import compile_ops
+            from sglang_tpu.k3_programs.compilation import compile_ops
 
             # The first step compiles its own variant (its state buffers come
             # from allocation, not from an op), which the precompiled graphs
@@ -947,7 +947,7 @@ class KimiDecoder:
             calls.sort(key=lambda call: call.priority, reverse=True)
             # These builders capture the same static kernel/configuration
             # on every rank; weights and state are dynamic operands.
-            from vllm_torchtpu.megakernel.export_cache import prepare_distributed
+            from sglang_tpu.k3_programs.export_cache import prepare_distributed
 
             prepare_distributed(calls)
             compile_ops(calls)

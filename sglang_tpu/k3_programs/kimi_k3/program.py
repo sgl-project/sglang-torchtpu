@@ -13,8 +13,8 @@ import importlib
 from pathlib import Path
 from typing import Any
 
-from vllm_torchtpu.megakernel.config import MegakernelEngineConfig
-from vllm_torchtpu.megakernel.program import Capabilities
+from sglang_tpu.k3_programs.config import MegakernelEngineConfig
+from sglang_tpu.k3_programs.program import Capabilities
 
 TP_SIZE = 32
 DCP_SIZE = 32
@@ -39,9 +39,9 @@ _SPEC_SUPPORT = (
 
 
 def kernel_modules(*names: str) -> list[Any]:
-    """Import ``vllm_torchtpu.megakernel.kimi_k3.kernels.<name>`` for each name."""
+    """Import ``sglang_tpu.k3_programs.kimi_k3.kernels.<name>`` for each name."""
     return [
-        importlib.import_module(f"vllm_torchtpu.megakernel.kimi_k3.kernels.{name}")
+        importlib.import_module(f"sglang_tpu.k3_programs.kimi_k3.kernels.{name}")
         for name in names
     ]
 
@@ -178,7 +178,7 @@ def check(config: MegakernelEngineConfig) -> None:
             f"the K3 megakernel needs --decode-context-parallel-size {dcp}"
             + (f" under attention_dp {config.attention_dp}" if dcp != DCP_SIZE else "")
         )
-    from vllm_torchtpu.megakernel.kimi_k3.layout import cache_layout
+    from sglang_tpu.k3_programs.kimi_k3.layout import cache_layout
 
     layout = cache_layout(config.kv_cache_dtype)
     if config.block_size != layout.tokens_per_block:
@@ -262,11 +262,11 @@ def build(
     ring the prefill wrote)."""
     check(config)
     if config.role == "prefill":
-        from vllm_torchtpu.megakernel.kimi_k3.prefill import KimiPrefiller
+        from sglang_tpu.k3_programs.kimi_k3.prefill import KimiPrefiller
 
         return KimiPrefiller(config, presharded, draft_checkpoint, tp_rank=tp_rank)
-    from vllm_torchtpu.megakernel.kimi_k3.decode import KimiDecoder
-    from vllm_torchtpu.megakernel.kimi_k3.decode_ops import (
+    from sglang_tpu.k3_programs.kimi_k3.decode import KimiDecoder
+    from sglang_tpu.k3_programs.kimi_k3.decode_ops import (
         Control,
         DecodeOps,
         decode_batch_sizes,
@@ -275,7 +275,7 @@ def build(
     dense = spec_tokens_per_batch(config)
     draft = None
     if draft_checkpoint is not None and dense is not None and any(dense):
-        from vllm_torchtpu.megakernel.kimi_k3.draft import draft_class
+        from sglang_tpu.k3_programs.kimi_k3.draft import draft_class
 
         draft = draft_class(draft_checkpoint)(
             max_position=config.max_model_len + 16,

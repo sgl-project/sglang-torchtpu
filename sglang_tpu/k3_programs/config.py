@@ -20,7 +20,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Protocol
 
-from vllm_torchtpu.megakernel import backend
+from sglang_tpu.k3_programs import backend
 
 
 @dataclasses.dataclass(frozen=True)

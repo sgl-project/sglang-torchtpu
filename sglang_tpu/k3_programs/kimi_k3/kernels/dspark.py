@@ -36,7 +36,7 @@ import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu
 
-from vllm_torchtpu.megakernel.common import collectives32
+from sglang_tpu.k3_programs.common import collectives32
 
 from .decode_megakernel import _attention_scores, _dot
 

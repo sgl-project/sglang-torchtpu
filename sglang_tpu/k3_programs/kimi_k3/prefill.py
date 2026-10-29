@@ -36,8 +36,8 @@ import numpy as np
 import torch
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.megakernel.bridge import (
+from sglang_tpu.k3_programs._support.logger import init_logger
+from sglang_tpu.k3_programs.bridge import (
     hbm,
     kernel_mesh,
     materialize,
@@ -46,9 +46,9 @@ from vllm_torchtpu.megakernel.bridge import (
     report_load_stats,
     stream_to_device,
 )
-from vllm_torchtpu.megakernel.config import MegakernelEngineConfig
-from vllm_torchtpu.megakernel.kimi_k3.layout import NUM_LAYERS
-from vllm_torchtpu.megakernel.kimi_k3.pools import (
+from sglang_tpu.k3_programs.config import MegakernelEngineConfig
+from sglang_tpu.k3_programs.kimi_k3.layout import NUM_LAYERS
+from sglang_tpu.k3_programs.kimi_k3.pools import (
     CONV_ROWS,
     KDA_LAYERS,
     MLA_LAYERS,
@@ -61,14 +61,14 @@ from vllm_torchtpu.megakernel.kimi_k3.pools import (
     tp_rank_permutation,
     write_draft_rings,
 )
-from vllm_torchtpu.megakernel.kimi_k3.program import (
+from sglang_tpu.k3_programs.kimi_k3.program import (
     DCP_SIZE,
     HIDDEN_SIZE,
     TP_SIZE,
     VOCAB,
     kernel_modules,
 )
-from vllm_torchtpu.megakernel.program import (
+from sglang_tpu.k3_programs.program import (
     KVGroup,
     RequestInput,
     StepInput,
@@ -747,7 +747,7 @@ class PoolWriter:
     ) -> None:
         self.mesh, self.rank = mesh, rank
         self.raw_pools = raw_pools
-        from vllm_torchtpu.megakernel.kimi_k3.layout import cache_layout
+        from sglang_tpu.k3_programs.kimi_k3.layout import cache_layout
 
         self.layout = cache_layout(str(raw_pools[0].dtype))
         self.mla_raw, self._kda_raw = tuple(mla_raw), tuple(kda_raw)
@@ -812,7 +812,7 @@ class PoolWriter:
         """(inside an op) ``count`` sequences' KDA states, ``[69, count,
         ...]``, into ``kda_blocks`` ``[count * 69]`` (each sequence's 69
         blocks in turn; unused sequences aim at the null block)."""
-        from vllm_torchtpu.kernels import pool_adapters
+        from sglang_tpu.k3_programs._support import pool_adapters
 
         blocks = kda_blocks.reshape(count, KDA_LAYERS)
         for k in range(KDA_LAYERS):
@@ -1081,7 +1081,7 @@ class PoolWriter:
         return recurrent, conv
 
     def _read_states_op(self, sequences: int) -> Any:
-        from vllm_torchtpu.kernels import pool_adapters
+        from sglang_tpu.k3_programs._support import pool_adapters
 
         key = ("read", sequences)
         if key not in self._ops:
@@ -1203,7 +1203,7 @@ class KimiPrefiller:
         if draft_checkpoint is not None:
             (mla,) = kernel_modules("dspark_mla")
             if mla.is_mla_draft(Path(draft_checkpoint)):
-                from vllm_torchtpu.megakernel.kimi_k3.draft_mla_prefill import (
+                from sglang_tpu.k3_programs.kimi_k3.draft_mla_prefill import (
                     PrefillDraftLatents,
                 )
 
@@ -1216,7 +1216,7 @@ class KimiPrefiller:
                     config.max_model_len,
                 )
             else:
-                from vllm_torchtpu.megakernel.kimi_k3.draft_ring import PrefillRing
+                from sglang_tpu.k3_programs.kimi_k3.draft_ring import PrefillRing
 
                 self.ring = PrefillRing(
                     self.program.mesh,
@@ -1419,7 +1419,7 @@ class KimiPrefiller:
         key = ("sampler", sampled)
         if key in self.program._ops:
             return self.program._ops[key]
-        from vllm_torchtpu.megakernel.kimi_k3 import sampling
+        from sglang_tpu.k3_programs.kimi_k3 import sampling
 
         width = VOCAB // TP_SIZE
 
@@ -1683,7 +1683,7 @@ class KimiPrefiller:
         weights and pools as they are): every window's stack ops, state
         stack/split, draft-ring update and pool writes, then the hit-state
         and ring reads, the block copy and the first-token samplers."""
-        from vllm_torchtpu.megakernel.compilation import CompileCall
+        from sglang_tpu.k3_programs.compilation import CompileCall
 
         program, writer, ring = self.program, self._writer, self.ring
         assert writer is not None
@@ -1824,8 +1824,8 @@ class KimiPrefiller:
         """Trace :meth:`compilation_calls` spread over the workers and compile
         them concurrently (``megakernel.compilation``), so the warmup that
         follows only runs them."""
-        from vllm_torchtpu.megakernel.compilation import compile_ops
-        from vllm_torchtpu.megakernel.export_cache import prepare_distributed
+        from sglang_tpu.k3_programs.compilation import compile_ops
+        from sglang_tpu.k3_programs.export_cache import prepare_distributed
 
         started = time.perf_counter()
         calls = self.compilation_calls()

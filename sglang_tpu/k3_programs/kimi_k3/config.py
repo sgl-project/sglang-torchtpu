@@ -13,7 +13,7 @@ import hashlib
 import json
 from typing import Any
 
-from vllm_torchtpu.megakernel.config import set_active_kernel_config
+from sglang_tpu.k3_programs.config import set_active_kernel_config
 
 
 @dataclasses.dataclass(frozen=True)

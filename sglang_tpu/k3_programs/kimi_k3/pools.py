@@ -25,8 +25,8 @@ import torch
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.megakernel.kimi_k3.layout import (
+from sglang_tpu.k3_programs._support.logger import init_logger
+from sglang_tpu.k3_programs.kimi_k3.layout import (
     CONV_HEAD_ROWS,
     CONV_TAPS,
     HEAD_DIM,
@@ -34,7 +34,7 @@ from vllm_torchtpu.megakernel.kimi_k3.layout import (
     LAYOUT,
     cache_layout,
 )
-from vllm_torchtpu.megakernel.kimi_k3.program import TP_SIZE
+from sglang_tpu.k3_programs.kimi_k3.program import TP_SIZE
 
 logger = init_logger(__name__)
 
@@ -255,7 +255,7 @@ def write_draft_rings(raws: list, kda_raw: Sequence[int], packed, blocks) -> lis
     """(inside an op) packed draft rings ``[n, 69, DRAFT_ROWS, lanes]``
     (``kernels.dspark.pack_ring``) into the draft rows of each sequence's 69
     KDA state blocks ``[n, 69]``."""
-    from vllm_torchtpu.kernels import pool_adapters
+    from sglang_tpu.k3_programs._support import pool_adapters
 
     n = packed.shape[0]
     for k in range(KDA_LAYERS):
@@ -282,7 +282,7 @@ def write_draft_rings(raws: list, kda_raw: Sequence[int], packed, blocks) -> lis
 def read_draft_rings(raws, kda_raw: Sequence[int], blocks, lanes: int):
     """(inside an op) the draft rows of each sequence's 69 KDA state blocks
     ``[n, 69]`` -> ``[n, 69, DRAFT_ROWS, lanes]`` bf16."""
-    from vllm_torchtpu.kernels import pool_adapters
+    from sglang_tpu.k3_programs._support import pool_adapters
 
     n = blocks.shape[0]
     return jnp.stack(
@@ -348,8 +348,8 @@ class KdaImporter:
     def _build(self) -> Any:
         if self._op is not None:
             return self._op
-        from vllm_torchtpu.kernels import pool_adapters
-        from vllm_torchtpu.megakernel.bridge import register_op
+        from sglang_tpu.k3_programs._support import pool_adapters
+        from sglang_tpu.k3_programs.bridge import register_op
 
         num_raw, kda_raw, perm = (
             len(self.raw_pools),
@@ -464,8 +464,8 @@ class KdaImporter:
         rank's KV head, positions [1, window])`` -- all ``-1`` (a cold ring)
         unless the prefill wrote a ring for ``length`` tokens there."""
         if self._ring_op is None:
-            from vllm_torchtpu.megakernel.bridge import register_op
-            from vllm_torchtpu.megakernel.kimi_k3.program import kernel_modules
+            from sglang_tpu.k3_programs.bridge import register_op
+            from sglang_tpu.k3_programs.kimi_k3.program import kernel_modules
 
             (dspark,) = kernel_modules("dspark")
             num_raw, kda_raw, perm = (

@@ -36,10 +36,10 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
 
-from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
-from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.megakernel import export_cache
-from vllm_torchtpu.megakernel.config import get_active_kernel_config
+from sglang_tpu.k3_programs._support.sharded_jax_op import sharded_jax_op
+from sglang_tpu.k3_programs._support.logger import init_logger
+from sglang_tpu.k3_programs import export_cache
+from sglang_tpu.k3_programs.config import get_active_kernel_config
 
 logger = init_logger(__name__)
 

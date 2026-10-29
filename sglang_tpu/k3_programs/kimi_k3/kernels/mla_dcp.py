@@ -54,7 +54,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.megakernel.kimi_k3.config import active as _config
+from sglang_tpu.k3_programs.kimi_k3.config import active as _config
 
 PAGE_TOKENS = 256
 LANES = 640  # latent 512 | rope 64 | zero 64

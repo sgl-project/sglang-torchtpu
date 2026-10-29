@@ -16,12 +16,12 @@ from jax import typing as jax_typing
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu
 
-from vllm_torchtpu.megakernel.common import collectives32, pool_alias
-from vllm_torchtpu.megakernel.common.vmem_pool import VmemPool
-from vllm_torchtpu.megakernel.kimi_k3 import kernels as kimi
-from vllm_torchtpu.megakernel.kimi_k3.config import active as _config
-from vllm_torchtpu.megakernel.kimi_k3.kernels import mla_dcp
-from vllm_torchtpu.megakernel.kimi_k3.layout import CONV_HEAD_ROWS
+from sglang_tpu.k3_programs.common import collectives32, pool_alias
+from sglang_tpu.k3_programs.common.vmem_pool import VmemPool
+from sglang_tpu.k3_programs.kimi_k3 import kernels as kimi
+from sglang_tpu.k3_programs.kimi_k3.config import active as _config
+from sglang_tpu.k3_programs.kimi_k3.kernels import mla_dcp
+from sglang_tpu.k3_programs.kimi_k3.layout import CONV_HEAD_ROWS
 
 _COMMUNICATION_SCRATCH_SPEC_COUNT = 10
 
@@ -6319,7 +6319,7 @@ def stack(
     pool_map = tuple(dcp_pool_map)
     if len(dcp_pool_map) != MLA_LAYERS or len(states) != 2 + 1 + max(dcp_pool_map):
         raise ValueError("The stack takes (conv, recurrent, *pools) and a pool per MLA layer")
-    from vllm_torchtpu.megakernel.kimi_k3.layout import cache_layout
+    from sglang_tpu.k3_programs.kimi_k3.layout import cache_layout
     layout = cache_layout(str(states[2].dtype))
     if any(pool.shape[1:] != layout.block_shape or pool.dtype != states[2].dtype for pool in states[2:]):
         raise ValueError(f"unified pools must match {layout.block_shape} {layout.dtype}")

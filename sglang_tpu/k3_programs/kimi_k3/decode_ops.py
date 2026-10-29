@@ -25,8 +25,8 @@ import numpy as np
 import torch
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.megakernel.bridge import (
+from sglang_tpu.k3_programs._support.logger import init_logger
+from sglang_tpu.k3_programs.bridge import (
     hbm,
     kernel_mesh,
     materialize,
@@ -34,13 +34,13 @@ from vllm_torchtpu.megakernel.bridge import (
     report_load_stats,
     stream_to_device,
 )
-from vllm_torchtpu.megakernel.kimi_k3 import config as kernel_config
-from vllm_torchtpu.megakernel.kimi_k3.layout import CONV_HEAD_ROWS, NUM_LAYERS
-from vllm_torchtpu.megakernel.kimi_k3.pools import (
+from sglang_tpu.k3_programs.kimi_k3 import config as kernel_config
+from sglang_tpu.k3_programs.kimi_k3.layout import CONV_HEAD_ROWS, NUM_LAYERS
+from sglang_tpu.k3_programs.kimi_k3.pools import (
     KDA_LAYERS,
     group_slots,
 )
-from vllm_torchtpu.megakernel.kimi_k3.program import TP_SIZE, VOCAB, kernel_modules
+from sglang_tpu.k3_programs.kimi_k3.program import TP_SIZE, VOCAB, kernel_modules
 
 logger = init_logger(__name__)
 
@@ -153,7 +153,7 @@ class DecodeOps:
         batch_sizes: tuple[int, ...] = (1,),
         mamba_ssm_cache_dtype: str = "auto",
     ) -> None:
-        from vllm_torchtpu.megakernel.kimi_k3.program import recurrent_state_dtype
+        from sglang_tpu.k3_programs.kimi_k3.program import recurrent_state_dtype
 
         self.recurrent_dtype = getattr(
             torch, recurrent_state_dtype(mamba_ssm_cache_dtype)
@@ -299,7 +299,7 @@ class DecodeOps:
                 f"K3 decode: batch {batch} is not among "
                 f"the compiled sizes {self.batch_sizes}"
             )
-        from vllm_torchtpu.megakernel.kimi_k3 import sampling
+        from sglang_tpu.k3_programs.kimi_k3 import sampling
 
         paged, names = self.paged, self.names
         count = len(names)
@@ -401,7 +401,7 @@ class DecodeOps:
         width), the verify ops are built with. ``masked_ops``: also compile
         the grammar-masked plain steps (structured outputs; with DSpark, the
         steps where a structured request decodes)."""
-        from vllm_torchtpu.megakernel.compilation import CompileCall
+        from sglang_tpu.k3_programs.compilation import CompileCall
 
         operands = self._operands()
         calls = []
@@ -842,7 +842,7 @@ class DecodeOps:
         synthetic_rates,
         single,
     ):
-        from vllm_torchtpu.megakernel.kimi_k3 import sampling
+        from sglang_tpu.k3_programs.kimi_k3 import sampling
 
         requests = modes.shape[0]
         rows_per = tokens.shape[0] // requests

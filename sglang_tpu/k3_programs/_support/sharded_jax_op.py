@@ -40,7 +40,7 @@ import torch
 from jax.sharding import NamedSharding, PartitionSpec
 from torch_tpu._internal.pallas import pallas as pallas_impl
 
-from vllm_torchtpu.logger import init_logger
+from sglang_tpu.k3_programs._support.logger import init_logger
 
 logger = init_logger(__name__)
 

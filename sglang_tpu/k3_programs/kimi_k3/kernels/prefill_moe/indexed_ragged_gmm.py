@@ -9,7 +9,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.megakernel.kimi_k3.kernels import prefill_megakernel as k
+from sglang_tpu.k3_programs.kimi_k3.kernels import prefill_megakernel as k
 
 
 class _PackedRows:

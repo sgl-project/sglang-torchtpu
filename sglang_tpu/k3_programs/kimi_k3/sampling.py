@@ -23,7 +23,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-from vllm_torchtpu.megakernel.kimi_k3.program import TP_SIZE, kernel_modules
+from sglang_tpu.k3_programs.kimi_k3.program import TP_SIZE, kernel_modules
 
 AXIS = "tp"
 CANDIDATES = 128

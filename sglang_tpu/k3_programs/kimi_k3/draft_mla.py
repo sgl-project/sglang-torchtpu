@@ -35,16 +35,16 @@ import numpy as np
 import torch
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.megakernel.bridge import (
+from sglang_tpu.k3_programs._support.logger import init_logger
+from sglang_tpu.k3_programs.bridge import (
     hbm,
     kernel_mesh,
     materialize,
     register_op,
     upload,
 )
-from vllm_torchtpu.megakernel.kimi_k3 import config as kernel_config
-from vllm_torchtpu.megakernel.kimi_k3.program import TP_SIZE, kernel_modules
+from sglang_tpu.k3_programs.kimi_k3 import config as kernel_config
+from sglang_tpu.k3_programs.kimi_k3.program import TP_SIZE, kernel_modules
 
 logger = init_logger(__name__)
 
@@ -584,7 +584,7 @@ class MlaDsparkDraft:
         return self._ops[key]
 
     def compilation_calls(self, control: Any, spec_alone: bool, spec_shapes) -> list:
-        from vllm_torchtpu.megakernel.compilation import CompileCall
+        from sglang_tpu.k3_programs.compilation import CompileCall
 
         c = self.config
         operands = self._operands()

@@ -73,9 +73,9 @@ from jax.experimental.pallas import tpu_sc as plsc
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.megakernel.common import pool_alias
-from vllm_torchtpu.megakernel.kimi_k3.config import active as _config
-from vllm_torchtpu.megakernel.kimi_k3.kernels.helpers import (
+from sglang_tpu.k3_programs.common import pool_alias
+from sglang_tpu.k3_programs.kimi_k3.config import active as _config
+from sglang_tpu.k3_programs.kimi_k3.kernels.helpers import (
     e8m0_scale,
     expert_activation,
     kda_decay,

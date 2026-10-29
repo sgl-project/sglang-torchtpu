@@ -25,9 +25,9 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu
 
-from vllm_torchtpu.megakernel.kimi_k3.config import active as _config
-from vllm_torchtpu.megakernel.kimi_k3.kernels import mla_dcp
-from vllm_torchtpu.megakernel.kimi_k3.kernels.decode_megakernel import (
+from sglang_tpu.k3_programs.kimi_k3.config import active as _config
+from sglang_tpu.k3_programs.kimi_k3.kernels import mla_dcp
+from sglang_tpu.k3_programs.kimi_k3.kernels.decode_megakernel import (
     MLA_LAYERS,
     decode_local,
 )
