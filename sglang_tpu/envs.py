@@ -123,6 +123,10 @@ class TpuEnvs:
     # token included; InferenceX pins "7:3.78,3:2.87" for Kimi-K3). Empty
     # verifies for real.
     SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS = EnvStr("")
+    # Kernel config overrides for the programs, "FIELD=VALUE;..." (fields of
+    # sglang_tpu/k3_programs/kimi_k3/config.py KernelConfig, e.g.
+    # "moe_reduce_dtype=bfloat16;prefill_expert_parallel=32"). Empty: the defaults.
+    SGLANG_TPU_K3_PROGRAM_KERNEL_CONFIG = EnvStr("")
 
     # Host padding is unconditional; this routes speculative batches to the
     # experimental spec worker, which keeps their metadata on the host as well.

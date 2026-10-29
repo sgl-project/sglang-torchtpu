@@ -126,6 +126,25 @@ class TestServerConfig(CustomTestCase):
                 sglang_program.build_from_server()
 
 
+class TestKernelConfig(CustomTestCase):
+    def test_overrides_parse_and_reject_unknown_fields(self):
+        from sglang_tpu.k3_programs.kimi_k3 import config
+
+        with mock.patch.object(config, "install", side_effect=lambda c: c):
+            installed = sglang_program.install_kernel_config(
+                "moe_reduce_dtype=bfloat16; prefill_expert_parallel=32"
+            )
+            self.assertEqual(
+                (installed.moe_reduce_dtype, installed.prefill_expert_parallel),
+                ("bfloat16", 32),
+            )
+            self.assertEqual(
+                sglang_program.install_kernel_config(""), config.KernelConfig()
+            )
+            with self.assertRaisesRegex(ValueError, "KernelConfig field"):
+                sglang_program.install_kernel_config("no_such_field=1")
+
+
 class TestDecodeBinding(CustomTestCase):
     def test_binds_the_unified_pools(self):
         with mock.patch(

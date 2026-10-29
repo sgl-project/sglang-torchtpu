@@ -441,9 +441,14 @@ def register() -> None:
 
     if ALGORITHM in _REGISTRY:
         return
-    from sglang_tpu.k3_programs.sglang_program import build_steps
+    from sglang_tpu.k3_programs.sglang_program import (
+        build_steps,
+        install_kernel_config,
+    )
 
     K3ProgramWorker.build_steps = build_steps
+    # Before any kernel module is imported (they read the config at import).
+    install_kernel_config()
 
     @SpeculativeAlgorithm.register(ALGORITHM, spec_class=K3ProgramAlgo)
     def _factory(server_args):

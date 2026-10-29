@@ -41,6 +41,27 @@ def parse_acc_lengths(text: str) -> dict[int, float] | None:
     return lengths
 
 
+def install_kernel_config(text: str | None = None):
+    """Install the programs' kernel config from ``"FIELD=VALUE;..."`` (default:
+    ``SGLANG_TPU_K3_PROGRAM_KERNEL_CONFIG``). Kernel modules read it when they
+    are first imported, so this runs before any of them."""
+    from sglang_tpu.envs import envs as tpu_envs
+    from sglang_tpu.k3_programs.kimi_k3 import config
+
+    if text is None:
+        text = tpu_envs.SGLANG_TPU_K3_PROGRAM_KERNEL_CONFIG.get()
+    fields = {}
+    for item in filter(None, (part.strip() for part in text.split(";"))):
+        name, _, value = item.partition("=")
+        if not value or name not in config.KernelConfig.__dataclass_fields__:
+            raise ValueError(
+                f"K3_PROGRAM kernel config {item!r}: expected FIELD=VALUE with a "
+                "KernelConfig field"
+            )
+        fields[name] = value
+    return config.install(config.KernelConfig().replace(**fields))
+
+
 def _local_checkpoint(path: str) -> Path:
     """A checkpoint argument (directory or Hugging Face id) as its local
     directory, from the cache only."""
@@ -107,6 +128,7 @@ def build_from_server():
             f"K3_PROGRAM: the draft has {layers} layers; the unified pools hold "
             f"{bridge.DSPARK_DRAFT_LAYERS}"
         )
+    install_kernel_config()
     config = server_engine_config()
     # The program is a handful of whole-model custom ops per step: fusing the
     # eager ops around them would compile a new device program for every
