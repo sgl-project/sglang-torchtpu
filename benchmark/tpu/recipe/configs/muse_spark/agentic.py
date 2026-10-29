@@ -40,5 +40,8 @@ CONFIG["runtime_env"].update(
         "SGLANG_TPU_DFLASH_FP8_DRAFT": "1",
         "SGLANG_SPEC_TP_SYNC": "rng",
         "SGLANG_TPU_ALLOW_SPEC_RECOMPILE": "1",
+        # Per-chunk tree inserts leave each chunk's SWA tail live, so a few long
+        # prompts fill the SWA pool and its eviction drops older prefixes whole.
+        "SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE": "131072",
     }
 )
