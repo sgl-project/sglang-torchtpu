@@ -31,7 +31,9 @@ def _make_block512_layer(
     include_unused_params: bool = True, group_size: int = BLOCK_SIZE
 ) -> torch.nn.Module:
     layer = torch.nn.Module()
-    layer.moe_runner_config = types.SimpleNamespace(is_gated=True, activation="silu")
+    layer.moe_runner_config = types.SimpleNamespace(
+        is_gated=True, activation="silu", routed_scaling_factor=None
+    )
     layer.register_parameter(
         "w13_weight",
         torch.nn.Parameter(
