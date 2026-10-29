@@ -125,6 +125,20 @@ class TestRuntimeEnvironment(unittest.TestCase):
                 self.assertEqual(overridden["HF_HUB_OFFLINE"], "1")
                 self.assertNotIn("TORCH_LOGS", overridden)
 
+    def test_concurrency_selects_get_config(self):
+        recipe = "recipe/configs/muse_spark/agentic.py"
+        config = load_recipe(recipe, 24)
+        self.assertEqual(config["server_args"]["max_running_requests"], 6)
+        self.assertEqual(config["runtime_env"]["SGLANG_TPU_MUSE_MK_MAX_ROWS"], "48")
+        for name, concurrency in (
+            (recipe, 2),
+            (recipe, None),
+            ("recipe/configs/muse_spark/server.py", 16),
+        ):
+            with self.subTest(name=name, concurrency=concurrency):
+                with self.assertRaises(ValueError):
+                    load_recipe(name, concurrency)
+
 
 if __name__ == "__main__":
     unittest.main()
