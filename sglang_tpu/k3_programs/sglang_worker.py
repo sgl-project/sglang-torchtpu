@@ -98,9 +98,12 @@ class K3ProgramAlgo(CustomSpecAlgo):
 
     def handle_server_args(self, server_args: Any) -> None:
         """The settings the programs serve under: a round's KV reservation
-        for eight tokens, KV pages of one logical block, the scheduler
-        synchronous (the worker runs each step to its tokens) and no radix
-        cache (a request's KDA state lives in the program's slots)."""
+        for eight tokens, KV pages of one logical block and the scheduler
+        synchronous (the worker runs each step to its tokens). The decode
+        runs without the radix cache (a request's KDA state lives in the
+        program's slots). A prefill with the radix cache uses the hybrid
+        cache's ``extra_buffer`` strategy, chunked a page at a time so every
+        full chunk ends on a checkpoint the cache keeps."""
         from sglang_tpu.k3_programs.kimi_k3.layout import cache_layout
         from sglang_tpu.k3_programs.sglang_config import program_kv_cache_dtype
 
@@ -110,7 +113,13 @@ class K3ProgramAlgo(CustomSpecAlgo):
         layout = cache_layout(program_kv_cache_dtype(server_args.kv_cache_dtype))
         server_args.page_size = bridge.TP_SIZE * layout.tokens_per_block
         server_args.disable_overlap_schedule = True
-        server_args.disable_radix_cache = True
+        role = getattr(server_args, "disaggregation_mode", None)
+        if role != "prefill" or getattr(server_args, "disable_radix_cache", False):
+            server_args.disable_radix_cache = True
+            return
+        server_args.mamba_radix_cache_strategy = "extra_buffer"
+        server_args.mamba_track_interval = server_args.page_size
+        server_args.chunked_prefill_size = server_args.page_size
 
     def build_disagg_draft_input(self, batch, last_tokens_tensor, future_map):
         # A request the P/D transfer delivered: the program takes its first
@@ -242,10 +251,12 @@ class PrefillSteps:
         plan: bridge.UnifiedPoolPlan,
         *,
         table_width: int,
+        kda_width: int = 1,
     ) -> None:
         self.program = program
         self.plan = plan
         self.table_width = table_width
+        self.kda_width = kda_width
         self._live: set[str] = set()
         self._prompts = _Prompts()
 
@@ -276,6 +287,7 @@ class PrefillSteps:
                         int(req.kv.mamba_pool_idx.reshape(-1)[0]),
                         self.plan,
                         self.table_width,
+                        self.kda_width,
                     ),
                     sampling_params=req.sampling_params,
                 )
@@ -361,9 +373,16 @@ class K3ProgramWorker(BaseSpecWorker):
             .numpy()
         )
         if prefill:
+            state_pool = self.req_to_token_pool.mamba_pool
+            # A prefix hit's cached state into the request's slot (sglang's
+            # model runner does this before a forward; the program reads it).
+            cow_src = getattr(batch, "mamba_cow_src_indices", None)
+            if cow_src is not None and len(cow_src):
+                state_pool.copy_from(cow_src, batch.mamba_cow_dst_indices)
             first = self.steps.step(
                 batch.reqs, batch.prefix_lens, batch.extend_lens, starts
             )
+            self._track_checkpoints(batch, state_pool)
             if on_publish is not None:
                 on_publish(batch.seq_lens)
             return GenerationBatchResult(
@@ -385,6 +404,33 @@ class K3ProgramWorker(BaseSpecWorker):
             next_draft_input=K3ProgramInput(),
             speculative_num_draft_tokens=WIDTH,
             speculative_output_stride=WIDTH,
+        )
+
+    @staticmethod
+    def _track_checkpoints(batch, state_pool) -> None:
+        """The state after each tracked chunk into the request's track slot,
+        which the radix cache keeps as the checkpoint at that length."""
+        mask = getattr(batch, "mamba_track_mask", None)
+        if mask is None:
+            return
+        rows = [i for i, tracked in enumerate(mask.tolist()) if tracked]
+        if not rows:
+            return
+        seqlens = batch.mamba_track_seqlens_cpu
+        for i in rows:
+            end = batch.prefix_lens[i] + batch.extend_lens[i]
+            # The cache tracks the state at the last checkpoint of the chunk:
+            # with page-sized chunks, the chunk's end (+1 when it is not the
+            # final state position, as sglang marks a forced track).
+            if int(seqlens[i]) not in (end, end + 1):
+                raise RuntimeError(
+                    f"K3 prefill: request {batch.reqs[i].rid} tracks length "
+                    f"{int(seqlens[i])}, not its chunk end {end}: chunks must be "
+                    "one page"
+                )
+        working = [batch.reqs[i].kv.mamba_pool_idx.reshape(-1)[0] for i in rows]
+        state_pool.copy_from(
+            torch.stack(working), batch.mamba_track_indices.reshape(-1)[rows]
         )
 
 

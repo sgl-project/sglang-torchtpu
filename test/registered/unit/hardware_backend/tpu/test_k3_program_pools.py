@@ -130,6 +130,125 @@ class TestUnifiedPoolClasses(CustomTestCase):
         self.assertEqual(ids[: len(MLA)], list(MLA))
 
 
+class TestPrefixCache(CustomTestCase):
+    """A prefix hit restores a cached slot's KDA state; a tracked chunk's
+    state goes to the track slot the radix cache keeps."""
+
+    def setUp(self):
+        with _model():
+            self.state, self.kv = _build(slots=4, pages=10)
+        self.plan = self.kv.plan
+
+    def _mark(self, slot, value):
+        for pool in self.state.host_pools():
+            for g in range(3):
+                pool[self.plan.state_block(slot, g)].fill_(value)
+
+    def _value(self, slot):
+        values = {
+            float(pool[self.plan.state_block(slot, g)].float().mean())
+            for pool in self.state.host_pools()
+            for g in range(3)
+        }
+        self.assertEqual(len(values), 1)
+        return values.pop()
+
+    def test_copy_from_moves_every_hosting_pools_blocks(self):
+        self.assertEqual(len(self.state.host_pools()), len(KDA) // 3)
+        self._mark(2, 7.0)
+        self._mark(3, 1.0)
+        self.state.copy_from(torch.tensor([2]), torch.tensor([3]))
+        self.assertEqual(self._value(3), 7.0)
+        self.assertEqual(self._value(2), 7.0)
+        # The KV pages are untouched.
+        self.assertEqual(
+            float(self.kv.caches[bridge.mla_layer_name(MLA[0])][1].float().abs().sum()),
+            0.0,
+        )
+
+    def test_prefill_hit_and_track(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang_tpu.k3_programs import sglang_worker as worker
+        from sglang_tpu.k3_programs.program import StepOutput
+
+        seen = []
+
+        class Prefill:
+            def step(self, step_input):
+                seen.append(step_input)
+                return StepOutput(torch.full((1, 1), -1, dtype=torch.int32))
+
+        groups = bridge.kv_groups(
+            self.plan, 1 << 20, 128, kda_block_size=self.plan.layout.tokens_per_block
+        )
+        kda_width = groups[1].table_width
+        self.assertEqual((groups[1].block_size, kda_width), (256, 4096))
+        steps = worker.PrefillSteps(
+            Prefill(), self.plan, table_width=128, kda_width=kda_width
+        )
+        r2t = np.zeros((3, 1 << 20), np.int32)
+        for k, page in enumerate((1, 2, 3)):
+            r2t[1, k * STEP : (k + 1) * STEP] = np.arange(
+                page * STEP, (page + 1) * STEP
+            )
+        req = SimpleNamespace(
+            rid="r",
+            origin_input_ids=list(range(3 * STEP + 5)),
+            sampling_params=SimpleNamespace(
+                temperature=1.0, top_p=1.0, top_k=1, sampling_seed=None
+            ),
+            kv=SimpleNamespace(req_pool_idx=1, mamba_pool_idx=torch.tensor([1])),
+            grammar=None,
+        )
+        self._mark(2, 5.0)  # the cached node's state after STEP tokens
+        self._mark(1, 0.0)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            reqs=[req],
+            prefix_lens=[STEP],
+            extend_lens=[STEP],
+            seq_lens=torch.tensor([2 * STEP]),
+            return_logprob=False,
+            mamba_cow_src_indices=torch.tensor([2]),
+            mamba_cow_dst_indices=torch.tensor([1]),
+            mamba_track_mask=torch.tensor([True]),
+            mamba_track_indices=torch.tensor([3]),
+            mamba_track_seqlens_cpu=[2 * STEP],
+        )
+        target = SimpleNamespace(
+            model_runner=None,
+            get_memory_pool=lambda: (
+                SimpleNamespace(
+                    req_to_token=torch.from_numpy(r2t), mamba_pool=self.state
+                ),
+                None,
+            ),
+        )
+        worker.K3ProgramWorker.build_steps = lambda t: steps
+        self.addCleanup(setattr, worker.K3ProgramWorker, "build_steps", None)
+        w = worker.K3ProgramWorker(None, 0, 0, target)
+        w.alloc_memory_pool()
+        w.forward_batch_generation(batch)
+        (row,) = seen[0].requests
+        # The hit: computed STEP, its column (STEP // 256 - 1) is the request's
+        # slot, which now holds the cached state.
+        self.assertEqual(row.computed, STEP)
+        self.assertEqual(self._value(1), 5.0)
+        column = pools.kda_blocks_at_column(
+            row.block_tables,
+            [(1 + k % 3, 256) for k in range(len(KDA))],
+            STEP // 256 - 1,
+        )
+        self.assertEqual(
+            set(column.tolist()), {self.plan.state_block(1, g) for g in range(3)}
+        )
+        # The tracked chunk's end state (the slot's, after the step) is in slot 3.
+        self.assertEqual(self._value(3), 5.0)
+        batch.mamba_track_seqlens_cpu = [STEP + 100]
+        with self.assertRaisesRegex(RuntimeError, "chunks must be one page"):
+            w.forward_batch_generation(batch)
+
+
 class TestRaidenGroups(CustomTestCase):
     """Raiden moves rows of root tensors by index: a page's row is its page
     id, a slot's three rows are the blocks the program reads its state from."""

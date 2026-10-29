@@ -238,11 +238,14 @@ def mla_table_row(
     return row
 
 
-def kda_table_rows(slot: int, plan: UnifiedPoolPlan) -> tuple[np.ndarray, ...]:
+def kda_table_rows(
+    slot: int, plan: UnifiedPoolPlan, width: int = 1
+) -> tuple[np.ndarray, ...]:
     """A request's rows in the three KDA groups: its slot's block for that
-    group, in column 0."""
+    group in every column, so the state a step reads or writes at any length
+    (a prefix hit's column included) is the slot's."""
     return tuple(
-        np.array([plan.state_block(slot, group)], np.int32)
+        np.full(width, plan.state_block(slot, group), np.int32)
         for group in range(KDA_PER_POOL)
     )
 
@@ -253,12 +256,20 @@ def kda_group_layers(group: int) -> tuple[int, ...]:
 
 
 def kv_groups(
-    plan: UnifiedPoolPlan, context_len: int, table_width: int, draft_layers: int = 0
+    plan: UnifiedPoolPlan,
+    context_len: int,
+    table_width: int,
+    draft_layers: int = 0,
+    kda_block_size: int | None = None,
 ) -> list[KVGroup]:
     """The groups the programs bind: the MLA layers' pages (with the draft
-    layers', read through the same tables), then the three KDA groups, each
-    with one block spanning the context (column 0: the request's state block
-    for that group)."""
+    layers', read through the same tables), then the three KDA groups. A KDA
+    group's block spans the whole context (one column: the request's state
+    block), or ``kda_block_size`` tokens: the prefill program reads a prefix
+    hit's state from column ``hit // block_size - 1`` (vLLM's ``align``
+    mode), so a prefill with prefix caching takes a column per page."""
+    kda_size = kda_block_size or max(context_len, 1)
+    kda_width = -(-max(context_len, 1) // kda_size)
     return [
         KVGroup(
             tuple(mla_layer_name(layer) for layer in MLA)
@@ -269,8 +280,8 @@ def kv_groups(
         *(
             KVGroup(
                 tuple(kda_layer_name(layer) for layer in kda_group_layers(group)),
-                max(context_len, 1),
-                1,
+                kda_size,
+                kda_width,
             )
             for group in range(KDA_PER_POOL)
         ),
@@ -283,11 +294,12 @@ def block_tables(
     slot: int,
     plan: UnifiedPoolPlan,
     table_width: int,
+    kda_width: int = 1,
 ) -> tuple[np.ndarray, ...]:
     """``RequestInput.block_tables`` for the four groups of :func:`kv_groups`."""
     return (
         mla_table_row(starts, seq_len, plan, table_width),
-        *kda_table_rows(slot, plan),
+        *kda_table_rows(slot, plan, kda_width),
     )
 
 

@@ -39,8 +39,12 @@ PAGE_SIZE = 32 * (512 if KV_DTYPE.startswith("fp8") else 256)
 # The decode admits twice the client concurrency; the prefill holds what it is
 # computing or transferring.
 RUNNING = max(4, 2 * CONCURRENCY) if ROLE == "decode" else max(4, CONCURRENCY)
-# Prefill windows run up to 8192 tokens, page aligned.
-PREFILL_CHUNK = 8192
+# A prefill chunk is one page: every full chunk ends on a KDA checkpoint the
+# prefix cache keeps (the programs' windows split it as they need).
+PREFILL_CHUNK = PAGE_SIZE
+# Prefill KDA checkpoints the prefix cache may hold (each three blocks of the
+# 29 pools: about 28 MB a rank).
+PREFILL_CHECKPOINTS = int(os.environ.get("K3_PROGRAM_PREFILL_CHECKPOINTS", "512"))
 
 CONFIG = deepcopy(SERVER_CONFIG)
 server_args = CONFIG["server_args"]
@@ -67,14 +71,30 @@ server_args.update(
         "chunked_prefill_size": PREFILL_CHUNK,
         "max_prefill_tokens": PREFILL_CHUNK,
         "max_running_requests": RUNNING,
-        # One KDA state slot per running request.
-        "max_mamba_cache_size": RUNNING,
-        # The decode's whole working set: every running request at full context.
-        "max_total_tokens": RUNNING * CONTEXT_LENGTH,
         "mem_fraction_static": 0.9,
         "skip_server_warmup": True,
     }
 )
+if ROLE == "decode":
+    server_args.update(
+        disable_radix_cache=True,
+        # A KDA state slot and a full context of KV per running request, and
+        # as many again for requests still arriving over the transfer: the
+        # decode never retracts.
+        max_mamba_cache_size=2 * RUNNING,
+        max_total_tokens=2 * RUNNING * CONTEXT_LENGTH,
+    )
+else:
+    # AgentX turns extend the session's earlier prompt: the prefill keeps them
+    # in its radix cache, the KV pages and a KDA checkpoint per page-aligned
+    # chunk, and sizes the KV pool from what the checkpoints leave.
+    server_args.update(
+        disable_radix_cache=False,
+        mamba_radix_cache_strategy="extra_buffer",
+        mamba_track_interval=PAGE_SIZE,
+        max_mamba_cache_size=PREFILL_CHECKPOINTS,
+        max_total_tokens=None,
+    )
 runtime_env = CONFIG["runtime_env"]
 # The sglang decoder kernels' switches: the program replaces the decoder.
 for key in (

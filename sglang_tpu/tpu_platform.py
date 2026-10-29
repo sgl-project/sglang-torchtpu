@@ -1121,8 +1121,10 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 
         # KDA shares GDN metadata setup, but does not pass snapshot tracking
-        # to its kernel yet. Only the GDN backend writes reusable checkpoints.
-        return hybrid_gdn_config(model_config) is not None
+        # to its kernel yet. Only the GDN backend writes reusable checkpoints,
+        # and the Kimi-K3 programs (their worker copies each tracked chunk's
+        # state into the track slot).
+        return hybrid_gdn_config(model_config) is not None or _k3_program_selected()
 
     def validate_mamba_prefix_cache(self, view, hf_config=None) -> None:
         # Mixed-batch merging drops the tracking plan while requests retain

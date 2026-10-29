@@ -137,13 +137,21 @@ def build_steps(target_worker):
         )
     plan = pool.plan
     width = -(-_config.max_model_len // plan.logical_block_tokens)
+    # The prefill reads a prefix hit's KDA state from its page's column.
+    kda_block = plan.layout.tokens_per_block if _config.role == "prefill" else None
     groups = bridge.kv_groups(
-        plan, _config.max_model_len, width, draft_layers=bridge.DSPARK_DRAFT_LAYERS
+        plan,
+        _config.max_model_len,
+        width,
+        draft_layers=bridge.DSPARK_DRAFT_LAYERS,
+        kda_block_size=kda_block,
     )
     _program.bind_kv_caches(pool.caches, groups)
     _program.warmup()
     if _config.role == "prefill":
-        return PrefillSteps(_program, plan, table_width=width)
+        return PrefillSteps(
+            _program, plan, table_width=width, kda_width=int(groups[1].table_width)
+        )
     return DecodeSteps(
         _program,
         plan,

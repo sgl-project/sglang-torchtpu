@@ -53,6 +53,8 @@ class K3StatePool:
     the unified pools (``UnifiedPoolPlan.state_row``)."""
 
     slot_allocator_device = "cpu"
+    # HybridReqToTokenPool resets GDN ReplaySSM rings on fresh slots; KDA has none.
+    replayssm_write_pos = None
 
     def __init__(
         self, *, size: int, mamba_layer_ids, device: str, **kwargs: Any
@@ -78,6 +80,39 @@ class K3StatePool:
 
     def bind(self, plan: bridge.UnifiedPoolPlan, caches: dict[str, torch.Tensor]):
         self.plan, self.caches = plan, caches
+
+    def _state_rows(self, slots) -> torch.Tensor:
+        assert self.plan is not None
+        slots = torch.as_tensor(slots, dtype=torch.int64).reshape(-1).cpu()
+        first = torch.tensor([self.plan.state_row(int(s)) for s in slots])
+        rows = first[:, None] + torch.arange(bridge.KDA_PER_POOL)[None, :]
+        return rows.reshape(-1)
+
+    def host_pools(self) -> list[torch.Tensor]:
+        """The pools holding KDA state (each hosts three KDA layers)."""
+        assert self.caches is not None
+        seen: dict[int, torch.Tensor] = {}
+        for layer in KDA:
+            pool = self.caches[bridge.kda_layer_name(layer)]
+            seen.setdefault(pool.data_ptr(), pool)
+        return list(seen.values())
+
+    def copy_from(self, src_indices, dst_indices) -> None:
+        """Copy slots' KDA state (their three blocks of every hosting pool):
+        a prefix hit's cached state into the request's slot, or a chunk's
+        state into its track slot for the radix cache."""
+        src, dst = self._state_rows(src_indices), self._state_rows(dst_indices)
+        if src.numel() != dst.numel():
+            raise ValueError(f"copy of {src.numel()} state rows into {dst.numel()}")
+        if not src.numel():
+            return
+        for pool in self.host_pools():
+            device_src, device_dst = src.to(pool.device), dst.to(pool.device)
+            pool.index_copy_(0, device_dst, pool.index_select(0, device_src))
+
+    def clear_slots(self, indices) -> None:
+        """Nothing to clear: a request without a prefix hit starts from a zero
+        state in the program, which never reads its slot first."""
 
     def mem_usage_bytes(self) -> int:
         return 0  # counted with the KV pool, which allocates the unified pools

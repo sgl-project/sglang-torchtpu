@@ -232,6 +232,18 @@ class TestRegisteredAlgorithm(CustomTestCase):
         self.algo.handle_server_args(args)
         self.assertEqual(args.page_size, 16384)
         self.assertTrue(args.disable_overlap_schedule and args.disable_radix_cache)
+        # A prefill keeps the radix cache: extra_buffer, page-sized chunks.
+        prefill = SimpleNamespace(
+            kv_cache_dtype="fp8_e4m3",
+            disaggregation_mode="prefill",
+            disable_radix_cache=False,
+        )
+        self.algo.handle_server_args(prefill)
+        self.assertFalse(prefill.disable_radix_cache)
+        self.assertEqual(prefill.mamba_radix_cache_strategy, "extra_buffer")
+        self.assertEqual(
+            (prefill.mamba_track_interval, prefill.chunked_prefill_size), (16384, 16384)
+        )
         self.assertEqual(
             (
                 args.speculative_num_steps,
@@ -327,7 +339,10 @@ class TestRegisteredAlgorithm(CustomTestCase):
         r2t = torch.from_numpy(_req_to_token(3, {1: [1], 2: [2]}))
         target = SimpleNamespace(
             model_runner=None,
-            get_memory_pool=lambda: (SimpleNamespace(req_to_token=r2t), None),
+            get_memory_pool=lambda: (
+                SimpleNamespace(req_to_token=r2t, mamba_pool=None),
+                None,
+            ),
         )
         worker.K3ProgramWorker.build_steps = lambda target_worker: worker.PrefillSteps(
             StubPrefill(), plan, table_width=4
