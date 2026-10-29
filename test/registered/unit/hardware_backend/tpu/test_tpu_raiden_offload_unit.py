@@ -156,8 +156,11 @@ class TestRaidenHostMemoryBudget(CustomTestCase):
             start_layer=0,
             end_layer=2,
             layer_num=2,
-            get_fused_kv_buffer=Mock(
-                return_value=torch.empty((3, 4, 1, 2, 128), dtype=torch.bfloat16)
+            page_buffers=Mock(
+                return_value=[
+                    torch.empty((3, 4, 1, 2, 128), dtype=torch.bfloat16)
+                    for _ in range(2)
+                ]
             ),
         )
 
@@ -273,9 +276,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
             start_layer=0,
             end_layer=1,
             layer_num=1,
-            get_fused_kv_buffer=Mock(
-                return_value=torch.empty((8, 4), dtype=torch.bfloat16)
-            ),
+            page_buffers=Mock(return_value=[torch.empty((8, 4), dtype=torch.bfloat16)]),
         )
 
         # Test the sizing warning independently of the CI runner's free RAM.
@@ -300,7 +301,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         self.assertEqual(pool.size, 20)
         self.assertLess(pool.size, device_pool.size)
         self.assertIn("L2 cache effectiveness is reduced", logs.output[0])
-        device_pool.get_fused_kv_buffer.assert_called_once_with(0)
+        device_pool.page_buffers.assert_called_once_with()
         transfer_cls.assert_called_once_with(device_pool, 5, draft_pools=())
 
     def test_decode_kv_args_include_raiden_metadata(self):
