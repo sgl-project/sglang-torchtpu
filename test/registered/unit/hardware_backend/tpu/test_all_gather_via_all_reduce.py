@@ -1,9 +1,10 @@
 """CPU contract for the all-reduce-based TP all-gather (sgl-project/sglang-torchtpu#1700).
 
 The TPU hook rebuilds GroupCoordinator.all_gather_into_tensor from the in-place
-all-reduce while Dynamo traces. These tests simulate a TP group on CPU and check
-that the result is bit-identical to the concatenation a correct all-gather
-writes, and that eager calls keep the native collective.
+all-reduce while a graph is traced. These tests simulate a TP group on CPU and
+check that the result equals the concatenation a correct all-gather writes
+(bit-identical except that -0.0 becomes +0.0), and that eager calls keep the
+native collective.
 """
 
 import unittest
@@ -89,6 +90,14 @@ class TestGatherBlocksViaAllReduce(CustomTestCase):
         self.assertTrue(
             torch.equal(got, torch.tensor([[float("inf"), -1.0], [float("-inf"), 2.0]]))
         )
+
+    def test_negative_zero_keeps_its_value_but_not_its_sign_bit(self):
+        blocks = [torch.tensor([[-0.0, 1.0]]), torch.tensor([[3.0, -0.0]])]
+
+        got = agar.gather_blocks_via_all_reduce(_SimulatedGroup(blocks, 0), blocks[0])
+
+        self.assertEqual(got.tolist(), [[0.0, 1.0], [3.0, 0.0]])
+        self.assertFalse(torch.signbit(got).any())
 
 
 class TestAllGatherIntoTensorAround(CustomTestCase):
