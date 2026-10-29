@@ -1128,10 +1128,10 @@ class DefaultModelLoader(BaseModelLoader):
             _drain_device_transients_after_module_load()
         if target_device.type == "tpu":
             from sglang_tpu.moe.pallas.fused_moe_decode import (
-                arm_fused_moe_decode_model,
+                prepare_model_for_fused_moe_decode,
             )
 
-            arm_fused_moe_decode_model(model)
+            prepare_model_for_fused_moe_decode(model)
 
     @staticmethod
     def restore_weights_before_loading(model, target_device):

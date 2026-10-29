@@ -1334,11 +1334,11 @@ class DeepseekV2MoE(nn.Module):
             and not getattr(self, "is_hash", False)
         ):
             from sglang_tpu.moe.pallas.fused_moe_decode import (
-                apply_deepseek_v2_fused_moe_decode,
-                should_use_deepseek_v2_fused_moe_decode,
+                apply_fused_moe_decode,
+                should_use_fused_moe_decode,
             )
 
-            if should_use_deepseek_v2_fused_moe_decode(self, hidden_states):
+            if should_use_fused_moe_decode(self, hidden_states):
                 router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
                 topk_output = self.topk(
                     hidden_states,
@@ -1346,9 +1346,7 @@ class DeepseekV2MoE(nn.Module):
                     num_token_non_padded=num_token_non_padded,
                     expert_location_dispatch_info=dispatch_info,
                 )
-                return apply_deepseek_v2_fused_moe_decode(
-                    self, hidden_states, topk_output
-                )
+                return apply_fused_moe_decode(self, hidden_states, topk_output)
 
         if hidden_states.shape[0] > 0:
             # Quantize-once (SGLANG_OPT_MOE_QUANT_ONCE): only worthwhile when
@@ -2895,12 +2893,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         _fmd_summed = False
         if _is_tpu and isinstance(self.mlp, DeepseekV2MoE):
             from sglang_tpu.moe.pallas.fused_moe_decode import (
-                should_use_deepseek_v2_fused_moe_decode,
+                should_use_fused_moe_decode,
             )
 
-            _fmd_summed = should_use_deepseek_v2_fused_moe_decode(
-                self.mlp, hidden_states
-            )
+            _fmd_summed = should_use_fused_moe_decode(self.mlp, hidden_states)
 
         with (
             self.ffn_boundary.exit(

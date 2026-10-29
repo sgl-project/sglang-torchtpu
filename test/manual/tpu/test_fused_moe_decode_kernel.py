@@ -21,9 +21,9 @@ from torch_tpu._internal.distributed import tpu_distributed  # noqa: F401
 import sglang_tpu.moe.pallas.fused_moe_decode.fused_moe_decode_op as fmd_op
 from sglang.srt.platforms import current_platform
 from sglang_tpu.moe.pallas.fused_moe_decode import (
-    apply_deepseek_v2_fused_moe_decode,
-    arm_deepseek_v2_fused_moe_decode,
-    should_use_deepseek_v2_fused_moe_decode,
+    apply_fused_moe_decode,
+    prepare_moe_layer_for_fused_decode,
+    should_use_fused_moe_decode,
 )
 
 
@@ -92,11 +92,9 @@ class DummyMoE(nn.Module):
         topk_w: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        if should_use_deepseek_v2_fused_moe_decode(self, hidden_states):
-            return apply_deepseek_v2_fused_moe_decode(
-                self, hidden_states, (topk_w, topk_ids, None)
-            )
-        raise RuntimeError("Expected should_use_deepseek_v2_fused_moe_decode=True")
+        if should_use_fused_moe_decode(self, hidden_states):
+            return apply_fused_moe_decode(self, hidden_states, (topk_w, topk_ids, None))
+        raise RuntimeError("Expected should_use_fused_moe_decode=True")
 
 
 def main():
@@ -122,9 +120,9 @@ def main():
     fmd_op.get_parallel = lambda: fake_parallel
     try:
         moe = DummyMoE(rank, world_size, e_local, h, i_e, i_s, routed_scale, device)
-        assert arm_deepseek_v2_fused_moe_decode(moe)
+        assert prepare_moe_layer_for_fused_decode(moe)
         x_257 = torch.empty((257, h), dtype=torch.bfloat16, device=device)
-        assert not should_use_deepseek_v2_fused_moe_decode(moe, x_257)
+        assert not should_use_fused_moe_decode(moe, x_257)
 
         compiled_moe = torch.compile(
             moe, backend=current_platform.get_compile_backend(), fullgraph=True
@@ -149,7 +147,7 @@ def main():
             topk_ids = topk_ids_cpu.to(device)
             topk_w = topk_w_cpu.to(device)
 
-            assert should_use_deepseek_v2_fused_moe_decode(moe, x)
+            assert should_use_fused_moe_decode(moe, x)
             out = compiled_moe(x, topk_w, topk_ids)
 
             # Reference on local rank followed by all-reduce across 8 ranks
