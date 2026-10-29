@@ -717,6 +717,26 @@ class RaidenSenderMixin:
                 "state yet; use equal attention TP on prefill and decode."
             )
         req = ReshardReq.from_frames(msg)
+        if self._bounded_staging:
+            # The reshard push copies every layer with one engine.d2h call, which
+            # raiden rejects for staging layers.
+            # TODO(wyzhang): Remove this check once a tpu-sync release reuses staging
+            # layers for this block-addressed push, as pool reshard sends do since
+            # https://github.com/google/tpu-sync/commit/3d98f15362b6, and the push
+            # uses them.
+            reason = (
+                "Raiden asymmetric attention TP does not support staging layers to "
+                "reduce host staging RAM. Set SGLANG_TPU_RAIDEN_STAGING_LAYERS=0 on "
+                "prefill and decode to keep full mirrors."
+            )
+            with self._state_lock:
+                self._fail_room_locked(req.room, reason)
+            self._reply_room_failed(
+                room=req.room,
+                endpoint=_tcp_endpoint(ip=req.decode_ip, port=req.decode_port),
+                reason=reason,
+            )
+            return
         room = req.room
         decode_ip = req.decode_ip
         decode_port = req.decode_port

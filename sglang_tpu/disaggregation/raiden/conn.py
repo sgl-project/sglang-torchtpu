@@ -66,11 +66,14 @@ from sglang_tpu.disaggregation.raiden.common import (
     logger,
 )
 from sglang_tpu.disaggregation.raiden.host_pool import (
+    WINDOW_SLOTS_PER_FULL_SLOT,
     StagingAdmission,
+    host_pool_gb,
     node_worker_rank,
     ranks_per_node,
     slot_host_bytes,
     slots_within_budget,
+    split_staging_layers,
 )
 from sglang_tpu.disaggregation.raiden.receiver import (
     RaidenKVReceiver,
@@ -147,6 +150,10 @@ class RaidenKVManager(
     # The legacy transport unless set_kv_caches builds a pipeline transfer.
     _pipeline = None
     _pipeline_enabled = False
+    # Host layer buffers per transfer, from SGLANG_TPU_RAIDEN_STAGING_LAYERS.
+    _staging_layers_total = 0
+    # Whether an engine stages through fewer host buffers than device layers.
+    _bounded_staging = False
     _listener_start_read = False
     # Layout tag of the registered KV tensors, sent with every CHUNK and BLOCKS.
     kv_layout: str = PER_LAYER_KV_LAYOUT
@@ -232,6 +239,11 @@ class RaidenKVManager(
             "1" if dynamic_host_staging else "0"
         )
         self._dynamic_host_staging = dynamic_host_staging
+        self._staging_layers_total = tpu_envs.SGLANG_TPU_RAIDEN_STAGING_LAYERS.get()
+        if self._staging_layers_total < 0:
+            raise ValueError(
+                f"{tpu_envs.SGLANG_TPU_RAIDEN_STAGING_LAYERS.name} must be >= 0"
+            )
         # Whether KV moves chunk by chunk as the prefill commits it, or in one
         # transfer after the whole prefill; decided from the KV layout when the
         # pool tensors are handed over.
@@ -446,14 +458,30 @@ class RaidenKVManager(
     def _build_engine(self) -> None:
         if self._engine is not None or self._kv_caches is None:
             return
-        engines = 1 + bool(self._swa_kv_caches) + bool(self._state_kv_caches)
         max_blocks = self._max_request_blocks()
-        num_slots = self._num_slots(self._kv_caches, max_blocks, engines)
+        engines = [(self._kv_caches, max_blocks)]
+        if self._swa_kv_caches:
+            swa_max_blocks = self._swa_max_request_blocks()
+            engines.append((self._swa_kv_caches, swa_max_blocks))
+        layers = split_staging_layers(
+            [len(t) for t, _ in engines], self._staging_layers_total
+        )
+        if self._state_kv_caches:
+            # GDN state engines keep every layer.
+            state_max_blocks = self._state_max_blocks
+            engines.append((list(self._state_kv_caches), state_max_blocks))
+            layers.append(len(self._state_kv_caches))
+        self._bounded_staging = any(
+            n < len(tensors) for (tensors, _), n in zip(engines, layers)
+        )
+        sizes = self._size_host_staging(engines, layers)
+        num_slots, staging_layers = sizes[0]
         self.raiden_endpoint, self._engine = self._start_engine(
             kv_caches=self._kv_caches,
             port=self._control_port,
             max_blocks=max_blocks,
             num_slots=num_slots,
+            staging_layers=staging_layers,
         )
         self._full_engine_max_blocks = max_blocks
         pool_pages = num_slots * max_blocks
@@ -472,15 +500,13 @@ class RaidenKVManager(
             self._transfer_parallelism,
         )
         if self._swa_kv_caches:
-            swa_max_blocks = self._swa_max_request_blocks()
-            swa_num_slots = self._num_slots(
-                self._swa_kv_caches, swa_max_blocks, engines
-            )
+            swa_num_slots, swa_staging_layers = sizes[1]
             self.swa_raiden_endpoint, self._swa_engine = self._start_engine(
                 kv_caches=self._swa_kv_caches,
                 port=self._control_port + SWA_PORT_OFFSET,
                 max_blocks=swa_max_blocks,
                 num_slots=swa_num_slots,
+                staging_layers=swa_staging_layers,
             )
             self._swa_engine_max_blocks = swa_max_blocks
             swa_pool_pages = swa_num_slots * swa_max_blocks
@@ -495,10 +521,7 @@ class RaidenKVManager(
                 swa_pool_pages,
             )
         if self._state_kv_caches:
-            state_max_blocks = self._state_max_blocks
-            state_num_slots = self._num_slots(
-                list(self._state_kv_caches), state_max_blocks, engines
-            )
+            state_num_slots, _ = sizes[-1]
             self.state_raiden_endpoint, self._state_engine = self._start_engine(
                 kv_caches=list(self._state_kv_caches),
                 port=self._control_port + STATE_PORT_OFFSET,
@@ -522,7 +545,13 @@ class RaidenKVManager(
         self._pulling = StagingAdmission(pool_pages, swa_pool_pages, state_pool_pages)
 
     def _start_engine(
-        self, *, kv_caches: List[Any], port: int, max_blocks: int, num_slots: int
+        self,
+        *,
+        kv_caches: List[Any],
+        port: int,
+        max_blocks: int,
+        num_slots: int,
+        staging_layers: Optional[int] = None,
     ) -> Tuple[str, Any]:
         """Endpoint and raiden engine serving kv_caches on control port port."""
         # TPU-only import, deferred so the disaggregation module imports cleanly
@@ -540,8 +569,72 @@ class RaidenKVManager(
             num_slots=num_slots,
             timeout_s=self._timeout_s,
             parallelism=self._transfer_parallelism,
+            num_staging_layers=staging_layers,
         )
         return endpoint, engine
+
+    def _size_host_staging(
+        self, engines: List[Tuple[List[Any], int]], layers: List[int]
+    ) -> List[Tuple[int, int]]:
+        """Size all engine staging pools within this rank's host-memory budget.
+
+        Each engine's slot cost is its host layer buffer count multiplied by
+        max_blocks and the widest layer's bytes per page.
+
+        Fixed-slot engines receive the same number of slots. Dynamic staging
+        assigns WINDOW_SLOTS_PER_FULL_SLOT slots to each remaining engine for
+        every full-attention slot. Choose the largest full-attention slot count
+        whose combined allocation fits the rank budget, and cap every engine at
+        _slot_ceiling, which is the most slots a rank can claim.
+
+        Args:
+            engines: (KV tensors, max_blocks per slot) pairs, with full attention
+                first, followed by any sliding-window or state engines.
+            layers: Host layer buffer counts for the engines, in matching order.
+
+        Returns:
+            A list of (slot count, host layer buffer count) pairs in engine order.
+
+        Raises:
+            ValueError: The budget cannot hold one full-attention slot together
+                with the corresponding slots in the other engines.
+
+        Example:
+            With a 24 GiB node budget and eight local ranks, each rank gets 3 GiB.
+            For Muse Spark with two full-attention buffers and six SWA buffers:
+                Full slot: 2 * 1120 pages * 128 KiB = 280 MiB.
+                SWA slot:  6 *    9 pages * 128 KiB = 6.75 MiB.
+            Fixed-slot mode fits floor(3072 / 286.75) = 10 slots per engine,
+            returning [(10, 2), (10, 6)].
+        """
+        slot_bytes = []
+        for (tensors, max_blocks), num_layers in zip(engines, layers):
+            slot_bytes.append(slot_host_bytes(tensors, max_blocks, num_layers))
+
+        other_slots_per_full_slot = 1
+        if self._dynamic_host_staging:
+            other_slots_per_full_slot = WINDOW_SLOTS_PER_FULL_SLOT
+
+        full_slot_bytes = slot_bytes[0]
+        other_slot_bytes = other_slots_per_full_slot * sum(slot_bytes[1:])
+        budget = self._rank_budget_bytes()
+        ceiling = self._slot_ceiling()
+        full_slots = slots_within_budget(
+            budget, full_slot_bytes + other_slot_bytes, ceiling
+        )
+
+        other_slots = min(full_slots * other_slots_per_full_slot, ceiling)
+        counts = [full_slots] + [other_slots] * (len(engines) - 1)
+        logger.info(
+            "RaidenKVManager rank%d host staging | rank_budget=%.2fGB slots=%s "
+            "layers=%s of %s",
+            self.attn_tp_rank,
+            budget / (1024**3),
+            counts,
+            layers,
+            [len(tensors) for tensors, _ in engines],
+        )
+        return list(zip(counts, layers))
 
     def _staging_cost(self, pages: int, max_blocks: int) -> int:
         """Host pages a read of ``pages`` pages takes from its engine's pool.
@@ -607,16 +700,7 @@ class RaidenKVManager(
         shrinks the pool instead, and refuses to start when not even one slot
         fits the budget.
         """
-        budget = tpu_envs.SGLANG_RAIDEN_HOST_POOL_GB.get() * 1024**3
-        local_ranks = ranks_per_node(
-            self.attn_tp_size,
-            self.attn_dp_size,
-            self.system_dp_size,
-            self.server_args.nnodes,
-            self.attn_cp_size,
-            self.pp_size,
-        )
-        budget = budget / (local_ranks * max(1, engines)) - reserved_bytes
+        budget = self._rank_budget_bytes() / max(1, engines) - reserved_bytes
         slot_bytes = slot_host_bytes(kv_caches, max_blocks) + paired_slot_bytes
         slots = slots_within_budget(budget, slot_bytes, self._slot_ceiling())
         logger.info(
@@ -629,6 +713,19 @@ class RaidenKVManager(
             slots,
         )
         return slots
+
+    def _rank_budget_bytes(self) -> float:
+        """This rank's share of the per-node host staging budget."""
+        local_ranks = ranks_per_node(
+            self.attn_tp_size,
+            self.attn_dp_size,
+            self.system_dp_size,
+            self.server_args.nnodes,
+            self.attn_cp_size,
+            self.pp_size,
+        )
+        budget_gb = host_pool_gb(staging_layers=self._bounded_staging)
+        return budget_gb * 1024**3 / local_ranks
 
     def _ensure_engine(self) -> Any:
         if self._engine is None:

@@ -23,6 +23,7 @@ from sglang.srt.utils.network import NetworkAddress
 from sglang_tpu.disaggregation.raiden import pp_swa
 from sglang_tpu.disaggregation.raiden.host_pool import (
     StagingAdmission,
+    host_pool_gb,
     ranks_per_node,
 )
 from sglang_tpu.disaggregation.raiden.pipeline_final_chunks import FinalChunks
@@ -605,7 +606,7 @@ class PipelineTransfer:
             manager.attn_cp_size,
             manager.pp_size,
         )
-        budget = envs.SGLANG_RAIDEN_HOST_POOL_GB.get() * 1024**3 / local_ranks
+        budget = host_pool_gb(staging_layers=False) * 1024**3 / local_ranks
         slots, mirror_peak = legacy_mirror_slots(
             pools=self.pools,
             slot_bytes=initial_slot_bytes,

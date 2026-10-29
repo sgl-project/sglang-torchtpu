@@ -220,7 +220,7 @@ class TestEngineEndpoint(CustomTestCase):
         mgr._swa_kv_caches = [object()] if swa else None
         mgr._max_request_blocks = lambda: 8
         mgr._swa_max_request_blocks = lambda: 2
-        mgr._num_slots = lambda *a, **k: 3
+        mgr._size_host_staging = lambda engines, layers: [(3, n) for n in layers]
         fake_api = types.ModuleType("tpu_sync.api.torch.kv_cache_manager")
         fake_api.KVCacheManager = Mock()
         modules = {

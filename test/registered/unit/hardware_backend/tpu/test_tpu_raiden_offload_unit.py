@@ -1944,6 +1944,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr._superseded_sender_reads = set()
+        mgr._staging_layers_total = 0
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
