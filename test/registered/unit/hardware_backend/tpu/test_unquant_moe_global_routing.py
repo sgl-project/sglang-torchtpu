@@ -168,6 +168,7 @@ class TestUnquantGlobalRouting(CustomTestCase):
                                 activation="silu",
                                 gemm1_alpha=None,
                                 gemm1_clamp_limit=None,
+                                routed_scaling_factor=None,
                             )
                         )
                         dispatch = SimpleNamespace(

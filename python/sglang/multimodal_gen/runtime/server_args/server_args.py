@@ -1094,6 +1094,10 @@ class ServerArgs(DisaggServerArgsMixin):
     def _adjust_attention_backend(self):
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
+        elif self.attention_backend is not None and (
+            self.attention_backend == current_platform.get_oot_attn_backend_name()
+        ):
+            self.attention_backend = AttentionBackendEnum.OOT.name.lower()
         self.component_attention_backends = (
             self._normalize_component_attention_backends(
                 self.component_attention_backends
@@ -1198,6 +1202,8 @@ class ServerArgs(DisaggServerArgsMixin):
             normalized = "fa"
         elif normalized == "cudnn_sdpa":
             normalized = "torch_cudnn_sdpa"
+        elif normalized == current_platform.get_oot_attn_backend_name():
+            normalized = AttentionBackendEnum.OOT.name.lower()
         try:
             return AttentionBackendEnum[normalized.upper()].name.lower()
         except KeyError:

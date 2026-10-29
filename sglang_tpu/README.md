@@ -184,3 +184,22 @@ opt-outs.
 - Requires DP1/attention-DP1/CP1/PP1, device-resident decoder KV, and capacity for
   the full batch. Mixed cohorts, retraction, invalid completion, or timeout fail
   the benchmark. `SGLANG_TPU_BENCHMARK_TIMEOUT_SEC` defaults to `600`.
+
+## Diffusion (multimodal_gen)
+
+`multimodal_gen/` holds the diffusion TPU code. The `tpu_oot` entry point of
+`sglang.multimodal_gen.platforms` selects `multimodal_gen.platform.TpuOOTPlatform`
+whenever `torch.tpu` is registered; `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=tpu`
+selects the fork's built-in TPU platform instead. `TpuOOTPlatform` subclasses that
+built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and carries the
+TPU behavior (`--attention-backend tpu_splash_attn`, the `AttentionBackendEnum.OOT`
+backend).
+
+Gates that take the OOT arm, with the same outcome as the built-in platform:
+
+- `CustomOp` dispatch: the dispatch key is `tpu`, so ops reach `forward_tpu`
+  where they define it and `forward_native` otherwise.
+- `get_torch_library_dispatch_key()`: `PrivateUse1` instead of `CUDA`; its only
+  caller registers the CUDA flash-attention op, which TPU never selects.
+- `get_all_to_all_communicator_cls()`: answered explicitly with the base
+  communicator the built-in platform uses.

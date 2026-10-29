@@ -9,6 +9,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.compilation import decoder_compile_policy
 from sglang_tpu.pp_profile import (
     profile_cache,
     set_profile_inputs,
@@ -155,33 +156,44 @@ class TestProfileInputs(CustomTestCase):
 
     def test_later_stage_proxies_take_the_wave_buffer_height_and_handoff_dtype(self):
         """Serving hands the wave's full buffer to the shim, which trims it to
-        the bucket, so the profile traces that row count in the runner dtype."""
-        policy, slots = _policy()
-        policy._pp_profile_slots = slots
-        outputs = []
-        sync_module = SimpleNamespace(synchronize=Mock())
-        with (
-            patch.dict(sys.modules, {"torch_tpu._internal.sync.sync": sync_module}),
-            patch(
-                "sglang_tpu.compilation.decoder_compile_policy.max_extend_tokens",
-                return_value=40,
-            ) as rows,
+        the bucket; the profile must also use the declared handoff dtype."""
+        for model, dtype in (
+            (SimpleNamespace(), torch.bfloat16),
+            (SimpleNamespace(pp_transfer_dtype=torch.float32), torch.float32),
         ):
-            for _ in range(2):
-                batch = SimpleNamespace(out_cache_loc=torch.zeros(1, dtype=torch.int32))
-                _, kwargs = set_profile_inputs(
-                    policy, batch, (), {"pp_proxy_tensors": None}, 7, 12
+            with self.subTest(dtype=dtype):
+                policy, slots = _policy()
+                policy.model_runner.model = model
+                policy._pp_profile_slots = slots
+                outputs = []
+                sync_module = SimpleNamespace(synchronize=Mock())
+                with (
+                    patch.dict(
+                        sys.modules, {"torch_tpu._internal.sync.sync": sync_module}
+                    ),
+                    patch.object(
+                        decoder_compile_policy,
+                        "max_extend_tokens",
+                        return_value=40,
+                    ) as rows,
+                ):
+                    for _ in range(2):
+                        batch = SimpleNamespace(
+                            out_cache_loc=torch.zeros(1, dtype=torch.int32)
+                        )
+                        _, kwargs = set_profile_inputs(
+                            policy, batch, (), {"pp_proxy_tensors": None}, 7, 12
+                        )
+                        outputs.append(kwargs["pp_proxy_tensors"].tensors)
+                self.assertEqual(rows.call_args.kwargs, {"context_len": 48})
+                for name in ("hidden_states", "residual"):
+                    self.assertEqual(outputs[0][name].shape, (40, 8))
+                    self.assertEqual(outputs[0][name].dtype, dtype)
+                    self.assertGreater(outputs[0][name].float().std().item(), 0)
+                    torch.testing.assert_close(outputs[0][name], outputs[1][name])
+                self.assertFalse(
+                    torch.equal(outputs[0]["hidden_states"], outputs[0]["residual"])
                 )
-                outputs.append(kwargs["pp_proxy_tensors"].tensors)
-        self.assertEqual(rows.call_args.kwargs, {"context_len": 48})
-        for name in ("hidden_states", "residual"):
-            self.assertEqual(outputs[0][name].shape, (40, 8))
-            self.assertEqual(outputs[0][name].dtype, torch.bfloat16)
-            self.assertGreater(outputs[0][name].float().std().item(), 0)
-            torch.testing.assert_close(outputs[0][name], outputs[1][name])
-        self.assertFalse(
-            torch.equal(outputs[0]["hidden_states"], outputs[0]["residual"])
-        )
 
 
 if __name__ == "__main__":

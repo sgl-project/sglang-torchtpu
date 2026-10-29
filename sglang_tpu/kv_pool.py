@@ -125,6 +125,10 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     HEAD_DIM_ALIGNMENT = 128
     # Whether this layout can store exactly-fitting heads side by side (kv_pack_heads).
     PACKS_HEADS = True
+    # Name of the page's interior arrangement. The torch_tpu host pool folds it
+    # into its HiCache storage key; a subclass that changes the arrangement
+    # must restate it, or pages it writes would be read back by this layout.
+    KV_LAYOUT_NAME = "token-major"
     # HiCache io backends (--hicache-io-backend) that can offload this pool to
     # host; hicache_hook refuses the rest at startup. torch_tpu's host pool
     # stores this 5D row verbatim; TPU DMA backends add themselves through
@@ -133,6 +137,15 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     # the pool's KV state: a pool that keeps quantization scales outside
     # get_fused_kv_buffer must not list it.
     kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu"})
+
+    def kv_layout_tag(self) -> str:
+        """Identity of this pool's page byte layout, for storage keys.
+
+        Names the arrangement plus the two packing factors the page dims do
+        not spell out: heads stored side by side in one row (``kv_pack_heads``)
+        and elements sharing a 32-bit lane (``kv_packing``).
+        """
+        return f"{self.KV_LAYOUT_NAME}-hp{self.kv_pack_heads}-p{self.kv_packing}"
 
     @classmethod
     def kv_bytes_per_token_per_layer(
@@ -606,6 +619,7 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
     """
 
     PACKS_HEADS = False
+    KV_LAYOUT_NAME = "seq-along-lane"
 
     # torch_tpu's host pool reads its page shape from get_fused_kv_buffer, so it
     # mirrors this layout too.

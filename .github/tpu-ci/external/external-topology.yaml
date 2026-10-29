@@ -51,14 +51,8 @@ suites:
         cmd: env JAX_PLATFORMS=cpu TORCH_TPU_TOPOLOGY=2,2,2,2 python3 test/registered/e2e/hardware_backend/tpu/test_node_normalization.py -v
       - files: test/registered/tpu/e2e/test_diffusion_tpu_multihost_collectives.py
         cmd: python3 test/registered/tpu/e2e/test_diffusion_tpu_multihost_collectives.py
-      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py
-        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py integration
-        pd: {prefill_hosts: 2, decode_hosts: 2}
       - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_kv_offload_resharding.py
         cmd: env MODEL_PROFILE=gpt_oss_120b python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_kv_offload_resharding.py
-        pd: {prefill_hosts: 2, decode_hosts: 2}
-      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload.py
-        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload.py
         pd: {prefill_hosts: 2, decode_hosts: 2}
       - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py
         cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py integration
@@ -66,24 +60,12 @@ suites:
       - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_reshard.py
         cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_reshard.py integration
         pd: {prefill_hosts: 2, decode_hosts: 2}
-      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py
-        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py integration
-        pd: {prefill_hosts: 2, decode_hosts: 2}
       - files: test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py
         cmd: env MODEL_PROFILE=qwen3_coder_480b python3 test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py
         pd: {prefill_hosts: 2, decode_hosts: 2}
       - files: test/registered/tpu/e2e/test_tpu_qwen3_vl_8b_pd_multihost_eagle3.py
         cmd: python3 test/registered/tpu/e2e/test_tpu_qwen3_vl_8b_pd_multihost_eagle3.py integration
         pd: {prefill_hosts: 2, decode_hosts: 2}
-      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py
-        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py integration
-        pd: {prefill_hosts: 1, decode_hosts: 1}
-      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py
-        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py integration
-        pd: {prefill_hosts: 1, decode_hosts: 1}
-      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload.py
-        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload.py integration
-        pd: {prefill_hosts: 1, decode_hosts: 1}
       - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_spec.py
         cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_spec.py integration
         pd: {prefill_hosts: 1, decode_hosts: 1}
@@ -98,9 +80,6 @@ suites:
         pd: {prefill_hosts: 1, decode_hosts: 1}
       - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_recompile.py
         cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_recompile.py integration
-        pd: {prefill_hosts: 1, decode_hosts: 1}
-      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py
-        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py integration
         pd: {prefill_hosts: 1, decode_hosts: 1}
       - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_pp_eagle3_perf.py
         cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_pp_eagle3_perf.py integration

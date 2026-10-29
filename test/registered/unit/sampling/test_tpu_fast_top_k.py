@@ -390,6 +390,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
     def test_speculative_batch_does_not_inspect_sampling_info(self):
         class SpecBatch:
             spec_algorithm = SpeculativeAlgorithm.EAGLE3
+            logits_output_mode = LogitsOutputMode.FULL_VOCAB
 
             @property
             def sampling_info(self):
@@ -410,6 +411,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
     def test_draft_batch_does_not_inspect_sampling_state(self):
         class DraftBatch:
             spec_info = object()
+            logits_output_mode = LogitsOutputMode.FULL_VOCAB
 
             @property
             def spec_algorithm(self):
@@ -428,6 +430,20 @@ class TestDistributedTopKEligibility(CustomTestCase):
             self.assertIs(
                 select_logits_output_mode(DraftBatch(), object()),
                 LogitsOutputMode.FULL_VOCAB,
+            )
+        candidate_width.assert_not_called()
+
+    def test_speculative_batch_keeps_the_worker_requested_mode(self):
+        class VerifyBatch:
+            spec_info = object()
+            logits_output_mode = LogitsOutputMode.DISTRIBUTED_TOP_K
+
+        with patch.object(
+            tpu_sampler_module, "distributed_top_k_candidate_width_for_model"
+        ) as candidate_width:
+            self.assertIs(
+                select_logits_output_mode(VerifyBatch(), object()),
+                LogitsOutputMode.DISTRIBUTED_TOP_K,
             )
         candidate_width.assert_not_called()
 
@@ -1375,9 +1391,9 @@ class TestHostSamplingWarmupCoverage(CustomTestCase):
                 vocab_size=self.VOCAB,
                 return_sampling_masks=[False] * rows,
                 device="cpu",
-                uniform_top_k=int(top_ks[0])
-                if bool((top_ks == top_ks[0]).all())
-                else None,
+                uniform_top_k=(
+                    int(top_ks[0]) if bool((top_ks == top_ks[0]).all()) else None
+                ),
             )
 
     def test_serving_kernel_variants_are_warmed(self):

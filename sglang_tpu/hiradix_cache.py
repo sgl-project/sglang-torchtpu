@@ -55,6 +55,8 @@ from sglang.srt.mem_cache.radix_cache import (
 )
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
+    last_hash_value,
+    prefix_hash_values,
     split_node_hash_value,
 )
 from sglang.srt.observability.metrics_collector import (
@@ -118,6 +120,12 @@ class HiTreeNode(TreeNode):
             self.host_ref_counter -= 1
         else:
             raise RuntimeError("Host reference counter is already zero.")
+
+    def get_last_hash_value(self) -> Optional[str]:
+        return last_hash_value(self)
+
+    def get_prefix_hash_values(self, node: Optional[TreeNode]) -> List[str]:
+        return prefix_hash_values(node)
 
 
 class HiRadixCache(RadixCache):
@@ -352,12 +360,15 @@ class HiRadixCache(RadixCache):
             attn_cp_rank, attn_cp_size = (
                 self.cache_controller.get_attn_cp_rank_and_size()
             )
+            # The controller resolves ranks into storage_config when it attaches
+            # the backend (same source unified_cache/storage_attachment.py uses).
+            config = self.cache_controller.storage_config
             labels = {
                 "storage_backend": storage_backend,
-                "tp_rank": self.cache_controller.tp_rank,
-                "dp_rank": self.cache_controller.dp_rank,
-                "pp_rank": self.cache_controller.pp_rank,
-                "pp_size": self.cache_controller.pp_size,
+                "tp_rank": config.tp_rank,
+                "dp_rank": config.dp_rank,
+                "pp_rank": config.pp_rank,
+                "pp_size": config.pp_size,
                 "attn_cp_rank": attn_cp_rank,
                 "attn_cp_size": attn_cp_size,
             }
@@ -831,6 +842,18 @@ class HiRadixCache(RadixCache):
     def is_backuped(self, node: HiTreeNode) -> bool:
         """Whether the node's Full KV is present on host."""
         return node.backuped
+
+    # Node queries the scheduler's storage prefetch path makes on the cache.
+
+    def is_root(self, node: TreeNode) -> bool:
+        return node is self.root_node
+
+    def get_last_hash_value(self, node: HiTreeNode) -> Optional[str]:
+        return node.get_last_hash_value()
+
+    def get_prefix_hash_values(self, node: HiTreeNode) -> List[str]:
+        """Hash chain of the node's ancestors, root-to-parent order."""
+        return node.get_prefix_hash_values(node.parent)
 
     def release_host_resources(self) -> None:
         if self.token_to_kv_pool_host is not None:
