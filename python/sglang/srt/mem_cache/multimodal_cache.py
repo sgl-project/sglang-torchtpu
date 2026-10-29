@@ -78,14 +78,30 @@ class EmbeddingResult:
             self.storage_size(), self.embedding.element_size() * self.embedding.numel()
         )
 
-    def backing_buffers(self) -> dict[int, int]:
-        """Bytes of each buffer this entry keeps alive, keyed by ``id()`` of the buffer tensor.
+    def backing_buffers(self) -> tuple[torch.Tensor, ...]:
+        """Buffer tensors this entry keeps alive.
 
         The cache charges a buffer once however many entries hold the same tensor
         object. Different views of one storage count as different buffers, which
         over-counts but never under-counts.
         """
-        return {id(self.embedding): self.storage_size()}
+        return (self.embedding,)
+
+
+@dataclass
+class _BufferCharge:
+    # Holding the buffer keeps its id from being reused while it is charged.
+    buffer: torch.Tensor
+    nbytes: int
+    holders: int
+
+
+def _buffers(embedding: EmbeddingResult) -> dict[int, torch.Tensor]:
+    return {id(buffer): buffer for buffer in embedding.backing_buffers()}
+
+
+def _nbytes(buffer: torch.Tensor) -> int:
+    return buffer.untyped_storage().nbytes()
 
 
 class MultiModalStaticCache(MultimodalCache):
@@ -102,9 +118,8 @@ class MultiModalStaticCache(MultimodalCache):
         self.max_size = max_size
         self.mm_cache: OrderedDict[int, EmbeddingResult] = OrderedDict()
         self.current_size = 0
-        # Buffer identity -> [bytes, entries holding it]. Entries keep their
-        # buffers alive, so an identity is not reused while it is listed here.
-        self._buffer_refs: dict[int, list[int]] = {}
+        # Buffer id -> its charge, shared by every entry holding the buffer.
+        self._buffer_charges: dict[int, _BufferCharge] = {}
 
     def get(
         self, mm_hashes: List[int], combined_hash: Optional[int] = None
@@ -128,11 +143,13 @@ class MultiModalStaticCache(MultimodalCache):
             self.mm_cache.move_to_end(mm_hash)
             return True
         tensor = embedding.embedding
-        compact = embedding.storage_size() > embedding.cache_size()
+        # A slice of a larger tensor is cloned on admission, so it is charged its
+        # own bytes rather than the tensor it was sliced from.
+        clone_on_admit = embedding.storage_size() > embedding.cache_size()
         total = (
             embedding.cache_size()
-            if compact
-            else sum(embedding.backing_buffers().values())
+            if clone_on_admit
+            else sum(_nbytes(buffer) for buffer in _buffers(embedding).values())
         )
         # An entry larger than the whole cache must not evict useful entries on
         # every chunk before it is rejected.
@@ -141,7 +158,11 @@ class MultiModalStaticCache(MultimodalCache):
         while True:
             # Recomputed after each eviction: evicting an entry that shares a
             # buffer with the new one leaves that buffer uncharged.
-            needed = embedding.cache_size() if compact else self._uncharged(embedding)
+            needed = (
+                embedding.cache_size()
+                if clone_on_admit
+                else self._bytes_to_charge(embedding)
+            )
             if self.current_size + needed <= self.max_size:
                 break
             if not self.mm_cache:
@@ -149,36 +170,37 @@ class MultiModalStaticCache(MultimodalCache):
             _, lru_embedding = self.mm_cache.popitem(last=False)
             self._release(lru_embedding)
 
-        if compact:
+        if clone_on_admit:
             # Clone admitted slices so one cached item cannot retain a whole batch.
             embedding = replace(embedding, embedding=tensor.clone())
         self.mm_cache[mm_hash] = embedding
         self._acquire(embedding)
         return True
 
-    def _uncharged(self, embedding: EmbeddingResult) -> int:
+    def _bytes_to_charge(self, embedding: EmbeddingResult) -> int:
+        """Bytes of the entry's buffers that no cached entry holds yet."""
         return sum(
-            nbytes
-            for key, nbytes in embedding.backing_buffers().items()
-            if key not in self._buffer_refs
+            _nbytes(buffer)
+            for buffer_id, buffer in _buffers(embedding).items()
+            if buffer_id not in self._buffer_charges
         )
 
     def _acquire(self, embedding: EmbeddingResult) -> None:
-        for key, nbytes in embedding.backing_buffers().items():
-            ref = self._buffer_refs.get(key)
-            if ref is None:
-                self._buffer_refs[key] = [nbytes, 1]
-                self.current_size += nbytes
-            else:
-                ref[1] += 1
+        for buffer_id, buffer in _buffers(embedding).items():
+            charge = self._buffer_charges.get(buffer_id)
+            if charge is None:
+                charge = _BufferCharge(buffer, _nbytes(buffer), holders=0)
+                self._buffer_charges[buffer_id] = charge
+                self.current_size += charge.nbytes
+            charge.holders += 1
 
     def _release(self, embedding: EmbeddingResult) -> None:
-        for key in embedding.backing_buffers():
-            ref = self._buffer_refs[key]
-            ref[1] -= 1
-            if ref[1] == 0:
-                del self._buffer_refs[key]
-                self.current_size -= ref[0]
+        for buffer_id in _buffers(embedding):
+            charge = self._buffer_charges[buffer_id]
+            charge.holders -= 1
+            if charge.holders == 0:
+                del self._buffer_charges[buffer_id]
+                self.current_size -= charge.nbytes
 
     def get_single(self, mm_hash: int) -> Optional[EmbeddingResult]:
         """Get a single cached embedding by its hash (no combine_hashes)."""
@@ -201,7 +223,7 @@ class MultiModalStaticCache(MultimodalCache):
 
     def clear(self):
         self.mm_cache.clear()
-        self._buffer_refs.clear()
+        self._buffer_charges.clear()
         self.current_size = 0
 
     def __len__(self):
