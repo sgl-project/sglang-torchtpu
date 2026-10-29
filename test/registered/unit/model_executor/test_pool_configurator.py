@@ -1,6 +1,7 @@
 """CPU-only tests for pool_configurator.py: available_bytes -> MemoryPoolConfig."""
 
 import contextlib
+import types
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -9,7 +10,9 @@ import torch
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_memory,
+    get_model,
     get_parallel,
     get_schedule,
     get_server_args,
@@ -290,7 +293,10 @@ class TestDefaultConfigurator(CustomTestCase):
 
         with patch(
             "sglang.srt.model_executor.pool_configurator.current_platform",
-            SimpleNamespace(get_mha_kv_bytes_per_token=padded_bytes),
+            SimpleNamespace(
+                get_mha_kv_bytes_per_token=padded_bytes,
+                get_kv_pool_reserved_blocks=lambda **_: 0,
+            ),
         ):
             mr, _, config = self._run(available)
 
@@ -629,6 +635,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
                 SimpleNamespace(
                     get_mha_kv_bytes_per_token=padded_bytes,
                     dcp_shards_every_kv_pool=lambda: False,
+                    get_kv_pool_reserved_blocks=lambda **_: 0,
                 ),
             ),
         ):
@@ -2191,6 +2198,187 @@ class TestOutOfTreeMlaPoolConstruction(CustomTestCase):
                     fake, max_total_num_tokens=256, is_dsa_model=False
                 )
                 self.assertIsInstance(pool, pool_cls)
+
+
+class TestRaidenLandArenaBudget(CustomTestCase):
+    """SGLANG_RAIDEN_RESHARD_LAND_ARENA charges the arena blocks every
+    full-attention KV pool reserves past the allocator (#829)."""
+
+    PAGE = 64
+    # 2 * ceil(8192 / 64)
+    ARENA = 256
+    AVAILABLE = 4_000_000_000
+
+    def _run(
+        self,
+        arena,
+        *,
+        available=AVAILABLE,
+        dtype=torch.float8_e4m3fn,
+        mode="decode",
+        eagle_draft_layers=None,
+        platform_cls=None,
+        **kwargs,
+    ):
+        from sglang_tpu.envs import envs
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
+
+        mr = _make_model_runner(
+            self, page_size=self.PAGE, disaggregation_mode=mode, **kwargs
+        )
+        mr.kv_cache_dtype = dtype
+        if eagle_draft_layers:
+            mr.spec_algorithm.is_eagle.return_value = True
+            mr.spec_algorithm.is_none.return_value = False
+            mr.spec_aux_config.eagle_draft_num_layers = eagle_draft_layers
+        platform = SimpleNamespace(
+            get_mha_kv_bytes_per_token=lambda **_: None,
+            get_mha_kv_pool_cls=lambda: TpuFusedMHATokenToKVPool,
+            dcp_shards_every_kv_pool=lambda: False,
+        )
+        # The budget reads the reserved blocks through the platform hook.
+        platform.get_kv_pool_reserved_blocks = types.MethodType(
+            (platform_cls or TpuSRTPlatform).get_kv_pool_reserved_blocks, platform
+        )
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock_cpu_env())
+            stack.enter_context(
+                get_disagg().override(disaggregation_transfer_backend="raiden")
+            )
+            stack.enter_context(
+                get_model().override(
+                    kv_cache_dtype=(
+                        "fp8_e4m3" if dtype == torch.float8_e4m3fn else "bfloat16"
+                    )
+                )
+            )
+            for target in (
+                "sglang.srt.model_executor.pool_configurator.current_platform",
+                "sglang.srt.platforms.current_platform",
+            ):
+                stack.enter_context(patch(target, platform))
+            # land_arena_blocks asks uses_mla_backend(), which otherwise builds
+            # a ModelConfig from the published model_path ("dummy") via HF.
+            stack.enter_context(
+                patch(
+                    "sglang.srt.runtime_context.uses_mla_backend",
+                    lambda: mr.use_mla_backend,
+                )
+            )
+            if arena is not None:
+                stack.enter_context(
+                    envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(arena)
+                )
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, self.PAGE)
+        return cfg, config
+
+    def test_default_platform_charges_nothing(self):
+        from sglang.srt.platforms.interface import SRTPlatform
+
+        _, off = self._run(False)
+        _, on = self._run(True, platform_cls=SRTPlatform)
+        self.assertEqual(on, off)
+
+    def test_env_off_matches_unset(self):
+        _, off = self._run(False)
+        _, unset = self._run(None)
+        self.assertEqual(off, unset)
+
+    def test_default_charges_arena_on_every_layer(self):
+        cfg, on = self._run(True)
+        _, off = self._run(False)
+        cell = cfg._cell_size
+        tokens = (self.AVAILABLE - self.ARENA * self.PAGE * cell) // cell
+        self.assertEqual(on.max_total_num_tokens, tokens // self.PAGE * self.PAGE)
+        self.assertLess(on.max_total_num_tokens, off.max_total_num_tokens)
+
+    def test_cells_without_arena_are_uncharged(self):
+        for name, kwargs in (
+            ("bf16", dict(dtype=torch.bfloat16)),
+            ("prefill", dict(mode="prefill")),
+            ("mla", dict(use_mla_backend=True)),
+        ):
+            with self.subTest(name):
+                _, off = self._run(False, **kwargs)
+                _, on = self._run(True, **kwargs)
+                self.assertEqual(on, off)
+
+    def test_hybrid_swa_charges_full_layers_only(self):
+        swa = dict(
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(8)),
+            swa_attention_layer_ids=list(range(8, 32)),
+            swa_num_kv_heads=4,
+        )
+        cfg, _ = self._run(False, **swa)
+        _, on = self._run(True, **swa)
+        arena = self.ARENA * self.PAGE * cfg._full_per_token * cfg._full_layers_num
+        _, shrunk = self._run(False, available=self.AVAILABLE - arena, **swa)
+        self.assertEqual(on, shrunk)
+
+    def test_swa_chunk_cap_charges_full_layers_only(self):
+        from sglang.srt.model_executor.pool_configurator import (
+            SWAChunkCapPoolConfigurator,
+        )
+
+        # disable_radix_cache + chunked_prefill + window + max_running_requests
+        # selects the chunk-cap configurator, which overrides calculate_pool_sizes.
+        cap = dict(
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(8)),
+            swa_attention_layer_ids=list(range(8, 32)),
+            swa_num_kv_heads=4,
+            disable_radix_cache=True,
+            chunked_prefill_size=self.PAGE,
+            sliding_window_size=128,
+            max_running_requests=4,
+        )
+        cfg, off = self._run(False, **cap)
+        self.assertIsInstance(cfg, SWAChunkCapPoolConfigurator)
+        _, on = self._run(True, **cap)
+        # 4 heads * (64 + 64) dims * 2 B, on the 8 full layers; SWA is a fixed cap.
+        arena = self.ARENA * self.PAGE * 4 * 128 * 2 * 8
+        _, shrunk = self._run(False, available=self.AVAILABLE - arena, **cap)
+        self.assertEqual(on, shrunk)
+        self.assertLess(on.full_max_total_num_tokens, off.full_max_total_num_tokens)
+        self.assertEqual(on.swa_max_total_num_tokens, off.swa_max_total_num_tokens)
+
+    def test_default_charges_eagle_draft_layers(self):
+        # The draft pool reserves the same arena blocks, so the charge must use
+        # the draft-inclusive _cell_size (target 32 + draft 4 layers).
+        target_cell = 4 * 128 * 2 * 32
+        cfg, on = self._run(True, eagle_draft_layers=4)
+        self.assertEqual(cfg._cell_size, target_cell * 36 // 32)
+        _, with_draft = self._run(
+            False,
+            available=self.AVAILABLE - self.ARENA * self.PAGE * cfg._cell_size,
+            eagle_draft_layers=4,
+        )
+        _, target_only = self._run(
+            False,
+            available=self.AVAILABLE - self.ARENA * self.PAGE * target_cell,
+            eagle_draft_layers=4,
+        )
+        self.assertEqual(on, with_draft)
+        self.assertNotEqual(on, target_only)
+
+
+class TestKvPoolReservedBlocksDefault(CustomTestCase):
+    def test_default_platform_reserves_no_blocks(self):
+        from sglang.srt.platforms.interface import SRTPlatform
+
+        hook = SRTPlatform.get_kv_pool_reserved_blocks
+        for use_mla_backend in (False, True):
+            with self.subTest(use_mla_backend=use_mla_backend):
+                self.assertEqual(
+                    hook(SimpleNamespace(), use_mla_backend=use_mla_backend), 0
+                )
 
 
 if __name__ == "__main__":

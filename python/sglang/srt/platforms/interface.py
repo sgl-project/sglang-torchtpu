@@ -106,6 +106,14 @@ class SRTPlatform(DeviceMixin):
         del num_kv_heads, head_dim, v_head_dim, kv_cache_dtype
         return None
 
+    def get_kv_pool_reserved_blocks(self, *, use_mla_backend: bool) -> int:
+        """Blocks every full-attention KV pool, target and draft alike, reserves
+        past its allocator's pages, which the KV budget charges per layer; SWA
+        pools reserve none. Called when sizing pools, after the schedule is
+        published."""
+        del use_mla_backend
+        return 0
+
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
         """Return the host (L2) MHA KV pool class matching ``device_pool``.
 
