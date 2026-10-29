@@ -174,6 +174,13 @@ class TpuEnvs:
     SGLANG_TPU_VISION_FLASH_BLOCK_Q = EnvInt(0)
     SGLANG_TPU_VISION_FLASH_BLOCK_Q_MAX_SEQ = EnvInt(4096)
 
+    # Fused MoE + Shared-Expert + All-Reduce decode kernel (`sglang_tpu/moe/pallas/fused_moe_decode`).
+    # Can be selected via `SGLANG_TPU_MOE_IMPLEMENTATION=fused_moe_decode`,
+    # `SGLANG_TPU_ENABLE_FUSED_MOE_DECODE_KERNEL=1`, or `--moe-runner-backend pallas_tpu_fused_decode`.
+    SGLANG_TPU_MOE_IMPLEMENTATION = EnvStr("")
+    SGLANG_TPU_ENABLE_FUSED_MOE_DECODE_KERNEL = EnvBool(False)
+    SGLANG_TPU_FUSED_MOE_DECODE_MAX_TOKENS = EnvInt(256)
+
     # Raiden PD disaggregation
     # Base control port. Each local rank reserves consecutive control/data
     # ports for full KV, SWA KV, and recurrent state.

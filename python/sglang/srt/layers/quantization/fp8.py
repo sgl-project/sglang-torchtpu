@@ -2677,6 +2677,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_mxfp8=self.use_mxfp8,
                 is_fp4_expert=self.is_fp4_expert,
             )
+            from sglang_tpu.moe.pallas.fused_moe_decode import (
+                prepare_fp8_fused_moe_decode,
+            )
+
+            prepare_fp8_fused_moe_decode(layer)
             moe_runner_backend = get_moe_runner_backend()
             if (
                 moe_runner_backend.is_auto()
@@ -2927,6 +2932,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         elif (
             moe_runner_backend.is_pallas_tpu()
             or moe_runner_backend.is_pallas_tpu_fused_rs()
+            or moe_runner_backend.is_pallas_tpu_fused_decode()
         ) and not _is_tpu:
             raise ValueError(f"{moe_runner_backend.value} is only available on TPU")
 
@@ -3038,6 +3044,26 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         moe_runner_config = self.moe_runner_config
 
         if _is_tpu:
+            from sglang_tpu.moe.pallas.fused_moe_decode import (
+                apply_routed_fused_moe_decode,
+                should_use_routed_fused_moe_decode,
+            )
+
+            if should_use_routed_fused_moe_decode(
+                layer,
+                x,
+                block_quant=self.block_quant,
+                no_combine=moe_runner_config.no_combine,
+            ):
+                topk_weights, topk_ids, _ = dispatch_output.topk_output
+                out = apply_routed_fused_moe_decode(
+                    layer,
+                    x,
+                    topk_weights,
+                    topk_ids,
+                    swiglu_limit=moe_runner_config.swiglu_limit,
+                )
+                return StandardCombineInput(hidden_states=out)
             if self.handles_moe_reduction:
                 from sglang_tpu.fp8_moe_fused_rs import (
                     apply_fp8_fused_rs,
