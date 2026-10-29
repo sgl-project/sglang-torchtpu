@@ -139,6 +139,21 @@ class TestRuntimeEnvironment(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     load_recipe(name, concurrency)
 
+    def test_agentx_pd_modes(self):
+        """A PP prefill must run without the megakernel (the model rejects it under PP)."""
+        from benchmark.tpu.recipe.configs.muse_spark.agentic import get_config
+
+        prefill, decode = (get_config(24, mode=m) for m in ("prefill", "decode"))
+        self.assertEqual(prefill["server_args"]["pp_size"], 8)
+        self.assertEqual(prefill["runtime_env"]["SGLANG_TPU_MUSE_MEGAKERNEL"], "0")
+        self.assertEqual(decode["runtime_env"]["SGLANG_TPU_MUSE_MEGAKERNEL"], "1")
+        self.assertEqual(decode["runtime_env"]["SGLANG_RAIDEN_PIPELINE_TRANSFER"], "1")
+        for config, mode in ((prefill, "prefill"), (decode, "decode")):
+            self.assertEqual(config["server_args"]["disaggregation_mode"], mode)
+        self.assertNotIn("disaggregation_mode", get_config(24)["server_args"])
+        with self.assertRaises(ValueError):
+            get_config(24, mode="router")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,25 +1,47 @@
-"""Muse Spark AgentX on one tpu7x 2x2x1 host (4 chips, TP8), one server per client concurrency.
+"""Muse Spark AgentX on tpu7x 2x2x1 hosts (4 chips), one engine per host and client concurrency.
 
 Every concurrency starts from _BASE (decode megakernel, 8-token DFlash, HiCache) and
 applies its _Patch: KV layout (bf16 at c4/c8, fp8 1M-context elsewhere), running
-requests, prefill/decode interval and megakernel row cap.
+requests, prefill/decode interval and megakernel row cap. The mode picks the engine:
+
+- mixed: one TP8 server, prefill and decode together.
+- prefill / decode: one Raiden P/D engine each, a PP8 prefill host feeding a TP8
+  megakernel decode host, both on the experimental spec worker.
 
 The fp8 pool assumes a windowed draft: a DFlash2 config declaring is_hybrid_swa and
-an all-SWA hybrid_layer_pattern keeps the draft's KV in the target's SWA slots.
+an all-SWA hybrid_layer_pattern keeps the draft's KV in the target's SWA slots;
+main() writes it next to the checkpoint.
 
+    bash benchmark/tpu/recipe/muse_spark_agentx_launcher.sh <mixed|prefill|decode> 16
     python3 -m benchmark.tpu.launch_server \\
-        --config recipe/configs/muse_spark/agentic.py --concurrency 16
+        --config recipe/configs/muse_spark/agentic.py --concurrency 16   # mixed only
+
+A P/D pair still needs its router, e.g. on the prefill host:
+
+    python3 -m sglang_router.launch_router --pd-disaggregation --mini-lb \\
+        --prefill http://<prefill>:30000 8998 --decode http://<decode>:30000 \\
+        --host 0.0.0.0 --port 8000
 """
 
 from __future__ import annotations
 
+import argparse
+import json
 from copy import deepcopy
+from pathlib import Path
 
 from benchmark.tpu.recipe.configs.muse_spark.server import CONFIG as SERVER_CONFIG
 
 # 7 proposals + the anchor; SIMULATED_ACC_LEN is InferenceX's reference for 8-token verify.
 DRAFT_TOKENS = 8
 SIMULATED_ACC_LEN = 4.05
+
+# Local weights main() serves; MODEL_ROOT holds both checkpoints.
+MODEL_ROOT = Path("/models")
+MODEL = "meta-models/Muse-Spark-Open-816B-A42B-NVFP4"
+DRAFT = "RadixArk/Muse-Spark-Open-DFlash2"
+PORT = 8000
+MODES = ("mixed", "prefill", "decode")
 
 _BASE = deepcopy(SERVER_CONFIG)
 _BASE["server_args"].update(
@@ -167,14 +189,110 @@ def _apply(patch: dict[str, dict]) -> dict:
     return config
 
 
-def build_config(max_running_requests: int, **patch_kwargs) -> dict:
-    """_BASE with the fp8 1M-context KV unless patch_kwargs overrides _patch's defaults."""
-    return _apply(_patch(max_running_requests, **patch_kwargs))
+# Both P/D engines: the experimental spec worker is the only one serving DFlash on a PP prefill.
+_PD: dict[str, dict] = {
+    "server_args": {
+        "disaggregation_transfer_backend": "raiden",
+        "host": "0.0.0.0",
+        "watchdog_timeout": 3600,
+        "dist_timeout": 3600,
+    },
+    "runtime_env": {
+        "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
+        # The experimental worker only simulates acceptance with fixed draft tokens.
+        "SGLANG_SIMULATE_ACC_TOKEN_MODE": "fixed",
+        "SGLANG_WARMUP_TIMEOUT": "3600",
+        # These JobSet variables describe the public router, not its engines.
+        "HOST": None,
+        "PORT": None,
+    },
+}
+
+_ROLES: dict[str, dict[str, dict]] = {
+    "prefill": {
+        "server_args": {
+            "disaggregation_mode": "prefill",
+            # Raiden's pipeline producer needs attention TP=1; PP rejects the overlap schedule.
+            "tp_size": 1,
+            "ep_size": 1,
+            "pp_size": 8,
+            "disable_overlap_schedule": True,
+        },
+        # The megakernel runs the whole decoder in one kernel, so it cannot be staged.
+        "runtime_env": {"SGLANG_TPU_MUSE_MEGAKERNEL": "0"},
+    },
+    "decode": {
+        "server_args": {
+            "disaggregation_mode": "decode",
+            # The decode HiCache (pd_decode_swa_hicache) rejects host_pool retraction.
+            "disaggregation_decode_retraction_backup": "cpu_tensor",
+        },
+        # A non-PP decode names its layer pools to pull from the PP producer.
+        "runtime_env": {"SGLANG_RAIDEN_PIPELINE_TRANSFER": "1"},
+    },
+}
 
 
-def get_config(concurrency: int) -> dict:
+def get_config(concurrency: int, mode: str = "mixed") -> dict:
     if concurrency not in _PATCHES_BY_CONCURRENCY:
         raise ValueError(
             f"no patch for concurrency {concurrency}; defined: {sorted(_PATCHES_BY_CONCURRENCY)}"
         )
-    return _apply(_PATCHES_BY_CONCURRENCY[concurrency])
+    if mode not in MODES:
+        raise ValueError(f"mode {mode!r} is not one of {MODES}")
+    config = _apply(_PATCHES_BY_CONCURRENCY[concurrency])
+    if mode != "mixed":
+        for patch in (_PD, _ROLES[mode]):
+            for section, overrides in patch.items():
+                config[section].update(deepcopy(overrides))
+        # One engine on this host; launch_server starts no router for it.
+        config["group"] = {"hosts": 1}
+    return config
+
+
+def _write_swa_draft(model_root: Path) -> Path:
+    """The windowed draft: DFLASH weights linked under a config declaring every layer SWA."""
+    source, target = model_root / DRAFT, model_root / f"{DRAFT}-swa"
+    target.mkdir(parents=True, exist_ok=True)
+    for path in source.iterdir():
+        if path.name == "config.json":
+            continue
+        link = target / path.name
+        if link.is_symlink():
+            link.unlink()
+        if not link.exists():
+            link.symlink_to(path)
+    draft_config = json.loads((source / "config.json").read_text())
+    draft_config["is_hybrid_swa"] = True
+    draft_config["hybrid_layer_pattern"] = [1] * draft_config["num_hidden_layers"]
+    (target / "config.json").write_text(json.dumps(draft_config, indent=2))
+    return target
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Serve one Muse Spark AgentX engine.")
+    parser.add_argument("mode", choices=MODES)
+    parser.add_argument("concurrency", type=int)
+    parser.add_argument("--dry-run", action="store_true", help="print the config only")
+    args = parser.parse_args(argv)
+    config = get_config(args.concurrency, mode=args.mode)
+    config["server_args"].update(
+        model_path=str(MODEL_ROOT / MODEL),
+        served_model_name=MODEL,
+        speculative_draft_model_path=str(MODEL_ROOT / f"{DRAFT}-swa"),
+    )
+    if args.mode == "mixed":
+        config["server_args"].update(host="0.0.0.0", port=PORT)
+    print(json.dumps(config, indent=1))
+    if args.dry_run:
+        return 0
+    _write_swa_draft(MODEL_ROOT)
+    path = Path(f"/tmp/muse_agentx_{args.mode}_c{args.concurrency}.json")
+    path.write_text(json.dumps(config))
+    from benchmark.tpu.launch_server import main as launch
+
+    return launch(["--config", f"@{path}"])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
