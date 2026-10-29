@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
     sync::{Arc, Mutex, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -311,18 +311,34 @@ async fn generate_handler(
     let worker_id = format!("worker-{}", config.port);
 
     if should_fail(&config).await {
-        return (
-            fail_status_code(config.port),
-            [("x-worker-id", worker_id)],
-            Json(json!({
-                "error": "Random failure for testing"
-            })),
-        )
-            .into_response();
+        let status = fail_status_code(config.port);
+        let error_body = json!({
+            "error": "Random failure for testing"
+        });
+        if let Some(stall_ms) = get_fail_body_stall_ms_for_port(config.port) {
+            // Send the failure status and headers now, the body later.
+            let body_bytes = serde_json::to_vec(&error_body).unwrap();
+            let body_stream = stream::once(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(stall_ms)).await;
+                Ok::<_, Infallible>(body_bytes)
+            });
+            return (
+                status,
+                [
+                    ("x-worker-id", worker_id),
+                    ("content-type", "application/json".to_string()),
+                ],
+                axum::body::Body::from_stream(body_stream),
+            )
+                .into_response();
+        }
+        return (status, [("x-worker-id", worker_id)], Json(error_body)).into_response();
     }
 
     if config.response_delay_ms > 0 {
+        let cancel_guard = GenerateCancelGuard::new(config.port);
         tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
+        cancel_guard.disarm();
     }
 
     let is_stream = payload
@@ -1554,6 +1570,83 @@ pub fn clear_fail_status_code(port: u16) {
 fn get_fail_status_code_for_port(port: u16) -> Option<u16> {
     let map = get_fail_status_code_config().lock().unwrap();
     map.get(&port).copied()
+}
+
+// --- Failure-body stall (for "error headers, slow error body" tests) ---
+// When set for `port`, `should_fail`-triggered `/generate` failures send the
+// status and headers at once and the JSON body only after `stall_ms`.
+
+static FAIL_BODY_STALL_MS: OnceLock<Mutex<HashMap<u16, u64>>> = OnceLock::new();
+
+fn get_fail_body_stall_config() -> &'static Mutex<HashMap<u16, u64>> {
+    FAIL_BODY_STALL_MS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Configure a worker (by port) to delay the body of its `/generate`
+/// failure responses by `stall_ms` after sending the headers.
+pub fn set_fail_body_stall_ms(port: u16, stall_ms: u64) {
+    let mut map = get_fail_body_stall_config().lock().unwrap();
+    map.insert(port, stall_ms);
+}
+
+/// Clear the failure-body stall for a worker port.
+pub fn clear_fail_body_stall_ms(port: u16) {
+    let mut map = get_fail_body_stall_config().lock().unwrap();
+    map.remove(&port);
+}
+
+fn get_fail_body_stall_ms_for_port(port: u16) -> Option<u64> {
+    let map = get_fail_body_stall_config().lock().unwrap();
+    map.get(&port).copied()
+}
+
+// --- Generate cancellation tracking (for upstream cancel tests) ---
+// Records when a `/generate` handler was dropped while it was still in its
+// `response_delay_ms` wait, i.e. when the gateway closed the connection
+// before the worker answered.
+
+static GENERATE_CANCELLED_AT: OnceLock<Mutex<HashMap<u16, Instant>>> = OnceLock::new();
+
+fn get_generate_cancelled_at_map() -> &'static Mutex<HashMap<u16, Instant>> {
+    GENERATE_CANCELLED_AT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Returns when a `/generate` handler on `port` was cancelled during its
+/// response delay, if one was.
+pub fn generate_cancelled_at(port: u16) -> Option<Instant> {
+    let map = get_generate_cancelled_at_map().lock().unwrap();
+    map.get(&port).copied()
+}
+
+/// Forget any recorded `/generate` cancellation for `port`.
+pub fn reset_generate_cancelled(port: u16) {
+    let mut map = get_generate_cancelled_at_map().lock().unwrap();
+    map.remove(&port);
+}
+
+/// Records a cancellation for `port` if dropped before `disarm`.
+struct GenerateCancelGuard {
+    port: u16,
+    armed: bool,
+}
+
+impl GenerateCancelGuard {
+    fn new(port: u16) -> Self {
+        Self { port, armed: true }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for GenerateCancelGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut map = get_generate_cancelled_at_map().lock().unwrap();
+            map.insert(self.port, Instant::now());
+        }
+    }
 }
 
 // --- Stream cancellation tracking (for upstream cancel tests) ---
