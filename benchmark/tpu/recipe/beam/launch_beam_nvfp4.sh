@@ -58,6 +58,11 @@ SWA_FULL_TOKENS_RATIO="${SWA_FULL_TOKENS_RATIO:-0.1}"
 # QUANTIZATION is empty on purpose: the method (modelopt -> modelopt_fp4) comes
 #   from the checkpoint's quantization_config; launch_server.sh would otherwise
 #   pass --quantization fp8.
+# Distributed top-k stays off for this recipe: with the fused-RS MoE backend
+# its logits module halts a SparseCore at the 2048/4096-token prefill buckets
+# (libtpu 0.0.50); see _DISTRIBUTED_TOP_K_SPARSE_CORE_OVERRIDES in
+# sglang_tpu/env_override.py. FULL_VOCAB logits pass every bucket.
+SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE="${SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE:-100000}" \
 MODEL="$MODEL" \
 TP_SIZE=8 EP_SIZE=8 \
 QUANTIZATION="" \

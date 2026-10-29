@@ -139,3 +139,10 @@ Bring-up deltas from the FP8 checklist:
   GSM8K at or above the GPU NVFP4 reference.
 - Keep `CHUNKED_PREFILL_SIZE` at or below 4096 (the W4A16 expert GEMMs are
   compute-bound above ~3K tokens per chunk).
+- The launch script disables the TPU distributed top-k
+  (`SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE=100000`): with the fused-RS
+  backend its logits module halts a SparseCore at the 2048/4096-token prefill
+  buckets on libtpu 0.0.50. The 64-1024 buckets are covered by the scoped
+  `all_gather` offload override in `sglang_tpu/env_override.py`
+  (`_DISTRIBUTED_TOP_K_SPARSE_CORE_OVERRIDES`); re-enable the distributed
+  top-k only after a libtpu fix, and re-validate all prefill buckets.
