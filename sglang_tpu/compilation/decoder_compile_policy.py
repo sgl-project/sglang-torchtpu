@@ -1131,8 +1131,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 setattr(
                     forward_batch,
                     name,
-                    # Replacing the field may release the only host reference.
-                    value.to(self.model_runner.device),
+                    value.to(self.model_runner.device, non_blocking=True),
                 )
 
     def _upload_host_padded_inputs(self, forward_batch: ForwardBatch) -> None:
@@ -1149,8 +1148,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 setattr(
                     forward_batch,
                     name,
-                    # Replacing the field may release the only host reference.
-                    value.to(self.model_runner.device),
+                    value.to(self.model_runner.device, non_blocking=True),
                 )
 
     def _cp_batch_active(self, forward_batch: ForwardBatch) -> bool:

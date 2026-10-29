@@ -434,8 +434,7 @@ def _upload_params(info: SamplingBatchInfo, padded_size: int) -> dict:
             continue
         padded = value.new_full((padded_size, *value.shape[1:]), fill)
         padded[:size].copy_(value)
-        # Each loop iteration releases its temporary padded host buffer.
-        params[name] = padded.to(info.device)
+        params[name] = padded.to(info.device, non_blocking=True)
     return params
 
 

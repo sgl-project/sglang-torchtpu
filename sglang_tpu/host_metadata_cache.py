@@ -53,7 +53,6 @@ class HostMetadataCache:
                 return resident
         # Keep our own CPU snapshot: callers may subsequently mutate their input.
         snapshot = value.clone()
-        # A later forward may replace this entry before its upload completes.
-        resident = snapshot.to(device)
+        resident = snapshot.to(device, non_blocking=True)
         self._by_value[name] = snapshot, key, resident
         return resident
