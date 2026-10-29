@@ -824,6 +824,7 @@ class TpuSRTPlatform(SRTPlatform):
 
         from sglang_tpu.env_override import (
             apply_decode_cp_sparse_core_override,
+            apply_distributed_top_k_sparse_core_override,
             apply_prefill_cp_sparse_core_override,
             apply_small_kv_pool_vmem_prefetch_override,
         )
@@ -833,6 +834,11 @@ class TpuSRTPlatform(SRTPlatform):
             num_hidden_layers=_resolve_num_hidden_layers(cfg),
         )
         apply_decode_cp_sparse_core_override(dcp_size=cfg.dcp_size)
+        apply_distributed_top_k_sparse_core_override(
+            sampling_backend=cfg.sampling_backend,
+            tp_size=cfg.tp_size,
+            moe_runner_backend=cfg.moe_runner_backend,
+        )
 
         if cfg.dtype is None or cfg.dtype == "auto":
             declare_resolution(

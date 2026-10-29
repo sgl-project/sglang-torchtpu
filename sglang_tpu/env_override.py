@@ -76,6 +76,25 @@ _DECODE_CP_SPARSE_CORE_OVERRIDES = (
     "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false",
 )
 
+_DISTRIBUTED_TOP_K_SPARSE_CORE_OVERRIDES = (
+    # TODO: drop once libtpu is fixed. With the fused-RS MoE backend, the
+    # compiled distributed top-k logits module halts a SparseCore on first
+    # execute (RuntimeUnexpectedCoreHalt, HLO module
+    # tt_jit_logits_processor_...__get_distributed_top_k_mul). Observed on
+    # Beam-1.0-501B-A23B NVFP4 at TP=8 with libtpu 0.0.50: the 256-token
+    # prefill bucket halts with the SparseCore all-gather offload enabled
+    # (same bug family as the prefill-CP halts above), while the 2048/4096
+    # token buckets halt even with every SparseCore collective offload
+    # disabled -- there the top-k kernel's own remote-copy ring faults, so
+    # large-bucket fused-RS serving must also keep the distributed top-k
+    # disabled (SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE). The stock-MoE
+    # backend passes every bucket with the offloads enabled, so this
+    # override is scoped to fused-RS to keep the offload performance
+    # elsewhere.
+    "--xla_tpu_offload_gather_to_sparsecore=false",
+    "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false",
+)
+
 # Smallest KV pool (in tokens) observed safe with the default prefetch depth
 # on the largest supported dense stack (36-layer gpt-oss at TP=8): 4096 pages
 # of 64 tokens. Pools at or above this never deadlocked; below it the first
@@ -200,5 +219,45 @@ def apply_decode_cp_sparse_core_override(*, dcp_size: int) -> None:
             "TPU env_override: decode context parallelism (--dcp-size %d); "
             "turning off SparseCore offloads (%s)",
             dcp_size,
+            " ".join(appended),
+        )
+
+
+# Physical batch size the compile policy warms every reachable logits mode
+# at; a distributed top-k cutoff above it keeps the distributed variant out
+# of warmup and serving alike, so no override is needed.
+_DISTRIBUTED_TOP_K_WARMUP_BATCH = 64
+
+
+def apply_distributed_top_k_sparse_core_override(
+    *, sampling_backend: str | None, tp_size: int, moe_runner_backend: str | None
+) -> None:
+    """Turn off the SparseCore offloads that halt the TPU distributed top-k.
+
+    Called before workers spawn, so they inherit the flags. The halt only
+    appears with the fused-RS MoE backend, and the distributed top-k only
+    runs with the "tpu" sampling backend on supported world sizes, and only
+    for batches at or above SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE; any
+    other configuration keeps the libtpu defaults.
+    """
+    if moe_runner_backend != "pallas_tpu_fused_rs":
+        return
+    if sampling_backend not in (None, "tpu"):
+        return
+    if tp_size not in (8, 16):
+        return
+    min_batch_size = int(
+        os.environ.get("SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE", "64")
+    )
+    if min_batch_size > _DISTRIBUTED_TOP_K_WARMUP_BATCH:
+        return
+    appended = _override_libtpu_flags(_DISTRIBUTED_TOP_K_SPARSE_CORE_OVERRIDES)
+    if appended:
+        logger.info(
+            "TPU env_override: fused-RS MoE with TPU distributed top-k "
+            "(sampling_backend=%r, tp_size=%d); turning off SparseCore "
+            "offloads (%s)",
+            sampling_backend,
+            tp_size,
             " ".join(appended),
         )
