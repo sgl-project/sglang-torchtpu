@@ -151,7 +151,7 @@ class TestDecodeBinding(CustomTestCase):
             mock.patch.object(sglang_program, "_program", program),
             mock.patch.object(sglang_program, "_config", config),
         ):
-            steps = sglang_program.build_decode_steps(target)
+            steps = sglang_program.build_steps(target)
         caches, groups = program.bound
         self.assertIs(caches, kv.caches)
         self.assertTrue(program.warm)
@@ -165,7 +165,7 @@ class TestDecodeBinding(CustomTestCase):
             mock.patch.object(sglang_program, "_program", None),
             self.assertRaisesRegex(RuntimeError, "not built at model load"),
         ):
-            sglang_program.build_decode_steps(target)
+            sglang_program.build_steps(target)
 
 
 if __name__ == "__main__":

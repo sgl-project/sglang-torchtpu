@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The Kimi-K3 decode program as an sglang speculative worker.
+"""The Kimi-K3 programs as an sglang speculative worker.
 
 The decode program (``kimi_k3.decode.KimiDecoder``) runs a whole step in its
 ops: DSpark drafts, the target's verify, acceptance and sampling, keeping each
@@ -7,7 +7,9 @@ request's next input on the device. sglang's speculative workers have the
 same shape from the scheduler's side -- a decode batch in, each request's
 accepted tokens out -- so the program serves as the worker of a
 plugin-registered algorithm, ``K3_PROGRAM``, the way vLLM-TorchTPU's
-``MegakernelModelRunner`` serves it under vLLM (``runner.py`` at ``c78529c``):
+``MegakernelModelRunner`` serves it under vLLM (``runner.py`` at ``c78529c``).
+On a P/D prefill server the same worker runs the prefill program
+(:class:`PrefillSteps`) on sglang's chunked prefill. A decode step hands over:
 
 * every request of the batch goes in as host rows (:mod:`sglang_step`):
   ``computed`` its committed KV, ``scheduled`` the next token plus the drafts
@@ -167,13 +169,81 @@ class DecodeSteps:
         self._live = set()
 
 
+class PrefillSteps:
+    """A prefill program's steps from sglang's chunked prefill: each extend
+    batch's chunks in, the first token of every prompt that finishes out. The
+    program keeps a request's KDA state between its chunks and writes the
+    state after each chunk into the request's slot blocks, its KV and the
+    draft's into its pages, for the P/D transfer."""
+
+    def __init__(
+        self,
+        program: MegakernelProgram,
+        plan: bridge.UnifiedPoolPlan,
+        *,
+        table_width: int,
+    ) -> None:
+        self.program = program
+        self.plan = plan
+        self.table_width = table_width
+        self._live: set[str] = set()
+
+    def step(
+        self,
+        reqs: Sequence[Any],
+        prefix_lens: Sequence[int],
+        extend_lens: Sequence[int],
+        req_to_token: np.ndarray,
+    ) -> np.ndarray:
+        """One extend batch: the ``[len(reqs)]`` int64 first tokens (0 for a
+        request whose prompt continues in a later chunk)."""
+        requests = []
+        for req, computed, scheduled in zip(reqs, prefix_lens, extend_lens):
+            tables = bridge.block_tables(
+                req_to_token[req.kv.req_pool_idx],
+                int(computed) + int(scheduled),
+                int(req.kv.mamba_pool_idx.reshape(-1)[0]),
+                self.plan,
+                self.table_width,
+            )
+            requests.append(
+                sglang_step.request_input(
+                    rid=req.rid,
+                    origin_input_ids=req.origin_input_ids,
+                    output_ids=(),
+                    computed=int(computed),
+                    scheduled=int(scheduled),
+                    block_tables=tables,
+                    sampling_params=req.sampling_params,
+                )
+            )
+        current = {req.rid for req in reqs}
+        finished, self._live = self._live - current, current
+        tokens = self.program.step(StepInput(requests, finished)).tokens
+        first = np.asarray(tokens[: len(reqs)].cpu(), dtype=np.int64)[:, 0]
+        for i, (computed, scheduled) in enumerate(zip(prefix_lens, extend_lens)):
+            finishes = computed + scheduled >= len(reqs[i].origin_input_ids)
+            if finishes != (first[i] >= 0):
+                raise RuntimeError(
+                    f"K3 prefill: request {reqs[i].rid} "
+                    + ("finished its prompt without" if finishes else "got")
+                    + " a first token"
+                )
+        return np.maximum(first, 0)
+
+    def forget_all(self) -> None:
+        if self._live:
+            self.program.step(StepInput((), set(self._live)))
+        self._live = set()
+
+
 class K3ProgramWorker(BaseSpecWorker):
-    """The decode role's worker: :class:`DecodeSteps` over the program
-    ``build_steps`` returns once the target's pools exist."""
+    """A P/D role's worker: :class:`DecodeSteps` or :class:`PrefillSteps`
+    over the program ``build_steps`` returns once the target's pools exist."""
 
     # Set by the plugin before the scheduler builds the worker: (target worker)
-    # -> DecodeSteps over the unified pools.
-    build_steps: Callable[[Any], DecodeSteps] | None = None
+    # -> the role's steps over the unified pools.
+    build_steps: Callable[[Any], DecodeSteps | PrefillSteps] | None = None
 
     def __init__(self, server_args, gpu_id: int, nccl_port: int, target_worker):
         super().__init__()
@@ -182,7 +252,7 @@ class K3ProgramWorker(BaseSpecWorker):
         self.model_runner = target_worker.model_runner
         self.speculative_num_steps = WIDTH - 1
         self.speculative_num_draft_tokens = WIDTH
-        self.steps: DecodeSteps | None = None
+        self.steps: DecodeSteps | PrefillSteps | None = None
 
     @property
     def draft_worker(self):
@@ -204,21 +274,35 @@ class K3ProgramWorker(BaseSpecWorker):
     def forward_batch_generation(
         self, batch, on_publish=None, pp_proxy_tensors=None
     ) -> GenerationBatchResult:
-        if not batch.forward_mode.is_decode():
-            raise NotImplementedError(
-                f"K3_PROGRAM serves the P/D decode role: no {batch.forward_mode} "
-                "batches (prompts arrive through the KV transfer)"
-            )
         assert self.steps is not None
+        prefill = isinstance(self.steps, PrefillSteps)
+        if prefill != batch.forward_mode.is_extend():
+            raise NotImplementedError(
+                f"K3_PROGRAM's {'prefill' if prefill else 'decode'} role runs no "
+                f"{batch.forward_mode} batches"
+            )
         if batch.return_logprob or any(req.grammar is not None for req in batch.reqs):
             # The program returns tokens only, and its next inputs live on the
             # device: a grammar truncating a run on the host would leave them
             # behind (vLLM-TorchTPU hands it the bitmasks instead).
             raise NotImplementedError(
-                "K3_PROGRAM decodes without logprobs or structured outputs"
+                "K3_PROGRAM serves without logprobs or structured outputs"
             )
-        req_to_token = self.req_to_token_pool.req_to_token
-        flat, lens = self.steps.step(batch.reqs, req_to_token.cpu().numpy())
+        req_to_token = self.req_to_token_pool.req_to_token.cpu().numpy()
+        if prefill:
+            first = self.steps.step(
+                batch.reqs, batch.prefix_lens, batch.extend_lens, req_to_token
+            )
+            if on_publish is not None:
+                on_publish(batch.seq_lens)
+            return GenerationBatchResult(
+                next_token_ids=torch.from_numpy(first),
+                accept_lens=torch.ones(len(batch.reqs), dtype=torch.int32),
+                new_seq_lens=batch.seq_lens,
+                next_draft_input=K3ProgramInput(),
+                speculative_num_draft_tokens=WIDTH,
+            )
+        flat, lens = self.steps.step(batch.reqs, req_to_token)
         accept_lens = torch.from_numpy(lens)
         new_seq_lens = batch.seq_lens + accept_lens.to(batch.seq_lens.device)
         if on_publish is not None:
@@ -240,9 +324,9 @@ def register() -> None:
 
     if ALGORITHM in _REGISTRY:
         return
-    from sglang_tpu.k3_programs.sglang_program import build_decode_steps
+    from sglang_tpu.k3_programs.sglang_program import build_steps
 
-    K3ProgramWorker.build_steps = build_decode_steps
+    K3ProgramWorker.build_steps = build_steps
 
     @SpeculativeAlgorithm.register(ALGORITHM, spec_class=K3ProgramAlgo)
     def _factory(server_args):

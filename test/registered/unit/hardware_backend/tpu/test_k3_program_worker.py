@@ -141,6 +141,56 @@ class TestDecodeSteps(CustomTestCase):
             self.steps.step([req], _req_to_token(2, {1: [1]}))
 
 
+class StubPrefill:
+    """First token 50 + i for each request that finishes its prompt."""
+
+    def __init__(self):
+        self.inputs = []
+
+    def step(self, step_input):
+        self.inputs.append(step_input)
+        rows = torch.full((max(len(step_input.requests), 1), 1), -1, dtype=torch.int32)
+        for i, req in enumerate(step_input.requests):
+            if req.end >= req.num_prompt_tokens:
+                rows[i, 0] = 50 + i
+        return StepOutput(rows)
+
+
+class TestPrefillSteps(CustomTestCase):
+    def setUp(self):
+        self.plan = bridge.UnifiedPoolPlan(40, 4, pools.cache_layout("auto"))
+        self.program = StubPrefill()
+        self.steps = worker.PrefillSteps(self.program, self.plan, table_width=4)
+
+    def test_chunks_and_first_tokens(self):
+        long = _req("long", prompt=3 * STEP, output=[], committed=0, pool_idx=1, slot=1)
+        short = _req("short", prompt=100, output=[], committed=0, pool_idx=2, slot=2)
+        r2t = _req_to_token(3, {1: [4, 5, 6], 2: [7]})
+        first = self.steps.step([long, short], [STEP, 0], [STEP, 100], r2t)
+        self.assertEqual(first.tolist(), [0, 51])
+        a, b = self.program.inputs[0].requests
+        self.assertEqual(
+            (a.computed, a.scheduled, a.num_prompt_tokens), (STEP, STEP, 3 * STEP)
+        )
+        self.assertTrue(a.partial)
+        self.assertEqual(
+            a.block_tables[0].tolist(),
+            [self.plan.kv_block(4), self.plan.kv_block(5), 0, 0],
+        )
+        self.assertEqual(b.block_tables[1].tolist(), [self.plan.state_block(2, 0)])
+        # The short prompt is done; the long one goes on with its last chunk.
+        self.steps.step([long], [2 * STEP], [STEP], r2t)
+        self.assertEqual(set(self.program.inputs[1].finished), {"short"})
+
+    def test_a_first_token_must_match_the_prompt_end(self):
+        req = _req("a", prompt=100, output=[], committed=0, pool_idx=1, slot=1)
+        self.program.step = lambda step_input: StepOutput(
+            torch.full((1, 1), -1, dtype=torch.int32)
+        )
+        with self.assertRaisesRegex(RuntimeError, "finished its prompt without"):
+            self.steps.step([req], [0], [100], _req_to_token(2, {1: [1]}))
+
+
 class TestRegisteredAlgorithm(CustomTestCase):
     def setUp(self):
         worker.register()
@@ -216,7 +266,40 @@ class TestRegisteredAlgorithm(CustomTestCase):
             w.forward_batch_generation(batch)
         batch.reqs[0].grammar = None
         batch.forward_mode = ForwardMode.EXTEND
-        with self.assertRaisesRegex(NotImplementedError, "decode role"):
+        with self.assertRaisesRegex(NotImplementedError, "decode role runs no"):
+            w.forward_batch_generation(batch)
+
+    def test_prefill_worker_result(self):
+        plan = bridge.UnifiedPoolPlan(40, 4, pools.cache_layout("auto"))
+        r2t = torch.from_numpy(_req_to_token(3, {1: [1], 2: [2]}))
+        target = SimpleNamespace(
+            model_runner=None,
+            get_memory_pool=lambda: (SimpleNamespace(req_to_token=r2t), None),
+        )
+        worker.K3ProgramWorker.build_steps = lambda target_worker: worker.PrefillSteps(
+            StubPrefill(), plan, table_width=4
+        )
+        self.addCleanup(setattr, worker.K3ProgramWorker, "build_steps", None)
+        w = worker.K3ProgramWorker(None, 0, 0, target)
+        w.alloc_memory_pool()
+        seq_lens = torch.tensor([100, 4000])
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            reqs=[
+                _req("a", prompt=100, output=[], committed=0, pool_idx=1, slot=1),
+                _req("b", prompt=9000, output=[], committed=0, pool_idx=2, slot=2),
+            ],
+            prefix_lens=[0, 0],
+            extend_lens=[100, 4000],
+            seq_lens=seq_lens,
+            return_logprob=False,
+        )
+        result = w.forward_batch_generation(batch)
+        self.assertEqual(result.next_token_ids.tolist(), [50, 0])
+        self.assertIs(result.new_seq_lens, seq_lens)
+        self.assertIsInstance(result.next_draft_input, worker.K3ProgramInput)
+        batch.forward_mode = ForwardMode.DECODE
+        with self.assertRaisesRegex(NotImplementedError, "prefill role runs no"):
             w.forward_batch_generation(batch)
 
 

@@ -7,7 +7,7 @@ Two moments, as in vLLM-TorchTPU's ``MegakernelModelRunner``:
   ``post_load_weights`` hook): the program for this server's P/D role, with
   its pre-sharded weights resident, so sglang sizes the KV pools from the HBM
   the weights leave;
-* once the pools exist (:func:`build_decode_steps`, the K3_PROGRAM worker's
+* once the pools exist (:func:`build_steps`, the K3_PROGRAM worker's
   ``alloc_memory_pool``): bind the unified pools and compile every op.
 """
 
@@ -116,16 +116,14 @@ def build_from_server():
     return program
 
 
-def build_decode_steps(target_worker):
-    """The decode role's steps: the program bound to the target's unified
-    pools, every op compiled."""
+def build_steps(target_worker):
+    """The role's steps: the program bound to the target's unified pools,
+    every op compiled."""
     from sglang_tpu.k3_programs.sglang_pools import K3UnifiedKVPool
-    from sglang_tpu.k3_programs.sglang_worker import DecodeSteps
+    from sglang_tpu.k3_programs.sglang_worker import DecodeSteps, PrefillSteps
 
     if _program is None or _config is None:
         raise RuntimeError("K3_PROGRAM: the program was not built at model load")
-    if _config.role != "decode":
-        raise RuntimeError(f"K3_PROGRAM: the {_config.role} role has no decode steps")
     pool = target_worker.model_runner.token_to_kv_pool.full_kv_pool
     if not isinstance(pool, K3UnifiedKVPool):
         raise RuntimeError(
@@ -138,6 +136,8 @@ def build_decode_steps(target_worker):
     )
     _program.bind_kv_caches(pool.caches, groups)
     _program.warmup()
+    if _config.role == "prefill":
+        return PrefillSteps(_program, plan, table_width=width)
     return DecodeSteps(
         _program,
         plan,
