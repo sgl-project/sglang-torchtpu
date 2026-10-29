@@ -24,10 +24,16 @@ from sglang.test.test_utils import CustomTestCase, enter_scope
 from sglang_tpu.envs import envs
 from sglang_tpu.experimental import register_host_batch_padder, uses_host_batch
 from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
+from sglang_tpu.experimental.speculative import base_spec_worker, draft_info
 from sglang_tpu.experimental.speculative.block_info import (
     HostPaddedBlockDraftInput,
 )
+from sglang_tpu.experimental.speculative.block_spec_worker import TpuBlockSpecWorker
 from sglang_tpu.experimental.speculative.chain_info import HostPaddedChainDraftInput
+from sglang_tpu.experimental.speculative.spec_types import (
+    DraftResult,
+    TpuSpecVerifyInput,
+)
 from sglang_tpu.hooks.experimental_spec import (
     alloc_extend,
     hook_specs,
@@ -36,6 +42,10 @@ from sglang_tpu.hooks.experimental_spec import (
 )
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class _LogprobBlockSpecWorker(TpuBlockSpecWorker):
+    supports_logprobs = True
 
 
 def _pad(bs):
@@ -85,6 +95,55 @@ def _state(rows):
 
 
 class TestExperimentalSpecHooks(CustomTestCase):
+    def test_verify_passes_current_draft_metadata_to_target(self):
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker.num_verify_rows = 2
+        worker._simulate_acc_len = 0
+        worker._tp_sync = MagicMock()
+        worker._verify_top_k_width = None
+        worker._rank_check_interval = 0
+        logits = SimpleNamespace(
+            next_token_logits=torch.zeros(2, 4), has_next_token_global_top_k=False
+        )
+        worker._target_worker = SimpleNamespace(
+            forward_batch_generation=MagicMock(
+                return_value=SimpleNamespace(logits_output=logits)
+            )
+        )
+        draft = DraftResult(
+            torch.tensor([[1]]), None, torch.tensor([1]), torch.tensor([0, 1])
+        )
+        bucket = SimpleNamespace(
+            state=SimpleNamespace(seq_lens=torch.tensor([4])),
+            live_mask=torch.tensor([True]),
+            temperatures=None,
+            top_ks=None,
+        )
+        metadata = SimpleNamespace()
+        accepted = object()
+        batch, rows, addressing = object(), object(), object()
+        with (
+            patch.object(worker, "make_verify_input", return_value=metadata) as make,
+            patch.object(
+                worker,
+                "_build_verify_batch",
+                return_value=SimpleNamespace(spec_info=metadata),
+            ) as build,
+            patch.object(base_spec_worker, "accept_greedy_step", return_value=accepted),
+        ):
+            result = worker.verify(batch, bucket, rows, draft, addressing)
+        make.assert_called_once_with(
+            batch=batch,
+            verify_tokens=draft.verify_tokens,
+            rows=rows,
+        )
+        self.assertIs(build.call_args.kwargs["spec_info"], metadata)
+        self.assertTrue(metadata.keep_outputs_padded)
+        self.assertEqual(result, (logits, accepted))
+        target = worker.target_worker.forward_batch_generation.call_args.kwargs
+        self.assertIs(target["forward_batch"].spec_info, metadata)
+        self.assertTrue(target["is_verify"])
+
     def setUp(self):
         super().setUp()
         # enterContext is 3.11+; CI runs 3.10.
@@ -297,9 +356,15 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 compute_base_logits=lambda values: (values, None),
                 markov_head=SimpleNamespace(sample_block=sample_block),
             )
-            result = DSparkDraftModel.sample_draft_tokens_tpu(model, hidden, tokens)
+            result, lattice = DSparkDraftModel.sample_draft_tokens_tpu(
+                model, hidden, tokens
+            )
             torch.testing.assert_close(result, torch.full((2, 2), 3, dtype=torch.int64))
-        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+            self.assertIsNone(lattice)
+        with (
+            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
+            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        ):
             sentinel = object()
             self.assertIs(
                 sample_draft_tokens(lambda *args: sentinel, None, None, None), sentinel
@@ -471,7 +536,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 # The carry stays in the draft's table, so FutureMap relays no hidden.
                 self.assertFalse(spec_need_hidden_states(lambda: True))
         self.assertEqual(prepared, [batch])
-        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+        with (
+            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
+            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        ):
             self.assertIsNone(select_experimental_spec_worker(None, mtp, None))
             # Off the flag, init_new never sets host_pad_bs, so core prepares.
             prepare_spec_decode(core_prepare, core_batch)
@@ -500,7 +568,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
             self.assertTrue(
                 supports_pd_decode_swa_hicache(core, SpeculativeAlgorithm.EAGLE3)
             )
-        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+        with (
+            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
+            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        ):
             self.assertFalse(
                 supports_pd_decode_swa_hicache(core, SpeculativeAlgorithm.DSPARK)
             )
@@ -535,6 +606,28 @@ class TestExperimentalSpecHooks(CustomTestCase):
         )
         self.assertEqual(seen[1], "device-indices")
 
+    def test_host_relayed_dflash_draft_state_filters_with_host_indices(self):
+        """DFlash's relayed draft state stays on host too; device indices can't index it."""
+        from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+        from sglang_tpu.hooks.experimental_spec import filter_spec_input
+
+        spec_info = DFlashDraftInputV2(
+            topk_p=torch.ones(3, 1),
+            topk_index=torch.zeros(3, 1, dtype=torch.int64),
+            bonus_tokens=torch.arange(3),
+            new_seq_lens=torch.arange(3),
+            hidden_states=torch.zeros(3, 4),
+        )
+        batch = SimpleNamespace(spec_info=spec_info, enable_overlap=False)
+        seen = []
+        filter_spec_input(
+            lambda b, keep, keep_device: seen.append(keep_device),
+            batch,
+            [1, 2],
+            "device-indices",
+        )
+        self.assertEqual(seen[0].tolist(), [1, 2])
+
     def test_pp_stages_before_the_last_get_no_draft(self):
         """Under PP only the last stage hosts the draft; an earlier stage building one
         would bind the target embedding or lm_head its stage does not hold."""
@@ -558,7 +651,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
                         select_experimental_spec_worker(None, algorithm, None),
                         TpuPipelineStageWorker,
                     )
-            with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+            with (
+                envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
+                envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+            ):
                 for algorithm in algorithms:
                     self.assertIsNone(
                         select_experimental_spec_worker(None, algorithm, None)
@@ -597,6 +693,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
             with (
                 self.subTest(algo=algo, experimental=experimental),
                 envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(experimental),
+                envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(experimental),
                 patch(
                     "sglang.srt.arg_groups.overrides.resolving_view",
                     side_effect=lambda server_args: server_args,
@@ -881,15 +978,21 @@ class TestExperimentalSpecHooks(CustomTestCase):
 
         worker = object.__new__(TpuBlockSpecWorker)
         greedy = torch.ones((4, 2), dtype=torch.int64)
-        worker._forward_draft_block = lambda **kwargs: (None, greedy)
+        worker._forward_draft_block = lambda **kwargs: (None, greedy, None)
         worker._sync_greedy_drafts = lambda tokens: tokens
-        worker._sample_draft_block = lambda *args: ("sampled", "logits")
+        worker._sample_draft_block = lambda *args, **kwargs: SimpleNamespace(
+            draft_tokens="sampled",
+            draft_logits="logits",
+            verify_tokens=None,
+            draft_candidates=None,
+        )
         worker._all_drafts = {4: None}
         bucket = SimpleNamespace(
             state=SimpleNamespace(seq_lens=torch.zeros(4), bonus_tokens=None),
             live_mask=None,
             temperatures=torch.ones(4),
             top_ks=torch.ones(4),
+            target_candidates=False,
         )
         results = {}
         for sampled in (True, False):
@@ -906,7 +1009,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
 
         platform = TpuSRTPlatform()
         for enabled in (True, False):
-            with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(enabled):
+            with (
+                envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(enabled),
+                envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(enabled),
+            ):
                 for algorithm in ("DFLASH", "DSPARK", "EAGLE3", "NEXTN"):
                     with self.subTest(algorithm=algorithm, enabled=enabled):
                         self.assertEqual(
@@ -1190,6 +1296,22 @@ class TestExperimentalSpecHooks(CustomTestCase):
         worker._bsearch_filtering = True
         check(batch=batch(top_k=1 << 30, top_p=0.9), pp_proxy_tensors=None)
 
+        penalized = batch(top_k=1 << 30, top_p=0.9)
+        penalized.sampling_info.acc_additive_penalties = torch.full((2, 32), -0.5)
+        with self.assertRaisesRegex(NotImplementedError, "penalties"):
+            check(batch=penalized, pp_proxy_tensors=None)
+        worker.supports_additive_penalties = True
+        check(batch=penalized, pp_proxy_tensors=None)
+        for name, value in (
+            ("acc_scaling_penalties", torch.ones(2, 32)),
+            ("logit_bias", torch.zeros(2, 32)),
+            ("penalizer_orchestrator", SimpleNamespace(is_required=True)),
+        ):
+            with self.subTest(unsupported=name):
+                with patch.object(penalized.sampling_info, name, value):
+                    with self.assertRaisesRegex(NotImplementedError, "penalties"):
+                        check(batch=penalized, pp_proxy_tensors=None)
+
     def test_block_draft_input_relays_through_the_future_map(self):
         """RelayPayload.from_draft_input reads the EAGLE seed slots of every draft
         input; the block input left them out and every DFlash/DSpark startup died."""
@@ -1204,9 +1326,8 @@ class TestExperimentalSpecHooks(CustomTestCase):
         """prepare_for_decode reserves 2 * N tokens past the committed length,
         plans the verify window on host from the committed lengths, and refuses
         a device-resident pool."""
-        from sglang_tpu.experimental.speculative import draft_info
-
         page_size, num_draft_tokens = 4, 3
+        worker_factory = MagicMock(return_value=TpuBlockSpecWorker)
         reqs = [
             SimpleNamespace(
                 kv=SimpleNamespace(kv_committed_len=c, kv_allocated_len=a),
@@ -1231,18 +1352,27 @@ class TestExperimentalSpecHooks(CustomTestCase):
             enable_overlap=True,
             return_logprob=False,
             has_grammar=False,
+            sampling_info=None,
+            spec_algorithm=SimpleNamespace(create_worker=worker_factory),
         )
         allocations = []
         spec = SimpleNamespace(
-            speculative_num_draft_tokens=num_draft_tokens,
+            speculative_num_draft_tokens=2,
             speculative_draft_window_size=None,
         )
         draft = HostPaddedBlockDraftInput(
             bonus_tokens=torch.zeros(2, dtype=torch.int64),
             new_seq_lens=torch.zeros(2, dtype=torch.int64),
         )
+        server_args = object()
         with (
             patch.object(draft_info, "get_spec", return_value=spec),
+            patch.object(draft_info, "get_server_args", return_value=server_args),
+            patch.object(
+                draft_info,
+                "max_speculative_num_draft_tokens",
+                return_value=num_draft_tokens,
+            ),
             patch.object(
                 draft_info,
                 "allocate_and_assign_decode_cache",
@@ -1266,11 +1396,32 @@ class TestExperimentalSpecHooks(CustomTestCase):
             self.assertEqual(draft.tpu_committed_lens.tolist(), [5, 10])
             self.assertEqual(draft.tpu_req_pool_indices.tolist(), [1, 2])
 
-            # Logprobs can commit past the window's bound: stay on the sync path.
+            # A shorter active step still trails a preceding full-width commit.
+            batch.spec_info = draft
+            plan = TpuSpecVerifyInput.from_batch(batch, num_verify_rows=2, padded_bs=4)
+            self.assertEqual(plan.host_len_slack, num_draft_tokens)
+            self.assertEqual(plan.verify_cache_candidates.shape, (4, 6))
+            with self.assertRaisesRegex(ValueError, "reserved KV window"):
+                TpuSpecVerifyInput.from_batch(batch, num_verify_rows=4, padded_bs=4)
+
+            # Request validation and KV planning use the selected worker's
+            # capability, including an input constructed outside the worker.
             batch.return_logprob = True
+            worker = object.__new__(TpuBlockSpecWorker)
+            with self.assertRaisesRegex(NotImplementedError, "logprobs"):
+                worker._check_supported(batch=batch, pp_proxy_tensors=None)
             draft.prepare_for_decode(batch)
             self.assertFalse(draft.tpu_host_seq_lens_is_committed)
             self.assertIsNone(draft.tpu_verify_cache_candidates)
+            # Scoring can use the same window when the algorithm keeps the
+            # ordinary N + 1 token commit bound.
+            worker_factory.return_value = _LogprobBlockSpecWorker
+            worker = object.__new__(_LogprobBlockSpecWorker)
+            worker._check_supported(batch=batch, pp_proxy_tensors=None)
+            draft.prepare_for_decode(batch)
+            self.assertTrue(draft.tpu_host_seq_lens_is_committed)
+            self.assertEqual(draft.tpu_verify_cache_candidates.shape, (2, 6))
+            worker_factory.assert_called_with(server_args)
 
             batch.req_to_token_pool.host_resident = False
             with self.assertRaisesRegex(RuntimeError, "host-resident"):

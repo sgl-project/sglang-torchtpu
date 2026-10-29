@@ -131,6 +131,15 @@ class RaidenReceiverMixin:
                     aux_index,
                     aux_blob,
                 )
+            if (
+                req.state_meta
+                and self._write_state_meta is not None
+                and room not in self._aborted
+            ):
+                self._write_state_meta(
+                    self._decode.local_state_rows.get(room, ()),
+                    req.state_meta,
+                )
             if self.chunked_transfer:
                 holds_nothing = (
                     room in self._decode.local_blocks
@@ -730,12 +739,13 @@ class RaidenReceiverMixin:
         return True
 
     def _state_read_locked(self, room: int) -> Tuple[List[int], List[int], str]:
-        """Remote rows, local rows and endpoint of the room's GDN state read."""
+        """Remote rows, local rows and endpoint of the room's state read."""
         remote = list(self._decode.remote_state_rows.get(room, []))
         local = list(self._decode.local_state_rows.get(room, []))
-        if len(remote) != 1 or len(local) != 1:
+        expected = self._state_engine_max_blocks
+        if len(remote) != expected or len(local) != expected:
             raise RuntimeError(
-                f"Raiden GDN state read of room {room} needs one row per side, "
+                f"Raiden state read of room {room} needs {expected} row(s) per side, "
                 f"got remote={remote} local={local}"
             )
         return remote, local, self._decode.remote_state_endpoint.get(room, "")

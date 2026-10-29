@@ -12,18 +12,22 @@ import logging
 
 from sglang.srt.plugins.hook_registry import HookType
 from sglang_tpu.hooks.attn_residual import (
-    aggregate,
-    aggregate_fused_add,
     prepare_attn_residual_kernel,
     register_attn_residual_ops,
 )
 from sglang_tpu.hooks.attn_tp import device_supports_input_scattered
-from sglang_tpu.hooks.cpu_pinning import pin_scheduler_main_thread
+from sglang_tpu.hooks.cpu_pinning import bind_rank_cpu_set, pin_scheduler_main_thread
 from sglang_tpu.hooks.draft_kv_pool import (
     draft_cell_size_per_token,
     draft_mha_pool_class,
 )
 from sglang_tpu.hooks.dsa_kv_pool import size_tpu_dsa_kv_pool
+from sglang_tpu.hooks.encoder import (
+    bootstrap_encoder_worker,
+    encode_indices_within_patch_budget,
+    install_encoder_vision_compile,
+    reject_encoder_dp,
+)
 from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.glm_flash_megakernel import (
     drop_freed_glm_flash_megakernel_request,
@@ -80,6 +84,11 @@ logger = logging.getLogger(__name__)
 
 HOOKS: list[tuple] = [
     (
+        "sglang.srt.utils.common.set_gpu_proc_affinity",
+        bind_rank_cpu_set,
+        HookType.AROUND,
+    ),
+    (
         "sglang.srt.managers.scheduler.Scheduler.run_event_loop",
         pin_scheduler_main_thread,
         HookType.BEFORE,
@@ -88,6 +97,31 @@ HOOKS: list[tuple] = [
         "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
         initialize_dense_moe_config,
         HookType.AFTER,
+    ),
+    (
+        "sglang.srt.disaggregation.encoder.server.MMEncoder.init_moe_gemm_config",
+        initialize_dense_moe_config,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.disaggregation.encoder.server.MMEncoder.__init__",
+        bootstrap_encoder_worker,
+        HookType.BEFORE,
+    ),
+    (
+        "sglang.srt.disaggregation.encoder.server.MMEncoder.__init__",
+        install_encoder_vision_compile,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.disaggregation.encoder.server.MMEncoder.encode_indices",
+        encode_indices_within_patch_budget,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.disaggregation.encoder.runtime.launch_dp_runtime",
+        reject_encoder_dp,
+        HookType.BEFORE,
     ),
     (
         "sglang.srt.arg_groups.validation_hook.check_pipeline_parallel_compat",
@@ -162,16 +196,6 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.models.kimi_k3_vl.KimiK3MultiModalProjector.forward",
         pass_through_projected_features,
-        HookType.AROUND,
-    ),
-    (
-        "sglang.srt.layers.attn_residual._aggregate",
-        aggregate,
-        HookType.AROUND,
-    ),
-    (
-        "sglang.srt.layers.attn_residual._aggregate_fused_add",
-        aggregate_fused_add,
         HookType.AROUND,
     ),
     (

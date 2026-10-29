@@ -52,6 +52,15 @@ if TYPE_CHECKING:
 _PALLAS_SPARSE_MLA_OPS = {}
 
 
+def topk_row_width(hf_config) -> int:
+    """Columns of the top-k rows index_topk / index_topk_kpool return."""
+    if get_dsa_index_kpool(hf_config) == 1:
+        return get_dsa_index_topk(hf_config)
+    # Pooled tokens plus the open pool's tail, padded with -1 to whole lanes for
+    # the sparse kernel's gather (SparseCore RoPE packing).
+    return -(-get_dsa_mtp_topk_width(hf_config) // 128) * 128
+
+
 def _build_pallas_sparse_mla_kernel_op(
     qblock_kpool: int = 0, gather_chunk_tokens: Optional[int] = None
 ):
@@ -193,6 +202,19 @@ def _build_pallas_sparse_mla_kernel_op(
     return custom_op
 
 
+def _kpool_query_bound(metadata, *, num_tokens: int) -> int:
+    """Static per-request new-token bound for fused kpool pooling.
+
+    Decode carries one row per request. Verify and draft extend carry exactly
+    ``decode_query_size`` rows when it is above 1: _forward_decode_query_size
+    only reports it for uniform batches, and it is already a compiled-graph
+    constant for the attention kernel. Ragged extend keeps the token bucket.
+    """
+    if metadata.decode_query_size > 1 or metadata.segments == "decode":
+        return min(metadata.decode_query_size, num_tokens)
+    return num_tokens
+
+
 class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
     """``pallas_tpu_mla`` with sparse attention: it runs the DSA indexer too."""
 
@@ -208,9 +230,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         super().__init__(model_runner, speculative_step_id)
         self._topk = get_dsa_index_topk(hf_config)
         if self._kpool > 1:
-            # Pooled tokens plus the open pool's tail, padded with -1 to whole
-            # lanes for the sparse kernel's gather (SparseCore RoPE packing).
-            self._kpool_width = -(-get_dsa_mtp_topk_width(hf_config) // 128) * 128
+            self._kpool_width = topk_row_width(hf_config)
             self._index_topk_op = build_dsa_kpool_topk_op()
         else:
             self._index_topk_op = build_dsa_index_topk_op()
@@ -331,6 +351,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             kpool,
             self._kpool_width,
             metadata.decode_query_size,
+            _kpool_query_bound(metadata, num_tokens=query.shape[0]),
         )
 
     def _forward_mla(

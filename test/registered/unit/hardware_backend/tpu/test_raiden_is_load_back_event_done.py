@@ -21,8 +21,8 @@ from sglang.srt.managers.cache_controller import BatchDoneCounter
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import patches
-from sglang_tpu.raiden_hybrid_cache_controller import (
-    TpuRaidenHybridCacheController,
+from sglang_tpu.tpu_dma_hybrid_cache_controller import (
+    TpuDMAHybridCacheController,
 )
 
 
@@ -44,8 +44,8 @@ def _all_reduce_as(remote_done: int):
     return MagicMock(side_effect=all_reduce)
 
 
-def _make_controller() -> TpuRaidenHybridCacheController:
-    controller = object.__new__(TpuRaidenHybridCacheController)
+def _make_controller() -> TpuDMAHybridCacheController:
+    controller = object.__new__(TpuDMAHybridCacheController)
     controller.layer_done_counter = BatchDoneCounter()
     return controller
 

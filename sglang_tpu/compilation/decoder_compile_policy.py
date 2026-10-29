@@ -80,7 +80,6 @@ from sglang_tpu.cp_layout import warmup_request_lengths
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
 from sglang_tpu.host_padding import (
-    check_host_padding_config,
     ordinary_compiled_forward,
 )
 from sglang_tpu.pp_wave import num_relayed_aux_slots
@@ -967,8 +966,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         """The ``pp_proxy_tensors`` kwarg a non-first pipeline stage warms up with.
 
         The proxy carries the previous stage's hidden states and residual at the
-        padded token bucket, in the model dtype, on the device; the first stage
-        (and a non-pipelined model) gets no proxy.
+        padded token bucket, in the model's PP dtype (or its compute dtype by
+        default), on the device; the first stage gets no proxy.
         """
         pp_group = self.model_runner.pp_group
         if pp_group is None or pp_group.is_first_rank:
@@ -982,7 +981,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         def zeros(shape: tuple[int, int]) -> torch.Tensor:
             buffer = torch.zeros(
                 (rows, shape[1]),
-                dtype=self.model_runner.dtype,
+                dtype=getattr(
+                    self.model_runner.model,
+                    "pp_transfer_dtype",
+                    self.model_runner.dtype,
+                ),
                 device=self.model_runner.device,
             )
             return buffer[: shape[0]]
@@ -1078,7 +1081,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         # EAGLE warmup and serving have different sampling_info values. Avoid
         # guarding that metadata in compiled paths which cannot use this mode.
-        if not tpu_envs.SGLANG_TPU_HOST_PADDING.get() or batch.spec_info is not None:
+        if batch.spec_info is not None:
             return False
         info = getattr(batch, "sampling_info", None)
         if info is None or not supports_padded_sampling(info):
@@ -1102,10 +1105,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
 
     def _upload_host_inputs(self, forward_batch: ForwardBatch) -> None:
-        if (
-            not tpu_envs.SGLANG_TPU_HOST_PADDING.get()
-            or forward_batch.spec_info is not None
-        ):
+        if forward_batch.spec_info is not None:
             return
         # Each field is checked on its own: tokens, lengths and extend metadata
         # are placed by separate decisions, so one device-side field does not
@@ -1337,13 +1337,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if disagg_mode != "prefill":
             pending += self._precompile_decode()
         spec_algorithm = getattr(self.model_runner, "spec_algorithm", None)
-        host_padded_prefill = (
-            tpu_envs.SGLANG_TPU_HOST_PADDING.get()
-            and spec_algorithm is not None
-            and spec_algorithm.is_none()
-        )
-        if host_padded_prefill:
-            check_host_padding_config(self.model_runner)
+        host_padded_prefill = spec_algorithm is not None and spec_algorithm.is_none()
         if (
             host_padded_prefill
             and get_exec().kernel.sampling_backend == "tpu"
@@ -1645,8 +1639,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         spec_info: SpecInput | None = None,
         attn_backend: Any | None = None,
         profile_prefix: int | None = None,
+        publish_dsa_topk: bool = False,
     ) -> PendingCall | float | None:
-        """Run one warmup, defer async execution, or time synchronous profiling."""
+        """Run one warmup, defer async execution, or time synchronous profiling.
+
+        publish_dsa_topk traces a draft forward that leaves its DSA top-k in
+        spec_info (forward_draft_rows' flag of the same name).
+        """
         self._compiled_extend_variants.add(variant)
         args, kwargs = self._make_warmup_inputs(
             num_tokens=num_tokens,
@@ -1666,6 +1665,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             else:
                 args = (*args[:2], prepared_batch, *args[3:])
             forward_batch = prepared_batch
+        if publish_dsa_topk:
+            forward_batch.reuse_dsa_topk_indices = True
         if profile_prefix is not None:
             from sglang_tpu.pp_profile import set_profile_inputs
 
@@ -2025,7 +2026,18 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
 
 class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
-    """Qwen3-VL decoder policy that warms multimodal prefill call shapes."""
+    """Qwen3-VL decoder policy that warms multimodal prefill call shapes.
+
+    ``spmd_safe`` declares the traced graphs identical across TP/EP ranks so
+    ``--use-spmd-compile`` can compile each warmup once and broadcast it. It
+    was verified with ``VERIFY_SPMD_SAFE=1`` for the Qwen3-VL-30B-A3B single
+    host and P/D recipes (#1623). Other models that reuse this policy must
+    pass the same verification before their recipes enable the flag: a
+    rank-dependent constant would ship the owner rank's executable to every
+    rank with no error.
+    """
+
+    spmd_safe = True
 
     def _warmup_host_padding(self) -> None:
         # The compiled inner decoder excludes eager prompt embedding and logits.
@@ -2513,3 +2525,33 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 # Kimi-K3's multimodal wrapper compiles its language model with the Qwen3-VL
 # policy unchanged.
 KimiK3VLDecoderTpuCompilePolicy = Qwen3VLDecoderTpuCompilePolicy
+
+
+class BailingVLDecoderTpuCompilePolicy(Qwen3VLDecoderTpuCompilePolicy):
+    """Qwen3-VL policy with Bailing's unsupported-config fail-fasts.
+
+    The shared VL policy has no later-stage warmup and no input_ids-only
+    direct-tracer key; refuse those here so the compile never starts,
+    saving the ~19-minute cold compile on misconfigured hosts.
+    """
+
+    def install(self) -> bool:
+        from sglang.srt.runtime_context import get_parallel
+
+        parallel = get_parallel()
+        if parallel.pp_size > 1:
+            raise ValueError(
+                "Bailing/Ling-3's multimodal model does not support "
+                "pipeline parallelism with --enable-torch-compile on TPU "
+                "yet."
+            )
+        if (
+            getattr(self.model_runner.server_args, "tpu_compile_tracer", None)
+            == "direct"
+        ):
+            raise ValueError(
+                "Bailing/Ling-3's multimodal model does not support "
+                "--tpu-compile-tracer direct with --enable-torch-compile "
+                "on TPU yet."
+            )
+        return super().install()

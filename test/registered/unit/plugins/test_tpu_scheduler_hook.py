@@ -81,7 +81,7 @@ class TestTpuSchedulerHook(CustomTestCase):
     def test_non_tpu_dense_initialization_is_unchanged(self):
         self.initialize(tpu=False)
         self.assertIsNone(get_flags().moe.runner_backend)
-        self.assertTrue(get_flags().moe.a2a_backend.is_none())
+        self.assertTrue(moe_utils.get_moe_a2a_backend().is_none())
 
 
 if __name__ == "__main__":

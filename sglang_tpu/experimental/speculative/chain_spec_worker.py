@@ -15,10 +15,15 @@ extend: target forward on the prompt, then a draft forward on the prompt
 g lives in a [req pool rows, H] device table, so filter/merge and the overlap
 relay never carry it. Under PD, prefill ships g as the EAGLE hidden seed and
 decode writes it back into the table. Not ported yet: a draft sliding window.
+
+A DSA draft that shares its indexer top-k (MTP index sharing) keeps a second
+table beside g: the top-k of the row g was taken from, which commit and extend
+capture and every draft step reuses. Not under PD: prefill does not ship it.
 """
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Sequence
 
 import torch
@@ -46,6 +51,7 @@ from sglang_tpu.experimental import register_pd_carry_seeder, runs_draft_prompt_
 from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
 from sglang_tpu.experimental.speculative.chain_draft_input import (
     chain_draft_forward_input,
+    dsa_seed_topk_buffer,
 )
 from sglang_tpu.experimental.speculative.chain_draft_worker import (
     TpuChainDraftWorker,
@@ -60,7 +66,7 @@ from sglang_tpu.experimental.speculative.mtp.mtp_draft_worker import (
 )
 from sglang_tpu.experimental.speculative.spec_ops import (
     build_chain_block_inputs,
-    pick,
+    commit_carry,
     select_verify_rows,
 )
 from sglang_tpu.experimental.speculative.spec_types import (
@@ -248,11 +254,14 @@ class TpuChainSpecWorker(TpuSpecWorker):
         assert target_hidden is not None
         padded_bs = state.seq_lens.shape[0]
         width = self.num_verify_rows
+        drafter = self._chain_draft_worker
+        shares_dsa_topk = drafter.dsa_seed_topk_width is not None
         # Rows past the bonus carry token 0; their draft KV is past the new seq_lens.
         inputs = build_chain_block_inputs(
             accept.window_tokens, rows, state.seq_lens, accept.live_mask, 0
         )
-        with self._chain_draft_worker.draft_context():
+        spec_info = chain_draft_forward_input(hidden_states=target_hidden, width=width)
+        with drafter.draft_context():
             draft_out = forward_draft_rows(
                 draft_runner=self._draft_runner,
                 spec_algorithm=self._spec_algorithm,
@@ -261,18 +270,25 @@ class TpuChainSpecWorker(TpuSpecWorker):
                 verify_input=verify_input,
                 offset=0,
                 width=width,
-                spec_info=chain_draft_forward_input(
-                    hidden_states=target_hidden, width=width
-                ),
+                spec_info=spec_info,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
+                publish_dsa_topk=shares_dsa_topk,
             )
         draft_hidden = draft_out.hidden_states
         assert draft_hidden is not None, "Chain draft rows returned no hidden."
-        last_hidden = pick(
-            draft_hidden.view(padded_bs, width, -1), accept.num_correct_drafts
-        )
-        self._chain_draft_worker.carry.index_copy_(
-            0, state.req_pool_indices, last_hidden
+        rows_topk = None
+        if shares_dsa_topk:
+            rows_topk = spec_info.dsa_topk_indices
+            assert rows_topk is not None, "The DSA draft published no top-k."
+            assert rows_topk.shape[0] == padded_bs * width, rows_topk.shape
+        # The next draft steps reuse the top-k of the row the carry comes from.
+        drafter.carry, drafter.dsa_seed_topk_table, last_hidden = commit_carry(
+            carry=drafter.carry,
+            req_pool_indices=state.req_pool_indices,
+            rows_hidden=draft_hidden,
+            num_correct_drafts=accept.num_correct_drafts,
+            seed_table=drafter.dsa_seed_topk_table,
+            rows_topk=rows_topk,
         )
         next_state = SpecState(
             bonus_tokens=accept.bonus_tokens,
@@ -356,12 +372,17 @@ class TpuChainSpecWorker(TpuSpecWorker):
             return_hidden_states_before_norm=False,
         )
         forward_batch.input_ids = draft_ids
+        drafter = self._chain_draft_worker
+        seed_capture, seed_select = self._prompt_seed_capture(batch)
         forward_batch.spec_info = chain_draft_forward_input(
-            hidden_states=target_hidden, width=1
+            hidden_states=target_hidden,
+            width=1,
+            dsa_seed_topk_capture=seed_capture,
+            dsa_seed_topk_select=seed_select,
         )
         forward_batch.return_logprob = False
         self._set_draft_prefill_dp_counts(forward_batch, padded_tokens=padded_tokens)
-        with self._chain_draft_worker.draft_context(), torch.no_grad():
+        with drafter.draft_context(), torch.no_grad():
             if mm_input_embeds is not None:
                 assert mm_input_embeds.shape[0] == padded_tokens
                 # Embeds in hand keep the draft off its mm_inputs path, whose
@@ -376,8 +397,29 @@ class TpuChainSpecWorker(TpuSpecWorker):
         pool_rows = pad_rows(batch.req_pool_indices_cpu, cap).to(
             self.device, non_blocking=True
         )
-        self._chain_draft_worker.carry.index_copy_(0, pool_rows, tail_hidden)
+        drafter.carry.index_copy_(0, pool_rows, tail_hidden)
+        seed_table = drafter.dsa_seed_topk_table
+        if seed_table is not None:
+            assert seed_capture is not None
+            seed_table.index_copy_(0, pool_rows, seed_capture)
         return tail_hidden
+
+    def _prompt_seed_capture(
+        self, batch: ScheduleBatch
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """The draft prompt's DSA top-k capture at the extend cap and the rows it
+        keeps: each request's last prompt row, the row its carry comes from."""
+        cap = self._compile_policy()._extend_compile_cap()
+        capture = dsa_seed_topk_buffer(
+            num_rows=cap,
+            width=self._chain_draft_worker.dsa_seed_topk_width,
+            device=self.device,
+        )
+        if capture is None:
+            return None, None
+        last_rows = torch.cumsum(torch.tensor(batch.extend_lens), dim=0) - 1
+        # Padded slots keep row 0; their seed lands in the reserved pool row 0.
+        return capture, padded_h2d(last_rows, cap, self.device)
 
     def _pd_seed_hidden(self, device: torch.device) -> torch.Tensor:
         """Zero seed hidden at the extend cap; the decode derives the carry itself."""
@@ -546,10 +588,11 @@ class TpuChainSpecWorker(TpuSpecWorker):
     def _warmup_draft_ops(self) -> None:
         """Eager draft/commit ops around the compiled draft programs, per batch bucket."""
         drafter = self._chain_draft_worker
-        width = self.num_verify_rows
         with torch.no_grad():
-            for pbs in self._b_bucketer().buckets:
-                self._warmup_draft_chain(pbs)
+            for width, pbs in itertools.product(
+                self.verify_widths(), self._b_bucketer().buckets
+            ):
+                self._warmup_draft_chain(pbs, width)
                 rows = _dummy_verify_rows(pbs, width, self.device)
                 accept_tokens = torch.zeros(
                     (pbs, width), dtype=torch.int64, device=self.device
@@ -563,27 +606,37 @@ class TpuChainSpecWorker(TpuSpecWorker):
                     torch.ones((pbs,), dtype=torch.bool, device=self.device),
                     0,
                 )
-                # commit: the last accepted row's hidden back into the table.
-                rows_hidden = torch.zeros(
-                    (pbs * width, drafter.carry_size),
-                    dtype=self._draft_runner.dtype,
-                ).to(self.device)
-                last = pick(
-                    rows_hidden.view(pbs, width, -1),
+                # commit: the last accepted row's hidden (and top-k) into the tables.
+                seed_table = drafter.dsa_seed_topk_table
+                warmup_compiled_op(
+                    commit_carry,
+                    drafter.carry,
+                    torch.zeros((pbs,), dtype=torch.int64).to(self.device),
+                    torch.zeros(
+                        (pbs * width, drafter.carry_size),
+                        dtype=self._draft_runner.dtype,
+                    ).to(self.device),
                     torch.zeros((pbs,), dtype=torch.int64, device=self.device),
+                    seed_table,
+                    (
+                        None
+                        if seed_table is None
+                        else torch.zeros(
+                            (pbs * width, seed_table.shape[1]), dtype=torch.int32
+                        ).to(self.device)
+                    ),
                 )
-                pool_rows = torch.zeros((pbs,), dtype=torch.int64).to(self.device)
-                drafter.carry.index_copy_(0, pool_rows, last)
 
-    def _warmup_draft_chain(self, pbs: int) -> None:
+    def _warmup_draft_chain(self, pbs: int, width: int) -> None:
         """draft's eager prelude fuses with select_verify_rows' layout, so replay both."""
 
         def upload(*shape: int, dtype: torch.dtype = torch.int64) -> torch.Tensor:
             return torch.zeros(shape, dtype=dtype).to(self.device, non_blocking=True)
 
-        width = self.num_verify_rows
         seq_lens = upload(pbs)
-        rows = select_verify_rows(upload(pbs, 2 * width), upload(pbs), seq_lens)
+        rows = select_verify_rows(
+            upload(pbs, 2 * self.verify_window_rows), upload(pbs), seq_lens, width
+        )
         state = SpecState(
             bonus_tokens=upload(pbs), seq_lens=seq_lens, req_pool_indices=upload(pbs)
         )
@@ -645,16 +698,20 @@ class TpuChainSpecWorker(TpuSpecWorker):
 
     def _warmup_verify_mrope(self) -> None:
         """compute_spec_mrope_positions on the verify rows: text-only, then per-request deltas."""
-        width = self.num_verify_rows
 
         def upload(*shape: int) -> torch.Tensor:
             return torch.zeros(shape, dtype=torch.int64).to(self.device)
 
         with torch.no_grad():
-            for padded_bs in self._b_bucketer().buckets:
+            for width, padded_bs in itertools.product(
+                self.verify_widths(), self._b_bucketer().buckets
+            ):
                 # make_verify_input hands over select_verify_rows' flat positions.
                 rows = select_verify_rows(
-                    upload(padded_bs, 2 * width), upload(padded_bs), upload(padded_bs)
+                    upload(padded_bs, 2 * self.verify_window_rows),
+                    upload(padded_bs),
+                    upload(padded_bs),
+                    width,
                 )
                 positions = rows.flat_positions.view(padded_bs, -1)
                 positions.flatten().unsqueeze(0).repeat(3, 1).cpu()
@@ -696,6 +753,10 @@ class TpuChainSpecWorker(TpuSpecWorker):
                 dtype=self._draft_runner.dtype,
             ).to(self.device)
             self._chain_draft_worker.carry.index_copy_(0, pool_rows, tail_hidden)
+            seed_table = self._chain_draft_worker.dsa_seed_topk_table
+            if seed_table is not None:
+                seeds = torch.zeros((cap, seed_table.shape[1]), dtype=torch.int32)
+                seed_table.index_copy_(0, pool_rows, seeds.to(self.device))
 
 
 @compiled_op()

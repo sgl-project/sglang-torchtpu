@@ -244,6 +244,7 @@ NIGHTLY_SUITES = {
         "nightly-tpu-perf-gemma4-31b",
         "nightly-tpu-perf-gemma4-26b-a4b",
         "nightly-tpu-perf-qwen3-5-397b",
+        "nightly-tpu-perf-glm-5-3-flash-mtp-mk",
         # One suite per quality eval so each gets an independent TPU slice.
         "nightly-tpu-accuracy-gpt-oss-20b",
         "nightly-tpu-accuracy-gemma4-31b-aime",
@@ -260,6 +261,11 @@ NIGHTLY_SUITES = {
         "nightly-tpu-accuracy-gpt-oss-120b-gpqa",
         "nightly-tpu-accuracy-gpt-oss-120b-gsm8k",
         "nightly-tpu-accuracy-gpt-oss-120b-mmlupro",
+        "nightly-tpu-accuracy-muse-spark-aime",
+        "nightly-tpu-accuracy-muse-spark-gpqa",
+        "nightly-tpu-accuracy-muse-spark-gsm8k",
+        "nightly-tpu-accuracy-muse-spark-mmlupro",
+        "nightly-tpu-accuracy-glm-5-3-flash-aime",
         # External tpu7x cluster (nightly-test-external-tpu.yml; see
         # .github/tpu-ci/external/README.md). 1host: single-host tests that launch
         # their own server. 2x2x2 / 2x2x4: multi-host jobs wired by hand in
@@ -339,6 +345,19 @@ def registered_test_files() -> List[str]:
         # registered tests, and must not be executed as one.
         if os.path.basename(f) not in ("conftest.py", "__init__.py")
     ]
+
+
+def fails_on_all_skipped(hw: HWBackend, suites: List[str]) -> bool:
+    """Whether a file whose tests all skip fails the run instead of passing.
+
+    On for the TPU per-commit suites: while the CI pods pinned JAX to CPU,
+    kernel tests gated on jax.devices() skipped every case and reported green
+    (#413). Other backends keep the old behavior until someone
+    checks their suites for files that skip on purpose.
+    """
+    return hw == HWBackend.TPU and any(
+        suite in PER_COMMIT_SUITES[HWBackend.TPU] for suite in suites
+    )
 
 
 def validate_all_suites(all_tests: List[CIRegistry]):
@@ -510,6 +529,7 @@ def run_a_suite(args):
         )
 
     pretty_print_tests(args, ci_tests, skipped_tests)
+    fail_on_all_skipped = fails_on_all_skipped(hw, suites)
 
     # None hands the per-file budget over to est_time (see run_unittest_files).
     timeout = None if args.timeout_from_est_time else args.timeout_per_file
@@ -529,6 +549,7 @@ def run_a_suite(args):
             timeout_per_file=timeout,
             derive_timeout=derive_timeout_per_file,
             continue_on_error=args.continue_on_error,
+            fail_on_all_skipped=fail_on_all_skipped,
         )
         # Handed to run_unittest_files so the suite still ends with one
         # TIMINGS block covering every file; the est_time model and the
@@ -551,6 +572,7 @@ def run_a_suite(args):
         max_attempts=args.max_attempts,
         retry_wait_seconds=args.retry_wait_seconds,
         fork_worker_batch_size=args.fork_worker_batch_size,
+        fail_on_all_skipped=fail_on_all_skipped,
     )
     return rest if pinned_ok else -1
 

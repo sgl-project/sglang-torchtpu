@@ -804,15 +804,13 @@ def _patch_raiden_is_load_back_event_done() -> None:
     _raiden_is_load_back_event_done_patched = True
 
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-    from sglang_tpu.raiden_hybrid_cache_controller import (
-        TpuRaidenHybridCacheController,
-    )
+    from sglang_tpu.tpu_dma_hybrid_cache_controller import TpuDMAHybridCacheController
 
     orig_is_load_back_event_done = UnifiedRadixCache.is_load_back_event_done
 
     def is_load_back_event_done(self, consumer_index):
         controller = self.cache_controller
-        if not isinstance(controller, TpuRaidenHybridCacheController):
+        if not isinstance(controller, TpuDMAHybridCacheController):
             return orig_is_load_back_event_done(self, consumer_index)
         return controller.is_load_back_event_done(consumer_index, self._all_reduce)
 
@@ -978,6 +976,9 @@ def apply_tpu_patches() -> None:
     _patch_pd_decode_swa_hicache()
     _patch_hicache_write_back_copy_ahead()
     _patch_pd_decode_async_prefill_info()
+    from sglang_tpu.benchmark_batch_gate import install as install_benchmark_batch_gate
+
+    install_benchmark_batch_gate()
     _patch_host_heap_trim()
     _patch_profile_auto()
     _patch_scheduler_reject_prompt_logprob()

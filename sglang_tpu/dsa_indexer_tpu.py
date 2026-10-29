@@ -228,6 +228,7 @@ def build_dsa_kpool_topk_op():
         kpool: int,
         out_width: int,
         decode_query_size: int,
+        max_query_length: int,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         return kpool_indexer_step(
             query,
@@ -246,6 +247,7 @@ def build_dsa_kpool_topk_op():
             kpool=kpool,
             out_width=out_width,
             decode_query_size=decode_query_size,
+            max_query_length=max_query_length or None,
         )
 
     raw_argnum, pooled_argnum = argnums(_wrapped, "raw_cache", "pooled_cache")
@@ -253,7 +255,13 @@ def build_dsa_kpool_topk_op():
         _wrapped,
         name=f"jax_{op_name}",
         static_argnums=argnums(
-            _wrapped, "weight_scale", "topk", "kpool", "out_width", "decode_query_size"
+            _wrapped,
+            "weight_scale",
+            "topk",
+            "kpool",
+            "out_width",
+            "decode_query_size",
+            "max_query_length",
         ),
         # Both caches are updated in place: outputs 1 and 2 alias them.
         donate_argnums=(raw_argnum, pooled_argnum),
@@ -283,6 +291,7 @@ def build_dsa_kpool_topk_op():
         kpool: int,
         out_width: int,
         decode_query_size: int = 1,
+        max_query_length: int = 0,
     ) -> torch.Tensor:
         # See build_dsa_index_topk_op: JAX needs the TPU info to compile here.
         with tpu_info_for_cpu_export():
@@ -303,6 +312,7 @@ def build_dsa_kpool_topk_op():
                 kpool,
                 out_width,
                 decode_query_size,
+                max_query_length,
             )
         return topk_indices
 

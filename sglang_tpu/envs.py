@@ -8,7 +8,16 @@ core readers move; never declare one name in both registries.
 
 from __future__ import annotations
 
-from sglang.srt.environ import EnvBool, EnvField, EnvFloat, EnvInt, EnvStr, EnvTuple
+from sglang.srt.environ import (
+    EnvBool,
+    EnvBoolWithAlias,
+    EnvField,
+    EnvFloat,
+    EnvFloatWithAlias,
+    EnvInt,
+    EnvStr,
+    EnvTuple,
+)
 
 __all__ = ["TpuEnvs", "envs"]
 
@@ -17,6 +26,12 @@ EnvField._allow_set_name = True
 
 
 class TpuEnvs:
+    # Opt-in, request-tagged benchmark admission (benchmark_batch_gate.py).
+    # Zero preserves ordinary scheduling, including continuous batching.
+    SGLANG_TPU_BENCHMARK_BATCH_SIZE = EnvInt(0)
+    SGLANG_TPU_BENCHMARK_TIMEOUT_SEC = EnvFloat(600.0)
+    SGLANG_TPU_RELEASE_CHECKPOINT_PAGE_CACHE = EnvBool(True)
+    SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS = EnvBool(True)
     # Host heap (see host_heap_trim.py)
     SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED = EnvBool(True)
     # Seconds between periodic trims. 0 turns the periodic trim off.
@@ -47,6 +62,9 @@ class TpuEnvs:
     # query-blocked kernel (attention/pallas/mla_sparse_qblock.py), which fetches
     # each block's union of selected pages once; False keeps the per-query kernel.
     SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL = EnvBool(False)
+    # Vision: run single-sequence "tpu" vision attention through block-skipping splash
+    # (attention/vision_splash.py); False keeps the segment-id flash op.
+    SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION = EnvBool(False)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.
@@ -107,18 +125,21 @@ class TpuEnvs:
     # A/B comparisons; the default lets the kernel own the decoder weights.
     SGLANG_TPU_K3_MEGAKERNEL_KEEP_SGLANG_WEIGHTS = EnvBool(False)
 
-    # Host padding
-    # Keep eligible host-built inputs on CPU through bucket padding, then upload
-    # once to avoid per-length XLA compilations. Device inputs are not read back.
-    SGLANG_TPU_HOST_PADDING = EnvBool(False)
+    # Host padding is unconditional; this routes speculative batches to the
+    # experimental spec worker, which keeps their metadata on the host as well.
+    SGLANG_TPU_HOST_PADDING_NO_D2H = EnvBool(True)
 
     # Speculative decoding
     # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker and MTP
     # and EAGLE3 to TpuChainSpecWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
-    SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
-    # Same effect as SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER. Non-speculative
-    # batches ignore it.
-    SGLANG_TPU_HOST_PADDING_NO_D2H = EnvBool(False)
+    SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(True)
+    # Every N verify steps, TP ranks compare a digest of their committed tokens and
+    # raise on mismatch: hash_uniforms replaces the accept broadcast. 0 disables.
+    # Steps, not seconds, so every rank joins the same all-gather; ~1 min at bs 1.
+    SGLANG_TPU_SPEC_RANK_CHECK_INTERVAL = EnvInt(8192)
+    # TpuBlockSpecWorker's candidate acceptance by block verification (Sun et al.
+    # 2024, Algorithm 2) instead of token-wise rejection; lossless either way.
+    SGLANG_TPU_SPEC_BLOCK_VERIFICATION = EnvBool(False)
     # PD on the experimental spec worker: the prefill ships the target's draft-input
     # hidden states (pd_hidden_pool.py) and the decode builds the draft KV and carry,
     # instead of the prefill running the draft over the prompt.
@@ -135,12 +156,64 @@ class TpuEnvs:
     # fit exactly (e.g. 2 x head_dim 64): half the bytes of a zero-padded row per head.
     SGLANG_TPU_KV_PACK_HEADS = EnvBool(False)
 
-    # PD disaggregation (raiden)
+    # Raiden PD disaggregation
+    # Base control port. Each local rank reserves consecutive control/data
+    # ports for full KV, SWA KV, and recurrent state.
+    SGLANG_RAIDEN_KV_PORT = EnvInt(31000)
     # TCP connections per rank pair for raiden KV reads and resharding pushes,
     # not the pipeline path. Set the same value on prefill and decode. More can
     # raise throughput but opens more connections, and above 4 is unlikely to
     # help much. Benchmark first; in a large prefill-decode mesh, consider 1 or 2.
     SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM = EnvInt(4)
+    # Threads pushing resharded KV off the listener thread.
+    SGLANG_RAIDEN_PUSH_WORKERS = EnvInt(1)
+
+    # Host staging budget per node, split across local ranks and engines.
+    SGLANG_RAIDEN_HOST_POOL_GB = EnvFloat(128.0)
+    # Maximum pages per request. 0 derives the limit from the context/window.
+    SGLANG_RAIDEN_MAX_BLOCKS = EnvInt(0)
+    SGLANG_RAIDEN_SWA_MAX_BLOCKS = EnvInt(0)
+    # Context length fallback when --context-length is unset.
+    SGLANG_RAIDEN_MAX_MODEL_LEN = EnvInt(8192)
+    # Pinned-host budget for retraction backup. 0 keeps the row-copy path.
+    SGLANG_RAIDEN_RETRACT_HOST_GB = EnvFloat(0.0)
+
+    # Raiden: a DP or TP decode receives KV from a pipeline-parallel prefill.
+    SGLANG_RAIDEN_PIPELINE_TRANSFER = EnvBool(False)
+    # Raiden: stage each transfer (and reshard plan) in its own host-pool pages
+    # instead of fixed max-length slots; asymmetric attention TP needs it.
+    SGLANG_RAIDEN_DYNAMIC_HOST_STAGING = EnvBoolWithAlias(
+        True, deprecated_name="TPU_RAIDEN_DYNAMIC_HOST_STAGING"
+    )
+    # Raiden: a decode starts a room's next read as soon as the prefill
+    # announces it; 0 starts reads only on the next scheduler poll.
+    SGLANG_RAIDEN_LISTENER_START_READ = EnvBool(True)
+    # Raiden: deadline of each KV chunk transfer, not of the whole request; the
+    # closing read counts as a chunk, and a non-chunked transfer is one chunk.
+    # Counted from registration on the prefill and from start_read on the
+    # decode. Set the same on both.
+    SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S = EnvFloatWithAlias(
+        60.0, deprecated_name="SGLANG_RAIDEN_TIMEOUT_S"
+    )
+    # Pipeline prefill: move pages final before the prefill ends (cached prefix,
+    # finished chunks) as early transfers of at least PART_PAGES pages each.
+    SGLANG_RAIDEN_PIPELINE_EARLY_PARTS = EnvBool(False)
+    SGLANG_RAIDEN_PIPELINE_PART_PAGES = EnvInt(16)
+    # Pipeline prefill: each group of STAGE_GROUP consecutive stages moves its
+    # layers once its forwards of the final chunk complete, before sampling.
+    SGLANG_RAIDEN_PIPELINE_STAGE_PARTS = EnvBool(False)
+    SGLANG_RAIDEN_PIPELINE_STAGE_GROUP = EnvInt(1)
+    # Decode: threads coordinating pipeline transfers, one client each.
+    SGLANG_RAIDEN_PIPELINE_COORD_WORKERS = EnvInt(1)
+    # Pipeline prefill: each stage registers its share of the closing transfer
+    # at the final chunk's launch, the last stage once its tokens are copied.
+    SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE = EnvBool(False)
+
+    # raiden KV-offload backend
+    # Seconds a raiden DMA may stay pending, from each blocking wait or, when
+    # polled, from issue. Past it the scheduler exits with TimeoutError, so keep
+    # it far above a healthy transfer.
+    SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S = EnvFloat(60.0)
 
     # HiCache write_back on raiden (see hicache_write_back_copy_ahead.py): tokens
     # of the next eviction victims kept copied to host. Unset: four chunked-prefill

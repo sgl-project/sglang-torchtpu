@@ -20,8 +20,9 @@ class PrefillState:
     # The pages of send_blocks, for the repeated-page check.
     send_block_set: Dict[int, Set[int]] = field(default_factory=dict)
     send_swa_blocks: Dict[int, List[int]] = field(default_factory=dict)
-    # Committed GDN state row of the room, on the state engine.
+    # Committed state row/pages of the room, on the state engine.
     send_state_rows: Dict[int, List[int]] = field(default_factory=dict)
+    send_state_meta: Dict[int, bytes] = field(default_factory=dict)
     send_aux: Dict[int, bytes] = field(default_factory=dict)
 
     # Decode reply address and the page counts it allocated.

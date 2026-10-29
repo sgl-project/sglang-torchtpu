@@ -99,10 +99,11 @@ def merge_model_inputs(original, batch, other):
 
 
 def _draft_state_on_host(spec_info: SpecInput | None) -> bool:
+    from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
     from sglang.srt.speculative.eagle_info import EagleDraftInput
 
     return (
-        isinstance(spec_info, EagleDraftInput)
+        isinstance(spec_info, (EagleDraftInput, DFlashDraftInputV2))
         and spec_info.bonus_tokens is not None
         and spec_info.bonus_tokens.device.type == "cpu"
     )
@@ -482,8 +483,8 @@ def hook_specs():
         ),
     ]
     if experimental_spec_enabled():
-        # Hot paths every spec batch takes; registered only with the flag on so
-        # the default path runs no extra wrappers.
+        # Hot paths every spec batch takes (non-spec batches return immediately);
+        # skipped when SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=0 at import time.
         hooks += [
             (
                 "sglang.srt.speculative.spec_utils.spec_prepare_for_decode",

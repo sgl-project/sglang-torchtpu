@@ -363,8 +363,8 @@ def _select_verify_cache_locs(
     """Slice the block starting at seq_lens - committed_lens out of candidates.
 
     Args:
-      candidates: Slot ids for [base, base + 2 * block_size),
-        [bs, 2 * block_size].
+      candidates: Slot ids for [base, base + 2 * capacity), where capacity
+        bounds both the preceding commit and the active block_size.
       seq_lens: Device prefix lengths, [bs].
       committed_lens: Device mirror of the host base, [bs].
       block_size: Verify block width.
@@ -374,9 +374,9 @@ def _select_verify_cache_locs(
     """
     device = candidates.device
     # Binds only on the zero-filled bucket-padding rows; live rows stay inside
-    # [0, block_size] by the one-commit lag.
+    # [0, capacity] by the one-commit lag, even after a shorter adaptive step.
     offsets = (seq_lens.to(torch.int64) - committed_lens.to(torch.int64)).clamp_(
-        0, block_size
+        0, candidates.shape[1] // 2
     )
     columns = offsets[:, None] + torch.arange(
         block_size, device=device, dtype=torch.int64

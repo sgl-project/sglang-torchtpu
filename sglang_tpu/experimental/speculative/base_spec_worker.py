@@ -29,7 +29,7 @@ from __future__ import annotations
 import contextlib
 import itertools
 from abc import abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -54,6 +54,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    LogitsOutputMode,
     PPProxyTensors,
 )
 from sglang.srt.runtime_context import (
@@ -64,6 +65,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
     mamba_track_grid,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
@@ -84,6 +86,8 @@ from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolic
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
+from sglang_tpu.compilation.warmup_queue import eager_warmup
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.experimental import (
     pd_decode_draft_prefill,
     register_host_batch_padder,
@@ -106,10 +110,14 @@ from sglang_tpu.experimental.speculative.pd_hidden_pool import (
     register_pd_hidden_pool,
 )
 from sglang_tpu.experimental.speculative.spec_ops import (
-    accept_drafts_greedy,
-    accept_drafts_sampled,
-    accept_drafts_sampled_filtered,
-    accept_drafts_target_only,
+    TARGET_CANDIDATES,
+    accept_candidates_step,
+    accept_greedy_step,
+    accept_greedy_top_k_step,
+    accept_sampled_filtered_step,
+    accept_sampled_step,
+    accept_target_only_step,
+    accept_top_k_candidates_step,
     build_verify_tokens,
     finalize_accept,
     live_result_rows,
@@ -138,6 +146,7 @@ from sglang_tpu.mamba_pool import (
 )
 from sglang_tpu.overlap_utils_tpu import flush_direct_handoff_tpu
 from sglang_tpu.sampler import TpuSampler
+from sglang_tpu.top_k import register_tpu_top_k_ops
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
@@ -182,6 +191,11 @@ class TpuSpecWorker(BaseSpecWorker):
     and result packing are shared.
     """
 
+    supports_logprobs = False
+    # Opt in only when verification applies the scheduler's additive snapshot
+    # at the padded batch size. Live penalizer state is still unsupported.
+    supports_additive_penalties = False
+
     def __init__(
         self,
         target_worker: TpModelWorker,
@@ -212,7 +226,11 @@ class TpuSpecWorker(BaseSpecWorker):
         self.num_verify_rows = num_drafts + 1
         self.device = target_worker.device
         # Ranks that share one batch: the attention-TP group under DP attention.
-        self._tp_sync = SpecTpSync(get_dp_tp_group())
+        self._tp_group = get_dp_tp_group()
+        self._tp_sync = SpecTpSync(self._tp_group)
+        self._rank_check_interval = tpu_envs.SGLANG_TPU_SPEC_RANK_CHECK_INTERVAL.get()
+        self._block_verification = tpu_envs.SGLANG_TPU_SPEC_BLOCK_VERIFICATION.get()
+        self._verify_ct = 0
         self._dp_attention = is_dp_attention_enabled()
         if self._dp_attention and (
             envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
@@ -224,18 +242,11 @@ class TpuSpecWorker(BaseSpecWorker):
                 "TpuSpecWorker does not support mixed prefill/decode DP steps."
             )
         self._attn_tp_size = parallel.attn_tp_size
+        self._verify_top_k_width = self.verify_top_k_width()
         # An idle DP rank mirrors its peers' draft syncs without knowing whether they
         # sample; greedy drafts sync one [pbs, gamma] int64 either way, and sampled
         # requests take the target-only accept, as TPU EAGLE does.
         self._sampled_drafts = not self._dp_attention
-        if self._dp_attention and self._tp_sync.enabled(
-            SpecTpSyncSite.SPEC_ACCEPT_GREEDY
-        ) != self._tp_sync.enabled(SpecTpSyncSite.SPEC_ACCEPT_SAMPLE):
-            # An idle DP rank cannot tell which accept its peers ran.
-            raise ValueError(
-                "SGLANG_SPEC_TP_SYNC must enable both or neither spec-accept site "
-                "under DP attention."
-            )
         if self._dp_attention:
             _check_draft_lm_head_group(
                 draft_worker.model_runner.model, attn_tp_size=parallel.attn_tp_size
@@ -244,6 +255,8 @@ class TpuSpecWorker(BaseSpecWorker):
             mambaish_config(target_worker.model_runner.model_config) is not None
         )
         self._bucket: BucketState | None = None
+        # hash_uniforms counter; every TP rank advances it identically, once per sampled step.
+        self._rng_step = torch.zeros((1,), dtype=torch.int64).to(self.device)
         self._accept_threshold_single = get_spec().speculative_accept_threshold_single
         self._accept_threshold_acc = get_spec().speculative_accept_threshold_acc
         # Filled per batch bucket once the target compile policy exists.
@@ -383,6 +396,8 @@ class TpuSpecWorker(BaseSpecWorker):
 
     def init_cuda_graphs(self) -> None:
         super().init_cuda_graphs()
+        # accept_drafts_candidates' TopK op must exist before its first trace.
+        register_tpu_top_k_ops()
         # Before the Raiden manager, which registers it, and before its warmup.
         self._pd_hidden_pool = self._init_pd_hidden_pool()
         self._all_drafts = {
@@ -433,15 +448,32 @@ class TpuSpecWorker(BaseSpecWorker):
         torch.accelerator.synchronize()
         snapshot_recompilation_baseline()
 
-    def _warmup_logical_bs_ops(self) -> None:
+    @property
+    def verify_window_rows(self) -> int:
+        """Capacity for both the preceding commit and the next verification."""
+        return int(max_speculative_num_draft_tokens())
+
+    def verify_widths(self) -> Sequence[int]:
+        """Active widths to warm; adaptive workers override with every reachable width."""
+        return (self.num_verify_rows,)
+
+    def _warmup_logical_bs_ops(
+        self, *, batch_sizes: Sequence[int] | None = None
+    ) -> None:
         # torch_tpu compiles one program per shape even for a plain H2D copy.
         max_bs = min(
             self.target_worker.model_runner.max_running_requests,
             self._b_bucketer().max_val,
         )
-        live_sizes = range(1, max_bs + 1)
+        live_sizes = range(1, max_bs + 1) if batch_sizes is None else batch_sizes
         # Every bucket: DP attention can run any bucket above a rank's own.
-        bucket_sizes = list(self._b_bucketer().buckets)
+        bucket_sizes = (
+            list(self._b_bucketer().buckets)
+            if batch_sizes is None
+            else sorted(
+                {pbs for bs in live_sizes for pbs in self._decode_buckets_for(bs)}
+            )
+        )
         # Live bs: HOST_PADDED req_pool_indices re-uploaded after filter/merge.
         # Bucket: host-padded sampling params and the plan's padded verify window.
         h2d_shapes = (
@@ -452,9 +484,12 @@ class TpuSpecWorker(BaseSpecWorker):
                 for dtype in (torch.int64, torch.int32, torch.float32)
             ]
             + [((pbs, 1), torch.float32) for pbs in bucket_sizes]
-            + [((pbs, 2 * self.num_verify_rows), torch.int64) for pbs in bucket_sizes]
+            + [
+                ((pbs, 2 * self.verify_window_rows), torch.int64)
+                for pbs in bucket_sizes
+            ]
         )
-        with torch.no_grad():
+        with torch.no_grad(), eager_warmup() as materialize:
             for bs in live_sizes:
                 # _bucket_state pads the relayed live state to each bucket it can run.
                 for padded_bs in self._decode_buckets_for(bs):
@@ -466,22 +501,40 @@ class TpuSpecWorker(BaseSpecWorker):
                         padded_bs,
                     )
             for shape, dtype in h2d_shapes:
-                torch.zeros(shape, dtype=dtype).to(self.device, non_blocking=True).cpu()
+                materialize(
+                    torch.zeros(shape, dtype=dtype).to(self.device, non_blocking=True)
+                )
             for pbs in bucket_sizes:
                 # _bucket_state derives live_mask from the padded pool rows.
-                (torch.zeros((pbs,), dtype=torch.int64, device=self.device) != 0).cpu()
+                materialize(
+                    torch.zeros((pbs,), dtype=torch.int64, device=self.device) != 0
+                )
+            for width, pbs in itertools.product(self.verify_widths(), bucket_sizes):
+                # The generic spec-op context only knows the active width. The
+                # worker owns the full-capacity candidate shape used in serving.
+                warmup_compiled_op(
+                    select_verify_rows,
+                    torch.zeros(
+                        (pbs, 2 * self.verify_window_rows),
+                        dtype=torch.int64,
+                        device=self.device,
+                    ),
+                    torch.zeros((pbs,), dtype=torch.int64, device=self.device),
+                    torch.zeros((pbs,), dtype=torch.int64, device=self.device),
+                    width,
+                )
                 # Eager ops compile per input layout, so bump finalize_accept's output.
-                next_seq_lens = self._warmup_accept(pbs).next_seq_lens
-                (next_seq_lens + self.num_verify_rows).to(torch.int32).cpu()
+                next_seq_lens = self._warmup_accept(pbs, width).next_seq_lens
+                materialize((next_seq_lens + width).to(torch.int32))
 
-    def _warmup_accept(self, padded_bs: int) -> AcceptResult:
+    def _warmup_accept(self, padded_bs: int, width: int) -> AcceptResult:
         """finalize_accept outputs at padded_bs, the inputs eager consumers see while serving."""
 
         def zeros(*shape: int) -> torch.Tensor:
             return torch.zeros(shape, dtype=torch.int64, device=self.device)
 
         return finalize_accept(
-            zeros(padded_bs, self.num_drafts),
+            zeros(padded_bs, width - 1),
             zeros(padded_bs),
             zeros(padded_bs),
             zeros(padded_bs),
@@ -572,6 +625,15 @@ class TpuSpecWorker(BaseSpecWorker):
         Noop: never; the root tokens live only there.
         """
 
+    def verify_top_k_width(self) -> int | None:
+        """The target's distributed top-k width if this algorithm's verify may read only it.
+
+        Why: greedy and candidate acceptance need just the target's top-k, which the
+        verify reduces before the vocabulary gather instead of gathering every logit.
+        Noop: None keeps full-vocabulary verify logits.
+        """
+        return None
+
     @abstractmethod
     def state_to_spec_info(self, state: SpecState) -> SpecInput:
         """SpecState -> the next step's batch.spec_info.
@@ -581,7 +643,6 @@ class TpuSpecWorker(BaseSpecWorker):
         Noop: never.
         """
 
-    @abstractmethod
     def make_verify_input(
         self, *, batch: ScheduleBatch, verify_tokens: torch.Tensor, rows: VerifyRows
     ) -> SpecInput:
@@ -589,8 +650,10 @@ class TpuSpecWorker(BaseSpecWorker):
 
         Why: attention backends and the dynamo tracer key on the algorithm's
         verify type; its compile policy must warm the same structure.
-        Noop: never.
+        Workers using the shared verify or idle-verify path must implement this.
+        A custom verify may construct its spec_info directly.
         """
+        raise NotImplementedError("Shared verification requires make_verify_input().")
 
     def make_dummy_carry(self, rows: int) -> Any:
         """A zero draft_carry of rows rows on device, shaped and typed like serving.
@@ -611,34 +674,152 @@ class TpuSpecWorker(BaseSpecWorker):
         """Score [r, d] with the target in one forward and accept losslessly.
 
         The returned LogitsProcessorOutput holds [pbs * (N + 1), ...] verify rows:
-        next_token_logits is p, hidden_states is the target feature phi.
+        next_token_logits is p (or its distributed top-k when the accept reads only
+        that), hidden_states is the target feature phi.
         """
         verify_tokens = draft_result.verify_tokens
         if verify_tokens is None:
             verify_tokens = build_verify_tokens(
                 bucket.state.bonus_tokens, draft_result.draft_tokens
             )
+        spec_info = self.make_verify_input(
+            batch=batch,
+            verify_tokens=verify_tokens,
+            rows=rows,
+        )
         logits_output = self._forward_target_verify(
             batch=batch,
             bucket_state=bucket.state,
             verify_tokens=verify_tokens,
             rows=rows,
             verify_input=verify_input,
+            spec_info=spec_info,
+            logits_output_mode=self._verify_logits_output_mode(bucket, draft_result),
         )
-        target_logits = logits_output.next_token_logits
-        assert target_logits.shape[0] == draft_result.draft_tokens.shape[0] * (
-            self.num_verify_rows
-        ), "verify logits must keep the batch bucket rows"
-        if bucket.temperatures is None or bucket.top_ks is None:
-            num_correct_drafts, bonus_tokens = accept_drafts_greedy(
-                target_logits, draft_result.draft_tokens, draft_result.num_verify_drafts
+        accept = self._accept(bucket, draft_result, logits_output)
+        self._check_rank_agreement(accept)
+        return logits_output, accept
+
+    def _check_rank_agreement(self, accept: AcceptResult) -> None:
+        """Raise if TP ranks committed different tokens; nothing broadcasts them."""
+        if self._rank_check_interval <= 0 or self._tp_group.world_size == 1:
+            return
+        self._verify_ct += 1
+        if self._verify_ct % self._rank_check_interval:
+            return
+        digest = torch.stack(
+            [
+                self._rng_step.view(()),
+                accept.accept_tokens.sum(),
+                accept.next_seq_lens.sum(),
+            ]
+        ).cpu()
+        gathered = [torch.empty_like(digest) for _ in range(self._tp_group.world_size)]
+        torch.distributed.all_gather(gathered, digest, group=self._tp_group.cpu_group)
+        if any(not torch.equal(g, gathered[0]) for g in gathered):
+            raise RuntimeError(
+                f"TP ranks diverged at verify step {self._verify_ct}: "
+                f"[rng_step, sum(accept_tokens), sum(next_seq_lens)] per rank = "
+                f"{[g.tolist() for g in gathered]}"
             )
-            site = SpecTpSyncSite.SPEC_ACCEPT_GREEDY
+
+    def _verify_logits_output_mode(
+        self, bucket: BucketState, draft_result: DraftResult
+    ) -> LogitsOutputMode:
+        """DISTRIBUTED_TOP_K when the accept reads only the target's top-k (greedy or candidates)."""
+        if self._verify_top_k_width is None:
+            return LogitsOutputMode.FULL_VOCAB
+        if self._simulate_acc_len > 0:
+            return LogitsOutputMode.FULL_VOCAB
+        if bucket.temperatures is None or draft_result.draft_candidates is not None:
+            return LogitsOutputMode.DISTRIBUTED_TOP_K
+        return LogitsOutputMode.FULL_VOCAB
+
+    def _accept(
+        self,
+        bucket: BucketState,
+        draft_result: DraftResult,
+        logits_output: LogitsProcessorOutput,
+    ) -> AcceptResult:
+        """Accept and finalize in one program; ranks agree without a broadcast (hash_uniforms)."""
+        draft_tokens = draft_result.draft_tokens
+        state = bucket.state
+        num_rows = draft_tokens.shape[0] * self.num_verify_rows
+        if logits_output.has_next_token_global_top_k:
+            top_logits = logits_output.next_token_global_top_k_logits
+            top_ids = logits_output.next_token_global_top_k_token_ids
+            assert top_ids.shape == (num_rows, TARGET_CANDIDATES), top_ids.shape
+            if bucket.temperatures is None or bucket.top_ks is None:
+                return accept_greedy_top_k_step(
+                    top_ids,
+                    draft_tokens,
+                    draft_result.num_verify_drafts,
+                    state.seq_lens,
+                    bucket.live_mask,
+                )
+            assert draft_result.draft_candidates is not None
+            assert bucket.target_candidates
+            draft_ids, draft_logits = draft_result.draft_candidates
+            accept, self._rng_step = accept_top_k_candidates_step(
+                top_logits,
+                top_ids,
+                draft_tokens,
+                draft_result.num_verify_drafts,
+                draft_ids,
+                draft_logits,
+                bucket.temperatures,
+                bucket.top_ks,
+                state.seq_lens,
+                bucket.live_mask,
+                self._rng_step,
+                self._block_verification,
+            )
+            return accept
+        target_logits = logits_output.next_token_logits
+        assert target_logits.shape[0] == num_rows, (
+            "verify logits must keep the bucket rows"
+        )
+        if self._simulate_acc_len > 0:
+            num_correct_drafts, bonus_tokens, draft_tokens = self._simulated_accept(
+                draft_tokens.shape[0]
+            )
+            return finalize_accept(
+                draft_tokens,
+                num_correct_drafts,
+                bonus_tokens,
+                state.seq_lens,
+                bucket.live_mask,
+            )
+        if bucket.temperatures is None or bucket.top_ks is None:
+            return accept_greedy_step(
+                target_logits,
+                draft_tokens,
+                draft_result.num_verify_drafts,
+                state.seq_lens,
+                bucket.live_mask,
+            )
+        if draft_result.draft_candidates is not None:
+            # The draft only sends candidates when the bucket allows it.
+            assert bucket.target_candidates
+            draft_ids, draft_logits = draft_result.draft_candidates
+            accept, self._rng_step = accept_candidates_step(
+                target_logits,
+                draft_tokens,
+                draft_result.num_verify_drafts,
+                draft_ids,
+                draft_logits,
+                bucket.temperatures,
+                bucket.top_ks,
+                state.seq_lens,
+                bucket.live_mask,
+                self._rng_step,
+                self._block_verification,
+            )
         elif draft_result.draft_logits is None:
             # A deterministic draft is a one-hot q: TPU EAGLE's target-only rule.
-            num_correct_drafts, bonus_tokens = accept_drafts_target_only(
+            accept, self._rng_step = accept_target_only_step(
                 target_logits,
-                draft_result.draft_tokens,
+                draft_tokens,
                 draft_result.num_verify_drafts,
                 bucket.temperatures,
                 bucket.top_ks,
@@ -646,46 +827,37 @@ class TpuSpecWorker(BaseSpecWorker):
                 bucket.min_ps,
                 self._accept_threshold_single,
                 self._accept_threshold_acc,
+                state.seq_lens,
+                bucket.live_mask,
+                self._rng_step,
             )
-            site = SpecTpSyncSite.SPEC_ACCEPT_SAMPLE
         elif bucket.need_filters:
-            num_correct_drafts, bonus_tokens = accept_drafts_sampled_filtered(
+            accept, self._rng_step = accept_sampled_filtered_step(
                 target_logits,
-                draft_result.draft_tokens,
+                draft_tokens,
                 draft_result.num_verify_drafts,
                 draft_result.draft_logits.float(),
                 bucket.temperatures,
                 bucket.top_ks,
                 bucket.top_ps,
                 bucket.min_ps,
+                state.seq_lens,
+                bucket.live_mask,
+                self._rng_step,
             )
-            site = SpecTpSyncSite.SPEC_ACCEPT_SAMPLE
         else:
-            num_correct_drafts, bonus_tokens = accept_drafts_sampled(
+            accept, self._rng_step = accept_sampled_step(
                 target_logits,
-                draft_result.draft_tokens,
+                draft_tokens,
                 draft_result.num_verify_drafts,
                 draft_result.draft_logits.float(),
                 bucket.temperatures,
                 bucket.top_ks,
+                state.seq_lens,
+                bucket.live_mask,
+                self._rng_step,
             )
-            site = SpecTpSyncSite.SPEC_ACCEPT_SAMPLE
-        draft_tokens = draft_result.draft_tokens
-        if self._simulate_acc_len > 0:
-            num_correct_drafts, bonus_tokens, draft_tokens = self._simulated_accept(
-                draft_tokens.shape[0]
-            )
-        # Sampled acceptance draws per-rank randoms; ranks must commit rank 0's outcome.
-        self._tp_sync.sync(site, num_correct_drafts)
-        self._tp_sync.sync(site, bonus_tokens)
-        accept = finalize_accept(
-            draft_tokens,
-            num_correct_drafts,
-            bonus_tokens,
-            bucket.state.seq_lens,
-            bucket.live_mask,
-        )
-        return logits_output, accept
+        return accept
 
     def _simulated_accept(
         self, padded_bs: int
@@ -788,6 +960,7 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_input.verify_cache_candidates,
             verify_input.committed_lens,
             bucket.state.seq_lens,
+            self.num_verify_rows,
         )
         committed, logits_output, accept = self.step(batch, bucket, rows, verify_input)
         next_state = committed.state
@@ -885,7 +1058,7 @@ class TpuSpecWorker(BaseSpecWorker):
         """
         padded_bs = self._decode_bucket(batch, 0)
         verify_input = TpuSpecVerifyInput.idle(
-            num_verify_rows=self.num_verify_rows,
+            verify_window_rows=self.verify_window_rows,
             padded_bs=padded_bs,
             device=self.device,
         )
@@ -901,6 +1074,7 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_input.verify_cache_candidates,
             verify_input.committed_lens,
             state.seq_lens,
+            self.num_verify_rows,
         )
         # The forwards' preparation writes these; the idle batch must stay idle.
         with overridden_fields(
@@ -963,45 +1137,49 @@ class TpuSpecWorker(BaseSpecWorker):
         verify_input: TpuSpecVerifyInput,
         verify_tokens: torch.Tensor,
     ) -> LogitsProcessorOutput:
-        """verify()'s collectives on idle rows: the target forward and the accept broadcasts.
-
-        A collective over a DP rank's own TP group still needs every DP rank to
-        issue it, so the idle rank mirrors the [pbs] int64 accept broadcasts.
-        """
-        logits_output = self._forward_target_verify(
+        """verify()'s collectives on idle rows: the target forward (accept broadcasts nothing)."""
+        # DP attention gathers full logits (no distributed top-k), as the active ranks do.
+        assert self._verify_top_k_width is None
+        return self._forward_target_verify(
             batch=batch,
             bucket_state=state,
             verify_tokens=verify_tokens,
             rows=rows,
             verify_input=verify_input,
+            spec_info=self.make_verify_input(
+                batch=batch, verify_tokens=verify_tokens, rows=rows
+            ),
+            logits_output_mode=LogitsOutputMode.FULL_VOCAB,
         )
-        site = SpecTpSyncSite.SPEC_ACCEPT_GREEDY
-        padded_bs = state.seq_lens.shape[0]
-        self._tp_sync.sync(site, self._device_zeros(padded_bs))
-        self._tp_sync.sync(site, self._device_zeros(padded_bs))
-        return logits_output
 
     def _warmup_target_only_accept(self) -> None:
         """Target-only acceptance, target filter included, per batch bucket."""
         vocab_size = self.target_worker.model_runner.model_config.vocab_size
         with torch.no_grad():
-            for padded_bs in self._b_bucketer().buckets:
+            for width, padded_bs in itertools.product(
+                self.verify_widths(), self._b_bucketer().buckets
+            ):
                 warmup_compiled_op(
-                    accept_drafts_target_only,
+                    accept_target_only_step,
                     torch.zeros(
-                        (padded_bs * self.num_verify_rows, vocab_size),
+                        (padded_bs * width, vocab_size),
                         dtype=torch.float32,
                         device=self.device,
                     ),
                     torch.zeros(
-                        (padded_bs, self.num_drafts),
+                        (padded_bs, width - 1),
                         dtype=torch.int64,
                         device=self.device,
                     ),
-                    self._all_drafts[padded_bs],
+                    torch.full(
+                        (padded_bs,), width - 1, dtype=torch.int32, device=self.device
+                    ),
                     *self._sampling_param_warmup_args(padded_bs),
                     self._accept_threshold_single,
                     self._accept_threshold_acc,
+                    self._device_zeros(padded_bs),
+                    torch.ones((padded_bs,), dtype=torch.bool, device=self.device),
+                    self._rng_step,
                 )
 
     def sync_target_tokens(self, next_token_ids: torch.Tensor) -> torch.Tensor:
@@ -1037,7 +1215,7 @@ class TpuSpecWorker(BaseSpecWorker):
         # A multimodal wrapper's eager outer logits processor emits live rows,
         # which TpuSampler pads to the batch bucket (whatever the input modality).
         eager_logits = not self._compile_policy()._compiles_logits_processor()
-        with torch.no_grad():
+        with torch.no_grad(), eager_warmup() as materialize:
             for pbs in sorted({self._pad_bs(bs) for bs in extend_sizes}):
                 for variant in _SAMPLING_WARMUP_VARIANTS:
                     # A target that keeps extend outputs padded samples all cap rows,
@@ -1062,33 +1240,40 @@ class TpuSpecWorker(BaseSpecWorker):
                             torch.zeros((rows,), dtype=torch.int64, device=self.device),
                         )
                         # extend() broadcasts these tokens; the collective compiles per shape.
-                        self.sync_target_tokens(next_token_ids).cpu()
+                        materialize(self.sync_target_tokens(next_token_ids))
             if self._dp_attention:
                 # A DP rank without prompts syncs no rows.
-                self.sync_target_tokens(
-                    torch.zeros((0,), dtype=torch.int64, device=self.device)
-                ).cpu()
+                materialize(
+                    self.sync_target_tokens(
+                        torch.zeros((0,), dtype=torch.int64, device=self.device)
+                    )
+                )
             for bs in extend_sizes:
                 # The shim pads the device-resident extend bs fields (seq_lens,
                 # req_pool_indices int64; orig_seq_lens int32) to the cap.
                 for dtype in (torch.int64, torch.int32):
-                    torch.nn.functional.pad(
-                        torch.zeros((bs,), dtype=dtype).to(self.device), (0, cap - bs)
-                    ).cpu()
+                    materialize(
+                        torch.nn.functional.pad(
+                            torch.zeros((bs,), dtype=dtype).to(self.device),
+                            (0, cap - bs),
+                        )
+                    )
                 # ModelRunner.sample positions, then the block-draft extend trim; a
                 # target that keeps extend outputs padded samples at the cap rows.
-                (torch.zeros((bs,), dtype=torch.int64).to(self.device) - 1).cpu()
+                materialize(torch.zeros((bs,), dtype=torch.int64).to(self.device) - 1)
                 for rows in {self._pad_bs(bs), cap}:
-                    torch.zeros((rows,), dtype=torch.int64, device=self.device)[
-                        :bs
-                    ].cpu()
+                    materialize(
+                        torch.zeros((rows,), dtype=torch.int64, device=self.device)[:bs]
+                    )
                 if eager_logits and self._pad_bs(bs) != bs:
-                    torch.nn.functional.pad(
-                        torch.zeros((bs, vocab_size), dtype=torch.float32).to(
-                            self.device
-                        ),
-                        (0, 0, 0, self._pad_bs(bs) - bs),
-                    ).cpu()
+                    materialize(
+                        torch.nn.functional.pad(
+                            torch.zeros((bs, vocab_size), dtype=torch.float32).to(
+                                self.device
+                            ),
+                            (0, 0, 0, self._pad_bs(bs) - bs),
+                        )
+                    )
 
     def _warmup_extend_logits(
         self, cap: int, rows: int, vocab_size: int
@@ -1118,8 +1303,9 @@ class TpuSpecWorker(BaseSpecWorker):
         self, padded_bs: int, draft_tokens: torch.Tensor, draft_logits: torch.Tensor
     ) -> None:
         """verify's sampled acceptance at padded_bs, with and without target filters."""
+        width = draft_tokens.shape[1] + 1
         target_logits = torch.zeros(
-            (padded_bs * self.num_verify_rows, draft_logits.shape[-1]),
+            (padded_bs * width, draft_logits.shape[-1]),
             dtype=torch.float32,
             device=self.device,
         )
@@ -1129,13 +1315,65 @@ class TpuSpecWorker(BaseSpecWorker):
         args = (
             target_logits,
             draft_tokens,
-            self._all_drafts[padded_bs],
+            torch.full((padded_bs,), width - 1, dtype=torch.int32, device=self.device),
             draft_logits.float(),
             temperatures,
             top_ks,
         )
-        warmup_compiled_op(accept_drafts_sampled, *args)
-        warmup_compiled_op(accept_drafts_sampled_filtered, *args, top_ps, min_ps)
+        tail = (
+            self._device_zeros(padded_bs),
+            torch.ones((padded_bs,), dtype=torch.bool, device=self.device),
+            self._rng_step,
+        )
+        warmup_compiled_op(accept_sampled_step, *args, *tail)
+        warmup_compiled_op(accept_sampled_filtered_step, *args, top_ps, min_ps, *tail)
+
+    def _warmup_candidates_accept(
+        self,
+        padded_bs: int,
+        draft_tokens: torch.Tensor,
+        draft_candidates: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
+        """verify's candidates acceptance at padded_bs, for drafts sending a q on candidates."""
+        vocab_size = self.target_worker.model_runner.model_config.vocab_size
+        temperatures, top_ks, _, _ = self._sampling_param_warmup_args(padded_bs)
+        if self._verify_top_k_width is not None:
+            rows = padded_bs * self.num_verify_rows
+            warmup_compiled_op(
+                accept_top_k_candidates_step,
+                torch.zeros(
+                    (rows, TARGET_CANDIDATES), dtype=torch.float32, device=self.device
+                ),
+                torch.zeros(
+                    (rows, TARGET_CANDIDATES), dtype=torch.int32, device=self.device
+                ),
+                draft_tokens,
+                self._all_drafts[padded_bs],
+                *draft_candidates,
+                temperatures,
+                top_ks,
+                self._device_zeros(padded_bs),
+                torch.ones((padded_bs,), dtype=torch.bool, device=self.device),
+                self._rng_step,
+                self._block_verification,
+            )
+        warmup_compiled_op(
+            accept_candidates_step,
+            torch.zeros(
+                (padded_bs * self.num_verify_rows, vocab_size),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            draft_tokens,
+            self._all_drafts[padded_bs],
+            *draft_candidates,
+            temperatures,
+            top_ks,
+            self._device_zeros(padded_bs),
+            torch.ones((padded_bs,), dtype=torch.bool, device=self.device),
+            self._rng_step,
+            self._block_verification,
+        )
 
     def _warmup_relay_and_results(self) -> None:
         """FutureMap relay and result D2H run per live bs outside any compiled op."""
@@ -1152,8 +1390,10 @@ class TpuSpecWorker(BaseSpecWorker):
                 # Decode relays [:bs] views of finalize_accept's outputs at each bucket
                 # the rank can run; extend relays a compact seq_lens upload.
                 relays = []
-                for padded_bs in self._decode_buckets_for(bs):
-                    accept = self._warmup_accept(padded_bs)
+                for width, padded_bs in itertools.product(
+                    self.verify_widths(), self._decode_buckets_for(bs)
+                ):
+                    accept = self._warmup_accept(padded_bs, width)
                     relays.append(
                         (
                             accept.bonus_tokens[:bs],
@@ -1197,19 +1437,23 @@ class TpuSpecWorker(BaseSpecWorker):
                         future_map.topk_p_buf,
                         future_map.topk_index_buf,
                         future_map.output_tokens_buf,
-                        future_map.hidden_states_buf
-                        if future_map.need_hidden_states
-                        else None,
+                        (
+                            future_map.hidden_states_buf
+                            if future_map.need_hidden_states
+                            else None
+                        ),
                     ):
                         if tensor is not None:
                             tensor.cpu()
-                for padded_bs in self._decode_buckets_for(bs):
+                for width, padded_bs in itertools.product(
+                    self.verify_widths(), self._decode_buckets_for(bs)
+                ):
                     if padded_bs != bs:
                         # _pack_decode_result's rows.
                         warmup_compiled_op(
                             live_result_rows,
                             torch.zeros(
-                                (padded_bs, self.num_verify_rows),
+                                (padded_bs, width),
                                 dtype=torch.int64,
                                 device=self.device,
                             ),
@@ -1219,10 +1463,12 @@ class TpuSpecWorker(BaseSpecWorker):
                             bs,
                         )
             if self._dp_attention:
-                for padded_bs in self._b_bucketer().buckets:
+                for width, padded_bs in itertools.product(
+                    self.verify_widths(), self._b_bucketer().buckets
+                ):
                     # _forward_idle_step's all-padding drafts.
                     torch.zeros(
-                        (padded_bs, self.num_drafts),
+                        (padded_bs, width - 1),
                         dtype=torch.int64,
                         device=self.device,
                     ).cpu()
@@ -1348,11 +1594,9 @@ class TpuSpecWorker(BaseSpecWorker):
         verify_tokens: torch.Tensor,
         rows: VerifyRows,
         verify_input: TpuSpecVerifyInput,
+        spec_info: SpecInput,
     ) -> ForwardBatch:
         """TARGET_VERIFY ForwardBatch already at the [pbs, N + 1] bucket; the shim pads nothing."""
-        spec_info = self.make_verify_input(
-            batch=batch, verify_tokens=verify_tokens, rows=rows
-        )
         batch.out_cache_loc = rows.flat_cache_locs
         with self._bucket_view(
             batch,
@@ -1404,6 +1648,8 @@ class TpuSpecWorker(BaseSpecWorker):
         verify_tokens: torch.Tensor,
         rows: VerifyRows,
         verify_input: TpuSpecVerifyInput,
+        spec_info: SpecInput,
+        logits_output_mode: LogitsOutputMode,
     ) -> LogitsProcessorOutput:
         verify_forward_batch = self._build_verify_batch(
             batch=batch,
@@ -1411,7 +1657,9 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_tokens=verify_tokens,
             rows=rows,
             verify_input=verify_input,
+            spec_info=spec_info,
         )
+        verify_forward_batch.logits_output_mode = logits_output_mode
         # Keep logits/hidden on the batch bucket so the compiled accept op needs no re-pad.
         assert verify_forward_batch.spec_info is not None
         verify_forward_batch.spec_info.keep_outputs_padded = True
@@ -1422,7 +1670,7 @@ class TpuSpecWorker(BaseSpecWorker):
             # prepare_for_verify leaves TPU attention metadata to the runner.
             skip_attn_backend_init=False,
         )
-        # Custom logit processors, penalties and logit bias are rejected up front.
+        # Algorithm-specific verifiers own any supported logits adjustments.
         return target_out.logits_output
 
     @staticmethod
@@ -1445,9 +1693,7 @@ class TpuSpecWorker(BaseSpecWorker):
         # The scheduler relays and accounts per live request, so cut the bucket rows here.
         next_token_ids, accept_lens = self._live_result_rows(accept, bs)
         new_seq_lens = next_state.seq_lens[:bs]
-        logits_output.next_token_logits = logits_output.next_token_logits[
-            : bs * self.num_verify_rows
-        ]
+        logits_output.trim_next_token_outputs(bs * self.num_verify_rows)
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=next_token_ids,
@@ -1505,7 +1751,7 @@ class TpuSpecWorker(BaseSpecWorker):
             raise NotImplementedError("TpuSpecWorker under PP only extends.")
         if batch.has_grammar:
             raise NotImplementedError("TpuSpecWorker does not support grammar.")
-        if batch.return_logprob:
+        if batch.return_logprob and not self.supports_logprobs:
             raise NotImplementedError("TpuSpecWorker does not support logprobs.")
         sampling_info = batch.sampling_info
         if sampling_info is None:
@@ -1514,7 +1760,10 @@ class TpuSpecWorker(BaseSpecWorker):
         # would compile per batch-size pair.
         if (
             sampling_info.logit_bias is not None
-            or sampling_info.acc_additive_penalties is not None
+            or (
+                sampling_info.acc_additive_penalties is not None
+                and not self.supports_additive_penalties
+            )
             or sampling_info.acc_scaling_penalties is not None
             or (
                 sampling_info.penalizer_orchestrator is not None
@@ -1526,8 +1775,9 @@ class TpuSpecWorker(BaseSpecWorker):
             )
         # The sort-based target filter keeps different boundary ties than the
         # verify filter, so filtered sampling needs the sort-free path on both.
-        if not self._bsearch_filtering and any(
-            _sampled_row_filters(sampling_info).values()
+        filters = _sampled_row_filters(sampling_info)
+        if not self._bsearch_filtering and (
+            filters["need_top_k"] or filters["need_top_p"] or filters["need_min_p"]
         ):
             raise NotImplementedError(
                 "TpuSpecWorker needs SGLANG_TPU_ENABLE_BSEARCH_SAMPLING for "
@@ -1557,8 +1807,13 @@ def _sampled_row_filters(sampling_info: SamplingBatchInfo) -> dict[str, bool]:
         sampling_info.min_ps,
     )
     sampled = top_ks > 1
+    need_top_p = bool((sampled & (top_ps < 1.0)).any())
+    need_min_p = bool((sampled & (min_ps > 0.0)).any())
     return {
         "need_top_k": bool((sampled & (top_ks < sampling_info.vocab_size)).any()),
-        "need_top_p": bool((sampled & (top_ps < 1.0)).any()),
-        "need_min_p": bool((sampled & (min_ps > 0.0)).any()),
+        "need_top_p": need_top_p,
+        "need_min_p": need_min_p,
+        "target_candidates": not need_top_p
+        and not need_min_p
+        and bool((top_ks[sampled] <= TARGET_CANDIDATES).all()),
     }

@@ -198,12 +198,15 @@ fi
 
 # Pods 1-3 are standalone engines that outlive a finished leader, holding the JobSet
 # open until its deadline; leave once the leader's LB, seen healthy, stops answering.
-# A failed leader fails the JobSet on its own.
-LEADER_LB="http://${SLICE_HOSTS[0]}:$LB_PORT/health"
+# A failed leader fails the JobSet on its own. Any HTTP answer means the LB process is
+# up: /health now also fails while an engine is down, and older sglang-router wheels
+# answer /liveness with 404, which still proves the LB is alive.
+LEADER_LB="http://${SLICE_HOSTS[0]}:$LB_PORT/liveness"
 LEADER_GONE_POLLS=6
 seen=0 misses=0
 while kill -0 "$ENGINE_PID" 2>/dev/null; do
-    if curl -sf -o /dev/null -m "$CURL_MAX_TIME" "$LEADER_LB"; then
+    code=$(curl -s -o /dev/null -m "$CURL_MAX_TIME" -w "%{http_code}" "$LEADER_LB" 2>/dev/null || true)
+    if [[ -n "$code" && "$code" != "000" ]]; then
         seen=1 misses=0
     elif (( seen && ++misses >= LEADER_GONE_POLLS )); then
         echo "[serve_group] leader LB $LEADER_LB gone for $misses polls; rank $WORKER_ID exiting"

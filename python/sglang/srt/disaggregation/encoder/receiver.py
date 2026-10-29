@@ -21,7 +21,7 @@ import uvicorn
 import zmq
 import zmq.asyncio
 from aiohttp import ClientSession, ClientTimeout
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response
 from transformers import PretrainedConfig
 
@@ -893,6 +893,8 @@ class WaitingMMRequestBase(ABC):
         self.rid = rid
         self.recv_req = recv_req
         self.mm_inputs = None
+        # Scheduler ticks spent ready but held back for pending batch-mates.
+        self.held_ticks = 0
         self.error = None
         self.thread = None
         self.mm_processor = mm_processor
@@ -933,6 +935,12 @@ class WaitingMMRequestBase(ABC):
     @abstractmethod
     def send_encode_request(self) -> None:
         """Kick off the transport-specific encode / receive flow."""
+
+    def still_receiving(self) -> bool:
+        """Pending on embedding parts that have not all arrived (not just on pool space)."""
+        return self.status == WaitingMMRequestStatus.PENDING and not (
+            self.recv_embedding_data is not None and self.recv_embedding_data.ready
+        )
 
     def _try_recv_mm_data(self):
         if self.status != WaitingMMRequestStatus.PENDING:
@@ -2234,16 +2242,22 @@ class MMReceiverBase(ABC):
             )
             encode_thread.start()
             return scheduler_dispatch_ready
+        elif mm_data:
+            # A language-only server does not warm its vision tower, so encoding
+            # locally would compile per image shape instead of failing visibly.
+            logger.warning(
+                f"No encoder URLs available for request {obj.rid}; "
+                "rejecting instead of encoding locally."
+            )
+            raise HTTPException(
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                detail=(
+                    f"No encoder is registered to embed the {len(mm_data)} "
+                    "multimodal item(s) in this request."
+                ),
+            )
         else:
-            # No encoder URLs available (bootstrap may not have any registered yet);
-            # reset the flag so the scheduler does not wait for embeddings that will
-            # never arrive.  A warning is emitted so the user can diagnose why
-            # disaggregation is not happening for this request.
-            if mm_data:
-                logger.warning(
-                    f"No encoder URLs available for request {obj.rid}; "
-                    "processing without encoder disaggregation."
-                )
+            # Nothing to dispatch; the scheduler must not wait for embeddings.
             obj.need_wait_for_mm_inputs = False
             return None
 
@@ -2422,17 +2436,31 @@ class MMReceiverBase(ABC):
                 waiting_req.close_recv_socket()
             local_status.append(waiting_req.status)
 
-        local_status = torch.tensor(local_status, device="cpu", dtype=torch.int32)
-
+        # One MIN all-reduce carries both the statuses and, negated, whether any
+        # rank is still receiving each request's embedding parts.
+        num_waiting = len(self.waiting_list)
+        reduced = torch.tensor(
+            local_status
+            + [int(not req.still_receiving()) for req in self.waiting_list],
+            device="cpu",
+            dtype=torch.int32,
+        )
         torch.distributed.all_reduce(
-            local_status,
+            reduced,
             op=torch.distributed.ReduceOp.MIN,
             group=self.tp_group.cpu_group,
         )
+        local_status = reduced[:num_waiting]
+        receiving = reduced[num_waiting:] == 0
 
+        hold_ready = self._hold_ready_requests(local_status, receiving)
         new_waiting = []
         for i, waiting_req in enumerate(self.waiting_list):
             status_value = local_status[i].item()
+            if status_value == WaitingMMRequestStatus.SUCCESS and hold_ready:
+                waiting_req.held_ticks += 1
+                new_waiting.append(waiting_req)
+                continue
             if status_value == WaitingMMRequestStatus.SUCCESS:
                 new_recv_reqs.append(waiting_req.recv_req)
             elif status_value == WaitingMMRequestStatus.FAIL:
@@ -2470,6 +2498,34 @@ class MMReceiverBase(ABC):
 
         self.waiting_list = new_waiting
         return new_recv_reqs, abort_reqs
+
+    def _hold_ready_requests(
+        self, statuses: torch.Tensor, receiving: torch.Tensor
+    ) -> bool:
+        """Whether to keep ready requests back so batch-mates still receiving prefill with them.
+
+        Embeddings of one encoder batch reach the TP ranks over several ticks, and
+        each partial release would interrupt decode for its own prefill. A request
+        whose parts all arrived but waits for pool space is not waited for: held
+        requests may be what occupies the pool. Decided from TP-reduced values and
+        tick counts only, so every rank agrees.
+        """
+        max_ticks = envs.SGLANG_ENCODER_RECEIVER_COALESCE_TICKS.get()
+        if (
+            max_ticks <= 0
+            or self.scheduler is None
+            or self.scheduler.running_batch.is_empty()
+        ):
+            return False
+        ready = statuses == WaitingMMRequestStatus.SUCCESS
+        if not bool(ready.any()) or not bool(receiving.any()):
+            return False
+        oldest_held = max(
+            req.held_ticks
+            for req, is_ready in zip(self.waiting_list, ready.tolist())
+            if is_ready
+        )
+        return oldest_held < max_ticks
 
     def _run_encode_in_thread(
         self,
@@ -2513,7 +2569,9 @@ class MMReceiverBase(ABC):
         req = Req(
             recv_req.rid,
             recv_req.input_text,
-            recv_req.input_ids,
+            # A request still waiting on its encoder has no input_ids yet; the
+            # abort it is built for must still stream.
+            recv_req.input_ids if recv_req.input_ids is not None else array("q"),
             recv_req.sampling_params,
             return_logprob=recv_req.return_logprob,
             top_logprobs_num=recv_req.top_logprobs_num,

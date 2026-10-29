@@ -19,10 +19,17 @@ class ChainDraftForwardInput(DFlashVerifyInput):
       hidden_states: [rows, D] target aux features or the draft's own hidden.
       rpa_draft_kv_lens: [pbs] int32 absolute KV length of the current fused draft
         step; None outside the fused draft, where the attention metadata holds it.
+      dsa_seed_topk_capture: [rows, W] int32 buffer an extend-shaped draft forward
+        publishes its DSA top-k rows into (IndexTopKShareState.publish); None
+        when the draft does not share its indexer top-k.
+      dsa_seed_topk_select: [rows] int64 forward rows the capture keeps, or None
+        to keep the first rows.
     """
 
     hidden_states: torch.Tensor | None = None
     rpa_draft_kv_lens: torch.Tensor | None = None
+    dsa_seed_topk_capture: torch.Tensor | None = None
+    dsa_seed_topk_select: torch.Tensor | None = None
 
 
 @functools.cache
@@ -39,7 +46,11 @@ def register_chain_draft_pytree() -> None:
 
 
 def chain_draft_forward_input(
-    *, hidden_states: torch.Tensor, width: int
+    *,
+    hidden_states: torch.Tensor,
+    width: int,
+    dsa_seed_topk_capture: torch.Tensor | None = None,
+    dsa_seed_topk_select: torch.Tensor | None = None,
 ) -> ChainDraftForwardInput:
     device = hidden_states.device
     return ChainDraftForwardInput(
@@ -48,4 +59,19 @@ def chain_draft_forward_input(
         draft_token_num=width,
         custom_mask=None,
         hidden_states=hidden_states,
+        dsa_seed_topk_capture=dsa_seed_topk_capture,
+        dsa_seed_topk_select=dsa_seed_topk_select,
     )
+
+
+def dsa_seed_topk_buffer(
+    *, num_rows: int, width: int | None, device: torch.device | str
+) -> torch.Tensor | None:
+    """The [num_rows, width] capture a draft forward publishes its DSA top-k into.
+
+    None when width is None (the draft runs its indexer every step). Warmup and
+    serving must both build it here: the compiled forward guards on its shape.
+    """
+    if width is None:
+        return None
+    return torch.empty((num_rows, width), dtype=torch.int32, device=device)

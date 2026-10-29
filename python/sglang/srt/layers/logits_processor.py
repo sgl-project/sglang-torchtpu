@@ -289,6 +289,9 @@ class LogitsProcessorOutput:
 
     # Sampled draft token IDs when draft sampling is fused into draft model forward
     next_draft_tokens: Optional[torch.Tensor] = None
+    # DFlash2 candidate ids [bs, gamma, K] and scores [bs, gamma, K, K] from the
+    # draft forward, so sampled drafting reuses them instead of rebuilding.
+    next_draft_lattice: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
@@ -320,18 +323,23 @@ class LogitsProcessorOutput:
         """Remove padded rows while preserving global TopK pair alignment.
         TopK rows default to the full-logits row count when not specified."""
 
-        if self.next_token_logits is not None:
+        if (
+            self.next_token_logits is not None
+            and self.next_token_logits.shape[0] > logits_rows
+        ):
             self.next_token_logits = self.next_token_logits[:logits_rows]
         if self.has_next_token_global_top_k:
             global_top_k_rows = (
                 logits_rows if global_top_k_rows is None else global_top_k_rows
             )
-            self.next_token_global_top_k_logits = self.next_token_global_top_k_logits[
-                :global_top_k_rows
-            ]
-            self.next_token_global_top_k_token_ids = (
-                self.next_token_global_top_k_token_ids[:global_top_k_rows]
-            )
+            if self.next_token_global_top_k_logits.shape[0] > global_top_k_rows:
+                self.next_token_global_top_k_logits = (
+                    self.next_token_global_top_k_logits[:global_top_k_rows]
+                )
+            if self.next_token_global_top_k_token_ids.shape[0] > global_top_k_rows:
+                self.next_token_global_top_k_token_ids = (
+                    self.next_token_global_top_k_token_ids[:global_top_k_rows]
+                )
 
     def finalize_input_logprobs(self) -> None:
         if self.input_logprobs_copy_done is None:

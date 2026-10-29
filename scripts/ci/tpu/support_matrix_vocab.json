@@ -76,6 +76,9 @@
     "gemma4-26b-a4b": {
       "name": "Gemma 4 26B-A4B"
     },
+    "glm-5.3-flash": {
+      "name": "GLM-5.3-Flash"
+    },
     "wan2.2-ti2v-5b": {
       "name": "Wan2.2-TI2V-5B"
     }
@@ -96,6 +99,7 @@
     "pcp": "Prefill context parallel",
     "pp": "Pipeline parallel",
     "pd": "PD disaggregation",
+    "epd": "EPD (standalone vision encode server)",
     "tp-reshard": {
       "name": "PD TP resharding",
       "aliases": [
@@ -104,7 +108,13 @@
     },
     "decode-radix": "PD decode-side radix reuse",
     "prefix-cache": "Prefix cache",
-    "kv-offload": "HiCache KV offload",
+    "kv-offload": {
+      "name": "HiCache KV offload",
+      "aliases": [
+        "hicache"
+      ]
+    },
+    "l3-file": "HiCache L3 storage (file backend)",
     "logprob": "Prompt logprobs",
     "compile": "torch.compile",
     "torch-compile": "torch.compile bundles",

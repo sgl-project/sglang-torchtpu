@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
+    LogitsOutputMode,
 )
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.models.dspark import DSparkDraftModel
@@ -53,6 +54,12 @@ class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
         if not isinstance(model, DFlashDraftModel):
             raise TypeError(f"Expected a DFlashDraftModel draft, got {type(model)}.")
         return block_draft_width(model, self.draft_token_num)
+
+    def target_verify_logits_output_modes(self) -> tuple[LogitsOutputMode, ...]:
+        # TpuBlockSpecWorker.verify_top_k_width reads the same negotiated width.
+        if self.is_draft_worker or self._distributed_top_k_width() is None:
+            return (LogitsOutputMode.FULL_VOCAB,)
+        return (LogitsOutputMode.FULL_VOCAB, LogitsOutputMode.DISTRIBUTED_TOP_K)
 
     def make_null_spec_info(self) -> DFlashVerifyInput:
         # Same structure as TpuBlockSpecWorker's draft block input, so the draft trace matches.

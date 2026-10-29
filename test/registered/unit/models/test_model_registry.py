@@ -36,6 +36,7 @@ DEFAULT_PACKAGE = "sglang.srt.models"
 FAKE_PACKAGES = {
     DEFAULT_PACKAGE: {"DefaultArch": _DefaultModel, "SharedArch": _DefaultModel},
     "another.models": {"DefaultArch": _ExternalModel},
+    "backend.models": {"BackendArch": _ExternalModel},
 }
 EXTERNAL_MODELS = {"ExternalArch": _ExternalModel, "SharedArch": _ExternalOverride}
 
@@ -85,6 +86,33 @@ class TestLazyDefaultModels(CustomTestCase):
         with self.assertRaises(ValueError):
             self.registry.register("another.models")
         self.assertEqual(self.import_calls, [DEFAULT_PACKAGE, "another.models"])
+
+    def test_lazy_backend_preserves_external_fast_path_and_default_fallback(self):
+        self.registry.register_lazy("backend.models")
+        self.assertIs(
+            self.registry.resolve_model_cls("ExternalArch")[0], _ExternalModel
+        )
+        self.assertEqual(self.import_calls, [])
+        self.assertIs(self.registry.resolve_model_cls("BackendArch")[0], _ExternalModel)
+        self.assertIs(self.registry.resolve_model_cls("DefaultArch")[0], _DefaultModel)
+        self.assertEqual(self.import_calls, [DEFAULT_PACKAGE, "backend.models"])
+
+    def test_lazy_registration_after_defaults_preserves_eager_overwrite(self):
+        self.registry.get_supported_archs()
+        self.import_calls.clear()
+        self.registry.register_lazy("backend.models")
+        self.assertEqual(self.import_calls, [])
+
+        self.registry.register("another.models", overwrite=True)
+        self.assertEqual(self.import_calls, ["backend.models", "another.models"])
+        self.assertIs(self.registry.resolve_model_cls("BackendArch")[0], _ExternalModel)
+        self.assertIs(self.registry.resolve_model_cls("DefaultArch")[0], _ExternalModel)
+
+    def test_lazy_duplicate_still_fails_when_catalog_is_loaded(self):
+        self.registry.register_lazy("another.models")
+        for _ in range(2):
+            with self.assertRaisesRegex(ValueError, "DefaultArch already registered"):
+                self.registry.get_supported_archs()
 
 
 if __name__ == "__main__":

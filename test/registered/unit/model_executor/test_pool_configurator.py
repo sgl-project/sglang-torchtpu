@@ -1920,12 +1920,13 @@ class TestSWAPoolFloor(CustomTestCase):
         self.assertEqual(planner.bytes_per_full_token, expected_full)
         mrr = 64
         num_req_slots = mrr + 1
-        c4_rows = 4 + num_req_slots * max(planner.ring_sizes[4], 32) + 8192
+        state_pages = 1 + num_req_slots * 32 + 2048
+        c4_rows = state_pages * 4
         self.assertEqual(
             planner._fixed_c4_state_bytes(mrr),
             c4_rows * (4 * 512 * 4 + 4 * 128 * 4) * 21,
         )
-        c128_rows = 8 + num_req_slots * max(planner.ring_sizes[128], 256) + 8192
+        c128_rows = state_pages * 8
         self.assertEqual(
             planner._get_c128_state_fixed_bytes(mrr),
             c128_rows * (2 * 512 * 4) * 21,

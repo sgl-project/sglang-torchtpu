@@ -2293,6 +2293,10 @@ class FreezeGCReq(BaseReq, kw_only=True):
     pass
 
 
+class FreezeGCReqOutput(BaseReq, kw_only=True):
+    pass
+
+
 class ShutdownReq(BaseReq, kw_only=True):
     # Broadcast across TP ranks via the normal recv path, so all ranks break
     # the scheduler loop on the same iteration.

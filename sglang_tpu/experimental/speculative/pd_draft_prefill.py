@@ -118,11 +118,13 @@ def prebuilt_extend_view(
         dtype=torch.int64,
     )
     view.out_cache_loc = batch.out_cache_loc[starts[0] : starts[-1]]
-    view.req_pool_indices = batch.req_pool_indices[group.start : group.stop]
+    # Host copies: the shim pads them on host and uploads at the bucket, while a
+    # device slice would compile a pad per group size and offset.
     view.req_pool_indices_cpu = batch.req_pool_indices_cpu[group.start : group.stop]
-    view.seq_lens = batch.seq_lens[group.start : group.stop]
+    view.req_pool_indices = view.req_pool_indices_cpu.clone()
     view.seq_lens_cpu = batch.seq_lens_cpu[group.start : group.stop]
-    view.orig_seq_lens = batch.orig_seq_lens[group.start : group.stop]
+    view.seq_lens = view.seq_lens_cpu.clone()
+    view.orig_seq_lens = view.seq_lens_cpu.to(torch.int32)
     view.seq_lens_sum = int(view.seq_lens_cpu.sum())
     view.prefix_lens = prefix_lens
     view.extend_lens = extend_lens

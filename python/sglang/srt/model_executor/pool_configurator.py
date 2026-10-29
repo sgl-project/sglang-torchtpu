@@ -1656,8 +1656,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         ring_size = self.ring_sizes[128]
 
         if self._is_tpu_dsv4:
-            ring_tokens = max(ring_size, 256)
-            state_rows = 8 + num_req_slots * ring_tokens + 8192
+            state_pages = 1 + num_req_slots * 32 + 2048
+            state_rows = state_pages * 8
             return state_rows * (2 * self.attn_head_dim * 4) * num_layers
 
         _, c128_state_dtype_size = _get_dsv4_compress_state_dtype_sizes()
@@ -1701,8 +1701,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         if self._is_tpu_dsv4:
             num_req_slots = self._get_num_req_slots(max_running_requests)
-            ring_tokens = max(self.ring_sizes[4], 32)
-            state_rows = 4 + num_req_slots * ring_tokens + 8192
+            state_pages = 1 + num_req_slots * 32 + 2048
+            state_rows = state_pages * 4
             core_bytes = 4 * self.attn_head_dim * 4
             indexer_bytes = 4 * self.indexer_head_dim * 4
             return state_rows * (core_bytes + indexer_bytes) * num_layers

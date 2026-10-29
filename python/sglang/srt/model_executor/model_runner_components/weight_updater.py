@@ -208,6 +208,8 @@ class WeightUpdater:
             return iter
 
         def model_load_weights(model, iter):
+            # undo post-load repacking first, as begin_weight_update does for the tensor paths
+            DefaultModelLoader.restore_weights_before_loading(model, target_device)
             loader.load_weights_and_postprocess(model, iter, target_device)
             return model
 

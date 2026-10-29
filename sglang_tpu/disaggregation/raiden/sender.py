@@ -402,6 +402,13 @@ class RaidenSenderMixin:
                     self.kv_args.aux_item_lens,
                     aux_index,
                 )
+            if (
+                self._read_state_meta is not None
+                and room in self._prefill.send_state_rows
+            ):
+                self._prefill.send_state_meta[room] = self._read_state_meta(
+                    self._prefill.send_state_rows[room]
+                )
             self._prefill.reshard_finalized.add(room)
             is_reshard = room in self._prefill.reshard_req
             self.update_status(room, KVPoll.Transferring)
@@ -626,6 +633,7 @@ class RaidenSenderMixin:
             blocks = list(self._prefill.send_blocks[room])
             addr = self._prefill.decode_addr[room]
             aux_blob = self._prefill.send_aux.get(room, b"")
+            state_meta = self._prefill.send_state_meta.get(room, b"")
             decode_pages = self._prefill.decode_pages[room]
             decode_swa_pages = self._prefill.decode_swa_pages[room]
             self._prefill.replied.add(room)
@@ -675,6 +683,7 @@ class RaidenSenderMixin:
                 aux_blob=aux_blob,
                 state_blocks=state_rows,
                 state_endpoint=self.state_raiden_endpoint or "",
+                state_meta=state_meta,
             ).to_frames()
             try:
                 self._send_multipart_locked(endpoint, payload)

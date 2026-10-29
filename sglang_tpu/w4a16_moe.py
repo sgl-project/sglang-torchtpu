@@ -173,6 +173,16 @@ def apply_tpu_w4a16_moe(
             "apply_router_weight_on_input is not supported on TPU yet."
         )
 
+    routed_scaling_factor = layer.moe_runner_config.routed_scaling_factor
+    if routed_scaling_factor is not None and routed_scaling_factor != 1.0:
+        # Shares the fused_moe_call combine with the hardware-validated
+        # bf16/fp8 runners, but no rsf != 1 model has run on this stack;
+        # refuse rather than promise an unverified magnitude.
+        raise NotImplementedError(
+            "routed_scaling_factor is not yet applied on the TPU w4a16 path; "
+            "validate against a concrete rsf != 1 model first."
+        )
+
     x = dispatch_output.hidden_states
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk_weights = topk_weights.to(x.dtype)

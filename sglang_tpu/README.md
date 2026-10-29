@@ -127,3 +127,79 @@ prepares patches. Live check:
 [`test_tpu_muse_spark_mm_pd_multihost.py`](../test/registered/tpu/e2e/test_tpu_muse_spark_mm_pd_multihost.py)
 (images and video over P/D), with `SGLANG_TPU_USE_LIVE_SERVER=1` and
 `BASE_URL` pointing at the router.
+
+## Startup cleanup
+
+Before the scheduler-ready handshake, all ranks join pending compilation saves
+and release startup file-cache pages. This also covers direct `Engine` and Rust
+launches without a `/freeze_gc` request. Each host scans its files once per cleanup
+pass; all ranks finish before the handshake returns.
+
+The existing `/freeze_gc` request repeats file-cache release to cover files used
+or created by subsequent warmup, clears JAX tracing caches, then collects garbage, freezes GC and trims freed
+host heap pages. Python HTTP startup waits for this second pass before reporting
+readiness. Direct `Engine` callers can also call `freeze_gc()` after their own
+warmup. Keeping cleanup in this lifecycle ensures temporary objects are collected
+before `gc.freeze()` retains the remaining objects. Explicit `/freeze_gc` calls
+also run the cleanup hooks.
+
+Attention DP with shared MLP scheduling requires global control broadcasts:
+`--enable-dp-attention-local-control-broadcast` and elastic EP scaling are rejected
+because independently received freeze requests can deadlock with scheduling
+collectives. DWDP's independent scheduling is exempt from this check.
+
+`SGLANG_TPU_RELEASE_CHECKPOINT_PAGE_CACHE=0` keeps target and draft checkpoint
+shards cached. `SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS=0` keeps the native compiler
+cache pages. Both releases default on. The compiler cache namespace comes from
+`TORCH_TPU_TIER2_COMPILATION_CACHE` (legacy:
+`TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE`); empty or unset selects `default`,
+and `disabled` skips it. Other namespaces are untouched. Disk-backed files are
+advised with `POSIX_FADV_DONTNEED` and remain on disk; tmpfs/ramfs are skipped.
+Advice is not a measurement of resident memory freed.
+
+Checkpoint pages remain eligible for kernel reclaim during startup, but explicit
+eviction starts at the scheduler-ready handshake. This can increase peak host
+memory relative to evicting immediately after weight loading. Reusing files
+after cleanup can require storage reads. After freeze cleanup, one rank per host
+logs cgroup `memory.current` in bytes; this diagnostic does not gate readiness.
+
+JAX cache clearing leaves loaded serving executables alive, but new shapes may
+need retracing. `SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED=0` skips export-record
+clearing, JAX cache clearing, CPU-backend release, garbage collection before
+freezing and startup heap trimming. File-cache release retains its separate
+opt-outs.
+
+## Fixed-cohort benchmark gate
+
+- Enable with `SGLANG_TPU_BENCHMARK_BATCH_SIZE=N` (default: `0`, disabled).
+- Send a native batch with base request ID `hourly-batch:<unique-cohort>`;
+  normalization appends `_0` through `_N-1`. Use `x-rid` if the router overrides
+  request IDs. Untagged requests bypass the gate.
+- Unified and P/D emit first tokens as ready. Decode waits for all first tokens
+  and, for P/D, KV transfers. Unified disables decode mixing during prefill.
+- Decode timing runs from the first decode forward to the last request completion.
+  Token counts exclude the prefill token and clip SBD output at the stop boundary.
+- `/server_info` exposes `benchmark_batch_gate`: cohort ID, decode duration,
+  decode output tokens, gate wait duration, and TPOT.
+- Requires DP1/attention-DP1/CP1/PP1, device-resident decoder KV, and capacity for
+  the full batch. Mixed cohorts, retraction, invalid completion, or timeout fail
+  the benchmark. `SGLANG_TPU_BENCHMARK_TIMEOUT_SEC` defaults to `600`.
+
+## Diffusion (multimodal_gen)
+
+`multimodal_gen/` holds the diffusion TPU code. The `tpu_oot` entry point of
+`sglang.multimodal_gen.platforms` selects `multimodal_gen.platform.TpuOOTPlatform`
+whenever `torch.tpu` is registered; `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=tpu`
+selects the fork's built-in TPU platform instead. `TpuOOTPlatform` subclasses that
+built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and carries the
+TPU behavior (`--attention-backend tpu_splash_attn`, the `AttentionBackendEnum.OOT`
+backend).
+
+Gates that take the OOT arm, with the same outcome as the built-in platform:
+
+- `CustomOp` dispatch: the dispatch key is `tpu`, so ops reach `forward_tpu`
+  where they define it and `forward_native` otherwise.
+- `get_torch_library_dispatch_key()`: `PrivateUse1` instead of `CUDA`; its only
+  caller registers the CUDA flash-attention op, which TPU never selects.
+- `get_all_to_all_communicator_cls()`: answered explicitly with the base
+  communicator the built-in platform uses.

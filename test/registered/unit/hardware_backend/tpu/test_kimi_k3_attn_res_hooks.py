@@ -1,5 +1,6 @@
 """Kimi-K3 attention-residual kernel hooks (sglang_tpu/hooks/attn_residual.py),
-applied through HookRegistry, with a stand-in for the JAX kernel module."""
+applied through HookRegistry, and the aggregation they register with
+attn_residual, with a stand-in for the JAX kernel module."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -24,6 +25,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.models import kimi_k3
+from sglang.srt.platforms import current_platform
 from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 from sglang.srt.runtime_context import get_context
 from sglang.test.layer_ut_utils import init_single_process_dist
@@ -35,12 +37,15 @@ from sglang_tpu.hooks import attn_residual as hooks
 _KERNEL_MODULE = "sglang_tpu.kimi_attn_residual"
 _FLAG = tpu_envs.SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL
 _ATTN_RES_HOOKS = [h for h in HOOKS if h[1].__module__ == hooks.__name__]
+_KEY = current_platform.get_dispatch_key_name()
 
 
 @contextlib.contextmanager
 def _hooks_applied(kernel=None):
     """Apply the attention-residual HOOKS entries through HookRegistry, as the
-    plugin does on TPU, with `kernel` behind them; restore every target on exit."""
+    plugin does on TPU, with `kernel` behind them and a scratch aggregation
+    registry; restore every target on exit. A given `kernel` is registered as
+    register_attn_residual_ops registers it."""
     with contextlib.ExitStack() as stack:
         for target, _, _ in _ATTN_RES_HOOKS:
             obj_path, attr = target.rsplit(".", 1)
@@ -50,11 +55,14 @@ def _hooks_applied(kernel=None):
         stack.enter_context(patch.object(HookRegistry, "_hooks", defaultdict(list)))
         stack.enter_context(patch.object(HookRegistry, "_patched", set()))
         stack.enter_context(patch.object(hooks, "_kernel", kernel))
+        stack.enter_context(patch.object(attn_residual, "_AGGREGATE_IMPLS", {}))
         for target, hook, hook_type in _ATTN_RES_HOOKS:
             HookRegistry.register(target, hook, hook_type)
         HookRegistry.apply_hooks()
         # apply_hooks logs and moves on when a target fails to resolve.
         assert HookRegistry._patched == {t for t, _, _ in _ATTN_RES_HOOKS}
+        if kernel is not None:
+            attn_residual.register_aggregate_impl(_KEY, hooks.aggregate)
         yield
 
 
@@ -75,17 +83,18 @@ def _stand_in_kernel(supported: bool = True) -> types.ModuleType:
 
 
 class TestAttnResidualHookWiring(CustomTestCase):
-    def test_around_hooks_mirror_target_signatures(self):
-        """The AROUND hooks name their targets' parameters, so a core signature
-        change fails here instead of misrouting arguments."""
-        arounds = [h for h in _ATTN_RES_HOOKS if h[2] is HookType.AROUND]
-        self.assertEqual(len(arounds), 2)
-        for target, hook, _ in arounds:
-            with self.subTest(target=target):
-                params = list(inspect.signature(hook).parameters)
-                original = inspect.signature(pkgutil.resolve_name(target))
-                self.assertEqual(params[0], "original")
-                self.assertEqual(params[1:], list(original.parameters))
+    def test_only_model_hooks_remain(self):
+        """Aggregation goes through attn_residual's registry, not AROUND hooks
+        on its private functions."""
+        self.assertEqual(
+            [h[2] for h in _ATTN_RES_HOOKS], [HookType.AFTER, HookType.AFTER]
+        )
+
+    def test_aggregate_mirrors_the_registry_protocol(self):
+        """A core signature change fails here instead of misrouting arguments."""
+        params = list(inspect.signature(hooks.aggregate).parameters)
+        protocol = inspect.signature(attn_residual.AggregateImpl.__call__)
+        self.assertEqual(params, list(protocol.parameters)[1:])
 
     def test_model_without_attn_residuals_keeps_kernel_off(self):
         # None in sys.modules makes importing the kernel module raise.
@@ -94,9 +103,11 @@ class TestAttnResidualHookWiring(CustomTestCase):
             patch.dict(sys.modules, {_KERNEL_MODULE: None}),
             _FLAG.override(True),
             patch.object(hooks, "_kernel", None),
+            patch.object(attn_residual, "_AGGREGATE_IMPLS", {}),
         ):
             hooks.register_attn_residual_ops(None, model)
             self.assertIsNone(hooks._kernel)
+            self.assertEqual(attn_residual._AGGREGATE_IMPLS, {})
 
 
 @unittest.skipIf(torch.cuda.is_available(), "the original takes the TPU torch path")
@@ -254,7 +265,8 @@ class TestKimiK3AttnResHookModelSetup(CustomTestCase):
 
     def _build(self, flag: bool, kernel):
         """Construct and post-load the model with the hooks applied. Returns the
-        model and the hooks' kernel right after construction."""
+        model, the hooks' kernel right after construction, and the aggregation
+        registry then."""
         with (
             patch.dict(sys.modules, {_KERNEL_MODULE: kernel}),
             _FLAG.override(flag),
@@ -264,17 +276,19 @@ class TestKimiK3AttnResHookModelSetup(CustomTestCase):
                 config=_tiny_config(), quant_config=None
             )
             kernel_after_init = hooks._kernel
+            registered = dict(attn_residual._AGGREGATE_IMPLS)
             model.post_load_weights()
-        return model, kernel_after_init
+        return model, kernel_after_init, registered
 
     def test_flag_on_prepares_the_kernel_before_the_trace(self):
         """Model init registers the decode ops; post-load builds each aggregation
         point's fp32 out-norm weight next to its fp32 score weight, and publishes
         the weight updater's guard."""
         kernel = _stand_in_kernel()
-        model, kernel_after_init = self._build(flag=True, kernel=kernel)
+        model, kernel_after_init, registered = self._build(flag=True, kernel=kernel)
         self.assertIs(kernel_after_init, kernel)
         kernel.register_kimi_attn_res_decode_ops.assert_called_once_with()
+        self.assertEqual(registered, {_KEY: hooks.aggregate})
 
         points = _aggregation_points(model)
         self.assertEqual(len(points), 2 * 4 + 1)
@@ -291,8 +305,9 @@ class TestKimiK3AttnResHookModelSetup(CustomTestCase):
 
     def test_flag_off_never_imports_the_kernel(self):
         # None in sys.modules makes importing the kernel module raise.
-        model, kernel_after_init = self._build(flag=False, kernel=None)
+        model, kernel_after_init, registered = self._build(flag=False, kernel=None)
         self.assertIsNone(kernel_after_init)
+        self.assertEqual(registered, {})
         self.assertIsNone(getattr(model.model, "_derived_weight_cache_error", None))
 
 

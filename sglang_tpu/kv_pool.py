@@ -102,6 +102,13 @@ def kv_pack_heads(num_kv_heads: int, head_dim: int, align: int) -> int:
     return 1
 
 
+def register_hicache_io_backend_pools(io_backend: str, *pool_classes: type) -> None:
+    """Declare that ``io_backend`` can offload each of ``pool_classes`` to host,
+    by adding it to their ``kv_offload_io_backends``."""
+    for pool_cls in pool_classes:
+        pool_cls.kv_offload_io_backends |= {io_backend}
+
+
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
@@ -118,14 +125,27 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     HEAD_DIM_ALIGNMENT = 128
     # Whether this layout can store exactly-fitting heads side by side (kv_pack_heads).
     PACKS_HEADS = True
+    # Name of the page's interior arrangement. The torch_tpu host pool folds it
+    # into its HiCache storage key; a subclass that changes the arrangement
+    # must restate it, or pages it writes would be read back by this layout.
+    KV_LAYOUT_NAME = "token-major"
     # HiCache io backends (--hicache-io-backend) that can offload this pool to
-    # host; hicache_hook refuses the rest at startup. raiden copies whole pages
-    # by their dim-0 block id, so it serves any block-major pool exposing
-    # get_fused_kv_buffer; torch_tpu's host pool stores this 5D row verbatim.
-    # A subclass that changes the buffer layout must restate this. Listing an
-    # io backend asserts it moves all of the pool's KV state: a pool that keeps
-    # quantization scales outside get_fused_kv_buffer must not list it.
-    kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu", "raiden"})
+    # host; hicache_hook refuses the rest at startup. torch_tpu's host pool
+    # stores this 5D row verbatim; TPU DMA backends add themselves through
+    # register_hicache_io_backend_pools. A subclass that changes the buffer
+    # layout must restate this. Listing an io backend asserts it moves all of
+    # the pool's KV state: a pool that keeps quantization scales outside
+    # get_fused_kv_buffer must not list it.
+    kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu"})
+
+    def kv_layout_tag(self) -> str:
+        """Identity of this pool's page byte layout, for storage keys.
+
+        Names the arrangement plus the two packing factors the page dims do
+        not spell out: heads stored side by side in one row (``kv_pack_heads``)
+        and elements sharing a 32-bit lane (``kv_packing``).
+        """
+        return f"{self.KV_LAYOUT_NAME}-hp{self.kv_pack_heads}-p{self.kv_packing}"
 
     @classmethod
     def kv_bytes_per_token_per_layer(
@@ -599,10 +619,11 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
     """
 
     PACKS_HEADS = False
+    KV_LAYOUT_NAME = "seq-along-lane"
 
-    # raiden's page copy is layout-agnostic, and torch_tpu's host pool reads
-    # its page shape from get_fused_kv_buffer, so it mirrors this layout too.
-    kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu", "raiden"})
+    # torch_tpu's host pool reads its page shape from get_fused_kv_buffer, so it
+    # mirrors this layout too.
+    kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu"})
 
     @classmethod
     def kv_bytes_per_token_per_layer(
@@ -1277,3 +1298,10 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
 
     def set_mla_kv_buffer(self, *args, **kwargs):
         self._unsupported("set_mla_kv_buffer")
+
+
+# raiden copies whole pages by their dim-0 block id, so it serves any
+# block-major pool exposing get_fused_kv_buffer.
+register_hicache_io_backend_pools(
+    "raiden", TpuFusedMHATokenToKVPool, TpuSeqAlongLaneKVPool
+)

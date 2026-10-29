@@ -29,6 +29,20 @@ REL_TOL = 1e-2
 
 @unittest.skipUnless(_HAS_TPU, "requires a TPU backend")
 class TestSparseMlaPrefillQblock(CustomTestCase):
+    @staticmethod
+    def _glm_shape():
+        # GLM-5.3-Flash's q-block prefill: NoPE + RoPE query lanes, the
+        # recipe's 128-token pages, and the most pages per request the op
+        # lets this kernel take.
+        from sglang_tpu.attention.pallas import mla_sparse_fused as fused
+
+        return dict(
+            q_width=fused.NOPE_DIM + fused.ROPE_DIM,
+            page_size=PAGE,
+            pages_per_seq=fused.QBLOCK_MAX_PAGES_PER_SEQ,
+            dtype=jnp.bfloat16,
+        )
+
     @classmethod
     def setUpClass(cls):
         from sglang_tpu.attention.pallas import dsa_kpool_topk as kp
@@ -60,7 +74,7 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
     def _f(self, *shape, scale=1.0):
         return jnp.asarray((self.rng.normal(size=shape) * scale).astype(np.float32))
 
-    def _case(self, seqs, num_tokens, max_seqs, ctx, sm_scale, k_scale):
+    def _case(self, seqs, num_tokens, max_seqs, ctx, sm_scale, k_scale, heads=QH):
         """seqs: (prefix, q_len) per request, prefixed requests first. Returns the
         q-block arguments and the per-query kernel's output for the last step."""
         kp = self.kp
@@ -96,8 +110,8 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
                 cu,
                 dist,
             )
-            ql = self._f(T, QH, 512).astype(jnp.bfloat16)
-            qpe = self._f(T, QH, 64).astype(jnp.bfloat16)
+            ql = self._f(T, heads, 512).astype(jnp.bfloat16)
+            qpe = self._f(T, heads, 64).astype(jnp.bfloat16)
             out, cn, cr = att(
                 ql,
                 qpe,
@@ -130,8 +144,14 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
         )
         return args, ref
 
-    def _check(self, args, ref, sm_scale, k_scale):
-        out = self.qblock(*args, sm_scale=sm_scale, k_scale=k_scale, kpool=KPOOL)
+    def _check(self, args, ref, sm_scale, k_scale, query_block=256):
+        out = self.qblock(
+            *args,
+            sm_scale=sm_scale,
+            k_scale=k_scale,
+            kpool=KPOOL,
+            query_block=query_block,
+        )
         cu, dist = args[7], args[8]
         n = int(cu[dist[2]])
         o = np.asarray(out[:n].astype(jnp.float32))
@@ -147,6 +167,52 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
         seqs = [(1024, 2500), (600, 1800), (0, 2049), (0, 1)]
         args, ref = self._case(seqs, 8192, 6, 4096, 0.08, 0.75)
         self._check(args, ref, 0.08, 0.75)
+
+    def test_64_heads_128_query_blocks(self):
+        # 64 heads per chip (GLM-5.3-Flash at attention TP1) take 128-query
+        # blocks, since 64 x 256 score rows do not fit in VMEM. 8 and 32 heads
+        # per chip (TP8, TP2) keep 256.
+        from sglang_tpu.attention.pallas.mla_sparse_fused import qblock_query_block
+
+        def query_block(heads):
+            return qblock_query_block(heads, **self._glm_shape())
+
+        self.assertEqual(query_block(8), 256)
+        self.assertEqual(query_block(32), 256)
+        self.assertEqual(query_block(64), 128)
+        seqs = [(300, 700), (0, 300)]
+        args, ref = self._case(seqs, 1024, 4, 1024, 0.08, 0.75, heads=64)
+        self._check(args, ref, 0.08, 0.75, query_block=query_block(64))
+
+    def test_largest_shape_within_vmem_estimate_compiles(self):
+        # The op trusts the VMEM estimate, so the most heads it allows at the
+        # default query block (35 at 256 queries on tpu7x) must compile.
+        from sglang_tpu.attention.pallas import mla_sparse_qblock as mq
+
+        shape = self._glm_shape()
+        heads = max(
+            h
+            for h in range(1, 129)
+            if mq.vmem_required_by_sparse_mla(h, mq.QUERY_BLOCK, **shape)
+            <= mq.vmem_limit_bytes()
+        )
+        pps, seqs, tokens = shape["pages_per_seq"], 4, 1024
+        sd = jax.ShapeDtypeStruct
+        mq.sparse_mla_prefill_qblock.lower(
+            sd((tokens, heads, 512), jnp.bfloat16),
+            sd((tokens, heads, 64), jnp.bfloat16),
+            sd((seqs * pps + 1, PAGE, 4, 128), jnp.uint8),
+            sd((seqs * pps + 1, PAGE // 4, 4, 128), jnp.uint8),
+            sd((tokens, W), jnp.int32),
+            sd((seqs,), jnp.int32),
+            sd((seqs * pps,), jnp.int32),
+            sd((seqs + 1,), jnp.int32),
+            sd((3,), jnp.int32),
+            sm_scale=0.08,
+            k_scale=0.75,
+            kpool=KPOOL,
+            query_block=mq.QUERY_BLOCK,
+        ).compile()
 
 
 if __name__ == "__main__":

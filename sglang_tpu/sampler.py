@@ -21,7 +21,6 @@ from sglang.srt.layers.sampler import (
 from sglang.srt.model_executor.forward_batch_info import LogitsOutputMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
 from sglang_tpu.top_k import PallasDistributedTopKConfig
 
@@ -290,10 +289,10 @@ def distributed_top_k_for_batch(
 def select_logits_output_mode(forward_batch, model) -> LogitsOutputMode:
     """Select full-vocabulary logits or distributed TopK candidates."""
 
-    # Model capability negotiation uses a CPU collective, which speculative
-    # forwards never need because they require full-vocabulary logits.
+    # Speculative forwards keep the mode their worker set (FULL_VOCAB by default);
+    # a worker asking for candidates negotiated the width at init, outside any trace.
     if _is_speculative_batch(forward_batch):
-        return LogitsOutputMode.FULL_VOCAB
+        return forward_batch.logits_output_mode
     candidate_width = distributed_top_k_candidate_width_for_model(model)
     if candidate_width is None:
         return LogitsOutputMode.FULL_VOCAB
@@ -604,21 +603,16 @@ class TpuSampler(Sampler):
         ):
             from sglang_tpu.top_k import tpu_top_k
 
-            candidate_width = (
-                min(MAX_DISTRIBUTED_TOP_K, probs.shape[-1])
-                if tpu_envs.SGLANG_TPU_HOST_PADDING.get()
-                else top_k
-            )
+            # Keep the candidate shape independent of the requested k.
+            # Rank masking retains exactly the requested number of candidates.
+            candidate_width = min(MAX_DISTRIBUTED_TOP_K, probs.shape[-1])
             global_top_k_probs, global_top_k_token_ids = tpu_top_k(
                 probs, candidate_width
             )
-            if tpu_envs.SGLANG_TPU_HOST_PADDING.get():
-                # Keep the candidate shape independent of the requested k.
-                # Rank masking retains exactly the requested number of candidates.
-                ranks = torch.arange(candidate_width, device=probs.device)
-                global_top_k_probs = global_top_k_probs.masked_fill(
-                    ranks[None, :] >= sampling_info.top_ks[:, None], 0
-                )
+            ranks = torch.arange(candidate_width, device=probs.device)
+            global_top_k_probs = global_top_k_probs.masked_fill(
+                ranks[None, :] >= sampling_info.top_ks[:, None], 0
+            )
             if needs_top_p_or_min_p:
                 # Filtering the gathered block replaces ~30 full-vocabulary
                 # reductions with ~30 reductions over top_k columns.
