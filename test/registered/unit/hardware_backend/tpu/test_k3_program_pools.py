@@ -67,6 +67,18 @@ class TestUnifiedPoolClasses(CustomTestCase):
         self.assertEqual(len(raw), len(MLA))
         self.assertEqual(len(pools.draft_raw_pools(kv.caches)), 5)
 
+    def test_bytes_per_token(self):
+        # 29 pools x one 320 KiB block per 8192 logical tokens on each rank.
+        self.assertEqual(sglang_pools.K3UnifiedKVPool.bytes_per_token("auto"), 1160.0)
+        self.assertEqual(
+            sglang_pools.K3UnifiedKVPool.bytes_per_token("fp8_e4m3"), 580.0
+        )
+        with _model():
+            _, kv = _build(slots=4, pages=10)
+        # The unified pools' bytes over their logical tokens (the state blocks aside).
+        kv_bytes = kv.get_kv_size_bytes() * kv.plan.kv_blocks / kv.plan.num_blocks
+        self.assertAlmostEqual(kv_bytes / kv.size, 1160.0)
+
     def test_fp8_pages_hold_twice_the_tokens(self):
         with _model("fp8_e4m3"):
             _, kv = _build(page_size=2 * STEP)
@@ -187,6 +199,21 @@ class TestRaidenGroups(CustomTestCase):
                     groups.state[k // 3].data_ptr(),
                     self.kv.caches[bridge.kda_layer_name(KDA[k])].data_ptr(),
                 )
+
+
+class TestConfiguratorHook(CustomTestCase):
+    def test_cell_size_is_the_unified_pools(self):
+        configurator = SimpleNamespace(_cell_size=27_648)
+        with (
+            mock.patch.object(hooks, "k3_program_active", return_value=True),
+            _model("auto"),
+        ):
+            hooks.size_k3_program_pools(None, configurator, None)
+        self.assertEqual(configurator._cell_size, 1160)
+        other = SimpleNamespace(_cell_size=27_648)
+        with mock.patch.object(hooks, "k3_program_active", return_value=False):
+            hooks.size_k3_program_pools(None, other, None)
+        self.assertEqual(other._cell_size, 27_648)
 
 
 class TestSpecCheckHook(CustomTestCase):

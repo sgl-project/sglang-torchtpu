@@ -152,6 +152,15 @@ class K3UnifiedKVPool:
     def host_pool_decls(self) -> list:
         return []
 
+    @classmethod
+    def bytes_per_token(cls, kv_cache_dtype: str) -> int:
+        """A logical token's share of the unified pools on one rank: every
+        pool's block holds this rank's share of a logical block's tokens."""
+        layout = cache_layout(program_kv_cache_dtype(kv_cache_dtype))
+        pools = len(MLA) + bridge.DSPARK_DRAFT_LAYERS
+        tokens = bridge.TP_SIZE * layout.tokens_per_block
+        return pools * _block_bytes(program_kv_cache_dtype(kv_cache_dtype)) // tokens
+
     def raw_pools(self) -> list[torch.Tensor]:
         """The distinct tensors: 24 unified pools, then the draft's."""
         seen: dict[int, torch.Tensor] = {}

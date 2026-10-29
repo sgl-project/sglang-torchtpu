@@ -34,6 +34,19 @@ attach_k3_program
   Upstream PR or issue: <to be filed> (a model-level seam to replace a decoder
        stack's layers and forward).
   Remove when: that seam exists.
+
+size_k3_program_pools
+  Why: DefaultPoolConfigurator sizes the full-attention pool from the MLA
+       latent's bytes per token on every rank (about 27.6 KB for Kimi-K3); the
+       unified pools hold a rank's share of each logical block (1160 bytes a
+       token in bf16), so sized from free memory the pool would come out about
+       24 times too small.
+  How: AFTER DefaultPoolConfigurator.__init__ sets the cell size from
+       K3UnifiedKVPool.bytes_per_token under K3_PROGRAM (the state slots are
+       costed through K3StatePool.cache_bytes_per_request).
+  Upstream PR or issue: sgl-project/sglang-torchtpu#1072 (the configurator
+       asking the platform pool for its bytes per token).
+  Remove when: that lands.
 """
 
 from __future__ import annotations
@@ -91,6 +104,19 @@ def attach_k3_program(result: None, causal_lm: Any, *args, **kwargs) -> None:
     )
 
 
+def size_k3_program_pools(result: None, configurator, kvc, *args, **kwargs) -> None:
+    """AFTER DefaultPoolConfigurator.__init__."""
+    if not k3_program_active():
+        return result
+    from sglang.srt.runtime_context import get_model
+    from sglang_tpu.k3_programs.sglang_pools import K3UnifiedKVPool
+
+    configurator._cell_size = K3UnifiedKVPool.bytes_per_token(
+        get_model().kv_cache_dtype
+    )
+    return result
+
+
 def hook_specs() -> list[tuple]:
     from sglang.srt.plugins.hook_registry import HookType
 
@@ -108,6 +134,11 @@ def hook_specs() -> list[tuple]:
         (
             "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
             attach_k3_program,
+            HookType.AFTER,
+        ),
+        (
+            "sglang.srt.model_executor.pool_configurator.DefaultPoolConfigurator.__init__",
+            size_k3_program_pools,
             HookType.AFTER,
         ),
     ]
