@@ -411,6 +411,69 @@ def test_emptied_role_does_not_log_recovery(caplog):
 
 
 @pytest.mark.unit
+def test_requested_probe_skips_a_broken_decode_before_the_next_poll():
+    async def test(backends, prefill_urls, decode_urls):
+        healthy, broken = decode_urls
+        load_balancer = _lb(prefill_urls, decode_urls, health_check_interval_secs=600)
+        backends.status[broken] = 503
+
+        load_balancer.request_health_probe(broken)
+        await _wait_for(lambda: broken in load_balancer._health.unhealthy)
+
+        assert _selected(load_balancer) == (set(prefill_urls), {healthy})
+        assert backends.probes == {prefill_urls[0]: 0, healthy: 0, broken: 1}
+
+    _run(test)
+
+
+@pytest.mark.unit
+def test_requested_probe_keeps_a_healthy_backend_routable():
+    # A transient break on a backend that still answers 200 must not take
+    # it out of rotation: the probe decides, not the break.
+    async def test(backends, prefill_urls, decode_urls):
+        load_balancer = _lb(prefill_urls, decode_urls, health_check_interval_secs=600)
+
+        load_balancer.request_health_probe(decode_urls[0])
+        await _wait_for(lambda: backends.probes[decode_urls[0]] == 1)
+        await asyncio.gather(*list(mini_lb._background_tasks))
+
+        assert _selected(load_balancer) == (set(prefill_urls), set(decode_urls))
+
+    _run(test)
+
+
+@pytest.mark.unit
+def test_requested_probes_of_one_backend_do_not_pile_up():
+    async def test(backends, prefill_urls, decode_urls):
+        hung = decode_urls[0]
+        backends.hung.add(hung)
+        load_balancer = _lb(prefill_urls, decode_urls, health_check_interval_secs=600)
+
+        for _ in range(3):
+            load_balancer.request_health_probe(hung)
+        await backends.probe_started[hung].wait()
+        backends.release.set()
+        await asyncio.gather(*list(mini_lb._background_tasks))
+
+        assert backends.probes[hung] == 1
+
+    _run(test)
+
+
+@pytest.mark.unit
+def test_requested_probe_is_a_no_op_when_health_checks_are_off():
+    async def test(backends, prefill_urls, decode_urls):
+        load_balancer = _lb(prefill_urls, decode_urls, disable_health_check=True)
+
+        load_balancer.request_health_probe(decode_urls[0])
+        await asyncio.sleep(0.05)
+
+        assert sum(backends.probes.values()) == 0
+
+    _run(test)
+
+
+@pytest.mark.unit
 def test_disable_health_check_disables_polling():
     async def test(backends, prefill_urls, decode_urls):
         load_balancer = _lb(prefill_urls, decode_urls, disable_health_check=True)
