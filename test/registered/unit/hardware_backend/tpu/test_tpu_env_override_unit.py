@@ -17,12 +17,12 @@ from unittest.mock import patch
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.env_override import (
     _DECODE_CP_SPARSE_CORE_OVERRIDES,
-    _DISTRIBUTED_TOP_K_SPARSE_CORE_OVERRIDES,
+    _FUSED_RS_SPARSE_CORE_OVERRIDES,
     _VMEM_PREFETCH_MIN_LAYERS,
     _VMEM_PREFETCH_OVERRIDES,
     _VMEM_PREFETCH_SAFE_MIN_TOKENS,
     apply_decode_cp_sparse_core_override,
-    apply_distributed_top_k_sparse_core_override,
+    apply_fused_rs_sparse_core_override,
     apply_small_kv_pool_vmem_prefetch_override,
     apply_tpu_env_overrides,
 )
@@ -102,11 +102,12 @@ class TestLibtpuInitArgsOverrides(CustomTestCase):
                     self.assertEqual(flag in args, expected)
 
 
-    def test_distributed_top_k_turns_off_sparse_core_offloads(self):
-        # libtpu 0.0.50 halts a SparseCore in the compiled distributed-top-k
-        # logits module with the fused-RS MoE backend (Beam-1.0-501B-A23B
-        # NVFP4, TP=8, 256-token prefill bucket); the offloads are turned
-        # off only for the affected configuration.
+    def test_fused_rs_turns_off_sparse_core_offloads(self):
+        # libtpu 0.0.50 faults fused-RS EXTEND modules with the SparseCore
+        # collective offloads on (Beam-1.0-501B-A23B NVFP4, TP=8): a
+        # SparseCore halt in the distributed-top-k logits module, and a
+        # silent execute wedge in the FULL_VOCAB 256-token module -- so the
+        # offloads go off for fused-RS regardless of the top-k cutoff.
         cases = [
             # (moe_backend, sampling_backend, tp_size, min_batch_env, expected)
             ("pallas_tpu_fused_rs", None, 8, None, True),
@@ -115,7 +116,7 @@ class TestLibtpuInitArgsOverrides(CustomTestCase):
             ("auto", "tpu", 8, None, False),
             ("pallas_tpu_fused_rs", "pytorch", 8, None, False),
             ("pallas_tpu_fused_rs", "tpu", 4, None, False),
-            ("pallas_tpu_fused_rs", "tpu", 8, "100000", False),
+            ("pallas_tpu_fused_rs", "tpu", 8, "100000", True),
         ]
         for moe_backend, backend, tp_size, min_batch, expected in cases:
             with self.subTest(
@@ -132,13 +133,13 @@ class TestLibtpuInitArgsOverrides(CustomTestCase):
                         os.environ.pop(
                             "SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE", None
                         )
-                    apply_distributed_top_k_sparse_core_override(
+                    apply_fused_rs_sparse_core_override(
                         sampling_backend=backend,
                         tp_size=tp_size,
                         moe_runner_backend=moe_backend,
                     )
                     args = os.environ["LIBTPU_INIT_ARGS"].split()
-                for flag in _DISTRIBUTED_TOP_K_SPARSE_CORE_OVERRIDES:
+                for flag in _FUSED_RS_SPARSE_CORE_OVERRIDES:
                     self.assertEqual(flag in args, expected)
 
 
