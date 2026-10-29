@@ -54,6 +54,21 @@ def in_pod() -> bool:
     return "TPU_WORKER_HOSTNAMES" in os.environ and not os.environ.get("SLURM_JOB_ID")
 
 
+def resolve_hosts(hosts: list[str], timeout: float = 1800.0) -> list[str]:
+    """The slice's host IPs. A pod's DNS record appears once it is scheduled,
+    and the pods of a slice start minutes apart, so wait for all of them."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return [socket.gethostbyname(h) for h in hosts]
+        except socket.gaierror as e:
+            if time.monotonic() > deadline:
+                raise SystemExit(
+                    f"TPU hosts {hosts} unresolved after {timeout:.0f}s: {e}"
+                )
+            time.sleep(10)
+
+
 def launch_pod(argv: list[str], extra_env: dict[str, str], per_host: int) -> int:
     """Run ``argv`` as this pod's ``per_host`` workers, with the Slurm variables
     the workers read (node index ``TPU_WORKER_ID``). Every pod of the slice runs
@@ -68,7 +83,7 @@ def launch_pod(argv: list[str], extra_env: dict[str, str], per_host: int) -> int
     env.update(
         {
             WORKER_ENV: "1",
-            "TP32_HOST_IPS": ",".join(socket.gethostbyname(h) for h in hosts),
+            "TP32_HOST_IPS": ",".join(resolve_hosts(hosts)),
             "MASTER_PORT": env.get("MASTER_PORT", "20111"),
             "TP32_SESSION": env.get("TP32_SESSION", "cdk"),
             "HF_HUB_OFFLINE": "1",
