@@ -56,6 +56,7 @@ class TestPositionOnHost(CustomTestCase):
             mix_running_indices=None,
             dllm_config=None,
             input_tensor_device=None,
+            sampling_info=None,
             model_config=SimpleNamespace(
                 is_generation=True,
                 use_ngram_embedding=False,
