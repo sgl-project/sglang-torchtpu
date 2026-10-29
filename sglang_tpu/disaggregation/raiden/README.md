@@ -107,12 +107,12 @@ cannot be rebuilt from cached KV. Push-resharding and pipeline transfer raise
 
 Fused TPU KV pool (`pallas_tpu_rpa_v3`), MHA models (incl. hybrid
 sliding-window at symmetric TP and under push-resharding, and hybrid GDN at
-symmetric TP), decode in
+symmetric TP), MLA with KDA state (Kimi-K3) at symmetric TP, decode in
 chunk-cache mode.
 Symmetric attn TP uses the pull path; `dst_tp < src_tp` uses the
 push-resharding path above. Needs `tpu_sync` built against the same `torch_tpu`
-as this fork (tpu-sync `build.sh`). Not covered: MLA,
-NSA, Mamba/GDN under push-resharding or pipeline transfer, speculative draft
+as this fork (tpu-sync `build.sh`). Not covered: MLA under push-resharding,
+NSA, Mamba/GDN/KDA under push-resharding or pipeline transfer, speculative draft
 KV, decode prefix-cache reuse, `dst_tp > src_tp`.
 
 ## Tunables (env)
