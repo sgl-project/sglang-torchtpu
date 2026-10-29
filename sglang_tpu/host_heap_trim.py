@@ -202,8 +202,8 @@ def _release_cpu_backend() -> bool:
     return True
 
 
-def _before_freeze() -> None:
-    release_startup_page_cache()
+def _before_freeze(*, synchronize: bool) -> None:
+    release_startup_page_cache(synchronize=synchronize)
     if tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.get():
         import jax
 
@@ -241,11 +241,15 @@ def install(scheduler_cls: Optional[type] = None) -> None:
         return orig_get_init_info(self, *args, **kwargs)
 
     def handle_freeze_gc(self, *args, **kwargs):
-        _before_freeze()
+        # PP stages dispatch the freeze in different loop iterations (the wave
+        # sends PD consensus a round ahead), so a world barrier here deadlocks.
+        synchronize = get_parallel().pp_size == 1
+        _before_freeze(synchronize=synchronize)
         result = orig(self, *args, **kwargs)
         _after_freeze()
-        # A scheduler reply must cover cleanup on every rank, including PP stages.
-        get_parallel().world_group.barrier()
+        if synchronize:
+            # The scheduler reply covers cleanup on every rank.
+            get_parallel().world_group.barrier()
         if int(os.environ["LOCAL_RANK"]) == 0:
             log_startup_memory()
         return result

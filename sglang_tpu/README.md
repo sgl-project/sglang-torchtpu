@@ -141,7 +141,10 @@ host heap pages. Python HTTP startup waits for this second pass before reporting
 readiness. Direct `Engine` callers can also call `freeze_gc()` after their own
 warmup. Keeping cleanup in this lifecycle ensures temporary objects are collected
 before `gc.freeze()` retains the remaining objects. Explicit `/freeze_gc` calls
-also run the cleanup hooks.
+also run the cleanup hooks. Under PP the stages dispatch the freeze in different
+loop iterations, so each rank cleans up without a world barrier: only the
+lock-guarded native compiler cache is removed, and the reply does not wait for the
+other stages.
 
 Attention DP with shared MLP scheduling requires global control broadcasts:
 `--enable-dp-attention-local-control-broadcast` and elastic EP scaling are rejected

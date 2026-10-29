@@ -173,10 +173,13 @@ def _release_native_cache() -> None:
     )
 
 
-def release_compile_artifacts() -> None:
+def release_compile_artifacts(*, native_only: bool = False) -> None:
     if not envs.SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS.get():
         return
     _release_native_cache()
+    if native_only:
+        # Only native tier-2 entries are lock-guarded against live writers.
+        return
     # Only serialized TorchTPU/AOT and JAX caches are disposable. Inductor can
     # also contain generated Python and shared libraries used during serving.
     roots = []
@@ -189,14 +192,20 @@ def release_compile_artifacts() -> None:
             _release_tmpfs_cache(root)
 
 
-def release_startup_page_cache() -> None:
-    """Join cache writers, then release startup files once per host."""
+def release_startup_page_cache(*, synchronize: bool = True) -> None:
+    """Join cache writers, then release startup files once per host.
+
+    Args:
+      synchronize: Wait for every rank's writers. Without it, only lock-guarded
+        native cache entries are removed.
+    """
     resolve_compilations([])
-    get_parallel().world_group.barrier()
+    if synchronize:
+        get_parallel().world_group.barrier()
     if get_parallel().world_group.local_rank != 0:
         return
     model_paths = [get_model().model_path]
     if draft_path := get_spec().speculative_draft_model_path:
         model_paths.append(draft_path)
     release_checkpoint_page_cache(model_paths)
-    release_compile_artifacts()
+    release_compile_artifacts(native_only=not synchronize)
