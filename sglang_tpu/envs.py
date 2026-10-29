@@ -26,6 +26,15 @@ EnvField._allow_set_name = True
 
 
 class TpuEnvs:
+    # Optional private CPU tier beneath the TPU vision embedding cache.
+    SGLANG_VLM_HOST_TIER_MB = EnvInt(0)
+    SGLANG_VLM_HOST_TIER_VERIFY = EnvBool(False)
+    SGLANG_VLM_HOST_TIER_STATS_S = EnvFloat(None)
+    SGLANG_VLM_HOST_TIER_PIN_PENDING = EnvBool(False)
+    # A shared local directory and version namespace select a host-wide tier.
+    SGLANG_VLM_SHARED_HOST_TIER_DIR = EnvStr(None)
+    SGLANG_VLM_SHARED_HOST_TIER_NAMESPACE = EnvStr(None)
+
     # Opt-in, request-tagged benchmark admission (benchmark_batch_gate.py).
     # Zero preserves ordinary scheduling, including continuous batching.
     SGLANG_TPU_BENCHMARK_BATCH_SIZE = EnvInt(0)
