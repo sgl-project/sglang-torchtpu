@@ -364,6 +364,8 @@ def register_twin(
                 dst_attn_tp,
                 int(transfer.manager.kv_args.total_kv_head_num),
                 with_swa=True,
+                draft_kv_heads=transfer.draft_kv_heads,
+                draft_swa_kv_heads=transfer.draft_swa_kv_heads,
             ),
         )
     except Exception:

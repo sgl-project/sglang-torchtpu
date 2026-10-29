@@ -305,6 +305,10 @@ class PipelineTransfer:
 
     # The window link, when sliding-window layers have their own engine.
     swa: pp_swa.SwaLink | None = None
+    # The draft pool's kv-head counts, of its full-attention and window
+    # layers; 0 slices draft layers like the target's.
+    draft_kv_heads: int = 0
+    draft_swa_kv_heads: int = 0
 
     def __init__(self, manager, groups):
         from tpu_sync.api.torch.reshard_client import ReshardClient
@@ -318,6 +322,8 @@ class PipelineTransfer:
         # A hybrid pool's sliding-window layers get an engine of their own.
         self.pools, swa_pools = pp_swa.split_manifest(pool_manifest(groups))
         self.tensors = list(groups.full)
+        self.draft_kv_heads = int(getattr(groups, "draft_kv_head_num", 0))
+        self.draft_swa_kv_heads = int(getattr(groups, "draft_swa_kv_head_num", 0))
         if swa_pools:
             pp_swa.require_bounded_staging()
         # One worker per pipeline stage or attention-TP rank. Rank 0 hosts the
@@ -738,6 +744,8 @@ class PipelineTransfer:
                 dst_attn_tp,
                 int(self.manager.kv_args.total_kv_head_num),
                 with_swa=with_swa,
+                draft_kv_heads=self.draft_kv_heads,
+                draft_swa_kv_heads=self.draft_swa_kv_heads,
             )
             self.client.register_request_blocks(
                 req_id=req_id,

@@ -73,6 +73,11 @@ class RaidenKVCacheGroups:
     # Trailing tensors of full / swa that belong to a separate draft pool.
     num_draft_full: int = 0
     num_draft_swa: int = 0
+    # This rank's kv-head count of the draft pool, which an EAGLE3 draft sets
+    # from its own config; 0 when unknown or there is no separate draft pool.
+    draft_kv_head_num: int = 0
+    # The same for a hybrid draft pool's sliding-window layers.
+    draft_swa_kv_head_num: int = 0
     # Per-layer request-state tensors (GDN/Mamba rows or DSV4 compressor rings).
     state: List[torch.Tensor] = field(default_factory=list)
     state_type: StateType = StateType.MAMBA
@@ -91,6 +96,14 @@ def _assert_root_buffers(name: str, buffers: Sequence[torch.Tensor]) -> None:
                 f"Raiden requires root tensors (not views) for {name}[{idx}] "
                 "so PJRT buffer registration remains valid."
             )
+
+
+def _kv_head_num(pool) -> int:
+    """A pool's kv-head count, 0 when it reports none. A pool that packs heads
+    into one row (SGLANG_TPU_KV_PACK_HEADS) reports a single head."""
+    return int(getattr(pool, "head_num", 0) or 0) * int(
+        getattr(pool, "kv_pack_heads", 1) or 1
+    )
 
 
 def get_raiden_kv_caches(
@@ -178,6 +191,7 @@ def get_raiden_kv_caches(
     full, swa = list(groups.full), list(groups.swa)
     full_ids, swa_ids = list(groups.full_layer_ids), list(groups.swa_layer_ids)
     num_draft_full = num_draft_swa = 0
+    draft_kv_head_num = draft_swa_kv_head_num = 0
     if draft_pool is not None and draft_pool is not pool:
         draft_groups = group_one(draft_pool)
         num_draft_full, num_draft_swa = len(draft_groups.full), len(draft_groups.swa)
@@ -185,6 +199,12 @@ def get_raiden_kv_caches(
         swa.extend(draft_groups.swa)
         full_ids.extend(draft_groups.full_layer_ids)
         swa_ids.extend(draft_groups.swa_layer_ids)
+        draft_kv_head_num = _kv_head_num(draft_pool)
+        # A hybrid pool's window sub-pool may hold its own head count.
+        if num_draft_swa:
+            draft_swa_kv_head_num = _kv_head_num(
+                getattr(draft_pool, "swa_kv_pool", None)
+            )
 
     state: List[torch.Tensor] = []
     state_type = StateType.MAMBA
@@ -223,6 +243,8 @@ def get_raiden_kv_caches(
         swa_layer_ids=swa_ids,
         num_draft_full=num_draft_full,
         num_draft_swa=num_draft_swa,
+        draft_kv_head_num=draft_kv_head_num,
+        draft_swa_kv_head_num=draft_swa_kv_head_num,
         state=state,
         state_type=state_type,
         state_max_blocks=state_max_blocks,

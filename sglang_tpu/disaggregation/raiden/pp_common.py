@@ -71,6 +71,37 @@ def source_spans(pools: Sequence[dict], full: list[int], swa: list[int]) -> list
     return result
 
 
+def _pool_kv_heads(
+    pool: dict,
+    tensor,
+    total_kv_heads: int,
+    draft_kv_heads: int,
+    draft_swa_kv_heads: int,
+) -> int:
+    """Global kv-head count of one pool: the draft's own for draft layers, its
+    window count for draft window layers. The TP1 producer holds every head,
+    so its page must fit exactly that many."""
+    is_draft = pool["tag"].startswith("draft.")
+    heads = total_kv_heads
+    if is_draft:
+        swa_heads = draft_swa_kv_heads if is_swa_pool(pool["tag"]) else 0
+        heads = swa_heads or draft_kv_heads or total_kv_heads
+    if _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
+        rows, need = int(tensor.shape[1]), 2 * heads
+    else:
+        packing = int(tensor.shape[3])
+        rows = int(tensor.shape[2]) * packing
+        need = -(-2 * heads // packing) * packing
+    if rows != need:
+        raise ValueError(
+            f"Raiden pipeline layer {pool['tag']} holds {rows} K/V head rows per "
+            f"token, but the {'draft' if is_draft else 'target'} model's {heads} "
+            f"kv heads need {need}; head slicing cannot split a row of heads "
+            "packed by SGLANG_TPU_KV_PACK_HEADS"
+        )
+    return heads
+
+
 def head_slice_spans(
     pools: Sequence[dict],
     tensors: Sequence[Any],
@@ -78,12 +109,19 @@ def head_slice_spans(
     swa: list[int],
     dst_attn_tp: int,
     total_kv_heads: int,
+    draft_kv_heads: int = 0,
+    draft_swa_kv_heads: int = 0,
 ) -> list[Any]:
     """Describe each destination rank's kv-head slice of every locally owned
-    page: one strided span per page and rank, routed to that rank only."""
+    page: one strided span per page and rank, routed to that rank only. Draft
+    layers are sliced by ``draft_kv_heads``, and draft window layers by
+    ``draft_swa_kv_heads``, when known."""
     result = []
     for pool, tensor in zip(pools, tensors):
         blocks = swa if is_swa_pool(pool["tag"]) else full
+        heads = _pool_kv_heads(
+            pool, tensor, total_kv_heads, draft_kv_heads, draft_swa_kv_heads
+        )
         if _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
             result.append(
                 _head_major_slice_spans(
@@ -91,7 +129,7 @@ def head_slice_spans(
                     tensor=tensor,
                     blocks=blocks,
                     dst_attn_tp=dst_attn_tp,
-                    total_kv_heads=total_kv_heads,
+                    total_kv_heads=heads,
                 )
             )
             continue
@@ -99,7 +137,7 @@ def head_slice_spans(
             src_tp=1,
             dst_tp=dst_attn_tp,
             hp_bytes=head_bytes(tensor),
-            total_kv_heads=total_kv_heads,
+            total_kv_heads=heads,
             kv_packing=int(tensor.shape[3]),
             element_size=tensor.element_size(),
         )
@@ -235,6 +273,8 @@ def part_spans(
     total_kv_heads: int,
     *,
     with_swa: bool,
+    draft_kv_heads: int = 0,
+    draft_swa_kv_heads: int = 0,
 ) -> list[Any]:
     """Spans of one transfer over the full-attention pools and, when with_swa,
     the sliding-window pools."""
@@ -247,7 +287,16 @@ def part_spans(
     tensors = [tensors[i] for i in keep]
     if dst_attn_tp == 1:
         return source_spans(pools, full, swa)
-    return head_slice_spans(pools, tensors, full, swa, dst_attn_tp, total_kv_heads)
+    return head_slice_spans(
+        pools,
+        tensors,
+        full,
+        swa,
+        dst_attn_tp,
+        total_kv_heads,
+        draft_kv_heads,
+        draft_swa_kv_heads,
+    )
 
 
 def part_destination_blocks(

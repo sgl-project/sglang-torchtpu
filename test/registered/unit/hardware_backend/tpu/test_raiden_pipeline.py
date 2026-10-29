@@ -1077,10 +1077,141 @@ class TestPipelineInitialization(unittest.TestCase):
         self.assertEqual(manager._pipeline_messages, [message])
 
 
+def bf16_heads(heads):
+    """A bf16 fused layer type holding ``heads`` kv-heads per token."""
+
+    class Heads(Bf16Buffer):
+        def __init__(self, pages=64):
+            self.shape = (pages, 128, heads, 2, 128)
+
+    return Heads
+
+
+class TestDraftKvHeads(unittest.TestCase):
+    """#1666: a TP1 producer slices draft pages for a TP decode by the draft's
+    own kv-head count, which an EAGLE3 draft takes from its own config."""
+
+    TARGET_HEADS = 4
+
+    def producer(self, draft_heads, known=True):
+        pipe = transfer(producer=True)
+        pipe.manager.kv_args.total_kv_head_num = self.TARGET_HEADS
+        layers = SimpleNamespace(
+            full=[bf16_heads(self.TARGET_HEADS)(), bf16_heads(draft_heads)()],
+            swa=[],
+            full_layer_ids=[6, 0],
+            swa_layer_ids=[],
+            num_draft_full=1,
+            num_draft_swa=0,
+        )
+        pipe.pools = pool_manifest(layers)
+        pipe.tensors = list(layers.full)
+        if known:
+            pipe.draft_kv_heads = draft_heads
+        return pipe
+
+    def registered_spans(self, pipe, dst_tp):
+        pipe.manager._prefill.send_blocks[7] = [20, 21]
+        pipe.finalize_send(7, None)
+        meta = json.dumps(dict(attn_tp_size=dst_tp, attn_tp_rank=0)).encode()
+        pipe.on_message([MessageTag.PIPELINE_REQ, b"7", b"tcp://decode:31000", meta])
+        return pipe.client.register_request_blocks.call_args.kwargs["pool_spans"]
+
+    @staticmethod
+    def landed(entry, heads, dst_tp):
+        """Apply one pool's spans to random source pages; return each rank's
+        destination bytes and the bytes it should hold."""
+        import numpy as np
+
+        head, tokens = 2 * 128 * 2, 128
+        per_rank = max(1, heads // dst_tp)
+        replication = max(1, dst_tp // heads)
+        src_page, dst_page = tokens * heads * head, tokens * per_rank * head
+        pages = np.random.default_rng(0).integers(
+            0, 255, size=(len(entry.block_ids), src_page), dtype=np.uint8
+        )
+        dst = [np.zeros(len(pages) * dst_page, dtype=np.uint8) for _ in range(dst_tp)]
+        for span in entry.spans:
+            for i in range(span.count):
+                s = span.src_offset_bytes + i * span.src_stride_bytes
+                d = span.dst_offset_bytes + i * span.dst_stride_bytes
+                assert s + span.size_bytes <= src_page, "read past the source page"
+                assert d + span.size_bytes <= dst[0].size, "wrote past the rank"
+                dst[span.dst_unit_ordinal][d : d + span.size_bytes] = pages[
+                    span.src_block_ordinal
+                ][s : s + span.size_bytes]
+        want = []
+        for rank in range(dst_tp):
+            first = rank // replication * per_rank
+            rows = pages.reshape(len(pages), tokens, heads * head)
+            want.append(
+                rows[:, :, first * head : (first + per_rank) * head].reshape(-1)
+            )
+        return dst, want
+
+    def test_draft_pages_land_as_the_decode_rank_draft_heads(self):
+        import numpy as np
+
+        for draft_heads in (2, 8):
+            for dst_tp in (2, 4):
+                with self.subTest(draft_heads=draft_heads, dst_tp=dst_tp):
+                    pipe = self.producer(draft_heads)
+                    spans = self.registered_spans(pipe, dst_tp)
+                    self.assertEqual([e.tag for e in spans], ["fa.l6", "draft.fa.l0"])
+                    for entry, heads in zip(spans, (self.TARGET_HEADS, draft_heads)):
+                        got, want = self.landed(entry, heads, dst_tp)
+                        for rank in range(dst_tp):
+                            self.assertTrue(
+                                np.array_equal(got[rank], want[rank]),
+                                (entry.tag, rank),
+                            )
+                    self.assertNotIn(7, pipe.manager.failure_records)
+
+    def test_a_draft_with_the_target_head_count_is_sliced_as_before(self):
+        layers = SimpleNamespace(
+            full=[bf16_heads(4)(), bf16_heads(4)()],
+            swa=[],
+            full_layer_ids=[6, 0],
+            swa_layer_ids=[],
+            num_draft_full=1,
+            num_draft_swa=0,
+        )
+        pools = pool_manifest(layers)
+        for dst_tp in (2, 4, 8):
+            before = head_slice_spans(pools, layers.full, [20, 21], [], dst_tp, 4)
+            after = head_slice_spans(
+                pools, layers.full, [20, 21], [], dst_tp, 4, draft_kv_heads=4
+            )
+            self.assertEqual(
+                [(e.tag, e.declared_bytes, [vars(s) for s in e.spans]) for e in after],
+                [(e.tag, e.declared_bytes, [vars(s) for s in e.spans]) for e in before],
+            )
+
+    def test_a_draft_page_the_plan_cannot_fit_fails_the_room(self):
+        """Without the draft's head count the draft is planned for the
+        target's heads; its page is checked against that and the room fails
+        on the registration path instead of moving the wrong bytes."""
+        pipe = self.producer(draft_heads=2, known=False)
+        pipe.manager._prefill.send_blocks[7] = [20, 21]
+        pipe.replies[7] = {"tcp://decode:31000": dict(attn_tp_size=2)}
+        self.assertFalse(pipe.finalize_send(7, None))
+        self.assertIn("7", pipe.manager._failed)
+        reason = pipe.manager.failure_records[7]
+        self.assertIn("draft.fa.l0 holds 4 K/V head rows", reason)
+        self.assertIn("draft model's 4 kv heads need 8", reason)
+        pipe.client.register_request_blocks.assert_not_called()
+        pipe._send.assert_not_called()
+
+    def test_a_dp_decode_takes_whole_draft_pages(self):
+        pipe = self.producer(draft_heads=2)
+        spans = self.registered_spans(pipe, dst_tp=1)
+        self.assertEqual(spans[1].declared_bytes, 2 * 128 * 2 * 512)
+
+
 class TestDraftPoolGroups(unittest.TestCase):
-    def pool(self, layers=2):
+    def pool(self, layers=2, **attrs):
         return SimpleNamespace(
-            start_layer=0, kv_buffer=[Buffer() for _ in range(layers)]
+            start_layer=0, kv_buffer=[Buffer() for _ in range(layers)], **attrs
         )
 
     def test_target_pool_alone_has_no_draft_pool(self):
@@ -1094,6 +1225,43 @@ class TestDraftPoolGroups(unittest.TestCase):
         groups = get_raiden_kv_caches(self.pool(), draft_pool=self.pool(layers=1))
         self.assertEqual(groups.num_draft_full, 1)
         self.assertEqual(groups.full_layer_ids, [0, 1, 0])
+
+    def test_the_draft_pool_reports_its_own_kv_head_count(self):
+        target = self.pool(head_num=8)
+        self.assertEqual(get_raiden_kv_caches(target).draft_kv_head_num, 0)
+        self.assertEqual(
+            get_raiden_kv_caches(target, draft_pool=target).draft_kv_head_num, 0
+        )
+        draft = self.pool(layers=1, head_num=2)
+        self.assertEqual(
+            get_raiden_kv_caches(target, draft_pool=draft).draft_kv_head_num, 2
+        )
+        # SGLANG_TPU_KV_PACK_HEADS stores two heads as one row of head_num 1.
+        packed = self.pool(layers=1, head_num=1, kv_pack_heads=2)
+        self.assertEqual(
+            get_raiden_kv_caches(target, draft_pool=packed).draft_kv_head_num, 2
+        )
+        self.assertEqual(
+            get_raiden_kv_caches(target, draft_pool=self.pool(1)).draft_kv_head_num,
+            0,
+        )
+
+    def test_a_hybrid_draft_pool_reports_its_window_head_count(self):
+        """An SWAKVPool's window sub-pool may hold its own head count; the
+        draft's window layers are planned with it."""
+        draft = self.pool(
+            layers=2,
+            head_num=2,
+            layers_mapping={0: (0, False), 1: (0, True)},
+            swa_kv_pool=SimpleNamespace(head_num=1, kv_pack_heads=1),
+        )
+        groups = get_raiden_kv_caches(self.pool(head_num=8), draft_pool=draft)
+        self.assertEqual((groups.num_draft_full, groups.num_draft_swa), (1, 1))
+        self.assertEqual(
+            (groups.draft_kv_head_num, groups.draft_swa_kv_head_num), (2, 1)
+        )
+        plain = get_raiden_kv_caches(self.pool(), draft_pool=self.pool(head_num=2))
+        self.assertEqual(plain.draft_swa_kv_head_num, 0)
 
 
 if __name__ == "__main__":

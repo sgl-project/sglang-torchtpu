@@ -113,7 +113,8 @@ Symmetric attn TP uses the pull path; `dst_tp < src_tp` uses the
 push-resharding path above. Needs `tpu_sync` built against the same `torch_tpu`
 as this fork (tpu-sync `build.sh`). Not covered: MLA,
 NSA, Mamba/GDN under push-resharding or pipeline transfer, speculative draft
-KV, decode prefix-cache reuse, `dst_tp > src_tp`.
+KV outside the pipeline transfer below, decode prefix-cache reuse,
+`dst_tp > src_tp`.
 
 ## Tunables (env)
 
@@ -232,9 +233,11 @@ Pool geometry and materialized TPU layouts must match between peers, and
 prefill and decode must both use hybrid SWA memory or both run with
 `--disable-hybrid-swa-memory`. Every pipeline stage needs at least one
 full-attention layer and, with hybrid SWA memory, at least one sliding-window
-layer. Speculative decoding is supported only on the decode, and only when its
-draft has no separate KV pool and takes no draft hidden states from the
-prefill.
+layer. A pipeline prefill may run speculative decoding; pipeline parallelism
+refuses it on any other role. A separate draft KV pool moves with the target's
+pages under `draft.fa` / `draft.swa` tags, sliced for a TP decode by the
+draft's own kv-head counts, and the last stage's aux carries the draft hidden
+states.
 Host staging uses bounded leases when the installed Raiden supports per-pool
 staging, which hybrid SWA memory requires. Older PP-capable wheels use full
 host mirrors; startup measures their

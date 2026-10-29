@@ -972,8 +972,8 @@ class Buffer:
 
     dtype = "torch.float8_e4m3fn"
 
-    def __init__(self, pages):
-        self.shape = (pages, 2 * HEADS, 128, 256)
+    def __init__(self, pages, heads=HEADS):
+        self.shape = (pages, 2 * heads, 128, 256)
         self.materialized = True
 
     def element_size(self):
@@ -1181,6 +1181,43 @@ def test_window_engine_without_bounded_staging_is_refused_before_any_engine():
     assert isinstance(r.error, RuntimeError)
     assert "--disable-hybrid-swa-memory" in str(r.error)
     assert r.engines == [] and r.stores == []
+
+
+def test_a_draft_window_layer_is_sliced_by_the_draft_window_head_count():
+    """#1666: PipelineTransfer takes the draft pool's head counts from its
+    groups, and the window twin slices a draft window layer by the draft's
+    window count: 4 target heads over 2 ranks, 1 draft head on both."""
+    groups = SimpleNamespace(
+        full=[Buffer(5121), Buffer(5121, heads=2)],
+        swa=[Buffer(1297), Buffer(1297, heads=1)],
+        full_layer_ids=[3, 0],
+        swa_layer_ids=[0, 1],
+        num_draft_full=1,
+        num_draft_swa=1,
+        draft_kv_head_num=2,
+        draft_swa_kv_head_num=1,
+    )
+    r = _initialize(groups)
+    assert r.error is None
+    pipe = r.pipe
+    assert (pipe.draft_kv_heads, pipe.draft_swa_kv_heads) == (2, 1)
+    pipe.client, pipe.swa.client = Mock(), Mock()
+    ps.register_twin(pipe, req_id="7", uuid=7, swa=[5, 6], dst_attn_tp=2)
+    entries = pipe.swa.client.register_request_blocks.call_args.kwargs["pool_spans"]
+    spans = {entry.tag: entry.spans for entry in entries}
+    assert sorted(spans) == ["draft.swa.l1", "swa.l0"]
+    head = 2 * 128 * 256  # one kv-head's K and V rows of an fp8 rank-4 page
+    for tag, heads in (("swa.l0", 2), ("draft.swa.l1", 1)):
+        for rank in range(2):
+            got = [
+                (s.src_offset_bytes, s.size_bytes)
+                for s in spans[tag]
+                if s.dst_unit_ordinal == rank
+            ]
+            first = rank * heads if tag == "swa.l0" else 0
+            assert got == [(first * head, heads * head)] * 2, (tag, rank)
+    assert "7" in pipe.swa.registered
+    pipe.client.cancel_request_blocks_if_unclaimed.assert_not_called()
 
 
 def test_full_attention_only_stage_is_unchanged():

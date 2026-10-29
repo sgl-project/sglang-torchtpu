@@ -82,6 +82,41 @@ def test_rank4_head_slices_land_on_owning_rank(total_kv_heads, dst_tp, dtype):
                 assert np.array_equal(got, want), (rank, index)
 
 
+@pytest.mark.parametrize("draft_heads,dst_tp", [(2, 2), (2, 4), (8, 2)])
+def test_rank4_draft_slices_follow_the_draft_head_count(draft_heads, dst_tp):
+    """#1666: a draft layer is sliced by its own kv-heads, not the target's 4."""
+    head_dim, page = 128, 16
+    target = torch.zeros((3, 2 * 4, head_dim, page), dtype=torch.bfloat16)
+    draft = torch.zeros((3, 2 * draft_heads, head_dim, page), dtype=torch.bfloat16)
+    groups = _groups([target, draft], [], [5, 0], [])
+    groups.num_draft_full = 1
+    pools = pl.pool_manifest(groups)
+    blocks = [4, 0]
+    _, entry = pp_common.head_slice_spans(
+        pools, [target, draft], blocks, [], dst_tp, 4, draft_kv_heads=draft_heads
+    )
+    assert entry.tag == "draft.fa.l0"
+    run = 2 * head_dim * page * draft.element_size()
+    heads_per_rank = max(1, draft_heads // dst_tp)
+    replication = max(1, dst_tp // draft_heads)
+    pages = np.random.default_rng(0).integers(
+        0, 255, size=(len(blocks), draft_heads * run), dtype=np.uint8
+    )
+    dst_page_bytes = heads_per_rank * run
+    dst = [
+        np.zeros(len(blocks) * dst_page_bytes, dtype=np.uint8) for _ in range(dst_tp)
+    ]
+    _apply(entry, pages, dst)
+    for rank in range(dst_tp):
+        first = rank // replication * heads_per_rank
+        for index in range(len(blocks)):
+            want = pages[index][first * run : (first + heads_per_rank) * run]
+            got = dst[rank][index * dst_page_bytes : (index + 1) * dst_page_bytes]
+            assert np.array_equal(got, want), (rank, index)
+    with pytest.raises(ValueError, match="draft model's 4 kv heads"):
+        pp_common.head_slice_spans(pools, [target, draft], blocks, [], dst_tp, 4)
+
+
 def test_rank4_fingerprint_ignores_per_rank_heads():
     """A PP producer holds every kv-head and a TP consumer a slice of them; the
     pools must still match, or the controller rejects the transfer."""
