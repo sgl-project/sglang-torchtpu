@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -203,8 +204,10 @@ class TestRegisteredAlgorithm(CustomTestCase):
             worker.K3ProgramWorker,
         )
         self.assertFalse(self.algo.need_topk())
-        args = SimpleNamespace()
+        args = SimpleNamespace(kv_cache_dtype="fp8_e4m3")
         self.algo.handle_server_args(args)
+        self.assertEqual(args.page_size, 16384)
+        self.assertTrue(args.disable_overlap_schedule and args.disable_radix_cache)
         self.assertEqual(
             (
                 args.speculative_num_steps,
@@ -217,6 +220,32 @@ class TestRegisteredAlgorithm(CustomTestCase):
         self.assertIsInstance(spec, worker.K3ProgramInput)
         self.assertIsNone(spec.accept_lens_device)
         worker.register()  # idempotent
+
+    def test_settings_through_sglangs_speculative_hook(self):
+        server_args = SimpleNamespace(
+            speculative_draft_model_path=None,
+            speculative_draft_model_revision=None,
+            speculative_moe_runner_backend=None,
+            moe_runner_backend="auto",
+            speculative_algorithm="k3_program",
+            decrypted_draft_config_file=None,
+            trust_remote_code=False,
+            speculative_draft_window_size=None,
+            speculative_draft_sink_size=None,
+            speculative_skip_dp_mlp_sync=False,
+            speculative_adaptive=False,
+            kv_cache_dtype="auto",
+        )
+        handle_speculative_decoding(server_args)
+        self.assertEqual(
+            (
+                server_args.page_size,
+                server_args.speculative_num_draft_tokens,
+                server_args.disable_overlap_schedule,
+                server_args.disable_radix_cache,
+            ),
+            (8192, 8, True, True),
+        )
 
     def test_worker_result(self):
         plan = bridge.UnifiedPoolPlan(40, 4, pools.cache_layout("auto"))

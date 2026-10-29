@@ -97,10 +97,20 @@ class K3ProgramAlgo(CustomSpecAlgo):
         )
 
     def handle_server_args(self, server_args: Any) -> None:
-        """Size the scheduler's per-round KV reservation for eight tokens."""
+        """The settings the programs serve under: a round's KV reservation
+        for eight tokens, KV pages of one logical block, the scheduler
+        synchronous (the worker runs each step to its tokens) and no radix
+        cache (a request's KDA state lives in the program's slots)."""
+        from sglang_tpu.k3_programs.kimi_k3.layout import cache_layout
+        from sglang_tpu.k3_programs.sglang_config import program_kv_cache_dtype
+
         server_args.speculative_num_steps = WIDTH - 1
         server_args.speculative_eagle_topk = 1
         server_args.speculative_num_draft_tokens = WIDTH
+        layout = cache_layout(program_kv_cache_dtype(server_args.kv_cache_dtype))
+        server_args.page_size = bridge.TP_SIZE * layout.tokens_per_block
+        server_args.disable_overlap_schedule = True
+        server_args.disable_radix_cache = True
 
     def build_disagg_draft_input(self, batch, last_tokens_tensor, future_map):
         # A request the P/D transfer delivered: the program takes its first
