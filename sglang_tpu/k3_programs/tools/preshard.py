@@ -250,7 +250,7 @@ def write_k3(args, log) -> None:
     checkpoint = load.Checkpoint(args.checkpoint)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
-    if host == 0:
+    if host == 0 or os.environ.get("K3_PRESHARD_EVERY_HOST") == "1":
         (output / "layout.json").write_text(
             json.dumps(
                 {
@@ -508,7 +508,10 @@ def run(args, log) -> int:
     if args.target == "k3":
         write_k3(args, log)
     elif args.target == "prefill":
-        if int(os.environ.get("SLURM_NODEID", "0")) == 0:
+        if (
+            int(os.environ.get("SLURM_NODEID", "0")) == 0
+            or os.environ.get("K3_PRESHARD_EVERY_HOST") == "1"
+        ):
             write_prefill(args, log)
     elif args.target == "dspark":
         write_dspark(args, log)

@@ -69,6 +69,16 @@ def resolve_hosts(hosts: list[str], timeout: float = 1800.0) -> list[str]:
             time.sleep(10)
 
 
+def topological_node(hosts: list[str], host_index: int) -> int:
+    """This pod's node rank in physical (z, y, x) host order, which device
+    ids, and so the programs' kernel ranks, follow: its devices are kernel
+    ranks ``8 * node .. 8 * node + 7``. Pod indices need not follow it."""
+    from sglang_tpu.node_normalization import TopologyConfig, query_node_rank
+
+    config = TopologyConfig(hosts=tuple(hosts), topology=(2, 2, 4))
+    return query_node_rank(config, host_index, timeout=600)
+
+
 def launch_pod(argv: list[str], extra_env: dict[str, str], per_host: int) -> int:
     """Run ``argv`` as this pod's ``per_host`` workers, with the Slurm variables
     the workers read (node index ``TPU_WORKER_ID``). Every pod of the slice runs
@@ -78,6 +88,13 @@ def launch_pod(argv: list[str], extra_env: dict[str, str], per_host: int) -> int
     if len(hosts) != 4:
         raise SystemExit(f"{len(hosts)} TPU hosts; the K3 programs need 4 (32 devices)")
     node = int(os.environ.get("TPU_WORKER_ID", "0"))
+    if per_host == 1:
+        # Host-side tools (the pre-shard) name what they write by kernel rank.
+        pod = node
+        node = topological_node(hosts, pod)
+        log_host(
+            f"pod {pod} is topological node {node} (kernel ranks {8 * node}..{8 * node + 7})"
+        )
     env = dict(os.environ)
     env.update(extra_env)
     env.update(
@@ -89,6 +106,9 @@ def launch_pod(argv: list[str], extra_env: dict[str, str], per_host: int) -> int
             "HF_HUB_OFFLINE": "1",
             "SLURM_NODEID": str(node),
             "SLURM_JOB_ID": "cdk",
+            # Every pod pre-shards onto its own volume: each writes the files
+            # one host writes on a shared Slurm file system.
+            "K3_PRESHARD_EVERY_HOST": "1",
         }
     )
     workers = [
