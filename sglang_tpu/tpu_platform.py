@@ -665,12 +665,6 @@ def _validate_decode_context_parallel(server_args) -> None:
             "--decode-context-parallel-size > 1 on TPU (got "
             f"{cfg.speculative_algorithm!r})."
         )
-    if cfg.enable_mixed_chunk:
-        raise ValueError(
-            "--enable-mixed-chunk is not supported with "
-            "--decode-context-parallel-size > 1 on TPU: the DCP attention runs "
-            "plain decode and extend batches only."
-        )
     if cfg.attn_dp_size > 1:
         raise ValueError(
             "DP attention (--attn-dp-size > 1) is not supported with "

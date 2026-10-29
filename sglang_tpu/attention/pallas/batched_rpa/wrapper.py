@@ -539,8 +539,10 @@ def calculate_block_sizes(
         "cache_only",
         "skip_kv_write",
         "return_lse",
+        "decode_query_size",
         "cp_group_size",
         "attention_scope",
+        "rpa_cases",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
@@ -574,10 +576,12 @@ def ragged_paged_attention(
     cache_only: bool = False,
     skip_kv_write: bool = False,
     return_lse: bool = False,
+    decode_query_size: int = 1,
     cp_group_size: int | None = None,
     cp_rank: jax.Array | None = None,
     kv_lens_global: jax.Array | None = None,
     attention_scope: configs.AttentionScope | int = configs.AttentionScope.FULL,
+    rpa_cases: tuple[configs.RpaCase, ...] | configs.RpaCase | None = None,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -710,6 +714,7 @@ def ragged_paged_attention(
         scale_k=k_scale,
         scale_v=v_scale,
         kv_layout=kv_layout,
+        decode_query_size=decode_query_size,
         cache_only=cache_only,
         skip_kv_write=skip_kv_write,
         return_lse=return_lse,
@@ -806,10 +811,19 @@ def ragged_paged_attention(
             kv_lens_global=kv_lens_global,
         )
 
-    o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
-        configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm
-    )
-    if serve_cfgs.attention_scope != configs.AttentionScope.STRIPED:
+    if rpa_cases is None:
+        active_cases = (configs.RpaCase.DECODE, configs.RpaCase.MIXED)
+    elif isinstance(rpa_cases, configs.RpaCase):
+        active_cases = (rpa_cases,)
+    else:
+        active_cases = tuple(rpa_cases)
+
+    o_hbm_alias_q_hbm = q_hbm
+    if configs.RpaCase.DECODE in active_cases:
+        o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
+            configs.RpaCase.DECODE, o_hbm_alias_q_hbm, kv_cache, lse_hbm
+        )
+    if configs.RpaCase.MIXED in active_cases:
         o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
             configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
         )

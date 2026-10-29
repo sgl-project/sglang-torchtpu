@@ -115,12 +115,18 @@ def build_dcp_kernel_op(spec):
         skip_kv_write: bool = False,
         cp_group_size: int = 0,
         attention_scope: int = 0,
+        rpa_cases: int = 0,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         # The kernel takes ``cp_group_size=None`` for the non-CP form and then
         # rejects the two CP operands, so drop them together.
         cp_size = cp_group_size if cp_group_size else None
         if cache_only and attention_scope == 0:
             attention_scope = 1
+        active_cases = None
+        if rpa_cases == 1:
+            active_cases = (configs.RpaCase.DECODE,)
+        elif rpa_cases == 2:
+            active_cases = (configs.RpaCase.MIXED,)
         return _jax_rpa(
             queries,
             keys,
@@ -146,6 +152,7 @@ def build_dcp_kernel_op(spec):
             cp_rank=cp_rank if cp_size else None,
             kv_lens_global=kv_lens_global if cp_size else None,
             attention_scope=attention_scope,
+            rpa_cases=active_cases,
         )
 
     jax_kernel = _torch_pallas.custom_jax_kernel(
@@ -153,8 +160,9 @@ def build_dcp_kernel_op(spec):
         name=f"jax_{DCP_OP_NAME}",
         # Static (non-traced) args by _wrapped position: 11=sm_scale,
         # 12=sliding_window, 13=soft_cap, 14=k_scale, 15=v_scale,
-        # 16=cache_only, 17=skip_kv_write, 18=cp_group_size, 19=attention_scope.
-        static_argnums=(11, 12, 13, 14, 15, 16, 17, 18, 19),
+        # 16=cache_only, 17=skip_kv_write, 18=cp_group_size, 19=attention_scope,
+        # 20=rpa_cases.
+        static_argnums=(11, 12, 13, 14, 15, 16, 17, 18, 19, 20),
         donate_argnums=(3,),
         input_output_aliases={3: 1},
         warn_deprecated=False,
@@ -186,6 +194,7 @@ def build_dcp_kernel_op(spec):
         skip_kv_write: bool = False,
         cp_group_size: int = 0,
         attention_scope: int = 0,
+        rpa_cases: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         with tpu_info_for_cpu_export():
             output, _updated_kv, lse = jax_kernel(
@@ -209,6 +218,7 @@ def build_dcp_kernel_op(spec):
                 skip_kv_write,
                 cp_group_size,
                 attention_scope,
+                rpa_cases,
             )
         return output, lse
 

@@ -579,6 +579,7 @@ def compute_metadata(
             rank = cp_rank_ref[0] if cp_rank_ref is not None else 0
             owns_token = (
                 (k_len_global > 0)
+                & (q_len == 1)
                 & (((k_len_global - 1) // page_size) % cp_size == rank)
             )
             kv_left_frm_cache = jnp.where(

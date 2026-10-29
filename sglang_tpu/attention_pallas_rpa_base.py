@@ -1080,11 +1080,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         if self._dcp > 1 and forward_batch.forward_mode not in (
             ForwardMode.DECODE,
             ForwardMode.EXTEND,
+            ForwardMode.MIXED,
         ):
             raise ValueError(
-                "Decode context parallelism supports plain decode and extend "
-                f"batches only; got {forward_batch.forward_mode.name}. "
-                "Speculative decoding, mixed batches and split prefill are not "
+                "Decode context parallelism supports plain decode, extend and "
+                f"mixed batches only; got {forward_batch.forward_mode.name}. "
+                "Speculative decoding and split prefill are not "
                 "supported on the TPU DCP path."
             )
 
@@ -1157,16 +1158,29 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             )
             if forward_batch.forward_mode.is_decode():
                 prefix_host = seq_lens_host
+                target_host = seq_lens_host
+                target_global = seq_lens_host
+            elif forward_batch.forward_mode.is_mixed():
+                # In mixed batches: decode sequences (ext == 1) fuse their new
+                # token into the stripe (length = seq_len); prefill chunks (ext > 1)
+                # attend the cached prefix only (length = seq_len - ext).
+                # Both have global length seq_lens_host so q_global_start = seq_lens - ext.
+                prefix_host = seq_lens_host - ext_host
+                is_decode_seq = (ext_host == 1)
+                target_host = torch.where(is_decode_seq, seq_lens_host, prefix_host)
+                target_global = seq_lens_host
             else:
                 prefix_host = seq_lens_host - ext_host
+                target_host = prefix_host
+                target_global = seq_lens_host
 
             def _padded(values: torch.Tensor) -> torch.Tensor:
                 out = torch.zeros(bs, dtype=torch.int32)
                 out[:live] = values.to(torch.int32)
                 return out.to(device, non_blocking=True)
 
-            kv_lens = _padded(self._dcp_lens(seq_lens_host))
-            dcp_kv_lens_global = _padded(seq_lens_host)
+            kv_lens = _padded(self._dcp_lens(target_host))
+            dcp_kv_lens_global = _padded(target_global)
             dcp_prefix_kv_lens = _padded(self._dcp_lens(prefix_host))
             dcp_cp_rank = self._cp_rank_t
 
@@ -1201,37 +1215,54 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         step_positions: torch.Tensor | None = None
         num_tokens = 0
         if self._dcp > 1 and not forward_batch.forward_mode.is_decode():
-            # Extend only: the fused STRIPED decode launch writes the owned
-            # token itself. The slots and positions of this step's tokens come
-            # from the host request-to-token table, so the owner-masked write
-            # targets are built here and shipped with the rest of the metadata,
-            # padded to the token bucket like the batch's own token fields.
-            starts = (seq_lens_host - ext_host).tolist()
-            counts = ext_host.tolist()
-            step_positions = torch.cat(
-                [
-                    torch.arange(s, s + n, dtype=torch.int64)
-                    for s, n in zip(starts, counts)
+            # Extend and mixed modes: write owned chunk tokens.
+            # In mixed mode, single-token decode queries (count == 1) are written
+            # in-kernel by the STRIPED launch, so write_spans covers only prefill chunks.
+            is_mixed = forward_batch.forward_mode.is_mixed()
+            starts_all = (seq_lens_host - ext_host).tolist()
+            counts_all = ext_host.tolist()
+            if is_mixed:
+                prefill_mask = [n > 1 for n in counts_all]
+                starts = [s for s, m in zip(starts_all, prefill_mask) if m]
+                counts = [n for n, m in zip(counts_all, prefill_mask) if m]
+                req_indices = [
+                    idx
+                    for idx, m in zip(
+                        req_pool_indices[: ext_host.numel()].tolist(), prefill_mask
+                    )
+                    if m
                 ]
-                + [torch.zeros(0, dtype=torch.int64)]
-            )
-            rows = torch.repeat_interleave(
-                req_pool_indices[: ext_host.numel()], ext_host
-            )
-            step_slots = req_to_token[rows, step_positions].to(torch.int64)
-            padded = getattr(forward_batch, "out_cache_loc", None)
-            num_tokens = (
-                padded.shape[0] if padded is not None else step_positions.numel()
-            )
-            write_spans = build_owner_write_spans(
-                step_positions,
-                step_slots,
-                self._dcp,
-                self._dcp_rank,
-                page_size,
-                num_tokens,
-                bs,
-            ).to_device(device)
+            else:
+                starts = starts_all
+                counts = counts_all
+                req_indices = req_pool_indices[: ext_host.numel()].tolist()
+
+            if counts:
+                step_positions = torch.cat(
+                    [
+                        torch.arange(s, s + n, dtype=torch.int64)
+                        for s, n in zip(starts, counts)
+                    ]
+                    + [torch.zeros(0, dtype=torch.int64)]
+                )
+                rows = torch.repeat_interleave(
+                    torch.tensor(req_indices, dtype=torch.int64),
+                    torch.tensor(counts, dtype=torch.int64),
+                )
+                step_slots = req_to_token[rows, step_positions].to(torch.int64)
+                padded = getattr(forward_batch, "out_cache_loc", None)
+                num_tokens = (
+                    padded.shape[0] if padded is not None else step_positions.numel()
+                )
+                write_spans = build_owner_write_spans(
+                    step_positions,
+                    step_slots,
+                    self._dcp,
+                    self._dcp_rank,
+                    page_size,
+                    num_tokens,
+                    bs,
+                ).to_device(device)
         if self._is_hybrid_swa:
             full_to_swa = self.token_to_kv_pool.full_to_swa_index_mapping
             assert full_to_swa is not None, (
@@ -1794,6 +1825,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 False,  # skip_kv_write: the owner writes its token
                 cp,  # cp_group_size
                 3,  # attention_scope: STRIPED
+                1,  # rpa_cases: DECODE only
             )
             out, lse = merge_across_ranks(
                 out_p.float(),
@@ -1807,31 +1839,63 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 out = sink_fold(out, lse, sinks)
             return out.to(q.dtype)
 
-        write_owned_kv(
-            self._kv_write_op, kv_cache, fused_kv_rows(k, v, kv_cache), spans
-        )
+        is_mixed = forward_batch.forward_mode.is_mixed()
+        if spans is not None and spans.lens.numel() > 0:
+            write_owned_kv(
+                self._kv_write_op, kv_cache, fused_kv_rows(k, v, kv_cache), spans
+            )
 
-        out_prefix, lse_prefix = self._dcp_op(
-            q_all,
-            k,
-            v,
-            kv_cache,
-            md.dcp_prefix_kv_lens,
-            page_indices,
-            md.cu_q_lens,
-            md.distribution,
-            md.dcp_kv_lens_global,
-            md.dcp_cp_rank,
-            None,  # attention_sink: folded in by the chunk pass below
-            sm_scale,
-            sliding_window,
-            soft_cap,
-            k_scale,
-            v_scale,
-            True,  # cache_only
-            True,  # skip_kv_write
-            cp,  # cp_group_size
-        )
+        if is_mixed:
+            # Mixed mode: Phase 2 runs STRIPED across both decode and prefill
+            # sequences. Decode sequences attend stripe + new token on owner;
+            # prefill chunks attend cached prefix only.
+            out_prefix, lse_prefix = self._dcp_op(
+                q_all,
+                k,
+                v,
+                kv_cache,
+                md.kv_lens,
+                page_indices,
+                md.cu_q_lens,
+                md.distribution,
+                md.dcp_kv_lens_global,
+                md.dcp_cp_rank,
+                None,  # attention_sink: folded in after merge
+                sm_scale,
+                sliding_window,
+                soft_cap,
+                k_scale,
+                v_scale,
+                False,  # cache_only
+                False,  # skip_kv_write: owner writes decode token
+                cp,  # cp_group_size
+                3,  # attention_scope: STRIPED
+                0,  # rpa_cases: DECODE + MIXED
+            )
+        else:
+            out_prefix, lse_prefix = self._dcp_op(
+                q_all,
+                k,
+                v,
+                kv_cache,
+                md.dcp_prefix_kv_lens,
+                page_indices,
+                md.cu_q_lens,
+                md.distribution,
+                md.dcp_kv_lens_global,
+                md.dcp_cp_rank,
+                None,  # attention_sink: folded in by the chunk pass below
+                sm_scale,
+                sliding_window,
+                soft_cap,
+                k_scale,
+                v_scale,
+                True,  # cache_only
+                True,  # skip_kv_write
+                cp,  # cp_group_size
+                1,  # attention_scope: CACHE_ONLY
+                2,  # rpa_cases: MIXED only
+            )
         out_prefix, lse_prefix = merge_across_ranks(
             out_prefix.float(),
             lse_prefix,
@@ -1856,7 +1920,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             md.distribution,
             md.dcp_kv_lens_global,  # unused: this pass is not context-parallel
             md.dcp_cp_rank,
-            sinks,
+            None if is_mixed else sinks,
             sm_scale,
             sliding_window,
             soft_cap,
@@ -1865,8 +1929,20 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             False,  # cache_only
             True,  # skip_kv_write
             0,  # cp_group_size
+            2 if is_mixed else 0,  # attention_scope: NEW_TOKENS_ONLY / FULL
+            2,  # rpa_cases: MIXED only (skips DECODE!)
         )
-        out, _lse = merge_lse(out_prefix, lse_prefix, out_chunk.float(), lse_chunk)
+
+        if is_mixed:
+            decode_mask = (q_lens == 1)
+            token_is_decode = torch.repeat_interleave(decode_mask, q_lens).unsqueeze(-1)
+            lse_chunk = torch.where(token_is_decode, -float("inf"), lse_chunk)
+
+        out, lse = merge_lse(out_prefix, lse_prefix, out_chunk.float(), lse_chunk)
+
+        if is_mixed and sinks is not None:
+            out = sink_fold(out, lse, sinks)
+
         return out.to(q.dtype)
 
     # ------------------------------------------------------------------ #

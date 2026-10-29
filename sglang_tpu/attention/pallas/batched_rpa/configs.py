@@ -108,6 +108,7 @@ class ServingConfigs:
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE
     smem_fraction_limit_for_schedule_generation: float = 0.33
     max_schedule_size_multiplier: int = 16
+    decode_query_size: int = 1
     # Context-parallel modes; see `wrapper.ragged_paged_attention`.
     cache_only: bool = False
     skip_kv_write: bool = False
@@ -571,5 +572,9 @@ class RpaConfigs:
             raise ValueError("cp_rank and kv_lens_global require cp_group_size.")
 
         if self.serve.attention_scope == AttentionScope.STRIPED:
-            if self.mode != RpaCase.DECODE:
-                raise ValueError("AttentionScope.STRIPED is decode-only.")
+            if self.serve.decode_query_size != 1:
+                raise ValueError(
+                    "AttentionScope.STRIPED requires decode_query_size == 1, got"
+                    f" {self.serve.decode_query_size=}; use the CACHE_ONLY +"
+                    " NEW_TOKENS_ONLY pair for multi-token decode."
+                )
