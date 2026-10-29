@@ -198,10 +198,43 @@ class TestWaveBuffers(CustomTestCase):
             (SimpleNamespace(pp_transfer_dtype=torch.float32), torch.float32),
         ):
             with self.subTest(dtype=dtype):
-                self.assertEqual(self._wave_args(policy, model)["dtype"], dtype)
+                wave_args = self._wave_args(policy, model)
+                self.assertEqual(wave_args["dtype"], dtype)
+                self.assertEqual(wave_args["aux_dtype"], torch.bfloat16)
                 proxy = policy._pp_warmup_kwargs(64)["pp_proxy_tensors"]
                 for name in ("hidden_states", "residual"):
                     self.assertEqual(proxy[name].dtype, dtype)
+
+    def test_aux_slots_stay_in_compute_dtype_when_transfer_is_fp32(self):
+        from sglang.srt.layers.aux_hidden_states import AUX_HIDDEN_STATES_PROXY_KEY
+
+        policy = self._policy([64, 256], [1, 32])
+        model = SimpleNamespace(
+            pp_transfer_dtype=torch.float32,
+            relays_pp_aux_hidden_states=True,
+        )
+        self._wave_args(policy, model)
+        policy.model_runner.spec_aux_config = SpecAuxHiddenStateConfig(
+            dflash_use_aux_hidden_state=True,
+            dflash_target_layer_ids=[1, 16],
+        )
+        with patch.object(pp_scheduler, "build_pp_wave") as build:
+            SchedulerPPMixin._pp_init_wave(
+                SimpleNamespace(
+                    pp_group=policy.model_runner.pp_group,
+                    tp_group=SimpleNamespace(),
+                    world_group=SimpleNamespace(),
+                    tp_worker=SimpleNamespace(model_runner=policy.model_runner),
+                )
+            )
+        wave_args = build.call_args.kwargs
+        self.assertEqual(wave_args["dtype"], torch.float32)
+        self.assertEqual(wave_args["aux_dtype"], torch.bfloat16)
+        self.assertEqual(wave_args["num_aux"], 2)
+        proxy = policy._pp_warmup_kwargs(64)["pp_proxy_tensors"]
+        self.assertEqual(proxy["hidden_states"].dtype, torch.float32)
+        self.assertEqual(proxy["residual"].dtype, torch.float32)
+        self.assertEqual(proxy[AUX_HIDDEN_STATES_PROXY_KEY].dtype, torch.bfloat16)
 
 
 if __name__ == "__main__":

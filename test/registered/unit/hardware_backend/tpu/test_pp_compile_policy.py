@@ -176,6 +176,26 @@ class TestWarmupProxy(CustomTestCase):
         self.assertEqual(tuple(proxy["hidden_states"].shape), (64, _HIDDEN))
         materialize.assert_called_once()
 
+    def test_warmup_proxy_uses_fp32_pp_transfer_dtype_and_bf16_aux_slots(self):
+        from sglang.srt.layers.aux_hidden_states import AUX_HIDDEN_STATES_PROXY_KEY
+
+        runner = _model_runner(_pp_group(first=False, last=False))
+        runner.model.pp_transfer_dtype = torch.float32
+        runner.model.relays_pp_aux_hidden_states = True
+        runner.spec_aux_config = SimpleNamespace(
+            eagle_use_aux_hidden_state=False,
+            dflash_use_aux_hidden_state=True,
+            dflash_target_layer_ids=[1, 16, 31],
+        )
+        _, kwargs = _policy(runner)._make_warmup_inputs(
+            num_tokens=64, bs=4, mode=ForwardMode.EXTEND
+        )
+        proxy = kwargs["pp_proxy_tensors"]
+        self.assertEqual(proxy["hidden_states"].dtype, torch.float32)
+        self.assertEqual(proxy["residual"].dtype, torch.float32)
+        self.assertEqual(proxy[AUX_HIDDEN_STATES_PROXY_KEY].dtype, torch.bfloat16)
+        self.assertEqual(proxy[AUX_HIDDEN_STATES_PROXY_KEY].shape, (64, 3 * _HIDDEN))
+
 
 class TestLogitsProcessorGating(CustomTestCase):
     def test_only_the_last_stage_compiles_the_logits_processor(self):
