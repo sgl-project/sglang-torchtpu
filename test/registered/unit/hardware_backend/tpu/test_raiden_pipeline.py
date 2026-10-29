@@ -33,6 +33,7 @@ from sglang_tpu.disaggregation.raiden.pipeline import (
 )
 from sglang_tpu.disaggregation.raiden.pp_common import (
     head_slice_spans,
+    is_swa_pool,
     source_spans,
 )
 from sglang_tpu.disaggregation.raiden.serde import MessageTag, RoomFailed
@@ -85,6 +86,26 @@ class Fp8Buffer(Buffer):
 
     def __init__(self, pages=64):
         self.shape = (pages, 128, 4, 4, 128)
+
+
+class BundleBuffer(Buffer):
+    """A block-major bundle: every layer of a page in one row."""
+
+    def __init__(self, pages=64, layers=3):
+        self.shape = (pages, layers, 128, 8, 2, 128)
+
+
+def bundle_groups(full=(1, 3), swa=(0, 3), pages=64):
+    """Bundle groups as (first global layer, layer count) per namespace."""
+    return SimpleNamespace(
+        full=[BundleBuffer(pages, full[1])],
+        swa=[BundleBuffer(pages, swa[1])] if swa else [],
+        full_layer_ids=[full[0]],
+        swa_layer_ids=[swa[0]] if swa else [],
+        num_draft_full=0,
+        num_hidden_full=0,
+        num_draft_swa=0,
+    )
 
 
 def groups(full=(0, 2), swa=(1, 3), pages=64, buffer=Buffer, draft_full=()):
@@ -399,8 +420,12 @@ class TestLayerPools(unittest.TestCase):
         consumer = groups(full=(6,), swa=(), buffer=Bf16Buffer)
         consumer.full[0].shape = (64, 128, 1, 2, 128)
         self.assertEqual(
-            layout_fingerprint(pool_manifest(producer), producer.full, getter),
-            layout_fingerprint(pool_manifest(consumer), consumer.full, getter),
+            layout_fingerprint(
+                pool_manifest(producer), producer.full, getter, ships_pd_hidden=False
+            ),
+            layout_fingerprint(
+                pool_manifest(consumer), consumer.full, getter, ships_pd_hidden=False
+            ),
         )
 
     def test_fingerprint_matches_an_uneven_stage_subset(self):
@@ -408,15 +433,22 @@ class TestLayerPools(unittest.TestCase):
         stage = groups(full=tuple(range(55, 62)), swa=(), pages=192)
         getter = lambda tensor: ((4, 3, 2, 1, 0), ((8, 128),), 8)
         self.assertEqual(
-            layout_fingerprint(pool_manifest(full), full.full, getter),
-            layout_fingerprint(pool_manifest(stage), stage.full, getter),
+            layout_fingerprint(
+                pool_manifest(full), full.full, getter, ships_pd_hidden=False
+            ),
+            layout_fingerprint(
+                pool_manifest(stage), stage.full, getter, ships_pd_hidden=False
+            ),
         )
         self.assertNotEqual(
-            layout_fingerprint(pool_manifest(full), full.full, getter),
+            layout_fingerprint(
+                pool_manifest(full), full.full, getter, ships_pd_hidden=False
+            ),
             layout_fingerprint(
                 pool_manifest(stage),
                 stage.full,
                 lambda tensor: ((4, 3, 2, 1, 0), ((4, 128),), 8),
+                ships_pd_hidden=False,
             ),
         )
 
@@ -428,8 +460,12 @@ class TestLayerPools(unittest.TestCase):
         stage = groups(full=(0, 1), swa=())
         decode = groups(full=(0, 1, 2), swa=(), draft_full=(0,))
         self.assertEqual(
-            layout_fingerprint(pool_manifest(stage), stage.full, getter),
-            layout_fingerprint(pool_manifest(decode), decode.full, getter),
+            layout_fingerprint(
+                pool_manifest(stage), stage.full, getter, ships_pd_hidden=False
+            ),
+            layout_fingerprint(
+                pool_manifest(decode), decode.full, getter, ships_pd_hidden=False
+            ),
         )
 
     def test_pp_ranks_have_distinct_ports_and_share_the_host_budget(self):
@@ -440,6 +476,62 @@ class TestLayerPools(unittest.TestCase):
         self.assertEqual(ranks, set(range(8)))
         self.assertEqual(ranks_per_node(1, 1, 1, 1, pp_size=8), 8)
         self.assertEqual(ranks_per_node(1, 1, 1, 2, pp_size=8), 4)
+
+
+class TestBlockMajorBundlePools(unittest.TestCase):
+    ROW_BYTES = 3 * 128 * 8 * 2 * 128
+    BUNDLE_LAYOUT = staticmethod(lambda _: ((5, 4, 3, 2, 1, 0), ((8, 128),), 8))
+    LAYER_LAYOUT = staticmethod(lambda _: ((4, 3, 2, 1, 0), ((8, 128),), 8))
+
+    def test_bundle_is_one_pool_named_by_its_first_layer_and_count(self):
+        pools = pool_manifest(bundle_groups(full=(1, 3), swa=(0, 3)))
+        self.assertEqual([p["tag"] for p in pools], ["fa.l1+3", "swa.l0+3"])
+        self.assertEqual([p["storage_index"] for p in pools], [0, 1])
+        self.assertEqual([p["block_stride_bytes"] for p in pools], [self.ROW_BYTES] * 2)
+        self.assertEqual([is_swa_pool(p["tag"]) for p in pools], [False, True])
+
+    def test_bundle_pages_move_as_whole_rows(self):
+        pools = pool_manifest(bundle_groups())
+        spans = source_spans(pools, [100, 103], [12])
+        self.assertEqual(
+            [entry.declared_bytes for entry in spans],
+            [2 * self.ROW_BYTES, self.ROW_BYTES],
+        )
+        self.assertEqual(
+            [span.size_bytes for span in spans[0].spans], [self.ROW_BYTES] * 2
+        )
+
+    def test_bundle_fingerprint_spans_stage_layer_counts_not_layouts(self):
+        """Every stage of a transfer must fingerprint alike, whatever its layer
+        count, and a per-layer peer must not, so the controller rejects a
+        mixed pair at every transfer."""
+
+        def fingerprint(layers, getter):
+            return layout_fingerprint(
+                pool_manifest(layers), layers.full, getter, ships_pd_hidden=False
+            )
+
+        five = fingerprint(bundle_groups(full=(1, 5), swa=()), self.BUNDLE_LAYOUT)
+        four = fingerprint(bundle_groups(full=(11, 4), swa=()), self.BUNDLE_LAYOUT)
+        per_layer = fingerprint(groups(full=(1, 3), swa=()), self.LAYER_LAYOUT)
+        self.assertEqual(five, four)
+        self.assertNotEqual(five, per_layer)
+
+    def test_bundle_rejects_tensor_parallel_consumers(self):
+        layers = bundle_groups(swa=())
+        with self.assertRaisesRegex(ValueError, "block-major"):
+            head_slice_spans(pool_manifest(layers), layers.full, [20], [], 8, 8)
+
+    def test_legacy_mirrors_size_a_bundle_as_its_row(self):
+        layers = bundle_groups(swa=())
+        self.assertEqual(
+            legacy_slot_host_bytes(layers.full, 4, self.BUNDLE_LAYOUT),
+            4 * self.ROW_BYTES,
+        )
+        slots, _ = legacy_mirror_slots(
+            pool_manifest(layers), self.ROW_BYTES, 4, 1 << 40
+        )
+        self.assertEqual(slots, 4)
 
 
 class TestLegacyPoolBudget(unittest.TestCase):
@@ -688,29 +780,37 @@ class TestPipelineLifetimes(unittest.TestCase):
         once instead of leaving it to wait out the transfer deadline."""
         from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 
-        pipe = transfer(pp_size=8, pp_rank=3)
-        pipe.receives[7] = receive(rank=3)
-        meta = pipe.receives[7].sources[3] | {"pool_tags": ["fa.l12", "swa.l13"]}
-        manager = RaidenKVManager.__new__(RaidenKVManager)
-        manager.attn_tp_rank = 0
-        manager._pipeline_enabled = True
-        manager._pipeline_init_lock = threading.Lock()
-        manager._pipeline = pipe
-        manager._state_lock = threading.Lock()
-        manager._status_lock = threading.Lock()
-        manager._aborted = {}
-        manager._failed = set()
-        manager.failure_lock = threading.Lock()
-        manager.failure_records = {}
-        manager.request_status = {7: KVPoll.Transferring}
-        with self.assertRaisesRegex(ValueError, "same layers per stage"):
-            manager._dispatch(
-                [MessageTag.PIPELINE_READY, b"7", json.dumps(meta).encode(), b""]
-            )
-        self.assertIn("7", manager._failed)
-        self.assertIn(7, manager._aborted)
-        self.assertEqual(manager.request_status[7], KVPoll.Failed)
-        self.assertIn("same layers per stage", manager.failure_records[7])
+        # The second tag set names this stage's layers in the block-major layout.
+        for tags in (["fa.l12", "swa.l13"], ["fa.l6+1", "swa.l7+1"]):
+            with self.subTest(tags=tags):
+                pipe = transfer(pp_size=8, pp_rank=3)
+                pipe.receives[7] = receive(rank=3)
+                meta = pipe.receives[7].sources[3] | {"pool_tags": tags}
+                manager = RaidenKVManager.__new__(RaidenKVManager)
+                manager.attn_tp_rank = 0
+                manager._pipeline_enabled = True
+                manager._pipeline_init_lock = threading.Lock()
+                manager._pipeline = pipe
+                manager._state_lock = threading.Lock()
+                manager._status_lock = threading.Lock()
+                manager._aborted = {}
+                manager._failed = set()
+                manager.failure_lock = threading.Lock()
+                manager.failure_records = {}
+                manager.request_status = {7: KVPoll.Transferring}
+                with self.assertRaisesRegex(ValueError, "same layers per stage"):
+                    manager._dispatch(
+                        [
+                            MessageTag.PIPELINE_READY,
+                            b"7",
+                            json.dumps(meta).encode(),
+                            b"",
+                        ]
+                    )
+                self.assertIn("7", manager._failed)
+                self.assertIn(7, manager._aborted)
+                self.assertEqual(manager.request_status[7], KVPoll.Failed)
+                self.assertIn("same layers per stage", manager.failure_records[7])
 
     def test_dp_destination_takes_aux_from_the_last_stage_only(self):
         """Stages before the last carry no draft hidden states; their aux must not

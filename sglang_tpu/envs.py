@@ -155,6 +155,11 @@ class TpuEnvs:
     # Fused KV pool stores a rank's heads side by side in one 128-lane row when they
     # fit exactly (e.g. 2 x head_dim 64): half the bytes of a zero-padded row per head.
     SGLANG_TPU_KV_PACK_HEADS = EnvBool(False)
+    # Allocates RPA v3 MHA KV as [num_blocks, layer_num, page_size, ...],
+    # so all layers for a page form one row for single-DMA Raiden P/D transfers.
+    # Both P/D servers must agree; tpu_platform refuses the configurations that
+    # read layer by layer.
+    SGLANG_TPU_USE_BLOCK_MAJOR_KV = EnvBool(False)
 
     # Raiden PD disaggregation
     # Base control port. Each local rank reserves consecutive control/data

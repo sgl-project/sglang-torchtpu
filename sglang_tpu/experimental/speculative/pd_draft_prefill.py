@@ -12,9 +12,13 @@ from collections.abc import Callable
 
 import torch
 
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+    SpecAuxHiddenStateConfig,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang_tpu.disaggregation.raiden.common import get_raiden_kv_caches
@@ -24,12 +28,22 @@ from sglang_tpu.experimental.speculative.pd_hidden_pool import PdHiddenPool
 PdDraftPrefiller = Callable[[ScheduleBatch], None]
 
 _pd_draft_prefiller: PdDraftPrefiller | None = None
+_pd_draft_prompt_cap: Callable[[], int] | None = None
 
 
-def register_pd_draft_prefiller(prefiller: PdDraftPrefiller) -> None:
-    """Set the draft prompt pass a PD decode runs on each prebuilt batch."""
-    global _pd_draft_prefiller
+def register_pd_draft_prefiller(
+    prefiller: PdDraftPrefiller, *, max_prompt_tokens: Callable[[], int]
+) -> None:
+    """Set the draft prompt pass a PD decode runs on each prebuilt batch, and the
+    longest prompt it takes (read once the compile policy exists)."""
+    global _pd_draft_prefiller, _pd_draft_prompt_cap
     _pd_draft_prefiller = prefiller
+    _pd_draft_prompt_cap = max_prompt_tokens
+
+
+def pd_draft_prompt_cap() -> int | None:
+    """The longest prompt the decode's draft prompt pass takes; None without one."""
+    return None if _pd_draft_prompt_cap is None else _pd_draft_prompt_cap()
 
 
 def get_pd_draft_prefiller() -> PdDraftPrefiller:
@@ -38,10 +52,8 @@ def get_pd_draft_prefiller() -> PdDraftPrefiller:
     return _pd_draft_prefiller
 
 
-def draft_feature_size(target_runner: ModelRunner) -> int:
+def draft_feature_size(config: SpecAuxHiddenStateConfig, hidden_size: int) -> int:
     """Width of the target hidden the draft reads: its aux layers, or the final hidden."""
-    config = target_runner.spec_aux_config
-    hidden_size = target_runner.model_config.hidden_size
     if config.eagle_use_aux_hidden_state:
         layer_ids = config.eagle_aux_hidden_state_layer_ids
     elif config.dflash_use_aux_hidden_state:
@@ -56,6 +68,18 @@ def draft_feature_size(target_runner: ModelRunner) -> int:
     return len(layer_ids) * hidden_size
 
 
+def pd_hidden_bytes_per_token(
+    config: SpecAuxHiddenStateConfig, model_config: ModelConfig, dtype: torch.dtype
+) -> int:
+    """The hidden pool's HBM per KV token slot on this rank."""
+    return PdHiddenPool.bytes_per_token(
+        feature_size=draft_feature_size(config, model_config.hidden_size),
+        total_kv_heads=model_config.get_total_num_kv_heads(),
+        attn_tp_size=get_parallel().attn_tp_size,
+        dtype=dtype,
+    )
+
+
 def build_pd_hidden_pool(target_runner: ModelRunner) -> PdHiddenPool:
     """A hidden pool paged like the target's full-attention KV pages."""
     full = get_raiden_kv_caches(target_runner.token_to_kv_pool).full
@@ -63,7 +87,9 @@ def build_pd_hidden_pool(target_runner: ModelRunner) -> PdHiddenPool:
     return PdHiddenPool(
         num_pages=int(full[0].shape[0]),
         page_size=int(full[0].shape[1]),
-        feature_size=draft_feature_size(target_runner),
+        feature_size=draft_feature_size(
+            target_runner.spec_aux_config, target_runner.model_config.hidden_size
+        ),
         total_kv_heads=target_runner.model_config.get_total_num_kv_heads(),
         attn_tp_size=parallel.attn_tp_size,
         attn_tp_group=parallel.attn_tp_group if parallel.attn_tp_size > 1 else None,
@@ -79,12 +105,8 @@ def prebuilt_extend_groups(
     groups = []
     start = tokens = 0
     for index, length in enumerate(batch.extend_lens):
-        if length > max_tokens:
-            raise NotImplementedError(
-                f"A {length}-token prompt exceeds the decode's largest extend bucket "
-                f"{max_tokens}; SGLANG_TPU_PD_DECODE_DRAFT_PREFILL runs the draft over "
-                "a whole prompt at once, so raise --tpu-compile-tokens."
-            )
+        # Admission aborts longer prompts (reject_overlong_pd_draft_prompt).
+        assert length <= max_tokens, (length, max_tokens)
         if index > start and (
             tokens + length > max_tokens or index - start == max_reqs
         ):

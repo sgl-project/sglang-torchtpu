@@ -237,6 +237,46 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertIsNone(forwarded.penalizer_orchestrator)
         self.assertEqual(forwarded.on_device().temperatures.shape, (8, 1))
 
+    def test_host_sampling_params_repack_after_filter(self):
+        batch = self.batch([2, 5])
+        info = batch.sampling_info
+        info.top_ks = torch.tensor([8, 16, 1, 1], dtype=torch.int32)
+        info.top_ps = torch.tensor([0.8, 0.9, 1.0, 1.0])
+        info.min_ps = torch.tensor([0.1, 0.2, 0.0, 0.0])
+        info.sampling_seed = torch.tensor([31, 37, 0, 0], dtype=torch.int64)
+        batch.filter_batch(keep_indices=[1])
+        expected = {
+            "temperatures": (0.2, 1.0),
+            "top_ps": (0.9, 1.0),
+            "top_ks": (16, 1),
+            "min_ps": (0.2, 0.0),
+            "sampling_seed": (37, 0),
+        }
+        for rows in (1, 4, 8):
+            with self.subTest(rows=rows):
+                params = info.host_params_at(rows)
+                for name, (live, fill) in expected.items():
+                    value = params[name]
+                    self.assertEqual(value.shape[0], rows)
+                    self.assertEqual(value.dtype, getattr(info, name).dtype)
+                    padded = torch.full_like(value, fill)
+                    padded[0] = live
+                    self.assertTrue(torch.equal(value, padded), name)
+        self.assertEqual(info.top_ks.shape, (4,))
+        self.assertIs(info.host_params_at(4)["top_ks"], info.top_ks)
+
+    def test_host_sampling_params_live_row_boundaries(self):
+        info = self.batch([2]).sampling_info
+        with self.assertRaisesRegex(ValueError, "live batch"):
+            info.host_params_at(0)
+        info.real_batch_size = 0
+        params = info.host_params_at(0)
+        self.assertNotIn("sampling_seed", params)
+        for value in params.values():
+            self.assertEqual(value.shape[0], 0)
+        with self.assertRaisesRegex(ValueError, "live batch"):
+            info.host_params_at(-1)
+
     def test_pd_prefill_without_overlap_filters_core_rows(self):
         """A PP PD prefill filters its chunked extend batch without overlap; FutureMap
         owns no rows there, so the filter must keep core's rows and the seed's."""

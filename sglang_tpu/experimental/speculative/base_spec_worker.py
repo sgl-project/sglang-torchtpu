@@ -290,7 +290,10 @@ class TpuSpecWorker(BaseSpecWorker):
         pool = build_pd_hidden_pool(self.target_worker.model_runner)
         register_pd_hidden_pool(pool)
         if disagg_mode == "decode":
-            register_pd_draft_prefiller(self.prefill_draft_from_pd)
+            register_pd_draft_prefiller(
+                self.prefill_draft_from_pd,
+                max_prompt_tokens=self._pd_draft_max_prompt_tokens,
+            )
         return pool
 
     @property
@@ -314,6 +317,12 @@ class TpuSpecWorker(BaseSpecWorker):
         return self._pd_hidden_pool.write(
             target_hidden, segments=segments.to(self.device, non_blocking=True)
         )
+
+    def _pd_draft_max_prompt_tokens(self) -> int:
+        """The decode draft prompt pass takes a prompt in one extend bucket."""
+        t_bucketer = self._compile_policy().t_bucketer
+        assert t_bucketer is not None
+        return t_bucketer.max_val
 
     def prefill_draft_from_pd(self, batch: ScheduleBatch) -> None:
         """Draft prompt pass of a PD decode's prebuilt batch, from the shipped hidden rows."""

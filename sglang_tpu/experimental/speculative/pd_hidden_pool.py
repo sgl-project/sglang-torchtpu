@@ -88,6 +88,15 @@ class PdHiddenPool:
         self._row_width = total_kv_heads * _PACKING * self.lanes
         self._span_write: Callable[..., None] | None = None
 
+    @staticmethod
+    def bytes_per_token(
+        *, feature_size: int, total_kv_heads: int, attn_tp_size: int, dtype: torch.dtype
+    ) -> int:
+        """HBM one token's row takes on a rank, as the KV budget counts it."""
+        local_heads = max(1, total_kv_heads // attn_tp_size)
+        lanes = hidden_lanes(feature_size=feature_size, total_kv_heads=total_kv_heads)
+        return local_heads * _PACKING * lanes * torch._utils._element_size(dtype)
+
     def write_segments(
         self, cache_loc_cpu: torch.Tensor, num_rows: int
     ) -> torch.Tensor:

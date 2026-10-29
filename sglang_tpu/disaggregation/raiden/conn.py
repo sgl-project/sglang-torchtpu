@@ -62,6 +62,7 @@ from sglang_tpu.disaggregation.raiden.common import (
     RaidenKVCacheGroups,
     _tcp_endpoint,
     get_raiden_kv_caches,
+    kv_layout_of,
     logger,
 )
 from sglang_tpu.disaggregation.raiden.host_pool import (
@@ -77,6 +78,7 @@ from sglang_tpu.disaggregation.raiden.receiver import (
 )
 from sglang_tpu.disaggregation.raiden.sender import RaidenKVSender, RaidenSenderMixin
 from sglang_tpu.disaggregation.raiden.serde import (
+    PER_LAYER_KV_LAYOUT,
     Blocks,
     Chunk,
     MessageTag,
@@ -146,6 +148,8 @@ class RaidenKVManager(
     _pipeline = None
     _pipeline_enabled = False
     _listener_start_read = False
+    # Layout tag of the registered KV tensors, sent with every CHUNK and BLOCKS.
+    kv_layout: str = PER_LAYER_KV_LAYOUT
     # State engine: one row per request for GDN, or multi-page request rings for DSV4.
     _state_engine: Optional[Any] = None
     _state_kv_caches: Tuple[Any, ...] = ()
@@ -347,6 +351,7 @@ class RaidenKVManager(
         is identical. Taking it from the SWA tensor rather than assuming it
         matches keeps the two pools free to differ in dtype or head_dim.
         """
+        from sglang_tpu.disaggregation.raiden.pp_common import _BLOCK_MAJOR_KV_RANK
         from sglang_tpu.disaggregation.raiden.reshard_schedule import (
             ReshardGeometry,
             head_pair_bytes,
@@ -360,6 +365,16 @@ class RaidenKVManager(
                 + " KV tensors to build a reshard geometry from"
             )
         tensor = tensors[0]
+        # Resharding runs only for unequal attention TP (the pull path serves
+        # equal TP), and it slices per-layer heads a bundle row does not expose.
+        if len(tensor.shape) == _BLOCK_MAJOR_KV_RANK and src_attn_tp != dst_attn_tp:
+            raise ValueError(
+                "Raiden push resharding moves per-layer kv-head slices, which a "
+                "block-major KV bundle (SGLANG_TPU_USE_BLOCK_MAJOR_KV) does not "
+                f"have; got attention TP {src_attn_tp} on prefill and "
+                f"{dst_attn_tp} on decode. Run both at equal attention TP or "
+                "unset SGLANG_TPU_USE_BLOCK_MAJOR_KV on both."
+            )
         hp = head_pair_bytes(tensor)
         # Distinct model kv-head count (model_config.get_total_num_kv_heads()),
         # set on both the prefill and decode KVArgs.
@@ -378,6 +393,7 @@ class RaidenKVManager(
         """
         self._kv_caches = list(kv_caches.full)
         self._swa_kv_caches = list(kv_caches.swa)
+        self.kv_layout = kv_layout_of(self._kv_caches)
         self._state_kv_caches = tuple(kv_caches.state)
         self._state_type = kv_caches.state_type
         self._state_max_blocks = kv_caches.state_max_blocks
@@ -444,10 +460,11 @@ class RaidenKVManager(
         swa_pool_pages = None
         state_pool_pages = None
         logger.info(
-            "RaidenKVManager rank%d engine up | endpoint=%s max_blocks=%d "
-            "num_slots=%d pool_pages=%d chunked=%d parallelism=%d",
+            "RaidenKVManager rank%d engine up | endpoint=%s kv_tensors=%d "
+            "max_blocks=%d num_slots=%d pool_pages=%d chunked=%d parallelism=%d",
             self.attn_tp_rank,
             self.raiden_endpoint,
+            len(self._kv_caches),
             max_blocks,
             num_slots,
             pool_pages,
@@ -469,9 +486,10 @@ class RaidenKVManager(
             swa_pool_pages = swa_num_slots * swa_max_blocks
             logger.info(
                 "RaidenKVManager rank%d SWA engine up | endpoint=%s "
-                "max_blocks=%d num_slots=%d pool_pages=%d",
+                "kv_tensors=%d max_blocks=%d num_slots=%d pool_pages=%d",
                 self.attn_tp_rank,
                 self.swa_raiden_endpoint,
+                len(self._swa_kv_caches),
                 swa_max_blocks,
                 swa_num_slots,
                 swa_pool_pages,

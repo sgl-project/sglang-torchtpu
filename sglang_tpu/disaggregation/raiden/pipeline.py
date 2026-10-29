@@ -27,6 +27,7 @@ from sglang_tpu.disaggregation.raiden.host_pool import (
 )
 from sglang_tpu.disaggregation.raiden.pipeline_final_chunks import FinalChunks
 from sglang_tpu.disaggregation.raiden.pp_common import (
+    _BLOCK_MAJOR_KV_RANK,
     _HEAD_MAJOR_KV_RANK,
     _kv_rank,
     _new_transfer_state,
@@ -58,7 +59,11 @@ _EARLY_COMPLETION = "Only an empty producer registration may complete before"
 
 
 def pool_manifest(groups: Any) -> list[dict]:
-    """Name each local full-attention or sliding-window tensor by model layer."""
+    """Name each local full-attention or sliding-window tensor by model layer.
+
+    A block-major bundle is one pool whose block is the whole row,
+    ``<kind>.l<first>+<count>``; it pairs only with a bundle of the same layers.
+    """
     pools = []
     for kind, tensors, layer_ids, num_draft, num_hidden in (
         (
@@ -82,11 +87,13 @@ def pool_manifest(groups: Any) -> list[dict]:
                 tag_kind = f"draft.{kind}"
             else:
                 tag_kind = f"pdhid.{kind}"
-            _kv_rank(tensor)
+            tag = f"{tag_kind}.l{int(layer)}"
+            if _kv_rank(tensor) == _BLOCK_MAJOR_KV_RANK:
+                tag += f"+{int(tensor.shape[1])}"
             size = math.prod(int(n) for n in tensor.shape[1:]) * tensor.element_size()
             pools.append(
                 dict(
-                    tag=f"{tag_kind}.l{int(layer)}",
+                    tag=tag,
                     storage_index=len(pools),
                     base_offset_bytes=0,
                     block_stride_bytes=size,
@@ -130,10 +137,13 @@ def materialized_storage_layout(tensor, getter):
     return layout
 
 
-def layout_fingerprint(pools: Sequence[dict], tensors: Sequence[Any], getter) -> str:
+def layout_fingerprint(
+    pools: Sequence[dict], tensors: Sequence[Any], getter, *, ships_pd_hidden: bool
+) -> str:
     """Compare per-class page geometry and materialized layout across layer
     subsets; the per-rank head count is left out so a tensor-parallel consumer
-    matches its producer."""
+    matches its producer. ships_pd_hidden makes both ends agree on
+    SGLANG_TPU_PD_DECODE_DRAFT_PREFILL, which the skipped pdhid pools cannot."""
     classes = {}
     schema = "sglang-fused-kv-v2"
     for pool, tensor in zip(pools, tensors):
@@ -149,6 +159,10 @@ def layout_fingerprint(pools: Sequence[dict], tensors: Sequence[Any], getter) ->
             # Axis 1, the per-rank 2 * kv_heads, is left out.
             schema = "sglang-rpa-seq-kv-v1"
             page_shape = [int(tensor.shape[2]), int(tensor.shape[3])]
+        elif _kv_rank(tensor) == _BLOCK_MAJOR_KV_RANK:
+            # Axis 1, the layer count, differs between stages; the tag carries it.
+            schema = "sglang-block-major-kv-v1"
+            page_shape = [int(n) for n in tensor.shape[2:]]
         else:
             page_shape = [
                 int(tensor.shape[1]),
@@ -168,8 +182,19 @@ def layout_fingerprint(pools: Sequence[dict], tensors: Sequence[Any], getter) ->
         if kind in classes and classes[kind] != signature:
             raise ValueError(f"Raiden {kind} layers have differing page layouts")
         classes[kind] = signature
-    value = json.dumps(dict(schema=schema, classes=classes), sort_keys=True)
+    fields = dict(schema=schema, classes=classes)
+    if ships_pd_hidden:
+        fields["pd_hidden"] = True
+    value = json.dumps(fields, sort_keys=True)
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _ships_pd_hidden() -> bool:
+    """Whether this P/D pair moves draft-input hidden rows instead of draft KV."""
+    from sglang.srt.runtime_context import get_spec
+    from sglang_tpu.experimental import pd_decode_draft_prefill
+
+    return pd_decode_draft_prefill() and get_spec().speculative_algorithm is not None
 
 
 def destination_blocks(
@@ -632,6 +657,7 @@ class PipelineTransfer:
             pools,
             tensors,
             tpu_torch_compile.get_device_layout_if_materialized,
+            ships_pd_hidden=_ships_pd_hidden(),
         )
         client.register_work_unit(
             unit=unit,
@@ -1223,7 +1249,8 @@ class PipelineTransfer:
                 return
             if mgr.pp_size > 1 and set(meta["pool_tags"]) != set(self._pool_tags()):
                 raise ValueError(
-                    "Matching pipelines must own the same layers per stage"
+                    "Matching pipelines must own the same layers per stage, "
+                    "in the same KV layout (SGLANG_TPU_USE_BLOCK_MAJOR_KV)"
                 )
             if meta.get("part") is None:
                 pp_swa.check_agreement(self, meta)

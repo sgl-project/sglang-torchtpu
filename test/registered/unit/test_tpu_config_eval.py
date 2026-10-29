@@ -103,6 +103,42 @@ class TestTpuConfigEval(unittest.TestCase):
         self.assertEqual(json.loads(args[3]), {"adapter": "/tmp/adapter"})
 
 
+class TestMultiHostPDEngines(unittest.TestCase):
+    """A P/D engine that spans a slice launches as a multi-node server on each
+    of the slice's hosts, with its role and the Raiden backend."""
+
+    RECIPE = "recipe/configs/kimi_k3/pd.py"
+
+    def test_each_engine_plans_one_rank_of_a_four_host_server(self):
+        import argparse
+
+        from sglang.srt.server_args import ServerArgs
+
+        topology = {"TPU_WORKER_ID": "2", "TPU_WORKER_HOSTNAMES": "h0,h1,h2,h3"}
+        for export, role in (
+            ("PREFILL_CONFIG", "prefill"),
+            ("DECODE_CONFIG", "decode"),
+        ):
+            with self.subTest(engine=export):
+                plan = plan_launch(
+                    load_recipe(f"{self.RECIPE}:{export}"), inherited=topology
+                )
+                args = plan.config.server_args
+                self.assertEqual((args["nnodes"], args["node_rank"]), (4, 2))
+                self.assertEqual(args["dist_init_addr"], "h0:10011")
+                self.assertEqual(args["disaggregation_mode"], role)
+                self.assertEqual(args["disaggregation_transfer_backend"], "raiden")
+                self.assertIsNone(plan.router)
+                argv = plan.command[plan.command.index("sglang.launch_server") + 1 :]
+                parser = argparse.ArgumentParser()
+                ServerArgs.add_cli_args(parser)
+                parser.parse_args(argv)
+
+    def test_a_recipe_without_engines_cannot_be_selected(self):
+        with self.assertRaisesRegex(ValueError, "Select PREFILL_CONFIG"):
+            load_recipe("recipe/configs/kimi_k26/mmmu.py:PREFILL_CONFIG")
+
+
 class TestAccuracyRecipes(unittest.TestCase):
     MULTIHOST = (
         "recipe/configs/deepseek_r1_0528/accuracy.py",
