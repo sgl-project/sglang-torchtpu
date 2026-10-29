@@ -1965,6 +1965,15 @@ class Envs:
     # Override the computed ladder's rung count, trading compiles against
     # padding waste. Unset leaves each encoder on the count it picked.
     SGLANG_TPU_VIT_NUM_PRECOMPILE_BUCKETS = EnvInt(None)
+    # VisionTpuAttention, dense flash_attention path: query rows per kernel tile.
+    # Unset keeps the kernel default (128). 256 gives bitwise-identical outputs
+    # with half the grid steps (applied up to 12288 keys, where it fits the
+    # default scoped VMEM); other values change the summation and are rejected.
+    SGLANG_TPU_VISION_FLASH_BLOCK_Q = EnvInt(None)
+    # VisionTpuAttention, dense flash_attention path: compute only the key chunks
+    # whose segments meet each query block (band-skip kernel). Byte-identical to the
+    # dense kernel at the shapes it covers; other shapes keep the dense kernel.
+    SGLANG_TPU_VISION_FLASH_BAND_SKIP = EnvBool(False)
     # MoE: offload the gather in permute and unpermute to SparseCore.
     SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)
     # MoE: gather on the TensorCore below this many routed rows (tokens x topk);

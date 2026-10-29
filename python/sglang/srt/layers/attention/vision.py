@@ -1106,7 +1106,11 @@ class VisionTpuAttention(nn.Module):
         self.scale = (
             softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
         )
-        self._flash_op = _get_vision_flash_op(float(self.scale))
+        self._flash_op = _get_vision_flash_op(
+            float(self.scale),
+            envs.SGLANG_TPU_VISION_FLASH_BLOCK_Q.get(),
+            envs.SGLANG_TPU_VISION_FLASH_BAND_SKIP.get(),
+        )
         self._sdpa_fallback = VisionSdpaAttention(
             head_dim=head_dim,
             num_heads=num_heads,
