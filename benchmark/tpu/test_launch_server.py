@@ -144,7 +144,10 @@ class TestRuntimeEnvironment(unittest.TestCase):
         from benchmark.tpu.recipe.configs.muse_spark.agentic import get_config
 
         prefill, decode = (get_config(24, mode=m) for m in ("prefill", "decode"))
-        self.assertEqual(prefill["server_args"]["pp_size"], 8)
+        self.assertEqual(prefill["server_args"]["pp_size"], 2)
+        for config in (prefill, decode):
+            # A rank != 0 in a one-host group makes launch_server start nothing.
+            self.assertEqual(config["runtime_env"]["SGLANG_LAUNCHER_RANK"], "0")
         self.assertEqual(prefill["runtime_env"]["SGLANG_TPU_MUSE_MEGAKERNEL"], "0")
         self.assertEqual(decode["runtime_env"]["SGLANG_TPU_MUSE_MEGAKERNEL"], "1")
         self.assertEqual(decode["runtime_env"]["SGLANG_RAIDEN_PIPELINE_TRANSFER"], "1")

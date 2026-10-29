@@ -5,7 +5,7 @@ applies its _Patch: KV layout (bf16 at c4/c8, fp8 1M-context elsewhere), running
 requests, prefill/decode interval and megakernel row cap. The mode picks the engine:
 
 - mixed: one TP8 server, prefill and decode together.
-- prefill / decode: one Raiden P/D engine each, a PP8 prefill host feeding a TP8
+- prefill / decode: one Raiden P/D engine each, a PP2 x TP4 prefill host feeding a TP8
   megakernel decode host, both on the experimental spec worker.
 
 The fp8 pool assumes a windowed draft: a DFlash2 config declaring is_hybrid_swa and
@@ -205,6 +205,8 @@ _PD: dict[str, dict] = {
         # These JobSet variables describe the public router, not its engines.
         "HOST": None,
         "PORT": None,
+        # Each engine is rank 0 of its own one-host group, whatever TPU_WORKER_ID its pod has.
+        "SGLANG_LAUNCHER_RANK": "0",
     },
 }
 
@@ -212,10 +214,15 @@ _ROLES: dict[str, dict[str, dict]] = {
     "prefill": {
         "server_args": {
             "disaggregation_mode": "prefill",
-            # Raiden's pipeline producer needs attention TP=1; PP rejects the overlap schedule.
-            "tp_size": 1,
+            # Raiden's pipeline producer needs attention TP=1 (DP attention), while NVFP4
+            # MoE needs fused-RS expert TP > 1; PP rejects the overlap schedule.
+            "tp_size": 4,
+            "dp_size": 4,
+            "enable_dp_attention": True,
+            # The DFlash draft shares the target head, sharded over attention TP under DP.
+            "enable_dp_lm_head": True,
             "ep_size": 1,
-            "pp_size": 8,
+            "pp_size": 2,
             "disable_overlap_schedule": True,
         },
         # The megakernel runs the whole decoder in one kernel, so it cannot be staged.
