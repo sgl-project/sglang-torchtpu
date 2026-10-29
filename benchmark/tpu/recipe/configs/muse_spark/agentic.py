@@ -160,12 +160,21 @@ _PATCHES_BY_CONCURRENCY: dict[int, dict[str, dict]] = {
 }
 
 
+def _apply(patch: dict[str, dict]) -> dict:
+    config = deepcopy(_BASE)
+    for section, overrides in patch.items():
+        config[section].update(deepcopy(overrides))
+    return config
+
+
+def build_config(max_running_requests: int, **patch_kwargs) -> dict:
+    """_BASE with the fp8 1M-context KV unless patch_kwargs overrides _patch's defaults."""
+    return _apply(_patch(max_running_requests, **patch_kwargs))
+
+
 def get_config(concurrency: int) -> dict:
     if concurrency not in _PATCHES_BY_CONCURRENCY:
         raise ValueError(
             f"no patch for concurrency {concurrency}; defined: {sorted(_PATCHES_BY_CONCURRENCY)}"
         )
-    config = deepcopy(_BASE)
-    for section, overrides in _PATCHES_BY_CONCURRENCY[concurrency].items():
-        config[section].update(deepcopy(overrides))
-    return config
+    return _apply(_PATCHES_BY_CONCURRENCY[concurrency])
