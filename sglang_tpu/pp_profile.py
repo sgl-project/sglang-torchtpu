@@ -108,19 +108,24 @@ def set_profile_inputs(policy, batch, args, kwargs, tokens, prefix):
         # repeats.
         rows = max_extend_tokens(context_len=runner.model_config.context_len)
 
-        def randn(cols: int) -> torch.Tensor:
+        transfer_dtype = getattr(runner.model, "pp_transfer_dtype", runner.dtype)
+
+        def randn(cols: int, dtype: torch.dtype) -> torch.Tensor:
             return torch.randn(
                 (rows, cols),
                 generator=generator,
-                dtype=getattr(runner.model, "pp_transfer_dtype", runner.dtype),
+                dtype=dtype,
             ).to(device)
 
-        proxy = {"hidden_states": randn(hidden), "residual": randn(hidden)}
+        proxy = {
+            "hidden_states": randn(hidden, transfer_dtype),
+            "residual": randn(hidden, transfer_dtype),
+        }
         # Serving hands the aux capture slots on with the activations, so
         # the profiled chunk must carry them too.
         num_aux = num_relayed_aux_slots(runner.spec_aux_config, runner.model)
         if num_aux:
-            proxy[AUX_HIDDEN_STATES_PROXY_KEY] = randn(hidden * num_aux)
+            proxy[AUX_HIDDEN_STATES_PROXY_KEY] = randn(hidden * num_aux, runner.dtype)
         kwargs["pp_proxy_tensors"] = PPProxyTensors(proxy)
         tensors.extend(proxy.values())
     from torch_tpu._internal.sync.sync import synchronize
