@@ -17,8 +17,10 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs import sglang_bridge as bridge
+from sglang_tpu.k3_programs import sglang_config
 from sglang_tpu.k3_programs import sglang_step as step
 from sglang_tpu.k3_programs.kimi_k3 import pools
+from sglang_tpu.k3_programs.kimi_k3 import program as k3_program
 from sglang_tpu.k3_programs.kimi_k3.layout import KDA, MLA, NUM_LAYERS
 
 PACKAGE = pathlib.Path(bridge.__file__).parent
@@ -41,9 +43,7 @@ class TestVendoredPrograms(CustomTestCase):
                 names = (
                     [a.name for a in node.names]
                     if isinstance(node, ast.Import)
-                    else [node.module or ""]
-                    if isinstance(node, ast.ImportFrom)
-                    else []
+                    else [node.module or ""] if isinstance(node, ast.ImportFrom) else []
                 )
                 for name in names:
                     with self.subTest(file=str(path.relative_to(PACKAGE)), name=name):
@@ -196,6 +196,69 @@ class TestStepConversion(CustomTestCase):
         self.assertEqual((flat, lens), ([5, 6, 7, 9], [3, 1, 0]))
         with self.assertRaisesRegex(ValueError, "not -1 padded"):
             step.accepted(np.array([[-1, 4]]), num_requests=1)
+
+
+class TestEngineConfig(CustomTestCase):
+    def test_golden_acceptance_lengths_as_rates(self):
+        rates = sglang_config.acceptance_length_to_rates
+        self.assertEqual(rates(3.78, 7)[:2], (1.0, 1.0))
+        self.assertAlmostEqual(rates(3.78, 7)[2], 0.78)
+        self.assertEqual(rates(3.78, 7)[3:], (0.0,) * 4)
+        self.assertEqual(rates(2.87, 3)[0], 1.0)
+        self.assertAlmostEqual(rates(2.87, 3)[1], 0.87)
+        self.assertEqual(rates(2.87, 3)[2], 0.0)
+        self.assertAlmostEqual(sum(rates(3.78, 7)) + 1, 3.78)
+        with self.assertRaisesRegex(ValueError, "in \\[1, 4\\]"):
+            rates(4.5, 3)
+
+    def test_configs_pass_the_programs_check(self):
+        decode = sglang_config.engine_config(
+            role="decode",
+            max_running_requests=8,
+            context_length=1 << 20,
+            chunked_prefill_size=8192,
+            speculative_tokens=7,
+            simulate_acc_lengths={7: 3.78, 3: 2.87},
+        )
+        k3_program.check(decode)
+        self.assertEqual(
+            decode.num_speculative_tokens_per_batch_size, ((1, 4, 7), (5, 8, 3))
+        )
+        self.assertEqual(
+            [w for w, _ in decode.synthetic_acceptance_rates_by_width], [3, 7]
+        )
+        self.assertEqual(
+            (decode.block_size, decode.cp_kv_cache_interleave_size), (256, 256)
+        )
+        prefill = sglang_config.engine_config(
+            role="prefill",
+            max_running_requests=16,
+            context_length=1 << 20,
+            chunked_prefill_size=8192,
+            kv_cache_dtype="fp8",
+        )
+        k3_program.check(prefill)
+        self.assertEqual(prefill.block_size, 512)
+
+    def test_every_scheduled_width_needs_a_length(self):
+        with self.assertRaisesRegex(
+            ValueError, "no simulated acceptance length for \\[3\\]"
+        ):
+            sglang_config.engine_config(
+                role="decode",
+                max_running_requests=8,
+                context_length=1 << 20,
+                chunked_prefill_size=8192,
+                speculative_tokens=7,
+                simulate_acc_lengths={7: 3.78},
+            )
+        with self.assertRaisesRegex(ValueError, "roles"):
+            sglang_config.engine_config(
+                role="both",
+                max_running_requests=1,
+                context_length=1,
+                chunked_prefill_size=1,
+            )
 
 
 if __name__ == "__main__":
