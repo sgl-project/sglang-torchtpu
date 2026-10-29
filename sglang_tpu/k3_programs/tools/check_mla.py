@@ -23,7 +23,7 @@ import dataclasses
 
 import numpy as np
 
-from tools.megakernel import harness
+from sglang_tpu.k3_programs.tools import harness
 
 
 def add_arguments(sub) -> None:
@@ -49,12 +49,12 @@ def run_mladraft(args, records: harness.Records) -> None:
     import torch
     from jax.sharding import PartitionSpec as P
 
-    from tools.megakernel import k3
-    from vllm_torchtpu.megakernel.bridge import register_op
-    from vllm_torchtpu.megakernel.kimi_k3 import config
-    from vllm_torchtpu.megakernel.kimi_k3.decode_ops import DecodeOps
-    from vllm_torchtpu.megakernel.kimi_k3.draft_mla import MlaDsparkDraft
-    from vllm_torchtpu.megakernel.kimi_k3.program import kernel_modules
+    from sglang_tpu.k3_programs.tools import k3
+    from sglang_tpu.k3_programs.bridge import register_op
+    from sglang_tpu.k3_programs.kimi_k3 import config
+    from sglang_tpu.k3_programs.kimi_k3.decode_ops import DecodeOps
+    from sglang_tpu.k3_programs.kimi_k3.draft_mla import MlaDsparkDraft
+    from sglang_tpu.k3_programs.kimi_k3.program import kernel_modules
 
     mla, kernel = kernel_modules("dspark_mla", "dspark_mla_kernel")
     R, steps, stride = args.requests, args.steps, args.stride

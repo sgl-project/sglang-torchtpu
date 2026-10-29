@@ -16,7 +16,7 @@ CACHE_DTYPE = "auto"
 
 def configure_cache(dtype: str) -> None:
     """Configure standalone fixtures from the same cache option as serving."""
-    from vllm_torchtpu.megakernel.kimi_k3.layout import cache_layout
+    from sglang_tpu.k3_programs.kimi_k3.layout import cache_layout
 
     global PAGE, LOGICAL, CACHE_DTYPE
     PAGE = cache_layout(dtype).tokens_per_block
@@ -26,7 +26,7 @@ def configure_cache(dtype: str) -> None:
 
 def logical() -> int:
     """Tokens per DCP block under the installed kernel config's DCP group."""
-    from vllm_torchtpu.megakernel.kimi_k3 import config
+    from sglang_tpu.k3_programs.kimi_k3 import config
 
     return PAGE * config.active().dcp_group
 
@@ -35,7 +35,7 @@ def fixed_prompt(count: int, checkpoint: str):
     """``(tokens, tokenizer)``: the first ``count`` tokens of a fixed text, the
     model repository's own Python sources (``checkpoint``: the Kimi-K3
     checkpoint directory)."""
-    from vllm_torchtpu.megakernel.kimi_k3.program import kernel_modules
+    from sglang_tpu.k3_programs.kimi_k3.program import kernel_modules
 
     (load,) = kernel_modules("load")
     tokenizer = load.load_tokenizer(checkpoint)
@@ -58,8 +58,8 @@ class Pools:
     ) -> None:
         import torch
 
-        from vllm_torchtpu.megakernel import program as mk
-        from vllm_torchtpu.megakernel.kimi_k3 import layout
+        from sglang_tpu.k3_programs import program as mk
+        from sglang_tpu.k3_programs.kimi_k3 import layout
 
         cache = layout.cache_layout(CACHE_DTYPE)
         dtype = getattr(torch, cache.dtype)
@@ -116,7 +116,7 @@ class Pools:
         ``g = index % dp`` (fewest requests first) and its pages are ids
         ``g * num_blocks + row`` (``megakernel.dp_blocks``); the null block
         stays shared."""
-        from vllm_torchtpu.megakernel.kimi_k3 import config
+        from sglang_tpu.k3_programs.kimi_k3 import config
 
         group = index % config.active().attention_dp
         table = np.asarray(table, np.int32)
@@ -149,8 +149,8 @@ def engine_config(
     """The serving configuration's megakernel view, for the TP32 / DCP32
     deployment (DCP over each group under the installed kernel config's
     attention DP) with the configured cache (``configure_cache``)."""
-    from vllm_torchtpu.megakernel.config import MegakernelEngineConfig
-    from vllm_torchtpu.megakernel.kimi_k3 import config
+    from sglang_tpu.k3_programs.config import MegakernelEngineConfig
+    from sglang_tpu.k3_programs.kimi_k3 import config
 
     dp = config.active().attention_dp
     return MegakernelEngineConfig(
@@ -181,7 +181,7 @@ def decoder(
     fixture ``pools``, bound and ready to warm. ``schedule``: vLLM's
     per-batch-size draft count (None: plain steps only). Pages are owned by
     mesh position, as the fixtures lay them out."""
-    from vllm_torchtpu.megakernel.kimi_k3.decode import KimiDecoder
+    from sglang_tpu.k3_programs.kimi_k3.decode import KimiDecoder
 
     config = engine_config(
         "decode",
@@ -206,7 +206,7 @@ def request(
     """A decode step's request scheduling ``tokens`` after ``computed`` ones,
     MLA pages ``table``. Its KDA tables hold only the null block, so a
     decoder that has not seen it starts it from a clean state (no import)."""
-    from vllm_torchtpu.megakernel import program as mk
+    from sglang_tpu.k3_programs import program as mk
 
     tokens = np.asarray(tokens, np.int32)
     end = computed + len(tokens)

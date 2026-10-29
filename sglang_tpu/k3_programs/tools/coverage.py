@@ -27,7 +27,7 @@ import threading
 from pathlib import Path
 
 ROOTS = tuple(
-    str(Path(__file__).resolve().parents[2] / "src/vllm_torchtpu/megakernel" / sub)
+    str(Path(__file__).resolve().parents[1] / sub)
     for sub in ("kimi_k3/kernels", "common")
 )
 

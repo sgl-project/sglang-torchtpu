@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import socket
 import subprocess
 import sys
 import time
@@ -47,6 +48,45 @@ def log(msg: str) -> None:
         print(f"[{time.perf_counter() - T0:7.1f}s r{rank():02d}] {msg}", flush=True)
 
 
+def in_pod() -> bool:
+    """A CDK pod of a 2x2x4 slice: no Slurm allocation, and the GKE TPU webhook
+    gives every pod the slice's hosts and its own index."""
+    return "TPU_WORKER_HOSTNAMES" in os.environ and not os.environ.get("SLURM_JOB_ID")
+
+
+def launch_pod(argv: list[str], extra_env: dict[str, str], per_host: int) -> int:
+    """Run ``argv`` as this pod's ``per_host`` workers, with the Slurm variables
+    the workers read (node index ``TPU_WORKER_ID``). Every pod of the slice runs
+    the same command; the master port and session must agree, so they are
+    fixed rather than drawn."""
+    hosts = os.environ["TPU_WORKER_HOSTNAMES"].split(",")
+    if len(hosts) != 4:
+        raise SystemExit(f"{len(hosts)} TPU hosts; the K3 programs need 4 (32 devices)")
+    node = int(os.environ.get("TPU_WORKER_ID", "0"))
+    env = dict(os.environ)
+    env.update(extra_env)
+    env.update(
+        {
+            WORKER_ENV: "1",
+            "TP32_HOST_IPS": ",".join(socket.gethostbyname(h) for h in hosts),
+            "MASTER_PORT": env.get("MASTER_PORT", "20111"),
+            "TP32_SESSION": env.get("TP32_SESSION", "cdk"),
+            "HF_HUB_OFFLINE": "1",
+            "SLURM_NODEID": str(node),
+            "SLURM_JOB_ID": "cdk",
+        }
+    )
+    workers = [
+        subprocess.Popen(
+            [sys.executable, "-m", "sglang_tpu.k3_programs.tools", *argv],
+            env=dict(env, SLURM_LOCALID=str(i), SLURM_PROCID=str(node * per_host + i)),
+        )
+        for i in range(per_host)
+    ]
+    codes = [worker.wait() for worker in workers]
+    return next((code for code in codes if code), 0)
+
+
 def launch(
     argv: list[str],
     jobid: str,
@@ -55,7 +95,10 @@ def launch(
     per_host: int = LOCAL_WORLD,
 ) -> int:
     """Run ``python -m tools.megakernel argv`` on the four hosts of ``jobid``,
-    ``per_host`` processes each (default one per TPU device)."""
+    ``per_host`` processes each (default one per TPU device). In a CDK pod
+    (no ``jobid``), run this pod's share (:func:`launch_pod`)."""
+    if not jobid and in_pod():
+        return launch_pod(argv, extra_env, per_host)
     nodelist = subprocess.run(
         ["squeue", "-j", jobid, "-h", "-o", "%N"], capture_output=True, text=True
     ).stdout.strip()
@@ -100,7 +143,7 @@ def launch(
         f"--chdir={REPO}",
         f"{venv}/bin/python",
         "-m",
-        "tools.megakernel",
+        "sglang_tpu.k3_programs.tools",
         *argv,
     ]
     return subprocess.call(command, env=env)

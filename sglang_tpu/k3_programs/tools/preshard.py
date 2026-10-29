@@ -107,7 +107,7 @@ def _modules():
     import importlib
 
     return tuple(
-        importlib.import_module(f"vllm_torchtpu.megakernel.kimi_k3.kernels.{m}")
+        importlib.import_module(f"sglang_tpu.k3_programs.kimi_k3.kernels.{m}")
         for m in ("load", "dspark")
     )
 
@@ -278,7 +278,7 @@ def _mla_module():
     import importlib
 
     return importlib.import_module(
-        "vllm_torchtpu.megakernel.kimi_k3.kernels.dspark_mla"
+        "sglang_tpu.k3_programs.kimi_k3.kernels.dspark_mla"
     )
 
 

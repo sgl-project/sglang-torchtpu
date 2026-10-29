@@ -44,7 +44,7 @@ import time
 
 import numpy as np
 
-from tools.megakernel import harness, k3
+from sglang_tpu.k3_programs.tools import harness, k3
 
 
 def add_arguments(parser) -> None:
@@ -91,7 +91,7 @@ def add_arguments(parser) -> None:
         default=None,
         help="the DSpark speculator checkpoint: compare the prefill's rings too",
     )
-    from tools.megakernel.check_mla import add_arguments as add_mla_arguments
+    from sglang_tpu.k3_programs.tools.check_mla import add_arguments as add_mla_arguments
 
     add_mla_arguments(sub)
     greedy = sub.add_parser(
@@ -122,7 +122,7 @@ def add_arguments(parser) -> None:
 
 def run(args, records: harness.Records) -> None:
     if args.check == "mladraft":
-        from tools.megakernel.check_mla import run_mladraft
+        from sglang_tpu.k3_programs.tools.check_mla import run_mladraft
 
         return run_mladraft(args, records)
     {
@@ -139,8 +139,8 @@ def run_greedy(args, records: harness.Records) -> None:
 
     import torch
 
-    from vllm_torchtpu.megakernel import program as mk
-    from vllm_torchtpu.megakernel.kimi_k3.decode_ops import DecodeOps
+    from sglang_tpu.k3_programs import program as mk
+    from sglang_tpu.k3_programs.kimi_k3.decode_ops import DecodeOps
 
     all_ids, tokenizer = k3.fixed_prompt(args.prompt_tokens, args.model)
     prompts = [np.asarray(all_ids, np.int32)] + [
@@ -209,9 +209,9 @@ def _agree(a: list[int], b: list[int]) -> int:
 def run_masked(args, records: harness.Records) -> None:
     import torch
 
-    from vllm_torchtpu.megakernel import program as mk
-    from vllm_torchtpu.megakernel.kimi_k3 import program as k3_program
-    from vllm_torchtpu.megakernel.kimi_k3.decode_ops import DecodeOps
+    from sglang_tpu.k3_programs import program as mk
+    from sglang_tpu.k3_programs.kimi_k3 import program as k3_program
+    from sglang_tpu.k3_programs.kimi_k3.decode_ops import DecodeOps
 
     all_ids, tokenizer = k3.fixed_prompt(args.prompt_tokens, args.model)
     prompts = [
@@ -231,7 +231,7 @@ def run_masked(args, records: harness.Records) -> None:
     pools = k3.Pools(16 * pages + 1, pages, 1)
     draft = None
     if args.dspark:
-        from vllm_torchtpu.megakernel.kimi_k3.draft import DsparkDraft
+        from sglang_tpu.k3_programs.kimi_k3.draft import DsparkDraft
 
         draft = DsparkDraft(
             max_position=args.prompt_tokens + 8 * args.generate + 64,
@@ -370,8 +370,8 @@ def _masked_around_speculation(decoder, prompts, tables, names, reference) -> bo
     multi-token step), and the greedy streams must follow the plain
     reference (until a near-tie: the verify and plain ops reduce in
     different orders) about as far as the pure DSpark streams do."""
-    from vllm_torchtpu.megakernel import program as mk
-    from vllm_torchtpu.megakernel.kimi_k3 import program as k3_program
+    from sglang_tpu.k3_programs import program as mk
+    from sglang_tpu.k3_programs.kimi_k3 import program as k3_program
 
     ones = np.full((2, k3_program.VOCAB // 32), -1, np.int32)
     plain_ref = [[int(t) for t in reference[:, n]] for n in range(2)]
@@ -433,14 +433,14 @@ def _masked_around_speculation(decoder, prompts, tables, names, reference) -> bo
 def run_spec(args, records: harness.Records) -> None:
     import torch
 
-    from vllm_torchtpu.megakernel import bridge
-    from vllm_torchtpu.megakernel import program as mk
-    from vllm_torchtpu.megakernel.kimi_k3.decode_ops import (
+    from sglang_tpu.k3_programs import bridge
+    from sglang_tpu.k3_programs import program as mk
+    from sglang_tpu.k3_programs.kimi_k3.decode_ops import (
         Control,
         DecodeOps,
         decode_batch_sizes,
     )
-    from vllm_torchtpu.megakernel.kimi_k3.draft import draft_class
+    from sglang_tpu.k3_programs.kimi_k3.draft import draft_class
 
     count, generate, rows = args.prompt_tokens, args.generate, args.single_drafts + 1
     large = sorted(int(n) for n in args.large_batches.split(",") if n)
@@ -991,9 +991,9 @@ def run_spec(args, records: harness.Records) -> None:
 def run_handoff(args, records: harness.Records) -> None:
     import torch
 
-    from vllm_torchtpu.megakernel import bridge
-    from vllm_torchtpu.megakernel import program as mk
-    from vllm_torchtpu.megakernel.kimi_k3 import program as k3_program
+    from sglang_tpu.k3_programs import bridge
+    from sglang_tpu.k3_programs import program as mk
+    from sglang_tpu.k3_programs.kimi_k3 import program as k3_program
 
     generate, max_model_len = args.generate, 32768
     # The kernel rank stands in for the TP / DCP rank, so the prefiller writes
@@ -1223,8 +1223,8 @@ def _handoff_rings(
     """The DSpark half of ``check handoff`` (see the module docstring)."""
     import torch
 
-    from vllm_torchtpu.megakernel import program as mk
-    from vllm_torchtpu.megakernel.kimi_k3.pools import kda_blocks_at_length
+    from sglang_tpu.k3_programs import program as mk
+    from sglang_tpu.k3_programs.kimi_k3.pools import kda_blocks_at_length
 
     window, steps, ok = decoder.draft.config.window, args.speculate_steps, True
     for req, n in lengths.items():
@@ -1320,11 +1320,11 @@ def run_packing(args, records: harness.Records) -> None:
 
     import torch
 
-    from vllm_torchtpu.megakernel import bridge
-    from vllm_torchtpu.megakernel import program as mk
-    from vllm_torchtpu.megakernel.kimi_k3 import prefill as k3_prefill
-    from vllm_torchtpu.megakernel.kimi_k3 import program as k3_program
-    from vllm_torchtpu.megakernel.kimi_k3.pools import kda_blocks_at_length
+    from sglang_tpu.k3_programs import bridge
+    from sglang_tpu.k3_programs import program as mk
+    from sglang_tpu.k3_programs.kimi_k3 import prefill as k3_prefill
+    from sglang_tpu.k3_programs.kimi_k3 import program as k3_program
+    from sglang_tpu.k3_programs.kimi_k3.pools import kda_blocks_at_length
 
     window, slots = k3_program.MAX_STEP_TOKENS, k3_prefill.SLOTS
     max_model_len = 2 * window

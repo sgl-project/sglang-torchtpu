@@ -29,7 +29,7 @@ from contextlib import contextmanager
 
 import numpy as np
 
-from tools.megakernel import harness, k3
+from sglang_tpu.k3_programs.tools import harness, k3
 
 
 def add_arguments(parser, profile: bool = False) -> None:
@@ -155,10 +155,10 @@ def run(args, records: harness.Records) -> None:
 def run_decode(args, records: harness.Records) -> None:
     import torch
 
-    from vllm_torchtpu.megakernel import bridge
-    from vllm_torchtpu.megakernel import program as mk
-    from vllm_torchtpu.megakernel.kimi_k3 import config
-    from vllm_torchtpu.megakernel.kimi_k3.decode_ops import Control, DecodeOps
+    from sglang_tpu.k3_programs import bridge
+    from sglang_tpu.k3_programs import program as mk
+    from sglang_tpu.k3_programs.kimi_k3 import config
+    from sglang_tpu.k3_programs.kimi_k3.decode_ops import Control, DecodeOps
 
     batches = [int(b) for b in args.batches.split(",")]
     contexts = [int(c) for c in args.contexts.split(",")]
@@ -198,7 +198,7 @@ def run_decode(args, records: harness.Records) -> None:
 
     draft = None
     if args.dspark and any(drafts_at(batch) for batch, _ in cases):
-        from vllm_torchtpu.megakernel.kimi_k3.draft import draft_class
+        from sglang_tpu.k3_programs.kimi_k3.draft import draft_class
 
         rates = None
         if args.acceptance:
@@ -311,10 +311,10 @@ def run_decode(args, records: harness.Records) -> None:
 def run_prefill(args, records: harness.Records) -> None:
     import torch
 
-    from vllm_torchtpu.megakernel import bridge
-    from vllm_torchtpu.megakernel import program as mk
-    from vllm_torchtpu.megakernel.kimi_k3 import prefill as k3_prefill
-    from vllm_torchtpu.megakernel.kimi_k3 import program as k3_program
+    from sglang_tpu.k3_programs import bridge
+    from sglang_tpu.k3_programs import program as mk
+    from sglang_tpu.k3_programs.kimi_k3 import prefill as k3_prefill
+    from sglang_tpu.k3_programs.kimi_k3 import program as k3_program
 
     cases = []
     for part in filter(None, args.prompts.split(",")):

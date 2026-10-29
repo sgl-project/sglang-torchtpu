@@ -23,7 +23,7 @@ Commands (Kimi-K3; see each module's docstring):
 
 From the login node the tool runs itself as 32 processes (8 per host) on the
 allocation ``--jobid`` (default ``$JOBID``). ``--set`` overrides a
-``KernelConfig`` field (``vllm_torchtpu.megakernel.kimi_k3.config``) to compare
+``KernelConfig`` field (``sglang_tpu.k3_programs.kimi_k3.config``) to compare
 configs; every result line and JSON record names the config digest and git
 revision that produced it.
 """
@@ -35,7 +35,7 @@ import os
 import sys
 import tempfile
 
-from tools.megakernel import bench, check, harness, k3, preshard
+from sglang_tpu.k3_programs.tools import bench, check, harness, k3, preshard
 
 LLO_FLAGS = (
     "--xla_jf_dump_to={dir} --xla_jf_dump_llo_text=true "
@@ -104,7 +104,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 def kernel_config(overrides: list[str]):
-    from vllm_torchtpu.megakernel.kimi_k3 import config
+    from sglang_tpu.k3_programs.kimi_k3 import config
 
     fields = {}
     for item in overrides:
@@ -124,7 +124,7 @@ def main(argv: list[str]) -> int:
     if not args.presharded:
         raise SystemExit("set --presharded to the TP32 pre-shard directory")
     if not harness.is_worker():
-        if not args.jobid:
+        if not args.jobid and not harness.in_pod():
             raise SystemExit(
                 "set --jobid (or $JOBID) to a running four-host allocation"
             )
@@ -156,7 +156,7 @@ def main(argv: list[str]) -> int:
     harness.init()
     coverage = None
     if args.coverage and harness.rank() == 0:
-        from tools.megakernel.coverage import LineCoverage
+        from sglang_tpu.k3_programs.tools.coverage import LineCoverage
 
         coverage = LineCoverage(args.coverage)
         coverage.start()  # before the kernels import: their module-level lines count
@@ -189,7 +189,7 @@ def run_preshard(argv: list[str], args) -> int:
     """Host-side conversion: no TPU, one process per host on the allocation
     for the model's checkpoint, in place otherwise."""
     if preshard.runs_on_allocation(args) and not harness.is_worker():
-        if not args.jobid:
+        if not args.jobid and not harness.in_pod():
             raise SystemExit(
                 "set --jobid (or $JOBID) to a running four-host allocation"
             )
