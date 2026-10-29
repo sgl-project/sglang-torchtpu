@@ -864,8 +864,14 @@ class SchedulerPPMixin:
         if target is None or _pp_can_skip_output_comm(target):
             self._pp_send_deferred_output(mb_id)
             return
-        outputs = self.last_rank_comm_queue[0][1].tensors
-        next_token_ids = outputs["next_token_ids"] = outputs["next_token_ids"].cpu()
+        ready_event, queued_outputs = self.last_rank_comm_queue[0]
+        outputs = queued_outputs.tensors
+        with self.pp_comm_stream_ctx:
+            if ready_event is not None:
+                # Wait for this forward's recorded boundary, not later forwards
+                # already queued on the compute stream.
+                ready_event.synchronize()
+            next_token_ids = outputs["next_token_ids"] = outputs["next_token_ids"].cpu()
         self._pp_send_deferred_output(mb_id)
         self.disagg_prefill_bootstrap_queue.kv_manager.on_outputs_copied(
             mb_id, next_token_ids

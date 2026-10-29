@@ -34,6 +34,14 @@ def metadata_device(original, batch):
     return original(batch)
 
 
+def extend_metadata_device(original, batch, device):
+    # PP consumes these lengths to build positions before the decoder pads and
+    # uploads them. Reading freshly uploaded lengths would fence the PP wave.
+    if _can_stage_forward_metadata(batch, allow_pipeline_parallel=True):
+        return "cpu"
+    return original(batch, device)
+
+
 def _stages_spec_metadata(batch) -> bool:
     """A non-overlap experimental-worker batch (a PD prefill, PP included) keeps
     its lengths and request rows on host, so filtering and bucket padding never
@@ -153,6 +161,11 @@ def hook_specs():
         (
             "sglang.srt.managers.schedule_batch.ScheduleBatch.metadata_device",
             metadata_device,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.model_executor.forward_batch_info._extend_metadata_device",
+            extend_metadata_device,
             HookType.AROUND,
         ),
         (
