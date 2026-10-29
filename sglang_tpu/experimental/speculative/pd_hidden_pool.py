@@ -20,7 +20,6 @@ import torch
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang_tpu.kv_row_write import kv_write_segments
-from sglang_tpu.kv_span_write import get_kv_span_write_op
 
 _LANES = 128
 # bf16 packs two values per 32-bit word, the fused layout's K/V pair axis.
@@ -124,6 +123,9 @@ class PdHiddenPool:
         if self.buffer.device.type == "tpu":
             # HBM-to-HBM DMAs: a hidden row is too wide for kv_row_write's VMEM staging.
             if self._span_write is None:
+                # Lazy: the op imports JAX, which CPU-only Raiden callers lack.
+                from sglang_tpu.kv_span_write import get_kv_span_write_op
+
                 self._span_write = get_kv_span_write_op()
             self._span_write(segments[1], segments[0], segments[2], rows, self.buffer)
         else:
