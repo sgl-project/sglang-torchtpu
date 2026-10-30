@@ -89,7 +89,7 @@ def physical_host_order(hosts: list[str], host_index: int) -> list[int]:
     sglang's node normalization orders host ranks and SliceBuilder endpoints."""
     from sglang_tpu.node_normalization import discover_host_order
 
-    return discover_host_order(_topology(hosts), host_index, timeout=600)
+    return discover_host_order(_topology(hosts), host_index, timeout=3600)
 
 
 def launch_pod(argv: list[str], extra_env: dict[str, str], per_host: int) -> int:
