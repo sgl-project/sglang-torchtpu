@@ -1089,6 +1089,7 @@ def kernel_main_fused_rs(
 
     relay_diag = tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_RELAY_DIAG.get()
     pair_window_add = tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_WINDOW_ADD.get()
+    pair_run_add = tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_RUN_ADD.get() and _pair_run_table()
     # Row windows for the pair / relay adds: rows are the untiled leading dim of a slot, so
     # any window size and start work; pick the smallest that covers the rows needed.
     window_rows = [b for b in (8, 16, 32, 64, 128, 256, 512) if b < tile_m] + [tile_m]
@@ -1302,7 +1303,31 @@ def kernel_main_fused_rs(
 
         if "pairnoadd" not in _ABLATE:
             with jax.named_scope("pair_add"):
-                if pair_window_add:
+                if pair_run_add:
+                    # pair sums only leave in this core's forwarded runs (targets 2..):
+                    # one row window per run; extra rows in a window get correct sums too
+                    n_targets = ep_size // 2 + 1
+                    for t in range(2, n_targets):
+                        at = pair_meta_base + g * n_targets + t
+                        run_len = group_start_ref[at]
+                        lo = row0 + group_start_ref[at + pair_meta_stride]
+
+                        def _add(b, lo=lo):
+                            start = jnp.minimum(lo, tile_m - b)
+                            pair_sum_ref[stg, pl.ds(start, b)] = (
+                                scatter_staging_3x_ref[stg, pl.ds(start, b)].astype(
+                                    jnp.float32
+                                )
+                                + pair_ring_ref[ring_slot, pl.ds(start, b)].astype(
+                                    jnp.float32
+                                )
+                            ).astype(pair_sum_ref.dtype)
+
+                        @pl.when(run_len > 0)
+                        def _(run_len=run_len, _add=_add):
+                            _row_window(run_len, _add)
+
+                elif pair_window_add:
                     # only rows [0, row0 + valid) are ever sent or relayed
 
                     def _add(b):

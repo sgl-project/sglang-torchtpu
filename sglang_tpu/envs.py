@@ -188,6 +188,13 @@ class TpuEnvs:
     SGLANG_TPU_FUSED_RS_PAIR_RELAY_DIAG = EnvInt(2)
     # Pair exchange: add the sibling's partial only over the tile's valid rows (bit-identical).
     SGLANG_TPU_FUSED_RS_PAIR_WINDOW_ADD = EnvBool(False)
+    # Pair exchange with the run table: add the sibling's partial only over the rows of this
+    # core's three forwarded runs (the only pair sums it sends); bit-identical.
+    SGLANG_TPU_FUSED_RS_PAIR_RUN_ADD = EnvBool(False)
+    # Pair exchange combine: derive each owned rank's token and top-k weight from a stable sort
+    # of this rank's own (token, slot) pairs instead of argsorting every row and gathering back.
+    # Same arrays (bit-identical).
+    SGLANG_TPU_FUSED_RS_PAIR_LOCAL_RANKS = EnvBool(False)
     # Batched RPA: run target-verify rows (speculative_num_draft_tokens per request) as MIXED
     # with a q block of that width; the prefill block search otherwise pads each request's
     # rows to a ~2048-row block (16 x 8 rows at 150K context: 42 -> 2.2 ms per layer).

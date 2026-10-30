@@ -157,11 +157,29 @@ def _pair_post_combine(
     then token-sorted); the weighted sum maps ranks back to tokens with a 0/1 matmul.
     """
     rows = chunk_size * topk
-    flat_sorted = jnp.argsort(topk_indices.reshape(-1))
-    owned = (flat_sorted // topk) // chunk_size == my_id
-    flat = flat_sorted[jnp.nonzero(owned, size=rows)[0]]
-    token = flat // topk - my_id * chunk_size
-    weight = topk_weights.astype(jnp.float32)[token, flat % topk]
+    if tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_LOCAL_RANKS.get():
+        # The kernel's row order is a stable sort by expert of the flat (token, slot)
+        # index; this rank's rows keep that order, so a stable sort of its own pairs,
+        # carrying the index and weight, gives the same ranks without the global sort.
+        local_ids = jax.lax.dynamic_slice_in_dim(
+            topk_indices, my_id * chunk_size, chunk_size, axis=0
+        ).reshape(-1)
+        _, flat, weight = jax.lax.sort(
+            (
+                local_ids,
+                jnp.arange(rows, dtype=jnp.int32),
+                topk_weights.astype(jnp.float32).reshape(-1),
+            ),
+            num_keys=1,
+            is_stable=True,
+        )
+        token = flat // topk
+    else:
+        flat_sorted = jnp.argsort(topk_indices.reshape(-1))
+        owned = (flat_sorted // topk) // chunk_size == my_id
+        flat = flat_sorted[jnp.nonzero(owned, size=rows)[0]]
+        token = flat // topk - my_id * chunk_size
+        weight = topk_weights.astype(jnp.float32)[token, flat % topk]
     out_dtype = jnp.result_type(recv.dtype, topk_weights.dtype)
     if post_expert_norm_weight is not None and recv.ndim == 3:
         weighted = pair_post_combine(
