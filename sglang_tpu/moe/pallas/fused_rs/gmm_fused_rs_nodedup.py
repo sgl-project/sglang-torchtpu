@@ -509,6 +509,10 @@ def kernel_main_fused_rs(
     pair_sum_ref=None,  # VMEM (staging_slots, tile_m, N2//NL, NL): own + sibling partials per slot
     pair_recv_sem_ref=None,  # REGULAR (_PAIR_RING,): sibling pieces landed in a ring slot
     pair_credit_ref=None,  # REGULAR (1,): ring slots the sibling has freed
+    pair_relay: bool = False,  # relay the diagonal chip's runs through a neighbor (run table)
+    relay_ring_ref=None,  # VMEM (2, tile_m, N2//NL, NL): relayed rows, one slot per direction
+    relay_recv_sem_ref=None,  # REGULAR (2,): relayed pieces landed, per direction
+    relay_credit_ref=None,  # REGULAR (2,): relay slots the neighbor has freed, per direction
 ):
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write kernel.
 
@@ -1083,6 +1087,121 @@ def kernel_main_fused_rs(
             off = off + jnp.where(has, b, 0)
         gm_id_ref[1 + stg_id] = gm_id_ref[1 + stg_id] + _pair_count_pieces(num_valid)
 
+    relay_diag = tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_RELAY_DIAG.get()
+    pair_window_add = tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_WINDOW_ADD.get()
+    # Row windows for the pair / relay adds: rows are the untiled leading dim of a slot, so
+    # any window size and start work; pick the smallest that covers the rows needed.
+    window_rows = [b for b in (8, 16, 32, 64, 128, 256, 512) if b < tile_m] + [tile_m]
+
+    def _row_window(n, fn):
+        """fn(B) for the smallest window size B >= n (n <= tile_m)."""
+        idx = jnp.int32(0)
+        for b in window_rows[:-1]:
+            idx += (n > b).astype(jnp.int32)
+        lax.switch(idx, [(lambda b=b: (fn(b), jnp.int32(0))[1]) for b in window_rows])
+
+    def _issue_pieces(run_len, src_ref, src_row, dst_ref, dst_row, d, send_sem, recv_sem):
+        """Power-of-two DMAs for one run; returns the number issued."""
+        n = jnp.int32(0)
+        for b in pair_pieces:
+            has = (run_len & b) != 0
+            off = run_len & ~(2 * b - 1)
+
+            @pl.when(has)
+            def _(b=b, off=off):
+                pltpu.make_async_remote_copy(
+                    src_ref=src_ref.at[pl.ds(src_row + off, b), :, :],
+                    dst_ref=dst_ref.at[pl.ds(dst_row + off, b), :, :],
+                    send_sem=send_sem,
+                    recv_sem=recv_sem,
+                    device_id={ep_axis_name: d},
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                ).start()
+
+            n = n + has.astype(jnp.int32)
+        return n
+
+    @jax.named_scope("relay_send")
+    def _relay_send(g, stg, row0, run_len, src_off, relay_dir, relay_chip):
+        """Tile g's diagonal run (pair sums) to the same rows of the neighbor's relay slot."""
+        d = 2 * relay_chip + my_id % 2
+        n = _issue_pieces(
+            run_len,
+            pair_sum_ref.at[stg],
+            row0 + src_off,
+            relay_ring_ref.at[relay_dir],
+            row0 + src_off,
+            d,
+            send_sems_ref.at[stg],
+            relay_recv_sem_ref.at[relay_dir],
+        )
+        gm_id_ref[1 + stg] = gm_id_ref[1 + stg] + n
+
+    @jax.named_scope("relay_finish")
+    def _relay_finish(g):
+        """Add the rows a neighbor relayed for tile g into this core's held run and send it."""
+        num_chips = ep_size // 2
+        my_chip = my_id // 2
+        relay_dir = g % 2
+        relay_s = 1 - 2 * relay_dir
+        k = jnp.where(relay_dir == 0, 1, 3)
+        t = 1 + k
+        stg = g % staging_slots
+        n_targets = num_chips + 1
+        at = pair_meta_base + g * n_targets + t
+        run_len = group_start_ref[at]
+        src_off = group_start_ref[at + pair_meta_stride]
+        rank = group_start_ref[at + 2 * pair_meta_stride]
+        m_st = metadata_ref.gm_id_to_m_offset[g]
+        row0 = m_st % _sls_pair
+        n_pieces = _pair_count_pieces(run_len)
+
+        @pl.when(n_pieces > 0)
+        def _():
+            pl.semaphore_wait(relay_recv_sem_ref.at[relay_dir], n_pieces)
+
+        lo = row0 + src_off
+
+        def _add(b):
+            start = jnp.minimum(lo, tile_m - b)
+            rows = start + lax.broadcasted_iota(jnp.int32, (b, 1, 1), 0)
+            inside = jnp.logical_and(rows >= lo, rows < lo + run_len)
+            own = pair_sum_ref[stg, pl.ds(start, b)]
+            pair_sum_ref[stg, pl.ds(start, b)] = jnp.where(
+                inside,
+                (
+                    own.astype(jnp.float32)
+                    + relay_ring_ref[relay_dir, pl.ds(start, b)].astype(jnp.float32)
+                ).astype(own.dtype),
+                own,
+            )
+
+        with jax.named_scope("relay_add"):
+
+            @pl.when(run_len > 0)
+            def _():
+                _row_window(run_len, _add)
+        src_chip = (my_chip - relay_s + num_chips) % num_chips
+        pltpu.semaphore_signal(
+            relay_credit_ref.at[relay_dir],
+            device_id={ep_axis_name: 2 * src_chip + my_id % 2},
+            device_id_type=pltpu.DeviceIdType.MESH,
+        )
+        owner = 2 * ((my_chip + k) % num_chips) + my_id % 2
+        block = jnp.where(relay_dir == 0, 3, 2)
+        rows_per_block = out_buf_ref.shape[0] // num_chips
+        n = _issue_pieces(
+            run_len,
+            pair_sum_ref.at[stg],
+            row0 + src_off,
+            out_buf_ref,
+            block * rows_per_block + rank,
+            owner,
+            send_sems_ref.at[stg],
+            recv_sem_ref.at[0],
+        )
+        gm_id_ref[1 + stg] = gm_id_ref[1 + stg] + n
+
     @jax.named_scope("pair_issue")
     def _pair_issue_table(g, stg, row0, my_chip, num_chips, rows_per_block):
         """Issue tile g's runs from the precomputed table: own and sibling rows carry this
@@ -1091,6 +1210,17 @@ def kernel_main_fused_rs(
         n_targets = num_chips + 1
         stride = pair_meta_stride
         sent = jnp.int32(0)
+        if pair_relay:
+            # even tiles relay through chip + 1 and hold back the k = 1 run (it gets the
+            # rows chip - 1 relays); odd tiles mirror that through chip - 1 and k = 3
+            relay_dir = g % 2
+            relay_s = 1 - 2 * relay_dir
+            relay_chip = (my_chip + relay_s + num_chips) % num_chips
+
+            @pl.when(g >= 2)
+            def _():
+                pl.semaphore_wait(relay_credit_ref.at[relay_dir], 1)
+
         for t in range(n_targets):
             at = pair_meta_base + g * n_targets + t
             run_len = group_start_ref[at]
@@ -1107,6 +1237,15 @@ def kernel_main_fused_rs(
                 src = pair_sum_ref
                 if "pairnofwd" in _ABLATE or f"fwdskip{k}" in _ABLATE:
                     continue
+                if pair_relay:
+                    if k == relay_diag:
+                        _relay_send(g, stg, row0, run_len, src_off, relay_dir, relay_chip)
+                        continue
+                    # owners see the two neighbor blocks: from chip - 1 -> 3, chip + 1 -> 2
+                    block = 3 if k == 1 else 2
+                    held = relay_dir == (0 if k == 1 else 1)
+                    # the held run goes out from _relay_finish once the relayed rows are in
+                    run_len = jnp.where(held, 0, run_len)
             dst0 = block * rows_per_block + rank
 
             def _pieces(sizes, *, run_len=run_len, src_off=src_off, dst0=dst0, d=d, src=src):
@@ -1163,10 +1302,21 @@ def kernel_main_fused_rs(
 
         if "pairnoadd" not in _ABLATE:
             with jax.named_scope("pair_add"):
-                pair_sum_ref[stg] = (
-                    scatter_staging_3x_ref[stg].astype(jnp.float32)
-                    + pair_ring_ref[ring_slot].astype(jnp.float32)
-                ).astype(pair_sum_ref.dtype)
+                if pair_window_add:
+                    # only rows [0, row0 + valid) are ever sent or relayed
+
+                    def _add(b):
+                        pair_sum_ref[stg, pl.ds(0, b)] = (
+                            scatter_staging_3x_ref[stg, pl.ds(0, b)].astype(jnp.float32)
+                            + pair_ring_ref[ring_slot, pl.ds(0, b)].astype(jnp.float32)
+                        ).astype(pair_sum_ref.dtype)
+
+                    _row_window(row0 + m_en - m_st, _add)
+                else:
+                    pair_sum_ref[stg] = (
+                        scatter_staging_3x_ref[stg].astype(jnp.float32)
+                        + pair_ring_ref[ring_slot].astype(jnp.float32)
+                    ).astype(pair_sum_ref.dtype)
         if "pairnosend" not in _ABLATE:
             pltpu.semaphore_signal(
                 pair_credit_ref.at[0],
@@ -1177,7 +1327,9 @@ def kernel_main_fused_rs(
             return
         my_chip = my_id // 2
         num_chips = ep_size // 2
-        rows_per_block = out_buf_ref.shape[0] // (num_chips + 1)
+        rows_per_block = out_buf_ref.shape[0] // (
+            num_chips if pair_relay else num_chips + 1
+        )
         if _pair_run_table():
             _pair_issue_table(g, stg, row0, my_chip, num_chips, rows_per_block)
             return
@@ -1553,6 +1705,12 @@ def kernel_main_fused_rs(
                 def _():
                     _pair_finish(gm_id - 1)
 
+                if pair_relay:
+
+                    @pl.when(gm_id >= 2)
+                    def _():
+                        _relay_finish(gm_id - 2)
+
             @jax.named_scope("direct_write_rows")
             def _do_direct_write():
                 def _write_row(i, carry):
@@ -1740,6 +1898,16 @@ def kernel_main_fused_rs(
         def _():
             _pair_finish(local_num_gm - 1)
 
+        if pair_relay:
+
+            @pl.when(local_num_gm >= 2)
+            def _():
+                _relay_finish(local_num_gm - 2)
+
+            @pl.when(local_num_gm >= 1)
+            def _():
+                _relay_finish(local_num_gm - 1)
+
     if defer_writes:
         # A kernel must not exit with DMAs or semaphores outstanding.
         for _s in range(staging_slots):
@@ -1751,6 +1919,14 @@ def kernel_main_fused_rs(
             pl.semaphore_wait(
                 pair_credit_ref.at[0], jnp.minimum(local_num_gm, _PAIR_RING)
             )
+
+        if pair_relay:
+            # each direction's last relayed tile was never waited before a reuse
+            for _dir in range(2):
+
+                @pl.when(local_num_gm > _dir)
+                def _(_dir=_dir):
+                    pl.semaphore_wait(relay_credit_ref.at[_dir], 1)
 
     # Post-Scatter Cross-Rank Optical Barrier
     sync_barrier()
@@ -2562,7 +2738,14 @@ def gmm_v2_fused_rs(
             group_start = group_start - row_offset
 
     pair_meta_base = pair_meta_stride = 0
-    num_pair_blocks = ep_size // 2 + 1
+    pair_relay = (
+        pair_exchange
+        and _pair_run_table()
+        and ep_size == 8
+        and tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_RELAY.get()
+    )
+    # own, sibling, then one block per other chip (only the two neighbors under relay)
+    num_pair_blocks = ep_size // 2 if pair_relay else ep_size // 2 + 1
     if pair_exchange:
         group_start, pair_meta_base, pair_meta_stride = _pair_exchange_metadata(
             group_start,
@@ -2632,6 +2815,7 @@ def gmm_v2_fused_rs(
         pair_exchange=pair_exchange,
         pair_meta_base=pair_meta_base,
         pair_meta_stride=pair_meta_stride,
+        pair_relay=pair_relay,
     )
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.HBM),  # hidden_states_3d
@@ -2654,7 +2838,7 @@ def gmm_v2_fused_rs(
         payload, row_scales = pl.pallas_call(
             functools.partial(
                 kernel_main_fused_rs_fp8,
-                **{k: v for k, v in kernel_kwargs.items() if k != "pair_exchange"},
+                **{k: v for k, v in kernel_kwargs.items() if k not in ("pair_exchange", "pair_relay")},
             ),
             out_shape=(out_buf_init, out_scale_init),
             grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -2682,8 +2866,22 @@ def gmm_v2_fused_rs(
             pltpu.SemaphoreType.REGULAR((_PAIR_RING,)),
             pltpu.SemaphoreType.REGULAR((1,)),
         ]
+        if pair_relay:
+            scratch_shapes = scratch_shapes + [
+                pltpu.VMEM((2, tile_m, n2_cols, num_lanes), out_dtype),
+                pltpu.SemaphoreType.REGULAR((2,)),
+                pltpu.SemaphoreType.REGULAR((2,)),
+            ]
 
         def kernel_fn(*refs, _base=kernel_fn):
+            relay = {}
+            if pair_relay:
+                *refs, ring_r, recv_r, credit_r = refs
+                relay = dict(
+                    relay_ring_ref=ring_r,
+                    relay_recv_sem_ref=recv_r,
+                    relay_credit_ref=credit_r,
+                )
             *base, ring, pair_sum, pair_recv, credit = refs
             _base(
                 *base,
@@ -2691,6 +2889,7 @@ def gmm_v2_fused_rs(
                 pair_sum_ref=pair_sum,
                 pair_recv_sem_ref=pair_recv,
                 pair_credit_ref=credit,
+                **relay,
             )
 
     result = pl.pallas_call(
