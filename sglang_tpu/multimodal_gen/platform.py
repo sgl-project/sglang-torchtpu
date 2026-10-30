@@ -54,9 +54,11 @@ class TpuOOTPlatform(TpuPlatform):
     def oot_attn_backend_serves(
         cls, supported_attention_backends: set[AttentionBackendEnum]
     ) -> bool:
-        # The splash backend runs SDPA for shapes its kernels do not cover, so a
-        # ring launch (which selects it automatically) can serve any layer that
-        # takes TORCH_SDPA.
+        # A ring launch selects the splash backend globally, so every layer
+        # that takes TORCH_SDPA (DiT and text encoder alike) runs it, as with
+        # an explicit --attention-backend tpu_splash_attn, which the recipes
+        # pass. Shapes its kernels do not cover, such as prompts up to 512
+        # tokens and ragged causal attention, run SDPA.
         return AttentionBackendEnum.TORCH_SDPA in supported_attention_backends
 
     @classmethod

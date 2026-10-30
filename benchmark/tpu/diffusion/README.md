@@ -16,9 +16,6 @@ Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `HOST` (default `127.0.0.1`)
 scoped-VMEM defaults are benchmark settings, added unless it sets them. Extra arguments are passed to the server,
 e.g. `./ltx2.sh --warmup-resolutions 1280x720`.
 
-`bench_splash_attn.py` times the splash attention kernels against SDPA at one shape on one core
-(`PYTHONPATH=python:. python3 benchmark/tpu/diffusion/bench_splash_attn.py`).
-
 ## Example requests
 
 `/v1/images/generations` returns the image; `size`, `num_inference_steps` and `guidance_scale` set the request.
