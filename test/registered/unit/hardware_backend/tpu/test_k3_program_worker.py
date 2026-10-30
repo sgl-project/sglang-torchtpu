@@ -228,7 +228,7 @@ class TestRegisteredAlgorithm(CustomTestCase):
             worker.K3ProgramWorker,
         )
         self.assertFalse(self.algo.need_topk())
-        args = SimpleNamespace(kv_cache_dtype="fp8_e4m3")
+        args = SimpleNamespace(kv_cache_dtype="fp8_e4m3", disaggregation_mode="decode")
         self.algo.handle_server_args(args)
         self.assertEqual(args.page_size, 16384)
         self.assertTrue(args.disable_overlap_schedule and args.disable_radix_cache)
@@ -244,6 +244,17 @@ class TestRegisteredAlgorithm(CustomTestCase):
         self.assertEqual(
             (prefill.mamba_track_interval, prefill.chunked_prefill_size), (16384, 16384)
         )
+        # Colocated (no disaggregation): the radix cache stays, decode never tracked.
+        colocated = SimpleNamespace(
+            kv_cache_dtype="fp8_e4m3",
+            disaggregation_mode="null",
+            disable_radix_cache=False,
+        )
+        self.algo.handle_server_args(colocated)
+        self.assertFalse(colocated.disable_radix_cache)
+        self.assertEqual(colocated.mamba_radix_cache_strategy, "extra_buffer")
+        self.assertGreaterEqual(colocated.mamba_track_interval, 1 << 30)
+        self.assertEqual(colocated.mamba_track_interval % 16384, 0)
         self.assertEqual(
             (
                 args.speculative_num_steps,
@@ -271,6 +282,7 @@ class TestRegisteredAlgorithm(CustomTestCase):
             speculative_skip_dp_mlp_sync=False,
             speculative_adaptive=False,
             kv_cache_dtype="auto",
+            disaggregation_mode="decode",
         )
         handle_speculative_decoding(server_args)
         self.assertEqual(

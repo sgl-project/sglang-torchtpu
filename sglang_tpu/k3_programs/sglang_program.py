@@ -85,12 +85,29 @@ def _local_checkpoint(path: str) -> Path:
     return Path(snapshot_download(path, local_files_only=True))
 
 
-def server_engine_config():
-    """This server's program configuration (P/D role, limits, DSpark)."""
-    from sglang.srt.runtime_context import get_disagg, get_model, get_schedule
-    from sglang_tpu.envs import envs as tpu_envs
+COLOCATED = "colocated"
+
+
+def server_role() -> str:
+    """``"prefill"`` or ``"decode"`` for a P/D server, ``"colocated"`` for a
+    server running both programs (no disaggregation)."""
+    from sglang.srt.runtime_context import get_disagg
 
     role = str(get_disagg().disaggregation_mode)
+    if role in sglang_config.ROLES:
+        return role
+    if role in ("null", "None", ""):
+        return COLOCATED
+    raise ValueError(f"K3_PROGRAM: no programs for --disaggregation-mode {role!r}")
+
+
+def server_engine_config(role: str | None = None):
+    """The program configuration for ``role`` (default: the server's P/D
+    role) from the server's limits and DSpark settings."""
+    from sglang.srt.runtime_context import get_model, get_schedule
+    from sglang_tpu.envs import envs as tpu_envs
+
+    role = role or server_role()
     if role not in sglang_config.ROLES:
         raise ValueError(
             "K3_PROGRAM serves one role of a P/D pair: --disaggregation-mode "
@@ -148,48 +165,49 @@ def build_from_server():
             f"{bridge.DSPARK_DRAFT_LAYERS}"
         )
     install_kernel_config()
-    config = server_engine_config()
+    role = server_role()
+    roles = sglang_config.ROLES if role == COLOCATED else (role,)
+    configs = {r: server_engine_config(r) for r in roles}
     # The program is a handful of whole-model custom ops per step: fusing the
     # eager ops around them would compile a new device program for every
     # distinct surrounding op sequence (vLLM-TorchTPU's runner does the same).
     from torch_tpu._internal import execution_mode
 
     execution_mode.eager_mode = execution_mode.EagerMode.DEFER_NEVER
-    program = k3.build(
-        config, Path(presharded), draft, tp_rank=int(get_parallel().tp_rank)
-    )
-    program.load_weights()
-    _program, _config = program, config
-    return program
+    tp_rank = int(get_parallel().tp_rank)
+    programs = {
+        r: k3.build(configs[r], Path(presharded), draft, tp_rank=tp_rank) for r in roles
+    }
+    if role == COLOCATED:
+        from sglang_tpu.k3_programs.sglang_colocated import share_experts
+
+        # The decode program's experts serve the prefill program too.
+        share_experts(programs["prefill"], programs["decode"])
+    for program in programs.values():
+        program.load_weights()
+    _program, _config = programs, configs
+    return programs
 
 
-def build_steps(target_worker):
-    """The role's steps: the program bound to the target's unified pools,
-    every op compiled."""
-    from sglang_tpu.k3_programs.sglang_pools import K3UnifiedKVPool
+def _role_steps(role, program, config, pool):
+    """``role``'s steps: its program bound to the unified pools, every op
+    compiled."""
     from sglang_tpu.k3_programs.sglang_worker import DecodeSteps, PrefillSteps
 
-    if _program is None or _config is None:
-        raise RuntimeError("K3_PROGRAM: the program was not built at model load")
-    pool = target_worker.model_runner.token_to_kv_pool.full_kv_pool
-    if not isinstance(pool, K3UnifiedKVPool):
-        raise RuntimeError(
-            f"K3_PROGRAM: the full-attention pool is {type(pool).__name__}"
-        )
     plan = pool.plan
-    width = -(-_config.max_model_len // plan.logical_block_tokens)
+    width = -(-config.max_model_len // plan.logical_block_tokens)
     # The prefill reads a prefix hit's KDA state from its page's column.
-    kda_block = plan.layout.tokens_per_block if _config.role == "prefill" else None
+    kda_block = plan.layout.tokens_per_block if role == "prefill" else None
     groups = bridge.kv_groups(
         plan,
-        _config.max_model_len,
+        config.max_model_len,
         width,
         draft_layers=bridge.DSPARK_DRAFT_LAYERS,
         kda_block_size=kda_block,
     )
-    _program.bind_kv_caches(pool.caches, groups)
-    _program.warmup()
-    if _config.role == "prefill":
+    program.bind_kv_caches(pool.caches, groups)
+    program.warmup()
+    if role == "prefill":
         tails = None
         if plan.tail_slots:
             from sglang_tpu.k3_programs.sglang_tails import TailIndex
@@ -198,7 +216,7 @@ def build_steps(target_worker):
                 plan.tail_slots, plan.logical_block_tokens, plan.layout.tokens_per_block
             )
         return PrefillSteps(
-            _program,
+            program,
             plan,
             table_width=width,
             kda_width=int(groups[1].table_width),
@@ -207,8 +225,31 @@ def build_steps(target_worker):
             state_pool=pool.state_pool,
         )
     return DecodeSteps(
-        _program,
+        program,
         plan,
         table_width=width,
-        schedule=_config.num_speculative_tokens_per_batch_size,
+        schedule=config.num_speculative_tokens_per_batch_size,
     )
+
+
+def build_steps(target_worker):
+    """The server's steps over the target's unified pools: one role's, or
+    both programs' on a colocated server."""
+    from sglang_tpu.k3_programs.sglang_pools import K3UnifiedKVPool
+
+    if _program is None or _config is None:
+        raise RuntimeError("K3_PROGRAM: the program was not built at model load")
+    pool = target_worker.model_runner.token_to_kv_pool.full_kv_pool
+    if not isinstance(pool, K3UnifiedKVPool):
+        raise RuntimeError(
+            f"K3_PROGRAM: the full-attention pool is {type(pool).__name__}"
+        )
+    steps = {
+        role: _role_steps(role, _program[role], _config[role], pool)
+        for role in _program
+    }
+    if len(steps) == 1:
+        return next(iter(steps.values()))
+    from sglang_tpu.k3_programs.sglang_colocated import ColocatedSteps
+
+    return ColocatedSteps(steps["prefill"], steps["decode"])

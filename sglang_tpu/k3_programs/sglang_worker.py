@@ -115,12 +115,21 @@ class K3ProgramAlgo(CustomSpecAlgo):
         server_args.page_size = bridge.TP_SIZE * layout.tokens_per_block
         server_args.disable_overlap_schedule = True
         role = getattr(server_args, "disaggregation_mode", None)
-        if role != "prefill" or getattr(server_args, "disable_radix_cache", False):
+        colocated = role in (None, "null")
+        if not (role == "prefill" or colocated) or getattr(
+            server_args, "disable_radix_cache", False
+        ):
             server_args.disable_radix_cache = True
             return
         server_args.mamba_radix_cache_strategy = "extra_buffer"
-        server_args.mamba_track_interval = server_args.page_size
         server_args.chunked_prefill_size = server_args.page_size
+        if colocated:
+            # The decode program keeps a request's KDA state in its own slots:
+            # no decode step may be tracked into the radix cache (the interval
+            # lies past any context), only the prefill's chunk checkpoints.
+            server_args.mamba_track_interval = server_args.page_size * (1 << 16)
+        else:
+            server_args.mamba_track_interval = server_args.page_size
 
     def build_disagg_draft_input(self, batch, last_tokens_tensor, future_map):
         # A request the P/D transfer delivered: the program takes its first
@@ -451,7 +460,12 @@ class K3ProgramWorker(BaseSpecWorker):
         self, batch, on_publish=None, pp_proxy_tensors=None
     ) -> GenerationBatchResult:
         assert self.steps is not None
-        prefill = isinstance(self.steps, PrefillSteps)
+        from sglang_tpu.k3_programs.sglang_colocated import ColocatedSteps
+
+        steps = self.steps
+        if isinstance(steps, ColocatedSteps):
+            steps = steps.prefill if batch.forward_mode.is_extend() else steps.decode
+        prefill = isinstance(steps, PrefillSteps)
         if prefill != batch.forward_mode.is_extend():
             raise NotImplementedError(
                 f"K3_PROGRAM's {'prefill' if prefill else 'decode'} role runs no "
@@ -478,9 +492,7 @@ class K3ProgramWorker(BaseSpecWorker):
             cow_src = getattr(batch, "mamba_cow_src_indices", None)
             if cow_src is not None and len(cow_src):
                 state_pool.copy_from(cow_src, batch.mamba_cow_dst_indices)
-            first = self.steps.step(
-                batch.reqs, batch.prefix_lens, batch.extend_lens, starts
-            )
+            first = steps.step(batch.reqs, batch.prefix_lens, batch.extend_lens, starts)
             self._track_checkpoints(batch, state_pool)
             if on_publish is not None:
                 on_publish(batch.seq_lens)
@@ -491,7 +503,7 @@ class K3ProgramWorker(BaseSpecWorker):
                 next_draft_input=K3ProgramInput(),
                 speculative_num_draft_tokens=WIDTH,
             )
-        flat, lens = self.steps.step(batch.reqs, starts)
+        flat, lens = steps.step(batch.reqs, starts)
         accept_lens = torch.from_numpy(lens)
         new_seq_lens = batch.seq_lens + accept_lens.to(batch.seq_lens.device)
         if on_publish is not None:

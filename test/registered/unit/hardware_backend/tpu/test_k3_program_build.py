@@ -186,8 +186,8 @@ class TestDecodeBinding(CustomTestCase):
             )
         )
         with (
-            mock.patch.object(sglang_program, "_program", program),
-            mock.patch.object(sglang_program, "_config", config),
+            mock.patch.object(sglang_program, "_program", {"decode": program}),
+            mock.patch.object(sglang_program, "_config", {"decode": config}),
         ):
             steps = sglang_program.build_steps(target)
         caches, groups = program.bound
