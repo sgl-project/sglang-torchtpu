@@ -123,6 +123,7 @@ class TestUnifiedPoolClasses(CustomTestCase):
         self.assertEqual(len(state_ptrs), len(KDA))
         self.assertEqual(set(state_items), {3 * BLOCK})
         self.assertEqual(hybrid.get_state_layer_ids(), list(KDA))
+        self.assertIsNone(hybrid.maybe_get_custom_mem_pool())
         # Core's ids cover the 24 MLA entries only; the hook covers all 29.
         ids = hooks.k3_program_kv_layer_ids(HybridLinearKVPool.get_kv_layer_ids, hybrid)
         self.assertEqual(len(ids), len(kv_ptrs))

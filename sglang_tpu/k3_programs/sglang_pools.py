@@ -223,6 +223,10 @@ class K3UnifiedKVPool:
     def host_pool_decls(self) -> list:
         return []
 
+    def maybe_get_custom_mem_pool(self) -> None:
+        # The P/D transfer registers the pools' own buffers.
+        return None
+
     @classmethod
     def bytes_per_token(cls, kv_cache_dtype: str) -> int:
         """A logical token's share of the unified pools on one rank: every
