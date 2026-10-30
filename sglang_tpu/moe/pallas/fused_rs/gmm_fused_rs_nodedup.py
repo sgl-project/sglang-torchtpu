@@ -17,6 +17,7 @@ Key design principles:
 
 import dataclasses
 import functools
+import os
 
 import jax
 import jax.experimental.pallas as pl
@@ -25,6 +26,10 @@ from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.envs import envs as tpu_envs
+
+# Profiling only: comma list of nocompute/nogather/pairnoadd/pairnowrite/pairnofwd/pairnosend drops that part of
+# the kernel (wrong output).
+_ABLATE = frozenset(x for x in os.environ.get("SGLANG_TPU_FUSED_RS_ABLATE", "").split(",") if x)
 from sglang_tpu.moe.pallas.fused_rs.gmm_v2_gather_scatter import (
     Dimensions,
     FusedDims,
@@ -1034,6 +1039,8 @@ def kernel_main_fused_rs(
     def _pair_send(gm_id, stg_id, row0, num_valid):
         """Ship tile gm_id's valid partial rows to the sibling's ring slot (power-of-two DMAs)."""
         ring_slot = gm_id % _PAIR_RING
+        if "pairnosend" in _ABLATE:
+            return
 
         @pl.when(gm_id >= _PAIR_RING)
         def _():
@@ -1059,6 +1066,62 @@ def kernel_main_fused_rs(
             off = off + jnp.where(has, b, 0)
         gm_id_ref[1 + stg_id] = gm_id_ref[1 + stg_id] + _pair_count_pieces(num_valid)
 
+    @jax.named_scope("pair_issue")
+    def _pair_issue_table(g, stg, row0, my_chip, num_chips, rows_per_block):
+        """Issue tile g's runs from the precomputed table: own and sibling rows carry this
+        core's partial; the run for chip my_chip + k carries the pair sum to the core of
+        this parity there, into that owner's receive block 1 + (num_chips - k) % num_chips."""
+        n_targets = num_chips + 1
+        stride = pair_meta_stride
+        sent = jnp.int32(0)
+        for t in range(n_targets):
+            at = pair_meta_base + g * n_targets + t
+            run_len = group_start_ref[at]
+            src_off = group_start_ref[at + stride]
+            rank = group_start_ref[at + 2 * stride]
+            if t == 0:
+                d, block, src = my_id, 0, scatter_staging_3x_ref
+            elif t == 1:
+                d, block, src = jnp.bitwise_xor(my_id, 1), 1, scatter_staging_3x_ref
+            else:
+                k = t - 1
+                d = 2 * ((my_chip + k) % num_chips) + my_id % 2
+                block = 1 + (num_chips - k) % num_chips
+                src = pair_sum_ref
+                if "pairnofwd" in _ABLATE:
+                    continue
+            dst0 = block * rows_per_block + rank
+
+            def _pieces(sizes, *, run_len=run_len, src_off=src_off, dst0=dst0, d=d, src=src):
+                n = jnp.int32(0)
+                for b in sizes:
+                    has = (run_len & b) != 0
+                    off = run_len & ~(2 * b - 1)  # rows of the larger pieces before this one
+
+                    @pl.when(has)
+                    def _(b=b, off=off):
+                        pltpu.make_async_remote_copy(
+                            src_ref=src.at[stg, pl.ds(row0 + src_off + off, b), :, :],
+                            dst_ref=out_buf_ref.at[pl.ds(dst0 + off, b), :, :],
+                            send_sem=send_sems_ref.at[stg],
+                            recv_sem=recv_sem_ref.at[0],
+                            device_id={ep_axis_name: d},
+                            device_id_type=pltpu.DeviceIdType.MESH,
+                        ).start()
+
+                    n = n + has.astype(jnp.int32)
+                return n
+
+            big = [b for b in pair_pieces if b >= 32]
+            small = [b for b in pair_pieces if b < 32]
+            if big:
+                # most runs are a few dozen rows: test the large pieces only when needed
+                sent = sent + lax.cond(
+                    run_len >= 32, lambda: _pieces(big), lambda: jnp.int32(0)
+                )
+            sent = sent + _pieces(small)
+        gm_id_ref[1 + stg] = gm_id_ref[1 + stg] + sent
+
     @jax.named_scope("pair_finish")
     def _pair_finish(g):
         """Tile g: add the sibling's partial rows, free its ring slot, write each owner's run.
@@ -1075,22 +1138,32 @@ def kernel_main_fused_rs(
         row0 = m_st % _sls_pair
         n_pieces = _pair_count_pieces(m_en - m_st)
 
-        @pl.when(n_pieces > 0)
-        def _():
-            pl.semaphore_wait(pair_recv_sem_ref.at[ring_slot], n_pieces)
+        with jax.named_scope("pair_wait"):
 
-        pair_sum_ref[stg] = (
-            scatter_staging_3x_ref[stg].astype(jnp.float32)
-            + pair_ring_ref[ring_slot].astype(jnp.float32)
-        ).astype(pair_sum_ref.dtype)
-        pltpu.semaphore_signal(
-            pair_credit_ref.at[0],
-            device_id={ep_axis_name: sibling},
-            device_id_type=pltpu.DeviceIdType.MESH,
-        )
+            @pl.when(jnp.logical_and(n_pieces > 0, "pairnosend" not in _ABLATE))
+            def _():
+                pl.semaphore_wait(pair_recv_sem_ref.at[ring_slot], n_pieces)
+
+        if "pairnoadd" not in _ABLATE:
+            with jax.named_scope("pair_add"):
+                pair_sum_ref[stg] = (
+                    scatter_staging_3x_ref[stg].astype(jnp.float32)
+                    + pair_ring_ref[ring_slot].astype(jnp.float32)
+                ).astype(pair_sum_ref.dtype)
+        if "pairnosend" not in _ABLATE:
+            pltpu.semaphore_signal(
+                pair_credit_ref.at[0],
+                device_id={ep_axis_name: sibling},
+                device_id_type=pltpu.DeviceIdType.MESH,
+            )
+        if "pairnowrite" in _ABLATE:
+            return
         my_chip = my_id // 2
         num_chips = ep_size // 2
         rows_per_block = out_buf_ref.shape[0] // (num_chips + 1)
+        if _pair_run_table():
+            _pair_issue_table(g, stg, row0, my_chip, num_chips, rows_per_block)
+            return
 
         def _owner(d, carry):
             src_off, sent = carry
@@ -1106,6 +1179,8 @@ def kernel_main_fused_rs(
             )
             dst0 = block * rows_per_block + rank
             send = jnp.logical_and(same_chip | forward, run_len > 0)
+            if "pairnofwd" in _ABLATE:
+                send = jnp.logical_and(send, ~forward)
             off = jnp.int32(0)
             for b in pair_pieces:
                 has = jnp.logical_and(send, (run_len & b) != 0)
@@ -1140,7 +1215,8 @@ def kernel_main_fused_rs(
                 sent = sent + has.astype(jnp.int32)
             return src_off + run_len, sent
 
-        _, sent = lax.fori_loop(0, ep_size, _owner, (jnp.int32(0), jnp.int32(0)))
+        with jax.named_scope("pair_issue"):
+            _, sent = lax.fori_loop(0, ep_size, _owner, (jnp.int32(0), jnp.int32(0)))
         gm_id_ref[1 + stg] = gm_id_ref[1 + stg] + sent
 
     @jax.named_scope("gm_loop_body")
@@ -1334,7 +1410,8 @@ def kernel_main_fused_rs(
                 # ns % num_w1_bufs == buf_id, so starting the next DMA first
                 # would overwrite the tile this matmul is still reading (WAR
                 # race between the refill DMA and compute -> nondeterminism).
-                _dispatch(compute_gmm1_tile, buf_id, _n1, _k1, gm_id)
+                if "nocompute" not in _ABLATE:
+                    _dispatch(compute_gmm1_tile, buf_id, _n1, _k1, gm_id)
                 if step + num_w1_bufs < total_w1_steps:
                     ns = step + num_w1_bufs
                     start_w1_dma(ns % num_w1_bufs, expert_id, ns // num_k1, ns % num_k1)
@@ -1392,7 +1469,8 @@ def kernel_main_fused_rs(
                         out_dtype
                     ).reshape(m_sub, dims.size_lhs_sublane, dims.size_k2)
 
-                _dispatch(_interlude)
+                if "nocompute" not in _ABLATE:
+                    _dispatch(_interlude)
 
             # GMM2 loop.
             for step in range(total_w2_steps):
@@ -1406,7 +1484,8 @@ def kernel_main_fused_rs(
                     wait_w2_dma(buf_id)
 
                 # See GMM1 loop: consume the slot before refilling it (WAR).
-                _dispatch(compute_gmm2_tile, buf_id, _n2, _k2, gm_id)
+                if "nocompute" not in _ABLATE:
+                    _dispatch(compute_gmm2_tile, buf_id, _n2, _k2, gm_id)
                 if step + num_w2_bufs < total_w2_steps:
                     ns = step + num_w2_bufs
                     start_w2_dma(ns % num_w2_bufs, expert_id, ns // num_k2, ns % num_k2)
@@ -1646,7 +1725,7 @@ def kernel_main_fused_rs(
             wait_staging_slot_writes(_s)
     if pair_exchange:
         # one credit per tile the sibling consumed; the first _PAIR_RING were never waited
-        @pl.when(local_num_gm > 0)
+        @pl.when(jnp.logical_and(local_num_gm > 0, "pairnosend" not in _ABLATE))
         def _():
             pl.semaphore_wait(
                 pair_credit_ref.at[0], jnp.minimum(local_num_gm, _PAIR_RING)
@@ -1656,7 +1735,12 @@ def kernel_main_fused_rs(
     sync_barrier()
 
     # Drain incoming receive semaphores using in-kernel computed total_recv
-    @pl.when(total_recv > 0)
+    # (write-dropping ablations change the receive count: pairnowrite receives nothing,
+    # pairnofwd only the own and sibling blocks of the ep // 2 + 1)
+    if "pairnofwd" in _ABLATE and pair_exchange:
+        total_recv = total_recv // (ep_size // 2 + 1) * 2
+
+    @pl.when(jnp.logical_and(total_recv > 0, "pairnowrite" not in _ABLATE))
     def _():
         pl.semaphore_wait(recv_sem_ref.at[0], total_recv)
         if fp8_direct_write:
@@ -1852,11 +1936,36 @@ def _pair_exchange_metadata(
     total_recv = num_blocks * jnp.sum(pieces)
     head = group_start.at[2].set(total_recv.astype(jnp.int32))
     base = head.shape[0]
+    if _pair_run_table():
+        # Runs this rank issues per tile, in _pair_targets order: (length, offset in the
+        # tile, rank among the owner's rows). Rows of a tile are token-sorted, so a run
+        # starts after the runs of all lower owners.
+        src_off = jnp.cumsum(run_len, axis=1) - run_len
+        targets = _pair_targets(my_rank, ep_size)
+        cols = [jnp.take(a, targets, axis=1) for a in (run_len, src_off, run_rank)]
+        stride = num_slots * len(targets)
+        meta = jnp.concatenate([head] + [c.reshape(-1) for c in cols])
+        return meta.astype(jnp.int32), base, stride
     stride = num_slots * ep_size
     meta = jnp.concatenate([head, run_len.reshape(-1), run_rank.reshape(-1)]).astype(
         jnp.int32
     )
     return meta, base, stride
+
+
+def _pair_run_table() -> bool:
+    return tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_RUN_TABLE.get()
+
+
+def _pair_targets(my_id, ep_size: int):
+    """Owners a rank sends runs to under pair exchange: itself, its sibling, then the core
+    of its parity on chip (my_chip + k) % num_chips for k = 1.. num_chips - 1."""
+    num_chips = ep_size // 2
+    my_chip, parity = my_id // 2, my_id % 2
+    return jnp.stack(
+        [my_id, jnp.bitwise_xor(my_id, 1)]
+        + [2 * ((my_chip + k) % num_chips) + parity for k in range(1, num_chips)]
+    ).astype(jnp.int32)
 
 
 # =============================================================================
