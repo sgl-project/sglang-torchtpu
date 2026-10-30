@@ -85,6 +85,18 @@ struct PDRequestContext<'a> {
 #[derive(Clone, Copy)]
 struct BreakerOutcomesRecorded;
 
+/// Marker placed on a `Response` when the attempt cancelled its paired request
+/// and the request body pins the engine request id (see `pins_engine_rid`).
+/// The cancelled request keeps that id registered on its worker until the
+/// engine notices the disconnect (~4-8s). A retry reuses the id and re-runs
+/// `select_pd_pair`, which can pick that worker again (always with a single
+/// worker, usually under `cache_aware`); the engine would then reject the
+/// retry with a non-retryable 400 "Duplicate request ID", and the client would
+/// get that instead of the real error. So the outer dispatcher returns this
+/// response without retrying (see `should_retry_response`).
+#[derive(Clone, Copy)]
+struct CancelledRequestHoldsRid;
+
 /// Prefill's reply with its body read to the end. A prefill has completed only
 /// when its body ends: for streaming requests the engine commits 200 headers
 /// immediately and holds the body open until prefill (and, with Raiden, the
@@ -450,6 +462,26 @@ impl PDRouter {
         Ok((prefill_request, decode_request))
     }
 
+    /// Whether `body` sets the id the engine registers the request under:
+    /// `rid`, or `request_id` on /v1/responses. Without one the engine mints a
+    /// fresh id for every request, so a retry can't collide with a cancelled
+    /// attempt.
+    fn pins_engine_rid(route: &str, body: &Value) -> bool {
+        let key = if route == "/v1/responses" {
+            "request_id"
+        } else {
+            "rid"
+        };
+        body.get(key).is_some_and(|id| !id.is_null())
+    }
+
+    /// Retry a retryable status unless the retry would reuse an id that a
+    /// cancelled request still holds (see `CancelledRequestHoldsRid`).
+    fn should_retry_response(res: &Response) -> bool {
+        is_retryable_status(res.status())
+            && res.extensions().get::<CancelledRequestHoldsRid>().is_none()
+    }
+
     async fn execute_dual_dispatch<T: Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
@@ -572,7 +604,7 @@ impl PDRouter {
                     }
                 }
             },
-            |res, _attempt| is_retryable_status(res.status()),
+            |res, _attempt| Self::should_retry_response(res),
             |delay, attempt| {
                 // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
                 Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
@@ -597,7 +629,9 @@ impl PDRouter {
                 endpoint,
                 duration,
             );
-        } else if !is_retryable_status(response.status()) {
+        } else if !Self::should_retry_response(&response) {
+            // Failures that were retried until exhausted are counted by the
+            // retries-exhausted hook above.
             Metrics::record_router_error(
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_PD,
@@ -883,6 +917,11 @@ impl PDRouter {
             }
         };
 
+        // Every early return below cancels the paired request, which then keeps
+        // a pinned engine id registered for a few seconds; see
+        // `CancelledRequestHoldsRid`.
+        let pins_rid = Self::pins_engine_rid(context.route, &json_request);
+
         let (prefill_result, decode_early, decode_prefix) = match race {
             DispatchRace::PrefillDone {
                 prefill_result,
@@ -936,6 +975,9 @@ impl PDRouter {
                     }
                 };
                 response.extensions_mut().insert(BreakerOutcomesRecorded);
+                if pins_rid {
+                    response.extensions_mut().insert(CancelledRequestHoldsRid);
+                }
                 return response;
             }
             DispatchRace::DecodeFailedEarly(decode_result) => {
@@ -954,9 +996,13 @@ impl PDRouter {
                 events::RequestReceivedEvent {}.emit();
                 // Prefill was cancelled due to a decode fault, not its own, so
                 // don't record it.
-                return self
+                let mut response = self
                     .handle_decode_failure(decode_result, None, &context, prefill, decode)
                     .await;
+                if pins_rid {
+                    response.extensions_mut().insert(CancelledRequestHoldsRid);
+                }
+                return response;
             }
         };
 
@@ -996,6 +1042,9 @@ impl PDRouter {
                     ),
                 };
             response.extensions_mut().insert(BreakerOutcomesRecorded);
+            if pins_rid {
+                response.extensions_mut().insert(CancelledRequestHoldsRid);
+            }
             return response;
         }
 
@@ -2346,5 +2395,36 @@ mod tests {
         assert_eq!(first_sse_event_is_error(b"data: {\"error\":"), None);
         let oversized = vec![b'x'; MAX_DECODE_PEEK_BYTES];
         assert_eq!(first_sse_event_is_error(&oversized), Some(false));
+    }
+
+    #[test]
+    fn test_pins_engine_rid() {
+        // SRT registers a request under the client's `rid` (`request_id` on
+        // /v1/responses) when given, and under a fresh id otherwise.
+        assert!(PDRouter::pins_engine_rid(
+            "/generate",
+            &json!({"text": "a", "rid": "r"})
+        ));
+        assert!(PDRouter::pins_engine_rid(
+            "/v1/completions",
+            &json!({"prompt": "a", "rid": ["r0", "r1"]})
+        ));
+        assert!(PDRouter::pins_engine_rid(
+            "/v1/responses",
+            &json!({"input": "a", "request_id": "resp_r"})
+        ));
+
+        assert!(!PDRouter::pins_engine_rid(
+            "/generate",
+            &json!({"text": "a"})
+        ));
+        assert!(!PDRouter::pins_engine_rid(
+            "/generate",
+            &json!({"text": "a", "rid": null})
+        ));
+        assert!(!PDRouter::pins_engine_rid(
+            "/v1/responses",
+            &json!({"input": "a", "rid": "r"})
+        ));
     }
 }

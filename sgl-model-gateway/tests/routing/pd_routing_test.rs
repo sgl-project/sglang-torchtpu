@@ -974,3 +974,262 @@ mod pd_early_stream_error_tests {
         d.abort();
     }
 }
+
+/// A retry reuses the client's `rid`. When an attempt ends with the router
+/// cancelling the paired request (decode failed before prefill completed, or
+/// prefill failed), the cancelled request stays registered on its engine until
+/// the engine notices the disconnect (~4 s on TPU v7x). A retry that reaches
+/// that engine in the meantime gets 400 "Duplicate request ID detected", which
+/// is not retried, so the client would see it instead of the real error. The
+/// router must return the real error instead, while requests without a `rid`
+/// keep their retries.
+#[cfg(test)]
+mod pd_retry_rid_reuse_tests {
+    use std::{
+        collections::HashSet,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
+        time::Duration,
+    };
+
+    use axum::{extract::State, routing::post, Json};
+    use http_body_util::BodyExt;
+    use serde_json::Value;
+    use smg::{
+        config::{PolicyConfig, RetryConfig},
+        core::{BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType as CoreWorkerType},
+        policies::PolicyRegistry,
+        protocols::generate::GenerateRequest,
+        routers::{pd_router::PDRouter, RouterTrait},
+    };
+    use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
+
+    use super::*;
+
+    /// Attempts the router makes per request, including the first.
+    const MAX_ATTEMPTS: usize = 3;
+    /// How long an engine keeps a rid registered after receiving it.
+    const RID_HELD_MS: u64 = 3000;
+    /// The failing engine answers after this delay, long before the other
+    /// engine would.
+    const REJECT_MS: u64 = 200;
+
+    /// Engine that, like SRT's `TokenizerManager`, rejects a rid that is still
+    /// registered with 400 "Duplicate request ID detected". It answers only
+    /// after releasing the rid, so in these tests the router always cancels it.
+    #[derive(Clone, Default)]
+    struct RidHoldingEngine {
+        in_flight: Arc<Mutex<HashSet<String>>>,
+        duplicates: Arc<AtomicUsize>,
+    }
+
+    impl RidHoldingEngine {
+        fn app(&self) -> axum::Router {
+            axum::Router::new()
+                .route("/generate", post(rid_holding_generate))
+                .with_state(self.clone())
+        }
+
+        fn duplicates(&self) -> usize {
+            self.duplicates.load(Ordering::SeqCst)
+        }
+    }
+
+    async fn rid_holding_generate(
+        State(engine): State<RidHoldingEngine>,
+        Json(request): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        // Without a client rid the engine generates a unique one.
+        if let Some(rid) = request["rid"].as_str().map(str::to_owned) {
+            if !engine.in_flight.lock().unwrap().insert(rid.clone()) {
+                engine.duplicates.fetch_add(1, Ordering::SeqCst);
+                let message = format!("Duplicate request ID detected: {rid}");
+                let error = json!({"error": {"message": message}});
+                return (StatusCode::BAD_REQUEST, Json(error));
+            }
+            // The engine keeps the rid until the request finishes or, if the
+            // router hangs up first, until the disconnect watcher aborts it.
+            // Release it from a detached task, because axum drops this handler
+            // when the router hangs up.
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(RID_HELD_MS)).await;
+                engine.in_flight.lock().unwrap().remove(&rid);
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(RID_HELD_MS + 50)).await;
+        (StatusCode::OK, Json(json!({"text": "", "meta_info": {}})))
+    }
+
+    /// Engine that rejects its first `failures` requests with a retryable 503,
+    /// like an overloaded engine, and accepts the rest. A rejected request
+    /// leaves no rid registered.
+    #[derive(Clone)]
+    struct FailingEngine {
+        failures: usize,
+        requests: Arc<AtomicUsize>,
+    }
+
+    impl FailingEngine {
+        fn new(failures: usize) -> Self {
+            Self {
+                failures,
+                requests: Arc::default(),
+            }
+        }
+
+        fn app(&self) -> axum::Router {
+            axum::Router::new()
+                .route("/generate", post(failing_generate))
+                .with_state(self.clone())
+        }
+
+        fn requests(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
+    }
+
+    async fn failing_generate(State(engine): State<FailingEngine>) -> (StatusCode, Json<Value>) {
+        let seen = engine.requests.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(REJECT_MS)).await;
+        if seen < engine.failures {
+            let error = json!({"error": {"message": "engine overloaded"}});
+            (StatusCode::SERVICE_UNAVAILABLE, Json(error))
+        } else {
+            (StatusCode::OK, Json(json!({"text": "", "meta_info": {}})))
+        }
+    }
+
+    async fn spawn_server(app: axum::Router) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), task)
+    }
+
+    fn make_router(prefill_url: String, decode_url: String) -> PDRouter {
+        let router = PDRouter {
+            worker_registry: Arc::new(WorkerRegistry::new()),
+            policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            client: reqwest::Client::new(),
+            retry_config: RetryConfig {
+                max_retries: MAX_ATTEMPTS as u32,
+                initial_backoff_ms: 10,
+                max_backoff_ms: 50,
+                ..Default::default()
+            },
+            api_key: None,
+            enable_igw: false,
+        };
+        let prefill = BasicWorkerBuilder::new(prefill_url)
+            .worker_type(CoreWorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+        prefill.set_healthy(true);
+        let decode = BasicWorkerBuilder::new(decode_url)
+            .worker_type(CoreWorkerType::Decode)
+            .build();
+        decode.set_healthy(true);
+        router.worker_registry.register(Arc::new(prefill));
+        router.worker_registry.register(Arc::new(decode));
+        router
+    }
+
+    /// Sends one non-streaming /generate through a router with one prefill and
+    /// one decode, and returns the client's status and body. With a single
+    /// worker per role every retry reaches the same engines; with several, the
+    /// default cache_aware policy usually picks them again, because the retry's
+    /// prompt matches what it recorded for the first attempt.
+    async fn generate(
+        prefill: axum::Router,
+        decode: axum::Router,
+        rid: Option<&str>,
+    ) -> (StatusCode, String) {
+        let (prefill_url, p) = spawn_server(prefill).await;
+        let (decode_url, d) = spawn_server(decode).await;
+        let router = make_router(prefill_url, decode_url);
+        let mut request = json!({"text": "hello", "stream": false});
+        if let Some(rid) = rid {
+            request["rid"] = json!(rid);
+        }
+        let request: GenerateRequest = serde_json::from_value(request).unwrap();
+
+        let result = timeout(Duration::from_secs(30), async {
+            let response = router.route_generate(None, &request, None).await;
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        })
+        .await
+        .expect("PD request must complete");
+        p.abort();
+        d.abort();
+        result
+    }
+
+    /// A decode that fails before prefill completes cancels prefill, which
+    /// keeps the rid registered.
+    #[tokio::test]
+    async fn test_early_decode_failure_with_client_rid_returns_decode_error() {
+        let prefill = RidHoldingEngine::default();
+        let decode = FailingEngine::new(usize::MAX);
+
+        let (status, body) = generate(prefill.app(), decode.app(), Some("client-rid")).await;
+
+        assert_eq!(
+            prefill.duplicates(),
+            0,
+            "a retry reused the rid of the cancelled attempt still registered on prefill; \
+             client got {status}: {body}"
+        );
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "client must get decode's 503: {body}"
+        );
+        assert_eq!(decode.requests(), 1, "no retry while prefill holds the rid");
+    }
+
+    /// A failed prefill cancels decode, which keeps the rid registered. Without
+    /// the guard, the retry's decode rejects the rid, and the client gets that
+    /// 400 instead of prefill's error once prefill recovers.
+    #[tokio::test]
+    async fn test_prefill_failure_with_client_rid_returns_prefill_error() {
+        let prefill = FailingEngine::new(1);
+        let decode = RidHoldingEngine::default();
+
+        let (status, body) = generate(prefill.app(), decode.app(), Some("client-rid")).await;
+
+        assert_eq!(
+            decode.duplicates(),
+            0,
+            "a retry reused the rid of the cancelled attempt still registered on decode; \
+             client got {status}: {body}"
+        );
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "client must get prefill's 503: {body}"
+        );
+        assert_eq!(prefill.requests(), 1, "no retry while decode holds the rid");
+    }
+
+    /// Without a client rid the engine gives every attempt a fresh id, so both
+    /// cancel paths keep their retries.
+    #[tokio::test]
+    async fn test_paired_cancel_without_client_rid_still_retries() {
+        let prefill = RidHoldingEngine::default();
+        let decode = FailingEngine::new(usize::MAX);
+        let (status, body) = generate(prefill.app(), decode.app(), None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(decode.requests(), MAX_ATTEMPTS, "early decode failure");
+
+        let prefill = FailingEngine::new(usize::MAX);
+        let decode = RidHoldingEngine::default();
+        let (status, body) = generate(prefill.app(), decode.app(), None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(prefill.requests(), MAX_ATTEMPTS, "prefill failure");
+    }
+}
