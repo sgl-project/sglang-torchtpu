@@ -356,11 +356,11 @@ def _splash_mha(q, k, v, scale, is_causal):
         block_kv,
     )
 
-    # make_splash_mha takes no scale, so q is pre-scaled and rounded to bf16:
-    # up to 2^-9 relative error per element, which the flash kernel avoids by
-    # scaling its f32 scores. The extra error grows with the logit spread
-    # (test_splash_high_logit_gain bounds it).
-    q = (q.astype(jnp.float32) * scale).astype(k.dtype)
+    # make_splash_mha takes no scale. Keep the scaled query in f32: rounding
+    # it to bf16 perturbs logits enough to change high-gain attention weights.
+    output_dtype = q.dtype
+    q = q.astype(jnp.float32) * scale
+    k = k.astype(jnp.float32)
     if num_q_heads != num_kv_heads:
         k = jnp.repeat(k, num_q_heads // num_kv_heads, axis=1)
         v = jnp.repeat(v, num_q_heads // num_kv_heads, axis=1)
@@ -379,15 +379,16 @@ def _splash_mha(q, k, v, scale, is_causal):
             block_kv_compute=min(block_kv, 512),
         ),
     )
-    if kv_padded == kv_seq:
-        out = jax.vmap(kernel)(q, k, v)
-    else:
-        segment_ids = splash.SegmentIds(
-            q=jnp.ones((q_padded,), jnp.int32),
-            kv=(jnp.arange(kv_padded) < kv_seq).astype(jnp.int32),
-        )
-        out = jax.vmap(functools.partial(kernel, segment_ids=segment_ids))(q, k, v)
-    return out[:, :, :q_seq]
+    with jax.default_matmul_precision("highest"):
+        if kv_padded == kv_seq:
+            out = jax.vmap(kernel)(q, k, v)
+        else:
+            segment_ids = splash.SegmentIds(
+                q=jnp.ones((q_padded,), jnp.int32),
+                kv=(jnp.arange(kv_padded) < kv_seq).astype(jnp.int32),
+            )
+            out = jax.vmap(functools.partial(kernel, segment_ids=segment_ids))(q, k, v)
+    return out[:, :, :q_seq].astype(output_dtype)
 
 
 def _add_kernel_source_to_compile_cache_key() -> None:
