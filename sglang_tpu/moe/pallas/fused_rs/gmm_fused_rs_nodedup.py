@@ -1019,10 +1019,14 @@ def kernel_main_fused_rs(
     _w_qdt = cfgs1.rhs_cfgs.quant_dtype
     _weight_is_fp4 = _w_qdt is not None and jax.dtypes.itemsize_bits(_w_qdt) <= 4
     if (only := tpu_envs.SGLANG_TPU_FUSED_RS_M_BUCKETS.get()) is not None:
-        # every bucket variant is a full copy of the GMM code; fewer keeps it in
-        # instruction memory
+        # The exact bucket set (multiples of the sublane tiling, tile_m always kept).
+        # Every bucket variant is a full copy of the GMM code: fewer keeps it in
+        # instruction memory; sizes between 128 and 256 trim MXU padding when tiles
+        # run ~130-200 rows (4096-token prefill at ~128 rows per expert).
         keep = {int(b) for b in only.split(",") if b}
-        M_BUCKETS = [b for b in M_BUCKETS if b in keep or b == tile_m]
+        M_BUCKETS = sorted(
+            {b for b in keep if _sls_b <= b <= tile_m and b % _sls_b == 0} | {tile_m}
+        )
     _USE_BUCKETS = len(M_BUCKETS) > 1 and _weight_is_fp4
 
     # --- Main padded gm loop ---
