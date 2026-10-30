@@ -88,6 +88,8 @@ async def _run(prefill_handler, decode_handler, max_chunks=None):
                 if max_chunks is not None and len(chunks) >= max_chunks:
                     await response.body_iterator.aclose()
                     break
+        # A completed stream lets the prefill finish in the background.
+        await asyncio.gather(*list(mini_lb._background_tasks))
         return response, chunks, sessions
     finally:
         aiohttp.ClientSession = real_session
@@ -401,3 +403,83 @@ def test_affinity_request_deadline_does_not_mark_engine_unreachable():
                 release.set()
 
     asyncio.run(run())
+
+
+async def _decode_dies_mid_stream(request):
+    """Streams two chunks, then drops the connection without ending the
+    chunked body, as a decode whose pod is preempted does."""
+    resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+    await resp.prepare(request)
+    for i in range(2):
+        await resp.write(json.dumps({"text": "x" * (i + 1)}).encode() + b"\n\n")
+    await asyncio.sleep(0.05)
+    request.transport.close()
+    return resp
+
+
+@pytest.mark.unit
+def test_decode_dying_mid_stream_reports_an_error(caplog, monkeypatch):
+    probed = []
+    monkeypatch.setattr(
+        MiniLoadBalancer, "request_health_probe", lambda self, url: probed.append(url)
+    )
+    with caplog.at_level("ERROR", logger="sglang_router.mini_lb"):
+        response, chunks, sessions = asyncio.run(_run(_stream, _decode_dies_mid_stream))
+    # Health routing re-checks the decode that broke, and only that one.
+    assert len(probed) == 1
+    assert response.status_code == 200  # already committed when it broke
+    body = b"".join(chunks)
+    assert body.count(b'"text"') == 2
+    events = [e for e in body.split(b"\n\n") if e.startswith(b"data: {")]
+    error = json.loads(events[-1][len(b"data: ") :])["error"]
+    assert error["code"] == 502
+    assert error["retryable"] is True
+    assert "stream broke" in error["message"]
+    assert body.endswith(b"data: [DONE]\n\n")
+    records = [r for r in caplog.records if r.name == "sglang_router.mini_lb"]
+    assert len(records) == 1 and records[0].exc_info is None  # one line
+    assert probed[0] in records[0].getMessage()
+    _assert_sessions_closed(sessions)
+
+
+def _slow_prefill(finish_after_s, outcome):
+    """A prefill that answers its first chunk at once but ends its own
+    response only `finish_after_s` later (its KV transfer is still being
+    wrapped up). Records whether it got to finish or saw a disconnect."""
+
+    async def handler(request):
+        resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await resp.prepare(request)
+        await resp.write(b'data: {"text": "x"}\n\n')
+        try:
+            await asyncio.sleep(finish_after_s)
+            await resp.write(b"data: [DONE]\n\n")
+            await resp.write_eof()
+            outcome.append("finished")
+        except (ConnectionResetError, asyncio.CancelledError):
+            outcome.append("disconnected")
+            raise
+        return resp
+
+    return handler
+
+
+@pytest.mark.unit
+def test_completed_stream_lets_the_prefill_finish():
+    outcome = []
+    response, chunks, sessions = asyncio.run(_run(_slow_prefill(0.3, outcome), _stream))
+    assert response.status_code == 200
+    assert b"".join(chunks).endswith(b"data: [DONE]\n\n")
+    # The prefill was not cut off once the decode had answered.
+    assert outcome == ["finished"]
+    _assert_sessions_closed(sessions)
+
+
+@pytest.mark.unit
+def test_stuck_prefill_is_closed_after_the_drain_timeout(monkeypatch):
+    monkeypatch.setattr(mini_lb, "PREFILL_DRAIN_TIMEOUT_SECS", 0.2)
+    outcome = []
+    response, chunks, sessions = asyncio.run(_run(_slow_prefill(2, outcome), _stream))
+    assert response.status_code == 200
+    assert b"".join(chunks).endswith(b"data: [DONE]\n\n")
+    _assert_sessions_closed(sessions)
