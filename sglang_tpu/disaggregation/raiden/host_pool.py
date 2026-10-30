@@ -192,3 +192,46 @@ def slots_within_budget(budget_bytes: float, slot_bytes: int, ceiling: int) -> i
             "raise SGLANG_RAIDEN_HOST_POOL_GB or lower the context length"
         )
     return max(1, min(ceiling, int(budget_bytes // max(1, slot_bytes))))
+
+
+def plan_dynamic_staging(
+    budget_bytes: float,
+    ceiling: int,
+    full_page_bytes: int,
+    max_blocks: int,
+    chunk_blocks: int,
+    swa_slot_bytes: Optional[int] = None,
+) -> Tuple[int, Optional[int]]:
+    """(full_pool_pages, swa_num_slots) within ``budget_bytes`` for dynamic staging.
+
+    Per-transfer staging locks only the pages each in-flight transfer actually
+    moves, while a closing transfer on a hybrid model holds at most one chunk
+    of full-attention pages alongside one sliding-window slot. Reserving one
+    max-length request up front guarantees any single request fits; pairing
+    each window slot with one full-attention chunk keeps both pools balanced,
+    and the remaining budget goes to full-attention pages.
+    """
+    full_slot_bytes = full_page_bytes * max_blocks
+    if swa_slot_bytes is None:
+        slots_within_budget(budget_bytes, full_slot_bytes, ceiling)
+        pool_pages = min(
+            ceiling * max_blocks,
+            int(budget_bytes // max(1, full_page_bytes)),
+        )
+        return max(max_blocks, pool_pages), None
+
+    slots_within_budget(budget_bytes, full_slot_bytes + swa_slot_bytes, ceiling)
+    chunk_bytes = full_page_bytes * chunk_blocks
+    if swa_slot_bytes <= 0:
+        swa_num_slots = ceiling
+    else:
+        swa_num_slots = min(
+            ceiling,
+            int((budget_bytes - full_slot_bytes) // swa_slot_bytes),
+            int(budget_bytes // max(1, chunk_bytes + swa_slot_bytes)),
+        )
+    pool_pages = min(
+        ceiling * max_blocks,
+        int((budget_bytes - swa_num_slots * swa_slot_bytes) // max(1, full_page_bytes)),
+    )
+    return max(max_blocks, pool_pages), swa_num_slots
