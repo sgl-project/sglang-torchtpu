@@ -61,10 +61,14 @@ logger = logging.getLogger(__name__)
 _PALLAS_GDN_OP = None
 
 
-def _mamba_chunk_cap() -> int:
-    """Return the active radix-cache mamba chunk size, or 64 if uninitialized."""
-    if get_server_args() is None:
-        return 64
+def _mamba_chunk_cap() -> Optional[int]:
+    """Return the radix-cache mamba chunk cap when active, or None otherwise."""
+    try:
+        server_args = get_server_args()
+    except ValueError:  # Standalone op use: no ServerArgs published.
+        return None
+    if server_args.disable_radix_cache:
+        return None
     return mamba_cache_chunk_size()
 
 
@@ -144,6 +148,7 @@ def build_gdn_pallas_op():
         track_end: Optional[jax.Array] = None,
         read_offsets: Optional[jax.Array] = None,
         num_spec_tokens: int = 0,
+        max_mixed_tile_size: Optional[int] = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         conv_dim = n_kq * d_k * 2 + n_v * d_v
         if fused_qkvg:
@@ -195,7 +200,7 @@ def build_gdn_pallas_op():
                 track_indices=track_indices,
                 track_end=track_end,
                 num_spec_tokens=num_spec_tokens,
-                max_mixed_tile_size=_mamba_chunk_cap(),
+                max_mixed_tile_size=max_mixed_tile_size,
             )
         # Flatten the ((conv, rec), out) return so the bridge can alias the two
         # state buffers (outputs 0, 1) back onto the donated inputs (args 3, 4).
@@ -213,8 +218,9 @@ def build_gdn_pallas_op():
         _wrapped,
         name=f"jax_{op_name}",
         # n_kq, n_v, d_k, d_v, kernel_size, kda, gate_lower_bound, batched_only,
-        # prefill_only, fused_qkvg and num_spec_tokens are static.
-        static_argnums=(13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 27),
+        # prefill_only, fused_qkvg, num_spec_tokens and max_mixed_tile_size are
+        # static.
+        static_argnums=(13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 27, 28),
         donate_argnums=(3, 4),
         input_output_aliases={3: 0, 4: 1},
         warn_deprecated=False,
@@ -286,6 +292,7 @@ def build_gdn_pallas_op():
             track_end,
             read_offsets,
         )
+        chunk_cap = _mamba_chunk_cap()
         key = (
             tuple(None if t is None else (tuple(t.shape), t.dtype) for t in tensors),
             n_kq,
@@ -299,6 +306,7 @@ def build_gdn_pallas_op():
             prefill_only,
             fused_qkvg,
             num_spec_tokens,
+            chunk_cap,
         )
         if key in _exported_shapes:
             _new_conv, _new_rec, output = jax_kernel(
@@ -330,6 +338,7 @@ def build_gdn_pallas_op():
                 track_end,
                 read_offsets,
                 num_spec_tokens,
+                chunk_cap,
             )
         else:
             with (
@@ -365,6 +374,7 @@ def build_gdn_pallas_op():
                     track_end,
                     read_offsets,
                     num_spec_tokens,
+                    chunk_cap,
                 )
             _exported_shapes.add(key)
         return output

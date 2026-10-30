@@ -322,12 +322,12 @@ def calculate_mixed_tile_size(
     act_out_bytes = jnp.dtype(act_out_dtype).itemsize
     rec_state_bytes = jnp.dtype(recurrent_state_dtype).itemsize
 
-    # Select the largest candidate chunk (up to 128 tokens) that fits in VMEM.
+    # Keep the prefill chunk fixed at the largest candidate (up to 128 tokens,
+    # or max_tile_size when radix caching is active) and shrink only for VMEM.
     prefill_candidates = [
         c
         for c in tile_sizes
-        if c <= seq_len
-        and (max_tile_size is None or max_tile_size <= 0 or c <= max_tile_size)
+        if max_tile_size is None or max_tile_size <= 0 or c <= max_tile_size
     ]
     if not prefill_candidates:
         prefill_candidates = [tile_sizes[-1]]
@@ -426,9 +426,9 @@ def get_tile_sizes(
         decode_tile_size = min(decode_tile_target(active_num_seqs, n_v), vmem_fit)
 
     if mixed_tile_size is None or mixed_tile_size <= 0:
-        # Size C from the token bucket: a static (B, N, W) shape cannot tell a
-        # decode step from a prefill, and an empty PER_SEQ launch costs the
-        # same at any C.
+        # Keep the VMEM-fitted prefill chunk invariant across token buckets and
+        # clamp only to padded_batch_size below so prefix-cache resumes cut at
+        # identical chunk boundaries.
         mixed_tile_size = calculate_mixed_tile_size(
             seq_len=batch_size,
             n_kq=n_kq,
@@ -447,5 +447,5 @@ def get_tile_sizes(
 
     # Guarantee strictly positive tile sizes (>= 1) for Pallas grid compilation.
     decode_tile_size = max(1, min(decode_tile_size, padded_batch_size))
-    mixed_tile_size = max(1, min(mixed_tile_size, batch_size))
+    mixed_tile_size = max(1, min(mixed_tile_size, padded_batch_size))
     return decode_tile_size, mixed_tile_size

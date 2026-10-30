@@ -2082,10 +2082,10 @@ class TestGDNTileSelection(CustomTestCase):
 
             num_lanes = pltpu.get_tpu_info().num_lanes
             vmem_limit = config.GDNConfig.get_vmem_limit_bytes(1)
-            for max_cap, expected_full, expected_resumed in (
-                (None, 128, 64),
-                (128, 128, 64),
-                (64, 64, 64),
+            for max_cap, expected_full, expected_resumed, expected_short in (
+                (None, 128, 80, 48),
+                (128, 128, 80, 48),
+                (64, 64, 64, 48),
             ):
                 _, mix_full = tiling.get_tile_sizes(
                     batch_size=193,
@@ -2121,8 +2121,26 @@ class TestGDNTileSelection(CustomTestCase):
                     mixed_vmem_limit_bytes=vmem_limit,
                     max_mixed_tile_size=max_cap,
                 )
+                _, mix_short = tiling.get_tile_sizes(
+                    batch_size=40,
+                    num_seqs=1,
+                    padded_batch_size=48,
+                    n_kq=2,
+                    n_v=4,
+                    d_k=128,
+                    d_v=128,
+                    kernel_size=4,
+                    conv_state_dim_size=2 * 2 * 128 + 4 * 128,
+                    act_out_dtype=jnp.dtype(jnp.bfloat16),
+                    recurrent_state_dtype=jnp.dtype(jnp.float32),
+                    num_lanes=num_lanes,
+                    decode_vmem_limit_bytes=vmem_limit,
+                    mixed_vmem_limit_bytes=vmem_limit,
+                    max_mixed_tile_size=max_cap,
+                )
                 self.assertEqual(mix_full, expected_full)
                 self.assertEqual(mix_resumed, expected_resumed)
+                self.assertEqual(mix_short, expected_short)
 
         self._with_tpu7x_mesh(_check)
 
