@@ -44,8 +44,11 @@ RUNNING = min(64, max(4, 2 * CONCURRENCY)) if ROLE == "decode" else max(4, CONCU
 # prefix cache keeps (the programs' windows split it as they need).
 PREFILL_CHUNK = PAGE_SIZE
 # Prefill KDA checkpoints the prefix cache may hold (each three blocks of the
-# 29 pools: about 28 MB a rank).
-PREFILL_CHECKPOINTS = int(os.environ.get("K3_PROGRAM_PREFILL_CHECKPOINTS", "512"))
+# 29 pools: about 28 MB a rank). The prefill program's weights take ~74 GB of
+# a rank's 96 GB (experts 45, dense 6, its sequence-parallel copies of the
+# latent and shared projections 22.5), so its pools share ~12 GB: 128
+# checkpoints, 96 tails (38 MB each) and ~8M tokens of KV at 580 bytes.
+PREFILL_CHECKPOINTS = int(os.environ.get("K3_PROGRAM_PREFILL_CHECKPOINTS", "128"))
 
 CONFIG = deepcopy(SERVER_CONFIG)
 server_args = CONFIG["server_args"]
@@ -71,7 +74,7 @@ server_args.update(
         "chunked_prefill_size": PREFILL_CHUNK,
         "max_prefill_tokens": PREFILL_CHUNK,
         "max_running_requests": RUNNING,
-        "mem_fraction_static": 0.9,
+        "mem_fraction_static": 0.92,
         "skip_server_warmup": True,
     }
 )
@@ -90,7 +93,7 @@ else:
     # chunk, and sizes the KV pool from what the checkpoints leave.
     # Prompt ends past their last full page, for hits inside a page (sglang_tails).
     CONFIG["runtime_env"]["SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS"] = os.environ.get(
-        "K3_PROGRAM_PREFIX_TAILS", "160"
+        "K3_PROGRAM_PREFIX_TAILS", "96"
     )
     server_args.update(
         disable_radix_cache=False,

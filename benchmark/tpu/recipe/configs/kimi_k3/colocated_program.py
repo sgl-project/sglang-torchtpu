@@ -32,7 +32,10 @@ PAGE_SIZE = 32 * (512 if KV_DTYPE.startswith("fp8") else 256)
 # Decoding requests, up to the 64 rows the programs' plain decode is checked
 # to; the prefill takes its share of the same slots.
 RUNNING = min(64, max(4, 2 * CONCURRENCY))
-CHECKPOINTS = int(os.environ.get("K3_PROGRAM_PREFILL_CHECKPOINTS", "384"))
+# Both programs' weights take ~80 GB of a rank's 96 GB (the shared experts 45,
+# two sets of dense weights 12, the prefill's sequence-parallel projections
+# 22.5): the pools are small.
+CHECKPOINTS = int(os.environ.get("K3_PROGRAM_PREFILL_CHECKPOINTS", "64"))
 
 CONFIG = deepcopy(SERVER_CONFIG)
 server_args = CONFIG["server_args"]
@@ -54,7 +57,7 @@ server_args.update(
         "chunked_prefill_size": PAGE_SIZE,
         "max_prefill_tokens": PAGE_SIZE,
         "max_running_requests": RUNNING,
-        "mem_fraction_static": 0.9,
+        "mem_fraction_static": 0.92,
         "skip_server_warmup": True,
         # The prefix cache: KV pages, a KDA checkpoint per page-aligned prefill
         # chunk, and tails past the last full page (sglang_tails). The running
@@ -87,7 +90,7 @@ runtime_env.update(
         # decode program's tensors, which it shares.
         "SGLANG_TPU_K3_PROGRAM_KERNEL_CONFIG": "prefill_expert_parallel=8",
         "SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS": os.environ.get(
-            "K3_PROGRAM_PREFIX_TAILS", "160"
+            "K3_PROGRAM_PREFIX_TAILS", "48"
         ),
         "SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS": "7:3.78,3:2.87",
         "SGLANG_TPU_K3_PROGRAM_SPEC_SCHEDULE": "1:1:7,2:16:3",
