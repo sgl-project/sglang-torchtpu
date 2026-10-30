@@ -7,6 +7,7 @@ Remove when: upstream provides backend factories for these staging decisions.
 """
 
 from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_schedule
+from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
 from sglang_tpu.host_padding import _can_stage_forward_metadata, _enabled
 
 
@@ -32,6 +33,16 @@ def metadata_device(original, batch):
     ):
         return "cpu"
     return original(batch)
+
+
+def extend_metadata_device(original, batch, device):
+    # PP consumes these lengths to build positions before the decoder pads and
+    # uploads them. Reading freshly uploaded lengths would fence the PP wave.
+    if is_host_padded(batch.sampling_info) or _can_stage_forward_metadata(
+        batch, allow_pipeline_parallel=True
+    ):
+        return "cpu"
+    return original(batch, device)
 
 
 def _stages_spec_metadata(batch) -> bool:
@@ -153,6 +164,11 @@ def hook_specs():
         (
             "sglang.srt.managers.schedule_batch.ScheduleBatch.metadata_device",
             metadata_device,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.model_executor.forward_batch_info._extend_metadata_device",
+            extend_metadata_device,
             HookType.AROUND,
         ),
         (

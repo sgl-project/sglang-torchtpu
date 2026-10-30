@@ -40,6 +40,7 @@ from sglang_tpu.hooks.experimental_spec import (
     initialize_host_batch,
     kimi_spec_defaults,
 )
+from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -164,7 +165,13 @@ class TestExperimentalSpecHooks(CustomTestCase):
         register_host_batch_padder(_pad)
         # Exercise the real registry's descriptor handling and import propagation,
         # then restore every patched binding so this test cannot affect other tests.
-        for target, hook, kind in hook_specs():
+        hooks = hook_specs()
+        hooks.extend(
+            spec
+            for spec in host_padding_hooks()
+            if spec[0].endswith("._extend_metadata_device")
+        )
+        for target, hook, kind in hooks:
             owner_path, name = target.rsplit(".", 1)
             owner = pkgutil.resolve_name(owner_path)
             raw = vars(owner).get(name)
