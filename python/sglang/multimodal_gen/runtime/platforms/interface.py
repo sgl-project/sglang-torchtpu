@@ -160,6 +160,14 @@ class Platform:
         """Return the backend used to compile diffusion modules."""
         return self.simple_compile_backend
 
+    def prepare_spmd_region_wrapper(self) -> Callable | None:
+        """Decorator for --regional-compile regions that every rank runs with the
+        same graph (the model sets ``_compile_regions_spmd_safe``). The regions
+        should trace as one graph each. May configure process-wide compile
+        state the wrapper needs (e.g. a cache-key tag); call it once, before
+        compiling."""
+        return None
+
     def get_compile_options(self, module: torch.nn.Module) -> dict[str, object] | None:
         """Return backend-specific options for a diffusion module."""
         return None
@@ -592,6 +600,24 @@ class Platform:
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
         """Apply platform-specific optimizations to VAE after loading."""
         return vae
+
+    @classmethod
+    def drain_device_queue_after_request(cls) -> bool:
+        """Whether every rank drains its device queue when a request finishes.
+
+        For platforms where queued collectives can otherwise reach into the
+        next request, so a host-to-device copy there waits on a peer.
+        """
+        return False
+
+    @classmethod
+    def fusion_barrier(cls, x: torch.Tensor) -> torch.Tensor:
+        """Pass ``x`` through a point the graph compiler may not fuse across.
+
+        The values are unchanged; platforms without such a primitive return
+        ``x`` itself.
+        """
+        return x
 
     def get_attn_backend(self, *args, **kwargs) -> AttentionImpl:
         attention_cls_str = self.get_attn_backend_cls_str(*args, **kwargs)

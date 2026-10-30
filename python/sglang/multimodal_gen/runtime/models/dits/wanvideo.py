@@ -119,6 +119,9 @@ class _WanGELUMLP(MLP):
                 bias,
                 use_fused_bias_gelu=nvfp4_bias_gelu_active(self),
             )
+        # Keep the activation in fc_in's epilogue: XLA would otherwise fuse it
+        # into fc_out as a slower matmul prologue.
+        x = current_platform.fusion_barrier(x)
         x, _ = self.fc_out(x)
         return x
 
@@ -1024,6 +1027,10 @@ class WanTransformerBlock_VSA(nn.Module):
 class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_block]
     _compile_conditions = [is_block]
+    # SP ranks feed each block equal-length shards at storage offset 0 (see
+    # forward; torch_tpu keys executables on input storage offsets), so all
+    # ranks compile the same block program.
+    _compile_regions_spmd_safe = True
     param_names_mapping = WanVideoConfig().param_names_mapping
     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = WanVideoConfig().lora_param_names_mapping
@@ -1234,7 +1241,13 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             hidden_states = hidden_states.view(
                 batch_size, self.sp_size, local_seq_len, hidden_states.shape[2]
             )
-            hidden_states = hidden_states[:, sp_rank, :, :]
+            # A fresh shard: a view starts at a rank-dependent storage offset,
+            # which torch_tpu keys compiled executables on. Unconditional on
+            # purpose: the copy is negligible elsewhere and keeps one trace on
+            # every platform.
+            hidden_states = hidden_states[:, sp_rank, :, :].clone(
+                memory_format=torch.contiguous_format
+            )
 
             frame_stride = post_patch_height * post_patch_width
             freqs_cos, freqs_sin = self._compute_rope_for_sequence_shard(
@@ -1292,7 +1305,10 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 timestep_proj.shape[2],
                 timestep_proj.shape[3],
             )
-            timestep_proj = timestep_proj[:, sp_rank, :, :, :]
+            # Fresh for the same reason as the hidden-state shard.
+            timestep_proj = timestep_proj[:, sp_rank, :, :, :].clone(
+                memory_format=torch.contiguous_format
+            )
 
         if encoder_hidden_states_image is not None:
             encoder_hidden_states = torch.concat(

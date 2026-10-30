@@ -9,6 +9,8 @@ TPU behavior. ``is_tpu()`` stays true, so core TPU paths keep applying.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 
 from sglang.multimodal_gen.runtime.platforms.interface import (
@@ -116,6 +118,34 @@ class TpuOOTPlatform(TpuPlatform):
             )
         return super().get_compile_backend(mode)
 
+    def prepare_spmd_region_wrapper(self) -> Callable | None:
+        # torch_tpu splits a compiled graph at every collective and re-lays out
+        # tensors at each split. Marking a region SPMD-safe keeps its
+        # collectives in one program. A whole-DiT program needs too much
+        # scratch, so only regions. The ranks must run identical programs: the
+        # fused collectives otherwise hang or exchange the wrong data.
+        import torch.compiler.config as compiler_config
+
+        try:
+            from torch_tpu._internal.distributed.spmd_util import spmd_safe
+        except ImportError:
+            # A private API: without it, regions keep split collectives.
+            logger.warning_once(
+                "torch_tpu has no spmd_safe; regional-compile programs keep "
+                "their collectives split."
+            )
+            return None
+
+        # The region annotation is not part of the compile cache key; keep
+        # persisted executables of the two region policies apart.
+        tag = "spmd-safe-regions-v1"
+        existing_tag = str(compiler_config.cache_key_tag or "")
+        if tag not in existing_tag.split("|"):
+            compiler_config.cache_key_tag = (
+                f"{existing_tag}|{tag}" if existing_tag else tag
+            )
+        return spmd_safe
+
     def apply_server_args_defaults(self, server_args) -> None:
         # The compile warmup layerwise-offloads the DiT, which TPU cannot run.
         if (
@@ -140,3 +170,22 @@ class TpuOOTPlatform(TpuPlatform):
         # turn a channels-last [1, 512, 128, 128] activation into [1, 32, 262144]),
         # and the other VAEs are untested under it.
         return False
+
+    @classmethod
+    def drain_device_queue_after_request(cls) -> bool:
+        # Without it Wan2.2-A14B hangs in its second warmup request: 7 of 8
+        # ranks block in a host-to-device copy behind collectives one rank
+        # never queued (4 of 4 runs, torch_tpu 0.2.0rc4 and 0.2.0). Output
+        # and warm latency are unchanged.
+        return True
+
+    @classmethod
+    def fusion_barrier(cls, x: torch.Tensor) -> torch.Tensor:
+        # Only a compiled XLA program fuses; in eager the barrier would copy x.
+        if x.device.type != "tpu" or not torch.compiler.is_compiling():
+            return x
+        barrier = getattr(getattr(torch.tpu, "ops", None), "optimization_barrier", None)
+        if barrier is None:
+            # torch_tpu releases before torch.tpu.ops expose only the raw op.
+            barrier = torch.ops.tpu.optimization_barrier
+        return barrier([x])[0]

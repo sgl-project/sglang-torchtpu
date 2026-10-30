@@ -202,6 +202,9 @@ built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
 - torch.compile with the `tpu` backend and static shapes; compile-cache tags for
   the rank assignment and the kernel inputs; TeaCache dropped and the VAE left
   eager under compile; `--offload-during-compile` off.
+- Regional-compile regions of a model marked SPMD-safe (Wan) keep their
+  collectives in one program (torch_tpu's `spmd_safe`, with its own cache tag);
+  `fusion_barrier` is XLA's optimization barrier.
 - Checkpoints read on the host, then moved (safetensors cannot open `tpu:N`);
   the Ulysses output all-to-all exchanges heads-major outputs in head slabs.
 - `--ring-degree` (non-causal, by K/V all-gather) on the splash backend, its
