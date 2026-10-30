@@ -243,9 +243,34 @@ class MuseSparkInterleavedRope(nn.Module):
         rotated = torch.stack((even * cos - odd * sin, odd * cos + even * sin), -1)
         return rotated.view(x.shape).to(x.dtype)
 
+    def _rotate_roll(
+        self, x: torch.Tensor, cos_x: torch.Tensor, sin_x: torch.Tensor
+    ) -> torch.Tensor:
+        """The same rotation on [tokens, heads * head_dim]: a pair's partner is one lane
+        away and never in another head, so no [..., head_dim // 2, 2] view (whose
+        minor dim of 2 costs TPU relayouts). sin_x carries the even lanes' minus sign."""
+        xf = x.float()
+        heads = xf.shape[-1] // self.head_dim
+        nxt = torch.cat((xf[:, 1:], xf[:, :1]), dim=-1)
+        prv = torch.cat((xf[:, -1:], xf[:, :-1]), dim=-1)
+        even = torch.arange(xf.shape[-1], device=xf.device) % 2 == 0
+        partner = torch.where(even, nxt, prv)
+        return (xf * cos_x.repeat(1, heads) + partner * sin_x.repeat(1, heads)).to(
+            x.dtype
+        )
+
     def forward(
         self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if tpu_envs.SGLANG_TPU_MUSE_ROPE_ROLL.get():
+            # [num_tokens, head_dim]: each frequency on both lanes of its pair.
+            cos = self.cos.index_select(0, positions)
+            sin = self.sin.index_select(0, positions)
+            cos_x = torch.stack((cos, cos), dim=-1).flatten(1)
+            sin_x = torch.stack((-sin, sin), dim=-1).flatten(1)
+            return self._rotate_roll(q, cos_x, sin_x), self._rotate_roll(
+                k, cos_x, sin_x
+            )
         # [num_tokens, 1, head_dim // 2] broadcasts over heads.
         cos = self.cos.index_select(0, positions).unsqueeze(1)
         sin = self.sin.index_select(0, positions).unsqueeze(1)

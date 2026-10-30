@@ -75,6 +75,9 @@ class TpuEnvs:
     # Muse Spark: gather prefill-sized column shards with one all-gather along the column
     # dim instead of a token-dim all-gather plus a transpose.
     SGLANG_TPU_MUSE_GATHER_COLUMNS_DIM = EnvBool(False)
+    # Muse Spark rotary embedding by a one-lane roll on [tokens, heads * head_dim]
+    # instead of a [..., head_dim // 2, 2] pair view (same arithmetic).
+    SGLANG_TPU_MUSE_ROPE_ROLL = EnvBool(False)
     # Largest megakernel step in rows (running requests x verify tokens, padded to the
     # TP size); larger steps run the native decoder. Steps above 32 rows use the
     # large-step paths (ops._BASE_STEP_MAX_ROWS).
