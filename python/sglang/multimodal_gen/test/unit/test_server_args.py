@@ -3432,6 +3432,51 @@ class TestDirectGpuWeightLoading(unittest.TestCase):
                 tp_args._validate_direct_gpu_weight_loading()
 
 
+class TestRingCapableAttentionBackends(unittest.TestCase):
+    def _args(self, attention_backend=None):
+        with patch.object(PipelineConfig, "from_kwargs", return_value=PipelineConfig()):
+            args = ServerArgs.from_dict({"model_path": "/fake"})
+        args.num_gpus, args.ring_degree = 8, 2
+        args.attention_backend = attention_backend
+        return args
+
+    def test_core_ring_backends_by_default(self):
+        args = self._args()
+        with patch.object(
+            current_platform, "get_ring_capable_attention_backends", return_value=None
+        ):
+            args._adjust_attention_backend()
+            self.assertEqual(args.attention_backend, "fa")
+            with self.assertRaisesRegex(ValueError, r"\(fa, sage_attn\)"):
+                self._args("torch_sdpa")._adjust_attention_backend()
+
+    def test_a_platform_names_its_own_ring_backend(self):
+        # A platform's own backend name normalizes to "oot", as on the CLI.
+        with (
+            patch.object(
+                current_platform,
+                "get_ring_capable_attention_backends",
+                return_value=("vendor_attn",),
+            ),
+            patch.object(
+                current_platform,
+                "get_oot_attn_backend_name",
+                return_value="vendor_attn",
+            ),
+        ):
+            args = self._args()
+            args._adjust_attention_backend()
+            self.assertEqual(args.attention_backend, "oot")
+            self.assertFalse(args.is_arg_explicitly_set("attention_backend"))
+
+            args = self._args("vendor_attn")
+            args._adjust_attention_backend()
+            self.assertEqual(args.attention_backend, "oot")
+
+            with self.assertRaisesRegex(ValueError, r"\(vendor_attn\)"):
+                self._args("fa")._adjust_attention_backend()
+
+
 class TestTpuDistributedArgs(unittest.TestCase):
     def _args(self, num_gpus):
         with patch.object(PipelineConfig, "from_kwargs", return_value=PipelineConfig()):
@@ -3493,13 +3538,6 @@ class TestTpuDistributedArgs(unittest.TestCase):
         args.tp_size = 2
         with self._on_tpu(), self._slice_env():
             with self.assertRaisesRegex(ValueError, "tensor-parallel"):
-                args._adjust_platform_specific()
-
-    def test_ring_sequence_parallel_is_rejected(self):
-        args = self._args(8)
-        args.ring_degree = 2
-        with self._on_tpu(), self._slice_env():
-            with self.assertRaisesRegex(ValueError, "ring sequence-parallel"):
                 args._adjust_platform_specific()
 
     def test_other_platforms_are_unaffected(self):

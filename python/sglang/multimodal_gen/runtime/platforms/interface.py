@@ -359,6 +359,21 @@ class Platform:
         return None
 
     @classmethod
+    def oot_attn_backend_serves(
+        cls, supported_attention_backends: set[AttentionBackendEnum]
+    ) -> bool:
+        """Whether automatic selection may give the OOT backend to a layer that
+        lists only ``supported_attention_backends``."""
+        return False
+
+    @classmethod
+    def get_ring_capable_attention_backends(cls) -> tuple[str, ...] | None:
+        """``--attention-backend`` names that run ring attention on this
+        platform, the first being the ``--ring-degree`` default; None keeps the
+        core list."""
+        return None
+
+    @classmethod
     def get_device_capability(
         cls,
         device_id: int = 0,

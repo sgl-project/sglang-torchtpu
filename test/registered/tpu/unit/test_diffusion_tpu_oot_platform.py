@@ -93,6 +93,12 @@ class TestSplashBackend(CustomTestCase):
                 TpuOOTPlatform.get_attn_backend_cls_str(selected, 128, torch.bfloat16),
             )
 
+    def test_it_serves_layers_that_take_sdpa(self):
+        fa, sdpa = AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA
+        self.assertTrue(TpuOOTPlatform.oot_attn_backend_serves({fa, sdpa}))
+        self.assertFalse(TpuOOTPlatform.oot_attn_backend_serves({fa}))
+        self.assertFalse(Platform.oot_attn_backend_serves({fa, sdpa}))
+
     def test_explicit_selection_overrides_the_layer_preference_set(self):
         from sglang_tpu.multimodal_gen.tpu_splash_attn import (
             TpuSplashAttentionBackend,
@@ -175,6 +181,24 @@ class TestCompileDefaults(CustomTestCase):
             self.assertFalse(torch._dynamo.config.automatic_dynamic_shapes)
         base_init.assert_called_once_with()
         install.assert_called_once_with()
+
+
+class TestWorkerRuntimePatches(CustomTestCase):
+    def test_worker_registers_the_aten_fallbacks_and_patches(self):
+        # Ring attention merges replicated-token partials with logaddexp, which
+        # torch_tpu has no kernel for (test_aten_fallbacks_tpu checks the kernel).
+        from sglang_tpu import patches
+        from sglang_tpu.multimodal_gen import rope, sdpa_mask, worker
+
+        with (
+            patch.object(patches, "_register_aten_fallbacks") as aten_fallbacks,
+            patch.object(rope, "install") as rope_install,
+            patch.object(sdpa_mask, "install") as sdpa_mask_install,
+        ):
+            worker.install_runtime_patches()
+        aten_fallbacks.assert_called_once_with()
+        rope_install.assert_called_once_with()
+        sdpa_mask_install.assert_called_once_with()
 
 
 if __name__ == "__main__":

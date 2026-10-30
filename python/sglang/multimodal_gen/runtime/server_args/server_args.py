@@ -1158,21 +1158,30 @@ class ServerArgs(DisaggServerArgsMixin):
             self._automatic_component_attention_backend_keys.add("text_encoder")
 
         if self.ring_degree > 1:
+            ring_backends = (
+                current_platform.get_ring_capable_attention_backends()
+                or RING_CAPABLE_ATTENTION_BACKENDS
+            )
+            # attention_backend is normalized above (a platform's own backend
+            # name becomes "oot"); compare and default in that form.
+            ring_backend_ids = [
+                self._normalize_attention_backend_name(name) for name in ring_backends
+            ]
             if (
                 self.attention_backend is not None
-                and self.attention_backend not in RING_CAPABLE_ATTENTION_BACKENDS
+                and self.attention_backend not in ring_backend_ids
             ):
                 raise ValueError(
                     "Ring Attention requires one of the ring-capable backends "
-                    f"({', '.join(RING_CAPABLE_ATTENTION_BACKENDS)}), got "
+                    f"({', '.join(ring_backends)}), got "
                     f"{self.attention_backend!r}"
                 )
             if self.attention_backend is None:
-                self.attention_backend = RING_CAPABLE_ATTENTION_BACKENDS[0]
+                self.attention_backend = ring_backend_ids[0]
                 logger.info(
                     "Ring Attention requires a ring-capable backend; "
                     "attention_backend has been automatically set to %s",
-                    self.attention_backend,
+                    ring_backends[0],
                 )
 
         if self.attention_backend is None and self.backend != Backend.DIFFUSERS:
@@ -1677,11 +1686,6 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError(
                 "TPU diffusion has no tensor-parallel path yet; shard with "
                 f"--cfg-parallel-size / --sp-degree instead (got --tp-size {self.tp_size})."
-            )
-        if self.ring_degree not in (None, 1):
-            raise ValueError(
-                "TPU diffusion has no ring sequence-parallel path yet; use "
-                f"--ulysses-degree instead (got --ring-degree {self.ring_degree})."
             )
 
     def is_arg_explicitly_set(self, arg_name: str) -> bool:

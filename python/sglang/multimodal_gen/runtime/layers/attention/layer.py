@@ -67,6 +67,7 @@ from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_input_all_to_all_varlen,
     _usp_output_all_to_all,
     _usp_output_all_to_all_varlen,
+    allgather_kv_ring_attn,
     ring_attn,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
@@ -1249,9 +1250,18 @@ class USPAttention(nn.Module):
                     and self.backend == AttentionBackendEnum.FA
                 ):
                     return self._forward_ring_tail_pad(q, k, v, attn_mask_meta)
+                if (
+                    meta_only_pad
+                    and not self.causal
+                    and self.attn_impl.supports_ring_resume()
+                ):
+                    return self._forward_allgather_ring_tail_pad(
+                        q, k, v, attn_mask_meta
+                    )
                 raise NotImplementedError(
                     "USPAttention masked path supports ring parallelism only "
-                    "for batch-1 tail-pad metadata on the FA backend."
+                    "for tail-pad metadata, on the FA backend at batch 1 or on "
+                    "a backend with all-gather ring support."
                 )
             if attn_mask is not None and attn_mask.dim() != 2:
                 raise NotImplementedError(
@@ -1463,14 +1473,23 @@ class USPAttention(nn.Module):
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
-            out = ring_attn(
-                q,
-                k,
-                v,
-                attn_impl=self.attn_impl,
-                is_causal=self.causal,
-                dropout_p=self.dropout_p,
-            )
+            if not self.causal and self.attn_impl.supports_ring_resume():
+                out = allgather_kv_ring_attn(q, k, v, attn_impl=self.attn_impl)
+            elif self.attn_impl.supports_ring_resume():
+                # Backends that ring by all-gather (TPU) lack a causal kernel
+                # path; the templated ring would run an unrolled reference.
+                raise NotImplementedError(
+                    "All-gather ring attention is non-causal only."
+                )
+            else:
+                out = ring_attn(
+                    q,
+                    k,
+                    v,
+                    attn_impl=self.attn_impl,
+                    is_causal=self.causal,
+                    dropout_p=self.dropout_p,
+                )
         else:
             # -> [B, S, H_local, D]
             out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
@@ -1514,6 +1533,29 @@ class USPAttention(nn.Module):
         if pad_from < out.shape[0]:
             out[max(pad_from, 0) :].zero_()
         return _usp_output_all_to_all(out.unsqueeze(0), head_dim=2)
+
+    def _forward_allgather_ring_tail_pad(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask_meta: dict,
+    ) -> torch.Tensor:
+        """K/V all-gather ring attention for a tail-padded shard.
+
+        All padding sits at the global tail, so each gathered shard attends over
+        its real-key prefix and no mask is built; masked query rows read as
+        zeros.
+        """
+        q, k, v = _usp_input_all_to_all_qkv(q, k, v)
+        out = allgather_kv_ring_attn(
+            q,
+            k,
+            v,
+            attn_impl=self.attn_impl,
+            kv_real_len=int(attn_mask_meta["pad_start"]),
+        )
+        return _usp_output_all_to_all(out, head_dim=2)
 
     @staticmethod
     def _gather_sharded_sequence(
