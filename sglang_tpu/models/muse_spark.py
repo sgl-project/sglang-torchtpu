@@ -113,6 +113,45 @@ def _rms_normalize(x: torch.Tensor, eps: float) -> torch.Tensor:
     return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
 
 
+def _prefill_sp_min_tokens() -> Optional[int]:
+    """Token count from which extend forwards run sequence-parallel, or None when off."""
+    parallel = get_parallel()
+    if not tpu_envs.SGLANG_TPU_MUSE_PREFILL_SP.get() or parallel.tp_size == 1:
+        return None
+    if parallel.attn_tp_size != parallel.tp_size:
+        raise ValueError(
+            "Muse Spark prefill sequence parallelism needs attention TP == TP"
+        )
+    return tpu_envs.SGLANG_TPU_MUSE_PREFILL_SP_MIN_TOKENS.get()
+
+
+def _gather_tokens(shard: torch.Tensor) -> torch.Tensor:
+    """This rank's [T / tp, ...] token block -> [T, ...] on every rank."""
+    return get_parallel().tp_group.all_gather(shard.contiguous(), dim=0)
+
+
+def _reduce_scatter_tokens(partial: torch.Tensor) -> torch.Tensor:
+    """[T, N] per-rank partial sums -> this rank's [T / tp, N] block of their sum."""
+    group = get_parallel().tp_group
+    output = partial.new_empty(
+        (partial.shape[0] // group.world_size, *partial.shape[1:])
+    )
+    group.reduce_scatter_tensor(output, partial.contiguous())
+    return output
+
+
+def _columns_to_tokens(shard: torch.Tensor) -> torch.Tensor:
+    """[T, N / tp] column shard of every token -> this rank's [T / tp, N] token block."""
+    group = get_parallel().tp_group
+    tp = group.world_size
+    tokens, cols = shard.shape
+    # Block r of the send buffer holds rank r's tokens; block r received holds rank r's columns.
+    send = shard.reshape(tp, tokens // tp, cols).contiguous()
+    received = torch.empty_like(send)
+    group.all_to_all_single(received, send)
+    return received.transpose(0, 1).reshape(tokens // tp, tp * cols)
+
+
 class MuseSparkRMSNorm(nn.Module):
     """RMSNorm with the checkpoint's gain conventions.
 
@@ -288,7 +327,9 @@ class MuseSparkAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        sequence_parallel: bool = False,
     ) -> torch.Tensor:
+        """With ``sequence_parallel``, returns this rank's token block of the output."""
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = (self._per_head_normalize(q) * self.query_scale).to(qkv.dtype)
@@ -298,7 +339,11 @@ class MuseSparkAttention(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
         attn_output = self._per_head_normalize(attn_output).to(qkv.dtype)
         gate, _ = self.gate_proj(hidden_states)
-        output, _ = self.o_proj(torch.sigmoid(gate) * attn_output)
+        gated = torch.sigmoid(gate) * attn_output
+        if sequence_parallel:
+            partial, _ = self.o_proj(gated, skip_all_reduce=True)
+            return _reduce_scatter_tokens(partial)
+        output, _ = self.o_proj(gated)
         return output
 
 
@@ -488,9 +533,56 @@ class MuseSparkMoE(nn.Module):
             .reshape(tokens, self.tp_size * cols)
         )
 
-    def forward(
+    def _gather_topk(self, topk_output: StandardTopKOutput) -> StandardTopKOutput:
+        """Every token's top-k from this rank's block, in one all-gather."""
+        # int32 bit patterns: weights survive the round trip exactly.
+        packed = torch.cat(
+            [topk_output.topk_weights.float().view(torch.int32), topk_output.topk_ids],
+            dim=-1,
+        )
+        packed = _gather_tokens(packed)
+        return topk_output._replace(
+            topk_weights=packed[:, : self.top_k].contiguous().view(torch.float32),
+            topk_ids=packed[:, self.top_k :].contiguous(),
+            router_logits=None,
+        )
+
+    def _forward_sequence_parallel(
         self, hidden_states: torch.Tensor, router_input: torch.Tensor
     ) -> torch.Tensor:
+        """Inputs and output are this rank's token block of the chunk.
+
+        Expert TP holds a slice of every expert on every rank, so fused-RS reads
+        every token's expert input and top-k and returns this rank's token block.
+        """
+        if not (self.oneshot_gather and self.experts.handles_moe_reduction):
+            raise RuntimeError(
+                "Muse Spark sequence parallelism needs the expert-TP fused-RS MoE"
+            )
+        from sglang_tpu.fused_rs_sequence_parallel import (
+            FusedMoeSequenceParallelPlan,
+            use_fused_moe_sequence_parallel_plan,
+        )
+
+        topk_output = self._gather_topk(self._route(router_input))
+        expert_input, _ = self.pre_expert_proj(_gather_tokens(hidden_states))
+        expert_input = self._gather_columns(expert_input)
+        plan = FusedMoeSequenceParallelPlan(
+            gather_hidden_states=False, gather_topk=False, keep_output_shard=True
+        )
+        with use_fused_moe_sequence_parallel_plan(plan):
+            output = self.experts(self.pre_expert_norm(expert_input), topk_output)
+        output, _ = self.post_expert_proj(_gather_tokens(output))
+        return _columns_to_tokens(output)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_input: torch.Tensor,
+        sequence_parallel: bool = False,
+    ) -> torch.Tensor:
+        if sequence_parallel:
+            return self._forward_sequence_parallel(hidden_states, router_input)
         topk_output = self._route(router_input)
         expert_input, _ = self.pre_expert_proj(hidden_states)
         if self.oneshot_gather:
@@ -541,15 +633,28 @@ class MuseSparkDecoderLayer(nn.Module):
         )
 
     def forward(
-        self, positions: torch.Tensor, stream: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        positions: torch.Tensor,
+        stream: torch.Tensor,
+        forward_batch: ForwardBatch,
+        sequence_parallel: bool = False,
     ) -> torch.Tensor:
+        """``stream`` is this rank's token block when ``sequence_parallel``."""
         attn_input = self.input_layernorm(stream).to(torch.bfloat16)
-        attn_output = self.self_attn(positions, attn_input, forward_batch)
+        if sequence_parallel:
+            attn_input = _gather_tokens(attn_input)
+        attn_output = self.self_attn(
+            positions, attn_input, forward_batch, sequence_parallel=sequence_parallel
+        )
         stream = self.post_attention_residual_gate(
             stream, self.post_attention_layernorm(attn_output)
         )
         router_input = self.pre_feedforward_layernorm(stream)
-        ffn_output = self.mlp(router_input.to(torch.bfloat16), router_input)
+        ffn_output = self.mlp(
+            router_input.to(torch.bfloat16),
+            router_input,
+            sequence_parallel=sequence_parallel,
+        )
         return self.post_feedforward_residual_gate(
             stream, self.post_feedforward_layernorm(ffn_output)
         )
@@ -591,6 +696,33 @@ class MuseSparkTextModel(nn.Module):
         )
         # The output norm's gain is centered on zero, unlike the per-layer norms.
         self.norm = MuseSparkRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        parallel = get_parallel()
+        self.tp_size = parallel.tp_size
+        self.prefill_sp_min_tokens = _prefill_sp_min_tokens()
+        if self.prefill_sp_min_tokens is not None:
+            # A tensor index, not a Python int, keeps one compiled graph for every rank.
+            self.register_buffer(
+                "_tp_rank_t",
+                torch.tensor([parallel.tp_rank], dtype=torch.int32),
+                persistent=False,
+            )
+
+    def _use_sequence_parallel(
+        self, num_tokens: int, forward_batch: ForwardBatch
+    ) -> bool:
+        return (
+            self.prefill_sp_min_tokens is not None
+            and num_tokens >= self.prefill_sp_min_tokens
+            and num_tokens % self.tp_size == 0
+            and forward_batch.forward_mode.is_extend()
+        )
+
+    def _take_token_shard(self, full: torch.Tensor) -> torch.Tensor:
+        """[T, ...] replicated -> this rank's [T / tp, ...] block."""
+        blocks = full.reshape(self.tp_size, full.shape[0] // self.tp_size, -1)
+        return blocks.index_select(0, self._tp_rank_t).reshape(
+            full.shape[0] // self.tp_size, *full.shape[1:]
+        )
 
     def forward(
         self,
@@ -605,14 +737,24 @@ class MuseSparkTextModel(nn.Module):
             input_embeds = _rms_normalize(embeds, self.config.rms_norm_eps).to(
                 embeds.dtype
             )
+        sequence_parallel = self._use_sequence_parallel(
+            input_embeds.shape[0], forward_batch
+        )
+        if sequence_parallel:
+            input_embeds = self._take_token_shard(input_embeds)
         stream = input_embeds.float()
         aux_hidden_states = []
         for layer_idx, layer in enumerate(self.layers):
-            stream = layer(positions, stream, forward_batch)
+            stream = layer(positions, stream, forward_batch, sequence_parallel)
             if layer_idx in self.layers_to_capture:
                 # Drafts read the operator dtype, not the fp32 residual.
-                aux_hidden_states.append(stream.to(torch.bfloat16))
+                captured = stream.to(torch.bfloat16)
+                if sequence_parallel:
+                    captured = _gather_tokens(captured)
+                aux_hidden_states.append(captured)
         hidden = self.norm(stream.to(torch.bfloat16))
+        if sequence_parallel:
+            hidden = _gather_tokens(hidden)
         if not aux_hidden_states:
             return hidden
         # One tensor, not a list: packing a list happens outside the compiled

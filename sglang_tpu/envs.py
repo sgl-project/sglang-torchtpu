@@ -68,6 +68,10 @@ class TpuEnvs:
     # on the kernel's fp8 K-major copies (per-column scales, as in decode) and the bf16
     # weights are freed for the KV pool.
     SGLANG_TPU_MUSE_SHARED_DENSE = EnvBool(False)
+    # Muse Spark prefill sequence parallelism: extend forwards of at least MIN_TOKENS tokens
+    # keep the fp32 residual stream token-sharded over the TP group between layers.
+    SGLANG_TPU_MUSE_PREFILL_SP = EnvBool(False)
+    SGLANG_TPU_MUSE_PREFILL_SP_MIN_TOKENS = EnvInt(1024)
     # Muse Spark: gather prefill-sized column shards with one all-gather along the column
     # dim instead of a token-dim all-gather plus a transpose.
     SGLANG_TPU_MUSE_GATHER_COLUMNS_DIM = EnvBool(False)
