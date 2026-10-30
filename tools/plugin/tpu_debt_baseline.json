@@ -57,7 +57,7 @@
     "python/sglang/srt/model_loader/loader.py": 4,
     "python/sglang/srt/model_loader/utils.py": 1,
     "python/sglang/srt/models/bailing_mm_v3.py": 6,
-    "python/sglang/srt/models/bailing_moe_v3.py": 1,
+    "python/sglang/srt/models/bailing_moe_v3.py": 2,
     "python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py": 3,
     "python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py": 4,
     "python/sglang/srt/models/deepseek_common/utils.py": 2,
