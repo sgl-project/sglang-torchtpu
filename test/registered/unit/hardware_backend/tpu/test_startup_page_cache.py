@@ -134,6 +134,27 @@ def test_startup_discovers_files_only_on_the_host_leader(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "enabled,mode,rank",
+    [(False, "serial", 0), (True, "overlap", 0), (True, "serial", 1)],
+)
+def test_checkpoint_overlap_skip_preserves_collective_order(
+    monkeypatch, enabled, mode, rank
+):
+    group = Mock()
+    monkeypatch.setenv("LOCAL_RANK", str(rank))
+    with (
+        get_context().override_server_args(startup_weight_load_mode=mode),
+        get_parallel().override(world_group=group),
+        tpu_envs.SGLANG_TPU_RELEASE_CHECKPOINT_PAGE_CACHE.override(enabled),
+        patch.object(page_cache.os, "posix_fadvise") as advise,
+    ):
+        page_cache.start_checkpoint_page_cache_release()
+    group.barrier.assert_called_once_with()
+    advise.assert_not_called()
+    assert page_cache._checkpoint_release is None
+
+
+@pytest.mark.parametrize(
     "env_name",
     ["TORCH_TPU_TIER2_COMPILATION_CACHE", "TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"],
 )
@@ -147,12 +168,30 @@ def test_compile_cache_disabled_skips(monkeypatch, tmp_path, caplog, env_name):
     monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
     monkeypatch.delenv("JAX_COMPILATION_CACHE_DIR", raising=False)
     monkeypatch.setenv(env_name, "disabled")
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "inductor"))
+    monkeypatch.setenv("JAX_COMPILATION_CACHE_DIR", str(tmp_path / "jax"))
     monkeypatch.setattr(
         page_cache, "_filesystem_type", lambda _: pytest.fail("cache disabled")
     )
     with caplog.at_level(logging.INFO):
         page_cache.release_compile_artifacts()
     assert not caplog.records
+
+
+def test_native_only_release_keeps_unlocked_caches(monkeypatch, tmp_path):
+    (tmp_path / "inductor" / "aotautograd").mkdir(parents=True)
+    (tmp_path / "jax").mkdir()
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "inductor"))
+    monkeypatch.setenv("JAX_COMPILATION_CACHE_DIR", str(tmp_path / "jax"))
+    monkeypatch.setattr(
+        page_cache, "_filesystem_type", lambda _: pytest.fail("unlocked cache read")
+    )
+    with (
+        tpu_envs.SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS.override(True),
+        patch.object(page_cache, "_release_native_cache") as native,
+    ):
+        page_cache.release_compile_artifacts(native_only=True)
+    native.assert_called_once()
 
 
 def test_disappeared_cache_paths_are_skipped(tmp_path):

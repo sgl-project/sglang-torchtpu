@@ -28,6 +28,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 from sglang_tpu.tpu_platform import (
     TpuSRTPlatform,
@@ -602,7 +603,6 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
     def test_shared_head_experimental_drafts_need_dp_lm_head_at_attn_tp_1(self):
         """At attention TP 1 the target head shards over the full TP group, but these
         drafts share it inside the attention-TP group: they would draft from one shard."""
-        from sglang_tpu.envs import envs as tpu_envs
 
         for algorithm, enabled, error in (
             ("DFLASH", True, True),
@@ -722,7 +722,7 @@ class TestPrefillContextParallelValidation(CustomTestCase):
             )
             self.assertEqual(self._resolved(args, "sampling_backend"), "pytorch")
             self.assertTrue(envs.SGLANG_TPU_REQ_TO_TOKEN_ON_HOST.get())
-            self.assertFalse(envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get())
+            self.assertFalse(tpu_envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get())
             libtpu_args = os.environ["LIBTPU_INIT_ARGS"].split()
         self.assertIn(user_flag, libtpu_args)
         self.assertNotIn("--xla_tpu_offload_gather_to_sparsecore=false", libtpu_args)
@@ -737,7 +737,7 @@ class TestPrefillContextParallelValidation(CustomTestCase):
             os.environ.pop("SGLANG_TPU_FUSED_MOE_SC_GATHER", None)
             self._apply(self._args(tp_size=8))
             self.assertEqual(os.environ["LIBTPU_INIT_ARGS"], "")
-            self.assertTrue(envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get())
+            self.assertTrue(tpu_envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get())
 
     def test_rejections_name_the_missing_piece(self):
         cases = [
@@ -798,17 +798,28 @@ class TestDsaValidation(CustomTestCase):
     _apply = TestTpuPlatformServerDefaults._apply
 
     def _apply_dsa(
-        self, *, attention_backend, tpu_compile_tracer="dynamo", **config_fields
+        self,
+        *,
+        attention_backend,
+        tpu_compile_tracer="dynamo",
+        speculative_algorithm=None,
+        disaggregation_mode="null",
+        index_topk=2048,
+        **config_fields,
     ):
         args = self._args(
             attention_backend=attention_backend,
             tpu_compile_tracer=tpu_compile_tracer,
+            speculative_algorithm=speculative_algorithm,
+            disaggregation_mode=disaggregation_mode,
             model_path="model",
             trust_remote_code=False,
             revision=None,
         )
         hf_config = SimpleNamespace(
-            architectures=["GlmMoeDsaForCausalLM"], index_topk=2048, **config_fields
+            architectures=["GlmMoeDsaForCausalLM"],
+            index_topk=index_topk,
+            **config_fields,
         )
         with patch(
             "sglang.srt.utils.hf_transformers.config.get_config",
@@ -839,6 +850,33 @@ class TestDsaValidation(CustomTestCase):
                 attention_backend="pallas_tpu_mla_sparse",
                 tpu_compile_tracer="direct",
             )
+
+    def test_mtp_index_share_runs_only_on_the_chain_worker(self):
+        """Only the experimental chain worker reuses the MTP draft's DSA top-k
+        across its steps. Core's workers would take their GPU paths, a non-DSA
+        indexer has no TPU seed, and a P/D decode would draft on seeds its
+        prefill never sent: each must stop the launch."""
+
+        sparse = dict(attention_backend="pallas_tpu_mla_sparse")
+        share = dict(speculative_algorithm="NEXTN", index_share_for_mtp_iteration=True)
+        self._apply_dsa(**sparse, **share)
+        # An EAGLE3 draft is its own model; the target's flag does not reach it.
+        self._apply_dsa(
+            **sparse, speculative_algorithm="EAGLE3", index_share_for_mtp_iteration=True
+        )
+        # Either flag routes MTP to the chain worker.
+        with (
+            tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
+            tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER"
+            ):
+                self._apply_dsa(**sparse, **share)
+        with self.assertRaisesRegex(NotImplementedError, "P/D"):
+            self._apply_dsa(**sparse, disaggregation_mode="decode", **share)
+        with self.assertRaisesRegex(ValueError, "DSA models only"):
+            self._apply_dsa(**sparse, index_topk=None, **share)
 
 
 class TestTpuPlatformDecodeContextParallel(CustomTestCase):

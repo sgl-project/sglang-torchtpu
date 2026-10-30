@@ -35,8 +35,8 @@ class TpuDMAKVTransfer(Protocol):
 
     The registered factory builds it as ``factory(device_pool, num_host_pages)``,
     once per device sub-pool (full, SWA, draft), after warm-up, on the thread that
-    issues torch ops on the pool. It may bind the pool's per-layer
-    ``get_fused_kv_buffer`` tensors once, so they must only be written in place.
+    issues torch ops on the pool. It may bind the pool's ``page_buffers()``
+    tensors once, so they must only be written in place.
     It owns the host memory for ``num_host_pages`` pages (allocation, pinning, DMA
     registration); ``TpuDMAHostKVPool`` owns which pages are free.
     """

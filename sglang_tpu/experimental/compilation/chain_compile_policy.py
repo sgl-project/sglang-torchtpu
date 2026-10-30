@@ -41,11 +41,13 @@ from sglang_tpu.compilation.recompilation_checker import (
 from sglang_tpu.compilation.spec_decode_compile_policy_dflash import (
     DFlashSpecDecodeCompilePolicyMixin,
 )
+from sglang_tpu.experimental import runs_draft_prompt_pass
 from sglang_tpu.experimental.compilation.spec_compile_policy import (
     TpuSpecDecodeCompilePolicyMixin,
 )
 from sglang_tpu.experimental.speculative.chain_draft_input import (
     chain_draft_forward_input,
+    dsa_seed_topk_buffer,
     register_chain_draft_pytree,
 )
 
@@ -278,9 +280,15 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
         draft_attn_backend: AttentionBackend,
         *,
         target_feature_size: int,
+        dsa_seed_topk_width: int | None,
         fused_draft_warmup: Callable[[int, bool], None],
     ) -> None:
-        """Compile the fused draft, commit's draft rows and the draft prompt extend."""
+        """Compile the fused draft, commit's draft rows and the draft prompt extend.
+
+        A draft sharing its DSA top-k (dsa_seed_topk_width set) warms the draft
+        rows publishing their top-k and the prompt extend with its top-k capture,
+        as commit and extend run them.
+        """
         if not self.is_draft_worker:
             raise ValueError("precompile_draft runs on the draft runner only.")
         if self.b_bucketer is None or self.t_bucketer is None:
@@ -290,10 +298,14 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
         if disagg_mode != "prefill":
             self._precompile_fused_draft(fused_draft_warmup)
             self._precompile_draft_rows(
-                draft_attn_backend, target_feature_size=target_feature_size
+                draft_attn_backend,
+                target_feature_size=target_feature_size,
+                dsa_seed_topk_width=dsa_seed_topk_width,
             )
-        if disagg_mode != "decode":
-            self._precompile_draft_prompt_extend(target_feature_size)
+        if runs_draft_prompt_pass(disagg_mode):
+            self._precompile_draft_prompt_extend(
+                target_feature_size, dsa_seed_topk_width=dsa_seed_topk_width
+            )
         logger.info(
             "[spec compile policy] %s DRAFT precompile done in %.1fs.",
             self.algo_label,
@@ -326,7 +338,11 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
         self._precompile_shapes(f"{self.algo_label} FUSED DRAFT", shapes, run)
 
     def _precompile_draft_rows(
-        self, draft_attn_backend: AttentionBackend, *, target_feature_size: int
+        self,
+        draft_attn_backend: AttentionBackend,
+        *,
+        target_feature_size: int,
+        dsa_seed_topk_width: int | None,
     ) -> None:
         """commit's draft forward over the N + 1 verify rows on target features."""
         assert self.b_bucketer is not None
@@ -351,14 +367,18 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
                     width=width,
                 ),
                 attn_backend=draft_attn_backend,
+                publish_dsa_topk=dsa_seed_topk_width is not None,
             )
             return f"bs={bs}, rows={width}"
 
         self._precompile_shapes(f"{self.algo_label} DRAFT ROWS", buckets, run)
 
-    def _precompile_draft_prompt_extend(self, target_feature_size: int) -> None:
+    def _precompile_draft_prompt_extend(
+        self, target_feature_size: int, *, dsa_seed_topk_width: int | None
+    ) -> None:
         assert self.t_bucketer is not None
         bs = self._extend_compile_cap()
+        device = self.model_runner.device
         variants = (
             ("plain", "input_embeds") if self._target_is_multimodal else ("plain",)
         )
@@ -379,6 +399,10 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
 
         def run(shape: tuple[int, str]) -> str:
             num_tokens, variant = shape
+            # Serving keeps each request's last prompt row: one per request at the cap.
+            seed_capture = dsa_seed_topk_buffer(
+                num_rows=bs, width=dsa_seed_topk_width, device=device
+            )
             self._run_one(
                 num_tokens=num_tokens,
                 bs=bs,
@@ -388,6 +412,12 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
                 spec_info=chain_draft_forward_input(
                     hidden_states=self._dummy_hidden(num_tokens, target_feature_size),
                     width=1,
+                    dsa_seed_topk_capture=seed_capture,
+                    dsa_seed_topk_select=(
+                        None
+                        if seed_capture is None
+                        else torch.zeros((bs,), dtype=torch.int64, device=device)
+                    ),
                 ),
             )
             return f"tokens={num_tokens}, bs={bs}, variant={variant}"

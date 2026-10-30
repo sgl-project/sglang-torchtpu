@@ -79,6 +79,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cpu_amx_available,
     _is_cuda,
     _is_hip,
+    _is_tpu,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.kimi_linear import KimiDeltaAttention
@@ -358,29 +359,20 @@ class BailingMLP(nn.Module):
     ):
         x, _ = self.gate_up_proj(x)
 
-        if self.padded_size_per_partition is not None:
-            gate_padded = x[..., : self.padded_size_per_partition]
-            up_padded = x[..., self.padded_size_per_partition :]
-
-            gate_effective = gate_padded[..., : self.effective_size_per_partition]
-            up_effective = up_padded[..., : self.effective_size_per_partition]
-
-            if self.swiglu_limit is not None:
-                x = F.silu(gate_effective).clamp(
-                    max=self.swiglu_limit
-                ) * up_effective.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-            else:
-                x = F.silu(gate_effective) * up_effective
-
-            x = F.pad(x, (0, self.pad_size_per_partition))
+        # A padded intermediate size uses the append-at-end convention of the
+        # weight loaders (pad_or_narrow_weight / _pad_block_scale_tail in
+        # linear.py): each rank holds a contiguous
+        # [rank * padded_size_per_partition, ...) slice of the checkpoint,
+        # zero-padded at the global tail. Zero channels are inert under
+        # SiLU*Up and the row-parallel matmul, so padded channels flow through
+        # the activation unchanged instead of being sliced out and re-padded.
+        if self.swiglu_limit is not None:
+            d = x.shape[-1] // 2
+            gate = F.silu(x[..., :d]).clamp(max=self.swiglu_limit)
+            up = x[..., d:].clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+            x = gate * up
         else:
-            if self.swiglu_limit is not None:
-                d = x.shape[-1] // 2
-                gate = F.silu(x[..., :d]).clamp(max=self.swiglu_limit)
-                up = x[..., d:].clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-                x = gate * up
-            else:
-                x = self.act_fn(x)
+            x = self.act_fn(x)
 
         x, _ = self.down_proj(x)
         return x
@@ -1148,7 +1140,11 @@ class BailingMoELinearDecoderLayer(nn.Module):
             ),
         )
 
-    @torch.inference_mode()
+    # No ctx guard here: every TPU-validated family guards the CausalLM
+    # forward only (deepseek_v2, qwen3, kimi_k3). A per-layer
+    # _DecoratorContextManager wrapper makes Dynamo trace the context
+    # factory inside each decoder layer, which trips AttributeError under
+    # the TPU backend.
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1582,6 +1578,11 @@ class BailingMoeV3ForCausalLM(nn.Module):
             )
             if not hasattr(self_attn, "kv_b_proj"):
                 continue
+            # Bind at load time, as deepseek_weight_loader does: the lazy
+            # bind in the eager forward would execute inside a traced
+            # region on whole-graph compile. Reassigning on a repeat load
+            # is the same tensor.
+            self_attn.attn_mha.kv_b_proj = self_attn.kv_b_proj
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 awq_dequantize = _get_awq_dequantize()
                 if awq_dequantize is None:
@@ -1734,6 +1735,27 @@ class BailingMoeV3ForCausalLM(nn.Module):
         # guard); a second model-level pass double-packs the scales and
         # crashes, which is why deepseek_v2 dropped its copy too.
 
+        if _is_tpu:
+            # Post-load, never inside the compiled forward: TPU weight
+            # materialization re-creates these parameters after __init__
+            # bound them onto RadixLinearAttention, and Dynamo/AOT would
+            # lift the stale references as free variables whose storages
+            # then die.
+            for layer in self.model.layers:
+                attention = layer.attention
+                if not isinstance(attention, KimiDeltaAttention):
+                    continue
+                # The kernel contract is the squeezed [dim, K] view
+                # kimi_linear's __init__ binds; Kimi-K3's packed path uses
+                # the raw [dim, 1, K] parameter, not this class's.
+                attention.attn.conv_weights = attention.qkv_conv1d.weight.squeeze(1)
+                # Built bias=False; the kernel reads None as no conv bias.
+                attention.attn.bias = attention.qkv_conv1d.bias
+                # Same name on both sides, but the right-hand side is the
+                # materialized replacement, not the __init__ reference.
+                attention.attn.A_log = attention.A_log
+                attention.attn.dt_bias = attention.dt_bias
+
     def get_decoder_attention_types(self):
         return self.model.decoder_attention_types
 
@@ -1760,6 +1782,7 @@ class BailingMoeV3ForCausalLM(nn.Module):
         self.model.capture_aux_hidden_states = True
         self.model.layers_to_capture = list(layer_ids)
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,

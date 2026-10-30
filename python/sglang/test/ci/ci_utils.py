@@ -13,6 +13,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 from sglang.srt.debug_utils import cuda_coredump
 from sglang.srt.utils.common import kill_process_tree
 from sglang.test.ci.ci_register import CIRegistry
+from sglang.test.ci.skip_guard import command_for_test_file
 
 # Configure logger to output to stdout
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -121,6 +122,8 @@ NON_RETRIABLE_PATTERNS = [
     r"core dumped",
     r"ConnectionRefusedError",
     r"FileNotFoundError",
+    # skip_guard: every test in the file skipped, which a rerun cannot change.
+    r"\[skip_guard\]",
 ]
 
 
@@ -265,6 +268,7 @@ def run_unittest_files(
     retry_wait_seconds: int = 60,
     fork_worker_batch_size: int = 1,
     prior_results: Optional[List[Tuple[str, bool, float]]] = None,
+    fail_on_all_skipped: bool = False,
 ):
     """
     Run a list of test files.
@@ -287,6 +291,9 @@ def run_unittest_files(
                        into the summary and the TIMINGS block so one suite
                        still reports one block covering every file, whichever
                        runner ran it.
+        fail_on_all_skipped: If True, run each file through skip_guard, which
+                             fails a file whose tests all skipped. Files then
+                             run one exec each, without the fork worker.
     """
     coredump_enabled = cuda_coredump.is_enabled()
     if coredump_enabled:
@@ -308,7 +315,9 @@ def run_unittest_files(
             failed_tests.append((prior_name, "see the chip-pinned phase above"))
             success = False
     fork_worker = None
-    use_fork_worker = fork_worker_batch_size > 1 and not enable_retry
+    use_fork_worker = (
+        fork_worker_batch_size > 1 and not enable_retry and not fail_on_all_skipped
+    )
 
     for i, file in enumerate(files):
         if isinstance(file, CIRegistry):
@@ -353,7 +362,7 @@ def run_unittest_files(
                     elapsed = time.perf_counter() - file_tic
                 elif capture_output:
                     # Capture output for retry decision
-                    cmd = ["python3", full_path, "-f"]
+                    cmd = command_for_test_file(full_path, fail_on_all_skipped)
                     process = subprocess.Popen(
                         cmd,
                         stdout=subprocess.PIPE,
@@ -375,7 +384,7 @@ def run_unittest_files(
                     # Bounded wait for the reader to finish.
                     reader_thread.join(timeout=60)
                 else:
-                    cmd = ["python3", full_path, "-f"]
+                    cmd = command_for_test_file(full_path, fail_on_all_skipped)
                     process = subprocess.Popen(cmd, stdout=None, stderr=None)
                     process.wait()
 

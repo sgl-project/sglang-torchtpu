@@ -18,13 +18,13 @@ The kernel reads either of two KV cache layouts, chosen once here from
 # NOTE: do *not* add ``from __future__ import annotations`` here (see
 # attention_pallas_rpa_base for why torch_tpu's jax_op needs real annotations).
 
-from sglang.srt.environ import envs
 from sglang_tpu.attention_pallas_rpa_base import (
     BaseTpuPallasRpaAttnBackend,
     PallasForwardMetadata,
     RpaKernelSpec,
 )
 from sglang_tpu.cp_forward import get_tpu_cp_layout
+from sglang_tpu.envs import envs
 
 __all__ = [
     "PallasForwardMetadata",

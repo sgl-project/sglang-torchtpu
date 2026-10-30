@@ -83,6 +83,8 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
     get_eviction_strategy,
+    last_hash_value,
+    prefix_hash_values,
     split_node_hash_value,
 )
 
@@ -178,16 +180,10 @@ class UnifiedTreeNode:
         return self.last_access_time < other.last_access_time
 
     def get_last_hash_value(self) -> Optional[str]:
-        if self.hash_value is None or len(self.hash_value) == 0:
-            return None
-        return self.hash_value[-1]
+        return last_hash_value(self)
 
     def get_prefix_hash_values(self, node: UnifiedTreeNode) -> list[str]:
-        chunks = []
-        while node is not None and node.hash_value is not None:
-            chunks.append(node.hash_value)
-            node = node.parent
-        return [value for chunk in reversed(chunks) for value in chunk]
+        return prefix_hash_values(node)
 
 
 def _set_tlru_lens_and_raise_history(
