@@ -960,6 +960,25 @@ class USPAttention(nn.Module):
         effective_skip_sp = (
             self.skip_sequence_parallel or skip_sequence_parallel_override
         )
+        head_pad = self._ulysses_head_pad(
+            q, k, attn_mask, effective_skip_sp, qkv_pre_all_to_all, q_prefix
+        )
+        if head_pad:
+            # Zero heads attend uniformly to zero values and are cut again.
+            pad = (0, 0, 0, head_pad)
+            out = self.forward(
+                torch.nn.functional.pad(q, pad),
+                torch.nn.functional.pad(k, pad),
+                torch.nn.functional.pad(v, pad),
+                attn_mask=attn_mask,
+                num_replicated_prefix=num_replicated_prefix,
+                num_replicated_suffix=num_replicated_suffix,
+                num_replicated_kv_prefix=num_replicated_kv_prefix,
+                skip_sequence_parallel_override=skip_sequence_parallel_override,
+                attn_mask_meta=attn_mask_meta,
+                seq_lens=seq_lens,
+            )
+            return out[:, :, : q.shape[2]]
         if seq_lens is not None:
             assert (
                 attn_mask is None
@@ -1353,6 +1372,27 @@ class USPAttention(nn.Module):
                     out = _usp_output_all_to_all(out, head_dim=2)
                 return out
 
+            if (
+                meta_only_pad
+                and meta_pad_end == q.shape[1]
+                and not self.backend.is_sparse
+                and not self.causal
+            ):
+                # Padding only at the gathered tail: attend over the real key
+                # prefix with the selected backend; no mask to build. Sparse
+                # kernels need K/V as long as Q and keep the masked path below.
+                out = self.attn_impl.forward(
+                    q, k[:, :meta_pad_start], v[:, :meta_pad_start], ctx_attn_metadata
+                )
+                # Not an in-place write into the impl's output buffer.
+                real_rows = (
+                    torch.arange(out.shape[1], device=out.device) < meta_pad_start
+                )
+                out = torch.where(real_rows[None, :, None, None], out, 0)
+                if sp_size > 1:
+                    out = _usp_output_all_to_all(out, head_dim=2)
+                return out
+
             # If NCCL timeout/deadlock occurs here, check whether
             # attn_mask is inconsistent across SP ranks (None on some, Tensor on
             # others), which causes all_gather participant mismatch. Upstream
@@ -1501,6 +1541,18 @@ class USPAttention(nn.Module):
 
         return out
 
+    def supports_tail_pad_meta(self, batch_size: int) -> bool:
+        """Whether tail-pad metadata alone (no mask) is served under the
+        current parallel layout; the masked path's ring branch raises for it
+        otherwise. A caller that cannot honour the padding attends to the pad
+        keys instead, as without the metadata."""
+        if get_ring_parallel_world_size() == 1:
+            return True
+        # The ring branches of forward's masked path.
+        return (self.backend == AttentionBackendEnum.FA and batch_size == 1) or (
+            not self.causal and self.attn_impl.supports_ring_resume()
+        )
+
     def _forward_ring_tail_pad(
         self,
         q: torch.Tensor,
@@ -1618,6 +1670,30 @@ class USPAttention(nn.Module):
         if attn_mask is None and attn_mask_meta is None:
             return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
 
+        use_varlen_fa = (
+            _VARLEN_FA_ENABLED
+            and self.backend == AttentionBackendEnum.FA
+            and q.device.type == "cuda"
+            and q.dtype in (torch.float16, torch.bfloat16)
+        )
+        if (
+            attn_mask is None
+            and not use_varlen_fa
+            and not (num_replicated_prefix or num_replicated_suffix)
+        ):
+            pad_start = attn_mask_meta.get("pad_start", attn_mask_meta.get("gap_start"))
+            pad_end = attn_mask_meta.get("pad_end", attn_mask_meta.get("gap_end"))
+            if pad_start is not None and pad_end == k.shape[1]:
+                # Tail padding only: attend over the global real-key prefix
+                # with the selected backend. Every rank slices the same span,
+                # so every rank runs the same program (spmd-safe compiled
+                # regions need that) and no mask is built or gathered. Pad
+                # query rows keep their values; the caller trims them after
+                # the final gather.
+                return self.attn_impl.forward(
+                    q, k[:, :pad_start], v[:, :pad_start], ctx_attn_metadata
+                )
+
         explicit_mask = attn_mask is not None
         if attn_mask is None:
             local_pad = int(attn_mask_meta.get("local_pad", 0))
@@ -1665,12 +1741,7 @@ class USPAttention(nn.Module):
         else:
             key_mask = cached["key_mask"]
 
-        if (
-            _VARLEN_FA_ENABLED
-            and self.backend == AttentionBackendEnum.FA
-            and q.device.type == "cuda"
-            and q.dtype in (torch.float16, torch.bfloat16)
-        ):
+        if use_varlen_fa:
             if (
                 explicit_mask
                 and attn_mask_meta is not None
@@ -1718,6 +1789,16 @@ class USPAttention(nn.Module):
                 query_len,
             )
 
+        out = self._kv_gather_masked_sdpa(q, k, v, key_mask)
+        return out * attn_mask[:, :, None, None]
+
+    def _kv_gather_masked_sdpa(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        key_mask: torch.Tensor,
+    ) -> torch.Tensor:
         q_ = q.transpose(1, 2)
         k_ = k.transpose(1, 2)
         v_ = v.transpose(1, 2)
@@ -1737,7 +1818,7 @@ class USPAttention(nn.Module):
             else nullcontext()
         )
         with sdpa_context:
-            out = torch.nn.functional.scaled_dot_product_attention(
+            return torch.nn.functional.scaled_dot_product_attention(
                 q_,
                 k_,
                 v_,
@@ -1746,7 +1827,6 @@ class USPAttention(nn.Module):
                 is_causal=False,
                 scale=self.softmax_scale,
             ).transpose(1, 2)
-        return out * attn_mask[:, :, None, None]
 
     def _forward_with_replicated_prefix(
         self,
@@ -1965,6 +2045,36 @@ class USPAttention(nn.Module):
                 is_causal=False,
                 scale=self.softmax_scale,
             ).transpose(1, 2)
+
+    @staticmethod
+    def _ulysses_head_pad(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        attn_mask: torch.Tensor | None,
+        skip_sp: bool,
+        qkv_pre_all_to_all: bool,
+        q_prefix: torch.Tensor | None,
+    ) -> int:
+        """Zero heads to append so the head count divides by the Ulysses degree
+        (e.g. Z-Image's 30 heads at Ulysses 8); 0 where padding does not apply."""
+        # Ulysses degree; the same split the exchanges use (sp = ulysses x ring).
+        world_size = (
+            get_sequence_parallel_world_size() // get_ring_parallel_world_size()
+        )
+        if (
+            world_size <= 1
+            or skip_sp
+            or qkv_pre_all_to_all
+            or q_prefix is not None
+            or k.shape[2] != q.shape[2]
+            or (
+                attn_mask is not None
+                and attn_mask.dim() == 4
+                and attn_mask.shape[1] > 1
+            )
+        ):
+            return 0
+        return -q.shape[2] % world_size
 
     def forward_with_replicated_kv_prefix(
         self,
