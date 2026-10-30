@@ -27,12 +27,14 @@ COPY scripts/ci/tpu/warm_mmlu_cache.py ./scripts/ci/tpu/warm_mmlu_cache.py
 
 # Install the pinned TPU stack (dev_tpu extra = all_tpu + test + ray) without sglang itself.
 # diffusion_tpu: test_diffusion_tpu_platform.py imports the diffusion runtime.
-RUN cd python && \
+RUN --mount=type=secret,id=gar_netrc,target=/root/.netrc,required=true \
+    cd python && \
     mkdir -p sglang && \
     touch sglang/__init__.py && \
     pip install --upgrade pip && \
     pip install \
       --extra-index-url https://download.pytorch.org/whl/cpu \
+      --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/ \
       ".[dev_tpu,diffusion_tpu]" && \
     pip uninstall -y sglang && \
     rm -rf sglang && \
