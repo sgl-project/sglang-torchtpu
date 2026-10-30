@@ -119,6 +119,74 @@ def _rpa_kernel_spec(backend: str | None):
     return spec
 
 
+def _uses_block_major_kv() -> bool:
+    from sglang_tpu.envs import envs as tpu_envs
+
+    return tpu_envs.SGLANG_TPU_USE_BLOCK_MAJOR_KV.get()
+
+
+def _check_block_major_supported(server_args) -> None:
+    """Refuses configurations whose consumers read the KV pool layer by layer."""
+    from sglang.srt.arg_groups.overrides import (
+        attention_backends_of,
+        model_config_of,
+        resolving_view,
+    )
+    from sglang.srt.configs.hybrid_arch import mambaish_config
+
+    cfg = resolving_view(server_args)
+    # Prefill and decode context parallelism also write the per-layer tensor;
+    # both run on pallas_tpu_rpa_batched only, so this check excludes them too.
+    for backend in (cfg.attention_backend, *attention_backends_of(cfg)):
+        if backend != "pallas_tpu_rpa_v3":
+            raise ValueError(
+                "SGLANG_TPU_USE_BLOCK_MAJOR_KV requires the pallas_tpu_rpa_v3 "
+                f"attention backend for prefill and decode; got {backend!r}."
+            )
+    if cfg.speculative_algorithm is not None:
+        raise ValueError(
+            "SGLANG_TPU_USE_BLOCK_MAJOR_KV does not support speculative "
+            f"decoding; got --speculative-algorithm "
+            f"{cfg.speculative_algorithm!r}."
+        )
+    if cfg.disaggregation_mode != "null":
+        _check_block_major_disaggregation(cfg)
+    if cfg.enable_hierarchical_cache and cfg.hicache_io_backend == "torch_tpu":
+        raise ValueError(
+            "SGLANG_TPU_USE_BLOCK_MAJOR_KV supports KV offload over the raiden "
+            "HiCache backend only; got --hicache-io-backend "
+            f"{cfg.hicache_io_backend!r}."
+        )
+    if mambaish_config(model_config_of(server_args)) is not None:
+        raise ValueError(
+            "SGLANG_TPU_USE_BLOCK_MAJOR_KV does not support hybrid "
+            "linear-attention models."
+        )
+
+
+def _check_block_major_disaggregation(cfg) -> None:
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if cfg.disaggregation_transfer_backend != "raiden":
+        raise ValueError(
+            "SGLANG_TPU_USE_BLOCK_MAJOR_KV supports P/D over the raiden "
+            "transfer backend only; got --disaggregation-transfer-backend "
+            f"{cfg.disaggregation_transfer_backend!r}."
+        )
+    # A pipeline stage registers one bundle over its own layers, so only a
+    # decode pipeline with the same stage layout holds a matching bundle.
+    if (
+        cfg.disaggregation_mode == "decode"
+        and cfg.pp_size == 1
+        and tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get()
+    ):
+        raise ValueError(
+            "SGLANG_TPU_USE_BLOCK_MAJOR_KV pairs a pipeline prefill only with a "
+            "decode pipeline of the same stage layout; unset "
+            "SGLANG_RAIDEN_PIPELINE_TRANSFER or SGLANG_TPU_USE_BLOCK_MAJOR_KV."
+        )
+
+
 def _uses_seq_along_lane_kv() -> bool:
     """Ask the backend, so the pool cannot disagree with the kernel."""
     from sglang_tpu.attention_pallas_rpa_batched import (
@@ -225,7 +293,9 @@ def _validate_prefill_context_parallel(server_args: ServerArgs) -> None:
             f"{feature} requires --sampling-backend pytorch (the logits step runs on "
             f"the reduced last-token rows), got {cfg.sampling_backend!r}."
         )
-    if envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get():
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if tpu_envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get():
         raise NotImplementedError(
             f"{feature} does not support input (prompt) logprobs; unset "
             "SGLANG_TPU_ENABLE_PROMPT_LOGPROB."
@@ -250,15 +320,17 @@ def _pin_req_to_token_on_host(reason: str) -> None:
 
 def _pin_fused_moe_tensorcore_gather(reason: str) -> None:
     """Force SGLANG_TPU_FUSED_MOE_SC_GATHER off, warning if it was turned on."""
+    from sglang_tpu.envs import envs as tpu_envs
+
     if (
-        envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.is_set()
-        and envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get()
+        tpu_envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.is_set()
+        and tpu_envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get()
     ):
         logger.warning(
             "Overriding SGLANG_TPU_FUSED_MOE_SC_GATHER=1 -> 0: "
             f"{reason} gathers the fused-MoE rows on the TensorCore."
         )
-    envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.set(False)
+    tpu_envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.set(False)
 
 
 def _mha_kv_pool_cls(backend: str | None) -> type:
@@ -269,6 +341,11 @@ def _mha_kv_pool_cls(backend: str | None) -> type:
     so the two cannot disagree. A plugin that routes its backend to its own
     pool patches this function.
     """
+    if _uses_block_major_kv():
+        # _check_block_major_supported ensured the backend is rpa_v3.
+        from sglang_tpu.kv_pool import TpuBlockMajorMHATokenToKVPool
+
+        return TpuBlockMajorMHATokenToKVPool
     if backend == "pallas_tpu_rpa_batched" and _uses_seq_along_lane_kv():
         # SEQ_ALONG_LANE puts the token index on the lane axis, so the
         # buffer shape differs from the fused one the other backends read.
@@ -525,6 +602,7 @@ def _validate_dsa(server_args) -> None:
     except Exception:
         # A model that cannot be loaded here fails later with its real error.
         return
+    _validate_mtp_index_share(cfg, hf_config)
     if not is_deepseek_dsa(hf_config):
         return
     if cfg.attention_backend != "pallas_tpu_mla_sparse":
@@ -553,6 +631,40 @@ def _validate_dsa(server_args) -> None:
         raise ValueError(
             "DSA on TPU needs --tpu-compile-tracer dynamo, got "
             f"{cfg.tpu_compile_tracer!r}."
+        )
+
+
+def _validate_mtp_index_share(cfg, hf_config) -> None:
+    """Reject the MTP index-sharing setups no TPU spec worker serves.
+
+    Only the experimental chain worker reuses the draft's DSA top-k across its
+    steps (TpuChainDraftWorker); core's workers would run their GPU paths.
+    """
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang_tpu.experimental import experimental_spec_enabled
+
+    # The raw flag: platform defaults run before NEXTN resolves to EAGLE.
+    if cfg.speculative_algorithm not in ("EAGLE", "NEXTN"):
+        return
+    if not getattr(hf_config, "index_share_for_mtp_iteration", False):
+        return
+    opt_out = (
+        "or keep a per-step indexer with --json-model-override-args "
+        "index_share_for_mtp_iteration=false"
+    )
+    if not is_deepseek_dsa(hf_config):
+        raise ValueError(
+            f"TPU shares the MTP draft's indexer top-k for DSA models only; {opt_out}."
+        )
+    if not experimental_spec_enabled():
+        raise ValueError(
+            "DSA index sharing on TPU runs on the experimental spec worker; set "
+            f"SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1 {opt_out}."
+        )
+    if cfg.disaggregation_mode != "null":
+        # A P/D decode would draft on seeds its prefill never sent.
+        raise NotImplementedError(
+            f"DSA index sharing on TPU does not support P/D disaggregation; {opt_out}."
         )
 
 
@@ -1033,6 +1145,8 @@ class TpuSRTPlatform(SRTPlatform):
         # After the page-size default: the DCP chunk check reads the page size.
         _validate_decode_context_parallel(server_args)
         _apply_kv_cache_dtype_default(server_args)
+        if _uses_block_major_kv():
+            _check_block_major_supported(server_args)
 
     # ------------------------------------------------------------------
     # Subsystem factory methods
@@ -1390,6 +1504,7 @@ class TpuSRTPlatform(SRTPlatform):
             arm_recompilation_checker,
             maybe_enable_site_tracing,
         )
+        from sglang_tpu.envs import envs as tpu_envs
 
         if get_exec().graph.enable_torch_compile:
             arm_recompilation_checker(reset_counters=False, overwrite_baseline=False)
@@ -1399,7 +1514,7 @@ class TpuSRTPlatform(SRTPlatform):
             return
         if (
             get_spec().speculative_algorithm is not None
-            and envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.get()
+            and tpu_envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.get()
         ):
             logger.info(
                 "[tpu] Warmup complete; leaving torch.compile recompiles enabled "

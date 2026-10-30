@@ -53,11 +53,13 @@ def forward_draft_rows(
     width: int,
     spec_info: DFlashVerifyInput,
     capture_hidden_mode: CaptureHiddenMode,
+    publish_dsa_topk: bool = False,
 ) -> LogitsProcessorOutput:
     """Draft forward of width rows per request, offset rows past seq_lens, at the batch bucket.
 
     Writes draft KV into the verify slots of those rows; inputs come from
-    build_draft_block_inputs / build_chain_block_inputs.
+    build_draft_block_inputs / build_chain_block_inputs. With publish_dsa_topk a
+    DSA NextN draft leaves its indexer top-k rows in spec_info.dsa_topk_indices.
     """
     padded_bs = req_pool_indices.shape[0]
     bs = verify_input.seq_lens_cpu.shape[0]
@@ -98,6 +100,9 @@ def forward_draft_rows(
         # Tensor-vs-None per input.
         num_token_non_padded=num_token_non_padded,
         global_num_token_non_padded_cpu=num_live_tokens,
+        # Handed no shared top-k, a reusing NextN layer runs its indexer and sets
+        # spec_info.dsa_topk_indices (IndexTopKShareState.publish).
+        reuse_dsa_topk_indices=publish_dsa_topk,
     )
     set_bucket_dp_metadata(
         forward_batch,

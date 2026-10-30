@@ -297,6 +297,10 @@ class Model(msgspec.Struct):
         "support it then read only their EP rank's routed experts "
         "(SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS=1 reads whole shards).",
     ] = False
+    custom_pull_weights_pre_read_hook: A[
+        Optional[str],
+        "Import path of a hook(source_dir, target_version) that /pull_weights calls before reading the published weights. POSIX shared filesystems need no hook; object-store-backed mounts often lack cross-host read-after-write consistency, so another host's writes only become visible after an explicit refresh.",
+    ] = None
     weight_loader_prefetch_checkpoints: A[
         bool,
         "Prefetch checkpoint files into OS page cache before loading. Each rank prefetches a fraction of the shards, reducing total network I/O on shared filesystems (NFS/Lustre) from N*checkpoint to 1*checkpoint. Recommended for models on network storage. When enabled, multi-threaded safetensors loading is disabled by default to avoid I/O oversubscription with the prefetch threads; set enable_multithread_load=true in --model-loader-extra-config to keep multi-threaded loading (e.g. on local NVMe where prefetch is a no-op).",

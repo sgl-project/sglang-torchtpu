@@ -148,10 +148,10 @@ class TestProxyReceive(CustomTestCase):
         scheduler._pp_recv_typed_dict.assert_not_called()
 
 
-class TestWaveRows(CustomTestCase):
-    def _rows(self, compile_policy):
+class TestWaveBuffers(CustomTestCase):
+    def _wave_args(self, compile_policy, model=None):
         scheduler = SchedulerPPMixin()
-        scheduler.pp_group = SimpleNamespace()
+        scheduler.pp_group = SimpleNamespace(is_first_rank=False)
         scheduler.tp_group = SimpleNamespace()
         scheduler.world_group = SimpleNamespace()
         scheduler.tp_worker = SimpleNamespace(
@@ -159,14 +159,19 @@ class TestWaveRows(CustomTestCase):
                 compile_policy=compile_policy,
                 model_config=SimpleNamespace(context_len=4096, hidden_size=16),
                 spec_aux_config=SpecAuxHiddenStateConfig(),
-                model=SimpleNamespace(),
+                pp_group=scheduler.pp_group,
+                model=SimpleNamespace() if model is None else model,
                 dtype=torch.bfloat16,
                 device="cpu",
             )
         )
+        compile_policy.model_runner = scheduler.tp_worker.model_runner
         with patch.object(pp_scheduler, "build_pp_wave") as build:
             scheduler._pp_init_wave()
-        return build.call_args.kwargs["rows"]
+        return build.call_args.kwargs
+
+    def _rows(self, compile_policy):
+        return self._wave_args(compile_policy)["rows"]
 
     def _policy(self, token_buckets, bs_buckets):
         return DecoderTpuCompilePolicy(
@@ -185,6 +190,18 @@ class TestWaveRows(CustomTestCase):
 
     def test_buffer_holds_the_largest_decode_batch(self):
         self.assertEqual(self._rows(self._policy([64, 256], [1, 512])), 512)
+
+    def test_wave_and_warmup_preserve_the_models_residual_dtype(self):
+        policy = self._policy([64, 256], [1, 32])
+        for model, dtype in (
+            (SimpleNamespace(), torch.bfloat16),
+            (SimpleNamespace(pp_transfer_dtype=torch.float32), torch.float32),
+        ):
+            with self.subTest(dtype=dtype):
+                self.assertEqual(self._wave_args(policy, model)["dtype"], dtype)
+                proxy = policy._pp_warmup_kwargs(64)["pp_proxy_tensors"]
+                for name in ("hidden_states", "residual"):
+                    self.assertEqual(proxy[name].dtype, dtype)
 
 
 if __name__ == "__main__":
