@@ -153,8 +153,6 @@ class PallasForwardMetadata:
     # (``[chunk_rows, chunk_rows, rows]``; see the kernel's ``tail_decode``).
     # i32[max_num_seqs]  unsharded KV length per sequence
     dcp_kv_lens_global: torch.Tensor | None = None
-    # i32[max_num_seqs]  this rank's shard of the KV cached before this step
-    dcp_prefix_kv_lens: torch.Tensor | None = None
     # i32[1]  this rank's index inside its DCP group
     dcp_cp_rank: torch.Tensor | None = None
 
@@ -1122,16 +1120,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 pass
 
         dcp_kv_lens_global: torch.Tensor | None = None
-        dcp_prefix_kv_lens: torch.Tensor | None = None
         dcp_cp_rank: torch.Tensor | None = None
         seq_lens_host: torch.Tensor | None = None
         ext_host: torch.Tensor | None = None
         if self._dcp > 1:
             # The kernel derives the global query position of a local key from
-            # the unsharded lengths, so it needs them alongside the shard. The
-            # prefix shard excludes this step's own tokens: the extend path
-            # attends those in a separate chunk-local pass. seq_lens_cpu holds
-            # the live rows only; the bucket's padding rows stay at length 0.
+            # the unsharded lengths, so it needs them alongside the shard.
+            # seq_lens_cpu holds the live rows only; the bucket's padding rows
+            # stay at length 0.
             seq_lens_host = torch.as_tensor(
                 list(seq_lens_cpu) if isinstance(seq_lens_cpu, list) else seq_lens_cpu,
                 dtype=torch.int64,
@@ -1142,10 +1138,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 if query_lens is not None
                 else torch.full((live,), query_width, dtype=torch.int64)
             )
+            target_global = seq_lens_host
             if forward_batch.forward_mode.is_decode():
-                prefix_host = seq_lens_host
                 target_host = seq_lens_host
-                target_global = seq_lens_host
             else:
                 # Extend and mixed: a single-token row (a decode row of a mixed
                 # batch, or a one-token extend) fuses its new token into the
@@ -1154,10 +1149,10 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 # and writes its tokens from the NEW_TOKENS_ONLY chunk pass.
                 # Both have global length seq_lens_host, so
                 # q_global_start = seq_lens - ext.
-                prefix_host = seq_lens_host - ext_host
                 is_single = ext_host == 1
-                target_host = torch.where(is_single, seq_lens_host, prefix_host)
-                target_global = seq_lens_host
+                target_host = torch.where(
+                    is_single, seq_lens_host, seq_lens_host - ext_host
+                )
                 if forward_batch.forward_mode.is_mixed():
                     # SGLang appends the running (decode) rows after the
                     # prefill rows: the kernel reads ``distribution`` back to
@@ -1185,7 +1180,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
 
             kv_lens = _padded(self._dcp_lens(target_host))
             dcp_kv_lens_global = _padded(target_global)
-            dcp_prefix_kv_lens = _padded(self._dcp_lens(prefix_host))
             dcp_cp_rank = self._cp_rank_t
 
         req_pool_indices = forward_batch.req_pool_indices_cpu
@@ -1241,7 +1235,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             active_num_tokens=active_num_tokens,
             swa_page_indices=swa_page_indices,
             dcp_kv_lens_global=dcp_kv_lens_global,
-            dcp_prefix_kv_lens=dcp_prefix_kv_lens,
             dcp_cp_rank=dcp_cp_rank,
             decode_query_size=decode_query_size,
             segments=segments,

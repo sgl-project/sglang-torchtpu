@@ -11,9 +11,8 @@ This module holds the parts of that scheme that are independent of the backend
 object: the torch custom op for the CP-aware kernel (including the fused
 ``STRIPED`` decode scope and the stripe-writing ``NEW_TOKENS_ONLY`` chunk
 scope), the query-head all-gather and the pure-torch merges (cross-rank
-log-sum-exp merge, sink fold, two-pass extend combine). The fused-pool row
-layout and the owner-masked span write are kept for callers that stage K/V
-outside the kernel; the backend's extend path no longer needs them.
+log-sum-exp merge, sink fold, two-pass extend combine). The kernel writes the
+step's K/V itself in every mode; nothing stages K/V outside it.
 
 ``attention_pallas_rpa_base`` drives them; the non-DCP path never calls in here.
 """
@@ -21,26 +20,18 @@ outside the kernel; the backend's extend path no longer needs them.
 # NOTE: do *not* add ``from __future__ import annotations`` here (see
 # attention_pallas_rpa_base for why torch_tpu's jax_op needs real annotations).
 
-from typing import NamedTuple
-
 import torch
 
 from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
 __all__ = [
     "DCP_OP_NAME",
-    "DcpWriteSpans",
-    "broadcast_own_kv_heads",
     "build_dcp_kernel_op",
-    "build_owner_write_spans",
-    "fused_kv_rows",
     "gather_heads",
-    "max_write_spans",
     "merge_across_ranks",
     "merge_lse",
     "own_heads",
     "sink_fold",
-    "write_owned_kv",
 ]
 
 # torch custom-op name of the CP-aware kernel. Distinct from the plain batched op
@@ -247,156 +238,6 @@ def build_dcp_kernel_op(spec):
 
     _OP_CACHE[spec.op_name] = custom_op
     return custom_op
-
-
-def fused_kv_rows(
-    k: torch.Tensor, v: torch.Tensor, kv_cache: torch.Tensor
-) -> torch.Tensor:
-    """Rows ``[T, packed, packing, padded_head_dim]`` of ``k``/``v`` (each
-    ``[T, heads, head_dim]``) in the fused pool layout of ``kv_cache``.
-
-    K and V are interleaved per head, the head axis is padded to the pool's
-    packing and the head dim to 128 -- the layout the kernel's own
-    ``prepare_inputs`` produces for its KV write.
-    """
-    num_tokens, heads, head_dim = k.shape
-    packed, packing, padded_head_dim = kv_cache.shape[2:]
-    rows = torch.stack([k, v], dim=2).reshape(num_tokens, 2 * heads, head_dim)
-    pad_dim = padded_head_dim - head_dim
-    pad_heads = packed * packing - 2 * heads
-    if pad_dim or pad_heads:
-        rows = torch.nn.functional.pad(rows, (0, pad_dim, 0, pad_heads))
-    return rows.reshape(num_tokens, packed, packing, padded_head_dim)
-
-
-def broadcast_own_kv_heads(
-    k: torch.Tensor, v: torch.Tensor, dcp_size: int, rank_index: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """``k``/``v`` with every local KV head replaced by one this rank's q heads own.
-
-    K/V are sharded over ``attn_tp // dcp`` groups, so every rank of a DCP group
-    holds the same ``Hkv`` heads while its own query heads cover only the
-    ``Hkv // dcp`` wide slice that starts at its rank. A kernel call that
-    passes this rank's query heads alone still has them grouped over all ``Hkv``
-    heads, and the head count has to stay ``Hkv`` because the kernel stages new
-    and cached K/V into one buffer shaped by the cache -- so the slice is
-    repeated back up to ``Hkv`` heads, ``dcp_size`` copies of each.
-
-    ``rank_index`` is the rank as an ``i64[1]`` device tensor, so every rank
-    traces the same program (see ``_all_reduce_gather``).
-
-    Kernel calls that pass the group's gathered query heads take ``k``/``v``
-    unchanged.
-    """
-    num_tokens, heads, head_dim = k.shape
-    if heads % dcp_size and dcp_size % heads:
-        raise ValueError(
-            f"{heads} local KV heads do not divide evenly over a DCP group of "
-            f"{dcp_size}: the query heads of one rank would straddle two KV "
-            "heads, which the ragged-paged-attention head grouping cannot "
-            "express."
-        )
-    own = max(1, heads // dcp_size)
-    if own == heads:
-        return k, v
-    reps = heads // own
-    start = torch.div(rank_index * heads, dcp_size, rounding_mode="floor")
-    index = start + torch.arange(own, device=k.device, dtype=torch.int64)
-
-    def _own(x: torch.Tensor) -> torch.Tensor:
-        return (
-            x.index_select(1, index)[:, :, None, :]
-            .expand(num_tokens, own, reps, head_dim)
-            .reshape(num_tokens, heads, head_dim)
-        )
-
-    return _own(k), _own(v)
-
-
-class DcpWriteSpans(NamedTuple):
-    """Host-built targets of one step's owner-masked KV write.
-
-    ``index`` (i64[num_tokens]) gathers this rank's owned rows to the front in
-    token order; the spans (i32[max_spans] each) then name, per run of
-    consecutive physical slots, the first slot (``dst``), the first compacted
-    row (``src``) and the row count (``lens``, 0 for padding spans).
-    """
-
-    index: torch.Tensor
-    dst: torch.Tensor
-    src: torch.Tensor
-    lens: torch.Tensor
-
-    def to_device(self, device) -> "DcpWriteSpans":
-        return DcpWriteSpans(*(t.to(device, non_blocking=True) for t in self))
-
-
-def max_write_spans(num_tokens: int, num_seqs: int, page_size: int) -> int:
-    """Static span-table length for a token bucket: every request opens a span
-    and every page it touches may open another."""
-    return 2 * num_seqs + num_tokens // page_size + 1
-
-
-def build_owner_write_spans(
-    positions: torch.Tensor,
-    out_cache_loc: torch.Tensor,
-    dcp_size: int,
-    rank: int,
-    page_size: int,
-    num_tokens: int,
-    num_seqs: int,
-) -> DcpWriteSpans:
-    """Compaction index and DMA spans that write this rank's rows of a step.
-
-    The cache is page-striped: a token at position ``p`` belongs to rank
-    ``(p // page_size) % dcp_size``. The allocator hands out widened logical
-    slots (one logical page = ``page_size * dcp_size`` tokens, backed by one
-    physical page per rank), so the owned token lives in physical slot
-    ``(loc // (page_size * dcp_size)) * page_size + p % page_size`` -- the
-    same slot the fused decode kernel writes (local stripe index
-    ``local_cache_len``, whose page offset is ``p % page_size``).
-    Consecutive owned tokens of one request share a page in consecutive
-    physical slots, so a span ends only where the physical slot jumps.
-    """
-    loc = out_cache_loc.to(torch.int64)
-    pos = positions.to(torch.int64)
-    stride = page_size * dcp_size
-    owned = torch.nonzero((pos // page_size) % dcp_size == rank).flatten()
-    phys = (loc[owned] // stride) * page_size + pos[owned] % page_size
-    index = torch.zeros(num_tokens, dtype=torch.int64)
-    index[: owned.numel()] = owned
-    max_spans = max_write_spans(num_tokens, num_seqs, page_size)
-    dst = torch.zeros(max_spans, dtype=torch.int32)
-    src = torch.zeros(max_spans, dtype=torch.int32)
-    lens = torch.zeros(max_spans, dtype=torch.int32)
-    if owned.numel():
-        breaks = torch.nonzero(phys[1:] != phys[:-1] + 1).flatten() + 1
-        starts = torch.cat([torch.zeros(1, dtype=torch.int64), breaks])
-        ends = torch.cat([breaks, torch.tensor([owned.numel()], dtype=torch.int64)])
-        if starts.numel() > max_spans:
-            raise ValueError(
-                f"{starts.numel()} write spans exceed the {max_spans}-span table "
-                f"of a {num_tokens}-token, {num_seqs}-sequence bucket."
-            )
-        n = starts.numel()
-        dst[:n] = phys[starts].to(torch.int32)
-        src[:n] = starts.to(torch.int32)
-        lens[:n] = (ends - starts).to(torch.int32)
-    return DcpWriteSpans(index, dst, src, lens)
-
-
-def write_owned_kv(
-    write_op, kv_cache: torch.Tensor, rows: torch.Tensor, spans: DcpWriteSpans
-) -> None:
-    """Write this rank's rows of ``rows`` into ``kv_cache`` in place.
-
-    ``rows`` is every token's row in the pool layout; ``spans`` compacts the
-    owned ones and ``write_op`` (``kv_span_write``) DMAs each span into the
-    pool. A torch scatter into the pool inside the compiled forward costs
-    about a millisecond per layer.
-    """
-    rows = rows.index_select(0, spans.index).contiguous()
-    write_op(spans.dst, spans.src, spans.lens, rows, kv_cache)
 
 
 def sink_fold(
