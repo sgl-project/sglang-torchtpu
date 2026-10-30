@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -45,6 +46,49 @@ class TestMiniMaxH3EncoderDevice(unittest.TestCase):
             minimax_h3_qwen3vl, "get_local_torch_device", return_value=cpu
         ):
             self.assertEqual(encoder.device, cpu)
+
+    def test_text_positions_resolve_on_host_without_changing_values(self):
+        encoder = self._encoder_with_param_on(torch.device("cpu"))
+        encoder.hidden_dim = 8
+        encoder.conditioning_projection = None
+        config = SimpleNamespace(
+            vision_config=SimpleNamespace(spatial_merge_size=2),
+            image_token_id=100,
+            video_token_id=101,
+            vision_start_token_id=102,
+        )
+        position_model = SimpleNamespace(config=config)
+        resolve = mock.Mock(
+            side_effect=lambda *a, **kw: minimax_h3_qwen3vl.Qwen3VLModel.get_rope_index(
+                position_model, *a, **kw
+            )
+        )
+        encoder.model = SimpleNamespace(get_rope_index=resolve)
+        ids = torch.tensor([10, 13, 3, 20], dtype=torch.long)
+        hidden = torch.arange(32).reshape(1, 4, 8).to(torch.bfloat16)
+        with (
+            mock.patch.object(
+                minimax_h3_qwen3vl,
+                "get_local_torch_device",
+                return_value=torch.device("cpu"),
+            ),
+            mock.patch.object(
+                MiniMaxH3Qwen3VLEncoder,
+                "__call__",
+                return_value=SimpleNamespace(last_hidden_state=hidden),
+            ) as forward,
+        ):
+            output = encoder.encode_ids(ids)
+        torch.testing.assert_close(output, hidden[0], rtol=0, atol=0)
+        resolve.assert_called_once()
+        self.assertEqual(resolve.call_args.args[0].device.type, "cpu")
+        torch.testing.assert_close(forward.call_args.kwargs["input_ids"], ids[None])
+        torch.testing.assert_close(
+            forward.call_args.kwargs["position_ids"],
+            torch.arange(4).view(1, 1, 4).expand(3, 1, 4),
+            rtol=0,
+            atol=0,
+        )
 
 
 if __name__ == "__main__":

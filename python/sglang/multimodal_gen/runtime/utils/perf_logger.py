@@ -213,7 +213,7 @@ _host_anon_sampler = _HostAnonSampler()
 
 
 def capture_memory_snapshot() -> MemorySnapshot:
-    if not torch.get_device_module().is_available():
+    if not torch.accelerator.is_available():
         return MemorySnapshot(
             allocated_mb=0.0,
             reserved_mb=0.0,

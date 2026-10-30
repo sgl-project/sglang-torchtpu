@@ -67,6 +67,35 @@ def _perf_record(memory_snapshots: dict[str, dict]) -> RequestPerfRecord:
     )
 
 
+@pytest.mark.parametrize("available", [False, True])
+def test_memory_snapshot_uses_public_accelerator_availability(monkeypatch, available):
+    device_module = Mock()
+    device_module.is_available.side_effect = RuntimeError("device-private API")
+    for index, name in enumerate(
+        (
+            "memory_allocated",
+            "memory_reserved",
+            "max_memory_allocated",
+            "max_memory_reserved",
+        ),
+        start=1,
+    ):
+        getattr(device_module, name).return_value = index * 1024**2
+    public_available = Mock(return_value=available)
+    monkeypatch.setattr(current_platform, "is_mps", lambda: False)
+    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    monkeypatch.setattr(torch.accelerator, "is_available", public_available)
+    monkeypatch.setattr(perf_logger_module._host_anon_sampler, "peak_mb", lambda: 5.0)
+    snapshot = perf_logger_module.capture_memory_snapshot()
+    assert snapshot.allocated_mb == (1.0 if available else 0.0)
+    assert snapshot.reserved_mb == (2.0 if available else 0.0)
+    assert snapshot.peak_allocated_mb == (3.0 if available else 0.0)
+    assert snapshot.peak_reserved_mb == (4.0 if available else 0.0)
+    assert snapshot.peak_host_anon_mb == 5.0
+    public_available.assert_called_once_with()
+    device_module.is_available.assert_not_called()
+
+
 def test_request_metrics_attributes_steps_and_iterations_to_active_stage():
     metrics = RequestMetrics("request")
     metrics.active_stage_name = "ShapeStage"
