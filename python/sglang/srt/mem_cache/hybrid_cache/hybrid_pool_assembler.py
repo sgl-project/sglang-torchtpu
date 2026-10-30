@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -488,6 +489,10 @@ def build_hybrid_swa_stack(
         kv_host_size, swa_host_size = _split_hicache_size(
             memory.hicache_size, (full_kv_pool, swa_kv_pool)
         )
+        swa_host_fraction = envs.SGLANG_HICACHE_SWA_HOST_FRACTION.get()
+        if swa_host_fraction is not None:
+            swa_host_size = memory.hicache_size * swa_host_fraction
+            kv_host_size = memory.hicache_size - swa_host_size
 
     host_pool_group = build_hybrid_swa_group(
         page_size=params.page_size,

@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import jax
 import jax.numpy as jnp
 from jax import lax
 
 from sglang_tpu.attention.pallas.batched_rpa import configs, utils
+
+LOG2E = 1.0 / math.log(2.0)
 
 
 def flash_attention_qk_softmax(
@@ -33,9 +37,21 @@ def flash_attention_qk_softmax(
     bq_start: int,
     kv_len_left: list[jax.Array] | None = None,  # [B]
     global_q_k_gap: list[jax.Array] | None = None,  # [B]
+    apply_mask: bool = True,
+    fold_sm_scale: bool = False,
 ):
-    """Flash attention kernel."""
+    """Flash attention kernel.
+
+    ``apply_mask=False`` is for tiles the caller proved fully visible;
+    ``fold_sm_scale`` scales q instead of the scores (exact for a power of two).
+    """
     b, k_heads, tq, h_size = q.shape
+    exp2 = cfgs.serve.exp2_softmax
+    exp_fn = jnp.exp2 if exp2 else jnp.exp
+    # With exp2 the scores carry log2e, so exp2(x) == exp(x / log2e).
+    score_scale = cfgs.model.sm_scale * (LOG2E if exp2 else 1.0)
+    if fold_sm_scale:
+        q = q * jnp.asarray(score_scale, q.dtype)
 
     if cfgs.serve.scale_q is not None:
         q = q / cfgs.serve.scale_q
@@ -64,8 +80,12 @@ def flash_attention_qk_softmax(
         )
     qk = qk.astype(cfgs.serve.dtype_out).reshape(b, k_heads, tq, s)
 
-    qk *= cfgs.model.sm_scale
-    if cfgs.serve.scale_k is not None:
+    if not fold_sm_scale:
+        qk *= score_scale
+    # A unit K scale is the identity; skip the multiply.
+    if cfgs.serve.scale_k is not None and not (
+        isinstance(cfgs.serve.scale_k, (int, float)) and cfgs.serve.scale_k == 1
+    ):
         qk *= cfgs.serve.scale_k
     if cfgs.serve.scale_q is not None:
         qk *= cfgs.serve.scale_q
@@ -85,6 +105,10 @@ def flash_attention_qk_softmax(
         q_kv_diff_global = q_iota - cfgs.serve.cp_group_size * kv_iota
 
     for b_idx in range(cfgs.block.batch_size):
+        if not apply_mask:
+            # The unused iotas above are dead code once no tile reads them.
+            qk_masked.append(qk[b_idx])
+            continue
         # NOTE: Goal is to compute q_len >= kv_len. But we want to utilize scalar
         # compute as much as possible before involving vector compute. Therefore, we
         # break down a computational steps into following equations to separate out
@@ -133,7 +157,12 @@ def flash_attention_qk_softmax(
         qk_masked.append(jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value))
     qk = jnp.stack(qk_masked, axis=0)
 
-    m_curr = jnp.max(qk, axis=-1, keepdims=True)
+    if cfgs.serve.no_max:
+        # A zero max: m is -inf at a q block's first k block (alpha clears l and acc)
+        # and 0 after, so p is exp(s) and no row-max barrier sits between QK and exp.
+        m_curr = jnp.zeros(qk.shape[:-1] + (1,), qk.dtype)
+    else:
+        m_curr = jnp.max(qk, axis=-1, keepdims=True)
 
     alpha_list = []
     m_next_list = []
@@ -141,17 +170,24 @@ def flash_attention_qk_softmax(
     for b_idx in range(cfgs.block.batch_size):
         m_curr_b = m_curr[b_idx]
         m_next_b = jnp.maximum(m_prev, m_curr_b)
-        alpha_b = jnp.exp(m_prev - m_next_b)
+        alpha_b = exp_fn(m_prev - m_next_b)
         alpha_list.append(alpha_b)
         m_next_list.append(m_next_b)
         m_prev = jnp.where(is_last_k[step, b_idx], -jnp.inf, m_next_b)
 
     m_next = jnp.stack(m_next_list, axis=0)
-    p = jnp.exp(qk - utils.broadcast_minor(m_next, qk.shape))
+    # m is an f32 carry; the scores and p stay in the output dtype.
+    if cfgs.serve.no_max:
+        p = exp_fn(qk)
+    else:
+        p = exp_fn(qk - utils.broadcast_minor(m_next, qk.shape).astype(qk.dtype))
     if kv_len_left is not None:
         # A row with no key in range keeps l == 0 rather than weighting masked
         # keys by exp(mask_value - mask_value).
         p = jnp.where(jnp.stack(masks, axis=0), p, 0)
+    if cfgs.serve.ones_v:
+        # The PV matmul produces the row sums (ones rows in V); l is unused.
+        return p, alpha_list, m_prev, jnp.stack([l_prev] * b, axis=0), m_next
     p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out)
 
     l_next_list = []

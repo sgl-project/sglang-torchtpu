@@ -230,6 +230,8 @@ def _create_dflash_worker_for_tpu(
     worker._draft_block_end_buf = None
     worker._draft_extend_seq_lens_buf = None
     worker._draft_seq_lens_cpu_buf = None
+    worker._draft_kv_is_swa = False
+    worker._verify_swa_block_selector = None
     worker._draft_block_spec_info = DFlashVerifyInput(
         draft_token=torch.empty((0,), dtype=torch.long, device=dev),
         positions=torch.empty((0,), dtype=torch.int64, device=dev),

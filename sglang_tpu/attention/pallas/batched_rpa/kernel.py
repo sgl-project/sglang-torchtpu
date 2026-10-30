@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import math
 
 import jax
 import jax.experimental.pallas as pl
@@ -28,6 +29,7 @@ from sglang_tpu.attention.pallas.batched_rpa import (
     flash_attention,
     schedule,
     stitch_utils,
+    transposed,
     utils,
 )
 
@@ -170,6 +172,11 @@ def calculate_and_store_out(
             )
         if cfgs.model.has_attention_sink:
             batch_l = add_attention_sink(batch_l, batch_m, sink_ref)
+        if cfgs.serve.ones_v:
+            # l rode along in the accumulator lanes above the head.
+            h = cfgs.aligned_kv_head_dim
+            batch_l = batch_acc[..., h : 2 * h]
+            batch_acc = batch_acc[..., :h]
         if cfgs.serve.cache_only:
             # A row that attended no key keeps l == 0 and outputs 0.
             batch_l = jnp.where(batch_l == 0, jnp.ones_like(batch_l), batch_l)
@@ -224,8 +231,7 @@ def rpa_body(
     m_scratch_ref: jax.Ref,
     l_scratch_ref: jax.Ref,
     acc_scratch_ref: jax.Ref,
-    lse_stage_ref: jax.Ref | None,
-    *,
+    *rest_scratch_refs: jax.Ref | None,
     # Passed refs
     cu_q_lens_ref: jax.Ref,
     kv_lens_ref: jax.Ref,
@@ -235,6 +241,10 @@ def rpa_body(
     # Configs.
     cfgs: configs.RpaConfigs,
 ):
+    if cfgs.use_transposed:
+        qt_scratch_ref, qkey_scratch_ref, lse_stage_ref = rest_scratch_refs
+    else:
+        (lse_stage_ref,) = rest_scratch_refs
     step = pl.program_id(0)
 
     # Step 1: Fetch metadata.
@@ -302,6 +312,7 @@ def rpa_body(
         cfgs.bq_sz * cfgs.aligned_num_q_heads_per_kv_head,
         cfgs.aligned_q_head_dim,
     )
+    q_wide = q
     if cfgs.aligned_q_head_dim != cfgs.aligned_kv_head_dim:
         q = q[..., : cfgs.aligned_kv_head_dim]
 
@@ -312,9 +323,29 @@ def rpa_body(
     k_b = []
     v_b = []
 
-    if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-        stitch_results = []
+    # Multi-row q blocks stitch only lanes whose block holds new tokens: a block read
+    # wholly from the cache stitches to itself (verify blocks: all but the last).
+    guard_stitch = (
+        cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE and cfgs.bq_sz > 1
+    )
+    if guard_stitch:
         for b_idx in range(cfgs.batch_size):
+
+            @pl.when(bkv_sz_frm_cache_list[b_idx] < cfgs.bkv_sz)
+            def _(b_idx=b_idx):
+                res = stitch_utils.stitch_new_kv_lane(
+                    kv_in_vref,
+                    b_idx,
+                    bkv_sz_frm_cache_list[b_idx],
+                    new_kv_len_start_list[b_idx],
+                    cfgs=cfgs,
+                )
+                stitch_utils.store_new_kv_lane(kv_in_vref, b_idx, res, cfgs=cfgs)
+
+    if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+        n_unguarded = 0 if guard_stitch else cfgs.batch_size
+        stitch_results = []
+        for b_idx in range(n_unguarded):
             res = stitch_utils.stitch_new_kv_lane(
                 kv_in_vref,
                 b_idx,
@@ -323,7 +354,7 @@ def rpa_body(
                 cfgs=cfgs,
             )
             stitch_results.append(res)
-        for b_idx in range(cfgs.batch_size):
+        for b_idx in range(n_unguarded):
             stitch_utils.store_new_kv_lane(
                 kv_in_vref,
                 b_idx,
@@ -380,92 +411,197 @@ def rpa_body(
     # Stack to (batch, num_heads, bkv_sz, num_lanes)
     k = jnp.stack(k_b, axis=0)
     v = jnp.stack(v_b, axis=0)
-
-    # Step 3: Perform compute.
-    m_val = m_scratch_ref[...]
-    l_val = l_scratch_ref[...]
-    acc_val = acc_scratch_ref[...]
-
-    l_new_list = []
-    m_new_list = []
-    acc_new_list = []
-
-    prev_p = prev_alpha_list = prev_q_slice = None
-    for bq_start in range(0, cfgs.bq_sz, cfgs.bq_c_sz):
-        bq_end = min(bq_start + cfgs.bq_c_sz, cfgs.bq_sz)
-        q_start = bq_start * cfgs.aligned_num_q_heads_per_kv_head
-        q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
-        q_slice = slice(q_start, q_end)
-
-        p, alpha_list, m_next, l_next, m_lanes = (
-            flash_attention.flash_attention_qk_softmax(
-                step,
-                q[:, :, q_slice],
-                k,
-                m_val[:, q_slice],
-                l_val[:, q_slice],
-                schedule_ref.is_last_k,
-                processed_q_len=processed_q_len,
-                processed_kv_len=processed_kv_len,
-                cfgs=cfgs,
-                bq_start=bq_start,
-                kv_len_left=kv_len_left,
-                global_q_k_gap=global_q_k_gap,
-            )
+    if cfgs.serve.ones_v and not cfgs.use_transposed:
+        # [B, KV, H, S] -> [B, KV, lanes, S]: the PV matmul then returns
+        # sum(p) in the lanes above the head, for free on an MXU that pads H.
+        assert cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+        ones_rows = cfgs.acc_width - v.shape[-2]
+        assert ones_rows > 0, v.shape
+        v = jnp.concatenate(
+            [v, jnp.ones((*v.shape[:-2], ones_rows, v.shape[-1]), v.dtype)],
+            axis=-2,
         )
-        m_scratch_ref[:, q_slice] = m_next
-        l_scratch_ref[:, q_slice] = l_next[-1]
-        l_new_list.append(l_next)
-        m_new_list.append(m_lanes)
 
-        if prev_p is not None:
-            o_next = flash_attention.flash_attention_pv(
-                prev_p,
-                v,
-                prev_alpha_list,
-                acc_val[:, prev_q_slice],
-                cfgs=cfgs,
+    if cfgs.use_transposed:
+        transposed.refresh_qt(
+            q_wide,
+            qt_scratch_ref,
+            qkey_scratch_ref,
+            schedule_ref.s_idx[step, 0],
+            schedule_ref.q_idx[step, 0],
+            cfgs=cfgs,
+        )
+        run_tile = functools.partial(
+            transposed.tile,
+            step,
+            k,
+            v,
+            schedule_ref,
+            m_scratch_ref,
+            acc_scratch_ref,
+            qt_scratch_ref,
+            o_vref,
+            processed_q_len=processed_q_len[0],
+            processed_kv_len=processed_kv_len[0],
+            cfgs=cfgs,
+        )
+        if not cfgs.serve.skip_full_tile_mask:
+            run_tile(apply_mask=True)
+            return
+        full_tile = _full_tile(
+            step, schedule_ref, processed_q_len, processed_kv_len, cfgs
+        )
+        pl.when(full_tile)(lambda: run_tile(apply_mask=False))
+        pl.when(jnp.logical_not(full_tile))(lambda: run_tile(apply_mask=True))
+        return
+
+    # Step 3: Perform compute, then step 4: write back outputs.
+    fast_tiles = (
+        cfgs.serve.skip_full_tile_mask
+        and cfgs.batch_size == 1
+        and kv_len_left is None
+        and global_q_k_gap is None
+    )
+    # exp2 folds sm_scale * log2e into q, which is not a power of two: bf16 q rounds.
+    fold_sm_scale = (
+        fast_tiles
+        and cfgs.serve.scale_q is None
+        and math.frexp(cfgs.model.sm_scale)[0] == 0.5
+    ) or (cfgs.serve.exp2_softmax and cfgs.serve.scale_q is None)
+
+    def compute_and_store(apply_mask: bool):
+        m_val = m_scratch_ref[...]
+        l_val = l_scratch_ref[...]
+        acc_val = acc_scratch_ref[...]
+
+        l_new_list = []
+        m_new_list = []
+        acc_new_list = []
+
+        prev_p = prev_alpha_list = prev_q_slice = None
+        for bq_start in range(0, cfgs.bq_sz, cfgs.bq_c_sz):
+            bq_end = min(bq_start + cfgs.bq_c_sz, cfgs.bq_sz)
+            q_start = bq_start * cfgs.aligned_num_q_heads_per_kv_head
+            q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
+            q_slice = slice(q_start, q_end)
+
+            p, alpha_list, m_next, l_next, m_lanes = (
+                flash_attention.flash_attention_qk_softmax(
+                    step,
+                    q[:, :, q_slice],
+                    k,
+                    m_val[:, q_slice],
+                    l_val[:, q_slice],
+                    schedule_ref.is_last_k,
+                    processed_q_len=processed_q_len,
+                    processed_kv_len=processed_kv_len,
+                    cfgs=cfgs,
+                    bq_start=bq_start,
+                    kv_len_left=kv_len_left,
+                    global_q_k_gap=global_q_k_gap,
+                    apply_mask=apply_mask,
+                    fold_sm_scale=fold_sm_scale,
+                )
             )
-            acc_scratch_ref[:, prev_q_slice] = o_next[-1]
-            acc_new_list.append(o_next)
+            m_scratch_ref[:, q_slice] = m_next
+            if not cfgs.serve.ones_v:
+                l_scratch_ref[:, q_slice] = l_next[-1]
+            l_new_list.append(l_next)
+            m_new_list.append(m_lanes)
 
-        prev_p = p
-        prev_alpha_list = alpha_list
-        prev_q_slice = q_slice
+            if prev_p is not None:
+                o_next = flash_attention.flash_attention_pv(
+                    prev_p,
+                    v,
+                    prev_alpha_list,
+                    acc_val[:, prev_q_slice],
+                    cfgs=cfgs,
+                )
+                acc_scratch_ref[:, prev_q_slice] = o_next[-1]
+                acc_new_list.append(o_next)
 
-    assert prev_p is not None
-    o_next = flash_attention.flash_attention_pv(
-        prev_p,
-        v,
-        prev_alpha_list,
-        acc_val[:, prev_q_slice],
-        cfgs=cfgs,
-    )
-    acc_scratch_ref[:, prev_q_slice] = o_next[-1]
-    acc_new_list.append(o_next)
+            prev_p = p
+            prev_alpha_list = alpha_list
+            prev_q_slice = q_slice
 
-    l_next = jnp.concatenate(l_new_list, axis=2)
-    acc_next = jnp.concatenate(acc_new_list, axis=2)
-    m_lanes = None
-    if cfgs.model.has_attention_sink or cfgs.serve.return_lse:
-        m_lanes = jnp.concatenate(m_new_list, axis=2)
+        assert prev_p is not None
+        o_next = flash_attention.flash_attention_pv(
+            prev_p,
+            v,
+            prev_alpha_list,
+            acc_val[:, prev_q_slice],
+            cfgs=cfgs,
+        )
+        acc_scratch_ref[:, prev_q_slice] = o_next[-1]
+        acc_new_list.append(o_next)
 
-    # Step 4: Write back outputs.
-    calculate_and_store_out(
-        step,
-        schedule_ref,
-        acc_next,
-        l_next,
-        o_vref,
-        m_list=m_lanes,
-        sink_ref=sink_ref,
-        lse_vref=lse_vref,
-        lse_stage_ref=lse_stage_ref,
-        cfgs=cfgs,
-    )
+        l_next = jnp.concatenate(l_new_list, axis=2)
+        acc_next = jnp.concatenate(acc_new_list, axis=2)
+        m_lanes = None
+        if cfgs.model.has_attention_sink or cfgs.serve.return_lse:
+            m_lanes = jnp.concatenate(m_new_list, axis=2)
+
+        calculate_and_store_out(
+            step,
+            schedule_ref,
+            acc_next,
+            l_next,
+            o_vref,
+            m_list=m_lanes,
+            sink_ref=sink_ref,
+            lse_vref=lse_vref,
+            lse_stage_ref=lse_stage_ref,
+            cfgs=cfgs,
+        )
+
+    if not fast_tiles:
+        compute_and_store(apply_mask=True)
+        return
+    full_tile = _full_tile(step, schedule_ref, processed_q_len, processed_kv_len, cfgs)
+
+    @pl.when(full_tile)
+    def _():
+        compute_and_store(apply_mask=False)
+
+    @pl.when(jnp.logical_not(full_tile))
+    def _():
+        compute_and_store(apply_mask=True)
+
+
+def _full_tile(step, schedule_ref, processed_q_len, processed_kv_len, cfgs):
+    # The tile needs no mask when its last key precedes its first query and, with
+    # a sliding window, its last query still sees its first key.
+    is_valid = schedule_ref.s_idx[step, 0] != -1
+    first_q, first_k = processed_q_len[0], processed_kv_len[0]
+    full_tile = jnp.logical_and(is_valid, first_q >= first_k + cfgs.bkv_sz - 1)
+    if cfgs.model.sliding_window is not None:
+        full_tile = jnp.logical_and(
+            full_tile,
+            first_q + cfgs.bq_sz - 1 - first_k < cfgs.model.sliding_window,
+        )
+    return full_tile
 
 
 # Define main kernel.
+
+
+def _carry_scratch_shapes(cfgs: configs.RpaConfigs):
+    if not cfgs.use_transposed:
+        # f32 carries: in bf16 the running sum l stops growing once it exceeds
+        # ~256x a tile's row sum (40% error at 300K keys).
+        return (
+            pltpu.VMEM(cfgs.lm_scratch_shape, dtype=jnp.float32),  # m
+            pltpu.VMEM(cfgs.lm_scratch_shape, dtype=jnp.float32),  # l
+            pltpu.VMEM(cfgs.acc_scratch_shape, dtype=jnp.float32),  # acc
+        )
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    return (
+        pltpu.VMEM(cfgs.mt_scratch_shape, dtype=jnp.float32),  # m, base 2
+        pltpu.VMEM((1, 1, num_lanes), dtype=jnp.float32),  # l rides in acc
+        pltpu.VMEM(cfgs.acct_scratch_shape, dtype=jnp.float32),  # O^T and l
+        pltpu.VMEM(cfgs.qt_scratch_shape, dtype=cfgs.serve.dtype_kv),  # Q^T
+        pltpu.SMEM((2,), dtype=jnp.int32),  # (s_idx, q_idx) of the cached Q^T
+    )
 
 
 def create_allocs(
@@ -558,6 +694,8 @@ def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
         name += "-lse"
     if cfgs.serve.cp_group_size is not None:
         name += f"-cp{cfgs.serve.cp_group_size}"
+    if cfgs.use_transposed:
+        name += "-tr"
     return name
 
 
@@ -661,20 +799,7 @@ def rpa_kernel(
             final_allocs=(q_alloc, kv_cache_alloc, o_alloc, lse_alloc),
             schedule_ref=schedule.RpaSchedule.create_shape_dtype(cfgs).scratch_shapes(),
             dma_sem=pltpu.SemaphoreType.DMA((1,)),
-            scratches=(
-                pltpu.VMEM(
-                    cfgs.lm_scratch_shape,
-                    dtype=cfgs.serve.dtype_out,
-                ),  # m
-                pltpu.VMEM(
-                    cfgs.lm_scratch_shape,
-                    dtype=cfgs.serve.dtype_out,
-                ),  # l
-                pltpu.VMEM(
-                    cfgs.acc_scratch_shape,
-                    dtype=cfgs.serve.dtype_out,
-                ),  # acc
-            ),
+            scratches=_carry_scratch_shapes(cfgs),
             lse_stage=(
                 pltpu.VMEM(cfgs.lse_stage_shape, dtype=jnp.float32)
                 if cfgs.serve.return_lse and cfgs.bq_sz > 1
@@ -695,6 +820,10 @@ def rpa_kernel(
             scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
             scratches[1][...] = jnp.zeros_like(scratches[1])
             scratches[2][...] = jnp.zeros_like(scratches[2])
+            if cfgs.use_transposed:
+                # No (sequence, q block) owns the Q^T scratch yet.
+                scratches[4][0] = -1
+                scratches[4][1] = -1
 
             num_lanes = pltpu.get_tpu_info().num_lanes
             kv_alloc = final_allocs[1]

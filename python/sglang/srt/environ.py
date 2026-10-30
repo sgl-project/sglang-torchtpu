@@ -615,6 +615,13 @@ class Envs:
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
     SGLANG_MAX_NEW_TOKENS_LIMIT = EnvInt(None)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
+    # shortest-prefill-first: a request queued longer than this many seconds goes
+    # ahead of shorter prefills, oldest first; 0 disables aging.
+    SGLANG_SCHEDULE_SPF_MAX_WAIT_S = EnvFloat(0.0)
+    # While a long prompt is mid-prefill, waiting requests whose uncached prefill fits
+    # share each prefill batch with it under any schedule policy; the long prompt keeps at
+    # least this many tokens per batch. 0 disables (only shortest-prefill-first shares).
+    SGLANG_PREFILL_CHUNK_SHARE_MIN_TOKENS = EnvInt(0)
     # Window for the token-weighted recent cache-hit rate used to estimate
     # waiting-queue prefill load.
     SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS = EnvFloat(15.0)
@@ -656,6 +663,12 @@ class Envs:
     # Overlap scheduler and pipeline parallelism
     # ===================================================================
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
+    # --prefill-decode-interval does not defer prefill while no request is
+    # decoding: there is nothing to interleave, so the deferral only idles.
+    SGLANG_PREFILL_DECODE_INTERVAL_SKIP_IDLE = EnvBool(False)
+    # Decode steps before the next chunk of a prompt left mid-prefill; unset waits the full
+    # --prefill-decode-interval, so a long prompt's TTFT grows by one interval per chunk.
+    SGLANG_PREFILL_DECODE_INTERVAL_CHUNKED = EnvInt(None)
     # Force delay_sample_func for all overlap decode (not just grammar mode),
     # allowing CPU result processing to overlap with subsequent forward computation
     # and reducing the impact of sampling overhead on the critical path.
@@ -790,6 +803,9 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # Hybrid-SWA host pools: fraction of --hicache-size given to the SWA pool. Unset splits
+    # by device pool bytes; a cached prefix needs only its last window of SWA KV.
+    SGLANG_HICACHE_SWA_HOST_FRACTION = EnvFloat(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
@@ -1426,6 +1442,9 @@ class Envs:
     # DFlash2 conv on flat [tokens, hidden] rows, the per-group deltas widened to channels
     # by one exact 0/1 matmul per sublayer; needs groups to be a multiple of 128.
     SGLANG_DFLASH_CONV_MATMUL_EXPAND = EnvBool(False)
+    # With --enable-mixed-chunk, a decoding request joins a mixed batch with its whole
+    # DFLASH verify block (drafted first) instead of a single-token decode.
+    SGLANG_DFLASH_MIXED_VERIFY = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

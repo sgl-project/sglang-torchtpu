@@ -191,6 +191,7 @@ def _make_model_runner(
         eagle_draft_num_layers=None,
         eagle_draft_swa_num_layers=None,
         dflash_draft_num_layers=None,
+        dflash_draft_kv_is_swa=False,
     )
 
     return mr
@@ -1250,6 +1251,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
             eagle_draft_num_layers=None,
             dflash_draft_num_layers=5,
             dflash_draft_cell_size_per_token=draft_kv_per_token,
+            dflash_draft_kv_is_swa=False,
         )
 
         target_kv_per_token = 4 * (64 + 64) * 32 * KV_SIZE
@@ -1289,6 +1291,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
                 eagle_draft_num_layers=None,
                 dflash_draft_num_layers=5,
                 dflash_draft_cell_size_per_token=draft_kv_per_token,
+                dflash_draft_kv_is_swa=False,
             )
             with mock_cpu_env():
                 from sglang.srt.model_executor.pool_configurator import (
@@ -1300,6 +1303,39 @@ class TestDflashDraftKvBudget(CustomTestCase):
             return config.full_max_total_num_tokens
 
         self.assertLess(_tokens(10240), _tokens(None))
+
+    def test_hybrid_swa_draft_is_charged_per_swa_token(self):
+        """A draft whose KV lives in the target's SWA slots costs ratio x its bytes."""
+        draft_kv_per_token = 10_240
+        ratio = 0.125
+
+        def _cell_size(draft_kv_is_swa):
+            mr = _make_model_runner(
+                self,
+                is_hybrid_swa=True,
+                full_attention_layer_ids=list(range(16)),
+                swa_attention_layer_ids=list(range(16, 32)),
+                swa_num_kv_heads=4,
+                swa_full_tokens_ratio=ratio,
+            )
+            mr.spec_algorithm.is_dflash_family.return_value = True
+            mr.spec_aux_config = SimpleNamespace(
+                eagle_draft_num_layers=None,
+                dflash_draft_num_layers=5,
+                dflash_draft_cell_size_per_token=draft_kv_per_token,
+                dflash_draft_kv_is_swa=draft_kv_is_swa,
+            )
+            with mock_cpu_env():
+                from sglang.srt.model_executor.pool_configurator import (
+                    create_memory_pool_configurator,
+                )
+
+                return create_memory_pool_configurator(mr)._cell_size
+
+        self.assertEqual(
+            _cell_size(False) - _cell_size(True),
+            draft_kv_per_token * (1 - ratio),
+        )
 
 
 class TestMixedKVFormats(CustomTestCase):
@@ -1360,6 +1396,7 @@ class TestMixedKVFormats(CustomTestCase):
             hf_config=SimpleNamespace(),
             get_num_kv_heads=MagicMock(return_value=3),
             head_dim=64,
+            is_hybrid_swa=False,
         )
         parsed = SimpleNamespace(
             require_num_layers=lambda: 2,

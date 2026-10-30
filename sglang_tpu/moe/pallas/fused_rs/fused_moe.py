@@ -27,11 +27,17 @@ from jax import numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
     _select_fused_rs_block_sizes,
 )
 from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
     gmm_v2_fused_rs as gmm_v2_fused_rs_nodedup,
+)
+from sglang_tpu.moe.pallas.fused_rs.post_combine import (
+    fused_post_combine,
+    pair_post_combine,
+    supports_fused_post_combine,
 )
 from sglang_tpu.moe.pallas.fused_rs.utils import (
     combine_partition_axes,
@@ -134,6 +140,53 @@ def _compute_expert_tp_routing(
     return lhs_indices, group_sizes, lhs_indices, topk_slot_indices
 
 
+def _pair_post_combine(
+    recv: jax.Array,  # [blocks * chunk * topk, ...] receive blocks, rows in owned-row rank order
+    topk_indices: jax.Array,  # [num_tokens, topk], replicated
+    topk_weights: jax.Array,  # [chunk, topk], this rank's tokens
+    post_expert_norm_weight: jax.Array | None,
+    *,
+    my_id: jax.Array,
+    chunk_size: int,
+    topk: int,
+    hidden_size: int,
+) -> jax.Array:
+    """[chunk, hidden]: sum the source blocks, post-expert norm, top-k weighted sum.
+
+    Rank r is the r-th row owned by this rank in the kernel's row order (expert-sorted,
+    then token-sorted); the weighted sum maps ranks back to tokens with a 0/1 matmul.
+    """
+    rows = chunk_size * topk
+    flat_sorted = jnp.argsort(topk_indices.reshape(-1))
+    owned = (flat_sorted // topk) // chunk_size == my_id
+    flat = flat_sorted[jnp.nonzero(owned, size=rows)[0]]
+    token = flat // topk - my_id * chunk_size
+    weight = topk_weights.astype(jnp.float32)[token, flat % topk]
+    out_dtype = jnp.result_type(recv.dtype, topk_weights.dtype)
+    if post_expert_norm_weight is not None and recv.ndim == 3:
+        weighted = pair_post_combine(
+            recv, post_expert_norm_weight, weight, rows=rows, eps=1e-8
+        ).reshape(rows, hidden_size)
+    else:
+        y = jnp.sum(recv.reshape(-1, rows, hidden_size).astype(jnp.float32), axis=0)
+        y = y.astype(recv.dtype).astype(jnp.float32)
+        if post_expert_norm_weight is not None:
+            norm_size = post_expert_norm_weight.shape[0]
+            y = y * (post_expert_norm_weight.astype(jnp.float32) + 1.0)[None, :]
+            y = y * jax.lax.rsqrt(
+                jnp.sum(y * y, axis=-1, keepdims=True) / norm_size + 1e-8
+            )
+        weighted = (y.astype(recv.dtype).astype(jnp.float32) * weight[:, None]).astype(
+            recv.dtype
+        )
+    scatter = (
+        token[None, :] == jnp.arange(chunk_size, dtype=jnp.int32)[:, None]
+    ).astype(weighted.dtype)
+    return jnp.dot(scatter, weighted, preferred_element_type=jnp.float32).astype(
+        out_dtype
+    )
+
+
 # ============================================================================
 # Per-chip MoE body (nodedup kernel variant)
 # ============================================================================
@@ -224,7 +277,13 @@ def moe_gmm_local_rs_nodedup(
             _compute_rs_routing(topk_indices, num_experts=num_experts, topk=topk)
         )
     size_m = lhs_indices.shape[0]
-    _assert_fused_rs_smem_safe(size_m)
+    local_rows = expert_tp and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_LOCAL_ROWS.get()
+    tiled_output = (
+        expert_tp
+        and not fp8_direct_write
+        and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_TILED_REDUCE.get()
+    )
+    _assert_fused_rs_smem_safe(size_m // ep_size if local_rows else size_m)
 
     # Compute local row range [local_start, local_end) without per-row source
     # materialization. Avoids the heavy ``jnp.repeat -> scatter_add``.
@@ -288,6 +347,16 @@ def moe_gmm_local_rs_nodedup(
         dtype=jnp.int32,
     )
 
+    # Below 4096 tokens per call the extra sibling stage costs more than it saves (bench).
+    pair_exchange = (
+        expert_tp
+        and num_tokens >= 4096
+        and local_rows
+        and ep_size % 2 == 0
+        and ep_size >= 4
+        and not fp8_direct_write
+        and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_PAIR_EXCHANGE.get()
+    )
     out_buf = gmm_v2_fused_rs_nodedup(
         hidden_states_local,
         w1,
@@ -313,6 +382,13 @@ def moe_gmm_local_rs_nodedup(
         top_k=kernel_topk,
         fp8_direct_write=fp8_direct_write,
         expert_tp=expert_tp,
+        local_rows=local_rows,
+        tiled_output=tiled_output,
+        row_loop_unroll=tpu_envs.SGLANG_TPU_FUSED_RS_ROW_LOOP_UNROLL.get(),
+        skip_out_zero=expert_tp
+        and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_SKIP_OUT_ZERO.get(),
+        staging_slots=tpu_envs.SGLANG_TPU_FUSED_RS_STAGING_SLOTS.get(),
+        pair_exchange=pair_exchange,
     )
 
     # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
@@ -326,7 +402,45 @@ def moe_gmm_local_rs_nodedup(
             topk_weights, my_id * chunk_size, chunk_size, axis=0
         )
     )
-    if expert_tp:
+    post_expert_norm_weight = post_expert_norm_weight_input if has_post_norm else None
+    if pair_exchange:
+        return _pair_post_combine(
+            out_buf,
+            topk_indices,
+            local_topk_weights,
+            post_expert_norm_weight,
+            my_id=my_id,
+            chunk_size=chunk_size,
+            topk=topk,
+            hidden_size=hidden_size,
+        )
+    if (
+        expert_tp
+        and post_expert_norm_weight is not None
+        and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_FUSED_COMBINE.get()
+        and supports_fused_post_combine(
+            out_buf, chunk_size, post_expert_norm_weight.shape[0]
+        )
+    ):
+        return fused_post_combine(
+            out_buf,
+            post_expert_norm_weight,
+            local_topk_weights,
+            chunk_size=chunk_size,
+            topk=topk,
+            ep_size=ep_size,
+            eps=1e-8,
+        )
+    if expert_tp and out_buf.ndim == 3:
+        # Split rows only: the ep sum reads the kernel's tiled layout in place.
+        out_3d = (
+            out_buf.reshape(chunk_size, topk, ep_size, *out_buf.shape[1:])
+            .astype(jnp.float32)
+            .sum(axis=2)
+            .astype(out_buf.dtype)
+            .reshape(chunk_size, topk, hidden_size)
+        )
+    elif expert_tp:
         out_3d = (
             out_buf.reshape(chunk_size, topk, ep_size, hidden_size)
             .astype(jnp.float32)
@@ -540,6 +654,8 @@ def fused_moe_func_rs(
     group_offset_input: jax.Array | None = None,
     fp8_direct_write: bool = False,
     expert_tp: bool = False,
+    w1_global_scale: jax.Array | None = None,
+    w2_global_scale: jax.Array | None = None,
 ) -> jax.Array:
     """EP MoE with ICI reduce-scatter fused in kernel (gmm_fused_rs).
 
@@ -597,6 +713,8 @@ def fused_moe_func_rs(
         topk=topk,
         mesh=mesh,
         post_expert_norm_weight=post_expert_norm_weight,
+        w1_global_scale=w1_global_scale,
+        w2_global_scale=w2_global_scale,
         fp8_direct_write=fp8_direct_write,
         expert_tp=expert_tp,
     )

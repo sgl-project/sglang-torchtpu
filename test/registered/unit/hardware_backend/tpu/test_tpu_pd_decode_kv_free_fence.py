@@ -127,7 +127,7 @@ def _unfenceable_overrides():
             dict(token_to_kv_pool_allocator=_generic_allocator()),
             "PagedTokenToKVPoolAllocator",
         ),
-        (dict(spec_algorithm=SpeculativeAlgorithm.DFLASH), "DFLASH"),
+        (dict(spec_algorithm=SpeculativeAlgorithm.DSPARK), "DSPARK"),
         (
             dict(
                 spec_algorithm=SpeculativeAlgorithm.EAGLE3, tpu_async_copy_worker=None
@@ -150,15 +150,17 @@ class TestPdDecodeFenceInstall(CustomTestCase):
             scheduler.token_to_kv_pool_allocator.kv_free_fence, scheduler.kv_free_fence
         )
 
-    def test_pd_decode_with_eagle_installs_the_fence_when_the_draft_tail_is_copied(
+    def test_pd_decode_with_draft_kv_installs_the_fence_when_the_draft_tail_is_copied(
         self,
     ):
-        scheduler = _scheduler(
-            spec_algorithm=SpeculativeAlgorithm.EAGLE,
-            tpu_async_copy_worker=SimpleNamespace(copy_draft_tail=True),
-        )
-        scheduler.maybe_init_kv_free_fence()
-        self.assertIsNotNone(scheduler.kv_free_fence)
+        for algorithm in (SpeculativeAlgorithm.EAGLE, SpeculativeAlgorithm.DFLASH):
+            with self.subTest(algorithm=algorithm.name):
+                scheduler = _scheduler(
+                    spec_algorithm=algorithm,
+                    tpu_async_copy_worker=SimpleNamespace(copy_draft_tail=True),
+                )
+                scheduler.maybe_init_kv_free_fence()
+                self.assertIsNotNone(scheduler.kv_free_fence)
 
     def test_no_fence_without_overlap_or_off_decode(self):
         for overrides in (
@@ -199,7 +201,7 @@ class TestPdDecodeFenceInstall(CustomTestCase):
         generic = _generic_allocator()
         for overrides, mode in (
             (dict(token_to_kv_pool_allocator=generic), DisaggregationMode.NULL),
-            (dict(spec_algorithm=SpeculativeAlgorithm.DFLASH), DisaggregationMode.NULL),
+            (dict(spec_algorithm=SpeculativeAlgorithm.DSPARK), DisaggregationMode.NULL),
             (dict(token_to_kv_pool_allocator=generic), DisaggregationMode.DECODE),
             (
                 dict(

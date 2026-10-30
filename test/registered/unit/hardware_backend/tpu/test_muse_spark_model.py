@@ -10,6 +10,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.models.muse_spark import (
     MuseSparkInterleavedRope,
+    MuseSparkTextModel,
     _param_name,
     _to_interleaved_rope,
 )
@@ -103,6 +104,25 @@ class TestMuseSparkConfig(CustomTestCase):
         swa, full = get_hybrid_layer_ids(config.architectures, text)
         self.assertEqual(swa, [0, 2])
         self.assertEqual(full, [1, 3])
+
+
+class TestMuseSparkPipelineAuxRelay(CustomTestCase):
+    def test_relay_over_stages_matches_single_stage_concat(self):
+        """Captures spread over PP stages reach the last stage in capture order."""
+        hidden, tokens = 4, 3
+        capture = [1, 2, 5]
+        layer_outputs = {i: torch.randn(tokens, hidden) for i in range(6)}
+        buffer = None
+        for start, end in ((0, 2), (2, 4), (4, 6)):
+            stage = MuseSparkTextModel.__new__(MuseSparkTextModel)
+            stage.config = MuseSparkConfig().text_config
+            stage.config.hidden_size = hidden
+            stage.start_layer, stage.end_layer = start, end
+            stage.set_layers_to_capture(capture)
+            captured = [layer_outputs[i] for i in capture if start <= i < end]
+            buffer = stage._relay_aux_hidden_states(buffer, captured)
+        expected = torch.cat([layer_outputs[i] for i in capture], dim=-1)
+        self.assertTrue(torch.equal(buffer, expected))
 
 
 if __name__ == "__main__":

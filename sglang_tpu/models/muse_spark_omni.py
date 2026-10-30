@@ -8,14 +8,17 @@ heads cannot be tensor-sharded over the 32 ranks of a four-host engine.
 
 import itertools
 import re
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.managers import mm_utils
 from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.multimodal.mm_utils import (
     get_dp_encoder_lb_assignment,
@@ -235,6 +238,8 @@ class MuseSparkForConditionalGeneration(TextModel):
         self.vision_enabled = bool(get_mm().enable_multimodal)
         if not self.vision_enabled:
             return
+        if self.pp_group.world_size > 1:
+            raise NotImplementedError("Muse Spark PP serves text only")
         from sglang.srt.compilation.support_torch_compile import support_torch_compile
         from sglang_tpu.compilation.decoder_compile_policy import (
             Qwen3VLDecoderTpuCompilePolicy,
@@ -267,12 +272,27 @@ class MuseSparkForConditionalGeneration(TextModel):
         support_torch_compile(self.model.vision_tower, policy=MuseVisionCompilePolicy)
 
     def get_input_embeddings(self):
+        if isinstance(self.model.embed_tokens, PPMissingLayer):
+            return self.model.embed_tokens
         return self._normalized_embedding
 
     @torch.no_grad()
-    def forward(self, input_ids, positions, forward_batch, input_embeds=None):
+    def forward(
+        self,
+        input_ids,
+        positions,
+        forward_batch,
+        input_embeds=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
         if not self.vision_enabled:
-            return super().forward(input_ids, positions, forward_batch, input_embeds)
+            return super().forward(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
         if (
             input_ids is None
             or forward_batch.forward_mode.is_decode()

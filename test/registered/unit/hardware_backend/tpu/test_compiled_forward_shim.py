@@ -129,6 +129,7 @@ def _forward_batch(real_t, real_b, mode="extend", return_logprob=False):
         extend_logprob_start_lens_cpu=([0] * real_b if extend else None),
         forward_mode=_ForwardModeMock(mode),
         return_logprob=return_logprob,
+        mix_verify_width=1,
         dp_padding_mode=None,
         global_num_tokens_cpu=None,
         # Real ForwardBatch always carries spec_info (None when not spec).
@@ -840,6 +841,7 @@ class TestCompiledForwardShim(CustomTestCase):
             "extend_seq_lens_cpu": None,
             "extend_logprob_start_lens_cpu": None,
             "capture_hidden_mode": CaptureHiddenMode.NULL,
+            "mix_verify_width": 1,
         }
         defaults.update(kwargs)
         return SimpleNamespace(**defaults)
@@ -1911,6 +1913,7 @@ class TestShimInputLogprobPath(CustomTestCase):
             extend_seq_lens_cpu=[4, 4],
             extend_logprob_start_lens_cpu=list(starts),
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            mix_verify_width=1,
             input_ids=torch.arange(8, dtype=torch.int32),
             _tpu_real_q=8,
             _tpu_real_b=2,
