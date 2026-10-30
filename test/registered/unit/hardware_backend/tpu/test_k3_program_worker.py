@@ -181,6 +181,25 @@ class TestDecodeSteps(CustomTestCase):
         )
         self.assertIs(colocated.prefill.first_tokens, self.steps.first_tokens)
 
+    def test_extents_stop_at_the_tables(self):
+        # A request at the context limit (4 pages here) under overlap: its
+        # lagging extent would pass the last page the tables hold.
+        prompt = 4 * STEP - 20
+        req = _req("a", prompt=prompt, output=[7], committed=prompt, pool_idx=1, slot=1)
+        r2t = _req_to_token(2, {1: [1, 2, 3, 4]})[:, ::STEP]
+        self.steps.launch([req], r2t, lagging=True)
+        req.output_ids += list(range(18))
+        req.kv.kv_committed_len = 4 * STEP - 3
+        req.kv.kv_allocated_len = 5 * STEP
+        self.steps.launch([req], r2t, lagging=True)
+        table = self.program.inputs[-1].requests[0].block_tables[0].tolist()
+        self.assertEqual(table, [self.plan.kv_block(p) for p in (1, 2, 3, 4)])
+
+    def test_first_tokens_are_bounded_and_flushed(self):
+        self.steps.first_tokens.update({str(i): i for i in range(3)})
+        self.steps.forget_all()
+        self.assertEqual(self.steps.first_tokens, {})
+
     def test_lagging_tables_reach_a_step_further(self):
         # Under overlap scheduling a running request's committed length trails
         # its device position by a step: its tables cover one step more, up
@@ -337,6 +356,10 @@ class TestRegisteredAlgorithm(CustomTestCase):
         synchronous = worker.K3ProgramInput()
         synchronous.merge_batch(worker.K3ProgramInput())
         self.assertIsNone(synchronous.future_indices)
+        with self.assertRaisesRegex(AssertionError, "without future indices"):
+            spec.merge_batch(worker.K3ProgramInput())
+        # The fence's tensor: the copied tokens follow the step's last KV write.
+        self.assertTrue(self.algo.supports_kv_free_fence(copies_draft_tail=False))
 
     def test_overlap_on_the_decoding_roles(self):
         with tpu_envs.SGLANG_TPU_K3_PROGRAM_OPT_OVERLAP.override(True):

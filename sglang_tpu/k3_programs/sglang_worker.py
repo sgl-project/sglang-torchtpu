@@ -51,6 +51,9 @@ logger = logging.getLogger(__name__)
 ALGORITHM = "K3_PROGRAM"
 # Tokens a step returns per request: up to seven accepted drafts and the bonus.
 WIDTH = 8
+# Colocated: prefill first tokens kept for decode steps (far above the requests
+# that can sit between a prefill and their first decode step).
+FIRST_TOKENS_KEPT = 4096
 
 
 def drafts_for(schedule: Sequence[tuple[int, int, int]] | None, batch: int) -> int:
@@ -88,10 +91,12 @@ class K3ProgramInput(SpecInput):
             self.future_indices = self.future_indices[new_indices]
 
     def merge_batch(self, spec_info: K3ProgramInput) -> None:
-        if self.future_indices is None or spec_info.future_indices is None:
-            if self.future_indices is None:
-                self.future_indices = spec_info.future_indices
+        if self.future_indices is None:
+            self.future_indices = spec_info.future_indices
             return
+        assert spec_info.future_indices is not None, (
+            "K3_PROGRAM: merging a batch without future indices under overlap"
+        )
         self.future_indices = torch.cat([self.future_indices, spec_info.future_indices])
 
 
@@ -101,6 +106,12 @@ class K3ProgramAlgo(CustomSpecAlgo):
 
     def need_topk(self) -> bool:
         return False
+
+    def supports_kv_free_fence(self, *, copies_draft_tail: bool) -> bool:
+        # The tokens and accept lengths the result copies derive from the
+        # step's emitted tokens, the output of its last op (which commits the
+        # target's and the draft's KV); the device runs ops in launch order.
+        return True
 
     def create_future_map(
         self,
@@ -335,6 +346,9 @@ class DecodeSteps:
                 num_tokens = computed + len(outputs)
                 end = computed + scheduled
                 token_ids = np.concatenate((prompt, np.asarray(outputs, np.int32)))
+            # Near the context limit the scheduled (and lagging) extent can
+            # pass the last page the tables hold; the program stops there.
+            end = min(end, self.table_width * self.plan.logical_block_tokens)
             requests.append(
                 sglang_step.request_input(
                     rid=req.rid,
@@ -375,6 +389,7 @@ class DecodeSteps:
         self._prompts.drop(self._live)
         self._live = set()
         self._departed.clear()
+        self.first_tokens.clear()
 
 
 class PrefillSteps:
@@ -547,6 +562,10 @@ class PrefillSteps:
                 )
             if finishes and self.first_tokens is not None:
                 self.first_tokens[reqs[i].rid] = int(first[i])
+                # A request that ends at its first token never decodes: keep
+                # only the latest entries (a decode step takes its own).
+                while len(self.first_tokens) > FIRST_TOKENS_KEPT:
+                    del self.first_tokens[next(iter(self.first_tokens))]
         return np.maximum(first, 0)
 
     def forget_all(self) -> None:
