@@ -89,6 +89,20 @@ class SRTPlatform(DeviceMixin):
         """Return the full device-graph backend class for this platform."""
         return None
 
+    def get_weight_update_handlers(self) -> dict[str, Callable[..., Any]]:
+        """Weight transports this platform serves through /plugin_weight_update, by name.
+
+        A handler is the receive half of a weight update, like
+        ``receive_weights_from_distributed``: ``handler(context=PluginWeightUpdateContext,
+        payload=dict)`` runs on every TP rank inside a begin/end_weight_update session and
+        returns the ``(name, tensor)`` pairs it received. The core loads them into the
+        selected runners exactly as /update_weights_from_distributed does. A handler that
+        writes parameters itself (through ``context.runners``) returns ``[]``, so
+        end_weight_update runs post_load_weights, as after peer (p2p) writes. An exception
+        on any rank fails the request on all ranks; the transport owns its timeouts.
+        """
+        return {}
+
     def get_mha_kv_pool_cls(self) -> type:
         """Return the MHA KV pool class for this platform."""
         raise NotImplementedError

@@ -31,6 +31,8 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    PluginWeightUpdateReqInput,
+    PluginWeightUpdateReqOutput,
     PullWeightsReqInput,
     PullWeightsReqOutput,
     ReleaseMemoryOccupationReqInput,
@@ -46,6 +48,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils.weight_checker import overall_checksum
 
@@ -80,6 +83,18 @@ def _parse_runner_selector(selector: str) -> Set[str]:
     )
 
 
+class PluginWeightUpdateContext(msgspec.Struct, frozen=True):
+    """What a platform weight transport sees on one TP rank."""
+
+    # (role, model runner) of each runner the request selects: "target", then any "draft"
+    # runners; read-only, except a transport that writes parameters itself
+    runners: List[Tuple[str, Any]]
+    tp_rank: int
+    tp_size: int
+    # per-rank storage kept across calls (e.g. registered receive buffers)
+    state: Dict[str, Any]
+
+
 class _WeightUpdateSession(msgspec.Struct, frozen=True):
     # recorded at begin so end finalizes the same runners
     selector: str
@@ -99,6 +114,7 @@ class SchedulerWeightUpdaterManager:
     stashed_model_static_state: Any = None
     # replicated on every TP rank, so a rejected call returns on all ranks before any barrier
     _session: Optional[_WeightUpdateSession] = None
+    _plugin_state: Dict[str, Any] = field(default_factory=dict)
     tp_cpu_group: Any = field(init=False)
 
     def __post_init__(self) -> None:
@@ -240,13 +256,9 @@ class SchedulerWeightUpdaterManager:
                 success, message = False, f"Failed to receive weights: {e}"
                 logger.error(message)
             else:
-                success, message = True, "Succeeded to update parameter online."
-                for _, runner in self._select_runners(recv_req.selector):
-                    success, message = (
-                        runner.weight_updater.load_weights_from_distributed(weights)
-                    )
-                    if not success:
-                        break
+                success, message = self._load_into_selected_runners(
+                    weights, recv_req.selector
+                )
             if success:
                 self._session = msgspec.structs.replace(
                     self._session, loaded_weights=True
@@ -256,6 +268,19 @@ class SchedulerWeightUpdaterManager:
             return UpdateWeightsFromDistributedReqOutput(
                 success=success, message=message
             )
+
+    def _load_into_selected_runners(
+        self, weights: List[Tuple[str, torch.Tensor]], selector: str
+    ) -> Tuple[bool, str]:
+        """Load tensors the target runner received into every selected runner."""
+        success, message = True, "Succeeded to update parameter online."
+        for _, runner in self._select_runners(selector):
+            success, message = runner.weight_updater.load_weights_from_distributed(
+                weights
+            )
+            if not success:
+                break
+        return success, message
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors on the selected runners."""
@@ -357,6 +382,72 @@ class SchedulerWeightUpdaterManager:
         self._session = None
         torch.distributed.barrier(group=self.tp_cpu_group)
         return EndWeightUpdateReqOutput(success=True, message="Success")
+
+    def plugin_weight_update(self, recv_req: PluginWeightUpdateReqInput):
+        """Receive weights through a platform transport, then load them as update_weights_from_distributed does."""
+        if self._session is None:
+            return PluginWeightUpdateReqOutput(
+                success=False,
+                message="plugin_weight_update must run between "
+                "begin_weight_update() and end_weight_update()",
+            )
+        handler = current_platform.get_weight_update_handlers().get(recv_req.handler)
+        if handler is None:
+            return PluginWeightUpdateReqOutput(
+                success=False,
+                message=f"this platform has no weight-update handler {recv_req.handler!r}",
+            )
+        context = PluginWeightUpdateContext(
+            runners=self._select_runners(recv_req.selector),
+            tp_rank=get_parallel().tp_rank,
+            tp_size=get_parallel().tp_size,
+            state=self._plugin_state,
+        )
+        with self._observe_weight_load("plugin"):
+            try:
+                weights = handler(context=context, payload=recv_req.payload)
+                error = None
+            except Exception as e:
+                logger.exception("weight transport failed on this TP rank")
+                weights, error = [], f"TP rank {context.tp_rank}: {e}"
+            # no rank loads a bucket another rank failed to receive
+            success, message, _ = self._agree_across_tp_ranks(error=error, value=None)
+            counts = []
+            if success:
+                if weights:
+                    success, message = self._load_into_selected_runners(
+                        weights, recv_req.selector
+                    )
+                success, message, counts = self._agree_across_tp_ranks(
+                    error=None if success else message, value=len(weights)
+                )
+            if success:
+                if any(counts):
+                    self._session = msgspec.structs.replace(
+                        self._session, loaded_weights=True
+                    )
+                self.flush_cache_after_weight_update(recv_req)
+                self.record_weight_version_after_update(recv_req.weight_version)
+            return PluginWeightUpdateReqOutput(
+                success=success,
+                message=message,
+                loaded_tensor_counts=counts if success else [],
+            )
+
+    def _agree_across_tp_ranks(
+        self, *, error: Optional[str], value: Any
+    ) -> Tuple[bool, str, List[Any]]:
+        """Every rank reaches this gather, so one rank's failure fails all of them."""
+        outcomes: List[Any] = [None] * get_parallel().tp_size
+        torch.distributed.all_gather_object(
+            outcomes, (value, error), group=self.tp_cpu_group
+        )
+        errors = [error for _, error in outcomes if error is not None]
+        return (
+            not errors,
+            " | ".join(errors) or "Success",
+            [value for value, _ in outcomes],
+        )
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         scheduler = self.scheduler
