@@ -10,10 +10,12 @@ from __future__ import annotations
 import os
 
 from sglang_tpu._logging import get_logger
+from sglang_tpu.envs import envs as tpu_envs
 
 logger = get_logger(__name__)
 
 _LIBTPU_INIT_ARGS = "LIBTPU_INIT_ARGS"
+_LD_PRELOAD = "LD_PRELOAD"
 
 # Mirror legacy compilation-cache env vars to their renamed counterparts.
 # TODO(wyzhang): Remove after the TorchTPU upgrade completes.
@@ -81,16 +83,21 @@ _DECODE_CP_SPARSE_CORE_OVERRIDES = (
     "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false",
 )
 
-# glibc gives each thread that allocates its own malloc arena (up to 8 per
-# core). XLA compiles on a thread pool, so a cold start spreads its temporary
-# buffers over many arenas, and malloc_trim after warmup cannot return the
-# fragmented pages. On tpu7x TP=8 Qwen3-8B, each rank kept about 1.25 GiB more
-# RSS after a cold start than after a warm one (#1429). Capping the arenas at
-# 8 removed that gap with no measured throughput loss; a cap of 2 cost about
-# 10% throughput. Child processes read the variable when they start, so it
-# applies to every scheduler rank spawned after this override.
-_MALLOC_ARENA_MAX_ENV = "MALLOC_ARENA_MAX"
-_MALLOC_ARENA_MAX_DEFAULT = "8"
+# glibc ptmalloc gives each allocating thread its own arena. XLA compiles on a
+# thread pool, so a cold start spreads its temporary buffers over many arenas,
+# and malloc_trim after warmup cannot return the fragmented pages: each TP rank
+# kept about 1.25 GiB more RSS after a cold start than after a warm one
+# (#1817). TorchTPU also warns that ptmalloc contention slows its host work
+# (torch_tpu/_tcmalloc_check.py). Preloading tcmalloc into the scheduler ranks
+# removes the gap without slowing compilation, unlike capping MALLOC_ARENA_MAX.
+# The ranks are spawned after this override and read LD_PRELOAD when they
+# exec; the launcher process itself keeps its allocator.
+_TCMALLOC_LIBRARIES = (
+    "/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4",
+    "/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4",
+    "/usr/lib/aarch64-linux-gnu/libtcmalloc_minimal.so.4",
+    "/usr/lib/aarch64-linux-gnu/libtcmalloc.so.4",
+)
 
 # Smallest KV pool (in tokens) observed safe with the default prefetch depth
 # on the largest supported dense stack (36-layer gpt-oss at TP=8): 4096 pages
@@ -132,10 +139,35 @@ def _set_renamed_compilation_cache_envs() -> list[str]:
     return added
 
 
+def _preload_tcmalloc_for_spawned_ranks() -> str | None:
+    """Add tcmalloc to LD_PRELOAD for processes spawned after this call.
+
+    Returns the library added, or None when it is disabled, already preloaded,
+    or not installed. An existing LD_PRELOAD is kept after tcmalloc.
+    """
+    if not tpu_envs.SGLANG_TPU_PRELOAD_TCMALLOC.get():
+        return None
+    preload = os.environ.get(_LD_PRELOAD, "")
+    if "tcmalloc" in preload:
+        return None
+    library = next((path for path in _TCMALLOC_LIBRARIES if os.path.exists(path)), None)
+    if library is None:
+        logger.warning(
+            "TPU env_override: libtcmalloc is not installed, so scheduler ranks "
+            "use glibc malloc and keep about 1.25 GiB more RSS each after a "
+            "cold start (#1817). Install libtcmalloc-minimal4 to fix it."
+        )
+        return None
+    os.environ[_LD_PRELOAD] = f"{library}:{preload}" if preload else library
+    return library
+
+
 def apply_tpu_env_overrides() -> None:
     """Apply TPU env overrides."""
     os.environ.setdefault("TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS", "1")
-    os.environ.setdefault(_MALLOC_ARENA_MAX_ENV, _MALLOC_ARENA_MAX_DEFAULT)
+    preloaded = _preload_tcmalloc_for_spawned_ranks()
+    if preloaded:
+        logger.info("TPU env_override preloads %s for spawned ranks", preloaded)
     added = _set_renamed_compilation_cache_envs()
     if added:
         logger.info(
