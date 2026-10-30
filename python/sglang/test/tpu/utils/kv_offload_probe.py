@@ -109,6 +109,7 @@ def plan_eviction(
     probe_tokens: int,
     hicache_ratio: float,
     tail_tokens: int = 0,
+    swa_full_tokens_ratio: float = 1.0,
 ) -> EvictionPlan:
     """Size the filler run, or refuse a config that cannot prove anything.
 
@@ -117,9 +118,15 @@ def plan_eviction(
     as well, and the reload silently becomes a recompute that still looks like a
     pass. Both ends are arithmetic, so both are settled here rather than on the
     hardware.
+
+    ``device_pool_tokens`` is the full-attention pool (``max_total_num_tokens``).
+    A hybrid SWA model also holds a sliding-window pool of
+    ``swa_full_tokens_ratio`` times that size, each pool gets its own host pool of
+    ``hicache_ratio`` times itself, and a page lives in both, so the smaller SWA
+    host pool is the one the fillers must not overflow.
     """
     num_fillers = math.ceil(_EVICTION_MARGIN * device_pool_tokens / probe_tokens)
-    host_pool_tokens = int(device_pool_tokens * hicache_ratio)
+    host_pool_tokens = int(device_pool_tokens * hicache_ratio * swa_full_tokens_ratio)
     backed_up_tokens = probe_tokens * (num_fillers + 1) + tail_tokens
     if host_pool_tokens < backed_up_tokens:
         raise ValueError(

@@ -14,8 +14,8 @@ import os
 import socket
 import subprocess
 import sys
-import time
 import unittest
+import urllib.error
 import urllib.request
 from collections.abc import Mapping
 from typing import Any
@@ -24,6 +24,13 @@ import msgspec
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu.evals.eval_support import wait_for_health
+from sglang.test.tpu.utils.kv_offload_probe import (
+    EvictionPlan,
+    plan_eviction,
+    probe_prompt,
+    run_probe,
+    validate_probe,
+)
 from sglang.test.tpu.utils.pd_singlehost_base import PDSingleHostTestCase
 
 register_tpu_ci(
@@ -71,9 +78,13 @@ PREFILL_LOG = "/tmp/pd_block_major_prefill.log"
 DECODE_LOG = "/tmp/pd_block_major_decode.log"
 
 PAGE_SIZE = 64
-# The recipe's max_total_tokens on each engine; a hybrid SWA engine splits it
-# between its full and SWA device pools.
+# The recipe's max_total_tokens on each engine. The running engine splits it into
+# a full and an SWA device pool, so the probe reads the pools from /server_info.
 MAX_TOTAL_TOKENS = 393216
+# Words in the probe prompt and in each filler, about one token each.
+PROBE_TOKENS = int(E("CACHE_PROBE_TOKENS", "2048"))
+# /flush_cache waits this long for the prefill engine to go idle.
+FLUSH_TIMEOUT_S = 300
 DISAGG_TRANSFER_BACKEND = "raiden"
 # Raiden handles P/D KV transfer, the prefill host tier and decode host-pool I/O.
 HICACHE_IO_BACKEND = "raiden"
@@ -84,8 +95,6 @@ BUNDLE_LINE = "Allocating block-major TPU KV bundle"
 FUSED_LINE = "Allocating fused TPU KV buffers"
 # Logged by sglang_tpu/raiden_transfer.py when the host tier is up.
 RAIDEN_READY_MARKER = "Raiden KV transfer ready"
-
-GENERATE_TIMEOUT = 900
 
 # Measured 0.97 accuracy on this topology; 0.80 serves as the CI passing floor.
 GSM8K_BASELINE = float(E("GSM8K_THRESHOLD_GPT_OSS_120B", E("GSM8K_THRESHOLD", "0.80")))
@@ -258,337 +267,100 @@ def raiden_engaged_runner(*, log_path: str):
     return run
 
 
-class CacheProbeConfig(msgspec.Struct, frozen=True, kw_only=True):
-    page_size: int
-    # None reads the full device pool from the prefill engine's /server_info.
-    device_pool_tokens: int | None
-    target_words: int
-    filler_words: int
-    # None sizes the churn from the first filler's measured token count.
-    num_fillers: int | None
-    max_new_tokens: int
+def flush_prefill_cache(prefill_url: str) -> None:
+    """Empty the prefill's radix tree and host pool once the engine is idle.
 
-    @classmethod
-    def from_env(cls, env: Mapping[str, str] | None = None) -> "CacheProbeConfig":
-        values = os.environ if env is None else env
-        fillers_raw = values.get("CACHE_PROBE_NUM_FILLERS")
-        device_raw = values.get("CACHE_PROBE_DEVICE_TOKENS")
-        return cls(
-            page_size=PAGE_SIZE,
-            device_pool_tokens=None if device_raw is None else int(device_raw),
-            target_words=int(values.get("CACHE_PROBE_TARGET_WORDS", "2048")),
-            filler_words=int(values.get("CACHE_PROBE_FILLER_WORDS", "2048")),
-            num_fillers=None if fillers_raw is None else int(fillers_raw),
-            # Room for all four copied item lines plus any preamble.
-            max_new_tokens=int(values.get("CACHE_PROBE_MAX_NEW_TOKENS", "64")),
-        )
-
-
-class ProbePools(msgspec.Struct, frozen=True, kw_only=True):
-    device_tokens: int
-    host_tokens: int
-
-
-def probe_pools(
-    info: Mapping[str, Any], *, device_override: int | None = None
-) -> ProbePools:
-    """Read the prefill engine's full device pool and its smaller host pool.
-
-    HiCache sizes each host pool as hicache_ratio times its device pool, and the
-    SWA device pool is swa_full_tokens_ratio times the full one.
+    This goes to the prefill engine, not the router: the router's /flush_cache
+    reports 200 even when an engine refused. The timeout makes the engine wait
+    for idle; a flush without one skips that check and can free KV that a P/D
+    transfer is still reading.
     """
-    device = device_override or int(info["max_total_num_tokens"])
-    swa_share = min(1.0, float(info["swa_full_tokens_ratio"]))
-    host = int(device * float(info["hicache_ratio"]) * swa_share)
-    return ProbePools(device_tokens=device, host_tokens=host)
+    request = urllib.request.Request(
+        f"{prefill_url.rstrip('/')}/flush_cache?timeout={FLUSH_TIMEOUT_S}",
+        data=b"",
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=FLUSH_TIMEOUT_S + 60) as r:
+            r.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            f"prefill /flush_cache failed with HTTP {exc.code}: {body}"
+        ) from exc
 
 
-def host_overflow_failure(
-    *, num_fillers: int, filler_tokens: int, target_tokens: int, host_pool_tokens: int
-) -> str | None:
-    """Refuse a churn that would push the target out of the host tier as well.
+def tokenize(prefill_url: str, text: str) -> list[int]:
+    """Token ids of ``text`` without special tokens, from the prefill engine."""
+    response = _post_json(
+        f"{prefill_url.rstrip('/')}/tokenize",
+        {"model": SERVED_MODEL_NAME, "prompt": text, "add_special_tokens": False},
+        timeout=600,
+    )
+    return response["tokens"]
 
-    Write-through backs up the target and every filler, and the host tier evicts
-    LRU, so past its capacity the reload becomes a recompute that reports host=0.
+
+def eviction_plan(info: Mapping[str, Any], *, probe_tokens: int) -> EvictionPlan:
+    """Size the churn from the prefill engine's /server_info.
+
+    GPT-OSS is a hybrid SWA model, so the plan takes the SWA share: the host
+    pool behind the smaller SWA device pool is the one the fillers must not
+    overflow, or the reload reads host=0 and looks like a broken transfer.
     """
-    backed_up = num_fillers * filler_tokens + target_tokens
-    if backed_up <= host_pool_tokens:
-        return None
-    return (
-        f"churn backs up {backed_up} tokens but the host tier holds "
-        f"{host_pool_tokens}, so the target would be evicted from host too; "
-        "raise HICACHE_RATIO or set CACHE_PROBE_NUM_FILLERS lower"
+    return plan_eviction(
+        device_pool_tokens=int(info["max_total_num_tokens"]),
+        probe_tokens=probe_tokens,
+        hicache_ratio=float(info["hicache_ratio"]),
+        swa_full_tokens_ratio=float(info["swa_full_tokens_ratio"]),
     )
 
 
-def churn_fillers_needed(
-    *, measured_filler_tokens: int, device_pool_tokens: int
-) -> int:
-    """Fillers that push 2x the device pool through the cache.
-
-    Sized from a measured filler's token count; a churn that runs short of the
-    pool never evicts, and the host-reload leg then tests nothing.
-    """
-    if measured_filler_tokens <= 0:
-        raise AssertionError(
-            f"measured filler prompt_tokens={measured_filler_tokens}; cannot "
-            "size the churn"
-        )
-    return (2 * device_pool_tokens) // measured_filler_tokens + 1
-
-
-_VOCAB = (
-    "the of and to in a is that for it as was with on be by at this from but not "
-    "are or his they she had which were we when your can said there use each "
-    "their time will how other about many then them these so some her would make "
-    "like him into has two more very after our just name good through where help "
-    "much before line right too mean old"
-).split()
-
-
-def make_prompt(index: int, nwords: int) -> str:
-    seed = (index + 1) * 2654435761 & 0xFFFFFFFF
-    words = []
-    for _ in range(nwords):
-        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-        words.append(_VOCAB[seed % len(_VOCAB)])
-    return f"Document {index} header alpha{index} beta{index * 7}. " + " ".join(words)
-
-
-_ITEM_NOUNS = (
-    "lantern kettle walnut anchor violet magnet saddle donkey harbor pencil "
-    "quartz turnip magpie helmet donkey copper barrel falcon garnet hammer "
-    "island jasper kitten locket mirror needle onward parrot quiver ribbon "
-    "sombra tundra"
-).split()
-
-
-def make_target_prompt(nwords: int) -> tuple[str, tuple[int, ...]]:
-    """A numbered item list ending in a verbatim copy instruction.
-
-    The greedy continuation is forced: the model repeats four distinctive lines
-    read through full attention from the queried positions' KV, so a text
-    difference between cached passes means the KV values themselves changed.
-    """
-    num_items = max(40, nwords // 6)
-    lines = []
-    for i in range(1, num_items + 1):
-        noun = _ITEM_NOUNS[(i * 2654435761 & 0xFFFFFFFF) % len(_ITEM_NOUNS)]
-        lines.append(f"item {i}: {noun}-{i * 7 % 97}")
-    queried = (
-        num_items // 8,
-        num_items // 3,
-        (2 * num_items) // 3,
-        num_items - 5,
-    )
-    ask = ", ".join(str(q) for q in queried)
-    prompt = (
-        "Below is a list of items.\n"
-        + "\n".join(lines)
-        + f"\nOutput items {ask} from the list above exactly as written, "
-        "one per line, and nothing else.\nAnswer:\nitem "
-    )
-    return prompt, queried
-
-
-class GenerationRecord(msgspec.Struct, frozen=True, kw_only=True):
-    text: str
-    prompt_tokens: int
-    completion_tokens: int
-    device_cached_tokens: int
-    host_cached_tokens: int
-    latency_seconds: float
-
-
-def _generate(base_url: str, prompt: str, max_new_tokens: int) -> GenerationRecord:
-    started = time.perf_counter()
-    payload = _post_json(
-        f"{base_url}/generate",
-        {
-            "text": prompt,
-            "sampling_params": {"temperature": 0.0, "max_new_tokens": max_new_tokens},
-        },
-        timeout=GENERATE_TIMEOUT,
-    )
-    meta = payload.get("meta_info") or {}
-    details = meta.get("cached_tokens_details") or {}
-    return GenerationRecord(
-        text=payload["text"],
-        prompt_tokens=int(meta.get("prompt_tokens") or 0),
-        completion_tokens=int(meta.get("completion_tokens") or 0),
-        device_cached_tokens=int(details.get("device") or 0),
-        host_cached_tokens=int(details.get("host") or 0),
-        latency_seconds=round(time.perf_counter() - started, 3),
-    )
-
-
-def _flush_cache(url: str) -> None:
-    with urllib.request.urlopen(f"{url}/flush_cache", timeout=60) as r:
-        r.read()
-
-
-# Restored KV is judged on the first characters only (see RECIPES.md).
-DIVERGENCE_CHARS = 8
-
-
-def _diverges(a: str, b: str) -> bool:
-    return a[:DIVERGENCE_CHARS] != b[:DIVERGENCE_CHARS]
-
-
-def validate_cache_probe(
-    *,
-    cold: GenerationRecord,
-    device_hit: GenerationRecord,
-    host_reload: GenerationRecord,
-    post_reload_hit: GenerationRecord,
-    page_size: int,
-) -> list[str]:
-    """The device-hit, churn, host-reload oracle.
-
-    The three cached passes run the same extend shape over the same stored
-    prefix KV, so their greedy text must agree over the first DIVERGENCE_CHARS
-    characters; the TPU stack is not run-to-run deterministic past that, so
-    full equality is printed, not gated. The cold pass runs a different extend
-    shape and is held to cache-state and liveness only.
-    """
-    if cold.prompt_tokens < 2 * page_size:
-        return [f"target prompt too short: {cold.prompt_tokens} tokens"]
-    if cold.device_cached_tokens or cold.host_cached_tokens:
-        return [
-            "cold request unexpectedly hit cache: "
-            f"device={cold.device_cached_tokens} host={cold.host_cached_tokens}"
-        ]
-    if not cold.text.strip() or cold.completion_tokens <= 0:
-        return ["cold request produced no decode output: P/D KV transfer broken"]
-
-    failures = []
-    expected = max(page_size, (cold.prompt_tokens // page_size - 1) * page_size)
-    if device_hit.device_cached_tokens < expected:
-        failures.append(
-            "immediate resend missed the device prefix cache: "
-            f"device={device_hit.device_cached_tokens} expected>={expected}"
-        )
-    if device_hit.host_cached_tokens:
-        failures.append(
-            f"immediate resend loaded from host: {device_hit.host_cached_tokens}"
-        )
-    if not device_hit.text.strip() or device_hit.completion_tokens <= 0:
-        failures.append("device-hit request produced no decode output")
-
-    if host_reload.host_cached_tokens <= 0:
-        failures.append(
-            "target was not reloaded from the host tier after churn: "
-            "KV offload never engaged"
-        )
-    if host_reload.device_cached_tokens + host_reload.host_cached_tokens < expected:
-        failures.append(
-            "host reload did not recover the cached prefix: "
-            f"device={host_reload.device_cached_tokens} "
-            f"host={host_reload.host_cached_tokens} expected>={expected}"
-        )
-    # A reload that raced its own host->device DMA reads clean once the pages
-    # settle; corrupt values stay wrong on the post-reload pass.
-    if _diverges(host_reload.text, device_hit.text):
-        if not _diverges(post_reload_hit.text, device_hit.text):
-            failures.append(
-                "host-reloaded copy output diverged from the device-hit pass but "
-                "the post-reload resend matches: the reload raced its own "
-                "host->device transfer"
-            )
-        else:
-            failures.append(
-                "host-reloaded copy output diverged from the device-hit pass: "
-                "the offloaded KV pages did not survive the host round trip"
-            )
-    elif _diverges(post_reload_hit.text, device_hit.text):
-        failures.append(
-            "post-reload resend diverged from the device-hit pass: the reloaded "
-            "device-resident pages hold different KV values"
-        )
-    return failures
-
-
-def run_cache_probe(
-    *, base_url: str, flush_url: str, config: CacheProbeConfig
-) -> dict[str, Any]:
-    """Run the four probe passes and the churn between them through the router."""
-    _flush_cache(flush_url)
-    pools = probe_pools(
-        _get_json(f"{flush_url}/server_info"),
-        device_override=config.device_pool_tokens,
-    )
-    target, queried = make_target_prompt(config.target_words)
-    print(f"[pd-block-major] cache probe target queries items {queried}", flush=True)
-    cold = _generate(base_url, target, config.max_new_tokens)
-    device_hit = _generate(base_url, target, config.max_new_tokens)
-
-    first_filler = _generate(base_url, make_prompt(1000, config.filler_words), 1)
-    num_fillers = config.num_fillers
-    if num_fillers is None:
-        num_fillers = churn_fillers_needed(
-            measured_filler_tokens=first_filler.prompt_tokens,
-            device_pool_tokens=pools.device_tokens,
-        )
-    print(
-        f"[pd-block-major] churn: {num_fillers} fillers x "
-        f"{first_filler.prompt_tokens} tokens against a "
-        f"{pools.device_tokens}-token device pool and a "
-        f"{pools.host_tokens}-token host pool",
-        flush=True,
-    )
-    overflow = host_overflow_failure(
-        num_fillers=num_fillers,
-        filler_tokens=first_filler.prompt_tokens,
-        target_tokens=cold.prompt_tokens,
-        host_pool_tokens=pools.host_tokens,
-    )
-    if overflow:
-        return {"score": 0.0, "_passed": False, "_failures": [overflow]}
-    for index in range(1, num_fillers):
-        _generate(base_url, make_prompt(1000 + index, config.filler_words), 1)
-    host_reload = _generate(base_url, target, config.max_new_tokens)
-    post_reload_hit = _generate(base_url, target, config.max_new_tokens)
-
-    # Printed before validation so a failed oracle still carries every pass.
-    print(
-        json.dumps(
-            {
-                "cache_probe": "pd_block_major",
-                "cold": msgspec.to_builtins(cold),
-                "device_hit": msgspec.to_builtins(device_hit),
-                "host_reload": msgspec.to_builtins(host_reload),
-                "post_reload_hit": msgspec.to_builtins(post_reload_hit),
-            },
-            sort_keys=True,
-        ),
-        flush=True,
-    )
-    failures = validate_cache_probe(
-        cold=cold,
-        device_hit=device_hit,
-        host_reload=host_reload,
-        post_reload_hit=post_reload_hit,
-        page_size=config.page_size,
-    )
-    print(
-        f"[pd-block-major] cache probe device_hit={device_hit.device_cached_tokens} "
-        f"host_reload={host_reload.host_cached_tokens} "
-        f"identical_text={host_reload.text == device_hit.text == post_reload_hit.text} "
-        f"failures={len(failures)}",
-        flush=True,
-    )
-    return {
-        "score": float(host_reload.host_cached_tokens),
-        "_passed": not failures,
-        "_failures": failures,
-    }
-
-
-def cache_probe_runner(*, flush_url: str, config: CacheProbeConfig):
+def cache_probe_runner(*, prefill_url: str, probe_tokens: int):
     """Score the device-hit, churn, host-reload round trip through the router."""
 
     def run(base_url: str) -> dict[str, Any]:
-        return run_cache_probe(base_url=base_url, flush_url=flush_url, config=config)
+        flush_prefill_cache(prefill_url)
+        info = _get_json(f"{prefill_url}/server_info")
+        probe_ids = tokenize(
+            prefill_url, probe_prompt(index=0, approx_tokens=probe_tokens)
+        )
+        plan = eviction_plan(info, probe_tokens=len(probe_ids))
+        print(
+            f"[pd-block-major] cache probe: {len(probe_ids)}-token probe, "
+            f"{plan.num_fillers} fillers against a "
+            f"{info['max_total_num_tokens']}-token full device pool and a "
+            f"{plan.host_pool_tokens}-token SWA host pool",
+            flush=True,
+        )
+        probe = run_probe(
+            base_url=base_url,
+            test_name=RUN_NAME,
+            probe_tokens=probe_tokens,
+            plan=plan,
+            flush_cache=False,
+        )
+        failures = validate_probe(probe=probe, page_size=PAGE_SIZE, plan=plan)
+        print(
+            json.dumps(
+                {
+                    "cache_probe": "pd_block_major",
+                    "probe_tokens": len(probe_ids),
+                    "num_fillers": plan.num_fillers,
+                    "host_pool_tokens": plan.host_pool_tokens,
+                    "cold": msgspec.to_builtins(probe.cold),
+                    "device_hit": msgspec.to_builtins(probe.warm),
+                    "host_reload": msgspec.to_builtins(probe.reload),
+                    "failures": failures,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return {
+            "score": float(probe.reload.host_tokens),
+            "_passed": not failures,
+            "_failures": failures,
+        }
 
     return run
 
@@ -617,7 +389,7 @@ def build_model_config() -> dict[str, Any]:
                 "dataset": "prefix_cache_kv_offload",
                 "label": "prefix-cache-kv-offload",
                 "runner": cache_probe_runner(
-                    flush_url=prefill_url, config=CacheProbeConfig.from_env()
+                    prefill_url=prefill_url, probe_tokens=PROBE_TOKENS
                 ),
             },
             {
@@ -830,91 +602,25 @@ class TestPdSingleHostBlockMajorGptOss120bConfiguration(unittest.TestCase):
         self.assertEqual(len(none), 1)
         self.assertIn("no block-major bundle", none[0])
 
-    def test_cache_probe_oracle(self) -> None:
-        def record(**overrides) -> GenerationRecord:
-            fields = {
-                "text": "1: lantern-7\nitem 2",
-                "prompt_tokens": 2048,
-                "completion_tokens": 8,
-                "device_cached_tokens": 0,
-                "host_cached_tokens": 0,
-                "latency_seconds": 1.0,
-            }
-            return GenerationRecord(**{**fields, **overrides})
-
-        cold = record()
-        hit = record(device_cached_tokens=1984)
-        reload = record(host_cached_tokens=1984)
-        self.assertEqual(
-            validate_cache_probe(
-                cold=cold,
-                device_hit=hit,
-                host_reload=reload,
-                post_reload_hit=hit,
-                page_size=PAGE_SIZE,
-            ),
-            [],
-        )
-        for name, kwargs in (
-            ("never engaged", {"host_reload": record(device_cached_tokens=1984)}),
-            ("missed the device", {"device_hit": record()}),
-            (
-                "raced its own",
-                {"host_reload": record(host_cached_tokens=1984, text="1: kettle")},
-            ),
-            (
-                "did not survive",
-                {
-                    "host_reload": record(host_cached_tokens=1984, text="1: kettle"),
-                    "post_reload_hit": record(
-                        device_cached_tokens=1984, text="1: kettle"
-                    ),
-                },
-            ),
-        ):
-            with self.subTest(name=name):
-                failures = validate_cache_probe(
-                    **{
-                        "cold": cold,
-                        "device_hit": hit,
-                        "host_reload": reload,
-                        "post_reload_hit": hit,
-                        **kwargs,
-                    },
-                    page_size=PAGE_SIZE,
-                )
-                self.assertTrue(any(name in f for f in failures), failures)
-        self.assertEqual(
-            churn_fillers_needed(measured_filler_tokens=2048, device_pool_tokens=4096),
-            5,
-        )
-
-    def test_churn_stays_inside_the_host_tier(self) -> None:
-        # max_total_tokens covers the full and SWA pools together; a churn sized
-        # from it overflows the host tier, and the reload reads host=0.
+    def test_eviction_plan_takes_the_swa_host_pool(self) -> None:
+        # max_total_tokens is the full pool; the SWA pool and its host pool are
+        # swa_full_tokens_ratio times smaller, and a page is backed up to both.
         info = {
             "max_total_num_tokens": 220096,
             "swa_full_tokens_ratio": 0.8,
             "hicache_ratio": 3.0,
         }
-        pools = probe_pools(info)
-        self.assertEqual(pools.device_tokens, 220096)
-        self.assertEqual(pools.host_tokens, 528230)
-
-        def overflow(device_pool_tokens: int) -> str | None:
-            return host_overflow_failure(
-                num_fillers=churn_fillers_needed(
-                    measured_filler_tokens=2060,
-                    device_pool_tokens=device_pool_tokens,
-                ),
-                filler_tokens=2060,
-                target_tokens=2865,
-                host_pool_tokens=pools.host_tokens,
-            )
-
-        self.assertIsNone(overflow(pools.device_tokens))
-        self.assertIn("evicted from host", overflow(MAX_TOTAL_TOKENS) or "")
-        self.assertEqual(probe_pools(info, device_override=4096).device_tokens, 4096)
+        plan = eviction_plan(info, probe_tokens=2060)
+        self.assertEqual(plan.host_pool_tokens, 528230)
+        self.assertLessEqual(plan.backed_up_tokens, plan.host_pool_tokens)
+        self.assertEqual(
+            plan.num_fillers,
+            plan_eviction(
+                device_pool_tokens=220096, probe_tokens=2060, hicache_ratio=3.0
+            ).num_fillers,
+        )
+        with self.assertRaisesRegex(ValueError, "evicted from host"):
+            eviction_plan(dict(info, hicache_ratio=1.2), probe_tokens=2060)
 
     # Skip in runtime images, which do not contain the renderer.
     @unittest.skipUnless(
