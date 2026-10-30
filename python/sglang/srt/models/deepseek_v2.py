@@ -1327,6 +1327,27 @@ class DeepseekV2MoE(nn.Module):
         # hidden in the decoder layer (before the dp gather) and added after the
         # reduce_scatterv. When set, never compute/add it here (on the global buffer).
         shared_output = None
+        if (
+            _is_tpu
+            and not skip_shared_experts
+            and not use_vision_topk
+            and not getattr(self, "is_hash", False)
+        ):
+            from sglang_tpu.moe.pallas.fused_moe_decode.fused_moe_decode_op import (
+                apply_fused_moe_decode,
+                should_use_fused_moe_decode,
+            )
+
+            if should_use_fused_moe_decode(self, hidden_states):
+                router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=dispatch_info,
+                )
+                return apply_fused_moe_decode(self, hidden_states, topk_output)
+
         if hidden_states.shape[0] > 0:
             # Quantize-once (SGLANG_OPT_MOE_QUANT_ONCE): only worthwhile when
             # the shared expert also runs here on the same tensor.
@@ -2869,7 +2890,20 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             _mlp_ctx = nullcontext()
 
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit, _mlp_ctx:
+        _fmd_summed = False
+        if _is_tpu and isinstance(self.mlp, DeepseekV2MoE):
+            from sglang_tpu.moe.pallas.fused_moe_decode.fused_moe_decode_op import (
+                should_use_fused_moe_decode,
+            )
+
+            _fmd_summed = should_use_fused_moe_decode(self.mlp, hidden_states)
+
+        with (
+            self.ffn_boundary.exit(
+                forward_batch, summed_by_compute=_fmd_summed
+            ) as ffn_exit,
+            _mlp_ctx,
+        ):
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,

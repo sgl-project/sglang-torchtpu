@@ -955,13 +955,23 @@ class Glm5NextDecoderLayer(nn.Module):
         else:
             _mlp_ctx = nullcontext()
 
+        _fmd_summed = False
+        if isinstance(self.mlp, Glm5NextMoE) and hidden_states.device.type == "tpu":
+            from sglang_tpu.moe.pallas.fused_moe_decode.fused_moe_decode_op import (
+                should_use_fused_moe_decode,
+            )
+
+            _fmd_summed = should_use_fused_moe_decode(self.mlp, hidden_states)
+
         with _mlp_ctx:
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,
                 gemm_output_zero_allocator,
             )
-        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(
+            hidden_states, forward_batch, summed_by_compute=_fmd_summed
+        )
 
         return (hidden_states, topk_indices)
 

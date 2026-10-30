@@ -130,6 +130,9 @@ class _MoeRunnerBackendPredicates:
     def is_pallas_tpu_fused_rs(self):
         return self.value == MoeRunnerBackend.PALLAS_TPU_FUSED_RS.value
 
+    def is_pallas_tpu_fused_decode(self):
+        return self.value == MoeRunnerBackend.PALLAS_TPU_FUSED_DECODE.value
+
     def is_deep_gemm(self):
         return self.value == MoeRunnerBackend.DEEP_GEMM.value
 
@@ -214,6 +217,7 @@ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     HPC_OPS = "hpc_ops"
     PALLAS_TPU = "pallas_tpu"
     PALLAS_TPU_FUSED_RS = "pallas_tpu_fused_rs"
+    PALLAS_TPU_FUSED_DECODE = "pallas_tpu_fused_decode"
     INTEL_XPU = "intel_xpu"
 
 
