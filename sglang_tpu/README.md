@@ -135,13 +135,17 @@ and release startup file-cache pages. This also covers direct `Engine` and Rust
 launches without a `/freeze_gc` request. Each host scans its files once per cleanup
 pass; all ranks finish before the handshake returns.
 
-The existing `/freeze_gc` request repeats file-cache release to cover files used
-or created by subsequent warmup, clears JAX tracing caches, then collects garbage, freezes GC and trims freed
-host heap pages. Python HTTP startup waits for this second pass before reporting
-readiness. Direct `Engine` callers can also call `freeze_gc()` after their own
-warmup. Keeping cleanup in this lifecycle ensures temporary objects are collected
-before `gc.freeze()` retains the remaining objects. Explicit `/freeze_gc` calls
-also run the cleanup hooks.
+The existing `/freeze_gc` request repeats compiler-artifact cleanup to cover files
+used or created by subsequent warmup, then clears export records and JAX caches,
+collects garbage, freezes GC and trims freed host heap pages. Checkpoint eviction
+is completed by scheduler readiness and is not repeated during this pass. Python
+HTTP startup waits for this second pass before reporting readiness. Direct
+`Engine` callers can also call `freeze_gc()` after their own warmup. Keeping cleanup
+in this lifecycle ensures temporary objects are collected before `gc.freeze()`
+retains the remaining objects. Explicit `/freeze_gc` calls also run the cleanup
+hooks. Under PP the stages dispatch the freeze in different loop iterations, so
+each rank cleans up without a world barrier: only the lock-guarded native compiler
+cache is removed, and the reply does not wait for the other stages.
 
 Attention DP with shared MLP scheduling requires global control broadcasts:
 `--enable-dp-attention-local-control-broadcast` and elastic EP scaling are rejected
@@ -154,12 +158,13 @@ cache pages. Both releases default on. The compiler cache namespace comes from
 `TORCH_TPU_TIER2_COMPILATION_CACHE` (legacy:
 `TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE`); empty or unset selects `default`,
 and `disabled` skips it. Other namespaces are untouched. Disk-backed files are
-advised with `POSIX_FADV_DONTNEED` and remain on disk; tmpfs/ramfs are skipped.
+advised with `POSIX_FADV_DONTNEED` and remain on disk. Disposable native, AOT and
+JAX compiler files on tmpfs/ramfs are removed; lock files and directories remain.
 Advice is not a measurement of resident memory freed.
 
-Checkpoint pages remain eligible for kernel reclaim during startup, but explicit
-eviction starts at the scheduler-ready handshake. This can increase peak host
-memory relative to evicting immediately after weight loading. Reusing files
+After serial weight loading, checkpoint eviction runs in the background during
+graph warmup and is joined before scheduler readiness. Overlapped weight loading
+uses synchronous eviction at readiness, after all readers finish. Reusing files
 after cleanup can require storage reads. After freeze cleanup, one rank per host
 logs cgroup `memory.current` in bytes; this diagnostic does not gate readiness.
 
@@ -191,9 +196,13 @@ opt-outs.
 `sglang.multimodal_gen.platforms` selects `multimodal_gen.platform.TpuOOTPlatform`
 whenever `torch.tpu` is registered; `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=tpu`
 selects the fork's built-in TPU platform instead. `TpuOOTPlatform` subclasses that
-built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and carries the
-TPU behavior (`--attention-backend tpu_splash_attn`, the `AttentionBackendEnum.OOT`
-backend).
+built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
+
+- `--attention-backend tpu_splash_attn`, the `AttentionBackendEnum.OOT` backend.
+- torch.compile with the `tpu` backend and static shapes; TeaCache dropped and
+  the VAE left eager under compile; `--offload-during-compile` off.
+- Runtime patches applied at worker init (`multimodal_gen/worker.py`), each with
+  the debt header: `rope.py` (RoPE without stride-2 lane access).
 
 Gates that take the OOT arm, with the same outcome as the built-in platform:
 
@@ -203,3 +212,10 @@ Gates that take the OOT arm, with the same outcome as the built-in platform:
   caller registers the CUDA flash-attention op, which TPU never selects.
 - `get_all_to_all_communicator_cls()`: answered explicitly with the base
   communicator the built-in platform uses.
+
+Gates whose OOT arm differs from the built-in platform:
+
+- `build_torch_compile_kwargs()`: the OOT arm compiles with `get_compile_backend()`
+  (`tpu`) and drops the mode; the built-in arm passes the mode to the default
+  backend (inductor). Worker init turns off dynamo's automatic dynamic shapes,
+  as `dynamic=False` would.

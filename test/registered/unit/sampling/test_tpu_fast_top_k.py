@@ -13,7 +13,6 @@ from unittest.mock import MagicMock, call, patch
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers import logits_processor as logits_processor_module
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -27,6 +26,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import sampler as tpu_sampler_module
 from sglang_tpu import top_k as tpu_top_k_module
+from sglang_tpu.envs import envs
 from sglang_tpu.row_pad import pad_rows, row_bucket
 from sglang_tpu.sampler import (
     MAX_DISTRIBUTED_TOP_K,

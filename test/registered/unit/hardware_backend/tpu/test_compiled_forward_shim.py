@@ -9,7 +9,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import resolve_forward_inputs
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
@@ -60,6 +59,7 @@ from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
 )
+from sglang_tpu.envs import envs
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 # Pure-logic tests: CPU tensors only, and the shim's import chain is

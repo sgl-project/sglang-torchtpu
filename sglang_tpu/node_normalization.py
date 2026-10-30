@@ -20,6 +20,7 @@ import sys
 from dataclasses import asdict, dataclass, replace
 from datetime import timedelta
 
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.patches import build_slicebuilder_addresses
 
 logger = logging.getLogger(__name__)
@@ -271,14 +272,13 @@ def prepare_tpu_environment(server_args) -> None:
     if not master_host or not separator:
         raise ValueError("--dist-init-addr must contain a host and port")
     master_port = int(port)
+    bootstrap_port = tpu_envs.SGLANG_TPU_TOPOLOGY_BOOTSTRAP_PORT.get()
     config = TopologyConfig(
         hosts=tuple(hosts.split(",")),
         topology=dimensions(topology),
         devices_per_host=int(os.environ.get("TORCH_TPU_DEVICES_PER_HOST", "8")),
         chips_per_host=dimensions(os.environ.get("TPU_CHIPS_PER_HOST_BOUNDS", "2,2,1")),
-        bootstrap_port=int(
-            os.environ.get("SGLANG_TPU_TOPOLOGY_BOOTSTRAP_PORT", master_port + 1)
-        ),
+        bootstrap_port=(master_port + 1 if bootstrap_port is None else bootstrap_port),
         master_port=master_port,
         slicebuilder_port=int(os.environ.get("TORCH_TPU_BASE_PORT", "8070")),
     )

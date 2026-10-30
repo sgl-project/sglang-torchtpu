@@ -45,7 +45,6 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Range
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -64,6 +63,7 @@ from sglang_tpu.disaggregation.tpu.serde import (
     KVDataChannelHeader,
     Transfer,
 )
+from sglang_tpu.envs import envs
 
 # Enable Perfetto tracing for tests to exercise tracing code paths
 envs.SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING.set(True)

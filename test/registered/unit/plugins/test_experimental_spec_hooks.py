@@ -40,6 +40,7 @@ from sglang_tpu.hooks.experimental_spec import (
     initialize_host_batch,
     kimi_spec_defaults,
 )
+from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -164,7 +165,13 @@ class TestExperimentalSpecHooks(CustomTestCase):
         register_host_batch_padder(_pad)
         # Exercise the real registry's descriptor handling and import propagation,
         # then restore every patched binding so this test cannot affect other tests.
-        for target, hook, kind in hook_specs():
+        hooks = hook_specs()
+        hooks.extend(
+            spec
+            for spec in host_padding_hooks()
+            if spec[0].endswith("._extend_metadata_device")
+        )
+        for target, hook, kind in hooks:
             owner_path, name = target.rsplit(".", 1)
             owner = pkgutil.resolve_name(owner_path)
             raw = vars(owner).get(name)
@@ -645,6 +652,28 @@ class TestExperimentalSpecHooks(CustomTestCase):
             "device-indices",
         )
         self.assertEqual(seen[1], "device-indices")
+
+    def test_host_relayed_dflash_draft_state_filters_with_host_indices(self):
+        """DFlash's relayed draft state stays on host too; device indices can't index it."""
+        from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+        from sglang_tpu.hooks.experimental_spec import filter_spec_input
+
+        spec_info = DFlashDraftInputV2(
+            topk_p=torch.ones(3, 1),
+            topk_index=torch.zeros(3, 1, dtype=torch.int64),
+            bonus_tokens=torch.arange(3),
+            new_seq_lens=torch.arange(3),
+            hidden_states=torch.zeros(3, 4),
+        )
+        batch = SimpleNamespace(spec_info=spec_info, enable_overlap=False)
+        seen = []
+        filter_spec_input(
+            lambda b, keep, keep_device: seen.append(keep_device),
+            batch,
+            [1, 2],
+            "device-indices",
+        )
+        self.assertEqual(seen[0].tolist(), [1, 2])
 
     def test_pp_stages_before_the_last_get_no_draft(self):
         """Under PP only the last stage hosts the draft; an earlier stage building one

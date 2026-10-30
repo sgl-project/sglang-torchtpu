@@ -264,7 +264,6 @@ def _make_dsv4_pool(
     override = get_context().override_server_args(
         host="127.0.0.1",
         disaggregation_bootstrap_port=bootstrap_port,
-        dsv4_attn_backend="tpu_dsv4",
         page_size=256,
         tp_size=1,
         dp_size=1,

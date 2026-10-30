@@ -65,16 +65,28 @@ def pool_manifest(groups: Any) -> list[dict]:
     ``<kind>.l<first>+<count>``; it pairs only with a bundle of the same layers.
     """
     pools = []
-    for kind, tensors, layer_ids, num_draft in (
-        ("fa", groups.full, groups.full_layer_ids, groups.num_draft_full),
-        ("swa", groups.swa, groups.swa_layer_ids, groups.num_draft_swa),
+    for kind, tensors, layer_ids, num_draft, num_hidden in (
+        (
+            "fa",
+            groups.full,
+            groups.full_layer_ids,
+            groups.num_draft_full,
+            groups.num_hidden_full,
+        ),
+        ("swa", groups.swa, groups.swa_layer_ids, groups.num_draft_swa, 0),
     ):
         if len(tensors) != len(layer_ids):
             raise ValueError(f"Raiden {kind} pools need one global layer ID per tensor")
-        num_target = len(tensors) - num_draft
+        num_target = len(tensors) - num_draft - num_hidden
         for index, (tensor, layer) in enumerate(zip(tensors, layer_ids)):
-            # Draft layer IDs restart at 0, so they need their own namespace.
-            tag_kind = kind if index < num_target else f"draft.{kind}"
+            # Draft layer IDs restart at 0, so they need their own namespace; the
+            # PD hidden rows have their own page geometry, hence their own class.
+            if index < num_target:
+                tag_kind = kind
+            elif index < num_target + num_draft:
+                tag_kind = f"draft.{kind}"
+            else:
+                tag_kind = f"pdhid.{kind}"
             tag = f"{tag_kind}.l{int(layer)}"
             if _kv_rank(tensor) == _BLOCK_MAJOR_KV_RANK:
                 tag += f"+{int(tensor.shape[1])}"
@@ -125,13 +137,20 @@ def materialized_storage_layout(tensor, getter):
     return layout
 
 
-def layout_fingerprint(pools: Sequence[dict], tensors: Sequence[Any], getter) -> str:
+def layout_fingerprint(
+    pools: Sequence[dict], tensors: Sequence[Any], getter, *, ships_pd_hidden: bool
+) -> str:
     """Compare per-class page geometry and materialized layout across layer
     subsets; the per-rank head count is left out so a tensor-parallel consumer
-    matches its producer."""
+    matches its producer. ships_pd_hidden makes both ends agree on
+    SGLANG_TPU_PD_DECODE_DRAFT_PREFILL, which the skipped pdhid pools cannot."""
     classes = {}
     schema = "sglang-fused-kv-v2"
     for pool, tensor in zip(pools, tensors):
+        # Only the last stage holds the PD hidden pool, whose pages match no target
+        # class; both ends build it from the same geometry (pd_hidden_pool.py).
+        if pool_kind(pool["tag"]).startswith("pdhid."):
+            continue
         layout = materialized_storage_layout(tensor, getter)
         if layout is None:
             raise ValueError("Raiden pipeline KV must have a materialized TPU layout")
@@ -163,8 +182,19 @@ def layout_fingerprint(pools: Sequence[dict], tensors: Sequence[Any], getter) ->
         if kind in classes and classes[kind] != signature:
             raise ValueError(f"Raiden {kind} layers have differing page layouts")
         classes[kind] = signature
-    value = json.dumps(dict(schema=schema, classes=classes), sort_keys=True)
+    fields = dict(schema=schema, classes=classes)
+    if ships_pd_hidden:
+        fields["pd_hidden"] = True
+    value = json.dumps(fields, sort_keys=True)
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _ships_pd_hidden() -> bool:
+    """Whether this P/D pair moves draft-input hidden rows instead of draft KV."""
+    from sglang.srt.runtime_context import get_spec
+    from sglang_tpu.experimental import pd_decode_draft_prefill
+
+    return pd_decode_draft_prefill() and get_spec().speculative_algorithm is not None
 
 
 def destination_blocks(
@@ -627,6 +657,7 @@ class PipelineTransfer:
             pools,
             tensors,
             tpu_torch_compile.get_device_layout_if_materialized,
+            ships_pd_hidden=_ships_pd_hidden(),
         )
         client.register_work_unit(
             unit=unit,

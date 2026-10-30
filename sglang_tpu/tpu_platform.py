@@ -293,7 +293,9 @@ def _validate_prefill_context_parallel(server_args: ServerArgs) -> None:
             f"{feature} requires --sampling-backend pytorch (the logits step runs on "
             f"the reduced last-token rows), got {cfg.sampling_backend!r}."
         )
-    if envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get():
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if tpu_envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get():
         raise NotImplementedError(
             f"{feature} does not support input (prompt) logprobs; unset "
             "SGLANG_TPU_ENABLE_PROMPT_LOGPROB."
@@ -318,15 +320,17 @@ def _pin_req_to_token_on_host(reason: str) -> None:
 
 def _pin_fused_moe_tensorcore_gather(reason: str) -> None:
     """Force SGLANG_TPU_FUSED_MOE_SC_GATHER off, warning if it was turned on."""
+    from sglang_tpu.envs import envs as tpu_envs
+
     if (
-        envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.is_set()
-        and envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get()
+        tpu_envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.is_set()
+        and tpu_envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get()
     ):
         logger.warning(
             "Overriding SGLANG_TPU_FUSED_MOE_SC_GATHER=1 -> 0: "
             f"{reason} gathers the fused-MoE rows on the TensorCore."
         )
-    envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.set(False)
+    tpu_envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.set(False)
 
 
 def _mha_kv_pool_cls(backend: str | None) -> type:
@@ -948,8 +952,11 @@ class TpuSRTPlatform(SRTPlatform):
             Phase,
             with_phase,
         )
+        from sglang_tpu.hooks.dsv4 import register_tpu_dsv4_resolution_hooks
         from sglang_tpu.kimi_k3 import static_fp8_parts
         from sglang_tpu.patches import _prepare_tpu_env
+
+        register_tpu_dsv4_resolution_hooks()
 
         # Fail on a mistyped SGLANG_TPU_K3_STATIC_FP8 now, not after the
         # weights have loaded (its binder runs post-load).
@@ -1494,6 +1501,7 @@ class TpuSRTPlatform(SRTPlatform):
             arm_recompilation_checker,
             maybe_enable_site_tracing,
         )
+        from sglang_tpu.envs import envs as tpu_envs
 
         if get_exec().graph.enable_torch_compile:
             arm_recompilation_checker(reset_counters=False, overwrite_baseline=False)
@@ -1503,7 +1511,7 @@ class TpuSRTPlatform(SRTPlatform):
             return
         if (
             get_spec().speculative_algorithm is not None
-            and envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.get()
+            and tpu_envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.get()
         ):
             logger.info(
                 "[tpu] Warmup complete; leaving torch.compile recompiles enabled "

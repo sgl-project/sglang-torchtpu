@@ -268,10 +268,16 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         )
         # Must inject before returning: the scheduler may update radix afterward,
         # invalidating out_cache_loc.
-        with self._block_draft_worker.draft_context():
-            kv_fence_tail = self._block_draft_worker.write_draft_kv(
-                target_hidden=target_hidden, positions=positions, cache_loc=cache_loc
-            )
+        if self.ships_pd_hidden:
+            # The decode projects these rows into its draft KV.
+            kv_fence_tail = self.write_pd_hidden(batch, target_hidden)
+        else:
+            with self._block_draft_worker.draft_context():
+                kv_fence_tail = self._block_draft_worker.write_draft_kv(
+                    target_hidden=target_hidden,
+                    positions=positions,
+                    cache_loc=cache_loc,
+                )
         logits_output.hidden_states = None
         if not batch.reqs:
             return self._idle_extend_result(result)
@@ -296,6 +302,26 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 f"distributed top-k width {width} != TARGET_CANDIDATES {TARGET_CANDIDATES}"
             )
         return width
+
+    def extend_draft_from_hidden(
+        self,
+        batch: ScheduleBatch,
+        *,
+        target_hidden: torch.Tensor,
+        cache_loc: torch.Tensor,
+        bonus_tokens: torch.Tensor,
+    ) -> None:
+        del bonus_tokens
+        positions = pad_rows(
+            prompt_positions(
+                prefix_lens=batch.prefix_lens, extend_lens=batch.extend_lens
+            ),
+            target_hidden.shape[0],
+        ).to(self.device, non_blocking=True)
+        with self._block_draft_worker.draft_context():
+            self._block_draft_worker.write_draft_kv(
+                target_hidden=target_hidden, positions=positions, cache_loc=cache_loc
+            )
 
     def make_verify_input(
         self, *, batch: ScheduleBatch, verify_tokens: torch.Tensor, rows: VerifyRows

@@ -57,7 +57,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 import torch
 from torch_tpu._internal.pallas import jax_op
 
-from sglang.srt.environ import envs
+from sglang_tpu.envs import envs as tpu_envs
 
 if TYPE_CHECKING:
     import jax
@@ -545,7 +545,6 @@ def _fused_moe_jax(
     # directly, so it does not depend on the permute path chosen below
     # (permute_dense_threshold).
     if m == 1 and not no_combine:
-        from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.moe.pallas import single_token_moe
 
         if (
@@ -616,8 +615,6 @@ def _fused_moe_jax(
         )
         rhs_quant_dtype = jnp.int4
         maybe_quantize_lhs = use_vmem_fp8
-
-    from sglang_tpu.envs import envs as tpu_envs
 
     if tpu_envs.SGLANG_TPU_ENABLE_STREAMING_MOE_KERNEL.get():
         from sglang_tpu.moe.pallas.moe_stream import maybe_moe_stream
@@ -1189,8 +1186,8 @@ def fused_moe_call(
     # Routed rows for this (bucket-padded) call; static per compiled graph.
     routed_rows = int(hidden_states.shape[0]) * int(topk)
     use_sc_gather = int(
-        envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get()
-        and routed_rows >= envs.SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS.get()
+        tpu_envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get()
+        and routed_rows >= tpu_envs.SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS.get()
     )
     expert_group_offset_int, expert_group_offset_tensor = _resolve_expert_group_offset(
         expert_group_offset,
@@ -1214,7 +1211,7 @@ def fused_moe_call(
         expert_group_offset_int,
         use_sc_gather,
         w_quant_bits,
-        int(envs.SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD.get()),
+        int(tpu_envs.SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD.get()),
         w1_channel_scale,
         w2_channel_scale,
         expert_group_offset_tensor,
