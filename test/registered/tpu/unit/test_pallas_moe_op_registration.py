@@ -20,7 +20,7 @@ registration time.
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
 
 import unittest
 from unittest.mock import Mock, patch
@@ -57,7 +57,7 @@ class TestPallasMoeOpRegistration(CustomTestCase):
     drift here would silently produce a separate, unregistered op."""
 
     def test_op_registered_under_expected_qualified_name(self):
-        from sglang.srt.layers.moe.pallas.fused_moe_op import _build_fused_moe_op
+        from sglang_tpu.moe.pallas.fused_moe_op import _build_fused_moe_op
 
         _build_fused_moe_op()
         # Reachable via the torch.ops namespace -- this is what dynamo
@@ -80,7 +80,7 @@ class TestPallasMoeOpIdempotency(CustomTestCase):
     the cached singleton instead of re-registering."""
 
     def test_build_returns_same_singleton(self):
-        from sglang.srt.layers.moe.pallas.fused_moe_op import _build_fused_moe_op
+        from sglang_tpu.moe.pallas.fused_moe_op import _build_fused_moe_op
 
         op_a = _build_fused_moe_op()
         op_b = _build_fused_moe_op()
@@ -94,7 +94,7 @@ class TestPallasMoeCallContract(CustomTestCase):
     """
 
     def test_forwards_ep_and_sparse_core_options_to_registered_op(self):
-        import sglang.srt.layers.moe.pallas.fused_moe_op as fused_moe_op
+        import sglang_tpu.moe.pallas.fused_moe_op as fused_moe_op
 
         hidden_states = torch.empty(2, 8, dtype=torch.bfloat16)
         w1 = torch.empty(2, 8, 16, dtype=torch.bfloat16)
@@ -108,12 +108,12 @@ class TestPallasMoeCallContract(CustomTestCase):
         with (
             patch.object(fused_moe_op, "_build_fused_moe_op", return_value=op),
             patch.object(
-                fused_moe_op.envs.SGLANG_TPU_FUSED_MOE_SC_GATHER,
+                fused_moe_op.tpu_envs.SGLANG_TPU_FUSED_MOE_SC_GATHER,
                 "get",
                 return_value=True,
             ),
             patch.object(
-                fused_moe_op.envs.SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD,
+                fused_moe_op.tpu_envs.SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD,
                 "get",
                 return_value=128,
             ),
@@ -153,11 +153,46 @@ class TestPallasMoeCallContract(CustomTestCase):
             128,  # permute_dense_threshold
             None,  # w1_channel_scale (vmem-fp8 only)
             None,  # w2_channel_scale (vmem-fp8 only)
+            None,  # expert_group_offset_tensor (lifted when trace_rank is active)
         )
+
+    def test_lifts_expert_group_offset_when_trace_rank_is_active(self):
+        import sglang_tpu.moe.pallas.fused_moe_op as fused_moe_op
+        from sglang_tpu.rank_local import trace_rank
+
+        hidden_states = torch.empty(2, 8, dtype=torch.bfloat16)
+        w1 = torch.empty(2, 8, 16, dtype=torch.bfloat16)
+        w2 = torch.empty(2, 8, 8, dtype=torch.bfloat16)
+        topk_weights = torch.empty(2, 2, dtype=torch.bfloat16)
+        topk_ids = torch.empty(2, 2, dtype=torch.int32)
+        op = Mock(return_value=hidden_states)
+        rank_tensor = torch.tensor([3], dtype=torch.int32)
+
+        with (
+            patch.object(fused_moe_op, "_build_fused_moe_op", return_value=op),
+            patch("sglang_tpu.rank_local.dist.get_rank", return_value=3),
+            trace_rank(rank_tensor),
+        ):
+            fused_moe_op.fused_moe_call(
+                hidden_states=hidden_states,
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                topk=2,
+                activation="silu",
+                global_num_experts=8,
+                expert_group_offset=6,
+            )
+
+        self.assertEqual(op.call_args.args[13], 0)
+        offset_tensor = op.call_args.args[19]
+        self.assertIsInstance(offset_tensor, torch.Tensor)
+        torch.testing.assert_close(offset_tensor, torch.tensor([6], dtype=torch.int32))
 
     def test_situ_params_are_encoded_in_the_activation(self):
         """SiTU (beta, linear_beta) reach the op in the activation string."""
-        import sglang.srt.layers.moe.pallas.fused_moe_op as fused_moe_op
+        import sglang_tpu.moe.pallas.fused_moe_op as fused_moe_op
 
         t = torch.empty(2, 2)
         op = Mock(return_value=t)

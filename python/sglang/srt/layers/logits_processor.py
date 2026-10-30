@@ -88,7 +88,7 @@ _UNQUANTIZED_LM_HEAD_METHODS = {
 # None outside a FlashInfer autotune pass; inside one, whether that pass runs the
 # LM head. Not-None means the forward's output is discarded -- attention backends
 # read that via get_in_autotune_dummy_run() to skip a cross-node exchange.
-# Skipping the LM head skips its [batch * dp_size, vocab] all-gather, which OOMs
+# Skipping the LM head skips its [batch * num_dp_ranks, vocab] all-gather, which OOMs
 # under DP attention with a tight mem_fraction_static.
 _autotune_run_lm_head: Optional[bool] = None
 
@@ -110,6 +110,7 @@ class SamplingMaskOutput:
     selected_logprobs: torch.Tensor
     support_logprobs: Optional[torch.Tensor]
     statuses: torch.Tensor
+    num_accept_tokens: Optional[torch.Tensor] = None
 
     def map_device_tensors(self, fn) -> None:
         self.token_ids = fn(self.token_ids)
@@ -118,6 +119,8 @@ class SamplingMaskOutput:
         if self.support_logprobs is not None:
             self.support_logprobs = fn(self.support_logprobs)
         self.statuses = fn(self.statuses)
+        if self.num_accept_tokens is not None:
+            self.num_accept_tokens = fn(self.num_accept_tokens)
 
 
 def _trace_e2e_logits(stage: str, **fields) -> None:
@@ -193,7 +196,7 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
 
 
 # FlashInfer autotune skips the unprofiled LM-head all-gather; its
-# [batch * dp_size, vocab] output can OOM under tight DP-attention memory.
+# [batch * num_dp_ranks, vocab] output can OOM under tight DP-attention memory.
 _in_autotune_dummy_run = False
 
 
@@ -239,8 +242,12 @@ class LogitsProcessorOutput:
     # Post-filter support IDs and requested behavior logprobs, bounded by server
     # capacity. Logprobs are normalized over the full realized support.
     sampling_mask_output: Optional[SamplingMaskOutput] = None
-    next_token_sampling_mask_idx: Optional[List[Optional[np.ndarray]]] = None
-    next_token_sampling_logprobs: Optional[List[Optional[np.ndarray]]] = None
+    next_token_sampling_mask_idx: Optional[
+        List[Optional[Union[np.ndarray, List[np.ndarray]]]]
+    ] = None
+    next_token_sampling_logprobs: Optional[
+        List[Optional[Union[np.ndarray, List[np.ndarray]]]]
+    ] = None
     next_token_sampling_mask_status: Optional[List[Optional[int]]] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
@@ -282,6 +289,9 @@ class LogitsProcessorOutput:
 
     # Sampled draft token IDs when draft sampling is fused into draft model forward
     next_draft_tokens: Optional[torch.Tensor] = None
+    # DFlash2 candidate ids [bs, gamma, K] and scores [bs, gamma, K, K] from the
+    # draft forward, so sampled drafting reuses them instead of rebuilding.
+    next_draft_lattice: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
@@ -313,18 +323,23 @@ class LogitsProcessorOutput:
         """Remove padded rows while preserving global TopK pair alignment.
         TopK rows default to the full-logits row count when not specified."""
 
-        if self.next_token_logits is not None:
+        if (
+            self.next_token_logits is not None
+            and self.next_token_logits.shape[0] > logits_rows
+        ):
             self.next_token_logits = self.next_token_logits[:logits_rows]
         if self.has_next_token_global_top_k:
             global_top_k_rows = (
                 logits_rows if global_top_k_rows is None else global_top_k_rows
             )
-            self.next_token_global_top_k_logits = self.next_token_global_top_k_logits[
-                :global_top_k_rows
-            ]
-            self.next_token_global_top_k_token_ids = (
-                self.next_token_global_top_k_token_ids[:global_top_k_rows]
-            )
+            if self.next_token_global_top_k_logits.shape[0] > global_top_k_rows:
+                self.next_token_global_top_k_logits = (
+                    self.next_token_global_top_k_logits[:global_top_k_rows]
+                )
+            if self.next_token_global_top_k_token_ids.shape[0] > global_top_k_rows:
+                self.next_token_global_top_k_token_ids = (
+                    self.next_token_global_top_k_token_ids[:global_top_k_rows]
+                )
 
     def finalize_input_logprobs(self) -> None:
         if self.input_logprobs_copy_done is None:
@@ -574,7 +589,7 @@ class LogitsProcessor(nn.Module):
         if self.use_tpu_distributed_top_k:
             # Register before an optional fullgraph torch.compile trace reaches
             # the logits processor. StableHLO export itself remains lazy.
-            from sglang.srt.hardware_backend.tpu.top_k import register_tpu_top_k_ops
+            from sglang_tpu.top_k import register_tpu_top_k_ops
 
             register_tpu_top_k_ops()
 
@@ -618,6 +633,12 @@ class LogitsProcessor(nn.Module):
         aux_hidden_states: Optional[AuxHiddenStates] = None,
         hidden_states_before_norm: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
+        if aux_hidden_states is not None and not isinstance(
+            aux_hidden_states, torch.Tensor
+        ):
+            # A plain list for the ops below: the TPU compiled forward cannot
+            # hand the models' AuxHiddenStateList (a list subclass) to torch.cat.
+            aux_hidden_states = [hidden for hidden in aux_hidden_states]
         # Extract MIS / setwise indices before ForwardBatch → LogitsMetadata conversion
         multi_item_delimiter_indices = None
         distributed_top_k = None
@@ -626,7 +647,7 @@ class LogitsProcessor(nn.Module):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
             logits_output_mode = logits_metadata.logits_output_mode
             if logits_output_mode is LogitsOutputMode.DISTRIBUTED_TOP_K:
-                from sglang.srt.hardware_backend.tpu.sampler import (
+                from sglang_tpu.sampler import (
                     distributed_top_k_candidate_width,
                 )
 
@@ -1030,7 +1051,7 @@ class LogitsProcessor(nn.Module):
         """Reduce sharded LM-head logits into an exact global TopK.
         Monotonic final softcapping is applied after the global merge."""
 
-        from sglang.srt.hardware_backend.tpu.top_k import (
+        from sglang_tpu.top_k import (
             TpuVocabShard,
             distributed_tpu_top_k,
         )
@@ -1101,7 +1122,7 @@ class LogitsProcessor(nn.Module):
             and hidden_states.ndim == 2
         )
         if bucket_rows:
-            from sglang.srt.hardware_backend.tpu.row_pad import pad_rows, row_bucket
+            from sglang_tpu.row_pad import pad_rows, row_bucket
 
             hidden_states = pad_rows(hidden_states, row_bucket(rows))
         lora_batch_layout = (
@@ -1184,7 +1205,7 @@ class LogitsProcessor(nn.Module):
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if _is_tpu and hidden_states.ndim == 2 and not torch.compiler.is_compiling():
-            from sglang.srt.hardware_backend.tpu.row_pad import pad_rows, row_bucket
+            from sglang_tpu.row_pad import pad_rows, row_bucket
 
             # Eager on TPU, each row count compiles its own program; bucket rows.
             rows = hidden_states.shape[0]

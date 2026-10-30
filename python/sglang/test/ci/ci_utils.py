@@ -8,11 +8,12 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from sglang.srt.debug_utils import cuda_coredump
 from sglang.srt.utils.common import kill_process_tree
 from sglang.test.ci.ci_register import CIRegistry
+from sglang.test.ci.skip_guard import command_for_test_file
 
 # Configure logger to output to stdout
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -121,6 +122,8 @@ NON_RETRIABLE_PATTERNS = [
     r"core dumped",
     r"ConnectionRefusedError",
     r"FileNotFoundError",
+    # skip_guard: every test in the file skipped, which a rerun cannot change.
+    r"\[skip_guard\]",
 ]
 
 
@@ -216,7 +219,7 @@ def derive_timeout_per_file(est_time: float) -> float:
 def _clear_compilation_caches():
     """Clear compilation caches after each test unit to prevent disk/shm exhaustion."""
     is_tpu_or_ci = (
-        os.environ.get("SGLANG_PLATFORM") == "tpu"
+        os.environ.get("SGLANG_PLATFORM", "").startswith("tpu")
         or os.environ.get("CI") is not None
         or os.environ.get("GITHUB_ACTIONS") is not None
     )
@@ -264,6 +267,8 @@ def run_unittest_files(
     max_attempts: int = 2,
     retry_wait_seconds: int = 60,
     fork_worker_batch_size: int = 1,
+    prior_results: Optional[List[Tuple[str, bool, float]]] = None,
+    fail_on_all_skipped: bool = False,
 ):
     """
     Run a list of test files.
@@ -281,6 +286,14 @@ def run_unittest_files(
         fork_worker_batch_size: Number of files served by one preloaded fork
                                 worker. Each file still runs in a fresh child
                                 process. One keeps the existing exec behavior.
+        prior_results: (filename, passed, elapsed) for files another runner
+                       already executed for this same suite. They are folded
+                       into the summary and the TIMINGS block so one suite
+                       still reports one block covering every file, whichever
+                       runner ran it.
+        fail_on_all_skipped: If True, run each file through skip_guard, which
+                             fails a file whose tests all skipped. Files then
+                             run one exec each, without the fork worker.
     """
     coredump_enabled = cuda_coredump.is_enabled()
     if coredump_enabled:
@@ -294,8 +307,17 @@ def run_unittest_files(
     # Per-file elapsed seconds, latest attempt wins. Consumed by the
     # TIMINGS block emitted at the end of this function.
     file_elapsed: Dict[str, float] = {}
+    for prior_name, prior_passed, prior_elapsed in prior_results or ():
+        file_elapsed[prior_name] = prior_elapsed
+        if prior_passed:
+            passed_tests.append(prior_name)
+        else:
+            failed_tests.append((prior_name, "see the chip-pinned phase above"))
+            success = False
     fork_worker = None
-    use_fork_worker = fork_worker_batch_size > 1 and not enable_retry
+    use_fork_worker = (
+        fork_worker_batch_size > 1 and not enable_retry and not fail_on_all_skipped
+    )
 
     for i, file in enumerate(files):
         if isinstance(file, CIRegistry):
@@ -340,7 +362,7 @@ def run_unittest_files(
                     elapsed = time.perf_counter() - file_tic
                 elif capture_output:
                     # Capture output for retry decision
-                    cmd = ["python3", full_path, "-f"]
+                    cmd = command_for_test_file(full_path, fail_on_all_skipped)
                     process = subprocess.Popen(
                         cmd,
                         stdout=subprocess.PIPE,
@@ -362,7 +384,7 @@ def run_unittest_files(
                     # Bounded wait for the reader to finish.
                     reader_thread.join(timeout=60)
                 else:
-                    cmd = ["python3", full_path, "-f"]
+                    cmd = command_for_test_file(full_path, fail_on_all_skipped)
                     process = subprocess.Popen(cmd, stdout=None, stderr=None)
                     process.wait()
 
@@ -503,7 +525,8 @@ def run_unittest_files(
 
     # Print summary
     logger.info(f"\n{'=' * 60}")
-    logger.info(f"Test Summary: {len(passed_tests)}/{len(files)} passed")
+    total_files = len(files) + len(prior_results or ())
+    logger.info(f"Test Summary: {len(passed_tests)}/{total_files} passed")
     if enable_retry and retried_tests:
         logger.info(f"Retries: {len(retried_tests)} test(s) were retried")
     logger.info(f"{'=' * 60}")

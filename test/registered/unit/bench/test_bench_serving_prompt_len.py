@@ -33,15 +33,16 @@ class _ChatHandler(BaseHTTPRequestHandler):
             "completion_tokens": 1,
             "prompt_tokens": self.server.prompt_tokens[len(self.server.bodies) - 1],
         }
+        reply = getattr(self.server, "reply", "hi")
         if body.get("stream"):
-            chunks = [{"choices": [{"index": 0, "delta": {"content": "hi"}}]}]
+            chunks = [{"choices": [{"index": 0, "delta": {"content": reply}}]}]
             if (body.get("stream_options") or {}).get("include_usage"):
                 chunks.append({"choices": [], "usage": usage})
             content_type = "text/event-stream"
             payload = b"".join(f"data: {json.dumps(c)}\n\n".encode() for c in chunks)
             payload += b"data: [DONE]\n\n"
         else:
-            message = {"role": "assistant", "content": "hi"}
+            message = {"role": "assistant", "content": reply}
             choice = {"index": 0, "message": message, "finish_reason": "length"}
             content_type = "application/json"
             payload = json.dumps({"choices": [choice], "usage": usage}).encode()
@@ -133,6 +134,20 @@ class TestBenchServingPromptLen(CustomTestCase):
                 self.assertEqual(
                     [b["stream_options"] for b in self.server.bodies], [sent] * 3
                 )
+
+    def test_multi_turn_replay_drops_control_token_markup(self):
+        raw = "Let's run tests.<|start|>assistant<|channel|>commentary <|message|>{}"
+        self.server.reply = raw
+        multi_turn = wrap_multi_turn_request_func(
+            async_request_openai_chat_completions, backend="sglang-oai-chat"
+        )
+        self._run(multi_turn, ["one", "two"], [10, 20])
+        replayed = self.server.bodies[1]["messages"][1]
+        self.assertEqual(replayed["role"], "assistant")
+        self.assertEqual(
+            replayed["content"],
+            "Let's run tests.startassistantchannelcommentary message{}",
+        )
 
 
 if __name__ == "__main__":

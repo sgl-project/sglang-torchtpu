@@ -8,7 +8,7 @@ from sglang.test.tpu.utils.kv_offload_probe import kv_offload_runner
 
 register_tpu_ci(
     est_time=5400,
-    suite="nightly-tpu-4-v7",
+    suite="external-nightly-1host",
     nightly=True,
     labels=["singlehost", "gpt-oss-120b", "prefix-cache", "kv-offload", "spec", "dpa"],
 )
@@ -51,6 +51,8 @@ LAUNCH_ENV = {
     "HICACHE_WRITE_POLICY": "write_through",
     "ENABLE_CACHE_REPORT": "1",
     "ENABLE_PROFILER_ENDPOINT": "0",
+    # EAGLE3 on the experimental TPU spec worker.
+    "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
     "EXTRA_ARGS": (
         "--reasoning-parser gpt-oss "
         f"--served-model-name {SERVED_MODEL_NAME} "

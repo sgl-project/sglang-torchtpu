@@ -6,6 +6,7 @@ import torch.nn as nn
 
 from sglang.srt.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 from sglang.srt.layers.parameter import PerTensorScaleParameter
+from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
@@ -18,6 +19,17 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestModelOptNvfp4(CustomTestCase):
+    def test_only_interleaving_backends_support_the_fusion(self):
+        for backend, expected in (
+            (Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL, True),
+            (Fp4GemmRunnerBackend.FLASHINFER_CUTLASS, True),
+            (Fp4GemmRunnerBackend.FLASHINFER_CUDNN, True),
+            (Fp4GemmRunnerBackend.FLASHINFER_TRTLLM, False),
+            (Fp4GemmRunnerBackend.MARLIN, False),
+        ):
+            with self.subTest(backend=backend):
+                self.assertEqual(backend.supports_swiglu_fusion(), expected)
+
     def _make_layer(self):
         return MergedColumnParallelLinear(
             input_size=16,
@@ -131,6 +143,18 @@ class TestModelOptNvfp4(CustomTestCase):
                 group_size=16,
                 use_per_token_activation=True,
             )
+
+    def test_flat_config_reads_exclude_modules(self):
+        # config.json-style (flat) ModelOpt configs may list BF16 modules under
+        # exclude_modules instead of ignore; dropping them quantizes BF16 layers.
+        config = ModelOptFp4Config.from_config(
+            {
+                "quant_algo": "NVFP4",
+                "group_size": 16,
+                "exclude_modules": ["layers.0.", "lm_head"],
+            }
+        )
+        self.assertEqual(config.exclude_modules, ["layers.0.", "lm_head"])
 
     def test_shared_expert_fusion_requires_matching_fp4_precision(self):
         quantized_shared = ModelOptFp4Config(

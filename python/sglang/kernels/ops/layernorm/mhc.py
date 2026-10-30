@@ -21,20 +21,30 @@ from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.srt.utils.common import is_gfx1250_supported
 
+_is_hip = is_hip()
+if _is_hip:
+    from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
+        hc_mix_reduce_sinkhorn_vec,
+    )
+
 logger = logging.getLogger(__name__)
 
 _AITER_MHC_RUNTIME_DISABLED = False
 _AITER_MHC_ACTIVE_LOGGED = False
 
 
+# The platform probes below are fixed for the process and not traceable, so a
+# compiled forward evaluates them once at trace time.
+@torch.compiler.assume_constant_result
+def _aiter_mhc_supported() -> bool:
+    return is_gfx95_supported() and envs.SGLANG_USE_AITER.get()
+
+
 def _use_aiter_mhc() -> bool:
-    return (
-        not _AITER_MHC_RUNTIME_DISABLED
-        and is_gfx95_supported()
-        and envs.SGLANG_USE_AITER.get()
-    )
+    return not _AITER_MHC_RUNTIME_DISABLED and _aiter_mhc_supported()
 
 
+@torch._dynamo.disable
 def _try_aiter_mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -86,6 +96,7 @@ def _try_aiter_mhc_pre(
     return result
 
 
+@torch._dynamo.disable
 def _try_aiter_mhc_post(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -218,10 +229,12 @@ def _use_deep_gemm_hc_prenorm() -> bool:
     return ENABLE_JIT_DEEPGEMM
 
 
+@torch.compiler.assume_constant_result
 def _use_tilelang_mhc_pre() -> bool:
     return envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get() and not is_hip()
 
 
+@torch.compiler.assume_constant_result
 def _use_tilelang_mhc_post() -> bool:
     return envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get() and not is_hip()
 
@@ -1939,7 +1952,7 @@ def _mhc_post_torch(
     return out.type_as(x)
 
 
-@torch._dynamo.disable
+# Only the kernel calls stay out of the graph; the torch path is traceable.
 def _mhc_pre_dispatch(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -1986,7 +1999,7 @@ def _mhc_pre_dispatch(
         )
         return post_mix, comb_mix, layer_input, False
 
-    post_mix, comb_mix, layer_input = mhc_pre(
+    post_mix, comb_mix, layer_input = torch._dynamo.disable(mhc_pre)(
         residual=residual,
         fn=fn,
         hc_scale=hc_scale,
@@ -2002,7 +2015,6 @@ def _mhc_pre_dispatch(
     return post_mix, comb_mix, layer_input, norm_weight is not None
 
 
-@torch._dynamo.disable
 def _mhc_post_dispatch(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -2023,7 +2035,7 @@ def _mhc_post_dispatch(
 
     if not _use_tilelang_mhc_post():
         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
-    return mhc_post(x, residual, post_layer_mix, comb_res_mix)
+    return torch._dynamo.disable(mhc_post)(x, residual, post_layer_mix, comb_res_mix)
 
 
 def hc_pre(
@@ -2267,7 +2279,8 @@ _HC_MIX_SLICE_CHOICES = (80, 64, 40, 32, 16, 8, 4, 2, 1)
 _HC_MIX_BLOCK_M = 32
 _HC_MIX_BLOCK_K = 64
 _HC_MIX_NUM_WARPS = 4
-_HC_MIX_DOT_PRECISION = "tf32x3"
+# Triton on AMD has no tf32x3 (gfx942 adds only tf32); "ieee" is the fp32 MFMA
+_HC_MIX_DOT_PRECISION = "ieee" if _is_hip else "tf32x3"
 # num_stages only reorders memory issue, not arithmetic; 2 is enough to cover the
 # short k_per_slice loop (K=20480 gives 80 slices, i.e. 4 BLOCK_K tiles per CTA).
 _HC_MIX_NUM_STAGES = 2
@@ -2281,6 +2294,9 @@ _HC_MIX_MID_MAX_M = 2048
 
 def _block_m_for(m: int) -> int:
     """Row-tile choices preserve each row's arithmetic and may depend on M."""
+    if _is_hip:
+        # fp32 MFMA tile heights do not share a per-row reduction order, so one height serves every M
+        return _HC_MIX_BLOCK_M_MID
     if m <= _HC_MIX_BLOCK_M_SMALL:
         return _HC_MIX_BLOCK_M_SMALL
     if m <= _HC_MIX_MID_MAX_M:
@@ -2479,6 +2495,24 @@ def hc_mix_stats_sinkhorn(
         num_warps=_HC_MIX_NUM_WARPS,
         num_stages=_num_stages_for(m, k),
     )
+    if _is_hip:
+        hc_mix_reduce_sinkhorn_vec(
+            part_mix,
+            part_sq,
+            hc_scale,
+            hc_base,
+            pre,
+            post,
+            comb,
+            k=k,
+            rms_eps=rms_eps,
+            mix=mix,
+            hc_mult=hc_mult,
+            num_slices=num_slices,
+            sinkhorn_iters=sinkhorn_iters,
+            hc_eps=hc_eps,
+        )
+        return pre, post, comb
     _hc_mix_reduce_sinkhorn_kernel[(m,)](
         part_mix,
         part_sq,
@@ -2583,7 +2617,10 @@ def hc_mix_stats_sinkhorn_bf16x3(
     m, k = x.shape
     mix = (2 + hc_mult) * hc_mult
     slices = _HC_MIX_COMPENSATED_SLICES
-    assert x.is_contiguous() and x.dtype == torch.bfloat16 and 4096 <= m <= 65536
+    hopper_medium = get_platform().is_sm90 and 32 <= m < 4096
+    block_m = 64 if hopper_medium else _HC_MIX_BF16X3_BLOCK_M
+    assert x.is_contiguous() and x.dtype == torch.bfloat16
+    assert hopper_medium or 4096 <= m <= 65536
     assert k % (slices * _HC_MIX_BLOCK_K) == 0
     assert len(weight_parts) == 3
     assert all(
@@ -2595,7 +2632,7 @@ def hc_mix_stats_sinkhorn_bf16x3(
     pre = torch.empty((m, hc_mult), device=x.device, dtype=torch.float32)
     post = torch.empty_like(pre)
     comb = torch.empty((m, hc_mult, hc_mult), device=x.device, dtype=torch.float32)
-    _hc_mix_stats_bf16x3_kernel[(triton.cdiv(m, _HC_MIX_BF16X3_BLOCK_M), slices)](
+    _hc_mix_stats_bf16x3_kernel[(triton.cdiv(m, block_m), slices)](
         x,
         *weight_parts,
         part_mix,
@@ -2606,7 +2643,7 @@ def hc_mix_stats_sinkhorn_bf16x3(
         MIX_COLS=mix,
         MIX_PAD=triton.next_power_of_2(mix),
         BLOCK_K=_HC_MIX_BLOCK_K,
-        BLOCK_M=_HC_MIX_BF16X3_BLOCK_M,
+        BLOCK_M=block_m,
         num_warps=4,
         num_stages=3,
     )

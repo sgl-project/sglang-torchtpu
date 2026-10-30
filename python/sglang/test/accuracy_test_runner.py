@@ -55,6 +55,8 @@ class AccuracyTestParams:
     num_shots: Optional[int] = None  # few-shot count; None = run_eval's default
     # Report a completed score without comparing it to a quality floor.
     report_only: bool = False
+    # Fail the gate if any serving-time XLA recompilation or cache load occurred.
+    fail_on_recompile: bool = False
 
     def __post_init__(self) -> None:
         if self.spec_accept_length_threshold is not None and (
@@ -609,6 +611,7 @@ def run_accuracy_test(
 
     spec_accept_lengths = None
     spec_accept_length_error = None
+    recompile_failures: List[str] = []
     with served(model, base_url):
         success, error, metrics = _dispatch_eval(model, params, base_url)
         if success and params.spec_accept_length_threshold is not None:
@@ -616,6 +619,12 @@ def run_accuracy_test(
                 spec_accept_lengths = _get_avg_spec_accept_lengths(base_url)
             except (TypeError, ValueError, requests.RequestException) as exc:
                 spec_accept_length_error = str(exc)
+        if success and params.fail_on_recompile:
+            from sglang.test.recompilation_gate import (
+                check_no_serving_recompilation,
+            )
+
+            recompile_failures = check_no_serving_recompilation(base_url)
 
     if not success:
         print(f"✗ Accuracy test failed for {model.model_path}: {error}")
@@ -636,7 +645,8 @@ def run_accuracy_test(
         score = metrics.get("mean_score")
     if score is None:
         score = metrics.get("accuracy")
-    if params.report_only and score is None:
+    # A graded gate with no score must not reach the dashboard as a 0.0.
+    if score is None and (params.report_only or params.floor is not None):
         error = f"{params.name}: eval completed without a numeric score"
         print(f"✗ {error}")
         return AccuracyTestResult(
@@ -718,6 +728,15 @@ def run_accuracy_test(
                 f"minimum {min(spec_accept_lengths):.4f} >= threshold "
                 f"{spec_threshold:.4f}"
             )
+
+    if params.fail_on_recompile:
+        if recompile_failures:
+            recompile_error = f"{params.name}: " + "; ".join(recompile_failures)
+            passed = False
+            error = "; ".join(filter(None, [error, recompile_error]))
+            print(f"✗ {recompile_error}")
+        else:
+            print(f"✓ {params.name}: zero serving-time XLA recompilations")
 
     return AccuracyTestResult(
         model=model.model_path,

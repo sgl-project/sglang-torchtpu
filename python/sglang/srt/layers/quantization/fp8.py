@@ -56,7 +56,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
     block_fp8_scale_to_mxfp8_e8m0,
-    block_quant_dequant,
     can_auto_enable_marlin_fp8,
     can_serve_block_fp8_as_mxfp8,
     cutlass_fp8_supported,
@@ -90,7 +89,6 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import (
-    get_exec,
     get_parallel,
     get_platform,
 )
@@ -130,6 +128,9 @@ _is_cpu = is_cpu()
 _is_tpu = is_tpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
+
+if _is_hip:
+    from sglang.srt.layers.quantization import fp8_hip
 # gfx942 (MI300) has no MX matmul HW; MXFP8 checkpoints are converted to
 # block-fp8 [128,128] at load and run through the native block-fp8 kernels.
 # SGLANG_FORCE_MXFP8_BLOCK_CONVERT=1 opts into that same block-fp8 path on
@@ -146,23 +147,6 @@ _is_gfx1250_supported = is_gfx1250_supported()
 # gfx1250 grouped MoE runs the a8w4 (fp8 activation) FlyDSL kernel when
 # AITER_FORCE_A8W4 is set; that kernel consumes (16,16)-preshuffled weights.
 _use_aiter_a8w4 = get_bool_env_var("AITER_FORCE_A8W4", "false")
-
-
-def _get_tpu_fp8_runtime() -> str:
-    return get_exec().kernel.tpu_fp8_runtime
-
-
-def _clear_replaced_param(module: Module, name: str) -> None:
-    param = getattr(module, name, None)
-    if not isinstance(param, Parameter):
-        setattr(module, name, None)
-        return
-
-    old = param.data
-    param.data = torch.empty(0, dtype=old.dtype, device=old.device)
-    if old.untyped_storage().data_ptr() != param.data.untyped_storage().data_ptr():
-        old.untyped_storage().resize_(0)
-    setattr(module, name, None)
 
 
 def _scaled_fp8_quant_tpu_weight(
@@ -570,16 +554,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 act_scale_ue8m0=isinstance(self.quant_config, Fp8Config)
                 and self.quant_config.scale_fmt == "ue8m0",
             )
-            if _is_tpu and self.block_quant:
-                # Register the Pallas block-FP8 op at construction, before
-                # torch.compile traces the model, so the traced forward is a
-                # plain op lookup. Mirrors the RPA v3 backend and the fused-MoE
-                # registration path.
-                from sglang.srt.hardware_backend.tpu.quantized_matmul import (
-                    register_tpu_block_fp8_matmul_op,
-                )
-
-                register_tpu_block_fp8_matmul_op()
         # Method-wide gate; a layer that cannot take the MXFP8 view stays on the
         # block kernel (see _prepare_block_fp8_as_mxfp8).
         self.block_fp8_as_mxfp8 = not self.use_mxfp8 and can_serve_block_fp8_as_mxfp8(
@@ -661,16 +635,6 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
-        if _is_tpu:
-            tp_rank = get_parallel().tp_rank
-            layer.tpu_fp8_output_tp_rank = (
-                tp_rank if output_size != output_size_per_partition else 0
-            )
-            layer.tpu_fp8_input_offset = (
-                tp_rank * input_size_per_partition
-                if input_size != input_size_per_partition
-                else 0
-            )
         layer.orig_dtype = params_dtype
 
         if block_quant:
@@ -711,25 +675,20 @@ class Fp8LinearMethod(LinearMethodBase):
                 scale_dtype = torch.uint8 if use_mxfp8 else torch.float32
                 scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.empty
                 if _is_tpu and not use_mxfp8:
-                    tp_rank = get_parallel().tp_rank
-                    output_tp_rank = (
-                        tp_rank if output_size != output_size_per_partition else 0
+                    from sglang_tpu.fp8_linear import (
+                        compute_tpu_fp8_linear_scale_shape,
                     )
-                    scale_rows = sum(
-                        (output_tp_rank * partition_size + partition_size + block_n - 1)
-                        // block_n
-                        - (output_tp_rank * partition_size) // block_n
-                        for partition_size in output_partition_sizes
+
+                    scale_rows, scale_cols = compute_tpu_fp8_linear_scale_shape(
+                        layer,
+                        input_size=input_size,
+                        input_size_per_partition=input_size_per_partition,
+                        output_size=output_size,
+                        output_size_per_partition=output_size_per_partition,
+                        output_partition_sizes=output_partition_sizes,
+                        block_n=block_n,
+                        block_k=block_k,
                     )
-                    if input_size != input_size_per_partition:
-                        scale_cols = (
-                            tp_rank * input_size_per_partition
-                            + input_size_per_partition
-                            + block_k
-                            - 1
-                        ) // block_k - (tp_rank * input_size_per_partition) // block_k
-                    else:
-                        scale_cols = (input_size_per_partition + block_k - 1) // block_k
                 else:
                     scale_rows = (output_size_per_partition + block_n - 1) // block_n
                     scale_cols = (input_size_per_partition + block_k - 1) // block_k
@@ -898,6 +857,46 @@ class Fp8LinearMethod(LinearMethodBase):
 
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
+        if hasattr(layer, "_block_fp8_bf16_weight"):
+            layer._block_fp8_bf16_weight = None
+            layer._derived_weight_cache_error = None
+        if (
+            _is_cuda
+            and get_platform().is_sm90
+            and envs.SGLANG_OPT_HOPPER_BLOCK_FP8_BF16.get()
+            and weight.is_cuda
+            and weight.dtype == torch.float8_e4m3fn
+            and self.weight_block_size == [32, 32]
+            and getattr(self.quant_config, "scale_fmt", None) == "ue8m0"
+            and getattr(layer, "orig_dtype", None) == torch.bfloat16
+            and not self.use_marlin
+            and not getattr(layer, "keep_plain_weight_layout", False)
+        ):
+            from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+            from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+
+            # Keep even the smallest/largest finite E4M3 value representable
+            # as normal BF16, and reject mislabeled non-power-of-two scales.
+            exact_bf16_scales = (
+                (weight_scale >= 2.0**-117)
+                & (weight_scale <= 2.0**119)
+                & (torch.frexp(weight_scale)[0] == 0.5)
+            ).all()
+            if not is_batch_invariant_mode_enabled() and exact_bf16_scales.item():
+                # Hopper group32 FP8 accumulates each 32-wide block separately.
+                # Reuse a BF16 weight expansion for larger GEMMs, keeping the
+                # original FP8 weights for decode and weight reloads.
+                layer.register_buffer(
+                    "_block_fp8_bf16_weight",
+                    block_quant_dequant(weight, weight_scale, [32, 32], torch.bfloat16),
+                    persistent=False,
+                )
+                layer._derived_weight_cache_error = (
+                    "Online weight updates are not supported while Hopper FP8 "
+                    "BF16 weight caches are active: captured CUDA graphs retain "
+                    "these derived weights. Restart with "
+                    "SGLANG_OPT_HOPPER_BLOCK_FP8_BF16=0 to allow online updates."
+                )
         if self.block_fp8_as_mxfp8:
             self._prepare_block_fp8_as_mxfp8(layer)
 
@@ -1030,6 +1029,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 "weight_scale_inv_swizzled",
                 block_scale_interleave(scale_u8.contiguous()).contiguous(),
             )
+        elif backend.is_gfx95():
+            fp8_hip.process_dense_weights(self, layer, scale_u8)
         elif backend.is_deep_gemm():
             from sglang.srt.layers.deep_gemm_wrapper.configurer import (
                 DEEPGEMM_SCALE_UE8M0,
@@ -1089,46 +1090,18 @@ class Fp8LinearMethod(LinearMethodBase):
         self._process_mxfp8_linear_weight_scale(layer)
         layer.input_scale = None
 
-    def _requantize_tpu_block_fp8_to_channelwise(self, layer: Module) -> None:
-        weight = layer.weight.data
-        weight_dequant = block_quant_dequant(
-            weight,
-            layer.weight_scale_inv.data,
-            self.quant_config.weight_block_size,
-            torch.float32,
-        )
-        dtype_max = torch.finfo(weight.dtype).max
-        weight_scale = torch.clamp(
-            weight_dequant.abs().amax(dim=1, keepdim=True) / dtype_max,
-            min=1e-12,
-        )
-        weight = torch.clamp(
-            weight_dequant / weight_scale,
-            min=-dtype_max,
-            max=dtype_max,
-        ).to(weight.dtype)
-
-        layer.weight = Parameter(weight.t().contiguous(), requires_grad=False)
-        layer.weight_scale = Parameter(weight_scale, requires_grad=False)
-        _clear_replaced_param(layer, "weight_scale_inv")
-        layer.weight_block_size = None
-        layer.input_scale = None
-
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
             if _is_tpu and not self.use_mxfp8:
-                if _get_tpu_fp8_runtime() == "channelwise":
-                    logger.warning_once(
-                        "TPU dense FP8 linear is converting block-FP8 checkpoint "
-                        "weights to channelwise runtime scales by default for "
-                        "performance. Use --tpu-fp8-runtime=channelwise to make "
-                        "this explicit, or --tpu-fp8-runtime=blockwise to preserve "
-                        "blockwise runtime scales."
-                    )
-                    self._requantize_tpu_block_fp8_to_channelwise(layer)
-                else:
-                    layer.weight_block_size = self.quant_config.weight_block_size
+                from sglang_tpu.fp8_linear import (
+                    prepare_tpu_fp8_linear_weights,
+                )
+
+                prepare_tpu_fp8_linear_weights(
+                    layer,
+                    weight_block_size=self.quant_config.weight_block_size,
+                )
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -1278,6 +1251,9 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
+        if _is_hip and self.block_fp8_as_mxfp8 and self.mxfp8_dense_backend.is_gfx95():
+            return fp8_hip.apply_dense(self, layer, x, bias)
+
         mxfp8_view = self.use_mxfp8 or (
             self.block_fp8_as_mxfp8 and layer.block_fp8_mxfp8_ready
         )
@@ -1337,19 +1313,21 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             return out
 
+        if (
+            _is_tpu
+            and not self.use_mxfp8
+            and (not self.block_quant or layer.weight_block_size is None)
+        ):
+            from sglang_tpu.fp8_linear import apply_tpu_fp8_linear
+
+            return apply_tpu_fp8_linear(
+                x=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                bias=bias,
+            )
+
         if self.block_quant:
-            if _is_tpu and not self.use_mxfp8 and layer.weight_block_size is None:
-                from sglang.srt.hardware_backend.tpu.fp8_linear import (
-                    apply_tpu_fp8_linear,
-                )
-
-                return apply_tpu_fp8_linear(
-                    x=x,
-                    weight=layer.weight,
-                    weight_scale=layer.weight_scale,
-                    bias=bias,
-                )
-
             if use_intel_amx_backend(layer):
                 return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
                     x,
@@ -1361,6 +1339,10 @@ class Fp8LinearMethod(LinearMethodBase):
                     True,  # is_vnni
                 )
 
+            cached_weight = getattr(layer, "_block_fp8_bf16_weight", None)
+            extra_kwargs = (
+                {"weight_bf16": cached_weight} if cached_weight is not None else {}
+            )
             if isinstance(x, tuple):
                 return self.w8a8_block_fp8_linear(
                     input=x[0],
@@ -1369,6 +1351,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale=layer.weight_scale_inv,
                     input_scale=x[1],
                     bias=bias,
+                    **extra_kwargs,
                 )
 
             return self.w8a8_block_fp8_linear(
@@ -1378,16 +1361,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_scale_inv,
                 input_scale=None,
                 bias=bias,
-            )
-
-        if _is_tpu and not self.block_quant and not self.use_mxfp8:
-            from sglang.srt.hardware_backend.tpu.fp8_linear import apply_tpu_fp8_linear
-
-            return apply_tpu_fp8_linear(
-                x=x,
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                bias=bias,
+                **extra_kwargs,
             )
 
         if use_intel_amx_backend(layer):
@@ -2163,6 +2137,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 logger.warning_once("Dequantized FP4 expert weights to FP8.")
 
             if self.is_fp4_expert:
+                if _is_tpu:
+                    return
                 if _is_npu:
                     self._process_npu_fp4_expert_weights(layer)
                     return
@@ -2556,6 +2532,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight.is_shuffled = True
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        quant_fn = _scaled_fp8_quant_tpu_weight if _is_tpu else scaled_fp8_quant
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
 
@@ -2580,22 +2557,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
             for expert in range(layer.num_local_experts):
-                if _is_tpu:
-                    w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                        _scaled_fp8_quant_tpu_weight(
-                            layer.w13_weight.data[expert, :, :]
-                        )
-                    )
-                    w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                        _scaled_fp8_quant_tpu_weight(layer.w2_weight.data[expert, :, :])
-                    )
-                else:
-                    w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                        scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
-                    )
-                    w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                        scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
-                    )
+                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = quant_fn(
+                    layer.w13_weight.data[expert, :, :]
+                )
+                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = quant_fn(
+                    layer.w2_weight.data[expert, :, :]
+                )
             layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
@@ -2674,22 +2641,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                             layer.w13_weight[expert_id][start : start + shard_size, :],
                             layer.w13_weight_scale[expert_id][shard_id],
                         )
-                        if _is_tpu:
-                            (
-                                layer.w13_weight[expert_id][
-                                    start : start + shard_size, :
-                                ],
-                                _,
-                            ) = _scaled_fp8_quant_tpu_weight(
-                                dq_weight, max_w13_scales[expert_id]
-                            )
-                        else:
-                            (
-                                layer.w13_weight[expert_id][
-                                    start : start + shard_size, :
-                                ],
-                                _,
-                            ) = scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
+                        (
+                            layer.w13_weight[expert_id][start : start + shard_size, :],
+                            _,
+                        ) = quant_fn(dq_weight, max_w13_scales[expert_id])
                         start += shard_size
 
             layer.w13_weight_scale = torch.nn.Parameter(
@@ -2711,7 +2666,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
         if _is_tpu:
-            from sglang.srt.hardware_backend.tpu.fp8_moe import (
+            from sglang_tpu.fp8_moe import (
                 prepare_tpu_fp8_moe_weights,
             )
 
@@ -2727,7 +2682,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend.is_auto()
                 or moe_runner_backend.is_pallas_tpu_fused_rs()
             ):
-                from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
+                from sglang_tpu.fp8_moe_fused_rs import (
                     prepare_fp8_fused_rs,
                 )
 
@@ -2846,7 +2801,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight=layer.w2_weight,
                 block_quant=True,
                 global_num_experts=int(layer.num_experts),
-                moe_ep_rank=int(layer.moe_ep_rank),
                 w13_weight_scale_inv=layer.hpc_ops_w13_weight_scale,
                 w2_weight_scale_inv=layer.hpc_ops_w2_weight_scale,
                 block_shape=self.quant_config.weight_block_size,
@@ -2857,7 +2811,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight=layer.w2_weight,
                 block_quant=False,
                 global_num_experts=int(layer.num_experts),
-                moe_ep_rank=int(layer.moe_ep_rank),
                 gate_up_alphas=layer.hpc_ops_gate_up_alphas,
                 down_alphas=layer.hpc_ops_down_alphas,
                 w13_input_scale=layer.w13_input_scale,
@@ -3086,7 +3039,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if _is_tpu:
             if self.handles_moe_reduction:
-                from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
+                from sglang_tpu.fp8_moe_fused_rs import (
                     apply_fp8_fused_rs,
                 )
 
@@ -3094,8 +3047,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer=layer,
                     dispatch_output=dispatch_output,
                     activation=moe_runner_config.activation,
+                    swiglu_limit=moe_runner_config.swiglu_limit,
                 )
-            from sglang.srt.hardware_backend.tpu.fp8_moe import apply_tpu_fp8_moe
+            from sglang_tpu.fp8_moe import apply_tpu_fp8_moe
 
             return apply_tpu_fp8_moe(
                 layer=layer,

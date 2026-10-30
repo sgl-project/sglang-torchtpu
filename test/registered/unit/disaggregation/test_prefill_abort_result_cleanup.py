@@ -4,9 +4,12 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
+from sglang.srt.managers import scheduler_pp_mixin
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -17,6 +20,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -28,6 +32,7 @@ class _Req:
         self.inflight_middle_chunks = inflight_middle_chunks
         self.kv = ReqKvInfo(
             req_pool_idx=1 if allocated else None,
+            kv_committed_len=1 if allocated else 0,
             kv_allocated_len=1 if allocated else 0,
             mamba_pool_idx=object() if allocated else None,
         )
@@ -55,8 +60,11 @@ class _Req:
         self.finished_reason = self.to_finish
         self.to_finish = None
 
+    def owned_kv_len(self):
+        return self.kv.kv_committed_len
 
-class _Scheduler(SchedulerDisaggregationPrefillMixin):
+
+class _Scheduler(Scheduler):
     def __init__(self):
         self.batch_result_processor = SimpleNamespace(
             snapshot_auxiliary_output_starts=Mock(return_value=[]),
@@ -74,6 +82,34 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.req_to_metadata_buffer_idx_allocator = Mock()
         self.enable_hicache_storage = True
         self.chunked_req = None
+        self._deferred_chunked_sender_aborts = []
+        # The TPU raiden release path reads the transfer backend.
+        self.transfer_backend = None
+
+
+class _ChunkedAbortScheduler(_Scheduler):
+    """Sets up chunked-abort state on the scheduler fake."""
+
+    def __init__(self, req):
+        super().__init__()
+        self.disaggregation_mode = DisaggregationMode.PREFILL
+        self.attn_tp_cpu_group = None
+        self.attn_cp_cpu_group = None
+        self.chunked_req = req
+        # abort_request defers a mid chunked-prefill abort to the next step.
+        self._pending_chunked_abort_req = req
+        self.ipc_channels = Mock()
+        # No mamba state (e.g. hybrid SWA): releasing a request that holds no
+        # KV trips release_kv_cache's free-before-alloc assert.
+        self.tree_cache.supports_mamba.return_value = False
+        self.tree_cache.claim_kv_row.return_value = False
+        self.tree_cache.token_to_kv_pool_allocator.page_size = 1
+
+        def free_row(owner):
+            assert owner.kv.holds_kv
+            owner.kv.req_pool_idx = None
+
+        self.tree_cache.req_to_token_pool.free.side_effect = free_row
 
 
 def _batch(req):
@@ -97,9 +133,9 @@ def _free_req(req, _tree_cache, *, is_insert):
 
 
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
-@patch("sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req")
+@patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
 def test_aborted_final_result_releases_hybrid_cache(
-    maybe_cache_unfinished_req, release_kv_cache
+    checkpoint_kv_cache, release_kv_cache
 ):
     scheduler = _Scheduler()
     req = _Req(inflight_middle_chunks=0)
@@ -107,7 +143,7 @@ def test_aborted_final_result_releases_hybrid_cache(
     scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
 
     release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
-    maybe_cache_unfinished_req.assert_not_called()
+    checkpoint_kv_cache.assert_not_called()
     req.disagg_kv_sender.abort.assert_called_once_with()
     scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
     scheduler.tree_cache.finish.assert_called_once_with(
@@ -178,9 +214,9 @@ def test_sender_abort_failure_does_not_skip_local_cleanup(release_kv_cache):
 
 
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
-@patch("sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req")
+@patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
 def test_grammar_rejection_retires_prefill_before_transfer(
-    maybe_cache_unfinished_req, release_kv_cache
+    checkpoint_kv_cache, release_kv_cache
 ):
     scheduler = _Scheduler()
     req = _Req(inflight_middle_chunks=0)
@@ -194,10 +230,96 @@ def test_grammar_rejection_retires_prefill_before_transfer(
     assert req.grammar.finished
     assert req.finished()
     release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
-    maybe_cache_unfinished_req.assert_not_called()
+    checkpoint_kv_cache.assert_not_called()
     scheduler.send_kv_chunk.assert_not_called()
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
     assert scheduler.disagg_prefill_inflight_queue == []
+
+
+def test_overlap_chunked_abort_releases_parked_pages_once_after_drain():
+    """Under overlap, the chunk launched before the abort resolves after the
+    abort has parked the request's pages behind the sender's drain."""
+    req = _Req(inflight_middle_chunks=1)
+    req.extend_range = SimpleNamespace(end=50)
+    req.kv.mamba_pool_idx = None
+    req.time_stats.trace_ctx = Mock()
+    req.weight_version_events = []
+    req.disagg_kv_sender = Mock(group_failure_requires_drain=True)
+    req.disagg_kv_sender.drained.side_effect = [False, True]
+    scheduler = _ChunkedAbortScheduler(req)
+
+    with get_context().override_server_args():
+        # Step N: the abort parks the pages while the sender still reads them,
+        scheduler.process_pending_chunked_abort()
+        # then the same step resolves the middle chunk launched in step N-1.
+        scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+        held_until_drain = req.kv.holds_kv
+        # Step N+1: the sender has drained.
+        scheduler.process_pending_chunked_abort()
+
+    assert held_until_drain
+    scheduler.tree_cache.req_to_token_pool.free.assert_called_once_with(req)
+    assert scheduler._deferred_chunked_sender_aborts == []
+    req.disagg_kv_sender.abort.assert_called_once_with()
+    req.disagg_kv_sender.clear.assert_called_once_with()
+    scheduler.tree_cache.finish.assert_called_once_with(
+        req.cache_request_handle, CacheRequestOutcome.ABORT
+    )
+    scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
+    scheduler.output_streamer.stream_output.assert_not_called()
+    assert req.rid not in scheduler.disagg_prefill_pending_chunk_rids
+
+
+@pytest.mark.parametrize("pp_size", [1, 2])
+@patch("sglang.srt.managers.scheduler.release_kv_cache", side_effect=_free_req)
+@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+def test_aborted_final_result_keeps_pages_until_its_sender_drains(
+    release_at_result, release_after_drain, pp_size
+):
+    """A sender that may still read an aborted request's pages kept reading
+    them after the result point freed them. Its pages now wait for its drain;
+    a pipeline stage does not free them on its own drain, since its free pages
+    would then differ from the other stages' and their next batches diverge,
+    but on the in-flight queue's release consensus, which they join."""
+    scheduler = _Scheduler()
+    scheduler.attn_tp_cpu_group = scheduler.attn_cp_cpu_group = None
+    scheduler.scheduler_stage_metrics = None
+    scheduler.pp_group = SimpleNamespace(is_first_rank=True)
+    req = _Req(inflight_middle_chunks=0)
+    sender = req.disagg_kv_sender = Mock(group_failure_requires_drain=True)
+    sender.drained.return_value = pp_size > 1  # a drained stage still waits
+    sender.poll.return_value = KVPoll.Failed
+    with (
+        patch(
+            "sglang.srt.managers.scheduler.get_parallel",
+            return_value=SimpleNamespace(pp_size=pp_size),
+        ),
+        patch(
+            "sglang.srt.managers.scheduler.current_platform",
+            SimpleNamespace(is_tpu=lambda: False),
+        ),
+        patch.object(
+            scheduler_pp_mixin,
+            "poll_and_all_reduce_attn_cp_tp_group",
+            lambda pollers, *groups: [int(p.poll()) for p in pollers],
+        ),
+    ):
+        scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+        assert scheduler._deferred_chunked_sender_aborts == [req]
+        scheduler._drain_deferred_chunked_sender_aborts()
+        assert req.kv.holds_kv
+        if pp_size == 1:
+            sender.drained.return_value = True
+            scheduler._drain_deferred_chunked_sender_aborts()
+        else:
+            assert scheduler._pp_pd_get_prefill_transferred_ids() == [req.rid]
+            scheduler.process_disagg_prefill_inflight_queue([req.rid])
+    release_at_result.assert_not_called()
+    release_after_drain.assert_called_once_with(
+        req, scheduler.tree_cache, is_insert=False
+    )
+    sender.clear.assert_called_once_with()
+    assert scheduler._deferred_chunked_sender_aborts == []
 
 
 def test_aborted_result_releases_mamba_allocated_before_kv():
@@ -266,6 +388,75 @@ def test_sampling_mask_abort_preserves_error_and_releases_once(
     )
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
     scheduler.send_kv_chunk.assert_not_called()
+
+
+class TestPrefillCompleteResult(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        override = get_context().override_server_args(
+            disaggregation_decode_allocation_policy="prefill_complete"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+    @patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
+    def test_ready_observes_accepted_token_and_speculative_sidecars(self, cache):
+        scheduler = _Scheduler()
+        scheduler.spec_algorithm = SimpleNamespace(is_eagle=lambda: True)
+        req = _Req(inflight_middle_chunks=0)
+        req.to_finish = None
+        req.time_stats.set_prefill_transfer_queue_entry_time = Mock()
+        draft = SimpleNamespace(
+            hidden_states=torch.tensor([[1.0, 2.0]]),
+            topk_p=torch.tensor([[0.75, 0.25]]),
+            topk_index=torch.tensor([[3, 4]]),
+            dsa_topk_indices=torch.tensor([[5, 6]]),
+        )
+        batch = _batch(req)
+        batch.spec_info = draft
+        result = GenerationBatchResult(
+            next_token_ids=torch.tensor([11]), next_draft_input=draft
+        )
+        observed = []
+
+        def ready():
+            observed.append(
+                (
+                    list(req.output_ids),
+                    req.hidden_states_tensor.tolist(),
+                    req.output_dsa_topk_indices.tolist(),
+                    req in scheduler.disagg_prefill_inflight_queue,
+                )
+            )
+
+        req.disagg_kv_sender.mark_prefill_complete.side_effect = ready
+        scheduler.process_batch_result_disagg_prefill(batch, result)
+        self.assertEqual(observed, [([11], [1.0, 2.0], [5, 6], True)])
+        self.assertTrue(req.pending_bootstrap)
+        scheduler.send_kv_chunk.assert_not_called()
+
+    @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+    def test_aborted_final_result_never_publishes_ready(self, release):
+        scheduler = _Scheduler()
+        req = _Req(inflight_middle_chunks=0)
+        scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+        self.assertTrue(req.finished())
+        self.assertFalse(req.kv.holds_kv)
+        self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])
+        req.disagg_kv_sender.mark_prefill_complete.assert_not_called()
+
+    @patch("sglang.srt.disaggregation.prefill.should_force_retry", return_value=True)
+    def test_discarded_attempt_never_publishes_ready(self, force_retry):
+        scheduler = _Scheduler()
+        req = _Req(inflight_middle_chunks=0)
+        req.to_finish = None
+        retried = []
+        scheduler.optimistic_release_and_requeue = lambda r: retried.append(r)
+        scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+        self.assertEqual(retried, [req])
+        self.assertEqual(req.output_ids, [])
+        self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])
+        req.disagg_kv_sender.mark_prefill_complete.assert_not_called()
 
 
 if __name__ == "__main__":

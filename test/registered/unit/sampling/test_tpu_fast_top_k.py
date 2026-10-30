@@ -7,31 +7,12 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 import importlib
 import unittest
+from itertools import product
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu import sampler as tpu_sampler_module
-from sglang.srt.hardware_backend.tpu import top_k as tpu_top_k_module
-from sglang.srt.hardware_backend.tpu.row_pad import pad_rows, row_bucket
-from sglang.srt.hardware_backend.tpu.sampler import (
-    TpuSampler,
-    distributed_top_k_candidate_width,
-    distributed_top_k_for_batch,
-    sample_from_global_top_k_logits,
-    select_logits_output_mode,
-)
-from sglang.srt.hardware_backend.tpu.top_k import (
-    PallasDistributedTopKConfig,
-    PallasDistributedTopKNegotiation,
-    TpuVocabShard,
-    distributed_tpu_top_k,
-    negotiate_pallas_distributed_top_k_config,
-    supports_distributed_tpu_top_k,
-    tpu_top_k,
-)
 from sglang.srt.layers import logits_processor as logits_processor_module
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -40,12 +21,35 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, LogitsOutputMode
 from sglang.srt.model_executor.runner import eager_runner as eager_runner_module
 from sglang.srt.model_executor.runner.eager_runner import EagerRunner
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu import sampler as tpu_sampler_module
+from sglang_tpu import top_k as tpu_top_k_module
+from sglang_tpu.envs import envs
+from sglang_tpu.row_pad import pad_rows, row_bucket
+from sglang_tpu.sampler import (
+    MAX_DISTRIBUTED_TOP_K,
+    TpuSampler,
+    distributed_top_k_candidate_width,
+    distributed_top_k_for_batch,
+    sample_from_global_top_k_logits,
+    select_logits_output_mode,
+)
+from sglang_tpu.top_k import (
+    PallasDistributedTopKConfig,
+    PallasDistributedTopKNegotiation,
+    TpuVocabShard,
+    distributed_tpu_top_k,
+    negotiate_pallas_distributed_top_k_config,
+    supports_distributed_tpu_top_k,
+    tpu_top_k,
+)
 
 
 def _forward_batch(*, batch_size=1, **info_overrides):
     info = SimpleNamespace(
+        sampling_params_on_cpu=False,
         uniform_top_k=50,
         is_any_greedy=False,
         need_top_k_sampling=True,
@@ -130,6 +134,18 @@ def _distributed_top_k_model(shard_width=202_048 // 16):
     return SimpleNamespace(logits_processor=processor, lm_head=lm_head)
 
 
+def _padded_top_k(probs_block, ids_block):
+    """tpu_top_k stand-in returning the given block zero-padded to the requested width."""
+
+    def top_k(probs, k):
+        pad = (0, k - probs_block.shape[1])
+        return torch.nn.functional.pad(probs_block, pad), torch.nn.functional.pad(
+            ids_block, pad
+        )
+
+    return top_k
+
+
 class TestDistributedTopKEligibility(CustomTestCase):
     def test_eager_runner_selects_logits_output_mode_only_on_tpu(self):
         model = _distributed_top_k_model()
@@ -211,7 +227,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
                 return_value=True,
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.sampler.get_parallel",
+                "sglang_tpu.sampler.get_parallel",
                 return_value=SimpleNamespace(tp_group=group, attn_tp_group=group),
             ) as get_group,
             patch.object(
@@ -220,7 +236,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
                 return_value=PallasDistributedTopKNegotiation(config, None),
             ) as negotiate,
             patch(
-                "sglang.srt.hardware_backend.tpu.distributed_topk_pallas."
+                "sglang_tpu.distributed_topk_pallas."
                 "register_pallas_distributed_top_k_op"
             ) as register,
         ):
@@ -277,7 +293,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
                 return_value=True,
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.sampler.get_parallel",
+                "sglang_tpu.sampler.get_parallel",
                 return_value=SimpleNamespace(tp_group=group, attn_tp_group=group),
             ),
             patch.object(
@@ -286,7 +302,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
                 return_value=PallasDistributedTopKNegotiation(config, None),
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.distributed_topk_pallas."
+                "sglang_tpu.distributed_topk_pallas."
                 "register_pallas_distributed_top_k_op"
             ),
         ):
@@ -374,6 +390,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
     def test_speculative_batch_does_not_inspect_sampling_info(self):
         class SpecBatch:
             spec_algorithm = SpeculativeAlgorithm.EAGLE3
+            logits_output_mode = LogitsOutputMode.FULL_VOCAB
 
             @property
             def sampling_info(self):
@@ -382,10 +399,19 @@ class TestDistributedTopKEligibility(CustomTestCase):
         self.assertIsNone(
             distributed_top_k_for_batch(SpecBatch(), sampling_backend="tpu")
         )
+        with patch.object(
+            tpu_sampler_module, "distributed_top_k_candidate_width_for_model"
+        ) as candidate_width:
+            self.assertIs(
+                select_logits_output_mode(SpecBatch(), object()),
+                LogitsOutputMode.FULL_VOCAB,
+            )
+        candidate_width.assert_not_called()
 
     def test_draft_batch_does_not_inspect_sampling_state(self):
         class DraftBatch:
             spec_info = object()
+            logits_output_mode = LogitsOutputMode.FULL_VOCAB
 
             @property
             def spec_algorithm(self):
@@ -398,6 +424,61 @@ class TestDistributedTopKEligibility(CustomTestCase):
         self.assertIsNone(
             distributed_top_k_for_batch(DraftBatch(), sampling_backend="tpu")
         )
+        with patch.object(
+            tpu_sampler_module, "distributed_top_k_candidate_width_for_model"
+        ) as candidate_width:
+            self.assertIs(
+                select_logits_output_mode(DraftBatch(), object()),
+                LogitsOutputMode.FULL_VOCAB,
+            )
+        candidate_width.assert_not_called()
+
+    def test_speculative_batch_keeps_the_worker_requested_mode(self):
+        class VerifyBatch:
+            spec_info = object()
+            logits_output_mode = LogitsOutputMode.DISTRIBUTED_TOP_K
+
+        with patch.object(
+            tpu_sampler_module, "distributed_top_k_candidate_width_for_model"
+        ) as candidate_width:
+            self.assertIs(
+                select_logits_output_mode(VerifyBatch(), object()),
+                LogitsOutputMode.DISTRIBUTED_TOP_K,
+            )
+        candidate_width.assert_not_called()
+
+    def test_non_speculative_selection_keeps_capability_negotiation_order(self):
+        batch = _forward_batch(batch_size=64)
+        model = object()
+        calls = MagicMock()
+        with (
+            patch.object(
+                tpu_sampler_module,
+                "distributed_top_k_candidate_width_for_model",
+            ) as candidate_width,
+            patch.object(
+                tpu_sampler_module, "distributed_top_k_for_batch"
+            ) as requested_top_k,
+        ):
+            calls.attach_mock(candidate_width, "candidate_width")
+            calls.attach_mock(requested_top_k, "requested_top_k")
+            for width, requested, expected in (
+                (None, 50, LogitsOutputMode.FULL_VOCAB),
+                (64, None, LogitsOutputMode.FULL_VOCAB),
+                (64, 65, LogitsOutputMode.FULL_VOCAB),
+                (64, 50, LogitsOutputMode.DISTRIBUTED_TOP_K),
+            ):
+                with self.subTest(width=width, requested=requested):
+                    calls.reset_mock()
+                    candidate_width.return_value = width
+                    requested_top_k.return_value = requested
+                    self.assertIs(select_logits_output_mode(batch, model), expected)
+                    expected_calls = [call.candidate_width(model)]
+                    if width is not None:
+                        expected_calls.append(
+                            call.requested_top_k(batch, sampling_backend="tpu")
+                        )
+                    self.assertEqual(calls.mock_calls, expected_calls)
 
     def test_environment_can_raise_the_pre_gather_cutoff(self):
         cutoff = envs.SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE
@@ -471,6 +552,33 @@ class TestDistributedTopKEligibility(CustomTestCase):
 
 
 class TestTpuSamplerGlobalTopK(CustomTestCase):
+    def test_host_padding_keeps_candidate_width_and_exact_requested_support(self):
+        probs = torch.arange(128, 0, -1, dtype=torch.float32).reshape(1, -1)
+        probs /= probs.sum()
+        for k in (2, 20, 50, 64):
+            with self.subTest(k=k):
+                info = _forward_batch(uniform_top_k=k).sampling_info
+                info.top_ks = torch.tensor([k], dtype=torch.int32)
+                observed = []
+
+                def sample(weights, **kwargs):
+                    observed.append(weights)
+                    return weights.argmax(-1).to(torch.int32)
+
+                with (
+                    patch("sglang_tpu.top_k.tpu_top_k", side_effect=torch.topk),
+                    patch.object(
+                        tpu_sampler_module, "sampling_from_probs_torch", sample
+                    ),
+                ):
+                    result, _ = TpuSampler._sample_from_probs(
+                        SimpleNamespace(), probs, info, torch.zeros(1), False
+                    )
+                self.assertEqual(observed[0].shape, (1, 64))
+                torch.testing.assert_close(observed[0][:, :k], probs[:, :k])
+                self.assertEqual(torch.count_nonzero(observed[0][:, k:]).item(), 0)
+                self.assertEqual(result.tolist(), [0])
+
     def test_global_top_k_outputs_are_paired_and_exclusive(self):
         with self.assertRaisesRegex(ValueError, "must be provided together"):
             LogitsProcessorOutput(
@@ -618,8 +726,8 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
 
         with (
             patch(
-                "sglang.srt.hardware_backend.tpu.top_k.tpu_top_k",
-                return_value=(global_top_k_probs, global_top_k_token_ids),
+                "sglang_tpu.top_k.tpu_top_k",
+                side_effect=_padded_top_k(global_top_k_probs, global_top_k_token_ids),
             ),
             patch.object(
                 tpu_sampler_module,
@@ -633,9 +741,10 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
 
         torch.testing.assert_close(actual, torch.tensor([11, 20], dtype=torch.int32))
         self.assertIsNotNone(capture)
-        torch.testing.assert_close(capture.weights, torch.tensor([[0.6, 0.4]]))
+        torch.testing.assert_close(capture.weights[:, :2], torch.tensor([[0.6, 0.4]]))
+        self.assertEqual(torch.count_nonzero(capture.weights[:, 2:]).item(), 0)
         torch.testing.assert_close(
-            capture.token_ids, torch.tensor([[20, 21]], dtype=torch.int32)
+            capture.token_ids[:, :2], torch.tensor([[20, 21]], dtype=torch.int32)
         )
         torch.testing.assert_close(capture.selected_weight, torch.tensor([0.6]))
         torch.testing.assert_close(capture.batch_rows, torch.tensor([1]))
@@ -656,7 +765,7 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
                 tpu_sampler_module, "_use_bsearch_filtering", return_value=True
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.sampling_mask.tpu_filter_probs",
+                "sglang_tpu.sampling_mask.tpu_filter_probs",
                 return_value=filtered,
             ) as filter_probs,
             patch.object(
@@ -705,11 +814,11 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
                 tpu_sampler_module, "_use_bsearch_filtering", return_value=True
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.top_k.tpu_top_k",
-                return_value=(global_top_k_probs, global_top_k_token_ids),
+                "sglang_tpu.top_k.tpu_top_k",
+                side_effect=_padded_top_k(global_top_k_probs, global_top_k_token_ids),
             ) as top_k,
             patch(
-                "sglang.srt.hardware_backend.tpu.sampling_mask.tpu_filter_probs",
+                "sglang_tpu.sampling_mask.tpu_filter_probs",
                 return_value=filtered_block,
             ) as filter_probs,
             patch.object(
@@ -724,9 +833,12 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
 
         torch.testing.assert_close(actual, torch.tensor([91], dtype=torch.int32))
         self.assertIsNone(capture)
-        top_k.assert_called_once_with(probs, 50)
+        top_k.assert_called_once_with(probs, MAX_DISTRIBUTED_TOP_K)
+        filtered_input = filter_probs.call_args.args[0]
+        torch.testing.assert_close(filtered_input[:, :2], global_top_k_probs)
+        self.assertEqual(torch.count_nonzero(filtered_input[:, 2:]).item(), 0)
         filter_probs.assert_called_once_with(
-            global_top_k_probs,
+            filtered_input,
             info.top_ks,
             info.top_ps,
             info.min_ps,
@@ -754,7 +866,7 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
             patch.object(
                 tpu_sampler_module, "_use_bsearch_filtering", return_value=False
             ),
-            patch("sglang.srt.hardware_backend.tpu.top_k.tpu_top_k") as top_k,
+            patch("sglang_tpu.top_k.tpu_top_k") as top_k,
             patch.object(
                 tpu_sampler_module,
                 "top_k_top_p_min_p_sampling_from_probs_torch",
@@ -780,8 +892,8 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
 
         with (
             patch(
-                "sglang.srt.hardware_backend.tpu.top_k.tpu_top_k",
-                return_value=(global_top_k_probs, global_top_k_token_ids),
+                "sglang_tpu.top_k.tpu_top_k",
+                side_effect=_padded_top_k(global_top_k_probs, global_top_k_token_ids),
             ) as top_k,
             patch.object(
                 tpu_sampler_module,
@@ -795,10 +907,13 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
 
         torch.testing.assert_close(actual, torch.tensor([17], dtype=torch.int32))
         self.assertIsNone(capture)
-        top_k.assert_called_once_with(probs, 50)
-        sample.assert_called_once_with(
-            global_top_k_probs,
-            unseeded_sampling_fn=tpu_sampler_module.sample_exponential_race,
+        top_k.assert_called_once_with(probs, MAX_DISTRIBUTED_TOP_K)
+        sampled_block = sample.call_args.args[0]
+        torch.testing.assert_close(sampled_block[:, :2], global_top_k_probs)
+        self.assertEqual(torch.count_nonzero(sampled_block[:, 2:]).item(), 0)
+        self.assertIs(
+            sample.call_args.kwargs["unseeded_sampling_fn"],
+            tpu_sampler_module.sample_exponential_race,
         )
 
 
@@ -1201,6 +1316,90 @@ class TestRowPad(CustomTestCase):
         self.assertEqual(tuple(ks.shape), (8,))
         self.assertEqual(ks.dtype, torch.int32)
         self.assertEqual(ks[3:].tolist(), [0] * 5)
+
+
+class TestHostSamplingWarmupCoverage(CustomTestCase):
+    """Serving batches must not reach a sampling kernel variant warmup skipped.
+
+    A mixed greedy/sampled batch has no uniform top-k and once compiled the
+    full-vocabulary filter at serving time on TPU.
+    """
+
+    VOCAB = 128
+
+    def _kernel_calls(self, infos):
+        from sglang_tpu import sampling_mask as sampling_mask_module
+        from sglang_tpu.sampling import warmup as warmup_module
+
+        calls = set()
+
+        def fake_top_k(probs, width):
+            calls.add(("top_k", probs.shape[1], width))
+            return torch.topk(probs, width, dim=-1)
+
+        def fake_filter(
+            probs, top_ks, top_ps, min_ps, need_top_k, need_top_p, need_min_p
+        ):
+            calls.add(("filter", probs.shape[1], need_top_k, need_top_p, need_min_p))
+            return probs
+
+        sampler = object.__new__(TpuSampler)
+        with (
+            patch.object(tpu_sampler_module, "_use_bsearch_filtering", lambda _: True),
+            patch.object(tpu_top_k_module, "tpu_top_k", fake_top_k),
+            patch.object(sampling_mask_module, "tpu_filter_probs", fake_filter),
+        ):
+            for info in infos(warmup_module):
+                if info.is_all_greedy:
+                    continue
+                simple = not (
+                    info.need_top_k_sampling
+                    or info.need_top_p_sampling
+                    or info.need_min_p_sampling
+                )
+                probs = torch.softmax(torch.randn(len(info), self.VOCAB), dim=-1)
+                sampler._sample_from_probs(probs, info, None, simple)
+        return calls
+
+    def _warmup_infos(self, warmup_module):
+        captured = []
+        warmup_module.warmup_host_sampling(
+            lambda _logits, info, *_: captured.append(info) or torch.zeros(1),
+            [1, 4],
+            self.VOCAB,
+            "cpu",
+            make_logits=lambda rows: torch.zeros(rows, self.VOCAB),
+        )
+        return captured
+
+    def _serving_infos(self, warmup_module):
+        sampled = (1, 20, 64, 100, warmup_module.TOP_K_ALL)
+        for rows, (k0, k1), top_p, min_p in product(
+            (1, 4), product((1, *sampled), sampled), (1.0, 0.9), (0.0, 0.05)
+        ):
+            top_ks = torch.tensor(([k0, k1] * rows)[:rows], dtype=torch.int32)
+            yield SamplingBatchInfo(
+                temperatures=torch.ones((rows, 1)),
+                top_ps=torch.full((rows,), top_p),
+                top_ks=top_ks,
+                min_ps=torch.full((rows,), min_p),
+                is_all_greedy=False,
+                is_any_greedy=bool((top_ks == 1).any()),
+                need_top_p_sampling=top_p < 1.0,
+                need_top_k_sampling=bool((top_ks != warmup_module.TOP_K_ALL).any()),
+                need_min_p_sampling=min_p > 0.0,
+                vocab_size=self.VOCAB,
+                return_sampling_masks=[False] * rows,
+                device="cpu",
+                uniform_top_k=(
+                    int(top_ks[0]) if bool((top_ks == top_ks[0]).all()) else None
+                ),
+            )
+
+    def test_serving_kernel_variants_are_warmed(self):
+        warmed = self._kernel_calls(self._warmup_infos)
+        served = self._kernel_calls(self._serving_infos)
+        self.assertLessEqual(served, warmed)
 
 
 if __name__ == "__main__":

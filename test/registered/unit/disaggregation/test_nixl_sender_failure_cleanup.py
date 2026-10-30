@@ -23,13 +23,22 @@ class TestNixlSenderFailureCleanup(unittest.TestCase):
             prefetch_requested={(room, 0, "session-a"), (8, 0, "session-b")},
         )
         request_status = {room: object()}
+        # This stub mirrors CommonKVManager's field set by hand, so any new
+        # field touched by CommonKVSender.clear() fails here with an
+        # AttributeError instead of a meaningful assertion. If that keeps
+        # happening, spy on clear() here and test its contents where clear()
+        # is tested, or build a real manager instance.
         sender.kv_mgr = SimpleNamespace(
             clear_status=lambda room: request_status.pop(room, None),
+            deferred_bootstrap=None,
             enable_staging=True,
             _staging_ctx=staging_ctx,
             request_status=request_status,
             req_to_decode_prefix_len={room: 3},
             transfer_infos={room: object()},
+            _staging_outstanding={},
+            _deferred_ack_targets={},
+            _maybe_ack_drained_abort=lambda room: None,
             exceptions={room: expected_exc},
             failure_records={room: "transfer failed"},
             failure_lock=threading.Lock(),

@@ -33,6 +33,15 @@ from sglang.srt.utils.common import log_info_on_rank0
 logger = logging.getLogger(__name__)
 
 
+def local_routed_expert_range(
+    storage_rank: int, num_local_routed: int
+) -> tuple[int, int]:
+    """Global routed-expert ids [start, end) stored on EP storage rank
+    ``storage_rank``; experts are placed contiguously by storage rank."""
+    start = storage_rank * num_local_routed
+    return start, start + num_local_routed
+
+
 class MoeA2ABackend(Enum):
     NONE = "none"
     DEEPEP = "deepep"
@@ -493,18 +502,24 @@ def initialize_moe_config():
     )
 
 
+# The two readers below run inside compiled forwards (dense FFN exits ask
+# them whether the post-FFN all-reduce can be deferred), so they must not
+# write: a dense model never runs initialize_moe_config, and a lazy default
+# written here would mutate the flag group under Dynamo tracing. The defaults
+# are module globals because Dynamo in torch 2.11 can fail to call a method
+# such as ``is_none()`` on an enum member reached as ``MoeA2ABackend.NONE``.
+_DEFAULT_MOE_A2A_BACKEND = MoeA2ABackend.NONE
+_DEFAULT_MOE_RUNNER_BACKEND = MoeRunnerBackend.AUTO
+
+
 def get_moe_a2a_backend() -> MoeA2ABackend:
-    moe = get_flags().moe
-    if moe.a2a_backend is None:
-        moe.a2a_backend = MoeA2ABackend.NONE
-    return moe.a2a_backend
+    backend = get_flags().moe.a2a_backend
+    return _DEFAULT_MOE_A2A_BACKEND if backend is None else backend
 
 
 def get_moe_runner_backend() -> MoeRunnerBackendLike:
-    moe = get_flags().moe
-    if moe.runner_backend is None:
-        moe.runner_backend = MoeRunnerBackend.AUTO
-    return moe.runner_backend
+    backend = get_flags().moe.runner_backend
+    return _DEFAULT_MOE_RUNNER_BACKEND if backend is None else backend
 
 
 def get_speculative_moe_runner_backend() -> MoeRunnerBackendLike:
@@ -568,7 +583,12 @@ def draft_model_build_scope():
     original_scope = moe.in_speculative_scope
     try:
         moe.in_speculative_scope = True
-        yield
+        # Boundaries capture this resolved preference while the draft builds.
+        # Restoring it cannot change an already constructed target plan.
+        with get_exec().comm.override(
+            boundary_reduction=get_spec().speculative_boundary_reduction
+        ):
+            yield
     finally:
         moe.in_speculative_scope = original_scope
         moe.disable_shared_experts_fusion = original_fusion
@@ -738,12 +758,10 @@ def should_use_dp_reduce_scatterv():
 def should_skip_mlp_all_reduce() -> bool:
     """Whether dense MLP / row-parallel projections should skip their all-reduce.
 
-    True when the decoder published ``fuse_mlp_allreduce`` (next residual+LN
-    absorbs the AR) or ``mlp_reduce_scatter`` (postprocess will reduce-scatter)
-    on ``get_forward()``.
+    True when the decoder published ``mlp_reduce_scatter`` (postprocess will
+    reduce-scatter) on ``get_forward()``.
     """
-    f = get_forward()
-    return f.fuse_mlp_allreduce or f.mlp_reduce_scatter
+    return get_forward().mlp_reduce_scatter
 
 
 def post_experts_output_is_complete(*, is_tp_path: bool) -> bool:
@@ -754,7 +772,17 @@ def post_experts_output_is_complete(*, is_tp_path: bool) -> bool:
     This is a property of the MoE configuration. Whether the MoE block or a later
     step runs a sum that is still owed is decided separately.
     """
-    if get_parallel().dwdp_size > 1:
+    parallel = get_parallel()
+    if parallel.dwdp_size > 1:
+        return True
+    # Experts replicated on every device of the TP group hold each token's
+    # full output.
+    if is_tp_path and parallel.tp_size > 1 and parallel.moe_dp_size == parallel.tp_size:
+        return True
+    if not is_tp_path and _is_tpu and get_moe_runner_backend().is_pallas_tpu_fused_rs():
+        # The TPU fused-RS experts kernel runs the EP reduction itself (the
+        # explicit backend refuses to load when it cannot); the MoE-TP sum,
+        # when present, is still owed to the layer boundary.
         return True
     if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
         # The combine reduce-scatters back to the local tokens.
@@ -782,10 +810,8 @@ def should_skip_post_experts_all_reduce(
     # parallel context.
     if experts_reduced and not is_tp_path:
         return True
-    return (
-        should_skip_mlp_all_reduce()
-        or should_use_dp_reduce_scatterv()
-        or post_experts_output_is_complete(is_tp_path=is_tp_path)
+    return should_skip_mlp_all_reduce() or post_experts_output_is_complete(
+        is_tp_path=is_tp_path
     )
 
 
@@ -817,6 +843,18 @@ def should_add_replicated_moe_output() -> bool:
     return not (parallel.tp_size > 1 and summed_later and parallel.tp_rank != 0)
 
 
+def adds_replicated_output_to_partial() -> bool:
+    """For a MoE block whose stage boundary completes its sum: whether this rank
+    adds an output every TP rank holds in full, such as a shared expert
+    replicated with tp_size=1, to its MoE output. While the output still owes a
+    TP sum, only TP rank 0 adds it, so the sum counts it once."""
+    parallel = get_parallel()
+    owes_sum = parallel.tp_size > 1 and not post_experts_output_is_complete(
+        is_tp_path=True
+    )
+    return not owes_sum or parallel.tp_rank == 0
+
+
 def can_merge_post_experts_all_reduce() -> bool:
     """Whether the EP and MoE-TP reductions can collapse into one _TP all-reduce.
 
@@ -840,18 +878,38 @@ def post_experts_all_reduce(
     sequential ones, which also restores the invariant the fused residual+LN path
     depends on. ``experts_reduced``: see should_skip_post_experts_all_reduce.
     """
+    parallel = get_parallel()
+    return _post_experts_sum(
+        hidden_states,
+        reduce_ep=parallel.moe_ep_size > 1
+        and not should_skip_post_experts_all_reduce(
+            is_tp_path=False, experts_reduced=experts_reduced
+        ),
+        reduce_tp=parallel.moe_tp_size > 1
+        and not should_skip_post_experts_all_reduce(is_tp_path=True),
+    )
+
+
+def sum_post_experts_output(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Complete the sum a MoE output owes over the EP and MoE-TP groups, for the
+    boundary that owns it; a path the combine already summed is left alone."""
+    parallel = get_parallel()
+    return _post_experts_sum(
+        hidden_states,
+        reduce_ep=parallel.moe_ep_size > 1
+        and not post_experts_output_is_complete(is_tp_path=False),
+        reduce_tp=parallel.moe_tp_size > 1
+        and not post_experts_output_is_complete(is_tp_path=True),
+    )
+
+
+def _post_experts_sum(
+    hidden_states: torch.Tensor, *, reduce_ep: bool, reduce_tp: bool
+) -> torch.Tensor:
     from sglang.srt.distributed.communication_op import (
         moe_expert_parallel_all_reduce,
         moe_tensor_model_parallel_all_reduce,
         tensor_model_parallel_all_reduce,
-    )
-
-    parallel = get_parallel()
-    reduce_ep = parallel.moe_ep_size > 1 and not should_skip_post_experts_all_reduce(
-        is_tp_path=False, experts_reduced=experts_reduced
-    )
-    reduce_tp = parallel.moe_tp_size > 1 and not should_skip_post_experts_all_reduce(
-        is_tp_path=True
     )
 
     if reduce_ep and reduce_tp and can_merge_post_experts_all_reduce():

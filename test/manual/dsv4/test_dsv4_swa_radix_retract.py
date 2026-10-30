@@ -1,6 +1,6 @@
 """DSV4 stress test for SWA radix cache + tombstone + retract interaction.
 
-Regression test for the former SWA `cache_unfinished_req` assertion:
+Regression test for the former SWA `checkpoint` assertion:
     assert old_prefix_len <= len(new_indices)
 The unified cache reads `req.kv.cache_protected_len` and tolerates page_size - 1
 of alignment slack, so this reproduces the historical trip conditions rather
@@ -11,7 +11,7 @@ Trip conditions (all required):
   2. Multiple requests share a long prefix (so one req's tombstoned leaf
      poisons match_prefix for others walking the same radix path).
   3. Memory pressure forces retract while at least one req has tombstoned
-     its leaf (decode_batch_idx >= sliding_window_size at retract time).
+     its leaf (a window past its locked prefix at retract time).
 
 After main #19427 changed `old_prefix_len = req.cache_protected_len`
 (stable), tombstone-induced shrinks in match's `best_value_len` across
@@ -64,9 +64,8 @@ class TestDSV4FlashSWARadixRetract(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "4",
-            "--dp",
+            "--attn-dp-size",
             "4",
-            "--enable-dp-attention",
             "--moe-a2a-backend",
             "deepep",
             "--cuda-graph-max-bs-decode",

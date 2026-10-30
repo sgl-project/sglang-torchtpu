@@ -22,9 +22,9 @@ import time
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
-from sglang.srt.hardware_backend.tpu.kv_pool_host import TpuRaidenHostKVCache
-from sglang.srt.hardware_backend.tpu.raiden_transfer import RaidenKVTransfer
+from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+from sglang_tpu.kv_pool_host import TpuDMAHostKVPool
+from sglang_tpu.raiden_transfer import RaidenKVTransfer
 
 DEVICE = "tpu:0"
 PAGE_SIZE = 64
@@ -52,6 +52,9 @@ class _SingleBufferPool:
     def get_fused_kv_buffer(self, layer_id):
         return self._buf
 
+    def page_buffers(self):
+        return [self._buf]
+
 
 def test_raiden_dma_roundtrip():
     """D2h device pages -> host, H2d host -> DIFFERENT device pages, verify."""
@@ -78,10 +81,10 @@ def test_raiden_dma_roundtrip():
 
 
 def test_host_pool_wiring():
-    """TpuRaidenHostKVCache over the real fused pool: token->page conversion,
+    """TpuDMAHostKVPool over the real fused pool: token->page conversion,
     page-granular alloc/free, and that backup/load EXECUTE and complete on
     hardware (data is zeros here — fidelity is covered by test 1)."""
-    print("== test 2: TpuRaidenHostKVCache wiring on the real pool ==")
+    print("== test 2: TpuDMAHostKVPool wiring on the real pool ==")
     pool = TpuFusedMHATokenToKVPool(
         size=256,
         page_size=PAGE_SIZE,
@@ -92,7 +95,7 @@ def test_host_pool_wiring():
         device=DEVICE,
         enable_memory_saver=False,
     )
-    host = TpuRaidenHostKVCache(
+    host = TpuDMAHostKVPool(
         pool,
         host_to_device_ratio=2.0,
         host_size=0,

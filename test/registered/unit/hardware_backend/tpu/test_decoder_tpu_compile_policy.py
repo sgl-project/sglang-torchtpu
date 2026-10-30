@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import contextlib
+import functools
 import sys
 import unittest
 from types import ModuleType, SimpleNamespace
@@ -17,34 +18,25 @@ from sglang.srt.compilation.support_torch_compile import (
     get_torch_compile_policy,
     support_torch_compile,
 )
+from sglang.srt.configs.mamba_utils import (
+    Mamba2CacheParams,
+    Mamba2StateDType,
+    Mamba2StateShape,
+)
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu import sampler as tpu_sampler_module
-from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
-from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
-    CompiledForwardShim,
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
 )
-from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
-    DecoderTpuCompilePolicy,
-    Qwen3VLDecoderTpuCompilePolicy,
-    _materialize_out,
-    _unpad_decoder_outputs,
-)
-from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
-from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_dflash import (
-    DFlashSpecDecoderTpuCompilePolicy,
-    _kv_appender_specialization_key,
-)
-from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3 import (
-    Eagle3SpecDecodeCompilePolicyMixin,
-    SpecDecoderTpuCompilePolicy,
-)
-from sglang.srt.hardware_backend.tpu.sampler import select_logits_output_mode
-from sglang.srt.hardware_backend.tpu.top_k import (
-    PallasDistributedTopKConfig,
-    TpuVocabShard,
-)
+from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
+from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    HybridReqToTokenPool,
+    MHATokenToKVPool,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -65,6 +57,37 @@ from sglang.srt.speculative.eagle_utils import eagle_sample
 from sglang.srt.speculative.eagle_worker_common import run_eagle_verify
 from sglang.srt.speculative.spec_info import SpecInputType, SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu import sampler as tpu_sampler_module
+from sglang_tpu.attention_gdn_pallas import GdnTracedMetadata, TpuGDNAttnBackend
+from sglang_tpu.compilation.bucketer import Bucketer
+from sglang_tpu.compilation.compiled_forward_shim import (
+    CompiledForwardShim,
+    _dp_attn_compute_padding,
+)
+from sglang_tpu.compilation.decoder_compile_policy import (
+    DecoderTpuCompilePolicy,
+    Qwen3VLDecoderTpuCompilePolicy,
+    _materialize_out,
+    _unpad_decoder_outputs,
+)
+from sglang_tpu.compilation.hybrid_linear_direct_compile import bind_traced_conv_weights
+from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.compilation.spec_decode_compile_policy_dflash import (
+    DFlashSpecDecoderTpuCompilePolicy,
+    _kv_appender_specialization_key,
+)
+from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
+    Eagle3SpecDecodeCompilePolicyMixin,
+    SpecDecoderTpuCompilePolicy,
+)
+from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
+from sglang_tpu.mamba_pool import TpuMambaPool
+from sglang_tpu.sampler import select_logits_output_mode
+from sglang_tpu.top_k import (
+    PallasDistributedTopKConfig,
+    TpuVocabShard,
+)
 
 
 class _FakeAttnBackend:
@@ -136,6 +159,15 @@ class _SpecPolicyTestCase(_PolicyTestCase):
     config_defaults = _EAGLE3_CONFIG
 
 
+class _FakeModel(torch.nn.Module):
+    """Model stand-in; direct compile walks named_modules for linear-attention weights."""
+
+    def __init__(self, **attrs):
+        super().__init__()
+        for name, value in attrs.items():
+            setattr(self, name, value)
+
+
 def _model_runner(device="cpu"):
     """Minimal ModelRunner stand-in for unit tests.
 
@@ -146,7 +178,7 @@ def _model_runner(device="cpu"):
     embed_tokens = torch.nn.Embedding(8, 4)
     return SimpleNamespace(
         device=device,
-        model=SimpleNamespace(
+        model=_FakeModel(
             forward=MagicMock(),
             prepare_forward_batch=MagicMock(),
             get_input_embeddings=lambda: embed_tokens,
@@ -264,9 +296,7 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         model_runner = _model_runner()
         runner_kv_pool = model_runner.token_to_kv_pool
         policy = CustomPolicy(model_runner=model_runner, owner=model_runner.model)
-        compile_module_name = (
-            "sglang.srt.hardware_backend.tpu.compilation.direct_compile"
-        )
+        compile_module_name = "sglang_tpu.compilation.direct_compile"
         compile_module = ModuleType(compile_module_name)
         compile_module.direct_compile = MagicMock(return_value=MagicMock())
 
@@ -287,15 +317,11 @@ class TestDirectCompileExtraModelState(CustomTestCase):
             model_runner=model_runner, owner=model_runner.model
         )
         compiled = MagicMock()
-        compile_module_name = (
-            "sglang.srt.hardware_backend.tpu.compilation.direct_compile"
-        )
+        compile_module_name = "sglang_tpu.compilation.direct_compile"
         compile_module = ModuleType(compile_module_name)
         compile_module.direct_compile = MagicMock(return_value=compiled)
         rank_tensors = (torch.tensor(0), torch.tensor(1))
-        policy_module = (
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy"
-        )
+        policy_module = "sglang_tpu.compilation.decoder_compile_policy"
 
         with (
             patch.dict(sys.modules, {compile_module_name: compile_module}),
@@ -324,7 +350,7 @@ class TestDirectCompileExtraModelState(CustomTestCase):
                 "object_state.weight_alias",
             )
 
-        model = SimpleNamespace(forward=MagicMock())
+        model = _FakeModel(forward=MagicMock())
         support_torch_compile(model, policy=CustomPolicy)
         policy_cls = get_torch_compile_policy(model)
         self.assertIs(policy_cls, CustomPolicy)
@@ -342,9 +368,7 @@ class TestDirectCompileExtraModelState(CustomTestCase):
             owner=model,
             tracer="direct",
         )
-        compile_module_name = (
-            "sglang.srt.hardware_backend.tpu.compilation.direct_compile"
-        )
+        compile_module_name = "sglang_tpu.compilation.direct_compile"
         compile_module = ModuleType(compile_module_name)
         compile_module.direct_compile = MagicMock(return_value=MagicMock())
 
@@ -355,12 +379,24 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         compiled = compile_module.direct_compile.return_value
         compiled.side_effect = trace_forward
         compiled.warmup_async.side_effect = trace_forward
-        backend = SimpleNamespace(forward_metadata=object())
-        inputs = (torch.ones(2), None, None)
+        backend = AttentionBackend()
+        metadata = object()
+        backend.forward_metadata = metadata
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        inputs = (torch.ones(2), None, forward_batch)
         with forward_context(ForwardContext(attn_backend=backend)):
             for invoke in (call, warmup_async):
-                with self.subTest(invoke=invoke.__name__):
+                with (
+                    self.subTest(invoke=invoke.__name__),
+                    patch.object(
+                        backend,
+                        "bind_forward_metadata",
+                        wraps=backend.bind_forward_metadata,
+                    ) as bind_metadata,
+                ):
                     self.assertIs(invoke(*inputs), model.forward.return_value)
+                    bind_metadata.assert_called_once_with(metadata, ForwardMode.DECODE)
+                    self.assertIs(backend.forward_metadata, metadata)
         self.assertEqual(model.forward.call_count, 2)
 
         compile_module.direct_compile.assert_called_once()
@@ -380,6 +416,225 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         )
 
 
+class _GdnNoInit(TpuGDNAttnBackend):
+    def __init__(self, metadata: GdnTracedMetadata):  # skips the JAX op build
+        self._set_traced_metadata(metadata)
+
+
+class _FullKVPool(MHATokenToKVPool):
+    def __init__(self, num_layers: int):  # skips allocation
+        self.k_buffer = [torch.zeros(2) for _ in range(num_layers)]
+        self.v_buffer = [torch.zeros(2) for _ in range(num_layers)]
+
+
+class _HybridKVPool(HybridLinearKVPool):
+    def __init__(self, full_kv_pool: MHATokenToKVPool):  # skips allocation
+        self.full_kv_pool = full_kv_pool
+
+
+class _HybridReqPool(HybridReqToTokenPool):
+    def __init__(self, mamba_pool: TpuMambaPool):  # skips allocation
+        self.mamba_pool = mamba_pool
+
+
+def _linear_attention() -> RadixLinearAttention:
+    return RadixLinearAttention(
+        layer_id=0,
+        num_q_heads=1,
+        num_k_heads=1,
+        num_v_heads=1,
+        head_q_dim=1,
+        head_k_dim=1,
+        head_v_dim=1,
+    )
+
+
+def _gdn_metadata(fill: int) -> GdnTracedMetadata:
+    def tensor():
+        return torch.full((2,), fill, dtype=torch.int32)
+
+    return GdnTracedMetadata(
+        distribution=tensor(),
+        seq_lens=tensor(),
+        state_indices=tensor(),
+        query_start_loc=tensor(),
+        track_indices=None,
+        track_end=None,
+        read_offsets=tensor(),
+    )
+
+
+def _cpu_mamba_pool(num_layers: int) -> TpuMambaPool:
+    shape = Mamba2StateShape.create(
+        tp_world_size=1,
+        intermediate_size=8,
+        n_groups=1,
+        num_heads=1,
+        head_dim=8,
+        state_size=8,
+        conv_kernel=4,
+    )
+    layers = list(range(num_layers))
+    return TpuMambaPool(
+        size=2,
+        spec_state_size=0,
+        cache_params=Mamba2CacheParams(
+            dtype=Mamba2StateDType(conv=torch.float32, temporal=torch.float32),
+            layers=layers,
+            shape=shape,
+        ),
+        mamba_layer_ids=layers,
+        device="cpu",
+    )
+
+
+class TestHybridLinearDirectCompile(CustomTestCase):
+    def test_trace_binds_each_child_metadata_and_restores_it(self):
+        """HybridLinearAttnBackend has no forward_metadata of its own.
+
+        Binding only the wrapper leaves both children reading eager tensors while
+        tracing, which bakes one batch's metadata into the executable.
+        """
+        full = AttentionBackend()
+        full.token_to_kv_pool = full.req_to_token_pool = None
+        eager_full = object()
+        full.forward_metadata = eager_full
+        linear = _GdnNoInit(_gdn_metadata(0))
+        eager_linear = linear.traced_metadata()
+        backend = HybridLinearAttnBackend(
+            full_attn_backend=full, linear_attn_backend=linear, full_attn_layers=[0]
+        )
+        seen = []
+
+        def forward(*_args, **_kwargs):
+            seen.append((full.forward_metadata, linear.traced_metadata()))
+            return torch.zeros(1)
+
+        model_runner = _model_runner()
+        model_runner.model.forward = forward
+        policy = DecoderTpuCompilePolicy(
+            model_runner=model_runner, owner=model_runner.model
+        )
+        compile_module_name = "sglang_tpu.compilation.direct_compile"
+        compile_module = ModuleType(compile_module_name)
+        compile_module.direct_compile = MagicMock(return_value=MagicMock())
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        graph_full, graph_linear = object(), _gdn_metadata(7)
+
+        with (
+            patch.dict(sys.modules, {compile_module_name: compile_module}),
+            forward_context(ForwardContext(attn_backend=backend)),
+        ):
+            call, _ = policy._direct_compile(forward)
+            call("input_ids", None, forward_batch)
+            trace_forward = compile_module.direct_compile.call_args.args[0]
+            trace_forward(
+                (graph_full, graph_linear),
+                "input_ids",
+                None,
+                forward_batch,
+                attention_rank_tensors=(),
+            )
+
+        passed_full, passed_linear = (
+            compile_module.direct_compile.return_value.call_args.args[0]
+        )
+        self.assertIs(passed_full, eager_full)
+        self.assertEqual([id(t) for t in passed_linear], [id(t) for t in eager_linear])
+        traced_full, traced_linear = seen[-1]
+        self.assertIs(traced_full, graph_full)
+        self.assertEqual([id(t) for t in traced_linear], [id(t) for t in graph_linear])
+        self.assertIs(full.forward_metadata, eager_full)
+        self.assertEqual(
+            [id(t) for t in linear.traced_metadata()], [id(t) for t in eager_linear]
+        )
+
+    def test_kv_pool_swaps_full_kv_then_linear_state(self):
+        """get_state and set_state must agree on one layout.
+
+        A split at the wrong index still traces, but hands KV buffers to the GDN
+        layers (or the reverse) and silently corrupts both caches.
+        """
+        num_layers = 2
+        full_kv_pool = _FullKVPool(num_layers)
+        mamba_pool = _cpu_mamba_pool(num_layers)
+        model_runner = _model_runner()
+        model_runner.model.gdn = _linear_attention()
+        model_runner.token_to_kv_pool = _HybridKVPool(full_kv_pool)
+        model_runner.req_to_token_pool = _HybridReqPool(mamba_pool)
+        policy = DecoderTpuCompilePolicy(
+            model_runner=model_runner, owner=model_runner.model
+        )
+
+        kv_pool = policy.get_direct_compile_kv_pool()
+        expected = [
+            *full_kv_pool.k_buffer,
+            *full_kv_pool.v_buffer,
+            *mamba_pool.get_state(),
+        ]
+        self.assertEqual(
+            [id(t) for t in kv_pool.get_state()], [id(t) for t in expected]
+        )
+        replacement = [torch.empty_like(t) for t in expected]
+        kv_pool.set_state(replacement)
+        num_full = 2 * num_layers
+        self.assertEqual(
+            [id(t) for t in [*full_kv_pool.k_buffer, *full_kv_pool.v_buffer]],
+            [id(t) for t in replacement[:num_full]],
+        )
+        self.assertEqual(
+            [id(t) for t in mamba_pool.get_state()],
+            [id(t) for t in replacement[num_full:]],
+        )
+
+    def test_kv_pool_without_linear_layers_leaves_linear_state_out(self):
+        """An MTP draft shares the target's hybrid pools but runs no GDN layer.
+
+        Lifting the GDN state would copy_ fresh buffers into it on every draft
+        forward, so Raiden P/D would move rows of the stale registered buffers.
+        """
+        full_kv_pool = _FullKVPool(2)
+        model_runner = _model_runner()
+        model_runner.token_to_kv_pool = _HybridKVPool(full_kv_pool)
+        model_runner.req_to_token_pool = _HybridReqPool(_cpu_mamba_pool(2))
+        policy = DecoderTpuCompilePolicy(
+            model_runner=model_runner, owner=model_runner.model
+        )
+
+        self.assertIs(policy.get_direct_compile_kv_pool(), full_kv_pool)
+
+    def test_trace_derives_conv_weights_from_the_traced_conv1d_weight(self):
+        """RadixLinearAttention keeps conv_weights as a view of conv1d.weight.
+
+        Read as-is while tracing, the graph uses a tensor no input provides and
+        the compile aborts; lifted as an input, execute re-materializes the view
+        on every call. The trace must view the placeholder weight instead.
+        """
+        layer = torch.nn.Module()
+        layer.conv1d = torch.nn.Conv1d(4, 4, 3, groups=4, bias=False)
+        eager_view = layer.conv1d.weight.view(4, 3)
+        layer.attn = RadixLinearAttention(
+            layer_id=0,
+            num_q_heads=1,
+            num_k_heads=1,
+            num_v_heads=1,
+            head_q_dim=1,
+            head_k_dim=1,
+            head_v_dim=1,
+            conv_weights=eager_view,
+        )
+        model = torch.nn.ModuleList([layer])
+        placeholder = torch.nn.Parameter(torch.ones(4, 1, 3))
+        eager_weight = layer.conv1d.weight
+        # direct_compile swaps parameters for placeholders before tracing.
+        layer.conv1d.weight = placeholder
+        with bind_traced_conv_weights(model):
+            self.assertIs(layer.attn.conv_weights._base, placeholder)
+            self.assertEqual(tuple(layer.attn.conv_weights.shape), (4, 3))
+        layer.conv1d.weight = eager_weight
+        self.assertIs(layer.attn.conv_weights, eager_view)
+
+
 class TestEagle3DirectCompile(_SpecPolicyTestCase):
     def test_fused_draft_trace_temporarily_restores_eager_regions(self):
         eager_backbone = MagicMock(name="eager_backbone")
@@ -390,7 +645,7 @@ class TestEagle3DirectCompile(_SpecPolicyTestCase):
         compiled_logits = MagicMock(name="compiled_logits")
         backbone = SimpleNamespace(forward=eager_backbone)
         logits_processor = SimpleNamespace(forward=eager_logits)
-        model = SimpleNamespace(
+        model = _FakeModel(
             model=backbone,
             logits_processor=logits_processor,
             forward=eager_model,
@@ -429,16 +684,14 @@ class TestEagle3DirectCompile(_SpecPolicyTestCase):
             self.assertIs(backend.forward_metadata, captured["trace_metadata"])
             return (value + 1,)
 
-        compile_module_name = (
-            "sglang.srt.hardware_backend.tpu.compilation.direct_compile"
-        )
+        compile_module_name = "sglang_tpu.compilation.direct_compile"
         compile_module = ModuleType(compile_module_name)
         compile_module.direct_compile = fake_direct_compile
 
         with (
             patch.dict(sys.modules, {compile_module_name: compile_module}),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation."
+                "sglang_tpu.compilation."
                 "spec_decode_compile_policy_eagle3.get_forward_context",
                 return_value=SimpleNamespace(attn_backend=backend),
             ),
@@ -660,18 +913,15 @@ class TestInstallExtendCap(_PolicyTestCase):
 
         with (
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "build_bucketers",
+                "sglang_tpu.compilation.decoder_compile_policy.build_bucketers",
                 return_value=(t_bucketer, b_bucketer),
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "is_dp_attention_enabled",
+                "sglang_tpu.compilation.decoder_compile_policy.is_dp_attention_enabled",
                 return_value=dp_attention,
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "torch.compile",
+                "sglang_tpu.compilation.decoder_compile_policy.torch.compile",
                 return_value=MagicMock(),
             ),
             patch.object(policy, "_install_dp_idle_as_decode"),
@@ -725,13 +975,11 @@ class TestInstallExtendCap(_PolicyTestCase):
 
         with (
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "is_dp_attention_enabled",
+                "sglang_tpu.compilation.decoder_compile_policy.is_dp_attention_enabled",
                 return_value=False,
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "torch.compile",
+                "sglang_tpu.compilation.decoder_compile_policy.torch.compile",
                 return_value=MagicMock(),
             ),
         ):
@@ -773,21 +1021,18 @@ class TestInstallExtendCap(_PolicyTestCase):
 
         with (
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "build_bucketers",
+                "sglang_tpu.compilation.decoder_compile_policy.build_bucketers",
                 return_value=(
                     Bucketer(name="Token", buckets=[64, 2048]),
                     Bucketer(name="Bs", buckets=[16, 32, 64]),
                 ),
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "is_dp_attention_enabled",
+                "sglang_tpu.compilation.decoder_compile_policy.is_dp_attention_enabled",
                 return_value=False,
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "torch.compile",
+                "sglang_tpu.compilation.decoder_compile_policy.torch.compile",
                 return_value=compiled_outer,
             ) as compile_mock,
         ):
@@ -835,21 +1080,18 @@ class TestInstallExtendCap(_PolicyTestCase):
 
         with (
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "build_bucketers",
+                "sglang_tpu.compilation.decoder_compile_policy.build_bucketers",
                 return_value=(
                     Bucketer(name="Token", buckets=[64, 2048]),
                     Bucketer(name="Bs", buckets=[16, 32, 64]),
                 ),
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "is_dp_attention_enabled",
+                "sglang_tpu.compilation.decoder_compile_policy.is_dp_attention_enabled",
                 return_value=False,
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "torch.compile",
+                "sglang_tpu.compilation.decoder_compile_policy.torch.compile",
                 side_effect=[compiled_backbone, compiled_logits],
             ) as compile_mock,
         ):
@@ -892,21 +1134,18 @@ class TestInstallExtendCap(_PolicyTestCase):
 
         with (
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "build_bucketers",
+                "sglang_tpu.compilation.decoder_compile_policy.build_bucketers",
                 return_value=(
                     Bucketer(name="Token", buckets=[64, 2048]),
                     Bucketer(name="Bs", buckets=[16, 32, 64]),
                 ),
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "is_dp_attention_enabled",
+                "sglang_tpu.compilation.decoder_compile_policy.is_dp_attention_enabled",
                 return_value=False,
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "torch.compile",
+                "sglang_tpu.compilation.decoder_compile_policy.torch.compile",
                 return_value=compiled_model,
             ) as compile_mock,
         ):
@@ -918,12 +1157,14 @@ class TestInstallExtendCap(_PolicyTestCase):
 
 
 class TestQwen3VLDecoderPolicy(_PolicyTestCase):
-    def _forward_batch(self):
+    def _forward_batch(self, sampling_info=None):
         return SimpleNamespace(
             _tpu_real_q=3,
             _tpu_real_b=2,
             batch_size=4,
             seq_lens=torch.zeros(4, dtype=torch.int32),
+            sampling_info=sampling_info,
+            forward_mode=ForwardMode.EXTEND,
         )
 
     def test_slices_raw_hidden_states_before_logits_processing(self):
@@ -979,6 +1220,40 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
         self.assertEqual(result_hidden.shape, (3, 4))
         self.assertEqual(result_aux[0].shape, (3, 4))
 
+    def test_host_padded_extend_keeps_the_bucket_rows(self):
+        """The experimental spec worker samples and writes draft KV at the buckets.
+
+        Trimming to the live tokens here would run the eager logits and the draft
+        KV writer once per prompt length while serving.
+        """
+        policy = Qwen3VLDecoderTpuCompilePolicy()
+        sampling_info = HostPaddedSamplingInfo(
+            temperatures=torch.ones((4, 1)),
+            top_ps=torch.ones((4,)),
+            top_ks=torch.ones((4,), dtype=torch.int32),
+            min_ps=torch.zeros((4,)),
+            is_all_greedy=True,
+            is_any_greedy=True,
+            need_top_p_sampling=False,
+            need_top_k_sampling=False,
+            need_min_p_sampling=False,
+            vocab_size=8,
+            device="cpu",
+            host_pad_bs=lambda bs: bs,
+            real_batch_size=4,
+        )
+        forward_batch = self._forward_batch(sampling_info)
+        hidden_states = torch.zeros(5, 4)
+        aux = [torch.ones(5, 4)]
+
+        result_hidden, result_aux = policy.finalize_forward_batch(
+            (hidden_states, aux), forward_batch
+        )
+
+        self.assertIs(result_hidden, hidden_states)
+        self.assertIs(result_aux[0], aux[0])
+        self.assertEqual(forward_batch.seq_lens.shape, (4,))
+
     @staticmethod
     def _policy_for(*, multimodal: bool):
         """Policy whose owner model does / does not expose the VL image path."""
@@ -991,18 +1266,18 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
         # A wrapper whose image steps or logits run eager collectives hangs
         # under DP attention; fail at install as before.
         policy = self._policy_for(multimodal=True)
+        model_name = type(policy.model_runner.model).__name__
 
         with (
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "is_dp_attention_enabled",
+                "sglang_tpu.compilation.decoder_compile_policy.is_dp_attention_enabled",
                 return_value=True,
             ),
             patch.object(
                 DecoderTpuCompilePolicy, "install", return_value=True
             ) as base_install,
         ):
-            with self.assertRaises(NotImplementedError):
+            with self.assertRaisesRegex(NotImplementedError, f"^{model_name}: "):
                 policy.install()
 
         base_install.assert_not_called()
@@ -1015,8 +1290,7 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
 
         with (
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "is_dp_attention_enabled",
+                "sglang_tpu.compilation.decoder_compile_policy.is_dp_attention_enabled",
                 return_value=True,
             ),
             patch.object(
@@ -1034,8 +1308,7 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
 
         with (
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "is_dp_attention_enabled",
+                "sglang_tpu.compilation.decoder_compile_policy.is_dp_attention_enabled",
                 return_value=True,
             ),
             patch.object(
@@ -1134,6 +1407,7 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
             forward_mode=ForwardMode.DECODE,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             batch_size=8,
+            logits_output_mode=LogitsOutputMode.FULL_VOCAB,
         )
         policy = Qwen3VLDecoderTpuCompilePolicy(
             model_runner=model_runner, owner=model_runner.model
@@ -1151,6 +1425,14 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
         self.assertEqual(len(args), 3)
         self.assertIs(args[0], forward_batch.input_ids)
         self.assertIs(args[2], forward_batch)
+
+        # Direct compilation must accept this exact positional call too, and
+        # must not reuse its token-ID artifact for an embedding-input program.
+        ids_key = policy._direct_compile_specialization_key(None, *args, **kwargs)
+        embeds_key = policy._direct_compile_specialization_key(
+            None, None, args[1], forward_batch, input_embeds=torch.zeros(8, 4)
+        )
+        self.assertNotEqual(ids_key, embeds_key)
 
     def test_slices_hidden_and_aux_tuple(self):
         policy = Qwen3VLDecoderTpuCompilePolicy()
@@ -1174,6 +1456,42 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
 
         self.assertEqual(result["hidden_states"].shape, (5, 4))
         self.assertEqual(result["residual"].shape, (5, 4))
+
+    def test_spec_full_capture_extend_warms_text_ids(self):
+        """A speculative multimodal target still serves text-only prefills.
+
+        Those take the positional token-ID call with FULL capture. Warming only
+        the input_embeds variant let the server's image warmup request freeze
+        compilation first, so the first text prefill tripped fail_on_recompile.
+        """
+
+        class _SpecQwenPolicy(
+            Eagle3SpecDecodeCompilePolicyMixin, Qwen3VLDecoderTpuCompilePolicy
+        ):
+            pass
+
+        policy = object.__new__(_SpecQwenPolicy)
+        policy.model_runner = SimpleNamespace(model=SimpleNamespace())
+        policy.owner = policy.model_runner.model
+        policy.t_bucketer = SimpleNamespace(buckets=(1024,))
+        policy.b_bucketer = SimpleNamespace(buckets=(1,))
+        policy._extend_compile_cap = lambda: 1
+        policy._uses_input_embeds = lambda target: True
+        policy.make_null_spec_info = MagicMock()
+        policy._run_one = MagicMock(return_value=None)
+
+        with patch(
+            "sglang_tpu.compilation.spec_decode_compile_policy.get_parallel",
+            return_value=SimpleNamespace(tp_rank=1),
+        ):
+            policy._precompile_extend_full()
+
+        warmed = {
+            (call.kwargs["variant"], call.kwargs["capture_hidden_mode"])
+            for call in policy._run_one.call_args_list
+        }
+        self.assertIn(("text_ids", CaptureHiddenMode.FULL), warmed)
+        self.assertIn(("text_only", CaptureHiddenMode.FULL), warmed)
 
     def test_spec_policy_delegates_raw_vl_output_unpadding(self):
         class _SpecQwenPolicy(
@@ -1258,9 +1576,7 @@ class TestMakeDummyForwardBatch(_PolicyTestCase):
         dies under fail_on_recompile (two-host tp16/ep16 R1-0528 and V3.1).
         """
         policy = _make_policy()
-        policy_module = (
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy"
-        )
+        policy_module = "sglang_tpu.compilation.decoder_compile_policy"
 
         with (
             patch(f"{policy_module}.enable_num_token_non_padded", return_value=True),
@@ -1300,37 +1616,114 @@ class TestMakeDummyForwardBatch(_PolicyTestCase):
         self.assertIsNone(fb.sampling_info.penalizer_orchestrator)
 
 
+def _idle_forward_batch(global_num_tokens, *, is_extend_in_batch=False):
+    """An idle DP rank's ForwardBatch as init_new builds it, before MLP sync."""
+    empty = functools.partial(torch.empty, 0, dtype=torch.int64)
+    return SimpleNamespace(
+        forward_mode=ForwardMode.IDLE,
+        _original_forward_mode=None,
+        spec_info=None,
+        is_extend_in_batch=is_extend_in_batch,
+        global_num_tokens_cpu=global_num_tokens,
+        original_global_num_tokens_cpu=global_num_tokens,
+        batch_size=0,
+        # ScheduleBatch.prepare_for_idle uses int64 regardless of the
+        # allocator dtype used by active peers and warmup.
+        input_ids=empty(),
+        positions=empty(),
+        out_cache_loc=empty(),
+        seq_lens=empty(),
+        seq_lens_cpu=empty(),
+        seq_lens_sum=0,
+        orig_seq_lens=torch.empty(0, dtype=torch.int32),
+        req_pool_indices=empty(),
+        req_pool_indices_cpu=empty(),
+    )
+
+
 class TestDpIdleDecodeMaterializationScope(_SpecPolicyTestCase):
+    def _as_rank(self, attn_dp_rank):
+        """Run as attention-DP rank ``attn_dp_rank`` of the published groups."""
+        return get_parallel().override(
+            tp_rank=attn_dp_rank, attn_tp_rank=0, attn_dp_rank=attn_dp_rank
+        )
+
+    def _run_idle_rank(
+        self,
+        batch,
+        *,
+        attn_dp_rank,
+        allocator_dtype=torch.int32,
+        make_policy=_make_policy,
+    ):
+        dp_size = len(batch.global_num_tokens_cpu)
+        self.publish_config(tp_size=dp_size, attn_dp_size=dp_size)
+        policy = make_policy()
+        policy.model_runner.token_to_kv_pool_allocator.free_pages = torch.arange(
+            4, dtype=allocator_dtype
+        )
+        seen = []
+        policy.model_runner.forward = lambda batch: seen.append(
+            (batch.forward_mode, batch.out_cache_loc.dtype)
+        )
+        policy._install_dp_idle_as_decode()
+        with _dp_attention(True), self._as_rank(attn_dp_rank):
+            policy.model_runner.forward(batch)
+        return policy, seen
+
     def test_plain_idle_decode_matches_warmup_cache_location_dtype(self):
         for dtype in (torch.int32, torch.int64):
             with self.subTest(allocator_dtype=dtype):
-                policy = _make_policy()
-                policy.model_runner.token_to_kv_pool_allocator.free_pages = (
-                    torch.arange(4, dtype=dtype)
+                batch = _idle_forward_batch([0, 1])
+                policy, seen = self._run_idle_rank(
+                    batch, attn_dp_rank=0, allocator_dtype=dtype
                 )
-                seen = []
-                policy.model_runner.forward = lambda batch: seen.append(
-                    (batch.forward_mode, batch.out_cache_loc.dtype)
-                )
-                policy._install_dp_idle_as_decode()
                 warmup = policy._make_dummy_forward_batch(
                     num_tokens=4, bs=4, mode=ForwardMode.DECODE
                 )
-                batch = SimpleNamespace(
-                    forward_mode=ForwardMode.IDLE,
-                    global_num_tokens_cpu=[0, 1],
-                    # ScheduleBatch.prepare_for_idle uses int64 regardless of
-                    # the allocator dtype used by active peers and warmup.
-                    out_cache_loc=torch.empty(0, dtype=torch.int64),
-                )
-
-                with _dp_attention(True):
-                    policy.model_runner.forward(batch)
 
                 self.assertEqual(
                     seen, [(ForwardMode.DECODE, warmup.out_cache_loc.dtype)]
                 )
-                self.assertEqual(batch.out_cache_loc.shape, (0,))
+
+    def test_idle_decode_rank_keeps_the_busiest_ranks_rows(self):
+        """An idle DP rank's decode outputs must not be unpadded to zero rows
+        while its peers keep theirs: TPU collectives in the eager tail pair up
+        by issue order across ranks, so the busy ranks hang."""
+        scheduler_counts = [3, 1, 0]
+        batch = _idle_forward_batch(scheduler_counts)
+        self._run_idle_rank(batch, attn_dp_rank=2)
+
+        self.assertEqual(batch.seq_lens.tolist(), [1, 1, 1])
+        self.assertEqual(batch.out_cache_loc.tolist(), [0, 0, 0])
+        self.assertEqual(batch.req_pool_indices.tolist(), [0, 0, 0])
+        self.assertEqual(batch.original_global_num_tokens_cpu, [3, 1, 3])
+        self.assertEqual(scheduler_counts, [3, 1, 0])
+
+        # MLP sync pads every rank to the shared max before the shim runs.
+        batch.global_num_tokens_cpu = [3, 3, 3]
+        batch.dp_padding_mode = DpPaddingMode.MAX_LEN
+        with self._as_rank(2):
+            _, _, real_q_out, real_b_out = _dp_attn_compute_padding(
+                batch,
+                Bucketer(name="Token", buckets=[64]),
+                Bucketer(name="Bs", buckets=[1, 4]),
+                real_q=3,
+                real_b=3,
+            )
+        self.assertEqual((real_q_out, real_b_out), (3, 3))
+
+    def test_idle_rank_beside_an_extending_peer_is_left_to_the_extend_path(self):
+        # The counts are tokens here: rows built from them would not match any
+        # compiled decode shape, and MLP sync materializes the rank as an extend.
+        # The EAGLE3 policy sends its spec-less target prefill down this path too.
+        for make_policy in (_make_policy, _make_spec_policy):
+            with self.subTest(policy=make_policy.__name__):
+                batch = _idle_forward_batch([1024, 0], is_extend_in_batch=True)
+                self._run_idle_rank(batch, attn_dp_rank=1, make_policy=make_policy)
+
+                self.assertEqual(batch.seq_lens.shape, (0,))
+                self.assertEqual(batch.original_global_num_tokens_cpu, [1024, 0])
 
     def test_prepare_materializes_zero_row_spec_batch(self):
         policy = _make_spec_policy()
@@ -1349,6 +1742,7 @@ class TestDpIdleDecodeMaterializationScope(_SpecPolicyTestCase):
             out_cache_loc=torch.empty((0,), dtype=torch.int32),
             req_pool_indices=torch.empty((0,), dtype=torch.int32),
             spec_info=spec_info,
+            sampling_info=None,
         )
 
         with (
@@ -1359,6 +1753,44 @@ class TestDpIdleDecodeMaterializationScope(_SpecPolicyTestCase):
 
         self.assertEqual(forward_batch.seq_lens.tolist(), [1])
         self.assertEqual(forward_batch.input_ids.tolist(), [0])
+
+
+_CP_STRATEGY_PATH = "sglang_tpu.compilation.decoder_compile_policy.get_cp_strategy"
+_CP_STRATEGY = SimpleNamespace(cp_size=2, cp_rank=0)
+
+
+class TestContextParallelWarmupFamily(_PolicyTestCase):
+    """The context-parallel extend family must survive both the order the
+    policy is constructed in and any ``_precompile_extend`` override."""
+
+    def test_cp_strategy_is_resolved_after_construction(self):
+        """The strategy may initialize after the policy is built; a value
+        captured at construction would turn off the CP warmup family, batch
+        bucketing and embedding wrapper for the process's life, silently."""
+        with patch(_CP_STRATEGY_PATH, return_value=None):
+            policy = _make_policy()
+        with patch(_CP_STRATEGY_PATH, return_value=_CP_STRATEGY):
+            self.assertIs(policy._cp_strategy, _CP_STRATEGY)
+
+    def test_extend_warmup_compiles_the_cp_family(self):
+        policy = _make_policy(token_buckets=(8, 64), bs_buckets=(1, 4))
+        policy._run_one = MagicMock()
+        with patch(_CP_STRATEGY_PATH, return_value=_CP_STRATEGY):
+            _run_cases(policy, ForwardMode.EXTEND)
+        variants = [c.kwargs["variant"] for c in policy._run_one.call_args_list]
+        self.assertIn("cp", variants)
+
+    def test_precompile_rejects_an_override_that_drops_the_cp_family(self):
+        """Dropping the family is otherwise silent until the first served batch
+        recompiles, which fail_on_recompile makes fatal mid-run."""
+        policy = _make_policy()
+        policy._precompile_extend = MagicMock(return_value=[])
+        policy._precompile_decode = MagicMock(return_value=[])
+        with (
+            patch(_CP_STRATEGY_PATH, return_value=_CP_STRATEGY),
+            self.assertRaisesRegex(RuntimeError, "context-parallel extend"),
+        ):
+            policy.precompile()
 
 
 class TestPrecompileLoops(_PolicyTestCase):
@@ -1388,7 +1820,7 @@ class TestPrecompileLoops(_PolicyTestCase):
                 with (
                     patch.object(policy, "_run_one", side_effect=run_one),
                     patch(
-                        "sglang.srt.hardware_backend.tpu.compilation."
+                        "sglang_tpu.compilation."
                         "decoder_compile_policy.time.perf_counter",
                         side_effect=lambda: clock[0],
                     ),
@@ -1454,7 +1886,7 @@ class TestPrecompileLoops(_PolicyTestCase):
         policy = _make_policy(_model_runner(), token_buckets=(8,), bs_buckets=(1, 4))
         policy._run_one = MagicMock()
 
-        with envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(True):
+        with tpu_envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(True):
             with get_parallel().override(
                 tp_size=2,
                 tp_rank=1,
@@ -1476,7 +1908,7 @@ class TestPrecompileLoops(_PolicyTestCase):
         policy = _make_distributed_top_k_policy()
 
         with patch(
-            "sglang.srt.hardware_backend.tpu.sampler.distributed_top_k_min_batch_size",
+            "sglang_tpu.sampler.distributed_top_k_min_batch_size",
             return_value=64,
         ):
             self.assertEqual(
@@ -1666,9 +2098,7 @@ class TestPrecompileLoops(_PolicyTestCase):
         policy._run_one = MagicMock()
 
         with (
-            patch(
-                "sglang.srt.hardware_backend.tpu.mm_embed_tpu.apply_host_mm_embeds"
-            ) as warmed,
+            patch("sglang_tpu.mm_embed_tpu.apply_host_mm_embeds") as warmed,
             get_parallel().override(
                 tp_size=2,
                 tp_rank=1,
@@ -1741,15 +2171,14 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
             patch.object(envs.SGLANG_DIRECT_COMPILE_ASYNC, "get", return_value=True),
             patch.object(policy, "_supports_async_warmup", return_value=True),
             patch(
-                "sglang.srt.hardware_backend.tpu.pp_profile.set_profile_inputs",
+                "sglang_tpu.pp_profile.set_profile_inputs",
                 side_effect=lambda policy, batch, args, kwargs, tokens, prefix: (
                     args,
                     kwargs,
                 ),
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation."
-                "decoder_compile_policy.time.perf_counter",
+                "sglang_tpu.compilation.decoder_compile_policy.time.perf_counter",
                 side_effect=[10.0, 10.25],
             ),
         ):
@@ -1790,18 +2219,38 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
         cm = MagicMock()
         with (
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy.torch.no_grad",
+                "sglang_tpu.compilation.decoder_compile_policy.torch.no_grad",
                 return_value=cm,
             ) as no_grad,
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation."
-                "decoder_compile_policy.torch.inference_mode",
+                "sglang_tpu.compilation.decoder_compile_policy.torch.inference_mode",
                 side_effect=AssertionError("inference_mode should not be used"),
             ),
         ):
             policy._run_one(num_tokens=64, bs=4, mode=ForwardMode.EXTEND)
         no_grad.assert_called_once_with()
         cm.__enter__.assert_called_once()
+
+    def test_draft_warmup_keeps_target_dp_gather_width(self):
+        from sglang.srt.distributed import parallel_state
+        from sglang.srt.runtime_context import get_flags
+
+        self.publish_config(tp_size=8, attn_dp_size=4)
+        policy = _make_policy()
+        batch = SimpleNamespace()
+        group = SimpleNamespace(world_size=2, rank_in_group=0)
+        with (
+            get_flags().dp.override(enabled=True),
+            get_parallel().override(attn_dp_rank=0),
+            patch.object(parallel_state, "_TP", group),
+            parallel_state.patch_tensor_parallel_group(group, owns_attention=True),
+        ):
+            self.assertEqual(get_parallel().attn_dp_size, 1)
+            policy.set_dp_attention_metadata(batch, 64, 4, ForwardMode.EXTEND)
+
+        self.assertEqual(batch.global_num_tokens_cpu, [64] * 4)
+        self.assertEqual(batch.global_num_tokens_gpu.tolist(), [64] * 4)
+        self.assertEqual(batch.global_num_tokens_for_logprob_gpu.tolist(), [4] * 4)
 
     def test_materialize_out_syncs_global_top_k_and_flagged_kv_side_effects(self):
         global_top_k_logits = torch.zeros(1)
@@ -1872,7 +2321,7 @@ def _spec_model_runner(device="cpu", is_draft_worker=False):
     embed_tokens = torch.nn.Embedding(8, 4)
     return SimpleNamespace(
         device=device,
-        model=SimpleNamespace(
+        model=_FakeModel(
             forward=MagicMock(),
             prepare_forward_batch=MagicMock(),
             get_input_embeddings=lambda: embed_tokens,
@@ -1939,10 +2388,8 @@ def _make_spec_policy(
     return policy
 
 
-_SPEC_POLICY = (
-    "sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3."
-)
-_DECODER_POLICY = "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+_SPEC_POLICY = "sglang_tpu.compilation.spec_decode_compile_policy_eagle3."
+_DECODER_POLICY = "sglang_tpu.compilation.decoder_compile_policy."
 
 
 @contextlib.contextmanager
@@ -2204,7 +2651,7 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
                 moe_tp_rank=1,
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation."
+                "sglang_tpu.compilation."
                 "spec_decode_compile_policy_eagle3.install_recompilation_checker",
                 side_effect=install,
             ),
@@ -2234,14 +2681,12 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
 
         self.assertEqual(draft_extend_backend.calls, [(4, 1), (16, 4)])
 
-    def test_non_eagle3_algorithm_raises(self):
-        # The spec policy enforces the supported algorithm at construction (only
-        # EAGLE3 today); an unsupported algorithm fails loudly rather than
-        # silently degrading to a non-spec policy.
+    def test_non_eagle_family_algorithm_raises(self):
+        # Unsupported algorithms must fail instead of running a non-spec policy.
         mr = _spec_model_runner()
         # The algorithm is read from get_spec() as the policy is constructed.
         self.publish_config(speculative_algorithm="NGRAM")
-        with self.assertRaisesRegex(ValueError, "only supports EAGLE3"):
+        with self.assertRaisesRegex(ValueError, "supports EAGLE, EAGLE3 and NEXTN"):
             _make_spec_policy(mr)
 
 
@@ -2371,7 +2816,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         tracer="dynamo",
     ):
-        model = SimpleNamespace(
+        model = _FakeModel(
             fc=SimpleNamespace(in_features=target_hidden_size),
             forward=MagicMock(),
             prepare_forward_batch=MagicMock(),
@@ -2571,9 +3016,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         worker = SimpleNamespace(
             append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
         )
-        compile_module_name = (
-            "sglang.srt.hardware_backend.tpu.compilation.direct_compile"
-        )
+        compile_module_name = "sglang_tpu.compilation.direct_compile"
         compile_module = ModuleType(compile_module_name)
         compile_module.direct_compile = MagicMock(return_value=MagicMock())
 
@@ -2630,11 +3073,15 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         policy._compiled_kv_appender = mock_append_kernel
         mock_block_embedder = MagicMock()
         policy._compiled_block_embedder = mock_block_embedder
+        mock_draft_block = MagicMock()
+        policy._compiled_draft_block = mock_draft_block
         worker = SimpleNamespace(
             draft_model=mr.model,
             draft_model_runner=mr,
             append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
             embed_draft_block_ids=MagicMock(),
+            _full_embed_gpu=None,
+            _block_pos_offsets=torch.arange(4),
         )
 
         with get_parallel().override(
@@ -2655,6 +3102,10 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
             policy.append_target_hidden_to_draft_kv_by_loc_tpu,
         )
         self.assertEqual(worker.embed_draft_block_ids, mock_block_embedder)
+        self.assertEqual(
+            worker.prepare_draft_block_fused, policy._prepare_draft_block_fused
+        )
+        self.assertEqual(mock_draft_block.call_count, 2)
 
         # Extend call with 10 tokens pads to token bucket 16.
         target_hidden = torch.ones(10, 32)
@@ -2785,9 +3236,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         policy, _ = self._make_dflash_policy(
             hidden_size=32, draft_token_num=4, is_draft_worker=True
         )
-        policy_module = (
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy"
-        )
+        policy_module = "sglang_tpu.compilation.decoder_compile_policy"
         with (
             patch(f"{policy_module}.enable_num_token_non_padded", return_value=True),
             patch(
@@ -2851,11 +3300,15 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         policy._compiled_kv_appender = mock_append_kernel
         mock_block_embedder = MagicMock()
         policy._compiled_block_embedder = mock_block_embedder
+        mock_draft_block = MagicMock()
+        policy._compiled_draft_block = mock_draft_block
         worker = SimpleNamespace(
             draft_model=mr.model,
             draft_model_runner=mr,
             append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
             embed_draft_block_ids=MagicMock(),
+            _full_embed_gpu=None,
+            _block_pos_offsets=torch.arange(4),
         )
 
         # precompile_draft branches on get_disagg().disaggregation_mode.
@@ -2879,6 +3332,8 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         self.assertEqual(mock_append_kernel.call_count, 2)
         # Block embed warmup is not mode-gated: one call per bs bucket.
         self.assertEqual(mock_block_embedder.call_count, 2)
+        # A prefill-only engine never builds a draft block.
+        self.assertEqual(mock_draft_block.call_count, 0)
 
     def test_precompile_draft_pd_decode_mode_skips_extend(self):
         policy, mr = self._make_dflash_policy(
@@ -2888,11 +3343,15 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         policy._compiled_kv_appender = mock_append_kernel
         mock_block_embedder = MagicMock()
         policy._compiled_block_embedder = mock_block_embedder
+        mock_draft_block = MagicMock()
+        policy._compiled_draft_block = mock_draft_block
         worker = SimpleNamespace(
             draft_model=mr.model,
             draft_model_runner=mr,
             append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
             embed_draft_block_ids=MagicMock(),
+            _full_embed_gpu=None,
+            _block_pos_offsets=torch.arange(4),
         )
 
         with (
@@ -2914,6 +3373,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         self.assertEqual(mr.model.forward.call_count, 2)
         self.assertEqual(mock_append_kernel.call_count, 2)
         self.assertEqual(mock_block_embedder.call_count, 2)
+        self.assertEqual(mock_draft_block.call_count, 2)
 
     def test_dflash_build_disagg_draft_input(self):
         from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -3693,7 +4153,7 @@ class TestDraftPrecompile(_SpecPolicyTestCase):
                 moe_tp_rank=1,
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation."
+                "sglang_tpu.compilation."
                 "spec_decode_compile_policy_eagle3._materialize_out"
             ) as materialize,
         ):
@@ -3737,9 +4197,7 @@ class TestDraftPrecompile(_SpecPolicyTestCase):
             )
             return torch.zeros(forward_batch.batch_size)
 
-        policy_module = (
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy"
-        )
+        policy_module = "sglang_tpu.compilation.decoder_compile_policy"
         with (
             get_parallel().override(
                 tp_size=2,
@@ -3756,7 +4214,7 @@ class TestDraftPrecompile(_SpecPolicyTestCase):
             ),
             patch("sglang.srt.layers.cp.utils.is_mla_cp_enabled", return_value=False),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation."
+                "sglang_tpu.compilation."
                 "spec_decode_compile_policy_eagle3._materialize_out"
             ),
         ):
@@ -4367,6 +4825,63 @@ class TestSpecVerifyPaddingIsInert(_SpecPolicyTestCase):
         self.assertTrue(torch.all(logits[LOGICAL_TOKENS:] == 0))
         finalized, _ = policy.finalize_spec_verify(padding, result, (None, None))
         self.assertEqual(finalized[1].shape, (BS,))
+
+
+class TestDraftRankInputVocabBounds(CustomTestCase):
+    def setUp(self):
+        from sglang.srt.layers import vocab_parallel_embedding
+
+        # TPU backend initialization unwraps this dynamic CPU/CUDA compile wrapper.
+        # ExitStack rather than enterContext, which is 3.11+.
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(
+            patch.object(
+                vocab_parallel_embedding,
+                "get_masked_input_and_mask",
+                vocab_parallel_embedding.get_masked_input_and_mask.__wrapped__,
+            )
+        )
+
+    def _embedding(self, tp_rank):
+        from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+
+        embedding = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
+        torch.nn.Module.__init__(embedding)
+        embedding.tp_rank = tp_rank
+        embedding.tp_size = 4
+        embedding.org_vocab_size = 15
+        embedding.org_vocab_size_padded = 16
+        embedding.num_embeddings = 18
+        embedding.num_embeddings_padded = 24
+        embedding.shard_indices = VocabParallelEmbedding._get_indices(
+            24, 16, 18, 15, tp_rank, 4
+        )
+        embedding.weight = torch.nn.Parameter(torch.zeros(6, 2))
+        return embedding
+
+    def test_rank_input_bounds_match_the_shard_constants(self):
+        for tp_rank in range(4):
+            with self.subTest(tp_rank=tp_rank):
+                embedding = self._embedding(tp_rank)
+                ids = torch.arange(18)
+                constant = embedding._get_masked_input_and_mask(ids)
+                embedding.lift_rank_to_input()
+                lifted = embedding._get_masked_input_and_mask(ids)
+                for got, want in zip(lifted, constant):
+                    torch.testing.assert_close(got, want)
+                self.assertNotIn("_rank_input", embedding.state_dict())
+
+    def test_lifting_is_idempotent_and_skips_unsharded(self):
+        embedding = self._embedding(1)
+        embedding.lift_rank_to_input()
+        rank = embedding._rank_input
+        embedding.lift_rank_to_input()
+        self.assertIs(embedding._rank_input, rank)
+        unsharded = self._embedding(0)
+        unsharded.tp_size = 1
+        unsharded.lift_rank_to_input()
+        self.assertEqual(list(unsharded.buffers()), [])
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 # in these comments -- the renderer would substitute them here too):
 #   IMAGE         digest-pinned image
 #   HOSTS         completions/parallelism (single-host = 1)
-#   TOPOLOGY/POOL node labels (looked up by host count in topology.yaml)
+#   TOPOLOGY/QUEUE slice shape and Kueue queue (looked up by host count in topology.yaml)
 #   RUN_NAME      DNS-safe label for the JobSet (a suite name or a launch-group name)
 #   SUITE         single-host: the run_suite suite; NIGHTLY_FLAG: --nightly or empty
 #   LAUNCH_SCRIPT multi-host: the launch group's recipe (relative to benchmark/tpu/);
@@ -13,6 +13,8 @@
 #   TIMEOUT_PER_FILE per-file timeout (run_suite.py single-host; `timeout` per live-server file)
 #   PARTITION_FLAGS single-host run_suite partition arguments (empty when unsharded)
 #   TEST_FILE_FLAG single-host exact-file selection (empty when running a whole suite)
+#   CHIP_WORKERS_FLAG single-host --tpu-chip-workers (empty when chip sharing is off)
+#   FULL_MATRIX   1 on nightly runs: tests that trim their sweep for the gate run it whole
 #   SERVICE_ACCOUNT  indented serviceAccountName line (empty -> namespace default KSA)
 # The renderer substitutes only those; the container's own $spid / TPU_WORKER_ID stay
 # literal. Gating is handled by the kind-aware _tpu-test.
@@ -24,16 +26,14 @@
 #     model + config); rank 0 runs each of the group's TEST_FILES in LIVE-SERVER mode
 #     against the one server; workers serve until the leader tears down, then exit 0.
 #     Files sharing an identical launch spec share this one server (grouping).
-# ci-tpu-pools: ${POOL_LIST}
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
   generateName: tpu-ci-${RUN_NAME}-
   namespace: tpu-ci
   labels:
-    # Created suspended; Kueue releases it when a whole slice is free (kueue-tpu.yaml).
-    # The ci-tpu-pool nodeSelector below is redundant with the flavor, but keeps pods off
-    # the dev pools if Kueue is absent -- drop it when a second slice flavor is added.
+    # Created suspended; Kueue releases it when a whole slice is free (reconcile_quota.py
+    # keeps the queues).
     kueue.x-k8s.io/queue-name: ${QUEUE}
 spec:
   ttlSecondsAfterFinished: 7200
@@ -55,6 +55,8 @@ spec:
             metadata:
               labels:
                 app: tpu-ci
+              annotations:
+                gke-gcsfuse/volumes: "true"
             spec:
               restartPolicy: Never
 ${SERVICE_ACCOUNT}
@@ -77,6 +79,13 @@ ${POOL_AFFINITY}
                 - name: tmp
                   emptyDir:
                     sizeLimit: 64Gi
+                # JAX compile cache shared across CI runs; objects expire after 7 days.
+                - name: compile-cache
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    volumeAttributes:
+                      bucketName: sglang-torchtpu-ci-compile-cache
+                      mountOptions: "implicit-dirs"
 ${WEIGHTS_VOLUME}
               containers:
                 - name: test
@@ -99,10 +108,12 @@ ${WEIGHTS_VOLUME}
                     - |
                       set -uo pipefail
                       cd /sgl-workspace/sglang
-                      export HF_HOME=/tmp/hf SGLANG_PLATFORM=tpu SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                      export HF_HOME=/tmp/hf SGLANG_PLATFORM=${PLATFORM} SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                      export SGLANG_TPU_FULL_MATRIX=${FULL_MATRIX}
                       # torch_tpu's tier-3 cache defaults to $HOME, on the pod's ephemeral
                       # overlay; warmup fills the node disk and the kubelet evicts the pod.
                       export TORCH_TPU_TIER3_ROOT=/dev/shm/torch_tpu_tier3
+                      export JAX_COMPILATION_CACHE_DIR=/compile-cache/jax
                       NNODES=$(awk -F, '{print NF}' <<<"${TPU_WORKER_HOSTNAMES:-x}")
                       RANK="${TPU_WORKER_ID:-0}"
                       echo "run=${RUN_NAME} nnodes=$NNODES rank=$RANK"
@@ -156,7 +167,7 @@ ${WEIGHTS_VOLUME}
 
                       if [ "$NNODES" -le 1 ]; then
                         # Single-host: each test self-launches its own server.
-                        exec python3 test/run_suite.py --hw tpu --suite ${SUITE} ${NIGHTLY_FLAG} ${PARTITION_FLAGS} ${TEST_FILE_FLAG} --timeout-per-file ${TIMEOUT_PER_FILE}
+                        exec python3 test/run_suite.py --hw tpu --suite ${SUITE} ${NIGHTLY_FLAG} ${PARTITION_FLAGS} ${TEST_FILE_FLAG} ${CHIP_WORKERS_FLAG} --timeout-per-file ${TIMEOUT_PER_FILE}
                       fi
 
                       # Multi-host: every host runs the launch group's recipe (owns model+config).
@@ -175,7 +186,9 @@ ${WEIGHTS_VOLUME}
                                       --working-directory benchmark/tpu) ;;
                         *)    launch=(bash "benchmark/tpu/${LAUNCH_SCRIPT}") ;;
                       esac
-                      ( HOST=127.0.0.1 PORT=30000 ENABLE_PROFILER_ENDPOINT=0 ENABLE_COMPILE_CACHE=0 \
+                      # Normalization may move serving to another pod; the input
+                      # leader forwards this port to that pod's reachable listener.
+                      ( HOST=0.0.0.0 PORT=30000 ENABLE_PROFILER_ENDPOINT=0 ENABLE_COMPILE_CACHE=0 \
                           "${launch[@]}" ) > >(tee /tmp/server.log) 2>&1 &
                       spid=$!
                       if [ "$RANK" = "0" ]; then
@@ -235,12 +248,14 @@ ${WEIGHTS_VOLUME}
                       google.com/tpu: "4"
                       cpu: "4"
                       memory: 32Gi
-                      # No ephemeral-storage here: kueue-tpu.yaml's coveredResources
+                      # No ephemeral-storage here: the CI ClusterQueues' coveredResources
                       # omit it, and Kueue silently never admits a workload asking
                       # for a resource the ClusterQueue does not cover.
                     limits:
                       google.com/tpu: "4"
                   volumeMounts:
+                    - name: compile-cache
+                      mountPath: /compile-cache
                     - name: dshm
                       mountPath: /dev/shm
                     - name: tmp

@@ -1,0 +1,296 @@
+"""Shared helpers for the raiden prefill/decode disaggregation backend.
+
+Holds what both sides of the transport need: the package logger, the port and
+chunk-size constants, the peer-endpoint formatter, and the KV-cache grouping
+that turns a device pool into the per-namespace tensor lists raiden registers.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Callable, List, Optional, Sequence
+
+import torch
+
+from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVCache
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.utils.network import NetworkAddress
+from sglang_tpu.disaggregation.raiden.pp_common import _BLOCK_MAJOR_KV_RANK
+from sglang_tpu.disaggregation.raiden.serde import (
+    BLOCK_MAJOR_KV_LAYOUT,
+    PER_LAYER_KV_LAYOUT,
+)
+from sglang_tpu.dsv4.dsv4_memory_pool import (
+    _TPU_STATE_SLOT_STRIDE_PAGES,
+    DSV4TPUTokenToKVPool,
+    TPUCompressStatePool,
+    TPUDeepSeekV4CSAKVPool,
+    TPUDeepSeekV4HCAKVPool,
+    TPUDeepSeekV4IndexerPool,
+    TPUDeepSeekV4SWAKVPool,
+)
+from sglang_tpu.kv_pool import TpuBlockMajorMHATokenToKVPool
+from sglang_tpu.mamba_pool import TpuMambaPool
+
+# One logger for the whole package, deliberately keeping the name of the module
+# this code used to live in: emitted record names and the existing test
+# monkeypatch target "…raiden.conn.logger" both depend on it.
+logger = logging.getLogger("sglang_tpu.disaggregation.raiden.conn")
+
+# Pages are announced to the decode in pieces of at least this many tokens. A
+# raiden read costs about the same whether it moves 16 pages or 200, so
+# announcing every prefill step would spend more on rendezvous than it hides;
+# pieces of this size keep the overlap while costing a few reads per request.
+CHUNK_ANNOUNCE_TOKENS = 8192
+
+# Ports each rank reserves: control+data for the full, SWA and GDN state engines.
+PORTS_PER_RANK = 6
+SWA_PORT_OFFSET = 2
+STATE_PORT_OFFSET = 4
+
+# Base of the per-rank control ports (`base + 6*local_rank`). Not 30000: that
+# puts rank 0 on the default HTTP serving port, and the engine wins the bind --
+# uvicorn then dies with EADDRINUSE and takes the server down before any
+# transfer is attempted.
+DEFAULT_KV_PORT = 31000
+
+
+def _tcp_endpoint(ip: str, port: int) -> str:
+    """``tcp://`` endpoint of a peer rank's rendezvous socket.
+
+    Peer addresses travel as bare literals (``rank_ip`` from the bootstrap
+    server, the ip frame of PULL_REQ / RESHARD_REQ); an IPv6 literal must be
+    bracketed before a port is appended or the port merges into the address.
+    The bracket is also what ``_send_multipart_locked`` keys the IPv6 socket
+    option on.
+    """
+    return NetworkAddress(host=ip, port=int(port)).to_tcp()
+
+
+@dataclass(frozen=True)
+class RaidenKVCacheGroups:
+    """Page-compatible cache groups registered with independent Raiden engines."""
+
+    full: List[Any]
+    swa: List[Any]
+    # One global layer ID per tensor; a block-major bundle is named by its first.
+    full_layer_ids: List[int] = field(default_factory=list)
+    swa_layer_ids: List[int] = field(default_factory=list)
+    # Trailing tensors of full / swa that belong to a separate draft pool.
+    num_draft_full: int = 0
+    num_draft_swa: int = 0
+    # Trailing full tensors after the draft's: the PD hidden pool (pd_hidden_pool.py).
+    num_hidden_full: int = 0
+    # Per-layer request-state tensors (GDN/Mamba rows or DSV4 compressor rings).
+    state: List[torch.Tensor] = field(default_factory=list)
+    state_type: StateType = StateType.MAMBA
+    state_max_blocks: int = 1
+    # Maps a request's mamba slot to the state row a transfer moves.
+    committed_state_row: Optional[Callable[[int], int]] = None
+    # Optional host-side metadata pack/unpack hooks accompanying state_blocks.
+    read_state_meta: Optional[Callable[[Sequence[int]], bytes]] = None
+    write_state_meta: Optional[Callable[[Sequence[int], bytes], None]] = None
+
+
+def _assert_root_buffers(name: str, buffers: Sequence[torch.Tensor]) -> None:
+    for idx, buf in enumerate(buffers):
+        if isinstance(buf, torch.Tensor) and buf._is_view():
+            raise RuntimeError(
+                f"Raiden requires root tensors (not views) for {name}[{idx}] "
+                "so PJRT buffer registration remains valid."
+            )
+
+
+def kv_layout_of(tensors: Sequence[torch.Tensor]) -> str:
+    """The P/D layout tag of the registered full-attention KV tensors."""
+    if any(len(tensor.shape) == _BLOCK_MAJOR_KV_RANK for tensor in tensors):
+        return BLOCK_MAJOR_KV_LAYOUT
+    return PER_LAYER_KV_LAYOUT
+
+
+def _block_major_groups(pool: KVCache) -> Optional[RaidenKVCacheGroups]:
+    """One bundle per page namespace for a block-major pool, else None.
+
+    The bundle row holds every layer of a page, so it is registered whole; its
+    strided per-layer ``kv_buffer`` views are never registered.
+    """
+    if isinstance(pool, TpuBlockMajorMHATokenToKVPool):
+        groups = RaidenKVCacheGroups(
+            full=pool.page_buffers(), swa=[], full_layer_ids=[pool.start_layer]
+        )
+    elif isinstance(pool, SWAKVPool) and isinstance(
+        pool.full_kv_pool, TpuBlockMajorMHATokenToKVPool
+    ):
+        mapping = pool.layers_mapping
+        full_ids = sorted(layer for layer, (_, swa) in mapping.items() if not swa)
+        swa_ids = sorted(layer for layer, (_, swa) in mapping.items() if swa)
+        groups = RaidenKVCacheGroups(
+            full=pool.full_kv_pool.page_buffers(),
+            swa=pool.swa_kv_pool.page_buffers(),
+            full_layer_ids=full_ids[:1],
+            swa_layer_ids=swa_ids[:1],
+        )
+    else:
+        return None
+    _assert_root_buffers("block-major full KV", groups.full)
+    _assert_root_buffers("block-major SWA KV", groups.swa)
+    return groups
+
+
+def get_raiden_kv_caches(
+    pool: KVCache, draft_pool: Optional[KVCache] = None
+) -> RaidenKVCacheGroups:
+    """Group per-layer device KV tensors by their page-index namespace.
+
+    The TPU fused KV pool stores one [num_blocks, page_size, ...] tensor per
+    layer in ``kv_buffer`` and exposes them via ``get_fused_kv_buffer``. Hybrid
+    SWA pools allocate full-attention and sliding-window pages independently, so
+    they must not share one Raiden block-id list. Speculative decoding uses the
+    same page indices for target and draft KV, so append the draft tensors to
+    the matching namespace and move them in the same Raiden transfer. Hybrid
+    linear-attention pools contribute GDN state rows; ``DSV4TPUTokenToKVPool``
+    contributes its compressed full-page sub-pools, SWA pages, and 32-page
+    request compressor state rings. A block-major pool contributes one bundle
+    per namespace.
+    """
+
+    def group_one(current_pool: KVCache) -> RaidenKVCacheGroups:
+        if isinstance(current_pool, DSV4TPUTokenToKVPool):
+            dsv4_full: List[torch.Tensor] = []
+            if isinstance(current_pool.c4_kv_pool, TPUDeepSeekV4CSAKVPool):
+                dsv4_full.extend(current_pool.c4_kv_pool.nope_buffer)
+                dsv4_full.extend(current_pool.c4_kv_pool.rope_buffer)
+            if isinstance(current_pool.c4_indexer_kv_pool, TPUDeepSeekV4IndexerPool):
+                dsv4_full.extend(
+                    current_pool.c4_indexer_kv_pool.index_k_with_scale_buffer
+                )
+            if isinstance(current_pool.c128_kv_pool, TPUDeepSeekV4HCAKVPool):
+                dsv4_full.extend(current_pool.c128_kv_pool.k_buffer)
+            dsv4_swa: List[torch.Tensor] = (
+                list(current_pool.swa_kv_pool.k_buffer)
+                if isinstance(current_pool.swa_kv_pool, TPUDeepSeekV4SWAKVPool)
+                else []
+            )
+            _assert_root_buffers("DSV4 full KV", dsv4_full)
+            _assert_root_buffers("DSV4 SWA KV", dsv4_swa)
+            return RaidenKVCacheGroups(full=dsv4_full, swa=dsv4_swa)
+        bundles = _block_major_groups(current_pool)
+        if bundles is not None:
+            return bundles
+
+        layers_mapping = getattr(current_pool, "layers_mapping", None)
+        start = current_pool.start_layer
+        if isinstance(current_pool, HybridLinearKVPool):
+            # Only full-attention layers own KV; GDN layers ship as state.
+            layer_ids = sorted(current_pool.full_attention_layer_id_mapping)
+            buffers = [
+                current_pool.get_fused_kv_buffer(layer_id) for layer_id in layer_ids
+            ]
+        elif hasattr(current_pool, "get_fused_kv_buffer"):
+            layer_ids = (
+                sorted(layers_mapping)
+                if layers_mapping
+                else list(range(start, start + current_pool.layer_num))
+            )
+            buffers = [
+                current_pool.get_fused_kv_buffer(layer_id) for layer_id in layer_ids
+            ]
+        elif hasattr(current_pool, "kv_buffer"):
+            buffers = list(current_pool.kv_buffer)
+            layer_ids = (
+                sorted(layers_mapping)
+                if layers_mapping
+                else list(range(start, start + len(buffers)))
+            )
+        else:
+            raise RuntimeError(
+                "Raiden backend requires a fused KV pool exposing kv_buffer; got "
+                f"{type(current_pool).__name__}"
+            )
+        if layers_mapping:
+            full = []
+            swa = []
+            full_ids = []
+            swa_ids = []
+            for layer_id, buf in zip(layer_ids, buffers, strict=True):
+                (swa if layers_mapping[layer_id][1] else full).append(buf)
+                (swa_ids if layers_mapping[layer_id][1] else full_ids).append(layer_id)
+            return RaidenKVCacheGroups(
+                full=full, swa=swa, full_layer_ids=full_ids, swa_layer_ids=swa_ids
+            )
+        return RaidenKVCacheGroups(
+            full=buffers, swa=[], full_layer_ids=layer_ids, swa_layer_ids=[]
+        )
+
+    # Lazy: the experimental spec package loads after the platform.
+    from sglang_tpu.experimental.speculative.pd_hidden_pool import get_pd_hidden_pool
+
+    hidden_pool = get_pd_hidden_pool() if draft_pool is not None else None
+    if hidden_pool is not None:
+        # The decode builds the draft KV from these rows, so it never travels.
+        draft_pool = None
+
+    groups = group_one(pool)
+    full, swa = list(groups.full), list(groups.swa)
+    full_ids, swa_ids = list(groups.full_layer_ids), list(groups.swa_layer_ids)
+    num_draft_full = num_draft_swa = num_hidden_full = 0
+    if draft_pool is not None and draft_pool is not pool:
+        draft_groups = group_one(draft_pool)
+        num_draft_full, num_draft_swa = len(draft_groups.full), len(draft_groups.swa)
+        full.extend(draft_groups.full)
+        swa.extend(draft_groups.swa)
+        full_ids.extend(draft_groups.full_layer_ids)
+        swa_ids.extend(draft_groups.swa_layer_ids)
+
+    if hidden_pool is not None:
+        full.append(hidden_pool.buffer)
+        full_ids.append(0)
+        num_hidden_full = 1
+
+    state: List[torch.Tensor] = []
+    state_type = StateType.MAMBA
+    state_max_blocks = 1
+    committed_state_row = None
+    read_state_meta = None
+    write_state_meta = None
+    if isinstance(pool, DSV4TPUTokenToKVPool):
+        state = [
+            p.state_buffer
+            for p in (*pool.compress_state_pools, *pool.indexer_compress_state_pools)
+            if isinstance(p, TPUCompressStatePool)
+        ]
+        _assert_root_buffers("DSV4 compressor state", state)
+        state_type = StateType.DSV4_REQUEST_STATE
+        state_max_blocks = _TPU_STATE_SLOT_STRIDE_PAGES
+        read_state_meta = pool.pack_req_state_meta
+        write_state_meta = pool.unpack_req_state_meta
+    elif isinstance(pool, HybridLinearKVPool) and isinstance(
+        pool.mamba_pool, TpuMambaPool
+    ):
+        state = pool.mamba_pool.get_state()
+        committed_state_row = pool.mamba_pool.committed_row
+
+    for name, group in (("full KV", full), ("SWA KV", swa), ("GDN state", state)):
+        block_counts = {int(buf.shape[0]) for buf in group}
+        if len(block_counts) > 1:
+            raise RuntimeError(
+                f"Raiden requires uniform {name} block counts; got "
+                f"{sorted(block_counts)}"
+            )
+    return RaidenKVCacheGroups(
+        full=full,
+        swa=swa,
+        full_layer_ids=full_ids,
+        swa_layer_ids=swa_ids,
+        num_draft_full=num_draft_full,
+        num_draft_swa=num_draft_swa,
+        num_hidden_full=num_hidden_full,
+        state=state,
+        state_type=state_type,
+        state_max_blocks=state_max_blocks,
+        committed_state_row=committed_state_row,
+        read_state_meta=read_state_meta,
+        write_state_meta=write_state_meta,
+    )

@@ -1,7 +1,7 @@
 """Correctness tests for the vendored Pallas ragged-paged-attention v3 kernel.
 
 The kernel and its pure-JAX ``ref_ragged_paged_attention`` reference both
-live in ``sglang.srt.layers.attention.pallas.ragged_paged_attention_v3``.
+live in ``sglang_tpu.attention.pallas.ragged_paged_attention_v3``.
 These tests build small inputs in both formats (fused/packed for the
 kernel, unpacked pages for the reference) and assert the outputs match
 within bfloat16 tolerance.
@@ -35,7 +35,7 @@ import numpy as np
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit", chips=1)
 
 # This is a standalone raw-JAX kernel test, not a TorchTPU runtime process.
 # SGLang platform discovery selects CPU-only JAX for export, so select the
@@ -96,7 +96,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         import jax
         import jax.numpy as jnp
 
-        from sglang.srt.layers.attention.pallas.util import get_dtype_packing
+        from sglang_tpu.attention.pallas.util import get_dtype_packing
 
         num_q_heads = num_q_heads if num_q_heads is not None else self.NUM_Q_HEADS
         num_kv_heads = num_kv_heads if num_kv_heads is not None else self.NUM_KV_HEADS
@@ -264,12 +264,21 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         }
 
     def _run_and_compare(
-        self, inputs, *, distribution, tolerance=None, **kernel_kwargs
+        self,
+        inputs,
+        *,
+        distribution,
+        tolerance=None,
+        check_live_cache=False,
+        **kernel_kwargs,
     ):
-        """Run kernel + reference with matching kwargs and assert close."""
+        """Run kernel + reference with matching kwargs and assert close.
+
+        ``check_live_cache`` also asserts every live K/V slot after the call.
+        """
         import jax.numpy as jnp
 
-        from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
             ragged_paged_attention,
             ref_ragged_paged_attention,
         )
@@ -320,7 +329,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
             **kernel_kwargs,
             **scale_kwargs,
         )
-        if "decode_query_size" in kernel_kwargs:
+        if check_live_cache or "decode_query_size" in kernel_kwargs:
             self._assert_live_cache_matches_reference(inputs, updated_cache)
         kernel_out = kernel_out[: inputs["total_q_tokens"]]
 
@@ -403,7 +412,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         """The decode route keeps masks, sinks, live cache, and inactive rows."""
         import jax.numpy as jnp
 
-        from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
             ragged_paged_attention,
         )
 
@@ -521,7 +530,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         and differs from causal on the earlier rows of the block."""
         import jax.numpy as jnp
 
-        from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
             ragged_paged_attention,
         )
 
@@ -560,7 +569,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
     def test_custom_mask_requires_noncausal(self):
         import jax.numpy as jnp
 
-        from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
             ragged_paged_attention,
         )
 
@@ -644,6 +653,44 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         self.TOTAL_NUM_PAGES = self.PAGES_PER_SEQ
         inputs = self._build_inputs([(kv_len, 8)])
         self._run_and_compare(inputs, distribution=(0, 0, 1), sliding_window=32)
+
+    # Each query block's KV loop starts at its window, so the last query block
+    # of a long sliding-window prefill never visits the first KV blocks. Their
+    # new tokens must still reach the cache: a later prefix-cache hit inside
+    # this prompt reads the window before the hit from there.
+
+    def test_extend_sliding_window_writes_all_new_kv(self):
+        """The last query block's window starts one 128-key block in."""
+        self.PAGES_PER_SEQ = 17
+        self.TOTAL_NUM_PAGES = 17
+        inputs = self._build_inputs(
+            [(256, 256)], num_q_heads=8, num_kv_heads=2, noncontiguous_pages=True
+        )
+        self._run_and_compare(
+            inputs,
+            distribution=(0, 0, 1),
+            sliding_window=40,
+            m_block_sizes=(32, 128, 32, 32),
+            check_live_cache=True,
+        )
+
+    def test_extend_sliding_window_writes_all_new_kv_prefix_multi_seq(self):
+        """A cached prefix and a second sequence, several blocks per window."""
+        self.PAGES_PER_SEQ = 21
+        self.TOTAL_NUM_PAGES = 42
+        inputs = self._build_inputs(
+            [(320, 192), (200, 200)],
+            num_q_heads=8,
+            num_kv_heads=2,
+            noncontiguous_pages=True,
+        )
+        self._run_and_compare(
+            inputs,
+            distribution=(0, 0, 2),
+            sliding_window=48,
+            m_block_sizes=(32, 64, 32, 32),
+            check_live_cache=True,
+        )
 
     def test_decode_soft_cap(self):
         """soft_cap rescales logits with tanh before softmax. Verifies the

@@ -11,7 +11,7 @@ from sglang.test.tpu import model_config_main
 
 register_tpu_ci(
     est_time=3600,
-    suite="nightly-tpu-4-v7",
+    suite="external-nightly-1host",
     nightly=True,
     labels=["singlehost", "gpt-oss-120b", "spec", "dflash"],
 )
@@ -49,6 +49,7 @@ LAUNCH_ENV = {
     # init and the RNG draws. The deterministic ones (greedy accept) compute the
     # same answer everywhere, so syncing them costs a collective per step.
     "SGLANG_SPEC_TP_SYNC": "rng",
+    "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
     "EXTRA_ARGS": (
         "--reasoning-parser gpt-oss "
         f"--served-model-name {SERVED_MODEL_NAME} "

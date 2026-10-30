@@ -98,9 +98,13 @@ class SamplingBatchInfo:
     return_sampling_support_logprobs: Optional[List[bool]] = None
     sampling_mask_batch_indices: Optional[torch.Tensor] = None
     sampling_support_logprobs_capture_indices: Optional[torch.Tensor] = None
+    # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
+    sampling_mask_top_ks: Optional[List[int]] = None
 
-    # Device
+    # Execution device for logits, penalties, and grammar masks.
     device: str = "cuda"
+    # Storage mode for request sampling parameters only.
+    sampling_params_on_cpu: bool = False
 
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
@@ -116,37 +120,46 @@ class SamplingBatchInfo:
     npu_top_k_top_p_eligible: bool = False
 
     @classmethod
-    def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
+    def from_schedule_batch(
+        cls,
+        batch: ScheduleBatch,
+        vocab_size: int,
+        *,
+        sampling_params_on_cpu: bool = False,
+    ):
         enable_deterministic = get_exec().deterministic.enable_deterministic_inference
 
         reqs = batch.reqs
         device = batch.device
         _pin = is_pin_memory_available(device)
+        param_device = "cpu" if sampling_params_on_cpu else cls.parameter_device(batch)
+        # Match the [B, 1] device allocation produced by merging/filtering.
+        # A device-side view of [B] gives TorchTPU a different compiled input.
         temperatures = (
             torch.tensor(
                 [r.sampling_params.temperature for r in reqs],
                 dtype=torch.float,
                 pin_memory=_pin,
             )
-            .to(device, non_blocking=True)
             .view(-1, 1)
+            .to(param_device, non_blocking=True)
         )
         top_ps = torch.tensor(
             [r.sampling_params.top_p for r in reqs],
             dtype=torch.float,
             pin_memory=_pin,
-        ).to(device, non_blocking=True)
+        ).to(param_device, non_blocking=True)
         top_k_values = [r.sampling_params.top_k for r in reqs]
         top_ks = torch.tensor(
             top_k_values,
             dtype=torch.int32,
             pin_memory=_pin,
-        ).to(device, non_blocking=True)
+        ).to(param_device, non_blocking=True)
         min_ps = torch.tensor(
             [r.sampling_params.min_p for r in reqs],
             dtype=torch.float,
             pin_memory=_pin,
-        ).to(device, non_blocking=True)
+        ).to(param_device, non_blocking=True)
         sampling_seed = (
             torch.tensor(
                 [
@@ -159,7 +172,7 @@ class SamplingBatchInfo:
                 ],
                 dtype=torch.int64,
                 pin_memory=_pin,
-            ).to(device, non_blocking=True)
+            ).to(param_device, non_blocking=True)
             if enable_deterministic
             else None
         )
@@ -208,6 +221,9 @@ class SamplingBatchInfo:
                 device,
             )
         )
+        sampling_mask_top_ks = [
+            r.sampling_params.top_k if r.return_sampling_mask else 1 for r in reqs
+        ]
 
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
@@ -252,6 +268,7 @@ class SamplingBatchInfo:
         )
 
         ret = cls(
+            sampling_params_on_cpu=sampling_params_on_cpu,
             temperatures=temperatures,
             top_ps=top_ps,
             top_ks=top_ks,
@@ -283,6 +300,7 @@ class SamplingBatchInfo:
             sampling_support_logprobs_capture_indices=(
                 sampling_support_logprobs_capture_indices
             ),
+            sampling_mask_top_ks=sampling_mask_top_ks,
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -337,6 +355,37 @@ class SamplingBatchInfo:
             return None
         return _rows_to_device_indices(indices, device)
 
+    @classmethod
+    def parameter_device(cls, batch):
+        """Device on which request sampling parameters are initially materialized."""
+        return batch.device
+
+    def _filter_params(self, keep_indices, keep_indices_device):
+        indices = keep_indices if self.sampling_params_on_cpu else keep_indices_device
+        for item in [
+            "temperatures",
+            "top_ps",
+            "top_ks",
+            "min_ps",
+            "sampling_seed",
+        ]:
+            value = getattr(self, item, None)
+            if value is not None:
+                setattr(self, item, value[indices])
+
+    def _merge_params(self, other):
+        for item in [
+            "temperatures",
+            "top_ps",
+            "top_ks",
+            "min_ps",
+            "sampling_seed",
+        ]:
+            self_val = getattr(self, item, None)
+            other_val = getattr(other, item, None)
+            if self_val is not None and other_val is not None:
+                setattr(self, item, torch.cat([self_val, other_val]))
+
     def __len__(self):
         return len(self.temperatures)
 
@@ -372,7 +421,7 @@ class SamplingBatchInfo:
             self.acc_additive_penalties = torch.zeros(
                 (len(self.temperatures), self.vocab_size),
                 dtype=torch.float32,
-                device=self.temperatures.device,
+                device=self.device,
             )
             self.penalizer_orchestrator.accumulate_additive_penalties(
                 self.acc_additive_penalties
@@ -430,16 +479,7 @@ class SamplingBatchInfo:
         if self.has_custom_logit_processor:
             self._filter_batch_custom_logit_processor(keep_indices)
 
-        for item in [
-            "temperatures",
-            "top_ps",
-            "top_ks",
-            "min_ps",
-            "sampling_seed",
-        ]:
-            value = getattr(self, item, None)
-            if value is not None:
-                setattr(self, item, value[keep_indices_device])
+        self._filter_params(keep_indices, keep_indices_device)
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
@@ -447,6 +487,10 @@ class SamplingBatchInfo:
             self.return_sampling_masks = [
                 self.return_sampling_masks[i] for i in keep_indices
             ]
+            if self.sampling_mask_top_ks is not None:
+                self.sampling_mask_top_ks = [
+                    self.sampling_mask_top_ks[i] for i in keep_indices
+                ]
             if self.return_sampling_support_logprobs is not None:
                 self.return_sampling_support_logprobs = [
                     self.return_sampling_support_logprobs[i] for i in keep_indices
@@ -496,6 +540,10 @@ class SamplingBatchInfo:
             self.has_custom_logit_processor = False
 
     def merge_batch(self, other: SamplingBatchInfo):
+        if self.sampling_params_on_cpu != other.sampling_params_on_cpu:
+            raise ValueError(
+                "Cannot merge sampling parameters with different storage modes"
+            )
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
         # Merge the custom logit processors and custom params lists
@@ -549,21 +597,14 @@ class SamplingBatchInfo:
                     self.device,
                 )
             )
+            self.sampling_mask_top_ks = (
+                self.sampling_mask_top_ks or [1] * self_len
+            ) + (other.sampling_mask_top_ks or [1] * other_len)
 
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
         # the merge operation of the temperatures tensor below.
-        for item in [
-            "temperatures",
-            "top_ps",
-            "top_ks",
-            "min_ps",
-            "sampling_seed",
-        ]:
-            self_val = getattr(self, item, None)
-            other_val = getattr(other, item, None)
-            if self_val is not None and other_val is not None:
-                setattr(self, item, torch.cat([self_val, other_val]))
+        self._merge_params(other)
 
         self.is_all_greedy &= other.is_all_greedy
         self.is_any_greedy |= other.is_any_greedy

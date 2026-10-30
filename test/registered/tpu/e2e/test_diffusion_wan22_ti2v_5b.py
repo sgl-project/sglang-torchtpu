@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # est_time covers a cold Hugging Face pull; /weights is used when hydrated.
 register_tpu_ci(
     est_time=2700,
-    suite="nightly-tpu-4-v7",
+    suite="external-nightly-1host",
     nightly=True,
     labels=["singlehost", "wan2.2-ti2v-5b", "diffusion"],
 )
@@ -91,11 +91,12 @@ class TestWan22TI2V5BTPU(DiffusionServerBase):
             sampling_params=case.sampling_params,
         )
 
-        perf_record, content = self.run_and_collect(
-            diffusion_server, case.id, generate_fn
+        # This smoke test has no TPU latency baseline or load-time measurement.
+        # Performance validation requires both even with run_perf_check=False.
+        _, content = self.run_and_collect(
+            diffusion_server, case.id, generate_fn, collect_perf=False
         )
 
-        self._validate_and_record(case, perf_record)
         self._test_v1_models_endpoint(diffusion_server, case)
 
         frames = _decoded_frame_count(content)

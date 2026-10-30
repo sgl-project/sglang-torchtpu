@@ -30,7 +30,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.tpu.evals import model_config
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cpu_ci(est_time=70, suite="base-a-test-cpu")
 
 REPO = Path(__file__).resolve().parents[3]
 TPU_TESTS = REPO / "test" / "registered" / "tpu"
@@ -51,6 +51,40 @@ ALIASES_FILE = TPU_CI / "dashboard_aliases.json"
 # The dashboard's contract kinds (redesign doc B.5.3): anything else is stored
 # but charted nowhere, which is exactly the silent failure this lint prevents.
 CONTRACT_KINDS = {"accuracy", "performance", "info"}
+
+
+_DISCOVER_MANY = """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import discover_tests
+root, suites = sys.argv[2], json.loads(sys.argv[3])
+print(json.dumps({s: discover_tests.discover(s, True, root) for s in suites}))
+"""
+
+
+def _discover_suites(suites: tuple) -> dict:
+    """{suite: rendered rows} for many suites, in one discovery process.
+
+    Same code path as ``discover_tests.py --suite <s> --nightly``, asked once
+    per suite inside a single child: collecting imports every registered test,
+    which the script caches per root, so a call per suite would re-walk the
+    whole tree each time.
+    """
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _DISCOVER_MANY,
+            str(TPU_CI),
+            str(REPO / "test" / "registered"),
+            json.dumps(list(suites)),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO),
+        check=True,
+    )
+    return json.loads(proc.stdout)
 
 
 def _discover(script: str, *args: str) -> list:
@@ -305,13 +339,6 @@ class TestJobMapsToOneTest(CustomTestCase):
         self.assertEqual(
             qwen["with"]["suite"], "nightly-tpu-accuracy-qwen3-5-397b-mmmupro"
         )
-        # The long P/D gates leave `all` (the nightly) for the 5 PM slot.
-        pd = workflow["jobs"]["pd-kvoff-reshard"]
-        self.assertIn('"day-5pm"', pd["if"])
-        feature = yaml.safe_load((WORKFLOWS / "feature-validation-tpu.yml").read_text())
-        for only in pd["strategy"]["matrix"]["only"]:
-            self.assertEqual(feature["jobs"][only]["if"].count("inputs.only =="), 1)
-            self.assertNotIn('"all"', feature["jobs"][only]["if"])
         nightly = yaml.safe_load((WORKFLOWS / "nightly-test-tpu.yml").read_text())
         self.assertNotIn("accuracy", nightly["jobs"])
 
@@ -333,6 +360,7 @@ class TestJobMapsToOneTest(CustomTestCase):
             + list(self.external)
         )
         accuracy_perf_files = []
+        rendered = _discover_suites(tuple(self.registered))
         for suite in self.registered:
             workflow = None
             if suite.startswith("nightly-tpu-perf-"):
@@ -345,7 +373,7 @@ class TestJobMapsToOneTest(CustomTestCase):
             text = (WORKFLOWS / workflow).read_text(encoding="utf-8")
             self.assertIn(suite, text, f"{suite} is not in {workflow}'s matrix")
             # ...and render to exactly one file (one file, one suite, one job).
-            rows = _discover("discover_tests.py", "--suite", suite, "--nightly")
+            rows = rendered[suite]
             self.assertEqual(
                 len(rows), 1, f"{suite} renders {len(rows)} jobs, contract is 1"
             )
@@ -466,10 +494,10 @@ class TestNightlyConfigLabelLint(CustomTestCase):
     def test_perf_measures_through_recipe_and_bench_serving_only(self):
         # A recipe launch plus bench_serving.sh is what puts the server/bench
         # config panels on the dashboard; a hand-booted server or hand-rolled
-        # bench produces a chart nobody can reproduce from. Two launch forms
-        # qualify: MODEL_CONFIG's own `launch.recipe`, and the unified launcher,
-        # where a TPULauncherTestCase subclass serves a Python recipe module and
-        # the config carries gates only.
+        # bench produces a chart nobody can reproduce from. Three launch forms
+        # qualify: MODEL_CONFIG's own `launch.recipe` or `launch.config`, and
+        # the unified launcher, where a TPULauncherTestCase subclass serves a
+        # Python recipe module and the config carries gates only.
         for path, mod in self.perf:
             config = (
                 mod.build_model_config()
@@ -478,9 +506,11 @@ class TestNightlyConfigLabelLint(CustomTestCase):
             )
             launch = config.get("launch") or {}
             self.assertTrue(
-                launch.get("recipe") or self._fixture_config_module(mod),
+                launch.get("recipe")
+                or launch.get("config")
+                or self._fixture_config_module(mod),
                 f"{path.name}: perf must serve through a recipe -- launch.recipe, "
-                "or a TPULauncherTestCase subclass with config_module",
+                "launch.config, or a TPULauncherTestCase subclass with config_module",
             )
             self.assertFalse(launch.get("external"), path.name)
             for gate in config["gates"]:

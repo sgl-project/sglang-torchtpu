@@ -3,8 +3,12 @@
 CFG x Ulysses needs all_reduce, all_gather and all_to_all_single on `tpu` tensors.
 """
 
+import gc
 import os
 import queue
+import signal
+import time
+import traceback
 import unittest
 
 import torch
@@ -18,7 +22,7 @@ register_tpu_ci(
     est_time=600,
     suite="tpu-integration",
     nightly=True,
-    labels=["multihost", "diffusion", "collectives"],
+    labels=["multihost", "infra", "diffusion", "collectives"],
 )
 
 from sglang.test.test_utils import CustomTestCase, is_in_ci
@@ -46,6 +50,7 @@ def _worker(local_rank: int, hosts: list[str], node_rank: int, result_q) -> None
     os.environ["LOCAL_RANK"] = str(local_rank)
     os.environ["WORLD_SIZE"] = str(world_size)
 
+    status = 1
     try:
         current_platform.set_device(current_platform.get_device(local_rank))
         backend = current_platform.get_torch_distributed_backend_str()
@@ -83,16 +88,31 @@ def _worker(local_rank: int, hosts: list[str], node_rank: int, result_q) -> None
             f"all_to_all_single: {recv.cpu().tolist()}"
         )
 
+        del summed, gathered, send, recv
+        gc.collect()
+        torch.distributed.barrier()
         result_q.put((rank, "ok"))
+        status = 0
     except Exception as e:  # surfaced by the parent as the failure message
         result_q.put((rank, f"{type(e).__name__}: {e}"))
-        raise
+        traceback.print_exc()
     finally:
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
+        # libtpu's atexit vBAR StopSession can hang on GKE, and a parent SIGTERM mid-teardown
+        # wedges the slice; exit without it, as node_normalization does.
+        result_q.close()
+        result_q.join_thread()  # flush the result before the hard exit drops the feeder thread
+        os._exit(status)
 
 
 class TestTpuDistCollectivesMultihost(CustomTestCase):
+    def _callTestMethod(self, method):
+        # Exec-mode runs unittest independently on each host. Unilateral
+        # per-host retry after a peer host has already exited 0 hangs in
+        # PRE_START_SESSION_BARRIER waiting for the terminated peer pod.
+        unittest.TestCase._callTestMethod(self, method)
+
     def test_collectives_across_the_slice(self):
         hosts = _slice_hosts()
         if len(hosts) < 2:
@@ -120,8 +140,10 @@ class TestTpuDistCollectivesMultihost(CustomTestCase):
                 except queue.Empty:
                     break
                 results[rank] = status
+            deadline = time.monotonic() + 20
             for p in procs:
-                p.join(timeout=60)
+                remaining = max(0.0, deadline - time.monotonic())
+                p.join(timeout=remaining)
         finally:
             for p in procs:
                 if p.is_alive():
@@ -132,8 +154,15 @@ class TestTpuDistCollectivesMultihost(CustomTestCase):
                     p.join(timeout=10)
         # Exit codes first: a rank that aborts in libtpu reports nothing.
         exit_codes = [p.exitcode for p in procs]
+        expected_ranks = [
+            node_rank * DEVICES_PER_HOST + i for i in range(DEVICES_PER_HOST)
+        ]
+        clean_exits = [
+            c == 0 or (c == -signal.SIGTERM and results.get(r) == "ok")
+            for c, r in zip(exit_codes, expected_ranks)
+        ]
         self.assertTrue(
-            all(c == 0 for c in exit_codes),
+            all(clean_exits),
             f"exitcodes={exit_codes} (negative = killed by that signal); "
             f"reported={results}",
         )

@@ -1,0 +1,33 @@
+# Daily TPU plugin migration scoreboard: every debt counter, trending to zero.
+name: TPU Plugin Scoreboard
+
+on:
+  schedule:
+    - cron: "0 16 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tpu-plugin-scoreboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Publish the scoreboard and the hook and patch inventory
+        run: |
+          {
+            echo "# TPU plugin migration"
+            echo
+            python tools/plugin/scoreboard.py
+            echo
+            python tools/plugin/inventory.py
+          } >> "$GITHUB_STEP_SUMMARY"
+          python tools/plugin/scoreboard.py --json > tpu-plugin-scoreboard.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tpu-plugin-scoreboard
+          path: tpu-plugin-scoreboard.json

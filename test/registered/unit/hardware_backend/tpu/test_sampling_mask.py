@@ -17,7 +17,7 @@ properties:
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
 
 import unittest
 
@@ -57,7 +57,7 @@ def _random_rows(rng, batch_size, vocab_size):
 
 
 def _filter_on_tpu(probs, top_ks, top_ps, min_ps, need_top_k, need_top_p, need_min_p):
-    from sglang.srt.hardware_backend.tpu.sampling_mask import tpu_filter_probs
+    from sglang_tpu.sampling_mask import tpu_filter_probs
 
     filtered = tpu_filter_probs(
         torch.from_numpy(probs).to("tpu"),
@@ -183,7 +183,7 @@ class TestGatheredBlockFilterEquivalence(CustomTestCase):
         return [np.sort(row[row > 0]) for row in filtered]
 
     def test_block_filter_matches_full_width(self):
-        from sglang.srt.hardware_backend.tpu.top_k import tpu_top_k
+        from sglang_tpu.top_k import tpu_top_k
 
         rng = np.random.default_rng(23)
         k = 50
@@ -227,7 +227,7 @@ class TestGatheredBlockFilterEquivalence(CustomTestCase):
     def test_top_k_rows_off_the_power_of_two_bucket_match_torch(self):
         """Row counts between buckets are padded for the exported TopK op and
         sliced back, so the caller sees its own shape, values and indices."""
-        from sglang.srt.hardware_backend.tpu.top_k import tpu_top_k
+        from sglang_tpu.top_k import tpu_top_k
 
         rng = np.random.default_rng(29)
         for batch_size in (1, 3, 5, 13):
@@ -250,7 +250,7 @@ class TestEagleVerifyRenorm(CustomTestCase):
         return kept / kept.sum(axis=-1, keepdims=True)
 
     def test_top_k_then_top_p_stages_match_sort_reference(self):
-        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+        from sglang_tpu.eagle_utils_tpu import (
             top_k_renorm_prob_tpu,
             top_p_renorm_prob_tpu,
         )
@@ -295,7 +295,7 @@ class TestEagleVerifyRenorm(CustomTestCase):
         )
 
     def test_boundary_ties_are_kept_inclusively(self):
-        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+        from sglang_tpu.eagle_utils_tpu import (
             top_k_renorm_prob_tpu,
         )
 

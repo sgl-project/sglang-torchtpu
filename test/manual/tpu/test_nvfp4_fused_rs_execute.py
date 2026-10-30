@@ -190,11 +190,11 @@ def main() -> None:
     if world_size != 16:
         raise RuntimeError(f"This execution gate requires TP16, got {world_size}")
 
-    from sglang.srt.hardware_backend.tpu.fp4_moe import (
+    from sglang_tpu.fp4_moe import (
         prepare_tpu_nvfp4_moe_weights,
     )
-    from sglang.srt.layers.moe.pallas import fused_moe_rs_op
-    from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
+    from sglang_tpu.moe.pallas import fused_moe_rs_op
+    from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
     global_experts = 256
     local_experts = global_experts // world_size
@@ -205,7 +205,7 @@ def main() -> None:
 
     physical_id = tpu_distributed.global_device_id()
     group_offset = torch.tensor(
-        [rank * local_experts, rank], dtype=torch.int32, device=device
+        [rank * local_experts], dtype=torch.int32, device=device
     )
     no_post_norm = torch.zeros(1, dtype=torch.bfloat16, device=device)
 

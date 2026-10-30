@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
 
 import unittest
 
@@ -55,7 +55,7 @@ def _routing(m, g, topk, seed):
 
 
 def _run_fused(hidden, w1, w2, w1_scale, w2_scale, ids, w, activation):
-    from sglang.srt.layers.moe.pallas.fused_moe_op import _fused_moe_jax
+    from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
 
     out = _fused_moe_jax(
         hidden_states=hidden,

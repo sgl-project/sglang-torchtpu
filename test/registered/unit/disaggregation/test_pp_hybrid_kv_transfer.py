@@ -299,10 +299,17 @@ class TestBuildTransferEntryPairsDuplicateIds(CustomTestCase):
         self.assertEqual(pairs, [(0, 0), (1, 1), (2, 3), (3, 4)])
 
 
-def _hybrid_pool_with_ids(*, layer_ids: list) -> HybridLinearKVPool:
+def _hybrid_pool_with_ids(
+    *, layer_ids: list, buffers_per_layer: int = 2
+) -> HybridLinearKVPool:
+    """buffers_per_layer: 2 for MHA K and V, 1 for MLA or a fused K+V pool."""
     pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
     pool.full_attention_layer_id_mapping = layer_ids
     pool.use_mla = False
+    num_buffers = buffers_per_layer * len(layer_ids)
+    pool.full_kv_pool = SimpleNamespace(
+        get_contiguous_buf_infos=lambda: ([0] * num_buffers,) * 3
+    )
     return pool
 
 
@@ -342,6 +349,21 @@ class TestBuildKvLayerIds(CustomTestCase):
         )
         stage1 = self._stage1_ids()
         self.assertEqual(ids, stage1 + stage1 + [60, 60])
+
+    def test_fused_kv_pool_publishes_one_id_per_buffer(self):
+        """A fused K+V pool (TPU) registers one buffer per layer, so its MTP
+        draft pool must report one id, not a K and a V id."""
+        ids = build_kv_layer_ids(
+            token_to_kv_pool=_hybrid_pool_with_ids(
+                layer_ids=self._stage1_ids(), buffers_per_layer=1
+            ),
+            draft_token_to_kv_pool=_hybrid_pool_with_ids(
+                layer_ids=[0], buffers_per_layer=1
+            ),
+            num_draft_entries=1,
+            num_hidden_layers=60,
+        )
+        self.assertEqual(ids, self._stage1_ids() + [60])
 
     def test_non_hybrid_pool_publishes_nothing(self):
         self.assertEqual(

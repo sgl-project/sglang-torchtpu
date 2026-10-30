@@ -41,6 +41,9 @@ MULTIHOST_ENV = (
     "TORCH_TPU_SLICEBUILDER_ADDRESSES",
     "TORCH_TPU_TOPOLOGY",
 )
+# The name torch_tpu itself reads for the tier-2 cache; the launcher's
+# TORCH_TPU_INTERNAL_* spelling is mirrored onto it by the TPU env override.
+TIER2_CACHE_ENV = "TORCH_TPU_TIER2_COMPILATION_CACHE"
 
 
 def _object(value: Any, name: str) -> dict:
@@ -191,6 +194,12 @@ def resolve_server(config: LaunchConfig, inherited, *, single_host=False):
         for name, value in cache_defaults.items():
             if name not in config.runtime_envs:
                 env.setdefault(name, value)
+    elif env.get("ENABLE_COMPILE_CACHE", "1") != "1":
+        # Leaving the names unset is not enough: torch_tpu then falls back to
+        # an implicit tier-2 cache (/dev/shm/torch_tpu_cache/default) whenever
+        # WORLD_SIZE > 1. "disabled" is its sentinel for really off.
+        if TIER2_CACHE_ENV not in config.runtime_envs:
+            env.setdefault(TIER2_CACHE_ENV, "disabled")
     if settings.get("tp_size", 1) > 1:
         for key in (
             "TPU_VISIBLE_CHIPS",
@@ -378,11 +387,15 @@ def run_server(
                 signal.signal(sig, handler)
 
 
-def load_recipe(name):
+def load_recipe(name, concurrency: int | None = None):
     """Load a recipe, or one P/D engine via module:PREFILL_CONFIG/DECODE_CONFIG.
 
-    Selecting an engine runs it on the local host without a router. A decode
-    service can therefore start without knowing the prefill pod's address.
+    Selecting an engine runs it without a router, so a decode service can start
+    without knowing the prefill pod's address. A single-host engine (from a
+    GROUP recipe) runs on the local host; a multi-host engine (``nnodes > 1``)
+    runs like any multi-node recipe on each host of its slice. With concurrency,
+    a single-engine recipe builds its config with get_config(concurrency)
+    instead of exporting CONFIG.
     """
     name, _, export = name.partition(":")
     name = name.removesuffix(".py").replace("/", ".")
@@ -392,19 +405,26 @@ def load_recipe(name):
         raise ValueError("Expected a module under benchmark.tpu.recipe")
     module = importlib.import_module(name)
     group = getattr(module, "GROUP", None)
+    if concurrency is not None and (export or (group and group.get("prefill_engines"))):
+        raise ValueError("--concurrency applies only to single-engine recipes")
     if export:
-        if (
-            not group
-            or not group.get("prefill_engines")
-            or export not in ("PREFILL_CONFIG", "DECODE_CONFIG")
+        engine = (
+            getattr(module, export, None)
+            if export in ("PREFILL_CONFIG", "DECODE_CONFIG")
+            else None
+        )
+        multi_host = engine is not None and engine["server_args"].get("nnodes", 1) > 1
+        if engine is None or not (
+            multi_host or (group and group.get("prefill_engines"))
         ):
             raise ValueError("Select PREFILL_CONFIG or DECODE_CONFIG from a P/D recipe")
-        config = deepcopy(getattr(module, export))
+        config = deepcopy(engine)
         config["server_args"].setdefault(
             "disaggregation_mode", export.removesuffix("_CONFIG").lower()
         )
         config["server_args"].setdefault("host", "0.0.0.0")
-        config["group"] = {"hosts": 1}
+        if not multi_host:
+            config["group"] = {"hosts": 1}
         if "runtime_env" in config:
             if "runtime_envs" in config:
                 raise ValueError("Use only one of runtime_envs and runtime_env")
@@ -419,7 +439,15 @@ def load_recipe(name):
             "prefill": deepcopy(module.PREFILL_CONFIG),
             "decode": deepcopy(module.DECODE_CONFIG),
         }
-    config = deepcopy(module.CONFIG)
+    get_config = getattr(module, "get_config", None)
+    if concurrency is not None:
+        if get_config is None:
+            raise ValueError(f"{name} has no get_config(concurrency)")
+        config = get_config(concurrency)
+    elif not hasattr(module, "CONFIG") and get_config is not None:
+        raise ValueError(f"{name} is selected by --concurrency")
+    else:
+        config = deepcopy(module.CONFIG)
     if group:
         config["group"] = deepcopy(group)
     return config
@@ -740,19 +768,24 @@ def _grace(argument: str) -> float:
     return value
 
 
-def _config(argument):
+def _config(argument, concurrency: int | None = None):
     if argument.startswith(("recipe/", "recipe.", "benchmark.tpu.recipe.")):
         try:
-            return load_recipe(argument)
+            return load_recipe(argument, concurrency)
         except (ImportError, AttributeError, ValueError) as exc:
             raise argparse.ArgumentTypeError(str(exc)) from exc
+    if concurrency is not None:
+        raise argparse.ArgumentTypeError(
+            "--concurrency needs a recipe module, not JSON"
+        )
     return _json_object(argument)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", required=True, help="Recipe module, JSON or @file")
     parser.add_argument(
-        "--config", required=True, type=_config, help="Recipe module, JSON or @file"
+        "--concurrency", type=int, help="Client concurrency for get_config recipes"
     )
     parser.add_argument(
         "--runtime-envs", type=_json_object, help="JSON or @file; overrides config envs"
@@ -763,10 +796,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
+    try:
+        config = _config(args.config, args.concurrency)
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
     if args.working_directory:
         os.chdir(args.working_directory)
     try:
-        plan = plan_launch(args.config, runtime_envs=args.runtime_envs)
+        plan = plan_launch(config, runtime_envs=args.runtime_envs)
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
     return serve(plan, dry_run=args.dry_run, grace=args.shutdown_grace)

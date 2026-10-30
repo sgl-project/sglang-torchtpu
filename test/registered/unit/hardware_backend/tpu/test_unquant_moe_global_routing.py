@@ -18,7 +18,7 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 class TestUnquantGlobalRouting(CustomTestCase):
     def test_sparse_core_permute_gathers_full_sorted_range(self):
-        module_name = "sglang.srt.layers.moe.pallas.fused_moe_op"
+        module_name = "sglang_tpu.moe.pallas.fused_moe_op"
         torch_tpu = ModuleType("torch_tpu")
         torch_tpu_internal = ModuleType("torch_tpu._internal")
         torch_tpu_pallas = ModuleType("torch_tpu._internal.pallas")
@@ -40,20 +40,18 @@ class TestUnquantGlobalRouting(CustomTestCase):
         jnp = ModuleType("jax.numpy")
         for name in ("uint8", "int32"):
             setattr(jnp, name, getattr(np, name))
-        for name in ("argsort", "repeat", "arange", "sum", "array"):
+        for name in ("argsort", "repeat", "arange", "sum", "array", "where"):
             setattr(jnp, name, getattr(np, name))
         jax.numpy = jnp
 
-        gmm_v2 = ModuleType("sglang.srt.layers.moe.pallas.gmm_v2")
+        gmm_v2 = ModuleType("sglang_tpu.moe.pallas.gmm_v2")
         gmm_v2.TileSizes = object
         gmm_v2.apply_act_fn = Mock()
         gmm_v2.calculate_tiling = Mock()
         gmm_v2.gmm_v2 = Mock()
         gmm_v2.lhs_sublane_tiling = Mock(return_value=16)
 
-        gather_module = ModuleType(
-            "sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_v2"
-        )
+        gather_module = ModuleType("sglang_tpu.moe.pallas.sparse_core.ragged_gather_v2")
         captured = {}
 
         class GatherCalled(Exception):
@@ -69,10 +67,8 @@ class TestUnquantGlobalRouting(CustomTestCase):
         fake_modules = {
             "jax": jax,
             "jax.numpy": jnp,
-            "sglang.srt.layers.moe.pallas.gmm_v2": gmm_v2,
-            "sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_v2": (
-                gather_module
-            ),
+            "sglang_tpu.moe.pallas.gmm_v2": gmm_v2,
+            "sglang_tpu.moe.pallas.sparse_core.ragged_gather_v2": (gather_module),
         }
         topk_ids = np.array(
             [
@@ -119,16 +115,17 @@ class TestUnquantGlobalRouting(CustomTestCase):
 
         def kernel(**kwargs):
             routed_ids = kwargs["topk_ids"]
-            self.assertTrue(torch.all(routed_ids >= 0))
+            # Router ids arrive unchanged; the kernel drops out-of-range ids.
+            torch.testing.assert_close(routed_ids, ids)
+            in_range = (routed_ids >= 0) & (routed_ids < kwargs["global_num_experts"])
             local_ids = routed_ids - kwargs["expert_group_offset"]
             local_experts = kwargs["w1"].shape[0]
-            local = (local_ids >= 0) & (local_ids < local_experts)
+            local = in_range & (local_ids >= 0) & (local_ids < local_experts)
             expert_values = kwargs["w1"][:, 0, 0][local_ids.clamp(0, local_experts - 1)]
             values = expert_values.unsqueeze(-1) * kwargs["hidden_states"].unsqueeze(1)
-            route_weights = kwargs["topk_weights"] * local
+            route_weights = torch.where(local, kwargs["topk_weights"], 0)
             if kwargs["no_combine"]:
-                # Global routing masks ownership, not weights. In particular,
-                # sanitized invalid IDs still produce expert-0 output on rank 0.
+                # Global routing masks ownership, not weights.
                 mask = (
                     local
                     if kwargs["global_num_experts"] > local_experts
@@ -141,7 +138,7 @@ class TestUnquantGlobalRouting(CustomTestCase):
             with (
                 self.subTest(sparsecore=sparsecore),
                 patch(
-                    "sglang.srt.layers.quantization.unquant.envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get",
+                    "sglang_tpu.envs.envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get",
                     return_value=sparsecore,
                 ),
             ):
@@ -171,6 +168,7 @@ class TestUnquantGlobalRouting(CustomTestCase):
                                 activation="silu",
                                 gemm1_alpha=None,
                                 gemm1_clamp_limit=None,
+                                routed_scaling_factor=None,
                             )
                         )
                         dispatch = SimpleNamespace(
@@ -179,7 +177,7 @@ class TestUnquantGlobalRouting(CustomTestCase):
                         # Test routing independently of the TPU kernel bridge.
                         # Importing the real bridge would require torch_tpu even
                         # though every tensor and the kernel reference are CPU.
-                        module_name = "sglang.srt.layers.moe.pallas.fused_moe_op"
+                        module_name = "sglang_tpu.moe.pallas.fused_moe_op"
                         bridge = ModuleType(module_name)
                         call = bridge.fused_moe_call = Mock(side_effect=kernel)
                         with (

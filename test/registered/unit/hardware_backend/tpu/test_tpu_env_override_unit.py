@@ -14,14 +14,16 @@ import os
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.hardware_backend.tpu.env_override import (
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.env_override import (
+    _DECODE_CP_SPARSE_CORE_OVERRIDES,
     _VMEM_PREFETCH_MIN_LAYERS,
     _VMEM_PREFETCH_OVERRIDES,
     _VMEM_PREFETCH_SAFE_MIN_TOKENS,
+    apply_decode_cp_sparse_core_override,
     apply_small_kv_pool_vmem_prefetch_override,
     apply_tpu_env_overrides,
 )
-from sglang.test.test_utils import CustomTestCase
 
 
 class TestLibtpuInitArgsOverrides(CustomTestCase):
@@ -79,12 +81,34 @@ class TestLibtpuInitArgsOverrides(CustomTestCase):
         self.assertIn(user_flag, args)
         self.assertNotIn("--xla_gf_vmem_max_outstanding_prefetches=1", args)
 
+    def test_original_hlo_is_discarded_unless_explicitly_requested(self):
+        flag = "--xla_tpu_save_original_hlo_module"
+        for initial, expected in ((None, "false"), (f"{flag}=true", "true")):
+            with self.subTest(initial=initial):
+                args = self._apply(initial, None)
+                args = self._apply(args, None).split()
+                self.assertEqual(
+                    [arg for arg in args if arg.startswith(f"{flag}=")],
+                    [f"{flag}={expected}"],
+                )
+
     def test_unrelated_user_flags_are_preserved(self):
         user_flag = "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false"
         args = self._apply(user_flag, _VMEM_PREFETCH_SAFE_MIN_TOKENS - 1).split()
         self.assertIn(user_flag, args)
         for flag in _VMEM_PREFETCH_OVERRIDES:
             self.assertIn(flag, args)
+
+    def test_decode_cp_turns_off_sparse_core_offloads(self):
+        # Under DCP the SparseCore all-gather offload returns a wrong first
+        # token after long prompts; without DCP the libtpu defaults stay.
+        for dcp_size, expected in ((2, True), (1, False)):
+            with self.subTest(dcp_size=dcp_size):
+                with patch.dict(os.environ, {"LIBTPU_INIT_ARGS": ""}, clear=False):
+                    apply_decode_cp_sparse_core_override(dcp_size=dcp_size)
+                    args = os.environ["LIBTPU_INIT_ARGS"].split()
+                for flag in _DECODE_CP_SPARSE_CORE_OVERRIDES:
+                    self.assertEqual(flag in args, expected)
 
 
 if __name__ == "__main__":

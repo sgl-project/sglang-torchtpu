@@ -6,26 +6,40 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
-    _zero_inactive_rpa_rows,
-)
-from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
-    TpuPallasRpaV3AttnBackend,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention_pallas_rpa_base import (
+    _zero_inactive_rpa_rows,
+)
+from sglang_tpu.attention_pallas_rpa_v3 import (
+    TpuPallasRpaV3AttnBackend,
+)
+from sglang_tpu.envs import envs
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
+from sglang_tpu.attention_pallas_rpa_base import (
     _SCOPED_SMEM_BYTES,
     _get_pages_per_seq,
     _page_table_smem_bytes,
 )
+
+
+class TestDistributionWarmup(CustomTestCase):
+    def test_distribution_has_fixed_shape_for_all_live_counts(self):
+        backend = object.__new__(TpuPallasRpaV3AttnBackend)
+        backend._distribution_cache = {}
+        backend.warmup_distributions(256, "cpu:0")
+        self.assertEqual(len(backend._distribution_cache), 2)
+        for rows in (0, 1, 3, 7, 255, 256):
+            for decode in (False, True):
+                dist = backend._get_cached_rpa_distribution(decode, rows, "cpu")
+                self.assertEqual(dist.shape, (3,))
+                self.assertEqual(dist.tolist(), [rows if decode else 0, rows, rows])
 
 
 class TestPageTableSmemBudget(unittest.TestCase):
@@ -93,8 +107,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
         )
         with (
             patch(
-                "sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base."
-                "_build_pallas_kernel_op",
+                "sglang_tpu.attention_pallas_rpa_base._build_pallas_kernel_op",
                 return_value=None,
             ),
             envs.SGLANG_TPU_ENABLE_ATTN_METADATA_CACHE.override(cache_metadata),

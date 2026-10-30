@@ -34,14 +34,24 @@ from google.protobuf.wrappers_pb2 import Int64Value
 
 from sglang.srt.disaggregation.base.conn import BaseKVSender, KVArgs, StateType
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeReqToTokenPool
-from sglang.srt.disaggregation.raiden.conn import (
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    KVClassType,
+    TransferBackend,
+)
+from sglang.srt.mem_cache import hicache_auto_size as sizing
+from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
+from sglang.srt.mem_cache.pool_host import base as host_base
+from sglang.srt.runtime_context import get_context
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.disaggregation.raiden.conn import (
     DEFAULT_KV_PORT,
     RaidenKVManager,
     RaidenKVSender,
     get_raiden_kv_caches,
 )
-from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
-from sglang.srt.disaggregation.raiden.serde import (
+from sglang_tpu.disaggregation.raiden.host_pool import StagingAdmission
+from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
     MessageTag,
@@ -52,31 +62,32 @@ from sglang.srt.disaggregation.raiden.serde import (
     ReshardReady,
     ReshardReq,
 )
-from sglang.srt.disaggregation.raiden.state import DecodeState, PrefillState
-from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
-    KVClassType,
-    TransferBackend,
+from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
+from sglang_tpu.envs import envs
+from sglang_tpu.kv_pool_host import (
+    TPU_DMA_LAYOUT,
+    TpuDMAHostKVPool,
 )
-from sglang.srt.hardware_backend.tpu.kv_pool_host import (
-    RAIDEN_LAYOUT,
-    TpuRaidenHostKVCache,
-)
-from sglang.srt.hardware_backend.tpu.raiden_transfer import (
-    NOOP_EVENT,
-    CombinedFutureEvent,
-    RaidenFutureEvent,
-    RaidenKVTransfer,
-)
-from sglang.srt.runtime_context import get_context
-from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.raiden_transfer import RaidenFutureEvent, RaidenKVTransfer
+from sglang_tpu.tpu_dma_hicache import NOOP_EVENT, CombinedFutureEvent
 
 
 def _polled(sent=(), received=(), failed=(), completed_ns=None):
     """Fake poll_stats_with_details() result for the given req ids."""
 
     def settled(ids):
-        return [SimpleNamespace(req_id=r, completed_ns=completed_ns) for r in ids]
+        return [
+            SimpleNamespace(
+                req_id=r,
+                completed_ns=completed_ns,
+                elapsed_ns=None,
+                peer=None,
+                code=None,
+                reason=None,
+                phase=None,
+            )
+            for r in ids
+        ]
 
     return SimpleNamespace(
         sent=settled(sent), received=settled(received), failed=settled(failed)
@@ -108,11 +119,11 @@ class _FakeTransfer:
 
 
 def _make_host_pool(page_size=4, page_num=3):
-    pool = object.__new__(TpuRaidenHostKVCache)
+    pool = object.__new__(TpuDMAHostKVPool)
     pool.page_size = page_size
     pool.page_num = page_num
     pool.size = page_size * page_num
-    pool.layout = RAIDEN_LAYOUT
+    pool.layout = TPU_DMA_LAYOUT
     import threading
 
     pool.lock = threading.RLock()
@@ -137,6 +148,123 @@ class TestDecodeReqToTokenPool(CustomTestCase):
         torch.testing.assert_close(pool.req_to_token[2, 1:4], values)
 
 
+class TestRaidenHostMemoryBudget(CustomTestCase):
+    def _device_pool(self):
+        return SimpleNamespace(
+            size=8,
+            store_dtype=torch.bfloat16,
+            start_layer=0,
+            end_layer=2,
+            layer_num=2,
+            get_fused_kv_buffer=Mock(
+                return_value=torch.empty((3, 4, 1, 2, 128), dtype=torch.bfloat16)
+            ),
+        )
+
+    def _host_pool(self, *, host_size=0, pool_label="kv"):
+        return TpuDMAHostKVPool(
+            self._device_pool(),
+            host_to_device_ratio=2,
+            host_size=host_size,
+            page_size=4,
+            layout="page_first_fused",
+            pool_label=pool_label,
+        )
+
+    def test_oversized_pool_fails_before_raiden_allocation(self):
+        """HiCache must reject padded, page-rounded bytes above the per-rank budget."""
+        # 20 tokens after page rounding, 512 bytes/layer/token, two layers.
+        requested = 20_480
+        for host_size in (0, 16_384 / 1e9):
+            for budget in (requested - 1, requested):
+                with (
+                    self.subTest(host_size=host_size, budget=budget),
+                    patch.object(host_base, "ranks_per_host", return_value=8),
+                    patch.object(
+                        host_base,
+                        "available_host_memory_bytes",
+                        return_value=host_base.HICACHE_HOST_MEMORY_RESERVE_BYTES
+                        + budget * 8,
+                    ),
+                    patch("sglang_tpu.raiden_transfer.RaidenKVTransfer") as transfer,
+                ):
+                    if budget < requested:
+                        with self.assertRaisesRegex(
+                            ValueError, "Not enough host memory available"
+                        ):
+                            self._host_pool(host_size=host_size)
+                        transfer.assert_not_called()
+                    else:
+                        pool = self._host_pool(host_size=host_size)
+                        self.assertEqual(pool.available_size(), 20)
+                        self.assertEqual(pool.size_per_token, 1024)
+                        transfer.assert_called_once()
+
+    def test_explicit_hybrid_pools_share_one_budget(self):
+        """Full and SWA pools must not each spend the same host-memory allowance."""
+        from sglang_tpu.platform import TpuOOTPlatform
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
+
+        for platform_cls in (TpuSRTPlatform, TpuOOTPlatform):
+            for host_size in (0, 16_384 / 1e9):
+                self._check_explicit_hybrid_budget(platform_cls(), host_size)
+
+    def test_native_or_disabled_hicache_does_not_reserve_raiden_budget(self):
+        """The Raiden policy must not consume headroom for other cache paths."""
+        from sglang_tpu.platform import TpuOOTPlatform
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
+
+        for platform_cls in (TpuSRTPlatform, TpuOOTPlatform):
+            for io_backend, enabled in (("torch_tpu", True), ("raiden", False)):
+                with (
+                    self.subTest(platform=platform_cls.__name__, backend=io_backend),
+                    patch.object(sizing, "current_platform", platform_cls()),
+                    get_context().override_server_args(
+                        hicache_io_backend=io_backend,
+                        hicache_host_memory_fraction=None,
+                    ),
+                    patch.object(
+                        host_base,
+                        "available_host_memory_bytes",
+                        side_effect=AssertionError("unexpected host-memory query"),
+                    ),
+                    auto_size_hicache(None, None, enabled=enabled),
+                ):
+                    self.assertIsNone(host_base._host_memory_budget.get())
+
+    def _check_explicit_hybrid_budget(self, platform, host_size):
+        with (
+            self.subTest(platform=type(platform).__name__, host_size=host_size),
+            patch.object(sizing, "current_platform", platform),
+            get_context().override_server_args(
+                enable_hierarchical_cache=True,
+                hicache_ratio=2.0,
+                hicache_size=host_size,
+                hicache_io_backend="raiden",
+                hicache_host_memory_fraction=None,
+            ),
+            patch.object(host_base, "ranks_per_host", return_value=8),
+            patch.object(
+                host_base,
+                "available_host_memory_bytes",
+                return_value=host_base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 30_000 * 8,
+            ),
+            patch("sglang_tpu.raiden_transfer.RaidenKVTransfer") as transfer,
+        ):
+            with auto_size_hicache(None, None, enabled=True):
+                full = self._host_pool(host_size=host_size, pool_label="full")
+                self.assertEqual(full.available_size(), 20)
+                with self.assertRaisesRegex(ValueError, "Not enough host memory"):
+                    self._host_pool(host_size=host_size, pool_label="swa")
+                self.assertEqual(transfer.call_count, 1)
+            # A failed startup must not leak its reservations into the next one.
+            with auto_size_hicache(None, None, enabled=True):
+                self.assertEqual(
+                    self._host_pool(host_size=host_size).available_size(), 20
+                )
+        self.assertIsNone(host_base._host_memory_budget.get())
+
+
 class TestRaidenHostPoolPaging(CustomTestCase):
     def test_smaller_host_pool_warns_instead_of_failing(self):
         device_pool = SimpleNamespace(
@@ -150,15 +278,18 @@ class TestRaidenHostPoolPaging(CustomTestCase):
             ),
         )
 
+        # Test the sizing warning independently of the CI runner's free RAM.
         with (
-            patch(
-                "sglang.srt.hardware_backend.tpu.raiden_transfer.RaidenKVTransfer"
-            ) as transfer_cls,
-            self.assertLogs(
-                "sglang.srt.hardware_backend.tpu.kv_pool_host", level="WARNING"
-            ) as logs,
+            patch.object(host_base, "ranks_per_host", return_value=1),
+            patch.object(
+                host_base,
+                "available_host_memory_bytes",
+                return_value=host_base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 1024,
+            ),
+            patch("sglang_tpu.raiden_transfer.RaidenKVTransfer") as transfer_cls,
+            self.assertLogs("sglang_tpu.kv_pool_host", level="WARNING") as logs,
         ):
-            pool = TpuRaidenHostKVCache(
+            pool = TpuDMAHostKVPool(
                 device_pool,
                 host_to_device_ratio=0.5,
                 host_size=0,
@@ -379,6 +510,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
     def test_hybrid_swa_max_blocks_is_sized_from_sliding_window(self):
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = None
         mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
@@ -397,6 +529,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
     def test_hybrid_swa_max_blocks_override_is_independent(self):
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = None
         mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
@@ -426,6 +559,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         for finalize_first in (False, True):
             with self.subTest(finalize_first=finalize_first):
                 mgr = object.__new__(RaidenKVManager)
+                mgr.attn_tp_rank = 0
                 mgr._prefill = PrefillState(announce_pages=1)
                 mgr._decode = None
                 mgr._timeout_s = 120.0
@@ -478,6 +612,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         full_blocks = [3, 9]
         swa_blocks = [5, 7]
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = PrefillState(announce_pages=1)
         mgr._decode = None
         mgr._timeout_s = 120.0
@@ -532,6 +667,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_hybrid_swa_decode_starts_both_pulls_with_separate_pages(self):
         room = 29
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = None
         mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
@@ -661,6 +797,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_decode_defers_pull_until_the_pool_has_room(self):
         first, second = 29, 30
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = None
         mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
@@ -877,6 +1014,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     @staticmethod
     def _reshard_decode_mgr():
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = None
         mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
@@ -1005,6 +1143,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
     @staticmethod
     def _prefill():
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = PrefillState(announce_pages=1)
         mgr._decode = None
         mgr._timeout_s = 120.0
@@ -1569,8 +1708,8 @@ class TestRaidenRoleStatePlacement(CustomTestCase):
     )
 
     def test_role_state_is_declared_in_the_record_that_reads_it(self):
-        from sglang.srt.disaggregation.raiden.receiver import RaidenReceiverMixin
-        from sglang.srt.disaggregation.raiden.sender import RaidenSenderMixin
+        from sglang_tpu.disaggregation.raiden.receiver import RaidenReceiverMixin
+        from sglang_tpu.disaggregation.raiden.sender import RaidenSenderMixin
 
         roles = (
             ("_prefill", PrefillState, RaidenSenderMixin, self.PREFILL_SIDE),
@@ -1627,9 +1766,9 @@ class TestRaidenRoleStatePlacement(CustomTestCase):
                 "sglang.srt.disaggregation.common.conn.CommonKVManager.__init__",
                 init_base,
             ),
-            patch("sglang.srt.disaggregation.raiden.conn.threading.Thread"),
+            patch("sglang_tpu.disaggregation.raiden.conn.threading.Thread"),
             patch(
-                "sglang.srt.disaggregation.raiden.conn.concurrent.futures.ThreadPoolExecutor"
+                "sglang_tpu.disaggregation.raiden.conn.concurrent.futures.ThreadPoolExecutor"
             ),
             patch.object(RaidenKVManager, "_start_heartbeat_checker_thread"),
         ):
@@ -1716,7 +1855,7 @@ class TestNoPushLock(CustomTestCase):
         # The per-endpoint send helper replaced the old global push lock; a
         # send site reintroducing it would crash in production while unit
         # fixtures could mask the missing constructor field.
-        from sglang.srt.disaggregation.raiden import conn, receiver, sender
+        from sglang_tpu.disaggregation.raiden import conn, receiver, sender
 
         for module in (conn, sender, receiver):
             with self.subTest(module=module.__name__):
@@ -1793,7 +1932,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
 
     @staticmethod
     def _geometry(src_tp, dst_tp):
-        from sglang.srt.disaggregation.raiden.reshard_schedule import ReshardGeometry
+        from sglang_tpu.disaggregation.raiden.reshard_schedule import ReshardGeometry
 
         return ReshardGeometry(src_tp, dst_tp, 1024, 8)
 
@@ -1824,6 +1963,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr.attn_tp_size = 8
         mgr._local_rank = 1
         mgr._timeout_s = 5
+        mgr._transfer_parallelism = 4
         mgr._push_executor = _InlineExecutor()
         mgr._make_geometry = self._geometry
         mgr._read_leases = {}
@@ -2105,6 +2245,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
         self.assertEqual(mgr._cleared_plans, {})
         self.assertFalse(mgr._failed)
+        self.assertNotIn(self.ROOM, mgr.failure_records)
 
     def test_room_is_not_complete_while_closing_registration_is_pending(self):
         mgr, _ = self._decode_with_chunk_plan()
@@ -2587,6 +2728,22 @@ class TestRaidenFutureEvent(CustomTestCase):
         ev = RaidenFutureEvent(_FakeFuture(ready_after=3))
         ev.synchronize()  # returns once is_ready() flips True
 
+    def test_query_raises_once_pending_past_the_deadline(self):
+        """A copy that never lands must stop the scheduler when polled, as a
+        blocking wait does, instead of holding its pages and every later ack."""
+        monotonic = "sglang_tpu.raiden_transfer.time.monotonic"
+        with envs.SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S.override(60.0):
+            with patch(monotonic, return_value=1000.0):
+                pending = RaidenFutureEvent(_FakeFuture(ready_after=10**6))
+                landed = RaidenFutureEvent(_FakeFuture())
+            with patch(monotonic, return_value=1059.0):
+                self.assertFalse(pending.query())
+            with patch(monotonic, return_value=1061.0):
+                with self.assertRaisesRegex(TimeoutError, "still pending"):
+                    pending.query()
+                # A copy that landed is done, however late it is polled.
+                self.assertTrue(landed.query())
+
     def test_record_and_wait_are_noops(self):
         ev = RaidenFutureEvent(_FakeFuture())
         ev.record()
@@ -2663,6 +2820,7 @@ class TestDecodeRadixPullRegistration(CustomTestCase):
 
     def _make_receiver(self, local_blocks):
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = None
         mgr._decode = DecodeState()
         mgr.chunked_transfer = False

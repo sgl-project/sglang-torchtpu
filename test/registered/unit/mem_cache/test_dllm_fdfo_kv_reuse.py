@@ -2,6 +2,7 @@
 
 import unittest
 from array import array
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
@@ -25,6 +26,9 @@ class _FakeAllocator:
 
     def available_size(self):
         return 1 << 30
+
+    def forward_write_target(self):
+        return nullcontext()
 
     def alloc(self, need_size):
         self.alloc_calls.append(need_size)
@@ -54,8 +58,8 @@ class _FakeTreeCache:
         self.page_size = allocator.page_size
         self.token_to_kv_pool_allocator = allocator
 
-    def is_chunk_cache(self):
-        return True
+    def supports_prefix_sharing(self):
+        return False
 
 
 def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
@@ -90,6 +94,8 @@ def _make_batch(pool, allocator, reqs, extend_lens):
     )
     return SimpleNamespace(
         device="cpu",
+        input_tensor_device=None,
+        metadata_device=lambda: "cpu",
         reqs=reqs,
         req_to_token_pool=pool,
         token_to_kv_pool_allocator=allocator,

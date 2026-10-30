@@ -4,15 +4,25 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.models.dflash import (
     CandidateSelector,
     DFlash2DraftModel,
+    DFlashGroupedConv,
     _grouped_conv,
 )
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import published_topology
 
 register_cpu_ci(est_time=38, suite="base-a-test-cpu")
+
+
+@pytest.fixture
+def topology():
+    # The worker reads its rank from the context.
+    with published_topology():
+        yield
 
 
 def test_dflash_unary_logit_transform():
@@ -248,7 +258,7 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
     worker = SimpleNamespace(
         block_size=8,
         selector=object(),
-        model_runner=SimpleNamespace(tp_rank=0),
+        _target_tp_rank=0,
         ps=SimpleNamespace(tp_rank=0),
         draft_model=SimpleNamespace(lm_head=None),
         device="cpu",
@@ -272,7 +282,9 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
     assert worker.draft_model.lm_head is None
 
 
-def test_lilicorr_sampling_falls_back_when_the_device_cannot_accept_it(monkeypatch):
+def test_lilicorr_sampling_falls_back_when_the_device_cannot_accept_it(
+    monkeypatch, topology
+):
     from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 
     warnings = []
@@ -287,7 +299,6 @@ def test_lilicorr_sampling_falls_back_when_the_device_cannot_accept_it(monkeypat
         lilicorr=object(),
         _lilicorr_sampling_enabled=False,
         _warned_sampling_fallback=False,
-        model_runner=SimpleNamespace(tp_rank=0),
     )
     batch = SimpleNamespace(sampling_info=SimpleNamespace(is_all_greedy=False))
 
@@ -301,7 +312,7 @@ def test_lilicorr_sampling_falls_back_when_the_device_cannot_accept_it(monkeypat
     assert len(warnings) == 1
 
 
-def test_worker_warns_once_when_selector_sampling_is_disabled(monkeypatch):
+def test_worker_warns_once_when_selector_sampling_is_disabled(monkeypatch, topology):
     from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 
     warnings = []
@@ -312,7 +323,6 @@ def test_worker_warns_once_when_selector_sampling_is_disabled(monkeypatch):
         selector=object(),
         _selector_sampling_enabled=False,
         _warned_sampling_fallback=False,
-        model_runner=SimpleNamespace(tp_rank=0),
         ps=SimpleNamespace(tp_rank=0),
     )
     batch = SimpleNamespace(sampling_info=SimpleNamespace(is_all_greedy=False))
@@ -462,6 +472,36 @@ def test_grouped_conv_supports_runtime_block_sizes():
                     value += coefficient * hidden_3d[batch, position - tap]
                 expected[batch * block_size + position] = value.flatten()
         torch.testing.assert_close(actual, expected)
+
+
+def test_grouped_conv_matmul_expand_is_exact():
+    """SGLANG_DFLASH_CONV_MATMUL_EXPAND must reproduce the default conv bit for bit,
+    across a block boundary and with more than one 128-group expansion block."""
+    hidden_size, block_size, taps, group_size = 4096, 8, 2, 16
+    generator = torch.Generator().manual_seed(1)
+    plain = DFlashGroupedConv(hidden_size, block_size, taps, group_size)
+    with envs.SGLANG_DFLASH_CONV_MATMUL_EXPAND.override(True):
+        fast = DFlashGroupedConv(hidden_size, block_size, taps, group_size)
+        assert not DFlashGroupedConv(256, block_size, taps, group_size).matmul_expand
+    assert fast.matmul_expand and not plain.matmul_expand
+    with torch.no_grad():
+        plain.kernel_projection.weight.normal_(0, 0.02, generator=generator)
+        plain.base_kernel.normal_(0, 0.1, generator=generator)
+    fast.load_state_dict(plain.state_dict())
+    plain, fast = plain.to(torch.bfloat16), fast.to(torch.bfloat16)
+    x, y = torch.randn(2, 2 * block_size, hidden_size, generator=generator).to(
+        torch.bfloat16
+    )
+
+    # Both paths eager: inductor fuses the compiled reference's elementwise chain in
+    # fp32 and rounds once, while the expanded path rounds to bf16 after every op.
+    with torch.compiler.set_stance("force_eager"):
+        want_out, want_kernel = plain.prepare(x)
+        got_out, got_kernel = fast.prepare(x)
+        torch.testing.assert_close(got_out, want_out, rtol=0, atol=0)
+        torch.testing.assert_close(
+            fast.finish(y, got_kernel), plain.finish(y, want_kernel), rtol=0, atol=0
+        )
 
 
 if __name__ == "__main__":

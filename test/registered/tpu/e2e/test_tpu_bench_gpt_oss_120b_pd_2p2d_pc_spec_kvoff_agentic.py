@@ -29,6 +29,16 @@ register_tpu_ci(
     est_time=7200,
     suite="external-nightly-2x2x4",
     nightly=True,
+    labels=[
+        "multihost",
+        "gpt-oss-120b",
+        "perf",
+        "pd",
+        "prefix-cache",
+        "spec",
+        "kv-offload",
+        "agentic",
+    ],
 )
 
 MULTIHOST_LAUNCH = {

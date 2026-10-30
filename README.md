@@ -1,99 +1,171 @@
-<div align="center" id="sglangtop">
-<img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
-
-[![PyPI](https://img.shields.io/pypi/v/sglang)](https://pypi.org/project/sglang)
-![PyPI - Downloads](https://static.pepy.tech/badge/sglang?period=month)
-[![license](https://img.shields.io/github/license/sgl-project/sglang.svg)](https://github.com/sgl-project/sglang/tree/main/LICENSE)
-[![issue resolution](https://img.shields.io/github/issues-closed-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
-[![open issues](https://img.shields.io/github/issues-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/sgl-project/sglang)
-
-</div>
-
---------------------------------------------------------------------------------
-
 <p align="center">
-<a href="https://www.sglang.io/"><b>🌐 Website</b></a> |
-<a href="https://lmsys.org/blog/"><b>Blog</b></a> |
-<a href="https://docs.sglang.io/"><b>Documentation</b></a> |
-<a href="https://roadmap.sglang.io/"><b>Roadmap</b></a> |
-<a href="https://slack.sglang.io/"><b>Join Slack</b></a> |
-<a href="https://meet.sglang.io/"><b>Weekly Dev Meeting</b></a> |
-<a href="https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides"><b>Slides</b></a>
+  <img src="assets/torch-tpu.svg" alt="SGLang-TorchTPU" width="360">
 </p>
 
-## News
-- [2026/07] 🔥 SGLang and Miles add day-0 support for Kimi K3 ([blog](https://lmsys.org/blog/2026-07-27-kimi-k3-day0-support/)).
-- [2026/07] RadixArk and Google bring full SGLang features to TPUs ([blog](https://lmsys.org/blog/2026-07-30-sglang-google-tpu/)).
-- [2026/07] Serving GLM5.2 NVFP4 agentic workloads with SGLang: Reaching 500 TPS in two weeks ([blog](https://lmsys.org/blog/2026-07-13-glm52-optimization/)).
-- [2026/06] 🔥 The next generation of speculative decoding: DFlash and Spec V2 ([blog](https://lmsys.org/blog/2026-06-15-next-generation-speculative-decoding-dflash-v2/)).
-- [2026/06] SGLang provides day-0 support for latest open models ([Nemotron 3 Ultra](https://lmsys.org/blog/2026-06-04-nvidia-run-nemotron-3-ultra/), [Nemotron 3 Super](https://lmsys.org/blog/2026-03-11-run-nvidia-nemotron-3-super/), [Higgs Audio v3 TTS](https://lmsys.org/blog/2026-06-04-higgs-audio-v3-tts/)).
-- [2026/04] 🔥 DeepSeek-V4 on Day 0: From Fast Inference to Verified RL with SGLang and Miles ([blog](https://lmsys.org/blog/2026-04-25-deepseek-v4/)).
-- [2026/02] 🔥 Unlocking 25x Inference Performance with SGLang on NVIDIA GB300 NVL72 ([blog](https://lmsys.org/blog/2026-02-20-gb300-inferencex/)).
-- [2026/01] SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2026-01-16-sglang-diffusion/)).
+<h1 align="center">SGLang-TorchTPU</h1>
 
-<details>
-<summary>More</summary>
+<p align="center">
+  <strong>PyTorch-native LLM serving on Google TPUs.</strong><br>
+  The SGLang serving engine. The PyTorch ecosystem. Built for TPU.
+</p>
 
-- [2025/12] SGLang provides day-0 support for latest open models ([MiMo-V2-Flash](https://lmsys.org/blog/2025-12-16-mimo-v2-flash/), [Nemotron 3 Nano](https://lmsys.org/blog/2025-12-15-run-nvidia-nemotron-3-nano/), [Mistral Large 3](https://github.com/sgl-project/sglang/pull/14213), [LLaDA 2.0 Diffusion LLM](https://lmsys.org/blog/2025-12-19-diffusion-llm/), [MiniMax M2](https://lmsys.org/blog/2025-11-04-miminmax-m2/)).
-- [2025/11] SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2025-11-07-sglang-diffusion/)).
-- [2025/10] SGLang now runs natively on TPU with the SGLang-Jax backend ([blog](https://lmsys.org/blog/2025-10-29-sglang-jax/)).
-- [2025/10] PyTorch Conference 2025 SGLang Talk ([slide](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/sglang_pytorch_2025.pdf)).
-- [2025/10] SGLang x Nvidia SF Meetup on 10/2 ([recap](https://x.com/lmsysorg/status/1975339501934510231)).
-- [2025/09] Deploying DeepSeek on GB200 NVL72 with PD and Large Scale EP (Part II): 3.8x Prefill, 4.8x Decode Throughput ([blog](https://lmsys.org/blog/2025-09-25-gb200-part-2/)).
-- [2025/09] SGLang Day 0 Support for DeepSeek-V3.2 with Sparse Attention ([blog](https://lmsys.org/blog/2025-09-29-deepseek-V32/)).
-- [2025/08] SGLang x AMD SF Meetup on 8/22: Hands-on GPU workshop, tech talks by AMD/xAI/SGLang, and networking ([Roadmap](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_roadmap.pdf), [Large-scale EP](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_ep.pdf), [Highlights](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_highlights.pdf), [AITER/MoRI](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_aiter_mori.pdf), [Wave](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_wave.pdf)).
-- [2025/08] SGLang provides day-0 support for OpenAI gpt-oss model ([instructions](https://github.com/sgl-project/sglang/issues/8833))
-- [2025/06] SGLang, the high-performance serving infrastructure powering trillions of tokens daily, has been awarded the third batch of the Open Source AI Grant by a16z ([a16z blog](https://a16z.com/advancing-open-source-ai-through-benchmarks-and-bold-experimentation/)).
-- [2025/06] Deploying DeepSeek on GB200 NVL72 with PD and Large Scale EP (Part I): 2.7x Higher Decoding Throughput ([blog](https://lmsys.org/blog/2025-06-16-gb200-part-1/)).
-- [2025/05] Deploying DeepSeek with PD Disaggregation and Large-scale Expert Parallelism on 96 H100 GPUs ([blog](https://lmsys.org/blog/2025-05-05-large-scale-ep/)).
-- [2025/03] Supercharge DeepSeek-R1 Inference on AMD Instinct MI300X ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1-Part2/README.html))
-- [2025/03] SGLang Joins PyTorch Ecosystem: Efficient LLM Serving Engine ([PyTorch blog](https://pytorch.org/blog/sglang-joins-pytorch/))
-- [2025/02] Unlock DeepSeek-R1 Inference Performance on AMD Instinct™ MI300X GPU ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1_Perf/README.html))
-- [2025/01] SGLang provides day one support for DeepSeek V3/R1 models on NVIDIA and AMD GPUs with DeepSeek-specific optimizations. ([instructions](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3), [AMD blog](https://www.amd.com/en/developer/resources/technical-articles/amd-instinct-gpus-power-deepseek-v3-revolutionizing-ai-development-with-sglang.html), [10+ other companies](https://x.com/lmsysorg/status/1887262321636221412))
-- [2024/12] v0.4 Release: Zero-Overhead Batch Scheduler, Cache-Aware Load Balancer, Faster Structured Outputs ([blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/)).
-- [2024/10] The First SGLang Online Meetup ([slides](https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#the-first-sglang-online-meetup)).
-- [2024/09] v0.3 Release: 7x Faster DeepSeek MLA, 1.5x Faster torch.compile, Multi-Image/Video LLaVA-OneVision ([blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/)).
-- [2024/07] v0.2 Release: Faster Llama3 Serving with SGLang Runtime (vs. TensorRT-LLM, vLLM) ([blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/)).
-- [2024/02] SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
-- [2024/01] SGLang provides up to **5x faster inference** with RadixAttention ([blog](https://lmsys.org/blog/2024-01-17-sglang/)).
-- [2024/01] SGLang powers the serving of the official **LLaVA v1.6** release demo ([usage](https://github.com/haotian-liu/LLaVA?tab=readme-ov-file#demo)).
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-green?style=flat&amp;labelColor=555555" alt="License: Apache 2.0"></a>
+  <img src="https://img.shields.io/badge/Hardware-TPU7x%20Ironwood-orange?style=flat&amp;labelColor=555555" alt="Hardware: TPU7x Ironwood">
+</p>
 
-</details>
+SGLang-TorchTPU brings [SGLang](https://github.com/sgl-project/sglang) to Google TPUs through **torch_tpu** and **Pallas kernels**. Serve large language and vision-language models with SGLang's OpenAI-compatible API and scheduling engine, while developing in PyTorch with eager execution and TPU compilation.
 
-## About
-SGLang is a high-performance serving framework for large language models and multimodal models.
-It is designed to deliver low-latency and high-throughput inference across a wide range of setups, from a single GPU to large distributed clusters.
-Its core features include:
+<p align="center">
+  <a href="https://docs.sglang.io/docs/hardware-platforms/tpu#sglang-torchtpu">Documentation</a>
+</p>
 
-- **Fast Runtime**: Provides efficient serving with RadixAttention for prefix caching, a zero-overhead CPU scheduler, prefill-decode disaggregation, speculative decoding, continuous batching, paged attention, tensor/pipeline/expert/data parallelism, structured outputs, chunked prefill, quantization (FP4/FP8/INT4/AWQ/GPTQ), and multi-LoRA batching.
-- **Broad Model Support**: Supports a wide range of language models (Llama, Qwen, DeepSeek, Kimi, GLM, GPT, Gemma, Mistral, etc.), embedding models (e5-mistral, gte, mcdse), reward models (Skywork), and diffusion models (WAN, Qwen-Image), with easy extensibility for adding new models. Compatible with most Hugging Face models and OpenAI APIs.
-- **Extensive Hardware Support**: Runs on NVIDIA GPUs (GB200/B300/H100/A100/Spark/5090), AMD GPUs (MI355/MI300), Intel Xeon CPUs, Google TPUs, Ascend NPUs, and more.
-- **Active Community**: SGLang is open-source and supported by a vibrant community with widespread industry adoption, powering over 400,000 GPUs worldwide.
-- **RL & Post-Training Backbone**: SGLang is a proven rollout backend used for training many frontier models, with native RL integrations and adoption by well-known post-training frameworks such as [**AReaL**](https://github.com/inclusionAI/AReaL), [**Miles**](https://github.com/radixark/miles), [**slime**](https://github.com/THUDM/slime), [**Tunix**](https://github.com/google/tunix), [**verl**](https://github.com/volcengine/verl) and more.
+## Highlights
 
-## Getting Started
-- [Install SGLang](https://docs.sglang.io/get_started/install.html)
-- [Quick Start](https://docs.sglang.io/basic_usage/send_request.html)
-- [Cookbook](https://docs.sglang.io/cookbook) — the deployment command we recommend for each supported model
-- [Backend Tutorial](https://docs.sglang.io/basic_usage/openai_api_completions.html)
-- [Frontend Tutorial](https://docs.sglang.io/references/frontend/frontend_tutorial.html)
-- [Contribution Guide](https://docs.sglang.io/developer_guide/contribution_guide.html)
+**PyTorch-native TPU serving.** Develop with familiar PyTorch workflows and deploy on TPU7x (Ironwood), with `torch.compile` and direct compilation. Tensor, expert, data, pipeline, and context parallelism cover a range of serving configurations.
 
-## Benchmark and Performance
-Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/), [Large-scale expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/), [GB200 rack-scale parallelism](https://lmsys.org/blog/2025-09-25-gb200-part-2/), [GB300 long context](https://lmsys.org/blog/2026-02-19-gb300-longctx/).
+**Efficient inference at scale.** Combine prefix caching, HiCache KV offload to host memory, disaggregated prefill/decode with TP resharding, and encoder disaggregation for vision-language models. Low-precision inference includes FP8, MXFP4, INT4 W4A16, and FP8 KV cache.
 
-## Adoption and Sponsorship
-SGLang has been deployed at large scale, generating trillions of tokens in production each day. It is trusted and adopted by a wide range of leading enterprises and institutions, including xAI, NVIDIA, AMD, Intel, LinkedIn, Cursor, Oracle Cloud, Google Cloud, Microsoft Azure, AWS, Atlas Cloud, Voltage Park, Nebius, DataCrunch, Novita, RunPod, InnoMatrix, Modal, MIT, UCLA, the University of Washington, Stanford, UC Berkeley, Tsinghua University, Baseten, Baidu, AntGroup, Alibaba, Tencent, and other major technology organizations.
-As an open-source LLM inference engine, SGLang has become the de facto industry standard, with deployments running on over 400,000 GPUs worldwide.
-SGLang is currently hosted under the non-profit open-source organization [LMSYS](https://lmsys.org/about/).
+**Speculative decoding.** Explore EAGLE3, DFlash, DFlash2, DSPark, and MTP for supported model configurations. The speculative decoding developer guide below covers worker selection and model-specific requirements.
 
-<img src="https://raw.githubusercontent.com/sgl-project/sgl-learning-materials/refs/heads/main/slides/adoption.png" alt="logo" width="800" margin="10px"></img>
+## Get started
 
-## Contact Us
-For enterprises interested in adopting or deploying SGLang at scale, including technical consulting, sponsorship opportunities, or partnership inquiries, please contact us at [sglang@lmsys.org](mailto:sglang@lmsys.org).
+### Docker
 
-Long-term active SGLang contributors are eligible for coding agent sponsorship, such as Cursor, Claude Code, or OpenAI Codex. Email [sglang@lmsys.org](mailto:sglang@lmsys.org) with your most important commits or pull requests.
+Pull the TPU image, which has the engine and TPU plugin installed:
 
-## Acknowledgment
-We learned the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
+```bash
+docker pull lmsysorg/sglang:v0.1.0-tpu
+```
+
+On a TPU7x host, start a container with access to the TPU chips:
+
+```bash
+docker run -it --rm --privileged --net=host --shm-size=64g \
+  -e SGLANG_PLATFORM=tpu_oot \
+  lmsysorg/sglang:v0.1.0-tpu
+```
+
+The container starts in the repository root, `/sgl-workspace/sglang`.
+
+### pip
+
+On a TPU7x host (Linux x86_64, Python 3.11 to 3.14), install the engine and TPU plugin wheels from the [v0.1.0 release](https://github.com/sgl-project/sglang-torchtpu/releases/tag/tpu-v0.1.0). Install both together: `sglang` here is this repository's build, not the PyPI package.
+
+```bash
+pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+  https://github.com/sgl-project/sglang-torchtpu/releases/download/tpu-v0.1.0/sglang-0.5.22-py3-none-any.whl \
+  https://github.com/sgl-project/sglang-torchtpu/releases/download/tpu-v0.1.0/sglang_tpu-0.1.0-py3-none-any.whl
+```
+
+The serving recipes below live in the repository, so clone it to run them.
+
+### From source
+
+On a TPU7x host, install the engine with [the TPU dependency manifest](python/pyproject_tpu.toml), then the TPU plugin:
+
+```bash
+git clone https://github.com/sgl-project/sglang-torchtpu.git
+cd sglang-torchtpu
+cp python/pyproject_tpu.toml python/pyproject.toml
+pip install --extra-index-url https://download.pytorch.org/whl/cpu -e python/
+pip install --no-deps -e .
+```
+
+### Launch a server
+
+From the repository root, launch GPT-OSS-20B with the single-host serving recipe, configured for 4 chips and 8 TensorCores:
+
+```bash
+python -m benchmark.tpu.launch_server --config recipe/configs/gpt_oss_20b/server.py
+```
+
+Once the server is ready, send an OpenAI-compatible request from another terminal:
+
+```bash
+curl http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-oss-20b", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+## Supported hardware
+
+Development and testing focus on **TPU7x (Ironwood)**, from a single host to multi-host serving and disaggregated prefill/decode.
+
+| Deployment | Topology |
+| --- | --- |
+| Single host | 4 chips, 8 TensorCores; TP up to 8 |
+| Multi-host | 2 hosts; TP 16 |
+| Disaggregated serving | 4 hosts; 2 prefill + 2 decode |
+| Encoder disaggregation | Vision encoder on its own host or chips; sized independently of the language model |
+
+## Models and features
+
+Selected model integrations include the following. Recipe availability and test coverage vary by model; experimental integrations are included.
+
+| Model | Available recipes and tests |
+| --- | --- |
+| Muse Spark Open | Serving and agentic recipes |
+| GLM-5.3-Flash | Serving and MTP recipes |
+| Kimi-K3 | Small-model compile test with dummy weights |
+| DeepSeek-V4-Flash | Serving recipe |
+| Qwen3.8-27B | Accuracy and MTP recipes |
+| GPT-OSS (20B, 120B) | 20B recipes, 120B recipes |
+| Gemma 4 (31B, 26B-A4B) | 31B recipes, 26B-A4B recipes |
+
+See the [full support guide](SUPPORT.md) for support tiers, model-specific requirements, and experimental capabilities.
+
+Explore [model recipes](benchmark/tpu/recipe/README.md), [TPU benchmarks](benchmark/tpu/README.md), and the [CI support matrix](SUPPORT_MATRIX.md) for configurations and test coverage.
+
+## Encoder disaggregation (EPD)
+
+A vision-language model can run its vision encoder in a separate encode server that sends image embeddings to a language-only server ([#665](https://github.com/sgl-project/sglang-torchtpu/pull/665)). EPD is supported for the Qwen family and verified on Qwen3-VL-8B and Qwen3-VL-235B-A22B; other model families should work but are not verified.
+
+- **Latency.** At the same request rate, TPOT drops 4-30% on 8B and 5-24% on 235B-A22B, and TTFT stays low as load rises: at 5 req/s on 235B-A22B, 392 ms vs 2091 ms with the encoder on the same host.
+- **HBM.** The language server no longer compiles or runs the encoder, so after warmup it uses about 2 GB less HBM per TensorCore (8B and 235B-A22B alike).
+- **Independent topology.** The encoder and the language model pick their own TP size and hosts: for example, a TP8/EP8 235B-A22B language server with a TP8 encoder on a second host. Scale the encoder by adding encode servers or TP; encoder data parallelism is not supported on TPU.
+
+```bash
+# Encode server (requires --enable-torch-compile on TPU)
+sglang serve --model-path $MODEL --device tpu --tp-size 8 --enable-torch-compile --encoder-only
+# Language server; without a registered encoder it returns 503 for image requests
+sglang serve --model-path $MODEL --device tpu --tp-size 8 --enable-torch-compile --language-only \
+  --encoder-urls http://$ENCODER_HOST:$ENCODER_PORT
+```
+
+## Part of the SGLang ecosystem
+
+SGLang-TorchTPU is the PyTorch-native TPU backend in the [SGLang](https://github.com/sgl-project/sglang) ecosystem, alongside the JAX-based [SGL-JAX](https://github.com/sgl-project/sglang-jax). It brings TPU execution to the SGLang serving interface, so applications can use familiar OpenAI-compatible clients.
+
+TPU kernels, memory management, and backend integrations live in `sglang_tpu/`.
+
+## Development and contributing
+
+Contributions are welcome in model support, kernel optimizations, serving features, benchmarks, and documentation.
+
+1. Read the [contributor guide](CONTRIBUTING.md) for development setup and the pull request workflow.
+2. Explore the [TPU backend](sglang_tpu/README.md) and [speculative decoding developer guide](sglang_tpu/experimental/speculative/README.md).
+3. Add coverage for your changes and include accuracy or performance results where relevant.
+
+CPU-only unit tests run without a TPU:
+
+```bash
+python test/run_suite.py --suite base-a-test-cpu
+```
+
+Kernel and end-to-end tests require TPU hardware. A maintainer applies the `run-ci` label and comments `/tag-and-rerun-ci` to run them on your pull request.
+
+## Issues and feedback
+
+- **Bugs and feature requests:** Open an [issue](https://github.com/sgl-project/sglang-torchtpu/issues), including your TPU generation, topology, and torch_tpu version for bug reports.
+- **Security:** See our [security policy](SECURITY.md) for reporting vulnerabilities.
+
+For engine issues that also reproduce on GPUs, use the [upstream SGLang issue tracker](https://github.com/sgl-project/sglang/issues).
+
+## License and acknowledgments
+
+SGLang-TorchTPU is released under the [Apache 2.0 license](LICENSE).
+
+SGLang-TorchTPU is a joint effort of Google, Meta, RadixArk, and the SGLang community. Thanks to all contributors.
+
+See [NOTICE](NOTICE) for attribution details.

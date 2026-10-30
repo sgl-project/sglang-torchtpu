@@ -126,7 +126,9 @@ def _make_model_runner(
     mc.swa_head_dim = swa_head_dim or head_dim
     mc.swa_v_head_dim = swa_v_head_dim or v_head_dim
     mc.get_num_kv_heads = lambda tp_size, dcp_size=1: num_kv_heads
-    mc.get_swa_num_kv_heads = lambda tp_size: swa_num_kv_heads or num_kv_heads
+    mc.get_swa_num_kv_heads = lambda tp_size, dcp_size=1: (
+        swa_num_kv_heads or num_kv_heads
+    )
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
     mc.hf_config.model_type = "llama"
     mc.hf_config.get_text_config = lambda: mc.hf_config
@@ -275,6 +277,37 @@ class TestDefaultConfigurator(CustomTestCase):
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
 
+    def test_padding_platform_budget_covers_the_padded_pool(self):
+        """Bug regression: sizing priced heads * (head_dim + v_head_dim) while
+        the built pool padded, so the allocation outgrew the HBM budget."""
+        available = 10_000_000
+        pad_to = 128
+
+        def padded_bytes(*, num_kv_heads, head_dim, v_head_dim, kv_cache_dtype):
+            del kv_cache_dtype
+            del v_head_dim  # the fused layout gives V a slot of K's padded width
+            return num_kv_heads * 2 * max(head_dim, pad_to) * KV_SIZE
+
+        with patch(
+            "sglang.srt.model_executor.pool_configurator.current_platform",
+            SimpleNamespace(get_mha_kv_bytes_per_token=padded_bytes),
+        ):
+            mr, _, config = self._run(available)
+
+        mc = mr.model_config
+        used = (
+            config.max_total_num_tokens
+            * mr.layer_info.num_effective_layers
+            * padded_bytes(
+                num_kv_heads=mc.get_num_kv_heads(1),
+                head_dim=mc.head_dim,
+                v_head_dim=mc.v_head_dim,
+                kv_cache_dtype=None,
+            )
+        )
+        self.assertLessEqual(used, available)
+        self.assertGreater(used, available * 0.99)
+
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         side_effect=(576, 656),
@@ -351,6 +384,34 @@ class TestHybridSWAConfigurator(CustomTestCase):
         used = _actual_memory_used(mr, config)
         self.assertLessEqual(used, available)
         self.assertGreater(used, available * 0.99)
+
+    def test_dcp_leaves_non_tpu_geometry_unchanged(self):
+        """Only TPU widens the hybrid-SWA pool under DCP; another platform keeps
+        its per-rank KV heads and the physical page of the SWA admission floor."""
+        from sglang.srt.model_executor import pool_configurator
+
+        def geometry(dcp_size):
+            mr = self._make_swa_runner(page_size=16)
+            mc = mr.model_config
+            mc.get_num_kv_heads = lambda tp_size, dcp_size=1: 8 // (tp_size // dcp_size)
+            mc.get_swa_num_kv_heads = mc.get_num_kv_heads
+            with (
+                mock_cpu_env(tp_size=8),
+                get_parallel().override(attn_dcp_size=dcp_size),
+                patch.object(
+                    pool_configurator.current_platform,
+                    "dcp_shards_every_kv_pool",
+                    return_value=False,
+                ),
+                patch.object(
+                    pool_configurator.MemoryPoolConfigurator, "validate_swa_pool_size"
+                ) as floor,
+            ):
+                cfg = pool_configurator.create_memory_pool_configurator(mr)
+                cfg.calculate_pool_sizes(10_000_000, 16)
+            return cfg._full_per_token, cfg._swa_per_token, floor.call_args
+
+        self.assertEqual(geometry(2), geometry(1))
 
     def test_draft_does_not_inherit_target_shared_byte_budget(self):
         """A separate draft pool must not allocate the target's byte envelope again."""
@@ -548,6 +609,55 @@ class TestHybridSWAConfigurator(CustomTestCase):
             config.swa_max_total_num_tokens,
             int(config.full_max_total_num_tokens * 0.5),
         )
+
+    def test_padding_platform_budget_covers_the_padded_pool(self):
+        """Bug regression: sizing priced heads * (head_dim + v_head_dim) while
+        the built pool padded, so the allocation outgrew the HBM budget."""
+        available = 10_000_000
+        pad_to = 128
+
+        def padded_bytes(*, num_kv_heads, head_dim, v_head_dim, kv_cache_dtype):
+            del kv_cache_dtype
+            del v_head_dim  # the fused layout gives V a slot of K's padded width
+            return num_kv_heads * 2 * max(head_dim, pad_to) * KV_SIZE
+
+        mr = self._make_swa_runner(page_size=1)
+        with (
+            mock_cpu_env(),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.current_platform",
+                SimpleNamespace(
+                    get_mha_kv_bytes_per_token=padded_bytes,
+                    dcp_shards_every_kv_pool=lambda: False,
+                ),
+            ),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            config = create_memory_pool_configurator(mr).calculate_pool_sizes(
+                available, get_schedule().page_size
+            )
+
+        mc = mr.model_config
+        used = config.full_max_total_num_tokens * len(
+            mc.full_attention_layer_ids
+        ) * padded_bytes(
+            num_kv_heads=mc.get_num_kv_heads(1),
+            head_dim=mc.head_dim,
+            v_head_dim=mc.v_head_dim,
+            kv_cache_dtype=None,
+        ) + config.swa_max_total_num_tokens * len(
+            mc.swa_attention_layer_ids
+        ) * padded_bytes(
+            num_kv_heads=mc.get_swa_num_kv_heads(1),
+            head_dim=mc.swa_head_dim,
+            v_head_dim=mc.swa_v_head_dim,
+            kv_cache_dtype=None,
+        )
+        self.assertLessEqual(used, available)
+        self.assertGreater(used, available * 0.99)
 
     def test_chunk_cache_cap_accounts_for_spec_topk_page_rounding(self):
         available = 1_000_000
@@ -1306,10 +1416,10 @@ class TestMixedKVFormats(CustomTestCase):
                 )
 
     def test_mixed_formats_reserve_dummy_pages_and_align_capacity(self):
-        from sglang.srt.hardware_backend.tpu.kv_mxint8 import cache_bytes_per_token
         from sglang.srt.model_executor.pool_configurator import (
             create_memory_pool_configurator,
         )
+        from sglang_tpu.kv_mxint8 import cache_bytes_per_token
 
         available, page_size = 10_000_000, 128
         # 512 INT8 payload bytes plus 16 exponent rows aligned to 32.
@@ -1415,10 +1525,10 @@ class TestMixedKVFormats(CustomTestCase):
                     )
 
     def test_mxint8_groups_preserve_asymmetric_full_swa_geometry(self):
-        from sglang.srt.hardware_backend.tpu.kv_mxint8 import cache_bytes_per_token
         from sglang.srt.model_executor.pool_configurator import (
             create_memory_pool_configurator,
         )
+        from sglang_tpu.kv_mxint8 import cache_bytes_per_token
 
         available, page_size = 10_000_000, 128
         # Full: 2048 payload bytes plus 128/64/32 exponent rows.
@@ -1785,6 +1895,101 @@ class TestSWAPoolFloor(CustomTestCase):
         self.assertEqual(planner.kv_bytes, 512)
         self.assertEqual(planner.bytes_per_swa_token, 512)
 
+    @staticmethod
+    def _patch_tpu_dsv4_pool_configurator():
+        from contextlib import ExitStack
+
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+        from sglang_tpu.hooks.dsv4 import (
+            get_tpu_dsv4_bytes_per_full_token,
+            get_tpu_dsv4_bytes_per_swa_token,
+            get_tpu_dsv4_c128_state_fixed_bytes,
+            get_tpu_dsv4_fixed_c4_state_bytes,
+        )
+
+        stack = ExitStack()
+        for attr, hook in (
+            ("_get_bytes_per_swa_token", get_tpu_dsv4_bytes_per_swa_token),
+            ("_get_bytes_per_full_token", get_tpu_dsv4_bytes_per_full_token),
+            ("_get_c128_state_fixed_bytes", get_tpu_dsv4_c128_state_fixed_bytes),
+            ("_fixed_c4_state_bytes", get_tpu_dsv4_fixed_c4_state_bytes),
+        ):
+            orig = getattr(DSV4PoolConfigurator, attr)
+            stack.enter_context(
+                patch.object(
+                    DSV4PoolConfigurator,
+                    attr,
+                    lambda self, *a, _h=hook, _o=orig, **kw: _h(_o, self, *a, **kw),
+                )
+            )
+        return stack
+
+    def test_dsv4_tpu_budget_accounting(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        kvc = _make_model_runner(self, num_layers=44, page_size=256)
+        _publish_config(self, page_size=256)
+        kvc.kv_cache_dtype_str = "bf16"
+        cfg = kvc.model_config
+        cfg.qk_nope_head_dim = 448
+        cfg.qk_rope_head_dim = 64
+        cfg.index_head_dim = 128
+        cfg.compress_ratios = [0, 0] + [128, 4] * 21
+        cfg.window_size = 512
+        cfg.hf_config.kv_source_layer_ids = []
+        with self._patch_tpu_dsv4_pool_configurator():
+            planner = DSV4PoolConfigurator(kvc)
+            self.assertEqual(planner.bytes_per_swa_token, 44 * 1024.0)
+            expected_full = (
+                0.1 * (44 * 1024.0)
+                + (1 / 4) * 640 * 21
+                + (1 / 128) * 1024 * 21
+                + (1 / 4) * 256 * 21
+            )
+            self.assertEqual(planner.bytes_per_full_token, expected_full)
+            mrr = 64
+            num_req_slots = mrr + 1
+            state_pages = 1 + num_req_slots * 32 + 2048
+            c4_rows = state_pages * 4
+            self.assertEqual(
+                planner._fixed_c4_state_bytes(mrr),
+                c4_rows * (4 * 512 * 4 + 4 * 128 * 4) * 21,
+            )
+            c128_rows = state_pages * 8
+            self.assertEqual(
+                planner._get_c128_state_fixed_bytes(mrr),
+                c128_rows * (2 * 512 * 4) * 21,
+            )
+
+    def test_dsv4_pro_tpu_budget_accounting(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        kvc = _make_model_runner(self, num_layers=61, page_size=256)
+        _publish_config(self, page_size=256)
+        kvc.kv_cache_dtype_str = "bf16"
+        cfg = kvc.model_config
+        cfg.qk_nope_head_dim = 448
+        cfg.qk_rope_head_dim = 64
+        cfg.index_head_dim = 128
+        # DeepSeek-V4-Pro config.json has 64 entries for 61 target layers
+        # (31 HCA, 30 CSA, and 3 trailing MTP 0s).
+        cfg.compress_ratios = [128] + [128, 4] * 30 + [0, 0, 0]
+        cfg.window_size = 128
+        cfg.hf_config.kv_source_layer_ids = []
+        with self._patch_tpu_dsv4_pool_configurator():
+            planner = DSV4PoolConfigurator(kvc)
+            self.assertEqual(planner.num_layers_total, 61)
+            self.assertEqual(planner.num_layers(4), 30)
+            self.assertEqual(planner.num_layers(128), 31)
+            self.assertEqual(planner.bytes_per_swa_token, 61 * 1024.0)
+            expected_full = (
+                0.1 * (61 * 1024.0)
+                + (1 / 4) * 640 * 30
+                + (1 / 128) * 1024 * 31
+                + (1 / 4) * 256 * 30
+            )
+            self.assertEqual(planner.bytes_per_full_token, expected_full)
+
     def test_dsv4_unified_c4_state_not_token_scaled(self):
         # Unified-KV sizes the c4 state ring from max_running_requests in
         # finalize_with_max_running_requests, so it must not scale here.
@@ -1824,6 +2029,197 @@ class TestSWAPoolFloor(CustomTestCase):
         slots = cfg._get_num_req_slots(mrr)
         target = slots * cfg._swa_ring_size * 640 * cfg.num_layers_total
         self.assertEqual(cfg._fixed_swa_bytes(mrr), int(target * cfg._spec_infl))
+
+    def test_dsv4_fp8_pd_refuses_pp_and_hisparse(self):
+        from sglang.srt.model_executor.pool_configurator import (
+            check_dsv4_unified_fp8_pd_supported,
+        )
+
+        base = dict(
+            unified_fp8=True,
+            disaggregation_mode="prefill",
+            pp_size=1,
+            enable_hisparse=False,
+        )
+        check_dsv4_unified_fp8_pd_supported(**base)
+        # bf16 PD keeps both
+        check_dsv4_unified_fp8_pd_supported(
+            **{**base, "unified_fp8": False, "pp_size": 2, "enable_hisparse": True}
+        )
+        # fp8 without PD keeps both
+        check_dsv4_unified_fp8_pd_supported(
+            **{
+                **base,
+                "disaggregation_mode": "null",
+                "pp_size": 2,
+                "enable_hisparse": True,
+            }
+        )
+        for mode in ("prefill", "decode"):
+            for key, value, message in (
+                ("pp_size", 2, "pp_size=2"),
+                ("enable_hisparse", True, "enable-hisparse"),
+            ):
+                with self.subTest(disaggregation_mode=mode, refused=key):
+                    with self.assertRaisesRegex(ValueError, message):
+                        check_dsv4_unified_fp8_pd_supported(
+                            **{**base, "disaggregation_mode": mode, key: value}
+                        )
+
+
+class TestOutOfTreeHybridSwaRouting(CustomTestCase):
+    """Under an OOT platform a hybrid-SWA model must get the full+SWA sub-pools
+    and the generic SWA allocator, not a flat pool and a paged allocator."""
+
+    def _fake_configurator(self):
+        _publish_config(self, page_size=64, disaggregation_mode="null")
+        return SimpleNamespace(
+            device="cpu",
+            kv_cache_dtype=torch.bfloat16,
+            kv_cache_dtype_str="auto",
+            is_draft_worker=False,
+            is_hybrid_swa=True,
+            use_mla_backend=False,
+            mambaish_config=None,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+            _build_tpu_swa_kv_pool=MagicMock(name="swa_builder"),
+            _build_oot_mha_kv_pool=MagicMock(name="flat_builder"),
+        )
+
+    def _sizes(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import _PoolSizes
+
+        return _PoolSizes(
+            max_total_num_tokens=256,
+            max_running_requests=4,
+            full_max_total_num_tokens=256,
+            swa_max_total_num_tokens=128,
+            c4_max_total_num_tokens=0,
+            c128_max_total_num_tokens=0,
+            c4_state_pool_size=0,
+            c128_state_pool_size=0,
+            c4_state_dtype=None,
+            c128_state_dtype=None,
+        )
+
+    def test_oot_hybrid_swa_builds_full_and_swa_sub_pools(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        fake = self._fake_configurator()
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_configurator.current_platform"
+        ) as platform:
+            platform.is_out_of_tree.return_value = True
+            platform.is_tpu.return_value = False
+            KVCacheConfigurator._build_token_to_kv_pool(
+                fake,
+                sizes=self._sizes(),
+                is_dsa_model=False,
+                is_dsv4_model=False,
+                req_to_token_pool=MagicMock(),
+            )
+        fake._build_tpu_swa_kv_pool.assert_called_once_with(
+            full_max_total_num_tokens=256, swa_max_total_num_tokens=128
+        )
+        fake._build_oot_mha_kv_pool.assert_not_called()
+
+    def test_oot_hybrid_swa_uses_generic_swa_allocator(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        fake = self._fake_configurator()
+        with (
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.current_platform"
+            ) as platform,
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.SWATokenToKVPoolAllocator"
+            ) as swa_allocator,
+        ):
+            platform.is_out_of_tree.return_value = True
+            platform.is_tpu.return_value = False
+            KVCacheConfigurator._build_token_to_kv_pool_allocator(
+                fake,
+                sizes=self._sizes(),
+                token_to_kv_pool=MagicMock(),
+                is_dsv4_model=False,
+                req_to_token_pool=MagicMock(),
+                token_to_kv_pool_allocator=None,
+            )
+        platform.get_paged_allocator_cls.assert_not_called()
+        swa_allocator.assert_called_once()
+
+
+class TestTpuDsaRouting(CustomTestCase):
+    """On TPU a DSA model must get the TPU DSA pool. The generic DSA builder
+    allocates the GPU layout, which the TPU kernels cannot read."""
+
+    _fake_configurator = TestOutOfTreeHybridSwaRouting._fake_configurator
+    _sizes = TestOutOfTreeHybridSwaRouting._sizes
+
+    def test_tpu_dsa_model_builds_the_tpu_dsa_pool(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        fake = self._fake_configurator()
+        fake.is_hybrid_swa = False
+        fake.use_mla_backend = True
+        fake._build_tpu_dsa_kv_pool = MagicMock(name="tpu_dsa_builder")
+        fake._build_dsa_kv_pool = MagicMock(name="generic_dsa_builder")
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_configurator.current_platform"
+        ) as platform:
+            platform.is_out_of_tree.return_value = False
+            platform.is_tpu.return_value = True
+            KVCacheConfigurator._build_token_to_kv_pool(
+                fake,
+                sizes=self._sizes(),
+                is_dsa_model=True,
+                is_dsv4_model=False,
+                req_to_token_pool=MagicMock(),
+            )
+        fake._build_tpu_dsa_kv_pool.assert_called_once_with(max_total_num_tokens=256)
+        fake._build_dsa_kv_pool.assert_not_called()
+
+
+class TestOutOfTreeMlaPoolConstruction(CustomTestCase):
+    """The core OOT MLA builder passes index_head_dim, which no TPU MLA pool took,
+    so every MLA model failed to build its KV pool under SGLANG_PLATFORM=tpu_oot."""
+
+    def test_oot_mla_builder_kwargs_reach_the_tpu_mla_pools(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+        from sglang_tpu.kv_pool import TpuFusedMLATokenToKVPool
+        from sglang_tpu.platform import TpuOOTPlatform
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
+
+        _publish_config(self, page_size=64, disaggregation_mode="null")
+        fake = SimpleNamespace(
+            device="cpu",
+            pool_page_size=64,
+            kv_cache_dtype=torch.bfloat16,
+            model_config=SimpleNamespace(
+                kv_lora_rank=512, qk_rope_head_dim=64, index_head_dim=None
+            ),
+            layer_info=SimpleNamespace(
+                num_effective_layers=2, start_layer=0, end_layer=2
+            ),
+        )
+        for pool_cls in (TpuFusedMLATokenToKVPool, MLATokenToKVPool):
+            with (
+                self.subTest(pool=pool_cls.__name__),
+                patch.object(
+                    TpuSRTPlatform, "get_mla_kv_pool_cls", lambda _, c=pool_cls: c
+                ),
+                # autospec raises TypeError on a keyword the real __init__ lacks.
+                patch.object(pool_cls, "__init__", autospec=True, return_value=None),
+                patch(
+                    "sglang.srt.mem_cache.kv_cache_configurator.current_platform",
+                    TpuOOTPlatform(),
+                ),
+            ):
+                pool = KVCacheConfigurator._build_oot_mla_kv_pool(
+                    fake, max_total_num_tokens=256, is_dsa_model=False
+                )
+                self.assertIsInstance(pool, pool_cls)
 
 
 if __name__ == "__main__":

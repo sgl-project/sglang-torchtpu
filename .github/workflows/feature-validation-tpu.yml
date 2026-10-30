@@ -10,7 +10,9 @@
 #                     GROUPS them by launch spec; one JobSet per group (launch
 #                     once, rank-0 runs the group's files).
 #   * pd-*         -> static P/D disaggregation gates (2 engines per job).
-#   * static exec  -> no server, every host runs the file (exec mode).
+# Most feature validation runs on the external cluster instead
+# (nightly-test-external-tpu.yml, the external-nightly-* suites); what stays here
+# is waiting on its weights in the external bucket.
 # Every job runs in the `nightly` lane (topology.yaml) and maps to exactly ONE
 # test file, so a red job names its test (the dashboard contract).
 name: Feature Validation (TPU)
@@ -31,21 +33,7 @@ on:
         options:
           - all
           - mh
-          - diffusion-mh-collectives
-          - node-normalization
-          - pd-mh-gpt-120b
-          - pd-mh-gpt-120b-pc-offload
-          - pd-mh-gpt-120b-spec
-          - pd-mh-gpt-120b-pc-offload-spec
-          - pd-mh-gpt-120b-pc-offload-spec-reshard
-          - pd-mh-gpt-120b-kvoff-reshard
-          - pd-mh-qwen3-480b-kvoff-reshard
-          - pd-mh-qwen3-vl-8b-spec
-          - pd-sh-gpt-120b
-          - pd-sh-gpt-120b-spec
-          - pd-sh-gpt-120b-decode-radix
-          - pd-sh-gpt-120b-offload
-          - pd-sh-gpt-120b-offload-spec
+          - pd-sh-qwen3-vl-30b
           - sh
       test_filter:
         description: "Substring of a test file path; runs only matching tests"
@@ -109,17 +97,7 @@ jobs:
       contents: read
     outputs:
       single_host: ${{ steps.tests.outputs.single_host }}
-      pd_pc_offload: ${{ steps.tests.outputs.pd_pc_offload }}
-      pd_kvoff_reshard: ${{ steps.tests.outputs.pd_kvoff_reshard }}
-      pd_kvoff_reshard_qwen: ${{ steps.tests.outputs.pd_kvoff_reshard_qwen }}
-      pd_singlehost: ${{ steps.tests.outputs.pd_singlehost }}
-      pd_singlehost_spec: ${{ steps.tests.outputs.pd_singlehost_spec }}
-      pd_singlehost_decode_radix: ${{ steps.tests.outputs.pd_singlehost_decode_radix }}
-      pd_singlehost_offload: ${{ steps.tests.outputs.pd_singlehost_offload }}
-      pd_singlehost_offload_spec: ${{ steps.tests.outputs.pd_singlehost_offload_spec }}
-      pd_multihost: ${{ steps.tests.outputs.pd_multihost }}
-      diffusion_mh_collectives: ${{ steps.tests.outputs.diffusion_mh_collectives }}
-      node_normalization: ${{ steps.tests.outputs.node_normalization }}
+      pd_singlehost_qwen3_vl_30b: ${{ steps.tests.outputs.pd_singlehost_qwen3_vl_30b }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -139,7 +117,6 @@ jobs:
             echo "::error::test_filter cannot be combined with update-dashboard"
             exit 1
           fi
-          discover_files='python3 .github/tpu-ci/discover_files.py'
           single_host=$(python3 .github/tpu-ci/discover_tests.py --suite nightly-tpu-4-v7 --nightly)
           if [ -n "$TEST_FILTER" ]; then
             single_host=$(printf '%s' "$single_host" \
@@ -147,17 +124,8 @@ jobs:
             echo "test_filter=$TEST_FILTER kept: $single_host"
           fi
           echo "single_host=$single_host" >> "$GITHUB_OUTPUT"
-          echo "pd_pc_offload=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload.py)" >> "$GITHUB_OUTPUT"
-          echo "pd_kvoff_reshard=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_kv_offload_resharding.py)" >> "$GITHUB_OUTPUT"
-          echo "pd_kvoff_reshard_qwen=$($discover_files --entry test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py)" >> "$GITHUB_OUTPUT"
-          echo "pd_singlehost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py)" >> "$GITHUB_OUTPUT"
-          echo "pd_singlehost_spec=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py)" >> "$GITHUB_OUTPUT"
-          echo "pd_singlehost_decode_radix=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py)" >> "$GITHUB_OUTPUT"
-          echo "pd_singlehost_offload=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload.py)" >> "$GITHUB_OUTPUT"
-          echo "pd_singlehost_offload_spec=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_spec.py)" >> "$GITHUB_OUTPUT"
-          echo "pd_multihost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py)" >> "$GITHUB_OUTPUT"
-          echo "diffusion_mh_collectives=$($discover_files --entry test/registered/tpu/e2e/test_diffusion_tpu_multihost_collectives.py)" >> "$GITHUB_OUTPUT"
-          echo "node_normalization=$($discover_files --entry test/registered/e2e/hardware_backend/tpu/test_node_normalization.py)" >> "$GITHUB_OUTPUT"
+          discover_files='python3 .github/tpu-ci/discover_files.py'
+          echo "pd_singlehost_qwen3_vl_30b=$($discover_files --entry test/registered/tpu/e2e/test_tpu_qwen3_vl_30b_a3b_pd_singlehost_mmmu.py)" >> "$GITHUB_OUTPUT"
 
   single-host:
     needs: [build, discover-tests]
@@ -179,411 +147,64 @@ jobs:
       suite: ${{ matrix.test.suite }}
       test_file: ${{ matrix.test.file }}
       nightly: true
+      # nightly-tpu-4-v7 runs mode B like the PR gate; multi-host, P/D, accuracy
+      # and perf lanes stay on mode A, so each test runs in one mode only.
+      platform: tpu_oot
       run_name: ${{ matrix.test.run_name }}
       weights_pvc: ${{ matrix.test.weights_pvc || 'model-weights' }}
     permissions:
       contents: read
       id-token: write
 
-  # P/D disaggregation integration tests: same JobSets as the standalone
-  # integration-test-tpu.yml action, which is workflow_dispatch-only. Only
-  # SCHEDULED runs are ingested by the CI dashboard, so a dispatch-only test
-  # never earns a history row -- these jobs give them a nightly cadence and
-  # therefore a green/red trend. Each engine role holds a whole 2x2x2 nightly
-  # slice, so every P/D job holds BOTH nightly-2h slices at once; the shared
-  # tpu-pd-lock in _tpu-test.yml serializes them (and against pd-sh /
-  # pd-mh below). See the runner-cap gap in .github/tpu-ci/README.md.
-  # P/D pods are named tpu-ci-<run_name>-<rand>-{prefill,decode}-<idx>; names
-  # use compact abbreviations (pd-{sh,mh}-gpt-120b[-<feature>]) to stay well
-  # under k8s's 63-char pod-name cap.
-  pd-mh-gpt-120b-pc-offload:
+  # Qwen3-VL-30B-A3B MMMU-Pro on the raiden P/D pair: the prefill runs the ViT,
+  # so image-derived KV crosses into a fused-MoE decode. Same serving settings
+  # and gate as the single-host Qwen3-VL-30B-A3B test, which isolates the handoff.
+  # In-project: its weights are not staged for the external cluster (no internet egress there).
+  pd-sh-qwen3-vl-30b:
     needs: [build, discover-tests]
     if: >-
       ${{ !cancelled() && needs.discover-tests.result == 'success'
-          && contains(fromJSON('["all","pd-mh-gpt-120b-pc-offload"]'), inputs.only || 'all')
-          && contains('test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload.py', inputs.test_filter) }}
-    name: ${{ fromJSON(needs.discover-tests.outputs.pd_pc_offload)[0].name }}
+          && contains(fromJSON('["all","pd-sh-qwen3-vl-30b"]'), inputs.only || 'all')
+          && contains('test/registered/tpu/e2e/test_tpu_qwen3_vl_30b_a3b_pd_singlehost_mmmu.py', inputs.test_filter) }}
+    name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_qwen3_vl_30b)[0].name }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
-      display_name: test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload
-      # hosts feeds only the slice concurrency group; the P/D topology below
-      # sizes the JobSet (2-host prefill slice + 2-host decode slice).
-      hosts: 2
-      # The nightly lane is the only one owning two 2x2x2 slices, which is what
-      # a prefill engine and a decode engine need at the same time.
-      lane: nightly
-      pd_prefill_hosts: 2
-      pd_decode_hosts: 2
-      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload.py
-      # Names the dashboard row and the TIMINGS record; required in P/D mode.
-      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload.py
-      weights_pvc: model-weights
-      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_pc_offload)[0].run_name }}
-    permissions:
-      contents: read
-      id-token: write
-
-  # Not part of `all`: accuracy-test-tpu.yml's 5 PM slot runs this and the qwen3
-  # kvoff-reshard gate, which hold both 2-host slices for over an hour each.
-  pd-mh-gpt-120b-kvoff-reshard:
-    needs: [build, discover-tests]
-    if: >-
-      ${{ !cancelled() && needs.discover-tests.result == 'success'
-          && inputs.only == 'pd-mh-gpt-120b-kvoff-reshard'
-          && contains('test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_kv_offload_resharding.py', inputs.test_filter) }}
-    name: ${{ fromJSON(needs.discover-tests.outputs.pd_kvoff_reshard)[0].name }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      display_name: test_pd_kvoff_resharding
-      hosts: 2
-      lane: nightly
-      pd_prefill_hosts: 2
-      pd_decode_hosts: 2
-      exec_cmd: env MODEL_PROFILE=gpt_oss_120b python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_kv_offload_resharding.py
-      # Names the dashboard row and the TIMINGS record; required in P/D mode.
-      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_kv_offload_resharding.py
-      weights_pvc: model-weights
-      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_kvoff_reshard)[0].run_name }}
-    permissions:
-      contents: read
-      id-token: write
-
-  # One host per P/D engine isolates this gate from intra-engine multihost issues.
-  # Kueue queues it against other P/D jobs contending for the nightly lane.
-  pd-mh-qwen3-480b-kvoff-reshard:
-    needs: [build, discover-tests]
-    if: >-
-      ${{ !cancelled() && needs.discover-tests.result == 'success'
-          && inputs.only == 'pd-mh-qwen3-480b-kvoff-reshard'
-          && contains('test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py', inputs.test_filter) }}
-    name: ${{ fromJSON(needs.discover-tests.outputs.pd_kvoff_reshard_qwen)[0].name }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      display_name: test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding
-      hosts: 2
-      lane: nightly
-      pd_prefill_hosts: 2
-      pd_decode_hosts: 2
-      exec_cmd: env MODEL_PROFILE=qwen3_coder_480b python3 test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py
-      # Names the dashboard row and the TIMINGS record; required in P/D mode.
-      files: test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py
-      weights_pvc: model-weights
-      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_kvoff_reshard_qwen)[0].run_name }}
-    permissions:
-      contents: read
-      id-token: write
-
-  # One host per P/D engine isolates this gate from intra-engine multihost issues.
-  # Kueue queues it against other P/D jobs contending for the nightly lane.
-  pd-sh:
-    needs: [build, discover-tests]
-    if: >-
-      ${{ !cancelled() && needs.discover-tests.result == 'success'
-          && contains(fromJSON('["all","pd-sh-gpt-120b"]'), inputs.only || 'all')
-          && contains('test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py', inputs.test_filter) }}
-    name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost)[0].name }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      display_name: test_tpu_gpt_oss_120b_pd_singlehost
+      display_name: test_tpu_qwen3_vl_30b_a3b_pd_singlehost_mmmu
       lane: nightly
       hosts: 1
       pd_prefill_hosts: 1
       pd_decode_hosts: 1
-      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py integration
-      # Names the dashboard row and the TIMINGS record; required in P/D mode.
-      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_qwen3_vl_30b_a3b_pd_singlehost_mmmu.py integration
+      files: test/registered/tpu/e2e/test_tpu_qwen3_vl_30b_a3b_pd_singlehost_mmmu.py
       weights_pvc: model-weights
-      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost)[0].run_name }}
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_qwen3_vl_30b)[0].run_name }}
     permissions:
       contents: read
       id-token: write
 
-  # Keep the CI identifier compact: <category>-<topology>-<model>-<feature>.
-  # The full model and testcase remain visible in the dashboard file key.
-  pd-sh-gpt-120b-spec:
+  pd-mh-muse-dflash:
     needs: [build, discover-tests]
     if: >-
       ${{ !cancelled() && needs.discover-tests.result == 'success'
-          && contains(fromJSON('["all","pd-sh-gpt-120b-spec"]'), inputs.only || 'all')
-          && contains('test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py', inputs.test_filter) }}
-    name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_spec)[0].name }}
+          && (inputs.only || 'all') == 'all'
+          && contains('test/registered/e2e/tpu/test_tpu_muse_spark_pd_multihost_prefix_cache_kv_offload_dflash.py', inputs.test_filter) }}
+    name: test_tpu_muse_spark_pd_multihost_prefix_cache_kv_offload_dflash
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
-      display_name: test_tpu_gpt_oss_120b_pd_singlehost_spec
-      lane: nightly
-      hosts: 1
-      pd_prefill_hosts: 1
-      pd_decode_hosts: 1
-      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py integration
-      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py
-      weights_pvc: model-weights
-      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_spec)[0].run_name }}
-    permissions:
-      contents: read
-      id-token: write
-
-  # Decode-side radix cache on the raiden P/D pair: a returning turn reuses
-  # the response KV the decode engine holds, so only the suffix crosses the wire.
-  pd-sh-gpt-120b-decode-radix:
-    needs: [build, discover-tests]
-    if: >-
-      ${{ !cancelled() && needs.discover-tests.result == 'success'
-          && contains(fromJSON('["all","pd-sh-gpt-120b-decode-radix"]'), inputs.only || 'all') }}
-    name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_decode_radix)[0].name }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      display_name: test_tpu_gpt_oss_120b_pd_singlehost_decode_radix
-      lane: nightly
-      hosts: 1
-      pd_prefill_hosts: 1
-      pd_decode_hosts: 1
-      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py integration
-      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py
-      weights_pvc: model-weights
-      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_decode_radix)[0].run_name }}
-    permissions:
-      contents: read
-      id-token: write
-
-  # RAM KV offload on both engines: a conversation pushed out of HBM comes
-  # back from host RAM on prefill and decode with the device-resident output.
-  pd-sh-gpt-120b-offload:
-    needs: [build, discover-tests]
-    if: >-
-      ${{ !cancelled() && needs.discover-tests.result == 'success'
-          && contains(fromJSON('["all","pd-sh-gpt-120b-offload"]'), inputs.only || 'all')
-          && contains('test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload.py', inputs.test_filter) }}
-    name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_offload)[0].name }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      display_name: test_tpu_gpt_oss_120b_pd_singlehost_kv_offload
-      lane: nightly
-      hosts: 1
-      pd_prefill_hosts: 1
-      pd_decode_hosts: 1
-      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload.py integration
-      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload.py
-      weights_pvc: model-weights
-      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_offload)[0].run_name }}
-    permissions:
-      contents: read
-      id-token: write
-
-  # RAM KV offload on both engines with EAGLE3: a conversation pushed out of
-  # HBM comes back from host RAM on prefill and decode with spec still active.
-  pd-sh-gpt-120b-offload-spec:
-    needs: [build, discover-tests]
-    if: >-
-      ${{ !cancelled() && needs.discover-tests.result == 'success'
-          && contains(fromJSON('["all","pd-sh-gpt-120b-offload-spec"]'), inputs.only || 'all')
-          && contains('test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_spec.py', inputs.test_filter) }}
-    name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_offload_spec)[0].name }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      display_name: test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_spec
-      lane: nightly
-      hosts: 1
-      pd_prefill_hosts: 1
-      pd_decode_hosts: 1
-      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_spec.py integration
-      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_spec.py
-      weights_pvc: model-weights
-      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_offload_spec)[0].run_name }}
-    permissions:
-      contents: read
-      id-token: write
-
-  # Multihost P/D GSM8K accuracy test with 2 prefill and 2 decode hosts.
-  pd-mh:
-    needs: [build, discover-tests]
-    if: >-
-      ${{ !cancelled() && needs.discover-tests.result == 'success'
-          && contains(fromJSON('["all","pd-mh-gpt-120b"]'), inputs.only || 'all')
-          && contains('test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py', inputs.test_filter) }}
-    name: ${{ fromJSON(needs.discover-tests.outputs.pd_multihost)[0].name }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      display_name: test_tpu_gpt_oss_120b_pd_multihost
+      display_name: test_tpu_muse_spark_pd_multihost_prefix_cache_kv_offload_dflash
       lane: nightly
       hosts: 2
       pd_prefill_hosts: 2
       pd_decode_hosts: 2
-      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py integration
-      # Used for dashboard and timing records.
-      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py
+      exec_cmd: python3 test/registered/e2e/tpu/test_tpu_muse_spark_pd_multihost_prefix_cache_kv_offload_dflash.py
+      files: test/registered/e2e/tpu/test_tpu_muse_spark_pd_multihost_prefix_cache_kv_offload_dflash.py
       weights_pvc: model-weights
-      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_multihost)[0].run_name }}
-    permissions:
-      contents: read
-      id-token: write
-
-  # Multihost P/D with 2 prefill + 2 decode hosts, EAGLE3 spec + prefix caching.
-  pd-mh-spec:
-    needs: build
-    if: >-
-      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","pd-mh-gpt-120b-spec"]'), inputs.only || 'all')
-          && contains('test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py', inputs.test_filter) }}
-    name: pd-mh-gpt-120b-spec
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      display_name: test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k
-      lane: nightly
-      hosts: 2
-      pd_prefill_hosts: 2
-      pd_decode_hosts: 2
-      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py integration
-      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py
-      weights_pvc: model-weights
-      run_name: pd-mh-gpt-120b-spec
-    permissions:
-      contents: read
-      id-token: write
-
-  # Qwen3-VL-8B 2P+2D gate: the prefill owns the ViT, so the handoff carries
-  # image-derived KV into an EAGLE3 draft/verify decode loop. Scores MMMU-Pro.
-  pd-mh-qwen3-vl-8b-spec:
-    needs: build
-    if: >-
-      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","pd-mh-qwen3-vl-8b-spec"]'), inputs.only || 'all')
-          && contains('test/registered/tpu/e2e/test_tpu_qwen3_vl_8b_pd_multihost_eagle3.py', inputs.test_filter) }}
-    name: pd-mh-qwen3-vl-8b-spec
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      display_name: test_tpu_qwen3_vl_8b_pd_multihost_eagle3
-      lane: nightly
-      hosts: 2
-      pd_prefill_hosts: 2
-      pd_decode_hosts: 2
-      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_qwen3_vl_8b_pd_multihost_eagle3.py integration
-      files: test/registered/tpu/e2e/test_tpu_qwen3_vl_8b_pd_multihost_eagle3.py
-      weights_pvc: model-weights
-      run_name: pd-mh-qwen3-vl-8b-spec
-    permissions:
-      contents: read
-      id-token: write
-
-  # GPT-OSS-120B 2P+2D gate with prefix cache, Raiden KV offload, and EAGLE3 spec.
-  pd-mh-gpt-120b-pc-offload-spec:
-    needs: build
-    if: >-
-      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","pd-mh-gpt-120b-pc-offload-spec"]'), inputs.only || 'all')
-          && contains('test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py', inputs.test_filter) }}
-    name: pd-mh-gpt-120b-pc-offload-spec
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      display_name: test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec
-      lane: nightly
-      hosts: 2
-      pd_prefill_hosts: 2
-      pd_decode_hosts: 2
-      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py integration
-      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py
-      weights_pvc: model-weights
-      run_name: pd-mh-gpt-120b-pc-offload-spec
-    permissions:
-      contents: read
-      id-token: write
-
-  # tpu_dist collectives across a 2x2x2 slice. No server: exec mode, because the
-  # file spawns each host's ranks itself and a launch group runs it on rank 0 alone.
-  diffusion-mh-collectives:
-    needs: [build, discover-tests]
-    if: >-
-      ${{ !cancelled() && needs.discover-tests.result == 'success'
-          && contains(fromJSON('["all","diffusion-mh-collectives"]'), inputs.only || 'all')
-          && contains('test/registered/tpu/e2e/test_diffusion_tpu_multihost_collectives.py', inputs.test_filter) }}
-    name: ${{ fromJSON(needs.discover-tests.outputs.diffusion_mh_collectives)[0].name }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      display_name: test_diffusion_tpu_multihost_collectives
-      lane: nightly
-      hosts: 2
-      exec_cmd: python3 test/registered/tpu/e2e/test_diffusion_tpu_multihost_collectives.py
-      # Names the dashboard row and the TIMINGS record.
-      files: test/registered/tpu/e2e/test_diffusion_tpu_multihost_collectives.py
-      run_name: ${{ fromJSON(needs.discover-tests.outputs.diffusion_mh_collectives)[0].run_name }}
-    permissions:
-      contents: read
-      id-token: write
-
-  node-normalization:
-    needs: [build, discover-tests]
-    if: >-
-      ${{ !cancelled() && needs.discover-tests.result == 'success'
-          && contains(fromJSON('["all","node-normalization"]'), inputs.only || 'all')
-          && contains('test/registered/e2e/hardware_backend/tpu/test_node_normalization.py', inputs.test_filter) }}
-    name: ${{ fromJSON(needs.discover-tests.outputs.node_normalization)[0].name }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      display_name: test_node_normalization
-      lane: nightly
-      hosts: 2
-      exec_cmd: env JAX_PLATFORMS=cpu TORCH_TPU_TOPOLOGY=2,2,2,2 python3 test/registered/e2e/hardware_backend/tpu/test_node_normalization.py -v
-      files: test/registered/e2e/hardware_backend/tpu/test_node_normalization.py
-      run_name: ${{ fromJSON(needs.discover-tests.outputs.node_normalization)[0].run_name }}
-    permissions:
-      contents: read
-      id-token: write
-
-  # Issue #379: the row above plus heterogeneous attention TP, so the KV crosses
-  # Raiden's strided push-reshard instead of landing rank-for-rank. Its own file,
-  # so the symmetric gate stays untouched and the two differ in exactly the
-  # feature under test. Needs #592 (hybrid SWA under push-resharding) and #583
-  # (draft KV over the P/D transfer).
-  #
-  # run_name feeds the pod names, which JobSet caps at 63 chars including its
-  # own suffixes -- hence the abbreviation rather than the full job name.
-  pd-mh-gpt-120b-pc-offload-spec-reshard:
-    needs: build
-    if: >-
-      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","pd-mh-gpt-120b-pc-offload-spec-reshard"]'), inputs.only || 'all')
-          && contains('test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_reshard.py', inputs.test_filter) }}
-    name: pd-mh-gpt-120b-pc-offload-spec-reshard
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      display_name: test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_reshard
-      lane: nightly
-      hosts: 2
-      pd_prefill_hosts: 2
-      pd_decode_hosts: 2
-      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_reshard.py integration
-      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_reshard.py
-      weights_pvc: model-weights
-      run_name: pd-mh-gpt-120b-pcoff-spec-rs
+      run_name: pd-mh-muse-dflash
+      timeout_per_file: 14400
     permissions:
       contents: read
       id-token: write

@@ -19,8 +19,9 @@ MODEL_PATH = GEMMA4_26B_A4B["served_model_name"]
 GATE = {
     "dataset": "aime26",
     "label": "aime26",
+    "baseline": 0.85,  # measured on TPU
+    "atol": 0.12,
     "runner": make_runner(GEMMA4_26B_A4B, "aime26", n_repeats=4),
-    "report_only": True,
 }
 
 

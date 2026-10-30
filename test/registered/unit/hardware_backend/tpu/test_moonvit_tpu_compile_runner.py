@@ -5,14 +5,14 @@ from unittest.mock import MagicMock
 import torch
 from torch import nn
 
-from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.graph_runner.moonvit_tpu_compile_runner import (
+from sglang.test.ci.ci_register import register_tpu_ci
+from sglang_tpu.envs import envs
+from sglang_tpu.graph_runner.moonvit_tpu_compile_runner import (
     MoonVitTpuCompilePolicy,
     MoonVitTpuCompileRunner,
 )
-from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
 
 
 class _Block(nn.Module):

@@ -22,7 +22,7 @@ import numpy as np
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=240, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=240, suite="stage-a-test-tpu-unit", chips=1)
 
 # Standalone raw-JAX kernel test, not a TorchTPU runtime process: SGLang
 # platform discovery selects CPU-only JAX for export, so pick the physical
@@ -52,7 +52,7 @@ class TestKvLayoutEquivalence(unittest.TestCase):
     def _run(self, layout, *, num_q_heads, num_kv_heads, num_seqs, chunk, steps):
         import jax.numpy as jnp
 
-        from sglang.srt.layers.attention.pallas.batched_rpa import wrapper
+        from sglang_tpu.attention.pallas.batched_rpa import wrapper
 
         rng = np.random.default_rng(0)
         pages_per_seq = -(-(chunk + steps + self.PAGE_SIZE) // self.PAGE_SIZE)
@@ -119,7 +119,7 @@ class TestKvLayoutEquivalence(unittest.TestCase):
         return outs
 
     def _assert_layouts_agree(self, **kw):
-        from sglang.srt.layers.attention.pallas.batched_rpa import configs
+        from sglang_tpu.attention.pallas.batched_rpa import configs
 
         ref = self._run(configs.KVLayout.HEAD_ALONG_SUBLANE, **kw)
         got = self._run(configs.KVLayout.SEQ_ALONG_LANE, **kw)

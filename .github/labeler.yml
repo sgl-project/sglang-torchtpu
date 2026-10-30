@@ -94,7 +94,12 @@ npu:
 tpu:
   - changed-files:
     - any-glob-to-any-file:
+      - 'sglang_tpu/**'
       - 'python/sglang/srt/hardware_backend/tpu/**'
+      - 'python/sglang/srt/layers/attention/pallas/**'
+      - 'python/sglang/srt/layers/moe/pallas/**'
+      - 'python/sglang/srt/disaggregation/tpu/**'
+      - 'python/sglang/test/tpu/**'
       - 'python/sglang/multimodal_gen/runtime/platforms/tpu.py'
       - 'python/sglang/multimodal_gen/runtime/platforms/__init__.py'
       # Shared diffusion files carrying a TPU-only branch.
@@ -113,6 +118,11 @@ tpu:
       - 'docker/cloudbuild.tpu.yaml'
       - 'docker/cloudbuild.tpu-base.yaml'
       - 'test/registered/tpu/**'
+      - 'test/registered/unit/hardware_backend/tpu/**'
+      - 'test/registered/unit/layers/attention/pallas/**'
+      - 'test/registered/unit/layers/moe/pallas/**'
+      - 'test/registered/e2e/tpu/**'
+      - 'test/registered/e2e/hardware_backend/tpu/**'
       - '.github/tpu-ci/**'
       - '.github/workflows/_tpu-build.yml'
       - '.github/workflows/_tpu-test.yml'

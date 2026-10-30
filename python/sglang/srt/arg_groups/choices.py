@@ -95,6 +95,7 @@ ATTENTION_BACKEND_CHOICES = [
     "pallas_tpu_rpa_v3",
     "pallas_tpu_rpa_batched",
     "pallas_tpu_mla",
+    "pallas_tpu_mla_sparse",
     # Other platforms
     "intel_amx",
     "ascend",
@@ -136,6 +137,14 @@ DISAGG_TRANSFER_BACKEND_CHOICES = [
     "fake",
     "mori",
     "mooncake_tcp",
+]
+
+HICACHE_IO_BACKEND_CHOICES = [
+    "direct",
+    "kernel",
+    "kernel_ascend",
+    "torch_tpu",
+    "raiden",
 ]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
@@ -233,6 +242,8 @@ add_quantization_method_choices = QUANTIZATION_CHOICES.extend
 add_attention_backend_choices = ATTENTION_BACKEND_CHOICES.extend
 
 add_draft_attention_backend_choices = DRAFT_ATTENTION_BACKEND_CHOICES.extend
+
+add_hicache_io_backend_choices = HICACHE_IO_BACKEND_CHOICES.extend
 
 # Attention backends whose kernels read the chunked prefix-cache layout.
 # Out-of-tree platforms may extend this list (via

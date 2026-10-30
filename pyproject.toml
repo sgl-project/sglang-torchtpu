@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+# The out-of-tree TPU plugin. Installs next to the fork in python/:
+#     pip install -e python/ && pip install --no-deps -e .
+[build-system]
+requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sglang-tpu"
+dynamic = ["version"]
+description = "Out-of-tree TPU platform plugin for SGLang, backed by torch_tpu."
+readme = "sglang_tpu/README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+]
+# Not published to PyPI while the plugin still needs the fork tree.
+dependencies = ["sglang"]
+
+[project.entry-points."sglang.srt.platforms"]
+tpu_oot = "sglang_tpu:activate"
+
+[project.entry-points."sglang.srt.plugins"]
+tpu_oot_hooks = "sglang_tpu.hooks:register"
+
+[project.entry-points."sglang.multimodal_gen.platforms"]
+tpu_oot = "sglang_tpu.multimodal_gen:activate"
+
+[tool.setuptools.packages.find]
+include = ["sglang_tpu*"]
+
+[tool.setuptools.package-data]
+"sglang_tpu" = ["**/*.md"]
+
+[tool.setuptools_scm]
+# release-tpu.yml pins the version with SETUPTOOLS_SCM_PRETEND_VERSION so both
+# wheels in a release carry the same number. Builds without .git metadata
+# (the CI image copies the tree without it) fall back.
+fallback_version = "0.0.0.dev0"

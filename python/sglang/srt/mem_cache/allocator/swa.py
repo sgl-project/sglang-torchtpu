@@ -8,6 +8,7 @@ from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_npu, is_tpu
 from sglang.srt.utils.common import get_num_new_pages
 from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect
@@ -25,7 +26,7 @@ if _is_npu:
     )
 
 if _is_tpu:
-    from sglang.srt.hardware_backend.tpu.allocator_tpu import (
+    from sglang_tpu.allocator_tpu import (
         TpuPagedTokenToKVPoolAllocator,
     )
 
@@ -214,7 +215,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
-        if tree_cache is None or tree_cache.is_chunk_cache():
+        if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return
         full_shortfall = max(0, num_tokens - self.full_available_size())
         swa_shortfall = max(0, num_tokens - self.swa_available_size())
@@ -310,8 +311,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,  # last_loc for full layers
         extend_num_tokens: int,
         out_indices_cpu: Optional[torch.Tensor] = None,
+        return_host: bool = False,
     ):
         assert self.page_size > 1
+        # Opt-in: inner allocators return host indices for later padded upload.
+        host_kwargs = {"return_host": True} if return_host else {}
 
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
@@ -329,11 +333,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 last_loc,
                 extend_num_tokens,
                 num_new_pages=num_new_pages,
+                **host_kwargs,
             )
 
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
 
-        full_alloc_kwargs = {"num_new_pages": num_new_pages}
+        full_alloc_kwargs = {"num_new_pages": num_new_pages, **host_kwargs}
         if out_indices_cpu is not None:
             # TPU speculative decoding preallocates this host output buffer.
             # Only the full-attention locations are returned to the caller;
@@ -358,6 +363,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             swa_last_loc,
             extend_num_tokens,
             num_new_pages=num_new_pages,
+            **host_kwargs,
         )
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
@@ -450,27 +456,46 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,  # last_loc for full layers
+        out_indices_cpu: Optional[torch.Tensor] = None,
     ):
+        """``out_indices_cpu``: optional caller-owned host (bs,) buffer filled
+        with the returned full-attention locations. Requires a host-resident
+        ``last_loc`` and inner allocators that accept it (TPU)."""
         assert self.page_size > 1
+        full_alloc_kwargs = {}
+        if out_indices_cpu is not None:
+            full_alloc_kwargs["out_indices_cpu"] = out_indices_cpu
         if self._swa_req_ring:
             # See alloc_extend: slot-addressed ring, so full-attention KV only.
             return self.full_attn_allocator.alloc_decode(
-                seq_lens, seq_lens_cpu, last_loc
+                seq_lens, seq_lens_cpu, last_loc, **full_alloc_kwargs
             )
 
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
+        # Host copy of the SWA locations as well, so the mapping update below
+        # reads neither result back from the device.
+        swa_indices_cpu = None
+        swa_alloc_kwargs = {}
+        if out_indices_cpu is not None:
+            swa_indices_cpu = torch.empty_like(out_indices_cpu)
+            swa_alloc_kwargs["out_indices_cpu"] = swa_indices_cpu
 
         alloc_full_indices = self.full_attn_allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, last_loc
+            seq_lens, seq_lens_cpu, last_loc, **full_alloc_kwargs
         )
         alloc_swa_indices = self.swa_attn_allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, swa_last_loc
+            seq_lens, seq_lens_cpu, swa_last_loc, **swa_alloc_kwargs
         )
 
         if alloc_full_indices is None or alloc_swa_indices is None:
             return None
 
-        if _is_npu:
+        if out_indices_cpu is not None:
+            mapping = self.full_to_swa_index_mapping
+            mapping[out_indices_cpu.to(mapping.device, torch.int64)] = (
+                swa_indices_cpu.to(mapping.device, torch.int64)
+            )
+        elif _is_npu:
             indices_2d = alloc_full_indices.to(torch.int64).unsqueeze(-1)
             torch_npu.npu_scatter_nd_update_(
                 self.full_to_swa_index_mapping,
@@ -591,6 +616,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def _free_swa_pages(self, free_index: torch.Tensor, start_pos: int):
         ps = self.page_size
         assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
+        if current_platform.keeps_swa_index_mapping_on_host():
+            # The mapping is host-resident (see __init__), and so are the kv rows
+            # segment frees are cut from (the host-resident req_to_token table).
+            assert free_index.device.type == "cpu", (
+                "SWA segment frees need host indices; "
+                "SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=0 is not supported with SWA"
+            )
         full_page_representatives = free_index[::ps]
         # torch_npu's transfer_to_npu aliases Tensor.is_cuda to Tensor.is_npu.
         if not _is_npu and free_index.is_cuda:

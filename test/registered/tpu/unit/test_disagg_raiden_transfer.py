@@ -23,19 +23,32 @@ from __future__ import annotations
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit", chips=1)
 
+import os
+import sys
 import threading
+import types
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import torch
 from google.protobuf.wrappers_pb2 import Int64Value
 
+from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
-from sglang.srt.disaggregation.raiden.conn import RaidenKVManager
-from sglang.srt.disaggregation.raiden.serde import (
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.disaggregation.raiden.common import (
+    RaidenKVCacheGroups,
+    get_raiden_kv_caches,
+)
+from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
+from sglang_tpu.disaggregation.raiden.host_pool import StagingAdmission
+from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
     MessageTag,
@@ -46,15 +59,25 @@ from sglang.srt.disaggregation.raiden.serde import (
     ReshardReady,
     ReshardReq,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.mamba_pool import TpuMambaPool
 
 
 def _polled(sent=(), received=(), failed=(), completed_ns=None):
     """Fake poll_stats_with_details() result for the given req ids."""
 
     def settled(ids):
-        return [SimpleNamespace(req_id=r, completed_ns=completed_ns) for r in ids]
+        return [
+            SimpleNamespace(
+                req_id=r,
+                completed_ns=completed_ns,
+                code=None,
+                phase=None,
+                peer=None,
+                elapsed_ns=None,
+                reason=None,
+            )
+            for r in ids
+        ]
 
     return SimpleNamespace(
         sent=settled(sent), received=settled(received), failed=settled(failed)
@@ -208,6 +231,7 @@ class RaidenRendezvousTestCase(CustomTestCase):
             total_kv_head_num=8,
             sliding_window_size=None,
             engine_rank=attn_tp_rank,
+            state_types=[],
         )
         server_args = SimpleNamespace(context_length=1024)
 
@@ -216,6 +240,7 @@ class RaidenRendezvousTestCase(CustomTestCase):
         # decode heartbeat checker is stubbed the same way -- the stubbed
         # common init carries none of the fields its thread reads.
         with (
+            patch.dict(os.environ, {"SGLANG_RAIDEN_KV_PORT": "32000"}),
             patch.object(CommonKVManager, "__init__", _fake_common_init),
             patch.object(RaidenKVManager, "_listen", lambda self: None),
             patch.object(
@@ -223,8 +248,6 @@ class RaidenRendezvousTestCase(CustomTestCase):
             ),
         ):
             m = RaidenKVManager(kv_args, mode, server_args)
-
-        from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
 
         m._engine = _FakeRaidenEngine()
         m._full_engine_max_blocks = 256
@@ -609,6 +632,73 @@ class TestRaidenDecodeBookkeeping(RaidenRendezvousTestCase):
         blocks_frames = self.inboxes[decode.endpoint].take(MessageTag.BLOCKS)
         return prefill, decode, chunk_frames, blocks_frames
 
+    def _assert_layout_refused(self, decode, room):
+        self.assertIn(room, decode._aborted)
+        self.assertEqual(decode.request_status[room], KVPoll.Failed)
+        reason = decode.failure_records[room]
+        for text in ("SGLANG_TPU_USE_BLOCK_MAJOR_KV", "block-major", "per-layer"):
+            self.assertIn(text, reason)
+
+    def test_blocks_from_a_peer_in_the_other_kv_layout_fail_the_room(self):
+        """Peers in different KV layouts register rows of different sizes, so
+        the decode refuses the prefill's blocks instead of reading them; peers
+        in the same layout proceed."""
+        for prefill_layout, decode_layout, refused in (
+            ("block-major", "per-layer", True),
+            ("block-major", "block-major", False),
+        ):
+            with self.subTest(prefill=prefill_layout, decode=decode_layout):
+                prefill, decode = self._prefill(), self._decode()
+                prefill.kv_layout, decode.kv_layout = prefill_layout, decode_layout
+                room = 7210
+                decode.request_status[room] = KVPoll.WaitingForInput
+                decode.register_decode_request(
+                    room,
+                    [1, 2, 3],
+                    [],
+                    aux_index=None,
+                    bootstrap_infos=self._bootstrap_info(prefill),
+                )
+                prefill._on_pull_req(
+                    self.inboxes[prefill.endpoint].take(MessageTag.PULL_REQ)
+                )
+                prefill.append_send_blocks(room, [31, 32, 33])
+                prefill.finalize_send(room, aux_index=None)
+
+                decode._on_blocks(self.inboxes[decode.endpoint].take(MessageTag.BLOCKS))
+
+                if refused:
+                    self._assert_layout_refused(decode, room)
+                    self.assertNotIn(room, decode._decode.remote_blocks)
+                else:
+                    self.assertEqual(decode._decode.remote_blocks[room], [31, 32, 33])
+                    self.assertNotIn(room, decode._aborted)
+
+    def test_chunk_from_a_peer_in_the_other_kv_layout_starts_no_read(self):
+        """A chunked transfer announces pages before BLOCKS, so the layout is
+        checked on the first CHUNK, before any read is queued."""
+        room = 7211
+        prefill, decode = self._prefill(), self._decode()
+        prefill.kv_layout = "block-major"
+        decode.chunked_transfer = True
+        decode.request_status[room] = KVPoll.WaitingForInput
+        decode.register_decode_request(
+            room,
+            [101, 102, 103, 104],
+            [],
+            aux_index=None,
+            bootstrap_infos=self._bootstrap_info(prefill),
+        )
+        prefill._on_pull_req(self.inboxes[prefill.endpoint].take(MessageTag.PULL_REQ))
+        prefill.append_send_blocks(room, [11, 12])
+        prefill._announce_chunk(room, 0, [11, 12], total_pages=4)
+
+        decode._dispatch(self.inboxes[decode.endpoint].take(MessageTag.CHUNK))
+
+        self._assert_layout_refused(decode, room)
+        self.assertEqual(decode._decode.chunk_queue.get(room, []), [])
+        self.assertEqual(decode._engine.started, [])
+
     def test_duplicate_chunk_is_queued_once(self):
         """A CHUNK delivered twice must queue one read, not a second pull of
         the same pages."""
@@ -675,11 +765,381 @@ class TestRaidenDecodeBookkeeping(RaidenRendezvousTestCase):
         self.assertFalse(prefill.is_failed(room))
 
 
+def _fake_tpu_sync(engine_cls) -> dict:
+    """sys.modules entries that resolve raiden's deferred KVCacheManager import."""
+    api = types.ModuleType("tpu_sync.api.torch.kv_cache_manager")
+    api.KVCacheManager = engine_cls
+    return {
+        "tpu_sync": types.ModuleType("tpu_sync"),
+        "tpu_sync.api": types.ModuleType("tpu_sync.api"),
+        "tpu_sync.api.torch": types.ModuleType("tpu_sync.api.torch"),
+        "tpu_sync.api.torch.kv_cache_manager": api,
+    }
+
+
+def _mamba_state_indices(slot: int) -> list:
+    """state_indices as core builds them for a [MAMBA] state_types list."""
+    return [[np.array(slot)]]
+
+
+class RaidenStateTestCase(RaidenRendezvousTestCase):
+    """Managers with a GDN state engine; a slot's committed state is its own row."""
+
+    def _with_state(self, m):
+        m._state_engine = _FakeRaidenEngine()
+        m._state_engine_max_blocks = 1
+        m._committed_state_row = lambda slot: slot
+        m.state_raiden_endpoint = f"raiden-state://127.0.0.1:{m.rank_port}"
+        m.kv_args.state_types = [StateType.MAMBA]
+        m._pulling = StagingAdmission(256, None, 8)
+        return m
+
+    def _state_pair(self, *, chunked: bool = False):
+        prefill = self._with_state(self._prefill())
+        decode = self._with_state(self._decode())
+        prefill.chunked_transfer = decode.chunked_transfer = chunked
+        # Reads are issued from the poll so tests see each step.
+        decode._listener_start_read = False
+        return prefill, decode
+
+    def _hand_off(self, prefill, decode, room, *, local_blocks, prefill_slot=7):
+        """Drive the handshake up to the decode holding BLOCKS; decode slot 5."""
+        decode.register_decode_request(
+            room,
+            local_blocks,
+            [],
+            aux_index=None,
+            bootstrap_infos=self._bootstrap_info(prefill),
+            local_state_rows=decode._state_rows_from_state_indices(
+                _mamba_state_indices(5)
+            ),
+        )
+        prefill._on_pull_req(self.inboxes[prefill.endpoint].take(MessageTag.PULL_REQ))
+        prefill.append_send_blocks(
+            room,
+            [31, 32, 33],
+            state_block_ids=prefill._state_rows_from_state_indices(
+                _mamba_state_indices(prefill_slot)
+            ),
+        )
+        prefill.finalize_send(room, aux_index=None)
+        decode._on_blocks(self.inboxes[decode.endpoint].take(MessageTag.BLOCKS))
+
+
+class TestRaidenStateTransfer(RaidenStateTestCase):
+    def test_state_read_moves_each_sides_committed_row(self):
+        """Prefill slot 7 is row 7 and decode slot 5 is row 5, whatever the width."""
+        for chunked in (False, True):
+            with self.subTest(chunked=chunked):
+                prefill, decode = self._state_pair(chunked=chunked)
+                room = 7300 + chunked
+
+                self._hand_off(prefill, decode, room, local_blocks=[1, 2, 3])
+
+                self.assertEqual(
+                    prefill._state_engine.reads, [(f"state:{room}", room, [7])]
+                )
+                self.assertTrue(decode.maybe_start_pull(room))
+                self.assertEqual(
+                    [args for args, _ in decode._state_engine.started],
+                    [(f"state:{room}", room, prefill.state_raiden_endpoint, [7], [5])],
+                )
+                self.assertEqual(
+                    [args[0] for args, _ in decode._engine.started], [str(room)]
+                )
+
+    def test_full_prefix_hit_still_moves_state(self):
+        for chunked in (False, True):
+            with self.subTest(chunked=chunked):
+                prefill, decode = self._state_pair(chunked=chunked)
+                room = 7310 + chunked
+
+                self._hand_off(prefill, decode, room, local_blocks=[])
+
+                self.assertEqual(
+                    [r[0] for r in prefill._engine.reads + prefill._state_engine.reads],
+                    [f"state:{room}"],
+                )
+                self.assertTrue(decode.maybe_start_pull(room))
+                self.assertEqual(decode._engine.started, [])
+                self.assertEqual(
+                    [args for args, _ in decode._state_engine.started],
+                    [(f"state:{room}", room, prefill.state_raiden_endpoint, [7], [5])],
+                )
+                # Polling again must not issue the read twice.
+                self.assertTrue(decode.maybe_start_pull(room))
+                self.assertEqual(len(decode._state_engine.started), 1)
+                self.assertFalse(decode.is_recv_done(room))
+                decode._state_engine._stats = ([], [f"state:{room}"], [])
+                decode._drain_engine()
+                self.assertTrue(decode.is_recv_done(room))
+
+    def test_send_completes_only_once_the_state_read_is_served(self):
+        prefill, decode = self._state_pair()
+        room = 7320
+        self._hand_off(prefill, decode, room, local_blocks=[1, 2, 3])
+
+        prefill._engine._stats = ([str(room)], [], [], 1_000_000_000)
+        prefill._drain_engine()
+        self.assertFalse(prefill.is_send_done(room))
+        self.assertTrue(prefill.sender_has_active_io(room))
+
+        prefill._state_engine._stats = ([f"state:{room}"], [], [], 2_000_000_000)
+        prefill._drain_engine()
+        self.assertTrue(prefill.is_send_done(room))
+        self.assertFalse(prefill.sender_has_active_io(room))
+        self.assertEqual(prefill.send_done_time(room), 2.0)
+
+    def test_receive_completes_only_once_the_state_read_lands(self):
+        prefill, decode = self._state_pair()
+        room = 7321
+        self._hand_off(prefill, decode, room, local_blocks=[1, 2, 3])
+        self.assertTrue(decode.maybe_start_pull(room))
+
+        decode._engine._stats = ([], [str(room)], [])
+        decode._drain_engine()
+        self.assertFalse(decode.is_recv_done(room))
+        self.assertTrue(decode.room_has_active_io(room))
+        self.assertEqual(decode._pulling.state_pages(), 1)
+
+        decode._state_engine._stats = ([], [f"state:{room}"], [])
+        decode._drain_engine()
+        self.assertTrue(decode.is_recv_done(room))
+        self.assertFalse(decode.room_has_active_io(room))
+        self.assertEqual(len(decode._pulling), 0)
+
+    def test_failed_state_read_fails_the_room(self):
+        prefill, decode = self._state_pair()
+        room = 7322
+        # send_metadata opens the room; only a live room keeps its failure reason.
+        decode.request_status[room] = KVPoll.WaitingForInput
+        self._hand_off(prefill, decode, room, local_blocks=[1, 2, 3])
+        self.assertTrue(decode.maybe_start_pull(room))
+        self.assertEqual(RaidenKVManager._room_of(f"state:{room}"), room)
+
+        decode._state_engine._stats = ([], [], [f"state:{room}"])
+        decode._drain_engine()
+
+        self.assertTrue(decode.is_failed(room))
+        self.assertIn(f"state:{room}", decode.failure_records[room])
+        # The full read still holds the room's staging.
+        self.assertTrue(decode.room_has_active_io(room))
+
+    def test_clearing_a_room_holds_its_state_read_until_it_settles(self):
+        prefill, decode = self._state_pair()
+        room = 7323
+        self._hand_off(prefill, decode, room, local_blocks=[1, 2, 3])
+        self.assertTrue(decode.maybe_start_pull(room))
+        decode._engine._stats = ([], [str(room)], [])
+        decode._drain_engine()
+
+        decode.clear_room(room)
+        self.assertTrue(decode.room_has_active_io(room))
+        self.assertNotIn(room, decode._decode.remote_state_rows)
+        self.assertNotIn(room, decode._decode.local_state_rows)
+
+        decode._state_engine._stats = ([], [f"state:{room}"], [])
+        decode._drain_engine()
+        self.assertEqual(len(decode._pulling), 0)
+        self.assertFalse(decode.room_has_active_io(room))
+        self.assertEqual(decode._completed_recv, set())
+
+        prefill.clear_room(room)
+        self.assertNotIn(room, prefill._prefill.send_state_rows)
+
+    def test_push_resharding_with_state_fails_closed(self):
+        prefill, decode = self._state_pair()
+        infos = self._bootstrap_info(prefill) * 2
+        with self.assertRaisesRegex(NotImplementedError, "GDN"):
+            decode.register_decode_request(
+                7330, [1], [], aux_index=None, bootstrap_infos=infos
+            )
+        with self.assertRaisesRegex(NotImplementedError, "GDN"):
+            prefill._on_reshard_req(
+                ReshardReq(
+                    room=7330,
+                    decode_ip="127.0.0.1",
+                    decode_port=decode.rank_port,
+                    push_endpoint="tcp://push",
+                    decode_blocks=[1],
+                    dst_attn_tp=1,
+                    decode_swa_blocks=[],
+                    swa_push_endpoint="",
+                ).to_frames()
+            )
+
+    def test_pipeline_transfer_with_state_fails_closed(self):
+        decode = self._decode()
+        decode._pipeline_enabled = True
+        groups = RaidenKVCacheGroups(
+            full=[torch.zeros(4, 2)],
+            swa=[],
+            state=[torch.zeros(3, 2)],
+            committed_state_row=lambda slot: slot,
+        )
+        with self.assertRaisesRegex(NotImplementedError, "GDN"):
+            decode.set_kv_caches(groups)
+
+
+class TestRaidenStateEngine(RaidenRendezvousTestCase):
+    def _build(self, *, attn_tp_rank, swa, state):
+        m = self._prefill(attn_tp_rank=attn_tp_rank, attn_tp_size=2)
+        built = []
+
+        class Engine:
+            def __init__(self, **kwargs):
+                built.append(kwargs)
+
+        m._engine = None
+        m._kv_caches = [torch.zeros(9, 4)]
+        m._swa_kv_caches = [torch.zeros(5, 4)] if swa else []
+        m._state_kv_caches = (torch.zeros(6, 3), torch.zeros(6, 7)) if state else ()
+        m._max_request_blocks = lambda: 8
+        m._swa_max_request_blocks = lambda: 2
+        m._num_slots = lambda kv_caches, max_blocks, engines=1, **_: 10 * engines
+        with patch.dict(sys.modules, _fake_tpu_sync(Engine)):
+            m._build_engine()
+        return m, built
+
+    def test_state_engine_is_built_only_with_state_tensors(self):
+        m, built = self._build(attn_tp_rank=0, swa=False, state=False)
+        self.assertEqual(len(built), 1)
+        self.assertIsNone(m._state_engine)
+        self.assertIsNone(m._pulling.state_capacity)
+
+        m, built = self._build(attn_tp_rank=0, swa=False, state=True)
+        self.assertEqual(len(built), 2)
+        state = built[1]
+        self.assertEqual([t.shape[0] for t in state["kv_caches"]], [6, 6])
+        self.assertEqual((state["max_blocks"], state["num_slots"]), (1, 20))
+        self.assertIsNotNone(m._state_engine)
+        self.assertEqual(m._state_engine_max_blocks, 1)
+        self.assertEqual(m._pulling.state_capacity, 20)
+
+    def test_each_rank_reserves_six_ports(self):
+        """Full, SWA and state engines at +0/+2/+4 of base + 6*local_rank."""
+        m, built = self._build(attn_tp_rank=1, swa=True, state=True)
+        self.assertEqual(m._control_port, 32006)
+        self.assertEqual(
+            [kw["local_control_port"] for kw in built], [32006, 32008, 32010]
+        )
+        self.assertEqual(m.raiden_endpoint, "127.0.0.1:32006")
+        self.assertEqual(m.swa_raiden_endpoint, "127.0.0.1:32008")
+        self.assertEqual(m.state_raiden_endpoint, "127.0.0.1:32010")
+
+
+class TestRaidenBlockMajorEngine(RaidenRendezvousTestCase):
+    """A block-major pool hands each engine one bundle, staged at the per-layer price."""
+
+    @staticmethod
+    def _pool(pool_cls):
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        return SWAKVPool(
+            size=32,
+            size_swa=16,
+            page_size=4,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=128,
+            swa_attention_layer_ids=[0, 2, 4],
+            full_attention_layer_ids=[1, 3, 5],
+            device="cpu",
+            token_to_kv_pool_class=pool_cls,
+        )
+
+    def test_each_engine_registers_one_bundle(self):
+        from sglang_tpu.disaggregation.raiden.host_pool import slot_host_bytes
+        from sglang_tpu.kv_pool import (
+            TpuBlockMajorMHATokenToKVPool,
+            TpuFusedMHATokenToKVPool,
+        )
+
+        pool = self._pool(TpuBlockMajorMHATokenToKVPool)
+        bundles = get_raiden_kv_caches(pool)
+        layers = get_raiden_kv_caches(self._pool(TpuFusedMHATokenToKVPool))
+        m = self._prefill()
+        built = []
+
+        class Engine:
+            def __init__(self, **kwargs):
+                built.append(kwargs)
+
+        m._engine = None
+        m._max_request_blocks = lambda: 8
+        m._swa_max_request_blocks = lambda: 2
+        m._num_slots = lambda kv_caches, max_blocks, engines=1, **_: 10
+        with (
+            patch.dict(sys.modules, _fake_tpu_sync(Engine)),
+            self.assertLogs("sglang_tpu.disaggregation.raiden.conn", "INFO") as logs,
+        ):
+            m.set_kv_caches(bundles)
+
+        self.assertTrue(m.chunked_transfer)
+        engine_lines = [line for line in logs.output if "engine up" in line]
+        self.assertEqual(len(engine_lines), 2)
+        self.assertTrue(all("kv_tensors=1 " in line for line in engine_lines))
+        self.assertEqual([len(kw["kv_caches"]) for kw in built], [1, 1])
+        self.assertIs(built[0]["kv_caches"][0], pool.full_kv_pool.kv_bundle)
+        self.assertIs(built[1]["kv_caches"][0], pool.swa_kv_pool.kv_bundle)
+        for bundle, per_layer, max_blocks in (
+            (bundles.full, layers.full, 8),
+            (bundles.swa, layers.swa, 2),
+        ):
+            self.assertEqual(
+                slot_host_bytes(bundle, max_blocks),
+                slot_host_bytes(per_layer, max_blocks),
+            )
+
+
+class TestRaidenStateGroups(CustomTestCase):
+    def _hybrid_pool(self, *, mamba_pool):
+        pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
+        pool.start_layer = 0
+        pool.full_attention_layer_id_mapping = {3: 0, 7: 1}
+        kv = {3: torch.zeros(9, 2), 7: torch.zeros(9, 2)}
+        pool.get_fused_kv_buffer = lambda layer_id: kv[layer_id]
+        pool.mamba_pool = mamba_pool
+        return pool, kv
+
+    def test_linear_attention_pool_contributes_its_state(self):
+        mamba = TpuMambaPool.__new__(TpuMambaPool)
+        mamba.checkpoint_width = 3
+        state = [torch.zeros(12, 2, 1, 4), torch.zeros(12, 4, 2, 2)]
+        mamba.get_state = lambda: state
+        pool, kv = self._hybrid_pool(mamba_pool=mamba)
+
+        groups = get_raiden_kv_caches(pool)
+
+        self.assertEqual(groups.full, [kv[3], kv[7]])
+        self.assertEqual(groups.full_layer_ids, [3, 7])
+        self.assertEqual(groups.state, state)
+        self.assertEqual(groups.committed_state_row(2), 2)
+
+    def test_non_tpu_mamba_pool_contributes_no_state(self):
+        pool, _ = self._hybrid_pool(mamba_pool=object())
+
+        groups = get_raiden_kv_caches(pool)
+
+        self.assertEqual(groups.state, [])
+        self.assertIsNone(groups.committed_state_row)
+
+    def test_state_tensors_must_share_one_row_count(self):
+        mamba = TpuMambaPool.__new__(TpuMambaPool)
+        mamba.checkpoint_width = 1
+        mamba.get_state = lambda: [torch.zeros(4, 2), torch.zeros(5, 2)]
+        pool, _ = self._hybrid_pool(mamba_pool=mamba)
+
+        with self.assertRaisesRegex(RuntimeError, "uniform GDN state"):
+            get_raiden_kv_caches(pool)
+
+
 class TestRaidenMessageValidation(CustomTestCase):
     def test_all_message_types_round_trip(self):
         messages = [
             PullReq(1, "127.0.0.1", 1234, 2),
             Blocks(1, [2, 3], "tcp://kv", [4], "tcp://swa", b"aux"),
+            Blocks(1, [2], "tcp://kv", [], "", b"", [8], "tcp://state"),
             Chunk(1, "req", 2, 0, 2, [3, 4], "tcp://kv"),
             ReshardReq(
                 room=1,

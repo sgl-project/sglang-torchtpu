@@ -27,7 +27,10 @@ from sglang.srt.disaggregation import prefill
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.prefill_early_send import (
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.prefill_early_send import (
     _collect_prefill_write_page_ids,
     _find_safe_prefix_send_end,
     tpu_clip_cached_prefix_send_end,
@@ -35,9 +38,6 @@ from sglang.srt.hardware_backend.tpu.prefill_early_send import (
     tpu_hicache_load_page_ids,
     tpu_update_inflight_kv_write_pages,
 )
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -124,28 +124,32 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.gracefully_exit = False
         self.kv_checksum_computer = None
         self.kv_free_fence = None
+        self._deferred_input_requests = []
         self.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=PAGE_SIZE, translate_kv_indices_for_transfer=lambda kv: kv
         )
         self.req_to_token_pool = SimpleNamespace(
             req_to_token=torch.zeros((8, num_slots), dtype=torch.int32)
         )
+        self.tree_cache = SimpleNamespace(supports_prefix_sharing=lambda: True)
         self.tpu_inflight_kv_write_page_ids: Optional[torch.Tensor] = None
 
 
 def _req(rid: str, pool_idx: int, sender, input_len: int, prefix_indices=None):
+    if prefix_indices is None:
+        prefix_indices = torch.empty(0, dtype=torch.int64)
     return SimpleNamespace(
         rid=rid,
-        kv=SimpleNamespace(req_pool_idx=pool_idx),
-        origin_input_ids=list(range(input_len)),
-        prefix_indices=(
-            torch.empty(0, dtype=torch.int64)
-            if prefix_indices is None
-            else prefix_indices
+        # The matched prefix is tree-owned from admission on.
+        kv=SimpleNamespace(
+            req_pool_idx=pool_idx, cache_protected_len=len(prefix_indices)
         ),
+        origin_input_ids=list(range(input_len)),
+        prefix_indices=prefix_indices,
         host_hit_length=0,
         start_send_idx=0,
         pending_bootstrap=False,
+        skip_radix_cache_insert=False,
         early_send_prefix_end=None,
         extend_range=None,
         disagg_kv_sender=sender,
@@ -229,6 +233,7 @@ class _Harness:
         req.prefix_indices = self.s.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :upto
         ].to(torch.int64)
+        req.kv.cache_protected_len = upto
 
     def sends_of(self, rid: str) -> List[List[int]]:
         return [pages for r, pages, _ in self.log if r == rid]
@@ -270,6 +275,7 @@ def _scenario(harness: _Harness) -> Dict[str, object]:
     step1 = [(r, p) for r, p, _ in harness.log[n_before:]]
 
     harness.cache_chunk(a, 16)
+    harness.cache_chunk(b, 12)
     c = _req(
         "C",
         3,
@@ -284,6 +290,8 @@ def _scenario(harness: _Harness) -> Dict[str, object]:
     harness.step([a, c])
     step2 = [(r, p) for r, p, _ in harness.log[n_before:]]
 
+    harness.cache_chunk(a, 20)
+    harness.cache_chunk(c, 18)
     n_before = len(harness.log)
     harness.step(None)
     step3 = [(r, p) for r, p, _ in harness.log[n_before:]]
@@ -335,6 +343,64 @@ class TestEarlySendAvoidsInflightWrites(CustomTestCase):
         ):
             sent = [p for pages in harness.sends_of(rid) for p in pages]
             self.assertEqual(sent, expected, rid)
+
+
+class TestSendStaysWithinProtectedPrefix(CustomTestCase):
+    """A non-final send stops at cache_protected_len: positions a checkpoint
+    left unpublished can be freed by the next one while a transfer lists them."""
+
+    def _scheduler(self, *, prefix_sharing: bool = True):
+        s = _Scheduler(enable_overlap=True)
+        s.tree_cache = SimpleNamespace(supports_prefix_sharing=lambda: prefix_sharing)
+        return s
+
+    def test_pages_past_the_protected_prefix_wait_for_the_next_send(self):
+        s = self._scheduler()
+        harness = _Harness(s)
+        req = _req("A", 1, harness.sender("A"), input_len=24)
+        harness.write_chunk(req, 0, 16, [1, 2, 3, 4])
+        # The checkpoint of chunk [0, 16) published only [0, 8).
+        harness.cache_chunk(req, 8)
+        with _platform(is_tpu=True):
+            s.send_kv_chunk(req, last_chunk=False, end_idx=16)
+            self.assertEqual(harness.sends_of("A"), [[1, 2]])
+            self.assertEqual(req.start_send_idx, 8)
+
+            # Once the tree holds [0, 24), the rest goes with the next send.
+            harness.write_chunk(req, 16, 24, [5, 6])
+            harness.cache_chunk(req, 24)
+            s.send_kv_chunk(req, last_chunk=False, end_idx=24)
+            self.assertEqual(harness.sends_of("A"), [[1, 2], [3, 4, 5, 6]])
+            self.assertEqual(req.start_send_idx, 24)
+
+    def test_nothing_is_sent_while_the_protected_prefix_does_not_grow(self):
+        s = self._scheduler()
+        harness = _Harness(s)
+        req = _req("A", 1, harness.sender("A"), input_len=16)
+        harness.write_chunk(req, 0, 8, [1, 2])
+        harness.cache_chunk(req, 8)
+        harness.write_chunk(req, 8, 16, [3, 4])
+        with _platform(is_tpu=True):
+            s.send_kv_chunk(req, last_chunk=False, end_idx=8)
+            s.send_kv_chunk(req, last_chunk=False, end_idx=16)
+        self.assertEqual(harness.sends_of("A"), [[1, 2]])
+        self.assertEqual(req.start_send_idx, 8)
+
+    def test_final_send_and_unshared_trees_send_the_whole_range(self):
+        for prefix_sharing, last_chunk in ((True, True), (False, False)):
+            with self.subTest(prefix_sharing=prefix_sharing, last_chunk=last_chunk):
+                s = self._scheduler(prefix_sharing=prefix_sharing)
+                s.disagg_metadata_buffers = SimpleNamespace(set_buf=lambda req: None)
+                s.disagg_prefill_bootstrap_queue = SimpleNamespace(
+                    kv_manager=SimpleNamespace(kv_args=SimpleNamespace(state_types=()))
+                )
+                harness = _Harness(s)
+                req = _req("A", 1, harness.sender("A"), input_len=16)
+                harness.write_chunk(req, 0, 16, [1, 2, 3, 4])
+                harness.cache_chunk(req, 8)
+                with _platform(is_tpu=True):
+                    s.send_kv_chunk(req, last_chunk=last_chunk, end_idx=16)
+                self.assertEqual(harness.sends_of("A"), [[1, 2, 3, 4]])
 
 
 class TestFindSafePrefixSendEnd(CustomTestCase):
@@ -642,6 +708,7 @@ class TestEarlySendSkipsHiCacheLoadPages(CustomTestCase):
                 [1, 2, 3, 4]
             ).to(torch.int32)
             req.prefix_indices = _slots([1, 2, 3, 4])
+            req.kv.cache_protected_len = 16
         a.host_hit_length = 2 * PAGE_SIZE
         batch = SimpleNamespace(
             reqs=[a, b],
@@ -659,8 +726,9 @@ class TestEarlySendSkipsHiCacheLoadPages(CustomTestCase):
         early = [(r, p) for r, p, _ in harness.log]
         harness.device.land()
         with _platform(is_tpu=True):
-            # Each request's send after its forward.
+            # Each request's checkpoint and send after its forward.
             for req in (a, b):
+                harness.cache_chunk(req, 20)
                 s.send_kv_chunk(req, last_chunk=False, end_idx=20)
         return harness, early
 

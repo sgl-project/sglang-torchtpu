@@ -17,8 +17,10 @@ warmup_buckets.py    # request-sender used by warmup.sh
 ## Usage
 
 The Python launcher (`python -m benchmark.tpu.launch_server --config ...`)
-preserves hardware metadata such as `TPU_TOPOLOGY`. For one-host-per-engine P/D,
-it removes cross-host rendezvous settings so each engine initializes locally.
+runs a per-model recipe; [`recipe/README.md`](recipe/README.md) is the index of
+them and the config format. It preserves hardware metadata such as
+`TPU_TOPOLOGY`. For one-host-per-engine P/D, it removes cross-host rendezvous
+settings so each engine initializes locally.
 The shared serving recipes include the shell launcher's diagnostic, telemetry,
 recompilation logging, and online Hugging Face defaults. Override them with
 `--runtime-envs`, for example `'{"HF_HUB_OFFLINE":"1","TRANSFORMERS_OFFLINE":"1"}'`.
@@ -28,7 +30,11 @@ cache to `torchtpu_<model-slug>` and tier-3 to
 `$HOME/.cache/torch_tpu_compile_cache`, with local backup enabled. Explicit
 `TORCH_TPU_INTERNAL_TIER*` settings take precedence; `runtime_envs` entries set
 to `null` remove those variables. `ENABLE_COMPILE_CACHE=0` suppresses the cache
-defaults. Cache directories are created only for a real launch, not a dry-run.
+defaults and sets `TORCH_TPU_TIER2_COMPILATION_CACHE=disabled` (unless already
+set): with no tier-2 name, torch_tpu otherwise falls back to an implicit
+`/dev/shm/torch_tpu_cache/default` tier-2 cache whenever `WORLD_SIZE > 1`.
+Both launchers behave the same way. Cache directories are created only for a
+real launch, not a dry-run.
 
 Run launch and bench in separate shells; set `MODEL` for both.
 
@@ -157,9 +163,9 @@ for those layers; the stages hand their activations (hidden states and
 residual summed into one buffer, padded to the largest token bucket under
 `--enable-torch-compile`) to the next stage over ICI, as one `jax.lax.ppermute`
 collective-permute ring per iteration (`pp_wave.py`), and the last stage
-samples. Each stage logs `pipeline wave stage r/N: hand-off cycle over devices
-[...]` once at startup; the gloo `cpu_group` carries only the last stage's
-output dict and control traffic.
+samples. At startup each device logs
+`pipeline wave stage r/N column c/K: hand-off cycles (...)`; the gloo
+`cpu_group` carries only the last stage's output dict and control traffic.
 Set `--pp-max-micro-batch-size` so that `max_running_requests /
 pp_max_micro_batch_size >= pp_size`: the pipeline is full only when at least
 one microbatch per stage is in flight (the default is `max_running_requests /
@@ -182,9 +188,11 @@ Supported: chunked prefill, `--kv-cache-dtype fp8_e4m3`, `--max-total-tokens`
 holds one prefill chunk per pipeline slot on top of `--swa-full-tokens-ratio`).
 Rejected at launch with `--pp-size > 1` on TPU: eager mode (without
 `--enable-torch-compile`),
-`--tp-size > 1` (a pipeline stage is one device), speculative decoding, and
-`--enable-dynamic-chunking`. Input (prompt) logprobs are rejected per request.
-`--ep-size` and `--dp-size` have not been run with pipeline parallelism on
+`--tp-size > 1` unless a stage is a tensor-parallel pair or one
+context-parallel group (as below), speculative decoding, `--dcp-size > 1`,
+and `--enable-dynamic-chunking`.
+Input (prompt) logprobs are rejected per request.
+`--dp-size` has not been run with pipeline parallelism on
 TPU. Overlap scheduling is switched off by pipeline parallelism itself. A
 stage waiting for the previous stage looks idle to the watchdog, so pass
 `--watchdog-timeout` at least `pp_size` times the longest microbatch.
@@ -194,6 +202,38 @@ torch.compile warmup doesn't yet cover all compile-shape buckets:
 
 ```bash
 MODEL=Qwen/Qwen3-32B ./warmup.sh
+```
+
+### Context-parallel stages (PP4 x PCP2)
+
+Requires `--tp-size` equal to `--attn-cp-size`, one host, a bf16 KV cache, and a
+torch_tpu with standalone process subgroups, so that a stage's collectives run
+on the stage's devices only.
+
+```bash
+MODEL=openai/gpt-oss-120b QUANTIZATION=unquant KV_CACHE_DTYPE=bfloat16 \
+TP_SIZE=2 PP_SIZE=4 PP_MAX_MICRO_BATCH_SIZE=4 \
+ATTENTION_BACKEND=pallas_tpu_rpa_batched PAGE_SIZE=256 CONTEXT_LEN=33000 CONC=64 \
+CHUNKED_PREFILL_SIZE=16384 MAX_PREFILL_TOKENS=16384 \
+MAX_TOTAL_TOKENS=524288 MEM_FRACTION_STATIC=0.8 \
+EXTRA_ARGS="--attn-cp-size 2 --enable-prefill-cp --cp-strategy zigzag --moe-dp-size 2 --watchdog-timeout 3600" \
+./launch_server.sh
+```
+
+### Tensor-parallel stages (PP4 x TP2)
+
+`--tp-size 2` with `--attn-cp-size 1` makes each stage a tensor-parallel pair
+that shards the stage's heads and expert weights (no DP attention or
+`--ep-size`); it needs the same torch_tpu as the context-parallel stages.
+
+```bash
+MODEL=openai/gpt-oss-120b QUANTIZATION=unquant SGLANG_TPU_FUSED_MOE_SC_GATHER=0 \
+TP_SIZE=2 PP_SIZE=4 PP_MAX_MICRO_BATCH_SIZE=4 KV_CACHE_DTYPE=bfloat16 \
+ATTENTION_BACKEND=pallas_tpu_rpa_batched PAGE_SIZE=256 CONTEXT_LEN=33000 CONC=64 \
+CHUNKED_PREFILL_SIZE=16384 MAX_PREFILL_TOKENS=16384 MAX_TOTAL_TOKENS=524288 \
+TPU_COMPILE_TOKENS="2048 4096 8192 16384" \
+EXTRA_ARGS="--sampling-backend pytorch --watchdog-timeout 3600" \
+./launch_server.sh
 ```
 
 ### Prefill chunk sizing

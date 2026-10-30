@@ -3,27 +3,50 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 """
 
 import asyncio
+import contextlib
+import functools
 import ipaddress
 import logging
+import math
 import random
 import urllib
 import warnings
 from http import HTTPStatus
 from itertools import chain
-from typing import Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 import aiohttp
 import orjson
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
-from sglang_router.router_args import RouterArgs
+from sglang_router.mini_lb_policy import (
+    EngineOverloaded,
+    LoadPoller,
+    SessionAffinityPolicy,
+)
+from sglang_router.router_args import MINI_LB_POLICY_CHOICES, RouterArgs
 
 logger = logging.getLogger(__name__)
+
+_CONNECT_TIMEOUT_SECS = 10.0
 
 AIOHTTP_STREAM_READ_CHUNK_SIZE = (
     1024 * 64
 )  # 64KB, to prevent aiohttp's "Chunk too big" error
+
+# A server's /health and /health_generate run a one-token generation by default
+# and give up after SGLANG_HEALTH_CHECK_TIMEOUT (20 s by default) with a 503;
+# wait a little longer so the server's own answer arrives.
+HEALTH_CHECK_TIMEOUT_SECS = 30
+
+# The background health probe that decides which backends receive traffic
+# always GETs this path with HEALTH_CHECK_TIMEOUT_SECS. It ignores
+# --health-check-endpoint and --health-check-timeout-secs: their defaults
+# (/health, 5 s) suit the Rust gateway, but on a TPU engine /health can skip
+# the generation (SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0) and a 5 s timeout
+# would mark a server unhealthy before its own 20 s check answers.
+HEALTH_PROBE_PATH = "/health_generate"
 
 # How long a completed stream waits, in the background, for the prefill to end
 # its own response before the connection to it is closed anyway.
@@ -65,7 +88,66 @@ def maybe_wrap_ipv6_address(address: str) -> str:
         return address
 
 
+class _UpstreamConnectionError(aiohttp.ClientConnectionError):
+    """A connection failure recorded in the affinity load table."""
+
+
+def _health_poll_interval_secs(router_args: RouterArgs) -> Optional[float]:
+    """Seconds between health probes, or None for --disable-health-check."""
+    if router_args.disable_health_check:
+        return None
+    interval = router_args.health_check_interval_secs
+    if not (math.isfinite(interval) and interval > 0):
+        raise ValueError(
+            "--health-check-interval-secs must be a finite number > 0, "
+            f"got {interval!r} (use --disable-health-check to turn probes off)"
+        )
+    return interval
+
+
+class _BackendHealth:
+    """Which backends failed their last health probe.
+
+    A backend that has not been probed since it was last (re)registered counts
+    as healthy.
+    """
+
+    def __init__(self):
+        self.unhealthy: Set[str] = set()
+        # Roles routing past unhealthy backends because none is healthy.
+        self.roles_failing_open: Set[str] = set()
+        # Bumped when a backend is (re)registered or removed, so a probe that
+        # started before that change can tell its result is stale.
+        self._epochs: Dict[str, int] = {}
+
+    def epoch(self, url: str) -> int:
+        return self._epochs.get(url, 0)
+
+    def forget(self, url: str) -> None:
+        self.unhealthy.discard(url)
+        self._epochs[url] = self.epoch(url) + 1
+
+
+async def _probe_status(
+    session: aiohttp.ClientSession, server: str, path: str
+) -> Tuple[Optional[int], Optional[str]]:
+    """GET `path` on `server`; return (status, None) or (None, error)."""
+    try:
+        async with session.get(f"{server}{path}") as response:
+            return response.status, None
+    except asyncio.TimeoutError:
+        return None, f"no answer in {HEALTH_CHECK_TIMEOUT_SECS} s"
+    except aiohttp.ClientError as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
 class MiniLoadBalancer:
+    """Debug P/D router with opt-in prefill affinity and sampled load placement.
+
+    Routing skips backends whose last /health_generate probe failed. A backend
+    that has not been probed yet counts as healthy.
+    """
+
     def __init__(
         self,
         router_args: RouterArgs,
@@ -81,16 +163,79 @@ class MiniLoadBalancer:
         self.test_external_dp_routing = router_args.test_external_dp_routing
         self.prefill_dp_size = None
         self.decode_dp_size = None
+        self.affinity_policy = (
+            SessionAffinityPolicy()
+            if router_args.mini_lb_policy == "session_affinity"
+            else None
+        )
+        self._load_poller = (
+            LoadPoller(
+                loads=self.affinity_policy.loads,
+                metric_names=self.affinity_policy.metric_names,
+                interval_secs=1.0,
+                timeout_secs=5.0,
+            )
+            if self.affinity_policy is not None
+            else None
+        )
+        self.health_poll_interval_secs = _health_poll_interval_secs(router_args)
+
+    @functools.cached_property
+    def _health(self) -> _BackendHealth:
+        # Created on first use, which also covers instances built without
+        # __init__.
+        return _BackendHealth()
+
+    def _client_timeout(self) -> aiohttp.ClientTimeout:
+        affinity = self.affinity_policy is not None
+        return aiohttp.ClientTimeout(
+            total=self.timeout,
+            # The total deadline already bounds affinity reads.
+            sock_read=None if affinity else self.timeout,
+            connect=_CONNECT_TIMEOUT_SECS if affinity else None,
+            sock_connect=_CONNECT_TIMEOUT_SECS if affinity else 300,
+        )
+
+    async def _engine_request(self, engine, operation, *args, **kwargs):
+        try:
+            return await operation(*args, **kwargs)
+        except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError) as error:
+            if self.affinity_policy is None:
+                raise
+            self.affinity_policy.loads.mark_unreachable(engine)
+            raise _UpstreamConnectionError(f"{engine}: {error!r}") from error
+
+    async def _gather_requests(self, *requests):
+        """Cancel and close the peer when affinity loses one upstream."""
+        if self.affinity_policy is None:
+            return await asyncio.gather(*requests)
+        tasks = [asyncio.ensure_future(request) for request in requests]
+        try:
+            return await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            for response in responses:
+                if isinstance(response, aiohttp.ClientResponse):
+                    response.close()
+            raise
 
     def _validate_router_args(self, router_args: RouterArgs):
         logger.warning(
-            "\x1b[33mMiniLB is only for debugging purposes, it only supports random policy!\033[0m"
+            "\x1b[33mMiniLB is for debugging only. "
+            "Routing policy comes from --mini-lb-policy.\033[0m"
         )
 
         # NOTE: too many arguments unsupported, just validate some important ones
         if router_args.policy != "random":
-            logger.warning("[MiniLB] Overriding policy to random")
+            logger.warning("[MiniLB] Ignoring --policy, see --mini-lb-policy")
             router_args.policy = "random"
+        if router_args.mini_lb_policy not in MINI_LB_POLICY_CHOICES:
+            raise ValueError(
+                f"Unknown MiniLB policy {router_args.mini_lb_policy!r}, "
+                f"expected one of {MINI_LB_POLICY_CHOICES}"
+            )
 
         if not router_args.pd_disaggregation:
             raise ValueError("MiniLB only supports PD disaggregation mode")
@@ -103,18 +248,143 @@ class MiniLoadBalancer:
     def start(self):
         global lb
         lb = self
+        if self.affinity_policy is not None:
+            logging.basicConfig(
+                level=logging.INFO,
+                format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+                force=True,
+            )
         uvicorn.run(app, host=self.host, port=self.port)
+
+    def start_load_polling(self) -> Optional[asyncio.Task]:
+        """Poll engine loads only when session affinity is enabled."""
+        if self._load_poller is None:
+            return None
+        return asyncio.create_task(
+            self._load_poller.run(lambda: self.prefill_urls + self.decode_urls)
+        )
+
+    def start_health_polling(self) -> Optional[asyncio.Task]:
+        """Probe backend health in the background unless it is disabled."""
+        if self.health_poll_interval_secs is None:
+            return None
+        return asyncio.create_task(self._poll_health())
+
+    def _registered_urls(self) -> List[str]:
+        return list(dict.fromkeys(chain(self.prefill_urls, self.decode_urls)))
+
+    async def _poll_health(self) -> None:
+        """Probe each backend every interval, like LoadPoller: a backend whose
+        probe is still in flight is skipped, so one hung backend does not delay
+        the others."""
+        probes: Dict[str, asyncio.Task] = {}
+        timeout = aiohttp.ClientTimeout(total=HEALTH_CHECK_TIMEOUT_SECS)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            try:
+                while True:
+                    probes = {
+                        url: probe for url, probe in probes.items() if not probe.done()
+                    }
+                    for url in self._registered_urls():
+                        if url not in probes:
+                            probes[url] = asyncio.create_task(
+                                self._probe_health(session, url)
+                            )
+                    await asyncio.sleep(self.health_poll_interval_secs)
+            finally:
+                for probe in probes.values():
+                    probe.cancel()
+                await asyncio.gather(*probes.values(), return_exceptions=True)
+
+    async def probe_backend_health(self) -> None:
+        """Probe every registered backend once; each verdict applies as soon as
+        that backend answers.
+
+        Run one probe at a time: the background poller is the only caller.
+        """
+        timeout = aiohttp.ClientTimeout(total=HEALTH_CHECK_TIMEOUT_SECS)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            await asyncio.gather(
+                *(self._probe_health(session, url) for url in self._registered_urls())
+            )
+
+    async def _probe_health(self, session: aiohttp.ClientSession, url: str) -> None:
+        """GET HEALTH_PROBE_PATH on `url` and route to it only if it answers 200."""
+        health = self._health
+        epoch = health.epoch(url)
+        try:
+            status, error = await _probe_status(session, url, HEALTH_PROBE_PATH)
+        except Exception:
+            logger.exception("[MiniLB] health probe of %s failed", url)
+            return
+        if health.epoch(url) != epoch:
+            # Removed or re-registered while the probe was in flight.
+            return
+        if status == 200:
+            if url in health.unhealthy:
+                logger.info("[MiniLB] backend %s is healthy again", url)
+                health.unhealthy.discard(url)
+        elif url not in health.unhealthy:
+            logger.warning(
+                "[MiniLB] backend %s failed %s (%s), skipping it",
+                url,
+                HEALTH_PROBE_PATH,
+                status if error is None else error,
+            )
+            health.unhealthy.add(url)
+
+    def _routable(self, role: str, urls: List[str]) -> List[str]:
+        """Candidates of `role` for select_pair: healthy and reachable backends,
+        else the reachable ones, else all of them.
+
+        Reachability comes from the session affinity load table. The policy
+        fails open on it too, so passing it only healthy backends would let
+        it fall back to an unreachable subset instead of a reachable one.
+        """
+        if not urls:
+            return []
+        loads = self.affinity_policy.loads if self.affinity_policy else None
+        reachable = [url for url in urls if loads is None or loads.is_reachable(url)]
+        healthy = [url for url in reachable if url not in self._health.unhealthy]
+        failing_open = self._health.roles_failing_open
+        if healthy:
+            if role in failing_open:
+                logger.info("[MiniLB] %s has a healthy backend again", role)
+                failing_open.discard(role)
+            return healthy
+        if role not in failing_open:
+            logger.warning(
+                "[MiniLB] no healthy %s backend, routing to all %d of them",
+                role,
+                len(reachable or urls),
+            )
+            failing_open.add(role)
+        return reachable or list(urls)
+
+    def _forget_health(self, worker_url) -> None:
+        """Treat `worker_url` as not probed yet."""
+        self._health.forget(worker_url)
 
     async def _ensure_dp_sizes(self):
         if self.prefill_dp_size is not None:
             return
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{self.prefill_urls[0]}/server_info") as resp:
-                info = await resp.json()
-                self.prefill_dp_size = len(info.get("internal_states", [1]))
-            async with session.get(f"{self.decode_urls[0]}/server_info") as resp:
-                info = await resp.json()
-                self.decode_dp_size = len(info.get("internal_states", [1]))
+        session_args = (
+            {"timeout": self._client_timeout()}
+            if self.affinity_policy is not None
+            else {}
+        )
+        async with aiohttp.ClientSession(**session_args) as session:
+            async with await self._engine_request(
+                self.prefill_urls[0], session.get, f"{self.prefill_urls[0]}/server_info"
+            ) as resp:
+                info = await self._engine_request(self.prefill_urls[0], resp.json)
+                prefill_dp_size = len(info.get("internal_states", [1]))
+            async with await self._engine_request(
+                self.decode_urls[0], session.get, f"{self.decode_urls[0]}/server_info"
+            ) as resp:
+                info = await self._engine_request(self.decode_urls[0], resp.json)
+                decode_dp_size = len(info.get("internal_states", [1]))
+        self.prefill_dp_size, self.decode_dp_size = prefill_dp_size, decode_dp_size
         logger.info(
             f"[MiniLB] DP sizes: prefill={self.prefill_dp_size}, decode={self.decode_dp_size}"
         )
@@ -131,16 +401,33 @@ class MiniLoadBalancer:
 
         return prefill_req, decode_req, d_rank
 
-    def select_pair(self):
-        assert len(self.prefill_urls) > 0, "No prefill servers available"
-        assert len(self.decode_urls) > 0, "No decode servers available"
-        pidx = random.randint(0, len(self.prefill_urls) - 1)
-        didx = random.randint(0, len(self.decode_urls) - 1)
-        return (
-            self.prefill_urls[pidx],
-            self.prefill_bootstrap_ports[pidx],
-            self.decode_urls[didx],
-        )
+    def select_pair(self, routing_key=None, room=None):
+        """Return a random or affinity-selected (prefill, bootstrap port, decode).
+
+        Only healthy backends are candidates (see _routable), so session
+        affinity re-pins a routing key whose pinned prefill became unhealthy.
+        """
+        prefill_urls = self._routable("prefill", self.prefill_urls)
+        decode_urls = self._routable("decode", self.decode_urls)
+        assert prefill_urls, "No prefill servers available"
+        assert decode_urls, "No decode servers available"
+        if self.affinity_policy is None:
+            prefill = prefill_urls[random.randint(0, len(prefill_urls) - 1)]
+            decode = decode_urls[random.randint(0, len(decode_urls) - 1)]
+        else:
+            decisions = self.affinity_policy.select(
+                prefill_urls=prefill_urls,
+                decode_urls=decode_urls,
+                routing_key=routing_key,
+            )
+            for decision in decisions:
+                logger.info(
+                    "[MiniLB] routing decision %s",
+                    decision.to_log_json(room=room, routing_key=routing_key),
+                )
+            prefill, decode = (decision.engine for decision in decisions)
+        pidx = self.prefill_urls.index(prefill)
+        return prefill, self.prefill_bootstrap_ports[pidx], decode
 
     def current_role_and_port(self, worker_url):
         """Return (role, bootstrap_port) of a registered server, or (None, None)
@@ -157,6 +444,7 @@ class MiniLoadBalancer:
     def remove_worker(self, worker_url):
         """Drop a server from both routing lists so no new requests are sent to
         it (used to quiesce it before a role switch)."""
+        self._forget_health(worker_url)
         if worker_url in self.decode_urls:
             self.decode_urls.remove(worker_url)
         if worker_url in self.prefill_urls:
@@ -166,6 +454,7 @@ class MiniLoadBalancer:
 
     def add_worker(self, worker_url, role, bootstrap_port=None):
         """Register a server under a role in the routing lists."""
+        self._forget_health(worker_url)
         if role == "prefill":
             self.prefill_urls.append(worker_url)
             self.prefill_bootstrap_ports.append(bootstrap_port or 8998)
@@ -193,24 +482,32 @@ class MiniLoadBalancer:
             prefill_req = modified_request
             decode_req = modified_request
 
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(
-                total=self.timeout,
-                sock_read=self.timeout,
-                sock_connect=300,
-            )  # Add timeout for request reliability
-        ) as session:
+        async with aiohttp.ClientSession(timeout=self._client_timeout()) as session:
             tasks = [
-                session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
-                session.post(f"{decode_server}/{endpoint}", json=decode_req),
+                self._engine_request(
+                    prefill_server,
+                    session.post,
+                    f"{prefill_server}/{endpoint}",
+                    json=prefill_req,
+                ),
+                self._engine_request(
+                    decode_server,
+                    session.post,
+                    f"{decode_server}/{endpoint}",
+                    json=decode_req,
+                ),
             ]
 
             # Wait for both responses to complete. Prefill should end first.
-            prefill_response, decode_response = await asyncio.gather(*tasks)
+            prefill_response, decode_response = await self._gather_requests(*tasks)
 
             if "return_logprob" in modified_request:
-                prefill_json = await prefill_response.json()
-                ret_json = await decode_response.json()
+                prefill_json = await self._engine_request(
+                    prefill_server, prefill_response.json
+                )
+                ret_json = await self._engine_request(
+                    decode_server, decode_response.json
+                )
 
                 # merge `meta_info.input_token_logprobs` from prefill to decode
                 if "meta_info" in ret_json:
@@ -220,7 +517,9 @@ class MiniLoadBalancer:
                             + ret_json["meta_info"]["input_token_logprobs"]
                         )
             else:
-                ret_json = await decode_response.json()
+                ret_json = await self._engine_request(
+                    decode_server, decode_response.json
+                )
 
             if expected_decode_dp_rank is not None:
                 actual = ret_json.get("meta_info", {}).get("dp_rank")
@@ -246,13 +545,7 @@ class MiniLoadBalancer:
 
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
-        session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(
-                total=self.timeout,
-                sock_read=self.timeout,
-                sock_connect=300,
-            )  # Add timeout for request reliability
-        )
+        session = aiohttp.ClientSession(timeout=self._client_timeout())
         responses = []
 
         async def close_upstreams():
@@ -344,14 +637,24 @@ class MiniLoadBalancer:
             # Both servers answer the headers before any token is produced, so
             # a request either server rejects is known here, before the
             # streaming response (and its 200 status) is committed.
-            prefill_response, decode_response = await asyncio.gather(
-                session.post(f"{prefill_server}/{endpoint}", json=modified_request),
-                session.post(f"{decode_server}/{endpoint}", json=modified_request),
+            prefill_response, decode_response = await self._gather_requests(
+                self._engine_request(
+                    prefill_server,
+                    session.post,
+                    f"{prefill_server}/{endpoint}",
+                    json=modified_request,
+                ),
+                self._engine_request(
+                    decode_server,
+                    session.post,
+                    f"{decode_server}/{endpoint}",
+                    json=modified_request,
+                ),
             )
             responses.extend((prefill_response, decode_response))
-            for response in responses:
+            for response, engine in zip(responses, (prefill_server, decode_server)):
                 if response.status != 200:
-                    body = await response.read()
+                    body = await self._engine_request(engine, response.read)
                     return Response(
                         content=body,
                         status_code=response.status,
@@ -367,25 +670,78 @@ class MiniLoadBalancer:
                 await close_upstreams()
 
 
-app = FastAPI()
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    pollers = (
+        [lb.start_load_polling(), lb.start_health_polling()] if lb is not None else []
+    )
+    pollers = [poller for poller in pollers if poller is not None]
+    try:
+        yield
+    finally:
+        for poller in pollers:
+            poller.cancel()
+        for poller in pollers:
+            with contextlib.suppress(asyncio.CancelledError):
+                await poller
+
+
+app = FastAPI(lifespan=_lifespan)
 lb: Optional[MiniLoadBalancer] = None
+
+
+async def _probe_backends(path: str) -> Response:
+    """GET `path` on every registered server; 200 only if all answer 200.
+
+    Routing skips unhealthy servers, but only after the next background probe
+    and with fallback to all servers of a role when none is healthy, so this
+    stays strict: one dead server reports the whole deployment as degraded.
+    This is stricter than the Rust gateway's /readiness.
+    """
+    timeout = HEALTH_CHECK_TIMEOUT_SECS
+
+    roles = {"prefill": list(lb.prefill_urls), "decode": list(lb.decode_urls)}
+    backends = [(role, url) for role, urls in roles.items() for url in urls]
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=timeout)
+    ) as session:
+        results = await asyncio.gather(
+            *(_probe_status(session, url, path) for _, url in backends)
+        )
+    unhealthy = [
+        {"role": role, "url": url, "status": status, "error": error}
+        for (role, url), (status, error) in zip(backends, results)
+        if status != 200
+    ]
+    # A role switch can briefly leave a role with no registered server.
+    unhealthy += [
+        {"role": role, "url": None, "status": None, "error": "no server registered"}
+        for role, urls in roles.items()
+        if not urls
+    ]
+    if not unhealthy:
+        return Response(status_code=200)
+    logger.warning(f"[MiniLB] {path}: unhealthy backends {unhealthy}")
+    return ORJSONResponse(
+        content={"unhealthy": unhealthy},
+        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+    )
+
+
+@app.get("/liveness")
+async def liveness():
+    """200 while the MiniLB process serves requests; ignores the backends."""
+    return Response(status_code=200)
 
 
 @app.get("/health")
 async def health_check():
-    return Response(status_code=200)
+    return await _probe_backends("/health")
 
 
 @app.get("/health_generate")
 async def health_generate():
-    async with aiohttp.ClientSession() as session:
-        # Create the tasks
-        tasks = []
-        for server in chain(lb.prefill_urls, lb.decode_urls):
-            tasks.append(session.get(f"{server}/health_generate"))
-        for i, response in enumerate(asyncio.as_completed(tasks)):
-            await response
-    return Response(status_code=200)
+    return await _probe_backends("/health_generate")
 
 
 async def _post_role_switch(worker_url, body):
@@ -554,83 +910,75 @@ async def get_model_info():
 
 
 @app.post("/generate")
-async def handle_generate_request(request_data: dict):
-    prefill_server, bootstrap_port, decode_server = lb.select_pair()
+async def handle_generate_request(
+    request_data: dict, x_routing_key: Optional[str] = Header(default=None)
+):
+    return await _forward_to_backend(request_data, "generate", x_routing_key)
 
-    # Parse and transform prefill_server for bootstrap data
-    parsed_url = urllib.parse.urlparse(prefill_server)
-    hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
-    modified_request = request_data.copy()
 
-    batch_size = _get_request_batch_size(modified_request)
-    if batch_size is not None:
-        modified_request.update(
-            {
-                "bootstrap_host": [hostname] * batch_size,
-                "bootstrap_port": [bootstrap_port] * batch_size,
-                "bootstrap_room": [
-                    _generate_bootstrap_room() for _ in range(batch_size)
-                ],
-            }
+async def _forward_to_backend(
+    request_data: dict, endpoint_name: str, routing_key: Optional[str]
+):
+    batch_size = _get_request_batch_size(request_data)
+    bootstrap_rooms = [
+        _generate_bootstrap_room()
+        for _ in range(batch_size if batch_size is not None else 1)
+    ]
+    try:
+        prefill_server, bootstrap_port, decode_server = lb.select_pair(
+            routing_key=routing_key,
+            room=bootstrap_rooms[0] if bootstrap_rooms else None,
         )
-    else:
-        modified_request.update(
-            {
-                "bootstrap_host": hostname,
-                "bootstrap_port": bootstrap_port,
-                "bootstrap_room": _generate_bootstrap_room(),
-            }
+    except EngineOverloaded as error:
+        logger.warning(f"[MiniLB] POST /{endpoint_name} failed: {error}")
+        return ORJSONResponse(
+            content={"error": {"message": str(error)}},
+            status_code=HTTPStatus.TOO_MANY_REQUESTS,
         )
 
-    if request_data.get("stream", False):
-        return await lb.generate_stream(
-            modified_request, prefill_server, decode_server, "generate"
-        )
-    else:
-        return await lb.generate(
-            modified_request, prefill_server, decode_server, "generate"
-        )
-
-
-async def _forward_to_backend(request_data: dict, endpoint_name: str):
-    prefill_server, bootstrap_port, decode_server = lb.select_pair()
-
-    # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
     modified_request = request_data.copy()
     modified_request.update(
         {
-            "bootstrap_host": hostname,
-            "bootstrap_port": bootstrap_port,
-            "bootstrap_room": _generate_bootstrap_room(),
+            "bootstrap_host": (
+                [hostname] * batch_size if batch_size is not None else hostname
+            ),
+            "bootstrap_port": (
+                [bootstrap_port] * batch_size
+                if batch_size is not None
+                else bootstrap_port
+            ),
+            "bootstrap_room": (
+                bootstrap_rooms if batch_size is not None else bootstrap_rooms[0]
+            ),
         }
     )
-
-    if request_data.get("stream", False):
-        return await lb.generate_stream(
-            modified_request,
-            prefill_server,
-            decode_server,
-            endpoint=endpoint_name,
+    forward = lb.generate_stream if request_data.get("stream", False) else lb.generate
+    try:
+        return await forward(
+            modified_request, prefill_server, decode_server, endpoint=endpoint_name
         )
-    else:
-        return await lb.generate(
-            modified_request,
-            prefill_server,
-            decode_server,
-            endpoint=endpoint_name,
+    except _UpstreamConnectionError as error:
+        logger.warning("[MiniLB] upstream unreachable: %s", error)
+        return ORJSONResponse(
+            content={"error": {"message": f"upstream unreachable: {error}"}},
+            status_code=HTTPStatus.BAD_GATEWAY,
         )
 
 
 @app.post("/v1/chat/completions")
-async def handle_chat_completion_request(request_data: dict):
-    return await _forward_to_backend(request_data, "v1/chat/completions")
+async def handle_chat_completion_request(
+    request_data: dict, x_routing_key: Optional[str] = Header(default=None)
+):
+    return await _forward_to_backend(request_data, "v1/chat/completions", x_routing_key)
 
 
 @app.post("/v1/completions")
-async def handle_completion_request(request_data: dict):
-    return await _forward_to_backend(request_data, "v1/completions")
+async def handle_completion_request(
+    request_data: dict, x_routing_key: Optional[str] = Header(default=None)
+):
+    return await _forward_to_backend(request_data, "v1/completions", x_routing_key)
 
 
 def _generate_bootstrap_room():

@@ -1,0 +1,345 @@
+# External P/D disaggregation test workload -- TWO replicated jobs (prefill, decode),
+# each pinned to a slice by nodepool (no Kueue on this cluster). Adapted from the in-project
+# jobset-tpu-pd.yaml; rendered by render_external_jobset.py for P/D `commands` groups. Render vars
+# (do NOT write them as dollar-brace tokens in these comments -- the renderer would
+# substitute them here too):
+#   IMAGE / NAMESPACE / ACCELERATOR / TOPOLOGY   image and node labels
+#   RUN_NAME             DNS-safe label; must not contain "prefill"/"decode"
+#                        (pods derive peer hostnames by swapping the replicated-job
+#                        segment of their own hostname)
+#   EXEC_CMD             every pod of both roles runs this command; the test dispatches
+#                        roles from CI_PD_ROLE, and the prefill leader's exit gates
+#   TEST_FILES           the file EXEC_CMD runs; reported by the prefill leader in TIMINGS
+#   ACTIVE_DEADLINE      per-Job runtime cap (seconds)
+#   PREFILL_HOSTS / DECODE_HOSTS          pods (= hosts) per role
+#   PREFILL_NODEPOOL / DECODE_NODEPOOL    the role's slice; equal when 1+1 shares a slice
+#   PREFILL_SINGLE_HOST / DECODE_SINGLE_HOST   non-empty when the role is smaller than
+#                        its slice: its pods drop the slice-wide TPU env
+#   WEIGHTS_BUCKET / WEIGHTS_MOUNT_OPTIONS / WEIGHTS_MOUNT_PATH / EPHEMERAL_LIMIT  gcsfuse
+#   WEIGHTS_DIR          the bucket's weights/ dir; linked to /weights, the in-project path
+# NO securityContext.privileged: the external cluster's admission policy rejects it.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: ${RUN_NAME}-
+  namespace: ${NAMESPACE}
+spec:
+  ttlSecondsAfterFinished: 7200
+  failurePolicy:
+    maxRestarts: 0
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - prefill
+  network:
+    enableDNSHostnames: true       # stable pod DNS for cross-slice rendezvous
+  replicatedJobs:
+    - name: prefill
+      replicas: 1
+      template:
+        spec:
+          backoffLimit: 0
+          completions: ${PREFILL_HOSTS}
+          parallelism: ${PREFILL_HOSTS}
+          activeDeadlineSeconds: ${ACTIVE_DEADLINE}
+          template:
+            metadata:
+              labels:
+                app: external-tpu-ci
+              annotations:
+                gke-gcsfuse/volumes: "true"
+                gke-gcsfuse/ephemeral-storage-limit: "${EPHEMERAL_LIMIT}"
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: ${ACCELERATOR}
+                cloud.google.com/gke-tpu-topology: ${TOPOLOGY}
+                cloud.google.com/gke-nodepool: ${PREFILL_NODEPOOL}
+              tolerations:
+                - key: google.com/tpu
+                  operator: Exists
+                  effect: NoSchedule
+              volumes:
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
+                    # Holds tier-2 AND tier-3 now; 16Gi fit neither for a 120B run.
+                    sizeLimit: 64Gi
+                # Unmounted, /tmp is the container writable layer: unbounded node
+                # ephemeral-storage. Overrunning it evicts whoever the kubelet picks,
+                # so a pod's own logs took out unrelated jobs on the same node.
+                - name: tmp
+                  emptyDir:
+                    sizeLimit: 64Gi
+                - name: weights
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: ${WEIGHTS_BUCKET}
+                      mountOptions: "${WEIGHTS_MOUNT_OPTIONS}"
+              containers:
+                - name: test
+                  image: ${IMAGE}
+                  imagePullPolicy: IfNotPresent
+                  env:
+                    - name: CI_PD_ROLE
+                      value: prefill
+                    - name: HF_TOKEN
+                      valueFrom:
+                        secretKeyRef:
+                          name: hf-token
+                          key: token
+                          optional: true
+                  command: ["bash", "-lc"]
+                  args:
+                    - |
+                      set -uo pipefail
+                      cd /sgl-workspace/sglang
+                      export HF_HOME=/tmp/hf SGLANG_PLATFORM=tpu SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                      # torch_tpu's tier-3 cache defaults to $HOME, on the pod's ephemeral
+                      # overlay; warmup fills the node disk and the kubelet evicts the pod.
+                      # EXEC_CMD reaches launch_server.sh without the ENABLE_COMPILE_CACHE=0
+                      # that the multi-host path sets, so this route does write it.
+                      export TORCH_TPU_TIER3_ROOT=/dev/shm/torch_tpu_tier3
+                      # GKE treats a JobSet with two TPU replicated jobs as one
+                      # Multislice workload and injects MEGASCALE_* coordination
+                      # env spanning both slices; with it set, the TPU runtime
+                      # builds a cross-slice megascale client instead of a plain
+                      # per-slice client. The P/D engines are independent slices
+                      # (the KV transfer is application-level), so drop it.
+                      for v in $(compgen -e | grep '^MEGASCALE'); do unset "$v"; done
+                      # Tests and recipes hard-code the in-project weights path.
+                      [ -e /weights ] || ln -s "${WEIGHTS_DIR}" /weights
+                      # No internet on this cluster: the GSM8K evals read the cached
+                      # /tmp/test.jsonl, and HF repo ids resolve from the bucket's offline
+                      # hub cache (weights/hf-hub, staged from huggingface.co).
+                      [ -f /tmp/test.jsonl ] || cp /weights/datasets/gsm8k/test.jsonl /tmp/test.jsonl
+                      export HF_HUB_CACHE=/weights/hf-hub HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+                      # load_dataset reads a prepared Arrow cache (weights/datasets/hf-datasets);
+                      # symlinked into /tmp because it writes lock files next to the data.
+                      [ -d /tmp/hf-datasets ] || cp -rs /weights/datasets/hf-datasets /tmp/hf-datasets
+                      export HF_DATASETS_CACHE=/tmp/hf-datasets HF_DATASETS_OFFLINE=1
+                      # gpt-oss's harmony encoding loads its tiktoken vocab from here.
+                      export TIKTOKEN_ENCODINGS_BASE=/weights/datasets/tiktoken
+                      # A role smaller than its slice runs one single-host engine per pod:
+                      # the injected TPU_* vars describe the whole slice, and libtpu would
+                      # wait for a peer that belongs to the other role.
+                      if [ -n "${PREFILL_SINGLE_HOST}" ]; then
+                        # The tests name their peer from this pod's DNS name, which the
+                        # dropped TPU_WORKER_HOSTNAMES carried (one entry: this pod).
+                        PD_SELF_HOST="${TPU_WORKER_HOSTNAMES%%,*}"
+                        export PD_SELF_HOST="${PD_SELF_HOST:-$(hostname -f)}"
+                        unset TPU_WORKER_ID TPU_WORKER_HOSTNAMES TPU_PROCESS_ADDRESSES \
+                              TPU_TOPOLOGY TPU_TOPOLOGY_WRAP TPU_TOPOLOGY_ALT TPU_HOST_BOUNDS \
+                              TPU_ACCELERATOR_TYPE
+                      fi
+                      echo "run=${RUN_NAME} role=$CI_PD_ROLE rank=${TPU_WORKER_ID:-0}"
+                      # Print /tmp usage to debug a disk eviction after the fact: the
+                      # kubelet only reports a total, and the container log is unreadable
+                      # by then. Past 20 GiB each line grows a du breakdown.
+                      #   == prefill /tmp 24K ==
+                      #   == decode /tmp 3220292K ==
+                      if [ "${TPU_WORKER_ID:-0}" = "0" ]; then
+                        ( while sleep 120; do
+                            tot=$(du -sxk /tmp 2>/dev/null | cut -f1)
+                            echo "== $CI_PD_ROLE /tmp ${tot:-?}K =="
+                            [ "${tot:-0}" -gt 20971520 ] && du -xhd2 /tmp 2>/dev/null | sort -rh | head -10
+                          done ) &
+                      fi
+                      # Name the test BEFORE anything can fail. A P/D run can
+                      # spend an hour in weight load and compile before dying,
+                      # and with no test named the dashboard files the red row
+                      # under the job -- which reads as a test that does not
+                      # exist. Printed unconditionally, as in jobset-tpu.yaml.
+                      echo "== test files: ${TEST_FILES} =="
+                      t0=$SECONDS
+                      ${EXEC_CMD}
+                      rc=$?
+                      # Only the prefill leader's verdict gates. On a non-leader
+                      # host teardown is expected in two shapes: SIGTERM (143), or
+                      # -- when the leader finishes the eval and exits first -- the
+                      # worker scheduler dying on the severed request-broadcast
+                      # socket (gloo Connection closed/reset by peer), which
+                      # sglang's crash handler then SIGKILLs to 137. Treat both as
+                      # success; the disconnect grep keeps a real 137 (e.g.
+                      # OOM-kill) red, and the leader gates every real failure.
+                      if [ "${TPU_WORKER_ID:-0}" != "0" ]; then
+                        if [ "$rc" = 143 ]; then
+                          echo "worker teardown SIGTERM; success"; rc=0
+                        elif [ "$rc" = 137 ] && grep -qsE "Connection (closed|reset) by peer" /tmp/pd*prefill*.log; then
+                          echo "worker teardown (leader closed request-broadcast socket); success"; rc=0
+                        fi
+                      fi
+                      # Per-file verdict in run_suite's TIMINGS format, so the
+                      # dashboard reads P/D, multi-host and single-host through
+                      # one parser. Leader only: all four pods run the same
+                      # command, but only rank 0's exit code carries the verdict
+                      # and four records would be four duplicate rows.
+                      if [ "${TPU_WORKER_ID:-0}" = "0" ]; then
+                        passed=true
+                        [ "$rc" -eq 0 ] || passed=false
+                        echo "========== TIMINGS BEGIN =========="
+                        printf '{"file": "%s", "passed": %s, "elapsed": %s}\n' \
+                          "${TEST_FILES}" "$passed" "$((SECONDS - t0))"
+                        echo "========== TIMINGS END =========="
+                      fi
+                      exit $rc
+                  resources:
+                    requests:
+                      google.com/tpu: "4"
+                      cpu: "4"
+                      memory: 32Gi
+                    limits:
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    - name: dshm
+                      mountPath: /dev/shm
+                    - name: tmp
+                      mountPath: /tmp
+                    - name: weights
+                      mountPath: ${WEIGHTS_MOUNT_PATH}
+                      readOnly: true
+    - name: decode
+      replicas: 1
+      template:
+        spec:
+          backoffLimit: 0
+          completions: ${DECODE_HOSTS}
+          parallelism: ${DECODE_HOSTS}
+          activeDeadlineSeconds: ${ACTIVE_DEADLINE}
+          template:
+            metadata:
+              labels:
+                app: external-tpu-ci
+              annotations:
+                gke-gcsfuse/volumes: "true"
+                gke-gcsfuse/ephemeral-storage-limit: "${EPHEMERAL_LIMIT}"
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: ${ACCELERATOR}
+                cloud.google.com/gke-tpu-topology: ${TOPOLOGY}
+                cloud.google.com/gke-nodepool: ${DECODE_NODEPOOL}
+              tolerations:
+                - key: google.com/tpu
+                  operator: Exists
+                  effect: NoSchedule
+              volumes:
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
+                    # Holds tier-2 AND tier-3 now; 16Gi fit neither for a 120B run.
+                    sizeLimit: 64Gi
+                # Unmounted, /tmp is the container writable layer: unbounded node
+                # ephemeral-storage. Overrunning it evicts whoever the kubelet picks,
+                # so a pod's own logs took out unrelated jobs on the same node.
+                - name: tmp
+                  emptyDir:
+                    sizeLimit: 64Gi
+                - name: weights
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: ${WEIGHTS_BUCKET}
+                      mountOptions: "${WEIGHTS_MOUNT_OPTIONS}"
+              containers:
+                - name: test
+                  image: ${IMAGE}
+                  imagePullPolicy: IfNotPresent
+                  env:
+                    - name: CI_PD_ROLE
+                      value: decode
+                    - name: HF_TOKEN
+                      valueFrom:
+                        secretKeyRef:
+                          name: hf-token
+                          key: token
+                          optional: true
+                  command: ["bash", "-lc"]
+                  args:
+                    - |
+                      set -uo pipefail
+                      cd /sgl-workspace/sglang
+                      export HF_HOME=/tmp/hf SGLANG_PLATFORM=tpu SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                      # torch_tpu's tier-3 cache defaults to $HOME, on the pod's ephemeral
+                      # overlay; warmup fills the node disk and the kubelet evicts the pod.
+                      # EXEC_CMD reaches launch_server.sh without the ENABLE_COMPILE_CACHE=0
+                      # that the multi-host path sets, so this route does write it.
+                      export TORCH_TPU_TIER3_ROOT=/dev/shm/torch_tpu_tier3
+                      # GKE treats a JobSet with two TPU replicated jobs as one
+                      # Multislice workload and injects MEGASCALE_* coordination
+                      # env spanning both slices; with it set, the TPU runtime
+                      # builds a cross-slice megascale client instead of a plain
+                      # per-slice client. The P/D engines are independent slices
+                      # (the KV transfer is application-level), so drop it.
+                      for v in $(compgen -e | grep '^MEGASCALE'); do unset "$v"; done
+                      # Tests and recipes hard-code the in-project weights path.
+                      [ -e /weights ] || ln -s "${WEIGHTS_DIR}" /weights
+                      # No internet on this cluster: the GSM8K evals read the cached
+                      # /tmp/test.jsonl, and HF repo ids resolve from the bucket's offline
+                      # hub cache (weights/hf-hub, staged from huggingface.co).
+                      [ -f /tmp/test.jsonl ] || cp /weights/datasets/gsm8k/test.jsonl /tmp/test.jsonl
+                      export HF_HUB_CACHE=/weights/hf-hub HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+                      # load_dataset reads a prepared Arrow cache (weights/datasets/hf-datasets);
+                      # symlinked into /tmp because it writes lock files next to the data.
+                      [ -d /tmp/hf-datasets ] || cp -rs /weights/datasets/hf-datasets /tmp/hf-datasets
+                      export HF_DATASETS_CACHE=/tmp/hf-datasets HF_DATASETS_OFFLINE=1
+                      # gpt-oss's harmony encoding loads its tiktoken vocab from here.
+                      export TIKTOKEN_ENCODINGS_BASE=/weights/datasets/tiktoken
+                      # A role smaller than its slice runs one single-host engine per pod:
+                      # the injected TPU_* vars describe the whole slice, and libtpu would
+                      # wait for a peer that belongs to the other role.
+                      if [ -n "${DECODE_SINGLE_HOST}" ]; then
+                        # The tests name their peer from this pod's DNS name, which the
+                        # dropped TPU_WORKER_HOSTNAMES carried (one entry: this pod).
+                        PD_SELF_HOST="${TPU_WORKER_HOSTNAMES%%,*}"
+                        export PD_SELF_HOST="${PD_SELF_HOST:-$(hostname -f)}"
+                        unset TPU_WORKER_ID TPU_WORKER_HOSTNAMES TPU_PROCESS_ADDRESSES \
+                              TPU_TOPOLOGY TPU_TOPOLOGY_WRAP TPU_TOPOLOGY_ALT TPU_HOST_BOUNDS \
+                              TPU_ACCELERATOR_TYPE
+                      fi
+                      echo "run=${RUN_NAME} role=$CI_PD_ROLE rank=${TPU_WORKER_ID:-0}"
+                      # Print /tmp usage to debug a disk eviction after the fact: the
+                      # kubelet only reports a total, and the container log is unreadable
+                      # by then. Past 20 GiB each line grows a du breakdown.
+                      #   == prefill /tmp 24K ==
+                      #   == decode /tmp 3220292K ==
+                      if [ "${TPU_WORKER_ID:-0}" = "0" ]; then
+                        ( while sleep 120; do
+                            tot=$(du -sxk /tmp 2>/dev/null | cut -f1)
+                            echo "== $CI_PD_ROLE /tmp ${tot:-?}K =="
+                            [ "${tot:-0}" -gt 20971520 ] && du -xhd2 /tmp 2>/dev/null | sort -rh | head -10
+                          done ) &
+                      fi
+                      # Same announcement as the prefill side; the verdict is
+                      # the prefill leader's alone, so no TIMINGS record here.
+                      echo "== test files: ${TEST_FILES} =="
+                      ${EXEC_CMD}
+                      rc=$?
+                      # Decode pods never gate the verdict, so a teardown exit is
+                      # success: SIGTERM (143), or a 137 whose log shows the peer
+                      # disconnect (leader closed the socket, sglang SIGKILLs its
+                      # tree). The disconnect grep keeps a real 137 (OOM-kill) red.
+                      if [ "$rc" = 143 ]; then
+                        echo "worker teardown SIGTERM; success"; rc=0
+                      elif [ "$rc" = 137 ] && grep -qsE "Connection (closed|reset) by peer" /tmp/pd*decode*.log; then
+                        echo "worker teardown (peer disconnect); success"; rc=0
+                      fi
+                      exit $rc
+                  resources:
+                    requests:
+                      google.com/tpu: "4"
+                      cpu: "4"
+                      memory: 32Gi
+                    limits:
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    - name: dshm
+                      mountPath: /dev/shm
+                    - name: tmp
+                      mountPath: /tmp
+                    - name: weights
+                      mountPath: ${WEIGHTS_MOUNT_PATH}
+                      readOnly: true

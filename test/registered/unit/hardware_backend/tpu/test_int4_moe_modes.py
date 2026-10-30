@@ -10,11 +10,11 @@ import unittest
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.hardware_backend.tpu.w4a16_moe import (
-    _unpack_int4_offset_binary,
-)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.w4a16_moe import (
+    _unpack_int4_offset_binary,
+)
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -55,7 +55,7 @@ class TestUnpackInt4OffsetBinary(CustomTestCase):
 class TestVmemFp8Preparation(CustomTestCase):
     def test_packed_storage_scales_and_idempotence(self):
         from sglang.srt.environ import envs
-        from sglang.srt.hardware_backend.tpu.w4a16_moe import (
+        from sglang_tpu.w4a16_moe import (
             prepare_tpu_w4a16_moe_weights,
         )
 
@@ -93,7 +93,7 @@ class TestVmemFp8Preparation(CustomTestCase):
 
     def test_unsupported_groups_fail_before_mutation(self):
         from sglang.srt.environ import envs
-        from sglang.srt.hardware_backend.tpu.w4a16_moe import (
+        from sglang_tpu.w4a16_moe import (
             prepare_tpu_w4a16_moe_weights,
         )
 
@@ -120,8 +120,8 @@ class TestScaleStorage(CustomTestCase):
         return layer, scales
 
     def test_default_stores_f32_scales(self):
-        from sglang.srt.environ import envs
-        from sglang.srt.hardware_backend.tpu.w4a16_moe import (
+        from sglang_tpu.envs import envs
+        from sglang_tpu.w4a16_moe import (
             prepare_tpu_w4a16_moe_weights,
         )
 
@@ -134,8 +134,8 @@ class TestScaleStorage(CustomTestCase):
         )
 
     def test_opt_out_keeps_bf16_scales(self):
-        from sglang.srt.environ import envs
-        from sglang.srt.hardware_backend.tpu.w4a16_moe import (
+        from sglang_tpu.envs import envs
+        from sglang_tpu.w4a16_moe import (
             prepare_tpu_w4a16_moe_weights,
         )
 
@@ -150,13 +150,14 @@ class TestScaleStorage(CustomTestCase):
 
     def test_vmem_fp8_ignores_the_opt_out(self):
         from sglang.srt.environ import envs
-        from sglang.srt.hardware_backend.tpu.w4a16_moe import (
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.w4a16_moe import (
             prepare_tpu_w4a16_moe_weights,
         )
 
         layer, _ = self._layer()
         with (
-            envs.SGLANG_TPU_INT4_MOE_FP32_SCALES.override(False),
+            tpu_envs.SGLANG_TPU_INT4_MOE_FP32_SCALES.override(False),
             envs.SGLANG_TPU_INT4_MOE_MODE.override("vmem-fp8"),
         ):
             prepare_tpu_w4a16_moe_weights(layer, 32)

@@ -1,4 +1,12 @@
-"""GPT-OSS-20B EAGLE3 + DP-attention PR gate on one TPU host."""
+"""GPT-OSS-20B EAGLE3 + DP-attention PR gate on one TPU host.
+
+This is the only per-commit test that runs a server with DP attention
+(`DP_SIZE` > 1 becomes `--dp-size N --enable-dp-attention`), so it stays on the
+gate. It deliberately does NOT set `--tpu-compile-tracer dynamo`: the tracers
+have their own gate in test_tpu_qwen3_0_6b_singlehost_compile_tracer.py at 150s
+against Qwen3-0.6B, and carrying the flag here made this launch the second most
+expensive in the e2e suite.
+"""
 
 import os
 
@@ -8,7 +16,11 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
 from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
 
-register_tpu_ci(est_time=1800, suite="stage-b-test-tpu-4-v7")
+register_tpu_ci(
+    est_time=550,
+    suite="stage-b-test-tpu-4-v7",
+    labels=["singlehost", "gpt-oss-20b", "spec", "dpa"],
+)
 
 SERVED_MODEL_NAME = "gpt-oss-20b"
 MODEL_PATH = resolve_tpu_model_path("openai/gpt-oss-20b")
@@ -80,37 +92,16 @@ def spec_dpa_runner(base_url: str):
     }
 
 
-LAUNCH_ENV = {
-    "MODEL": MODEL_PATH,
-    "DRAFT_MODEL": DRAFT_MODEL_PATH,
-    "ISL": "2048",
-    "OSL": "512",
-    "CONCUR": "4",
-    "CONTEXT_LEN": "4096",
-    "MAX_TOTAL_TOKENS": "8192",
-    "TPU_COMPILE_TOKENS": "512 1024 2048",
-    "TPU_COMPILE_BS": "1 2 4",
-    "ENABLE_PROFILER_ENDPOINT": "0",
-    "DP_SIZE": str(DP_SIZE),
-    "EXTRA_ARGS": (
-        "--reasoning-parser gpt-oss "
-        f"--served-model-name {SERVED_MODEL_NAME} "
-        "--speculative-algorithm EAGLE3 "
-        f"--speculative-draft-model-path {DRAFT_MODEL_PATH} "
-        "--speculative-num-steps 3 "
-        "--speculative-eagle-topk 1 "
-        "--speculative-num-draft-tokens 4 "
-        "--tpu-compile-tracer dynamo "
-        "--trust-remote-code"
-    ),
-}
+# The recipe owns the serving config; these two only point it at the CI
+# weights mount when there is one.
+LAUNCH_ENV = {"MODEL": MODEL_PATH, "DRAFT_MODEL": DRAFT_MODEL_PATH}
 
 MODEL_CONFIG = {
     "model": SERVED_MODEL_NAME,
     "test_name": "gpt-oss-20b-spec-dpa",
     "variant": "TP8+EP8+DP2+EAGLE3",
     "launch": {
-        "recipe": "recipe/gpt_oss_120b/server.sh",
+        "config": "recipe/configs/gpt_oss_20b/spec_dpa.py",
         "env": LAUNCH_ENV,
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "gpt-oss-20b-spec-dpa-e2e",

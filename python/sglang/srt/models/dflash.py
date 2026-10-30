@@ -15,6 +15,7 @@ from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -317,6 +318,7 @@ class DFlashAttention(nn.Module):
             layer_id=layer_id,
             sliding_window_size=self.sliding_window_size,
             attn_type=self.attn_type,
+            quant_config=quant_config,
         )
 
     def forward_prepare_npu(self, positions, hidden_states):
@@ -474,8 +476,29 @@ def _grouped_conv(hidden_states, delta, base, block_size, num_groups, group_size
         position = position % block_size
     for tap in range(1, taps):
         shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
-        out = out + coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
+        shifted = torch.where((position >= tap).view(-1, 1, 1), shifted, 0)
+        out = out + coefficients[:, tap] * shifted
     return out.flatten(-2)
+
+
+# Groups per expansion matmul (SGLANG_DFLASH_CONV_MATMUL_EXPAND): keeps the 0/1 matrix
+# one lane-width deep instead of [groups, hidden].
+_EXPAND_GROUPS = 128
+
+
+def _grouped_conv_channels(hidden_states, delta, base, block_size, taps):
+    """_grouped_conv with ``delta`` [T, taps, H] already widened to channels."""
+    coefficients = base.unsqueeze(0) + delta
+    out = coefficients[:, 0] * hidden_states
+    position = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+    position = position % block_size
+    for tap in range(1, taps):
+        shifted = torch.cat(
+            [hidden_states.new_zeros(tap, hidden_states.shape[1]), hidden_states[:-tap]]
+        )
+        shifted = torch.where((position >= tap).unsqueeze(1), shifted, 0)
+        out = out + coefficients[:, tap] * shifted
+    return out
 
 
 class DFlashGroupedConv(nn.Module):
@@ -506,6 +529,20 @@ class DFlashGroupedConv(nn.Module):
         self.kernel_projection = nn.Linear(
             hidden_size, 2 * self.taps * self.num_groups, bias=False
         )
+        # Convolve flat [T, H] rows, the deltas widened by one 0/1 matmul per sublayer;
+        # on TPU the [T, groups, group_size] views pad to 128 lanes and become copies.
+        self.matmul_expand = (
+            envs.SGLANG_DFLASH_CONV_MATMUL_EXPAND.get()
+            and self.num_groups % _EXPAND_GROUPS == 0
+        )
+        if self.matmul_expand:
+            # Row g is one over channels [g * group_size, (g + 1) * group_size), so
+            # each output is exactly one delta.
+            columns = torch.arange(_EXPAND_GROUPS * self.group_size)
+            expand = columns // self.group_size == torch.arange(_EXPAND_GROUPS)[:, None]
+            self.register_buffer(
+                "group_expand", expand.to(torch.get_default_dtype()), persistent=False
+            )
 
     def _convolve(self, hidden_states, delta, side: int) -> torch.Tensor:
         # Marked here, not inside: by the time the compiled function traces, the dim
@@ -523,8 +560,25 @@ class DFlashGroupedConv(nn.Module):
             self.taps,
         )
 
+    def _convolve_channels(self, hidden_states, delta, side: int) -> torch.Tensor:
+        return _grouped_conv_channels(
+            hidden_states, delta, self.base_kernel[side], self.block_size, self.taps
+        )
+
     def prepare(self, hidden_states: torch.Tensor):
-        coefficients = self.kernel_projection(hidden_states).reshape(
+        coefficients = self.kernel_projection(hidden_states)
+        if self.matmul_expand:
+            # Both sides' deltas at once: [T * 2 * taps * groups / 128, 128] @ group_expand.
+            coefficients = torch.matmul(
+                coefficients.reshape(-1, _EXPAND_GROUPS), self.group_expand
+            ).reshape(*hidden_states.shape[:-1], 2, self.taps, -1)
+            return (
+                self._convolve_channels(
+                    hidden_states, coefficients[..., 0, :, :], side=0
+                ),
+                coefficients[..., 1, :, :],
+            )
+        coefficients = coefficients.reshape(
             *hidden_states.shape[:-1], 2, self.taps, self.num_groups
         )
         return (
@@ -533,6 +587,8 @@ class DFlashGroupedConv(nn.Module):
         )
 
     def finish(self, hidden_states: torch.Tensor, coefficients) -> torch.Tensor:
+        if self.matmul_expand:
+            return self._convolve_channels(hidden_states, coefficients, side=1)
         return self._convolve(hidden_states, coefficients, side=1)
 
 
@@ -623,6 +679,8 @@ class DFlashDraftModel(nn.Module):
 
     decoder_layer_cls = DFlashDecoderLayer
     supports_fused_context_kv = True
+    # Layer prefixes and a quant_config-aware `fc`, for quantized checkpoints.
+    supports_quantization = False
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
@@ -639,6 +697,7 @@ class DFlashDraftModel(nn.Module):
         self.candidate_selector: Optional[nn.Module] = None
         self.lilicorr: Optional[nn.Module] = None
         self.is_nemotron_35_draft = is_nemotron_35_draft_config(config)
+        self.quantizable = self.supports_quantization or self.is_nemotron_35_draft
         self.embed_tokens: Optional[VocabParallelEmbedding] = None
         if self.is_nemotron_35_draft:
             embed_prefix = f"{prefix}.embed_tokens" if prefix else "embed_tokens"
@@ -669,7 +728,7 @@ class DFlashDraftModel(nn.Module):
                     quant_config=quant_config,
                     prefix=(
                         (f"{prefix}.layers.{i}" if prefix else f"layers.{i}")
-                        if self.is_nemotron_35_draft
+                        if self.quantizable
                         else ""
                     ),
                 )
@@ -693,8 +752,17 @@ class DFlashDraftModel(nn.Module):
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
-        if self.is_nemotron_35_draft:
-            fc_prefix = f"{prefix}.fc" if prefix else "fc"
+        fc_prefix = f"{prefix}.fc" if prefix else "fc"
+        if envs.SGLANG_DFLASH_ROW_PARALLEL_FC.get():
+            self.fc = RowParallelLinear(
+                self.num_context_features * hidden_size,
+                hidden_size,
+                bias=False,
+                input_is_parallel=False,
+                quant_config=quant_config if self.quantizable else None,
+                prefix=fc_prefix,
+            )
+        elif self.quantizable:
             self.fc = ReplicatedLinear(
                 self.num_context_features * hidden_size,
                 hidden_size,
@@ -762,11 +830,20 @@ class DFlashDraftModel(nn.Module):
     ) -> torch.Tensor:
         return ctx_hidden
 
+    def _fc_in_features(self) -> int:
+        return int(
+            self.fc.in_features
+            if isinstance(self.fc, nn.Linear)
+            else self.fc.input_size
+        )
+
+    def _project(self, features: torch.Tensor) -> torch.Tensor:
+        projected = self.fc(features)
+        return projected if isinstance(self.fc, nn.Linear) else projected[0]
+
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
-        expected = int(
-            self.fc.input_size if self.is_nemotron_35_draft else self.fc.in_features
-        )
+        expected = self._fc_in_features()
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "DFLASH target_hidden feature dim mismatch. "
@@ -776,31 +853,30 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        projected = self.fc(target_hidden)
-        if self.is_nemotron_35_draft:
-            projected = projected[0]
-        return self.hidden_norm(projected)
+        return self.hidden_norm(self._project(target_hidden))
 
     def sample_draft_tokens_tpu(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor
-    ) -> torch.Tensor:
-        """Sample draft tokens on TPU using target lm_head.
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        """Sample draft tokens on TPU using target lm_head; no candidate lattice.
 
         Extension hook: DSpark overrides it with its markov chain, whose first
-        step conditions on the anchor token in input_ids.
+        step conditions on the anchor token in input_ids; DFlash2 also returns
+        the candidate lattice it walked.
         """
-        from sglang.srt.hardware_backend.tpu.dflash_utils_tpu import (
+        from sglang_tpu.dflash_utils_tpu import (
             argmax_draft_tokens_tpu,
         )
 
         del input_ids
         if self.lm_head is None:
             raise ValueError("DFlash draft on TPU requires lm_head.")
-        return argmax_draft_tokens_tpu(
+        draft_tokens = argmax_draft_tokens_tpu(
             lm_head=self.lm_head,
             hidden_states=hidden_states,
             block_size=self.block_size,
         )
+        return draft_tokens, None
 
     @torch.no_grad()
     def forward(
@@ -852,13 +928,16 @@ class DFlashDraftModel(nn.Module):
                 hidden_states, _ = self.norm(hidden_states, residual)
 
         if _is_tpu and hidden_states.numel() != 0:
-            next_draft_tokens = self.sample_draft_tokens_tpu(hidden_states, input_ids)
+            next_draft_tokens, next_draft_lattice = self.sample_draft_tokens_tpu(
+                hidden_states, input_ids
+            )
         else:
-            next_draft_tokens = None
+            next_draft_tokens, next_draft_lattice = None, None
 
         return LogitsProcessorOutput(
             next_token_logits=None,
             next_draft_tokens=next_draft_tokens,
+            next_draft_lattice=next_draft_lattice,
             hidden_states=hidden_states,
         )
 
@@ -940,7 +1019,12 @@ class DFlashDraftModel(nn.Module):
                             and tuple(loaded_weight.shape) == tuple(param.shape)
                         )
                     else:
-                        expected_shape = tuple(param.shape)
+                        # A row-parallel fc holds a shard; the checkpoint holds the whole matrix.
+                        expected_shape = (
+                            (int(self.config.hidden_size), self._fc_in_features())
+                            if isinstance(self.fc, RowParallelLinear)
+                            else tuple(param.shape)
+                        )
                         loaded_shape = tuple(loaded_weight.shape)
                         shape_matches = loaded_shape == expected_shape
                     if not shape_matches:
@@ -1056,9 +1140,7 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         return layer.input_layernorm(ctx_hidden)
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        expected = int(
-            self.fc.input_size if self.is_nemotron_35_draft else self.fc.in_features
-        )
+        expected = self._fc_in_features()
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "Laguna DFLASH target_hidden feature dim mismatch. "
@@ -1077,10 +1159,7 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         for i, norm in enumerate(self.aux_hidden_norms):
             normed[:, i, :] = norm(slices[:, i, :])
         fused = normed.reshape(target_hidden.shape[0], -1)
-        projected = self.fc(fused)
-        if self.is_nemotron_35_draft:
-            projected = projected[0]
-        return self.hidden_norm(projected)
+        return self.hidden_norm(self._project(fused))
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)

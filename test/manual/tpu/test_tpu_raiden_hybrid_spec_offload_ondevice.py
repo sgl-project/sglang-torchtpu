@@ -6,7 +6,7 @@ Requires a TPU + a built tpu_sync extension + torch_tpu. NOT a CI unit test
     PYTHONPATH=/path/to/sglang-torchtpu/python \
         python3 test/manual/tpu/test_tpu_raiden_hybrid_spec_offload_ondevice.py
 
-Drives a write round + a load round through ``TpuRaidenHybridCacheController``
+Drives a write round + a load round through ``TpuDMAHybridCacheController``
 with the hybrid pool set — a full-attention anchor pool, a SWA pool with its
 own page-id space, and an EAGLE-style 1-layer draft sidecar riding the
 anchor's indices — each backed by its own raiden manager (real DMA), and
@@ -24,14 +24,14 @@ import time
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
-from sglang.srt.hardware_backend.tpu.kv_pool_host import TpuRaidenHostKVCache
-from sglang.srt.hardware_backend.tpu.raiden_hybrid_cache_controller import (
-    TpuRaidenHybridCacheController,
-)
 from sglang.srt.managers.cache_controller import BatchDoneCounter
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import CacheOperation
+from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+from sglang_tpu.kv_pool_host import TpuDMAHostKVPool
+from sglang_tpu.tpu_dma_hybrid_cache_controller import (
+    TpuDMAHybridCacheController,
+)
 
 DEVICE = "tpu:0"
 PAGE_SIZE = 16
@@ -91,7 +91,7 @@ def _page_tokens(pages):
 
 
 def _make_host_pool(pool, label):
-    return TpuRaidenHostKVCache(
+    return TpuDMAHostKVPool(
         pool,
         host_to_device_ratio=2.0,
         host_size=0,
@@ -117,7 +117,7 @@ class _Group:
 
 
 def _make_controller(anchor, swa, draft):
-    controller = object.__new__(TpuRaidenHybridCacheController)
+    controller = object.__new__(TpuDMAHybridCacheController)
     controller.io_backend = "raiden"
     controller.mem_pool_host = _Group(anchor, [swa, draft])
     controller.layer_done_counter = BatchDoneCounter()

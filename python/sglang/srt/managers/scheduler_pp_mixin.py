@@ -12,9 +12,11 @@ import torch.distributed
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
-from sglang.srt.distributed.parallel_state import P2PWork
+from sglang.srt.distributed.parallel_state import GroupCoordinator, P2PWork
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.io_struct import FreezeGCReq
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -43,8 +45,8 @@ _is_tpu = is_tpu()
 _PP_PD_CONSENSUS_TAG = 0x5050
 
 if TYPE_CHECKING:
-    from sglang.srt.hardware_backend.tpu.pp_scheduler import PPDecodeTransferStatus
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang_tpu.pp_scheduler import PPDecodeTransferStatus
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -57,6 +59,14 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
     )
+
+
+def _pp_snapshot_forward_batch(batch: ScheduleBatch) -> Optional[ScheduleBatch]:
+    if batch.spec_algorithm.is_none():
+        return None
+    fwd_batch = batch.copy()
+    fwd_batch.req_pool_indices = batch.req_pool_indices.clone()
+    return fwd_batch
 
 
 def _pp_exchange_outputs_before_forward(
@@ -201,6 +211,7 @@ class SchedulerPPMixin:
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 self._pp_send_proxy(result if cur_batch else None)
+                self._pp_process_freeze_gc(recv_reqs)
 
                 self.pp_outputs = next_pp_outputs
 
@@ -213,7 +224,7 @@ class SchedulerPPMixin:
     # otherwise over the host channel. Each helper dispatches once; the wait
     # on the output copy event is the same on both.
     def _pp_init_wave(self: Scheduler):
-        from sglang.srt.hardware_backend.tpu.pp_scheduler import (
+        from sglang_tpu.pp_scheduler import (
             build_scheduler_pp_wave,
         )
 
@@ -231,6 +242,11 @@ class SchedulerPPMixin:
             return self._pp_recv_proxy_tensors()
         tensors = self._pp_wave.receive()
         return None if tensors is None else PPProxyTensors(tensors)
+
+    def _pp_process_freeze_gc(self: Scheduler, recv_reqs: List) -> None:
+        requests = [req for req in recv_reqs if isinstance(req, FreezeGCReq)]
+        if requests:
+            self.process_input_requests(requests)
 
     def _pp_send_proxy(
         self: Scheduler, result: Optional[GenerationBatchResult]
@@ -402,8 +418,9 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    self._pp_pd_stage_ready(mb_id, cur_batch, result)
                 if get_parallel().pp_async_batch_depth > 0:
-                    self._pp_send_deferred_output(next_first_rank_mb_id)
+                    self._pp_pd_send_deferred_output(next_first_rank_mb_id)
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -457,6 +474,7 @@ class SchedulerPPMixin:
                         control
                     )
                 self._pp_send_proxy(result if cur_batch else None)
+                self._pp_process_freeze_gc(recv_reqs)
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -690,6 +708,7 @@ class SchedulerPPMixin:
                         send_transfer_work,
                     ) = control
                 self._pp_send_proxy(result if has_forward else None)
+                self._pp_process_freeze_gc(recv_reqs)
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -726,7 +745,7 @@ class SchedulerPPMixin:
         self.pp_outputs: Optional[PPProxyTensors] = None
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
         self._pp_spec_relay = (
-            envs.SGLANG_ENABLE_PP_SPEC.get()
+            pp_spec_stable_rows_enabled()
             and get_parallel().pp_size > 1
             and not self.spec_algorithm.is_none()
         )
@@ -828,11 +847,42 @@ class SchedulerPPMixin:
         )
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
+    def _pp_pd_stage_ready(
+        self: Scheduler, mb_id: int, batch: ScheduleBatch, result
+    ) -> None:
+        """Report a launched forward to the prefill KV manager, which may move
+        this stage's KV of the requests it finishes before they sample."""
+        self.disagg_prefill_bootstrap_queue.kv_manager.on_forward_launched(
+            self, mb_id, batch, result
+        )
+
+    def _pp_pd_send_deferred_output(self: Scheduler, mb_id: int) -> None:
+        """_pp_send_deferred_output for the prefill. The wave ships outputs as
+        host copies; the sampled tokens are copied first, so the prefill KV
+        manager gets the same copy once it is sent."""
+        target = self.mbs[mb_id] if self._pp_output_send_deferred() else None
+        if target is None or _pp_can_skip_output_comm(target):
+            self._pp_send_deferred_output(mb_id)
+            return
+        ready_event, queued_outputs = self.last_rank_comm_queue[0]
+        outputs = queued_outputs.tensors
+        with self.pp_comm_stream_ctx:
+            if ready_event is not None:
+                self.device_module.current_stream().wait_event(ready_event)
+            next_token_ids = outputs["next_token_ids"] = outputs["next_token_ids"].cpu()
+        self._pp_send_deferred_output(mb_id)
+        self.disagg_prefill_bootstrap_queue.kv_manager.on_outputs_copied(
+            mb_id, next_token_ids
+        )
+
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success
+        # Aborts holding pages until their senders drain vote here too, so
+        # every stage frees them in the same iteration.
+        reqs = self.disagg_prefill_inflight_queue + self._deferred_chunked_sender_aborts
         if self.pp_group.is_first_rank:
             transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
+                reqs,
                 True,
                 [KVPoll.Success, KVPoll.Failed],
             )
@@ -843,7 +893,7 @@ class SchedulerPPMixin:
             prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
             # 2. get the current stage's transferred reqs info
             curr_transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
+                reqs,
                 True,
                 [KVPoll.Success, KVPoll.Failed],
             )
@@ -1108,12 +1158,8 @@ class SchedulerPPMixin:
             tensor_dict["spec_accept_lens"] = result.accept_lens
             tensor_dict["spec_new_seq_lens"] = result.new_seq_lens
             tensor_dict["spec_bonus_tokens"] = result.next_draft_input.bonus_tokens
-            if (
-                result.accept_index is not None
-                and get_spec().speculative_eagle_topk > 1
-            ):
-                # Only a tree needs it: a chain's accepted path is already the
-                # front of each block, so compacting it is an identity.
+            if result.accept_index is not None:
+                # Relayed recurrent commits also need chain accept indices.
                 tensor_dict["spec_accept_index"] = result.accept_index
             if result.next_verify_chain is not None:
                 # Tail-drafted tree for the next verify round (root = bonus),
@@ -1180,7 +1226,7 @@ class SchedulerPPMixin:
             p2p_work.extend(
                 self.pp_group.send_tensor_dict(
                     tensor_dict=tensor_dict,
-                    all_gather_group=(self.attn_tp_group),
+                    all_gather_group=self._pp_tensor_dict_shard_group(),
                     async_send=async_send,
                 )
             )
@@ -1237,12 +1283,16 @@ class SchedulerPPMixin:
                     (tensor_dict, recv_event)
                 )
 
+    def _pp_tensor_dict_shard_group(self: Scheduler) -> Optional[GroupCoordinator]:
+        # None sends whole dicts: TPU dicts go over host gloo, no device all-gather.
+        return None if self._pp_wave is not None else self.attn_tp_group
+
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
             tensor_dict, self.pp_proxy_recv_event = self._pp_recv_typed_dict(
                 expected_kind="proxy",
-                all_gather_group=(self.attn_tp_group),
+                all_gather_group=self._pp_tensor_dict_shard_group(),
             )
             pp_proxy_tensors = PPProxyTensors(tensor_dict)
         return pp_proxy_tensors
@@ -1254,7 +1304,7 @@ class SchedulerPPMixin:
         # there and relays them on without another copy off the device.
         return self._pp_recv_typed_dict(
             expected_kind="output",
-            all_gather_group=(self.attn_tp_group),
+            all_gather_group=self._pp_tensor_dict_shard_group(),
             keep_on_host=self._pp_wave is not None,
         )
 
@@ -1326,7 +1376,7 @@ class SchedulerPPMixin:
             new_seq_lens = pp_outputs["spec_new_seq_lens"]
             fwd_rids = [req.rid for req in fwd_batch.reqs]
             live_rids = [req.rid for req in batch.reqs]
-            self._pp_spec_compact_accept_kv(
+            self._pp_spec_commit_relayed_accept(
                 batch,
                 fwd_batch,
                 fwd_rids,
@@ -1370,33 +1420,47 @@ class SchedulerPPMixin:
             return output_result
 
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
-        if self._pp_wave is not None:
-            # The relayed outputs stay on the host; decode reads its input IDs
-            # from a device buffer.
+        draft_state = {
+            key: pp_outputs[key]
+            for key in (
+                "draft_topk_p",
+                "draft_topk_index",
+                "draft_hidden_states",
+                "draft_dsa_topk_indices",
+            )
+            if key in pp_outputs.tensors
+        }
+        if self._pp_wave is not None and get_disagg().disaggregation_mode != "prefill":
+            # The relayed outputs stay on the host, and pp_outputs is relayed on
+            # as is; decode reads its input IDs and the draft state from device.
+            # A PD prefill only ships them, so they stay on the host there.
             next_token_ids = next_token_ids.to(batch.device, non_blocking=True)
+            draft_state = {
+                key: value.to(batch.device, non_blocking=True)
+                for key, value in draft_state.items()
+            }
 
         # Rebind the last stage's ring proposal as batch.spec_info so the PD result
         # processor sees the same object on every rank.
         next_draft_input = None
-        if "draft_topk_p" in pp_outputs.tensors:
+        if "draft_topk_p" in draft_state:
             from sglang.srt.speculative.eagle_info import EagleDraftInput
 
             next_draft_input = EagleDraftInput(
-                topk_p=pp_outputs["draft_topk_p"],
-                topk_index=pp_outputs["draft_topk_index"],
-                hidden_states=pp_outputs["draft_hidden_states"],
+                topk_p=draft_state["draft_topk_p"],
+                topk_index=draft_state["draft_topk_index"],
+                hidden_states=draft_state["draft_hidden_states"],
                 bonus_tokens=next_token_ids,
                 num_tokens_per_req=1,
                 num_tokens_for_logprob_per_req=1,
-                dsa_topk_indices=pp_outputs.tensors.get("draft_dsa_topk_indices"),
+                dsa_topk_indices=draft_state.get("draft_dsa_topk_indices"),
             )
             batch.spec_info = next_draft_input
-        elif batch.spec_algorithm.is_dspark():
-            from sglang.srt.speculative.dspark_components.dspark_draft import (
-                make_next_draft_input,
-            )
+        elif batch.spec_algorithm.is_dflash_family():
+            # DFlash (PP prefill on TPU) seeds only the bonus token, like DSpark.
+            from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 
-            next_draft_input = make_next_draft_input(
+            next_draft_input = make_draft_input_v2(
                 bonus_tokens=next_token_ids,
                 new_seq_lens=batch.seq_lens,
             )
@@ -1466,7 +1530,7 @@ class SchedulerPPMixin:
     ):
         self.process_batch_result(batch, output_result)
 
-    def _pp_spec_compact_accept_kv(
+    def _pp_spec_commit_relayed_accept(
         self: Scheduler,
         batch: ScheduleBatch,
         fwd_batch: ScheduleBatch,
@@ -1475,47 +1539,60 @@ class SchedulerPPMixin:
         verify_out_cache_loc: Optional[torch.Tensor],
         pp_outputs,
     ) -> None:
-        """Move this stage's accepted-path KV to the front of each request block.
+        """Commit relayed recurrent state, then compact tree KV when present.
 
-        The verify forward writes one KV slot per tree node, in node order. The
-        committed prefix that every later read assumes is the accepted path laid
-        out contiguously, so the two have to be reconciled once per round -- and
-        each stage has to do it for its own layers, since KV is not relayed.
-        The last stage does it inside verify (_finalize_accept_tree_path); this
-        is the same step for the stages that only ran the target forward.
-
-        Must run before seq_lens advances: the move writes into the block that
-        starts at the pre-advance length.
+        Must run before the live batch advances ``seq_lens``.
         """
         accept_index = pp_outputs.tensors.get("spec_accept_index")
         if accept_index is None or fwd_batch.forward_mode.is_idle():
             return
-        if verify_out_cache_loc is None:
-            return
         from sglang.srt.speculative.spec_utils import (
+            commit_mamba_states_after_verify,
             move_accept_tokens_to_target_kvcache,
         )
 
-        # The destination base is the length each request had when the forward
-        # ran. ScheduleBatch.copy() drops seq_lens but keeps seq_lens_cpu, and
-        # that snapshot is already in the forward's row order -- the live batch
-        # may have been filtered or merged since, and reindexing it would skip
-        # exactly the rounds whose composition changed.
-        device = verify_out_cache_loc.device
+        # Preserve the forward batch's row order after live-batch recomposition.
+        device = (
+            verify_out_cache_loc.device
+            if verify_out_cache_loc is not None
+            else batch.seq_lens.device
+        )
         if fwd_batch.seq_lens_cpu is not None:
             seq_lens = fwd_batch.seq_lens_cpu.to(device=device, dtype=torch.int64)
         elif live_rids == fwd_rids:
             seq_lens = batch.seq_lens
         else:
-            return
+            raise RuntimeError(
+                "PP-spec delayed relay cannot commit a recomposed micro-batch "
+                "without its forward-time seq_lens_cpu snapshot"
+            )
         fwd_batch.seq_lens = seq_lens
+        # copy() drops tree_cache, which the tracking-grid commit needs.
+        fwd_batch.tree_cache = batch.tree_cache
+        accept_index = accept_index.to(device)
+        accept_lens = pp_outputs["spec_accept_lens"].to(device)
+
+        # The last stage already commits inside run_eagle_verify.
+        if not self.pp_group.is_last_rank:
+            commit_mamba_states_after_verify(
+                self.tp_worker,
+                fwd_batch,
+                accept_lens,
+                accept_index,
+                get_spec().speculative_num_draft_tokens,
+            )
+
+        if verify_out_cache_loc is None:
+            return
         fwd_batch.out_cache_loc = verify_out_cache_loc
-        move_accept_tokens_to_target_kvcache(
-            fwd_batch,
-            accept_index.to(device),
-            pp_outputs["spec_accept_lens"].to(device) - 1,
-            self.token_to_kv_pool_allocator,
-        )
+
+        if get_spec().speculative_eagle_topk > 1:
+            move_accept_tokens_to_target_kvcache(
+                fwd_batch,
+                accept_index,
+                accept_lens - 1,
+                self.token_to_kv_pool_allocator,
+            )
 
     def _pp_spec_adopt_relayed_tree(
         self: Scheduler,
@@ -1866,7 +1943,7 @@ class SchedulerPPMixin:
         batch_result = None
         send_output_work = []
 
-        all_gather_group = self.attn_tp_group
+        all_gather_group = self._pp_tensor_dict_shard_group()
 
         # ---- Prepare send dict ----
         # On NPU, always send something (full output or a lightweight skip
@@ -1975,11 +2052,7 @@ class SchedulerPPMixin:
                 )
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
-                    fwd_batch=(
-                        cur_batch.copy()
-                        if not cur_batch.spec_algorithm.is_none()
-                        else None
-                    ),
+                    fwd_batch=_pp_snapshot_forward_batch(cur_batch),
                     verify_out_cache_loc=result.spec_verify_out_cache_loc,
                 )
                 event = self.device_module.Event()
@@ -2092,7 +2165,7 @@ class SchedulerPPMixin:
         if self._pp_wave is not None:
             # Over the wave every stage polls its own receivers and the status
             # carries the failures seen by any stage.
-            from sglang.srt.hardware_backend.tpu.pp_scheduler import (
+            from sglang_tpu.pp_scheduler import (
                 decode_transfer_status,
             )
 
@@ -2169,7 +2242,7 @@ class SchedulerPPMixin:
         if release_rids is not None:
             terminal_rids = release_rids
             if self._pp_wave is not None:
-                from sglang.srt.hardware_backend.tpu.pp_scheduler import (
+                from sglang_tpu.pp_scheduler import (
                     abort_failed_receivers,
                 )
 

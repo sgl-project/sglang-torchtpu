@@ -84,10 +84,9 @@ class TestStageTestFiles(CustomTestCase):
         self.assertTrue(any("multihost" in f for f in self.files))
 
     def test_covers_the_hand_wired_static_jobs(self):
-        # Static P/D and diffusion jobs are not discovered; they are parsed out
-        # of feature-validation-tpu.yml's literal `files:` values.
+        # Static P/D jobs are external-cluster groups (external-topology.yaml).
         self.assertIn(
-            "test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py",
+            "test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_spec.py",
             self.files,
         )
 

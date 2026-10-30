@@ -18,6 +18,8 @@ __all__ = [
     "register_xpu_ci",
     "register_musa_ci",
     "register_mlx_ci",
+    "register_mps_ci",
+    "register_ppu_ci",
     "ut_parse_one_file",
 ]
 
@@ -25,7 +27,7 @@ __all__ = [
 # `register_cpu_ci(5, "base-a-test-cpu")` style positional calls. New fields
 # (`stage`, `runner_config`) are kwarg-only.
 _PARAM_ORDER = ("est_time", "suite", "nightly", "disabled")
-_KWARG_ONLY = ("stage", "runner_config", "labels", "weights_pvc")
+_KWARG_ONLY = ("stage", "runner_config", "labels", "weights_pvc", "chips")
 _ALL_PARAMS = _PARAM_ORDER + _KWARG_ONLY
 _UNSET = object()
 
@@ -39,6 +41,8 @@ class HWBackend(Enum):
     TPU = auto()
     MUSA = auto()
     MLX = auto()
+    MPS = auto()
+    PPU = auto()
 
 
 @dataclass
@@ -59,6 +63,12 @@ class CIRegistry:
     # Weights PVC to mount at /weights, for a test whose checkpoint is not on the
     # shared disk its lane mounts by default.
     weights_pvc: Optional[str] = None
+    # TPU chips the test needs. 1 means it runs correctly pinned to a single
+    # chip, so several such tests can share a host. Anything else -- including
+    # 0, the default, which means nobody has checked -- gets the whole node to
+    # itself, the safe reading. A value above 1 is documentation today: the
+    # runner only dispatches `chips=1` specially.
+    chips: int = 0
 
     @property
     def effective_suite(self) -> Optional[str]:
@@ -142,6 +152,7 @@ def register_tpu_ci(
     runner_config: Optional[str] = None,
     labels: Optional[List[str]] = None,
     weights_pvc: Optional[str] = None,
+    chips: int = 0,
 ):
     """Marker for TPU CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -173,6 +184,32 @@ def register_mlx_ci(
     return None
 
 
+def register_ppu_ci(
+    est_time: float,
+    suite: Optional[str] = None,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner_config: Optional[str] = None,
+):
+    """Marker for PPU CI registration (parsed via AST; runtime no-op)."""
+    return None
+
+
+def register_mps_ci(
+    est_time: float,
+    suite: Optional[str] = None,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner_config: Optional[str] = None,
+):
+    """Marker for Apple MPS CI registration (parsed via AST; runtime no-op)."""
+    return None
+
+
 REGISTER_MAPPING = {
     "register_cpu_ci": HWBackend.CPU,
     "register_cuda_ci": HWBackend.CUDA,
@@ -183,6 +220,8 @@ REGISTER_MAPPING = {
     "register_tpu_ci": HWBackend.TPU,
     "register_musa_ci": HWBackend.MUSA,
     "register_mlx_ci": HWBackend.MLX,
+    "register_mps_ci": HWBackend.MPS,
+    "register_ppu_ci": HWBackend.PPU,
 }
 
 
@@ -312,6 +351,13 @@ class RegistryVisitor(ast.NodeVisitor):
                 f"in {func_call.func.id}()"
             )
 
+        chips = args["chips"] if args["chips"] is not _UNSET else 0
+        if not (isinstance(chips, int) and not isinstance(chips, bool) and chips >= 0):
+            raise ValueError(
+                f"{self.filename}: chips must be a non-negative integer "
+                f"in {func_call.func.id}()"
+            )
+
         return {
             "est_time": float(est_time),
             "stage": stage,
@@ -321,6 +367,7 @@ class RegistryVisitor(ast.NodeVisitor):
             "disabled": disabled,
             "labels": labels,
             "weights_pvc": weights_pvc,
+            "chips": chips,
         }
 
     def _collect_ci_registry(self, func_call: ast.Call):

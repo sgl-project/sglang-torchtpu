@@ -14,6 +14,7 @@
 #                          over raiden. Rank 0 additionally fronts all four
 #                          with the mini-LB on :30000 -- the port the JobSet
 #                          health-gates and rank-0's test files bench.
+#                          Ranks 1-3 exit 0 once that LB goes away.
 set -uo pipefail
 
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -122,6 +123,9 @@ env | grep -E '^TPU_' | sed 's/^/[serve_group]   /' || true
 # validate. (A 2-host tp=16-per-engine variant on a subdivided slice also
 # brings up with a consistently re-scoped libtpu env, but its KV-transfer
 # path is unvalidated; revisit if tp=16 engines are wanted.)
+# The mini-LB keeps the recipe's front port (:30000); capture it before PORT
+# is re-pointed at this pod's engine port below.
+LB_PORT=${LB_PORT:-$PORT}
 if (( WORKER_ID < 2 )); then
     ROLE=prefill
     export PORT=$PD_PREFILL_PORT
@@ -173,7 +177,6 @@ if [[ "$WORKER_ID" == "0" ]]; then
     # --prefill hostnames are injected into requests as the KV bootstrap
     # addresses the decode engines dial, so they must be the cluster-reachable
     # names, never 127.0.0.1.
-    LB_PORT=${LB_PORT:-$PORT}   # the health-gated/benched port
     wait_url "http://${SLICE_HOSTS[0]}:$PD_PREFILL_PORT" "prefill engine 0" "$HEALTH_TIMEOUT" "$ENGINE_PID" || exit 1
     wait_url "http://${SLICE_HOSTS[1]}:$PD_PREFILL_PORT" "prefill engine 1" "$HEALTH_TIMEOUT" || exit 1
     wait_url "http://${SLICE_HOSTS[2]}:$PD_DECODE_PORT" "decode engine 0" "$HEALTH_TIMEOUT" || exit 1
@@ -185,7 +188,30 @@ if [[ "$WORKER_ID" == "0" ]]; then
         --decode "http://${SLICE_HOSTS[2]}:$PD_DECODE_PORT" \
         --decode "http://${SLICE_HOSTS[3]}:$PD_DECODE_PORT" \
         --host 0.0.0.0 --port "$LB_PORT" > >(sed 's/^/[mini-lb] /') 2>&1 &
-    CHILD_PIDS+=("$!")
+    LB_PID=$!
+    CHILD_PIDS+=("$LB_PID")
+    # Waiting only on the engine would leave a dead LB to the JobSet's 90-minute health gate.
+    wait_url "http://127.0.0.1:$LB_PORT" "mini-lb" "$HEALTH_TIMEOUT" "$LB_PID" || exit 1
+    wait "$ENGINE_PID"
+    exit
 fi
 
+# Pods 1-3 are standalone engines that outlive a finished leader, holding the JobSet
+# open until its deadline; leave once the leader's LB, seen healthy, stops answering.
+# A failed leader fails the JobSet on its own. Any HTTP answer means the LB process is
+# up: /health now also fails while an engine is down, and older sglang-router wheels
+# answer /liveness with 404, which still proves the LB is alive.
+LEADER_LB="http://${SLICE_HOSTS[0]}:$LB_PORT/liveness"
+LEADER_GONE_POLLS=6
+seen=0 misses=0
+while kill -0 "$ENGINE_PID" 2>/dev/null; do
+    code=$(curl -s -o /dev/null -m "$CURL_MAX_TIME" -w "%{http_code}" "$LEADER_LB" 2>/dev/null || true)
+    if [[ -n "$code" && "$code" != "000" ]]; then
+        seen=1 misses=0
+    elif (( seen && ++misses >= LEADER_GONE_POLLS )); then
+        echo "[serve_group] leader LB $LEADER_LB gone for $misses polls; rank $WORKER_ID exiting"
+        exit 0
+    fi
+    sleep "$HEALTH_POLL_INTERVAL"
+done
 wait "$ENGINE_PID"

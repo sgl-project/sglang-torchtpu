@@ -21,7 +21,7 @@ from types import SimpleNamespace
 from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
 
 import unittest
 
@@ -37,8 +37,8 @@ except ImportError:  # pragma: no cover - JAX is absent on some CPU CI agents
 # Deliberately outside the try: once JAX is present, a failure to import the
 # pallas chain is a real breakage and must surface, not silently skip the suite.
 if _HAS_GMM:
-    from sglang.srt.layers.moe.pallas import gmm_v2
-    from sglang.srt.layers.moe.pallas.fused_moe_op import (
+    from sglang_tpu.moe.pallas import gmm_v2
+    from sglang_tpu.moe.pallas.fused_moe_op import (
         _dividing_tile_k,
         _gmm2_tile_source,
         _largest_compatible_tile_k,
@@ -153,8 +153,8 @@ class TestDividingTileK(CustomTestCase):
 
     # ---- no-op on everything that already worked ------------------------
 
-    def test_tier5_shape_is_unchanged(self):
-        # Tier5: hidden 8192 (GMM1 k) and routed hidden 4096 (GMM2 k) both
+    def test_aligned_shape_is_unchanged(self):
+        # Hidden 8192 (GMM1 k) and routed hidden 4096 (GMM2 k) both
         # resolve tile_k=2048, already a multiple of 512. Must not move.
         for size_k in (4096, 8192):
             with self.subTest(size_k=size_k):
@@ -230,7 +230,7 @@ class TestGmm2TileSource(CustomTestCase):
         return jnp.zeros((num_experts, size_k, size_n), dtype=dtype)
 
     def _source(self, dtype, *, w2_packed, w2_scale=None):
-        # Real gmm2 K is 4096 (Tier5 routed hidden). Packed FP4 stores 2 codes
+        # Real gmm2 K is 4096 (the routed hidden). Packed FP4 stores 2 codes
         # per byte along K, so its stored K is half that.
         return _gmm2_tile_source(
             jnp.zeros((4096, 4096), dtype=jnp.bfloat16),

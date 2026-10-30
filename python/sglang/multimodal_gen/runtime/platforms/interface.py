@@ -52,6 +52,10 @@ class AttentionBackendEnum(enum.Enum):
     CUBE_SPARSE_ATTN = enum.auto()
     FP8_FA_SM120 = enum.auto()
     NO_ATTENTION = enum.auto()
+    # An out-of-tree platform's own backend: the platform names it
+    # (Platform.get_oot_attn_backend_name) and resolves its class. Appended so
+    # earlier members keep their auto() values.
+    OOT = enum.auto()
 
     def __str__(self):
         return self.name.lower()
@@ -142,6 +146,15 @@ class Platform:
     def apply_server_args_defaults(self, server_args: ServerArgs) -> None:
         """Apply defaults before argument normalization and validation."""
         pass
+
+    def supports_teacache_with_torch_compile(self) -> bool:
+        """Whether TeaCache may run under --enable-torch-compile.
+
+        TeaCache updates module state every denoising step; a backend that
+        recompiles on that (rather than graph-breaking cheaply) says False and
+        requests drop TeaCache with a warning.
+        """
+        return True
 
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the backend used to compile diffusion modules."""
@@ -269,7 +282,6 @@ class Platform:
         return self.is_rocm()
 
     @classmethod
-    @lru_cache(maxsize=1)
     def is_amp_supported(cls) -> bool:
         return True
 
@@ -288,6 +300,11 @@ class Platform:
 
     @classmethod
     def supports_device_tensor_pickle(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_safetensors_device_load(cls) -> bool:
+        """Whether safetensors can open tensors directly on this platform's device."""
         return True
 
     @classmethod
@@ -319,6 +336,12 @@ class Platform:
     ) -> str:
         """Get the attention backend class of a device."""
         return ""
+
+    @classmethod
+    def get_oot_attn_backend_name(cls) -> str | None:
+        """The ``--attention-backend`` name of this platform's own backend
+        (``AttentionBackendEnum.OOT``), or None when it has none."""
+        return None
 
     @classmethod
     def get_device_capability(
@@ -514,6 +537,11 @@ class Platform:
     def get_cpu_architecture(cls) -> CpuArchEnum:
         """Get the CPU architecture of the current platform."""
         return CpuArchEnum.UNSPECIFIED
+
+    @classmethod
+    def supports_vae_torch_compile(cls) -> bool:
+        """Whether ``--enable-torch-compile`` also compiles the VAE decode."""
+        return True
 
     @classmethod
     def enable_dit_layerwise_offload_by_default(cls) -> bool:

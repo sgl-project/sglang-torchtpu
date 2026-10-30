@@ -71,11 +71,44 @@ _is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_tpu = is_tpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_gfx95 = _is_hip and is_gfx95_supported()
 
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
+    from aiter.ops.triton.gemm_a16w16 import gemm_a16w16 as _aiter_triton_a16w16
     from aiter.tuned_gemm import tgemm
+
+# Route supported decode shapes that are absent from the tuned table.
+_A16W16_TRITON_MAX_K = 2048
+_A16W16_TRITON_MAX_M = 64
+_A16W16_TRITON_NARROW_K = 512
+_A16W16_TRITON_NARROW_K_MAX_M = 512
+
+
+def _prefer_triton_a16w16(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Return whether the Triton BF16 path supports this decode shape."""
+    if x.dim() != 2 or weight.dim() != 2:
+        return False
+    k = weight.shape[1]
+    max_m = (
+        _A16W16_TRITON_NARROW_K_MAX_M
+        if k <= _A16W16_TRITON_NARROW_K
+        else _A16W16_TRITON_MAX_M
+    )
+    return (
+        x.is_cuda
+        and weight.is_cuda
+        and x.device == weight.device
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and x.shape[1] == k
+        and 0 < k <= _A16W16_TRITON_MAX_K
+        and 0 < x.shape[0] <= max_m
+        and weight.shape[0] > 0
+        and x.is_contiguous()
+        and weight.is_contiguous()
+    )
 
 
 class Bf16GemmBackend(Enum):
@@ -483,6 +516,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return output
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
+            if _is_gfx95 and _prefer_triton_a16w16(x, layer.weight):
+                return _aiter_triton_a16w16(x, layer.weight, bias, dtype=x.dtype)
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         elif (
@@ -630,6 +665,21 @@ def _empty_xpu_moe_expert_weight(
     return torch.empty(num_experts, n_dim, k_dim + pad, dtype=dtype)[:, :, :k_dim]
 
 
+# SGLang's (num_experts, n, k) <-> gmm_v2's (num_experts, k, n), for w13 and w2
+def _swap_expert_weight_layout(layer: torch.nn.Module) -> None:
+    for name in ("w13_weight", "w2_weight"):
+        old = getattr(layer, name).data
+        copy_or_rebind_param(layer, name, old.transpose(1, 2).contiguous())
+        # copy_or_rebind_param copies in place when the shape is unchanged, so a
+        # shape-preserving (square) transpose leaves the param on `old`'s storage;
+        # freeing it then would zero the live weight (e.g. w2 when intermediate == hidden).
+        if (
+            getattr(layer, name).data.untyped_storage().data_ptr()
+            != old.untyped_storage().data_ptr()
+        ):
+            old.untyped_storage().resize_(0)
+
+
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
     """MoE method without quantization."""
 
@@ -661,6 +711,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         **extra_weight_attrs,
     ):
         self.with_bias = with_bias
+        # TPU: the intermediate-dim padding while the experts are in gmm_v2's layout, None otherwise
+        layer.tpu_gmm_pad = None
 
         # XPU only: the sgl-kernel-xpu grouped GEMM honours the weights' row
         # stride, so it can be padded to dodge L3 set aliasing on unlucky K
@@ -723,6 +775,24 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             layer.register_parameter("w2_weight_bias", w2_weight_bias)
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        # TPU: the FusedMoE weight loader writes SGLang's (num_experts, n, k) layout, so a
+        # reload first undoes process_weights_after_loading's gmm_v2 layout and padding
+        pad = layer.tpu_gmm_pad
+        if pad is None:
+            return
+        _swap_expert_weight_layout(layer)
+        if pad:
+            inter = layer.w2_weight.shape[-1] - pad
+            gate, up = layer.w13_weight.data.split(inter + pad, dim=1)
+            copy_or_rebind_param(
+                layer, "w13_weight", torch.cat([gate[:, :inter], up[:, :inter]], dim=1)
+            )
+            copy_or_rebind_param(
+                layer, "w2_weight", layer.w2_weight.data[..., :inter].contiguous()
+            )
+        layer.tpu_gmm_pad = None
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # TPU: gmm_v2 expects (num_experts, k, n) but SGLang stores
         # (num_experts, n, k). Swap once at load time so the forward_tpu
@@ -743,20 +813,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 copy_or_rebind_param(layer, "w13_weight", w13)
                 w2 = _pad_last_axis(layer.w2_weight.data, pad)
                 copy_or_rebind_param(layer, "w2_weight", w2)
-            for name in ("w13_weight", "w2_weight"):
-                old = getattr(layer, name).data
-                new = old.transpose(1, 2).contiguous()
-                copy_or_rebind_param(layer, name, new)
-                # copy_or_rebind_param copies in place when the shape is
-                # unchanged, so a shape-preserving (square) transpose leaves the
-                # param pointing at `old`'s storage. Only free `old` when the
-                # param was actually rebound to a new storage; otherwise we would
-                # zero out the live weight (e.g. w2 when intermediate == hidden).
-                if (
-                    getattr(layer, name).data.untyped_storage().data_ptr()
-                    != old.untyped_storage().data_ptr()
-                ):
-                    old.untyped_storage().resize_(0)
+            else:
+                pad = 0
+            _swap_expert_weight_layout(layer)
+            layer.tpu_gmm_pad = pad
             return
 
         _should_use_aiter_moe = (
@@ -1144,10 +1204,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 swiglu_limit=swiglu_limit,
-                moe_ep_size=layer.moe_ep_size,
-                moe_ep_rank=layer.moe_ep_rank,
-                moe_tp_size=layer.moe_tp_size,
-                moe_tp_rank=layer.moe_tp_rank,
                 apply_routed_scaling_factor=not layer.should_fuse_routed_scaling_factor_in_topk,
             )
             return self.runner.run(dispatch_output, quant_info)
@@ -1313,8 +1369,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         w1_scale: Optional[torch.Tensor] = None,
         w2_scale: Optional[torch.Tensor] = None,
     ) -> CombineInput:
-        from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
         moe_runner_config = self.moe_runner_config
         if moe_runner_config.apply_router_weight_on_input:
@@ -1337,16 +1393,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         # expert_group_offset + num_local_experts). gmm_v2 only touches the rows
         # of expert groups inside that window, so non-local experts cost nothing
         # and no remapping to local IDs is needed. Under EP1 the offset is 0 and
-        # the window spans every expert, so the window check is a no-op.
+        # the window spans every expert, so the window check is a no-op. The
+        # kernel drops IDs outside the global range (TopK's -1 padded tokens).
         global_num_experts = layer.num_local_experts * get_parallel().moe_ep_size
         expert_group_offset = layer.num_local_experts * get_parallel().moe_ep_rank
-        # gmm_v2 indexes its weights by expert ID, so IDs outside the global
-        # range would read out of bounds. Clamp them and zero their routing
-        # weight, so the expert-0 slot they land on contributes nothing.
-        # Defensive: no router on this path emits out-of-range IDs today.
-        valid = (topk_ids >= 0) & (topk_ids < global_num_experts)
-        topk_ids = torch.where(valid, topk_ids, 0)
-        kernel_topk_weights = kernel_topk_weights * valid.to(x.dtype)
 
         # Weights are already in gmm_v2's (num_experts, k, n) layout — the swap
         # from SGLang's (num_experts, n, k) happens once in
@@ -1372,11 +1422,26 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             gemm1_alpha=moe_runner_config.gemm1_alpha,
             gemm1_clamp_limit=moe_runner_config.gemm1_clamp_limit,
         )
+        # The pallas fused-MoE runner has no in-kernel routed_scaling_factor
+        # support (its triton counterpart applies it inside the combine
+        # kernel). Apply it to the combined routed output here so models
+        # declaring routed_scaling_factor (e.g. Bailing's 2.5, applied after
+        # topk renormalization) keep their trained routing magnitude; the
+        # model layer adds shared experts outside and leaves them unscaled.
+        # Contract with the model layer: it applies the factor itself only on
+        # A2A paths (see _apply_routed_scaling_factor_on_output), so this
+        # multiply is valid for the standard dispatcher only; an A2A backend
+        # on TPU would need this guard revisited to avoid applying it twice.
+        routed_scaling_factor = moe_runner_config.routed_scaling_factor
         if no_combine:
-            # The kernel masks non-local groups, but invalid IDs mapped to
-            # expert 0 appear local on rank 0. Preserve zero-weight slot masking
-            # before the caller applies per-expert normalization and weights.
+            # Per-expert output stays unscaled: the caller combines on its
+            # own terms (per-request normalization), so pre-scaling would
+            # change those semantics.
+            # The EP kernel masks by ownership only; zero-weight slots stay zero
+            # for the caller's per-expert normalization, as without EP.
             output = torch.where(kernel_topk_weights.unsqueeze(-1) != 0, output, 0)
+        elif routed_scaling_factor is not None and routed_scaling_factor != 1.0:
+            output = output * routed_scaling_factor
         return StandardCombineInput(hidden_states=output)
 
     def forward_musa(self, *args, **kwargs) -> CombineInput:

@@ -5,7 +5,7 @@ Runs anywhere (no TPU required) — exercises pure Python env-var logic.
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit", chips=1)
 
 import os
 import unittest
@@ -47,7 +47,14 @@ class TestInitializeTorchTpuWorker(CustomTestCase):
 
     def test_skips_when_device_not_tpu(self):
         args = SimpleNamespace(
-            device="cuda", tp_size=8, pp_size=1, nnodes=1, node_rank=0, use_ray=False
+            device="cuda",
+            tp_size=8,
+            pp_size=1,
+            nnodes=1,
+            node_rank=0,
+            use_ray=False,
+            dp_size=1,
+            attn_dp_size=1,
         )
         initialize_torch_tpu_worker(args, tp_rank=3)
         for k in _TORCHRUN_ENV_VARS:
@@ -56,7 +63,14 @@ class TestInitializeTorchTpuWorker(CustomTestCase):
 
     def test_sets_torchrun_vars_for_tpu(self):
         args = SimpleNamespace(
-            device="tpu", tp_size=4, pp_size=1, nnodes=2, node_rank=1, use_ray=False
+            device="tpu",
+            tp_size=4,
+            pp_size=1,
+            nnodes=2,
+            node_rank=1,
+            use_ray=False,
+            dp_size=1,
+            attn_dp_size=1,
         )
 
         def assert_worker_env_is_ready():
@@ -75,7 +89,14 @@ class TestInitializeTorchTpuWorker(CustomTestCase):
 
     def test_single_node_rank0(self):
         args = SimpleNamespace(
-            device="tpu", tp_size=8, pp_size=1, nnodes=1, node_rank=0, use_ray=False
+            device="tpu",
+            tp_size=8,
+            pp_size=1,
+            nnodes=1,
+            node_rank=0,
+            use_ray=False,
+            dp_size=1,
+            attn_dp_size=1,
         )
         initialize_torch_tpu_worker(args, tp_rank=0)
         self.assertEqual(os.environ["RANK"], "0")
@@ -84,7 +105,14 @@ class TestInitializeTorchTpuWorker(CustomTestCase):
 
     def test_pipeline_stages_share_one_slice(self):
         args = SimpleNamespace(
-            device="tpu", tp_size=1, pp_size=8, nnodes=1, node_rank=0, use_ray=False
+            device="tpu",
+            tp_size=1,
+            pp_size=8,
+            nnodes=1,
+            node_rank=0,
+            use_ray=False,
+            dp_size=1,
+            attn_dp_size=1,
         )
         initialize_torch_tpu_worker(args, tp_rank=0, pp_rank=5)
         self.assertEqual(os.environ["RANK"], "5")
@@ -95,7 +123,14 @@ class TestInitializeTorchTpuWorker(CustomTestCase):
 
     def test_pipeline_rank_is_pp_major(self):
         args = SimpleNamespace(
-            device="tpu", tp_size=2, pp_size=2, nnodes=1, node_rank=0, use_ray=False
+            device="tpu",
+            tp_size=2,
+            pp_size=2,
+            nnodes=1,
+            node_rank=0,
+            use_ray=False,
+            dp_size=1,
+            attn_dp_size=1,
         )
         initialize_torch_tpu_worker(args, tp_rank=1, pp_rank=1)
         self.assertEqual(os.environ["RANK"], "3")
@@ -105,7 +140,14 @@ class TestInitializeTorchTpuWorker(CustomTestCase):
         os.environ["MASTER_ADDR"] = "10.0.0.1"
         os.environ["MASTER_PORT"] = "12345"
         args = SimpleNamespace(
-            device="tpu", tp_size=1, pp_size=1, nnodes=1, node_rank=0, use_ray=False
+            device="tpu",
+            tp_size=1,
+            pp_size=1,
+            nnodes=1,
+            node_rank=0,
+            use_ray=False,
+            dp_size=1,
+            attn_dp_size=1,
         )
         initialize_torch_tpu_worker(args, tp_rank=0)
         self.assertEqual(os.environ["MASTER_ADDR"], "10.0.0.1")
@@ -119,6 +161,8 @@ class TestInitializeTorchTpuWorker(CustomTestCase):
             nnodes=1,
             node_rank=0,
             use_ray=False,
+            dp_size=1,
+            attn_dp_size=1,
             base_gpu_id=4,
             gpu_id_step=1,
         )
@@ -134,6 +178,8 @@ class TestInitializeTorchTpuWorker(CustomTestCase):
             nnodes=1,
             node_rank=0,
             use_ray=False,
+            dp_size=1,
+            attn_dp_size=1,
             base_gpu_id=1,
             gpu_id_step=2,
         )
@@ -149,6 +195,8 @@ class TestInitializeTorchTpuWorker(CustomTestCase):
             nnodes=1,
             node_rank=0,
             use_ray=True,
+            dp_size=1,
+            attn_dp_size=1,
             base_gpu_id=0,
             gpu_id_step=1,
         )

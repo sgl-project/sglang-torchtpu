@@ -19,7 +19,7 @@ otherwise.
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
 
 import importlib.util
 import unittest
@@ -43,7 +43,7 @@ class TestTpuFusedKVPoolFp8(CustomTestCase):
     LAYER_NUM = 2
 
     def _make_pool(self, dtype):
-        from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
         return TpuFusedMHATokenToKVPool(
             size=self.SIZE,
@@ -100,7 +100,7 @@ class TestTpuFusedKVPoolFp8(CustomTestCase):
     def test_mla_pool_layers_are_fp8_bases(self):
         import torch
 
-        from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMLATokenToKVPool
+        from sglang_tpu.kv_pool import TpuFusedMLATokenToKVPool
 
         pool = TpuFusedMLATokenToKVPool(
             size=self.SIZE,

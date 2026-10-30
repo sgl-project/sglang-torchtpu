@@ -266,7 +266,8 @@ class Req:
                 f"'{type(self).__name__}' object has no attribute '{name}'"
             )
 
-        sampling_params = object.__getattribute__(self, "sampling_params")
+        # __dict__ rather than object.__getattribute__, which dynamo cannot trace.
+        sampling_params = self.__dict__.get("sampling_params")
         if sampling_params is not None and hasattr(sampling_params, name):
             return getattr(sampling_params, name)
 
@@ -346,7 +347,8 @@ class Req:
         self.metrics.suppress_stage_breakdown = True
         self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
         self.extra["warmup_target_num_inference_steps"] = self.num_inference_steps
-        self.num_inference_steps = warmup_steps
+        floor = getattr(type(self.sampling_params), "min_num_inference_steps", 1)
+        self.num_inference_steps = max(warmup_steps, floor)
 
     def copy_as_warmup(self, warmup_steps: int = 1) -> Req:
         req = deepcopy(self)

@@ -1,55 +1,7 @@
-load("@rules_python//python:defs.bzl", "py_library", "py_test")
+load("@rules_python//python:defs.bzl", "py_library")
 load("//bazel:defs.bzl", "sglang_tpu_e2e_test")
 
 package(default_visibility = ["//visibility:public"])
-
-# These files select their host-side configuration checks by default. Their
-# existing `integration` argument starts the P/D fixture in the assigned pod.
-[py_test(
-    name = "test_tpu_gpt_oss_120b_pd_singlehost" + suffix + "_config",
-    size = "small",
-    srcs = ["test_tpu_gpt_oss_120b_pd_singlehost" + suffix + ".py"],
-    data = ["//benchmark/tpu:runtime"],
-    main = "test_tpu_gpt_oss_120b_pd_singlehost" + suffix + ".py",
-    python_version = "3.12",
-    deps = ["//python:tpu_launcher_test_support"],
-) for suffix in ["", "_decode_radix", "_spec"]]
-
-sglang_tpu_e2e_test(
-    name = "test_tpu_gpt_oss_120b_singlehost_spec",
-    srcs = ["test_tpu_gpt_oss_120b_singlehost_spec.py"],
-    data = [
-        # Shell recipes, eval configs, and helpers the launcher resolves at
-        # runtime (benchmark/tpu/**, reached via _TPU_BENCH_DIR).
-        "//benchmark/tpu:runtime",
-    ],
-    main = "test_tpu_gpt_oss_120b_singlehost_spec.py",
-    tags = [
-        "requires-tpu-v7x",
-    ],
-    deps = [
-        "//python:tpu_launcher_test_support",
-        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
-    ],
-)
-
-sglang_tpu_e2e_test(
-    name = "test_tpu_gpt_oss_120b_singlehost_dpa",
-    srcs = ["test_tpu_gpt_oss_120b_singlehost_dpa.py"],
-    data = [
-        # Shell recipes, eval configs, and helpers the launcher resolves at
-        # runtime (benchmark/tpu/**, reached via _TPU_BENCH_DIR).
-        "//benchmark/tpu:runtime",
-    ],
-    main = "test_tpu_gpt_oss_120b_singlehost_dpa.py",
-    tags = [
-        "requires-tpu-v7x",
-    ],
-    deps = [
-        "//python:sglang",
-        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
-    ],
-)
 
 sglang_tpu_e2e_test(
     name = "test_tpu_qwen3_coder_30b_singlehost_lm_eval",
@@ -76,30 +28,6 @@ sglang_tpu_e2e_test(
     tags = ["requires-tpu-v7x"],
     deps = [
         "//benchmark/tpu:python_configs",
-        "//python:sglang",
-        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
-    ],
-)
-
-sglang_tpu_e2e_test(
-    name = "test_tpu_qwen3_0_6b_singlehost_eval_accuracy_large",
-    srcs = ["test_tpu_qwen3_0_6b_singlehost_eval_accuracy_large.py"],
-    data = ["//benchmark/tpu:runtime"],
-    main = "test_tpu_qwen3_0_6b_singlehost_eval_accuracy_large.py",
-    tags = ["requires-tpu-v7x"],
-    deps = [
-        "//python:sglang",
-        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
-    ],
-)
-
-sglang_tpu_e2e_test(
-    name = "test_tpu_qwen3_0_6b_singlehost_prefix_cache",
-    srcs = ["test_tpu_qwen3_0_6b_singlehost_prefix_cache.py"],
-    data = ["//benchmark/tpu:runtime"],
-    main = "test_tpu_qwen3_0_6b_singlehost_prefix_cache.py",
-    tags = ["requires-tpu-v7x"],
-    deps = [
         "//python:sglang",
         "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
     ],
@@ -149,18 +77,6 @@ sglang_tpu_e2e_test(
     srcs = ["test_tpu_qwen3_coder_480b_singlehost_prefix_cache_kv_offload_gsm8k.py"],
     data = ["//benchmark/tpu:runtime"],
     main = "test_tpu_qwen3_coder_480b_singlehost_prefix_cache_kv_offload_gsm8k.py",
-    tags = ["requires-tpu-v7x"],
-    deps = [
-        "//python:sglang",
-        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
-    ],
-)
-
-sglang_tpu_e2e_test(
-    name = "test_tpu_qwen3_coder_480b_singlehost_spec_decoding_gsm8k",
-    srcs = ["test_tpu_qwen3_coder_480b_singlehost_spec_decoding_gsm8k.py"],
-    data = ["//benchmark/tpu:runtime"],
-    main = "test_tpu_qwen3_coder_480b_singlehost_spec_decoding_gsm8k.py",
     tags = ["requires-tpu-v7x"],
     deps = [
         "//python:sglang",

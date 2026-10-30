@@ -123,7 +123,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         quant_config = _mtp_quant_config(quant_config)
 
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
 
@@ -164,6 +163,9 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             num_logical_experts=text_config.num_experts,
             num_groups=None,
         )
+
+    def get_input_embeddings(self):
+        return self.model.get_input_embeddings()
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -208,21 +210,24 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             )
 
         try:
-            assert input_embeds is None
-            input_embeds = forward_batch.mm_input_embeds
-            if (
-                forward_batch.forward_mode.is_extend()
-                and forward_batch.contains_mm_inputs()
-                and not forward_batch.forward_mode.is_draft_extend_v2()
-            ):
-                assert input_embeds is not None
-                last_indices = (
-                    forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
-                ).long()
-                input_embeds[last_indices] = self.model.embed_tokens(
-                    input_ids[last_indices]
-                )
-
+            # TPU draft warmup/serving can supply embeddings with the appended
+            # next token already folded in outside the compiled backbone.
+            if input_embeds is None:
+                input_embeds = forward_batch.mm_input_embeds
+                if (
+                    forward_batch.forward_mode.is_extend()
+                    and forward_batch.contains_mm_inputs()
+                    and not forward_batch.forward_mode.is_draft_extend_v2()
+                ):
+                    assert input_embeds is not None
+                    last_indices = (
+                        forward_batch.extend_start_loc
+                        + forward_batch.extend_seq_lens
+                        - 1
+                    ).long()
+                    input_embeds[last_indices] = self.model.embed_tokens(
+                        input_ids[last_indices]
+                    )
             if input_embeds is None:
                 input_embeds = self.model.embed_tokens(input_ids)
 

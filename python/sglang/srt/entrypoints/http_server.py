@@ -142,6 +142,7 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
     ProfileReq,
+    PullWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
@@ -433,7 +434,7 @@ async def lifespan(fast_api_app: FastAPI):
         # Execute the general warmup
         warmup_thread = threading.Thread(
             target=_wait_and_warmup,
-            kwargs=warmup_thread_kwargs,
+            kwargs={**warmup_thread_kwargs, "event_loop": asyncio.get_running_loop()},
         )
         warmup_thread.start()
 
@@ -699,6 +700,23 @@ async def ready() -> Response:
     return Response(status_code=status_code)
 
 
+def _retrieve_health_probe_outcome(task: asyncio.Task) -> None:
+    """Consume the outcome of a health probe task that nobody awaits.
+
+    health_generate decides from last_receive_tstamp and only requests
+    cancellation of its probe. The cancel can lose a race with the probe's own
+    wait_for timeout in _stream_one_response: the task then finishes with the
+    client-disconnect ValueError (the handler has already returned) instead of
+    CancelledError, and asyncio logs "Task exception was never retrieved" when
+    the task is garbage-collected.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.debug("Abandoned health check probe ended with %r", exc)
+
+
 @app.get("/health")
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
@@ -754,6 +772,10 @@ async def health_generate(request: Request) -> Response:
             break
 
     task = asyncio.create_task(gen())
+    # A done callback, not an await: if the cancel below loses its race, the
+    # task runs until the next SGLANG_REQUEST_STATE_WAIT_TIMEOUT tick, and
+    # awaiting it would add that to the probe's latency.
+    task.add_done_callback(_retrieve_health_probe_outcome)
 
     # As long as we receive any response from the detokenizer/scheduler, we consider the server is healthy.
     tic = time.time()
@@ -1187,6 +1209,7 @@ async def stop_profile_async():
 
 
 @app.api_route("/set_trace_level", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 def set_trace_level(level: int = Query(..., ge=0)):
     set_global_trace_level(level)
 
@@ -1269,6 +1292,19 @@ async def update_weights_from_disk(
             content,
             status_code=HTTPStatus.BAD_REQUEST,
         )
+
+
+@app.post("/pull_weights")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pull_weights(obj: Annotated[PullWeightsReqInput, Body()], request: Request):
+    """Have every host of this deployment pull published weight deltas into its
+    local checkpoint (materialized from the model path on first use)."""
+    success, message = await _global_state.tokenizer_manager.pull_weights(obj, request)
+
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST
+    )
 
 
 @app.post("/init_weights_send_group_for_remote_instance")
@@ -1606,6 +1642,7 @@ async def load_lora_adapter(
 
 
 @app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def load_lora_adapter_from_tensors(
     obj: Annotated[LoadLoRAAdapterFromTensorsReqInput, Body()], request: Request
 ):
@@ -2252,7 +2289,7 @@ async def _send_disaggregation_warmup_requests(
         return await asyncio.gather(
             *(
                 send_request(session, dp_rank)
-                for dp_rank in range(get_parallel().dp_size)
+                for dp_rank in range(get_parallel().num_dp_ranks)
             )
         )
 
@@ -2316,9 +2353,11 @@ def _execute_server_warmup(server_args: ServerArgs):
         },
     }
     if get_serving().skip_tokenizer_init:
-        json_data["input_ids"] = [[10, 11, 12] for _ in range(get_parallel().dp_size)]
+        json_data["input_ids"] = [
+            [10, 11, 12] for _ in range(get_parallel().num_dp_ranks)
+        ]
         # TODO Workaround the bug that embedding errors for list of size 1
-        if get_parallel().dp_size == 1:
+        if get_parallel().num_dp_ranks == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
     elif (
         is_vlm
@@ -2362,9 +2401,11 @@ def _execute_server_warmup(server_args: ServerArgs):
             "temperature": 0.0,
         }
     else:
-        json_data["text"] = ["The capital city of France is"] * get_parallel().dp_size
+        json_data["text"] = [
+            "The capital city of France is"
+        ] * get_parallel().num_dp_ranks
         # TODO Workaround the bug that embedding errors for list of size 1
-        if get_parallel().dp_size == 1:
+        if get_parallel().num_dp_ranks == 1:
             json_data["text"] = json_data["text"][0]
 
     # Config debug dumping
@@ -2387,9 +2428,6 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
-            # Skip server_status update for Rust server
-            if not envs.SGLANG_RUST_SERVER.get():
-                _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
@@ -2402,26 +2440,17 @@ def _execute_server_warmup(server_args: ServerArgs):
                 )
             )
             failed_status_codes = [code for code in status_codes if code != 200]
-            if not failed_status_codes:
-                logger.info(
-                    "Disaggregation warmup requests completed for all %s DP ranks",
-                    get_parallel().dp_size,
+            if failed_status_codes:
+                raise RuntimeError(
+                    "Disaggregation warmup failed "
+                    f"(mode={get_disagg().disaggregation_mode}), "
+                    f"status codes: {failed_status_codes}"
                 )
-                logger.info("End of disaggregation warmup")
-            else:
-                logger.info(
-                    "Disaggregation warmup failed (mode=%s), status codes: %s",
-                    get_disagg().disaggregation_mode,
-                    failed_status_codes,
-                )
-            # In rust-server mode there is no TokenizerManager (readiness is
-            # the Rust server's own /health), so skip the status update.
-            if not envs.SGLANG_RUST_SERVER.get():
-                _global_state.tokenizer_manager.server_status = (
-                    ServerStatus.Up
-                    if not failed_status_codes
-                    else ServerStatus.UnHealthy
-                )
+            logger.info(
+                "Disaggregation warmup requests completed for all %s DP ranks",
+                get_parallel().num_dp_ranks,
+            )
+            logger.info("End of disaggregation warmup")
 
     except Exception:
         last_traceback = get_exception_traceback()
@@ -2432,29 +2461,25 @@ def _execute_server_warmup(server_args: ServerArgs):
     return success
 
 
-def _freeze_gc_after_server_warmup(server_args: ServerArgs):
-    # Freeze GC after server warmup so static objects skip future GC gen2 collection.
-    # Use /freeze_gc to freeze scheduler and detokenizer as well.
-    freeze_key = get_serving().admin_api_key or get_serving().api_key
-    freeze_headers = {}
-    if freeze_key:
-        freeze_headers["Authorization"] = f"Bearer {freeze_key}"
-    try:
-        res = requests.post(
-            server_args.url() + "/freeze_gc",
-            headers=freeze_headers,
-            timeout=10,
-            verify=ssl_verify_of(server_args),
-        )
-        res.raise_for_status()
-    except requests.exceptions.RequestException:
-        logger.warning("post-warmup freeze_gc failed", exc_info=True)
+_FREEZE_GC_TIMEOUT_SECS = 600
+
+
+def _freeze_gc_after_server_warmup(event_loop: asyncio.AbstractEventLoop):
+    # Use the serving loop that owns the tokenizer's IPC handlers. This reaches
+    # every scheduler without waiting for the server to accept HTTP connections.
+    cleanup = asyncio.run_coroutine_threadsafe(
+        _global_state.tokenizer_manager.freeze_gc(), event_loop
+    )
+    timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
+    cleanup.result(timeout=timeout if timeout > 0 else _FREEZE_GC_TIMEOUT_SECS)
 
 
 def _wait_and_warmup(
     server_args: ServerArgs,
     launch_callback: Optional[Callable[[], None]] = None,
     execute_warmup_func: Callable = _execute_server_warmup,
+    *,
+    event_loop: asyncio.AbstractEventLoop,
 ):
     if get_model().checkpoint_engine_wait_weights_before_ready:
         _wait_weights_ready()
@@ -2470,10 +2495,11 @@ def _wait_and_warmup(
     if not get_serving().skip_server_warmup and not skip_elastic_joiner_warmup:
         if not execute_warmup_func(server_args):
             return
-    else:
-        _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
-    _freeze_gc_after_server_warmup(server_args)
+    if not envs.SGLANG_RUST_SERVER.get():
+        # Rust owns its readiness lifecycle and has no /freeze_gc endpoint.
+        _freeze_gc_after_server_warmup(event_loop)
+        _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
     # The server is ready for requests
     logger.info("The server is fired up and ready to roll!")

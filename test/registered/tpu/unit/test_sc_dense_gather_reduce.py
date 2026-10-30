@@ -3,7 +3,7 @@ import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit", chips=1)
 
 # This is a standalone raw-JAX kernel test, not a TorchTPU runtime process.
 # Platform discovery above enforces CPU-only JAX for SGLang, but does not import
@@ -26,11 +26,14 @@ from absl.testing import parameterized
 from jax._src import test_util as jtu
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang.srt.layers.moe.pallas.sparse_core import dense_gather_reduce as dgr_mod
-from sglang.srt.layers.moe.pallas.sparse_core.dense_gather_reduce import (
+from sglang_tpu.compile_cache import initialize_jax_compile_cache
+from sglang_tpu.moe.pallas.sparse_core import dense_gather_reduce as dgr_mod
+from sglang_tpu.moe.pallas.sparse_core.dense_gather_reduce import (
     dense_gather_reduce,
     is_compatible,
 )
+
+initialize_jax_compile_cache()
 
 
 def reference_dense_gather_reduce(

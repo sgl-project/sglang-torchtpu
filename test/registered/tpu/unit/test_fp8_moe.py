@@ -7,18 +7,18 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
-import sglang.srt.hardware_backend.tpu.fp8_moe as tpu_fp8_moe
-import sglang.srt.layers.moe.pallas.fused_moe_op as fused_moe_op_module
 import sglang.srt.layers.quantization.fp8 as fp8_mod
-from sglang.srt.layers.moe.pallas.fused_moe_op import (
-    _build_fused_moe_op,
-    fused_moe_call,
-)
+import sglang_tpu.fp8_moe as tpu_fp8_moe
+import sglang_tpu.moe.pallas.fused_moe_op as fused_moe_op_module
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.moe.pallas.fused_moe_op import (
+    _build_fused_moe_op,
+    fused_moe_call,
+)
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
 
 # Eager and compiled kernels use different BF16 accumulation orders. Retain
 # BF16's default relative tolerance and cover rounding near zero explicitly.
@@ -160,6 +160,7 @@ class TestTpuFp8MoE(CustomTestCase):
         topk_ids = torch.tensor([[0, -1], [1, 0]], dtype=torch.int64)
         layer = SimpleNamespace(
             num_fused_shared_experts=0,
+            moe_runner_config=SimpleNamespace(routed_scaling_factor=None),
             w13_weight=torch.empty(2, 8, 16, dtype=torch.float8_e4m3fn),
             w2_weight=torch.empty(2, 8, 8, dtype=torch.float8_e4m3fn),
             w13_weight_scale=torch.ones(2, 1, 1, 16, dtype=torch.float32),
@@ -200,12 +201,10 @@ class TestTpuFp8MoE(CustomTestCase):
         self.assertEqual(captured["activation"], "silu")
         self.assertEqual(captured["global_num_experts"], 0)
         self.assertEqual(captured["expert_group_offset"], 0)
+        # Padded slots (-1) reach the kernel, which drops them.
+        torch.testing.assert_close(captured["topk_weights"], topk_weights)
         torch.testing.assert_close(
-            captured["topk_weights"],
-            torch.tensor([[0.75, 0.0], [1.0, 0.5]], dtype=torch.bfloat16),
-        )
-        torch.testing.assert_close(
-            captured["topk_ids"], torch.tensor([[0, 0], [1, 0]], dtype=torch.int32)
+            captured["topk_ids"], torch.tensor([[0, -1], [1, 0]], dtype=torch.int32)
         )
 
     def test_fp8_moe_forwards_ep_metadata_multi_rank(self):
@@ -227,6 +226,7 @@ class TestTpuFp8MoE(CustomTestCase):
         layer = SimpleNamespace(
             num_fused_shared_experts=0,
             num_local_experts=2,
+            moe_runner_config=SimpleNamespace(routed_scaling_factor=None),
             w13_weight=torch.empty(2, 8, 16, dtype=torch.float8_e4m3fn),
             w2_weight=torch.empty(2, 8, 8, dtype=torch.float8_e4m3fn),
             w13_weight_scale=torch.ones(2, 1, 1, 16, dtype=torch.float32),
@@ -279,6 +279,7 @@ class TestTpuFp8MoE(CustomTestCase):
         hidden_states = torch.randn(2, 8, dtype=torch.bfloat16)
         layer = SimpleNamespace(
             num_fused_shared_experts=0,
+            moe_runner_config=SimpleNamespace(routed_scaling_factor=None),
             w13_weight=torch.empty(2, 8, 16, dtype=torch.float8_e4m3fn),
             w2_weight=torch.empty(2, 8, 8, dtype=torch.float8_e4m3fn),
             w13_weight_scale=torch.ones(2, 1, 1, 16, dtype=torch.float32),

@@ -521,8 +521,12 @@ class MetadataBuffers:
         )
 
     def set_buf(self, req: Req):
+        self.set_buf_with_first_token(req, req.output_ids[0])
 
-        self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+    def set_buf_with_first_token(self, req: Req, first_token: int):
+        """set_buf with the first output token passed in, for a token known
+        before req's result is processed."""
+        self.output_ids[req.metadata_buffer_index][0] = first_token
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
         # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
@@ -712,7 +716,7 @@ def get_kv_class(
             KVClassType.BOOTSTRAP_SERVER: AscendKVBootstrapServer,
         }
     elif transfer_backend == TransferBackend.RAIDEN:
-        from sglang.srt.disaggregation.raiden import (
+        from sglang_tpu.disaggregation.raiden import (
             RaidenKVBootstrapServer,
             RaidenKVManager,
             RaidenKVReceiver,
@@ -740,7 +744,7 @@ def get_kv_class(
             KVClassType.BOOTSTRAP_SERVER: NixlKVBootstrapServer,
         }
     elif transfer_backend == TransferBackend.TPU:
-        from sglang.srt.disaggregation.tpu import (
+        from sglang_tpu.disaggregation.tpu import (
             TpuKVBootstrapServer,
             TpuKVManager,
             TpuKVReceiver,
@@ -1487,19 +1491,16 @@ def setup_state_kv_args(
             # so they inherit the index payload of the KV they describe.
             # Only the concrete SWAKVPool owns a full sub-pool; other
             # BaseSWAKVPool implementations describe their state per entry.
-            if isinstance(token_to_kv_pool, SWAKVPool) and isinstance(
-                token_to_kv_pool.full_kv_pool, MHATokenToKVPoolMXFP8
-            ):
-                append_state_component(
-                    kv_args,
-                    StateType.BLOCK_SCALE,
-                    *token_to_kv_pool.get_kv_scale_buf_infos(),
-                )
-                append_state_component(
-                    kv_args,
-                    StateType.BLOCK_SCALE_SWA,
-                    *token_to_kv_pool.get_swa_kv_scale_buf_infos(),
-                )
+            if isinstance(token_to_kv_pool, SWAKVPool):
+                # Global and SWA caches may use different dtypes.
+                for pool, state_type in (
+                    (token_to_kv_pool.full_kv_pool, StateType.BLOCK_SCALE),
+                    (token_to_kv_pool.swa_kv_pool, StateType.BLOCK_SCALE_SWA),
+                ):
+                    if isinstance(pool, MHATokenToKVPoolMXFP8):
+                        append_state_component(
+                            kv_args, state_type, *pool.get_kv_scale_buf_infos()
+                        )
             # unified_kv: the SWA ring lives in the unified buffers (no separate
             # swa_kv_pool) and is addressed per-row, so ship it as SWA_RING.
             if getattr(token_to_kv_pool, "_unified_kv", False) and hasattr(
@@ -1656,7 +1657,7 @@ def setup_state_kv_args(
                 tail_item_lens = tail_item_lens + draft_tail_item_lens
             if isinstance(token_to_kv_pool, NPUMLATokenToKVPool):
                 kv_args.kv_buf_groups = (
-                    len(kv_args.kv_data_ptrs) // token_to_kv_pool.layer_num
+                    3 if token_to_kv_pool.index_head_dim is not None else 2
                 )
                 kv_args.hidden_kv_layers = total_kv_layers
                 kv_args.draft_kv_layers = (

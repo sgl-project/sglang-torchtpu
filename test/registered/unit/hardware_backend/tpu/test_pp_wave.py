@@ -15,8 +15,9 @@ import unittest
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.pp_wave import PPWave
+from sglang.srt.layers.aux_hidden_states import AUX_HIDDEN_STATES_PROXY_KEY
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.pp_wave import PPAuxWave, PPWave, pipeline_permutation
 
 ROWS, HIDDEN = 8, 4
 
@@ -37,7 +38,9 @@ class _FakeIci:
         def launch(x):
             with self.cond:
                 k = self.count[rank]
-                self.sent[(k, rank)] = x.clone()
+                self.sent[(k, rank)] = (
+                    tuple(t.clone() for t in x) if isinstance(x, tuple) else x.clone()
+                )
                 self.count[rank] += 1
                 self.cond.notify_all()
                 ok = self.cond.wait_for(
@@ -56,7 +59,19 @@ class _FakeIci:
         return launch
 
 
-def _wave(rank, size, ici=None):
+def _wave(rank, size, ici=None, num_aux=0):
+    launcher = ici.launcher(rank) if ici else (lambda x: x)
+    if num_aux:
+        return PPAuxWave(
+            rank=rank,
+            size=size,
+            rows=ROWS,
+            hidden=HIDDEN,
+            num_aux=num_aux,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            launcher=launcher,
+        )
     return PPWave(
         rank=rank,
         size=size,
@@ -64,7 +79,7 @@ def _wave(rank, size, ici=None):
         hidden=HIDDEN,
         dtype=torch.float32,
         device=torch.device("cpu"),
-        launcher=ici.launcher(rank) if ici else (lambda x: x),
+        launcher=launcher,
     )
 
 
@@ -211,6 +226,25 @@ class TestWaveProtocol(CustomTestCase):
         self.assertEqual(ici.count, [3, 3])
 
 
+class TestWaveWarmup(CustomTestCase):
+    def test_warmup_merges_every_bucket_the_buffer_holds(self):
+        """Each forward bucket's sum and pad compiles at warmup, not on its first hand-off."""
+        for num_aux in (0, 2):
+            wave = _wave(0, 2, num_aux=num_aux)
+            seen = []
+            merge = wave.merge
+            wave.merge = lambda tensors: (
+                seen.append({k: tuple(v.shape) for k, v in tensors.items()})
+                or merge(tensors)
+            )
+            wave.warmup_merge({2, ROWS, ROWS + 4})
+            self.assertEqual(
+                sorted(rows["hidden_states"][0] for rows in seen), [2, ROWS]
+            )
+            for rows in seen:
+                self.assertEqual(len(rows), 2 + (num_aux > 0))
+
+
 class TestWaveGuards(CustomTestCase):
     def test_rejects_rows_above_the_buffer(self):
         wave = _wave(0, 2)
@@ -286,6 +320,170 @@ class TestWaveGuards(CustomTestCase):
         wave = _wave(2, 3)
         wave._launcher = wrong
         self.assertFalse(wave.probe())
+
+    def test_probe_tells_the_device_columns_apart(self):
+        def from_device(index):
+            return lambda x: torch.full_like(x, float(index + 1))
+
+        # Stage 2, column 1 of 2 receives from stage 1: device 3 is its column.
+        wave = _wave(2, 3)
+        wave._launcher = from_device(3)
+        self.assertTrue(wave.probe(column=1, columns=2))
+        wave = _wave(2, 3)
+        wave._launcher = from_device(2)
+        self.assertFalse(wave.probe(column=1, columns=2))
+
+    def test_permutation_forms_one_cycle_per_column(self):
+        # Column 0: ranks 0,2,4,6; column 1: ranks 1,3,5,7.
+        cycles = ((0, 2), (2, 4), (4, 6), (6, 0), (1, 3), (3, 5), (5, 7), (7, 1))
+        for stage in range(4):
+            for column in range(2):
+                with self.subTest(stage=stage, column=column):
+                    perm = pipeline_permutation(
+                        pp_ranks=tuple(range(column, 8, 2)),
+                        stage_ranks=(2 * stage, 2 * stage + 1),
+                        column=column,
+                    )
+                    self.assertEqual(perm, cycles)
+        self.assertEqual(
+            pipeline_permutation(pp_ranks=(2, 0, 1), stage_ranks=(2,), column=0),
+            ((2, 0), (0, 1), (1, 2)),
+        )
+
+
+class TestWaveAuxSlots(CustomTestCase):
+    """Eagle3's capture layers sit on different stages, so their slots ride the
+    same permute as the activation sum and must stay in their own columns."""
+
+    def test_every_stage_slot_reaches_the_last_stage(self):
+        size, num_aux = 3, 2
+        schedule = _drained(size, [True])
+        ici = _FakeIci(size)
+        waves = [_wave(r, size, ici, num_aux=num_aux) for r in range(size)]
+        arrived = [None] * size
+        errors = []
+
+        def run(rank):
+            wave = waves[rank]
+            try:
+                for has_batch in schedule:
+                    wave.begin_iteration(has_batch)
+                    tensors = None
+                    if has_batch:
+                        incoming = wave.receive()
+                        aux = (
+                            torch.zeros((ROWS, HIDDEN * num_aux))
+                            if rank == 0
+                            else incoming[AUX_HIDDEN_STATES_PROXY_KEY].clone()
+                        )
+                        if rank < num_aux:
+                            aux[:, rank * HIDDEN : (rank + 1) * HIDDEN] = float(
+                                rank + 1
+                            )
+                        arrived[rank] = aux
+                        if rank < size - 1:
+                            hidden = torch.full((ROWS, HIDDEN), 7.0)
+                            tensors = {
+                                "hidden_states": hidden,
+                                "residual": torch.zeros_like(hidden),
+                                AUX_HIDDEN_STATES_PROXY_KEY: aux,
+                            }
+                    wave.end_iteration(tensors)
+            except Exception as exc:  # noqa: BLE001
+                errors.append((rank, exc))
+                with ici.cond:
+                    ici.failed = True
+                    ici.cond.notify_all()
+
+        threads = [threading.Thread(target=run, args=(r,)) for r in range(size)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(errors, [])
+        slots = torch.split(arrived[size - 1], HIDDEN, dim=-1)
+        self.assertEqual([float(slot[0, 0]) for slot in slots], [1.0, 2.0])
+
+    def test_a_payload_of_the_wrong_width_is_rejected(self):
+        """The model and the wave derive the slot count separately; a mismatch
+        would otherwise land as silently misaligned columns."""
+        wave = _wave(0, 3, num_aux=2)
+        tensors = {
+            "hidden_states": torch.zeros((ROWS, HIDDEN)),
+            "residual": torch.zeros((ROWS, HIDDEN)),
+            AUX_HIDDEN_STATES_PROXY_KEY: torch.zeros((ROWS, HIDDEN)),
+        }
+        with self.assertRaisesRegex(ValueError, "carries 8 aux columns, got 4"):
+            wave.merge(tensors)
+
+    def test_received_pieces_are_their_own_buffers(self):
+        """torch_tpu hands a view of a shared buffer to an executable as the
+        buffer's base, so a piece sliced out of one hand-off buffer fails at the
+        first forward that reads it."""
+        wave = _wave(1, 3, num_aux=2)
+        wave.begin_iteration(True)
+        got = wave.receive()
+        for key, piece in got.items():
+            head = piece[: ROWS // 2]
+            self.assertTrue(head.is_contiguous(), key)
+            self.assertEqual(head.storage_offset(), 0, key)
+        self.assertEqual(got[AUX_HIDDEN_STATES_PROXY_KEY].shape, (ROWS, 2 * HIDDEN))
+
+    def test_a_payload_without_the_aux_slots_is_rejected(self):
+        wave = _wave(0, 3, num_aux=2)
+        tensors = {
+            "hidden_states": torch.zeros((ROWS, HIDDEN)),
+            "residual": torch.zeros((ROWS, HIDDEN)),
+        }
+        with self.assertRaisesRegex(ValueError, "hands on exactly"):
+            wave.merge(tensors)
+
+    def test_mixed_dtype_wave_relays_fp32_stream_and_bf16_aux_slots(self):
+        """Models with fp32 pp_transfer_dtype still relay bf16 draft aux captures."""
+        size, num_aux = 2, 2
+        ici = _FakeIci(size)
+        waves = [
+            PPAuxWave(
+                rank=r,
+                size=size,
+                rows=ROWS,
+                hidden=HIDDEN,
+                num_aux=num_aux,
+                dtype=torch.float32,
+                aux_dtype=torch.bfloat16,
+                device=torch.device("cpu"),
+                launcher=ici.launcher(r),
+            )
+            for r in range(size)
+        ]
+        warm = waves[0].warmup_tensors(4)
+        self.assertEqual(warm["hidden_states"].dtype, torch.float32)
+        self.assertEqual(warm["residual"].dtype, torch.float32)
+        self.assertEqual(warm[AUX_HIDDEN_STATES_PROXY_KEY].dtype, torch.bfloat16)
+
+        with self.assertRaisesRegex(ValueError, "carries torch.bfloat16 aux"):
+            waves[0].merge(
+                {
+                    "hidden_states": torch.zeros((ROWS, HIDDEN), dtype=torch.float32),
+                    "residual": torch.zeros((ROWS, HIDDEN), dtype=torch.float32),
+                    AUX_HIDDEN_STATES_PROXY_KEY: torch.zeros(
+                        (ROWS, HIDDEN * num_aux), dtype=torch.float32
+                    ),
+                }
+            )
+
+        verdicts = [None] * size
+        threads = [
+            threading.Thread(
+                target=lambda idx=r: verdicts.__setitem__(idx, waves[idx].probe())
+            )
+            for r in range(size)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(verdicts, [True, True])
 
 
 if __name__ == "__main__":

@@ -231,6 +231,8 @@ class Glm5NextTextConfig(PretrainedConfig):
         self.index_topk_pattern = index_topk_pattern
         self.index_skip_topk_offset = index_skip_topk_offset
 
+        # Older Transformers rejects these layer_types; restore them after init.
+        layer_types = kwargs.pop("layer_types", None)
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -238,6 +240,8 @@ class Glm5NextTextConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+        if layer_types is not None:
+            self.layer_types = layer_types
         if rope_parameters is not None or rope_scaling is not None:
             self.rope_parameters = rope_parameters or rope_scaling
 

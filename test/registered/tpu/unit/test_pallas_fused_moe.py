@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=25, suite="stage-a-test-tpu-unit", chips=1)
 
 import unittest
 
@@ -63,7 +63,7 @@ def _call_production_kernel(
     """
     # Lazy import so the module loads on hosts without JAX (the
     # @skipUnless decorator below will skip the whole class there).
-    from sglang.srt.layers.moe.pallas.fused_moe_op import _fused_moe_jax
+    from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
 
     topk = int(topk_ids.shape[-1])
     return _fused_moe_jax(
@@ -315,7 +315,7 @@ class TestFusedMoEJaxKernelGuards(unittest.TestCase):
         """SGLang spells the GPT-OSS gating ``swiglu_oai``; gmm_v2's
         in-kernel ``fuse_act`` spells it ``swigluoai``. Both spellings must
         map through, since the activation is applied inside GMM1."""
-        from sglang.srt.layers.moe.pallas.fused_moe_op import _fuse_act_name
+        from sglang_tpu.moe.pallas.fused_moe_op import _fuse_act_name
 
         self.assertEqual(_fuse_act_name("swiglu_oai"), "swigluoai")
         self.assertEqual(_fuse_act_name("swigluoai"), "swigluoai")
@@ -326,11 +326,150 @@ class TestFusedMoEJaxKernelGuards(unittest.TestCase):
         the offending value, so a model that requests a new activation
         gets a clear failure mode.
         """
-        from sglang.srt.layers.moe.pallas.fused_moe_op import _fuse_act_name
+        from sglang_tpu.moe.pallas.fused_moe_op import _fuse_act_name
 
         with self.assertRaises(NotImplementedError) as cm:
             _fuse_act_name("relu2")
         self.assertIn("relu2", str(cm.exception))
+
+
+def _pad_moe_weights(w1, w1_bias, w2, w2_bias, *, k_padded, n_padded):
+    """Zero-pad unpadded MoE weights the way ``prepare_tpu_mxfp4_moe_weights``
+    lays them out: hidden (w1's K, w2's N) to ``k_padded``, and each of gate
+    and up (w1's N halves) and w2's K to ``n_padded``."""
+    _, k, two_n = w1.shape
+    n = two_n // 2
+    w1_pad = ((0, 0), (0, k_padded - k), (0, n_padded - n))
+    b1_pad = ((0, 0), (0, 0), (0, n_padded - n))
+    w1 = jnp.concatenate(
+        [jnp.pad(w1[..., :n], w1_pad), jnp.pad(w1[..., n:], w1_pad)], axis=-1
+    )
+    w1_bias = jnp.concatenate(
+        [jnp.pad(w1_bias[..., :n], b1_pad), jnp.pad(w1_bias[..., n:], b1_pad)],
+        axis=-1,
+    )
+    w2 = jnp.pad(w2, ((0, 0), (0, n_padded - n), (0, k_padded - k)))
+    w2_bias = jnp.pad(w2_bias, ((0, 0), (0, 0), (0, k_padded - k)))
+    return w1, w1_bias, w2, w2_bias
+
+
+@unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON)
+class TestFusedMoEPaddedIntermediate(unittest.TestCase):
+    """GPT-OSS's MoE at TP1: hidden = intermediate = 2880. The loader pads the
+    intermediate to ``gmm_v2.pad_size_n_to_fewest_tiles`` (3072 on tpu7x)
+    rather than the 128-aligned 2944 that GMM1 splits into 128-wide tiles.
+    With 128 MiB of VMEM 2944 is one tile and the two widths coincide."""
+
+    HIDDEN = INTER = 2880
+    K = 2944  # hidden padded to 128 lanes
+
+    def _padded_inter(self):
+        from sglang_tpu.moe.pallas.gmm_v2 import pad_size_n_to_fewest_tiles
+
+        return pad_size_n_to_fewest_tiles(
+            self.K, self.INTER, jnp.bfloat16, fuse_act="swigluoai"
+        )
+
+    def _gmm1_tile_n(self, size_m, size_n):
+        """The N tile make_gmm_configs runs for GMM1 on this chip."""
+        from sglang_tpu.moe.pallas import gmm_v2
+
+        spec = jax.ShapeDtypeStruct
+        return gmm_v2.make_gmm_configs(
+            spec((size_m, self.K), jnp.bfloat16),
+            spec((1, self.K, 2 * size_n), jnp.bfloat16),
+            None,
+            None,
+            spec((1,), jnp.int32),
+            spec((1,), jnp.int32),
+            tile_info=gmm_v2.calculate_tiling,
+            vmem_limit_bytes=gmm_v2.default_vmem_limit_bytes(),
+            out_dtype=None,
+            acc_dtype=None,
+            maybe_quantize_lhs=True,
+            zero_initialize=True,
+            fuse_act="swigluoai",
+        ).tiles.tile_n
+
+    def test_padded_width_runs_fewer_gmm1_tiles(self):
+        from jax._src.pallas.mosaic import tpu_info
+        from jax.experimental.pallas import tpu as pltpu
+
+        # The loader sizes the width against the per-chip metadata
+        # tpu_info_for_cpu_export swaps in, so that has to match what the
+        # kernel sees in every field the tiling reads.
+        chip = tpu_info.chip_version_from_device_kind(jax.devices()[0].device_kind)
+        export = tpu_info.get_tpu_info_for_chip(chip, 1)
+        runtime = pltpu.get_tpu_info()
+        for field in ("vmem_capacity_bytes", "num_lanes", "mxu_column_size"):
+            with self.subTest(field=field):
+                self.assertEqual(getattr(export, field), getattr(runtime, field))
+        self.assertEqual(
+            export.get_sublane_tiling(jnp.bfloat16),
+            runtime.get_sublane_tiling(jnp.bfloat16),
+        )
+
+        padded = self._padded_inter()
+        prefill_m = 4096
+        tile_n = self._gmm1_tile_n(prefill_m, padded)
+        self.assertLessEqual(
+            padded // tile_n, self.K // self._gmm1_tile_n(prefill_m, self.K)
+        )
+        if runtime.vmem_capacity_bytes == 64 * 2**20:
+            self.assertEqual((padded, tile_n), (3072, 1024))
+        # Decode steps route fewer rows, which only widens the tile.
+        for size_m in (16, 32, 128):
+            with self.subTest(size_m=size_m):
+                self.assertGreaterEqual(self._gmm1_tile_n(size_m, padded), tile_n)
+
+    def test_padded_intermediate_matches_the_128_aligned_width(self):
+        """Zero gate/up columns and bias give zero activations, which meet
+        zero rows of w2, so only the accumulation order may differ."""
+        from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
+
+        g, topk = 8, 4
+        hidden, w1, w2, topk_weights, topk_ids = _make_inputs(
+            512, self.HIDDEN, self.INTER, g, topk, seed=0
+        )
+        kb1, kb2 = jax.random.split(jax.random.PRNGKey(1))
+        w1_bias = jax.random.normal(kb1, (g, 1, 2 * self.INTER), jnp.float32) * 0.05
+        w2_bias = jax.random.normal(kb2, (g, 1, self.HIDDEN), jnp.float32) * 0.05
+        widths = {
+            "lane_aligned": self.K,
+            "fewest_tiles": self._padded_inter(),
+        }
+        weights = {
+            name: _pad_moe_weights(
+                w1, w1_bias, w2, w2_bias, k_padded=self.K, n_padded=n_padded
+            )
+            for name, n_padded in widths.items()
+        }
+        # 8 tokens is a decode step (32 routed rows), 512 a prefill chunk.
+        for m in (8, 512):
+            outs = {}
+            for name, (pw1, pb1, pw2, pb2) in weights.items():
+                outs[name] = jax.block_until_ready(
+                    _fused_moe_jax(
+                        hidden[:m],
+                        pw1,
+                        pw2,
+                        topk_weights[:m],
+                        topk_ids[:m],
+                        None,
+                        None,
+                        pb1,
+                        pb2,
+                        topk,
+                        "swigluoai",
+                    )
+                ).astype(jnp.float32)
+            base, got = outs["lane_aligned"], outs["fewest_tiles"]
+            with self.subTest(m=m, widths=widths):
+                self.assertTrue(bool(jnp.all(jnp.isfinite(got))))
+                max_diff = float(jnp.max(jnp.abs(got - base)))
+                # A couple of bf16 ulps at the output's largest magnitude.
+                tol = 2**-6 * max(1.0, float(jnp.max(jnp.abs(base))))
+                self.assertLess(max_diff, tol)
 
 
 if __name__ == "__main__":

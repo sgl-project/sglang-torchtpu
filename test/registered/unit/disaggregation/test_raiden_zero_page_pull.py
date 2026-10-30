@@ -5,11 +5,11 @@ import threading
 import unittest
 from unittest.mock import Mock
 
-from sglang.srt.disaggregation.raiden.conn import RaidenKVManager
-from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
-from sglang.srt.disaggregation.raiden.serde import Blocks
-from sglang.srt.disaggregation.raiden.state import DecodeState
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
+from sglang_tpu.disaggregation.raiden.host_pool import StagingAdmission
+from sglang_tpu.disaggregation.raiden.serde import Blocks
+from sglang_tpu.disaggregation.raiden.state import DecodeState
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -92,6 +92,25 @@ class TestZeroPagePull(unittest.TestCase):
             str(ROOM), ROOM, "127.0.0.1:31020", [2], [100]
         )
         self.assertFalse(mgr.is_recv_done(ROOM))
+
+    def test_successful_transfer_logs_only_at_debug(self):
+        # Successful transfers log several lines per request on every rank, so
+        # they stay at DEBUG; at INFO they flood the server log of long P/D runs.
+        mgr = _decode_manager(hybrid=False)
+        mgr._decode.local_blocks[ROOM] = [100]
+        mgr._decode.local_swa_blocks[ROOM] = []
+        mgr._on_blocks(_blocks(hybrid=False))
+
+        with self.assertLogs(
+            "sglang_tpu.disaggregation.raiden.conn", level="DEBUG"
+        ) as logs:
+            self.assertTrue(mgr.maybe_start_pull(ROOM))
+            mgr._log_settled_transfers(sent=[str(ROOM)], received=[str(ROOM)])
+
+        self.assertEqual({record.levelname for record in logs.records}, {"DEBUG"})
+        messages = "\n".join(logs.output)
+        for event in ("decode pull started", "prefill read served", "decode pull done"):
+            self.assertIn(event, messages)
 
 
 if __name__ == "__main__":

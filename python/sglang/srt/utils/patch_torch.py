@@ -140,11 +140,16 @@ def monkey_patch_torch_tpu_env(
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_WORLD_SIZE"] = str(local_world_size)
 
-    dp_size = getattr(server_args, "dp_size", 1) or 1
+    # The resolved width: the raw record only carries it for the deprecated
+    # `--dp-size N --enable-dp-attention` spelling, not for `--attn-dp-size N`.
+    attn_dp_size = cfg.attn_dp_size
+    # Replicas times attention-DP groups: what the raw dp_size counted under
+    # the deprecated spelling, so the compile-cache scope below keeps its name.
+    dp_size = max(cfg.dp_size, 1) * max(attn_dp_size, 1)
     if dp_rank is not None:
         effective_dp_rank = dp_rank
-    elif getattr(server_args, "enable_dp_attention", False) and dp_size > 1:
-        attn_tp_size = max(1, server_args.tp_size // dp_size)
+    elif attn_dp_size > 1:
+        attn_tp_size = max(1, cfg.tp_size // attn_dp_size)
         effective_dp_rank = tp_rank // attn_tp_size
     else:
         effective_dp_rank = int(os.environ.get("SGLANG_DP_RANK", "0"))
@@ -170,6 +175,9 @@ def monkey_patch_torch_tpu_env(
         physical_device = cfg.base_gpu_id + local_rank * cfg.gpu_id_step
         # Assign an individual TPU device to each rank.
         os.environ["TPU_VISIBLE_DEVICES"] = str(physical_device)
+        # torch_tpu ignores TPU_VISIBLE_DEVICES and pins TPU_VISIBLE_CHIPS to
+        # LOCAL_RANK, so the offset must ride on LOCAL_RANK to move off chiplet 0.
+        os.environ["LOCAL_RANK"] = str(physical_device)
 
     # Multihost: every rank must rendezvous at rank-0's node. TPU_WORKER_HOSTNAMES
     # is ordered by TPU_WORKER_ID (physical slice order), so hosts[0] is where

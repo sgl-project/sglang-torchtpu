@@ -192,21 +192,24 @@ class DFlashDraftInputV2(SpecInput):
         self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
 
         if _is_tpu and batch.req_to_token_pool.host_resident:
-            allocate_and_assign_decode_cache(
-                tree_cache=batch.tree_cache,
-                req_to_token_pool=batch.req_to_token_pool,
-                req_pool_indices=batch.req_pool_indices,
-                cur_kv_lens_cpu=cur_kv_lens_cpu_t,
-                nxt_kv_lens_cpu=nxt_kv_lens_cpu_t,
-                num_needed_tokens=num_needed_tokens,
-                batch_size=bs,
-                device=batch.device,
-                host_req_pool_indices=batch.req_pool_indices_cpu,
-            )
-            for i, req in enumerate(batch.reqs):
-                req.kv.kv_allocated_len = max(
-                    req.kv.kv_allocated_len, int(nxt_kv_lens_cpu_t[i])
+            # A step where no request needs a new slot would only pre-evict; the next
+            # allocating step pre-evicts with the same per-request headroom.
+            if num_needed_tokens > 0:
+                allocate_and_assign_decode_cache(
+                    tree_cache=batch.tree_cache,
+                    req_to_token_pool=batch.req_to_token_pool,
+                    req_pool_indices=batch.req_pool_indices,
+                    cur_kv_lens_cpu=cur_kv_lens_cpu_t,
+                    nxt_kv_lens_cpu=nxt_kv_lens_cpu_t,
+                    num_needed_tokens=num_needed_tokens,
+                    batch_size=bs,
+                    device=batch.device,
+                    host_req_pool_indices=batch.req_pool_indices_cpu,
                 )
+                for i, req in enumerate(batch.reqs):
+                    req.kv.kv_allocated_len = max(
+                        req.kv.kv_allocated_len, int(nxt_kv_lens_cpu_t[i])
+                    )
         else:
             caller_stream = None
             if plan_stream is not None:
@@ -265,7 +268,7 @@ class DFlashDraftInputV2(SpecInput):
         """Record this step's device-resident verify addressing, if eligible."""
         plan = None
         if _is_tpu:
-            from sglang.srt.hardware_backend.tpu.dflash_utils_tpu import (
+            from sglang_tpu.dflash_utils_tpu import (
                 plan_dflash_device_accept,
             )
 

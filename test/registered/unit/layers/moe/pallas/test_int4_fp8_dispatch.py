@@ -3,10 +3,12 @@
 import unittest
 from unittest import mock
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
+# The CPU lane has no JAX and skips; the TPU lane runs it.
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit", chips=1)
 
 try:
     import jax
@@ -21,7 +23,7 @@ except ImportError:
 @unittest.skipUnless(_HAS_JAX, "requires JAX")
 class TestInt4Fp8Dispatch(CustomTestCase):
     def test_bs1_ep_window_and_padding(self):
-        from sglang.srt.layers.moe.pallas.fused_moe_op import _fused_moe_jax
+        from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
 
         w1 = jax.ShapeDtypeStruct((48, 896, 4096), jnp.int32)
         w2 = jax.ShapeDtypeStruct((48, 256, 7168), jnp.int32)
@@ -39,9 +41,10 @@ class TestInt4Fp8Dispatch(CustomTestCase):
             def fake_gmm(lhs, rhs, group_sizes, **kwargs):
                 calls.append(kwargs)
                 sizes = np.asarray(group_sizes)
-                # 8 real routes + 8 sublane-pad rows (expert 0, weight 0).
-                self.assertEqual(int(sizes.sum()), 16)
-                self.assertEqual(int(sizes[0]), 8 + ids.count(0))
+                # 8 real routes; the sublane-pad token's 8 slots carry -1 ids
+                # and are dropped, so no GMM row goes to them.
+                self.assertEqual(int(sizes.sum()), 8)
+                self.assertEqual(int(sizes[0]), ids.count(0))
                 width = rhs.shape[-1] // (2 if kwargs.get("fuse_act") else 1)
                 out = jnp.zeros((lhs.shape[0], width), jnp.bfloat16)
                 start = int(sizes[:48].sum())
@@ -53,8 +56,12 @@ class TestInt4Fp8Dispatch(CustomTestCase):
 
             with (
                 self.subTest(ids=ids),
+                mock.patch("sglang_tpu.moe.pallas.gmm_v2.gmm_v2", side_effect=fake_gmm),
+                # bf16 sublane tiling on TPU (m pads from 1 to 2 at top-8), here
+                # without a TPU backend for JAX.
                 mock.patch(
-                    "sglang.srt.layers.moe.pallas.gmm_v2.gmm_v2", side_effect=fake_gmm
+                    "sglang_tpu.moe.pallas.gmm_v2.lhs_sublane_tiling",
+                    return_value=16,
                 ),
             ):
                 out = _fused_moe_jax(

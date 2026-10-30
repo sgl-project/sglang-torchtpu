@@ -38,6 +38,8 @@ def _args(**overrides):
         device="tpu",
         tp_size=1,
         pp_size=8,
+        dp_size=1,
+        attn_dp_size=1,
         nnodes=1,
         node_rank=0,
         use_ray=False,

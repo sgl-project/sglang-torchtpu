@@ -1,6 +1,9 @@
 # PR gate: runs the registered TPU per-commit suite on a single-host 2x2x1 slice.
 #
-# Runs when EITHER:
+# On demand only: a push never claims a slice. Each `/tag-and-rerun-ci` or
+# `/rerun-failed-ci` from a user listed in .github/CI_PERMISSIONS.json or the PR
+# author, or "Re-run failed jobs" from anyone with write access, runs the suite once
+# for the current head commit. A new push needs a new trigger. Applies when EITHER:
 #   * the PR touches a TPU-explicit path (auto), OR
 #   * the PR carries the `tpu` label (manual opt-in -- for shared-code changes a
 #     maintainer judges need TPU coverage but that don't match those paths).
@@ -21,19 +24,17 @@ concurrency:
 
 jobs:
   decide:
-    # For labeled events, only `tpu` and `run-ci` can affect this workflow.
-    # Readiness itself is fetched live below so label-then-rerun is not tied to
-    # the original event payload.
+    # Only the `tpu` label can make a PR TPU-relevant. Labels are fetched live
+    # below so label-then-rerun is not tied to the original event payload.
     if: >-
       github.event.action != 'labeled' ||
-      github.event.label.name == 'tpu' ||
-      github.event.label.name == 'run-ci'
+      github.event.label.name == 'tpu'
     runs-on: ubuntu-latest
-    # dorny/paths-filter lists the PR's changed files via the GitHub API, which
-    # needs pull-requests: read (the repo's default token is otherwise too narrow).
+    # dorny/paths-filter lists the PR's changed files via the GitHub API (read);
+    # write lets the gate post its on-demand notice on the PR.
     permissions:
       contents: read
-      pull-requests: read
+      pull-requests: write
     outputs:
       run: ${{ steps.gate.outputs.run }}
     steps:
@@ -47,7 +48,6 @@ jobs:
               repo: context.repo.repo,
               pull_number: context.issue.number,
             });
-            core.setOutput("draft", pr.data.draft);
             core.setOutput("labels", JSON.stringify(pr.data.labels.map(l => l.name)));
 
       - name: Detect TPU-explicit path changes
@@ -56,6 +56,12 @@ jobs:
         with:
           filters: |
             tpu:
+              - 'sglang_tpu/**'
+              - 'pyproject.toml'
+              # Shared runtime TPU serves through. Keep this guard on all TPU CI
+              # until the OOT refactor is done. Not mirrored in labeler.yml.
+              - 'python/sglang/srt/**'
+              # Re-export shims left by the plugin move.
               - 'python/sglang/srt/hardware_backend/tpu/**'
               - 'python/sglang/srt/layers/attention/pallas/**'
               - 'python/sglang/srt/layers/moe/pallas/**'
@@ -82,6 +88,8 @@ jobs:
               - 'test/registered/unit/hardware_backend/tpu/**'
               - 'test/registered/unit/layers/attention/pallas/**'
               - 'test/registered/unit/layers/moe/pallas/**'
+              - 'test/registered/e2e/tpu/**'
+              - 'test/registered/e2e/hardware_backend/tpu/**'
               - '.github/tpu-ci/**'
               - '.github/workflows/_tpu-build.yml'
               - '.github/workflows/_tpu-test.yml'
@@ -90,19 +98,46 @@ jobs:
               - '.github/workflows/feature-validation-tpu.yml'
               - '.github/workflows/accuracy-test-tpu.yml'
               - '.github/workflows/perf-test-tpu.yml'
-      - name: Gate on readiness and TPU relevance
+      # A TPU-relevant first attempt FAILS here rather than skipping: a skip would
+      # leave the required pr-test-tpu-finish green, and a failed decide is what
+      # /tag-and-rerun-ci re-runs. Only that re-run (attempt > 1) claims a slice.
+      - name: Gate on an explicit trigger and TPU relevance
         id: gate
         run: |
-          if [[ "${{ steps.pr.outputs.draft }}" == "true" && \
-                "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}" != "true" ]]; then
-            echo "Draft PR without run-ci; skipping TPU CI"
+          if [[ "${{ steps.paths.outputs.tpu }}" != "true" && \
+                "${{ contains(fromJson(steps.pr.outputs.labels), 'tpu') }}" != "true" ]]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ steps.paths.outputs.tpu }}" == "true" || \
-                  "${{ contains(fromJson(steps.pr.outputs.labels), 'tpu') }}" == "true" ]]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.run_attempt }}" == "1" ]]; then
+            echo "run=needs-trigger" >> "$GITHUB_OUTPUT"
           else
-            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "run=true" >> "$GITHUB_OUTPUT"
           fi
+
+      # Posted once per PR; later pushes find the marker and stay quiet. Fork PRs
+      # get a read-only token, so a failed post must not mask the gate.
+      - name: Post the on-demand notice
+        if: steps.gate.outputs.run == 'needs-trigger'
+        continue-on-error: true
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const marker = "<!-- tpu-ci-on-demand -->";
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100,
+            });
+            if (comments.some(c => c.body && c.body.includes(marker))) return;
+            await github.rest.issues.createComment({
+              owner, repo, issue_number,
+              body: `${marker}\nA user listed in .github/CI_PERMISSIONS.json must comment **\`/tag-and-rerun-ci\`** to trigger the required TPU checks. Repeat this after every new push, including rebases.`,
+            });
+
+      - name: Require an explicit trigger
+        if: steps.gate.outputs.run == 'needs-trigger'
+        run: |
+          echo "::error::TPU CI runs on demand. A user listed in .github/CI_PERMISSIONS.json must comment /tag-and-rerun-ci to trigger the required TPU checks. Repeat this after every new push, including rebases."
+          exit 1
 
   # Build the image once (keyless WIF). Fork PRs can't get WIF secrets, so keep the
   # reserved slice for trusted branches only.
@@ -133,6 +168,11 @@ jobs:
       # Unit suite (kernels/backends; each test self-contained, no model server) runs
       # first so a broken kernel fails before the serving suite claims the slice.
       suite: stage-a-test-tpu-unit
+      # The PR gate runs the plugin platform (mode B); nightly lanes cover mode A.
+      platform: tpu_oot
+      # Most unit tests are registered chips=1 and run four at a time, each
+      # pinned to one chip of the slice. Whole-node tests follow sequentially.
+      tpu_chip_workers: 4
     permissions:
       contents: read
       id-token: write
@@ -145,6 +185,7 @@ jobs:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
       image: ${{ needs.build.outputs.digest }}
       suite: stage-b-test-tpu-4-v7
+      platform: tpu_oot
       weights_pvc: model-weights
     permissions:
       contents: read

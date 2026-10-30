@@ -8,12 +8,13 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from sglang.srt.hardware_backend.tpu.result_copy_worker import (
+from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.experimental.speculative.block_info import HostPaddedBlockDraftInput
+from sglang_tpu.result_copy_worker import (
     TpuAsyncCopyEvent,
     TPUAsyncCopyWorker,
 )
-from sglang.srt.speculative.eagle_info import EagleDraftInput
-from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -31,6 +32,10 @@ class DelayedCopyEvent:
         assert self.recorded.is_set(), "consumer waited on an unrecorded event"
         self.waiting.set()
         assert self.transferred.wait(timeout=5)
+
+    def query(self):
+        # Like a device event, an unrecorded event reports done.
+        return not self.recorded.is_set() or self.transferred.is_set()
 
 
 def test_consumer_waits_for_submission_and_transfer():
@@ -60,6 +65,35 @@ def test_consumer_waits_for_submission_and_transfer():
             if not submitted.done():
                 submitted.set_exception(RuntimeError("test cleanup"))
             event.transferred.set()
+
+
+def test_query_tracks_submission_then_transfer():
+    """The prefill's continuous input polling calls query() on copy_done."""
+    event = DelayedCopyEvent()
+    submitted = Future()
+    completion = TpuAsyncCopyEvent(event, submitted)
+
+    # Not submitted yet: the device event would report done, query must not.
+    assert not completion.query()
+    event.record()
+    assert not completion.query()
+    submitted.set_result(None)
+    assert not completion.query()
+    event.transferred.set()
+    assert completion.query()
+    assert not event.waiting.is_set()
+
+
+def test_query_reports_failed_submission_as_done():
+    event = DelayedCopyEvent()
+    submitted = Future()
+    submitted.set_exception(RuntimeError("copy submission failed"))
+    completion = TpuAsyncCopyEvent(event, submitted)
+
+    assert completion.query()
+    with pytest.raises(RuntimeError, match="copy submission failed"):
+        completion.synchronize()
+    assert not event.waiting.is_set()
 
 
 def test_worker_error_reaches_consumer_before_event_wait():
@@ -145,8 +179,9 @@ def test_worker_preserves_context_and_serializes_copies(monkeypatch):
     assert contexts == []
 
 
+@pytest.mark.parametrize("host_padded", [False, True])
 @pytest.mark.parametrize("copy_draft_tail", [True, False])
-def test_copy_done_covers_spec_draft_extend(monkeypatch, copy_draft_tail):
+def test_copy_done_covers_spec_draft_extend(monkeypatch, copy_draft_tail, host_padded):
     """Draft-extend writes draft KV after the verify outputs are produced, so
     under the KV free fence copy_done must also wait for one of its outputs;
     otherwise the extra copy would only delay result processing."""
@@ -169,9 +204,15 @@ def test_copy_done_covers_spec_draft_extend(monkeypatch, copy_draft_tail):
     )
     event = Mock()
     event.record.side_effect = lambda: issued.append("record")
-    result = SimpleNamespace(
-        copy_done=event, next_draft_input=EagleDraftInput(topk_index=topk_index)
-    )
+    if host_padded:
+        # The experimental worker's commit writes draft KV; kv_fence_tail reads it.
+        draft_input = HostPaddedBlockDraftInput(
+            bonus_tokens=torch.zeros(1), new_seq_lens=torch.zeros(1)
+        )
+        draft_input.kv_fence_tail = topk_index
+    else:
+        draft_input = EagleDraftInput(topk_index=topk_index)
+    result = SimpleNamespace(copy_done=event, next_draft_input=draft_input)
     result.copy_to_cpu = lambda *args: (
         issued.append("copy"),
         result.copy_done.record(),

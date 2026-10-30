@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     g++ \
     make \
     ffmpeg \
+    libssl-dev \
     netcat-openbsd && \
     curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list && \
@@ -33,10 +34,11 @@ COPY . /workspace/sglang
 # 2. Copy pyproject_tpu.toml to pyproject.toml
 # 3. Install sglang tpu dependencies and sglang itself
 RUN cd /workspace/sglang/python && \
-    sed -i 's/"torch-tpu==[^"]*"/"torch-tpu"/' pyproject_tpu.toml && \
+    sed -i 's/"torch_tpu==[^"]*"/"torch_tpu"/' pyproject_tpu.toml && \
     sed -i '/\[tool.uv\]/,$d' pyproject_tpu.toml && \
     cp pyproject_tpu.toml pyproject.toml && \
-    uv pip install --system .[all_tpu,ray,runai]
+    uv pip install --system .[all_tpu,ray,runai] && \
+    cd /workspace/sglang && uv pip install --system --no-deps .
 
 # Default command
 CMD ["/bin/bash"]

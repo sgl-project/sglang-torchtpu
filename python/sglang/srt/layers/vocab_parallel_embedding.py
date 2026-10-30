@@ -4,7 +4,7 @@
 
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
@@ -21,12 +21,12 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import PackWeightMethod
-from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.parameter import BasevLLMParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -34,6 +34,7 @@ from sglang.srt.layers.quantization.base_config import (
     method_has_implemented_embedding,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -262,14 +263,12 @@ class VocabParallelEmbedding(torch.nn.Module):
             tp_rank = 0
             self.tp_size = 1
 
+        self.tp_rank = tp_rank
         self.num_embeddings = num_embeddings
         self.org_vocab_size = org_num_embeddings or num_embeddings
 
         # Support the case where the vocab size is not divisible by the TP size.
-        if (
-            _is_cpu
-            and pad_vocab_size(self.org_vocab_size, padding_size) % self.tp_size != 0
-        ):
+        if pad_vocab_size(self.org_vocab_size, padding_size) % self.tp_size != 0:
             padding_size *= self.tp_size
         self.padding_size = padding_size
 
@@ -386,70 +385,44 @@ class VocabParallelEmbedding(torch.nn.Module):
             added_vocab_end_index,
         )
 
-    def get_sharded_to_full_mapping(self) -> Optional[List[int]]:
-        """Get a mapping that can be used to reindex the gathered
-        logits for sampling.
+    def lift_rank_to_input(self) -> None:
+        """Derive the shard bounds from a rank buffer instead of constants.
 
-        During sampling, we gather logits from all ranks. The relationship
-        of index->token_id will follow the same format as outlined in the class
-        docstring. However, after the gather, we want to reindex the final
-        logits tensor to map index->token_id one-to-one (the index is always
-        equal the token_id it corresponds to). The indices returned by this
-        method allow us to do that.
+        A compiled graph then holds no rank-specific bounds, as under a
+        platform's traced rank.
         """
-        if self.tp_size < 2:
-            return None
+        if self.tp_size > 1 and "_rank_input" not in self._buffers:
+            self.register_buffer(
+                "_rank_input",
+                torch.tensor(self.tp_rank, device=self.weight.device),
+                persistent=False,
+            )
 
-        base_embeddings: List[int] = []
-        added_embeddings: List[int] = []
-        padding: List[int] = []
-        for tp_rank in range(self.tp_size):
-            shard_indices = self._get_indices(
-                self.num_embeddings_padded,
-                self.org_vocab_size_padded,
-                self.num_embeddings,
-                self.org_vocab_size,
-                tp_rank,
-                self.tp_size,
-            )
-            range_start = self.num_embeddings_per_partition * tp_rank
-            range_end = self.num_embeddings_per_partition * (tp_rank + 1)
-            base_embeddings.extend(
-                range(range_start, range_start + shard_indices.num_org_elements)
-            )
-            padding.extend(
-                range(
-                    range_start + shard_indices.num_org_elements,
-                    range_start + shard_indices.num_org_elements_padded,
-                )
-            )
-            added_embeddings.extend(
-                range(
-                    range_start + shard_indices.num_org_elements_padded,
-                    range_start
-                    + shard_indices.num_org_elements_padded
-                    + shard_indices.num_added_elements,
-                )
-            )
-            padding.extend(
-                range(
-                    range_start
-                    + shard_indices.num_org_elements_padded
-                    + shard_indices.num_added_elements,
-                    range_start
-                    + shard_indices.num_org_elements_padded
-                    + shard_indices.num_added_elements_padded,
-                )
-            )
-            assert (
-                range_start
-                + shard_indices.num_org_elements_padded
-                + shard_indices.num_added_elements_padded
-                == range_end
-            )
-        ret = base_embeddings + added_embeddings + padding
-        assert len(ret) == self.num_embeddings_padded
-        return ret
+    def _traced_shard_bounds(self, rank: torch.Tensor):
+        """``get_masked_input_and_mask`` bounds for a traced rank tensor.
+
+        Mirrors ``_get_indices`` (clamp replaces min) so a shared executable
+        selects each rank's shard at runtime.
+        """
+        org_stride = self.org_vocab_size_padded // self.tp_size
+        added_stride = (
+            self.num_embeddings_padded - self.org_vocab_size_padded
+        ) // self.tp_size
+        org_start = (rank * org_stride).clamp(max=self.org_vocab_size)
+        org_end = ((rank + 1) * org_stride).clamp(max=self.org_vocab_size)
+        added_start = (self.org_vocab_size + rank * added_stride).clamp(
+            max=self.num_embeddings
+        )
+        added_end = (self.org_vocab_size + (rank + 1) * added_stride).clamp(
+            max=self.num_embeddings
+        )
+        return (
+            org_start,
+            org_end,
+            org_stride - (org_end - org_start),
+            added_start,
+            added_end,
+        )
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         output_dim = getattr(param, "output_dim", None)
@@ -529,6 +502,22 @@ class VocabParallelEmbedding(torch.nn.Module):
             and self.weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
         )
 
+    def _get_masked_input_and_mask(self, input_: torch.Tensor):
+        """Map IDs to this shard and identify foreign IDs, including shared traces."""
+        bounds = (
+            self.shard_indices.org_vocab_start_index,
+            self.shard_indices.org_vocab_end_index,
+            self.shard_indices.num_org_vocab_padding,
+            self.shard_indices.added_vocab_start_index,
+            self.shard_indices.added_vocab_end_index,
+        )
+        rank = current_platform.get_traced_rank(self.tp_rank, group_size=self.tp_size)
+        if rank is None:
+            rank = self._buffers.get("_rank_input")
+        if rank is not None:
+            bounds = self._traced_shard_bounds(rank.to(input_.dtype))
+        return get_masked_input_and_mask(input_, *bounds)
+
     def _embed_local_shard(self, input_: torch.Tensor) -> torch.Tensor:
         """Embed against the local vocab shard; out-of-shard rows are zero
         (identity when tp_size == 1).
@@ -561,14 +550,7 @@ class VocabParallelEmbedding(torch.nn.Module):
                 output_parallel = output_parallel.to(self.output_dtype)
             return output_parallel
         # Map out-of-shard ids to index 0, gather, then zero those rows.
-        masked_input, input_mask = get_masked_input_and_mask(
-            input_,
-            self.shard_indices.org_vocab_start_index,
-            self.shard_indices.org_vocab_end_index,
-            self.shard_indices.num_org_vocab_padding,
-            self.shard_indices.added_vocab_start_index,
-            self.shard_indices.added_vocab_end_index,
-        )
+        masked_input, input_mask = self._get_masked_input_and_mask(input_)
         with symm_alloc:
             output_parallel = self.quant_method.embedding(self, masked_input.long())
         if self.output_dtype is not None:

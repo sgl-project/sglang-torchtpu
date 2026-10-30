@@ -11,9 +11,8 @@ What is specific to this model:
   * TEXT ONLY, which is what makes the RoPE cache slice and skipping the ViT
     precompile safe.
 
-Serving config lives in recipe/configs/qwen3_5_397b/perf.py, ported from the
-measured recipe on branch haolin/qwen35-recipe-dp-attention -- the same 8k1k
-shape its published numbers came from.
+Serving config lives in recipe/configs/qwen3_5_397b/perf.py, ported from a
+measured serving recipe at the same 8k1k shape.
 """
 
 import os

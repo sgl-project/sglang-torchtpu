@@ -24,19 +24,19 @@ bucket there, so this key is only ever a hit when a test inserts it.
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit", chips=1)
 
 import unittest
 from unittest import mock
 
 import jax.numpy as jnp
 
-from sglang.srt.layers.attention.pallas import tuned_block_sizes_mla as tbs
-from sglang.srt.layers.attention.pallas.tuned_block_sizes_mla import (
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention.pallas import tuned_block_sizes_mla as tbs
+from sglang_tpu.attention.pallas.tuned_block_sizes_mla import (
     get_tuned_block_sizes_mla,
 )
-from sglang.srt.layers.attention.pallas.util import next_power_of_2
-from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention.pallas.util import next_power_of_2
 
 _DECODE_ARGS = ("decode", "bfloat16", "bfloat16", 8, 512, 64, 256, 128)
 _MIXED_ARGS = ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 256, 512)
@@ -248,6 +248,41 @@ class TestShippedTunedTable(_TunedTableTestBase):
                 for key, cfg in table.items():
                     with self.subTest(device=device, key=key):
                         self.assertEqual(get_tuned_block_sizes_mla(*key), cfg)
+
+    def test_kimi_k3_fp8_kv_serving_buckets_are_tuned(self):
+        """Kimi-K3 TP32 (3 q heads per shard, padded to 4) with an fp8 KV
+        cache: every decode bucket of its recipes and every prefill chunk size
+        has a tuned row. Without them the kernel falls back to blocks that ran
+        2x slower at decode and up to 20x slower at prefill."""
+        with mock.patch.object(tbs, "get_device_name", lambda: "TPU v7"):
+            for bs in (1, 2, 4, 8):
+                with self.subTest(case="decode", mnt=bs):
+                    self.assertIsNotNone(
+                        get_tuned_block_sizes_mla(
+                            "decode",
+                            jnp.bfloat16,
+                            jnp.float8_e4m3fn,
+                            3,
+                            512,
+                            64,
+                            128,
+                            bs,
+                        )
+                    )
+            for tokens in (512, 1024, 4096, 8192):
+                with self.subTest(case="mixed", mnt=tokens):
+                    self.assertIsNotNone(
+                        get_tuned_block_sizes_mla(
+                            "mixed",
+                            jnp.bfloat16,
+                            jnp.float8_e4m3fn,
+                            3,
+                            512,
+                            64,
+                            128,
+                            tokens,
+                        )
+                    )
 
 
 if __name__ == "__main__":

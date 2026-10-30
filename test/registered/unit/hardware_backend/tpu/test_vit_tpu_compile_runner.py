@@ -7,11 +7,16 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.compilation import direct_compile
-from sglang.srt.hardware_backend.tpu.graph_runner import (
-    vit_tpu_compile_runner as vit_runner,
+from sglang.srt.layers.attention.vision import (
+    VisionTpuAttention,
+    _build_tpu_segment_ids,
 )
-from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
+from sglang.srt.observability.compile_timing import CompileTimingRecorder
+from sglang.test.ci.ci_register import register_tpu_ci
+from sglang_tpu.compilation import direct_compile
+from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.graph_runner import vit_tpu_compile_runner as vit_runner
+from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
     Qwen3VLVisionTpuCompilePolicy,
     VisionPaddingContext,
     VisionTpuCompilePolicy,
@@ -19,14 +24,24 @@ from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import 
     _cu_seqlens_to_segment_ids,
     _Qwen3VLRunContext,
 )
-from sglang.srt.layers.attention.vision import (
-    VisionTpuAttention,
-    _build_tpu_segment_ids,
-)
-from sglang.srt.observability.compile_timing import CompileTimingRecorder
-from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
+
+
+def _graph_config(
+    *,
+    tpu_compile_tracer: str,
+    unsafe_save_torch_compile_bundle: str | None = None,
+    unsafe_load_torch_compile_bundle: str | None = None,
+):
+    graph = SimpleNamespace(
+        tpu_compile_tracer=tpu_compile_tracer,
+        unsafe_save_torch_compile_bundle=unsafe_save_torch_compile_bundle,
+        unsafe_load_torch_compile_bundle=unsafe_load_torch_compile_bundle,
+    )
+    return patch.object(
+        vit_runner, "get_exec", return_value=SimpleNamespace(graph=graph)
+    )
 
 
 @contextlib.contextmanager
@@ -92,6 +107,32 @@ def _make_vit(block):
     )
 
 
+class _Qwen3VLTowerStub(nn.Module):
+    """Qwen3-VL vision tower surface the compile policy touches."""
+
+    def __init__(self, hidden):
+        super().__init__()
+        self.hidden = hidden
+        self.spatial_merge_size = 2
+        self.dtype = torch.float32
+        # 3 channels * 2 temporal * 1x1 patch == 6 features per patch.
+        self.patch_embed = SimpleNamespace(
+            in_channels=3, temporal_patch_size=2, patch_size=1
+        )
+        self.forward_with_tpu_graph = MagicMock()
+        self.prologue_inputs = []
+
+    def prepare_tpu_graph_inputs(self, x, grid_thw):
+        self.prologue_inputs.append(x)
+        bucket = x.shape[0]
+        return (
+            torch.zeros(bucket, self.hidden),
+            torch.tensor([0, bucket], dtype=torch.int32),
+            torch.zeros(bucket, 2),
+            torch.zeros(bucket, 2),
+        )
+
+
 class _FakeVisionPolicy(VisionTpuCompilePolicy):
     """Smallest subclass that exercises the base ``run`` seam."""
 
@@ -124,13 +165,6 @@ class TestViTTpuCompileRunner(unittest.TestCase):
             nn.Identity(),
             owner=owner,
             compile_timing_recorder=recorder,
-            model_runner=SimpleNamespace(
-                server_args=SimpleNamespace(
-                    tpu_compile_tracer="direct",
-                    unsafe_save_torch_compile_bundle=None,
-                    unsafe_load_torch_compile_bundle=None,
-                )
-            ),
         )
         events = []
         clock = SimpleNamespace(now=0.0)
@@ -152,6 +186,7 @@ class TestViTTpuCompileRunner(unittest.TestCase):
 
         with (
             envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True),
+            _graph_config(tpu_compile_tracer="direct"),
             patch.object(vit_runner, "_precompiled_max_patch_count", None),
             patch.object(
                 vit_runner, "time", SimpleNamespace(perf_counter=lambda: clock.now)
@@ -184,12 +219,11 @@ class TestViTTpuCompileRunner(unittest.TestCase):
             self.assertEqual(len(policy.compiled_fn.cache), 2)
 
     def test_default_policy_keeps_dynamo_with_async_enabled(self):
-        policy = _FakeVisionPolicy(
-            model_runner=SimpleNamespace(
-                server_args=SimpleNamespace(tpu_compile_tracer="direct")
-            )
-        )
-        with envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True):
+        policy = _FakeVisionPolicy()
+        with (
+            envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True),
+            _graph_config(tpu_compile_tracer="direct"),
+        ):
             compiled = policy._compile_method(lambda x: x, use_bundle=False)
         self.assertNotIsInstance(compiled, direct_compile.CompiledFunction)
 
@@ -226,11 +260,40 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         # ... and its ctx drives unpad_outputs on the way back.
         self.assertEqual(result.tolist(), [0.0, 2.0])
 
+    def test_base_run_sends_inputs_past_the_ladder_to_eager_fn(self):
+        """Any policy reporting a patch count gets the fallback from the base."""
+
+        class _SizedPolicy(_FakeVisionPolicy):
+            def input_patch_count(self, x):
+                return x.shape[0]
+
+        policy = _SizedPolicy()
+        policy.compiled_fn = MagicMock(side_effect=lambda x, extra: x * 2)
+        policy.eager_fn = MagicMock(side_effect=lambda x, extra: x * 3)
+
+        # 4 patches fit the [4] ladder; 5 do not.
+        self.assertEqual(policy.run(torch.arange(4).float()).tolist(), [0.0, 2.0])
+        self.assertEqual(policy.run(torch.arange(5).float()).tolist(), [0.0, 3.0])
+        policy.compiled_fn.assert_called_once()
+        # The eager fn gets prepare_call's arguments, like the compiled one.
+        self.assertEqual(policy.eager_fn.call_args.args[1].tolist(), [1])
+
+    def test_base_run_without_a_patch_count_keeps_the_compiled_fn(self):
+        """A policy that reports no count is unchanged, even past the ladder."""
+        policy = _FakeVisionPolicy()
+        policy.compiled_fn = MagicMock(side_effect=lambda x, extra: x * 2)
+        policy.eager_fn = MagicMock()
+
+        policy.run(torch.arange(5).float())
+
+        policy.eager_fn.assert_not_called()
+        policy.compiled_fn.assert_called_once()
+
     def test_qwen3_vl_patch_buckets_honor_the_env_override(self):
         policy = Qwen3VLVisionTpuCompilePolicy(SimpleNamespace(spatial_merge_size=2))
-        sizes = envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES
+        sizes = tpu_envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES
 
-        with _unset(sizes), _unset(envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES):
+        with _unset(sizes), _unset(tpu_envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES):
             ladder = policy.compute_patch_buckets()
         self.assertEqual((ladder[0], ladder[-1]), (196, 4900))
 
@@ -255,8 +318,8 @@ class TestViTTpuCompileRunner(unittest.TestCase):
     def test_env_cap_bounds_the_ladder_but_is_not_its_top_bucket(self):
         policy = Qwen3VLVisionTpuCompilePolicy(SimpleNamespace(spatial_merge_size=2))
         with (
-            _unset(envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES),
-            envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(5000),
+            _unset(tpu_envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES),
+            tpu_envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(5000),
         ):
             ladder = policy.compute_patch_buckets()
         # 72^2 = 5184 overshoots the cap, so the real ceiling stays 70^2. Callers
@@ -330,6 +393,83 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         # 324 == 18^2, so a square grid lands exactly on the bucket.
         self.assertEqual(grid_thw.tolist(), [[1, 18, 18]])
 
+    def test_qwen3_vl_supplies_the_vision_tower_for_direct_compile(self):
+        tower = nn.Linear(2, 2)
+        self.assertIs(Qwen3VLVisionTpuCompilePolicy(tower).get_compile_model(), tower)
+        # A non-module stand-in keeps the Dynamo path rather than tracing
+        # something direct_compile cannot enumerate state for.
+        self.assertIsNone(
+            Qwen3VLVisionTpuCompilePolicy(
+                SimpleNamespace(spatial_merge_size=2)
+            ).get_compile_model()
+        )
+
+    def test_qwen3_vl_direct_warmup_queues_the_serve_time_boundary(self):
+        """Under direct compile, buckets are submitted, not compiled inline.
+
+        The warmup must hand warmup_async the same argument tuple run() passes
+        at serve time; otherwise the first real image of each bucket misses the
+        specialization cache and compiles synchronously.
+        """
+        hidden = 4
+        vit = _Qwen3VLTowerStub(hidden)
+        runner = SimpleNamespace(
+            _supports_segment_ids=True, forward=lambda x, cu, cos, sin, seg: x
+        )
+        vit.graph_runners = runner
+        policy = Qwen3VLVisionTpuCompilePolicy(vit, owner=vit)
+        events = []
+
+        def compile_artifact(args, kwargs, **options):
+            events.append(("compile", args[0].shape[0], options["async_compile"]))
+
+            def execute(call):
+                args, kwargs = call
+                events.append(("execute", args[0].shape[0]))
+                return policy.compiled_fn.fn(*args, **kwargs)
+
+            return execute
+
+        with (
+            envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True),
+            envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.override(False),
+            _graph_config(tpu_compile_tracer="direct"),
+            patch.object(vit_runner, "_precompiled_max_patch_count", None),
+            patch.object(vit_runner, "tpu_sync") as sync,
+            patch.object(
+                direct_compile.CompiledFunction,
+                "_compile",
+                side_effect=compile_artifact,
+            ),
+        ):
+            self.assertTrue(policy.install())
+            self.assertIsInstance(policy.compiled_fn, direct_compile.CompiledFunction)
+            pending = policy.precompile([4, 16])
+
+            self.assertEqual(events, [("compile", 4, True), ("compile", 16, True)])
+            self.assertEqual(
+                [tuple(x.shape) for x in vit.prologue_inputs], [(4, 6), (16, 6)]
+            )
+            vit.forward_with_tpu_graph.assert_not_called()
+            sync.assert_not_called()
+
+            for call in pending:
+                call.wait()
+            self.assertEqual(events[-2:], [("execute", 4), ("execute", 16)])
+            self.assertEqual(sync.call_count, 2)
+
+            # A real 3x4 image padded into the 16 bucket reuses the warmed graph.
+            out = runner.run(
+                torch.zeros(16, hidden),
+                torch.tensor([0, 12], dtype=torch.int32),
+                rotary_pos_emb_cos=torch.zeros(16, 2),
+                rotary_pos_emb_sin=torch.zeros(16, 2),
+            )
+            self.assertEqual(len(policy.compiled_fn.cache), 2)
+            self.assertEqual(events[-1], ("execute", 16))
+            # 12 real patches with a 2x2 merge leave 3 merged rows.
+            self.assertEqual(out.shape[0], 3)
+
     def test_precompile_publishes_nothing_when_warming_is_disabled(self):
         policy = _FakeVisionPolicy()
         policy.owner = SimpleNamespace()
@@ -346,11 +486,11 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         unwarmed = patch.object(vit_runner, "_precompiled_max_patch_count", None)
         with (
             unwarmed,
-            _unset(envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES),
-            envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(1600),
+            _unset(tpu_envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES),
+            tpu_envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(1600),
         ):
             self.assertEqual(vit_runner.precompiled_max_patch_count(), 1600)
-        with unwarmed, envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.override("196, 1024"):
+        with unwarmed, tpu_envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.override("196, 1024"):
             self.assertEqual(vit_runner.precompiled_max_patch_count(), 1024)
 
     def test_qwen3_vl_unpad_trims_bucket_padding_and_selects_rows(self):
@@ -431,6 +571,61 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         self.assertEqual(ctx.padding.real_seq_len, 5)
         self.assertEqual(ctx.padding.bucket_len, bucket_len)
         self.assertTrue(ctx.padding.padded)
+
+    @staticmethod
+    def _installed_qwen3_vl_policy(buckets):
+        """A Qwen3-VL policy wired onto a runner, with both fns as spies."""
+        policy = Qwen3VLVisionTpuCompilePolicy(SimpleNamespace(spatial_merge_size=1))
+        policy._patch_buckets = list(buckets)
+
+        def boundary(x, cu_seqlens, cos, sin, segment_ids):
+            return x[:, 0] + 1
+
+        # Stand in for install(): eager is the runner's forward, compiled is its
+        # torch.compile wrapper; both compute the same thing here.
+        policy.eager_fn = MagicMock(side_effect=boundary)
+        policy.compiled_fn = MagicMock(side_effect=boundary)
+        runner = SimpleNamespace()
+        policy._install_run_adapter(runner)
+        return policy, runner
+
+    def test_qwen3_vl_images_past_the_ladder_run_eagerly(self):
+        """Past the top bucket, recompiling would raise under fail_on_recompile
+        and take down every scheduler rank, so these images run uncompiled."""
+        policy, runner = self._installed_qwen3_vl_policy([16])
+        # The caller found no bucket, so it left x at its real 20 patches.
+        x = torch.arange(20 * 4, dtype=torch.float32).reshape(20, 4)
+        rope = torch.zeros(20, 2)
+        cu_seqlens = torch.tensor([0, 8, 20], dtype=torch.int32)
+
+        out = runner.run(
+            x, cu_seqlens, rotary_pos_emb_cos=rope, rotary_pos_emb_sin=rope
+        )
+
+        policy.compiled_fn.assert_not_called()
+        policy.eager_fn.assert_called_once()
+        x_3d, graph_cu_seqlens, _, _, segment_ids = policy.eager_fn.call_args.args
+        self.assertEqual(tuple(x_3d.shape), (20, 1, 4))
+        # Same boundary arguments the compiled fn takes: the segmentation rides
+        # on segment_ids, and with no padding there is no trailing segment.
+        self.assertEqual(graph_cu_seqlens.tolist(), [0, 20])
+        self.assertEqual(segment_ids.tolist(), [[0] * 8 + [1] * 12])
+        torch.testing.assert_close(out, x + 1)
+
+    def test_qwen3_vl_bucketed_images_stay_compiled(self):
+        policy, runner = self._installed_qwen3_vl_policy([16])
+        # 12 real patches, padded on the host to the 16 bucket.
+        x = torch.arange(16 * 4, dtype=torch.float32).reshape(16, 4)
+        rope = torch.zeros(16, 2)
+        cu_seqlens = torch.tensor([0, 12], dtype=torch.int32)
+
+        out = runner.run(
+            x, cu_seqlens, rotary_pos_emb_cos=rope, rotary_pos_emb_sin=rope
+        )
+
+        policy.eager_fn.assert_not_called()
+        policy.compiled_fn.assert_called_once()
+        torch.testing.assert_close(out, x[:12] + 1)
 
     def test_segment_ids_are_built_from_host_cumulative_lengths(self):
         cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)

@@ -14,7 +14,7 @@ from unittest.mock import patch
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu.evals.eval_support import RecipeLauncher
 
-register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=90, suite="stage-a-test-tpu-unit", chips=4)
 
 
 def worker(phase, source):
@@ -78,12 +78,10 @@ class TestCollectiveCompileCache(unittest.TestCase):
 
         if hardware.get_tpu_device_count() < 2:
             self.skipTest("requires at least two TPU devices")
-        source = (
-            Path(__file__).resolve().parents[5]
-            / "python/sglang/srt/hardware_backend/tpu/compile_cache.py"
-        )
+
+        source = Path(__file__).resolve().parents[5] / "sglang_tpu/compile_cache.py"
         python = shlex.quote(sys.executable)
-        wrapper = "torch_tpu._internal.distributed.launchers.singlehost_wrapper"
+        wrapper = "torch.tpu.distributed"
         with tempfile.TemporaryDirectory(prefix="tpu-collective-cache-") as cache:
             env = {
                 **os.environ,

@@ -31,6 +31,8 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    PullWeightsReqInput,
+    PullWeightsReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -44,7 +46,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
-from sglang.srt.runtime_context import get_model
+from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils.weight_checker import overall_checksum
 
 logger = logging.getLogger(__name__)
@@ -88,7 +90,6 @@ class _WeightUpdateSession(msgspec.Struct, frozen=True):
 class SchedulerWeightUpdaterManager:
     tp_worker: Any
     draft_worker: Any
-    tp_cpu_group: Any
     memory_saver_adapter: Any
     flush_cache: Callable[..., bool]
     is_fully_idle: Callable[..., bool]
@@ -98,6 +99,10 @@ class SchedulerWeightUpdaterManager:
     stashed_model_static_state: Any = None
     # replicated on every TP rank, so a rejected call returns on all ranks before any barrier
     _session: Optional[_WeightUpdateSession] = None
+    tp_cpu_group: Any = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.tp_cpu_group = get_parallel().tp_group.cpu_group
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -148,6 +153,44 @@ class SchedulerWeightUpdaterManager:
             return UpdateWeightFromDiskReqOutput(
                 success=success, message=message, num_paused_requests=0
             )
+
+    def pull_weights(self, recv_req: PullWeightsReqInput):
+        """Sync this host's local checkpoint up to recv_req.target_version.
+
+        Every rank runs the pull; a per-host file lock collapses co-located
+        ranks to one pull. Success is gathered across the TP group (all nodes),
+        so the reply only reports success once every host holds a verified
+        checkpoint.
+        """
+        from sglang.srt.weight_sync import local_checkpoint
+
+        server_args = self.tp_worker.model_runner.server_args
+        try:
+            local_checkpoint.pull(
+                local_checkpoint_dir=recv_req.local_checkpoint_dir,
+                base_dir=server_args.model_path,
+                source_dir=recv_req.source_dir,
+                target_version=recv_req.target_version,
+                pre_read_hook=server_args.custom_pull_weights_pre_read_hook,
+            )
+            success, message = True, "Success."
+        except Exception:
+            success, message = False, traceback.format_exc()
+            logger.error(message)
+
+        tp_size = (
+            torch.distributed.get_world_size(group=self.tp_cpu_group)
+            if torch.distributed.is_initialized()
+            else 1
+        )
+        if tp_size > 1:
+            results = [None] * tp_size
+            torch.distributed.all_gather_object(
+                results, (success, message), group=self.tp_cpu_group
+            )
+            success = all(ok for ok, _ in results)
+            message = "; ".join(msg for ok, msg in results if not ok) or message
+        return PullWeightsReqOutput(success=success, message=message)
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""

@@ -11,7 +11,6 @@ import torch.nn as nn
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    can_use_fused_temb_table_slices,
     can_use_linear_gelu,
     fused_gelu_active,
     fused_linear_gelu_tanh,
@@ -410,7 +409,8 @@ def _wan_temb_table_slices(
     verified = _WAN_TEMB_SLICES.verified
     if (
         not _WAN_TEMB_SLICES.disabled
-        and can_use_fused_temb_table_slices(table, temb)
+        and _is_cuda
+        and temb.is_cuda
         and (verified or _WAN_TEMB_SLICES.can_attempt_once())
     ):
         try:
@@ -1341,7 +1341,10 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 self.maybe_cache_states(hidden_states, original_hidden_states)
             if enable_spectrum:
                 self.spectrum_record_features(hidden_states)
-        self.cnt += 1
+        # Only TeaCache reads the step counter; under torch.compile a mutated
+        # int attribute recompiles the forward every step.
+        if self.enable_teacache:
+            self.cnt += 1
 
         if sequence_shard_enabled:
             hidden_states = hidden_states.contiguous()

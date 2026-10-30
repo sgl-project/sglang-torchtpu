@@ -79,14 +79,11 @@ def _bind_threads_if_cpu(*, device: str) -> "Optional[List[int]]":
     from sglang.srt.utils import numa_utils
 
     parallel = get_parallel()
-    # With --enable-dp-attention, dp partitions the existing TP group rather
-    # than spawning additional processes, so dp_size must not be multiplied
-    # into the process count here (unlike regular DP, where dp_size * tp_size *
-    # pp_size is the true worker count).
-    dp_size = 1 if parallel.enable_dp_attention else parallel.dp_size
+    # Attention DP partitions the existing TP group rather than spawning
+    # additional processes, so only the replicas multiply the process count.
     return numa_utils.init_threads_binding(
         numa_index=get_device().gpu_id,
-        world_size=dp_size * parallel.tp_size * parallel.pp_size,
+        world_size=parallel.dp_size * parallel.tp_size * parallel.pp_size,
     )
 
 
@@ -95,12 +92,12 @@ def init_parallel_runtime(
     server_args: ServerArgs,
     device: str,
     dist_port: int,
-) -> None:
+) -> float:
     """Initialize the parallel runtime once, after publishing configuration.
 
     Set up CPU thread binding, the current device, and the shared Mooncake
     engine before creating process groups. Draft workers reuse their target's
-    groups and must not call this function.
+    groups and must not call this function. Return the elapsed initialization time.
     """
     global _PARALLEL_INITIALISED
     if _PARALLEL_INITIALISED:
@@ -175,7 +172,22 @@ def init_parallel_runtime(
     ):
         _prewarm_tp_lm_head_all_to_all()
 
-    logger.info(f"Init parallel ends. elapsed={time.perf_counter() - tic:.2f} s")
+    # EPLB uses the default process group, not the TP/EP coordinators.
+    # Limit warmup to static, single-node full-EP layouts for now.
+    if (
+        device == "cuda"
+        and backend == "nccl"
+        and get_exec().moe.enable_eplb
+        and get_exec().moe.elastic_ep_backend is None
+        and parallel.nnodes == 1
+        and parallel.pp_size == 1
+        and parallel.moe_ep_size == parallel.tp_size > 1
+    ):
+        _prewarm_eplb_p2p()
+
+    elapsed = time.perf_counter() - tic
+    logger.info(f"Init parallel ends. elapsed={elapsed:.2f} s")
+    return elapsed
 
 
 def measure_pre_model_load_memory(*, device: str, is_draft_worker: bool) -> float:
@@ -215,7 +227,7 @@ def _resolve_backend(*, device: str, tp_size: int, pp_size: int = 1) -> str:
     backend = get_default_distributed_backend(device)
     # tpu_dist bootstrap requires exactly one TPU device per process.
     # On multi-chip hosts with world_size==1, PJRT sees multiple chips
-    # and raises. Match torchtpu-vllm: use gloo for a single-process TPU
+    # and raises. Match vllm-torchtpu: use gloo for a single-process TPU
     # world. A pipeline-parallel world (tp_size * pp_size > 1) is a real
     # slice with one device per process and keeps tpu_dist.
     if device == "tpu" and tp_size * pp_size == 1:
@@ -334,6 +346,7 @@ def _init_parallel_groups(
         rank_offset=rank_offset,
         max_world_size=None if is_scale_joiner else get_parallel().max_ep_size,
     )
+    current_platform.prepare_model_parallel_groups()
     _tag_groups_for_flashinfer_allreduce_only()
     initialize_dp_attention(server_args=server_args)
     if is_npu():
@@ -361,6 +374,41 @@ def _prewarm_nccl() -> None:
         f"NCCL/RCCL/HCCL warmup completed in {warmup_elapsed:.3f}s "
         f"(tp_size={parallel.tp_size}, pp_size={parallel.pp_size}, "
         f"ep_size={parallel.moe_ep_size})"
+    )
+
+
+def _prewarm_eplb_p2p() -> None:
+    """Materialize EPLB's default-group NCCL transports before KV sizing."""
+    warmup_start = time.perf_counter()
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    free_before, _ = torch.cuda.mem_get_info()
+    # Exercise bulk transfers as well as communicator creation.
+    bytes_per_peer = 4 << 20
+    send = torch.empty(bytes_per_peer, dtype=torch.uint8, device="cuda")
+    recv = torch.empty(
+        (world_size - 1, bytes_per_peer), dtype=torch.uint8, device="cuda"
+    )
+    ops = []
+    for slot, peer in enumerate(p for p in range(world_size) if p != rank):
+        ops.extend(
+            [
+                dist.P2POp(dist.isend, send, peer),
+                dist.P2POp(dist.irecv, recv[slot], peer),
+            ]
+        )
+    for work in dist.batch_isend_irecv(ops):
+        work.wait()
+    current_platform.synchronize()
+    del ops, send, recv
+    current_platform.empty_cache()
+    free_after, _ = torch.cuda.mem_get_info()
+    logger.info(
+        "EPLB default-group P2P warmup completed in %.3fs "
+        "(world_size=%d, free memory delta=%.2f MiB)",
+        time.perf_counter() - warmup_start,
+        world_size,
+        (free_before - free_after) / (1 << 20),
     )
 
 

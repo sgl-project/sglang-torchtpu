@@ -9,7 +9,7 @@ Two modes:
                       --hosts N [--weights-pvc <pvc>] [--name <run-name>]
       every host runs the launch script (it owns model+config); rank-0 runs each file.
 
-The SLICE (topology + pool) is looked up by host count in topology.yaml. Only the render
+The slice shape and Kueue queue are looked up by host count in topology.yaml. Only the render
 vars are substituted; the container's own $spid / ${TPU_WORKER_ID} stay literal.
 ${WEIGHTS_VOLUME}/${WEIGHTS_MOUNT} expand to indented YAML blocks (empty when no PVC),
 as does ${SERVICE_ACCOUNT} (empty -> namespace default KSA).
@@ -36,11 +36,19 @@ import os
 import re
 import sys
 
+import ci_topology
 import yaml
 from ci_register_loader import ci_register as _ci_register
 
 _WAIT_MARGIN = 1.5
 _WAIT_FLOOR_SECONDS = 360
+
+# Fraction of perfect scaling the chip-pinned phase actually achieves. Four
+# workers measured 2.8x, the loss being the 3s launch spacing plus the tail
+# where fewer than four files remain. Used only to size the runtime budget:
+# over-stating it would cut a slow run short, understating it hands the
+# runtime clock seconds that the admission budget needs more.
+_CHIP_PARALLEL_EFFICIENCY = 0.7
 
 # P/D mode: two engines to bring up (weight load + compile warmup on both
 # slices) before the probe + accuracy eval even start. Longest seen: 100 min;
@@ -55,19 +63,18 @@ WEIGHTS_VOLUME_TMPL = (
     "                    claimName: {pvc}\n"
     "                    readOnly: true"
 )
-# Pod-level nodeAffinity restricting the pod to this (lane, hosts)'s pools. Indented to sit
-# under the pod spec, same level as nodeSelector. Kueue's ResourceFlavor injects the exact
-# ci-tpu-pool via nodeSelector on admission; this is the outer bound, and it is what keeps a
-# JobSet Kueue is NOT managing off the dev pools (manageJobsWithoutQueueName is false).
-POOL_AFFINITY_TMPL = (
+# Pod-level nodeAffinity restricting the pod to CI pools. Indented to sit under the pod
+# spec, same level as nodeSelector. Kueue's ResourceFlavor injects the exact ci-tpu-pool via
+# nodeSelector on admission; this is the outer bound, and it is what keeps a JobSet Kueue
+# is NOT managing off the dev pools (manageJobsWithoutQueueName is false).
+POOL_AFFINITY = (
     "              affinity:\n"
     "                nodeAffinity:\n"
     "                  requiredDuringSchedulingIgnoredDuringExecution:\n"
     "                    nodeSelectorTerms:\n"
     "                      - matchExpressions:\n"
     "                          - key: ci-tpu-pool\n"
-    "                            operator: In\n"
-    "                            values: [{pools}]"
+    "                            operator: Exists"
 )
 
 
@@ -102,6 +109,7 @@ def suite_wait_seconds(
     test_file="",
     partition_id=None,
     partition_size=None,
+    chip_workers=0,
 ):
     files = [
         path
@@ -126,6 +134,14 @@ def suite_wait_seconds(
     if partition_size is not None:
         tests = _ci_register.auto_partition(tests, partition_id, partition_size)
     total = sum(test.est_time for test in tests)
+    if chip_workers > 1:
+        # `chips=1` files run several at a time, so their est_time no longer
+        # adds up along the clock. Whole-node files still do. Getting this
+        # wrong is not symmetric: _tpu-test.yml spends what is left of the
+        # runner's 6h on queueing, so an over-booked runtime is why a job
+        # sits behind a busy queue and then reports NOT ADMITTED.
+        pinned = sum(test.est_time for test in tests if test.chips == 1)
+        total -= pinned - pinned / (chip_workers * _CHIP_PARALLEL_EFFICIENCY)
     return max(int(total * _WAIT_MARGIN), _WAIT_FLOOR_SECONDS)
 
 
@@ -141,12 +157,8 @@ def main():
     # Plain words only -- the command is inlined into the pod script unquoted.
     ap.add_argument("--exec", dest="exec_cmd", default="")
     ap.add_argument("--hosts", type=int, default=1)
-    # Which lane's pools to use. pr-gate and nightly both own 1- and 2-host slices, so a
-    # host count alone no longer identifies a pool (see topology.yaml).
+    # Which lane's Kueue queue to submit to; every lane shares every CI pool of a shape.
     ap.add_argument("--lane", default="pr-gate")
-    # Overrides topology.yaml's `pools` for this (lane, hosts). discover_pools.py supplies
-    # it so a new slice needs no edit there; empty falls back to the static list.
-    ap.add_argument("--pools", default="")
     # P/D mode: hosts per role, each role on its own slice. Both must be set
     # (with --exec); --hosts is ignored in this mode.
     ap.add_argument("--pd-prefill-hosts", type=int, default=0)
@@ -163,8 +175,19 @@ def main():
         help="KSA for the pod; Workload Identity uses it to read weights from GCS.",
     )
     ap.add_argument("--name", default="")  # multi-host run label
+    # SGLANG_PLATFORM for the pods: tpu (mode A, in-tree) or tpu_oot (mode B, plugin).
+    ap.add_argument("--platform", choices=("tpu", "tpu_oot"), default="tpu")
     ap.add_argument("--dir", default=".github/tpu-ci")
     ap.add_argument("--tests-dir", default="test/registered")
+    ap.add_argument(
+        "--tpu-chip-workers",
+        type=int,
+        default=0,
+        help=(
+            "Run this many `chips=1` tests at once, each pinned to one chip of "
+            "the slice the job already holds. 0 or 1 keeps the whole node per test."
+        ),
+    )
     ap.add_argument("--partition-id", type=int, default=-1)
     ap.add_argument("--partition-size", type=int, default=0)
     ap.add_argument(
@@ -191,6 +214,7 @@ def main():
                 a.tests_dir,
                 nightly=a.nightly,
                 test_file=a.test_file,
+                chip_workers=a.tpu_chip_workers,
                 **partition_args,
             )
         )
@@ -204,19 +228,15 @@ def main():
         weights_pvcs = yaml.safe_load(f)
     a.weights_pvc = weights_pvcs.get(a.weights_pvc, a.weights_pvc)
 
-    lanes = yaml.safe_load(open(f"{a.dir}/topology.yaml"))["lanes"]
-    if a.lane not in lanes:
-        ap.error(f"unknown --lane {a.lane!r}; topology.yaml has {sorted(lanes)}")
-    slices = lanes[a.lane]
+    topo = ci_topology.load(f"{a.dir}/topology.yaml")
+    if a.lane not in topo["lanes"]:
+        ap.error(f"unknown --lane {a.lane!r}; topology.yaml has {topo['lanes']}")
 
     def slice_for(hosts):
-        sl = slices.get(hosts, slices.get(str(hosts)))
-        if not sl:
-            sys.exit(
-                f"no slice for lane={a.lane} hosts={hosts} in topology.yaml "
-                f"(lane has {sorted(slices)})"
-            )
-        return sl
+        shape = ci_topology.shape_for_hosts(topo, hosts)
+        if shape is None:
+            sys.exit(f"no slice shape with {hosts} hosts in topology.yaml")
+        return {"topology": shape, "queue": ci_topology.queue_name(a.lane, hosts)}
 
     if a.pd_prefill_hosts or a.pd_decode_hosts:
         if partitioned:
@@ -225,6 +245,10 @@ def main():
             ap.error("P/D mode needs both --pd-prefill-hosts and --pd-decode-hosts")
         if not a.exec_cmd:
             ap.error("P/D mode needs --exec")
+        if a.platform != "tpu":
+            ap.error(
+                "P/D mode runs mode A only; jobset-tpu-pd.yaml pins SGLANG_PLATFORM=tpu"
+            )
         # The pod script announces --files and reports the run's verdict against
         # them in TIMINGS format, which is the only thing that gives a P/D run a
         # test name on the dashboard. Without it the run lands there named after
@@ -261,12 +285,6 @@ def main():
             "    alpha.jobset.sigs.k8s.io/exclusive-topology: "
             "cloud.google.com/gke-nodepool"
         )
-        # Both roles draw from the same discovered pool set (--pools already unions
-        # topology.yaml's entry); Kueue's per-PodSet flavor is what separates the
-        # two roles onto different slices within it.
-        pd_pools = a.pools.split() or list(
-            dict.fromkeys(prefill_slice["pools"] + decode_slice["pools"])
-        )
         pvc = a.weights_pvc
         vals = {
             "IMAGE": a.image,
@@ -279,14 +297,10 @@ def main():
             "DECODE_HOSTS": str(a.pd_decode_hosts),
             "QUEUE": prefill_slice["queue"],
             "PREFILL_TOPOLOGY": prefill_slice["topology"],
-            "PREFILL_POOL_AFFINITY": POOL_AFFINITY_TMPL.format(
-                pools=", ".join(pd_pools)
-            ),
+            # Kueue's per-PodSet flavor puts the two roles on different slices.
+            "PREFILL_POOL_AFFINITY": POOL_AFFINITY,
             "DECODE_TOPOLOGY": decode_slice["topology"],
-            "DECODE_POOL_AFFINITY": POOL_AFFINITY_TMPL.format(
-                pools=", ".join(pd_pools)
-            ),
-            "POOL_LIST": " ".join(pd_pools),
+            "DECODE_POOL_AFFINITY": POOL_AFFINITY,
             "WEIGHTS_VOLUME": WEIGHTS_VOLUME_TMPL.format(pvc=pvc) if pvc else "",
             "WEIGHTS_MOUNT": WEIGHTS_MOUNT_TMPL if pvc else "",
             "SERVICE_ACCOUNT": (
@@ -336,12 +350,9 @@ def main():
 
     sl = slice_for(hosts)
 
-    # Discovered set when --pools is passed (it already unions in topology.yaml's entry).
-    pools = a.pools.split() or sl["pools"]
-
-    # Suite mode runs every registered file sequentially, so its deadline scales
-    # with the suite (same est_time formula as _tpu-test's poll budget, keeping the
-    # two in agreement). Exec gets 7200: the combo rows budget WAIT_SECS=2400 for
+    # Suite mode's deadline scales with the suite (same est_time formula as
+    # _tpu-test's poll budget, keeping the two in agreement), discounted for
+    # chip sharing when it is on. Exec gets 7200: the combo rows budget WAIT_SECS=2400 for
     # engine bring-up alone.
     if suite:
         active_deadline = suite_wait_seconds(
@@ -349,6 +360,7 @@ def main():
             a.tests_dir,
             nightly=a.nightly,
             test_file=a.test_file,
+            chip_workers=a.tpu_chip_workers,
             **partition_args,
         )
     elif a.exec_cmd:
@@ -366,11 +378,11 @@ def main():
         "EXEC_CMD": a.exec_cmd,
         "HOSTS": str(hosts),
         "TOPOLOGY": sl["topology"],
-        "POOL_AFFINITY": POOL_AFFINITY_TMPL.format(pools=", ".join(pools)),
-        "POOL_LIST": " ".join(pools),
+        "POOL_AFFINITY": POOL_AFFINITY,
         "QUEUE": sl["queue"],
         "RUN_NAME": run_name,
         "SUITE": suite,
+        "PLATFORM": a.platform,
         # --continue-on-error only on the nightly, matching the CUDA nightly: a
         # scheduled run should report every file's verdict, where the PR gate still
         # fast-fails to give the slice back. Without it the suite stops at the first
@@ -383,6 +395,12 @@ def main():
             else ""
         ),
         "TEST_FILE_FLAG": f"--test-file {a.test_file}" if a.test_file else "",
+        "CHIP_WORKERS_FLAG": (
+            f"--tpu-chip-workers {a.tpu_chip_workers}" if a.tpu_chip_workers > 1 else ""
+        ),
+        # Sweeps trimmed for the gate run whole on the nightly; see
+        # python/sglang/test/ci/gate_matrix.py.
+        "FULL_MATRIX": "1" if a.nightly else "0",
         "LAUNCH_SCRIPT": a.launch_script,
         "TEST_FILES": a.files,
         "WEIGHTS_VOLUME": WEIGHTS_VOLUME_TMPL.format(pvc=pvc) if pvc else "",

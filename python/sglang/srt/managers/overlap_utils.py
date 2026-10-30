@@ -16,7 +16,7 @@ from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu
 _is_tpu = is_tpu()
 
 if _is_tpu:
-    from sglang.srt.hardware_backend.tpu.overlap_utils_tpu import (
+    from sglang_tpu.overlap_utils_tpu import (
         device_accept_resolved_tpu,
         resolve_device_accept_seq_lens_tpu,
     )
@@ -91,14 +91,25 @@ def _assert_nonneg_and_invalidate(
     buf[indices] = -1
 
 
+def _stage_prefill_tokens(batch):
+    """Materialize the staged prompt before combining it with decode inputs."""
+    # None uploads now; a backend may keep prompts on CPU until padding.
+    return batch.prefill_input_ids_cpu.to(
+        batch.input_tensor_device or batch.device, non_blocking=True
+    )
+
+
 def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     """Materialize input_ids at forward entry. Two sources:
 
     - Prefill: H2D copy from pinned CPU staging (prefill_input_ids_cpu).
     - Decode/spec_v2: gather from FutureMap (last iter's sampled token).
     """
+    batch.mm_input_ids_cpu = None
     if batch.prefill_input_ids_cpu is not None:
-        prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
+        if _is_tpu and any(batch.multimodal_inputs or ()):
+            batch.mm_input_ids_cpu = batch.prefill_input_ids_cpu
+        prefill_gpu = _stage_prefill_tokens(batch)
         if batch.mix_running_indices is not None:
             if batch.enable_overlap and not batch.spec_algorithm.is_none():
                 future_map.resolve_mixed_spec_tails(batch)
@@ -115,10 +126,14 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
         batch.prefill_input_ids_cpu = None
         batch.mix_running_indices = None
     elif batch.input_ids is None and future_map.spec_algo.is_none():
-        batch.input_ids = future_map.output_tokens_buf[batch.req_pool_indices]
+        # Relay needs device indices even when scheduler metadata stays on host.
+        relay_indices = batch.req_pool_indices.to(
+            future_map.output_tokens_buf.device, non_blocking=True
+        )
+        batch.input_ids = future_map.output_tokens_buf[relay_indices]
         if _DEBUG_ASSERT:
             _assert_nonneg_and_invalidate(
-                batch.input_ids, future_map.output_tokens_buf, batch.req_pool_indices
+                batch.input_ids, future_map.output_tokens_buf, relay_indices
             )
 
     # Only the overlap path relays spec extras through the future_map; the
@@ -516,8 +531,9 @@ class FutureMap:
         """
         # Cast to the buffer dtype before storing (main #134: the sampler now
         # returns int64 token ids that must land in the buffer's dtype).
-        if values.dtype != buf.dtype:
-            values = values.to(buf.dtype)
+        # Host-owned scheduler lengths may arrive on CPU; same-device values are no-ops.
+        values = values.to(device=buf.device, dtype=buf.dtype, non_blocking=True)
+        indices = indices.to(buf.device, non_blocking=True)
         if self._use_dynamic_index:
             buf.index_copy_(0, indices, values)
         else:

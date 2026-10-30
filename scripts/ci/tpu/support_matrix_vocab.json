@@ -1,0 +1,132 @@
+{
+  "_comment": [
+    "Label vocabulary for scripts/ci/tpu/support_matrix.py.",
+    "Every `labels=[...]` entry on a register_tpu_ci(...) call must be one of:",
+    "a topology, a model (or one of its aliases), a kind, or a feature (or alias).",
+    "Unknown labels are reported; --strict turns them into a failure.",
+    "Keys are the canonical labels; values are display names, or {name, aliases}.",
+    "The `infra` kind marks tests that exercise launch/cluster plumbing rather than",
+    "a model; they are listed in their own table and need no model label."
+  ],
+  "topologies": {
+    "singlehost": "Single-host",
+    "multihost": "Multi-host"
+  },
+  "models": {
+    "muse-spark-open-816b-a42b": {
+      "name": "Muse Spark Open 816B-A42B NVFP4"
+    },
+    "gpt-oss-120b": {
+      "name": "gpt-oss-120b"
+    },
+    "gpt-oss-20b": {
+      "name": "gpt-oss-20b"
+    },
+    "qwen3-coder-480b": {
+      "name": "Qwen3-Coder-480B-A35B FP8"
+    },
+    "qwen3-coder-30b": {
+      "name": "Qwen3-Coder-30B-A3B FP8"
+    },
+    "qwen3-30b-a3b": {
+      "name": "Qwen3-30B-A3B FP8",
+      "aliases": [
+        "qwen3-30b"
+      ]
+    },
+    "qwen3-0.6b": {
+      "name": "Qwen3-0.6B"
+    },
+    "qwen3.5-397b": {
+      "name": "Qwen3.5-397B-A17B FP8"
+    },
+    "qwen3-vl-8b": {
+      "name": "Qwen3-VL-8B"
+    },
+    "qwen3-vl-30b-a3b": {
+      "name": "Qwen3-VL-30B-A3B"
+    },
+    "qwen3-8b": {
+      "name": "Qwen3-8B"
+    },
+    "qwen3.8-27b": {
+      "name": "Qwen3.8-27B"
+    },
+    "mimo-v2.5-pro": {
+      "name": "MiMo-V2.5-Pro"
+    },
+    "deepseek-r1-0528": {
+      "name": "DeepSeek-R1-0528",
+      "aliases": [
+        "deepseek-r1"
+      ]
+    },
+    "deepseek-v3-1": {
+      "name": "DeepSeek-V3.1"
+    },
+    "kimi-k2.6": {
+      "name": "Kimi-K2.6"
+    },
+    "kimi-k3": {
+      "name": "Kimi-K3"
+    },
+    "gemma4-31b": {
+      "name": "Gemma 4 31B"
+    },
+    "gemma4-26b-a4b": {
+      "name": "Gemma 4 26B-A4B"
+    },
+    "glm-5.3-flash": {
+      "name": "GLM-5.3-Flash"
+    },
+    "wan2.2-ti2v-5b": {
+      "name": "Wan2.2-TI2V-5B"
+    }
+  },
+  "kinds": {
+    "accuracy": "accuracy",
+    "perf": "perf",
+    "smoke": "smoke",
+    "infra": "infra"
+  },
+  "features": {
+    "spec": "Speculative decoding",
+    "eagle3": "EAGLE3",
+    "dflash": "DFlash",
+    "dpa": "DP attention",
+    "hybrid": "DP attention hybrid (attn-TP>1)",
+    "tp": "Tensor parallel",
+    "pcp": "Prefill context parallel",
+    "pp": "Pipeline parallel",
+    "pd": "PD disaggregation",
+    "epd": "EPD (standalone vision encode server)",
+    "tp-reshard": {
+      "name": "PD TP resharding",
+      "aliases": [
+        "reshard"
+      ]
+    },
+    "decode-radix": "PD decode-side radix reuse",
+    "prefix-cache": "Prefix cache",
+    "kv-offload": {
+      "name": "HiCache KV offload",
+      "aliases": [
+        "hicache"
+      ]
+    },
+    "l3-file": "HiCache L3 storage (file backend)",
+    "logprob": "Prompt logprobs",
+    "compile": "torch.compile",
+    "torch-compile": "torch.compile bundles",
+    "compile-tracer": "Direct compile tracer",
+    "agentic": "Agentic tool-call workload",
+    "multimodal": "Multimodal",
+    "video": "Video input",
+    "diffusion": "Diffusion",
+    "collectives": "Multi-host collectives",
+    "tpu-oot": "Out-of-tree plugin (mode B)",
+    "rpa-v3": "RPA v3 attention backend",
+    "seq-along-lane": "Batched RPA seq-along-lane layout",
+    "normalization": "Multi-host node normalization"
+  }
+}

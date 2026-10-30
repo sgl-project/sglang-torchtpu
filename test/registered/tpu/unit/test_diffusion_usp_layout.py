@@ -11,7 +11,7 @@ from sglang.kernels.ops.diffusion import can_use_usp_merge_heads, usp_merge_head
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.utils import is_in_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
 
 
 class TestUspLayoutTpu(unittest.TestCase):
@@ -21,7 +21,7 @@ class TestUspLayoutTpu(unittest.TestCase):
             if is_in_ci():
                 raise RuntimeError("TPU CI requires torch_tpu and a TPU device")
             raise unittest.SkipTest("torch_tpu is not installed")
-        from sglang.srt.hardware_backend.tpu.env_override import apply_tpu_env_overrides
+        from sglang_tpu.env_override import apply_tpu_env_overrides
 
         apply_tpu_env_overrides()
         import torch_tpu  # noqa: F401

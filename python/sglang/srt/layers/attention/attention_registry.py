@@ -23,11 +23,12 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_spec,
 )
-from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
+from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu, is_tpu
 
 _is_musa = is_musa()
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_tpu = is_tpu()
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +39,23 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 ATTENTION_BACKENDS = {}
+# fn(runner, topk, speculative_num_steps) -> multi-step draft decode container;
+# the draft extend of the same name builds the ATTENTION_BACKENDS entry.
+DRAFT_ATTENTION_BACKENDS = {}
+HYBRID_GDN_SM100_BACKENDS = {"triton", "trtllm_mha", "fa4", "flashinfer"}
 
 
 def register_attention_backend(name):
     def decorator(fn):
         ATTENTION_BACKENDS[name] = fn
+        return fn
+
+    return decorator
+
+
+def register_draft_attention_backend(name):
+    def decorator(fn):
+        DRAFT_ATTENTION_BACKENDS[name] = fn
         return fn
 
     return decorator
@@ -439,7 +452,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     # GDN models. In particular, quantized KV recipes use it
                     # to expose an FP8 dequant workspace while a different
                     # backend (for example TRT-LLM GenMHA) owns decode.
-                    allowed = {"triton", "trtllm_mha", "fa4", "flashinfer"}
+                    allowed = HYBRID_GDN_SM100_BACKENDS
                 prefill_be = runner.prefill_attention_backend_str
                 decode_be = runner.decode_attention_backend_str
                 assert prefill_be in allowed and decode_be in allowed, (
@@ -454,7 +467,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
                 )
             if is_tpu():
-                from sglang.srt.hardware_backend.tpu.attention_gdn_pallas import (
+                from sglang_tpu.attention_gdn_pallas import (
                     TpuGDNAttnBackend,
                 )
 
@@ -517,8 +530,12 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 hybrid_backend_cls = ShortConvHybridAttnBackend
             else:
                 linear_attn_backend = Mamba2AttnBackend(runner)
-        elif kimi_linear_config(runner.model_config) is not None:
-            if _is_npu:
+        elif (
+            kimi_linear_config(runner.model_config) is not None
+            or glm5_next_config(runner.model_config) is not None
+        ):
+            # Kimi-Linear and GLM-5.3 share the KDA layer.
+            if _is_npu and kimi_linear_config(runner.model_config) is not None:
                 from sglang.srt.hardware_backend.npu.attention.ascend_kda_backend import (
                     AscendKDAAttnBackend,
                     AscendKDAHybridLinearAttnBackend,
@@ -527,18 +544,14 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 linear_attn_backend = AscendKDAAttnBackend(runner)
                 hybrid_backend_cls = AscendKDAHybridLinearAttnBackend
             elif is_tpu():
-                from sglang.srt.hardware_backend.tpu.attention_kda_pallas import (
+                from sglang_tpu.attention_kda_pallas import (
                     TpuKDAAttnBackend,
                 )
 
-                logger.info(
-                    "Using TPU KDA linear-attention backend for Kimi linear models."
-                )
+                logger.info("Using TPU KDA linear-attention backend.")
                 linear_attn_backend = TpuKDAAttnBackend(runner)
             else:
                 linear_attn_backend = KDAAttnBackend(runner)
-        elif glm5_next_config(runner.model_config) is not None:
-            linear_attn_backend = KDAAttnBackend(runner)
         elif hybrid_lightning_config(runner.model_config) is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:
@@ -578,14 +591,14 @@ def create_intel_xpu_backend(runner):
 
 @register_attention_backend("pallas_tpu_flash")
 def create_pallas_tpu_flash_backend(runner):
-    from sglang.srt.hardware_backend.tpu.attention_pallas import TpuPallasAttnBackend
+    from sglang_tpu.attention_pallas import TpuPallasAttnBackend
 
     return TpuPallasAttnBackend(runner)
 
 
 @register_attention_backend("pallas_tpu_rpa_v3")
 def create_pallas_tpu_rpa_v3_backend(runner):
-    from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
+    from sglang_tpu.attention_pallas_rpa_v3 import (
         TpuPallasRpaV3AttnBackend,
     )
 
@@ -594,7 +607,7 @@ def create_pallas_tpu_rpa_v3_backend(runner):
 
 @register_attention_backend("pallas_tpu_rpa_batched")
 def create_pallas_tpu_rpa_batched_backend(runner):
-    from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
+    from sglang_tpu.attention_pallas_rpa_batched import (
         TpuPallasRpaBatchedAttnBackend,
     )
 
@@ -603,7 +616,7 @@ def create_pallas_tpu_rpa_batched_backend(runner):
 
 @register_attention_backend("pallas_tpu_mla")
 def create_pallas_tpu_mla_backend(runner):
-    from sglang.srt.hardware_backend.tpu.attention_pallas_mla import (
+    from sglang_tpu.attention_pallas_mla import (
         TpuPallasMlaAttnBackend,
     )
 

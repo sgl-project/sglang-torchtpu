@@ -7,10 +7,12 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.managers.overlap_utils import RelayPayload
-from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
+from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.platforms import current_platform
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.utils import is_tpu
+from sglang.srt.utils.common import is_pin_memory_available
 
 logger = logging.getLogger(__name__)
 
@@ -87,13 +89,15 @@ class ScheduleBatchDisaggregationDecodeMixin:
         # input_ids from the relay.
         self.input_ids = None
         self.req_pool_indices = torch.tensor(
-            req_pool_indices, dtype=torch.int64, device=self.device
+            req_pool_indices, dtype=torch.int64, device=self.metadata_device()
         )
         self.req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
+        self.seq_lens = torch.tensor(
+            seq_lens, dtype=torch.int64, device=self.metadata_device()
+        )
         self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         self.orig_seq_lens = torch.tensor(
-            seq_lens, dtype=torch.int32, device=self.device
+            seq_lens, dtype=torch.int32, device=self.metadata_device()
         )
         self.out_cache_loc = out_cache_loc
         self.seq_lens_sum = sum(seq_lens)
@@ -126,7 +130,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             # PREBUILT does not materialize a local SWA branching window.
             if req.swa_branching_seqlen is not None:
                 req.swa_branching_seqlen = None
-            maybe_cache_unfinished_req(req, self.tree_cache)
+            checkpoint_kv_cache(req, self.tree_cache)
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
@@ -146,9 +150,14 @@ class ScheduleBatchDisaggregationDecodeMixin:
                         error_message, HTTPStatus.INTERNAL_SERVER_ERROR
                     )
                 req.grammar.finished = req.finished()
+        # Same placement as prefill: None uploads now, a backend may keep the
+        # host-built first token on CPU until its relay pads it.
+        input_device = current_platform.get_batch_input_device(self) or self.device
         last_tokens_tensor = torch.tensor(
-            last_tokens, dtype=torch.int64, device=self.device
-        )
+            last_tokens,
+            dtype=torch.int64,
+            pin_memory=is_pin_memory_available(self.device),
+        ).to(input_device, non_blocking=True)
 
         spec_info = self.spec_algorithm.build_disagg_draft_input(
             self,

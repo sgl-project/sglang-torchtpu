@@ -38,7 +38,9 @@ class TestPDTransferMetrics(CustomTestCase):
         self.reporter.scheduler = SimpleNamespace(
             disaggregation_mode=DisaggregationMode.PREFILL,
             disagg_prefill_inflight_queue=[],
-            disagg_decode_transfer_queue=SimpleNamespace(queue=[]),
+            disagg_decode_transfer_queue=SimpleNamespace(
+                queue=[], num_pending_deferred_releases=lambda: 0
+            ),
         )
 
     def set_queue(self, mode, times):
@@ -195,6 +197,51 @@ class TestPDTransferMetrics(CustomTestCase):
             with patch(f"{REPORTER}.ENABLE_METRICS_DEVICE_TIMER", False):
                 self.reporter._maybe_log_idle_metrics()
             update.assert_not_called()
+        self.reporter.metrics_collector.log_stats.assert_not_called()
+
+    def stall_publish(self, mode, times, last_log_time, now=100):
+        self.set_queue(mode, times)
+        self.reporter.metrics_collector.last_log_time = last_log_time
+        self.reporter.metrics_collector.log_stats.reset_mock()
+        with (
+            patch(f"{REPORTER}.time.perf_counter", return_value=now),
+            patch(f"{REPORTER}.ENABLE_METRICS_DEVICE_TIMER", False),
+        ):
+            self.reporter.maybe_log_stall_metrics()
+
+    def test_stall_publishes_queues_age_and_zero_throughput(self):
+        """A P/D engine whose queued requests never form a batch must not keep
+        its last batch's gauges (#1303): after 30 s without a stats log, the
+        queues, the growing oldest-transfer age and zero throughput go out."""
+        self.prepare_reporting()
+        for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
+            with self.subTest(mode=mode):
+                self.reporter.stats.gen_throughput = 123.0
+                self.stall_publish(mode, [60, 80], last_log_time=0)
+                self.reporter.metrics_collector.log_stats.assert_called_once_with(
+                    self.reporter.stats
+                )
+                self.assertEqual(
+                    self.reporter.stats.kv_transfer_oldest_inflight_age_seconds, 40
+                )
+                self.assertEqual(self.reporter.stats.gen_throughput, 0)
+                if mode == DisaggregationMode.PREFILL:
+                    queued = self.reporter.stats.num_prefill_inflight_queue_reqs
+                else:
+                    queued = self.reporter.stats.num_decode_transfer_queue_reqs
+                self.assertEqual(queued.total, 2)
+
+    def test_stall_waits_out_the_window_after_a_stats_log(self):
+        """An engine that is only between batches logged stats recently; it must
+        not report a zero throughput in that gap."""
+        self.prepare_reporting()
+        self.stall_publish(DisaggregationMode.DECODE, [60], last_log_time=90)
+        self.reporter.metrics_collector.log_stats.assert_not_called()
+
+    def test_stall_publish_respects_disabled_metrics(self):
+        self.prepare_reporting()
+        self.reporter.current_scheduler_metrics_enabled = False
+        self.stall_publish(DisaggregationMode.DECODE, [60], last_log_time=0)
         self.reporter.metrics_collector.log_stats.assert_not_called()
 
     def test_collector_exports_stats_with_standard_labels(self):

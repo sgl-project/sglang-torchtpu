@@ -12,10 +12,10 @@ import unittest
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.mm_embed_tpu import embed_mm_on_host
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.mm_embed_tpu import embed_mm_on_host
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -179,6 +179,31 @@ class TestHostEmbedPlacement(CustomTestCase):
 
         self.assertTrue(torch.equal(got_embeds, dest))
         self.assertTrue(torch.equal(got_deepstack, torch.zeros(ROWS, deepstack_hidden)))
+
+    def test_reused_deepstack_grid_drops_rows_of_the_previous_batch(self):
+        """The host grid is reused across prefills; rows written for one batch must not leak into the next."""
+        deepstack_hidden = HIDDEN * 3
+
+        def place(mask, deepstack_src):
+            _, got = embed_mm_on_host(
+                input_embeds=torch.randn(ROWS, HIDDEN),
+                deepstack_shape=torch.Size((ROWS, deepstack_hidden)),
+                modalities=[Modality.IMAGE],
+                embeddings=[torch.randn(deepstack_src.shape[0], HIDDEN)],
+                masks=[mask],
+                deepstack_embeddings=[deepstack_src],
+                use_deepstack={Modality.IMAGE: True},
+            )
+            return got.clone()
+
+        place(_random_mask(7), torch.randn(7, deepstack_hidden))
+        mask = _random_mask(3)
+        deepstack_src = torch.randn(3, deepstack_hidden)
+        got = place(mask, deepstack_src)
+
+        expected = torch.zeros(ROWS, deepstack_hidden)
+        expected.masked_scatter_(mask.expand_as(expected), deepstack_src)
+        self.assertTrue(torch.equal(got, expected))
 
 
 if __name__ == "__main__":

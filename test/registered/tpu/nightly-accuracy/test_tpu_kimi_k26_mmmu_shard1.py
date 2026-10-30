@@ -12,7 +12,7 @@ from sglang.test.tpu.utils.accuracy_base import (
 )
 
 register_tpu_ci(
-    est_time=14400,
+    est_time=11400,
     suite="nightly-tpu-multihost-accuracy",
     nightly=True,
     labels=["multihost", "kimi-k2.6", "accuracy"],
@@ -23,7 +23,7 @@ MULTIHOST_LAUNCH = {
     "weights_pvc": "model-weights",
     # Which accuracy-test-tpu.yml lane runs this file.
     "schedule": "nightly",
-    "timeout_per_file": 14400,
+    "timeout_per_file": 11400,
 }
 CONFIG_MODULE = "recipe/configs/kimi_k26/mmmu.py"
 
@@ -42,7 +42,8 @@ def build_model_config():
             {
                 "dataset": "mmmu_pro",
                 "label": "mmmu_pro_shard1",
-                "report_only": True,
+                "baseline": 0.791,  # measured on TPU
+                "atol": 0.1,
                 "runner": partial(
                     run_shard,
                     shard=1,

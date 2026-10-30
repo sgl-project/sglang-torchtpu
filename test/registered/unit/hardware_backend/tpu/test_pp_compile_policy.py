@@ -15,22 +15,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.compilation import decoder_compile_policy
-from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
-from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
-    CompiledForwardShim,
-    _fit_pp_proxy_in_args,
-    _fit_pp_proxy_rows,
-)
-from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
-    DecoderTpuCompilePolicy,
-    _materialize_out,
-)
-from sglang.srt.hardware_backend.tpu.compilation.pp_proxy_pytree import (
-    flatten_pp_proxy_with_keys,
-    register_pp_proxy_pytree,
-    unflatten_pp_proxy,
-)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -40,6 +24,22 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.compilation import decoder_compile_policy
+from sglang_tpu.compilation.bucketer import Bucketer
+from sglang_tpu.compilation.compiled_forward_shim import (
+    CompiledForwardShim,
+    _fit_pp_proxy_in_args,
+    _fit_pp_proxy_rows,
+)
+from sglang_tpu.compilation.decoder_compile_policy import (
+    DecoderTpuCompilePolicy,
+    _materialize_out,
+)
+from sglang_tpu.compilation.pp_proxy_pytree import (
+    flatten_pp_proxy_with_keys,
+    register_pp_proxy_pytree,
+    unflatten_pp_proxy,
+)
 
 _HIDDEN = 16
 
@@ -77,6 +77,7 @@ def _model_runner(pp_group=None):
         model_config=SimpleNamespace(model_is_mrope=False, hidden_size=_HIDDEN),
         is_draft_worker=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
+        spec_aux_config=SimpleNamespace(eagle_use_aux_hidden_state=False),
         server_args=SimpleNamespace(page_size=1, dp_size=1, disaggregation_mode="null"),
         prepare_dummy_forward_batch=lambda forward_batch: forward_batch,
     )
@@ -175,6 +176,26 @@ class TestWarmupProxy(CustomTestCase):
         self.assertEqual(tuple(proxy["hidden_states"].shape), (64, _HIDDEN))
         materialize.assert_called_once()
 
+    def test_warmup_proxy_uses_fp32_pp_transfer_dtype_and_bf16_aux_slots(self):
+        from sglang.srt.layers.aux_hidden_states import AUX_HIDDEN_STATES_PROXY_KEY
+
+        runner = _model_runner(_pp_group(first=False, last=False))
+        runner.model.pp_transfer_dtype = torch.float32
+        runner.model.relays_pp_aux_hidden_states = True
+        runner.spec_aux_config = SimpleNamespace(
+            eagle_use_aux_hidden_state=False,
+            dflash_use_aux_hidden_state=True,
+            dflash_target_layer_ids=[1, 16, 31],
+        )
+        _, kwargs = _policy(runner)._make_warmup_inputs(
+            num_tokens=64, bs=4, mode=ForwardMode.EXTEND
+        )
+        proxy = kwargs["pp_proxy_tensors"]
+        self.assertEqual(proxy["hidden_states"].dtype, torch.float32)
+        self.assertEqual(proxy["residual"].dtype, torch.float32)
+        self.assertEqual(proxy[AUX_HIDDEN_STATES_PROXY_KEY].dtype, torch.bfloat16)
+        self.assertEqual(proxy[AUX_HIDDEN_STATES_PROXY_KEY].shape, (64, 3 * _HIDDEN))
+
 
 class TestLogitsProcessorGating(CustomTestCase):
     def test_only_the_last_stage_compiles_the_logits_processor(self):
@@ -222,7 +243,7 @@ class TestLogitsProcessorGating(CustomTestCase):
     def test_non_last_stage_warms_only_full_vocab(self):
         policy = _policy(_model_runner(_pp_group(first=False, last=False)))
         with patch(
-            "sglang.srt.hardware_backend.tpu.sampler.distributed_top_k_candidate_width_for_model"
+            "sglang_tpu.sampler.distributed_top_k_candidate_width_for_model"
         ) as width:
             self.assertIsNone(policy._distributed_top_k_width())
             self.assertEqual(
@@ -356,7 +377,9 @@ def _shim(pp_group=None):
     runner = SimpleNamespace(
         model=SimpleNamespace(),
         token_to_kv_pool=SimpleNamespace(layer_transfer_counter=None),
-        server_args=SimpleNamespace(pp_size=8, dp_size=1, enable_dp_attention=False),
+        server_args=SimpleNamespace(
+            pp_size=8, dp_size=1, attn_dp_size=1, enable_dp_attention=False
+        ),
         pp_group=pp_group,
     )
     policy.model_runner = runner
@@ -432,11 +455,14 @@ class TestShimProxyCheck(CustomTestCase):
         self.assertIs(compiled.call_args.kwargs["pp_proxy_tensors"], proxy)
 
     def test_shim_rejects_a_proxy_from_another_bucket_before_compiling(self):
+        """The rejection leaves the batch as the caller passed it."""
         shim, compiled = _shim(_pp_group(first=False, last=False))
         fb = _forward_batch(64)
+        fb.is_prefill_only = True
         with self.assertRaisesRegex(ValueError, "different token buckets"):
             shim(fb.input_ids, None, fb, pp_proxy_tensors=_proxy(32))
         compiled.assert_not_called()
+        self.assertIs(fb.is_prefill_only, True)
 
     def test_first_stage_drops_a_proxy(self):
         shim, compiled = _shim(_pp_group(first=True, last=False))
@@ -450,6 +476,26 @@ class TestShimProxyCheck(CustomTestCase):
         proxy = _proxy(64)
         shim(fb.input_ids, None, fb, pp_proxy_tensors=proxy)
         self.assertIs(compiled.call_args.kwargs["pp_proxy_tensors"], proxy)
+
+    def _cp_layout(self, local_rows: int):
+        return SimpleNamespace(
+            host=SimpleNamespace(cp_size=2, local_rows_padded=local_rows),
+            local_rows=torch.arange(local_rows),
+        )
+
+    def test_later_stages_take_local_rows_and_fit_the_proxy_to_them(self):
+        shim, compiled = _shim(_pp_group(first=False, last=False))
+        shim._attn_cp_size = 2
+        fb = _forward_batch(48)
+        fb.positions = torch.arange(48)
+        fb._tpu_cp_layout = self._cp_layout(32)
+        shim(fb.input_ids, fb.positions, fb, pp_proxy_tensors=_proxy(64))
+        args, kwargs = compiled.call_args
+        self.assertEqual(args[0].shape[0], 32)
+        self.assertNotIn("cp_local_rows", kwargs)
+        self.assertEqual(
+            kwargs["pp_proxy_tensors"].tensors["hidden_states"].shape[0], 32
+        )
 
     def test_default_none_proxy_is_still_dropped(self):
         shim, compiled = _shim(_pp_group(first=False, last=False))

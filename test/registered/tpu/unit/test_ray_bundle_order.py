@@ -35,20 +35,21 @@ import pytest
 # stage-a-test-tpu-unit runner image installs sglang[ray] so it actually runs.
 pytest.importorskip("ray")
 
-from sglang.srt.hardware_backend.tpu.patches import compute_single_host_tpu_env
-from sglang.srt.hardware_backend.tpu.ray_utils import (
+from sglang.srt.runtime_context import get_context
+from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.patches import compute_single_host_tpu_env
+from sglang_tpu.ray_utils import (
     _forwarded_driver_env,
     _resolve_bundle_order_from_probes,
     redact_env_for_log,
     tpu_actor_runtime_env,
 )
-from sglang.srt.runtime_context import get_context
-from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_tpu_ci(
     est_time=30,
     suite="stage-a-test-tpu-unit",
+    chips=1,
 )
 
 
@@ -335,14 +336,12 @@ class TestComputeSingleHostTpuEnv(CustomTestCase):
         clear=True,
     )
     def test_worker_resolves_missing_topology(self):
-        from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
+        from sglang_tpu.patches import _prepare_tpu_env
 
         with (
+            mock.patch("sglang_tpu.env_override.apply_tpu_env_overrides"),
             mock.patch(
-                "sglang.srt.hardware_backend.tpu.env_override.apply_tpu_env_overrides"
-            ),
-            mock.patch(
-                "sglang.srt.hardware_backend.tpu.patches._resolve_single_host_tpu_topology",
+                "sglang_tpu.patches._resolve_single_host_tpu_topology",
                 return_value="1,1,1,2",
             ) as resolve_topology,
         ):
@@ -419,7 +418,7 @@ class TestDetectTpuNnodes(CustomTestCase):
     """
 
     def test_counts_only_alive_tpu_nodes(self):
-        from sglang.srt.hardware_backend.tpu import ray_utils
+        from sglang_tpu import ray_utils
 
         nodes = [
             {"Alive": True, "Resources": {"TPU": 4}},
@@ -431,7 +430,7 @@ class TestDetectTpuNnodes(CustomTestCase):
             self.assertEqual(ray_utils.detect_tpu_nnodes(), 2)
 
     def test_returns_zero_on_error(self):
-        from sglang.srt.hardware_backend.tpu import ray_utils
+        from sglang_tpu import ray_utils
 
         with mock.patch.object(
             ray_utils.ray, "nodes", side_effect=RuntimeError("boom")

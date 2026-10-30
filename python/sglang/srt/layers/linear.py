@@ -15,7 +15,6 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.srt.distributed import (
     divide,
-    split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_quant_all_reduce,
@@ -39,6 +38,7 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -148,6 +148,22 @@ def adjust_shard_offsets(shard_offsets, loaded_weight, dim):
             new_offset += actual_shard_size
         return new_shard_offsets
     return shard_offsets
+
+
+def pad_block_scale_tail(loaded_weight: torch.Tensor, dim: int, blocks: int):
+    # Blockwise scale counterpart of pad_or_narrow_weight: when a TP-sharded
+    # parameter was padded to block alignment (fp8 blockwise, intermediate
+    # sizes such as 1280 at TP8), the ranks past the checkpoint tail read scale
+    # rows that do not exist. Padding conventions must match the weight side:
+    # zeros appended at the tail. Zero scales are inert because the padded
+    # weight rows they cover are zeros too.
+    shortfall = blocks - loaded_weight.size(dim)
+    if shortfall <= 0:
+        return loaded_weight
+    pad_shape = list(loaded_weight.shape)
+    pad_shape[dim] = shortfall
+    pad = torch.zeros(pad_shape, dtype=loaded_weight.dtype, device=loaded_weight.device)
+    return torch.cat([loaded_weight, pad], dim=dim)
 
 
 class LinearBase(torch.nn.Module):
@@ -897,7 +913,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 shard_offset=rank_shard_offset,
                 shard_size=rank_shard_size,
                 tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
                 use_presharded_weights=self.use_presharded_weights,
             )
 
@@ -929,7 +944,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                         loaded_weight=loaded_weight,
                         shard_id=shard_id,
                         tp_rank=self.tp_rank,
-                        tp_size=self.tp_size,
                     )
                 return
             elif isinstance(param, BlockQuantScaleParameter):
@@ -939,7 +953,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 param.load_merged_column_weight(
                     loaded_weight=loaded_weight,
                     tp_rank=self.tp_rank,
-                    tp_size=self.tp_size,
                 )
                 return
             output_sizes = (
@@ -976,6 +989,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 shard_size = (
                     global_start + local_size + block_n - 1
                 ) // block_n - global_start // block_n
+                loaded_weight = pad_block_scale_tail(
+                    loaded_weight,
+                    param.output_dim,
+                    global_start // block_n + shard_size,
+                )
                 loaded_weight = loaded_weight.narrow(
                     param.output_dim, global_start // block_n, shard_size
                 )
@@ -1005,7 +1023,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             shard_size=shard_size,
             use_presharded_weights=self.use_presharded_weights,
             tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
         )
 
 
@@ -1199,7 +1216,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 source_rank = (
                     self.tp_rank
                     if shard_id == "q"
-                    else self.tp_rank // self.num_kv_head_replicas
+                    else self.kv_tp_rank // self.num_kv_head_replicas
                 )
                 global_start = source_rank * local_size
                 block_start = global_start // block_n
@@ -1290,7 +1307,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 source_rank = (
                     self.tp_rank
                     if loaded_shard_id == "q"
-                    else self.tp_rank // self.num_kv_head_replicas
+                    else self.kv_tp_rank // self.num_kv_head_replicas
                 )
                 global_start = source_rank * local_size
                 param_offset = sum(
@@ -1307,6 +1324,11 @@ class QKVParallelLinear(ColumnParallelLinear):
                 shard_size = (
                     global_start + local_size + block_n - 1
                 ) // block_n - global_start // block_n
+                loaded_weight = pad_block_scale_tail(
+                    loaded_weight,
+                    param.output_dim,
+                    global_start // block_n + shard_size,
+                )
                 loaded_weight = loaded_weight.narrow(
                     param.output_dim, global_start // block_n, shard_size
                 )
@@ -1731,6 +1753,9 @@ class RowParallelLinear(LinearBase):
                 global_start + self.input_size_per_partition + block_k - 1
             ) // block_k
             block_count = block_end - block_start
+            loaded_weight = pad_block_scale_tail(
+                loaded_weight, param.input_dim, block_end
+            )
             loaded_weight = loaded_weight.narrow(
                 param.input_dim, block_start, block_count
             )
@@ -1770,10 +1795,9 @@ class RowParallelLinear(LinearBase):
         if self.input_is_parallel:
             input_parallel = input_
         else:
-            splitted_input = split_tensor_along_last_dim(
-                input_, num_partitions=self.tp_size
+            input_parallel = current_platform.slice_tensor_for_rank(
+                input_, -1, self.tp_size, self.tp_rank
             )
-            input_parallel = splitted_input[self.tp_rank].contiguous()
 
         # Matrix multiply.
         assert self.quant_method is not None
@@ -1829,9 +1853,9 @@ class RowParallelLinear(LinearBase):
                     self, input_parallel, output_tensor, bias=bias_
                 )
 
-        # skip_all_reduce: explicit call-site override. Also honor
-        # ForwardFlags (fuse_mlp_allreduce / mlp_reduce_scatter) published by
-        # the decoder — callers should not thread those flags into modules.
+        # skip_all_reduce: explicit call-site override. Also honor the
+        # mlp_reduce_scatter ForwardFlag published by the decoder — callers
+        # should not thread it into modules.
         if (
             ((self.reduce_results and self.tp_size > 1) or self.use_decode_attn_tp)
             and not skip_all_reduce

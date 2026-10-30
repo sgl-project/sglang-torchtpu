@@ -4,6 +4,7 @@ Multi-modality utils
 
 import copy
 import hashlib
+import math
 import mmap
 import os
 import pickle
@@ -422,6 +423,8 @@ def embed_mm_inputs(
     data_embedding_func_mapping: Dict[Modality, DataEmbeddingFunc] = None,
     placeholder_tokens: dict[Modality, List[int]] = None,
     use_deepstack: Dict[Modality, bool] = {},
+    *,
+    forward_batch: Optional[ForwardBatch] = None,
 ) -> Optional[torch.Tensor]:
     """
     Embed multimodal inputs and integrate them with text token embeddings.
@@ -433,6 +436,7 @@ def embed_mm_inputs(
         input_ids: Input token IDs tensor
         input_embedding: Embedding layer for text tokens
         placeholder_tokens: Token IDs for multimodal placeholders (uses pad_values if None)
+        forward_batch: Batch metadata for splitting adaptive encoder requests.
 
     Returns:
         Combined embedding tensor with multimodal content integrated
@@ -440,6 +444,24 @@ def embed_mm_inputs(
     other_info = {}
     if mm_inputs_list is None:
         return None
+
+    if (
+        forward_batch is not None
+        and get_server_args()
+        and get_disagg().enable_adaptive_dispatch_to_encoder
+    ):
+        return _embed_mm_inputs_with_split(
+            mm_inputs_list=mm_inputs_list,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_seq_lens=extend_seq_lens,
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+            input_embedding=input_embedding,
+            multimodal_model=multimodal_model,
+            data_embedding_func_mapping=data_embedding_func_mapping,
+            placeholder_tokens=placeholder_tokens,
+            use_deepstack=use_deepstack,
+        )
 
     # 1. Calculate the multimodal data which exists in input_ids, with the help of pad_values
     # we assume that multimodal data are represented with its pad_values in input_ids
@@ -535,7 +557,7 @@ def embed_mm_inputs(
 
     # 4. scatter embeddings into input embedding
     if _is_tpu and not envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.get():
-        from sglang.srt.hardware_backend.tpu.mm_embed_tpu import embed_mm_on_host
+        from sglang_tpu.mm_embed_tpu import embed_mm_on_host
 
         input_embeds, input_deepstack_embeds = embed_mm_on_host(
             input_embeds=input_embeds,
@@ -687,6 +709,7 @@ def general_mm_embed_routine(
     placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
     use_deepstack: Dict[Modality, bool] = {},
     feature_dtypes: Optional[Dict[Modality, torch.dtype]] = None,
+    mm_embedder: Callable = embed_mm_inputs,
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -700,6 +723,8 @@ def general_mm_embed_routine(
         placeholder_tokens: Token IDs for multimodal placeholders
         use_deepstack: Whether to use deepstack embeddings for each modality, default False
         feature_dtypes: Optional per-modality dtypes for preparing CUDA features before cache lookup.
+        mm_embedder: Backend preparation callback returning merged embeddings and
+            extra model inputs. Owns cache/chunk preparation and encoder dispatch.
         **kwargs: Additional arguments passed to language model
 
     Returns:
@@ -743,37 +768,22 @@ def general_mm_embed_routine(
                 for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
                 if forward_batch.mm_inputs[i] is not None
             ]
-            server_args = get_server_args()
             # Makes VLM profiles directly attributable: this range includes
             # encoder/ViT execution and multimodal feature placement, while
             # the language model range below excludes both.
             with torch.profiler.record_function("sglang.vlm.mm_embedding"):
-                if server_args and get_disagg().enable_adaptive_dispatch_to_encoder:
-                    # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
-                    input_embeds, other_info = _embed_mm_inputs_with_split(
-                        mm_inputs_list=mm_inputs_list,
-                        extend_prefix_lens=extend_prefix_lens,
-                        extend_seq_lens=extend_seq_lens,
-                        input_ids=input_ids,
-                        forward_batch=forward_batch,
-                        input_embedding=embed_tokens,
-                        multimodal_model=multimodal_model,
-                        data_embedding_func_mapping=data_embedding_funcs,
-                        placeholder_tokens=placeholder_tokens,
-                        use_deepstack=use_deepstack,
-                    )
-                else:
-                    input_embeds, other_info = embed_mm_inputs(
-                        mm_inputs_list=mm_inputs_list,
-                        extend_prefix_lens=extend_prefix_lens,
-                        extend_seq_lens=extend_seq_lens,
-                        input_ids=input_ids,
-                        input_embedding=embed_tokens,
-                        multimodal_model=multimodal_model,
-                        data_embedding_func_mapping=data_embedding_funcs,
-                        placeholder_tokens=placeholder_tokens,
-                        use_deepstack=use_deepstack,
-                    )
+                input_embeds, other_info = mm_embedder(
+                    forward_batch=forward_batch,
+                    mm_inputs_list=mm_inputs_list,
+                    extend_prefix_lens=extend_prefix_lens,
+                    extend_seq_lens=extend_seq_lens,
+                    input_ids=input_ids,
+                    input_embedding=embed_tokens,
+                    multimodal_model=multimodal_model,
+                    data_embedding_func_mapping=data_embedding_funcs,
+                    placeholder_tokens=placeholder_tokens,
+                    use_deepstack=use_deepstack,
+                )
 
             # add for qwen3_vl deepstack
             if use_deepstack:
@@ -1318,6 +1328,13 @@ class ShmPointerMMData:
     This acts as a "pointer" to the tensor data across process boundaries.
     """
 
+    # Byte offset of the tensor in its segment: a node fan-out receiver lands a
+    # request's tensors in one segment. Page-aligned so ``materialize`` can map it.
+    offset = 0
+    _shm_handle: Optional[shared_memory.SharedMemory]
+    tensor: Optional[torch.Tensor]
+    _materialization_error: Optional[str]
+
     def __init__(self, tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
         self._shm_handle = None
         self.tensor = None
@@ -1349,9 +1366,22 @@ class ShmPointerMMData:
         self.shm_name = shm.name
         shm.close()
 
+    @classmethod
+    def in_segment(cls, shm_name, offset, shape, dtype, precomputed_hash=None):
+        """Attach to an existing tensor, deferring open errors to materialization."""
+        pointer = object.__new__(cls)
+        pointer.shm_name = shm_name
+        pointer.offset = offset
+        pointer.shape = shape
+        pointer.dtype = dtype
+        pointer.precomputed_hash = precomputed_hash
+        pointer._open_segment()
+        return pointer
+
     def __getstate__(self):
         return {
             "shm_name": self.shm_name,
+            "offset": self.offset,
             "shape": self.shape,
             "dtype": self.dtype,
             "precomputed_hash": self.precomputed_hash,
@@ -1359,19 +1389,28 @@ class ShmPointerMMData:
 
     def __setstate__(self, state):
         self.shm_name = state["shm_name"]
+        self.offset = state.get("offset", 0)
         self.shape = state["shape"]
         self.dtype = state["dtype"]
         self.precomputed_hash = state.get("precomputed_hash")
+        self._open_segment()
+
+    def _open_segment(self) -> None:
+        """Open without raising so every rank can finish the broadcast."""
         self._shm_handle = None
         self.tensor = None
         self._materialization_error = None
 
-        # keep deserialization infallible so all TP ranks finish the broadcast
         handle = None
         tensor = None
         try:
             handle = shared_memory.SharedMemory(name=self.shm_name)
-            tensor = torch.frombuffer(handle.buf, dtype=self.dtype)
+            tensor = torch.frombuffer(
+                handle.buf,
+                dtype=self.dtype,
+                count=math.prod(self.shape),
+                offset=self.offset,
+            )
             self.tensor = tensor.reshape(self.shape)
             self._shm_handle = handle
         except Exception as error:
@@ -1398,11 +1437,14 @@ class ShmPointerMMData:
         try:
             if self._materialization_error is not None:
                 raise RuntimeError(self._materialization_error)
+            if self._shm_handle is None or self.tensor is None:
+                raise RuntimeError("Multimodal SHM pointer has not been opened")
             if sys.platform == "linux":
                 owned = mmap.mmap(
-                    self._shm_handle._fd,
+                    self._shm_handle._fd,  # type: ignore[attr-defined]
                     self.tensor.numel() * self.tensor.element_size(),
                     access=mmap.ACCESS_COPY,
+                    offset=self.offset,
                 )
                 try:
                     return torch.frombuffer(owned, dtype=self.dtype).reshape(self.shape)
@@ -1496,11 +1538,15 @@ def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
     return value
 
 
-def wrap_shm_features(obj):
+def wrap_shm_features(obj, force: bool = False):
     """
     Scan the object for multimodal tensors and wrap them in SHM pointers.
+
+    ``force`` wraps even when the tokenizer transport is the default inline one
+    (multi-node): the scheduler's node fan-out ships pixels through each node's
+    /dev/shm itself.
     """
-    if _get_is_default_transport() or get_serving().skip_tokenizer_init:
+    if not force and (_get_is_default_transport() or get_serving().skip_tokenizer_init):
         return obj
 
     if obj.mm_inputs:
@@ -1584,7 +1630,9 @@ def unwrap_shm_features(obj):
     Restore ShmPointerMMData wrappers back into standard torch.Tensors.
     Handles both single requests and batch requests.
     """
-    if _get_is_default_transport() or get_serving().skip_tokenizer_init:
+    # No transport gate: values that are not SHM pointers pass through, and the
+    # scheduler's node fan-out wraps features even under the default transport.
+    if get_serving().skip_tokenizer_init:
         return obj
     # Handle batch requests
     if isinstance(obj, BaseBatchReq):

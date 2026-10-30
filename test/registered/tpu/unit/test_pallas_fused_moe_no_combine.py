@@ -18,7 +18,7 @@ hardware.
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
 
 import importlib.util
 import unittest
@@ -45,7 +45,7 @@ class TestPallasFusedMoeNoCombineTpu(CustomTestCase):
         import jax
         import jax.numpy as jnp
 
-        from sglang.srt.layers.moe.pallas.fused_moe_op import _fused_moe_jax
+        from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
 
         rng = jax.random.PRNGKey(0)
         m, hidden, inter, num_experts, topk = 16, 128, 256, 8, 2

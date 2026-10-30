@@ -11,7 +11,7 @@ from pathlib import Path
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_tpu_ci(est_time=600, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=155, suite="stage-a-test-tpu-unit", chips=4)
 
 
 class TestFp8FusedRsKernel(CustomTestCase):
@@ -30,7 +30,7 @@ class TestFp8FusedRsKernel(CustomTestCase):
     ):
         repo_root = Path(__file__).resolve().parents[4]
         worker = repo_root / "test/manual/tpu/test_fp8_fused_rs_kernel.py"
-        wrapper_module = "torch_tpu._internal.distributed.launchers.singlehost_wrapper"
+        wrapper_module = "torch.tpu.distributed"
         worker_command = shlex.join(
             [
                 str(worker),

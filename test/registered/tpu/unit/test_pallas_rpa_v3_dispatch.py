@@ -3,9 +3,9 @@
 Two TPU attention backends share the ``pallas_tpu_*`` namespace:
 
 * ``pallas_tpu_rpa_v3`` (default) — wraps the vendored
-  :mod:`sglang.srt.layers.attention.pallas.ragged_paged_attention_v3` kernel
+  :mod:`sglang_tpu.attention.pallas.ragged_paged_attention_v3` kernel
   and needs the fused 5D KV layout from
-  :class:`sglang.srt.hardware_backend.tpu.kv_pool.TpuFusedMHATokenToKVPool`.
+  :class:`sglang_tpu.kv_pool.TpuFusedMHATokenToKVPool`.
 * ``pallas_tpu_flash`` — wraps ``flash_attention`` for prefill/extend and
   ``jax.experimental.pallas.ops.tpu.paged_attention`` for decode. Reads
   separate K/V from the standard :class:`MHATokenToKVPool`.
@@ -22,11 +22,11 @@ the patch-and-dispatch glue.
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit", chips=1)
 
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.test.test_utils import CustomTestCase
 
@@ -55,15 +55,15 @@ class TestPallasBackendRegistration(CustomTestCase):
 
 class TestMHAKVPoolSelection(CustomTestCase):
     def _pool_cls_for(self, attention_backend):
-        from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
         from sglang.srt.runtime_context import get_context
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
 
         # get_mha_kv_pool_cls reads the exec bag; publish the backend.
         with get_context().override_server_args(attention_backend=attention_backend):
             return TpuSRTPlatform().get_mha_kv_pool_cls()
 
     def test_fused_pool_for_rpa_backends(self):
-        from sglang.srt.hardware_backend.tpu.kv_pool import (
+        from sglang_tpu.kv_pool import (
             TpuFusedMHATokenToKVPool,
         )
 
@@ -107,24 +107,34 @@ class TestBatchedRpaSpecBackend(CustomTestCase):
         )
 
     def test_decode_backend_registered(self):
+        from sglang.srt.layers.attention.attention_registry import (
+            DRAFT_ATTENTION_BACKENDS,
+        )
+
         factory = self._factory()
         expected = types.SimpleNamespace(attn_backends=[])
-        with patch.object(
-            factory,
-            "_create_tpu_pallas_rpa_batched_decode_backend",
-            return_value=("tpu_pallas_rpa_batched", expected),
-        ):
+        create = Mock(return_value=expected)
+        with patch.dict(DRAFT_ATTENTION_BACKENDS, {"pallas_tpu_rpa_batched": create}):
             self.assertIs(factory.create_decode_backend(), expected)
+        create.assert_called_once_with(
+            runner=factory.draft_model_runner, topk=1, speculative_num_steps=3
+        )
 
     def test_draft_extend_backend_registered(self):
+        from sglang.srt.layers.attention.attention_registry import (
+            ATTENTION_BACKENDS,
+            DRAFT_ATTENTION_BACKENDS,
+        )
+
         factory = self._factory()
         expected = types.SimpleNamespace(attn_backends=[])
-        with patch.object(
-            factory,
-            "_create_tpu_pallas_rpa_batched_prefill_backend",
-            return_value=("tpu_pallas_rpa_batched", expected),
+        create = Mock(return_value=expected)
+        with (
+            patch.dict(DRAFT_ATTENTION_BACKENDS, {"pallas_tpu_rpa_batched": Mock()}),
+            patch.dict(ATTENTION_BACKENDS, {"pallas_tpu_rpa_batched": create}),
         ):
             self.assertIs(factory.create_draft_extend_backend(), expected)
+        create.assert_called_once_with(factory.draft_model_runner)
 
 
 if __name__ == "__main__":

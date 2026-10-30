@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.runtime_context import get_exec
 
 logger = logging.getLogger(__name__)
@@ -58,10 +59,7 @@ from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 from sglang.srt.utils import ceil_align, is_hip
 
 if TYPE_CHECKING:
-    from torch.distributed import ProcessGroup
-
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import HiCacheDraftPlan
@@ -178,19 +176,6 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
 
     backend = disagg.disaggregation_decode_retraction_backup
     unified_hybrid_swa = memory.enable_unified_memory and tp_worker.is_hybrid_swa
-    unified_decode_radix = (
-        memory.enable_unified_memory and disagg.disaggregation_decode_enable_radix_cache
-    )
-    if backend == "host_pool" and unified_decode_radix:
-        raise ValueError(
-            "Unified-memory H2D/D2H does not support host-pool decode "
-            "retraction with decode radix cache yet."
-        )
-    if backend == "host_pool" and unified_hybrid_swa:
-        raise ValueError(
-            "Unified-memory hybrid-SWA H2D/D2H does not support host-pool "
-            "decode retraction yet."
-        )
     if backend is None:
         kv_cache = tp_worker.get_memory_pool()[1].get_kvcache()
         full_tokens_per_layer = (
@@ -275,13 +260,8 @@ def build_kv_cache(
     tp_worker: BaseTpWorker,
     page_size: int,
     spec_algorithm: SpeculativeAlgorithm,
-    attn_tp_cpu_group: ProcessGroup,
-    tp_cpu_group: ProcessGroup,
-    attn_cp_cpu_group: ProcessGroup,
     enable_metrics: bool,
     enable_kv_cache_events: bool,
-    tp_group: GroupCoordinator,
-    pp_group: GroupCoordinator,
     enable_hierarchical_cache: bool,
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
 ) -> KVCacheBuildResult:
@@ -323,20 +303,18 @@ def build_kv_cache(
             "Transformers backend to avoid multimodal prefix-cache mismatches."
         )
 
-    # TPU has no recurrent-state copy-on-write (TpuMambaPool.copy_from raises),
-    # so the mamba radix cache's prefix-branch copy would crash mid-request.
-    # Require the operator to pass --disable-radix-cache explicitly rather than
-    # flipping it here: the mamba pool is sized from server_args.disable_radix_cache
-    # (see ModelRunner._calculate_mamba_ratio), which runs during model-runner
-    # init — before this point. Silently disabling here would leave the pool
-    # sized for a radix cache we never build, shrinking usable capacity.
     from sglang.srt.platforms import current_platform
 
-    if is_hybrid_ssm and current_platform.is_tpu() and not disable_radix_cache:
+    if (
+        is_hybrid_ssm
+        and not disable_radix_cache
+        and not current_platform.supports_mamba_prefix_cache(model_config)
+    ):
+        # Pool sizing and the Mamba strategy were resolved before this builder.
+        # Disabling only the tree here would retain checkpoint slots and limits.
         raise ValueError(
-            "Radix cache is not supported for hybrid SSM/GDN models on TPU: "
-            "recurrent (conv/ssm) state cannot be copy-on-written for prefix "
-            "caching yet. Relaunch with --disable-radix-cache."
+            "The platform does not support prefix checkpoints for this model's "
+            "recurrent backend. Relaunch with --disable-radix-cache."
         )
 
     # Decode-side radix cache supports SWA only through the unified tree, whose
@@ -383,12 +361,10 @@ def build_kv_cache(
             else token_to_kv_pool_allocator.page_size
         ),
         is_eagle=spec_algorithm.is_eagle(),
-        tp_cache_group=(
-            attn_tp_cpu_group if get_parallel().enable_dp_attention else tp_cpu_group
-        ),
-        attn_cp_cache_group=attn_cp_cpu_group,
-        attn_tp_cache_group=attn_tp_cpu_group,
-        pp_cache_group=pp_group.cpu_group,
+        tp_cache_group=get_dp_tp_group().cpu_group,
+        attn_cp_cache_group=parallel.attn_cp_group.cpu_group,
+        attn_tp_cache_group=parallel.attn_tp_group.cpu_group,
+        pp_cache_group=parallel.pp_group.cpu_group,
         eviction_policy=get_memory().radix_eviction_policy,
         eviction_policy_config=get_memory().radix_eviction_policy_config,
         enable_metrics=enable_metrics,
@@ -419,7 +395,7 @@ def build_kv_cache(
         model_config=model_config,
         tp_size=parallel.tp_size,
         tp_rank=parallel.tp_rank,
-        tp_group=tp_group,
+        tp_group=parallel.tp_group,
     )
     with auto_size_hicache(
         params,

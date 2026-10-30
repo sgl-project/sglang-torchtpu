@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import zmq
 
+from sglang.srt.managers.io_struct import FreezeGCReq
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
     ScriptedTokenizerRecvProxy,
@@ -59,6 +60,17 @@ def _is_start_req(rid: str):
 
 
 class TestScriptedTokenizerRecvProxyRecv(CustomTestCase):
+    def test_freeze_is_counted_when_delivered_to_the_scheduler(self):
+        underlying = _FakeUnderlyingSocket()
+        proxy = ScriptedTokenizerRecvProxy(underlying=underlying)
+        control, freeze = _ControlMsg(), FreezeGCReq()
+        underlying.feed(control)
+        underlying.feed(freeze)
+        self.assertIs(proxy.recv_pyobj(), control)
+        self.assertEqual(proxy.freeze_gc_reqs_seen, 0)
+        self.assertIs(proxy.recv_pyobj(), freeze)
+        self.assertEqual(proxy.freeze_gc_reqs_seen, 1)
+
     def test_recv_pyobj_drains_then_pops_fifo(self):
         underlying = _FakeUnderlyingSocket()
         proxy = ScriptedTokenizerRecvProxy(underlying=underlying)

@@ -24,6 +24,10 @@ import runner_configs as _runner_configs  # noqa: E402
 # (single path component under that dir, no whitespace/operators).
 _ALLOWED_INSTALL_SCRIPT = re.compile(r"^scripts/ci/cuda/[\w.-]+\.sh$")
 
+# Temporarily disabled while their runners are unavailable. rerun-test.yml
+# skips these too; rejecting here gives a clear reply instead of a skipped run.
+_DISABLED_RUNNER_CONFIGS = {"4-gpu-gb300"}
+
 # Configuration
 PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
 TEST_GROUPS_FILE_PATH = "scripts/ci/rerun_test_groups.json"
@@ -942,6 +946,8 @@ _OTHER_BACKEND_REGISTERS = {
     "register_xpu_ci": "XPU",
     "register_musa_ci": "MUSA",
     "register_mlx_ci": "MLX",
+    "register_mps_ci": "MPS",
+    "register_ppu_ci": "PPU",
 }
 
 
@@ -989,6 +995,12 @@ def _resolve_runner_config(rc, full_path, suite):
             f"Unknown runner_config `{rc}` in `{full_path}` "
             f"— not in scripts/ci/runner_configs.yml.\n\n"
             f"Known runner_configs: {known}",
+        )
+    if rc in _DISABLED_RUNNER_CONFIGS:
+        return _dispatch_err(
+            suite,
+            f"runner_config `{rc}` in `{full_path}` is temporarily disabled "
+            f"while its runners are unavailable.",
         )
     install_script = cfg["install"]
     if not _ALLOWED_INSTALL_SCRIPT.match(install_script):
@@ -1577,11 +1589,6 @@ def handle_rerun_test(
         lines.append(f"⛔ `{r['spec']}`: {r['error']}")
 
     body = "\n\n".join(lines)
-    # Echo the originating command so each reply is self-identifying when
-    # several /rerun-test commands are in flight at once. Backtick-wrapping
-    # also keeps any `*` in the pattern from rendering as italics.
-    if command_label:
-        body = f"Results for `{command_label}`:\n\n{body}"
 
     successes = [dr for dr in dispatch_results if dr["success"]]
     if successes:
@@ -1734,7 +1741,7 @@ def main():
 
     # PR authors can always rerun failed CI on their own PRs, even if they are not
     # listed in CI_PERMISSIONS.json.
-    # Note: /tag-run-ci-label still requires CI_PERMISSIONS.json.
+    # Note: /tag-run-ci-label still requires CI_PERMISSIONS.json (or the opt-in below).
     # Authorship grants nothing for /rerun-test; that gate reads the commenter.
     if pr.user.login == user_login:
         if user_perms is None:
@@ -1753,6 +1760,14 @@ def main():
     # so a write-holder absent from the file must still reach its handler.
     if user_perms is None:
         user_perms = {}
+
+    # Opt-in per repo (Actions variable): write access alone may tag run-ci and rerun CI.
+    if os.getenv("CI_WRITE_ACCESS_CAN_TAG") == "true" and (
+        repo.get_collaborator_permission(user_login) in ("admin", "write")
+    ):
+        print(f"User {user_login} has write access. Granting CI tag and rerun.")
+        user_perms["can_tag_run_ci_label"] = True
+        user_perms["can_rerun_failed_ci"] = True
 
     # 4. Parse Command and Execute
     first_line = comment_body.split("\n")[0].strip()

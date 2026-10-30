@@ -30,14 +30,19 @@ from transformers import PretrainedConfig
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerFacts,
-    reduce_output,
+from sglang.srt.layers.aux_hidden_states import (
+    AUX_HIDDEN_STATES_PROXY_KEY,
+    AuxHiddenStateList,
 )
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -47,7 +52,6 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    reduce_moe_output,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -75,6 +79,7 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -90,7 +95,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_tpu,
-    make_layers,
+    make_pp_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -210,7 +215,6 @@ class GptOssSparseMoeBlock(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_parallel().tp_size
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         self.activation = config.hidden_act
@@ -320,7 +324,7 @@ class GptOssSparseMoeBlock(nn.Module):
         # unpadded slice so the small bf16 router GEMM dimensions stay
         # untouched, while the experts call gets to keep the padded view
         # and skip the duplicate pad inside the MXFP4 method. The output
-        # is then trimmed back to the unpadded width so postprocess_layer
+        # is then trimmed back to the unpadded width so the FFN boundary
         # can pair it with the (M, hidden_dim_unpadded) residual.
         num_tokens = hidden_states.shape[0]
         hidden_dim_unpadded = self.hidden_size
@@ -336,8 +340,6 @@ class GptOssSparseMoeBlock(nn.Module):
             router_logits, _ = self.router(router_input)
             topk_output = self.topk(router_input, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
-
-        final_hidden_states = reduce_moe_output(final_hidden_states)
 
         # When input was pre-padded, FusedMoE.forward_impl captured the
         # padded width as `origin_hidden_states_dim` and skipped its own
@@ -389,27 +391,35 @@ class GptOssAttention(nn.Module):
 
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
+        # TPU DCP replicates K/V within a DCP group, so they shard across
+        # attn_tp_size // dcp_size groups while Q stays sharded by attn_tp.
+        dcp_size = (
+            get_parallel().attn_dcp_size
+            if current_platform.dcp_shards_every_kv_pool()
+            else 1
+        )
+        kv_tp_rank = attn_tp_rank // dcp_size
+        kv_tp_size = attn_tp_size // dcp_size
 
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= attn_tp_size:
+        if self.total_num_kv_heads >= kv_tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % attn_tp_size == 0
+            assert self.total_num_kv_heads % kv_tp_size == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
-            assert attn_tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
+            assert kv_tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // kv_tp_size)
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.tp_rank = get_parallel().tp_rank
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -421,6 +431,8 @@ class GptOssAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
+            kv_tp_rank=kv_tp_rank,
+            kv_tp_size=kv_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -564,21 +576,9 @@ class GptOssDecoderLayer(nn.Module):
 
         self.layer_id = layer_id
 
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-
         # GptOss all layers are sparse
         self.is_layer_sparse = True
-        is_previous_layer_sparse = True
         is_next_layer_sparse = True
-
-        self.layer_facts = LayerFacts.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
 
         if self.is_layer_sparse:
             self.mlp = GptOssSparseMoeBlock(
@@ -608,29 +608,26 @@ class GptOssDecoderLayer(nn.Module):
             x_pad_to_multiple=post_attn_pad_multiple,
         )
 
-        self.layer_communicator = LayerCommunicator(
-            layer_facts=self.layer_facts,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(
+                    sparse=self.is_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
+                ),
+                self.post_attention_layernorm,
+            ),
         )
-        self._is_layer_to_capture = False
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: torch.Tensor | None,
-        captured_last_layer_outputs: list[torch.Tensor] | None = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
-            )
+        capture_output=None,
+    ) -> torch.Tensor:
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states, forward_batch, capture=capture_output
         )
 
         if hidden_states.shape[0] != 0:
@@ -640,15 +637,13 @@ class GptOssDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
-            hidden_states = self.mlp(hidden_states, forward_batch)
-        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
-        return hidden_states, residual
+        return hidden_states
 
 
 class GptOssModel(nn.Module):
@@ -681,7 +676,7 @@ class GptOssModel(nn.Module):
 
         # Use the provided decoder layer type or default to GptOssDecoderLayer
         decoder_layer_type = decoder_layer_type or GptOssDecoderLayer
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: decoder_layer_type(
                 layer_id=idx,
@@ -689,8 +684,6 @@ class GptOssModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
@@ -699,16 +692,46 @@ class GptOssModel(nn.Module):
             self.norm = PPMissingLayer(return_tuple=True)
 
         self.layers_to_capture: list[int] = []
+        # Slot each of this stage's captures occupies in the global buffer.
+        self.local_capture_slots: list[int] = []
 
     def set_eagle3_layers_to_capture(self, layers_to_capture: list[int]) -> None:
-        self.layers_to_capture = layers_to_capture
-        for layer_id in self.layers_to_capture:
-            self.layers[layer_id]._is_layer_to_capture = True
+        self._set_layers_to_capture(layers_to_capture)
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]) -> None:
+        self._set_layers_to_capture(layers_to_capture)
+
+    def _set_layers_to_capture(self, layers_to_capture: list[int]) -> None:
         self.layers_to_capture = layers_to_capture
-        for layer_id in self.layers_to_capture:
-            self.layers[layer_id]._is_layer_to_capture = True
+        # The final norm output (boundary end_layer) is captured on the last stage only.
+        self.local_capture_slots = [
+            slot
+            for slot, layer_id in enumerate(layers_to_capture)
+            if self.start_layer <= layer_id < self.end_layer
+            or layer_id == self.end_layer == len(self.layers)
+        ]
+
+    def _relay_aux_hidden_states(
+        self,
+        incoming: Optional[torch.Tensor],
+        captured: list[torch.Tensor],
+        reference: torch.Tensor,
+    ) -> torch.Tensor:
+        """The global [tokens, num_captures * hidden] slot buffer.
+
+        Under PP the Eagle3/DFlash capture layers are spread over the stages, so
+        earlier stages' captures ride through untouched while this stage's
+        land in their own slots. Slots nobody has filled yet are zero.
+        """
+        hidden = reference.shape[-1]
+        if incoming is None:
+            unfilled = reference.new_zeros((reference.shape[0], hidden))
+            slots = [unfilled] * len(self.layers_to_capture)
+        else:
+            slots = list(torch.split(incoming, hidden, dim=-1))
+        for slot, captured_hidden in zip(self.local_capture_slots, captured):
+            slots[slot] = captured_hidden
+        return torch.cat(slots, dim=-1)
 
     def forward(
         self,
@@ -723,66 +746,70 @@ class GptOssModel(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
+            aux_buffer = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
-
-        # TPU captures inside the layer; other backends capture the boundary
-        # hidden states here: boundary 0 is the embedding output, boundary i + 1
-        # the output of block i.
-        aux_hidden_states = []
-        if not _is_tpu and self.start_layer in self.layers_to_capture:
-            aux_hidden_states.append(
-                hidden_states + residual if residual is not None else hidden_states
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
             )
+            aux_buffer = pp_proxy_tensors.tensors.get(AUX_HIDDEN_STATES_PROXY_KEY)
+
+        # Capture hidden-state boundaries: boundary 0 is the embedding output,
+        # and boundary i + 1 is the output after transformer block i.
+        aux_hidden_states = AuxHiddenStateList()
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
-                hidden_states, residual = layer(
+                hidden_states = layer(
                     positions,
                     hidden_states,
                     forward_batch,
-                    residual,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states
-                        if _is_tpu and getattr(layer, "_is_layer_to_capture", False)
-                        else None
-                    ),
+                    capture_output=aux_hidden_states.capture
+                    if i in self.layers_to_capture
+                    else None,
                 )
-                if not _is_tpu and i + 1 in self.layers_to_capture:
-                    hidden_states = reduce_output(hidden_states)
-                    aux_hidden_states.append(
-                        hidden_states + residual
-                        if residual is not None
-                        else hidden_states
-                    )
-        last_layer = self.layers[self.end_layer - 1]
-        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
-            hidden_states, residual, forward_batch
-        )
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            proxy = residual_batch.to_pp(hidden_states, forward_batch)
+            if self.layers_to_capture:
+                proxy[AUX_HIDDEN_STATES_PROXY_KEY] = self._relay_aux_hidden_states(
+                    aux_buffer, aux_hidden_states, proxy["hidden_states"]
+                )
+            return proxy
         else:
+            hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if hidden_states.shape[0] != 0:
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
-        if len(aux_hidden_states) == 0:
+                hidden_states = residual_batch.final_norm(
+                    hidden_states,
+                    forward_batch,
+                    self.norm,
+                    capture=aux_hidden_states.capture
+                    if self.end_layer in self.layers_to_capture
+                    else None,
+                )
+            elif self.end_layer in self.layers_to_capture:
+                aux_hidden_states.append(
+                    residual_batch.snapshot(hidden_states, forward_batch)
+                )
+        if self.pp_group.is_first_rank:
+            # A single stage owns every capture; keep the per-layer list.
+            if len(aux_hidden_states) == 0:
+                return hidden_states
+            return hidden_states, aux_hidden_states
+        if self.layers_to_capture:
+            aux_buffer = self._relay_aux_hidden_states(
+                aux_buffer, aux_hidden_states, hidden_states
+            )
+        if aux_buffer is None:
             return hidden_states
 
-        return hidden_states, aux_hidden_states
+        return hidden_states, aux_buffer
 
 
 class GptOssForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
+    # The forward hands earlier stages' Eagle3/DFlash captures on in PPProxyTensors.
+    relays_pp_aux_hidden_states = True
 
     _lora_pattern_moe = re.compile(
         r"^(?:model\.layers\.\d+\.(?:self_attn\.(?:qkv_proj|o_proj)|mlp\.experts)|lm_head|model\.embed_tokens)$"
@@ -843,20 +870,21 @@ class GptOssForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        # Off the last stage the captures ride on inside the proxy tensors.
+        if not self.pp_group.is_last_rank:
+            return hidden_states
+
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
-        if self.pp_group.is_last_rank:
-            return self.logits_processor(
-                input_ids,
-                hidden_states,
-                self.lm_head,
-                forward_batch,
-                aux_hidden_states,
-            )
-        else:
-            return hidden_states
+        return self.logits_processor(
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            forward_batch,
+            aux_hidden_states,
+        )
 
     @property
     def start_layer(self):
@@ -1379,32 +1407,27 @@ class GptOssForCausalLM(nn.Module):
         torch.cuda.synchronize()
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
-        if not self.pp_group.is_last_rank:
-            return
-
+        # Every stage marks the capture layers it owns and relays the buffer;
+        # only the last stage unpacks it out of the model's return.
+        self.capture_aux_hidden_states = self.pp_group.is_last_rank
         num_layers = self.config.num_hidden_layers
         if layer_ids is None:
-            self.capture_aux_hidden_states = True
             self.model.set_eagle3_layers_to_capture(
                 [2, num_layers // 2, num_layers - 3]
             )
+        elif layer_ids and max(layer_ids) == num_layers:
+            self.model.set_eagle3_layers_to_capture(list(layer_ids))
         else:
-            self.capture_aux_hidden_states = True
-            if layer_ids and max(layer_ids) == num_layers:
-                self.model.set_eagle3_layers_to_capture(list(layer_ids))
-            else:
-                self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
+            self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
-        if not self.pp_group.is_last_rank:
-            return
-
         if layer_ids is None:
             raise ValueError(
                 "DFLASH requires explicit layer_ids for aux hidden capture."
             )
 
-        self.capture_aux_hidden_states = True
+        # As for Eagle3: every stage relays the captures it owns to the last.
+        self.capture_aux_hidden_states = self.pp_group.is_last_rank
         self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
     @classmethod

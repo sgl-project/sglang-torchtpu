@@ -6,8 +6,11 @@ the fully-qualified platform class name when TPU hardware is available.
 """
 
 import importlib.util
+import os
 
-from sglang.srt.hardware_backend.tpu._logging import get_logger
+from sglang_tpu._logging import get_logger
+
+os.environ.setdefault("TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS", "1")
 
 logger = get_logger(__name__)
 
@@ -22,6 +25,7 @@ def activate():
     importing here causes lockfile collisions between processes that don't
     even need TPU access.  The real import is deferred to init_backend().
     """
+    os.environ.setdefault("TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS", "1")
     try:
         torch_tpu_available = importlib.util.find_spec("torch_tpu") is not None
     except (ImportError, ModuleNotFoundError, ValueError):
@@ -32,4 +36,4 @@ def activate():
         return None
 
     logger.info("TPU plugin detected (torch_tpu installable).")
-    return "sglang.srt.hardware_backend.tpu.tpu_platform:TpuSRTPlatform"
+    return "sglang_tpu.tpu_platform:TpuSRTPlatform"

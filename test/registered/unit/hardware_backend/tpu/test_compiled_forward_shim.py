@@ -2,17 +2,35 @@
 
 import inspect
 import unittest
+from array import array
+from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.overlap_utils import resolve_forward_inputs
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
+from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.runtime_context import get_context, get_exec, get_parallel, get_schedule
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu import patches
+from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
+from sglang_tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
 )
-from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+from sglang_tpu.compilation.compiled_forward_shim import (
     _BS_FIELDS,
     _PINNED_LOGPROB_FIELDS,
     _TOKEN_FIELDS,
@@ -33,19 +51,16 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     needs_input_logprob,
     reconcile_tpu_batch_limits,
 )
-from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+from sglang_tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
     _DummyForwardBatchFields,
 )
-from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
-from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3 import (
+from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sglang.srt.runtime_context import get_context, get_exec
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.envs import envs
+from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 # Pure-logic tests: CPU tensors only, and the shim's import chain is
 # torch_tpu-free, so this runs on the CPU CI runner (no TPU required).
@@ -145,6 +160,227 @@ class TestDummyFieldPadCoverage(CustomTestCase):
             and not name.endswith("_cpu")
         }
         self.assertLessEqual(device_tensor_fields, set(_TOKEN_FIELDS) | set(_BS_FIELDS))
+
+
+class TestHostStagedPrefillInputs(CustomTestCase):
+    """Arbitrary prefill lengths must not reach the device before bucketing."""
+
+    def test_default_platform_keeps_device_input_contract(self):
+        batch = ScheduleBatch(
+            reqs=[], device="meta", prefill_input_ids_cpu=torch.arange(3)
+        )
+        with patch(
+            "sglang.srt.managers.schedule_batch.current_platform",
+            SRTPlatform(),
+        ):
+            resolve_forward_inputs(batch, None)
+        self.assertEqual(batch.input_ids.device.type, "meta")
+        self.assertEqual(batch.input_ids.shape, (3,))
+        self.assertIsNone(batch.prefill_input_ids_cpu)
+
+    def test_mixed_and_speculative_batches_keep_the_device_contract(self):
+        with get_context().override_server_args(enable_torch_compile=True):
+            allocator = TpuPagedTokenToKVPoolAllocator(
+                size=32,
+                page_size=4,
+                dtype=torch.bfloat16,
+                device="meta",
+                kvcache=None,
+                need_sort=False,
+            )
+            batch = ScheduleBatch(
+                reqs=[
+                    SimpleNamespace(
+                        positional_embed_overrides=None,
+                        input_embeds=None,
+                        beam_group=None,
+                    )
+                ],
+                device="meta",
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+                model_config=SimpleNamespace(
+                    is_generation=True,
+                    is_encoder_decoder=False,
+                    is_multimodal=False,
+                    use_ngram_embedding=False,
+                    use_engram=False,
+                ),
+                token_to_kv_pool_allocator=allocator,
+                req_to_token_pool=SimpleNamespace(req_to_token=torch.empty(2, 32)),
+            )
+            platform = TpuSRTPlatform()
+            self.assertEqual(platform.get_batch_input_device(batch), "cpu")
+            with get_schedule().override(enable_mixed_chunk=True):
+                self.assertIsNone(platform.get_batch_input_device(batch))
+            batch.spec_algorithm = SpeculativeAlgorithm.EAGLE
+            self.assertIsNone(platform.get_batch_input_device(batch))
+            batch.spec_algorithm = SpeculativeAlgorithm.NONE
+            batch.model_config.is_multimodal = True
+            self.assertEqual(platform.get_batch_input_device(batch), "cpu")
+
+    def test_host_inputs_survive_forward_construction_and_upload_after_padding(self):
+        class HostInputPlatform(SRTPlatform):
+            calls = 0
+
+            def get_batch_input_device(self, batch):
+                self.calls += 1
+                if self.calls > 1:
+                    raise AssertionError("placement must be resolved once per prefill")
+                return "cpu"
+
+        runner = SimpleNamespace(
+            device="meta",
+            is_draft_worker=False,
+            kv_index_translator=SimpleNamespace(rebind_write_loc=lambda _: None),
+            ngram_embedding_manager=SimpleNamespace(enabled=False),
+            model_config=SimpleNamespace(
+                model_is_mrope=True, requires_mm_token_modalities=False
+            ),
+            lora_manager=None,
+            prefill_attention_backend_str="torch_native",
+        )
+        with (
+            get_context().override_server_args(),
+            get_parallel().override(attn_dcp_size=1),
+            patch(
+                "sglang.srt.managers.schedule_batch.SamplingBatchInfo.from_schedule_batch",
+                return_value=None,
+            ),
+        ):
+            for n, has_image in (
+                (1, False),
+                (3, True),
+                (8, False),
+                (9, True),
+                (17, True),
+            ):
+                with self.subTest(tokens=n, multimodal=has_image):
+                    platform = HostInputPlatform()
+                    req = Req(
+                        "0", "", array("q", range(n + 3)), SamplingParams(), False
+                    )
+                    req.refresh_fill_ids()
+                    req.prefix_indices = torch.arange(3)
+                    req.set_extend_range(3, n + 3)
+                    expected_mrope = torch.arange(3, n + 3).repeat(3, 1)
+                    if has_image:
+                        spatial_offsets = torch.tensor([[0], [10], [20]])
+                        req.multimodal_inputs = SimpleNamespace(
+                            mrope_positions=torch.arange(n + 3).repeat(3, 1)
+                            + spatial_offsets,
+                            vision_position_ids=None,
+                            visible_frame_counts=None,
+                        )
+                        expected_mrope = expected_mrope + spatial_offsets
+                    batch = ScheduleBatch(
+                        reqs=[req],
+                        device="meta",
+                        model_config=SimpleNamespace(
+                            is_encoder_decoder=False, vocab_size=32
+                        ),
+                        spec_algorithm=SpeculativeAlgorithm.NONE,
+                    )
+
+                    def allocate(batch):
+                        # Allocation and the later upload must share the decision.
+                        self.assertEqual(batch.input_tensor_device, "cpu")
+                        return (
+                            torch.arange(n, dtype=torch.int32),
+                            torch.empty(1, dtype=torch.int64, device="meta"),
+                            torch.tensor([0]),
+                        )
+
+                    with (
+                        patch(
+                            "sglang.srt.managers.schedule_batch.current_platform",
+                            platform,
+                        ),
+                        patch(
+                            "sglang.srt.managers.schedule_batch.alloc_for_extend",
+                            allocate,
+                        ),
+                    ):
+                        batch.prepare_for_extend()
+                    resolve_forward_inputs(batch, None)
+                    self.assertEqual(batch.input_ids.device.type, "cpu")
+                    fb = ForwardBatch.init_new(
+                        batch,
+                        runner,
+                        capture_hidden_mode=CaptureHiddenMode.NULL,
+                        return_hidden_states_before_norm=False,
+                    )
+                    torch.testing.assert_close(fb.positions, torch.arange(3, n + 3))
+                    torch.testing.assert_close(fb.mrope_positions, expected_mrope)
+                    for field in (
+                        "input_ids",
+                        "positions",
+                        "mrope_positions",
+                        "out_cache_loc",
+                        "extend_seq_lens",
+                        "extend_prefix_lens",
+                        "extend_start_loc",
+                    ):
+                        self.assertEqual(getattr(fb, field).device.type, "cpu")
+                    policy = DecoderTpuCompilePolicy()
+                    policy.model_runner = runner
+                    policy.t_bucketer = _bucketer("Token", [8, 16, 32])
+                    policy.b_bucketer = _bucketer("Bs", [1, 4])
+                    policy.extend_bs = 4
+                    policy.prepare_forward_batch(fb)
+                    self.assertEqual(
+                        fb.input_ids.shape, (8 if n <= 8 else 16 if n <= 16 else 32,)
+                    )
+                    self.assertEqual(fb.extend_start_loc.shape, (4,))
+                    for field in (
+                        "input_ids",
+                        "positions",
+                        "out_cache_loc",
+                        "mrope_positions",
+                        "extend_seq_lens",
+                        "extend_prefix_lens",
+                        "extend_start_loc",
+                    ):
+                        self.assertEqual(getattr(fb, field).device.type, "meta")
+                    # Preparation owns the forward snapshot, not scheduler inputs.
+                    self.assertEqual(batch.input_ids.device.type, "cpu")
+                    self.assertEqual(batch.input_ids.numel(), n)
+                    self.assertEqual(fb.req_pool_indices_cpu.device.type, "cpu")
+                    self.assertEqual(platform.calls, 1)
+
+                    batch.sampling_info = SimpleNamespace(
+                        penalizer_orchestrator=SimpleNamespace(is_required=False)
+                    )
+                    with patch(
+                        "sglang.srt.managers.schedule_batch.alloc_for_decode",
+                        return_value=torch.empty(1, dtype=torch.int32, device="meta"),
+                    ):
+                        batch.prepare_for_decode()
+                    self.assertEqual(batch.out_cache_loc.device.type, "meta")
+
+    def test_extend_allocator_can_retain_host_output_without_changing_default(self):
+        with get_context().override_server_args():
+            for output_device in (None, "cpu"):
+                allocator = TpuPagedTokenToKVPoolAllocator(
+                    size=32,
+                    page_size=4,
+                    dtype=torch.bfloat16,
+                    device="meta",
+                    kvcache=None,
+                    need_sort=False,
+                )
+                indices = allocator.alloc_extend(
+                    torch.tensor([0]),
+                    torch.tensor([0]),
+                    torch.tensor([5]),
+                    torch.tensor([5]),
+                    torch.tensor([-1]),
+                    5,
+                    **({"return_host": True} if output_device else {}),
+                )
+                self.assertEqual(indices.device.type, output_device or "meta")
+                self.assertEqual(allocator.available_size(), 24)
+                if output_device == "cpu":
+                    self.assertEqual(indices.tolist(), [4, 5, 6, 7, 8])
 
 
 class TestZeroPadDim0(CustomTestCase):
@@ -257,6 +493,27 @@ class TestPadForwardBatchInputs(CustomTestCase):
         self.assertEqual(fb.extend_prefix_lens_cpu, [0, 0, 0, 0])
         self.assertEqual(fb.extend_logprob_start_lens_cpu, [0, 0, 0, 0])
         self.assertEqual(fb.batch_size, 4)
+
+    def test_mamba_tracking_padding_roundtrip(self):
+        fb = _forward_batch(real_t=10, real_b=3, mode="extend")
+        original = {
+            "mamba_track_indices": _t(7, 8, 9),
+            "mamba_track_mask": _t(True, False, True, dtype=torch.bool),
+            "mamba_track_seqlens": _t(64, -1, 128),
+        }
+        for name, value in original.items():
+            setattr(fb, name, value)
+        q, b = _pad_forward_batch_inputs(
+            fb, _bucketer("Token", [16, 64]), _bucketer("Bs", [1, 4])
+        )
+        for name, value in original.items():
+            padded = getattr(fb, name)
+            torch.testing.assert_close(padded[:3], value)
+            self.assertEqual(padded.shape[0], 4)
+            self.assertEqual(padded[3].item(), 0)
+        _restore_forward_batch_inputs(fb, q, b)
+        for name, value in original.items():
+            torch.testing.assert_close(getattr(fb, name), value)
 
     def test_extend_batch_cap_does_not_exceed_token_ceiling(self):
         fb = _forward_batch(real_t=4, real_b=2, mode="extend")
@@ -670,8 +927,7 @@ class TestCompiledForwardShim(CustomTestCase):
         shim.set_recompilation_checker(checker, model_label="M")
         fb = self._forward_batch(input_ids=torch.arange(8, dtype=torch.int32))
         with patch(
-            "sglang.srt.hardware_backend.tpu.compilation."
-            "compiled_forward_shim.torch.compiler.is_compiling",
+            "sglang_tpu.compilation.compiled_forward_shim.torch.compiler.is_compiling",
             return_value=True,
         ):
             shim(None, None, fb)
@@ -719,6 +975,25 @@ class TestCompiledForwardShim(CustomTestCase):
         self.assertTrue(torch.equal(out.next_token_logits, padded_logits[:2]))
         self.assertTrue(torch.equal(out.hidden_states, padded_hidden[:4]))
 
+        # When real_b == pad_b and real_q == pad_q, trim_next_token_outputs
+        # must not materialize a no-op slice view.
+        exact_logits = torch.zeros(4, 10)
+        exact_hidden = torch.zeros(8, 5)
+        shim_exact = CompiledForwardShim(
+            MagicMock(
+                return_value=LogitsProcessorOutput(
+                    next_token_logits=exact_logits,
+                    hidden_states=exact_hidden,
+                )
+            ),
+            policy=DecoderTpuCompilePolicy(),
+        )
+        out_exact = shim_exact(
+            None, None, self._forward_batch(_tpu_real_q=8, _tpu_real_b=4)
+        )
+        self.assertIs(out_exact.next_token_logits, exact_logits)
+        self.assertIs(out_exact.hidden_states, exact_hidden)
+
     def test_defers_output_unpadding_for_chained_forwards(self):
         padded = LogitsProcessorOutput(
             next_token_logits=torch.zeros(4, 10),
@@ -749,6 +1024,69 @@ class TestCompiledForwardShim(CustomTestCase):
         fb = self._forward_batch(_tpu_real_q=4, _tpu_real_b=2)
         shim("ids", "pos", fb, "extra1", kw="extra2")
         compiled.assert_called_once_with("ids", "pos", fb, "extra1", kw="extra2")
+
+    def test_non_spec_sampling_keeps_physical_outputs_and_metadata(self):
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        from sglang_tpu.compilation.decoder_compile_policy import (
+            Qwen3VLDecoderTpuCompilePolicy,
+        )
+
+        # A full decoder returns logits; Qwen-VL returns hidden states to an
+        # outer logits processor. Neither may unpad the forward metadata.
+        for hidden_boundary in (False, True):
+            with self.subTest(hidden_boundary=hidden_boundary):
+                tensor = torch.arange(80).reshape(8, 10).float()
+                padded = (
+                    tensor
+                    if hidden_boundary
+                    else LogitsProcessorOutput(next_token_logits=tensor)
+                )
+                policy_cls = (
+                    Qwen3VLDecoderTpuCompilePolicy
+                    if hidden_boundary
+                    else DecoderTpuCompilePolicy
+                )
+                policy = policy_cls()
+                policy.keep_outputs_padded = MagicMock(return_value=True)
+                shim = CompiledForwardShim(lambda *args: padded, policy=policy)
+                fb = self._forward_batch(
+                    _tpu_real_q=3,
+                    _tpu_real_b=3,
+                    batch_size=8,
+                    input_ids=torch.arange(8),
+                    positions=torch.arange(8),
+                    out_cache_loc=torch.arange(8),
+                    seq_lens=torch.ones(8),
+                    orig_seq_lens=torch.ones(8),
+                    mm_input_embeds=torch.ones(8, 4),
+                )
+                original = {
+                    name: getattr(fb, name)
+                    for name in (
+                        "input_ids",
+                        "positions",
+                        "out_cache_loc",
+                        "seq_lens",
+                        "orig_seq_lens",
+                        "mm_input_embeds",
+                    )
+                }
+                slices = []
+
+                class ObserveSlices(TorchDispatchMode):
+                    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                        if func == torch.ops.aten.slice.Tensor:
+                            slices.append(func)
+                        return func(*args, **(kwargs or {}))
+
+                with ObserveSlices():
+                    out = shim(None, None, fb)
+                self.assertIs(out, padded)
+                self.assertEqual(fb.batch_size, 8)
+                for name, value in original.items():
+                    self.assertIs(getattr(fb, name), value)
+                self.assertEqual(slices, [])
 
     def test_preserves_compiled_signature_for_later_inspection(self):
         def forward(input_ids, positions, forward_batch, pp_proxy_tensors=None):
@@ -858,6 +1196,62 @@ class TestCompiledForwardShim(CustomTestCase):
         shim(None, None, fb)
         self.assertIs(seen["during"], False)
         self.assertIs(fb.is_prefill_only, True)
+
+
+class TestContextParallelInputs(CustomTestCase):
+    """Under prefill context parallelism the graph takes the rank's zigzag rows
+    and one extend_seq_lens_cpu per program family."""
+
+    @staticmethod
+    def _call(cp_layout=False, input_embeds=None):
+        seen = {}
+
+        def compiled(input_ids, positions, forward_batch, *args, **kwargs):
+            seen.update(ids=input_ids, kwargs=kwargs, batch_ids=forward_batch.input_ids)
+            seen["lens"] = list(forward_batch.extend_seq_lens_cpu)
+            return SimpleNamespace()
+
+        fb = TestCompiledForwardShim._forward_batch(
+            input_ids=torch.zeros(48, dtype=torch.int64),
+            positions=torch.arange(48),
+            forward_mode=_ForwardModeMock("extend"),
+            extend_seq_lens_cpu=[40, 8],
+            input_embeds=input_embeds,
+        )
+        if cp_layout:
+            fb._tpu_cp_layout = SimpleNamespace(
+                host=SimpleNamespace(cp_size=2, local_rows_padded=32),
+                local_rows=torch.arange(32),
+            )
+        shim = CompiledForwardShim(compiled, policy=_policy(SimpleNamespace()))
+        shim._attn_cp_size = 2
+        shim(fb.input_ids, fb.positions, fb)
+        return fb, seen
+
+    def test_cp_batch_embeds_the_global_ids_and_keeps_the_rows(self):
+        fb, seen = self._call(cp_layout=True)
+        self.assertEqual(seen["ids"].shape[0], 64)  # global ids padded to cp x rows
+        self.assertEqual(seen["kwargs"]["cp_local_rows"].shape[0], 32)
+        self.assertEqual(seen["batch_ids"].shape[0], 32)
+        self.assertEqual(seen["lens"], [4, 4])
+        self.assertEqual(fb.input_ids.shape[0], 48)
+        self.assertEqual(fb.extend_seq_lens_cpu, [40, 8])
+
+    def test_plain_extend_presents_the_plain_stand_in(self):
+        """A plain extend on a context-parallel server must not trace the CP
+        program, whatever its live lengths."""
+        fb, seen = self._call()
+        self.assertEqual(seen["lens"], [0, 0])
+        self.assertNotIn("cp_local_rows", seen["kwargs"])
+        self.assertEqual(fb.extend_seq_lens_cpu, [40, 8])
+
+    def test_supplied_embeddings_skip_the_lookup(self):
+        """Caller embeddings are global; they narrow to the rank's rows and the
+        graph takes local ids, not the global ids plus the row selector."""
+        _, seen = self._call(cp_layout=True, input_embeds=torch.ones(48, 3))
+        self.assertEqual(seen["ids"].shape[0], 32)
+        self.assertNotIn("cp_local_rows", seen["kwargs"])
+        self.assertEqual(seen["kwargs"]["input_embeds"].shape, (32, 3))
 
 
 class TestBuildBucketers(CustomTestCase):
@@ -979,9 +1373,14 @@ class TestReconcileTpuBatchLimits(CustomTestCase):
         tpu_compile_bs=None,
         max_running_requests=None,
         attn_dp_size=1,
+        attn_tp_size=1,
     ):
         return reconcile_tpu_batch_limits(
-            torch_compile_max_bs, tpu_compile_bs, max_running_requests, attn_dp_size
+            torch_compile_max_bs,
+            tpu_compile_bs,
+            max_running_requests,
+            attn_dp_size,
+            attn_tp_size=attn_tp_size,
         )
 
     def test_default_neither_set(self):
@@ -1079,6 +1478,38 @@ class TestReconcileTpuBatchLimits(CustomTestCase):
                 self.assertGreaterEqual(
                     max(bs), mrr, f"buckets don't cover concurrency for {cases}"
                 )
+
+    def test_dp_attention_grid_covers_attention_tp_padded_decode_rows(self):
+        # Attention DP pads each worker's decode rows up to a multiple of the
+        # attention-TP width before the bucket lookup. 184 requests over 4
+        # workers at attention TP 8 pad a full worker's 46 rows to 48, which a
+        # grid ending at 46 refused ("exceeds the maximum bucket size 46").
+        cases = [(46, 4, 8, [16, 32, 46])] + [
+            (per_worker, 2, attn_tp_size, bs)
+            for per_worker in (1, 3, 64, 94)
+            for attn_tp_size in (2, 8, 16)
+            for bs in (None, [1, 2, 4])
+        ]
+        for per_worker, attn_dp_size, attn_tp_size, bs_in in cases:
+            with self.subTest(
+                per_worker=per_worker, attn_tp_size=attn_tp_size, bs=bs_in
+            ):
+                tcmb, bs, mrr = self._r(
+                    tpu_compile_bs=bs_in,
+                    max_running_requests=per_worker * attn_dp_size,
+                    attn_dp_size=attn_dp_size,
+                    attn_tp_size=attn_tp_size,
+                )
+                self.assertEqual(mrr, per_worker * attn_dp_size)
+                bucketer = (
+                    _bucketer("Bs", bs)
+                    if bs
+                    else PowerBucketer(name="Bs", min_val=1, max_val=tcmb)
+                )
+                for rows in range(1, per_worker + 1):
+                    padded = -(-rows // attn_tp_size) * attn_tp_size
+                    self.assertLessEqual(padded, tcmb)
+                    bucketer.next_bucket(padded)
 
 
 class TestDpAttnSelectBucketShape(CustomTestCase):
@@ -1216,6 +1647,7 @@ class TestHiCacheReloadGate(CustomTestCase):
                 token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter)
             ),
             finalize_forward_batch=lambda out, fb: out,
+            keep_outputs_padded=lambda fb: False,
         )
         return CompiledForwardShim(lambda *a, **k: "out", policy=policy)
 
@@ -1329,6 +1761,79 @@ class TestNeedsInputLogprob(CustomTestCase):
         self.assertFalse(needs_input_logprob(self._fb(starts=None, lens=None)))
 
 
+class TestPromptLogprobRejection(CustomTestCase):
+    """One answer on prompt logprobs, shared by the shim (per batch) and intake (per request)."""
+
+    def test_flag_off_names_the_flag(self):
+        self.assertIn(
+            "SGLANG_TPU_ENABLE_PROMPT_LOGPROB=1",
+            CompiledForwardShim._prompt_logprob_rejection(False),
+        )
+
+    def test_flag_on_plain_server_serves(self):
+        with get_context().override_server_args():
+            self.assertIsNone(CompiledForwardShim._prompt_logprob_rejection(True))
+
+    def test_flag_on_dp_attention_rejects(self):
+        with get_context().override_server_args(tp_size=2, attn_dp_size=2):
+            self.assertIn(
+                "DP attention", CompiledForwardShim._prompt_logprob_rejection(True)
+            )
+
+    def test_flag_on_pipeline_parallel_rejects(self):
+        with get_context().override_server_args(pp_size=2):
+            self.assertIn(
+                "pipeline parallelism",
+                CompiledForwardShim._prompt_logprob_rejection(True),
+            )
+
+
+class TestPromptLogprobIntakeGate(CustomTestCase):
+    """The TPU patch finishes an unservable prompt-logprob request with 400 at
+    scheduler intake; everything else reaches the queue untouched."""
+
+    def _enqueue(self, *, logprob_start_len, flag, return_logprob=True):
+        req = Req("r", "", array("q", [1, 2, 3, 4]), SamplingParams(), return_logprob)
+        req.logprob_start_len = logprob_start_len
+        queue = MagicMock()
+        with (
+            patch.object(Scheduler, "_add_request_to_queue", queue),
+            envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(flag),
+            get_context().override_server_args(),
+            get_parallel().override(tp_rank=0),
+        ):
+            patches._patch_scheduler_reject_prompt_logprob()
+            Scheduler._add_request_to_queue(SimpleNamespace(), req)
+        queue.assert_called_once()
+        return req
+
+    def test_prompt_logprobs_refused_with_the_flag_off(self):
+        # -2 is not validated upstream and batch prep clamps it to 0: prompt logprobs.
+        for start in (0, 2, -2):
+            with self.subTest(logprob_start_len=start):
+                req = self._enqueue(logprob_start_len=start, flag=False)
+                self.assertIsInstance(req.to_finish, FINISH_ABORT)
+                self.assertEqual(req.to_finish.status_code, HTTPStatus.BAD_REQUEST)
+                self.assertIn(
+                    "SGLANG_TPU_ENABLE_PROMPT_LOGPROB=1", req.to_finish.message
+                )
+
+    def test_output_only_logprobs_pass(self):
+        for start in (-1, 4):
+            with self.subTest(logprob_start_len=start):
+                self.assertIsNone(
+                    self._enqueue(logprob_start_len=start, flag=False).to_finish
+                )
+        self.assertIsNone(
+            self._enqueue(
+                logprob_start_len=0, flag=False, return_logprob=False
+            ).to_finish
+        )
+
+    def test_prompt_logprobs_pass_with_the_flag_on(self):
+        self.assertIsNone(self._enqueue(logprob_start_len=0, flag=True).to_finish)
+
+
 class TestPinFields(CustomTestCase):
     """Freezes logprob metadata for the compiled call and puts it back."""
 
@@ -1380,10 +1885,12 @@ class TestShimInputLogprobPath(CustomTestCase):
 
     def _publish_topology(self, *, pp_size=1, dp_size=1, enable_dp_attention=False):
         """Publish the topology the prompt-logprob gate reads, for this test."""
+        # Attention DP is declared by width now; the flag alone no longer
+        # resolves to a width inside an override.
         override = get_context().override_server_args(
             pp_size=pp_size,
-            dp_size=dp_size,
-            enable_dp_attention=enable_dp_attention,
+            dp_size=1 if enable_dp_attention else dp_size,
+            attn_dp_size=dp_size if enable_dp_attention else 1,
         )
         override.install()
         self.addCleanup(override.restore)

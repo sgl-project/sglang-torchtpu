@@ -13,13 +13,14 @@ _PYTHON_DIR = os.path.join(_REPO_ROOT, "python")
 if _PYTHON_DIR not in sys.path:
     sys.path.insert(0, _PYTHON_DIR)
 
+from sglang.test.ci.chip_parallel import run_files_chip_parallel
 from sglang.test.ci.ci_register import (
     CIRegistry,
     HWBackend,
     auto_partition,
     collect_tests,
 )
-from sglang.test.ci.ci_utils import run_unittest_files
+from sglang.test.ci.ci_utils import derive_timeout_per_file, run_unittest_files
 
 # Defensive fallback in case sglang is loaded from an external environment missing TPU
 if not hasattr(HWBackend, "TPU"):
@@ -34,6 +35,8 @@ HW_MAPPING = {
     "tpu": HWBackend.TPU,
     "xpu": HWBackend.XPU,
     "mlx": HWBackend.MLX,
+    "mps": HWBackend.MPS,
+    "ppu": HWBackend.PPU,
 }
 
 # Per-commit test suites (run on every PR).
@@ -139,6 +142,19 @@ PER_COMMIT_SUITES = {
         "stage-a-unit-test-mlx",
         "stage-b-e2e-mlx",
     ],
+    HWBackend.MPS: [
+        "stage-a-unit-test-mps",
+        # stage-b needs a self-hosted Apple Silicon runner; dispatched manually.
+        "stage-b-e2e-mps",
+    ],
+    # PPU has no suite in any of the three dicts yet: pr-test-ppu.yml only runs
+    # the runner preflight until the PPU SRT platform and AOT kernels land.
+    # Declaring a name here before a workflow dispatches it would let a test
+    # register, validate, and count as covered while never running, so each PPU
+    # suite name arrives with the job that runs it. Until then PPU is in
+    # _SUITE_CHECKED_BACKENDS with no valid suite, so validate_all_suites()
+    # rejects any register_ppu_ci() outright.
+    HWBackend.PPU: [],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
@@ -167,11 +183,14 @@ NIGHTLY_SUITES = {
         "nightly-amd-8-gpu-mi35x-qwen38-mxfp4",
         "nightly-amd-8-gpu-mi35x-glm52-fp8",
         "nightly-amd-8-gpu-mi35x-glm53-flash",
+        "nightly-amd-accuracy-8-gpu-glm53",
+        "nightly-amd-8-gpu-mi35x-glm53",
         "nightly-amd-4-gpu",
         "nightly-amd-8-gpu",
         "nightly-amd-vlm",
         "nightly-amd-accuracy-8-gpu-deepseek-v4-flash",
         "nightly-amd-8-gpu-mi35x-deepseek-v4-flash",
+        "nightly-amd-4-gpu-mi35x-deepseek-v41-flash",
         # MI35x 8-GPU suite (different model configs)
         "nightly-amd-8-gpu-mi35x",
     ],
@@ -225,7 +244,7 @@ NIGHTLY_SUITES = {
         "nightly-tpu-perf-gemma4-31b",
         "nightly-tpu-perf-gemma4-26b-a4b",
         "nightly-tpu-perf-qwen3-5-397b",
-        "nightly-perf-tpu",
+        "nightly-tpu-perf-glm-5-3-flash-mtp-mk",
         # One suite per quality eval so each gets an independent TPU slice.
         "nightly-tpu-accuracy-gpt-oss-20b",
         "nightly-tpu-accuracy-gemma4-31b-aime",
@@ -235,10 +254,25 @@ NIGHTLY_SUITES = {
         "nightly-tpu-accuracy-gemma4-26b-a4b-gpqa",
         "nightly-tpu-accuracy-gemma4-26b-a4b-mmmupro",
         "nightly-tpu-accuracy-qwen3-5-397b-mmmupro",
+        "nightly-tpu-accuracy-qwen3-8-27b-gpqa",
+        "nightly-tpu-accuracy-qwen3-8-27b-aime",
+        "nightly-tpu-accuracy-qwen3-8-27b-mmmupro",
         "nightly-tpu-accuracy-gpt-oss-120b-aime",
         "nightly-tpu-accuracy-gpt-oss-120b-gpqa",
         "nightly-tpu-accuracy-gpt-oss-120b-gsm8k",
         "nightly-tpu-accuracy-gpt-oss-120b-mmlupro",
+        "nightly-tpu-accuracy-muse-spark-aime",
+        "nightly-tpu-accuracy-muse-spark-gpqa",
+        "nightly-tpu-accuracy-muse-spark-gsm8k",
+        "nightly-tpu-accuracy-muse-spark-mmlupro",
+        "nightly-tpu-accuracy-glm-5-3-flash-aime",
+        # External tpu7x cluster (nightly-test-external-tpu.yml; see
+        # .github/tpu-ci/external/README.md). 1host: single-host tests that launch
+        # their own server. 2x2x2 / 2x2x4: multi-host jobs wired by hand in
+        # external-topology.yaml, including the bench matrix.
+        "external-nightly-1host",
+        "external-nightly-2x2x2",
+        "external-nightly-2x2x4",
     ],
     HWBackend.XPU: [
         "nightly-xpu-1-gpu",
@@ -250,6 +284,12 @@ NIGHTLY_SUITES = {
 
 
 OTHER_SUITES = {
+    # Hand-wired jobs (`files:` / `cmd:`) that no generic suite runner launches:
+    # P/D gates and exec-mode probes in external-topology.yaml,
+    # feature-validation-tpu.yml and combo-test-tpu.yml.
+    HWBackend.TPU: [
+        "tpu-integration",
+    ],
     HWBackend.CPU: [
         "default",
         # `stage="weekly"`, dispatched by weekly-test-cpu.yml.
@@ -276,6 +316,9 @@ _SUITE_CHECKED_BACKENDS = {
     HWBackend.MUSA,
     HWBackend.XPU,
     HWBackend.MLX,
+    HWBackend.MPS,
+    HWBackend.PPU,
+    HWBackend.TPU,
 }
 
 
@@ -288,6 +331,33 @@ def _valid_suites_by_backend() -> dict:
                 result[backend] = set()
             result[backend].update(suites)
     return result
+
+
+def registered_test_files() -> List[str]:
+    """Every registered test file under test/registered/, as collect_tests sees them."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return [
+        f
+        for f in glob.glob(
+            os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
+        )
+        # conftest.py / __init__.py are pytest+package structure, never
+        # registered tests, and must not be executed as one.
+        if os.path.basename(f) not in ("conftest.py", "__init__.py")
+    ]
+
+
+def fails_on_all_skipped(hw: HWBackend, suites: List[str]) -> bool:
+    """Whether a file whose tests all skip fails the run instead of passing.
+
+    On for the TPU per-commit suites: while the CI pods pinned JAX to CPU,
+    kernel tests gated on jax.devices() skipped every case and reported green
+    (#413). Other backends keep the old behavior until someone
+    checks their suites for files that skip on purpose.
+    """
+    return hw == HWBackend.TPU and any(
+        suite in PER_COMMIT_SUITES[HWBackend.TPU] for suite in suites
+    )
 
 
 def validate_all_suites(all_tests: List[CIRegistry]):
@@ -417,16 +487,7 @@ def run_a_suite(args):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.dirname(script_dir)
 
-    # Registered tests under test/registered/
-    files = [
-        f
-        for f in glob.glob(
-            os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
-        )
-        # conftest.py / __init__.py are pytest+package structure, never
-        # registered tests, and must not be executed as one.
-        if os.path.basename(f) not in ("conftest.py", "__init__.py")
-    ]
+    files = registered_test_files()
 
     # Strict: all discovered files must have proper registration
     sanity_check = True
@@ -436,9 +497,15 @@ def run_a_suite(args):
     ci_tests, skipped_tests = filter_tests(all_tests, hw, suites, nightly)
 
     if args.test_file:
-        requested = os.path.normpath(os.path.join(repo_root, args.test_file))
+        # Comma-separated, like --suite: one runner can be handed a specific
+        # set of files without inventing a suite for them.
+        requested = {
+            os.path.normpath(os.path.join(repo_root, name.strip()))
+            for name in args.test_file.split(",")
+            if name.strip()
+        }
         ci_tests = [
-            test for test in ci_tests if os.path.normpath(test.filename) == requested
+            test for test in ci_tests if os.path.normpath(test.filename) in requested
         ]
         if not ci_tests:
             raise ValueError(
@@ -462,6 +529,7 @@ def run_a_suite(args):
         )
 
     pretty_print_tests(args, ci_tests, skipped_tests)
+    fail_on_all_skipped = fails_on_all_skipped(hw, suites)
 
     # None hands the per-file budget over to est_time (see run_unittest_files).
     timeout = None if args.timeout_from_est_time else args.timeout_per_file
@@ -470,15 +538,43 @@ def run_a_suite(args):
     if timeout is not None and args.enable_retry:
         timeout += args.retry_timeout_increase
 
-    return run_unittest_files(
+    pinned_ok = True
+    pinned_results = []
+    if args.tpu_chip_workers > 1:
+        # Chip-pinned files first; they release their chips before any
+        # whole-node test starts, so the two never share a host.
+        pinned_ok, pinned_passed, _, pinned_elapsed = run_files_chip_parallel(
+            ci_tests,
+            workers=args.tpu_chip_workers,
+            timeout_per_file=timeout,
+            derive_timeout=derive_timeout_per_file,
+            continue_on_error=args.continue_on_error,
+            fail_on_all_skipped=fail_on_all_skipped,
+        )
+        # Handed to run_unittest_files so the suite still ends with one
+        # TIMINGS block covering every file; the est_time model and the
+        # dashboard both read that block.
+        passed_set = set(pinned_passed)
+        pinned_results = [
+            (name, name in passed_set, elapsed)
+            for name, elapsed in pinned_elapsed.items()
+        ]
+        if not pinned_ok and not args.continue_on_error:
+            return -1
+        ci_tests = [test for test in ci_tests if getattr(test, "chips", 0) != 1]
+
+    rest = run_unittest_files(
         ci_tests,
+        prior_results=pinned_results,
         timeout_per_file=timeout,
         continue_on_error=args.continue_on_error,
         enable_retry=args.enable_retry,
         max_attempts=args.max_attempts,
         retry_wait_seconds=args.retry_wait_seconds,
         fork_worker_batch_size=args.fork_worker_batch_size,
+        fail_on_all_skipped=fail_on_all_skipped,
     )
+    return rest if pinned_ok else -1
 
 
 def main():
@@ -534,6 +630,16 @@ def main():
         action="store_true",
         default=False,
         help="Continue running remaining tests even if one fails (default: False, useful for nightly tests).",
+    )
+    parser.add_argument(
+        "--tpu-chip-workers",
+        type=int,
+        default=0,
+        help=(
+            "Run `chips=1` TPU tests this many at a time, each pinned to one "
+            "chip of the slice the job already holds. 0 or 1 keeps every test "
+            "on the whole node, which is the default."
+        ),
     )
     parser.add_argument(
         "--auto-partition-id",

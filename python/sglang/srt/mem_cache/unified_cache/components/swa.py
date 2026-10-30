@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentType,
     EvictLayer,
     ExternalLinkerLoadPhase,
+    InternalStateBackup,
     LinkerTransferPhase,
     LRURefreshPhase,
     PreparePrefetchResult,
@@ -80,6 +81,9 @@ class SWAComponent(TreeComponent):
 
         super().__init__(cache, params)
         self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
+        self._evict_stale_windows_first = (
+            envs.SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST.get()
+        )
         self.sliding_window_size = params.sliding_window_size
         self.full_window_pages = (
             self.sliding_window_size + params.page_size - 1
@@ -220,9 +224,14 @@ class SWAComponent(TreeComponent):
                     )
 
     def _translate_full_to_swa(self, full_indices: torch.Tensor) -> torch.Tensor:
-        return self.cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-            full_indices
+        swa_indices = (
+            self.cache.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
+                full_indices
+            )
         )
+        # Tree component values use int64 indices; normalize transfer ids at the
+        # tree boundary.
+        return swa_indices.to(torch.int64)
 
     def _unified_allocator(self):
         """The unified SWA composite, or None when running on the static pool."""
@@ -711,7 +720,7 @@ class SWAComponent(TreeComponent):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> Optional[NodeId]:
+    ) -> NodeId | InternalStateBackup | None:
         """Advance one device-eviction step and return a leaf, if selected.
 
         An internal tombstone is one complete step so the caller can apply its
@@ -746,9 +755,33 @@ class SWAComponent(TreeComponent):
             )
             return x.id
         if not enabled:
-            x_next = lru.get_prev_no_lock(x)
-        # write_back: demote the SWA KV to host before the internal tombstone.
-        self._maybe_backup_node_before_swa_tombstone(x)
+            self._evict_device_cursor = lru.get_prev_no_lock(x)
+        cd = x.component_data[ct]
+        if (
+            self.tree_core.enable_hicache
+            and self.tree_core.is_write_back
+            and self.tree_core.has_swa_host_pool
+            and cd.host_value is None
+            and not x.backuped
+            and x.component_data[BASE_COMPONENT_TYPE].value is not None
+        ):
+            # Reserve the whole unbacked window, not just this victim, before
+            # its best-effort host backup and resumed internal tombstone.
+            needed = sum(
+                len(node.component_data[ct].value)
+                for node in self._collect_unbacked_swa_nodes(x)
+            )
+            if needed:
+                if ct == ComponentType.SWA:
+                    return InternalStateBackup(node_id=x.id, num_tokens=needed)
+                # Custom SWA component types use Python's inherited inline
+                # path; the shared finish hook is for built-in SWA only.
+                if (
+                    self._swa_kv_pool_host is not None
+                    and self._swa_kv_pool_host.available_size() < needed
+                ):
+                    self.cache.evict_host(needed, ct)
+                self.cache.backup_node_for_write_back(x.id)
         self.tree_core._evict_component_and_detach_lru(
             x,
             self,
@@ -760,47 +793,9 @@ class SWAComponent(TreeComponent):
         self.tree_core._cascade_evict(
             x, self, tracker, device_frees=device_frees, host_frees=host_frees
         )
-        self._evict_device_cursor = lru.cursor_next() if enabled else x_next
+        if enabled:
+            self._evict_device_cursor = lru.cursor_next()
         return None
-
-    def _maybe_backup_node_before_swa_tombstone(self, node: UnifiedTreeNode) -> None:
-        """Demote an internal node's SWA KV to host before its tombstone
-        (write_back only), mirroring the leaf deferred-demote path.
-
-        The match validator treats an unbacked tombstone as a window reset,
-        so a dropped internal SWA segment caps the match frontier until a
-        full sliding window re-accumulates below it, leaving up to one
-        window of still-resident KV unservable. The leaf backup walk covers
-        ancestors only within one window of the evicted leaf, so an
-        internal node whose child spans the window arrives here unbacked.
-        Best-effort: this walk must make progress (it satisfies an imminent
-        allocation), so any failure falls back to the legacy drop.
-        """
-        cache = self.cache
-        cd = node.component_data[self.component_type]
-        if (
-            cache.cache_controller is None
-            or not cache.is_write_back
-            or not self.tree_core.has_swa_host_pool
-            or cd.host_value is not None
-            or node.backuped
-            or node.component_data[BASE_COMPONENT_TYPE].value is None
-        ):
-            return
-        # The backup executor pre-evicts only the KV host pool; make room
-        # in the SWA host pool the way the PREFETCH hook does.
-        needed = sum(
-            len(n.component_data[self.component_type].value)
-            for n in self._collect_unbacked_swa_nodes(node)
-        )
-        if needed == 0:
-            return
-        if (
-            self._swa_kv_pool_host is not None
-            and self._swa_kv_pool_host.available_size() < needed
-        ):
-            cache.evict_host(needed, self.component_type)
-        cache.backup_node_for_write_back(node.id)
 
     def _evict_device_end(self) -> None:
         """Clear the device-eviction walk cursor state."""
@@ -856,7 +851,7 @@ class SWAComponent(TreeComponent):
             covered += len(cur.key)
             if covered >= sliding_window_size:
                 if comp.metadata.get(uuid_key) is None:
-                    comp.metadata[uuid_key] = next_component_uuid()
+                    comp.metadata[uuid_key] = next_component_uuid(ct)
                 swa_uuid = comp.metadata[uuid_key]
             cur = cur.parent
 
@@ -1027,6 +1022,101 @@ class SWAComponent(TreeComponent):
         ):
             forward_key_len = len(req.get_fill_ids()) - int(self.tree_core.is_eagle)
             self._free_out_of_window_slots(req, forward_key_len - 1)
+
+        if (
+            self._evict_stale_windows_first
+            and insert_result is not None
+            and insert_result.last_device_node is not None
+        ):
+            self._demote_stale_windows(
+                last_node=self.tree_core.node_by_id(insert_result.last_device_node)
+            )
+
+    # An insert leaves live SWA behind the request's sliding window: one window at each
+    # chunk boundary, and the earlier turns' windows once a new turn extends a
+    # conversation. The request can no longer free them; move those on its path to the
+    # SWA LRU end.
+    def _demote_stale_windows(self, *, last_node: UnifiedTreeNode) -> None:
+        root = self.tree_core.root_node
+        path = []
+        node = last_node
+        while node is not root:
+            assert node is not None, "insert returned a node detached from the tree"
+            path.append(node)
+            node = node.parent
+        depth = sum(len(n.key) for n in path)
+        # Same bound as the INSERT_END refresh, so a demoted node is never one that
+        # refresh just made MRU.
+        window_bound = self.sliding_window_size + self.tree_core.page_size
+        end = depth
+        child = None
+        for n in path:
+            num_others = len(n.children) - (child is not None)
+            abandoned: list[UnifiedTreeNode] = []
+            if num_others:
+                # Above a branch point the path is shared: another sequence's window
+                # may need these nodes. The exception is one abandoned output, such
+                # as a reply the client did not send back in its next turn.
+                if num_others > 1:
+                    break
+                other = next(c for c in n.children.values() if c is not child)
+                abandoned = self._abandoned_output_chain(other, child)
+                if not abandoned:
+                    break
+            if depth - end >= window_bound:
+                self._demote_swa(n)
+            # Demoted last, tail last, so the output goes before the window above it.
+            for x in abandoned:
+                self._demote_swa(x)
+            child = n
+            end -= len(n.key)
+
+    def _abandoned_output_chain(
+        self, head: UnifiedTreeNode, path_child: Optional[UnifiedTreeNode]
+    ) -> list[UnifiedTreeNode]:
+        """The nodes of a request's dropped output, or [] if ``head`` is not one.
+
+        ``head`` holds less than a page of the request's prompt, then its generated
+        output, possibly continued by a chain of output-only nodes down to a leaf (an
+        SWA leaf is capped at one window). The path beside it repeats that prompt and
+        continues with prompt where the output began, so it is not another reply to
+        the same prompt. Nothing has matched, locked or pinned the chain since the
+        path was created."""
+        offset = head.output_offset
+        path_offset = path_child.created_output_offset if path_child else None
+        if not (
+            path_child is not None
+            and offset is not None
+            and 0 < offset < self.tree_core.page_size
+            and head.key.match(path_child.key) >= offset
+            and (path_offset is None or path_offset > offset)
+        ):
+            return []
+        chain = []
+        node = head
+        while True:
+            if (
+                (node is not head and node.output_offset != 0)
+                or node.last_access_time >= path_child.creation_time
+                or any(
+                    node.component_data[ct].lock_ref
+                    or node.component_data[ct].session_ref
+                    for ct in node.component_types
+                )
+            ):
+                return []
+            chain.append(node)
+            if not node.children:
+                return chain
+            if len(node.children) > 1:
+                return []
+            node = next(iter(node.children.values()))
+
+    def _demote_swa(self, node: UnifiedTreeNode) -> None:
+        cd = node.component_data[self.component_type]
+        lru = self.tree_core.lru_lists[self.component_type]
+        if cd.value is not None and cd.lock_ref == 0 and lru.in_list(node):
+            lru.reset_node_lru(node)
 
     # ---- HiCache Hooks ----
 

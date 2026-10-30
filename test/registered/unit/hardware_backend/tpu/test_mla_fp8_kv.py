@@ -5,24 +5,29 @@ base tensors (no uint8 view), the per-tensor quantizer, and the backend's
 fp8 branch handing quantized latents plus one shared scale to the kernel op.
 """
 
+import functools
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.attention_pallas_mla import (
-    TpuPallasMlaAttnBackend,
-)
-from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
-    _quantize_kv_to_fp8,
-)
-from sglang.srt.hardware_backend.tpu.kv_pool import (
-    TpuFusedMLATokenToKVPool,
-    _zeros_kv_buffer,
-)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention_pallas_mla import (
+    TpuPallasMlaAttnBackend,
+)
+from sglang_tpu.attention_pallas_mla_sparse import (
+    TpuPallasSparseMlaAttnBackend,
+)
+from sglang_tpu.attention_pallas_rpa_base import (
+    _quantize_kv_to_fp8,
+)
+from sglang_tpu.kv_pool import (
+    TpuFusedMLATokenToKVPool,
+    TpuSplitMLATokenToKVPool,
+    _zeros_kv_buffer,
+)
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -58,6 +63,69 @@ class TestZerosKvBuffer(CustomTestCase):
             self.assertEqual(buf.dtype, FP8)
             self.assertIsNone(buf._base)
 
+    def test_split_pool_allocates_the_buffers_the_sparse_kernels_read(self):
+        pool = TpuSplitMLATokenToKVPool(
+            size=64,
+            page_size=32,
+            dtype=FP8,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            layer_num=3,
+            device="cpu",
+            enable_memory_saver=False,
+            index_head_dim=128,
+            index_key_layers=[True, False, True],
+        )
+        # Per token: 512 NoPE bytes, 64 RoPE bytes padded to 128, and a
+        # 256-byte index-key record. Each buffer must be a whole uint8 tensor,
+        # not a view, or the ops cannot update it in place and copy the pool.
+        expected = {
+            pool.get_nope_cache: (pool.num_pages, 32, 4, 128),
+            pool.get_rope_cache: (pool.num_pages, 8, 4, 128),
+            pool.get_index_key_cache: (pool.num_pages, 8, 4, 256),
+        }
+        total_bytes = 0
+        for accessor, shape in expected.items():
+            layers = (0, 2) if accessor == pool.get_index_key_cache else (0, 1, 2)
+            for layer_id in layers:
+                buf = accessor(layer_id)
+                self.assertEqual(tuple(buf.shape), shape)
+                self.assertEqual(buf.dtype, torch.uint8)
+                self.assertIsNone(buf._base)
+                total_bytes += buf.nbytes
+        # A layer that reuses the previous layer's result must have no cache.
+        with self.assertRaisesRegex(ValueError, "no index-key cache"):
+            pool.get_index_key_cache(1)
+        self.assertEqual(pool.get_kv_size_bytes(), total_bytes)
+
+    def test_split_pool_bytes_per_token_is_what_it_allocates(self):
+        # The KV budget divides free memory by bytes_per_token, so it must count
+        # every buffer, the pooled indexer's bf16 raw buffer included.
+        for index_kpool in (1, 4):
+            with self.subTest(index_kpool=index_kpool):
+                kwargs = dict(
+                    index_head_dim=128,
+                    index_key_layers=[True, False, True],
+                    index_kpool=index_kpool,
+                )
+                pool = TpuSplitMLATokenToKVPool(
+                    size=64,
+                    page_size=32,
+                    dtype=FP8,
+                    kv_lora_rank=512,
+                    qk_rope_head_dim=0,
+                    layer_num=3,
+                    device="cpu",
+                    enable_memory_saver=False,
+                    **kwargs,
+                )
+                self.assertEqual(
+                    pool.get_kv_size_bytes(),
+                    TpuSplitMLATokenToKVPool.bytes_per_token(**kwargs)
+                    * pool.num_pages
+                    * pool.page_size,
+                )
+
 
 class TestQuantizeKvToFp8(CustomTestCase):
     def test_divides_by_scale_clamps_and_casts(self):
@@ -74,7 +142,16 @@ class TestQuantizeKvToFp8(CustomTestCase):
         torch.testing.assert_close(q.to(torch.bfloat16), t, rtol=0, atol=0)
 
 
-def _run_forward_mla(*, quant_dtype, k_scale_float):
+def _forward_batch(draft_kv_lens=None):
+    spec_info = (
+        None
+        if draft_kv_lens is None
+        else SimpleNamespace(rpa_draft_kv_lens=draft_kv_lens)
+    )
+    return SimpleNamespace(spec_info=spec_info)
+
+
+def _run_forward_mla(*, quant_dtype, k_scale_float, draft_kv_lens=None):
     """Drive ``_forward_mla`` on a stand-in backend with a mocked kernel op."""
     T, H, R, D = 3, 4, 512, 64
     op = MagicMock(return_value=torch.zeros(T, H, R))
@@ -87,9 +164,19 @@ def _run_forward_mla(*, quant_dtype, k_scale_float):
             cu_q_lens=torch.zeros(2, dtype=torch.int32),
             cu_kv_lens=torch.zeros(2, dtype=torch.int32),
             distribution=torch.zeros(3, dtype=torch.int32),
+            segments="mixed",
+            decode_query_size=1,
         ),
         token_to_kv_pool=SimpleNamespace(get_fused_kv_buffer=lambda _: "kv"),
     )
+    # _forward_mla builds the op's arguments through these methods.
+    backend._mla_kernel_args = functools.partial(
+        TpuPallasMlaAttnBackend._mla_kernel_args, backend
+    )
+    backend._kv_cache_buffers = functools.partial(
+        TpuPallasMlaAttnBackend._kv_cache_buffers, backend
+    )
+    backend._kv_lens = functools.partial(TpuPallasMlaAttnBackend._kv_lens, backend)
     layer = SimpleNamespace(
         v_head_dim=R,
         qk_head_dim=R + D,
@@ -103,7 +190,13 @@ def _run_forward_mla(*, quant_dtype, k_scale_float):
     k = torch.randn(T, 1, R, dtype=torch.bfloat16) * 4
     k_rope = torch.randn(T, 1, D, dtype=torch.bfloat16) * 4
     out = TpuPallasMlaAttnBackend._forward_mla(
-        backend, q, k, layer, forward_batch=None, q_rope=q_rope, k_rope=k_rope
+        backend,
+        q,
+        k,
+        layer,
+        forward_batch=_forward_batch(draft_kv_lens),
+        q_rope=q_rope,
+        k_rope=k_rope,
     )
     return out, op.call_args.args, k, k_rope
 
@@ -142,6 +235,177 @@ class TestForwardMlaFp8Branch(CustomTestCase):
         self.assertEqual(args[12], 1.0)
         # Inputs are made dense and contiguous before the pallas bridge.
         self.assertTrue(args[0].is_contiguous() and args[1].is_contiguous())
+
+    def test_fused_draft_step_attends_with_its_own_kv_lens(self):
+        draft_kv_lens = torch.tensor([7], dtype=torch.int32)
+        _, args, _, _ = _run_forward_mla(
+            quant_dtype=None, k_scale_float=None, draft_kv_lens=draft_kv_lens
+        )
+        self.assertIs(args[5], draft_kv_lens)
+
+
+class TestSparseForwardMlaCacheBuffers(CustomTestCase):
+    def test_op_gets_two_cache_buffers_in_place_of_the_fused_one(self):
+        """The sparse op takes the dense op's arguments, with the pool's NoPE
+        and RoPE buffers in place of the fused buffer and the top-k rows last."""
+        T, H, R, D = 3, 4, 512, 64
+        op = MagicMock(return_value=torch.zeros(T, H, R))
+        backend = SimpleNamespace(
+            kv_cache_quant_dtype=FP8,
+            _op=op,
+            _prefill_op=None,
+            # _mla_kernel_args passes these through, so names stand in for them.
+            forward_metadata=SimpleNamespace(
+                kv_lens="kv_lens",
+                page_indices="page_indices",
+                cu_q_lens="cu_q_lens",
+                cu_kv_lens="cu_kv_lens",
+                distribution="distribution",
+            ),
+            token_to_kv_pool=SimpleNamespace(
+                get_nope_cache=lambda layer_id: f"nope{layer_id}",
+                get_rope_cache=lambda layer_id: f"rope{layer_id}",
+            ),
+        )
+        backend._mla_kernel_args = functools.partial(
+            TpuPallasMlaAttnBackend._mla_kernel_args, backend
+        )
+        backend._kv_cache_buffers = functools.partial(
+            TpuPallasSparseMlaAttnBackend._kv_cache_buffers, backend
+        )
+        backend._kv_lens = functools.partial(
+            TpuPallasSparseMlaAttnBackend._kv_lens, backend
+        )
+        layer = SimpleNamespace(
+            v_head_dim=R,
+            qk_head_dim=R + D,
+            tp_q_head_num=H,
+            scaling=0.125,
+            layer_id=7,
+            k_scale_float=0.5,
+        )
+        TpuPallasSparseMlaAttnBackend._forward_mla(
+            backend,
+            torch.randn(T, H, R, dtype=torch.bfloat16),
+            torch.randn(T, 1, R, dtype=torch.bfloat16),
+            layer,
+            forward_batch=_forward_batch(),
+            q_rope=torch.randn(T, H, D, dtype=torch.bfloat16),
+            k_rope=torch.randn(T, 1, D, dtype=torch.bfloat16),
+            topk_indices="topk",
+        )
+        # After the four query and new-token tensors:
+        self.assertEqual(
+            op.call_args.args[4:],
+            (
+                "nope7",
+                "rope7",
+                "kv_lens",
+                "page_indices",
+                "cu_q_lens",
+                "cu_kv_lens",
+                "distribution",
+                0.125,  # sm_scale
+                0.5,  # k_scale
+                0.5,  # v_scale
+                "topk",
+            ),
+        )
+        self.assertEqual(op.call_args.kwargs, {})
+
+
+class TestSparseIndexerKvLens(CustomTestCase):
+    """A fused draft step picks its top-k over its own KV length, not step 0's."""
+
+    def _backend(self):
+        backend = SimpleNamespace(
+            _index_topk_op=MagicMock(),
+            _topk=4,
+            _kpool_width=8,
+            forward_metadata=SimpleNamespace(
+                kv_lens="kv_lens",
+                page_indices="page_indices",
+                cu_q_lens="cu_q_lens",
+                distribution="distribution",
+                decode_query_size=1,
+                segments="all",
+            ),
+            token_to_kv_pool=SimpleNamespace(
+                get_index_key_cache=lambda layer_id: f"index{layer_id}",
+                get_kpool_raw_cache=lambda layer_id: f"raw{layer_id}",
+            ),
+        )
+        backend._kv_lens = functools.partial(
+            TpuPallasSparseMlaAttnBackend._kv_lens, backend
+        )
+        return backend
+
+    def test_index_topk(self):
+        backend = self._backend()
+        t = torch.zeros(1)
+        for draft_kv_lens, expected in ((None, "kv_lens"), ("draft", "draft")):
+            with self.subTest(draft_kv_lens=draft_kv_lens):
+                TpuPallasSparseMlaAttnBackend.index_topk(
+                    backend,
+                    forward_batch=_forward_batch(draft_kv_lens),
+                    layer_id=2,
+                    query=t,
+                    key=t,
+                    head_weights=t,
+                    weight_scale=1.0,
+                )
+                args = backend._index_topk_op.call_args.args
+                self.assertEqual(args[3:5], ("index2", expected))
+
+    def test_index_topk_kpool(self):
+        backend = self._backend()
+        t = torch.zeros(1)
+        TpuPallasSparseMlaAttnBackend.index_topk_kpool(
+            backend,
+            forward_batch=_forward_batch("draft"),
+            layer_id=2,
+            query=t,
+            key=t,
+            gate=t,
+            head_weights=t,
+            ape=t,
+            weight_scale=1.0,
+            kpool=4,
+        )
+        args = backend._index_topk_op.call_args.args
+        self.assertEqual(args[5:8], ("raw2", "index2", "draft"))
+
+    def test_kpool_query_bound_tracks_the_compiled_metadata_mode(self):
+        # Decode and uniform verify/draft extend take their static per-request
+        # width; ragged extend (width 1 outside DECODE) must keep the token
+        # bucket, or pools closed by long requests would be dropped.
+        for segments, width, tokens, bound in (
+            ("decode", 1, 32, 1),
+            ("all", 6, 192, 6),
+            ("all", 6, 4, 4),
+            ("mixed", 1, 8192, 8192),
+            ("all", 1, 64, 64),
+        ):
+            with self.subTest(segments=segments, width=width):
+                backend = self._backend()
+                backend.forward_metadata.segments = segments
+                backend.forward_metadata.decode_query_size = width
+                t = torch.zeros(tokens, 1, 128)
+                TpuPallasSparseMlaAttnBackend.index_topk_kpool(
+                    backend,
+                    forward_batch=_forward_batch(),
+                    layer_id=2,
+                    query=t,
+                    key=t,
+                    gate=t,
+                    head_weights=t,
+                    ape=t,
+                    weight_scale=1.0,
+                    kpool=4,
+                )
+                self.assertEqual(
+                    backend._index_topk_op.call_args.args[-2:], (width, bound)
+                )
 
 
 if __name__ == "__main__":

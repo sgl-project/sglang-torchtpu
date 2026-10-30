@@ -13,7 +13,7 @@ tasks:
 - name: "mmlu_llama"
   metrics:
   - name: "exact_match,strict_match"
-    value: 0.7991  # torchtpu-vllm ref (sglang-TPU measured 0.7879)
+    value: 0.7991  # vllm-torchtpu ref (sglang-TPU measured 0.7879)
 limit: 100
 num_concurrent: 32
 batch_size: "auto"

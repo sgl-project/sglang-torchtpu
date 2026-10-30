@@ -21,14 +21,11 @@ import uvicorn
 import zmq
 import zmq.asyncio
 from aiohttp import ClientSession, ClientTimeout
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed.parallel_state import (
-    GroupCoordinator,
-    get_mooncake_transfer_engine,
-)
+from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     EncoderDispatchErrorReq,
@@ -896,6 +893,8 @@ class WaitingMMRequestBase(ABC):
         self.rid = rid
         self.recv_req = recv_req
         self.mm_inputs = None
+        # Scheduler ticks spent ready but held back for pending batch-mates.
+        self.held_ticks = 0
         self.error = None
         self.thread = None
         self.mm_processor = mm_processor
@@ -936,6 +935,12 @@ class WaitingMMRequestBase(ABC):
     @abstractmethod
     def send_encode_request(self) -> None:
         """Kick off the transport-specific encode / receive flow."""
+
+    def still_receiving(self) -> bool:
+        """Pending on embedding parts that have not all arrived (not just on pool space)."""
+        return self.status == WaitingMMRequestStatus.PENDING and not (
+            self.recv_embedding_data is not None and self.recv_embedding_data.ready
+        )
 
     def _try_recv_mm_data(self):
         if self.status != WaitingMMRequestStatus.PENDING:
@@ -1870,9 +1875,6 @@ class MMReceiverBase(ABC):
         server_args: ServerArgs,
         dtype: Optional[torch.dtype] = None,
         hf_config: Optional[PretrainedConfig] = None,
-        pp_rank: Optional[int] = None,
-        tp_rank: Optional[int] = None,
-        tp_group: Optional[GroupCoordinator] = None,
         scheduler: Optional["Scheduler"] = None,
         encode_urls: Optional[List[str]] = None,
     ):
@@ -1892,10 +1894,13 @@ class MMReceiverBase(ABC):
         )
         self.recv_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
         self.host = get_local_ip_auto(get_serving().host)
-        self.pp_rank = pp_rank
-        self.tp_rank = tp_rank
-        self.tp_size = get_parallel().tp_size
-        self.tp_group = tp_group
+        # A scheduler-side receiver works across its TP group; the tokenizer
+        # side has no placement.
+        parallel = get_parallel()
+        self.pp_rank = parallel.pp_rank if scheduler is not None else None
+        self.tp_rank = parallel.tp_rank if scheduler is not None else None
+        self.tp_size = parallel.tp_size
+        self.tp_group = parallel.tp_group if scheduler is not None else None
         self.nnodes = get_parallel().nnodes
         self.hostname = get_local_ip_auto()
         self.waiting_list: List[WaitingMMRequestBase] = []
@@ -1908,7 +1913,7 @@ class MMReceiverBase(ABC):
             and scheduler is not None
         ):
             self.registration_runner = _ReceiveRegistrationRunner(
-                f"encoder-receive-registration-{tp_rank}"
+                f"encoder-receive-registration-{self.tp_rank}"
             )
             (
                 self.scheduler_embedding_port,
@@ -2237,16 +2242,22 @@ class MMReceiverBase(ABC):
             )
             encode_thread.start()
             return scheduler_dispatch_ready
+        elif mm_data:
+            # A language-only server does not warm its vision tower, so encoding
+            # locally would compile per image shape instead of failing visibly.
+            logger.warning(
+                f"No encoder URLs available for request {obj.rid}; "
+                "rejecting instead of encoding locally."
+            )
+            raise HTTPException(
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                detail=(
+                    f"No encoder is registered to embed the {len(mm_data)} "
+                    "multimodal item(s) in this request."
+                ),
+            )
         else:
-            # No encoder URLs available (bootstrap may not have any registered yet);
-            # reset the flag so the scheduler does not wait for embeddings that will
-            # never arrive.  A warning is emitted so the user can diagnose why
-            # disaggregation is not happening for this request.
-            if mm_data:
-                logger.warning(
-                    f"No encoder URLs available for request {obj.rid}; "
-                    "processing without encoder disaggregation."
-                )
+            # Nothing to dispatch; the scheduler must not wait for embeddings.
             obj.need_wait_for_mm_inputs = False
             return None
 
@@ -2425,17 +2436,31 @@ class MMReceiverBase(ABC):
                 waiting_req.close_recv_socket()
             local_status.append(waiting_req.status)
 
-        local_status = torch.tensor(local_status, device="cpu", dtype=torch.int32)
-
+        # One MIN all-reduce carries both the statuses and, negated, whether any
+        # rank is still receiving each request's embedding parts.
+        num_waiting = len(self.waiting_list)
+        reduced = torch.tensor(
+            local_status
+            + [int(not req.still_receiving()) for req in self.waiting_list],
+            device="cpu",
+            dtype=torch.int32,
+        )
         torch.distributed.all_reduce(
-            local_status,
+            reduced,
             op=torch.distributed.ReduceOp.MIN,
             group=self.tp_group.cpu_group,
         )
+        local_status = reduced[:num_waiting]
+        receiving = reduced[num_waiting:] == 0
 
+        hold_ready = self._hold_ready_requests(local_status, receiving)
         new_waiting = []
         for i, waiting_req in enumerate(self.waiting_list):
             status_value = local_status[i].item()
+            if status_value == WaitingMMRequestStatus.SUCCESS and hold_ready:
+                waiting_req.held_ticks += 1
+                new_waiting.append(waiting_req)
+                continue
             if status_value == WaitingMMRequestStatus.SUCCESS:
                 new_recv_reqs.append(waiting_req.recv_req)
             elif status_value == WaitingMMRequestStatus.FAIL:
@@ -2473,6 +2498,34 @@ class MMReceiverBase(ABC):
 
         self.waiting_list = new_waiting
         return new_recv_reqs, abort_reqs
+
+    def _hold_ready_requests(
+        self, statuses: torch.Tensor, receiving: torch.Tensor
+    ) -> bool:
+        """Whether to keep ready requests back so batch-mates still receiving prefill with them.
+
+        Embeddings of one encoder batch reach the TP ranks over several ticks, and
+        each partial release would interrupt decode for its own prefill. A request
+        whose parts all arrived but waits for pool space is not waited for: held
+        requests may be what occupies the pool. Decided from TP-reduced values and
+        tick counts only, so every rank agrees.
+        """
+        max_ticks = envs.SGLANG_ENCODER_RECEIVER_COALESCE_TICKS.get()
+        if (
+            max_ticks <= 0
+            or self.scheduler is None
+            or self.scheduler.running_batch.is_empty()
+        ):
+            return False
+        ready = statuses == WaitingMMRequestStatus.SUCCESS
+        if not bool(ready.any()) or not bool(receiving.any()):
+            return False
+        oldest_held = max(
+            req.held_ticks
+            for req, is_ready in zip(self.waiting_list, ready.tolist())
+            if is_ready
+        )
+        return oldest_held < max_ticks
 
     def _run_encode_in_thread(
         self,
@@ -2516,7 +2569,9 @@ class MMReceiverBase(ABC):
         req = Req(
             recv_req.rid,
             recv_req.input_text,
-            recv_req.input_ids,
+            # A request still waiting on its encoder has no input_ids yet; the
+            # abort it is built for must still stream.
+            recv_req.input_ids if recv_req.input_ids is not None else array("q"),
             recv_req.sampling_params,
             return_logprob=recv_req.return_logprob,
             top_logprobs_num=recv_req.top_logprobs_num,
@@ -2674,9 +2729,6 @@ class MMReceiverHTTP(MMReceiverBase):
         server_args: ServerArgs,
         dtype: Optional[torch.dtype] = None,
         hf_config: Optional[PretrainedConfig] = None,
-        pp_rank: Optional[int] = None,
-        tp_rank: Optional[int] = None,
-        tp_group: Optional[GroupCoordinator] = None,
         scheduler: Optional["Scheduler"] = None,
         encode_urls: Optional[List[str]] = None,
     ):
@@ -2684,9 +2736,6 @@ class MMReceiverHTTP(MMReceiverBase):
             server_args,
             dtype=dtype,
             hf_config=hf_config,
-            pp_rank=pp_rank,
-            tp_rank=tp_rank,
-            tp_group=tp_group,
             scheduler=scheduler,
             encode_urls=encode_urls,
         )
@@ -2813,9 +2862,6 @@ class MMReceiverGrpc(MMReceiverBase):
         server_args: ServerArgs,
         dtype: Optional[torch.dtype] = None,
         hf_config: Optional[PretrainedConfig] = None,
-        pp_rank: Optional[int] = None,
-        tp_rank: Optional[int] = None,
-        tp_group: Optional[GroupCoordinator] = None,
         scheduler: Optional["Scheduler"] = None,
         encode_urls: Optional[List[str]] = None,
     ):
@@ -2830,9 +2876,6 @@ class MMReceiverGrpc(MMReceiverBase):
             server_args,
             dtype=dtype,
             hf_config=hf_config,
-            pp_rank=pp_rank,
-            tp_rank=tp_rank,
-            tp_group=tp_group,
             scheduler=scheduler,
             encode_urls=encode_urls,
         )
@@ -2946,9 +2989,6 @@ def create_mm_receiver(
     server_args: ServerArgs,
     dtype: Optional[torch.dtype] = None,
     hf_config: Optional[PretrainedConfig] = None,
-    pp_rank: Optional[int] = None,
-    tp_rank: Optional[int] = None,
-    tp_group: Optional[GroupCoordinator] = None,
     scheduler: Optional["Scheduler"] = None,
     transport_mode: Optional[str] = None,
     encode_urls: Optional[List[str]] = None,
@@ -2967,9 +3007,6 @@ def create_mm_receiver(
         server_args,
         dtype=dtype,
         hf_config=hf_config,
-        pp_rank=pp_rank,
-        tp_rank=tp_rank,
-        tp_group=tp_group,
         scheduler=scheduler,
         encode_urls=encode_urls,
     )

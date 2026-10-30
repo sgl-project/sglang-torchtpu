@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch, sentinel
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
+    _handle_dflash,
     _resolve_dflash_draft_attention_backend,
 )
 from sglang.srt.platforms.interface import SRTPlatform
@@ -108,6 +109,26 @@ class TestOOTDFlashHooks(CustomTestCase):
                 self.assertRaisesRegex(ValueError, error),
             ):
                 self._resolve_backend(None, platform)
+
+    def test_dp_attention_needs_npu_or_a_platform_opt_in(self):
+        for device, opts_in, error in (
+            ("custom", False, "does not support dp attention"),
+            ("custom", True, "requires setting --speculative-draft-model-path"),
+            ("npu", False, "requires setting --speculative-draft-model-path"),
+        ):
+            platform = _platform()
+            platform.supports_speculative_dp_attention.return_value = opts_in
+            args = ServerArgs(
+                model_path="dummy", device=device, speculative_algorithm="DFLASH"
+            )
+            with (
+                self.subTest(device=device, opts_in=opts_in),
+                patch(f"{HOOK_MODULE}.current_platform", platform),
+                patch(f"{HOOK_MODULE}.attn_dp_enabled_of", return_value=True),
+                # The draft-path check right after the gate shows it was passed.
+                self.assertRaisesRegex(ValueError, error),
+            ):
+                _handle_dflash(args)
 
     def test_cache_location_dispatch_tracks_platform_changes(self):
         for expected in (sentinel.first, sentinel.second):

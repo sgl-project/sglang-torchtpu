@@ -15,8 +15,11 @@ name: Nightly Test (TPU - Remote Wheel)
 run-name: "Nightly Test (TPU - Remote Wheel)${{ inputs.update-dashboard && ' [publish]' || '' }}"
 
 on:
-  # Dispatch-only: run it against a candidate wheel before bumping the torch_tpu pin.
-  # A daily run replayed the whole nightly on the nightly slices it shares.
+  schedule:
+    # Mondays at 12:00 UTC (after the 08:00 UTC tpu-sync nightly wheel is on PyPI):
+    # validates the latest tpu-sync-torch pre-release wheel on a weekly cadence.
+    - cron: "0 12 * * 1"
+  # Manual dispatch: run it against a candidate wheel before bumping the torch_tpu or tpu-sync-torch pin.
   workflow_dispatch:
     inputs:
       ref:
@@ -24,12 +27,12 @@ on:
         required: false
         default: main
       wheel:
-        description: "Package specifier from torchtpu registry (default: torch-tpu latest) or URL"
+        description: "Package specifier from PyPI (default: torch_tpu latest) or URL"
         required: false
-        default: "torch-tpu"
+        default: "torch_tpu"
         type: string
       wheel_gcs_url:
-        description: "Optional GCS URL to candidate torch-tpu wheel (e.g. gs://bucket/path/to/torch_tpu-*.whl). Overrides 'wheel'."
+        description: "Optional GCS URL to candidate torch_tpu wheel (e.g. gs://bucket/path/to/torch_tpu-*.whl). Overrides 'wheel'."
         required: false
         default: ""
         type: string
@@ -167,7 +170,7 @@ jobs:
         env:
           CI_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
           BASE_IMAGE: ${{ needs.resolve-baseline.outputs.image }}
-          WHEEL: ${{ inputs.wheel_gcs_url || inputs.wheel || 'torch-tpu' }}
+          WHEEL: ${{ inputs.wheel_gcs_url || inputs.wheel || (github.event_name == 'schedule' && 'tpu-sync-torch') || 'torch_tpu' }}
           INPUT_REF: ${{ inputs.ref || 'main' }}
           TRIGGER_ACTOR: ${{ github.triggering_actor }}
           ORIGIN_ACTOR: ${{ github.actor }}

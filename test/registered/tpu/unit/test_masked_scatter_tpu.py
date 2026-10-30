@@ -16,7 +16,7 @@ Run standalone with
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit", chips=1)
 
 import unittest
 
@@ -31,8 +31,8 @@ class TestMaskedScatterTpu(CustomTestCase):
         try:
             import torch_tpu  # noqa: F401
 
-            from sglang.srt.hardware_backend.tpu import patches
-            from sglang.srt.hardware_backend.tpu.env_override import (
+            from sglang_tpu import patches
+            from sglang_tpu.env_override import (
                 apply_tpu_env_overrides,
             )
 

@@ -1,20 +1,32 @@
 """Unit tests for the TPU pipeline-parallel host-channel hand-off.
 
-CPU only: the device tensors are mocks and torch.distributed is patched.
+CPU only: the device tensors are mocks and torch.distributed is patched, except
+for the two-rank hand-off over a gloo process group.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import maybe_stub_sgl_kernel
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+
+maybe_stub_sgl_kernel()
 
 import unittest
+from collections import defaultdict, deque
+from contextlib import nullcontext
+from datetime import timedelta
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+import torch.distributed
+import torch.multiprocessing
 
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.parallel_state import GroupCoordinator, TensorMetadata
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -187,6 +199,70 @@ class TestRecvTensorDictOnTpu(CustomTestCase):
         to.assert_not_called()
         self.assertIs(irecv.call_args.kwargs["group"], coordinator.cpu_group)
         self.assertEqual(out["hidden_states"].shape, (2,))
+
+
+def _run_wave_column_hand_off(rank: int, init_file: str) -> None:
+    """Rank r is stage r of one device column of a PP2 x TP2 layout with the
+    ICI wave active; its TP pair's other device sits in the other column."""
+    torch.distributed.init_process_group(
+        backend="gloo",
+        init_method=Path(init_file).as_uri(),
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        pp_group = GroupCoordinator.__new__(GroupCoordinator)
+        pp_group.world_size = 2
+        pp_group.rank = pp_group.rank_in_group = rank
+        pp_group.ranks = [0, 1]
+        pp_group.cpu_group = pp_group.device_group = torch.distributed.group.WORLD
+        tp_pair = _coordinator(rank_in_group=0, world_size=2)
+        tp_pair.all_gather = MagicMock(
+            side_effect=AssertionError("the hand-off all-gathered over the TP pair")
+        )
+        scheduler = SchedulerPPMixin()
+        scheduler._pp_wave = object()
+        scheduler.pp_group = pp_group
+        scheduler.attn_tp_group = tp_pair
+        scheduler.pp_comm_stream = None
+        scheduler.pp_comm_stream_ctx = nullcontext()
+        scheduler._pp_tensor_dict_inbox = defaultdict(deque)
+        hidden = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+        tokens = torch.arange(4)
+        with patch.object(parallel_state, "_is_tpu", True):
+            if rank == 0:
+                for tensors, kind in (
+                    ({"hidden_states": hidden}, "proxy"),
+                    ({"next_token_ids": tokens}, "output"),
+                ):
+                    for p2p in scheduler._pp_send_dict_to_next_stage(
+                        tensors, msg_type=kind
+                    ):
+                        p2p.work.wait()
+            else:
+                proxy = scheduler._pp_recv_proxy_tensors()
+                outputs, _ = scheduler._pp_recv_dict_from_prev_stage()
+                if not torch.equal(proxy["hidden_states"], hidden):
+                    raise AssertionError(f"proxy hidden states {proxy.tensors}")
+                if not torch.equal(outputs["next_token_ids"], tokens):
+                    raise AssertionError(f"output dict {outputs}")
+        torch.distributed.barrier()
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+class TestWaveHandOffBetweenTwoRanks(CustomTestCase):
+    def test_stage_of_a_tp_pair_hands_on_whole_dicts(self):
+        """Over the wave, each device sends its column's next-stage device the
+        whole proxy and output dicts; no slice, no all-gather over the TP pair."""
+        with TemporaryDirectory() as directory:
+            torch.multiprocessing.spawn(
+                _run_wave_column_hand_off,
+                args=(str(Path(directory) / "gloo-init"),),
+                nprocs=2,
+                join=True,
+            )
 
 
 if __name__ == "__main__":

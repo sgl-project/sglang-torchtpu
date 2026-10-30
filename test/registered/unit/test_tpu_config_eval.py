@@ -1,10 +1,13 @@
 """Unit tests for Python recipe dictionaries and CLI flag conversion."""
 
+import importlib
 import json
+import os
 import sys
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -14,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
 from benchmark.tpu.launch_server import load_recipe, plan_launch
-from benchmark.tpu.recipe.configs import config_eval
+from benchmark.tpu.recipe.configs import base, config_eval
 from benchmark.tpu.recipe.configs.base import CONFIG as BASE_CONFIG
 from benchmark.tpu.recipe.configs.qwen3_0_6b import CONFIG
 
@@ -25,7 +28,25 @@ class TestTpuConfigEval(unittest.TestCase):
         self.assertEqual(CONFIG["server_args"]["max_running_requests"], 1)
         self.assertEqual(CONFIG["runtime_env"]["TPU_VISIBLE_CHIPS"], "0")
         self.assertNotIn("model_path", BASE_CONFIG["server_args"])
-        self.assertEqual(BASE_CONFIG["runtime_env"], {"SGLANG_PLATFORM": "tpu"})
+        self.assertEqual(list(BASE_CONFIG["runtime_env"]), ["SGLANG_PLATFORM"])
+
+    def test_inherited_platform_reaches_recipe_servers(self):
+        """A mode-B run (SGLANG_PLATFORM=tpu_oot) must launch mode-B servers;
+        the recipe pinned "tpu", which silently ran them in mode A."""
+        env = {k: v for k, v in os.environ.items() if k != "SGLANG_PLATFORM"}
+        try:
+            for inherited, expected in ((None, "tpu"), ("tpu_oot", "tpu_oot")):
+                case = (
+                    env if inherited is None else {**env, "SGLANG_PLATFORM": inherited}
+                )
+                with (
+                    self.subTest(inherited=inherited),
+                    patch.dict(os.environ, case, clear=True),
+                ):
+                    runtime_env = importlib.reload(base).CONFIG["runtime_env"]
+                    self.assertEqual(runtime_env["SGLANG_PLATFORM"], expected)
+        finally:
+            importlib.reload(base)
 
     def test_config_overrides_do_not_modify_shared_defaults(self):
         original = deepcopy(CONFIG)
@@ -80,6 +101,42 @@ class TestTpuConfigEval(unittest.TestCase):
         self.assertEqual(args[:2], ["--quantization", "modelopt_fp8"])
         self.assertEqual(args[2], "--lora-paths")
         self.assertEqual(json.loads(args[3]), {"adapter": "/tmp/adapter"})
+
+
+class TestMultiHostPDEngines(unittest.TestCase):
+    """A P/D engine that spans a slice launches as a multi-node server on each
+    of the slice's hosts, with its role and the Raiden backend."""
+
+    RECIPE = "recipe/configs/kimi_k3/pd.py"
+
+    def test_each_engine_plans_one_rank_of_a_four_host_server(self):
+        import argparse
+
+        from sglang.srt.server_args import ServerArgs
+
+        topology = {"TPU_WORKER_ID": "2", "TPU_WORKER_HOSTNAMES": "h0,h1,h2,h3"}
+        for export, role in (
+            ("PREFILL_CONFIG", "prefill"),
+            ("DECODE_CONFIG", "decode"),
+        ):
+            with self.subTest(engine=export):
+                plan = plan_launch(
+                    load_recipe(f"{self.RECIPE}:{export}"), inherited=topology
+                )
+                args = plan.config.server_args
+                self.assertEqual((args["nnodes"], args["node_rank"]), (4, 2))
+                self.assertEqual(args["dist_init_addr"], "h0:10011")
+                self.assertEqual(args["disaggregation_mode"], role)
+                self.assertEqual(args["disaggregation_transfer_backend"], "raiden")
+                self.assertIsNone(plan.router)
+                argv = plan.command[plan.command.index("sglang.launch_server") + 1 :]
+                parser = argparse.ArgumentParser()
+                ServerArgs.add_cli_args(parser)
+                parser.parse_args(argv)
+
+    def test_a_recipe_without_engines_cannot_be_selected(self):
+        with self.assertRaisesRegex(ValueError, "Select PREFILL_CONFIG"):
+            load_recipe("recipe/configs/kimi_k26/mmmu.py:PREFILL_CONFIG")
 
 
 class TestAccuracyRecipes(unittest.TestCase):
@@ -195,6 +252,80 @@ class TestAccuracyRecipes(unittest.TestCase):
                     )
                     declared.add(script)
         self.assertEqual(declared, set(self.MULTIHOST))
+
+
+class TestWorkloadProfiles(unittest.TestCase):
+    """A profile sizes a workload; it must not restate how a model is served."""
+
+    def test_profiles_set_only_sizing_keys(self):
+        """A stray key here would silently re-serve the model.
+
+        apply_profile() feeds the cookbook generator, so that would publish a
+        different parallelism or backend than the gates validated.
+        """
+        from benchmark.tpu.recipe.configs.profiles import PROFILE_KEYS, PROFILES
+
+        for name, profile in PROFILES.items():
+            with self.subTest(profile=name):
+                self.assertEqual(set(profile["server_args"]) - set(PROFILE_KEYS), set())
+
+    def test_apply_profile_does_not_modify_its_inputs(self):
+        from benchmark.tpu.recipe.configs.profiles import PROFILES, apply_profile
+
+        config = deepcopy(CONFIG)
+        original, profile = deepcopy(config), PROFILES["chat_1k1k"]
+        original_profile = deepcopy(profile)
+        sized = apply_profile(config, profile)
+        self.assertEqual(config, original)
+        self.assertEqual(profile, original_profile)
+        self.assertEqual(sized["server_args"]["max_running_requests"], 64)
+        # The chunk follows the profile's prefill bucket, not the base's.
+        self.assertEqual(
+            sized["server_args"]["chunked_prefill_size"], profile["prefill_tokens"]
+        )
+
+
+class TestRenderedCookbookCommands(unittest.TestCase):
+    """Every generated cookbook command must be one the server accepts.
+
+    The page tells a reader to paste it on a clean host, so a flag the server
+    has since renamed is a bring-up failure nobody sees in CI.
+    """
+
+    PAGES = (
+        "docs/cookbook/autoregressive/OpenAI/GPT-OSS.mdx",
+        "docs/cookbook/autoregressive/Moonshotai/Kimi-K3.mdx",
+    )
+
+    def test_generated_blocks_parse_as_server_args(self):
+        import argparse
+
+        from sglang.srt.server_args import ServerArgs
+
+        sys.path.insert(0, str(ROOT / "scripts/ci/tpu"))
+        import render_recipe
+
+        for page in self.PAGES:
+            text = (ROOT / page).read_text()
+            markers = list(render_recipe.MARKER.finditer(text))
+            self.assertTrue(markers, page)
+            for match in markers:
+                attrs = render_recipe.parse_attrs(match.group("attrs"))
+                with self.subTest(page=page, **attrs):
+                    block = render_recipe.render(attrs["config"], attrs["profile"])
+                    argv = []
+                    for line in block.splitlines():
+                        line = line.strip().removesuffix(" \\")
+                        if line.startswith("--"):
+                            argv.extend(line.split())
+                    parser = argparse.ArgumentParser()
+                    ServerArgs.add_cli_args(parser)
+                    try:
+                        parser.parse_args(argv)
+                    except SystemExit as exit_code:
+                        self.fail(
+                            f"{page}: server rejects its own command ({exit_code})"
+                        )
 
 
 if __name__ == "__main__":
