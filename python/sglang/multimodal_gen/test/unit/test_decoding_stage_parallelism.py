@@ -254,23 +254,26 @@ class TestDecodeUsesEveryRank(unittest.TestCase):
             )
 
         cases = (
-            (False, vae("auto", True), True),
-            (False, vae("auto", False), False),
-            (False, vae("spatial_shard", False), True),
-            (False, vae("tiled", False), True),
-            (True, vae("auto", False), True),
+            (False, vae("auto", True), 2, True),
+            (False, vae("auto", True), 32, False),
+            (False, vae("auto", False), 2, False),
+            (False, vae("spatial_shard", False), 2, True),
+            (False, vae("tiled", False), 2, True),
+            (True, vae("auto", False), 32, True),
         )
-        for p2p, stub, expected in cases:
+        for p2p, stub, world_size, expected in cases:
             platform = SimpleNamespace(supports_distributed_p2p=lambda p2p=p2p: p2p)
             with (
-                self.subTest(p2p=p2p, mode=stub.parallel_decode_mode),
+                self.subTest(
+                    p2p=p2p, mode=stub.parallel_decode_mode, world_size=world_size
+                ),
                 # The policy helper lives with the VAE config policy.
                 patch.object(vae_base, "current_platform", platform),
                 patch.object(
                     decoding, "model_parallel_is_initialized", return_value=True
                 ),
                 patch.object(
-                    decoding, "get_decode_parallel_world_size", return_value=2
+                    decoding, "get_decode_parallel_world_size", return_value=world_size
                 ),
             ):
                 self.assertEqual(decoding.decode_uses_every_rank(stub), expected)

@@ -41,13 +41,23 @@ def _should_use_auto_spatial_shard_parallel_decode(
     return latent_elements_per_rank >= min_latent_elements_per_rank
 
 
-def auto_mode_may_shard_on_this_platform(shards_without_p2p: bool) -> bool:
+# All-gathered halo traffic grows with the decode group; measured up to two
+# tpu7x hosts (16 ranks).
+MAX_NO_P2P_AUTO_DECODE_RANKS = 16
+
+
+def auto_mode_may_shard_on_this_platform(
+    shards_without_p2p: bool, world_size: int
+) -> bool:
     """The no-p2p policy of auto mode, shared by decode and stage planning.
 
     Without p2p the conv halos travel by all-gather, which pays off only for
-    VAEs that opt in (``auto_parallel_decode_shards_without_p2p``).
+    VAEs that opt in (``auto_parallel_decode_shards_without_p2p``), and only up
+    to ``MAX_NO_P2P_AUTO_DECODE_RANKS`` ranks.
     """
-    return current_platform.supports_distributed_p2p() or shards_without_p2p
+    return current_platform.supports_distributed_p2p() or (
+        shards_without_p2p and world_size <= MAX_NO_P2P_AUTO_DECODE_RANKS
+    )
 
 
 def should_use_spatial_shard_parallel_decode(
@@ -66,7 +76,7 @@ def should_use_spatial_shard_parallel_decode(
         return False
 
     if not auto_mode_may_shard_on_this_platform(
-        config.auto_parallel_decode_shards_without_p2p()
+        config.auto_parallel_decode_shards_without_p2p(), world_size
     ):
         return False
 
