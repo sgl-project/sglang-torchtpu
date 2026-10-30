@@ -72,6 +72,16 @@ def refresh_qt(
         qkey_ref[1] = q_idx
 
 
+def skip_group_tokens(cfgs: configs.RpaConfigs) -> int:
+    """Query tokens per partial-block loop iteration: the configured group rounded down
+    to whole compute blocks, and to a divisor of the q block (the whole block if none)."""
+    per = max(1, cfgs.serve.skip_pad_q_group // cfgs.bq_c_sz)
+    n_blocks = cfgs.bq_sz // cfgs.bq_c_sz
+    while n_blocks % per:
+        per -= 1
+    return per * cfgs.bq_c_sz
+
+
 def tile(
     step: jax.Array,
     k: jax.Array,  # [1, KV, aligned_kv_head_dim, bkv] fp8
@@ -143,11 +153,11 @@ def tile(
             schedule_ref.is_last_k[step, 0], -jnp.inf, m_new
         )
 
-    # Partial q blocks: groups of compute blocks covering 128 tokens.
-    per_group = max(1, 128 // cfgs.bq_c_sz)
-    n_groups = cfgs.bq_sz // (per_group * cfgs.bq_c_sz)
-    grouped = q_rows is not None and cfgs.bq_sz % (per_group * cfgs.bq_c_sz) == 0
-    group_tokens = per_group * cfgs.bq_c_sz
+    # Partial q blocks: groups of compute blocks covering skip_group_tokens tokens.
+    group_tokens = skip_group_tokens(cfgs)
+    per_group = group_tokens // cfgs.bq_c_sz
+    n_groups = cfgs.bq_sz // group_tokens
+    grouped = q_rows is not None and n_groups > 1
     group_lanes = group_tokens * heads
 
     for kv_head in range(cfgs.model.num_kv_heads):

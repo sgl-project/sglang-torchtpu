@@ -454,7 +454,8 @@ def rpa_body(
             s_idx = jnp.maximum(0, schedule_ref.s_idx[step, 0])
             q_len = cu_q_lens_ref[s_idx + 1] - cu_q_lens_ref[s_idx]
             q_rows = q_len - schedule_ref.q_idx[step, 0] * cfgs.bq_sz
-            partial_q = q_rows < cfgs.bq_sz
+            # Only when a whole loop group is skippable: the loop costs more per row.
+            partial_q = q_rows <= cfgs.bq_sz - transposed.skip_group_tokens(cfgs)
             run_full_q = run_tile
 
             def run_tile(apply_mask):

@@ -221,6 +221,8 @@ class TpuEnvs:
     # Transposed prefill tiles skip the compute blocks past the last query of a
     # partial q block (a sequence's last) instead of scoring padded rows. Exact.
     SGLANG_TPU_RPA_SKIP_PAD_Q = EnvBool(False)
+    # Query tokens per iteration of that skip's loop (fewer, longer iterations overlap better).
+    SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP = EnvInt(128)
     # "bq:bkv": batched-RPA prefill q / k block sizes for full-attention layers and
     # for sliding-window layers, instead of the VMEM search's; unset keeps the search.
     SGLANG_TPU_RPA_PREFILL_BLOCKS = EnvStr(None)

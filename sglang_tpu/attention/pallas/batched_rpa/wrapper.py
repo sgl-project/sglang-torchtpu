@@ -744,6 +744,7 @@ def ragged_paged_attention(
             and cp_group_size is None
         ),
         skip_pad_q=tpu_envs.SGLANG_TPU_RPA_SKIP_PAD_Q.get(),
+        skip_pad_q_group=tpu_envs.SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP.get(),
         out_head_norm_eps=tpu_envs.SGLANG_TPU_RPA_OUT_HEAD_NORM_EPS.get(),
     )
 

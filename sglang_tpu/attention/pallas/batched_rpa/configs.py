@@ -102,6 +102,8 @@ class ServingConfigs:
     # Transposed tiles skip the compute blocks past a partial q block's last
     # query (a sequence's last block) instead of scoring padded rows; exact.
     skip_pad_q: bool = False
+    # Query tokens per group of the partial-block loop (a multiple of bq_c_sz).
+    skip_pad_q_group: int = 128
     # Per-head RMS norm of the output rows (weightless, this eps), applied to the
     # output-dtype values as a model's following norm would (Muse Spark).
     out_head_norm_eps: float | None = None
