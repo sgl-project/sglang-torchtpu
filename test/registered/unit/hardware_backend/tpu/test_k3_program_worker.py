@@ -310,6 +310,34 @@ class TestRegisteredAlgorithm(CustomTestCase):
         self.assertIsNone(spec.accept_lens_device)
         worker.register()  # idempotent
 
+    def test_overlap_relays_through_the_future_map(self):
+        published, stashed = [], []
+        future_map = SimpleNamespace(
+            publish=lambda i, lens: published.append((i.tolist(), lens.tolist())),
+            stash=lambda i, payload: stashed.append(payload.bonus_tokens.tolist()),
+        )
+        batch = SimpleNamespace(
+            enable_overlap=True,
+            req_pool_indices=torch.tensor([3, 5]),
+            seq_lens=torch.tensor([100, 200]),
+        )
+        spec = self.algo.build_disagg_draft_input(
+            batch, torch.tensor([7, 8]), future_map
+        )
+        self.assertEqual(spec.future_indices.tolist(), [3, 5])
+        self.assertEqual(published, [([3, 5], [100, 200])])
+        self.assertEqual(stashed, [[7, 8]])
+        # The indices follow the batch's requests.
+        other = worker.K3ProgramInput()
+        other.future_indices = torch.tensor([9])
+        spec.merge_batch(other)
+        self.assertEqual(spec.future_indices.tolist(), [3, 5, 9])
+        spec.filter_batch(torch.tensor([0, 2]))
+        self.assertEqual(spec.future_indices.tolist(), [3, 9])
+        synchronous = worker.K3ProgramInput()
+        synchronous.merge_batch(worker.K3ProgramInput())
+        self.assertIsNone(synchronous.future_indices)
+
     def test_overlap_on_the_decoding_roles(self):
         with tpu_envs.SGLANG_TPU_K3_PROGRAM_OPT_OVERLAP.override(True):
             for role, overlapped in (

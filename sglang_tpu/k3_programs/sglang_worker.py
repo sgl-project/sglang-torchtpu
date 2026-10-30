@@ -82,10 +82,17 @@ class K3ProgramInput(SpecInput):
         super().__init__(SpecInputType.NGRAM_VERIFY)
 
     def filter_batch(self, new_indices, new_indices_cpu=None) -> None:
-        pass
+        # Overlap scheduling reads the batch's lengths through its future
+        # indices, which follow the batch's requests.
+        if self.future_indices is not None:
+            self.future_indices = self.future_indices[new_indices]
 
     def merge_batch(self, spec_info: K3ProgramInput) -> None:
-        pass
+        if self.future_indices is None or spec_info.future_indices is None:
+            if self.future_indices is None:
+                self.future_indices = spec_info.future_indices
+            return
+        self.future_indices = torch.cat([self.future_indices, spec_info.future_indices])
 
 
 class K3ProgramAlgo(CustomSpecAlgo):
@@ -149,8 +156,18 @@ class K3ProgramAlgo(CustomSpecAlgo):
 
     def build_disagg_draft_input(self, batch, last_tokens_tensor, future_map):
         # A request the P/D transfer delivered: the program takes its first
-        # token from the host on its first step.
-        return K3ProgramInput()
+        # token from the host on its first step. Under overlap scheduling the
+        # future map carries the batch's lengths and last tokens (as for
+        # DSpark's disaggregated decode).
+        spec = K3ProgramInput()
+        spec.bonus_tokens = last_tokens_tensor
+        if getattr(batch, "enable_overlap", False):
+            from sglang.srt.managers.overlap_utils import RelayPayload
+
+            spec.future_indices = batch.req_pool_indices
+            future_map.publish(spec.future_indices, batch.seq_lens)
+            future_map.stash(spec.future_indices, RelayPayload.from_draft_input(spec))
+        return spec
 
 
 class _Prompts:
