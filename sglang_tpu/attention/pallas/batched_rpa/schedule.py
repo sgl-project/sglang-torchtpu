@@ -110,6 +110,9 @@ class HeadAlongSublaneDmaNew(DmaNew):
     fetch_hbm = FieldOffset(1)
     fetch_vmem = FieldOffset(2)
     wb_vmem = FieldOffset(2)
+    # fetch size in the low 16 bits, writeback size in the high 16 (a page is
+    # at most 2**16 tokens). They differ under context parallelism, where a
+    # rank fetches every new token but writes back only its own pages.
     _flags = FieldOffset(3)
 
     @staticmethod
@@ -118,14 +121,14 @@ class HeadAlongSublaneDmaNew(DmaNew):
 
     @property
     def fetch_val(self):
-        return self._flags[...]
+        return self._flags[...] & 0xFFFF
 
     @property
     def wb_val(self):
-        return self._flags[...]
+        return self._flags[...] >> 16
 
     def set_flags(self, fetch_val, wb_val):
-        self._flags[...] = fetch_val
+        self._flags[...] = fetch_val | (wb_val << 16)
 
 
 @jax.tree_util.register_dataclass
@@ -588,11 +591,17 @@ def compute_metadata(
         else:
             kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
         p_offset = s_idx * cfgs.serve.pages_per_seq + kv_p_start
+        # NEW_TOKENS_ONLY keeps the cached keys' VMEM slots (so the new tokens
+        # sit at their global offsets and the page-aligned writeback below
+        # applies) but fetches none of them; the kernel masks them out.
+        skip_cached = cfgs.serve.attention_scope.skips_cached_keys
 
         for i in range(cfgs.bkv_p_cache):
             dst_vmem = i << cfgs.serve.page_size_log2
             dma_sz = kv_left_frm_cache - dst_vmem
             dma_sz = jnp.clip(dma_sz, 0, cfgs.serve.page_size)
+            if skip_cached:
+                dma_sz = 0
 
             src_hbm = jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
 
@@ -656,20 +665,38 @@ def compute_metadata(
                 dma_entry.wb_vmem[...] = slot_start
                 dma_entry.set_flags(fetch_val, wb_val)
             else:
-                p_idx = jnp.minimum(
-                    (kv_len_start + dst_vmem) >> cfgs.serve.page_size_log2,
-                    cfgs.serve.pages_per_seq - 1,
-                )
-                p_off = (kv_len_start + dst_vmem) & cfgs.serve.page_size_mask
+                tok_idx = kv_len_start + dst_vmem
+                p_off = tok_idx & cfgs.serve.page_size_mask
+                if skip_cached and cfgs.serve.cp_group_size is not None:
+                    # Page-striped cache: global page g lives in local slot
+                    # g // cp of rank g % cp. Only the owner writes, and only
+                    # for multi-token rows (a single new token is written by
+                    # the STRIPED launch that also attends it).
+                    cp_size = cfgs.serve.cp_group_size
+                    rank = cp_rank_ref[0] if cp_rank_ref is not None else 0
+                    p_idx = jnp.minimum(
+                        tok_idx >> cfgs.serve.page_size_log2,
+                        cfgs.serve.pages_per_seq * cp_size - 1,
+                    )
+                    local_slot = p_idx // cp_size
+                    wb_sz = jnp.where(
+                        (p_idx % cp_size == rank) & (q_len > 1), dma_sz, 0
+                    )
+                else:
+                    local_slot = jnp.minimum(
+                        tok_idx >> cfgs.serve.page_size_log2,
+                        cfgs.serve.pages_per_seq - 1,
+                    )
+                    wb_sz = dma_sz
                 dst_hbm = (
-                    (s_idx * cfgs.serve.pages_per_seq + p_idx)
+                    (s_idx * cfgs.serve.pages_per_seq + local_slot)
                     << cfgs.serve.page_size_log2
                 ) | p_off
 
                 dma_entry.fetch_hbm[...] = src_hbm
                 dma_entry.fetch_vmem[...] = dst_vmem
                 dma_entry.wb_hbm[...] = dst_hbm
-                dma_entry.set_flags(dma_sz, dma_sz)
+                dma_entry.set_flags(dma_sz, wb_sz)
 
         if cfgs.block.bq_sz == 1:
             # Decode path
@@ -720,7 +747,10 @@ def compute_metadata(
 
         start_k_idx = 0
         if (sliding_window := cfgs.model.sliding_window) is not None:
-            if q_global_start is not None:
+            if (
+                q_global_start is not None
+                and cfgs.serve.attention_scope.walks_cache_stripe
+            ):
                 # First local key inside the window of the block's first query.
                 # The cache is page-striped: local page l of this rank is
                 # global page l * cp_group_size + cp_rank, so the first local
@@ -745,6 +775,10 @@ def compute_metadata(
             else:
                 sw_start_idx = k_len - q_len + q_idx * cfgs.bq_sz - sliding_window + 1
                 start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
+        if cfgs.serve.attention_scope.skips_cached_keys:
+            # Cached keys are not attended: start at the block holding the
+            # first new token.
+            start_k_idx = jnp.maximum(start_k_idx, (k_len - q_len) // cfgs.bkv_sz)
 
         if cfgs.serve.cache_only or cfgs.serve.attention_scope.walks_cache_stripe:
             # No causal bound. One k block always runs, so a q block with no key
@@ -755,6 +789,14 @@ def compute_metadata(
                 k_len - q_len + q_idx * cfgs.bq_sz + q_sz_task - 1
             ) // cfgs.bkv_sz + 1
             end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
+            if (
+                cfgs.serve.attention_scope.skips_cached_keys
+                and cfgs.serve.cp_group_size is not None
+            ):
+                # A single-token row is the STRIPED launch's (attended and
+                # written there); leave it unprocessed here: output untouched,
+                # LSE -inf.
+                end_k_idx = jnp.where(q_len == 1, start_k_idx, end_k_idx)
 
         k_loop_fn = functools.partial(
             k_loop,
@@ -797,7 +839,9 @@ def compute_metadata(
 
         return jax.lax.fori_loop(0, num_q, q_loop_fn, carry)
 
-    start_seq_idx, end_seq_idx = cfgs.mode.get_range(distribution_ref)
+    start_seq_idx, end_seq_idx = cfgs.mode.get_range(
+        distribution_ref, tail_decode=cfgs.serve.tail_decode
+    )
     init_carry = LoopCarry(0, 0)
     return jax.lax.fori_loop(start_seq_idx, end_seq_idx, seq_loop, init_carry)
 

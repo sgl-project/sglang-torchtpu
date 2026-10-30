@@ -28,7 +28,7 @@ from sglang_tpu.attention_pallas_rpa_dcp import (
 register_tpu_ci(est_time=60, suite="stage-a-test-tpu-unit", chips=1)
 
 # The op's arguments, in order. build_dcp_kernel_op passes the JAX wrapper
-# static_argnums=(11, ..., 19), which are exactly the nine entries after
+# static_argnums=(11, ..., 21), which are exactly the eleven entries after
 # attention_sink here.
 ARG_NAMES = (
     "queries",
@@ -51,6 +51,8 @@ ARG_NAMES = (
     "skip_kv_write",
     "cp_group_size",
     "attention_scope",
+    "rpa_cases",
+    "tail_decode",
 )
 NUM_TRACED_TENSORS = 10
 STATIC_FLAGS = (
@@ -63,6 +65,8 @@ STATIC_FLAGS = (
     "skip_kv_write",
     "cp_group_size",
     "attention_scope",
+    "rpa_cases",
+    "tail_decode",
 )
 FIRST_STATIC_ARGNUM = 11
 

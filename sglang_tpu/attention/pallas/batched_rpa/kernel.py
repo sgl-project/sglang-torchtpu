@@ -242,8 +242,14 @@ def rpa_body(
     processed_q_len = []
     processed_kv_len = []
     kv_len_left = [] if (cfgs.serve.cache_only or cfgs.serve.attention_scope.walks_cache_stripe) else None
+    # NEW_TOKENS_ONLY: keys before this per-block bound are cached and masked.
+    kv_new_start_left = [] if cfgs.serve.attention_scope.skips_cached_keys else None
     global_q_k_gap = None
-    if cfgs.serve.cp_group_size is not None and cfgs.model.sliding_window is not None:
+    if (
+        cfgs.serve.cp_group_size is not None
+        and cfgs.model.sliding_window is not None
+        and cfgs.serve.attention_scope.walks_cache_stripe
+    ):
         global_q_k_gap = []
     # Lists to hold the 2 variables needed for stitching
     bkv_sz_frm_cache_list = []
@@ -274,6 +280,8 @@ def rpa_body(
         processed_kv_len.append(k_id)
         if kv_len_left is not None:
             kv_len_left.append(kv_len - k_id)
+        if kv_new_start_left is not None:
+            kv_new_start_left.append(kv_len - q_len - k_id)
         if global_q_k_gap is not None:
             kv_len_global = jnp.where(is_valid, kv_lens_global_ref[safe_s_idx], 0)
             q_global = kv_len_global - q_len + q_idx * cfgs.bq_sz
@@ -438,6 +446,7 @@ def rpa_body(
                 bq_start=bq_start,
                 kv_len_left=kv_len_left,
                 global_q_k_gap=global_q_k_gap,
+                kv_new_start_left=kv_new_start_left,
             )
         )
         m_scratch_ref[:, q_slice] = m_next
@@ -581,12 +590,16 @@ def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
         name += "-co"
     elif cfgs.serve.attention_scope == configs.AttentionScope.STRIPED:
         name += "-striped"
+    elif cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
+        name += "-new"
     if cfgs.serve.skip_kv_write:
         name += "-nowb"
     if cfgs.serve.return_lse:
         name += "-lse"
     if cfgs.serve.cp_group_size is not None:
         name += f"-cp{cfgs.serve.cp_group_size}"
+    if cfgs.serve.tail_decode:
+        name += "-td"
     return name
 
 

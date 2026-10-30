@@ -57,7 +57,17 @@ class AttentionScope(enum.StrEnum):
 
     FULL:            attend all positions (default).
     CACHE_ONLY:      attend only cached tokens, skip new tokens.
-    NEW_TOKENS_ONLY: attend only new tokens, skip cached tokens.
+    NEW_TOKENS_ONLY: attend only new tokens, skip cached tokens. The KV index
+                     space is the sequence's global positions (``kv_lens`` is
+                     the full length, the last ``q_len`` of it new), the cached
+                     pages are neither fetched nor attended, and the new
+                     tokens are written back as in FULL. With
+                     ``cp_group_size`` the cache is page-striped, so the
+                     write of each new token goes to its owner rank's stripe
+                     slot (``page // cp`` on rank ``page % cp``) and only the
+                     owner issues it; a single-token row is left unprocessed
+                     (output untouched, LSE -inf), its token being the
+                     STRIPED launch's to attend and write.
     STRIPED:         decode under decode context parallelism in one launch:
                      attend this rank's page stripe of the cache plus the
                      sequence's new token when this rank owns its page. The
@@ -78,6 +88,11 @@ class AttentionScope(enum.StrEnum):
     def walks_cache_stripe(self) -> bool:
         """Whether the KV index space of this call is one rank's page stripe."""
         return self in (AttentionScope.CACHE_ONLY, AttentionScope.STRIPED)
+
+    @property
+    def skips_cached_keys(self) -> bool:
+        """Whether cached keys are left unfetched and masked out."""
+        return self == AttentionScope.NEW_TOKENS_ONLY
 
 
 class KVLayout(enum.StrEnum):
@@ -115,6 +130,11 @@ class ServingConfigs:
     return_lse: bool = False
     cp_group_size: int | None = None
     attention_scope: AttentionScope = AttentionScope.FULL
+    # ``distribution`` read back to front: MIXED sequences first,
+    # ``[0, distribution[0])``, PREFILL next and DECODE last,
+    # ``[distribution[1], distribution[2])``. For batches that append their
+    # decode rows after the prefill rows (SGLang's mixed batches).
+    tail_decode: bool = False
 
     def __post_init__(self):
         if self.cache_only and self.attention_scope == AttentionScope.FULL:
@@ -164,9 +184,17 @@ class RpaCase(enum.StrEnum):
         }[self]
 
     def get_range(
-        self, distribution: jax.Array
+        self, distribution: jax.Array, tail_decode: bool = False
     ) -> tuple[jax.typing.ArrayLike, jax.typing.ArrayLike]:
         assert distribution.shape == (3,)
+        if tail_decode:
+            match self:
+                case RpaCase.MIXED:
+                    return 0, distribution[0]
+                case RpaCase.PREFILL:
+                    return distribution[0], distribution[1]
+                case RpaCase.DECODE:
+                    return distribution[1], distribution[2]
         match self:
             case RpaCase.DECODE:
                 return 0, distribution[0]
@@ -542,6 +570,13 @@ class RpaConfigs:
             # SEQ_ALONG_LANE fetches whole pages, so the stale tail of a shard's
             # last page would reach p * v unmasked.
             raise NotImplementedError("cache_only requires HEAD_ALONG_SUBLANE.")
+        if (
+            self.serve.attention_scope.skips_cached_keys
+            and self.serve.kv_layout != KVLayout.HEAD_ALONG_SUBLANE
+        ):
+            # SEQ_ALONG_LANE writes whole pages, so the unfetched cached head
+            # of a page the new tokens share would be written back stale.
+            raise NotImplementedError("NEW_TOKENS_ONLY requires HEAD_ALONG_SUBLANE.")
         num_lanes = pltpu.get_tpu_info().num_lanes
         if self.serve.return_lse and self.aligned_num_q_heads_per_kv_head > num_lanes:
             raise ValueError(

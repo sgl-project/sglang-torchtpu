@@ -298,13 +298,21 @@ class TestPallasRpaDcpMetadataExtend(CustomTestCase):
         )
         return _build_meta(backend, self.fb, self.DCP, rank)
 
-    def test_kv_lens_cover_prefix_plus_chunk(self):
+    def test_kv_lens_are_the_striped_pass_lengths(self):
+        # The STRIPED prefix pass walks the cached prefix of a multi-token row
+        # and, for a single-token row, the whole sequence (its token included
+        # on the owner): the chunk pass writes the multi-token rows' tokens.
         for rank in range(self.DCP):
             with self.subTest(rank=rank):
                 meta = self._meta(rank)
-                expected = _local_lens(self.SEQ_LENS, self.DCP, rank)
+                lengths = [
+                    s if e == 1 else s - e
+                    for s, e in zip(self.SEQ_LENS, self.EXTEND_SEQ_LENS)
+                ]
+                expected = _local_lens(lengths, self.DCP, rank)
                 self.assertTrue(
-                    torch.equal(meta.kv_lens.to(torch.int32), expected.to(torch.int32))
+                    torch.equal(meta.kv_lens.to(torch.int32), expected.to(torch.int32)),
+                    f"{meta.kv_lens.tolist()} != {expected.tolist()}",
                 )
 
     def test_prefix_kv_lens_exclude_this_steps_tokens(self):
@@ -337,12 +345,78 @@ class TestPallasRpaDcpMetadataExtend(CustomTestCase):
             total = meta.dcp_prefix_kv_lens.to(torch.int64) + torch.tensor(
                 chunk_local, dtype=torch.int64
             )
-            self.assertTrue(torch.equal(total, meta.kv_lens.to(torch.int64)))
+            expected = _local_lens(self.SEQ_LENS, self.DCP, rank).to(torch.int64)
+            self.assertTrue(torch.equal(total, expected))
 
     def test_cu_q_lens_is_the_unsharded_cumsum(self):
         meta = self._meta(1)
         expected = torch.tensor([0, 7, 12, 19, 20], dtype=torch.int32)
         self.assertTrue(torch.equal(meta.cu_q_lens.to(torch.int32), expected))
+
+    def test_extend_distribution_is_the_chunk_range_only(self):
+        # Pure extend keeps the batched layout [0, 0, n]: every row, the
+        # one-token row included, runs on the chunk tile.
+        meta = self._meta(0)
+        self.assertEqual(meta.distribution.tolist(), [0, 0, len(self.SEQ_LENS)])
+
+
+@_requires_dcp_helpers
+class TestPallasRpaDcpMetadataMixed(CustomTestCase):
+    """Mixed batches under dcp=2: SGLang lists the prefill rows first and the
+    running (decode) rows last, so the metadata hands the kernel a
+    back-to-front ``distribution`` (``tail_decode``): the chunk rows are
+    ``[0, n_chunk)`` and the trailing single-token run ``[n_chunk, n)``."""
+
+    PAGE_SIZE = 16
+    DCP = 2
+    PAGES_PER_SEQ = 8
+    MAX_CONTEXT_LEN = PAGE_SIZE * DCP * PAGES_PER_SEQ  # 256
+    # Two prefill chunks (one with a single new token, which still belongs to
+    # the chunk range), then three decode rows.
+    SEQ_LENS = [40, 31, 9, 70, 33]
+    EXTEND_SEQ_LENS = [7, 1, 9, 1, 1]
+
+    def setUp(self):
+        self.req_to_token = _build_req_to_token(8, self.MAX_CONTEXT_LEN + 32)
+        self.req_pool_indices = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int64)
+        self.fb = _make_forward_batch(
+            seq_lens=torch.tensor(self.SEQ_LENS, dtype=torch.int32),
+            req_pool_indices=self.req_pool_indices,
+            forward_mode=ForwardMode.MIXED,
+            extend_seq_lens=torch.tensor(self.EXTEND_SEQ_LENS, dtype=torch.int32),
+        )
+
+    def _meta(self, rank: int) -> PallasForwardMetadata:
+        backend = _DcpBackendUnderTest(
+            self.PAGE_SIZE,
+            self.req_to_token,
+            self.DCP,
+            rank,
+            max_context_len=self.MAX_CONTEXT_LEN,
+        )
+        return _build_meta(backend, self.fb, self.DCP, rank)
+
+    def test_distribution_is_read_back_to_front(self):
+        meta = self._meta(0)
+        self.assertEqual(meta.distribution.tolist(), [3, 3, 5])
+
+    def test_kv_lens_are_the_striped_pass_lengths(self):
+        for rank in range(self.DCP):
+            with self.subTest(rank=rank):
+                meta = self._meta(rank)
+                lengths = [
+                    s if e == 1 else s - e
+                    for s, e in zip(self.SEQ_LENS, self.EXTEND_SEQ_LENS)
+                ]
+                expected = _local_lens(lengths, self.DCP, rank)
+                self.assertTrue(
+                    torch.equal(meta.kv_lens.to(torch.int32), expected.to(torch.int32)),
+                    f"{meta.kv_lens.tolist()} != {expected.tolist()}",
+                )
+
+    def test_global_kv_lens_are_the_full_lengths(self):
+        meta = self._meta(1)
+        self.assertEqual(meta.dcp_kv_lens_global.tolist(), self.SEQ_LENS)
 
     def test_global_kv_lens_field_is_the_unsharded_length(self):
         meta = self._meta(1)

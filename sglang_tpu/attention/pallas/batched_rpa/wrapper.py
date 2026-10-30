@@ -543,6 +543,7 @@ def calculate_block_sizes(
         "cp_group_size",
         "attention_scope",
         "rpa_cases",
+        "tail_decode",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
@@ -582,6 +583,7 @@ def ragged_paged_attention(
     kv_lens_global: jax.Array | None = None,
     attention_scope: configs.AttentionScope | int = configs.AttentionScope.FULL,
     rpa_cases: tuple[configs.RpaCase, ...] | configs.RpaCase | None = None,
+    tail_decode: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -634,13 +636,23 @@ def ragged_paged_attention(
             natural log, float32, with exp(sink) in the sum when attention_sink
             is given; -inf for a row that attended no key and has no sink.
         cp_group_size: Size of a decode-context-parallel group whose ranks each
-            hold the positions p with p % cp_group_size == cp_rank, local key j
-            being global position j * cp_group_size + cp_rank. The sliding
-            window then runs in global positions. Requires cache_only.
+            hold the pages p with p % cp_group_size == cp_rank, local page j
+            being global page j * cp_group_size + cp_rank. The sliding window
+            then runs in global positions. Requires a non-FULL attention_scope.
         cp_rank: [1] int32. This rank's index in the group, traced so that one
             program serves every rank.
         kv_lens_global: [max_num_seqs] int32. Global kv length of each sequence;
             its queries sit at global positions kv_lens_global[s] - q_len onward.
+        attention_scope: Which keys the call attends; see
+            ``configs.AttentionScope``. NEW_TOKENS_ONLY with cp_group_size
+            writes each multi-token sequence's new tokens into the owner
+            rank's stripe slots (``kv_lens`` and ``page_indices`` being the
+            global lengths and this rank's stripe table).
+        rpa_cases: Which of the DECODE / MIXED launches to run (both when
+            None); a case whose ``distribution`` range is empty can be skipped.
+        tail_decode: Read ``distribution`` back to front: the MIXED sequences
+            are ``[0, distribution[0])`` and the DECODE ones
+            ``[distribution[1], distribution[2])``.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -720,6 +732,7 @@ def ragged_paged_attention(
         return_lse=return_lse,
         cp_group_size=cp_group_size,
         attention_scope=attention_scope,
+        tail_decode=tail_decode,
     )
 
     q_hbm, new_kv_hbm = prepare_inputs(

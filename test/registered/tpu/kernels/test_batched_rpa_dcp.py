@@ -847,6 +847,217 @@ class TestBatchedRpaDcpMixedPrefillAndDecode(_CloseAssertions):
 
 
 @unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
+class TestBatchedRpaDcpStripedChunkWrite(_CloseAssertions):
+    """The backend's extend path: no KV write outside the kernel.
+
+    The chunk pass (NEW_TOKENS_ONLY with cp_group_size, global kv_lens, this
+    rank's stripe page table) attends each multi-token row's chunk causally
+    and writes the chunk's owned pages into the stripe itself; a single-token
+    row is left to the STRIPED prefix pass, which attends and writes it. The
+    batch is laid out as SGLang's mixed batches are -- chunk rows first, the
+    decode rows last -- and read back to front (``tail_decode``), so the
+    trailing single-token rows take the decode tile. A single-token row inside
+    the chunk range (a one-token extend) goes the same way on the chunk tile.
+    """
+
+    # (prefix, chunk). Chunk starts mid-page on rank 0 (200), mid-page on
+    # rank 1 spanning three pages of alternating owners (300 + 600), without
+    # a prefix (0 + 127), page-aligned (512 + 128); a one-token extend (51 +
+    # 1) sits inside the chunk range; the two trailing rows are decode rows.
+    SEQS = (
+        (200, 63),
+        (51, 1),
+        (300, 600),
+        (0, 127),
+        (512, 128),
+        (257, 1),
+        (1025, 1),
+    )
+    NUM_CHUNK_ROWS = 5
+    MAX_NUM_TOKENS = 1024
+
+    def _data(self, geo: Geometry):
+        rng = np.random.default_rng(4242 + geo.cp)
+        kv_shape = (geo.num_kv_heads, HEAD_DIM)
+        prefix_k = [_random(rng, (p, *kv_shape)) for p, _ in self.SEQS]
+        prefix_v = [_random(rng, (p, *kv_shape)) for p, _ in self.SEQS]
+        chunk_k = [_random(rng, (c, *kv_shape)) for _, c in self.SEQS]
+        chunk_v = [_random(rng, (c, *kv_shape)) for _, c in self.SEQS]
+        queries = _random(rng, (self.MAX_NUM_TOKENS, geo.num_q_heads, HEAD_DIM))
+        return prefix_k, prefix_v, chunk_k, chunk_v, queries
+
+    def _new_kv(self, geo: Geometry, chunk_k, chunk_v):
+        cu_q_lens = np.concatenate([[0], np.cumsum([c for _, c in self.SEQS])])
+        new_k = np.zeros((self.MAX_NUM_TOKENS, geo.num_kv_heads, HEAD_DIM), np.float32)
+        new_v = np.zeros_like(new_k)
+        for s, (_, c) in enumerate(self.SEQS):
+            new_k[cu_q_lens[s] : cu_q_lens[s] + c] = chunk_k[s]
+            new_v[cu_q_lens[s] : cu_q_lens[s] + c] = chunk_v[s]
+        return cu_q_lens, new_k, new_v
+
+    def _shard(self, geo: Geometry, rank: int, pages, prefix_k, prefix_v,
+               chunk_k, chunk_v, written):
+        """This rank's stripe holding every prefix and, per ``written[s]``,
+        sequence s's chunk too. Same rng per rank, so the stale filler and the
+        page table are identical across the before/after shards."""
+        keys, values = [], []
+        for s, (p, c) in enumerate(self.SEQS):
+            length = p + c if written[s] else p
+            positions = _local_positions(length, rank, geo.cp)
+            full_k = np.concatenate([prefix_k[s], chunk_k[s]])
+            full_v = np.concatenate([prefix_v[s], chunk_v[s]])
+            keys.append(full_k[positions])
+            values.append(full_v[positions])
+        return _paged_shard(
+            keys, values, pages, np.random.default_rng(900 + rank), geo.num_kv_heads
+        )
+
+    def _run(self, geo: Geometry, window):
+        import jax.numpy as jnp
+        from sglang_tpu.attention.pallas.batched_rpa import configs
+
+        prefix_k, prefix_v, chunk_k, chunk_v, queries = self._data(geo)
+        cu_q_lens, new_k, new_v = self._new_kv(geo, chunk_k, chunk_v)
+        num_seqs = len(self.SEQS)
+        total_q = int(cu_q_lens[-1])
+        totals = [p + c for p, c in self.SEQS]
+        pages = _pages_per_seq(totals, geo.cp)
+        distribution = [self.NUM_CHUNK_ROWS, self.NUM_CHUNK_ROWS, num_seqs]
+        multi = [c > 1 for _, c in self.SEQS]
+        every = [True] * num_seqs
+
+        chunk_results = []
+        prefix_partials = []
+        for rank in range(geo.cp):
+            cp_kwargs = dict(
+                return_lse=True,
+                cp_group_size=geo.cp,
+                cp_rank=jnp.asarray([rank], jnp.int32),
+                kv_lens_global=jnp.asarray(totals, jnp.int32),
+                tail_decode=True,
+            )
+            before = self._shard(
+                geo, rank, pages, prefix_k, prefix_v, chunk_k, chunk_v,
+                [False] * num_seqs,
+            )
+            # Chunk pass: global lengths, this rank's stripe table.
+            out_c, cache_c, lse_c = _run_kernel(
+                queries,
+                new_k,
+                new_v,
+                before._replace(kv_lens=totals),
+                cu_q_lens,
+                distribution,
+                sliding_window=window,
+                skip_kv_write=False,
+                attention_scope=2,  # NEW_TOKENS_ONLY
+                rpa_cases=(configs.RpaCase.MIXED,),
+                **cp_kwargs,
+            )
+            after_chunk = self._shard(
+                geo, rank, pages, prefix_k, prefix_v, chunk_k, chunk_v, multi
+            )
+            np.testing.assert_array_equal(
+                cache_c,
+                np.asarray(after_chunk.cache.astype(jnp.float32)),
+                f"{geo.name} rank {rank}: cache after the chunk pass",
+            )
+            chunk_results.append((out_c[:total_q], lse_c[:total_q]))
+
+            # Prefix pass on the cache the chunk pass left: this rank's
+            # stripe of the prefix, plus a single-token row's token on its
+            # owner. Decode rows on the decode tile, chunk rows on the chunk
+            # tile.
+            owns = [
+                c == 1 and ((p // PAGE_SIZE) % geo.cp == rank) for p, c in self.SEQS
+            ]
+            striped_lens = [
+                _local_len(p, rank, geo.cp) + int(own)
+                for (p, _), own in zip(self.SEQS, owns)
+            ]
+            out_p, cache_p, lse_p = _run_kernel(
+                queries,
+                new_k,
+                new_v,
+                before._replace(
+                    cache=jnp.asarray(cache_c, jnp.bfloat16), kv_lens=striped_lens
+                ),
+                cu_q_lens,
+                distribution,
+                sliding_window=window,
+                skip_kv_write=False,
+                attention_scope=3,  # STRIPED
+                **cp_kwargs,
+            )
+            after_all = self._shard(
+                geo, rank, pages, prefix_k, prefix_v, chunk_k, chunk_v, every
+            )
+            np.testing.assert_array_equal(
+                cache_p,
+                np.asarray(after_all.cache.astype(jnp.float32)),
+                f"{geo.name} rank {rank}: cache after the prefix pass",
+            )
+            prefix_partials.append((out_p[:total_q], lse_p[:total_q]))
+        return chunk_results, prefix_partials, cu_q_lens
+
+    def _reference(self, geo: Geometry, window, *, chunk_only: bool):
+        prefix_k, prefix_v, chunk_k, chunk_v, queries = self._data(geo)
+        cu_q_lens, _, _ = self._new_kv(geo, chunk_k, chunk_v)
+        outs, lses = [], []
+        for s, (p, c) in enumerate(self.SEQS):
+            q_seq = queries[cu_q_lens[s] : cu_q_lens[s] + c]
+            if chunk_only:
+                if c == 1:
+                    # Left to the STRIPED pass: no output, LSE -inf.
+                    outs.append(np.zeros_like(q_seq))
+                    lses.append(np.full((1, geo.num_q_heads), -np.inf, np.float32))
+                    continue
+                keys, values = chunk_k[s], chunk_v[s]
+                key_positions = p + np.arange(c)
+            else:
+                keys = np.concatenate([prefix_k[s], chunk_k[s]])
+                values = np.concatenate([prefix_v[s], chunk_v[s]])
+                key_positions = None
+            out, lse = _dense_attention(
+                q_seq, keys, values, p + np.arange(c), window,
+                causal=True, key_positions=key_positions,
+            )
+            outs.append(out)
+            lses.append(lse)
+        return np.concatenate(outs), np.concatenate(lses)
+
+    def test_chunk_pass_attends_the_chunk_and_writes_the_owned_pages(self):
+        for geo in (DCP2, DCP8):
+            for window in (None, SLIDING_WINDOW):
+                label = f"{geo.name} window={window}"
+                with self.subTest(label):
+                    chunk_results, _, cu_q_lens = self._run(geo, window)
+                    ref_out, ref_lse = self._reference(geo, window, chunk_only=True)
+                    for rank, (out, lse) in enumerate(chunk_results):
+                        # Every rank attends the whole chunk; single-token
+                        # rows are unprocessed, their LSE -inf.
+                        self.assert_lse_close(lse, ref_lse, f"{label} rank {rank}")
+                        processed = np.isfinite(ref_lse[:, 0])
+                        self.assert_out_close(
+                            out[processed], ref_out[processed], f"{label} rank {rank}"
+                        )
+
+    def test_two_passes_merge_to_the_dense_reference(self):
+        for geo in (DCP2, DCP8):
+            for window in (None, SLIDING_WINDOW):
+                label = f"{geo.name} window={window}"
+                with self.subTest(label):
+                    chunk_results, prefix_partials, _ = self._run(geo, window)
+                    out_prefix, lse_prefix = _merge_by_lse(prefix_partials)
+                    out, lse = _merge_by_lse(
+                        [(out_prefix, lse_prefix), chunk_results[0]]
+                    )
+                    ref_out, ref_lse = self._reference(geo, window, chunk_only=False)
+                    self.assert_out_close(out, ref_out, label)
+                    self.assert_lse_close(lse, ref_lse, label)
+
+
+@unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
 class TestBatchedRpaDcpExtendPrefixPass(_CloseAssertions):
     """cache_only with q_len > 1 in the MIXED range: every cached key precedes
     every query, and the window runs in global positions."""
