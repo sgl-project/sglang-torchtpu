@@ -55,11 +55,12 @@ _OP_CACHE: dict = {}
 
 
 def _import_dcp_kernel():
+    from sglang_tpu.attention.pallas.batched_rpa import configs
     from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
         ragged_paged_attention,
     )
 
-    return ragged_paged_attention
+    return ragged_paged_attention, configs
 
 
 def build_dcp_kernel_op(spec):
@@ -95,7 +96,7 @@ def build_dcp_kernel_op(spec):
     import jax
     from torch_tpu._internal import pallas as _torch_pallas
 
-    _jax_rpa = _import_dcp_kernel()
+    _jax_rpa, configs = _import_dcp_kernel()
 
     def _wrapped(
         queries: jax.Array,
