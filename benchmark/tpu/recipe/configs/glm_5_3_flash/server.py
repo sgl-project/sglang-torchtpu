@@ -22,6 +22,8 @@ CONTEXT_LENGTH = (
 )
 MAX_RUNNING = CONCURRENCY if CONCURRENCY == 1 else CONCURRENCY + 2
 COMPILE_BS = [b for b in (1, 2, 4, 8, 16) if b <= CONCURRENCY] or [1]
+# Radix snapshot slots; too few stops cache hits silently. Arbitrary.
+MAMBA_SLOTS = 5 * MAX_RUNNING + 64
 
 CONFIG = deepcopy(_FP8_BASE_CONFIG)
 CONFIG["server_args"].update(
@@ -40,13 +42,14 @@ CONFIG["server_args"].update(
         "torch_compile_max_bs": MAX_RUNNING,
         "tpu_compile_bs": COMPILE_BS,
         "max_total_tokens": max(2, MAX_RUNNING) * CONTEXT_LENGTH,
-        "max_mamba_cache_size": MAX_RUNNING + 2,
+        "max_mamba_cache_size": MAMBA_SLOTS,
         "attention_backend": (
             "pallas_tpu_mla" if DENSE_MAX_CONTEXT else "pallas_tpu_mla_sparse"
         ),
         "kv_cache_dtype": "fp8_e4m3",
         "page_size": 128,
-        "disable_radix_cache": True,
+        "disable_radix_cache": False,
+        "mamba_radix_cache_strategy": "extra_buffer",
         "mem_fraction_static": 0.9,
         "disable_shared_experts_fusion": True,
         "watchdog_timeout": 1800,
