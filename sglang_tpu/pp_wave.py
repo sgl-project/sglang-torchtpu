@@ -3,9 +3,9 @@
 
 torch_tpu has no device send/recv, so each hand-off is one collective-permute
 that every device of the slice launches in the same order: each device sends
-the sum of its hidden states and residual to its column's device in the next
-stage, one closed cycle per column. Stage 0 launches once per iteration while
-the wave is active and owes 2 * (stages - 2) zero launches after its last send;
+its residual (or the sum of hidden states and residual) to the next
+stage in its column, one closed cycle per column. Stage 0 launches once per
+iteration while the wave is active and owes 2 * (stages - 2) zero launches after its last send;
 stage r > 0 launches up to stage 0's count plus min(r - 1, launches owed).
 
 Eagle3 and DFlash/DSpark also relay their capture slots, whose layers sit on
@@ -167,6 +167,7 @@ class PPWave:
     forward when the iteration carries a batch, then ``end_iteration``.
     """
 
+    # Models with a completed residual stream set pp_residual_only = True.
     KEYS = ("hidden_states", "residual")
 
     def __init__(
@@ -179,6 +180,7 @@ class PPWave:
         dtype: torch.dtype,
         device: torch.device,
         launcher: Callable[[Payload], Payload],
+        residual_only: bool = False,
     ) -> None:
         if size < 2:
             raise ValueError("the pipeline wave needs at least two stages")
@@ -188,6 +190,7 @@ class PPWave:
         self.rows = int(rows)
         self.hidden = int(hidden)
         self.dtype = dtype
+        self.keys = ("residual",) if residual_only else self.KEYS
         self._launcher = launcher
         self.zero = torch.zeros((self.rows, self.hidden), dtype=dtype, device=device)
         self.zero_payload: Payload = self.zero
@@ -231,25 +234,27 @@ class PPWave:
             key: torch.zeros(
                 (rows, self.hidden), dtype=self.dtype, device=self.zero.device
             )
-            for key in self.KEYS
+            for key in self.keys
         }
 
     def warmup_merge(self, row_buckets: Iterable[int]) -> None:
-        """Compile merge's sum and pad for every bucket a forward hands on."""
+        """Compile merge's optional sum and pad for every bucket a forward hands on."""
         for rows in row_buckets:
             if rows <= self.rows:
                 self.merge(self.warmup_tensors(rows))
 
     def merge(self, tensors: dict[str, torch.Tensor]) -> Payload:
-        """The padded sum of a forward's outgoing hidden states and residual."""
-        if set(tensors) != set(self.KEYS):
+        """Pad the residual, summing hidden states first for two-tensor models."""
+        if set(tensors) != set(self.keys):
             raise ValueError(
-                f"the pipeline wave hands on exactly {self.KEYS}, got {sorted(tensors)}"
+                f"the pipeline wave hands on exactly {self.keys}, got {sorted(tensors)}"
             )
-        merged = tensors[self.KEYS[0]] + tensors[self.KEYS[1]]
+        merged = tensors[self.keys[0]]
+        for key in self.keys[1:]:
+            merged = merged + tensors[key]
         if merged.dtype != self.dtype:
             raise ValueError(
-                f"the pipeline wave carries {self.dtype}, got a {merged.dtype} sum"
+                f"the pipeline wave carries {self.dtype}, got {merged.dtype}"
             )
         return self._pad(merged, self.zero)
 
@@ -290,7 +295,7 @@ class PPWave:
     def receive(self) -> dict[str, torch.Tensor] | None:
         """Before a forward: launch (sending the output still held) and return
         the incoming activations at the buffer's row count; None on stage 0.
-        The sum arrives as the hidden states; the residual is zero."""
+        Two-tensor models receive the sum as hidden states and a zero residual."""
         if self.rank == 0:
             return None
         if not self._has_batch:
@@ -302,7 +307,7 @@ class PPWave:
 
     def unpack(self, x: Payload) -> dict[str, torch.Tensor]:
         """The forward's inputs from one received buffer."""
-        return {self.KEYS[0]: x, self.KEYS[1]: self.zero}
+        return {key: x if i == 0 else self.zero for i, key in enumerate(self.keys)}
 
     def _check_count(self) -> None:
         expected = self._target()
@@ -370,13 +375,13 @@ class PPWave:
     def probe_payload(self, value: float) -> dict[str, torch.Tensor]:
         """The outgoing tensors of a probe forward, every element ``value``."""
         return {
-            self.KEYS[0]: torch.full_like(self.zero, value),
-            self.KEYS[1]: self.zero,
+            key: torch.full_like(self.zero, value) if i == 0 else self.zero
+            for i, key in enumerate(self.keys)
         }
 
     def probe_blocks(self, got: dict[str, torch.Tensor]) -> list[torch.Tensor]:
         """The received tensors a probe checks."""
-        return [got[self.KEYS[0]]]
+        return [got[self.keys[0]]]
 
 
 class PPAuxWave(PPWave):
@@ -399,6 +404,7 @@ class PPAuxWave(PPWave):
         aux_dtype: torch.dtype | None = None,
         device: torch.device,
         launcher: Callable[[Payload], Payload],
+        residual_only: bool = False,
     ) -> None:
         super().__init__(
             rank=rank,
@@ -408,6 +414,7 @@ class PPAuxWave(PPWave):
             dtype=dtype,
             device=device,
             launcher=launcher,
+            residual_only=residual_only,
         )
         if num_aux < 1:
             raise ValueError("PPAuxWave relays at least one capture slot")
@@ -429,7 +436,7 @@ class PPAuxWave(PPWave):
         if AUX_HIDDEN_STATES_PROXY_KEY not in tensors:
             raise ValueError(
                 f"the pipeline wave hands on exactly "
-                f"{sorted((*self.KEYS, AUX_HIDDEN_STATES_PROXY_KEY))}, "
+                f"{sorted((*self.keys, AUX_HIDDEN_STATES_PROXY_KEY))}, "
                 f"got {sorted(tensors)}"
             )
         aux = tensors[AUX_HIDDEN_STATES_PROXY_KEY]
@@ -489,6 +496,7 @@ def build_pp_wave(
     rows: int,
     hidden: int,
     num_aux: int = 0,
+    residual_only: bool = False,
     dtype: torch.dtype,
     aux_dtype: torch.dtype | None = None,
     device: torch.device,
@@ -527,6 +535,7 @@ def build_pp_wave(
             aux_dtype=resolved_aux_dtype,
             device=device,
             launcher=lambda x: launch_pair_now(pair_op, x),
+            residual_only=residual_only,
         )
     else:
         op = build_pp_permute_op(perm)
@@ -538,6 +547,7 @@ def build_pp_wave(
             dtype=dtype,
             device=device,
             launcher=lambda x: launch_now(op, x),
+            residual_only=residual_only,
         )
     ok = wave.probe(column=column, columns=columns)
     # Every device must agree on the routing, so the verdict is gathered.

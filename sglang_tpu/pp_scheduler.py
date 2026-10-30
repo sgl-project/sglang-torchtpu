@@ -68,6 +68,7 @@ def build_scheduler_pp_wave(scheduler: Scheduler) -> PPWave:
         rows=policy.max_padded_tokens(),
         hidden=int(model_runner.model_config.hidden_size),
         num_aux=num_aux,
+        residual_only=getattr(model_runner.model, "pp_residual_only", False),
         dtype=getattr(model_runner.model, "pp_transfer_dtype", model_runner.dtype),
         aux_dtype=model_runner.dtype,
         device=torch.device(model_runner.device),

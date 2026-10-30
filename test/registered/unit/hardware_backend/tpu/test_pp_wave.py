@@ -59,7 +59,7 @@ class _FakeIci:
         return launch
 
 
-def _wave(rank, size, ici=None, num_aux=0):
+def _wave(rank, size, ici=None, num_aux=0, residual_only=False):
     launcher = ici.launcher(rank) if ici else (lambda x: x)
     if num_aux:
         return PPAuxWave(
@@ -71,6 +71,7 @@ def _wave(rank, size, ici=None, num_aux=0):
             dtype=torch.float32,
             device=torch.device("cpu"),
             launcher=launcher,
+            residual_only=residual_only,
         )
     return PPWave(
         rank=rank,
@@ -80,6 +81,7 @@ def _wave(rank, size, ici=None, num_aux=0):
         dtype=torch.float32,
         device=torch.device("cpu"),
         launcher=launcher,
+        residual_only=residual_only,
     )
 
 
@@ -98,14 +100,15 @@ def _expected_counts(size, schedule):
     return counts
 
 
-def _run_schedule(size, schedule, rows_per_batch=None):
+def _run_schedule(size, schedule, rows_per_batch=None, residual_only=False):
     """Every stage runs ``schedule`` (True = an iteration with a batch). Stage 0
     emits batch j as hidden states 100 + j with residual 0.5, so the sum
     100.5 + j arrives; each later stage adds one. Returns the per-stage
     received sums, the per-stage launch count after every iteration, the
     waves, any stage error and the fake ICI."""
     ici = _FakeIci(size)
-    waves = [_wave(r, size, ici) for r in range(size)]
+    waves = [_wave(r, size, ici, residual_only=residual_only) for r in range(size)]
+    key = "residual" if residual_only else "hidden_states"
     received = [[] for _ in range(size)]
     counts = [[] for _ in range(size)]
     errors = []
@@ -123,18 +126,23 @@ def _run_schedule(size, schedule, rows_per_batch=None):
                     if rank == 0:
                         out = torch.full((rows, HIDDEN), 100.0 + batch)
                     else:
-                        received[rank].append(float(incoming["hidden_states"][0, 0]))
-                        assert float(incoming["residual"].abs().max()) == 0.0, rank
+                        received[rank].append(float(incoming[key][0, 0]))
+                        if not residual_only:
+                            assert float(incoming["residual"].abs().max()) == 0.0, rank
                         assert (
-                            float(incoming["hidden_states"][rows - 1, HIDDEN - 1])
+                            float(incoming[key][rows - 1, HIDDEN - 1])
                             == received[rank][-1]
                         ), (rank, batch)
-                        out = incoming["hidden_states"][:rows] + 1.0
+                        out = incoming[key][:rows] + 1.0
                     if rank < size - 1:
-                        tensors = {
-                            "hidden_states": out,
-                            "residual": torch.full_like(out, 0.5),
-                        }
+                        tensors = (
+                            {"residual": out + 0.5}
+                            if residual_only
+                            else {
+                                "hidden_states": out,
+                                "residual": torch.full_like(out, 0.5),
+                            }
+                        )
                     batch += 1
                 wave.end_iteration(tensors)
                 counts[rank].append(wave.launches)
@@ -183,6 +191,26 @@ class TestWaveProtocol(CustomTestCase):
             self.assertEqual(wave.owed, 0)
             self.assertEqual(wave.launches, wave.stage0_launches)
 
+    def test_residual_only_batches_cross_stages_and_drain(self):
+        for size in (2, 4, 16):
+            with self.subTest(size=size):
+                schedule = _drained(size, [True, False, True, True])
+                received, counts, waves, errors, ici = _run_schedule(
+                    size, schedule, rows_per_batch=[3, ROWS, 5], residual_only=True
+                )
+                self.assertEqual(errors, [])
+                expected_counts = _expected_counts(size, schedule)
+                for rank in range(1, size):
+                    self.assertEqual(
+                        received[rank],
+                        [100.5 + j + 1.5 * (rank - 1) for j in range(3)],
+                    )
+                for rank, wave in enumerate(waves):
+                    self.assertEqual(counts[rank], [c[rank] for c in expected_counts])
+                    self.assertIsNone(wave.pending)
+                    self.assertEqual(wave.owed, 0)
+                self.assertEqual(len(set(ici.count)), 1)
+
     def test_stage_zero_launches_one_hop_per_iteration_and_stages_keep_pace(self):
         """Stage 0 issues at most one launch per iteration (a send, or a zero
         launch while draining), and stage r is at most r-1 launches ahead."""
@@ -230,19 +258,46 @@ class TestWaveWarmup(CustomTestCase):
     def test_warmup_merges_every_bucket_the_buffer_holds(self):
         """Each forward bucket's sum and pad compiles at warmup, not on its first hand-off."""
         for num_aux in (0, 2):
-            wave = _wave(0, 2, num_aux=num_aux)
-            seen = []
-            merge = wave.merge
-            wave.merge = lambda tensors: (
-                seen.append({k: tuple(v.shape) for k, v in tensors.items()})
-                or merge(tensors)
-            )
-            wave.warmup_merge({2, ROWS, ROWS + 4})
-            self.assertEqual(
-                sorted(rows["hidden_states"][0] for rows in seen), [2, ROWS]
-            )
-            for rows in seen:
-                self.assertEqual(len(rows), 2 + (num_aux > 0))
+            for residual_only in (False, True):
+                wave = _wave(0, 2, num_aux=num_aux, residual_only=residual_only)
+                seen = []
+                merge = wave.merge
+                wave.merge = lambda tensors: (
+                    seen.append({k: tuple(v.shape) for k, v in tensors.items()})
+                    or merge(tensors)
+                )
+                wave.warmup_merge({2, ROWS, ROWS + 4})
+                key = "residual" if residual_only else "hidden_states"
+                self.assertEqual(sorted(rows[key][0] for rows in seen), [2, ROWS])
+                for rows in seen:
+                    self.assertEqual(len(rows), 2 - residual_only + (num_aux > 0))
+
+    def test_residual_only_round_trip_preserves_bits_and_storage(self):
+        residual = torch.tensor([-0.0, float("nan"), float("inf"), -1.25]).repeat(
+            ROWS, 1
+        )
+        for num_aux in (0, 2):
+            for rows in (3, ROWS):
+                with self.subTest(num_aux=num_aux, rows=rows):
+                    wave = _wave(0, 2, num_aux=num_aux, residual_only=True)
+                    outgoing = {"residual": residual[:rows]}
+                    if num_aux:
+                        outgoing[AUX_HIDDEN_STATES_PROXY_KEY] = residual[:rows].repeat(
+                            1, num_aux
+                        )
+                    incoming = wave.unpack(wave.merge(outgoing))
+                    self.assertEqual(set(incoming), set(outgoing))
+                    for key, sent in outgoing.items():
+                        self.assertTrue(
+                            torch.equal(
+                                incoming[key][:rows].view(torch.int32),
+                                sent.view(torch.int32),
+                            )
+                        )
+                        self.assertEqual(torch.count_nonzero(incoming[key][rows:]), 0)
+                        if rows == ROWS:
+                            self.assertIs(incoming[key], sent)
+                    self.assertEqual(set(wave.probe_payload(2.0)), set(outgoing))
 
 
 class TestWaveGuards(CustomTestCase):
@@ -265,6 +320,14 @@ class TestWaveGuards(CustomTestCase):
             )
         with self.assertRaisesRegex(ValueError, "carries torch.float32"):
             wave.end_iteration({"hidden_states": rows, "residual": rows.double()})
+
+    def test_residual_only_rejects_extra_keys_and_wrong_dtype(self):
+        wave = _wave(0, 2, residual_only=True)
+        residual = torch.zeros(ROWS, HIDDEN)
+        with self.assertRaisesRegex(ValueError, "hands on exactly"):
+            wave.merge({"residual": residual, "hidden_states": residual})
+        with self.assertRaisesRegex(ValueError, "carries torch.float32"):
+            wave.merge({"residual": residual.double()})
 
     def test_receive_needs_an_iteration_with_a_batch(self):
         wave = _wave(1, 3)
