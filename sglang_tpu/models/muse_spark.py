@@ -369,6 +369,7 @@ class MuseSparkMoE(nn.Module):
             from sglang_tpu.oneshot_collectives import get_oneshot_all_gather_op
 
             get_oneshot_all_gather_op(self.tp_size)
+            self.gather_columns_dim = tpu_envs.SGLANG_TPU_MUSE_GATHER_COLUMNS_DIM.get()
             self.register_buffer(
                 "_tp_rank_t",
                 torch.tensor([parallel.tp_rank], dtype=torch.int32),
@@ -466,6 +467,14 @@ class MuseSparkMoE(nn.Module):
         """[T, N/tp] column shard -> [T, N]."""
         if shard.numel() * shard.element_size() > 256 * 1024:
             # Prefill-sized shards: XLA's bandwidth-oriented all-gather.
+            if self.gather_columns_dim:
+                from torch_tpu._internal.ops.collectives import all_gather_dim
+
+                return all_gather_dim(
+                    shard.contiguous(),
+                    dim=1,
+                    group=get_parallel().tp_group.device_group,
+                )
             return tensor_model_parallel_all_gather(shard.contiguous())
         from sglang_tpu.oneshot_collectives import oneshot_all_gather
 
