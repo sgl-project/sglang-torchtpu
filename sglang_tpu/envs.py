@@ -167,6 +167,9 @@ class TpuEnvs:
     # Pair exchange: issue each tile's five runs (own, sibling, one per other chip) from a
     # per-tile table built with the routing metadata instead of walking all owners in-kernel.
     SGLANG_TPU_FUSED_RS_PAIR_RUN_TABLE = EnvBool(False)
+    # Fused-RS: GMM2 stores each 256-column block straight into the row-DMA staging layout
+    # (overlaps the relayout with the next block's matmul) instead of relayouting the tile after.
+    SGLANG_TPU_FUSED_RS_GMM2_ROW_OUT = EnvBool(False)
     # Batched RPA: run target-verify rows (speculative_num_draft_tokens per request) as MIXED
     # with a q block of that width; the prefill block search otherwise pads each request's
     # rows to a ~2048-row block (16 x 8 rows at 150K context: 42 -> 2.2 ms per layer).

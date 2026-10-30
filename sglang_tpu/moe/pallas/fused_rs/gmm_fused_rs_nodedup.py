@@ -27,8 +27,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.envs import envs as tpu_envs
 
-# Profiling only: comma list of nocompute/nogather/pairnoadd/pairnowrite/pairnofwd/pairnosend drops that part of
-# the kernel (wrong output).
+# Profiling only: comma list of nocompute/nogather/pairnoadd/pairnowrite/pairnofwd/pairnosend/fwdskip<k> drops that
+# part of the kernel (wrong output). fwdskip<k> (run table only) drops the forward to chip my_chip + k.
 _ABLATE = frozenset(x for x in os.environ.get("SGLANG_TPU_FUSED_RS_ABLATE", "").split(",") if x)
 from sglang_tpu.moe.pallas.fused_rs.gmm_v2_gather_scatter import (
     Dimensions,
@@ -528,6 +528,14 @@ def kernel_main_fused_rs(
     """
     dims = fused_dims
     num_lanes = pltpu.get_tpu_info().num_lanes
+    # GMM2 writes the staging slot itself (one k step, no fp8 write path); the slot's
+    # previous writes are then awaited before GMM2 instead of before the relayout.
+    gmm2_row_out = (
+        tpu_envs.SGLANG_TPU_FUSED_RS_GMM2_ROW_OUT.get()
+        and dims.size_k2 // tile_k2 == 1
+        and not fp8_direct_write
+        and "nocompute" not in _ABLATE
+    )
     my_rank = group_offset_ref[0] // dims.size_group
     my_id = my_rank
     max_num_gm = max_num_gm_ref[0]
@@ -962,6 +970,15 @@ def kernel_main_fused_rs(
             _num_k=num_k2,
             _gm_id=0,
             _n_id=n_id,
+            row_out_ref=(
+                scatter_staging_3x_ref.at[
+                    gm_id % staging_slots,
+                    pl.ds(0, m_rows),
+                    pl.ds(n_id * tile_n2 // num_lanes, tile_n2 // num_lanes),
+                ]
+                if gmm2_row_out
+                else None
+            ),
         )
 
     # Initialize per-slot DMA counts to 0.
@@ -1088,7 +1105,7 @@ def kernel_main_fused_rs(
                 d = 2 * ((my_chip + k) % num_chips) + my_id % 2
                 block = 1 + (num_chips - k) % num_chips
                 src = pair_sum_ref
-                if "pairnofwd" in _ABLATE:
+                if "pairnofwd" in _ABLATE or f"fwdskip{k}" in _ABLATE:
                     continue
             dst0 = block * rows_per_block + rank
 
@@ -1472,6 +1489,9 @@ def kernel_main_fused_rs(
                 if "nocompute" not in _ABLATE:
                     _dispatch(_interlude)
 
+            if defer_writes and gmm2_row_out:
+                wait_staging_slot_writes(stg_id)
+
             # GMM2 loop.
             for step in range(total_w2_steps):
                 _n2 = step // num_k2
@@ -1500,7 +1520,7 @@ def kernel_main_fused_rs(
             _sls = pltpu.get_tpu_info().get_sublane_tiling(out_dtype)
             _ml = m_st % _sls
 
-            if defer_writes:
+            if defer_writes and not gmm2_row_out:
                 wait_staging_slot_writes(stg_id)
 
             with jax.named_scope("reshape_gmm2_output"):
@@ -1515,7 +1535,8 @@ def kernel_main_fused_rs(
                         scatter_staging_3x_ref.shape[3],
                     )
 
-                _dispatch(_relayout)
+                if not gmm2_row_out:
+                    _dispatch(_relayout)
 
             # Step 10: Direct-write — single pass over valid rows only.
             # Each row either ICI-sends (remote) or DMA-copies (local) to
@@ -1739,6 +1760,8 @@ def kernel_main_fused_rs(
     # pairnofwd only the own and sibling blocks of the ep // 2 + 1)
     if "pairnofwd" in _ABLATE and pair_exchange:
         total_recv = total_recv // (ep_size // 2 + 1) * 2
+    if any(a.startswith("fwdskip") for a in _ABLATE) and pair_exchange:
+        total_recv = total_recv // (ep_size // 2 + 1) * (ep_size // 2)
 
     @pl.when(jnp.logical_and(total_recv > 0, "pairnowrite" not in _ABLATE))
     def _():

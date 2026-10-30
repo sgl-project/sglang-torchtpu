@@ -278,8 +278,13 @@ def inner_kernel(
     _num_k: int | None = None,
     _gm_id: int | None = None,
     _n_id: int | None = None,
+    row_out_ref=None,
 ):
     """Inner kernel invoked by emit_pipeline to perform matmul.
+
+    `row_out_ref` ([tile_m, tile_n // lanes, lanes], scatter mode, one k step, quantized RHS,
+    no activation or bias): store each MXU column block, scaled and masked, straight into
+    this row-major layout as soon as it is done, instead of `tiled_out_ref` after the tile.
 
     tiled_lhs_ref and tiled_out_ref points to rows [m_start:m_end] of lhs and out.
     Additionally, m_start and m_end does not have to align with tile boundaries
@@ -375,6 +380,26 @@ def inner_kernel(
                 )
             return block_q, block_scale
 
+        # Every k-step variant is traced; only the single-step one stores row blocks (the
+        # caller passes row_out_ref only when there is one k step).
+        row_blocks = row_out_ref is not None and is_first_k_step and is_last_k_step
+        if row_blocks:
+            assert scatter_mode and cfgs.fuse_act is None and not cfgs.rhs_cfgs.has_bias
+
+        def _store_row_block(acc_n, start_n, end_n):
+            # Same ops per element as the whole-tile epilogue below (global scale, row
+            # mask, cast), so the stored values are bit-identical.
+            if cfgs.rhs_cfgs.has_scale and gs_gate_ref is not None:
+                _gid = metadata_ref.gm_id_to_group_id[_resolved_gm_id]
+                acc_n = acc_n * gs_gate_ref[_gid].astype(acc_n.dtype)
+            acc_n = jnp.where(_valid_m_mask(acc_n.shape), acc_n, 0)
+            lanes = row_out_ref.shape[-1]
+            row_out_ref[:, pl.ds(start_n // lanes, (end_n - start_n) // lanes), :] = (
+                acc_n.astype(row_out_ref.dtype).reshape(
+                    acc_n.shape[0], (end_n - start_n) // lanes, lanes
+                )
+            )
+
         valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
         if is_last_k_step and valid_k != 0:
             mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
@@ -432,6 +457,13 @@ def inner_kernel(
             acc_list = []
             mxu_size = pltpu.get_tpu_info().mxu_column_size
             rhs_tile_n = tiled_rhs.shape[-1]
+            # Row-layout stores go out in groups of whole [sublanes, lanes] tiles per row.
+            row_group = row_group_start = 0
+            if row_blocks:
+                row_group = (
+                    pltpu.get_tpu_info().get_sublane_tiling(row_out_ref.dtype)
+                    * row_out_ref.shape[-1]
+                )
             for start_n in range(0, rhs_tile_n, mxu_size):
                 end_n = min(rhs_tile_n, start_n + mxu_size)
                 col_size = end_n - start_n
@@ -502,6 +534,14 @@ def inner_kernel(
                     acc_n += block_acc
 
                 acc_list.append(acc_n)
+                if row_blocks and (end_n - row_group_start == row_group or end_n == rhs_tile_n):
+                    _store_row_block(
+                        jnp.concatenate(acc_list, axis=1), row_group_start, end_n
+                    )
+                    acc_list = []
+                    row_group_start = end_n
+            if row_blocks:
+                return
             acc = jnp.concatenate(acc_list, axis=1)
 
         if not is_first_k_step:
