@@ -495,7 +495,8 @@ class RaidenReceiverMixin:
         """
         if not self.chunked_transfer or self._pipeline is not None:
             return
-        self._drain_engine()
+        if not self._try_drain_engine():
+            return
         with self._state_lock:
             rooms = [room for room, queue in self._decode.chunk_queue.items() if queue]
         for room in rooms:
