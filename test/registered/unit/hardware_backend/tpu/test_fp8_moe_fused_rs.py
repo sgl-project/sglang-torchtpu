@@ -174,6 +174,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
             w13_weight_scale_inv=w13_scale_inv,
             w2_weight_scale_inv=w2_scale_inv,
             moe_ep_size=8,
+            moe_runner_config=SimpleNamespace(routed_scaling_factor=None),
             _tpu_fused_rs_group_offset=torch.tensor([0], dtype=torch.int32),
         )
 
@@ -210,6 +211,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
             w13_weight_scale=torch.ones(1, 1, 1, 2 * hidden),
             w2_weight_scale=torch.ones(1, 1, 1, hidden),
             moe_ep_size=8,
+            moe_runner_config=SimpleNamespace(routed_scaling_factor=None),
             _tpu_fused_rs_group_offset=torch.tensor([0], dtype=torch.int32),
         )
 

@@ -1,6 +1,7 @@
 """MiniLB /health and /health_generate must report the backends, not only the
-LB process: MiniLB routes to every registered server without health tracking,
-so one dead server already fails part of the traffic."""
+LB process: routing skips an unhealthy server only after the next background
+probe, and falls back to all servers of a role when none is healthy, so one
+dead server can still fail part of the traffic."""
 
 import asyncio
 import json

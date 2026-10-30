@@ -80,6 +80,7 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
     SpecDecoderTpuCompilePolicy,
 )
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
 from sglang_tpu.mamba_pool import TpuMambaPool
 from sglang_tpu.sampler import select_logits_output_mode
@@ -1885,7 +1886,7 @@ class TestPrecompileLoops(_PolicyTestCase):
         policy = _make_policy(_model_runner(), token_buckets=(8,), bs_buckets=(1, 4))
         policy._run_one = MagicMock()
 
-        with envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(True):
+        with tpu_envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(True):
             with get_parallel().override(
                 tp_size=2,
                 tp_rank=1,

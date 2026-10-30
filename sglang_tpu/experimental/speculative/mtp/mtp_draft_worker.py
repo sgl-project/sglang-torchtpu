@@ -3,6 +3,8 @@
 draft: h_1 = layer(fc(cat(norm(embed(t)), norm(target hidden)))) normed at the
        last committed row; each step feeds the previous token and the draft's
        own normed hidden; d_j ~ softmax(lm_head(h_j) / T) over the target vocab.
+       A DSA checkpoint with index_share_for_mtp_iteration runs its indexer on
+       the committed rows only; every step reuses the last committed row's top-k.
 
 Not supported: draft trees (topk > 1).
 """
@@ -13,13 +15,16 @@ from typing import cast
 
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
+from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.dspark import gather_and_crop_vocab, project_through_lm_head
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
+from sglang_tpu.attention_pallas_mla_sparse import topk_row_width
 from sglang_tpu.experimental.speculative.chain_draft_worker import (
     TpuChainDraftWorker,
 )
@@ -49,6 +54,9 @@ class TpuMtpDraftWorker(TpuChainDraftWorker):
         # Both widths are the hidden size: the draft reads the target's final hidden.
         self.carry_size = int(draft_model.config.hidden_size)
         self.target_feature_size = self.carry_size
+        self.dsa_seed_topk_width = _shared_dsa_topk_width(
+            self.model_runner.model_config.hf_config
+        )
         _share_target_vocab(draft_model=draft_model, target_runner=target_runner)
         # The fused draft is shared by all TP ranks, so shard bounds come from a rank buffer.
         draft_model.model.embed_tokens.lift_rank_to_input()
@@ -67,6 +75,17 @@ class TpuMtpDraftWorker(TpuChainDraftWorker):
 
     def target_logits(self, draft_logits: torch.Tensor) -> torch.Tensor:
         return draft_logits
+
+
+def _shared_dsa_topk_width(hf_config: PretrainedConfig) -> int | None:
+    """Columns of the DSA top-k rows the draft steps share, or None when each
+    step runs the draft's indexer."""
+    # Read at the top level, where --json-model-override-args writes it, as core's
+    # EAGLE worker and P/D seed relay read it.
+    shares = getattr(hf_config, "index_share_for_mtp_iteration", False)
+    if not (shares and is_deepseek_dsa(hf_config)):
+        return None
+    return topk_row_width(hf_config)
 
 
 def _share_target_vocab(

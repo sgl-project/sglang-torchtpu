@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
+    LogitsOutputMode,
 )
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.models.dspark import DSparkDraftModel
@@ -22,6 +23,7 @@ from sglang_tpu.compilation.recompilation_checker import (
     install_recompilation_checker,
 )
 from sglang_tpu.dflash_utils_tpu import register_argmax_draft_top_k
+from sglang_tpu.experimental import runs_draft_prompt_pass
 from sglang_tpu.experimental.compilation.spec_compile_policy import (
     TpuSpecDecodeCompilePolicyMixin,
 )
@@ -53,6 +55,12 @@ class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
             raise TypeError(f"Expected a DFlashDraftModel draft, got {type(model)}.")
         return block_draft_width(model, self.draft_token_num)
 
+    def target_verify_logits_output_modes(self) -> tuple[LogitsOutputMode, ...]:
+        # TpuBlockSpecWorker.verify_top_k_width reads the same negotiated width.
+        if self.is_draft_worker or self._distributed_top_k_width() is None:
+            return (LogitsOutputMode.FULL_VOCAB,)
+        return (LogitsOutputMode.FULL_VOCAB, LogitsOutputMode.DISTRIBUTED_TOP_K)
+
     def make_null_spec_info(self) -> DFlashVerifyInput:
         # Same structure as TpuBlockSpecWorker's draft block input, so the draft trace matches.
         width = self.draft_block_width if self.is_draft_worker else self.draft_token_num
@@ -78,7 +86,7 @@ class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
         if disagg_mode != "prefill":
             self._precompile_draft_block(draft_attn_backend)
             self._precompile_draft_append_kv_verify()
-        if disagg_mode != "decode":
+        if runs_draft_prompt_pass(disagg_mode):
             self._precompile_draft_append_kv_extend()
         logger.info(
             "[spec compile policy] %s DRAFT precompile done in %.1fs.",

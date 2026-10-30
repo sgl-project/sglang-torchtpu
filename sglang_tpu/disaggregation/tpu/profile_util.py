@@ -25,7 +25,7 @@ class _LazyPerfetto:
 
     def __bool__(self) -> bool:
         try:
-            from sglang.srt.environ import envs
+            from sglang_tpu.envs import envs
 
             return bool(envs.SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING.get())
         except Exception:

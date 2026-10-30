@@ -125,6 +125,38 @@ class TestRuntimeEnvironment(unittest.TestCase):
                 self.assertEqual(overridden["HF_HUB_OFFLINE"], "1")
                 self.assertNotIn("TORCH_LOGS", overridden)
 
+    def test_concurrency_selects_get_config(self):
+        recipe = "recipe/configs/muse_spark/agentic.py"
+        config = load_recipe(recipe, 24)
+        self.assertEqual(config["server_args"]["max_running_requests"], 6)
+        self.assertEqual(config["runtime_env"]["SGLANG_TPU_MUSE_MK_MAX_ROWS"], "48")
+        for name, concurrency in (
+            (recipe, 2),
+            (recipe, None),
+            ("recipe/configs/muse_spark/server.py", 16),
+        ):
+            with self.subTest(name=name, concurrency=concurrency):
+                with self.assertRaises(ValueError):
+                    load_recipe(name, concurrency)
+
+    def test_agentx_pd_modes(self):
+        """A PP prefill must run without the megakernel (the model rejects it under PP)."""
+        from benchmark.tpu.recipe.configs.muse_spark.agentic import get_config
+
+        prefill, decode = (get_config(24, mode=m) for m in ("prefill", "decode"))
+        self.assertEqual(prefill["server_args"]["pp_size"], 2)
+        for config in (prefill, decode):
+            # A rank != 0 in a one-host group makes launch_server start nothing.
+            self.assertEqual(config["runtime_env"]["SGLANG_LAUNCHER_RANK"], "0")
+        self.assertEqual(prefill["runtime_env"]["SGLANG_TPU_MUSE_MEGAKERNEL"], "0")
+        self.assertEqual(decode["runtime_env"]["SGLANG_TPU_MUSE_MEGAKERNEL"], "1")
+        self.assertEqual(decode["runtime_env"]["SGLANG_RAIDEN_PIPELINE_TRANSFER"], "1")
+        for config, mode in ((prefill, "prefill"), (decode, "decode")):
+            self.assertEqual(config["server_args"]["disaggregation_mode"], mode)
+        self.assertNotIn("disaggregation_mode", get_config(24)["server_args"])
+        with self.assertRaises(ValueError):
+            get_config(24, mode="router")
+
 
 if __name__ == "__main__":
     unittest.main()

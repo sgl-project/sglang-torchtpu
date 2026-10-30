@@ -3,23 +3,28 @@
     python3 -m benchmark.tpu.launch_server \\
         --config recipe/configs/glm_5_3_flash/mtp.py
 
-The draft layer runs its own DSA indexer each step instead of reusing the
-target's top-k (index sharing is not supported on TPU).
+As the checkpoint config sets (index_share_for_mtp_iteration), the draft runs
+its DSA indexer on the committed rows only and every draft step reuses that
+top-k. GLM_FLASH_MTP_INDEX_SHARE=0 runs the draft's indexer on every step.
 """
 
 import json
+import os
 from copy import deepcopy
 
 from benchmark.tpu.recipe.configs.glm_5_3_flash.server import CONFIG as BASE_CONFIG
 
 NUM_STEPS = 3
-NO_INDEX_SHARE = {"index_share_for_mtp_iteration": False}
+INDEX_SHARE = os.environ.get("GLM_FLASH_MTP_INDEX_SHARE", "1") != "0"
 
 CONFIG = deepcopy(BASE_CONFIG)
 _args = CONFIG["server_args"]
-_overrides = json.loads(_args.get("json_model_override_args") or "{}")
-_overrides.update(NO_INDEX_SHARE)
-_overrides["text_config"] = {**_overrides.get("text_config", {}), **NO_INDEX_SHARE}
+if not INDEX_SHARE:
+    no_index_share = {"index_share_for_mtp_iteration": False}
+    _overrides = json.loads(_args.get("json_model_override_args") or "{}")
+    _overrides.update(no_index_share)
+    _overrides["text_config"] = {**_overrides.get("text_config", {}), **no_index_share}
+    _args["json_model_override_args"] = json.dumps(_overrides)
 _args.update(
     {
         "speculative_algorithm": "NEXTN",
@@ -29,7 +34,6 @@ _args.update(
         "speculative_num_draft_tokens": NUM_STEPS + 1,
         # Linear-chain KDA speculation keeps one state slot per running request.
         "max_mamba_cache_size": _args["max_running_requests"],
-        "json_model_override_args": json.dumps(_overrides),
         # Young-generation GC ~70x rarer: a collection on one TP rank stalls
         # every rank at the next all-reduce.
         "gc_threshold": [50000, 100, 100],

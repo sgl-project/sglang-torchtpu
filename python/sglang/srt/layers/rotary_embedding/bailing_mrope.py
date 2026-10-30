@@ -13,6 +13,7 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_get_mscale_simple,
     yarn_linear_ramp_mask,
 )
+from sglang.srt.utils import is_cuda_alike, is_xpu
 
 
 class BailingMRotaryEmbedding(RotaryEmbedding):
@@ -150,6 +151,27 @@ class BailingMRotaryEmbedding(RotaryEmbedding):
             if query.ndim == 3:
                 query = query.reshape(query_shape[0], -1)
                 key = key.reshape(key_shape[0], -1)
+            self._rope_qk_fused_inplace(query, key, positions)
+            if query_shape != query.shape:
+                query = query.view(query_shape)
+                key = key.view(key_shape)
+            return query, key
+        return RotaryEmbedding.forward(self, positions, query, key)
+
+    def _rope_qk_fused_inplace(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """Triton fused mRoPE where a Triton driver exists, eager mirror else.
+
+        The device probe folds to a constant under Dynamo (verified with
+        torch.compile(fullgraph=True) on torch 2.11). is_cuda_alike()
+        includes HIP: upstream MRotaryEmbedding routes ROCm through
+        forward_cuda, which calls the same Triton kernel.
+        """
+        if is_cuda_alike() or is_xpu():
             triton_ernie45_rope_fused_inplace(
                 query,
                 key,
@@ -160,11 +182,68 @@ class BailingMRotaryEmbedding(RotaryEmbedding):
                 self.rotary_dim,
                 self.is_neox_style,
             )
-            if query_shape != query.shape:
-                query = query.view(query_shape)
-                key = key.view(key_shape)
-            return query, key
-        return RotaryEmbedding.forward(self, positions, query, key)
+        else:
+            self._ernie45_rope_fused_inplace_native(query, key, positions)
+
+    def _ernie45_rope_fused_inplace_native(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """Triton-fused mRoPE mirror for devices without a Triton driver.
+
+        Bit-follows _triton_ernie45_rope_qk_fused: query/key arrive flattened
+        to [num_tokens, num_heads * head_size]; only the first rotary_dim
+        elements of each head rotate; frequency indices below
+        section_h + section_w take the height (even) / width (odd) position
+        rows, the rest take the time row; pairs compute in the cache dtype.
+        """
+        half_rd = self.rotary_dim // 2
+        # self.mrope_section stores [height, width, time] -- __init__ reorders
+        # the checkpoint's [time, height, width] to the Ernie4.5 kernel's
+        # section order -- so the unpicked tail is the time section.
+        section_h, section_w, _ = self.mrope_section
+        hw = section_h + section_w
+        num_tokens = query.shape[0]
+
+        # positions rows are [t, h, w]; pick the source row per frequency.
+        freq_idx = torch.arange(half_rd, device=positions.device)
+        source_row = torch.where(
+            freq_idx < hw,
+            torch.where(freq_idx % 2 == 0, 1, 2),
+            0,
+        )
+        freq_pos = positions[source_row].transpose(0, 1).reshape(-1).long()
+        # cos_sin[i, f] is the [cos | sin] cache row for token i's frequency
+        # f; element f of the first half is cos, element half_rd + f is sin.
+        cos_sin = self.cos_sin_cache.index_select(0, freq_pos).view(
+            num_tokens, half_rd, self.rotary_dim
+        )
+        gather_idx = freq_idx.view(1, -1, 1).expand(num_tokens, -1, -1)
+        cos = cos_sin.gather(2, gather_idx).squeeze(-1).unsqueeze(1)
+        sin = cos_sin.gather(2, gather_idx + half_rd).squeeze(-1).unsqueeze(1)
+
+        def rotate(x: torch.Tensor) -> None:
+            x = x.view(num_tokens, -1, self.head_size)
+            rot = x[..., : self.rotary_dim]
+            if self.is_neox_style:
+                first, second = rot[..., :half_rd], rot[..., half_rd:]
+            else:
+                first, second = rot[..., 0::2], rot[..., 1::2]
+            first_in = first.to(cos.dtype)
+            second_in = second.to(cos.dtype)
+            new_first = first_in * cos - second_in * sin
+            new_second = second_in * cos + first_in * sin
+            new_rot = (
+                torch.cat((new_first, new_second), dim=-1)
+                if self.is_neox_style
+                else torch.stack((new_first, new_second), dim=-1).flatten(-2)
+            )
+            x[..., : self.rotary_dim] = new_rot.to(x.dtype)
+
+        rotate(query)
+        rotate(key)
 
     @staticmethod
     def _text_config(hf_config: PretrainedConfig) -> PretrainedConfig:

@@ -40,7 +40,6 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
@@ -65,6 +64,7 @@ from sglang_tpu.cp_forward import (
     get_tpu_cp_layout,
 )
 from sglang_tpu.cp_layout import TpuCpHostLayout
+from sglang_tpu.envs import envs
 from sglang_tpu.host_metadata_cache import HostMetadataCache
 from sglang_tpu.kv_row_write import (
     get_write_rows_op,
@@ -388,6 +388,10 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
     ``torch.library`` boundary. We override ``register_fake`` to return
     shape-matching empties without re-tracing the JAX function — this is what
     lets the dynamic token dimension flow through ``torch.compile``.
+
+    With ``layer_idx``, ``kv_cache_fused`` is a bundle
+    ``[num_blocks, layer_num, page_size, ...]``, zero-copy reshaped to flat
+    layout preserving arg 3 donation, with padded page 0 in block 0.
     """
     cached = _OP_CACHE.get(spec.op_name)
     if cached is not None:
@@ -418,9 +422,17 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         decode_query_size: int = 1,
         prefill_kv_tile_hint: jax.Array | None = None,
         use_causal_mask: bool = True,
+        layer_idx: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         if not spec.supports_attention_sink and attention_sink is not None:
             raise NotImplementedError(f"{op_name} does not support attention sinks")
+        kv_cache_flat = kv_cache_fused
+        if layer_idx is not None:
+            num_blocks, layer_num = kv_cache_fused.shape[:2]
+            kv_cache_flat = kv_cache_fused.reshape(
+                (num_blocks * layer_num,) + kv_cache_fused.shape[2:]
+            )
+            page_indices = page_indices * layer_num + layer_idx
         # For fp8 KV cache: K/V are quantized to fp8 before this call, so the
         # kernel dequantizes on read by multiplying the attention scores /
         # output by these per-tensor scales. ``q_scale`` is left unset so
@@ -430,12 +442,12 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
             if prefill_kv_tile_hint is None
             else {"prefill_kv_tile_hint": prefill_kv_tile_hint}
         )
-        return spec.invoke_kernel(
+        output, updated = spec.invoke_kernel(
             _jax_rpa,
             queries=queries,
             keys=keys,
             values=values,
-            kv_cache_fused=kv_cache_fused,
+            kv_cache_fused=kv_cache_flat,
             kv_lens=kv_lens,
             page_indices=page_indices,
             cu_q_lens=cu_q_lens,
@@ -451,13 +463,16 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
             use_causal_mask=use_causal_mask,
             **hint_options,
         )
+        return output, updated.reshape(kv_cache_fused.shape)
 
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
         # Static (non-traced) args by _wrapped position: 10=sm_scale,
         # 11=sliding_window, 12=soft_cap, 13=k_scale, 14=v_scale,
-        # 15=decode_query_size, 17=use_causal_mask.
+        # 15=decode_query_size, 17=use_causal_mask. 16=prefill_kv_tile_hint and
+        # 18=layer_idx are traced; a traced layer_idx lets every layer share one
+        # program.
         static_argnums=(10, 11, 12, 13, 14, 15, 17),
         donate_argnums=(3,),
         input_output_aliases={3: 1},
@@ -488,6 +503,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         decode_query_size: int = 1,
         prefill_kv_tile_hint: torch.Tensor | None = None,
         use_causal_mask: bool = True,
+        layer_idx: torch.Tensor | None = None,
     ) -> torch.Tensor:
         with tpu_info_for_cpu_export():
             output, _updated_kv = jax_kernel(
@@ -509,6 +525,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
                 decode_query_size,
                 prefill_kv_tile_hint,
                 use_causal_mask,
+                layer_idx,
             )
         return output
 
@@ -526,6 +543,20 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
 
     _OP_CACHE[op_name] = custom_op
     return custom_op
+
+
+def _fused_kv_operands(pool, layer_id: int) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """The kernel's KV cache tensor and, for a block-major bundle, its traced layer index."""
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+    from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+    if isinstance(pool, SWAKVPool):
+        layer_id, is_swa_layer = pool.layers_mapping[layer_id]
+        pool = pool.swa_kv_pool if is_swa_layer else pool.full_kv_pool
+    if isinstance(pool, TpuFusedMHATokenToKVPool):
+        return pool.get_fused_kv_operands(layer_id)
+    # Wrappers such as HybridLinearKVPool proxy the per-layer buffer only.
+    return pool.get_fused_kv_buffer(layer_id), None
 
 
 class BaseTpuPallasRpaAttnBackend(AttentionBackend):
@@ -1569,7 +1600,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 )
             q, k, v = _pack_qkv_heads(q, k, v, pack)
 
-        kv_cache = self.token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
+        kv_cache, kv_layer_idx = _fused_kv_operands(
+            self.token_to_kv_pool, layer.layer_id
+        )
 
         op = self._op
 
@@ -1694,6 +1727,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 v_scale,
                 self.forward_metadata.decode_query_size,
                 use_causal_mask=use_causal_mask,
+                layer_idx=kv_layer_idx,
             )
 
         capture_mode = getattr(forward_batch, "capture_hidden_mode", None)

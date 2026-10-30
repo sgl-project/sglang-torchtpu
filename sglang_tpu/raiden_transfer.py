@@ -18,7 +18,7 @@ import os
 import time
 from typing import TYPE_CHECKING, List
 
-from sglang.srt.environ import envs
+from sglang_tpu.envs import envs
 from sglang_tpu.tpu_dma_hicache import NOOP_EVENT
 
 if TYPE_CHECKING:
@@ -112,12 +112,9 @@ class RaidenKVTransfer:
         self.num_host_pages = num_host_pages
         self.layer_num = device_pool.layer_num
 
-        # outer list = layer, inner list = shard (one shard per TPU core here).
-        # Keep-alive: held on self so the underlying buffers outlive raiden.
-        self._device_tensors = [
-            [device_pool.get_fused_kv_buffer(device_pool.start_layer + i)]
-            for i in range(self.layer_num)
-        ]
+        # One entry per registered tensor (one shard each); Raiden blocks span dim 0.
+        # Held on self so device buffer lifetimes outlive the Raiden session.
+        self._device_tensors = [[buf] for buf in device_pool.page_buffers()]
         # raiden issues ``d2h`` / ``h2d`` copies on a background thread only
         # when this variable is set; otherwise the calls block the scheduler
         # thread until every per-layer copy has been submitted. The manager
@@ -131,8 +128,10 @@ class RaidenKVTransfer:
             unsafe_skip_buffer_lock=True,
         )
         logger.info(
-            "Raiden KV transfer ready: %d layers, %d host pages (page=%d tokens)",
+            "Raiden KV transfer ready: %d layers, tensors=%d, %d host pages "
+            "(page=%d tokens)",
             self.layer_num,
+            len(self._device_tensors),
             num_host_pages,
             device_pool.page_size,
         )
