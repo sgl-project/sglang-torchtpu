@@ -44,6 +44,20 @@ def is_swa_pool(tag: str) -> bool:
     return pool_kind(tag).endswith("swa")
 
 
+def is_draft_pool(tag: str) -> bool:
+    return pool_kind(tag).startswith("draft.")
+
+
+def _producer_tensor_kv_heads(tensor: Any) -> int:
+    """KV head count of a TP=1 producer page tensor when the pool omitted head_num."""
+    rank = _kv_rank(tensor)
+    if rank == _HEAD_MAJOR_KV_RANK:
+        return int(tensor.shape[1]) // 2
+    if rank == _FUSED_KV_RANK:
+        return int(tensor.shape[2]) * int(tensor.shape[3]) // 2
+    raise ValueError("Block-major KV bundles do not slice kv-heads")
+
+
 def source_spans(pools: Sequence[dict], full: list[int], swa: list[int]) -> list[Any]:
     """Describe whole pages in destination byte space for each locally owned layer."""
     result = []
@@ -82,17 +96,37 @@ def head_slice_spans(
     swa: list[int],
     dst_attn_tp: int,
     total_kv_heads: int,
+    *,
+    draft_total_kv_heads: int | None = None,
+    draft_swa_total_kv_heads: int | None = None,
 ) -> list[Any]:
     """Describe each destination rank's kv-head slice of every locally owned
     page: one strided span per page and rank, routed to that rank only."""
     result = []
     for pool, tensor in zip(pools, tensors):
-        blocks = swa if is_swa_pool(pool["tag"]) else full
+        tag = pool["tag"]
+        blocks = swa if is_swa_pool(tag) else full
         if _kv_rank(tensor) == _BLOCK_MAJOR_KV_RANK:
             raise ValueError(
                 "A block-major KV bundle moves whole page rows; a "
                 "tensor-parallel consumer needs per-layer KV pools"
             )
+        # A separate draft model can have fewer or more KV heads than the target
+        # (e.g. Muse Spark 16 KV heads with DFlash2 8 KV heads), while pdhid.*
+        # rows are sharded by the target's total_kv_heads.
+        if is_draft_pool(tag):
+            draft_heads = (
+                draft_swa_total_kv_heads
+                if is_swa_pool(tag) and draft_swa_total_kv_heads is not None
+                else draft_total_kv_heads
+            )
+            pool_kv_heads = (
+                int(draft_heads)
+                if draft_heads is not None
+                else _producer_tensor_kv_heads(tensor)
+            )
+        else:
+            pool_kv_heads = total_kv_heads
         if _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
             result.append(
                 _head_major_slice_spans(
@@ -100,7 +134,7 @@ def head_slice_spans(
                     tensor=tensor,
                     blocks=blocks,
                     dst_attn_tp=dst_attn_tp,
-                    total_kv_heads=total_kv_heads,
+                    total_kv_heads=pool_kv_heads,
                 )
             )
             continue
@@ -108,7 +142,7 @@ def head_slice_spans(
             src_tp=1,
             dst_tp=dst_attn_tp,
             hp_bytes=head_bytes(tensor),
-            total_kv_heads=total_kv_heads,
+            total_kv_heads=pool_kv_heads,
             kv_packing=int(tensor.shape[3]),
             element_size=tensor.element_size(),
         )
@@ -134,7 +168,7 @@ def head_slice_spans(
             )
         result.append(
             SimpleNamespace(
-                tag=pool["tag"],
+                tag=tag,
                 block_ids=list(blocks),
                 # Ranks that share a kv-head each receive it, so the spans can
                 # sum to more than the source pages hold.
@@ -243,6 +277,8 @@ def part_spans(
     dst_attn_tp: int,
     total_kv_heads: int,
     *,
+    draft_total_kv_heads: int | None = None,
+    draft_swa_total_kv_heads: int | None = None,
     with_swa: bool,
 ) -> list[Any]:
     """Spans of one transfer over the full-attention pools and, when with_swa,
@@ -256,7 +292,16 @@ def part_spans(
     tensors = [tensors[i] for i in keep]
     if dst_attn_tp == 1:
         return source_spans(pools, full, swa)
-    return head_slice_spans(pools, tensors, full, swa, dst_attn_tp, total_kv_heads)
+    return head_slice_spans(
+        pools,
+        tensors,
+        full,
+        swa,
+        dst_attn_tp,
+        total_kv_heads,
+        draft_total_kv_heads=draft_total_kv_heads,
+        draft_swa_total_kv_heads=draft_swa_total_kv_heads,
+    )
 
 
 def part_destination_blocks(
