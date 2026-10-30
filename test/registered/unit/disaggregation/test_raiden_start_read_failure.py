@@ -3,6 +3,7 @@ with SGLANG_RAIDEN_LISTENER_START_READ an announcement starts its read."""
 
 import ast
 import inspect
+import queue
 import threading
 import time
 import unittest
@@ -12,6 +13,7 @@ from unittest.mock import Mock, patch
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.disaggregation.raiden import conn as conn_module
 from sglang_tpu.disaggregation.raiden import receiver as receiver_module
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager, RaidenKVReceiver
 from sglang_tpu.disaggregation.raiden.host_pool import StagingAdmission
@@ -83,6 +85,7 @@ def _decode_manager(*, hybrid, chunked, listener=False):
     mgr.chunked_transfer = chunked
     mgr._listener_start_read = listener
     mgr._state_lock = threading.Lock()
+    mgr._drain_lock = threading.Lock()
     mgr._status_lock = threading.Lock()
     mgr.request_status = {ROOM: KVPoll.WaitingForInput}
     mgr.failure_records = {}
@@ -303,6 +306,49 @@ class TestListenerStartsReads(unittest.TestCase):
             listener.join(5)
 
         mgr._engine.start_read.assert_called_once()
+
+
+class _FakeServerSocket:
+    """The listener's PULL socket: frames queued by the test, delivered in order."""
+
+    def __init__(self):
+        self._frames = queue.Queue()
+
+    def put(self, frames):
+        self._frames.put(frames)
+
+    def poll(self, timeout_ms):
+        deadline = time.monotonic() + timeout_ms / 1000
+        while self._frames.empty() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        return not self._frames.empty()
+
+    def recv_multipart(self):
+        return self._frames.get()
+
+
+class TestListenerSweep(unittest.TestCase):
+    def test_next_chunk_starts_while_the_scheduler_does_not_poll(self):
+        """#1451: a decode scheduler stalled for a minute left every chunk after
+        a room's first unissued, because only its poll settled the read in
+        flight; the queued announcements then outwaited the transfer deadline.
+        """
+        mgr = _decode_manager(hybrid=False, chunked=True, listener=True)
+        mgr._message_handlers = {Chunk.TAG: mgr._on_chunk}
+        mgr.server_socket = _FakeServerSocket()
+        mgr._engine.poll_stats_with_details.return_value = _polled(
+            received=[f"{ROOM}#0"]
+        )
+
+        with patch.object(conn_module, "_LISTENER_SWEEP_INTERVAL_S", 0.01):
+            threading.Thread(target=mgr._listen, daemon=True).start()
+            mgr.server_socket.put(_chunk(0))
+            mgr.server_socket.put(_chunk(1))
+            deadline = time.monotonic() + 5
+            while len(_started(mgr._engine)) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+        self.assertEqual(_started(mgr._engine), [f"{ROOM}#0", f"{ROOM}#1"])
 
 
 if __name__ == "__main__":

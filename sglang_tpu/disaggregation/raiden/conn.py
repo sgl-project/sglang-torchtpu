@@ -96,6 +96,11 @@ from sglang_tpu.envs import envs as tpu_envs
 if TYPE_CHECKING:
     from tpu_sync.api.torch.kv_cache_manager import SettledTransfer
 
+# How often a decode listener settles finished reads and starts queued chunks
+# itself, so a stalled scheduler cannot hold them past the transfer deadline.
+# Arbitrary; it only has to be well under SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S.
+_LISTENER_SWEEP_INTERVAL_S = 1.0
+
 # Re-exported so that "from …raiden.conn import X" keeps resolving for the
 # callers and tests that predate the split into common/sender/receiver.
 __all__ = [
@@ -306,6 +311,7 @@ class RaidenKVManager(
         # skipped -- its pages then ride the closing transfer.
         self._announce_lock = threading.Lock()
         self._state_lock = threading.Lock()
+        self._drain_lock = threading.Lock()
 
         self._prefill: Optional[PrefillState] = None
         self._decode: Optional[DecodeState] = None
@@ -696,6 +702,16 @@ class RaidenKVManager(
         return start, tail
 
     def _drain_engine(self) -> None:
+        """Take the engines' settled transfers into the room tables.
+
+        The scheduler's poll and the listener's stall sweep both call this;
+        the lock keeps two callers from interleaving one engine's poll with
+        the bookkeeping of another.
+        """
+        with self._drain_lock:
+            self._drain_engine_serialized()
+
+    def _drain_engine_serialized(self) -> None:
         if self._pipeline is not None:
             sent, received, failed = self._pipeline.poll()
             with self._state_lock:
@@ -1041,16 +1057,28 @@ class RaidenKVManager(
     # ----- rendezvous (ZMQ over the existing per-rank PULL socket) -----------
 
     def _listen(self) -> None:
+        sweeps = self._decode is not None and self._listener_start_read
+        next_sweep = time.monotonic() + _LISTENER_SWEEP_INTERVAL_S
         while True:
             try:
-                msg = self.server_socket.recv_multipart()
+                ready = not sweeps or self.server_socket.poll(
+                    max(0, int((next_sweep - time.monotonic()) * 1000))
+                )
+                msg = self.server_socket.recv_multipart() if ready else None
             except Exception as e:
                 logger.error("RaidenKVManager listener error: %s", e)
                 continue
-            try:
-                self._dispatch(msg)
-            except Exception as e:
-                logger.error("RaidenKVManager message handling error: %s", e)
+            if msg is not None:
+                try:
+                    self._dispatch(msg)
+                except Exception as e:
+                    logger.error("RaidenKVManager message handling error: %s", e)
+            if sweeps and time.monotonic() >= next_sweep:
+                next_sweep = time.monotonic() + _LISTENER_SWEEP_INTERVAL_S
+                try:
+                    self._sweep_pulls()
+                except Exception as e:
+                    logger.error("RaidenKVManager pull sweep error: %s", e)
 
     def _dispatch(self, msg: List[bytes]) -> None:
         """Route one multipart message from the per-rank PULL socket by its tag."""
