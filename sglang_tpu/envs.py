@@ -93,6 +93,9 @@ class TpuEnvs:
     # chunk is masked by key column only (MKConfig.attn_col_mask).
     SGLANG_TPU_MUSE_MK_ATTN_SKIP_IDLE = EnvBool(False)
     SGLANG_TPU_MUSE_MK_ATTN_COL_MASK = EnvBool(False)
+    # Experimental: the pipelined SAL attention loop (MKConfig.attn_pipe) on steps of 33-64 rows
+    # too, not only up to _BASE_STEP_MAX_ROWS (12-16 decoding requests at 4-token verify).
+    SGLANG_TPU_MUSE_MK_LARGE_STEP_ATTN_PIPE = EnvBool(False)
     # Fused KV pool stores a rank's heads side by side in one 128-lane row when they
     # fit exactly (e.g. 2 x head_dim 64): half the bytes of a zero-padded row per head.
     SGLANG_TPU_KV_PACK_HEADS = EnvBool(False)
@@ -117,6 +120,9 @@ class TpuEnvs:
     # Profiling only: name megakernel regions in xprof; needs libtpu's
     # --xla_enable_custom_call_region_trace=true and slows fine-grained regions.
     SGLANG_TPU_MK_TRACE_REGIONS = EnvBool(False)
+    # Profiling only: scoped VMEM limit (MiB) for every step while TRACE_REGIONS is on; the region
+    # markers take stack VMEM (the 16-row step overflowed the default 60 MiB by 1.1 MiB).
+    SGLANG_TPU_MK_TRACE_VMEM_LIMIT_MB = EnvFloat(None)
     # Tuning only: declared-scratch budget cut per row past 64 rows (KiB), for the VMEM sweep.
     SGLANG_TPU_MK_LARGE_STEP_BUDGET_PER_ROW_KB = EnvInt(None)
     # Tuning only: scoped VMEM limit (MiB) for steps past 64 rows (default 60; 64 MiB physical).

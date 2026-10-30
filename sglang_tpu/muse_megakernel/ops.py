@@ -374,7 +374,12 @@ class MuseMegakernel(torch.nn.Module):
         unshifted = (
             1.1 * g.scale_query_by * g.head_dim * g.attn_scale <= K.UNSHIFTED_MAX
         )
-        attn_pipe = unshifted and kv_sal and rows <= _BASE_STEP_MAX_ROWS
+        pipe_max_rows = (
+            _LARGE_STEP_ROWS
+            if tpu_envs.SGLANG_TPU_MUSE_MK_LARGE_STEP_ATTN_PIPE.get()
+            else _BASE_STEP_MAX_ROWS
+        )
+        attn_pipe = unshifted and kv_sal and rows <= pipe_max_rows
         # few-row steps (decode) gather their rows in one round and have nothing to fold
         fold = (
             tpu_envs.SGLANG_TPU_MUSE_MK_FOLD.get()
@@ -669,6 +674,9 @@ def _pack_pages(n_page_entries: int) -> bool:
 
 
 def _vmem_limit(rows: int) -> int:
+    trace_mb = tpu_envs.SGLANG_TPU_MK_TRACE_VMEM_LIMIT_MB.get()
+    if trace_mb is not None and tpu_envs.SGLANG_TPU_MK_TRACE_REGIONS.get():
+        return int(trace_mb * 2**20)
     mb = tpu_envs.SGLANG_TPU_MK_LARGE_STEP_VMEM_LIMIT_MB.get()
     if mb is None or rows <= _LARGE_STEP_ROWS:
         return 60 * 2**20
