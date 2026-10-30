@@ -44,7 +44,7 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
-    get_server_args,
+    get_memory,
     mamba_cache_chunk_size,
 )
 from sglang_tpu.mamba_pool import AT_SLOT
@@ -64,12 +64,11 @@ _PALLAS_GDN_OP = None
 def _mamba_chunk_cap() -> Optional[int]:
     """Return the radix-cache mamba chunk cap when active, or None otherwise."""
     try:
-        server_args = get_server_args()
-    except ValueError:  # Standalone op use: no ServerArgs published.
+        if get_memory().disable_radix_cache:
+            return None
+        return mamba_cache_chunk_size()
+    except ValueError:  # Standalone op use: no config published.
         return None
-    if server_args.disable_radix_cache:
-        return None
-    return mamba_cache_chunk_size()
 
 
 def build_gdn_pallas_op():

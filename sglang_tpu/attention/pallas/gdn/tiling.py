@@ -311,6 +311,7 @@ def calculate_mixed_tile_size(
       kernel_size: 1D convolution kernel window size.
       tile_sizes: Candidate chunk tile sizes in descending order.
       attention_mode: Attention mode (GDN or KDA).
+      max_tile_size: Optional chunk cap enforced when radix caching is active.
 
     Returns:
       Derived chunk tile size fitting within VMEM capacity limits.
@@ -400,6 +401,7 @@ def get_tile_sizes(
       decode_tile_size: Explicit decode sequence tile size override, if provided.
       mixed_tile_size: Explicit prefill/mixed chunk size override, if provided.
       attention_mode: Attention mode (GDN or KDA).
+      max_mixed_tile_size: Optional chunk cap passed to calculate_mixed_tile_size.
 
     Returns:
       Tuple of (decode_tile_size, mixed_tile_size).
