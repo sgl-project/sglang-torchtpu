@@ -768,6 +768,16 @@ def ragged_paged_attention(
         default_decode, default_prefill = calculate_block_sizes(
             model_cfgs, serve_cfgs, vmem_limit_bytes
         )
+    swa_blocks = tpu_envs.SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS.get()
+    if prefill_block_sizes is None and sliding_window is not None and swa_blocks:
+        # Smaller tiles waste less of a sliding-window band than the full-attention search.
+        bq_sz, bkv_sz = (int(v) for v in swa_blocks.split(":"))
+        prefill_block_sizes = dataclasses.replace(
+            default_prefill,
+            bq_sz=bq_sz,
+            bq_c_sz=math.gcd(bq_sz, default_prefill.bq_c_sz),
+            bkv_sz=bkv_sz,
+        )
 
     num_q_heads_per_kv_head = num_q_heads // num_kv_heads
     lse_hbm = None
