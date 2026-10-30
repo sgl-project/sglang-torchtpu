@@ -9,7 +9,7 @@ import os
 import re
 import stat
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 from sglang.srt.runtime_context import get_model, get_parallel, get_spec
@@ -18,6 +18,7 @@ from sglang_tpu.envs import envs
 
 logger = logging.getLogger(__name__)
 _CACHE_ROOT = Path("/dev/shm/torch_tpu_cache")
+_checkpoint_release: Future[None] | None = None
 resolve_compilations = LazyImport(
     "torch_tpu._internal.compile._backend", "resolve_compilations"
 )
@@ -192,20 +193,59 @@ def release_compile_artifacts(*, native_only: bool = False) -> None:
             _release_tmpfs_cache(root)
 
 
-def release_startup_page_cache(*, synchronize: bool = True) -> None:
-    """Join cache writers, then release startup files once per host.
+def _model_paths() -> list[str]:
+    model_paths = [get_model().model_path]
+    if draft_path := get_spec().speculative_draft_model_path:
+        model_paths.append(draft_path)
+    return model_paths
 
-    Args:
-      synchronize: Wait for every rank's writers. Without it, only lock-guarded
-        native cache entries are removed.
+
+def start_checkpoint_page_cache_release() -> None:
+    """Overlap checkpoint eviction with warmup after all weight readers finish."""
+    global _checkpoint_release
+    # Keep collective order independent of host-local cleanup settings.
+    # Other local ranks can still be reading the same checkpoint files.
+    get_parallel().world_group.barrier()
+    if (
+        not envs.SGLANG_TPU_RELEASE_CHECKPOINT_PAGE_CACHE.get()
+        or get_model().is_startup_weight_load_overlap
+    ):
+        return
+    if int(os.environ["LOCAL_RANK"]) != 0 or _checkpoint_release is not None:
+        return
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tpu-checkpoint")
+    _checkpoint_release = executor.submit(release_checkpoint_page_cache, _model_paths())
+    executor.shutdown(wait=False)
+    logger.info("Checkpoint page-cache release queued before graph warmup")
+
+
+def release_startup_page_cache(
+    *, include_checkpoints: bool = True, synchronize: bool = True
+) -> None:
+    """Join writers and release files; checkpoint cleanup belongs to scheduler init.
+
+    Without rank synchronization, only lock-guarded native compiler entries are
+    removed.
     """
+    global _checkpoint_release
     resolve_compilations([])
     if synchronize:
         get_parallel().world_group.barrier()
     if get_parallel().world_group.local_rank != 0:
         return
-    model_paths = [get_model().model_path]
-    if draft_path := get_spec().speculative_draft_model_path:
-        model_paths.append(draft_path)
-    release_checkpoint_page_cache(model_paths)
+    if include_checkpoints:
+        if _checkpoint_release is None:
+            release_checkpoint_page_cache(_model_paths())
+        else:
+            _join_checkpoint_page_cache_release()
+            _checkpoint_release = None
     release_compile_artifacts(native_only=not synchronize)
+
+
+def _join_checkpoint_page_cache_release() -> None:
+    started = time.monotonic()
+    _checkpoint_release.result()
+    logger.info(
+        "Checkpoint page-cache release join: elapsed_s=%.3f",
+        time.monotonic() - started,
+    )
