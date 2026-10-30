@@ -20,9 +20,17 @@ step's K/V itself in every mode; nothing stages K/V outside it.
 # NOTE: do *not* add ``from __future__ import annotations`` here (see
 # attention_pallas_rpa_base for why torch_tpu's jax_op needs real annotations).
 
+import os
+
 import torch
 
 from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+# How ``gather_heads`` collects the group's query heads. The default is the
+# zero-padded all-reduce; ``SGLANG_TPU_DCP_GATHER=all_gather`` selects
+# ``all_gather_into_tensor``, which returns a wrong buffer inside the compiled
+# decode forward at some batch sizes (see ``gather_heads``).
+_GATHER_VIA_ALL_GATHER = os.environ.get("SGLANG_TPU_DCP_GATHER", "") == "all_gather"
 
 __all__ = [
     "DCP_OP_NAME",
@@ -296,9 +304,9 @@ def _all_reduce_gather(
 
     Implemented as an in-place all-reduce over a zero-padded copy: every rank
     contributes its own block and zeros elsewhere, so the sum is exact.
-    Workaround: inside a compiled graph the torch_tpu all-gather op returns its
-    freshly allocated output uninitialised (torch_tpu 0.1.1.dev20260914); the
-    all-gather can replace this once it fills its output there.
+    Used instead of the torch_tpu all-gather, which inside a compiled graph
+    returns a wrong (uninitialised or stale) output for some shapes; see
+    ``gather_heads``.
 
     ``rank_mask`` is ``arange(world_size) == rank`` as a device tensor: the rank
     enters the graph as data, not as structure, so every rank compiles the same
@@ -324,25 +332,32 @@ def gather_heads(
 ) -> torch.Tensor:
     """``[T, H, D]`` of every rank as ``[T, H * world_size, D]``, rank-major.
 
-    One ``all_gather_into_tensor`` over the group. The zero-padded all-reduce
-    form (``_all_reduce_gather``) is kept for groups without an all-gather
-    (the CPU test doubles); on torch_tpu 0.2.0 / libtpu 0.0.50 a bf16
-    all-reduce of the queries inside the compiled forward deadlocks the
-    device on its first execute, while the all-gather runs.
+    Gathered with the zero-padded all-reduce (``_all_reduce_gather``), as on
+    main. ``all_gather_into_tensor`` into a fresh buffer is not used: inside
+    the compiled decode forward on torch_tpu 0.2.0 / libtpu 0.0.50 it hands
+    the kernel wrong gathered queries at the bs=16 bucket (gpt-oss-120b,
+    dcp 2: gsm8k 98% -> ~5% as soon as a decode batch has more than 8 rows,
+    with one live request as well as with many; swapping only this gather for
+    the all-reduce restores 98.5% at 64-way concurrency). The same op compiled
+    on its own, over the same 2-rank groups and shapes, returns the right
+    data, so the fault lies in its interaction with the rest of the graph
+    (the mutated ``new_empty`` output next to the donated Pallas op) and is
+    not isolated yet. The all-gather form is kept behind
+    ``SGLANG_TPU_DCP_GATHER=all_gather`` for experiments.
     """
     if world_size == 1:
         return x
-    if not hasattr(group, "all_gather_into_tensor"):
-        return _all_reduce_gather(x, group, world_size, rank_mask, dim=1)
-    num_tokens, heads, head_dim = x.shape
-    gathered = x.new_empty((world_size * num_tokens * heads, head_dim))
-    group.all_gather_into_tensor(gathered, x.contiguous().view(-1, head_dim))
-    return (
-        gathered.view(world_size, num_tokens, heads, head_dim)
-        .permute(1, 0, 2, 3)
-        .reshape(num_tokens, world_size * heads, head_dim)
-        .contiguous()
-    )
+    if _GATHER_VIA_ALL_GATHER and hasattr(group, "all_gather_into_tensor"):
+        num_tokens, heads, head_dim = x.shape
+        gathered = x.new_empty((world_size * num_tokens * heads, head_dim))
+        group.all_gather_into_tensor(gathered, x.contiguous().view(-1, head_dim))
+        return (
+            gathered.view(world_size, num_tokens, heads, head_dim)
+            .permute(1, 0, 2, 3)
+            .reshape(num_tokens, world_size * heads, head_dim)
+            .contiguous()
+        )
+    return _all_reduce_gather(x, group, world_size, rank_mask, dim=1)
 
 
 def own_heads(
