@@ -15,8 +15,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # libssl-dev: the HiCache page-hash extension (mem_cache/cpp_utils) links
 # OpenSSL; storage backends and KV events JIT-build it at runtime.
+# libtcmalloc-minimal4: TPU env overrides preload it into the scheduler ranks
+# (sglang_tpu/env_override.py, #1817).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git curl ca-certificates build-essential libgomp1 libssl-dev \
+        libtcmalloc-minimal4 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /sgl-workspace/sglang
