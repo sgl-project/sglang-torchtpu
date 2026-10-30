@@ -161,7 +161,6 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     is_cross_layer_mhc_fusion_enabled,
 )
 from sglang.srt.models.deepseek_common.utils import (
-    _is_tpu,
     _use_aiter_bpreshuffle_gfx95,
     is_wint4afp8_or_wint4a16_config,
     quant_blocks_shared_experts_fusion,
@@ -283,7 +282,7 @@ def _get_mhc_ops() -> MhcOps:
 
 logger = logging.getLogger(__name__)
 
-_FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get() and not _is_tpu
+_FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _FP8_WO_A_UE8M0 = _FP8_WO_A_GEMM and DEEPGEMM_SCALE_UE8M0
 
 
@@ -1007,7 +1006,7 @@ class MqaAttentionBase(nn.Module):
         )
 
     def _kernel_num_heads(self, num_tokens: int) -> int:
-        if self.attn_tp_size == 1 or _is_tpu:
+        if self.attn_tp_size == 1:
             return self.n_local_heads
 
         if get_platform().is_sm120:
@@ -5470,12 +5469,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self._mhc_prewarmed_at_load:
             return
         self._mhc_prewarmed_at_load = True
-        if (
-            _is_npu
-            or _is_xpu
-            or _is_tpu
-            or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
-        ):
+        if _is_npu or _is_xpu or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             return
         layer = next(
             (m for m in self.model.layers if isinstance(m, DeepseekV4DecoderLayer)),
