@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLModel
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.weights.source import (
     materialize_weight,
     resolve_weight,
@@ -356,7 +357,13 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
             else None
         )
         position_ids = None
-        if host_image_grid_thw is not None or host_video_grid_thw is not None:
+        # On TPU, text-only positions are resolved on the host too: the model's
+        # fallback reads input_ids on the device.
+        if (
+            host_image_grid_thw is not None
+            or host_video_grid_thw is not None
+            or current_platform.is_tpu()
+        ):
             position_ids, _ = self.model.get_rope_index(
                 host_ids,
                 host_image_grid_thw,
