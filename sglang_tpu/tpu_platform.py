@@ -1179,6 +1179,11 @@ class TpuSRTPlatform(SRTPlatform):
 
         return TpuGraphRunner
 
+    def get_weight_update_handlers(self) -> dict:
+        from sglang_tpu.weight_sync.handlers import WEIGHT_UPDATE_HANDLERS
+
+        return WEIGHT_UPDATE_HANDLERS
+
     def get_quantization_config(
         self, quantization: str
     ) -> Optional[Type[QuantizationConfig]]:
