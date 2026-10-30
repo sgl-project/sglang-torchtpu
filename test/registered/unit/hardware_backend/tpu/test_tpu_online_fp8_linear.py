@@ -12,8 +12,8 @@ from torch import nn
 
 from sglang.srt.layers.quantization import fp8
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-from sglang.srt.layers.quantization.fp8_utils import per_output_channel_quant_fp8
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.fp8_linear import prepare_tpu_online_fp8_linear_weights
 
 _FP8 = torch.float8_e4m3fn
 
@@ -57,9 +57,12 @@ class TestTpuOnlineFp8Linear(CustomTestCase):
         layer0 = _quantize_on_tpu(shard0)
         layer1 = _quantize_on_tpu(shard1)
 
-        # Post-load layout is [K, N]; kv columns follow the 32 q columns.
-        kv0 = layer0.weight[:, 32:].contiguous().view(torch.uint8)
-        kv1 = layer1.weight[:, 32:].contiguous().view(torch.uint8)
+        # Post-load layout is a contiguous [K, N]; kv columns follow the 32 q
+        # columns.
+        self.assertTrue(layer0.weight.is_contiguous())
+        self.assertTrue(layer1.weight.is_contiguous())
+        kv0 = layer0.weight.view(torch.uint8)[:, 32:]
+        kv1 = layer1.weight.view(torch.uint8)[:, 32:]
         self.assertTrue(torch.equal(kv0, kv1))
         self.assertTrue(torch.equal(layer0.weight_scale[32:], layer1.weight_scale[32:]))
 
@@ -82,6 +85,11 @@ class TestTpuOnlineFp8Linear(CustomTestCase):
 
         self.assertEqual(layer.weight.dtype, _FP8)
         self.assertEqual(tuple(layer.weight.shape), (4, 2))
+        # apply_tpu_fp8_linear reads a contiguous [K, N] base tensor, not a
+        # transposed view of the [N, K] weight.
+        self.assertTrue(layer.weight.is_contiguous())
+        self.assertIsNone(layer.weight.data._base)
+        self.assertTrue(layer.weight_scale.is_contiguous())
         self.assertEqual(tuple(layer.weight_scale.shape), (2, 1))
         self.assertIsNone(layer.input_scale)
         fp8_max = torch.finfo(_FP8).max
@@ -96,9 +104,12 @@ class TestTpuOnlineFp8Linear(CustomTestCase):
     def test_channelwise_round_trip_is_within_fp8_precision(self):
         weight = torch.randn(64, 128, generator=torch.Generator().manual_seed(1))
 
-        qweight, scale = per_output_channel_quant_fp8(weight, dtype=_FP8)
+        layer = nn.Module()
+        layer.weight = nn.Parameter(weight.clone(), requires_grad=False)
 
-        dequant = qweight.float() * scale
+        prepare_tpu_online_fp8_linear_weights(layer, dtype=_FP8)
+
+        dequant = layer.weight.t().float() * layer.weight_scale
         relative_error = (dequant - weight).abs().max() / weight.abs().max()
         self.assertLess(relative_error.item(), 0.07)
 
