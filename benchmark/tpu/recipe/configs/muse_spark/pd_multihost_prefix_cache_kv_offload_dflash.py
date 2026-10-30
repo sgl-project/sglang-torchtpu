@@ -10,6 +10,13 @@ from copy import deepcopy
 from benchmark.tpu.recipe.configs.muse_spark.server import CONFIG as SERVER_CONFIG
 
 ROLE = os.environ.get("CI_PD_ROLE", "prefill")
+# The CI weights volume may not carry the draft; the Hub checkpoint is public.
+_STAGED_DRAFT = "/weights/Muse-Spark-Open-DFlash2"
+DRAFT_MODEL = (
+    _STAGED_DRAFT
+    if os.path.isdir(_STAGED_DRAFT)
+    else "RadixArk/Muse-Spark-Open-DFlash2"
+)
 
 CONFIG = deepcopy(SERVER_CONFIG)
 CONFIG["server_args"].update(
@@ -21,7 +28,7 @@ CONFIG["server_args"].update(
     context_length=8192,
     mem_fraction_static=0.85,
     speculative_algorithm="DFLASH",
-    speculative_draft_model_path="/weights/Muse-Spark-Open-DFlash2",
+    speculative_draft_model_path=DRAFT_MODEL,
     speculative_num_draft_tokens=8,
     disaggregation_mode=ROLE,
     disaggregation_transfer_backend="raiden",
