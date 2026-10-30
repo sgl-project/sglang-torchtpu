@@ -41,7 +41,12 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
-from sglang.srt.runtime_context import get_disagg, get_exec
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_server_args,
+    mamba_cache_chunk_size,
+)
 from sglang_tpu.mamba_pool import AT_SLOT
 
 if TYPE_CHECKING:
@@ -54,6 +59,13 @@ logger = logging.getLogger(__name__)
 # One custom op per process. The kernel specialises on shapes internally, so no
 # shape-dependent op specialisation is needed at the torch.library boundary.
 _PALLAS_GDN_OP = None
+
+
+def _mamba_chunk_cap() -> int:
+    """Return the active radix-cache mamba chunk size, or 64 if uninitialized."""
+    if get_server_args() is None:
+        return 64
+    return mamba_cache_chunk_size()
 
 
 def build_gdn_pallas_op():
@@ -183,6 +195,7 @@ def build_gdn_pallas_op():
                 track_indices=track_indices,
                 track_end=track_end,
                 num_spec_tokens=num_spec_tokens,
+                max_mixed_tile_size=_mamba_chunk_cap(),
             )
         # Flatten the ((conv, rec), out) return so the bridge can alias the two
         # state buffers (outputs 0, 1) back onto the donated inputs (args 3, 4).

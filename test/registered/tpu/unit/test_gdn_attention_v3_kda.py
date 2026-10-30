@@ -380,17 +380,32 @@ def _reachable_tile_batches(
                 window_size=window,
                 attention_mode=attention_mode,
             )
-            if dec in seen_decode and mix in seen_mixed:
+            if (dec in seen_decode and mix in seen_mixed) or (
+                window > 1 and len(batches) > 0 and dec in seen_decode
+            ):
                 continue
+            batched_only = (mix in seen_mixed) or (window > 1 and len(batches) > 0)
+            prefill_only = (dec in seen_decode) and not batched_only
             seen_decode.add(dec)
             seen_mixed.add(mix)
-            lengths = [window, batch_size - window] + [0] * (num_seqs - 2)
+            if batched_only:
+                num_decode = min(num_seqs, batch_size // window)
+                lengths = [window] * num_decode + [0] * (num_seqs - num_decode)
+                distribution = [num_decode, num_decode, num_decode]
+            elif prefill_only:
+                lengths = [batch_size] + [0] * (num_seqs - 1)
+                distribution = [0, 1, 1]
+            else:
+                lengths = [window, batch_size - window] + [0] * (num_seqs - 2)
+                distribution = [1, 2, 2]
             batches.append(
                 dict(
                     max_reqs=num_seqs,
                     lengths=lengths,
                     q_loc=[0, *np.cumsum(lengths)],
-                    distribution=[1, 2, 2],
+                    distribution=distribution,
+                    batched_only=batched_only,
+                    prefill_only=prefill_only,
                 )
             )
     assert batches, f"No reachable tile pairs for n_v={n_v}, window={window}"
@@ -915,7 +930,9 @@ class TestGDNAttentionV3KDA(CustomTestCase):
                 n_kq, n_v, jnp.float32, 1, config.AttentionMode.KDA
             ):
                 query_lens = batch["lengths"]
-                context_lens = [4, 4] + [0] * (len(query_lens) - 2)
+                context_lens = [4] * int(batch["distribution"][2]) + [0] * (
+                    len(query_lens) - int(batch["distribution"][2])
+                )
                 distribution = batch["distribution"]
                 with self.subTest(
                     n_v=n_v,
@@ -936,6 +953,8 @@ class TestGDNAttentionV3KDA(CustomTestCase):
                             "recurrent_state": kwargs["recurrent_state"].copy(),
                         },
                         attention_mode=config.AttentionMode.KDA,
+                        batched_only=batch.get("batched_only", False),
+                        prefill_only=batch.get("prefill_only", False),
                     )
                     self._assert_matches_reference(
                         kwargs, out_conv, out_state, out, int(distribution[2])

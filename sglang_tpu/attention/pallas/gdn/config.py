@@ -187,7 +187,10 @@ class GDNConfig:
                     return b
             return 2
         # GDN: between-block updates scale as 1 / B.
-        return max(2, min(16, 16 // head_groups))
+        for b in (16, 8, 4):
+            if head_groups * b <= 16:
+                return b
+        return 2
 
     @property
     def use_recurrent(self) -> bool:

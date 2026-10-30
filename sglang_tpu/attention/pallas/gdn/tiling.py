@@ -291,6 +291,7 @@ def calculate_mixed_tile_size(
     kernel_size: int = 4,
     tile_sizes: tuple[int, ...] = GDNConfig.MIXED_TILE_SIZES,
     attention_mode: config.AttentionMode = config.AttentionMode.GDN,
+    max_tile_size: int | None = None,
 ) -> int:
     """Largest prefill chunk whose VMEM estimate fits the limit.
 
@@ -322,7 +323,14 @@ def calculate_mixed_tile_size(
     rec_state_bytes = jnp.dtype(recurrent_state_dtype).itemsize
 
     # Select the largest candidate chunk (up to 128 tokens) that fits in VMEM.
-    prefill_candidates = [c for c in tile_sizes if c <= seq_len]
+    prefill_candidates = [
+        c
+        for c in tile_sizes
+        if c <= seq_len
+        and (max_tile_size is None or max_tile_size <= 0 or c <= max_tile_size)
+    ]
+    if not prefill_candidates:
+        prefill_candidates = [tile_sizes[-1]]
     mixed_tile_size = prefill_candidates[-1]
     for candidate in prefill_candidates:
         vmem_est = get_vmem_estimate_bytes(
@@ -365,6 +373,7 @@ def get_tile_sizes(
     decode_tile_size: int | None = None,
     mixed_tile_size: int | None = None,
     attention_mode: config.AttentionMode = config.AttentionMode.GDN,
+    max_mixed_tile_size: int | None = None,
 ) -> tuple[int, int]:
     """Derives decode and mixed tile sizes within each kernel's VMEM limit.
 
@@ -433,6 +442,7 @@ def get_tile_sizes(
             vmem_capacity_limit_bytes=mixed_vmem_limit_bytes,
             kernel_size=kernel_size,
             attention_mode=attention_mode,
+            max_tile_size=max_mixed_tile_size,
         )
 
     # Guarantee strictly positive tile sizes (>= 1) for Pallas grid compilation.

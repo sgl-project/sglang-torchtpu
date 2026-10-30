@@ -382,17 +382,32 @@ def _reachable_tile_batches(
                 window_size=window,
                 attention_mode=attention_mode,
             )
-            if dec in seen_decode and mix in seen_mixed:
+            if (dec in seen_decode and mix in seen_mixed) or (
+                window > 1 and len(batches) > 0 and dec in seen_decode
+            ):
                 continue
+            batched_only = (mix in seen_mixed) or (window > 1 and len(batches) > 0)
+            prefill_only = (dec in seen_decode) and not batched_only
             seen_decode.add(dec)
             seen_mixed.add(mix)
-            lengths = [window, batch_size - window] + [0] * (num_seqs - 2)
+            if batched_only:
+                num_decode = min(num_seqs, batch_size // window)
+                lengths = [window] * num_decode + [0] * (num_seqs - num_decode)
+                distribution = [num_decode, num_decode, num_decode]
+            elif prefill_only:
+                lengths = [batch_size] + [0] * (num_seqs - 1)
+                distribution = [0, 1, 1]
+            else:
+                lengths = [window, batch_size - window] + [0] * (num_seqs - 2)
+                distribution = [1, 2, 2]
             batches.append(
                 dict(
                     max_reqs=num_seqs,
                     lengths=lengths,
                     q_loc=[0, *np.cumsum(lengths)],
-                    distribution=[1, 2, 2],
+                    distribution=distribution,
+                    batched_only=batched_only,
+                    prefill_only=prefill_only,
                 )
             )
     assert batches, f"No reachable tile pairs for n_v={n_v}, window={window}"
@@ -1509,6 +1524,8 @@ class TestGDNAttentionV3(CustomTestCase):
                                 kwargs,
                                 conv_state=conv_state.copy(),
                                 recurrent_state=rec_state.copy(),
+                                batched_only=batch.get("batched_only", False),
+                                prefill_only=batch.get("prefill_only", False),
                             )
                             if num_spec_tokens > 0:
                                 call_kwargs["read_offsets"] = read_offsets
@@ -1865,6 +1882,7 @@ class TestGDNTileSelection(CustomTestCase):
                 (config.AttentionMode.KDA, 32, 8),
                 (config.AttentionMode.GDN, 8, 16),
                 (config.AttentionMode.GDN, 16, 8),
+                (config.AttentionMode.GDN, 24, 4),
                 (config.AttentionMode.GDN, 32, 4),
                 (config.AttentionMode.GDN, 64, 2),
             ):
@@ -2027,6 +2045,86 @@ class TestGDNTileSelection(CustomTestCase):
                 np.asarray(rec[active_slots]),
                 np.asarray(rec)[np.asarray(expected)],
             )
+
+    def test_mixed_tile_size_power_of_two_and_radix_cap(self):
+        """GDN triangular_block_size is always a power of two and mixed_tile_size respects max_mixed_tile_size."""
+        importlib = __import__("importlib")
+        pltpu = importlib.import_module("jax.experimental.pallas.tpu")
+        config = importlib.import_module("sglang_tpu.attention.pallas.gdn.config")
+        tiling = importlib.import_module("sglang_tpu.attention.pallas.gdn.tiling")
+
+        def _check():
+            dtypes = config.Dtypes(
+                act_in=jnp.dtype(jnp.float32),
+                act_out=jnp.dtype(jnp.bfloat16),
+                compute=jnp.dtype(jnp.float32),
+                recurrent_state=jnp.dtype(jnp.float32),
+                conv_state=jnp.dtype(jnp.float32),
+            )
+            for mode in (config.AttentionMode.GDN, config.AttentionMode.KDA):
+                for n_v in range(1, 65):
+                    cfg = config.GDNConfig(
+                        mode=config.GDNMode.PER_SEQ,
+                        dtypes=dtypes,
+                        batch_size=128,
+                        dim_size=3 * n_v * 128,
+                        kernel_size=4,
+                        tile_size=64,
+                        num_kq_heads=n_v,
+                        num_v_heads=n_v,
+                        kq_head_dim=128,
+                        v_head_dim=128,
+                        attention_mode=mode,
+                    )
+                    b = cfg.triangular_block_size
+                    self.assertIn(b, (2, 4, 8, 16))
+                    self.assertEqual(cfg.chunk_size % b, 0)
+
+            num_lanes = pltpu.get_tpu_info().num_lanes
+            vmem_limit = config.GDNConfig.get_vmem_limit_bytes(1)
+            for max_cap, expected_full, expected_resumed in (
+                (None, 128, 64),
+                (128, 128, 64),
+                (64, 64, 64),
+            ):
+                _, mix_full = tiling.get_tile_sizes(
+                    batch_size=193,
+                    num_seqs=1,
+                    padded_batch_size=208,
+                    n_kq=2,
+                    n_v=4,
+                    d_k=128,
+                    d_v=128,
+                    kernel_size=4,
+                    conv_state_dim_size=2 * 2 * 128 + 4 * 128,
+                    act_out_dtype=jnp.dtype(jnp.bfloat16),
+                    recurrent_state_dtype=jnp.dtype(jnp.float32),
+                    num_lanes=num_lanes,
+                    decode_vmem_limit_bytes=vmem_limit,
+                    mixed_vmem_limit_bytes=vmem_limit,
+                    max_mixed_tile_size=max_cap,
+                )
+                _, mix_resumed = tiling.get_tile_sizes(
+                    batch_size=65,
+                    num_seqs=1,
+                    padded_batch_size=80,
+                    n_kq=2,
+                    n_v=4,
+                    d_k=128,
+                    d_v=128,
+                    kernel_size=4,
+                    conv_state_dim_size=2 * 2 * 128 + 4 * 128,
+                    act_out_dtype=jnp.dtype(jnp.bfloat16),
+                    recurrent_state_dtype=jnp.dtype(jnp.float32),
+                    num_lanes=num_lanes,
+                    decode_vmem_limit_bytes=vmem_limit,
+                    mixed_vmem_limit_bytes=vmem_limit,
+                    max_mixed_tile_size=max_cap,
+                )
+                self.assertEqual(mix_full, expected_full)
+                self.assertEqual(mix_resumed, expected_resumed)
+
+        self._with_tpu7x_mesh(_check)
 
 
 @unittest.skipIf(not _has_jax(), "Requires JAX")

@@ -375,6 +375,7 @@ def outer_kernel(
         "num_spec_tokens",
         "decode_tile_size",
         "mixed_tile_size",
+        "max_mixed_tile_size",
         "batched_only",
         "prefill_only",
         "zero_initialize_out",
@@ -420,6 +421,7 @@ def fused_conv1d_gdn(
     compute_precision: jnp.dtype = jnp.float32.dtype,
     decode_tile_size: int | None = None,
     mixed_tile_size: int | None = None,
+    max_mixed_tile_size: int | None = None,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -632,6 +634,7 @@ def fused_conv1d_gdn(
         decode_tile_size=decode_tile_size,
         mixed_tile_size=mixed_tile_size,
         attention_mode=attention_mode,
+        max_mixed_tile_size=max_mixed_tile_size,
     )
 
     batch_padding_size = padded_batch_size - batch_size
