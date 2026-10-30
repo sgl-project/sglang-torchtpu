@@ -33,6 +33,7 @@ on:
         options:
           - all
           - mh
+          - pd-sh-muse-overload
           - pd-sh-qwen3-vl-30b
           - sh
       test_filter:
@@ -205,6 +206,33 @@ jobs:
       weights_pvc: model-weights
       run_name: pd-mh-muse-dflash
       timeout_per_file: 14400
+    permissions:
+      contents: read
+      id-token: write
+
+  # Muse Spark 1P1D overload stress: mixed text, image and video load through an
+  # admission-capped Rust router, GSM8K and MMMU-Pro under load and again after
+  # the pair drains. One full host per engine; the router runs on the prefill pod.
+  pd-sh-muse-overload:
+    needs: [build, discover-tests]
+    if: >-
+      ${{ !cancelled() && needs.discover-tests.result == 'success'
+          && contains(fromJSON('["all","pd-sh-muse-overload"]'), inputs.only || 'all')
+          && contains('test/registered/tpu/e2e/test_tpu_muse_spark_pd_singlehost_overload.py', inputs.test_filter) }}
+    name: test_tpu_muse_spark_pd_singlehost_overload
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_tpu_muse_spark_pd_singlehost_overload
+      lane: nightly
+      hosts: 1
+      pd_prefill_hosts: 1
+      pd_decode_hosts: 1
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_muse_spark_pd_singlehost_overload.py integration
+      files: test/registered/tpu/e2e/test_tpu_muse_spark_pd_singlehost_overload.py
+      weights_pvc: model-weights
+      run_name: pd-sh-muse-overload
     permissions:
       contents: read
       id-token: write
