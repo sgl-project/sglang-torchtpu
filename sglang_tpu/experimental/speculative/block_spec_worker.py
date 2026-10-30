@@ -26,7 +26,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     PPProxyTensors,
 )
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.draft_worker_common import make_draft_block_spec_info
@@ -113,9 +113,20 @@ class TpuBlockSpecWorker(TpuSpecWorker):
 
     def init_cuda_graphs(self) -> None:
         super().init_cuda_graphs()
-        self._warmup_draft_block_inputs()
-        if self._sampled_drafts:
-            self._warmup_draft_sampling()
+        # Under PP (pp_size > 1), TpuBlockSpecWorker only runs on the last stage
+        # of a non-decode (PD prefill) server, which projects extend draft KV and
+        # never drafts or samples speculative blocks. Scope this skip strictly to
+        # pp_size > 1 and disaggregation_mode != "decode" so PP prefill avoids
+        # single-stage decode compilations and unsharded-lm_head draft-sampling
+        # HBM spikes on the last stage, while keeping all pp_size == 1 (TP /
+        # monolithic) and decode paths completely unchanged.
+        is_pp_non_decode = (
+            get_parallel().pp_size > 1 and get_disagg().disaggregation_mode != "decode"
+        )
+        if not is_pp_non_decode:
+            self._warmup_draft_block_inputs()
+            if self._sampled_drafts:
+                self._warmup_draft_sampling()
         self._warmup_extend_draft_inputs()
         # The base snapshot ran before these block-draft warmups.
         snapshot_recompilation_baseline()
