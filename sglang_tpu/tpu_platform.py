@@ -1499,15 +1499,14 @@ class TpuSRTPlatform(SRTPlatform):
         # process before init_backend() runs in worker subprocesses.
         if not getattr(self, "_backend_initialized", False):
             return 0
-        _, limit = torch.accelerator.get_memory_info(self.get_device(device_id))
+        # The worker rank is a label; PJRT exposes its bound chiplet at index 0.
+        _, limit = torch.accelerator.get_memory_info(self.get_device(0))
         return int(limit)
 
     def get_current_memory_usage(self, device: Optional[torch.device] = None) -> float:
         if not getattr(self, "_backend_initialized", False):
             return 0.0
-        if device is None:
-            device = self.get_device(0)
-        free, total = torch.accelerator.get_memory_info(device)
+        free, total = torch.accelerator.get_memory_info(self.get_device(0))
         return float(total - free)
 
     def get_device(self, device_id: int = 0) -> torch.device:

@@ -309,13 +309,18 @@ class TestTpuPlatformMemory(CustomTestCase):
 
     def test_total_memory_returns_reported_limit(self):
         dev, mem = self._patch_mem(10 << 30, 96 << 30)
-        with dev, mem:
-            self.assertEqual(self.platform.get_device_total_memory(), 96 << 30)
+        with dev as get_device, mem:
+            self.assertEqual(self.platform.get_device_total_memory(2), 96 << 30)
+            get_device.assert_called_once_with(0)
 
     def test_current_memory_usage_is_total_minus_free(self):
         dev, mem = self._patch_mem(10 << 30, 96 << 30)
-        with dev, mem:
-            self.assertEqual(self.platform.get_current_memory_usage(), float(86 << 30))
+        with dev as get_device, mem:
+            self.assertEqual(
+                self.platform.get_current_memory_usage(torch.device("cpu", 2)),
+                float(86 << 30),
+            )
+            get_device.assert_called_once_with(0)
 
     def test_available_memory_returns_free_and_total(self):
         dev, mem = self._patch_mem(10 << 30, 96 << 30)
