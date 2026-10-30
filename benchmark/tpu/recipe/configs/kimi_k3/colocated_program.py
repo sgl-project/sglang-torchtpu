@@ -64,6 +64,9 @@ server_args.update(
         # requests' slots come out of the same state slots.
         "disable_radix_cache": False,
         "mamba_radix_cache_strategy": "extra_buffer",
+        # Checkpoints at the prefill's page-sized chunks only (the decode
+        # program keeps its requests' KDA state; K3ProgramAlgo sets the same).
+        "mamba_track_interval": PAGE_SIZE * (1 << 16),
         "max_mamba_cache_size": CHECKPOINTS + 2 * RUNNING,
         "max_total_tokens": None,
     }
