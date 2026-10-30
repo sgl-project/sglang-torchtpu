@@ -215,6 +215,9 @@ class TpuEnvs:
     # fp8 q; not bit-exact with the default tile. Mixed/prefill, SEQ_ALONG_LANE,
     # head_dim <= 64, no sink / LSE / soft cap / cache-only / context parallel.
     SGLANG_TPU_RPA_TRANSPOSED = EnvBool(False)
+    # Transposed prefill tiles skip the compute blocks past the last query of a
+    # partial q block (a sequence's last) instead of scoring padded rows. Exact.
+    SGLANG_TPU_RPA_SKIP_PAD_Q = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:

@@ -86,13 +86,18 @@ def tile(
     processed_kv_len: jax.Array,
     apply_mask: bool,
     cfgs: configs.RpaConfigs,
+    q_rows: jax.Array | None = None,
 ):
+    """``q_rows``: the q block's real queries when it may be partial; compute
+    blocks wholly past them are skipped and keep m at -inf (acc stays finite)."""
     heads = cfgs.aligned_num_q_heads_per_kv_head
     hd = cfgs.aligned_kv_head_dim
     bkv = cfgs.bkv_sz
     lanes = cfgs.bq_c_sz * heads
     rows = cfgs.bq_sz * heads
     offset = processed_kv_len - processed_q_len  # kv index of the first query
+    # QK-normed q and k bound |s| (log2 units) far inside exp2's range.
+    no_max = cfgs.serve.no_max
 
     if apply_mask:
         kv_iota = lax.broadcasted_iota(jnp.int32, (bkv, lanes), 0)
@@ -111,32 +116,55 @@ def tile(
         )  # [acc rows, bkv]
         for bq_start in range(0, cfgs.bq_sz, cfgs.bq_c_sz):
             cs = slice(bq_start * heads, bq_start * heads + lanes)
-            qt = qt_ref[kv_head, :, cs]  # [hd, lanes] fp8
-            s = lax.dot_general(
-                kh, qt, (((0,), (0,)), ((), ())), preferred_element_type=jnp.float32
-            )  # [bkv, lanes]
-            s = s.astype(jnp.bfloat16)
-            if apply_mask:
-                # key index kv_iota + processed_kv_len <= query index
-                # q_iota + bq_start + processed_q_len, i.e. q_kv_diff >= offset - bq_start.
-                mask = q_kv_diff >= offset - bq_start
-                if (window := cfgs.model.sliding_window) is not None:
-                    mask = jnp.logical_and(mask, q_kv_diff < window + offset - bq_start)
-                s = jnp.where(mask, s, cfgs.model.mask_value)
-            m_prev = m_ref[kv_head, :, cs]  # [1, lanes]
-            m_cur = jnp.max(s, axis=0, keepdims=True).astype(jnp.float32)
-            m_new = jnp.maximum(m_prev, m_cur)
-            alpha = jnp.exp2(m_prev - m_new)
-            p = jnp.exp2(s - m_new.astype(jnp.bfloat16))  # [bkv, lanes] bf16
-            o_t = lax.dot_general(
-                vt, p, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
-            )  # [acc rows, lanes]: O^T rows, then the row sums
-            acc_ref[kv_head, :, cs] = alpha * acc_ref[kv_head, :, cs] + o_t
-            # A finished q block starts its next one from -inf (alpha == 0 then
-            # clears acc and l).
-            m_ref[kv_head, :, cs] = jnp.where(
-                schedule_ref.is_last_k[step, 0], -jnp.inf, m_new
-            )
+
+            def block(kv_head=kv_head, kh=kh, vt=vt, bq_start=bq_start, cs=cs):
+                qt = qt_ref[kv_head, :, cs]  # [hd, lanes] fp8
+                s = lax.dot_general(
+                    kh, qt, (((0,), (0,)), ((), ())), preferred_element_type=jnp.float32
+                )  # [bkv, lanes]
+                if not no_max:
+                    s = s.astype(jnp.bfloat16)
+                if apply_mask:
+                    # key index kv_iota + processed_kv_len <= query index
+                    # q_iota + bq_start + processed_q_len, i.e. q_kv_diff >= offset - bq_start.
+                    mask = q_kv_diff >= offset - bq_start
+                    if (window := cfgs.model.sliding_window) is not None:
+                        mask = jnp.logical_and(
+                            mask, q_kv_diff < window + offset - bq_start
+                        )
+                    s = jnp.where(mask, s, cfgs.model.mask_value)
+                m_prev = m_ref[kv_head, :, cs]  # [1, lanes]
+                if no_max:
+                    # Bounded scores: m is -inf at a q block's first k block (alpha
+                    # clears acc and l) and 0 after; s stays f32 up to exp2.
+                    m_new = jnp.maximum(m_prev, 0.0)
+                    alpha = jnp.exp2(m_prev - m_new)
+                    p = jnp.exp2(s).astype(jnp.bfloat16)  # [bkv, lanes]
+                else:
+                    m_cur = jnp.max(s, axis=0, keepdims=True).astype(jnp.float32)
+                    m_new = jnp.maximum(m_prev, m_cur)
+                    alpha = jnp.exp2(m_prev - m_new)
+                    p = jnp.exp2(s - m_new.astype(jnp.bfloat16))  # [bkv, lanes] bf16
+                o_t = lax.dot_general(
+                    vt, p, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+                )  # [acc rows, lanes]: O^T rows, then the row sums
+                acc_ref[kv_head, :, cs] = alpha * acc_ref[kv_head, :, cs] + o_t
+                # A finished q block starts its next one from -inf (alpha == 0 then
+                # clears acc and l).
+                m_ref[kv_head, :, cs] = jnp.where(
+                    schedule_ref.is_last_k[step, 0], -jnp.inf, m_new
+                )
+
+            # A q block holds at least one query, so its first compute block is live.
+            if q_rows is None or bq_start == 0:
+                block()
+                continue
+            live = bq_start < q_rows
+            pl.when(live)(block)
+
+            @pl.when(jnp.logical_not(live))
+            def _(kv_head=kv_head, cs=cs):
+                m_ref[kv_head, :, cs] = jnp.full((1, lanes), -jnp.inf, jnp.float32)
 
     is_last_k = schedule_ref.is_last_k[step, 0] == 1
 

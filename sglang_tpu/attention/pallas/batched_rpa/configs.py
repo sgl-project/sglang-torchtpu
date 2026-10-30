@@ -99,6 +99,9 @@ class ServingConfigs:
     # Prefill tiles with transposed scores and fp8 q (see transposed.py);
     # env-gated in the wrapper, applied where `use_transposed` holds.
     transposed: bool = False
+    # Transposed tiles skip the compute blocks past a partial q block's last
+    # query (a sequence's last block) instead of scoring padded rows; exact.
+    skip_pad_q: bool = False
 
     @property
     def pages_per_seq(self) -> int:

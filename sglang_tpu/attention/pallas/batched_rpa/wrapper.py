@@ -743,6 +743,7 @@ def ragged_paged_attention(
             and not cache_only
             and cp_group_size is None
         ),
+        skip_pad_q=tpu_envs.SGLANG_TPU_RPA_SKIP_PAD_Q.get(),
     )
 
     q_hbm, new_kv_hbm = prepare_inputs(

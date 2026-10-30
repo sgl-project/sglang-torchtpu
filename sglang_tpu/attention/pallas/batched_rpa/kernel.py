@@ -445,6 +445,22 @@ def rpa_body(
             processed_kv_len=processed_kv_len[0],
             cfgs=cfgs,
         )
+        if cfgs.serve.skip_pad_q:
+            # A partial q block (a sequence's last) skips its padded compute blocks.
+            s_idx = jnp.maximum(0, schedule_ref.s_idx[step, 0])
+            q_len = cu_q_lens_ref[s_idx + 1] - cu_q_lens_ref[s_idx]
+            q_rows = q_len - schedule_ref.q_idx[step, 0] * cfgs.bq_sz
+            partial_q = q_rows < cfgs.bq_sz
+            run_full_q = run_tile
+
+            def run_tile(apply_mask):
+                pl.when(partial_q)(
+                    lambda: run_full_q(apply_mask=apply_mask, q_rows=q_rows)
+                )
+                pl.when(jnp.logical_not(partial_q))(
+                    lambda: run_full_q(apply_mask=apply_mask)
+                )
+
         if not cfgs.serve.skip_full_tile_mask:
             run_tile(apply_mask=True)
             return
@@ -696,6 +712,10 @@ def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
         name += f"-cp{cfgs.serve.cp_group_size}"
     if cfgs.use_transposed:
         name += "-tr"
+        if cfgs.serve.skip_pad_q:
+            name += "-spq"
+        if cfgs.serve.no_max:
+            name += "-nm"
     return name
 
 
