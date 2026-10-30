@@ -198,6 +198,8 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
     Attributes:
       verify_cache_candidates: [pbs, 2 * capacity] device int64 KV slots of
         [base, base + 2 * capacity); active verify rows are picked without a D2H sync.
+      verify_cache_candidates_cpu: [bs, 2 * capacity] host copy of the live rows,
+        which a hybrid-SWA draft maps to its SWA slots.
       committed_lens: [pbs] device int64 committed base.
       req_pool_indices: [pbs] device pool rows. 0 (reserved) marks padded rows
         in all three device fields.
@@ -209,6 +211,7 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
     """
 
     verify_cache_candidates: torch.Tensor
+    verify_cache_candidates_cpu: torch.Tensor
     committed_lens: torch.Tensor
     req_pool_indices: torch.Tensor
     req_pool_indices_cpu: torch.Tensor
@@ -255,6 +258,7 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
         # 0 is the reserved row and slot.
         return cls(
             verify_cache_candidates=padded_h2d(candidates, padded_bs, batch.device),
+            verify_cache_candidates_cpu=candidates,
             committed_lens=padded_h2d(committed_lens, padded_bs, batch.device),
             req_pool_indices=padded_h2d(req_pool_indices, padded_bs, batch.device),
             req_pool_indices_cpu=pad_rows(req_pool_indices_cpu, padded_bs),
@@ -278,6 +282,9 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
             verify_cache_candidates=torch.zeros(
                 (padded_bs, 2 * verify_window_rows), dtype=torch.int64
             ).to(device, non_blocking=True),
+            verify_cache_candidates_cpu=torch.zeros(
+                (0, 2 * verify_window_rows), dtype=torch.int64
+            ),
             committed_lens=zeros.to(device, non_blocking=True),
             req_pool_indices=zeros.to(device, non_blocking=True),
             req_pool_indices_cpu=zeros,

@@ -1441,6 +1441,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
             plan = TpuSpecVerifyInput.from_batch(batch, num_verify_rows=2, padded_bs=4)
             self.assertEqual(plan.host_len_slack, num_draft_tokens)
             self.assertEqual(plan.verify_cache_candidates.shape, (4, 6))
+            # A hybrid-SWA draft maps the live host rows to its SWA slots.
+            self.assertIs(
+                plan.verify_cache_candidates_cpu, draft.tpu_verify_cache_candidates
+            )
             with self.assertRaisesRegex(ValueError, "reserved KV window"):
                 TpuSpecVerifyInput.from_batch(batch, num_verify_rows=4, padded_bs=4)
 
