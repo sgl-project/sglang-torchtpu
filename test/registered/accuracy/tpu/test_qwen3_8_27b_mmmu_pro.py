@@ -1,4 +1,4 @@
-"""Qwen3.8-27B TPU accuracy on all 1,730 MMMU-Pro standard-10 questions."""
+"""Qwen3.8-27B TPU accuracy on the nightly MMMU-Pro question set (mmmu_full)."""
 
 import unittest
 
@@ -8,7 +8,7 @@ from sglang.test.tpu.utils.accuracy_base import AccuracyTestCase, gate_server_fa
 from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
 
 register_tpu_ci(
-    est_time=7200,
+    est_time=4500,
     suite="nightly-tpu-accuracy-qwen3-8-27b-mmmupro",
     nightly=True,
     labels=["singlehost", "qwen3.8-27b", "accuracy"],

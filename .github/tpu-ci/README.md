@@ -133,17 +133,20 @@ build ─┬─▶ feature-validation-tpu.yml
 Runs at 10:00 and 17:00 PT. A `plan` job maps the cron that fired to a selection
 (`day-10am` or `day-5pm`); dispatch takes `model` instead.
 
-| Slot | 1-host lane | 2-host lane |
-|---|---|---|
-| `day-10am` | GPT-OSS-120B AIME / GPQA / GSM8K / MMLU-Pro; GPT-OSS-20B; Gemma 4 AIME / GPQA; Qwen3.8 AIME / GPQA | Kimi-K2.6 MMMU shards |
-| `day-5pm` | Gemma 4 / Qwen3.5 / Qwen3.8 MMMU-Pro | DeepSeek R1 / V3.1 accuracy |
-
-- **Single-host:** one job per benchmark (one suite, one file), each written out in the
-  workflow with its suite, `run_name`, timeout and the selections it belongs to.
-- **Multi-host:** files registered to `nightly-tpu-multihost-accuracy` are discovered, and
-  a name pattern splits them between the two slots.
-- **`collect-full-evaluations`** merges the Kimi MMMU shards' results and checks that all
-  1,730 MMMU-Pro questions were answered exactly once.
+- **Slots:** `accuracy_slots.json` assigns every leg (a single-host suite, or a
+  multi-host group name) to one slot; `accuracy_slots.py` reads it for the workflow.
+  The weekly est_time bot (`update_tpu_est_time.py`) rebalances it per lane from the
+  recalibrated `est_time`, moving or swapping legs only when that shortens the busier
+  slot by at least 15 minutes. Legs sharing a `group` (the Kimi MMMU shards) move together.
+- **Single-host:** one matrix job, one leg per benchmark (one suite, one file); the
+  table carries each leg's `timeout_per_file`.
+- **Multi-host:** files registered to `nightly-tpu-multihost-accuracy` are discovered and
+  filtered by the table.
+- **Throttle:** each matrix caps its running legs at the lane's slices + 1, so later legs
+  wait in Actions with their full admission budget instead of timing out in Kueue.
+- **MMMU-Pro** scores every 4th question (433 of 1,730; `mmmu_full.SUBSET_STRIDE`).
+  **`collect-full-evaluations`** merges the Kimi MMMU shards' results and checks that
+  every question of that set was answered exactly once.
 
 ## How one TPU job runs — `_tpu-test.yml`
 
@@ -219,7 +222,7 @@ upstream est_time bot has no TPU data.
 | A single-host nightly test | `register_tpu_ci(..., suite="nightly-tpu-4-v7", nightly=True)`. Discovery adds the job. |
 | A multi-host nightly test | Register to `nightly-tpu-multihost` and add a `MULTIHOST_LAUNCH` dict plus its recipe. Discovery adds the job. |
 | A perf suite | Register it, add the suite to `run_suite.py`, and add the entry to both lists in `perf-test-tpu.yml` (the `model` choice and the default list), plus the `model` dispatch option. |
-| An accuracy benchmark | Register it, add the suite to `run_suite.py`, and add a job to `accuracy-test-tpu.yml` with its slot list. Keep `run_name` to 34 characters: it prefixes pod names, which are capped at 63. |
+| An accuracy benchmark | Register it, add the suite to `run_suite.py`, and add it to `accuracy_slots.json` with its `timeout_per_file` and either slot (the weekly bot rebalances). `accuracy-<suite minus nightly-tpu-accuracy->` becomes its `run_name`, which must stay within 34 characters: it prefixes pod names, which are capped at 63. |
 | A hand-wired P/D or exec test | A job in `feature-validation-tpu.yml` with `files:`, plus the `only` dispatch option in both nightly workflows. |
 | A 2x2x1 host | Resize any 2x2x1 CI node pool. Nothing else; the priority lane's share grows. |
 | A slice of a listed shape | A new node pool with a unique `ci-tpu-pool` label (multi-host: `--tpu-topology` and a workload policy). Nothing else. |

@@ -1,4 +1,4 @@
-"""MMMU-Pro shard 1/2: 865 distinct questions on one 2x2x2 slice."""
+"""MMMU-Pro shard 1/2 of the nightly question set (mmmu_full) on one 2x2x2 slice."""
 
 import unittest
 from functools import partial
@@ -12,7 +12,7 @@ from sglang.test.tpu.utils.accuracy_base import (
 )
 
 register_tpu_ci(
-    est_time=11400,
+    est_time=5400,
     suite="nightly-tpu-multihost-accuracy",
     nightly=True,
     labels=["multihost", "kimi-k2.6", "accuracy"],
@@ -23,7 +23,7 @@ MULTIHOST_LAUNCH = {
     "weights_pvc": "model-weights",
     # Which accuracy-test-tpu.yml lane runs this file.
     "schedule": "nightly",
-    "timeout_per_file": 11400,
+    "timeout_per_file": 5400,
 }
 CONFIG_MODULE = "recipe/configs/kimi_k26/mmmu.py"
 

@@ -1,4 +1,4 @@
-"""Qwen3.5-397B-A17B-FP8 TPU MMMU-Pro nightly score, all 1,730 standard-10 questions.
+"""Qwen3.5-397B-A17B-FP8 TPU MMMU-Pro score on the nightly question set (mmmu_full).
 
 sgl-eval's own loader and grader, thinking on, with the model card's sampling.
 """
@@ -10,7 +10,7 @@ from sglang.test.tpu import QWEN3_5_397B, make_model_config, make_runner
 from sglang.test.tpu.utils.accuracy_base import AccuracyTestCase, gate_server_failures
 
 register_tpu_ci(
-    est_time=9000,
+    est_time=6000,
     suite="nightly-tpu-accuracy-qwen3-5-397b-mmmupro",
     nightly=True,
     labels=["singlehost", "qwen3.5-397b", "accuracy"],
