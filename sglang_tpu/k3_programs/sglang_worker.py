@@ -554,6 +554,7 @@ class K3ProgramWorker(BaseSpecWorker):
         if K3ProgramWorker.build_steps is None:
             raise RuntimeError("K3_PROGRAM: no decode program was configured")
         self.steps = K3ProgramWorker.build_steps(self._target_worker)
+        self._warm_slot_bookkeeping()
         rank = getattr(self.model_runner, "tp_rank", 0)
         self.guard.log = rank == 0
         for role in (
@@ -563,6 +564,41 @@ class K3ProgramWorker(BaseSpecWorker):
         ):
             if role is not None and hasattr(role, "clock"):
                 role.clock.enabled = rank == 0
+
+    def _warm_slot_bookkeeping(self) -> None:
+        """Compile sglang's slot bookkeeping on the device before serving (the
+        TPU KDA backend's warmup, which K3_PROGRAM does not build): the
+        request pool's mapping writes, once per admitted-request count, and
+        under P/D the state payload's per-row reads (a Python int row is a
+        constant of each program)."""
+        pool = self.req_to_token_pool
+        mappings = [
+            getattr(pool, name, None)
+            for name in (
+                "req_index_to_mamba_index_mapping",
+                "req_index_to_mamba_ping_pong_track_buffer_mapping",
+            )
+        ]
+        mappings = [
+            m
+            for m in mappings
+            if isinstance(m, torch.Tensor) and m.device.type != "cpu"
+        ]
+        if not mappings:
+            return
+        from sglang.srt.runtime_context import get_disagg
+
+        with torch.no_grad():
+            for mapping in mappings:
+                width = mapping.shape[1:]
+                for count in range(1, pool.size + 1):
+                    # Request row 0 and state slot 0 are reserved: no request's.
+                    zeros = torch.zeros((count, *width), dtype=torch.int64)
+                    mapping[[0] * count] = zeros.to(mapping.device, mapping.dtype)
+                    mapping[0:1].cpu()
+            if get_disagg().disaggregation_mode != "null":
+                for row in range(mappings[0].shape[0]):
+                    mappings[0][row].cpu()
 
     def clear_cache_pool(self) -> None:
         if self.steps is not None:
