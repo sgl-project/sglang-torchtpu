@@ -747,7 +747,7 @@ class TpuSpecWorker(BaseSpecWorker):
         )
         if self._target_has_linear_attn:
             self._commit_linear_attn_states(
-                batch=batch, accept=accept, verify_input=verify_input
+                batch=batch, accept=accept, pre_verify_lens=bucket.state.seq_lens
             )
         committed = self.commit(
             batch, bucket.state, rows, verify_input, logits_output, accept
@@ -759,7 +759,7 @@ class TpuSpecWorker(BaseSpecWorker):
         *,
         batch: ScheduleBatch,
         accept: AcceptResult,
-        verify_input: TpuSpecVerifyInput,
+        pre_verify_lens: torch.Tensor,
     ) -> None:
         """Select each slot's verify checkpoint at its last accepted token, and
         the checkpoints radix tracking snapshots."""
@@ -768,8 +768,9 @@ class TpuSpecWorker(BaseSpecWorker):
         assert isinstance(attn_backend, HybridLinearAttnBackend), type(attn_backend)
         steps_to_track = None
         if batch.mamba_track_indices is not None:
+            # Device lengths: under overlap the host committed_lens trail by one commit.
             steps_to_track = verify_track_steps(
-                verify_input.committed_lens,
+                pre_verify_lens,
                 accept.last_steps,
                 mamba_track_grid(batch.tree_cache.page_size),
             )

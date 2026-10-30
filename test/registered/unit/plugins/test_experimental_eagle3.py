@@ -10,6 +10,9 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+)
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -183,6 +186,33 @@ class TestExperimentalEagle3(CustomTestCase):
         )
         self.assertEqual((worker.num_drafts, worker.num_verify_rows), (3, 4))
         self.assertEqual(_chain_worker().verify_widths(), (3,))
+
+    def test_radix_track_step_counts_from_the_device_length(self):
+        """Under overlap the host committed base trails the device by the last
+        commit; the snapshot step must count from the device length (63 + 2 -> step 0)."""
+        snapshots = []
+        backend = object.__new__(HybridLinearAttnBackend)
+        backend.update_mamba_state_after_mtp_verify = lambda **kw: snapshots.append(
+            kw["mamba_steps_to_track"]
+        )
+        worker = _chain_worker()
+        worker._target_has_linear_attn = True
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(attn_backend=backend, model=None)
+        )
+        accept = SimpleNamespace(last_steps=torch.tensor([1, -1]))
+        worker.draft = lambda *args: None
+        worker.verify = lambda *args: (None, accept)
+        worker.commit = lambda *args: None
+        batch = SimpleNamespace(
+            mamba_track_indices=torch.tensor([3, 0]),
+            tree_cache=SimpleNamespace(page_size=64),
+        )
+        bucket = SimpleNamespace(state=SimpleNamespace(seq_lens=torch.tensor([63, 0])))
+        verify_input = SimpleNamespace(committed_lens=torch.tensor([60, 0]))
+        with patch.object(base_spec_worker, "mamba_track_grid", return_value=64):
+            TpuSpecWorker.step(worker, batch, bucket, None, verify_input)
+        self.assertEqual(snapshots[0].tolist(), [0, -1])
 
     def test_flag_routes_eagle3_and_leaves_other_algorithms_alone(self):
         with (
