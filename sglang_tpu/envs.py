@@ -140,6 +140,10 @@ class TpuEnvs:
     # TpuBlockSpecWorker's candidate acceptance by block verification (Sun et al.
     # 2024, Algorithm 2) instead of token-wise rejection; lossless either way.
     SGLANG_TPU_SPEC_BLOCK_VERIFICATION = EnvBool(False)
+    # PD on the experimental spec worker: the prefill ships the target's draft-input
+    # hidden states (pd_hidden_pool.py) and the decode builds the draft KV and carry,
+    # instead of the prefill running the draft over the prompt.
+    SGLANG_TPU_PD_DECODE_DRAFT_PREFILL = EnvBool(False)
     # DFLASH draft linears, including the DFlash2 conv kernel projections, as fp8
     # weight-only (fp8_weight_linear.py) for decode-sized calls; prefill-sized calls
     # keep the bf16 weights. Changes the draft's proposals, not verification.

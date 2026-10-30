@@ -646,6 +646,28 @@ class TestExperimentalSpecHooks(CustomTestCase):
         )
         self.assertEqual(seen[1], "device-indices")
 
+    def test_host_relayed_dflash_draft_state_filters_with_host_indices(self):
+        """DFlash's relayed draft state stays on host too; device indices can't index it."""
+        from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+        from sglang_tpu.hooks.experimental_spec import filter_spec_input
+
+        spec_info = DFlashDraftInputV2(
+            topk_p=torch.ones(3, 1),
+            topk_index=torch.zeros(3, 1, dtype=torch.int64),
+            bonus_tokens=torch.arange(3),
+            new_seq_lens=torch.arange(3),
+            hidden_states=torch.zeros(3, 4),
+        )
+        batch = SimpleNamespace(spec_info=spec_info, enable_overlap=False)
+        seen = []
+        filter_spec_input(
+            lambda b, keep, keep_device: seen.append(keep_device),
+            batch,
+            [1, 2],
+            "device-indices",
+        )
+        self.assertEqual(seen[0].tolist(), [1, 2])
+
     def test_pp_stages_before_the_last_get_no_draft(self):
         """Under PP only the last stage hosts the draft; an earlier stage building one
         would bind the target embedding or lm_head its stage does not hold."""

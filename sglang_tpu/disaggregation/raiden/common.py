@@ -81,6 +81,8 @@ class RaidenKVCacheGroups:
     # Trailing tensors of full / swa that belong to a separate draft pool.
     num_draft_full: int = 0
     num_draft_swa: int = 0
+    # Trailing full tensors after the draft's: the PD hidden pool (pd_hidden_pool.py).
+    num_hidden_full: int = 0
     # Per-layer request-state tensors (GDN/Mamba rows or DSV4 compressor rings).
     state: List[torch.Tensor] = field(default_factory=list)
     state_type: StateType = StateType.MAMBA
@@ -222,10 +224,18 @@ def get_raiden_kv_caches(
             full=buffers, swa=[], full_layer_ids=layer_ids, swa_layer_ids=[]
         )
 
+    # Lazy: the experimental spec package loads after the platform.
+    from sglang_tpu.experimental.speculative.pd_hidden_pool import get_pd_hidden_pool
+
+    hidden_pool = get_pd_hidden_pool() if draft_pool is not None else None
+    if hidden_pool is not None:
+        # The decode builds the draft KV from these rows, so it never travels.
+        draft_pool = None
+
     groups = group_one(pool)
     full, swa = list(groups.full), list(groups.swa)
     full_ids, swa_ids = list(groups.full_layer_ids), list(groups.swa_layer_ids)
-    num_draft_full = num_draft_swa = 0
+    num_draft_full = num_draft_swa = num_hidden_full = 0
     if draft_pool is not None and draft_pool is not pool:
         draft_groups = group_one(draft_pool)
         num_draft_full, num_draft_swa = len(draft_groups.full), len(draft_groups.swa)
@@ -233,6 +243,11 @@ def get_raiden_kv_caches(
         swa.extend(draft_groups.swa)
         full_ids.extend(draft_groups.full_layer_ids)
         swa_ids.extend(draft_groups.swa_layer_ids)
+
+    if hidden_pool is not None:
+        full.append(hidden_pool.buffer)
+        full_ids.append(0)
+        num_hidden_full = 1
 
     state: List[torch.Tensor] = []
     state_type = StateType.MAMBA
@@ -271,6 +286,7 @@ def get_raiden_kv_caches(
         swa_layer_ids=swa_ids,
         num_draft_full=num_draft_full,
         num_draft_swa=num_draft_swa,
+        num_hidden_full=num_hidden_full,
         state=state,
         state_type=state_type,
         state_max_blocks=state_max_blocks,

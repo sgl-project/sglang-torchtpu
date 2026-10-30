@@ -103,6 +103,7 @@ def bundle_groups(full=(1, 3), swa=(0, 3), pages=64):
         full_layer_ids=[full[0]],
         swa_layer_ids=[swa[0]] if swa else [],
         num_draft_full=0,
+        num_hidden_full=0,
         num_draft_swa=0,
     )
 
@@ -114,6 +115,7 @@ def groups(full=(0, 2), swa=(1, 3), pages=64, buffer=Buffer, draft_full=()):
         full_layer_ids=[*full, *draft_full],
         swa_layer_ids=list(swa),
         num_draft_full=len(draft_full),
+        num_hidden_full=0,
         num_draft_swa=0,
     )
 
@@ -418,8 +420,12 @@ class TestLayerPools(unittest.TestCase):
         consumer = groups(full=(6,), swa=(), buffer=Bf16Buffer)
         consumer.full[0].shape = (64, 128, 1, 2, 128)
         self.assertEqual(
-            layout_fingerprint(pool_manifest(producer), producer.full, getter),
-            layout_fingerprint(pool_manifest(consumer), consumer.full, getter),
+            layout_fingerprint(
+                pool_manifest(producer), producer.full, getter, ships_pd_hidden=False
+            ),
+            layout_fingerprint(
+                pool_manifest(consumer), consumer.full, getter, ships_pd_hidden=False
+            ),
         )
 
     def test_fingerprint_matches_an_uneven_stage_subset(self):
@@ -427,15 +433,22 @@ class TestLayerPools(unittest.TestCase):
         stage = groups(full=tuple(range(55, 62)), swa=(), pages=192)
         getter = lambda tensor: ((4, 3, 2, 1, 0), ((8, 128),), 8)
         self.assertEqual(
-            layout_fingerprint(pool_manifest(full), full.full, getter),
-            layout_fingerprint(pool_manifest(stage), stage.full, getter),
+            layout_fingerprint(
+                pool_manifest(full), full.full, getter, ships_pd_hidden=False
+            ),
+            layout_fingerprint(
+                pool_manifest(stage), stage.full, getter, ships_pd_hidden=False
+            ),
         )
         self.assertNotEqual(
-            layout_fingerprint(pool_manifest(full), full.full, getter),
+            layout_fingerprint(
+                pool_manifest(full), full.full, getter, ships_pd_hidden=False
+            ),
             layout_fingerprint(
                 pool_manifest(stage),
                 stage.full,
                 lambda tensor: ((4, 3, 2, 1, 0), ((4, 128),), 8),
+                ships_pd_hidden=False,
             ),
         )
 
@@ -447,8 +460,12 @@ class TestLayerPools(unittest.TestCase):
         stage = groups(full=(0, 1), swa=())
         decode = groups(full=(0, 1, 2), swa=(), draft_full=(0,))
         self.assertEqual(
-            layout_fingerprint(pool_manifest(stage), stage.full, getter),
-            layout_fingerprint(pool_manifest(decode), decode.full, getter),
+            layout_fingerprint(
+                pool_manifest(stage), stage.full, getter, ships_pd_hidden=False
+            ),
+            layout_fingerprint(
+                pool_manifest(decode), decode.full, getter, ships_pd_hidden=False
+            ),
         )
 
     def test_pp_ranks_have_distinct_ports_and_share_the_host_budget(self):
@@ -490,7 +507,9 @@ class TestBlockMajorBundlePools(unittest.TestCase):
         mixed pair at every transfer."""
 
         def fingerprint(layers, getter):
-            return layout_fingerprint(pool_manifest(layers), layers.full, getter)
+            return layout_fingerprint(
+                pool_manifest(layers), layers.full, getter, ships_pd_hidden=False
+            )
 
         five = fingerprint(bundle_groups(full=(1, 5), swa=()), self.BUNDLE_LAYOUT)
         four = fingerprint(bundle_groups(full=(11, 4), swa=()), self.BUNDLE_LAYOUT)
