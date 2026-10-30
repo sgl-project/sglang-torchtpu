@@ -352,5 +352,24 @@ class TestSpecCheckHook(CustomTestCase):
         self.assertEqual(calls, [dspark])
 
 
+class TestModelRunnerHooks(CustomTestCase):
+    def test_no_backends_or_graphs_under_k3_program(self):
+        original = mock.Mock()
+        runner = SimpleNamespace()
+        with mock.patch.object(hooks, "k3_program_active", return_value=True):
+            hooks.skip_k3_program_backends(original, runner)
+            hooks.skip_k3_program_graphs(original, runner)
+        original.assert_not_called()
+        self.assertIsNone(runner.attn_backend)
+        self.assertIsNone(runner.decode_cuda_graph_runner)
+        with mock.patch.object(hooks, "k3_program_active", return_value=False):
+            hooks.skip_k3_program_backends(original, runner)
+            hooks.skip_k3_program_graphs(
+                original, runner, capture_decode_cuda_graph=True
+            )
+        self.assertEqual(original.call_count, 2)
+        original.assert_called_with(runner, capture_decode_cuda_graph=True)
+
+
 if __name__ == "__main__":
     unittest.main()

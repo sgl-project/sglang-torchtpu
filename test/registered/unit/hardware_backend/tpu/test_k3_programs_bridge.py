@@ -342,11 +342,13 @@ class TestEngineConfig(CustomTestCase):
             role="prefill",
             max_running_requests=16,
             context_length=1 << 20,
-            chunked_prefill_size=8192,
+            chunked_prefill_size=16384,
             kv_cache_dtype="fp8",
         )
         k3_program.check(prefill)
         self.assertEqual(prefill.block_size, 512)
+        # A page-sized fp8 chunk runs in the prefill's 8192-token windows.
+        self.assertEqual(prefill.max_num_batched_tokens, 8192)
 
     def test_every_scheduled_width_needs_a_length(self):
         with self.assertRaisesRegex(

@@ -14,6 +14,7 @@ from collections.abc import Sequence
 
 from sglang_tpu.k3_programs.config import MegakernelEngineConfig
 from sglang_tpu.k3_programs.kimi_k3.layout import cache_layout
+from sglang_tpu.k3_programs.kimi_k3.program import MAX_STEP_TOKENS
 
 TP_SIZE = 32
 DCP_SIZE = 32
@@ -86,6 +87,11 @@ def engine_config(
             rates = acceptance_length_to_rates(
                 simulate_acc_lengths[speculative_tokens], speculative_tokens
             )
+    budget = chunked_prefill_size
+    if role == "prefill":
+        # The prefill's windows go up to MAX_STEP_TOKENS; a longer chunk (a
+        # 16384-token fp8 page) runs in consecutive windows of one step.
+        budget = min(budget, MAX_STEP_TOKENS)
     return MegakernelEngineConfig(
         role=role,
         tensor_parallel_size=TP_SIZE,
@@ -93,7 +99,7 @@ def engine_config(
         block_size=block_size,
         max_num_seqs=max_running_requests,
         max_model_len=context_length,
-        max_num_batched_tokens=chunked_prefill_size,
+        max_num_batched_tokens=budget,
         num_speculative_tokens=speculative_tokens,
         num_speculative_tokens_per_batch_size=spec_schedule,
         synthetic_acceptance_rates=rates,

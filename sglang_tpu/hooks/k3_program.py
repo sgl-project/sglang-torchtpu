@@ -47,6 +47,19 @@ size_k3_program_pools
   Upstream PR or issue: sgl-project/sglang-torchtpu#1072 (the configurator
        asking the platform pool for its bytes per token).
   Remove when: that lands.
+
+skip_k3_program_backends, skip_k3_program_graphs
+  Why: the program runs the whole model, so sglang's forward never runs, but
+       the model runner still builds the KDA/MLA attention backends over the
+       unified pools (which are not TpuMambaPool or MLA token pools) and
+       captures graphs whose warmup runs that forward.
+  How: AROUND sglang.srt.model_executor.model_runner.ModelRunner
+       .init_attention_backends and .init_cuda_graphs return without building
+       under K3_PROGRAM, leaving no backends or graph runners (the compile
+       policy stays the runner's no-op one).
+  Upstream PR or issue: <to be filed> (a model-runner seam for a worker that
+       owns the forward).
+  Remove when: that seam exists.
 """
 
 from __future__ import annotations
@@ -117,6 +130,26 @@ def size_k3_program_pools(result: None, configurator, kvc, *args, **kwargs) -> N
     return result
 
 
+def skip_k3_program_backends(original, model_runner: Any, *args, **kwargs) -> None:
+    """AROUND ModelRunner.init_attention_backends."""
+    if not k3_program_active():
+        return original(model_runner, *args, **kwargs)
+    model_runner.attn_backend = None
+    model_runner.decode_attn_backend = None
+    model_runner.decode_attn_backend_group = []
+    return None
+
+
+def skip_k3_program_graphs(original, model_runner: Any, *args, **kwargs) -> None:
+    """AROUND ModelRunner.init_cuda_graphs."""
+    if not k3_program_active():
+        return original(model_runner, *args, **kwargs)
+    model_runner.eager_runner = None
+    model_runner.prefill_cuda_graph_runner = None
+    model_runner.decode_cuda_graph_runner = None
+    return None
+
+
 def hook_specs() -> list[tuple]:
     from sglang.srt.plugins.hook_registry import HookType
 
@@ -140,5 +173,15 @@ def hook_specs() -> list[tuple]:
             "sglang.srt.model_executor.pool_configurator.DefaultPoolConfigurator.__init__",
             size_k3_program_pools,
             HookType.AFTER,
+        ),
+        (
+            "sglang.srt.model_executor.model_runner.ModelRunner.init_attention_backends",
+            skip_k3_program_backends,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.model_executor.model_runner.ModelRunner.init_cuda_graphs",
+            skip_k3_program_graphs,
+            HookType.AROUND,
         ),
     ]
