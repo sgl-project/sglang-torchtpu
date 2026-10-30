@@ -8,8 +8,9 @@ from sglang.test.tpu.utils.kv_offload_probe import kv_offload_runner
 from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
 
 register_tpu_ci(
-    est_time=7200,
-    suite="tpu-integration",
+    # The external suite's 1 h per file covers it: 2,878 s in-project.
+    est_time=3600,
+    suite="external-nightly-1host",
     nightly=True,
     labels=[
         "singlehost",

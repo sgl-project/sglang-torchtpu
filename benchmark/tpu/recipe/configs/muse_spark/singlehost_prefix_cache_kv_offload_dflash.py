@@ -19,7 +19,7 @@ CONFIG["server_args"].update(
     # token stays live. A smaller SWA pool stalled the probe's eviction chunks.
     swa_full_tokens_ratio=1.0,
     speculative_algorithm="DFLASH",
-    speculative_draft_model_path="RadixArk/Muse-Spark-Open-DFlash2",
+    speculative_draft_model_path="/weights/Muse-Spark-Open-DFlash2",
     speculative_num_draft_tokens=8,
     enable_hierarchical_cache=True,
     hicache_io_backend="raiden",

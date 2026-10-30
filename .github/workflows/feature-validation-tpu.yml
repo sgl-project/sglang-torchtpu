@@ -34,9 +34,7 @@ on:
           - all
           - mh
           - pd-sh-qwen3-vl-30b
-          - pd-sh-muse-spark-dflash
           - sh
-          - sh-muse-spark-dflash
       test_filter:
         description: "Substring of a test file path; runs only matching tests"
         required: false
@@ -182,56 +180,6 @@ jobs:
       files: test/registered/tpu/e2e/test_tpu_qwen3_vl_30b_a3b_pd_singlehost_mmmu.py
       weights_pvc: model-weights
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_qwen3_vl_30b)[0].run_name }}
-    permissions:
-      contents: read
-      id-token: write
-
-  # Muse Spark DFlash on the raiden P/D pair, prefix cache and KV offload on the
-  # prefill. 1P1D: the nightly lane has one 2x2x2 slice, so 2P2D is never admitted.
-  pd-sh-muse-spark-dflash:
-    needs: [build, discover-tests]
-    if: >-
-      ${{ !cancelled() && needs.discover-tests.result == 'success'
-          && contains(fromJSON('["all","pd-sh-muse-spark-dflash"]'), inputs.only || 'all')
-          && contains('test/registered/tpu/e2e/test_tpu_muse_spark_pd_singlehost_prefix_cache_kv_offload_dflash.py', inputs.test_filter) }}
-    name: test_tpu_muse_spark_pd_singlehost_prefix_cache_kv_offload_dflash
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      display_name: test_tpu_muse_spark_pd_singlehost_prefix_cache_kv_offload_dflash
-      lane: nightly
-      hosts: 1
-      pd_prefill_hosts: 1
-      pd_decode_hosts: 1
-      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_muse_spark_pd_singlehost_prefix_cache_kv_offload_dflash.py
-      files: test/registered/tpu/e2e/test_tpu_muse_spark_pd_singlehost_prefix_cache_kv_offload_dflash.py
-      weights_pvc: model-weights
-      run_name: pd-sh-muse-spark-dflash
-    permissions:
-      contents: read
-      id-token: write
-
-  # Muse Spark single-host DFlash with the prefix cache and KV offload. A static
-  # exec job: weight load and compile take ~40 min, past the sh lane's 1h per file.
-  sh-muse-spark-dflash:
-    needs: [build, discover-tests]
-    if: >-
-      ${{ !cancelled() && needs.discover-tests.result == 'success'
-          && contains(fromJSON('["all","sh-muse-spark-dflash"]'), inputs.only || 'all')
-          && contains('test/registered/tpu/e2e/test_tpu_muse_spark_singlehost_prefix_cache_kv_offload_dflash.py', inputs.test_filter) }}
-    name: test_tpu_muse_spark_singlehost_prefix_cache_kv_offload_dflash
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      display_name: test_tpu_muse_spark_singlehost_prefix_cache_kv_offload_dflash
-      lane: nightly
-      hosts: 1
-      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_muse_spark_singlehost_prefix_cache_kv_offload_dflash.py
-      files: test/registered/tpu/e2e/test_tpu_muse_spark_singlehost_prefix_cache_kv_offload_dflash.py
-      weights_pvc: model-weights
-      run_name: sh-muse-spark-dflash
     permissions:
       contents: read
       id-token: write

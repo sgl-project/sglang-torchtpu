@@ -32,6 +32,9 @@ TEST_NAME = "muse-spark-pd-singlehost-dflash"
 
 
 def self_hostname() -> str:
+    # External single-host roles drop TPU_WORKER_HOSTNAMES and set PD_SELF_HOST.
+    if os.environ.get("PD_SELF_HOST"):
+        return os.environ["PD_SELF_HOST"]
     hostnames = [h for h in os.environ.get("TPU_WORKER_HOSTNAMES", "").split(",") if h]
     return hostnames[0] if hostnames else socket.gethostname()
 

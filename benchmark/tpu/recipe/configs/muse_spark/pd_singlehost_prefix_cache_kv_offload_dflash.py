@@ -19,7 +19,7 @@ _COMMON_CONFIG["server_args"].update(
     mem_fraction_static=0.85,
     kv_cache_dtype="fp8_e4m3",
     speculative_algorithm="DFLASH",
-    speculative_draft_model_path="RadixArk/Muse-Spark-Open-DFlash2",
+    speculative_draft_model_path="/weights/Muse-Spark-Open-DFlash2",
     speculative_num_draft_tokens=8,
     disaggregation_transfer_backend="raiden",
     enable_cache_report=True,
