@@ -69,6 +69,11 @@ server_args.update(
         "mamba_track_interval": PAGE_SIZE * (1 << 16),
         "max_mamba_cache_size": CHECKPOINTS + 2 * RUNNING,
         "max_total_tokens": None,
+        # Decode steps between prefill batches: a long prompt's chunks would
+        # otherwise stop every decoding request on the engine until it ends.
+        "prefill_decode_interval": int(
+            os.environ.get("K3_PROGRAM_PREFILL_DECODE_INTERVAL", "16")
+        ),
     }
 )
 runtime_env = CONFIG["runtime_env"]
