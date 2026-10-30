@@ -199,6 +199,8 @@ _PD: dict[str, dict] = {
     },
     "runtime_env": {
         "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
+        # Pipeline transfers keep full mirrors, which outgrow the default at this context.
+        "SGLANG_RAIDEN_HOST_POOL_GB": "128",
         # The experimental worker only simulates acceptance with fixed draft tokens.
         "SGLANG_SIMULATE_ACC_TOKEN_MODE": "fixed",
         "SGLANG_WARMUP_TIMEOUT": "3600",

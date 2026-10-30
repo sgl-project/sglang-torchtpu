@@ -58,6 +58,8 @@ def pp_spec_role_configs(
             SGLANG_RAIDEN_KV_PORT=os.environ.get("SGLANG_RAIDEN_KV_PORT", "40000"),
             SGLANG_WARMUP_TIMEOUT="3600",
             HEALTH_TIMEOUT=os.environ.get("WAIT_SECS", "5400"),
+            # Pipeline transfers stage full mirrors of every layer pool.
+            SGLANG_RAIDEN_HOST_POOL_GB="128",
             **spec_envs,
         )
 
