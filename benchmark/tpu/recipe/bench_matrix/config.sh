@@ -5,7 +5,7 @@
 # run uses identical settings.
 #
 # The matrix (task: "Add more benchmark tests for GPT-OSS models"):
-#   BENCH_MODEL   gpt_oss_120b | qwen3_coder_480b | muse_spark (1host_pc only)
+#   BENCH_MODEL   gpt_oss_120b | qwen3_coder_480b
 #   BENCH_RECIPE  1host_pc               1 host, tp=8, prefix caching
 #                 1host_pc_spec_kvoff    + EAGLE3 spec + KV offload (raiden)
 #                 pd_2p2d_pc_spec_kvoff  4 hosts: 2 prefill + 2 decode engines
@@ -34,7 +34,7 @@ REPO_ROOT=$(cd -- "$TPU_BENCH_DIR/../.." && pwd)
 # Reuse the agentic nightly's tools (trace generator, metrics probe, summary).
 NIGHTLY_TOOLS_DIR="$TPU_BENCH_DIR/recipe/qwen3_coder_480b/nightly"
 
-BENCH_MODEL=${BENCH_MODEL:?set BENCH_MODEL=gpt_oss_120b|qwen3_coder_480b|muse_spark}
+BENCH_MODEL=${BENCH_MODEL:?set BENCH_MODEL=gpt_oss_120b|qwen3_coder_480b}
 BENCH_RECIPE=${BENCH_RECIPE:?set BENCH_RECIPE=1host_pc|1host_pc_spec_kvoff|pd_2p2d_pc_spec_kvoff}
 WORKLOAD=${WORKLOAD:-agentic}
 PROFILE=${PROFILE:-ci}
@@ -221,30 +221,6 @@ case "$BENCH_MODEL" in
         MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.9}
         MODEL_EXTRA_ARGS="--tpu-fp8-runtime channelwise --sampling-defaults openai"
         ;;
-    muse_spark)
-        # recipe/configs/muse_spark/server.py with fp8 KV: experts tensor-parallel
-        # over all 8 ranks (ep 1) through the NVFP4 fused-RS kernel.
-        MODEL=${MODEL:-$GCS_WEIGHTS_ROOT/Muse-Spark-Open-816B-A42B-NVFP4}
-        # No recipe here drafts for Muse (SPEC_ARGS is EAGLE3), see the recipe check.
-        DRAFT_MODEL=${DRAFT_MODEL:-}
-        QUANTIZATION=modelopt_fp4
-        KV_CACHE_DTYPE=${KV_CACHE_DTYPE-fp8_e4m3}
-        ATTENTION_BACKEND=pallas_tpu_rpa_v3
-        PAGE_SIZE=${PAGE_SIZE:-128}
-        CONTEXT_LEN=${CONTEXT_LEN:-262144}
-        # The bf16 pool the Muse agentic runs used at this mem fraction, fp8 halves it.
-        MAX_TOTAL_TOKENS_TP8=917504
-        MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.92}
-        MODEL_EP_SIZE=1
-        # The extend graphs were measured at 4096 tokens, the weights leave less HBM.
-        CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-4096}
-        # server.py's measured setting: SparseCore all-gather offload off too.
-        LIBTPU_INIT_ARGS=${LIBTPU_INIT_ARGS:-"$(source "$TPU_BENCH_DIR/common_env.sh" >/dev/null 2>&1 \
-            && echo "$LIBTPU_INIT_ARGS") --xla_tpu_enable_sparse_core_collective_offload_all_gather=false"}
-        export LIBTPU_INIT_ARGS
-        MODEL_EXTRA_ARGS="--moe-runner-backend pallas_tpu_fused_rs \
---swa-full-tokens-ratio 0.125 --reasoning-parser muse --watchdog-timeout 3600"
-        ;;
     *)
         echo "ERROR: unknown BENCH_MODEL='$BENCH_MODEL'" >&2
         exit 2
@@ -287,12 +263,6 @@ case "$BENCH_RECIPE" in
         exit 2
         ;;
 esac
-if [[ "$BENCH_MODEL" == "muse_spark" && "$BENCH_RECIPE" != "1host_pc" ]]; then
-    echo "ERROR: muse_spark runs only 1host_pc (its draft is DFlash, SPEC_ARGS is EAGLE3)" >&2
-    exit 2
-fi
-# Muse shards experts by TP (ep 1), the other models by EP.
-EP_SIZE=${MODEL_EP_SIZE:-$EP_SIZE}
 # Prefill engines a request can be routed to; the agentic prefix-hit gate
 # scales its reachable rate by 1/N because each engine caches on its own.
 PD_PREFILL_ENGINES=${PD_PREFILL_ENGINES:-1}
