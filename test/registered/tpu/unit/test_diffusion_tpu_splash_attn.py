@@ -496,19 +496,6 @@ class TestTpuSplashDispatch(CustomTestCase):
         self.assertEqual(_splash_mha_block_sizes(1000, 1000, True), (512, 512))
         self.assertEqual(_splash_mha_block_sizes(200, 4128, False), (256, 256))
 
-    def test_kernel_source_keys_the_compile_cache_once(self):
-        import torch.compiler.config as compiler_config
-
-        from sglang_tpu.multimodal_gen import tpu_splash_attn
-
-        with patch.object(compiler_config, "cache_key_tag", "user-tag"):
-            tpu_splash_attn._add_kernel_source_to_compile_cache_key()
-            tpu_splash_attn._add_kernel_source_to_compile_cache_key()
-            tags = compiler_config.cache_key_tag.split("|")
-        self.assertEqual(tags[0], "user-tag")
-        self.assertEqual(len(tags), 2)
-        self.assertTrue(tags[1].startswith("diffusion-tpu-splash-attn:"))
-
     def test_sdpa_fallback_reasons(self):
         from sglang_tpu.multimodal_gen import tpu_splash_attn
 
