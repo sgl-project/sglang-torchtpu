@@ -174,6 +174,13 @@ def tile(
             acc = acc_ref[kv_head]  # [acc rows, rows]
             l = acc[hd : hd + 1]
             o_t = acc[:hd] * pl.reciprocal(l, approx=True)
+            if cfgs.serve.out_head_norm_eps is not None:
+                o_t = utils.head_norm(
+                    o_t.astype(cfgs.serve.dtype_out),
+                    0,
+                    cfgs.model.head_dim,
+                    cfgs.serve.out_head_norm_eps,
+                )
             pad = cfgs.aligned_q_head_dim - hd
             if pad:
                 o_t = jnp.concatenate([o_t, jnp.zeros((pad, rows), o_t.dtype)], axis=0)

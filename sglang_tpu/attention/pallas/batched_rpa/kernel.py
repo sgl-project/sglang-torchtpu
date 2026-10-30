@@ -190,6 +190,10 @@ def calculate_and_store_out(
         else:
             result = batch_acc * pl.reciprocal(batch_l, approx=True)
         out = result.astype(cfgs.serve.dtype_out)
+        if cfgs.serve.out_head_norm_eps is not None:
+            out = utils.head_norm(
+                out, -1, cfgs.model.head_dim, cfgs.serve.out_head_norm_eps
+            )
 
         o_u32_vref = o_vref.at[b_idx].bitcast(jnp.uint32)
         out_ref = o_u32_vref.reshape(-1, cfgs.aligned_q_head_dim)

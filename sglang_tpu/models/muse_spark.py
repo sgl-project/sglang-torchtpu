@@ -297,6 +297,14 @@ class MuseSparkAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.norm_eps = config.rms_norm_eps
+        # Batched RPA can return the output already per-head normalized (same eps).
+        kernel_eps = tpu_envs.SGLANG_TPU_RPA_OUT_HEAD_NORM_EPS.get()
+        self.kernel_out_head_norm = kernel_eps is not None
+        if self.kernel_out_head_norm and kernel_eps != self.norm_eps:
+            raise ValueError(
+                f"SGLANG_TPU_RPA_OUT_HEAD_NORM_EPS={kernel_eps} must equal the"
+                f" attention output norm's rms_norm_eps {self.norm_eps}"
+            )
         self.query_scale = config.qk_scale_factor
         self.qkv_proj = QKVParallelLinear(
             hidden_size=config.hidden_size,
@@ -362,7 +370,8 @@ class MuseSparkAttention(nn.Module):
         if self.rotary_emb is not None:
             q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
-        attn_output = self._per_head_normalize(attn_output).to(qkv.dtype)
+        if not self.kernel_out_head_norm:
+            attn_output = self._per_head_normalize(attn_output).to(qkv.dtype)
         gate, _ = self.gate_proj(hidden_states)
         gated = torch.sigmoid(gate) * attn_output
         if sequence_parallel:

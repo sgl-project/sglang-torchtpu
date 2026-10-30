@@ -224,6 +224,9 @@ class TpuEnvs:
     # "bq:bkv": prefill q / k block sizes for sliding-window layers (batched RPA),
     # instead of the full-attention search's; unset keeps the search.
     SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS = EnvStr(None)
+    # Batched RPA outputs come per-head RMS-normalized (weightless, this eps), as Muse
+    # Spark's attention output norm; the model then skips its own. Muse only.
+    SGLANG_TPU_RPA_OUT_HEAD_NORM_EPS = EnvFloat(None)
 
     @classmethod
     def names(cls) -> list[str]:
