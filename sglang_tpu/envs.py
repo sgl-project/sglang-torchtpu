@@ -140,6 +140,10 @@ class TpuEnvs:
     # than as --speculative-draft-model-path, which sglang opens with
     # transformers (model type k3_dspark is not one of its architectures).
     SGLANG_TPU_K3_PROGRAM_DRAFT = EnvStr(None)
+    # Run torch_tpu's deferred work (in-place view writes the scheduler leaves
+    # between steps) as its own small program before each program step, so it
+    # is not compiled into the program's next op (one executable per mix).
+    SGLANG_TPU_K3_PROGRAM_OPT_FLUSH_DEFERRED = EnvBool(False)
 
     # Host padding is unconditional; this routes speculative batches to the
     # experimental spec worker, which keeps their metadata on the host as well.
