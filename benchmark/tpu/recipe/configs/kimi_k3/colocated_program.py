@@ -88,7 +88,8 @@ runtime_env.update(
         "SGLANG_TPU_K3_PROGRAM_DRAFT": "Inferact/Kimi-K3-DSpark",
         # The prefill program reads the experts in the pre-shard's layout, the
         # decode program's tensors, which it shares.
-        "SGLANG_TPU_K3_PROGRAM_KERNEL_CONFIG": "prefill_expert_parallel=8",
+        # (and more concurrent ranges per file, reading the pre-shard from GCS).
+        "SGLANG_TPU_K3_PROGRAM_KERNEL_CONFIG": "prefill_expert_parallel=8;read_streams=16",
         "SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS": os.environ.get(
             "K3_PROGRAM_PREFIX_TAILS", "48"
         ),

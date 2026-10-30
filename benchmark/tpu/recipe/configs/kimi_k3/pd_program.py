@@ -132,5 +132,7 @@ runtime_env.update(
         # beat seven from two requests and beat plain steps through sixteen
         # (e.g. B8 1034 vs 851 tok/s, B16 1274 vs 995 at 131k context).
         "SGLANG_TPU_K3_PROGRAM_SPEC_SCHEDULE": "1:1:7,2:16:3",
+        # Reading the pre-shard from GCS (gcsfuse): more concurrent ranges per file.
+        "SGLANG_TPU_K3_PROGRAM_KERNEL_CONFIG": "read_streams=16",
     }
 )
