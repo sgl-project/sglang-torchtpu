@@ -75,8 +75,12 @@ def should_run_spatial_shard_parallel_decode(
     config: VAEConfig, z: torch.Tensor
 ) -> bool:
     world_size = _decode_parallel_world_size()
-    return world_size > 1 and should_use_spatial_shard_parallel_decode(
-        config, z, world_size
+    # Every rank needs at least one latent row to join the equal-shape halo
+    # exchange; auto mode checks this too, an explicit spatial_shard did not.
+    return (
+        world_size > 1
+        and z.shape[-2] >= world_size
+        and should_use_spatial_shard_parallel_decode(config, z, world_size)
     )
 
 
@@ -116,6 +120,8 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         self.use_parallel_tiling = config.use_parallel_tiling
         self.use_parallel_decode = config.use_parallel_decode
         self.parallel_decode_mode = config.parallel_decode_mode
+        # A bool, distinct from the VAEConfig method of the same policy.
+        self.auto_shards_without_p2p = config.auto_parallel_decode_shards_without_p2p()
 
     @property
     def device(self):

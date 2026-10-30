@@ -56,6 +56,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
     _ensure_tensor_decode_output,
+    decode_uses_every_rank,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -950,6 +951,9 @@ class MOVADecodingStage(PipelineStage):
     @property
     def parallelism_type(self) -> StageParallelismType:
         if get_global_server_args().enable_cfg_parallel:
+            # A parallel video decode spans the whole decode group.
+            if decode_uses_every_rank(self.video_vae):
+                return StageParallelismType.REPLICATED
             return StageParallelismType.MAIN_RANK_ONLY
         return StageParallelismType.REPLICATED
 

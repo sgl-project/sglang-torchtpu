@@ -11,8 +11,8 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.vaes.base import (
+    auto_mode_may_shard_on_this_platform,
     is_auto_parallel_decode_mode,
-    is_spatial_shard_parallel_decode_mode,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     quality_allows_kernel_fusions,
@@ -62,14 +62,19 @@ def decode_uses_every_rank(vae) -> bool:
     """
     if vae is None or not vae.use_parallel_decode:
         return False
-    mode = vae.parallel_decode_mode
-    # Only height shards trade conv halos over p2p; auto may resolve to one.
-    needs_p2p = is_auto_parallel_decode_mode(mode) or (
-        is_spatial_shard_parallel_decode_mode(mode)
-    )
-    if needs_p2p and not current_platform.supports_distributed_p2p():
+    if not model_parallel_is_initialized():
         return False
-    return model_parallel_is_initialized() and get_decode_parallel_world_size() > 1
+    world_size = get_decode_parallel_world_size()
+    # The same no-p2p policy as should_use_spatial_shard_parallel_decode.
+    # Read from the VAE: some replace .config with their arch config; a VAE
+    # without the attribute never opted in.
+    if is_auto_parallel_decode_mode(
+        vae.parallel_decode_mode
+    ) and not auto_mode_may_shard_on_this_platform(
+        getattr(vae, "auto_shards_without_p2p", False), world_size
+    ):
+        return False
+    return world_size > 1
 
 
 def scale_and_shift_latents(latents: torch.Tensor, server_args, vae) -> torch.Tensor:
