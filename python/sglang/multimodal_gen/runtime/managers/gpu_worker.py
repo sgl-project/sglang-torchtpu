@@ -398,7 +398,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             distributed_init_method=rendezvous_addr.to_tcp(),
             dist_timeout=self.server_args.dist_timeout,
         )
-        current_platform.configure_compile_cache()
 
         from sglang.srt.runtime_context import get_context, publish
         from sglang.srt.server_args import ServerArgs as SrtServerArgs

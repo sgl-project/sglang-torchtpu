@@ -81,12 +81,6 @@ class TpuOOTPlatform(TpuPlatform):
         torch._dynamo.config.automatic_dynamic_shapes = False
         worker.install_runtime_patches()
 
-    def configure_compile_cache(self) -> None:
-        # torch_tpu persists XLA executables in AOTAutogradCache, whose key sees
-        # neither the device assignment behind collectives, opaque Pallas kernel
-        # sources nor the XLA flags: a stale hit can hang or ignore new flags.
-        worker.configure_compile_cache()
-
     def get_compile_backend(self, mode: str | None = None) -> str:
         if mode is not None:
             logger.info_once(

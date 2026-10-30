@@ -120,22 +120,16 @@ class TestWanStepCounter(unittest.TestCase):
             parallel_state.cleanup_dist_env_and_memory()
             cls._rendezvous.cleanup()
 
-    def _tiny_wan(self):
-        from sglang.multimodal_gen.configs.models.dits.wanvideo import (
-            WanVideoArchConfig,
-            WanVideoConfig,
-        )
+    @staticmethod
+    def _tiny_dit(model_cls, config_cls, arch_cls):
         from sglang.multimodal_gen.configs.pipeline_configs.base import (
             PipelineConfig,
-        )
-        from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
-            WanTransformer3DModel,
         )
         from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
         with patch.object(PipelineConfig, "from_kwargs", return_value=PipelineConfig()):
             server_args = ServerArgs.from_kwargs(model_path="/fake")
-        arch_config = WanVideoArchConfig(
+        arch_config = arch_cls(
             num_attention_heads=2,
             attention_head_dim=12,
             in_channels=4,
@@ -149,13 +143,22 @@ class TestWanStepCounter(unittest.TestCase):
             "sglang.multimodal_gen.runtime.server_args.server_args._global_server_args",
             server_args,
         ):
-            model = WanTransformer3DModel(
-                WanVideoConfig(arch_config=arch_config), hf_config={}
-            )
+            model = model_cls(config_cls(arch_config=arch_config), hf_config={})
         # The counter lives outside the blocks; the CPU fused output norm needs
         # sgl_kernel's CPU build.
         model.norm_out = _ScaleShift()
         return model.eval()
+
+    def _tiny_wan(self):
+        from sglang.multimodal_gen.configs.models.dits.wanvideo import (
+            WanVideoArchConfig,
+            WanVideoConfig,
+        )
+        from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
+            WanTransformer3DModel,
+        )
+
+        return self._tiny_dit(WanTransformer3DModel, WanVideoConfig, WanVideoArchConfig)
 
     def test_counter_stays_put_without_teacache_and_forward_compiles_once(self):
         from sglang.multimodal_gen.runtime.managers.forward_context import (
@@ -204,9 +207,6 @@ class TestWanStepCounter(unittest.TestCase):
             LingBotWorldArchConfig,
             LingBotWorldVideoConfig,
         )
-        from sglang.multimodal_gen.configs.pipeline_configs.base import (
-            PipelineConfig,
-        )
         from sglang.multimodal_gen.runtime.managers.forward_context import (
             set_forward_context,
         )
@@ -216,33 +216,17 @@ class TestWanStepCounter(unittest.TestCase):
         from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
             WanTransformer3DModel,
         )
-        from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
         # Wan's TeaCache step check, which reads the counter, is borrowed.
         self.assertIs(
             LingBotWorldTransformer3DModel.should_skip_forward_for_cached_states,
             WanTransformer3DModel.should_skip_forward_for_cached_states,
         )
-        with patch.object(PipelineConfig, "from_kwargs", return_value=PipelineConfig()):
-            server_args = ServerArgs.from_kwargs(model_path="/fake")
-        arch_config = LingBotWorldArchConfig(
-            num_attention_heads=2,
-            attention_head_dim=12,
-            in_channels=4,
-            out_channels=4,
-            text_dim=16,
-            freq_dim=16,
-            ffn_dim=32,
-            num_layers=0,
+        model = self._tiny_dit(
+            LingBotWorldTransformer3DModel,
+            LingBotWorldVideoConfig,
+            LingBotWorldArchConfig,
         )
-        with patch(
-            "sglang.multimodal_gen.runtime.server_args.server_args._global_server_args",
-            server_args,
-        ):
-            model = LingBotWorldTransformer3DModel(
-                LingBotWorldVideoConfig(arch_config=arch_config), hf_config={}
-            ).eval()
-        model.norm_out = _ScaleShift()
         for enable_teacache, expected in ((False, 0), (True, 3)):
             model.cnt = 0
             req = Req(sampling_params=SamplingParams(enable_teacache=enable_teacache))

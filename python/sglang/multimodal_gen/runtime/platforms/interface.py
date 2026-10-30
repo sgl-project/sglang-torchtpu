@@ -164,14 +164,6 @@ class Platform:
         """Return backend-specific options for a diffusion module."""
         return None
 
-    def configure_compile_cache(self) -> None:
-        """Configure torch.compile caching for this worker.
-
-        Called once per worker after distributed initialization, before any
-        compilation.
-        """
-        pass
-
     def get_dispatch_key_name(self) -> str:
         """Return the behavioral dispatch key used by :class:`CustomOp`.
 
