@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import collections
 import logging
+import time
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -157,6 +158,66 @@ class _Prompts:
             self._arrays.pop(rid, None)
 
 
+class StepClock:
+    """Where a role's steps spend host time: each phase between marks, and
+    the gap since the previous step (the scheduler's own work; gaps over a
+    second are idle and not counted). Logged every ``every`` steps when
+    ``enabled`` (the worker enables rank 0)."""
+
+    IDLE = 1.0
+    SLOW = 1.0  # a step this long (seconds) is logged on its own
+
+    def __init__(self, name: str, every: int = 1000) -> None:
+        self.name, self.every = name, every
+        self.enabled = False
+        self.sums: collections.Counter = collections.Counter()
+        self.step_sums: collections.Counter = collections.Counter()
+        self.steps = self.rows = 0
+        self._last_end: float | None = None
+        self._at = 0.0
+
+    def start(self) -> None:
+        now = time.perf_counter()
+        if self._last_end is not None and now - self._last_end < self.IDLE:
+            self.sums["scheduler"] += now - self._last_end
+        self._at = now
+
+    def mark(self, phase: str) -> None:
+        now = time.perf_counter()
+        self.sums[phase] += now - self._at
+        self.step_sums[phase] += now - self._at
+        self._at = now
+
+    def stop(self, rows: int) -> None:
+        self._last_end = time.perf_counter()
+        self.steps += 1
+        self.rows += rows
+        if self.enabled and sum(self.step_sums.values()) > self.SLOW:
+            logger.info(
+                "K3 %s: slow step (%d rows); ms: %s",
+                self.name,
+                rows,
+                ", ".join(f"{k} {1e3 * v:.1f}" for k, v in self.step_sums.items()),
+            )
+        self.step_sums.clear()
+        if self.steps % self.every:
+            return
+        if self.enabled:
+            phases = ", ".join(
+                f"{phase} {1e3 * total / self.every:.2f}"
+                for phase, total in self.sums.items()
+            )
+            logger.info(
+                "K3 %s: %d steps, %.1f rows a step; ms a step: %s",
+                self.name,
+                self.every,
+                self.rows / self.every,
+                phases,
+            )
+        self.sums.clear()
+        self.rows = 0
+
+
 class DecodeSteps:
     """A decode program's steps from sglang requests (no sglang objects
     beyond the requests' fields, so it runs on CPU against a stub program)."""
@@ -179,6 +240,7 @@ class DecodeSteps:
         self._live: set[str] = set()
         self._departed: dict[str, None] = {}
         self._prompts = _Prompts()
+        self.clock = StepClock("decode")
 
     def step(self, reqs: Sequence[Any], starts: np.ndarray) -> tuple:
         """One step for ``reqs`` (sglang ``Req``s, batch order) with their
@@ -224,8 +286,11 @@ class DecodeSteps:
         current = {req.rid for req in reqs}
         finished, self._live = self._live - current, current
         self._forget(finished)
+        self.clock.mark("inputs")
         tokens = self.program.step(StepInput(requests, finished)).tokens
+        self.clock.mark("dispatch")
         rows = np.asarray(tokens[: len(reqs)].cpu(), dtype=np.int64)
+        self.clock.mark("tokens")
         _, lens = sglang_step.accepted(rows, len(reqs))
         if not all(lens):
             idle = [reqs[i].rid for i, n in enumerate(lens) if not n]
@@ -284,6 +349,7 @@ class PrefillSteps:
         self._live: set[str] = set()
         self._prompts = _Prompts()
         self.stats = collections.Counter()
+        self.clock = StepClock("prefill", every=200)
 
     def _row(self, req, prompt, computed, end, starts, columns=()):
         """The program's row for ``req`` computing ``[computed, end)``; each
@@ -451,6 +517,14 @@ class K3ProgramWorker(BaseSpecWorker):
         if K3ProgramWorker.build_steps is None:
             raise RuntimeError("K3_PROGRAM: no decode program was configured")
         self.steps = K3ProgramWorker.build_steps(self._target_worker)
+        rank = getattr(self.model_runner, "tp_rank", 0)
+        for role in (
+            getattr(self.steps, "prefill", None),
+            getattr(self.steps, "decode", None),
+            self.steps,
+        ):
+            if role is not None and hasattr(role, "clock"):
+                role.clock.enabled = rank == 0
 
     def clear_cache_pool(self) -> None:
         if self.steps is not None:
@@ -478,6 +552,8 @@ class K3ProgramWorker(BaseSpecWorker):
             raise NotImplementedError(
                 "K3_PROGRAM serves without logprobs or structured outputs"
             )
+        clock = steps.clock
+        clock.start()
         # One slot per logical block of each row (a strided view of the host
         # table; a device table copies only these).
         starts = (
@@ -485,6 +561,7 @@ class K3ProgramWorker(BaseSpecWorker):
             .cpu()
             .numpy()
         )
+        clock.mark("page_starts")
         if prefill:
             state_pool = self.req_to_token_pool.mamba_pool
             # A prefix hit's cached state into the request's slot (sglang's
@@ -492,10 +569,14 @@ class K3ProgramWorker(BaseSpecWorker):
             cow_src = getattr(batch, "mamba_cow_src_indices", None)
             if cow_src is not None and len(cow_src):
                 state_pool.copy_from(cow_src, batch.mamba_cow_dst_indices)
+            clock.mark("cow")
             first = steps.step(batch.reqs, batch.prefix_lens, batch.extend_lens, starts)
+            clock.mark("step")
             self._track_checkpoints(batch, state_pool)
             if on_publish is not None:
                 on_publish(batch.seq_lens)
+            clock.mark("track")
+            clock.stop(sum(int(n) for n in batch.extend_lens))
             return GenerationBatchResult(
                 next_token_ids=torch.from_numpy(first),
                 accept_lens=torch.ones(len(batch.reqs), dtype=torch.int32),
@@ -508,6 +589,8 @@ class K3ProgramWorker(BaseSpecWorker):
         new_seq_lens = batch.seq_lens + accept_lens.to(batch.seq_lens.device)
         if on_publish is not None:
             on_publish(new_seq_lens)
+        clock.mark("result")
+        clock.stop(len(batch.reqs))
         return GenerationBatchResult(
             next_token_ids=torch.from_numpy(flat),
             accept_lens=accept_lens,

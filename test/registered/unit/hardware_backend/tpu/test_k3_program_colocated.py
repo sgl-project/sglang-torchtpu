@@ -102,8 +102,10 @@ class TestColocatedDispatch(CustomTestCase):
         plan = bridge.UnifiedPoolPlan(40, 4, pools.cache_layout("auto"))
         prefill = mock.Mock(spec=worker.PrefillSteps)
         prefill.step.return_value = np.array([42])
+        prefill.clock = worker.StepClock("prefill")
         decode = mock.Mock(spec=worker.DecodeSteps)
         decode.plan = plan
+        decode.clock = worker.StepClock("decode")
         decode.step.return_value = (
             np.array([1, 2, -1, -1, -1, -1, -1, -1]),
             np.array([2], np.int32),
