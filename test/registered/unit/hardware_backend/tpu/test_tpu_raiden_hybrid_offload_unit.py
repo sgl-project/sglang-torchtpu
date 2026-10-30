@@ -724,6 +724,22 @@ class TestRecurrentStateGate(CustomTestCase):
         backend.req_to_token_pool = _Pool()
         self.assertEqual(backend._layer_state(7), ("state", 2))
 
+    def test_rpa_kv_read_never_touches_the_transfer_counter(self):
+        """The RPA backend reads a hybrid model's full-attention KV inside the
+        compiled forward; consulting the offload counter there guards the graph."""
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from sglang_tpu.attention_pallas_rpa_base import _fused_kv_operands
+
+        class _Pool(HybridLinearKVPool):
+            @property
+            def layer_transfer_counter(self):
+                raise AssertionError("read the HiCache counter")
+
+        pool = object.__new__(_Pool)
+        pool.full_attention_layer_id_mapping = {7: 2}
+        pool.full_kv_pool = SimpleNamespace(get_fused_kv_buffer=lambda i: ("kv", i))
+        self.assertEqual(_fused_kv_operands(pool, 7), (("kv", 2), None))
+
 
 class TestDraftSidecar(CustomTestCase):
     def _controller_with_draft(self):
