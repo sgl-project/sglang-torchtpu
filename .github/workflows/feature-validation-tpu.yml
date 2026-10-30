@@ -33,6 +33,7 @@ on:
         options:
           - all
           - mh
+          - pd-sh-muse-spark-pp8-dflash
           - pd-sh-qwen3-vl-30b
           - sh
       test_filter:
@@ -180,6 +181,33 @@ jobs:
       files: test/registered/tpu/e2e/test_tpu_qwen3_vl_30b_a3b_pd_singlehost_mmmu.py
       weights_pvc: model-weights
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_qwen3_vl_30b)[0].run_name }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # Muse Spark NVFP4 1P (PP8, EP1) + 1D (TP8, EP1) DFlash2, Raiden HiCache,
+  # SWA-crossing passkey recall, and GSM8K over Raiden pipeline transfer.
+  # In-project: public RadixArk/Muse-Spark-Open-DFlash2 draft needs egress.
+  pd-sh-muse-spark-pp8-dflash:
+    needs: [build, discover-tests]
+    if: >-
+      ${{ !cancelled() && needs.discover-tests.result == 'success'
+          && contains(fromJSON('["all","pd-sh-muse-spark-pp8-dflash"]'), inputs.only || 'all')
+          && contains('test/registered/tpu/e2e/test_tpu_muse_spark_pd_singlehost_pp8_dflash.py', inputs.test_filter) }}
+    name: test_tpu_muse_spark_pd_singlehost_pp8_dflash
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_tpu_muse_spark_pd_singlehost_pp8_dflash
+      lane: nightly
+      hosts: 1
+      pd_prefill_hosts: 1
+      pd_decode_hosts: 1
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_muse_spark_pd_singlehost_pp8_dflash.py
+      files: test/registered/tpu/e2e/test_tpu_muse_spark_pd_singlehost_pp8_dflash.py
+      weights_pvc: model-weights
+      run_name: pd-sh-muse-spark-pp8-dflash
     permissions:
       contents: read
       id-token: write
