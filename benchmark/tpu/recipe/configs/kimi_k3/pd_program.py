@@ -124,5 +124,10 @@ runtime_env.update(
         "SGLANG_RAIDEN_RESHARD": "0",
         # The MLA DSpark draft (both roles hold its KV).
         "SGLANG_TPU_K3_PROGRAM_DRAFT": "Inferact/Kimi-K3-DSpark",
+        # At AgentX's pinned acceptance (3.78 at seven drafts, 2.87 at three),
+        # measured with fp8 KV: seven drafts win only for a lone request; three
+        # beat seven from two requests and beat plain steps through sixteen
+        # (e.g. B8 1034 vs 851 tok/s, B16 1274 vs 995 at 131k context).
+        "SGLANG_TPU_K3_PROGRAM_SPEC_SCHEDULE": "1:1:7,2:16:3",
     }
 )
