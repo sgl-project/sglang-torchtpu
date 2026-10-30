@@ -1126,19 +1126,16 @@ def _resolve_expert_group_offset(
     ``trace_rank`` so every EP rank traces identical MLIR (``spmd_safe``).
 
     Outside a rank-parameterized trace (eager, dynamo, EP=1) the offset stays a
-    static int and the op signature is unchanged. The lift relies on
-    ``moe_ep_rank == world_rank % ep_size``: ``direct_compile`` only enables
-    ``lift_rank`` when the TP group is the whole world, so the EP group is a
-    contiguous slice of it, and ``traced_rank`` raises if that ever breaks.
+    static int and the op signature is unchanged. Under the trace the offset
+    follows ``traced_moe_ep_rank``, ``(tp_rank // moe_tp_size) % moe_ep_size``,
+    so EP < TP (``moe_tp_size > 1``) lifts as EP == TP does.
     """
     if global_num_experts <= num_local_experts:
         # EP=1: no window, and no new op input so the trace is unchanged.
         return expert_group_offset, None
-    from sglang_tpu.rank_local import traced_rank
+    from sglang_tpu.moe.ep_rank import traced_moe_ep_rank
 
-    ep_size = global_num_experts // num_local_experts
-    ep_rank = expert_group_offset // num_local_experts
-    rank = traced_rank(ep_rank, group_size=ep_size)
+    rank = traced_moe_ep_rank()
     if rank is None:
         return expert_group_offset, None
     return 0, (rank * num_local_experts).to(dtype=torch.int32).reshape(1)

@@ -10,6 +10,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang_tpu.compilation.direct_compile import direct_compile
 from sglang_tpu.moe.ep_rank import mask_tpu_moe_non_local_experts, traced_moe_ep_rank
+from sglang_tpu.moe.pallas.fused_moe_op import _resolve_expert_group_offset
 from sglang_tpu.rank_local import rank_slice
 
 
@@ -122,11 +123,21 @@ def check_moe_ep_rank_below_tp(cpu_group):
             w, i = mask_tpu_moe_non_local_experts(
                 weights, ids, num_local, ep_rank, traced_ep_rank=traced
             )
-            return traced, w, i
+            # The FP8 and W4A16 paths lift their expert window offset instead.
+            static, offset = _resolve_expert_group_offset(
+                ep_rank * num_local, ep_size * num_local, num_local
+            )
+            assert static == 0
+            return traced, w, i, offset
 
         with get_parallel().override(**layout):
-            traced, actual_weights, actual_ids = compile_local(fn, (weights, ids))
+            traced, actual_weights, actual_ids, offset = compile_local(
+                fn, (weights, ids)
+            )
         assert torch.equal(traced.cpu(), torch.tensor([ep_rank], dtype=torch.int32))
+        assert torch.equal(
+            offset.cpu(), torch.tensor([ep_rank * num_local], dtype=torch.int32)
+        )
         local_ids = ids_cpu - ep_rank * num_local
         valid = (local_ids >= 0) & (local_ids < num_local)
         assert torch.equal(
