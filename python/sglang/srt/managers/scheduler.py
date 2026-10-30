@@ -462,6 +462,7 @@ class Scheduler(
     _last_stall_publish_ts: float = float("-inf")
     kv_checksum_computer: Optional[KvChecksumComputer] = None
     kv_free_fence: Optional["KVFreeFence"] = None
+    pp_kv_read_fence: Optional["KVFreeFence"] = None
     # Draft KV pools cpu_tensor retraction backs up with the target KV.
     retraction_draft_kv_pools: tuple = ()
 
@@ -676,6 +677,7 @@ class Scheduler(
         # Init overlap schedule
         self.init_overlap()
         self.maybe_init_kv_free_fence()
+        self.maybe_init_pp_kv_read_fence()
 
         # Init Ngram Embedding
         self.maybe_init_ngram_embedding()
@@ -1823,6 +1825,21 @@ class Scheduler(
         )
         if self._uses_tpu_dma_hicache():
             fence_hicache_backups(self.tree_cache.cache_controller, self.kv_free_fence)
+
+    def maybe_init_pp_kv_read_fence(self):
+        """Defer raiden HiCache backups under PP until this stage's in-flight
+        forwards finish writing the pages."""
+        if not (
+            self.device == "tpu"
+            and get_parallel().pp_size > 1
+            and self.disaggregation_mode == DisaggregationMode.NULL
+            and self._uses_raiden_hicache()
+        ):
+            return
+        from sglang_tpu.kv_free_fence import KVFreeFence, fence_hicache_backups
+
+        self.pp_kv_read_fence = KVFreeFence(self.device_module.synchronize)
+        fence_hicache_backups(self.tree_cache.cache_controller, self.pp_kv_read_fence)
 
     def precompile_tpu_spec_ops(self) -> None:
         from sglang_tpu.compilation.spec_decode_compile_policy import (
