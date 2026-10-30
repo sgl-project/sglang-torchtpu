@@ -490,7 +490,10 @@ class MiniLoadBalancer:
                     decode_server, decode_response.json
                 )
 
-            if expected_decode_dp_rank is not None:
+            # Only a successful decode response carries meta_info.dp_rank; an
+            # upstream rejection must keep its own status rather than being
+            # reported as a DP rank mismatch.
+            if expected_decode_dp_rank is not None and decode_response.status == 200:
                 actual = ret_json.get("meta_info", {}).get("dp_rank")
                 if actual != expected_decode_dp_rank:
                     return ORJSONResponse(
@@ -918,10 +921,23 @@ def _generate_bootstrap_room():
 
 # We may utilize `GenerateReqInput`'s logic later
 def _get_request_batch_size(request):
+    """Return the batch size of a batched /generate request, or None when it is
+    a single request that takes scalar bootstrap fields.
+
+    Only the batch shape is detected here. Validating the prompt is left to the
+    engines (`GenerateReqInput.normalize_batch_and_arguments`), whose 400 is
+    forwarded, so empty or malformed inputs must not raise. For example,
+    `input_ids: []` is a single request: the engines reject it as empty unless
+    `session_params` supplies the prompt.
+    """
     if (text := request.get("text")) is not None:
-        return None if isinstance(text, str) else len(text)
+        return len(text) if isinstance(text, list) else None
     if (input_ids := request.get("input_ids")) is not None:
-        return None if isinstance(input_ids[0], int) else len(input_ids)
+        # Only a non-empty list of lists is a batch, matching the engine's
+        # GenerateReqInput._determine_batch_size.
+        if isinstance(input_ids, list) and input_ids and isinstance(input_ids[0], list):
+            return len(input_ids)
+        return None
     return None
 
 
