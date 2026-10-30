@@ -2749,6 +2749,71 @@ class TestTpuBatchLimitsUnderAttentionDp(CustomTestCase):
         self.assertEqual(resolution_result(args, "tpu_compile_bs"), [1, 2, 4, 8])
 
 
+class TestTorchCompileMaxBsResolution(CustomTestCase):
+    def _run_memory_settings(self, device="tpu", **overrides) -> ServerArgs:
+        args = ServerArgs(
+            model_path="dummy",
+            device=device,
+            chunked_prefill_size=4096,
+            mem_fraction_static=0.8,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(backend=Backend.DISABLED),
+                prefill=PhaseConfig(backend=Backend.DISABLED),
+            ),
+            **overrides,
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.memory_hook.use_mla_backend",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                return_value=None,
+            ),
+        ):
+            handle_gpu_memory_settings(args)
+        return args
+
+    def test_tpu_unset_compile_cap_follows_max_running_requests(self):
+        args = self._run_memory_settings(max_running_requests=8)
+        self.assertIsNone(args.torch_compile_max_bs)
+        self.assertEqual(resolution_result(args, "torch_compile_max_bs"), 8)
+        self.assertEqual(resolution_result(args, "max_running_requests"), 8)
+
+    def test_tpu_explicit_compile_cap_reconciles_with_concurrency(self):
+        # Only torch_compile_max_bs set -> concurrency follows it.
+        args = self._run_memory_settings(torch_compile_max_bs=16)
+        self.assertEqual(resolution_result(args, "torch_compile_max_bs"), 16)
+        self.assertEqual(resolution_result(args, "max_running_requests"), 16)
+
+        # Compile cap > concurrency -> compile cap stays 16, concurrency stays 8.
+        args = self._run_memory_settings(
+            torch_compile_max_bs=16, max_running_requests=8
+        )
+        self.assertEqual(resolution_result(args, "torch_compile_max_bs"), 16)
+        self.assertEqual(resolution_result(args, "max_running_requests"), 8)
+
+        # Concurrency > compile cap -> compile cap grows to cover concurrency (32).
+        args = self._run_memory_settings(
+            torch_compile_max_bs=16, max_running_requests=32
+        )
+        self.assertEqual(resolution_result(args, "torch_compile_max_bs"), 32)
+        self.assertEqual(resolution_result(args, "max_running_requests"), 32)
+
+    def test_tpu_neither_set_defaults_both_to_64(self):
+        args = self._run_memory_settings()
+        self.assertIsNone(args.torch_compile_max_bs)
+        self.assertEqual(resolution_result(args, "torch_compile_max_bs"), 64)
+        self.assertEqual(resolution_result(args, "max_running_requests"), 64)
+
+    def test_cpu_unset_compile_cap_uses_32_fallback(self):
+        args = self._run_memory_settings(device="cpu")
+        self.assertIsNone(args.torch_compile_max_bs)
+        self.assertEqual(resolution_result(args, "torch_compile_max_bs"), 32)
+        self.assertEqual(resolution_result(args, "cuda_graph_config").decode.max_bs, 32)
+
+
 class TestCudaGraphConfigDataclassAccess(CustomTestCase):
     @patch(
         "sglang.srt.model_executor.runner_backend."
