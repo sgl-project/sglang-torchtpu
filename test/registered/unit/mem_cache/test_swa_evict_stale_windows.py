@@ -5,6 +5,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 import random
 import unittest
 from array import array
+from types import SimpleNamespace
 
 import torch
 
@@ -81,13 +82,20 @@ class PrefillWorld:
         a.set_full_to_swa_mapping(full, swa)
         return full[:n]
 
-    def prefill(self, tokens: list[int], chunk: int) -> int:
+    def prefill(
+        self, tokens: list[int], chunk: int, media: tuple[int, int] | None = None
+    ) -> int:
         req = Req(
             rid=f"r{self.rid}",
             origin_input_text="",
             origin_input_ids=array("q", tokens),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
+        if media is not None:
+            # Only the item token offsets (inclusive) matter to the cache.
+            req.multimodal_inputs = SimpleNamespace(
+                mm_items=[SimpleNamespace(offsets=[(media[0], media[1] - 1)])]
+            )
         self.rid += 1
         self.req_to_token_pool.alloc([req])
         req.init_next_round_input(tree_cache=self.cache)
@@ -167,6 +175,93 @@ class TestSWAEvictStaleWindowsFirst(unittest.TestCase):
         # b matches 96 tokens and restores the shared window [96, 160).
         w.prefill(b, self.CHUNK)
         keep = 6 * (WINDOW + 1)  # two windows per tail plus the shared window
+        w.cache.evict(
+            EvictParams(
+                num_tokens=0, swa_num_tokens=w.cache.swa_evictable_size() - keep
+            )
+        )
+        self.assertEqual(len(w.match(shared + _tokens(10, 200)).device_indices), 160)
+        w.cache.sanity_check()
+
+
+
+class TestSWADemoteFinalWindows(unittest.TestCase):
+    """DTF stage 2 (SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS): a finished request's
+    private tail windows go to the SWA eviction end after it unpins; on a first
+    visit, the window ending at the page-floored media end stays put."""
+
+    # 2048-token chunks against a 2047-token window, as served: every chunk insert
+    # leaves the whole chunk with live SWA, so the media-end window is in the tree.
+    CHUNK = 64
+    MEDIA = 336  # system + media tokens: 21 pages, not on a chunk boundary
+    TAIL = 400
+
+    def _world(
+        self, *, stage1: bool, stage2: bool, swa_tokens: int = 8192
+    ) -> PrefillWorld:
+        with (
+            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("python"),
+            envs.SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST.override(stage1),
+            envs.SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS.override(stage2),
+        ):
+            return PrefillWorld(full_tokens=32768, swa_tokens=swa_tokens)
+
+    def _media_hit_after_dead_tails(self, *, stage1: bool, stage2: bool) -> int:
+        """First visit of a media prefix, then newer unrelated requests; keep only
+        a few windows of SWA; a sibling (same media, new text) matches."""
+        w = self._world(stage1=stage1, stage2=stage2)
+        media = _tokens(1, self.MEDIA)
+        w.prefill(media + _tokens(2, self.TAIL), self.CHUNK, media=(64, self.MEDIA))
+        for k in range(6):
+            w.prefill(_tokens(50 + k, self.MEDIA + self.TAIL), self.CHUNK)
+        keep = 4 * (WINDOW + 1)
+        w.cache.evict(
+            EvictParams(
+                num_tokens=0, swa_num_tokens=w.cache.swa_evictable_size() - keep
+            )
+        )
+        hit = len(w.match(media + _tokens(3, 200)).device_indices)
+        w.cache.sanity_check()
+        return hit
+
+    def test_first_visit_media_window_survives_dead_tails(self):
+        self.assertLess(
+            self._media_hit_after_dead_tails(stage1=False, stage2=False), self.MEDIA
+        )
+        self.assertEqual(
+            self._media_hit_after_dead_tails(stage1=False, stage2=True), self.MEDIA
+        )
+        self.assertEqual(
+            self._media_hit_after_dead_tails(stage1=True, stage2=True), self.MEDIA
+        )
+
+    def test_stage1_alone_demotes_the_media_window(self):
+        """Stage 1 treats the first-visit media window as stale; stage 2 exempts it."""
+        self.assertLess(
+            self._media_hit_after_dead_tails(stage1=True, stage2=False), self.MEDIA
+        )
+
+    def test_revisit_is_not_first_visit(self):
+        """A request whose floor already covers the media has no media window to keep."""
+        w = self._world(stage1=False, stage2=True)
+        media = _tokens(1, self.MEDIA)
+        w.prefill(media + _tokens(2, self.TAIL), self.CHUNK, media=(64, self.MEDIA))
+        cached = w.prefill(
+            media + _tokens(4, self.TAIL), self.CHUNK, media=(64, self.MEDIA)
+        )
+        self.assertEqual(cached, self.MEDIA)
+        w.cache.sanity_check()
+
+    def test_branch_window_is_not_demoted_at_finish(self):
+        """The finish walk stops at a branch point: a window another cached
+        sequence branches from keeps its LRU place."""
+        w = self._world(stage1=False, stage2=True)
+        shared = _tokens(7, 160)
+        a = shared + _tokens(8, self.MEDIA + self.TAIL - 160)
+        b = shared + _tokens(9, self.MEDIA + self.TAIL - 160)
+        w.prefill(a, self.CHUNK)
+        w.prefill(b, self.CHUNK)
+        keep = 6 * (WINDOW + 1)
         w.cache.evict(
             EvictParams(
                 num_tokens=0, swa_num_tokens=w.cache.swa_evictable_size() - keep

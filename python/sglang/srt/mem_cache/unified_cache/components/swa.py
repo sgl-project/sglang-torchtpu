@@ -84,6 +84,16 @@ class SWAComponent(TreeComponent):
         self._evict_stale_windows_first = (
             envs.SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST.get()
         )
+        self.demotes_final_windows = envs.SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS.get()
+        # CAP (SGLANG_OPT_SWA_CAP): page-by-page release of a running request's
+        # prompt-end window lock, plus the budgeted media anchors.
+        self.cap_enabled = envs.SGLANG_OPT_SWA_CAP.get()
+        self.cap_media_anchors = (
+            max(0, envs.SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS.get())
+            if self.cap_enabled
+            else 0
+        )
+        self.cap_text = _cap_text_mode()
         self.sliding_window_size = params.sliding_window_size
         self.full_window_pages = (
             self.sliding_window_size + params.page_size - 1
@@ -963,8 +973,14 @@ class SWAComponent(TreeComponent):
         insert_params.set_evicted_seqlen(
             self.component_type, req.kv.get_evicted_seqlen(self.component_type)
         )
-        if self._evict_stale_windows_first and req.swa_stale_window_floor is None:
+        if (
+            self._evict_stale_windows_first
+            or self.demotes_final_windows
+            or self.cap_media_anchors
+        ) and req.swa_stale_window_floor is None:
             req.swa_stale_window_floor = req.kv.cache_protected_len
+            if self.demotes_final_windows or self.cap_media_anchors:
+                req.swa_media_end = _media_end(req)
 
         # A recurrent checkpoint must stay attached to its exact token prefix.
         # Let MambaComponent select the insertion length for hybrid caches.
@@ -987,6 +1003,17 @@ class SWAComponent(TreeComponent):
     def _free_out_of_window_slots(self, req: Req, pre_len: int) -> None:
         if self.sliding_window_size is None:
             return
+        retain_floor = self.cache.swa_retain_floor(req)
+        if (
+            envs.SGLANG_OPT_SWA_KEEP_PREFILL_CHUNK_WINDOWS.get()
+            and pre_len < len(req.origin_input_ids) + 1
+        ):
+            # A prefill-phase insert frees nothing above the tree-owned prefix,
+            # so the leaf it inserts is SWA-live for the whole chunk.
+            protected = req.kv.cache_protected_len
+            retain_floor = (
+                protected if retain_floor is None else min(retain_floor, protected)
+            )
         free_swa_out_of_window_slots(
             req,
             pre_len,
@@ -994,7 +1021,7 @@ class SWAComponent(TreeComponent):
             page_size=self.cache.page_size,
             req_to_token_pool=self.cache.req_to_token_pool,
             token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
-            retain_floor=self.cache.swa_retain_floor(req),
+            retain_floor=retain_floor,
         )
 
     def free_out_of_window_slots(
@@ -1034,11 +1061,27 @@ class SWAComponent(TreeComponent):
             self._demote_stale_windows(
                 last_node=self.tree_core.node_by_id(insert_result.last_device_node),
                 floor=req.swa_stale_window_floor,
+                exempt=self._media_window(req),
+            )
+
+        if (
+            self.cap_media_anchors
+            and insert_result is not None
+            and insert_result.last_device_node is not None
+        ):
+            self._cap_anchor_media(
+                req, self.tree_core.node_by_id(insert_result.last_device_node)
             )
 
     # Each chunk insert leaves one window of live SWA at the chunk boundary that the
     # request can no longer free; move those behind its window to the SWA LRU end.
-    def _demote_stale_windows(self, *, last_node: UnifiedTreeNode, floor: int) -> None:
+    def _demote_stale_windows(
+        self,
+        *,
+        last_node: UnifiedTreeNode,
+        floor: int,
+        exempt: Optional[tuple[int, int]] = None,
+    ) -> None:
         ct = self.component_type
         root = self.tree_core.root_node
         path = []
@@ -1066,10 +1109,223 @@ class SWAComponent(TreeComponent):
                 and cd.value is not None
                 and cd.lock_ref == 0
                 and lru.in_list(n)
+                and not _overlaps(start, end, exempt)
             ):
                 lru.reset_node_lru(n)
             child = n
             end = start
+
+    def _media_window(self, req: Req) -> Optional[tuple[int, int]]:
+        """[start, end) of the SWA window that a later request reusing this
+        request's media needs live: the one ending at the page-floored media
+        end. Only a first visit (the media lies past the request's floor) owns
+        it; otherwise an earlier request already left it in the tree."""
+        if (
+            not (self.demotes_final_windows or self.cap_media_anchors)
+            or req.swa_media_end is None
+        ):
+            return None
+        boundary = req.swa_media_end // self.cache.page_size * self.cache.page_size
+        floor = req.swa_stale_window_floor
+        if floor is None or floor >= boundary:
+            return None
+        return boundary - self.sliding_window_size, boundary
+
+    def demote_final_windows(self, req: Req) -> None:
+        """At finish, after the request dropped its tree lock: move the live SWA
+        windows of its private tail (above its floor, below the first branch
+        point, unlocked) to the SWA LRU eviction end, except the first-visit
+        media window. Same break rule as ``_demote_stale_windows``, without its
+        window bound: nothing of this request's tail is in use any more."""
+        floor = req.swa_stale_window_floor
+        if floor is None or req.last_node is None:
+            return
+        try:
+            last_node = self.tree_core.node_by_id(req.last_node)
+        except KeyError:
+            return
+        ct = self.component_type
+        root = self.tree_core.root_node
+        path = []
+        node = last_node
+        while node is not root:
+            assert node is not None, "request last_node detached from the tree"
+            path.append(node)
+            node = node.parent
+        exempt = self._media_window(req)
+        lru = self.tree_core.lru_lists[ct]
+        end = sum(len(n.key) for n in path)
+        child = None
+        for n in path:
+            start = end - len(n.key)
+            if start < floor or any(c is not child for c in n.children.values()):
+                break
+            cd = n.component_data[ct]
+            if (
+                cd.value is not None
+                and cd.lock_ref == 0
+                and lru.in_list(n)
+                and not _overlaps(start, end, exempt)
+            ):
+                lru.reset_node_lru(n)
+            child = n
+            end = start
+
+    # ---- CAP (SGLANG_OPT_SWA_CAP) ----
+
+    def _path_with_positions(
+        self, node: UnifiedTreeNode
+    ) -> list[tuple[UnifiedTreeNode, int, int]]:
+        """``(node, start, end)`` token positions from ``node`` up to the root
+        (leaf first)."""
+        root = self.tree_core.root_node
+        path = []
+        cur = node
+        while cur is not root:
+            assert cur is not None, "node detached from the tree"
+            path.append(cur)
+            cur = cur.parent
+        end = sum(len(n.key) for n in path)
+        out = []
+        for n in path:
+            start = end - len(n.key)
+            out.append((n, start, end))
+            end = start
+        return out
+
+    def shrink_window_lock(
+        self,
+        node: UnifiedTreeNode,
+        params: DecLockRefParams,
+        cut: int,
+    ) -> list[tuple[UnifiedTreeNode, int, int]]:
+        """Shrink the SWA segment lock that ``params`` holds on [node,
+        boundary] to the nodes at or after token position ``cut`` (page
+        aligned); a node straddling ``cut`` is split there first. Release the
+        older nodes of the segment, stamp the new boundary with a uuid and
+        record it in ``params`` (in place). Return the released ``(node,
+        start, end)``, newest first. The caller keeps ``cut`` above 0 and below
+        the node's end (a full release is ``release_window_lock``)."""
+        ct = self.component_type
+        root = self.tree_core.root_node
+        page_size = self.tree_core.page_size
+        assert cut % page_size == 0, "CAP cut must be page aligned"
+        old_uuid = params.get_lock_uuid(ct)
+        segment = []
+        for n, start, end in self._path_with_positions(node):
+            segment.append((n, start, end))
+            if old_uuid is not None and n.component_data[ct].metadata.get("uuid") == old_uuid:
+                break
+        if not segment or segment[-1][1] >= cut:
+            return []  # the lock already starts at or after the cut
+        released = []
+        for i, (n, start, end) in enumerate(segment):
+            if start >= cut:
+                continue
+            if end <= cut:
+                # The cut sits exactly at this node's end: the previous node is
+                # the new boundary.
+                boundary = segment[i - 1][0]
+                released = segment[i:]
+                break
+            # start < cut < end: split so the newer part keeps the lock.
+            if n.write_through_pending_id is not None:
+                return []  # never split a node with an in-flight write-through
+            older, action = self.tree_core._split_node(n.key, n, cut - start)
+            assert action is None
+            boundary = n
+            released = [(older, start, cut)] + segment[i + 1 :]
+            break
+        else:
+            return []
+        lru_dirty = []
+        for r, _, _ in released:
+            comp = r.component_data[ct]
+            assert comp.lock_ref > 0, f"CAP release hit lock_ref=0 on node {r.id}"
+            if comp.lock_ref == 1 and comp.value is not None:
+                key_len = len(comp.value)
+                self.tree_core.component_evictable_size_[ct] += key_len
+                self.tree_core.component_protected_size_[ct] -= key_len
+            comp.lock_ref -= 1
+            if comp.lock_ref == 0:
+                lru_dirty.append(r)
+        for r in lru_dirty:
+            self.tree_core._update_evictable_leaf_sets(r)
+        meta = boundary.component_data[ct].metadata
+        if meta.get("uuid") is None:
+            meta["uuid"] = next_component_uuid(ct)
+        params.component_lock_uuids[ct] = meta["uuid"]
+        return released
+
+    def cap_text_exempt(self, req: Req) -> tuple[bool, Optional[tuple[int, int]]]:
+        """For a request without media under SGLANG_OPT_SWA_CAP_TEXT: whether
+        CAP leaves its lock alone ("skip"), and the window spared from demotion
+        ("keep_prompt_end": the one ending at the page-floored prompt end minus
+        one token, where an exact repeat's match ends). ``(False, None)`` keeps
+        the CAP behaviour, as does any request that carries media."""
+        if self.cap_text == "release" or _media_end(req) is not None:
+            return False, None
+        if self.cap_text == "skip":
+            return True, None
+        boundary = (len(req.origin_input_ids) - 1) // self.cache.page_size
+        boundary *= self.cache.page_size
+        return False, (boundary - self.sliding_window_size, boundary)
+
+    def demote_released(
+        self,
+        released: list[tuple[UnifiedTreeNode, int, int]],
+        exempt: Optional[tuple[int, int]] = None,
+    ) -> None:
+        """Move released, unlocked, SWA-live nodes to the SWA LRU eviction end,
+        except those overlapping ``exempt`` (the first-visit media window)."""
+        ct = self.component_type
+        lru = self.tree_core.lru_lists[ct]
+        for n, start, end in released:
+            cd = n.component_data[ct]
+            if (
+                cd.value is not None
+                and cd.lock_ref == 0
+                and lru.in_list(n)
+                and not _overlaps(start, end, exempt)
+            ):
+                lru.reset_node_lru(n)
+
+    def node_ending_at(
+        self, node: UnifiedTreeNode, position: int
+    ) -> Optional[UnifiedTreeNode]:
+        """The node of ``node``'s root path that ends at token ``position``
+        (page aligned), splitting the node that straddles it; None when the
+        path is shorter or the straddling node cannot be split."""
+        for n, start, end in self._path_with_positions(node):
+            if end == position:
+                return n
+            if start < position < end:
+                if n.write_through_pending_id is not None:
+                    return None
+                older, action = self.tree_core._split_node(n.key, n, position - start)
+                assert action is None
+                return older
+        return None
+
+    def _cap_anchor_media(self, req: Req, last_node: UnifiedTreeNode) -> None:
+        """CAP media anchor: once the request's prompt reaches its page-floored
+        media end, keep the window ending there SWA-locked by the cache
+        (``UnifiedRadixCache.cap_pin_media``: budgeted, least recently used
+        released first); a request that reaches an anchored window refreshes it."""
+        if req.swa_media_end is None or getattr(req, "swa_media_anchored", False):
+            return
+        page_size = self.tree_core.page_size
+        boundary = req.swa_media_end // page_size * page_size
+        if boundary <= self.sliding_window_size:
+            return
+        path = self._path_with_positions(last_node)
+        if not path or path[0][2] < boundary:
+            return
+        anchor = self.node_ending_at(last_node, boundary)
+        if anchor is None:
+            return
+        req.swa_media_anchored = True
+        self.cache.cap_pin_media(anchor)
 
     # ---- HiCache Hooks ----
 
@@ -1599,3 +1855,32 @@ class SWAComponent(TreeComponent):
         raise AssertionError(
             f"SWAComponent: unhandled ComponentAction {type(action).__name__}"
         )
+
+
+_CAP_TEXT_MODES = ("release", "skip", "keep_prompt_end")
+
+
+def _cap_text_mode() -> str:
+    """SGLANG_OPT_SWA_CAP_TEXT, checked against the known modes."""
+    mode = envs.SGLANG_OPT_SWA_CAP_TEXT.get()
+    if mode not in _CAP_TEXT_MODES:
+        raise ValueError(
+            f"SGLANG_OPT_SWA_CAP_TEXT must be one of {_CAP_TEXT_MODES}, got {mode!r}"
+        )
+    return mode
+
+
+def _overlaps(start: int, end: int, span: Optional[tuple[int, int]]) -> bool:
+    return span is not None and end > span[0] and start < span[1]
+
+
+def _media_end(req: Req) -> Optional[int]:
+    """Token position just past the request's last multimodal item, or None."""
+    mm = getattr(req, "multimodal_inputs", None)
+    ends = [
+        end + 1
+        for item in (getattr(mm, "mm_items", None) or ())
+        for _, end in (getattr(item, "offsets", None) or ())
+    ]
+    return max(ends) if ends else None
+

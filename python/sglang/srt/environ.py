@@ -692,16 +692,44 @@ class Envs:
     # Hybrid-SWA unified cache: insert a mid-prefill chunk only if it reaches a
     # multiple of this many tokens (0: every chunk); each insert pins an SWA window.
     SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE = EnvInt(0)
+    # Hybrid-SWA unified cache: while a request is in prefill, free none of its
+    # own SWA at a chunk insert, so every chunk stays SWA-live in the tree. A
+    # chunk longer than window + page (4096-token chunks) then keeps the match
+    # points of window-sized chunks instead of only its last window.
+    SGLANG_OPT_SWA_KEEP_PREFILL_CHUNK_WINDOWS = EnvBool(False)
     # Move the stale SWA windows a chunked request leaves behind its sliding window
     # to the SWA LRU eviction end, ahead of shared windows and prefix tails.
     SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST = EnvBool(False)
+    # When a request finishes, move its unshared final SWA windows (its private
+    # tail, after it drops its tree lock) to the SWA LRU eviction end. On a first
+    # visit of the request's media, the window ending at the page-floored media
+    # end stays put, here and under SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST.
+    SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS = EnvBool(False)
+    # CAP (SWA right-sizing): every SGLANG_OPT_SWA_CAP_INTERVAL decode batches,
+    # shrink a running request's SWA tree lock page by page to the prompt pages
+    # its sliding window still reads ([seqlen - 1 - window, seqlen)), move the
+    # released pages to the SWA LRU eviction end, and run the out-of-window
+    # eviction at the same interval.
+    SGLANG_OPT_SWA_CAP = EnvBool(False)
+    SGLANG_OPT_SWA_CAP_INTERVAL = EnvInt(32)
+    # CAP media anchor: keep up to this many first-visit media-boundary windows
+    # (the window ending at the page-floored media end) SWA-locked by the cache,
+    # least recently used released first; 0 disables.
+    SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS = EnvInt(0)
+    # CAP for requests without media (they have no media anchor, and their reuse
+    # is an exact repeat of the whole prompt, which needs the prompt-end window):
+    # "release" (the CAP behaviour above), "skip" (keep the prompt-end window
+    # lock until the release-leaf-lock path drops it) or "keep_prompt_end"
+    # (release the lock but leave the prompt-end window in LRU order).
+    SGLANG_OPT_SWA_CAP_TEXT = EnvStr("release")
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # The tree-core registry falls back to Python for:
     # - Session-aware caching.
     # - C128 or other unsupported components.
     # - Custom component overrides.
-    # - SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST on an SWA cache.
+    # - SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST,
+    #   SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS or SGLANG_OPT_SWA_CAP on an SWA cache.
     # - Non-Linux platforms.
     # - Unsupported PyTorch versions.
     # - Devices other than CPU or CUDA.

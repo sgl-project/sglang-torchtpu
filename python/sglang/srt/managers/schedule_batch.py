@@ -1223,6 +1223,11 @@ class Req(ReqDllmMixin):
         # Matched prefix length at this request's first radix insert; stale SWA
         # window demotion stops here (SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST).
         self.swa_stale_window_floor: Optional[int] = None
+        # End (exclusive) of the last multimodal item's tokens, read at the first
+        # radix insert (SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS); None for text.
+        self.swa_media_end: Optional[int] = None
+        # CAP media anchor taken for this request (SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS).
+        self.swa_media_anchored: bool = False
         # Logical-page KV sharding: rotation base of the chain this request
         # extends (owner of position-page P is (base + P) % shard_size).
         # Refreshed at every sharded alloc — read through last_node, or drawn
@@ -1995,6 +2000,8 @@ class Req(ReqDllmMixin):
         self.lock_receipt = DecLockRefParams()
         self.swa_prefix_lock_released = False
         self.swa_stale_window_floor = None
+        self.swa_media_end = None
+        self.swa_media_anchored = False
         self.swa_branching_seqlen = None
         self.extend_range = None
         self.dllm_initialized = False
@@ -4033,6 +4040,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
             eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
+            # CAP (SGLANG_OPT_SWA_CAP): right-size the prompt-end window lock and
+            # run the out-of-window eviction every CAP interval.
+            cap_interval = (
+                max(1, envs.SGLANG_OPT_SWA_CAP_INTERVAL.get())
+                if envs.SGLANG_OPT_SWA_CAP.get()
+                and hasattr(self.tree_cache, "cap_release")
+                else None
+            )
+            if cap_interval is not None:
+                eviction_interval = cap_interval
             swa_evict_due = self._swa_eviction_trigger(
                 sliding_window_size, eviction_interval
             )
@@ -4056,6 +4073,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                                 eviction_interval if has_auxiliary_swa else 1
                             ),
                         )
+
+                    if (
+                        cap_interval is not None
+                        and req.decode_batch_idx >= 1
+                        and req.decode_batch_idx % cap_interval == 0
+                        and req.kv.holds_kv
+                    ):
+                        self.tree_cache.cap_release(req)
 
                     # The next query, at seqlen - 1, reads down to seqlen - 1 - W;
                     # past cache_protected_len the prefix SWA lock is unused, so it

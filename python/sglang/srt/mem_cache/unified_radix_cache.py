@@ -216,6 +216,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # Components execute boundary actions through the tree core.
         for component in self.components.values():
             component.tree_core = self.tree_core
+        # CAP media anchors (SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS): anchored node id ->
+        # the SWA lock receipt the cache holds on it, least recently used first.
+        self._cap_anchors: dict[int, DecLockRefParams] = {}
 
         if (
             page_interleave_shard_size(params.token_to_kv_pool_allocator) > 1
@@ -370,6 +373,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
         self.tree_core.reset()
+        self._cap_anchors = {}
         self.session_refs.reset()
 
         # Reset Controller.
@@ -997,6 +1001,67 @@ class UnifiedRadixCache(BasePrefixCache):
         if req.last_node is not None:
             self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
 
+    def cap_release(self, req: Req) -> None:
+        """CAP (SGLANG_OPT_SWA_CAP): a running request's sliding window reads
+        only [seqlen - 1 - window, seqlen), so shrink its SWA tree lock to the
+        prompt pages at or after the page-floored window start and move the
+        released pages to the SWA LRU eviction end (except the first-visit
+        media window). Once the window has left the prompt, release the whole
+        SWA lock, as the release-leaf-lock path does after a full window."""
+        if self.disable or not self.is_swa_enabled:
+            return
+        swa = self.components.get(ComponentType.SWA)
+        receipt = req.lock_receipt
+        if (
+            swa is None
+            or not swa.cap_enabled
+            or req.last_node is None
+            or req.swa_prefix_lock_released
+            or receipt is None
+            or ComponentType.SWA in receipt.skipped_lock_components
+            or ComponentType.SWA not in receipt.component_lock_uuids
+        ):
+            return
+        skip, exempt = swa.cap_text_exempt(req)
+        if skip:
+            return
+        node = self.tree_core.node_by_id(req.last_node)
+        if node is self.tree_core.root_node:
+            return
+        cut = (req.seqlen - 1 - swa.sliding_window_size) // self.page_size * self.page_size
+        if cut <= 0:
+            return
+        path = swa._path_with_positions(node)
+        if cut >= path[0][2]:
+            # The window has left the prompt: nothing of the tree path is read.
+            released = list(path)
+            uuid = receipt.get_lock_uuid(ComponentType.SWA)
+            if uuid is not None:
+                for i, (n, _, _) in enumerate(path):
+                    if n.component_data[ComponentType.SWA].metadata.get("uuid") == uuid:
+                        released = path[: i + 1]
+                        break
+            self.dec_swa_lock_only(req.last_node, receipt)
+            req.swa_prefix_lock_released = True
+        else:
+            released = swa.shrink_window_lock(node, receipt, cut)
+        if released:
+            swa.demote_released(released, exempt=exempt or swa._media_window(req))
+
+    def cap_pin_media(self, node: UnifiedTreeNode) -> None:
+        """Keep ``node``'s trailing window locked by the cache (a CAP media
+        anchor): the same lock a request takes on it (FULL on the root path,
+        SWA on the trailing window). Re-anchoring refreshes it; beyond the
+        budget the least recently used anchor is released."""
+        swa = self.components[ComponentType.SWA]
+        if node.id in self._cap_anchors:
+            self._cap_anchors[node.id] = self._cap_anchors.pop(node.id)
+            return
+        self._cap_anchors[node.id] = self.tree_core.inc_lock_ref(node.id).to_dec_params()
+        while len(self._cap_anchors) > swa.cap_media_anchors:
+            old_id = next(iter(self._cap_anchors))
+            self.tree_core.dec_lock_ref(old_id, self._cap_anchors.pop(old_id))
+
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
@@ -1032,6 +1097,10 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_params=["req.rid", "inserted"])
     def on_release(self, req: Req, *, inserted: bool) -> None:
         if inserted:
+            # The request has dropped its tree lock: its private tail can go first.
+            swa = self.components.get(ComponentType.SWA)
+            if swa is not None and req.finished() and swa.demotes_final_windows:
+                swa.demote_final_windows(req)
             return
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(req, is_finished=True)
