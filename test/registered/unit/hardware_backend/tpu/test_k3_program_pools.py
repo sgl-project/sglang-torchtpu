@@ -167,6 +167,19 @@ class TestPrefixCache(CustomTestCase):
             0.0,
         )
 
+    def test_a_bound_program_copies_blocks(self):
+        pairs = []
+        sglang_pools.set_block_copier(pairs.extend)
+        self.addCleanup(sglang_pools.set_block_copier, None)
+        self._mark(2, 7.0)
+        self.state.copy_from(torch.tensor([2]), torch.tensor([3]))
+        self.kv.copy_blocks([5], [6])
+        # Slot 2's three state blocks onto slot 3's, then the page block; no
+        # eager copy (slot 3 keeps its value).
+        rows = [self.plan.state_block(s, g) for s in (2, 3) for g in range(3)]
+        self.assertEqual(pairs, list(zip(rows[:3], rows[3:])) + [(5, 6)])
+        self.assertEqual(self._value(3), 0.0)
+
     def test_prefill_hit_and_track(self):
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
         from sglang_tpu.k3_programs import sglang_worker as worker

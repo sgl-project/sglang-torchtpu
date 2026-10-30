@@ -189,6 +189,20 @@ def build_from_server():
     return programs
 
 
+def block_copier(prefiller):
+    """``prefiller``'s compiled block copy, ``(pairs) -> None``, over every
+    unified pool and the draft's (what the prefill runs for vLLM's
+    copy-on-write copies; warmed with the program)."""
+    from sglang_tpu.k3_programs.kimi_k3.prefill import COPY_PAIRS
+
+    def copy(pairs):
+        prefiller._writer.copy_blocks(pairs)
+        if prefiller.draft_latents is not None:
+            prefiller.draft_latents.copy_blocks(pairs, COPY_PAIRS)
+
+    return copy
+
+
 def _role_steps(role, program, config, pool):
     """``role``'s steps: its program bound to the unified pools, every op
     compiled."""
@@ -208,6 +222,11 @@ def _role_steps(role, program, config, pool):
     program.bind_kv_caches(pool.caches, groups)
     program.warmup()
     if role == "prefill":
+        from sglang_tpu.k3_programs.sglang_pools import set_block_copier
+
+        # The bridge's copies (prefix hits, checkpoints, tails) run the
+        # program's copy op, not eager index copies into its pools.
+        set_block_copier(block_copier(program))
         tails = None
         if plan.tail_slots:
             from sglang_tpu.k3_programs.sglang_tails import TailIndex

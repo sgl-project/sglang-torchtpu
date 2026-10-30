@@ -54,6 +54,26 @@ def _copy_rows(tensors, src: torch.Tensor, dst: torch.Tensor) -> None:
         pool.index_copy_(0, device_dst, pool.index_select(0, device_src))
 
 
+# A bound program's block copy, ``(pairs) -> None`` over every unified and
+# draft pool (``sglang_program.block_copier``). Eager index copies into the
+# pools would stay pending until the program's next op read them, which then
+# compiles a new executable for each pending copy; the program's copy op is
+# compiled once. Unset (no program, CPU tests): eager index copies.
+_block_copier: Any = None
+
+
+def set_block_copier(copier: Any) -> None:
+    global _block_copier
+    _block_copier = copier
+
+
+def _copy_blocks(tensors, src: torch.Tensor, dst: torch.Tensor) -> None:
+    if _block_copier is None:
+        _copy_rows(tensors, src, dst)
+        return
+    _block_copier([(int(a), int(b)) for a, b in zip(src.tolist(), dst.tolist())])
+
+
 def _kv_cache_dtype() -> str:
     from sglang.srt.runtime_context import get_model
 
@@ -129,14 +149,14 @@ class K3StatePool:
             raise ValueError(f"copy of {src.numel()} state rows into {dst.numel()}")
         if not src.numel():
             return
-        _copy_rows(self.host_pools(), src, dst)
+        _copy_blocks(self.host_pools(), src, dst)
 
     def copy_blocks(self, src_blocks, dst_blocks) -> None:
         """Copy state blocks (a tail's slot) in every hosting pool."""
         src = torch.as_tensor(src_blocks, dtype=torch.int64).reshape(-1).cpu()
         dst = torch.as_tensor(dst_blocks, dtype=torch.int64).reshape(-1).cpu()
         if src.numel():
-            _copy_rows(self.host_pools(), src, dst)
+            _copy_blocks(self.host_pools(), src, dst)
 
     def clear_slots(self, indices) -> None:
         """Nothing to clear: a request without a prefix hit starts from a zero
@@ -249,7 +269,7 @@ class K3UnifiedKVPool:
         src = torch.as_tensor(src_blocks, dtype=torch.int64).reshape(-1).cpu()
         dst = torch.as_tensor(dst_blocks, dtype=torch.int64).reshape(-1).cpu()
         if src.numel():
-            _copy_rows(self.raw_pools(), src, dst)
+            _copy_blocks(self.raw_pools(), src, dst)
 
     def get_kv_size_bytes(self) -> int:
         return sum(t.numel() * t.element_size() for t in self.raw_pools())
