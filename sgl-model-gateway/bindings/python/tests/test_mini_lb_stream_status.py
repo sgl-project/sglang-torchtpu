@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import socket
+import time
 from types import SimpleNamespace
 
 import aiohttp
@@ -401,3 +402,112 @@ def test_affinity_request_deadline_does_not_mark_engine_unreachable():
                 release.set()
 
     asyncio.run(run())
+
+
+# --- #658: a side that fails first must not leave the other side working ---
+
+SLOW_SECONDS = 5.0
+EARLY_RETURN_BOUND_SECONDS = 2.0
+
+
+def _slow(disconnected: asyncio.Event):
+    """A server that takes SLOW_SECONDS to answer (like a prefill computing a
+    long prompt) and sets `disconnected` once MiniLB closes the connection."""
+
+    async def handler(request):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + SLOW_SECONDS
+        try:
+            while loop.time() < deadline:
+                if request.transport is None or request.transport.is_closing():
+                    disconnected.set()
+                    break
+                await asyncio.sleep(0.02)
+        except asyncio.CancelledError:
+            # Some aiohttp versions cancel the handler on client disconnect.
+            disconnected.set()
+            raise
+        return web.json_response({"text": "late"})
+
+    return handler
+
+
+async def _run_early_failure(slow_side, stream):
+    """Send one request whose `slow_side` ("prefill" or "decode") is slow and
+    whose other side rejects immediately; return (response, elapsed_s,
+    slow_side_disconnected)."""
+    disconnected = asyncio.Event()
+    slow = _slow(disconnected)
+    prefill_handler, decode_handler = (
+        (slow, _reject) if slow_side == "prefill" else (_reject, slow)
+    )
+    prefill_runner, prefill_url = await _serve(prefill_handler)
+    decode_runner, decode_url = await _serve(decode_handler)
+    try:
+        lb = _lb(prefill_url, decode_url)
+        start = time.monotonic()
+        if stream:
+            response = await lb.generate_stream(
+                {"text": "hello", "stream": True}, prefill_url, decode_url
+            )
+        else:
+            response = await lb.generate(
+                {"text": "hello"}, prefill_url, decode_url, "generate"
+            )
+        elapsed = time.monotonic() - start
+        try:
+            await asyncio.wait_for(disconnected.wait(), EARLY_RETURN_BOUND_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+        return response, elapsed, disconnected.is_set()
+    finally:
+        await prefill_runner.cleanup()
+        await decode_runner.cleanup()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("stream", [False, True])
+def test_early_decode_rejection_cancels_slow_prefill(stream):
+    response, elapsed, disconnected = asyncio.run(_run_early_failure("prefill", stream))
+    assert response.status_code == 400
+    assert b"longer than the context length" in response.body
+    assert elapsed < EARLY_RETURN_BOUND_SECONDS
+    assert disconnected, "MiniLB must close its connection to the doomed prefill"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("stream", [False, True])
+def test_early_prefill_rejection_cancels_slow_decode(stream):
+    response, elapsed, disconnected = asyncio.run(_run_early_failure("decode", stream))
+    assert response.status_code == 400
+    assert elapsed < EARLY_RETURN_BOUND_SECONDS
+    assert disconnected, "MiniLB must close its connection to the doomed decode"
+
+
+@pytest.mark.unit
+def test_generate_returns_decode_rejection_after_fast_prefill():
+    """When prefill finishes 200 first and decode then rejects with non-200,
+    both responses are non-None; generate() must still return decode's status."""
+
+    async def fast_prefill(request):
+        return web.json_response({"text": "", "meta_info": {}})
+
+    async def slow_reject_decode(request):
+        await asyncio.sleep(0.05)
+        return web.Response(text="decode overloaded", status=503)
+
+    async def run():
+        prefill_runner, prefill_url = await _serve(fast_prefill)
+        decode_runner, decode_url = await _serve(slow_reject_decode)
+        try:
+            lb = _lb(prefill_url, decode_url)
+            return await lb.generate(
+                {"text": "hello"}, prefill_url, decode_url, "generate"
+            )
+        finally:
+            await prefill_runner.cleanup()
+            await decode_runner.cleanup()
+
+    response = asyncio.run(run())
+    assert response.status_code == 503
+    assert response.body == b"decode overloaded"
