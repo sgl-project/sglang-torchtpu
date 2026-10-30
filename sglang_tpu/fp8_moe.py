@@ -17,13 +17,13 @@ import os
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import print_warning_once
+from sglang_tpu.envs import envs
 
 
 def _free_replaced_storage(old: torch.Tensor, new: torch.Tensor) -> None:
@@ -598,4 +598,14 @@ def apply_tpu_fp8_moe(
         global_num_experts=global_num_experts,
         expert_group_offset=expert_group_offset,
     )
+    # Same contract as the unquantized runner: the standard dispatcher leaves
+    # routed_scaling_factor to the runner, and per-expert output (the caller
+    # combines on its own terms) stays unscaled.
+    routed_scaling_factor = layer.moe_runner_config.routed_scaling_factor
+    if (
+        not no_combine
+        and routed_scaling_factor is not None
+        and routed_scaling_factor != 1.0
+    ):
+        output = output * routed_scaling_factor
     return StandardCombineInput(hidden_states=output)

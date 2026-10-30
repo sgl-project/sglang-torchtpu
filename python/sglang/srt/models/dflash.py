@@ -857,11 +857,12 @@ class DFlashDraftModel(nn.Module):
 
     def sample_draft_tokens_tpu(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor
-    ) -> torch.Tensor:
-        """Sample draft tokens on TPU using target lm_head.
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        """Sample draft tokens on TPU using target lm_head; no candidate lattice.
 
         Extension hook: DSpark overrides it with its markov chain, whose first
-        step conditions on the anchor token in input_ids.
+        step conditions on the anchor token in input_ids; DFlash2 also returns
+        the candidate lattice it walked.
         """
         from sglang_tpu.dflash_utils_tpu import (
             argmax_draft_tokens_tpu,
@@ -870,11 +871,12 @@ class DFlashDraftModel(nn.Module):
         del input_ids
         if self.lm_head is None:
             raise ValueError("DFlash draft on TPU requires lm_head.")
-        return argmax_draft_tokens_tpu(
+        draft_tokens = argmax_draft_tokens_tpu(
             lm_head=self.lm_head,
             hidden_states=hidden_states,
             block_size=self.block_size,
         )
+        return draft_tokens, None
 
     @torch.no_grad()
     def forward(
@@ -926,13 +928,16 @@ class DFlashDraftModel(nn.Module):
                 hidden_states, _ = self.norm(hidden_states, residual)
 
         if _is_tpu and hidden_states.numel() != 0:
-            next_draft_tokens = self.sample_draft_tokens_tpu(hidden_states, input_ids)
+            next_draft_tokens, next_draft_lattice = self.sample_draft_tokens_tpu(
+                hidden_states, input_ids
+            )
         else:
-            next_draft_tokens = None
+            next_draft_tokens, next_draft_lattice = None, None
 
         return LogitsProcessorOutput(
             next_token_logits=None,
             next_draft_tokens=next_draft_tokens,
+            next_draft_lattice=next_draft_lattice,
             hidden_states=hidden_states,
         )
 

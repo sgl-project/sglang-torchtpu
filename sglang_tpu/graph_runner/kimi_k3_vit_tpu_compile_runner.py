@@ -37,8 +37,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import multimodal_encoder_runs_here
+from sglang_tpu.envs import envs
 from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
     VisionTpuCompilePolicy,
     _compute_patch_counts,

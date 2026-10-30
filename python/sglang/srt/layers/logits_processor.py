@@ -289,6 +289,9 @@ class LogitsProcessorOutput:
 
     # Sampled draft token IDs when draft sampling is fused into draft model forward
     next_draft_tokens: Optional[torch.Tensor] = None
+    # DFlash2 candidate ids [bs, gamma, K] and scores [bs, gamma, K, K] from the
+    # draft forward, so sampled drafting reuses them instead of rebuilding.
+    next_draft_lattice: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None

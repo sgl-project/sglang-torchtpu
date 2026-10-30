@@ -69,10 +69,13 @@ _ENV_FIELDS_NOT_KEYED = frozenset(
         "SGLANG_TPU_CHECK_RECOMPILATION",
         "SGLANG_TPU_CHECK_RECOMPILATION_SITES",
         # PD KV transfer and its tracing, on the host.
+        "SGLANG_DEBUG_TPU_KV_STATS_EVERY",
         "SGLANG_RAIDEN_DYNAMIC_HOST_STAGING",
         "SGLANG_RAIDEN_LISTENER_START_READ",
         "SGLANG_RAIDEN_PIPELINE_TRANSFER",
         "SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING",
+        "SGLANG_TPU_KV_ASYNC",
+        "SGLANG_TPU_KV_CHANNELS",
         # PP chunk scheduling; the token buckets it picks are graph shapes.
         "SGLANG_TPU_PP_CHUNK_SLACK",
         "SGLANG_TPU_PP_DYNAMIC_CHUNKS",
@@ -82,6 +85,8 @@ _ENV_FIELDS_NOT_KEYED = frozenset(
         "SGLANG_TPU_PROFILE_PYTHON_TRACER",
         # KV transfer timeout.
         "SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S",
+        # Multi-host discovery port, derived from --dist-init-addr per launch.
+        "SGLANG_TPU_TOPOLOGY_BOOTSTRAP_PORT",
         # Which vision shapes are precompiled; each shape is in its graph.
         "SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES",
         "SGLANG_TPU_VIT_NUM_PRECOMPILE_BUCKETS",

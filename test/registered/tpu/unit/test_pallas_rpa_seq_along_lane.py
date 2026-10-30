@@ -18,13 +18,13 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.attention_pallas_rpa_batched import (
     RPA_BATCHED_SPEC,
     kv_layout,
 )
+from sglang_tpu.envs import envs
 
 
 class TestKvLayoutSelection(CustomTestCase):

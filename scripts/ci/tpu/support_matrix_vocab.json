@@ -108,7 +108,13 @@
     },
     "decode-radix": "PD decode-side radix reuse",
     "prefix-cache": "Prefix cache",
-    "kv-offload": "HiCache KV offload",
+    "kv-offload": {
+      "name": "HiCache KV offload",
+      "aliases": [
+        "hicache"
+      ]
+    },
+    "l3-file": "HiCache L3 storage (file backend)",
     "logprob": "Prompt logprobs",
     "compile": "torch.compile",
     "torch-compile": "torch.compile bundles",
