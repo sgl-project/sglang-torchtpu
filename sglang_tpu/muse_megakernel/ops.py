@@ -13,6 +13,7 @@ place).
 """
 
 import logging
+import math
 
 import jax
 import msgspec
@@ -21,15 +22,21 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool, kv_pack_heads
+from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.fp8_weight_linear import TpuSharedKMajorLinearMethod
+from sglang_tpu.kv_pool import (
+    TpuFusedMHATokenToKVPool,
+    TpuSeqAlongLaneKVPool,
+    kv_pack_heads,
+)
 from sglang_tpu.muse_megakernel import kernel as K
+
+# Profiling only: in-kernel region names for xprof (kernel.py's _TRACE).
+K._TRACE = tpu_envs.SGLANG_TPU_MK_TRACE_REGIONS.get()
 
 logger = logging.getLogger(__name__)
 
 _OP_NS = "sglang_tpu_pallas"
-# Larger steps run the native decoder: 32 rows (cc=8 with 4 DFlash drafts) is the
-# largest batch measured faster on the megakernel.
-_MAX_ROWS = 32
 # KV pages per attention chunk: 4 beats 2 on long-context verify steps and is neutral
 # at short context; 8+ costs VMEM the expert ring needs.
 _CHUNK_PAGES = 4
@@ -120,6 +127,7 @@ class MuseMegakernel(torch.nn.Module):
         tp_rank: int,
         max_rows: int,
         max_position: int,
+        scale_fp8: bool,
     ) -> None:
         super().__init__()
         self.geo = geo
@@ -127,6 +135,7 @@ class MuseMegakernel(torch.nn.Module):
         self.tp_size = tp_size
         self.max_rows = max_rows
         self.max_position = max_position
+        self.scale_fp8 = scale_fp8
         self.chunk_pages = _CHUNK_PAGES
         # the pools' layout: SGLANG_TPU_KV_PACK_HEADS stores the rank's heads in one row
         self.kv_packed = (
@@ -151,7 +160,7 @@ class MuseMegakernel(torch.nn.Module):
 
     # ------------------------------------------------------------------ preparation
     @classmethod
-    def from_model(cls, model, *, max_rows: int = _MAX_ROWS) -> "MuseMegakernel":
+    def from_model(cls, model) -> "MuseMegakernel":
         from sglang.srt.runtime_context import get_parallel
 
         parallel = get_parallel()
@@ -162,10 +171,11 @@ class MuseMegakernel(torch.nn.Module):
             raise NotImplementedError(
                 "the Muse megakernel needs expert TP across the whole TP group"
             )
-        # Remote DMA over one host's devices only; rows are padded to the TP size.
-        if parallel.tp_size not in (1, 8):
+        # Remote DMA reaches every device of the slice's mesh (tp 16 spans two hosts);
+        # rows are padded to the TP size.
+        if parallel.tp_size not in (1, 8, 16):
             raise NotImplementedError(
-                f"the Muse megakernel runs at TP 1 or 8, got {parallel.tp_size}"
+                f"the Muse megakernel runs at TP 1, 8 or 16, got {parallel.tp_size}"
             )
         if parallel.attn_dcp_size != 1:
             raise NotImplementedError("the Muse megakernel reads unstrided page tables")
@@ -176,6 +186,11 @@ class MuseMegakernel(torch.nn.Module):
         device = decoder.norm.weight.device
         qkvg, wo, wpool, wunpool, wrouter, smalls = [], [], [], [], [], []
         experts, kinds = [], []
+        # e4m3 NVFP4 block scales come with per-expert globals (SGLANG_TPU_NVFP4_E4M3_SCALES)
+        scale_fp8 = any(
+            layer.mlp.experts.w13_weight_scale.dtype == torch.float8_e4m3fn
+            for layer in decoder.layers
+        )
         for layer in decoder.layers:
             attn, moe = layer.self_attn, layer.mlp
             if layer.post_attention_layernorm.weight is not None:
@@ -214,6 +229,12 @@ class MuseMegakernel(torch.nn.Module):
             sm[S["expert_bias"], :Ep] = K.NEG
             sm[S["expert_bias"], : geo.n_experts] = moe.e_score_correction_bias.float()
             sm[S["post_expert_w"], : geo.expert_hidden] = moe.post_expert_norm.gain()
+            if scale_fp8 and moe.experts.w13_weight_scale.dtype == torch.float8_e4m3fn:
+                E = geo.n_experts
+                gs13 = moe.experts._tpu_w13_global_scale
+                sm[S["expert_gs"], :E] = gs13[:, 0]
+                sm[S["expert_gs"], Ep : Ep + E] = gs13[:, 1]
+                sm[S["expert_gs_down"], :E] = moe.experts._tpu_w2_global_scale
             # fp8 e4m3 dense copies with per-output-channel scales (the router stays bf16).
             for name, mats in (
                 ("wqkvg", qkvg),
@@ -267,12 +288,62 @@ class MuseMegakernel(torch.nn.Module):
             kinds=tuple(kinds),
             tp_size=parallel.tp_size,
             tp_rank=parallel.tp_rank,
-            max_rows=max_rows,
+            max_rows=tpu_envs.SGLANG_TPU_MUSE_MK_MAX_ROWS.get(),
             max_position=rope_tab.shape[0],
+            scale_fp8=scale_fp8,
         )
         _INSTANCE[:] = [mk]
         _register_op()
         return mk
+
+    def share_dense_weights(self, decoder) -> int:
+        """Run the native path's dense linears and routers on the kernel's K-major copies and
+        drop their own weights; returns the bytes dropped per device."""
+        S = K.SMALL
+        dropped = 0
+        for i, layer in enumerate(decoder.layers):
+            attn, moe = layer.self_attn, layer.mlp
+            qkv_cols = attn.qkv_proj.weight.shape[0]
+            gate_cols = attn.gate_proj.weight.shape[0]
+            plan = (
+                (attn.qkv_proj, self.w_wqkvg, 0, qkv_cols, "wqkvg_s"),
+                (
+                    attn.gate_proj,
+                    self.w_wqkvg,
+                    qkv_cols,
+                    qkv_cols + gate_cols,
+                    "wqkvg_s",
+                ),
+                (attn.o_proj, self.w_wo, 0, attn.o_proj.weight.shape[0], "wo_s"),
+                (
+                    moe.pre_expert_proj,
+                    self.w_wpool,
+                    0,
+                    moe.pre_expert_proj.weight.shape[0],
+                    "wpool_s",
+                ),
+                (
+                    moe.post_expert_proj,
+                    self.w_wunpool,
+                    0,
+                    moe.post_expert_proj.weight.shape[0],
+                    "wunpool_s",
+                ),
+                (moe.gate, self.w_wrouter, 0, self.geo.n_experts, None),
+            )
+            for linear, stack, c0, c1, scale_name in plan:
+                dropped += linear.weight.numel() * linear.weight.element_size()
+                linear.quant_method = TpuSharedKMajorLinearMethod(
+                    linear,
+                    stack=stack,
+                    index=i,
+                    col_start=c0,
+                    col_stop=c1,
+                    scales=None if scale_name is None else self.w_smalls,
+                    scale_row=0 if scale_name is None else S[scale_name],
+                )
+                linear.weight = None
+        return dropped
 
     # ------------------------------------------------------------------ op building
     def config(
@@ -284,8 +355,33 @@ class MuseMegakernel(torch.nn.Module):
         n_page_entries: int,
         page_size: int,
         capture: tuple,
+        kv_sal: bool = False,
+        kv_sal_fp8: bool = False,
     ) -> K.MKConfig:
         g = self.geo
+        # SAL chunks are one expert w13 slot row of tokens (the ring is a view of those slots)
+        sal_chunk_pages = 2 * g.inter_local // page_size
+        swa_chunk_pages = (
+            tpu_envs.SGLANG_TPU_MUSE_MK_SAL_SWA_CHUNK_TOKENS.get() // page_size
+            if kv_sal
+            else 0
+        )
+        if swa_chunk_pages >= sal_chunk_pages:
+            swa_chunk_pages = 0
+        kv_chunk_tokens = sal_chunk_pages * page_size if kv_sal else 512
+        kv_group = 2 if rows > _LARGE_STEP_ROWS else 4
+        # q and k are RMS-normalized per head: the score bound allows exp without a max
+        unshifted = (
+            1.1 * g.scale_query_by * g.head_dim * g.attn_scale <= K.UNSHIFTED_MAX
+        )
+        attn_pipe = unshifted and kv_sal and rows <= _BASE_STEP_MAX_ROWS
+        # few-row steps (decode) gather their rows in one round and have nothing to fold
+        fold = (
+            tpu_envs.SGLANG_TPU_MUSE_MK_FOLD.get()
+            and n_req * q > 2
+            and rows <= _BASE_STEP_MAX_ROWS
+        )
+        y_early = tpu_envs.SGLANG_TPU_MK_Y_EARLY.get() and rows <= 16
         cfg = K.MKConfig(
             hidden=g.hidden,
             head_dim=g.head_dim,
@@ -316,18 +412,65 @@ class MuseMegakernel(torch.nn.Module):
             n_req=n_req,
             capture_layers=capture,
             compact_rows=4 if rows <= _COMPACT4_MAX_ROWS else 8,
-            chunk_pages=self.chunk_pages,
-            kv_packed=self.kv_packed,
+            topk_iter=_TOPK_ITER_MIN_ROWS <= rows <= _BASE_STEP_MAX_ROWS,
+            fold_f=fold,
+            fold_o=fold,
+            # SEQ_ALONG_LANE pages are >= 256 tokens
+            chunk_pages=sal_chunk_pages if kv_sal else self.chunk_pages,
+            swa_chunk_pages=swa_chunk_pages,
+            attn_skip_idle_streams=tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_SKIP_IDLE.get(),
+            attn_col_mask=bool(swa_chunk_pages)
+            and tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_COL_MASK.get(),
+            attn_unshifted=unshifted,
+            attn_pipe=attn_pipe,
+            attn_streams=_PIPE_STREAMS[kv_sal_fp8] if attn_pipe else 2,
+            kv_packed=self.kv_packed and not kv_sal,
+            kv_sal=kv_sal,
+            kv_sal_fp8=kv_sal_fp8,
+            kv_write_pipelined=kv_sal
+            and tpu_envs.SGLANG_TPU_MUSE_MK_KV_WRITE_PIPELINED.get(),
+            sal_fp8_dot=tpu_envs.SGLANG_TPU_MK_SAL_FP8_DOT.get() if kv_sal_fp8 else 0,
+            scale_fp8=self.scale_fp8,
+            # measured a loss at 32 rows, where the expert loop is compute-bound
+            y_early=y_early,
+            y_block_send=tpu_envs.SGLANG_TPU_MK_Y_BLOCK_SEND.get() and not y_early,
+            xfull_packed=rows > _BASE_STEP_MAX_ROWS,
+            # the dense merge/combine/top-k fit VMEM up to 64 rows and run faster (per-slot
+            # merge measured 3.2 vs 0.2 ms per 64-row step)
+            row_bounded_temps=rows > _LARGE_STEP_ROWS,
+            packed_pages=_pack_pages(n_page_entries),
+            fold_attn_scale=tpu_envs.SGLANG_TPU_MK_FOLD_ATTN_SCALE.get()
+            and math.frexp(g.attn_scale)[0] == 0.5,
+            # half-height dense tiles: smaller ring slots for the larger steps' VMEM
+            # smaller dense tiles and KV fetch groups for the larger steps' VMEM: 96 rows with
+            # 512-row tiles and 4-chunk groups overflowed by 0.5 MiB
+            tile_k=256
+            if rows > _LARGE_STEP_ROWS
+            else 512
+            if rows > _BASE_STEP_MAX_ROWS
+            else 1024,
+            kv_group=kv_group,
+            vmem_limit_bytes=_vmem_limit(rows),
         )
         # Deepest expert prefetch, then largest dense ring (2.25 MiB slots), whose declared
         # scratch leaves VMEM headroom for Mosaic temporaries; rows-scaled scratch grows ~0.24 MiB/row.
         for depth, cap in _DEPTH_RING_PREFERENCE:
+            if rows > _BASE_STEP_MAX_ROWS and cap > 4:
+                # half-height tiles double the tile count, so a deep ring of them fills the
+                # VMEM those steps' temporaries need: 64 rows with a 10-slot ring overflowed
+                continue
             cand = msgspec.structs.replace(cfg, expert_depth=depth)
             slots = K.fit_ring_slots(cand, cap=cap)
             cand = msgspec.structs.replace(
                 cand, ring_slots=slots, stream_depth=slots - 1
             )
-            if K.scratch_vmem_bytes(cand) <= _SCRATCH_VMEM_BUDGET:
+            if fold and not K.fold_fits(cand):
+                cand = msgspec.structs.replace(cand, fold_f=False, fold_o=False)
+            if K.scratch_vmem_bytes(cand) <= _scratch_budget(rows, kv_chunk_tokens) - (
+                # the larger steps' SAL attention temporaries; measured 1.2 MiB over at 32 rows
+                # with page-block unpacks (steps up to 32 rows now unpack whole ring chunks)
+                _SAL_VMEM_HEADROOM if kv_sal and rows > _BASE_STEP_MAX_ROWS else 0
+            ):
                 return cand
         raise ValueError(
             f"no Muse megakernel ring fits the VMEM budget at {rows} rows of {q}"
@@ -342,6 +485,11 @@ class MuseMegakernel(torch.nn.Module):
             else (pool,)
         )
         for p in pools:
+            if type(p) is TpuSeqAlongLaneKVPool and p.store_dtype in (
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+            ):
+                continue
             if (
                 type(p) is not TpuFusedMHATokenToKVPool
                 or p.store_dtype != torch.bfloat16
@@ -404,6 +552,10 @@ class MuseMegakernel(torch.nn.Module):
         pool = backend.token_to_kv_pool
         self.check_kv_pools(pool)
         kv = [pool.get_fused_kv_buffer(i) for i in range(self.geo.n_layers)]
+        if _pack_pages(page_indices.shape[0]) and max(k.shape[0] for k in kv) > 0xFFFF:
+            raise NotImplementedError(
+                "packed page tables need fewer than 65536 KV pages"
+            )
         weights = [getattr(self, f"w_{n}") for n in K.WEIGHT_NAMES]
         experts = [getattr(self, f"expert_{i}") for i in range(self.n_expert_refs)]
         hidden, aux = torch.ops.sglang_tpu_pallas.muse_megakernel(
@@ -452,13 +604,17 @@ def _register_op() -> None:
         from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
         mk = _INSTANCE[0]
+        # SEQ_ALONG_LANE blocks are [pages, 2 * kv_heads, words, pk, page_size]
+        kv_sal = kv[0].shape[1] == 2 * mk.geo.kv_heads and kv[0].shape[-1] >= 128
         cfg = mk.config(
             rows=emb.shape[0],
             q=rows_per_req,
             n_req=n_req,
             n_page_entries=pf.shape[0],
-            page_size=kv[0].shape[1],
+            page_size=kv[0].shape[-1] if kv_sal else kv[0].shape[1],
             capture=tuple(capture),
+            kv_sal=kv_sal,
+            kv_sal_fp8=kv[0].dtype == torch.float8_e4m3fn,
         )
         callable_ = mk.callable_for(cfg)
         with tpu_info_for_cpu_export():
@@ -479,10 +635,55 @@ def _register_op() -> None:
 # (verify attention): 24 rows of 6 compile at 46.8 MiB declared, 32 rows of 8 overflowed the
 # 60 MiB limit at 48.7 MiB (~11.5 MiB of temporaries).
 _SCRATCH_VMEM_BUDGET = 48 * 2**20
-_DEPTH_RING_PREFERENCE = ((3, 11), (3, 4), (1, 4))
+_SAL_VMEM_HEADROOM = 2 * 2**20
+# Pipelined attention, chunks per loop iteration by fp8 SAL (measured at 500k context)
+_PIPE_STREAMS = {False: 4, True: 8}
+_DEPTH_RING_PREFERENCE = ((3, K.MAX_RING_SLOTS), (3, 4), (1, 4), (1, 2))
+# Past 64 rows Mosaic's own temporaries grow ~0.1 MiB per row: 96 rows of 4 overflowed the
+# 64 MiB VMEM by 2.5 MiB at 41.5 MiB declared (39.5 + SAL headroom), so the declared budget
+# shrinks with rows.
+_LARGE_STEP_ROWS = 64
+# Steps of at most this many rows compile the original program; larger ones
+# (SGLANG_TPU_MUSE_MK_MAX_ROWS > 32) keep the expert inputs as packed bf16 pairs, use
+# half-height dense weight tiles, a ring of at most 4 slots and row-bounded temporaries.
+_BASE_STEP_MAX_ROWS = 32
+_LARGE_STEP_BUDGET_PER_ROW = int(0.3 * 2**20)
+_LARGE_CHUNK_BUDGET = int(2.5 * 2**20)
 # Measured device step (real geometry, random routing): the 8-row block-diag variant is
 # slower than the 4-row one at 8-24 rows and faster only at 48.
 _COMPACT4_MAX_ROWS = 24
+# Iterative router top-k from this many rows: 32-row verify steps 1.1 ms faster, 16 rows neutral.
+_TOPK_ITER_MIN_ROWS = 24
+
+
+# Both int32 page tables in SMEM: 16 requests at 1M context (512 KiB) read at SMEM speed, 24
+# (768 KiB) did not (every page lookup ~1 us: 670 ms steps), 32 do not fit (1 MiB).
+_PAGE_TABLES_SMEM_BYTES_MAX = 600 * 1024
+
+
+def _pack_pages(n_page_entries: int) -> bool:
+    forced = tpu_envs.SGLANG_TPU_MK_PACK_PAGE_TABLES.get()
+    if forced is not None:
+        return bool(forced)
+    return n_page_entries * 2 * 4 > _PAGE_TABLES_SMEM_BYTES_MAX
+
+
+def _vmem_limit(rows: int) -> int:
+    mb = tpu_envs.SGLANG_TPU_MK_LARGE_STEP_VMEM_LIMIT_MB.get()
+    if mb is None or rows <= _LARGE_STEP_ROWS:
+        return 60 * 2**20
+    return int(mb * 2**20)
+
+
+def _scratch_budget(rows: int, chunk_tokens: int) -> int:
+    per_row = tpu_envs.SGLANG_TPU_MK_LARGE_STEP_BUDGET_PER_ROW_KB.get()
+    per_row = _LARGE_STEP_BUDGET_PER_ROW if per_row is None else per_row * 1024
+    budget = _SCRATCH_VMEM_BUDGET - max(0, rows - _LARGE_STEP_ROWS) * per_row
+    if rows > _BASE_STEP_MAX_ROWS:
+        # Larger KV chunks grow the chunk unpack and score temporaries: 64 rows with 1024-token
+        # chunks overflowed by 1.2 MiB at 40.2 MiB declared.
+        budget -= max(0, chunk_tokens // 512 - 1) * _LARGE_CHUNK_BUDGET
+    return budget
 
 
 def _round_up(n: int, m: int) -> int:
@@ -505,6 +706,8 @@ def _build_callable(cfg: K.MKConfig, tp: int):
     kvw = K.kv_write_call(cfg)
 
     def body(*xs):
+        if cfg.packed_pages:
+            xs = (*xs[:2], K.pack_page_table(xs[2]), K.pack_page_table(xs[3]), *xs[4:])
         hid, aux, newkv = mk(*xs)
         pools = kvw(*xs[:4], newkv, *xs[kv0:])
         return (hid, aux, *pools)

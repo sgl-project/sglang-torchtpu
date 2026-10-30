@@ -211,7 +211,22 @@ class SchedulerInternalStateController:
             "dspark_clear_info_records": _UpdateHandler(
                 self._validate_dspark_clear_records, self._apply_dspark_clear_records
             ),
+            # DIAG (do not merge): runtime sweep of --prefill-decode-interval.
+            "prefill_decode_interval": _UpdateHandler(
+                self._validate_pdi, self._apply_pdi
+            ),
         }
+
+    def _validate_pdi(self, key: str, value: Any) -> None:
+        if not isinstance(value, int) or value < 0:
+            raise UpdateRejected(f"{key} must be a non-negative int, got {value}.")
+
+    def _apply_pdi(self, key: str, value: Any) -> None:
+        self.scheduler.prefill_decode_interval = value
+        self.scheduler._prefill_decode_interval_remaining = min(
+            self.scheduler._prefill_decode_interval_remaining, value
+        )
+        logger.info("DIAG prefill_decode_interval set to %d", value)
 
     def _validate_pp_micro_batch_size(self, key: str, value: Any) -> None:
         upper = self.scheduler.max_running_requests // get_parallel().pp_size

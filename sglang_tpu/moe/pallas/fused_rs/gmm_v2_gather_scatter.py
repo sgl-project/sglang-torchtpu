@@ -306,6 +306,15 @@ def inner_kernel(
     # LHS quant dtype before matmul so their per-block scales are not dropped.
     _resolved_gm_id = pl.program_id(0) if _gm_id is None else _gm_id
 
+    def _to_bf16(w):
+        # e2m1 values are exact in e4m3; fp4 -> fp8 -> bf16 takes fewer VPU ops than the
+        # direct widen (bit-identical).
+        if fp4_via_fp8 and w.dtype == jnp.float4_e2m1fn:
+            w = w.astype(jnp.float8_e4m3fn)
+        return w.astype(jnp.bfloat16)
+
+    fp4_via_fp8 = envs.SGLANG_TPU_FP4_DEQUANT_VIA_FP8.get()
+
     def _matmul(is_first_k_step: bool, is_last_k_step: bool):
         tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[...]
         tiled_rhs = tiled_rhs_ref.get_weight()
@@ -332,8 +341,13 @@ def inner_kernel(
             rhs_scale = tiled_rhs_ref.get_scale()
             if rhs_scale.ndim == 2:
                 # Compact [num_quant_blocks, n] tile (fused-RS 3D scale layout).
-                return rhs_scale[b_id : b_id + 1, start_n:end_n]
-            return rhs_scale[..., b_id, :, start_n:end_n]
+                scale = rhs_scale[b_id : b_id + 1, start_n:end_n]
+            else:
+                scale = rhs_scale[..., b_id, :, start_n:end_n]
+            # e4m3 block scales (NVFP4 with separate globals) widen on use.
+            if scale.dtype == jnp.float8_e4m3fn:
+                scale = scale.astype(jnp.float32)
+            return scale
 
         def _online_quantize(block, axis, quant_dtype):
             if jnp.issubdtype(quant_dtype, jnp.floating):
@@ -439,14 +453,14 @@ def inner_kernel(
                             local_k_end = rhs_k_end - start_k
                             rhs_scale_slice = _get_scale_slice(b_id, start_n, end_n)
                             block_rhs_slice = block_rhs[local_k_start:local_k_end]
-                            scaled_rhs_slice = block_rhs_slice.astype(
-                                jnp.bfloat16
+                            scaled_rhs_slice = _to_bf16(
+                                block_rhs_slice
                             ) * rhs_scale_slice.astype(jnp.bfloat16)
                             scaled_rhs_slices.append(scaled_rhs_slice)
                             rhs_k_start = rhs_k_end
                         block_rhs_for_quant = jnp.concatenate(scaled_rhs_slices, axis=0)
                     else:
-                        block_rhs_for_quant = block_rhs.astype(jnp.bfloat16)
+                        block_rhs_for_quant = _to_bf16(block_rhs)
 
                     if fp8_activation_quant:
                         block_lhs_for_matmul, lhs_scale = _online_quantize(
@@ -949,12 +963,21 @@ def _can_dma_rows(size, dtype):
 
 @jax.named_scope("dma_gather_gm_start")
 def dma_gather_gm_start(
-    src_ref, dst_ref, indices_ref, sem_ref, gm_id, metadata_ref, divisor: int = 1
+    src_ref,
+    dst_ref,
+    indices_ref,
+    sem_ref,
+    gm_id,
+    metadata_ref,
+    divisor: int = 1,
+    unroll: int = 1,
 ):
     """Start gathering rows for a specific gm tile via DMA.
 
     src_ref and dst_ref must be 3D: (rows, k // num_lanes, num_lanes).
     No reshape — reshape on refs breaks dynamic pl.ds offsets.
+
+    `unroll`: rows issued per loop iteration (the remainder runs one by one).
 
     `divisor`: optional integer divisor applied to indices_ref values before
     use. Set > 1 when indices_ref contains packed values (e.g.,
@@ -978,7 +1001,20 @@ def dma_gather_gm_start(
         ).start()
         return _
 
-    lax.fori_loop(0, m_end - m_start, _gather_body, 0)
+    num_rows = m_end - m_start
+    if unroll == 1:
+        lax.fori_loop(0, num_rows, _gather_body, 0)
+        return
+
+    # `unroll` rows per iteration (fewer loop branches per row), then the tail.
+    def _block(b, _):
+        for u in range(unroll):
+            _gather_body(b * unroll + u, None)
+        return _
+
+    num_blocks = num_rows // unroll
+    lax.fori_loop(0, num_blocks, _block, 0)
+    lax.fori_loop(num_blocks * unroll, num_rows, _gather_body, 0)
 
 
 @jax.named_scope("dma_gather_gm_wait")

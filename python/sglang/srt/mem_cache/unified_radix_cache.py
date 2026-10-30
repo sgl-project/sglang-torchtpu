@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import logging
+import os
 import threading
 import time
 from dataclasses import replace
@@ -133,6 +134,7 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 
 
 logger = logging.getLogger(__name__)
+_EVICT_LOG = os.environ.get("SGLANG_TPU_EVICT_LOG") == "1"
 
 
 class _OngoingWriteThrough(NamedTuple):
@@ -728,6 +730,21 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Report full-layer tokens only
         self.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
+        if _EVICT_LOG:
+            logger.info(
+                "EVICT req full=%d swa=%d evicted full=%d swa=%d | evictable full=%d "
+                "swa=%d protected full=%d swa=%d | avail full=%d swa=%d",
+                params.num_tokens,
+                params.swa_num_tokens,
+                tracker[BASE_COMPONENT_TYPE],
+                tracker.get(ComponentType.SWA, 0),
+                self.full_evictable_size(),
+                self.swa_evictable_size(),
+                self.full_protected_size(),
+                self.swa_protected_size(),
+                self._component_available_size(ComponentType.FULL),
+                self._component_available_size(ComponentType.SWA),
+            )
         return EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
             swa_num_tokens_evicted=tracker.get(ComponentType.SWA, 0),
@@ -3257,10 +3274,15 @@ class UnifiedRadixCache(BasePrefixCache):
             dtype=torch.int64,
             device="cpu",
         )
-        if self.host_memory_mode == "buffer_only" and self.pp_size > 1:
-            self._all_reduce_attn_groups(ready_counts, torch.distributed.ReduceOp.MIN)
-        else:
-            self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
+        from sglang_tpu.diag_timing import timed as _dt
+
+        with _dt("2b_hicache_allreduce"):
+            if self.host_memory_mode == "buffer_only" and self.pp_size > 1:
+                self._all_reduce_attn_groups(
+                    ready_counts, torch.distributed.ReduceOp.MIN
+                )
+            else:
+                self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 
         count_values = list(map(int, ready_counts.tolist()))
         assert digest == count_values[-2] and digest == -count_values[-1], (

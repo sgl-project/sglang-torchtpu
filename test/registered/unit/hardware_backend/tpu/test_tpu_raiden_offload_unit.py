@@ -109,17 +109,20 @@ class _FakeTransfer:
         self.backups = []
         self.loads = []
 
-    def backup(self, device_pages, host_pages):
+    def backup(self, device_pages, host_pages, num_pages=None):
         self.backups.append((list(device_pages), list(host_pages)))
+        self.backup_num_pages = num_pages
         return RaidenFutureEvent(None)  # immediately "ready"
 
-    def load(self, host_pages, device_pages):
+    def load(self, host_pages, device_pages, num_pages=None):
         self.loads.append((list(host_pages), list(device_pages)))
+        self.load_num_pages = num_pages
         return RaidenFutureEvent(None)
 
 
-def _make_host_pool(page_size=4, page_num=3):
+def _make_host_pool(page_size=4, page_num=3, coalesce_pages=False):
     pool = object.__new__(TpuDMAHostKVPool)
+    pool.coalesce_pages = coalesce_pages
     pool.page_size = page_size
     pool.page_num = page_num
     pool.size = page_size * page_num
@@ -1112,6 +1115,24 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         dev_pages, host_pages = pool.transfer.backups[0]
         self.assertEqual(dev_pages, [2, 5])  # 8//4, 20//4
         self.assertEqual(host_pages, [0, 1])
+
+    def test_coalesced_backup_and_load_move_page_runs_as_segments(self):
+        # A run must advance by one page on both sides; a break on either side
+        # starts a new segment, or the DMA would read or write the wrong pages.
+        pool = _make_host_pool(page_size=4, page_num=8, coalesce_pages=True)
+        device_pages = [2, 3, 4, 9, 10, 11]
+        host_pages = [0, 1, 5, 6, 7, 8]
+        tokens = lambda pages: torch.tensor(
+            [p * 4 + i for p in pages for i in range(4)], dtype=torch.int64
+        )
+        pool.backup_from_device_all_layer(
+            None, tokens(host_pages), tokens(device_pages), "raiden"
+        )
+        self.assertEqual(pool.transfer.backups[0], ([2, 4, 9], [0, 5, 6]))
+        self.assertEqual(pool.transfer.backup_num_pages, [2, 1, 3])
+        pool.load_all_layer(None, tokens(host_pages), tokens(device_pages))
+        self.assertEqual(pool.transfer.loads[0], ([0, 5, 6], [2, 4, 9]))
+        self.assertEqual(pool.transfer.load_num_pages, [2, 1, 3])
 
     def test_load_all_layer_converts_page_ids(self):
         pool = _make_host_pool(page_size=4, page_num=8)

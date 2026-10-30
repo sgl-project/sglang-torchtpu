@@ -17,6 +17,13 @@ import sglang_tpu.dflash_utils_tpu as dflash_utils_tpu
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang_tpu.dflash_adaptive_verify import (
+    VerifyWidthRule,
+    adaptive_verify_shapes,
+    full_verify_buckets,
+    parse_adaptive_verify,
+    select_verify_width,
+)
 from sglang_tpu.dflash_utils_tpu import (
     DeviceVerifyBlockSelector,
     argmax_draft_tokens_tpu,
@@ -503,6 +510,44 @@ def test_fused_draft_block_matches_the_step_by_step_prep():
             ),
         )
         assert torch.equal(embeds, embed(block_ids=expected_ids))
+
+
+def test_adaptive_verify_parse_orders_rules_and_drops_full_width():
+    rules = parse_adaptive_verify("5:3:2.54, 3:4:3.06, 2:8:4.05", block_size=8)
+    assert rules == (
+        VerifyWidthRule(min_bs=3, width=4, simulate_accept_length=3.06),
+        VerifyWidthRule(min_bs=5, width=3, simulate_accept_length=2.54),
+    )
+    assert parse_adaptive_verify("", block_size=8) == ()
+
+
+@pytest.mark.parametrize("spec", ["3", "0:4", "3:1", "3:4:5.0", "3:4,3:2"])
+def test_adaptive_verify_parse_rejects_malformed(spec):
+    with pytest.raises(ValueError):
+        parse_adaptive_verify(spec, block_size=8)
+
+
+def test_adaptive_verify_select_uses_last_rule_reached():
+    rules = parse_adaptive_verify("3:4:3.06,6:3:2.54", block_size=8)
+    widths = [
+        None if (r := select_verify_width(rules, bs)) is None else r.width
+        for bs in range(1, 9)
+    ]
+    assert widths == [None, None, 4, 4, 4, 3, 3, 3]
+
+
+def test_adaptive_verify_shapes_map_logical_batches_to_buckets():
+    rules = parse_adaptive_verify("3:4:3.06", block_size=8)
+    # bs 3 and 4 run in bucket 4; bucket 2 serves only full-width batches.
+    assert adaptive_verify_shapes(rules, [1, 2, 4, 8]) == {4: [4, 8]}
+    assert adaptive_verify_shapes(rules, [1, 2, 3, 4]) == {4: [3, 4]}
+    assert adaptive_verify_shapes((), [1, 2, 4]) == {}
+    # Bucket 4 also serves bs 3 and 4, so only bucket 8 drops its full-width graph.
+    assert full_verify_buckets(rules, [1, 2, 4, 8]) == [1, 2]
+    assert full_verify_buckets(
+        parse_adaptive_verify("4:4:3.06", block_size=8), [1, 2, 4, 8]
+    ) == [1, 2, 4]
+    assert full_verify_buckets((), [1, 2, 4]) == [1, 2, 4]
 
 
 if __name__ == "__main__":

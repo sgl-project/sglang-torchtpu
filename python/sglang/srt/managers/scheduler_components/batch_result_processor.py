@@ -291,6 +291,19 @@ class SchedulerBatchResultProcessor:
 
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
+            # Mixed verify: per request a padded run (spec decode layout); a prefill
+            # request's token is its first slot, a decoding tail commits its whole run.
+            verify_runs = {}
+            if batch.mix_verify_tails:
+                width = result.speculative_num_draft_tokens
+                accept_lens = result.accept_lens.tolist()
+                first_tail = len(batch.reqs) - batch.mix_verify_tails
+                runs = [
+                    next_token_ids[i * width : i * width + accept_lens[i]]
+                    for i in range(len(batch.reqs))
+                ]
+                verify_runs = {i: runs[i] for i in range(first_tail, len(batch.reqs))}
+                next_token_ids = [run[0] for run in runs]
             self.move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
             self.materialize_sampling_mask_output(batch.reqs, logits_output)
 
@@ -354,6 +367,13 @@ class SchedulerBatchResultProcessor:
                         self.beam_coordinator.commit_prefill(
                             req, up_to_tick=batch.forward_iter
                         )
+                    elif i in verify_runs:
+                        run = verify_runs[i]
+                        req.output_ids.extend(run)
+                        self._maybe_update_reasoning_tokens(req, run)
+                        req.update_finish_state(len(run))
+                        req.spec_verify_ct += 1
+                        req.spec_num_correct_drafts += len(run) - 1
                     else:
                         # req output_ids are set here
                         req.output_ids.append(next_token_id)
@@ -361,15 +381,18 @@ class SchedulerBatchResultProcessor:
                         self._maybe_update_reasoning_tokens(req, next_token_id)
 
                         req.update_finish_state()
-                    # A mixed spec tail committed its pending bonus token; advance
-                    # so the next spec prepare_for_decode reserves from the right base.
+                    # A mixed spec tail committed its pending bonus token (a mixed
+                    # verify tail its accepted run); advance so the next spec
+                    # prepare_for_decode reserves from the right base.
                     if (
                         not req.finished()
                         and batch.decoding_reqs
                         and req in batch.decoding_reqs
                         and not batch.spec_algorithm.is_none()
                     ):
-                        req.kv.kv_committed_len += 1
+                        req.kv.kv_committed_len += (
+                            len(verify_runs[i]) if i in verify_runs else 1
+                        )
                     if req.finished():
                         if sampling_mask_finish_reason is None:
                             self._maybe_collect_routed_experts(req)

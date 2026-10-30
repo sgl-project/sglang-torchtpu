@@ -85,6 +85,20 @@ class ServingConfigs:
     skip_kv_write: bool = False
     return_lse: bool = False
     cp_group_size: int | None = None
+    # Prefill tiles whose every key precedes every query (and lies inside the
+    # sliding window) run without the mask, and a power-of-two sm_scale is folded
+    # into q; both are exact.
+    skip_full_tile_mask: bool = False
+    # Softmax variants (env-gated in the wrapper): exp2 with log2e folded into the
+    # q scale; row sums from ones rows appended to V (l rides in the accumulator).
+    exp2_softmax: bool = False
+    ones_v: bool = False
+    # Softmax without the running row max (env-gated in the wrapper): scores must be
+    # bounded so exp cannot overflow, e.g. QK-normed models.
+    no_max: bool = False
+    # Prefill tiles with transposed scores and fp8 q (see transposed.py);
+    # env-gated in the wrapper, applied where `use_transposed` holds.
+    transposed: bool = False
 
     @property
     def pages_per_seq(self) -> int:
@@ -365,16 +379,85 @@ class RpaConfigs:
 
     @property
     def acc_scratch_shape(self):
+        # With ones_v the accumulator is a full vreg wide: the head in the low
+        # lanes, the row sum l in the lanes above it.
+        width = self.acc_width if self.serve.ones_v else self.aligned_kv_head_dim
         return (
             self.model.num_kv_heads,
             self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
+            width,
+        )
+
+    @property
+    def acc_width(self) -> int:
+        return pltpu.get_tpu_info().num_lanes
+
+    @property
+    def use_transposed(self) -> bool:
+        # One sequence per tile, compute blocks of whole lane vregs, the head
+        # inside half a vreg so O^T pads to one lane tile at the store.
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        return (
+            self.serve.transposed
+            and self.mode != RpaCase.DECODE
+            and self.batch_size == 1
+            and self.bq_sz > 1
+            and self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE
+            and (self.bq_c_sz * self.aligned_num_q_heads_per_kv_head) % num_lanes == 0
+            and self.aligned_kv_head_dim * 2 <= num_lanes
+        )
+
+    @property
+    def mt_scratch_shape(self):
+        return (
+            self.model.num_kv_heads,
+            1,
+            self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
+        )
+
+    @property
+    def acct_scratch_shape(self):
+        # O^T rows, then one bf16 sublane tile of row sums (ones rows in V^T).
+        num_sublanes = pltpu.get_tpu_info().num_sublanes
+        return (
+            self.model.num_kv_heads,
+            self.aligned_kv_head_dim + 2 * num_sublanes,
+            self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
+        )
+
+    @property
+    def qt_scratch_shape(self):
+        return (
+            self.model.num_kv_heads,
             self.aligned_kv_head_dim,
+            self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
         )
 
     @property
     def max_schedule_size_multiplier(self) -> int:
         # By default, setting an upper bound of ~5x the SMEM capacity on schedule.
-        return self.serve.max_schedule_size_multiplier
+        # Grown to the static step bound: a long prefill padded to many rows (whose
+        # page table shrinks max_steps_ub) needs more steps than 16 SMEM chunks, and
+        # the schedule kernel flushes chunks past the HBM buffer end without a check.
+        return max(
+            self.serve.max_schedule_size_multiplier,
+            -(-(self.static_max_steps + 1) // self.max_steps_ub),
+        )
+
+    @property
+    def static_max_steps(self) -> int:
+        """Upper bound on schedule steps for any input of these static shapes."""
+        num_k = -(
+            -(self.serve.pages_per_seq * self.serve.page_size) // self.block.bkv_sz
+        )
+        if self.mode == RpaCase.DECODE:
+            steps = self.serve.num_seqs * num_k
+        else:
+            num_q = (
+                -(-self.serve.total_q_tokens // self.block.bq_sz) + self.serve.num_seqs
+            )
+            steps = num_q * num_k
+        return -(-steps // self.block.batch_size)
 
     def validate_inputs(
         self,

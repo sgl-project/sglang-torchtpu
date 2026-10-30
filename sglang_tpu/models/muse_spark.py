@@ -667,6 +667,13 @@ class MuseSparkForConditionalGeneration(nn.Module):
         from sglang_tpu.muse_megakernel.ops import MuseMegakernel
 
         self._megakernel = MuseMegakernel.from_model(self)
+        if tpu_envs.SGLANG_TPU_MUSE_SHARED_DENSE.get():
+            dropped = self._megakernel.share_dense_weights(self.model)
+            logger.info(
+                "Muse dense linears share the megakernel's copies: %.2f GiB of weights "
+                "freed per device",
+                dropped / 2**30,
+            )
         # The megakernel path also takes the fp8 weight-only LM head.
         self.lm_head.quant_method = TpuFp8LmHeadMethod(self.lm_head)
 
