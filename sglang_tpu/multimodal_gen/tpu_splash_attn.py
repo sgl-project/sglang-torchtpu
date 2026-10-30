@@ -226,8 +226,7 @@ def _flash_attention(q, k, v, scale, kv_len=None):
     masked = kv_len is not None
     if masked and (q.shape[0] != 1 or q_seq != kv_seq):
         raise ValueError(
-            "kv_len masking needs batch-1 self-attention, got "
-            f"q={q.shape} k={k.shape}"
+            f"kv_len masking needs batch-1 self-attention, got q={q.shape} k={k.shape}"
         )
     # One VMEM figure feeds both the block-size model and Mosaic's limit.
     vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
@@ -487,7 +486,11 @@ def _register_ops() -> None:
                 return _splash_mha(q, k, v, scale, is_causal)
 
             def flash_kv_len(
-                q: jax.Array, k: jax.Array, v: jax.Array, kv_len: jax.Array, scale: float
+                q: jax.Array,
+                k: jax.Array,
+                v: jax.Array,
+                kv_len: jax.Array,
+                scale: float,
             ) -> jax.Array:
                 return _flash_attention(q, k, v, scale, kv_len=kv_len)
 
@@ -725,7 +728,9 @@ class TpuSplashAttentionImpl(SDPAImpl):
             and query.shape[0] >= 512
         ):
             q, k, v = (t.transpose(0, 1).unsqueeze(0) for t in (query, key, value))
-            if _sdpa_fallback_reason(q, k, v, False) is None:
+            # The flash kernel covers 512 keys too, which SDPA's "short"
+            # cutoff would send back to the per-segment path.
+            if _sdpa_fallback_reason(q, k, v, False) in (None, "short"):
                 output = _FLASH_KV_LEN_OP(
                     q.contiguous(),
                     k.contiguous(),

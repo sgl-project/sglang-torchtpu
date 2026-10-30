@@ -5,17 +5,22 @@ Runtime patch, tracked debt:
 - Why: torch_tpu compiles static shapes, and a 50-block H3 stack takes
   minutes per new shape. H3 packs ``[text | cond | audio | video]`` into one
   attention segment padded to 64 rows, so every prompt length is a new
-  shape. Separately, the breakable-CUDA-graph break point around H3's
-  attention splits every compiled block into two graphs; BCG is CUDA-only.
-- How: :func:`install` (1) wraps the packed-sequence builders so the padded
-  length is a multiple of 512 (padding rows are tagged padding, carry zero
-  RoPE positions and stay in ``cu_seqlens``' trailing segment) and (2) rebinds
+  shape. The token refiner's blocks also match the regional-compile
+  condition and run at the prompt length. Separately, the breakable-CUDA-graph
+  break point around H3's attention splits every compiled block into two
+  graphs; BCG is CUDA-only.
+- How: :func:`install` (1) wraps the packed-sequence builders (and the
+  ComfyUI step's references to them) so the padded length is a multiple of
+  512 (padding rows are tagged padding, carry zero RoPE positions and stay in
+  ``cu_seqlens``' trailing segment), (2) compiles only the 50 DiT blocks: the
+  refiner runs once per request, eager, and (3) rebinds
   ``_minimax_h3_attention_core_bcg`` to the undecorated core. The attention
   backend reads the live length on device (``trailing_padding_on_device``),
   so the blocks take no host bounds and compile once per padded length.
 - Upstream PR or issue: none.
-- Remove when: the H3 packed builder takes a platform-provided alignment and
-  its attention break point is skipped where BCG cannot run.
+- Remove when: the H3 packed builder takes a platform-provided alignment, the
+  refiner pads to a bucket, and the attention break point is skipped where
+  BCG cannot run.
 """
 
 from __future__ import annotations
@@ -61,10 +66,19 @@ def _padded(builder):
     return build
 
 
+def _is_dit_block(name: str, module: object) -> bool:
+    from sglang.multimodal_gen.configs.models.fsdp import is_block
+
+    return is_block(name, module) and not name.startswith("token_refiner.")
+
+
 def install() -> None:
     from sglang.multimodal_gen.runtime.models.dits import minimax_h3 as dit
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
         packed_sequence,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages import (
+        comfyui_step,
     )
 
     for name in (
@@ -73,5 +87,12 @@ def install() -> None:
     ):
         builder = getattr(packed_sequence, name)
         if not getattr(builder, "__wrapped_for_tpu__", False):
-            setattr(packed_sequence, name, _padded(builder))
+            builder = _padded(builder)
+            setattr(packed_sequence, name, builder)
+        setattr(comfyui_step, name, builder)
+    if not getattr(comfyui_step.comfyui_layout_to_packed, "__wrapped_for_tpu__", False):
+        comfyui_step.comfyui_layout_to_packed = _padded(
+            comfyui_step.comfyui_layout_to_packed
+        )
+    dit.MiniMaxH3DiTModel._compile_conditions = [_is_dit_block]
     dit._minimax_h3_attention_core_bcg = dit._minimax_h3_attention_core_impl

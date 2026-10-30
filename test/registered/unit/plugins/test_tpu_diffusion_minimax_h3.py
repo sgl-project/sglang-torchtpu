@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU tests for sglang_tpu's MiniMax H3 patches (sglang_tpu.multimodal_gen.minimax_h3)."""
 
+import contextlib
 import os
 import sys
 import unittest
@@ -19,6 +20,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.models.dits import minimax_h3 as dit
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
     packed_sequence,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages import (
+    comfyui_step,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
@@ -39,18 +43,31 @@ if _REPO_ROOT not in sys.path:
 
 from sglang_tpu.multimodal_gen import minimax_h3  # noqa: E402
 
+_BUILDERS = ("minimax_h3_packed_sequence", "minimax_h3_packed_sequence_ref2va_blocks")
 
+
+@contextlib.contextmanager
 def _installed():
     """Run install() with every patched name restored afterwards."""
-    return patch.multiple(
-        packed_sequence,
-        minimax_h3_packed_sequence=packed_sequence.minimax_h3_packed_sequence,
-        minimax_h3_packed_sequence_ref2va_blocks=(
-            packed_sequence.minimax_h3_packed_sequence_ref2va_blocks
-        ),
-    ), patch.object(
-        dit, "_minimax_h3_attention_core_bcg", dit._minimax_h3_attention_core_bcg
-    )
+    with contextlib.ExitStack() as stack:
+        for module, names in (
+            (packed_sequence, _BUILDERS),
+            (comfyui_step, _BUILDERS + ("comfyui_layout_to_packed",)),
+            (dit, ("_minimax_h3_attention_core_bcg",)),
+        ):
+            stack.enter_context(
+                patch.multiple(module, **{n: getattr(module, n) for n in names})
+            )
+        stack.enter_context(
+            patch.object(
+                dit.MiniMaxH3DiTModel,
+                "_compile_conditions",
+                dit.MiniMaxH3DiTModel._compile_conditions,
+            )
+        )
+        minimax_h3.install()
+        minimax_h3.install()  # idempotent
+        yield
 
 
 def _packed(text_len):
@@ -85,11 +102,12 @@ class _DeviceLiveLengthAttention:
 class TestMiniMaxH3PackedSequence(CustomTestCase):
     def test_pads_to_512_and_keeps_layout(self):
         reference = {text_len: _packed(text_len) for text_len in (60, 130, 250)}
-        a, b = _installed()
-        with a, b:
-            minimax_h3.install()
-            minimax_h3.install()  # idempotent
+        with _installed():
             layouts = {text_len: _packed(text_len) for text_len in reference}
+            self.assertIs(
+                comfyui_step.minimax_h3_packed_sequence,
+                packed_sequence.minimax_h3_packed_sequence,
+            )
         self.assertEqual({p["seq_len"] for p in layouts.values()}, {512})
         for text_len, packed in layouts.items():
             ref = reference[text_len]
@@ -110,9 +128,7 @@ class TestMiniMaxH3CompiledBlock(CustomTestCase):
     def test_block_compiles_once_across_live_lengths(self):
         if not model_parallel_is_initialized():
             ensure_distributed_env_defaults()
-            maybe_init_distributed_environment_and_model_parallel(
-                tp_size=1, sp_size=1
-            )
+            maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
         torch.manual_seed(0)
         hidden, seq_len = 256, 128
         arch = MiniMaxH3DiTArchConfig(
@@ -159,15 +175,20 @@ class TestMiniMaxH3CompiledBlock(CustomTestCase):
             graphs.append(graph_module)
             return graph_module.forward
 
-        a, b = _installed()
-        with a, b, torch.no_grad():
-            minimax_h3.install()
+        with _installed(), torch.no_grad():
             compiled = torch.compile(
                 block, backend=counting_backend, fullgraph=True, dynamic=False
             )
             for used in (100, 77, 128):
                 torch.testing.assert_close(run(compiled, used), run(block, used))
         self.assertEqual(len(graphs), 1)
+
+    def test_refiner_blocks_stay_eager(self):
+        with _installed():
+            (condition,) = dit.MiniMaxH3DiTModel._compile_conditions
+            block = torch.nn.Linear(1, 1)
+            self.assertTrue(condition("blocks.7", block))
+            self.assertFalse(condition("token_refiner.blocks.0", block))
 
 
 if __name__ == "__main__":
