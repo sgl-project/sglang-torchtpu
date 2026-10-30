@@ -1,6 +1,7 @@
 """The mini load balancer must return an upstream rejection with its own
 status instead of wrapping it in a 200 event stream, and must close its
-upstream session however a request ends."""
+upstream session however a request ends. A streaming prefill that fails in
+its 200 body is returned as is, without waiting for decode (#1706)."""
 
 import asyncio
 import contextlib
@@ -63,10 +64,13 @@ def _lb(prefill_url, decode_url):
     return MiniLoadBalancer(args)
 
 
-async def _run(prefill_handler, decode_handler, max_chunks=None):
-    """Issue one streaming request through MiniLB and read up to
-    `max_chunks` of its body; returns the response, the chunks read and the
-    upstream sessions MiniLB opened."""
+async def _run(
+    prefill_handler, decode_handler, max_chunks=None, request=None, before_cleanup=None
+):
+    """Issue one streaming request (default `{"text": "hello", "stream": True}`)
+    through MiniLB and read up to `max_chunks` of its body; returns the
+    response, the chunks read and the upstream sessions MiniLB opened.
+    `before_cleanup` is awaited before the test servers shut down."""
     sessions = []
     real_session = aiohttp.ClientSession
 
@@ -80,7 +84,7 @@ async def _run(prefill_handler, decode_handler, max_chunks=None):
     try:
         lb = _lb(prefill_url, decode_url)
         response = await lb.generate_stream(
-            {"text": "hello", "stream": True}, prefill_url, decode_url
+            request or {"text": "hello", "stream": True}, prefill_url, decode_url
         )
         chunks = []
         if hasattr(response, "body_iterator"):
@@ -89,6 +93,8 @@ async def _run(prefill_handler, decode_handler, max_chunks=None):
                 if max_chunks is not None and len(chunks) >= max_chunks:
                     await response.body_iterator.aclose()
                     break
+        if before_cleanup is not None:
+            await before_cleanup()
         return response, chunks, sessions
     finally:
         aiohttp.ClientSession = real_session
@@ -511,3 +517,377 @@ def test_generate_returns_decode_rejection_after_fast_prefill():
     response = asyncio.run(run())
     assert response.status_code == 503
     assert response.body == b"decode overloaded"
+
+
+# --- #1706: a streaming prefill reports its failure in a 200 body ---
+
+DECODE_KV_WAIT_SECONDS = 3.0
+PREFILL_FAILURE_BOUND_SECONDS = 1.5
+
+
+def _sse(*events):
+    """Encode events as an SSE body ending in `[DONE]`, like the engine."""
+    return b"".join(b"data: " + json.dumps(e).encode() + b"\n\n" for e in events) + (
+        b"data: [DONE]\n\n"
+    )
+
+
+PREFILL_ERROR_BODY = _sse(
+    {
+        "error": {
+            "message": "The input is longer than the context length",
+            "type": "invalid_request_error",
+            "code": 400,
+            "retryable": False,
+        }
+    }
+)
+PREFILL_ABORT_BODY = _sse(
+    {
+        "text": "",
+        "meta_info": {
+            "id": "r1",
+            "finish_reason": {
+                "type": "abort",
+                "message": "Request r1 exceeds the maximum number of tokens: 9 > 8",
+                "status_code": 400,
+            },
+        },
+    }
+)
+PREFILL_FINISHED_BODY = _sse(
+    {
+        "text": "",
+        "meta_info": {
+            "id": "r1",
+            "finish_reason": {"type": "length", "length": 1},
+            "input_token_logprobs": [[-0.5, 1, None], [-0.25, 2, None]],
+        },
+    }
+)
+DECODE_BODY = _sse(
+    *(
+        {
+            "text": "x" * (i + 1),
+            "meta_info": {"id": "r1", "input_token_logprobs": []},
+        }
+        for i in range(3)
+    )
+)
+
+
+def _prefill_answers(body):
+    """A streaming prefill that answers 200 with `body`."""
+
+    async def handler(request):
+        resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await resp.prepare(request)
+        await resp.write(body)
+        await resp.write_eof()
+        return resp
+
+    return handler
+
+
+def _decode_waiting_for_kv(disconnected: asyncio.Event, wait_seconds):
+    """A decode that answers its headers at once, then streams DECODE_BODY
+    after `wait_seconds` (waiting for prefill's KV); sets `disconnected` if
+    MiniLB closes the connection first."""
+
+    async def handler(request):
+        resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await resp.prepare(request)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait_seconds
+        try:
+            while loop.time() < deadline:
+                if request.transport is None or request.transport.is_closing():
+                    disconnected.set()
+                    return resp
+                await asyncio.sleep(0.02)
+            await resp.write(DECODE_BODY)
+            await resp.write_eof()
+        except asyncio.CancelledError:
+            disconnected.set()
+            raise
+        except ConnectionError:
+            disconnected.set()
+        return resp
+
+    return handler
+
+
+async def _run_with_prefill_body(prefill_body, decode_wait_seconds, request=None):
+    """Stream one request whose prefill answers 200 with `prefill_body`; return
+    (response, body, elapsed_s including the body, decode_disconnected,
+    sessions). Disconnection is sampled before the test servers shut down,
+    since their shutdown would disconnect decode anyway."""
+    disconnected = asyncio.Event()
+    observed = {}
+
+    async def before_cleanup():
+        observed["elapsed"] = time.monotonic() - start
+        try:
+            await asyncio.wait_for(disconnected.wait(), 1.0)
+        except asyncio.TimeoutError:
+            pass
+        observed["disconnected"] = disconnected.is_set()
+
+    start = time.monotonic()
+    response, chunks, sessions = await _run(
+        _prefill_answers(prefill_body),
+        _decode_waiting_for_kv(disconnected, decode_wait_seconds),
+        request=request,
+        before_cleanup=before_cleanup,
+    )
+    # A failed prefill is answered with a plain (non-streaming) Response.
+    body = b"".join(chunks) if hasattr(response, "body_iterator") else response.body
+    return response, body, observed["elapsed"], observed["disconnected"], sessions
+
+
+def _assert_prefill_failure_returned(prefill_body, request=None):
+    response, body, elapsed, decode_disconnected, sessions = asyncio.run(
+        _run_with_prefill_body(prefill_body, DECODE_KV_WAIT_SECONDS, request)
+    )
+    assert response.status_code == 200
+    assert response.media_type == "text/event-stream"
+    assert body == prefill_body
+    assert elapsed < PREFILL_FAILURE_BOUND_SECONDS, "MiniLB waited for decode"
+    assert decode_disconnected, "MiniLB must close its connection to the decode"
+    _assert_sessions_closed(sessions)
+
+
+@pytest.mark.unit
+def test_prefill_inband_error_does_not_wait_for_decode():
+    _assert_prefill_failure_returned(PREFILL_ERROR_BODY)
+
+
+@pytest.mark.unit
+def test_aborted_prefill_does_not_wait_for_decode():
+    _assert_prefill_failure_returned(PREFILL_ABORT_BODY)
+
+
+@pytest.mark.unit
+def test_failed_prefill_with_return_logprob_returns_prefill_stream():
+    _assert_prefill_failure_returned(
+        PREFILL_ERROR_BODY,
+        request={"text": "hello", "stream": True, "return_logprob": True},
+    )
+
+
+@pytest.mark.unit
+def test_finished_prefill_still_relays_decode():
+    response, body, _, decode_disconnected, sessions = asyncio.run(
+        _run_with_prefill_body(PREFILL_FINISHED_BODY, 0.3)
+    )
+    assert response.status_code == 200
+    assert body == DECODE_BODY
+    assert not decode_disconnected
+    _assert_sessions_closed(sessions)
+
+
+@pytest.mark.unit
+def test_finished_prefill_with_return_logprob_merges_input_logprobs():
+    response, body, _, _, sessions = asyncio.run(
+        _run_with_prefill_body(
+            PREFILL_FINISHED_BODY,
+            0.3,
+            request={"text": "hello", "stream": True, "return_logprob": True},
+        )
+    )
+    assert response.status_code == 200
+    # Parse per line: the merge path may re-emit blank separator lines.
+    events = [
+        line[len(b"data:") :].strip()
+        for line in body.split(b"\n")
+        if line.startswith(b"data:")
+    ]
+    assert events[-1] == b"[DONE]"
+    decoded = [json.loads(e) for e in events[:-1]]
+    assert [e["text"] for e in decoded] == ["x", "xx", "xxx"]
+    for event in decoded:
+        assert event["meta_info"]["input_token_logprobs"] == [
+            [-0.5, 1, None],
+            [-0.25, 2, None],
+        ]
+    _assert_sessions_closed(sessions)
+
+
+def _abort(rid, status_code=None):
+    finish_reason = {"type": "abort", "message": "aborted"}
+    if status_code is not None:
+        finish_reason["status_code"] = status_code
+    return {"text": "", "meta_info": {"id": rid, "finish_reason": finish_reason}}
+
+
+def _finish(rid, finish_reason):
+    return {"text": "", "meta_info": {"id": rid, "finish_reason": finish_reason}}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "body, expected",
+    [
+        (PREFILL_ERROR_BODY, "error_event"),
+        (_sse({"error": {"message": "no code"}}), "error_event"),
+        (PREFILL_ABORT_BODY, "aborted"),
+        (_sse(_abort("r1", 400), _abort("r2", 500)), "aborted"),
+        (_sse(_abort("r1")), "aborted"),
+        # A request reports a null finish reason before its final one.
+        (_sse(_finish("r1", None), _abort("r1", 400)), "aborted"),
+        # Partially aborted batch: keep relaying decode for the survivor.
+        (_sse(_abort("r1", 400), _finish("r2", {"type": "length"})), None),
+        (PREFILL_FINISHED_BODY, None),
+        (_sse(_finish("r1", None)), None),
+        (b"data: [DONE]\n\n", None),
+        (b"", None),
+        (b"data: not json\n\n", None),
+    ],
+)
+def test_prefill_stream_failure_classifier(body, expected):
+    from sglang_router.mini_lb import _prefill_stream_failure
+
+    assert _prefill_stream_failure(body) == expected
+
+
+# --- #658 + #1706: a streaming decode also reports its failure in a 200 body ---
+
+DECODE_ERROR_BODY = _sse(
+    {
+        "error": {
+            "message": "The input is longer than the context length",
+            "type": "invalid_request_error",
+            "code": 400,
+            "retryable": False,
+        }
+    }
+)
+DECODE_ABORT_BODY = _sse(_abort("r1", 400))
+
+
+def _decode_answers(body):
+    """A streaming decode that answers 200 with `body` at once, like a real
+    engine rejecting a streaming request (error event, then `[DONE]`)."""
+    return _prefill_answers(body)
+
+
+def _prefill_waiting_for_decode(disconnected: asyncio.Event):
+    """A streaming prefill that answers its headers at once, then sends nothing
+    for SLOW_SECONDS (waiting for decode to ask for its KV); sets
+    `disconnected` if MiniLB closes the connection first."""
+
+    async def handler(request):
+        resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await resp.prepare(request)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + SLOW_SECONDS
+        try:
+            while loop.time() < deadline:
+                if request.transport is None or request.transport.is_closing():
+                    disconnected.set()
+                    return resp
+                await asyncio.sleep(0.02)
+            await resp.write(PREFILL_FINISHED_BODY)
+            await resp.write_eof()
+        except asyncio.CancelledError:
+            disconnected.set()
+            raise
+        except ConnectionError:
+            disconnected.set()
+        return resp
+
+    return handler
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("decode_body", [DECODE_ERROR_BODY, DECODE_ABORT_BODY])
+def test_streaming_decode_inband_failure_does_not_wait_for_prefill(decode_body):
+    """A streaming decode that rejects the request answers 200 with the failure
+    in its body and never asks prefill for KV, so prefill never finishes (it
+    waits for decode until its bootstrap timeout). Reading prefill's body before
+    relaying decode would hang the client for that long; decode's stream must be
+    relayed at once and prefill's connection closed so it aborts the request."""
+
+    async def run():
+        disconnected = asyncio.Event()
+        observed = {}
+
+        async def before_cleanup():
+            observed["elapsed"] = time.monotonic() - start
+            try:
+                await asyncio.wait_for(disconnected.wait(), 1.0)
+            except asyncio.TimeoutError:
+                pass
+            observed["disconnected"] = disconnected.is_set()
+
+        start = time.monotonic()
+        response, chunks, sessions = await _run(
+            _prefill_waiting_for_decode(disconnected),
+            _decode_answers(decode_body),
+            before_cleanup=before_cleanup,
+        )
+        return response, chunks, sessions, observed
+
+    response, chunks, sessions, observed = asyncio.run(run())
+    assert response.status_code == 200
+    assert b"".join(chunks) == decode_body
+    assert observed["elapsed"] < EARLY_RETURN_BOUND_SECONDS, "MiniLB waited for prefill"
+    assert observed["disconnected"], "MiniLB must close its connection to the prefill"
+    _assert_sessions_closed(sessions)
+
+
+@pytest.mark.unit
+def test_decode_token_before_prefill_body_still_relays_decode():
+    """Decode may emit its first token before prefill's 200 body has arrived.
+    MiniLB must then still wait for prefill's body and relay decode in full,
+    including the event it already read."""
+
+    async def late_prefill(request):
+        resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await resp.prepare(request)
+        await asyncio.sleep(0.3)
+        await resp.write(PREFILL_FINISHED_BODY)
+        await resp.write_eof()
+        return resp
+
+    response, chunks, sessions = asyncio.run(
+        _run(late_prefill, _decode_answers(DECODE_BODY))
+    )
+    assert response.status_code == 200
+    assert b"".join(chunks) == DECODE_BODY
+    _assert_sessions_closed(sessions)
+
+
+@pytest.mark.unit
+def test_affinity_truncated_streaming_prefill_body_returns_502(monkeypatch):
+    """A streaming prefill body lost before the stream is committed is a
+    connection failure of that prefill, as for non-streaming bodies."""
+
+    async def truncated(request):
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(b'data: {"text":')
+        request.transport.close()
+        return response
+
+    async def waiting_decode(request):
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await asyncio.sleep(5)
+        return response
+
+    async def run():
+        async with _engine(truncated) as prefill, _engine(waiting_decode) as decode:
+            balancer = _affinity_lb(prefill, decode)
+            monkeypatch.setattr(mini_lb, "lb", balancer)
+            response = await asyncio.wait_for(
+                mini_lb._forward_to_backend(
+                    {"text": "hi", "stream": True}, "generate", None
+                ),
+                timeout=2,
+            )
+            assert response.status_code == 502
+            assert not balancer.affinity_policy.loads.is_reachable(prefill)
+            assert balancer.affinity_policy.loads.is_reachable(decode)
+
+    asyncio.run(run())
