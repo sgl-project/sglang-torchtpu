@@ -128,7 +128,8 @@ class K3ProgramAlgo(CustomSpecAlgo):
         from sglang_tpu.envs import envs as tpu_envs
 
         server_args.disable_overlap_schedule = not (
-            role == "decode" and tpu_envs.SGLANG_TPU_K3_PROGRAM_OPT_OVERLAP.get()
+            role in ("decode", None, "null")
+            and tpu_envs.SGLANG_TPU_K3_PROGRAM_OPT_OVERLAP.get()
         )
         colocated = role in (None, "null")
         if not (role == "prefill" or colocated) or getattr(
@@ -255,6 +256,9 @@ class DecodeSteps:
         self._departed: dict[str, None] = {}
         self._prompts = _Prompts()
         self.clock = StepClock("decode")
+        # Colocated: the prefill's first tokens by request, for a request whose
+        # prefill result the overlapped scheduler has not processed yet.
+        self.first_tokens: dict[str, int] = {}
 
     def step(self, reqs: Sequence[Any], starts: np.ndarray) -> tuple:
         """One step for ``reqs`` (sglang ``Req``s, batch order) with their
@@ -288,11 +292,11 @@ class DecodeSteps:
                     f"K3 decode: request {req.rid} came back after leaving the "
                     "batch (a retraction); the programs do not resume requests"
                 )
-            computed = int(req.kv.kv_committed_len)
             prompt = self._prompts.get(req)
-            num_tokens = len(prompt) + len(req.output_ids)
-            end = computed + scheduled
             if req.rid in self._live:
+                computed = int(req.kv.kv_committed_len)
+                num_tokens = len(prompt) + len(req.output_ids)
+                end = computed + scheduled
                 token_ids = prompt  # the program holds its next input
                 if lagging:
                     end += WIDTH
@@ -300,8 +304,20 @@ class DecodeSteps:
                     if allocated:
                         end = min(end, allocated)
             else:
-                outputs = np.asarray(req.output_ids, dtype=np.int32)
-                token_ids = np.concatenate((prompt, outputs))
+                # A request's first step: its whole prompt computed (prefilled
+                # or transferred), then the prefill's token.
+                outputs = list(req.output_ids)
+                first = self.first_tokens.pop(req.rid, None)
+                if not outputs:
+                    if first is None:
+                        raise RuntimeError(
+                            f"K3 decode: request {req.rid} has no first token"
+                        )
+                    outputs = [first]
+                computed = len(prompt)
+                num_tokens = computed + len(outputs)
+                end = computed + scheduled
+                token_ids = np.concatenate((prompt, np.asarray(outputs, np.int32)))
             requests.append(
                 sglang_step.request_input(
                     rid=req.rid,
@@ -381,6 +397,8 @@ class PrefillSteps:
         self._prompts = _Prompts()
         self.stats = collections.Counter()
         self.clock = StepClock("prefill", every=200)
+        # Colocated: shared with the decode steps (DecodeSteps.first_tokens).
+        self.first_tokens: dict[str, int] | None = None
 
     def _row(self, req, prompt, computed, end, starts, columns=()):
         """The program's row for ``req`` computing ``[computed, end)``; each
@@ -510,6 +528,8 @@ class PrefillSteps:
                     + ("finished its prompt without" if finishes else "got")
                     + " a first token"
                 )
+            if finishes and self.first_tokens is not None:
+                self.first_tokens[reqs[i].rid] = int(first[i])
         return np.maximum(first, 0)
 
     def forget_all(self) -> None:
@@ -659,15 +679,19 @@ class K3ProgramWorker(BaseSpecWorker):
             first = steps.step(batch.reqs, batch.prefix_lens, batch.extend_lens, starts)
             clock.mark("step")
             self._track_checkpoints(batch, state_pool)
+            relay = K3ProgramInput()
             if on_publish is not None:
                 on_publish(batch.seq_lens)
+                # Overlap scheduling relays each request's last token.
+                device = future_map.device if future_map is not None else "cpu"
+                relay.bonus_tokens = torch.from_numpy(first).to(device)
             clock.mark("track")
             clock.stop(sum(int(n) for n in batch.extend_lens))
             return GenerationBatchResult(
                 next_token_ids=torch.from_numpy(first),
                 accept_lens=torch.ones(len(batch.reqs), dtype=torch.int32),
                 new_seq_lens=batch.seq_lens,
-                next_draft_input=K3ProgramInput(),
+                next_draft_input=relay,
                 speculative_num_draft_tokens=WIDTH,
             )
         if on_publish is not None:

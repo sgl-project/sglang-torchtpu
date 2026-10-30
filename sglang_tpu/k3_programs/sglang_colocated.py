@@ -84,6 +84,9 @@ class ColocatedSteps:
     def __init__(self, prefill: Any, decode: Any) -> None:
         self.prefill, self.decode = prefill, decode
         self.plan = decode.plan
+        # A request's first decode step takes the prefill's token from here
+        # when the (overlapped) scheduler has not processed its prefill yet.
+        prefill.first_tokens = decode.first_tokens = {}
 
     def forget_all(self) -> None:
         self.prefill.forget_all()

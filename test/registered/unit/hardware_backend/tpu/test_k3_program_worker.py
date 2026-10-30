@@ -4,6 +4,7 @@ output processor reads, and the registered algorithm."""
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import torch
@@ -18,6 +19,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.k3_programs import sglang_bridge as bridge
+from sglang_tpu.k3_programs import sglang_colocated as worker_colocated
 from sglang_tpu.k3_programs import sglang_worker as worker
 from sglang_tpu.k3_programs.kimi_k3 import pools
 from sglang_tpu.k3_programs.program import StepOutput
@@ -160,6 +162,25 @@ class TestDecodeSteps(CustomTestCase):
         self.steps.step(reqs, _req_to_token(2, {1: [1]})[:, ::STEP])
         self.assertEqual({r.scheduled for r in self.program.inputs[0].requests}, {1})
 
+    def test_first_step_from_the_prefills_token(self):
+        # Colocated under overlap: the request reaches its first decode step
+        # before the scheduler processed its prefill (no output, the committed
+        # length still the prefix): the prefill's token and the whole prompt.
+        req = _req("a", prompt=STEP + 5, output=[], committed=STEP, pool_idx=1, slot=2)
+        r2t = _req_to_token(2, {1: [3, 6]})[:, ::STEP]
+        with self.assertRaisesRegex(RuntimeError, "no first token"):
+            self.steps.launch([req], r2t, lagging=True)
+        self.steps.first_tokens["a"] = 7
+        self.steps.launch([req], r2t, lagging=True)
+        (row,) = self.program.inputs[-1].requests
+        self.assertEqual((row.computed, row.num_tokens), (STEP + 5, STEP + 6))
+        self.assertEqual(row.token_ids[-1], 7)
+        self.assertEqual(self.steps.first_tokens, {})
+        colocated = worker_colocated.ColocatedSteps(
+            mock.Mock(spec=worker.PrefillSteps), self.steps
+        )
+        self.assertIs(colocated.prefill.first_tokens, self.steps.first_tokens)
+
     def test_lagging_tables_reach_a_step_further(self):
         # Under overlap scheduling a running request's committed length trails
         # its device position by a step: its tables cover one step more, up
@@ -289,12 +310,12 @@ class TestRegisteredAlgorithm(CustomTestCase):
         self.assertIsNone(spec.accept_lens_device)
         worker.register()  # idempotent
 
-    def test_overlap_on_the_decode_only(self):
+    def test_overlap_on_the_decoding_roles(self):
         with tpu_envs.SGLANG_TPU_K3_PROGRAM_OPT_OVERLAP.override(True):
             for role, overlapped in (
                 ("decode", True),
                 ("prefill", False),
-                ("null", False),
+                ("null", True),  # colocated
             ):
                 args = SimpleNamespace(
                     kv_cache_dtype="fp8_e4m3",
