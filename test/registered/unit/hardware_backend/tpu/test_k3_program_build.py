@@ -130,7 +130,7 @@ class TestServerConfig(CustomTestCase):
         with (
             _Patched(_server(draft=None)),
             tpu_envs.SGLANG_TPU_K3_PROGRAM_PRESHARDED.override("/presharded"),
-            self.assertRaisesRegex(ValueError, "--speculative-draft-model-path"),
+            self.assertRaisesRegex(ValueError, "SGLANG_TPU_K3_PROGRAM_DRAFT"),
         ):
             sglang_program.build_from_server()
 

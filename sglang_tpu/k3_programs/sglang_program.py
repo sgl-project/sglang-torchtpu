@@ -129,10 +129,13 @@ def build_from_server():
             "K3_PROGRAM needs SGLANG_TPU_K3_PROGRAM_PRESHARDED (python -m "
             "sglang_tpu.k3_programs.tools preshard k3 --output DIR)"
         )
-    draft_path = get_spec().speculative_draft_model_path
+    draft_path = (
+        tpu_envs.SGLANG_TPU_K3_PROGRAM_DRAFT.get()
+        or get_spec().speculative_draft_model_path
+    )
     if not draft_path:
         raise ValueError(
-            "K3_PROGRAM needs --speculative-draft-model-path (the MLA DSpark draft, "
+            "K3_PROGRAM needs SGLANG_TPU_K3_PROGRAM_DRAFT (the MLA DSpark draft, "
             "Inferact/Kimi-K3-DSpark): both roles hold its KV"
         )
     draft = _local_checkpoint(str(draft_path))

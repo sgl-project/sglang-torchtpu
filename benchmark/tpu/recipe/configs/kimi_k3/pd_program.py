@@ -63,7 +63,6 @@ server_args.update(
     {
         "host": "0.0.0.0",
         "speculative_algorithm": "K3_PROGRAM",
-        "speculative_draft_model_path": "Inferact/Kimi-K3-DSpark",
         "disaggregation_mode": ROLE,
         "disaggregation_transfer_backend": "raiden",
         "kv_cache_dtype": KV_DTYPE,
@@ -123,5 +122,7 @@ runtime_env.update(
         # accepted length, bonus token included, per draft width).
         "SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS": "7:3.78,3:2.87",
         "SGLANG_RAIDEN_RESHARD": "0",
+        # The MLA DSpark draft (both roles hold its KV).
+        "SGLANG_TPU_K3_PROGRAM_DRAFT": "Inferact/Kimi-K3-DSpark",
     }
 )

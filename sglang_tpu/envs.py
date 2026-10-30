@@ -135,6 +135,11 @@ class TpuEnvs:
     # (drafts 7 or 3 through batch 8, 3 through 16). Empty: 7 through four
     # requests, 3 through eight.
     SGLANG_TPU_K3_PROGRAM_SPEC_SCHEDULE = EnvStr("")
+    # The DSpark draft checkpoint the programs use (the MLA draft,
+    # Inferact/Kimi-K3-DSpark; directory or Hugging Face id). Given here rather
+    # than as --speculative-draft-model-path, which sglang opens with
+    # transformers (model type k3_dspark is not one of its architectures).
+    SGLANG_TPU_K3_PROGRAM_DRAFT = EnvStr(None)
 
     # Host padding is unconditional; this routes speculative batches to the
     # experimental spec worker, which keeps their metadata on the host as well.

@@ -81,7 +81,9 @@ def topological_node(hosts: list[str], host_index: int) -> int:
     ranks ``8 * node .. 8 * node + 7``. Pod indices need not follow it."""
     from sglang_tpu.node_normalization import query_node_rank
 
-    return query_node_rank(_topology(hosts), host_index, timeout=600)
+    # The coordinate query brings up the TPU runtime, which waits for every
+    # host of the slice: pods can start minutes apart.
+    return query_node_rank(_topology(hosts), host_index, timeout=3600)
 
 
 def physical_host_order(hosts: list[str], host_index: int) -> list[int]:
