@@ -23,6 +23,9 @@ from torch import nn
 
 from sglang.multimodal_gen.configs.models.vaes.base import VAEConfig
 from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
+from sglang.multimodal_gen.runtime.layers.parallel_conv import (
+    disable_spatial_parallel_decode,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -532,7 +535,9 @@ class AutoencoderKL(nn.Module, LayerwiseOffloadableModuleMixin):
                 ]
                 if self.config.use_post_quant_conv:
                     tile = self.post_quant_conv(tile)
-                decoded = self.decoder(tile)
+                # Tiles are not height shards: run any halo convs unsharded.
+                with disable_spatial_parallel_decode():
+                    decoded = self.decoder(tile)
                 row.append(decoded)
             rows.append(row)
         result_rows = []
