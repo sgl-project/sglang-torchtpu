@@ -129,6 +129,13 @@ class TpuEnvs:
     # experimental spec worker, which keeps their metadata on the host as well.
     SGLANG_TPU_HOST_PADDING_NO_D2H = EnvBool(True)
 
+    # Compile tracer
+    # Keep the Dynamo tracer where apply_server_args_defaults would resolve
+    # pallas_tpu_rpa_v3 at attention TP >= 4 to the direct tracer
+    # (sgl-project/sglang-torchtpu#1700). For compile-path work only: under the
+    # Dynamo tracer those configurations can return a wrong first token.
+    SGLANG_TPU_FORCE_DYNAMO_TRACER = EnvBool(False)
+
     # Speculative decoding
     # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker and MTP
     # and EAGLE3 to TpuChainSpecWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
