@@ -60,7 +60,6 @@ class TestQwen38MtpServesWithoutRecompile(TPULauncherTestCase):
             **super().get_runtime_envs(),
             "MODEL": MODEL_PATH,
             "SGLANG_IS_IN_CI": None,
-            "SGLANG_TPU_CHECK_RECOMPILATION_SITES": "1",
         }
 
     def test_draining_batch_compiles_nothing(self):
