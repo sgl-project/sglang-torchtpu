@@ -49,6 +49,12 @@ class MessageTag(bytes, enum.Enum):
     ABORT = b"ABORT"  # decode -> prefill: room, decode ip, decode port
 
 
+# KV layout tags. A peer of the other layout registers rows of another size,
+# so a decode refuses a prefill whose tag differs from its own.
+PER_LAYER_KV_LAYOUT = "per-layer"
+BLOCK_MAJOR_KV_LAYOUT = "block-major"
+
+
 def _require_port(port: int) -> None:
     if not 1 <= port <= 65535:
         raise ValueError(f"invalid decode_port: expected 1..65535, got {port}")
@@ -88,6 +94,7 @@ class Blocks(WireMessage):
     state_endpoint: str = ""
     # Optional opaque host state metadata (e.g., DSV4 ring shifts).
     state_meta: bytes = b""
+    kv_layout: str = PER_LAYER_KV_LAYOUT
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
@@ -104,6 +111,7 @@ class Chunk(WireMessage):
     total_pages: int
     blocks: list[int]
     endpoint: str
+    kv_layout: str = PER_LAYER_KV_LAYOUT
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")

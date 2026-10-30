@@ -256,6 +256,16 @@ def _apply_fp8_fused_rs(
     swiglu_limit: float | None = None,
     post_expert_norm_weight: torch.Tensor | None = None,
 ) -> StandardCombineInput:
+    routed_scaling_factor = layer.moe_runner_config.routed_scaling_factor
+    if routed_scaling_factor is not None and routed_scaling_factor != 1.0:
+        # The fused-RS reduction stack is not validated with an rsf != 1
+        # model; refuse rather than serving the routed channels at the
+        # wrong magnitude.
+        raise NotImplementedError(
+            "routed_scaling_factor is not yet applied on the TPU FP8 "
+            "fused-RS path; use the BF16 checkpoint or the standard FP8 "
+            "path first."
+        )
     if swiglu_limit is not None:
         if activation != "silu":
             raise ValueError("TPU clamped MoE requires silu activation")

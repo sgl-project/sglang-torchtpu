@@ -144,3 +144,9 @@ class TpuEmbeddingResult(EmbeddingResult):
         if isinstance(self.embedding, PaddedEmbedding):
             return self.storage_size()
         return super().cache_size()
+
+    def backing_buffers(self) -> tuple[torch.Tensor, ...]:
+        # Spans of one gathered encoder output share its buffer across entries.
+        if isinstance(self.embedding, PaddedEmbedding):
+            return tuple(span.buffer for span in self.embedding.spans)
+        return super().backing_buffers()
