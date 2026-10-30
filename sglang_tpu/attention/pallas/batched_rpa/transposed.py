@@ -88,8 +88,9 @@ def tile(
     cfgs: configs.RpaConfigs,
     q_rows: jax.Array | None = None,
 ):
-    """``q_rows``: the q block's real queries when it may be partial; compute
-    blocks wholly past them are skipped and keep m at -inf (acc stays finite)."""
+    """``q_rows``: the q block's real queries when it may be partial. Its compute blocks
+    then run in a loop over 128-token groups up to the last query; the groups past it
+    only set m to -inf, so the next q block starts clean (acc stays finite)."""
     heads = cfgs.aligned_num_q_heads_per_kv_head
     hd = cfgs.aligned_kv_head_dim
     bkv = cfgs.bkv_sz
@@ -104,6 +105,51 @@ def tile(
         q_iota = lax.broadcasted_iota(jnp.int32, (bkv, lanes), 1) // heads
         q_kv_diff = q_iota - kv_iota
 
+    def block(kv_head, kh, vt, bq_start, cs):
+        """One compute block: queries [bq_start, bq_start + bq_c_sz) of the q block,
+        lanes ``cs`` (a static slice, or a pl.ds at a traced lane offset)."""
+        qt = qt_ref[kv_head, :, cs]  # [hd, lanes] fp8
+        s = lax.dot_general(
+            kh, qt, (((0,), (0,)), ((), ())), preferred_element_type=jnp.float32
+        )  # [bkv, lanes]
+        if not no_max:
+            s = s.astype(jnp.bfloat16)
+        if apply_mask:
+            # key index kv_iota + processed_kv_len <= query index
+            # q_iota + bq_start + processed_q_len, i.e. q_kv_diff >= offset - bq_start.
+            mask = q_kv_diff >= offset - bq_start
+            if (window := cfgs.model.sliding_window) is not None:
+                mask = jnp.logical_and(mask, q_kv_diff < window + offset - bq_start)
+            s = jnp.where(mask, s, cfgs.model.mask_value)
+        m_prev = m_ref[kv_head, :, cs]  # [1, lanes]
+        if no_max:
+            # Bounded scores: m is -inf at a q block's first k block (alpha clears
+            # acc and l) and 0 after; s stays f32 up to exp2.
+            m_new = jnp.maximum(m_prev, 0.0)
+            alpha = jnp.exp2(m_prev - m_new)
+            p = jnp.exp2(s).astype(jnp.bfloat16)  # [bkv, lanes]
+        else:
+            m_cur = jnp.max(s, axis=0, keepdims=True).astype(jnp.float32)
+            m_new = jnp.maximum(m_prev, m_cur)
+            alpha = jnp.exp2(m_prev - m_new)
+            p = jnp.exp2(s - m_new.astype(jnp.bfloat16))  # [bkv, lanes] bf16
+        o_t = lax.dot_general(
+            vt, p, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+        )  # [acc rows, lanes]: O^T rows, then the row sums
+        acc_ref[kv_head, :, cs] = alpha * acc_ref[kv_head, :, cs] + o_t
+        # A finished q block starts its next one from -inf (alpha == 0 then
+        # clears acc and l).
+        m_ref[kv_head, :, cs] = jnp.where(
+            schedule_ref.is_last_k[step, 0], -jnp.inf, m_new
+        )
+
+    # Partial q blocks: groups of compute blocks covering 128 tokens.
+    per_group = max(1, 128 // cfgs.bq_c_sz)
+    n_groups = cfgs.bq_sz // (per_group * cfgs.bq_c_sz)
+    grouped = q_rows is not None and cfgs.bq_sz % (per_group * cfgs.bq_c_sz) == 0
+    group_tokens = per_group * cfgs.bq_c_sz
+    group_lanes = group_tokens * heads
+
     for kv_head in range(cfgs.model.num_kv_heads):
         kh = k[0, kv_head]  # [hd, bkv] fp8, contracted on dim 0: the MXU LHS
         ones_rows = cfgs.acct_scratch_shape[1] - hd
@@ -114,57 +160,29 @@ def tile(
             ],
             axis=0,
         )  # [acc rows, bkv]
-        for bq_start in range(0, cfgs.bq_sz, cfgs.bq_c_sz):
-            cs = slice(bq_start * heads, bq_start * heads + lanes)
+        if not grouped:
+            for bq_start in range(0, cfgs.bq_sz, cfgs.bq_c_sz):
+                cs = slice(bq_start * heads, bq_start * heads + lanes)
+                block(kv_head, kh, vt, bq_start, cs)
+            continue
 
-            def block(kv_head=kv_head, kh=kh, vt=vt, bq_start=bq_start, cs=cs):
-                qt = qt_ref[kv_head, :, cs]  # [hd, lanes] fp8
-                s = lax.dot_general(
-                    kh, qt, (((0,), (0,)), ((), ())), preferred_element_type=jnp.float32
-                )  # [bkv, lanes]
-                if not no_max:
-                    s = s.astype(jnp.bfloat16)
-                if apply_mask:
-                    # key index kv_iota + processed_kv_len <= query index
-                    # q_iota + bq_start + processed_q_len, i.e. q_kv_diff >= offset - bq_start.
-                    mask = q_kv_diff >= offset - bq_start
-                    if (window := cfgs.model.sliding_window) is not None:
-                        mask = jnp.logical_and(
-                            mask, q_kv_diff < window + offset - bq_start
-                        )
-                    s = jnp.where(mask, s, cfgs.model.mask_value)
-                m_prev = m_ref[kv_head, :, cs]  # [1, lanes]
-                if no_max:
-                    # Bounded scores: m is -inf at a q block's first k block (alpha
-                    # clears acc and l) and 0 after; s stays f32 up to exp2.
-                    m_new = jnp.maximum(m_prev, 0.0)
-                    alpha = jnp.exp2(m_prev - m_new)
-                    p = jnp.exp2(s).astype(jnp.bfloat16)  # [bkv, lanes]
-                else:
-                    m_cur = jnp.max(s, axis=0, keepdims=True).astype(jnp.float32)
-                    m_new = jnp.maximum(m_prev, m_cur)
-                    alpha = jnp.exp2(m_prev - m_new)
-                    p = jnp.exp2(s - m_new.astype(jnp.bfloat16))  # [bkv, lanes] bf16
-                o_t = lax.dot_general(
-                    vt, p, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
-                )  # [acc rows, lanes]: O^T rows, then the row sums
-                acc_ref[kv_head, :, cs] = alpha * acc_ref[kv_head, :, cs] + o_t
-                # A finished q block starts its next one from -inf (alpha == 0 then
-                # clears acc and l).
-                m_ref[kv_head, :, cs] = jnp.where(
-                    schedule_ref.is_last_k[step, 0], -jnp.inf, m_new
-                )
+        def run_group(g, carry, kv_head=kv_head, kh=kh, vt=vt):
+            for j in range(per_group):
+                bq_start = g * group_tokens + j * cfgs.bq_c_sz
+                lane0 = pl.multiple_of(g * group_lanes + j * lanes, lanes)
+                block(kv_head, kh, vt, bq_start, pl.ds(lane0, lanes))
+            return carry
 
-            # A q block holds at least one query, so its first compute block is live.
-            if q_rows is None or bq_start == 0:
-                block()
-                continue
-            live = bq_start < q_rows
-            pl.when(live)(block)
+        def reset_group(g, carry, kv_head=kv_head):
+            lane0 = pl.multiple_of(g * group_lanes, group_lanes)
+            m_ref[kv_head, :, pl.ds(lane0, group_lanes)] = jnp.full(
+                (1, group_lanes), -jnp.inf, jnp.float32
+            )
+            return carry
 
-            @pl.when(jnp.logical_not(live))
-            def _(kv_head=kv_head, cs=cs):
-                m_ref[kv_head, :, cs] = jnp.full((1, lanes), -jnp.inf, jnp.float32)
+        live_groups = jnp.clip((q_rows + group_tokens - 1) // group_tokens, 1, n_groups)
+        lax.fori_loop(0, live_groups, run_group, 0)
+        lax.fori_loop(live_groups, n_groups, reset_group, 0)
 
     is_last_k = schedule_ref.is_last_k[step, 0] == 1
 
