@@ -67,6 +67,16 @@ class K3ProgramInput(SpecInput):
 
     accept_lens_device = None
     future_indices = None
+    # What overlap scheduling relays through its future map (the EAGLE
+    # draft-input fields): only each request's last token is set, unused.
+    bonus_tokens = None
+    topk_p = None
+    topk_index = None
+    hidden_states = None
+    draft_probs = None
+    dsa_topk_indices = None
+    future_dsa_topk_indices_available = False
+    device_accept_selected_cache_locs = None
 
     def __init__(self) -> None:
         super().__init__(SpecInputType.NGRAM_VERIFY)
@@ -114,8 +124,12 @@ class K3ProgramAlgo(CustomSpecAlgo):
         server_args.speculative_num_draft_tokens = WIDTH
         layout = cache_layout(program_kv_cache_dtype(server_args.kv_cache_dtype))
         server_args.page_size = bridge.TP_SIZE * layout.tokens_per_block
-        server_args.disable_overlap_schedule = True
         role = getattr(server_args, "disaggregation_mode", None)
+        from sglang_tpu.envs import envs as tpu_envs
+
+        server_args.disable_overlap_schedule = not (
+            role == "decode" and tpu_envs.SGLANG_TPU_K3_PROGRAM_OPT_OVERLAP.get()
+        )
         colocated = role in (None, "null")
         if not (role == "prefill" or colocated) or getattr(
             server_args, "disable_radix_cache", False
@@ -270,6 +284,23 @@ class DecodeSteps:
         ``req_to_token`` rows' :func:`sglang_bridge.page_starts`: the flat
         ``[len(reqs) * WIDTH]`` int64 tokens and the ``[len(reqs)]`` int32
         accept lengths."""
+        tokens = self.launch(reqs, starts)
+        rows = np.asarray(tokens.cpu(), dtype=np.int64)
+        self.clock.mark("tokens")
+        _, lens = sglang_step.accepted(rows, len(reqs))
+        if not all(lens):
+            idle = [reqs[i].rid for i, n in enumerate(lens) if not n]
+            raise RuntimeError(f"K3 decode: requests {idle} took no token this step")
+        return rows.reshape(-1), np.asarray(lens, np.int32)
+
+    def launch(
+        self, reqs: Sequence[Any], starts: np.ndarray, *, lagging: bool = False
+    ) -> torch.Tensor:
+        """Launch one step for ``reqs``: its ``[len(reqs), WIDTH]`` tokens on
+        the device, -1 padded (no host sync). ``lagging``: under overlap
+        scheduling a running request's committed length trails its device
+        position by up to a step, so its tables reach a step further (within
+        the KV sglang allocated); the program tracks its position itself."""
         scheduled = 1 + drafts_for(self.schedule, len(reqs))
         requests = []
         for req in reqs:
@@ -283,8 +314,14 @@ class DecodeSteps:
             computed = int(req.kv.kv_committed_len)
             prompt = self._prompts.get(req)
             num_tokens = len(prompt) + len(req.output_ids)
+            end = computed + scheduled
             if req.rid in self._live:
                 token_ids = prompt  # the program holds its next input
+                if lagging:
+                    end += WIDTH
+                    allocated = int(getattr(req.kv, "kv_allocated_len", 0) or 0)
+                    if allocated:
+                        end = min(end, allocated)
             else:
                 outputs = np.asarray(req.output_ids, dtype=np.int32)
                 token_ids = np.concatenate((prompt, outputs))
@@ -298,7 +335,7 @@ class DecodeSteps:
                     scheduled=scheduled,
                     block_tables=bridge.block_tables(
                         starts[req.kv.req_pool_idx],
-                        computed + scheduled,
+                        end,
                         int(req.kv.mamba_pool_idx.reshape(-1)[0]),
                         self.plan,
                         self.table_width,
@@ -315,13 +352,7 @@ class DecodeSteps:
             self.clock.mark("flush")
         tokens = self.program.step(StepInput(requests, finished)).tokens
         self.clock.mark("dispatch")
-        rows = np.asarray(tokens[: len(reqs)].cpu(), dtype=np.int64)
-        self.clock.mark("tokens")
-        _, lens = sglang_step.accepted(rows, len(reqs))
-        if not all(lens):
-            idle = [reqs[i].rid for i, n in enumerate(lens) if not n]
-            raise RuntimeError(f"K3 decode: requests {idle} took no token this step")
-        return rows.reshape(-1), np.asarray(lens, np.int32)
+        return tokens[: len(reqs)]
 
     def _forget(self, finished: set[str]) -> None:
         self._prompts.drop(finished)
@@ -613,11 +644,31 @@ class K3ProgramWorker(BaseSpecWorker):
                 next_draft_input=K3ProgramInput(),
                 speculative_num_draft_tokens=WIDTH,
             )
+        if on_publish is not None:
+            # Overlap scheduling: everything stays on the device; the
+            # scheduler copies the tokens out while the next step runs.
+            tokens = steps.launch(batch.reqs, starts, lagging=True)
+            accept_lens = (tokens >= 0).sum(dim=1, dtype=torch.int32)
+            last = tokens.gather(1, (accept_lens - 1).clamp(min=0).long()[:, None])
+            new_seq_lens = batch.seq_lens.to(tokens.device) + accept_lens.to(
+                batch.seq_lens.dtype
+            )
+            on_publish(new_seq_lens)
+            relay = K3ProgramInput()
+            relay.bonus_tokens = last.reshape(-1).long()
+            clock.mark("result")
+            clock.stop(len(batch.reqs))
+            return GenerationBatchResult(
+                next_token_ids=tokens.reshape(-1).long(),
+                accept_lens=accept_lens,
+                new_seq_lens=new_seq_lens,
+                next_draft_input=relay,
+                speculative_num_draft_tokens=WIDTH,
+                speculative_output_stride=WIDTH,
+            )
         flat, lens = steps.step(batch.reqs, starts)
         accept_lens = torch.from_numpy(lens)
         new_seq_lens = batch.seq_lens + accept_lens.to(batch.seq_lens.device)
-        if on_publish is not None:
-            on_publish(new_seq_lens)
         clock.mark("result")
         clock.stop(len(batch.reqs))
         return GenerationBatchResult(
@@ -673,6 +724,8 @@ def register() -> None:
     # Before any kernel module is imported (they read the config at import).
     install_kernel_config()
 
-    @SpeculativeAlgorithm.register(ALGORITHM, spec_class=K3ProgramAlgo)
+    @SpeculativeAlgorithm.register(
+        ALGORITHM, spec_class=K3ProgramAlgo, supports_overlap=True
+    )
     def _factory(server_args):
         return K3ProgramWorker

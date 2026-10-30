@@ -16,6 +16,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.k3_programs import sglang_bridge as bridge
 from sglang_tpu.k3_programs import sglang_worker as worker
 from sglang_tpu.k3_programs.kimi_k3 import pools
@@ -159,6 +160,26 @@ class TestDecodeSteps(CustomTestCase):
         self.steps.step(reqs, _req_to_token(2, {1: [1]})[:, ::STEP])
         self.assertEqual({r.scheduled for r in self.program.inputs[0].requests}, {1})
 
+    def test_lagging_tables_reach_a_step_further(self):
+        # Under overlap scheduling a running request's committed length trails
+        # its device position by a step: its tables cover one step more, up
+        # to the KV sglang allocated.
+        req = _req(
+            "a", prompt=STEP - 10, output=[7], committed=STEP - 10, pool_idx=1, slot=1
+        )
+        req.kv.kv_allocated_len = 2 * STEP
+        r2t = _req_to_token(2, {1: [3, 6]})[:, ::STEP]
+        self.steps.launch([req], r2t, lagging=True)  # admitted: exact
+        first = self.program.inputs[0].requests[0].block_tables[0].tolist()
+        self.assertEqual(first, [self.plan.kv_block(3), 0, 0, 0])
+        self.steps.launch([req], r2t, lagging=True)
+        second = self.program.inputs[1].requests[0].block_tables[0].tolist()
+        self.assertEqual(second, [self.plan.kv_block(3), self.plan.kv_block(6), 0, 0])
+        req.kv.kv_allocated_len = STEP  # nothing allocated past the page
+        self.steps.launch([req], r2t, lagging=True)
+        third = self.program.inputs[2].requests[0].block_tables[0].tolist()
+        self.assertEqual(third, [self.plan.kv_block(3), 0, 0, 0])
+
     def test_a_request_without_a_token_is_an_error(self):
         req = _req("a", prompt=10, output=[1], committed=10, pool_idx=1, slot=1)
         self.program.accepted = {"a": 0}
@@ -268,6 +289,22 @@ class TestRegisteredAlgorithm(CustomTestCase):
         self.assertIsNone(spec.accept_lens_device)
         worker.register()  # idempotent
 
+    def test_overlap_on_the_decode_only(self):
+        with tpu_envs.SGLANG_TPU_K3_PROGRAM_OPT_OVERLAP.override(True):
+            for role, overlapped in (
+                ("decode", True),
+                ("prefill", False),
+                ("null", False),
+            ):
+                args = SimpleNamespace(
+                    kv_cache_dtype="fp8_e4m3",
+                    disaggregation_mode=role,
+                    disable_radix_cache=role == "decode",
+                )
+                self.algo.handle_server_args(args)
+                self.assertEqual(args.disable_overlap_schedule, not overlapped, role)
+        self.assertTrue(self.algo.supports_overlap)
+
     def test_settings_through_sglangs_speculative_hook(self):
         server_args = SimpleNamespace(
             speculative_draft_model_path=None,
@@ -345,6 +382,39 @@ class TestRegisteredAlgorithm(CustomTestCase):
         batch.forward_mode = ForwardMode.EXTEND
         with self.assertRaisesRegex(NotImplementedError, "decode role runs no"):
             w.forward_batch_generation(batch)
+
+    def test_overlapped_worker_result(self):
+        plan = bridge.UnifiedPoolPlan(40, 4, pools.cache_layout("auto"))
+        program = StubProgram()
+        program.accepted = {"a": 3, "b": 1}
+        r2t = torch.from_numpy(_req_to_token(3, {1: [1], 2: [2]}))
+        target = SimpleNamespace(
+            model_runner=None,
+            get_memory_pool=lambda: (SimpleNamespace(req_to_token=r2t), None),
+        )
+        worker.K3ProgramWorker.build_steps = lambda target_worker: worker.DecodeSteps(
+            program, plan, table_width=4, schedule=SCHEDULE
+        )
+        self.addCleanup(setattr, worker.K3ProgramWorker, "build_steps", None)
+        w = worker.K3ProgramWorker(None, 0, 0, target)
+        w.alloc_memory_pool()
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            reqs=[
+                _req("a", prompt=10, output=[1], committed=10, pool_idx=1, slot=1),
+                _req("b", prompt=20, output=[1], committed=20, pool_idx=2, slot=2),
+            ],
+            seq_lens=torch.tensor([10, 20]),
+            return_logprob=False,
+        )
+        published = []
+        result = w.forward_batch_generation(batch, on_publish=published.append)
+        self.assertEqual(result.accept_lens.tolist(), [3, 1])
+        self.assertEqual(result.new_seq_lens.tolist(), [13, 21])
+        self.assertEqual(published[0].tolist(), [13, 21])
+        self.assertEqual(result.next_token_ids.view(2, 8)[0, :3].tolist(), [0, 1, 2])
+        # The future map relays each request's last token.
+        self.assertEqual(result.next_draft_input.bonus_tokens.tolist(), [2, 100])
 
     def test_prefill_worker_result(self):
         plan = bridge.UnifiedPoolPlan(40, 4, pools.cache_layout("auto"))

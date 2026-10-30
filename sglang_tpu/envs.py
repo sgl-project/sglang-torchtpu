@@ -144,6 +144,10 @@ class TpuEnvs:
     # between steps) as its own small program before each program step, so it
     # is not compiled into the program's next op (one executable per mix).
     SGLANG_TPU_K3_PROGRAM_OPT_FLUSH_DEFERRED = EnvBool(False)
+    # Overlap scheduling on the K3_PROGRAM decode role: the program's next
+    # step launches while the scheduler processes the last one's tokens (as
+    # vLLM's async scheduling runs it).
+    SGLANG_TPU_K3_PROGRAM_OPT_OVERLAP = EnvBool(False)
 
     # Host padding is unconditional; this routes speculative batches to the
     # experimental spec worker, which keeps their metadata on the host as well.
