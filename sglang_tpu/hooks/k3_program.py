@@ -48,6 +48,19 @@ size_k3_program_pools
        asking the platform pool for its bytes per token).
   Remove when: that lands.
 
+reject_unsupported_k3_requests
+  Why: the programs return tokens only and keep each request's next input on
+       the device, so a request asking for logprobs, hidden states or
+       structured output cannot be served; raised inside the step it would
+       stop the scheduler.
+  How: AROUND sglang.srt.managers.scheduler.Scheduler._add_request_to_queue
+       finishes such a request with an abort (an error to its client) under
+       K3_PROGRAM before it is queued, as the scheduler does for requests
+       DFlash cannot serve.
+  Upstream PR or issue: <to be filed> (a speculative algorithm's request
+       validation seam).
+  Remove when: that seam exists.
+
 skip_k3_program_backends, skip_k3_program_graphs
   Why: the program runs the whole model, so sglang's forward never runs, but
        the model runner still builds the KDA/MLA attention backends over the
@@ -130,6 +143,34 @@ def size_k3_program_pools(result: None, configurator, kvc, *args, **kwargs) -> N
     return result
 
 
+def k3_program_unsupported(req: Any) -> str | None:
+    """Why K3_PROGRAM cannot serve ``req``, or None."""
+    if getattr(req, "return_logprob", False):
+        return "logprobs"
+    if getattr(req, "return_hidden_states", False):
+        return "hidden states"
+    params = getattr(req, "sampling_params", None)
+    if params is not None and any(
+        getattr(params, name, None)
+        for name in ("json_schema", "regex", "ebnf", "structural_tag")
+    ):
+        return "structured output"
+    return None
+
+
+def reject_unsupported_k3_requests(
+    original, scheduler: Any, req: Any, *args, **kwargs
+) -> None:
+    """AROUND Scheduler._add_request_to_queue."""
+    if k3_program_active() and getattr(req, "finished_reason", None) is None:
+        reason = k3_program_unsupported(req)
+        if reason is not None:
+            req.set_finish_with_abort(
+                f"--speculative-algorithm K3_PROGRAM serves without {reason}"
+            )
+    return original(scheduler, req, *args, **kwargs)
+
+
 def skip_k3_program_backends(original, model_runner: Any, *args, **kwargs) -> None:
     """AROUND ModelRunner.init_attention_backends."""
     if not k3_program_active():
@@ -173,6 +214,11 @@ def hook_specs() -> list[tuple]:
             "sglang.srt.model_executor.pool_configurator.DefaultPoolConfigurator.__init__",
             size_k3_program_pools,
             HookType.AFTER,
+        ),
+        (
+            "sglang.srt.managers.scheduler.Scheduler._add_request_to_queue",
+            reject_unsupported_k3_requests,
+            HookType.AROUND,
         ),
         (
             "sglang.srt.model_executor.model_runner.ModelRunner.init_attention_backends",

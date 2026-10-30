@@ -366,6 +366,42 @@ class TestSpecCheckHook(CustomTestCase):
         self.assertEqual(calls, [dspark])
 
 
+class TestRequestAdmission(CustomTestCase):
+    def test_unservable_requests_are_aborted(self):
+        def req(**kw):
+            params = SimpleNamespace(
+                json_schema=kw.pop("json_schema", None),
+                regex=None,
+                ebnf=None,
+                structural_tag=None,
+            )
+            fields = dict(
+                finished_reason=None,
+                return_logprob=False,
+                return_hidden_states=False,
+                sampling_params=params,
+                aborted=None,
+            )
+            fields.update(kw)
+            r = SimpleNamespace(**fields)
+            r.set_finish_with_abort = lambda msg: setattr(r, "aborted", msg)
+            return r
+
+        queued = []
+
+        def original(scheduler, r, *args, **kwargs):
+            queued.append(r)
+
+        plain, logprob, schema = req(), req(return_logprob=True), req(json_schema="{}")
+        with mock.patch.object(hooks, "k3_program_active", return_value=True):
+            for r in (plain, logprob, schema):
+                hooks.reject_unsupported_k3_requests(original, None, r)
+        self.assertEqual(queued, [plain, logprob, schema])  # all reach the client
+        self.assertIsNone(plain.aborted)
+        self.assertIn("logprobs", logprob.aborted)
+        self.assertIn("structured output", schema.aborted)
+
+
 class TestModelRunnerHooks(CustomTestCase):
     def test_no_backends_or_graphs_under_k3_program(self):
         original = mock.Mock()
