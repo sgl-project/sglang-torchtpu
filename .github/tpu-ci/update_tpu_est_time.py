@@ -17,6 +17,9 @@ moves by at least MIN_DELTA_S and MIN_DELTA_REL. A literal timeout_per_file
 moves with it only where it equals est_time today; anything else is a
 deliberate figure (e.g. the bench matrix's budget chain) and is left alone.
 
+The same estimates then rebalance accuracy_slots.json: each lane's accuracy legs
+are split across the two daytime slots so neither outgrows its slices.
+
 Stdlib only: lint runs .github/tpu-ci/tests with `python -E -S -B`.
 """
 
@@ -47,6 +50,12 @@ MARGIN = 1.25
 MIN_SAMPLES = 3
 MIN_DELTA_S = 60
 MIN_DELTA_REL = 0.10
+SLOT_TABLE = ".github/tpu-ci/accuracy_slots.json"
+SLOTS = ("day-10am", "day-5pm")
+# A multi-host leg's est_time excludes bring-up; _tpu-test.yml books 3600 s for it.
+MULTIHOST_BRINGUP_S = 3600
+# A slot change must shorten the busier slot by this much; less is weekly noise.
+MIN_REBALANCE_S = 900
 
 _TIMINGS_BEGIN = "========== TIMINGS BEGIN =========="
 _TIMINGS_END = "========== TIMINGS END =========="
@@ -164,6 +173,109 @@ def rewrite(src: str, new: int) -> str:
     return re.sub(rf'("timeout_per_file"\s*:\s*){old}\b', rf"\g<1>{new}", src, count=1)
 
 
+# --- accuracy slots --------------------------------------------------------------
+_SUITE_RE = re.compile(r"\bsuite\s*=\s*\"([^\"]+)\"")
+
+
+def registered_est(root: Path, new_est: Dict[str, int]) -> Dict[str, int]:
+    """est_time by accuracy suite and by file stem, with planned rewrites applied."""
+    out = {}
+    for f in sorted((root / "test" / "registered").rglob("*.py")):
+        src = f.read_text()
+        est = current_est(src)
+        if est is None:
+            continue
+        est = new_est.get(f.relative_to(root).as_posix(), est)
+        out[f.stem] = est
+        hit = _CALL_RE.search(src).start()
+        a, b = _call_span(src, hit)
+        m = _SUITE_RE.search(src[a:b])
+        if m and m.group(1).startswith("nightly-tpu-accuracy-"):
+            out[m.group(1)] = est
+    return out
+
+
+def slot_loads(slot_of: Dict[str, str], weight: Dict[str, int]) -> Dict[str, int]:
+    load = {s: 0 for s in SLOTS}
+    for leg, slot in slot_of.items():
+        load[slot] += weight[leg]
+    return load
+
+
+def balance(slot_of: Dict[str, str], weight: Dict[str, int]) -> Dict[str, str]:
+    """Move or swap one leg at a time while it shortens the busier slot.
+
+    Starting from today's slots keeps the weekly diff to the legs that must move.
+    """
+    slot_of = dict(slot_of)
+    while True:
+        load = slot_loads(slot_of, weight)
+        heavy, light = sorted(SLOTS, key=lambda s: (-load[s], s))
+        gap = load[heavy] - load[light]
+        best = None
+        for a in sorted(k for k, s in slot_of.items() if s == heavy):
+            for b in [None] + sorted(k for k, s in slot_of.items() if s == light):
+                new_gap = abs(gap - 2 * (weight[a] - (weight[b] if b else 0)))
+                # The busier slot shrinks by half the gap's drop.
+                if gap - new_gap < 2 * MIN_REBALANCE_S:
+                    continue
+                key = (new_gap, b is not None, a, b or "")
+                if best is None or key < best:
+                    best = key
+        if best is None:
+            return slot_of
+        _, _, a, b = best
+        slot_of[a] = light
+        if b:
+            slot_of[b] = heavy
+
+
+def rebalance(
+    table: dict, est: Dict[str, int]
+) -> Tuple[dict, List[Tuple[str, str, str]], Dict[str, Dict[str, int]]]:
+    """(new table, [(leg, old, new slot)], per-lane slot loads in seconds)."""
+    table = json.loads(json.dumps(table))
+    moves, loads = [], {}
+    for lane, extra in (("singlehost", 0), ("multihost", MULTIHOST_BRINGUP_S)):
+        legs = table[lane]
+        unknown = sorted(set(legs) - set(est))
+        if unknown:
+            raise KeyError(f"{SLOT_TABLE} {lane} legs with no registration: {unknown}")
+        # Legs sharing a `group` (e.g. shards one collector combines) move as one.
+        unit = {leg: v.get("group", leg) for leg, v in legs.items()}
+        unit_slot, weight = {}, defaultdict(int)
+        for leg, v in legs.items():
+            if unit_slot.setdefault(unit[leg], v["slot"]) != v["slot"]:
+                raise ValueError(f"{SLOT_TABLE} group {unit[leg]} spans two slots")
+            weight[unit[leg]] += est[leg] + extra
+        unit_slot = balance(unit_slot, weight)
+        for leg in sorted(legs):
+            slot = unit_slot[unit[leg]]
+            if legs[leg]["slot"] != slot:
+                moves.append((leg, legs[leg]["slot"], slot))
+                legs[leg]["slot"] = slot
+        loads[lane] = slot_loads(unit_slot, weight)
+    return table, moves, loads
+
+
+def dump_table(table: dict) -> str:
+    return json.dumps(table, indent=2, sort_keys=True) + "\n"
+
+
+def slots_summary(moves, loads) -> str:
+    rows = [f"| `{leg}` | {old} | {new} |" for leg, old, new in moves]
+    lanes = ", ".join(
+        f"{lane} " + " / ".join(f"{s} {load[s] / 3600:.1f} h" for s in SLOTS)
+        for lane, load in loads.items()
+    )
+    out = f"### Accuracy slots\n\nest_time per slot: {lanes}.\n\n"
+    if rows:
+        out += "| Leg | Old | New |\n| --- | --- | --- |\n" + "\n".join(rows) + "\n"
+    else:
+        out += "No leg moves.\n"
+    return out
+
+
 # --- GitHub ----------------------------------------------------------------------
 def _get(url: str, token: str, raw: bool = False):
     req = urllib.request.Request(url)
@@ -250,9 +362,16 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--summary-file", default="")
     ap.add_argument("--samples", default="", help="JSON cache of collected samples")
+    ap.add_argument(
+        "--rebalance-only",
+        action="store_true",
+        help="rebalance accuracy slots from the checked-in est_time, no sampling",
+    )
     a = ap.parse_args()
 
-    if a.samples and Path(a.samples).is_file():
+    if a.rebalance_only:
+        samples = {}
+    elif a.samples and Path(a.samples).is_file():
         samples = json.loads(Path(a.samples).read_text())
     else:
         token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
@@ -273,12 +392,27 @@ def main() -> int:
         if not a.dry_run:
             f = root / path
             f.write_text(rewrite(f.read_text(), new))
-    if a.summary_file and rows:
-        Path(a.summary_file).write_text(
+    summary = ""
+    if rows:
+        summary = (
             f"### TPU est_time ({len(rows)} files; p90 x {MARGIN} of passing runs)\n\n"
             "| File | Old (s) | New (s) | p90 (s) | n |\n"
             "| --- | ---: | ---: | ---: | ---: |\n" + "\n".join(rows) + "\n"
         )
+
+    table_path = root / SLOT_TABLE
+    est = registered_est(root, {path: new for path, _, new, _ in changes})
+    table, moves, loads = rebalance(json.loads(table_path.read_text()), est)
+    for leg, old, new in moves:
+        print(f"{leg}: slot {old} -> {new}")
+    print(f"accuracy slot loads (s): {loads}")
+    if moves and not a.dry_run:
+        table_path.write_text(dump_table(table))
+    if rows or moves:
+        summary += ("\n" if summary else "") + slots_summary(moves, loads)
+
+    if a.summary_file and summary:
+        Path(a.summary_file).write_text(summary)
     return 0
 
 

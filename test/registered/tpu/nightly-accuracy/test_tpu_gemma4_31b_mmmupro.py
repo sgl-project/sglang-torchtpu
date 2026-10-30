@@ -1,4 +1,4 @@
-"""Gemma-4-31B TPU MMMU-Pro score, all 1,730 standard-10 questions."""
+"""Gemma-4-31B TPU MMMU-Pro score on the nightly question set (mmmu_full)."""
 
 import unittest
 
@@ -7,7 +7,7 @@ from sglang.test.tpu import GEMMA4_31B, make_model_config, make_runner
 from sglang.test.tpu.utils.accuracy_base import AccuracyTestCase, gate_server_failures
 
 register_tpu_ci(
-    est_time=9000,
+    est_time=4500,
     suite="nightly-tpu-accuracy-gemma4-31b-mmmupro",
     nightly=True,
     labels=["singlehost", "gemma4-31b", "accuracy"],

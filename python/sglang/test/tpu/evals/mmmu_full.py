@@ -1,9 +1,11 @@
-"""Full MMMU-Pro, split deterministically across independent serving instances.
+"""MMMU-Pro's nightly question set, split deterministically across serving instances.
 
 Only the row list changes: sgl-eval's own loader builds every example and its
 own grader scores it, so a shard is comparable with an unsharded run of the
-same benchmark. The shards partition the set by stride, and the collector
-rejects a missing or duplicated id before reporting the combined score.
+same benchmark. The nightly set is every SUBSET_STRIDE-th question, which keeps
+every subject since rows are ordered by subject. The shards partition that set
+by stride, and the collector rejects a missing or duplicated id before
+reporting the combined score.
 
 Sharding is for a model too slow to finish the set inside one CI job; the caller
 supplies the model and its sampling.
@@ -17,12 +19,35 @@ import tempfile
 from pathlib import Path
 
 SHARD_RESULT_PREFIX = "MMMU_SHARD_RESULT "
+# 433 of the 1,730 questions, to fit the accuracy slots; 1 restores the full set.
+SUBSET_STRIDE = 4
 
 
 def shard_rows(rows, shard, shards):
     if shards < 1 or not 0 <= shard < shards:
         raise ValueError("Invalid shard index/count")
-    return list(rows)[shard::shards]
+    return list(rows)[::SUBSET_STRIDE][shard::shards]
+
+
+def eval_command(
+    base_url: str, *, shard: int, shards: int, output: str, sampling: dict
+):
+    """argv scoring one shard of the nightly set into ``output``."""
+    return [
+        sys.executable,
+        "-m",
+        __name__,
+        "--base-url",
+        base_url,
+        "--shard",
+        str(shard),
+        "--shards",
+        str(shards),
+        "--output",
+        output,
+        "--sampling",
+        json.dumps(sampling),
+    ]
 
 
 def run_shard(
@@ -40,30 +65,20 @@ def run_shard(
     """Score one shard of MMMU-Pro and print its summary for the collector."""
     output = Path(tempfile.mkdtemp(prefix=f"mmmu-pro-shard-{shard}-"))
     subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            __name__,
-            "--base-url",
+        eval_command(
             base_url,
-            "--shard",
-            str(shard),
-            "--shards",
-            str(shards),
-            "--output",
-            str(output),
-            "--sampling",
-            json.dumps(
-                {
-                    "model": model,
-                    "max_tokens": max_tokens,
-                    "num_threads": num_threads,
-                    "temperature": temperature,
-                    "top_p": top_p,
-                    "chat_template_kwargs": chat_template_kwargs or {},
-                }
-            ),
-        ],
+            shard=shard,
+            shards=shards,
+            output=str(output),
+            sampling={
+                "model": model,
+                "max_tokens": max_tokens,
+                "num_threads": num_threads,
+                "temperature": temperature,
+                "top_p": top_p,
+                "chat_template_kwargs": chat_template_kwargs or {},
+            },
+        ),
         check=True,
     )
     files = list(output.glob("sgl_eval_mmmu_pro_*/metrics.json"))
@@ -85,6 +100,7 @@ def run_shard(
     summary = {
         "shard": shard,
         "shards": shards,
+        "stride": SUBSET_STRIDE,
         "questions": result["num_examples"],
         "score": result["aggregate"]["score"],
         "correct": round(result["aggregate"]["score"] * result["num_examples"]),
@@ -115,7 +131,7 @@ def main():
 
     def load_shard(split="test", num_examples=None):
         if num_examples is not None:
-            raise ValueError("Full-set evaluation cannot have a sample limit")
+            raise ValueError("The nightly set cannot take a sample limit")
         examples = load_mmmu_pro(split)
         if not examples:
             raise ValueError("MMMU-Pro loaded no examples")
