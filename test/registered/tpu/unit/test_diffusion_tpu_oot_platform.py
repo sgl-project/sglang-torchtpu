@@ -161,29 +161,9 @@ class TestCompileDefaults(CustomTestCase):
             server_args(offload_during_compile=True).offload_during_compile
         )
 
-    def test_teacache_is_dropped_under_torch_compile(self):
-        from sglang.multimodal_gen.configs.sample.sampling_params import (
-            SamplingParams,
-        )
-        from sglang.multimodal_gen.runtime.platforms import current_platform
-
+    def test_teacache_and_vae_decode_stay_out_of_compile(self):
+        # What the core does with each False: TestPlatformCompileGates.
         self.assertFalse(TpuOOTPlatform().supports_teacache_with_torch_compile())
-        for compile_on, expected in ((True, False), (False, True)):
-            with (
-                self.subTest(enable_torch_compile=compile_on),
-                patch.object(
-                    current_platform,
-                    "supports_teacache_with_torch_compile",
-                    TpuOOTPlatform().supports_teacache_with_torch_compile,
-                ),
-            ):
-                params = SamplingParams(enable_teacache=True)
-                params._drop_teacache_if_it_recompiles(
-                    SimpleNamespace(enable_torch_compile=compile_on)
-                )
-                self.assertEqual(params.enable_teacache, expected)
-
-    def test_vae_decode_stays_eager(self):
         self.assertFalse(TpuOOTPlatform.supports_vae_torch_compile())
 
     def test_worker_init_keeps_recompiles_static_and_patches_the_worker(self):
