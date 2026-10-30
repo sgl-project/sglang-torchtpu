@@ -5,13 +5,13 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.attention_pallas_rpa_base import (
     BaseTpuPallasRpaAttnBackend,
 )
+from sglang_tpu.envs import envs
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

@@ -13,8 +13,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     SGLANG_BUILD_RUST_EXTS=none \
     SGLANG_PLATFORM=tpu
 
+# libssl-dev: the HiCache page-hash extension (mem_cache/cpp_utils) links
+# OpenSSL; storage backends and KV events JIT-build it at runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git curl ca-certificates build-essential libgomp1 \
+        git curl ca-certificates build-essential libgomp1 libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /sgl-workspace/sglang

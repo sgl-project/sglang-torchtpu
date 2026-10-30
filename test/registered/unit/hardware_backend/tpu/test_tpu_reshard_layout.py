@@ -7,7 +7,10 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
-from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+from sglang_tpu.kv_pool import (
+    TpuBlockMajorMHATokenToKVPool,
+    TpuFusedMHATokenToKVPool,
+)
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -57,6 +60,31 @@ class TestTpuReshardLayout(unittest.TestCase):
                 self.assertLessEqual(dst_off + size, destination_width)
                 written.update(range(dst_off, dst_off + size))
             self.assertEqual(written, set(range(destination_width)))
+
+    def test_block_major_bundle_refuses_unequal_tp(self):
+        """A bundle's axis 2 is page_size, not the kv-head axis the reshard
+        geometry reads, so resharding a bundle must fail instead of computing
+        wrong byte ranges."""
+        pool = TpuBlockMajorMHATokenToKVPool(
+            size=128,
+            page_size=64,
+            dtype=torch.bfloat16,
+            head_num=2,
+            head_dim=128,
+            layer_num=3,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        mgr = object.__new__(RaidenKVManager)
+        mgr._kv_caches = pool.page_buffers()
+        mgr._swa_kv_caches = pool.page_buffers()
+        mgr.kv_args = SimpleNamespace(total_kv_head_num=8)
+        for swa in (False, True):
+            with self.subTest(swa=swa):
+                with self.assertRaisesRegex(
+                    ValueError, "SGLANG_TPU_USE_BLOCK_MAJOR_KV.*TP 8 on prefill and 4"
+                ):
+                    mgr._make_geometry(8, 4, swa=swa)
 
 
 if __name__ == "__main__":

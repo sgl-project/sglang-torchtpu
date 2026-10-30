@@ -29,6 +29,12 @@
         "cooldown_interval_minutes": 0,
         "reason": "sglang-torchtpu TPU contributor"
     },
+    "cthi": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "sglang-torchtpu TPU contributor"
+    },
     "hlFu": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -40,6 +46,18 @@
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
         "reason": "sglang-torchtpu maintainer listed in CODEOWNERS TPU area"
+    },
+    "linzebing": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "sglang-torchtpu TPU contributor"
+    },
+    "lk-chen": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "sglang-torchtpu TPU contributor"
     },
     "madongfly": {
         "can_tag_run_ci_label": true,
