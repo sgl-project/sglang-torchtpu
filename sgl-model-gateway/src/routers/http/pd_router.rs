@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::Arc, time::Instant};
+use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use axum::{
@@ -179,6 +179,83 @@ fn first_sse_event_is_error(buf: &[u8]) -> Option<bool> {
         let data = data.strip_prefix(b" ").unwrap_or(data);
         serde_json::from_slice::<Value>(data).is_ok_and(|v| v.get("error").is_some())
     }))
+}
+
+/// How a streaming prefill that answered 2xx reported failure in its body.
+#[derive(Clone, Copy, Debug)]
+enum PrefillStreamFailure {
+    /// An `error` event: the engine rejected the request (e.g. a prompt over
+    /// `--context-length`, or any `ValueError` while streaming), or an OpenAI
+    /// route reported an abort that carries a status.
+    ErrorEvent,
+    /// Every request in the stream finished with reason `abort` (e.g. the
+    /// scheduler's KV-capacity check, or a KV transfer failure).
+    Aborted,
+}
+
+impl PrefillStreamFailure {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ErrorEvent => "in-band stream error",
+            Self::Aborted => "aborted",
+        }
+    }
+}
+
+/// Classifies the fully read body of a streaming prefill that answered 2xx.
+///
+/// A streaming engine commits 200 headers before it knows the outcome, so a
+/// failed prefill still answers 200 and reports the failure in its body. A
+/// prefill that finished normally in PD prefill mode ends with finish reason
+/// `length`, never `abort`, so neither `PrefillStreamFailure` matches a success.
+///
+/// Returns the failure and the HTTP status the engine reported for it
+/// (`error.code`, or the abort's `status_code`), or `None` if prefill
+/// succeeded. A batch stream counts as failed only when every request in it
+/// aborted: a partially aborted batch keeps today's behavior of relaying
+/// decode, which still serves the requests that did prefill.
+///
+/// Not recognized (decode is still awaited, as before): `/v1/responses`
+/// failures, reported as a `response.failed` event with a nested error, and
+/// OpenAI-route aborts without a status, sent as a normal chunk.
+fn prefill_stream_failure(body: &[u8]) -> Option<(PrefillStreamFailure, Option<u16>)> {
+    // Final finish reason per request id: (aborted, reported status).
+    let mut finishes: HashMap<String, (bool, Option<u16>)> = HashMap::new();
+    let status_of = |v: Option<&Value>| {
+        v.and_then(Value::as_u64)
+            .and_then(|code| u16::try_from(code).ok())
+    };
+    for line in body.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(data) = line.strip_prefix(b"data:") else {
+            continue;
+        };
+        let data = data.strip_prefix(b" ").unwrap_or(data);
+        let Ok(event) = serde_json::from_slice::<Value>(data) else {
+            continue; // `[DONE]` or a non-JSON payload
+        };
+        if let Some(err) = event.get("error") {
+            return Some((PrefillStreamFailure::ErrorEvent, status_of(err.get("code"))));
+        }
+        let Some(finish_reason) = event.pointer("/meta_info/finish_reason") else {
+            continue;
+        };
+        if finish_reason.is_null() {
+            continue;
+        }
+        let id = event
+            .pointer("/meta_info/id")
+            .map(Value::to_string)
+            .unwrap_or_default();
+        let aborted = finish_reason.get("type").and_then(Value::as_str) == Some("abort");
+        finishes.insert(id, (aborted, status_of(finish_reason.get("status_code"))));
+    }
+    if finishes.is_empty() || !finishes.values().all(|&(aborted, _)| aborted) {
+        return None;
+    }
+    // Report the most severe status (a 5xx outranks a 4xx).
+    let status = finishes.values().filter_map(|&(_, status)| status).max();
+    Some((PrefillStreamFailure::Aborted, status))
 }
 
 impl PDRouter {
@@ -1046,6 +1123,42 @@ impl PDRouter {
                 response.extensions_mut().insert(CancelledRequestHoldsRid);
             }
             return response;
+        }
+
+        // A streaming prefill that failed still answers 200 and reports the
+        // failure in its body (see `prefill_stream_failure`); decode would then
+        // wait for KV that never comes. Same handling as a failed status above,
+        // except that the client gets prefill's stream unchanged, as it would
+        // from a single engine.
+        if context.is_stream {
+            if let Some((status, failure, reported_status, body)) =
+                prefill_result.as_ref().ok().and_then(|resp| {
+                    let body = resp.body.as_ref().ok()?;
+                    let (failure, reported_status) = prefill_stream_failure(body)?;
+                    Some((resp.status(), failure, reported_status, body.clone()))
+                })
+            {
+                warn!(
+                    "Prefill stream failed ({}, reported status {:?}), aborting paired decode request decode_url={} prefill_url={}",
+                    failure.as_str(),
+                    reported_status,
+                    decode.url(),
+                    prefill.url()
+                );
+                // Only a reported 5xx is a worker fault. Error events always
+                // carry a code; an abort without one is graceful (e.g.
+                // `/abort_request`), not a prefill fault. Don't record decode,
+                // as above.
+                prefill.record_outcome(reported_status.is_none_or(|s| s < 500));
+                let mut response = Response::new(Body::from(body));
+                *response.status_mut() = status;
+                response
+                    .headers_mut()
+                    .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+                // No `CancelledRequestHoldsRid`: a 2xx response is never retried.
+                response.extensions_mut().insert(BreakerOutcomesRecorded);
+                return response;
+            }
         }
 
         // Prefill ok: take decode's result, awaiting it if still pending.
@@ -2395,6 +2508,60 @@ mod tests {
         assert_eq!(first_sse_event_is_error(b"data: {\"error\":"), None);
         let oversized = vec![b'x'; MAX_DECODE_PEEK_BYTES];
         assert_eq!(first_sse_event_is_error(&oversized), Some(false));
+    }
+
+    #[test]
+    fn test_prefill_stream_failure() {
+        let classify = |body: &[u8]| {
+            prefill_stream_failure(body).map(|(failure, status)| (failure.as_str(), status))
+        };
+        let done = |id: &str| {
+            format!("data: {{\"text\":\"\",\"meta_info\":{{\"id\":\"{id}\",\"finish_reason\":{{\"type\":\"length\",\"length\":0}}}}}}\n\n")
+        };
+        let abort = |id: &str, code: u16| {
+            format!("data: {{\"text\":\"\",\"meta_info\":{{\"id\":\"{id}\",\"finish_reason\":{{\"type\":\"abort\",\"message\":\"m\",\"status_code\":{code}}}}}}}\n\n")
+        };
+
+        // Rejected before dispatch (`stream_results` in http_server.py).
+        let engine_error = b"data: {\"error\":{\"message\":\"too long\",\"type\":\"invalid_request_error\",\"code\":400,\"retryable\":false}}\n\ndata: [DONE]\n\n";
+        assert_eq!(
+            classify(engine_error),
+            Some(("in-band stream error", Some(400)))
+        );
+        assert_eq!(
+            classify(b"data:{\"error\":\"boom\"}\r\n\r\n"),
+            Some(("in-band stream error", None))
+        );
+
+        // Aborted by the scheduler.
+        let aborted = format!("{}data: [DONE]\n\n", abort("a", 400));
+        assert_eq!(classify(aborted.as_bytes()), Some(("aborted", Some(400))));
+        // Batch: failed only when every request aborted; worst status wins.
+        let all_aborted = format!("{}{}", abort("a", 400), abort("b", 500));
+        assert_eq!(
+            classify(all_aborted.as_bytes()),
+            Some(("aborted", Some(500)))
+        );
+        let partly_aborted = format!("{}{}", abort("a", 400), done("b"));
+        assert_eq!(classify(partly_aborted.as_bytes()), None);
+        // Only a request's final finish reason counts.
+        let null_then_abort = format!(
+            "data: {{\"text\":\"\",\"meta_info\":{{\"id\":\"a\",\"finish_reason\":null}}}}\n\n{}",
+            abort("a", 503)
+        );
+        assert_eq!(
+            classify(null_then_abort.as_bytes()),
+            Some(("aborted", Some(503)))
+        );
+
+        // Successful or empty prefill streams are not failures.
+        assert_eq!(
+            classify(format!("{}data: [DONE]\n\n", done("a")).as_bytes()),
+            None
+        );
+        assert_eq!(classify(b"data: {}\n\n"), None);
+        assert_eq!(classify(b"data: [DONE]\n\n"), None);
+        assert_eq!(classify(b""), None);
     }
 
     #[test]
