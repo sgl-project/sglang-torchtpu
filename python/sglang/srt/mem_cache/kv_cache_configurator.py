@@ -1820,8 +1820,16 @@ class KVCacheConfigurator:
         # attn_tp_size // attn_dcp_size groups, as get_num_kv_heads does for
         # the full sub-pool below. A draft model never joins the DCP group, so
         # it shards over the whole attn TP group.
-        swa_dcp_size = get_parallel().attn_dcp_size
-        if swa_dcp_size > 1 and self.model_config.is_draft_model:
+        dcp_size = get_parallel().attn_dcp_size
+        # An unsplit SWA sub-pool keeps plain-TP heads and every token on every
+        # DCP rank, paged like its allocator (page_size * attn_dcp_size).
+        swa_replicated = (
+            dcp_size > 1
+            and not self.model_config.is_draft_model
+            and current_platform.dcp_replicates_swa_kv()
+        )
+        swa_dcp_size = dcp_size
+        if swa_dcp_size > 1 and (self.model_config.is_draft_model or swa_replicated):
             swa_dcp_size = 1
         swa_head_num = max(
             1,
@@ -1832,15 +1840,32 @@ class KVCacheConfigurator:
             )
             // (get_parallel().attn_tp_size // swa_dcp_size),
         )
-        mxint8_subpool_kwargs = {}
-        if self.kv_cache_dtype_str == "mxint8":
+        subpool_kwargs = {}
+        if swa_replicated:
+            if self.kv_cache_dtype_str == "mxint8":
+                raise ValueError(
+                    "An unsplit SWA KV pool under decode context parallelism "
+                    "does not support MXINT8 KV."
+                )
+            subpool_kwargs = {
+                "swa_kv_pool_kwargs": {
+                    "page_size": self.pool_page_size * dcp_size,
+                    "device": self.device,
+                    "enable_memory_saver": False,
+                    "head_num": swa_head_num,
+                    "head_dim": self.model_config.swa_head_dim,
+                    "v_head_dim": self.model_config.swa_v_head_dim,
+                    "allocation_label": "SWA",
+                },
+            }
+        elif self.kv_cache_dtype_str == "mxint8":
             common = {
                 "page_size": self.pool_page_size,
                 "device": self.device,
                 "enable_memory_saver": False,
                 **self._mxint8_pool_kwargs(),
             }
-            mxint8_subpool_kwargs = {
+            subpool_kwargs = {
                 "full_kv_pool_kwargs": {
                     **common,
                     "head_num": self.model_config.get_num_kv_heads(
@@ -1880,7 +1905,7 @@ class KVCacheConfigurator:
             full_attention_layer_ids=full_attention_layer_ids,
             device=self.device,
             token_to_kv_pool_class=PoolCls,
-            **mxint8_subpool_kwargs,
+            **subpool_kwargs,
         )
 
     def _build_tpu_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
@@ -2453,9 +2478,16 @@ class KVCacheConfigurator:
                         if current_platform.dcp_shards_every_kv_pool()
                         else 1
                     )
+                    # An unsplit SWA sub-pool hands out its own rows (see
+                    # _build_tpu_swa_kv_pool), not widened locations.
+                    swa_widening = (
+                        1
+                        if widening > 1 and current_platform.dcp_replicates_swa_kv()
+                        else widening
+                    )
                     token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
                         sizes.full_max_total_num_tokens * widening,
-                        sizes.swa_max_total_num_tokens * widening,
+                        sizes.swa_max_total_num_tokens * swa_widening,
                         page_size=get_schedule().page_size * widening,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
