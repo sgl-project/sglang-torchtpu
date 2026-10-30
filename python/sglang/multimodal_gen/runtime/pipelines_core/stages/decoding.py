@@ -62,16 +62,19 @@ def decode_uses_every_rank(vae) -> bool:
     """
     if vae is None or not vae.use_parallel_decode:
         return False
+    if not model_parallel_is_initialized():
+        return False
+    world_size = get_decode_parallel_world_size()
     # The same no-p2p policy as should_use_spatial_shard_parallel_decode.
     # Read from the VAE: some replace .config with their arch config; a VAE
     # without the attribute never opted in.
     if is_auto_parallel_decode_mode(
         vae.parallel_decode_mode
     ) and not auto_mode_may_shard_on_this_platform(
-        getattr(vae, "auto_shards_without_p2p", False)
+        getattr(vae, "auto_shards_without_p2p", False), world_size
     ):
         return False
-    return model_parallel_is_initialized() and get_decode_parallel_world_size() > 1
+    return world_size > 1
 
 
 def scale_and_shift_latents(latents: torch.Tensor, server_args, vae) -> torch.Tensor:
