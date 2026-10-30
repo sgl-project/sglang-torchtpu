@@ -172,28 +172,6 @@ class _Prompts:
             self._arrays.pop(rid, None)
 
 
-_flush_probe: torch.Tensor | None = None
-
-
-def flush_deferred() -> None:
-    """Materialize torch_tpu's pending (deferred) work through a one-element
-    program of its own, ahead of a program step
-    (``SGLANG_TPU_K3_PROGRAM_OPT_FLUSH_DEFERRED``)."""
-    global _flush_probe
-    from torch_tpu._internal.sync import synchronize
-
-    if _flush_probe is None:
-        _flush_probe = torch.zeros(1, dtype=torch.int32).to("tpu")
-    synchronize([], wait=False)
-    (_flush_probe + 1).cpu()
-
-
-def _flush_enabled() -> bool:
-    from sglang_tpu.envs import envs as tpu_envs
-
-    return bool(tpu_envs.SGLANG_TPU_K3_PROGRAM_OPT_FLUSH_DEFERRED.get())
-
-
 class StepClock:
     """Where a role's steps spend host time: each phase between marks, and
     the gap since the previous step (the scheduler's own work; gaps over a
@@ -277,7 +255,6 @@ class DecodeSteps:
         self._departed: dict[str, None] = {}
         self._prompts = _Prompts()
         self.clock = StepClock("decode")
-        self.flush = _flush_enabled()
 
     def step(self, reqs: Sequence[Any], starts: np.ndarray) -> tuple:
         """One step for ``reqs`` (sglang ``Req``s, batch order) with their
@@ -347,9 +324,6 @@ class DecodeSteps:
         finished, self._live = self._live - current, current
         self._forget(finished)
         self.clock.mark("inputs")
-        if self.flush:
-            flush_deferred()
-            self.clock.mark("flush")
         tokens = self.program.step(StepInput(requests, finished)).tokens
         self.clock.mark("dispatch")
         return tokens[: len(reqs)]
@@ -407,7 +381,6 @@ class PrefillSteps:
         self._prompts = _Prompts()
         self.stats = collections.Counter()
         self.clock = StepClock("prefill", every=200)
-        self.flush = _flush_enabled()
 
     def _row(self, req, prompt, computed, end, starts, columns=()):
         """The program's row for ``req`` computing ``[computed, end)``; each
@@ -516,8 +489,6 @@ class PrefillSteps:
         if hit_copies:
             src, dst = zip(*hit_copies)
             self.kv_pool.copy_blocks(src, dst)
-        if self.flush:
-            flush_deferred()
         tokens = self.program.step(StepInput(first_rows, finished)).tokens
         first = np.asarray(tokens[: len(reqs)].cpu(), dtype=np.int64)[:, 0]
         if split_rows:
@@ -564,6 +535,12 @@ class K3ProgramWorker(BaseSpecWorker):
         self.speculative_num_steps = WIDTH - 1
         self.speculative_num_draft_tokens = WIDTH
         self.steps: DecodeSteps | PrefillSteps | None = None
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.k3_programs.sglang_deferred import DeferredGuard
+
+        self.guard = DeferredGuard(
+            enabled=not tpu_envs.SGLANG_TPU_K3_PROGRAM_DISABLE_DEFERRED_GUARD.get()
+        )
 
     @property
     def draft_worker(self):
@@ -578,6 +555,7 @@ class K3ProgramWorker(BaseSpecWorker):
             raise RuntimeError("K3_PROGRAM: no decode program was configured")
         self.steps = K3ProgramWorker.build_steps(self._target_worker)
         rank = getattr(self.model_runner, "tp_rank", 0)
+        self.guard.log = rank == 0
         for role in (
             getattr(self.steps, "prefill", None),
             getattr(self.steps, "decode", None),
@@ -622,6 +600,18 @@ class K3ProgramWorker(BaseSpecWorker):
             .numpy()
         )
         clock.mark("page_starts")
+        # sglang's deferred writes since the last step run as a program of
+        # their own, not inside the program's next op (sglang_deferred).
+        future_map = getattr(getattr(on_publish, "func", None), "__self__", None)
+        self.guard(
+            (
+                ("batch", batch),
+                ("req_to_token_pool", self.req_to_token_pool),
+                ("allocator", self.token_to_kv_pool_allocator),
+                ("future_map", future_map),
+            )
+        )
+        clock.mark("guard")
         if prefill:
             state_pool = self.req_to_token_pool.mamba_pool
             # A prefix hit's cached state into the request's slot (sglang's

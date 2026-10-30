@@ -140,10 +140,10 @@ class TpuEnvs:
     # than as --speculative-draft-model-path, which sglang opens with
     # transformers (model type k3_dspark is not one of its architectures).
     SGLANG_TPU_K3_PROGRAM_DRAFT = EnvStr(None)
-    # Run torch_tpu's deferred work (in-place view writes the scheduler leaves
-    # between steps) as its own small program before each program step, so it
-    # is not compiled into the program's next op (one executable per mix).
-    SGLANG_TPU_K3_PROGRAM_OPT_FLUSH_DEFERRED = EnvBool(False)
+    # Kill-switch for the deferred-write guard (k3_programs/sglang_deferred.py):
+    # torch_tpu writes the scheduler leaves between steps are otherwise compiled
+    # into the program's next op, one executable per mix.
+    SGLANG_TPU_K3_PROGRAM_DISABLE_DEFERRED_GUARD = EnvBool(False)
     # Overlap scheduling on the K3_PROGRAM decode role: the program's next
     # step launches while the scheduler processes the last one's tokens (as
     # vLLM's async scheduling runs it).
