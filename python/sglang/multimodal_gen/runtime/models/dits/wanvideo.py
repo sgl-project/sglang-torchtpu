@@ -1341,7 +1341,10 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 self.maybe_cache_states(hidden_states, original_hidden_states)
             if enable_spectrum:
                 self.spectrum_record_features(hidden_states)
-        self.cnt += 1
+        # Only TeaCache reads the step counter; under torch.compile a mutated
+        # int attribute recompiles the forward every step.
+        if self.enable_teacache:
+            self.cnt += 1
 
         if sequence_shard_enabled:
             hidden_states = hidden_states.contiguous()

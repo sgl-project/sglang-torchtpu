@@ -25,6 +25,7 @@ def _groups(full, swa, full_ids, swa_ids):
         full_layer_ids=full_ids,
         swa_layer_ids=swa_ids,
         num_draft_full=0,
+        num_hidden_full=0,
         num_draft_swa=0,
     )
 
@@ -90,9 +91,9 @@ def test_rank4_fingerprint_ignores_per_rank_heads():
     decode = torch.zeros((7, 2, 128, 512), dtype=torch.bfloat16)
     p_pools = pl.pool_manifest(_groups([prefill], [], [5], []))
     d_pools = pl.pool_manifest(_groups([decode], [], [5], []))
-    assert pl.layout_fingerprint(p_pools, [prefill], getter) == pl.layout_fingerprint(
-        d_pools, [decode], getter
-    )
+    assert pl.layout_fingerprint(
+        p_pools, [prefill], getter, ships_pd_hidden=False
+    ) == pl.layout_fingerprint(d_pools, [decode], getter, ships_pd_hidden=False)
 
 
 def test_unsupported_or_mixed_kv_layouts_are_rejected():

@@ -3,6 +3,8 @@
 import unittest
 from types import SimpleNamespace
 
+import numpy as np
+
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import get_context
@@ -37,6 +39,18 @@ class TestGenerateRequestValidation(CustomTestCase):
     def test_accepts_input_ids_at_vocab_boundaries(self):
         self._validate(GenerateReqInput(input_ids=[0, _VOCAB_SIZE - 1]))
 
+    def test_accepts_integral_input_ids(self):
+        class IntSubclass(int):
+            pass
+
+        for integral_type in (IntSubclass, np.int32, np.int64, np.uint64):
+            with self.subTest(integral_type=integral_type):
+                self.manager._validate_input_ids_in_vocab(
+                    GenerateReqInput(
+                        input_ids=[integral_type(0), integral_type(_VOCAB_SIZE - 1)]
+                    )
+                )
+
     def test_rejects_out_of_vocab_input_ids(self):
         for input_ids, bad_id in (
             ([1000000000, -5], -5),
@@ -54,9 +68,24 @@ class TestGenerateRequestValidation(CustomTestCase):
     def test_rejects_non_integer_input_ids(self):
         # A non-integer between integer extremes must not slip past a
         # min/max-only check.
-        for input_ids in ([1, "2"], [1, 2.5, 3], [1, None], [1, True, 3]):
+        for input_ids in (
+            [1, "2"],
+            [1, 2.5, 3],
+            [1, None],
+            [1, True, 3],
+            [False, 1],
+            [1, 2.0],
+            [1, np.float64(2.0)],
+            [1, np.bool_(True)],
+        ):
             with self.subTest(input_ids=input_ids):
                 with self.assertRaisesRegex(ValueError, "input_ids must be integers"):
+                    self._validate(GenerateReqInput(input_ids=input_ids))
+
+    def test_rejects_mixed_invalid_input_ids(self):
+        for input_ids in ([-1, "2"], [_VOCAB_SIZE, True], [1000000000, -5, 2.5]):
+            with self.subTest(input_ids=input_ids):
+                with self.assertRaises(ValueError):
                     self._validate(GenerateReqInput(input_ids=input_ids))
 
     def test_text_prompt_ids_are_not_checked_against_vocab(self):

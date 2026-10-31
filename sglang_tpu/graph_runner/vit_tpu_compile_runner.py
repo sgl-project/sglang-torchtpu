@@ -21,6 +21,7 @@ from sglang.srt.environ import envs
 from sglang.srt.observability.compile_timing import CompileTimingRecorder
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.patches import _register_tpu_compile_backend
 
 logger = logging.getLogger(__name__)
@@ -43,10 +44,10 @@ def precompiled_max_patch_count() -> int:
     """
     if _precompiled_max_patch_count is not None:
         return _precompiled_max_patch_count
-    explicit_sizes = envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.get()
+    explicit_sizes = tpu_envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.get()
     if explicit_sizes:
         return max(int(size) for size in explicit_sizes)
-    return envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.get()
+    return tpu_envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.get()
 
 
 def _compute_patch_counts(
@@ -532,14 +533,14 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
         merge_size = self.vit.spatial_merge_size
         # Set but empty disables precompile: EnvTuple drops empty entries, so the
         # override is (), which validates trivially and warms nothing.
-        if envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.is_set():
+        if tpu_envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.is_set():
             buckets = sorted(
-                {int(x) for x in envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.get()}
+                {int(x) for x in tpu_envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.get()}
             )
             return _validate_patch_buckets(buckets, merge_size)
         return _compute_patch_counts(
             merge_size,
-            max_patches=envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.get(),
+            max_patches=tpu_envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.get(),
         )
 
     def get_compile_model(self) -> torch.nn.Module | None:

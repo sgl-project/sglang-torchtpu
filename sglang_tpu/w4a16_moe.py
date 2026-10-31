@@ -94,11 +94,11 @@ def prepare_tpu_w4a16_moe_weights(layer: torch.nn.Module, group_size: int) -> No
     if getattr(layer, "is_tpu_w4a16_converted", False):
         return
 
-    from sglang.srt.environ import envs
     from sglang.srt.layers.moe.tpu_moe_utils import (
         INT4_MOE_MODE_VMEM_FP8,
         resolve_int4_moe_mode,
     )
+    from sglang_tpu.envs import envs
 
     mode = resolve_int4_moe_mode()
     if mode == INT4_MOE_MODE_VMEM_FP8:
@@ -171,16 +171,6 @@ def apply_tpu_w4a16_moe(
     if apply_router_weight_on_input:
         raise NotImplementedError(
             "apply_router_weight_on_input is not supported on TPU yet."
-        )
-
-    routed_scaling_factor = layer.moe_runner_config.routed_scaling_factor
-    if routed_scaling_factor is not None and routed_scaling_factor != 1.0:
-        # Shares the fused_moe_call combine with the hardware-validated
-        # bf16/fp8 runners, but no rsf != 1 model has run on this stack;
-        # refuse rather than promise an unverified magnitude.
-        raise NotImplementedError(
-            "routed_scaling_factor is not yet applied on the TPU w4a16 path; "
-            "validate against a concrete rsf != 1 model first."
         )
 
     x = dispatch_output.hidden_states

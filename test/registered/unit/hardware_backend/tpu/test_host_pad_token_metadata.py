@@ -11,6 +11,7 @@ from sglang.srt.model_executor import forward_batch_info
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import patches
@@ -22,6 +23,8 @@ from sglang_tpu.compilation.compiled_forward_shim import (
 from sglang_tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
+from sglang_tpu.hooks.host_padding import extend_metadata_device
+from sglang_tpu.host_padding import _can_stage_forward_metadata
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -47,6 +50,40 @@ class TestPaddedSamplingCompileGuards(CustomTestCase):
 
 
 class TestPositionOnHost(CustomTestCase):
+    def test_pp_extend_lengths_stay_on_host_without_staging_other_inputs(self):
+        batch = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            mix_running_indices=None,
+            dllm_config=None,
+            input_tensor_device=None,
+            sampling_info=None,
+            model_config=SimpleNamespace(
+                is_generation=True,
+                use_ngram_embedding=False,
+                use_engram=False,
+                is_encoder_decoder=False,
+            ),
+        )
+
+        def original(batch, device):
+            return device
+
+        with get_context().override_server_args(
+            pp_size=16, enable_torch_compile=True, enable_mixed_chunk=False
+        ):
+            self.assertFalse(_can_stage_forward_metadata(batch))
+            self.assertEqual(extend_metadata_device(original, batch, "meta"), "cpu")
+            positions, starts = forward_batch_info.compute_position_torch(
+                torch.tensor([2, 9], dtype=torch.int32),
+                torch.tensor([3, 2], dtype=torch.int32),
+            )
+            self.assertTrue(torch.equal(positions, torch.tensor([2, 3, 4, 9, 10])))
+            self.assertTrue(
+                torch.equal(starts, torch.tensor([0, 3], dtype=torch.int32))
+            )
+            batch.spec_algorithm = SpeculativeAlgorithm.EAGLE
+            self.assertEqual(extend_metadata_device(original, batch, "meta"), "meta")
+
     def test_compute_position_torch_cpu_staged(self):
         cases = (
             ([7], [3], [7, 8, 9], [0]),
@@ -451,12 +488,14 @@ class TestHostPadFieldSelection(CustomTestCase):
                     lengths = torch.arange(10, 10 + size)
                     deltas = [(-3 if i % 2 == 0 else 0) for i in range(size)]
                     mm_inputs = [
-                        SimpleNamespace(
-                            mrope_positions=None,
-                            mrope_position_delta=torch.tensor(delta),
+                        (
+                            SimpleNamespace(
+                                mrope_positions=None,
+                                mrope_position_delta=torch.tensor(delta),
+                            )
+                            if multimodal and delta
+                            else None
                         )
-                        if multimodal and delta
-                        else None
                         for delta in deltas
                     ]
                     batch = SimpleNamespace(

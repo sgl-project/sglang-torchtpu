@@ -1079,6 +1079,8 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
             inserted_len=req.kv.cache_inserted_len,
+            # A bigram key's last prompt entry already pairs with the first output.
+            output_start=len(req.origin_input_ids) - int(self.tree_core.is_eagle),
             priority=req.priority or 0,
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,

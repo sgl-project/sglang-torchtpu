@@ -13,8 +13,8 @@ import importlib
 import os
 from collections.abc import Sequence
 
-from sglang.srt.environ import envs
 from sglang_tpu._logging import get_logger
+from sglang_tpu.envs import envs
 
 logger = get_logger(__name__)
 
