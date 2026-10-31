@@ -464,6 +464,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             cp_align_size=cp_align_size,
         )
 
+        if is_dp_attention_enabled() and self._dp_extend_group(forward_batch):
+            # Pad extend ranks straight to the bucket the shim picks: padding to
+            # the raw max compiles fresh pad / dummy programs on most steps.
+            global_num_tokens = [
+                self._dp_extend_bucket(count) if count else 0
+                for count in global_num_tokens
+            ]
+
         # TPU DPA gather derives its expected local rows from the DP-global
         # count, so logprob counts must use the same attention-TP alignment.
         if attn_tp_size > 1:
@@ -472,6 +480,23 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 for value in global_num_tokens_for_logprob
             ]
         return global_num_tokens, global_num_tokens_for_logprob
+
+    @staticmethod
+    def _dp_extend_group(forward_batch: ForwardBatch) -> bool:
+        """Whether this DP step pads as an extend (_dp_attn_select_bucket_shape)."""
+        mode = forward_batch.forward_mode
+        if mode.is_target_verify() or mode.is_draft_extend_v2():
+            return False
+        # An idle rank, relabeled DECODE by now, rebuilds itself as an extend
+        # when any peer extends (materialize_dp_idle_extend).
+        return mode.is_extend() or bool(forward_batch.is_extend_in_batch)
+
+    def _dp_extend_bucket(self, num_tokens: int) -> int:
+        assert self.t_bucketer is not None
+        assert self.b_bucketer is not None
+        return self.t_bucketer.next_bucket(
+            max(num_tokens, _extend_batch_cap(self.t_bucketer, self.b_bucketer))
+        )
 
     def __init__(
         self,
