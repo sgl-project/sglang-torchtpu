@@ -138,7 +138,7 @@ class TestUnquantGlobalRouting(CustomTestCase):
             with (
                 self.subTest(sparsecore=sparsecore),
                 patch(
-                    "sglang.srt.layers.quantization.unquant.envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get",
+                    "sglang_tpu.envs.envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get",
                     return_value=sparsecore,
                 ),
             ):
@@ -168,6 +168,7 @@ class TestUnquantGlobalRouting(CustomTestCase):
                                 activation="silu",
                                 gemm1_alpha=None,
                                 gemm1_clamp_limit=None,
+                                routed_scaling_factor=None,
                             )
                         )
                         dispatch = SimpleNamespace(

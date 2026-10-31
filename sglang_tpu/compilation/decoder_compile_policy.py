@@ -977,22 +977,23 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         # (_fit_pp_proxy_rows), so the program takes row views of them; warm
         # with the same views, or each bucket copies its view on first use.
         rows = self.max_padded_tokens()
+        transfer_dtype = getattr(
+            self.model_runner.model,
+            "pp_transfer_dtype",
+            self.model_runner.dtype,
+        )
 
-        def zeros(shape: tuple[int, int]) -> torch.Tensor:
+        def zeros(shape: tuple[int, int], dtype: torch.dtype) -> torch.Tensor:
             buffer = torch.zeros(
                 (rows, shape[1]),
-                dtype=getattr(
-                    self.model_runner.model,
-                    "pp_transfer_dtype",
-                    self.model_runner.dtype,
-                ),
+                dtype=dtype,
                 device=self.model_runner.device,
             )
             return buffer[: shape[0]]
 
         proxy = {
-            "hidden_states": zeros((num_tokens, hidden_size)),
-            "residual": zeros((num_tokens, hidden_size)),
+            "hidden_states": zeros((num_tokens, hidden_size), transfer_dtype),
+            "residual": zeros((num_tokens, hidden_size), transfer_dtype),
         }
         # Serving hands the aux capture slots on with the activations, so
         # trace them too or the graph signature differs from the real one.
@@ -1001,7 +1002,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         if num_aux:
             proxy[AUX_HIDDEN_STATES_PROXY_KEY] = zeros(
-                (num_tokens, hidden_size * num_aux)
+                (num_tokens, hidden_size * num_aux), self.model_runner.dtype
             )
         return {"pp_proxy_tensors": PPProxyTensors(proxy)}
 
@@ -1461,7 +1462,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         # the extend graph the backend has always compiled.
         extend_capture_hidden_mode = (
             CaptureHiddenMode.FULL
-            if envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
+            if tpu_envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
             else CaptureHiddenMode.NULL
         )
         logger.info(
@@ -2525,3 +2526,33 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 # Kimi-K3's multimodal wrapper compiles its language model with the Qwen3-VL
 # policy unchanged.
 KimiK3VLDecoderTpuCompilePolicy = Qwen3VLDecoderTpuCompilePolicy
+
+
+class BailingVLDecoderTpuCompilePolicy(Qwen3VLDecoderTpuCompilePolicy):
+    """Qwen3-VL policy with Bailing's unsupported-config fail-fasts.
+
+    The shared VL policy has no later-stage warmup and no input_ids-only
+    direct-tracer key; refuse those here so the compile never starts,
+    saving the ~19-minute cold compile on misconfigured hosts.
+    """
+
+    def install(self) -> bool:
+        from sglang.srt.runtime_context import get_parallel
+
+        parallel = get_parallel()
+        if parallel.pp_size > 1:
+            raise ValueError(
+                "Bailing/Ling-3's multimodal model does not support "
+                "pipeline parallelism with --enable-torch-compile on TPU "
+                "yet."
+            )
+        if (
+            getattr(self.model_runner.server_args, "tpu_compile_tracer", None)
+            == "direct"
+        ):
+            raise ValueError(
+                "Bailing/Ling-3's multimodal model does not support "
+                "--tpu-compile-tracer direct with --enable-torch-compile "
+                "on TPU yet."
+            )
+        return super().install()

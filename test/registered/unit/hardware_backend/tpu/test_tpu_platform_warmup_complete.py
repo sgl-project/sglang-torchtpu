@@ -6,9 +6,9 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.environ import envs
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.runtime_context import get_context
+from sglang_tpu.envs import envs
 from sglang_tpu.platform import TpuOOTPlatform
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 

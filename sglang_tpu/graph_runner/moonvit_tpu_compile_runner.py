@@ -24,7 +24,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.environ import envs
+from sglang_tpu.envs import envs
 from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
     VisionPaddingContext,
     VisionTpuCompilePolicy,

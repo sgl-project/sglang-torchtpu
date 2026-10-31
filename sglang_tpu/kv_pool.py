@@ -125,6 +125,10 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     HEAD_DIM_ALIGNMENT = 128
     # Whether this layout can store exactly-fitting heads side by side (kv_pack_heads).
     PACKS_HEADS = True
+    # Name of the page's interior arrangement. The torch_tpu host pool folds it
+    # into its HiCache storage key; a subclass that changes the arrangement
+    # must restate it, or pages it writes would be read back by this layout.
+    KV_LAYOUT_NAME = "token-major"
     # HiCache io backends (--hicache-io-backend) that can offload this pool to
     # host; hicache_hook refuses the rest at startup. torch_tpu's host pool
     # stores this 5D row verbatim; TPU DMA backends add themselves through
@@ -133,6 +137,15 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     # the pool's KV state: a pool that keeps quantization scales outside
     # get_fused_kv_buffer must not list it.
     kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu"})
+
+    def kv_layout_tag(self) -> str:
+        """Identity of this pool's page byte layout, for storage keys.
+
+        Names the arrangement plus the two packing factors the page dims do
+        not spell out: heads stored side by side in one row (``kv_pack_heads``)
+        and elements sharing a 32-bit lane (``kv_packing``).
+        """
+        return f"{self.KV_LAYOUT_NAME}-hp{self.kv_pack_heads}-p{self.kv_packing}"
 
     @classmethod
     def kv_bytes_per_token_per_layer(
@@ -385,7 +398,14 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
             self._raiden_backup_obj = None if swa_member else maybe_build_backup(self)
         return self._raiden_backup_obj
 
-    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+    def get_cpu_copy(
+        self,
+        indices,
+        mamba_indices=None,
+        req_pool_index=None,
+        *,
+        allow_raiden_backup: bool = True,
+    ):
         """Copy the KV rows at ``indices`` out to host.
 
         Overrides the base version, which stores K and V in two separate
@@ -394,7 +414,7 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         DMA instead and come back the same way; rows that do not fill their
         pages sequentially use the row path.
         """
-        backup = self._raiden_backup()
+        backup = self._raiden_backup() if allow_raiden_backup else None
         if backup is not None:
             self._synchronize_device()
             handle = backup.try_save(indices)
@@ -509,6 +529,18 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     def get_fused_kv_buffer(self, layer_id: int) -> torch.Tensor:
         return self.kv_buffer[layer_id - self.start_layer]
 
+    # Storage accessors for the attention kernel and Raiden DMA,
+    # enabling subclasses to alter layout (e.g. block-major bundling).
+    def get_fused_kv_operands(
+        self, layer_id: int
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """The kernel's cache operand and, for a bundle layout, its traced layer index."""
+        return self.get_fused_kv_buffer(layer_id), None
+
+    def page_buffers(self) -> list[torch.Tensor]:
+        """Contiguous device tensors with the block axis outermost, for DMA registration."""
+        return list(self.kv_buffer)
+
     def _logical_kv_view(self, layer_id: int) -> torch.Tensor:
         """Return a logical [num_tokens, num_kv_heads*2, head_dim] view.
 
@@ -606,6 +638,7 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
     """
 
     PACKS_HEADS = False
+    KV_LAYOUT_NAME = "seq-along-lane"
 
     # torch_tpu's host pool reads its page shape from get_fused_kv_buffer, so it
     # mirrors this layout too.
@@ -679,9 +712,16 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
             n_blocks * page_size, kv_heads_x2, hd_words * packing
         )
 
-    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+    def get_cpu_copy(
+        self,
+        indices,
+        mamba_indices=None,
+        req_pool_index=None,
+        *,
+        allow_raiden_backup: bool = True,
+    ):
         """Copy selected token lanes to the fused pool's host-row format."""
-        backup = self._raiden_backup()
+        backup = self._raiden_backup() if allow_raiden_backup else None
         if backup is not None:
             self._synchronize_device()
             handle = backup.try_save(indices)
@@ -773,6 +813,177 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
                 )
                 write_pages_torch(part_blocks, pages, dst)
         self._synchronize_device()
+
+
+class TpuBlockMajorMHATokenToKVPool(TpuFusedMHATokenToKVPool):
+    """MHA KV pool consolidating all layers of a page into one contiguous bundle row.
+
+    Storage layout::
+
+        [num_blocks, layer_num, page_size, num_kv_heads_x2 // kv_packing,
+         kv_packing, padded_head_dim]
+
+    All layers of page ``b`` sit contiguously on dim 1 for single-DMA Raiden transfers;
+    ``kv_buffer`` holds strided per-layer slices for queries only.
+    """
+
+    # raiden moves a bundle row by its dim-0 block id; torch_tpu's host pool
+    # reads the pool layer by layer, which the bundle does not offer.
+    kv_offload_io_backends: frozenset[str] = frozenset({"raiden"})
+
+    def _create_buffers(self):
+        kv_heads_packed = self.num_kv_heads_x2 // self.kv_packing
+        shape = (
+            self.num_blocks,
+            self.layer_num,
+            self.page_size,
+            kv_heads_packed,
+            self.kv_packing,
+            self.padded_head_dim,
+        )
+        logger.info(
+            "Allocating block-major TPU KV bundle: shape=%s, dtype=%s",
+            shape,
+            self.store_dtype,
+        )
+        # The bundle is the kernel's donated operand, so it must be a genuine
+        # ``store_dtype`` base tensor -- see ``_zeros_kv_buffer``.
+        self.kv_bundle = _zeros_kv_buffer(shape, self.store_dtype, self.device)
+        self._rebuild_layer_views()
+        # The kernel's traced layer operand, one entry per layer, so every layer
+        # runs the same compiled program. One tensor, because the compiled
+        # forward donates and copies back every get_state tensor each step.
+        self._layer_idx = torch.arange(
+            self.layer_num, dtype=torch.int32, device=self.device
+        )
+
+    def _rebuild_layer_views(self):
+        self.kv_buffer = [self.kv_bundle[:, i] for i in range(self.layer_num)]
+
+    def get_state(self) -> list[torch.Tensor]:
+        return [self.kv_bundle, self._layer_idx]
+
+    def set_state(self, state: list[torch.Tensor]) -> None:
+        self.kv_bundle, self._layer_idx = state
+        self._rebuild_layer_views()
+
+    def _clear_buffers(self):
+        del self.kv_buffer
+        del self.kv_bundle
+        del self._layer_idx
+
+    def get_fused_kv_operands(
+        self, layer_id: int
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return self.kv_bundle, self._layer_idx[layer_id - self.start_layer]
+
+    def page_buffers(self) -> list[torch.Tensor]:
+        return [self.kv_bundle]
+
+    def _logical_kv_view(self, layer_id: int) -> torch.Tensor:
+        # Strided layer slice requires a copy to flatten; used for inspection only.
+        buf = self.kv_bundle[:, layer_id - self.start_layer]
+        n_blocks, page_size, packed, packing, hd = buf.shape
+        return buf.reshape(n_blocks * page_size, packed * packing, hd)
+
+    def _flat_token_rows(self, indices: torch.Tensor, layer_id: int) -> torch.Tensor:
+        # Flat row: ((t // page_size) * layer_num + l) * page_size + t % page_size.
+        blocks = indices // self.page_size
+        offsets = indices % self.page_size
+        return (blocks * self.layer_num + layer_id) * self.page_size + offsets
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        backup = self._raiden_backup()
+        if backup is not None:
+            self._synchronize_device()
+            handle = backup.try_save(indices)
+            if handle is not None:
+                return handle
+        indices = indices.to(device=self.kv_bundle.device, dtype=torch.long)
+        self._synchronize_device()
+        flat = self.kv_bundle.view(
+            self.num_blocks * self.layer_num * self.page_size,
+            *self.kv_bundle.shape[3:],
+        )
+        kv_cache_cpu = []
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            rows = self._flat_token_rows(indices, layer_id)
+            kv_cache_cpu.append(
+                [
+                    flat.index_select(0, rows[i : i + chunk_size]).to(
+                        "cpu", non_blocking=True
+                    )
+                    for i in range(0, len(indices), chunk_size)
+                ]
+            )
+        self._synchronize_device()
+        return kv_cache_cpu
+
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        # Regroups into full bundle rows and writes directly to kv_bundle via
+        # write_pages_torch; the op donates its destination buffer, so mutating
+        # a view would not update the bundle.
+        from sglang_tpu.kv_page_write import write_pages_torch
+        from sglang_tpu.raiden_kv_backup import RaidenKVBackupHandle
+
+        if isinstance(kv_cache_cpu, RaidenKVBackupHandle):
+            self._synchronize_device()
+            self._raiden_backup().restore(kv_cache_cpu, indices)
+            self._synchronize_device()
+            return
+
+        indices = indices.to(device="cpu", dtype=torch.long)
+        if indices.numel() == 0:
+            return
+        assert len(kv_cache_cpu) == self.layer_num
+        page = self.page_size
+        blocks = indices // page
+        offsets = indices % page
+        uniq_blocks, block_pos = torch.unique(blocks, return_inverse=True)
+        full = torch.bincount(block_pos, minlength=uniq_blocks.numel()) == page
+        full_rows = full[block_pos]
+        full_pos = torch.cumsum(full.long(), 0) - 1
+        part_pos = torch.cumsum((~full).long(), 0) - 1
+        device = self.kv_bundle.device
+        full_blocks = uniq_blocks[full].to(device)
+        part_blocks = uniq_blocks[~full].to(device)
+        full_page_pos = full_pos[block_pos][full_rows]
+        full_offsets = offsets[full_rows]
+        part_page_pos = part_pos[block_pos][~full_rows].to(device)
+        part_offsets = offsets[~full_rows].to(device)
+        rows = [torch.cat(chunks, dim=0) for chunks in kv_cache_cpu]
+        assert all(r.shape[0] == indices.numel() for r in rows)
+
+        self._synchronize_device()
+        if full_blocks.numel():
+            pages = torch.empty(
+                (full_blocks.numel(), *self.kv_bundle.shape[1:]),
+                dtype=self.kv_bundle.dtype,
+            )
+            for layer_id, layer_rows in enumerate(rows):
+                pages[full_page_pos, layer_id, full_offsets] = layer_rows[full_rows]
+            write_pages_torch(
+                full_blocks, pages.to(device, non_blocking=True), self.kv_bundle
+            )
+        if part_blocks.numel():
+            pages = self.kv_bundle[part_blocks]
+            for layer_id, layer_rows in enumerate(rows):
+                pages[part_page_pos, layer_id, part_offsets] = layer_rows[
+                    ~full_rows
+                ].to(device, non_blocking=True)
+            write_pages_torch(part_blocks, pages, self.kv_bundle)
+        self._synchronize_device()
+
+    def get_contiguous_buf_infos(self):
+        # One item = one block's bundle row, every layer included.
+        return (
+            [self.kv_bundle.data_ptr()],
+            [self.kv_bundle.nbytes],
+            [self.kv_bundle[0].nbytes],
+        )
 
 
 class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
@@ -1044,9 +1255,11 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
     Each layer that runs its own DSA indexer also gets an index-key buffer. It
     uses the same page table. A layer that reuses the previous layer's top-k
     result has no index-key buffer. With a pooled indexer (``index_kpool > 1``,
-    GLM-5.3-Flash) the index-key buffer holds one record per pool, at the pool's
-    position, and a raw buffer keeps each token's bf16 index key and
-    compression gate, ``[num_pages, page_size, 2 * index_head_dim]``.
+    GLM-5.3-Flash) the index-key buffer holds one record per pool, in the page of
+    the pool's tokens (``page_size // index_kpool`` records per page), so a
+    request never writes a page another request shares through the radix tree.
+    A raw buffer keeps each token's bf16 index key and compression gate,
+    ``[num_pages, page_size, 2 * index_head_dim]``.
 
     Only the ops write these buffers, and they update them in place. That is
     why the accessors of the flat MLA pool, which address tokens by index, are
@@ -1118,10 +1331,10 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
                 f"size ({self.size}) must be divisible by page_size "
                 f"({self.page_size}) for the TPU split MLA pool."
             )
-        if self.page_size % self.TOKENS_PER_ROW != 0:
+        if self.page_size % (self.TOKENS_PER_ROW * index_kpool) != 0:
             raise ValueError(
                 f"page_size ({self.page_size}) must be divisible by "
-                f"{self.TOKENS_PER_ROW} for the TPU split MLA pool."
+                f"{self.TOKENS_PER_ROW * index_kpool} for the TPU split MLA pool."
             )
         # Allocate one extra page. Token index 0 is the slot used for padded
         # tokens, and the TPU allocator hands out page IDs starting at 1, so
@@ -1136,7 +1349,7 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         cls, *, index_head_dim: int, index_key_layers: list[bool], index_kpool: int
     ) -> int:
         """Bytes one token takes across all layers' buffers, as allocated."""
-        index_bytes = cls.index_key_record_bytes(index_head_dim)
+        index_bytes = cls.index_key_record_bytes(index_head_dim) // index_kpool
         if index_kpool > 1:
             index_bytes += 2 * index_head_dim * torch.bfloat16.itemsize
         layer_bytes = cls.NOPE_BYTES + cls.LANE_BYTES
@@ -1171,7 +1384,7 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         )
         index_key_shape = (
             self.num_pages,
-            rows_per_page,
+            rows_per_page // self._index_kpool,
             self.TOKENS_PER_ROW,
             self.index_key_record_bytes(self._index_head_dim),
         )
@@ -1287,7 +1500,7 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
 
 
 # raiden copies whole pages by their dim-0 block id, so it serves any
-# block-major pool exposing get_fused_kv_buffer.
+# page-major pool exposing page_buffers.
 register_hicache_io_backend_pools(
     "raiden", TpuFusedMHATokenToKVPool, TpuSeqAlongLaneKVPool
 )

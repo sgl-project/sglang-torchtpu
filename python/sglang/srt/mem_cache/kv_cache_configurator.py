@@ -1513,13 +1513,6 @@ class KVCacheConfigurator:
 
             pool_cls = DSV4NPUTokenToKVPool
             kv_layout_kwargs = {}
-        elif current_platform.is_tpu():
-            from sglang_tpu.dsv4.dsv4_memory_pool import (
-                DSV4TPUTokenToKVPool,
-            )
-
-            pool_cls = DSV4TPUTokenToKVPool
-            kv_layout_kwargs = {}
         else:
             pool_cls = DeepSeekV4TokenToKVPool
             kv_layout, compressed_kv_layout = select_dsv4_kv_layout()
@@ -1565,9 +1558,7 @@ class KVCacheConfigurator:
             **({"is_draft_worker": self.is_draft_worker} if not _is_npu else {}),
             **kv_layout_kwargs,
         )
-        if not self.is_draft_worker and (
-            token_to_kv_pool._unified_kv or current_platform.is_tpu()
-        ):
+        if not self.is_draft_worker and token_to_kv_pool._unified_kv:
             # The draft pool has no C4 layers and shares this req pool, so only
             # the target registers the per-slot C4 reset.
             req_to_token_pool.register_on_alloc_rows(

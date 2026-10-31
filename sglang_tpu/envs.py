@@ -8,7 +8,16 @@ core readers move; never declare one name in both registries.
 
 from __future__ import annotations
 
-from sglang.srt.environ import EnvBool, EnvField, EnvFloat, EnvInt, EnvStr, EnvTuple
+from sglang.srt.environ import (
+    EnvBool,
+    EnvBoolWithAlias,
+    EnvField,
+    EnvFloat,
+    EnvFloatWithAlias,
+    EnvInt,
+    EnvStr,
+    EnvTuple,
+)
 
 __all__ = ["TpuEnvs", "envs"]
 
@@ -131,6 +140,10 @@ class TpuEnvs:
     # TpuBlockSpecWorker's candidate acceptance by block verification (Sun et al.
     # 2024, Algorithm 2) instead of token-wise rejection; lossless either way.
     SGLANG_TPU_SPEC_BLOCK_VERIFICATION = EnvBool(False)
+    # PD on the experimental spec worker: the prefill ships the target's draft-input
+    # hidden states (pd_hidden_pool.py) and the decode builds the draft KV and carry,
+    # instead of the prefill running the draft over the prompt.
+    SGLANG_TPU_PD_DECODE_DRAFT_PREFILL = EnvBool(False)
     # DFLASH draft linears, including the DFlash2 conv kernel projections, as fp8
     # weight-only (fp8_weight_linear.py) for decode-sized calls; prefill-sized calls
     # keep the bf16 weights. Changes the draft's proposals, not verification.
@@ -142,18 +155,177 @@ class TpuEnvs:
     # Fused KV pool stores a rank's heads side by side in one 128-lane row when they
     # fit exactly (e.g. 2 x head_dim 64): half the bytes of a zero-padded row per head.
     SGLANG_TPU_KV_PACK_HEADS = EnvBool(False)
+    # Allocates RPA v3 MHA KV as [num_blocks, layer_num, page_size, ...],
+    # so all layers for a page form one row for single-DMA Raiden P/D transfers.
+    # Both P/D servers must agree; tpu_platform refuses the configurations that
+    # read layer by layer.
+    SGLANG_TPU_USE_BLOCK_MAJOR_KV = EnvBool(False)
 
-    # PD disaggregation (raiden)
+    # Raiden PD disaggregation
+    # Base control port. Each local rank reserves consecutive control/data
+    # ports for full KV, SWA KV, and recurrent state.
+    SGLANG_RAIDEN_KV_PORT = EnvInt(31000)
     # TCP connections per rank pair for raiden KV reads and resharding pushes,
     # not the pipeline path. Set the same value on prefill and decode. More can
     # raise throughput but opens more connections, and above 4 is unlikely to
     # help much. Benchmark first; in a large prefill-decode mesh, consider 1 or 2.
     SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM = EnvInt(4)
+    # Threads pushing resharded KV off the listener thread.
+    SGLANG_RAIDEN_PUSH_WORKERS = EnvInt(1)
+
+    # Host staging budget per node, split across local ranks and engines.
+    SGLANG_RAIDEN_HOST_POOL_GB = EnvFloat(128.0)
+    # Maximum pages per request. 0 derives the limit from the context/window.
+    SGLANG_RAIDEN_MAX_BLOCKS = EnvInt(0)
+    SGLANG_RAIDEN_SWA_MAX_BLOCKS = EnvInt(0)
+    # Context length fallback when --context-length is unset.
+    SGLANG_RAIDEN_MAX_MODEL_LEN = EnvInt(8192)
+    # Pinned-host budget for retraction backup. 0 keeps the row-copy path.
+    SGLANG_RAIDEN_RETRACT_HOST_GB = EnvFloat(0.0)
+
+    # Raiden: a DP or TP decode receives KV from a pipeline-parallel prefill.
+    SGLANG_RAIDEN_PIPELINE_TRANSFER = EnvBool(False)
+    # Raiden: stage each transfer (and reshard plan) in its own host-pool pages
+    # instead of fixed max-length slots; asymmetric attention TP needs it.
+    SGLANG_RAIDEN_DYNAMIC_HOST_STAGING = EnvBoolWithAlias(
+        True, deprecated_name="TPU_RAIDEN_DYNAMIC_HOST_STAGING"
+    )
+    # Raiden: a decode starts a room's next read as soon as the prefill
+    # announces it; 0 starts reads only on the next scheduler poll.
+    SGLANG_RAIDEN_LISTENER_START_READ = EnvBool(True)
+    # Raiden: deadline of each KV chunk transfer, not of the whole request; the
+    # closing read counts as a chunk, and a non-chunked transfer is one chunk.
+    # Counted from registration on the prefill and from start_read on the
+    # decode. Set the same on both.
+    SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S = EnvFloatWithAlias(
+        60.0, deprecated_name="SGLANG_RAIDEN_TIMEOUT_S"
+    )
+    # Pipeline prefill: move pages final before the prefill ends (cached prefix,
+    # finished chunks) as early transfers of at least PART_PAGES pages each.
+    SGLANG_RAIDEN_PIPELINE_EARLY_PARTS = EnvBool(False)
+    SGLANG_RAIDEN_PIPELINE_PART_PAGES = EnvInt(16)
+    # Pipeline prefill: each group of STAGE_GROUP consecutive stages moves its
+    # layers once its forwards of the final chunk complete, before sampling.
+    SGLANG_RAIDEN_PIPELINE_STAGE_PARTS = EnvBool(False)
+    SGLANG_RAIDEN_PIPELINE_STAGE_GROUP = EnvInt(1)
+    # Decode: threads coordinating pipeline transfers, one client each.
+    SGLANG_RAIDEN_PIPELINE_COORD_WORKERS = EnvInt(1)
+    # Pipeline prefill: each stage registers its share of the closing transfer
+    # at the final chunk's launch, the last stage once its tokens are copied.
+    SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE = EnvBool(False)
+
+    # raiden KV-offload backend
+    # Seconds a raiden DMA may stay pending, from each blocking wait or, when
+    # polled, from issue. Past it the scheduler exits with TimeoutError, so keep
+    # it far above a healthy transfer.
+    SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S = EnvFloat(60.0)
 
     # HiCache write_back on raiden (see hicache_write_back_copy_ahead.py): tokens
     # of the next eviction victims kept copied to host. Unset: four chunked-prefill
     # chunks. 0: evictions back up their victims synchronously, as upstream does.
     SGLANG_TPU_HICACHE_WRITE_BACK_COPY_AHEAD_TOKENS = EnvInt(None)
+
+    # TPU PD KV transfer (disaggregation/tpu/conn.py)
+    # Transfers between logged latency summaries; 0 disables.
+    SGLANG_DEBUG_TPU_KV_STATS_EVERY = EnvInt(100)
+    # Issue the prefill D2H asynchronously; 0 keeps the synchronous batched D2H.
+    SGLANG_TPU_KV_ASYNC = EnvBool(True)
+    # Parallel PUSH streams per transfer on each TP rank; values below 1 mean 1.
+    SGLANG_TPU_KV_CHANNELS = EnvInt(2)
+
+    # Multi-host node normalization (node_normalization.py)
+    # Discovery store port; unset uses the --dist-init-addr port plus one.
+    SGLANG_TPU_TOPOLOGY_BOOTSTRAP_PORT = EnvInt(None)
+
+    # Pipeline-parallel prefill chunking
+    SGLANG_TPU_PP_DYNAMIC_CHUNKS = EnvBool(True)
+    SGLANG_TPU_PP_CHUNK_SLACK = EnvFloat(0.1)
+
+    # PD disaggregation tracing
+    SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_ENABLE_PERFETTO_TRACING"
+    )
+
+    # Compilation, kernels, sampling and profiling
+    SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
+    # Also attribute eager compiles to sglang source lines. ~9 us per eager op.
+    SGLANG_TPU_CHECK_RECOMPILATION_SITES = EnvBool(False)
+    SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
+    # Serve input (prompt) logprobs on the compiled backend. Opt-in because it
+    # is not free for anyone else: the compiled extend must return every prefill
+    # row (CaptureHiddenMode.FULL), and capture_hidden_mode is part of the
+    # graph's guard, so the mode is a property of the warmed variant rather than
+    # of the request. Off keeps the extend graph and the serving path exactly as
+    # they are today, and a request asking for prompt logprobs is rejected.
+    SGLANG_TPU_ENABLE_PROMPT_LOGPROB = EnvBool(False)
+    # Preserve FP32 expert scales and apply GMM partial scales in FP32.
+    SGLANG_TPU_FP8_MOE_FP32_SCALES = EnvBool(False)
+    # Store INT4 MoE group scales as f32 instead of bf16 (66 MB per layer per
+    # device on Kimi-K2.6). vmem-fp8 always uses f32.
+    SGLANG_TPU_INT4_MOE_FP32_SCALES = EnvBool(False)
+    SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
+    SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
+    SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
+    # Reuse uploaded attention metadata across forwards; applies to all TPU batches.
+    SGLANG_TPU_ENABLE_ATTN_METADATA_CACHE = EnvBool(True)
+    # Read extend query lengths from a complete host mirror instead of the device.
+    SGLANG_TPU_ENABLE_HOST_QUERY_LENS = EnvBool(True)
+    # Opt-in runtime KV-tile promotion for compatible prefill backends.
+    # Backends snapshot this flag at initialization; tile hints are tensor inputs.
+    SGLANG_TPU_WORKLOAD_AWARE_KV_TILES = EnvBool(False)
+    SGLANG_TPU_EAGER_MODE = EnvStr("DEFER_NEVER")
+    # Physical TPU v7 TP8 measurements favor distributed TopK from batch 64.
+    # Deployments can override this cutoff after measuring their topology.
+    SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE = EnvInt(64)
+    # Filter top-k/top-p/min-p with the sort-free binary-search cutoff instead
+    # of the full-vocabulary torch sort. Disable to A/B the sampled
+    # distribution against the reference path.
+    SGLANG_TPU_ENABLE_BSEARCH_SAMPLING = EnvBool(True)
+    # Vision-encoder precompile ladder. Unset uses the computed square-grid
+    # ladder; set-but-empty disables precompile entirely.
+    SGLANG_TPU_VIT_PRECOMPILE_SIZES = EnvTuple(tuple())
+    SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES = EnvInt(4900)
+    # Override the computed ladder's rung count, trading compiles against
+    # padding waste. Unset leaves each encoder on the count it picked.
+    SGLANG_TPU_VIT_NUM_PRECOMPILE_BUCKETS = EnvInt(None)
+    # MoE: offload the gather in permute and unpermute to SparseCore.
+    SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)
+    # MoE: gather on the TensorCore below this many routed rows (tokens x topk);
+    # 0 = SparseCore always. Measured crossover is 1024 (Kimi, R1, Qwen3-480B).
+    SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS = EnvInt(0)
+    # MoE: use onehot dense matmul for small permute and unpermute/combine
+    # paths instead of gather. When set to 0, this is disabled. When set
+    # to a positive integer, this is the threshold for tokens per rank below
+    # which the dense matmul path is taken. Suggset to start with 1024 or 2048
+    # and tune from there. Below it, batches of up to 2048 routed rows also
+    # take the sort-free dense rank route, and one-token batches the
+    # route-meta kernel.
+    SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD = EnvInt(0)
+    # Turn off EP-local expert reads (models that opt in read only their EP
+    # rank's routed experts with --weight-loader-disable-mmap).
+    SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS = EnvBool(False)
+    # xprof scope per task. Values <= 0 trace all chips or SparseCores.
+    SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
+    SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)
+    # xprof python tracer. Off by default: it dominates host busy time.
+    SGLANG_TPU_PROFILE_PYTHON_TRACER = EnvBool(False)
+    # Read the RPA KV cache in the SEQ_ALONG_LANE layout (token index on the
+    # lane axis) instead of the token-major fused one. num_kv_heads*2 is
+    # unpadded there, so at one KV head per rank and fp8 KV it is 256 bytes per
+    # token against 512, which is what lets long context and large batches fit.
+    # Opt-in: it changes the KV pool's buffer shape.
+    SGLANG_TPU_USE_SEQ_ALONG_LANE_KV = EnvBool(False)
+    # Pin the RPA prefill/MIXED k-block instead of deriving it from the VMEM
+    # budget. Escape hatch for a shape or a chip where that derivation is
+    # wrong: too large and the kernel fails to allocate at startup, too small
+    # and the step runs more blocks than it needs. Rounded up to a page
+    # multiple. Unset (None) means the wrapper's own search decides.
+    SGLANG_TPU_FORCE_RPA_PREFILL_BKV = EnvInt(None)
+    # Hack to workaround libtpu bug in 0.0.46 and 0.0.47 causing performance
+    # regression in fused MoE with reduce scatter.
+    # TODO: Remove once the issue gets resolved in libtpu version > 0.0.47
+    # (likely 0.0.48).
+    SGLANG_TPU_LIBTPU_WORKAROUND_FOR_ONLINE_QUANT_SCALE = EnvBool(True)
 
     @classmethod
     def names(cls) -> list[str]:

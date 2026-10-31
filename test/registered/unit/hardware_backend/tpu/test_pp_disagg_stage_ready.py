@@ -6,6 +6,7 @@ the pages it exposed out of the radix cache."""
 
 import sys
 from collections import deque
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -210,6 +211,7 @@ def test_prefill_loop_reports_launches_and_the_tokens_its_send_copied():
 
     kv_manager = Mock()
     scheduler = SchedulerPPMixin()
+    scheduler.pp_comm_stream_ctx = nullcontext()
     scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(kv_manager=kv_manager)
     batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND, reqs=[])
     scheduler._pp_pd_stage_ready(1, batch, "result")

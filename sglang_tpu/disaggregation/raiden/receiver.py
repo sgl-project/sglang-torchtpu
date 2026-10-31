@@ -66,6 +66,29 @@ class RaidenReceiverMixin:
         if room in self._decode.local_blocks:
             self._decode.last_announced_at[room] = now
 
+    def _refuse_layout_locked(self, room: int, remote_layout: str) -> bool:
+        """Fails ``room`` when the prefill registered KV in another layout.
+
+        Its rows differ in size from this decode's, so every read of the room
+        would fail in raiden; the room fails here instead, with the reason.
+        """
+        if remote_layout == self.kv_layout:
+            return False
+        if room not in self.request_status:
+            return True  # cleared already; the frame is stale
+        reason = (
+            f"Raiden P/D peers disagree on the KV layout: the prefill registers "
+            f"{remote_layout} KV and this decode {self.kv_layout} KV; set "
+            "SGLANG_TPU_USE_BLOCK_MAJOR_KV the same on prefill and decode"
+        )
+        logger.error(
+            "RaidenKVManager rank%d room %s: %s", self.attn_tp_rank, room, reason
+        )
+        self._mark_aborted_locked(room)
+        self._fail_room_locked(room, reason, preserve_reason=True)
+        self.update_status(room, KVPoll.Failed)
+        return True
+
     def _on_chunk(self, msg: List[bytes]) -> None:
         req = Chunk.from_frames(msg)
         room = req.room
@@ -81,6 +104,8 @@ class RaidenReceiverMixin:
                 or room in self._decode.final_seen
                 or req_id in self._decode.announced_at
             ):
+                return
+            if self._refuse_layout_locked(room, req.kv_layout):
                 return
             self._record_announcement_locked(room, req_id)
             self._decode.remote_total[room] = total_pages
@@ -113,6 +138,8 @@ class RaidenReceiverMixin:
         aux_index = None
         with self._state_lock:
             if room in self._aborted or room in self._decode.final_seen:
+                return
+            if self._refuse_layout_locked(room, req.kv_layout):
                 return
             self._decode.remote_blocks[room] = remote_blocks
             self._decode.remote_endpoint[room] = endpoint

@@ -77,26 +77,35 @@ def has_triton() -> bool:
     return platform_key() in _CUDA_LIKE
 
 
+class _LazyFallback:
+    """A fallback named without importing its module until it is resolved."""
+
+    def __init__(self, kind: str, name: str) -> None:
+        self.kind = kind
+        self.name = name
+        self.__name__ = name
+        self.__qualname__ = f"{kind}_fallback.{name}"
+
+    def resolve(self) -> Callable:
+        from importlib import import_module
+
+        return getattr(
+            import_module(f"sglang.kernels.ops.diffusion.common.fallback_{self.kind}"),
+            self.name,
+        )
+
+    def __call__(self, *args, **kwargs):
+        return self.resolve()(*args, **kwargs)
+
+
 def lazy_fallback(kind: str, name: str) -> Callable:
     """Name a fallback without importing its module.
 
     ``select_impl`` is handed every candidate at once, so a plain import here
-    would pull in *all* fallback modules on every platform.  The returned shim
-    imports ``common.fallback_<kind>`` on its
-    first call instead, which for the unselected candidates never happens.
+    would pull in *all* fallback modules on every platform. Only the selected
+    candidate imports ``common.fallback_<kind>``.
     """
-
-    def _call(*args, **kwargs):
-        from importlib import import_module
-
-        impl = getattr(
-            import_module(f"sglang.kernels.ops.diffusion.common.fallback_{kind}"), name
-        )
-        return impl(*args, **kwargs)
-
-    _call.__name__ = name
-    _call.__qualname__ = f"{kind}_fallback.{name}"
-    return _call
+    return _LazyFallback(kind, name)
 
 
 def select_impl(triton_impl: F, **fallbacks: F) -> F:
@@ -110,4 +119,15 @@ def select_impl(triton_impl: F, **fallbacks: F) -> F:
     and can later be replaced wholesale by a ``BaseFusedOp`` dispatch without
     touching call sites.
     """
-    return fallbacks.get(platform_key(), triton_impl)
+    impl = fallbacks.get(platform_key(), triton_impl)
+    # Resolve now: an import inside a torch.compile'd forward breaks the graph.
+    if isinstance(impl, _LazyFallback):
+        return impl.resolve()
+    # debug_kernel_api(lazy_fallback(...)): wrap the resolved function instead,
+    # so the wrapper does not import on every call.
+    inner = getattr(impl, "__wrapped__", None)
+    if isinstance(inner, _LazyFallback):
+        from sglang.kernels.kernel_api_logging import debug_kernel_api
+
+        return debug_kernel_api(inner.resolve())
+    return impl

@@ -59,9 +59,7 @@ def _make_dsv4_tpu_pool(
 ) -> DSV4TPUTokenToKVPool:
     from sglang.srt.runtime_context import get_context
 
-    override = get_context().override_server_args(
-        dsv4_attn_backend="tpu_dsv4", page_size=256
-    )
+    override = get_context().override_server_args(page_size=256)
     override.install()
     testcase.addCleanup(override.restore)
 
@@ -313,9 +311,7 @@ class TestDSV4TPUMemoryPool(CustomTestCase):
         """
         from sglang.srt.runtime_context import get_context
 
-        override = get_context().override_server_args(
-            dsv4_attn_backend="tpu_dsv4", page_size=256
-        )
+        override = get_context().override_server_args(page_size=256)
         override.install()
         self.addCleanup(override.restore)
 
@@ -543,6 +539,267 @@ class TestDSV4TPUPatches(CustomTestCase):
             self.assertEqual(mock_qnorm_rope.call_count, 0)
             self.assertEqual(mock_rope.call_count, 2)  # Both Q and KV use plain rope
             self.assertTrue(torch.equal(q_out, q_no_norm))
+
+    def test_dsv4_tpu_pool_sizing_and_hooks(self):
+        from unittest.mock import MagicMock
+
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+        from sglang_tpu.hooks import HOOKS
+        from sglang_tpu.hooks.dsv4 import (
+            build_tpu_dsv4_kv_pool,
+            get_tpu_dsv4_bytes_per_full_token,
+            get_tpu_dsv4_bytes_per_swa_token,
+            get_tpu_dsv4_c128_state_fixed_bytes,
+            get_tpu_dsv4_fixed_c4_state_bytes,
+            hook_specs,
+        )
+
+        for spec in hook_specs():
+            self.assertIn(spec, HOOKS)
+
+        cfg = object.__new__(DSV4PoolConfigurator)
+        cfg.num_layers_total = 6
+        cfg._unified = False
+        cfg.swa_cap_tokens = None
+        cfg.swa_ratio = 0.1
+        cfg.c4_shrink_factor = 1
+        cfg.stage_owner_layers = {4: [3, 5], 128: [2, 4]}
+        cfg.attn_head_dim = 512
+        cfg.indexer_head_dim = 128
+        cfg.disaggregation_mode = "null"
+        cfg.disaggregation_decode_extra_slots = 0
+
+        swa_bpt = get_tpu_dsv4_bytes_per_swa_token(None, cfg)
+        self.assertEqual(swa_bpt, 1024.0 * 6)
+        cfg.bytes_per_swa_token = swa_bpt
+
+        full_bpt = get_tpu_dsv4_bytes_per_full_token(None, cfg)
+        expected_full_bpt = (
+            0.1 * (1024.0 * 6)
+            + (1.0 / 4) * 640 * 2
+            + (1.0 / 128) * 1024 * 2
+            + (1.0 / 4) * 256 * 2
+        )
+        self.assertAlmostEqual(full_bpt, expected_full_bpt)
+
+        # Verify state fixed byte formulas match actual allocated TPUCompressStatePool bytes
+        pool = _make_dsv4_tpu_pool(self, num_req_slots=5)
+        c128_bytes = get_tpu_dsv4_c128_state_fixed_bytes(None, cfg, 4)
+        actual_c128_bytes = sum(
+            p.get_kv_size_bytes()[0]
+            for p in pool.compress_state_pools
+            if p is not None and p.ratio == 128
+        )
+        self.assertEqual(c128_bytes, actual_c128_bytes)
+
+        c4_bytes = get_tpu_dsv4_fixed_c4_state_bytes(None, cfg, 4)
+        actual_c4_bytes = sum(
+            p.get_kv_size_bytes()[0]
+            for p in pool.compress_state_pools
+            if p is not None and p.ratio == 4
+        ) + sum(
+            p.get_kv_size_bytes()[0]
+            for p in pool.indexer_compress_state_pools
+            if p is not None
+        )
+        self.assertEqual(c4_bytes, actual_c4_bytes)
+
+        # Verify build_tpu_dsv4_kv_pool patches DeepSeekV4TokenToKVPool and registers C4 state reset
+        req_to_token_pool = MagicMock()
+        kvc_stub = SimpleNamespace(is_draft_worker=False)
+
+        def fake_original(kvc_arg, **kw):
+            import sglang.srt.mem_cache.kv_cache_configurator as kvc_mod
+
+            self.assertIs(kvc_mod.DeepSeekV4TokenToKVPool, DSV4TPUTokenToKVPool)
+            return pool
+
+        built = build_tpu_dsv4_kv_pool(
+            fake_original, kvc_stub, req_to_token_pool=req_to_token_pool
+        )
+        self.assertIs(built, pool)
+        req_to_token_pool.register_on_alloc_rows.assert_called_once_with(
+            pool.clear_c4_req_states
+        )
+
+    def test_dsv4_tpu_compressor_and_resolution_hooks(self):
+        from unittest.mock import MagicMock
+
+        from sglang.srt.arg_groups import model_override_base, resolution_hooks
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang_tpu.hooks.dsv4 import (
+            _tpu_deepseek_v4_env_adjustments,
+            _tpu_deepseek_v4_overrides,
+            forward_tpu_dsv4_compressor,
+            register_tpu_dsv4_resolution_hooks,
+            skip_tpu_dsv4_ape_hotfix,
+        )
+
+        # 1. Verify skip_tpu_dsv4_ape_hotfix leaves ape untouched and sets ape_converted
+        ape = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+        ape_orig = ape.clone()
+        comp = SimpleNamespace(ape=ape, ape_converted=False, head_dim=8)
+        skip_tpu_dsv4_ape_hotfix(
+            lambda c: self.fail("original _apply_ape_hotfix should not run"), comp
+        )
+        self.assertTrue(comp.ape_converted)
+        self.assertTrue(torch.equal(comp.ape, ape_orig))
+
+        # 2. Verify forward_tpu_dsv4_compressor handles idle and non-idle forward batches
+        idle_fb = SimpleNamespace(forward_mode=ForwardMode.IDLE)
+        empty_x = torch.empty((0, 16), dtype=torch.bfloat16)
+        out_idle = forward_tpu_dsv4_compressor(None, comp, empty_x, idle_fb)
+        self.assertEqual(tuple(out_idle.shape), (0, 8))
+
+        active_fb = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        x = torch.ones((4, 16), dtype=torch.bfloat16)
+        attn_backend = MagicMock()
+        sentinel = object()
+        attn_backend.forward_compress.return_value = sentinel
+        out_active = forward_tpu_dsv4_compressor(
+            None, comp, x, active_fb, attn_backend=attn_backend
+        )
+        self.assertIs(out_active, sentinel)
+        attn_backend.forward_compress.assert_called_once_with(comp, x, active_fb)
+
+        # 3. Verify idempotent registration and TPU-only behavior of config/env hooks
+        register_tpu_dsv4_resolution_hooks()
+        register_tpu_dsv4_resolution_hooks()
+        fns = model_override_base._MODEL_OVERRIDE_FNS.get("DeepseekV4ForCausalLM", [])
+        self.assertEqual(fns.count(_tpu_deepseek_v4_overrides), 1)
+        res_hooks = resolution_hooks._HOOKS.get("handle_model_specific_adjustments", [])
+        self.assertEqual(res_hooks.count(_tpu_deepseek_v4_env_adjustments), 1)
+
+        hf = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+        self.assertEqual(
+            _tpu_deepseek_v4_overrides(SimpleNamespace(device="cuda"), hf), {}
+        )
+        self.assertEqual(
+            _tpu_deepseek_v4_overrides(SimpleNamespace(device="tpu"), hf),
+            {
+                "prefill_attention_backend": "dsv4",
+                "decode_attention_backend": "dsv4",
+                "disable_shared_experts_fusion": True,
+            },
+        )
+
+        server_args = SimpleNamespace(
+            device="tpu",
+            model_path="/tmp/fake-dsv4",
+            _model_config=SimpleNamespace(hf_config=hf),
+            _model_config_built_from="/tmp/fake-dsv4",
+        )
+        prev_called = []
+        with (
+            envs.SGLANG_OPT_FP8_WO_A_GEMM.override(True),
+            envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(True),
+            envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.override(True),
+            envs.SGLANG_OPT_USE_TILELANG_MHC_POST.override(True),
+            envs.SGLANG_OPT_FUSE_MHC_POST_PRE.override(True),
+            envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.override(True),
+            envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(True),
+            envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.override(False),
+        ):
+            _tpu_deepseek_v4_env_adjustments(
+                server_args, lambda sa: prev_called.append(sa)
+            )
+            self.assertEqual(prev_called, [server_args])
+            self.assertFalse(envs.SGLANG_OPT_FP8_WO_A_GEMM.get())
+            self.assertFalse(envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get())
+            self.assertFalse(envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get())
+            self.assertFalse(envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get())
+            self.assertFalse(envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get())
+            self.assertFalse(envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get())
+            self.assertFalse(envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get())
+            self.assertTrue(envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get())
+
+    def test_dsv4_tpu_moe_mhc_and_model_hooks(self):
+        from unittest.mock import patch
+
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.hash_topk import HashTopK
+        from sglang.srt.layers.moe.mhc_post_fusion import (
+            MhcPostFusion,
+            current_mhc_post_fusion,
+            use_mhc_post_fusion,
+        )
+        from sglang_tpu.hooks.dsv4 import (
+            disable_tpu_dsv4_wo_a_fp8_gemm,
+            forward_tpu_dsv4_hash_topk,
+            forward_tpu_dsv4_hash_topk_torch,
+            get_tpu_dsv4_kernel_num_heads,
+            skip_tpu_dsv4_prewarm_mhc_kernels,
+            tpu_dsv4_current_mhc_post_fusion,
+            tpu_dsv4_silu_and_mul_clamp,
+        )
+
+        # 1. HashTopK hooks: int64 gather, float32 weights, out-of-place padded row mask
+        topk = HashTopK(
+            topk=2,
+            num_experts=8,
+            num_fused_shared_experts=0,
+            vocab_size=16,
+            scoring_func="sqrtsoftplus",
+        )
+        hidden = torch.zeros((4, 8), dtype=torch.bfloat16)
+        logits = torch.randn((4, 8), dtype=torch.bfloat16)
+        input_ids = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+        non_padded = torch.tensor([2], dtype=torch.int32)
+
+        with (
+            envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(True),
+            patch.object(
+                HashTopK,
+                "_forward_torch",
+                lambda self, r, i, _orig=HashTopK._forward_torch: (
+                    forward_tpu_dsv4_hash_topk_torch(_orig, self, r, i)
+                ),
+            ),
+        ):
+            out = forward_tpu_dsv4_hash_topk(
+                HashTopK.forward,
+                topk,
+                hidden,
+                logits,
+                input_ids,
+                num_token_non_padded=non_padded,
+            )
+        self.assertEqual(out.topk_weights.dtype, torch.float32)
+        self.assertEqual(out.topk_ids.dtype, torch.int32)
+        self.assertTrue(torch.all(out.topk_ids[:2] >= 0))
+        self.assertTrue(torch.all(out.topk_ids[2:] == -1))
+        self.assertTrue(torch.all(out.topk_weights[2:] == 0.0))
+
+        # 2. silu_and_mul_clamp hook
+        x_in = torch.tensor([[10.0, -10.0, 20.0, -20.0]], dtype=torch.bfloat16)
+        x_out = torch.empty((1, 2), dtype=torch.bfloat16)
+        tpu_dsv4_silu_and_mul_clamp(None, x_in, x_out, swiglu_limit=7.0)
+        g_ref = torch.tensor([[7.0, -10.0]], dtype=torch.float32)
+        u_ref = torch.tensor([[7.0, -7.0]], dtype=torch.float32)
+        expected = (torch.nn.functional.silu(g_ref) * u_ref).to(torch.bfloat16)
+        torch.testing.assert_close(x_out, expected)
+
+        # 3. current_mhc_post_fusion hook
+        dummy_state = MhcPostFusion(
+            residual=torch.zeros(1), post=None, comb=None, stats_stream=None
+        )
+        with use_mhc_post_fusion(dummy_state):
+            self.assertIs(
+                tpu_dsv4_current_mhc_post_fusion(current_mhc_post_fusion), dummy_state
+            )
+            with patch("torch.compiler.is_compiling", return_value=True):
+                self.assertIsNone(
+                    tpu_dsv4_current_mhc_post_fusion(current_mhc_post_fusion)
+                )
+
+        # 4. deepseek_v4 model hooks
+        self.assertFalse(disable_tpu_dsv4_wo_a_fp8_gemm(None, object()))
+        attn_stub = SimpleNamespace(n_local_heads=16, attn_tp_size=8, n_heads=128)
+        self.assertEqual(get_tpu_dsv4_kernel_num_heads(None, attn_stub, 4), 16)
+        model_stub = SimpleNamespace(_mhc_prewarmed_at_load=False)
+        skip_tpu_dsv4_prewarm_mhc_kernels(None, model_stub)
+        self.assertTrue(model_stub._mhc_prewarmed_at_load)
 
 
 if __name__ == "__main__":

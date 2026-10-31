@@ -22,6 +22,10 @@ from sglang_tpu.hooks.draft_kv_pool import (
     draft_mha_pool_class,
 )
 from sglang_tpu.hooks.dsa_kv_pool import size_tpu_dsa_kv_pool
+from sglang_tpu.hooks.dsv4 import hook_specs as dsv4_hooks
+from sglang_tpu.hooks.dsv4 import (
+    register_tpu_dsv4_resolution_hooks,
+)
 from sglang_tpu.hooks.encoder import (
     bootstrap_encoder_worker,
     encode_indices_within_patch_budget,
@@ -31,6 +35,7 @@ from sglang_tpu.hooks.encoder import (
 from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.glm_flash_megakernel import (
     drop_freed_glm_flash_megakernel_request,
+    flush_glm_flash_megakernel_request,
     route_glm_flash_megakernel,
 )
 from sglang_tpu.hooks.hicache_swa_metrics import hook_specs as hicache_swa_metrics_hooks
@@ -235,6 +240,11 @@ HOOKS: list[tuple] = [
         HookType.BEFORE,
     ),
     (
+        "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.checkpoint",
+        flush_glm_flash_megakernel_request,
+        HookType.BEFORE,
+    ),
+    (
         "sglang.srt.models.glm5_next.Glm5NextDecoderLayer._hc_pre",
         hc_pre,
         HookType.AROUND,
@@ -301,6 +311,8 @@ HOOKS: list[tuple] = [
     ),
 ]
 
+HOOKS.extend(dsv4_hooks())
+
 HOOKS.extend(host_padding_hooks())
 
 HOOKS.extend(hicache_swa_metrics_hooks())
@@ -336,6 +348,7 @@ def register() -> None:
     )
 
     register_muse_spark_processor()
+    register_tpu_dsv4_resolution_hooks()
 
     from sglang.srt.plugins.hook_registry import HookRegistry
 

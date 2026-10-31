@@ -40,6 +40,7 @@ from sglang_tpu.hooks.experimental_spec import (
     initialize_host_batch,
     kimi_spec_defaults,
 )
+from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -164,7 +165,13 @@ class TestExperimentalSpecHooks(CustomTestCase):
         register_host_batch_padder(_pad)
         # Exercise the real registry's descriptor handling and import propagation,
         # then restore every patched binding so this test cannot affect other tests.
-        for target, hook, kind in hook_specs():
+        hooks = hook_specs()
+        hooks.extend(
+            spec
+            for spec in host_padding_hooks()
+            if spec[0].endswith("._extend_metadata_device")
+        )
+        for target, hook, kind in hooks:
             owner_path, name = target.rsplit(".", 1)
             owner = pkgutil.resolve_name(owner_path)
             raw = vars(owner).get(name)
@@ -236,6 +243,46 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertEqual(len(forwarded), 5)
         self.assertIsNone(forwarded.penalizer_orchestrator)
         self.assertEqual(forwarded.on_device().temperatures.shape, (8, 1))
+
+    def test_host_sampling_params_repack_after_filter(self):
+        batch = self.batch([2, 5])
+        info = batch.sampling_info
+        info.top_ks = torch.tensor([8, 16, 1, 1], dtype=torch.int32)
+        info.top_ps = torch.tensor([0.8, 0.9, 1.0, 1.0])
+        info.min_ps = torch.tensor([0.1, 0.2, 0.0, 0.0])
+        info.sampling_seed = torch.tensor([31, 37, 0, 0], dtype=torch.int64)
+        batch.filter_batch(keep_indices=[1])
+        expected = {
+            "temperatures": (0.2, 1.0),
+            "top_ps": (0.9, 1.0),
+            "top_ks": (16, 1),
+            "min_ps": (0.2, 0.0),
+            "sampling_seed": (37, 0),
+        }
+        for rows in (1, 4, 8):
+            with self.subTest(rows=rows):
+                params = info.host_params_at(rows)
+                for name, (live, fill) in expected.items():
+                    value = params[name]
+                    self.assertEqual(value.shape[0], rows)
+                    self.assertEqual(value.dtype, getattr(info, name).dtype)
+                    padded = torch.full_like(value, fill)
+                    padded[0] = live
+                    self.assertTrue(torch.equal(value, padded), name)
+        self.assertEqual(info.top_ks.shape, (4,))
+        self.assertIs(info.host_params_at(4)["top_ks"], info.top_ks)
+
+    def test_host_sampling_params_live_row_boundaries(self):
+        info = self.batch([2]).sampling_info
+        with self.assertRaisesRegex(ValueError, "live batch"):
+            info.host_params_at(0)
+        info.real_batch_size = 0
+        params = info.host_params_at(0)
+        self.assertNotIn("sampling_seed", params)
+        for value in params.values():
+            self.assertEqual(value.shape[0], 0)
+        with self.assertRaisesRegex(ValueError, "live batch"):
+            info.host_params_at(-1)
 
     def test_pd_prefill_without_overlap_filters_core_rows(self):
         """A PP PD prefill filters its chunked extend batch without overlap; FutureMap
@@ -605,6 +652,28 @@ class TestExperimentalSpecHooks(CustomTestCase):
             "device-indices",
         )
         self.assertEqual(seen[1], "device-indices")
+
+    def test_host_relayed_dflash_draft_state_filters_with_host_indices(self):
+        """DFlash's relayed draft state stays on host too; device indices can't index it."""
+        from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+        from sglang_tpu.hooks.experimental_spec import filter_spec_input
+
+        spec_info = DFlashDraftInputV2(
+            topk_p=torch.ones(3, 1),
+            topk_index=torch.zeros(3, 1, dtype=torch.int64),
+            bonus_tokens=torch.arange(3),
+            new_seq_lens=torch.arange(3),
+            hidden_states=torch.zeros(3, 4),
+        )
+        batch = SimpleNamespace(spec_info=spec_info, enable_overlap=False)
+        seen = []
+        filter_spec_input(
+            lambda b, keep, keep_device: seen.append(keep_device),
+            batch,
+            [1, 2],
+            "device-indices",
+        )
+        self.assertEqual(seen[0].tolist(), [1, 2])
 
     def test_pp_stages_before_the_last_get_no_draft(self):
         """Under PP only the last stage hosts the draft; an earlier stage building one
@@ -1404,6 +1473,50 @@ class TestExperimentalSpecHooks(CustomTestCase):
             batch.req_to_token_pool.host_resident = False
             with self.assertRaisesRegex(RuntimeError, "host-resident"):
                 draft.prepare_for_decode(batch)
+
+    def test_block_spec_worker_init_cuda_graphs_skips_decode_warmups_only_on_pp_non_decode(
+        self,
+    ):
+        from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
+
+        all_warmups = ["base", "block", "sampling", "extend", "snapshot"]
+        cases = (
+            (1, "null", all_warmups),
+            (1, "prefill", all_warmups),
+            (1, "decode", all_warmups),
+            (8, "prefill", ["base", "extend", "snapshot"]),
+            (8, "null", ["base", "extend", "snapshot"]),
+            (8, "decode", all_warmups),
+        )
+        for pp_size, mode, expected in cases:
+            with self.subTest(pp_size=pp_size, mode=mode):
+                calls: list[str] = []
+                worker = object.__new__(TpuBlockSpecWorker)
+                worker._sampled_drafts = True
+                worker._warmup_draft_block_inputs = lambda c=calls: c.append("block")
+                worker._warmup_draft_sampling = lambda c=calls: c.append("sampling")
+                worker._warmup_extend_draft_inputs = lambda c=calls: c.append("extend")
+                with (
+                    patch.object(
+                        TpuSpecWorker,
+                        "init_cuda_graphs",
+                        side_effect=lambda c=calls: c.append("base"),
+                    ),
+                    patch(
+                        "sglang_tpu.experimental.speculative.block_spec_worker.get_parallel",
+                        return_value=SimpleNamespace(pp_size=pp_size),
+                    ),
+                    patch(
+                        "sglang_tpu.experimental.speculative.block_spec_worker.get_disagg",
+                        return_value=SimpleNamespace(disaggregation_mode=mode),
+                    ),
+                    patch(
+                        "sglang_tpu.experimental.speculative.block_spec_worker.snapshot_recompilation_baseline",
+                        side_effect=lambda c=calls: c.append("snapshot"),
+                    ),
+                ):
+                    worker.init_cuda_graphs()
+                self.assertEqual(calls, expected)
 
 
 if __name__ == "__main__":

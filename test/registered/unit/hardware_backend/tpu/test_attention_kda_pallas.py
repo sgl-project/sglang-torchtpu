@@ -43,6 +43,7 @@ def _run(lower_bound, conv_weights=None, is_decode=True, **layer_attrs):
     backend._distribution = None
     backend._is_decode = is_decode
     backend._read_offsets, backend._num_spec_tokens, backend._spec_window = None, 0, 1
+    backend._track_indices = backend._track_end = None
     backend._op = Mock(return_value=torch.zeros(_T, _N_V, _D_V))
     out = backend._run(
         layer,

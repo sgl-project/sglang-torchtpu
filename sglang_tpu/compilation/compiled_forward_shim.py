@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
@@ -43,6 +42,7 @@ from sglang_tpu.cp_forward import (
     get_tpu_cp_layout,
     pinned_extend_seq_lens_cpu,
 )
+from sglang_tpu.envs import envs
 
 if TYPE_CHECKING:
     from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy

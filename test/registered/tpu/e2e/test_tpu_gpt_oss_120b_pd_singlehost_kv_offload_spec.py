@@ -104,8 +104,8 @@ CHURN_TOKENS = MAX_TOTAL_TOKENS + 2 * PAGE_SIZE
 GENERATE_TIMEOUT = 600
 
 SPEC_ACCEPT_LENGTH_THRESHOLD = float(E("SPEC_ACCEPT_LENGTH_THRESHOLD", "1.90"))
-# Lower than the non-spec test's 0.80: the chat API with 512 max tokens cuts
-# some reasoning short. Measured 0.80 to 0.83 on tpu7x with this recipe.
+# The chat API with 512 max tokens cuts some reasoning short.
+# Measured 0.80 to 0.83 on tpu7x with this recipe.
 GSM8K_BASELINE = float(E("GSM8K_THRESHOLD_GPT_OSS_120B_SPEC", "0.70"))
 NUM_EXAMPLES = int(E("GSM8K_NUM_EXAMPLES", "200"))
 NUM_THREADS = int(E("GSM8K_NUM_THREADS", "16"))

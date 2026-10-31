@@ -9,8 +9,9 @@ tokens (upstream ``IndexerKPool``, CUDA only). Per indexer layer and forward:
 2. Every token that closes a pool (``pos % kpool == kpool - 1``) compresses it:
    per channel, a softmax over the pool's slots of ``gate + ape`` weights the
    raw keys; the sum is rounded to bf16, Hadamard-rotated in f32 and quantized
-   to FP8 with a power-of-two scale. Pool ``p`` is stored at position
-   ``p`` of the request in the pooled cache (the GLM-5.2 index-key layout).
+   to FP8 with a power-of-two scale. Pool ``p`` is stored in the page of its
+   own tokens, record ``p % (page_size // kpool)``, so a request never writes
+   a page it shares with another request through the radix tree.
 3. Each query scores the closed pools before it,
    ``sum over heads of w_h * relu(q_h . k_pool) * scale``, keeps the top
    ``topk // kpool`` pools (all of them when there are no more), expands each
@@ -44,9 +45,9 @@ _LANE_BYTES = 128
 _TOKENS_PER_ROW = 4
 # Upstream act_quant / the kpool writer floor the absolute max before scaling.
 _AMAX_FLOOR = 1e-4
-# StreamIndex block sizes for its (decode, prefill, mixed) passes, as in
-# dsa_index_topk; not tuned for GLM.
-_NUM_KV_PAGES_PER_BLOCK = (2, 2, 2)
+# Pools per StreamIndex KV block for its (decode, prefill, mixed) passes;
+# not tuned for GLM.
+_NUM_POOLS_PER_BLOCK = 256
 _NUM_QUERIES_PER_BLOCK = (1, 128, 128)
 # Query rows per scoring chunk: the kernel's score buffer is rows x positions.
 _CHUNK_TOKENS = 2048
@@ -177,7 +178,7 @@ def kpool_indexer_step(
     num_seqs = kv_lens.shape[0]
     expected = (
         num_pages,
-        page_size // _TOKENS_PER_ROW,
+        page_size // kpool // _TOKENS_PER_ROW,
         _TOKENS_PER_ROW,
         pooled_record_bytes(d),
     )
@@ -186,8 +187,10 @@ def kpool_indexer_step(
             f"pooled cache has shape {pooled_cache.shape}; the index-key layout "
             f"is {expected}"
         )
-    if topk % kpool != 0 or page_size % kpool != 0:
-        raise ValueError("topk and page_size must be multiples of kpool")
+    if topk % kpool != 0 or page_size % (kpool * _TOKENS_PER_ROW) != 0:
+        raise ValueError(
+            f"topk must be a multiple of kpool and page_size of {kpool * _TOKENS_PER_ROW}"
+        )
 
     req, pos, valid = _token_rows(kv_lens, cu_q_lens, distribution, num_tokens)
     loc = dict(
@@ -246,22 +249,25 @@ def kpool_indexer_step(
         rows = raw_cache[jnp.minimum(m_page, num_pages - 1), m_slot]  # [T, kpool, 2d]
         pooled = compress_pools(rows[..., :d], rows[..., d:], ape)
         records = _pool_records(pooled, record_bytes)
-        pool_id = pos // kpool
-        p_page, p_slot = _page_slot(req, pool_id, valid=closing, **loc)
+        p_page, p_slot = _page_slot(req, jnp.maximum(first, 0), valid=closing, **loc)
+        record = p_slot // kpool
         pooled_cache = pooled_cache.at[
-            p_page, p_slot // tokens_per_row, p_slot % tokens_per_row
+            p_page, record // tokens_per_row, record % tokens_per_row
         ].set(records, mode="drop")
 
     # 3. Score each query against its request's closed pools and keep the best
-    # topk // kpool. Pool p sits at position p of its request, so the kernel
-    # needs only the first 1/kpool of each request's page table.
-    # Round to whole kernel blocks so no block reads past a request's row.
+    # topk // kpool. The pooled cache is paged like the raw cache with
+    # page_size // kpool pools per page, so the kernel reads the request's own
+    # page table. Pad each row to whole kernel blocks so no block reads past it;
+    # page 0 is never a real page and kv_lens masks the padding.
     pages_per_seq = page_indices.shape[0] // num_seqs
-    block_pages = max(_NUM_KV_PAGES_PER_BLOCK)
-    pool_pages = min(_align(-(-pages_per_seq // kpool), block_pages), pages_per_seq)
-    pool_page_indices = page_indices.reshape(num_seqs, pages_per_seq)[
-        :, :pool_pages
-    ].reshape(-1)
+    pool_page_size = page_size // kpool
+    block_pages = max(1, _NUM_POOLS_PER_BLOCK // pool_page_size)
+    pool_pages = _align(pages_per_seq, block_pages)
+    pool_page_indices = jnp.pad(
+        page_indices.reshape(num_seqs, pages_per_seq),
+        ((0, 0), (0, pool_pages - pages_per_seq)),
+    ).reshape(-1)
     # Upstream rotates the bf16 query (rotate_activation) before quantizing.
     query = hadamard_rotate(query).astype(jnp.bfloat16)
     q_fp8, q_scale, _ = quantize_ue8m0(query)
@@ -270,7 +276,7 @@ def kpool_indexer_step(
     chunked = (
         num_tokens > _CHUNK_TOKENS
         and num_tokens % _CHUNK_TOKENS == 0
-        and num_tokens * pool_pages * page_size * 4 > _MAX_UNCHUNKED_SCORE_BYTES
+        and num_tokens * pool_pages * pool_page_size * 4 > _MAX_UNCHUNKED_SCORE_BYTES
     )
     # causal_offset = kpool - 1: a query at pos sees pools < (pos + 1) // kpool,
     # the ones closed at or before it.
@@ -285,7 +291,7 @@ def kpool_indexer_step(
         k=n_pick,
         compression_ratio=kpool,
         causal_offset=kpool - 1,
-        num_kv_pages_per_block=_NUM_KV_PAGES_PER_BLOCK,
+        num_kv_pages_per_block=(block_pages,) * 3,
         num_queries_per_block=_NUM_QUERIES_PER_BLOCK,
         decode_query_size=decode_query_size,
         enable_early_exit=False,

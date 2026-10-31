@@ -438,6 +438,53 @@ class TestWaveAuxSlots(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "hands on exactly"):
             wave.merge(tensors)
 
+    def test_mixed_dtype_wave_relays_fp32_stream_and_bf16_aux_slots(self):
+        """Models with fp32 pp_transfer_dtype still relay bf16 draft aux captures."""
+        size, num_aux = 2, 2
+        ici = _FakeIci(size)
+        waves = [
+            PPAuxWave(
+                rank=r,
+                size=size,
+                rows=ROWS,
+                hidden=HIDDEN,
+                num_aux=num_aux,
+                dtype=torch.float32,
+                aux_dtype=torch.bfloat16,
+                device=torch.device("cpu"),
+                launcher=ici.launcher(r),
+            )
+            for r in range(size)
+        ]
+        warm = waves[0].warmup_tensors(4)
+        self.assertEqual(warm["hidden_states"].dtype, torch.float32)
+        self.assertEqual(warm["residual"].dtype, torch.float32)
+        self.assertEqual(warm[AUX_HIDDEN_STATES_PROXY_KEY].dtype, torch.bfloat16)
+
+        with self.assertRaisesRegex(ValueError, "carries torch.bfloat16 aux"):
+            waves[0].merge(
+                {
+                    "hidden_states": torch.zeros((ROWS, HIDDEN), dtype=torch.float32),
+                    "residual": torch.zeros((ROWS, HIDDEN), dtype=torch.float32),
+                    AUX_HIDDEN_STATES_PROXY_KEY: torch.zeros(
+                        (ROWS, HIDDEN * num_aux), dtype=torch.float32
+                    ),
+                }
+            )
+
+        verdicts = [None] * size
+        threads = [
+            threading.Thread(
+                target=lambda idx=r: verdicts.__setitem__(idx, waves[idx].probe())
+            )
+            for r in range(size)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(verdicts, [True, True])
+
 
 if __name__ == "__main__":
     unittest.main()

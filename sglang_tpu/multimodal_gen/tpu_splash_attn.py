@@ -10,10 +10,8 @@ static shapes.
 """
 
 import functools
-import hashlib
 import math
 import threading
-from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -391,24 +389,6 @@ def _splash_mha(q, k, v, scale, is_causal):
     return out[:, :, :q_seq].astype(output_dtype)
 
 
-def _add_kernel_source_to_compile_cache_key() -> None:
-    # The kernels are opaque custom ops in FX graphs, so persisted
-    # torch.compile artifacts are keyed on their source: this file and the
-    # srt modules that lower them.
-    import torch.compiler.config as compiler_config
-
-    from sglang_tpu import pallas_export, pallas_jax_op
-
-    hasher = hashlib.sha256()
-    for source in (__file__, pallas_jax_op.__file__, pallas_export.__file__):
-        hasher.update(Path(source).read_bytes())
-    digest = hasher.hexdigest()[:16]
-    tag = f"diffusion-tpu-splash-attn:{digest}"
-    existing = str(compiler_config.cache_key_tag or "")
-    if tag not in existing.split("|"):
-        compiler_config.cache_key_tag = f"{existing}|{tag}" if existing else tag
-
-
 def _register_ops() -> None:
     """Create the kernel ops; must run before torch.compile traces a model.
 
@@ -450,7 +430,6 @@ def _register_ops() -> None:
                 "sglang_tpu_pallas::diffusion_flash_attention", flash
             )
             flash_op.register_fake(flash_fake)
-            _add_kernel_source_to_compile_cache_key()
         except Exception as exc:
             logger.warning(
                 "TPU Pallas splash attention ops failed to register (%s); using SDPA.",

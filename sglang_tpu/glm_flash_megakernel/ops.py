@@ -7,6 +7,8 @@ caches are copied from serving's pools at its first kernel step and then live in
 kernel. Before anything else reads serving's pools for that request, `flush` writes
 the kernel's rows and states back in serving's layout. With MTP the KDA states hold
 one checkpoint per draft token, and a verify resumes from the last accepted one.
+With the radix cache, `snapshot` writes the kernel's KDA state into a track slot at
+the steps serving would have snapshotted.
 """
 
 from __future__ import annotations
@@ -205,6 +207,8 @@ class GlmFlashMegakernel:
             donate=tuple(range(4 + nw, 4 + nw + nd)),
         )
         self.req, self.prev_pos, self.last_steps = None, None, None
+        # Set when the radix cache is on: only then does serving snapshot KDA state.
+        self.radix_snapshots = False
         self.slot: Optional[torch.Tensor] = None
         self.req_rows: Optional[torch.Tensor] = None
 
@@ -224,6 +228,9 @@ class GlmFlashMegakernel:
     def active(self) -> bool:
         """A request's caches live in the kernel (serving's pools lag behind)."""
         return self.req is not None
+
+    def holds(self, req: int) -> bool:
+        return self.req is not None and self.req == req
 
     def invalidate(self):
         self.req = None
@@ -293,6 +300,31 @@ class GlmFlashMegakernel:
         """The verify's last accepted step, in place of serving's checkpoint commit."""
         self.last_steps = last_steps
 
+    def snapshot(self, track_slots: torch.Tensor, steps: Optional[torch.Tensor] = None):
+        """Copy the request's KDA state into its radix track slot, as serving's
+        snapshot after a decode step or (checkpoint ``steps``) after a verify.
+
+        Virtual track ids; a non-positive slot or a negative step writes the null
+        slot 0, so no host read decides whether to copy.
+        """
+        recur, conv = self.kda_caches
+        device = recur[0].device
+        dst = self._lin._translate_mamba_indices(track_slots[:1]).to(
+            device, torch.int64
+        )
+        if steps is not None:
+            step = steps[:1].to(device, torch.int64)
+            dst = torch.where(step >= 0, dst, torch.zeros_like(dst))
+            step = step.clamp(min=0)
+        dst = torch.where(dst > 0, dst, torch.zeros_like(dst))
+        for k, L in enumerate(self.spec.kda_layers):
+            c = self._req_pool.mamba2_layer_cache(L)
+            st, cv = recur[k], conv[k]
+            if self.Q > 1:
+                st, cv = st.index_select(0, step), cv.index_select(0, step)
+            c.temporal.index_copy_(0, dst, st.reshape(1, *c.temporal.shape[1:]))
+            c.conv[0].index_copy_(0, dst, cv.reshape(1, *c.conv[0].shape[1:]))
+
     def flush(self):
         """Write the request's kernel-side rows and states into serving's pools."""
         if self.req is None:
@@ -327,7 +359,8 @@ class GlmFlashMegakernel:
                     [ik[d].index_select(0, src), ig[d].index_select(0, src)], 1
                 )
                 pool.get_kpool_raw_cache(L).index_put_(idx, raw)
-        # Pools closed while the kernel held the request; pool p sits at position p.
+        # Pools closed while the kernel held the request; pool p sits in the page
+        # of its first token p * kp, record (slot // kp).
         p_lo, p_hi = self.start // kp, -(-hi // kp)
         for a in range(p_lo - p_lo % _CHUNK, p_hi, _CHUNK):
             pools = self._rows(a, device)
@@ -335,8 +368,9 @@ class GlmFlashMegakernel:
             valid = (
                 (end >= self.start) & (end < committed) & (pools * kp < self.max_len)
             )
-            locs = self._locs(pools, valid)
-            idx = (locs // ps, (locs % ps) // 4, locs % 4)
+            locs = self._locs(pools * kp, valid)
+            record = (locs % ps) // kp
+            idx = (locs // ps, record // 4, record % 4)
             src = pools.clamp(max=self.max_len // kp - 1).to(torch.int32)
             records = self.pool_records(ik, ig, self.smalls, src)[0]
             for d, L in enumerate(spec.dsa_layers):
@@ -391,5 +425,15 @@ class GlmFlashMegakernel:
         logits, hidden, self.prev_pos, nd = out[0], out[1], out[2], len(self.dsa_caches)
         caches = list(out[3:])
         self.dsa_caches, self.kda_caches = caches[:nd], caches[nd:]
+        # A decode step on a radix track boundary snapshots the state it produced.
+        # On TPU the mask is a host tensor (TpuMambaPool keeps slot ids on CPU).
+        mask = forward_batch.mamba_track_mask
+        if (
+            self.radix_snapshots
+            and self.Q == 1
+            and mask is not None
+            and bool(mask.reshape(-1)[0])
+        ):
+            self.snapshot(forward_batch.mamba_track_indices)
         logits = tensor_model_parallel_all_gather(logits, dim=-1)[:, : self.vocab]
         return LogitsProcessorOutput(next_token_logits=logits, hidden_states=hidden)

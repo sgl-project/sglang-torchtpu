@@ -50,7 +50,6 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVManager,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_disagg, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
@@ -63,6 +62,7 @@ from sglang_tpu.disaggregation.raiden.common import (
     RaidenKVCacheGroups,
     _tcp_endpoint,
     get_raiden_kv_caches,
+    kv_layout_of,
     logger,
 )
 from sglang_tpu.disaggregation.raiden.host_pool import (
@@ -78,6 +78,7 @@ from sglang_tpu.disaggregation.raiden.receiver import (
 )
 from sglang_tpu.disaggregation.raiden.sender import RaidenKVSender, RaidenSenderMixin
 from sglang_tpu.disaggregation.raiden.serde import (
+    PER_LAYER_KV_LAYOUT,
     Blocks,
     Chunk,
     MessageTag,
@@ -147,6 +148,8 @@ class RaidenKVManager(
     _pipeline = None
     _pipeline_enabled = False
     _listener_start_read = False
+    # Layout tag of the registered KV tensors, sent with every CHUNK and BLOCKS.
+    kv_layout: str = PER_LAYER_KV_LAYOUT
     # State engine: one row per request for GDN, or multi-page request rings for DSV4.
     _state_engine: Optional[Any] = None
     _state_kv_caches: Tuple[Any, ...] = ()
@@ -190,7 +193,7 @@ class RaidenKVManager(
         # decode opts in to consume from a pipeline prefill.
         self._pipeline_enabled = self.pp_size > 1 or (
             disaggregation_mode == DisaggregationMode.DECODE
-            and envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get()
+            and tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get()
         )
         self._pipeline_init_lock = threading.Lock()
         self._pipeline_messages = []
@@ -199,7 +202,7 @@ class RaidenKVManager(
         # rank counts every worker on the node -- attention-TP ranks of every
         # context-parallel, attention-DP, and system-DP replica -- so
         # replicas never share a port, an engine id, or a uuid namespace.
-        base_port = int(os.environ.get("SGLANG_RAIDEN_KV_PORT", str(DEFAULT_KV_PORT)))
+        base_port = tpu_envs.SGLANG_RAIDEN_KV_PORT.get()
         self._local_rank = node_worker_rank(
             self.attn_tp_rank,
             self.attn_tp_size,
@@ -212,17 +215,19 @@ class RaidenKVManager(
             self.pp_size,
         )
         self._control_port = base_port + PORTS_PER_RANK * self._local_rank
-        self._timeout_s = envs.SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S.get()
+        self._timeout_s = tpu_envs.SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S.get()
         self._transfer_parallelism = (
             tpu_envs.SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM.get()
         )
         if self._transfer_parallelism < 1:
-            raise ValueError("SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM must be >= 1")
+            raise ValueError(
+                f"{tpu_envs.SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM.name} must be >= 1"
+            )
         # Raiden reads its own TPU_RAIDEN_DYNAMIC_HOST_STAGING when the engine is
         # built in this process. Store the resolved value back so later reads
         # do not mistake the variable set here for the deprecated alias.
-        dynamic_host_staging = envs.SGLANG_RAIDEN_DYNAMIC_HOST_STAGING.get()
-        envs.SGLANG_RAIDEN_DYNAMIC_HOST_STAGING.set(dynamic_host_staging)
+        dynamic_host_staging = tpu_envs.SGLANG_RAIDEN_DYNAMIC_HOST_STAGING.get()
+        tpu_envs.SGLANG_RAIDEN_DYNAMIC_HOST_STAGING.set(dynamic_host_staging)
         os.environ["TPU_RAIDEN_DYNAMIC_HOST_STAGING"] = (
             "1" if dynamic_host_staging else "0"
         )
@@ -314,7 +319,7 @@ class RaidenKVManager(
             # Detects a prefill that stopped answering and fails its rooms.
             self._start_heartbeat_checker_thread()
             self._decode = DecodeState()
-            self._listener_start_read = envs.SGLANG_RAIDEN_LISTENER_START_READ.get()
+            self._listener_start_read = tpu_envs.SGLANG_RAIDEN_LISTENER_START_READ.get()
 
         # Native I/O tracking stays on the manager: it survives room cleanup.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -323,9 +328,7 @@ class RaidenKVManager(
             # _listen dispatch thread. raiden runs SyncPush unlocked, so
             # _reshard_push_lock serializes register+push across workers.
             self._push_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=max(
-                    1, int(os.environ.get("SGLANG_RAIDEN_PUSH_WORKERS", "1"))
-                ),
+                max_workers=max(1, tpu_envs.SGLANG_RAIDEN_PUSH_WORKERS.get()),
                 thread_name_prefix="raiden-reshard-push",
             )
             self._reshard_push_lock = threading.Lock()
@@ -348,6 +351,7 @@ class RaidenKVManager(
         is identical. Taking it from the SWA tensor rather than assuming it
         matches keeps the two pools free to differ in dtype or head_dim.
         """
+        from sglang_tpu.disaggregation.raiden.pp_common import _BLOCK_MAJOR_KV_RANK
         from sglang_tpu.disaggregation.raiden.reshard_schedule import (
             ReshardGeometry,
             head_pair_bytes,
@@ -361,6 +365,16 @@ class RaidenKVManager(
                 + " KV tensors to build a reshard geometry from"
             )
         tensor = tensors[0]
+        # Resharding runs only for unequal attention TP (the pull path serves
+        # equal TP), and it slices per-layer heads a bundle row does not expose.
+        if len(tensor.shape) == _BLOCK_MAJOR_KV_RANK and src_attn_tp != dst_attn_tp:
+            raise ValueError(
+                "Raiden push resharding moves per-layer kv-head slices, which a "
+                "block-major KV bundle (SGLANG_TPU_USE_BLOCK_MAJOR_KV) does not "
+                f"have; got attention TP {src_attn_tp} on prefill and "
+                f"{dst_attn_tp} on decode. Run both at equal attention TP or "
+                "unset SGLANG_TPU_USE_BLOCK_MAJOR_KV on both."
+            )
         hp = head_pair_bytes(tensor)
         # Distinct model kv-head count (model_config.get_total_num_kv_heads()),
         # set on both the prefill and decode KVArgs.
@@ -379,6 +393,7 @@ class RaidenKVManager(
         """
         self._kv_caches = list(kv_caches.full)
         self._swa_kv_caches = list(kv_caches.swa)
+        self.kv_layout = kv_layout_of(self._kv_caches)
         self._state_kv_caches = tuple(kv_caches.state)
         self._state_type = kv_caches.state_type
         self._state_max_blocks = kv_caches.state_max_blocks
@@ -391,12 +406,19 @@ class RaidenKVManager(
             and self._committed_state_row is None
         ):
             raise RuntimeError("Raiden GDN state tensors need a committed-row mapping")
+        if kv_caches.num_hidden_full and not self._pipeline_enabled:
+            raise NotImplementedError(
+                "SGLANG_TPU_PD_DECODE_DRAFT_PREFILL moves the draft hidden rows as a "
+                "named layer pool; it needs the Raiden pipeline transfer (a PP "
+                "prefill, and SGLANG_RAIDEN_PIPELINE_TRANSFER on the decode)."
+            )
         if self._pipeline_enabled:
             if self._state_kv_caches:
                 raise NotImplementedError(
                     "Raiden pipeline transfer does not move GDN (linear-attention) "
                     "state yet; serve hybrid linear-attention models without "
-                    "pipeline parallelism or SGLANG_RAIDEN_PIPELINE_TRANSFER."
+                    "pipeline parallelism or "
+                    f"{tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.name}."
                 )
             from sglang_tpu.disaggregation.raiden.pipeline import PipelineTransfer
 
@@ -438,10 +460,11 @@ class RaidenKVManager(
         swa_pool_pages = None
         state_pool_pages = None
         logger.info(
-            "RaidenKVManager rank%d engine up | endpoint=%s max_blocks=%d "
-            "num_slots=%d pool_pages=%d chunked=%d parallelism=%d",
+            "RaidenKVManager rank%d engine up | endpoint=%s kv_tensors=%d "
+            "max_blocks=%d num_slots=%d pool_pages=%d chunked=%d parallelism=%d",
             self.attn_tp_rank,
             self.raiden_endpoint,
+            len(self._kv_caches),
             max_blocks,
             num_slots,
             pool_pages,
@@ -463,9 +486,10 @@ class RaidenKVManager(
             swa_pool_pages = swa_num_slots * swa_max_blocks
             logger.info(
                 "RaidenKVManager rank%d SWA engine up | endpoint=%s "
-                "max_blocks=%d num_slots=%d pool_pages=%d",
+                "kv_tensors=%d max_blocks=%d num_slots=%d pool_pages=%d",
                 self.attn_tp_rank,
                 self.swa_raiden_endpoint,
+                len(self._swa_kv_caches),
                 swa_max_blocks,
                 swa_num_slots,
                 swa_pool_pages,
@@ -528,16 +552,17 @@ class RaidenKVManager(
         return pages if self._dynamic_host_staging else max_blocks
 
     def _max_request_blocks(self) -> int:
-        override = int(os.environ.get("SGLANG_RAIDEN_MAX_BLOCKS", "0"))
+        override = tpu_envs.SGLANG_RAIDEN_MAX_BLOCKS.get()
         if override > 0:
             return override
-        max_len = self.server_args.context_length or int(
-            os.environ.get("SGLANG_RAIDEN_MAX_MODEL_LEN", "8192")
+        max_len = (
+            self.server_args.context_length
+            or tpu_envs.SGLANG_RAIDEN_MAX_MODEL_LEN.get()
         )
         return max(1, math.ceil(max_len / self.kv_args.page_size))
 
     def _swa_max_request_blocks(self) -> int:
-        override = int(os.environ.get("SGLANG_RAIDEN_SWA_MAX_BLOCKS", "0"))
+        override = tpu_envs.SGLANG_RAIDEN_SWA_MAX_BLOCKS.get()
         if override > 0:
             return override
         window_size = self.kv_args.sliding_window_size
@@ -582,7 +607,7 @@ class RaidenKVManager(
         shrinks the pool instead, and refuses to start when not even one slot
         fits the budget.
         """
-        budget = float(os.environ.get("SGLANG_RAIDEN_HOST_POOL_GB", "128")) * 1024**3
+        budget = tpu_envs.SGLANG_RAIDEN_HOST_POOL_GB.get() * 1024**3
         local_ranks = ranks_per_node(
             self.attn_tp_size,
             self.attn_dp_size,

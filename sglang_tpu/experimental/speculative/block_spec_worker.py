@@ -26,7 +26,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     PPProxyTensors,
 )
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.draft_worker_common import make_draft_block_spec_info
@@ -113,9 +113,20 @@ class TpuBlockSpecWorker(TpuSpecWorker):
 
     def init_cuda_graphs(self) -> None:
         super().init_cuda_graphs()
-        self._warmup_draft_block_inputs()
-        if self._sampled_drafts:
-            self._warmup_draft_sampling()
+        # Under PP (pp_size > 1), TpuBlockSpecWorker only runs on the last stage
+        # of a non-decode (PD prefill) server, which projects extend draft KV and
+        # never drafts or samples speculative blocks. Scope this skip strictly to
+        # pp_size > 1 and disaggregation_mode != "decode" so PP prefill avoids
+        # single-stage decode compilations and unsharded-lm_head draft-sampling
+        # HBM spikes on the last stage, while keeping all pp_size == 1 (TP /
+        # monolithic) and decode paths completely unchanged.
+        is_pp_non_decode = (
+            get_parallel().pp_size > 1 and get_disagg().disaggregation_mode != "decode"
+        )
+        if not is_pp_non_decode:
+            self._warmup_draft_block_inputs()
+            if self._sampled_drafts:
+                self._warmup_draft_sampling()
         self._warmup_extend_draft_inputs()
         # The base snapshot ran before these block-draft warmups.
         snapshot_recompilation_baseline()
@@ -268,10 +279,16 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         )
         # Must inject before returning: the scheduler may update radix afterward,
         # invalidating out_cache_loc.
-        with self._block_draft_worker.draft_context():
-            kv_fence_tail = self._block_draft_worker.write_draft_kv(
-                target_hidden=target_hidden, positions=positions, cache_loc=cache_loc
-            )
+        if self.ships_pd_hidden:
+            # The decode projects these rows into its draft KV.
+            kv_fence_tail = self.write_pd_hidden(batch, target_hidden)
+        else:
+            with self._block_draft_worker.draft_context():
+                kv_fence_tail = self._block_draft_worker.write_draft_kv(
+                    target_hidden=target_hidden,
+                    positions=positions,
+                    cache_loc=cache_loc,
+                )
         logits_output.hidden_states = None
         if not batch.reqs:
             return self._idle_extend_result(result)
@@ -296,6 +313,26 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 f"distributed top-k width {width} != TARGET_CANDIDATES {TARGET_CANDIDATES}"
             )
         return width
+
+    def extend_draft_from_hidden(
+        self,
+        batch: ScheduleBatch,
+        *,
+        target_hidden: torch.Tensor,
+        cache_loc: torch.Tensor,
+        bonus_tokens: torch.Tensor,
+    ) -> None:
+        del bonus_tokens
+        positions = pad_rows(
+            prompt_positions(
+                prefix_lens=batch.prefix_lens, extend_lens=batch.extend_lens
+            ),
+            target_hidden.shape[0],
+        ).to(self.device, non_blocking=True)
+        with self._block_draft_worker.draft_context():
+            self._block_draft_worker.write_draft_kv(
+                target_hidden=target_hidden, positions=positions, cache_loc=cache_loc
+            )
 
     def make_verify_input(
         self, *, batch: ScheduleBatch, verify_tokens: torch.Tensor, rows: VerifyRows

@@ -56,6 +56,8 @@ def _lb(prefill_url, decode_url):
         decode_urls=[decode_url],
         test_external_dp_routing=False,
         request_timeout_secs=10,
+        disable_health_check=True,
+        health_check_interval_secs=60,
     )
     return MiniLoadBalancer(args)
 
