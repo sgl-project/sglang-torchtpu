@@ -141,6 +141,7 @@ from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PluginWeightUpdateReqInput,
     ProfileReq,
     PullWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
@@ -1463,6 +1464,19 @@ async def end_weight_update(
     return ORJSONResponse(
         {"success": success, "message": message},
         status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/plugin_weight_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def plugin_weight_update(
+    obj: Annotated[PluginWeightUpdateReqInput, Body()], request: Request
+):
+    """Run a weight-update handler that the platform registers, e.g. a trainer's direct weight transfer."""
+    reply = await _global_state.tokenizer_manager.plugin_weight_update(obj, request)
+    return ORJSONResponse(
+        {"success": reply.success, "message": reply.message, "results": reply.results},
+        status_code=HTTPStatus.OK if reply.success else HTTPStatus.BAD_REQUEST,
     )
 
 

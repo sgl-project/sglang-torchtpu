@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
+    PluginWeightUpdateReqInput,
 )
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.weight_updater import (
@@ -348,6 +349,79 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
         self.assertFalse(output.success)
         self.assertIn("begin_weight_update", output.message)
         target.weight_updater.receive_weights_from_distributed.assert_not_called()
+
+
+class TestPluginWeightUpdate(_WeightUpdaterManagerTestBase):
+    def setUp(self):
+        super().setUp()
+        gather = patch(
+            "torch.distributed.all_gather_object",
+            side_effect=lambda outputs, obj, group: outputs.__setitem__(0, obj),
+        )
+        gather.start()
+        self.addCleanup(gather.stop)
+        override = get_parallel().override(tp_rank=0, tp_size=1)
+        override.__enter__()
+        self.addCleanup(override.__exit__, None, None, None)
+        self.flushes = []
+
+    def _manager_serving(self, handlers):
+        manager = self._manager(_runner())
+        manager.flush_cache = lambda **kwargs: self.flushes.append(kwargs) or True
+        platform = patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.current_platform",
+            SimpleNamespace(get_weight_update_handlers=lambda: handlers),
+        )
+        platform.start()
+        self.addCleanup(platform.stop)
+        return manager
+
+    def test_handler_state_persists_and_results_come_back(self):
+        """A handler that registers buffers in one call must find them in the next, with the session visible."""
+        seen = []
+
+        def register(*, context, payload):
+            context.state["buffers"] = payload["size"]
+
+        def install(*, context, payload):
+            seen.append(context.session_open)
+            return context.state["buffers"]
+
+        manager = self._manager_serving({"register": register, "install": install})
+        manager.plugin_weight_update(
+            PluginWeightUpdateReqInput(handler="register", payload={"size": 7})
+        )
+        output = manager.plugin_weight_update(
+            PluginWeightUpdateReqInput(handler="install", flush_cache=True)
+        )
+
+        self.assertTrue(output.success)
+        self.assertEqual(output.results, [7])
+        self.assertEqual(seen, [True])
+        self.assertEqual(len(self.flushes), 1)
+
+    def test_a_failing_handler_fails_the_request_without_flushing(self):
+        """An exception on a rank is reported, not swallowed, and the old KV is kept."""
+
+        def broken(*, context, payload):
+            raise ValueError("no receive buffers")
+
+        output = self._manager_serving({"install": broken}).plugin_weight_update(
+            PluginWeightUpdateReqInput(handler="install", flush_cache=True)
+        )
+
+        self.assertFalse(output.success)
+        self.assertIn("no receive buffers", output.message)
+        self.assertEqual(self.flushes, [])
+
+    def test_an_unknown_handler_is_rejected(self):
+        """A platform without the handler answers with an error instead of crashing the scheduler."""
+        output = self._manager_serving({}).plugin_weight_update(
+            PluginWeightUpdateReqInput(handler="install")
+        )
+
+        self.assertFalse(output.success)
+        self.assertIn("install", output.message)
 
 
 if __name__ == "__main__":

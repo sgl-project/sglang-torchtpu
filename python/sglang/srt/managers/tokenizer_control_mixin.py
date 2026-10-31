@@ -56,6 +56,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
+    PluginWeightUpdateReqInput,
+    PluginWeightUpdateReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -142,6 +144,7 @@ _COMMUNICATOR_SPECS = [
     ("expert_distribution", ExpertDistributionReqOutput),
     ("begin_weight_update", BeginWeightUpdateReqOutput),
     ("end_weight_update", EndWeightUpdateReqOutput),
+    ("plugin_weight_update", PluginWeightUpdateReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
     ("dumper_control", DumperControlReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
@@ -473,6 +476,12 @@ class TokenizerControlMixin:
     async def _weight_update_session_call(
         self: TokenizerManager, communicator, obj
     ) -> Tuple[bool, str]:
+        results = await self._weight_update_session_replies(communicator, obj)
+        return FanOutCommunicator.merge_results(results)
+
+    async def _weight_update_session_replies(
+        self: TokenizerManager, communicator, obj
+    ) -> list:
         self.auto_create_handle_loop()
         async with self.is_pause_cond:
             is_paused = self.is_pause
@@ -482,7 +491,7 @@ class TokenizerControlMixin:
         if not is_paused:
             async with self.model_update_lock.writer_lock:
                 results = await communicator(obj)
-        return FanOutCommunicator.merge_results(results)
+        return results
 
     async def begin_weight_update(
         self: TokenizerManager,
@@ -501,6 +510,20 @@ class TokenizerControlMixin:
         return await self._weight_update_session_call(
             self.end_weight_update_communicator, obj
         )
+
+    async def plugin_weight_update(
+        self: TokenizerManager,
+        obj: PluginWeightUpdateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> PluginWeightUpdateReqOutput:
+        # a handler's per-rank state is not keyed by replica
+        assert get_parallel().dp_size == 1, (
+            "data-parallel replicas are not supported for plugin weight updates"
+        )
+        (reply,) = await self._weight_update_session_replies(
+            self.plugin_weight_update_communicator, obj
+        )
+        return reply
 
     async def update_weights_from_distributed(
         self: TokenizerManager,
