@@ -187,20 +187,17 @@ class TestExperimentalEagle3(CustomTestCase):
         self.assertEqual((worker.num_drafts, worker.num_verify_rows), (3, 4))
         self.assertEqual(_chain_worker().verify_widths(), (3,))
 
-    def test_radix_track_step_counts_from_the_device_length(self):
-        """Under overlap the host committed base trails the device by the last
-        commit; the snapshot step must count from the device length (63 + 2 -> step 0)."""
-        snapshots = []
+    def _radix_track_commit(self, *, host_lens, device_lens, last_steps):
+        """The backend's verify commit kwargs for one step (track grid 64, slack 4)."""
+        commits = []
         backend = object.__new__(HybridLinearAttnBackend)
-        backend.update_mamba_state_after_mtp_verify = lambda **kw: snapshots.append(
-            kw["mamba_steps_to_track"]
-        )
+        backend.update_mamba_state_after_mtp_verify = lambda **kw: commits.append(kw)
         worker = _chain_worker()
         worker._target_has_linear_attn = True
         worker._target_worker = SimpleNamespace(
             model_runner=SimpleNamespace(attn_backend=backend, model=None)
         )
-        accept = SimpleNamespace(last_steps=torch.tensor([1, -1]))
+        accept = SimpleNamespace(last_steps=torch.tensor(last_steps))
         worker.draft = lambda *args: None
         worker.verify = lambda *args: (None, accept)
         worker.commit = lambda *args: None
@@ -208,11 +205,40 @@ class TestExperimentalEagle3(CustomTestCase):
             mamba_track_indices=torch.tensor([3, 0]),
             tree_cache=SimpleNamespace(page_size=64),
         )
-        bucket = SimpleNamespace(state=SimpleNamespace(seq_lens=torch.tensor([63, 0])))
-        verify_input = SimpleNamespace(committed_lens=torch.tensor([60, 0]))
+        bucket = SimpleNamespace(
+            state=SimpleNamespace(seq_lens=torch.tensor(device_lens))
+        )
+        zeros = torch.zeros(2, dtype=torch.int64)
+        verify_input = TpuSpecVerifyInput(
+            verify_cache_candidates=zeros,
+            verify_cache_candidates_cpu=zeros,
+            committed_lens=zeros,
+            req_pool_indices=zeros,
+            req_pool_indices_cpu=zeros,
+            seq_lens_cpu=torch.tensor(host_lens),
+            host_len_slack=4,
+            future_indices=None,
+        )
         with patch.object(base_spec_worker, "mamba_track_grid", return_value=64):
             TpuSpecWorker.step(worker, batch, bucket, None, verify_input)
-        self.assertEqual(snapshots[0].tolist(), [0, -1])
+        return commits[0]
+
+    def test_radix_track_step_counts_from_the_device_length(self):
+        """Under overlap the host committed base trails the device by the last
+        commit; the snapshot step must count from the device length (63 + 2 -> step 0)."""
+        commit = self._radix_track_commit(
+            host_lens=[60, 0], device_lens=[63, 0], last_steps=[1, -1]
+        )
+        self.assertEqual(commit["mamba_steps_to_track"].tolist(), [0, -1])
+
+    def test_radix_tracking_skips_a_verify_that_cannot_cross_a_boundary(self):
+        """A verify whose host bounds (base 8, base + 4 rows + slack 4) stay inside one
+        track interval snapshots nothing, so it must not launch the snapshot."""
+        commit = self._radix_track_commit(
+            host_lens=[8, 0], device_lens=[11, 0], last_steps=[3, -1]
+        )
+        self.assertIsNone(commit["mamba_track_indices"])
+        self.assertIsNone(commit["mamba_steps_to_track"])
 
     def test_flag_routes_eagle3_and_leaves_other_algorithms_alone(self):
         with (

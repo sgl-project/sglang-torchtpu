@@ -895,7 +895,10 @@ class TpuSpecWorker(BaseSpecWorker):
         )
         if self._target_has_linear_attn:
             self._commit_linear_attn_states(
-                batch=batch, accept=accept, pre_verify_lens=bucket.state.seq_lens
+                batch=batch,
+                accept=accept,
+                pre_verify_lens=bucket.state.seq_lens,
+                verify_input=verify_input,
             )
         committed = self.commit(
             batch, bucket.state, rows, verify_input, logits_output, accept
@@ -908,28 +911,40 @@ class TpuSpecWorker(BaseSpecWorker):
         batch: ScheduleBatch,
         accept: AcceptResult,
         pre_verify_lens: torch.Tensor,
+        verify_input: TpuSpecVerifyInput,
     ) -> None:
         """Select each slot's verify checkpoint at its last accepted token, and
         the checkpoints radix tracking snapshots."""
         runner = self.target_worker.model_runner
         attn_backend = runner.attn_backend
         assert isinstance(attn_backend, HybridLinearAttnBackend), type(attn_backend)
-        steps_to_track = None
-        if batch.mamba_track_indices is not None:
-            # Device lengths: under overlap the host committed_lens trail by one commit.
-            steps_to_track = verify_track_steps(
-                pre_verify_lens,
-                accept.last_steps,
-                mamba_track_grid(batch.tree_cache.page_size),
-            )
+        track_indices, steps_to_track = batch.mamba_track_indices, None
+        if track_indices is not None:
+            track_grid = mamba_track_grid(batch.tree_cache.page_size)
+            if self._may_cross_track_boundary(verify_input, track_grid):
+                # Device lengths: under overlap the host committed_lens trail by one commit.
+                steps_to_track = verify_track_steps(
+                    pre_verify_lens, accept.last_steps, track_grid
+                )
+            else:
+                track_indices = None
         # Slots come from the verify forward's bucket metadata; padded rows accept 0,
         # so their -1 step leaves the slot untouched.
         attn_backend.update_mamba_state_after_mtp_verify(
             last_correct_step_indices=accept.last_steps,
-            mamba_track_indices=batch.mamba_track_indices,
+            mamba_track_indices=track_indices,
             mamba_steps_to_track=steps_to_track,
             model=runner.model,
         )
+
+    def _may_cross_track_boundary(
+        self, verify_input: TpuSpecVerifyInput, track_grid: int
+    ) -> bool:
+        """Whether a request may cross a track boundary in this verify: its device
+        length runs from at least the host committed base to at most the KV bound."""
+        low = verify_input.seq_lens_cpu
+        high, _ = verify_input.kv_lens_after_rows(self.num_verify_rows)
+        return bool((low // track_grid != high // track_grid).any())
 
     def forward_batch_generation(
         self,
