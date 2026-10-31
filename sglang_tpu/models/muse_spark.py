@@ -41,17 +41,19 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptQuantConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel, process_model_config
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, make_pp_layers
 from sglang_tpu.envs import envs as tpu_envs
 
 logger = logging.getLogger(__name__)
+
 
 # Everything else in the checkpoint belongs to the vision and audio towers.
 _TEXT_PREFIX = "model.language_model."
@@ -557,13 +559,18 @@ class MuseSparkTextModel(nn.Module):
     ):
         super().__init__()
         self.config = config
+        self.pp_group = get_parallel().pp_group
         # Layers whose output stream feeds a DFlash draft.
         self.layers_to_capture: List[int] = []
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=None,
-            prefix=add_prefix("embed_tokens", prefix),
+        self.embed_tokens = (
+            VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=None,
+                prefix=add_prefix("embed_tokens", prefix),
+            )
+            if self.pp_group.is_first_rank
+            else PPMissingLayer()
         )
         rope_thetas = {theta for theta in config.layer_rope_theta if theta > 0}
         if len(rope_thetas) != 1:
@@ -571,18 +578,23 @@ class MuseSparkTextModel(nn.Module):
         self.rotary_emb = MuseSparkInterleavedRope(
             config.head_dim, max_position=max_position, base=rope_thetas.pop()
         )
-        self.layers = nn.ModuleList(
-            MuseSparkDecoderLayer(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: MuseSparkDecoderLayer(
                 config,
-                layer_idx,
+                idx,
                 self.rotary_emb,
                 quant_config,
-                add_prefix(f"layers.{layer_idx}", prefix),
-            )
-            for layer_idx in range(config.num_hidden_layers)
+                prefix,
+            ),
+            prefix=add_prefix("layers", prefix),
         )
         # The output norm's gain is centered on zero, unlike the per-layer norms.
-        self.norm = MuseSparkRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = (
+            MuseSparkRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            if self.pp_group.is_last_rank
+            else PPMissingLayer()
+        )
 
     def forward(
         self,
@@ -590,20 +602,38 @@ class MuseSparkTextModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
-        if input_embeds is None:
-            # The decoder reads weightless-RMS-normalized token embeddings.
-            embeds = self.embed_tokens(input_ids)
-            input_embeds = _rms_normalize(embeds, self.config.rms_norm_eps).to(
-                embeds.dtype
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor] | PPProxyTensors:
+        if self.pp_group.is_first_rank:
+            if input_embeds is None:
+                # The decoder reads weightless-RMS-normalized token embeddings.
+                embeds = self.embed_tokens(input_ids)
+                input_embeds = _rms_normalize(embeds, self.config.rms_norm_eps).to(
+                    embeds.dtype
+                )
+            stream = input_embeds.float()
+        else:
+            assert pp_proxy_tensors is not None
+            stream = (
+                pp_proxy_tensors.tensors["hidden_states"].float()
+                + pp_proxy_tensors.tensors["residual"].float()
             )
-        stream = input_embeds.float()
+
         aux_hidden_states = []
-        for layer_idx, layer in enumerate(self.layers):
-            stream = layer(positions, stream, forward_batch)
+        for layer_idx in range(self.start_layer, self.end_layer):
+            stream = self.layers[layer_idx](positions, stream, forward_batch)
             if layer_idx in self.layers_to_capture:
                 # Drafts read the operator dtype, not the fp32 residual.
                 aux_hidden_states.append(stream.to(torch.bfloat16))
+
+        if not self.pp_group.is_last_rank:
+            return PPProxyTensors(
+                {
+                    "hidden_states": stream,
+                    "residual": torch.zeros_like(stream),
+                }
+            )
+
         hidden = self.norm(stream.to(torch.bfloat16))
         if not aux_hidden_states:
             return hidden
@@ -618,6 +648,8 @@ class MuseSparkForConditionalGeneration(nn.Module):
     # Parameters a subclass loads itself (perception towers); the checkpoint
     # completeness check here skips them.
     tower_param_prefixes: Tuple[str, ...] = ()
+    # Norm-preserving gated residuals accumulate in fp32 across stage boundaries.
+    pp_transfer_dtype = torch.float32
 
     def __init__(
         self,
@@ -632,6 +664,7 @@ class MuseSparkForConditionalGeneration(nn.Module):
         self.config = config
         self.text_config = text_config
         self.quant_config = quant_config
+        self.pp_group = get_parallel().pp_group
         # The fp32 RoPE table must cover the served context: positions past its
         # end rotate with the last row. 2^17 rows = 32 MiB floor.
         max_position = min(
@@ -641,11 +674,19 @@ class MuseSparkForConditionalGeneration(nn.Module):
         self.model = MuseSparkTextModel(
             text_config, max_position, quant_config, add_prefix("model", prefix)
         )
-        self.lm_head = ParallelLMHead(
-            text_config.vocab_size,
-            text_config.hidden_size,
-            quant_config=None,
-            prefix=add_prefix("lm_head", prefix),
+        if text_config.tie_word_embeddings and self.pp_group.world_size > 1:
+            raise NotImplementedError(
+                "Muse Spark pipeline parallelism does not support tied word embeddings"
+            )
+        self.lm_head = (
+            ParallelLMHead(
+                text_config.vocab_size,
+                text_config.hidden_size,
+                quant_config=None,
+                prefix=add_prefix("lm_head", prefix),
+            )
+            if self.pp_group.is_last_rank
+            else PPMissingLayer()
         )
         if text_config.tie_word_embeddings:
             self.lm_head.tie_weights(self.model.embed_tokens)
@@ -655,8 +696,18 @@ class MuseSparkForConditionalGeneration(nn.Module):
         # The checkpoint's output GEMM accumulates in fp32.
         self.logits_processor.use_fp32_lm_head = True
         self.capture_aux_hidden_states = False
-        self._megakernel_enabled = tpu_envs.SGLANG_TPU_MUSE_MEGAKERNEL.get()
+        self._megakernel_enabled = (
+            tpu_envs.SGLANG_TPU_MUSE_MEGAKERNEL.get() and self.pp_group.world_size == 1
+        )
         self._megakernel = None
+
+    @property
+    def start_layer(self) -> int:
+        return self.model.start_layer
+
+    @property
+    def end_layer(self) -> int:
+        return self.model.end_layer
 
     def precompile_kernels_after_loading(self) -> None:
         """Build the megakernel's weights once quant post-processing has laid out the
@@ -683,12 +734,14 @@ class MuseSparkForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
         **kwargs,
     ):
         megakernel = self._megakernel
         if (
             megakernel is not None
             and input_embeds is None
+            and pp_proxy_tensors is None
             and megakernel.handles(forward_batch, input_ids.shape[0])
         ):
             hidden_states, aux_hidden_states = megakernel.forward(
@@ -705,8 +758,14 @@ class MuseSparkForConditionalGeneration(nn.Module):
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
         hidden_states = self.model(
-            input_ids, positions, forward_batch, input_embeds=input_embeds
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds=input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
+        if not self.pp_group.is_last_rank:
+            return hidden_states
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
@@ -769,9 +828,24 @@ class MuseSparkForConditionalGeneration(nn.Module):
     def _is_online_quant_scale(self, name: str) -> bool:
         """Scales that online FP8 quantization creates for the BF16 experts."""
         index = _layer_index(name)
-        if index < 0 or ".experts." not in name or not name.endswith("_scale"):
+        if (
+            not (self.start_layer <= index < self.end_layer)
+            or ".experts." not in name
+            or not name.endswith("_scale")
+        ):
             return False
         return not self.model.layers[index].mlp.quantized_experts
+
+    def _is_off_stage_param(self, name: str) -> bool:
+        """Return True when ``name`` belongs to another pipeline stage."""
+        layer_idx = _layer_index(name)
+        if layer_idx >= 0:
+            return not (self.start_layer <= layer_idx < self.end_layer)
+        if name.startswith("model.embed_tokens."):
+            return not self.pp_group.is_first_rank
+        if name == "lm_head.weight" or name.startswith("model.norm."):
+            return not self.pp_group.is_last_rank
+        return False
 
     def _load_qkv_shard(
         self, params: dict, name: str, loaded_weight: torch.Tensor
@@ -801,8 +875,12 @@ class MuseSparkForConditionalGeneration(nn.Module):
         skipped = 0
         for checkpoint_name, loaded_weight in weights:
             name = _param_name(checkpoint_name)
-            if name is None or _layer_index(name) >= num_layers:
-                # Tower tensors, unused scales, or layers cut by a num_hidden_layers override.
+            if (
+                name is None
+                or _layer_index(name) >= num_layers
+                or self._is_off_stage_param(name)
+            ):
+                # Tower tensors, unused scales, off-stage PP parameters, or cut layers.
                 skipped += 1
                 continue
             if self.text_config.tie_word_embeddings and name == "lm_head.weight":
@@ -837,6 +915,7 @@ class MuseSparkForConditionalGeneration(nn.Module):
             )
         if skipped:
             logger.info("Skipped %d non-text or unused checkpoint tensors", skipped)
-        for layer in self.model.layers:
+        for layer_idx in range(self.start_layer, self.end_layer):
+            layer = self.model.layers[layer_idx]
             layer.post_attention_residual_gate.precompute_coefficients()
             layer.post_feedforward_residual_gate.precompute_coefficients()
