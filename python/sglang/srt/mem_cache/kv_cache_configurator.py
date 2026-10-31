@@ -367,8 +367,18 @@ class KVCacheConfigurator:
         full_capacity: Optional[int],
         swa_capacity: Optional[int],
     ) -> int:
+        capacity = None
         if get_memory().enable_unified_memory:
             capacity = allocator.size_full
+        elif (
+            max_request_tokens := getattr(allocator, "max_request_tokens", None)
+        ) is not None and (
+            custom_capacity := max_request_tokens(
+                getattr(self, "sliding_window_size", None)
+            )
+        ) is not None:
+            capacity = custom_capacity
+        if capacity is not None:
             max_total_tokens = get_schedule().max_total_tokens
             return (
                 min(capacity, max_total_tokens)
@@ -1792,6 +1802,14 @@ class KVCacheConfigurator:
         full_max_total_num_tokens: Optional[int],
         swa_max_total_num_tokens: Optional[int],
     ) -> KVCache:
+        if (
+            pool := current_platform.build_swa_kv_pool(
+                self,
+                full_max_total_num_tokens=full_max_total_num_tokens,
+                swa_max_total_num_tokens=swa_max_total_num_tokens,
+            )
+        ) is not None:
+            return pool
         PoolCls = self._tpu_mha_pool_class()
         # This stage's own layers, not the model's: under PP the global lists
         # would size every stage's pool to the whole model.
@@ -2348,10 +2366,10 @@ class KVCacheConfigurator:
                     need_sort=need_sort,
                 )
             elif current_platform.is_tpu() and not self.is_hybrid_swa:
-                # Hybrid SWA on TPU falls through to the generic SWA allocator
-                # arms below -- the sub-pools are TPU-fused but the allocator
-                # just bookkeeps token slots and the full<->swa mapping
-                # (queried by pallas_backend in _build_metadata).
+                # Hybrid SWA on TPU takes the unified arm below or falls through
+                # to the generic SWA allocator arms -- the sub-pools are TPU-fused
+                # but the allocator just bookkeeps token slots and the full<->swa
+                # mapping (queried by pallas_backend in _build_metadata).
                 # Under DCP the allocator is virtual: it hands out locations in
                 # a space widened by attn_dcp_size, where a location's physical
                 # slot is loc // attn_dcp_size and its physical page is
@@ -2367,6 +2385,20 @@ class KVCacheConfigurator:
                     kvcache=token_to_kv_pool,
                     need_sort=need_sort,
                 )
+            elif (
+                self.is_hybrid_swa
+                and (
+                    allocator := current_platform.build_swa_kv_pool_allocator(
+                        self,
+                        sizes=sizes,
+                        token_to_kv_pool=token_to_kv_pool,
+                        req_to_token_pool=req_to_token_pool,
+                        need_sort=need_sort,
+                    )
+                )
+                is not None
+            ):
+                token_to_kv_pool_allocator = allocator
             elif _is_npu and (
                 get_exec().kernel.attention_backend == "ascend"
                 or is_dsv4_model

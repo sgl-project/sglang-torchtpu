@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import copy
+import types
 import unittest
 from array import array
 from unittest.mock import MagicMock, call, patch
@@ -25,13 +27,17 @@ from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool, TpuSeqAlongLaneKVPool
 from sglang_tpu.unified_kv_pool import (
     AttnLayerSpec,
     TpuUnifiedSWAKVPool,
+    TpuUnifiedSWAPoolConfigurator,
     TpuUnifiedSWATokenToKVPoolAllocator,
     UnifiedPageLayout,
     num_swa_groups,
+    unified_kv_pool_enabled,
+    unified_kv_pool_requested,
 )
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -566,6 +572,357 @@ class TestTpuUnifiedSWAKVPoolAllocator(unittest.TestCase):
         self.assertEqual(alloc._free_page_count(), 1)
         self.assertEqual(
             (cache.full_evictable_size(), cache.swa_evictable_size()), (0, 4)
+        )
+
+
+class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
+    """Tests for PR 3: configurator sizing, RPA page-table selection, and CLI guards."""
+
+    def _cfg_patches(self, **server_arg_overrides):
+        from contextlib import ExitStack
+
+        from sglang.srt.runtime_context import get_context, get_parallel
+
+        stack = ExitStack()
+        tpu_unified_kv_pool = server_arg_overrides.pop("tpu_unified_kv_pool", True)
+        defaults = dict(
+            attention_backend="pallas_tpu_rpa_v3",
+            tp_size=1,
+            pp_size=1,
+            dcp_size=1,
+            attn_cp_size=1,
+            disaggregation_mode="null",
+            enable_hierarchical_cache=False,
+            hicache_io_backend="raiden",
+            enable_unified_cache_external_linker=False,
+            enable_unified_memory=False,
+            page_size=128,
+            disable_radix_cache=False,
+            swa_full_tokens_ratio=0.5,
+            chunked_prefill_size=4096,
+            disable_overlap_schedule=False,
+            max_running_requests=None,
+        )
+        defaults.update(server_arg_overrides)
+        stack.enter_context(
+            tpu_envs.SGLANG_TPU_UNIFIED_KV_POOL.override(tpu_unified_kv_pool)
+        )
+        stack.enter_context(get_context().override_server_args(**defaults))
+        stack.enter_context(
+            get_parallel().override(
+                attn_tp_size=defaults["tp_size"] // defaults["attn_cp_size"],
+                attn_dcp_size=defaults["dcp_size"],
+                dcp_enabled=defaults["dcp_size"] > 1,
+            )
+        )
+        return stack
+
+    def _make_mock_kvc(
+        self,
+        full_ids=None,
+        swa_ids=None,
+        head_num=2,
+        head_dim=256,
+        swa_head_num=2,
+        swa_head_dim=256,
+        dtype=torch.bfloat16,
+        pool_cls=TpuFusedMHATokenToKVPool,
+    ):
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        full_ids = list(range(10)) if full_ids is None else list(full_ids)
+        swa_ids = list(range(10, 60)) if swa_ids is None else list(swa_ids)
+        mc = types.SimpleNamespace(
+            attention_arch=None,
+            has_asymmetric_kv=False,
+            head_dim=head_dim,
+            v_head_dim=head_dim,
+            swa_head_dim=swa_head_dim,
+            swa_v_head_dim=swa_head_dim,
+            get_num_kv_heads=lambda tp=1, dcp=1: head_num,
+            get_swa_num_kv_heads=lambda tp=1, dcp=1: swa_head_num,
+        )
+        elem = torch.empty((), dtype=dtype).element_size()
+        return types.SimpleNamespace(
+            device="cpu",
+            server_args=None,
+            is_hybrid_swa=True,
+            use_mla_backend=False,
+            mambaish_config=None,
+            hybrid_gdn_config=None,
+            hybrid_kda_config=None,
+            is_draft_worker=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            pp_size=1,
+            attn_dp_size=1,
+            _tpu_mha_pool_class=lambda: pool_cls,
+            kv_cache_dtype_str="fp8_e4m3" if elem == 1 else "bf16",
+            kv_cache_dtype=dtype,
+            kv_group_size=None,
+            pool_page_size=128,
+            page_size=128,
+            sliding_window_size=1024,
+            model_config=mc,
+            layer_info=types.SimpleNamespace(
+                start_layer=0,
+                full_attention_layer_ids=full_ids,
+                swa_attention_layer_ids=swa_ids,
+            ),
+        )
+
+    def test_configurator_sizes_from_shared_buffers_bf16_and_fp8(self):
+        with self._cfg_patches():
+            for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+                with self.subTest(dtype=dtype):
+                    kvc = self._make_mock_kvc(dtype=dtype)
+                    conf = TpuUnifiedSWAPoolConfigurator(kvc)
+                    self.assertEqual(conf._num_swa_groups, 5)
+                    budget = 2 * 1024**3
+                    cfg = conf.calculate_pool_sizes(budget, page_size=128)
+                    self.assertEqual(
+                        cfg.full_max_total_num_tokens, cfg.swa_max_total_num_tokens
+                    )
+                    self.assertEqual(
+                        cfg.max_total_num_tokens,
+                        conf.max_request_tokens(
+                            cfg.full_max_total_num_tokens, page_size=128
+                        ),
+                    )
+                    self.assertGreater(
+                        conf.calculate_total_physical_pages(budget, page_size=128), 0
+                    )
+                    self.assertEqual(
+                        conf.max_request_tokens(300_000, page_size=128),
+                        300_000 - 5 * (1024 + 128),
+                    )
+                    # --max-total-tokens clamping stays monotonically <= profiled shared_tokens.
+                    capped = conf.calculate_pool_sizes_from_max_tokens(
+                        cfg.max_total_num_tokens // 2, page_size=128
+                    )
+                    self.assertLessEqual(
+                        capped.full_max_total_num_tokens, cfg.full_max_total_num_tokens
+                    )
+                    self.assertEqual(
+                        capped.max_total_num_tokens,
+                        ((cfg.max_total_num_tokens // 2) // 128) * 128,
+                    )
+                    with self.assertRaises(ValueError):
+                        conf.calculate_pool_sizes_from_max_tokens(128, page_size=128)
+                    pool = TpuUnifiedSWAKVPool(
+                        size=cfg.full_max_total_num_tokens,
+                        page_size=128,
+                        dtype=dtype,
+                        full=AttnLayerSpec(
+                            head_num=2, head_dim=256, layer_ids=range(10)
+                        ),
+                        swa=AttnLayerSpec(
+                            head_num=2, head_dim=256, layer_ids=range(10, 60)
+                        ),
+                        device="cpu",
+                    )
+                    self.assertLessEqual(sum(pool.get_kv_size_bytes()), budget)
+
+            # Mismatched H_swa != H_full or D_swa != D_full is rejected
+            for bad_kwargs in (
+                dict(head_num=4, head_dim=256, swa_head_num=4, swa_head_dim=128),
+                dict(head_num=1, head_dim=256, swa_head_num=2, swa_head_dim=256),
+                dict(head_num=4, head_dim=128, swa_head_num=1, swa_head_dim=128),
+            ):
+                with self.assertRaises(ValueError):
+                    TpuUnifiedSWAPoolConfigurator(self._make_mock_kvc(**bad_kwargs))
+
+        # Tight HBM under chunk-cap flags (disable_radix_cache + max_running_requests)
+        # sizes directly from shared buffers instead of raising RuntimeError.
+        with self._cfg_patches(disable_radix_cache=True, max_running_requests=256):
+            kvc_tight = self._make_mock_kvc(dtype=torch.bfloat16)
+            conf_tight = TpuUnifiedSWAPoolConfigurator(kvc_tight)
+            tight_budget = 64 * 128 * conf_tight._full_per_token * 10
+            tight_cfg = conf_tight.calculate_pool_sizes(tight_budget, page_size=128)
+            self.assertEqual(
+                tight_cfg.max_total_num_tokens,
+                conf_tight.max_request_tokens(
+                    tight_cfg.full_max_total_num_tokens, page_size=128
+                ),
+            )
+
+    def test_unsupported_configurations_rejected(self):
+        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from sglang.srt.server_args import ServerArgs
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.tpu_platform import _resolve_unified_kv_pool
+
+        base = self._make_mock_kvc()
+        with self._cfg_patches():
+            self.assertTrue(unified_kv_pool_enabled(base))
+            for attr, val in (
+                ("is_hybrid_swa", False),
+                ("use_mla_backend", True),
+                ("mambaish_config", object()),
+                ("hybrid_gdn_config", object()),
+                ("is_draft_worker", True),
+                ("spec_algorithm", SpeculativeAlgorithm.EAGLE),
+                ("pp_size", 2),
+                ("_tpu_mha_pool_class", lambda: MHATokenToKVPool),
+                ("_tpu_mha_pool_class", lambda: object),
+                ("kv_cache_dtype_str", "mxint8"),
+                ("pool_page_size", 1),
+            ):
+                kvc = copy.copy(base)
+                setattr(kvc, attr, val)
+                with self.assertRaises(ValueError):
+                    unified_kv_pool_enabled(kvc)
+            kvc_asym = self._make_mock_kvc()
+            kvc_asym.model_config.has_asymmetric_kv = True
+            with self.assertRaises(ValueError):
+                unified_kv_pool_enabled(kvc_asym)
+
+            # TpuSeqAlongLaneKVPool is supported
+            kvc_along = self._make_mock_kvc(pool_cls=TpuSeqAlongLaneKVPool)
+            with patch(
+                "sglang_tpu.kv_pool._seq_along_lane_head_dim",
+                side_effect=lambda *, head_dim, kv_packing: (
+                    ((head_dim + 8 * kv_packing - 1) // (8 * kv_packing))
+                    * (8 * kv_packing)
+                ),
+            ):
+                self.assertIsNotNone(TpuUnifiedSWAPoolConfigurator(kvc_along))
+            # SGLANG_TPU_KV_PACK_HEADS is rejected
+            with patch(
+                "sglang_tpu.envs.envs.SGLANG_TPU_KV_PACK_HEADS.get", return_value=True
+            ):
+                with self.assertRaises(ValueError):
+                    unified_kv_pool_enabled(base)
+
+        for ctx_overrides in (
+            dict(pp_size=2),
+            dict(dcp_size=2, tp_size=2),
+            dict(attn_cp_size=2, tp_size=2),
+            dict(disaggregation_mode="prefill"),
+            dict(enable_hierarchical_cache=True, hicache_io_backend="kernel"),
+            dict(enable_hierarchical_cache=True, hicache_io_backend="raiden"),
+            dict(enable_unified_cache_external_linker=True),
+        ):
+            with self._cfg_patches(**ctx_overrides):
+                with self.assertRaisesRegex(ValueError, "--enable-unified-memory"):
+                    unified_kv_pool_enabled(base)
+
+        with self._cfg_patches(tpu_unified_kv_pool=False):
+            self.assertFalse(unified_kv_pool_enabled(base))
+
+        import pickle
+
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
+
+        ok_args = ServerArgs(model_path="dummy", enable_unified_memory=True)
+        _resolve_unified_kv_pool(ok_args)
+        view = resolving_view(ok_args)
+        self.assertFalse(view.enable_unified_memory)
+        self.assertTrue(unified_kv_pool_requested(ok_args))
+        self.assertTrue(unified_kv_pool_requested(pickle.loads(pickle.dumps(ok_args))))
+
+        off_args = ServerArgs(model_path="dummy", enable_unified_memory=False)
+        _resolve_unified_kv_pool(off_args)
+        self.assertFalse(unified_kv_pool_requested(off_args))
+
+        platform = TpuSRTPlatform()
+        with self._cfg_patches(tpu_unified_kv_pool=False):
+            self.assertIsNone(platform.create_memory_pool_configurator(base))
+            self.assertIsNone(
+                platform.build_swa_kv_pool(
+                    base,
+                    full_max_total_num_tokens=2048,
+                    swa_max_total_num_tokens=2048,
+                )
+            )
+            self.assertIsNone(
+                platform.build_swa_kv_pool_allocator(
+                    base,
+                    sizes=types.SimpleNamespace(full_max_total_num_tokens=2048),
+                    token_to_kv_pool=None,
+                    req_to_token_pool=None,
+                    need_sort=False,
+                )
+            )
+
+        with self._cfg_patches():
+            conf = platform.create_memory_pool_configurator(base)
+            self.assertIsInstance(conf, TpuUnifiedSWAPoolConfigurator)
+            sizes = conf.calculate_pool_sizes_from_max_tokens(1024, page_size=128)
+            pool = platform.build_swa_kv_pool(
+                base,
+                full_max_total_num_tokens=sizes.full_max_total_num_tokens,
+                swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+            )
+            self.assertIsInstance(pool, TpuUnifiedSWAKVPool)
+            req_pool = ReqToTokenPool(
+                size=4,
+                max_context_len=1024,
+                device="cpu",
+                enable_memory_saver=False,
+            )
+            alloc = platform.build_swa_kv_pool_allocator(
+                base,
+                sizes=sizes,
+                token_to_kv_pool=pool,
+                req_to_token_pool=req_pool,
+                need_sort=False,
+            )
+            self.assertIsInstance(alloc, TpuUnifiedSWATokenToKVPoolAllocator)
+            expected_capacity = conf.max_request_tokens(
+                sizes.full_max_total_num_tokens, page_size=128
+            )
+            self.assertEqual(
+                alloc.max_request_tokens(base.sliding_window_size),
+                expected_capacity,
+            )
+            from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+            self.assertEqual(
+                KVCacheConfigurator.hybrid_swa_token_capacity(
+                    base,
+                    allocator=alloc,
+                    full_capacity=sizes.full_max_total_num_tokens,
+                    swa_capacity=sizes.swa_max_total_num_tokens,
+                ),
+                expected_capacity,
+            )
+
+    def test_rpa_backend_layer_page_indices_selects_full_and_swa_groups(self):
+        from sglang_tpu.attention_pallas_rpa_base import (
+            BaseTpuPallasRpaAttnBackend,
+            PallasForwardMetadata,
+        )
+
+        backend = object.__new__(BaseTpuPallasRpaAttnBackend)
+        backend._swa_layer_groups = {2: 0, 3: 1, 4: 2}
+        f0 = torch.tensor([1, 2], dtype=torch.int32)
+        s0 = torch.tensor([3, 4], dtype=torch.int32)
+        sg = torch.tensor([[13, 14], [23, 24]], dtype=torch.int32)
+        backend.forward_metadata = PallasForwardMetadata(
+            kv_lens=torch.tensor([8], dtype=torch.int32),
+            page_indices=f0,
+            cu_q_lens=torch.tensor([0, 8], dtype=torch.int32),
+            cu_kv_lens=torch.tensor([0, 8], dtype=torch.int32),
+            distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+            active_num_tokens=torch.tensor([8], dtype=torch.int32),
+            swa_page_indices=s0,
+            swa_group_page_indices=sg,
+        )
+        self.assertTrue(
+            torch.equal(backend._layer_page_indices(0, is_swa_layer=False), f0)
+        )
+        self.assertTrue(
+            torch.equal(backend._layer_page_indices(1, is_swa_layer=False), f0)
+        )
+        self.assertTrue(
+            torch.equal(backend._layer_page_indices(2, is_swa_layer=True), s0)
+        )
+        self.assertTrue(
+            torch.equal(backend._layer_page_indices(3, is_swa_layer=True), sg[0])
+        )
+        self.assertTrue(
+            torch.equal(backend._layer_page_indices(4, is_swa_layer=True), sg[1])
         )
 
 

@@ -124,6 +124,8 @@ class PallasForwardMetadata:
     active_num_tokens: torch.Tensor
     # i32[max_num_seqs * pages_per_seq]  page indices
     swa_page_indices: torch.Tensor | None = None
+    # i32[num_swa_groups - 1, max_num_seqs * pages_per_seq]  companion SWA group page indices
+    swa_group_page_indices: torch.Tensor | None = None
     # Static query rows per DECODE sequence for this forward (1 = ordinary
     # decode); above 1 the active rows take the kernel's DECODE range.
     decode_query_size: int = 1
@@ -680,6 +682,18 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # sub-pool. ``token_to_kv_pool`` carries the full→swa index mapping.
         self._is_hybrid_swa = bool(getattr(model_runner, "is_hybrid_swa", False))
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
+
+        pool = self.token_to_kv_pool
+        is_unified = self._is_hybrid_swa and isinstance(pool, TpuUnifiedSWAKVPool)
+        self._swa_group_pages: torch.Tensor | None = (
+            pool.swa_group_pages
+            if is_unified and pool.swa_group_pages.shape[0] > 0
+            else None
+        )
+        self._swa_layer_groups: dict[int, int] = (
+            dict(pool._swa_layer_group) if is_unified else {}
+        )
 
         # fp8 KV cache: when the resolved cache dtype is fp8, K/V are quantized
         # before the kernel call and the kernel dequantizes on read via
@@ -990,6 +1004,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         page_indices = page_indices.reshape(bs * pages_per_seq).contiguous()
 
         swa_page_indices: torch.Tensor | None = None
+        swa_group_page_indices: torch.Tensor | None = None
         if self._is_hybrid_swa:
             # ``page_indices`` are page-level indices into the full pool. To get
             # the SWA-pool variant, look up the full→swa token mapping at the
@@ -1004,12 +1019,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             # First token index of each full-pool page (page_indices * page_size).
             # full_to_swa is host-resident (CPU) on TPU: gather on CPU (where the
             # table lives), then move the small int32 result to the batch device.
-            full_token_starts = page_indices.to(torch.int64) * page_size
-            swa_page_indices = (
-                (full_to_swa[full_token_starts.cpu()] // page_size)
-                .to(torch.int32)
-                .to(device)
-            )
+            full_token_starts = page_indices.to(torch.int64).cpu() * page_size
+            swa_pages = full_to_swa[full_token_starts] // page_size
+            swa_page_indices = swa_pages.to(torch.int32).to(device)
+            if self._swa_group_pages is not None:
+                swa_group_page_indices = self._swa_group_pages[:, swa_pages].to(device)
 
         return PallasForwardMetadata(
             kv_lens=seq_lens,
@@ -1019,6 +1033,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             distribution=distribution,
             active_num_tokens=_make_active_num_tokens(cu_q_lens, non_empty_bs),
             swa_page_indices=swa_page_indices,
+            swa_group_page_indices=swa_group_page_indices,
             decode_query_size=decode_query_size,
             segments=segments,
         )
@@ -1214,6 +1229,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # Sliding-window attention uses a separate KV pool. Translate full-pool
         # page indices through the CPU mapping before uploading or reusing them.
         swa_page_indices: torch.Tensor | None = None
+        swa_group_page_indices: torch.Tensor | None = None
         write_spans: DcpWriteSpans | None = None
         swa_write_spans: DcpWriteSpans | None = None
         step_slots: torch.Tensor | None = None
@@ -1258,13 +1274,18 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             )
             # The mapping uses token slots, so look up each page's first token.
             full_token_starts = page_indices.to(torch.int64) * self._page_stride
+            swa_pages = full_to_swa[full_token_starts] // self._page_stride
             swa_page_indices = self._value_metadata(
                 name="swa_page_indices",
-                value=(full_to_swa[full_token_starts] // self._page_stride).to(
-                    torch.int32
-                ),
+                value=swa_pages.to(torch.int32),
                 device=device,
             )
+            if self._swa_group_pages is not None:
+                swa_group_page_indices = self._value_metadata(
+                    name="swa_group_page_indices",
+                    value=self._swa_group_pages[:, swa_pages],
+                    device=device,
+                )
             if self._dcp > 1:
                 # SWA layers write into the SWA sub-pool, whose slots the
                 # mapping gives for the same tokens.
@@ -1292,6 +1313,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             distribution=distribution,
             active_num_tokens=active_num_tokens,
             swa_page_indices=swa_page_indices,
+            swa_group_page_indices=swa_group_page_indices,
             dcp_kv_lens_global=dcp_kv_lens_global,
             dcp_prefix_kv_lens=dcp_prefix_kv_lens,
             dcp_cp_rank=dcp_cp_rank,
@@ -1559,6 +1581,19 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             return draft_kv_lens
         return self.forward_metadata.kv_lens
 
+    def _layer_page_indices(self, layer_id: int, *, is_swa_layer: bool) -> torch.Tensor:
+        """Page table for ``layer_id``."""
+        md = self.forward_metadata
+        assert md is not None
+        if is_swa_layer and md.swa_page_indices is not None:
+            group = self._swa_layer_groups.get(layer_id, 0)
+            return (
+                md.swa_page_indices
+                if group == 0 or md.swa_group_page_indices is None
+                else md.swa_group_page_indices[group - 1]
+            )
+        return md.page_indices
+
     def _forward(
         self,
         q: torch.Tensor,
@@ -1620,10 +1655,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         uses_swa_pool = (
             is_swa_layer and self.forward_metadata.swa_page_indices is not None
         )
-        if uses_swa_pool:
-            page_indices = self.forward_metadata.swa_page_indices
-        else:
-            page_indices = self.forward_metadata.page_indices
+        page_indices = self._layer_page_indices(
+            layer.layer_id, is_swa_layer=is_swa_layer
+        )
 
         soft_cap = layer.logit_cap if getattr(layer, "logit_cap", 0) else None
         # Same rule as the other attention backends; DFlash draft layers are
