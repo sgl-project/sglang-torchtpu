@@ -40,6 +40,7 @@ from sglang_tpu.hooks.experimental_spec import (
     initialize_host_batch,
     kimi_spec_defaults,
 )
+from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -164,7 +165,13 @@ class TestExperimentalSpecHooks(CustomTestCase):
         register_host_batch_padder(_pad)
         # Exercise the real registry's descriptor handling and import propagation,
         # then restore every patched binding so this test cannot affect other tests.
-        for target, hook, kind in hook_specs():
+        hooks = hook_specs()
+        hooks.extend(
+            spec
+            for spec in host_padding_hooks()
+            if spec[0].endswith("._extend_metadata_device")
+        )
+        for target, hook, kind in hooks:
             owner_path, name = target.rsplit(".", 1)
             owner = pkgutil.resolve_name(owner_path)
             raw = vars(owner).get(name)
@@ -1466,6 +1473,50 @@ class TestExperimentalSpecHooks(CustomTestCase):
             batch.req_to_token_pool.host_resident = False
             with self.assertRaisesRegex(RuntimeError, "host-resident"):
                 draft.prepare_for_decode(batch)
+
+    def test_block_spec_worker_init_cuda_graphs_skips_decode_warmups_only_on_pp_non_decode(
+        self,
+    ):
+        from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
+
+        all_warmups = ["base", "block", "sampling", "extend", "snapshot"]
+        cases = (
+            (1, "null", all_warmups),
+            (1, "prefill", all_warmups),
+            (1, "decode", all_warmups),
+            (8, "prefill", ["base", "extend", "snapshot"]),
+            (8, "null", ["base", "extend", "snapshot"]),
+            (8, "decode", all_warmups),
+        )
+        for pp_size, mode, expected in cases:
+            with self.subTest(pp_size=pp_size, mode=mode):
+                calls: list[str] = []
+                worker = object.__new__(TpuBlockSpecWorker)
+                worker._sampled_drafts = True
+                worker._warmup_draft_block_inputs = lambda c=calls: c.append("block")
+                worker._warmup_draft_sampling = lambda c=calls: c.append("sampling")
+                worker._warmup_extend_draft_inputs = lambda c=calls: c.append("extend")
+                with (
+                    patch.object(
+                        TpuSpecWorker,
+                        "init_cuda_graphs",
+                        side_effect=lambda c=calls: c.append("base"),
+                    ),
+                    patch(
+                        "sglang_tpu.experimental.speculative.block_spec_worker.get_parallel",
+                        return_value=SimpleNamespace(pp_size=pp_size),
+                    ),
+                    patch(
+                        "sglang_tpu.experimental.speculative.block_spec_worker.get_disagg",
+                        return_value=SimpleNamespace(disaggregation_mode=mode),
+                    ),
+                    patch(
+                        "sglang_tpu.experimental.speculative.block_spec_worker.snapshot_recompilation_baseline",
+                        side_effect=lambda c=calls: c.append("snapshot"),
+                    ),
+                ):
+                    worker.init_cuda_graphs()
+                self.assertEqual(calls, expected)
 
 
 if __name__ == "__main__":
