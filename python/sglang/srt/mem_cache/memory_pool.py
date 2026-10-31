@@ -4381,7 +4381,7 @@ class HybridLinearKVPool(KVCache):
     def host_pool_decls(self):
         # Only the full-attention sub-pool owns HiCache-addressable buffers here.
         # Mamba state belongs to req_to_token_pool's MambaPool and is assembled
-        # by _MambaStrategy, not declared through this pool.
+        # by MambaStrategy, not declared through this pool.
         return self.full_kv_pool.host_pool_decls()
 
     @property

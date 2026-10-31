@@ -555,6 +555,7 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
                 )
 
     def test_strategy_builds_dma_host_pools_and_controller(self):
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
         from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
         from sglang_tpu import hybrid_linear_hicache
 
@@ -576,6 +577,7 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
             full_kv_pool=SimpleNamespace(layer_num=2),
             full_attention_layer_id_mapping={0: 0, 3: 1},
             start_layer=0,
+            use_mla=True,
         )
         draft = object()
         params = SimpleNamespace(
@@ -590,6 +592,7 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
         )
         with (
             patch.object(hybrid_linear_hicache, "get_memory", return_value=memory),
+            patch.object(hybrid_pool_assembler, "get_memory", return_value=memory),
             patch(
                 "sglang_tpu.kv_pool_host.tpu_dma_host_kv_pool_cls",
                 return_value=MagicMock(return_value=kv_host),
@@ -598,8 +601,8 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
                 "sglang_tpu.kv_pool_host.tpu_dma_mamba_pool_host_cls",
                 return_value=MagicMock(return_value=state_host),
             ),
-            patch(
-                "sglang_tpu.tpu_dma_hybrid_cache_controller.TpuDMAHybridCacheController"
+            patch.object(
+                hybrid_linear_hicache.TpuDmaMambaStrategy, "cache_controller_cls"
             ) as controller,
         ):
             result = hybrid_linear_hicache.TpuDmaMambaStrategy().build(
