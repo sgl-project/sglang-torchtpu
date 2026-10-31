@@ -661,6 +661,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     defer_logits_to_eager: bool = False
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
+    # TPU prefill logit rows (sglang_tpu/compilation/logit_rows.py): int32 [6]
+    # = each request's last row (4, padded), the count and the identity flag.
+    # Set by the TPU compiled-forward shim on EXTEND forwards only when
+    # SGLANG_TPU_FOUR_STAGE_LOGIT_ROWS=1; None otherwise.
+    logit_rows: Optional[torch.Tensor] = None
 
     # Gate for reusing the first MTP draft step's indexer topk across steps;
     # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
