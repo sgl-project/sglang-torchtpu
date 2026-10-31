@@ -38,12 +38,17 @@ RUNNING = min(64, max(4, 2 * CONCURRENCY))
 # two sets of dense weights 12, the prefill's sequence-parallel projections
 # 22.5): the pools are small, and every KDA state (a checkpoint, a running
 # request's slot) takes three of their blocks, a tail four -- each block a
-# page of KV. Size the states by the sessions (a session resumes from its last
-# page-aligned checkpoint and its tail), not a fixed count: at concurrency 8,
-# 64 checkpoints and 48 tails left 1.2M tokens of KV, and sessions evicted
-# each other's prefixes.
+# page of KV. A prefix hit resumes only at a checkpoint, and running requests
+# hold several slots each (sglang plans five), so a burst evicts checkpoints:
+# at concurrency 8, 24 checkpoints left long sessions matching a few pages of
+# their 100k-500k contexts (minute-long TTFTs) while 94% of 9.8M KV tokens sat
+# idle; 64 checkpoints and 48 tails left only 1.2M tokens of KV, and sessions
+# evicted each other's pages. Eight checkpoints and two tails a session, up to
+# 64 checkpoints.
 CHECKPOINTS = int(
-    os.environ.get("K3_PROGRAM_PREFILL_CHECKPOINTS", str(max(16, 3 * CONCURRENCY)))
+    os.environ.get(
+        "K3_PROGRAM_PREFILL_CHECKPOINTS", str(min(64, max(16, 8 * CONCURRENCY)))
+    )
 )
 TAILS = os.environ.get("K3_PROGRAM_PREFIX_TAILS", str(max(8, 2 * CONCURRENCY)))
 
