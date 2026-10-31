@@ -1,6 +1,16 @@
 """Host-padding eligibility shared by the TPU platform and staging hooks."""
 
+from abc import ABC
+
 from sglang.srt.runtime_context import get_flags, get_parallel, get_schedule
+
+
+class HostSamplingAlgorithm(ABC):
+    """Algorithm whose worker stages request-owned CPU sampling parameters.
+
+    Backend adapters register their algorithm class after installing a worker
+    that materializes a device snapshot before sampling.
+    """
 
 
 def _enabled(batch):
