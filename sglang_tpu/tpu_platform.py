@@ -585,6 +585,68 @@ def _apply_kv_cache_dtype_default(server_args) -> None:
     )
 
 
+# Issue: under the Dynamo tracer the compiled extend program returns a perturbed
+# attention output for the last token row of a prefill chunk that spans more than
+# one RPA v3 KV tile when the attention TP group has four or more ranks, which
+# surfaces as a wrong first token. The direct tracer runs the same kernel
+# correctly, so configurations the direct tracer covers resolve to it.
+_RPA_V3_LONG_EXTEND_ISSUE = "https://github.com/sgl-project/sglang-torchtpu/issues/1700"
+_RPA_V3_DIRECT_TRACER_MIN_ATTN_TP = 4
+
+
+def _prefer_direct_tracer_for_rpa_v3(server_args: ServerArgs) -> None:
+    """Resolve ``tpu_compile_tracer`` to ``direct`` where #1700 applies."""
+    from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
+    from sglang_tpu.envs import envs as tpu_envs
+
+    cfg = resolving_view(server_args)
+    if not cfg.enable_torch_compile or cfg.tpu_compile_tracer != "dynamo":
+        return
+    if cfg.attention_backend != "pallas_tpu_rpa_v3":
+        return
+    attn_cp_size = getattr(cfg, "attn_cp_size", 1) or 1
+    attn_dp_size = getattr(cfg, "attn_dp_size", 1) or 1
+    attn_tp_size = cfg.tp_size // attn_dp_size // attn_cp_size
+    if attn_tp_size < _RPA_V3_DIRECT_TRACER_MIN_ATTN_TP:
+        return
+    # These paths exist only under the Dynamo tracer and their validators reject
+    # the direct tracer: context parallelism, speculative algorithms without
+    # direct-compile support, torch.compile bundles. They keep Dynamo.
+    if attn_cp_size > 1 or (getattr(cfg, "dcp_size", 1) or 1) > 1:
+        return
+    if (
+        getattr(cfg, "unsafe_save_torch_compile_bundle", None) is not None
+        or getattr(cfg, "unsafe_load_torch_compile_bundle", None) is not None
+    ):
+        return
+    if cfg.speculative_algorithm is not None:
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        algorithm = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
+        if not algorithm.supports_tpu_direct_compile():
+            return
+    if tpu_envs.SGLANG_TPU_FORCE_DYNAMO_TRACER.get():
+        logger.warning(
+            "SGLANG_TPU_FORCE_DYNAMO_TRACER=1 keeps the Dynamo tracer for "
+            "pallas_tpu_rpa_v3 at attention TP %d: prefill chunks longer than one "
+            "KV tile can return a wrong first token (%s).",
+            attn_tp_size,
+            _RPA_V3_LONG_EXTEND_ISSUE,
+        )
+        return
+    logger.warning(
+        "Resolving --tpu-compile-tracer to direct: under the Dynamo tracer, "
+        "pallas_tpu_rpa_v3 at attention TP %d returns a wrong first token for "
+        "prefill chunks longer than one KV tile (%s). Set "
+        "SGLANG_TPU_FORCE_DYNAMO_TRACER=1 to keep the Dynamo tracer.",
+        attn_tp_size,
+        _RPA_V3_LONG_EXTEND_ISSUE,
+    )
+    declare_resolution(
+        server_args, "tpu.apply_server_args_defaults", tpu_compile_tracer="direct"
+    )
+
+
 def _validate_dsa(server_args) -> None:
     """Reject the sparse-attention (DSA) setups that TPU cannot serve correctly."""
     from sglang.srt.arg_groups.overrides import resolving_view
@@ -1043,6 +1105,9 @@ class TpuSRTPlatform(SRTPlatform):
                 "tpu.apply_server_args_defaults",
                 sampling_backend="tpu",
             )
+
+        # After the attention backend is resolved: the tracer choice depends on it.
+        _prefer_direct_tracer_for_rpa_v3(server_args)
 
         # Graph configuration is resolved before platform defaults. Updating the
         # legacy flag alone cannot disable the already-resolved phase runners.
