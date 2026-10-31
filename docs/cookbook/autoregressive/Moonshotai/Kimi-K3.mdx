@@ -616,10 +616,10 @@ python3 -m sglang.launch_server \
 
 [Kimi-K3-DSpark](https://huggingface.co/RadixArk/Kimi-K3-DSpark) proposes 7
 draft tokens per step on the experimental TPU speculative worker. This recipe
-serves one request at a time: with `SGLANG_TPU_K3_STATIC_FP8` on, a verify batch
-of more than one request currently produces wrong tokens. Do not raise
-`--max-running-requests` without also unsetting `SGLANG_TPU_K3_STATIC_FP8` and
-`SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV`.
+serves one request at a time, sized for single-stream latency. A verify batch of
+four requests is validated too, with `SGLANG_TPU_K3_STATIC_FP8` on; to serve
+more streams, raise `--max-running-requests` and `--max-mamba-cache-size`
+together.
 
 {/* render_recipe config=recipe/configs/kimi_k3/dspark.py profile=long_8k1k_c1 */}
 **Hardware**: 4 tpu7x hosts (32 TensorCores), tp32/ep8.

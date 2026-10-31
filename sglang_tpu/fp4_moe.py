@@ -14,7 +14,6 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-from sglang.srt.layers.moe.tpu_moe_utils import mask_tpu_moe_non_local_experts
 from sglang.srt.layers.quantization.mxfp4_tpu_util import (
     _pad_gate_up_halves_axis1,
     _pad_last_axis,
@@ -27,6 +26,7 @@ from sglang_tpu.fused_rs_sequence_parallel import (
     prepare_fused_moe_sequence_parallel_input,
     prepare_tpu_fused_rs_post_expert_norm,
 )
+from sglang_tpu.moe.ep_rank import mask_tpu_moe_non_local_experts, traced_moe_ep_rank
 from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
 # Block-512 matches the original FP8 activation quantization block. The fused-RS
@@ -434,6 +434,7 @@ def apply_tpu_nvfp4_moe(
         topk_ids,
         layer.num_local_experts,
         layer.moe_ep_rank,
+        traced_ep_rank=traced_moe_ep_rank(),
     )
 
     output = fused_moe_call(
