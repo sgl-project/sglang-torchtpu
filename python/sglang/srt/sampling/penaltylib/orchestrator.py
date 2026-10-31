@@ -52,6 +52,16 @@ class BatchedPenalizerOrchestrator:
         for penalizer in self.penalizers.values():
             penalizer.cumulate_output_tokens(output_ids=output_ids)
 
+    def seed_history(self, rows: list, tokens: list):
+        """
+        Cumulate a token history into rows of this batch (rows[i] gets tokens[i]
+        as successive output tokens, the same bits as cumulate_output_tokens
+        feeding them one step at a time). Used for a request prefilled again
+        after a retraction (SGLANG_TPU_DETERMINISTIC_PENALTY_TOKENS v2).
+        """
+        for penalizer in self.penalizers.values():
+            penalizer.seed_history(rows, tokens)
+
     def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
         """
         Apply all penalizers to the logits in-place.
@@ -214,6 +224,20 @@ class _BatchedPenalizer(abc.ABC):
             return
 
         self._cumulate_output_tokens(output_ids=output_ids)
+
+    def seed_history(self, rows: list, tokens: list):
+        if not self._is_prepared:
+            return
+
+        self._seed_history(rows=rows, tokens=tokens)
+
+    def _seed_history(self, rows: list, tokens: list):
+        """
+        Cumulate tokens[i] into row rows[i] as successive output tokens.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot seed a token history"
+        )
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self._is_prepared:

@@ -43,6 +43,21 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
             src=self.frequency_penalties,
         )
 
+    def _seed_history(self, rows: list, tokens: list):
+        # scatter_add_ adds the row's value once per occurrence, in order: replay
+        # those float32 additions on the host so each seeded entry has the bits
+        # the step-by-step path gives (the row starts at zero).
+        device = self.orchestrator.device
+        values = self.frequency_penalties.reshape(-1).cpu()
+        for row, toks in zip(rows, tokens):
+            seeded = torch.zeros(self.orchestrator.vocab_size, dtype=torch.float32)
+            for t in toks:
+                seeded[t] = seeded[t] + values[row]
+            index = torch.tensor([row], dtype=torch.int64, device=device)
+            self.cumulated_frequency_penalties.index_copy_(
+                0, index, seeded.to(device).unsqueeze(0)
+            )
+
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
         logits.sub_(self.cumulated_frequency_penalties)
 
