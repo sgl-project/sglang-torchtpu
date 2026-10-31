@@ -36,8 +36,16 @@ PAGE_SIZE = 32 * (512 if KV_DTYPE.startswith("fp8") else 256)
 RUNNING = min(64, max(4, 2 * CONCURRENCY))
 # Both programs' weights take ~80 GB of a rank's 96 GB (the shared experts 45,
 # two sets of dense weights 12, the prefill's sequence-parallel projections
-# 22.5): the pools are small.
-CHECKPOINTS = int(os.environ.get("K3_PROGRAM_PREFILL_CHECKPOINTS", "64"))
+# 22.5): the pools are small, and every KDA state (a checkpoint, a running
+# request's slot) takes three of their blocks, a tail four -- each block a
+# page of KV. Size the states by the sessions (a session resumes from its last
+# page-aligned checkpoint and its tail), not a fixed count: at concurrency 8,
+# 64 checkpoints and 48 tails left 1.2M tokens of KV, and sessions evicted
+# each other's prefixes.
+CHECKPOINTS = int(
+    os.environ.get("K3_PROGRAM_PREFILL_CHECKPOINTS", str(max(16, 3 * CONCURRENCY)))
+)
+TAILS = os.environ.get("K3_PROGRAM_PREFIX_TAILS", str(max(8, 2 * CONCURRENCY)))
 
 CONFIG = deepcopy(SERVER_CONFIG)
 server_args = CONFIG["server_args"]
@@ -110,9 +118,7 @@ runtime_env.update(
             "prefill_expert_parallel={ep};decode_expert_parallel={ep};"
             "read_streams=16"
         ).format(ep=os.environ.get("K3_PROGRAM_EXPERT_PARALLEL", "16")),
-        "SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS": os.environ.get(
-            "K3_PROGRAM_PREFIX_TAILS", "48"
-        ),
+        "SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS": TAILS,
         "SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS": "7:3.78,3:2.87",
         "SGLANG_TPU_K3_PROGRAM_SPEC_SCHEDULE": "1:1:7,2:16:3",
         # Overlap scheduling: the decode program's next step launches while
