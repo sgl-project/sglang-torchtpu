@@ -4,6 +4,7 @@
 import contextlib
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -17,6 +18,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.layers import usp
 from sglang.multimodal_gen.runtime.models.dits import minimax_h3 as dit
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
     packed_sequence,
@@ -54,6 +56,7 @@ def _installed():
             (packed_sequence, _BUILDERS),
             (comfyui_step, _BUILDERS + ("comfyui_layout_to_packed",)),
             (dit, ("_minimax_h3_attention_core_bcg",)),
+            (usp, ("_usp_all_to_all_single",)),
         ):
             stack.enter_context(
                 patch.multiple(module, **{n: getattr(module, n) for n in names})
@@ -63,6 +66,11 @@ def _installed():
                 dit.MiniMaxH3DiTModel,
                 "_compile_conditions",
                 dit.MiniMaxH3DiTModel._compile_conditions,
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                dit.MiniMaxH3DiTBlock, "forward", dit.MiniMaxH3DiTBlock.forward
             )
         )
         minimax_h3.install()
@@ -189,6 +197,50 @@ class TestMiniMaxH3CompiledBlock(CustomTestCase):
             block = torch.nn.Linear(1, 1)
             self.assertTrue(condition("blocks.7", block))
             self.assertFalse(condition("token_refiner.blocks.0", block))
+
+
+def _all_to_all_worker(rank, world, init_file, results):
+    import torch.distributed as dist
+
+    from sglang.multimodal_gen.runtime.layers import usp
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world
+    )
+    try:
+        group = type("SpGroup", (), {"ulysses_group": dist.group.WORLD})()
+        with patch.object(usp, "get_sp_group", return_value=group):
+            lane_dense = minimax_h3._lane_dense_all_to_all_single(
+                usp._usp_all_to_all_single
+            )
+            # The H3 packed-QKV and output exchange shapes, scaled down.
+            for shape in ((world, 16, 3, 384), (world, 16, 3, 128), (6, 5)):
+                torch.manual_seed(rank)
+                x = torch.randn(shape).bfloat16()
+                flat = usp._usp_all_to_all_single(x.clone())
+                dense = lane_dense(x.clone())
+                staged = lane_dense(x.clone(), role="usp_test")
+                results[(rank, shape)] = torch.equal(flat, dense) and torch.equal(
+                    flat, staged
+                )
+    finally:
+        dist.destroy_process_group()
+
+
+class TestLaneDenseAllToAll(CustomTestCase):
+    def test_matches_the_flat_exchange(self):
+        import torch.multiprocessing as mp
+
+        world = 2
+        with tempfile.TemporaryDirectory() as tmp, mp.Manager() as manager:
+            results = manager.dict()
+            mp.spawn(
+                _all_to_all_worker,
+                args=(world, os.path.join(tmp, "init"), results),
+                nprocs=world,
+            )
+            self.assertEqual(len(results), 3 * world)
+            self.assertTrue(all(results.values()), dict(results))
 
 
 if __name__ == "__main__":

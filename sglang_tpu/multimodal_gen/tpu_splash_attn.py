@@ -204,7 +204,7 @@ def _splash_mha_block_sizes(
     return 256, 256
 
 
-def _flash_attention(q, k, v, scale, kv_len=None):
+def _flash_attention(q, k, v, scale, kv_len=None, num_heads=None):
     """Flash attention with an online exp2 softmax on ``[B, H, S, D]`` arrays.
 
     Takes the unscaled query: the softmax scale is applied to the float32
@@ -217,7 +217,7 @@ def _flash_attention(q, k, v, scale, kv_len=None):
     computed, and query rows at or past it output zeros. The length is read on
     device, so one kernel serves every live length of a padded shape. The
     blocks read the ``[S, H * D]`` rows in place, so the caller transposes
-    nothing.
+    nothing; ``[S, H * D]`` arrays with ``num_heads`` are taken as is.
     """
     import jax
     import jax.numpy as jnp
@@ -226,9 +226,15 @@ def _flash_attention(q, k, v, scale, kv_len=None):
     from jax.experimental.pallas import tpu as pltpu
 
     masked = kv_len is not None
-    if masked:
+    rows_in = masked and q.ndim == 2
+    if rows_in:
+        q_seq, num_q_heads = q.shape[0], num_heads
+        head_dim = q.shape[1] // num_heads
+        kv_seq, num_kv_heads = k.shape[0], k.shape[1] // head_dim
+    elif masked:
         q_seq, num_q_heads, head_dim = q.shape
         kv_seq, num_kv_heads = k.shape[0], k.shape[1]
+    if masked:
         if q_seq != kv_seq:
             raise ValueError(
                 f"kv_len masking needs self-attention, got q={q.shape} k={k.shape}"
@@ -418,7 +424,7 @@ def _flash_attention(q, k, v, scale, kv_len=None):
     if masked:
         rows = [t.reshape(t.shape[0], -1) for t in (q, k, v)]
         out = attend(kv_len.astype(jnp.int32).reshape(1), *rows)
-        return out.reshape(q_seq, num_q_heads, head_dim)
+        return out if rows_in else out.reshape(q_seq, num_q_heads, head_dim)
     return jax.vmap(attend)(q, k, v)
 
 
@@ -519,13 +525,16 @@ def _register_ops() -> None:
                 v: jax.Array,
                 kv_len: jax.Array,
                 scale: float,
+                num_heads: int,
             ) -> jax.Array:
-                return _flash_attention(q, k, v, scale, kv_len=kv_len)
+                return _flash_attention(
+                    q, k, v, scale, kv_len=kv_len, num_heads=num_heads
+                )
 
             def flash_fake(q, k, v, scale):
                 return q.new_empty(q.shape)
 
-            def flash_kv_len_fake(q, k, v, kv_len, scale):
+            def flash_kv_len_fake(q, k, v, kv_len, scale, num_heads):
                 return q.new_empty(q.shape)
 
             def splash_mha_fake(q, k, v, scale, is_causal):
@@ -540,7 +549,7 @@ def _register_ops() -> None:
             )
             flash_op.register_fake(flash_fake)
             flash_kv_len_op = cpu_export_jax_op(
-                "sglang_tpu_pallas::diffusion_flash_attention_kv_len_thd", flash_kv_len
+                "sglang_tpu_pallas::diffusion_flash_attention_kv_len_rows", flash_kv_len
             )
             flash_kv_len_op.register_fake(flash_kv_len_fake)
         except Exception as exc:
@@ -760,13 +769,17 @@ class TpuSplashAttentionImpl(SDPAImpl):
             # The flash kernel covers 512 keys too, which SDPA's "short"
             # cutoff would send back to the per-segment path.
             if _sdpa_fallback_reason(q, k, v, False) in (None, "short"):
-                return _FLASH_KV_LEN_OP(
-                    query.contiguous(),
-                    key.contiguous(),
-                    value.contiguous(),
+                # [S, H * D] rows: one lane-dense copy of a strided view,
+                # where .contiguous() pads 7 heads to 8 sublanes and the
+                # kernel's reshape then relayouts again.
+                rows = (t.reshape(t.shape[0], -1) for t in (query, key, value))
+                output = _FLASH_KV_LEN_OP(
+                    *rows,
                     cu_seqlens[1:2].to(torch.int32),
                     self.softmax_scale,
+                    query.shape[1],
                 )
+                return output.view(query.shape)
         # Packed segment lengths vary per request. Each new length compiles
         # under either backend (dynamic=False); SDPA skips the Pallas trace,
         # export and Mosaic compile on top of that, so segments stay on SDPA.
