@@ -324,14 +324,40 @@ class MlaDsparkDraft:
 
     # ------------------------------------------------------------ state
     def new_state(self, anchor: int | torch.Tensor) -> MlaDraftState:
-        """A state whose next verify is ``anchor`` with placeholder drafts."""
-        vector = torch.full((1, 128), -1, dtype=torch.int32).to("tpu")
+        """A state whose next verify is ``anchor`` with placeholder drafts.
+
+        The vector comes out of a registered op, as every continuing
+        request's comes out of the draft op: torch_tpu compiles an op per
+        operand history, so a batch mixing a fresh state built from torch
+        allocations and indexed writes with continuing ones compiled the
+        batched verify and draft ops again for each mix (14-30 s freezes as
+        requests joined, on hardware)."""
         if not isinstance(anchor, torch.Tensor):
             anchor = torch.tensor([int(anchor)], dtype=torch.int32).to("tpu")
-        anchor = anchor.reshape(1).to(torch.int32)
-        vector[0, : self.dspark.ROWS - 1] = anchor
-        vector[0, self.dspark.OUT_BONUS] = anchor[0]
-        return _settled(MlaDraftState(vector.clone()))
+        (vector,) = self._new_state_op()(anchor.reshape(1).to(torch.int32))
+        return _settled(MlaDraftState(vector))
+
+    def _new_state_op(self) -> Any:
+        key = ("new_state",)
+        if key not in self._ops:
+            import jax.numpy as jnp
+
+            rows, bonus = self.dspark.ROWS, self.dspark.OUT_BONUS
+
+            def body(anchor):
+                vector = jnp.full((1, 128), -1, jnp.int32)
+                vector = vector.at[0, : rows - 1].set(anchor[0])
+                return (vector.at[0, bonus].set(anchor[0]),)
+
+            self._ops[key] = register_op(
+                "pallas::k3_dspark_mla_new_state",
+                self.mesh,
+                body,
+                (P(),),
+                (P(),),
+                export_key=repr(("dspark_mla_new_state", rows, bonus)),
+            )
+        return self._ops[key]
 
     def from_ring(
         self, *args

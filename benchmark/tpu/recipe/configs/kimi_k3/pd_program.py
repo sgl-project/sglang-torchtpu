@@ -139,6 +139,9 @@ runtime_env.update(
     {
         # The program's custom ops run each as one device program.
         "SGLANG_TPU_EAGER_MODE": "DEFER_NEVER",
+        # Keep the compile cache (tmpfs) after warmup: an executable compiled
+        # while serving is then loaded, not compiled again, after a restart.
+        "SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS": "0",
         "SGLANG_TPU_K3_PROGRAM_PRESHARDED": os.environ.get(
             "SGLANG_TPU_K3_PROGRAM_PRESHARDED", "/presharded"
         ),
