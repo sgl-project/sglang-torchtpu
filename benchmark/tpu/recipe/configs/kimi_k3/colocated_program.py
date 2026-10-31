@@ -18,6 +18,8 @@ Environment:
     K3_PROGRAM_KV_DTYPE             fp8_e4m3 (default) or bf16
     K3_PROGRAM_EXPERT_PARALLEL      16 (default) or 8: both programs' expert
                                     parallelism (the shared experts' layout)
+    K3_PROGRAM_PREFILL_DECODE_INTERVAL  decode steps after a prefill batch (16)
+    K3_PROGRAM_SCHEDULE_POLICY      fcfs (default) or lpm
     SGLANG_TPU_K3_PROGRAM_PRESHARDED pre-sharded weights directory
 """
 
@@ -94,6 +96,10 @@ server_args.update(
         "prefill_decode_interval": int(
             os.environ.get("K3_PROGRAM_PREFILL_DECODE_INTERVAL", "16")
         ),
+        # Waiting prefills by arrival (fcfs) or longest cached prefix first
+        # (lpm: a session's next turn, a few pages of new work, before a cold
+        # prompt that starts from scratch).
+        "schedule_policy": os.environ.get("K3_PROGRAM_SCHEDULE_POLICY", "fcfs"),
     }
 )
 runtime_env = CONFIG["runtime_env"]
