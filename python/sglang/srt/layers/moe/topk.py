@@ -301,6 +301,42 @@ class TopKConfig:
         return self._correction_bias_dtype_cache
 
 
+class BiasedTopKImpl(Protocol):
+    def __call__(
+        self,
+        *,
+        router_logits: torch.Tensor,
+        correction_bias: torch.Tensor,
+        topk_config: TopKConfig,
+        num_token_non_padded: Optional[torch.Tensor],
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Return weights and logical expert IDs, or None to use built-in routing.
+
+        Implementations must handle the supplied configuration in full or
+        decline it. Padding, remapping and capture remain in select_experts.
+        """
+        ...
+
+
+_BIASED_TOPK_IMPLS: dict[str, BiasedTopKImpl] = {}
+
+
+def register_biased_topk_impl(platform_key: str, impl: BiasedTopKImpl) -> None:
+    """Register a platform's biased router during init_backend, before tracing.
+
+    The key is SRTPlatform.get_dispatch_key_name(). Explicit registration also
+    serves plugins that retain an in-tree platform identity. Re-registering the
+    same implementation is harmless; competing implementations are an error.
+    """
+    if not platform_key:
+        raise ValueError("Biased top-k platform key must not be empty")
+    previous = _BIASED_TOPK_IMPLS.get(platform_key)
+    if previous is not None and previous is not impl:
+        raise ValueError(f"Biased top-k already registered for {platform_key}")
+    _BIASED_TOPK_IMPLS[platform_key] = impl
+
+
 # -------------------------------- TopKOutput ---------------------------------------
 
 
@@ -2689,7 +2725,27 @@ def select_experts(
         if (has_per_rank_fused_shared_slots(num_fused_shared_experts) or _use_aiter)
         else num_fused_shared_experts
     )
-    if dynamic_expert_bias is not None:
+    backend_topk = None
+    if (
+        _BIASED_TOPK_IMPLS
+        and correction_bias is not None
+        and custom_routing_function is None
+    ):
+        from sglang.srt.platforms import current_platform
+
+        impl = _BIASED_TOPK_IMPLS.get(current_platform.get_dispatch_key_name())
+        if impl is not None:
+            backend_topk = impl(
+                router_logits=router_logits,
+                correction_bias=correction_bias,
+                topk_config=topk_config,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+            )
+
+    if backend_topk is not None:
+        topk_weights, topk_ids = backend_topk
+    elif dynamic_expert_bias is not None:
         if scoring_func != "sigmoid":
             raise ValueError(
                 "Per-token expert bias is only supported with sigmoid routing"
