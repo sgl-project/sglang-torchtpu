@@ -57,6 +57,7 @@ from sglang_tpu.hooks.kimi_k3_vision import (
     encode_with_k3_vision_runner,
     pass_through_projected_features,
 )
+from sglang_tpu.hooks.logits_gather import gather_logits_lane_aligned
 from sglang_tpu.hooks.mhc import (
     hc_ffn_post_pre,
     hc_post,
@@ -267,6 +268,12 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.models.kimi_k3.merged_moe_all_reduce",
         twolevel_merged_moe_all_reduce,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.distributed.device_communicators.triton_symm_mem_ag"
+        ".MultimemAllGatherer.__call__",
+        gather_logits_lane_aligned,
         HookType.AROUND,
     ),
     (
