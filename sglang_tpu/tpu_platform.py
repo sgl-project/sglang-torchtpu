@@ -1339,6 +1339,13 @@ class TpuSRTPlatform(SRTPlatform):
                 "TPU GDN/KDA prefix caching requires mamba_chunk_size=64."
             )
 
+    def create_weight_update_receiver(self, backend: str, *, tp_rank: int):
+        from sglang_tpu import shared_slice
+
+        if backend != shared_slice.BACKEND_NAME:
+            return None
+        return shared_slice.receiver(tp_rank)
+
     def get_mamba_pool_cls(self) -> type:
         # Hybrid GDN models (Qwen3.5 / Qwen3-Next) store their recurrent state
         # in a TPU-native, Pallas-kernel-layout pool.
@@ -1527,6 +1534,13 @@ class TpuSRTPlatform(SRTPlatform):
                 "TorchTPU backend initialization requires worker WORLD_SIZE. "
                 "Initialize it from the scheduler worker bootstrap."
             )
+        from sglang_tpu import shared_slice
+
+        shared = shared_slice.spec()
+        if shared is not None:
+            # libtpu builds the whole slice, trainer included, from these
+            job = shared_slice.enter_slice_env(shared)
+            world_size = os.environ["WORLD_SIZE"]
 
         # Keep c10d_functional collectives inside the compiled graph. torch_tpu
         # defaults to materializing collective tensors by forcing graph breaks, which
@@ -1583,6 +1597,8 @@ class TpuSRTPlatform(SRTPlatform):
             from sglang_tpu.fp8_linear import register_fp8_linear_small_m_op
 
             register_fp8_linear_small_m_op()
+        if shared is not None:
+            shared_slice.join(shared, job)
         # Set before registering: importing the model registry imports model_runner,
         # which calls init_backend again on the OOT path.
         self._backend_initialized = True
