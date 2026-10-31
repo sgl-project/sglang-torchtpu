@@ -178,6 +178,10 @@ def join(shared: SharedSlice, job: JobRank) -> None:
     )
 
 
+def joined() -> bool:
+    return _state.backend is not None
+
+
 def receiver(tp_rank: int) -> SharedSliceReceiver:
     """The trainer's rank i (slice rank i) sends to TP rank i."""
     assert _state.backend is not None, f"{ENV_VAR} is unset or the slice was not joined"

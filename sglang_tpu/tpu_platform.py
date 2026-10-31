@@ -1698,6 +1698,12 @@ class TpuSRTPlatform(SRTPlatform):
         return float(total - free)
 
     def get_device(self, device_id: int = 0) -> torch.device:
+        from sglang_tpu import shared_slice
+
+        # a worker on a shared slice sees only its own device, at index 0; joining
+        # started PJRT, so torch_tpu checks the index against that one device
+        if shared_slice.joined():
+            return torch.device("tpu", 0)
         return torch.device("tpu", device_id)
 
     def set_device(self, device: torch.device) -> None:
