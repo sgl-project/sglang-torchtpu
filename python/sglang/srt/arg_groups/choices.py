@@ -147,6 +147,8 @@ HICACHE_IO_BACKEND_CHOICES = [
     "raiden",
 ]
 
+DISAGG_DCP_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
+
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend", "intel_xpu", "tpu"}
@@ -274,6 +276,7 @@ add_radix_supported_deterministic_attention_backend_choices = (
 # --- Transport ---
 
 add_disagg_transfer_backend_choices = DISAGG_TRANSFER_BACKEND_CHOICES.extend
+add_disagg_dcp_transfer_backend_choices = DISAGG_DCP_TRANSFER_BACKEND_CHOICES.extend
 
 # --- Sampling and grammar ---
 

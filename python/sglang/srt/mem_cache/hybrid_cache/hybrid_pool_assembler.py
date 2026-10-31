@@ -166,10 +166,11 @@ def build_kv_host_pool(
         kwargs["mtp_draft_device_pools"] = mtp_draft_device_pools
     parallel = get_parallel()
     if parallel.dcp_enabled:
-        assert use_mla, (
+        assert use_mla or current_platform.dcp_shards_every_kv_pool(), (
             "HiCache + DCP is only wired for the MLA host pool; the MHA host "
             "pool has no DCP index translation."
         )
+    if parallel.dcp_enabled and use_mla:
         kwargs["dcp_size"] = parallel.attn_dcp_size
         kwargs["dcp_rank"] = parallel.attn_dcp_rank
     return kv_host_pool_cls(

@@ -21,6 +21,7 @@ from typing import NamedTuple
 
 import torch
 
+from sglang.srt.compilation.compiled_op import compiled_op
 from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
 __all__ = [
@@ -336,7 +337,8 @@ def build_owner_write_spans(
     src = torch.zeros(max_spans, dtype=torch.int32)
     lens = torch.zeros(max_spans, dtype=torch.int32)
     if owned.numel():
-        breaks = torch.nonzero(phys[1:] != phys[:-1] + 1).flatten() + 1
+        jumps = (phys[1:] != phys[:-1] + 1) | (phys[1:] % page_size == 0)
+        breaks = torch.nonzero(jumps).flatten() + 1
         starts = torch.cat([torch.zeros(1, dtype=torch.int64), breaks])
         ends = torch.cat([breaks, torch.tensor([owned.numel()], dtype=torch.int64)])
         if starts.numel() > max_spans:
@@ -349,6 +351,84 @@ def build_owner_write_spans(
         src[:n] = starts.to(torch.int32)
         lens[:n] = (ends - starts).to(torch.int32)
     return DcpWriteSpans(index, dst, src, lens)
+
+
+@compiled_op()
+def build_verify_step_on_device(
+    seq_lens: torch.Tensor,
+    page_indices: torch.Tensor,
+    swa_page_indices,
+    verify_width: int,
+    dcp_size: int,
+    rank: int,
+    page_size: int,
+    num_tokens: int,
+):
+    bs = seq_lens.shape[0]
+    device = seq_lens.device
+    i32 = torch.int32
+    prefix = seq_lens.to(i32)
+    live = prefix > 0
+    total = prefix + verify_width
+    zero = torch.zeros_like(prefix)
+
+    def shard(lengths):
+        return lengths // dcp_size + (lengths % dcp_size > rank).to(i32)
+
+    kv_lens = torch.where(live, shard(total), zero)
+    global_lens = torch.where(live, total, zero)
+    prefix_lens = torch.where(live, shard(prefix), zero)
+
+    stride = page_size * dcp_size
+    pos = (
+        prefix[:, None] + torch.arange(verify_width, dtype=i32, device=device)[None, :]
+    )
+    owned = (pos % dcp_size == rank) & live[:, None]
+    count = owned.sum(1, dtype=i32)
+    first = (dcp_size - prefix % dcp_size + rank) % dcp_size
+    row = torch.arange(bs, dtype=i32, device=device)
+    start = ((row[None, :] < row[:, None]).to(i32) * count[None, :]).sum(1, dtype=i32)
+    t = torch.arange(num_tokens, dtype=i32, device=device)
+    row_of = ((start + count)[None, :] <= t[:, None]).sum(1, dtype=i32)
+    pick = (row_of[:, None] == row[None, :]).to(i32)
+    first_t = (pick * first[None, :]).sum(1, dtype=i32)
+    start_t = (pick * start[None, :]).sum(1, dtype=i32)
+    index = torch.where(
+        row_of < bs, row_of * verify_width + first_t + (t - start_t) * dcp_size, 0
+    ).to(torch.int64)
+    max_spans = max_write_spans(num_tokens, bs, page_size)
+
+    def spans(table):
+        rows = table.reshape(bs, -1).to(i32)
+        cols = torch.arange(rows.shape[1], dtype=i32, device=device)[None, :]
+        col0 = (prefix // stride).clamp(max=rows.shape[1] - 1)
+        col1 = (col0 + 1).clamp(max=rows.shape[1] - 1)
+        page0 = (rows * (cols == col0[:, None]).to(i32)).sum(1, dtype=i32)
+        page1 = (rows * (cols == col1[:, None]).to(i32)).sum(1, dtype=i32)
+        in_first = (pos // stride).clamp(max=rows.shape[1] - 1) == col0[:, None]
+        page = torch.where(in_first, page0[:, None], page1[:, None])
+        phys = (page * stride + pos % stride) // dcp_size
+        seg_a = owned & in_first
+        seg_b = owned & ~in_first
+        count_a = seg_a.sum(1, dtype=i32)
+        count_b = seg_b.sum(1, dtype=i32)
+        far = torch.iinfo(i32).max
+        dst_a = torch.where(count_a > 0, torch.where(seg_a, phys, far).amin(1), zero)
+        dst_b = torch.where(count_b > 0, torch.where(seg_b, phys, far).amin(1), zero)
+        pad = torch.zeros(max_spans - 2 * bs, dtype=i32, device=device)
+
+        def table_of(a, b):
+            return torch.cat([torch.stack([a, b], 1).reshape(-1), pad])
+
+        return (
+            table_of(dst_a, dst_b),
+            table_of(start, start + count_a),
+            table_of(count_a, count_b),
+        )
+
+    full = spans(page_indices)
+    swa = spans(swa_page_indices) if swa_page_indices is not None else None
+    return kv_lens, global_lens, prefix_lens, index, full, swa
 
 
 def write_owned_kv(

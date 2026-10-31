@@ -13,6 +13,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.platforms import current_platform
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +139,10 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
             "--enable-hisparse with --dcp-size > 1 is not supported: the "
             "HiSparse host pool is constructed without DCP translation."
         )
-    if not use_mla_backend(server_args):
+    if (
+        not use_mla_backend(server_args)
+        and not current_platform.dcp_shards_every_kv_pool()
+    ):
         raise NotImplementedError(
             "HiCache with --dcp-size > 1 is only supported for MLA models: "
             "the index translation lives in MLATokenToKVPoolHost, and the "
