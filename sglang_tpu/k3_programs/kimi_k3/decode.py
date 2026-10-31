@@ -1020,8 +1020,13 @@ class KimiDecoder:
             if offered is not None:
                 states[0] = self.draft.from_ring(*offered, self._zero)
             emitted = None
-            for step in range(3):
-                self.device_plan = None
+            for step in range(4):
+                # Steps 0 and 1 upload their plans (requests entering, then
+                # continuing); steps 2 and 3 keep the device's plan, as steady
+                # serving does, so the ops take the control from the draft
+                # step instead of the plan splice (another operand history).
+                if step < 2:
+                    self.device_plan = None
                 self._sync_plan(
                     [(0, step == 0, 0, 0, params)] * requests, [null] * requests
                 )
