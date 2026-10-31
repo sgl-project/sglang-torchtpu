@@ -2129,6 +2129,24 @@ class EndWeightUpdateReqOutput(BaseReq, kw_only=True):
     message: str
 
 
+class PluginWeightUpdateReqInput(BaseReq, kw_only=True):
+    """Run a weight-update handler that the platform registers, on every TP rank."""
+
+    # a key of SRTPlatform.get_weight_update_handlers()
+    handler: str
+    payload: Dict[str, Any] = {}
+    # as in UpdateWeightsFromTensorReqInput: drop KV computed with the old weights after a successful run
+    flush_cache: bool = False
+    torch_empty_cache: bool = False
+
+
+class PluginWeightUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    # what the handler returned on each TP rank, in rank order
+    results: List[Any] = []
+
+
 class CheckWeightsReqInput(BaseReq, kw_only=True):
     action: str = "checksum"
     allow_quant_error: bool = False

@@ -31,6 +31,8 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    PluginWeightUpdateReqInput,
+    PluginWeightUpdateReqOutput,
     PullWeightsReqInput,
     PullWeightsReqOutput,
     ReleaseMemoryOccupationReqInput,
@@ -46,6 +48,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils.weight_checker import overall_checksum
 
@@ -80,6 +83,20 @@ def _parse_runner_selector(selector: str) -> Set[str]:
     )
 
 
+class PluginWeightUpdateContext(msgspec.Struct, frozen=True):
+    """What a platform weight-update handler sees on one TP rank."""
+
+    model: Any
+    model_config: Any
+    tp_rank: int
+    tp_size: int
+    has_draft_model: bool
+    # a begin_weight_update() session is open
+    session_open: bool
+    # per-rank storage kept across handler calls (e.g. registered receive buffers)
+    state: Dict[str, Any]
+
+
 class _WeightUpdateSession(msgspec.Struct, frozen=True):
     # recorded at begin so end finalizes the same runners
     selector: str
@@ -99,6 +116,7 @@ class SchedulerWeightUpdaterManager:
     stashed_model_static_state: Any = None
     # replicated on every TP rank, so a rejected call returns on all ranks before any barrier
     _session: Optional[_WeightUpdateSession] = None
+    _plugin_state: Dict[str, Any] = field(default_factory=dict)
     tp_cpu_group: Any = field(init=False)
 
     def __post_init__(self) -> None:
@@ -357,6 +375,54 @@ class SchedulerWeightUpdaterManager:
         self._session = None
         torch.distributed.barrier(group=self.tp_cpu_group)
         return EndWeightUpdateReqOutput(success=True, message="Success")
+
+    def plugin_weight_update(self, recv_req: PluginWeightUpdateReqInput):
+        """Run a platform weight-update handler on every TP rank."""
+        handler = current_platform.get_weight_update_handlers().get(recv_req.handler)
+        if handler is None:
+            return PluginWeightUpdateReqOutput(
+                success=False,
+                message=f"this platform has no weight-update handler {recv_req.handler!r}",
+            )
+        model_runner = self.tp_worker.model_runner
+        context = PluginWeightUpdateContext(
+            model=model_runner.model,
+            model_config=model_runner.model_config,
+            tp_rank=get_parallel().tp_rank,
+            tp_size=get_parallel().tp_size,
+            has_draft_model=self.draft_worker is not None,
+            session_open=self._session is not None,
+            state=self._plugin_state,
+        )
+        with self._observe_weight_load("plugin"):
+            success, message, results = self._run_on_every_tp_rank(
+                lambda: handler(context=context, payload=recv_req.payload)
+            )
+        if success:
+            self.flush_cache_after_weight_update(recv_req)
+        return PluginWeightUpdateReqOutput(
+            success=success, message=message, results=results
+        )
+
+    def _run_on_every_tp_rank(
+        self, action: Callable[[], Any]
+    ) -> Tuple[bool, str, List[Any]]:
+        """Run ``action`` here and agree across TP ranks, whose replies other than rank 0's are dropped."""
+        try:
+            outcome = (action(), None)
+        except Exception as e:
+            logger.exception(
+                "weight-update handler failed on TP rank %d", get_parallel().tp_rank
+            )
+            outcome = (None, f"TP rank {get_parallel().tp_rank}: {e}")
+        outcomes: List[Any] = [None] * get_parallel().tp_size
+        torch.distributed.all_gather_object(outcomes, outcome, group=self.tp_cpu_group)
+        errors = [error for _, error in outcomes if error is not None]
+        return (
+            not errors,
+            " | ".join(errors) or "Success",
+            [result for result, _ in outcomes],
+        )
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         scheduler = self.scheduler

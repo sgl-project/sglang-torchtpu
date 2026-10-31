@@ -89,6 +89,14 @@ class SRTPlatform(DeviceMixin):
         """Return the full device-graph backend class for this platform."""
         return None
 
+    def get_weight_update_handlers(self) -> dict[str, Callable[..., Any]]:
+        """Weight-update handlers this platform serves through /plugin_weight_update, by name.
+
+        A handler runs on every TP rank as ``handler(context=PluginWeightUpdateContext, payload=dict)``
+        and returns a picklable result; an exception on any rank fails the request on all of them.
+        """
+        return {}
+
     def get_mha_kv_pool_cls(self) -> type:
         """Return the MHA KV pool class for this platform."""
         raise NotImplementedError
