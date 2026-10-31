@@ -11,10 +11,7 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
-from sglang_tpu.hooks.attn_residual import (
-    prepare_attn_residual_kernel,
-    register_attn_residual_ops,
-)
+from sglang_tpu.hooks.attn_residual import register_attn_residual_ops
 from sglang_tpu.hooks.attn_tp import device_supports_input_scattered
 from sglang_tpu.hooks.cpu_pinning import bind_rank_cpu_set, pin_scheduler_main_thread
 from sglang_tpu.hooks.draft_kv_pool import (
@@ -76,7 +73,6 @@ from sglang_tpu.hooks.pipeline_parallel import (
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 from sglang_tpu.hooks.spec_tp_sync import broadcast_undeferred
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
-from sglang_tpu.hooks.static_fp8 import bind_kimi_k3_static_fp8
 from sglang_tpu.hooks.swa_miss_metrics import hook_specs as swa_miss_metrics_hooks
 from sglang_tpu.hooks.twolevel_allreduce import all_reduce as twolevel_all_reduce
 from sglang_tpu.hooks.twolevel_allreduce import (
@@ -162,11 +158,6 @@ HOOKS: list[tuple] = [
         "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.load_weights",
         load_k3_non_layer_weights,
         HookType.AROUND,
-    ),
-    (
-        "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
-        prepare_attn_residual_kernel,
-        HookType.AFTER,
     ),
     (
         "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
@@ -283,11 +274,6 @@ HOOKS: list[tuple] = [
         "sglang.srt.layers.moe.topk.biased_grouped_topk_impl",
         biased_grouped_topk,
         HookType.AROUND,
-    ),
-    (
-        "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
-        bind_kimi_k3_static_fp8,
-        HookType.AFTER,
     ),
     (
         "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._tpu_mha_pool_class",
