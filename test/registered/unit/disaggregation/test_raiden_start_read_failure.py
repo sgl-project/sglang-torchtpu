@@ -3,6 +3,7 @@ with SGLANG_RAIDEN_LISTENER_START_READ an announcement starts its read."""
 
 import ast
 import inspect
+import queue
 import threading
 import time
 import unittest
@@ -12,6 +13,7 @@ from unittest.mock import Mock, patch
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.disaggregation.raiden import conn as conn_module
 from sglang_tpu.disaggregation.raiden import receiver as receiver_module
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager, RaidenKVReceiver
 from sglang_tpu.disaggregation.raiden.host_pool import StagingAdmission
@@ -83,6 +85,7 @@ def _decode_manager(*, hybrid, chunked, listener=False):
     mgr.chunked_transfer = chunked
     mgr._listener_start_read = listener
     mgr._state_lock = threading.Lock()
+    mgr._drain_lock = threading.Lock()
     mgr._status_lock = threading.Lock()
     mgr.request_status = {ROOM: KVPoll.WaitingForInput}
     mgr.failure_records = {}
@@ -303,6 +306,183 @@ class TestListenerStartsReads(unittest.TestCase):
             listener.join(5)
 
         mgr._engine.start_read.assert_called_once()
+
+
+class _SocketClosed(BaseException):
+    """Sentinel that stops _listen cleanly in tests without logging an error."""
+
+
+class _FakeServerSocket:
+    """The listener's PULL socket: frames queued by the test, delivered in order."""
+
+    def __init__(self):
+        self._frames = queue.Queue()
+        self._closed = False
+
+    def put(self, frames):
+        self._frames.put(frames)
+
+    def close(self):
+        self._closed = True
+        self._frames.put(None)
+
+    def poll(self, timeout_ms):
+        deadline = time.monotonic() + timeout_ms / 1000
+        while self._frames.empty() and not self._closed and time.monotonic() < deadline:
+            time.sleep(0.001)
+        return not self._frames.empty() or self._closed
+
+    def recv_multipart(self):
+        frames = self._frames.get()
+        if frames is None and self._closed:
+            raise _SocketClosed()
+        return frames
+
+
+class TestListenerSweep(unittest.TestCase):
+    def _start_listener(self, mgr):
+        mgr._stop_listener = threading.Event()
+
+        def run():
+            try:
+                mgr._listen()
+            except _SocketClosed:
+                pass
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+
+        def stop():
+            mgr._stop_listener.set()
+            mgr.server_socket.close()
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive(), "listener thread leaked")
+
+        self.addCleanup(stop)
+        return thread
+
+    def test_next_chunk_starts_while_the_scheduler_does_not_poll(self):
+        """#1451: a decode scheduler stalled for a minute left every chunk after
+        a room's first unissued, because only its poll settled the read in
+        flight; the queued announcements then outwaited the transfer deadline.
+        """
+        mgr = _decode_manager(hybrid=False, chunked=True, listener=True)
+        mgr._message_handlers = {Chunk.TAG: mgr._on_chunk}
+        mgr.server_socket = _FakeServerSocket()
+        mgr._engine.poll_stats_with_details.return_value = _polled(
+            received=[f"{ROOM}#0"]
+        )
+
+        with patch.object(conn_module, "_LISTENER_SWEEP_INTERVAL_S", 0.01, create=True):
+            self._start_listener(mgr)
+            mgr.server_socket.put(_chunk(0))
+            mgr.server_socket.put(_chunk(1))
+            deadline = time.monotonic() + 1.0
+            while len(_started(mgr._engine)) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+        self.assertEqual(_started(mgr._engine), [f"{ROOM}#0", f"{ROOM}#1"])
+
+    def test_stuck_scheduler_drain_does_not_wedge_listener_dispatch(self):
+        """A scheduler hung inside _drain_engine holds _drain_lock; the listener
+        sweep must skip draining rather than blocking message dispatch."""
+        mgr = _decode_manager(hybrid=False, chunked=True, listener=True)
+        mgr._message_handlers = {Chunk.TAG: mgr._on_chunk}
+        mgr.server_socket = _FakeServerSocket()
+
+        self.assertTrue(mgr._drain_lock.acquire(blocking=False))
+        self.addCleanup(mgr._drain_lock.release)
+
+        with patch.object(conn_module, "_LISTENER_SWEEP_INTERVAL_S", 0.01, create=True):
+            self._start_listener(mgr)
+            # Let at least two sweep deadlines fire while _drain_lock is held.
+            time.sleep(0.05)
+            mgr.server_socket.put(_chunk(0))
+            deadline = time.monotonic() + 1.0
+            while len(_started(mgr._engine)) < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+        self.assertEqual(_started(mgr._engine), [f"{ROOM}#0"])
+        mgr._engine.poll_stats_with_details.assert_not_called()
+
+    def test_raising_sweep_keeps_listener_dispatching(self):
+        mgr = _decode_manager(hybrid=False, chunked=True, listener=True)
+        mgr._message_handlers = {Chunk.TAG: mgr._on_chunk}
+        mgr.server_socket = _FakeServerSocket()
+        mgr._engine.poll_stats_with_details.side_effect = RuntimeError("poll boom")
+        mgr._engine_poll_failing_since = {"full": -200.0}
+
+        with patch.object(conn_module, "_LISTENER_SWEEP_INTERVAL_S", 0.01, create=True):
+            self._start_listener(mgr)
+            deadline = time.monotonic() + 1.0
+            while (
+                mgr._engine.poll_stats_with_details.call_count < 2
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            mgr.server_socket.put(_chunk(0))
+            deadline = time.monotonic() + 1.0
+            while len(_started(mgr._engine)) < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+        self.assertGreaterEqual(mgr._engine.poll_stats_with_details.call_count, 2)
+        self.assertEqual(_started(mgr._engine), [f"{ROOM}#0"])
+
+    def test_expired_queued_chunk_fails_room_during_sweep(self):
+        mgr = _decode_manager(hybrid=False, chunked=True, listener=True)
+        mgr._message_handlers = {Chunk.TAG: mgr._on_chunk}
+        mgr.server_socket = _FakeServerSocket()
+        mgr._timeout_s = 10.0
+        clock = [100.0]
+        mgr._monotonic = lambda: clock[0]
+
+        with (
+            patch.object(RaidenKVReceiver, "_send_abort_notification"),
+            patch.object(conn_module, "_LISTENER_SWEEP_INTERVAL_S", 0.01, create=True),
+        ):
+            mgr._on_chunk(_chunk(0))
+            mgr._on_chunk(_chunk(1))
+            self.assertEqual(_started(mgr._engine), [f"{ROOM}#0"])
+            clock[0] = 125.0
+            mgr._engine.poll_stats_with_details.return_value = _polled(
+                received=[f"{ROOM}#0"]
+            )
+            self._start_listener(mgr)
+            deadline = time.monotonic() + 1.0
+            while not mgr.is_failed(ROOM) and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+        self.assertTrue(mgr.is_failed(ROOM))
+        self.assertEqual(_started(mgr._engine), [f"{ROOM}#0"])
+        self.assertIn(
+            "Request 53 waited 25s for a host staging slot, past the 10s transfer deadline",
+            mgr.failure_records[ROOM],
+        )
+
+    def test_prefill_pipeline_and_non_chunked_managers_do_not_sweep_reads(self):
+        for kind in ("prefill", "non_chunked", "pipeline"):
+            with self.subTest(kind=kind):
+                mgr = _decode_manager(
+                    hybrid=False,
+                    chunked=(kind != "non_chunked"),
+                    listener=True,
+                )
+                if kind == "prefill":
+                    mgr._decode = None
+                elif kind == "pipeline":
+                    mgr._pipeline = Mock()
+                mgr._message_handlers = {}
+                mgr.server_socket = _FakeServerSocket()
+
+                with patch.object(
+                    conn_module, "_LISTENER_SWEEP_INTERVAL_S", 0.01, create=True
+                ):
+                    self._start_listener(mgr)
+                    time.sleep(0.05)
+
+                mgr._engine.poll_stats_with_details.assert_not_called()
+                if mgr._pipeline is not None:
+                    mgr._pipeline.poll.assert_not_called()
 
 
 if __name__ == "__main__":

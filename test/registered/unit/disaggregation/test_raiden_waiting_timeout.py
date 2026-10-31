@@ -29,6 +29,7 @@ def _decode_manager():
     mgr._decode.local_blocks[ROOM] = [21, 22, 23]
     mgr.chunked_transfer = True
     mgr._state_lock = threading.Lock()
+    mgr._drain_lock = threading.Lock()
     mgr._status_lock = threading.Lock()
     mgr.failure_lock = threading.Lock()
     mgr.connection_lock = threading.Lock()

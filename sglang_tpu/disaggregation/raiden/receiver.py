@@ -485,6 +485,23 @@ class RaidenReceiverMixin:
             return self._start_chunked_pull(room)
         return self._start_whole_pull(room)
 
+    def _sweep_pulls(self) -> None:
+        """Settle finished reads and start the queued chunks they unblock.
+
+        Runs on the listener. A room keeps one chunk read in flight and a read
+        holds its staging until a drain settles it, so a scheduler stalled
+        between polls would otherwise leave every later announcement queued
+        until it outwaits the transfer deadline.
+        """
+        if not self.chunked_transfer or self._pipeline is not None:
+            return
+        if not self._try_drain_engine():
+            return
+        with self._state_lock:
+            rooms = [room for room, queue in self._decode.chunk_queue.items() if queue]
+        for room in rooms:
+            self._start_chunked_pull(room)
+
     def _start_chunked_pull(self, room: int) -> bool:
         """Issue the next announced chunk once the pool can seat it.
 
