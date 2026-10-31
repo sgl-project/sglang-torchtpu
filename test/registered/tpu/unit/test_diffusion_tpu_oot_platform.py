@@ -65,6 +65,14 @@ class TestOutOfTreeContract(CustomTestCase):
             Platform.get_device_communicator_cls(),
         )
 
+    def test_attention_output_is_exchanged_in_head_slabs(self):
+        self.assertTrue(TpuOOTPlatform.prefers_head_slab_output_exchange())
+        self.assertFalse(Platform.prefers_head_slab_output_exchange())
+
+    def test_safetensors_are_read_on_the_host(self):
+        self.assertFalse(TpuOOTPlatform.supports_safetensors_device_load())
+        self.assertTrue(Platform.supports_safetensors_device_load())
+
 
 class TestSplashBackend(CustomTestCase):
     def setUp(self):
