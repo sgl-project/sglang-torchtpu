@@ -18,8 +18,8 @@ Environment:
     K3_PROGRAM_KV_DTYPE             fp8_e4m3 (default) or bf16
     K3_PROGRAM_EXPERT_PARALLEL      16 (default) or 8: both programs' expert
                                     parallelism (the shared experts' layout)
-    K3_PROGRAM_PREFILL_DECODE_INTERVAL  decode steps after a prefill batch (16)
-    K3_PROGRAM_SCHEDULE_POLICY      fcfs (default) or lpm
+    K3_PROGRAM_PREFILL_DECODE_INTERVAL  decode steps after a prefill batch (32)
+    K3_PROGRAM_SCHEDULE_POLICY      lpm (default) or fcfs
     K3_PROGRAM_PREFILL_SHARE        prefill's share of the engine while
                                     requests decode (0: the fixed interval)
     SGLANG_TPU_K3_PROGRAM_PRESHARDED pre-sharded weights directory
@@ -95,13 +95,15 @@ server_args.update(
         "max_total_tokens": None,
         # Decode steps between prefill batches: a long prompt's chunks would
         # otherwise stop every decoding request on the engine until it ends.
+        # 32 (with lpm) against 16 (fcfs) at AgentX concurrency 8 on hardware:
+        # the same throughput, ITL 6.3 against 9.8 ms, TTFT 2.3 against 1.6 s.
         "prefill_decode_interval": int(
-            os.environ.get("K3_PROGRAM_PREFILL_DECODE_INTERVAL", "16")
+            os.environ.get("K3_PROGRAM_PREFILL_DECODE_INTERVAL", "32")
         ),
         # Waiting prefills by arrival (fcfs) or longest cached prefix first
         # (lpm: a session's next turn, a few pages of new work, before a cold
         # prompt that starts from scratch).
-        "schedule_policy": os.environ.get("K3_PROGRAM_SCHEDULE_POLICY", "fcfs"),
+        "schedule_policy": os.environ.get("K3_PROGRAM_SCHEDULE_POLICY", "lpm"),
     }
 )
 runtime_env = CONFIG["runtime_env"]
