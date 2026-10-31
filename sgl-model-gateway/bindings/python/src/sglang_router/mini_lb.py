@@ -13,7 +13,7 @@ import urllib
 import warnings
 from http import HTTPStatus
 from itertools import chain
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Awaitable, Dict, List, Optional, Set, Tuple
 
 import aiohttp
 import orjson
@@ -141,6 +141,57 @@ async def _probe_status(
         return None, f"{type(e).__name__}: {e}"
 
 
+def _response_failed(task: asyncio.Task) -> bool:
+    return task.exception() is not None or task.result().status != 200
+
+
+async def _post_prefill_and_decode(
+    *,
+    prefill_request: Awaitable[aiohttp.ClientResponse],
+    decode_request: Awaitable[aiohttp.ClientResponse],
+) -> Tuple[Optional[aiohttp.ClientResponse], Optional[aiohttp.ClientResponse]]:
+    """Send a request's prefill and decode POSTs concurrently.
+
+    Returns both responses once both have answered. A PD request needs both
+    halves, so if one side fails (non-200 or transport error) while the other
+    is still pending, the pending side can never succeed -- e.g. a prefill
+    whose decode rejected the request would otherwise wait until its 300s
+    bootstrap timeout, and the client with it (#658). The pending request is
+    then cancelled, which closes its connection so that engine aborts the
+    request, and ``None`` is returned in its place. A side is therefore
+    ``None`` only when the other failed. A transport error of the failed side
+    is re-raised, after closing the other side's response if it had arrived.
+    """
+    prefill_task = asyncio.ensure_future(prefill_request)
+    decode_task = asyncio.ensure_future(decode_request)
+    tasks = (prefill_task, decode_task)
+    pending = set(tasks)
+    try:
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            if pending and any(_response_failed(task) for task in done):
+                break
+    finally:
+        # Also runs if this coroutine is cancelled (client disconnect).
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+    answered = [task for task in tasks if not task.cancelled()]
+    error = next((t.exception() for t in answered if t.exception() is not None), None)
+    if error is not None:
+        for task in answered:
+            if task.exception() is None:
+                task.result().close()
+        raise error
+    return (
+        None if prefill_task.cancelled() else prefill_task.result(),
+        None if decode_task.cancelled() else decode_task.result(),
+    )
+
+
 class MiniLoadBalancer:
     """Debug P/D router with opt-in prefill affinity and sampled load placement.
 
@@ -204,22 +255,6 @@ class MiniLoadBalancer:
                 raise
             self.affinity_policy.loads.mark_unreachable(engine)
             raise _UpstreamConnectionError(f"{engine}: {error!r}") from error
-
-    async def _gather_requests(self, *requests):
-        """Cancel and close the peer when affinity loses one upstream."""
-        if self.affinity_policy is None:
-            return await asyncio.gather(*requests)
-        tasks = [asyncio.ensure_future(request) for request in requests]
-        try:
-            return await asyncio.gather(*tasks)
-        except BaseException:
-            for task in tasks:
-                task.cancel()
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
-            for response in responses:
-                if isinstance(response, aiohttp.ClientResponse):
-                    response.close()
-            raise
 
     def _validate_router_args(self, router_args: RouterArgs):
         logger.warning(
@@ -469,7 +504,7 @@ class MiniLoadBalancer:
 
     async def generate(
         self, modified_request, prefill_server, decode_server, endpoint
-    ) -> ORJSONResponse:
+    ) -> Response:
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
         expected_decode_dp_rank = None
@@ -483,23 +518,32 @@ class MiniLoadBalancer:
             decode_req = modified_request
 
         async with aiohttp.ClientSession(timeout=self._client_timeout()) as session:
-            tasks = [
-                self._engine_request(
+            prefill_response, decode_response = await _post_prefill_and_decode(
+                prefill_request=self._engine_request(
                     prefill_server,
                     session.post,
                     f"{prefill_server}/{endpoint}",
                     json=prefill_req,
                 ),
-                self._engine_request(
+                decode_request=self._engine_request(
                     decode_server,
                     session.post,
                     f"{decode_server}/{endpoint}",
                     json=decode_req,
                 ),
-            ]
-
-            # Wait for both responses to complete. Prefill should end first.
-            prefill_response, decode_response = await self._gather_requests(*tasks)
+            )
+            # Also covers a cancelled (None) side: the other one failed. Both
+            # can be non-None with one failed when it answered last.
+            for response, engine in (
+                (prefill_response, prefill_server),
+                (decode_response, decode_server),
+            ):
+                if response is not None and response.status != 200:
+                    return Response(
+                        content=await self._engine_request(engine, response.read),
+                        status_code=response.status,
+                        media_type=response.content_type,
+                    )
 
             if "return_logprob" in modified_request:
                 prefill_json = await self._engine_request(
@@ -636,23 +680,32 @@ class MiniLoadBalancer:
         try:
             # Both servers answer the headers before any token is produced, so
             # a request either server rejects is known here, before the
-            # streaming response (and its 200 status) is committed.
-            prefill_response, decode_response = await self._gather_requests(
-                self._engine_request(
+            # streaming response (and its 200 status) is committed. A side
+            # still pending when the other fails is cancelled (None).
+            prefill_response, decode_response = await _post_prefill_and_decode(
+                prefill_request=self._engine_request(
                     prefill_server,
                     session.post,
                     f"{prefill_server}/{endpoint}",
                     json=modified_request,
                 ),
-                self._engine_request(
+                decode_request=self._engine_request(
                     decode_server,
                     session.post,
                     f"{decode_server}/{endpoint}",
                     json=modified_request,
                 ),
             )
-            responses.extend((prefill_response, decode_response))
-            for response, engine in zip(responses, (prefill_server, decode_server)):
+            answered = [
+                (response, engine)
+                for response, engine in (
+                    (prefill_response, prefill_server),
+                    (decode_response, decode_server),
+                )
+                if response is not None
+            ]
+            responses.extend(response for response, _ in answered)
+            for response, engine in answered:
                 if response.status != 200:
                     body = await self._engine_request(engine, response.read)
                     return Response(
