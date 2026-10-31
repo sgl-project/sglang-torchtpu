@@ -457,6 +457,80 @@ class TestMuseSparkPipelineParallel(CustomTestCase):
                 else:
                     self.assertIsInstance(layer, PPMissingLayer)
 
+    def test_omni_wrapper_gates_vision_to_first_stage_and_forwards_proxy(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import sglang_tpu.models.muse_spark as text_mod
+        import sglang_tpu.models.muse_spark_omni as omni_mod
+        from sglang.srt.layers.utils import PPMissingLayer
+        from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
+        def _fake_text_init(self, config, quant_config=None, prefix=""):
+            torch.nn.Module.__init__(self)
+            self.text_config = SimpleNamespace(rms_norm_eps=1e-5, hidden_size=16)
+            self.pp_group = text_mod.get_parallel().pp_group
+            self.logits_processor = SimpleNamespace()
+            self.model = _build_stub_text_stage(
+                4,
+                0 if self.pp_group.is_first_rank else 2,
+                2 if self.pp_group.is_first_rank else 4,
+                is_first=self.pp_group.is_first_rank,
+                is_last=self.pp_group.is_last_rank,
+            )
+            self.lm_head = (
+                torch.nn.Linear(16, 32, bias=False)
+                if self.pp_group.is_last_rank
+                else PPMissingLayer()
+            )
+            self.capture_aux_hidden_states = False
+            self._megakernel = None
+
+        fake_non_first = SimpleNamespace(
+            pp_group=SimpleNamespace(
+                world_size=2, rank_in_group=1, is_first_rank=False, is_last_rank=False
+            )
+        )
+        with (
+            patch.object(
+                text_mod.MuseSparkForConditionalGeneration, "__init__", _fake_text_init
+            ),
+            patch.object(text_mod, "get_parallel", return_value=fake_non_first),
+            patch.object(
+                omni_mod,
+                "get_mm",
+                return_value=SimpleNamespace(enable_multimodal=True),
+            ),
+        ):
+            stage1 = omni_mod.MuseSparkForConditionalGeneration(SimpleNamespace())
+
+        self.assertFalse(stage1.vision_enabled)
+        self.assertIsInstance(stage1.get_input_embeddings(), PPMissingLayer)
+        in_proxy = PPProxyTensors(
+            {
+                "hidden_states": torch.randn(3, 16, dtype=torch.float32),
+                "residual": torch.zeros(3, 16, dtype=torch.float32),
+            }
+        )
+        out_proxy = stage1(
+            torch.tensor([1, 2, 3]),
+            torch.arange(3),
+            None,
+            pp_proxy_tensors=in_proxy,
+        )
+        self.assertIsInstance(out_proxy, PPProxyTensors)
+        self.assertEqual(out_proxy.tensors["hidden_states"].dtype, torch.float32)
+
+        decoder = omni_mod._Decoder(stage1)
+        self.assertIs(decoder.pp_group, stage1.pp_group)
+        dec_proxy = decoder(
+            torch.tensor([1, 2, 3]),
+            torch.arange(3),
+            None,
+            pp_proxy_tensors=in_proxy,
+        )
+        self.assertIsInstance(dec_proxy, PPProxyTensors)
+
 
 if __name__ == "__main__":
     unittest.main()
