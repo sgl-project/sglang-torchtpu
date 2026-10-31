@@ -72,8 +72,11 @@ class TestTpuDMAKVTransfer(CustomTestCase):
             start_layer=0,
             end_layer=2,
             layer_num=2,
-            get_fused_kv_buffer=Mock(
-                return_value=torch.empty((3, 4, 1, 2, 128), dtype=torch.bfloat16)
+            page_buffers=Mock(
+                return_value=[
+                    torch.empty((3, 4, 1, 2, 128), dtype=torch.bfloat16)
+                    for _ in range(2)
+                ]
             ),
         )
         with (
@@ -113,8 +116,11 @@ class TestTpuDMAKVTransfer(CustomTestCase):
                 start_layer=0,
                 end_layer=layer_num,
                 layer_num=layer_num,
-                get_fused_kv_buffer=Mock(
-                    return_value=torch.empty((8, 128, 8, 2, 128), dtype=torch.bfloat16)
+                page_buffers=Mock(
+                    return_value=[
+                        torch.empty((8, 128, 8, 2, 128), dtype=torch.bfloat16)
+                        for _ in range(layer_num)
+                    ]
                 ),
             )
 

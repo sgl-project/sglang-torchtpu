@@ -1431,6 +1431,16 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         del self.index_key_buffer
         del self.kpool_raw_buffer
 
+    def get_page_buffers(self, layer_id: int) -> list[torch.Tensor]:
+        """Layer ``layer_id``'s buffers in a fixed order: NoPE, RoPE, then the
+        index keys and raw key|gate when it has them. Each leads with
+        ``num_pages``, so a request's page ids address it in all of them."""
+        i = layer_id - self.start_layer
+        optional = (self.index_key_buffer[i], self.kpool_raw_buffer[i])
+        return [self.nope_buffer[i], self.rope_buffer[i]] + [
+            buf for buf in optional if buf is not None
+        ]
+
     def get_nope_cache(self, layer_id: int) -> torch.Tensor:
         return self.nope_buffer[layer_id - self.start_layer]
 

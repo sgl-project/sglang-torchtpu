@@ -40,7 +40,11 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.utils import next_power_of_2
-from sglang_tpu.tpu_dma_hicache import TransferEvent, create_tpu_dma_kv_transfer
+from sglang_tpu.tpu_dma_hicache import (
+    TransferEvent,
+    create_tpu_dma_kv_transfer,
+    page_major_tensors,
+)
 
 if TYPE_CHECKING:
     from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
@@ -369,12 +373,39 @@ class TpuDMAHostKVPool(HostKVCache):
         *,
         pool_label: str = "kv",
         mtp_draft_device_pools: tuple = (),
+        # MLA flat-layout row width; the engine copies the device pages as they
+        # are, so the width comes from page_major_tensors.
+        override_kv_cache_dim: Optional[int] = None,
     ):
-        if mtp_draft_device_pools:
-            raise NotImplementedError(
-                "MTP draft KV offload is not supported on --hicache-io-backend "
-                f"{self.io_backend}."
-            )
+        del override_kv_cache_dim
+        # Packed MTP draft pools share the target's page ids, so one engine
+        # moves a page of the target and of every draft together.
+        self.draft_pools = tuple(mtp_draft_device_pools)
+        self.dtype = device_pool.store_dtype
+        self.start_layer = device_pool.start_layer
+        self.end_layer = device_pool.end_layer
+        self.layer_num = device_pool.layer_num
+        self._init_pages(
+            device_pool,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=host_size,
+            page_size=page_size,
+            pin_memory=pin_memory,
+            device=device,
+            pool_label=pool_label,
+        )
+
+    def _init_pages(
+        self,
+        device_pool,
+        *,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        pin_memory: bool,
+        device: str,
+        pool_label: str,
+    ) -> None:
         # The engine owns the host storage, so skip the base allocator setup
         # but retain its sizing and host-memory admission check.
         self.device_pool = device_pool
@@ -383,11 +414,6 @@ class TpuDMAHostKVPool(HostKVCache):
         self.layout = TPU_DMA_LAYOUT
         self.pin_memory = pin_memory
         self.device = device
-
-        self.dtype = device_pool.store_dtype
-        self.start_layer = device_pool.start_layer
-        self.end_layer = device_pool.end_layer
-        self.layer_num = device_pool.layer_num
 
         self.size_per_token = self.get_size_per_token()
         if host_size > 0:
@@ -428,7 +454,7 @@ class TpuDMAHostKVPool(HostKVCache):
         )
 
         self.transfer = create_tpu_dma_kv_transfer(
-            self.io_backend, device_pool, self.page_num
+            self.io_backend, device_pool, self.page_num, draft_pools=self.draft_pools
         )
 
         self.lock = threading.RLock()
@@ -439,16 +465,19 @@ class TpuDMAHostKVPool(HostKVCache):
     # ------------------------------------------------------------------ #
 
     def get_size_per_token(self) -> int:
-        """Host bytes per cached token = fused device page bytes / page_size.
+        """Host bytes per cached token = device page bytes / page_size.
 
-        Uses the *real* (padded) fused-page byte size so the host_size GB
-        budget matches the engine's actual per-page allocation, not the logical
-        ``2 * head_num * head_dim`` lower bound.
+        Uses the *real* (padded) page byte size of every page-major tensor so
+        the host_size GB budget matches the engine's actual per-page allocation,
+        not the logical ``2 * head_num * head_dim`` lower bound.
         """
-        fused = self.device_pool.get_fused_kv_buffer(self.start_layer)
-        page_bytes = int(np.prod(fused.shape[1:])) * fused.element_size()
-        per_token = page_bytes // self.page_size
-        return per_token * self.layer_num
+        tensors = [
+            t
+            for pool in (self.device_pool, *self.draft_pools)
+            for t in page_major_tensors(pool)
+        ]
+        page_bytes = sum(int(np.prod(t.shape[1:])) * t.element_size() for t in tensors)
+        return page_bytes // self.page_size
 
     def init_kv_buffer(self):
         # The engine owns host memory; there is no torch host buffer.
@@ -566,5 +595,46 @@ def tpu_dma_host_kv_pool_cls(io_backend: str) -> type[TpuDMAHostKVPool]:
     return type(
         f"TpuDMAHostKVPool[{io_backend}]",
         (TpuDMAHostKVPool,),
+        {"io_backend": io_backend},
+    )
+
+
+class TpuDMAMambaPoolHost(TpuDMAHostKVPool):
+    """Host store for recurrent-state (GDN/KDA) slots, copied by the DMA engine.
+
+    ``TpuMambaPool`` keeps one ``[state_slots, ...]`` tensor per layer and state
+    kind, so a slot is one row of each: the engine moves it as a page of one row.
+    """
+
+    def __init__(
+        self,
+        device_pool,
+        host_to_device_ratio: float,
+        host_size: int,
+        *,
+        allocator_type: str = "default",
+        layout: str = TPU_DMA_LAYOUT,
+    ):
+        del allocator_type, layout
+        self.num_mamba_layers = device_pool.num_mamba_layers
+        self.draft_pools = ()
+        self._init_pages(
+            device_pool,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=host_size,
+            page_size=1,
+            pin_memory=False,
+            device="cpu",
+            pool_label="mamba",
+        )
+
+
+def tpu_dma_mamba_pool_host_cls(io_backend: str) -> type[TpuDMAMambaPoolHost]:
+    """The ``TpuDMAMambaPoolHost`` class whose instances copy with ``io_backend``."""
+    if io_backend == TpuDMAMambaPoolHost.io_backend:
+        return TpuDMAMambaPoolHost
+    return type(
+        f"TpuDMAMambaPoolHost[{io_backend}]",
+        (TpuDMAMambaPoolHost,),
         {"io_backend": io_backend},
     )
