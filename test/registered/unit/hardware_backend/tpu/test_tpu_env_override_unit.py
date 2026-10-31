@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import patch
 
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu import env_override
 from sglang_tpu.env_override import (
     _DECODE_CP_SPARSE_CORE_OVERRIDES,
     _VMEM_PREFETCH_MIN_LAYERS,
@@ -24,6 +25,50 @@ from sglang_tpu.env_override import (
     apply_small_kv_pool_vmem_prefetch_override,
     apply_tpu_env_overrides,
 )
+
+_MINIMAL = "/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4"
+_FULL = "/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4"
+
+
+class TestTcmallocPreload(CustomTestCase):
+    def _apply(self, preload, installed=frozenset(), enabled="1"):
+        env = {"SGLANG_TPU_PRELOAD_TCMALLOC": enabled}
+        if preload is not None:
+            env["LD_PRELOAD"] = preload
+        with (
+            patch.dict(os.environ, env, clear=False),
+            patch.object(
+                env_override.os.path, "exists", side_effect=installed.__contains__
+            ),
+        ):
+            if preload is None:
+                os.environ.pop("LD_PRELOAD", None)
+            apply_tpu_env_overrides()
+            return os.environ.get("LD_PRELOAD")
+
+    def test_installed_tcmalloc_is_preloaded_for_spawned_ranks(self):
+        self.assertEqual(self._apply(None, installed={_MINIMAL}), _MINIMAL)
+
+    def test_full_tcmalloc_is_used_when_minimal_is_missing(self):
+        self.assertEqual(self._apply(None, installed={_FULL}), _FULL)
+
+    def test_existing_preload_is_kept_after_tcmalloc(self):
+        self.assertEqual(
+            self._apply("/opt/stub.so", installed={_MINIMAL}),
+            f"{_MINIMAL}:/opt/stub.so",
+        )
+
+    def test_user_tcmalloc_preload_is_left_unchanged(self):
+        user = "/custom/libtcmalloc.so"
+        self.assertEqual(self._apply(user, installed={_MINIMAL}), user)
+
+    def test_missing_library_leaves_preload_unset_and_warns(self):
+        with self.assertLogs(env_override.logger, level="WARNING") as logs:
+            self.assertIsNone(self._apply(None))
+        self.assertIn("libtcmalloc-minimal4", logs.output[0])
+
+    def test_opt_out_leaves_preload_unset(self):
+        self.assertIsNone(self._apply(None, installed={_MINIMAL}, enabled="0"))
 
 
 class TestLibtpuInitArgsOverrides(CustomTestCase):
