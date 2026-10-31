@@ -304,5 +304,71 @@ class TestBatchedRpaKernelArguments(CustomTestCase):
         self.assertIs(kernel.call_args.kwargs["attention_sink"], sinks)
 
 
+class TestMixedVerifyTailsLast(CustomTestCase):
+    """SGLANG_TPU_MIXED_VERIFY_TAILS_LAST: the tails stay last and no row moves."""
+
+    def test_distribution_marks_the_trailing_tails(self):
+        from sglang_tpu.attention_pallas_rpa_base import (
+            _mixed_verify_tails_last_distribution,
+        )
+
+        d = _mixed_verify_tails_last_distribution(
+            query_lens=(20, 4, 8, 8, 0), live=4, width=8
+        )
+        self.assertEqual(d.tolist(), [0, 2, 4])
+
+    def _run(self, distribution, cu_q_lens, num_rows):
+        import os
+
+        import jax.numpy as jnp
+
+        from sglang_tpu import attention_pallas_rpa_batched
+
+        calls = []
+
+        def kernel(q, k, v, cache, kv_lens, pages, cu, dist, **kwargs):
+            calls.append((dist.tolist(), kwargs["prefill_block_sizes"] is not None))
+            return jnp.full(q.shape, float(len(calls))), cache
+
+        with (
+            patch.object(
+                attention_pallas_rpa_batched, "kv_layout", return_value="layout"
+            ),
+            patch.dict(os.environ, {"SGLANG_TPU_MIXED_VERIFY_TAILS_LAST": "1"}),
+        ):
+            out, _ = attention_pallas_rpa_batched._invoke_batched_kernel(
+                kernel,
+                queries=jnp.zeros((num_rows, 2, 4)),
+                keys=None,
+                values=None,
+                kv_cache_fused="cache",
+                kv_lens=None,
+                page_indices=None,
+                cu_q_lens=jnp.array(cu_q_lens, dtype=jnp.int32),
+                cu_kv_lens=None,
+                distribution=jnp.array(distribution, dtype=jnp.int32),
+                attention_sink=None,
+                sm_scale=1.0,
+                sliding_window=None,
+                soft_cap=None,
+                k_scale=None,
+                v_scale=None,
+                decode_query_size=8,
+            )
+        return calls, out[:, 0, 0].tolist()
+
+    def test_tails_run_in_the_verify_pass_and_prefill_in_the_rest(self):
+        # Two prefill sequences (20 and 4 rows), then two 8-row tails, then 2 padding rows.
+        calls, rows = self._run([0, 2, 4], [0, 20, 24, 32, 40], num_rows=42)
+        self.assertEqual(calls, [([0, 2, 4], True), ([0, 0, 2], False)])
+        self.assertEqual(rows[24:40], [1.0] * 16)
+        self.assertEqual(rows[:24] + rows[40:], [2.0] * 26)
+
+    def test_decode_ordered_verify_keeps_the_original_split(self):
+        calls, rows = self._run([4, 4, 4], [0, 8, 16, 24, 32], num_rows=34)
+        self.assertEqual(calls, [([0, 0, 4], True), ([0, 4, 4], False)])
+        self.assertEqual(rows[:32], [1.0] * 32)
+
+
 if __name__ == "__main__":
     unittest.main()

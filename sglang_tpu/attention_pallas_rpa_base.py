@@ -65,6 +65,7 @@ from sglang_tpu.cp_forward import (
     get_tpu_cp_layout,
 )
 from sglang_tpu.cp_layout import TpuCpHostLayout
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.host_metadata_cache import HostMetadataCache
 from sglang_tpu.kv_row_write import (
     get_write_rows_op,
@@ -203,6 +204,18 @@ def _mixed_verify_order(
         row_unperm=row_unperm.to(torch.int32),
         distribution=torch.tensor([len(narrow), len(narrow), live], dtype=torch.int32),
     )
+
+
+def _mixed_verify_tails_last_distribution(
+    *, query_lens: tuple[int, ...], live: int, width: int
+) -> torch.Tensor:
+    """``[0, p, live]`` for a mixed-verify extend kept in batch order: the trailing live
+    sequences of exactly ``width`` rows (the decoding tails) are ``[p, live)``. The leading
+    0 tells the kernel call apart from a decode-ordered ``[k, k, n]`` (k >= 1)."""
+    p = live
+    while p > 0 and query_lens[p - 1] == width:
+        p -= 1
+    return torch.tensor([0, p, live], dtype=torch.int32)
 
 
 def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch.Tensor:
@@ -1157,7 +1170,20 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             query_width = 1
 
         seq_order = row_perm = row_unperm = None
-        if getattr(forward_batch, "mix_verify_width", 1) > 1 and decode_query_size > 1:
+        mixed_verify = (
+            getattr(forward_batch, "mix_verify_width", 1) > 1 and decode_query_size > 1
+        )
+        if mixed_verify and tpu_envs.SGLANG_TPU_MIXED_VERIFY_TAILS_LAST.get():
+            # The tails already end the batch: keep its order and pass [0, prefill
+            # sequences, live]; the kernel runs the tails as the verify pass's MIXED range.
+            distribution = self._value_metadata(
+                name="mixed_verify_tails_last_distribution",
+                value=_mixed_verify_tails_last_distribution(
+                    query_lens=query_lens, live=non_empty_bs, width=decode_query_size
+                ),
+                device=device,
+            )
+        elif mixed_verify:
             order = _mixed_verify_order(
                 query_lens=query_lens,
                 live=non_empty_bs,

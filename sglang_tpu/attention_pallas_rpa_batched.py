@@ -130,15 +130,34 @@ def _invoke_batched_kernel(
     # remaining sequences then run as MIXED with the prefill blocks.
     import jax.numpy as jnp
 
+    verify_dist = jnp.zeros_like(distribution).at[2].set(distribution[0])
+    rest_dist = distribution.at[0].set(0)
+    rows = jnp.arange(queries.shape[0])
+    verify_rows = rows < cu_q_lens[distribution[0]]
+    if tpu_envs.SGLANG_TPU_MIXED_VERIFY_TAILS_LAST.get():
+        # A mixed-verify extend kept in batch order arrives as [0, p, n]: the tails are
+        # sequences [p, n), the verify pass's MIXED range, and the prefill pass takes
+        # [0, p). A decode-ordered [k, k, n] (k >= 1) keeps the split above.
+        tails_last = distribution[0] == 0
+        verify_dist = jnp.where(tails_last, rest_dist, verify_dist)
+        rest_dist = jnp.where(
+            tails_last,
+            jnp.zeros_like(distribution).at[2].set(distribution[1]),
+            rest_dist,
+        )
+        verify_rows = jnp.where(
+            tails_last,
+            (rows >= cu_q_lens[distribution[1]]) & (rows < cu_q_lens[distribution[2]]),
+            verify_rows,
+        )
     out_verify, kv_cache_fused = run(
         kv_cache_fused,
-        jnp.zeros_like(distribution).at[2].set(distribution[0]),
+        verify_dist,
         _verify_blocks(
             decode_query_size=decode_query_size, sliding_window=sliding_window
         ),
     )
-    out_rest, kv_cache_fused = run(kv_cache_fused, distribution.at[0].set(0))
-    verify_rows = jnp.arange(queries.shape[0]) < cu_q_lens[distribution[0]]
+    out_rest, kv_cache_fused = run(kv_cache_fused, rest_dist)
     return jnp.where(verify_rows[:, None, None], out_verify, out_rest), kv_cache_fused
 
 
@@ -173,7 +192,10 @@ def _verify_blocks(*, decode_query_size: int, sliding_window: int | None):
 _MIN_PAGE_SIZE = 256
 
 RPA_BATCHED_SPEC = RpaKernelSpec(
-    op_name="sglang_tpu_pallas::ragged_paged_attention_batched",
+    # Compiled kernels are cached by op name and static args, not by what the body read
+    # from the environment, so the tails-last split gets its own op.
+    op_name="sglang_tpu_pallas::ragged_paged_attention_batched"
+    + ("_tails_last" if tpu_envs.SGLANG_TPU_MIXED_VERIFY_TAILS_LAST.get() else ""),
     import_kernel=_import_batched_kernel,
     invoke_kernel=_invoke_batched_kernel,
     supports_attention_sink=True,
