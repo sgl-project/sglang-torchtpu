@@ -185,15 +185,23 @@ def checkpoint_kv_cache(
         return
     start, end = req.extend_range.start, req.extend_range.end
     stride = envs.SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE.get()
+    # A hybrid-SWA insert stops at a pending SWA branch; the branch window only
+    # stays live until the chunk that computes it is published.
+    branch = req.swa_branching_seqlen if stride > 0 else None
     if (
         mid_prefill
         and stride > 0
         and end // stride == start // stride
+        and (branch is None or branch > end)
         and tree_cache.defer_chunk_checkpoint(req)
     ):
         return
 
     tree_cache.checkpoint(req, up_to=end)
+    if branch is not None and branch < end and req.swa_branching_seqlen is None:
+        # That insert published only up to the branch; publish the rest of the
+        # chunk, or the next turn finds no window at this prompt's end.
+        tree_cache.checkpoint(req, up_to=end)
 
 
 def evict_from_tree_cache(

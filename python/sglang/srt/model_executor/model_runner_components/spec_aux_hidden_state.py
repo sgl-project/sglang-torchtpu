@@ -46,6 +46,9 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_draft_cell_size_per_token: int | None = None
     # Preserve heads/dim for layout-aware MXINT8 sizing; raw payload bytes lose it.
     dflash_draft_kv_geometry: tuple[int, int] | None = None
+    # The draft is all sliding-window and keeps its KV in slots of the target's
+    # SWA pool, so it costs the pool per SWA token rather than per full token.
+    dflash_draft_kv_is_swa: bool = False
 
 
 def resolve_spec_aux_hidden_state_config(
@@ -216,6 +219,13 @@ def _resolve_dflash_aux_hidden_state(
                 draft_model_config.get_num_kv_heads(get_parallel().tp_size),
                 draft_model_config.head_dim,
             )
+        if draft_model_config.is_hybrid_swa:
+            if draft_model_config.full_attention_layer_ids:
+                raise ValueError(
+                    "A hybrid-SWA DFLASH draft must use sliding-window attention "
+                    "in every layer."
+                )
+            config.dflash_draft_kv_is_swa = True
 
 
 def _resolve_dflash_draft_cell_size(

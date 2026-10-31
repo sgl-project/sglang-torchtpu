@@ -368,24 +368,32 @@ class _FakeRaidenManager:
             layers, host_pages, 2
         )
 
+    @staticmethod
+    def _expand(starts, block_counts):
+        """Segment starts and lengths -> every page id they cover."""
+        return [s + i for s, n in zip(starts, block_counts) for i in range(n)]
+
     def d2h(self, device_pages, host_pages, block_counts):
         if not device_pages:
             self.host[:, : self.device.shape[1]] = self.device
         else:
-            self.host[:, host_pages] = self.device[:, device_pages]
+            src = self._expand(device_pages, block_counts)
+            self.host[:, self._expand(host_pages, block_counts)] = self.device[:, src]
         return _FakeReadyFuture()
 
     def h2d(self, host_pages, device_pages, block_counts):
         if not host_pages:
             self.device[:] = self.host[:, : self.device.shape[1]]
         else:
-            self.device[:, device_pages] = self.host[:, host_pages]
+            src = self._expand(host_pages, block_counts)
+            self.device[:, self._expand(device_pages, block_counts)] = self.host[:, src]
         return _FakeReadyFuture()
 
 
 def _raiden_host_pool(mgr: _FakeRaidenManager, page_size: int):
     """A real raiden host pool and transfer driving ``mgr``."""
     pool = object.__new__(TpuDMAHostKVPool)
+    pool.coalesce_pages = False
     pool.page_size = page_size
     pool.page_num = mgr.host.shape[1]
     pool.size = pool.page_num * page_size

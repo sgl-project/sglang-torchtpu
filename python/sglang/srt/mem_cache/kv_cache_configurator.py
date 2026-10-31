@@ -345,6 +345,13 @@ class KVCacheConfigurator:
         )
 
     def _tpu_mha_pool_class(self):
+        # A draft runner's pool follows its own backend: DFlash drafts need RPA v3 (non-causal)
+        # under a batched-RPA target, whose SEQ_ALONG_LANE pool RPA v3 cannot read.
+        # TODO(haolin): move behind a platform seam before upstreaming.
+        if self.is_draft_worker and self.speculative_draft_attention_backend:
+            return current_platform.get_mha_kv_pool_cls_for_backend(
+                self.speculative_draft_attention_backend
+            )
         return current_platform.get_mha_kv_pool_cls()
 
     @property

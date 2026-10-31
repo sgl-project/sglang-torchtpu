@@ -1199,6 +1199,10 @@ class TpuSRTPlatform(SRTPlatform):
             return TpuModelOptMixedPrecisionConfig
         return None
 
+    def get_mha_kv_pool_cls_for_backend(self, backend: str) -> type:
+        # the pool a runner with its own backend (a draft) allocates
+        return _mha_kv_pool_cls(backend)
+
     def get_mha_kv_pool_cls(self) -> type:
         # Pick per the resolved backend: the raw field is None when --attention-backend is omitted.
         from sglang.srt.runtime_context import get_exec
@@ -1277,10 +1281,18 @@ class TpuSRTPlatform(SRTPlatform):
             host_memory_budget_scope,
         )
         from sglang.srt.runtime_context import get_memory
+        from sglang_tpu.envs import envs as tpu_envs
 
         if not is_tpu_dma_hicache_backend(get_memory().hicache_io_backend):
             return super().get_hicache_explicit_size_context()
-        # Full, SWA, and draft pools must fit within one combined RAM budget.
+        # Full, SWA, and draft pools must fit within one combined RAM budget. The
+        # sampled budget is free RAM / local ranks at the moment this rank arrives,
+        # so ranks that arrive after their peers allocated get a shrunken share.
+        budget_gb = tpu_envs.SGLANG_TPU_HICACHE_HOST_BUDGET_GB.get()
+        if tpu_envs.SGLANG_TPU_HICACHE_TRIM_BEFORE_ALLOC.get():
+            _release_host_heap_on_all_ranks()
+        if budget_gb is not None:
+            return host_memory_budget_scope(int(budget_gb * 1e9))
         return host_memory_budget_scope(host_memory_budget_bytes())
 
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
@@ -1676,3 +1688,20 @@ class TpuSRTPlatform(SRTPlatform):
             np.random.seed(seed)
             torch.manual_seed(seed)
             torch.tpu.manual_seed_all(seed)
+
+
+def _release_host_heap_on_all_ranks() -> None:
+    """Return freed startup heap pages to the OS, then wait for every rank.
+
+    Pools are pinned host memory sized near the node's RAM, so they only fit once every
+    rank has released its weight-loading buffers.
+    """
+    import gc
+
+    from sglang.srt.runtime_context import get_parallel
+    from sglang_tpu.host_heap_trim import trim_host_heap
+
+    gc.collect()
+    trim_host_heap("before HiCache host pools")
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier(group=get_parallel().world_group.cpu_group)

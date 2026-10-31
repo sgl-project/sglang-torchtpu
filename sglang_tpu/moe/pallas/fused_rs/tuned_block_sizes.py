@@ -6,6 +6,7 @@ import logging
 
 import jax.numpy as jnp
 
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.pallas_export import get_pallas_tpu_device_kind
 
 from .v2_fused_rs_tuned_block_sizes import (
@@ -14,6 +15,9 @@ from .v2_fused_rs_tuned_block_sizes import (
 )
 
 logger = logging.getLogger(__name__)
+
+# A 4096-token prefill chunk at top-8 routes 32768 rows.
+_EP_PREFILL_MIN_ROWS = 32768
 
 
 def _device_kind() -> str:
@@ -112,6 +116,14 @@ def get_fused_rs_tuned_block_sizes(
         )
         result = default_block_sizes
 
+    override = tpu_envs.SGLANG_TPU_FUSED_RS_EP_PREFILL_TILES.get()
+    if (
+        override
+        and not fp8_direct_write
+        and m >= _EP_PREFILL_MIN_ROWS
+        and n1 > k1  # EP holds whole experts: N1 = 2 x intermediate > hidden
+    ):
+        result = tuple(int(x) for x in override.split(","))
     if fp8_direct_write and result[0] > 64:
         result = (64,) + tuple(result[1:])
     return result

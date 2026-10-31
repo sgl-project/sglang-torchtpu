@@ -313,6 +313,15 @@ def calculate_block_sizes(
         # Account for batch size.
         total_bytes *= batch_size
 
+        # The m, l and acc carries: f32 scratch per KV head and (token, q head)
+        # row, a lane tile wide, shared by the batch. The transposed tile (one
+        # sequence per tile) keeps them as rows of lanes instead.
+        carry_rows = model_cfgs.num_kv_heads * bq_sz * aligned_num_q_heads_per_kv_head
+        carry_width = 3 * num_lanes
+        if serve_cfgs.transposed and batch_size == 1:
+            carry_width = aligned_head_dim // 2 + 3 * tpu_info.num_sublanes
+        total_bytes += carry_rows * carry_width * 4
+
         return total_bytes
 
     def calculate_compute_buffer_time(
@@ -701,6 +710,38 @@ def ragged_paged_attention(
         skip_kv_write=skip_kv_write,
         return_lse=return_lse,
         cp_group_size=cp_group_size,
+        skip_full_tile_mask=envs.SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK.get(),
+        # The sink term and the LSE read the running max.
+        no_max=(
+            envs.SGLANG_TPU_RPA_NO_MAX.get()
+            and attention_sink is None
+            and not return_lse
+        ),
+        # Base-2 m and l would reach the soft cap, the sink term and the LSE.
+        exp2_softmax=(
+            envs.SGLANG_TPU_RPA_EXP2_SOFTMAX.get()
+            and soft_cap is None
+            and attention_sink is None
+            and not return_lse
+        ),
+        ones_v=(
+            envs.SGLANG_TPU_RPA_ONES_V.get()
+            and kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+            and head_dim <= 64
+            and attention_sink is None
+            and not return_lse
+        ),
+        transposed=(
+            envs.SGLANG_TPU_RPA_TRANSPOSED.get()
+            and kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+            and head_dim <= 64
+            and q_scale is None
+            and soft_cap is None
+            and attention_sink is None
+            and not return_lse
+            and not cache_only
+            and cp_group_size is None
+        ),
     )
 
     q_hbm, new_kv_hbm = prepare_inputs(

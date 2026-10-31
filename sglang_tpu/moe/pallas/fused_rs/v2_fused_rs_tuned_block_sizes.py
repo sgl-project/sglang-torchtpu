@@ -207,6 +207,18 @@ def _all_m(tile):
 # top-8 x 8 routed rows) beats the default 64, and 256 and 512.
 _H4096_I4096_EXPERT_TP8 = (128, 4096, 1024, 512, 4096, 2, 2)
 
+# Expert-TP calls above 131072 routed rows exist only with
+# SGLANG_TPU_FUSED_RS_ETP_LOCAL_ROWS (4096- and 8192-token prefill chunks). Muse Spark
+# microbench: tile_m 256 beats 128 and the default, and ties 512, at TP8 and at TP16's
+# 256-wide slice.
+_EXPERT_TP_LOCAL_ROWS_M_KEYS = ["262144_silu", "524288_silu", "1048576_silu"]
+_H4096_I4096_EXPERT_TP8_LOCAL_ROWS = (256, 4096, 1024, 512, 4096, 2, 2)
+_H4096_I4096_EXPERT_TP16_LOCAL_ROWS = (256, 4096, 512, 256, 4096, 2, 2)
+
+
+def _local_rows_m(tile):
+    return {m_key: tile for m_key in _EXPERT_TP_LOCAL_ROWS_M_KEYS}
+
 
 def _h4096_i4096_fp4_size_dependent():
     """H4096-I4096 fp4: full tiles for small M, smaller tiles for large M.
@@ -528,7 +540,14 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
             (
                 "k-4096_n-1024_g-256_lhs_quant_rhs_bs-16"
                 "+k-512_n-4096_g-256_lhs_quant_rhs_bs-16"
-            ): _all_m(_H4096_I4096_EXPERT_TP8),
+            ): {
+                **_all_m(_H4096_I4096_EXPERT_TP8),
+                **_local_rows_m(_H4096_I4096_EXPERT_TP8_LOCAL_ROWS),
+            },
+            (
+                "k-4096_n-512_g-256_lhs_quant_rhs_bs-16"
+                "+k-256_n-4096_g-256_lhs_quant_rhs_bs-16"
+            ): _local_rows_m(_H4096_I4096_EXPERT_TP16_LOCAL_ROWS),
             # H4096-I4096: H=4096, I=4096, E=256, EP=8 → g=32
             # Small M: full tiles (1,1). Large M (≥32768): smaller tiles
             # with W2 caching (2,2) for better pipelining.
