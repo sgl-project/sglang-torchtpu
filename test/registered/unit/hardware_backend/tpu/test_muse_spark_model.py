@@ -105,5 +105,78 @@ class TestMuseSparkConfig(CustomTestCase):
         self.assertEqual(full, [1, 3])
 
 
+class TestMuseSparkHostFp8ExpertLoad(CustomTestCase):
+    def test_host_fp8_expert_stack_matches_per_expert_reference_and_frees_storage(
+        self,
+    ):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import sglang_tpu.models.muse_spark as muse_mod
+        from sglang.srt.layers.quantization.fp8 import (
+            _scaled_fp8_quant_tpu_weight,
+            fp8_dtype,
+        )
+
+        torch.manual_seed(17)
+        num_experts, two_inter, hidden = 8, 32, 16
+        # Partition across moe_tp_size=2 to cover gate/up half-slicing as well.
+        fake_parallel = SimpleNamespace(
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+            tp_size=2,
+            pp_size=1,
+        )
+        w13_ckpt = torch.randn(num_experts, two_inter, hidden, dtype=torch.bfloat16)
+        w13_param = torch.nn.Parameter(
+            torch.empty(num_experts, two_inter // 2, hidden, dtype=fp8_dtype),
+            requires_grad=False,
+        )
+        w13_scale_param = torch.nn.Parameter(
+            torch.ones(num_experts, dtype=torch.float32),
+            requires_grad=False,
+        )
+        old_w_storage = w13_param.data.untyped_storage()
+        old_s_storage = w13_scale_param.data.untyped_storage()
+        params = {
+            "model.layers.0.mlp.experts.w13_weight": w13_param,
+            "model.layers.0.mlp.experts.w13_weight_scale": w13_scale_param,
+        }
+
+        with patch.object(muse_mod, "get_parallel", return_value=fake_parallel):
+            scale_name = muse_mod.MuseSparkForConditionalGeneration._load_expert_stack(
+                SimpleNamespace(),
+                params,
+                w13_param,
+                w13_ckpt,
+                "model.layers.0.mlp.experts.w13_weight",
+            )
+
+        self.assertEqual(scale_name, "model.layers.0.mlp.experts.w13_weight_scale")
+        self.assertEqual(old_w_storage.nbytes(), 0)
+        self.assertEqual(old_s_storage.nbytes(), 0)
+
+        half = two_inter // 2
+        shard = half // 2
+        expected_slice = torch.cat(
+            (w13_ckpt[:, shard : 2 * shard], w13_ckpt[:, half + shard : 2 * half]),
+            dim=1,
+        )
+        ref_q, ref_s = [], []
+        for e in range(num_experts):
+            _, se = _scaled_fp8_quant_tpu_weight(expected_slice[e])
+            qe, _ = _scaled_fp8_quant_tpu_weight(expected_slice[e].float(), se)
+            ref_q.append(qe)
+            ref_s.append(se)
+        self.assertTrue(
+            torch.equal(
+                w13_param.view(torch.uint8), torch.stack(ref_q).view(torch.uint8)
+            )
+        )
+        self.assertTrue(torch.equal(w13_scale_param.data, torch.stack(ref_s)))
+
+
 if __name__ == "__main__":
     unittest.main()
