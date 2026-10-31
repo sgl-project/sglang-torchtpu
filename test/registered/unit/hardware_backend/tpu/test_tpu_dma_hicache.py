@@ -99,6 +99,64 @@ class TestTpuDMAKVTransfer(CustomTestCase):
             engine.calls, [("backup", [1, 2], [0, 1]), ("load", [0, 1], [1, 2])]
         )
 
+    def test_fixed_host_size_syncs_capacity_across_asymmetric_pp_stages(self):
+        """Fixed --hicache-size (GB) yields differing raw token counts on PP
+        stages that own different layer counts (e.g. 5 vs 6 SWA layers on Muse
+        Spark 7,8,8,8,8,8,8,7); TpuDMAHostKVPool must sync to the PP minimum
+        like HostKVCache, while leaving ratio-sized pools untouched."""
+        pool_cls = tpu_dma_host_kv_pool_cls(ENGINE)
+
+        def make_device_pool(layer_num: int):
+            return SimpleNamespace(
+                store_dtype=torch.bfloat16,
+                size=1024,
+                start_layer=0,
+                end_layer=layer_num,
+                layer_num=layer_num,
+                get_fused_kv_buffer=Mock(
+                    return_value=torch.empty((8, 128, 8, 2, 128), dtype=torch.bfloat16)
+                ),
+            )
+
+        with (
+            patch.object(host_base, "ranks_per_host", return_value=8),
+            patch.object(
+                host_base, "available_host_memory_bytes", return_value=1 << 42
+            ),
+            patch(
+                "sglang_tpu.kv_pool_host.sync_fixed_hicache_size",
+                side_effect=lambda raw_size, host_size: min(raw_size, 1500),
+            ) as sync_mock,
+        ):
+            stage_5_layers = pool_cls(
+                make_device_pool(5),
+                host_to_device_ratio=0.0,
+                host_size=4.0,
+                page_size=128,
+                layout="page_first_fused",
+            )
+            stage_6_layers = pool_cls(
+                make_device_pool(6),
+                host_to_device_ratio=0.0,
+                host_size=4.0,
+                page_size=128,
+                layout="page_first_fused",
+            )
+            ratio_pool = pool_cls(
+                make_device_pool(5),
+                host_to_device_ratio=2.0,
+                host_size=0,
+                page_size=128,
+                layout="page_first_fused",
+            )
+
+        self.assertEqual(sync_mock.call_count, 2)
+        self.assertEqual(stage_5_layers.size, stage_6_layers.size)
+        self.assertEqual(stage_5_layers.page_num, stage_6_layers.page_num)
+        # 1500 // 128 + 1 == 12 pages -> 1536 tokens
+        self.assertEqual(stage_5_layers.size, 12 * 128)
+        self.assertEqual(ratio_pool.size, (2048 // 128 + 1) * 128)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Kimi-K3 attention-residual decode kernel (opt-in).
 
-register_attn_residual_ops, prepare_attn_residual_kernel
+register_attn_residual_ops
   Why: the TPU Pallas decode kernel (sglang_tpu.kimi_attn_residual) must stay
-       out of core, and core has no pre-trace preparation call for it.
-  How: AFTER KimiK3LinearModel.__init__ registers the kernel's custom ops
-       before torch.compile traces the model, and registers aggregate with
-       attn_residual.register_aggregate_impl. AFTER
-       KimiK3LinearForCausalLM.post_load_weights builds the kernel's fp32
-       out-norm weights and refuses online weight updates. Both pass through
-       unless SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL=1 when the model is built.
+       out of core, and its custom ops must exist before torch.compile traces
+       the model.
+  How: AFTER KimiK3LinearModel.__init__ registers the kernel's custom ops and
+       registers aggregate with attn_residual.register_aggregate_impl. Passes
+       through unless SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL=1 when the model is
+       built. The platform's process_model_after_loading then calls
+       prepare_attn_residual_kernel.
   Upstream PR or issue: sgl-project/sglang-torchtpu#1428.
-  Remove when: the registered implementation gets a post-load prepare call
-       from core (#1428, part 2).
+  Remove when: core registers attention-residual ops ahead of the trace.
 """
 
 from __future__ import annotations
@@ -49,9 +48,10 @@ def register_attn_residual_ops(result: None, model: Any, *args, **kwargs) -> Non
     register_aggregate_impl(current_platform.get_dispatch_key_name(), aggregate)
 
 
-def prepare_attn_residual_kernel(result: None, causal_lm: Any, *args, **kwargs) -> None:
-    """AFTER KimiK3LinearForCausalLM.post_load_weights, which warms get_cw: also
-    build each aggregation point's fp32 out-norm weight before the trace."""
+def prepare_attn_residual_kernel(causal_lm: Any) -> None:
+    """From the platform's process_model_after_loading, after post_load_weights
+    warms get_cw: also build each aggregation point's fp32 out-norm weight
+    before the trace."""
     if _kernel is None:
         return
     from sglang.srt.layers.utils import PPMissingLayer

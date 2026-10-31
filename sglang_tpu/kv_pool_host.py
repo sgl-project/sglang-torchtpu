@@ -34,7 +34,10 @@ import numpy as np
 import torch
 
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
-from sglang.srt.mem_cache.pool_host.base import host_memory_budget_bytes
+from sglang.srt.mem_cache.pool_host.base import (
+    host_memory_budget_bytes,
+    sync_fixed_hicache_size,
+)
 from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.utils import next_power_of_2
 from sglang_tpu.tpu_dma_hicache import (
@@ -414,7 +417,9 @@ class TpuDMAHostKVPool(HostKVCache):
 
         self.size_per_token = self.get_size_per_token()
         if host_size > 0:
-            self.size = int(host_size * 1e9 // self.size_per_token)
+            self.size = sync_fixed_hicache_size(
+                int(host_size * 1e9 // self.size_per_token), host_size
+            )
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
         # Align the pool up to a whole number of pages.
