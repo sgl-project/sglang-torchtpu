@@ -20,6 +20,8 @@ Environment:
                                     parallelism (the shared experts' layout)
     K3_PROGRAM_PREFILL_DECODE_INTERVAL  decode steps after a prefill batch (16)
     K3_PROGRAM_SCHEDULE_POLICY      fcfs (default) or lpm
+    K3_PROGRAM_PREFILL_SHARE        prefill's share of the engine while
+                                    requests decode (0: the fixed interval)
     SGLANG_TPU_K3_PROGRAM_PRESHARDED pre-sharded weights directory
 """
 
@@ -135,5 +137,11 @@ runtime_env.update(
         # Overlap scheduling: the decode program's next step launches while
         # the scheduler processes the last one's tokens.
         "SGLANG_TPU_K3_PROGRAM_OPT_OVERLAP": os.environ.get("K3_PROGRAM_OVERLAP", "1"),
+        # Prefill's share of the engine while requests decode, each prefill
+        # batch deferring the next by rounds sized from its cost (0: the fixed
+        # prefill_decode_interval).
+        "SGLANG_TPU_K3_PROGRAM_PREFILL_SHARE": os.environ.get(
+            "K3_PROGRAM_PREFILL_SHARE", "0"
+        ),
     }
 )

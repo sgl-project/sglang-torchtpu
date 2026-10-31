@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import collections
 import logging
+import math
 import time
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -210,6 +211,26 @@ class _Prompts:
     def drop(self, rids) -> None:
         for rid in rids:
             self._arrays.pop(rid, None)
+
+
+# Colocated programs' step costs for prefill_deferral_rounds (tpu7x 2x2x4, fp8
+# KV, EP16 experts): a prefill batch ~1 s per 16384 rows, a DSpark decode
+# round ~10 ms plus ~1.6 ms a request.
+PREFILL_STEP_S, PREFILL_ROW_S = 0.05, 6e-5
+DECODE_STEP_S, DECODE_REQUEST_S = 0.010, 0.0016
+
+
+def prefill_deferral_rounds(prefill_rows: int, running: int, share: float) -> int:
+    """Decode rounds to run after a prefill batch of ``prefill_rows`` so that
+    prefill takes about ``share`` of a colocated engine's time while
+    ``running`` requests decode: none when nothing decodes (a prefill delays no
+    one), more after a long batch than after a short one (a fixed count lets a
+    cold prompt's full chunks starve decoding, or holds a short turn back)."""
+    if running <= 0 or prefill_rows <= 0:
+        return 0
+    prefill_s = PREFILL_STEP_S + PREFILL_ROW_S * prefill_rows
+    decode_s = DECODE_STEP_S + DECODE_REQUEST_S * running
+    return max(1, min(512, math.ceil(prefill_s * (1 - share) / share / decode_s)))
 
 
 class StepClock:

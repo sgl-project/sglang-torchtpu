@@ -277,6 +277,53 @@ class TestPrefillSteps(CustomTestCase):
             self.steps.step([req], [0], [100], _req_to_token(2, {1: [1]})[:, ::STEP])
 
 
+class TestPrefillShare(CustomTestCase):
+    """Colocated engines defer prefill by rounds sized from the batch."""
+
+    def test_rounds_follow_the_batch_cost(self):
+        rounds = worker.prefill_deferral_rounds
+        self.assertEqual(rounds(16384, 0, 0.25), 0)  # nothing decodes
+        self.assertEqual(rounds(0, 4, 0.25), 0)
+        cold = rounds(16384, 8, 0.25)
+        turn = rounds(2048, 8, 0.25)
+        self.assertGreater(cold, 4 * turn)
+        self.assertGreaterEqual(turn, 1)
+        # A larger share defers less; a larger batch decodes slower rounds.
+        self.assertLess(rounds(16384, 8, 0.5), cold)
+        self.assertLess(rounds(16384, 16, 0.25), cold)
+        # Prefill takes about the share of the engine's time.
+        prefill_s = worker.PREFILL_STEP_S + worker.PREFILL_ROW_S * 16384
+        decode_s = worker.DECODE_STEP_S + worker.DECODE_REQUEST_S * 8
+        share = prefill_s / (prefill_s + cold * decode_s)
+        self.assertAlmostEqual(share, 0.25, delta=0.01)
+
+    def test_hook_sets_the_deferral(self):
+        from sglang_tpu.hooks import k3_program as hooks
+
+        def arm(scheduler, batch):
+            scheduler._prefill_decode_interval_remaining = 16
+
+        scheduler = SimpleNamespace(
+            prefill_decode_interval=16,
+            _prefill_decode_interval_remaining=0,
+            running_batch=SimpleNamespace(reqs=[object()] * 8),
+        )
+        batch = SimpleNamespace(
+            extend_num_tokens=16384,
+            forward_mode=SimpleNamespace(is_extend=lambda: True),
+        )
+        with mock.patch.object(hooks, "k3_program_active", return_value=True):
+            with tpu_envs.SGLANG_TPU_K3_PROGRAM_PREFILL_SHARE.override(0.0):
+                hooks.k3_program_prefill_share(arm, scheduler, batch)
+                self.assertEqual(scheduler._prefill_decode_interval_remaining, 16)
+            with tpu_envs.SGLANG_TPU_K3_PROGRAM_PREFILL_SHARE.override(0.25):
+                hooks.k3_program_prefill_share(arm, scheduler, batch)
+                self.assertEqual(
+                    scheduler._prefill_decode_interval_remaining,
+                    worker.prefill_deferral_rounds(16384, 8, 0.25),
+                )
+
+
 class TestRegisteredAlgorithm(CustomTestCase):
     def setUp(self):
         worker.register()

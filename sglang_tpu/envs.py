@@ -152,6 +152,12 @@ class TpuEnvs:
     # k3_programs/sglang_decode_cache.py): a session's next turn transfers only
     # the pages past the decode's local prefix hit.
     SGLANG_TPU_K3_PROGRAM_ENABLE_DECODE_PREFIX_CACHE = EnvBool(False)
+    # Colocated K3_PROGRAM engines: the share of the engine's time prefill
+    # batches may take while requests decode (each prefill batch defers the
+    # next by decode rounds sized from its tokens and the running batch,
+    # sglang_worker.prefill_deferral_rounds). 0: --prefill-decode-interval's
+    # fixed count.
+    SGLANG_TPU_K3_PROGRAM_PREFILL_SHARE = EnvFloat(0.0)
 
     # Host padding is unconditional; this routes speculative batches to the
     # experimental spec worker, which keeps their metadata on the host as well.

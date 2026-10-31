@@ -72,6 +72,22 @@ reject_unsupported_k3_requests
        validation seam).
   Remove when: that seam exists.
 
+k3_program_prefill_share
+  Why: a colocated engine's prefill batches stop its decoding requests, and
+       --prefill-decode-interval defers the next prefill by a fixed number of
+       decode rounds whatever the batch cost: 16 rounds after each ~0.4 s
+       chunk of a cold prompt halved decoding during bursts on hardware
+       (ITL 9.8 ms at AgentX concurrency 8), while a short turn's batch
+       needs few.
+  How: AROUND sglang.srt.managers.scheduler.Scheduler
+       ._arm_prefill_decode_interval sets the deferral from the batch's
+       extend tokens and the running batch so prefill takes
+       SGLANG_TPU_K3_PROGRAM_PREFILL_SHARE of the engine while requests
+       decode (none when nothing decodes); from batch contents only, so every
+       rank defers alike. Off (0): the fixed interval.
+  Upstream PR or issue: <to be filed> (a cost-aware prefill/decode cadence).
+  Remove when: that cadence exists.
+
 skip_k3_program_backends, skip_k3_program_graphs
   Why: the program runs the whole model, so sglang's forward never runs, but
        the model runner still builds the KDA/MLA attention backends over the
@@ -199,6 +215,31 @@ def reject_unsupported_k3_requests(
     return original(scheduler, req, *args, **kwargs)
 
 
+def k3_program_prefill_share(original, scheduler: Any, batch: Any, *args, **kwargs):
+    """AROUND Scheduler._arm_prefill_decode_interval."""
+    result = original(scheduler, batch, *args, **kwargs)
+    from sglang_tpu.envs import envs as tpu_envs
+
+    share = tpu_envs.SGLANG_TPU_K3_PROGRAM_PREFILL_SHARE.get()
+    if (
+        not share
+        or batch is None
+        or not scheduler.prefill_decode_interval
+        or not batch.forward_mode.is_extend()
+        or not k3_program_active()
+    ):
+        return result
+    from sglang_tpu.k3_programs.sglang_worker import prefill_deferral_rounds
+
+    running = scheduler.running_batch
+    scheduler._prefill_decode_interval_remaining = prefill_deferral_rounds(
+        int(batch.extend_num_tokens or 0),
+        len(running.reqs) if running is not None else 0,
+        share,
+    )
+    return result
+
+
 def skip_k3_program_backends(original, model_runner: Any, *args, **kwargs) -> None:
     """AROUND ModelRunner.init_attention_backends."""
     if not k3_program_active():
@@ -251,6 +292,11 @@ def hook_specs() -> list[tuple]:
         (
             "sglang.srt.managers.scheduler.Scheduler._add_request_to_queue",
             reject_unsupported_k3_requests,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.managers.scheduler.Scheduler._arm_prefill_decode_interval",
+            k3_program_prefill_share,
             HookType.AROUND,
         ),
         (
