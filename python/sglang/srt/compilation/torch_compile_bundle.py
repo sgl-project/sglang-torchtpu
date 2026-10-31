@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import itertools
 import logging
 import os
 import tempfile
@@ -77,21 +78,29 @@ _guards_state_loader_installed = False
 
 
 def _install_guards_state_loader() -> None:
-    """Drop the dict key-order records a bundle cannot evaluate on load.
+    """Drop the dict key-order records a bundle cannot evaluate on load and
+    keep Dynamo's unique-id counter ahead of restored builtins-dict globals.
 
     Dynamo records the dicts whose key order a graph relies on (an enum-keyed
     dict read in the forward, such as a layer boundary's ``plan.paths``) next
     to the guards, and evaluates every record while rebuilding the guard
     manager. The guard filter never sees them, and one reached through the
-    compiled wrapper's closure dereferences a placeholder on load. Those dicts
-    are built by the same code that wrote the bundle, so the record adds
-    nothing here.
+    compiled wrapper's closure or a transient ``___unnamed_scope`` global
+    dereferences a placeholder or missing global on load. Those dicts are built
+    by the same code that wrote the bundle, so the record adds nothing here.
+
+    In addition, ``CompilePackage.install()`` writes each entry's
+    ``name_of_builtins_dict_key_in_fglobals`` (e.g. ``__builtins_dict___0``)
+    into ``runtime_global_scope`` without advancing
+    ``bytecode_transformation._unique_id_counter``. Advancing the counter past
+    the restored suffix prevents a later Dynamo compile in the same process
+    from minting a colliding ``__builtins_dict___<N>`` key.
     """
     global _guards_state_loader_installed
     if _guards_state_loader_installed:
         return
     _guards_state_loader_installed = True
-    from torch._dynamo import package
+    from torch._dynamo import bytecode_transformation, package
 
     orig_load_guards_state = package.load_guards_state
 
@@ -105,6 +114,17 @@ def _install_guards_state_loader() -> None:
         }
         if len(kept) != len(output_graph.guard_on_key_order):
             object.__setattr__(output_graph, "guard_on_key_order", kept)
+        builtin_key = getattr(
+            output_graph, "name_of_builtins_dict_key_in_fglobals", None
+        )
+        if isinstance(builtin_key, str):
+            _, _, suffix = builtin_key.rpartition("_")
+            if suffix.isdigit():
+                target_id = int(suffix)
+                cur_id = next(bytecode_transformation._unique_id_counter)
+                bytecode_transformation._unique_id_counter = itertools.count(
+                    max(cur_id, target_id + 1)
+                )
         return state
 
     package.load_guards_state = load_guards_state
@@ -122,7 +142,10 @@ def _source_chain(source: Any) -> tuple[Any, list[Any]]:
 
 def _rooted_in_transient_fn(source: Any) -> bool:
     root, _ = _source_chain(source)
-    return isinstance(root, LocalSource) and root.local_name == "fn"
+    return (isinstance(root, LocalSource) and root.local_name == "fn") or (
+        isinstance(root, GlobalSource)
+        and root.global_name.startswith("___unnamed_scope")
+    )
 
 
 def set_fresh_compiler_cache() -> tempfile.TemporaryDirectory[str]:
@@ -175,13 +198,20 @@ class Compiler:
 
 
 def _skip_unrestorable_guards_unsafe(guard_entries: Any) -> list[bool]:
-    """Drop guards rooted in transient wrapper and forward-context state, and
-    guards on a function's default arguments.
+    """Drop guards rooted in transient wrapper, forward-context, or unnamed
+    scope state, and guards on a function's default arguments.
 
     A DefaultsSource guard cannot be restored from a bundle: torch's
     ``dataclass_with_cached_hash.__reduce__`` hands the source's ``init=False``
     fields to ``__init__`` on unpickle. A default argument is a code constant,
     so the guard adds nothing a same-code bundle needs.
+
+    In ``torch>=2.13``, Dynamo traces ``NamedTuple.__new__`` (whose synthetic
+    ``__globals__`` has ``__name__ == 'namedtuple_<Type>'``) and installs the
+    frame globals as ``___unnamed_scope_<id>_c<compile_id>`` with a guard on
+    that ``GlobalSource``. ``CompilePackage.install()`` does not restore
+    ``___unnamed_scope_*`` globals into ``runtime_global_scope``, so keeping
+    the guard causes a guaranteed guard miss on load.
     """
 
     forward_context_global = (
@@ -193,6 +223,9 @@ def _skip_unrestorable_guards_unsafe(guard_entries: Any) -> list[bool]:
         source, chain = _source_chain(entry.orig_guard.originating_source)
 
         transient_fn = isinstance(source, LocalSource) and source.local_name == "fn"
+        transient_unnamed_scope = isinstance(
+            source, GlobalSource
+        ) and source.global_name.startswith("___unnamed_scope")
         transient_forward_context = (
             isinstance(source, GlobalSource)
             and source.global_name == forward_context_global
@@ -220,6 +253,7 @@ def _skip_unrestorable_guards_unsafe(guard_entries: Any) -> list[bool]:
         keep.append(
             not (
                 transient_fn
+                or transient_unnamed_scope
                 or transient_forward_context
                 or transient_runtime_forward
                 or defaults_guard
