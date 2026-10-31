@@ -28,6 +28,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.layers.aux_hidden_states import AUX_HIDDEN_STATES_PROXY_KEY
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -562,6 +563,7 @@ class MuseSparkTextModel(nn.Module):
         self.pp_group = get_parallel().pp_group
         # Layers whose output stream feeds a DFlash draft.
         self.layers_to_capture: List[int] = []
+        self._capture_slots_by_layer: dict[int, List[int]] = {}
         self.embed_tokens = (
             VocabParallelEmbedding(
                 config.vocab_size,
@@ -596,6 +598,33 @@ class MuseSparkTextModel(nn.Module):
             else PPMissingLayer()
         )
 
+    def _set_layers_to_capture(self, layer_ids: List[int]) -> None:
+        self.layers_to_capture = list(layer_ids)
+        slots_by_layer: dict[int, List[int]] = {}
+        for slot, layer_id in enumerate(self.layers_to_capture):
+            if self.start_layer <= layer_id < self.end_layer:
+                slots_by_layer.setdefault(layer_id, []).append(slot)
+        self._capture_slots_by_layer = slots_by_layer
+
+    def _relay_aux_hidden_states(
+        self,
+        incoming: Optional[torch.Tensor],
+        captured_by_slot: dict[int, torch.Tensor],
+        num_tokens: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        hidden = self.config.hidden_size
+        if incoming is None:
+            unfilled = torch.zeros(
+                (num_tokens, hidden), dtype=torch.bfloat16, device=device
+            )
+            slots = [unfilled] * len(self.layers_to_capture)
+        else:
+            slots = list(torch.split(incoming, hidden, dim=-1))
+        for slot, captured in captured_by_slot.items():
+            slots[slot] = captured
+        return torch.cat(slots, dim=-1)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -612,34 +641,45 @@ class MuseSparkTextModel(nn.Module):
                     embeds.dtype
                 )
             stream = input_embeds.float()
+            aux_buffer = None
         else:
             assert pp_proxy_tensors is not None
             stream = (
                 pp_proxy_tensors.tensors["hidden_states"].float()
                 + pp_proxy_tensors.tensors["residual"].float()
             )
+            aux_buffer = pp_proxy_tensors.tensors.get(AUX_HIDDEN_STATES_PROXY_KEY)
 
-        aux_hidden_states = []
+        captured_by_slot: dict[int, torch.Tensor] = {}
         for layer_idx in range(self.start_layer, self.end_layer):
             stream = self.layers[layer_idx](positions, stream, forward_batch)
-            if layer_idx in self.layers_to_capture:
+            slots = self._capture_slots_by_layer.get(layer_idx)
+            if slots is not None:
                 # Drafts read the operator dtype, not the fp32 residual.
-                aux_hidden_states.append(stream.to(torch.bfloat16))
+                snap = stream.to(torch.bfloat16)
+                for slot in slots:
+                    captured_by_slot[slot] = snap
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": stream,
-                    "residual": torch.zeros_like(stream),
-                }
-            )
+            proxy = {
+                "hidden_states": stream,
+                "residual": torch.zeros_like(stream),
+            }
+            if self.layers_to_capture:
+                proxy[AUX_HIDDEN_STATES_PROXY_KEY] = self._relay_aux_hidden_states(
+                    aux_buffer, captured_by_slot, stream.shape[0], stream.device
+                )
+            return PPProxyTensors(proxy)
 
         hidden = self.norm(stream.to(torch.bfloat16))
-        if not aux_hidden_states:
+        if not self.layers_to_capture:
             return hidden
         # One tensor, not a list: packing a list happens outside the compiled
         # graph and costs a separate eager program on every decode step.
-        return hidden, torch.cat(aux_hidden_states, dim=-1)
+        aux = self._relay_aux_hidden_states(
+            aux_buffer, captured_by_slot, hidden.shape[0], hidden.device
+        )
+        return hidden, aux
 
 
 class MuseSparkForConditionalGeneration(nn.Module):
@@ -650,6 +690,7 @@ class MuseSparkForConditionalGeneration(nn.Module):
     tower_param_prefixes: Tuple[str, ...] = ()
     # Norm-preserving gated residuals accumulate in fp32 across stage boundaries.
     pp_transfer_dtype = torch.float32
+    relays_pp_aux_hidden_states = True
 
     def __init__(
         self,
@@ -779,12 +820,12 @@ class MuseSparkForConditionalGeneration(nn.Module):
     def set_dflash_layers_to_capture(self, layer_ids: List[int]) -> None:
         if not layer_ids:
             raise ValueError("DFLASH requires explicit layer_ids for aux capture.")
-        num_layers = len(self.model.layers)
+        num_layers = self.text_config.num_hidden_layers
         bad = [i for i in layer_ids if not 0 <= i < num_layers]
         if bad:
             raise ValueError(f"Capture layer ids {bad} outside [0, {num_layers}).")
-        self.capture_aux_hidden_states = True
-        self.model.layers_to_capture = list(layer_ids)
+        self.capture_aux_hidden_states = self.pp_group.is_last_rank
+        self.model._set_layers_to_capture(layer_ids)
 
     def _load_expert_stack(
         self, param: torch.Tensor, loaded_weight: torch.Tensor, name: str

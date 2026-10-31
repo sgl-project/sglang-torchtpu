@@ -156,6 +156,7 @@ def _build_stub_text_stage(
     )
     stage.pp_group = SimpleNamespace(is_first_rank=is_first, is_last_rank=is_last)
     stage.layers_to_capture = []
+    stage._capture_slots_by_layer = {}
     stage.start_layer = start_layer
     stage.end_layer = end_layer
     stage.embed_tokens = (
@@ -245,15 +246,20 @@ class TestMuseSparkPipelineParallel(CustomTestCase):
 
         self.assertIs(TextWrapper.pp_transfer_dtype, torch.float32)
         self.assertIs(OmniWrapper.pp_transfer_dtype, torch.float32)
+        self.assertTrue(TextWrapper.relays_pp_aux_hidden_states)
+        self.assertTrue(OmniWrapper.relays_pp_aux_hidden_states)
 
-    def test_fp32_pp_handoff_matches_pp1_bit_for_bit(self):
+    def test_fp32_pp_handoff_and_aux_relay_match_pp1_bit_for_bit(self):
         from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
         torch.manual_seed(42)
         num_layers = 6
+        capture_ids = [5, 0, 3, 0]  # non-sorted + duplicate slot coverage
         pp1 = _build_stub_text_stage(
             num_layers, 0, num_layers, is_first=True, is_last=True
         )
+        pp1._set_layers_to_capture(capture_ids)
+
         stages = [
             _build_stub_text_stage(
                 num_layers,
@@ -267,11 +273,13 @@ class TestMuseSparkPipelineParallel(CustomTestCase):
             )
             for s, e in ((0, 2), (2, 4), (4, 6))
         ]
+        for st in stages:
+            st._set_layers_to_capture(capture_ids)
 
         input_ids = torch.tensor([1, 7, 13, 29])
         positions = torch.arange(4)
 
-        ref_hidden = pp1(input_ids, positions, None)
+        ref_hidden, ref_aux = pp1(input_ids, positions, None)
 
         proxy = None
         for st in stages[:-1]:
@@ -279,8 +287,12 @@ class TestMuseSparkPipelineParallel(CustomTestCase):
             self.assertIsInstance(proxy, PPProxyTensors)
             self.assertEqual(proxy.tensors["hidden_states"].dtype, torch.float32)
             self.assertEqual(proxy.tensors["residual"].dtype, torch.float32)
-        pp_hidden = stages[-1](input_ids, positions, None, pp_proxy_tensors=proxy)
+            self.assertEqual(proxy.tensors["aux_hidden_states"].dtype, torch.bfloat16)
+        pp_hidden, pp_aux = stages[-1](
+            input_ids, positions, None, pp_proxy_tensors=proxy
+        )
         self.assertTrue(torch.equal(pp_hidden, ref_hidden))
+        self.assertTrue(torch.equal(pp_aux, ref_aux))
 
         # Truncating the inter-stage residual stream to bf16 breaks bit-exact parity.
         bf16_proxy = None
@@ -290,12 +302,46 @@ class TestMuseSparkPipelineParallel(CustomTestCase):
                 {
                     "hidden_states": out.tensors["hidden_states"].to(torch.bfloat16),
                     "residual": out.tensors["residual"].to(torch.bfloat16),
+                    "aux_hidden_states": out.tensors["aux_hidden_states"],
                 }
             )
-        bf16_hidden = stages[-1](
+        bf16_hidden, _ = stages[-1](
             input_ids, positions, None, pp_proxy_tensors=bf16_proxy
         )
         self.assertFalse(torch.equal(bf16_hidden, ref_hidden))
+
+    def test_dflash_marks_every_stage_and_unpacks_on_last_stage_only(self):
+        from types import SimpleNamespace
+
+        from sglang_tpu.models.muse_spark import (
+            MuseSparkForConditionalGeneration,
+            MuseSparkTextModel,
+        )
+
+        for start, end, is_last, expected_slots in (
+            (0, 2, False, {1: [0]}),
+            (2, 4, False, {}),
+            (4, 6, True, {5: [1]}),
+        ):
+            stage = _build_stub_text_stage(
+                6, start, end, is_first=(start == 0), is_last=is_last
+            )
+            wrapper = SimpleNamespace(
+                text_config=SimpleNamespace(num_hidden_layers=6),
+                pp_group=SimpleNamespace(is_last_rank=is_last),
+                model=stage,
+                capture_aux_hidden_states=False,
+            )
+            MuseSparkForConditionalGeneration.set_dflash_layers_to_capture(
+                wrapper, [1, 5]
+            )
+            self.assertEqual(stage.layers_to_capture, [1, 5])
+            self.assertEqual(stage._capture_slots_by_layer, expected_slots)
+            self.assertEqual(wrapper.capture_aux_hidden_states, is_last)
+            self.assertIs(
+                MuseSparkTextModel._set_layers_to_capture,
+                stage._set_layers_to_capture.__func__,
+            )
 
     def test_off_stage_param_filter(self):
         from types import SimpleNamespace
