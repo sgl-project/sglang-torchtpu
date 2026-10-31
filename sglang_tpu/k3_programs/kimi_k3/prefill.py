@@ -145,16 +145,28 @@ class Piece:
 
 
 def skips_step(
-    computed: int, end: int, prompt: int, start: int, largest: int, block: int
+    computed: int,
+    end: int,
+    prompt: int,
+    start: int,
+    largest: int,
+    block: int,
+    align: int = 0,
 ) -> bool:
     """Whether a step scheduling a request's tokens ``[computed, end)`` of
     ``prompt`` is skipped (no token): its state is at ``start`` and the rest
-    of the prompt fits the ``largest`` window. Never when the step completes
-    a ``block``-token logical block: vLLM's KV offloading stores that block
-    (its pages and the boundary KDA state) behind this step's device work,
-    so a later computing step would write them after the host copy was
-    taken, and a hit restores the stale bytes."""
-    if end >= prompt or prompt - start > largest:
+    of the prompt fits the ``largest`` window, or (``align``) the step stops
+    inside the prompt's last ``align``-token block -- a prefix tail's cut,
+    whose remainder the next step computes: folded, the rest is planned in
+    consecutive pieces (plan_pieces), instead of the cut costing a window of
+    its own. Never when the step completes a ``block``-token logical block:
+    vLLM's KV offloading stores that block (its pages and the boundary KDA
+    state) behind this step's device work, so a later computing step would
+    write them after the host copy was taken, and a hit restores the stale
+    bytes."""
+    if end >= prompt:
+        return False
+    if prompt - start > largest and not (align and prompt - end < align):
         return False
     return end // block == computed // block
 
@@ -1332,7 +1344,13 @@ class KimiPrefiller:
                 if state.start:
                     hits.append((i, state))
             if skips_step(
-                cached, total, prompt, state.start, largest, self.page_tokens * DCP_SIZE
+                cached,
+                total,
+                prompt,
+                state.start,
+                largest,
+                self.page_tokens * DCP_SIZE,
+                self.page_tokens,
             ):
                 state.skipped.append(
                     (
