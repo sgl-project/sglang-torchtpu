@@ -17,12 +17,13 @@ import torch
 from sglang.srt.arg_groups.resolution_hooks import register_resolution_hook
 from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
-from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 from sglang.utils import LazyImport
 from sglang_tpu._logging import get_logger
 from sglang_tpu.tpu_dma_hicache import is_tpu_dma_hicache_backend
 
 if TYPE_CHECKING:
+    from sglang.srt.compilation.helper_compile import HelperCompilePolicy
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.server_args import ServerArgs
 
@@ -925,6 +926,13 @@ class TpuSRTPlatform(SRTPlatform):
     device_type: str = "tpu"
 
     supported_quantization: list[str] = []
+    # The upstream fields (Triton, graph capture, HiCache kernels) stay False.
+    capabilities = PlatformCapabilities(
+        uniform_dp_padding=True,
+        rank_uniform_graphs=True,
+        device_p2p=False,
+        traces_raw_collectives=False,
+    )
 
     def get_traced_rank(
         self, rank: int, *, group_size: int | None = None
@@ -1375,6 +1383,11 @@ class TpuSRTPlatform(SRTPlatform):
 
     def supports_torch_compile(self) -> bool:
         return True
+
+    def get_helper_compile_policy(self) -> HelperCompilePolicy:
+        from sglang_tpu.compilation.helper_compile import TPU_HELPER_COMPILE_POLICY
+
+        return TPU_HELPER_COMPILE_POLICY
 
     def get_piecewise_backend_cls(self) -> type:
         raise NotImplementedError("TPU piecewise backend not yet implemented.")

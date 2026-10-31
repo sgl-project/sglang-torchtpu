@@ -14,7 +14,7 @@ from sglang.srt.platforms.device_mixin import (
     DeviceMixin,
     PlatformEnum,
 )
-from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 
 
 class CpuDeviceMixin(DeviceMixin):
@@ -128,6 +128,8 @@ class CpuSRTPlatform(CpuDeviceMixin, SRTPlatform):
     here. is_pin_memory_available is repeated for explicitness: CPU has no GPU
     to pin host memory to.
     """
+
+    capabilities = PlatformCapabilities(graph_capture=True)
 
     def is_pin_memory_available(self, device=None) -> bool:
         return False

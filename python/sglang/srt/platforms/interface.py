@@ -15,15 +15,50 @@ from __future__ import annotations
 from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Optional, Type
 
+import msgspec
+
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 
 if TYPE_CHECKING:
     import torch
 
+    from sglang.srt.compilation.helper_compile import HelperCompilePolicy
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 # Re-export for convenience
-__all__ = ["SRTPlatform", "PlatformEnum"]
+__all__ = ["PlatformCapabilities", "SRTPlatform", "PlatformEnum"]
+
+
+class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
+    """What the platform can do.
+
+    Core reads these before it constructs anything and picks a code path
+    the platform can serve, instead of announcing a decision and asking the
+    platform to honor it. Every field defaults to the conservative answer.
+
+    ``supports_triton``: Triton kernels can launch on this device. When
+    False, core uses the torch-native allocator and req-to-token writers.
+    ``graph_capture``: the decode graph runner (``get_graph_runner_cls``)
+    runs. ``piecewise_graph``: the prefill piecewise compilation backend
+    runs.
+    ``hicache_device_kernels``: the sgl_kernel HiCache transfer / write-back
+    kernels are available; otherwise the host pools skip their staging
+    buffers.
+    """
+
+    supports_triton: bool = False
+    graph_capture: bool = False
+    piecewise_graph: bool = False
+    hicache_device_kernels: bool = False
+    # Fork-local fields below; each default is today's non-TPU behaviour.
+    # DP gather/scatter supports only equal per-rank blocks (DpPaddingMode.MAX_LEN).
+    uniform_dp_padding: bool = False
+    # Compiled programs must be identical on every rank; no rank-dependent branches.
+    rank_uniform_graphs: bool = False
+    # Device tensors can be sent point-to-point without a host copy.
+    device_p2p: bool = True
+    # Dynamo can trace raw torch.distributed (c10d functional) collectives.
+    traces_raw_collectives: bool = True
 
 
 class SRTPlatform(DeviceMixin):
@@ -37,8 +72,9 @@ class SRTPlatform(DeviceMixin):
     relevant to their hardware.
     """
 
-    # SRT-specific class-level attribute
+    # SRT-specific class-level attributes
     supported_quantization: list[str] = []
+    capabilities: PlatformCapabilities = PlatformCapabilities()
 
     # ------------------------------------------------------------------
     # Configuration lifecycle
@@ -173,6 +209,12 @@ class SRTPlatform(DeviceMixin):
     def supports_torch_compile(self) -> bool:
         """Whether this platform consumes annotation-driven compile policies."""
         return False
+
+    def get_helper_compile_policy(self) -> HelperCompilePolicy:
+        """How standalone tensor helpers compile; the default is torch.compile."""
+        from sglang.srt.compilation.helper_compile import DEFAULT_HELPER_COMPILE_POLICY
+
+        return DEFAULT_HELPER_COMPILE_POLICY
 
     def get_traced_rank(
         self, rank: int, *, group_size: int | None = None

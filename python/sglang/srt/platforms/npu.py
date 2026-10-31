@@ -9,7 +9,7 @@ from sglang.srt.platforms.device_mixin import (
     DeviceMixin,
     PlatformEnum,
 )
-from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 
 
 class NPUDeviceMixin(DeviceMixin):
@@ -70,6 +70,11 @@ class NPUDeviceMixin(DeviceMixin):
 
 class NPUSRTPlatform(NPUDeviceMixin, SRTPlatform):
     """Default in-tree NPU SRT platform."""
+
+    capabilities = PlatformCapabilities(
+        supports_triton=True,
+        graph_capture=True,
+    )
 
     def get_default_attention_backend(self) -> str:
         return "ascend"

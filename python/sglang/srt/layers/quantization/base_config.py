@@ -11,6 +11,7 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
+from sglang.srt.plugins.oot_classes import OotReplaceable
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
@@ -21,7 +22,7 @@ if TYPE_CHECKING:
     from sglang.srt.models.utils import WeightsMapper
 
 
-class QuantizeMethodBase(ABC):
+class QuantizeMethodBase(OotReplaceable, ABC):
     """Base class for different quantized methods."""
 
     def create_weights(

@@ -12,7 +12,7 @@ from sglang.srt.platforms.device_mixin import (
     DeviceMixin,
     PlatformEnum,
 )
-from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +102,13 @@ class CudaDeviceMixin(DeviceMixin):
 
 class CudaSRTPlatform(CudaDeviceMixin, SRTPlatform):
     """Default in-tree CUDA SRT platform."""
+
+    capabilities = PlatformCapabilities(
+        supports_triton=True,
+        graph_capture=True,
+        piecewise_graph=True,
+        hicache_device_kernels=True,
+    )
 
     def supports_fp8(self) -> bool:
         return True
