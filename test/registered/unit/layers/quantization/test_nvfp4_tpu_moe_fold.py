@@ -1411,25 +1411,32 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
         self.assertFalse(resolved)
         self.assertFalse(prepared["use_fused_rs"])
 
-    def test_sub512_auto_backend_fails_closed_on_unsupported_layout(self):
+    def test_sub512_auto_backend_falls_back_to_stock_pallas(self):
         for group_size in (16, 32, 64, 128, 256):
-            with (
-                self.subTest(group_size=group_size),
-                self.assertRaisesRegex(ValueError, "requires the fused-RS"),
-            ):
-                self._run_gate(
-                    ep_size=2,
-                    world_size=4,
-                    group_size=group_size,
-                )
+            for ep_size, world_size in ((1, 1), (2, 4)):
+                with self.subTest(
+                    group_size=group_size, ep_size=ep_size, world_size=world_size
+                ):
+                    _, resolved, prepared, _ = self._run_gate(
+                        ep_size=ep_size,
+                        world_size=world_size,
+                        group_size=group_size,
+                    )
+                    self.assertFalse(resolved)
+                    self.assertFalse(prepared["use_fused_rs"])
 
     def test_explicit_pallas_backend_fails_closed(self):
-        with self.assertRaisesRegex(ValueError, "Unmet requirements"):
-            self._run_gate(
-                ep_size=2,
-                world_size=4,
-                backend="pallas_tpu_fused_rs",
-            )
+        for group_size in (16, 512):
+            with (
+                self.subTest(group_size=group_size),
+                self.assertRaisesRegex(ValueError, "Unmet requirements"),
+            ):
+                self._run_gate(
+                    ep_size=1,
+                    world_size=1,
+                    group_size=group_size,
+                    backend="pallas_tpu_fused_rs",
+                )
 
     def test_rejects_non_pallas_backend_on_tpu(self):
         with self.assertRaisesRegex(ValueError, "supports only"):
