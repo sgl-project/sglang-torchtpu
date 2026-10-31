@@ -4191,6 +4191,35 @@ class Scheduler(
 
         return res
 
+    def _log_recompute_diag(
+        self, adder: PrefillAdder, continuing_req: Optional[Req], min_tokens: int
+    ) -> None:
+        """Log-only: why a newly admitted request computes >= min_tokens prompt tokens."""
+        for req in adder.can_run_list:
+            if req is continuing_req:
+                continue
+            isl = len(req.origin_input_ids)
+            prefix = len(req.prefix_indices)
+            if isl - prefix < min_tokens:
+                continue
+            entry = req.time_stats.wait_queue_entry_time
+            waited = time.perf_counter() - entry if entry else 0.0
+            logger.info(
+                "Recompute diag: rid=%s isl=%d waited=%.1fs full_kv_hit=%d swa_branch=%s "
+                "host_promised=%d host_loaded=%d prefix=%d uncached=%d running=%d queue=%d",
+                req.rid,
+                isl,
+                waited,
+                req.full_kv_hit_length,
+                req.swa_branching_seqlen,
+                req.host_hit_length,
+                req.host_loaded_length,
+                prefix,
+                isl - prefix,
+                len(self.running_batch.reqs),
+                len(self.waiting_queue),
+            )
+
     def _dynamic_first_chunk_cap(self, req: Req) -> Optional[int]:
         # Predicted first-chunk size for a request behind a cached prefix, or None.
         if self.dynamic_chunk_sizer is None:
@@ -4354,7 +4383,10 @@ class Scheduler(
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
             )
+            continuing_req = self.chunked_req
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+        else:
+            continuing_req = None
 
         if self.enable_lora:
             running_loras = {
@@ -4488,6 +4520,10 @@ class Scheduler(
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
+        if (
+            diag_min := envs.SGLANG_RECOMPUTE_DIAG_MIN_TOKENS.get()
+        ) and self.metrics_reporter.is_stats_logging_rank:
+            self._log_recompute_diag(adder, continuing_req, diag_min)
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list

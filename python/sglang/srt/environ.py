@@ -839,6 +839,10 @@ class Envs:
     # this many scheduler steps until a poll finds one (then every step again); ranks stay
     # in lockstep. 0 or 1 polls every step. Applies without PP, storage or linker only.
     SGLANG_HICACHE_QUIET_SYNC_EVERY = EnvInt(0)
+    # Log one line per admitted request that must compute at least this many prompt
+    # tokens: its Full-KV hit (device + host), the hit after the sliding-window check,
+    # the host load-back promised vs loaded, and the final prefix. 0 disables (log-only).
+    SGLANG_RECOMPUTE_DIAG_MIN_TOKENS = EnvInt(0)
     # Hybrid-SWA host pools: fraction of --hicache-size given to the SWA pool. Unset splits
     # by device pool bytes; a cached prefix needs only its last window of SWA KV.
     SGLANG_HICACHE_SWA_HOST_FRACTION = EnvFloat(None)
