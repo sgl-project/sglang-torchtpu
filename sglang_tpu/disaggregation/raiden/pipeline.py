@@ -480,8 +480,18 @@ class PipelineTransfer:
     def _check_support(self, raiden_service_pb2) -> None:
         """Reject topologies and native builds the pipeline transfer cannot serve."""
         manager = self.manager
-        if manager.attn_cp_size != 1:
-            raise ValueError("Raiden pipeline transfer requires attention CP=1")
+        # Prefill CP writes the whole sequence into every CP rank's pool, so CP
+        # rank 0 of each stage is the stage's only source; the other CP ranks
+        # never build a transfer (RaidenKVManager.set_kv_caches).
+        if manager.attn_cp_size != 1 and not self.producer:
+            raise ValueError(
+                "Raiden pipeline transfer requires attention CP=1 on the decode"
+            )
+        if manager.attn_cp_size != 1 and manager.attn_cp_rank != 0:
+            raise ValueError(
+                "Raiden pipeline transfer sends only from prefill CP rank 0, got CP rank "
+                f"{manager.attn_cp_rank}"
+            )
         if self.producer and (manager.attn_tp_size != 1 or manager.pp_size <= 1):
             raise ValueError(
                 "Raiden pipeline transfer requires a pipeline producer with "
@@ -634,7 +644,12 @@ class PipelineTransfer:
         manager = self.manager
         return KVCacheManager(
             kv_caches=tensors,
-            node_id=manager._local_rank,
+            # A push carries its engine's node id, and the receiver looks the
+            # sender's schedule up under that id, which the planner keys by
+            # transfer_rank. _local_rank also counts context-parallel ranks
+            # (0, 2, 4, 6 for PP4 x PCP2), so stages past the first found no
+            # schedule and their pushes were rejected.
+            node_id=self.rank,
             local_control_port=manager._control_port + port_offset,
             max_blocks=max_blocks,
             num_slots=slots,
