@@ -15,6 +15,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    try_cached_model,
 )
 
 register_tpu_ci(
@@ -51,13 +52,15 @@ class TestTpuQwen306bSinglehostSmoke(CustomTestCase):
     def setUpClass(cls):
         # setdefault: mode B runs these suites with SGLANG_PLATFORM=tpu_oot.
         os.environ.setdefault("SGLANG_PLATFORM", "tpu")
-        cls.model = MODEL
+        cls.model = try_cached_model(MODEL)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
+                "--served-model-name",
+                MODEL,
                 "--dtype",
                 "bfloat16",
                 "--device",
@@ -103,6 +106,11 @@ class TestTpuQwen306bSinglehostSmoke(CustomTestCase):
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
         self.assertIn("model_path", data)
+
+    def test_served_model_name(self):
+        resp = requests.get(f"{self.base_url}/v1/models")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"][0]["id"], MODEL)
 
     def test_completion_coherent(self):
         resp = requests.post(
