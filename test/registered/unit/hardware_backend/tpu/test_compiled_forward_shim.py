@@ -1930,6 +1930,7 @@ class TestShimInputLogprobPath(CustomTestCase):
             # Snapshot what the graph actually sees.
             seen["capture_hidden_mode"] = forward_batch.capture_hidden_mode
             seen["return_logprob"] = forward_batch.return_logprob
+            seen["raw_start_lens"] = forward_batch.extend_logprob_start_lens_cpu
             seen["start_lens"] = list(forward_batch.extend_logprob_start_lens_cpu or [])
             return LogitsProcessorOutput(
                 next_token_logits=torch.zeros(2, 10),
@@ -2032,16 +2033,78 @@ class TestShimInputLogprobPath(CustomTestCase):
     def test_output_only_logprob_request_skips_the_gather(self):
         # return_logprob=True but no prompt positions requested: still pinned
         # for the graph, but no eager pass.
+        seen = {}
         model = _StubModel()
         fb = self._fb(starts=(4, 4))
-        self._shim({}, model=model)(None, None, fb)
+        self._shim(seen, model=model)(None, None, fb)
         self.assertEqual(model.calls, 0)
+        self.assertIs(seen["capture_hidden_mode"], CaptureHiddenMode.NULL)
 
     # --- Disabled by default. Serving prompt logprobs makes the compiled
     # extend return every prefill row, which costs ~8% of prefill for everyone,
     # so the no-regression guarantee has to be structural rather than measured:
     # with the flag off, none of the above runs. Each case below goes red if
     # the gate is dropped and the cost becomes unconditional again.
+
+    def test_enabled_standard_prefill_retains_null_capture(self):
+        # Per-request dynamic dispatch: when prompt logprobs are enabled, standard
+        # prefill requests (return_logprob=False) retain NULL capture so they pay
+        # 0% latency penalty, and extend_logprob_start_lens_cpu is pinned to None.
+        seen = {}
+        fb = self._fb(return_logprob=False, starts=(2, 3))
+        self._shim(seen, model=_StubModel(), enabled=True)(None, None, fb)
+
+        self.assertIs(seen["capture_hidden_mode"], CaptureHiddenMode.NULL)
+        self.assertIs(fb.capture_hidden_mode, CaptureHiddenMode.NULL)
+        self.assertFalse(seen["return_logprob"])
+        self.assertIsNone(seen["raw_start_lens"])
+        self.assertEqual(fb.extend_logprob_start_lens_cpu, [2, 3])
+
+    def test_enabled_warmup_full_capture_sets_zero_start_lens(self):
+        # During warmup of the FULL-capture variant, return_logprob is False and
+        # capture_hidden_mode is preset to FULL. The shim must present the same
+        # [0] * pad_b start_lens to the graph as serving a prompt-logprob request,
+        # without running the eager gather.
+        seen = {}
+        model = _StubModel()
+        fb = self._fb(return_logprob=False, starts=(2, 3))
+        fb.capture_hidden_mode = CaptureHiddenMode.FULL
+        self._shim(seen, model=model, enabled=True)(None, None, fb)
+
+        self.assertIs(seen["capture_hidden_mode"], CaptureHiddenMode.FULL)
+        self.assertEqual(seen["start_lens"], [0, 0])
+        self.assertEqual(model.calls, 0)
+        self.assertEqual(fb.extend_logprob_start_lens_cpu, [2, 3])
+
+    def test_disabled_full_capture_extend_pins_start_lens_to_none(self):
+        # Non-prompt-logprob callers that set CaptureHiddenMode.FULL on an EXTEND
+        # batch (e.g. speculative decoding target extend) must not be misclassified
+        # as prompt-logprob batches when SGLANG_TPU_ENABLE_PROMPT_LOGPROB=0.
+        seen = {}
+        model = _StubModel()
+        fb = self._fb(return_logprob=False, starts=(2, 3))
+        fb.capture_hidden_mode = CaptureHiddenMode.FULL
+        self._shim(seen, model=model, enabled=False)(None, None, fb)
+
+        self.assertIs(seen["capture_hidden_mode"], CaptureHiddenMode.FULL)
+        self.assertIsNone(seen["raw_start_lens"])
+        self.assertEqual(model.calls, 0)
+        self.assertEqual(fb.extend_logprob_start_lens_cpu, [2, 3])
+
+    def test_target_verify_full_capture_pins_start_lens_to_none(self):
+        # TARGET_VERIFY returns True for forward_mode.is_extend() and uses
+        # CaptureHiddenMode.FULL in EAGLE speculative decoding, but is never a
+        # prompt-logprob prefill; it must keep extend_logprob_start_lens_cpu=None.
+        seen = {}
+        model = _StubModel()
+        fb = self._fb(mode="target_verify", return_logprob=False, starts=(2, 3))
+        fb.capture_hidden_mode = CaptureHiddenMode.FULL
+        self._shim(seen, model=model, enabled=True)(None, None, fb)
+
+        self.assertIs(seen["capture_hidden_mode"], CaptureHiddenMode.FULL)
+        self.assertIsNone(seen["raw_start_lens"])
+        self.assertEqual(model.calls, 0)
+        self.assertEqual(fb.extend_logprob_start_lens_cpu, [2, 3])
 
     def test_disabled_leaves_the_extend_batch_untouched(self):
         seen = {}

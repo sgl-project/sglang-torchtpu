@@ -1449,22 +1449,31 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
 
         compile_items = [
-            (num_tokens, bs, mode, "plain", logits_output_mode)
+            (num_tokens, bs, mode, "plain", logits_output_mode, CaptureHiddenMode.NULL)
             for num_tokens, bs, mode in compile_cases
             for logits_output_mode in self._warmup_logits_output_modes(bs)
         ]
-        cp_items = self._extend_cp_compile_items()
+        cp_items = [
+            (*item, CaptureHiddenMode.NULL) for item in self._extend_cp_compile_items()
+        ]
         compile_items += cp_items
-        # Input (prompt) logprobs need every prefill row, so they warm the
-        # FULL-capture variant instead of the NULL one -- a replacement, not an
-        # addition, because the shim then presents FULL on every extend and a
-        # single variant covers both. Off by default, which leaves this exactly
-        # the extend graph the backend has always compiled.
-        extend_capture_hidden_mode = (
-            CaptureHiddenMode.FULL
-            if tpu_envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
-            else CaptureHiddenMode.NULL
-        )
+        # When prompt logprobs are enabled, also warm the plain extend/mixed
+        # graphs with FULL capture. Standard prefill traffic retains
+        # CaptureHiddenMode.NULL (0% overhead), while requests requesting prompt
+        # logprobs use the FULL-capture variant (which always selects FULL_VOCAB
+        # because return_logprob=True disables distributed top-k).
+        if tpu_envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get():
+            compile_items += [
+                (
+                    num_tokens,
+                    bs,
+                    mode,
+                    "plain",
+                    LogitsOutputMode.FULL_VOCAB,
+                    CaptureHiddenMode.FULL,
+                )
+                for num_tokens, bs, mode in compile_cases
+            ]
         logger.info(
             "[decoder compile policy] EXTEND/MIXED: %d graph variants "
             "(mode_caps=%s, token_buckets=%s, context_parallel_cases=%d)",
@@ -1483,7 +1492,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             else compile_items
         )
         pending = []
-        for num_tokens, bs, mode, variant, logits_output_mode in compile_range:
+        for (
+            num_tokens,
+            bs,
+            mode,
+            variant,
+            logits_output_mode,
+            capture_hidden_mode,
+        ) in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
             warmup = self._run_one(
@@ -1492,7 +1508,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 mode=mode,
                 variant=variant,
                 logits_output_mode=logits_output_mode,
-                capture_hidden_mode=extend_capture_hidden_mode,
+                capture_hidden_mode=capture_hidden_mode,
             )
             elapsed = time.perf_counter() - start
             warmup = self._record_compile_step(
@@ -1503,7 +1519,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 num_tokens=num_tokens,
                 input_variant=None if variant == "plain" else variant,
                 logits_output_mode=logits_output_mode.name.lower(),
-                capture_hidden_mode=extend_capture_hidden_mode.name.lower(),
+                capture_hidden_mode=capture_hidden_mode.name.lower(),
             )
             if warmup is not None:
                 pending.append(warmup)
