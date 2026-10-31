@@ -722,10 +722,17 @@ def _validate_decode_context_parallel(server_args) -> None:
             "--decode-context-parallel-size > 1 on TPU: the DCP KV write "
             "targets the token-major fused KV cache."
         )
-    if cfg.kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
+    if cfg.kv_cache_dtype not in (
+        "auto",
+        "bf16",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+        "fp8_e5m2",
+    ):
         raise ValueError(
-            "--decode-context-parallel-size > 1 on TPU supports only a bf16 KV "
-            "cache (--kv-cache-dtype bfloat16), got --kv-cache-dtype "
+            "--decode-context-parallel-size > 1 on TPU supports only a bf16 or fp8 "
+            "KV cache (--kv-cache-dtype bfloat16 or fp8_e4m3), got --kv-cache-dtype "
             f"{cfg.kv_cache_dtype}."
         )
     chunk = cfg.chunked_prefill_size
