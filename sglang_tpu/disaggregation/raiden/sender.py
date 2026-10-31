@@ -113,11 +113,22 @@ class RaidenSenderMixin:
         sockets) or the sender's creation still wins.
         """
         try:
-            _, room_frame, *_ = msg
+            _, room_frame, *rest = msg
             room = int(decode_text(room_frame, "room"))
         except (IndexError, ValueError) as error:
             logger.error("RaidenKVManager received malformed ABORT: %s", error)
             return
+        # A decode that refuses a request at its door says why; the room is
+        # then failed even before this rank registers it, so the twin does
+        # not wait out the bootstrap timeout.
+        reason = next(
+            (
+                bytes(frame)[len(b"reason:") :].decode("ascii", "replace")
+                for frame in rest
+                if bytes(frame).startswith(b"reason:")
+            ),
+            None,
+        )
         with self._state_lock:
             # The status check, the tombstone, the failure record, and the
             # Failed status land as one step. A concurrent finalize either
@@ -132,6 +143,11 @@ class RaidenSenderMixin:
             if status == KVPoll.Success:
                 return
             self._mark_aborted_locked(room)
+            if status is None and reason is None:
+                return
+            self._fail_room_locked(
+                room, reason or "Aborted by decode-side abort notification."
+            )
             if status is None:
                 return
             self._fail_room_unless_failed_locked(

@@ -954,6 +954,15 @@ def _patch_scheduler_reject_prompt_logprob() -> None:
     Scheduler._add_request_to_queue = _add_request_to_queue
 
 
+def _patch_pd_decode_door_admission() -> None:
+    """Decide --max-queued-requests at the PD decode's door, before any prefill work.
+    See ``pd_decode_door_admission``.
+    """
+    from sglang_tpu import pd_decode_door_admission
+
+    pd_decode_door_admission.install()
+
+
 def apply_tpu_patches() -> None:
     """Install process-local TorchTPU runtime patches.
 
@@ -982,3 +991,4 @@ def apply_tpu_patches() -> None:
     _patch_host_heap_trim()
     _patch_profile_auto()
     _patch_scheduler_reject_prompt_logprob()
+    _patch_pd_decode_door_admission()

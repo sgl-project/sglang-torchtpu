@@ -415,22 +415,13 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
                 ):
                     self._apply(args)
 
-    def test_rejects_max_queued_requests_under_pd(self):
-        """The two sides admit independently, so a queue cap cannot be enforced
-        consistently; refuse at start-up instead of silently ignoring it."""
-        for mode in ("prefill", "decode"):
-            with self.subTest(mode=mode):
-                args = self._args(disaggregation_mode=mode, max_queued_requests=4)
-                with self.assertRaisesRegex(
-                    ValueError, "--max-queued-requests is not supported"
-                ):
-                    self._apply(args)
-
-    def test_queue_limit_allowed_outside_pd(self):
+    def test_queue_limit_allowed_under_pd(self):
+        """The door admission patch enforces --max-queued-requests for a PD pair,
+        so start-up no longer refuses the flag there."""
         for overrides in (
-            dict(max_queued_requests=4, enable_priority_scheduling=True),
-            dict(max_queued_requests=0),
-            dict(disaggregation_mode="decode"),
+            dict(max_queued_requests=4),
+            dict(disaggregation_mode="decode", max_queued_requests=4),
+            dict(disaggregation_mode="prefill", max_queued_requests=0),
         ):
             with self.subTest(**overrides):
                 self._apply(self._args(**overrides))
