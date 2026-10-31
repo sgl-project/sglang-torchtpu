@@ -1440,10 +1440,14 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
         self.assertTrue(prepared["use_fused_rs"])
 
     def test_explicit_legacy_pallas_backend_disables_fused_rs(self):
-        _, resolved, prepared, _ = self._run_gate(backend="pallas_tpu")
+        from sglang.srt.layers.quantization import modelopt_quant
+
+        with mock.patch.object(modelopt_quant.logger, "warning_once") as warn_mock:
+            _, resolved, prepared, _ = self._run_gate(backend="pallas_tpu")
 
         self.assertFalse(resolved)
         self.assertFalse(prepared["use_fused_rs"])
+        warn_mock.assert_not_called()
 
     def test_gate_still_declines_an_unsupported_layout(self):
         # EP 2 inside a world of 4 is the mixed TP/EP shape the requirement
@@ -1453,25 +1457,57 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
         self.assertFalse(resolved)
         self.assertFalse(prepared["use_fused_rs"])
 
-    def test_sub512_auto_backend_fails_closed_on_unsupported_layout(self):
+    def test_sub512_auto_backend_falls_back_to_stock_pallas(self):
+        from sglang.srt.layers.quantization import modelopt_quant
+
+        warn_fn = getattr(
+            modelopt_quant.logger.warning_once,
+            "__func__",
+            modelopt_quant.logger.warning_once,
+        )
         for group_size in (16, 32, 64, 128, 256):
-            with (
-                self.subTest(group_size=group_size),
-                self.assertRaisesRegex(ValueError, "requires the fused-RS"),
-            ):
-                self._run_gate(
-                    ep_size=2,
-                    world_size=4,
-                    group_size=group_size,
-                )
+            for ep_size, world_size in ((1, 1), (2, 4)):
+                with self.subTest(
+                    group_size=group_size, ep_size=ep_size, world_size=world_size
+                ):
+                    if hasattr(warn_fn, "cache_clear"):
+                        warn_fn.cache_clear()
+                    with self.assertLogs(
+                        modelopt_quant.logger, level="WARNING"
+                    ) as captured:
+                        _, resolved, prepared, _ = self._run_gate(
+                            ep_size=ep_size,
+                            world_size=world_size,
+                            group_size=group_size,
+                        )
+                        # Subsequent layers with the same unmet requirements
+                        # should not spam duplicate startup warnings.
+                        self._run_gate(
+                            ep_size=ep_size,
+                            world_size=world_size,
+                            group_size=group_size,
+                        )
+                    self.assertFalse(resolved)
+                    self.assertFalse(prepared["use_fused_rs"])
+                    self.assertEqual(len(captured.output), 1)
+                    self.assertIn("falling back to stock gmm_v2", captured.output[0])
+                    self.assertIn(
+                        "moe_ep_size == tp_size == world_size > 1",
+                        captured.output[0],
+                    )
 
     def test_explicit_pallas_backend_fails_closed(self):
-        with self.assertRaisesRegex(ValueError, "Unmet requirements"):
-            self._run_gate(
-                ep_size=2,
-                world_size=4,
-                backend="pallas_tpu_fused_rs",
-            )
+        for group_size in (16, 512):
+            with (
+                self.subTest(group_size=group_size),
+                self.assertRaisesRegex(ValueError, "Unmet requirements"),
+            ):
+                self._run_gate(
+                    ep_size=1,
+                    world_size=1,
+                    group_size=group_size,
+                    backend="pallas_tpu_fused_rs",
+                )
 
     def test_rejects_non_pallas_backend_on_tpu(self):
         with self.assertRaisesRegex(ValueError, "supports only"):
