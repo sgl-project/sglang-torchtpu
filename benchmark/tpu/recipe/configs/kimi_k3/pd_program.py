@@ -79,6 +79,8 @@ server_args.update(
         # AgentX traces reach 990k tokens: a long prompt's max_tokens is cut to
         # what the context leaves, rather than the request (and the run) failing.
         "allow_auto_truncate": True,
+        # usage.prompt_tokens_details.cached_tokens, for AgentX's cache metrics.
+        "enable_cache_report": True,
     }
 )
 if ROLE == "decode":

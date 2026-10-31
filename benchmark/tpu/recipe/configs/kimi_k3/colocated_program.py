@@ -62,6 +62,8 @@ server_args.update(
         # AgentX traces reach 990k tokens: a long prompt's max_tokens is cut to
         # what the context leaves, rather than the request (and the run) failing.
         "allow_auto_truncate": True,
+        # usage.prompt_tokens_details.cached_tokens, for AgentX's cache metrics.
+        "enable_cache_report": True,
         # The prefix cache: KV pages, a KDA checkpoint per page-aligned prefill
         # chunk, and tails past the last full page (sglang_tails). The running
         # requests' slots come out of the same state slots.
