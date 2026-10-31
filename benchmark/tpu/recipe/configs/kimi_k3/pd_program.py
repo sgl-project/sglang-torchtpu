@@ -122,6 +122,10 @@ else:
         mamba_track_interval=PAGE_SIZE,
         max_mamba_cache_size=PREFILL_CHECKPOINTS,
         max_total_tokens=None,
+        # A request joins the next prefill step on arrival and sends its KV
+        # once the decode's bootstrap lands, instead of waiting a step (or
+        # two: the prefill loop is synchronous) for the handshake first.
+        optimistic_prefill_attempts=1,
     )
 runtime_env = CONFIG["runtime_env"]
 # The sglang decoder kernels' switches: the program replaces the decoder.
