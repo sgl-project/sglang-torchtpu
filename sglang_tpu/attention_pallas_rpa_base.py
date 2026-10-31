@@ -1487,7 +1487,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # During torch.compile, rotary_emb may produce a 3D query; flatten so
         # the view below matches the kernel's expected layout. This mirrors
         # TorchNativeAttnBackend.
-        q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+        q_heads = layer.tp_q_head_num * getattr(layer, "dcp_q_heads_factor", 1)
+        q = q.reshape(-1, q_heads * layer.qk_head_dim)
         return self._forward(q, k, v, layer, forward_batch, sinks=kwargs.get("sinks"))
 
     def _kv_lens(self, forward_batch: ForwardBatch) -> torch.Tensor:
@@ -1513,7 +1514,17 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         )
 
         num_tokens = q.shape[0]
-        q = q.view(num_tokens, layer.tp_q_head_num, layer.qk_head_dim)
+        # Under --dcp-replicate-q-proj the layer projects its whole DCP
+        # group's query heads (rank-major), which is what the DCP path attends
+        # with; the output still carries this rank's tp_q_head_num heads.
+        q_factor = getattr(layer, "dcp_q_heads_factor", 1)
+        if q_factor != 1 and q_factor != self._dcp:
+            raise ValueError(
+                f"Layer {layer.layer_id} hands over {q_factor}x its query heads, "
+                f"but decode context parallelism is {self._dcp}."
+            )
+        q_heads = layer.tp_q_head_num * q_factor
+        q = q.view(num_tokens, q_heads, layer.qk_head_dim)
         k = k.view(num_tokens, layer.tp_k_head_num, layer.qk_head_dim)
         v = v.view(num_tokens, layer.tp_v_head_num, layer.v_head_dim)
 
@@ -1638,6 +1649,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 soft_cap,
                 k_scale,
                 v_scale,
+                layer.tp_q_head_num,
             )
         else:
             out = op(
@@ -1689,6 +1701,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         soft_cap: float | None,
         k_scale: float | None,
         v_scale: float | None,
+        layer_q_heads: int,
     ) -> torch.Tensor:
         """One layer of attention over a page-striped KV cache, ``[T, H, D]``.
 
@@ -1714,6 +1727,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         Both passes run on the group's gathered query heads against the full
         replicated KV block: the chunk pass has to see every KV head to write
         them all back, and each rank keeps its own head block of its result.
+        The heads are gathered here unless the layer already projected the
+        whole group's (``--dcp-replicate-q-proj``; ``q`` then has
+        ``cp * layer_q_heads`` heads and no exchange is needed).
         A mixed batch lists its prefill rows first and its decode rows last,
         so the STRIPED pass reads ``distribution`` back to front
         (``tail_decode``) to run the decode rows on the decode tile.
@@ -1722,7 +1738,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         cp = self._dcp
         group = self._dcp_group
 
-        q_all = gather_heads(q.contiguous(), group, cp, self._cp_rank_mask)
+        if q.shape[1] == cp * layer_q_heads:
+            # --dcp-replicate-q-proj: the layer projected the group's heads.
+            q_all = q.contiguous()
+        else:
+            q_all = gather_heads(q.contiguous(), group, cp, self._cp_rank_mask)
         if forward_batch.forward_mode.is_decode():
             # ``md.kv_lens`` is this rank's page-striped share of seq_len (the
             # new token included iff this rank owns its page); the page table

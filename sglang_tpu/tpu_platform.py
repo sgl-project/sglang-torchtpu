@@ -699,12 +699,6 @@ def _validate_decode_context_parallel(server_args) -> None:
             "LSEs and sums the outputs with zero-padded all-reduces, got "
             f"{cfg.dcp_comm_backend!r}."
         )
-    if cfg.dcp_replicate_q_proj:
-        raise ValueError(
-            "--dcp-replicate-q-proj is not supported with "
-            "--decode-context-parallel-size > 1 on TPU: it only applies to the "
-            "a2a/fi_a2a exchange on MLA attention."
-        )
     if not cfg.enable_torch_compile:
         raise ValueError(
             "--enable-torch-compile is required with "
@@ -1250,6 +1244,11 @@ class TpuSRTPlatform(SRTPlatform):
     def dcp_shards_every_kv_pool(self) -> bool:
         # The batched RPA DCP path addresses every pool through the widened
         # location space and replicates K/V heads within a DCP group.
+        return True
+
+    def dcp_replicates_q_heads(self) -> bool:
+        # The batched RPA DCP path attends with the group's gathered query
+        # heads; a Q projection sharded like K/V hands them over directly.
         return True
 
     def supports_moe_dp_pipeline_stages(self) -> bool:
