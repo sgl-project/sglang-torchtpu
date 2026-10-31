@@ -2,11 +2,9 @@
 """TPU NVFP4 (``modelopt_fp4``) MoE helpers.
 
 Serves block-16/32/64/128/256/512 NVFP4 MoE weights via the packed-FP4 path of
-Pallas ``gmm_v2`` kernels. Checkpoint global scales are folded into the per-block
-scales. No native fp4 MXU on TPU. Block-512 and block-256 weights use W4A8;
-blocks 16/32/64/128 use W4A16. Blocks below 512 require the fused-RS kernel because
-the stock Pallas packed-FP4 path supports block-512 only. The static
-``input_scale`` is unused.
+Pallas ``gmm_v2`` and fused-RS kernels. Checkpoint global scales are folded into
+the per-block scales. No native fp4 MXU on TPU. Block-512 and block-256 weights
+use W4A8; blocks 16/32/64/128 use W4A16. The static ``input_scale`` is unused.
 """
 
 from __future__ import annotations
@@ -20,7 +18,11 @@ from sglang.srt.layers.quantization.mxfp4_tpu_util import (
     _pad_last_axis,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
-from sglang_tpu.fp8_moe import _clear_replaced_param, _own_storage
+from sglang_tpu.fp8_moe import (
+    _clear_replaced_param,
+    _free_replaced_storage,
+    _own_storage,
+)
 from sglang_tpu.fused_rs_sequence_parallel import (
     get_tpu_fused_rs_post_expert_norm_weight,
     has_tpu_fused_rs_post_expert_norm,
@@ -29,9 +31,10 @@ from sglang_tpu.fused_rs_sequence_parallel import (
 )
 from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
-# Block-512 matches the original FP8 activation quantization block. The fused-RS
-# kernel additionally supports block-256 with W4A8 and blocks 16-128 with W4A16.
-# Keep the singular constant as the default/alignment contract for compatibility.
+# Block-512 matches the original FP8 activation quantization block. Both stock
+# Pallas gmm_v2 and fused-RS additionally support block-256 with W4A8 and blocks
+# 16-128 with W4A16. Keep the singular constant as the default/alignment
+# contract for compatibility.
 TPU_NVFP4_GROUP_SIZE = 512
 TPU_NVFP4_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128, 256, TPU_NVFP4_GROUP_SIZE)
 PACKING = 2  # two FP4 codes per uint8 byte
@@ -233,12 +236,6 @@ def prepare_tpu_nvfp4_moe_weights(
             f"{TPU_NVFP4_SUPPORTED_GROUP_SIZES}, "
             f"got {group_size}."
         )
-    if group_size != TPU_NVFP4_GROUP_SIZE and not use_fused_rs:
-        raise NotImplementedError(
-            f"TPU NVFP4 MoE group_size={group_size} requires the fused-RS "
-            "backend; the stock Pallas packed-FP4 path supports only "
-            f"group_size={TPU_NVFP4_GROUP_SIZE}."
-        )
 
     if not layer.moe_runner_config.is_gated:
         # GMM1 always splits its output in half for the gated SwiGLU, so a
@@ -246,18 +243,8 @@ def prepare_tpu_nvfp4_moe_weights(
         raise NotImplementedError("TPU NVFP4 MoE only supports gated (SwiGLU) experts.")
 
     w13 = layer.w13_weight.data  # (E, 2I, H/2) uint8
-    w2 = layer.w2_weight.data  # (E, H, I/2) uint8
     _E, two_I, _hidden_packed = w13.shape
     intermediate = two_I // 2
-
-    w13_s = layer.w13_weight_scale.data.float()
-    w2_s = layer.w2_weight_scale.data.float()
-    w13_global_scale = getattr(layer, "w13_weight_scale_2", None)
-    w2_global_scale = getattr(layer, "w2_weight_scale_2", None)
-    if w13_global_scale is not None:
-        w13_s = _fold_w13_global_scale(w13_s, w13_global_scale.data)
-    if w2_global_scale is not None:
-        w2_s *= w2_global_scale.data.float()[:, None, None]
 
     # Pad intermediate to align_to; pad_n must stay a multiple of group_size and
     # PACKING to keep scale blocks and packed bytes whole (enforced below).
@@ -268,18 +255,6 @@ def prepare_tpu_nvfp4_moe_weights(
             f"pad_n={pad_n} must be a multiple of both {group_size} and {PACKING}."
         )
 
-    # W13: pad gate/up halves independently, then transpose to gmm_v2 (E, K, N).
-    w13_w = _pad_gate_up_halves_axis1(w13, intermediate, pad_n)
-    w13_s = _pad_gate_up_halves_axis1(w13_s, intermediate, pad_n)
-    w13_scale = _to_gmm_v2_scale_layout(w13_s, scale_dtype)  # (E, H/G, 1, 2*I_pad)
-
-    # W2: pad packed-K and scale blocks to match, then transpose so N = hidden.
-    pad_k_packed = pad_n // PACKING
-    pad_k_blocks = pad_n // group_size
-    w2_w = _pad_last_axis(w2, pad_k_packed)
-    w2_s = _pad_last_axis(w2_s, pad_k_blocks)  # (E, H, I_pad/G)
-    w2_scale = _to_gmm_v2_scale_layout(w2_s, scale_dtype)  # (E, I_pad/G, 1, H)
-
     if use_fused_rs:
         from sglang_tpu.moe.pallas.fused_moe_rs_op import (
             prepare_fused_moe_rs,
@@ -287,23 +262,69 @@ def prepare_tpu_nvfp4_moe_weights(
 
         prepare_tpu_fused_rs_post_expert_norm(layer)
         prepare_fused_moe_rs(layer)
+
+    # W13: fold global scale, pad gate/up halves, and rebind before touching W2
+    # so single-device PP stages do not hold both layers' temporaries at once.
+    w13_s = layer.w13_weight_scale.data.float()
+    w13_global_scale = getattr(layer, "w13_weight_scale_2", None)
+    if w13_global_scale is not None:
+        w13_s = _fold_w13_global_scale(w13_s, w13_global_scale.data)
+    w13_w = _pad_gate_up_halves_axis1(w13, intermediate, pad_n)
+    w13_s = _pad_gate_up_halves_axis1(w13_s, intermediate, pad_n)
+    del w13
+    if use_fused_rs:
         w13_w = _materialize_packed_fp4(_transpose_packed_fp4(w13_w))
-        w2_w = _materialize_packed_fp4(_transpose_packed_fp4(w2_w))
         # Fused-RS reads [E, K_blocks, N]. The unit dim of the gmm_v2 layout is
         # stored major-most on TPU while the kernel needs it tiled, so XLA would
         # relayout both scale tensors before every call. Transpose directly: a
         # clone of a squeezed view is rebuilt from its base on every compiled
         # call (torch-tpu 0.2).
-        w13_scale = w13_s.to(scale_dtype).permute(0, 2, 1).contiguous()
-        w2_scale = w2_s.to(scale_dtype).permute(0, 2, 1).contiguous()
+        w13_scale = _own_storage(w13_s.to(scale_dtype).permute(0, 2, 1).contiguous())
     else:
         w13_w = w13_w.permute(0, 2, 1).contiguous()
-        w2_w = w2_w.permute(0, 2, 1).contiguous()
+        w13_scale = _to_gmm_v2_scale_layout(w13_s, scale_dtype)  # (E, H/G, 1, 2*I_pad)
+    del w13_s
+    if w13_w.device.type == "tpu":
+        from torch_tpu._internal.sync.sync import synchronize
 
+        synchronize([w13_w, w13_scale], wait=True)
+    old_w13 = layer.w13_weight.data
+    old_w13_scale = layer.w13_weight_scale.data
     copy_or_rebind_param(layer, "w13_weight", w13_w)
-    copy_or_rebind_param(layer, "w2_weight", w2_w)
     copy_or_rebind_param(layer, "w13_weight_scale", w13_scale)
+    _free_replaced_storage(old_w13, layer.w13_weight.data)
+    _free_replaced_storage(old_w13_scale, layer.w13_weight_scale.data)
+    del old_w13, old_w13_scale, w13_w, w13_scale
+
+    # W2: pad packed-K and scale blocks to match, then transpose so N = hidden.
+    w2 = layer.w2_weight.data  # (E, H, I/2) uint8
+    w2_s = layer.w2_weight_scale.data.float()
+    w2_global_scale = getattr(layer, "w2_weight_scale_2", None)
+    if w2_global_scale is not None:
+        w2_s *= w2_global_scale.data.float()[:, None, None]
+    pad_k_packed = pad_n // PACKING
+    pad_k_blocks = pad_n // group_size
+    w2_w = _pad_last_axis(w2, pad_k_packed)
+    w2_s = _pad_last_axis(w2_s, pad_k_blocks)  # (E, H, I_pad/G)
+    del w2
+    if use_fused_rs:
+        w2_w = _materialize_packed_fp4(_transpose_packed_fp4(w2_w))
+        w2_scale = _own_storage(w2_s.to(scale_dtype).permute(0, 2, 1).contiguous())
+    else:
+        w2_w = w2_w.permute(0, 2, 1).contiguous()
+        w2_scale = _to_gmm_v2_scale_layout(w2_s, scale_dtype)  # (E, I_pad/G, 1, H)
+    del w2_s
+    if w2_w.device.type == "tpu":
+        from torch_tpu._internal.sync.sync import synchronize
+
+        synchronize([w2_w, w2_scale], wait=True)
+    old_w2 = layer.w2_weight.data
+    old_w2_scale = layer.w2_weight_scale.data
+    copy_or_rebind_param(layer, "w2_weight", w2_w)
     copy_or_rebind_param(layer, "w2_weight_scale", w2_scale)
+    _free_replaced_storage(old_w2, layer.w2_weight.data)
+    _free_replaced_storage(old_w2_scale, layer.w2_weight_scale.data)
+    del old_w2, old_w2_scale, w2_w, w2_scale
 
     for name in _UNUSED_NVFP4_MOE_PARAMS:
         _clear_replaced_param(layer, name)
