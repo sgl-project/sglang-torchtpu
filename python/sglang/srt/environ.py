@@ -1490,6 +1490,9 @@ class Envs:
     # With --enable-mixed-chunk, a decoding request joins a mixed batch with its whole
     # DFLASH verify block (drafted first) instead of a single-token decode.
     SGLANG_DFLASH_MIXED_VERIFY = EnvBool(False)
+    # A spec tail that finishes inside a mixed batch commits its last run before its KV
+    # is released, as in decode; without it the radix tree misses the run's tokens.
+    SGLANG_MIXED_TAIL_COMMIT_ON_FINISH = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

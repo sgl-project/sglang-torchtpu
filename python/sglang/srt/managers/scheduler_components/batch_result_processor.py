@@ -383,9 +383,13 @@ class SchedulerBatchResultProcessor:
                         req.update_finish_state()
                     # A mixed spec tail committed its pending bonus token (a mixed
                     # verify tail its accepted run); advance so the next spec
-                    # prepare_for_decode reserves from the right base.
+                    # prepare_for_decode reserves from the right base. A tail finishing
+                    # here commits too (as decode does), so its release inserts the run.
                     if (
-                        not req.finished()
+                        (
+                            not req.finished()
+                            or envs.SGLANG_MIXED_TAIL_COMMIT_ON_FINISH.get()
+                        )
                         and batch.decoding_reqs
                         and req in batch.decoding_reqs
                         and not batch.spec_algorithm.is_none()
