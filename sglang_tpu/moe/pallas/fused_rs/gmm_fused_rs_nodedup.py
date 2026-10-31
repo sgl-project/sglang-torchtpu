@@ -29,7 +29,9 @@ from sglang_tpu.envs import envs as tpu_envs
 
 # Profiling only: comma list of nocompute/nogather/pairnoadd/pairnowrite/pairnofwd/pairnosend/fwdskip<k> drops that
 # part of the kernel (wrong output). fwdskip<k> (run table only) drops the forward to chip my_chip + k.
-_ABLATE = frozenset(x for x in os.environ.get("SGLANG_TPU_FUSED_RS_ABLATE", "").split(",") if x)
+_ABLATE = frozenset(
+    x for x in os.environ.get("SGLANG_TPU_FUSED_RS_ABLATE", "").split(",") if x
+)
 from sglang_tpu.moe.pallas.fused_rs.gmm_v2_gather_scatter import (
     Dimensions,
     FusedDims,
@@ -1105,7 +1107,9 @@ def kernel_main_fused_rs(
             idx += (n > b).astype(jnp.int32)
         lax.switch(idx, [(lambda b=b: (fn(b), jnp.int32(0))[1]) for b in window_rows])
 
-    def _issue_pieces(run_len, src_ref, src_row, dst_ref, dst_row, d, send_sem, recv_sem):
+    def _issue_pieces(
+        run_len, src_ref, src_row, dst_ref, dst_row, d, send_sem, recv_sem
+    ):
         """Power-of-two DMAs for one run; returns the number issued."""
         n = jnp.int32(0)
         for b in pair_pieces:
@@ -1186,6 +1190,7 @@ def kernel_main_fused_rs(
             @pl.when(run_len > 0)
             def _():
                 _row_window(run_len, _add)
+
         src_chip = (my_chip - relay_s + num_chips) % num_chips
         pltpu.semaphore_signal(
             relay_credit_ref.at[relay_dir],
@@ -1244,7 +1249,9 @@ def kernel_main_fused_rs(
                     continue
                 if pair_relay:
                     if k == relay_diag:
-                        _relay_send(g, stg, row0, run_len, src_off, relay_dir, relay_chip)
+                        _relay_send(
+                            g, stg, row0, run_len, src_off, relay_dir, relay_chip
+                        )
                         continue
                     # owners see the two neighbor blocks: from chip - 1 -> 3, chip + 1 -> 2
                     block = 3 if k == 1 else 2
@@ -1253,11 +1260,14 @@ def kernel_main_fused_rs(
                     run_len = jnp.where(held, 0, run_len)
             dst0 = block * rows_per_block + rank
 
-            def _pieces(sizes, *, run_len=run_len, src_off=src_off, dst0=dst0, d=d, src=src):
+            def _pieces(
+                sizes, *, run_len=run_len, src_off=src_off, dst0=dst0, d=d, src=src
+            ):
                 n = jnp.int32(0)
                 for b in sizes:
                     has = (run_len & b) != 0
-                    off = run_len & ~(2 * b - 1)  # rows of the larger pieces before this one
+                    # rows of the larger pieces before this one
+                    off = run_len & ~(2 * b - 1)
 
                     @pl.when(has)
                     def _(b=b, off=off):
@@ -2867,7 +2877,11 @@ def gmm_v2_fused_rs(
         payload, row_scales = pl.pallas_call(
             functools.partial(
                 kernel_main_fused_rs_fp8,
-                **{k: v for k, v in kernel_kwargs.items() if k not in ("pair_exchange", "pair_relay")},
+                **{
+                    k: v
+                    for k, v in kernel_kwargs.items()
+                    if k not in ("pair_exchange", "pair_relay")
+                },
             ),
             out_shape=(out_buf_init, out_scale_init),
             grid_spec=pltpu.PrefetchScalarGridSpec(

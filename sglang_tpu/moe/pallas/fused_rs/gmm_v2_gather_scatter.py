@@ -534,7 +534,9 @@ def inner_kernel(
                     acc_n += block_acc
 
                 acc_list.append(acc_n)
-                if row_blocks and (end_n - row_group_start == row_group or end_n == rhs_tile_n):
+                if row_blocks and (
+                    end_n - row_group_start == row_group or end_n == rhs_tile_n
+                ):
                     _store_row_block(
                         jnp.concatenate(acc_list, axis=1), row_group_start, end_n
                     )
