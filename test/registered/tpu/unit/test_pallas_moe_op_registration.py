@@ -190,6 +190,41 @@ class TestPallasMoeCallContract(CustomTestCase):
         self.assertIsInstance(offset_tensor, torch.Tensor)
         torch.testing.assert_close(offset_tensor, torch.tensor([6], dtype=torch.int32))
 
+    def test_lifts_expert_group_offset_by_the_traced_ep_rank(self):
+        """EP < TP: world rank 3 is EP rank 1 when moe_tp_size is 2, which the
+        world-rank lift cannot express; the caller's traced EP rank sets it."""
+        import sglang_tpu.moe.pallas.fused_moe_op as fused_moe_op
+        from sglang_tpu.rank_local import trace_rank
+
+        t = torch.empty(2, 8, dtype=torch.bfloat16)
+        op = Mock(return_value=t)
+        call = dict(
+            hidden_states=t,
+            w1=torch.empty(2, 8, 16, dtype=torch.bfloat16),
+            w2=torch.empty(2, 8, 8, dtype=torch.bfloat16),
+            topk_weights=torch.empty(2, 2, dtype=torch.bfloat16),
+            topk_ids=torch.empty(2, 2, dtype=torch.int32),
+            topk=2,
+            activation="silu",
+            global_num_experts=8,
+            expert_group_offset=2,
+        )
+        with (
+            patch.object(fused_moe_op, "_build_fused_moe_op", return_value=op),
+            patch("sglang_tpu.rank_local.dist.get_rank", return_value=3),
+            trace_rank(torch.tensor([3], dtype=torch.int32)),
+        ):
+            with self.assertRaisesRegex(ValueError, "contiguous logical rank groups"):
+                fused_moe_op.fused_moe_call(**call)
+            fused_moe_op.fused_moe_call(
+                **call, traced_ep_rank=torch.tensor([1], dtype=torch.int32)
+            )
+
+        self.assertEqual(op.call_args.args[13], 0)
+        torch.testing.assert_close(
+            op.call_args.args[19], torch.tensor([2], dtype=torch.int32)
+        )
+
     def test_situ_params_are_encoded_in_the_activation(self):
         """SiTU (beta, linear_beta) reach the op in the activation string."""
         import sglang_tpu.moe.pallas.fused_moe_op as fused_moe_op

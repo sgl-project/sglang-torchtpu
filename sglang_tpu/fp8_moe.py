@@ -24,6 +24,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import print_warning_once
 from sglang_tpu.envs import envs
+from sglang_tpu.moe.ep_rank import traced_moe_ep_rank
 
 
 def _free_replaced_storage(old: torch.Tensor, new: torch.Tensor) -> None:
@@ -597,6 +598,7 @@ def apply_tpu_fp8_moe(
         no_combine=no_combine,
         global_num_experts=global_num_experts,
         expert_group_offset=expert_group_offset,
+        traced_ep_rank=traced_moe_ep_rank(),
     )
     # Same contract as the unquantized runner: the standard dispatcher leaves
     # routed_scaling_factor to the runner, and per-expert output (the caller

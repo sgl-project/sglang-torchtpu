@@ -125,7 +125,7 @@ def check_moe_ep_rank_below_tp(cpu_group):
             )
             # The FP8 and W4A16 paths lift their expert window offset instead.
             static, offset = _resolve_expert_group_offset(
-                ep_rank * num_local, ep_size * num_local, num_local
+                ep_rank * num_local, ep_size * num_local, num_local, traced
             )
             assert static == 0
             return traced, w, i, offset
