@@ -711,11 +711,6 @@ class RaidenSenderMixin:
                 self._completed_send.add(self._swa_req_id(room))
 
     def _on_reshard_req(self, msg: List[bytes]) -> None:
-        if self._state_engine is not None:
-            raise NotImplementedError(
-                "Raiden push resharding does not move GDN (linear-attention) "
-                "state yet; use equal attention TP on prefill and decode."
-            )
         req = ReshardReq.from_frames(msg)
         room = req.room
         decode_ip = req.decode_ip
@@ -727,7 +722,17 @@ class RaidenSenderMixin:
         swa_push_endpoint = req.swa_push_endpoint
         with self._state_lock:
             failed_reason = self._tombstone_reason_locked(room)
-            if failed_reason is None:
+            if failed_reason is None and self._state_engine is not None:
+                # A decode without this check of its own (version skew) would
+                # otherwise wait out its timeout: fail the room and say why.
+                failed_reason = (
+                    "Raiden push resharding does not move GDN (linear-attention) "
+                    "state yet; use equal attention TP on prefill and decode."
+                )
+                self._mark_aborted_locked(room)
+                self._fail_room_locked(room, failed_reason)
+                self.update_status(room, KVPoll.Failed)
+            elif failed_reason is None:
                 self._prefill.reshard_req[room] = dict(
                     reply_addr=(decode_ip, decode_port),
                     push_endpoint=push_endpoint,
