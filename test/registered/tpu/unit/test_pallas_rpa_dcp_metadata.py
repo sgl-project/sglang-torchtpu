@@ -346,6 +346,74 @@ class TestPallasRpaDcpMetadataExtend(CustomTestCase):
 
 
 @_requires_dcp_helpers
+class TestPallasRpaDcpMetadataVerify(CustomTestCase):
+    """Target verify under dcp=2: lengths and owner writes from device lengths."""
+
+    PAGE_SIZE = 16
+    DCP = 2
+    PAGES_PER_SEQ = 5
+    MAX_CONTEXT_LEN = PAGE_SIZE * DCP * PAGES_PER_SEQ  # 160
+    WIDTH = 4
+    SEQ_LENS = [100, 33, 8]
+
+    def setUp(self):
+        self.req_to_token = _build_req_to_token(8, self.MAX_CONTEXT_LEN)
+        self.req_pool_indices = torch.tensor([5, 2, 7], dtype=torch.int64)
+        self.seq_lens = torch.tensor(self.SEQ_LENS, dtype=torch.int32)
+        self.fb = _make_forward_batch(
+            seq_lens=self.seq_lens,
+            req_pool_indices=self.req_pool_indices,
+            forward_mode=ForwardMode.TARGET_VERIFY,
+        )
+        # The spec worker's host lengths only bound the device ones.
+        self.fb.seq_lens_cpu = self.seq_lens + 3
+        self.fb.spec_info = types.SimpleNamespace(num_tokens_per_req=self.WIDTH)
+        self.fb.out_cache_loc = torch.zeros(
+            len(self.SEQ_LENS) * self.WIDTH, dtype=torch.int64
+        )
+
+    def _meta(self, rank: int) -> PallasForwardMetadata:
+        backend = _DcpBackendUnderTest(
+            self.PAGE_SIZE,
+            self.req_to_token,
+            self.DCP,
+            rank,
+            max_context_len=self.MAX_CONTEXT_LEN,
+        )
+        return _build_meta(backend, self.fb, self.DCP, rank)
+
+    def test_lengths_shard_the_device_window(self):
+        window = [n + self.WIDTH for n in self.SEQ_LENS]
+        for rank in range(self.DCP):
+            with self.subTest(rank=rank):
+                meta = self._meta(rank)
+                self.assertEqual(meta.dcp_kv_lens_global.tolist(), window)
+                self.assertEqual(
+                    meta.kv_lens.tolist(),
+                    _local_lens(window, self.DCP, rank).tolist(),
+                )
+                self.assertEqual(
+                    meta.dcp_prefix_kv_lens.tolist(),
+                    _local_lens(self.SEQ_LENS, self.DCP, rank).tolist(),
+                )
+
+    def test_each_window_token_lands_once_at_its_physical_slot(self):
+        """Exactly one rank writes each token, at loc // dcp of its widened loc."""
+        writers = torch.zeros(len(self.SEQ_LENS) * self.WIDTH, dtype=torch.int64)
+        for rank in range(self.DCP):
+            spans = self._meta(rank).dcp_write
+            self.assertEqual(spans.index.tolist(), spans.src.tolist())
+            writers += spans.lens.to(torch.int64)
+            for token in torch.nonzero(spans.lens).flatten().tolist():
+                req, offset = divmod(token, self.WIDTH)
+                position = self.SEQ_LENS[req] + offset
+                self.assertEqual(position % self.DCP, rank)
+                loc = int(self.req_to_token[self.req_pool_indices[req], position])
+                self.assertEqual(int(spans.dst[token]), loc // self.DCP)
+        self.assertEqual(writers.tolist(), [1] * writers.numel())
+
+
+@_requires_dcp_helpers
 class TestPallasRpaDcpCapacity(CustomTestCase):
     """The page-table capacity check measures one rank's local length."""
 
