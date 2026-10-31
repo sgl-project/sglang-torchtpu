@@ -1971,6 +1971,29 @@ class _ScopedWait:
             self.copy.wait()
 
 
+class _CopyGroup:
+    """Several async copies started and waited as one (EP16/TP2 half experts)."""
+
+    def __init__(self, *copies):
+        self.copies = copies
+
+    def start(self):
+        for copy in self.copies:
+            copy.start()
+
+    def wait(self):
+        for copy in self.copies:
+            copy.wait()
+
+
+# EP16/TP2 experts ([56, 448, 3072] per layer, the prefill's EP16 regrouping,
+# KernelConfig.decode_expert_parallel=16) run as 112 TP4-shaped half experts:
+# expert e's half h is virtual expert 2e + h (columns h of each of gate and up,
+# down rows h), so the expert slots, tiles and stream are those of EP8/TP4 (the
+# whole TP2 experts' slots would not fit VMEM past batch 8).
+HALF_EXPERT_LOCAL_COUNT = 896 // 16
+
+
 def _start_async_copies(copies: SimpleNamespace) -> None:
     for copy in vars(copies).values():
         if copy is not None:
@@ -2094,6 +2117,8 @@ class MixtureOfExpertsWeights:
         gate_up: bool = True,
         down: bool = True,
     ) -> SimpleNamespace:
+        if self.expert_gate_up_projection_vmem.shape[-1] < self.expert_gate_up_projection.shape[-1]:
+            return self.make_half_expert_copies(expert, slot, gate_up=gate_up, down=down)
         return SimpleNamespace(
             gate_up=(
                 tpu.make_async_copy(
@@ -2131,6 +2156,42 @@ class MixtureOfExpertsWeights:
                 if down
                 else None
             ),
+        )
+
+    def make_half_expert_copies(self, expert, slot, *, gate_up=True, down=True):
+        """Virtual expert ``expert``'s copies (see HALF_EXPERT_LOCAL_COUNT)."""
+        whole, half = expert // 2, expert % 2
+        width = self.expert_gate_up_projection_vmem.shape[-1] // 2  # TP4 gate (= up) width
+        gate_width = self.expert_gate_up_projection.shape[-1] // 2  # TP2 gate width
+
+        def columns(source, destination, semaphore):
+            return _CopyGroup(*(
+                tpu.make_async_copy(
+                    source.at[whole, :, pl.ds(pl.multiple_of(part * gate_width + half * width, 128), width)],
+                    destination.at[slot, :, pl.ds(part * width, width)],
+                    semaphore,
+                )
+                for part in range(2)  # gate, up
+            ))
+
+        def rows(source, destination, semaphore):
+            count = destination.shape[-2]
+            return tpu.make_async_copy(
+                source.at[whole, pl.ds(pl.multiple_of(half * count, 8), count)],
+                destination.at[slot],
+                semaphore,
+            )
+
+        semaphores = self.expert_copy_semaphores
+        return SimpleNamespace(
+            gate_up=columns(self.expert_gate_up_projection, self.expert_gate_up_projection_vmem,
+                            semaphores.at[slot, 0]) if gate_up else None,
+            gate_up_scales=columns(self.expert_gate_up_scales, self.expert_gate_up_scales_vmem,
+                                   semaphores.at[slot, 1]) if gate_up else None,
+            down=rows(self.expert_down_projection, self.expert_down_projection_vmem,
+                      semaphores.at[slot, 2]) if down else None,
+            down_scales=rows(self.expert_down_scales, self.expert_down_scales_vmem,
+                             semaphores.at[slot, 3]) if down else None,
         )
 
 
@@ -2232,6 +2293,10 @@ def moe(
     expert_output_size = weights.expert_down_projection.shape[-1]
     local_expert_count = weights.expert_gate_up_projection.shape[0]
     expert_tensor_parallel = 32 * local_expert_count // expert_count
+    half_experts = (
+        weights.expert_gate_up_projection_vmem.shape[-1]
+        < weights.expert_gate_up_projection.shape[-1]
+    )
     down_is_reblocked_fp8 = (
         weights.expert_down_projection.dtype == jnp.float8_e4m3fn
     )
@@ -2247,6 +2312,13 @@ def moe(
     )
     shared_width = weights.shared_down_projection.shape[0]
     expert_prefetch_slot_count = 4
+    # The HBM experts' width; half experts run at half of it.
+    stored_width = expert_width
+    if half_experts:
+        if expert_tensor_parallel != 2 or weights.expert_gate_up_projection.dtype != jnp.uint32:
+            raise ValueError("Half experts need EP16/TP2 MXFP4 experts")
+        expert_width //= 2
+    route_columns = (2 if half_experts else 1) * selected_expert_count
 
     if not 1 <= batch_size <= MAX_BATCH:
         raise ValueError(f"MoE supports 1 to {MAX_BATCH} rows")
@@ -2301,9 +2373,9 @@ def moe(
     if weights.expert_gate_up_projection.dtype == jnp.uint32:
         if (
             weights.expert_gate_up_projection.shape[1:]
-            != (expert_input_size // 8, 2 * expert_width)
+            != (expert_input_size // 8, 2 * stored_width)
             or weights.expert_gate_up_scales.shape[1:]
-            != (expert_input_size // 32, 2 * expert_width)
+            != (expert_input_size // 32, 2 * stored_width)
             or weights.expert_gate_up_scales.dtype != jnp.uint8
         ):
             raise ValueError("MXFP4 gate/up weights have inconsistent shapes")
@@ -2327,7 +2399,7 @@ def moe(
         ):
             raise ValueError("FP8 down scales must partition the contraction")
     elif (
-        weights.expert_down_projection.shape[1] * 8 != expert_width
+        weights.expert_down_projection.shape[1] * 8 != stored_width
         or weights.expert_down_scales.dtype != jnp.uint8
     ):
         raise ValueError("MXFP4 down weights or scales have inconsistent shapes")
@@ -2391,23 +2463,17 @@ def moe(
         raise ValueError("MoE latent-gather workspace must match the batch size")
     if weights.routing_projection_vmem.shape != (1, hidden_size, 512):
         raise ValueError("MoE routing projection workspace has the wrong shape")
+    def slot_shape(stored, axis):
+        shape = list(stored.shape[1:])
+        if half_experts:
+            shape[axis] //= 2
+        return (expert_prefetch_slot_count, *shape)
+
     expert_workspace_shapes = (
-        (
-            weights.expert_gate_up_projection_vmem.shape,
-            (expert_prefetch_slot_count, *weights.expert_gate_up_projection.shape[1:]),
-        ),
-        (
-            weights.expert_gate_up_scales_vmem.shape,
-            (expert_prefetch_slot_count, *weights.expert_gate_up_scales.shape[1:]),
-        ),
-        (
-            weights.expert_down_projection_vmem.shape,
-            (expert_prefetch_slot_count, *weights.expert_down_projection.shape[1:]),
-        ),
-        (
-            weights.expert_down_scales_vmem.shape,
-            (expert_prefetch_slot_count, *weights.expert_down_scales.shape[1:]),
-        ),
+        (weights.expert_gate_up_projection_vmem.shape, slot_shape(weights.expert_gate_up_projection, 1)),
+        (weights.expert_gate_up_scales_vmem.shape, slot_shape(weights.expert_gate_up_scales, 1)),
+        (weights.expert_down_projection_vmem.shape, slot_shape(weights.expert_down_projection, 0)),
+        (weights.expert_down_scales_vmem.shape, slot_shape(weights.expert_down_scales, 0)),
     )
     if any(actual != expected for actual, expected in expert_workspace_shapes):
         raise ValueError("MoE expert weight workspace has an invalid shape")
@@ -2564,24 +2630,26 @@ def moe(
             shared_route_prefix *= jnp.all(winners == winners[0]).astype(
                 jnp.int32
             )
+            halves = 2 if half_experts else 1
             should_prefetch = (
                 shared_route_prefix
                 * owned_locally.astype(jnp.int32)[0]
                 * (
-                    route_counts[0] < expert_prefetch_slot_count
+                    halves * route_counts[0] + halves - 1 < expert_prefetch_slot_count
                 ).astype(jnp.int32)
             )
 
             @pl.when(should_prefetch != 0)
             def start_expert_copy():
-                _start_async_copies(
-                    copy_expert(
-                        winners[0] % local_expert_count,
-                        route_counts[0],
+                for half in range(halves):
+                    _start_async_copies(
+                        copy_expert(
+                            halves * (winners[0] % local_expert_count) + half,
+                            halves * route_counts[0] + half,
+                        )
                     )
-                )
 
-            prefetched_expert_count += should_prefetch
+            prefetched_expert_count += halves * should_prefetch
 
         def overlap_router_score_exchange():
             # Latent projection reads hidden states, not router scores. Its
@@ -2667,13 +2735,22 @@ def moe(
                 live_rows=live_rows,
             )
         )
+        if half_experts:
+            # Each owned route runs as its two half experts, in order.
+            selected_experts = jnp.stack(
+                (2 * selected_experts, 2 * selected_experts + 1), axis=2
+            ).reshape(batch_size, route_columns)
+            selected_probabilities = jnp.stack(
+                (selected_probabilities, selected_probabilities), axis=2
+            ).reshape(batch_size, route_columns)
+            local_route_counts = 2 * local_route_counts
         selected_experts_vmem[...] = jnp.pad(
             selected_experts,
-            ((0, 0), (0, 128 - selected_expert_count)),
+            ((0, 0), (0, 128 - route_columns)),
         )
         selected_probabilities_vmem[...] = jnp.pad(
             selected_probabilities,
-            ((0, 0), (0, 128 - selected_expert_count)),
+            ((0, 0), (0, 128 - route_columns)),
         )
         local_route_counts_vmem[...] = jnp.broadcast_to(
             local_route_counts[:, None], local_route_counts_vmem.shape
@@ -3188,8 +3265,8 @@ def moe(
         with _phase("p4_experts"):
             _run_routed_expert_stream(
             latent_vmem,
-            selected_experts_vmem[:, :selected_expert_count],
-            selected_probabilities_vmem[:, :selected_expert_count],
+            selected_experts_vmem[:, :route_columns],
+            selected_probabilities_vmem[:, :route_columns],
             local_route_counts_vmem[:, 0],
             probability_totals_vmem[:, 0],
             expert_gate_up_vmem,
@@ -3221,8 +3298,8 @@ def moe(
         with _phase("p4_experts"):
             _run_routed_expert_stream(
             latent_vmem,
-            selected_experts_vmem[:, :selected_expert_count],
-            selected_probabilities_vmem[:, :selected_expert_count],
+            selected_experts_vmem[:, :route_columns],
+            selected_probabilities_vmem[:, :route_columns],
             local_route_counts_vmem[:, 0],
             probability_totals_vmem[:, 0],
             expert_gate_up_vmem,
@@ -6525,6 +6602,14 @@ def stack(
         name: jax.ShapeDtypeStruct(value.shape[1:], value.dtype)
         for name, value in weights.items()
     }
+    if local_weights["expert_gu"].shape[0] == HALF_EXPERT_LOCAL_COUNT:
+        # EP16/TP2 experts as 112 TP4-shaped half experts: only the VMEM
+        # slot shapes derive from these.
+        for name, axis in (("expert_gu", 2), ("expert_gus", 2), ("expert_down", 1), ("expert_ds", 1)):
+            dims = list(local_weights[name].shape)
+            dims[0] *= 2
+            dims[axis] //= 2
+            local_weights[name] = jax.ShapeDtypeStruct(tuple(dims), local_weights[name].dtype)
 
     def pooled_shape(name):
         """Pool footprint of a layer weight: a ring stream's slot region

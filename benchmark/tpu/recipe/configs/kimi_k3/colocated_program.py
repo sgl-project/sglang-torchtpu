@@ -5,8 +5,8 @@ tpu7x slice (tp32), for InferenceX AgentX.
         --config recipe/configs/kimi_k3/colocated_program.py
 
 Each engine prefills and decodes (sglang_tpu/k3_programs/sglang_colocated.py):
-the prefill program shares the decode program's routed experts (prefill expert
-parallelism 8), and a request goes from prefill to decode in place. Two
+the prefill program shares the decode program's routed experts (both at expert
+parallelism 16), and a request goes from prefill to decode in place. Two
 engines, one per slice, sit behind a cache-aware router, so a session's turns
 reach the engine holding its prefix. Weights come pre-sharded per host (see
 pd_program.py).
@@ -16,6 +16,8 @@ Environment:
                                     (default 4)
     K3_PROGRAM_CONTEXT              context length (default 1048576)
     K3_PROGRAM_KV_DTYPE             fp8_e4m3 (default) or bf16
+    K3_PROGRAM_EXPERT_PARALLEL      16 (default) or 8: both programs' expert
+                                    parallelism (the shared experts' layout)
     SGLANG_TPU_K3_PROGRAM_PRESHARDED pre-sharded weights directory
 """
 
@@ -99,10 +101,15 @@ runtime_env.update(
             "SGLANG_TPU_K3_PROGRAM_PRESHARDED", "/presharded"
         ),
         "SGLANG_TPU_K3_PROGRAM_DRAFT": "Inferact/Kimi-K3-DSpark",
-        # The prefill program reads the experts in the pre-shard's layout, the
-        # decode program's tensors, which it shares.
-        # (and more concurrent ranges per file, reading the pre-shard from GCS).
-        "SGLANG_TPU_K3_PROGRAM_KERNEL_CONFIG": "prefill_expert_parallel=8;read_streams=16",
+        # Both programs at one expert parallelism, so the prefill shares the
+        # decode program's experts: 16 by default, the fused prefill MoE's
+        # layout (the decode runs it as half experts); 8, the pre-shard's,
+        # leaves the prefill on the unfused MoE (about 5x slower). More
+        # concurrent ranges per file, reading the pre-shard from GCS.
+        "SGLANG_TPU_K3_PROGRAM_KERNEL_CONFIG": (
+            "prefill_expert_parallel={ep};decode_expert_parallel={ep};"
+            "read_streams=16"
+        ).format(ep=os.environ.get("K3_PROGRAM_EXPERT_PARALLEL", "16")),
         "SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS": os.environ.get(
             "K3_PROGRAM_PREFIX_TAILS", "48"
         ),

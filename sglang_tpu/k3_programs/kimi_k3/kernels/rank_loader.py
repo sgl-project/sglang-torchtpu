@@ -222,6 +222,23 @@ def _family_bytes(spec) -> int:
     return int(np.prod(spec["shape"])) * _dtype(spec["dtype"]).itemsize
 
 
+def _experts_at(presharded, rank: int, layers: int, rank_dir: RankDir, ep: int, split: bool):
+    """``rank``'s expert-family read jobs at expert parallelism ``ep``: its own
+    EP8/TP4 shards, or (16, 32) regrouped from its EP8 group's quarters on the
+    same host -- 16: 56 experts, half the intermediate (TP2 within the chip);
+    32: 28 whole experts. Regrouped families come per file, as ``split``."""
+    if ep not in (16, 32):
+        return _expert_jobs(rank_dir, split)
+    group = 4 * (rank // 4)
+    if ep == 32:
+        quarters, part, parts = range(4), rank % 4, 4
+    else:
+        quarters, part, parts = (2 * (rank % 2), 2 * (rank % 2) + 1), (rank // 2) % 2, 2
+    quarter_dirs = [RankDir(presharded, group + q, layers) for q in quarters]
+    return [job for name in sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n)))
+            for job in rank_dir.regrouped_expert_parts(name, quarter_dirs, part, parts)]
+
+
 def _expert_jobs(rank_dir: RankDir, split: bool):
     """Expert families largest first, whole or (``split``) one job per file."""
     experts = sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n)))
@@ -245,7 +262,9 @@ def iter_decode_rank(presharded, rank: int, *, layers: int = 93, split_experts: 
     rank's held TP32 shards (see :func:`attention_dp_families`).
     """
     rank_dir = RankDir(presharded, rank, layers)
-    jobs = list(_expert_jobs(rank_dir, split_experts))
+    jobs = list(
+        _experts_at(presharded, rank, layers, rank_dir, _config().decode_expert_parallel, split_experts)
+    )
     jobs.append(("dense", _dense_bytes(rank_dir), rank_dir.read_dense_all))
     for key, value in _budgeted(jobs):
         if key == "dense":
@@ -322,19 +341,9 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
         return (int(np.prod(spec["shape"])) * _dtype(spec["dtype"]).itemsize,
                 lambda: projection(name))
 
-    ep = _config().prefill_expert_parallel
-    jobs: list[tuple] = []
-    if ep in (16, 32):  # regrouped from the EP8 group's quarters (same host)
-        group = 4 * (rank // 4)
-        if ep == 32:  # 28 whole experts
-            quarters, part, parts = range(4), rank % 4, 4
-        else:  # 56 experts, half the intermediate (TP2 within the chip)
-            quarters, part, parts = (2 * (rank % 2), 2 * (rank % 2) + 1), (rank // 2) % 2, 2
-        quarter_dirs = [RankDir(presharded, group + q, layers) for q in quarters]
-        jobs += [job for name in sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n)))
-                 for job in rank_dir.regrouped_expert_parts(name, quarter_dirs, part, parts)]
-    else:
-        jobs += list(_expert_jobs(rank_dir, split_experts))
+    jobs: list[tuple] = list(
+        _experts_at(presharded, rank, layers, rank_dir, _config().prefill_expert_parallel, split_experts)
+    )
     jobs.append(("dense", _dense_bytes(rank_dir), rank_dir.read_dense_all))
     for name, source in (("latent_down", "latent_down"), ("latent_up", "latent_up"),
                          ("shared_gu", f"shared_gu_{parity}"), ("shared_down", f"shared_down_{parity}")):

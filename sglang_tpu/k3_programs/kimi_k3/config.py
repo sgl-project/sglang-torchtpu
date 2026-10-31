@@ -64,6 +64,10 @@ class KernelConfig:
     # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
     # 16 and 32 regroup the EP8 group's shards at load.
     prefill_expert_parallel: int = 16
+    # Decode routed experts: 8 (EP8/TP4, the pre-shard layout) or 16 (the
+    # prefill's EP16/TP2 regrouping, run as TP4-shaped half experts), so
+    # colocated programs can share EP16 experts with the fused prefill MoE.
+    decode_expert_parallel: int = 8
     # Packed dispatch/shared overlap and fused down/combine/reduce-scatter.
     # EP16: FP32 at all serving windows, BF16 at 4K/8K only.
     # False: the unfused SparseCore gather/combine.
@@ -86,6 +90,8 @@ class KernelConfig:
     def __post_init__(self) -> None:
         if self.prefill_expert_parallel not in (8, 16, 32):
             raise ValueError("prefill_expert_parallel is 8, 16 or 32")
+        if self.decode_expert_parallel not in (8, 16):
+            raise ValueError("decode_expert_parallel is 8 or 16")
         if self.moe_reduce_dtype not in ("float32", "bfloat16"):
             raise ValueError("moe_reduce_dtype is float32 or bfloat16")
         if self.mla_decode_ktile not in (1024, 2048):

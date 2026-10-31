@@ -23,18 +23,18 @@ STEP = 8192
 
 class StubRankLoader:
     """A rank loader whose prefill iterator reads expert parts through
-    ``_expert_jobs`` (as the real one at prefill expert parallelism 8)."""
+    ``_experts_at`` (as the real one at any expert parallelism)."""
 
     def __init__(self):
         self.expert_reads = 0
 
-    def _expert_jobs(self, *args, **kwargs):
+    def _experts_at(self, *args, **kwargs):
         for family in colocated.EXPERT_FAMILIES:
             self.expert_reads += 1
             yield ("moe", f"{family}@0/1", np.zeros(4))
 
     def iter_prefill_rank(self, presharded, cache, rank, **kwargs):
-        yield from self._expert_jobs()
+        yield from self._experts_at()
         yield ("dense", "latent_down", np.ones(2))
 
 
@@ -42,6 +42,7 @@ class StubPrefillProgram:
     def __init__(self):
         self._rank_loader = StubRankLoader()
         self.weights = {}
+        self.shared_experts = False
 
     def load_weights(self, presharded):
         for group, name, array in self._rank_loader.iter_prefill_rank(
@@ -54,10 +55,13 @@ class StubPrefillProgram:
             assert family in self.weights["moe"], family
 
 
-def _config(ep):
+def _config(ep, decode_ep=None):
     return mock.patch(
         "sglang_tpu.k3_programs.kimi_k3.config.active",
-        return_value=SimpleNamespace(prefill_expert_parallel=ep),
+        return_value=SimpleNamespace(
+            prefill_expert_parallel=ep,
+            decode_expert_parallel=ep if decode_ep is None else decode_ep,
+        ),
     )
 
 
@@ -76,9 +80,16 @@ class TestSharedExperts(CustomTestCase):
         self.prefiller = SimpleNamespace(program=StubPrefillProgram())
 
     def test_prefill_takes_the_decoders_experts(self):
+        for ep in colocated.SHARED_EXPERT_PARALLEL:
+            with self.subTest(ep=ep):
+                self.setUp()
+                self._check_shared(ep)
+
+    def _check_shared(self, ep):
         loader = self.prefiller.program._rank_loader
-        with _config(8):
+        with _config(ep):
             colocated.share_experts(self.prefiller, self.decoder)
+        self.assertTrue(self.prefiller.program.shared_experts)
         self.decoder.ops.load_weights.assert_called_once()
         self.prefiller.program.load_weights("/presharded")
         moe = self.prefiller.program.weights["moe"]
@@ -89,12 +100,16 @@ class TestSharedExperts(CustomTestCase):
         self.assertIn("latent_down", self.prefiller.program.weights["dense"])
         # The loader's expert jobs are back after the load.
         self.assertEqual(
-            len(list(loader._expert_jobs())), len(colocated.EXPERT_FAMILIES)
+            len(list(loader._experts_at())), len(colocated.EXPERT_FAMILIES)
         )
 
-    def test_only_at_prefill_expert_parallelism_eight(self):
-        with _config(16), self.assertRaisesRegex(ValueError, "parallelism 8, not 16"):
-            colocated.share_experts(self.prefiller, self.decoder)
+    def test_only_at_equal_expert_parallelism(self):
+        for ep, decode_ep in ((16, 8), (8, 16), (32, 32)):
+            with self.subTest(ep=ep, decode_ep=decode_ep):
+                with _config(ep, decode_ep), self.assertRaisesRegex(
+                    ValueError, f"not {ep} and {decode_ep}"
+                ):
+                    colocated.share_experts(self.prefiller, self.decoder)
 
 
 class TestColocatedDispatch(CustomTestCase):

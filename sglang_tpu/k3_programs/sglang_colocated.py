@@ -4,10 +4,11 @@
 Under P/D the decode slice is the bottleneck on AgentX while the prefill slice
 mostly waits (prefix hits leave ~2.6% of the input to compute). Two engines
 that each prefill and decode put both slices to decoding. The programs' HBM
-fits once they share the routed experts, nearly all of the weights: with
-prefill expert parallelism 8 the prefill program reads the experts in the
-pre-shard's layout, exactly the decode program's tensors, so it takes the
-decode program's copy instead of loading its own.
+fits once they share the routed experts, nearly all of the weights: at
+equal expert parallelism -- 8, the pre-shard's layout, or 16, the fused prefill
+MoE's (the decode runs it as half experts) -- both programs read the same
+tensors, so the prefill takes the decode program's copy instead of loading its
+own.
 
 Prefill and decode bind the same unified pools (each with its own tables).
 A request needs no transfer: the prefill leaves its KDA state in the
@@ -21,18 +22,18 @@ import contextlib
 from typing import Any
 
 EXPERT_FAMILIES = ("expert_gu", "expert_gus", "expert_down", "expert_ds")
-PREFILL_EXPERT_PARALLEL = 8
+SHARED_EXPERT_PARALLEL = (8, 16)
 
 
 @contextlib.contextmanager
 def _no_expert_jobs(rank_loader: Any):
     """The rank loader without the expert families' read jobs."""
-    original = rank_loader._expert_jobs
-    rank_loader._expert_jobs = lambda *args, **kwargs: iter(())
+    original = rank_loader._experts_at
+    rank_loader._experts_at = lambda *args, **kwargs: iter(())
     try:
         yield
     finally:
-        rank_loader._expert_jobs = original
+        rank_loader._experts_at = original
 
 
 class _SharedExpertLoader:
@@ -58,16 +59,17 @@ def share_experts(prefiller: Any, decoder: Any) -> None:
     other weights around them."""
     from sglang_tpu.k3_programs.kimi_k3.config import active
 
-    ep = active().prefill_expert_parallel
-    if ep != PREFILL_EXPERT_PARALLEL:
+    ep, decode_ep = active().prefill_expert_parallel, active().decode_expert_parallel
+    if ep != decode_ep or ep not in SHARED_EXPERT_PARALLEL:
         raise ValueError(
-            f"colocated K3 programs share the experts at prefill expert "
-            f"parallelism {PREFILL_EXPERT_PARALLEL}, not {ep}"
+            f"colocated K3 programs share the experts at prefill and decode "
+            f"expert parallelism 8 or 16 alike, not {ep} and {decode_ep}"
         )
     decoder.ops.load_weights()
     experts = {name: decoder.ops.weights[name] for name in EXPERT_FAMILIES}
     program = prefiller.program
     program._rank_loader = _SharedExpertLoader(program._rank_loader)
+    program.shared_experts = True
     load = program.load_weights
 
     def load_weights(presharded):

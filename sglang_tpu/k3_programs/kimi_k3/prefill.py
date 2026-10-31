@@ -296,6 +296,9 @@ class PrefillProgram:
         }
         self.weights: dict[str, dict[str, torch.Tensor]] = {}
         self._expert_banks: list[dict[str, torch.Tensor]] = []
+        # Set by sglang_colocated.share_experts: the routed experts are a
+        # decode program's, not loaded here.
+        self.shared_experts = False
         self._ops: dict[Any, dict[str, Any]] = {}
         self._pairs: list[torch.Tensor] = []
         self._state_ops: dict[tuple[str, int], Any] = {}
@@ -309,7 +312,13 @@ class PrefillProgram:
             presharded, cache, self.rank, split_experts=True
         )
         self._expert_banks = []
-        if active().prefill_fused_moe and active().prefill_expert_parallel == 16:
+        # Experts shared with a colocated decode program stay its single
+        # [92, ...] families (the fused MoE also reads a complete family).
+        if (
+            active().prefill_fused_moe
+            and active().prefill_expert_parallel == 16
+            and not self.shared_experts
+        ):
             self._expert_banks = [{} for _ in _EXPERT_BANK_SIZES]
             iterator = _bank_expert_weights(iterator)
 
