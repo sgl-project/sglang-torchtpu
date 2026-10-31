@@ -1,17 +1,21 @@
 """Pure-JAX TPU tests for the context-parallel modes of the batched RPA kernel.
 
 The geometries mirror gpt-oss-120b decode context parallelism on one host: each
-rank keeps all of its KV heads over 1/cp of the positions and attends the
-group's gathered query heads. DCP2 is 16 query heads over 2 KV heads, DCP8 is 64
-over 8; head_dim 64, bf16, page size 256, sliding window 128.
+rank keeps all of its KV heads over its page stripe of the positions (page
+``p`` lives on rank ``p % cp``) and attends the group's gathered query heads.
+DCP2 is 16 query heads over 2 KV heads, DCP8 is 64 over 8; head_dim 64, bf16,
+page size 256, sliding window 128.
 
 Cases:
 
-* ``cache_only`` + ``return_lse`` on every rank's position-interleaved shard,
-  merged by LSE, equals a dense reference over the whole sequence -- with and
-  without the window, with and without the sink fold -- on a decode batch with
-  a sequence whose shard is empty on most ranks, and with k blocks small enough
-  that the global window skips whole blocks.
+* ``cache_only`` + ``return_lse`` on every rank's page stripe, merged by LSE,
+  equals a dense reference over the whole sequence -- with and without the
+  window, with and without the sink fold -- on a decode batch with a sequence
+  whose stripe is empty on most ranks, and with k blocks small enough that the
+  global window skips whole blocks.
+* The fused ``STRIPED`` decode: one launch per rank attends its stripe plus the
+  new token on the rank that owns its page and writes that token into the
+  stripe; the merged partials equal the dense reference over every token.
 * The same on an extend prefix pass in the MIXED range, including q blocks
   past the window that see no prefix key and a sequence with no prefix at all.
 * The extend two-pass merge: a cache-only prefix pass and a chunk-local pass
@@ -213,14 +217,24 @@ def _cp_kwargs(geo: Geometry, rank: int, kv_lens_global):
     )
 
 
-def _local_positions(length: int, rank: int, cp: int) -> np.ndarray:
-    """Global positions rank `rank` stores, in local key order."""
-    return np.arange(rank, length, cp)
+def _local_positions(
+    length: int, rank: int, cp: int, page_size: int = PAGE_SIZE
+) -> np.ndarray:
+    """Global positions rank `rank` stores, in local key order (page-striped)."""
+    positions = np.arange(length)
+    return positions[(positions // page_size) % cp == rank]
+
+
+def _local_len(length: int, rank: int, cp: int, page_size: int = PAGE_SIZE) -> int:
+    """``get_dcp_lens(interleave_size=page_size)`` for one length."""
+    cycle = cp * page_size
+    rem = min(max(length % cycle - rank * page_size, 0), page_size)
+    return (length // cycle) * page_size + rem
 
 
 def _pages_per_seq(lengths, cp: int, page_size: int = PAGE_SIZE) -> int:
-    """Pages per sequence on the rank with the longest shard (rank 0)."""
-    longest = max(-(-length // cp) for length in lengths)
+    """Pages per sequence on the rank with the longest stripe (rank 0)."""
+    longest = max(_local_len(length, 0, cp, page_size) for length in lengths)
     return max(1, -(-longest // page_size))
 
 
@@ -267,10 +281,17 @@ def _dense_attention(
 
 
 def _first_window_key(q_global: int, rank: int, cp: int) -> int:
-    """First local key j of `rank` inside the window of global query q_global."""
-    j = 0
-    while j * cp + rank <= q_global - SLIDING_WINDOW:
-        j += 1
+    """First local key j of `rank` inside the window of global query q_global.
+
+    Mirrors the schedule: the first local page at or after the window's first
+    global page, plus the in-page offset when that page is this rank's.
+    """
+    first_global = max(q_global - SLIDING_WINDOW + 1, 0)
+    first_page = first_global // PAGE_SIZE
+    first_local_page = max(first_page - rank + cp - 1, 0) // cp
+    j = first_local_page * PAGE_SIZE
+    if first_local_page * cp + rank == first_page:
+        j += first_global % PAGE_SIZE
     return j
 
 
@@ -315,7 +336,7 @@ class _CloseAssertions(unittest.TestCase):
 
 @unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
 class TestBatchedRpaDcpDecode(_CloseAssertions):
-    """Interleaved shards of a decode batch merge back into the dense result."""
+    """Page stripes of a decode batch merge back into the dense result."""
 
     # Global KV lengths including the decoded token. Length 1 leaves every rank
     # but rank 0 empty; 2600 spans several one-page k blocks on every rank.
@@ -442,15 +463,17 @@ class TestBatchedRpaDcpDecode(_CloseAssertions):
 
     def test_empty_shard_row_returns_zero_output_and_minus_inf_lse(self):
         # Sequence 1 has one global token, which rank 0 owns: on the last rank
-        # its shard is empty and its q_len (1) exceeds its kv_len (0).
+        # its stripe is empty and its q_len (1) exceeds its kv_len (0). So is
+        # sequence 2's (173 tokens, all on page 0); sequence 0 (2600 tokens)
+        # reaches every rank's stripe and must still be attended.
         for geo in (DCP2, DCP8):
             with self.subTest(geo.name):
-                out, lse = self._partials(geo, SLIDING_WINDOW, None)[geo.cp - 1]
-                self.assertTrue(np.all(out[1] == 0.0), out[1])
-                self.assertTrue(np.all(np.isneginf(lse[1])), lse[1])
-                # The sequence after the empty one must still be attended.
-                self.assertTrue(np.all(np.isfinite(lse[2])))
-                self.assertGreater(float(np.abs(out[2]).max()), 0.0)
+                out, lse = self._partials(geo, None, None)[geo.cp - 1]
+                for seq in (1, 2):
+                    self.assertTrue(np.all(out[seq] == 0.0), out[seq])
+                    self.assertTrue(np.all(np.isneginf(lse[seq])), lse[seq])
+                self.assertTrue(np.all(np.isfinite(lse[0])))
+                self.assertGreater(float(np.abs(out[0]).max()), 0.0)
 
     def test_sink_in_a_cache_only_pass_joins_every_row(self):
         # A sink is one more key with a zero value: lse = logaddexp(sink, lse)
@@ -469,6 +492,569 @@ class TestBatchedRpaDcpDecode(_CloseAssertions):
                     lse, np.logaddexp(sinks[None, :], bare_lse), geo.name
                 )
                 self.assertTrue(np.all(out[1] == 0.0), out[1])
+
+
+@unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
+class TestBatchedRpaDcpStripedDecode(_CloseAssertions):
+    """The fused ``STRIPED`` decode launch.
+
+    The cache holds the first ``n - 1`` tokens of every sequence, page-striped;
+    the decoded token arrives through the k/v operands. The rank owning its
+    page (``((n - 1) // page) % cp``) passes ``kv_lens = local_cache + 1`` and
+    attends and writes it; the others pass their stripe length. The merged
+    partials equal dense attention over all ``n`` tokens, with and without the
+    window, and the owner's stripe ends with the new token afterwards.
+    """
+
+    # 256 and 257 put the new token at the last slot of a page and at the first
+    # slot of the next (a different owner); 1 is a fresh sequence.
+    SEQ_LENS = (2600, 1, 173, 300, 256, 257, 512)
+    MAX_NUM_TOKENS = 8
+
+    def _data(self, geo: Geometry):
+        rng = np.random.default_rng(4321 + geo.cp)
+        kv_shape = (geo.num_kv_heads, HEAD_DIM)
+        full_k = [_random(rng, (n, *kv_shape)) for n in self.SEQ_LENS]
+        full_v = [_random(rng, (n, *kv_shape)) for n in self.SEQ_LENS]
+        queries = _random(rng, (self.MAX_NUM_TOKENS, geo.num_q_heads, HEAD_DIM))
+        return full_k, full_v, queries
+
+    def _run_rank(self, geo: Geometry, rank: int, window, blocks):
+        import jax.numpy as jnp
+
+        full_k, full_v, queries = self._data(geo)
+        cache_lens = [n - 1 for n in self.SEQ_LENS]
+        positions = [_local_positions(n, rank, geo.cp) for n in cache_lens]
+        pages = _pages_per_seq(self.SEQ_LENS, geo.cp)
+        shard = _paged_shard(
+            [k[p] for k, p in zip(full_k, positions)],
+            [v[p] for v, p in zip(full_v, positions)],
+            pages,
+            np.random.default_rng(100 + rank),
+            geo.num_kv_heads,
+        )
+        owns = [((n - 1) // PAGE_SIZE) % geo.cp == rank for n in self.SEQ_LENS]
+        kv_lens = [
+            _local_len(n - 1, rank, geo.cp) + int(own)
+            for n, own in zip(self.SEQ_LENS, owns)
+        ]
+        shard = shard._replace(kv_lens=kv_lens)
+        new_k = np.zeros((self.MAX_NUM_TOKENS, geo.num_kv_heads, HEAD_DIM), np.float32)
+        new_v = np.zeros_like(new_k)
+        for seq, n in enumerate(self.SEQ_LENS):
+            new_k[seq], new_v[seq] = full_k[seq][n - 1], full_v[seq][n - 1]
+        num_seqs = len(self.SEQ_LENS)
+        out, cache_after, lse = _run_kernel(
+            queries,
+            new_k,
+            new_v,
+            shard,
+            np.arange(num_seqs + 1),
+            [num_seqs] * 3,
+            sliding_window=window,
+            decode_block_sizes=blocks,
+            skip_kv_write=False,
+            return_lse=True,
+            cp_group_size=geo.cp,
+            cp_rank=jnp.asarray([rank], jnp.int32),
+            kv_lens_global=jnp.asarray(self.SEQ_LENS, jnp.int32),
+            attention_scope=3,  # STRIPED
+        )
+        return (out[:num_seqs], lse[:num_seqs]), cache_after, shard, owns, pages
+
+    def _reference(self, geo: Geometry, window):
+        full_k, full_v, queries = self._data(geo)
+        num_seqs = len(self.SEQ_LENS)
+        out = np.zeros((num_seqs, geo.num_q_heads, HEAD_DIM), np.float32)
+        lse = np.zeros((num_seqs, geo.num_q_heads), np.float32)
+        for seq, n in enumerate(self.SEQ_LENS):
+            o, l = _dense_attention(
+                queries[seq : seq + 1], full_k[seq], full_v[seq], np.asarray([n - 1]), window
+            )
+            out[seq], lse[seq] = o[0], l[0]
+        return out, lse
+
+    def test_merged_striped_partials_match_the_dense_reference(self):
+        for geo in (DCP2, DCP8):
+            for window in (None, SLIDING_WINDOW):
+                for blocks in (None, _small_decode_blocks()):
+                    if not full_matrix() and (window is None) != (blocks is None):
+                        continue
+                    label = f"{geo.name} window={window} blocks={blocks}"
+                    with self.subTest(label):
+                        partials = [
+                            self._run_rank(geo, rank, window, blocks)[0]
+                            for rank in range(geo.cp)
+                        ]
+                        out, lse = _merge_by_lse(partials)
+                        ref_out, ref_lse = self._reference(geo, window)
+                        self.assert_out_close(out, ref_out, label)
+                        self.assert_lse_close(lse, ref_lse, label)
+
+    def test_the_owner_writes_the_new_token_at_its_stripe_end(self):
+        for geo in (DCP2, DCP8):
+            full_k, full_v, _ = self._data(geo)
+            claimed = {}
+            for rank in range(geo.cp):
+                _, cache_after, shard, owns, pages = self._run_rank(geo, rank, None, None)
+                for seq, n in enumerate(self.SEQ_LENS):
+                    if not owns[seq]:
+                        continue
+                    self.assertNotIn(seq, claimed)
+                    claimed[seq] = rank
+                    j = _local_len(n - 1, rank, geo.cp)
+                    page = shard.page_indices[seq * pages + j // PAGE_SIZE]
+                    row = cache_after[page, j % PAGE_SIZE]
+                    row = row.reshape(-1, row.shape[-1])[: 2 * geo.num_kv_heads, :HEAD_DIM]
+                    row = row.reshape(geo.num_kv_heads, 2, HEAD_DIM)
+                    label = f"{geo.name} rank {rank} seq {seq}"
+                    self.assert_out_close(row[:, 0], full_k[seq][n - 1], label + " k")
+                    self.assert_out_close(row[:, 1], full_v[seq][n - 1], label + " v")
+            self.assertEqual(sorted(claimed), list(range(len(self.SEQ_LENS))))
+
+    def test_fused_striped_rejects_multi_token_decode(self):
+        """STRIPED relies on one query per sequence; multi-token decode must use the 2-phase pair."""
+        import jax.numpy as jnp
+        from sglang_tpu.attention.pallas.batched_rpa.wrapper import ragged_paged_attention
+
+        shard = _paged_shard(
+            [np.zeros((1, 2, HEAD_DIM), np.float32)],
+            [np.zeros((1, 2, HEAD_DIM), np.float32)],
+            1,
+            np.random.default_rng(0),
+            2,
+        )
+        with self.assertRaisesRegex(ValueError, "decode_query_size == 1"):
+            ragged_paged_attention(
+                jnp.zeros((2, 16, HEAD_DIM), jnp.bfloat16),
+                jnp.zeros((2, 2, HEAD_DIM), jnp.bfloat16),
+                jnp.zeros((2, 2, HEAD_DIM), jnp.bfloat16),
+                shard.cache,
+                jnp.asarray([2], jnp.int32),
+                jnp.asarray(shard.page_indices, jnp.int32),
+                jnp.asarray([0, 2], jnp.int32),
+                jnp.asarray([1, 1, 1], jnp.int32),
+                decode_query_size=2,
+                attention_scope=3,
+                cp_group_size=2,
+                cp_rank=jnp.asarray([0], jnp.int32),
+                kv_lens_global=jnp.asarray([2], jnp.int32),
+            )
+
+
+@unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
+class TestBatchedRpaDcpMixedPrefillAndDecode(_CloseAssertions):
+    """Mixed batches with both decode (q=1) and chunked prefill (q>1) sequences.
+
+    Decode sequences fuse the new token into their stripe in Phase 2 (STRIPED)
+    and skip Phase 1 (NEW_TOKENS_ONLY) via rpa_cases=(RpaCase.MIXED,). Prefill
+    sequences compute causal attention on new tokens in Phase 1, attend their
+    prefix stripe in Phase 2 (with kv_new_lens=0 and no KV write), and merge
+    Phase 1 and Phase 2 by LSE.
+    """
+
+    # (prefix, chunk) per sequence.
+    # Decode cases (q=1):
+    #   (51, 1): prefix < local_page
+    #   (181, 1): mid-page
+    #   (257, 1): super-page boundary (crosses rank 0 to rank 1)
+    #   (1025, 1): large prefix
+    # Chunked prefill (q > 1):
+    #   (200, 63): partial Q tile and partial KV pages
+    #   (512, 128): exact 1 Q tile
+    # Pure prefill (q = kv, prefix = 0):
+    #   (0, 127): q < bq_sz
+    SEQS = (
+        (51, 1),
+        (181, 1),
+        (257, 1),
+        (1025, 1),
+        (200, 63),
+        (512, 128),
+        (0, 127),
+    )
+    MAX_NUM_TOKENS = 352
+
+    def _data(self, geo: Geometry):
+        rng = np.random.default_rng(777 + geo.cp)
+        kv_shape = (geo.num_kv_heads, HEAD_DIM)
+        prefix_k = [_random(rng, (p, *kv_shape)) for p, _ in self.SEQS]
+        prefix_v = [_random(rng, (p, *kv_shape)) for p, _ in self.SEQS]
+        chunk_k = [_random(rng, (c, *kv_shape)) for _, c in self.SEQS]
+        chunk_v = [_random(rng, (c, *kv_shape)) for _, c in self.SEQS]
+        queries = _random(rng, (self.MAX_NUM_TOKENS, geo.num_q_heads, HEAD_DIM))
+        return prefix_k, prefix_v, chunk_k, chunk_v, queries
+
+    def _run_shards(self, geo: Geometry, window):
+        import jax.numpy as jnp
+        from sglang_tpu.attention.pallas.batched_rpa import configs
+
+        prefix_k, prefix_v, chunk_k, chunk_v, queries = self._data(geo)
+        num_seqs = len(self.SEQS)
+        total_q = sum(c for _, c in self.SEQS)
+        cu_q_lens = np.concatenate([[0], np.cumsum([c for _, c in self.SEQS])])
+
+        # Pack all chunk tokens into contiguous new_k, new_v
+        new_k = np.zeros((self.MAX_NUM_TOKENS, geo.num_kv_heads, HEAD_DIM), np.float32)
+        new_v = np.zeros_like(new_k)
+        for s, (_, c) in enumerate(self.SEQS):
+            start = cu_q_lens[s]
+            new_k[start : start + c] = chunk_k[s]
+            new_v[start : start + c] = chunk_v[s]
+
+        decode_count = sum(1 for _, c in self.SEQS if c == 1)
+        distribution = [decode_count, decode_count, num_seqs]
+
+        pages = _pages_per_seq([p + int(c == 1) for p, c in self.SEQS], geo.cp)
+
+        # Run Phase 1 (NEW_TOKENS_ONLY): only MIXED runs, skipping DECODE
+        chunk_shard = _paged_shard(
+            [np.zeros((0, geo.num_kv_heads, HEAD_DIM), np.float32)] * num_seqs,
+            [np.zeros((0, geo.num_kv_heads, HEAD_DIM), np.float32)] * num_seqs,
+            1,
+            np.random.default_rng(42),
+            geo.num_kv_heads,
+        )
+        chunk_shard = chunk_shard._replace(
+            page_indices=np.zeros_like(chunk_shard.page_indices),
+            kv_lens=[c for _, c in self.SEQS],
+        )
+        phase1_out, _, phase1_lse = _run_kernel(
+            queries,
+            new_k,
+            new_v,
+            chunk_shard,
+            cu_q_lens,
+            distribution,
+            sliding_window=window,
+            skip_kv_write=True,
+            return_lse=True,
+            attention_scope=2,  # NEW_TOKENS_ONLY
+            rpa_cases=(configs.RpaCase.MIXED,),
+        )
+
+        # Run Phase 2 (STRIPED): on each rank
+        phase2_partials = []
+        caches_after = []
+        shards = []
+        owns_list = []
+        for rank in range(geo.cp):
+            prefix_lens = [p for p, _ in self.SEQS]
+            positions = [_local_positions(p, rank, geo.cp) for p in prefix_lens]
+            shard = _paged_shard(
+                [k[pos] for k, pos in zip(prefix_k, positions)],
+                [v[pos] for v, pos in zip(prefix_v, positions)],
+                pages,
+                np.random.default_rng(200 + rank),
+                geo.num_kv_heads,
+            )
+            kv_lens_global = [p + c for p, c in self.SEQS]
+            owns = [
+                (c == 1) and (((p + 1 - 1) // PAGE_SIZE) % geo.cp == rank)
+                for p, c in self.SEQS
+            ]
+            kv_lens = [
+                _local_len(p, rank, geo.cp) + int(own)
+                for (p, c), own in zip(self.SEQS, owns)
+            ]
+            shard = shard._replace(kv_lens=kv_lens)
+            out_p, cache_after, lse_p = _run_kernel(
+                queries,
+                new_k,
+                new_v,
+                shard,
+                cu_q_lens,
+                distribution,
+                sliding_window=window,
+                skip_kv_write=False,
+                return_lse=True,
+                cp_group_size=geo.cp,
+                cp_rank=jnp.asarray([rank], jnp.int32),
+                kv_lens_global=jnp.asarray(kv_lens_global, jnp.int32),
+                attention_scope=3,  # STRIPED
+            )
+            phase2_partials.append((out_p[:total_q], lse_p[:total_q]))
+            caches_after.append(cache_after)
+            shards.append(shard)
+            owns_list.append(owns)
+
+        # Merge Phase 2 across ranks
+        out_phase2, lse_phase2 = _merge_by_lse(phase2_partials)
+
+        # Merge Phase 2 and Phase 1
+        merged_out, merged_lse = _merge_by_lse([
+            (out_phase2, lse_phase2),
+            (phase1_out[:total_q], phase1_lse[:total_q]),
+        ])
+        return merged_out, merged_lse, caches_after, shards, owns_list, pages
+
+    def _reference(self, geo: Geometry, window):
+        prefix_k, prefix_v, chunk_k, chunk_v, queries = self._data(geo)
+        outs, lses = [], []
+        cu_q_lens = np.concatenate([[0], np.cumsum([c for _, c in self.SEQS])])
+        for seq, (p, c) in enumerate(self.SEQS):
+            start = cu_q_lens[seq]
+            q_seq = queries[start : start + c]
+            full_k = np.concatenate([prefix_k[seq], chunk_k[seq]])
+            full_v = np.concatenate([prefix_v[seq], chunk_v[seq]])
+            positions = p + np.arange(c)
+            out, lse = _dense_attention(
+                q_seq,
+                full_k,
+                full_v,
+                positions,
+                window,
+                causal=True,
+            )
+            outs.append(out)
+            lses.append(lse)
+        return np.concatenate(outs), np.concatenate(lses)
+
+    def test_mixed_prefill_and_decode_matches_dense_reference(self):
+        for geo in (DCP2, DCP8):
+            for window in (None, SLIDING_WINDOW):
+                label = f"{geo.name} window={window}"
+                with self.subTest(label):
+                    out, lse, _, _, _, _ = self._run_shards(geo, window)
+                    ref_out, ref_lse = self._reference(geo, window)
+                    self.assert_out_close(out, ref_out, label)
+                    self.assert_lse_close(lse, ref_lse, label)
+
+    def test_owner_writes_decode_tokens_and_prefill_leaves_cache_untouched(self):
+        for geo in (DCP2, DCP8):
+            prefix_k, prefix_v, chunk_k, chunk_v, _ = self._data(geo)
+            _, _, caches_after, shards, owns_list, pages = self._run_shards(geo, None)
+            claimed = {}
+            for rank in range(geo.cp):
+                cache_after = caches_after[rank]
+                shard = shards[rank]
+                owns = owns_list[rank]
+                for seq, (p, c) in enumerate(self.SEQS):
+                    if c == 1:
+                        if owns[seq]:
+                            self.assertNotIn(seq, claimed)
+                            claimed[seq] = rank
+                            j = _local_len(p, rank, geo.cp)
+                            page = shard.page_indices[seq * pages + j // PAGE_SIZE]
+                            row = cache_after[page, j % PAGE_SIZE]
+                            row = row.reshape(-1, row.shape[-1])[: 2 * geo.num_kv_heads, :HEAD_DIM]
+                            row = row.reshape(geo.num_kv_heads, 2, HEAD_DIM)
+                            label = f"{geo.name} rank {rank} seq {seq}"
+                            self.assert_out_close(row[:, 0], chunk_k[seq][0], label + " k")
+                            self.assert_out_close(row[:, 1], chunk_v[seq][0], label + " v")
+            decode_seq_indices = [s for s, (_, c) in enumerate(self.SEQS) if c == 1]
+            self.assertEqual(sorted(claimed), decode_seq_indices)
+
+
+@unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
+class TestBatchedRpaDcpStripedChunkWrite(_CloseAssertions):
+    """The backend's extend path: no KV write outside the kernel.
+
+    The chunk pass (NEW_TOKENS_ONLY with cp_group_size, global kv_lens, this
+    rank's stripe page table) attends each multi-token row's chunk causally
+    and writes the chunk's owned pages into the stripe itself; a single-token
+    row is left to the STRIPED prefix pass, which attends and writes it. The
+    batch is laid out as SGLang's mixed batches are -- chunk rows first, the
+    decode rows last -- and read back to front (``tail_decode``), so the
+    trailing single-token rows take the decode tile. A single-token row inside
+    the chunk range (a one-token extend) goes the same way on the chunk tile.
+    """
+
+    # (prefix, chunk). Chunk starts mid-page on rank 0 (200), mid-page on
+    # rank 1 spanning three pages of alternating owners (300 + 600), without
+    # a prefix (0 + 127), page-aligned (512 + 128); a one-token extend (51 +
+    # 1) sits inside the chunk range; the two trailing rows are decode rows.
+    SEQS = (
+        (200, 63),
+        (51, 1),
+        (300, 600),
+        (0, 127),
+        (512, 128),
+        (257, 1),
+        (1025, 1),
+    )
+    NUM_CHUNK_ROWS = 5
+    MAX_NUM_TOKENS = 1024
+
+    def _data(self, geo: Geometry):
+        rng = np.random.default_rng(4242 + geo.cp)
+        kv_shape = (geo.num_kv_heads, HEAD_DIM)
+        prefix_k = [_random(rng, (p, *kv_shape)) for p, _ in self.SEQS]
+        prefix_v = [_random(rng, (p, *kv_shape)) for p, _ in self.SEQS]
+        chunk_k = [_random(rng, (c, *kv_shape)) for _, c in self.SEQS]
+        chunk_v = [_random(rng, (c, *kv_shape)) for _, c in self.SEQS]
+        queries = _random(rng, (self.MAX_NUM_TOKENS, geo.num_q_heads, HEAD_DIM))
+        return prefix_k, prefix_v, chunk_k, chunk_v, queries
+
+    def _new_kv(self, geo: Geometry, chunk_k, chunk_v):
+        cu_q_lens = np.concatenate([[0], np.cumsum([c for _, c in self.SEQS])])
+        new_k = np.zeros((self.MAX_NUM_TOKENS, geo.num_kv_heads, HEAD_DIM), np.float32)
+        new_v = np.zeros_like(new_k)
+        for s, (_, c) in enumerate(self.SEQS):
+            new_k[cu_q_lens[s] : cu_q_lens[s] + c] = chunk_k[s]
+            new_v[cu_q_lens[s] : cu_q_lens[s] + c] = chunk_v[s]
+        return cu_q_lens, new_k, new_v
+
+    def _shard(self, geo: Geometry, rank: int, pages, prefix_k, prefix_v,
+               chunk_k, chunk_v, written):
+        """This rank's stripe holding every prefix and, per ``written[s]``,
+        sequence s's chunk too. Same rng per rank, so the stale filler and the
+        page table are identical across the before/after shards."""
+        keys, values = [], []
+        for s, (p, c) in enumerate(self.SEQS):
+            length = p + c if written[s] else p
+            positions = _local_positions(length, rank, geo.cp)
+            full_k = np.concatenate([prefix_k[s], chunk_k[s]])
+            full_v = np.concatenate([prefix_v[s], chunk_v[s]])
+            keys.append(full_k[positions])
+            values.append(full_v[positions])
+        return _paged_shard(
+            keys, values, pages, np.random.default_rng(900 + rank), geo.num_kv_heads
+        )
+
+    def _run(self, geo: Geometry, window):
+        import jax.numpy as jnp
+        from sglang_tpu.attention.pallas.batched_rpa import configs
+
+        prefix_k, prefix_v, chunk_k, chunk_v, queries = self._data(geo)
+        cu_q_lens, new_k, new_v = self._new_kv(geo, chunk_k, chunk_v)
+        num_seqs = len(self.SEQS)
+        total_q = int(cu_q_lens[-1])
+        totals = [p + c for p, c in self.SEQS]
+        pages = _pages_per_seq(totals, geo.cp)
+        distribution = [self.NUM_CHUNK_ROWS, self.NUM_CHUNK_ROWS, num_seqs]
+        multi = [c > 1 for _, c in self.SEQS]
+        every = [True] * num_seqs
+
+        chunk_results = []
+        prefix_partials = []
+        for rank in range(geo.cp):
+            cp_kwargs = dict(
+                return_lse=True,
+                cp_group_size=geo.cp,
+                cp_rank=jnp.asarray([rank], jnp.int32),
+                kv_lens_global=jnp.asarray(totals, jnp.int32),
+                tail_decode=True,
+            )
+            before = self._shard(
+                geo, rank, pages, prefix_k, prefix_v, chunk_k, chunk_v,
+                [False] * num_seqs,
+            )
+            # Chunk pass: global lengths, this rank's stripe table.
+            out_c, cache_c, lse_c = _run_kernel(
+                queries,
+                new_k,
+                new_v,
+                before._replace(kv_lens=totals),
+                cu_q_lens,
+                distribution,
+                sliding_window=window,
+                skip_kv_write=False,
+                attention_scope=2,  # NEW_TOKENS_ONLY
+                rpa_cases=(configs.RpaCase.MIXED,),
+                **cp_kwargs,
+            )
+            after_chunk = self._shard(
+                geo, rank, pages, prefix_k, prefix_v, chunk_k, chunk_v, multi
+            )
+            np.testing.assert_array_equal(
+                cache_c,
+                np.asarray(after_chunk.cache.astype(jnp.float32)),
+                f"{geo.name} rank {rank}: cache after the chunk pass",
+            )
+            chunk_results.append((out_c[:total_q], lse_c[:total_q]))
+
+            # Prefix pass on the cache the chunk pass left: this rank's
+            # stripe of the prefix, plus a single-token row's token on its
+            # owner. Decode rows on the decode tile, chunk rows on the chunk
+            # tile.
+            owns = [
+                c == 1 and ((p // PAGE_SIZE) % geo.cp == rank) for p, c in self.SEQS
+            ]
+            striped_lens = [
+                _local_len(p, rank, geo.cp) + int(own)
+                for (p, _), own in zip(self.SEQS, owns)
+            ]
+            out_p, cache_p, lse_p = _run_kernel(
+                queries,
+                new_k,
+                new_v,
+                before._replace(
+                    cache=jnp.asarray(cache_c, jnp.bfloat16), kv_lens=striped_lens
+                ),
+                cu_q_lens,
+                distribution,
+                sliding_window=window,
+                skip_kv_write=False,
+                attention_scope=3,  # STRIPED
+                **cp_kwargs,
+            )
+            after_all = self._shard(
+                geo, rank, pages, prefix_k, prefix_v, chunk_k, chunk_v, every
+            )
+            np.testing.assert_array_equal(
+                cache_p,
+                np.asarray(after_all.cache.astype(jnp.float32)),
+                f"{geo.name} rank {rank}: cache after the prefix pass",
+            )
+            prefix_partials.append((out_p[:total_q], lse_p[:total_q]))
+        return chunk_results, prefix_partials, cu_q_lens
+
+    def _reference(self, geo: Geometry, window, *, chunk_only: bool):
+        prefix_k, prefix_v, chunk_k, chunk_v, queries = self._data(geo)
+        cu_q_lens, _, _ = self._new_kv(geo, chunk_k, chunk_v)
+        outs, lses = [], []
+        for s, (p, c) in enumerate(self.SEQS):
+            q_seq = queries[cu_q_lens[s] : cu_q_lens[s] + c]
+            if chunk_only:
+                if c == 1:
+                    # Left to the STRIPED pass: no output, LSE -inf.
+                    outs.append(np.zeros_like(q_seq))
+                    lses.append(np.full((1, geo.num_q_heads), -np.inf, np.float32))
+                    continue
+                keys, values = chunk_k[s], chunk_v[s]
+                key_positions = p + np.arange(c)
+            else:
+                keys = np.concatenate([prefix_k[s], chunk_k[s]])
+                values = np.concatenate([prefix_v[s], chunk_v[s]])
+                key_positions = None
+            out, lse = _dense_attention(
+                q_seq, keys, values, p + np.arange(c), window,
+                causal=True, key_positions=key_positions,
+            )
+            outs.append(out)
+            lses.append(lse)
+        return np.concatenate(outs), np.concatenate(lses)
+
+    def test_chunk_pass_attends_the_chunk_and_writes_the_owned_pages(self):
+        for geo in (DCP2, DCP8):
+            for window in (None, SLIDING_WINDOW):
+                label = f"{geo.name} window={window}"
+                with self.subTest(label):
+                    chunk_results, _, cu_q_lens = self._run(geo, window)
+                    ref_out, ref_lse = self._reference(geo, window, chunk_only=True)
+                    for rank, (out, lse) in enumerate(chunk_results):
+                        # Every rank attends the whole chunk; single-token
+                        # rows are unprocessed, their LSE -inf.
+                        self.assert_lse_close(lse, ref_lse, f"{label} rank {rank}")
+                        processed = np.isfinite(ref_lse[:, 0])
+                        self.assert_out_close(
+                            out[processed], ref_out[processed], f"{label} rank {rank}"
+                        )
+
+    def test_two_passes_merge_to_the_dense_reference(self):
+        for geo in (DCP2, DCP8):
+            for window in (None, SLIDING_WINDOW):
+                label = f"{geo.name} window={window}"
+                with self.subTest(label):
+                    chunk_results, prefix_partials, _ = self._run(geo, window)
+                    out_prefix, lse_prefix = _merge_by_lse(prefix_partials)
+                    out, lse = _merge_by_lse(
+                        [(out_prefix, lse_prefix), chunk_results[0]]
+                    )
+                    ref_out, ref_lse = self._reference(geo, window, chunk_only=False)
+                    self.assert_out_close(out, ref_out, label)
+                    self.assert_lse_close(lse, ref_lse, label)
 
 
 @unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
@@ -559,18 +1145,17 @@ class TestBatchedRpaDcpExtendPrefixPass(_CloseAssertions):
 class TestBatchedRpaDcpWindowStart(_CloseAssertions):
     """The schedule's global-window start on a rank > 0, with one-page k blocks.
 
-    The first local key j in the window of query q (j * cp + rank > q - window)
-    lands mid-block, exactly on a block boundary, or past the end of a short
-    shard. Each rank's partial output and LSE must equal dense attention over
+    The first local key j in the window of query q lands mid-block, exactly on
+    a block boundary, or past the end of a short stripe. Each rank's partial output and LSE must equal dense attention over
     that rank's own keys at their global positions.
     """
 
     # Decode global lengths per geometry and the checked ranks; their first
     # window keys fall exactly on a block boundary and inside a block.
-    DECODE = {DCP2: ((1152, 2600), (1,)), DCP8: ((2172, 2600), (3, 5))}
+    DECODE = {DCP2: ((896, 2600), (1,)), DCP8: ((2944, 1500), (3, 5))}
     # One extend: the queries of later q blocks are past the window of the
-    # whole 37-token prefix.
-    PREFIX, CHUNK = 37, 700
+    # whole 300-token prefix (rank 1 of DCP2 owns its positions 256..299).
+    PREFIX, CHUNK = 300, 700
 
     def _check_rank(self, geo, rank, partial, seq_k, seq_v, q, q_positions, label):
         positions = _local_positions(len(seq_k), rank, geo.cp)

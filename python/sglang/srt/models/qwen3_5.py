@@ -51,6 +51,7 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
 )
+from sglang.srt.layers.dcp.layout import dcp_q_head_sharding
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -1264,7 +1265,21 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             assert self.kv_tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // self.kv_tp_size)
         self.head_dim = config.head_dim or (self.hidden_size // self.num_heads)
-        self.q_size = self.num_heads * self.head_dim
+        # --dcp-replicate-q-proj: Q is projected like K/V, so this rank's
+        # projection yields its whole DCP group's query heads (rank-major);
+        # attention and o_proj still work on this rank's num_heads.
+        if is_nextn:
+            q_tp_rank, q_tp_size, self.q_heads_factor = (
+                self.attn_tp_rank,
+                self.attn_tp_size,
+                1,
+            )
+        else:
+            q_tp_rank, q_tp_size, self.q_heads_factor = dcp_q_head_sharding(
+                self.attn_tp_rank, self.attn_tp_size
+            )
+        self.num_q_heads_proj = self.num_heads * self.q_heads_factor
+        self.q_size = self.num_q_heads_proj * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
@@ -1292,8 +1307,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
-        # Q stays sharded across attention TP ranks; K/V are replicated within
-        # each DCP group.
+        # Q stays sharded across attention TP ranks (or like K/V under
+        # --dcp-replicate-q-proj); K/V are replicated within each DCP group.
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
@@ -1301,8 +1316,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            tp_rank=q_tp_rank,
+            tp_size=q_tp_size,
             kv_tp_rank=self.kv_tp_rank,
             kv_tp_size=self.kv_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
@@ -1328,6 +1343,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
             quant_config=quant_config,
         )
+        self.attn.dcp_q_heads_factor = self.q_heads_factor
 
         # Dense MLP for non-MoE variant
         if config.model_type == "qwen3_5_text":
@@ -1453,7 +1469,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.rotary_emb.cos_sin_cache,
             positions,
             self.q_norm.variance_epsilon,
-            self.num_heads,
+            self.num_q_heads_proj,
             self.num_kv_heads,
             self.head_dim,
             self.rotary_emb.rotary_dim,
@@ -1477,7 +1493,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
             )
             orig_shape = q_gate.shape[:-1]
-            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
+            q_gate = q_gate.view(*orig_shape, self.num_q_heads_proj, -1)
             q, gate = torch.chunk(q_gate, 2, dim=-1)
             q = q.reshape(*orig_shape, -1)
             # gate stays as 3D strided view; fused_sigmoid_mul handles it directly
@@ -1507,7 +1523,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 self.k_norm.weight.data,
                 self.q_norm.variance_epsilon,
                 self.head_dim,
-                self.num_heads,
+                self.num_q_heads_proj,
             )
             q = q_flat.view(seq_len, -1)
             k = k_flat.view(seq_len, -1)
@@ -1571,6 +1587,20 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
 
+    def _own_heads_gate(self, gate: torch.Tensor) -> torch.Tensor:
+        """This rank's heads of the output gate.
+
+        Under --dcp-replicate-q-proj the projection carries the whole DCP
+        group's heads; the gate multiplies the attention output, which holds
+        this rank's heads only (the ``attn_dcp_rank``-th block).
+        """
+        if self.q_heads_factor == 1:
+            return gate
+        num_tokens = gate.shape[0]
+        gate = gate.reshape(num_tokens, self.num_q_heads_proj, self.head_dim)
+        start = get_parallel().attn_dcp_rank * self.num_heads
+        return gate[:, start : start + self.num_heads]
+
     def self_attention(
         self,
         positions: torch.Tensor,
@@ -1587,6 +1617,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
+            gate = self._own_heads_gate(gate)
             if _is_npu:
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
                 attn_output = npu_fused_sigmoid_mul(attn_output, gate_val.contiguous())

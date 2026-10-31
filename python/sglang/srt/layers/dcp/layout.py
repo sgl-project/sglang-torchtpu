@@ -20,6 +20,32 @@ import torch
 from sglang.srt.runtime_context import get_parallel
 
 
+def dcp_q_head_sharding(attn_tp_rank: int, attn_tp_size: int) -> tuple[int, int, int]:
+    """How a GQA/MHA attention layer shards its query heads under DCP.
+
+    Returns ``(q_tp_rank, q_tp_size, q_heads_factor)`` for the Q part of the
+    layer's QKV projection. Normally Q stays sharded by attention TP:
+    ``(attn_tp_rank, attn_tp_size, 1)``. With ``--dcp-replicate-q-proj`` on a
+    platform whose DCP attention runs on the group's gathered query heads
+    (``current_platform.dcp_replicates_q_heads()``), Q is sharded like K/V
+    instead -- over ``attn_tp_size // dcp_size`` groups -- so each rank
+    projects ``dcp_size`` times its own heads: its whole DCP group's, in rank
+    order, since DCP groups are contiguous slices of the TP group. The
+    attention backend then skips the per-layer Q gather, and the layer takes
+    its own heads (the ``attn_dcp_rank``-th block of ``q_heads_factor``) for
+    anything applied after attention, e.g. an output gate.
+    """
+    parallel = get_parallel()
+    dcp_size = parallel.attn_dcp_size
+    if dcp_size <= 1 or not parallel.dcp_replicate_q_proj:
+        return attn_tp_rank, attn_tp_size, 1
+    from sglang.srt.platforms import current_platform
+
+    if not current_platform.dcp_replicates_q_heads():
+        return attn_tp_rank, attn_tp_size, 1
+    return attn_tp_rank // dcp_size, attn_tp_size // dcp_size, dcp_size
+
+
 def get_dcp_lens(
     lens: torch.Tensor,
     dcp_size: int,

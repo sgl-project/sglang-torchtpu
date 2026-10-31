@@ -33,8 +33,14 @@ def flash_attention_qk_softmax(
     bq_start: int,
     kv_len_left: list[jax.Array] | None = None,  # [B]
     global_q_k_gap: list[jax.Array] | None = None,  # [B]
+    kv_new_start_left: list[jax.Array] | None = None,  # [B]
 ):
-    """Flash attention kernel."""
+    """Flash attention kernel.
+
+    ``kv_new_start_left[b]`` (NEW_TOKENS_ONLY) is the block-relative index of
+    the sequence's first new key; keys before it are cached, unfetched and
+    masked out.
+    """
     b, k_heads, tq, h_size = q.shape
 
     if cfgs.serve.scale_q is not None:
@@ -81,8 +87,12 @@ def flash_attention_qk_softmax(
     q_iota //= cfgs.aligned_num_q_heads_per_kv_head
     q_kv_diff = q_iota - kv_iota
     if global_q_k_gap is not None:
-        # Local key j holds global position j * cp_group_size + cp_rank.
-        q_kv_diff_global = q_iota - cfgs.serve.cp_group_size * kv_iota
+        # Page-striped cache: local key j holds global position
+        # j + (j // page_size) * (cp_group_size - 1) * page_size + rank * page_size.
+        # The rank term is scalar and lives in global_q_k_gap; the local-index
+        # part is computed per batch element below from the block's first key.
+        lp = cfgs.serve.page_size_log2
+        stripe_gap = (cfgs.serve.cp_group_size - 1) << lp
 
     for b_idx in range(cfgs.block.batch_size):
         # NOTE: Goal is to compute q_len >= kv_len. But we want to utilize scalar
@@ -107,6 +117,8 @@ def flash_attention_qk_softmax(
         else:
             # Every cached key precedes every query; keys past kv_len are stale.
             mask_b = kv_iota < kv_len_left[b_idx]
+        if kv_new_start_left is not None:
+            mask_b = jnp.logical_and(mask_b, kv_iota >= kv_new_start_left[b_idx])
 
         if (sliding_window := cfgs.model.sliding_window) is not None:
             # NOTE: Goal is to compute q_len < sliding_window + kv_len. And similar
@@ -124,8 +136,11 @@ def flash_attention_qk_softmax(
             if global_q_k_gap is None:
                 mask_b = jnp.logical_and(mask_b, q_kv_diff < sliding_window + offset)
             else:
-                # Same in global positions, with gap = q_global - k_global at
-                # q_iota = kv_iota = 0 of the block.
+                # Same in global positions: gap = q_global - (k_id + rank * page)
+                # at q_iota = kv_iota = 0 of the block; the stripe term adds
+                # (cp - 1) pages per local page of the key's local index.
+                local_key = kv_iota + processed_kv_len[b_idx]
+                q_kv_diff_global = q_kv_diff - (local_key >> lp) * stripe_gap
                 window_offset = sliding_window - (bq_start + global_q_k_gap[b_idx])
                 mask_b = jnp.logical_and(mask_b, q_kv_diff_global < window_offset)
 

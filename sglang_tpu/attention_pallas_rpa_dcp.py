@@ -2,14 +2,17 @@
 """Decode-context-parallel (DCP) pieces of the TPU Pallas batched RPA backend.
 
 Under DCP the KV of a sequence is split across the ranks of one DCP group by
-absolute position: rank ``r`` stores position ``p`` iff ``p % dcp == r``. Each
-rank therefore attends only its own shard, and the partial results are merged
-across the group by log-sum-exp.
+page: rank ``r`` stores page ``p = pos // page_size`` iff ``p % dcp == r``
+(tokens inside a page stay dense and contiguous). Each rank therefore attends
+only its own page stripe, and the partial results are merged across the group
+by log-sum-exp.
 
 This module holds the parts of that scheme that are independent of the backend
-object: the torch custom op for the CP-aware kernel, the fused-pool row layout
-and the owner-masked write that replaces the kernel's own KV write, and the
-pure-torch merges (cross-rank sink fold, two-pass extend combine).
+object: the torch custom op for the CP-aware kernel (including the fused
+``STRIPED`` decode scope and the stripe-writing ``NEW_TOKENS_ONLY`` chunk
+scope), the query-head all-gather and the pure-torch merges (cross-rank
+log-sum-exp merge, sink fold, two-pass extend combine). The kernel writes the
+step's K/V itself in every mode; nothing stages K/V outside it.
 
 ``attention_pallas_rpa_base`` drives them; the non-DCP path never calls in here.
 """
@@ -17,24 +20,26 @@ pure-torch merges (cross-rank sink fold, two-pass extend combine).
 # NOTE: do *not* add ``from __future__ import annotations`` here (see
 # attention_pallas_rpa_base for why torch_tpu's jax_op needs real annotations).
 
-from typing import NamedTuple
+import os
 
 import torch
 
 from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
+# How ``gather_heads`` collects the group's query heads. The default is the
+# zero-padded all-reduce; ``SGLANG_TPU_DCP_GATHER=all_gather`` selects
+# ``all_gather_into_tensor``, which returns a wrong buffer inside the compiled
+# decode forward at some batch sizes (see ``gather_heads``).
+_GATHER_VIA_ALL_GATHER = os.environ.get("SGLANG_TPU_DCP_GATHER", "") == "all_gather"
+
 __all__ = [
     "DCP_OP_NAME",
-    "DcpWriteSpans",
-    "broadcast_own_kv_heads",
     "build_dcp_kernel_op",
-    "build_owner_write_spans",
-    "fused_kv_rows",
     "gather_heads",
     "merge_across_ranks",
     "merge_lse",
+    "own_heads",
     "sink_fold",
-    "write_owned_kv",
 ]
 
 # torch custom-op name of the CP-aware kernel. Distinct from the plain batched op
@@ -49,11 +54,12 @@ _OP_CACHE: dict = {}
 
 
 def _import_dcp_kernel():
+    from sglang_tpu.attention.pallas.batched_rpa import configs
     from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
         ragged_paged_attention,
     )
 
-    return ragged_paged_attention
+    return ragged_paged_attention, configs
 
 
 def build_dcp_kernel_op(spec):
@@ -89,7 +95,7 @@ def build_dcp_kernel_op(spec):
     import jax
     from torch_tpu._internal import pallas as _torch_pallas
 
-    _jax_rpa = _import_dcp_kernel()
+    _jax_rpa, configs = _import_dcp_kernel()
 
     def _wrapped(
         queries: jax.Array,
@@ -111,10 +117,20 @@ def build_dcp_kernel_op(spec):
         cache_only: bool = False,
         skip_kv_write: bool = False,
         cp_group_size: int = 0,
+        attention_scope: int = 0,
+        rpa_cases: int = 0,
+        tail_decode: bool = False,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         # The kernel takes ``cp_group_size=None`` for the non-CP form and then
         # rejects the two CP operands, so drop them together.
         cp_size = cp_group_size if cp_group_size else None
+        if cache_only and attention_scope == 0:
+            attention_scope = 1
+        active_cases = None
+        if rpa_cases == 1:
+            active_cases = (configs.RpaCase.DECODE,)
+        elif rpa_cases == 2:
+            active_cases = (configs.RpaCase.MIXED,)
         return _jax_rpa(
             queries,
             keys,
@@ -139,6 +155,9 @@ def build_dcp_kernel_op(spec):
             cp_group_size=cp_size,
             cp_rank=cp_rank if cp_size else None,
             kv_lens_global=kv_lens_global if cp_size else None,
+            attention_scope=attention_scope,
+            rpa_cases=active_cases,
+            tail_decode=tail_decode,
         )
 
     jax_kernel = _torch_pallas.custom_jax_kernel(
@@ -146,8 +165,9 @@ def build_dcp_kernel_op(spec):
         name=f"jax_{DCP_OP_NAME}",
         # Static (non-traced) args by _wrapped position: 11=sm_scale,
         # 12=sliding_window, 13=soft_cap, 14=k_scale, 15=v_scale,
-        # 16=cache_only, 17=skip_kv_write, 18=cp_group_size.
-        static_argnums=(11, 12, 13, 14, 15, 16, 17, 18),
+        # 16=cache_only, 17=skip_kv_write, 18=cp_group_size, 19=attention_scope,
+        # 20=rpa_cases, 21=tail_decode.
+        static_argnums=(11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21),
         donate_argnums=(3,),
         input_output_aliases={3: 1},
         warn_deprecated=False,
@@ -178,6 +198,9 @@ def build_dcp_kernel_op(spec):
         cache_only: bool = False,
         skip_kv_write: bool = False,
         cp_group_size: int = 0,
+        attention_scope: int = 0,
+        rpa_cases: int = 0,
+        tail_decode: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         with tpu_info_for_cpu_export():
             output, _updated_kv, lse = jax_kernel(
@@ -200,6 +223,9 @@ def build_dcp_kernel_op(spec):
                 cache_only,
                 skip_kv_write,
                 cp_group_size,
+                attention_scope,
+                rpa_cases,
+                tail_decode,
             )
         return output, lse
 
@@ -220,149 +246,6 @@ def build_dcp_kernel_op(spec):
 
     _OP_CACHE[spec.op_name] = custom_op
     return custom_op
-
-
-def fused_kv_rows(
-    k: torch.Tensor, v: torch.Tensor, kv_cache: torch.Tensor
-) -> torch.Tensor:
-    """Rows ``[T, packed, packing, padded_head_dim]`` of ``k``/``v`` (each
-    ``[T, heads, head_dim]``) in the fused pool layout of ``kv_cache``.
-
-    K and V are interleaved per head, the head axis is padded to the pool's
-    packing and the head dim to 128 -- the layout the kernel's own
-    ``prepare_inputs`` produces for its KV write.
-    """
-    num_tokens, heads, head_dim = k.shape
-    packed, packing, padded_head_dim = kv_cache.shape[2:]
-    rows = torch.stack([k, v], dim=2).reshape(num_tokens, 2 * heads, head_dim)
-    pad_dim = padded_head_dim - head_dim
-    pad_heads = packed * packing - 2 * heads
-    if pad_dim or pad_heads:
-        rows = torch.nn.functional.pad(rows, (0, pad_dim, 0, pad_heads))
-    return rows.reshape(num_tokens, packed, packing, padded_head_dim)
-
-
-def broadcast_own_kv_heads(
-    k: torch.Tensor, v: torch.Tensor, dcp_size: int, rank_index: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """``k``/``v`` with every local KV head replaced by one this rank's q heads own.
-
-    K/V are sharded over ``attn_tp // dcp`` groups, so every rank of a DCP group
-    holds the same ``Hkv`` heads while its own query heads cover only the
-    ``Hkv // dcp`` wide slice that starts at its rank. A kernel call that
-    passes this rank's query heads alone still has them grouped over all ``Hkv``
-    heads, and the head count has to stay ``Hkv`` because the kernel stages new
-    and cached K/V into one buffer shaped by the cache -- so the slice is
-    repeated back up to ``Hkv`` heads, ``dcp_size`` copies of each.
-
-    ``rank_index`` is the rank as an ``i64[1]`` device tensor, so every rank
-    traces the same program (see ``_all_reduce_gather``).
-
-    Kernel calls that pass the group's gathered query heads take ``k``/``v``
-    unchanged.
-    """
-    num_tokens, heads, head_dim = k.shape
-    if heads % dcp_size and dcp_size % heads:
-        raise ValueError(
-            f"{heads} local KV heads do not divide evenly over a DCP group of "
-            f"{dcp_size}: the query heads of one rank would straddle two KV "
-            "heads, which the ragged-paged-attention head grouping cannot "
-            "express."
-        )
-    own = max(1, heads // dcp_size)
-    if own == heads:
-        return k, v
-    reps = heads // own
-    start = torch.div(rank_index * heads, dcp_size, rounding_mode="floor")
-    index = start + torch.arange(own, device=k.device, dtype=torch.int64)
-
-    def _own(x: torch.Tensor) -> torch.Tensor:
-        return (
-            x.index_select(1, index)[:, :, None, :]
-            .expand(num_tokens, own, reps, head_dim)
-            .reshape(num_tokens, heads, head_dim)
-        )
-
-    return _own(k), _own(v)
-
-
-class DcpWriteSpans(NamedTuple):
-    """Host-built targets of one step's owner-masked KV write.
-
-    ``index`` (i64[num_tokens]) gathers this rank's owned rows to the front in
-    token order; the spans (i32[max_spans] each) then name, per run of
-    consecutive physical slots, the first slot (``dst``), the first compacted
-    row (``src``) and the row count (``lens``, 0 for padding spans).
-    """
-
-    index: torch.Tensor
-    dst: torch.Tensor
-    src: torch.Tensor
-    lens: torch.Tensor
-
-    def to_device(self, device) -> "DcpWriteSpans":
-        return DcpWriteSpans(*(t.to(device, non_blocking=True) for t in self))
-
-
-def max_write_spans(num_tokens: int, num_seqs: int, page_size: int) -> int:
-    """Static span-table length for a token bucket: every request opens a span
-    and every page it touches may open another."""
-    return 2 * num_seqs + num_tokens // page_size + 1
-
-
-def build_owner_write_spans(
-    positions: torch.Tensor,
-    out_cache_loc: torch.Tensor,
-    dcp_size: int,
-    rank: int,
-    page_size: int,
-    num_tokens: int,
-    num_seqs: int,
-) -> DcpWriteSpans:
-    """Compaction index and DMA spans that write this rank's rows of a step.
-
-    A token at position ``p`` with widened logical slot ``loc`` belongs to
-    rank ``p % dcp_size`` and lives in physical slot ``loc // dcp_size``.
-    Consecutive owned tokens of one request share a page in consecutive
-    physical slots, so a span ends only where the physical slot jumps.
-    """
-    loc = out_cache_loc.to(torch.int64)
-    owned = torch.nonzero(positions.to(torch.int64) % dcp_size == rank).flatten()
-    phys = loc[owned] // dcp_size
-    index = torch.zeros(num_tokens, dtype=torch.int64)
-    index[: owned.numel()] = owned
-    max_spans = max_write_spans(num_tokens, num_seqs, page_size)
-    dst = torch.zeros(max_spans, dtype=torch.int32)
-    src = torch.zeros(max_spans, dtype=torch.int32)
-    lens = torch.zeros(max_spans, dtype=torch.int32)
-    if owned.numel():
-        breaks = torch.nonzero(phys[1:] != phys[:-1] + 1).flatten() + 1
-        starts = torch.cat([torch.zeros(1, dtype=torch.int64), breaks])
-        ends = torch.cat([breaks, torch.tensor([owned.numel()], dtype=torch.int64)])
-        if starts.numel() > max_spans:
-            raise ValueError(
-                f"{starts.numel()} write spans exceed the {max_spans}-span table "
-                f"of a {num_tokens}-token, {num_seqs}-sequence bucket."
-            )
-        n = starts.numel()
-        dst[:n] = phys[starts].to(torch.int32)
-        src[:n] = starts.to(torch.int32)
-        lens[:n] = (ends - starts).to(torch.int32)
-    return DcpWriteSpans(index, dst, src, lens)
-
-
-def write_owned_kv(
-    write_op, kv_cache: torch.Tensor, rows: torch.Tensor, spans: DcpWriteSpans
-) -> None:
-    """Write this rank's rows of ``rows`` into ``kv_cache`` in place.
-
-    ``rows`` is every token's row in the pool layout; ``spans`` compacts the
-    owned ones and ``write_op`` (``kv_span_write``) DMAs each span into the
-    pool. A torch scatter into the pool inside the compiled forward costs
-    about a millisecond per layer.
-    """
-    rows = rows.index_select(0, spans.index).contiguous()
-    write_op(spans.dst, spans.src, spans.lens, rows, kv_cache)
 
 
 def sink_fold(
@@ -421,9 +304,9 @@ def _all_reduce_gather(
 
     Implemented as an in-place all-reduce over a zero-padded copy: every rank
     contributes its own block and zeros elsewhere, so the sum is exact.
-    Workaround: inside a compiled graph the torch_tpu all-gather op returns its
-    freshly allocated output uninitialised (torch_tpu 0.1.1.dev20260914); the
-    all-gather can replace this once it fills its output there.
+    Used instead of the torch_tpu all-gather, which inside a compiled graph
+    returns a wrong (uninitialised or stale) output for some shapes; see
+    ``gather_heads``.
 
     ``rank_mask`` is ``arange(world_size) == rank`` as a device tensor: the rank
     enters the graph as data, not as structure, so every rank compiles the same
@@ -442,10 +325,62 @@ def _all_reduce_gather(
 
 
 def gather_heads(
-    x: torch.Tensor, group, world_size: int, rank_mask: torch.Tensor
+    x: torch.Tensor,
+    group,
+    world_size: int,
+    rank_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """``[T, H, D]`` of every rank as ``[T, H * world_size, D]``, rank-major."""
+    """``[T, H, D]`` of every rank as ``[T, H * world_size, D]``, rank-major.
+
+    Gathered with the zero-padded all-reduce (``_all_reduce_gather``), as on
+    main. ``all_gather_into_tensor`` into a fresh buffer is not used: inside
+    the compiled decode forward on torch_tpu 0.2.0 / libtpu 0.0.50 it hands
+    the kernel wrong gathered queries at the bs=16 bucket (gpt-oss-120b,
+    dcp 2: gsm8k 98% -> ~5% as soon as a decode batch has more than 8 rows,
+    with one live request as well as with many; swapping only this gather for
+    the all-reduce restores 98.5% at 64-way concurrency). The same op compiled
+    on its own, over the same 2-rank groups and shapes, returns the right
+    data, so the fault lies in its interaction with the rest of the graph
+    (the mutated ``new_empty`` output next to the donated Pallas op) and is
+    not isolated yet. The all-gather form is kept behind
+    ``SGLANG_TPU_DCP_GATHER=all_gather`` for experiments.
+    """
+    if world_size == 1:
+        return x
+    if _GATHER_VIA_ALL_GATHER and hasattr(group, "all_gather_into_tensor"):
+        num_tokens, heads, head_dim = x.shape
+        gathered = x.new_empty((world_size * num_tokens * heads, head_dim))
+        group.all_gather_into_tensor(gathered, x.contiguous().view(-1, head_dim))
+        return (
+            gathered.view(world_size, num_tokens, heads, head_dim)
+            .permute(1, 0, 2, 3)
+            .reshape(num_tokens, world_size * heads, head_dim)
+            .contiguous()
+        )
     return _all_reduce_gather(x, group, world_size, rank_mask, dim=1)
+
+
+def own_heads(
+    x: torch.Tensor, world_size: int, rank_index: torch.Tensor
+) -> torch.Tensor:
+    """This rank's head block of a rank-major gathered-head tensor.
+
+    ``x`` is ``[T, H * world_size, ...]`` as produced by :func:`gather_heads`
+    (or by the kernel run on such queries); the result is ``[T, H, ...]``.
+    ``rank_index`` is the rank as an ``i64[1]`` device tensor so the slice is
+    data, not program structure (see ``_all_reduce_gather``).
+    """
+    if world_size == 1:
+        return x
+    num_tokens, heads_all = x.shape[:2]
+    heads = heads_all // world_size
+    trailing = x.shape[2:]
+    return (
+        x.view(num_tokens, world_size, heads, *trailing)
+        .index_select(1, rank_index)
+        .reshape(num_tokens, heads, *trailing)
+        .contiguous()
+    )
 
 
 def merge_across_ranks(

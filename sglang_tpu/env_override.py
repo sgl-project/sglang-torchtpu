@@ -79,6 +79,11 @@ _DECODE_CP_SPARSE_CORE_OVERRIDES = (
     # also kept the SparseCore gather offload off.
     "--xla_tpu_offload_gather_to_sparsecore=false",
     "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false",
+    # The DCP decode program (per-layer query all-gather, STRIPED attention
+    # and cross-rank merge) hits the memory-space-assignment deadlock described
+    # at _VMEM_PREFETCH_OVERRIDES on its first execute (gpt-oss-120b, DCP2,
+    # libtpu 0.0.50) regardless of the KV pool size; serialize the prefetches.
+    "--xla_gf_vmem_max_outstanding_prefetches=1",
 )
 
 # Smallest KV pool (in tokens) observed safe with the default prefetch depth

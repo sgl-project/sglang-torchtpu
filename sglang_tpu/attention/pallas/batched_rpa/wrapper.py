@@ -539,7 +539,11 @@ def calculate_block_sizes(
         "cache_only",
         "skip_kv_write",
         "return_lse",
+        "decode_query_size",
         "cp_group_size",
+        "attention_scope",
+        "rpa_cases",
+        "tail_decode",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
@@ -573,9 +577,13 @@ def ragged_paged_attention(
     cache_only: bool = False,
     skip_kv_write: bool = False,
     return_lse: bool = False,
+    decode_query_size: int = 1,
     cp_group_size: int | None = None,
     cp_rank: jax.Array | None = None,
     kv_lens_global: jax.Array | None = None,
+    attention_scope: configs.AttentionScope | int = configs.AttentionScope.FULL,
+    rpa_cases: tuple[configs.RpaCase, ...] | configs.RpaCase | None = None,
+    tail_decode: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -628,13 +636,23 @@ def ragged_paged_attention(
             natural log, float32, with exp(sink) in the sum when attention_sink
             is given; -inf for a row that attended no key and has no sink.
         cp_group_size: Size of a decode-context-parallel group whose ranks each
-            hold the positions p with p % cp_group_size == cp_rank, local key j
-            being global position j * cp_group_size + cp_rank. The sliding
-            window then runs in global positions. Requires cache_only.
+            hold the pages p with p % cp_group_size == cp_rank, local page j
+            being global page j * cp_group_size + cp_rank. The sliding window
+            then runs in global positions. Requires a non-FULL attention_scope.
         cp_rank: [1] int32. This rank's index in the group, traced so that one
             program serves every rank.
         kv_lens_global: [max_num_seqs] int32. Global kv length of each sequence;
             its queries sit at global positions kv_lens_global[s] - q_len onward.
+        attention_scope: Which keys the call attends; see
+            ``configs.AttentionScope``. NEW_TOKENS_ONLY with cp_group_size
+            writes each multi-token sequence's new tokens into the owner
+            rank's stripe slots (``kv_lens`` and ``page_indices`` being the
+            global lengths and this rank's stripe table).
+        rpa_cases: Which of the DECODE / MIXED launches to run (both when
+            None); a case whose ``distribution`` range is empty can be skipped.
+        tail_decode: Read ``distribution`` back to front: the MIXED sequences
+            are ``[0, distribution[0])`` and the DECODE ones
+            ``[distribution[1], distribution[2])``.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -685,6 +703,17 @@ def ragged_paged_attention(
         mask_value=mask_value,
         has_attention_sink=attention_sink is not None,
     )
+    if isinstance(attention_scope, int):
+        _scope_map = {
+            0: configs.AttentionScope.FULL,
+            1: configs.AttentionScope.CACHE_ONLY,
+            2: configs.AttentionScope.NEW_TOKENS_ONLY,
+            3: configs.AttentionScope.STRIPED,
+        }
+        attention_scope = _scope_map.get(attention_scope, configs.AttentionScope.FULL)
+    if cache_only:
+        attention_scope = configs.AttentionScope.CACHE_ONLY
+
     serve_cfgs = configs.ServingConfigs(
         num_seqs=max_num_seqs,
         num_page_indices=num_page_indices,
@@ -697,10 +726,13 @@ def ragged_paged_attention(
         scale_k=k_scale,
         scale_v=v_scale,
         kv_layout=kv_layout,
+        decode_query_size=decode_query_size,
         cache_only=cache_only,
         skip_kv_write=skip_kv_write,
         return_lse=return_lse,
         cp_group_size=cp_group_size,
+        attention_scope=attention_scope,
+        tail_decode=tail_decode,
     )
 
     q_hbm, new_kv_hbm = prepare_inputs(
@@ -792,12 +824,22 @@ def ragged_paged_attention(
             kv_lens_global=kv_lens_global,
         )
 
-    o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
-        configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm
-    )
-    o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
-        configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
-    )
+    if rpa_cases is None:
+        active_cases = (configs.RpaCase.DECODE, configs.RpaCase.MIXED)
+    elif isinstance(rpa_cases, configs.RpaCase):
+        active_cases = (rpa_cases,)
+    else:
+        active_cases = tuple(rpa_cases)
+
+    o_hbm_alias_q_hbm = q_hbm
+    if configs.RpaCase.DECODE in active_cases:
+        o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
+            configs.RpaCase.DECODE, o_hbm_alias_q_hbm, kv_cache, lse_hbm
+        )
+    if configs.RpaCase.MIXED in active_cases:
+        o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
+            configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
+        )
 
     # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
     o_hbm = prepare_outputs(o_hbm_alias_q_hbm)

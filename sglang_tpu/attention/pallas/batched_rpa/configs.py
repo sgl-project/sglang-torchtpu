@@ -52,6 +52,49 @@ class ModelConfigs:
         return self.num_q_heads // self.num_kv_heads
 
 
+class AttentionScope(enum.StrEnum):
+    """Which KV positions to attend to.
+
+    FULL:            attend all positions (default).
+    CACHE_ONLY:      attend only cached tokens, skip new tokens.
+    NEW_TOKENS_ONLY: attend only new tokens, skip cached tokens. The KV index
+                     space is the sequence's global positions (``kv_lens`` is
+                     the full length, the last ``q_len`` of it new), the cached
+                     pages are neither fetched nor attended, and the new
+                     tokens are written back as in FULL. With
+                     ``cp_group_size`` the cache is page-striped, so the
+                     write of each new token goes to its owner rank's stripe
+                     slot (``page // cp`` on rank ``page % cp``) and only the
+                     owner issues it; a single-token row is left unprocessed
+                     (output untouched, LSE -inf), its token being the
+                     STRIPED launch's to attend and write.
+    STRIPED:         decode under decode context parallelism in one launch:
+                     attend this rank's page stripe of the cache plus the
+                     sequence's new token when this rank owns its page. The
+                     caller passes kv_new_lens / update_kv_cache as 1
+                     on the owner and 0 elsewhere; the new token is stitched
+                     and written at the end of the stripe, which is exactly
+                     its slot because the owner's stripe ends on that page.
+                     Decode-only (one query per sequence); the mask attends
+                     every key of the stripe, so no causal offset is needed.
+    """
+
+    FULL = enum.auto()
+    CACHE_ONLY = enum.auto()
+    NEW_TOKENS_ONLY = enum.auto()
+    STRIPED = enum.auto()
+
+    @property
+    def walks_cache_stripe(self) -> bool:
+        """Whether the KV index space of this call is one rank's page stripe."""
+        return self in (AttentionScope.CACHE_ONLY, AttentionScope.STRIPED)
+
+    @property
+    def skips_cached_keys(self) -> bool:
+        """Whether cached keys are left unfetched and masked out."""
+        return self == AttentionScope.NEW_TOKENS_ONLY
+
+
 class KVLayout(enum.StrEnum):
     """Represents the different layouts for KV cache.
 
@@ -80,11 +123,24 @@ class ServingConfigs:
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE
     smem_fraction_limit_for_schedule_generation: float = 0.33
     max_schedule_size_multiplier: int = 16
+    decode_query_size: int = 1
     # Context-parallel modes; see `wrapper.ragged_paged_attention`.
     cache_only: bool = False
     skip_kv_write: bool = False
     return_lse: bool = False
     cp_group_size: int | None = None
+    attention_scope: AttentionScope = AttentionScope.FULL
+    # ``distribution`` read back to front: MIXED sequences first,
+    # ``[0, distribution[0])``, PREFILL next and DECODE last,
+    # ``[distribution[1], distribution[2])``. For batches that append their
+    # decode rows after the prefill rows (SGLang's mixed batches).
+    tail_decode: bool = False
+
+    def __post_init__(self):
+        if self.cache_only and self.attention_scope == AttentionScope.FULL:
+            object.__setattr__(self, "attention_scope", AttentionScope.CACHE_ONLY)
+        elif self.attention_scope == AttentionScope.CACHE_ONLY and not self.cache_only:
+            object.__setattr__(self, "cache_only", True)
 
     @property
     def pages_per_seq(self) -> int:
@@ -128,9 +184,17 @@ class RpaCase(enum.StrEnum):
         }[self]
 
     def get_range(
-        self, distribution: jax.Array
+        self, distribution: jax.Array, tail_decode: bool = False
     ) -> tuple[jax.typing.ArrayLike, jax.typing.ArrayLike]:
         assert distribution.shape == (3,)
+        if tail_decode:
+            match self:
+                case RpaCase.MIXED:
+                    return 0, distribution[0]
+                case RpaCase.PREFILL:
+                    return distribution[0], distribution[1]
+                case RpaCase.DECODE:
+                    return distribution[1], distribution[2]
         match self:
             case RpaCase.DECODE:
                 return 0, distribution[0]
@@ -212,6 +276,24 @@ class RpaConfigs:
         num_lanes = pltpu.get_tpu_info().num_lanes
         max_steps_ub = max(1, max_steps_ub // num_lanes) * num_lanes
         return int(max_steps_ub)
+
+    def local_kv_cache_len(self, global_kv_cache_len, rank):
+        """This call's cache length in its own KV index space. CP only.
+
+        The cache is page-striped across the CP group, so a cache-phase call walks
+        only one rank's stripe.
+        """
+        if (
+            self.serve.cp_group_size is None
+            or not self.serve.attention_scope.walks_cache_stripe
+        ):
+            return global_kv_cache_len
+        return utils.cp_local_cache_len(
+            global_kv_cache_len,
+            self.serve.cp_group_size,
+            rank,
+            self.serve.page_size,
+        )
 
     @property
     def bkv_p(self) -> int:
@@ -488,6 +570,13 @@ class RpaConfigs:
             # SEQ_ALONG_LANE fetches whole pages, so the stale tail of a shard's
             # last page would reach p * v unmasked.
             raise NotImplementedError("cache_only requires HEAD_ALONG_SUBLANE.")
+        if (
+            self.serve.attention_scope.skips_cached_keys
+            and self.serve.kv_layout != KVLayout.HEAD_ALONG_SUBLANE
+        ):
+            # SEQ_ALONG_LANE writes whole pages, so the unfetched cached head
+            # of a page the new tokens share would be written back stale.
+            raise NotImplementedError("NEW_TOKENS_ONLY requires HEAD_ALONG_SUBLANE.")
         num_lanes = pltpu.get_tpu_info().num_lanes
         if self.serve.return_lse and self.aligned_num_q_heads_per_kv_head > num_lanes:
             raise ValueError(
@@ -497,8 +586,11 @@ class RpaConfigs:
         if self.serve.cp_group_size is not None:
             if self.serve.cp_group_size < 1:
                 raise ValueError(f"Expected {self.serve.cp_group_size=} >= 1.")
-            if not self.serve.cache_only:
-                raise ValueError("cp_group_size requires cache_only.")
+            if self.serve.attention_scope == AttentionScope.FULL:
+                raise ValueError(
+                    "Context Parallel does not support AttentionScope.FULL"
+                    " where cache is sharded."
+                )
             if cp_rank is None or kv_lens_global is None:
                 raise ValueError("cp_group_size requires cp_rank and kv_lens_global.")
             if cp_rank.shape != (1,) or cp_rank.dtype != jnp.int32:
@@ -509,5 +601,15 @@ class RpaConfigs:
                 raise ValueError(
                     f"Expected int32 {kv_lens_global.shape=} to be {kv_lens.shape}."
                 )
+        elif self.serve.attention_scope == AttentionScope.STRIPED:
+            raise ValueError("AttentionScope.STRIPED requires cp_group_size.")
         elif cp_rank is not None or kv_lens_global is not None:
             raise ValueError("cp_rank and kv_lens_global require cp_group_size.")
+
+        if self.serve.attention_scope == AttentionScope.STRIPED:
+            if self.serve.decode_query_size != 1:
+                raise ValueError(
+                    "AttentionScope.STRIPED requires decode_query_size == 1, got"
+                    f" {self.serve.decode_query_size=}; use the CACHE_ONLY +"
+                    " NEW_TOKENS_ONLY pair for multi-token decode."
+                )
