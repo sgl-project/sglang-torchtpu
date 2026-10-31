@@ -643,7 +643,10 @@ _SCRATCH_VMEM_BUDGET = 48 * 2**20
 _SAL_VMEM_HEADROOM = 2 * 2**20
 # Pipelined attention, chunks per loop iteration by fp8 SAL (measured at 500k context)
 _PIPE_STREAMS = {False: 4, True: 8}
-_DEPTH_RING_PREFERENCE = ((3, K.MAX_RING_SLOTS), (3, 4), (1, 4), (1, 2))
+# The ring must divide the 30 dense tiles of a <= 32-row layer: without the 6-slot cap a 32-row
+# step fell from 10 slots (49.9 MiB with folds, over budget) straight to 3, where the folds no
+# longer fit the issue depth. 6 slots with folds declare 40.9 MiB at 32 rows.
+_DEPTH_RING_PREFERENCE = ((3, K.MAX_RING_SLOTS), (3, 6), (3, 4), (1, 4), (1, 2))
 # Past 64 rows Mosaic's own temporaries grow ~0.1 MiB per row: 96 rows of 4 overflowed the
 # 64 MiB VMEM by 2.5 MiB at 41.5 MiB declared (39.5 + SAL headroom), so the declared budget
 # shrinks with rows.
