@@ -76,6 +76,9 @@ server_args.update(
         "max_running_requests": RUNNING,
         "mem_fraction_static": 0.92,
         "skip_server_warmup": True,
+        # AgentX traces reach 990k tokens: a long prompt's max_tokens is cut to
+        # what the context leaves, rather than the request (and the run) failing.
+        "allow_auto_truncate": True,
     }
 )
 if ROLE == "decode":
