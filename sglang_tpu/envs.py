@@ -148,6 +148,10 @@ class TpuEnvs:
     # step launches while the scheduler processes the last one's tokens (as
     # vLLM's async scheduling runs it).
     SGLANG_TPU_K3_PROGRAM_OPT_OVERLAP = EnvBool(False)
+    # Prefix cache on the K3_PROGRAM P/D decode (KV pages only,
+    # k3_programs/sglang_decode_cache.py): a session's next turn transfers only
+    # the pages past the decode's local prefix hit.
+    SGLANG_TPU_K3_PROGRAM_ENABLE_DECODE_PREFIX_CACHE = EnvBool(False)
 
     # Host padding is unconditional; this routes speculative batches to the
     # experimental spec worker, which keeps their metadata on the host as well.

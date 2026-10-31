@@ -329,6 +329,19 @@ class TestRegisteredAlgorithm(CustomTestCase):
         self.assertIsNone(spec.accept_lens_device)
         worker.register()  # idempotent
 
+    def test_decode_prefix_cache_settings(self):
+        with tpu_envs.SGLANG_TPU_K3_PROGRAM_ENABLE_DECODE_PREFIX_CACHE.override(True):
+            args = SimpleNamespace(
+                kv_cache_dtype="fp8_e4m3",
+                disaggregation_mode="decode",
+                disable_radix_cache=False,
+            )
+            self.algo.handle_server_args(args)
+        self.assertFalse(args.disable_radix_cache)
+        self.assertTrue(args.disaggregation_decode_enable_radix_cache)
+        self.assertEqual(args.mamba_radix_cache_strategy, "extra_buffer")
+        self.assertEqual(args.mamba_track_interval, 16384 << 16)  # never tracked
+
     def test_overlap_relays_through_the_future_map(self):
         published, stashed = [], []
         future_map = SimpleNamespace(

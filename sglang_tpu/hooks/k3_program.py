@@ -48,6 +48,17 @@ size_k3_program_pools
        asking the platform pool for its bytes per token).
   Remove when: that lands.
 
+k3_program_decode_tree
+  Why: a P/D decode's prefix cache needs no KDA states under K3_PROGRAM (the
+       transfer delivers each request's state into its slot; a state copied
+       from the tree would race it), but sglang's tree keeps Mamba state for
+       every hybrid model.
+  How: AROUND sglang.srt.mem_cache.registry.create_unified_radix_cache installs
+       k3_programs.sglang_decode_cache's stateless Mamba component on the
+       decode role with its prefix cache on.
+  Upstream PR or issue: <to be filed> (a model's choice of tree components).
+  Remove when: that choice exists.
+
 reject_unsupported_k3_requests
   Why: the programs return tokens only and keep each request's next input on
        the device, so a request asking for logprobs, hidden states or
@@ -143,6 +154,23 @@ def size_k3_program_pools(result: None, configurator, kvc, *args, **kwargs) -> N
     return result
 
 
+def k3_program_decode_tree(original, ctx: Any, *args, **kwargs):
+    """AROUND create_unified_radix_cache."""
+    from sglang.srt.runtime_context import get_disagg
+
+    disagg = get_disagg()
+    if (
+        k3_program_active()
+        and disagg.disaggregation_mode == "decode"
+        and disagg.disaggregation_decode_enable_radix_cache
+        and not ctx.disable_radix_cache
+    ):
+        from sglang_tpu.k3_programs.sglang_decode_cache import install
+
+        install(ctx.params)
+    return original(ctx, *args, **kwargs)
+
+
 def k3_program_unsupported(req: Any) -> str | None:
     """Why K3_PROGRAM cannot serve ``req``, or None."""
     if getattr(req, "return_logprob", False):
@@ -214,6 +242,11 @@ def hook_specs() -> list[tuple]:
             "sglang.srt.model_executor.pool_configurator.DefaultPoolConfigurator.__init__",
             size_k3_program_pools,
             HookType.AFTER,
+        ),
+        (
+            "sglang.srt.mem_cache.registry.create_unified_radix_cache",
+            k3_program_decode_tree,
+            HookType.AROUND,
         ),
         (
             "sglang.srt.managers.scheduler.Scheduler._add_request_to_queue",

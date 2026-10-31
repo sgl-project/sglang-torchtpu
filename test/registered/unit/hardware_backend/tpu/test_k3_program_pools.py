@@ -366,6 +366,37 @@ class TestSpecCheckHook(CustomTestCase):
         self.assertEqual(calls, [dspark])
 
 
+class TestDecodeTreeHook(CustomTestCase):
+    def test_stateless_component_on_the_decode_only(self):
+        from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+        from sglang_tpu.k3_programs.sglang_decode_cache import K3DecodeStateComponent
+
+        def build(mode, radix=True, active=True):
+            ctx = SimpleNamespace(
+                params=SimpleNamespace(component_registry_override=None),
+                disable_radix_cache=False,
+            )
+            disagg = SimpleNamespace(
+                disaggregation_mode=mode,
+                disaggregation_decode_enable_radix_cache=radix,
+            )
+            with (
+                mock.patch.object(hooks, "k3_program_active", return_value=active),
+                mock.patch(
+                    "sglang.srt.runtime_context.get_disagg", return_value=disagg
+                ),
+            ):
+                hooks.k3_program_decode_tree(lambda c: c, ctx)
+            return (ctx.params.component_registry_override or {}).get(
+                ComponentType.MAMBA
+            )
+
+        self.assertIs(build("decode"), K3DecodeStateComponent)
+        self.assertIsNone(build("prefill"))
+        self.assertIsNone(build("decode", radix=False))
+        self.assertIsNone(build("decode", active=False))
+
+
 class TestRequestAdmission(CustomTestCase):
     def test_unservable_requests_are_aborted(self):
         def req(**kw):

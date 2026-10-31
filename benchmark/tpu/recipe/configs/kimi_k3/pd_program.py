@@ -79,14 +79,30 @@ server_args.update(
     }
 )
 if ROLE == "decode":
+    # The decode keeps finished turns' KV pages, and a session's next turn
+    # transfers only the pages past that prefix (KV only: the transfer delivers
+    # each request's KDA state; sglang_decode_cache).
+    DECODE_PREFIX_CACHE = os.environ.get("K3_PROGRAM_DECODE_PREFIX_CACHE", "1") == "1"
+    CONFIG["runtime_env"]["SGLANG_TPU_K3_PROGRAM_ENABLE_DECODE_PREFIX_CACHE"] = (
+        "1" if DECODE_PREFIX_CACHE else "0"
+    )
     server_args.update(
-        disable_radix_cache=True,
+        disable_radix_cache=not DECODE_PREFIX_CACHE,
         # A KDA state slot and a full context of KV per running request, and
         # as many again for requests still arriving over the transfer: the
         # decode never retracts.
         max_mamba_cache_size=2 * RUNNING,
         max_total_tokens=2 * RUNNING * CONTEXT_LENGTH,
     )
+    if DECODE_PREFIX_CACHE:
+        server_args.update(
+            disaggregation_decode_enable_radix_cache=True,
+            # Validated before K3_PROGRAM's settings: the decode tracks nothing.
+            mamba_radix_cache_strategy="extra_buffer",
+            mamba_track_interval=PAGE_SIZE * (1 << 16),
+            # Each request's slot and its extra buffer's two.
+            max_mamba_cache_size=3 * 2 * RUNNING,
+        )
 else:
     # AgentX turns extend the session's earlier prompt: the prefill keeps them
     # in its radix cache, the KV pages and a KDA checkpoint per page-aligned

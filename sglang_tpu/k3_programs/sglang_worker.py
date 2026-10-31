@@ -150,6 +150,17 @@ class K3ProgramAlgo(CustomSpecAlgo):
             and tpu_envs.SGLANG_TPU_K3_PROGRAM_OPT_OVERLAP.get()
         )
         colocated = role in (None, "null")
+        if (
+            role == "decode"
+            and tpu_envs.SGLANG_TPU_K3_PROGRAM_ENABLE_DECODE_PREFIX_CACHE.get()
+            and not getattr(server_args, "disable_radix_cache", False)
+        ):
+            # KV pages only (sglang_decode_cache): the transfer delivers each
+            # request's KDA state, so the tree tracks none.
+            server_args.disaggregation_decode_enable_radix_cache = True
+            server_args.mamba_radix_cache_strategy = "extra_buffer"
+            server_args.mamba_track_interval = server_args.page_size * (1 << 16)
+            return
         if not (role == "prefill" or colocated) or getattr(
             server_args, "disable_radix_cache", False
         ):
