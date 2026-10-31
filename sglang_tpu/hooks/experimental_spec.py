@@ -1,7 +1,10 @@
-"""Narrow hook adapters for the experimental host-padded spec path.
+"""Narrow hook adapters for host padding and FutureMap-owned speculative rows.
 
 Why: filter/merge and H2D staging must be intercepted before device operations,
-not repaired afterward. All non-experimental calls delegate unchanged.
+not repaired afterward. A draft input can also opt into reindexing published
+FutureMap rows, avoiding device filter/merge programs for every pair of sizes.
+How: reuse the existing model-input and draft-input composition seams; inputs
+without either capability delegate unchanged.
 kimi_spec_defaults: core refuses speculation for Kimi hybrid (KDA) targets on
 TPU and otherwise pins GPU verify/draft backends; the experimental worker
 serves DSPARK on the TPU KDA checkpoint verify, so it skips both.
@@ -37,6 +40,7 @@ from sglang_tpu.experimental import (
     uses_host_batch,
 )
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
+from sglang_tpu.overlap_utils_tpu import ReindexableFutureRows
 
 logger = get_logger(__name__)
 
@@ -81,6 +85,16 @@ def _relays_rows(batch) -> bool:
     return uses_host_batch(batch) and batch.enable_overlap
 
 
+def _reindexes_future_rows(batch) -> bool:
+    return (
+        batch.enable_overlap
+        and isinstance(batch.spec_info, ReindexableFutureRows)
+        and batch.spec_info.can_reindex_future_rows()
+        and batch.input_ids is None
+        and not batch.is_extend_in_batch
+    )
+
+
 def _rebuild_relay_rows(batch):
     assert batch.enable_overlap and not batch.spec_algorithm.is_none()
     assert batch.input_ids is None
@@ -93,13 +107,16 @@ def _rebuild_relay_rows(batch):
 
 
 def filter_model_inputs(original, batch, keep_indices, keep_indices_device):
-    if not _relays_rows(batch):
+    if not (_relays_rows(batch) or _reindexes_future_rows(batch)):
         return original(batch, keep_indices, keep_indices_device)
     _rebuild_relay_rows(batch)
 
 
 def merge_model_inputs(original, batch, other):
     assert uses_host_batch(batch) == uses_host_batch(other)
+    if _reindexes_future_rows(batch) and _reindexes_future_rows(other):
+        _rebuild_relay_rows(batch)
+        return
     if not _relays_rows(batch):
         return original(batch, other)
     assert other.input_ids is None
@@ -118,6 +135,9 @@ def _draft_state_on_host(spec_info: SpecInput | None) -> bool:
 
 
 def filter_spec_input(original, batch, keep_indices, keep_indices_device):
+    if _reindexes_future_rows(batch):
+        batch.spec_info.reindex_future_rows(batch.req_pool_indices)
+        return
     if not _relays_rows(batch):
         if _draft_state_on_host(batch.spec_info):
             # A PP PD prefill keeps the relayed draft state on host; index it there.
@@ -134,6 +154,9 @@ def filter_spec_input(original, batch, keep_indices, keep_indices_device):
 
 
 def merge_spec_input(original, batch, other):
+    if _reindexes_future_rows(batch) and _reindexes_future_rows(other):
+        batch.spec_info.reindex_future_rows(batch.req_pool_indices)
+        return
     if not _relays_rows(batch):
         return original(batch, other)
     from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput

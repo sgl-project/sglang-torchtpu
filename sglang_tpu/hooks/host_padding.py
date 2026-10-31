@@ -8,14 +8,19 @@ Remove when: upstream provides backend factories for these staging decisions.
 
 from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_schedule
 from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
-from sglang_tpu.host_padding import _can_stage_forward_metadata, _enabled
+from sglang_tpu.host_padding import (
+    HostSamplingAlgorithm,
+    _can_stage_forward_metadata,
+    _enabled,
+)
 
 
 def sampling_from_batch(
     original, cls, batch, vocab_size, *, sampling_params_on_cpu=False
 ):
     sampling_params_on_cpu = sampling_params_on_cpu or (
-        _enabled(batch) and get_exec().kernel.sampling_backend == "tpu"
+        (_enabled(batch) or isinstance(batch.spec_algorithm, HostSamplingAlgorithm))
+        and get_exec().kernel.sampling_backend == "tpu"
     )
     return original(
         cls, batch, vocab_size, sampling_params_on_cpu=sampling_params_on_cpu
