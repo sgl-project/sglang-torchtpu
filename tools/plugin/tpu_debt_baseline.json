@@ -25,7 +25,7 @@
     "python/sglang/srt/layers/quantization/__init__.py": 2,
     "python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py": 3,
     "python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_fp8.py": 4,
-    "python/sglang/srt/layers/quantization/fp8.py": 14,
+    "python/sglang/srt/layers/quantization/fp8.py": 11,
     "python/sglang/srt/layers/quantization/fp8_utils.py": 3,
     "python/sglang/srt/layers/quantization/mxfp4.py": 3,
     "python/sglang/srt/layers/quantization/unquant.py": 4,
