@@ -43,6 +43,22 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
             src=self.presence_penalties,
         )
 
+    def _seed_history(self, rows: list, tokens: list):
+        # Set semantics (scatter_ of the row's value): a token present in the
+        # history holds the row's value, the same bits however often it occurs.
+        device = self.orchestrator.device
+        for row, toks in zip(rows, tokens):
+            mask = torch.zeros(self.orchestrator.vocab_size, dtype=torch.bool)
+            mask[torch.tensor(toks, dtype=torch.int64)] = True
+            index = torch.tensor([row], dtype=torch.int64, device=device)
+            current = self.cumulated_presence_penalties.index_select(0, index)
+            seeded = torch.where(
+                mask.to(device).unsqueeze(0),
+                self.presence_penalties.index_select(0, index),
+                current,
+            )
+            self.cumulated_presence_penalties.index_copy_(0, index, seeded)
+
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
         logits.sub_(self.cumulated_presence_penalties)
 

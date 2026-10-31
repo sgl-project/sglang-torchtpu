@@ -82,6 +82,15 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
     def _cumulate_output_tokens(self, output_ids: torch.Tensor):
         self.len_output_tokens += 1
 
+    def _seed_history(self, rows: list, tokens: list):
+        # One count per cumulated token.
+        device = self.orchestrator.device
+        for row, toks in zip(rows, tokens):
+            index = torch.tensor([row], dtype=torch.int64, device=device)
+            self.len_output_tokens.index_add_(
+                0, index, torch.tensor([[len(toks)]], dtype=torch.int32, device=device)
+            )
+
     def _apply(self, logits: torch.Tensor):
         # Boolean-mask indexing (logits[mask]) is data-dependent and forces a
         # device-to-host sync every decode step; torch.where is a plain
