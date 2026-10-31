@@ -99,6 +99,9 @@ def _round_down(x: int, multiple: int) -> int:
 # ``get_tpu_info().vmem_capacity_bytes`` to both the block-size model and
 # Mosaic's ``vmem_limit_bytes``; this default serves CPU-side callers.
 _V7X_VMEM_CAPACITY_BYTES = 64 * 2**20
+# Live-length (packed trailing padding) tiles; see _flash_attention.
+_LIVE_LENGTH_BLOCK_Q = 2048
+_LIVE_LENGTH_BLOCK_KV = 1024
 # Headroom for buffers the model does not count, chiefly the double-buffered
 # bf16 output block (3.1 MiB at block_q=6400).
 _VMEM_BUDGET_FRACTION = 0.93
@@ -208,11 +211,13 @@ def _flash_attention(q, k, v, scale, kv_len=None):
     scores. Inputs are not padded; Mosaic masks the ragged query edge block and
     the last KV block reads only real keys.
 
-    ``kv_len`` (int32 ``[1]``, batch-1 self-attention only) is the live length
-    of a sequence with trailing padding: keys at or past it are masked out, KV
-    blocks wholly past it are neither fetched nor computed, and query rows at
-    or past it output zeros. The length is read on device, so one kernel serves
-    every live length of a padded shape.
+    ``kv_len`` (int32 ``[1]``) is the live length of one packed sequence with
+    trailing padding, given as ``[S, H, D]`` self-attention arrays: keys at or
+    past it are masked out, KV blocks wholly past it are neither fetched nor
+    computed, and query rows at or past it output zeros. The length is read on
+    device, so one kernel serves every live length of a padded shape. The
+    blocks read the ``[S, H * D]`` rows in place, so the caller transposes
+    nothing.
     """
     import jax
     import jax.numpy as jnp
@@ -220,19 +225,30 @@ def _flash_attention(q, k, v, scale, kv_len=None):
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
 
-    num_q_heads, q_seq, head_dim = q.shape[1:]
-    num_kv_heads, kv_seq = k.shape[1], k.shape[2]
-    q_heads_per_kv_head = num_q_heads // num_kv_heads
     masked = kv_len is not None
-    if masked and (q.shape[0] != 1 or q_seq != kv_seq):
-        raise ValueError(
-            f"kv_len masking needs batch-1 self-attention, got q={q.shape} k={k.shape}"
-        )
+    if masked:
+        q_seq, num_q_heads, head_dim = q.shape
+        kv_seq, num_kv_heads = k.shape[0], k.shape[1]
+        if q_seq != kv_seq:
+            raise ValueError(
+                f"kv_len masking needs self-attention, got q={q.shape} k={k.shape}"
+            )
+    else:
+        num_q_heads, q_seq, head_dim = q.shape[1:]
+        num_kv_heads, kv_seq = k.shape[1], k.shape[2]
+    q_heads_per_kv_head = num_q_heads // num_kv_heads
     # One VMEM figure feeds both the block-size model and Mosaic's limit.
     vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
-    block_q, block_kv, block_kv_compute = _autotune_block_sizes(
-        q_seq, kv_seq, head_dim, vmem_capacity_bytes
-    )
+    if masked and q_seq >= _LIVE_LENGTH_BLOCK_Q and kv_seq >= _LIVE_LENGTH_BLOCK_KV:
+        # Compile-only tpu7x schedules at 32768x32768, 7 heads: within 2% of
+        # the autotuned 4096x2048 tiles, in one instruction overlay instead of
+        # ten (the masked kernel has four copies of the tile code).
+        block_q, block_kv = _LIVE_LENGTH_BLOCK_Q, _LIVE_LENGTH_BLOCK_KV
+        block_kv_compute = block_kv
+    else:
+        block_q, block_kv, block_kv_compute = _autotune_block_sizes(
+            q_seq, kv_seq, head_dim, vmem_capacity_bytes
+        )
     grid_width = pl.cdiv(kv_seq, block_kv)
     last_block_len = kv_seq - (grid_width - 1) * block_kv
     qk_scale = scale * LOG2_E
@@ -328,13 +344,17 @@ def _flash_attention(q, k, v, scale, kv_len=None):
             def boundary_block():
                 compute_block(block_len, True)
 
-        @pl.when(j != grid_width - 1)
-        def body():
+        if last_block_len == block_kv:
             dispatch(block_kv)
+        else:
 
-        @pl.when(j == grid_width - 1)
-        def last_body():
-            dispatch(last_block_len)
+            @pl.when(j != grid_width - 1)
+            def body():
+                dispatch(block_kv)
+
+            @pl.when(j == grid_width - 1)
+            def last_body():
+                dispatch(last_block_len)
 
         @pl.when(j == grid_width - 1)
         def end():
@@ -349,27 +369,33 @@ def _flash_attention(q, k, v, scale, kv_len=None):
             o_ref[...] = out.T.astype(o_ref.dtype)
 
     if masked:
-        # KV blocks wholly past the live length repeat the last live block's
-        # index, so the pipeline does not fetch them.
+        # [S, H * D] rows: head h is the h-th D-wide column block. KV blocks
+        # wholly past the live length repeat the last live block's index, so
+        # the pipeline does not fetch them.
         def kv_index(h, i, j, len_ref):
             last_live = jnp.maximum(len_ref[0] - 1, 0) // block_kv
-            return (h // q_heads_per_kv_head, jnp.minimum(j, last_live), 0)
+            return (jnp.minimum(j, last_live), h // q_heads_per_kv_head)
 
+        q_spec = pl.BlockSpec((block_q, head_dim), lambda h, i, j, _: (i, h))
+        kv_spec = pl.BlockSpec((block_kv, head_dim), kv_index)
+        out_spec = q_spec
+        out_shape = (q_seq, num_q_heads * head_dim)
     else:
 
         def kv_index(h, i, j):
             return (h // q_heads_per_kv_head, j, 0)
 
-    def attend(*args):
-        q_spec = pl.BlockSpec((None, block_q, head_dim), lambda h, i, j, *_: (h, i, 0))
+        q_spec = pl.BlockSpec((None, block_q, head_dim), lambda h, i, j: (h, i, 0))
         kv_spec = pl.BlockSpec((None, block_kv, head_dim), kv_index)
+        out_spec = q_spec
+        out_shape = (num_q_heads, q_seq, head_dim)
+
+    def attend(*args):
         grid_spec = pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1 if masked else 0,
             grid=(num_q_heads, pl.cdiv(q_seq, block_q), grid_width),
             in_specs=[q_spec, kv_spec, kv_spec],
-            out_specs=pl.BlockSpec(
-                (None, block_q, head_dim), lambda h, i, j, *_: (h, i, 0)
-            ),
+            out_specs=out_spec,
             scratch_shapes=[
                 pltpu.VMEM((NUM_SUBLANES, block_q), jnp.float32),
                 pltpu.VMEM((NUM_SUBLANES, block_q), jnp.float32),
@@ -385,12 +411,14 @@ def _flash_attention(q, k, v, scale, kv_len=None):
                 # Autotuned score tiles exceed Mosaic's 32 MiB default.
                 vmem_limit_bytes=vmem_capacity_bytes,
             ),
-            out_shape=jax.ShapeDtypeStruct((num_q_heads, q_seq, head_dim), q.dtype),
+            out_shape=jax.ShapeDtypeStruct(out_shape, q.dtype),
             name="diffusion_flash_attention",
         )(*args)
 
     if masked:
-        return attend(kv_len.astype(jnp.int32).reshape(1), q[0], k[0], v[0])[None]
+        rows = [t.reshape(t.shape[0], -1) for t in (q, k, v)]
+        out = attend(kv_len.astype(jnp.int32).reshape(1), *rows)
+        return out.reshape(q_seq, num_q_heads, head_dim)
     return jax.vmap(attend)(q, k, v)
 
 
@@ -512,7 +540,7 @@ def _register_ops() -> None:
             )
             flash_op.register_fake(flash_fake)
             flash_kv_len_op = cpu_export_jax_op(
-                "sglang_tpu_pallas::diffusion_flash_attention_kv_len", flash_kv_len
+                "sglang_tpu_pallas::diffusion_flash_attention_kv_len_thd", flash_kv_len
             )
             flash_kv_len_op.register_fake(flash_kv_len_fake)
         except Exception as exc:
@@ -727,18 +755,18 @@ class TpuSplashAttentionImpl(SDPAImpl):
             and cu_seqlens.shape == (3,)
             and query.shape[0] >= 512
         ):
+            # [S, H, D] views in the kernel's [B, H, S, D] terms, for the checks.
             q, k, v = (t.transpose(0, 1).unsqueeze(0) for t in (query, key, value))
             # The flash kernel covers 512 keys too, which SDPA's "short"
             # cutoff would send back to the per-segment path.
             if _sdpa_fallback_reason(q, k, v, False) in (None, "short"):
-                output = _FLASH_KV_LEN_OP(
-                    q.contiguous(),
-                    k.contiguous(),
-                    v.contiguous(),
+                return _FLASH_KV_LEN_OP(
+                    query.contiguous(),
+                    key.contiguous(),
+                    value.contiguous(),
                     cu_seqlens[1:2].to(torch.int32),
                     self.softmax_scale,
                 )
-                return output[0].transpose(0, 1)
         # Packed segment lengths vary per request. Each new length compiles
         # under either backend (dynamic=False); SDPA skips the Pallas trace,
         # export and Mosaic compile on top of that, so segments stay on SDPA.
