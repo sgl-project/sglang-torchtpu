@@ -247,7 +247,13 @@ def python_command(module: str) -> list[str]:
 
 
 def router_command(
-    prefill_urls, decode_urls, *, bootstrap_port=8998, host="0.0.0.0", port=30000
+    prefill_urls,
+    decode_urls,
+    *,
+    bootstrap_port=8998,
+    host="0.0.0.0",
+    port=30000,
+    extra_args=(),
 ):
     command = [
         *python_command("sglang_router.launch_router"),
@@ -259,6 +265,7 @@ def router_command(
     for url in decode_urls:
         command.extend(["--decode", url])
     command.extend(["--host", host, "--port", str(port)])
+    command.extend(extra_args)
     return command
 
 
@@ -544,6 +551,7 @@ def _plan_pd_group(config, group, topology, common_env, overrides, *, inherited,
             urls[prefill_count:],
             bootstrap_port=bootstrap,
             port=lb_port,
+            extra_args=group.get("router_args", ()),
         )
     return selected, hosts, router, urls
 
@@ -559,9 +567,19 @@ def plan_launch(config, inherited=None, runtime_envs=None):
     hosts = []
     if group is not None:
         group = _object(group, "group")
-        unknown = group.keys() - {"hosts", "prefill_engines", "decode_engines"}
+        unknown = group.keys() - {
+            "hosts",
+            "prefill_engines",
+            "decode_engines",
+            "router_args",
+        }
         if unknown:
             raise ValueError(f"Unknown group fields: {sorted(unknown)}")
+        router_args = group.get("router_args", [])
+        if not isinstance(router_args, list) or not all(
+            isinstance(arg, str) for arg in router_args
+        ):
+            raise ValueError("group.router_args must be a list of strings")
         if "runtime_envs" in config and "runtime_env" in config:
             raise ValueError("Use only one of runtime_envs and runtime_env")
         common_env = _envs(config.get("runtime_envs", config.get("runtime_env", {})))
