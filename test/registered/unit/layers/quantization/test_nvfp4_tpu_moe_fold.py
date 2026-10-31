@@ -430,6 +430,59 @@ class TestNvfp4Block512Contract(CustomTestCase):
         )
         self.assertEqual(tuple(result.hidden_states.shape), (2, 2, HIDDEN_SIZE))
 
+    def _apply_non_rs_at_ep2_rank1(self, native_ep_offset):
+        from sglang_tpu import fp4_moe
+        from sglang_tpu.envs import envs as tpu_envs
+
+        topk_weights = torch.tensor([[0.75, 0.25], [0.60, 0.40]], dtype=torch.bfloat16)
+        topk_ids = torch.tensor([[0, 2], [3, 1]], dtype=torch.int64)
+        dispatch_output = types.SimpleNamespace(
+            hidden_states=torch.randn(2, HIDDEN_SIZE, dtype=torch.bfloat16),
+            topk_output=(topk_weights, topk_ids, None),
+        )
+        layer = _make_block512_layer(include_unused_params=False)
+        layer.num_local_experts = 2
+        layer.moe_ep_size = 2
+        layer.moe_ep_rank = 1
+        fused_moe_call = mock.Mock(
+            return_value=torch.empty(2, HIDDEN_SIZE, dtype=torch.bfloat16)
+        )
+        with (
+            tpu_envs.SGLANG_TPU_FP4_MOE_NATIVE_EP_OFFSET.override(native_ep_offset),
+            mock.patch.object(fp4_moe, "fused_moe_call", fused_moe_call),
+        ):
+            fp4_moe.apply_tpu_nvfp4_moe(
+                layer=layer,
+                dispatch_output=dispatch_output,
+                activation="silu",
+                apply_router_weight_on_input=False,
+            )
+        return fused_moe_call.call_args.kwargs
+
+    def test_non_rs_native_ep_offset_passes_global_ids_and_window(self):
+        call = self._apply_non_rs_at_ep2_rank1(native_ep_offset=True)
+        self.assertEqual(call["global_num_experts"], 4)
+        self.assertEqual(call["expert_group_offset"], 2)
+        torch.testing.assert_close(
+            call["topk_ids"], torch.tensor([[0, 2], [3, 1]], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            call["topk_weights"],
+            torch.tensor([[0.75, 0.25], [0.60, 0.40]], dtype=torch.bfloat16),
+        )
+
+    def test_non_rs_default_masks_non_local_experts_at_ep2(self):
+        call = self._apply_non_rs_at_ep2_rank1(native_ep_offset=False)
+        self.assertEqual(call["global_num_experts"], 0)
+        self.assertEqual(call["expert_group_offset"], 0)
+        torch.testing.assert_close(
+            call["topk_ids"], torch.tensor([[-1, 0], [1, -1]], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            call["topk_weights"],
+            torch.tensor([[0.0, 0.25], [0.60, 0.0]], dtype=torch.bfloat16),
+        )
+
     def test_fused_backend_prepares_layer_eagerly(self):
         from sglang_tpu import fp4_moe
 
