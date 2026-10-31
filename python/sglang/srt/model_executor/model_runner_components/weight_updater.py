@@ -16,6 +16,7 @@ from sglang.srt.model_loader.loader import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
+from sglang.srt.platforms.interface import WeightUpdateReceiver
 from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -125,6 +126,13 @@ class WeightUpdater:
             f"rank_offset={rank_offset}, rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
         )
 
+        receiver = current_platform.create_weight_update_receiver(
+            backend, tp_rank=self.tp_rank
+        )
+        if receiver is not None:
+            self._model_update_group[group_name] = receiver
+            return True, f"Succeeded to bind a {backend} weight update receiver."
+
         try:
             na = NetworkAddress(master_address, master_port)
             self._model_update_group[group_name] = init_custom_process_group(
@@ -144,7 +152,10 @@ class WeightUpdater:
         try:
             if group_name in self._model_update_group:
                 pg = self._model_update_group.pop(group_name)
-                torch.distributed.destroy_process_group(pg)
+                if isinstance(pg, WeightUpdateReceiver):
+                    pg.close()
+                else:
+                    torch.distributed.destroy_process_group(pg)
                 return True, "Succeeded to destroy custom process group."
             else:
                 return False, "The group to be destroyed does not exist."
@@ -265,6 +276,10 @@ class WeightUpdater:
             f"Group {group_name} not in {list(self._model_update_group.keys())}. "
             "Please call `init_weights_update_group` first."
         )
+
+        group = self._model_update_group[group_name]
+        if isinstance(group, WeightUpdateReceiver):
+            return group.receive(names, dtypes, shapes, device=self.device)
 
         if load_format == "flattened_bucket":
             return self._receive_bucketed_weights_from_distributed(
