@@ -12,6 +12,7 @@ import unittest
 
 from sglang_tpu.disaggregation.raiden.host_pool import (
     node_worker_rank,
+    plan_dynamic_staging,
     ranks_per_node,
     slot_host_bytes,
     slots_within_budget,
@@ -136,6 +137,87 @@ class TestSlotsWithinBudget(unittest.TestCase):
         self.assertEqual(short, 64)
         self.assertLess(long, short)
         self.assertGreaterEqual(long, 1)
+
+
+class TestPlanDynamicStaging(unittest.TestCase):
+    def test_gpt_oss_1m_context_fits_rank_budget_with_full_swa_ceiling(self):
+        # gpt-oss-120b TP8 bf16 prefill (#1566): 18 full + 18 SWA layers,
+        # page=64, 1 full page = 589,824 B (9/16 MiB), 16,384 pages = 9 GiB,
+        # 1 SWA slot = 3 pages = 1,769,472 B (1.6875 MiB), rank budget = 16 GiB.
+        page = 9 * 65536
+        pool_pages, swa_slots = plan_dynamic_staging(
+            budget_bytes=16 * GB,
+            ceiling=64,
+            full_page_bytes=page,
+            max_blocks=16384,
+            chunk_blocks=128,
+            swa_slot_bytes=3 * page,
+        )
+        self.assertEqual(swa_slots, 64)
+        self.assertEqual(pool_pages, 28935)
+        self.assertLessEqual(pool_pages * page + swa_slots * 3 * page, 16 * GB)
+
+    def test_chunk_pairing_prevents_large_window_from_starving_full_pages(self):
+        # 5:1 SWA-heavy model with win=4096: full page = 1.25 MiB (chunk = 160 MiB),
+        # SWA slot = 406.25 MiB. Pairing (chunk + swa) = 566.25 MiB gives 28 sets
+        # so every SWA slot has a matching full-attention chunk in the pool.
+        mib = 1024**2
+        full_page = int(1.25 * mib)
+        swa_slot = int(406.25 * mib)
+        pool_pages, swa_slots = plan_dynamic_staging(
+            budget_bytes=16 * GB,
+            ceiling=64,
+            full_page_bytes=full_page,
+            max_blocks=128,
+            chunk_blocks=128,
+            swa_slot_bytes=swa_slot,
+        )
+        self.assertEqual(swa_slots, 28)
+        self.assertEqual(pool_pages, 4007)
+        self.assertGreaterEqual(pool_pages, swa_slots * 128)
+
+    def test_small_full_and_large_swa_reaches_full_ceiling_without_half_cap(self):
+        # 64 full slots cost 2 GiB total; 64 SWA slots cost 12 GiB total.
+        # Dynamic pairing uses 14 GiB of the 16 GiB budget and reaches 64 on both.
+        full_page = (2 * GB) // (64 * 128)
+        swa_slot = (12 * GB) // 64
+        pool_pages, swa_slots = plan_dynamic_staging(
+            budget_bytes=16 * GB,
+            ceiling=64,
+            full_page_bytes=full_page,
+            max_blocks=128,
+            chunk_blocks=128,
+            swa_slot_bytes=swa_slot,
+        )
+        self.assertEqual(swa_slots, 64)
+        self.assertEqual(pool_pages, 64 * 128)
+
+    def test_pure_full_model_allocates_fractional_slot_pages(self):
+        # 10 GiB per full slot in a 16 GiB rank budget: dynamic page sizing
+        # reserves 1,638 pages instead of truncating to 1 whole 1,024-page slot.
+        full_page = (10 * GB) // 1024
+        pool_pages, swa_slots = plan_dynamic_staging(
+            budget_bytes=16 * GB,
+            ceiling=64,
+            full_page_bytes=full_page,
+            max_blocks=1024,
+            chunk_blocks=128,
+            swa_slot_bytes=None,
+        )
+        self.assertIsNone(swa_slots)
+        self.assertEqual(pool_pages, int((16 * GB) // full_page))
+        self.assertGreater(pool_pages, 1024)
+
+    def test_rejects_when_single_combined_request_exceeds_budget(self):
+        with self.assertRaises(ValueError):
+            plan_dynamic_staging(
+                budget_bytes=16 * GB,
+                ceiling=64,
+                full_page_bytes=1024**2,
+                max_blocks=15 * 1024,
+                chunk_blocks=128,
+                swa_slot_bytes=2 * GB,
+            )
 
 
 if __name__ == "__main__":
