@@ -117,8 +117,8 @@ pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
 # ONE pip hub for the whole module graph. The lock behind it is a single uv
 # resolution of sglang's python/pyproject_tpu.toml AND @torch_tpu's
 # pyproject.toml together (see //requirements:regenerate_lock), so every
-# package torch_tpu references -- including the TPU stack (torch 2.11.0,
-# torchvision 0.26.0, libtpu 0.0.50, jax/jaxlib 0.10.2) pinned in
+# package torch_tpu references -- including the TPU stack (torch 2.13.0,
+# torchvision 0.28.0, libtpu 0.0.50, jax/jaxlib 0.10.2) pinned in
 # pyproject_tpu.toml -- resolves here, not in torch_tpu's own hub. The
 # override_repo below then substitutes this hub for torch_tpu's: the root
 # module gets the final say over the whole PyPI stack.
@@ -178,7 +178,7 @@ use_repo(
 # visible in this module's scope.
 override_repo(
     pip,
-    # torch_tpu's hub -> our single hub (jax 0.10.2, torch 2.11.0, ...).
+    # torch_tpu's hub -> our single hub (jax 0.10.2, torch 2.13.0, ...).
     torch_tpu_pypi = "sglang_pypi",
     # torch_tpu's 3.12 torch/libtpu spokes (consumed as @pypi_torch_312//...,
     # @pypi_libtpu_312//... by its shims, and by canonical path in
