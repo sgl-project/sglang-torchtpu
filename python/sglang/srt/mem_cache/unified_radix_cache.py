@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
 )
 from sglang.srt.mem_cache.common import RetractionBackup
+from sglang.srt.mem_cache.hicache_quiet_sync import QuietSyncGate
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -259,6 +260,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
+        # Set by init_hicache when SGLANG_HICACHE_QUIET_SYNC_EVERY applies.
+        self._quiet_sync: Optional[QuietSyncGate] = None
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -521,6 +524,19 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
+        quiet_every = envs.SGLANG_HICACHE_QUIET_SYNC_EVERY.get()
+        if (
+            quiet_every > 1
+            and self.cache_controller is not None
+            and self.pp_size <= 1
+            and self.linker is None
+            and self.host_memory_mode != "buffer_only"
+        ):
+            self._quiet_sync = QuietSyncGate(quiet_every)
+            logger.info(
+                "HiCache ack poll: every %d steps while no rank has a ready ack",
+                quiet_every,
+            )
 
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
         atexit.register(self.shutdown)
@@ -3482,12 +3498,30 @@ class UnifiedRadixCache(BasePrefixCache):
         # in get_next_batch_to_run, abort_request, and the PD prefill release.
         self.flush_pending_backups()
 
+        # Every rank skips the poll on the same steps (QuietSyncGate). A storage backend
+        # can be attached at runtime, so its queues are polled every step; so are
+        # in-flight load-backs, whose queue length agrees on every rank (see
+        # has_free_load_back_slot) and whose slots admission waits on.
+        gate = self._quiet_sync
+        if (
+            gate is not None
+            and not self.enable_storage
+            and not self.cache_controller.ack_load_queue
+            and gate.should_skip()
+        ):
+            return
         (
             write_finish_count,
             load_finish_count,
             storage_queue_sizes,
             extra_pool_names,
         ) = self._sync_hicache_ready_counts()
+        if gate is not None:
+            gate.record(
+                write_finish_count > 0
+                or load_finish_count > 0
+                or any(storage_queue_sizes)
+            )
         self.writing_check(finish_count=write_finish_count)
         self.loading_check(finish_count=load_finish_count)
 

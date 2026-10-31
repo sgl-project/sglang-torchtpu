@@ -835,6 +835,10 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # After a TP-wide HiCache ack poll in which no rank had a ready ack, poll only every
+    # this many scheduler steps until a poll finds one (then every step again); ranks stay
+    # in lockstep. 0 or 1 polls every step. Applies without PP, storage or linker only.
+    SGLANG_HICACHE_QUIET_SYNC_EVERY = EnvInt(0)
     # Hybrid-SWA host pools: fraction of --hicache-size given to the SWA pool. Unset splits
     # by device pool bytes; a cached prefix needs only its last window of SWA KV.
     SGLANG_HICACHE_SWA_HOST_FRACTION = EnvFloat(None)
