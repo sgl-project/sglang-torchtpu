@@ -251,6 +251,7 @@ class RaidenRendezvousTestCase(CustomTestCase):
 
         m._engine = _FakeRaidenEngine()
         m._full_engine_max_blocks = 256
+        m._slot_ceiling = lambda: 64
         m._pulling = StagingAdmission(256)
         m.raiden_endpoint = f"raiden://127.0.0.1:{port + 1000}"
         m.aux = aux
@@ -1090,6 +1091,229 @@ class TestRaidenBlockMajorEngine(RaidenRendezvousTestCase):
                 slot_host_bytes(bundle, max_blocks),
                 slot_host_bytes(per_layer, max_blocks),
             )
+
+
+class TestRaidenSwaSlotBudget(RaidenRendezvousTestCase):
+    def _build_manager(
+        self,
+        *,
+        budget_mib: float,
+        full_blocks: int = 64,
+        swa_blocks: int = 3,
+        full_layers: int = 1,
+        swa_layers: int = 3,
+        ceiling: int = 64,
+        dynamic_host_staging: bool = True,
+        state_layers: int = 0,
+        decode: bool = False,
+        chunked: bool = True,
+    ):
+        from sglang_tpu.disaggregation.raiden.host_pool import slot_host_bytes
+
+        # 1 rank, 1 host (local_ranks=1), page_size=64, element_size=2, 8 kv_heads, head_dim=128
+        # 1 block = 64 * 2 * 8 * 128 * 2 = 262,144 bytes = 0.25 MiB.
+        # With full_layers=1, full_blocks=64: full slot = 16 MiB.
+        # With swa_layers=3, swa_blocks=3: swa slot = 2.25 MiB.
+        factory = self._decode if decode else self._prefill
+        m = factory(attn_tp_rank=0, attn_tp_size=1, page_size=64)
+        built = []
+        testcase = self
+
+        class Engine:
+            def __init__(self, **kwargs):
+                testcase.assertEqual(
+                    os.environ.get("TPU_RAIDEN_DYNAMIC_HOST_STAGING"),
+                    "1" if dynamic_host_staging else "0",
+                )
+                built.append(kwargs)
+
+        m._engine = None
+        m._dynamic_host_staging = dynamic_host_staging
+        m.chunked_transfer = chunked
+        m._state_kv_caches = tuple(
+            torch.zeros(6, 64, 2, 8, 128, dtype=torch.bfloat16)
+            for _ in range(state_layers)
+        )
+        m._kv_caches = [
+            torch.zeros(1, 64, 2, 8, 128, dtype=torch.bfloat16)
+            for _ in range(full_layers)
+        ]
+        m._swa_kv_caches = [
+            torch.zeros(1, 64, 2, 8, 128, dtype=torch.bfloat16)
+            for _ in range(swa_layers)
+        ]
+        m._max_request_blocks = lambda: full_blocks
+        m._swa_max_request_blocks = lambda: swa_blocks
+        m._slot_ceiling = lambda: ceiling
+        m.server_args = SimpleNamespace(nnodes=1, context_length=1024)
+
+        with (
+            patch.dict(
+                os.environ, {"SGLANG_RAIDEN_HOST_POOL_GB": str(budget_mib / 1024)}
+            ),
+            patch.dict(sys.modules, _fake_tpu_sync(Engine)),
+        ):
+            m._build_engine()
+
+        total_engines = 1 + bool(swa_layers) + bool(state_layers)
+        group_budget = (budget_mib * 1024**2) * (1 + bool(swa_layers)) / total_engines
+        full_pages = built[0]["num_slots"] * built[0]["max_blocks"]
+        full_bytes = full_pages * slot_host_bytes(m._kv_caches, 1)
+        swa_bytes = (
+            built[1]["num_slots"] * slot_host_bytes(m._swa_kv_caches, swa_blocks)
+            if swa_layers
+            else 0
+        )
+        self.assertLessEqual(full_bytes + swa_bytes, group_budget)
+        return m, built
+
+    def test_fixed_slots_pair_full_attention_and_window_engines(self):
+        """With fixed slots, a full slot stages 16 MiB and a window slot 2.25 MiB:
+        128 MiB and 139.25 MiB afford 7 pairs; 143.75 MiB leaves the full-attention
+        engine one more slot for early prefill chunks."""
+        cases = [
+            (128, (7, 7)),
+            (139.25, (7, 7)),
+            (143.75, (8, 7)),
+        ]
+        for budget_mib, expected in cases:
+            with self.subTest(budget_mib=budget_mib):
+                _, built = self._build_manager(
+                    budget_mib=budget_mib, dynamic_host_staging=False
+                )
+                slots = (built[0]["num_slots"], built[1]["num_slots"])
+                self.assertEqual(slots, expected)
+
+    def test_dynamic_staging_sizes_full_pool_in_pages_on_prefill_and_decode(self):
+        """Under per-transfer staging, full-attention allocates a single page pool
+        (num_slots=1, max_blocks=pool_pages) while keeping per-request max_blocks."""
+        for decode in (False, True):
+            with self.subTest(decode=decode):
+                # 139.25 MiB, full_blocks=64 (16 MiB < 32 MiB chunk):
+                # chunk_blocks = min(64, 128) = 64 -> chunk_bytes = 16 MiB, swa = 2.25 MiB.
+                # swa_slots = min(64, (139.25 - 16)//2.25=54, 139.25//18.25=7) = 7.
+                # remaining = 139.25 - 15.75 = 123.5 MiB -> 494 pages (vs 7*64 = 448!).
+                m, built = self._build_manager(
+                    budget_mib=139.25,
+                    dynamic_host_staging=True,
+                    decode=decode,
+                )
+                self.assertEqual(built[0]["num_slots"], 1)
+                self.assertEqual(built[0]["max_blocks"], 494)
+                self.assertEqual(m._full_engine_max_blocks, 64)
+                self.assertEqual(m._pulling.capacity, 494)
+                self.assertEqual(built[1]["num_slots"], 7)
+                self.assertEqual(m._pulling.swa_capacity, 7 * 3)
+
+    def test_large_context_starts_and_scales_full_page_pool(self):
+        """A 9 GiB full slot exceeds half of a 16 GiB rank budget (#1566); both
+        modes start cleanly, and dynamic staging uses the remaining ~7 GiB as
+        extra full-attention pages alongside 64 SWA slots."""
+        # full_blocks=36864 -> 36864 * 0.25 MiB = 9216 MiB (9.00 GiB).
+        _, static_built = self._build_manager(
+            budget_mib=16384, full_blocks=36864, dynamic_host_staging=False
+        )
+        self.assertEqual(
+            (static_built[0]["num_slots"], static_built[1]["num_slots"]),
+            (1, 1),
+        )
+
+        m, built = self._build_manager(
+            budget_mib=16384, full_blocks=36864, dynamic_host_staging=True
+        )
+        # 64 SWA slots = 144 MiB; remaining = 16240 MiB -> 64,960 full pages!
+        self.assertEqual(built[0]["num_slots"], 1)
+        self.assertEqual(built[0]["max_blocks"], 64960)
+        self.assertEqual(m._full_engine_max_blocks, 36864)
+        self.assertEqual(built[1]["num_slots"], 64)
+        self.assertEqual(m._pulling.capacity, 64960)
+        self.assertEqual(m._pulling.swa_capacity, 64 * 3)
+        self.assertTrue(m._pulling.admit("r1", 32, swa_pages=3))
+        self.assertTrue(m._pulling.admit("r2", 32, swa_pages=3))
+
+    def test_state_engine_keeps_one_third_share_on_three_engine_rank(self):
+        """With full + window + state, state keeps 1/3 of rank budget while
+        full + window share the remaining 2/3."""
+        # 417.75 MiB across 3 engines: state gets 139.25 MiB (64 layers = 16 MiB/slot -> 8 slots);
+        # full + window share 278.5 MiB -> swa = 278.5 // 18.25 = 15 slots (33.75 MiB),
+        # full = (278.5 - 33.75) // 0.25 = 979 pages.
+        _, built = self._build_manager(
+            budget_mib=417.75, state_layers=64, dynamic_host_staging=True
+        )
+        self.assertEqual(built[0]["max_blocks"], 979)
+        self.assertEqual(built[1]["num_slots"], 15)
+        self.assertEqual(built[2]["num_slots"], 8)
+
+    def test_non_chunked_dynamic_pairs_with_whole_full_slot(self):
+        """When chunked_transfer is False, each SWA slot pairs with a full
+        max_blocks request instead of an 8K chunk."""
+        # full_blocks=256 (64 MiB), chunk=128 (32 MiB), swa=2.25 MiB, budget=274 MiB:
+        # chunked=True -> 274 // 34.25 = 8 SWA slots (1024 full pages);
+        # chunked=False -> 274 // 66.25 = 4 SWA slots (1060 full pages).
+        _, chunked_built = self._build_manager(
+            budget_mib=274, full_blocks=256, chunked=True
+        )
+        _, whole_built = self._build_manager(
+            budget_mib=274, full_blocks=256, chunked=False
+        )
+        self.assertEqual(
+            (chunked_built[0]["max_blocks"], chunked_built[1]["num_slots"]), (1024, 8)
+        )
+        self.assertEqual(
+            (whole_built[0]["max_blocks"], whole_built[1]["num_slots"]), (1060, 4)
+        )
+
+    def test_each_engine_logs_one_slot_budget_line(self):
+        for dynamic in (False, True):
+            with (
+                self.subTest(dynamic=dynamic),
+                self.assertLogs(
+                    "sglang_tpu.disaggregation.raiden.conn", "INFO"
+                ) as logs,
+            ):
+                self._build_manager(budget_mib=139.25, dynamic_host_staging=dynamic)
+            budget_lines = [line for line in logs.output if "slot budget" in line]
+            self.assertEqual(len(budget_lines), 2)
+
+    def test_start_engine_resyncs_native_dynamic_staging_env(self):
+        """If os.environ changes between __init__ and set_kv_caches (e.g. scoped
+        env overrides or a second manager), _start_engine re-syncs
+        TPU_RAIDEN_DYNAMIC_HOST_STAGING right before KVCacheManager construction."""
+        for dynamic, stale_env in ((True, None), (True, "0"), (False, "1")):
+            with self.subTest(dynamic=dynamic, stale_env=stale_env):
+                m = self._prefill(attn_tp_rank=0, attn_tp_size=1, page_size=64)
+                seen_env = []
+
+                class Engine:
+                    def __init__(self, **kwargs):
+                        seen_env.append(
+                            os.environ.get("TPU_RAIDEN_DYNAMIC_HOST_STAGING")
+                        )
+
+                m._engine = None
+                m._dynamic_host_staging = dynamic
+                m.chunked_transfer = True
+                m._kv_caches = [torch.zeros(1, 64, 2, 8, 128, dtype=torch.bfloat16)]
+                m._swa_kv_caches = [torch.zeros(1, 64, 2, 8, 128, dtype=torch.bfloat16)]
+                m._max_request_blocks = lambda: 64
+                m._swa_max_request_blocks = lambda: 3
+                m._slot_ceiling = lambda: 8
+                m.server_args = SimpleNamespace(nnodes=1, context_length=1024)
+
+                with (
+                    patch.dict(os.environ, {"SGLANG_RAIDEN_HOST_POOL_GB": "0.25"}),
+                    patch.dict(sys.modules, _fake_tpu_sync(Engine)),
+                ):
+                    if stale_env is None:
+                        os.environ.pop("TPU_RAIDEN_DYNAMIC_HOST_STAGING", None)
+                    else:
+                        os.environ["TPU_RAIDEN_DYNAMIC_HOST_STAGING"] = stale_env
+                    m._build_engine()
+                    after_env = os.environ.get("TPU_RAIDEN_DYNAMIC_HOST_STAGING")
+
+                expected = "1" if dynamic else "0"
+                self.assertEqual(seen_env, [expected, expected])
+                self.assertEqual(after_env, stale_env)
 
 
 class TestRaidenStateGroups(CustomTestCase):
