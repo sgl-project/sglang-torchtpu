@@ -2536,6 +2536,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         """The adaptive narrow-verify rule for this step, or None to verify the full block."""
         if (
             not self._adaptive_verify_rules
+            # Mixed-forward tails: the MIXED batch reserved block_size rows per tail.
+            or getattr(batch, "full_verify_block", False)
             or batch.has_grammar
             or batch.return_logprob
             or self._need_mamba_verify_commit
@@ -3331,6 +3333,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 if batch.seq_lens_cpu is not None
                 else None
             ),
+            full_verify_block=True,
         )
         tail_input = make_draft_input_v2(bonus_tokens=bonus_in, new_seq_lens=committed)
         if plan is not None:

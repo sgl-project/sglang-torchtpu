@@ -527,6 +527,20 @@ def test_adaptive_verify_select_uses_last_rule_reached():
     assert widths == [None, None, 4, 4, 4, 3, 3, 3]
 
 
+def test_mixed_verify_tails_always_verify_the_full_block():
+    # A MIXED batch reserves block_size rows per tail; its tail view must never narrow.
+    from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+    worker = SimpleNamespace(
+        _adaptive_verify_rules=parse_adaptive_verify("3:4:3.06", block_size=8),
+        _need_mamba_verify_commit=False,
+    )
+    select = DFlashWorkerV2._select_verify_rule
+    assert select(worker, batch=SimpleNamespace(full_verify_block=True), bs=8) is None
+    decode = SimpleNamespace(has_grammar=False, return_logprob=False)
+    assert select(worker, batch=decode, bs=8).width == 4
+
+
 def test_adaptive_verify_shapes_map_logical_batches_to_buckets():
     rules = parse_adaptive_verify("3:4:3.06", block_size=8)
     # bs 3 and 4 run in bucket 4; bucket 2 serves only full-width batches.
