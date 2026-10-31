@@ -57,6 +57,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW4A16Int4DynamicMoE,
     NPUCompressedTensorsW8A8Int8,
     NPUCompressedTensorsW8A8Int8DynamicMoE,
+    TpuCompressedTensorsW8A8Fp8MoE,
     TpuCompressedTensorsWNA16MoE,
     XPUCompressedTensorsWNA16,
 )
@@ -404,6 +405,10 @@ class CompressedTensorsConfig(QuantizationConfig):
         return []
 
     def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
+        # TPU has no CUDA compute capability; schemes gate TPU support in their own
+        # TPU branches (get_moe_scheme, apply_weights).
+        if _is_tpu:
+            return True
         if _is_xpu:
             if error:
                 raise RuntimeError(
@@ -916,6 +921,19 @@ class CompressedTensorsConfig(QuantizationConfig):
             logger.info_once("Using CompressedTensorsW4A4Nvfp4MoE")
             return CompressedTensorsW4A4Nvfp4MoE()
         elif self._is_fp8_w8a8(weight_quant, input_quant):
+            if _is_tpu:
+                if not (
+                    weight_quant.strategy == QuantizationStrategy.CHANNEL
+                    and input_quant.strategy == QuantizationStrategy.TOKEN
+                ):
+                    raise NotImplementedError(
+                        "TPU FP8 MoE supports only channelwise weights with "
+                        "dynamic per-token activations, got weight strategy "
+                        f"{weight_quant.strategy} and input strategy "
+                        f"{input_quant.strategy}."
+                    )
+                logger.info_once("Using TpuCompressedTensorsW8A8Fp8MoE")
+                return TpuCompressedTensorsW8A8Fp8MoE(weight_quant, input_quant)
             logger.info_once("Using CompressedTensorsW8A8Fp8MoE")
             return CompressedTensorsW8A8Fp8MoE(weight_quant, input_quant)
         elif self._is_dynamic_token_w8a8(weight_quant, input_quant):
