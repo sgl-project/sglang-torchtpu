@@ -359,6 +359,7 @@ def _decode_manager_stub(**overrides):
         is_recv_done=lambda room: False,
         last_announcement_age=lambda room: None,
         maybe_start_pull=lambda room: False,
+        take_parked_reshard_failure=lambda room, bound: None,
         request_status={ROOM: KVPoll.WaitingForInput},
         failure_records={},
         failure_lock=threading.Lock(),

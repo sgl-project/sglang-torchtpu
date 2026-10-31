@@ -1802,6 +1802,9 @@ class TestRaidenRoleStatePlacement(CustomTestCase):
                     if isinstance(value, dict):
                         if field.name == "announced_at":
                             value.update({f"{room}#0": 1.0, f"{other}#0": 1.0})
+                        elif field.name == "reshard_parked":
+                            # (parked_at, charges, publish_args)
+                            value.update({room: (1.0, (), ()), other: (1.0, (), ())})
                         else:
                             value.update({room: object(), other: object()})
                     elif isinstance(value, set):
@@ -2675,6 +2678,517 @@ class TestRaidenChunkedResharding(CustomTestCase):
         )
         self.assertEqual(mgr._decode.chunk_reads[room], ["41#0", "41"])
         self.assertNotIn(room, mgr._decode.reshard_chunk_registering)
+
+
+class _CountingAdmission(StagingAdmission):
+    """Records how often each held key is released."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.admitted = []
+        self.releases = collections.Counter()
+
+    def admit(self, key, pages, swa_pages=0, state_pages=0):
+        held = key in self
+        ok = super().admit(key, pages, swa_pages, state_pages)
+        if ok and not held:
+            self.admitted.append(key)
+        return ok
+
+    def release(self, key):
+        if key in self:
+            self.releases[key] += 1
+        super().release(key)
+
+
+class _StagingEngine:
+    """Raiden's receive side as far as host staging goes: a plan takes one
+    host block per distinct destination block when it registers, without
+    waiting, and gives them back when its upload settles."""
+
+    transfer_address = "10.0.0.2:31000"
+
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.used = 0
+        self.peak = 0
+        self.live = {}
+        self.refused = []
+        self.registered = []
+        self.lock = threading.Lock()
+
+    def register_active_plan(self, uuid, req, is_sender):
+        pages = len(
+            {
+                e.dst_block_id
+                for s in req.shard_push_schedules.values()
+                for e in s.entries
+            }
+        )
+        with self.lock:
+            if self.used + pages > self.capacity:
+                self.refused.append(req.req_id)
+                raise RuntimeError("cannot acquire host staging")
+            self.used += pages
+            self.peak = max(self.peak, self.used)
+            self.live[req.req_id] = pages
+            self.registered.append(req.req_id)
+
+    def unregister_active_plan(self, uuid):
+        pass
+
+    def poll_stats_with_details(self):
+        with self.lock:
+            done = list(self.live)
+            self.used -= sum(self.live.values())
+            self.live.clear()
+        return _polled([], done, [])
+
+
+class TestRaidenPushStagingAdmission(CustomTestCase):
+    """Push receive plans take host staging from the pool the pulls are
+    admitted against (#1661)."""
+
+    ROOM = 41
+    DECODE_BLOCKS = TestRaidenChunkedResharding.DECODE_BLOCKS
+    _geometry = staticmethod(TestRaidenChunkedResharding._geometry)
+    # The closing plan of ROOM without chunks stages its 40 decode pages; with
+    # chunk 0 (pages 24..32) acknowledged first, 8 and then 32.
+    WHOLE, CHUNK, REST = 40, 8, 32
+
+    def _decode(self, capacity=100, swa_capacity=None):
+        mgr = TestRaidenChunkedResharding._decode(self)
+        mgr._pulling = _CountingAdmission(capacity, swa_capacity)
+        mgr._pipeline = None
+        mgr._ensure_engine = lambda: mgr._engine
+        self.clock = [1000.0]
+        mgr._monotonic = lambda: self.clock[0]
+        mgr._decode.reshard_meta[self.ROOM]["requested_at"] = self.clock[0]
+        return mgr
+
+    def _add_room(self, mgr, room):
+        meta = dict(mgr._decode.reshard_meta[self.ROOM])
+        mgr._decode.reshard_meta[room] = meta
+        mgr._decode.reshard_sources[room] = {}
+        mgr._decode.reshard_swa_sources[room] = {}
+
+    def _chunk(self, mgr, room=None):
+        room = self.ROOM if room is None else room
+        with patch.dict(sys.modules, _pb2_modules()):
+            for rank in (0, 1):
+                mgr._on_reshard_chunk(
+                    _reshard_chunk_frames(room, 0, 24, 64, list(range(124, 132)), rank)
+                )
+
+    def _close(self, mgr, room=None, swa=None, patch_modules=True):
+        room = self.ROOM if room is None else room
+        with patch.dict(sys.modules, _pb2_modules() if patch_modules else {}):
+            for rank in (0, 1):
+                mgr._on_reshard_blocks(
+                    ReshardBlocks(
+                        room,
+                        list(range(100 + 200 * rank, 164 + 200 * rank)),
+                        rank,
+                        b"",
+                        list(swa or []),
+                    ).to_frames()
+                )
+
+    def _sent(self, mgr, tag):
+        return [
+            c.args[0]
+            for c in mgr._socket.send_multipart.call_args_list
+            if c.args[0][0] == tag
+        ]
+
+    def _poll(self, mgr, room=None):
+        with patch.dict(sys.modules, _pb2_modules()):
+            mgr.maybe_start_pull(self.ROOM if room is None else room)
+
+    def _assert_released_once(self, mgr):
+        push = [k for k in mgr._pulling.admitted if k.startswith("push:")]
+        for key in push:
+            self.assertEqual(mgr._pulling.releases[key], 1, key)
+        self.assertFalse([k for k in mgr._pulling.rooms() if k.startswith("push:")])
+        self.assertIsNone(mgr._pulling.waiting)
+        self.assertEqual(mgr._decode.reshard_parked, {})
+
+    def test_chunk_and_closing_plans_hold_staging_until_they_settle(self):
+        mgr = self._decode()
+        self._chunk(mgr)
+        self.assertEqual(mgr._pulling.rooms(), ["push:41#0"])
+        self.assertEqual(mgr._pulling.pages(), self.CHUNK)
+        self._close(mgr)
+        self.assertEqual(mgr._pulling.pages(), self.CHUNK + self.REST)
+        self.assertEqual(len(self._sent(mgr, MessageTag.RESHARD_READY)), 2)
+
+        mgr._engine.poll_stats_with_details = Mock(return_value=_polled([], ["41#0"]))
+        mgr._drain_engine()
+        self.assertEqual(mgr._pulling.rooms(), ["push:41"])
+        mgr._engine.poll_stats_with_details = Mock(return_value=_polled([], ["41"]))
+        mgr._drain_engine()
+        self.assertTrue(mgr.is_recv_done(self.ROOM))
+        mgr.clear_room(self.ROOM)
+        mgr._drain_engine()
+        self._assert_released_once(mgr)
+
+    def test_refused_chunk_rides_the_closing_plan(self):
+        mgr = self._decode(capacity=self.WHOLE)
+        self.assertTrue(mgr._pulling.admit("7", self.WHOLE - self.CHUNK + 1))
+        self._chunk(mgr)
+        mgr._engine.register_active_plan.assert_not_called()
+        self.assertEqual(self._sent(mgr, MessageTag.RESHARD_CHUNK_READY), [])
+        self.assertNotIn(self.ROOM, mgr._decode.reshard_covered)
+        # It will not ask again, so it does not hold the line.
+        self.assertIsNone(mgr._pulling.waiting)
+
+        mgr._pulling.release("7")
+        self._close(mgr)
+        uuid, req = mgr._engine.register_active_plan.call_args.args
+        self.assertEqual(req.req_id, "41")
+        self.assertEqual(_plan_blocks(req, 0)[1], self.DECODE_BLOCKS)
+        ready = ReshardReady.from_frames(self._sent(mgr, MessageTag.RESHARD_READY)[0])
+        self.assertEqual(ready.pages, list(range(24, 64)))
+        self.assertEqual(mgr._pulling.pages(), self.WHOLE)
+
+    def test_closing_plan_waits_for_staging_and_publishes_on_poll(self):
+        mgr = self._decode(capacity=self.WHOLE)
+        self.assertTrue(mgr._pulling.admit("7", 10))
+        self._close(mgr)
+        mgr._engine.register_active_plan.assert_not_called()
+        self.assertEqual(self._sent(mgr, MessageTag.RESHARD_READY), [])
+        self.assertFalse(mgr.is_failed(self.ROOM))
+        self.assertFalse(mgr.is_recv_done(self.ROOM))
+        self.assertFalse(mgr.room_has_active_io(self.ROOM))
+        # It holds the head of the line: a later read cannot overtake it.
+        self.assertEqual(mgr._pulling.waiting, "push:41")
+        self.assertFalse(mgr._pulling.admit("8", 1))
+
+        self._poll(mgr)
+        mgr._engine.register_active_plan.assert_not_called()
+        mgr._pulling.release("7")
+        self._poll(mgr)
+        mgr._engine.register_active_plan.assert_called_once()
+        self.assertEqual(len(self._sent(mgr, MessageTag.RESHARD_READY)), 2)
+        self.assertEqual(mgr._pulling.rooms(), ["push:41"])
+        self.assertEqual(mgr._decode.reshard_parked, {})
+        self._poll(mgr)
+        mgr._engine.register_active_plan.assert_called_once()
+
+    def test_parked_plan_fails_once_the_prefill_gives_up(self):
+        mgr = self._decode(capacity=self.WHOLE)
+        self.assertTrue(mgr._pulling.admit("7", 10))
+        self._close(mgr)
+        with envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.override(30):
+            self.clock[0] += 29
+            self._poll(mgr)
+            self.assertFalse(mgr.is_failed(self.ROOM))
+            self.clock[0] += 1
+            self._poll(mgr)
+        self.assertTrue(mgr.is_failed(self.ROOM))
+        reason = mgr.failure_records[self.ROOM]
+        for part in (
+            "waited 30s for host staging",
+            "40 pages, 10 of 40 in use",
+            "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=30s",
+            "SGLANG_RAIDEN_HOST_POOL_GB",
+        ):
+            self.assertIn(part, reason)
+        mgr._engine.register_active_plan.assert_not_called()
+        self.assertIsNone(mgr._pulling.waiting)
+        self.assertEqual(mgr._decode.reshard_parked, {})
+        self.assertTrue(mgr._pulling.admit("8", 1))
+
+    def test_bootstrap_deadline_counts_from_the_reshard_request(self):
+        # The prefill's clock starts at its reply, after this rank's request,
+        # so time spent collecting the sources counts against the wait.
+        mgr = self._decode(capacity=self.WHOLE)
+        mgr._decode.reshard_meta[self.ROOM]["requested_at"] = self.clock[0] - 20
+        self.assertTrue(mgr._pulling.admit("7", 10))
+        self._close(mgr)
+        with envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.override(30):
+            self.clock[0] += 9
+            self._poll(mgr)
+            self.assertFalse(mgr.is_failed(self.ROOM))
+            self.clock[0] += 1
+            mgr._pulling.release("7")
+            self._poll(mgr)
+        self.assertTrue(mgr.is_failed(self.ROOM))
+        self.assertIn("since its RESHARD_REQ", mgr.failure_records[self.ROOM])
+        mgr._engine.register_active_plan.assert_not_called()
+        self.assertEqual(mgr._pulling.rooms(), [])
+
+    def test_reason_reports_each_pool_it_charged(self):
+        mgr = self._decode(capacity=100, swa_capacity=4)
+        mgr._swa_engine = Mock(transfer_address="10.0.0.2:31001")
+        mgr._decode.reshard_meta[self.ROOM]["local_swa_blocks"] = [300, 301]
+        self.assertTrue(mgr._pulling.admit("7", 10, 3))
+        self._close(mgr, swa=[1, 2])
+        self.assertIn(self.ROOM, mgr._decode.reshard_parked)
+        reason = mgr.take_parked_reshard_failure(self.ROOM, "bound")
+        self.assertIn("40 pages, 10 of 100 in use", reason)
+        self.assertIn("2 sliding-window pages, 3 of 4 in use", reason)
+
+    def test_error_before_registration_fails_the_room_and_releases(self):
+        def swa_geometry_raises(mgr):
+            orig = mgr._make_geometry
+
+            def geometry(*args, **kwargs):
+                if kwargs.get("swa"):
+                    raise ValueError("Partial FP8 head packs are unsupported")
+                return orig(*args, **kwargs)
+
+            mgr._make_geometry = geometry
+
+        for parked in (False, True):
+            with self.subTest(parked=parked):
+                mgr = self._decode(capacity=self.WHOLE, swa_capacity=100)
+                mgr._swa_engine = Mock(transfer_address="10.0.0.2:31001")
+                mgr._decode.reshard_meta[self.ROOM]["local_swa_blocks"] = [300, 301]
+                swa_geometry_raises(mgr)
+                if parked:
+                    self.assertTrue(mgr._pulling.admit("7", 10))
+                # Neither the listener nor the scheduler poll sees it.
+                self._close(mgr, swa=[1, 2])
+                if parked:
+                    self.assertIn(self.ROOM, mgr._decode.reshard_parked)
+                    mgr._pulling.release("7")
+                    self._poll(mgr)
+                self.assertTrue(mgr.is_failed(self.ROOM))
+                self.assertIn("Partial FP8 head packs", mgr.failure_records[self.ROOM])
+                self.assertEqual(
+                    sorted(mgr._pulling.admitted),
+                    ["7", "push:41", "push:swa:41"]
+                    if parked
+                    else ["push:41", "push:swa:41"],
+                )
+                mgr._swa_engine.register_active_plan.assert_not_called()
+                mgr._engine.register_active_plan.assert_not_called()
+                self.assertEqual(mgr._pulling.rooms(), [])
+                mgr.clear_room(self.ROOM)
+                self._assert_released_once(mgr)
+
+        mgr = self._decode()
+        with patch.object(
+            ReshardChunkReady, "to_frames", side_effect=RuntimeError("boom")
+        ):
+            self._chunk(mgr)
+        self.assertTrue(mgr.is_failed(self.ROOM))
+        mgr._engine.register_active_plan.assert_not_called()
+        self.assertEqual(mgr._pulling.admitted, ["push:41#0"])
+        self._assert_released_once(mgr)
+
+    def test_waiting_timeout_reports_host_staging(self):
+        mgr = self._decode(capacity=self.WHOLE)
+        self.assertIsNone(mgr.take_parked_reshard_failure(self.ROOM, "bound"))
+        self.assertTrue(mgr._pulling.admit("7", 10))
+        self._close(mgr)
+        self.clock[0] += 300
+        reason = mgr.take_parked_reshard_failure(
+            self.ROOM, "past SGLANG_DISAGGREGATION_WAITING_TIMEOUT=300s"
+        )
+        self.assertIn("waited 300s for host staging", reason)
+        self.assertIn("past SGLANG_DISAGGREGATION_WAITING_TIMEOUT=300s", reason)
+        self.assertIsNone(mgr._pulling.waiting)
+        self.assertEqual(mgr._decode.reshard_parked, {})
+
+    def test_receiver_waiting_timeout_replaces_the_reason(self):
+        mgr = self._decode(capacity=self.WHOLE)
+        mgr.waiting_timeout = 1
+        self.assertTrue(mgr._pulling.admit("7", 10))
+        self._close(mgr)
+        from sglang.srt.disaggregation.base.conn import KVPoll
+        from sglang_tpu.disaggregation.raiden.conn import RaidenKVReceiver
+
+        recv = object.__new__(RaidenKVReceiver)
+        recv.kv_mgr = mgr
+        recv.bootstrap_room = self.ROOM
+        recv.init_time = time.time() - 2
+        recv.conclude_state = None
+        with patch(
+            "sglang.srt.disaggregation.common.conn.CommonKVReceiver._check_waiting_timeout",
+            return_value=KVPoll.Failed,
+        ):
+            self.assertEqual(recv._check_waiting_timeout(), KVPoll.Failed)
+        self.assertIn("for host staging", mgr.failure_records[self.ROOM])
+        self.assertEqual(mgr._decode.reshard_parked, {})
+
+    def test_plan_the_pool_can_never_seat_fails_the_room(self):
+        mgr = self._decode(capacity=self.WHOLE - 1)
+        self._close(mgr)
+        self.assertTrue(mgr.is_failed(self.ROOM))
+        reason = mgr.failure_records[self.ROOM]
+        self.assertIn("cannot stage plan 41", reason)
+        self.assertIn("SGLANG_RAIDEN_HOST_POOL_GB", reason)
+        mgr._engine.register_active_plan.assert_not_called()
+        self.assertEqual(mgr._pulling.rooms(), [])
+        self.assertIsNone(mgr._pulling.waiting)
+
+    def test_push_staging_is_released_exactly_once(self):
+        def chunk_register_fails(mgr):
+            mgr._engine.register_active_plan.side_effect = RuntimeError("boom")
+            self._chunk(mgr)
+            self.assertTrue(mgr.is_failed(self.ROOM))
+
+        def closing_register_fails(mgr):
+            mgr._engine.register_active_plan.side_effect = RuntimeError("boom")
+            self._close(mgr)
+            self.assertTrue(mgr.is_failed(self.ROOM))
+            mgr.clear_room(self.ROOM)
+
+        def cleared_while_registering(mgr):
+            mgr._engine.register_active_plan.side_effect = lambda *a, **k: (
+                mgr.clear_room(self.ROOM)
+            )
+            self._close(mgr)
+            mgr._engine.unregister_active_plan.assert_called_once_with(self.ROOM)
+
+        def cleared_before_settle(mgr):
+            self._chunk(mgr)
+            self._close(mgr)
+            mgr.clear_room(self.ROOM)
+            self.assertEqual(sorted(mgr._pulling.rooms()), ["push:41", "push:41#0"])
+            mgr._engine.poll_stats_with_details = Mock(
+                return_value=_polled([], ["41#0", "41"])
+            )
+            mgr._drain_engine()
+            mgr._drain_engine()
+
+        def cleared_after_settle(mgr):
+            self._close(mgr)
+            mgr._engine.poll_stats_with_details = Mock(return_value=_polled([], ["41"]))
+            mgr._drain_engine()
+            mgr.clear_room(self.ROOM)
+            mgr._drain_engine()
+
+        def raiden_fails_the_push(mgr):
+            self._chunk(mgr)
+            self._close(mgr)
+            mgr._engine.poll_stats_with_details = Mock(
+                return_value=_polled([], [], ["41#0", "41"])
+            )
+            mgr._drain_engine()
+            self.assertTrue(mgr.is_failed(self.ROOM))
+            mgr.clear_room(self.ROOM)
+            mgr._drain_engine()
+
+        def parked_then_aborted(mgr):
+            mgr._pulling.admit("7", 10)
+            mgr._pulling.capacity = self.WHOLE
+            self._close(mgr)
+            self.assertIn(self.ROOM, mgr._decode.reshard_parked)
+            mgr._aborted[self.ROOM] = 1.0
+            mgr._pulling.release("7")
+            self._poll(mgr)
+            mgr._engine.register_active_plan.assert_not_called()
+            # Nothing was granted; the place in line is all it gave up.
+            self.assertEqual(mgr._pulling.admitted, ["7"])
+
+        def parked_then_cleared(mgr):
+            mgr._pulling.capacity = self.WHOLE + self.CHUNK - 1
+            self._chunk(mgr)
+            self.assertTrue(mgr._pulling.admit("7", 10))
+            self._close(mgr)
+            self.assertIn(self.ROOM, mgr._decode.reshard_parked)
+            mgr.clear_room(self.ROOM)
+            mgr._pulling.release("7")
+            mgr._engine.poll_stats_with_details = Mock(
+                return_value=_polled([], ["41#0"])
+            )
+            mgr._drain_engine()
+            mgr._engine.register_active_plan.assert_called_once()
+
+        def window_short_of_pages(mgr):
+            mgr._swa_engine = Mock(transfer_address="10.0.0.2:31001")
+            mgr._decode.reshard_meta[self.ROOM]["local_swa_blocks"] = [
+                300,
+                301,
+                302,
+                303,
+            ]
+            self._close(mgr, swa=[1, 2])
+            self.assertTrue(mgr.is_failed(self.ROOM))
+            self.assertEqual(sorted(mgr._pulling.admitted), ["push:41", "push:swa:41"])
+            mgr._swa_engine.register_active_plan.assert_not_called()
+            mgr._engine.register_active_plan.assert_not_called()
+
+        for path in (
+            chunk_register_fails,
+            closing_register_fails,
+            cleared_while_registering,
+            cleared_before_settle,
+            cleared_after_settle,
+            raiden_fails_the_push,
+            parked_then_aborted,
+            parked_then_cleared,
+            window_short_of_pages,
+        ):
+            with self.subTest(path=path.__name__):
+                mgr = self._decode(swa_capacity=100)
+                path(mgr)
+                self._assert_released_once(mgr)
+
+    def test_concurrent_rooms_never_overrun_raiden_staging(self):
+        rooms = list(range(41, 49))
+        # Raiden's pool is the one admission is sized from; it seats two
+        # closing plans at a time.
+        mgr = self._decode(capacity=2 * self.WHOLE + 5)
+        engine = _StagingEngine(capacity=2 * self.WHOLE + 5)
+        mgr._engine = engine
+        for room in rooms[1:]:
+            self._add_room(mgr, room)
+        threads = [
+            threading.Thread(
+                target=self._close, args=(mgr, r), kwargs=dict(patch_modules=False)
+            )
+            for r in rooms
+        ]
+        with patch.dict(sys.modules, _pb2_modules()):
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+        for _ in range(len(rooms)):
+            mgr._drain_engine()
+            for room in rooms:
+                self._poll(mgr, room)
+        mgr._drain_engine()
+        self.assertEqual(engine.refused, [])
+        self.assertLessEqual(engine.peak, engine.capacity)
+        self.assertEqual(sorted(engine.registered), sorted(str(r) for r in rooms))
+        for room in rooms:
+            self.assertFalse(mgr.is_failed(room), room)
+            self.assertTrue(mgr.is_recv_done(room), room)
+            mgr.clear_room(room)
+        self._assert_released_once(mgr)
+
+    def test_without_admission_raiden_refuses_the_overflow(self):
+        # The failure #1661 reports: without the charge, the third closing
+        # plan reaches raiden while two hold its staging, and the room fails.
+        rooms = [41, 42, 43]
+        mgr = self._decode()
+        mgr._pulling = None
+        engine = _StagingEngine(capacity=2 * self.WHOLE + 5)
+        mgr._engine = engine
+        for room in rooms[1:]:
+            self._add_room(mgr, room)
+        for room in rooms:
+            self._close(mgr, room)
+        self.assertEqual(engine.refused, ["43"])
+        self.assertIn("cannot stage plan 43", mgr.failure_records[43])
+
+    def test_pull_keys_settle_independently_of_push_keys(self):
+        mgr = self._decode()
+        self.assertTrue(mgr._pulling.admit("push:41", 5))
+        self.assertTrue(mgr._pulling.admit("7", 5))
+        mgr._completed_recv.add("7")
+        with mgr._state_lock:
+            mgr._release_pull_slots_locked()
+        self.assertEqual(mgr._pulling.rooms(), ["push:41"])
+        mgr._completed_recv.add("41")
+        with mgr._state_lock:
+            mgr._release_pull_slots_locked()
+        self.assertEqual(mgr._pulling.rooms(), [])
 
 
 class _FakeFuture:

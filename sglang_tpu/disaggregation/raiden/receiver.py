@@ -43,6 +43,11 @@ def _present_ids(*req_ids: Optional[str]) -> Tuple[str, ...]:
     return tuple(rid for rid in req_ids if rid is not None)
 
 
+# Prefix of a push receive plan's staging admission key; no pull read id
+# starts with it.
+_PUSH_KEY = "push:"
+
+
 class RaidenReceiverMixin:
     """Decode-side methods of ``RaidenKVManager``."""
 
@@ -362,7 +367,10 @@ class RaidenReceiverMixin:
         """Hand back the staging of reads that have settled."""
         if self._pulling is None:
             return
+        self._release_push_staging_locked()
         for key in self._pulling.rooms():
+            if key.startswith(_PUSH_KEY):
+                continue
             if not self._pull_settled_locked(key):
                 continue
             self._pulling.release(key)
@@ -374,6 +382,180 @@ class RaidenReceiverMixin:
                     self._completed_recv.discard(rid)
                     self._failed.discard(rid)
                     self._native_failed.discard(rid)
+
+    # ----- host staging of push receive plans --------------------------------
+    #
+    # An HBM receive plan takes its host blocks from the same pool the pulls
+    # are admitted against, when it is registered, and raiden returns them
+    # when the plan's upload settles (done, failed or timed out) or when an
+    # idle plan is unregistered. Each plan is charged under its own key, so it
+    # is released by the completion of its own request id.
+
+    @staticmethod
+    def _push_key(req_id: str) -> str:
+        return _PUSH_KEY + req_id
+
+    @staticmethod
+    def _push_plan_staging_pages(req) -> int:
+        """Host blocks raiden stages a receive plan in: one per distinct
+        destination block over every source's schedule."""
+        return len(
+            {
+                e.dst_block_id
+                for s in req.shard_push_schedules.values()
+                for e in s.entries
+            }
+        )
+
+    def _admit_push_locked(self, charges: Sequence[Tuple[str, int, int]]) -> bool:
+        """Admit (key, pages, sliding-window pages) charges in order. False
+        leaves the charges admitted so far held; the first refused one keeps
+        its place in line. Raises ValueError for a charge the pool can never
+        seat."""
+        if self._pulling is None:
+            return True
+        return all(self._pulling.admit(key, p, swa) for key, p, swa in charges)
+
+    def _release_push_locked(self, req_id: str) -> None:
+        """Release the plan req_id never registered, or that raiden dropped
+        while idle."""
+        if self._pulling is not None:
+            self._pulling.release(self._push_key(req_id))
+
+    def _release_push_staging_locked(self) -> None:
+        """Release the plans raiden has reported settled. Runs before any
+        sweep drops their completions."""
+        if self._pulling is None:
+            return
+        for key in self._pulling.rooms():
+            if not key.startswith(_PUSH_KEY):
+                continue
+            rid = key[len(_PUSH_KEY) :]
+            if rid in self._completed_recv or rid in self._native_failed:
+                self._pulling.release(key)
+
+    def _drop_parked_reshard_locked(self, room: int) -> None:
+        """Drop the room's closing plan that is waiting for staging: release
+        what it was already granted and give up its place in line."""
+        entry = self._decode.reshard_parked.pop(room, None)
+        if entry is not None:
+            self._withdraw_push_locked(entry[1])
+
+    def _withdraw_push_locked(self, charges: Sequence[Tuple[str, int, int]]) -> None:
+        """Release charges whose plans never registered and give up their
+        place in line."""
+        if self._pulling is None:
+            return
+        for key, _, _ in charges:
+            self._pulling.forget(key)
+            self._pulling.release(key)
+
+    def _parked_reshard_reason_locked(self, room: int, bound: str) -> Optional[str]:
+        entry = self._decode.reshard_parked.get(room)
+        if entry is None:
+            return None
+        parked_at, charges, _ = entry
+        pages = sum(p for _, p, _ in charges)
+        swa_pages = sum(swa for _, _, swa in charges)
+        if self._pulling is None:
+            need = f"{pages} pages"
+        else:
+            need = (
+                f"{pages} pages, {self._pulling.pages()} of "
+                f"{self._pulling.capacity} in use"
+            )
+            if swa_pages:
+                need += (
+                    f"; {swa_pages} sliding-window pages, "
+                    f"{self._pulling.swa_pages()} of "
+                    f"{self._pulling.swa_capacity} in use"
+                )
+        return (
+            f"Raiden receive failed: request {room} waited "
+            f"{self._monotonic() - parked_at:.0f}s for host staging for its "
+            f"push receive plan ({need}), {bound}. Raise "
+            "SGLANG_RAIDEN_HOST_POOL_GB or lower the decode's concurrency"
+        )
+
+    def take_parked_reshard_failure(self, room: int, bound: str) -> Optional[str]:
+        """Failure reason of a room that timed out while its closing plan
+        waited for host staging, or None if none waits; the plan is dropped."""
+        if self._decode is None:
+            return None
+        with self._state_lock:
+            reason = self._parked_reshard_reason_locked(room, bound)
+            self._drop_parked_reshard_locked(room)
+        return reason
+
+    def _retry_parked_reshard(self, room: int) -> None:
+        """Publish the room's parked closing plan once the pool can seat it.
+
+        Runs on the room's scheduler poll, like a pull waiting for staging,
+        so it never raises: an unexpected error fails the room instead.
+        """
+        if room not in self._decode.reshard_parked:
+            return
+        charges = ()
+        try:
+            with self._state_lock:
+                entry = self._decode.reshard_parked.get(room)
+                if entry is None:
+                    return
+                if (
+                    room not in self._decode.reshard_meta
+                    or room in self._aborted
+                    or self._is_failed_locked(room)
+                ):
+                    self._drop_parked_reshard_locked(room)
+                    return
+                _, charges, publish_args = entry
+                # The prefill fails a room the decode has not cleared to push
+                # within SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT of its reply;
+                # the reply follows this rank's RESHARD_REQ, so counting from
+                # the request never publishes after the prefill gave up.
+                deadline = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+                requested_at = self._decode.reshard_meta[room]["requested_at"]
+                if self._monotonic() - requested_at >= deadline:
+                    reason = self._parked_reshard_reason_locked(
+                        room,
+                        f"past SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT={deadline:.0f}s "
+                        "since its RESHARD_REQ, after which the prefill gives up "
+                        "on it",
+                    )
+                    self._drop_parked_reshard_locked(room)
+                    self._fail_room_locked(room, reason)
+                    logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+                    return
+                if not self._admit_push_locked(charges):
+                    return
+                del self._decode.reshard_parked[room]
+        except Exception as e:
+            self._abandon_push(room, charges, e)
+            return
+        self._publish_reshard_closing(charges, *publish_args)
+
+    def _abandon_push(
+        self, room: int, charges: Sequence[Tuple[str, int, int]], error: Exception
+    ) -> None:
+        """Fail the room after an unexpected error between admitting its push
+        plans and registering them.
+
+        A plan that registered keeps its charge until raiden reports it
+        settled, as on every other path; the charges of the others are
+        released here, since nothing else would.
+        """
+        reason = f"Raiden receive failed: cannot stage the push of room {room}: {error}"
+        logger.exception("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+        with self._state_lock:
+            self._decode.reshard_parked.pop(room, None)
+            registered = set(self._reshard_plans.get(room, {})) | set(
+                self._cleared_plans
+            )
+            self._withdraw_push_locked(
+                [c for c in charges if c[0][len(_PUSH_KEY) :] not in registered]
+            )
+            if room in self._decode.reshard_meta:
+                self._fail_room_locked(room, reason, preserve_reason=True)
 
     def _reject_oversized_pull(
         self,
@@ -481,6 +663,7 @@ class RaidenReceiverMixin:
         """
         if self._pipeline is not None:
             return self._pipeline.maybe_start_pull(room)
+        self._retry_parked_reshard(room)
         if self.chunked_transfer:
             return self._start_chunked_pull(room)
         return self._start_whole_pull(room)
@@ -855,6 +1038,8 @@ class RaidenReceiverMixin:
                 src_attn_tp=int(src_attn_tp),
                 aux_index=aux_index,
                 ready_endpoints=ready_endpoints,
+                # Bounds how long a closing plan may wait for host staging.
+                requested_at=self._monotonic(),
             )
             self._decode.reshard_sources[room] = {}
             self._decode.reshard_swa_sources[room] = {}
@@ -988,10 +1173,30 @@ class RaidenReceiverMixin:
             dst_block_ids=dst,
             live_tokens=[self.kv_args.page_size] * window.length,
         )
-        payload = ReshardChunkReady(room=room, index=index, uuid=uuid).to_frames()
-        if not self._publish_reshard_plan(
-            room, req_id, uuid, req, payload, ready_endpoints
-        ):
+        key = self._push_key(req_id)
+        with self._state_lock:
+            try:
+                admitted = self._admit_push_locked(
+                    [(key, self._push_plan_staging_pages(req), 0)]
+                )
+            except ValueError:
+                admitted = False
+            if not admitted:
+                # Unacknowledged, the chunk's pages ride the closing plan, as
+                # for a chunk that lost its race; it asks for nothing later,
+                # so it must not hold the line.
+                if self._pulling is not None:
+                    self._pulling.forget(key)
+                return None
+        try:
+            payload = ReshardChunkReady(room=room, index=index, uuid=uuid).to_frames()
+            published = self._publish_reshard_plan(
+                room, req_id, uuid, req, payload, ready_endpoints
+            )
+        except Exception as e:
+            self._abandon_push(room, [(key, 0, 0)], e)
+            return None
+        if not published:
             return None
         return (start, start + length)
 
@@ -1086,13 +1291,13 @@ class RaidenReceiverMixin:
         room no longer owns: a failed registration fails the room, and a
         plan registered for a cleared room is dropped again.
         """
-        engine = self._ensure_engine()
         try:
-            engine.register_active_plan(uuid, req, is_sender=False)
+            self._ensure_engine().register_active_plan(uuid, req, is_sender=False)
         except Exception as e:
             reason = f"Raiden receive failed: cannot stage plan {req_id}: {e}"
             logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
             with self._state_lock:
+                self._release_push_locked(req_id)
                 if room not in self._decode.reshard_meta:
                     # Cleared while registering: nothing reads a failure for
                     # this room any more, so record none.
@@ -1113,7 +1318,11 @@ class RaidenReceiverMixin:
                 for endpoint in ready_endpoints:
                     self._send_multipart_locked(endpoint, ready_payload)
                 return True
+        # No push was asked for, so the plan is idle and its staging returns
+        # as it is unregistered.
         self._unregister_plan(uuid)
+        with self._state_lock:
+            self._release_push_locked(req_id)
         return False
 
     def _register_reshard_swa_receiver(
@@ -1168,6 +1377,7 @@ class RaidenReceiverMixin:
                 )
                 logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
                 with self._state_lock:
+                    self._release_push_locked(self._swa_req_id(room))
                     self._failed.add(str(room))
                     self.record_failure(room, reason)
                 return False
@@ -1191,6 +1401,7 @@ class RaidenReceiverMixin:
             reason = f"Raiden reshard SWA receive: cannot stage plan {room}: {e}"
             logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
             with self._state_lock:
+                self._release_push_locked(self._swa_req_id(room))
                 if room not in self._decode.reshard_meta:
                     return False
                 self._failed.add(str(room))
@@ -1201,6 +1412,7 @@ class RaidenReceiverMixin:
                 # Cleared while registering; drop the plan again so the pages
                 # cannot be written under their next owner.
                 self._unregister_plan(room)
+                self._release_push_locked(self._swa_req_id(room))
                 return False
             self._reshard_plans.setdefault(room, {})[self._swa_req_id(room)] = room
         # INFO for the same reason as the push: without it a skipped window and
@@ -1235,42 +1447,22 @@ class RaidenReceiverMixin:
             sources_map = dict(self._decode.reshard_sources[room])
             swa_sources_map = dict(self._decode.reshard_swa_sources.get(room, {}))
 
-        # Arm the sliding-window receive before the READY goes out: the READY is
-        # what tells every source to push, and its closing push carries the SWA
-        # pages, so the second engine's plan has to be registered by then. A
-        # failure here fails the room, so no READY is sent either way.
-        if not self._register_reshard_swa_receiver(
-            room, src_attn_tp, local_swa_blocks, swa_sources_map
-        ):
-            return
-
         geom = self._make_geometry(src_attn_tp, self.attn_tp_size)
         n = len(local_blocks)
+        missing: List[int] = []
         if self.chunked_transfer:
             # Only the pages no registered chunk plan covers are left to
             # move. The covered set is not a prefix -- a chunk can lose its
             # race anywhere in the range -- so the closing plan is its exact
             # complement, and the READY tells the sources to push just that.
+            # No chunk registers once the room is in reshard_registered, so
+            # the complement is final.
             any_blocks = next(iter(sources_map.values()))
             total = len(any_blocks)
             base = total - n
             with self._state_lock:
                 covered = list(self._decode.reshard_covered.get(room, []))
             missing = [pg for pg in self._uncovered_pages(total, covered) if pg >= base]
-            with self._state_lock:
-                if room not in self._decode.reshard_meta:
-                    return  # cleared while the complement was computed
-                # The closing read is owed from the moment the room can look
-                # complete: it is recorded before _final_seen so completion
-                # can never be inferred while its registration is pending.
-                if missing:
-                    self._decode.chunk_reads.setdefault(room, []).append(str(room))
-                self._decode.final_seen.add(room)
-            if not missing:
-                for endpoint in ready_endpoints:
-                    payload = ReshardReady(room=room).to_frames()
-                    self._send_multipart_locked(endpoint, payload)
-                return
             sources = [
                 (p_rank, [sources_map[p_rank][pg] for pg in missing])
                 for p_rank in sorted(sources_map)
@@ -1285,19 +1477,123 @@ class RaidenReceiverMixin:
             for p_rank in sorted(sources_map):
                 pb = sources_map[p_rank]
                 sources.append((p_rank, pb[-n:] if len(pb) > n else pb))
-        live = [self.kv_args.page_size] * n
-
-        req = build_receiver_request(
-            pb2,
-            uuid=room,
-            req_id=str(room),
-            peer=self._ensure_engine().transfer_address,
-            decode_rank=self.attn_tp_rank,
-            geom=geom,
-            sources=sources,
-            dst_block_ids=local_blocks,
-            live_tokens=live,
+        req = None
+        if not self.chunked_transfer or missing:
+            req = build_receiver_request(
+                pb2,
+                uuid=room,
+                req_id=str(room),
+                peer=self._ensure_engine().transfer_address,
+                decode_rank=self.attn_tp_rank,
+                geom=geom,
+                sources=sources,
+                dst_block_ids=local_blocks,
+                live_tokens=[self.kv_args.page_size] * n,
+            )
+        # The window plan and the full-attention plan are charged before
+        # either registers, so a closing transfer that does not fit waits
+        # whole instead of failing half-registered.
+        charges = []
+        if self._swa_engine is not None and local_swa_blocks:
+            charges.append(
+                (self._push_key(self._swa_req_id(room)), 0, len(set(local_swa_blocks)))
+            )
+        if req is not None:
+            charges.append(
+                (self._push_key(str(room)), self._push_plan_staging_pages(req), 0)
+            )
+        publish_args = (
+            room,
+            src_attn_tp,
+            local_swa_blocks,
+            swa_sources_map,
+            ready_endpoints,
+            missing,
+            req,
+            sources,
+            local_blocks,
         )
+        with self._state_lock:
+            if room not in self._decode.reshard_meta or room in self._aborted:
+                return
+            try:
+                admitted = self._admit_push_locked(charges)
+            except ValueError as e:
+                reason = (
+                    f"Raiden receive failed: cannot stage plan {room}: {e}. "
+                    "Raise SGLANG_RAIDEN_HOST_POOL_GB"
+                )
+                self._withdraw_push_locked(charges)
+                self._fail_room_locked(room, reason)
+                logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+                return
+            if not admitted:
+                self._decode.reshard_parked[room] = (
+                    self._monotonic(),
+                    charges,
+                    publish_args,
+                )
+                logger.info(
+                    "RaidenKVManager rank%d room %s closing push plan waits for "
+                    "host staging (%d pages in use of %d)",
+                    self.attn_tp_rank,
+                    room,
+                    self._pulling.pages(),
+                    self._pulling.capacity,
+                )
+                return
+        self._publish_reshard_closing(charges, *publish_args)
+
+    def _publish_reshard_closing(
+        self, charges: Sequence[Tuple[str, int, int]], room: int, *args: Any
+    ) -> None:
+        """Register the room's admitted closing plans and ask the sources to
+        push. Never raises: it also runs on the scheduler poll."""
+        try:
+            self._register_reshard_closing(room, *args)
+        except Exception as e:
+            self._abandon_push(room, charges, e)
+
+    def _register_reshard_closing(
+        self,
+        room: int,
+        src_attn_tp: int,
+        local_swa_blocks: List[int],
+        swa_sources_map: Dict[int, List[int]],
+        ready_endpoints: List[str],
+        missing: List[int],
+        req,
+        sources: List[Tuple[int, List[int]]],
+        local_blocks: List[int],
+    ) -> None:
+        # Arm the sliding-window receive before the READY goes out: the READY is
+        # what tells every source to push, and its closing push carries the SWA
+        # pages, so the second engine's plan has to be registered by then. A
+        # failure here fails the room, so no READY is sent either way.
+        if not self._register_reshard_swa_receiver(
+            room, src_attn_tp, local_swa_blocks, swa_sources_map
+        ):
+            with self._state_lock:
+                self._release_push_locked(str(room))
+            return
+
+        if self.chunked_transfer:
+            with self._state_lock:
+                if room not in self._decode.reshard_meta:
+                    # Cleared while the window plan registered.
+                    self._release_push_locked(str(room))
+                    return
+                # The closing read is owed from the moment the room can look
+                # complete: it is recorded before _final_seen so completion
+                # can never be inferred while its registration is pending.
+                if missing:
+                    self._decode.chunk_reads.setdefault(room, []).append(str(room))
+                self._decode.final_seen.add(room)
+            if not missing:
+                for endpoint in ready_endpoints:
+                    payload = ReshardReady(room=room).to_frames()
+                    self._send_multipart_locked(endpoint, payload)
+                return
         # register_active_plan (dst_mem_type=HBM) arms the completion barrier from
         # the schedule (one block-push per (block, layer) across all writers) and
         # supplies the strided receive + auto-H2D-to-HBM geometry.
@@ -1378,21 +1674,32 @@ class RaidenKVReceiver(CommonKVReceiver):
             return None
         age = self.kv_mgr.last_announcement_age(self.bootstrap_room)
         if age is None:
-            return super()._check_waiting_timeout()
-        if age < self.kv_mgr.waiting_timeout:
+            result = super()._check_waiting_timeout()
+        elif age < self.kv_mgr.waiting_timeout:
             return None
-        # send_metadata predates every announcement, so the base check fails
-        # the room here.
-        result = super()._check_waiting_timeout()
+        else:
+            # send_metadata predates every announcement, so the base check
+            # fails the room here.
+            result = super()._check_waiting_timeout()
+            if result is not None:
+                # Replace the base reason, which counts from send_metadata.
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    f"Request {self.bootstrap_room} timed out after {age:.1f}s "
+                    f"without a new KV announcement ({time.time() - self.init_time:.1f}s "
+                    "since send_metadata, SGLANG_DISAGGREGATION_WAITING_TIMEOUT="
+                    f"{self.kv_mgr.waiting_timeout:.0f}s)",
+                )
         if result is not None:
-            # Replace the base reason, which counts from send_metadata.
-            self.kv_mgr.record_failure(
+            # A resharded room whose closing plan was still waiting for host
+            # staging timed out on the decode's pool, not on the prefill.
+            reason = self.kv_mgr.take_parked_reshard_failure(
                 self.bootstrap_room,
-                f"Request {self.bootstrap_room} timed out after {age:.1f}s without "
-                f"a new KV announcement ({time.time() - self.init_time:.1f}s since "
-                "send_metadata, SGLANG_DISAGGREGATION_WAITING_TIMEOUT="
-                f"{self.kv_mgr.waiting_timeout:.0f}s)",
+                "past SGLANG_DISAGGREGATION_WAITING_TIMEOUT="
+                f"{self.kv_mgr.waiting_timeout:.0f}s",
             )
+            if reason is not None:
+                self.kv_mgr.record_failure(self.bootstrap_room, reason)
         return result
 
     def poll(self) -> KVPoll:

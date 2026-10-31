@@ -1246,6 +1246,10 @@ class RaidenKVManager(
         with self._state_lock:
             if self._prefill is not None:
                 self._prefill.reshard_replied_at.pop(room, None)
+            if self._decode is not None:
+                # A closing plan still waiting for staging gives up what it
+                # was granted and its place in line.
+                self._drop_parked_reshard_locked(room)
             # A read raiden still holds keeps its admission, and a push it is
             # still delivering keeps its receiver plan, each with the
             # completion that will settle it, until the engine reports it.
