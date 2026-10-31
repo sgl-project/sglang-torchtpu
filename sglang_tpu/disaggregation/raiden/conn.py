@@ -1049,8 +1049,8 @@ class RaidenKVManager(
                 continue
             try:
                 self._dispatch(msg)
-            except Exception as e:
-                logger.error("RaidenKVManager message handling error: %s", e)
+            except Exception:
+                logger.exception("RaidenKVManager message handling error")
 
     def _dispatch(self, msg: List[bytes]) -> None:
         """Route one multipart message from the per-rank PULL socket by its tag."""
