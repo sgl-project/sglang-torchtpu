@@ -160,6 +160,14 @@ class TpuEnvs:
     # Both P/D servers must agree; tpu_platform refuses the configurations that
     # read layer by layer.
     SGLANG_TPU_USE_BLOCK_MAJOR_KV = EnvBool(False)
+    # Vision encoder flash attention: q tile (0 = the kernel's default blocks).
+    # The kernel keeps a single k step (block_k = kv_len, softmax over the whole
+    # row); 256 is bit-exact with the default tile on tpu7x, 512+ differ at bf16
+    # rounding level. Applied only while kv_len <=
+    # SGLANG_TPU_VISION_FLASH_BLOCK_Q_MAX_SEQ: a 256-row q tile at the 8K-16K
+    # image buckets halted the TPU during warmup.
+    SGLANG_TPU_VISION_FLASH_BLOCK_Q = EnvInt(0)
+    SGLANG_TPU_VISION_FLASH_BLOCK_Q_MAX_SEQ = EnvInt(4096)
 
     # Raiden PD disaggregation
     # Base control port. Each local rank reserves consecutive control/data
