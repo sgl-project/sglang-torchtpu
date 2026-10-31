@@ -55,6 +55,7 @@ def _bare_manager(mode):
     mgr.failure_records = {}
     mgr.failure_lock = threading.Lock()
     mgr._state_lock = threading.Lock()
+    mgr._drain_lock = threading.Lock()
     mgr._status_lock = threading.Lock()
     mgr._announce_lock = threading.Lock()
     mgr._engine_lock = threading.Lock()

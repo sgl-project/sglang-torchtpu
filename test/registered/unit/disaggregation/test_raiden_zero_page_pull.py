@@ -24,6 +24,7 @@ def _decode_manager(hybrid):
     mgr.attn_tp_rank = 0
     mgr.chunked_transfer = True
     mgr._state_lock = threading.Lock()
+    mgr._drain_lock = threading.Lock()
     mgr._status_lock = threading.Lock()
     mgr.request_status = {}
     mgr.failure_records = {}
