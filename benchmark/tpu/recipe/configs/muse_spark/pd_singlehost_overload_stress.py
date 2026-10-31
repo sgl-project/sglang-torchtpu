@@ -38,6 +38,9 @@ _COMMON_CONFIG["runtime_env"].update(
     LB_PORT=os.environ.get("LB_PORT", "8000"),
     SGLANG_RAIDEN_KV_PORT=os.environ.get("SGLANG_RAIDEN_KV_PORT", "31000"),
     SGLANG_RAIDEN_RESHARD="0",
+    # Image and video serving loads the TPU Muse processor (sglang_tpu/README.md).
+    SGLANG_EXTERNAL_MM_MODEL_ARCH="MuseSparkForConditionalGeneration",
+    SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE="sglang_tpu.multimodal",
 )
 
 PREFILL_CONFIG = deepcopy(_COMMON_CONFIG)
