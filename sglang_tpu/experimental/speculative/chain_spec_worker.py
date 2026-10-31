@@ -637,6 +637,9 @@ class TpuChainSpecWorker(TpuSpecWorker):
         rows = select_verify_rows(
             upload(pbs, 2 * self.verify_window_rows), upload(pbs), seq_lens, width
         )
+        # The fused draft batch takes this slice eagerly. A later blocking H2D
+        # can materialize it independently of the compiled draft's consumers.
+        rows.cache_locs[:, 0].contiguous().cpu()
         state = SpecState(
             bonus_tokens=upload(pbs), seq_lens=seq_lens, req_pool_indices=upload(pbs)
         )
@@ -714,11 +717,18 @@ class TpuChainSpecWorker(TpuSpecWorker):
                     width,
                 )
                 positions = rows.flat_positions.view(padded_bs, -1)
-                positions.flatten().unsqueeze(0).repeat(3, 1).cpu()
+                seq_lens = self._warmup_accept(padded_bs, width).next_seq_lens
                 deltas = torch.zeros((padded_bs, 1), dtype=torch.int64)
-                (positions + deltas.to(self.device)).flatten().unsqueeze(0).repeat(
-                    3, 1
-                ).cpu()
+                for with_deltas in (False, True):
+                    shifted = (
+                        positions + deltas.to(self.device) if with_deltas else positions
+                    )
+                    mrope_positions = shifted.flatten().unsqueeze(0).repeat(3, 1)
+                    # repeat leaves a pending broadcast even in DEFER_NEVER.
+                    # Serving combines it with RPA's verify KV-length add;
+                    # materializing the positions first warms a different graph.
+                    (seq_lens + width).to(torch.int32).cpu()
+                    mrope_positions.cpu()
 
     def _warmup_extend_ops(self) -> None:
         """Host uploads and the tail fill of the draft prompt extend, per token and batch bucket."""

@@ -15,8 +15,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # libssl-dev: the HiCache page-hash extension (mem_cache/cpp_utils) links
 # OpenSSL; storage backends and KV events JIT-build it at runtime.
+# Raiden's torch extension links libibverbs even for host KV-cache offload.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git curl ca-certificates build-essential libgomp1 libssl-dev \
+        git curl ca-certificates build-essential libgomp1 libssl-dev libibverbs1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /sgl-workspace/sglang
@@ -29,12 +30,14 @@ COPY scripts/ci/tpu/warm_mmlu_cache.py ./scripts/ci/tpu/warm_mmlu_cache.py
 
 # Install the pinned TPU stack (dev_tpu extra = all_tpu + test + ray) without sglang itself.
 # diffusion_tpu: test_diffusion_tpu_platform.py imports the diffusion runtime.
-RUN cd python && \
+RUN --mount=type=secret,id=gar_netrc,target=/root/.netrc,required=true \
+    cd python && \
     mkdir -p sglang && \
     touch sglang/__init__.py && \
     pip install --upgrade pip && \
     pip install \
       --extra-index-url https://download.pytorch.org/whl/cpu \
+      --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/ \
       ".[dev_tpu,diffusion_tpu]" && \
     pip uninstall -y sglang && \
     rm -rf sglang && \
@@ -47,5 +50,8 @@ RUN python scripts/ci/tpu/warm_mmlu_cache.py
 RUN python -c "import torch, libtpu; print('torch', torch.__version__, '| libtpu', libtpu.__version__)" \
  && (python -c "import torch_tpu; print('torch_tpu OK')" \
        || echo "warn: torch_tpu import needs a TPU device; deferring to the on-hardware test")
+
+# Load the actual Raiden extension without allocating a TPU or KV cache.
+RUN python -c "from tpu_sync.api.torch.kv_cache_manager import _torch_impl; _torch_impl(); print('Raiden extension OK')"
 
 CMD ["/bin/bash"]
