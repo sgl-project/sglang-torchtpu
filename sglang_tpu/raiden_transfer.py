@@ -19,7 +19,7 @@ import time
 from typing import TYPE_CHECKING, List
 
 from sglang_tpu.envs import envs
-from sglang_tpu.tpu_dma_hicache import NOOP_EVENT
+from sglang_tpu.tpu_dma_hicache import NOOP_EVENT, page_major_tensors
 
 if TYPE_CHECKING:
     from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
@@ -93,8 +93,8 @@ class RaidenFutureEvent:
 
 
 class RaidenKVTransfer:
-    """Owns a raiden ``KVCacheManager`` over a TPU fused KV pool and issues
-    page-granular D2H / H2D transfers.
+    """Owns a raiden ``KVCacheManager`` over a TPU pool's page-major tensors and
+    issues page-granular D2H / H2D transfers.
 
     The device buffers are registered with raiden by raw PJRT pointer; the
     tensor list MUST stay alive for raiden's lifetime or ``D2h``/``H2d`` will
@@ -105,16 +105,26 @@ class RaidenKVTransfer:
         self,
         device_pool: TpuFusedMHATokenToKVPool,
         num_host_pages: int,
+        draft_pools: tuple = (),
     ):
         from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
 
         self.device_pool = device_pool
         self.num_host_pages = num_host_pages
-        self.layer_num = device_pool.layer_num
+        # Packed MTP draft pools ride the target's page ids, after its tensors.
+        tensors = [
+            t for pool in (device_pool, *draft_pools) for t in page_major_tensors(pool)
+        ]
+        if len({t.shape[0] for t in tensors}) != 1:
+            raise ValueError(
+                "Raiden HiCache needs every target and draft page tensor to hold "
+                f"the same number of pages; got {sorted({t.shape[0] for t in tensors})}"
+            )
+        self.layer_num = len(tensors)
 
-        # One entry per registered tensor (one shard each); Raiden blocks span dim 0.
-        # Held on self so device buffer lifetimes outlive the Raiden session.
-        self._device_tensors = [[buf] for buf in device_pool.page_buffers()]
+        # outer list = raiden "layer" (one per tensor), inner list = shard (one
+        # per TPU core here). Keep-alive: the buffers must outlive raiden.
+        self._device_tensors = [[t] for t in tensors]
         # raiden issues ``d2h`` / ``h2d`` copies on a background thread only
         # when this variable is set; otherwise the calls block the scheduler
         # thread until every per-layer copy has been submitted. The manager
@@ -128,12 +138,10 @@ class RaidenKVTransfer:
             unsafe_skip_buffer_lock=True,
         )
         logger.info(
-            "Raiden KV transfer ready: %d layers, tensors=%d, %d host pages "
-            "(page=%d tokens)",
+            "Raiden KV transfer ready: %d tensors, %d host pages, %.2f MiB per page",
             self.layer_num,
-            len(self._device_tensors),
             num_host_pages,
-            device_pool.page_size,
+            sum(t.nbytes // t.shape[0] for t in tensors) / 2**20,
         )
 
     def backup(

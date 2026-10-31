@@ -8,6 +8,7 @@ nightly. DeepSeek Sparse Attention, no speculative decoding.
 from copy import deepcopy
 
 from benchmark.tpu.recipe.configs.glm_5_3_flash.server import CONFIG as BASE_CONFIG
+from benchmark.tpu.recipe.configs.glm_5_3_flash.server import HICACHE_ARGS
 
 CONCURRENCY = 32
 # 290k thinking budget + prompt; at 128k, 3.3% of AIME26 samples truncated.
@@ -29,3 +30,6 @@ CONFIG["server_args"].update(
         "disable_radix_cache": True,
     }
 )
+# HiCache needs the radix cache.
+for key in HICACHE_ARGS:
+    del CONFIG["server_args"][key]

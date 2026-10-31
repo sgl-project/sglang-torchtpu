@@ -6,6 +6,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -38,7 +39,10 @@ def _run(lower_bound, conv_weights=None, is_decode=True, **layer_attrs):
         **layer_attrs,
     )
     backend = TpuKDAAttnBackend.__new__(TpuKDAAttnBackend)
-    backend.req_to_token_pool = SimpleNamespace(mamba2_layer_cache=lambda _: cache)
+    backend.req_to_token_pool = SimpleNamespace(
+        mamba_map=defaultdict(int),
+        mamba_pool=SimpleNamespace(mamba2_layer_cache=lambda _: cache),
+    )
     backend._query_start_loc = backend._state_indices = backend._seq_lens = None
     backend._distribution = None
     backend._is_decode = is_decode
