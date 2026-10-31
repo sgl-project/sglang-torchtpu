@@ -965,7 +965,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     def _pp_warmup_kwargs(self, num_tokens: int) -> dict[str, Any]:
         """The ``pp_proxy_tensors`` kwarg a non-first pipeline stage warms up with.
 
-        The proxy carries the previous stage's hidden states and residual at the
+        The proxy carries the previous stage's residual and optional hidden states at the
         padded token bucket, in the model's PP dtype (or its compute dtype by
         default), on the device; the first stage gets no proxy.
         """
@@ -991,10 +991,12 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
             return buffer[: shape[0]]
 
-        proxy = {
-            "hidden_states": zeros((num_tokens, hidden_size), transfer_dtype),
-            "residual": zeros((num_tokens, hidden_size), transfer_dtype),
-        }
+        keys = (
+            ("residual",)
+            if getattr(self.model_runner.model, "pp_residual_only", False)
+            else ("hidden_states", "residual")
+        )
+        proxy = {key: zeros((num_tokens, hidden_size), transfer_dtype) for key in keys}
         # Serving hands the aux capture slots on with the activations, so
         # trace them too or the graph signature differs from the real one.
         num_aux = num_relayed_aux_slots(

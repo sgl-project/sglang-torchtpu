@@ -248,14 +248,24 @@ class TestWaveBuffers(CustomTestCase):
         for model, dtype in (
             (SimpleNamespace(), torch.bfloat16),
             (SimpleNamespace(pp_transfer_dtype=torch.float32), torch.float32),
+            (
+                SimpleNamespace(pp_transfer_dtype=torch.float32, pp_residual_only=True),
+                torch.float32,
+            ),
         ):
             with self.subTest(dtype=dtype):
                 wave_args = self._wave_args(policy, model)
+                residual_only = getattr(model, "pp_residual_only", False)
                 self.assertEqual(wave_args["dtype"], dtype)
                 self.assertEqual(wave_args["aux_dtype"], torch.bfloat16)
+                self.assertEqual(wave_args["residual_only"], residual_only)
                 proxy = policy._pp_warmup_kwargs(64)["pp_proxy_tensors"]
-                for name in ("hidden_states", "residual"):
+                keys = {"residual"} if residual_only else {"hidden_states", "residual"}
+                self.assertEqual(set(proxy.tensors), keys)
+                for name in keys:
                     self.assertEqual(proxy[name].dtype, dtype)
+                    self.assertEqual(proxy[name].shape, (64, 16))
+                    self.assertEqual(proxy[name].storage_offset(), 0)
 
     def test_aux_slots_stay_in_compute_dtype_when_transfer_is_fp32(self):
         from sglang.srt.layers.aux_hidden_states import AUX_HIDDEN_STATES_PROXY_KEY
