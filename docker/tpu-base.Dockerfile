@@ -13,8 +13,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     SGLANG_BUILD_RUST_EXTS=none \
     SGLANG_PLATFORM=tpu
 
+# Raiden's torch extension links libibverbs even for host KV-cache offload.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git curl ca-certificates build-essential libgomp1 \
+        git curl ca-certificates build-essential libgomp1 libibverbs1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /sgl-workspace/sglang
@@ -47,5 +48,8 @@ RUN python scripts/ci/tpu/warm_mmlu_cache.py
 RUN python -c "import torch, libtpu; print('torch', torch.__version__, '| libtpu', libtpu.__version__)" \
  && (python -c "import torch_tpu; print('torch_tpu OK')" \
        || echo "warn: torch_tpu import needs a TPU device; deferring to the on-hardware test")
+
+# Load the actual Raiden extension without allocating a TPU or KV cache.
+RUN python -c "from tpu_sync.api.torch.kv_cache_manager import _torch_impl; _torch_impl(); print('Raiden extension OK')"
 
 CMD ["/bin/bash"]
