@@ -5,12 +5,12 @@ from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _STRATEGIES,
+    MambaStrategy,
     StackBuildResult,
     StackStrategy,
     _apply_stack_result,
     _DeepSeekV4Strategy,
     _DsaStrategy,
-    _MambaStrategy,
     _MiniMaxSparseStrategy,
     _PlainKvStrategy,
     _select_strategy,
@@ -57,7 +57,7 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
 
         kvcache = _mock_kvcache(HybridLinearKVPool)
         strategy = _select_strategy(kvcache, {FULL, MAMBA})
-        self.assertIsInstance(strategy, _MambaStrategy)
+        self.assertIsInstance(strategy, MambaStrategy)
 
     def test_swa(self):
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool

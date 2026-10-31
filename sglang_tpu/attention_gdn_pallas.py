@@ -646,6 +646,15 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
                 0, self._state_indices.clamp(min=0).long(), AT_SLOT
             )
 
+    def _layer_state(self, layer_id: int):
+        """``layer_id``'s state tensors, read inside the compiled forward.
+
+        Skips the pool's per-layer HiCache wait: the forward already waited for
+        the whole batch, and branching on the counter would guard the graph on it.
+        """
+        req_pool = self.req_to_token_pool
+        return req_pool.mamba_pool.mamba2_layer_cache(req_pool.mamba_map[layer_id])
+
     def _state_rows(self) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """(base state rows, per-sequence read offsets) the kernel addresses.
 
@@ -730,7 +739,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         a: torch.Tensor,
         b: torch.Tensor,
     ) -> torch.Tensor:
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        layer_cache = self._layer_state(layer.layer_id)
         conv_state = layer_cache.conv[0]  # [size+1, K-1, 1, dim]
         recurrent_state = layer_cache.temporal  # [size+1, n_v, d_k, d_v]
 

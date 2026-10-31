@@ -559,6 +559,18 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
     return custom_op
 
 
+def _fused_kv_buffer(pool, layer_id: int) -> torch.Tensor:
+    """The kernel's fused KV cache tensor of ``layer_id``."""
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    if isinstance(pool, HybridLinearKVPool):
+        # Skips the pool's per-layer HiCache wait: the forward already waited for
+        # the whole batch, and branching on the counter would guard the graph on it.
+        full_layer_id = pool.full_attention_layer_id_mapping[layer_id]
+        return pool.full_kv_pool.get_fused_kv_buffer(full_layer_id)
+    return pool.get_fused_kv_buffer(layer_id)
+
+
 class BaseTpuPallasRpaAttnBackend(AttentionBackend):
     """Shared SGLang attention backend for the Pallas ragged-paged-attention kernels.
 
@@ -1605,7 +1617,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 )
             q, k, v = _pack_qkv_heads(q, k, v, pack)
 
-        kv_cache = self.token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
+        kv_cache = _fused_kv_buffer(self.token_to_kv_pool, layer.layer_id)
 
         op = self._op
 

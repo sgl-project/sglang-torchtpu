@@ -867,6 +867,16 @@ def _patch_prefill_transfer_finish_from_raiden() -> None:
     )
 
 
+def _install_hybrid_linear_hicache() -> None:
+    """Offload GDN/KDA models' KV and recurrent state through a TPU DMA engine.
+
+    Registers a host stack strategy; see ``hybrid_linear_hicache``.
+    """
+    from sglang_tpu import hybrid_linear_hicache
+
+    hybrid_linear_hicache.install()
+
+
 def _patch_pd_decode_swa_hicache() -> None:
     """Allow PD decode prefix cache + RAM offload on sliding-window models.
 
@@ -974,6 +984,7 @@ def apply_tpu_patches() -> None:
     _patch_raiden_is_load_back_event_done()
     _patch_prefill_transfer_finish_from_raiden()
     _patch_pd_decode_swa_hicache()
+    _install_hybrid_linear_hicache()
     _patch_hicache_write_back_copy_ahead()
     _patch_pd_decode_async_prefill_info()
     from sglang_tpu.benchmark_batch_gate import install as install_benchmark_batch_gate
