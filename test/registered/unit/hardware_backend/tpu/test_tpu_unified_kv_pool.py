@@ -765,7 +765,6 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
                 ("pp_size", 2),
                 ("_tpu_mha_pool_class", lambda: MHATokenToKVPool),
                 ("_tpu_mha_pool_class", lambda: object),
-                ("kv_cache_dtype_str", "mxint8"),
                 ("pool_page_size", 1),
             ):
                 kvc = copy.copy(base)
@@ -924,6 +923,175 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
         self.assertTrue(
             torch.equal(backend._layer_page_indices(4, is_swa_layer=True), sg[1])
         )
+
+    def test_mxint8_unified_blocked_sizing_and_pool(self):
+        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.server_args import ServerArgs
+        from sglang_tpu import tpu_platform
+        from sglang_tpu.kv_mxint8 import (
+            TOKEN_BLOCK,
+            blocked_page_rows,
+            cache_bytes_per_token,
+        )
+        from sglang_tpu.tpu_platform import (
+            _apply_page_size_default,
+            _resolve_unified_kv_pool,
+        )
+
+        class _FakeMXINT8Pool(TpuFusedMHATokenToKVPool):
+            def __init__(
+                self,
+                *args,
+                kv_cache_dtype_str=None,
+                kv_group_size=32,
+                kv_layout="merged",
+                **kw,
+            ):
+                self.kv_cache_dtype_str = kv_cache_dtype_str
+                self.kv_group_size = kv_group_size
+                self.kv_layout = kv_layout
+                super().__init__(*args, **kw)
+
+            def kv_bytes_per_token_per_layer(self, **_):
+                return cache_bytes_per_token(
+                    self.head_num,
+                    self.head_dim,
+                    self.page_size,
+                    group_size=self.kv_group_size,
+                    layout=self.kv_layout,
+                )
+
+            def _create_buffers(self):
+                shape = (
+                    self.num_blocks,
+                    blocked_page_rows(
+                        self.head_num, self.head_dim, self.page_size, self.kv_group_size
+                    ),
+                    TOKEN_BLOCK,
+                )
+                self.kv_buffer = [
+                    torch.zeros(shape, dtype=torch.int8, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+
+            def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+                pages = (indices.cpu() // self.page_size).long()
+                return [b[pages].clone() for b in self.kv_buffer]
+
+            def load_cpu_copy(
+                self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+            ):
+                pages = (indices.cpu() // self.page_size).long()
+                for b, src in zip(self.kv_buffer, kv_cache_cpu):
+                    b[pages] = src
+
+        for ps, expected_bpt in ((128, 160), (256, 144), (512, 136)):
+            kvc = self._make_mock_kvc(
+                full_ids=[0, 1],
+                swa_ids=[2, 3, 4, 5],
+                head_num=1,
+                head_dim=64,
+                swa_head_num=1,
+                swa_head_dim=64,
+                dtype=torch.int8,
+                pool_cls=_FakeMXINT8Pool,
+            )
+            kvc.kv_cache_dtype_str = "mxint8"
+            kvc.kv_group_size = 32
+            kvc.pool_page_size = ps
+            kvc.page_size = ps
+
+            with self._cfg_patches():
+                cfg = TpuUnifiedSWAPoolConfigurator(kvc)
+                self.assertEqual(cfg._full_per_token, expected_bpt)
+                avail = 64 * ps * expected_bpt * 2
+                sized = cfg.calculate_pool_sizes(avail, ps)
+                self.assertEqual(
+                    sized.max_total_num_tokens,
+                    cfg.max_request_tokens(sized.full_max_total_num_tokens, ps),
+                )
+
+            pool = TpuUnifiedSWAKVPool(
+                size=sized.full_max_total_num_tokens,
+                page_size=ps,
+                dtype=torch.int8,
+                full=AttnLayerSpec(head_num=1, head_dim=64, layer_ids=[0, 1]),
+                swa=AttnLayerSpec(head_num=1, head_dim=64, layer_ids=[2, 3, 4, 5]),
+                device="cpu",
+                token_to_kv_pool_class=_FakeMXINT8Pool,
+                pool_kwargs={"kv_cache_dtype_str": "mxint8", "kv_group_size": 32},
+            )
+            self.assertEqual(pool.kv_layout, "blocked")
+            self.assertEqual(
+                sum(pool.get_kv_size_bytes()),
+                (sized.full_max_total_num_tokens // ps + 1) * ps * expected_bpt * 2,
+            )
+            self.assertLessEqual(sum(pool.get_kv_size_bytes()), avail)
+            self.assertEqual(
+                pool.get_fused_kv_buffer(0).data_ptr(),
+                pool.get_fused_kv_buffer(2).data_ptr(),
+            )
+
+            # Verify get_cpu_copy / load_cpu_copy works with an OOT pool overriding get_cpu_copy.
+            mapping = torch.zeros(
+                sized.full_max_total_num_tokens + ps + 1, dtype=torch.int64
+            )
+            mapping[-1] = -1
+            mapping[ps : 2 * ps] = torch.arange(2 * ps, 3 * ps)
+            pool.register_mapping(mapping)
+            pool.swa_group_pages[:, 2] = torch.tensor([5], dtype=torch.int32)
+            pool.get_fused_kv_buffer(0)[1].fill_(7)
+            pool.get_fused_kv_buffer(2)[2].fill_(11)
+            pool.get_fused_kv_buffer(4)[5].fill_(13)
+            saved = pool.get_cpu_copy(torch.tensor([ps]))
+            mapping[3 * ps : 4 * ps] = torch.arange(4 * ps, 5 * ps)
+            pool.swa_group_pages[:, 4] = torch.tensor([6], dtype=torch.int32)
+            pool.load_cpu_copy(saved, torch.tensor([3 * ps]))
+            self.assertTrue(torch.all(pool.get_fused_kv_buffer(0)[3] == 7))
+            self.assertTrue(torch.all(pool.get_fused_kv_buffer(2)[4] == 11))
+            self.assertTrue(torch.all(pool.get_fused_kv_buffer(4)[6] == 13))
+
+        # Invalid blocked page sizes (64, 192, 1024) are rejected in validation.
+        for bad_ps in (64, 192, 1024):
+            bad_kvc = self._make_mock_kvc(
+                full_ids=[0, 1],
+                swa_ids=[2, 3],
+                head_num=1,
+                head_dim=64,
+                swa_head_num=1,
+                swa_head_dim=64,
+                dtype=torch.int8,
+                pool_cls=_FakeMXINT8Pool,
+            )
+            bad_kvc.kv_cache_dtype_str = "mxint8"
+            bad_kvc.pool_page_size = bad_ps
+            bad_kvc.page_size = bad_ps
+            with self._cfg_patches(), self.assertRaises(ValueError):
+                unified_kv_pool_enabled(bad_kvc)
+
+        # Platform defaults promote page_size=None to spec.min_page_size=128 before unified resolution.
+        with patch.object(
+            tpu_platform,
+            "_rpa_kernel_spec",
+            side_effect=lambda b: (
+                types.SimpleNamespace(min_page_size=128)
+                if b == "oot_mxint8_rpa"
+                else None
+            ),
+        ):
+            mx_args = ServerArgs(
+                model_path="dummy",
+                enable_unified_memory=True,
+                attention_backend="oot_mxint8_rpa",
+                kv_cache_dtype="mxint8",
+                page_size=None,
+            )
+            _apply_page_size_default(mx_args)
+            _resolve_unified_kv_pool(mx_args)
+            mx_view = resolving_view(mx_args)
+            self.assertFalse(mx_view.enable_unified_memory)
+            self.assertTrue(unified_kv_pool_requested(mx_args))
+            self.assertEqual(mx_view.page_size, 128)
 
 
 if __name__ == "__main__":
