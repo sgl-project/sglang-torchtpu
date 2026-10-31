@@ -52,6 +52,11 @@ class TpuEnvs:
     # MoE: one fused kernel for single-token packed-MXFP4 decode
     # (moe/pallas/single_token_moe.py); False keeps the gmm_v2 path.
     SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL = EnvBool(True)
+    # Stock NVFP4 Pallas MoE at EP>1: pass the rank's expert-group offset and the
+    # global expert count to the kernel, as the FP8 and W4A16 paths do, instead
+    # of first rewriting topk_ids to local ids with non-local slots dropped (-1,
+    # weight 0). False keeps the rewrite.
+    SGLANG_TPU_FP4_MOE_NATIVE_EP_OFFSET = EnvBool(False)
     # MoE: one kernel streaming the selected FP8 experts' weights for 1..8 tokens
     # (moe/pallas/moe_stream.py); False keeps the gmm_v2 path.
     SGLANG_TPU_ENABLE_STREAMING_MOE_KERNEL = EnvBool(False)
