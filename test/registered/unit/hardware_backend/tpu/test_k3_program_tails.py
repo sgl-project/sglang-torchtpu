@@ -74,6 +74,49 @@ class TestTailIndex(CustomTestCase):
         self.assertIsNone(self.index.lookup(b, PAGE, PAGE + 1000))
 
 
+class TestTailReuse(CustomTestCase):
+    """A session's new tail takes its earlier turn's slot, not another
+    session's live tail."""
+
+    def test_new_turn_replaces_its_earlier_tail(self):
+        index = TailIndex(2, PAGE, ALIGN)
+        a = np.arange(3 * PAGE, dtype=np.int32)
+        b = a + 1_000_000
+        sa = index.record(a, PAGE + 512)  # session a, turn 1
+        sb = index.record(b, PAGE + 512)  # session b, turn 1 (LRU now a)
+        index.begin_step()
+        # Session a's next turn (same floor, further) takes a's slot, not b's.
+        self.assertEqual(index.record(a, PAGE + 2048), sa)
+        index.begin_step()
+        self.assertEqual(index.lookup(b, PAGE, PAGE + 1000), (sb, PAGE + 512))
+        self.assertEqual(index.lookup(a, PAGE, 2 * PAGE), (sa, PAGE + 2048))
+        # A later page: a's tail past the next boundary still replaces a's.
+        index.begin_step()
+        self.assertEqual(index.record(a, 2 * PAGE + 1024), sa)
+        index.begin_step()
+        self.assertEqual(index.lookup(b, PAGE, PAGE + 1000), (sb, PAGE + 512))
+
+    def test_a_diverged_prompt_does_not_replace(self):
+        index = TailIndex(2, PAGE, ALIGN)
+        a = np.arange(3 * PAGE, dtype=np.int32)
+        sa = index.record(a, PAGE + 512)
+        other = a.copy()
+        other[PAGE + 100] += 1  # rewrites inside a's tail
+        index.begin_step()
+        self.assertNotEqual(index.record(other, PAGE + 2048), sa)
+        index.begin_step()
+        self.assertEqual(index.lookup(a, PAGE, PAGE + 1000), (sa, PAGE + 512))
+
+    def test_page_digests_match_one_shot(self):
+        from sglang_tpu.k3_programs.sglang_tails import _digest, _page_digests
+
+        tokens = np.arange(3 * PAGE + 77, dtype=np.int32) * 7
+        digests = _page_digests(tokens, PAGE, 3 * PAGE)
+        self.assertEqual(sorted(digests), [0, PAGE, 2 * PAGE, 3 * PAGE])
+        for floor, digest in digests.items():
+            self.assertEqual(digest, _digest(tokens[:floor]))
+
+
 class StubPrefill:
     """Records step inputs; a request finishing its prompt gets token 77."""
 

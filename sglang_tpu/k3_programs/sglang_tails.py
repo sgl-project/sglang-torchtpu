@@ -37,6 +37,18 @@ def _digest(tokens: np.ndarray) -> bytes:
     ).digest()
 
 
+def _page_digests(tokens: np.ndarray, page: int, upto: int) -> dict[int, bytes]:
+    """``_digest(tokens[:f])`` for every page boundary ``f <= upto``, in one
+    pass over the tokens."""
+    data = np.ascontiguousarray(tokens[:upto], dtype=np.int32)
+    hasher = hashlib.blake2b(digest_size=16)
+    digests = {0: hasher.copy().digest()}
+    for floor in range(page, upto + 1, page):
+        hasher.update(data[floor - page : floor].tobytes())
+        digests[floor] = hasher.copy().digest()
+    return digests
+
+
 @dataclasses.dataclass
 class Tail:
     floor: int  # the page boundary the tail starts at
@@ -46,7 +58,11 @@ class Tail:
 
 
 class TailIndex:
-    """Up to ``slots`` tails, least recently used out first."""
+    """Up to ``slots`` tails. A new tail takes the slot of a tail its prompt
+    extends (the same session's earlier turn, which its next turn no longer
+    needs), else the least recently used: with LRU alone, sessions' turns
+    evicted each other's live tails while superseded ones lingered (124 of
+    1137 turns an hour recomputed up to a page at AgentX concurrency 8)."""
 
     def __init__(self, slots: int, page: int, align: int) -> None:
         if slots < 1 or page % align:
@@ -95,14 +111,17 @@ class TailIndex:
         floor = end // self.page * self.page
         if end == floor:
             return None
-        key = (_digest(prompt[:floor]), floor)
+        digests = _page_digests(prompt, self.page, floor)
+        key = (digests[floor], floor)
         tokens = np.array(prompt[floor:end], dtype=np.int32)
         for t in self._by_key.get(key, ()):
             tail = self._tails[t]
             if tail.end == end and np.array_equal(tail.tokens, tokens):
                 self._lru.move_to_end(t)
                 return None
-        slot = next((t for t in self._lru if t not in self._pinned), None)
+        slot = self._superseded(prompt, digests, end)
+        if slot is None:
+            slot = next((t for t in self._lru if t not in self._pinned), None)
         if slot is None:
             return None
         old = self._tails[slot]
@@ -115,6 +134,25 @@ class TailIndex:
         self._lru.move_to_end(slot)
         self._pinned.add(slot)
         return slot
+
+    def _superseded(
+        self, prompt: np.ndarray, digests: dict[int, bytes], end: int
+    ) -> int | None:
+        """The unpinned tail ``prompt`` extends that ends the furthest (before
+        ``end``), or None."""
+        best = None
+        for t, tail in enumerate(self._tails):
+            if (
+                tail is None
+                or t in self._pinned
+                or tail.end >= end
+                or digests.get(tail.floor) != tail.key[0]
+                or (best is not None and tail.end <= self._tails[best].end)
+            ):
+                continue
+            if np.array_equal(prompt[tail.floor : tail.end], tail.tokens):
+                best = t
+        return best
 
     def drop(self, slot: int) -> None:
         """Forget a tail whose blocks were not written."""
