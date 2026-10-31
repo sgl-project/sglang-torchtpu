@@ -52,7 +52,7 @@ _FULL = {recipe: WORKLOADS for recipe in RECIPES}
 CELLS = {
     "gpt_oss_120b": _FULL,
     "qwen3_coder_480b": _FULL,
-    "muse_spark": {"1host_pc": ("8k1k",)},
+    "muse_spark": {"1host_pc": ("8k1k",), "1host_pc_spec_kvoff": WORKLOADS},
 }
 
 

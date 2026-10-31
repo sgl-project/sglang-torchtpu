@@ -5,9 +5,10 @@
 # run uses identical settings.
 #
 # The matrix (task: "Add more benchmark tests for GPT-OSS models"):
-#   BENCH_MODEL   gpt_oss_120b | qwen3_coder_480b | muse_spark (1host_pc only)
+#   BENCH_MODEL   gpt_oss_120b | qwen3_coder_480b | muse_spark (1host_* only)
 #   BENCH_RECIPE  1host_pc               1 host, tp=8, prefix caching
-#                 1host_pc_spec_kvoff    + EAGLE3 spec + KV offload (raiden)
+#                 1host_pc_spec_kvoff    + spec (EAGLE3, DFlash on Muse) + KV
+#                                        offload (raiden)
 #                 pd_2p2d_pc_spec_kvoff  4 hosts: 2 prefill + 2 decode engines
 #                                        (single-host tp=8 each) over raiden
 #                                        P/D, prefix caching + spec + KV offload
@@ -113,6 +114,12 @@ case "$BENCH_MODEL" in
         # fits with headroom (a "128k" target is unreachable: the last
         # round's output plus rounding must also fit). Requires the enlarged
         # pool in the model fragment (see its sizing comment).
+        LONG_TARGET_CONTEXT=${LONG_TARGET_CONTEXT:-120832}
+        LONG_RAMP_DEFAULT=16384
+        ;;
+    muse_spark)
+        # The same ramp as gpt-oss. c32-long4 peaks at ~0.78M tokens, inside
+        # the 917504 pool. The 256k target of the default arm would not fit.
         LONG_TARGET_CONTEXT=${LONG_TARGET_CONTEXT:-120832}
         LONG_RAMP_DEFAULT=16384
         ;;
@@ -225,8 +232,16 @@ case "$BENCH_MODEL" in
         # recipe/configs/muse_spark/server.py with fp8 KV: experts tensor-parallel
         # over all 8 ranks (ep 1) through the NVFP4 fused-RS kernel.
         MODEL=${MODEL:-$GCS_WEIGHTS_ROOT/Muse-Spark-Open-816B-A42B-NVFP4}
-        # No recipe here drafts for Muse (SPEC_ARGS is EAGLE3), see the recipe check.
-        DRAFT_MODEL=${DRAFT_MODEL:-}
+        DRAFT_MODEL=${DRAFT_MODEL:-$GCS_WEIGHTS_ROOT/Muse-Spark-Open-DFlash2}
+        # The DFlash settings of configs/muse_spark/singlehost_prefix_cache_kv_offload_dflash.py.
+        MODEL_SPEC_ARGS="--speculative-algorithm DFLASH \
+--speculative-draft-model-path $DRAFT_MODEL \
+--speculative-num-draft-tokens 8 \
+--watchdog-timeout 7200"
+        if [[ "$BENCH_RECIPE" == *spec* ]]; then
+            export SGLANG_SPEC_TP_SYNC=${SGLANG_SPEC_TP_SYNC:-rng}
+            export SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=${SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER:-1}
+        fi
         QUANTIZATION=modelopt_fp4
         KV_CACHE_DTYPE=${KV_CACHE_DTYPE-fp8_e4m3}
         ATTENTION_BACKEND=pallas_tpu_rpa_v3
@@ -257,12 +272,12 @@ esac
 # --watchdog-timeout as in the validated spec gates: the verify/draft graph
 # captures keep the scheduler busy past the 300s default, which trips the
 # (soft) watchdog into repeated stack-dump attempts mid-compile.
-SPEC_ARGS="--speculative-algorithm EAGLE3 \
+SPEC_ARGS=${MODEL_SPEC_ARGS:-"--speculative-algorithm EAGLE3 \
 --speculative-draft-model-path $DRAFT_MODEL \
 --speculative-num-steps 3 \
 --speculative-eagle-topk 1 \
 --speculative-num-draft-tokens 4 \
---watchdog-timeout 7200"
+--watchdog-timeout 7200"}
 
 case "$BENCH_RECIPE" in
     1host_pc)
@@ -287,8 +302,8 @@ case "$BENCH_RECIPE" in
         exit 2
         ;;
 esac
-if [[ "$BENCH_MODEL" == "muse_spark" && "$BENCH_RECIPE" != "1host_pc" ]]; then
-    echo "ERROR: muse_spark runs only 1host_pc (its draft is DFlash, SPEC_ARGS is EAGLE3)" >&2
+if [[ "$BENCH_MODEL" == "muse_spark" && "$BENCH_RECIPE" != 1host_* ]]; then
+    echo "ERROR: muse_spark runs only the 1host_* recipes" >&2
     exit 2
 fi
 # Muse shards experts by TP (ep 1), the other models by EP.
@@ -417,7 +432,7 @@ log_config() {
   --- features ---
   prefix_caching         = $([[ "$PREFIX_CACHE" == "1" ]] && echo ENABLED || echo disabled)
   kv_offload (hicache)   = $([[ "$KV_OFFLOAD" == "1" ]] && echo "ENABLED (io=$HICACHE_IO_BACKEND ratio=$HICACHE_RATIO)" || echo disabled)
-  spec_decode (EAGLE3)   = $([[ "$SPEC_DECODE" == "1" ]] && echo "ENABLED (draft=$DRAFT_MODEL)" || echo disabled)
+  spec_decode            = $([[ "$SPEC_DECODE" == "1" ]] && echo "ENABLED (draft=$DRAFT_MODEL)" || echo disabled)
   pd_disaggregation      = $([[ "$PD_DISAGG" == "1" ]] && echo "ENABLED (2P+2D raiden, tp=$TP_SIZE/engine)" || echo disabled)
   --- workload ---
   turn input / output    = $TURN_INPUT_TOKENS / $TURN_OUTPUT_TOKENS tokens

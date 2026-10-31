@@ -32,7 +32,7 @@ is trustworthy at all:
     (multi-turn agentic; a single-turn 8k1k session cannot re-see a prefix,
     so there the rate is recorded but not gated),
   * the server admitted the work without retracting or aborting requests,
-  * EAGLE3 actually drafted, on the recipes that claim it (a spec config
+  * the draft model actually drafted, on the recipes that claim it (a spec config
     that silently fell back to plain decode would benchmark the wrong thing).
 """
 
@@ -508,7 +508,7 @@ def build_bench_test(
         if spec_metrics_url_fn is not None:
 
             def test_spec_decoding_active(self):
-                """The recipe claims EAGLE3; prove drafting actually ran (a
+                """The recipe claims spec; prove drafting actually ran (a
                 silent fallback to plain decode would still pass every other
                 gate while benchmarking the wrong configuration). Oracle: the
                 decoding engine's own sglang:spec_accept_length gauge after
