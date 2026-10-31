@@ -64,6 +64,9 @@
     "deepseek-v3-1": {
       "name": "DeepSeek-V3.1"
     },
+    "deepseek-v4-flash": {
+      "name": "DeepSeek-V4-Flash"
+    },
     "kimi-k2.6": {
       "name": "Kimi-K2.6"
     },
