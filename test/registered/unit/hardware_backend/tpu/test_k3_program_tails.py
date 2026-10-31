@@ -96,6 +96,31 @@ class TestTailReuse(CustomTestCase):
         index.begin_step()
         self.assertEqual(index.lookup(b, PAGE, PAGE + 1000), (sb, PAGE + 512))
 
+    def test_a_turn_replaces_the_tail_it_hit_in_the_same_step(self):
+        index = TailIndex(2, PAGE, ALIGN)
+        a = np.arange(3 * PAGE, dtype=np.int32)
+        b = a + 1_000_000
+        sa = index.record(a, PAGE + 512)
+        sb = index.record(b, PAGE + 512)
+        index.begin_step()
+        # Session a's next turn hits its tail (pinning it), then records its
+        # new tail in the same step: it takes its own tail's slot, not b's.
+        self.assertEqual(index.lookup(a, PAGE, PAGE + 1500), (sa, PAGE + 512))
+        self.assertEqual(index.record(a, PAGE + 2048, own=sa), sa)
+        index.begin_step()
+        self.assertEqual(index.lookup(b, PAGE, PAGE + 1000), (sb, PAGE + 512))
+
+    def test_a_tail_another_request_reads_is_not_replaced(self):
+        index = TailIndex(3, PAGE, ALIGN)
+        a = np.arange(3 * PAGE, dtype=np.int32)
+        sa = index.record(a, PAGE + 512)
+        index.begin_step()
+        # Two requests of one batch hit the same tail; the first one's new
+        # tail must not take the slot the second still reads.
+        self.assertEqual(index.lookup(a, PAGE, PAGE + 1500), (sa, PAGE + 512))
+        self.assertEqual(index.lookup(a, PAGE, PAGE + 1500), (sa, PAGE + 512))
+        self.assertNotEqual(index.record(a, PAGE + 2048, own=sa), sa)
+
     def test_a_diverged_prompt_does_not_replace(self):
         index = TailIndex(2, PAGE, ALIGN)
         a = np.arange(3 * PAGE, dtype=np.int32)

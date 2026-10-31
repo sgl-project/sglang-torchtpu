@@ -73,11 +73,12 @@ class TailIndex:
         self._lru: collections.OrderedDict[int, None] = collections.OrderedDict(
             (t, None) for t in range(slots)
         )
-        self._pinned: set[int] = set()
+        # Tails the batch reads or writes, with how many of its requests do.
+        self._pinned: collections.Counter[int] = collections.Counter()
 
     def begin_step(self) -> None:
         """A new batch: tails it reads are pinned until the next one."""
-        self._pinned = set()
+        self._pinned = collections.Counter()
 
     def lookup(
         self, prompt: np.ndarray, hit: int, limit: int
@@ -95,15 +96,20 @@ class TailIndex:
                 if np.array_equal(prompt[hit : hit + n], tail.tokens):
                     best = (t, tail.end)
         if best is not None:
-            self._pinned.add(best[0])
+            self._pinned[best[0]] += 1
             self._lru.move_to_end(best[0])
         return best
 
-    def record(self, prompt: np.ndarray, end: int) -> int | None:
+    def record(
+        self, prompt: np.ndarray, end: int, own: int | None = None
+    ) -> int | None:
         """A slot for the tail of ``prompt`` ending at ``end`` (a multiple of
         the alignment past its last page boundary), or None when there is
         nothing to keep: no tokens past the boundary, or that tail already
-        kept (refreshed)."""
+        kept (refreshed). ``own``: the tail this request's lookup hit in the
+        same batch, which its new tail may replace (the program reads the hit
+        state inside the step, before any checkpoint write, and the tail
+        copies run after it) unless another request of the batch reads it."""
         if end % self.align:
             raise ValueError(
                 f"a tail ends on the {self.align}-token alignment, not {end}"
@@ -119,7 +125,7 @@ class TailIndex:
             if tail.end == end and np.array_equal(tail.tokens, tokens):
                 self._lru.move_to_end(t)
                 return None
-        slot = self._superseded(prompt, digests, end)
+        slot = self._superseded(prompt, digests, end, own)
         if slot is None:
             slot = next((t for t in self._lru if t not in self._pinned), None)
         if slot is None:
@@ -132,19 +138,24 @@ class TailIndex:
         self._tails[slot] = Tail(floor, end, tokens, key)
         self._by_key[key].add(slot)
         self._lru.move_to_end(slot)
-        self._pinned.add(slot)
+        self._pinned[slot] += 1
         return slot
 
     def _superseded(
-        self, prompt: np.ndarray, digests: dict[int, bytes], end: int
+        self,
+        prompt: np.ndarray,
+        digests: dict[int, bytes],
+        end: int,
+        own: int | None,
     ) -> int | None:
-        """The unpinned tail ``prompt`` extends that ends the furthest (before
-        ``end``), or None."""
+        """The tail ``prompt`` extends that ends the furthest (before
+        ``end``), unpinned or pinned only by ``own``'s lookup, or None."""
         best = None
         for t, tail in enumerate(self._tails):
+            pinned = self._pinned[t] - (1 if t == own else 0)
             if (
                 tail is None
-                or t in self._pinned
+                or pinned > 0
                 or tail.end >= end
                 or digests.get(tail.floor) != tail.key[0]
                 or (best is not None and tail.end <= self._tails[best].end)

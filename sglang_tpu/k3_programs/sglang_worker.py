@@ -515,11 +515,13 @@ class PrefillSteps:
             prompt = self._prompts.get(req)
             computed, end = int(prefix), int(prefix) + int(extend)
             columns = []
+            hit_tail = None
             if tails is not None and req.rid not in self._live:
                 limit = min(end - 1, len(prompt) - 1) // align * align
                 hit = tails.lookup(prompt, computed, limit)
                 if hit is not None:
                     tail, tail_end = hit
+                    hit_tail = tail
                     page_block = (
                         int(starts[req.kv.req_pool_idx][computed // page]) // page
                     )
@@ -531,7 +533,7 @@ class PrefillSteps:
             if tails is not None and end == len(prompt):
                 tail_end = end // align * align
                 if tail_end > end // page * page and tail_end > computed:
-                    tail = tails.record(prompt, tail_end)
+                    tail = tails.record(prompt, tail_end, own=hit_tail)
                     if tail is not None:
                         cut = (tail_end, tail)
             if cut is None:
