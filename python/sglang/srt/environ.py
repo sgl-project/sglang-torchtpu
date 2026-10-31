@@ -668,6 +668,10 @@ class Envs:
     # Decode steps before the next chunk of a prompt left mid-prefill; unset waits the full
     # --prefill-decode-interval, so a long prompt's TTFT grows by one interval per chunk.
     SGLANG_PREFILL_DECODE_INTERVAL_CHUNKED = EnvInt(None)
+    # "TARGET:MIN": while fewer than TARGET requests decode and prefill work waits, the
+    # --prefill-decode-interval ends after MIN decode steps, so admission fills the decode
+    # batch; at TARGET or more running the full interval applies. Admission order is unchanged.
+    SGLANG_PREFILL_DECODE_INTERVAL_ADAPTIVE = EnvStr(None)
     # Force delay_sample_func for all overlap decode (not just grammar mode),
     # allowing CPU result processing to overlap with subsequent forward computation
     # and reducing the impact of sampling overhead on the critical path.

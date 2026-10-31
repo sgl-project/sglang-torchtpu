@@ -440,6 +440,25 @@ def _accumulate_decode_moment(
     totals[5] += g
 
 
+def _parse_prefill_decode_interval_adaptive(
+    value: Optional[str],
+) -> Optional[tuple[int, int]]:
+    """Parse SGLANG_PREFILL_DECODE_INTERVAL_ADAPTIVE="TARGET:MIN" into (TARGET, MIN)."""
+    if not value:
+        return None
+    try:
+        target, min_steps = (int(x) for x in value.split(":"))
+    except ValueError:
+        raise ValueError(
+            f"SGLANG_PREFILL_DECODE_INTERVAL_ADAPTIVE must be TARGET:MIN, got {value!r}"
+        ) from None
+    if target < 1 or min_steps < 0:
+        raise ValueError(
+            f"SGLANG_PREFILL_DECODE_INTERVAL_ADAPTIVE needs TARGET >= 1 and MIN >= 0, got {value!r}"
+        )
+    return target, min_steps
+
+
 _is_npu = is_npu()
 _is_hip = is_hip()
 
@@ -1363,6 +1382,23 @@ class Scheduler(
         self.prefill_decode_interval_chunked = (
             None if self.require_mlp_sync else envs.SGLANG_PREFILL_DECODE_INTERVAL_CHUNKED.get()
         )
+        # Like skip-idle, the adaptive interval reads this rank's running batch and queue.
+        self._prefill_decode_interval_elapsed = 0
+        self.prefill_decode_interval_adaptive = (
+            None
+            if self.require_mlp_sync
+            else _parse_prefill_decode_interval_adaptive(
+                envs.SGLANG_PREFILL_DECODE_INTERVAL_ADAPTIVE.get()
+            )
+        )
+        if self.prefill_decode_interval_adaptive is not None:
+            logger.info(
+                "Adaptive prefill-decode interval: %d decode steps while fewer than %d "
+                "requests decode and prefill work waits, else %d",
+                self.prefill_decode_interval_adaptive[1],
+                self.prefill_decode_interval_adaptive[0],
+                self.prefill_decode_interval,
+            )
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -1422,8 +1458,19 @@ class Scheduler(
         if self.prefill_decode_interval_skip_idle and running_batch.is_empty():
             self._prefill_decode_interval_remaining = 0
             return False
+        if self.prefill_decode_interval_adaptive is not None:
+            target, min_steps = self.prefill_decode_interval_adaptive
+            # A prompt left mid-prefill is waiting prefill work too.
+            if (
+                self._prefill_decode_interval_elapsed >= min_steps
+                and running_batch.batch_size() < target
+                and (self.waiting_queue or self.chunked_req is not None)
+            ):
+                self._prefill_decode_interval_remaining = 0
+                return False
 
         self._prefill_decode_interval_remaining -= 1
+        self._prefill_decode_interval_elapsed += 1
         return True
 
     def _arm_prefill_decode_interval(self, batch: Optional[ScheduleBatch]) -> None:
@@ -1445,6 +1492,7 @@ class Scheduler(
                 and self.chunked_req is not None
                 else self.prefill_decode_interval
             )
+            self._prefill_decode_interval_elapsed = 0
 
     def init_metrics_reporter(self) -> None:
         # Override point for deployments that need a specialized reporter.
