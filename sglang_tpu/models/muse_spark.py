@@ -18,6 +18,7 @@ weights are skipped.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -38,9 +39,10 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod, fp8_dtype
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptQuantConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -52,6 +54,12 @@ from sglang.srt.utils import add_prefix
 from sglang_tpu.envs import envs as tpu_envs
 
 logger = logging.getLogger(__name__)
+
+
+def _free_replaced_storage(old: torch.Tensor, new: torch.Tensor) -> None:
+    if old.untyped_storage().data_ptr() != new.untyped_storage().data_ptr():
+        old.untyped_storage().resize_(0)
+
 
 # Everything else in the checkpoint belongs to the vision and audio towers.
 _TEXT_PREFIX = "model.language_model."
@@ -322,6 +330,94 @@ def _uses_quantized_experts(
     )
 
 
+class _HostQuantizedFp8MoEMethod(Fp8MoEMethod):
+    """Per-expert dynamic FP8 MoE whose BF16 checkpoint weights are quantized on
+    host during streaming load so single-device PP stages never hold both the
+    BF16 and FP8 expert stacks in HBM."""
+
+    def create_weights(
+        self,
+        layer: nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        with_bias: bool = False,
+        **extra_weight_attrs,
+    ):
+        super().create_weights(
+            layer=layer,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            params_dtype=fp8_dtype,
+            with_bias=with_bias,
+            **extra_weight_attrs,
+        )
+        old_w13_scale = layer.w13_weight_scale.data
+        copy_or_rebind_param(
+            layer,
+            "w13_weight_scale",
+            torch.ones(
+                num_experts,
+                dtype=torch.float32,
+                device=layer.w13_weight.device,
+            ),
+        )
+        _free_replaced_storage(old_w13_scale, layer.w13_weight_scale.data)
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        from sglang.srt.layers.moe import get_moe_runner_backend
+        from sglang_tpu.fp8_moe import prepare_tpu_fp8_moe_weights
+
+        prepare_tpu_fp8_moe_weights(
+            layer,
+            block_quant=False,
+            weight_block_size=None,
+            use_mxfp8=False,
+            is_fp4_expert=False,
+        )
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_auto() or moe_runner_backend.is_pallas_tpu_fused_rs():
+            from sglang_tpu.fp8_moe_fused_rs import prepare_fp8_fused_rs
+
+            self.handles_moe_reduction = prepare_fp8_fused_rs(layer)
+            if self.handles_moe_reduction and get_parallel().tp_rank == 0:
+                logger.info_once("Using TPU Pallas FP8 fused-RS MoE backend")
+            if (
+                moe_runner_backend.is_pallas_tpu_fused_rs()
+                and not self.handles_moe_reduction
+            ):
+                reason = getattr(
+                    layer,
+                    "_tpu_fused_rs_unsupported_reason",
+                    "unknown incompatibility",
+                )
+                raise ValueError(
+                    "--moe-runner-backend pallas_tpu_fused_rs is not supported by "
+                    f"this model or parallel layout: {reason}"
+                )
+        if hasattr(layer, "dispatcher"):
+            layer.dispatcher.set_quant_config(
+                {
+                    "weight_dtype": layer.w13_weight.dtype,
+                    "use_mxfp8": False,
+                }
+            )
+
+
+class _HostQuantizedFp8Config(Fp8Config):
+    """FP8 config that binds ``_HostQuantizedFp8MoEMethod`` onto ``FusedMoE``."""
+
+    def __init__(self):
+        super().__init__(is_checkpoint_fp8_serialized=False)
+
+    def get_quant_method(self, layer: nn.Module, prefix: str):
+        if isinstance(layer, FusedMoE):
+            return _HostQuantizedFp8MoEMethod(self)
+        return super().get_quant_method(layer, prefix)
+
+
 class MuseSparkMoE(nn.Module):
     def __init__(
         self,
@@ -412,13 +508,12 @@ class MuseSparkMoE(nn.Module):
             layer_id=layer_idx,
             top_k=self.top_k,
             reduce_results=False,
-            # BF16 experts are quantized to FP8 at load: the BF16 grouped GEMM in
-            # the same executable as fused-RS and the distributed TopK sampler
-            # core-halts the TPU at startup.
+            # BF16 experts are quantized to FP8 on host during load: the BF16
+            # grouped GEMM in the same executable as fused-RS and the distributed
+            # TopK sampler core-halts the TPU at startup, and streaming directly
+            # into FP8 avoids holding a 12 GiB BF16 stack on single-device PP stages.
             quant_config=(
-                quant_config
-                if self.quantized_experts
-                else Fp8Config(is_checkpoint_fp8_serialized=False)
+                quant_config if self.quantized_experts else _HostQuantizedFp8Config()
             ),
             prefix=experts_prefix,
             activation="silu",
@@ -728,13 +823,20 @@ class MuseSparkForConditionalGeneration(nn.Module):
         self.model.layers_to_capture = list(layer_ids)
 
     def _load_expert_stack(
-        self, param: torch.Tensor, loaded_weight: torch.Tensor, name: str
-    ) -> None:
+        self,
+        params: dict,
+        param: torch.Tensor,
+        loaded_weight: torch.Tensor,
+        name: str,
+    ) -> Optional[str]:
         """Copy this rank's slice of a ``[num_experts, ...]`` expert tensor.
 
         EP slices whole experts. Expert TP slices the intermediate dim: rows of
         each gate/up half of ``w13*`` (``[E, 2I, ...]``) and the last dim of
-        ``w2*`` (``[E, H, I/pack]``).
+        ``w2*`` (``[E, H, I/pack]``). Unquantized BF16 expert stacks are
+        quantized to per-expert FP8 on the host before upload so single-device
+        PP stages never materialize a 12 GiB BF16 stack or lazy slice-scatter
+        chain in HBM.
         """
         parallel = get_parallel()
         num_experts = loaded_weight.shape[0]
@@ -764,7 +866,67 @@ class MuseSparkForConditionalGeneration(nn.Module):
                 f"Expert tensor {name}: parameter {tuple(param.shape)} vs "
                 f"checkpoint slice {tuple(local.shape)}"
             )
-        param.data.copy_(local.to(param.dtype))
+        device, dtype = param.device, param.dtype
+        old = param.data
+        param.data = torch.empty(0, dtype=dtype, device=device)
+        _free_replaced_storage(old, param.data)
+
+        per_expert_bytes = max(
+            1, local[0].numel() * max(param.element_size(), local.element_size())
+        )
+        step = max(1, (256 << 20) // per_expert_bytes)
+        if dtype == fp8_dtype and local.dtype != fp8_dtype:
+            fp8_max = torch.finfo(fp8_dtype).max
+            chunks: list[torch.Tensor] = []
+            scale_chunks: list[torch.Tensor] = []
+            prev_threads = torch.get_num_threads()
+            host_cpus = os.cpu_count() or 8
+            active_ranks = min(host_cpus, max(1, parallel.tp_size, parallel.pp_size))
+            torch.set_num_threads(max(1, host_cpus // active_ranks))
+            try:
+                for start in range(0, local.shape[0], step):
+                    src = local[start : start + step].detach().cpu()
+                    scales = (
+                        src.abs().amax(dim=(1, 2)).to(torch.float32).clamp(min=1e-12)
+                        / fp8_max
+                    )
+                    qchunk = (
+                        (src / scales[:, None, None])
+                        .clamp(min=-fp8_max, max=fp8_max)
+                        .to(fp8_dtype)
+                    )
+                    chunks.append(qchunk.to(device=device, copy=True))
+                    scale_chunks.append(scales)
+            finally:
+                torch.set_num_threads(prev_threads)
+            param.data = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
+            del chunks
+            scale_name = f"{name}_scale"
+            scale_param = params[scale_name]
+            old_scale = scale_param.data
+            scale_param.data = torch.empty(0, dtype=scale_param.dtype, device=device)
+            _free_replaced_storage(old_scale, scale_param.data)
+            scale_param.data = torch.cat(scale_chunks, dim=0).to(
+                device=device, dtype=scale_param.dtype, copy=True
+            )
+            del scale_chunks
+            if device.type == "tpu":
+                from torch_tpu._internal.sync.sync import synchronize
+
+                synchronize([param.data, scale_param.data], wait=True)
+            return scale_name
+
+        chunks = [
+            local[start : start + step].to(device=device, dtype=dtype, copy=True)
+            for start in range(0, local.shape[0], step)
+        ]
+        param.data = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
+        del chunks
+        if device.type == "tpu":
+            from torch_tpu._internal.sync.sync import synchronize
+
+            synchronize([param.data], wait=True)
+        return None
 
     def _is_online_quant_scale(self, name: str) -> bool:
         """Scales that online FP8 quantization creates for the BF16 experts."""
@@ -817,7 +979,9 @@ class MuseSparkForConditionalGeneration(nn.Module):
                     f"Checkpoint tensor {checkpoint_name} has no model parameter"
                 )
             if ".experts.w" in name:
-                self._load_expert_stack(param, loaded_weight, name)
+                scale_name = self._load_expert_stack(params, param, loaded_weight, name)
+                if scale_name is not None:
+                    loaded.add(scale_name)
             else:
                 loader = getattr(param, "weight_loader", default_weight_loader)
                 loader(param, loaded_weight)
