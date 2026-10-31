@@ -960,10 +960,17 @@ class KimiDecoder:
                     time.perf_counter() - started,
                 )
 
+        # Batches past the speculation schedule step plainly in serving, the
+        # device's plan kept from step to step (the step then takes its
+        # control from the previous step, not from the plan splice).
+        plain_from = max(self.spec_batches, default=0) if self.draft is not None else 0
+
         def plain(sampled: bool, masked: bool = False) -> None:
-            outs = [
-                plain_step(batch, sampled, masked) for batch in self.ops.batch_sizes
-            ]
+            outs = []
+            for batch in self.ops.batch_sizes:
+                outs.append(plain_step(batch, sampled, masked))
+                if batch > plain_from and not masked:
+                    outs.append(plain_step(batch, sampled))
             for emitted in outs:
                 materialize(emitted)
 
