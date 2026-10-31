@@ -531,6 +531,28 @@ class TestMuseSparkPipelineParallel(CustomTestCase):
         )
         self.assertIsInstance(dec_proxy, PPProxyTensors)
 
+    def test_server_pp8_recipe_validates_under_launch_server(self):
+        import pathlib
+        import sys
+
+        repo_root = str(pathlib.Path(__file__).resolve().parents[5])
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+
+        from benchmark.tpu.launch_server import load_recipe, plan_launch
+
+        plan = plan_launch(
+            load_recipe("recipe/configs/muse_spark/server_pp8.py"),
+            inherited={},
+        )
+        self.assertEqual(plan.config.server_args["tp_size"], 1)
+        self.assertEqual(plan.config.server_args["pp_size"], 8)
+        self.assertEqual(plan.config.server_args["ep_size"], 1)
+        self.assertEqual(plan.config.server_args["quantization"], "modelopt_fp4")
+        self.assertEqual(plan.config.server_args["moe_runner_backend"], "auto")
+        self.assertTrue(plan.config.server_args["disable_overlap_schedule"])
+        self.assertEqual(plan.env["SGLANG_PP_LAYER_PARTITION"], "7,8,8,8,8,8,8,7")
+
 
 if __name__ == "__main__":
     unittest.main()
