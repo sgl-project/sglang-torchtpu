@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU tests for sglang_tpu's MiniMax H3 patches (sglang_tpu.multimodal_gen.minimax_h3)."""
+"""Tests for sglang_tpu's MiniMax H3 patches (sglang_tpu.multimodal_gen.minimax_h3)."""
 
 import contextlib
 import os
-import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -30,20 +29,12 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.multimodal_gen import minimax_h3
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
-
-_REPO_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, os.pardir, os.pardir)
-)
-
-# The CPU gate installs python/ only; an installed sglang_tpu still wins.
-if _REPO_ROOT not in sys.path:
-    sys.path.append(_REPO_ROOT)
-
-from sglang_tpu.multimodal_gen import minimax_h3  # noqa: E402
+# The TPU lane installs the diffusion_tpu extras (cache-dit) the H3 DiT imports.
+register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit", chips=1)
 
 _BUILDERS = ("minimax_h3_packed_sequence", "minimax_h3_packed_sequence_ref2va_blocks")
 
