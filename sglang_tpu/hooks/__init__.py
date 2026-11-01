@@ -40,6 +40,10 @@ from sglang_tpu.hooks.glm_flash_megakernel import (
 )
 from sglang_tpu.hooks.hicache_swa_metrics import hook_specs as hicache_swa_metrics_hooks
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
+from sglang_tpu.hooks.host_weight_feeder import (
+    weight_feeder_load_local_weights,
+    weight_feeder_prefetch,
+)
 from sglang_tpu.hooks.k3_megakernel import (
     attach_k3_megakernel,
     k3_megakernel_forward,
@@ -147,6 +151,21 @@ HOOKS: list[tuple] = [
         "sglang.srt.models.kimi_k3.KimiK3LinearModel.__init__",
         register_attn_residual_ops,
         HookType.AFTER,
+    ),
+    (
+        "sglang.srt.entrypoints.engine.Engine._launch_scheduler_processes",
+        weight_feeder_prefetch,
+        HookType.BEFORE,
+    ),
+    (
+        "sglang.srt.model_loader.loader.safetensors_weights_iterator",
+        weight_feeder_load_local_weights,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.model_loader.loader.buffered_multi_thread_safetensors_weights_iterator",
+        weight_feeder_load_local_weights,
+        HookType.AROUND,
     ),
     (
         "sglang.srt.models.kimi_k3.make_pp_layers",
