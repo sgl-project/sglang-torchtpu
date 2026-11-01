@@ -45,7 +45,13 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.observability.compile_timing import CompileTimingRecorder
-from sglang.srt.runtime_context import get_context, get_disagg, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_context,
+    get_disagg,
+    get_flags,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.eagle_info import (
@@ -65,10 +71,13 @@ from sglang_tpu.compilation.compiled_forward_shim import (
     _dp_attn_compute_padding,
 )
 from sglang_tpu.compilation.decoder_compile_policy import (
+    CompiledAttnFamily,
     DecoderTpuCompilePolicy,
     Qwen3VLDecoderTpuCompilePolicy,
+    _build_compile_grid_limits,
     _materialize_out,
     _unpad_decoder_outputs,
+    compiled_attention_row_families,
 )
 from sglang_tpu.compilation.hybrid_linear_direct_compile import bind_traced_conv_weights
 from sglang_tpu.compilation.pending_call import PendingCall
@@ -942,7 +951,12 @@ class TestInstallExtendCap(_PolicyTestCase):
         policy = self._install_policy(prefill_max_requests=16, dp_attention=True)
         self.assertEqual(policy.extend_bs, 64)
 
-    def test_context_length_does_not_cap_aggregate_chunked_prefill(self):
+    def _install_with_compile_tokens(
+        self,
+        *,
+        tpu_compile_tokens: list[int],
+        tpu_compile_bs: list[int] | None = None,
+    ) -> DecoderTpuCompilePolicy:
         model = SimpleNamespace(
             forward=MagicMock(),
             prepare_forward_batch=MagicMock(),
@@ -957,8 +971,8 @@ class TestInstallExtendCap(_PolicyTestCase):
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 prefill_max_requests=16,
-                tpu_compile_tokens=[1024, 4096, 8192],
-                tpu_compile_bs=[16],
+                tpu_compile_tokens=tpu_compile_tokens,
+                tpu_compile_bs=tpu_compile_bs,
                 unsafe_save_torch_compile_bundle=None,
                 unsafe_load_torch_compile_bundle=None,
             ),
@@ -974,19 +988,34 @@ class TestInstallExtendCap(_PolicyTestCase):
         policy.backend = "eager"
 
         with (
-            patch(
-                "sglang_tpu.compilation.decoder_compile_policy.is_dp_attention_enabled",
-                return_value=False,
-            ),
+            get_flags().dp.override(enabled=False),
             patch(
                 "sglang_tpu.compilation.decoder_compile_policy.torch.compile",
                 return_value=MagicMock(),
             ),
         ):
             self.assertTrue(policy.install())
+        return policy
 
+    def test_context_length_does_not_cap_aggregate_chunked_prefill(self):
+        policy = self._install_with_compile_tokens(
+            tpu_compile_tokens=[1024, 4096, 8192],
+            tpu_compile_bs=[16],
+        )
         self.assertEqual(policy.t_bucketer.buckets, [1024, 4096, 8192])
         self.assertEqual(policy.t_bucketer.next_bucket(8192), 8192)
+
+    def test_install_warns_for_dropped_compile_tokens(self):
+        with self.assertLogs(
+            "sglang_tpu.compilation.compiled_forward_shim", level="WARNING"
+        ) as logs:
+            policy = self._install_with_compile_tokens(
+                tpu_compile_tokens=[1024, 4096, 8192, 16384],
+            )
+        self.assertEqual(policy.t_bucketer.buckets, [1024, 4096, 8192])
+        self.assertTrue(
+            any("Dropping --tpu-compile-tokens [16384]" in m for m in logs.output)
+        )
 
     def test_target_model_keeps_outer_compile_boundary(self):
         original_outer = MagicMock(name="outer_forward")
@@ -2155,6 +2184,251 @@ class TestPrecompileLoops(_PolicyTestCase):
             policy.precompile()
         # EXTEND: (8,4), (64,4) = 2. DECODE: (1,1), (4,4) = 2.
         self.assertEqual(mr.model.forward.call_count, 4)
+
+
+class TestCompiledAttentionRowFamilies(_PolicyTestCase):
+    def _parallel_override(self, *, tp: int = 8, cp: int = 1, dp: int = 1):
+        return get_parallel().override(
+            tp_size=tp,
+            tp_rank=0,
+            attn_tp_size=tp // (dp * cp),
+            attn_tp_rank=0,
+            attn_dp_size=dp,
+            attn_dp_rank=0,
+            attn_dp_enabled=dp > 1,
+            attn_cp_size=cp,
+            attn_cp_rank=0,
+            moe_tp_size=tp // cp,
+            moe_tp_rank=0,
+            moe_dp_size=cp,
+            moe_ep_size=1,
+        )
+
+    def _assert_matches_precompile(
+        self, *, cp: int = 1, dp: int = 1, **server_args
+    ) -> None:
+        with (
+            get_context().override_server_args(
+                chunked_prefill_size=4096,
+                max_prefill_tokens=4096,
+                **server_args,
+            ),
+            self._parallel_override(tp=8, cp=cp, dp=dp),
+            patch(
+                _CP_STRATEGY_PATH,
+                return_value=(_CP_STRATEGY if cp > 1 else None),
+            ),
+        ):
+            families = compiled_attention_row_families(context_len=4096)
+            t_b, b_b, extend_bs, _ = _build_compile_grid_limits(context_len=4096)
+            mr = _model_runner()
+            policy = DecoderTpuCompilePolicy(
+                model_runner=mr,
+                t_bucketer=t_b,
+                b_bucketer=b_b,
+                owner=mr.model,
+            )
+            policy.extend_bs = extend_bs
+            policy._run_one = MagicMock(
+                side_effect=lambda **kw: policy._compiled_extend_variants.add(
+                    kw.get("variant", "plain")
+                )
+            )
+            policy.precompile()
+            warmed_rows = [
+                (
+                    2 * c.kwargs["bs"]
+                    if c.kwargs.get("variant") == "cp"
+                    else c.kwargs["bs"]
+                )
+                for c in policy._run_one.call_args_list
+            ]
+            self.assertEqual(max(f.rows for f in families), max(warmed_rows))
+
+    def test_disabled_compile_returns_no_families_unless_bs_list_set(self):
+        with get_context().override_server_args(
+            torch_compile_max_bs=0, tpu_compile_bs=None
+        ):
+            self.assertEqual(compiled_attention_row_families(context_len=4096), ())
+        with get_context().override_server_args(
+            torch_compile_max_bs=0, tpu_compile_bs=[1, 8]
+        ):
+            self.assertEqual(
+                compiled_attention_row_families(context_len=4096),
+                (
+                    CompiledAttnFamily(
+                        rows=8, rows_per_req=1, limit_flag="--max-running-requests"
+                    ),
+                ),
+            )
+
+    def test_decode_mode_ignores_prefill_cap_and_cp(self):
+        with (
+            get_context().override_server_args(
+                disaggregation_mode="decode",
+                torch_compile_max_bs=32,
+                prefill_max_requests=4,
+            ),
+            self._parallel_override(tp=4, cp=2),
+        ):
+            self.assertEqual(
+                compiled_attention_row_families(context_len=4096),
+                (
+                    CompiledAttnFamily(
+                        rows=32, rows_per_req=1, limit_flag="--max-running-requests"
+                    ),
+                ),
+            )
+
+    def test_explicit_bs_list_overrides_cap_without_drop_warning(self):
+        with (
+            get_context().override_server_args(
+                disaggregation_mode="prefill",
+                torch_compile_max_bs=16,
+                tpu_compile_bs=[1, 8, 24],
+                tpu_compile_tokens=[64, 512, 4096],
+                prefill_max_requests=20,
+                chunked_prefill_size=512,
+                max_prefill_tokens=512,
+            ),
+            self.assertNoLogs(
+                "sglang_tpu.compilation.compiled_forward_shim", level="WARNING"
+            ),
+        ):
+            self.assertEqual(
+                compiled_attention_row_families(context_len=512),
+                (
+                    CompiledAttnFamily(
+                        rows=20, rows_per_req=1, limit_flag="--prefill-max-requests"
+                    ),
+                ),
+            )
+
+    def test_prefill_mixed_chunk_or_dp_bounds_by_max_running_requests(self):
+        for label, extra_args, extra_ctx in (
+            ("mixed_chunk", dict(enable_mixed_chunk=True), contextlib.nullcontext()),
+            ("dp_flag", {}, get_flags().dp.override(enabled=True)),
+            ("dp_parallel", {}, self._parallel_override(tp=8, dp=2)),
+        ):
+            with (
+                self.subTest(case=label),
+                get_context().override_server_args(
+                    disaggregation_mode="prefill",
+                    torch_compile_max_bs=32,
+                    prefill_max_requests=8,
+                    chunked_prefill_size=4096,
+                    max_prefill_tokens=4096,
+                    **extra_args,
+                ),
+                extra_ctx,
+            ):
+                self.assertEqual(
+                    compiled_attention_row_families(context_len=4096),
+                    (
+                        CompiledAttnFamily(
+                            rows=32,
+                            rows_per_req=1,
+                            limit_flag="--max-running-requests",
+                        ),
+                    ),
+                )
+
+    def test_colocated_cp_flag_follows_prefill_cap(self):
+        for pmr, expected_cp_rows, expected_cp_flag in (
+            (40, 80, "--prefill-max-requests"),
+            (None, 128, "--max-running-requests"),
+        ):
+            with (
+                self.subTest(prefill_max_requests=pmr),
+                get_context().override_server_args(
+                    torch_compile_max_bs=64,
+                    prefill_max_requests=pmr,
+                    chunked_prefill_size=4096,
+                    max_prefill_tokens=4096,
+                ),
+                self._parallel_override(tp=8, cp=2),
+            ):
+                self.assertEqual(
+                    compiled_attention_row_families(context_len=4096),
+                    (
+                        CompiledAttnFamily(
+                            rows=expected_cp_rows,
+                            rows_per_req=2,
+                            limit_flag=expected_cp_flag,
+                        ),
+                        CompiledAttnFamily(
+                            rows=64,
+                            rows_per_req=1,
+                            limit_flag="--max-running-requests",
+                        ),
+                    ),
+                )
+
+    def test_matches_precompile_max_attention_rows(self):
+        """``compiled_attention_row_families`` agrees with the max attention rows
+        ``DecoderTpuCompilePolicy.precompile`` actually warms in every mode."""
+        for label, kwargs in (
+            ("colocated", dict(torch_compile_max_bs=32, prefill_max_requests=8)),
+            (
+                "prefill_pmr",
+                dict(
+                    disaggregation_mode="prefill",
+                    torch_compile_max_bs=32,
+                    prefill_max_requests=8,
+                ),
+            ),
+            (
+                "prefill_mixed_chunk",
+                dict(
+                    disaggregation_mode="prefill",
+                    torch_compile_max_bs=32,
+                    prefill_max_requests=8,
+                    enable_mixed_chunk=True,
+                ),
+            ),
+            (
+                "prefill_dp",
+                dict(
+                    disaggregation_mode="prefill",
+                    torch_compile_max_bs=32,
+                    prefill_max_requests=8,
+                    dp=2,
+                ),
+            ),
+            (
+                "decode_cp_ignored",
+                dict(
+                    disaggregation_mode="decode",
+                    torch_compile_max_bs=32,
+                    prefill_max_requests=4,
+                    cp=2,
+                ),
+            ),
+            (
+                "colocated_cp",
+                dict(torch_compile_max_bs=32, prefill_max_requests=20, cp=2),
+            ),
+            ("colocated_cp_unset_pmr", dict(torch_compile_max_bs=32, cp=2)),
+            (
+                "prefill_cp",
+                dict(
+                    disaggregation_mode="prefill",
+                    torch_compile_max_bs=32,
+                    prefill_max_requests=12,
+                    cp=2,
+                ),
+            ),
+            (
+                "explicit_bs_buckets",
+                dict(
+                    torch_compile_max_bs=16,
+                    tpu_compile_bs=[1, 8, 24],
+                    prefill_max_requests=20,
+                ),
+            ),
+        ):
+            with self.subTest(case=label):
+                self._assert_matches_precompile(**kwargs)
 
 
 class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):

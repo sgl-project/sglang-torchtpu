@@ -145,6 +145,106 @@ def max_extend_tokens(*, context_len: int) -> int:
     )
 
 
+class CompiledAttnFamily(msgspec.Struct, frozen=True):
+    """One compiled attention batch family and the CLI flag bounding its rows."""
+
+    rows: int
+    rows_per_req: int
+    limit_flag: Literal["--max-running-requests", "--prefill-max-requests"]
+
+
+def attention_dp_enabled() -> bool:
+    """Whether attention DP is active in the runtime flags or published config."""
+    return is_dp_attention_enabled() or get_parallel().attn_dp_enabled
+
+
+def _build_compile_grid_limits(
+    *, context_len: int, server_args: Any = None, warn_dropped: bool = False
+) -> tuple[Bucketer, Bucketer, int, bool]:
+    max_t = max_extend_tokens(context_len=context_len)
+    # Reconciled with max_running_requests via reconcile_tpu_batch_limits,
+    # so the grid covers every decode batch the scheduler can form.
+    max_b = max(get_exec().graph.torch_compile_max_bs or 0, 1)
+    t_bucketer, b_bucketer = build_bucketers(
+        server_args, max_t=max_t, max_b=max_b, warn_dropped=warn_dropped
+    )
+    dp_enabled = attention_dp_enabled()
+    extend_bs = (
+        b_bucketer.max_val
+        if dp_enabled
+        else min(
+            get_schedule().prefill_max_requests or b_bucketer.max_val,
+            b_bucketer.max_val,
+        )
+    )
+    return t_bucketer, b_bucketer, extend_bs, dp_enabled
+
+
+def compiled_attention_row_families(
+    *, context_len: int
+) -> tuple[CompiledAttnFamily, ...]:
+    """Return compiled attention batch families and the CLI flag bounding each.
+
+    Mirrors :meth:`DecoderTpuCompilePolicy.precompile`: context-parallel extend
+    (``2 * extend_cap`` rows on non-decode servers when ``attn_cp_size > 1``),
+    prefill-only extend/mixed on disaggregated prefill servers, and the decode
+    ladder (``b_bucketer.max_val``) on non-prefill servers.
+    """
+    graph = get_exec().graph
+    if (graph.torch_compile_max_bs or 0) <= 0 and not graph.tpu_compile_bs:
+        return ()
+
+    disagg_mode = get_disagg().disaggregation_mode
+    t_bucketer, b_bucketer, extend_bs, dp_enabled = _build_compile_grid_limits(
+        context_len=context_len, warn_dropped=False
+    )
+    schedule = get_schedule()
+    extend_cap = _extend_batch_cap(t_bucketer, b_bucketer, extend_bs)
+
+    families: list[CompiledAttnFamily] = []
+    if get_parallel().attn_cp_size > 1 and disagg_mode != "decode":
+        cp_uses_pmr = not dp_enabled and (
+            disagg_mode == "prefill" or schedule.prefill_max_requests is not None
+        )
+        families.append(
+            CompiledAttnFamily(
+                rows=2 * extend_cap,
+                rows_per_req=2,
+                limit_flag=(
+                    "--prefill-max-requests"
+                    if cp_uses_pmr
+                    else "--max-running-requests"
+                ),
+            )
+        )
+    if disagg_mode == "prefill":
+        plain_uses_mrr = dp_enabled or bool(schedule.enable_mixed_chunk)
+        families.append(
+            CompiledAttnFamily(
+                rows=(
+                    _extend_batch_cap(t_bucketer, b_bucketer, b_bucketer.max_val)
+                    if plain_uses_mrr
+                    else extend_cap
+                ),
+                rows_per_req=1,
+                limit_flag=(
+                    "--max-running-requests"
+                    if plain_uses_mrr
+                    else "--prefill-max-requests"
+                ),
+            )
+        )
+    else:
+        families.append(
+            CompiledAttnFamily(
+                rows=b_bucketer.max_val,
+                rows_per_req=1,
+                limit_flag="--max-running-requests",
+            )
+        )
+    return tuple(families)
+
+
 def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None:
     """Sync returned tensors and backend-marked KV side effects.
 
@@ -690,24 +790,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
             compiled_logits.__signature__ = inspect.signature(logits_fn)
             self.owner.logits_processor.forward = compiled_logits
-        max_t = max_extend_tokens(
-            context_len=self.model_runner.model_config.context_len
-        )
-        # max_b is the reconciled compile-batch ceiling, already grown to cover
-        # scheduler concurrency in ServerArgs.__post_init__ via
-        # reconcile_tpu_batch_limits, so the grid covers every decode batch the
-        # scheduler can form.
-        max_b = get_exec().graph.torch_compile_max_bs
-        t_bucketer, b_bucketer = build_bucketers(server_args, max_t=max_t, max_b=max_b)
-        self.t_bucketer = t_bucketer
-        self.b_bucketer = b_bucketer
-        if is_dp_attention_enabled():
-            self.extend_bs = b_bucketer.max_val
-        else:
-            self.extend_bs = min(
-                get_schedule().prefill_max_requests or b_bucketer.max_val,
-                b_bucketer.max_val,
+        self.t_bucketer, self.b_bucketer, self.extend_bs, _ = (
+            _build_compile_grid_limits(
+                context_len=self.model_runner.model_config.context_len,
+                server_args=server_args,
+                warn_dropped=True,
             )
+        )
 
         outer_model = self.model_runner.model
         existing_prep = getattr(outer_model, "prepare_forward_batch", None)

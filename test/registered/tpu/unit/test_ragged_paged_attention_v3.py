@@ -19,6 +19,7 @@ Cases covered:
   call (exercises the MIXED case path with heterogeneous q_lens)
 * bidirectional (``causal=0`` without ``custom_mask``) on the DECODE and
   MIXED ranges, with and without a sliding window
+* 1 MiB TPU SMEM compilation boundary against ``get_smem_estimate_bytes``
 
 The tests require JAX on a TPU device and are skipped otherwise. They
 do **not** depend on torch_tpu or the SGLang server runtime.
@@ -810,6 +811,61 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
             [(17, 1)], kv_dtype=jnp.float8_e5m2, k_scale=1.0, v_scale=1.0
         )
         self._run_and_compare(inputs, distribution=(1, 1, 1), tolerance=0.2)
+
+    def _compile_for_smem(
+        self, *, max_num_seqs: int, pages_per_seq: int, page_size: int = 64
+    ):
+        import jax
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
+            ragged_paged_attention,
+        )
+
+        max_tokens = max(8, ((max_num_seqs + 7) // 8) * 8)
+        sd = jax.ShapeDtypeStruct
+        return ragged_paged_attention.lower(
+            sd((max_tokens, 8, self.HEAD_DIM), jnp.bfloat16),
+            sd((max_tokens, self.NUM_KV_HEADS, self.HEAD_DIM), jnp.bfloat16),
+            sd((max_tokens, self.NUM_KV_HEADS, self.HEAD_DIM), jnp.bfloat16),
+            sd(
+                (self.TOTAL_NUM_PAGES, page_size, self.NUM_KV_HEADS, 2, self.HEAD_DIM),
+                jnp.bfloat16,
+            ),
+            sd((max_num_seqs,), jnp.int32),
+            sd((max_num_seqs * pages_per_seq,), jnp.int32),
+            sd((max_num_seqs + 1,), jnp.int32),
+            sd((max_num_seqs + 1,), jnp.int32),
+            sd((3,), jnp.int32),
+            None,
+        ).compile()
+
+    def test_mosaic_compile_matches_smem_estimate_boundary(self):
+        """``get_smem_estimate_bytes`` <= 1 MiB matches the Mosaic SMEM boundary."""
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
+            get_smem_estimate_bytes,
+        )
+
+        smem_limit_bytes = 1024 * 1024
+        # 4097 pages/seq tests the 256K @ page_size=64 boundary (63 vs 64);
+        # 4090 separates 9-buffer SMEM (max 63) from page-table-only sizing (max 64).
+        for pages_per_seq, expected_max in ((4097, 63), (4090, 63)):
+            with self.subTest(pages_per_seq=pages_per_seq):
+                max_safe = max(
+                    n
+                    for n in range(1, 257)
+                    if get_smem_estimate_bytes(n, pages_per_seq) <= smem_limit_bytes
+                )
+                self.assertEqual(max_safe, expected_max)
+                self._compile_for_smem(
+                    max_num_seqs=max_safe, pages_per_seq=pages_per_seq
+                )
+                with self.assertRaisesRegex(
+                    Exception, r"(?i)(memory space smem|scoped memory|\bsmem\b)"
+                ):
+                    self._compile_for_smem(
+                        max_num_seqs=max_safe + 1, pages_per_seq=pages_per_seq
+                    )
 
 
 if __name__ == "__main__":

@@ -13,6 +13,8 @@ PyTorch/Python and need no JAX / torch_tpu / TPU device:
 * The shared RPA forward adapter converts SGLang's left-window span to the
   kernel's total-token count.
 * Capability flags: ``support_triton()`` is False, fill value is 0.
+* ``RPA_V3_SPEC.smem_estimate_bytes`` matches the vendored kernel's
+  ``get_smem_estimate_bytes`` formula (imports JAX locally, touches no device).
 
 Kernel numerics live in ``test_ragged_paged_attention_v3.py`` (JAX+TPU
 required). Registration + pool-swap dispatch live in
@@ -43,6 +45,7 @@ from sglang_tpu.attention_pallas_rpa_base import (
     _resolve_decode_query_size,
 )
 from sglang_tpu.attention_pallas_rpa_v3 import (
+    RPA_V3_SPEC,
     PallasForwardMetadata,
     TpuPallasRpaV3AttnBackend,
     _invoke_v3_kernel,
@@ -969,6 +972,23 @@ class TestNonEmptyBatchSize(CustomTestCase):
         # than degrading to the padded count.
         fb = self._fb([10, 24, 0, 0], with_cpu=False)
         self.assertEqual(self.backend._non_empty_batch_size(fb), 2)
+
+
+class TestRpaV3SmemFormulaParity(CustomTestCase):
+    """``RPA_V3_SPEC.smem_estimate_bytes`` matches the vendored kernel formula."""
+
+    def test_spec_estimator_matches_vendored_kernel_formula(self):
+        from sglang_tpu.attention.pallas import ragged_paged_attention_v3
+
+        estimator = RPA_V3_SPEC.smem_estimate_bytes
+        self.assertIsNotNone(estimator)
+        for n in (1, 2, 15, 16, 31, 32, 63, 64, 127, 128, 129, 256):
+            for p in (1, 16, 64, 128, 2050, 4090, 4097, 8192, 16385, 65536):
+                self.assertEqual(
+                    estimator(n, p),
+                    ragged_paged_attention_v3.get_smem_estimate_bytes(n, p),
+                    msg=f"SMEM estimator drift at max_num_seqs={n}, pages_per_seq={p}",
+                )
 
 
 if __name__ == "__main__":

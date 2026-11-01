@@ -201,6 +201,11 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         # kernel op here — the parent never builds the unused RPA v3 op.
         return _build_pallas_mla_kernel_op()
 
+    def _smem_estimator(self) -> None:
+        # MLA v2 / sparse MLA run their own Pallas kernels (see _build_kernel_op),
+        # so do not inherit RPA_V3_SPEC's 9-buffer SMEM model.
+        return None
+
     # ------------------------------------------------------------------ #
     # Metadata
     # ------------------------------------------------------------------ #

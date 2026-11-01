@@ -44,7 +44,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang_tpu.attention_pallas_rpa_dcp import (
     DcpWriteSpans,
@@ -72,6 +72,11 @@ from sglang_tpu.kv_row_write import (
     write_run_bound,
 )
 from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+from sglang_tpu.rpa_smem_budget import (
+    SCOPED_SMEM_BYTES,
+    check_compiled_smem_budget,
+    page_table_smem_bytes,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -82,20 +87,6 @@ logger = logging.getLogger(__name__)
 
 def _get_pages_per_seq(max_context_len: int, page_size: int) -> int:
     return (max_context_len + page_size - 1) // page_size
-
-
-# Scoped SMEM available to one Pallas kernel invocation on TPU.
-_SCOPED_SMEM_BYTES = 1 << 20
-
-
-def _page_table_smem_bytes(max_num_seqs: int, pages_per_seq: int) -> int:
-    """Bytes of SMEM the kernel's page table occupies for ``max_num_seqs``.
-
-    The page table is a scalar-prefetch operand: ``max_num_seqs * pages_per_seq``
-    int32 entries, padded to a multiple of 128 entries.
-    """
-    entries = max_num_seqs * pages_per_seq
-    return ((entries + 127) // 128) * 128 * 4
 
 
 def _validate_kv_len_capacity(max_kv_len: int, capacity: int) -> None:
@@ -304,6 +295,9 @@ class RpaKernelSpec:
     # per sequence, so fixed-width target verification and decode-phase draft
     # extension run as decode.
     supports_decode_query_size: bool = False
+    # Pure-Python estimator of scoped SMEM bytes for (max_num_seqs, pages_per_seq),
+    # or None when only the page-table lower bound is known.
+    smem_estimate_bytes: Callable[[int, int], int] | None = None
 
 
 # torch custom ops are process-global; cache one per op_name so repeated backend
@@ -664,23 +658,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
 
             self._kv_write_op = get_kv_span_write_op()
 
-        max_bs = get_exec().graph.torch_compile_max_bs
-        if max_bs:
-            pages_per_seq = _get_pages_per_seq(self.max_context_len, self._page_stride)
-            table_bytes = _page_table_smem_bytes(max_bs, pages_per_seq)
-            if table_bytes > _SCOPED_SMEM_BYTES:
-                logger.warning(
-                    "RPA page table for %d sequences x %d pages needs %.2f MiB of "
-                    "SMEM, above the %.0f MiB scoped budget; the kernel compile "
-                    "will fail. Lower --torch-compile-max-bs (<= %d at this "
-                    "context length) or raise --page-size.",
-                    max_bs,
-                    pages_per_seq,
-                    table_bytes / 2**20,
-                    _SCOPED_SMEM_BYTES / 2**20,
-                    max(1, (_SCOPED_SMEM_BYTES // 4 - 128) // pages_per_seq),
-                )
-
         # Hybrid-SWA models keep two KV sub-pools and need a
         # second page_indices tensor with indices translated into the SWA
         # sub-pool. ``token_to_kv_pool`` carries the full→swa index mapping.
@@ -697,6 +674,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
         self.kv_cache_quant_dtype: torch.dtype | None = (
             kv_cache_dtype if kv_cache_dtype in fp8_dtypes else None
+        )
+
+        check_compiled_smem_budget(
+            context_len=model_runner.model_config.context_len,
+            pages_per_seq=_get_pages_per_seq(self.max_context_len, self._page_stride),
+            exact_fn=self._smem_estimator(),
         )
 
         # Query rows per DECODE sequence. Target verification and the draft's
@@ -724,6 +707,17 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         self._op = self._build_kernel_op()
         if get_parallel().attn_cp_size > 1 and model_runner.device == "tpu":
             get_write_rows_op()
+
+    def _smem_estimator(self) -> Callable[[int, int], int] | None:
+        """Exact scoped-SMEM model for the kernel this backend runs, or ``None``.
+
+        Overridable hook mirroring :meth:`_build_kernel_op`: subclasses that
+        bypass ``RpaKernelSpec``'s 3-input op shell (such as the MLA backend)
+        override this so they do not inherit an unrelated ``RpaKernelSpec``
+        SMEM model.
+        """
+        assert self.kernel_spec is not None
+        return self.kernel_spec.smem_estimate_bytes
 
     def _build_kernel_op(self):
         """Build the Pallas custom op stored as ``self._op``.
@@ -1340,12 +1334,15 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         page_size = self.page_size
         pages_per_seq = _get_pages_per_seq(self.max_context_len, page_size)
         num_rows = 2 * host.pad_b
-        table_bytes = _page_table_smem_bytes(num_rows, pages_per_seq)
-        if table_bytes > _SCOPED_SMEM_BYTES:
+        exact_fn = self._smem_estimator()
+        smem_fn = exact_fn or page_table_smem_bytes
+        smem_bytes = smem_fn(num_rows, pages_per_seq)
+        if smem_bytes > SCOPED_SMEM_BYTES:
+            label = "RPA kernel" if exact_fn is not None else "RPA page table"
             raise ValueError(
-                f"RPA page table for {num_rows} context-parallel rows x "
-                f"{pages_per_seq} pages needs {table_bytes / 2**20:.2f} MiB of "
-                f"SMEM, above the {_SCOPED_SMEM_BYTES / 2**20:.0f} MiB budget; "
+                f"{label} for {num_rows} context-parallel rows x "
+                f"{pages_per_seq} pages needs {smem_bytes / 2**20:.2f} MiB of "
+                f"SMEM, above the {SCOPED_SMEM_BYTES / 2**20:.0f} MiB budget; "
                 "lower --prefill-max-requests or raise --page-size."
             )
         _validate_kv_len_capacity(
