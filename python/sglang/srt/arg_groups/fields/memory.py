@@ -95,6 +95,10 @@ class Memory(msgspec.Struct):
         bool,
         "With --enable-session-radix-cache, when a session leaf's node leaves the tree (its KV is gone from device and host), release that coverage instead of moving it to the nearest reusable ancestor, so a session that stopped advancing stops protecting its path.",
     ] = False
+    session_coverage_host_only: A[
+        bool,
+        "With --enable-session-radix-cache, session coverage orders only the host LRU lists: device eviction (Full and SWA) stays plain LRU over the hot working set, while idle sessions' resume points are kept last on host. Coverage bookkeeping is unchanged.",
+    ] = False
     session_id_header: A[
         Optional[str],
         Arg(

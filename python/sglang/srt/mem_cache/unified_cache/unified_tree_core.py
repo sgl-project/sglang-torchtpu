@@ -463,6 +463,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.session_release_evicted_leaf = getattr(
             params, "session_release_evicted_leaf", False
         )
+        # Session coverage orders device eviction too, unless it is host-only.
+        self.session_orders_device = self.enable_session_radix_cache and not getattr(
+            params, "session_coverage_host_only", False
+        )
         self.swa_host_evict_passed_first = (
             envs.SGLANG_HICACHE_SWA_HOST_EVICT_PASSED_FIRST.get()
             and not self.enable_session_radix_cache
@@ -503,8 +507,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     # ==== Tree API ====
 
-    def _session_lru_predicate(self, ct: ComponentType):
+    def _session_lru_predicate(self, ct: ComponentType, *, host: bool):
         if not self.enable_session_radix_cache or ct is ComponentType.FULL:
+            return None
+        if not host and not self.session_orders_device:
             return None
         return lambda node: node.component_data[ct].session_ref > 0
 
@@ -540,7 +546,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         self.lru_lists = {
             ct: UnifiedLRUList(
-                ct, self.component_types, is_referenced=self._session_lru_predicate(ct)
+                ct,
+                self.component_types,
+                is_referenced=self._session_lru_predicate(ct, host=False),
             )
             for ct in self.component_types
         }
@@ -552,7 +560,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 ct,
                 self.component_types,
                 use_host_ptr=True,
-                is_referenced=self._session_lru_predicate(ct),
+                is_referenced=self._session_lru_predicate(ct, host=True),
             )
             for ct in self.component_types
         }
@@ -1747,7 +1755,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = EvictDeviceNextNodeResult(made_progress=True)
         node = self._node_arena.get(node_id)
         lru = self.lru_lists[component_type]
-        enabled = self.enable_session_radix_cache
+        enabled = self.session_orders_device
         if (
             node is None
             or node.component_data[component_type].value is None
@@ -2177,7 +2185,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 return False
             if EvictLayer.HOST in target and cd.host_lock_ref != 0:
                 return False
-            if cd.session_ref > 0 and trigger.session_ref(node) == 0:
+            if (
+                cd.session_ref > 0
+                and trigger.session_ref(node) == 0
+                and (EvictLayer.HOST in target or comp.tree_core.session_orders_device)
+            ):
                 return False
         if EvictLayer.DEVICE in target:
             assert cd.lock_ref == 0

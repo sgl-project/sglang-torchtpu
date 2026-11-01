@@ -170,11 +170,12 @@ class TreeComponent(ABC):
 
     def _refresh_session_partition(self, node: UnifiedTreeNode) -> None:
         ct = self.component_type
+        # Only partitioned lists move a node; a plain LRU keeps its recency.
         lru = self.tree_core.lru_lists[ct]
-        if lru.in_list(node):
+        if lru.mid is not None and lru.in_list(node):
             lru.reset_node_mru(node)
         host_lru = self.tree_core.host_lru_lists[ct]
-        if host_lru.in_list(node):
+        if host_lru.mid is not None and host_lru.in_list(node):
             host_lru.reset_node_mru(node)
 
     def _find_reusable_session_leaf(

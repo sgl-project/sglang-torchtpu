@@ -163,6 +163,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_session_radix_cache",
     "session_leaf_at_prompt_end",
     "session_release_evicted_leaf",
+    "session_coverage_host_only",
     "session_id_header",
     "log_level",
     "log_level_http",
