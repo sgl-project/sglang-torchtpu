@@ -96,7 +96,27 @@ class UnifiedSessionRefTracker:
         generation = self._session_generations.get(session_id)
         if generation is None:
             generation = self.open_radix_session(session_id)
+            self._log_session_growth()
         return generation
+
+    def _log_session_growth(self) -> None:
+        """Implicit sessions (a top-level session_id, e.g. from --session-id-header) are
+        released only by /close_session; log their bookkeeping at the first id and
+        every 100th."""
+        n = len(self._session_generations)
+        if n != 1 and n % 100:
+            return
+        leaves = covered = 0
+        for component in self.components:
+            leaves += sum(len(v) for v in component._session_leaves.values())
+            for by_leaf in getattr(component, "_session_leaf_covered_len", {}).values():
+                covered += sum(by_leaf.values())
+        logger.info(
+            "Radix sessions: %d open ids, %d component leaves, %d covered SWA tokens",
+            n,
+            leaves,
+            covered,
+        )
 
     def release_radix_session(self, session_id: str) -> int:
         if not self.enable_session_radix_cache or session_id is None:
