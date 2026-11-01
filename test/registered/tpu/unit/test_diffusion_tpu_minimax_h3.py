@@ -31,7 +31,7 @@ from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import
 )
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.multimodal_gen import minimax_h3
+from sglang_tpu.multimodal_gen import minimax_h3, ulysses
 
 # The TPU lane installs the diffusion_tpu extras (cache-dit) the H3 DiT imports.
 register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit", chips=1)
@@ -47,7 +47,6 @@ def _installed():
             (packed_sequence, _BUILDERS),
             (comfyui_step, _BUILDERS + ("comfyui_layout_to_packed",)),
             (dit, ("_minimax_h3_attention_core_bcg",)),
-            (usp, ("_usp_all_to_all_single",)),
         ):
             stack.enter_context(
                 patch.multiple(module, **{n: getattr(module, n) for n in names})
@@ -193,15 +192,13 @@ class TestMiniMaxH3CompiledBlock(CustomTestCase):
 def _all_to_all_worker(rank, world, init_file, results):
     import torch.distributed as dist
 
-    from sglang.multimodal_gen.runtime.layers import usp
-
     dist.init_process_group(
         "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world
     )
     try:
         group = type("SpGroup", (), {"ulysses_group": dist.group.WORLD})()
         with patch.object(usp, "get_sp_group", return_value=group):
-            lane_dense = minimax_h3._lane_dense_all_to_all_single(
+            lane_dense = ulysses.lane_dense_all_to_all_single(
                 usp._usp_all_to_all_single
             )
             # The H3 packed-QKV and output exchange shapes, scaled down.
