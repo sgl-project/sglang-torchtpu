@@ -100,6 +100,9 @@ suites:
       - files: test/registered/tpu/e2e/test_tpu_muse_spark_pd_singlehost_prefix_cache_kv_offload_dflash.py
         cmd: python3 test/registered/tpu/e2e/test_tpu_muse_spark_pd_singlehost_prefix_cache_kv_offload_dflash.py
         pd: {prefill_hosts: 1, decode_hosts: 1}
+      - files: test/registered/tpu/e2e/test_tpu_muse_spark_pd_singlehost_pp8_dflash.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_muse_spark_pd_singlehost_pp8_dflash.py
+        pd: {prefill_hosts: 1, decode_hosts: 1}
       - files: test/registered/tpu/e2e/test_tpu_qwen3_8b_pd_singlehost_dspark_recompile.py
         cmd: python3 test/registered/tpu/e2e/test_tpu_qwen3_8b_pd_singlehost_dspark_recompile.py integration
         pd: {prefill_hosts: 1, decode_hosts: 1}
