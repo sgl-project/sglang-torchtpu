@@ -156,8 +156,13 @@ class TestGrowthWithoutCloses(CustomTestCase):
     def test_bookkeeping_and_covered_windows_grow_with_session_ids(self):
         cache = make_cache(size=2048)
         refs = cache.session_refs
-        for i in range(40):
-            finish(cache, [1000 + 50 * i + k for k in range(12)], f"conv-{i}")
+        logger = "sglang.srt.mem_cache.unified_cache.session_ref_tracker"
+        with self.assertLogs(logger, level="INFO") as logs:
+            for i in range(40):
+                finish(cache, [1000 + 50 * i + k for k in range(12)], f"conv-{i}")
+        # Logged at the first id (then every 100th): ids, leaves, covered SWA tokens.
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("Radix sessions: 1 open ids", logs.output[0])
         # One generation, one leaf set per component and one SWA coverage record per
         # id; nothing shrinks without /close_session.
         self.assertEqual(len(refs._session_generations), 40)
@@ -165,7 +170,9 @@ class TestGrowthWithoutCloses(CustomTestCase):
         self.assertEqual(len(cache.components[SWA]._session_leaves), 40)
         self.assertEqual(len(cache.components[SWA]._session_leaf_covered_len), 40)
         # Each session covers its whole 12-token node (node-granular, > window + page).
-        self.assertEqual(sum(swa_covered(cache, f"conv-{i}") for i in range(40)), 40 * 12)
+        self.assertEqual(
+            sum(swa_covered(cache, f"conv-{i}") for i in range(40)), 40 * 12
+        )
         # Advancing a session does not add bookkeeping.
         finish(cache, [1000 + k for k in range(12)] + [7, 8, 9], "conv-0")
         self.assertEqual(len(refs._session_generations), 40)
@@ -179,7 +186,9 @@ class TestSWAHostPartition(CustomTestCase):
 
     def build(self, covered):
         is_ref = lambda n: n.component_data[SWA].session_ref > 0
-        host_lru = UnifiedLRUList(SWA, (FULL, SWA), use_host_ptr=True, is_referenced=is_ref)
+        host_lru = UnifiedLRUList(
+            SWA, (FULL, SWA), use_host_ptr=True, is_referenced=is_ref
+        )
         evicted = []
 
         def evict(node, comp, target, tracker, device_frees, host_frees):
