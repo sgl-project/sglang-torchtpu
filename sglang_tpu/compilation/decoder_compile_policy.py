@@ -944,23 +944,25 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         return key
 
+    def _owns_logits_processor(self) -> bool:
+        """Whether ``owner`` includes the target logits processor inside its forward."""
+        runner_model = self.model_runner.model
+        # A wrapper may compile its language model with the logits processor
+        # inside (Kimi); one that keeps the logits eager (Gemma4) does not.
+        return self.owner is runner_model or (
+            self.owner is getattr(runner_model, "language_model", None)
+            and getattr(self.owner, "logits_processor", None) is not None
+        )
+
     def _compiles_logits_processor(self) -> bool:
         """Whether this compiled callable includes target-model logits processing."""
-
+        if getattr(self.model_runner, "is_draft_worker", False):
+            return False
         pp_group = self.model_runner.pp_group
         if pp_group is not None and not pp_group.is_last_rank:
             # Only the final pipeline stage runs the logits processor.
             return False
-        runner_model = self.model_runner.model
-        # A wrapper may compile its language model with the logits processor
-        # inside (Kimi); one that keeps the logits eager (Gemma4) does not.
-        owns_logits = self.owner is runner_model or (
-            self.owner is getattr(runner_model, "language_model", None)
-            and getattr(self.owner, "logits_processor", None) is not None
-        )
-        return owns_logits and not bool(
-            getattr(self.model_runner, "is_draft_worker", False)
-        )
+        return self._owns_logits_processor()
 
     def _pp_warmup_kwargs(self, num_tokens: int) -> dict[str, Any]:
         """The ``pp_proxy_tensors`` kwarg a non-first pipeline stage warms up with.
@@ -2040,27 +2042,46 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 
     spmd_safe = True
 
+    def _runs_eager_logits(self) -> bool:
+        """Whether this stage runs target logits eagerly outside ``owner``."""
+        if getattr(self.model_runner, "is_draft_worker", False):
+            return False
+        pp_group = self.model_runner.pp_group
+        if pp_group is not None and not pp_group.is_last_rank:
+            return False
+        return not self._owns_logits_processor()
+
     def _warmup_host_padding(self) -> None:
         # The compiled inner decoder excludes eager prompt embedding and logits.
-        if not self._compiles_logits_processor():
+        pp_group = self.model_runner.pp_group
+        is_draft = bool(getattr(self.model_runner, "is_draft_worker", False))
+        warms_embedding = (
+            not is_draft
+            and not self._owns_logits_processor()
+            and (pp_group is None or pp_group.is_first_rank)
+        )
+        warms_logits = self._runs_eager_logits()
+        if warms_embedding or warms_logits:
             with torch.no_grad():
                 for tokens, rows, mode in self._extend_compile_cases():
-                    embedding = self.owner.get_input_embeddings()
-                    ids = torch.zeros(tokens, dtype=torch.int64).to(
-                        self.model_runner.device
-                    )
-                    ids.clamp_(min=0, max=embedding.num_embeddings - 1)
-                    embedding(ids).cpu()
-                    self._eager_warmup_logits(tokens, rows, mode).cpu()
+                    if warms_embedding:
+                        embedding = self.owner.get_input_embeddings()
+                        ids = torch.zeros(tokens, dtype=torch.int64).to(
+                            self.model_runner.device
+                        )
+                        ids.clamp_(min=0, max=embedding.num_embeddings - 1)
+                        embedding(ids).cpu()
+                    if warms_logits:
+                        self._eager_warmup_logits(tokens, rows, mode).cpu()
         super()._warmup_host_padding()
 
     def _sampling_warmup_logits(self, rows: int) -> torch.Tensor:
-        if self._compiles_logits_processor():
+        if not self._runs_eager_logits():
             return super()._sampling_warmup_logits(rows)
         return self._eager_warmup_logits(rows, rows, ForwardMode.DECODE)
 
     def warmup_eager_logits(self, cases: Sequence[EagerLogitsCase]) -> None:
-        if self._compiles_logits_processor():
+        if not self._runs_eager_logits():
             return
         with torch.no_grad():
             for case in cases:
