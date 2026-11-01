@@ -18,6 +18,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
 from sglang_tpu.attention_gdn_pallas import TpuGDNAttnBackend
+from sglang_tpu.envs import envs
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -199,6 +200,19 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
         use_residual: bool = True,
     ) -> torch.Tensor:
         """y ``[T, dim]`` for x ``[T, dim]``; updates the stream's state slots."""
+        if not envs.SGLANG_TPU_ENABLE_INKLING_SCONV_PALLAS.get():
+            xla_sconv = (
+                self._xla_sconv_decode
+                if self._is_decode and self._num_spec_tokens == 0
+                else self._xla_sconv
+            )
+            return xla_sconv(
+                x,
+                state=self.sconv_state(layer_id=layer_id, stream=stream),
+                weight=weight,
+                dyn=dyn,
+                use_residual=use_residual,
+            )
         state_rows, read_offsets = self._state_rows()
         return self._sconv_op(
             x.contiguous(),
@@ -214,6 +228,90 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
             batched_only=self._is_decode,
             prefill_only=not self._is_decode,
             num_spec_tokens=self._num_spec_tokens,
+        )
+
+    def _xla_sconv(self, x, *, state, weight, dyn, use_residual):
+        """The sconv kernel's math in XLA ops; reads and writes ``state``'s slot rows."""
+        assert self._num_spec_tokens == 0, "XLA sconv has no speculative verify path"
+        num_tokens, dim = x.shape
+        kernel_size = dyn.shape[2] if dyn is not None else weight.shape[-1]
+        hist = kernel_size - 1
+        qsl = self._query_start_loc.to(torch.int32)
+        num_seqs = qsl.numel() - 1
+        rows = torch.arange(num_tokens, device=x.device, dtype=torch.int32)
+        seq = (rows[:, None] >= qsl[None, 1:]).sum(1).clamp(max=num_seqs - 1)
+        pos = rows - qsl.index_select(0, seq)
+        q_lens = qsl[1:] - qsl[:-1]
+        # A request continues from its slot only if it had tokens before this forward.
+        has_state = (self._seq_lens[:num_seqs] - q_lens) > 0
+        slots = self._state_indices.clamp(min=0).long()
+        # [seqs * hist, dim], oldest row first per sequence.
+        old = state.index_select(0, slots).reshape(num_seqs, hist, dim).float()
+        old = (old * has_state[:, None, None]).reshape(num_seqs * hist, dim)
+        xf = x.float()
+        acc = xf if use_residual else torch.zeros_like(xf)
+        for lag in range(kernel_size):
+            past = xf
+            if lag:
+                shifted = torch.cat((xf.new_zeros(lag, dim), xf))[:num_tokens]
+                state_row = seq * hist + (hist - lag + pos).clamp(0, hist - 1)
+                from_state = old.index_select(0, state_row.long())
+                past = torch.where((pos >= lag)[:, None], shifted, from_state)
+            if dyn is None:
+                w = weight.reshape(dim, -1)[:, kernel_size - 1 - lag].float()[None]
+            else:
+                head_dim = dim // dyn.shape[1]
+                w = weight[lag].float()[None] + dyn[:, :, lag].float().repeat_interleave(head_dim, dim=1)
+            acc = acc + w * past
+        # New state: the last `hist` inputs of [old state rows, this forward's rows].
+        offs = q_lens[:, None] - hist + torch.arange(hist, device=x.device, dtype=torch.int32)[None]
+        x_rows = (qsl[:-1, None] + offs).clamp(0, num_tokens - 1).reshape(-1).long()
+        state_rows = (
+            torch.arange(num_seqs, device=x.device, dtype=torch.int32)[:, None] * hist + (hist + offs).clamp(0, hist - 1)
+        ).reshape(-1).long()
+        new = torch.where(
+            (offs >= 0).reshape(-1)[:, None], xf.index_select(0, x_rows), old.index_select(0, state_rows)
+        )
+        self._write_state(state, slots, new.reshape(num_seqs, hist * dim))
+        scale = (kernel_size * (2 if dyn is not None else 1) + int(use_residual)) ** -0.5
+        return (acc * scale).to(x.dtype)
+
+    def _xla_sconv_decode(self, x, *, state, weight, dyn, use_residual):
+        """``_xla_sconv`` for one new token per request: no per-row sequence lookup or gathers."""
+        num_seqs, dim = x.shape
+        kernel_size = dyn.shape[2] if dyn is not None else weight.shape[-1]
+        hist = kernel_size - 1
+        slots = self._state_indices.clamp(min=0).long()
+        old = state.index_select(0, slots).reshape(num_seqs, hist, dim).float()
+        old = old * (self._seq_lens[:num_seqs] > 1)[:, None, None]
+        # [seqs, K, dim], oldest first; the new token is the last tap.
+        window = torch.cat((old, x.float()[:, None]), dim=1)
+        if dyn is None:
+            w = weight.reshape(dim, kernel_size).float().T[None]
+        else:
+            # Lag-major (lag 0 = current token) -> window order.
+            head_dim = dim // dyn.shape[1]
+            lagged = weight.float()[None] + dyn.float().permute(0, 2, 1).repeat_interleave(head_dim, dim=2)
+            w = lagged.flip(1)
+        acc = (window * w).sum(1)
+        if use_residual:
+            acc = acc + x.float()
+        self._write_state(state, slots, window[:, 1:].reshape(num_seqs, hist * dim))
+        scale = (kernel_size * (2 if dyn is not None else 1) + int(use_residual)) ** -0.5
+        return (acc * scale).to(x.dtype)
+
+    def _write_state(self, state, slots, new):
+        """Store each request's new window ``new`` [seqs, K-1 * dim] in its slot of ``state``."""
+        # Dense one-hot write, not index_copy_: padded rows all clamp to slot 0, and the
+        # duplicate-index scatter is nondeterministic once compiled.
+        num_slots = state.shape[0]
+        onehot = (slots[:, None] == torch.arange(num_slots, device=new.device)[None]) & (
+            self._state_indices >= 0
+        )[:, None]
+        scattered = torch.einsum("ns,nf->sf", onehot.float(), new)
+        flat = state.reshape(num_slots, -1)
+        state.copy_(
+            torch.where(onehot.any(0)[:, None], scattered, flat.float()).to(state.dtype).reshape(state.shape)
         )
 
     def forward_decode(self, *args, **kwargs):

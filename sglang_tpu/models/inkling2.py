@@ -27,6 +27,8 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary.ops import _dp_scatter_step, dp_gather, to_dp_local
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -40,7 +42,8 @@ from sglang.srt.models.inkling_common.sconv import SconvType
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 from sglang.tml.config import Inkling2MMConfig, Inkling2ModelConfig
-from sglang_tpu.models.inkling2_quant import TpuInkling2QuantConfig
+from sglang_tpu.compilation.hybrid_linear_direct_compile import ConvStateModule
+from sglang_tpu.models.inkling2_quant import FP8_BLOCK, TpuInkling2QuantConfig
 
 logger = logging.getLogger(__name__)
 
@@ -97,21 +100,33 @@ def _log_scaling_tau(positions, n_floor, alpha):
 # ----------------------------------------------------------------------------
 
 
-def _block_attn_res(blocks, partial, queries, *, normalize_values, addend=None):
-    """Attention over residual sources at each token; one output per query row."""
+def _inv_rms(x: torch.Tensor) -> torch.Tensor:
+    """[T, D] -> [T] fp32 inverse RMS."""
+    return torch.rsqrt(x.float().square().mean(dim=-1) + _ATTN_RES_EPS)
+
+
+def _block_attn_res(blocks, block_inv_rms, partial, queries, *, normalize_values, addend=None):
+    """Attention over residual sources at each token; one output per query row.
+
+    ``block_inv_rms`` holds the cached inverse RMS of the leading ``blocks`` (it may be shorter;
+    the rest are computed). Sources are read in place: stacking them into one fp32 tensor per
+    call cost several full passes over every block.
+    """
     if queries.ndim == 1:
         queries = queries.unsqueeze(0)
-    values = torch.stack([*blocks, partial]).float()
-    if addend is not None:
-        values = torch.cat([values[:-1], (values[-1] + addend).unsqueeze(0)])
-    hidden = values.shape[-1]
-    inv_rms = torch.rsqrt(values.square().mean(dim=-1) + _ATTN_RES_EPS)
-    q = queries.float() * hidden**-0.5
-    logits = torch.einsum("ntd,qd,nt->qtn", values, q, inv_rms)
+    last = partial.float() if addend is None else partial.float() + addend
+    sources = [*blocks, last]
+    inv = [*block_inv_rms, *(_inv_rms(s) for s in sources[len(block_inv_rms) :])]
+    q = queries.float().T * partial.shape[-1] ** -0.5
+    # [T, Q, n] logits: one small matmul per source.
+    logits = torch.stack([(s.float() @ q) * r[:, None] for s, r in zip(sources, inv)], dim=-1)
     probs = torch.softmax(logits, dim=-1)
-    if normalize_values:
-        values = values * inv_rms.unsqueeze(-1)
-    return tuple(torch.einsum("qtn,ntd->qtd", probs, values).unbind(0))
+    out = None
+    for i, (s, r) in enumerate(zip(sources, inv)):
+        value = s.float() * r[:, None] if normalize_values else s.float()
+        term = probs[:, :, i, None] * value[:, None, :]
+        out = term if out is None else out + term
+    return tuple(out.unbind(1))
 
 
 class Inkling2AttnRes(nn.Module):
@@ -147,10 +162,13 @@ class _AttnResState:
         self.attn_res = attn_res
         self.partial = partial
         self.blocks: list[torch.Tensor] = []
+        # Inverse RMS of each finished block, computed once when it is appended.
+        self.block_inv_rms: list[torch.Tensor] = []
 
     def _mix(self, blocks, partial, query, addend=None):
         return _block_attn_res(
             blocks,
+            self.block_inv_rms,
             partial,
             query,
             normalize_values=self.attn_res.normalize_values,
@@ -176,6 +194,7 @@ class _AttnResState:
     def finalize_layer(self, layer_idx, attn_output, mlp_output) -> None:
         if self.attn_res.is_block_boundary(layer_idx):
             self.blocks.append(self.partial)
+            self.block_inv_rms.append(_inv_rms(self.partial))
             self.partial = (attn_output.float() + mlp_output.float()).to(attn_output.dtype)
         else:
             self.partial = (
@@ -191,7 +210,7 @@ class _AttnResState:
 # ----------------------------------------------------------------------------
 
 
-class Inkling2ShortConv(nn.Module):
+class Inkling2ShortConv(ConvStateModule):
     """Causal conv over the last ``kernel_size`` inputs of one stream, cached per request.
 
     Static streams load ``weight`` [D, 1, W] (tap order, lag = W-1-tap); dynamic
@@ -287,13 +306,19 @@ class Inkling2Attention(nn.Module):
             config.hidden_size,
             [size * self.tp_size for size in self.split_sizes],
             bias=False,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
             prefix=add_prefix("qkvr", prefix),
         )
+        # Under DP attention the sum stays inside this DP group's attention-TP ranks.
         self.wo_ud = RowParallelLinear(
             heads * self.head_dim,
             config.hidden_size,
             bias=False,
             reduce_results=True,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            use_dp_attention_reduce=is_dp_attention_enabled(),
             prefix=add_prefix("wo_ud", prefix),
         )
         rel_extent = config.sliding_window_size if is_local else config.rel_extent
@@ -369,8 +394,8 @@ class Inkling2Attention(nn.Module):
             k.reshape(tokens, -1),
             v.reshape(tokens, -1),
             forward_batch,
-            # The bias is added after sm_scale, so it is pre-scaled here.
-            rel_r=(r.float() * self.scaling).to(q.dtype),
+            # Unscaled: FA4 scale-after-add computes sm_scale * qk + bias (it adds bias / sm_scale first).
+            rel_r=r,
             rel_proj=self.rel_logits_proj.proj,
             token_sink=sink,
         )
@@ -430,8 +455,17 @@ class Inkling2MoE(nn.Module):
             topk_weights=weights, topk_ids=topk_ids.to(torch.int32), router_logits=logits
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.experts(x, self._route(x))
+    def forward(self, x: torch.Tensor, num_token_non_padded: Optional[torch.Tensor]) -> torch.Tensor:
+        topk = self._route(x)
+        if num_token_non_padded is not None:
+            # Bucket-padding rows hold stale values; under EP they must not reach the experts.
+            pad = (torch.arange(x.shape[0], device=x.device) >= num_token_non_padded)[:, None]
+            topk = StandardTopKOutput(
+                topk_weights=topk.topk_weights.masked_fill(pad, 0.0),
+                topk_ids=topk.topk_ids.masked_fill(pad, -1),
+                router_logits=topk.router_logits,
+            )
+        return self.experts(x, topk)
 
 
 # ----------------------------------------------------------------------------
@@ -470,7 +504,13 @@ class Inkling2DecoderLayer(nn.Module):
             )
         attention = self.attn_sconv(self.attn(sources, positions, forward_batch))
         mlp_input = self.mlp_norm(state.mlp_input(self.layer_id, attention))
-        mlp = self.mlp_sconv(self.mlp(mlp_input))
+        if is_dp_attention_enabled():
+            # Experts run on every DP group's tokens; sconv state is per request, so scatter back first.
+            # Gathered padding rows are zero, so no pad mask (the local count would mask other groups).
+            moe_out = to_dp_local(_dp_scatter_step, forward_batch, self.mlp(dp_gather(mlp_input, forward_batch), None))
+        else:
+            moe_out = self.mlp(mlp_input, forward_batch.num_token_non_padded)
+        mlp = self.mlp_sconv(moe_out)
         state.finalize_layer(self.layer_id, attention, mlp)
 
 
@@ -479,7 +519,10 @@ class Inkling2TextModel(nn.Module):
         super().__init__()
         self.config = config
         self.embed_tokens = VocabParallelEmbedding(
-            config.padded_vocab_size, config.hidden_size, prefix=add_prefix("embed_tokens", prefix)
+            config.padded_vocab_size,
+            config.hidden_size,
+            use_attn_tp_group=is_dp_attention_enabled(),
+            prefix=add_prefix("embed_tokens", prefix),
         )
         self.embed_norm = Inkling2RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.layers = nn.ModuleList(
@@ -517,7 +560,10 @@ class Inkling2ForConditionalGeneration(nn.Module):
         self.config, self.text_config, self.quant_config = config, text, quant_config
         self.llm = Inkling2TextModel(text, quant_config, add_prefix("llm", prefix))
         self.lm_head = ParallelLMHead(
-            text.padded_vocab_size, text.hidden_size, prefix=add_prefix("lm_head", prefix)
+            text.padded_vocab_size,
+            text.hidden_size,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
+            prefix=add_prefix("lm_head", prefix),
         )
         # Slices logits to the real vocab and applies the final softcap.
         self.logits_processor = LogitsProcessor(text)
@@ -544,10 +590,11 @@ class Inkling2ForConditionalGeneration(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         params = dict(self.named_parameters())
+        num_layers = self.text_config.num_hidden_layers
         loaded: set[str] = set()
         for checkpoint_name, tensor in weights:
             name = _param_name(checkpoint_name)
-            if name is None:
+            if name is None or _beyond_layers(name, num_layers):
                 continue
             for shard, projection in enumerate(_QKVR_PROJECTIONS):
                 if f".attn.{projection}." in name:
@@ -568,17 +615,26 @@ class Inkling2ForConditionalGeneration(nn.Module):
         )
         if missing:
             raise RuntimeError(f"Inkling2 checkpoint is missing {len(missing)} tensors, e.g. {missing[:5]}")
+        for module in self.modules():
+            if isinstance(module, Inkling2Attention) and len(module.split_sizes) > len(_QKVR_PROJECTIONS):
+                # The alignment pad shard has no checkpoint tensor; left as torch.empty it holds NaN/Inf.
+                module.qkvr.weight.data[-module.split_sizes[-1] :].zero_()
 
     def _load_experts(self, params, name, tensor, loaded) -> None:
         """Stacked [E, ...] expert tensors -> this rank's FusedMoE parameters."""
         prefix = name.split(".mlp.experts.", 1)[0] + ".mlp.experts."
         leaf = name[len(prefix):]
         precision = self.quant_config.expert_precision(prefix) if self.quant_config else "bf16"
-        if leaf.endswith(("_amax", "_outer_scale_denominator")):
-            self._pending[name] = tensor.float()
-            self._set_nvfp4_global_scales(params, prefix, loaded)
+        if precision == "fp8_block":  # stored ready to use: FP8 weights and their block scales
+            _copy_expert_slice(params[name], tensor)
+            loaded.add(name)
             return
-        if precision == "mxfp8":
+        if precision == "nvfp4":
+            dequantized = self._take_nvfp4(prefix, leaf, tensor)
+            if dequantized is None:
+                return
+            leaf, tensor = dequantized
+        elif precision == "mxfp8":
             # Weight and its UE8M0 scale may arrive in either order.
             self._pending[name] = tensor
             weight_leaf = leaf.removesuffix("_scale")
@@ -591,23 +647,22 @@ class Inkling2ForConditionalGeneration(nn.Module):
         target = prefix + leaf
         if leaf.startswith("w13"):
             tensor = _deinterleave_gate_up(tensor)
+        if precision in ("nvfp4", "mxfp8"):
+            tensor, scale_inv = _quant_block_fp8(_ep_slice(tensor, self.text_config.n_routed_experts))
+            _copy_expert_slice(params[target + "_scale_inv"], scale_inv)
+            loaded.add(target + "_scale_inv")
         _copy_expert_slice(params[target], tensor)
         loaded.add(target)
 
-    def _set_nvfp4_global_scales(self, params, prefix, loaded):
-        """weight_scale_2 = amax / outer_scale_denominator once both have arrived."""
-        for w in ("w13", "w2"):
-            amax = self._pending.get(f"{prefix}{w}_weight_amax")
-            den = self._pending.get(f"{prefix}{w}_weight_outer_scale_denominator")
-            target = f"{prefix}{w}_weight_scale_2"
-            if amax is None or den is None or target in loaded:
-                continue
-            scale = amax / den
-            param = params[target]
-            if param.dim() == 2:  # w13 holds one scale each for gate and up
-                scale = scale[:, None].expand(-1, param.shape[1])
-            _copy_expert_slice(param, scale)
-            loaded.add(target)
+    def _take_nvfp4(self, prefix, leaf, tensor):
+        """(weight leaf, BF16 [E, N, K]) once weight, block scale, amax and denominator arrived."""
+        weight_leaf = leaf.split("_weight", 1)[0] + "_weight"
+        self._pending[prefix + leaf] = _ep_slice(tensor, self.text_config.n_routed_experts)
+        parts = [prefix + weight_leaf + s for s in ("", "_scale", "_amax", "_outer_scale_denominator")]
+        if any(p not in self._pending for p in parts):
+            return None
+        weight, scale, amax, den = (self._pending.pop(p) for p in parts)
+        return weight_leaf, _dequant_nvfp4(weight, scale, amax.float() / den.float().reshape(-1)[0])
 
 
 def _param_name(checkpoint_name: str) -> Optional[str]:
@@ -622,9 +677,30 @@ def _param_name(checkpoint_name: str) -> Optional[str]:
     return name
 
 
+def _beyond_layers(name: str, num_layers: int) -> bool:
+    """Tensors of layers cut by a num_hidden_layers override."""
+    if ".layers." in name:
+        return int(name.split(".layers.", 1)[1].split(".", 1)[0]) >= num_layers
+    if ".attn_res.attn_queries." in name:  # attn_queries.{i} belongs to layer i + 1
+        return int(name.rsplit(".", 1)[1]) + 1 >= num_layers
+    if ".attn_res.mlp_queries." in name:
+        return int(name.rsplit(".", 1)[1]) >= num_layers
+    return False
+
+
 def _is_derived_param(name: str) -> bool:
     """Parameters the checkpoint does not carry: pads, unused input scales, online FP8 scales."""
     return name.endswith(("_input_scale", "_weight_scale_inv", "_weight_scale_2", "_weight_scale")) and ".experts." in name
+
+
+def _quant_block_fp8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """BF16 [E, N, K] -> (FP8 E4M3 [E, N, K], FP32 scale_inv [E, N/bn, K/bk]) per FP8_BLOCK block."""
+    bn, bk = FP8_BLOCK
+    e, n, k = w.shape
+    blocks = w.float().reshape(e, n // bn, bn, k // bk, bk)
+    scale = blocks.abs().amax(dim=(2, 4)).clamp(min=1e-12) / torch.finfo(torch.float8_e4m3fn).max
+    q = (blocks / scale[:, :, None, :, None]).to(torch.float8_e4m3fn)
+    return q.reshape(e, n, k), scale
 
 
 def _deinterleave_gate_up(w13: torch.Tensor) -> torch.Tensor:
@@ -637,6 +713,28 @@ def _dequant_mxfp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     factor = torch.exp2(scale.to(torch.float32) - 127.0)
     w = weight.to(torch.float32).unflatten(-1, (-1, 32)) * factor.unsqueeze(-1)
     return w.flatten(-2).to(torch.bfloat16)
+
+
+_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+
+
+def _dequant_nvfp4(
+    weight: torch.Tensor, scale: torch.Tensor, global_scale: torch.Tensor
+) -> torch.Tensor:
+    """Packed E2M1 [E, N, K/2] (low nibble first), FP8 block-16 scales [E, N, K/16] -> BF16."""
+    codes = torch.stack((weight & 0xF, weight >> 4), -1).flatten(-2).long()
+    vals = torch.tensor(_E2M1)[codes].unflatten(-1, (-1, 16))
+    w = vals * scale.float().unsqueeze(-1) * global_scale.reshape(-1, 1, 1, 1)
+    return w.flatten(-2).to(torch.bfloat16)
+
+
+def _ep_slice(tensor: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """This rank's experts of a stacked [E, ...] tensor; other tensors unchanged."""
+    parallel = get_parallel()
+    if tensor.dim() == 0 or tensor.shape[0] != num_experts or parallel.moe_ep_size == 1:
+        return tensor
+    count = num_experts // parallel.moe_ep_size
+    return tensor.narrow(0, parallel.moe_ep_rank * count, count)
 
 
 def _copy_expert_slice(param: torch.Tensor, tensor: torch.Tensor) -> None:

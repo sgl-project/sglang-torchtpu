@@ -27,6 +27,7 @@ from sglang_tpu.attention.pallas.gdn import (
     metadata,
     vmem_ldst,
 )
+from sglang_tpu.attention.pallas.util import get_tpu_version
 
 
 def inner_kernel(*refs, cfg: config.GDNConfig):
@@ -280,6 +281,9 @@ def fused_sconv(
         out, state = call_kernel(state, None, config.GDNMode.BATCHED)
     if not batched_only:
         out, state = call_kernel(state, out, config.GDNMode.PER_SEQ)
+    # Rows past the last sequence (bucket padding) are never written.
+    num_valid = query_start_loc[distribution[-1]]
+    out = jnp.where(jnp.arange(batch_size)[:, None, None] < num_valid, out, 0)
     return state.reshape(state_shape), out.reshape(batch_size, dim)
 
 
@@ -325,14 +329,31 @@ def _call_kernel(
     metadata_obj, metadata_layout = memory_ref.pack_metadata(metadata_obj)
     smem_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
     hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
-    # Uncovered rows (padding, or the other mode's sequences) must be finite.
-    if in_act is None:
-        in_act = jnp.zeros(cfg.get_out_shape().shape, cfg.dtypes.act_out)
+    # The kernel never reads in_act; it only names the buffer the output aliases.
+    # Without one, the output is a fresh buffer and fused_sconv zeroes the
+    # uncovered rows: aliasing a zeros constant into the output let XLA reuse
+    # that buffer while y was still live inside compiled graphs.
+    fresh_out = in_act is None
+    if fresh_out:
+        in_act = jnp.zeros((1,), cfg.dtypes.act_out)
+    out_struct = cfg.get_out_shape() if fresh_out else in_act
     # Flat inputs: packed metadata, x, [dyn], state, in_act, weights.
     state_input = 2 + int(dyn is not None)
+    # The kernel DMAs these as HBM; unpinned, XLA may place small ones in VMEM
+    # and the HBM DMAs then hit unrelated buffers.
+    pin = get_tpu_version() >= 7
+    if pin:
+        x, state, in_act = (
+            pltpu.with_memory_space_constraint(a, pltpu.HBM) for a in (x, state, in_act)
+        )
+        if dyn is not None:
+            dyn = pltpu.with_memory_space_constraint(dyn, pltpu.HBM)
+    out_shape = tuple(
+        pltpu.HBM(shape=a.shape, dtype=a.dtype) if pin else a for a in (out_struct, state)
+    )
     return pl.pallas_call(
         functools.partial(outer_kernel, cfg=cfg, metadata_layout=metadata_layout),
-        out_shape=(in_act, state),
+        out_shape=out_shape,
         in_specs=(
             smem_spec,
             hbm_spec,
@@ -343,7 +364,9 @@ def _call_kernel(
         ),
         out_specs=(hbm_spec, hbm_spec),
         scratch_shapes=cfg.get_scratch_shape_dict(),
-        input_output_aliases={state_input: 1, state_input + 1: 0},
+        input_output_aliases=(
+            {state_input: 1} if fresh_out else {state_input: 1, state_input + 1: 0}
+        ),
         compiler_params=pltpu.CompilerParams(
             disable_bounds_checks=True,
             vmem_limit_bytes=cfg.get_vmem_limit_bytes(),

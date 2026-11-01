@@ -347,7 +347,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # fail at boot, not 400 every request.
         self._inkling_default_reasoning_effort: float | None = (
             self._get_inkling_default_reasoning_effort()
-            if self.chat_encoding_spec == "inkling"
+            if self.chat_encoding_spec in ("inkling", "inkling2")
             else None
         )
         self._dsv41_default_reasoning_effort: Optional[Union[str, int]] = (
@@ -585,6 +585,28 @@ class OpenAIServingChat(OpenAIServingBase):
 
         Returns prompt_ids if handled, None to use default encoding.
         """
+        if self.chat_encoding_spec == "inkling2":
+            from sglang.tml.server import render_inkling2_messages, rendering_tokenizer
+
+            reasoning_effort = self._parse_inkling_reasoning_effort(
+                request.reasoning_effort
+            )
+            assistant_prefix = self._pop_inkling_assistant_prefix(messages, request)
+            return render_inkling2_messages(
+                messages,
+                rendering_tokenizer(self.tokenizer_manager.tokenizer),
+                tools=(
+                    [tool.model_dump() for tool in request.tools]
+                    if request.tools
+                    else None
+                ),
+                reasoning_effort=(
+                    self._inkling_default_reasoning_effort
+                    if reasoning_effort is None
+                    else reasoning_effort
+                ),
+                assistant_prefix=assistant_prefix,
+            )
         if self.chat_encoding_spec == "inkling":
             # Inkling: render messages -> input_ids with framing tokens + ONE placeholder per
             # media (encoding/expansion happens later in InklingMultimodalProcessor). The
@@ -1018,10 +1040,37 @@ class OpenAIServingChat(OpenAIServingBase):
         The reasoning parser is told the same thing, so channel-framed formats
         keep their framing intact exactly when a tool-call parser consumes it.
         """
+        if (
+            self._uses_inkling_response_parser()
+            and request.response_format is not None
+            and request.response_format.type in ("json_object", "json_schema")
+        ):
+            return False
         return bool(
             request.tool_choice != "none"
             and self._effective_tools(request)
             and self.tool_call_parser
+        )
+
+    def _uses_inkling_response_parser(self) -> bool:
+        return (
+            self.chat_encoding_spec in ("inkling", "inkling2")
+            and self.reasoning_parser == "inkling"
+        )
+
+    def _create_inkling_response_parser(self, request: ChatCompletionRequest):
+        from sglang.tml.response_parser import InklingResponseParser
+
+        return InklingResponseParser(
+            self.tokenizer_manager.tokenizer,
+            self._effective_tools(request)
+            if self._tool_call_parsing_active(request)
+            else [],
+            stream_reasoning=request.stream_reasoning,
+            continue_final_message=self._pop_inkling_assistant_prefix(
+                [message.model_dump() for message in request.messages[-1:]], request
+            )
+            is not None,
         )
 
     def _validate_request(self, request: ChatCompletionRequest) -> str | None:
@@ -1252,6 +1301,26 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint=processed_messages.tool_call_constraint,
             renderer_handles_response_format=self.chat_encoding_spec == "kimi_k3",
         )
+        if (
+            self.chat_encoding_spec in ("inkling", "inkling2")
+            and self.reasoning_parser == "inkling"
+            and "json_schema" in sampling_params
+        ):
+            from sglang.tml.inkling_grammar import constrain_json_response
+
+            assistant_prefix = self._pop_inkling_assistant_prefix(
+                [message.model_dump() for message in request.messages], request
+            )
+            constrain_json_response(
+                sampling_params,
+                assistant_prefix=assistant_prefix,
+                input_ids=request.input_ids,
+                enable_strict_thinking=self.tokenizer_manager.config_value(
+                    "enable_strict_thinking"
+                ),
+                grammar_backend=self.tokenizer_manager.config_value("grammar_backend"),
+                separate_reasoning=request.separate_reasoning,
+            )
         set_request_reasoning_end_token_ids(
             sampling_params, processed_messages.reasoning_end_token_ids
         )
@@ -1398,7 +1467,15 @@ class OpenAIServingChat(OpenAIServingBase):
             elif request.tools:
                 tools = [item.model_dump() for item in request.tools]
             if self.tool_call_parser and not glm_constraint:
-                parser = FunctionCallParser(
+                parser_class = FunctionCallParser
+                if (
+                    self.chat_encoding_spec == "inkling2"
+                    and self.tool_call_parser == "inkling"
+                ):
+                    from sglang.tml.server import Inkling2FunctionCallParser
+
+                    parser_class = Inkling2FunctionCallParser
+                parser = parser_class(
                     effective_tools,
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
@@ -1540,7 +1617,7 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         if prompt_ids is not None:
-            if self.chat_encoding_spec in ("inkling", "kimi_k3"):
+            if self.chat_encoding_spec in ("inkling", "inkling2", "kimi_k3"):
                 for message in request.messages:
                     msg_dict = message.model_dump()
                     if msg_dict.get("content") is None:
@@ -2386,7 +2463,18 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle reasoning content
             reasoning_text = None
-            if self.reasoning_parser and request.separate_reasoning:
+            parsed_output = None
+            if self._uses_inkling_response_parser() and request.separate_reasoning:
+                parser = self._create_inkling_response_parser(request)
+                parsed_output = parser.parse(
+                    ret_item["output_ids"],
+                    text=ret_item["text"],
+                    meta_info=ret_item["meta_info"],
+                )
+                parsed_output.extend(parser.finish())
+                reasoning_text = parsed_output.reasoning_text
+                text = parsed_output.normal_text
+            elif self.reasoning_parser and request.separate_reasoning:
                 force_reasoning = (
                     self.template_manager.force_reasoning
                     or self._get_reasoning_from_request(request)
@@ -2414,13 +2502,18 @@ class OpenAIServingChat(OpenAIServingBase):
             effective_tools = self._effective_tools(request)
             if self._tool_call_parsing_active(request):
                 history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
-                tool_calls, text, finish_reason = self._process_tool_calls(
-                    text,
-                    effective_tools,
-                    finish_reason,
-                    request.tool_choice,
-                    history_tool_calls_cnt,
-                )
+                if parsed_output is not None:
+                    tool_calls, text, finish_reason = self._format_tool_calls(
+                        parsed_output.calls, text, finish_reason, history_tool_calls_cnt
+                    )
+                else:
+                    tool_calls, text, finish_reason = self._process_tool_calls(
+                        text,
+                        effective_tools,
+                        finish_reason,
+                        request.tool_choice,
+                        history_tool_calls_cnt,
+                    )
 
             # Extract prompt_token_ids if requested
             choice_prompt_token_ids = (
@@ -2591,6 +2684,27 @@ class OpenAIServingChat(OpenAIServingBase):
             f"Process tool call idx, parser: {self.tool_call_parser}, tool_call_id: {tool_call_id}, history_cnt: {history_tool_calls_cnt}"
         )
         return tool_call_id
+
+    def _format_tool_calls(
+        self,
+        calls: list[ToolCallItem],
+        text: str,
+        finish_reason: dict[str, Any],
+        history_tool_calls_cnt: int,
+    ) -> ToolCallProcessingResult:
+        if not calls:
+            return ToolCallProcessingResult(None, text, finish_reason)
+        tool_calls = [
+            ToolCall(
+                id=self._process_tool_call_id(call, history_tool_calls_cnt),
+                index=index,
+                function=FunctionResponse(name=call.name, arguments=call.parameters),
+            )
+            for index, call in enumerate(calls)
+        ]
+        if finish_reason["type"] == "stop":
+            finish_reason = {**finish_reason, "type": "tool_calls", "matched": None}
+        return ToolCallProcessingResult(tool_calls, text, finish_reason)
 
     def _process_tool_calls(
         self,
