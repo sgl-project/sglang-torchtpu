@@ -1210,6 +1210,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             )
 
+        if (
+            is_finished
+            and len(prompt_key) < len(radix_key)
+            and getattr(self.tree_core, "swa_host_evict_passed_first", False)
+        ):
+            # The next turn re-renders the assistant message and diverges at the
+            # prompt end, so the output's window is never a resume point.
+            self.tree_core.mark_match_passed(result.last_device_node)
+
         # Protect the whole inserted path. With disaggregated decode caching,
         # SWA slots may exist only for the prompt's tail; EAGLE page alignment
         # can leave less than a live window inside the inserted range. A fresh

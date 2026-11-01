@@ -843,6 +843,11 @@ class Envs:
     # tokens: its Full-KV hit (device + host), the hit after the sliding-window check,
     # the host load-back promised vs loaded, and the final prefix. 0 disables (log-only).
     SGLANG_RECOMPUTE_DIAG_MIN_TOKENS = EnvInt(0)
+    # SWA host pool eviction: first evict windows that a later match walked past to a
+    # deeper usable point (superseded turn ends, stride checkpoints of active paths),
+    # then fall back to LRU. An idle session's last turn-end window is never walked
+    # past, so it outlives them.
+    SGLANG_HICACHE_SWA_HOST_EVICT_PASSED_FIRST = EnvBool(False)
     # Hybrid-SWA host pools: fraction of --hicache-size given to the SWA pool. Unset splits
     # by device pool bytes; a cached prefix needs only its last window of SWA KV.
     SGLANG_HICACHE_SWA_HOST_FRACTION = EnvFloat(None)

@@ -124,6 +124,10 @@ class UnifiedTreeNode:
         ]
         self.last_access_time = get_and_increase_time_counter()
         self.creation_time = get_and_increase_time_counter()
+        # Last match that ended here vs. last match that walked past this node to a
+        # deeper usable point (SGLANG_HICACHE_SWA_HOST_EVICT_PASSED_FIRST).
+        self.match_end_time = self.creation_time
+        self.match_pass_time = 0.0
         # Last insert or lock release on this node: a forward formed after
         # it cannot write the node's device values.
         self.write_horizon = self.creation_time
@@ -456,6 +460,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.is_write_back = False
         self.has_swa_host_pool = False
         self.enable_session_radix_cache = params.enable_session_radix_cache
+        self.swa_host_evict_passed_first = (
+            envs.SGLANG_HICACHE_SWA_HOST_EVICT_PASSED_FIRST.get()
+            and not self.enable_session_radix_cache
+        )
+        if self.swa_host_evict_passed_first:
+            logger.info("SWA host eviction: passed-over windows first")
         self.eviction_strategy = get_eviction_strategy(
             params.eviction_policy.lower(), params.eviction_policy_config
         )
@@ -560,6 +570,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_node=self.root_node.id,
             cache_actions=[],
         )
+
+    def mark_match_passed(self, node_id: NodeId) -> None:
+        """Count a node as walked past, so its SWA host copy is evicted first."""
+        self.node_by_id(node_id).match_pass_time = get_and_increase_time_counter()
 
     def node_by_id(self, node_id: NodeId) -> UnifiedTreeNode:
         """Resolve a NodeId back to its tree node.
@@ -1041,6 +1055,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             comp.refresh_lru(LRURefreshPhase.MATCH_END, node_update, self.root_node)
 
         cur_time = get_and_increase_time_counter()
+        if self.swa_host_evict_passed_first:
+            node_update.match_end_time = cur_time
+            ancestor = node_update.parent
+            while ancestor:
+                ancestor.match_pass_time = cur_time
+                ancestor = ancestor.parent
         while node_update:
             node_update.last_access_time = cur_time
             cur_time -= 0.00001
