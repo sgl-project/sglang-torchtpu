@@ -13,9 +13,11 @@ purpose:
 * `resolving_view` -- the view a resolution pass decides on -- still answers
   `None`, so a family's `if cfg.x is None` fires and its declaration lands.
   This is the half that carries the design: `model_overrides/inkling.py` and
-  `deepseek_v4.py` are the only `is None` readers of either declared field, and
-  both read this view. Pinned by the family-shaped test below rather than by
-  asserting the view directly, because the shape is what has to keep working.
+  `deepseek_v4.py` are the `is None` readers of the two ratio fields, and
+  `memory_hook.handle_gpu_memory_settings` reads `cfg.torch_compile_max_bs`
+  to tell an unset flag from an explicit value. Pinned by the reader-shaped
+  tests below rather than by asserting the view directly, because the shape is
+  what has to keep working.
   `resolved_view` is a separate class and is not pinned here -- nothing reads a
   declared field through it, and `with_fallback` is called from exactly one
   place (`resolution_result`), which is what makes both views answer `None`
@@ -35,7 +37,7 @@ from sglang.srt.arg_groups.overrides import (
     resolution_result,
     resolving_view,
 )
-from sglang.srt.runtime_context import get_schedule, publish, reset_context
+from sglang.srt.runtime_context import get_exec, get_schedule, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -54,6 +56,7 @@ class TestAFallbackIsWhatNobodySaid(CustomTestCase):
         server_args = _resolved()
         self.assertEqual(resolution_result(server_args, "swa_full_tokens_ratio"), 0.8)
         self.assertEqual(resolution_result(server_args, "mamba_full_memory_ratio"), 0.9)
+        self.assertEqual(resolution_result(server_args, "torch_compile_max_bs"), 32)
 
     def test_the_record_still_says_the_operator_typed_nothing(self):
         # The fallback is not the dataclass default. A child process that
@@ -62,15 +65,23 @@ class TestAFallbackIsWhatNobodySaid(CustomTestCase):
         server_args = _resolved()
         self.assertIsNone(server_args.swa_full_tokens_ratio)
         self.assertIsNone(server_args.mamba_full_memory_ratio)
+        self.assertIsNone(server_args.torch_compile_max_bs)
 
     def test_what_the_operator_typed_wins(self):
-        server_args = _resolved(swa_full_tokens_ratio=0.25)
+        server_args = _resolved(swa_full_tokens_ratio=0.25, torch_compile_max_bs=16)
         self.assertEqual(resolution_result(server_args, "swa_full_tokens_ratio"), 0.25)
+        self.assertEqual(resolution_result(server_args, "torch_compile_max_bs"), 16)
 
     def test_a_decision_wins(self):
         server_args = _resolved()
-        declare_resolution(server_args, "a_model_family", swa_full_tokens_ratio=0.1)
+        declare_resolution(
+            server_args,
+            "a_model_family",
+            swa_full_tokens_ratio=0.1,
+            torch_compile_max_bs=8,
+        )
         self.assertEqual(resolution_result(server_args, "swa_full_tokens_ratio"), 0.1)
+        self.assertEqual(resolution_result(server_args, "torch_compile_max_bs"), 8)
 
     def test_the_published_bag_answers_with_the_fallback(self):
         # Every runtime reader goes through the bags, so this is the surface
@@ -80,6 +91,7 @@ class TestAFallbackIsWhatNobodySaid(CustomTestCase):
         publish(ServerArgs(model_path="dummy"), role="test")
         self.assertEqual(get_schedule().swa_full_tokens_ratio, 0.8)
         self.assertEqual(get_schedule().mamba_full_memory_ratio, 0.9)
+        self.assertEqual(get_exec().graph.torch_compile_max_bs, 32)
 
     def test_the_dummy_short_circuit_leaves_no_bag_holding_none(self):
         # The dummy path returns before most of the pipeline. It used to have
@@ -90,6 +102,7 @@ class TestAFallbackIsWhatNobodySaid(CustomTestCase):
         publish(ServerArgs(model_path="none"), role="test")
         self.assertIsNotNone(get_schedule().swa_full_tokens_ratio)
         self.assertIsNotNone(get_schedule().mamba_full_memory_ratio)
+        self.assertIsNotNone(get_exec().graph.torch_compile_max_bs)
 
 
 class TestAPassDecidingStillSeesUnset(CustomTestCase):
@@ -108,6 +121,12 @@ class TestAPassDecidingStillSeesUnset(CustomTestCase):
         if cfg.swa_full_tokens_ratio is None:  # the family's exact shape
             declared["swa_full_tokens_ratio"] = 0.1
         self.assertEqual(declared, {"swa_full_tokens_ratio": 0.1})
+
+    def test_memory_hook_still_sees_unset_torch_compile_max_bs(self):
+        # memory_hook derives an unset TPU compile cap from --max-running-requests;
+        # answering 32 on resolving_view would make that branch dead.
+        cfg = resolving_view(_resolved(max_running_requests=8))
+        self.assertIsNone(cfg.torch_compile_max_bs)
 
 
 if __name__ == "__main__":

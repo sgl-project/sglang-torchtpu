@@ -1362,6 +1362,34 @@ class TestBuildBucketers(CustomTestCase):
             4096,
         )
 
+    def test_power_token_bucketer_clamps_small_max_t_to_64(self):
+        # Backend-init capacity checks may inspect tiny contexts (max_t < 64);
+        # PowerBucketer(min_val=64, max_val=max(64, max_t)) stays at [64].
+        t_b, b_b = build_bucketers(self._server_args(), max_t=32, max_b=4)
+        self.assertEqual(t_b.buckets, [64])
+        self.assertEqual(b_b.buckets, [1, 2, 4])
+
+    def test_none_server_args_reads_published_tokens_and_respects_warn_dropped(self):
+        with get_context().override_server_args(
+            tpu_compile_tokens=[64, 512, 4096], tpu_compile_bs=[1, 8]
+        ):
+            with self.assertNoLogs(
+                "sglang_tpu.compilation.compiled_forward_shim", level="WARNING"
+            ):
+                t_silent, b_silent = build_bucketers(
+                    None, max_t=512, max_b=8, warn_dropped=False
+                )
+            with self.assertLogs(
+                "sglang_tpu.compilation.compiled_forward_shim", level="WARNING"
+            ) as logs:
+                t_warn, _ = build_bucketers(None, max_t=512, max_b=8, warn_dropped=True)
+        self.assertEqual(t_silent.buckets, [64, 512])
+        self.assertEqual(b_silent.buckets, [1, 8])
+        self.assertEqual(t_warn.buckets, [64, 512])
+        self.assertTrue(
+            any("Dropping --tpu-compile-tokens [4096]" in m for m in logs.output)
+        )
+
 
 class TestReconcileTpuBatchLimits(CustomTestCase):
     """The compiled grid covers scheduler concurrency without compiling past
@@ -1384,7 +1412,7 @@ class TestReconcileTpuBatchLimits(CustomTestCase):
         )
 
     def test_default_neither_set(self):
-        # Nothing requested -> ceiling and concurrency default to 64 (NOT the
+        # Nothing requested -> ceiling and concurrency default to 32 (NOT the
         # ~2048 memory estimate), no explicit bucket list.
         self.assertEqual(
             self._r(),
@@ -1399,12 +1427,12 @@ class TestReconcileTpuBatchLimits(CustomTestCase):
         self.assertEqual(self._r(torch_compile_max_bs=8), (8, None, 8))
 
     def test_max_running_requests_grows_ceiling(self):
-        # --max-running-requests 128 -> grid ceiling 128, served (not clamped 64).
+        # --max-running-requests 128 -> grid ceiling 128, served (not clamped 32).
         self.assertEqual(self._r(max_running_requests=128), (128, None, 128))
 
     def test_max_running_requests_below_default_caps_grid(self):
         # --max-running-requests 4 with no explicit compile limit -> the grid
-        # stops at 4 instead of compiling dead shapes up to 64.
+        # stops at 4 instead of compiling dead shapes up to 32.
         self.assertEqual(self._r(max_running_requests=4), (4, None, 4))
 
     def test_dp_attention_derives_per_worker_cap(self):

@@ -1,5 +1,6 @@
 """Unit tests for the TPU Pallas RPA v3 backend."""
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -7,26 +8,28 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.attention_pallas_rpa_base import (
+    _get_pages_per_seq,
+    _runner_compile_mode,
     _zero_inactive_rpa_rows,
 )
 from sglang_tpu.attention_pallas_rpa_v3 import (
+    RPA_V3_SPEC,
     TpuPallasRpaV3AttnBackend,
+    _get_smem_estimate_bytes,
 )
 from sglang_tpu.envs import envs
+from sglang_tpu.rpa_smem_budget import (
+    SCOPED_SMEM_BYTES,
+    _max_smem_seqs,
+    page_table_smem_bytes,
+)
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-
-
-from sglang_tpu.attention_pallas_rpa_base import (
-    _SCOPED_SMEM_BYTES,
-    _get_pages_per_seq,
-    _page_table_smem_bytes,
-)
 
 
 class TestDistributionWarmup(CustomTestCase):
@@ -42,21 +45,41 @@ class TestDistributionWarmup(CustomTestCase):
                 self.assertEqual(dist.tolist(), [rows if decode else 0, rows, rows])
 
 
-class TestPageTableSmemBudget(unittest.TestCase):
-    def test_1m_context_default_batch_cap_exceeds_smem(self):
-        # 1,052,672 tokens at page 64 -> 16,448 pages/seq; the default compile
-        # cap of 64 sequences needs 4.2 MB, far above the 1 MiB scoped SMEM.
-        pages = _get_pages_per_seq(1052672, 64)
-        self.assertEqual(pages, 16448)
-        self.assertGreater(_page_table_smem_bytes(64, pages), _SCOPED_SMEM_BYTES)
-        self.assertLessEqual(_page_table_smem_bytes(8, pages), _SCOPED_SMEM_BYTES)
+class TestRpaSmemBudget(CustomTestCase):
+    def test_v3_smem_golden_bytes_and_max_seqs(self):
+        # Hand-computed 9-buffer scalar-prefetch totals in bytes:
+        # (align128(n) + align128(n*p) + 3*align128(n+1) + 512) * 4.
+        for n, p, expected_bytes in (
+            (1, 1, 4608),
+            (63, 4097, 1036800),
+            (64, 4097, 1053184),
+            (63, 4090, 1035264),
+            (64, 4090, 1051136),
+            (15, 16385, 987648),
+            (16, 16385, 1053184),
+        ):
+            with self.subTest(n=n, p=p):
+                self.assertEqual(_get_smem_estimate_bytes(n, p), expected_bytes)
+
+        # At (64, 4090), page_indices alone is 1,047,040 B <= 1 MiB, while the
+        # full 9-buffer kernel estimate is 1,051,136 B > 1 MiB (max_smem_seqs=63).
+        self.assertEqual(page_table_smem_bytes(64, 4090), 1047040)
+        self.assertLessEqual(page_table_smem_bytes(64, 4090), SCOPED_SMEM_BYTES)
+        self.assertGreater(_get_smem_estimate_bytes(64, 4090), SCOPED_SMEM_BYTES)
+        estimator = RPA_V3_SPEC.smem_estimate_bytes
+        self.assertEqual(_max_smem_seqs(estimate_fn=estimator, pages_per_seq=4090), 63)
+        self.assertEqual(_max_smem_seqs(estimate_fn=estimator, pages_per_seq=4097), 63)
+        self.assertEqual(_max_smem_seqs(estimate_fn=estimator, pages_per_seq=16385), 15)
+        self.assertEqual(_max_smem_seqs(estimate_fn=estimator, pages_per_seq=262144), 0)
 
     def test_entries_padded_to_128(self):
-        self.assertEqual(_page_table_smem_bytes(1, 1), 128 * 4)
-        self.assertEqual(_page_table_smem_bytes(2, 100), 256 * 4)
+        self.assertEqual(page_table_smem_bytes(1, 1), 128 * 4)
+        self.assertEqual(page_table_smem_bytes(1, 128), 128 * 4)
+        self.assertEqual(page_table_smem_bytes(1, 129), 256 * 4)
+        self.assertEqual(page_table_smem_bytes(2, 100), 256 * 4)
 
 
-class TestAttentionPallasRpaV3(unittest.TestCase):
+class TestAttentionPallasRpaV3(CustomTestCase):
     CONTEXT_LEN = 131072
     POOL_WIDTH = 262144
     PAGE_SIZE = 64
@@ -68,28 +91,32 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
         pool_width=None,
         req_to_token_device="cpu",
         cache_metadata=True,
+        context_len=None,
+        torch_compile_max_bs=32,
+        scoped_override=False,
+        **server_arg_overrides,
     ):
+        context_len = self.CONTEXT_LEN if context_len is None else context_len
         pool_width = self.POOL_WIDTH if pool_width is None else pool_width
-        override = get_context().override_server_args(
+        merged_args = dict(
             speculative_num_draft_tokens=self.DRAFT_TOKENS,
             speculative_algorithm="EAGLE3",
             speculative_num_steps=None,
             speculative_eagle_topk=1,
             page_size=self.PAGE_SIZE,
+            torch_compile_max_bs=torch_compile_max_bs,
+            tpu_compile_tokens=None,
         )
-        override.install()
-        self.addCleanup(override.restore)
-        server_args = SimpleNamespace(
-            speculative_num_draft_tokens=self.DRAFT_TOKENS,
-            speculative_algorithm="EAGLE3",
-            speculative_num_steps=None,
-            speculative_eagle_topk=1,
-            page_size=self.PAGE_SIZE,
-        )
+        merged_args.update(server_arg_overrides)
+        override = get_context().override_server_args(**merged_args)
+        if not scoped_override:
+            override.install()
+            self.addCleanup(override.restore)
+        server_args = SimpleNamespace(**merged_args)
         model_runner = SimpleNamespace(
             device=torch.device("cpu"),
             page_size=self.PAGE_SIZE,
-            model_config=SimpleNamespace(context_len=self.CONTEXT_LEN),
+            model_config=SimpleNamespace(context_len=context_len),
             server_args=server_args,
             req_to_token_pool=SimpleNamespace(
                 req_to_token=torch.zeros(
@@ -106,6 +133,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             spec_algorithm=SpeculativeAlgorithm.EAGLE3,
         )
         with (
+            override if scoped_override else contextlib.nullcontext(),
             patch(
                 "sglang_tpu.attention_pallas_rpa_base._build_pallas_kernel_op",
                 return_value=None,
@@ -272,6 +300,509 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             ValueError, "exceeds the request-to-token table width"
         ):
             self._make_backend(pool_width=self.CONTEXT_LEN)
+
+    def _assert_smem_budget(
+        self,
+        *,
+        ctx: int,
+        bs: int,
+        err: str | tuple[str, ...] | None = None,
+        absent: str | None = None,
+        cp: int = 1,
+        **overrides,
+    ) -> None:
+        overrides.setdefault("enable_torch_compile", True)
+        dp = overrides.get("attn_dp_size", 1)
+        par_ctx = (
+            get_parallel().override(
+                tp_size=8,
+                attn_tp_size=8 // (dp * cp),
+                attn_dp_size=dp,
+                attn_dp_enabled=dp > 1,
+                attn_cp_size=cp,
+                moe_tp_size=8 // cp,
+                moe_dp_size=cp,
+                moe_ep_size=1,
+            )
+            if (cp > 1 or dp > 1)
+            else get_parallel().override()
+        )
+        kwargs = dict(
+            context_len=ctx,
+            pool_width=ctx * 2,
+            req_to_token_device="meta",
+            torch_compile_max_bs=bs,
+            scoped_override=True,
+            **overrides,
+        )
+        with par_ctx:
+            if err is None:
+                self._make_backend(**kwargs)
+                return
+            with self.assertRaises(ValueError) as cm:
+                self._make_backend(**kwargs)
+        msg = str(cm.exception)
+        for fragment in (err,) if isinstance(err, str) else err:
+            self.assertIn(fragment, msg)
+        if absent is not None:
+            self.assertNotIn(absent, msg)
+
+    def _make_minimal_runner(
+        self,
+        *,
+        context_len: int,
+        page_size: int = 64,
+        pool_width: int = 524288,
+        pool_device: str = "cpu",
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            device=torch.device("cpu"),
+            page_size=page_size,
+            model_config=SimpleNamespace(
+                context_len=context_len, hf_config=SimpleNamespace()
+            ),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.zeros(
+                    1, pool_width, dtype=torch.int32, device=pool_device
+                )
+            ),
+            token_to_kv_pool=SimpleNamespace(),
+            is_hybrid_swa=False,
+            kv_cache_dtype=torch.bfloat16,
+            is_draft_worker=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+        )
+
+    def test_smem_budget_colocated_and_explicit_bs_buckets(self):
+        for ctx, max_ok, bad_bs in (
+            (65472, 254, 255),
+            (261632, 63, 64),
+            (1048576, 15, 32),
+        ):
+            with self.subTest(ctx=ctx):
+                self._assert_smem_budget(ctx=ctx, bs=max_ok)
+                self._assert_smem_budget(
+                    ctx=ctx,
+                    bs=bad_bs,
+                    err=(
+                        "lower --max-running-requests (and "
+                        f"--torch-compile-max-bs if set) to <= {max_ok}"
+                    ),
+                )
+        self._assert_smem_budget(
+            ctx=262144,
+            bs=16,
+            tpu_compile_bs=[1, 16, 64],
+            err=(
+                "needs 1.00 MiB (1,053,184 B) of SMEM, above the 1 MiB (1,048,576 B) scoped budget",
+                "drop any --tpu-compile-bs entries above 63",
+                "lower --max-running-requests (and --torch-compile-max-bs if set) to <= 63",
+            ),
+        )
+
+    def test_smem_budget_eager_and_embedding_warn_on_scheduler_cap_only(self):
+        from sglang.srt.model_executor.model_runner import ModelRunner
+        from sglang.srt.models.transformers import (
+            TransformersForCausalLM,
+            TransformersMoEForCausalLM,
+        )
+
+        # Eager mode ignores dead compile-grid flags when max_running_requests fits.
+        with self.assertNoLogs("sglang_tpu.rpa_smem_budget", level="WARNING"):
+            self._make_backend(
+                context_len=1048576,
+                pool_width=2097152,
+                req_to_token_device="meta",
+                enable_torch_compile=False,
+                torch_compile_max_bs=32,
+                tpu_compile_bs=[1, 64],
+                max_running_requests=8,
+                scoped_override=True,
+            )
+
+        # Zero-flag eager mode at 1M ctx warns on max_running_requests=32 without raising.
+        with self.assertLogs("sglang_tpu.rpa_smem_budget", level="WARNING") as logs:
+            self._make_backend(
+                context_len=1048576,
+                pool_width=2097152,
+                req_to_token_device="meta",
+                enable_torch_compile=False,
+                torch_compile_max_bs=32,
+                tpu_compile_bs=[1, 64],
+                max_running_requests=32,
+                scoped_override=True,
+            )
+        joined = "\n".join(logs.output)
+        self.assertIn("RPA kernel for 32 sequences", joined)
+        self.assertIn("lower --max-running-requests to <= 15", joined)
+        self.assertNotIn("--torch-compile-max-bs", joined)
+        self.assertNotIn("--tpu-compile-bs", joined)
+
+        # --is-embedding skips decoder compilation even with enable_torch_compile=True.
+        with self.assertNoLogs("sglang_tpu.rpa_smem_budget", level="WARNING"):
+            self._make_backend(
+                context_len=1048576,
+                pool_width=2097152,
+                req_to_token_device="meta",
+                enable_torch_compile=True,
+                is_embedding=True,
+                torch_compile_max_bs=32,
+                max_running_requests=32,
+                prefill_max_requests=8,
+                scoped_override=True,
+            )
+        with self.assertLogs("sglang_tpu.rpa_smem_budget", level="WARNING") as emb_logs:
+            self._make_backend(
+                context_len=1048576,
+                pool_width=2097152,
+                req_to_token_device="meta",
+                enable_torch_compile=True,
+                is_embedding=True,
+                torch_compile_max_bs=32,
+                max_running_requests=32,
+                prefill_max_requests=32,
+                scoped_override=True,
+            )
+        self.assertIn(
+            "lower --prefill-max-requests to <= 15", "\n".join(emb_logs.output)
+        )
+
+        # Real ModelRunner instances gate on is_generation and _can_torch_compile.
+        with get_context().override_server_args(enable_torch_compile=True):
+            non_gen_mr = ModelRunner.__new__(ModelRunner)
+            non_gen_mr.is_generation = False
+            non_gen_mr.model = SimpleNamespace()
+            self.assertEqual(_runner_compile_mode(non_gen_mr), (False, False))
+
+            for model_cls in (TransformersForCausalLM, TransformersMoEForCausalLM):
+                hf_model = model_cls.__new__(model_cls)
+                hf_model._compile_compatible = False
+                opt_out_mr = ModelRunner.__new__(ModelRunner)
+                opt_out_mr.is_generation = True
+                opt_out_mr.model = hf_model
+                self.assertEqual(_runner_compile_mode(opt_out_mr), (False, True))
+
+    def test_smem_budget_attention_dp_remedy_rounding(self):
+        from sglang.srt.distributed.parallel_state import patch_tensor_parallel_group
+
+        # dp=2, attn_tp=4, max_seqs=15 -> per-worker <= 12, global mrr <= 24.
+        self._assert_smem_budget(ctx=1048576, bs=12, attn_dp_size=2)
+        self._assert_smem_budget(
+            ctx=1048576,
+            bs=16,
+            attn_dp_size=2,
+            err=(
+                "lower --max-running-requests to <= 24",
+                "--torch-compile-max-bs to <= 12",
+            ),
+        )
+        # Speculative draft backends build inside patch_tensor_parallel_group(...,
+        # owns_attention=True), which scopes parallel.attn_dp_size to 1 while the
+        # deployment's num_dp_ranks remains 2.
+        with (
+            get_context().override_server_args(
+                enable_torch_compile=True,
+                tp_size=8,
+                dp_size=2,
+                enable_dp_attention=True,
+                enable_dp_lm_head=True,
+                page_size=self.PAGE_SIZE,
+                torch_compile_max_bs=16,
+                max_running_requests=32,
+                speculative_algorithm="EAGLE3",
+                speculative_num_draft_tokens=self.DRAFT_TOKENS,
+                speculative_eagle_topk=1,
+            ),
+            get_flags().dp.override(enabled=True),
+            get_parallel().override(
+                tp_size=8,
+                tp_rank=0,
+                attn_tp_size=4,
+                attn_tp_rank=0,
+                attn_dp_size=2,
+                attn_dp_rank=0,
+                attn_dp_enabled=True,
+                attn_cp_size=1,
+            ),
+            patch_tensor_parallel_group(
+                SimpleNamespace(world_size=4, rank_in_group=0), owns_attention=True
+            ),
+        ):
+            self.assertEqual(get_parallel().attn_dp_size, 1)
+            runner = self._make_minimal_runner(
+                context_len=1048576, pool_width=2097152, pool_device="meta"
+            )
+            runner.spec_algorithm = SpeculativeAlgorithm.EAGLE3
+            with (
+                patch(
+                    "sglang_tpu.attention_pallas_rpa_base._build_pallas_kernel_op",
+                    return_value=None,
+                ),
+                self.assertRaises(ValueError) as draft_cm,
+            ):
+                TpuPallasRpaV3AttnBackend(runner)
+        self.assertIn("lower --max-running-requests to <= 24", str(draft_cm.exception))
+        self.assertIn("--torch-compile-max-bs to <= 12", str(draft_cm.exception))
+        # ctx=4M -> max_seqs=3 < attn_tp=4 rounds per-worker cap to 0.
+        self._assert_smem_budget(
+            ctx=4194304,
+            bs=4,
+            attn_dp_size=2,
+            err="raise --page-size or lower --context-length",
+        )
+
+    def test_smem_budget_disaggregated_prefill_and_decode(self):
+        self._assert_smem_budget(
+            ctx=1048576, bs=64, disaggregation_mode="prefill", prefill_max_requests=8
+        )
+        self._assert_smem_budget(
+            ctx=1048576,
+            bs=64,
+            disaggregation_mode="prefill",
+            prefill_max_requests=32,
+            err="lower --prefill-max-requests to <= 15",
+        )
+        self._assert_smem_budget(
+            ctx=1048576,
+            bs=32,
+            disaggregation_mode="prefill",
+            prefill_max_requests=8,
+            attn_dp_size=2,
+            err=(
+                "lower --max-running-requests to <= 24",
+                "--torch-compile-max-bs to <= 12",
+            ),
+        )
+        self._assert_smem_budget(
+            ctx=1048576,
+            bs=32,
+            disaggregation_mode="prefill",
+            prefill_max_requests=8,
+            enable_mixed_chunk=True,
+            err="lower --max-running-requests (and --torch-compile-max-bs if set) to <= 15",
+        )
+        self._assert_smem_budget(
+            ctx=1048576,
+            bs=32,
+            disaggregation_mode="decode",
+            prefill_max_requests=4,
+            err="lower --max-running-requests (and --torch-compile-max-bs if set) to <= 15",
+        )
+
+    def test_smem_budget_colocated_context_parallel(self):
+        mrr_63 = (
+            "lower --max-running-requests (and --torch-compile-max-bs if set) to <= 63"
+        )
+        self._assert_smem_budget(
+            ctx=262144,
+            bs=64,
+            cp=2,
+            err=(
+                "128 sequences",
+                "lower --max-running-requests (and --torch-compile-max-bs if set) to <= 31",
+            ),
+        )
+        self._assert_smem_budget(
+            ctx=262144,
+            bs=64,
+            cp=2,
+            prefill_max_requests=60,
+            err=("lower --prefill-max-requests to <= 31", mrr_63),
+        )
+        self._assert_smem_budget(
+            ctx=262144,
+            bs=63,
+            cp=2,
+            prefill_max_requests=60,
+            err="lower --prefill-max-requests to <= 31",
+            absent="--max-running-requests",
+        )
+        self._assert_smem_budget(
+            ctx=262144,
+            bs=64,
+            cp=2,
+            prefill_max_requests=31,
+            err=mrr_63,
+            absent="--prefill-max-requests",
+        )
+        self._assert_smem_budget(ctx=262144, bs=63, cp=2, prefill_max_requests=31)
+
+    def test_smem_budget_prefill_cp_and_zero_cap_edges(self):
+        self._assert_smem_budget(
+            ctx=1048576,
+            bs=64,
+            cp=2,
+            disaggregation_mode="prefill",
+            prefill_max_requests=7,
+        )
+        self._assert_smem_budget(
+            ctx=1048576,
+            bs=64,
+            cp=2,
+            disaggregation_mode="prefill",
+            prefill_max_requests=8,
+            err="lower --prefill-max-requests to <= 7",
+        )
+        page_remedy = "raise --page-size or lower --context-length"
+        self._assert_smem_budget(ctx=33554432, bs=1, err=page_remedy, absent="<=")
+        self._assert_smem_budget(
+            ctx=33554432,
+            bs=1,
+            disaggregation_mode="prefill",
+            prefill_max_requests=1,
+            err=page_remedy,
+            absent="<=",
+        )
+        # Tied zero caps report the larger family (256 decode vs 128 CP rows).
+        self._assert_smem_budget(
+            ctx=33554432,
+            bs=256,
+            cp=2,
+            tpu_compile_tokens=[64],
+            err=("RPA kernel for 256 sequences", page_remedy),
+            absent="for 128 sequences",
+        )
+        self._assert_smem_budget(ctx=33554432, bs=0)
+
+    def _assert_cp_metadata_bound(
+        self,
+        backend,
+        *,
+        fits_pad_b: int,
+        pages_per_seq: int,
+        error_regex: str,
+    ) -> None:
+        from sglang_tpu.cp_layout import build_tpu_cp_layout
+
+        for pad_b, should_raise in ((fits_pad_b, False), (fits_pad_b + 1, True)):
+            host = build_tpu_cp_layout(
+                extend_lens=[16],
+                prefix_lens=[0],
+                cp_size=2,
+                cp_rank=0,
+                pad_b=pad_b,
+                local_rows_padded=16,
+            )
+            cp_layout = SimpleNamespace(host=host)
+            fb = SimpleNamespace(
+                seq_lens=torch.ones(pad_b, dtype=torch.int32),
+                req_pool_indices_cpu=torch.zeros(pad_b, dtype=torch.int64),
+            )
+            if should_raise:
+                with self.assertRaisesRegex(ValueError, error_regex):
+                    backend._build_cp_metadata(fb, cp_layout)
+            else:
+                meta = backend._build_cp_metadata(fb, cp_layout)
+                self.assertEqual(
+                    meta.page_indices.numel(), 2 * fits_pad_b * pages_per_seq
+                )
+
+    def test_cp_metadata_uses_v3_smem_estimate(self):
+        # At 261632 (+ EAGLE3 extra -> 4090 pages/seq), 2 * 31 = 62 rows fits
+        # while 2 * 32 = 64 rows raises ValueError under the 9-buffer v3 model.
+        backend = self._make_backend(
+            context_len=261632,
+            pool_width=262144,
+            req_to_token_device="cpu",
+            enable_torch_compile=True,
+            torch_compile_max_bs=32,
+        )
+        self.assertEqual(
+            _get_pages_per_seq(max_context_len=backend.max_context_len, page_size=64),
+            4090,
+        )
+        self._assert_cp_metadata_bound(
+            backend,
+            fits_pad_b=31,
+            pages_per_seq=4090,
+            error_regex=(
+                r"RPA kernel for 64 context-parallel rows x 4090 pages needs "
+                r"1\.00 MiB \(1,051,136 B\).*lower --max-running-requests "
+                r"\(and --torch-compile-max-bs if set\) to <= 31"
+            ),
+        )
+        with get_context().override_server_args(
+            enable_torch_compile=True, prefill_max_requests=40
+        ):
+            self._assert_cp_metadata_bound(
+                backend,
+                fits_pad_b=31,
+                pages_per_seq=4090,
+                error_regex=r"lower --prefill-max-requests to <= 31",
+            )
+
+    def test_batched_rpa_and_mla_cp_use_page_table_bound(self):
+        from sglang_tpu.attention_pallas_mla import TpuPallasMlaAttnBackend
+        from sglang_tpu.attention_pallas_rpa_batched import (
+            TpuPallasRpaBatchedAttnBackend,
+        )
+
+        # Unmodeled subclasses (_smem_estimator() -> None) warn in __init__ and
+        # enforce page-table SMEM in _build_cp_metadata.
+        cases = (
+            (
+                TpuPallasRpaBatchedAttnBackend,
+                "sglang_tpu.attention_pallas_rpa_base._build_pallas_kernel_op",
+                dict(context_len=1048576, page_size=256, pool_width=2097152),
+                dict(page_size=256, torch_compile_max_bs=32),
+                "lower --max-running-requests (and --torch-compile-max-bs if set) to <= 31",
+                4097,
+                31,
+                r"RPA page table for 64 context-parallel rows x 4097 pages needs 1\.00 MiB \(1,049,088 B\).*<= 31",
+            ),
+            (
+                TpuPallasMlaAttnBackend,
+                "sglang_tpu.attention_pallas_mla._build_pallas_mla_kernel_op",
+                dict(context_len=261696),
+                dict(page_size=64, torch_compile_max_bs=40, prefill_max_requests=35),
+                "lower --prefill-max-requests to <= 32",
+                4090,
+                32,
+                r"RPA page table for 66 context-parallel rows x 4090 pages.*lower --prefill-max-requests to <= 32",
+            ),
+        )
+        for (
+            cls,
+            patch_target,
+            runner_kw,
+            args_kw,
+            warn_sub,
+            pages,
+            fits_b,
+            err,
+        ) in cases:
+            with (
+                self.subTest(cls=cls.__name__),
+                get_context().override_server_args(
+                    enable_torch_compile=True, **args_kw
+                ),
+                get_parallel().override(
+                    tp_size=4,
+                    attn_tp_size=2,
+                    attn_dp_size=1,
+                    attn_dp_enabled=False,
+                    attn_cp_size=2,
+                    moe_tp_size=2,
+                    moe_dp_size=2,
+                    moe_ep_size=1,
+                ),
+                patch(patch_target, return_value=None),
+                self.assertLogs("sglang_tpu.rpa_smem_budget", level="WARNING") as logs,
+            ):
+                inst = cls(self._make_minimal_runner(**runner_kw))
+                joined = "\n".join(logs.output)
+                self.assertIn("above the 1 MiB (1,048,576 B) scoped budget", joined)
+                self.assertIn(warn_sub, joined)
+                self.assertEqual(
+                    _get_pages_per_seq(
+                        max_context_len=inst.max_context_len,
+                        page_size=args_kw["page_size"],
+                    ),
+                    pages,
+                )
+                self._assert_cp_metadata_bound(
+                    inst, fits_pad_b=fits_b, pages_per_seq=pages, error_regex=err
+                )
 
     def test_target_verify_bump_fits_rectangular_page_stride(self):
         backend = self._make_backend()
