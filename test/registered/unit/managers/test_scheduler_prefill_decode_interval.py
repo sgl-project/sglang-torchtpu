@@ -86,9 +86,7 @@ class TestPrefillDecodeInterval(unittest.TestCase):
     def test_skip_idle_does_not_defer_without_a_decode_to_interleave(self):
         # Each deferred loop iteration only idles the device when nothing decodes;
         # the interval resumes counting once requests decode again.
-        scheduler = _make_scheduler(
-            interval=3, require_mlp_sync=False, skip_idle=True
-        )
+        scheduler = _make_scheduler(interval=3, require_mlp_sync=False, skip_idle=True)
         batch = _make_batch(local_extend=True, global_extend=False)
 
         scheduler._arm_prefill_decode_interval(batch)

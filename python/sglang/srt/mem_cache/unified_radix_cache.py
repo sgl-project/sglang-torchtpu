@@ -3300,9 +3300,12 @@ class UnifiedRadixCache(BasePrefixCache):
             device="cpu",
         )
         from sglang_tpu.diag_timing import timed as _dt
+
         with _dt("2b_hicache_allreduce"):
             if self.host_memory_mode == "buffer_only" and self.pp_size > 1:
-                self._all_reduce_attn_groups(ready_counts, torch.distributed.ReduceOp.MIN)
+                self._all_reduce_attn_groups(
+                    ready_counts, torch.distributed.ReduceOp.MIN
+                )
             else:
                 self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 

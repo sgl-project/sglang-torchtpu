@@ -388,7 +388,8 @@ else:
 
 
 logger = logging.getLogger(__name__)
-from sglang_tpu.diag_timing import maybe_log as _dlog, timed as _dt  # DIAG
+from sglang_tpu.diag_timing import maybe_log as _dlog  # DIAG
+from sglang_tpu.diag_timing import timed as _dt
 
 
 def _prewarm_hccl_group(device, group, device_module):
@@ -1380,7 +1381,9 @@ class Scheduler(
         )
         # Like skip-idle, a per-rank chunked request would split the DP cadence.
         self.prefill_decode_interval_chunked = (
-            None if self.require_mlp_sync else envs.SGLANG_PREFILL_DECODE_INTERVAL_CHUNKED.get()
+            None
+            if self.require_mlp_sync
+            else envs.SGLANG_PREFILL_DECODE_INTERVAL_CHUNKED.get()
         )
         # Like skip-idle, the adaptive interval reads this rank's running batch and queue.
         self._prefill_decode_interval_elapsed = 0
@@ -1909,7 +1912,9 @@ class Scheduler(
             or draft_runner.model.config.vocab_size
         )
 
-        verify_shapes = {compile_policy.draft_token_num: compile_policy.full_verify_buckets()}
+        verify_shapes = {
+            compile_policy.draft_token_num: compile_policy.full_verify_buckets()
+        }
         if isinstance(compile_policy, DFlashSpecDecodeCompilePolicyMixin):
             verify_shapes.update(compile_policy.narrow_verify_shapes())
         for num_verify_tokens, buckets in verify_shapes.items():
@@ -4022,6 +4027,7 @@ class Scheduler(
             or self.enable_lmcache
         ):
             from sglang_tpu.diag_timing import timed as _dt
+
             with _dt("2a_hicache_events"):
                 self.tree_cache.check_hicache_events()
             if self.enable_hicache_storage and should_retry_storage_prefetch:

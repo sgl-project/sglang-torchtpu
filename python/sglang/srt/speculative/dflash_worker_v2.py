@@ -102,7 +102,6 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu, is_xpu
-from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.dflash_adaptive_verify import (
     parse_adaptive_verify,
     select_verify_width,
@@ -114,6 +113,7 @@ from sglang_tpu.dflash_utils_tpu import (
     dflash_verify_bookkeeping_torch,
     gather_dflash_candidate_window,
 )
+from sglang_tpu.envs import envs as tpu_envs
 
 _is_npu = is_npu()
 _is_tpu = is_tpu()
@@ -663,7 +663,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             r.width: torch.arange(r.width, dtype=torch.int64, device=self.device)
             for r in self._adaptive_verify_rules
         }
-        self._verify_tokens_bufs: dict[int, torch.Tensor] = {}  # width -> [cap_bs, width]
+        self._verify_tokens_bufs: dict[
+            int, torch.Tensor
+        ] = {}  # width -> [cap_bs, width]
         self._narrow_block_spec_infos = {
             width: make_draft_block_spec_info(draft_token_num=width, device=self.device)
             for width in self._verify_cols
@@ -1243,7 +1245,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Bucket-wide accept reads these like _draft_block_tokens_buf, ghost rows included.
         self._verify_tokens_bufs = {
             width: torch.full(
-                (new_cap, width), int(self._mask_token_id), dtype=torch.long, device=device
+                (new_cap, width),
+                int(self._mask_token_id),
+                dtype=torch.long,
+                device=device,
             )
             for width in self._verify_cols
         }
@@ -2557,7 +2562,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         cache_loc_2d: torch.Tensor,
         swa_cache_loc_2d: torch.Tensor | None,
     ) -> tuple[
-        torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor | None
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
     ]:
         """Leading ``width`` columns of the prepared [bs, block_size] draft block.
 
@@ -2572,9 +2581,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         embeds = (
             None
             if input_embeds is None
-            else torch.index_select(input_embeds.view(bs, block_size, -1), 1, cols).reshape(
-                bs * width, -1
-            )
+            else torch.index_select(
+                input_embeds.view(bs, block_size, -1), 1, cols
+            ).reshape(bs * width, -1)
         )
         return (
             narrow(block_ids),
@@ -2601,8 +2610,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             return
         self._verify_width_ct[width] = self._verify_width_ct.get(width, 0) + 1
         # Arbitrary period; one line per few minutes of decode.
-        if sum(self._verify_width_ct.values()) % 20000 == 0 and get_parallel().tp_rank == 0:
-            logger.info("DFLASH adaptive verify steps by width: %s", self._verify_width_ct)
+        if (
+            sum(self._verify_width_ct.values()) % 20000 == 0
+            and get_parallel().tp_rank == 0
+        ):
+            logger.info(
+                "DFLASH adaptive verify steps by width: %s", self._verify_width_ct
+            )
 
     def _ensure_accept_bonus_buffers(self, bs: int) -> None:
         if self._accept_bonus_buffer_cap >= int(bs):
@@ -3058,17 +3072,21 @@ class DFlashWorkerV2(BaseSpecWorker):
         if verify_rule is not None:
             # From here on the draft, verify, accept and draft-KV write all run the narrow
             # block; the draft drafts natively at that width.
-            block_ids, input_embeds, positions_2d, verify_out_cache_loc_2d, verify_swa_loc_2d = (
-                self._narrow_draft_block(
-                    width=verify_width,
-                    bs=bs,
-                    block_size=block_size,
-                    block_ids=block_ids,
-                    input_embeds=input_embeds,
-                    positions_2d=positions_2d,
-                    cache_loc_2d=verify_out_cache_loc_2d,
-                    swa_cache_loc_2d=verify_swa_loc_2d,
-                )
+            (
+                block_ids,
+                input_embeds,
+                positions_2d,
+                verify_out_cache_loc_2d,
+                verify_swa_loc_2d,
+            ) = self._narrow_draft_block(
+                width=verify_width,
+                bs=bs,
+                block_size=block_size,
+                block_ids=block_ids,
+                input_embeds=input_embeds,
+                positions_2d=positions_2d,
+                cache_loc_2d=verify_out_cache_loc_2d,
+                swa_cache_loc_2d=verify_swa_loc_2d,
             )
             positions = positions_2d.reshape(-1)
             verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
@@ -3321,7 +3339,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         tail_view = SimpleNamespace(
             req_to_token_pool=batch.req_to_token_pool,
             req_pool_indices=batch.req_pool_indices[n_p:].clone(),
-            req_pool_indices_cpu=torch.as_tensor(batch.req_pool_indices_cpu)[n_p:].clone(),
+            req_pool_indices_cpu=torch.as_tensor(batch.req_pool_indices_cpu)[
+                n_p:
+            ].clone(),
             sampling_info=_tail_sampling_info(
                 batch.sampling_info, reqs=batch.reqs, start=n_p, rows=n_tail
             ),
@@ -3423,7 +3443,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         # --- draft KV: every prompt row, then each tail's committed block rows.
         write_tail = None
         if n_p > 0:
-            ctx_lens = torch.tensor(batch.extend_lens[:n_p], dtype=torch.int32, device=device)
+            ctx_lens = torch.tensor(
+                batch.extend_lens[:n_p], dtype=torch.int32, device=device
+            )
             pf_positions, _ = compute_position(
                 self.model_runner.prefill_attention_backend_str,
                 torch.tensor(batch.prefix_lens[:n_p], dtype=torch.int32, device=device),

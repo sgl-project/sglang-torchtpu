@@ -502,7 +502,6 @@ def test_fused_draft_block_matches_the_step_by_step_prep():
         assert torch.equal(embeds, embed(block_ids=expected_ids))
 
 
-
 def test_adaptive_verify_parse_orders_rules_and_drops_full_width():
     rules = parse_adaptive_verify("5:3:2.54, 3:4:3.06, 2:8:4.05", block_size=8)
     assert rules == (
@@ -549,7 +548,9 @@ def test_adaptive_verify_shapes_map_logical_batches_to_buckets():
     assert adaptive_verify_shapes((), [1, 2, 4]) == {}
     # Bucket 4 also serves bs 3 and 4, so only bucket 8 drops its full-width graph.
     assert full_verify_buckets(rules, [1, 2, 4, 8]) == [1, 2]
-    assert full_verify_buckets(parse_adaptive_verify("4:4:3.06", block_size=8), [1, 2, 4, 8]) == [1, 2, 4]
+    assert full_verify_buckets(
+        parse_adaptive_verify("4:4:3.06", block_size=8), [1, 2, 4, 8]
+    ) == [1, 2, 4]
     assert full_verify_buckets((), [1, 2, 4]) == [1, 2, 4]
 
 
