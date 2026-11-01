@@ -693,6 +693,10 @@ class Sampler(nn.Module):
             #
             # Use broadcast because TPU MIN all-reduce is unsupported.
             if batch_next_token_ids.device.type == "tpu":
+                # A TPU subgroup collective launches on every device of the slice, and
+                # only some DP groups hold grammar requests: a grammar-only sync hangs.
+                if is_dp_attention_enabled() and not SYNC_TOKEN_IDS_ACROSS_TP:
+                    return
                 parallel = get_parallel()
                 tp_group = (
                     parallel.attn_tp_group
