@@ -403,6 +403,8 @@ class InklingMMConfig(PretrainedConfig):
 class InklingConvStateShape:
     conv: list[tuple[int, int]]
     temporal: tuple[int, int, int]
+    # None: each conv dim is a single shard group (read by the TPU state pool).
+    conv_shard_groups: Optional[list[int]] = None
 
     # Conv tuples read (K-1, dim) — the overlapping dedup view would alias
     # along the dim axis, so the dedup conv-intermediate layout must stay off.

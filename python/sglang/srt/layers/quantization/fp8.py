@@ -30,6 +30,7 @@ from sglang.srt.layers.amx_utils import (
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
+from sglang.srt.layers.moe.tpu_moe_utils import tpu_moe_activation
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
 )
@@ -3046,7 +3047,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 return apply_fp8_fused_rs(
                     layer=layer,
                     dispatch_output=dispatch_output,
-                    activation=moe_runner_config.activation,
+                    activation=tpu_moe_activation(
+                        moe_runner_config.activation,
+                        gemm1_alpha=moe_runner_config.gemm1_alpha,
+                        gemm1_clamp_limit=moe_runner_config.gemm1_clamp_limit,
+                    ),
                     swiglu_limit=moe_runner_config.swiglu_limit,
                 )
             from sglang_tpu.fp8_moe import apply_tpu_fp8_moe
@@ -3054,7 +3059,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return apply_tpu_fp8_moe(
                 layer=layer,
                 dispatch_output=dispatch_output,
-                activation=moe_runner_config.activation,
+                activation=tpu_moe_activation(
+                    moe_runner_config.activation,
+                    gemm1_alpha=moe_runner_config.gemm1_alpha,
+                    gemm1_clamp_limit=moe_runner_config.gemm1_clamp_limit,
+                ),
                 block_quant=self.block_quant,
                 apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
                 no_combine=moe_runner_config.no_combine,
