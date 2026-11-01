@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
 import msgspec
@@ -12,6 +13,18 @@ from sglang_tpu.experimental import uses_host_batch
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+
+class ReindexableFutureRows(ABC):
+    """A draft input whose published state can be resolved by request-pool row."""
+
+    @abstractmethod
+    def can_reindex_future_rows(self) -> bool:
+        """Whether every live row is owned by the overlap FutureMap."""
+
+    @abstractmethod
+    def reindex_future_rows(self, future_indices: torch.Tensor) -> None:
+        """Drop direct state; FutureMap must resolve these rows before forward."""
 
 
 def _select_device_accept_cache_locs(
