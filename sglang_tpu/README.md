@@ -202,7 +202,11 @@ built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
 - torch.compile with the `tpu` backend and static shapes; TeaCache dropped and
   the VAE left eager under compile; `--offload-during-compile` off.
 - Runtime patches applied at worker init (`multimodal_gen/worker.py`), each with
-  the debt header: `rope.py` (RoPE without stride-2 lane access).
+  the debt header: `rope.py` (RoPE without stride-2 lane access),
+  `minimax_h3.py` (MiniMax-H3 packed sequences padded to 512 rows, only the 50
+  DiT blocks compiled, the breakable-CUDA-graph break point skipped, blocks
+  marked spmd-safe) and `ulysses.py` (lane-dense `[dim0, -1, last two dims]`
+  all-to-all for every Ulysses caller).
 
 Gates that take the OOT arm, with the same outcome as the built-in platform:
 
