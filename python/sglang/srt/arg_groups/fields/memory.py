@@ -87,6 +87,20 @@ class Memory(msgspec.Struct):
         bool,
         "Track per-session references on UnifiedRadixCache KV: eviction consumes unreferenced entries before referenced ones, and closing a session only dereferences its KV.",
     ] = False
+    session_id_header: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Take a request's session_id from this HTTP header on the OpenAI "
+                "chat and completions endpoints when the body sets neither "
+                "session_id nor session_params (with --enable-session-radix-cache, "
+                "one radix-native session per header value). Without a value: "
+                "X-Correlation-ID. Off when omitted."
+            ),
+            nargs="?",
+            const="X-Correlation-ID",
+        ),
+    ] = None
     radix_cache_backend: A[
         Optional[str],
         "Name of a radix-cache backend previously registered via register_radix_cache_backend. Omit this flag to use the built-in default cache selection chain.",

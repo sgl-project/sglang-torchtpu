@@ -161,6 +161,7 @@ POSITIONAL_FIELD_ORDER = (
     "incremental_streaming_output",
     "enable_streaming_session",
     "enable_session_radix_cache",
+    "session_id_header",
     "log_level",
     "log_level_http",
     "log_requests",
