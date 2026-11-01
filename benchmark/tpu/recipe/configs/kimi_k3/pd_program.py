@@ -48,7 +48,15 @@ PREFILL_CHUNK = PAGE_SIZE
 # a rank's 96 GB (experts 45, dense 6, its sequence-parallel copies of the
 # latent and shared projections 22.5), so its pools share ~12 GB: 128
 # checkpoints, 96 tails (38 MB each) and ~8M tokens of KV at 580 bytes.
-PREFILL_CHECKPOINTS = int(os.environ.get("K3_PROGRAM_PREFILL_CHECKPOINTS", "128"))
+# A prefix hit resumes only at a checkpoint, and running requests hold
+# several slots each: at concurrency 32, 128 checkpoints let bursts evict
+# cached prefixes (4.9M tokens in 9 minutes, effective hit ~81%) and the
+# prefill queue grew to 32 requests. Eight a session, 128 to 384.
+PREFILL_CHECKPOINTS = int(
+    os.environ.get(
+        "K3_PROGRAM_PREFILL_CHECKPOINTS", str(min(384, max(128, 8 * CONCURRENCY)))
+    )
+)
 
 CONFIG = deepcopy(SERVER_CONFIG)
 server_args = CONFIG["server_args"]
