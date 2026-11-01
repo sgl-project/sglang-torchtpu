@@ -3048,7 +3048,9 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     # per owner group (one without y blocks): its few-row experts, then its
                     # large ones; the DMA ring and the block sends run on the global index
                     def group(g, carry):
-                        lo = jnp.where(g == 0, 0, rget("blk_end", jnp.maximum(g - 1, 0)))
+                        lo = jnp.where(
+                            g == 0, 0, rget("blk_end", jnp.maximum(g - 1, 0))
+                        )
                         mid, hi = rget("blk_mid", g), rget("blk_end", g)
                         carry = jax.lax.fori_loop(
                             lo, mid, functools.partial(ebody, part="few"), carry
