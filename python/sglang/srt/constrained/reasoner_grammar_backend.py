@@ -353,7 +353,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         ret = self.grammar_backend._init_value_dispatch(key, reasoning)
         if ret is None or isinstance(ret, InvalidGrammarObject):
             return ret
-        if key[0] == "full_assistant_ebnf":
+        if key[0] in ("full_assistant_ebnf", "inkling_json"):
             return ret
         if not self.enable_strict_thinking and key[0] == "structural_tag":
             from sglang.srt.function_call.inkling_detector import InklingDetector

@@ -256,6 +256,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     f"Failed to create XGrammar TokenizerInfo from tokenizer: {e}"
                 )
 
+        self.tokenizer_info = tokenizer_info
         self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
@@ -393,6 +394,16 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="ebnf"))
+
+    def dispatch_full_assistant_ebnf(self, key_string: str) -> BaseGrammarObject:
+        return self.dispatch_ebnf(key_string)
+
+    def dispatch_fallback(self, key_type: str, key_string: str) -> BaseGrammarObject:
+        if key_type == "inkling_json":
+            from sglang.tml.inkling_grammar import compile_json_response
+
+            return compile_json_response(self, key_string)
+        return super().dispatch_fallback(key_type, key_string)
 
     def dispatch_regex(self, key_string: str) -> BaseGrammarObject:
         try:
