@@ -22,6 +22,8 @@ Environment:
     K3_PROGRAM_CONTEXT              context length (default 1048576)
     K3_PROGRAM_KV_DTYPE             fp8_e4m3 (default, as vLLM-TorchTPU's AgentX
                                     sweep) or bf16
+    K3_PROGRAM_DECODE_RUNNING       the decode's running requests (default
+                                    twice the concurrency, up to 64)
     SGLANG_TPU_K3_PROGRAM_PRESHARDED pre-sharded weights directory
 """
 
@@ -40,6 +42,14 @@ PAGE_SIZE = 32 * (512 if KV_DTYPE.startswith("fp8") else 256)
 # programs' plain decode is checked to (without attention DP); the prefill
 # holds what it is computing or transferring.
 RUNNING = min(64, max(4, 2 * CONCURRENCY)) if ROLE == "decode" else max(4, CONCURRENCY)
+# A smaller decode batch keeps every step speculating: three drafts verify up
+# to 16 requests (64 rows), and past that the decode steps plain. At AgentX
+# concurrency 32 with 64 slots, ~18 requests decoded on average and 46% of
+# steps ran 17-32 requests plain (ITL 17.4 ms); 16 requests at three drafts
+# emit more tokens a second than 17-28 plain, and the others wait their turn
+# with their KV already transferred.
+if ROLE == "decode":
+    RUNNING = int(os.environ.get("K3_PROGRAM_DECODE_RUNNING", RUNNING))
 # A prefill chunk is one page: every full chunk ends on a KDA checkpoint the
 # prefix cache keeps (the programs' windows split it as they need).
 PREFILL_CHUNK = PAGE_SIZE
@@ -105,7 +115,7 @@ if ROLE == "decode":
         # as many again for requests still arriving over the transfer: the
         # decode never retracts.
         max_mamba_cache_size=2 * RUNNING,
-        max_total_tokens=2 * RUNNING * CONTEXT_LENGTH,
+        max_total_tokens=2 * max(RUNNING, CONCURRENCY) * CONTEXT_LENGTH,
     )
     if DECODE_PREFIX_CACHE:
         server_args.update(
