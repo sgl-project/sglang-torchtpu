@@ -31,7 +31,9 @@ from sglang.test.pd_overload_stress import (
     Outcome,
     RetryProxy,
     StressLedger,
+    color_video_part,
     scrape_counters,
+    square_image_part,
 )
 from sglang.test.tpu import MUSE_SPARK
 from sglang.test.tpu.utils.pd_singlehost_base import PDSingleHostTestCase
@@ -141,12 +143,61 @@ class TestMuseSparkPDOverloadStress(PDSingleHostTestCase):
         )
         return passed, error
 
+    def _preflight(self) -> None:
+        """One image and one video answered correctly before any load.
+
+        A missing video decoder or vision tower fails every multimodal request;
+        catching it here costs one request instead of the whole stress flow.
+        """
+        import requests
+
+        cases = (
+            (
+                square_image_part("blue"),
+                "What color is the square? Reply with the color only.",
+                "blue",
+            ),
+            (
+                color_video_part(("red", "green")),
+                "Name the square colors at the beginning and end of the video, "
+                "in order. Reply with only the two colors.",
+                "red",
+            ),
+        )
+        for part, question, expected in cases:
+            response = requests.post(
+                self.base_url + "/v1/chat/completions",
+                json={
+                    "model": MODEL,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [part, {"type": "text", "text": question}],
+                        }
+                    ],
+                    "temperature": 0,
+                    "max_tokens": 512,
+                    "chat_template_kwargs": {"reasoning_effort": "low"},
+                },
+                timeout=1800,
+            )
+            self.assertEqual(
+                response.status_code,
+                200,
+                f"{part['type']} preflight failed: {response.text[:500]}",
+            )
+            answer = response.json()["choices"][0]["message"].get("content") or ""
+            self.assertIn(
+                expected, answer.lower(), f"{part['type']} preflight: {answer!r}"
+            )
+
     def test_overload_drain_and_quality(self):
         if self.role == "decode":
             self.run_evaluations()
             return
 
         healthy_at = time.monotonic()
+        self._preflight()
         failures: list[str] = []
         engines = self._engine_urls()
         driver_ledger = StressLedger()
