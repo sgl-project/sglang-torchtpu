@@ -61,6 +61,16 @@ class TestSessionIdHeaderCli(CustomTestCase):
         args = self._parse(["--session-id-header", "X-Session-ID"])
         self.assertEqual(args.session_id_header, "X-Session-ID")
 
+    def test_session_leaf_flags(self):
+        off = self._parse([])
+        self.assertFalse(off.session_leaf_at_prompt_end)
+        self.assertFalse(off.session_release_evicted_leaf)
+        on = self._parse(
+            ["--session-leaf-at-prompt-end", "--session-release-evicted-leaf"]
+        )
+        self.assertTrue(on.session_leaf_at_prompt_end)
+        self.assertTrue(on.session_release_evicted_leaf)
+
 
 class TestSessionIdFromHeader(CustomTestCase):
     def _completion(self, header, **req_kwargs):

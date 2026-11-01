@@ -460,6 +460,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.is_write_back = False
         self.has_swa_host_pool = False
         self.enable_session_radix_cache = params.enable_session_radix_cache
+        self.session_release_evicted_leaf = getattr(
+            params, "session_release_evicted_leaf", False
+        )
         self.swa_host_evict_passed_first = (
             envs.SGLANG_HICACHE_SWA_HOST_EVICT_PASSED_FIRST.get()
             and not self.enable_session_radix_cache

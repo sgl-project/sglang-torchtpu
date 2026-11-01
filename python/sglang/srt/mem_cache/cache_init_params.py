@@ -34,6 +34,8 @@ class CacheInitParams:
     enable_metrics: bool = False
     enable_kv_cache_events: bool = False
     enable_session_radix_cache: bool = False
+    session_leaf_at_prompt_end: bool = False
+    session_release_evicted_leaf: bool = False
 
     enable_mamba_extra_buffer: bool = False
     enable_mamba_extra_buffer_lazy: bool = False

@@ -283,7 +283,13 @@ class TreeComponent(ABC):
         for session_id in tuple(cd.session_ids or ()):
             leaves = self._session_leaves.get(session_id)
             assert leaves is not None and node in leaves
-            fallback = self._find_reusable_session_leaf(node.parent)
+            # session_release_evicted_leaf: an evicted leaf ends the coverage instead of
+            # receding it, so a session that stopped advancing stops protecting its path.
+            fallback = (
+                None
+                if getattr(self.tree_core, "session_release_evicted_leaf", False)
+                else self._find_reusable_session_leaf(node.parent)
+            )
             if fallback is not None and fallback in self._session_leaves.get(
                 session_id, ()
             ):

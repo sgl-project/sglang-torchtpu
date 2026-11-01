@@ -370,6 +370,8 @@ def build_kv_cache(
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
+        session_leaf_at_prompt_end=get_memory().session_leaf_at_prompt_end,
+        session_release_evicted_leaf=get_memory().session_release_evicted_leaf,
         enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
         enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
         pp_rank=parallel.pp_rank,

@@ -87,6 +87,14 @@ class Memory(msgspec.Struct):
         bool,
         "Track per-session references on UnifiedRadixCache KV: eviction consumes unreferenced entries before referenced ones, and closing a session only dereferences its KV.",
     ] = False
+    session_leaf_at_prompt_end: A[
+        bool,
+        "With --enable-session-radix-cache, a finished request's session leaf is the deepest node of its inserted path that ends at or below its page-aligned prompt, not the end of its output. Agentic clients resend the assistant turn as re-rendered text, so the next turn diverges at the prompt end and only a prompt-end leaf lets the session's coverage advance.",
+    ] = False
+    session_release_evicted_leaf: A[
+        bool,
+        "With --enable-session-radix-cache, when a session leaf's node leaves the tree (its KV is gone from device and host), release that coverage instead of moving it to the nearest reusable ancestor, so a session that stopped advancing stops protecting its path.",
+    ] = False
     session_id_header: A[
         Optional[str],
         Arg(
