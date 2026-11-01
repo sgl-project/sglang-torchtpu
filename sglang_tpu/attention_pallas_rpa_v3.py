@@ -21,6 +21,7 @@ from sglang_tpu.attention_pallas_rpa_base import (
     PallasForwardMetadata,
     RpaKernelSpec,
 )
+from sglang_tpu.rpa_smem_budget import align_to_128, page_table_smem_bytes
 
 __all__ = [
     "PallasForwardMetadata",
@@ -79,6 +80,14 @@ def _invoke_v3_kernel(
     )
 
 
+# Mirrors ragged_paged_attention_v3.get_smem_estimate_bytes in pure Python;
+# adds 8 128-aligned i32 scalar-prefetch buffers to page_indices[n * p].
+def _get_smem_estimate_bytes(max_num_seqs: int, pages_per_seq: int) -> int:
+    return page_table_smem_bytes(max_num_seqs, pages_per_seq) + 4 * (
+        align_to_128(max_num_seqs) + 3 * align_to_128(max_num_seqs + 1) + 4 * 128
+    )
+
+
 RPA_V3_SPEC = RpaKernelSpec(
     op_name="sglang_tpu_pallas::ragged_paged_attention",
     import_kernel=_import_v3_kernel,
@@ -87,6 +96,7 @@ RPA_V3_SPEC = RpaKernelSpec(
     uses_cu_kv_lens=True,
     extend_distribution_mask=(0, 1, 1),  # [0, n, n]
     supports_decode_query_size=True,
+    smem_estimate_bytes=_get_smem_estimate_bytes,
 )
 
 

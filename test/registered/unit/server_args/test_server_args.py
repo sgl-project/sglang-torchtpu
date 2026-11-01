@@ -2749,6 +2749,122 @@ class TestTpuBatchLimitsUnderAttentionDp(CustomTestCase):
         self.assertEqual(resolution_result(args, "tpu_compile_bs"), [1, 2, 4, 8])
 
 
+class TestTorchCompileMaxBsResolution(CustomTestCase):
+    def _make_checkpoint(self, config: dict) -> str:
+        tmpdir = tempfile.mkdtemp(prefix="torch_compile_max_bs_")
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        with open(os.path.join(tmpdir, "config.json"), "w") as handle:
+            json.dump(config, handle)
+        return tmpdir
+
+    def _resolve_tpu(self, model_dir: str, **overrides) -> ServerArgs:
+        with (
+            override_platform(is_tpu=True, is_cuda=False, is_hip=False),
+            patch(
+                "sglang.srt.platforms.current_platform",
+                tpu_platform.TpuSRTPlatform(),
+            ),
+            patch("sglang_tpu.patches._prepare_tpu_env"),
+            patch(
+                "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                return_value=None,
+            ),
+        ):
+            args = ServerArgs(
+                model_path=model_dir,
+                device="tpu",
+                random_seed=42,
+                **overrides,
+            )
+            args.resolve_once()
+        return args
+
+    def test_tpu_resolve_once_batch_limit_reconciliation(self):
+        llama_dir = self._make_checkpoint(
+            {
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "hidden_size": 1024,
+                "intermediate_size": 2048,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 8,
+                "num_hidden_layers": 2,
+                "vocab_size": 128,
+                "max_position_embeddings": 1048576,
+                "torch_dtype": "bfloat16",
+            }
+        )
+        cases = (
+            (dict(context_length=131072), None, 32, 32),
+            (dict(context_length=262144), None, 32, 32),
+            (dict(context_length=1048576, max_running_requests=8), None, 8, 8),
+            (dict(torch_compile_max_bs=16), 16, 16, 16),
+            (dict(torch_compile_max_bs=16, max_running_requests=8), 16, 16, 8),
+            (dict(torch_compile_max_bs=16, max_running_requests=32), 16, 32, 32),
+            (
+                dict(tp_size=8, attn_dp_size=2, enable_dp_lm_head=True),
+                None,
+                32,
+                64,
+            ),
+            (dict(tpu_compile_bs=[1, 4, 16]), None, 16, 16),
+        )
+        for overrides, raw_tcmb, expected_tcmb, expected_mrr in cases:
+            with self.subTest(**overrides):
+                args = self._resolve_tpu(llama_dir, **overrides)
+                self.assertEqual(args.torch_compile_max_bs, raw_tcmb)
+                self.assertEqual(
+                    resolution_result(args, "torch_compile_max_bs"), expected_tcmb
+                )
+                self.assertEqual(
+                    resolution_result(args, "max_running_requests"), expected_mrr
+                )
+                if "tpu_compile_bs" in overrides:
+                    self.assertEqual(
+                        resolution_result(args, "tpu_compile_bs"),
+                        overrides["tpu_compile_bs"],
+                    )
+
+    def test_cpu_unset_and_explicit_compile_cap(self):
+        for explicit_cap, expected in ((None, 32), (16, 16)):
+            with self.subTest(torch_compile_max_bs=explicit_cap):
+                extra = (
+                    {}
+                    if explicit_cap is None
+                    else {"torch_compile_max_bs": explicit_cap}
+                )
+                args = ServerArgs(
+                    model_path="dummy",
+                    device="cpu",
+                    chunked_prefill_size=4096,
+                    mem_fraction_static=0.8,
+                    cuda_graph_config=CudaGraphConfig(
+                        decode=PhaseConfig(backend=Backend.DISABLED),
+                        prefill=PhaseConfig(backend=Backend.DISABLED),
+                    ),
+                    **extra,
+                )
+                with (
+                    patch(
+                        "sglang.srt.arg_groups.memory_hook.use_mla_backend",
+                        return_value=False,
+                    ),
+                    patch(
+                        "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                        return_value=None,
+                    ),
+                ):
+                    handle_gpu_memory_settings(args)
+                self.assertEqual(args.torch_compile_max_bs, explicit_cap)
+                self.assertEqual(
+                    resolution_result(args, "torch_compile_max_bs"), expected
+                )
+                self.assertEqual(
+                    resolution_result(args, "cuda_graph_config").decode.max_bs,
+                    expected,
+                )
+
+
 class TestCudaGraphConfigDataclassAccess(CustomTestCase):
     @patch(
         "sglang.srt.model_executor.runner_backend."

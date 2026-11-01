@@ -50,7 +50,9 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-DEFAULT_TPU_COMPILE_MAX_BS = 64
+# Compile ceiling when no batch flag is set, matching the upstream fallback;
+# fits zero-flag launches up to 8,160 pages/seq in the 1 MiB SMEM budget.
+DEFAULT_TPU_COMPILE_MAX_BS = 32
 
 # Fields whose token dim gets padded to the token bucket.
 _TOKEN_FIELDS = (
@@ -1271,17 +1273,23 @@ def reconcile_tpu_batch_limits(
 
 
 def build_bucketers(
-    server_args: Any, max_t: int, max_b: int
+    server_args: Any, max_t: int, max_b: int, *, warn_dropped: bool = True
 ) -> tuple[Bucketer, Bucketer]:
     """Build token and batch size bucketers."""
-    token_paddings = server_args.tpu_compile_tokens
+    # Backend-init checks pass server_args=None and read the published bag;
+    # both paths agree because no resolver mutates tpu_compile_tokens.
+    token_paddings = (
+        server_args.tpu_compile_tokens
+        if server_args is not None
+        else get_exec().graph.tpu_compile_tokens
+    )
     if token_paddings:
         # Keep the smallest configured bucket covering the extend limit to
         # preserve its shape alignment. Leave undersized lists unchanged.
         max_bucket = min((t for t in token_paddings if t >= max_t), default=max_t)
         kept = [t for t in token_paddings if t <= max_bucket]
         dropped = [t for t in token_paddings if t > max_bucket]
-        if dropped:
+        if dropped and warn_dropped:
             logger.warning(
                 "[compiled forward shim] Dropping --tpu-compile-tokens %s above "
                 "the last needed token bucket %d (max extend length %d).",
@@ -1292,7 +1300,7 @@ def build_bucketers(
         token_bucketer: Bucketer = Bucketer(name="TokenBucketer", buckets=kept)
     else:
         token_bucketer = PowerBucketer(
-            name="TokenBucketer", min_val=64, max_val=max_t, power=2
+            name="TokenBucketer", min_val=64, max_val=max(64, max_t), power=2
         )
 
     from sglang_tpu.pp_chunks import uses_dynamic_chunks
