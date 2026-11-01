@@ -84,7 +84,8 @@ EVAL_GATES = [
     },
     {
         "dataset": "mmmu_pro_vision",
-        "baseline": float(os.environ.get("STRESS_MMMU_BASELINE", "0.5")),
+        # Measured 0.84 under overload and after drain on tpu7x 1P1D (100 items).
+        "baseline": float(os.environ.get("STRESS_MMMU_BASELINE", "0.84")),
         "atol": float(os.environ.get("STRESS_MMMU_ATOL", "0.10")),
         "num_examples": int(os.environ.get("STRESS_MMMU_EXAMPLES", "100")),
         "num_threads": 16,
@@ -129,14 +130,27 @@ class TestMuseSparkPDOverloadStress(PDSingleHostTestCase):
         }
 
     def _eval_round(self, name: str, proxy_url: str) -> tuple[bool, str]:
+        """Run every quality gate at once through the retry proxy.
+
+        Gates run in parallel threads, one run_model_config per gate, so a
+        round costs its slowest eval rather than their sum.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
         from sglang.test.tpu import run_model_config
 
+        def run_gate(gate: dict) -> str:
+            config = {**self.build_model_config(), "gates": [gate]}
+            try:
+                run_model_config(config, base_url=proxy_url)
+                return ""
+            except AssertionError as failure:
+                return f"{gate['dataset']}: {failure}"
+
         started = time.monotonic()
-        try:
-            run_model_config(self.build_model_config(), base_url=proxy_url)
-            passed, error = True, ""
-        except AssertionError as failure:
-            passed, error = False, str(failure)
+        with ThreadPoolExecutor(max_workers=len(EVAL_GATES)) as pool:
+            errors = [e for e in pool.map(run_gate, EVAL_GATES) if e]
+        passed, error = not errors, "; ".join(errors)
         print(
             f"[{TEST_NAME}] eval {name}: {'PASS' if passed else 'FAIL'} "
             f"in {time.monotonic() - started:.0f}s {error}",

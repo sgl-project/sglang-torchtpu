@@ -216,7 +216,11 @@ class RetryProxy:
 
     async def _start(self) -> None:
         self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=self.request_timeout_s)
+            timeout=aiohttp.ClientTimeout(total=self.request_timeout_s),
+            # A fresh connection per request: at eval rates a pooled keep-alive
+            # connection can sit idle past the mini-LB's keep-alive timeout, and
+            # reusing it fails with ServerDisconnectedError before any response.
+            connector=aiohttp.TCPConnector(force_close=True, limit=0),
         )
         app = web.Application(client_max_size=1 << 30)
         app.router.add_route("*", "/{tail:.*}", self._handle)
@@ -477,7 +481,9 @@ class LoadDriver:
         self._long_slots = asyncio.Semaphore(self.config.max_concurrent_long)
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=self.config.request_timeout_s),
-            connector=aiohttp.TCPConnector(limit=0),
+            # See RetryProxy: never reuse a keep-alive connection the mini-LB
+            # may already have closed.
+            connector=aiohttp.TCPConnector(limit=0, force_close=True),
         )
         self._workers = [
             asyncio.create_task(self._worker(i)) for i in range(self.config.concurrency)
