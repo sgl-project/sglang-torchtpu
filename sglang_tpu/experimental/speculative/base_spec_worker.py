@@ -192,6 +192,7 @@ class TpuSpecWorker(BaseSpecWorker):
     """
 
     supports_logprobs = False
+    supports_grammar = False
     # Opt in only when verification applies the scheduler's additive snapshot
     # at the padded batch size. Live penalizer state is still unsupported.
     supports_additive_penalties = False
@@ -679,6 +680,8 @@ class TpuSpecWorker(BaseSpecWorker):
         rows: VerifyRows,
         draft_result: DraftResult,
         verify_input: TpuSpecVerifyInput,
+        *,
+        grammar_barrier: Callable[[], None] | None = None,
     ) -> tuple[LogitsProcessorOutput, AcceptResult]:
         """Score [r, d] with the target in one forward and accept losslessly.
 
@@ -888,10 +891,17 @@ class TpuSpecWorker(BaseSpecWorker):
         bucket: BucketState,
         rows: VerifyRows,
         verify_input: TpuSpecVerifyInput,
+        *,
+        grammar_barrier: Callable[[], None] | None = None,
     ) -> tuple[CommitResult, LogitsProcessorOutput, AcceptResult]:
         draft_result = self.draft(batch, bucket, rows, verify_input)
         logits_output, accept = self.verify(
-            batch, bucket, rows, draft_result, verify_input
+            batch,
+            bucket,
+            rows,
+            draft_result,
+            verify_input,
+            grammar_barrier=grammar_barrier,
         )
         if self._target_has_linear_attn:
             self._commit_linear_attn_states(
@@ -941,6 +951,9 @@ class TpuSpecWorker(BaseSpecWorker):
     ) -> GenerationBatchResult:
         self._check_supported(batch=batch, pp_proxy_tensors=pp_proxy_tensors)
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            # Mixed prefill samples another token for its running requests.
+            if batch.has_grammar and grammar_barrier is not None:
+                grammar_barrier()
             result = self.extend(batch, pp_proxy_tensors=pp_proxy_tensors)
         elif batch.forward_mode.is_idle():
             if self._dp_attention and max(batch.global_num_tokens or (0,)) > 0:
@@ -948,7 +961,7 @@ class TpuSpecWorker(BaseSpecWorker):
                 self._forward_idle_decode(batch)
             result = self._idle_result()
         else:
-            result = self._forward_decode(batch)
+            result = self._forward_decode(batch, grammar_barrier=grammar_barrier)
         next_draft_input = result.next_draft_input
         assert isinstance(next_draft_input, HostPaddedDraftInput)
         # Rows with requests write KV; idle rows write only the reserved slot 0.
@@ -957,7 +970,9 @@ class TpuSpecWorker(BaseSpecWorker):
             on_publish(result.new_seq_lens)
         return result
 
-    def _forward_decode(self, batch: ScheduleBatch) -> GenerationBatchResult:
+    def _forward_decode(
+        self, batch: ScheduleBatch, *, grammar_barrier: Callable[[], None] | None = None
+    ) -> GenerationBatchResult:
         bs = batch.seq_lens.shape[0]
         padded_bs = self._decode_bucket(batch, bs)
         verify_input = TpuSpecVerifyInput.from_batch(
@@ -972,7 +987,9 @@ class TpuSpecWorker(BaseSpecWorker):
             bucket.state.seq_lens,
             self.num_verify_rows,
         )
-        committed, logits_output, accept = self.step(batch, bucket, rows, verify_input)
+        committed, logits_output, accept = self.step(
+            batch, bucket, rows, verify_input, grammar_barrier=grammar_barrier
+        )
         next_state = committed.state
         # The scheduler stores this key as the next spec_info.future_indices.
         self._bucket = bucket._replace(key=batch.req_pool_indices, state=next_state)
@@ -1759,7 +1776,7 @@ class TpuSpecWorker(BaseSpecWorker):
             batch.forward_mode.is_extend() or batch.is_extend_in_batch
         ):
             raise NotImplementedError("TpuSpecWorker under PP only extends.")
-        if batch.has_grammar:
+        if batch.has_grammar and not self.supports_grammar:
             raise NotImplementedError("TpuSpecWorker does not support grammar.")
         if batch.return_logprob and not self.supports_logprobs:
             raise NotImplementedError("TpuSpecWorker does not support logprobs.")
