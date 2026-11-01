@@ -113,6 +113,10 @@ class TpuEnvs:
     # reduce-scatter rows to its owner as one DMA while the remaining experts run
     # (MKConfig.y_block_send; exact). Ignored where SGLANG_TPU_MK_Y_EARLY applies.
     SGLANG_TPU_MK_Y_BLOCK_SEND = EnvBool(True)
+    # Experimental: megakernel experts with more than this many live (row, slot) pairs (1, 2 or 4;
+    # 0 off) run in a second loop after each owner group's few-row experts (MKConfig.expert_split;
+    # exact). Steps of more than 24 rows only.
+    SGLANG_TPU_MUSE_MK_EXPERT_SPLIT = EnvInt(0)
     # Megakernel attention on fp8 SEQ_ALONG_LANE pools: feed K (and V) to the MXU as fp8
     # instead of widening each chunk to bf16 on the VPU first. 0 = off, 1 = K only, 2 = K and V
     # (exact; measured at 32 rows / 100K context: 1 is -1.8%, 2 is +1% slower than 0).

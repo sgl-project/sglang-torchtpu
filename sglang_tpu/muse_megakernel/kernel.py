@@ -129,6 +129,11 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     # exact fp8 block-diagonal dot on just those rows, padded up to the next power of two;
     # busier experts dequantize to bf16 for all rows
     compact_rows: int = 8
+    # vec_route only. Experts with more than this many live pairs (1, 2 or 4; 0 off) run in a
+    # second expert loop after each owner group's few-row experts, so the few-row loop body
+    # holds only the arms up to this bucket: the larger arms' live values make the common
+    # path spill on every expert. Same arm per expert, so bit-exact.
+    expert_split: int = 0
     # fp4 experts carry e4m3 block scales plus per-expert globals (smalls rows expert_gs*)
     # instead of bf16 scales with the globals folded in
     scale_fp8: bool = False
@@ -316,6 +321,11 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     def rows_per_dev(self):
         return self.rows // self.tp
 
+    @property
+    def split_rows(self):
+        """expert_split's bound on the few-row loop's experts: no larger than its arms."""
+        return min(self.expert_split, self.compact_rows)
+
     def use_rope(self, l):
         return l not in self.global_layers
 
@@ -327,6 +337,8 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
             "fp8 layers pair the expert slots"
         )
         assert self.compact_rows in (0, 1, 2, 4, 8)
+        assert self.expert_split in (0, 1, 2, 4)
+        assert not self.expert_split or (self.vec_route and not self.y_early)
         # bf16-packed collective buffers are half the per-device width and must stay lane tiles
         assert (
             self.hidden_local % (2 * LANE) == 0
@@ -1221,18 +1233,20 @@ def route_blocks(c):
 
 
 def route_rows(c):
-    """vec_route table rows: uniq, count, offset, perm fields, then n_u, then blk_end."""
-    return -(-(4 * route_blocks(c) + 2) // 8) * 8
+    """vec_route table rows: uniq, count, offset, perm fields, then n_u, blk_end (and blk_mid)."""
+    return -(-(4 * route_blocks(c) + 2 + bool(c.split_rows)) // 8) * 8
 
 
-def _route_table(ids_list, n_live, K, Ep, NB, pair_key, n_keys):
+def _route_table(ids_list, n_live, K, Ep, NB, pair_key, n_keys, split=0):
     """vec_route table ``[route_rows, LANE]`` int32 from per-slot expert ids ``K x [R, 1]``.
 
     Distinct experts are ordered by (the smallest ``pair_key`` [P, 1] of their pairs, id), pair
     q = k*R + r. Rows ``[f*NB, (f+1)*NB)`` hold field f: 0 experts, 1 their live (row, slot)
     counts, 2 offsets into field 3, 3 pairs as ``row * K + slot`` grouped by expert; row 4*NB
-    the distinct count; row 4*NB+1 lane b the experts whose key is <= b. Prefix sums run on
-    the MXU (0/1 and counts <= R*K are exact in bf16, summed in f32)."""
+    the distinct count; row 4*NB+1 lane b the experts whose key is <= b. With ``split``, experts
+    of more than ``split`` pairs sort after the others of their key, and row 4*NB+2 lane b
+    counts the experts before key b's large ones. Prefix sums run on the MXU (0/1 and counts
+    <= R*K are exact in bf16, summed in f32)."""
     R = ids_list[0].shape[0]
     P = R * K
     f32 = jnp.float32
@@ -1250,6 +1264,10 @@ def _route_table(ids_list, n_live, K, Ep, NB, pair_key, n_keys):
     key = jnp.min(
         jnp.where(hit, pair_key.astype(f32), big), axis=0, keepdims=True
     )  # [1, Ep]
+    # sort key: 2 * key + large with split (key b's experts end at sort key 2b + 1)
+    mult = 2 if split else 1
+    if split:
+        key = 2 * key + jnp.where(count > split, 1.0, 0.0)
     e_row = jax.lax.broadcasted_iota(jnp.int32, (1, Ep), 1).astype(f32)
     # per-expert values as columns, padded to a lane tile so the transpose is tile-aligned
     cols = jnp.transpose(
@@ -1303,13 +1321,22 @@ def _route_table(ids_list, n_live, K, Ep, NB, pair_key, n_keys):
     n_u = jnp.sum(jnp.where(present, 1, 0), axis=1, keepdims=True)
     b_lane = jax.lax.broadcasted_iota(jnp.int32, (Ep, LANE), 1).astype(f32)
     blk_end = jnp.sum(
-        jnp.where((pres_c > 0) & (key_c <= b_lane), 1, 0), axis=0, keepdims=True
+        jnp.where((pres_c > 0) & (key_c <= mult * b_lane + mult - 1), 1, 0),
+        axis=0,
+        keepdims=True,
     )
-    n_rows = -(-(4 * NB + 2) // 8) * 8
+    tail = [jnp.broadcast_to(n_u, (1, LANE)), blk_end]
+    if split:
+        tail.append(
+            jnp.sum(
+                jnp.where((pres_c > 0) & (key_c <= 2 * b_lane), 1, 0),
+                axis=0,
+                keepdims=True,
+            )
+        )
+    n_rows = -(-(4 * NB + len(tail)) // 8) * 8
     return jnp.concatenate(
-        rows
-        + [jnp.broadcast_to(n_u, (1, LANE)), blk_end]
-        + [jnp.zeros((n_rows - 4 * NB - 2, LANE), jnp.int32)],
+        rows + tail + [jnp.zeros((n_rows - 4 * NB - len(tail), LANE), jnp.int32)],
         axis=0,
     )
 
@@ -2515,8 +2542,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             """Entry i of a routing table: the vec_route table, else its SMEM array."""
             if not vec_route:
                 return S[name][i]
-            if name == "blk_end":
-                return S["route_s"][4 * NBR + 1, i]
+            if name in ("blk_end", "blk_mid"):
+                return S["route_s"][4 * NBR + 1 + (name == "blk_mid"), i]
             f = {"uniq": 0, "ex_cnt": 1, "ex_off": 2, "perm": 3}[name]
             return S["route_s"][f * NBR + i // LANE, i % LANE]
 
@@ -2525,7 +2552,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             o = jax.lax.broadcasted_iota(jnp.int32, (R * K, 1), 0) % R // c.rows_per_dev
             key = jax.lax.rem(o - me - 1 + c.tp, c.tp) if y_block else jnp.zeros_like(o)
             S["route_v"][...] = _route_table(
-                ids_list, n_live, K, c.n_experts_padded, NBR, key, c.tp
+                ids_list, n_live, K, c.n_experts_padded, NBR, key, c.tp, c.split_rows
             )
             cp = pltpu.make_async_copy(S["route_v"], S["route_s"], S["route_sem"].at[0])
             cp.start()
@@ -2850,7 +2877,9 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 else:
                     S["xfull"][...] = x_full.astype(jnp.float32)
 
-            def ebody(i, carry):
+            def ebody(i, carry, part=None):
+                """Distinct expert i; part "few" / "many": only the arms for at most / more
+                than expert_split pairs (the split loops)."""
                 slot = i % nslot
 
                 @pl.when(i + depth < n_u)
@@ -2962,6 +2991,10 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         if b <= c.compact_rows
                     ]
                     arms.append((None, full_scoped))
+                    if part == "few":
+                        arms = [a for a in arms if a[0] and a[0] <= c.split_rows]
+                    elif part == "many":
+                        arms = [a for a in arms if not a[0] or a[0] > c.split_rows]
 
                     def pick(arms):
                         if len(arms) == 1:
@@ -3011,7 +3044,22 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             if gscale:
                 gs_copy.wait()
             with _scope("experts"):
-                jax.lax.fori_loop(0, n_u, ebody, jnp.int32(0))
+                if c.split_rows and kind == "fp4":
+                    # per owner group (one without y blocks): its few-row experts, then its
+                    # large ones; the DMA ring and the block sends run on the global index
+                    def group(g, carry):
+                        lo = jnp.where(g == 0, 0, rget("blk_end", jnp.maximum(g - 1, 0)))
+                        mid, hi = rget("blk_mid", g), rget("blk_end", g)
+                        carry = jax.lax.fori_loop(
+                            lo, mid, functools.partial(ebody, part="few"), carry
+                        )
+                        return jax.lax.fori_loop(
+                            mid, hi, functools.partial(ebody, part="many"), carry
+                        )
+
+                    jax.lax.fori_loop(0, c.tp if y_block else 1, group, jnp.int32(0))
+                else:
+                    jax.lax.fori_loop(0, n_u, ebody, jnp.int32(0))
             ws.flush()
             # ---- token-sharded reduce of the per-rank partials, then norm + combine
             with _scope("y_rs"):

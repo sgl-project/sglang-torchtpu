@@ -439,6 +439,10 @@ class MuseMegakernel(torch.nn.Module):
             # measured a loss at 32 rows, where the expert loop is compute-bound
             y_early=y_early,
             y_block_send=tpu_envs.SGLANG_TPU_MK_Y_BLOCK_SEND.get() and not y_early,
+            # only where the 8-row arm exists: at <= 24 rows (no c8) it measured neutral to +1%
+            expert_split=tpu_envs.SGLANG_TPU_MUSE_MK_EXPERT_SPLIT.get()
+            if rows > _COMPACT4_MAX_ROWS
+            else 0,
             xfull_packed=rows > _BASE_STEP_MAX_ROWS,
             # the dense merge/combine/top-k fit VMEM up to 64 rows and run faster (per-slot
             # merge measured 3.2 vs 0.2 ms per 64-row step)
