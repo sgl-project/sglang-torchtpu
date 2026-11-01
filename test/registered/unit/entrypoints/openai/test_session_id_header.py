@@ -70,6 +70,10 @@ class TestSessionIdHeaderCli(CustomTestCase):
         )
         self.assertTrue(on.session_leaf_at_prompt_end)
         self.assertTrue(on.session_release_evicted_leaf)
+        self.assertFalse(off.session_coverage_host_only)
+        self.assertTrue(
+            self._parse(["--session-coverage-host-only"]).session_coverage_host_only
+        )
 
 
 class TestSessionIdFromHeader(CustomTestCase):
