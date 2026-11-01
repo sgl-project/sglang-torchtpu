@@ -280,6 +280,50 @@ class TestReleaseEvictedLeaf(CustomTestCase):
         self.assertEqual(swa_covered(cache, "conv"), 0)
 
 
+class TestEvictedLeafBoundsCoverage(CustomTestCase):
+    """A long run with no closes: one-turn sessions share the system prompt and the pool
+    is small, so finished sessions' leaves get evicted. By default their coverage
+    recedes onto the shared system prompt and stays; with session_release_evicted_leaf
+    it ends, so the sessions holding coverage and their covered SWA stay bounded."""
+
+    SESSIONS, POOL = 80, 160
+
+    def _run(self, release_evicted):
+        cache = make_cache(
+            size=self.POOL, prompt_end=True, release_evicted=release_evicted
+        )
+        alloc = cache.token_to_kv_pool_allocator
+        peak_holders = peak_covered = 0
+        for i in range(self.SESSIONS):
+            prompt = SYSTEM + [3000 + 10 * i + k for k in range(6)]
+            output = [5000 + 10 * i + k for k in range(4)]
+            need = len(prompt) + len(prompt) + len(output)
+            if min(alloc.full_available_size(), alloc.swa_available_size()) < need:
+                cache.evict(EvictParams(num_tokens=need, swa_num_tokens=need))
+            finish_turn(cache, prompt, output, f"conv-{i}")
+            holders = [s for s in cache.components[SWA]._session_leaves]
+            covered = sum(swa_covered(cache, s) for s in holders)
+            peak_holders = max(peak_holders, len(holders))
+            peak_covered = max(peak_covered, covered)
+        cache.sanity_check()
+        return len(holders), covered, peak_holders, peak_covered
+
+    def test_default_coverage_accumulates_on_the_shared_prefix(self):
+        holders, covered, _, _ = self._run(release_evicted=False)
+        # Every finished session keeps a receded leaf on the system prompt.
+        self.assertEqual(holders, self.SESSIONS)
+        self.assertGreater(covered, self.POOL)
+
+    def test_release_keeps_coverage_bounded(self):
+        holders, covered, peak_holders, peak_covered = self._run(release_evicted=True)
+        # Only sessions whose leaf is still in the tree hold coverage: a few pools'
+        # worth of 26-token turns at most, never the whole history.
+        turn = len(SYSTEM) + 6 + 4
+        self.assertLessEqual(peak_holders, self.POOL // (turn - len(SYSTEM)))
+        self.assertLess(holders, self.SESSIONS // 4)
+        self.assertLessEqual(peak_covered, self.POOL)
+
+
 class TestGrowthWithoutCloses(CustomTestCase):
     def test_bookkeeping_and_covered_windows_grow_with_session_ids(self):
         cache = make_cache(size=2048)
