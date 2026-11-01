@@ -1470,6 +1470,10 @@ class Envs:
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
+    # "incremental": drop finished requests' multimodal features a few at a
+    # time before device-result waits instead of all at once when they finish
+    # (scheduler_components/mm_feature_releaser.py). Outputs are unchanged.
+    SGLANG_ASYNC_MM_FEATURE_RELEASE = EnvStr("")
 
     # ===================================================================
     # Multimodal CUDA IPC transport
