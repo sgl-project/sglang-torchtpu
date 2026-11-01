@@ -14,7 +14,7 @@ cannot pass by comparing SDPA with SDPA.
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=150, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=170, suite="stage-a-test-tpu-unit", chips=1)
 
 import importlib.util
 import unittest
@@ -317,6 +317,65 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
             ).transpose(1, 2)[0]
             self.assertLess((got[seg].float() - want).abs().max().item(), 2e-2)
             start += n
+
+    def _live_length_impl(self):
+        tsa = self._kernels()
+        impl = tsa.TpuSplashAttentionImpl(
+            num_heads=7,
+            head_size=128,
+            causal=False,
+            softmax_scale=128**-0.5,
+            packed_trailing_padding=True,
+        )
+        self.assertTrue(impl.trailing_padding_on_device)
+        return tsa, impl
+
+    def test_live_length_varlen(self):
+        # MiniMax H3's packed [0, used, total] layout, read on device: one
+        # kernel call, padding rows zero, live rows attend live keys only.
+        tsa, impl = self._live_length_impl()
+        for total, used in ((512, 300), (2560, 1500), (2560, 2048), (4608, 4100)):
+            q, k, v = (
+                torch.randn(total, 7, 128, dtype=torch.bfloat16) for _ in range(3)
+            )
+            cu = torch.tensor([0, used, total], dtype=torch.int32)
+            with patch.object(
+                tsa, "_FLASH_KV_LEN_OP", wraps=tsa._FLASH_KV_LEN_OP
+            ) as kernel:
+                got = impl.forward_varlen(
+                    q.to("tpu"),
+                    k.to("tpu"),
+                    v.to("tpu"),
+                    cu_seqlens=cu.to("tpu"),
+                    max_seqlen=total,
+                ).to("cpu")
+            self.assertEqual(kernel.call_count, 1, (total, used))
+            self.assertEqual(got.shape, q.shape)
+            self.assertTrue((got[used:] == 0).all(), (total, used))
+            live = slice(0, used)
+            want = _reference(
+                q[None, live].transpose(1, 2),
+                k[None, live].transpose(1, 2),
+                v[None, live].transpose(1, 2),
+                128**-0.5,
+                False,
+            ).transpose(1, 2)[0]
+            err = (got[live].float() - want).abs().max().item()
+            self.assertLess(err, 2e-2, (total, used))
+
+    def test_live_length_varlen_with_host_bounds_uses_sdpa(self):
+        # A caller that passes host bounds (H3's token refiner) keeps SDPA.
+        tsa, impl = self._live_length_impl()
+        q, k, v = (
+            torch.randn(1024, 7, 128, dtype=torch.bfloat16).to("tpu") for _ in range(3)
+        )
+        cu = torch.tensor([0, 1024, 1024], dtype=torch.int32).to("tpu")
+        with patch.object(
+            tsa, "_FLASH_KV_LEN_OP", side_effect=AssertionError("kernel")
+        ):
+            impl.forward_varlen(
+                q, k, v, cu_seqlens=cu, max_seqlen=1024, cu_seqlens_host=(0, 1024, 1024)
+            )
 
     def test_backend_impl_layout(self):
         # The attention layer calls the impl with [B, S, H, D] tensors.

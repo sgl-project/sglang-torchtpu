@@ -2,6 +2,7 @@
 """Tests for sglang_tpu's MiniMax H3 patches (sglang_tpu.multimodal_gen.minimax_h3)."""
 
 import contextlib
+import inspect
 import os
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ import torch
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
     MiniMaxH3DiTArchConfig,
+    MiniMaxH3DiTConfig,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
@@ -31,12 +33,23 @@ from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import
 )
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.multimodal_gen import minimax_h3, ulysses
+from sglang_tpu.multimodal_gen import minimax_h3, ulysses, worker
 
 # The TPU lane installs the diffusion_tpu extras (cache-dit) the H3 DiT imports.
 register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit", chips=1)
 
 _BUILDERS = ("minimax_h3_packed_sequence", "minimax_h3_packed_sequence_ref2va_blocks")
+# The unpadded builders, even if a worker init already installed the patches.
+_PRISTINE = {n: inspect.unwrap(getattr(packed_sequence, n)) for n in _BUILDERS}
+
+
+def _init_parallel_state():
+    """Distributed init without the TPU worker's process-wide runtime patches."""
+    if model_parallel_is_initialized():
+        return
+    ensure_distributed_env_defaults()
+    with patch.object(worker, "install_runtime_patches"):
+        maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
 
 
 @contextlib.contextmanager
@@ -68,8 +81,9 @@ def _installed():
         yield
 
 
-def _packed(text_len):
-    return packed_sequence.minimax_h3_packed_sequence(
+def _packed(text_len, builder=None):
+    builder = builder or packed_sequence.minimax_h3_packed_sequence
+    return builder(
         text_len=text_len,
         latent_t=3,
         latent_h=8,
@@ -99,7 +113,10 @@ class _DeviceLiveLengthAttention:
 
 class TestMiniMaxH3PackedSequence(CustomTestCase):
     def test_pads_to_512_and_keeps_layout(self):
-        reference = {text_len: _packed(text_len) for text_len in (60, 130, 250)}
+        pristine = _PRISTINE["minimax_h3_packed_sequence"]
+        reference = {t: _packed(t, pristine) for t in (60, 130, 250)}
+        self.assertNotEqual({r["seq_len"] for r in reference.values()}, {512})
+        builders = {n: getattr(packed_sequence, n) for n in _BUILDERS}
         with _installed():
             layouts = {text_len: _packed(text_len) for text_len in reference}
             self.assertIs(
@@ -119,14 +136,29 @@ class TestMiniMaxH3PackedSequence(CustomTestCase):
             for key in ("img_pos", "audio_pos", "text_pos", "update_mask"):
                 torch.testing.assert_close(packed[key], ref[key])
         # Restored after the test.
-        self.assertEqual(_packed(60)["seq_len"], reference[60]["seq_len"])
+        for name, builder in builders.items():
+            self.assertIs(getattr(packed_sequence, name), builder)
+
+
+class TestMiniMaxH3LiveLength(CustomTestCase):
+    def test_blocks_read_the_live_length_only_from_the_attention(self):
+        _init_parallel_state()
+        with torch.device("meta"):
+            model = dit.MiniMaxH3DiTModel(
+                config=MiniMaxH3DiTConfig(), hf_config={}, quant_config=None
+            )
+        self.assertFalse(model._attention_reads_live_length())
+        attn = model.blocks[0].attn
+        attn._attention_impl = _DeviceLiveLengthAttention(attn.softmax_scale)
+        self.assertTrue(model._attention_reads_live_length())
+        # Cache-DiT swaps the block list for its wrapper while it runs.
+        model.blocks = torch.nn.ModuleList([torch.nn.Identity()])
+        self.assertFalse(model._attention_reads_live_length())
 
 
 class TestMiniMaxH3CompiledBlock(CustomTestCase):
     def test_block_compiles_once_across_live_lengths(self):
-        if not model_parallel_is_initialized():
-            ensure_distributed_env_defaults()
-            maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+        _init_parallel_state()
         torch.manual_seed(0)
         hidden, seq_len = 256, 128
         arch = MiniMaxH3DiTArchConfig(

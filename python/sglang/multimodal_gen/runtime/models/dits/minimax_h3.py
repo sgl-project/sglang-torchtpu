@@ -2235,6 +2235,14 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                 module._set_attention_backend(backend)
         self._resolved_attention_backend = backend.get_enum()
 
+    def _attention_reads_live_length(self) -> bool:
+        """Whether the block attention reads the live length from cu_seqlens
+        on device. Cache-DiT swaps ``blocks`` for its wrapper while it runs;
+        host bounds are kept then."""
+        attn = getattr(self.blocks[0], "attn", None)
+        impl = getattr(attn, "_attention_impl", None)
+        return bool(getattr(impl, "trailing_padding_on_device", False))
+
     def _mark_missing_params_required(self) -> None:
         for _, param in self.named_parameters():
             # A quant method's create_weights() declares its own policy for scales
@@ -2740,12 +2748,9 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         cu_seqlens = cu_seqlens.to(device)
         block_cu_seqlens_host = cu_seqlens_host
         block_max_seqlen = max_seqlen
-        if ring_ws == 1 and getattr(
-            self.blocks[0].attn._attention_impl, "trailing_padding_on_device", False
-        ):
-            # The attention reads the live length from cu_seqlens on device.
-            # Host bounds would specialize each compiled block on it, i.e. on
-            # the prompt length.
+        if ring_ws == 1 and self._attention_reads_live_length():
+            # Host bounds would specialize each compiled block on the live
+            # length, i.e. on the prompt length.
             block_cu_seqlens_host = None
             block_max_seqlen = seq_len
         spectrum_on = self._h3_spectrum_requested(sp_ws=sp_ws)

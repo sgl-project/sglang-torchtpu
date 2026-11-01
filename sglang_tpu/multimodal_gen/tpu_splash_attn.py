@@ -581,6 +581,13 @@ def _sdpa_fallback_reason(
         return "short"
     if is_causal and q_seq != kv_seq:
         return "ragged causal"
+    return _kernel_input_fallback_reason(query, key, value)
+
+
+def _kernel_input_fallback_reason(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+) -> str | None:
+    """Why the kernels cannot take these ``[B, H, S, D]`` inputs, else None."""
     if query.shape[-1] != 128 or key.shape[-1] != 128 or value.shape[-1] != 128:
         return f"head_dim={query.shape[-1]}/{value.shape[-1]}"
     if query.shape[1] % key.shape[1] != 0:
@@ -756,19 +763,21 @@ class TpuSplashAttentionImpl(SDPAImpl):
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
-        # cu_seqlens = [0, used, total]: rows [used, total) are padding.
+        # cu_seqlens = [0, used, total] without host bounds: rows [used, total)
+        # are padding. Callers that pass host bounds (e.g. H3's token refiner,
+        # whose length varies per prompt) keep the per-segment SDPA path.
         if (
             self.trailing_padding_on_device
+            and cu_seqlens_host is None
             and not self.causal
             and query.device.type == "tpu"
             and cu_seqlens.shape == (3,)
             and query.shape[0] >= 512
+            and key.shape[0] == query.shape[0]
         ):
             # [S, H, D] views in the kernel's [B, H, S, D] terms, for the checks.
             q, k, v = (t.transpose(0, 1).unsqueeze(0) for t in (query, key, value))
-            # The flash kernel covers 512 keys too, which SDPA's "short"
-            # cutoff would send back to the per-segment path.
-            if _sdpa_fallback_reason(q, k, v, False) in (None, "short"):
+            if _kernel_input_fallback_reason(q, k, v) is None:
                 # [S, H * D] rows: one lane-dense copy of a strided view,
                 # where .contiguous() pads 7 heads to 8 sublanes and the
                 # kernel's reshape then relayouts again.
