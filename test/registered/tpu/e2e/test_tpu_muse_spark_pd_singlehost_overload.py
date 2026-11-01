@@ -65,7 +65,6 @@ register_tpu_ci(
         "kv-offload",
         "multimodal",
         "video",
-        "seq-along-lane",
     ],
 )
 
