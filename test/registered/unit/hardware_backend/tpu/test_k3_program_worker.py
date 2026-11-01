@@ -324,6 +324,29 @@ class TestPrefillShare(CustomTestCase):
                 )
 
 
+class TestNoSpecStateReserve(CustomTestCase):
+    """The state pool is sized without sglang's speculative SSM scratch."""
+
+    def test_spec_reads_none_during_the_call_only(self):
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.hooks import k3_program as hooks
+
+        configurator = SimpleNamespace(spec_algorithm="K3_PROGRAM")
+        seen = []
+
+        def handle(c, rest):
+            seen.append(c.spec_algorithm)
+            return rest - 1
+
+        with mock.patch.object(hooks, "k3_program_active", return_value=True):
+            self.assertEqual(hooks.k3_program_no_spec_state_reserve(handle, configurator, 10), 9)
+        self.assertEqual(seen, [SpeculativeAlgorithm.NONE])
+        self.assertEqual(configurator.spec_algorithm, "K3_PROGRAM")
+        with mock.patch.object(hooks, "k3_program_active", return_value=False):
+            hooks.k3_program_no_spec_state_reserve(handle, configurator, 10)
+        self.assertEqual(seen[-1], "K3_PROGRAM")
+
+
 class TestRegisteredAlgorithm(CustomTestCase):
     def setUp(self):
         worker.register()

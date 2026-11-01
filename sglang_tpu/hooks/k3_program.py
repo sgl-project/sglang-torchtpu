@@ -48,6 +48,22 @@ size_k3_program_pools
        asking the platform pool for its bytes per token).
   Remove when: that lands.
 
+k3_program_no_spec_state_reserve
+  Why: with a speculative algorithm the KV cache configurator reserves, ahead
+       of the KV pool, sglang's intermediate SSM state for each capped running
+       request times the draft tokens (its own KDA target-verify scratch);
+       K3_PROGRAM verifies inside the decode program and never allocates it.
+       On hardware the reserve took ~5 GB a rank on colocated engines at
+       AgentX concurrency 8 and left a P/D prefill at concurrency 32 no KV
+       ("Loaded weights leave no GPU memory for the KV cache").
+  How: AROUND sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator
+       ._handle_max_mamba_cache sizes the state pool as without speculation
+       under K3_PROGRAM (the configurator's spec_algorithm reads NONE for the
+       call).
+  Upstream PR or issue: <to be filed> (a speculative worker's say in the
+       state scratch it needs).
+  Remove when: that seam exists.
+
 k3_program_decode_tree
   Why: a P/D decode's prefix cache needs no KDA states under K3_PROGRAM (the
        transfer delivers each request's state into its slot; a state copied
@@ -215,6 +231,20 @@ def reject_unsupported_k3_requests(
     return original(scheduler, req, *args, **kwargs)
 
 
+def k3_program_no_spec_state_reserve(original, configurator: Any, *args, **kwargs):
+    """AROUND KVCacheConfigurator._handle_max_mamba_cache."""
+    if not k3_program_active():
+        return original(configurator, *args, **kwargs)
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    algorithm = configurator.spec_algorithm
+    configurator.spec_algorithm = SpeculativeAlgorithm.NONE
+    try:
+        return original(configurator, *args, **kwargs)
+    finally:
+        configurator.spec_algorithm = algorithm
+
+
 def k3_program_prefill_share(original, scheduler: Any, batch: Any, *args, **kwargs):
     """AROUND Scheduler._arm_prefill_decode_interval."""
     result = original(scheduler, batch, *args, **kwargs)
@@ -292,6 +322,11 @@ def hook_specs() -> list[tuple]:
         (
             "sglang.srt.managers.scheduler.Scheduler._add_request_to_queue",
             reject_unsupported_k3_requests,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._handle_max_mamba_cache",
+            k3_program_no_spec_state_reserve,
             HookType.AROUND,
         ),
         (
