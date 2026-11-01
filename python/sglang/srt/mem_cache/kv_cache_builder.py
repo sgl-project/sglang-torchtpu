@@ -493,6 +493,8 @@ def build_kv_cache(
         dynamo_kv_event_format=dynamo_kv_event_format,
         kv_event_lora_names=kv_event_lora_names,
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
+        session_leaf_at_prompt_end=get_memory().session_leaf_at_prompt_end,
+        session_release_evicted_leaf=get_memory().session_release_evicted_leaf,
         enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
         enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
         decoder_swa_bounded_replay=get_exec().features.enable_decoder_swa_bounded_replay,

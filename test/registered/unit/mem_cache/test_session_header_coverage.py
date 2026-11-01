@@ -13,7 +13,11 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    InsertParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -32,7 +36,7 @@ WINDOW = 4
 LAYERS, FULL_LAYERS = 4, (3,)
 
 
-def make_cache(size=512):
+def make_cache(size=512, prompt_end=False, release_evicted=False):
     kv_pool = SWAKVPool(
         size=size,
         size_swa=size,
@@ -65,6 +69,8 @@ def make_cache(size=512):
             sliding_window_size=WINDOW,
             eviction_policy="lru",
             enable_session_radix_cache=True,
+            session_leaf_at_prompt_end=prompt_end,
+            session_release_evicted_leaf=release_evicted,
             tree_components=(FULL, SWA),
         )
     )
@@ -86,6 +92,34 @@ def finish(cache, tokens, session_id):
             session=None,
             origin_input_ids=array("q", tokens),
             output_ids=array("q"),
+            extra_key=None,
+        ),
+        leaf=leaf,
+    )
+    return cache.tree_core.node_by_id(leaf)
+
+
+def insert(cache, tokens):
+    indices = cache.token_to_kv_pool_allocator.alloc(len(tokens))
+    return cache.insert(
+        InsertParams(key=RadixKey(array("q", tokens)), value=indices.to(torch.int64))
+    ).last_device_node
+
+
+def finish_turn(cache, prompt, output, session_id):
+    """One agentic turn as the server caches it: the end-of-prefill checkpoint inserts
+    the prompt, the finished request inserts prompt + output, and the session leaf is
+    what checkpoint() registers (finished_session_leaf)."""
+    insert(cache, prompt)
+    last = insert(cache, prompt + output)
+    leaf = cache.finished_session_leaf(last, len(prompt))
+    cache.session_refs.register_session_ref(
+        SimpleNamespace(
+            session_id=session_id,
+            session_generation=cache.ensure_session_generation(session_id),
+            session=None,
+            origin_input_ids=array("q", prompt),
+            output_ids=array("q", output),
             extra_key=None,
         ),
         leaf=leaf,
@@ -150,6 +184,100 @@ class TestHelperCallsAndEdits(CustomTestCase):
         self.assertEqual(full_ref(self.cache, before), 0)
         self.assertEqual(full_ref(self.cache, after), 0)
         self.cache.sanity_check()
+
+
+class TestSessionLeafAtPromptEnd(CustomTestCase):
+    """AgentX resends each assistant turn as re-rendered text, so the next prompt
+    diverges from the cached output at the previous prompt's end."""
+
+    # turn 1: prompt, output; turn 2's prompt = turn 1's prompt + re-rendered reply + user
+    P1 = SYSTEM + [20, 21, 22, 23]
+    O1 = [60, 61, 62, 63, 64, 65]
+    P2 = P1 + [70, 71, 72, 73, 74] + [24, 25, 26]
+    O2 = [80, 81, 82, 83, 84, 85]
+
+    def test_without_the_flag_every_turn_adds_a_leaf(self):
+        cache = make_cache()
+        t1 = finish_turn(cache, self.P1, self.O1, "conv")
+        t2 = finish_turn(cache, self.P2, self.O2, "conv")
+        # The output-end leaves sit on diverging branches: coverage never advances.
+        self.assertEqual(leaves(cache, FULL, "conv"), {t1, t2})
+        self.assertEqual(leaves(cache, SWA, "conv"), {t1, t2})
+        cache.sanity_check()
+
+    def test_prompt_end_leaf_advances_across_turns(self):
+        cache = make_cache(prompt_end=True)
+        t1 = finish_turn(cache, self.P1, self.O1, "conv")
+        self.assertEqual(sum(len(n.key) for n in self._path(cache, t1)), len(self.P1))
+        t2 = finish_turn(cache, self.P2, self.O2, "conv")
+        self.assertEqual(sum(len(n.key) for n in self._path(cache, t2)), len(self.P2))
+        # The second prompt end descends from the first: one leaf, coverage moved.
+        self.assertEqual(leaves(cache, FULL, "conv"), {t2})
+        self.assertEqual(leaves(cache, SWA, "conv"), {t2})
+        self.assertEqual(full_ref(cache, t2), 1)
+        self.assertEqual(full_ref(cache, t1), 1)  # on t2's path, counted once
+        # The turn-1 output branch is uncovered and evictable first.
+        out1 = cache.tree_core.node_by_id(insert(cache, self.P1 + self.O1))
+        self.assertEqual(full_ref(cache, out1), 0)
+        t3 = finish_turn(cache, self.P2 + [90, 91, 92, 93], [95, 96], "conv")
+        self.assertEqual(leaves(cache, FULL, "conv"), {t3})
+        cache.sanity_check()
+
+    def test_helper_call_still_adds_a_leaf(self):
+        cache = make_cache(prompt_end=True)
+        main = finish_turn(cache, self.P1, self.O1, "conv")
+        helper = finish_turn(cache, HELPER_SYSTEM + [30, 31], [32, 33], "conv")
+        self.assertEqual(leaves(cache, FULL, "conv"), {main, helper})
+        main2 = finish_turn(cache, self.P2, self.O2, "conv")
+        self.assertEqual(leaves(cache, FULL, "conv"), {main2, helper})
+        cache.sanity_check()
+
+    def test_context_edit_still_adds_a_leaf(self):
+        cache = make_cache(prompt_end=True)
+        before = finish_turn(cache, self.P1 + [24, 25, 26, 27], self.O1, "conv")
+        after = finish_turn(cache, self.P1[:-2] + [40, 41, 42, 43, 44], self.O2, "conv")
+        self.assertEqual(leaves(cache, FULL, "conv"), {before, after})
+        cache.sanity_check()
+
+    @staticmethod
+    def _path(cache, node):
+        out = []
+        while node is not cache.tree_core.root_node:
+            out.append(node)
+            node = node.parent
+        return out
+
+
+class TestReleaseEvictedLeaf(CustomTestCase):
+    """When a session leaf's node leaves the tree, its coverage recedes to the nearest
+    reusable ancestor; with session_release_evicted_leaf it is released."""
+
+    P1 = TestSessionLeafAtPromptEnd.P1
+    P2 = TestSessionLeafAtPromptEnd.P2
+
+    def _evict_leaf(self, release_evicted):
+        cache = make_cache(prompt_end=True, release_evicted=release_evicted)
+        t1 = finish_turn(cache, self.P1, [60, 61, 62, 63, 64, 65], "conv")
+        t2 = finish_turn(cache, self.P2, [80, 81, 82, 83, 84, 85], "conv")
+        # Uncovered output branches (6 + 6 tokens) go first, then the covered leaf
+        # node t2 (8 tokens); t1's node (the first prompt) stays.
+        cache.evict(EvictParams(num_tokens=20))
+        self.assertNotIn(t2.id, cache.tree_core._node_arena)
+        self.assertIn(t1.id, cache.tree_core._node_arena)
+        cache.sanity_check()
+        return cache, t1
+
+    def test_coverage_recedes_by_default(self):
+        cache, t1 = self._evict_leaf(release_evicted=False)
+        self.assertEqual(leaves(cache, FULL, "conv"), {t1})
+        self.assertEqual(full_ref(cache, t1), 1)
+
+    def test_flag_releases_the_coverage(self):
+        cache, t1 = self._evict_leaf(release_evicted=True)
+        self.assertEqual(leaves(cache, FULL, "conv"), set())
+        self.assertEqual(leaves(cache, SWA, "conv"), set())
+        self.assertEqual(full_ref(cache, t1), 0)
+        self.assertEqual(swa_covered(cache, "conv"), 0)
 
 
 class TestGrowthWithoutCloses(CustomTestCase):
