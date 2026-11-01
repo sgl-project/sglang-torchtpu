@@ -143,21 +143,36 @@ def _requantize_tpu_block_fp8_to_channelwise(
         )
     weight_dequant = torch.cat(dequantized_shards, dim=0)
 
-    dtype_max = torch.finfo(weight.dtype).max
-    weight_scale = torch.clamp(
-        weight_dequant.abs().amax(dim=1, keepdim=True) / dtype_max,
-        min=1e-12,
-    )
-    weight = torch.clamp(
-        weight_dequant / weight_scale,
-        min=-dtype_max,
-        max=dtype_max,
-    ).to(weight.dtype)
-
-    layer.weight = Parameter(weight.t().contiguous(), requires_grad=False)
-    layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+    _set_channelwise_fp8_weight(layer, weight_dequant, weight.dtype)
     _clear_replaced_param(layer, "weight_scale_inv")
     layer.weight_block_size = None
+
+
+def _set_channelwise_fp8_weight(
+    layer: Module, weight: torch.Tensor, dtype: torch.dtype
+) -> None:
+    """Quantize an ``[N, K]`` weight with one scale per output row onto ``layer``.
+
+    Stores ``layer.weight`` as a contiguous ``[K, N]`` fp8 tensor and
+    ``layer.weight_scale`` as ``[N, 1]`` float32, the layout
+    ``apply_tpu_fp8_linear`` reads. A row's scale depends only on that row,
+    so rows replicated across TP ranks quantize to the same bytes on every
+    rank (#1767).
+    """
+    dtype_max = torch.finfo(dtype).max
+    weight_f32 = weight.to(torch.float32)
+    weight_scale = torch.clamp(
+        weight_f32.abs().amax(dim=1, keepdim=True) / dtype_max,
+        min=1e-12,
+    )
+    qweight = torch.clamp(
+        weight_f32 / weight_scale,
+        min=-dtype_max,
+        max=dtype_max,
+    ).to(dtype)
+
+    layer.weight = Parameter(qweight.t().contiguous(), requires_grad=False)
+    layer.weight_scale = Parameter(weight_scale, requires_grad=False)
     layer.input_scale = None
 
 
@@ -193,6 +208,18 @@ def prepare_tpu_fp8_linear_weights(
         _requantize_tpu_block_fp8_to_channelwise(layer, weight_block_size)
     else:
         layer.weight_block_size = list(weight_block_size)
+
+
+def prepare_tpu_online_fp8_linear_weights(
+    layer: Module, *, dtype: torch.dtype = torch.float8_e4m3fn
+) -> None:
+    """Post-load fp8 quantization of an unquantized TPU dense linear layer.
+
+    Used for online fp8 (``--quantization fp8`` on a bf16 checkpoint). Uses
+    per-row scales instead of one per-tensor scale over the rank's shard, so
+    TP-replicated kv heads stay byte-identical across ranks (#1767).
+    """
+    _set_channelwise_fp8_weight(layer, layer.weight.data, dtype)
 
 
 def register_tpu_block_fp8_linear() -> None:
