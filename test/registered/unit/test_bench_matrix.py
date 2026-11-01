@@ -243,6 +243,47 @@ class TestBenchMatrix(CustomTestCase):
                 "benchmark/tpu/recipe/bench_matrix/config.sh",
             )
 
+    def test_metrics_probe_sums_counters_over_prefill_engines(self):
+        """2P+2D pairs each request with a random prefill engine, so a c1 leg
+        can put every warm round on the second engine. Probing only the first
+        read 0% prefix hits (Oct 25 / Nov 1 nightlies); the probe must sum
+        counters over every engine and keep per-engine gauges from the first."""
+        spec = importlib.util.spec_from_file_location(
+            "metrics_probe",
+            os.path.join(
+                REPO,
+                "benchmark/tpu/recipe/qwen3_coder_480b/nightly/metrics_probe.py",
+            ),
+        )
+        probe = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(probe)
+        pages = {
+            "http://p0/metrics": 'sglang:prompt_tokens_total{a="x"} 110000.0\n'
+            'sglang:max_total_num_tokens{a="x"} 1000.0\n',
+            "http://p1/metrics": 'sglang:prompt_tokens_total{a="x"} 270000.0\n'
+            'sglang:cached_tokens_total{a="x"} 250000.0\n'
+            'sglang:max_total_num_tokens{a="x"} 1000.0\n',
+        }
+        probe._get = lambda url, timeout: pages.get(url)
+        metrics = probe._snapshot(["http://p0", "http://p1"], timeout=1)["metrics"]
+        self.assertEqual(metrics["sglang:prompt_tokens_total"], 380000.0)
+        self.assertEqual(metrics["sglang:cached_tokens_total"], 250000.0)
+        self.assertEqual(metrics["sglang:max_total_num_tokens"], 1000.0)
+
+        env = dict(os.environ, BENCH_MODEL="gpt_oss_120b")
+        env["BENCH_RECIPE"] = "pd_2p2d_pc_spec_kvoff"
+        out = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"source {BENCH_MATRIX}/config.sh && echo $PD_PREFILL_ENGINES",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(out.stdout.strip().splitlines()[-1], "2")
+
     def test_time_budget_chain(self):
         """The chain from config.sh: worst-case sweep <= SWEEP_TIMEOUT <
         TIMEOUT_PER_FILE. Its links live in three files (test literals, the

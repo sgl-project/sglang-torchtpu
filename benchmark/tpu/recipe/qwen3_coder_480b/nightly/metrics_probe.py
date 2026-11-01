@@ -108,7 +108,30 @@ def _parse_prometheus(text: str) -> Dict[str, float]:
     return out
 
 
-def _snapshot(url: str, timeout: int) -> Dict:
+def _snapshot(urls: List[str], timeout: int) -> Dict:
+    """Snapshot the first URL, then add the other URLs' counters.
+
+    Several URLs mean several engines behind one router (P/D with N prefill
+    engines): a request lands on one of them, so only the summed counters
+    describe the leg. Gauges and server info stay those of the first engine,
+    since capacity is per engine.
+    """
+    record = _snapshot_one(urls[0], timeout)
+    if len(urls) > 1:
+        record["urls"] = [url.rstrip("/") for url in urls]
+    for url in urls[1:]:
+        base = url.rstrip("/")
+        text = _get(f"{base}/metrics", timeout)
+        if text is None:
+            record["_error"] = f"could not read {base}/metrics"
+            continue
+        for name, value in _parse_prometheus(text).items():
+            if name in _COUNTERS:
+                record["metrics"][name] = record["metrics"].get(name, 0.0) + value
+    return record
+
+
+def _snapshot_one(url: str, timeout: int) -> Dict:
     base = url.rstrip("/")
     record: Dict = {"url": base}
 
@@ -339,7 +362,12 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     snap = sub.add_parser("snapshot", help="write one metrics/capacity snapshot")
-    snap.add_argument("--url", required=True)
+    snap.add_argument(
+        "--url",
+        required=True,
+        action="append",
+        help="repeat for engines behind one router; counters are summed",
+    )
     snap.add_argument("--out", required=True)
     snap.add_argument("--timeout", type=int, default=30)
 
