@@ -70,6 +70,8 @@ jobs:
             echo
             echo "\`_tpu-test.yml\` books a job's runtime from these values and spends what is left of the runner's 6h queueing for a slice, so an over-stated estimate surfaces as NOT ADMITTED."
             echo
+            echo "The same estimates rebalance \`.github/tpu-ci/accuracy_slots.json\` between the 10 AM and 5 PM accuracy slots, moving a leg only when that shortens the busier slot by at least 15 minutes."
+            echo
             cat /tmp/tpu_est_time_summary.md 2>/dev/null
             echo
             echo "🤖 Generated with GitHub Actions"

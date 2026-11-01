@@ -24,8 +24,9 @@ python3 -m pytest test/registered/unit/test_tpu_dashboard_contract.py -q
 The nightly (`nightly-test-tpu.yml`) builds once, then fans out the feature-validation
 and perf stage workflows **in parallel** — slice contention is Kueue's job, and a red
 stage costs the others nothing. Accuracy runs on `accuracy-test-tpu.yml`'s own 10 AM /
-5 PM schedule; that workflow picks the slot, so a new accuracy test just registers as
-nightly. Each stage workflow is also dispatchable alone.
+5 PM schedule; `.github/tpu-ci/accuracy_slots.json` picks each leg's slot and the weekly
+est_time bot rebalances it, so a new accuracy test registers as nightly and adds a table
+entry with either slot. Each stage workflow is also dispatchable alone.
 
 ## Required MODEL_CONFIG fields and labels (label lint fails the PR otherwise)
 
@@ -57,8 +58,8 @@ fields and don't hand-roll `dump_metric` labels in nightly tests.
 - **One job ↔ one test file.** A new nightly registration must be reachable from
   exactly one job: single-host via `discover_tests.py` (automatic), multi-host via a
   `MULTIHOST_LAUNCH` dict (automatic, one row per file), accuracy via one suite per
-  benchmark and perf via one suite per model, wired into the stage workflow's
-  matrix; static P/D via a hand-written job in `feature-validation-tpu.yml`.
+  benchmark (wired through `accuracy_slots.json`) and perf via one suite per
+  model, wired into the stage workflow's matrix; static P/D via a hand-written job in `feature-validation-tpu.yml`.
 - **Test-list filter chips come from `register_tpu_ci(labels=[...])`.** Every
   nightly TPU test registration carries free-form tags — topology
   (`singlehost`/`multihost`), model slug (`gpt-oss-120b`, `qwen3-coder-480b`, …),

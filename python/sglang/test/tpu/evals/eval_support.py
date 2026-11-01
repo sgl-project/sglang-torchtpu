@@ -33,6 +33,7 @@ from sglang.test.test_utils import (
     dump_metric,
     terminate_and_kill_process_tree,
 )
+from sglang.test.tpu.evals import mmmu_full
 
 DEFAULT_HEALTH_TIMEOUT = 1800.0
 
@@ -639,26 +640,45 @@ def sgl_eval_runner(
     Two reasons to prefer this over run_eval's sgl-eval path: that path can only
     toggle ``chat_template_kwargs.thinking``, so a template reading any other key
     needs ``chat_template_kwargs``; and it routes ``mmmu_pro`` to the shared
-    runner, which scores NeMo-Skills' 500-sample subset rather than the full set.
+    runner, which scores NeMo-Skills' 500-sample subset. ``mmmu_pro`` here scores
+    mmmu_full's nightly set, which every MMMU-Pro test shares.
     """
+    if eval_name == "mmmu_pro" and n_repeats != 1:
+        raise ValueError("mmmu_pro's nightly set is scored single-shot")
 
     def run(base_url: str) -> dict[str, Any]:
         out_dir = Path(tempfile.mkdtemp(prefix=f"sgl-eval-{eval_name}-"))
-        cmd = [
-            "sgl-eval",
-            *sgl_eval_args(
-                eval_name,
-                base_url=base_url,
-                model=model,
-                out_dir=str(out_dir),
-                max_tokens=max_tokens,
-                num_threads=num_threads,
-                temperature=temperature,
-                top_p=top_p,
-                n_repeats=n_repeats,
-                chat_template_kwargs=chat_template_kwargs,
-            ),
-        ]
+        if eval_name == "mmmu_pro":
+            cmd = mmmu_full.eval_command(
+                base_url,
+                shard=0,
+                shards=1,
+                output=str(out_dir),
+                sampling={
+                    "model": model,
+                    "max_tokens": max_tokens,
+                    "num_threads": num_threads,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "chat_template_kwargs": chat_template_kwargs or {},
+                },
+            )
+        else:
+            cmd = [
+                "sgl-eval",
+                *sgl_eval_args(
+                    eval_name,
+                    base_url=base_url,
+                    model=model,
+                    out_dir=str(out_dir),
+                    max_tokens=max_tokens,
+                    num_threads=num_threads,
+                    temperature=temperature,
+                    top_p=top_p,
+                    n_repeats=n_repeats,
+                    chat_template_kwargs=chat_template_kwargs,
+                ),
+            ]
         print("Running: " + shlex.join(cmd), flush=True)
         subprocess.run(cmd, check=True)
 
