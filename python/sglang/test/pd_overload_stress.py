@@ -614,10 +614,25 @@ class LoadDriver:
             data = json.loads(payload)
             prompt_tokens = data.get("usage", {}).get("prompt_tokens")
             choice = data["choices"][0]
-            text = (choice["message"].get("content") or "").lower()
-            if not text.strip() or (expect and not _answer_matches(text, expect)):
+            message = choice["message"]
+            text = (message.get("content") or "").lower()
+            if expect:
+                if not _answer_matches(text, expect):
+                    outcome = Outcome.WRONG_ANSWER
+                    detail = (
+                        f"expected {expect}, got {text[:200]!r} "
+                        f"(finish_reason={choice.get('finish_reason')})"
+                    )
+            elif (
+                not text.strip()
+                and not (message.get("reasoning_content") or "").strip()
+            ):
+                # Free text has no reference answer; a reasoning model may spend
+                # a short budget thinking, so either field shows it generated.
                 outcome = Outcome.WRONG_ANSWER
-                detail = f"expected {expect}, got {text[:200]!r}"
+                detail = (
+                    f"empty completion (finish_reason={choice.get('finish_reason')})"
+                )
         elif outcome is not Outcome.SHED:
             detail = payload[:300].decode(errors="replace")
         self.ledger.add(
