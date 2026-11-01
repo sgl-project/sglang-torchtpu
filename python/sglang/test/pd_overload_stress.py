@@ -418,6 +418,8 @@ class LoadDriverConfig:
     # Long requests must complete, so a 429 is retried until this deadline.
     long_retry_deadline_s: float = 2400.0
     mix: TrafficMix = field(default_factory=TrafficMix)
+    # Seconds a worker waits after its request is shed, drawn uniformly.
+    shed_backoff_s: tuple[float, float] = (1.0, 3.0)
     seed: int = 1867
     extra_body: dict = field(
         default_factory=lambda: {"chat_template_kwargs": {"reasoning_effort": "low"}}
@@ -509,9 +511,13 @@ class LoadDriver:
                     async with self._long_slots:
                         await self._long_request(rng)
                     continue
-            await self._one_request(kind, rng)
+            shed = await self._one_request(kind, rng)
+            if shed:
+                # A shed client backs off like a real one. Retrying at once
+                # turns the mini-LB into a 429 loop that crowds out the evals.
+                await asyncio.sleep(rng.uniform(*self.config.shed_backoff_s))
 
-    async def _one_request(self, kind: str, rng: random.Random) -> None:
+    async def _one_request(self, kind: str, rng: random.Random) -> bool:
         if kind == "image":
             color = rng.choice(_COLORS)
             content = [
@@ -545,7 +551,7 @@ class LoadDriver:
             ]
             expect = ()
             max_tokens = rng.choice((64, 128, 256))
-        await self._send(
+        return await self._send(
             kind, self._chat_body(content, max_tokens), expect, retry=False
         )
 
@@ -561,7 +567,8 @@ class LoadDriver:
         kind = f"text_long_{target // 1024}k"
         await self._send(kind, body, (prompt.code,), retry=True)
 
-    async def _send(self, kind: str, body: dict, expect: tuple, *, retry: bool) -> None:
+    async def _send(self, kind: str, body: dict, expect: tuple, *, retry: bool) -> bool:
+        """Send one request and record it; True if it ended shed with a 429."""
         started = time.monotonic()
         backoff = 0.5
         while True:
@@ -577,7 +584,7 @@ class LoadDriver:
                         kind, Outcome.TIMEOUT, None, time.monotonic() - started
                     )
                 )
-                return
+                return False
             except aiohttp.ClientError as error:
                 self.ledger.add(
                     RequestRecord(
@@ -588,7 +595,7 @@ class LoadDriver:
                         repr(error),
                     )
                 )
-                return
+                return False
             if (
                 status == 429
                 and retry
@@ -616,6 +623,7 @@ class LoadDriver:
         self.ledger.add(
             RequestRecord(kind, outcome, status, latency, detail, prompt_tokens)
         )
+        return outcome is Outcome.SHED
 
 
 def _answer_matches(text: str, expect: tuple) -> bool:

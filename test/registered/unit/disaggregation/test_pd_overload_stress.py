@@ -15,10 +15,13 @@ from aiohttp import web
 from sglang.test.pd_overload_stress import (
     EngineLoad,
     EngineLoadMonitor,
+    LoadDriver,
+    LoadDriverConfig,
     Outcome,
     RequestRecord,
     RetryProxy,
     StressLedger,
+    TrafficMix,
     _answer_matches,
     classify_status,
     parse_loads,
@@ -123,6 +126,35 @@ class TestRetryProxy(CustomTestCase):
         self.assertEqual(response.status_code, 429)
         self.assertEqual(ledger.count(Outcome.CLIENT_ERROR, "eval"), 1)
         self.assertEqual(ledger.count(Outcome.OK, "eval"), 0)
+
+
+class TestLoadDriverBackoff(CustomTestCase):
+    def test_shed_workers_back_off_instead_of_hammering(self):
+        lb = _FakeLB([429] * 100000)
+        self.addCleanup(lb.close)
+        ledger = StressLedger()
+        driver = LoadDriver(
+            lb.url,
+            LoadDriverConfig(
+                model="m",
+                concurrency=2,
+                mix=TrafficMix(text_short=1.0, image=0, video=0, text_long=0),
+                shed_backoff_s=(0.25, 0.25),
+            ),
+            ledger,
+        )
+        driver._tokens_per_line = 20.0  # skip calibration against the fake
+
+        driver.start()
+        import time
+
+        time.sleep(1.0)
+        driver.stop(drain_timeout_s=5)
+
+        # Two workers, 0.25 s apart after each 429: at most ~10 requests in 1 s.
+        self.assertGreater(lb.calls, 0)
+        self.assertLessEqual(lb.calls, 12)
+        self.assertEqual(ledger.count(Outcome.SHED), lb.calls)
 
 
 class TestClassification(CustomTestCase):

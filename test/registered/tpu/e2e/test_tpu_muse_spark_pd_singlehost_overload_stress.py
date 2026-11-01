@@ -18,6 +18,7 @@ does not drain in time, or if the flow outlasts one hour after healthy.
 import json
 import os
 import socket
+import threading
 import time
 import unittest
 from typing import Any
@@ -225,6 +226,20 @@ class TestMuseSparkPDOverloadStress(PDSingleHostTestCase):
         monitor.start()
         driver.start()
         overload_started = time.monotonic()
+        heartbeat_stop = threading.Event()
+
+        def heartbeat() -> None:
+            while not heartbeat_stop.wait(60):
+                print(
+                    f"[{TEST_NAME}] t={time.monotonic() - healthy_at:.0f}s "
+                    f"driver={json.dumps(driver_ledger.summary()['by_kind'])} "
+                    f"eval={json.dumps(eval_ledger.summary()['by_kind'])} "
+                    f"eval_429_retries={eval_ledger.retried_429} "
+                    f"peak={json.dumps({k: vars(v) for k, v in monitor.peak.items()})}",
+                    flush=True,
+                )
+
+        threading.Thread(target=heartbeat, daemon=True).start()
         round1 = self._eval_round("round1-under-overload", proxy.url)
         long_kinds = [f"text_long_{t // 1024}k" for t in LONG_CONTEXT_TOKENS]
         while time.monotonic() - overload_started < MAX_OVERLOAD_S:
@@ -252,6 +267,7 @@ class TestMuseSparkPDOverloadStress(PDSingleHostTestCase):
 
         # Phase 3: the same evals on the drained system.
         round2 = self._eval_round("round2-after-drain", proxy.url)
+        heartbeat_stop.set()
         proxy.stop()
         flow_s = time.monotonic() - healthy_at
 
