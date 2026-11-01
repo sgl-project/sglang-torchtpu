@@ -19,6 +19,9 @@ again. It passes when:
 A P/D engine does not shed load (max_queued_requests applies only without
 disaggregation), so the prefill pod starts its engine on its own and fronts the
 pair with the Rust router under an admission cap, not the mini load balancer.
+
+The nightly runs it on the external cluster (external-topology.yaml), where the
+two engines share one 2x2x2 slice.
 """
 
 import argparse
@@ -69,7 +72,9 @@ register_tpu_ci(
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, *[".."] * 4))
 BENCH = os.path.join(REPO, "benchmark", "tpu")
-RENDER_JOBSET = os.path.join(REPO, ".github", "tpu-ci", "render_jobset.py")
+RENDER_EXTERNAL_JOBSET = os.path.join(
+    REPO, ".github", "tpu-ci", "external", "render_external_jobset.py"
+)
 
 LAUNCH_CONFIG_MODULE = "recipe/configs/muse_spark/pd_singlehost_overload.py"
 
@@ -100,11 +105,6 @@ LOCAL_HOST = "127.0.0.1"
 
 WAIT_SECS = int(E("WAIT_SECS", "3600"))
 HEALTH_TIMEOUT = float(E("HEALTH_TIMEOUT", "3600"))
-PYTHON = E("PYTHON", "python3")
-
-# Local dry-run name only; CI passes the job's run name. Peer discovery swaps
-# the "-prefill-" and "-decode-" hostname segments, so the name holds neither.
-RUN_NAME = "pd-sh-muse-overload"
 
 PREFILL_LOG = "/tmp/pd_muse_overload_prefill.log"
 DECODE_LOG = "/tmp/pd_muse_overload_decode.log"
@@ -144,9 +144,9 @@ CHAT_TEMPLATE_KWARGS = {"reasoning_effort": "low"}
 
 OVERLOAD_WARMUP_S = 60
 DRAIN_TIMEOUT_S = 900
-# From both engines turning healthy to the end of the second round. A cold
-# single-host Muse start takes ~48 min in CI, so this also keeps the run inside
-# the P/D JobSet's 8700 s deadline.
+# From both engines turning healthy to the end of the second round. The DFlash
+# 1P1D nightly's pair took 32 min to turn healthy on the same hosts, so this
+# also keeps the run inside the P/D JobSet's 8700 s deadline.
 FLOW_LIMIT_S = 3600
 # token_usage excludes evictable prefix cache, so an idle engine reads its
 # pre-load level; the margin absorbs the gauge's two-decimal rounding.
@@ -541,35 +541,44 @@ class TestMuseSparkPdOverloadIntegration(PDSingleHostTestCase):
         self.assertEqual(report["failures"], [], "\n".join(report["failures"]))
 
 
-def render_jobset_yaml(
-    image: str = "us-central1-docker.pkg.dev/sgl-project/tpu-ci/sglang:latest",
-    lane: str = "nightly",
-    weights_pvc: str = "model-weights",
-    run_name: str = RUN_NAME,
-) -> str:
-    """Render one full prefill host plus one full decode host."""
+def external_group() -> dict[str, Any]:
+    """This file's group in the external nightly's slice matrix."""
+    rows = json.loads(
+        subprocess.check_output(
+            [sys.executable, RENDER_EXTERNAL_JOBSET, "--list-groups", "--nightly"],
+            cwd=REPO,
+            text=True,
+        )
+    )
     rel_path = os.path.relpath(__file__, REPO)
-    cmd = [
-        PYTHON,
-        RENDER_JOBSET,
-        "--pd-prefill-hosts",
-        str(HOSTS_PER_ENGINE),
-        "--pd-decode-hosts",
-        str(HOSTS_PER_ENGINE),
-        "--lane",
-        lane,
-        "--image",
-        image,
-        "--weights-pvc",
-        weights_pvc,
-        "--name",
-        run_name,
-        "--files",
-        rel_path,
-        "--exec",
-        f"python3 {rel_path} integration",
+    groups = [
+        group for row in rows for group in row["groups"] if group["files"] == rel_path
     ]
-    return subprocess.check_output(cmd, text=True)
+    if len(groups) != 1:
+        raise LookupError(f"{rel_path} is in {len(groups)} external groups, not one")
+    return groups[0]
+
+
+def render_jobset_yaml(
+    group: Mapping[str, Any],
+    image: str = "us-central1-docker.pkg.dev/sgl-project/tpu-ci/sglang:latest",
+) -> str:
+    """Render the external nightly's JobSet for this file's group."""
+    return subprocess.check_output(
+        [
+            sys.executable,
+            RENDER_EXTERNAL_JOBSET,
+            "--image",
+            image,
+            "--group",
+            json.dumps(group),
+            # CI resolves the slice's nodepool from a repo secret.
+            "--nodepool",
+            "dry-run-nodepool",
+        ],
+        cwd=REPO,
+        text=True,
+    )
 
 
 class TestMuseSparkPdOverloadConfiguration(unittest.TestCase):
@@ -652,10 +661,11 @@ class TestMuseSparkPdOverloadConfiguration(unittest.TestCase):
             self.assertEqual(plan["server_args"]["context_length"], CONTEXT_LENGTH)
 
     def test_peer_hostname_resolution(self) -> None:
-        prefill = f"tpu-ci-{RUN_NAME}-prefill-0-0"
+        # An external pod's PD_SELF_HOST: <jobset>-<role>-<job>-<pod>.<jobset>.
+        prefill = "0123456789ab-abcde-prefill-0-0.0123456789ab-abcde"
         self.assertEqual(
             peer_hostname(prefill, from_role=PREFILL_ROLE, to_role=DECODE_ROLE),
-            f"tpu-ci-{RUN_NAME}-decode-0-0",
+            "0123456789ab-abcde-decode-0-0.0123456789ab-abcde",
         )
         self.assertEqual(
             self_hostname({SELF_HOST_ENV: "retained-prefill.example"}),
@@ -663,19 +673,27 @@ class TestMuseSparkPdOverloadConfiguration(unittest.TestCase):
         )
 
     @unittest.skipUnless(
-        os.path.exists(RENDER_JOBSET), "renderer is not shipped in the runtime image"
+        os.path.exists(RENDER_EXTERNAL_JOBSET),
+        "renderer is not shipped in the runtime image",
     )
-    def test_dry_run_renders_one_host_per_role(self) -> None:
-        yaml_content = render_jobset_yaml()
+    def test_external_nightly_runs_one_host_per_role(self) -> None:
+        group = external_group()
+        self.assertEqual(group["mode"], "pd")
+        self.assertEqual(group["prefill_hosts"], HOSTS_PER_ENGINE)
+        self.assertEqual(group["decode_hosts"], HOSTS_PER_ENGINE)
+        # Both roles share one slice, a single-host engine per pod.
+        self.assertFalse(group["pair"])
+        rel_path = os.path.relpath(__file__, REPO)
+        self.assertEqual(group["cmd"], f"python3 {rel_path} integration")
+        # Peer discovery swaps the role segment of the pods' hostnames.
+        for role in (PREFILL_ROLE, DECODE_ROLE):
+            self.assertNotIn(role, group["run_name"])
+        yaml_content = render_jobset_yaml(group)
         self.assertIn("name: prefill", yaml_content)
         self.assertIn("name: decode", yaml_content)
         self.assertIn("completions: 1", yaml_content)
         self.assertIn("CI_PD_ROLE", yaml_content)
-        self.assertIn(
-            "python3 test/registered/tpu/e2e/"
-            "test_tpu_muse_spark_pd_singlehost_overload.py integration",
-            yaml_content,
-        )
+        self.assertIn(group["cmd"], yaml_content)
 
 
 if __name__ == "__main__":
@@ -689,7 +707,7 @@ if __name__ == "__main__":
     args, extra_args = parser.parse_known_args()
 
     if args.mode == "integration_dry_run":
-        print(render_jobset_yaml())
+        print(render_jobset_yaml(external_group()))
         sys.exit(0)
     test_case = (
         TestMuseSparkPdOverloadIntegration

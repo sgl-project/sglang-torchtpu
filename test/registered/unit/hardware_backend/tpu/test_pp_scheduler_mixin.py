@@ -11,7 +11,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 maybe_stub_sgl_kernel()
 
 import unittest  # noqa: E402
-from contextlib import nullcontext  # noqa: E402
+from contextlib import contextmanager, nullcontext  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
 from unittest.mock import MagicMock, patch  # noqa: E402
 
@@ -53,6 +53,58 @@ def _single_queue_scheduler(is_last_rank=False) -> SchedulerPPMixin:
 
 
 class TestStreamFences(CustomTestCase):
+    def test_deferred_prefill_result_copy_waits_on_its_communication_stream(self):
+        scheduler = _single_queue_scheduler(is_last_rank=True)
+        order = []
+
+        @contextmanager
+        def communication_stream():
+            order.append("enter-copy-stream")
+            yield
+            order.append("leave-copy-stream")
+
+        scheduler.pp_comm_stream_ctx = communication_stream()
+        scheduler._pp_output_send_deferred = lambda: True
+        scheduler.mbs = [SimpleNamespace()]
+        ready = MagicMock()
+        tokens = torch.tensor([7])
+        source = MagicMock()
+        source.cpu.side_effect = lambda: order.append("copy-complete") or tokens
+        scheduler.last_rank_comm_queue = [
+            (ready, PPProxyTensors({"next_token_ids": source}))
+        ]
+        copy_stream = scheduler.device_module.current_stream.return_value
+        copy_stream.wait_event.side_effect = lambda event: order.append(
+            "wait-producer-on-stream"
+        )
+        scheduler._pp_send_deferred_output = MagicMock(
+            side_effect=lambda mb: order.append("send")
+        )
+        manager = scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
+            kv_manager=MagicMock()
+        )
+        with patch(
+            "sglang.srt.managers.scheduler_pp_mixin._pp_can_skip_output_comm",
+            return_value=False,
+        ):
+            scheduler._pp_pd_send_deferred_output(0)
+        self.assertEqual(
+            order,
+            [
+                "enter-copy-stream",
+                "wait-producer-on-stream",
+                "copy-complete",
+                "leave-copy-stream",
+                "send",
+            ],
+        )
+        copy_stream.wait_event.assert_called_once_with(ready)
+        ready.synchronize.assert_not_called()
+        manager.kv_manager.on_outputs_copied.assert_called_once_with(0, tokens)
+        self.assertIs(
+            scheduler.last_rank_comm_queue[0][1].tensors["next_token_ids"], tokens
+        )
+
     def test_launch_batch_runs_without_schedule_stream(self):
         scheduler = _single_queue_scheduler()
         self.assertFalse(hasattr(scheduler, "schedule_stream"))
@@ -198,10 +250,43 @@ class TestWaveBuffers(CustomTestCase):
             (SimpleNamespace(pp_transfer_dtype=torch.float32), torch.float32),
         ):
             with self.subTest(dtype=dtype):
-                self.assertEqual(self._wave_args(policy, model)["dtype"], dtype)
+                wave_args = self._wave_args(policy, model)
+                self.assertEqual(wave_args["dtype"], dtype)
+                self.assertEqual(wave_args["aux_dtype"], torch.bfloat16)
                 proxy = policy._pp_warmup_kwargs(64)["pp_proxy_tensors"]
                 for name in ("hidden_states", "residual"):
                     self.assertEqual(proxy[name].dtype, dtype)
+
+    def test_aux_slots_stay_in_compute_dtype_when_transfer_is_fp32(self):
+        from sglang.srt.layers.aux_hidden_states import AUX_HIDDEN_STATES_PROXY_KEY
+
+        policy = self._policy([64, 256], [1, 32])
+        model = SimpleNamespace(
+            pp_transfer_dtype=torch.float32,
+            relays_pp_aux_hidden_states=True,
+        )
+        self._wave_args(policy, model)
+        policy.model_runner.spec_aux_config = SpecAuxHiddenStateConfig(
+            dflash_use_aux_hidden_state=True,
+            dflash_target_layer_ids=[1, 16],
+        )
+        with patch.object(pp_scheduler, "build_pp_wave") as build:
+            SchedulerPPMixin._pp_init_wave(
+                SimpleNamespace(
+                    pp_group=policy.model_runner.pp_group,
+                    tp_group=SimpleNamespace(),
+                    world_group=SimpleNamespace(),
+                    tp_worker=SimpleNamespace(model_runner=policy.model_runner),
+                )
+            )
+        wave_args = build.call_args.kwargs
+        self.assertEqual(wave_args["dtype"], torch.float32)
+        self.assertEqual(wave_args["aux_dtype"], torch.bfloat16)
+        self.assertEqual(wave_args["num_aux"], 2)
+        proxy = policy._pp_warmup_kwargs(64)["pp_proxy_tensors"]
+        self.assertEqual(proxy["hidden_states"].dtype, torch.float32)
+        self.assertEqual(proxy["residual"].dtype, torch.float32)
+        self.assertEqual(proxy[AUX_HIDDEN_STATES_PROXY_KEY].dtype, torch.bfloat16)
 
 
 if __name__ == "__main__":

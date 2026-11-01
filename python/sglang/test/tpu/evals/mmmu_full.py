@@ -25,6 +25,14 @@ def shard_rows(rows, shard, shards):
     return list(rows)[shard::shards]
 
 
+def read_jsonl_ids(path):
+    # sgl-eval writes with ensure_ascii=False, so a generation can hold raw
+    # U+2028/U+2029/U+0085. str.splitlines() breaks on those; JSONL records
+    # end only at "\n".
+    text = Path(path).read_text(encoding="utf-8")
+    return [json.loads(line)["id"] for line in text.split("\n") if line.strip()]
+
+
 def run_shard(
     base_url: str,
     *,
@@ -70,10 +78,7 @@ def run_shard(
     if len(files) != 1:
         raise RuntimeError(f"Expected one metrics file, found {files}")
     result = json.loads(files[0].read_text())
-    ids = [
-        json.loads(line)["id"]
-        for line in (files[0].parent / "output-rs0.jsonl").read_text().splitlines()
-    ]
+    ids = read_jsonl_ids(files[0].parent / "output-rs0.jsonl")
     if result["aggregate"]["error_rate"] != 0:
         raise RuntimeError("MMMU-Pro shard contains request errors")
     if result["num_examples"] != len(ids):

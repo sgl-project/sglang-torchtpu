@@ -10,7 +10,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 from sglang.srt.arg_groups import mamba_hook, overrides
-from sglang.srt.configs import Qwen3NextConfig
+from sglang.srt.configs import KimiLinearConfig, Qwen3NextConfig
 from sglang.srt.mem_cache import kv_cache_builder as builder
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.test.test_utils import CustomTestCase
@@ -84,13 +84,68 @@ class TestTpuPrefixCachePolicy(CustomTestCase):
                     with (
                         self.assertRaisesRegex(
                             ValueError,
-                            "TPU GDN prefix caching.*--enable-mixed-chunk.*"
+                            "TPU GDN/KDA prefix caching.*--enable-mixed-chunk.*"
                             "--disable-radix-cache",
                         )
                         if rejects
                         else contextlib.nullcontext()
                     ):
                         platform_cls().validate_mamba_prefix_cache(view)
+
+    def test_kda_models_write_checkpoints(self):
+        """KDA runs the GDN kernel with the same snapshot plan; its MLA draft does not."""
+        glm_text = SimpleNamespace()
+        cases = (
+            (SimpleNamespace(hf_config=KimiLinearConfig(), is_draft_model=False), True),
+            (
+                SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        model_type="glm5_next",
+                        architectures=["Glm5NextForConditionalGeneration"],
+                        get_text_config=lambda: glm_text,
+                    ),
+                    is_draft_model=False,
+                ),
+                True,
+            ),
+            (
+                SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        model_type="llama",
+                        architectures=["LlamaForCausalLM"],
+                        get_text_config=lambda: SimpleNamespace(),
+                    ),
+                    is_draft_model=False,
+                ),
+                False,
+            ),
+        )
+        for platform_cls in (TpuSRTPlatform, TpuOOTPlatform):
+            for model, expected in cases:
+                with self.subTest(platform=platform_cls.__name__, model=model):
+                    self.assertEqual(
+                        platform_cls().supports_mamba_prefix_cache(model), expected
+                    )
+
+    def test_state_offload_needs_a_dma_io_backend(self):
+        """Only a DMA engine moves TPU's per-layer kernel-layout states to host."""
+        for io_backend, rejects in (("raiden", False), ("torch_tpu", True)):
+            view = SimpleNamespace(
+                enable_mixed_chunk=False,
+                disable_radix_cache=False,
+                mamba_radix_cache_strategy="extra_buffer",
+                enable_hierarchical_cache=True,
+                hicache_io_backend=io_backend,
+                enable_int8_mamba_checkpoint=False,
+            )
+            for platform_cls in (TpuSRTPlatform, TpuOOTPlatform):
+                with (
+                    self.subTest(io_backend=io_backend, platform=platform_cls.__name__),
+                    self.assertRaisesRegex(ValueError, "DMA --hicache-io-backend")
+                    if rejects
+                    else contextlib.nullcontext(),
+                ):
+                    platform_cls().validate_mamba_prefix_cache(view)
 
     def test_backend_guard_preserves_other_devices_and_explicit_disable(self):
         """Unsupported backends must not silently disable caching after pool sizing."""
@@ -121,7 +176,10 @@ class TestTpuPrefixCachePolicy(CustomTestCase):
                 text_config = Qwen3NextConfig() if gdn else object()
                 model = SimpleNamespace(
                     is_multimodal=False,
-                    hf_config=SimpleNamespace(get_text_config=lambda: text_config),
+                    hf_config=SimpleNamespace(
+                        architectures=["Qwen3NextForCausalLM"],
+                        get_text_config=lambda: text_config,
+                    ),
                 )
                 memory = MagicMock(disable_radix_cache=disabled)
                 parallel = MagicMock(dcp_enabled=False, enable_dp_attention=False)

@@ -11,10 +11,7 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
-from sglang_tpu.hooks.attn_residual import (
-    prepare_attn_residual_kernel,
-    register_attn_residual_ops,
-)
+from sglang_tpu.hooks.attn_residual import register_attn_residual_ops
 from sglang_tpu.hooks.attn_tp import device_supports_input_scattered
 from sglang_tpu.hooks.cpu_pinning import bind_rank_cpu_set, pin_scheduler_main_thread
 from sglang_tpu.hooks.draft_kv_pool import (
@@ -22,6 +19,10 @@ from sglang_tpu.hooks.draft_kv_pool import (
     draft_mha_pool_class,
 )
 from sglang_tpu.hooks.dsa_kv_pool import size_tpu_dsa_kv_pool
+from sglang_tpu.hooks.dsv4 import hook_specs as dsv4_hooks
+from sglang_tpu.hooks.dsv4 import (
+    register_tpu_dsv4_resolution_hooks,
+)
 from sglang_tpu.hooks.encoder import (
     bootstrap_encoder_worker,
     encode_indices_within_patch_budget,
@@ -31,6 +32,7 @@ from sglang_tpu.hooks.encoder import (
 from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.glm_flash_megakernel import (
     drop_freed_glm_flash_megakernel_request,
+    flush_glm_flash_megakernel_request,
     route_glm_flash_megakernel,
 )
 from sglang_tpu.hooks.hicache_swa_metrics import hook_specs as hicache_swa_metrics_hooks
@@ -71,7 +73,6 @@ from sglang_tpu.hooks.pipeline_parallel import (
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 from sglang_tpu.hooks.spec_tp_sync import broadcast_undeferred
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
-from sglang_tpu.hooks.static_fp8 import bind_kimi_k3_static_fp8
 from sglang_tpu.hooks.swa_miss_metrics import hook_specs as swa_miss_metrics_hooks
 from sglang_tpu.hooks.twolevel_allreduce import all_reduce as twolevel_all_reduce
 from sglang_tpu.hooks.twolevel_allreduce import (
@@ -160,11 +161,6 @@ HOOKS: list[tuple] = [
     ),
     (
         "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
-        prepare_attn_residual_kernel,
-        HookType.AFTER,
-    ),
-    (
-        "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
         attach_k3_megakernel,
         HookType.AFTER,
     ),
@@ -235,6 +231,11 @@ HOOKS: list[tuple] = [
         HookType.BEFORE,
     ),
     (
+        "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.checkpoint",
+        flush_glm_flash_megakernel_request,
+        HookType.BEFORE,
+    ),
+    (
         "sglang.srt.models.glm5_next.Glm5NextDecoderLayer._hc_pre",
         hc_pre,
         HookType.AROUND,
@@ -275,11 +276,6 @@ HOOKS: list[tuple] = [
         HookType.AROUND,
     ),
     (
-        "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
-        bind_kimi_k3_static_fp8,
-        HookType.AFTER,
-    ),
-    (
         "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._tpu_mha_pool_class",
         draft_mha_pool_class,
         HookType.AROUND,
@@ -300,6 +296,8 @@ HOOKS: list[tuple] = [
         HookType.AROUND,
     ),
 ]
+
+HOOKS.extend(dsv4_hooks())
 
 HOOKS.extend(host_padding_hooks())
 
@@ -336,6 +334,7 @@ def register() -> None:
     )
 
     register_muse_spark_processor()
+    register_tpu_dsv4_resolution_hooks()
 
     from sglang.srt.plugins.hook_registry import HookRegistry
 

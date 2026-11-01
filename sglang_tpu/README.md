@@ -196,9 +196,13 @@ opt-outs.
 `sglang.multimodal_gen.platforms` selects `multimodal_gen.platform.TpuOOTPlatform`
 whenever `torch.tpu` is registered; `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=tpu`
 selects the fork's built-in TPU platform instead. `TpuOOTPlatform` subclasses that
-built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and carries the
-TPU behavior (`--attention-backend tpu_splash_attn`, the `AttentionBackendEnum.OOT`
-backend).
+built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
+
+- `--attention-backend tpu_splash_attn`, the `AttentionBackendEnum.OOT` backend.
+- torch.compile with the `tpu` backend and static shapes; TeaCache dropped and
+  the VAE left eager under compile; `--offload-during-compile` off.
+- Runtime patches applied at worker init (`multimodal_gen/worker.py`), each with
+  the debt header: `rope.py` (RoPE without stride-2 lane access).
 
 Gates that take the OOT arm, with the same outcome as the built-in platform:
 
@@ -208,3 +212,10 @@ Gates that take the OOT arm, with the same outcome as the built-in platform:
   caller registers the CUDA flash-attention op, which TPU never selects.
 - `get_all_to_all_communicator_cls()`: answered explicitly with the base
   communicator the built-in platform uses.
+
+Gates whose OOT arm differs from the built-in platform:
+
+- `build_torch_compile_kwargs()`: the OOT arm compiles with `get_compile_backend()`
+  (`tpu`) and drops the mode; the built-in arm passes the mode to the default
+  backend (inductor). Worker init turns off dynamo's automatic dynamic shapes,
+  as `dynamic=False` would.

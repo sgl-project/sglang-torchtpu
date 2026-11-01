@@ -112,8 +112,6 @@ parallel, all on the `nightly` lane. Kueue sorts out which job runs when.
 build ─┬─▶ feature-validation-tpu.yml
        │     ├─ single-host:  one job per file registered to nightly-tpu-4-v7 (tpu_oot)
        │     ├─ pd-sh-qwen3-vl-30b: one hand-wired 1-prefill + 1-decode job
-       │     ├─ pd-sh-muse-overload: one hand-wired 1-prefill + 1-decode job
-       │     │                       (overload stress behind a capped Rust router)
        │     └─ multi-host:   one job per file registered to nightly-tpu-multihost
        │                      with a MULTIHOST_LAUNCH dict (2x2x2 lane)
        └─▶ perf-test-tpu.yml: one job per perf suite, listed in the workflow (2x2x1 lane)

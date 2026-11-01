@@ -118,5 +118,56 @@ class TestSplashBackend(CustomTestCase):
                 normalize("tpu_splash_attn")
 
 
+class TestCompileDefaults(CustomTestCase):
+    def test_compile_warmup_keeps_the_dit_resident(self):
+        from sglang.multimodal_gen.configs.pipeline_configs.base import (
+            PipelineConfig,
+        )
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+
+        def server_args(**kwargs):
+            # ServerArgs.__post_init__ applies the platform defaults.
+            with (
+                patch.object(
+                    PipelineConfig, "from_kwargs", return_value=PipelineConfig()
+                ),
+                patch.object(
+                    current_platform,
+                    "apply_server_args_defaults",
+                    TpuOOTPlatform().apply_server_args_defaults,
+                ),
+            ):
+                return server_args_module.ServerArgs.from_kwargs(
+                    model_path="/fake", **kwargs
+                )
+
+        self.assertFalse(server_args().offload_during_compile)
+        # An explicit request is overridden: the warmup offload crashes on TPU.
+        self.assertFalse(
+            server_args(offload_during_compile=True).offload_during_compile
+        )
+
+    def test_teacache_and_vae_decode_stay_out_of_compile(self):
+        # What the core does with each False: TestPlatformCompileGates.
+        self.assertFalse(TpuOOTPlatform().supports_teacache_with_torch_compile())
+        self.assertFalse(TpuOOTPlatform.supports_vae_torch_compile())
+
+    def test_worker_init_keeps_recompiles_static_and_patches_the_worker(self):
+        import torch._dynamo
+
+        from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
+        from sglang_tpu.multimodal_gen import worker
+
+        with (
+            torch._dynamo.config.patch(automatic_dynamic_shapes=True),
+            patch.object(TpuPlatform, "_init_worker_process") as base_init,
+            patch.object(worker, "install_runtime_patches") as install,
+        ):
+            TpuOOTPlatform._init_worker_process()
+            self.assertFalse(torch._dynamo.config.automatic_dynamic_shapes)
+        base_init.assert_called_once_with()
+        install.assert_called_once_with()
+
+
 if __name__ == "__main__":
     unittest.main()

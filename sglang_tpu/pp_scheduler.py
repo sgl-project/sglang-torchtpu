@@ -69,6 +69,7 @@ def build_scheduler_pp_wave(scheduler: Scheduler) -> PPWave:
         hidden=int(model_runner.model_config.hidden_size),
         num_aux=num_aux,
         dtype=getattr(model_runner.model, "pp_transfer_dtype", model_runner.dtype),
+        aux_dtype=model_runner.dtype,
         device=torch.device(model_runner.device),
     )
     # A forward hands on its token bucket, or its batch bucket when decoding.
@@ -77,6 +78,14 @@ def build_scheduler_pp_wave(scheduler: Scheduler) -> PPWave:
     if torch.device(model_runner.device).type != "cpu":
         # torch_tpu compiles asynchronously; the checker must not count the warmups.
         torch.accelerator.synchronize()
+        # Blocking CPU copies synchronize their stream. Keep PP output copies
+        # off the stream that has already queued the next forward and wave.
+        scheduler.pp_comm_stream = scheduler.device_module.Stream(
+            device=torch.accelerator.current_device_index()
+        )
+        scheduler.pp_comm_stream_ctx = scheduler.device_module.stream(
+            scheduler.pp_comm_stream
+        )
     snapshot_recompilation_baseline()
     return wave
 

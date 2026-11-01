@@ -26,7 +26,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     PPProxyTensors,
 )
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.draft_worker_common import make_draft_block_spec_info
@@ -60,6 +60,7 @@ from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
 from sglang_tpu.experimental.speculative.spec_ops import (
     TARGET_CANDIDATES,
     build_draft_block_inputs,
+    select_verify_rows,
 )
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
@@ -70,7 +71,11 @@ from sglang_tpu.experimental.speculative.spec_types import (
     TpuSpecVerifyInput,
     VerifyRows,
 )
-from sglang_tpu.experimental.speculative.spec_utils import pad_rows, prompt_positions
+from sglang_tpu.experimental.speculative.spec_utils import (
+    pad_rows,
+    padded_h2d,
+    prompt_positions,
+)
 from sglang_tpu.sampler import distributed_top_k_candidate_width_for_model
 
 _DRAFT_WORKER_CLS: dict[SpeculativeAlgorithm, type[TpuBlockDraftWorker]] = {
@@ -113,9 +118,20 @@ class TpuBlockSpecWorker(TpuSpecWorker):
 
     def init_cuda_graphs(self) -> None:
         super().init_cuda_graphs()
-        self._warmup_draft_block_inputs()
-        if self._sampled_drafts:
-            self._warmup_draft_sampling()
+        # Under PP (pp_size > 1), TpuBlockSpecWorker only runs on the last stage
+        # of a non-decode (PD prefill) server, which projects extend draft KV and
+        # never drafts or samples speculative blocks. Scope this skip strictly to
+        # pp_size > 1 and disaggregation_mode != "decode" so PP prefill avoids
+        # single-stage decode compilations and unsharded-lm_head draft-sampling
+        # HBM spikes on the last stage, while keeping all pp_size == 1 (TP /
+        # monolithic) and decode paths completely unchanged.
+        is_pp_non_decode = (
+            get_parallel().pp_size > 1 and get_disagg().disaggregation_mode != "decode"
+        )
+        if not is_pp_non_decode:
+            self._warmup_draft_block_inputs()
+            if self._sampled_drafts:
+                self._warmup_draft_sampling()
         self._warmup_extend_draft_inputs()
         # The base snapshot ran before these block-draft warmups.
         snapshot_recompilation_baseline()
@@ -202,12 +218,25 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         logits_output: LogitsProcessorOutput,
         accept: AcceptResult,
     ) -> CommitResult:
-        del verify_input
         target_hidden = logits_output.hidden_states
         assert target_hidden is not None
         assert target_hidden.shape[0] == rows.cache_locs.numel(), (
             "verify hidden must keep the batch bucket rows"
         )
+        full_to_swa = self._block_draft_worker.full_to_swa
+        if full_to_swa is not None:
+            # A hybrid-SWA draft writes the SWA slots of the same window, mapped on host.
+            swa_candidates = full_to_swa[verify_input.verify_cache_candidates_cpu]
+            rows = select_verify_rows(
+                padded_h2d(
+                    swa_candidates.to(torch.int64),
+                    rows.cache_locs.shape[0],
+                    self.device,
+                ),
+                verify_input.committed_lens,
+                state.seq_lens,
+                self.num_verify_rows,
+            )
         # Padded rows commit 0 tokens, so the writer skips them.
         with self._block_draft_worker.draft_context():
             kv_fence_tail = self._block_draft_worker.write_draft_kv(
@@ -260,6 +289,9 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             )
             cache_loc_cpu = batch.out_cache_loc
             assert cache_loc_cpu.device.type == "cpu", cache_loc_cpu.device
+            full_to_swa = self._block_draft_worker.full_to_swa
+            if full_to_swa is not None and not self.ships_pd_hidden:
+                cache_loc_cpu = full_to_swa[cache_loc_cpu].to(cache_loc_cpu.dtype)
         positions = pad_rows(positions_cpu, padded_rows).to(
             self.device, non_blocking=True
         )
@@ -312,6 +344,10 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         bonus_tokens: torch.Tensor,
     ) -> None:
         del bonus_tokens
+        if self._block_draft_worker.full_to_swa is not None:
+            raise NotImplementedError(
+                "PD decode-side draft prefill does not support a hybrid-SWA draft."
+            )
         positions = pad_rows(
             prompt_positions(
                 prefix_lens=batch.prefix_lens, extend_lens=batch.extend_lens

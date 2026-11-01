@@ -19,12 +19,12 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    MambaStrategy,
     StackBuildResult,
     _check_declared_pools_present,
     _DsaStrategy,
     _evict_mamba_for_device_alloc,
     _evict_swa_for_device_alloc,
-    _MambaStrategy,
     _MambaSwaStrategy,
     _require_single_row_dsv4_swa_pages,
     _split_hicache_size,
@@ -129,7 +129,7 @@ class TestHybridStageLayerMappings(CustomTestCase):
         """Later pipeline stages must transfer every layer before signaling completion."""
         cases = [
             (
-                _MambaStrategy,
+                MambaStrategy,
                 "build_hybrid_mamba_stack",
                 {"full": {3: 0}, "mamba": {0: 2, 1: 0, 2: 1}},
             ),
