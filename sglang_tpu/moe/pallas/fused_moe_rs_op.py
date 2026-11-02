@@ -10,7 +10,7 @@ import torch
 from sglang_tpu.moe.expert_tp import is_fused_moe_rs_expert_tp
 
 _FUSED_MOE_RS_OP_NAME = "sglang_tpu_pallas::fused_moe_rs"
-_FUSED_MOE_RS_OP = None
+_FUSED_MOE_RS_OPS: dict = {}
 _FUSED_RS_ROUTED_ROW_ALIGNMENT = 16
 # Mirrors fused_rs.fused_moe._FUSED_RS_MAX_SAFE_SIZE_M (kernel SMEM bound on
 # routed rows); kept here so the Torch wrapper need not import JAX.
@@ -21,9 +21,15 @@ def fused_moe_rs_expert_tp_max_tokens(topk: int, tp_size: int) -> int:
     """Largest power-of-two token count one expert-TP call can route.
 
     Expert TP routes every (token, slot) to all ``tp_size`` expert slices, so a
-    call carries ``tokens * topk * tp_size`` kernel rows.
+    call carries ``tokens * topk * tp_size`` kernel rows, of which each device
+    indexes ``tokens * topk`` under SGLANG_TPU_FUSED_RS_ETP_LOCAL_ROWS.
     """
-    max_tokens = (_FUSED_RS_MAX_SAFE_ROUTED_ROWS - 1) // (topk * tp_size)
+    from sglang_tpu.envs import envs as tpu_envs
+
+    rows_per_token = topk * (
+        1 if tpu_envs.SGLANG_TPU_FUSED_RS_ETP_LOCAL_ROWS.get() else tp_size
+    )
+    max_tokens = (_FUSED_RS_MAX_SAFE_ROUTED_ROWS - 1) // rows_per_token
     return 1 << (max_tokens.bit_length() - 1)
 
 
@@ -102,6 +108,11 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
         )
         get_oneshot_all_gather_op(parallel.tp_size)
     _build_fused_moe_rs_op()
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if tpu_envs.SGLANG_TPU_NVFP4_E4M3_SCALES.get():
+        # Building an op builds its mesh, which Dynamo cannot trace: do it before capture.
+        _build_fused_moe_rs_op(global_scales=True)
 
 
 @functools.cache
@@ -112,10 +123,12 @@ def _get_mesh():
     return get_pallas_mesh(("data", "model"), (1, world_size))
 
 
-def _build_fused_moe_rs_op():
-    global _FUSED_MOE_RS_OP
-    if _FUSED_MOE_RS_OP is not None:
-        return _FUSED_MOE_RS_OP
+def _build_fused_moe_rs_op(global_scales: bool = False):
+    """The torch op over ``fused_moe_func_rs``; ``global_scales`` adds per-expert
+    ``(E, 2)`` gate/up and ``(E,)`` down global-scale inputs."""
+    op = _FUSED_MOE_RS_OPS.get(global_scales)
+    if op is not None:
+        return op
 
     import jax
     from jax.sharding import PartitionSpec as P
@@ -125,22 +138,24 @@ def _build_fused_moe_rs_op():
 
     mesh = _get_mesh()
 
-    def _wrapped(
-        hidden_states: jax.Array,
-        w1: jax.Array,
-        w2: jax.Array,
-        w1_scale: jax.Array,
-        w2_scale: jax.Array,
-        topk_weights: jax.Array,
-        topk_ids: jax.Array,
-        post_expert_norm_weight: jax.Array,
-        group_offset: jax.Array,
-        topk: int,
-        activation: str,
-        has_post_expert_norm: bool,
-        fp8_direct_write: bool,
-        expert_tp: bool,
-    ) -> jax.Array:
+    def _run(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        post_expert_norm_weight,
+        group_offset,
+        w1_global_scale,
+        w2_global_scale,
+        topk,
+        activation,
+        has_post_expert_norm,
+        fp8_direct_write,
+        expert_tp,
+    ):
         num_tokens = hidden_states.shape[0]
         ep_size = mesh.shape["model"]
         padded_tokens = fused_moe_rs_padded_tokens(num_tokens, topk, ep_size)
@@ -173,48 +188,150 @@ def _build_fused_moe_rs_op():
             ),
             fp8_direct_write=fp8_direct_write,
             expert_tp=expert_tp,
+            w1_global_scale=w1_global_scale,
+            w2_global_scale=w2_global_scale,
         )
         if not has_post_expert_norm:
             result = result + post_expert_norm_weight[0].astype(result.dtype) * 0
         return result
 
-    # Forward the mesh's device assignment while preserving the Torch-local
-    # shapes: the kernel already consumes local expert weights and returns a
-    # local token shard.
-    custom_op = jax_op(
-        _FUSED_MOE_RS_OP_NAME,
-        _wrapped,
-        mesh=mesh,
-        input_partition_specs=(P(),) * 9 + (None,) * 5,
-        output_partition_specs=(P(),),
-    )
-
-    def _fake_impl(
-        hidden_states: torch.Tensor,
-        w1: torch.Tensor,
-        w2: torch.Tensor,
-        w1_scale: torch.Tensor,
-        w2_scale: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        post_expert_norm_weight: torch.Tensor,
-        group_offset: torch.Tensor,
-        topk: int,
-        activation: str,
-        has_post_expert_norm: bool,
-        fp8_direct_write: bool,
-        expert_tp: bool,
-    ) -> torch.Tensor:
+    def _shard_shape(hidden_states, topk):
         ep_size = mesh.shape["model"]
         padded_tokens = fused_moe_rs_padded_tokens(
             hidden_states.shape[0], topk, ep_size
         )
-        shard_size = padded_tokens // ep_size
-        return hidden_states.new_empty((shard_size, hidden_states.shape[1]))
+        return (padded_tokens // ep_size, hidden_states.shape[1])
 
+    if global_scales:
+
+        def _wrapped(
+            hidden_states: jax.Array,
+            w1: jax.Array,
+            w2: jax.Array,
+            w1_scale: jax.Array,
+            w2_scale: jax.Array,
+            topk_weights: jax.Array,
+            topk_ids: jax.Array,
+            post_expert_norm_weight: jax.Array,
+            group_offset: jax.Array,
+            w1_global_scale: jax.Array,
+            w2_global_scale: jax.Array,
+            topk: int,
+            activation: str,
+            has_post_expert_norm: bool,
+            fp8_direct_write: bool,
+            expert_tp: bool,
+        ) -> jax.Array:
+            return _run(
+                hidden_states,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                topk_weights,
+                topk_ids,
+                post_expert_norm_weight,
+                group_offset,
+                w1_global_scale,
+                w2_global_scale,
+                topk,
+                activation,
+                has_post_expert_norm,
+                fp8_direct_write,
+                expert_tp,
+            )
+
+        def _fake_impl(
+            hidden_states: torch.Tensor,
+            w1: torch.Tensor,
+            w2: torch.Tensor,
+            w1_scale: torch.Tensor,
+            w2_scale: torch.Tensor,
+            topk_weights: torch.Tensor,
+            topk_ids: torch.Tensor,
+            post_expert_norm_weight: torch.Tensor,
+            group_offset: torch.Tensor,
+            w1_global_scale: torch.Tensor,
+            w2_global_scale: torch.Tensor,
+            topk: int,
+            activation: str,
+            has_post_expert_norm: bool,
+            fp8_direct_write: bool,
+            expert_tp: bool,
+        ) -> torch.Tensor:
+            return hidden_states.new_empty(_shard_shape(hidden_states, topk))
+
+        num_tensors, name = 11, _FUSED_MOE_RS_OP_NAME + "_gs"
+    else:
+
+        def _wrapped(
+            hidden_states: jax.Array,
+            w1: jax.Array,
+            w2: jax.Array,
+            w1_scale: jax.Array,
+            w2_scale: jax.Array,
+            topk_weights: jax.Array,
+            topk_ids: jax.Array,
+            post_expert_norm_weight: jax.Array,
+            group_offset: jax.Array,
+            topk: int,
+            activation: str,
+            has_post_expert_norm: bool,
+            fp8_direct_write: bool,
+            expert_tp: bool,
+        ) -> jax.Array:
+            return _run(
+                hidden_states,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                topk_weights,
+                topk_ids,
+                post_expert_norm_weight,
+                group_offset,
+                None,
+                None,
+                topk,
+                activation,
+                has_post_expert_norm,
+                fp8_direct_write,
+                expert_tp,
+            )
+
+        def _fake_impl(
+            hidden_states: torch.Tensor,
+            w1: torch.Tensor,
+            w2: torch.Tensor,
+            w1_scale: torch.Tensor,
+            w2_scale: torch.Tensor,
+            topk_weights: torch.Tensor,
+            topk_ids: torch.Tensor,
+            post_expert_norm_weight: torch.Tensor,
+            group_offset: torch.Tensor,
+            topk: int,
+            activation: str,
+            has_post_expert_norm: bool,
+            fp8_direct_write: bool,
+            expert_tp: bool,
+        ) -> torch.Tensor:
+            return hidden_states.new_empty(_shard_shape(hidden_states, topk))
+
+        num_tensors, name = 9, _FUSED_MOE_RS_OP_NAME
+
+    # Forward the mesh's device assignment while preserving the Torch-local
+    # shapes: the kernel already consumes local expert weights and returns a
+    # local token shard.
+    custom_op = jax_op(
+        name,
+        _wrapped,
+        mesh=mesh,
+        input_partition_specs=(P(),) * num_tensors + (None,) * 5,
+        output_partition_specs=(P(),),
+    )
     custom_op.register_fake(_fake_impl)
-    _FUSED_MOE_RS_OP = custom_op
-    return _FUSED_MOE_RS_OP
+    _FUSED_MOE_RS_OPS[global_scales] = custom_op
+    return custom_op
 
 
 def fused_moe_rs_call(
@@ -233,8 +350,10 @@ def fused_moe_rs_call(
     has_post_expert_norm: bool,
     fp8_direct_write: bool,
     expert_tp: bool = False,
+    w1_global_scale: torch.Tensor | None = None,
+    w2_global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return _build_fused_moe_rs_op()(
+    tensors = (
         hidden_states,
         w1,
         w2,
@@ -244,11 +363,12 @@ def fused_moe_rs_call(
         topk_ids,
         post_expert_norm_weight,
         group_offset,
-        topk,
-        activation,
-        has_post_expert_norm,
-        fp8_direct_write,
-        expert_tp,
+    )
+    static_args = (topk, activation, has_post_expert_norm, fp8_direct_write, expert_tp)
+    if w1_global_scale is None:
+        return _build_fused_moe_rs_op()(*tensors, *static_args)
+    return _build_fused_moe_rs_op(global_scales=True)(
+        *tensors, w1_global_scale, w2_global_scale, *static_args
     )
 
 
@@ -271,6 +391,8 @@ def fused_moe_rs_gather(
     keep_token_shard: bool = False,
     expert_tp: bool = False,
     oneshot_rank: torch.Tensor | None = None,
+    w1_global_scale: torch.Tensor | None = None,
+    w2_global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     import torch.distributed as dist
 
@@ -301,6 +423,8 @@ def fused_moe_rs_gather(
                         world_size=world_size,
                         expert_tp=True,
                         oneshot_rank=oneshot_rank,
+                        w1_global_scale=w1_global_scale,
+                        w2_global_scale=w2_global_scale,
                     )[: min(max_tokens, hidden_states.shape[0] - start)]
                     for start in range(0, hidden_states.shape[0], max_tokens)
                 ]
@@ -351,6 +475,8 @@ def fused_moe_rs_gather(
         has_post_expert_norm=has_post_expert_norm,
         fp8_direct_write=fp8_direct_write,
         expert_tp=expert_tp,
+        w1_global_scale=w1_global_scale,
+        w2_global_scale=w2_global_scale,
     )
     if token_shard.ndim != 2 or token_shard.shape != (
         padded_shard_rows,
