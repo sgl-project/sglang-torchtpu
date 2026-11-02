@@ -56,8 +56,9 @@ from sglang_tpu.k3_programs.kimi_k3.pools import (
 )
 from sglang_tpu.k3_programs.kimi_k3.program import (
     DP_SPEC_BATCHES,
-    SPEC_BATCHES,
     VOCAB,
+    compiled_spec_batches,
+    draft_rows,
     kernel_modules,
     spec_tokens_per_batch,
     supports_spec_tokens,
@@ -129,12 +130,13 @@ class KimiDecoder:
                         and supports_spec_tokens(compiled, k, self.groups)
                     ):
                         shapes.add((compiled, k + 1))
-            elif k and (b >= 2 or k == 3):
-                compiled = next((s for s in SPEC_BATCHES if s >= b), 0)
+            elif k and (b >= 2 or k in (1, 3)):
+                batches = compiled_spec_batches(k)
+                compiled = next((s for s in batches if s >= b), 0)
                 if not compiled or compiled > max(ops.batch_sizes):
                     raise ValueError(
                         f"K3 decode: no compiled speculation batch holds {b} "
-                        f"requests (batches {SPEC_BATCHES}, up to "
+                        f"requests at {k} drafts (batches {batches}, up to "
                         f"{max(ops.batch_sizes)})"
                     )
                 shapes.add((compiled, k + 1))
@@ -511,9 +513,12 @@ class KimiDecoder:
                 ),
                 0,
             )
-        if requests < 1 or (requests == 1 and 1 not in self.spec_batches):
+        if requests < 1:
             return 0
-        return next((b for b in self.spec_batches if b >= requests), 0)
+        return next(
+            (b for b, rows in self.spec_shapes if rows == rows_per and b >= requests),
+            0,
+        )
 
     def _modes_for(self, modes: tuple[int, ...]) -> torch.Tensor:
         if modes not in self._mode_rows:
@@ -863,9 +868,26 @@ class KimiDecoder:
                 self._pads.pop() if self._pads else self.draft.new_state(self._zero)
             )
         modes_t = self._modes_for(tuple(modes))
-        (ids,) = self._enter_batched(compiled, k)(
-            self.control, *(s.vector for s in states), modes_t
-        )
+        states, emitted = self._verify_and_draft(compiled, k, states, modes_t)
+        for row, (_, request) in zip(rows, decoding, strict=True):
+            self._drafts[request.req_id] = states[row]
+            self._fresh[request.req_id] = draft_rows(k)
+        self._pads.extend(states[row] for row in padding)
+        if self.device_plan is not None:
+            self.device_plan = self.layout.consumed(self.device_plan, compiled)
+        self.stats["batched"] += 1
+        return emitted, rows if self.groups > 1 else None
+
+    def _verify_and_draft(self, compiled: int, k: int, states, modes_t):
+        """One batched verify of ``k`` rows a request and the draft after it:
+        ``(states, emitted)``. A one-draft verify (``k`` 2) runs the draft's
+        four-row shape on its rows padded: the verify's two rows, then the
+        second again, with the ids of three drafts (the accepted count, at
+        most one, decides; the padding rows' context is rewritten before any
+        step reads it, as rejected rows' is)."""
+        assert self.draft is not None and self.layout is not None
+        vectors = [s.vector for s in states]
+        (ids,) = self._enter_batched(compiled, k)(self.control, *vectors, modes_t)
         sharded, aux, decisions = self.ops.verify_batched(
             ids,
             self.draft.aux_layers,
@@ -876,17 +898,50 @@ class KimiDecoder:
             modes_t,
             self.draft._synthetic_rates(k - 1),
         )
+        rows = draft_rows(k)
+        if rows != k:
+            (ids,) = self._enter_batched(compiled, rows)(
+                self.control, *vectors, modes_t
+            )
+            sharded, aux = self._pad_rows(compiled, k, rows)(sharded, aux)
         states, emitted, self.control = self.draft.step_batched(
-            states, aux, sharded, ids, self.control, decisions, self.layout, k
+            states, aux, sharded, ids, self.control, decisions, self.layout, rows
         )
-        for row, (_, request) in zip(rows, decoding, strict=True):
-            self._drafts[request.req_id] = states[row]
-            self._fresh[request.req_id] = k
-        self._pads.extend(states[row] for row in padding)
-        if self.device_plan is not None:
-            self.device_plan = self.layout.consumed(self.device_plan, compiled)
-        self.stats["batched"] += 1
-        return emitted, rows if self.groups > 1 else None
+        return states, emitted
+
+    def _pad_rows(self, requests: int, rows: int, padded: int) -> Any:
+        """``(logits, aux) -> (logits, aux)`` with ``padded`` rows a request:
+        its ``rows`` rows, then its last row repeated."""
+        key = ("pad_rows", requests, rows, padded)
+
+        def build():
+            import jax.numpy as jnp
+
+            from sglang_tpu.k3_programs.bridge import register_op
+            from sglang_tpu.k3_programs.kimi_k3.decode_ops import AXIS
+
+            pick = np.minimum(np.arange(padded), rows - 1)
+
+            def fn(logits, aux):
+                local = logits.reshape(logits.shape[0], requests, rows, -1)
+                local = jnp.take(local, pick, axis=2)
+                layered = aux.reshape(aux.shape[0], requests, rows, -1)
+                layered = jnp.take(layered, pick, axis=2)
+                return (
+                    local.reshape(logits.shape[0], requests * padded, -1),
+                    layered.reshape(aux.shape[0], requests * padded, -1),
+                )
+
+            return register_op(
+                f"pallas::k3_decode_pad_rows{requests}x{rows}to{padded}",
+                self.ops.mesh,
+                fn,
+                (P(AXIS), P()),
+                (P(AXIS), P()),
+                export_key=repr(key),
+            )
+
+        return self.ops.cached_op(key, build)
 
     # ------------------------------------------------------------ warmup
     def _warm_steps(self) -> None:
@@ -1038,28 +1093,8 @@ class KimiDecoder:
                     [(0, step == 0, 0, 0, params)] * requests, [null] * requests
                 )
                 modes = self._modes_for((min(step, 1),) * requests)
-                (ids,) = self._enter_batched(requests, rows_per)(
-                    self.control, *(s.vector for s in states), modes
-                )
-                sharded, aux, decisions = self.ops.verify_batched(
-                    ids,
-                    self.draft.aux_layers,
-                    requests,
-                    rows_per,
-                    self.layout,
-                    self.control,
-                    modes,
-                    self.draft._synthetic_rates(rows_per - 1),
-                )
-                states, emitted, self.control = self.draft.step_batched(
-                    states,
-                    aux,
-                    sharded,
-                    ids,
-                    self.control,
-                    decisions,
-                    self.layout,
-                    rows_per,
+                states, emitted = self._verify_and_draft(
+                    requests, rows_per, states, modes
                 )
             materialize(emitted)
             return states

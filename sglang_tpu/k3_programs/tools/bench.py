@@ -78,7 +78,7 @@ def add_arguments(parser, profile: bool = False) -> None:
     decode.add_argument(
         "--spec-drafts",
         type=int,
-        choices=(0, 3, 7),
+        choices=(0, 1, 3, 7),
         default=0,
         help="with --dspark: this many drafts at every batch, any size (e.g. "
         "attention DP2's batched verify + draft); default: --drafts or "
@@ -210,7 +210,7 @@ def run_decode(args, records: harness.Records) -> None:
             seven = tuple(float(r) for r in args.acceptance.split(","))
             if len(seven) != 7:
                 raise SystemExit("--acceptance takes seven rates")
-            rates = {7: seven, 3: seven[:3]}
+            rates = {7: seven, 3: seven[:3], 1: seven[:1]}
         draft = draft_class(args.dspark)(
             max_position=max_context + 8 * args.steps * args.repeats + 256,
             checkpoint=args.dspark,

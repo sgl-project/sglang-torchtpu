@@ -166,7 +166,7 @@ runtime_env.update(
         ),
         # InferenceX AgentX's synthetic acceptance for Kimi-K3 DSpark (mean
         # accepted length, bonus token included, per draft width).
-        "SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS": "7:3.78,3:2.87",
+        "SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS": "7:3.78,3:2.87,1:1.84",
         "SGLANG_RAIDEN_RESHARD": "0",
         # The MLA DSpark draft (both roles hold its KV).
         "SGLANG_TPU_K3_PROGRAM_DRAFT": "Inferact/Kimi-K3-DSpark",

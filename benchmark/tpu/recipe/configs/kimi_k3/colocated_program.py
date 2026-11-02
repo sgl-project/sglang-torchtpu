@@ -148,7 +148,7 @@ runtime_env.update(
             )
         ),
         "SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS": TAILS,
-        "SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS": "7:3.78,3:2.87",
+        "SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS": "7:3.78,3:2.87,1:1.84",
         "SGLANG_TPU_K3_PROGRAM_SPEC_SCHEDULE": os.environ.get(
             "K3_PROGRAM_SPEC_SCHEDULE", "1:1:7,2:16:3,17:64:0"
         ),

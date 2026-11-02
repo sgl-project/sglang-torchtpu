@@ -23,6 +23,9 @@ HIDDEN_SIZE = 7168
 VOCAB = 163840  # tokens; vocabulary-sharded 5120 per TP rank
 DRAFT_TOKENS = 7  # DSpark: the verify is the anchor and 7 drafts
 SPEC_BATCHES = (1, 2, 4, 6, 8, 12, 16, 20, 24)  # the batched speculation's compiled request counts
+# One-draft verifies (two rows a request; the draft runs its four-row shape on
+# the verify's rows padded): their compiled request counts.
+ONE_DRAFT_BATCHES = (16, 24, 32)
 # Attention DP2's compiled request counts: half of each are one group's.
 DP_SPEC_BATCHES = (2, 4, 8, 16, 32)
 MAX_STEP_TOKENS = 8192  # the prefill's largest window
@@ -34,7 +37,8 @@ _SPEC_SUPPORT = (
     f"3 or {DRAFT_TOKENS} drafts at batches 1-8, and 3 at batches "
     f"9-{max(SPEC_BATCHES)} (attention DP2: 9-{max(DP_SPEC_BATCHES)}) through "
     f"the compiled speculation batches {SPEC_BATCHES} (attention DP2: "
-    f"{DP_SPEC_BATCHES}; up to --max-num-seqs), 0 anywhere"
+    f"{DP_SPEC_BATCHES}; up to --max-num-seqs), 1 draft through "
+    f"{ONE_DRAFT_BATCHES} (no attention DP), 0 anywhere"
 )
 
 
@@ -50,11 +54,24 @@ def supports_spec_tokens(batch: int, drafts: int, attention_dp: int = 1) -> bool
     """Widths supported by the single and batched verifier/drafter (under
     attention DP2 three drafts up to 32 requests: a 128-row verify, drafted
     in parts)."""
+    if drafts == 1:
+        return attention_dp == 1 and 1 <= batch <= max(ONE_DRAFT_BATCHES)
     largest = max(DP_SPEC_BATCHES if attention_dp > 1 else SPEC_BATCHES)
     return drafts == 0 or (
         1 <= batch <= largest
         and (drafts == 3 or (batch <= 8 and drafts == DRAFT_TOKENS))
     )
+
+
+def compiled_spec_batches(drafts: int) -> tuple[int, ...]:
+    """The compiled request counts of a batched verify of ``drafts`` drafts."""
+    return ONE_DRAFT_BATCHES if drafts == 1 else SPEC_BATCHES
+
+
+def draft_rows(verify_rows: int) -> int:
+    """The draft kernel's rows a request for a verify of ``verify_rows``: the
+    one-draft verify's two rows run its four-row shape."""
+    return 4 if verify_rows == 2 else verify_rows
 
 
 def spec_tokens_per_batch(config: MegakernelEngineConfig) -> tuple[int, ...] | None:
@@ -118,7 +135,7 @@ def spec_tokens_per_batch(config: MegakernelEngineConfig) -> tuple[int, ...] | N
             # speculation batch, itself no wider than --max-num-seqs. (Attention
             # DP's plan rows, a DP batch size, hold every DP_SPEC_BATCHES entry
             # up to --max-num-seqs.)
-            supported = any(b <= s <= max_seqs for s in SPEC_BATCHES)
+            supported = any(b <= s <= max_seqs for s in compiled_spec_batches(k))
         if not supported:
             given = (
                 "None: num_speculative_tokens everywhere"

@@ -655,7 +655,10 @@ class MlaDsparkDraft:
                     priority=2 * rows,
                 )
             )
-        for requests, spec_rows in spec_shapes:
+        from sglang_tpu.k3_programs.kimi_k3.program import draft_rows
+
+        drafted = sorted({(requests, draft_rows(rows)) for requests, rows in spec_shapes})
+        for requests, spec_rows in drafted:
             rows = requests * spec_rows
             for index in self.parts(requests, self.attention_dp, spec_rows):
                 calls.append(
