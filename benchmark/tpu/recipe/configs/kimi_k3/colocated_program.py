@@ -22,6 +22,8 @@ Environment:
     K3_PROGRAM_SCHEDULE_POLICY      lpm (default) or fcfs
     K3_PROGRAM_PREFILL_SHARE        prefill's share of the engine while
                                     requests decode (0: the fixed interval)
+    K3_PROGRAM_PREFILL_WAIT         seconds a prefill waits for decoding
+                                    requests (0: off)
     K3_PROGRAM_KERNEL_EXTRA         more kernel settings (a=b;c=d)
     SGLANG_TPU_K3_PROGRAM_PRESHARDED pre-sharded weights directory
 """
@@ -158,6 +160,11 @@ runtime_env.update(
         # prefill_decode_interval).
         "SGLANG_TPU_K3_PROGRAM_PREFILL_SHARE": os.environ.get(
             "K3_PROGRAM_PREFILL_SHARE", "0"
+        ),
+        # While requests decode, a prefill waits up to this many seconds for
+        # them (0: the interval alone decides).
+        "SGLANG_TPU_K3_PROGRAM_PREFILL_WAIT_S": os.environ.get(
+            "K3_PROGRAM_PREFILL_WAIT", "0"
         ),
     }
 )

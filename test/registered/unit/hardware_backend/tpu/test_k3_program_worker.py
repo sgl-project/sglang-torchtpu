@@ -277,6 +277,59 @@ class TestPrefillSteps(CustomTestCase):
             self.steps.step([req], [0], [100], _req_to_token(2, {1: [1]})[:, ::STEP])
 
 
+class TestPrefillWait(CustomTestCase):
+    """Colocated engines hold a prefill back while requests decode, until the
+    oldest waiting request has waited the configured time."""
+
+    @staticmethod
+    def _req(entered):
+        return SimpleNamespace(time_stats=SimpleNamespace(wait_queue_entry_time=entered))
+
+    def _scheduler(self, decoding, waiting, chunked=None, mode=None):
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+
+        running = SimpleNamespace(
+            is_empty=lambda: not decoding, is_prefill_only=False
+        )
+        return SimpleNamespace(
+            running_batch=running,
+            waiting_queue=[self._req(t) for t in waiting],
+            chunked_req=None if chunked is None else self._req(chunked),
+            disaggregation_mode=mode or DisaggregationMode.NULL,
+        )
+
+    def test_defers_only_while_decoding_and_young(self):
+        from sglang_tpu.hooks import k3_program as hooks
+
+        defers = hooks.prefill_wait_defers
+        self.assertTrue(defers(self._scheduler(True, [9.5]), 1.0, 10.0))
+        # Waited past the limit, nothing decoding, or nothing waiting: no.
+        self.assertFalse(defers(self._scheduler(True, [8.5, 9.9]), 1.0, 10.0))
+        self.assertFalse(defers(self._scheduler(False, [9.9]), 1.0, 10.0))
+        self.assertFalse(defers(self._scheduler(True, []), 1.0, 10.0))
+        # A chunked prompt in progress counts as waiting since it entered.
+        self.assertTrue(defers(self._scheduler(True, [], chunked=9.8), 1.0, 10.0))
+        self.assertFalse(defers(self._scheduler(True, [], chunked=8.0), 1.0, 10.0))
+
+    def test_hook_falls_back_to_the_interval(self):
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from sglang_tpu.hooks import k3_program as hooks
+
+        original = mock.Mock(return_value=False)
+        young = self._scheduler(True, [1e12])  # entered "now": always young
+        with mock.patch.object(hooks, "k3_program_active", return_value=True):
+            with tpu_envs.SGLANG_TPU_K3_PROGRAM_PREFILL_WAIT_S.override(0.0):
+                self.assertFalse(hooks.k3_program_prefill_wait(original, young))
+            with tpu_envs.SGLANG_TPU_K3_PROGRAM_PREFILL_WAIT_S.override(2.0):
+                self.assertTrue(hooks.k3_program_prefill_wait(original, young))
+                old = self._scheduler(True, [1.0])
+                self.assertFalse(hooks.k3_program_prefill_wait(original, old))
+                # P/D roles keep the scheduler's own policy.
+                prefill = self._scheduler(True, [1e12], mode=DisaggregationMode.PREFILL)
+                self.assertFalse(hooks.k3_program_prefill_wait(original, prefill))
+        self.assertEqual(original.call_count, 3)
+
+
 class TestPrefillShare(CustomTestCase):
     """Colocated engines defer prefill by rounds sized from the batch."""
 

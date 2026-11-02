@@ -88,6 +88,20 @@ reject_unsupported_k3_requests
        validation seam).
   Remove when: that seam exists.
 
+k3_program_prefill_wait
+  Why: AgentX's interactivity averages each request's inter-token latency, and
+       a colocated engine's prefill batch (0.3-1 s a chunk) stops every
+       decoding request: a stall in a short answer multiplies its latency
+       (ITL mean 3.11 ms against a 2.79 ms median at concurrency 4 on
+       hardware), while the trace's sessions sit idle most of the time.
+  How: AROUND sglang.srt.managers.scheduler.Scheduler._should_defer_prefill
+       defers a new prefill while requests decode until the oldest waiting
+       (or chunked) request has waited SGLANG_TPU_K3_PROGRAM_PREFILL_WAIT_S;
+       otherwise the scheduler's own interval decides.
+  Upstream PR or issue: <to be filed> (a scheduling policy seam for
+       prefill/decode priority).
+  Remove when: that seam exists.
+
 k3_program_prefill_share
   Why: a colocated engine's prefill batches stop its decoding requests, and
        --prefill-decode-interval defers the next prefill by a fixed number of
@@ -270,6 +284,42 @@ def k3_program_prefill_share(original, scheduler: Any, batch: Any, *args, **kwar
     return result
 
 
+def prefill_wait_defers(scheduler: Any, wait_s: float, now: float) -> bool:
+    """Whether a colocated engine holds its next prefill back: requests are
+    decoding and the oldest waiting (or chunked) request has waited less than
+    ``wait_s`` seconds."""
+    running = scheduler.running_batch
+    if running is None or running.is_empty() or running.is_prefill_only:
+        return False
+    pending = list(scheduler.waiting_queue)
+    if scheduler.chunked_req is not None:
+        pending.append(scheduler.chunked_req)
+    entries = [
+        req.time_stats.wait_queue_entry_time
+        for req in pending
+        if req.time_stats.wait_queue_entry_time
+    ]
+    return bool(entries) and now - min(entries) < wait_s
+
+
+def k3_program_prefill_wait(original, scheduler: Any, *args, **kwargs) -> bool:
+    """AROUND Scheduler._should_defer_prefill."""
+    import time
+
+    from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang_tpu.envs import envs as tpu_envs
+
+    wait_s = tpu_envs.SGLANG_TPU_K3_PROGRAM_PREFILL_WAIT_S.get()
+    if (
+        wait_s > 0
+        and k3_program_active()
+        and scheduler.disaggregation_mode == DisaggregationMode.NULL
+        and prefill_wait_defers(scheduler, wait_s, time.perf_counter())
+    ):
+        return True
+    return original(scheduler, *args, **kwargs)
+
+
 def skip_k3_program_backends(original, model_runner: Any, *args, **kwargs) -> None:
     """AROUND ModelRunner.init_attention_backends."""
     if not k3_program_active():
@@ -332,6 +382,11 @@ def hook_specs() -> list[tuple]:
         (
             "sglang.srt.managers.scheduler.Scheduler._arm_prefill_decode_interval",
             k3_program_prefill_share,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.managers.scheduler.Scheduler._should_defer_prefill",
+            k3_program_prefill_wait,
             HookType.AROUND,
         ),
         (
