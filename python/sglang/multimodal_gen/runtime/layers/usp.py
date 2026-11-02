@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils.common import torch_release
 
 _cp_options.enable_load_balance = False
@@ -97,8 +98,13 @@ def _a2a_staging_buffer(
 def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Tensor:
     ulysses_pg = get_sp_group().ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
-    x_shape = x.shape
-    x = x.flatten().contiguous()
+    # Every caller's dim 0 splits evenly over the group, so exchanging the
+    # tensor in its own shape moves the same bytes as a flat exchange; a
+    # flattened buffer costs torch_tpu relayout copies around the collective.
+    x = x.contiguous()
+    assert x.shape[0] % get_ulysses_parallel_world_size() == 0, (
+        f"dim 0 ({x.shape[0]}) must split evenly over the Ulysses group"
+    )
     if role is None:
         output = torch.empty_like(x)
     else:
@@ -106,7 +112,7 @@ def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Te
     # USP calls this collective many times per denoising step and waits
     # immediately, so avoid the extra wrapper overhead of functional collectives.
     torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
-    return output.reshape(x_shape)
+    return output
 
 
 def _usp_all_to_all_single_varlen(
@@ -601,6 +607,36 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     )
 
     s_local, h_global = s_global // world_size, h_local * world_size
+
+    if (
+        head_dim == 2
+        and h_local > 1
+        and current_platform.prefers_head_slab_output_exchange()
+        and x.transpose(1, 2).is_contiguous()
+    ):
+        # Heads-major input ([b, h_local, s, d] viewed as [b, s, h_local, d]), on
+        # platforms that ask for it (TPU): exchange whole [s_local, d] head
+        # slabs instead of the sequence-major [s, b, h_local, d] buffer. The
+        # relayout copy before the exchange and the gather copy after it are the
+        # same two copies as the path below; what changes is the exchanged
+        # buffer, whose minor dims (s_local, d) stay dense where (h_local, d)
+        # would be padded to (8, 128) tiles on TPU. Values are bit-identical to
+        # the path below. Callers that slice a replicated prefix/suffix off the
+        # output (FLUX.2, Z-Image) are not heads-major contiguous and take the
+        # path below. h_local > 1: with one head,
+        # sequence-major inputs also pass the contiguity check.
+        x = (
+            x.transpose(1, 2)
+            .reshape(b, h_local, world_size, s_local, d)
+            .permute(2, 0, 1, 3, 4)
+            .contiguous()
+        )
+        x = _usp_all_to_all_single(x, role="usp_output")
+        # [world_size, b, h_local, s_local, d] -> [b, s_local, h_global, d]. A
+        # fresh tensor: contiguous() is a no-op when b == s_local == 1 and would
+        # return a view of the reused staging buffer.
+        x = x.permute(1, 3, 0, 2, 4).clone(memory_format=torch.contiguous_format)
+        return x.view(b, s_local, h_global, d)
 
     x = x.permute(permute_order).contiguous()
     x = _usp_all_to_all_single(x, role="usp_output")

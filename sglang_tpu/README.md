@@ -199,10 +199,14 @@ selects the fork's built-in TPU platform instead. `TpuOOTPlatform` subclasses th
 built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
 
 - `--attention-backend tpu_splash_attn`, the `AttentionBackendEnum.OOT` backend.
-- torch.compile with the `tpu` backend and static shapes; TeaCache dropped and
-  the VAE left eager under compile; `--offload-during-compile` off.
+- torch.compile with the `tpu` backend and static shapes; compile-cache tags for
+  the rank assignment and the kernel inputs; TeaCache dropped and the VAE left
+  eager under compile; `--offload-during-compile` off.
+- Checkpoints read on the host, then moved (safetensors cannot open `tpu:N`);
+  the Ulysses output all-to-all exchanges heads-major outputs in head slabs.
 - Runtime patches applied at worker init (`multimodal_gen/worker.py`), each with
-  the debt header: `rope.py` (RoPE without stride-2 lane access).
+  the debt header: `rope.py` (RoPE without stride-2 lane access), `sdpa_mask.py`
+  (SDPA masks that broadcast over queries).
 
 Gates that take the OOT arm, with the same outcome as the built-in platform:
 
