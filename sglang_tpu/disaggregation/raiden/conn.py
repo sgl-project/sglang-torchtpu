@@ -68,6 +68,7 @@ from sglang_tpu.disaggregation.raiden.common import (
 from sglang_tpu.disaggregation.raiden.host_pool import (
     StagingAdmission,
     node_worker_rank,
+    plan_dynamic_staging,
     ranks_per_node,
     slot_host_bytes,
     slots_within_budget,
@@ -148,6 +149,7 @@ class RaidenKVManager(
     _pipeline = None
     _pipeline_enabled = False
     _listener_start_read = False
+    _dynamic_host_staging = True
     # Layout tag of the registered KV tensors, sent with every CHUNK and BLOCKS.
     kv_layout: str = PER_LAYER_KV_LAYOUT
     # State engine: one row per request for GDN, or multi-page request rings for DSV4.
@@ -310,11 +312,7 @@ class RaidenKVManager(
         self._prefill: Optional[PrefillState] = None
         self._decode: Optional[DecodeState] = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self._prefill = PrefillState(
-                announce_pages=max(
-                    1, -(-CHUNK_ANNOUNCE_TOKENS // int(self.kv_args.page_size))
-                )
-            )
+            self._prefill = PrefillState(announce_pages=self._announce_pages())
         else:
             # Detects a prefill that stopped answering and fails its rooms.
             self._start_heartbeat_checker_thread()
@@ -446,17 +444,36 @@ class RaidenKVManager(
     def _build_engine(self) -> None:
         if self._engine is not None or self._kv_caches is None:
             return
-        engines = 1 + bool(self._swa_kv_caches) + bool(self._state_kv_caches)
+        total_engines = 1 + bool(self._swa_kv_caches) + bool(self._state_kv_caches)
+        # Full attention and its sliding window share their combined slice of
+        # the rank budget; a GDN/MLA state engine keeps its 1/total_engines share.
+        group_engines = total_engines / (1 + bool(self._swa_kv_caches))
         max_blocks = self._max_request_blocks()
-        num_slots = self._num_slots(self._kv_caches, max_blocks, engines)
+        swa_max_blocks = self._swa_max_request_blocks() if self._swa_kv_caches else None
+        if self._dynamic_host_staging:
+            pool_pages, swa_num_slots = self._plan_dynamic_engines(
+                max_blocks=max_blocks,
+                swa_max_blocks=swa_max_blocks,
+                engines=group_engines,
+            )
+            # Native KVCacheManager sizes dynamic host staging to num_slots * max_blocks.
+            full_engine_blocks, num_slots = pool_pages, 1
+        else:
+            num_slots, swa_num_slots = self._plan_fixed_engines(
+                max_blocks=max_blocks,
+                swa_max_blocks=swa_max_blocks,
+                engines=group_engines,
+            )
+            full_engine_blocks = max_blocks
+            pool_pages = num_slots * max_blocks
+
         self.raiden_endpoint, self._engine = self._start_engine(
             kv_caches=self._kv_caches,
             port=self._control_port,
-            max_blocks=max_blocks,
+            max_blocks=full_engine_blocks,
             num_slots=num_slots,
         )
         self._full_engine_max_blocks = max_blocks
-        pool_pages = num_slots * max_blocks
         swa_pool_pages = None
         state_pool_pages = None
         logger.info(
@@ -472,10 +489,6 @@ class RaidenKVManager(
             self._transfer_parallelism,
         )
         if self._swa_kv_caches:
-            swa_max_blocks = self._swa_max_request_blocks()
-            swa_num_slots = self._num_slots(
-                self._swa_kv_caches, swa_max_blocks, engines
-            )
             self.swa_raiden_endpoint, self._swa_engine = self._start_engine(
                 kv_caches=self._swa_kv_caches,
                 port=self._control_port + SWA_PORT_OFFSET,
@@ -497,7 +510,9 @@ class RaidenKVManager(
         if self._state_kv_caches:
             state_max_blocks = self._state_max_blocks
             state_num_slots = self._num_slots(
-                list(self._state_kv_caches), state_max_blocks, engines
+                kv_caches=list(self._state_kv_caches),
+                max_blocks=state_max_blocks,
+                engines=total_engines,
             )
             self.state_raiden_endpoint, self._state_engine = self._start_engine(
                 kv_caches=list(self._state_kv_caches),
@@ -519,7 +534,91 @@ class RaidenKVManager(
             )
         # Each engine's pool is handed out read by read, so the pages the
         # decode may hold in flight are the pages raiden reserved.
-        self._pulling = StagingAdmission(pool_pages, swa_pool_pages, state_pool_pages)
+        self._pulling = StagingAdmission(
+            capacity=pool_pages,
+            swa_capacity=swa_pool_pages,
+            state_capacity=state_pool_pages,
+        )
+
+    def _plan_fixed_engines(
+        self,
+        *,
+        max_blocks: int,
+        swa_max_blocks: Optional[int],
+        engines: float,
+    ) -> Tuple[int, Optional[int]]:
+        reserved = 0
+        swa_num_slots = None
+        if self._swa_kv_caches and swa_max_blocks is not None:
+            swa_num_slots = self._num_slots(
+                kv_caches=self._swa_kv_caches,
+                max_blocks=swa_max_blocks,
+                engines=engines,
+                paired_slot_bytes=slot_host_bytes(
+                    kv_caches=self._kv_caches, max_blocks=max_blocks
+                ),
+            )
+            reserved = swa_num_slots * slot_host_bytes(
+                kv_caches=self._swa_kv_caches, max_blocks=swa_max_blocks
+            )
+        num_slots = self._num_slots(
+            kv_caches=self._kv_caches,
+            max_blocks=max_blocks,
+            engines=engines,
+            reserved_bytes=reserved,
+        )
+        return num_slots, swa_num_slots
+
+    def _plan_dynamic_engines(
+        self,
+        *,
+        max_blocks: int,
+        swa_max_blocks: Optional[int],
+        engines: float,
+    ) -> Tuple[int, Optional[int]]:
+        budget = self._rank_budget(engines)
+        ceiling = self._slot_ceiling()
+        full_page_bytes = slot_host_bytes(kv_caches=self._kv_caches, max_blocks=1)
+        swa_slot_bytes = (
+            slot_host_bytes(kv_caches=self._swa_kv_caches, max_blocks=swa_max_blocks)
+            if self._swa_kv_caches and swa_max_blocks is not None
+            else None
+        )
+        chunk_blocks = (
+            min(max_blocks, self._announce_pages())
+            if self.chunked_transfer
+            else max_blocks
+        )
+        pool_pages, swa_num_slots = plan_dynamic_staging(
+            budget_bytes=budget,
+            ceiling=ceiling,
+            full_page_bytes=full_page_bytes,
+            max_blocks=max_blocks,
+            chunk_blocks=chunk_blocks,
+            swa_slot_bytes=swa_slot_bytes,
+        )
+        full_slot_bytes = full_page_bytes * max_blocks
+        swa_reserved = (swa_num_slots or 0) * (swa_slot_bytes or 0)
+        logger.info(
+            "RaidenKVManager rank%d slot budget | max_blocks=%d slot=%.1fMB "
+            "rank_budget=%.1fGB pool_pages=%d",
+            self.attn_tp_rank,
+            max_blocks,
+            full_slot_bytes / (1024**2),
+            (budget - swa_reserved) / (1024**3),
+            pool_pages,
+        )
+        if swa_num_slots is not None:
+            logger.info(
+                "RaidenKVManager rank%d slot budget | max_blocks=%d slot=%.1fMB "
+                "rank_budget=%.1fGB slots=%d",
+                self.attn_tp_rank,
+                swa_max_blocks,
+                (swa_slot_bytes or 0) / (1024**2),
+                budget / (1024**3),
+                swa_num_slots,
+            )
+        return pool_pages, swa_num_slots
 
     def _start_engine(
         self, *, kv_caches: List[Any], port: int, max_blocks: int, num_slots: int
@@ -531,16 +630,28 @@ class RaidenKVManager(
         # dim as a page, matching the TPU fused KV pool ([num_blocks, page, ...]).
         from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
 
+        # Sync before lazy KVCacheManager construction: dynamic sizing passes
+        # num_slots=1, which collapses concurrency if C++ reads stale "0".
         endpoint = NetworkAddress(host=self.local_ip, port=port).to_host_port_str()
-        engine = KVCacheManager(
-            kv_caches=kv_caches,
-            node_id=self._local_rank,
-            local_control_port=port,
-            max_blocks=max_blocks,
-            num_slots=num_slots,
-            timeout_s=self._timeout_s,
-            parallelism=self._transfer_parallelism,
+        prev_dynamic_env = os.environ.get("TPU_RAIDEN_DYNAMIC_HOST_STAGING")
+        os.environ["TPU_RAIDEN_DYNAMIC_HOST_STAGING"] = (
+            "1" if self._dynamic_host_staging else "0"
         )
+        try:
+            engine = KVCacheManager(
+                kv_caches=kv_caches,
+                node_id=self._local_rank,
+                local_control_port=port,
+                max_blocks=max_blocks,
+                num_slots=num_slots,
+                timeout_s=self._timeout_s,
+                parallelism=self._transfer_parallelism,
+            )
+        finally:
+            if prev_dynamic_env is None:
+                os.environ.pop("TPU_RAIDEN_DYNAMIC_HOST_STAGING", None)
+            else:
+                os.environ["TPU_RAIDEN_DYNAMIC_HOST_STAGING"] = prev_dynamic_env
         return endpoint, engine
 
     def _staging_cost(self, pages: int, max_blocks: int) -> int:
@@ -587,11 +698,26 @@ class RaidenKVManager(
         in_transfer = int(get_disagg().disaggregation_decode_extra_slots or 0)
         return max(1, batch + in_transfer)
 
+    def _announce_pages(self) -> int:
+        return max(1, -(-CHUNK_ANNOUNCE_TOKENS // int(self.kv_args.page_size)))
+
+    def _rank_budget(self, engines: float = 1) -> float:
+        budget = tpu_envs.SGLANG_RAIDEN_HOST_POOL_GB.get() * 1024**3
+        local_ranks = ranks_per_node(
+            attn_tp_size=self.attn_tp_size,
+            attn_dp_size=self.attn_dp_size,
+            system_dp_size=self.system_dp_size,
+            nnodes=self.server_args.nnodes,
+            attn_cp_size=self.attn_cp_size,
+            pp_size=self.pp_size,
+        )
+        return budget / (local_ranks * max(1.0, float(engines)))
+
     def _num_slots(
         self,
         kv_caches: List[Any],
         max_blocks: int,
-        engines: int = 1,
+        engines: float = 1,
         *,
         reserved_bytes: int = 0,
         paired_slot_bytes: int = 0,
@@ -607,24 +733,19 @@ class RaidenKVManager(
         shrinks the pool instead, and refuses to start when not even one slot
         fits the budget.
         """
-        budget = tpu_envs.SGLANG_RAIDEN_HOST_POOL_GB.get() * 1024**3
-        local_ranks = ranks_per_node(
-            self.attn_tp_size,
-            self.attn_dp_size,
-            self.system_dp_size,
-            self.server_args.nnodes,
-            self.attn_cp_size,
-            self.pp_size,
+        budget = self._rank_budget(engines=engines) - reserved_bytes
+        own_slot_bytes = slot_host_bytes(kv_caches=kv_caches, max_blocks=max_blocks)
+        slots = slots_within_budget(
+            budget_bytes=budget,
+            slot_bytes=own_slot_bytes + paired_slot_bytes,
+            ceiling=self._slot_ceiling(),
         )
-        budget = budget / (local_ranks * max(1, engines)) - reserved_bytes
-        slot_bytes = slot_host_bytes(kv_caches, max_blocks) + paired_slot_bytes
-        slots = slots_within_budget(budget, slot_bytes, self._slot_ceiling())
         logger.info(
             "RaidenKVManager rank%d slot budget | max_blocks=%d slot=%.1fMB "
             "rank_budget=%.1fGB slots=%d",
             self.attn_tp_rank,
             max_blocks,
-            slot_bytes / (1024**2),
+            own_slot_bytes / (1024**2),
             budget / (1024**3),
             slots,
         )

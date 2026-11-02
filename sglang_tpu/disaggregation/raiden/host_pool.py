@@ -192,3 +192,54 @@ def slots_within_budget(budget_bytes: float, slot_bytes: int, ceiling: int) -> i
             "raise SGLANG_RAIDEN_HOST_POOL_GB or lower the context length"
         )
     return max(1, min(ceiling, int(budget_bytes // max(1, slot_bytes))))
+
+
+# Reserve >= 1 full max-length request and pair each SWA slot with one full
+# chunk so closing transfers fit while surplus budget funds full-attention pages.
+def plan_dynamic_staging(
+    *,
+    budget_bytes: float,
+    ceiling: int,
+    full_page_bytes: int,
+    max_blocks: int,
+    chunk_blocks: int,
+    swa_slot_bytes: Optional[int] = None,
+) -> Tuple[int, Optional[int]]:
+    ceiling = max(1, ceiling)
+    max_blocks = max(1, max_blocks)
+    chunk_blocks = max(1, min(max_blocks, chunk_blocks))
+    full_slot_bytes = full_page_bytes * max_blocks
+    if swa_slot_bytes is None:
+        slots_within_budget(
+            budget_bytes=budget_bytes,
+            slot_bytes=full_slot_bytes,
+            ceiling=ceiling,
+        )
+        pool_pages = min(
+            ceiling * max_blocks,
+            int(budget_bytes // max(1, full_page_bytes)),
+        )
+        return max(max_blocks, pool_pages), None
+
+    slots_within_budget(
+        budget_bytes=budget_bytes,
+        slot_bytes=full_slot_bytes + swa_slot_bytes,
+        ceiling=ceiling,
+    )
+    chunk_bytes = full_page_bytes * chunk_blocks
+    if swa_slot_bytes <= 0:
+        swa_num_slots = ceiling
+    else:
+        swa_num_slots = max(
+            1,
+            min(
+                ceiling,
+                int((budget_bytes - full_slot_bytes) // swa_slot_bytes),
+                int(budget_bytes // max(1, chunk_bytes + swa_slot_bytes)),
+            ),
+        )
+    pool_pages = min(
+        ceiling * max_blocks,
+        int((budget_bytes - swa_num_slots * swa_slot_bytes) // max(1, full_page_bytes)),
+    )
+    return max(max_blocks, pool_pages), swa_num_slots

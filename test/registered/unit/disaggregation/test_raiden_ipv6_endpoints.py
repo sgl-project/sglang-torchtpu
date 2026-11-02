@@ -21,6 +21,7 @@ import types
 import unittest
 from unittest.mock import Mock, patch
 
+import torch
 import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
@@ -216,8 +217,9 @@ class TestEngineEndpoint(CustomTestCase):
         mgr._control_port = 31000
         mgr._timeout_s = 120.0
         mgr._local_rank = 0
-        mgr._kv_caches = [object()]
-        mgr._swa_kv_caches = [object()] if swa else None
+        mgr._kv_caches = [torch.zeros(1, 1)]
+        mgr._swa_kv_caches = [torch.zeros(1, 1)] if swa else None
+        mgr._dynamic_host_staging = False
         mgr._max_request_blocks = lambda: 8
         mgr._swa_max_request_blocks = lambda: 2
         mgr._num_slots = lambda *a, **k: 3
