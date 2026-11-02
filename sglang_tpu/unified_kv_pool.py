@@ -44,6 +44,7 @@ from sglang_tpu.kv_pool import (
     TpuFusedMHATokenToKVPool,
     _cdiv,
 )
+from sglang_tpu.tpu_dma_hicache import is_tpu_dma_hicache_backend
 
 logger = logging.getLogger(__name__)
 
@@ -214,8 +215,25 @@ def _unsupported_reason(kvc) -> Optional[str]:
             f"does not support PD disaggregation (disaggregation_mode={disagg_mode!r}).",
         ),
         (
-            memory.enable_hierarchical_cache,
-            "does not support --enable-hierarchical-cache.",
+            memory.enable_hierarchical_cache
+            and not is_tpu_dma_hicache_backend(
+                getattr(memory, "hicache_io_backend", None)
+            ),
+            "with --enable-hierarchical-cache requires a TPU DMA "
+            f"--hicache-io-backend (e.g. 'raiden'), got "
+            f"{getattr(memory, 'hicache_io_backend', None)!r}.",
+        ),
+        (
+            memory.enable_hierarchical_cache
+            and getattr(memory, "hicache_storage_backend", None) is not None,
+            "with --enable-hierarchical-cache does not support L3 storage "
+            f"(--hicache-storage-backend={getattr(memory, 'hicache_storage_backend', None)!r}).",
+        ),
+        (
+            memory.enable_hierarchical_cache
+            and getattr(memory, "hicache_host_memory_mode", "cache") == "buffer_only",
+            "with --enable-hierarchical-cache does not support "
+            "--hicache-host-memory-mode buffer_only.",
         ),
         (
             memory.enable_unified_cache_external_linker,

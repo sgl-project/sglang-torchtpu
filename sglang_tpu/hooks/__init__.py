@@ -92,6 +92,7 @@ from sglang_tpu.hooks.twolevel_allreduce import (
 from sglang_tpu.hooks.twolevel_allreduce import (
     row_parallel_linear_forward as twolevel_row_parallel_linear_forward,
 )
+from sglang_tpu.kv_pool_host import register_unified_hicache_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -383,6 +384,7 @@ def register() -> None:
 
     register_muse_spark_processor()
     register_tpu_dsv4_resolution_hooks()
+    register_unified_hicache_strategy()
 
     from sglang.srt.plugins.hook_registry import HookRegistry
 
