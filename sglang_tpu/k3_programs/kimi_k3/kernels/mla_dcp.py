@@ -252,7 +252,7 @@ def persistent_scratch(batch, group=GROUP, heads=HEADS_PER_RANK, *,
     # Plain attention DP2 holds six heads for B/2 rows. Speculative attention
     # retains full-precision owner queries for its causal new-token fold.
     plain = sequence_rows == 1 and (
-        (batch in (32, 64) and heads == HEADS_PER_RANK)
+        (batch in (32, 48, 64) and heads == HEADS_PER_RANK)
         or (group == 16 and batch in (16, 32, 48, 64) and heads == 6))
     query_dtype = (jnp.uint8 if cache_dtype == jnp.float8_e4m3fn
                    and (plain or fp8_wire or _grouped_spec(batch, group, heads, sequence_rows))
@@ -322,7 +322,7 @@ def scoped_scratch(batch, span=SPAN, buffers=BUFFERS, heads=HEADS_PER_RANK, grou
         raise ValueError(
             "mla_decode_ktile=2048 requires DCP16, six heads per rank and "
             "FP8 e4m3fn KV with 512-token pages")
-    if cache_dtype == jnp.float8_e4m3fn and batch in (8, 16, 32, 64):
+    if cache_dtype == jnp.float8_e4m3fn and batch in (8, 16, 32, 48, 64):
         span = 4 if wide and batch == 32 and sequence_rows == 1 else min(span, SPAN * PAGE_TOKENS // page_tokens)
     else:
         span = span * PAGE_TOKENS // page_tokens
@@ -614,7 +614,7 @@ class DcpAttention:
         # steps: rows with a partial last step fold its 1 .. span - 1 pages with
         # static tail shapes.
         if ((self.folds == 1 and (
-                self.sequence_rows != 1 or (self.heads != HEADS_PER_RANK and not (self.group == 16 and self.heads == 6 and self.batch == 32)) or self.batch not in (32, 64) or self.ws.gathered.dtype != jnp.uint8
+                self.sequence_rows != 1 or (self.heads != HEADS_PER_RANK and not (self.group == 16 and self.heads == 6 and self.batch == 32)) or self.batch not in (32, 48, 64) or self.ws.gathered.dtype != jnp.uint8
                 or (self.span != 2 and not (_config().mla_decode_ktile == 2048 and self.span == 4))))
                 or "attend" in self.skip or "pagecompute" in self.skip):
             return self._attend_pipeline(first, end, base)

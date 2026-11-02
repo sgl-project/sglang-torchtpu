@@ -72,7 +72,7 @@ def _scoped(name):
 
 # Largest supported decode batch; SCATTER_BATCHES lists the token-scatter batches.
 MAX_BATCH = 128
-SCATTER_BATCHES = (8, 12, 16, 20, 24, 28, 32, 64, 96, 128)
+SCATTER_BATCHES = (8, 12, 16, 20, 24, 28, 32, 48, 64, 96, 128)
 
 
 def _bf16_rows_view(ref, rows, width):
@@ -866,7 +866,7 @@ def _run_routed_expert_stream(
     dot_tile = (
         MXFP4_DOT_TILE if MXFP4_DOT_TILE is not None
         else 1024 if batch_size == 96
-        else 512 if batch_size in (1, 2, 4, 8, 16, 32, 64, 128) else 0
+        else 512 if batch_size in (1, 2, 4, 8, 16, 32, 48, 64, 128) else 0
     )
     # Aligned block staging avoids a separate source-slice branch for every
     # batch row. On by default at B16-B128; KernelConfig.singleton_block
@@ -1485,7 +1485,7 @@ def _run_routed_expert_stream(
         # Other batch/routing combinations use the selector loop.
         carry_routes = (
             (batch_size in (2, 4) and not group_pending_routes)
-            or (batch_size in (8, 16, 32, 64, 96, 128) and group_pending_routes)
+            or (batch_size in (8, 16, 32, 48, 64, 96, 128) and group_pending_routes)
         )
         def pack(choice):
             return tuple(value.astype(jnp.int32) for value in choice)
@@ -2234,7 +2234,7 @@ def _consume_completed_routed_chunks(
     until every chunk has been consumed, so later chunks can remain in flight
     while the caller computes on an earlier tile's complete latent vectors.
     """
-    if batch_size not in (32, 64) or tokens_per_lane != batch_size // 8:
+    if batch_size not in (32, 48, 64) or tokens_per_lane != batch_size // 8:
         raise ValueError("Routed token pipeline needs B32/B64 over eight lanes")
     chunk_rows = 16
     lanes_per_chunk = chunk_rows // tokens_per_lane
@@ -2329,7 +2329,7 @@ def moe(
     if routed_reduce_scatter and batch_size not in (6, *SCATTER_BATCHES):
         raise ValueError("MoE routed reduce-scatter requires batch size 6, 8 or 16")
     if token_pipeline and (
-        batch_size not in (32, 64)
+        batch_size not in (32, 48, 64)
         or not routed_reduce_scatter
         or not token_scatter_output
         or token_scatter_owners != 4
@@ -6499,13 +6499,13 @@ def stack(
         )
     if attention_dp_ownership and (
         attention_dp == 1
-        or batch_size not in (32, 64, 96)
+        or batch_size not in (32, 48, 64, 96)
         and not (attention_dp == 2 and batch_size in (2, 4, 8, 16, 128))
     ):
         raise ValueError("DP row ownership requires attention DP2 at B2..B128 or DP4 at B32/B64/B96")
     if moe_token_pipeline and (
         attention_dp not in (2, 4)
-        or batch_size not in (32, 64)
+        or batch_size not in (32, 48, 64)
         or not moe_routed_reduce_scatter
         or not moe_token_scatter_output
         or sp_owners != 4
@@ -6528,7 +6528,7 @@ def stack(
     dp_held_rows = batch_size if sp_owners == 1 else group_rows_per_pair
     default_streams = (
         {**DCP_B32_WEIGHT_STREAMS, **(DCP_B32_DECODE_RINGS if sequence_rows == 1 else {})}
-        if (batch_size in (32, 64) and attention_dp == 1
+        if (batch_size in (32, 48, 64) and attention_dp == 1
             and not _config().weight_streams)
         else {}
     )

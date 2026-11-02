@@ -47,13 +47,15 @@ logger = init_logger(__name__)
 AXIS = "tp"
 
 
+# Plain decode batches between the powers of two: a step pads to the next
+# compiled size, so 17-24 requests no longer pay for 32 rows, nor 33-48 for 64.
+PLAIN_BATCHES = (1, 2, 4, 8, 16, 24, 32, 48, 64, 128)
+
+
 def decode_batch_sizes(max_num_seqs: int) -> tuple[int, ...]:
-    """The powers of two below ``--max-num-seqs``, and itself."""
+    """The plain batches below ``--max-num-seqs``, and itself."""
     return tuple(
-        sorted(
-            {b for b in (1, 2, 4, 8, 16, 32, 64, 128) if b < max_num_seqs}
-            | {max_num_seqs}
-        )
+        sorted({b for b in PLAIN_BATCHES if b < max_num_seqs} | {max_num_seqs})
     )
 
 
@@ -99,7 +101,7 @@ def decode_options(batch_size: int) -> dict:
     routed reduce-scatter); the MLA cache tile is the whole batch up to B8, 4
     below B32, 2 from B32."""
     dp = kernel_config.active().attention_dp
-    scatter = dp > 1 or batch_size in (8, 12, 16, 20, 24, 28, 32, 64, 96, 128)
+    scatter = dp > 1 or batch_size in (8, 12, 16, 20, 24, 28, 32, 48, 64, 96, 128)
     tile = (
         batch_size
         if batch_size <= 8
@@ -128,7 +130,7 @@ def decode_options(batch_size: int) -> dict:
         "attention_token_scatter": scatter,
         "moe_token_scatter_output": scatter,
         "moe_routed_reduce_scatter": batch_size
-        in (6, 8, 12, 16, 20, 24, 28, 32, 64, 96, 128),
+        in (6, 8, 12, 16, 20, 24, 28, 32, 48, 64, 96, 128),
         "sequence_parallel_pre_attention": scatter,
     }
 
@@ -485,7 +487,7 @@ class DecodeOps:
     def _compiler_options(rows: int) -> dict[str, str]:
         config = kernel_config.active()
         dp_rows = rows in (2, 4) and config.attention_dp > 1
-        if (rows in (8, 16, 32, 64, 96, 128) or dp_rows) and config.decode_no_hlo_calls:
+        if (rows in (8, 16, 24, 32, 48, 64, 96, 128) or dp_rows) and config.decode_no_hlo_calls:
             return {"xla_tpu_enable_deduplicated_calls": "DISABLED"}
         return {}
 
