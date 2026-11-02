@@ -70,7 +70,10 @@ class _RegionalModel(_CompilableModule):
         ),
     ],
 )
-def test_out_of_tree_platform_controls_compile_kwargs(backend, options, expected):
+@pytest.mark.parametrize("dynamic", [None, False])
+def test_out_of_tree_platform_controls_compile_kwargs(
+    backend, options, expected, dynamic
+):
     """Out-of-tree hooks select valid backend, mode, and option combinations."""
     module = _CompilableModule()
     with (
@@ -90,13 +93,18 @@ def test_out_of_tree_platform_controls_compile_kwargs(backend, options, expected
             return_value=options,
         ) as get_compile_options,
     ):
-        compile_kwargs = build_torch_compile_kwargs(
-            mode="max-autotune-no-cudagraphs",
-            module=module,
-        )
+        with patch(
+            "sglang.multimodal_gen.runtime.utils.torch_compile."
+            "current_platform.get_compile_dynamic",
+            return_value=dynamic,
+        ):
+            compile_kwargs = build_torch_compile_kwargs(
+                mode="max-autotune-no-cudagraphs",
+                module=module,
+            )
 
     assert compile_kwargs == {
-        "dynamic": None,
+        "dynamic": dynamic,
         "fullgraph": False,
         **expected,
     }
@@ -125,6 +133,10 @@ def test_mova_uses_platform_compile_kwargs():
         patch(
             f"{compile_path}.current_platform.is_out_of_tree",
             return_value=True,
+        ),
+        patch(
+            f"{compile_path}.current_platform.get_compile_dynamic",
+            return_value=None,
         ),
         patch(
             f"{compile_path}.current_platform.get_compile_backend",

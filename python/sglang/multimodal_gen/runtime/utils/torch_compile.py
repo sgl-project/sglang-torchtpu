@@ -25,8 +25,18 @@ def build_torch_compile_kwargs(
     module: nn.Module | None = None,
     enable_inductor_compute_comm_overlap: bool = False,
 ) -> dict[str, object]:
-    compile_kwargs: dict[str, object] = {"fullgraph": False, "dynamic": None}
-    if current_platform.is_out_of_tree():
+    compile_kwargs: dict[str, object] = {
+        "fullgraph": False,
+        "dynamic": current_platform.get_compile_dynamic(),
+    }
+    if current_platform.is_npu() and not current_platform.is_out_of_tree():
+        from sglang.srt.utils.common import get_compiler_backend
+
+        compile_kwargs["backend"] = get_compiler_backend()
+        compile_kwargs["dynamic"] = False
+    else:
+        # Built-in platforms also declare a backend; omitting it silently
+        # selects Inductor even when the platform requires another compiler.
         backend = current_platform.get_compile_backend(mode)
         compile_kwargs["backend"] = backend
         if module is not None:
@@ -39,13 +49,6 @@ def build_torch_compile_kwargs(
             and mode is not None
         ):
             compile_kwargs["mode"] = mode
-    elif current_platform.is_npu():
-        from sglang.srt.utils.common import get_compiler_backend
-
-        compile_kwargs["backend"] = get_compiler_backend()
-        compile_kwargs["dynamic"] = False
-    elif mode is not None:
-        compile_kwargs["mode"] = mode
     if (
         enable_inductor_compute_comm_overlap
         and compile_kwargs.get("backend", "inductor") == "inductor"

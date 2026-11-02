@@ -68,6 +68,11 @@ class TpuPlatform(Platform):
 
     _worker_initialized: bool = False
 
+    def get_compile_dynamic(self) -> bool | None:
+        # Shardy propagation rejects bounded dynamic tensor dimensions. Keep
+        # separate static graphs for the model's supported shape buckets.
+        return False
+
     @classmethod
     def get_local_torch_device(cls) -> torch.device:
         return torch.device("tpu", 0)
