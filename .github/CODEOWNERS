@@ -130,6 +130,11 @@
 # TPU backend folder (whole tree). Kept above the narrower blocks below so their
 # more specific owner lists still win on last match.
 /python/sglang/srt/hardware_backend/tpu  @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD @benliangw
+/sglang_tpu/                            @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD @benliangw @brianseung-google
+/test/registered/tpu/                   @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD @benliangw @brianseung-google
+/test/registered/unit/layers/           @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD @benliangw @brianseung-google
+/test/registered/unit/hardware_backend/tpu/ @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD @benliangw @brianseung-google
+/benchmark/tpu/                         @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD @benliangw @brianseung-google
 
 # TPU kernels (Pallas attention / MoE / quantized matmul / KV write)
 /sglang_tpu/attention/pallas                             @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD @benliangw
