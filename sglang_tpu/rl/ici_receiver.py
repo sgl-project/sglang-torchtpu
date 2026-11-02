@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Receive RL weight buckets over ICI from a trainer sharing the TPU slice.
 
-The trainer (miles, --update-weight-transfer-mode ici) packs each bucket into one
-buffer and sends it to every engine rank, from the trainer rank the payload names
-for that rank. Every rank views the full tensors back out of it; /plugin_weight_update
-then loads them through each selected runner's load_weights, as
-/update_weights_from_distributed does, so fused, MoE and MLA parameters load as they
-do from a checkpoint.
+The trainer (miles, --update-weight-transfer-mode ici) packs what each of its ranks
+holds of a bucket into one buffer per rank and sends it to the engine ranks that rank
+serves. The payload lists, per engine rank, the transfers to receive, each with its
+source and manifest, so trainer ranks may hold different tensors (their own experts
+under expert parallelism). Every engine rank views the tensors back out;
+/plugin_weight_update then loads them through each selected runner's load_weights,
+as /update_weights_from_distributed does, so fused, MoE and MLA parameters load as
+they do from a checkpoint.
 """
 
 from __future__ import annotations
@@ -32,25 +34,34 @@ def receive_bucket(
     payload: dict[str, Any],
     shared_slice: SharedSlice,
 ) -> list[tuple[str, torch.Tensor]]:
-    """Receive one packed bucket from this rank's trainer rank.
+    """Receive this rank's share of one bucket: every transfer the payload lists for it.
 
-    payload: {"src_slice_ranks": the trainer slice rank each engine rank (by job
-    rank) receives from, "tag": int, "num_bytes": int,
-    "tensors": [[name, dtype, shape, byte_offset], ...]}.
+    payload: {"tag": int, "receives": per engine rank (by job rank), a list of
+    {"src_slice_rank": int, "num_bytes": int,
+     "tensors": [[name, dtype, shape, byte_offset], ...]}}.
     """
-    buffer = torch.empty(
-        payload["num_bytes"] // _BUFFER_DTYPE.itemsize,
-        dtype=_BUFFER_DTYPE,
-        device="tpu",
-    )
-    # recv rebinds `buffer` to the received storage, so views come only after it
-    shared_slice.backend.recv(
-        [buffer], payload["src_slice_ranks"][shared_slice.job_rank], payload["tag"]
-    ).wait()
-    # wait() returns once the receive is posted, not once the data lands; a read
-    # waits for it, and freeing the buffer before that crashes the sender
-    buffer[:1].cpu()
-    return unpack_bucket(buffer, payload["tensors"])
+    _, target = context.runners[0]
+    transfers = payload["receives"][shared_slice.job_rank]
+    buffers = []
+    # post every receive first, so no sender waits on another's transfer
+    for transfer in transfers:
+        buffer = torch.empty(
+            transfer["num_bytes"] // _BUFFER_DTYPE.itemsize,
+            dtype=_BUFFER_DTYPE,
+            device=target.device,
+        )
+        # recv rebinds `buffer` to the received storage, so views come only after it
+        shared_slice.backend.recv(
+            [buffer], transfer["src_slice_rank"], payload["tag"]
+        ).wait()
+        buffers.append(buffer)
+    named_tensors = []
+    for transfer, buffer in zip(transfers, buffers):
+        # wait() returns once the receive is posted, not once the data lands; a read
+        # waits for it, and freeing the buffer before that crashes the sender
+        buffer[:1].cpu()
+        named_tensors += unpack_bucket(buffer, transfer["tensors"])
+    return named_tensors
 
 
 def unpack_bucket(
