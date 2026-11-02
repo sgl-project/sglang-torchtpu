@@ -156,6 +156,8 @@ def apply_small_kv_pool_vmem_prefetch_override(
     large pool — or a model below the measured layer threshold — leaves the
     default prefetch schedule untouched.
     """
+    if os.environ.get("SGLANG_TPU_SKIP_VMEM_PREFETCH_OVERRIDE"):
+        return
     if max_total_tokens is None or max_total_tokens >= _VMEM_PREFETCH_SAFE_MIN_TOKENS:
         return
     if num_hidden_layers < _VMEM_PREFETCH_MIN_LAYERS:
@@ -199,7 +201,14 @@ def apply_decode_cp_sparse_core_override(*, dcp_size: int) -> None:
     """
     if dcp_size <= 1:
         return
-    appended = _override_libtpu_flags(_DECODE_CP_SPARSE_CORE_OVERRIDES)
+    flags = list(_DECODE_CP_SPARSE_CORE_OVERRIDES)
+    if os.environ.get("SGLANG_TPU_SKIP_VMEM_PREFETCH_OVERRIDE"):
+        flags = [
+            f
+            for f in flags
+            if not f.startswith("--xla_gf_vmem_max_outstanding_prefetches")
+        ]
+    appended = _override_libtpu_flags(flags)
     if appended:
         logger.info(
             "TPU env_override: decode context parallelism (--dcp-size %d); "
