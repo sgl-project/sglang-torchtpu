@@ -49,13 +49,14 @@ def test_verification_builds_only_shared_registered_inputs():
         ),
         patch("sglang.srt.compilation.compiled_op.is_tpu", return_value=True),
         patch(
-            "sglang.srt.compilation.compiled_op.direct_compile", return_value=compiled
+            "sglang.srt.compilation.compiled_op.direct_compile",
+            new=lambda *args, **kwargs: compiled,
         ),
         get_context().override_server_args(tpu_compile_tracer="direct"),
         envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
     ):
         precompile_spec_v2_ops(
-            device=torch.device("tpu"),
+            device=SimpleNamespace(type="tpu"),
             physical_batch_buckets=[1, 4],
             num_verify_tokens=3,
             vocab_size=8,
