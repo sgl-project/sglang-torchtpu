@@ -1422,26 +1422,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             gemm1_alpha=moe_runner_config.gemm1_alpha,
             gemm1_clamp_limit=moe_runner_config.gemm1_clamp_limit,
         )
-        # The pallas fused-MoE runner has no in-kernel routed_scaling_factor
-        # support (its triton counterpart applies it inside the combine
-        # kernel). Apply it to the combined routed output here so models
-        # declaring routed_scaling_factor (e.g. Bailing's 2.5, applied after
-        # topk renormalization) keep their trained routing magnitude; the
-        # model layer adds shared experts outside and leaves them unscaled.
-        # Contract with the model layer: it applies the factor itself only on
-        # A2A paths (see _apply_routed_scaling_factor_on_output), so this
-        # multiply is valid for the standard dispatcher only; an A2A backend
-        # on TPU would need this guard revisited to avoid applying it twice.
-        routed_scaling_factor = moe_runner_config.routed_scaling_factor
         if no_combine:
-            # Per-expert output stays unscaled: the caller combines on its
-            # own terms (per-request normalization), so pre-scaling would
-            # change those semantics.
             # The EP kernel masks by ownership only; zero-weight slots stay zero
             # for the caller's per-expert normalization, as without EP.
             output = torch.where(kernel_topk_weights.unsqueeze(-1) != 0, output, 0)
-        elif routed_scaling_factor is not None and routed_scaling_factor != 1.0:
-            output = output * routed_scaling_factor
         return StandardCombineInput(hidden_states=output)
 
     def forward_musa(self, *args, **kwargs) -> CombineInput:

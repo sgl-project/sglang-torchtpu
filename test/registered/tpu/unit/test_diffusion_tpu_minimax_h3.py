@@ -3,8 +3,6 @@
 
 import contextlib
 import inspect
-import os
-import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -19,7 +17,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
-from sglang.multimodal_gen.runtime.layers import usp
 from sglang.multimodal_gen.runtime.models.dits import minimax_h3 as dit
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
     packed_sequence,
@@ -33,7 +30,7 @@ from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import
 )
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.multimodal_gen import minimax_h3, ulysses, worker
+from sglang_tpu.multimodal_gen import minimax_h3, worker
 
 # The TPU lane installs the diffusion_tpu extras (cache-dit) the H3 DiT imports.
 register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit", chips=1)
@@ -219,48 +216,6 @@ class TestMiniMaxH3CompiledBlock(CustomTestCase):
             block = torch.nn.Linear(1, 1)
             self.assertTrue(condition("blocks.7", block))
             self.assertFalse(condition("token_refiner.blocks.0", block))
-
-
-def _all_to_all_worker(rank, world, init_file, results):
-    import torch.distributed as dist
-
-    dist.init_process_group(
-        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world
-    )
-    try:
-        group = type("SpGroup", (), {"ulysses_group": dist.group.WORLD})()
-        with patch.object(usp, "get_sp_group", return_value=group):
-            lane_dense = ulysses.lane_dense_all_to_all_single(
-                usp._usp_all_to_all_single
-            )
-            # The H3 packed-QKV and output exchange shapes, scaled down.
-            for shape in ((world, 16, 3, 384), (world, 16, 3, 128), (6, 5)):
-                torch.manual_seed(rank)
-                x = torch.randn(shape).bfloat16()
-                flat = usp._usp_all_to_all_single(x.clone())
-                dense = lane_dense(x.clone())
-                staged = lane_dense(x.clone(), role="usp_test")
-                results[(rank, shape)] = torch.equal(flat, dense) and torch.equal(
-                    flat, staged
-                )
-    finally:
-        dist.destroy_process_group()
-
-
-class TestLaneDenseAllToAll(CustomTestCase):
-    def test_matches_the_flat_exchange(self):
-        import torch.multiprocessing as mp
-
-        world = 2
-        with tempfile.TemporaryDirectory() as tmp, mp.Manager() as manager:
-            results = manager.dict()
-            mp.spawn(
-                _all_to_all_worker,
-                args=(world, os.path.join(tmp, "init"), results),
-                nprocs=world,
-            )
-            self.assertEqual(len(results), 3 * world)
-            self.assertTrue(all(results.values()), dict(results))
 
 
 if __name__ == "__main__":

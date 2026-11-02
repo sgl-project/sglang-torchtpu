@@ -127,6 +127,26 @@ class TestTpuPrefixCachePolicy(CustomTestCase):
                         platform_cls().supports_mamba_prefix_cache(model), expected
                     )
 
+    def test_state_offload_needs_a_dma_io_backend(self):
+        """Only a DMA engine moves TPU's per-layer kernel-layout states to host."""
+        for io_backend, rejects in (("raiden", False), ("torch_tpu", True)):
+            view = SimpleNamespace(
+                enable_mixed_chunk=False,
+                disable_radix_cache=False,
+                mamba_radix_cache_strategy="extra_buffer",
+                enable_hierarchical_cache=True,
+                hicache_io_backend=io_backend,
+                enable_int8_mamba_checkpoint=False,
+            )
+            for platform_cls in (TpuSRTPlatform, TpuOOTPlatform):
+                with (
+                    self.subTest(io_backend=io_backend, platform=platform_cls.__name__),
+                    self.assertRaisesRegex(ValueError, "DMA --hicache-io-backend")
+                    if rejects
+                    else contextlib.nullcontext(),
+                ):
+                    platform_cls().validate_mamba_prefix_cache(view)
+
     def test_backend_guard_preserves_other_devices_and_explicit_disable(self):
         """Unsupported backends must not silently disable caching after pool sizing."""
         cases = (

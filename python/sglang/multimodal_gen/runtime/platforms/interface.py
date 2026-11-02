@@ -164,6 +164,14 @@ class Platform:
         """Return backend-specific options for a diffusion module."""
         return None
 
+    def configure_compile_cache(self) -> None:
+        """Configure torch.compile caching for this worker.
+
+        Called once per worker after distributed initialization, before any
+        compilation.
+        """
+        pass
+
     def get_dispatch_key_name(self) -> str:
         """Return the behavioral dispatch key used by :class:`CustomOp`.
 
@@ -306,6 +314,13 @@ class Platform:
     def supports_safetensors_device_load(cls) -> bool:
         """Whether safetensors can open tensors directly on this platform's device."""
         return True
+
+    @classmethod
+    def prefers_head_slab_output_exchange(cls) -> bool:
+        """Whether the Ulysses output all-to-all sends a heads-major attention
+        output as per-head slabs instead of relayouting it to sequence-major
+        first. Both give bit-identical values."""
+        return False
 
     @classmethod
     def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
