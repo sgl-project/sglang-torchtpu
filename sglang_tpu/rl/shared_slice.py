@@ -68,7 +68,9 @@ class SharedSlice(msgspec.Struct, frozen=True):
         return self.slice_rank - self.spec.rank_offset
 
 
-def join(spec: SharedSliceSpec, *, job_rank: int, job_size: int) -> SharedSlice:
+def join_shared_slice(
+    spec: SharedSliceSpec, *, job_rank: int, job_size: int
+) -> SharedSlice:
     """Join the slice and create its send/recv backend, before the first TPU op.
 
     libtpu reads the slice-wide RANK / WORLD_SIZE when the runtime starts, and

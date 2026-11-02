@@ -28,7 +28,9 @@ def setup_worker(*, job_rank: int, job_size: int) -> RlSetup:
         shared_slice=(
             None
             if spec is None
-            else shared_slice.join(spec, job_rank=job_rank, job_size=job_size)
+            else shared_slice.join_shared_slice(
+                spec, job_rank=job_rank, job_size=job_size
+            )
         )
     )
 
