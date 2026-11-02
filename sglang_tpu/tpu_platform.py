@@ -1682,7 +1682,9 @@ class TpuSRTPlatform(SRTPlatform):
         return float(total - free)
 
     def get_device(self, device_id: int = 0) -> torch.device:
-        return torch.device("tpu", device_id)
+        # Each worker addresses one device, and once PJRT is up torch_tpu checks indices against it;
+        # sglang's gpu_id (base-gpu-id + rank) is only a label.
+        return torch.device("tpu", 0)
 
     def set_device(self, device: torch.device) -> None:
         # The PJRT bootstrap binds each worker to one chiplet at local index 0
