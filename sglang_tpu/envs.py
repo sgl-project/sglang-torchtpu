@@ -32,6 +32,17 @@ class TpuEnvs:
     SGLANG_TPU_BENCHMARK_TIMEOUT_SEC = EnvFloat(600.0)
     SGLANG_TPU_RELEASE_CHECKPOINT_PAGE_CACHE = EnvBool(True)
     SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS = EnvBool(True)
+    # Weight feeder (see weight_feeder, Linux only). WINDOW_GB caps the host RAM held
+    # by staged shards, in units of 2**30 bytes. READ_THREADS is how many shards are
+    # read at once. STAGING_DIR must be on tmpfs, shared by the ranks of a host.
+    # Off by default. Enable it only for loaders that stream: a loader that keeps
+    # tensors pins deleted shards, and staging can then outgrow the window.
+    SGLANG_TPU_WEIGHT_FEEDER_ENABLED = EnvBool(False)
+    SGLANG_TPU_WEIGHT_FEEDER_WINDOW_GB = EnvInt(128)
+    SGLANG_TPU_WEIGHT_FEEDER_READ_THREADS = EnvInt(32)
+    SGLANG_TPU_WEIGHT_FEEDER_STAGING_DIR = EnvStr(
+        "/dev/shm/sglang-torchtpu-weight-feeder"
+    )
     # Host heap (see host_heap_trim.py)
     SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED = EnvBool(True)
     # Seconds between periodic trims. 0 turns the periodic trim off.
