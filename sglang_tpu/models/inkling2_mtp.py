@@ -107,8 +107,7 @@ class Inkling2MTPHead(nn.Module):
         if self.final_logit_softcapping:
             cap = self.final_logit_softcapping
             logits = torch.tanh(logits / cap) * cap
-        vocab = torch.arange(logits.shape[-1], device=logits.device)
-        return logits.masked_fill(vocab >= self.unpadded_vocab_size, float("-inf"))
+        return logits
 
     def sample_block(
         self,
@@ -228,7 +227,8 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
         self.markov_head._gather_logits = self._gather_logits
 
     def _gather_logits(self, logits):
-        return gather_and_crop_vocab(logits, self.lm_head)
+        # Real vocab only, like the target's logits: sampled acceptance pairs the two.
+        return gather_and_crop_vocab(logits, self.lm_head)[..., : self.markov_head.unpadded_vocab_size]
 
     def compute_base_logits(self, hidden):
         if self.logits_mup_width_multiplier:
