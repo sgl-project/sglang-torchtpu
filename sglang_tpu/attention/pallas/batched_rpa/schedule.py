@@ -593,19 +593,40 @@ def compute_metadata(
         p_offset = s_idx * cfgs.serve.pages_per_seq + kv_p_start
         # NEW_TOKENS_ONLY keeps the cached keys' VMEM slots (so the new tokens
         # sit at their global offsets and the page-aligned writeback below
-        # applies) but fetches none of them; the kernel masks them out.
+        # applies) but, on HEAD_ALONG_SUBLANE, fetches none of them; the
+        # kernel masks them out. SEQ_ALONG_LANE writes back whole pages, so
+        # the one page the first new token shares with cached keys is fetched
+        # (its cached head would otherwise be written back stale); every
+        # other cached page stays unfetched. Under cp_group_size the lengths
+        # are global and the cache page-striped: global page g is local slot
+        # g // cp on rank g % cp, and only that rank fetches (and writes) it.
         skip_cached = cfgs.serve.attention_scope.skips_cached_keys
+        cp_size = cfgs.serve.cp_group_size
+        rank = cp_rank_ref[0] if cp_rank_ref is not None else 0
+        sal = cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
 
         for i in range(cfgs.bkv_p_cache):
             dst_vmem = i << cfgs.serve.page_size_log2
             dma_sz = kv_left_frm_cache - dst_vmem
             dma_sz = jnp.clip(dma_sz, 0, cfgs.serve.page_size)
-            if skip_cached:
-                dma_sz = 0
 
             src_hbm = jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
+            if skip_cached:
+                if sal:
+                    # Only the page shared with the first new token, and only
+                    # on the rank that owns it.
+                    shared = (dma_sz > 0) & (dma_sz < cfgs.serve.page_size)
+                    if cp_size is not None:
+                        g = kv_p_start + i
+                        shared &= g % cp_size == rank
+                        src_hbm = s_idx * cfgs.serve.pages_per_seq + jnp.minimum(
+                            g // cp_size, cfgs.serve.pages_per_seq - 1
+                        )
+                    dma_sz = jnp.where(shared, dma_sz, 0)
+                else:
+                    dma_sz = 0
 
-            if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            if sal:
                 dma_valid = jnp.where(dma_sz > 0, 1, 0)
                 schedule.dma_kv_cache[step, target_lane, i, 0] = src_hbm
                 schedule.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
@@ -652,12 +673,29 @@ def compute_metadata(
                 # immediately following the existing cached pages. E.g., if
                 # cache_pages=2, new pages go to offsets 2*page_size, 3*page_size, etc.
                 fetch_vmem = (cache_pages + i) * cfgs.serve.page_size
-                p_idx = jnp.minimum(
-                    (kv_len_start + slot_start) >> cfgs.serve.page_size_log2,
-                    cfgs.serve.pages_per_seq - 1,
-                )
+                tok_idx = kv_len_start + slot_start
+                if skip_cached and cp_size is not None:
+                    # Page-striped cache: global page g lives in local slot
+                    # g // cp of rank g % cp. Only the owner writes, and only
+                    # for multi-token rows (a single new token is written by
+                    # the STRIPED launch that also attends it). The page's
+                    # cached head was fetched above, so the whole-page write
+                    # carries it back intact.
+                    g = jnp.minimum(
+                        tok_idx >> cfgs.serve.page_size_log2,
+                        cfgs.serve.pages_per_seq * cp_size - 1,
+                    )
+                    p_idx = g // cp_size
+                    wb_val = jnp.where(
+                        (dma_sz > 0) & (g % cp_size == rank) & (q_len > 1), 1, 0
+                    )
+                else:
+                    p_idx = jnp.minimum(
+                        tok_idx >> cfgs.serve.page_size_log2,
+                        cfgs.serve.pages_per_seq - 1,
+                    )
+                    wb_val = jnp.where(dma_sz > 0, 1, 0)
                 dst_hbm = s_idx * cfgs.serve.pages_per_seq + p_idx
-                wb_val = jnp.where(dma_sz > 0, 1, 0)
 
                 dma_entry.fetch_hbm[...] = new_page_start
                 dma_entry.fetch_vmem[...] = fetch_vmem
@@ -667,13 +705,11 @@ def compute_metadata(
             else:
                 tok_idx = kv_len_start + dst_vmem
                 p_off = tok_idx & cfgs.serve.page_size_mask
-                if skip_cached and cfgs.serve.cp_group_size is not None:
+                if skip_cached and cp_size is not None:
                     # Page-striped cache: global page g lives in local slot
                     # g // cp of rank g % cp. Only the owner writes, and only
                     # for multi-token rows (a single new token is written by
                     # the STRIPED launch that also attends it).
-                    cp_size = cfgs.serve.cp_group_size
-                    rank = cp_rank_ref[0] if cp_rank_ref is not None else 0
                     p_idx = jnp.minimum(
                         tok_idx >> cfgs.serve.page_size_log2,
                         cfgs.serve.pages_per_seq * cp_size - 1,
@@ -839,9 +875,7 @@ def compute_metadata(
 
         return jax.lax.fori_loop(0, num_q, q_loop_fn, carry)
 
-    start_seq_idx, end_seq_idx = cfgs.mode.get_range(
-        distribution_ref, tail_decode=cfgs.serve.tail_decode
-    )
+    start_seq_idx, end_seq_idx = cfgs.mode.get_range(distribution_ref)
     init_carry = LoopCarry(0, 0)
     return jax.lax.fori_loop(start_seq_idx, end_seq_idx, seq_loop, init_carry)
 
@@ -882,8 +916,8 @@ def rpa_metadata_schedule_kernel(
             length. queries[a:b], keys[a:b], and values[a:b] where a=cu_q_lens[i] and
             b=cu_q_lens[i+1] represents q/k/v of sequence i.
         kv_lens_ref: [max_num_seqs]. Existing kv cache length of each sequence.
-            distribution_ref: [3]. Cumulative sum of number of decode, prefill, and
-            mixed
+        distribution_ref: [3]. Cumulative sum of the number of mixed, prefill
+            and decode sequences, in that batch order (see ``RpaCase``).
         schedule_hbm_ref: HBM memory that will store output of the kernel.
         schedule_ref: Scratch memory where schedule results gets written.
         dma_sem: Semaphore used for writing scheduler output to HBM.

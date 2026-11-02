@@ -60,14 +60,18 @@ class AttentionScope(enum.StrEnum):
     NEW_TOKENS_ONLY: attend only new tokens, skip cached tokens. The KV index
                      space is the sequence's global positions (``kv_lens`` is
                      the full length, the last ``q_len`` of it new), the cached
-                     pages are neither fetched nor attended, and the new
-                     tokens are written back as in FULL. With
-                     ``cp_group_size`` the cache is page-striped, so the
+                     pages are not attended, and the new tokens are written
+                     back as in FULL. HEAD_ALONG_SUBLANE fetches none of the
+                     cached pages; SEQ_ALONG_LANE writes back whole pages, so
+                     it fetches the cached head of the page the first new
+                     token shares (and nothing else) to write it back intact.
+                     With ``cp_group_size`` the cache is page-striped, so the
                      write of each new token goes to its owner rank's stripe
                      slot (``page // cp`` on rank ``page % cp``) and only the
-                     owner issues it; a single-token row is left unprocessed
-                     (output untouched, LSE -inf), its token being the
-                     STRIPED launch's to attend and write.
+                     owner issues it (and, under SEQ_ALONG_LANE, fetches the
+                     shared page's head); a single-token row is left
+                     unprocessed (output untouched, LSE -inf), its token being
+                     the STRIPED launch's to attend and write.
     STRIPED:         decode under decode context parallelism in one launch:
                      attend this rank's page stripe of the cache plus the
                      sequence's new token when this rank owns its page. The
@@ -130,11 +134,6 @@ class ServingConfigs:
     return_lse: bool = False
     cp_group_size: int | None = None
     attention_scope: AttentionScope = AttentionScope.FULL
-    # ``distribution`` read back to front: MIXED sequences first,
-    # ``[0, distribution[0])``, PREFILL next and DECODE last,
-    # ``[distribution[1], distribution[2])``. For batches that append their
-    # decode rows after the prefill rows (SGLang's mixed batches).
-    tail_decode: bool = False
 
     def __post_init__(self):
         if self.cache_only and self.attention_scope == AttentionScope.FULL:
@@ -169,6 +168,12 @@ class RpaCase(enum.StrEnum):
     - DECODE: Sequences are in decode-only mode (q_len = 1).
     - PREFILL: Sequences are in prefill-only mode (q_len > 1, static).
     - MIXED: Sequences can be a mix of prefill and decode (q_len > 1, dynamic).
+
+    A batch lists its MIXED sequences first, then PREFILL, then DECODE, and
+    ``distribution`` holds the cumulative counts in that order:
+    ``[n_mixed, n_mixed + n_prefill, total]``. This is the order SGLang's
+    scheduler produces (prefill chunks first, running decode rows appended
+    after them), so a mixed batch needs no permutation of its rows.
     """
 
     DECODE = enum.auto()
@@ -184,23 +189,15 @@ class RpaCase(enum.StrEnum):
         }[self]
 
     def get_range(
-        self, distribution: jax.Array, tail_decode: bool = False
+        self, distribution: jax.Array
     ) -> tuple[jax.typing.ArrayLike, jax.typing.ArrayLike]:
         assert distribution.shape == (3,)
-        if tail_decode:
-            match self:
-                case RpaCase.MIXED:
-                    return 0, distribution[0]
-                case RpaCase.PREFILL:
-                    return distribution[0], distribution[1]
-                case RpaCase.DECODE:
-                    return distribution[1], distribution[2]
         match self:
-            case RpaCase.DECODE:
+            case RpaCase.MIXED:
                 return 0, distribution[0]
             case RpaCase.PREFILL:
                 return distribution[0], distribution[1]
-            case RpaCase.MIXED:
+            case RpaCase.DECODE:
                 return distribution[1], distribution[2]
 
 
@@ -563,20 +560,6 @@ class RpaConfigs:
                 f" {self.serve.page_size=} when the kernel reads cached pages."
             )
 
-        if (
-            self.serve.cache_only
-            and self.serve.kv_layout != KVLayout.HEAD_ALONG_SUBLANE
-        ):
-            # SEQ_ALONG_LANE fetches whole pages, so the stale tail of a shard's
-            # last page would reach p * v unmasked.
-            raise NotImplementedError("cache_only requires HEAD_ALONG_SUBLANE.")
-        if (
-            self.serve.attention_scope.skips_cached_keys
-            and self.serve.kv_layout != KVLayout.HEAD_ALONG_SUBLANE
-        ):
-            # SEQ_ALONG_LANE writes whole pages, so the unfetched cached head
-            # of a page the new tokens share would be written back stale.
-            raise NotImplementedError("NEW_TOKENS_ONLY requires HEAD_ALONG_SUBLANE.")
         num_lanes = pltpu.get_tpu_info().num_lanes
         if self.serve.return_lse and self.aligned_num_q_heads_per_kv_head > num_lanes:
             raise ValueError(

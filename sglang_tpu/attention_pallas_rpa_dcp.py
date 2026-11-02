@@ -119,7 +119,6 @@ def build_dcp_kernel_op(spec):
         cp_group_size: int = 0,
         attention_scope: int = 0,
         rpa_cases: int = 0,
-        tail_decode: bool = False,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         # The kernel takes ``cp_group_size=None`` for the non-CP form and then
         # rejects the two CP operands, so drop them together.
@@ -157,7 +156,6 @@ def build_dcp_kernel_op(spec):
             kv_lens_global=kv_lens_global if cp_size else None,
             attention_scope=attention_scope,
             rpa_cases=active_cases,
-            tail_decode=tail_decode,
         )
 
     jax_kernel = _torch_pallas.custom_jax_kernel(
@@ -166,8 +164,8 @@ def build_dcp_kernel_op(spec):
         # Static (non-traced) args by _wrapped position: 11=sm_scale,
         # 12=sliding_window, 13=soft_cap, 14=k_scale, 15=v_scale,
         # 16=cache_only, 17=skip_kv_write, 18=cp_group_size, 19=attention_scope,
-        # 20=rpa_cases, 21=tail_decode.
-        static_argnums=(11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21),
+        # 20=rpa_cases.
+        static_argnums=(11, 12, 13, 14, 15, 16, 17, 18, 19, 20),
         donate_argnums=(3,),
         input_output_aliases={3: 1},
         warn_deprecated=False,
@@ -200,7 +198,6 @@ def build_dcp_kernel_op(spec):
         cp_group_size: int = 0,
         attention_scope: int = 0,
         rpa_cases: int = 0,
-        tail_decode: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         with tpu_info_for_cpu_export():
             output, _updated_kv, lse = jax_kernel(
@@ -225,7 +222,6 @@ def build_dcp_kernel_op(spec):
                 cp_group_size,
                 attention_scope,
                 rpa_cases,
-                tail_decode,
             )
         return output, lse
 

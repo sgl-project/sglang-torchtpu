@@ -27,6 +27,12 @@ Cases:
 * At page size 512, wider than the MXU, decode with searched k blocks still
   merges back into the dense result.
 
+Every case runs on the token-major ``HEAD_ALONG_SUBLANE`` cache by default;
+``SGLANG_TEST_KV_LAYOUT=SEQ_ALONG_LANE`` runs the whole file on the
+lane-major cache instead (``TestBatchedRpaDcpStripedChunkWriteSeqAlongLane``
+covers the SEQ_ALONG_LANE chunk write -- whole-page writeback of a page the
+chunk shares with its cached prefix -- on every run).
+
 Requires JAX on a TPU device; skipped otherwise. No torch_tpu, no server.
 """
 
@@ -73,6 +79,15 @@ PAGE_SIZE = 256
 SLIDING_WINDOW = 128
 SM_SCALE = 1.0 / float(np.sqrt(HEAD_DIM))
 TOLERANCE = 0.05
+# KV cache layout every case below runs on: the token-major fused layout by
+# default, the lane-major one on request.
+KV_LAYOUT_NAME = os.environ.get("SGLANG_TEST_KV_LAYOUT", "HEAD_ALONG_SUBLANE")
+
+
+def _kv_layout(name: str = KV_LAYOUT_NAME):
+    from sglang_tpu.attention.pallas.batched_rpa import configs
+
+    return configs.KVLayout[name]
 
 
 class Geometry(NamedTuple):
@@ -121,9 +136,15 @@ def _random(rng, shape, scale=1.0) -> np.ndarray:
     return _round_to_bf16(scale * rng.standard_normal(shape, np.float32))
 
 
-def _fused_cache(slot_k: np.ndarray, slot_v: np.ndarray, page_size: int = PAGE_SIZE):
-    """Pack per-slot K/V [slots, num_kv_heads, HEAD_DIM] into the kernel's
-    token-major paged cache: K and V of a head interleaved along the head axis."""
+def _fused_cache(
+    slot_k: np.ndarray,
+    slot_v: np.ndarray,
+    page_size: int = PAGE_SIZE,
+    layout_name: str = KV_LAYOUT_NAME,
+):
+    """Pack per-slot K/V [slots, num_kv_heads, HEAD_DIM] into the kernel's paged
+    cache: K and V of a head interleaved along the head axis, the token on the
+    sublane axis (HEAD_ALONG_SUBLANE) or the lane axis (SEQ_ALONG_LANE)."""
     import jax.numpy as jnp
 
     from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
@@ -131,11 +152,19 @@ def _fused_cache(slot_k: np.ndarray, slot_v: np.ndarray, page_size: int = PAGE_S
     )
 
     slots, num_kv_heads, _ = slot_k.shape
+    layout = _kv_layout(layout_name)
     shape = get_kv_cache_shape(
-        slots // page_size, page_size, num_kv_heads, HEAD_DIM, jnp.bfloat16
+        slots // page_size, page_size, num_kv_heads, HEAD_DIM, jnp.bfloat16,
+        kv_layout=layout,
     )
-    _, _, kv_words, packing, aligned_head_dim = shape
     kv = np.stack([slot_k, slot_v], axis=2).reshape(slots, 2 * num_kv_heads, HEAD_DIM)
+    if layout_name == "SEQ_ALONG_LANE":
+        # [pages, 2 * kv_heads, head_dim // packing, packing, page_size]
+        _, _, hd_words, packing, _ = shape
+        kv = np.pad(kv, ((0, 0), (0, 0), (0, hd_words * packing - HEAD_DIM)))
+        kv = kv.reshape(slots // page_size, page_size, 2 * num_kv_heads, hd_words, packing)
+        return _to_bf16(np.ascontiguousarray(kv.transpose(0, 2, 3, 4, 1)))
+    _, _, kv_words, packing, aligned_head_dim = shape
     kv = np.pad(
         kv,
         (
@@ -147,6 +176,61 @@ def _fused_cache(slot_k: np.ndarray, slot_v: np.ndarray, page_size: int = PAGE_S
     return _to_bf16(kv).reshape(shape)
 
 
+def _cache_tokens(
+    cache: np.ndarray, num_kv_heads: int, layout_name: str = KV_LAYOUT_NAME
+) -> np.ndarray:
+    """Token-major view ``[pages, page_size, num_kv_heads, 2, HEAD_DIM]`` of a
+    float32 copy of a cache in the given layout."""
+    if layout_name == "SEQ_ALONG_LANE":
+        # [pages, 2 * kv_heads, hd // packing, packing, page]
+        pages, _, hd_words, packing, page_size = cache.shape
+        tokens = cache.transpose(0, 4, 1, 2, 3).reshape(
+            pages, page_size, 2 * num_kv_heads, hd_words * packing
+        )
+    else:
+        # [pages, page, kv_words, packing, aligned_hd]
+        pages, page_size, kv_words, packing, aligned_hd = cache.shape
+        tokens = cache.reshape(pages, page_size, kv_words * packing, aligned_hd)
+        tokens = tokens[:, :, : 2 * num_kv_heads]
+    return tokens[..., :HEAD_DIM].reshape(pages, page_size, num_kv_heads, 2, HEAD_DIM)
+
+
+def _cache_row(cache: np.ndarray, page: int, slot: int, num_kv_heads: int):
+    """K/V of one token, ``[num_kv_heads, 2, HEAD_DIM]``, from a float32 copy of
+    a cache in the module's layout."""
+    return _cache_tokens(cache[page : page + 1], num_kv_heads)[0, slot]
+
+
+def _assert_cache_equal(
+    got: np.ndarray,
+    want: np.ndarray,
+    shard: "_PagedShard",
+    lengths,
+    pages_per_seq: int,
+    num_kv_heads: int,
+    layout_name: str,
+    label: str,
+):
+    """``got`` holds ``want`` wherever a sequence's token lives and leaves every
+    page no sequence writes untouched. HEAD_ALONG_SUBLANE DMAs exact token
+    spans, so the two caches must be identical; SEQ_ALONG_LANE writes whole
+    pages, so the slots past a sequence's length inside the pages it owns are
+    don't-care (they hold whatever VMEM held) and only the rest must match."""
+    if layout_name != "SEQ_ALONG_LANE":
+        np.testing.assert_array_equal(got, want, label)
+        return
+    got_tokens = _cache_tokens(got, num_kv_heads, layout_name)
+    want_tokens = _cache_tokens(want, num_kv_heads, layout_name)
+    num_pages, page_size = got_tokens.shape[:2]
+    care = np.ones((num_pages, page_size), dtype=bool)
+    for seq, length in enumerate(lengths):
+        for local_page in range(pages_per_seq):
+            page = shard.page_indices[seq * pages_per_seq + local_page]
+            used = int(np.clip(length - local_page * page_size, 0, page_size))
+            care[page, used:] = False
+    np.testing.assert_array_equal(got_tokens[care], want_tokens[care], label)
+
+
 class _PagedShard(NamedTuple):
     cache: object
     page_indices: np.ndarray
@@ -154,7 +238,13 @@ class _PagedShard(NamedTuple):
 
 
 def _paged_shard(
-    seq_keys, seq_values, pages_per_seq, rng, num_kv_heads, page_size=PAGE_SIZE
+    seq_keys,
+    seq_values,
+    pages_per_seq,
+    rng,
+    num_kv_heads,
+    page_size=PAGE_SIZE,
+    layout_name: str = KV_LAYOUT_NAME,
 ):
     """Page table and cache holding seq_keys[s] / seq_values[s] as sequence s.
 
@@ -175,7 +265,7 @@ def _paged_shard(
             slot_k[slot] = keys[j]
             slot_v[slot] = values[j]
     return _PagedShard(
-        cache=_fused_cache(slot_k, slot_v, page_size),
+        cache=_fused_cache(slot_k, slot_v, page_size, layout_name),
         page_indices=page_indices,
         kv_lens=[len(keys) for keys in seq_keys],
     )
@@ -189,6 +279,8 @@ def _run_kernel(queries, keys, values, shard, cu_q_lens, distribution, **kwargs)
         ragged_paged_attention,
     )
 
+    layout_name = kwargs.pop("layout_name", KV_LAYOUT_NAME)
+    kwargs.setdefault("kv_layout", _kv_layout(layout_name))
     result = ragged_paged_attention(
         _to_bf16(queries),
         _to_bf16(keys),
@@ -380,7 +472,7 @@ class TestBatchedRpaDcpDecode(_CloseAssertions):
             unused_kv,
             shard,
             np.arange(num_seqs + 1),
-            [num_seqs] * 3,
+            [0, 0, num_seqs],  # decode
             attention_sink=None if sinks is None else jnp.asarray(sinks),
             sliding_window=window,
             decode_block_sizes=blocks,
@@ -550,7 +642,7 @@ class TestBatchedRpaDcpStripedDecode(_CloseAssertions):
             new_v,
             shard,
             np.arange(num_seqs + 1),
-            [num_seqs] * 3,
+            [0, 0, num_seqs],  # decode
             sliding_window=window,
             decode_block_sizes=blocks,
             skip_kv_write=False,
@@ -604,9 +696,7 @@ class TestBatchedRpaDcpStripedDecode(_CloseAssertions):
                     claimed[seq] = rank
                     j = _local_len(n - 1, rank, geo.cp)
                     page = shard.page_indices[seq * pages + j // PAGE_SIZE]
-                    row = cache_after[page, j % PAGE_SIZE]
-                    row = row.reshape(-1, row.shape[-1])[: 2 * geo.num_kv_heads, :HEAD_DIM]
-                    row = row.reshape(geo.num_kv_heads, 2, HEAD_DIM)
+                    row = _cache_row(cache_after, page, j % PAGE_SIZE, geo.num_kv_heads)
                     label = f"{geo.name} rank {rank} seq {seq}"
                     self.assert_out_close(row[:, 0], full_k[seq][n - 1], label + " k")
                     self.assert_out_close(row[:, 1], full_v[seq][n - 1], label + " v")
@@ -653,25 +743,27 @@ class TestBatchedRpaDcpMixedPrefillAndDecode(_CloseAssertions):
     Phase 1 and Phase 2 by LSE.
     """
 
-    # (prefix, chunk) per sequence.
-    # Decode cases (q=1):
-    #   (51, 1): prefix < local_page
-    #   (181, 1): mid-page
-    #   (257, 1): super-page boundary (crosses rank 0 to rank 1)
-    #   (1025, 1): large prefix
+    # (prefix, chunk) per sequence, the chunk rows first and the decode rows
+    # last as the kernel's ``[mixed, mixed + prefill, total]`` layout lists
+    # them (SGLang's mixed batches append the running rows after the chunks).
     # Chunked prefill (q > 1):
     #   (200, 63): partial Q tile and partial KV pages
     #   (512, 128): exact 1 Q tile
     # Pure prefill (q = kv, prefix = 0):
     #   (0, 127): q < bq_sz
+    # Decode cases (q=1):
+    #   (51, 1): prefix < local_page
+    #   (181, 1): mid-page
+    #   (257, 1): super-page boundary (crosses rank 0 to rank 1)
+    #   (1025, 1): large prefix
     SEQS = (
+        (200, 63),
+        (512, 128),
+        (0, 127),
         (51, 1),
         (181, 1),
         (257, 1),
         (1025, 1),
-        (200, 63),
-        (512, 128),
-        (0, 127),
     )
     MAX_NUM_TOKENS = 352
 
@@ -702,8 +794,8 @@ class TestBatchedRpaDcpMixedPrefillAndDecode(_CloseAssertions):
             new_k[start : start + c] = chunk_k[s]
             new_v[start : start + c] = chunk_v[s]
 
-        decode_count = sum(1 for _, c in self.SEQS if c == 1)
-        distribution = [decode_count, decode_count, num_seqs]
+        chunk_count = sum(1 for _, c in self.SEQS if c > 1)
+        distribution = [chunk_count, chunk_count, num_seqs]
 
         pages = _pages_per_seq([p + int(c == 1) for p, c in self.SEQS], geo.cp)
 
@@ -836,9 +928,7 @@ class TestBatchedRpaDcpMixedPrefillAndDecode(_CloseAssertions):
                             claimed[seq] = rank
                             j = _local_len(p, rank, geo.cp)
                             page = shard.page_indices[seq * pages + j // PAGE_SIZE]
-                            row = cache_after[page, j % PAGE_SIZE]
-                            row = row.reshape(-1, row.shape[-1])[: 2 * geo.num_kv_heads, :HEAD_DIM]
-                            row = row.reshape(geo.num_kv_heads, 2, HEAD_DIM)
+                            row = _cache_row(cache_after, page, j % PAGE_SIZE, geo.num_kv_heads)
                             label = f"{geo.name} rank {rank} seq {seq}"
                             self.assert_out_close(row[:, 0], chunk_k[seq][0], label + " k")
                             self.assert_out_close(row[:, 1], chunk_v[seq][0], label + " v")
@@ -854,10 +944,11 @@ class TestBatchedRpaDcpStripedChunkWrite(_CloseAssertions):
     rank's stripe page table) attends each multi-token row's chunk causally
     and writes the chunk's owned pages into the stripe itself; a single-token
     row is left to the STRIPED prefix pass, which attends and writes it. The
-    batch is laid out as SGLang's mixed batches are -- chunk rows first, the
-    decode rows last -- and read back to front (``tail_decode``), so the
-    trailing single-token rows take the decode tile. A single-token row inside
-    the chunk range (a one-token extend) goes the same way on the chunk tile.
+    batch is laid out as SGLang's mixed batches are and as the kernel's
+    ``[mixed, mixed + prefill, total]`` layout lists them -- chunk rows first,
+    the decode rows last -- so the trailing single-token rows take the decode
+    tile. A single-token row inside the chunk range (a one-token extend) goes
+    the same way on the chunk tile.
     """
 
     # (prefix, chunk). Chunk starts mid-page on rank 0 (200), mid-page on
@@ -895,6 +986,8 @@ class TestBatchedRpaDcpStripedChunkWrite(_CloseAssertions):
             new_v[cu_q_lens[s] : cu_q_lens[s] + c] = chunk_v[s]
         return cu_q_lens, new_k, new_v
 
+    LAYOUT_NAME = KV_LAYOUT_NAME
+
     def _shard(self, geo: Geometry, rank: int, pages, prefix_k, prefix_v,
                chunk_k, chunk_v, written):
         """This rank's stripe holding every prefix and, per ``written[s]``,
@@ -909,7 +1002,8 @@ class TestBatchedRpaDcpStripedChunkWrite(_CloseAssertions):
             keys.append(full_k[positions])
             values.append(full_v[positions])
         return _paged_shard(
-            keys, values, pages, np.random.default_rng(900 + rank), geo.num_kv_heads
+            keys, values, pages, np.random.default_rng(900 + rank), geo.num_kv_heads,
+            layout_name=self.LAYOUT_NAME,
         )
 
     def _run(self, geo: Geometry, window):
@@ -934,7 +1028,7 @@ class TestBatchedRpaDcpStripedChunkWrite(_CloseAssertions):
                 cp_group_size=geo.cp,
                 cp_rank=jnp.asarray([rank], jnp.int32),
                 kv_lens_global=jnp.asarray(totals, jnp.int32),
-                tail_decode=True,
+                layout_name=self.LAYOUT_NAME,
             )
             before = self._shard(
                 geo, rank, pages, prefix_k, prefix_v, chunk_k, chunk_v,
@@ -957,9 +1051,15 @@ class TestBatchedRpaDcpStripedChunkWrite(_CloseAssertions):
             after_chunk = self._shard(
                 geo, rank, pages, prefix_k, prefix_v, chunk_k, chunk_v, multi
             )
-            np.testing.assert_array_equal(
+            _assert_cache_equal(
                 cache_c,
                 np.asarray(after_chunk.cache.astype(jnp.float32)),
+                after_chunk,
+                [_local_len(p + c if m else p, rank, geo.cp)
+                 for (p, c), m in zip(self.SEQS, multi)],
+                pages,
+                geo.num_kv_heads,
+                self.LAYOUT_NAME,
                 f"{geo.name} rank {rank}: cache after the chunk pass",
             )
             chunk_results.append((out_c[:total_q], lse_c[:total_q]))
@@ -992,9 +1092,14 @@ class TestBatchedRpaDcpStripedChunkWrite(_CloseAssertions):
             after_all = self._shard(
                 geo, rank, pages, prefix_k, prefix_v, chunk_k, chunk_v, every
             )
-            np.testing.assert_array_equal(
+            _assert_cache_equal(
                 cache_p,
                 np.asarray(after_all.cache.astype(jnp.float32)),
+                after_all,
+                [_local_len(p + c, rank, geo.cp) for p, c in self.SEQS],
+                pages,
+                geo.num_kv_heads,
+                self.LAYOUT_NAME,
                 f"{geo.name} rank {rank}: cache after the prefix pass",
             )
             prefix_partials.append((out_p[:total_q], lse_p[:total_q]))
@@ -1058,6 +1163,21 @@ class TestBatchedRpaDcpStripedChunkWrite(_CloseAssertions):
 
 
 @unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
+class TestBatchedRpaDcpStripedChunkWriteSeqAlongLane(TestBatchedRpaDcpStripedChunkWrite):
+    """The chunk write on the lane-major cache.
+
+    SEQ_ALONG_LANE DMAs whole pages, so the chunk pass fetches the page the
+    first new token shares with the cached prefix (on its owner rank only) and
+    writes it back whole; the bit-exact cache comparison after each pass
+    checks that the cached head of that page survives and that no other rank
+    touches it. The sequences start their chunks mid-page on both ranks of
+    DCP2 (200 -> rank 0, 300 -> rank 1) and page-aligned (512).
+    """
+
+    LAYOUT_NAME = "SEQ_ALONG_LANE"
+
+
+@unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
 class TestBatchedRpaDcpExtendPrefixPass(_CloseAssertions):
     """cache_only with q_len > 1 in the MIXED range: every cached key precedes
     every query, and the window runs in global positions."""
@@ -1094,7 +1214,7 @@ class TestBatchedRpaDcpExtendPrefixPass(_CloseAssertions):
             unused_kv,
             shard,
             cu_q_lens,
-            [0, 0, len(self.SEQS)],
+            [len(self.SEQS)] * 3,  # extend
             sliding_window=window,
             prefill_block_sizes=blocks,
             **_cp_kwargs(geo, rank, [p + c for p, c in self.SEQS]),
@@ -1202,7 +1322,7 @@ class TestBatchedRpaDcpWindowStart(_CloseAssertions):
                     unused_kv,
                     shard,
                     np.arange(num_seqs + 1),
-                    [num_seqs] * 3,
+                    [0, 0, num_seqs],  # decode
                     sliding_window=SLIDING_WINDOW,
                     decode_block_sizes=_small_decode_blocks(),
                     **_cp_kwargs(geo, rank, seq_lens),
@@ -1277,7 +1397,7 @@ class TestBatchedRpaDcpWindowStart(_CloseAssertions):
                     unused_kv,
                     shard,
                     [0, self.CHUNK],
-                    [0, 0, 1],
+                    [1, 1, 1],  # extend
                     sliding_window=SLIDING_WINDOW,
                     prefill_block_sizes=blocks,
                     **_cp_kwargs(geo, r, [self.PREFIX + self.CHUNK]),
@@ -1354,7 +1474,7 @@ class TestBatchedRpaTwoPassExtend(_CloseAssertions):
             np.zeros_like(self.chunk_v),
             shard,
             self.cu_q_lens,
-            [0, 0, len(self.SEQS)],
+            [len(self.SEQS)] * 3,  # extend
             sliding_window=window,
             cache_only=True,
             skip_kv_write=True,
@@ -1383,7 +1503,7 @@ class TestBatchedRpaTwoPassExtend(_CloseAssertions):
             self.chunk_v,
             shard,
             self.cu_q_lens,
-            [0, 0, len(self.SEQS)],
+            [len(self.SEQS)] * 3,  # extend
             sliding_window=window,
             skip_kv_write=True,
             return_lse=True,
@@ -1587,7 +1707,7 @@ class TestBatchedRpaFlagsOff(_CloseAssertions):
         )
         is_decode = all(q == 1 for _, q in seqs)
         num_seqs = len(seqs)
-        distribution = [num_seqs] * 3 if is_decode else [0, 0, num_seqs]
+        distribution = [0, 0, num_seqs] if is_decode else [num_seqs] * 3
         out, _ = _run_kernel(
             queries,
             new_k,
@@ -1664,7 +1784,7 @@ class TestBatchedRpaFlagsOff(_CloseAssertions):
             )
             original = np.asarray(shard.cache.astype(np.float32))
             out, cache = _run_kernel(
-                queries, new_k, new_v, shard, cu_q_lens, [0, 0, 1], **kwargs
+                queries, new_k, new_v, shard, cu_q_lens, [1, 1, 1], **kwargs
             )
             return out, cache, original
 

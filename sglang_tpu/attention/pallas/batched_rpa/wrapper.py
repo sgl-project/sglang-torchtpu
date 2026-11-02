@@ -543,7 +543,6 @@ def calculate_block_sizes(
         "cp_group_size",
         "attention_scope",
         "rpa_cases",
-        "tail_decode",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
@@ -583,7 +582,6 @@ def ragged_paged_attention(
     kv_lens_global: jax.Array | None = None,
     attention_scope: configs.AttentionScope | int = configs.AttentionScope.FULL,
     rpa_cases: tuple[configs.RpaCase, ...] | configs.RpaCase | None = None,
-    tail_decode: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -600,8 +598,12 @@ def ragged_paged_attention(
         cu_q_lens: [max_num_seqs + 1]. Cumulative sum of each sequence's query
             length. queries[a:b], keys[a:b], and values[a:b] where a=cu_q_lens[i] and
             b=cu_q_lens[i+1] represents q/k/v of sequence i.
-        distribution: [3]. Cumulative sum of number of decode, prefill, and mixed
-            sequences. distribution[2] represents total number of sequences.
+        distribution: [3]. Cumulative sum of the number of mixed, prefill and
+            decode sequences: the batch lists its mixed (extend) sequences
+            first, ``[0, distribution[0])``, and its decode sequences last,
+            ``[distribution[1], distribution[2])``; distribution[2] is the
+            total number of sequences. A decode-only batch is ``[0, 0, n]``,
+            an extend-only batch ``[n, n, n]``.
         attention_sink: [num_q_heads]. Per-head sink logit, treated as one extra
             key with a zero value for every query (same semantics as RPA v3).
         sm_scale: Softmax scale value.
@@ -650,9 +652,6 @@ def ragged_paged_attention(
             global lengths and this rank's stripe table).
         rpa_cases: Which of the DECODE / MIXED launches to run (both when
             None); a case whose ``distribution`` range is empty can be skipped.
-        tail_decode: Read ``distribution`` back to front: the MIXED sequences
-            are ``[0, distribution[0])`` and the DECODE ones
-            ``[distribution[1], distribution[2])``.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -732,7 +731,6 @@ def ragged_paged_attention(
         return_lse=return_lse,
         cp_group_size=cp_group_size,
         attention_scope=attention_scope,
-        tail_decode=tail_decode,
     )
 
     q_hbm, new_kv_hbm = prepare_inputs(

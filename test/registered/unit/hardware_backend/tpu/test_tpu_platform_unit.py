@@ -854,14 +854,18 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
     def test_refuses_speculative_decoding(self):
         self._assert_refused("(?i)specul", speculative_algorithm="EAGLE3")
 
-    def test_refuses_mixed_chunk(self):
-        self._assert_refused("(?i)mixed[-_ ]chunk", enable_mixed_chunk=True)
+    def test_accepts_mixed_chunk(self):
+        # Mixed batches run the decode rows on the decode tile of the STRIPED
+        # pass and the chunk rows on the chunk tile.
+        self._validate(self._args(enable_mixed_chunk=True))
 
-    def test_refuses_a_quantized_kv_cache(self):
-        # Only the bf16 cache has been validated under DCP.
-        for dtype in ("fp8_e4m3", "fp8_e5m2", "mxint8"):
+    def test_accepts_a_bf16_or_fp8_kv_cache_and_refuses_the_rest(self):
+        # The batched kernel dequantizes an fp8 cache on read under DCP as it
+        # does without it; mxint8 has no DCP path.
+        for dtype in ("auto", "bfloat16", "bf16", "fp8", "fp8_e4m3", "fp8_e5m2"):
             with self.subTest(kv_cache_dtype=dtype):
-                self._assert_refused("(?i)kv[-_ ]cache[-_ ]dtype", kv_cache_dtype=dtype)
+                self._validate(self._args(kv_cache_dtype=dtype))
+        self._assert_refused("(?i)kv[-_ ]cache[-_ ]dtype", kv_cache_dtype="mxint8")
 
     def test_refuses_dp_attention(self):
         self._assert_refused("(?i)dp[-_ ]attention", attn_dp_size=2)
@@ -885,8 +889,10 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
             with self.subTest(backend=backend):
                 self._assert_refused("(?i)dcp[-_ ]comm", dcp_comm_backend=backend)
 
-    def test_refuses_a_replicated_q_projection(self):
-        self._assert_refused("(?i)replicate[-_ ]q", dcp_replicate_q_proj=True)
+    def test_accepts_a_replicated_q_projection(self):
+        # GQA layers project the group's query heads directly and skip the
+        # per-layer head gather.
+        self._validate(self._args(dcp_replicate_q_proj=True))
 
     def test_refuses_eager_mode(self):
         self._assert_refused("(?i)torch[-_ ]compile", enable_torch_compile=False)
@@ -898,10 +904,11 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "SGLANG_TPU_REQ_TO_TOKEN_ON_HOST"):
             self._validate(self._args(), env={"SGLANG_TPU_REQ_TO_TOKEN_ON_HOST": "0"})
 
-    def test_refuses_the_seq_along_lane_kv_layout(self):
-        # The owner-masked KV write addresses the token-major fused cache.
-        with self.assertRaisesRegex(ValueError, "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV"):
-            self._validate(self._args(), env={"SGLANG_TPU_USE_SEQ_ALONG_LANE_KV": "1"})
+    def test_accepts_the_seq_along_lane_kv_layout(self):
+        # Every DCP KV write happens inside the kernel, which handles both
+        # cache layouts (SEQ_ALONG_LANE fetches the page a chunk shares with
+        # its cached prefix so its whole-page write carries the head back).
+        self._validate(self._args(), env={"SGLANG_TPU_USE_SEQ_ALONG_LANE_KV": "1"})
 
     def test_refuses_a_chunk_below_one_dcp_page(self):
         # A DCP page holds page_size * dcp_size tokens and prefill chunks end on
@@ -925,12 +932,13 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
             chunked_prefill_size=None,
         )
 
-    def test_refuses_more_than_two_dcp_ranks(self):
-        # DCP4 and DCP8 stall in warmup or return wrong first tokens on the
-        # pinned stack; only DCP2 passes the e2e gate.
-        for dcp_size in (4, 8):
+    def test_accepts_up_to_eight_dcp_ranks(self):
+        for dcp_size in (2, 4, 8):
             with self.subTest(dcp_size=dcp_size):
-                self._assert_refused("(?i)must be 1 or 2", dcp_size=dcp_size)
+                self._validate(
+                    self._args(dcp_size=dcp_size, chunked_prefill_size=4096)
+                )
+        self._assert_refused("(?i)decode-context-parallel-size", dcp_size=16, tp_size=16)
 
     def test_chunk_check_uses_the_resolved_page_size(self):
         # An unset page resolves to the batched kernel's 256-token floor first.

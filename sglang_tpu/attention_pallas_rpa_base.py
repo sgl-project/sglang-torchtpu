@@ -146,11 +146,11 @@ class PallasForwardMetadata:
     # Owned scalar i32: -1=native fallback, 0=static base, 1024/2048=promotion.
     # Backends without runtime tile selection leave this unset.
     prefill_kv_tile_hint: torch.Tensor | None = None
-    # Decode context parallelism: all three are None unless the DCP group size
-    # is > 1, in which case ``kv_lens`` holds this rank's shard of each sequence
+    # Decode context parallelism: both are None unless the DCP group size is
+    # > 1, in which case ``kv_lens`` holds this rank's shard of each sequence
     # (a single-token row's new token included iff this rank owns its page)
-    # and, for mixed batches, ``distribution`` is read back to front
-    # (``[chunk_rows, chunk_rows, rows]``; see the kernel's ``tail_decode``).
+    # and a mixed batch's ``distribution`` is ``[chunk_rows, chunk_rows, rows]``
+    # (its chunk rows first, its decode rows last).
     # i32[max_num_seqs]  unsharded KV length per sequence
     dcp_kv_lens_global: torch.Tensor | None = None
     # i32[1]  this rank's index inside its DCP group
@@ -284,11 +284,16 @@ class RpaKernelSpec:
     # of the exported JAX function: StableHLO drops them, while torch_tpu still
     # tries to refine every declared dynamic operand.
     uses_cu_kv_lens: bool
-    # Per-slot on/off mask selecting which of the three extend/prefill
-    # ``distribution`` slots get the active-sequence count: v3 = (0, 1, 1)
-    # ([0, n, n]); batched = (0, 0, 1) ([0, 0, n], MIXED-only — the batched
-    # kernel never runs the pure-prefill range). Decode is always [n, n, n].
+    # Per-slot on/off masks selecting which of the three ``distribution``
+    # slots get the active-sequence count. The two kernels order a batch
+    # differently: v3 is [decode, decode + prefill, total], so decode is
+    # [n, n, n] (1, 1, 1) and extend [0, n, n] (0, 1, 1); batched is
+    # [mixed, mixed + prefill, total] (SGLang's own row order, prefill chunks
+    # first and decode rows last), so decode is [0, 0, n] (0, 0, 1) and extend
+    # [n, n, n] (1, 1, 1) -- the batched kernel never runs the pure-prefill
+    # range.
     extend_distribution_mask: tuple[int, int, int]
+    decode_distribution_mask: tuple[int, int, int]
     # Minimum KV page size required by the backend.
     min_page_size: int | None = None
     # Whether the kernel's DECODE range accepts ``decode_query_size`` query rows
@@ -810,17 +815,15 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         self, is_decode: bool, non_empty_bs: int
     ) -> torch.Tensor:
         num_active = torch.tensor(non_empty_bs, dtype=torch.int32)
-        if is_decode:
-            return num_active.repeat(3)
-        # Extend/prefill: each slot is num_active or 0 per the variant's mask
-        # (v3 [0, n, n]; batched [0, 0, n]).
-        zero = torch.zeros((), dtype=torch.int32)
-        return torch.stack(
-            [
-                num_active if slot else zero
-                for slot in self.kernel_spec.extend_distribution_mask
-            ]
+        # Each slot is num_active or 0 per the variant's mask (see
+        # ``RpaKernelSpec``).
+        mask = (
+            self.kernel_spec.decode_distribution_mask
+            if is_decode
+            else self.kernel_spec.extend_distribution_mask
         )
+        zero = torch.zeros((), dtype=torch.int32)
+        return torch.stack([num_active if slot else zero for slot in mask])
 
     def _kernel_segments(self, forward_batch: ForwardBatch, is_decode: bool) -> str:
         """Kernel passes the ``distribution`` built from ``is_decode`` can
@@ -1155,10 +1158,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 )
                 if forward_batch.forward_mode.is_mixed():
                     # SGLang appends the running (decode) rows after the
-                    # prefill rows: the kernel reads ``distribution`` back to
-                    # front (``tail_decode``) so the trailing single-token run
-                    # takes the decode tile and the rows before it the chunk
-                    # tile.
+                    # prefill rows, which is the kernel's batch order: the
+                    # trailing single-token run takes the decode tile and the
+                    # rows before it the chunk tile.
                     num_tail = 0
                     for one in reversed(is_single[: min(non_empty_bs, live)].tolist()):
                         if not one:
@@ -1730,9 +1732,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         The heads are gathered here unless the layer already projected the
         whole group's (``--dcp-replicate-q-proj``; ``q`` then has
         ``cp * layer_q_heads`` heads and no exchange is needed).
-        A mixed batch lists its prefill rows first and its decode rows last,
-        so the STRIPED pass reads ``distribution`` back to front
-        (``tail_decode``) to run the decode rows on the decode tile.
+        A mixed batch lists its prefill rows first and its decode rows last
+        (the kernel's batch order), so the STRIPED pass runs its DECODE range
+        on the decode tile and its MIXED range on the chunk tile.
         """
         md = self.forward_metadata
         cp = self._dcp
@@ -1784,7 +1786,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 out = sink_fold(out, lse, sinks)
             return out.to(q.dtype)
 
-        tail_decode = forward_batch.forward_mode.is_mixed()
+        is_mixed = forward_batch.forward_mode.is_mixed()
 
         # Chunk pass: the global lengths make the last q_len keys of every row
         # the new tokens; the kernel attends them causally among themselves,
@@ -1813,7 +1815,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             cp,  # cp_group_size
             2,  # attention_scope: NEW_TOKENS_ONLY
             2,  # rpa_cases: MIXED only
-            tail_decode,
         )
         # Prefix pass: every row attends this rank's stripe of its cached
         # prefix; a single-token row also attends and writes its new token on
@@ -1840,8 +1841,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             False,  # skip_kv_write: the owner writes a single-token row's token
             cp,  # cp_group_size
             3,  # attention_scope: STRIPED
-            0 if tail_decode else 2,  # rpa_cases: DECODE + MIXED / MIXED only
-            tail_decode,
+            0 if is_mixed else 2,  # rpa_cases: DECODE + MIXED / MIXED only
         )
         out_prefix, lse_prefix = merge_across_ranks(
             out_prefix.float(),

@@ -52,7 +52,6 @@ ARG_NAMES = (
     "cp_group_size",
     "attention_scope",
     "rpa_cases",
-    "tail_decode",
 )
 NUM_TRACED_TENSORS = 10
 STATIC_FLAGS = (
@@ -66,7 +65,6 @@ STATIC_FLAGS = (
     "cp_group_size",
     "attention_scope",
     "rpa_cases",
-    "tail_decode",
 )
 FIRST_STATIC_ARGNUM = 11
 
@@ -194,17 +192,19 @@ class TestDcpOpContract(CustomTestCase):
             return (n // cycle) * page_size + rem
 
         # (scope, q_lens, global seq_lens, striped kv_lens, distribution,
-        # rpa_cases, tail_decode): decode rows first in the plain layout, a
-        # chunk row first and the decode rows last in the tail_decode layout.
+        # rpa_cases): the chunk row first and the decode rows last, as the
+        # kernel's [mixed, mixed + prefill, total] layout lists them; a
+        # decode-only selection reads the same batch with its chunk row
+        # excluded ([0, 0, n] would be a batch of three decode rows).
         cases = (
-            (3, [1, 1, 4], [300, 130, 200],
-             [local_len(300), local_len(130), local_len(196)], [2, 2, 3], 0, False),
-            (2, [1, 1, 4], [300, 130, 200], [300, 130, 200], [2, 2, 3], 2, False),
             (3, [4, 1, 1], [200, 300, 130],
-             [local_len(196), local_len(300), local_len(130)], [1, 1, 3], 0, True),
-            (2, [4, 1, 1], [200, 300, 130], [200, 300, 130], [1, 1, 3], 2, True),
+             [local_len(196), local_len(300), local_len(130)], [1, 1, 3], 0),
+            (2, [4, 1, 1], [200, 300, 130], [200, 300, 130], [1, 1, 3], 2),
+            (3, [4, 1, 1], [200, 300, 130],
+             [local_len(196), local_len(300), local_len(130)], [1, 1, 3], 1),
+            (2, [4, 1, 1], [200, 300, 130], [200, 300, 130], [1, 1, 1], 2),
         )
-        for scope, q_lens, seq_lens, kv_lens, distribution, rpa_cases, tail in cases:
+        for scope, q_lens, seq_lens, kv_lens, distribution, rpa_cases in cases:
             total_q = sum(q_lens)
             cu_q_lens = torch.tensor([0] + list(torch.cumsum(torch.tensor(q_lens), 0)), dtype=torch.int32)
             out, lse = self.overload(
@@ -229,7 +229,6 @@ class TestDcpOpContract(CustomTestCase):
                 cp,
                 scope,
                 rpa_cases,
-                tail,
             )
             self.assertEqual(tuple(out.shape), (self.NUM_TOKENS, self.NUM_Q_HEADS, self.HEAD_DIM))
             self.assertTrue(torch.isfinite(out.float().cpu()[:total_q]).all(), scope)

@@ -292,9 +292,15 @@ def rpa_body(
             k_global = k_id + cp_rank_ref[0] * cfgs.serve.page_size
             global_q_k_gap.append(q_global - k_global)
 
-        # Stitching metadata
+        # Stitching metadata (mirrors the schedule's split of a block into its
+        # cached and new keys; SEQ_ALONG_LANE rolls the new keys into place
+        # from ``bkv_sz_frm_cache`` on, so an overshort cached count would
+        # overwrite cached keys).
         kv_left = jnp.maximum(kv_len - k_id, 0)
-        if cfgs.serve.attention_scope == configs.AttentionScope.STRIPED:
+        if cfgs.serve.cache_only:
+            # Every key comes from the cache; nothing is stitched.
+            kv_left_frm_cache = kv_left
+        elif cfgs.serve.attention_scope == configs.AttentionScope.STRIPED:
             k_len_global = (
                 kv_lens_global_ref[safe_s_idx]
                 if kv_lens_global_ref is not None
@@ -598,8 +604,6 @@ def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
         name += "-lse"
     if cfgs.serve.cp_group_size is not None:
         name += f"-cp{cfgs.serve.cp_group_size}"
-    if cfgs.serve.tail_decode:
-        name += "-td"
     return name
 
 

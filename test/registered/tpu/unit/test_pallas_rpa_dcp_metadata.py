@@ -9,8 +9,8 @@ Covered here:
   cached prefix of a multi-token row, the whole sequence of a single-token
   row), ``page_indices`` uses the widened page stride, the
   ``dcp_kv_lens_global`` / ``dcp_cp_rank`` fields carry the global lengths
-  and the rank constant, and a mixed batch's ``distribution`` is read back
-  to front (chunk rows first, the trailing decode rows last).
+  and the rank constant, and a mixed batch's ``distribution`` is
+  ``[n_chunk, n_chunk, n]`` (chunk rows first, the trailing decode rows last).
 * The per-request page-table capacity check measures the LOCAL length, so a
   sequence longer than one rank's table but shorter than the group's is served.
 * The warmup dummy batch (every seq_len 1) shards to one token on rank 0 and
@@ -307,18 +307,19 @@ class TestPallasRpaDcpMetadataExtend(CustomTestCase):
         self.assertTrue(torch.equal(meta.cu_q_lens.to(torch.int32), expected))
 
     def test_extend_distribution_is_the_chunk_range_only(self):
-        # Pure extend keeps the batched layout [0, 0, n]: every row, the
+        # Pure extend keeps the batched layout [n, n, n]: every row, the
         # one-token row included, runs on the chunk tile.
+        n = len(self.SEQ_LENS)
         meta = self._meta(0)
-        self.assertEqual(meta.distribution.tolist(), [0, 0, len(self.SEQ_LENS)])
+        self.assertEqual(meta.distribution.tolist(), [n, n, n])
 
 
 @_requires_dcp_helpers
 class TestPallasRpaDcpMetadataMixed(CustomTestCase):
     """Mixed batches under dcp=2: SGLang lists the prefill rows first and the
-    running (decode) rows last, so the metadata hands the kernel a
-    back-to-front ``distribution`` (``tail_decode``): the chunk rows are
-    ``[0, n_chunk)`` and the trailing single-token run ``[n_chunk, n)``."""
+    running (decode) rows last, which is the kernel's batch order: the
+    ``distribution`` puts the chunk rows at ``[0, n_chunk)`` and the trailing
+    single-token run at ``[n_chunk, n)``."""
 
     PAGE_SIZE = 16
     DCP = 2
@@ -349,7 +350,7 @@ class TestPallasRpaDcpMetadataMixed(CustomTestCase):
         )
         return _build_meta(backend, self.fb, self.DCP, rank)
 
-    def test_distribution_is_read_back_to_front(self):
+    def test_distribution_lists_the_chunk_rows_then_the_decode_rows(self):
         meta = self._meta(0)
         self.assertEqual(meta.distribution.tolist(), [3, 3, 5])
 

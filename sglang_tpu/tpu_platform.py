@@ -716,12 +716,6 @@ def _validate_decode_context_parallel(server_args) -> None:
             "--decode-context-parallel-size > 1 on TPU: the DCP attention "
             "metadata is built from a host-resident req_to_token."
         )
-    if _uses_seq_along_lane_kv():
-        raise ValueError(
-            "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV=1 is not supported with "
-            "--decode-context-parallel-size > 1 on TPU: the DCP KV write "
-            "targets the token-major fused KV cache."
-        )
     if cfg.kv_cache_dtype not in (
         "auto",
         "bf16",
