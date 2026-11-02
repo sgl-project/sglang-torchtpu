@@ -158,7 +158,11 @@ def run_decode(args, records: harness.Records) -> None:
     from sglang_tpu.k3_programs import bridge
     from sglang_tpu.k3_programs import program as mk
     from sglang_tpu.k3_programs.kimi_k3 import config
-    from sglang_tpu.k3_programs.kimi_k3.decode_ops import Control, DecodeOps
+    from sglang_tpu.k3_programs.kimi_k3.decode_ops import (
+        Control,
+        DecodeOps,
+        decode_batch_sizes,
+    )
 
     batches = [int(b) for b in args.batches.split(",")]
     contexts = [int(c) for c in args.contexts.split(",")]
@@ -178,7 +182,8 @@ def run_decode(args, records: harness.Records) -> None:
     # Under attention DP a rank's pools hold only its own group's requests.
     dp = config.active().attention_dp
     blocks = 1 + -(-rows // dp) * pages
-    sizes = tuple(sorted({b for b, _ in cases if b > 1} | {1}))
+    # Serving's compiled plain batches (a case between them pads to the next).
+    sizes = decode_batch_sizes(max_num_seqs)
     ops = DecodeOps(
         args.presharded,
         num_slots=Control.total_slots(sub_base) if args.dspark else sub_base,
