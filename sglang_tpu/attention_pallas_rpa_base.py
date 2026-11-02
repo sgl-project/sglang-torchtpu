@@ -284,16 +284,9 @@ class RpaKernelSpec:
     # of the exported JAX function: StableHLO drops them, while torch_tpu still
     # tries to refine every declared dynamic operand.
     uses_cu_kv_lens: bool
-    # Per-slot on/off masks selecting which of the three ``distribution``
-    # slots get the active-sequence count. The two kernels order a batch
-    # differently: v3 is [decode, decode + prefill, total], so decode is
-    # [n, n, n] (1, 1, 1) and extend [0, n, n] (0, 1, 1); batched is
-    # [mixed, mixed + prefill, total] (SGLang's own row order, prefill chunks
-    # first and decode rows last), so decode is [0, 0, n] (0, 0, 1) and extend
-    # [n, n, n] (1, 1, 1) -- the batched kernel never runs the pure-prefill
-    # range.
-    extend_distribution_mask: tuple[int, int, int]
-    decode_distribution_mask: tuple[int, int, int]
+    # Whether this kernel variant is Batched RPA (with batch order [mixed, prefill, decode])
+    # vs legacy RPA v3 (with batch order [decode, prefill, mixed]).
+    is_batched: bool = False
     # Minimum KV page size required by the backend.
     min_page_size: int | None = None
     # Whether the kernel's DECODE range accepts ``decode_query_size`` query rows
@@ -814,16 +807,20 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
     def _make_rpa_distribution_cpu(
         self, is_decode: bool, non_empty_bs: int
     ) -> torch.Tensor:
-        num_active = torch.tensor(non_empty_bs, dtype=torch.int32)
-        # Each slot is num_active or 0 per the variant's mask (see
-        # ``RpaKernelSpec``).
-        mask = (
-            self.kernel_spec.decode_distribution_mask
-            if is_decode
-            else self.kernel_spec.extend_distribution_mask
-        )
-        zero = torch.zeros((), dtype=torch.int32)
-        return torch.stack([num_active if slot else zero for slot in mask])
+        if is_decode:
+            if self.kernel_spec.is_batched:
+                # Batched RPA: DECODE is [d1, d2) -> [0, 0, n]
+                return torch.tensor([0, 0, non_empty_bs], dtype=torch.int32)
+            else:
+                # RPA v3: DECODE is [0, d0) -> [n, n, n]
+                return torch.tensor([non_empty_bs, non_empty_bs, non_empty_bs], dtype=torch.int32)
+        else:
+            if self.kernel_spec.is_batched:
+                # Batched RPA: MIXED is [0, d0) -> [n, n, n]
+                return torch.tensor([non_empty_bs, non_empty_bs, non_empty_bs], dtype=torch.int32)
+            else:
+                # RPA v3: EXTEND is [d0, d1) -> [0, n, n]
+                return torch.tensor([0, non_empty_bs, non_empty_bs], dtype=torch.int32)
 
     def _kernel_segments(self, forward_batch: ForwardBatch, is_decode: bool) -> str:
         """Kernel passes the ``distribution`` built from ``is_decode`` can
