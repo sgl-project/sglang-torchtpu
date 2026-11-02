@@ -46,6 +46,10 @@ class KernelConfig:
     shared_expert_finishers: bool = True
     compact_overflow: bool = True
     b4_attention_gather: bool = True
+    # MLA verify page plan overrides (pages a step, steps in flight; 0: the
+    # kernel's choice), for verifies of more than four rows.
+    verify_page_span: int = 0
+    verify_page_buffers: int = 0
     # More DCP32 verify shapes (rows x rows per sequence, e.g. "16x4,48x4")
     # on the grouped FP8 QK/PV path (mla_dcp.GROUPED_SPEC_SHAPES).
     grouped_spec_extra: tuple[str, ...] = ()

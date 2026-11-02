@@ -101,8 +101,10 @@ def page_plan(batch: int, heads: int = HEADS_PER_RANK, sequence_rows: int = 1,
     if sequence_rows == 1:
         deep = batch == 64 and heads == 6 and cache_dtype == jnp.float8_e4m3fn
         return {"span": SPAN, "buffers": 3 if chunked(batch) and not deep else BUFFERS}
-    span = max(1, SPAN // 2)
-    buffers = 4 if batch == 64 or (batch == 32 and heads != HEADS_PER_RANK) else BUFFERS * SPAN // span
+    span = _config().verify_page_span or max(1, SPAN // 2)
+    buffers = _config().verify_page_buffers or (
+        4 if batch == 64 or (batch == 32 and heads != HEADS_PER_RANK) else BUFFERS * SPAN // span
+    )
     return {"span": span, "buffers": buffers if not chunked(batch, force_chunks) else max(2, buffers * 3 // 4)}
 
 
