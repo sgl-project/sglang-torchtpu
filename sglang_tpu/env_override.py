@@ -44,6 +44,11 @@ _ASSOCIATIVE_SCAN_OVERRIDES = (
     "--xla_tpu_use_associative_scan_emitter=false",
 )
 
+_EXECUTABLE_METADATA_OVERRIDES = (
+    # Original HLO is diagnostic state; serving uses the optimized executable.
+    "--xla_tpu_save_original_hlo_module=false",
+)
+
 _VMEM_PREFETCH_OVERRIDES = (
     # TODO: drop once the XLA:TPU memory-space-assignment scheduling issue is
     # fixed. With more than one outstanding VMEM prefetch, sufficiently large
@@ -74,11 +79,6 @@ _DECODE_CP_SPARSE_CORE_OVERRIDES = (
     # also kept the SparseCore gather offload off.
     "--xla_tpu_offload_gather_to_sparsecore=false",
     "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false",
-    # The DCP decode program (per-layer query all-gather, STRIPED attention
-    # and cross-rank merge) hits the memory-space-assignment deadlock described
-    # at _VMEM_PREFETCH_OVERRIDES on its first execute (gpt-oss-120b, DCP2,
-    # libtpu 0.0.50) regardless of the KV pool size; serialize the prefetches.
-    "--xla_gf_vmem_max_outstanding_prefetches=1",
 )
 
 # Smallest KV pool (in tokens) observed safe with the default prefetch depth
@@ -132,7 +132,9 @@ def apply_tpu_env_overrides() -> None:
         )
 
     appended = _override_libtpu_flags(
-        _SPARSE_CORE_OFFLOAD_OVERRIDES + _ASSOCIATIVE_SCAN_OVERRIDES
+        _SPARSE_CORE_OFFLOAD_OVERRIDES
+        + _ASSOCIATIVE_SCAN_OVERRIDES
+        + _EXECUTABLE_METADATA_OVERRIDES
     )
     if appended:
         logger.info(
@@ -156,8 +158,6 @@ def apply_small_kv_pool_vmem_prefetch_override(
     large pool — or a model below the measured layer threshold — leaves the
     default prefetch schedule untouched.
     """
-    if os.environ.get("SGLANG_TPU_SKIP_VMEM_PREFETCH_OVERRIDE"):
-        return
     if max_total_tokens is None or max_total_tokens >= _VMEM_PREFETCH_SAFE_MIN_TOKENS:
         return
     if num_hidden_layers < _VMEM_PREFETCH_MIN_LAYERS:
@@ -201,14 +201,7 @@ def apply_decode_cp_sparse_core_override(*, dcp_size: int) -> None:
     """
     if dcp_size <= 1:
         return
-    flags = list(_DECODE_CP_SPARSE_CORE_OVERRIDES)
-    if os.environ.get("SGLANG_TPU_SKIP_VMEM_PREFETCH_OVERRIDE"):
-        flags = [
-            f
-            for f in flags
-            if not f.startswith("--xla_gf_vmem_max_outstanding_prefetches")
-        ]
-    appended = _override_libtpu_flags(flags)
+    appended = _override_libtpu_flags(_DECODE_CP_SPARSE_CORE_OVERRIDES)
     if appended:
         logger.info(
             "TPU env_override: decode context parallelism (--dcp-size %d); "
