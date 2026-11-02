@@ -1,5 +1,6 @@
 """Both Kimi-K3 programs in one engine: the prefill program shares the decode
-program's routed experts, and the worker sends each batch to its program."""
+program's routed experts and identical dense families, and the worker sends
+each batch to its program."""
 
 import unittest
 from types import SimpleNamespace
@@ -36,6 +37,9 @@ class StubRankLoader:
     def iter_prefill_rank(self, presharded, cache, rank, **kwargs):
         yield from self._experts_at()
         yield ("dense", "latent_down", np.ones(2))
+        # A family both programs read alike, and one the prefill rebuilds.
+        yield ("kda", "k_projection", np.ones(2))
+        yield ("kda", "k_o", np.full(2, 5.0))
 
 
 class StubPrefillProgram:
@@ -71,9 +75,14 @@ class TestSharedExperts(CustomTestCase):
             f: torch.full((3,), i, dtype=torch.float32)
             for i, f in enumerate(colocated.EXPERT_FAMILIES)
         }
+        self.dense = {
+            name: torch.full((2,), 7.0)
+            for names in colocated.SHARED_DENSE.values()
+            for name in names
+        }
         self.decoder = SimpleNamespace(
             ops=SimpleNamespace(
-                weights=dict(self.experts, dense=torch.zeros(1)),
+                weights=dict(self.experts, **self.dense, k_o=torch.zeros(2)),
                 load_weights=mock.Mock(),
             )
         )
@@ -98,6 +107,13 @@ class TestSharedExperts(CustomTestCase):
         # No expert file was read for the prefill; its own dense weights were.
         self.assertEqual(loader.expert_reads, 0)
         self.assertIn("latent_down", self.prefiller.program.weights["dense"])
+        # The shared dense families are the decoder's tensors; the output
+        # projection the prefill rebuilds is its own.
+        weights = self.prefiller.program.weights
+        for group, names in colocated.SHARED_DENSE.items():
+            for name in names:
+                self.assertIs(weights[group][name], self.dense[name])
+        self.assertEqual(weights["kda"]["k_o"].tolist(), [5.0, 5.0])
         # The loader's expert jobs are back after the load.
         self.assertEqual(
             len(list(loader._experts_at())), len(colocated.EXPERT_FAMILIES)

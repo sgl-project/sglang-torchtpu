@@ -23,6 +23,18 @@ from typing import Any
 
 EXPERT_FAMILIES = ("expert_gu", "expert_gus", "expert_down", "expert_ds")
 SHARED_EXPERT_PARALLEL = (8, 16)
+# The dense families both programs read as the same pre-shard arrays, by the
+# prefill's weight group: all but the KDA and MLA output projections, which
+# the prefill rebuilds sequence-parallel from the chip pair's shards (and its
+# MoE latent and shared projections, from its own cache). ~3.8 GiB a rank,
+# ~230 more unified blocks.
+SHARED_DENSE = {
+    "io": ("embedding", "lm_head", "output_res", "final_norm"),
+    "common": ("attn_res", "attn_norm", "mlp_res", "ffn_norm", "dense_gu", "dense_down"),
+    "kda": ("k_gate", "k_fb", "k_projection", "k_conv", "k_a_log", "k_dt", "k_norm"),
+    "mla": ("m_qa", "m_qb", "m_ka", "m_kb", "m_gate", "m_qnorm", "m_knorm"),
+    "moe": ("router", "router_bias", "latent_norm"),
+}
 
 
 @contextlib.contextmanager
@@ -37,7 +49,8 @@ def _no_expert_jobs(rank_loader: Any):
 
 
 class _SharedExpertLoader:
-    """A rank loader whose prefill iterator reads no expert families."""
+    """A rank loader whose prefill iterator reads no expert families and
+    skips the dense families taken from the decode program."""
 
     def __init__(self, loader: Any) -> None:
         self._loader = loader
@@ -50,13 +63,15 @@ class _SharedExpertLoader:
             for group, name, array in self._loader.iter_prefill_rank(*args, **kwargs):
                 if name.split("@", 1)[0] in EXPERT_FAMILIES:
                     continue
+                if name in SHARED_DENSE.get(group, ()):
+                    continue
                 yield group, name, array
 
 
 def share_experts(prefiller: Any, decoder: Any) -> None:
     """Make ``prefiller`` (a ``KimiPrefiller``) use ``decoder``'s routed
-    experts: load the decoder's weights, then load the prefill program's
-    other weights around them."""
+    experts and shared dense families: load the decoder's weights, then load
+    the prefill program's other weights around them."""
     from sglang_tpu.k3_programs.kimi_k3.config import active
 
     ep, decode_ep = active().prefill_expert_parallel, active().decode_expert_parallel
@@ -67,6 +82,10 @@ def share_experts(prefiller: Any, decoder: Any) -> None:
         )
     decoder.ops.load_weights()
     experts = {name: decoder.ops.weights[name] for name in EXPERT_FAMILIES}
+    dense = {
+        group: {name: decoder.ops.weights[name] for name in names}
+        for group, names in SHARED_DENSE.items()
+    }
     program = prefiller.program
     program._rank_loader = _SharedExpertLoader(program._rank_loader)
     program.shared_experts = True
@@ -74,6 +93,8 @@ def share_experts(prefiller: Any, decoder: Any) -> None:
 
     def load_weights(presharded):
         program.weights.setdefault("moe", {}).update(experts)
+        for group, tensors in dense.items():
+            program.weights.setdefault(group, {}).update(tensors)
         return load(presharded)
 
     program.load_weights = load_weights
