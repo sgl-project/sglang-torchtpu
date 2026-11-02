@@ -32,6 +32,8 @@ from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary.ops import _dp_scatter_step, dp_gather, to_dp_local
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.managers import mm_utils
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -40,7 +42,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.inkling_common.sconv import SconvType
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import add_prefix
 from sglang.tml.config import Inkling2MMConfig, Inkling2ModelConfig
 from sglang_tpu.compilation.hybrid_linear_direct_compile import ConvStateModule
@@ -50,7 +52,13 @@ from sglang_tpu.inkling2_attn_res import (
     register_inkling2_attn_res_op,
     supports_attn_res_norm,
 )
+from sglang_tpu.mm_embed_tpu import embed_mm_inputs_tpu
+from sglang_tpu.mm_embedding import EmbeddingSpan, PaddedEmbedding
 from sglang_tpu.models.inkling2_quant import FP8_BLOCK, TpuInkling2QuantConfig
+from sglang_tpu.models.inkling2_vision import (
+    Inkling2VisionEncoderTpu,
+    prepare_vision_input,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -610,9 +618,12 @@ class Inkling2TextModel(nn.Module):
         # count stands for the final-norm hidden.
         self.layers_to_capture: list[int] = []
 
+    def embed(self, input_ids):
+        return self.embed_norm(self.embed_tokens(input_ids))
+
     def forward(self, input_ids, positions, forward_batch, input_embeds=None):
-        hidden = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
-        state = _AttnResState(self.attn_res, self.embed_norm(hidden))
+        hidden = self.embed(input_ids) if input_embeds is None else input_embeds
+        state = _AttnResState(self.attn_res, hidden)
         captures = []
         for i, layer in enumerate(self.layers):
             if i in self.layers_to_capture:
@@ -625,8 +636,54 @@ class Inkling2TextModel(nn.Module):
         return hidden, captures
 
 
+class _NormalizedEmbedding(nn.Module):
+    """Token embeddings with the decoder's input RMS norm applied; image rows skip it."""
+
+    def __init__(self, llm: Inkling2TextModel) -> None:
+        super().__init__()
+        object.__setattr__(self, "_llm", llm)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self._llm.embed(input_ids)
+
+    @property
+    def weight(self):
+        return self._llm.embed_tokens.weight
+
+    @property
+    def embedding_dim(self):
+        return self._llm.embed_tokens.embedding_dim
+
+    @property
+    def num_embeddings(self):
+        return self._llm.embed_tokens.num_embeddings
+
+
+class _Decoder(nn.Module):
+    """The compiled decoder-and-logits boundary, outside image preparation."""
+
+    def __init__(self, owner):
+        super().__init__()
+        object.__setattr__(self, "_owner", owner)
+
+    @property
+    def logits_processor(self):
+        return self._owner.logits_processor
+
+    def get_input_embeddings(self):
+        return self._owner.get_input_embeddings()
+
+    def forward(self, input_ids, positions, forward_batch, input_embeds=None):
+        return self._owner._forward_text(input_ids, positions, forward_batch, input_embeds)
+
+
 class Inkling2ForConditionalGeneration(nn.Module):
-    """Inkling2 served text-only on TPU."""
+    """Inkling2 on TPU: text decoder, optional PE-Lang image encoder."""
+
+    # Decode and verify embed inside the compiled decoder graph.
+    decode_embeds_in_language_model = True
+    # Patches stay on the host; prepare_vision_input pads them into the bucket.
+    keeps_mm_features_on_host = True
 
     def __init__(self, config: Inkling2MMConfig, quant_config=None, prefix: str = ""):
         super().__init__()
@@ -648,9 +705,30 @@ class Inkling2ForConditionalGeneration(nn.Module):
         self.logits_processor.use_fp32_lm_head = True
         # Checkpoint pieces that are combined once all parts of a tensor arrived.
         self._pending: dict[str, torch.Tensor] = {}
+        self._normalized_embedding = _NormalizedEmbedding(self.llm)
+        self.visual = None
+        self.language_model = None
+        self.vision_enabled = bool(get_mm().enable_multimodal)
+        if self.vision_enabled:
+            if config.vision_config is None:
+                raise ValueError("Inkling2 image inputs require vision_config")
+            from sglang.srt.compilation.support_torch_compile import support_torch_compile
+            from sglang_tpu.compilation.decoder_compile_policy import (
+                Qwen3VLDecoderTpuCompilePolicy,
+            )
+            from sglang_tpu.models.inkling2_vision_compile import (
+                Inkling2VisionCompilePolicy,
+            )
+
+            self.visual = Inkling2VisionEncoderTpu(
+                config.vision_config, text.hidden_size, add_prefix("visual", prefix)
+            )
+            self.language_model = _Decoder(self)
+            support_torch_compile(self.language_model, policy=Qwen3VLDecoderTpuCompilePolicy)
+            support_torch_compile(self.visual, policy=Inkling2VisionCompilePolicy)
 
     def get_input_embeddings(self) -> nn.Module:
-        return self.llm.embed_tokens
+        return self._normalized_embedding
 
     def get_attention_sliding_window_size(self) -> int:
         return self.text_config.sliding_window_size - 1
@@ -673,15 +751,69 @@ class Inkling2ForConditionalGeneration(nn.Module):
             )
         self.llm.layers_to_capture = list(layer_ids[:-1])
 
-    @torch.no_grad()
-    def forward(self, input_ids, positions, forward_batch: ForwardBatch, input_embeds=None, **kwargs):
-        if input_embeds is not None:
-            input_embeds = self.llm.embed_norm(input_embeds)
+    def _forward_text(self, input_ids, positions, forward_batch: ForwardBatch, input_embeds=None):
         hidden = self.llm(input_ids, positions, forward_batch, input_embeds)
         aux = None
         if self.capture_aux_hidden_states:
             hidden, aux = hidden
         return self.logits_processor(input_ids, hidden, self.lm_head, forward_batch, aux)
+
+    @torch.no_grad()
+    def forward(self, input_ids, positions, forward_batch: ForwardBatch, input_embeds=None, **kwargs):
+        if not self.vision_enabled:
+            return self._forward_text(input_ids, positions, forward_batch, input_embeds)
+        if (
+            input_ids is None
+            or forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            # Match the compile policy's positional token-ID warmup call shape.
+            if input_embeds is None:
+                return self.language_model(input_ids, positions, forward_batch)
+            return self.language_model(
+                input_ids, positions, forward_batch, input_embeds=input_embeds
+            )
+        return mm_utils.general_mm_embed_routine(
+            input_ids,
+            forward_batch,
+            language_model=self.language_model,
+            data_embedding_funcs={Modality.IMAGE: self.get_image_feature},
+            positions=positions,
+            mm_embedder=embed_mm_inputs_tpu,
+        )
+
+    def get_image_feature(self, items: list[MultimodalDataItem]):
+        """Encode each image in its own bucket; rows in placeholder order."""
+        visual = self.visual
+        param = visual.proj_out.weight
+        spans = []
+        for item in items:
+            grid = item.model_specific_data["vision_grid_thw"].tolist()
+            if len(grid) != 1 or grid[0][0] != 1:
+                raise ValueError("Inkling2 vision expects one still image per item")
+            _, h, w = grid[0]
+            patches = item.feature
+            if patches.ndim != 5 or patches.shape[0] != h * w:
+                raise ValueError("Inkling2 image patches do not match the image grid")
+            inputs, count = prepare_vision_input(
+                patches.to(torch.bfloat16),
+                [(int(h), int(w))],
+                patch_size=visual.patch_size,
+                merge=visual.merge_size,
+                head_dim=visual.head_dim,
+                posemb_grid=visual.posemb_grid_size,
+            )
+            device_inputs = tuple(t.to(param.device) for t in inputs)
+            spans.append(EmbeddingSpan(visual(*device_inputs), 0, count))
+        if not spans:
+            return param.new_empty((0, self.text_config.hidden_size))
+        # The TPU embedder copies only the valid rows to the host for placement.
+        return PaddedEmbedding(tuple(spans))
+
+    def pad_input_ids(self, input_ids, mm_inputs):
+        return mm_utils.MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
+            input_ids, mm_inputs
+        )
 
     # ------------------------------------------------------------------ #
     # Weight loading
@@ -692,6 +824,10 @@ class Inkling2ForConditionalGeneration(nn.Module):
         num_layers = self.text_config.num_hidden_layers
         loaded: set[str] = set()
         for checkpoint_name, tensor in weights:
+            if checkpoint_name.startswith("model.visual."):
+                if self.visual is not None:
+                    self._load_vision(params, checkpoint_name[len("model."):], tensor, loaded)
+                continue
             name = _param_name(checkpoint_name)
             if name is None or _beyond_layers(name, num_layers):
                 continue
@@ -718,6 +854,21 @@ class Inkling2ForConditionalGeneration(nn.Module):
             if isinstance(module, Inkling2Attention) and len(module.split_sizes) > len(_QKVR_PROJECTIONS):
                 # The alignment pad shard has no checkpoint tensor; left as torch.empty it holds NaN/Inf.
                 module.qkvr.weight.data[-module.split_sizes[-1] :].zero_()
+
+    def _load_vision(self, params, name, tensor, loaded) -> None:
+        """visual.* tensors; q/k/v projections fill the fused qkv_proj, out_proj is proj."""
+        for shard in ("q", "k", "v"):
+            if f".self_attn.{shard}_proj." in name:
+                target = name.replace(f".{shard}_proj.", ".qkv_proj.")
+                params[target].weight_loader(params[target], tensor, shard)
+                loaded.add(target)
+                return
+        name = name.replace(".self_attn.out_proj.", ".self_attn.proj.")
+        param = params.get(name)
+        if param is None:
+            raise ValueError(f"Unrecognized vision checkpoint tensor: {name}")
+        getattr(param, "weight_loader", default_weight_loader)(param, tensor)
+        loaded.add(name)
 
     def _load_experts(self, params, name, tensor, loaded) -> None:
         """Stacked [E, ...] expert tensors -> this rank's FusedMoE parameters."""
