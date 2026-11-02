@@ -641,22 +641,24 @@ class _NormalizedEmbedding(nn.Module):
 
     def __init__(self, llm: Inkling2TextModel) -> None:
         super().__init__()
-        object.__setattr__(self, "_llm", llm)
+        # Registered, so a draft sharing this module traces its weights as graph inputs.
+        self.embed_tokens = llm.embed_tokens
+        self.embed_norm = llm.embed_norm
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self._llm.embed(input_ids)
+        return self.embed_norm(self.embed_tokens(input_ids))
 
     @property
     def weight(self):
-        return self._llm.embed_tokens.weight
+        return self.embed_tokens.weight
 
     @property
     def embedding_dim(self):
-        return self._llm.embed_tokens.embedding_dim
+        return self.embed_tokens.embedding_dim
 
     @property
     def num_embeddings(self):
-        return self._llm.embed_tokens.num_embeddings
+        return self.embed_tokens.num_embeddings
 
 
 class _Decoder(nn.Module):
