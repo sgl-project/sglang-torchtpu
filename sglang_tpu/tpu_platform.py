@@ -201,7 +201,17 @@ def _uses_seq_along_lane_kv() -> bool:
 
 # Text-only decoders with softmax attention in every layer and no tensor-parallel
 # shared expert: the layer types the context-parallel path covers.
-_PREFILL_CP_ARCHITECTURES = ("Qwen3MoeForCausalLM", "GptOssForCausalLM")
+_PREFILL_CP_ARCHITECTURES = {"Qwen3MoeForCausalLM", "GptOssForCausalLM"}
+_PREFILL_CP_EP_ARCHITECTURES: set[str] = set()
+
+
+def register_prefill_cp_architecture(
+    architecture: str, *, expert_parallel: bool = False
+) -> None:
+    """Register an external text decoder implementing the TPU PCP contract."""
+    _PREFILL_CP_ARCHITECTURES.add(architecture)
+    if expert_parallel:
+        _PREFILL_CP_EP_ARCHITECTURES.add(architecture)
 
 
 def _validate_prefill_context_parallel(server_args: ServerArgs) -> None:
@@ -231,12 +241,15 @@ def _validate_prefill_context_parallel(server_args: ServerArgs) -> None:
     from sglang.srt.utils.hf_transformers.config import get_config
 
     hf_config = get_config(
-        cfg.model_path, trust_remote_code=cfg.trust_remote_code, revision=cfg.revision
+        cfg.model_path,
+        trust_remote_code=cfg.trust_remote_code,
+        revision=cfg.revision,
+        model_override_args=json.loads(cfg.json_model_override_args),
     )
     architectures = list(hf_config.architectures or [])
     if not set(architectures) & set(_PREFILL_CP_ARCHITECTURES):
         raise NotImplementedError(
-            f"{feature} supports {' and '.join(_PREFILL_CP_ARCHITECTURES)} models, "
+            f"{feature} supports {' and '.join(sorted(_PREFILL_CP_ARCHITECTURES))} models, "
             f"got {architectures}: multimodal, M-RoPE, linear-attention and "
             "state-space models, and MoE layers with a tensor-parallel shared "
             "expert, do not run on the context-parallel path."
@@ -260,9 +273,9 @@ def _validate_prefill_context_parallel(server_args: ServerArgs) -> None:
             "tpu.apply_server_args_defaults",
             attention_backend="pallas_tpu_rpa_batched",
         )
-    elif backend != "pallas_tpu_rpa_batched":
+    elif backend not in ("pallas_tpu_rpa_batched", "pallas_tpu_rpa_v3"):
         raise NotImplementedError(
-            f"{feature} requires --attention-backend pallas_tpu_rpa_batched, "
+            f"{feature} requires --attention-backend pallas_tpu_rpa_batched or pallas_tpu_rpa_v3, "
             f"got {backend!r}."
         )
     if _uses_seq_along_lane_kv():
@@ -274,7 +287,12 @@ def _validate_prefill_context_parallel(server_args: ServerArgs) -> None:
         raise NotImplementedError(f"{feature} does not support speculative decoding.")
     if cfg.attn_dp_size > 1:
         raise NotImplementedError(f"{feature} does not support DP attention.")
-    if cfg.moe_dp_size != attn_cp_size:
+    gathered_experts = (
+        bool(set(architectures) & _PREFILL_CP_EP_ARCHITECTURES)
+        and cfg.moe_dp_size == 1
+        and cfg.ep_size == attn_cp_size
+    )
+    if cfg.moe_dp_size != attn_cp_size and not gathered_experts:
         raise NotImplementedError(
             f"{feature} requires --moe-dp-size {attn_cp_size} (replicated experts "
             "on each rank's own tokens); expert-parallel MoE over the gathered "
@@ -496,11 +514,9 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
             f"supported with pipeline parallelism on TPU (--pp-size {pp})."
         )
     if cfg.attn_cp_size > 1:
-        if cfg.nnodes > 1:
-            # Only because no multi-host run has validated it with standalone
-            # stage groups; no technical limit is known.
+        if cfg.nnodes > 2:
             raise NotImplementedError(
-                "Pipeline stages made of a context-parallel group run on one host "
+                "Pipeline stages made of a context-parallel group run on up to two hosts "
                 f"(got --nnodes {cfg.nnodes})."
             )
         if cfg.kv_cache_dtype not in ("auto", "bf16", "bfloat16"):

@@ -484,8 +484,15 @@ class PipelineTransfer:
     def _check_support(self, raiden_service_pb2) -> None:
         """Reject topologies and native builds the pipeline transfer cannot serve."""
         manager = self.manager
-        if manager.attn_cp_size != 1:
-            raise ValueError("Raiden pipeline transfer requires attention CP=1")
+        if manager.attn_cp_size != 1 and not (
+            self.producer
+            and manager.attn_cp_rank == 0
+            and not manager.enable_all_cp_ranks_for_transfer
+        ):
+            raise ValueError(
+                "Raiden pipeline transfer takes attention CP>1 only on a prefill "
+                "whose CP rank 0 is each stage's sole source"
+            )
         if self.producer and (manager.attn_tp_size != 1 or manager.pp_size <= 1):
             raise ValueError(
                 "Raiden pipeline transfer requires a pipeline producer with "
@@ -638,7 +645,9 @@ class PipelineTransfer:
         manager = self.manager
         return KVCacheManager(
             kv_caches=tensors,
-            node_id=manager._local_rank,
+            # The receiver indexes senders by transfer worker, excluding CP
+            # replicas that never send; the tensors identify the TPU device.
+            node_id=self.rank,
             local_control_port=manager._control_port + port_offset,
             max_blocks=max_blocks,
             num_slots=slots,
@@ -712,9 +721,9 @@ class PipelineTransfer:
     def offer_part(self, room: int, start: int, block_ids: list[int]) -> None:
         """Offer full-attention pages that are final before the prefill ends.
 
-        Pages gather until they make part_min_pages; each such run registers
-        as its own native transfer once the decode has named the room, and the
-        decode pulls it while the pipeline keeps computing. Pages still
+        Pages gather until they make part_min_pages; runs larger than the
+        staging capacity are split into separate native transfers. The decode
+        pulls each part while the pipeline keeps computing. Pages still
         gathering when the prefill ends ride the closing transfer.
         """
         if not self.early_parts or not block_ids:
@@ -736,22 +745,28 @@ class PipelineTransfer:
                     f"Raiden pipeline room {room} offered pages out of order"
                 )
             p_blocks = p_blocks + [int(b) for b in block_ids]
-            if len(p_blocks) < self.part_min_pages:
-                state["pending"] = (p_start, p_blocks)
-                return
             state["pending"] = None
-            part = dict(
-                index=len(state["parts"]),
-                start=p_start,
-                full=p_blocks,
-                registered=False,
-                replied=set(),
-                done=False,
-                expires=time.monotonic() + mgr._timeout_s,
-            )
-            state["parts"].append(part)
-            state["offered"] = p_start + len(p_blocks)
-            self._reply_part(room, part)
+            while len(p_blocks) >= min(self.part_min_pages, self.max_blocks):
+                pages, p_blocks = (
+                    p_blocks[: self.max_blocks],
+                    p_blocks[self.max_blocks :],
+                )
+                part = dict(
+                    index=len(state["parts"]),
+                    start=p_start,
+                    full=pages,
+                    registered=False,
+                    replied=set(),
+                    done=False,
+                    expires=time.monotonic() + mgr._timeout_s,
+                )
+                state["parts"].append(part)
+                p_start += len(pages)
+                state["offered"] = p_start
+                self._reply_part(room, part)
+                if room in self.failed:
+                    return
+            state["pending"] = (p_start, p_blocks) if p_blocks else None
 
     def _dst_attn_tp(self, room) -> int:
         widths = {int(meta["attn_tp_size"]) for meta in self.replies[room].values()}

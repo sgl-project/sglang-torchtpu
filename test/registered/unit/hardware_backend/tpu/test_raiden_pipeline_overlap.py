@@ -396,6 +396,23 @@ def test_disabled_keeps_one_transfer(world):
     assert world.controller.transfers[0]["dst_device_block_ids"][:9] == dst_full[:9]
 
 
+def test_cached_prefix_parts_fit_staging_capacity(world):
+    sender = world.stages[0]
+    sender.part_min_pages = 4
+    sender.max_blocks = 32
+    blocks = list(range(100, 167))
+    sender.offer_part(ROOM, 0, blocks)
+    state = sender.early[ROOM]
+    assert [len(part["full"]) for part in state["parts"]] == [32, 32]
+    assert [part["start"] for part in state["parts"]] == [0, 32]
+    assert state["pending"] == (64, blocks[64:])
+    closing = sender._closing_entry(ROOM, blocks + [167], [], b"")
+    transferred = [page for part in state["parts"] for page in part["full"]]
+    assert transferred + closing["full"] == blocks + [167]
+    assert closing["start"] == 64
+    assert closing["parts"] == 2
+
+
 def test_part_ids_round_trip():
     assert pl.parse_req_id(pl.part_req_id(ROOM, 3)) == (ROOM, 3)
     assert pl.parse_req_id(str(ROOM)) == (ROOM, None)

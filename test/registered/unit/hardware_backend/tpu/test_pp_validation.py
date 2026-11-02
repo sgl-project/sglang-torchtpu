@@ -38,6 +38,8 @@ def _args(**overrides):
     defaults = dict(
         dtype=None,
         attention_backend=None,
+        prefill_attention_backend=None,
+        decode_attention_backend=None,
         sampling_backend=None,
         disable_cuda_graph=False,
         cuda_graph_config=default_cuda_graph_config(),
@@ -70,6 +72,7 @@ def _args(**overrides):
         disaggregation_enable_kv_checksum=False,
         attn_cp_size=1,
         enable_prefill_cp=False,
+        json_model_override_args="{}",
         cp_strategy=None,
         moe_dp_size=1,
         tpu_compile_tracer="dynamo",
@@ -194,9 +197,10 @@ class TestPipelineParallelValidation(CustomTestCase):
         with self.assertRaisesRegex(NotImplementedError, r"--dcp-size 2"):
             _apply(_cp_stage_args(dcp_size=2))
 
-    def test_context_parallel_stages_run_on_one_host(self):
-        with self.assertRaisesRegex(NotImplementedError, r"one host.*--nnodes 2"):
-            _apply(_cp_stage_args(nnodes=2))
+    def test_context_parallel_stages_run_on_up_to_two_hosts(self):
+        _apply(_cp_stage_args(nnodes=2))
+        with self.assertRaisesRegex(NotImplementedError, r"two hosts.*--nnodes 4"):
+            _apply(_cp_stage_args(nnodes=4))
 
     def test_context_parallel_stages_reject_other_kv_cache_dtypes(self):
         """Context-parallel stages serve only a bf16 KV cache, so any other
