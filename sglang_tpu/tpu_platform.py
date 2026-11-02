@@ -480,13 +480,13 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
         cfg.tp_size == 2
         and cfg.attn_cp_size == 1
         and cfg.attn_dp_size == 1
-        and cfg.ep_size == 1
+        and cfg.ep_size in (1, 2)
     )
     if cfg.tp_size > 1 and cfg.attn_cp_size != cfg.tp_size and not stage_is_tp_pair:
         raise NotImplementedError(
             "Pipeline parallelism on TPU requires --tp-size 1, a tensor-parallel "
-            "pair (--tp-size 2 with --attn-cp-size 1, no DP attention or expert "
-            "parallelism) or --attn-cp-size equal to --tp-size (got --tp-size "
+            "pair (--tp-size 2 with --attn-cp-size 1, --ep-size 1 or 2, "
+            "no DP attention) or --attn-cp-size equal to --tp-size (got --tp-size "
             f"{cfg.tp_size} with --attn-cp-size {cfg.attn_cp_size} and --pp-size "
             f"{pp})."
         )
@@ -1640,11 +1640,7 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang_tpu.pp_stage_chips import (
             validate_chips_for_pp,
         )
-        from sglang_tpu.pp_stage_groups import (
-            make_stage_groups_standalone,
-        )
 
-        make_stage_groups_standalone(get_parallel())
         validate_chips_for_pp(get_parallel())
         # Before the first collective and before torch.compile traces the model.
         from sglang_tpu.twolevel_allreduce import register_from_parallel_state
