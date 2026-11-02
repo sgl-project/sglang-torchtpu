@@ -64,6 +64,14 @@ def add_arguments(parser) -> None:
         "plain steps of the same requests",
     )
     spec.add_argument(
+        "--large-drafts",
+        type=int,
+        choices=(1, 3),
+        default=3,
+        help="drafts at the --large-batches counts past eight (1: the one-draft "
+        "verify, through 16/24/32 requests)",
+    )
+    spec.add_argument(
         "--require-verifier-parity",
         action="store_true",
         help="require every generated token in --large-batches to match "
@@ -841,6 +849,15 @@ def run_spec(args, records: harness.Records) -> None:
         # steps of the same requests.
         # The batched decoder's schedule carries three drafts past eight.
         spec_large, plain_large = batched, plain
+        if args.large_drafts != 3:
+            spec_large = decoder(
+                (
+                    (1, 1, args.single_drafts),
+                    (2, 4, args.small_batch_drafts),
+                    (5, 8, 3),
+                    (9, most, args.large_drafts),
+                )
+            )
         letters = tuple(prompts)
         source = [letters[i % len(letters)] for i in range(most)]
         group_tables = [
