@@ -1,0 +1,100 @@
+{
+  "multihost": {
+    "test_tpu_deepseek_r1_0528_tp16_dp1_accuracy": {
+      "slot": "day-5pm"
+    },
+    "test_tpu_deepseek_v3_1_tp16_dp1_accuracy": {
+      "slot": "day-5pm"
+    },
+    "test_tpu_kimi_k26_mmmu_shard0": {
+      "group": "kimi-k26-mmmu",
+      "slot": "day-10am"
+    },
+    "test_tpu_kimi_k26_mmmu_shard1": {
+      "group": "kimi-k26-mmmu",
+      "slot": "day-10am"
+    }
+  },
+  "singlehost": {
+    "nightly-tpu-accuracy-gemma4-26b-a4b-aime": {
+      "slot": "day-10am",
+      "timeout_per_file": 7200
+    },
+    "nightly-tpu-accuracy-gemma4-26b-a4b-gpqa": {
+      "slot": "day-10am",
+      "timeout_per_file": 7200
+    },
+    "nightly-tpu-accuracy-gemma4-26b-a4b-mmmupro": {
+      "slot": "day-5pm",
+      "timeout_per_file": 10800
+    },
+    "nightly-tpu-accuracy-gemma4-31b-aime": {
+      "slot": "day-10am",
+      "timeout_per_file": 7200
+    },
+    "nightly-tpu-accuracy-gemma4-31b-gpqa": {
+      "slot": "day-10am",
+      "timeout_per_file": 7200
+    },
+    "nightly-tpu-accuracy-gemma4-31b-mmmupro": {
+      "slot": "day-5pm",
+      "timeout_per_file": 10800
+    },
+    "nightly-tpu-accuracy-glm-5-3-flash-aime": {
+      "slot": "day-10am",
+      "timeout_per_file": 10800
+    },
+    "nightly-tpu-accuracy-gpt-oss-120b-aime": {
+      "slot": "day-5pm",
+      "timeout_per_file": 5400
+    },
+    "nightly-tpu-accuracy-gpt-oss-120b-gpqa": {
+      "slot": "day-10am",
+      "timeout_per_file": 5400
+    },
+    "nightly-tpu-accuracy-gpt-oss-120b-gsm8k": {
+      "slot": "day-10am",
+      "timeout_per_file": 5400
+    },
+    "nightly-tpu-accuracy-gpt-oss-120b-mmlupro": {
+      "slot": "day-10am",
+      "timeout_per_file": 5400
+    },
+    "nightly-tpu-accuracy-gpt-oss-20b": {
+      "slot": "day-10am",
+      "timeout_per_file": 10800
+    },
+    "nightly-tpu-accuracy-muse-spark-aime": {
+      "slot": "day-5pm",
+      "timeout_per_file": 14400
+    },
+    "nightly-tpu-accuracy-muse-spark-gpqa": {
+      "slot": "day-5pm",
+      "timeout_per_file": 14400
+    },
+    "nightly-tpu-accuracy-muse-spark-gsm8k": {
+      "slot": "day-5pm",
+      "timeout_per_file": 14400
+    },
+    "nightly-tpu-accuracy-muse-spark-mmlupro": {
+      "slot": "day-5pm",
+      "timeout_per_file": 14400
+    },
+    "nightly-tpu-accuracy-qwen3-5-397b-mmmupro": {
+      "slot": "day-5pm",
+      "timeout_per_file": 10800
+    },
+    "nightly-tpu-accuracy-qwen3-8-27b-aime": {
+      "slot": "day-10am",
+      "timeout_per_file": 10800
+    },
+    "nightly-tpu-accuracy-qwen3-8-27b-gpqa": {
+      "slot": "day-10am",
+      "timeout_per_file": 10800
+    },
+    "nightly-tpu-accuracy-qwen3-8-27b-mmmupro": {
+      "slot": "day-5pm",
+      "timeout_per_file": 10800
+    }
+  }
+}

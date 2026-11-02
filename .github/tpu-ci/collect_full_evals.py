@@ -1,4 +1,4 @@
-"""Collect full-evaluation archives and combine the two MMMU-Pro shards."""
+"""Collect full-evaluation archives and combine the MMMU-Pro shards."""
 
 import base64
 import io
@@ -13,10 +13,16 @@ from pathlib import Path
 MMMU_PRO_QUESTIONS = 1730
 
 
-def combine_shards(shards, total=MMMU_PRO_QUESTIONS):
-    count = shards[0]["shards"] if shards else 0
+def combine_shards(shards):
+    if not shards:
+        raise ValueError("No MMMU-Pro shard reported a result")
+    count = shards[0]["shards"]
     if len(shards) != count or {s["shard"] for s in shards} != set(range(count)):
         raise ValueError(f"Expected all {count} MMMU-Pro shards, got {len(shards)}")
+    if len({s["stride"] for s in shards}) != 1:
+        raise ValueError("MMMU-Pro shards scored different question sets")
+    # The shards split every stride-th question of the full set between them.
+    total = len(range(0, MMMU_PRO_QUESTIONS, shards[0]["stride"]))
     ids = [qid for shard in shards for qid in shard["ids"]]
     if len(ids) != total or len(set(ids)) != total:
         raise ValueError("MMMU-Pro coverage is incomplete or contains duplicates")
@@ -85,7 +91,8 @@ def main():
         (output / "mmmu-full-summary.json").write_text(json.dumps(result, indent=2))
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
             summary.write(
-                f"MMMU-Pro full set: **{result['correct']}/1730 = {result['score']:.2%}**\n"
+                f"MMMU-Pro: **{result['correct']}/{result['questions']} "
+                f"= {result['score']:.2%}**\n"
             )
 
 

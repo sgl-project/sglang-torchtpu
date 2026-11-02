@@ -10,7 +10,8 @@
 # Single-host models go through run_suite; multihost accuracy uses JobSets.
 # Each model uses the same serving recipe for scheduled and manual runs.
 # Accuracy stays off the 1 AM nightly, whose feature and perf jobs already fill
-# both lanes; each daytime slot fills the lane its MMMU-Pro legs leave idle.
+# both lanes. .github/tpu-ci/accuracy_slots.json assigns each leg its daytime slot;
+# the weekly est_time bot rebalances it so neither slot outgrows its lane.
 name: Accuracy Test (TPU)
 run-name: "Accuracy Test (TPU)${{ inputs.update-dashboard && ' [publish]' || '' }}"
 
@@ -18,9 +19,9 @@ on:
   # Pacific time, DST-aware like the nightly. `plan` maps each cron to its tests,
   # so a changed cron must change there too.
   schedule:
-    - cron: "0 10 * * *"  # day-10am: Kimi MMMU on the 2-host slices, single-host accuracy on the 1-host ones
+    - cron: "0 10 * * *"  # day-10am
       timezone: "America/Los_Angeles"
-    - cron: "0 17 * * *"  # day-5pm: Gemma4/Qwen3.5/Qwen3.8 MMMU on 1-host, DeepSeek accuracy on 2-host
+    - cron: "0 17 * * *"  # day-5pm
       timezone: "America/Los_Angeles"
   workflow_dispatch:
     inputs:
@@ -78,8 +79,11 @@ jobs:
   # caller's event, so the input must win over github.event.schedule.
   plan:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       model: ${{ steps.p.outputs.model }}
+      singlehost: ${{ steps.legs.outputs.singlehost }}
     steps:
       - id: p
         env:
@@ -98,6 +102,18 @@ jobs:
           fi
           echo "model=$MODEL" >> "$GITHUB_OUTPUT"
           echo "selection: $MODEL"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+          sparse-checkout: .github/tpu-ci
+      - id: legs
+        env:
+          MODEL: ${{ steps.p.outputs.model }}
+        run: |
+          set -euo pipefail
+          legs="$(python3 .github/tpu-ci/accuracy_slots.py singlehost "$MODEL")"
+          echo "singlehost=$legs" >> "$GITHUB_OUTPUT"
+          echo "single-host legs: $legs"
 
   # Standalone runs build their own image; the nightly passes one in so every
   # stage of the run tests a single build.
@@ -110,70 +126,21 @@ jobs:
       contents: read
       id-token: write
 
+  # One job per benchmark (one suite, one file, one slice), from accuracy_slots.json.
   accuracy:
     needs: [build, plan]
     # `build` may be skipped (image passed in); !cancelled() keeps this alive then.
     if: >-
       ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","day-10am","gpt-oss-120b"]'), needs.plan.outputs.model) }}
+          && needs.plan.result == 'success' && needs.plan.outputs.singlehost != '[]' }}
     strategy:
       # A broken benchmark must not cancel the others' scores.
       fail-fast: false
-      matrix:
-        # One suite (= one file, one job, one slice) per benchmark, each paired
-        # with the name its Kubernetes objects get. JobSet validates the POD name,
-        # tpu-ci-<run_name>-<5 rand>-slice-0-0-<5 rand>, against 63 chars, which
-        # leaves run_name 34; the suite itself (38-41) is rejected at admission.
-        # Suites stay spelled out: the pr-gate lint greps this file for each
-        # nightly-accuracy registration's literal suite. The next model adds its
-        # legs here and a choice above; selection stays in the job-level `if`
-        # while a single model is the only single-host entrant.
-        include:
-          - suite: nightly-tpu-accuracy-gpt-oss-120b-aime
-            run_name: accuracy-gpt-oss-120b-aime
-          - suite: nightly-tpu-accuracy-gpt-oss-120b-gpqa
-            run_name: accuracy-gpt-oss-120b-gpqa
-          - suite: nightly-tpu-accuracy-gpt-oss-120b-gsm8k
-            run_name: accuracy-gpt-oss-120b-gsm8k
-          - suite: nightly-tpu-accuracy-gpt-oss-120b-mmlupro
-            run_name: accuracy-gpt-oss-120b-mmlupro
-    name: ${{ matrix.suite }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      lane: nightly
-      hosts: 1
-      suite: ${{ matrix.suite }}
-      run_name: ${{ matrix.run_name }}
-      nightly: true
-      weights_pvc: model-weights
-      # Admission is separate; each eval file gets a 90-minute runtime budget.
-      timeout_per_file: 5400
-    permissions:
-      contents: read
-      id-token: write
-
-  accuracy-muse-spark:
-    needs: [build, plan]
-    if: >-
-      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","full-set","day-10am","muse-spark"]'), needs.plan.outputs.model) }}
-    strategy:
-      fail-fast: false
-      # Bound concurrent benchmark jobs and queue later ones in Actions so
-      # they retain their full TPU admission budget.
+      # Later legs wait in Actions instead of in Kueue, so each keeps its full
+      # admission budget; the 1-host lane has two slices.
       max-parallel: 3
       matrix:
-        include:
-          - suite: nightly-tpu-accuracy-muse-spark-aime
-            run_name: accuracy-muse-spark-aime
-          - suite: nightly-tpu-accuracy-muse-spark-gpqa
-            run_name: accuracy-muse-spark-gpqa
-          - suite: nightly-tpu-accuracy-muse-spark-gsm8k
-            run_name: accuracy-muse-spark-gsm8k
-          - suite: nightly-tpu-accuracy-muse-spark-mmlupro
-            run_name: accuracy-muse-spark-mmlupro
+        include: ${{ fromJSON(needs.plan.outputs.singlehost) }}
     name: ${{ matrix.suite }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
@@ -185,191 +152,7 @@ jobs:
       run_name: ${{ matrix.run_name }}
       nightly: true
       weights_pvc: model-weights
-      timeout_per_file: 14400
-    permissions:
-      contents: read
-      id-token: write
-
-  accuracy-gpt-oss-20b:
-    needs: [build, plan]
-    if: >-
-      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","full-set","day-10am","gpt-oss-20b"]'), needs.plan.outputs.model) }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      lane: nightly
-      hosts: 1
-      suite: nightly-tpu-accuracy-gpt-oss-20b
-      run_name: accuracy-gpt-oss-20b
-      nightly: true
-      weights_pvc: model-weights
-      timeout_per_file: 10800
-    permissions:
-      contents: read
-      id-token: write
-
-  accuracy-gemma4:
-    needs: [build, plan]
-    if: >-
-      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","full-set","day-10am","gemma4"]'), needs.plan.outputs.model) }}
-    strategy:
-      fail-fast: false
-      matrix:
-        # One suite per benchmark and checkpoint; 2 h covers ~21 min of bring-up
-        # plus the ~77 min of eval measured in CI.
-        include:
-          - suite: nightly-tpu-accuracy-gemma4-31b-aime
-            run_name: accuracy-gemma4-31b-aime
-          - suite: nightly-tpu-accuracy-gemma4-31b-gpqa
-            run_name: accuracy-gemma4-31b-gpqa
-          - suite: nightly-tpu-accuracy-gemma4-26b-a4b-aime
-            run_name: accuracy-gemma4-26b-a4b-aime
-          - suite: nightly-tpu-accuracy-gemma4-26b-a4b-gpqa
-            run_name: accuracy-gemma4-26b-a4b-gpqa
-    name: ${{ matrix.suite }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      lane: nightly
-      hosts: 1
-      suite: ${{ matrix.suite }}
-      run_name: ${{ matrix.run_name }}
-      nightly: true
-      weights_pvc: model-weights
-      timeout_per_file: 7200
-    permissions:
-      contents: read
-      id-token: write
-
-  accuracy-qwen3-8:
-    needs: [build, plan]
-    if: >-
-      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","full-set","day-10am","qwen3-8-27b"]'), needs.plan.outputs.model) }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - suite: nightly-tpu-accuracy-qwen3-8-27b-gpqa
-            run_name: accuracy-qwen3-8-27b-gpqa
-          - suite: nightly-tpu-accuracy-qwen3-8-27b-aime
-            run_name: accuracy-qwen3-8-27b-aime
-    name: ${{ matrix.suite }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      lane: nightly
-      hosts: 1
-      suite: ${{ matrix.suite }}
-      run_name: ${{ matrix.run_name }}
-      nightly: true
-      weights_pvc: model-weights
-      # GPQA's four 80k-budget passes measured 5113 s with a warm compile cache.
-      timeout_per_file: 10800
-    permissions:
-      contents: read
-      id-token: write
-
-  accuracy-glm-5-3-flash:
-    needs: [build, plan]
-    if: >-
-      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","full-set","day-10am","glm-5-3-flash"]'), needs.plan.outputs.model) }}
-    name: nightly-tpu-accuracy-glm-5-3-flash-aime
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      lane: nightly
-      hosts: 1
-      suite: nightly-tpu-accuracy-glm-5-3-flash-aime
-      run_name: accuracy-glm-5-3-flash-aime
-      nightly: true
-      weights_pvc: model-weights
-      # 36 min bring-up; eval took 42 min at a 128k budget, the 290k tail is longer.
-      timeout_per_file: 10800
-    permissions:
-      contents: read
-      id-token: write
-
-  # The 5 PM slot. 26B measured 8915 s in CI with bring-up; the
-  # JobSet deadline is 1.5 x est_time and the admission wait is the 6 h cap's rest.
-  accuracy-gemma4-mmmupro:
-    needs: [build, plan]
-    if: >-
-      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","full-set","gemma4","day-5pm"]'), needs.plan.outputs.model) }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - suite: nightly-tpu-accuracy-gemma4-31b-mmmupro
-            run_name: accuracy-gemma4-31b-mmmupro
-          - suite: nightly-tpu-accuracy-gemma4-26b-a4b-mmmupro
-            run_name: accuracy-gemma4-26b-a4b-mmmupro
-    name: ${{ matrix.suite }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      lane: nightly
-      hosts: 1
-      suite: ${{ matrix.suite }}
-      run_name: ${{ matrix.run_name }}
-      nightly: true
-      weights_pvc: model-weights
-      timeout_per_file: 10800
-    permissions:
-      contents: read
-      id-token: write
-
-  # The 5 PM slot with the Gemma4 MMMU-Pro legs. FP8 fits one host (bf16 needs
-  # two); the full set measured 2 h 22 min in CI.
-  accuracy-qwen3-5-mmmupro:
-    needs: [build, plan]
-    if: >-
-      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","full-set","qwen3-5-397b","day-5pm"]'), needs.plan.outputs.model) }}
-    name: nightly-tpu-accuracy-qwen3-5-397b-mmmupro
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      lane: nightly
-      hosts: 1
-      suite: nightly-tpu-accuracy-qwen3-5-397b-mmmupro
-      run_name: accuracy-qwen3-5-397b-mmmupro
-      nightly: true
-      weights_pvc: model-weights
-      timeout_per_file: 10800
-    permissions:
-      contents: read
-      id-token: write
-
-  # The 5 PM slot. BF16 TP8 fits one host; the full set measured 5490 s in CI
-  # with bring-up.
-  accuracy-qwen3-8-mmmupro:
-    needs: [build, plan]
-    if: >-
-      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","full-set","qwen3-8-27b","day-5pm"]'), needs.plan.outputs.model) }}
-    name: nightly-tpu-accuracy-qwen3-8-27b-mmmupro
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      lane: nightly
-      hosts: 1
-      suite: nightly-tpu-accuracy-qwen3-8-27b-mmmupro
-      run_name: accuracy-qwen3-8-27b-mmmupro
-      nightly: true
-      weights_pvc: model-weights
-      timeout_per_file: 10800
+      timeout_per_file: ${{ matrix.timeout_per_file }}
     permissions:
       contents: read
       id-token: write
@@ -379,7 +162,7 @@ jobs:
     needs: [build, plan]
     if: >-
       ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","full-set","day-10am","day-5pm","deepseek-r1-0528","deepseek-v3-1","kimi-k26","qwen3-5-397b"]'), needs.plan.outputs.model) }}
+          && needs.plan.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -402,17 +185,9 @@ jobs:
           fi
           groups="$(python3 .github/tpu-ci/discover_multihost.py \
                       --suite nightly-tpu-multihost-accuracy)"
-          # Test files only say "nightly"; the slot is decided here. The 10 AM slot
-          # takes the Kimi MMMU shards, the 5 PM slot every other file, so a new
-          # file runs without picking a slot. A model name selects by file name.
-          kimi='test("^test_tpu_kimi_k26_mmmu_")'
-          case "$MODEL" in
-            all|full-set) keep='.' ;;
-            day-10am) keep="map(select(.name | $kimi))" ;;
-            day-5pm) keep="map(select(.name | $kimi | not))" ;;
-            *) keep='map(select(.name | contains($m | gsub("-"; "_"))))' ;;
-          esac
-          groups="$(jq -c --arg m "$MODEL" "$keep" <<< "$groups")"
+          # Test files only say "nightly"; accuracy_slots.json picks the slot.
+          # A model name selects by file name.
+          groups="$(python3 .github/tpu-ci/accuracy_slots.py multihost "$MODEL" <<< "$groups")"
           if [ -n "$TEST_FILTER" ]; then
             groups="$(jq -c --arg f "$TEST_FILTER" \
                         '[.[] | select(.files | contains($f))]' <<< "$groups")"
@@ -431,6 +206,8 @@ jobs:
           && needs.discover-multihost.outputs.groups != '[]' }}
     strategy:
       fail-fast: false
+      # As in `accuracy`: the 2-host lane has one slice.
+      max-parallel: 2
       matrix:
         group: ${{ fromJSON(needs.discover-multihost.outputs.groups) }}
     name: ${{ matrix.group.name }}

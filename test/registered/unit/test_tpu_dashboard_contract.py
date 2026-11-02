@@ -261,7 +261,6 @@ class TestJobMapsToOneTest(CustomTestCase):
         step = next(s for s in job["steps"] if s.get("id") == "d")
 
         def discover(model):
-            self.assertIn(f'"{model}"', job["if"])
             rc, out = self._run_step(
                 step, {"MODEL": model, "TEST_FILTER": "", "UPDATE_DASHBOARD": "false"}
             )
@@ -272,23 +271,17 @@ class TestJobMapsToOneTest(CustomTestCase):
             model: {g["name"] for g in discover(model)}
             for model in ("day-10am", "day-5pm", "full-set")
         }
-        # Each slot's multihost legs take the 2-host lane its 1-host legs leave idle.
-        self.assertEqual(
-            names["day-10am"],
-            {"test_tpu_kimi_k26_mmmu_shard0", "test_tpu_kimi_k26_mmmu_shard1"},
-        )
-        self.assertEqual(
-            names["day-5pm"],
-            {
-                "test_tpu_deepseek_r1_0528_tp16_dp1_accuracy",
-                "test_tpu_deepseek_v3_1_tp16_dp1_accuracy",
-            },
-        )
+        # collect-full-evaluations combines the Kimi MMMU shards of one run.
+        kimi = {"test_tpu_kimi_k26_mmmu_shard0", "test_tpu_kimi_k26_mmmu_shard1"}
+        self.assertTrue(any(kimi <= names[m] for m in ("day-10am", "day-5pm")))
         # Every multihost accuracy file runs in exactly one scheduled selection.
         slots = ("day-10am", "day-5pm")
         scheduled = [names[m] for m in slots]
         self.assertEqual(set().union(*scheduled), names["full-set"])
         self.assertEqual(sum(map(len, scheduled)), len(names["full-set"]))
+        # A stale slot entry would make the est_time bot fail on a missing file.
+        table = json.loads((TPU_CI / "accuracy_slots.json").read_text())
+        self.assertEqual(set(table["multihost"]), names["full-set"])
         # Test authors only write "nightly"; the workflow picks the slot.
         for row in discover("full-set"):
             self.assertEqual(row["schedule"], "nightly", row["name"])
@@ -305,39 +298,27 @@ class TestJobMapsToOneTest(CustomTestCase):
             # A hosted runner has six hours, including startup and cleanup.
             runtime = 3600 + group["timeout_per_file"] + 600
             self.assertGreater(21600 - runtime - 900 - 600, 0, group["name"])
-        # The nightly no longer runs accuracy; single-host legs ride the 10 AM slot.
+        # The nightly no longer runs accuracy.
         for job in workflow["jobs"].values():
             self.assertNotIn('"nightly"', job.get("if", ""))
-        gpt = workflow["jobs"]["accuracy-gpt-oss-20b"]
-        self.assertIn('"day-10am"', gpt["if"])
-        self.assertEqual(gpt["with"]["suite"], "nightly-tpu-accuracy-gpt-oss-20b")
+        # Every single-host leg runs in exactly one scheduled slot; `all` runs each.
+        legs = workflow["jobs"]["plan"]["steps"][-1]
 
-        def suites(job_name):
-            legs = workflow["jobs"][job_name]["strategy"]["matrix"]["include"]
-            return {leg["suite"] for leg in legs}
+        def suites(model):
+            rc, out = self._run_step(legs, {"MODEL": model})
+            self.assertEqual(rc, 0, model)
+            return [leg["suite"] for leg in json.loads(out["singlehost"])]
 
-        sizes = ("31b", "26b-a4b")
-        self.assertIn('"day-10am"', workflow["jobs"]["accuracy-gemma4"]["if"])
+        ten, five, everything = (suites(m) for m in ("day-10am", "day-5pm", "all"))
+        self.assertEqual(sorted(ten + five), sorted(everything))
+        self.assertEqual(sorted(suites("full-set")), sorted(everything))
+        # A model name picks its own legs, never a longer name's (gpt-oss-20b).
+        self.assertEqual(suites("gpt-oss-20b"), ["nightly-tpu-accuracy-gpt-oss-20b"])
         self.assertEqual(
-            suites("accuracy-gemma4"),
-            {
-                f"nightly-tpu-accuracy-gemma4-{size}-{bench}"
-                for size in sizes
-                for bench in ("aime", "gpqa")
-            },
-        )
-        mmmu = workflow["jobs"]["accuracy-gemma4-mmmupro"]["if"]
-        self.assertIn('"day-5pm"', mmmu)
-        self.assertEqual(
-            suites("accuracy-gemma4-mmmupro"),
-            {f"nightly-tpu-accuracy-gemma4-{size}-mmmupro" for size in sizes},
-        )
-        qwen = workflow["jobs"]["accuracy-qwen3-5-mmmupro"]
-        for selection in ('"day-5pm"', '"qwen3-5-397b"'):
-            self.assertIn(selection, qwen["if"])
-        self.assertEqual(qwen["with"]["hosts"], 1)
-        self.assertEqual(
-            qwen["with"]["suite"], "nightly-tpu-accuracy-qwen3-5-397b-mmmupro"
+            sorted(suites("gemma4")),
+            sorted(
+                s for s in everything if s.startswith("nightly-tpu-accuracy-gemma4-")
+            ),
         )
         nightly = yaml.safe_load((WORKFLOWS / "nightly-test-tpu.yml").read_text())
         self.assertNotIn("accuracy", nightly["jobs"])
@@ -370,8 +351,13 @@ class TestJobMapsToOneTest(CustomTestCase):
             if workflow is None:
                 continue
             # The suite must be wired into its stage workflow's matrix...
-            text = (WORKFLOWS / workflow).read_text(encoding="utf-8")
-            self.assertIn(suite, text, f"{suite} is not in {workflow}'s matrix")
+            if workflow == "accuracy-test-tpu.yml":
+                text = (TPU_CI / "accuracy_slots.json").read_text(encoding="utf-8")
+                where = "accuracy_slots.json"
+            else:
+                text = (WORKFLOWS / workflow).read_text(encoding="utf-8")
+                where = f"{workflow}'s matrix"
+            self.assertIn(f'"{suite}"', text, f"{suite} is not in {where}")
             # ...and render to exactly one file (one file, one suite, one job).
             rows = rendered[suite]
             self.assertEqual(
@@ -379,6 +365,13 @@ class TestJobMapsToOneTest(CustomTestCase):
             )
             accuracy_perf_files.append(rows[0]["file"])
         job_files += accuracy_perf_files
+
+        # ...and every slot-table leg is still a registered suite.
+        table = json.loads((TPU_CI / "accuracy_slots.json").read_text())
+        stale = set(table["singlehost"]) - set(self.registered)
+        self.assertFalse(
+            stale, f"accuracy_slots.json legs with no registration: {stale}"
+        )
 
         duplicated = {f for f in job_files if job_files.count(f) > 1}
         self.assertFalse(duplicated, f"files reached by two jobs: {duplicated}")

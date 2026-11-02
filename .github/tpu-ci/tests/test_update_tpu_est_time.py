@@ -67,6 +67,35 @@ class TestUpdateTpuEstTime(unittest.TestCase):
         self.assertIsNone(u.current_est(src))
         self.assertEqual(u.rewrite(src, 10800), src)
 
+    def test_balance_moves_legs_only_for_a_real_win(self):
+        w = {"a": 5000, "b": 600, "c": 4000}
+        start = {"a": "day-10am", "b": "day-10am", "c": "day-5pm"}
+        # Moving b would trim the busier slot by 600 s: weekly noise, not a move.
+        self.assertEqual(u.balance(start, w), start)
+        w = {"a": 5000, "b": 4000, "c": 3000, "d": 3000}
+        out = u.balance(dict.fromkeys(w, "day-10am"), w)
+        self.assertEqual(max(u.slot_loads(out, w).values()), 8000)
+
+    def test_grouped_legs_share_a_slot(self):
+        # One collector combines the shards of a single run.
+        table = {
+            "singlehost": {},
+            "multihost": {
+                "k0": {"slot": "day-10am", "group": "k"},
+                "k1": {"slot": "day-10am", "group": "k"},
+                "r1": {"slot": "day-10am"},
+                "v3": {"slot": "day-10am"},
+            },
+        }
+        est = {"k0": 5400, "k1": 5400, "r1": 10800, "v3": 7200}
+        new, _, loads = u.rebalance(table, est)
+        slots = {k: v["slot"] for k, v in new["multihost"].items()}
+        self.assertEqual(slots["k0"], slots["k1"])
+        self.assertEqual(max(loads["multihost"].values()), 25200)
+        table["multihost"]["k1"]["slot"] = "day-5pm"
+        with self.assertRaises(ValueError):
+            u.rebalance(table, est)
+
 
 if __name__ == "__main__":
     unittest.main()
