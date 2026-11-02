@@ -59,7 +59,7 @@ def supports_spec_tokens(batch: int, drafts: int, attention_dp: int = 1) -> bool
     in parts)."""
     if drafts == 1:
         return attention_dp == 1 and 1 <= batch <= max(ONE_DRAFT_BATCHES)
-    largest = max(DP_SPEC_BATCHES if attention_dp > 1 else SPEC_BATCHES)
+    largest = max(DP_SPEC_BATCHES if attention_dp > 1 else compiled_spec_batches(3))
     return drafts == 0 or (
         1 <= batch <= largest
         and (drafts == 3 or (batch <= 8 and drafts == DRAFT_TOKENS))
@@ -68,7 +68,12 @@ def supports_spec_tokens(batch: int, drafts: int, attention_dp: int = 1) -> bool
 
 def compiled_spec_batches(drafts: int) -> tuple[int, ...]:
     """The compiled request counts of a batched verify of ``drafts`` drafts."""
-    return ONE_DRAFT_BATCHES if drafts == 1 else SPEC_BATCHES
+    if drafts == 1:
+        return ONE_DRAFT_BATCHES
+    from sglang_tpu.k3_programs.kimi_k3.config import active
+
+    extra = {int(b) for b in active().extra_spec_batches}
+    return tuple(sorted(set(SPEC_BATCHES) | extra))
 
 
 def draft_rows(verify_rows: int) -> int:

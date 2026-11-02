@@ -46,6 +46,11 @@ class KernelConfig:
     shared_expert_finishers: bool = True
     compact_overflow: bool = True
     b4_attention_gather: bool = True
+    # Serving batches beyond the powers of two, by request count: plain
+    # decode and three-draft verifies (e.g. "48" / "12"; multiples of 16 rows
+    # take the staged MoE paths).
+    extra_plain_batches: tuple[str, ...] = ()
+    extra_spec_batches: tuple[str, ...] = ()
     # MLA verify page plan overrides (pages a step, steps in flight; 0: the
     # kernel's choice), for verifies of more than four rows.
     verify_page_span: int = 0

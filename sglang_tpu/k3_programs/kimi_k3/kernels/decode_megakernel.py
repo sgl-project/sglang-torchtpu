@@ -873,11 +873,11 @@ def _run_routed_expert_stream(
     # and stage_blocks override it.
     singleton_block = (
         SINGLETON_BLOCK if SINGLETON_BLOCK is not None
-        else batch_size in (16, 32, 64, 96, 128)
+        else batch_size in (16, 32, 48, 64, 80, 96, 128)
     )
     stage_blocks = (
         STAGE_BLOCKS if STAGE_BLOCKS is not None
-        else batch_size in (16, 32, 64, 96, 128)
+        else batch_size in (16, 32, 48, 64, 80, 96, 128)
     )
     def expert_dot(source, packed, scales, accumulator, contraction_size, output_size, **options):
         if (batch_size > 1 and contraction_size == expert_input_size
@@ -1079,7 +1079,7 @@ def _run_routed_expert_stream(
             for word in range(-(-batch_size // 32))
         ]
 
-    reuse_row_plan = stage_blocks and batch_size in (32, 64, 96, 128)
+    reuse_row_plan = stage_blocks and batch_size in (32, 48, 64, 80, 96, 128)
 
     def compact_row_positions(active_rows):
         # Counts and row indices are < 128, hence exact in FP32. This avoids
@@ -1300,7 +1300,7 @@ def _run_routed_expert_stream(
         compact_overflow and down_accumulator.shape[0] < batch_size
     )
     share_compact_finish = (
-        SHARED_EXPERT_FINISHERS and batch_size in (16, 32, 64, 96, 128) and compact_capacity == 8
+        SHARED_EXPERT_FINISHERS and batch_size in (16, 32, 48, 64, 80, 96, 128) and compact_capacity == 8
         and (not compact_only or compact_overflow)
         and expert_gate_up_vmem.dtype == jnp.uint32
     )
@@ -6053,7 +6053,7 @@ def _shared_shards(batch_size):
 def _use_compact_overflow(batch_size, gate_up_dtype, *, group_pending_routes):
     return (
         COMPACT_OVERFLOW and not COMPACT_ONLY and SHARED_EXPERT_FINISHERS
-        and (batch_size in (32, 64, 96, 128) or (batch_size == 16 and B16_COMPACT_EXPERTS))
+        and (batch_size in (32, 48, 64, 80, 96, 128) or (batch_size == 16 and B16_COMPACT_EXPERTS))
         and COMPACT_ROWS == 8
         and gate_up_dtype == jnp.uint32 and group_pending_routes
     )
