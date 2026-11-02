@@ -22,10 +22,13 @@ BLOCK_SIZE = 256
 HIDDEN_SIZE = 7168
 VOCAB = 163840  # tokens; vocabulary-sharded 5120 per TP rank
 DRAFT_TOKENS = 7  # DSpark: the verify is the anchor and 7 drafts
-SPEC_BATCHES = (1, 2, 4, 6, 8, 12, 16, 20, 24)  # the batched speculation's compiled request counts
+SPEC_BATCHES = (1, 2, 4, 8, 16)  # the batched speculation's compiled request counts
 # One-draft verifies (two rows a request; the draft runs its four-row shape on
-# the verify's rows padded): their compiled request counts.
-ONE_DRAFT_BATCHES = (16, 24, 32)
+# the verify's rows padded): their compiled request counts. Batches between the
+# powers of two compile (B6/B12/B20/B24 at three drafts, plain B24/B48) but run
+# the kernels' generic paths, 2-4x slower than the next power of two on
+# hardware (x3 B12 74.5 ms vs B16 35.7; plain B48 85.4 vs B64 38.1).
+ONE_DRAFT_BATCHES = (16, 32)
 # Attention DP2's compiled request counts: half of each are one group's.
 DP_SPEC_BATCHES = (2, 4, 8, 16, 32)
 MAX_STEP_TOKENS = 8192  # the prefill's largest window

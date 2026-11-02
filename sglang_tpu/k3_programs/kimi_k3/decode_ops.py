@@ -47,9 +47,10 @@ logger = init_logger(__name__)
 AXIS = "tp"
 
 
-# Plain decode batches between the powers of two: a step pads to the next
-# compiled size, so 17-24 requests no longer pay for 32 rows, nor 33-48 for 64.
-PLAIN_BATCHES = (1, 2, 4, 8, 16, 24, 32, 48, 64, 128)
+# Plain decode batches: the powers of two (B24/B48 compile but take the
+# kernels' generic paths, slower than B32/B64 on hardware: 31.0 vs 23.5 ms,
+# 85.4 vs 38.1 ms at 131k).
+PLAIN_BATCHES = (1, 2, 4, 8, 16, 32, 64, 128)
 
 
 def decode_batch_sizes(max_num_seqs: int) -> tuple[int, ...]:
