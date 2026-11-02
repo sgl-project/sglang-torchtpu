@@ -435,6 +435,49 @@ class TestTpuMambaPool(CustomTestCase):
             self.assertTrue(torch.all(state[6] == 0))
             self.assertTrue(torch.all(state[0] == 0))
 
+    def test_conv_only_pool_radix_copies_cover_every_stream(self):
+        """Inkling keeps six conv streams per layer and no recurrent state. A prefix
+        hit (copy_from), a post-verify snapshot and a host offload page must each
+        move every stream; one that moves conv[0] only passes the GDN cases above."""
+        from sglang.srt.configs.inkling import (
+            InklingConvCacheParams,
+            InklingConvStateShape,
+        )
+        from sglang_tpu.tpu_dma_hicache import page_major_tensors
+
+        dims = (4, 4, 2, 2, 8, 8)
+        cp = InklingConvCacheParams(
+            shape=InklingConvStateShape(
+                conv=[(self.K - 1, d) for d in dims], temporal=(0, 0, 0)
+            ),
+            layers=[0, 1],
+        )
+        pool = TpuMambaPool(
+            size=4,
+            spec_state_size=2,
+            cache_params=cp,
+            mamba_layer_ids=[0, 1],
+            device="cpu",
+            speculative_num_draft_tokens=2,
+            speculative_eagle_topk=1,
+        )
+        states = pool.get_state()
+        self.assertEqual(len(states), len(dims) * 2)
+        offloaded = page_major_tensors(pool)
+        self.assertEqual(len(offloaded), len(states))
+        self.assertTrue(all(a is b for a, b in zip(offloaded, states)))
+        # Request row 1's window holds rows 7 and 8.
+        for i, state in enumerate(states):
+            state[1].fill_(i + 1)
+            state[8].fill_(i + 100)
+        pool.copy_from(torch.tensor([1]), torch.tensor([3]))
+        pool.snapshot_checkpoints(
+            torch.tensor([4], dtype=torch.int32), torch.tensor([1]), torch.tensor([1])
+        )
+        for i, state in enumerate(states):
+            self.assertTrue(torch.all(state[3] == i + 1))
+            self.assertTrue(torch.all(state[4] == i + 100))
+
     def test_verify_track_steps_match_the_boundary_crossing(self):
         """From 62, accepting 3 reaches 65: the 64-token boundary is window step
         1. From 60, accepting 2 stays short; an inactive row (-1) commits nothing;

@@ -27,14 +27,14 @@ from __future__ import annotations
 from typing import Any, Callable
 
 
-def _is_inkling2(hf_config: Any) -> bool:
+def is_inkling2(hf_config: Any) -> bool:
     from sglang.tml.config import Inkling2MMConfig, Inkling2ModelConfig
 
     return isinstance(hf_config, (Inkling2MMConfig, Inkling2ModelConfig))
 
 
 def inkling2_attn_backend(original: Callable, runner: Any, full_attn_backend: Any):
-    if not _is_inkling2(runner.model_config.hf_config):
+    if not is_inkling2(runner.model_config.hf_config):
         return original(runner, full_attn_backend)
     from sglang_tpu.attention_inkling_sconv_pallas import build_inkling_hybrid_backend
 
@@ -49,7 +49,7 @@ def inkling2_swa_kv_pool(
     swa_max_total_num_tokens: Any,
     mha_pool_class: Any,
 ):
-    if not _is_inkling2(configurator.model_config.hf_config):
+    if not is_inkling2(configurator.model_config.hf_config):
         return original(
             configurator,
             full_max_total_num_tokens=full_max_total_num_tokens,

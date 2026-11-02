@@ -4,7 +4,14 @@
 Wraps :func:`sglang_tpu.attention.pallas.gdn.sconv_wrapper.fused_sconv` as a
 torch custom op that updates one conv-state stream in place (donated, aliased),
 and :class:`TpuInklingSconvBackend`, which reuses the GDN backend's per-forward
-metadata (distribution, query_start_loc, state rows) for every sconv call.
+metadata (distribution, query_start_loc, state rows, radix snapshot plan) for
+every sconv call.
+
+Radix prefix caching: an extend or decode with a snapshot plan copies each
+stream's conv window at the planned boundary into the request's track slot,
+outside the kernel; a verify's snapshots come from its checkpoint window
+(``commit_verified_states``). A prefix hit copies a track slot into the new
+request's slot before its extend, which then resumes from it.
 """
 
 # NOTE: do *not* add ``from __future__ import annotations`` here; see
@@ -203,6 +210,49 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
         use_residual: bool = True,
     ) -> torch.Tensor:
         """y ``[T, dim]`` for x ``[T, dim]``; updates the stream's state slots."""
+        state = self.sconv_state(layer_id=layer_id, stream=stream)
+        # Read before the conv rewrites the slot rows a window may reach back into.
+        snapshot = self._track_snapshot(x, state)
+        y = self._conv(x, state, weight=weight, dyn=dyn, use_residual=use_residual)
+        if snapshot is not None:
+            write_state_rows(state, *snapshot)
+        return y
+
+    def _track_snapshot(
+        self, x: torch.Tensor, state: torch.Tensor
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """(track rows, conv windows, live) this forward snapshots for the radix cache.
+
+        Row i's window is the K-1 inputs before packed offset ``_track_end[i]``,
+        from x or, where it reaches before this forward, the slot's prior state.
+        A row without a snapshot (end -1, or no track slot) is not live.
+        """
+        if self._track_end is None or self._num_spec_tokens:
+            return None
+        hist, dim = state.shape[1], state.shape[-1]
+        ends = self._track_end.long()
+        num_seqs = ends.shape[0]
+        qsl = self._query_start_loc[: num_seqs + 1].long()
+        starts = qsl[:-1]
+        # [seqs, hist] packed token offsets of each window, oldest first.
+        lags = torch.arange(hist, device=x.device)
+        tokens = ends[:, None] - hist + lags[None]
+        slots = self._state_indices[:num_seqs].clamp(0, state.shape[0] - 1).long()
+        prior = state.index_select(0, slots).reshape(num_seqs, hist, dim)
+        # A fresh request has no prior state; where, so stale rows cannot leak NaN.
+        has_state = (self._seq_lens[:num_seqs] - (qsl[1:] - starts)) > 0
+        prior = torch.where(has_state[:, None, None], prior, torch.zeros_like(prior))
+        prior_rows = (tokens - starts[:, None] + hist).clamp(0, hist - 1)
+        prior = torch.gather(prior, 1, prior_rows[:, :, None].expand(-1, -1, dim))
+        x_rows = tokens.clamp(0, x.shape[0] - 1).reshape(-1)
+        recent = x.index_select(0, x_rows).reshape(num_seqs, hist, dim)
+        in_x = (tokens >= starts[:, None])[:, :, None]
+        window = torch.where(in_x, recent.to(state.dtype), prior)
+        track_slots = self._track_indices[:num_seqs].long()
+        live = (ends >= 0) & (track_slots > 0)
+        return track_slots, window, live
+
+    def _conv(self, x, state, *, weight, dyn, use_residual):
         if not envs.SGLANG_TPU_ENABLE_INKLING_SCONV_PALLAS.get():
             if self._num_spec_tokens:
                 xla_sconv = self._xla_sconv_verify
@@ -212,7 +262,7 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
                 xla_sconv = self._xla_sconv
             return xla_sconv(
                 x,
-                state=self.sconv_state(layer_id=layer_id, stream=stream),
+                state=state,
                 weight=weight,
                 dyn=dyn,
                 use_residual=use_residual,
@@ -220,7 +270,7 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
         state_rows, read_offsets = self._state_rows()
         return self._sconv_op(
             x.contiguous(),
-            self.sconv_state(layer_id=layer_id, stream=stream),
+            state,
             weight,
             self._query_start_loc,
             state_rows,

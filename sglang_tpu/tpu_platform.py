@@ -1217,13 +1217,16 @@ class TpuSRTPlatform(SRTPlatform):
 
     def supports_mamba_prefix_cache(self, model_config) -> bool:
         from sglang.srt.configs.hybrid_arch import hybrid_gdn_config, kimi_linear_config
+        from sglang_tpu.hooks.inkling2 import is_inkling2
 
         # GDN and KDA run the same kernel and pass it the same snapshot plan.
         # GLM-5.3-Flash also needs the per-page kpool index layout (public #1747),
         # which this branch lacks: its pooled index records cross radix-shared pages.
+        # Inkling2's sconv backend writes the plan's conv windows itself.
         return (
             hybrid_gdn_config(model_config) is not None
             or kimi_linear_config(model_config) is not None
+            or is_inkling2(model_config.hf_config)
         )
 
     def validate_mamba_prefix_cache(self, view, hf_config=None) -> None:
