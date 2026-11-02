@@ -188,5 +188,10 @@
 /test/registered/tpu/nightly-perf/*_eagle3_*.py                                     @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174 @jcc-google @cjx0709 @JamesBrianD @benliangw
 /benchmark/tpu/spec                                                                 @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174 @jcc-google @cjx0709 @JamesBrianD @benliangw
 
+# RL training (code only RL trainers use, e.g. trainer-to-engine weight sync)
+/sglang_tpu/rl                   @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD @benliangw @HJSang @Zhichenzzz
+/test/registered/tpu/unit/rl     @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD @benliangw @HJSang @Zhichenzzz
+/test/registered/tpu/e2e/rl      @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD @benliangw @HJSang @Zhichenzzz
+
 # Cross-cutting P/D + spec; last so it wins over the two blocks above
 /test/registered/tpu/e2e/*_pd_*spec*.py  @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD @benliangw

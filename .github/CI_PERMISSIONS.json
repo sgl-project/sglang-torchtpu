@@ -5,11 +5,23 @@
         "cooldown_interval_minutes": 0,
         "reason": "sglang-torchtpu maintainer listed in CODEOWNERS TPU area"
     },
+    "HJSang": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "sglang-torchtpu maintainer listed in CODEOWNERS TPU area (RL weight sync)"
+    },
     "JamesBrianD": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
         "reason": "sglang-torchtpu TPU contributor"
+    },
+    "Zhichenzzz": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "sglang-torchtpu maintainer listed in CODEOWNERS TPU area (RL weight sync)"
     },
     "alexnails": {
         "can_tag_run_ci_label": true,
