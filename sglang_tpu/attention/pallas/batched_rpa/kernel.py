@@ -170,8 +170,9 @@ def calculate_and_store_out(
             )
         if cfgs.model.has_attention_sink:
             batch_l = add_attention_sink(batch_l, batch_m, sink_ref)
-        if cfgs.serve.cache_only:
-            # A row that attended no key keeps l == 0 and outputs 0.
+        if cfgs.serve.attention_scope.walks_cache_stripe:
+            # A row that attended no key (empty stripe) keeps l == 0 and
+            # outputs 0.
             batch_l = jnp.where(batch_l == 0, jnp.ones_like(batch_l), batch_l)
         batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
 
@@ -240,9 +241,15 @@ def rpa_body(
     # Step 1: Fetch metadata.
     processed_q_len = []
     processed_kv_len = []
-    kv_len_left = [] if cfgs.serve.cache_only else None
+    kv_len_left = [] if (cfgs.serve.cache_only or cfgs.serve.attention_scope.walks_cache_stripe) else None
+    # NEW_TOKENS_ONLY: keys before this per-block bound are cached and masked.
+    kv_new_start_left = [] if cfgs.serve.attention_scope.skips_cached_keys else None
     global_q_k_gap = None
-    if cfgs.serve.cp_group_size is not None and cfgs.model.sliding_window is not None:
+    if (
+        cfgs.serve.cp_group_size is not None
+        and cfgs.model.sliding_window is not None
+        and cfgs.serve.attention_scope.walks_cache_stripe
+    ):
         global_q_k_gap = []
     # Lists to hold the 2 variables needed for stitching
     bkv_sz_frm_cache_list = []
@@ -263,21 +270,55 @@ def rpa_body(
         q_end = jnp.where(is_valid, cu_q_lens_ref[safe_s_idx + 1], 0)
         q_len = q_end - q_start
         # cache_only queries follow every one of the kv_len keys.
-        offset = kv_len if cfgs.serve.cache_only else kv_len - q_len
+        offset = (
+            kv_len
+            if (cfgs.serve.cache_only or cfgs.serve.attention_scope.walks_cache_stripe)
+            else kv_len - q_len
+        )
 
         processed_q_len.append((q_idx * cfgs.bq_sz + offset))
         processed_kv_len.append(k_id)
         if kv_len_left is not None:
             kv_len_left.append(kv_len - k_id)
+        if kv_new_start_left is not None:
+            kv_new_start_left.append(kv_len - q_len - k_id)
         if global_q_k_gap is not None:
             kv_len_global = jnp.where(is_valid, kv_lens_global_ref[safe_s_idx], 0)
             q_global = kv_len_global - q_len + q_idx * cfgs.bq_sz
-            k_global = k_id * cfgs.serve.cp_group_size + cp_rank_ref[0]
+            # Page-striped cache: local key j holds global position
+            # j + (j // page_size) * (cp - 1) * page_size + rank * page_size. The
+            # mask adds the j-dependent stripe term per key; the scalar part of
+            # the gap is q_global - (k_id + rank * page_size).
+            k_global = k_id + cp_rank_ref[0] * cfgs.serve.page_size
             global_q_k_gap.append(q_global - k_global)
 
-        # Stitching metadata
+        # Stitching metadata (mirrors the schedule's split of a block into its
+        # cached and new keys; SEQ_ALONG_LANE rolls the new keys into place
+        # from ``bkv_sz_frm_cache`` on, so an overshort cached count would
+        # overwrite cached keys).
         kv_left = jnp.maximum(kv_len - k_id, 0)
-        kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
+        if cfgs.serve.cache_only:
+            # Every key comes from the cache; nothing is stitched.
+            kv_left_frm_cache = kv_left
+        elif cfgs.serve.attention_scope == configs.AttentionScope.STRIPED:
+            k_len_global = (
+                kv_lens_global_ref[safe_s_idx]
+                if kv_lens_global_ref is not None
+                else 0
+            )
+            page_size = cfgs.serve.page_size
+            cp_size = cfgs.serve.cp_group_size
+            rank = cp_rank_ref[0] if cp_rank_ref is not None else 0
+            owns_token = (
+                (k_len_global > 0)
+                & (q_len == 1)
+                & (((k_len_global - 1) // page_size) % cp_size == rank)
+            )
+            kv_left_frm_cache = jnp.where(
+                owns_token, jnp.maximum(kv_left - q_len, 0), kv_left
+            )
+        else:
+            kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
         kv_left_frm_new = jnp.maximum(kv_left - kv_left_frm_cache, 0)
 
         bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, cfgs.bkv_sz)
@@ -411,6 +452,7 @@ def rpa_body(
                 bq_start=bq_start,
                 kv_len_left=kv_len_left,
                 global_q_k_gap=global_q_k_gap,
+                kv_new_start_left=kv_new_start_left,
             )
         )
         m_scratch_ref[:, q_slice] = m_next
@@ -550,8 +592,12 @@ def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
         name += f"-sw{cfgs.model.sliding_window}"
     if cfgs.model.has_attention_sink:
         name += "-sink"
-    if cfgs.serve.cache_only:
+    if cfgs.serve.attention_scope == configs.AttentionScope.CACHE_ONLY:
         name += "-co"
+    elif cfgs.serve.attention_scope == configs.AttentionScope.STRIPED:
+        name += "-striped"
+    elif cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
+        name += "-new"
     if cfgs.serve.skip_kv_write:
         name += "-nowb"
     if cfgs.serve.return_lse:

@@ -414,7 +414,7 @@ class TestKernelBlockSizes(CustomTestCase):
             kv_lens=jnp.zeros((num_seqs,), jnp.int32),
             page_indices=jnp.zeros((num_seqs * pages_per_seq,), jnp.int32),
             cu_q_lens=jnp.arange(num_seqs + 1, dtype=jnp.int32),
-            distribution=jnp.asarray([num_seqs] * 3, jnp.int32),
+            distribution=jnp.asarray([0, 0, num_seqs], jnp.int32),
         )
 
         def validate(bkv_sz, mode):

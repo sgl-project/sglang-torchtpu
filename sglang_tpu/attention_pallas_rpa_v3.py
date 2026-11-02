@@ -86,6 +86,7 @@ RPA_V3_SPEC = RpaKernelSpec(
     supports_attention_sink=True,
     uses_cu_kv_lens=True,
     extend_distribution_mask=(0, 1, 1),  # [0, n, n]
+    decode_distribution_mask=(1, 1, 1),  # [n, n, n]
     supports_decode_query_size=True,
 )
 
