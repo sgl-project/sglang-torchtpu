@@ -25,7 +25,7 @@ from sglang.test.tpu import run_model_config
 from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
 
 register_tpu_ci(
-    est_time=3600,
+    est_time=1670,
     suite="nightly-tpu-perf-qwen3-5-397b",
     nightly=True,
     labels=["singlehost", "qwen3.5-397b", "perf"],

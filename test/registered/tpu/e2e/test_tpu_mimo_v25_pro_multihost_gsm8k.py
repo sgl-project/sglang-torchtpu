@@ -30,7 +30,7 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 from sglang.test.tpu import model_config_main
 
 register_tpu_ci(
-    est_time=5400,
+    est_time=1250,
     suite="nightly-tpu-multihost",
     nightly=True,
     labels=["multihost", "mimo-v2.5-pro"],

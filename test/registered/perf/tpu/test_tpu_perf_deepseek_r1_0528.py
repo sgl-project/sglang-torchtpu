@@ -33,7 +33,7 @@ from sglang.test.tpu import run_model_config
 from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
 
 register_tpu_ci(
-    est_time=3600,
+    est_time=2410,
     suite="nightly-tpu-perf-deepseek-r1-0528",
     nightly=True,
     labels=["singlehost", "deepseek-r1-0528", "perf"],

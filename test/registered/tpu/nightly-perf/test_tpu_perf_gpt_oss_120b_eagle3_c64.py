@@ -18,7 +18,7 @@ from sglang.test.tpu import model_config_main
 # Longer than the non-speculative c64 file: bring-up also loads the draft model
 # and compiles the draft forward. Drives the JobSet poll budget.
 register_tpu_ci(
-    est_time=3000,
+    est_time=800,
     suite="nightly-tpu-perf-gpt-oss-120b-eagle3-c64",
     nightly=True,
     labels=["singlehost", "gpt-oss-120b", "perf", "spec", "eagle3"],

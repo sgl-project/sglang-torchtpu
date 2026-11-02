@@ -20,7 +20,7 @@ from sglang.test.tpu import model_config_main
 # decode bucket compiles slower and the KV pool is 4x. Drives the JobSet poll
 # budget, so an under-estimate kills the run.
 register_tpu_ci(
-    est_time=2400,
+    est_time=860,
     suite="nightly-tpu-perf-gpt-oss-120b-c64",
     nightly=True,
     labels=["singlehost", "gpt-oss-120b", "perf"],

@@ -14,7 +14,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
 
 register_tpu_ci(
-    est_time=7200,
+    est_time=3170,
     suite="nightly-tpu-4-v7",
     nightly=True,
     labels=["singlehost", "qwen3-vl-8b", "spec", "eagle3", "multimodal"],
