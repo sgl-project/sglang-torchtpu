@@ -126,7 +126,14 @@ class TestSPMDSafe(CustomTestCase):
                         sorted(w["rank"] for w in workers), list(range(world_size))
                     )
                     for record in workers:
-                        self.assertEqual(record["keys"], [_KEY])
+                        self.assertIn(_KEY, record["keys"])
+                        helper_keys = [
+                            key
+                            for key in record["keys"]
+                            if key.startswith("__main__._scale:")
+                        ]
+                        self.assertEqual(len(helper_keys), 1)
+                        self.assertEqual(len(record["keys"]), 2)
                         self.assertEqual(record["passed"], matching)
                         group_size = (
                             world_size // 2
@@ -260,12 +267,20 @@ def _run_shared_checks(group) -> None:
         get_context().override_server_args(
             use_spmd_compile=True, tpu_compile_tracer="direct"
         ),
+        envs.SGLANG_DIRECT_COMPILE_ASYNC.override(False),
     ):
-        with collect_warmups(group=group):
-            for factor in factors:
-                warmup_compiled_op(_scale, base, factor)
+        # Unequal local caches must not change the graph inventory or owner order.
+        if rank == 0:
+            _scale(base, 2)
+        _SCALED_TRACES.clear()
+        for _ in range(2):
+            with collect_warmups(group=group):
+                for factor in factors:
+                    warmup_compiled_op(
+                        _scale, make_args=lambda: ((base,), {"factor": factor})
+                    )
         # Owners are assigned round-robin in warmup order.
-        checks.assertEqual(_SCALED_TRACES, [2, 3][rank : rank + 1])
+        checks.assertEqual(_SCALED_TRACES, [2, 3][rank : rank + 1] * 2)
         for factor in factors:
             checks.assertTrue(
                 torch.equal(_scale(base, factor).cpu(), base.cpu() * factor)
@@ -362,8 +377,26 @@ def _run_worker(mode: str) -> None:
             spmd_safe=True,
             lift_rank=False,
         )
-        with get_context().override_server_args(use_spmd_compile=True):
+
+        def unused_inputs():
+            raise AssertionError("Unshared warmup inputs must not be constructed")
+
+        with (
+            get_context().override_server_args(
+                use_spmd_compile=True, tpu_compile_tracer="direct"
+            ),
+            envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
+            envs.SGLANG_DIRECT_COMPILE_ASYNC.override(False),
+        ):
             with collect_warmups(group=group) as queue:
+                warmup_compiled_op(compiled_op()(forward), make_args=unused_inputs)
+                warmup_compiled_op(
+                    _scale,
+                    make_args=lambda: (
+                        (torch.ones((128, 128)).to("tpu"),),
+                        {"factor": 2},
+                    ),
+                )
                 queue.calls.append(compiled.warmup_async(value))
         raise AssertionError("Verification must exit before warmup execution")
     finally:

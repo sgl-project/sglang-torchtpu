@@ -234,6 +234,88 @@ def _make_pruning_function(model, kv_pool, callback_values, **compile_options):
 
 
 class TestDirectCompile(CustomTestCase):
+    def test_lazy_helper_warmup_preserves_shared_queue_participation(self):
+        for verify, shared in ((False, False), (True, False), (True, True)):
+            with self.subTest(verify=verify, shared=shared):
+                queue = SimpleNamespace(verify=verify, spmd_compiler=object(), calls=[])
+                compiled = MagicMock()
+                compiled.cache = {}
+                compiled.precompile.return_value = PendingCall(lambda: None)
+                factory = MagicMock(return_value=((torch.ones(2),), {"factor": 3}))
+
+                def scale(value, factor):
+                    return value * factor
+
+                def build(fn, **options):
+                    compiled.cache[options["specialization_key"](torch.ones(2), 3)] = (
+                        object()
+                    )
+                    return compiled
+
+                op = compiled_op(spmd_safe=shared)(scale)
+                with (
+                    patch(
+                        "sglang.srt.compilation.compiled_op.is_tpu", return_value=True
+                    ),
+                    patch(
+                        "sglang.srt.compilation.compiled_op.current_warmup_queue",
+                        return_value=queue,
+                    ),
+                    patch(
+                        "sglang.srt.compilation.compiled_op.direct_compile",
+                        side_effect=build,
+                    ) as compile_fn,
+                    get_context().override_server_args(tpu_compile_tracer="direct"),
+                    envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
+                    envs.SGLANG_DIRECT_COMPILE_ASYNC.override(False),
+                ):
+                    for _ in range(2):
+                        warmup_compiled_op(op, make_args=factory)
+                    self.assertEqual(
+                        factory.call_count, 0 if verify and not shared else 2
+                    )
+                    self.assertEqual(
+                        compile_fn.call_count, 0 if verify and not shared else 1
+                    )
+                    self.assertEqual(compiled.precompile.call_count, 2 if shared else 0)
+                    if shared:
+                        self.assertTrue(
+                            compiled.precompile.call_args.kwargs["async_compile"]
+                        )
+                    # Verification must never suppress ordinary helper execution.
+                    op(torch.ones(2), 3)
+                    compiled.assert_called_once()
+
+        with self.assertRaisesRegex(ValueError, "either make_args"):
+            warmup_compiled_op(op, torch.ones(2), make_args=factory)
+
+    def test_verification_skips_only_unshared_warmups(self):
+        for verify, shared in ((False, False), (True, False), (True, True)):
+            with self.subTest(verify=verify, shared=shared):
+                compiled = direct_compile.direct_compile(
+                    lambda value: value + 1,
+                    specialization_key=lambda value: tuple(value.shape),
+                    name="test/model.forward",
+                    spmd_safe=shared,
+                )
+                queue = SimpleNamespace(verify=verify, spmd_compiler=object())
+                with (
+                    patch.object(
+                        direct_compile, "current_warmup_queue", return_value=queue
+                    ),
+                    patch.object(compiled, "_get_artifact") as get_artifact,
+                ):
+                    value = torch.ones(2)
+                    compiled.warmup_async(value).wait()
+                    compiled.precompile(value).wait()
+                    compiled.precompile(value, async_compile=True).wait()
+                    self.assertEqual(
+                        get_artifact.call_count, 0 if verify and not shared else 3
+                    )
+                    get_artifact.reset_mock()
+                    compiled(value)
+                    get_artifact.assert_called_once()
+
     def test_random_compiled_op_warmup_preserves_rng(self):
         torch_compile = torch.compile
 

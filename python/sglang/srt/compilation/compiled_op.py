@@ -110,12 +110,17 @@ def compiled_op(
         specialization_key = functools.partial(_specialization_key, spmd_safe)
 
         @functools.wraps(fn)
-        def wrapper(*args, _warmup_async=False, **kwargs):
+        def wrapper(*args, _warmup_async=False, _make_warmup_args=None, **kwargs):
             nonlocal compiled_fn, use_direct
             if torch.compiler.is_compiling():
                 return fn(*args, **kwargs)
             if not is_tpu() or not envs.SGLANG_ENABLE_TORCH_COMPILE.get():
                 return None if _warmup_async else fn(*args, **kwargs)
+            queue = current_warmup_queue() if _warmup_async else None
+            if queue is not None and queue.verify and not spmd_safe:
+                return None
+            if _make_warmup_args is not None:
+                args, kwargs = _make_warmup_args()
             # Positional warmups and keyword callers share a specialization.
             bound = signature.bind(*args, **kwargs)
             bound.apply_defaults()
@@ -136,11 +141,18 @@ def compiled_op(
                         fn, backend="tpu", fullgraph=True, dynamic=False
                     )
             if use_direct and _warmup_async:
-                if specialization_key(*args, **kwargs) in compiled_fn.cache:
+                shared = (
+                    spmd_safe and queue is not None and queue.spmd_compiler is not None
+                )
+                # Every shared queue needs participation even when local caches differ.
+                if (
+                    not shared
+                    and specialization_key(*args, **kwargs) in compiled_fn.cache
+                ):
                     return None
                 return compiled_fn.precompile(
                     *args,
-                    async_compile=envs.SGLANG_DIRECT_COMPILE_ASYNC.get(),
+                    async_compile=shared or envs.SGLANG_DIRECT_COMPILE_ASYNC.get(),
                     **kwargs,
                 )
             if _warmup_async and uses_rng:
@@ -173,8 +185,22 @@ def compiled_op(
     return decorator
 
 
-def warmup_compiled_op(op: Callable, *args, **kwargs) -> None:
-    """Submit output-free warmup to the current queue, or finish immediately."""
+def warmup_compiled_op(
+    op: Callable,
+    *args,
+    make_args: Callable[[], tuple[tuple[Any, ...], dict[str, Any]]] | None = None,
+    **kwargs,
+) -> None:
+    """Submit output-free warmup to the current queue, or finish immediately.
+
+    ``make_args`` returns ``(args, kwargs)`` only if the helper needs warming.
+    Use it instead of eager inputs to avoid allocations for unshared helpers
+    during SPMD verification. The factory runs synchronously on submission.
+    """
+    if make_args is not None and (args or kwargs):
+        raise ValueError("Pass either make_args or warmup arguments, not both")
+    if make_args is not None:
+        kwargs["_make_warmup_args"] = make_args
     pending = op(*args, _warmup_async=True, **kwargs)
     if pending is not None:
         queue = current_warmup_queue()

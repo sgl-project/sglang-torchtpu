@@ -1,12 +1,19 @@
 import sys
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
+from sglang.srt.compilation.compiled_op import RegisteredCompiledOp, compiled_op
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.dflash_utils_tpu import (
     dflash_verify_bookkeeping_torch,
 )
+from sglang_tpu.spec_op_precompile import precompile_spec_v2_ops
 from sglang_tpu.spec_op_warmup import (
     SpecOpWarmupContext,
     make_dflash_verify_bookkeeping_args,
@@ -16,6 +23,50 @@ from sglang_tpu.spec_op_warmup import (
 )
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def test_verification_builds_only_shared_registered_inputs():
+    queue = SimpleNamespace(
+        verify=True, spmd_compiler=object(), calls=[], completions=[]
+    )
+    unshared_args = MagicMock(side_effect=AssertionError("unshared inputs allocated"))
+    shared_args = MagicMock(side_effect=lambda context: (context.physical_bs,))
+    ops = (
+        RegisteredCompiledOp(compiled_op()(lambda value: value), unshared_args),
+        RegisteredCompiledOp(
+            compiled_op(spmd_safe=True)(lambda value: value), shared_args
+        ),
+    )
+    compiled = MagicMock()
+    compiled.cache = {}
+    compiled.precompile.side_effect = lambda *args, **kwargs: PendingCall(lambda: None)
+    with (
+        patch("sglang_tpu.spec_op_precompile.get_compiled_ops", return_value=ops),
+        patch("sglang_tpu.spec_op_precompile.current_warmup_queue", return_value=queue),
+        patch(
+            "sglang.srt.compilation.compiled_op.current_warmup_queue",
+            return_value=queue,
+        ),
+        patch("sglang.srt.compilation.compiled_op.is_tpu", return_value=True),
+        patch(
+            "sglang.srt.compilation.compiled_op.direct_compile", return_value=compiled
+        ),
+        get_context().override_server_args(tpu_compile_tracer="direct"),
+        envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
+    ):
+        precompile_spec_v2_ops(
+            device=torch.device("tpu"),
+            physical_batch_buckets=[1, 4],
+            num_verify_tokens=3,
+            vocab_size=8,
+            draft_vocab_size=5,
+            hidden_size=6,
+            hidden_dtype=torch.bfloat16,
+        )
+    unshared_args.assert_not_called()
+    assert [call.args[0].physical_bs for call in shared_args.call_args_list] == [1, 4]
+    assert [call.args for call in compiled.precompile.call_args_list] == [(1,), (4,)]
+    assert len(queue.calls) == 2
 
 
 def test_warmup_inputs_match_physical_helper_shapes():
