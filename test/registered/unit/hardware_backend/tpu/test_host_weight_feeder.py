@@ -18,7 +18,7 @@ from sglang.srt.configs.load_config import LoadFormat
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu import weight_feeder as host_weight_feeder
 from sglang_tpu.hooks.host_weight_feeder import weight_feeder_load_local_weights
-from sglang_tpu.weight_feeder import feeder
+from sglang_tpu.weight_feeder import _every_rank_loads_each_checkpoint, feeder
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -96,6 +96,12 @@ class TestHostWeightFeeder(unittest.TestCase):
         )
         environment_patch.start()
         self.addCleanup(environment_patch.stop)
+        # Every rank loads each checkpoint unless a test sets up parallelism itself.
+        ranks_patch = patch.object(
+            host_weight_feeder, "_every_rank_loads_each_checkpoint", return_value=True
+        )
+        ranks_patch.start()
+        self.addCleanup(ranks_patch.stop)
 
     def _filesystem_type(self, path: str) -> str:
         with patch("builtins.open", mock_open(read_data=self.MOUNTS)):
@@ -346,15 +352,18 @@ class TestHostWeightFeeder(unittest.TestCase):
             safetensors.torch.save_file(tensors, paths[-1])
         return tmp, expected, paths
 
-    def test_every_engine_prefetch_targets_the_first_load_of_its_ranks(self):
+    def test_each_engine_launch_feeds_the_first_load_of_its_own_ranks(self):
+        """A relaunch with the same PID must not open an earlier launch's staging."""
         tmp, _, paths = self._write_checkpoint()
         staging_root = os.path.join(tmp, "staging")
+        rank_paths = []
         with (
             patch.object(host_weight_feeder, "_STAGING_ROOT", staging_root),
             patch.object(
                 host_weight_feeder, "_checkpoint_shard_paths", lambda path: paths
             ),
             patch.object(host_weight_feeder, "_WeightFeederProcess") as process,
+            patch.dict(os.environ),
             _engine_on_local_path(tmp, NUM_RANKS),
         ):
             process.return_value.finish.side_effect = lambda: shutil.rmtree(
@@ -364,11 +373,47 @@ class TestHostWeightFeeder(unittest.TestCase):
                 host_weight_feeder.start_weight_prefetch()
                 while os.listdir(staging_root):
                     time.sleep(0.01)
-            rank = host_weight_feeder._open_staging_dir(
-                host_weight_feeder._rotate_shards_for_host(paths), os.getpid(), 0
-            )
+                # Ranks of a new launch count their loads from zero.
+                with patch.dict(host_weight_feeder._checkpoint_load_counts, clear=True):
+                    rank = host_weight_feeder._open_staging_dir(
+                        host_weight_feeder._rotate_shards_for_host(paths),
+                        os.getpid(),
+                        0,
+                    )
+                rank_paths.append(rank.path)
+                shutil.rmtree(rank.path)
         engine_paths = [call.args[0].path for call in process.call_args_list]
-        self.assertEqual(engine_paths, [rank.path, rank.path])
+        self.assertEqual(engine_paths, rank_paths)
+        self.assertNotEqual(rank_paths[0], rank_paths[1])
+
+    def test_orphan_sweep_keeps_staging_whose_owner_lock_is_held(self):
+        """An engine in another PID namespace looks dead but still owns its load."""
+        staging_root = tempfile.mkdtemp(dir="/dev/shm")
+        self.addCleanup(shutil.rmtree, staging_root, ignore_errors=True)
+        # No process has this PID, as in a namespace this process cannot see.
+        staging = feeder.StagingDir(os.path.join(staging_root, "999999999-x-0-k-0"))
+        os.makedirs(staging.path)
+        with patch.object(host_weight_feeder, "_STAGING_ROOT", staging_root):
+            lock_fd = host_weight_feeder._try_acquire_owner_lock(staging)
+            host_weight_feeder._remove_orphaned_staging()
+            self.assertTrue(os.path.exists(staging.path))
+            os.close(lock_fd)
+            host_weight_feeder._remove_orphaned_staging()
+            self.assertFalse(os.path.exists(staging.path))
+
+    def test_ranks_share_staging_only_if_all_load_each_checkpoint(self):
+        """Shard release waits for every local rank, so all must load the checkpoint."""
+        # Under PP only last-stage ranks load a speculative draft.
+        cases = {"plain": (1, None, True), "pp_with_draft": (2, "EAGLE", False)}
+        for name, (pp, draft, shared) in cases.items():
+            with (
+                self.subTest(name),
+                patch("sglang.srt.runtime_context.get_parallel") as get_parallel,
+                patch("sglang.srt.runtime_context.get_spec") as get_spec,
+            ):
+                get_parallel.return_value.pp_size = pp
+                get_spec.return_value.speculative_algorithm = draft
+                self.assertEqual(_every_rank_loads_each_checkpoint(), shared)
 
     def test_staging_on_disk_keeps_the_core_iterator(self):
         original = MagicMock(return_value=iter(()))

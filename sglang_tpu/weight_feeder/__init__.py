@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Callable, Generator, Iterator
 
 import safetensors
@@ -52,12 +53,38 @@ _OWNER_CHECK_INTERVAL_SECONDS = 2.0
 _checkpoint_load_counts: dict[str, int] = {}
 
 
+def _lock_is_held(lock_path: str) -> bool:
+    """Whether some process holds the flock of a lock file."""
+    try:
+        fd = os.open(lock_path, os.O_RDWR)
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
 def _remove_orphaned_staging() -> None:
-    """Delete staging left behind by engines that died."""
+    """Delete staging left behind by engines that died.
+
+    A held owner lock marks a running load, also of an engine in another PID
+    namespace, whose PID this process cannot see.
+    """
+    # shortcut: such an engine's staging can still go between its creation and
+    # owner lock, give staging a per-namespace root if engines share it that way.
     for entry in os.listdir(_STAGING_ROOT):
         engine_pid = entry.split("-", 1)[0]
-        if engine_pid.isdigit() and not os.path.exists(f"/proc/{engine_pid}"):
-            shutil.rmtree(os.path.join(_STAGING_ROOT, entry), ignore_errors=True)
+        path = os.path.join(_STAGING_ROOT, entry)
+        if (
+            engine_pid.isdigit()
+            and not os.path.exists(f"/proc/{engine_pid}")
+            and not _lock_is_held(StagingDir(path).lock_path)
+        ):
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def _filesystem_type(path: str) -> str:
@@ -84,12 +111,23 @@ def staging_is_memory_backed() -> bool:
     return on_tmpfs
 
 
+def _every_rank_loads_each_checkpoint() -> bool:
+    """Whether every rank of a host loads each checkpoint, as shard release expects."""
+    from sglang.srt.runtime_context import get_parallel, get_spec
+
+    # Under PP only last-stage ranks load a speculative draft.
+    return get_parallel().pp_size == 1 or not get_spec().speculative_algorithm
+
+
 def can_use_shared_staging(paths: list[str]) -> bool:
-    """Whether staging is usable and can hold the largest shard.
+    """Whether ranks can share staging, and staging can hold the largest shard.
 
     Uses the total size, not free space, so that the engine and ranks of a host agree.
     """
     if not staging_is_memory_backed():
+        return False
+    if not _every_rank_loads_each_checkpoint():
+        logger.info("Not every rank of this host loads each checkpoint, so read alone")
         return False
     try:
         os.makedirs(_STAGING_ROOT, exist_ok=True)
@@ -153,7 +191,11 @@ def _open_staging_dir(
         _checkpoint_load_counts[key] = sequence + 1
     os.makedirs(_STAGING_ROOT, exist_ok=True)
     _remove_orphaned_staging()
-    name = f"{engine_pid}-{_engine_replica_key(replica)}-{key}-{sequence}"
+    # The launch id keeps a relaunched engine with the same PID out of the
+    # staging of an earlier, possibly failed, launch.
+    launch_id = envs.SGLANG_TPU_WEIGHT_FEEDER_LAUNCH_ID.get()
+    replica_key = _engine_replica_key(replica)
+    name = f"{engine_pid}-{launch_id}-{replica_key}-{key}-{sequence}"
     staging = StagingDir(os.path.join(_STAGING_ROOT, name))
     os.makedirs(staging.path, exist_ok=True)
     return staging
@@ -179,14 +221,7 @@ def _try_acquire_owner_lock(staging: StagingDir) -> int | None:
 
 def _owner_is_gone(staging: StagingDir) -> bool:
     """Whether the feeder's owner has exited, which releases its lock."""
-    fd = os.open(staging.lock_path, os.O_RDWR)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        return False
-    finally:
-        os.close(fd)
-    return True
+    return not _lock_is_held(staging.lock_path)
 
 
 class _WeightFeederProcess:
@@ -422,6 +457,8 @@ def start_weight_prefetch() -> None:
     """
     from sglang.srt.runtime_context import get_model, get_parallel, get_server_args
 
+    # Ranks inherit this id, so each launch stages in its own directories.
+    envs.SGLANG_TPU_WEIGHT_FEEDER_LAUNCH_ID.set(uuid.uuid4().hex[:12])
     model_path = get_model().model_path
     if not _can_prefetch_weights(model_path):
         return
@@ -430,8 +467,6 @@ def start_weight_prefetch() -> None:
         return
     uris = _rotate_shards_for_host(shards)
     # New ranks count their loads from zero, however many engines came before.
-    # shortcut: a relaunch during a running feeder shares its directory, add a
-    # launch id if engines restart mid-load.
     staging = _open_staging_dir(uris, os.getpid(), replica=0, sequence=0)
     lock_fd = _try_acquire_owner_lock(staging)
     if lock_fd is None:

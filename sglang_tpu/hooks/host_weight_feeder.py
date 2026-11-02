@@ -32,6 +32,9 @@ def weight_feeder_load_local_weights(
     enabled = envs.SGLANG_TPU_WEIGHT_FEEDER_ENABLED.get()
     if hf_weights_files and enabled and can_use_shared_staging(hf_weights_files):
         logger.info("Loading %d local shards through the weight feeder", num_shards)
+        if kwargs.get("local_expert_range") is not None:
+            # Staged shards load faster than EP-local reads from the checkpoint.
+            logger.info("The weight feeder reads every expert, not only local ones")
         return shared_weights_iterator(
             hf_weights_files, lambda files: original(files, *args, **kwargs)
         )
