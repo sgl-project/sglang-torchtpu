@@ -22,6 +22,7 @@ Environment:
     K3_PROGRAM_SCHEDULE_POLICY      lpm (default) or fcfs
     K3_PROGRAM_PREFILL_SHARE        prefill's share of the engine while
                                     requests decode (0: the fixed interval)
+    K3_PROGRAM_KERNEL_EXTRA         more kernel settings (a=b;c=d)
     SGLANG_TPU_K3_PROGRAM_PRESHARDED pre-sharded weights directory
 """
 
@@ -132,10 +133,18 @@ runtime_env.update(
         # layout (the decode runs it as half experts); 8, the pre-shard's,
         # leaves the prefill on the unfused MoE (about 5x slower). More
         # concurrent ranges per file, reading the pre-shard from GCS.
-        "SGLANG_TPU_K3_PROGRAM_KERNEL_CONFIG": (
-            "prefill_expert_parallel={ep};decode_expert_parallel={ep};"
-            "read_streams=16"
-        ).format(ep=os.environ.get("K3_PROGRAM_EXPERT_PARALLEL", "16")),
+        "SGLANG_TPU_K3_PROGRAM_KERNEL_CONFIG": ";".join(
+            filter(
+                None,
+                (
+                    "prefill_expert_parallel={ep};decode_expert_parallel={ep};"
+                    "read_streams=16".format(
+                        ep=os.environ.get("K3_PROGRAM_EXPERT_PARALLEL", "16")
+                    ),
+                    os.environ.get("K3_PROGRAM_KERNEL_EXTRA"),
+                ),
+            )
+        ),
         "SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS": TAILS,
         "SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS": "7:3.78,3:2.87",
         "SGLANG_TPU_K3_PROGRAM_SPEC_SCHEDULE": "1:1:7,2:16:3,17:64:0",

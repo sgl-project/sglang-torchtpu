@@ -24,6 +24,7 @@ Environment:
                                     sweep) or bf16
     K3_PROGRAM_DECODE_RUNNING       the decode's running requests (default
                                     twice the concurrency, up to 64)
+    K3_PROGRAM_KERNEL_EXTRA         more kernel settings (a=b;c=d)
     SGLANG_TPU_K3_PROGRAM_PRESHARDED pre-sharded weights directory
 """
 
@@ -178,7 +179,10 @@ runtime_env.update(
         "SGLANG_TPU_K3_PROGRAM_SPEC_SCHEDULE": "1:1:7,2:16:3,17:64:0",
         # Overlap scheduling on the decode (the prefill stays synchronous).
         "SGLANG_TPU_K3_PROGRAM_OPT_OVERLAP": os.environ.get("K3_PROGRAM_OVERLAP", "1"),
-        # Reading the pre-shard from GCS (gcsfuse): more concurrent ranges per file.
-        "SGLANG_TPU_K3_PROGRAM_KERNEL_CONFIG": "read_streams=16",
+        # Reading the pre-shard from GCS (gcsfuse): more concurrent ranges per
+        # file; K3_PROGRAM_KERNEL_EXTRA appends kernel settings (a=b;c=d).
+        "SGLANG_TPU_K3_PROGRAM_KERNEL_CONFIG": ";".join(
+            filter(None, ("read_streams=16", os.environ.get("K3_PROGRAM_KERNEL_EXTRA")))
+        ),
     }
 )
