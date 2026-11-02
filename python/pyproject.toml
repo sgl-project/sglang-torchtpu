@@ -222,6 +222,7 @@ tpu_hooks = "sglang_tpu.hooks:register"
 [project.scripts]
 sglang = "sglang.cli.main:main"
 killall_sglang = "sglang.cli.killall:main"
+sglang-tpu-roofline = "sglang.srt.hardware_backend.tpu.roofline.cli:main"
 
 [tool.setuptools.package-data]
 "sglang" = [

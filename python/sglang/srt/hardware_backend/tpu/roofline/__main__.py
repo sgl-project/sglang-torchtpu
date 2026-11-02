@@ -16,21 +16,7 @@
 
 from __future__ import annotations
 
-import json
-import sys
-
-from .chips import CHIPS, TOPOLOGIES
-
-
-def main() -> int:
-    """Print available TPU chip specs and topologies when CLI is not yet installed."""
-    payload = {
-        "chips": sorted(CHIPS),
-        "topologies": sorted(TOPOLOGIES),
-    }
-    sys.stdout.write(json.dumps(payload) + "\n")
-    return 0
-
+from .cli import main
 
 if __name__ == "__main__":
     raise SystemExit(main())
