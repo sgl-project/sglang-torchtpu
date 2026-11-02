@@ -102,7 +102,7 @@ def decode_options(batch_size: int) -> dict:
     routed reduce-scatter); the MLA cache tile is the whole batch up to B8, 4
     below B32, 2 from B32."""
     dp = kernel_config.active().attention_dp
-    scatter = dp > 1 or batch_size in (8, 12, 16, 20, 24, 28, 32, 48, 64, 96, 128)
+    scatter = dp > 1 or batch_size in (8, 12, 16, 20, 24, 28, 32, 48, 64, 80, 96, 128)
     tile = (
         batch_size
         if batch_size <= 8
@@ -131,7 +131,7 @@ def decode_options(batch_size: int) -> dict:
         "attention_token_scatter": scatter,
         "moe_token_scatter_output": scatter,
         "moe_routed_reduce_scatter": batch_size
-        in (6, 8, 12, 16, 20, 24, 28, 32, 48, 64, 96, 128),
+        in (6, 8, 12, 16, 20, 24, 28, 32, 48, 64, 80, 96, 128),
         "sequence_parallel_pre_attention": scatter,
     }
 
@@ -488,7 +488,7 @@ class DecodeOps:
     def _compiler_options(rows: int) -> dict[str, str]:
         config = kernel_config.active()
         dp_rows = rows in (2, 4) and config.attention_dp > 1
-        if (rows in (8, 16, 24, 32, 48, 64, 96, 128) or dp_rows) and config.decode_no_hlo_calls:
+        if (rows in (8, 16, 24, 32, 48, 64, 80, 96, 128) or dp_rows) and config.decode_no_hlo_calls:
             return {"xla_tpu_enable_deduplicated_calls": "DISABLED"}
         return {}
 

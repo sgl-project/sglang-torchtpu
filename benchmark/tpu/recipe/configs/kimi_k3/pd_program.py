@@ -176,7 +176,9 @@ runtime_env.update(
         # (e.g. B8 1034 vs 851 tok/s, B16 1274 vs 995 at 131k context). Past
         # sixteen, plain steps (no wider three-draft verify compiles; vLLM's
         # schedule carries the last range's count into the tail).
-        "SGLANG_TPU_K3_PROGRAM_SPEC_SCHEDULE": "1:1:7,2:16:3,17:64:0",
+        "SGLANG_TPU_K3_PROGRAM_SPEC_SCHEDULE": os.environ.get(
+            "K3_PROGRAM_SPEC_SCHEDULE", "1:1:7,2:16:3,17:64:0"
+        ),
         # Overlap scheduling on the decode (the prefill stays synchronous).
         "SGLANG_TPU_K3_PROGRAM_OPT_OVERLAP": os.environ.get("K3_PROGRAM_OVERLAP", "1"),
         # Reading the pre-shard from GCS (gcsfuse): more concurrent ranges per

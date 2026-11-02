@@ -22,7 +22,7 @@ BLOCK_SIZE = 256
 HIDDEN_SIZE = 7168
 VOCAB = 163840  # tokens; vocabulary-sharded 5120 per TP rank
 DRAFT_TOKENS = 7  # DSpark: the verify is the anchor and 7 drafts
-SPEC_BATCHES = (1, 2, 4, 6, 8, 12, 16)  # the batched speculation's compiled request counts
+SPEC_BATCHES = (1, 2, 4, 6, 8, 12, 16, 20, 24)  # the batched speculation's compiled request counts
 # Attention DP2's compiled request counts: half of each are one group's.
 DP_SPEC_BATCHES = (2, 4, 8, 16, 32)
 MAX_STEP_TOKENS = 8192  # the prefill's largest window

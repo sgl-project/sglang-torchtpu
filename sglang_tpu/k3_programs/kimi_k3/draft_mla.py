@@ -488,7 +488,11 @@ class MlaDsparkDraft:
         share = requests // dp
         per = min(requests, MAX_ROWS // rows_per) // dp
         return [
-            tuple(g * share + first + i for g in range(dp) for i in range(per))
+            tuple(
+                g * share + first + i
+                for g in range(dp)
+                for i in range(min(per, share - first))
+            )
             for first in range(0, share, per)
         ]
 
