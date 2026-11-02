@@ -38,13 +38,13 @@ Usage:
 
 from __future__ import annotations
 
-from sglang.test.ci.ci_register import register_tpu_ci
-
-register_tpu_ci(est_time=100, suite="stage-a-test-tpu-unit", chips=1)
-
+import math
 import unittest
 
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_tpu_ci(est_time=300, suite="stage-a-test-tpu-unit", chips=1)
 
 
 def _has_jax() -> bool:
@@ -325,6 +325,113 @@ def gdn_attention_spec_ref(
         output = output.at[start:end].set(out_seq.reshape(query_len, n_v * d_v))
 
     return (new_conv_state, new_recurrent_state), output
+
+
+_SERVED_GDN_HEADS = ((2, 8), (8, 32), (16, 64))
+_SERVED_KDA_HEADS = ((3, 3), (12, 12), (4, 4), (32, 32))
+_TOKEN_BUCKETS = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+_SLOT_COUNTS = (8, 16, 32, 64, 128, 256, 384, 512)
+
+
+def _reachable_tile_batches(
+    n_kq: int,
+    n_v: int,
+    state_dtype,
+    window: int,
+    attention_mode=None,
+) -> list[dict]:
+    """One batch per reachable decode or mixed tile size across serving buckets."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    from sglang_tpu.attention.pallas.gdn import compute_gdn, config, tiling
+
+    if attention_mode is None:
+        attention_mode = config.AttentionMode.GDN
+    d_k = d_v = 128
+    kernel_size = 4
+    dim = 2 * n_kq * d_k + n_v * d_v
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    batch_align = math.lcm(2, compute_gdn.INVERT_BLOCK)
+    decode_limit = config.GDNConfig.get_vmem_limit_bytes(window)
+    mixed_limit = config.GDNConfig.get_vmem_limit_bytes(1)
+
+    seen_decode: set[int] = set()
+    seen_mixed: set[int] = set()
+    batches = []
+    for batch_size in _TOKEN_BUCKETS:
+        for num_seqs in _SLOT_COUNTS:
+            if batch_size <= window:
+                continue
+            padded = pl.cdiv(batch_size, batch_align) * batch_align
+            dec, mix = tiling.get_tile_sizes(
+                batch_size=batch_size,
+                num_seqs=num_seqs,
+                padded_batch_size=padded,
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                conv_state_dim_size=dim,
+                act_out_dtype=jnp.dtype(jnp.bfloat16),
+                recurrent_state_dtype=jnp.dtype(state_dtype),
+                num_lanes=num_lanes,
+                decode_vmem_limit_bytes=decode_limit,
+                mixed_vmem_limit_bytes=mixed_limit,
+                window_size=window,
+                attention_mode=attention_mode,
+            )
+            if (dec in seen_decode and mix in seen_mixed) or (
+                window > 1 and len(batches) > 0 and dec in seen_decode
+            ):
+                continue
+            batched_only = (mix in seen_mixed) or (window > 1 and len(batches) > 0)
+            prefill_only = (dec in seen_decode) and not batched_only
+            seen_decode.add(dec)
+            seen_mixed.add(mix)
+            if batched_only:
+                num_decode = min(num_seqs, batch_size // window)
+                lengths = [window] * num_decode + [0] * (num_seqs - num_decode)
+                distribution = [num_decode, num_decode, num_decode]
+            elif prefill_only:
+                lengths = [batch_size] + [0] * (num_seqs - 1)
+                distribution = [0, 1, 1]
+            else:
+                lengths = [window, batch_size - window] + [0] * (num_seqs - 2)
+                distribution = [1, 2, 2]
+            batches.append(
+                dict(
+                    max_reqs=num_seqs,
+                    lengths=lengths,
+                    q_loc=[0, *np.cumsum(lengths)],
+                    distribution=distribution,
+                    batched_only=batched_only,
+                    prefill_only=prefill_only,
+                )
+            )
+    assert batches, f"No reachable tile pairs for n_v={n_v}, window={window}"
+    return batches
+
+
+def _active_state_slots(
+    state_indices,
+    distribution,
+    lengths,
+    num_valid_seqs: int,
+    num_spec_tokens: int,
+):
+    """Return active conv and recurrent state slot indices as an int32 JAX array."""
+    active_slots = []
+    if num_spec_tokens > 0:
+        for i in range(int(distribution[0])):
+            base = int(state_indices[i])
+            active_slots.extend(base + t for t in range(int(lengths[i])))
+        for i in range(int(distribution[0]), num_valid_seqs):
+            active_slots.append(int(state_indices[i]))
+    else:
+        active_slots = [int(state_indices[i]) for i in range(num_valid_seqs)]
+    return jnp.asarray(active_slots, dtype=jnp.int32)
 
 
 @unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
@@ -940,6 +1047,1102 @@ class TestGDNAttentionV3(CustomTestCase):
                         atol=1e-2,
                         err_msg=f"rep={rep} seq={s} {name} checkpoints",
                     )
+
+    def test_dynamic_tiling_with_mixed_and_decode_parity(self):
+        """Dynamic tile sizing matches explicit static tile overrides on TPU."""
+        from sglang_tpu.attention.pallas.gdn import wrapper
+
+        d_k, d_v = self.KQ_HEAD_DIM, self.V_HEAD_DIM
+        kernel_size = self.KERNEL_SIZE
+
+        for n_kq, n_v, decode_Lens, prefill_lens in (
+            (2, 8, [1] * 16, [128, 64]),
+            (8, 32, [1] * 8, [128]),
+            (16, 64, [1] * 4, [64]),
+        ):
+            with self.subTest(n_kq=n_kq, n_v=n_v):
+                lengths = decode_Lens + prefill_lens
+                num_decode = len(decode_Lens)
+                num_seqs = len(lengths)
+                num_tokens = sum(lengths)
+                q_loc = jnp.array(
+                    np.concatenate([[0], np.cumsum(lengths)]), dtype=jnp.int32
+                )
+                distribution = jnp.array(
+                    [num_decode, num_seqs, num_seqs], dtype=jnp.int32
+                )
+                state_indices = jnp.arange(1, num_seqs + 1, dtype=jnp.int32)
+                num_blocks = num_seqs + 1
+                dim = 2 * n_kq * d_k + n_v * d_v
+
+                rngs = iter(jax.random.split(jax.random.key(42 + n_v), 10))
+                qkv = jax.random.normal(
+                    next(rngs), (num_tokens, dim), dtype=jnp.bfloat16
+                )
+                b = jax.random.normal(next(rngs), (num_tokens, n_v), dtype=jnp.bfloat16)
+                a = jax.random.normal(next(rngs), (num_tokens, n_v), dtype=jnp.bfloat16)
+                conv_state = jax.random.normal(
+                    next(rngs),
+                    (num_blocks, kernel_size - 1, dim),
+                    dtype=jnp.bfloat16,
+                )
+                rec_state = jax.random.normal(
+                    next(rngs),
+                    (num_blocks, n_v, d_k, d_v),
+                    dtype=jnp.float32,
+                )
+                conv_weight = jax.random.normal(
+                    next(rngs), (dim, 1, kernel_size), dtype=jnp.bfloat16
+                )
+                conv_bias = jax.random.normal(next(rngs), (dim,), dtype=jnp.bfloat16)
+                a_log = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+                dt_bias = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+                seq_lens = jnp.array(
+                    [16 + length for length in decode_Lens] + prefill_lens,
+                    dtype=jnp.int32,
+                )
+
+                common = dict(
+                    qkv=qkv,
+                    b=b,
+                    a=a,
+                    conv_weight=conv_weight,
+                    conv_bias=conv_bias,
+                    a_log=a_log,
+                    dt_bias=dt_bias,
+                    query_start_loc=q_loc,
+                    state_indices=state_indices,
+                    distribution=distribution,
+                    seq_lens=seq_lens,
+                    n_kq=n_kq,
+                    n_v=n_v,
+                    d_k=d_k,
+                    d_v=d_v,
+                    kernel_size=kernel_size,
+                )
+                (conv_dyn, rec_dyn), out_dyn = wrapper.fused_conv1d_gdn(
+                    conv_state=conv_state.copy(),
+                    recurrent_state=rec_state.copy(),
+                    **common,
+                )
+                (conv_stat, rec_stat), out_stat = wrapper.fused_conv1d_gdn(
+                    conv_state=conv_state.copy(),
+                    recurrent_state=rec_state.copy(),
+                    decode_tile_size=min(4, 64 // n_v),
+                    mixed_tile_size=64,
+                    **common,
+                )
+                np.testing.assert_allclose(out_dyn, out_stat, rtol=1e-2, atol=1e-2)
+                np.testing.assert_allclose(conv_dyn, conv_stat, rtol=1e-2, atol=1e-2)
+                np.testing.assert_allclose(rec_dyn, rec_stat, rtol=1e-2, atol=1e-2)
+
+    def test_gdn_v3_dynamic_tiling_spec_verify_matches_static(self):
+        """SPEC verify with dynamic decode tile (>1) matches static tile=1."""
+        from sglang_tpu.attention.pallas.gdn import wrapper
+
+        n_kq, n_v = 2, 8
+        d_k = d_v = 128
+        kernel_size = 4
+        num_spec_tokens = 3
+        window = num_spec_tokens + 1
+        spec_lengths = [4, 3, 2, 4, 1, 3, 4, 2]
+        prefill_lengths = [64]
+        lengths = spec_lengths + prefill_lengths
+        num_spec_seqs = len(spec_lengths)
+        num_seqs = len(lengths)
+        num_tokens = sum(lengths)
+
+        q_loc = jnp.array(np.concatenate([[0], np.cumsum(lengths)]), dtype=jnp.int32)
+        distribution = jnp.array(
+            [num_spec_seqs, num_spec_seqs, num_seqs], dtype=jnp.int32
+        )
+        state_indices = jnp.array(
+            [1 + i * window for i in range(num_seqs)], dtype=jnp.int32
+        )
+        num_blocks = 1 + num_seqs * window
+        read_offsets = jnp.array(
+            [1, 0, 2, 3, 0, 1, 2, 0] + [0] * len(prefill_lengths),
+            dtype=jnp.int32,
+        )
+        seq_lens = jnp.array(
+            [20 + sl for sl in spec_lengths] + prefill_lengths, dtype=jnp.int32
+        )
+
+        dim = 2 * n_kq * d_k + n_v * d_v
+        rngs = iter(jax.random.split(jax.random.key(99), 10))
+        qkv = jax.random.normal(next(rngs), (num_tokens, dim), dtype=jnp.bfloat16)
+        b = jax.random.normal(next(rngs), (num_tokens, n_v), dtype=jnp.bfloat16)
+        a = jax.random.normal(next(rngs), (num_tokens, n_v), dtype=jnp.bfloat16)
+        conv_state = jax.random.normal(
+            next(rngs),
+            (num_blocks, kernel_size - 1, dim),
+            dtype=jnp.bfloat16,
+        )
+        rec_state = jax.random.normal(
+            next(rngs), (num_blocks, n_v, d_k, d_v), dtype=jnp.float32
+        )
+        conv_weight = jax.random.normal(
+            next(rngs), (dim, 1, kernel_size), dtype=jnp.bfloat16
+        )
+        conv_bias = jax.random.normal(next(rngs), (dim,), dtype=jnp.bfloat16)
+        a_log = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+        dt_bias = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+
+        common = dict(
+            qkv=qkv,
+            b=b,
+            a=a,
+            conv_weight=conv_weight,
+            conv_bias=conv_bias,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            query_start_loc=q_loc,
+            state_indices=state_indices,
+            distribution=distribution,
+            seq_lens=seq_lens,
+            read_offsets=read_offsets,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            num_spec_tokens=num_spec_tokens,
+        )
+        (conv_dyn, rec_dyn), out_dyn = wrapper.fused_conv1d_gdn(
+            conv_state=conv_state.copy(),
+            recurrent_state=rec_state.copy(),
+            **common,
+        )
+        (conv_stat, rec_stat), out_stat = wrapper.fused_conv1d_gdn(
+            conv_state=conv_state.copy(),
+            recurrent_state=rec_state.copy(),
+            decode_tile_size=1,
+            mixed_tile_size=64,
+            **common,
+        )
+        np.testing.assert_allclose(out_dyn, out_stat, rtol=1e-2, atol=1e-2)
+        np.testing.assert_allclose(conv_dyn, conv_stat, rtol=1e-2, atol=1e-2)
+        np.testing.assert_allclose(rec_dyn, rec_stat, rtol=1e-2, atol=1e-2)
+
+    def test_per_seq_boundary_read_after_write(self):
+        """Multi-sequence PER_SEQ batch where sequence boundary crosses tiles."""
+        from sglang_tpu.attention.pallas.gdn import wrapper
+
+        n_kq, n_v = 2, 8
+        d_k = d_v = 128
+        kernel_size = 4
+        lengths = [100, 150, 80]
+        num_seqs = len(lengths)
+        num_tokens = sum(lengths)
+        q_loc = jnp.array(np.concatenate([[0], np.cumsum(lengths)]), dtype=jnp.int32)
+        distribution = jnp.array([0, num_seqs, num_seqs], dtype=jnp.int32)
+        state_indices = jnp.arange(1, num_seqs + 1, dtype=jnp.int32)
+        num_blocks = num_seqs + 1
+        dim = 2 * n_kq * d_k + n_v * d_v
+
+        rngs = iter(jax.random.split(jax.random.key(77), 10))
+        qkv = jax.random.normal(next(rngs), (num_tokens, dim), dtype=jnp.bfloat16)
+        b = jax.random.normal(next(rngs), (num_tokens, n_v), dtype=jnp.bfloat16)
+        a = jax.random.normal(next(rngs), (num_tokens, n_v), dtype=jnp.bfloat16)
+        conv_state = jax.random.normal(
+            next(rngs),
+            (num_blocks, kernel_size - 1, dim),
+            dtype=jnp.bfloat16,
+        )
+        rec_state = jax.random.normal(
+            next(rngs), (num_blocks, n_v, d_k, d_v), dtype=jnp.float32
+        )
+        conv_weight = jax.random.normal(
+            next(rngs), (dim, 1, kernel_size), dtype=jnp.bfloat16
+        )
+        conv_bias = jax.random.normal(next(rngs), (dim,), dtype=jnp.bfloat16)
+        a_log = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+        dt_bias = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+        seq_lens = jnp.array([32 + length for length in lengths], dtype=jnp.int32)
+
+        kwargs = dict(
+            qkv=qkv,
+            b=b,
+            a=a,
+            conv_state=conv_state,
+            recurrent_state=rec_state,
+            conv_weight=conv_weight,
+            conv_bias=conv_bias,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            query_start_loc=q_loc,
+            state_indices=state_indices,
+            distribution=distribution,
+            seq_lens=seq_lens,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
+        (ref_conv, ref_rec), ref_out = _gdn_attention_ref(**kwargs)
+        (got_conv, got_rec), got_out = wrapper.fused_conv1d_gdn(
+            **{
+                **kwargs,
+                "conv_state": conv_state.copy(),
+                "recurrent_state": rec_state.copy(),
+            }
+        )
+        np.testing.assert_allclose(got_out, ref_out, rtol=2e-2, atol=2e-2)
+        np.testing.assert_allclose(got_conv, ref_conv, rtol=2e-2, atol=2e-2)
+        np.testing.assert_allclose(got_rec, ref_rec, rtol=2e-2, atol=2e-2)
+
+    def test_qwen3_5_397b_parallelism_execution(self):
+        """End-to-end TPU execution across Qwen3.5-397B TP8/DP4TP2/DP8 head counts."""
+        from sglang_tpu.attention.pallas.gdn import wrapper
+
+        d_k = d_v = 128
+        kernel_size = 4
+        for n_kq, n_v in ((2, 8), (8, 32), (16, 64)):
+            with self.subTest(n_kq=n_kq, n_v=n_v):
+                lengths = [1, 1, 1, 1, 128, 64]
+                num_decode = 4
+                num_seqs = len(lengths)
+                num_tokens = sum(lengths)
+                q_loc = jnp.array(
+                    np.concatenate([[0], np.cumsum(lengths)]), dtype=jnp.int32
+                )
+                distribution = jnp.array(
+                    [num_decode, num_seqs, num_seqs], dtype=jnp.int32
+                )
+                state_indices = jnp.arange(1, num_seqs + 1, dtype=jnp.int32)
+                num_blocks = num_seqs + 1
+                dim = 2 * n_kq * d_k + n_v * d_v
+
+                rngs = iter(jax.random.split(jax.random.key(100 + n_v), 10))
+                qkv = jax.random.normal(
+                    next(rngs), (num_tokens, dim), dtype=jnp.bfloat16
+                )
+                b = jax.random.normal(next(rngs), (num_tokens, n_v), dtype=jnp.bfloat16)
+                a = jax.random.normal(next(rngs), (num_tokens, n_v), dtype=jnp.bfloat16)
+                conv_state = jnp.zeros(
+                    (num_blocks, kernel_size - 1, dim), dtype=jnp.bfloat16
+                )
+                rec_state = jnp.zeros((num_blocks, n_v, d_k, d_v), dtype=jnp.float32)
+                conv_weight = jax.random.normal(
+                    next(rngs), (dim, 1, kernel_size), dtype=jnp.bfloat16
+                )
+                conv_bias = jax.random.normal(next(rngs), (dim,), dtype=jnp.bfloat16)
+                a_log = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+                dt_bias = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+                seq_lens = jnp.array(lengths, dtype=jnp.int32)
+
+                kwargs = dict(
+                    qkv=qkv,
+                    b=b,
+                    a=a,
+                    conv_state=conv_state,
+                    recurrent_state=rec_state,
+                    conv_weight=conv_weight,
+                    conv_bias=conv_bias,
+                    a_log=a_log,
+                    dt_bias=dt_bias,
+                    query_start_loc=q_loc,
+                    state_indices=state_indices,
+                    distribution=distribution,
+                    seq_lens=seq_lens,
+                    n_kq=n_kq,
+                    n_v=n_v,
+                    d_k=d_k,
+                    d_v=d_v,
+                    kernel_size=kernel_size,
+                )
+                (ref_conv, ref_rec), ref_out = _gdn_attention_ref(**kwargs)
+                (got_conv, got_rec), got_out = wrapper.fused_conv1d_gdn(
+                    **{
+                        **kwargs,
+                        "conv_state": conv_state.copy(),
+                        "recurrent_state": rec_state.copy(),
+                    }
+                )
+                np.testing.assert_allclose(got_out, ref_out, rtol=2e-2, atol=2e-2)
+                np.testing.assert_allclose(got_conv, ref_conv, rtol=2e-2, atol=2e-2)
+                np.testing.assert_allclose(got_rec, ref_rec, rtol=2e-2, atol=2e-2)
+
+    def test_every_reachable_tile_matches_reference(self):
+        """Every reachable (T, C) tile pair across served GDN heads matches reference."""
+        from sglang_tpu.attention.pallas.gdn import config, wrapper
+
+        d_k = d_v = 128
+        kernel_size = 4
+        for n_kq, n_v in _SERVED_GDN_HEADS:
+            for state_dtype in (jnp.bfloat16, jnp.float32):
+                for window in (1, 4):
+                    for batch in _reachable_tile_batches(
+                        n_kq,
+                        n_v,
+                        state_dtype,
+                        window,
+                        config.AttentionMode.GDN,
+                    ):
+                        max_reqs = batch["max_reqs"]
+                        lengths = batch["lengths"]
+                        q_loc = jnp.array(batch["q_loc"], dtype=jnp.int32)
+                        distribution = jnp.array(batch["distribution"], dtype=jnp.int32)
+                        num_tokens = int(q_loc[-1])
+                        num_spec_tokens = window - 1
+                        with self.subTest(
+                            n_v=n_v,
+                            state_dtype=str(state_dtype),
+                            window=window,
+                            max_reqs=max_reqs,
+                            tokens=num_tokens,
+                        ):
+                            w_sz = num_spec_tokens + 1
+                            state_indices = jnp.array(
+                                [1 + i * w_sz for i in range(max_reqs)],
+                                dtype=jnp.int32,
+                            )
+                            num_blocks = 1 + max_reqs * w_sz
+                            dim = 2 * n_kq * d_k + n_v * d_v
+                            rngs = iter(
+                                jax.random.split(
+                                    jax.random.key(max_reqs + num_tokens), 10
+                                )
+                            )
+                            qkv = jax.random.normal(
+                                next(rngs),
+                                (num_tokens, dim),
+                                dtype=jnp.bfloat16,
+                            )
+                            b = jax.random.normal(
+                                next(rngs),
+                                (num_tokens, n_v),
+                                dtype=jnp.bfloat16,
+                            )
+                            a = jax.random.normal(
+                                next(rngs),
+                                (num_tokens, n_v),
+                                dtype=jnp.bfloat16,
+                            )
+                            conv_state = jnp.zeros(
+                                (num_blocks, kernel_size - 1, dim),
+                                dtype=jnp.bfloat16,
+                            )
+                            rec_state = jnp.zeros(
+                                (num_blocks, n_v, d_k, d_v), dtype=state_dtype
+                            )
+                            conv_weight = jax.random.normal(
+                                next(rngs),
+                                (dim, 1, kernel_size),
+                                dtype=jnp.bfloat16,
+                            )
+                            conv_bias = jax.random.normal(
+                                next(rngs), (dim,), dtype=jnp.bfloat16
+                            )
+                            a_log = jax.random.normal(
+                                next(rngs), (n_v,), dtype=jnp.float32
+                            )
+                            dt_bias = jax.random.normal(
+                                next(rngs), (n_v,), dtype=jnp.float32
+                            )
+                            seq_lens = jnp.array(lengths, dtype=jnp.int32)
+                            kwargs = dict(
+                                qkv=qkv,
+                                b=b,
+                                a=a,
+                                conv_state=conv_state,
+                                recurrent_state=rec_state,
+                                conv_weight=conv_weight,
+                                conv_bias=conv_bias,
+                                a_log=a_log,
+                                dt_bias=dt_bias,
+                                query_start_loc=q_loc,
+                                state_indices=state_indices,
+                                distribution=distribution,
+                                seq_lens=seq_lens,
+                                n_kq=n_kq,
+                                n_v=n_v,
+                                d_k=d_k,
+                                d_v=d_v,
+                                kernel_size=kernel_size,
+                            )
+                            num_valid_seqs = int(distribution[2])
+                            if num_spec_tokens > 0:
+                                read_offsets = jnp.zeros(max_reqs, dtype=jnp.int32)
+                                num_spec_seqs = int(distribution[0])
+                                (ref_conv, ref_rec), ref_out = gdn_attention_spec_ref(
+                                    qkv=qkv,
+                                    b=b,
+                                    a=a,
+                                    conv_state=conv_state,
+                                    recurrent_state=rec_state,
+                                    conv_weight=conv_weight,
+                                    conv_bias=conv_bias,
+                                    a_log=a_log,
+                                    dt_bias=dt_bias,
+                                    query_start_loc=q_loc,
+                                    state_indices=state_indices,
+                                    read_offsets=read_offsets,
+                                    num_spec_seqs=num_spec_seqs,
+                                    seq_lens=seq_lens,
+                                    n_kq=n_kq,
+                                    n_v=n_v,
+                                    d_k=d_k,
+                                    d_v=d_v,
+                                    kernel_size=kernel_size,
+                                )
+                                if num_valid_seqs > num_spec_seqs:
+                                    spec_end = int(q_loc[num_spec_seqs])
+                                    (ref_conv, ref_rec), prefill_out = (
+                                        _gdn_attention_ref(
+                                            qkv=qkv[spec_end:],
+                                            b=b[spec_end:],
+                                            a=a[spec_end:],
+                                            conv_state=ref_conv,
+                                            recurrent_state=ref_rec,
+                                            conv_weight=conv_weight,
+                                            conv_bias=conv_bias,
+                                            a_log=a_log,
+                                            dt_bias=dt_bias,
+                                            query_start_loc=q_loc[num_spec_seqs:]
+                                            - q_loc[num_spec_seqs],
+                                            state_indices=state_indices[num_spec_seqs:],
+                                            distribution=jnp.array(
+                                                [0, 0, num_valid_seqs - num_spec_seqs],
+                                                dtype=jnp.int32,
+                                            ),
+                                            seq_lens=seq_lens[num_spec_seqs:],
+                                            n_kq=n_kq,
+                                            n_v=n_v,
+                                            d_k=d_k,
+                                            d_v=d_v,
+                                            kernel_size=kernel_size,
+                                        )
+                                    )
+                                    ref_out = ref_out.at[spec_end:].set(prefill_out)
+                            else:
+                                (ref_conv, ref_rec), ref_out = _gdn_attention_ref(
+                                    **kwargs
+                                )
+                            call_kwargs = dict(
+                                kwargs,
+                                conv_state=conv_state.copy(),
+                                recurrent_state=rec_state.copy(),
+                                batched_only=batch.get("batched_only", False),
+                                prefill_only=batch.get("prefill_only", False),
+                            )
+                            if num_spec_tokens > 0:
+                                call_kwargs["read_offsets"] = read_offsets
+                                call_kwargs["num_spec_tokens"] = num_spec_tokens
+                            (got_conv, got_rec), got_out = wrapper.fused_conv1d_gdn(
+                                **call_kwargs
+                            )
+                            np.testing.assert_allclose(
+                                got_out, ref_out, rtol=3e-2, atol=3e-2
+                            )
+                            active_slots = _active_state_slots(
+                                state_indices=state_indices,
+                                distribution=distribution,
+                                lengths=lengths,
+                                num_valid_seqs=num_valid_seqs,
+                                num_spec_tokens=num_spec_tokens,
+                            )
+                            np.testing.assert_allclose(
+                                got_conv[active_slots],
+                                ref_conv[active_slots],
+                                rtol=3e-2,
+                                atol=3e-2,
+                            )
+                            np.testing.assert_allclose(
+                                got_rec[active_slots],
+                                ref_rec[active_slots],
+                                rtol=3e-2,
+                                atol=3e-2,
+                            )
+
+
+class TestGDNTileSelection(CustomTestCase):
+    """CPU-runnable tests for VMEM accounting, tile selection, and solver block sizes."""
+
+    def _with_tpu7x_mesh(self, fn):
+        try:
+            device = jax.sharding.AbstractDevice(
+                device_kind="TPU7x", num_cores=1, platform="tpu"
+            )
+        except TypeError:
+            device = jax.sharding.AbstractDevice(device_kind="TPU7x", num_cores=1)
+        mesh = jax.sharding.AbstractMesh(
+            axis_sizes=(1,),
+            axis_names=("x",),
+            abstract_device=device,
+        )
+        with jax.sharding.use_abstract_mesh(mesh):
+            return fn()
+
+    def test_qwen3_5_397b_parallelism_tile_selection(self):
+        """Tile selection across Qwen3.5-397B TP8, DP4TP2, and DP8 topologies."""
+        from jax.experimental.pallas import tpu as pltpu
+
+        from sglang_tpu.attention.pallas.gdn import config, tiling
+
+        def _check():
+            num_lanes = pltpu.get_tpu_info().num_lanes
+            d_k = d_v = 128
+            kernel_size = 4
+            vmem_64m = 64 * 1024 * 1024
+            limit_w1 = config.GDNConfig.get_vmem_limit_bytes(
+                1, vmem_capacity_bytes=vmem_64m
+            )
+            limit_w4 = config.GDNConfig.get_vmem_limit_bytes(
+                4, vmem_capacity_bytes=vmem_64m
+            )
+            self.assertEqual(limit_w1, int(0.80 * vmem_64m))
+            self.assertEqual(limit_w4, int(0.90 * vmem_64m))
+
+            for n_kq, n_v, state_dt, w_sz, expected in (
+                # TP8 (2, 8): decode T=8, prefill C=128
+                (2, 8, jnp.float32, 1, (8, 128)),
+                (2, 8, jnp.float32, 4, (8, 128)),
+                (2, 8, jnp.bfloat16, 1, (8, 128)),
+                # DP4TP2 (8, 32): decode T=4 at W=1, T=2 at W=4, prefill C=128
+                (8, 32, jnp.float32, 1, (4, 128)),
+                (8, 32, jnp.float32, 4, (2, 128)),
+                (8, 32, jnp.bfloat16, 4, (4, 128)),
+                # DP8 (16, 64): decode T=2 at W=1, T=1 at W=4, prefill C=64 in f32 & bf16
+                (16, 64, jnp.float32, 1, (2, 64)),
+                (16, 64, jnp.float32, 4, (1, 64)),
+                (16, 64, jnp.bfloat16, 1, (2, 64)),
+            ):
+                dim = 2 * n_kq * d_k + n_v * d_v
+                got = tiling.get_tile_sizes(
+                    batch_size=512,
+                    num_seqs=64,
+                    padded_batch_size=512,
+                    n_kq=n_kq,
+                    n_v=n_v,
+                    d_k=d_k,
+                    d_v=d_v,
+                    kernel_size=kernel_size,
+                    conv_state_dim_size=dim,
+                    act_out_dtype=jnp.dtype(jnp.bfloat16),
+                    recurrent_state_dtype=jnp.dtype(state_dt),
+                    num_lanes=num_lanes,
+                    decode_vmem_limit_bytes=limit_w4 if w_sz > 1 else limit_w1,
+                    mixed_vmem_limit_bytes=limit_w1,
+                    window_size=w_sz,
+                    attention_mode=config.AttentionMode.GDN,
+                )
+                self.assertEqual(got, expected)
+
+        self._with_tpu7x_mesh(_check)
+
+    def test_gdn_vmem_declared_bytes_matches_create_allocs(self):
+        """Declared VMEM bytes equal create_allocs + scratch + weights to 0 B."""
+        from jax.experimental.pallas import tpu as pltpu
+
+        from sglang_tpu.attention.pallas.gdn import config, memory_ref, tiling
+
+        def _check():
+            num_lanes = pltpu.get_tpu_info().num_lanes
+            d_k = d_v = 128
+            kernel_size = 4
+            dummy_arr_dt = jnp.dtype(jnp.float32)
+            dummy_out_dt = jnp.dtype(jnp.bfloat16)
+
+            for n_kq, n_v, tile_sz, is_decode, w_sz, rec_dt in (
+                (2, 8, 8, True, 1, jnp.float32),
+                (2, 8, 8, True, 4, jnp.float32),
+                (8, 32, 4, True, 1, jnp.float32),
+                (16, 64, 2, True, 1, jnp.bfloat16),
+                (2, 8, 128, False, 1, jnp.float32),
+                (16, 64, 64, False, 1, jnp.float32),
+            ):
+                dim = 2 * n_kq * d_k + n_v * d_v
+                aligned_dim = tiling.align_to(dim, num_lanes)
+                cfg = config.GDNConfig(
+                    mode=(
+                        config.GDNMode.BATCHED if is_decode else config.GDNMode.PER_SEQ
+                    ),
+                    dtypes=config.Dtypes(
+                        act_in=jnp.dtype(jnp.float32),
+                        act_out=jnp.dtype(jnp.bfloat16),
+                        compute=jnp.dtype(jnp.float32),
+                        recurrent_state=jnp.dtype(rec_dt),
+                        conv_state=jnp.dtype(jnp.float32),
+                    ),
+                    batch_size=tile_sz,
+                    dim_size=aligned_dim,
+                    kernel_size=kernel_size,
+                    tile_size=tile_sz,
+                    num_kq_heads=n_kq,
+                    num_v_heads=n_v,
+                    kq_head_dim=d_k,
+                    v_head_dim=d_v,
+                    num_buffers=2,
+                    window_size=w_sz,
+                    attention_mode=config.AttentionMode.GDN,
+                )
+                dummy_meta = memory_ref.MetadataRef(
+                    num_tiles=None,
+                    p_id_to_s_idx=None,
+                    p_id_to_r_base=None,
+                    p_id_to_r_size=None,
+                    p_id_is_first_tile=None,
+                    p_id_is_last_tile=None,
+                    s_idx_has_initial_state=None,
+                    s_idx_to_state_indices=None,
+                    s_idx_to_read_offset=None,
+                )
+                allocs = memory_ref.create_allocs(
+                    metadata_ref=dummy_meta,
+                    qkv_ref=dummy_arr_dt,
+                    b_ref=dummy_arr_dt,
+                    a_ref=dummy_arr_dt,
+                    out_ref=dummy_out_dt,
+                    conv_state_ref=dummy_arr_dt,
+                    recurrent_state_ref=jnp.dtype(rec_dt),
+                    cfg=cfg,
+                )
+                declared_allocs_bytes = sum(
+                    int(np.prod(a.window_ref.shape))
+                    * jnp.dtype(a.window_ref.dtype).itemsize
+                    for a in allocs
+                    if a.window_ref is not None
+                )
+                scratch_shapes = cfg.get_scratch_shape_dict()
+                declared_scratch_bytes = sum(
+                    int(np.prod(s.shape)) * 4
+                    for s in scratch_shapes.values()
+                    if s is not None
+                )
+                weights_bytes = (kernel_size + 1) * aligned_dim * 4 + (
+                    2 * tiling.align_to(n_v, num_lanes) * 4
+                )
+                total_declared = (
+                    declared_allocs_bytes + declared_scratch_bytes + weights_bytes
+                )
+                vmem_declared = tiling.get_vmem_declared_bytes(
+                    tile_b=cfg.seq_tile_size,
+                    chunk_sz=cfg.chunk_size,
+                    n_kq=n_kq,
+                    n_v=n_v,
+                    d_k=d_k,
+                    d_v=d_v,
+                    kernel_size=kernel_size,
+                    act_out_bytes=2,
+                    rec_state_bytes=jnp.dtype(rec_dt).itemsize,
+                    num_lanes=num_lanes,
+                    conv_state_dim_size=aligned_dim,
+                    is_decode=is_decode,
+                    window_size=w_sz,
+                    attention_mode=config.AttentionMode.GDN,
+                )
+                self.assertEqual(vmem_declared, total_declared)
+
+        self._with_tpu7x_mesh(_check)
+
+    def test_tile_sizes_with_split_state_slots_at_w1(self):
+        """Split state in/out slots (state_slots = 1 + W = 2 at W=1) are counted."""
+        from jax.experimental.pallas import tpu as pltpu
+
+        from sglang_tpu.attention.pallas.gdn import config, tiling
+
+        def _check():
+            num_lanes = pltpu.get_tpu_info().num_lanes
+            d_k = d_v = 128
+            kernel_size = 4
+            n_kq, n_v = 16, 64
+            dim = 2 * n_kq * d_k + n_v * d_v
+            vmem_64m = 64 * 1024 * 1024
+            limit_w1 = config.GDNConfig.get_vmem_limit_bytes(
+                1, vmem_capacity_bytes=vmem_64m
+            )
+            # At n_v=64, 1 sequence in f32 uses 2 state slots * 2 buffers = 16 MiB
+            # for recurrent state alone; T=4 would exceed the 51.20 MiB W=1 limit,
+            # and decode_tile_target(64, 64) = 2 fits within limit_w1.
+            dec_tile, mix_tile = tiling.get_tile_sizes(
+                batch_size=64,
+                num_seqs=64,
+                padded_batch_size=64,
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                conv_state_dim_size=dim,
+                act_out_dtype=jnp.dtype(jnp.bfloat16),
+                recurrent_state_dtype=jnp.dtype(jnp.float32),
+                num_lanes=num_lanes,
+                decode_vmem_limit_bytes=limit_w1,
+                mixed_vmem_limit_bytes=limit_w1,
+                window_size=1,
+                attention_mode=config.AttentionMode.GDN,
+            )
+            self.assertEqual((dec_tile, mix_tile), (2, 64))
+
+        self._with_tpu7x_mesh(_check)
+
+    def test_kda_vmem_and_tile_sizes_across_parallelism(self):
+        """KDA VMEM accounting, tile picks, and solver block sizes across TP/DP/MTP."""
+        from jax.experimental.pallas import tpu as pltpu
+
+        from sglang_tpu.attention.pallas.gdn import config, memory_ref, tiling
+
+        def _check():
+            num_lanes = pltpu.get_tpu_info().num_lanes
+            d_k = d_v = 128
+            kernel_size = 4
+            vmem_64m = 64 * 1024 * 1024
+            limit_w1 = config.GDNConfig.get_vmem_limit_bytes(
+                1, vmem_capacity_bytes=vmem_64m
+            )
+            limit_w4 = config.GDNConfig.get_vmem_limit_bytes(
+                4, vmem_capacity_bytes=vmem_64m
+            )
+
+            # 1. Kimi-Linear-48B DP8/TP1 (n_kq=32, n_v=32), C=128 in f32 is
+            # 59,884,032 B (> 51.20 MiB), so dynamic tiling selects (4, 64).
+            dim_32 = 2 * 32 * d_k + 32 * d_v
+            est_kda_c128 = tiling.get_vmem_estimate_bytes(
+                tile_b=1,
+                chunk_sz=128,
+                n_kq=32,
+                n_v=32,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                act_out_bytes=2,
+                rec_state_bytes=4,
+                num_lanes=num_lanes,
+                conv_state_dim_size=dim_32,
+                is_decode=False,
+                window_size=1,
+                attention_mode=config.AttentionMode.KDA,
+            )
+            self.assertEqual(est_kda_c128, 59_884_032)
+            self.assertGreater(est_kda_c128, limit_w1)
+
+            dp8_dec, dp8_mix = tiling.get_tile_sizes(
+                batch_size=128,
+                num_seqs=64,
+                padded_batch_size=128,
+                n_kq=32,
+                n_v=32,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                conv_state_dim_size=dim_32,
+                act_out_dtype=jnp.dtype(jnp.bfloat16),
+                recurrent_state_dtype=jnp.dtype(jnp.float32),
+                num_lanes=num_lanes,
+                decode_vmem_limit_bytes=limit_w1,
+                mixed_vmem_limit_bytes=limit_w1,
+                window_size=1,
+                attention_mode=config.AttentionMode.KDA,
+            )
+            self.assertEqual((dp8_dec, dp8_mix), (4, 64))
+
+            # 2. Tile picks across served KDA head configs (W=1, W=4, W=8).
+            for n_kq, n_v, w_sz, expected in (
+                (3, 3, 1, (16, 128)),
+                (3, 3, 4, (16, 128)),
+                (3, 3, 8, (8, 128)),
+                (12, 12, 1, (8, 128)),
+                (12, 12, 4, (4, 128)),
+                (12, 12, 8, (2, 128)),
+                (4, 4, 1, (16, 128)),
+                (4, 4, 4, (16, 128)),
+                (4, 4, 8, (8, 128)),
+                (32, 32, 1, (4, 64)),
+                (32, 32, 4, (2, 64)),
+                (32, 32, 8, (1, 64)),
+            ):
+                dim = 2 * n_kq * d_k + n_v * d_v
+                got = tiling.get_tile_sizes(
+                    batch_size=512,
+                    num_seqs=64,
+                    padded_batch_size=512,
+                    n_kq=n_kq,
+                    n_v=n_v,
+                    d_k=d_k,
+                    d_v=d_v,
+                    kernel_size=kernel_size,
+                    conv_state_dim_size=dim,
+                    act_out_dtype=jnp.dtype(jnp.bfloat16),
+                    recurrent_state_dtype=jnp.dtype(jnp.float32),
+                    num_lanes=num_lanes,
+                    decode_vmem_limit_bytes=limit_w4 if w_sz > 1 else limit_w1,
+                    mixed_vmem_limit_bytes=limit_w1,
+                    window_size=w_sz,
+                    attention_mode=config.AttentionMode.KDA,
+                )
+                self.assertEqual(got, expected)
+
+            # 3. Verify triangular_block_size across served KDA and GDN head counts.
+            for mode, n_v, expected_block in (
+                (config.AttentionMode.KDA, 3, 16),
+                (config.AttentionMode.KDA, 4, 16),
+                (config.AttentionMode.KDA, 12, 8),
+                (config.AttentionMode.KDA, 32, 8),
+                (config.AttentionMode.GDN, 8, 16),
+                (config.AttentionMode.GDN, 16, 8),
+                (config.AttentionMode.GDN, 24, 4),
+                (config.AttentionMode.GDN, 32, 4),
+                (config.AttentionMode.GDN, 64, 2),
+            ):
+                cfg_b = config.GDNConfig(
+                    mode=config.GDNMode.PER_SEQ,
+                    dtypes=config.Dtypes(
+                        act_in=jnp.dtype(jnp.float32),
+                        act_out=jnp.dtype(jnp.bfloat16),
+                        compute=jnp.dtype(jnp.float32),
+                        recurrent_state=jnp.dtype(jnp.float32),
+                        conv_state=jnp.dtype(jnp.float32),
+                    ),
+                    batch_size=64,
+                    dim_size=3 * n_v * d_k,
+                    kernel_size=kernel_size,
+                    tile_size=64,
+                    num_kq_heads=n_v,
+                    num_v_heads=n_v,
+                    kq_head_dim=d_k,
+                    v_head_dim=d_v,
+                    attention_mode=mode,
+                )
+                self.assertEqual(cfg_b.triangular_block_size, expected_block)
+
+            # 4. Declared VMEM bytes for KDA match create_allocs + scratch + weights.
+            dummy_arr_dt = jnp.dtype(jnp.float32)
+            dummy_out_dt = jnp.dtype(jnp.bfloat16)
+            for n_kq, n_v, tile_sz, is_decode, w_sz in (
+                (3, 3, 16, True, 4),
+                (12, 12, 4, True, 4),
+                (4, 4, 16, True, 4),
+                (32, 32, 2, True, 4),
+                (32, 32, 64, False, 1),
+            ):
+                dim = 2 * n_kq * d_k + n_v * d_v
+                aligned_dim = tiling.align_to(dim, num_lanes)
+                cfg = config.GDNConfig(
+                    mode=(
+                        config.GDNMode.BATCHED if is_decode else config.GDNMode.PER_SEQ
+                    ),
+                    dtypes=config.Dtypes(
+                        act_in=jnp.dtype(jnp.float32),
+                        act_out=jnp.dtype(jnp.bfloat16),
+                        compute=jnp.dtype(jnp.float32),
+                        recurrent_state=jnp.dtype(jnp.float32),
+                        conv_state=jnp.dtype(jnp.float32),
+                    ),
+                    batch_size=tile_sz,
+                    dim_size=aligned_dim,
+                    kernel_size=kernel_size,
+                    tile_size=tile_sz,
+                    num_kq_heads=n_kq,
+                    num_v_heads=n_v,
+                    kq_head_dim=d_k,
+                    v_head_dim=d_v,
+                    num_buffers=2,
+                    window_size=w_sz,
+                    attention_mode=config.AttentionMode.KDA,
+                )
+                dummy_meta = memory_ref.MetadataRef(
+                    num_tiles=None,
+                    p_id_to_s_idx=None,
+                    p_id_to_r_base=None,
+                    p_id_to_r_size=None,
+                    p_id_is_first_tile=None,
+                    p_id_is_last_tile=None,
+                    s_idx_has_initial_state=None,
+                    s_idx_to_state_indices=None,
+                    s_idx_to_read_offset=None,
+                )
+                allocs = memory_ref.create_allocs(
+                    metadata_ref=dummy_meta,
+                    qkv_ref=dummy_arr_dt,
+                    b_ref=dummy_arr_dt,
+                    a_ref=dummy_arr_dt,
+                    out_ref=dummy_out_dt,
+                    conv_state_ref=dummy_arr_dt,
+                    recurrent_state_ref=dummy_arr_dt,
+                    cfg=cfg,
+                )
+                declared_allocs_bytes = sum(
+                    int(np.prod(a.window_ref.shape))
+                    * jnp.dtype(a.window_ref.dtype).itemsize
+                    for a in allocs
+                    if a.window_ref is not None
+                )
+                scratch_shapes = cfg.get_scratch_shape_dict()
+                declared_scratch_bytes = sum(
+                    int(np.prod(s.shape)) * 4
+                    for s in scratch_shapes.values()
+                    if s is not None
+                )
+                weights_bytes = (kernel_size + 1) * aligned_dim * 4 + (
+                    tiling.align_to(n_v, num_lanes)
+                    + tiling.align_to(n_v * d_k, num_lanes)
+                ) * 4
+                total_declared = (
+                    declared_allocs_bytes + declared_scratch_bytes + weights_bytes
+                )
+                vmem_declared = tiling.get_vmem_declared_bytes(
+                    tile_b=cfg.seq_tile_size,
+                    chunk_sz=cfg.chunk_size,
+                    n_kq=n_kq,
+                    n_v=n_v,
+                    d_k=d_k,
+                    d_v=d_v,
+                    kernel_size=kernel_size,
+                    act_out_bytes=2,
+                    rec_state_bytes=4,
+                    num_lanes=num_lanes,
+                    conv_state_dim_size=aligned_dim,
+                    is_decode=is_decode,
+                    window_size=w_sz,
+                    attention_mode=config.AttentionMode.KDA,
+                )
+                self.assertEqual(vmem_declared, total_declared)
+
+        self._with_tpu7x_mesh(_check)
+
+    def test_reachable_tile_batches_active_slot_indexing(self):
+        """Reachable-tile batches and active slot indexing match a NumPy gather oracle across W=1 and W=4."""
+        for window, num_spec_tokens in ((1, 0), (4, 3)):
+            batches = self._with_tpu7x_mesh(
+                lambda w=window: _reachable_tile_batches(2, 8, jnp.bfloat16, w)
+            )
+            self.assertGreater(len(batches), 0)
+            batch = batches[0]
+            max_reqs = batch["max_reqs"]
+            lengths = batch["lengths"]
+            distribution = jnp.asarray(batch["distribution"], dtype=jnp.int32)
+            num_valid_seqs = int(distribution[2])
+            state_indices = jnp.arange(1, max_reqs + 1, dtype=jnp.int32) * window
+            active_slots = _active_state_slots(
+                state_indices=state_indices,
+                distribution=distribution,
+                lengths=lengths,
+                num_valid_seqs=num_valid_seqs,
+                num_spec_tokens=num_spec_tokens,
+            )
+            self.assertIsInstance(active_slots, jax.Array)
+            self.assertEqual(active_slots.dtype, jnp.int32)
+            expected = (
+                [window + t for t in range(window)] + [2 * window]
+                if num_spec_tokens > 0
+                else [1, 2]
+            )
+            self.assertEqual(active_slots.tolist(), expected)
+            num_blocks = max_reqs * window + 2
+            conv = jnp.arange(num_blocks * 3 * 16, dtype=jnp.bfloat16).reshape(
+                num_blocks, 3, 16
+            )
+            rec = jnp.arange(num_blocks * 2 * 4 * 4, dtype=jnp.float32).reshape(
+                num_blocks, 2, 4, 4
+            )
+            np.testing.assert_array_equal(
+                np.asarray(conv[active_slots]),
+                np.asarray(conv)[np.asarray(expected)],
+            )
+            np.testing.assert_array_equal(
+                np.asarray(rec[active_slots]),
+                np.asarray(rec)[np.asarray(expected)],
+            )
+
+    def test_mixed_tile_size_power_of_two_and_radix_cap(self):
+        """GDN triangular_block_size is always a power of two and mixed_tile_size respects max_mixed_tile_size."""
+        importlib = __import__("importlib")
+        pltpu = importlib.import_module("jax.experimental.pallas.tpu")
+        config = importlib.import_module("sglang_tpu.attention.pallas.gdn.config")
+        tiling = importlib.import_module("sglang_tpu.attention.pallas.gdn.tiling")
+
+        def _check():
+            dtypes = config.Dtypes(
+                act_in=jnp.dtype(jnp.float32),
+                act_out=jnp.dtype(jnp.bfloat16),
+                compute=jnp.dtype(jnp.float32),
+                recurrent_state=jnp.dtype(jnp.float32),
+                conv_state=jnp.dtype(jnp.float32),
+            )
+            for mode in (config.AttentionMode.GDN, config.AttentionMode.KDA):
+                for n_v in range(1, 65):
+                    cfg = config.GDNConfig(
+                        mode=config.GDNMode.PER_SEQ,
+                        dtypes=dtypes,
+                        batch_size=128,
+                        dim_size=3 * n_v * 128,
+                        kernel_size=4,
+                        tile_size=64,
+                        num_kq_heads=n_v,
+                        num_v_heads=n_v,
+                        kq_head_dim=128,
+                        v_head_dim=128,
+                        attention_mode=mode,
+                    )
+                    b = cfg.triangular_block_size
+                    self.assertIn(b, (2, 4, 8, 16))
+                    self.assertEqual(cfg.chunk_size % b, 0)
+
+            num_lanes = pltpu.get_tpu_info().num_lanes
+            vmem_limit = config.GDNConfig.get_vmem_limit_bytes(1)
+            for max_cap, expected_full, expected_resumed, expected_short in (
+                (None, 128, 80, 48),
+                (128, 128, 80, 48),
+                (64, 64, 64, 48),
+            ):
+                _, mix_full = tiling.get_tile_sizes(
+                    batch_size=193,
+                    num_seqs=1,
+                    padded_batch_size=208,
+                    n_kq=2,
+                    n_v=4,
+                    d_k=128,
+                    d_v=128,
+                    kernel_size=4,
+                    conv_state_dim_size=2 * 2 * 128 + 4 * 128,
+                    act_out_dtype=jnp.dtype(jnp.bfloat16),
+                    recurrent_state_dtype=jnp.dtype(jnp.float32),
+                    num_lanes=num_lanes,
+                    decode_vmem_limit_bytes=vmem_limit,
+                    mixed_vmem_limit_bytes=vmem_limit,
+                    max_mixed_tile_size=max_cap,
+                )
+                _, mix_resumed = tiling.get_tile_sizes(
+                    batch_size=65,
+                    num_seqs=1,
+                    padded_batch_size=80,
+                    n_kq=2,
+                    n_v=4,
+                    d_k=128,
+                    d_v=128,
+                    kernel_size=4,
+                    conv_state_dim_size=2 * 2 * 128 + 4 * 128,
+                    act_out_dtype=jnp.dtype(jnp.bfloat16),
+                    recurrent_state_dtype=jnp.dtype(jnp.float32),
+                    num_lanes=num_lanes,
+                    decode_vmem_limit_bytes=vmem_limit,
+                    mixed_vmem_limit_bytes=vmem_limit,
+                    max_mixed_tile_size=max_cap,
+                )
+                _, mix_short = tiling.get_tile_sizes(
+                    batch_size=40,
+                    num_seqs=1,
+                    padded_batch_size=48,
+                    n_kq=2,
+                    n_v=4,
+                    d_k=128,
+                    d_v=128,
+                    kernel_size=4,
+                    conv_state_dim_size=2 * 2 * 128 + 4 * 128,
+                    act_out_dtype=jnp.dtype(jnp.bfloat16),
+                    recurrent_state_dtype=jnp.dtype(jnp.float32),
+                    num_lanes=num_lanes,
+                    decode_vmem_limit_bytes=vmem_limit,
+                    mixed_vmem_limit_bytes=vmem_limit,
+                    max_mixed_tile_size=max_cap,
+                )
+                self.assertEqual(mix_full, expected_full)
+                self.assertEqual(mix_resumed, expected_resumed)
+                self.assertEqual(mix_short, expected_short)
+
+        self._with_tpu7x_mesh(_check)
 
 
 @unittest.skipIf(not _has_jax(), "Requires JAX")
