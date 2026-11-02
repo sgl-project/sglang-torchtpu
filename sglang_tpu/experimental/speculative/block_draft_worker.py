@@ -37,6 +37,7 @@ class TpuBlockDraftWorker(TpuDraftWorker):
 
     block_width: int
     mask_token_id: int
+    requires_full_kv_pool = True
 
     @abstractmethod
     def sample_drafts(
@@ -45,12 +46,32 @@ class TpuBlockDraftWorker(TpuDraftWorker):
         block_hidden: torch.Tensor,
         bonus_tokens: torch.Tensor,
         sampler: DraftSampler,
+        req_pool_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Sampled [pbs, gamma] drafts and the [pbs, gamma, V] logits q was drawn from.
 
         block_hidden is the [pbs, block_width, H] draft block output. The greedy
         drafts come from the draft graph itself (sample_draft_tokens_tpu).
         """
+
+    def seed_recurrent_context(
+        self,
+        *,
+        target_hidden: torch.Tensor,
+        rows: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        live: torch.Tensor,
+    ) -> None:
+        """Seed per-request draft state from the target features at hidden ``rows``.
+
+        Called after extend (each request's last prompt row) and commit (its last
+        accepted row). Drafts without per-request recurrent state ignore it.
+        """
+
+    def warmup_recurrent_context(
+        self, *, hidden_rows: tuple[int, ...], num_rows: tuple[int, ...]
+    ) -> None:
+        """Compile seed_recurrent_context for each (target hidden rows, seeded rows) pair."""
 
     def precompile_draft(self) -> None:
         self._compile_policy().precompile_draft(

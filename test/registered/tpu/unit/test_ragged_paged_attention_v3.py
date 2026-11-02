@@ -1003,6 +1003,47 @@ class TestRaggedPagedAttentionV3RelBias(unittest.TestCase):
             tolerance=0.1,
         )
 
+    # Under speculative decoding every call is compiled with decode_query_size =
+    # the verify width, prefill included.
+    def test_extend_with_decode_query_size(self):
+        inputs = self._build_inputs([(300, 300), (180, 70)])
+        self._run_and_compare(
+            inputs,
+            distribution=(0, 0, 2),
+            rel=self._rel_inputs(inputs),
+            decode_query_size=8,
+        )
+
+    def test_extend_sliding_window_with_decode_query_size(self):
+        inputs = self._build_inputs([(330, 190)])
+        self._run_and_compare(
+            inputs,
+            distribution=(0, 0, 1),
+            rel=self._rel_inputs(inputs),
+            sliding_window=self.EXTENT,
+            decode_query_size=8,
+        )
+
+    def test_verify_window(self):
+        """Fixed-width verify: 8 query rows per sequence on the DECODE range."""
+        inputs = self._build_inputs([(260, 8), (37, 8), (129, 8)])
+        self._run_and_compare(
+            inputs,
+            distribution=(3, 3, 3),
+            rel=self._rel_inputs(inputs),
+            decode_query_size=8,
+        )
+
+    def test_verify_window_sliding(self):
+        inputs = self._build_inputs([(300, 8), (140, 8)])
+        self._run_and_compare(
+            inputs,
+            distribution=(2, 2, 2),
+            rel=self._rel_inputs(inputs),
+            sliding_window=self.EXTENT,
+            decode_query_size=8,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 from typing import Iterable, NamedTuple, Optional
 
+
 import torch
 from torch import nn
 
@@ -538,13 +539,23 @@ class Inkling2TextModel(nn.Module):
             pre_affine=config.final_norm_pre_affine,
             out_dtype=torch.bfloat16,
         )
+        # Draft features: the residual partial entering each listed layer; the layer
+        # count stands for the final-norm hidden.
+        self.layers_to_capture: list[int] = []
 
     def forward(self, input_ids, positions, forward_batch, input_embeds=None):
         hidden = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         state = _AttnResState(self.attn_res, self.embed_norm(hidden))
-        for layer in self.layers:
+        captures = []
+        for i, layer in enumerate(self.layers):
+            if i in self.layers_to_capture:
+                captures.append(state.partial.to(torch.bfloat16))
             layer(state, positions, forward_batch)
-        return self.norm(state.output())
+        hidden = self.norm(state.output())
+        if not self.layers_to_capture:
+            return hidden
+        captures.append(hidden)
+        return hidden, captures
 
 
 class Inkling2ForConditionalGeneration(nn.Module):
@@ -577,12 +588,33 @@ class Inkling2ForConditionalGeneration(nn.Module):
     def get_attention_sliding_window_size(self) -> int:
         return self.text_config.sliding_window_size - 1
 
+    @property
+    def capture_aux_hidden_states(self) -> bool:
+        return bool(self.llm.layers_to_capture)
+
+    def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
+        num_layers = len(self.llm.layers)
+        if (
+            not layer_ids
+            or layer_ids != sorted(set(layer_ids))
+            or layer_ids[0] < 0
+            or layer_ids[-1] != num_layers
+        ):
+            raise ValueError(
+                "Inkling2 draft feature layers must be sorted, unique, and end "
+                f"with {num_layers}, the post-final-norm hidden state"
+            )
+        self.llm.layers_to_capture = list(layer_ids[:-1])
+
     @torch.no_grad()
     def forward(self, input_ids, positions, forward_batch: ForwardBatch, input_embeds=None, **kwargs):
         if input_embeds is not None:
             input_embeds = self.llm.embed_norm(input_embeds)
         hidden = self.llm(input_ids, positions, forward_batch, input_embeds)
-        return self.logits_processor(input_ids, hidden, self.lm_head, forward_batch)
+        aux = None
+        if self.capture_aux_hidden_states:
+            hidden, aux = hidden
+        return self.logits_processor(input_ids, hidden, self.lm_head, forward_batch, aux)
 
     # ------------------------------------------------------------------ #
     # Weight loading
@@ -629,6 +661,9 @@ class Inkling2ForConditionalGeneration(nn.Module):
             _copy_expert_slice(params[name], tensor)
             loaded.add(name)
             return
+        if precision == "nvfp4_packed":
+            self._load_packed_nvfp4(params, prefix, leaf, tensor, loaded)
+            return
         if precision == "nvfp4":
             dequantized = self._take_nvfp4(prefix, leaf, tensor)
             if dequantized is None:
@@ -653,6 +688,28 @@ class Inkling2ForConditionalGeneration(nn.Module):
             loaded.add(target + "_scale_inv")
         _copy_expert_slice(params[target], tensor)
         loaded.add(target)
+
+    def _load_packed_nvfp4(self, params, prefix, leaf, tensor, loaded) -> None:
+        """Packed E2M1 weights and FP8 block scales as stored; amax / denominator -> weight_scale_2."""
+        if leaf.endswith(("_amax", "_outer_scale_denominator")):
+            self._pending[prefix + leaf] = tensor.float()
+            for w in ("w13", "w2"):
+                amax = self._pending.get(f"{prefix}{w}_weight_amax")
+                den = self._pending.get(f"{prefix}{w}_weight_outer_scale_denominator")
+                target = f"{prefix}{w}_weight_scale_2"
+                if amax is None or den is None or target in loaded:
+                    continue
+                scale = amax / den.reshape(-1)[0]
+                param = params[target]
+                if param.dim() == 2:  # w13 holds one scale each for gate and up
+                    scale = scale[:, None].expand(-1, param.shape[1])
+                _copy_expert_slice(param, scale)
+                loaded.add(target)
+            return
+        if leaf.startswith("w13"):
+            tensor = _deinterleave_gate_up(tensor)
+        _copy_expert_slice(params[prefix + leaf], tensor)
+        loaded.add(prefix + leaf)
 
     def _take_nvfp4(self, prefix, leaf, tensor):
         """(weight leaf, BF16 [E, N, K]) once weight, block scale, amax and denominator arrived."""

@@ -12,6 +12,7 @@ metadata (distribution, query_start_loc, state rows) for every sconv call.
 
 from typing import TYPE_CHECKING, Optional
 
+
 import torch
 
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
@@ -201,11 +202,12 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
     ) -> torch.Tensor:
         """y ``[T, dim]`` for x ``[T, dim]``; updates the stream's state slots."""
         if not envs.SGLANG_TPU_ENABLE_INKLING_SCONV_PALLAS.get():
-            xla_sconv = (
-                self._xla_sconv_decode
-                if self._is_decode and self._num_spec_tokens == 0
-                else self._xla_sconv
-            )
+            if self._num_spec_tokens:
+                xla_sconv = self._xla_sconv_verify
+            elif self._is_decode:
+                xla_sconv = self._xla_sconv_decode
+            else:
+                xla_sconv = self._xla_sconv
             return xla_sconv(
                 x,
                 state=self.sconv_state(layer_id=layer_id, stream=stream),
@@ -244,10 +246,11 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
         q_lens = qsl[1:] - qsl[:-1]
         # A request continues from its slot only if it had tokens before this forward.
         has_state = (self._seq_lens[:num_seqs] - q_lens) > 0
-        slots = self._state_indices.clamp(min=0).long()
+        slots = self._state_indices.clamp(0, state.shape[0] - 1).long()
         # [seqs * hist, dim], oldest row first per sequence.
         old = state.index_select(0, slots).reshape(num_seqs, hist, dim).float()
-        old = (old * has_state[:, None, None]).reshape(num_seqs * hist, dim)
+        # where, not a multiply: a recycled slot's stale rows must not leak NaN/Inf.
+        old = torch.where(has_state[:, None, None], old, torch.zeros_like(old)).reshape(num_seqs * hist, dim)
         xf = x.float()
         acc = xf if use_residual else torch.zeros_like(xf)
         for lag in range(kernel_size):
@@ -281,9 +284,9 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
         num_seqs, dim = x.shape
         kernel_size = dyn.shape[2] if dyn is not None else weight.shape[-1]
         hist = kernel_size - 1
-        slots = self._state_indices.clamp(min=0).long()
+        slots = self._state_indices.clamp(0, state.shape[0] - 1).long()
         old = state.index_select(0, slots).reshape(num_seqs, hist, dim).float()
-        old = old * (self._seq_lens[:num_seqs] > 1)[:, None, None]
+        old = torch.where((self._seq_lens[:num_seqs] > 1)[:, None, None], old, torch.zeros_like(old))
         # [seqs, K, dim], oldest first; the new token is the last tap.
         window = torch.cat((old, x.float()[:, None]), dim=1)
         if dyn is None:
@@ -300,14 +303,50 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
         scale = (kernel_size * (2 if dyn is not None else 1) + int(use_residual)) ** -0.5
         return (acc * scale).to(x.dtype)
 
-    def _write_state(self, state, slots, new):
-        """Store each request's new window ``new`` [seqs, K-1 * dim] in its slot of ``state``."""
+    def _xla_sconv_verify(self, x, *, state, weight, dyn, use_residual):
+        """``_xla_sconv_decode`` over each request's verify window of ``_spec_window`` tokens.
+
+        Reads the committed state row and writes the state after every window position
+        into the request's checkpoint rows; ``commit_verified_states`` picks one.
+        """
+        width = self._spec_window
+        num_seqs, dim = x.shape[0] // width, x.shape[1]
+        kernel_size = dyn.shape[2] if dyn is not None else weight.shape[-1]
+        hist = kernel_size - 1
+        bases, offsets = self._state_rows()
+        bases = bases[:num_seqs].long()
+        read_rows = (bases + offsets[:num_seqs].long()).clamp(0, state.shape[0] - 1)
+        old = state.index_select(0, read_rows).reshape(num_seqs, hist, dim).float()
+        # [seqs, hist + width, dim], oldest first; a verify always continues a request.
+        seq = torch.cat((old, x.float().view(num_seqs, width, dim)), dim=1)
+        # [seqs, width, K, dim]: the conv window ending at each verify position.
+        windows = torch.stack([seq[:, tap : tap + width] for tap in range(kernel_size)], dim=2)
+        if dyn is None:
+            w = weight.reshape(dim, kernel_size).float().T[None, None]
+        else:
+            head_dim = dim // dyn.shape[1]
+            lagged = weight.float()[None] + dyn.float().permute(0, 2, 1).repeat_interleave(head_dim, dim=2)
+            w = lagged.flip(1).view(num_seqs, width, kernel_size, dim)
+        acc = (windows * w).sum(2).reshape(num_seqs * width, dim)
+        if use_residual:
+            acc = acc + x.float()
+        # State after position j: the hist inputs ending at it.
+        checkpoints = windows[:, :, 1:].reshape(num_seqs * width, hist * dim)
+        steps = torch.arange(width, device=x.device)
+        rows = (bases[:, None] + steps[None]).reshape(-1)
+        live = (self._state_indices[:num_seqs] >= 0).repeat_interleave(width)
+        self._write_state(state, rows, checkpoints, live=live)
+        scale = (kernel_size * (2 if dyn is not None else 1) + int(use_residual)) ** -0.5
+        return (acc * scale).to(x.dtype)
+
+    def _write_state(self, state, slots, new, live=None):
+        """Store each request's new window ``new`` [rows, K-1 * dim] in its row ``slots`` of ``state``."""
         # Dense one-hot write, not index_copy_: padded rows all clamp to slot 0, and the
         # duplicate-index scatter is nondeterministic once compiled.
         num_slots = state.shape[0]
-        onehot = (slots[:, None] == torch.arange(num_slots, device=new.device)[None]) & (
-            self._state_indices >= 0
-        )[:, None]
+        if live is None:
+            live = self._state_indices >= 0
+        onehot = (slots[:, None] == torch.arange(num_slots, device=new.device)[None]) & live[:, None]
         scattered = torch.einsum("ns,nf->sf", onehot.float(), new)
         flat = state.reshape(num_slots, -1)
         state.copy_(

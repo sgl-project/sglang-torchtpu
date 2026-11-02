@@ -81,6 +81,7 @@ class TpuDflashDraftWorker(TpuBlockDraftWorker):
         block_hidden: torch.Tensor,
         bonus_tokens: torch.Tensor,
         sampler: DraftSampler,
+        req_pool_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Row 0 is the root; draft_hidden[:, j - 1] predicts d_j at position n + j.
         lm_head = self._dflash_model.lm_head

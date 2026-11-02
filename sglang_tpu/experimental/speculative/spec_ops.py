@@ -504,3 +504,17 @@ def _exponential_race(weights: torch.Tensor) -> torch.Tensor:
     u = torch.rand_like(weights, dtype=torch.float32)
     noise = torch.log(u.clamp_min(torch.finfo(torch.float32).tiny)).neg_()
     return torch.argmax(weights / noise, dim=-1)
+
+
+@compiled_op(
+    warmup=lambda ctx: (
+        torch.zeros((ctx.physical_bs,), dtype=torch.int32, device=ctx.device),
+        ctx.num_verify_tokens,
+    )
+)
+def verify_last_rows(
+    accept_lens: torch.Tensor, width: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flat verify row of each request's last committed token, and whether it committed any."""
+    base = torch.arange(accept_lens.shape[0], device=accept_lens.device) * width
+    return base + (accept_lens - 1).clamp(min=0), accept_lens > 0

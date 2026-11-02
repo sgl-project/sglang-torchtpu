@@ -54,6 +54,7 @@ from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
 from sglang_tpu.experimental.speculative.spec_ops import (
     build_draft_block_inputs,
     sample_tokens,
+    verify_last_rows,
 )
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
@@ -110,6 +111,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         if self._sampled_drafts:
             self._warmup_draft_sampling()
         self._warmup_extend_draft_inputs()
+        self._warmup_recurrent_context()
         # The base snapshot ran before these block-draft warmups.
         snapshot_recompilation_baseline()
 
@@ -140,7 +142,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 num_verify_drafts=num_verify_drafts,
             )
         draft_tokens, draft_logits = self._sample_draft_block(
-            block_hidden, state.bonus_tokens, temperatures, top_ks
+            block_hidden, state.bonus_tokens, temperatures, top_ks, state.req_pool_indices
         )
         return DraftResult(
             draft_tokens=draft_tokens,
@@ -154,6 +156,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         bonus_tokens: torch.Tensor,
         temperatures: torch.Tensor,
         top_ks: torch.Tensor,
+        req_pool_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Sampled [pbs, gamma] drafts and their logits from the [pbs, width, H] block."""
         # FIXME(junyanxu): sampled drafting runs eager until the sampling params can
@@ -168,7 +171,10 @@ class TpuBlockSpecWorker(TpuSpecWorker):
 
         with self._block_draft_worker.draft_context():
             return self._block_draft_worker.sample_drafts(
-                block_hidden=block_hidden, bonus_tokens=bonus_tokens, sampler=sampler
+                block_hidden=block_hidden,
+                bonus_tokens=bonus_tokens,
+                sampler=sampler,
+                req_pool_indices=req_pool_indices,
             )
 
     def _sync_greedy_drafts(self, draft_tokens: torch.Tensor) -> torch.Tensor:
@@ -198,6 +204,13 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 cache_loc_2d=rows.cache_locs,
                 commit_lens=accept.accept_lens,
             )
+            last_rows, live = verify_last_rows(accept.accept_lens, self.num_verify_rows)
+            self._block_draft_worker.seed_recurrent_context(
+                target_hidden=target_hidden,
+                rows=last_rows,
+                req_pool_indices=state.req_pool_indices,
+                live=live,
+            )
         # Verify rows past the new seq_lens become dead target KV; freeing them is the allocator's job.
         next_state = SpecState(
             bonus_tokens=accept.bonus_tokens,
@@ -214,9 +227,12 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.FULL,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-        result.next_token_ids = self.sync_target_tokens(result.next_token_ids)
+        bonus_tokens = self.sync_target_tokens(result.next_token_ids)
+        # The scheduler copies the reported tokens to the host after the next step
+        # starts, and that step reuses the sampled buffer in place: report a copy.
         # Sampling ran at the batch bucket; the scheduler takes live rows.
-        result.next_token_ids = result.next_token_ids[: batch.seq_lens.shape[0]]
+        result.next_token_ids = bonus_tokens.clone()[: batch.seq_lens.shape[0]]
+        bonus_tokens = bonus_tokens[: batch.seq_lens.shape[0]]
         logits_output = result.logits_output
         target_hidden = logits_output.hidden_states
         if target_hidden is None:
@@ -253,11 +269,13 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             kv_fence_tail = self._block_draft_worker.write_draft_kv(
                 target_hidden=target_hidden, positions=positions, cache_loc=cache_loc
             )
+            if batch.reqs:
+                self._seed_after_extend(batch, target_hidden)
         logits_output.hidden_states = None
         if not batch.reqs:
             return self._idle_extend_result(result)
         next_state = SpecState(
-            bonus_tokens=result.next_token_ids,
+            bonus_tokens=bonus_tokens,
             seq_lens=batch.seq_lens,
             req_pool_indices=batch.req_pool_indices,
         )
@@ -266,6 +284,19 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         next_draft_input.kv_fence_tail = kv_fence_tail
         result.next_draft_input = next_draft_input
         return result
+
+    def _seed_after_extend(self, batch: ScheduleBatch, target_hidden: torch.Tensor) -> None:
+        """Seed the draft state from each request's last extend row (padded to the largest batch bucket)."""
+        num_rows = self._bucket_sizes()[-1]
+        last_rows = torch.tensor(batch.extend_lens, dtype=torch.int64).cumsum(0) - 1
+        req_rows = batch.req_pool_indices_cpu.to(torch.int64)
+        live = torch.arange(num_rows) < len(batch.reqs)
+        self._block_draft_worker.seed_recurrent_context(
+            target_hidden=target_hidden,
+            rows=pad_rows(last_rows, num_rows).to(self.device, non_blocking=True),
+            req_pool_indices=pad_rows(req_rows, num_rows).to(self.device, non_blocking=True),
+            live=live.to(self.device, non_blocking=True),
+        )
 
     def make_verify_input(
         self, *, batch: ScheduleBatch, verify_tokens: torch.Tensor, rows: VerifyRows
@@ -397,10 +428,25 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                     bonus_tokens,
                     torch.ones((padded_bs,), dtype=torch.float32).to(self.device),
                     torch.ones((padded_bs,), dtype=torch.int32).to(self.device),
+                    torch.zeros((padded_bs,), dtype=torch.int64, device=self.device),
                 )
                 draft_logits.float().cpu()
                 torch.cat([bonus_tokens[:, None], draft_tokens], dim=1).cpu()
                 self._warmup_sampled_accept(padded_bs, draft_tokens, draft_logits)
+
+    def _warmup_recurrent_context(self) -> None:
+        """Seeds after extend (every token bucket) and commit (every batch bucket)."""
+        compile_policy = self.target_worker.model_runner.compile_policy
+        assert isinstance(compile_policy, DecoderTpuCompilePolicy)
+        assert compile_policy.t_bucketer is not None
+        token_buckets = tuple(compile_policy.t_bucketer.buckets)
+        batch_buckets = self._bucket_sizes()
+        hidden_rows = token_buckets + tuple(bs * self.num_verify_rows for bs in batch_buckets)
+        num_rows = (batch_buckets[-1],) * len(token_buckets) + batch_buckets
+        with torch.no_grad(), self._block_draft_worker.draft_context():
+            self._block_draft_worker.warmup_recurrent_context(
+                hidden_rows=hidden_rows, num_rows=num_rows
+            )
 
     def _warmup_extend_draft_inputs(self) -> None:
         """extend's draft positions / cache_loc uploads at every token bucket."""

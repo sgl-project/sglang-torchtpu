@@ -147,6 +147,10 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
     def _infer_dflash_target_hidden_size(self) -> int:
         """Infer target hidden dimension for DFlash project_target_hidden."""
         model = self.model_runner.model
+        # A draft that takes the raw captured features reports their width itself.
+        width = getattr(model, "target_hidden_width", None)
+        if width is not None:
+            return int(width)
         fc = getattr(model, "fc", None)
         if fc is not None:
             # LinearBase (row-parallel included) reports the full input width.
