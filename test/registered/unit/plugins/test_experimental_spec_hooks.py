@@ -1544,7 +1544,8 @@ class TestExperimentalSpecHooks(CustomTestCase):
                     self.assertEqual(plan.host_len_slack, num_draft_tokens)
                     # A hybrid-SWA draft maps the live host rows to its SWA slots.
                     self.assertIs(
-                        plan.verify_cache_candidates_cpu, draft.tpu_verify_cache_candidates
+                        plan.verify_cache_candidates_cpu,
+                        draft.tpu_verify_cache_candidates,
                     )
                     self.assertEqual(plan.verify_cache_candidates.shape, (padded_bs, 6))
                     self.assertEqual(
