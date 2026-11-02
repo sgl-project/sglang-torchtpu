@@ -636,6 +636,36 @@ def _register_models() -> None:
     ModelRegistry.register_lazy("sglang_tpu.models")
 
 
+# Ports that serve correctly only through the direct tracer: the Dynamo path
+# lowers their compiled forward wrong (garbage prefill, layout dependent).
+_DIRECT_TRACER_ARCHITECTURES = frozenset({"Inkling2ForConditionalGeneration"})
+
+
+def _resolve_compile_tracer(server_args) -> None:
+    """Resolve an unset --tpu-compile-tracer: direct for the ports that need it, else dynamo."""
+    from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
+    from sglang.srt.arg_groups.platform_hook import handle_tpu_compile_tracer
+
+    cfg = resolving_view(server_args)
+    if cfg.tpu_compile_tracer is not None:
+        return
+    tracer = "dynamo"
+    try:
+        from sglang.srt.utils.hf_transformers.config import get_config
+
+        hf_config = get_config(
+            cfg.model_path, trust_remote_code=cfg.trust_remote_code, revision=cfg.revision
+        )
+        if set(hf_config.architectures or ()) & _DIRECT_TRACER_ARCHITECTURES:
+            tracer = "direct"
+    except Exception:
+        pass  # An unloadable model fails later with its real error.
+    declare_resolution(
+        server_args, "tpu.apply_server_args_defaults", tpu_compile_tracer=tracer
+    )
+    handle_tpu_compile_tracer(server_args)
+
+
 def _resolve_num_hidden_layers(server_args) -> int:
     """Layer count from the model's HF config (lru-cached load), 0 when
     unresolvable — an unloadable model fails later with its real error, and
@@ -847,6 +877,8 @@ class TpuSRTPlatform(SRTPlatform):
         # weights have loaded (its binder runs post-load).
         parts = static_fp8_parts()
         cfg = resolving_view(server_args)
+        # First: the context-parallel and DSA checks below read the resolved tracer.
+        _resolve_compile_tracer(server_args)
         if "latent_up" in parts:
             check_static_fp8_spec_batch(
                 parts,

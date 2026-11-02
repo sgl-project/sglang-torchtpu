@@ -2676,18 +2676,27 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
 
 
 class TestTpuCompileTracer(unittest.TestCase):
-    def test_default_is_dynamo(self):
-        args = ServerArgs(model_path="dummy")
-        self.assertEqual(args.tpu_compile_tracer, "dynamo")
+    def test_unset_resolves_to_dynamo_off_tpu(self):
+        # The TPU platform resolves an unset tracer per model; everywhere else
+        # the hook must settle it, or consumers would compare against None.
+        from sglang.srt.arg_groups.overrides import resolving_view
 
-    def test_eagle3_default_is_dynamo(self):
+        args = ServerArgs(model_path="dummy")
+        self.assertIsNone(args.tpu_compile_tracer)
+        handle_tpu_compile_tracer(args)
+        self.assertEqual(resolving_view(args).tpu_compile_tracer, "dynamo")
+
+    def test_unset_on_tpu_is_left_to_the_platform(self):
+        # Resolving it here would override the platform's per-model choice.
+        from sglang.srt.arg_groups.overrides import resolving_view
+
         args = ServerArgs(
             model_path="dummy",
             device="tpu",
             speculative_algorithm="EAGLE3",
         )
         handle_tpu_compile_tracer(args)
-        self.assertEqual(args.tpu_compile_tracer, "dynamo")
+        self.assertIsNone(resolving_view(args).tpu_compile_tracer)
 
     def test_direct_accepts_eagle3(self):
         args = ServerArgs(

@@ -197,6 +197,13 @@ def handle_hpu_backends(server_args: Any):
 
 def handle_tpu_compile_tracer(server_args: Any):
     cfg = resolving_view(server_args)
+    if cfg.tpu_compile_tracer is None:
+        # On TPU the platform defaults resolve it per model and re-run this check.
+        if cfg.device != "tpu":
+            declare_resolution(
+                server_args, "handle_tpu_compile_tracer", tpu_compile_tracer="dynamo"
+            )
+        return
     if cfg.tpu_compile_tracer == "dynamo":
         return
     if cfg.device != "tpu":

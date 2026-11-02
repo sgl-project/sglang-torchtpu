@@ -964,6 +964,19 @@ class ModelConfig:
             self.hf_config.architectures[0] = "InklingForConditionalGenerationMTP"
         if (
             is_draft_model
+            and self.hf_config.architectures[0] == "Inkling2ForConditionalGeneration"
+        ):
+            from sglang.tml.config import Inkling2MTPConfig
+
+            if self.speculative_algorithm not in (None, "DSPARK"):
+                raise ValueError("Inkling2 MTP requires --speculative-algorithm DSPARK")
+            if self.quantization is not None and self.is_draft_quantization_explicit:
+                raise ValueError("Inkling2 MTP uses its checkpoint BF16 precision")
+            self.quantization = None
+            self.hf_config = Inkling2MTPConfig.from_target(self.hf_config)
+            self.hf_text_config = self.hf_config
+        if (
+            is_draft_model
             and self.hf_config.architectures[0] == "GigaChat35ForCausalLM"
         ):
             self.hf_config.architectures[0] = "GigaChat35ForCausalLMNextN"
@@ -1456,8 +1469,6 @@ class ModelConfig:
         # Use vision_vocab_size for lm_head, LogitsProcessor, and graph-mode logits buffers.
         if _hf_arch(self.hf_config) == "GlmImageForConditionalGeneration":
             self.vocab_size = self.hf_text_config.vision_vocab_size
-        if _hf_arch(self.hf_config) == "Inkling2ForConditionalGeneration":
-            self.vocab_size = self.hf_text_config.padded_vocab_size
 
     def _init_mla_scaling(self, rope_scaling: Optional[dict]) -> None:
         """Base MLA attention scale from the head dims, then the rope mscale."""
