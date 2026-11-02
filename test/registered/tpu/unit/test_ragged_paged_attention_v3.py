@@ -931,6 +931,36 @@ class TestRaggedPagedAttentionV3RelBias(unittest.TestCase):
             m_block_sizes=(64, 128, 16, 32),
         )
 
+    def test_wide_compute_tile_is_sub_tiled(self):
+        """A compute tile wider than the bias tile (512 keys) is cut into bias
+        tiles where the bias is non-zero and left whole elsewhere; the kernel
+        used to refuse such tiles, which cost 3x at long context."""
+        inputs = self._build_inputs([(300, 300)])
+        self._run_and_compare(
+            inputs,
+            distribution=(0, 0, 1),
+            rel=self._rel_inputs(inputs),
+            m_block_sizes=(64, 1024, 64, 1024),
+        )
+        inputs = self._build_inputs([(260, 8), (300, 8)])
+        self._run_and_compare(
+            inputs,
+            distribution=(2, 2, 2),
+            rel=self._rel_inputs(inputs),
+            decode_query_size=8,
+            d_block_sizes=(8, 1024, 8, 1024),
+        )
+        # The kernel donates its inputs: rebuild them for the next call.
+        inputs = self._build_inputs([(260, 8), (300, 8)])
+        with self.assertRaises(ValueError):
+            self._run_and_compare(
+                inputs,
+                distribution=(2, 2, 2),
+                rel=self._rel_inputs(inputs),
+                decode_query_size=8,
+                d_block_sizes=(8, 1536, 8, 768),
+            )
+
     def test_decode_multi_seq(self):
         inputs = self._build_inputs([(260, 1), (37, 1), (129, 1)])
         self._run_and_compare(

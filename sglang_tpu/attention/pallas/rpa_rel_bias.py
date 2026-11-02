@@ -24,7 +24,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 REL_LANES = 128
 SINK_LANE = REL_LANES - 1
-# Largest KV compute tile the bias path supports; bounds the window table.
+# Largest KV tile the bias path handles at once; bounds the window table. A
+# wider compute tile is cut into tiles of this size when it needs the bias.
 REL_MAX_BKV_CSZ = 512
 # Rows per strided roll: Mosaic rejects strided shifts past one vreg's 128 lanes.
 _SHEAR_CHUNK = 64
@@ -32,6 +33,18 @@ _SHEAR_CHUNK = 64
 
 def _align(x: int, a: int) -> int:
     return (x + a - 1) // a * a
+
+
+def rel_sub_tile(bkv_csz: int) -> int:
+    """Keys per bias tile for a compute tile of ``bkv_csz`` keys."""
+    if bkv_csz <= REL_MAX_BKV_CSZ:
+        return bkv_csz
+    if bkv_csz % REL_MAX_BKV_CSZ:
+        raise ValueError(
+            f"{bkv_csz=} (bkv_csz) above {REL_MAX_BKV_CSZ} must be a multiple of it"
+            " with rel bias."
+        )
+    return REL_MAX_BKV_CSZ
 
 
 def rel_window_width(*, bkv_csz: int, bq_csz: int) -> int:

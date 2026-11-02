@@ -36,11 +36,11 @@ from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.attention.pallas.rpa_rel_bias import (
     REL_LANES,
-    REL_MAX_BKV_CSZ,
     add_rel_bias,
     build_rel_window_table,
     pack_rel_lanes,
     ref_rel_bias,
+    rel_sub_tile,
     rel_window_width,
     token_sink_rows,
 )
@@ -381,7 +381,7 @@ def _ragged_paged_attention_kernel_loop(
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128]
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim]
     rel_g_ref,  # [rel_window // 128, bq_csz * num_q_heads_per_kv_head, 128] f32 or None
-    rel_bias_ref,  # [cdiv(bkv_csz, 128), bq_csz * num_q_heads_per_kv_head, 128] f32 or None
+    rel_bias_ref,  # [cdiv(rel_csz, 128), bq_csz * num_q_heads_per_kv_head, 128] f32 or None
     *,
     causal: bool = True,
     sm_scale: float,
@@ -445,6 +445,7 @@ def _ragged_paged_attention_kernel_loop(
     assert bkv_sz % page_size == 0
     assert bkv_sz % bkv_csz == 0, f"bkv_sz={bkv_sz} not divisible by bkv_csz={bkv_csz}"
     bkv_p = bkv_sz // page_size
+    rel_csz = rel_sub_tile(bkv_csz)
     start_seq_idx, end_seq_idx = case.get_range(distribution_ref)
 
     q_start = cu_q_lens_ref[seq_idx]
@@ -489,8 +490,8 @@ def _ragged_paged_attention_kernel_loop(
         assert q.shape[0] % num_q_heads_per_kv_head == 0
         assert q.shape[1] == head_dim
         actual_bq_csz = q.shape[0] // num_q_heads_per_kv_head
-        assert k.shape == (bkv_csz, head_dim)
-        assert v.shape == (bkv_csz, head_dim)
+        assert k.shape[1] == head_dim
+        assert v.shape == k.shape
         assert l_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
         assert m_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
         assert k.dtype == v.dtype
@@ -519,7 +520,7 @@ def _ragged_paged_attention_kernel_loop(
         if xai_temperature_reg is not None:
             s = s * xai_temperature_reg[:, None]
 
-        if rel_extent is not None:
+        if rel_extent is not None and rel_r is not None:
             s = add_rel_bias(
                 s,
                 rel_r,
@@ -592,9 +593,8 @@ def _ragged_paged_attention_kernel_loop(
     ):
         assert len(p.shape) == 2
         assert p.shape[0] % num_q_heads_per_kv_head == 0
-        assert p.shape[1] == bkv_csz
         actual_bq_csz = p.shape[0] // num_q_heads_per_kv_head
-        assert v.shape == (bkv_csz, head_dim)
+        assert v.shape == (p.shape[1], head_dim)
         assert exp_m_diff.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
         assert o_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, head_dim)
         pv = jnp.matmul(p, v, preferred_element_type=jnp.float32)
@@ -1143,49 +1143,86 @@ def _ragged_paged_attention_kernel_loop(
                                     q_head_start : q_head_start + q_head_sz
                                 ]
 
-                            for kv_head_idx in range(actual_num_kv_heads):
-                                bk_c, bv_c = load_bkv(
-                                    bkv_sem_idx,
-                                    kv_head_idx,
-                                    bkv_start,
-                                    bkv_csz,
-                                )
-                                bq_c = load_bq(
-                                    bq_sem_idx, kv_head_idx, bq_start, actual_bq_csz
-                                )
-                                rel_r_c = None
-                                if use_rel_lanes:
-                                    rel_r_c = bq_c[:, head_dim:]
-                                    bq_c = bq_c[:, :head_dim]
-
-                                lm_slice_start = bq_start * num_q_heads_per_kv_head
-                                lm_slice_size = actual_bq_csz * num_q_heads_per_kv_head
-                                lm_slice = (
-                                    kv_head_idx,
-                                    pl.ds(lm_slice_start, lm_slice_size),
-                                )
-
-                                cur_p, cur_v, cur_exp_m_diff = (
-                                    flash_attention_step1_qk_softmax(
-                                        bq_c,
-                                        bk_c,
-                                        bv_c,
-                                        l_ref.at[lm_slice],
-                                        m_ref.at[lm_slice],
-                                        processed_q_len=processed_q_len + bq_start,
-                                        processed_kv_len=processed_kv_len + bkv_start,
-                                        effective_kv_len=effective_kv_len,
-                                        xai_temperature_reg=cur_xai_temp,
-                                        custom_mask_data=cur_mask_data,
-                                        rel_r=rel_r_c,
+                            def compute_tile(*, with_rel_bias):
+                                sub_csz = rel_csz if with_rel_bias else bkv_csz
+                                for kv_head_idx in range(actual_num_kv_heads):
+                                    bq_c = load_bq(
+                                        bq_sem_idx, kv_head_idx, bq_start, actual_bq_csz
                                     )
+                                    rel_r_c = None
+                                    if use_rel_lanes:
+                                        if with_rel_bias:
+                                            rel_r_c = bq_c[:, head_dim:]
+                                        bq_c = bq_c[:, :head_dim]
+
+                                    lm_slice_start = bq_start * num_q_heads_per_kv_head
+                                    lm_slice_size = (
+                                        actual_bq_csz * num_q_heads_per_kv_head
+                                    )
+                                    lm_slice = (
+                                        kv_head_idx,
+                                        pl.ds(lm_slice_start, lm_slice_size),
+                                    )
+
+                                    for sub_start in range(0, bkv_csz, sub_csz):
+                                        bk_c, bv_c = load_bkv(
+                                            bkv_sem_idx,
+                                            kv_head_idx,
+                                            bkv_start + sub_start,
+                                            sub_csz,
+                                        )
+                                        sub_mask_data = cur_mask_data
+                                        if sub_mask_data is not None:
+                                            sub_mask_data = cur_mask_data[
+                                                :, sub_start : sub_start + sub_csz
+                                            ]
+                                        cur_p, cur_v, cur_exp_m_diff = (
+                                            flash_attention_step1_qk_softmax(
+                                                bq_c,
+                                                bk_c,
+                                                bv_c,
+                                                l_ref.at[lm_slice],
+                                                m_ref.at[lm_slice],
+                                                processed_q_len=processed_q_len
+                                                + bq_start,
+                                                processed_kv_len=processed_kv_len
+                                                + bkv_start
+                                                + sub_start,
+                                                effective_kv_len=effective_kv_len,
+                                                xai_temperature_reg=cur_xai_temp,
+                                                custom_mask_data=sub_mask_data,
+                                                rel_r=rel_r_c,
+                                            )
+                                        )
+                                        flash_attention_step2_pv(
+                                            cur_p,
+                                            cur_v,
+                                            cur_exp_m_diff,
+                                            acc_ref.at[lm_slice],
+                                        )
+
+                            if rel_extent is None:
+                                compute_tile(with_rel_bias=False)
+                            else:
+                                # The bias is zero on a tile whose every
+                                # (query, key) distance lies outside
+                                # [0, extent); at long context that is nearly
+                                # every tile, and add_rel_bias costs more than
+                                # the attention itself.
+                                q_pos0 = processed_q_len + bq_start
+                                k_pos0 = processed_kv_len + bkv_start
+                                tile_in_extent = jnp.logical_and(
+                                    q_pos0 + actual_bq_csz - 1 >= k_pos0,
+                                    q_pos0 - k_pos0 - bkv_csz + 1 < rel_extent,
                                 )
-                                flash_attention_step2_pv(
-                                    cur_p,
-                                    cur_v,
-                                    cur_exp_m_diff,
-                                    acc_ref.at[lm_slice],
-                                )
+
+                                @pl.when(tile_in_extent)
+                                def _():
+                                    compute_tile(with_rel_bias=True)
+
+                                @pl.when(jnp.logical_not(tile_in_extent))
+                                def _():
+                                    compute_tile(with_rel_bias=False)
 
             # Load acc and calculate final output.
             acc = acc_ref[...]
@@ -1563,10 +1600,8 @@ def static_validate_inputs(
             ("prefill", p_block_sizes),
             ("mixed", m_block_sizes),
         ):
-            if block_sizes is not None and block_sizes[3] > REL_MAX_BKV_CSZ:
-                raise ValueError(
-                    f"{name} {block_sizes[3]=} (bkv_csz) exceeds {REL_MAX_BKV_CSZ} with rel bias."
-                )
+            if block_sizes is not None:
+                rel_sub_tile(block_sizes[3])  # raises when bkv_csz cannot be tiled
     if token_sink is not None:
         if token_sink.shape != q.shape[:2]:
             raise ValueError(f"Expected {token_sink.shape=} to be {q.shape[:2]}.")
@@ -2038,7 +2073,9 @@ def ragged_paged_attention(
         rel_window = None
         rel_table = None
         if rel_extent is not None:
-            rel_window = rel_window_width(bkv_csz=bkv_csz, bq_csz=bq_csz)
+            rel_window = rel_window_width(
+                bkv_csz=rel_sub_tile(bkv_csz), bq_csz=bq_csz
+            )
             rel_table = build_rel_window_table(rel_proj, window=rel_window)
 
         out_specs = [
@@ -2103,7 +2140,11 @@ def ragged_paged_attention(
             ),  # rel_g, lane-fold-major
             (
                 pltpu.VMEM(
-                    (cdiv(bkv_csz, 128), bq_csz * num_q_heads_per_kv_head, 128),
+                    (
+                        cdiv(rel_sub_tile(bkv_csz), 128),
+                        bq_csz * num_q_heads_per_kv_head,
+                        128,
+                    ),
                     jnp.float32,
                 )
                 if rel_extent is not None
@@ -2238,18 +2279,9 @@ def ragged_paged_attention(
 
         return run(scalar_prefetches, q, kv, kv_cache, o_init)
 
-    def _cap_rel_bkv_csz(sizes):
-        # The bias window table grows with bkv_csz; keep a divisor of bkv_sz.
-        if rel_extent is None or sizes["bkv_csz"] <= REL_MAX_BKV_CSZ:
-            return sizes
-        bkv_csz = REL_MAX_BKV_CSZ
-        while sizes["bkv_sz"] % bkv_csz:
-            bkv_csz -= page_size
-        return {**sizes, "bkv_csz": bkv_csz}
-
     def _prepare_block_sizes(block_sizes, case):
         if block_sizes is None:
-            return _cap_rel_bkv_csz(_default_block_sizes(case))
+            return _default_block_sizes(case)
 
         return {
             "bq_sz": block_sizes[0],
