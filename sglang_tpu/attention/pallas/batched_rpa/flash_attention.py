@@ -82,6 +82,29 @@ def flash_attention_qk_softmax(
     qk_masked = []
     masks = []
 
+    sliding_window = cfgs.model.sliding_window
+    if (
+        kv_len_left is not None
+        and sliding_window is None
+        and kv_new_start_left is None
+    ):
+        # Pure prefix attention (CACHE_ONLY, or STRIPED where every query
+        # follows every key of the stripe): the causal compare is always
+        # true, so the only mask is the stripe's length, which depends on the
+        # key index alone. Build it on a [1, 1, s] iota and let it broadcast
+        # over the heads and queries instead of materializing the
+        # [k_heads, tq, s] q/kv iotas and their difference (g3 cl/1005950290:
+        # 10-20% faster DCP cache-only / striped passes).
+        kv_iota = lax.broadcasted_iota(jnp.int32, (1, 1, s), 2)
+        for b_idx in range(cfgs.block.batch_size):
+            mask_b = kv_iota < kv_len_left[b_idx]
+            masks.append(mask_b)
+            qk_masked.append(jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value))
+        qk = jnp.stack(qk_masked, axis=0)
+        return _softmax_stats(
+            step, qk, masks, m_prev, l_prev, is_last_k, zero_masked=True, cfgs=cfgs
+        )
+
     kv_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 2)
     q_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1)
     q_iota //= cfgs.aligned_num_q_heads_per_kv_head
@@ -120,7 +143,7 @@ def flash_attention_qk_softmax(
         if kv_new_start_left is not None:
             mask_b = jnp.logical_and(mask_b, kv_iota >= kv_new_start_left[b_idx])
 
-        if (sliding_window := cfgs.model.sliding_window) is not None:
+        if sliding_window is not None:
             # NOTE: Goal is to compute q_len < sliding_window + kv_len. And similar
             # to above, we want to minimize vector compute. Therefore, we break
             # down computes into following steps.
@@ -147,7 +170,33 @@ def flash_attention_qk_softmax(
         masks.append(mask_b)
         qk_masked.append(jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value))
     qk = jnp.stack(qk_masked, axis=0)
+    return _softmax_stats(
+        step,
+        qk,
+        masks,
+        m_prev,
+        l_prev,
+        is_last_k,
+        zero_masked=kv_len_left is not None,
+        cfgs=cfgs,
+    )
 
+
+def _softmax_stats(
+    step: jax.Array,
+    qk: jax.Array,  # [B, KV, TQ, S], masked
+    masks: list[jax.Array],  # B * ([KV, TQ, S] or [1, 1, S])
+    m_prev: jax.Array,
+    l_prev: jax.Array,
+    is_last_k: jax.Ref,
+    *,
+    zero_masked: bool,
+    cfgs: configs.RpaConfigs,
+):
+    """Online-softmax statistics of a masked ``qk`` block, carried across the
+    batch lanes in order. ``zero_masked`` zeroes p on the masked keys (a row
+    with no key in range then keeps l == 0 instead of weighting masked keys by
+    exp(mask_value - mask_value)); the scopes whose rows can be empty set it."""
     m_curr = jnp.max(qk, axis=-1, keepdims=True)
 
     alpha_list = []
@@ -163,9 +212,7 @@ def flash_attention_qk_softmax(
 
     m_next = jnp.stack(m_next_list, axis=0)
     p = jnp.exp(qk - utils.broadcast_minor(m_next, qk.shape))
-    if kv_len_left is not None:
-        # A row with no key in range keeps l == 0 rather than weighting masked
-        # keys by exp(mask_value - mask_value).
+    if zero_masked:
         p = jnp.where(jnp.stack(masks, axis=0), p, 0)
     p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out)
 
