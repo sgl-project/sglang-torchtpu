@@ -159,9 +159,9 @@ class TpuEnvs:
     # fixed count.
     SGLANG_TPU_K3_PROGRAM_PREFILL_SHARE = EnvFloat(0.0)
     # Colocated K3_PROGRAM engines: while requests decode, a waiting prefill
-    # starts only once the oldest waiting request has waited this many
-    # seconds (each prefill batch stops every decoding request). 0: off.
-    SGLANG_TPU_K3_PROGRAM_PREFILL_WAIT_S = EnvFloat(0.0)
+    # waits up to this many scheduler rounds in a row (each prefill batch
+    # stops every decoding request; rounds keep TP ranks in step). 0: off.
+    SGLANG_TPU_K3_PROGRAM_PREFILL_WAIT_ROUNDS = EnvInt(0)
 
     # Host padding is unconditional; this routes speculative batches to the
     # experimental spec worker, which keeps their metadata on the host as well.

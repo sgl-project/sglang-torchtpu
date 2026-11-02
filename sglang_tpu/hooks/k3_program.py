@@ -95,8 +95,9 @@ k3_program_prefill_wait
        (ITL mean 3.11 ms against a 2.79 ms median at concurrency 4 on
        hardware), while the trace's sessions sit idle most of the time.
   How: AROUND sglang.srt.managers.scheduler.Scheduler._should_defer_prefill
-       defers a new prefill while requests decode until the oldest waiting
-       (or chunked) request has waited SGLANG_TPU_K3_PROGRAM_PREFILL_WAIT_S;
+       defers a new prefill while requests decode for up to
+       SGLANG_TPU_K3_PROGRAM_PREFILL_WAIT_ROUNDS scheduler rounds in a row
+       (rounds, not seconds: every TP rank must take the same branch);
        otherwise the scheduler's own interval decides.
   Upstream PR or issue: <to be filed> (a scheduling policy seam for
        prefill/decode priority).
@@ -284,37 +285,35 @@ def k3_program_prefill_share(original, scheduler: Any, batch: Any, *args, **kwar
     return result
 
 
-def prefill_wait_defers(scheduler: Any, wait_s: float, now: float) -> bool:
+def prefill_wait_defers(scheduler: Any, rounds: int) -> bool:
     """Whether a colocated engine holds its next prefill back: requests are
-    decoding and the oldest waiting (or chunked) request has waited less than
-    ``wait_s`` seconds."""
+    decoding and requests wait, for at most ``rounds`` scheduler rounds in a
+    row. Counted in rounds, not seconds: every TP rank must take the same
+    branch (a rank prefilling while another decodes mismatches their
+    collectives and hangs the slice), and the ranks see the same queues each
+    round but not the same clocks."""
     running = scheduler.running_batch
-    if running is None or running.is_empty() or running.is_prefill_only:
-        return False
-    pending = list(scheduler.waiting_queue)
-    if scheduler.chunked_req is not None:
-        pending.append(scheduler.chunked_req)
-    entries = [
-        req.time_stats.wait_queue_entry_time
-        for req in pending
-        if req.time_stats.wait_queue_entry_time
-    ]
-    return bool(entries) and now - min(entries) < wait_s
+    decoding = not (running is None or running.is_empty() or running.is_prefill_only)
+    waiting = bool(scheduler.waiting_queue) or scheduler.chunked_req is not None
+    held = getattr(scheduler, "_k3_prefill_wait_rounds", 0)
+    if decoding and waiting and held < rounds:
+        scheduler._k3_prefill_wait_rounds = held + 1
+        return True
+    scheduler._k3_prefill_wait_rounds = 0
+    return False
 
 
 def k3_program_prefill_wait(original, scheduler: Any, *args, **kwargs) -> bool:
     """AROUND Scheduler._should_defer_prefill."""
-    import time
-
     from sglang.srt.disaggregation.utils import DisaggregationMode
     from sglang_tpu.envs import envs as tpu_envs
 
-    wait_s = tpu_envs.SGLANG_TPU_K3_PROGRAM_PREFILL_WAIT_S.get()
+    rounds = tpu_envs.SGLANG_TPU_K3_PROGRAM_PREFILL_WAIT_ROUNDS.get()
     if (
-        wait_s > 0
+        rounds > 0
         and k3_program_active()
         and scheduler.disaggregation_mode == DisaggregationMode.NULL
-        and prefill_wait_defers(scheduler, wait_s, time.perf_counter())
+        and prefill_wait_defers(scheduler, rounds)
     ):
         return True
     return original(scheduler, *args, **kwargs)
