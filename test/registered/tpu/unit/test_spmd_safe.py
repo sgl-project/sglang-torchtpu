@@ -282,9 +282,7 @@ def _run_shared_checks(group) -> None:
         for _ in range(2):
             with collect_warmups(group=group):
                 for factor in factors:
-                    warmup_compiled_op(
-                        _scale, make_args=lambda: ((base,), {"factor": factor})
-                    )
+                    warmup_compiled_op(_scale, base, factor=factor)
         # Owners are assigned round-robin in warmup order.
         checks.assertEqual(_SCALED_TRACES, [2, 3][rank : rank + 1] * 2)
         for factor in factors:
@@ -384,8 +382,8 @@ def _run_worker(mode: str) -> None:
             lift_rank=False,
         )
 
-        def unused_inputs():
-            raise AssertionError("Unshared warmup inputs must not be constructed")
+        def unshared_forward(value):
+            raise AssertionError("Unshared warmup must not be traced")
 
         with (
             get_context().override_server_args(
@@ -395,13 +393,11 @@ def _run_worker(mode: str) -> None:
             envs.SGLANG_DIRECT_COMPILE_ASYNC.override(False),
         ):
             with collect_warmups(group=group) as queue:
-                warmup_compiled_op(compiled_op()(forward), make_args=unused_inputs)
+                warmup_compiled_op(compiled_op()(unshared_forward), value)
                 warmup_compiled_op(
                     _scale,
-                    make_args=lambda: (
-                        (torch.ones((128, 128)).to("tpu"),),
-                        {"factor": 2},
-                    ),
+                    torch.ones((128, 128)).to("tpu"),
+                    factor=2,
                 )
                 queue.calls.append(compiled.warmup_async(value))
         raise AssertionError("Verification must exit before warmup execution")

@@ -110,7 +110,7 @@ def compiled_op(
         specialization_key = functools.partial(_specialization_key, spmd_safe)
 
         @functools.wraps(fn)
-        def wrapper(*args, _warmup_async=False, _make_warmup_args=None, **kwargs):
+        def wrapper(*args, _warmup_async=False, **kwargs):
             nonlocal compiled_fn, use_direct
             if torch.compiler.is_compiling():
                 return fn(*args, **kwargs)
@@ -119,8 +119,6 @@ def compiled_op(
             queue = current_warmup_queue() if _warmup_async else None
             if queue is not None and queue.verify and not spmd_safe:
                 return None
-            if _make_warmup_args is not None:
-                args, kwargs = _make_warmup_args()
             # Positional warmups and keyword callers share a specialization.
             bound = signature.bind(*args, **kwargs)
             bound.apply_defaults()
@@ -185,22 +183,8 @@ def compiled_op(
     return decorator
 
 
-def warmup_compiled_op(
-    op: Callable,
-    *args,
-    make_args: Callable[[], tuple[tuple[Any, ...], dict[str, Any]]] | None = None,
-    **kwargs,
-) -> None:
-    """Submit output-free warmup to the current queue, or finish immediately.
-
-    ``make_args`` returns ``(args, kwargs)`` only if the helper needs warming.
-    Use it instead of eager inputs to avoid allocations for unshared helpers
-    during SPMD verification. The factory runs synchronously on submission.
-    """
-    if make_args is not None and (args or kwargs):
-        raise ValueError("Pass either make_args or warmup arguments, not both")
-    if make_args is not None:
-        kwargs["_make_warmup_args"] = make_args
+def warmup_compiled_op(op: Callable, *args, **kwargs) -> None:
+    """Submit output-free warmup to the current queue, or finish immediately."""
     pending = op(*args, _warmup_async=True, **kwargs)
     if pending is not None:
         queue = current_warmup_queue()

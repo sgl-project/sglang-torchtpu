@@ -234,14 +234,13 @@ def _make_pruning_function(model, kv_pool, callback_values, **compile_options):
 
 
 class TestDirectCompile(CustomTestCase):
-    def test_lazy_helper_warmup_preserves_shared_queue_participation(self):
+    def test_helper_warmup_preserves_shared_queue_participation(self):
         for verify, shared in ((False, False), (True, False), (True, True)):
             with self.subTest(verify=verify, shared=shared):
                 queue = SimpleNamespace(verify=verify, spmd_compiler=object(), calls=[])
                 compiled = MagicMock()
                 compiled.cache = {}
                 compiled.precompile.return_value = PendingCall(lambda: None)
-                factory = MagicMock(return_value=((torch.ones(2),), {"factor": 3}))
 
                 def scale(value, factor):
                     return value * factor
@@ -270,10 +269,7 @@ class TestDirectCompile(CustomTestCase):
                     envs.SGLANG_DIRECT_COMPILE_ASYNC.override(False),
                 ):
                     for _ in range(2):
-                        warmup_compiled_op(op, make_args=factory)
-                    self.assertEqual(
-                        factory.call_count, 0 if verify and not shared else 2
-                    )
+                        warmup_compiled_op(op, torch.ones(2), factor=3)
                     self.assertEqual(
                         compile_fn.call_count, 0 if verify and not shared else 1
                     )
@@ -285,9 +281,6 @@ class TestDirectCompile(CustomTestCase):
                     # Verification must never suppress ordinary helper execution.
                     op(torch.ones(2), 3)
                     compiled.assert_called_once()
-
-        with self.assertRaisesRegex(ValueError, "either make_args"):
-            warmup_compiled_op(op, torch.ones(2), make_args=factory)
 
     def test_verification_skips_only_unshared_warmups(self):
         for verify, shared in ((False, False), (True, False), (True, True)):
