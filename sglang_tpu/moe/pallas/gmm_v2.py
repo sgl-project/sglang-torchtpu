@@ -23,6 +23,7 @@
 
 import dataclasses
 import functools
+import logging
 from typing import Any, Callable, Tuple
 
 import jax
@@ -77,6 +78,19 @@ def silu_and_mul_clamp(
 
 
 _MXFP4_BLOCK_SIZE = 32
+_PACKED_FP4_BLOCK_SIZES = (16, _MXFP4_BLOCK_SIZE, 64, 128, 256, 512)
+
+logger = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=None)
+def _log_packed_fp4_route(block_size: int, w4a16: bool, dequantize_rhs: bool) -> None:
+    logger.info(
+        "gmm_v2 packed_fp4 rhs: block_size=%d %s dequantize_rhs=%s",
+        block_size,
+        "W4A16" if w4a16 else "W4A8",
+        dequantize_rhs,
+    )
 
 
 def apply_act_fn(acc: jax.Array, tile_n: int, fuse_act: str | None):
@@ -1467,18 +1481,20 @@ def make_gmm_configs(
         rhs_packing = 1
 
     lhs_quant_block_size = 512
-    if packed_fp4 and block_size not in (_MXFP4_BLOCK_SIZE, lhs_quant_block_size):
+    if packed_fp4 and block_size not in _PACKED_FP4_BLOCK_SIZES:
         raise NotImplementedError(
-            "Packed FP4 GMM requires quantization block size 32 (MXFP4) or 512 "
-            f"(NVFP4), got {block_size}."
+            "Packed FP4 GMM requires quantization block size in "
+            f"{_PACKED_FP4_BLOCK_SIZES}, got {block_size}."
         )
 
-    # FP4 scale blocks narrower than the lhs block run W4A16; wider ones run W4A8.
-    fp4_w4a16 = packed_fp4 and block_size < lhs_quant_block_size
+    # FP4 scale blocks up to 128 run W4A16 via VMEM dequantization; 256/512 run W4A8.
+    fp4_w4a16 = packed_fp4 and block_size <= 128
     if fp4_w4a16 and scale_block_n == 1:
-        # 32-wide MXFP4 blocks would split the matmul into short-K products;
+        # Narrow FP4 blocks would split the matmul into short-K products;
         # dequantize in VMEM and run one tile_k matmul instead.
         dequantize_rhs = True
+    if packed_fp4:
+        _log_packed_fp4_route(block_size, fp4_w4a16, dequantize_rhs)
 
     rhs_cfgs = InputConfigs(
         quant_dtype=rhs_quant_dtype,

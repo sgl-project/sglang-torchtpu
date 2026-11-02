@@ -32,6 +32,8 @@ def _make_block512_layer(
 ) -> torch.nn.Module:
     layer = torch.nn.Module()
     layer.moe_runner_config = types.SimpleNamespace(is_gated=True, activation="silu")
+    # Masked routing slots are spread over all experts by apply_tpu_nvfp4_moe.
+    layer.num_experts = EXPERTS
     layer.register_parameter(
         "w13_weight",
         torch.nn.Parameter(
@@ -102,13 +104,19 @@ class TestNvfp4Block512Contract(CustomTestCase):
         )
 
         layer = _make_block512_layer()
-        expected_w13 = layer.w13_weight.data.permute(0, 2, 1).contiguous()
-        expected_w2 = layer.w2_weight.data.permute(0, 2, 1).contiguous()
+        expected_w13 = layer.w13_weight.data.permute(0, 2, 1).contiguous().clone()
+        expected_w2 = layer.w2_weight.data.permute(0, 2, 1).contiguous().clone()
         expected_w13_scale = (
-            layer.w13_weight_scale.data.permute(0, 2, 1).contiguous().unsqueeze(2)
+            layer.w13_weight_scale.data.permute(0, 2, 1)
+            .contiguous()
+            .unsqueeze(2)
+            .clone()
         )
         expected_w2_scale = (
-            layer.w2_weight_scale.data.permute(0, 2, 1).contiguous().unsqueeze(2)
+            layer.w2_weight_scale.data.permute(0, 2, 1)
+            .contiguous()
+            .unsqueeze(2)
+            .clone()
         )
 
         prepare_tpu_nvfp4_moe_weights(layer)
@@ -175,20 +183,45 @@ class TestNvfp4Block512Contract(CustomTestCase):
                         use_fused_rs=use_fused_rs,
                     )
 
-    def test_sub512_rejects_stock_pallas_layout(self):
+    def test_sub512_formats_stock_pallas_layout(self):
         from sglang_tpu.fp4_moe import (
             prepare_tpu_nvfp4_moe_weights,
         )
 
         for group_size in (16, 32, 64, 128, 256):
-            with (
-                self.subTest(group_size=group_size),
-                self.assertRaisesRegex(NotImplementedError, "requires the fused-RS"),
-            ):
+            with self.subTest(group_size=group_size):
+                layer = _make_block512_layer(group_size=group_size)
+                old_storages = [
+                    layer.w13_weight.data.untyped_storage(),
+                    layer.w13_weight_scale.data.untyped_storage(),
+                    layer.w2_weight.data.untyped_storage(),
+                    layer.w2_weight_scale.data.untyped_storage(),
+                ]
                 prepare_tpu_nvfp4_moe_weights(
-                    _make_block512_layer(group_size=group_size),
+                    layer,
                     group_size=group_size,
+                    use_fused_rs=False,
                 )
+                for st in old_storages:
+                    self.assertEqual(st.nbytes(), 0)
+                self.assertEqual(
+                    tuple(layer.w13_weight.shape),
+                    (EXPERTS, HIDDEN_SIZE // 2, 2 * INTERMEDIATE_SIZE),
+                )
+                self.assertEqual(
+                    tuple(layer.w13_weight_scale.shape),
+                    (EXPERTS, HIDDEN_SIZE // group_size, 1, 2 * INTERMEDIATE_SIZE),
+                )
+                self.assertEqual(
+                    tuple(layer.w2_weight.shape),
+                    (EXPERTS, INTERMEDIATE_SIZE // 2, HIDDEN_SIZE),
+                )
+                self.assertEqual(
+                    tuple(layer.w2_weight_scale.shape),
+                    (EXPERTS, INTERMEDIATE_SIZE // group_size, 1, HIDDEN_SIZE),
+                )
+                self.assertIsNone(layer._parameters["w13_weight_scale_2"])
+                self.assertIsNone(layer._parameters["w2_weight_scale_2"])
 
     def test_scale_storage_dtype(self):
         from sglang_tpu.fp4_moe import (
@@ -550,6 +583,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         layer = _make_block512_layer(include_unused_params=False)
         layer._tpu_fused_rs_has_post_expert_norm = False
         layer._tpu_fused_rs_group_offset = torch.tensor([0], dtype=torch.int32)
+        layer._tpu_w13_global_scale = layer._tpu_w2_global_scale = None
         layer.moe_ep_size = 1
         from sglang_tpu.moe.pallas import fused_moe_rs_op
 
@@ -575,7 +609,8 @@ class TestNvfp4Block512Contract(CustomTestCase):
         self.assertFalse(call["fp8_direct_write"])
         self.assertFalse(call["has_post_expert_norm"])
         self.assertNotIn("collective_id", call)
-        self.assertEqual(call["topk_ids"][1, 1].item(), 0)
+        # A masked slot becomes a real expert id with weight 0 (spread, not expert 0).
+        self.assertTrue(0 <= call["topk_ids"][1, 1].item() < EXPERTS)
         self.assertEqual(call["topk_weights"][1, 1].item(), 0)
         self.assertEqual(tuple(result.hidden_states.shape), (3, HIDDEN_SIZE))
 
@@ -599,6 +634,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 layer = _make_block512_layer(include_unused_params=False)
                 layer._tpu_fused_rs_has_post_expert_norm = False
                 layer._tpu_fused_rs_group_offset = torch.tensor([0], dtype=torch.int32)
+                layer._tpu_w13_global_scale = layer._tpu_w2_global_scale = None
                 layer.moe_ep_size = 1
                 fused_moe_rs_gather = mock.Mock(
                     side_effect=lambda **kwargs: kwargs["hidden_states"]
@@ -663,6 +699,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         layer = _make_block512_layer(include_unused_params=False)
         layer._tpu_fused_rs_has_post_expert_norm = False
         layer._tpu_fused_rs_group_offset = torch.tensor([0], dtype=torch.int32)
+        layer._tpu_w13_global_scale = layer._tpu_w2_global_scale = None
         layer.moe_ep_size = 2
 
         # Model rank 0's output is the first partition of each kernel result.
@@ -1378,29 +1415,100 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
         self.assertFalse(resolved)
         self.assertFalse(prepared["use_fused_rs"])
 
-    def test_sub512_auto_backend_fails_closed_on_unsupported_layout(self):
+    def test_sub512_auto_backend_falls_back_to_stock_pallas(self):
         for group_size in (16, 32, 64, 128, 256):
-            with (
-                self.subTest(group_size=group_size),
-                self.assertRaisesRegex(ValueError, "requires the fused-RS"),
-            ):
-                self._run_gate(
-                    ep_size=2,
-                    world_size=4,
-                    group_size=group_size,
-                )
+            for ep_size, world_size in ((1, 1), (2, 4)):
+                with self.subTest(
+                    group_size=group_size, ep_size=ep_size, world_size=world_size
+                ):
+                    _, resolved, prepared, _ = self._run_gate(
+                        ep_size=ep_size,
+                        world_size=world_size,
+                        group_size=group_size,
+                    )
+                    self.assertFalse(resolved)
+                    self.assertFalse(prepared["use_fused_rs"])
 
     def test_explicit_pallas_backend_fails_closed(self):
-        with self.assertRaisesRegex(ValueError, "Unmet requirements"):
-            self._run_gate(
-                ep_size=2,
-                world_size=4,
-                backend="pallas_tpu_fused_rs",
-            )
+        for group_size in (16, 512):
+            with (
+                self.subTest(group_size=group_size),
+                self.assertRaisesRegex(ValueError, "Unmet requirements"),
+            ):
+                self._run_gate(
+                    ep_size=1,
+                    world_size=1,
+                    group_size=group_size,
+                    backend="pallas_tpu_fused_rs",
+                )
 
     def test_rejects_non_pallas_backend_on_tpu(self):
         with self.assertRaisesRegex(ValueError, "supports only"):
             self._run_gate(backend="triton")
+
+
+@unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
+class TestGmmV2PackedFp4BlockSizes(CustomTestCase):
+    def _make_cfgs(self, block_size: int):
+        import jax
+        import jax.numpy as jnp
+
+        from sglang_tpu.moe.pallas import gmm_v2
+
+        lhs = jax.ShapeDtypeStruct((128, 1024), jnp.bfloat16)
+        rhs = jax.ShapeDtypeStruct((2, 1024 // 2, 256), jnp.uint8)
+        rhs_scale = jax.ShapeDtypeStruct((2, 1024 // block_size, 1, 256), jnp.float32)
+        group_sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
+        group_offset = jax.ShapeDtypeStruct((1,), jnp.int32)
+        fake_tpu = types.SimpleNamespace(
+            fp8_ops_per_second=1.0,
+            int8_ops_per_second=1.0,
+            num_lanes=128,
+            num_sublanes=8,
+            get_sublane_tiling=lambda _dtype: 16,
+        )
+        with mock.patch.object(gmm_v2.pltpu, "get_tpu_info", return_value=fake_tpu):
+            return gmm_v2.make_gmm_configs(
+                lhs,
+                rhs,
+                rhs_scale,
+                None,
+                group_sizes,
+                group_offset,
+                tile_info=gmm_v2.TileSizes(tile_m=128, tile_k=512, tile_n=128),
+                vmem_limit_bytes=64 * 1024 * 1024,
+                out_dtype=None,
+                acc_dtype=None,
+                maybe_quantize_lhs=True,
+                zero_initialize=True,
+                packed_fp4=True,
+            )
+
+    def test_narrow_blocks_select_vmem_dequant_w4a16(self):
+        for block_size in (16, 32, 64, 128):
+            with self.subTest(block_size=block_size):
+                cfgs = self._make_cfgs(block_size)
+                self.assertTrue(cfgs.rhs_cfgs.dequantize_in_vmem)
+                self.assertIsNone(cfgs.lhs_cfgs.quant_dtype)
+                self.assertEqual(cfgs.rhs_cfgs.quant_block_size, block_size)
+
+    def test_wide_blocks_select_fp8_w4a8(self):
+        import jax.numpy as jnp
+
+        for block_size in (256, 512):
+            with self.subTest(block_size=block_size):
+                cfgs = self._make_cfgs(block_size)
+                self.assertFalse(cfgs.rhs_cfgs.dequantize_in_vmem)
+                self.assertEqual(cfgs.lhs_cfgs.quant_dtype, jnp.float8_e4m3fn.dtype)
+                self.assertEqual(cfgs.lhs_cfgs.quant_block_size, block_size)
+
+    def test_rejects_unsupported_packed_fp4_block_size(self):
+        for block_size in (4, 8):
+            with (
+                self.subTest(block_size=block_size),
+                self.assertRaisesRegex(NotImplementedError, "Packed FP4 GMM"),
+            ):
+                self._make_cfgs(block_size)
 
 
 if __name__ == "__main__":

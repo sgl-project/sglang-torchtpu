@@ -224,12 +224,37 @@ class TpuEnvs:
     SGLANG_TPU_FP4_DEQUANT_VIA_FP8 = EnvBool(False)
     # Tuning only: comma list of fused-RS row buckets to keep (the tile_m bucket always stays).
     SGLANG_TPU_FUSED_RS_M_BUCKETS = EnvStr(None)
+    # Fused-RS NVFP4 tiles of at most this many rows run the block-diagonal fp8 dot (e2m1
+    # codes to the MXU as e4m3, block scales applied to per-group partial products) instead
+    # of dequantizing the weight tile to bf16; 0 disables. Decode tiles hold 1-8 rows.
+    SGLANG_TPU_FUSED_RS_BLOCKDIAG_ROWS = EnvInt(0)
+    # K chunk of the block-diagonal fp8 dot; a multiple of the fp4 scale block that divides
+    # the GMM K tiles. Rows per chunk = tile rows x chunk / 16.
+    SGLANG_TPU_FUSED_RS_BLOCKDIAG_KC = EnvInt(256)
+    # Fused-RS NVFP4: run W4A8 (block scales folded into the weights, activations requantized
+    # to e4m3 per 256-wide block, fp8 MXU) instead of the W4A16 bf16 matmul.
+    SGLANG_TPU_FUSED_RS_FP4_W4A8 = EnvBool(False)
+    # Fused-RS EP mode: build the tile metadata in XLA before the kernel (as expert-TP does)
+    # instead of the kernel's scalar prologue over every routed row.
+    SGLANG_TPU_FUSED_RS_EP_PRECOMPUTE_META = EnvBool(True)
+    # Fused-RS: issue the first tile's expert weight DMAs before the entry barrier.
+    SGLANG_TPU_FUSED_RS_EARLY_WEIGHT_DMA = EnvBool(False)
+    # Fused-RS EP mode: skip zeroing the output buffer; every (token, slot) row is written
+    # exactly once by its expert's rank (masked slots are spread over real experts).
+    SGLANG_TPU_FUSED_RS_EP_SKIP_OUT_ZERO = EnvBool(True)
+    # Drop the post-scatter cross-rank barrier: send and receive semaphore waits already order
+    # every DMA, the barrier only aligned kernel exit (exact; -10% on the 8192-token call).
+    SGLANG_TPU_FUSED_RS_SKIP_EXIT_BARRIER = EnvBool(True)
+    # Fused-RS EP mode: write each tile's output as one DMA run per owner rank (power-of-two
+    # pieces) into a rank-ordered output instead of one DMA per row; the post-combine maps
+    # ranks back to tokens. Measured: the per-row loop costs ~0.7 us per local row.
+    SGLANG_TPU_FUSED_RS_EP_RUN_WRITE = EnvBool(False)
     # Fused-RS tiles (tile_m,k1,n1,k2,n2,w1_bufs,w2_bufs) for EP-layout prefill calls
     # (>= 32768 routed rows), overriding the tuned table.
     SGLANG_TPU_FUSED_RS_EP_PREFILL_TILES = EnvStr(None)
     # Fused-RS EP mode leaves each tile's output row writes in flight until its staging
     # slot is reused, as expert-TP mode does, instead of waiting for them after every tile.
-    SGLANG_TPU_FUSED_RS_EP_DEFER_WRITES = EnvBool(False)
+    SGLANG_TPU_FUSED_RS_EP_DEFER_WRITES = EnvBool(True)
     # Expert-TP fused-RS with a post-expert norm: ep sum, norm and top-k combine in one Pallas
     # pass instead of three XLA fusions. Equal up to f32 summation order (bf16 casts kept).
     SGLANG_TPU_FUSED_RS_ETP_FUSED_COMBINE = EnvBool(False)

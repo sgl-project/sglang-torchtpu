@@ -28,6 +28,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sglang_tpu.envs import envs as tpu_envs
+
 from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
     _select_fused_rs_block_sizes,
 )
@@ -356,6 +357,13 @@ def moe_gmm_local_rs_nodedup(
         and not fp8_direct_write
         and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_PAIR_EXCHANGE.get()
     )
+    # EP mode: one DMA run per (tile, owner) and a rank-ordered output; the pair
+    # post-combine maps ranks back to tokens.
+    ep_run_write = (
+        not expert_tp
+        and not fp8_direct_write
+        and tpu_envs.SGLANG_TPU_FUSED_RS_EP_RUN_WRITE.get()
+    )
     out_buf = gmm_v2_fused_rs_nodedup(
         hidden_states_local,
         w1,
@@ -388,6 +396,7 @@ def moe_gmm_local_rs_nodedup(
         and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_SKIP_OUT_ZERO.get(),
         staging_slots=tpu_envs.SGLANG_TPU_FUSED_RS_STAGING_SLOTS.get(),
         pair_exchange=pair_exchange,
+        ep_run_write=ep_run_write,
     )
 
     # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
@@ -402,7 +411,7 @@ def moe_gmm_local_rs_nodedup(
         )
     )
     post_expert_norm_weight = post_expert_norm_weight_input if has_post_norm else None
-    if pair_exchange:
+    if pair_exchange or ep_run_write:
         return _pair_post_combine(
             out_buf,
             topk_indices,
