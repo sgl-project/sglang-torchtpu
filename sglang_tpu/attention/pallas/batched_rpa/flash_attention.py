@@ -83,15 +83,19 @@ def flash_attention_qk_softmax(
     masks = []
 
     sliding_window = cfgs.model.sliding_window
-    if (
-        kv_len_left is not None
-        and sliding_window is None
-        and kv_new_start_left is None
-    ):
-        # Pure prefix attention (CACHE_ONLY, or STRIPED where every query
-        # follows every key of the stripe): the causal compare is always
-        # true, so the only mask is the stripe's length, which depends on the
-        # key index alone. Build it on a [1, 1, s] iota and let it broadcast
+    # Pure prefix attention: CACHE_ONLY, or STRIPED, whose rows either hold one
+    # query (decode; validate_inputs pins decode_query_size to 1 for STRIPED)
+    # or attend the cached prefix only (an extend row, owns_token False), so
+    # every query follows every key of the stripe. ``kv_len_left`` is built
+    # for exactly these two scopes.
+    is_pure_prefix = kv_len_left is not None and (
+        cfgs.serve.attention_scope != configs.AttentionScope.STRIPED
+        or cfgs.serve.decode_query_size == 1
+    )
+    if is_pure_prefix and sliding_window is None and kv_new_start_left is None:
+        # The causal compare is always true, so the only mask is the stripe's
+        # length, which depends on the key index alone. Build it on a
+        # [1, 1, s] iota and let it broadcast
         # over the heads and queries instead of materializing the
         # [k_heads, tq, s] q/kv iotas and their difference (g3 cl/1005950290:
         # 10-20% faster DCP cache-only / striped passes).
