@@ -17,6 +17,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 register_tpu_ci(est_time=150, suite="stage-a-test-tpu-unit", chips=1)
 
 import importlib.util
+import math
 import unittest
 from unittest.mock import patch
 
@@ -53,6 +54,17 @@ def _rel_l2(got, want):
     return ((got.float() - want).norm() / want.norm()).item()
 
 
+def _reference_lse(q, k, scale):
+    """float32 natural-log log-sum-exp of the scaled scores, [B, H, S]."""
+    return torch.logsumexp(
+        torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale, dim=-1
+    )
+
+
+def _kv_info(row_offset, real_keys):
+    return torch.tensor([row_offset, real_keys], dtype=torch.int32).to("tpu")
+
+
 def _inputs(
     batch,
     heads,
@@ -79,8 +91,8 @@ def _inputs(
     return q.bfloat16(), k.bfloat16(), v.bfloat16()
 
 
-def _kernel_calls(graphs):
-    """``(flash, make_splash_mha)`` op calls in the FX graphs Dynamo compiled."""
+def _kernel_calls(graphs, ops=("diffusion_flash_attention", "diffusion_splash_mha")):
+    """Calls of each kernel op in ``ops`` in the FX graphs Dynamo compiled."""
     names = [
         str(node.target).split(".")[1]
         for graph in graphs
@@ -88,10 +100,12 @@ def _kernel_calls(graphs):
         if node.op == "call_function"
         and str(node.target).startswith("sglang_tpu_pallas.")
     ]
-    return (
-        names.count("diffusion_flash_attention"),
-        names.count("diffusion_splash_mha"),
-    )
+    return tuple(names.count(op) for op in ops)
+
+
+def _ring_spy(tsa):
+    """Counts the calls of the ring kernel op."""
+    return patch.object(tsa, "_FLASH_RING_OP", wraps=tsa._FLASH_RING_OP)
 
 
 # (flash, make_splash_mha) kernel calls of each path.
@@ -317,6 +331,251 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
             ).transpose(1, 2)[0]
             self.assertLess((got[seg].float() - want).abs().max().item(), 2e-2)
             start += n
+
+    def test_lse_matches_reference(self):
+        tsa = self._kernels()
+        scale = 128**-0.5
+        for batch, heads, q_seq, kv_seq in ((1, 2, 4608, 4608), (2, 2, 880, 4128)):
+            with self.subTest(q_seq=q_seq, kv_seq=kv_seq), _ring_spy(tsa) as ring:
+                q, k, v = _inputs(batch, heads, q_seq, kv_seq)
+                want = _reference(q, k, v, scale, False)
+                want_lse = _reference_lse(q, k, scale)
+                out, lse = tsa.tpu_attention_with_lse(
+                    q.to("tpu"), k.to("tpu"), v.to("tpu"), scale
+                )
+                self.assertEqual(ring.call_count, 1)
+                out, lse = out.to("cpu"), lse.to("cpu")
+                self.assertEqual(lse.shape, want_lse.shape)
+                self.assertEqual(lse.dtype, torch.float32)
+                self.assertLess((out.float() - want).abs().max().item(), 2e-2)
+                self.assertLess((lse - want_lse).abs().max().item(), 2e-2)
+
+    def test_impl_returns_softmax_lse(self):
+        # The ring merge's contract: [b, s, h, d] output, [b, h, s] LSE.
+        tsa = self._kernels()
+        impl = tsa.TpuSplashAttentionImpl(
+            num_heads=2, head_size=128, causal=False, softmax_scale=128**-0.5
+        )
+        q, k, v = _inputs(1, 2, 4608, 4608)
+        with _ring_spy(tsa) as ring:
+            out, lse = impl.forward(
+                *(t.transpose(1, 2).to("tpu") for t in (q, k, v)),
+                None,
+                return_softmax_lse=True,
+            )
+        self.assertEqual(ring.call_count, 1)
+        want = _reference(q, k, v, 128**-0.5, False).transpose(1, 2)
+        self.assertEqual(out.shape, want.shape)
+        self.assertLess((out.to("cpu").float() - want).abs().max().item(), 2e-2)
+        want_lse = _reference_lse(q, k, 128**-0.5)
+        self.assertLess((lse.to("cpu") - want_lse).abs().max().item(), 2e-2)
+
+    def test_ring_step_skips_keys_past_the_real_count(self):
+        # Keys past the real count are sequence-parallel padding; NaN there
+        # proves they never contribute.
+        tsa = self._kernels()
+        scale = 128**-0.5
+        for q_seq, kv_seq, real in ((4608, 4624, 4600), (2048, 8192, 6150)):
+            with self.subTest(kv_seq=kv_seq, real=real), _ring_spy(tsa) as ring:
+                q, k, v = _inputs(1, 2, q_seq, kv_seq)
+                k[:, :, real:], v[:, :, real:] = float("nan"), float("nan")
+                want = _reference(q, k[:, :, :real], v[:, :, :real], scale, False)
+                out, carry = tsa.tpu_ring_attention_step(
+                    q.to("tpu"),
+                    k.to("tpu"),
+                    v.to("tpu"),
+                    _kv_info(0, real),
+                    None,
+                    scale,
+                )
+                self.assertEqual(ring.call_count, 1)
+                out = out.to("cpu").float()
+                self.assertFalse(torch.isnan(out).any().item())
+                self.assertFalse(torch.isnan(carry[1].to("cpu")).any().item())
+                self.assertLess((out - want).abs().max().item(), 2e-2)
+
+    def test_ring_step_resumes_an_earlier_partial(self):
+        # Two key halves, the second step resuming the first, equal attention
+        # over all keys.
+        tsa = self._kernels()
+        scale = 128**-0.5
+        q, k, v = _inputs(1, 2, 4608, 2 * 4600)
+        want = _reference(q, k, v, scale, False)
+        qt = q.to("tpu")
+        halves = [(t[:, :, :4600].to("tpu"), t[:, :, 4600:].to("tpu")) for t in (k, v)]
+        with _ring_spy(tsa) as ring:
+            _, carry = tsa.tpu_ring_attention_step(
+                qt, halves[0][0], halves[1][0], _kv_info(0, 4600), None, scale
+            )
+            out, _ = tsa.tpu_ring_attention_step(
+                qt, halves[0][1], halves[1][1], _kv_info(0, 4600), carry, scale
+            )
+        self.assertEqual(ring.call_count, 2)
+        # The partial output is carried in float32; only the result is bf16.
+        self.assertEqual(carry[0].dtype, torch.float32)
+        self.assertEqual(out.dtype, torch.bfloat16)
+        self.assertLess((out.to("cpu").float() - want).abs().max().item(), 2e-2)
+
+    def test_ring_step_picks_shard_and_key_count_at_run_time(self):
+        # Stacked shards with batch 2 and GQA: the row offset and real-key
+        # count arrive as data, resuming the local shard's softmax, as the
+        # padded ring does. NaN past the real keys proves they are unused.
+        tsa = self._kernels()
+        scale = 128**-0.5
+        batch, heads, kv_heads, shard_len = 2, 4, 2, 4624
+        gen = torch.Generator().manual_seed(0)
+
+        def randn(*shape):
+            return torch.randn(shape, generator=gen).bfloat16()
+
+        q = randn(batch, heads, 4608, 128)
+        k_local, v_local = (
+            randn(batch, kv_heads, shard_len, 128),
+            randn(batch, kv_heads, shard_len, 128),
+        )
+        k_stack, v_stack = (
+            randn(2 * batch, kv_heads, shard_len, 128),
+            randn(2 * batch, kv_heads, shard_len, 128),
+        )
+        for peer, real in ((0, shard_len), (1, 4600), (1, 2100)):
+            with self.subTest(peer=peer, real=real), _ring_spy(tsa) as ring:
+                kk, vv = k_stack.clone(), v_stack.clone()
+                rows = slice(peer * batch, (peer + 1) * batch)
+                kk[rows, :, real:], vv[rows, :, real:] = float("nan"), float("nan")
+                keys = torch.cat([k_local, kk[rows, :, :real]], dim=2)
+                values = torch.cat([v_local, vv[rows, :, :real]], dim=2)
+                want = _reference(
+                    q,
+                    keys.repeat_interleave(heads // kv_heads, 1),
+                    values.repeat_interleave(heads // kv_heads, 1),
+                    scale,
+                    False,
+                )
+                qt = q.to("tpu")
+                _, carry = tsa.tpu_ring_attention_step(
+                    qt,
+                    k_local.to("tpu"),
+                    v_local.to("tpu"),
+                    _kv_info(0, shard_len),
+                    None,
+                    scale,
+                )
+                out, _ = tsa.tpu_ring_attention_step(
+                    qt,
+                    kk.to("tpu"),
+                    vv.to("tpu"),
+                    _kv_info(peer * batch * kv_heads, real),
+                    carry,
+                    scale,
+                )
+                self.assertEqual(ring.call_count, 2)
+                out = out.to("cpu").float()
+                self.assertFalse(torch.isnan(out).any().item())
+                self.assertLess((out - want).abs().max().item(), 2e-2)
+
+    def test_ring_step_over_an_empty_shard_resumes_exactly(self):
+        tsa = self._kernels()
+        scale = 128**-0.5
+        q, k, v = _inputs(1, 2, 4608, 4608)
+        qt, kt, vt = q.to("tpu"), k.to("tpu"), v.to("tpu")
+        with _ring_spy(tsa) as ring:
+            empty_out, carry = tsa.tpu_ring_attention_step(
+                qt, kt, vt, _kv_info(0, 0), None, scale
+            )
+            out, _ = tsa.tpu_ring_attention_step(
+                qt, kt, vt, _kv_info(0, 4608), carry, scale
+            )
+        self.assertEqual(ring.call_count, 2)
+        self.assertTrue(torch.all(empty_out.to("cpu") == 0))
+        want = _reference(q, k, v, scale, False)
+        self.assertLess((out.to("cpu").float() - want).abs().max().item(), 2e-2)
+
+    def test_ring_carry_crosses_an_empty_later_shard_unchanged(self):
+        # A trailing peer of a padded ring holds no real keys: its step keeps
+        # the carry bit for bit, and the next step resumes from it.
+        tsa = self._kernels()
+        scale = 128**-0.5
+        q, k, v = _inputs(1, 2, 4608, 3 * 4608)
+        qt = q.to("tpu")
+        shards = [
+            (k_shard.to("tpu"), v_shard.to("tpu"))
+            for k_shard, v_shard in zip(k.chunk(3, dim=2), v.chunk(3, dim=2))
+        ]
+        with _ring_spy(tsa) as ring:
+            _, carry = tsa.tpu_ring_attention_step(
+                qt, *shards[0], _kv_info(0, 4608), None, scale
+            )
+            _, after_empty = tsa.tpu_ring_attention_step(
+                qt, *shards[1], _kv_info(0, 0), carry, scale
+            )
+            out, _ = tsa.tpu_ring_attention_step(
+                qt, *shards[2], _kv_info(0, 4608), after_empty, scale
+            )
+        self.assertEqual(ring.call_count, 3)
+        for kept, carried in zip(carry, after_empty):
+            self.assertTrue(torch.equal(kept.to("cpu"), carried.to("cpu")))
+        keys = torch.cat([k[:, :, :4608], k[:, :, 2 * 4608 :]], dim=2)
+        values = torch.cat([v[:, :, :4608], v[:, :, 2 * 4608 :]], dim=2)
+        self._assert_accurate(out.to("cpu"), q, keys, values, scale, False)
+
+    def test_three_ring_steps_carry_the_log_sum_exp(self):
+        tsa = self._kernels()
+        scale = 128**-0.5
+        q, k, v = _inputs(1, 2, 4608, 3 * 4608)
+        qt = q.to("tpu")
+        carry = None
+        with _ring_spy(tsa) as ring:
+            for step in range(3):
+                shard = slice(step * 4608, (step + 1) * 4608)
+                out, carry = tsa.tpu_ring_attention_step(
+                    qt,
+                    k[:, :, shard].to("tpu"),
+                    v[:, :, shard].to("tpu"),
+                    _kv_info(0, 4608),
+                    carry,
+                    scale,
+                )
+                seen = slice(0, (step + 1) * 4608)
+                with self.subTest(step=step):
+                    # The kernel carries a base-2 log-sum-exp, replicated over
+                    # NUM_SUBLANES rows.
+                    lse = carry[1][:, :, 0].to("cpu") * math.log(2.0)
+                    want_lse = _reference_lse(q, k[:, :, seen], scale)
+                    self.assertLess((lse - want_lse).abs().max().item(), 2e-2)
+                    self._assert_accurate(
+                        out.to("cpu"), q, k[:, :, seen], v[:, :, seen], scale, False
+                    )
+        self.assertEqual(ring.call_count, 3)
+
+    def test_ring_step_under_torch_compile(self):
+        import torch_tpu._internal.compile  # noqa: F401
+        from torch._dynamo.testing import CompileCounterWithBackend
+
+        tsa = self._kernels()
+        scale = 128**-0.5
+
+        def two_steps(q, k, v, info_a, info_b):
+            _, carry = tsa.tpu_ring_attention_step(q, k, v, info_a, None, scale)
+            out, _ = tsa.tpu_ring_attention_step(q, k, v, info_b, carry, scale)
+            return out
+
+        q, k, v = _inputs(1, 2, 4608, 2 * 4608)
+        stacked = [torch.cat(t.chunk(2, dim=2), dim=0) for t in (k, v)]
+        want = _reference(q, k, v, scale, False)
+        torch._dynamo.reset()
+        counter = CompileCounterWithBackend("tpu")
+        compiled = torch.compile(two_steps, backend=counter, dynamic=False)
+        got = compiled(
+            q.to("tpu"),
+            stacked[0].to("tpu"),
+            stacked[1].to("tpu"),
+            _kv_info(0, 4608),
+            _kv_info(2, 4608),
+        ).to("cpu")
+        # Both steps are the ring kernel op, traced through its fake.
+        ring_op = ("diffusion_flash_attention_ring",)
+        self.assertEqual(_kernel_calls(counter.graphs, ring_op), (2,))
+        self.assertLess((got.float() - want).abs().max().item(), 2e-2)
 
     def test_backend_impl_layout(self):
         # The attention layer calls the impl with [B, S, H, D] tensors.
