@@ -632,6 +632,100 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
         # Transfer layer 4 (after layers 0-3) is the draft, host layer 2.
         self.assertEqual(kv_entry.layer_mapper(4), 2)
 
+    def test_swa_state_strategy_takes_swa_pools_with_state_under_a_dma_engine(self):
+        """A hybrid SWA model with mamba-pool state (Inkling2) has an SWAKVPool and
+        three components; the built-in stack would read its states with the CUDA
+        MambaPoolHost, so the TPU stack must win exactly there."""
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        from sglang_tpu.hybrid_linear_hicache import TpuDmaMambaSwaStrategy
+
+        swa = object.__new__(SWAKVPool)
+        hybrid = object.__new__(HybridLinearKVPool)
+        full, swa_c, mamba = ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA
+        cases = (
+            ("raiden", swa, {full, swa_c, mamba}, True),
+            ("torch_tpu", swa, {full, swa_c, mamba}, False),
+            ("raiden", swa, {full, swa_c}, False),
+            ("raiden", hybrid, {full, swa_c, mamba}, False),
+        )
+        for io_backend, kvcache, components, expected in cases:
+            with (
+                self.subTest(io_backend=io_backend, kvcache=type(kvcache).__name__),
+                patch(
+                    "sglang_tpu.hybrid_linear_hicache.get_memory",
+                    return_value=SimpleNamespace(hicache_io_backend=io_backend),
+                ),
+            ):
+                self.assertEqual(
+                    TpuDmaMambaSwaStrategy().matches(kvcache, components), expected
+                )
+
+    def test_swa_state_strategy_builds_dma_state_pool_and_controller(self):
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        from sglang_tpu import hybrid_linear_hicache
+
+        state_host = MagicMock()
+        memory = SimpleNamespace(
+            hicache_io_backend="raiden",
+            hicache_size=0,
+            hicache_ratio=2,
+            hicache_mem_layout="page_first_fused",
+            hicache_write_policy="write_through",
+            hicache_host_memory_mode=None,
+            enable_unified_memory=False,
+        )
+        kvcache = SimpleNamespace(
+            start_layer=0,
+            layers_mapping={0: (0, False), 1: (0, True)},
+            full_kv_pool=object(),
+            swa_kv_pool=object(),
+        )
+        allocator = SimpleNamespace(alloc=MagicMock(), free=MagicMock())
+        params = SimpleNamespace(
+            mtp_draft_device_pools=(),
+            req_to_token_pool=SimpleNamespace(
+                mamba_pool=object(), mamba_map={0: 0, 1: 1}, mamba_allocator=allocator
+            ),
+            token_to_kv_pool_allocator=SimpleNamespace(swa_attn_allocator=allocator),
+            tp_cache_group=None,
+            pp_cache_group=None,
+        )
+        build = lambda strategy: strategy.build(
+            cache=SimpleNamespace(page_size=128),
+            kvcache=kvcache,
+            params=params,
+            server_args=None,
+            load_cache_event=None,
+        )
+        with (
+            patch.object(hybrid_linear_hicache, "get_memory", return_value=memory),
+            patch.object(hybrid_pool_assembler, "get_memory", return_value=memory),
+            patch.object(
+                hybrid_pool_assembler,
+                "build_kv_host_pool",
+                side_effect=lambda **kw: MagicMock(label=kw["pool_label"]),
+            ),
+            patch(
+                "sglang_tpu.kv_pool_host.tpu_dma_mamba_pool_host_cls",
+                return_value=MagicMock(return_value=state_host),
+            ),
+            patch.object(
+                hybrid_linear_hicache.TpuDmaMambaSwaStrategy, "cache_controller_cls"
+            ) as controller,
+        ):
+            result = build(hybrid_linear_hicache.TpuDmaMambaSwaStrategy())
+            params.mtp_draft_device_pools = (object(),)
+            with self.assertRaisesRegex(NotImplementedError, "packed MTP draft"):
+                build(hybrid_linear_hicache.TpuDmaMambaSwaStrategy())
+        self.assertIs(result.cache_controller, controller.return_value)
+        self.assertIs(result.component_host_pools[ComponentType.MAMBA], state_host)
+        self.assertEqual(
+            set(result.host_pool_group.entry_map),
+            {PoolName.KV, PoolName.SWA, PoolName.MAMBA},
+        )
+
     def test_split_pool_host_sizing_matches_its_allocation(self):
         """A host page holds every DSA buffer of the page, so host bytes per token
         must equal what the device pool allocates per token."""

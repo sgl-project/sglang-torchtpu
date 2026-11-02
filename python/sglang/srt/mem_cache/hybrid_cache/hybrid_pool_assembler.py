@@ -1305,6 +1305,8 @@ def build_hybrid_mamba_swa_stack(
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
+    mamba_host_pool_fn: Optional[Callable[..., Any]] = None,
+    cache_controller_cls: type = HybridCacheController,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_id_max = (
         max(
@@ -1335,13 +1337,18 @@ def build_hybrid_mamba_swa_stack(
         host_size=swa_host_size,
         pool_label="swa",
     )
-    mamba_host_pool = MambaPoolHost(
-        mamba_pool,
-        get_memory().hicache_ratio,
-        mamba_host_size,
-        allocator_type=_get_allocator_type(),
-        layout=get_memory().hicache_mem_layout,
-    )
+    if mamba_host_pool_fn is None:
+        mamba_host_pool = MambaPoolHost(
+            mamba_pool,
+            get_memory().hicache_ratio,
+            mamba_host_size,
+            allocator_type=_get_allocator_type(),
+            layout=get_memory().hicache_mem_layout,
+        )
+    else:
+        mamba_host_pool = mamba_host_pool_fn(
+            mamba_pool=mamba_pool, host_size=mamba_host_size
+        )
     entries = [
         build_pool_entry(
             name=PoolName.KV,
@@ -1382,7 +1389,7 @@ def build_hybrid_mamba_swa_stack(
         ),
     ]
     host_pool_group = HostPoolGroup(entries)
-    cache_controller = HybridCacheController(
+    cache_controller = cache_controller_cls(
         params.token_to_kv_pool_allocator,
         host_pool_group,
         page_size,
@@ -1968,7 +1975,11 @@ class _SwaStrategy(StackStrategy):
         )
 
 
-class _MambaSwaStrategy(StackStrategy):
+class MambaSwaStrategy(StackStrategy):
+    # A platform whose state layout MambaPoolHost cannot read overrides these.
+    mamba_host_pool_fn: Optional[Callable[..., Any]] = None
+    cache_controller_cls: type = HybridCacheController
+
     def matches(self, kvcache, components):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -2023,6 +2034,8 @@ class _MambaSwaStrategy(StackStrategy):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            mamba_host_pool_fn=self.mamba_host_pool_fn,
+            cache_controller_cls=self.cache_controller_cls,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -2232,7 +2245,7 @@ _STRATEGIES: list[StackStrategy] = [
     _DeepSeekV4Strategy(),
     MambaStrategy(),
     _SwaStrategy(),
-    _MambaSwaStrategy(),
+    MambaSwaStrategy(),
     _DsaStrategy(),
     _MiniMaxSparseStrategy(),
     _PlainKvStrategy(),
