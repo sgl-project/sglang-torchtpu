@@ -46,6 +46,9 @@ class KernelConfig:
     shared_expert_finishers: bool = True
     compact_overflow: bool = True
     b4_attention_gather: bool = True
+    # More DCP32 verify shapes (rows x rows per sequence, e.g. "16x4,48x4")
+    # on the grouped FP8 QK/PV path (mla_dcp.GROUPED_SPEC_SHAPES).
+    grouped_spec_extra: tuple[str, ...] = ()
     fused_cache_commit: bool = True
     decode_no_hlo_calls: bool = True  # no deduplicated HLO calls at B8..B128, DP B2/B4
     shard_routing: bool = False
