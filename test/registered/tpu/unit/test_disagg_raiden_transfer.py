@@ -289,6 +289,30 @@ class RaidenRendezvousTestCase(CustomTestCase):
 
 
 class TestRaidenPullHandshake(RaidenRendezvousTestCase):
+    def test_bounded_prefill_rejects_an_asymmetric_decode(self):
+        # Raiden's reshard push copies every layer, which bounded buffers reject.
+        prefill, decode = self._prefill(), self._decode()
+        prefill._bounded_staging = True
+        room = 6999
+        decode.request_status[room] = KVPoll.WaitingForInput
+        prefill._on_reshard_req(
+            ReshardReq(
+                room=room,
+                decode_ip=decode.local_ip,
+                decode_port=decode.rank_port,
+                push_endpoint="tcp://push",
+                decode_blocks=[1],
+                dst_attn_tp=1,
+                decode_swa_blocks=[],
+                swa_push_endpoint="",
+            ).to_frames()
+        )
+        decode._dispatch(self.inboxes[decode.endpoint].take(MessageTag.ROOM_FAILED))
+        self.assertTrue(prefill.is_failed(room))
+        self.assertTrue(decode.is_failed(room))
+        self.assertIn("does not support staging layers", decode.failure_records[room])
+        self.assertNotIn(room, prefill._prefill.reshard_req)
+
     def test_chunk_transfer_id_fits_positive_int64(self):
         for upper_bound in (False, True):
             with self.subTest(upper_bound=upper_bound):
@@ -996,7 +1020,9 @@ class TestRaidenStateEngine(RaidenRendezvousTestCase):
         m._state_kv_caches = (torch.zeros(6, 3), torch.zeros(6, 7)) if state else ()
         m._max_request_blocks = lambda: 8
         m._swa_max_request_blocks = lambda: 2
-        m._num_slots = lambda kv_caches, max_blocks, engines=1, **_: 10 * engines
+        m._size_host_staging = lambda engines, layers: [
+            (10 * len(engines), n) for n in layers
+        ]
         with patch.dict(sys.modules, _fake_tpu_sync(Engine)):
             m._build_engine()
         return m, built
@@ -1068,7 +1094,7 @@ class TestRaidenBlockMajorEngine(RaidenRendezvousTestCase):
         m._engine = None
         m._max_request_blocks = lambda: 8
         m._swa_max_request_blocks = lambda: 2
-        m._num_slots = lambda kv_caches, max_blocks, engines=1, **_: 10
+        m._size_host_staging = lambda engines, layers: [(10, n) for n in layers]
         with (
             patch.dict(sys.modules, _fake_tpu_sync(Engine)),
             self.assertLogs("sglang_tpu.disaggregation.raiden.conn", "INFO") as logs,

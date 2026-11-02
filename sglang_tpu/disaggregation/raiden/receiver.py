@@ -260,6 +260,13 @@ class RaidenReceiverMixin:
                     "rank) needs per-transfer host staging; do not set "
                     "SGLANG_RAIDEN_DYNAMIC_HOST_STAGING=0."
                 )
+            if self._bounded_staging:
+                raise NotImplementedError(
+                    "Raiden asymmetric attention TP does not support staging "
+                    "layers to reduce host staging RAM. Set "
+                    "SGLANG_TPU_RAIDEN_STAGING_LAYERS=0 on prefill and decode to "
+                    "keep full mirrors."
+                )
             if not local_blocks:
                 # Full prefix-cache hit: decode already holds every page,
                 # nothing to receive. A hybrid model's sliding-window pages sit
