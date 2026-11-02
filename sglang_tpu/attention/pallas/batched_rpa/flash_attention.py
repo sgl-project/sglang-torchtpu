@@ -97,79 +97,76 @@ def flash_attention_qk_softmax(
         # making causal masking (q_kv_diff >= offset) always True. We only need
         # to mask keys that exceed the local valid length (g3 cl/1005950290).
         kv_iota = lax.broadcasted_iota(jnp.int32, (1, 1, s), 2)
+        masks = [
+            kv_iota < kv_len_left[b_idx] for b_idx in range(cfgs.block.batch_size)
+        ]
+    else:
+        kv_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 2)
+        q_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1)
+        q_iota //= cfgs.aligned_num_q_heads_per_kv_head
+        q_kv_diff = q_iota - kv_iota
+        if global_q_k_gap is not None:
+            # Page-striped cache: local key j holds global position
+            # j + (j // page_size) * (cp_group_size - 1) * page_size + rank * page_size.
+            # The rank term is scalar and lives in global_q_k_gap; the local-index
+            # part is computed per batch element below from the block's first key.
+            lp = cfgs.serve.page_size_log2
+            stripe_gap = (cfgs.serve.cp_group_size - 1) << lp
+
         for b_idx in range(cfgs.block.batch_size):
-            mask_b = kv_iota < kv_len_left[b_idx]
-            masks.append(mask_b)
-            qk_masked.append(jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value))
-        qk = jnp.stack(qk_masked, axis=0)
-        return _softmax_stats(
-            step, qk, masks, m_prev, l_prev, is_last_k, zero_masked=True, cfgs=cfgs
-        )
-
-    kv_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 2)
-    q_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1)
-    q_iota //= cfgs.aligned_num_q_heads_per_kv_head
-    q_kv_diff = q_iota - kv_iota
-    if global_q_k_gap is not None:
-        # Page-striped cache: local key j holds global position
-        # j + (j // page_size) * (cp_group_size - 1) * page_size + rank * page_size.
-        # The rank term is scalar and lives in global_q_k_gap; the local-index
-        # part is computed per batch element below from the block's first key.
-        lp = cfgs.serve.page_size_log2
-        stripe_gap = (cfgs.serve.cp_group_size - 1) << lp
-
-    for b_idx in range(cfgs.block.batch_size):
-        # NOTE: Goal is to compute q_len >= kv_len. But we want to utilize scalar
-        # compute as much as possible before involving vector compute. Therefore, we
-        # break down a computational steps into following equations to separate out
-        # scalar and vector compute.
-        # q_len = q_iota + (bq_start + processed_q_len)
-        # kv_len = kv_iota + processed_kv_len
-        # Step 1: q_len >= kv_len:
-        # Step 2:
-        #   q_iota + (bq_start + processed_q_len)
-        #   >= kv_iota + processed_kv_len
-        # Step 3:
-        #   q_iota - kv_iota
-        #   >= processed_kv_len - (bq_start + processed_q_len)
-        # Step 4:
-        #   q_kv_delta = q_iota - kv_iota
-        #   offset = processed_kv_len - (bq_start + processed_q_len)
-        offset = processed_kv_len[b_idx] - (bq_start + processed_q_len[b_idx])
-        if kv_len_left is None:
-            mask_b = q_kv_diff >= offset
-        else:
-            # Every cached key precedes every query; keys past kv_len are stale.
-            mask_b = kv_iota < kv_len_left[b_idx]
-        if kv_new_start_left is not None:
-            mask_b = jnp.logical_and(mask_b, kv_iota >= kv_new_start_left[b_idx])
-
-        if sliding_window is not None:
-            # NOTE: Goal is to compute q_len < sliding_window + kv_len. And similar
-            # to above, we want to minimize vector compute. Therefore, we break
-            # down computes into following steps.
-            # Step 1: q_len < sliding_window + kv_len
+            # NOTE: Goal is to compute q_len >= kv_len. But we want to utilize scalar
+            # compute as much as possible before involving vector compute. Therefore, we
+            # break down a computational steps into following equations to separate out
+            # scalar and vector compute.
+            # q_len = q_iota + (bq_start + processed_q_len)
+            # kv_len = kv_iota + processed_kv_len
+            # Step 1: q_len >= kv_len:
             # Step 2:
             #   q_iota + (bq_start + processed_q_len)
-            #   < sliding_window + kv_iota + processed_kv_len
+            #   >= kv_iota + processed_kv_len
             # Step 3:
             #   q_iota - kv_iota
-            #   < sliding_window + processed_kv_len - (bq_start + processed_q_len)
+            #   >= processed_kv_len - (bq_start + processed_q_len)
             # Step 4:
-            #   q_kv_diff < sliding_window + offset
-            if global_q_k_gap is None:
-                mask_b = jnp.logical_and(mask_b, q_kv_diff < sliding_window + offset)
+            #   q_kv_delta = q_iota - kv_iota
+            #   offset = processed_kv_len - (bq_start + processed_q_len)
+            offset = processed_kv_len[b_idx] - (bq_start + processed_q_len[b_idx])
+            if kv_len_left is None:
+                mask_b = q_kv_diff >= offset
             else:
-                # Same in global positions: gap = q_global - (k_id + rank * page)
-                # at q_iota = kv_iota = 0 of the block; the stripe term adds
-                # (cp - 1) pages per local page of the key's local index.
-                local_key = kv_iota + processed_kv_len[b_idx]
-                q_kv_diff_global = q_kv_diff - (local_key >> lp) * stripe_gap
-                window_offset = sliding_window - (bq_start + global_q_k_gap[b_idx])
-                mask_b = jnp.logical_and(mask_b, q_kv_diff_global < window_offset)
+                # Every cached key precedes every query; keys past kv_len are stale.
+                mask_b = kv_iota < kv_len_left[b_idx]
+            if kv_new_start_left is not None:
+                mask_b = jnp.logical_and(mask_b, kv_iota >= kv_new_start_left[b_idx])
 
-        masks.append(mask_b)
-        qk_masked.append(jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value))
+            if sliding_window is not None:
+                # NOTE: Goal is to compute q_len < sliding_window + kv_len. And similar
+                # to above, we want to minimize vector compute. Therefore, we break
+                # down computes into following steps.
+                # Step 1: q_len < sliding_window + kv_len
+                # Step 2:
+                #   q_iota + (bq_start + processed_q_len)
+                #   < sliding_window + kv_iota + processed_kv_len
+                # Step 3:
+                #   q_iota - kv_iota
+                #   < sliding_window + processed_kv_len - (bq_start + processed_q_len)
+                # Step 4:
+                #   q_kv_diff < sliding_window + offset
+                if global_q_k_gap is None:
+                    mask_b = jnp.logical_and(mask_b, q_kv_diff < sliding_window + offset)
+                else:
+                    # Same in global positions: gap = q_global - (k_id + rank * page)
+                    # at q_iota = kv_iota = 0 of the block; the stripe term adds
+                    # (cp - 1) pages per local page of the key's local index.
+                    local_key = kv_iota + processed_kv_len[b_idx]
+                    q_kv_diff_global = q_kv_diff - (local_key >> lp) * stripe_gap
+                    window_offset = sliding_window - (bq_start + global_q_k_gap[b_idx])
+                    mask_b = jnp.logical_and(mask_b, q_kv_diff_global < window_offset)
+
+            masks.append(mask_b)
+
+    for b_idx in range(cfgs.block.batch_size):
+        qk_masked.append(jnp.where(masks[b_idx], qk[b_idx], cfgs.model.mask_value))
     qk = jnp.stack(qk_masked, axis=0)
     return _softmax_stats(
         step,
