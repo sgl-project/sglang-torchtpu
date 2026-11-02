@@ -505,8 +505,11 @@ def run_spec(args, records: harness.Records) -> None:
     single = decoder(((1, 1, args.single_drafts), (2, 8, 0)))
     plain = decoder()
     # Select both singleton and batched widths, including their transitions.
+    # Three drafts verify up to 16 requests: past that the batched decoder
+    # steps plain.
     batched = decoder(
         ((1, 1, args.single_drafts), (2, 4, args.small_batch_drafts), (5, 8, 3))
+        + (((17, most, 0),) if most > 16 else ())
     )
     harness.sync()
     # Under attention DP the fixtures alternate between the groups.
