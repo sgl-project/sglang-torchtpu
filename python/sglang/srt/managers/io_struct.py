@@ -2155,6 +2155,19 @@ class PluginWeightUpdateReqOutput(BaseReq, kw_only=True):
     # how many tensors each TP rank received and loaded, in rank order
     loaded_tensor_counts: List[int] = []
 
+    @classmethod
+    def merged(cls, replies: List[PluginWeightUpdateReqOutput]):
+        """One reply per attention-DP leader; all must succeed.
+
+        Every leader gathered the same TP-wide counts, so the first reply's stand.
+        """
+        success = all(reply.success for reply in replies)
+        return cls(
+            success=success,
+            message=" | ".join(reply.message for reply in replies),
+            loaded_tensor_counts=replies[0].loaded_tensor_counts if success else [],
+        )
+
 
 class CheckWeightsReqInput(BaseReq, kw_only=True):
     action: str = "checksum"

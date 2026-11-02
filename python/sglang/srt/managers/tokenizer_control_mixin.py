@@ -524,8 +524,11 @@ class TokenizerControlMixin:
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
-        (reply,) = await self._weight_update_session_replies(
-            self.plugin_weight_update_communicator, obj
+        # one reply per attention-DP leader, as for update_weights_from_distributed
+        reply = PluginWeightUpdateReqOutput.merged(
+            await self._weight_update_session_replies(
+                self.plugin_weight_update_communicator, obj
+            )
         )
         if reply.success and obj.flush_cache and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()

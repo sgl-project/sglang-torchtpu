@@ -6,6 +6,7 @@ from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
     PluginWeightUpdateReqInput,
+    PluginWeightUpdateReqOutput,
 )
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.weight_updater import (
@@ -463,6 +464,27 @@ class TestPluginWeightUpdate(_WeightUpdaterManagerTestBase):
         self.assertFalse(unknown.success)
         self.assertIn("nccl", unknown.message)
         self.assertEqual(called, [])
+
+
+class TestPluginWeightUpdateReply(CustomTestCase):
+    def test_attention_dp_leaders_replies_merge_like_the_distributed_route(self):
+        """Under attention DP the tokenizer gets one reply per leader; one failure fails the request."""
+        ok = PluginWeightUpdateReqOutput(
+            success=True, message="Success", loaded_tensor_counts=[3, 3]
+        )
+        failed = PluginWeightUpdateReqOutput(
+            success=False, message="TP rank 1: no receive buffers"
+        )
+
+        merged_ok = PluginWeightUpdateReqOutput.merged([ok, ok])
+        merged_failed = PluginWeightUpdateReqOutput.merged([ok, failed])
+
+        self.assertEqual(
+            (merged_ok.success, merged_ok.loaded_tensor_counts), (True, [3, 3])
+        )
+        self.assertFalse(merged_failed.success)
+        self.assertIn("no receive buffers", merged_failed.message)
+        self.assertEqual(merged_failed.loaded_tensor_counts, [])
 
 
 if __name__ == "__main__":
