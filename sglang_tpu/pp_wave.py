@@ -396,6 +396,7 @@ class PPAuxWave(PPWave):
         hidden: int,
         num_aux: int,
         dtype: torch.dtype,
+        aux_dtype: torch.dtype | None = None,
         device: torch.device,
         launcher: Callable[[Payload], Payload],
     ) -> None:
@@ -411,15 +412,16 @@ class PPAuxWave(PPWave):
         if num_aux < 1:
             raise ValueError("PPAuxWave relays at least one capture slot")
         self.num_aux = int(num_aux)
+        self.aux_dtype = aux_dtype if aux_dtype is not None else self.dtype
         self.aux_width = self.hidden * self.num_aux
         self.aux_zero = torch.zeros(
-            (self.rows, self.aux_width), dtype=self.dtype, device=self.zero.device
+            (self.rows, self.aux_width), dtype=self.aux_dtype, device=self.zero.device
         )
         self.zero_payload = (self.zero, self.aux_zero)
 
     def warmup_tensors(self, rows: int) -> dict[str, torch.Tensor]:
         aux = torch.zeros(
-            (rows, self.aux_width), dtype=self.dtype, device=self.zero.device
+            (rows, self.aux_width), dtype=self.aux_dtype, device=self.zero.device
         )
         return super().warmup_tensors(rows) | {AUX_HIDDEN_STATES_PROXY_KEY: aux}
 
@@ -435,6 +437,11 @@ class PPAuxWave(PPWave):
             raise ValueError(
                 f"the pipeline wave carries {self.aux_width} aux columns, "
                 f"got {int(aux.shape[-1])}"
+            )
+        if aux.dtype != self.aux_dtype:
+            raise ValueError(
+                f"the pipeline wave carries {self.aux_dtype} aux activations, "
+                f"got {aux.dtype}"
             )
         hidden = super().merge(
             {k: v for k, v in tensors.items() if k != AUX_HIDDEN_STATES_PROXY_KEY}
@@ -483,6 +490,7 @@ def build_pp_wave(
     hidden: int,
     num_aux: int = 0,
     dtype: torch.dtype,
+    aux_dtype: torch.dtype | None = None,
     device: torch.device,
 ) -> PPWave:
     """Create the stage's wave on the device and verify the hand-off routing.
@@ -506,6 +514,7 @@ def build_pp_wave(
         stage_ranks=tuple(stage_group.ranks),
         column=column,
     )
+    resolved_aux_dtype = aux_dtype if aux_dtype is not None else dtype
     if num_aux:
         pair_op = build_pp_pair_permute_op(perm)
         wave = PPAuxWave(
@@ -515,6 +524,7 @@ def build_pp_wave(
             hidden=hidden,
             num_aux=num_aux,
             dtype=dtype,
+            aux_dtype=resolved_aux_dtype,
             device=device,
             launcher=lambda x: launch_pair_now(pair_op, x),
         )
@@ -552,10 +562,11 @@ def build_pp_wave(
     )
     if num_aux:
         logger.info(
-            "pipeline wave stage %d: %d aux capture slot(s) as a second [%d, %d] buffer",
+            "pipeline wave stage %d: %d aux capture slot(s) as a second [%d, %d] %s buffer",
             rank,
             num_aux,
             rows,
             num_aux * hidden,
+            resolved_aux_dtype,
         )
     return wave

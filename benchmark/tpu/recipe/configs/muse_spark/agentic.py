@@ -6,7 +6,10 @@ requests, prefill/decode interval and megakernel row cap. The mode picks the eng
 
 - mixed: one TP8 server, prefill and decode together.
 - prefill / decode: one Raiden P/D engine each, a PP2 x TP4 prefill host feeding a TP8
-  megakernel decode host, both on the experimental spec worker.
+  megakernel decode host.
+
+Every mode serves DFlash on the experimental spec worker, the only one that runs it on
+a PP prefill.
 
 The fp8 pool assumes a windowed draft: a DFlash2 config declaring is_hybrid_swa and
 an all-SWA hybrid_layer_pattern keeps the draft's KV in the target's SWA slots;
@@ -66,9 +69,9 @@ _BASE["runtime_env"].update(
         # Acceptance is simulated so the curve compares speed, not draft quality.
         "SGLANG_SIMULATE_ACC_LEN": str(SIMULATED_ACC_LEN),
         "SGLANG_SIMULATE_ACC_METHOD": "match-expected",
-        "SGLANG_SIMULATE_ACC_TOKEN_MODE": "real-draft-token",
-        # Core DFlash worker: the experimental one only simulates the fixed token mode.
-        "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "0",
+        # The experimental spec worker only simulates acceptance with fixed draft tokens.
+        "SGLANG_SIMULATE_ACC_TOKEN_MODE": "fixed",
+        "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
         "SGLANG_SPEC_TP_SYNC": "rng",
         "SGLANG_TPU_ALLOW_SPEC_RECOMPILE": "1",
         "SGLANG_TPU_HOST_PADDING_NO_D2H": "0",
@@ -76,7 +79,6 @@ _BASE["runtime_env"].update(
         "SGLANG_TPU_KV_PACK_HEADS": "1",
         # Decode megakernel (whole decoder in one Pallas kernel) and its attention tuning.
         "SGLANG_TPU_MUSE_MEGAKERNEL": "1",
-        "SGLANG_TPU_MUSE_MK_ATTN_FIXED_MAX": "1",
         "SGLANG_TPU_MUSE_MK_ATTN_SKIP_IDLE": "1",
         "SGLANG_TPU_MUSE_MK_ATTN_COL_MASK": "1",
         "SGLANG_TPU_MK_FOLD_ATTN_SCALE": "1",
@@ -129,7 +131,6 @@ _FP8_1M_KV: dict[str, dict] = {
     "runtime_env": {
         "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV": "1",
         # Megakernel attention over SEQ_ALONG_LANE pools.
-        "SGLANG_TPU_MUSE_MK_SAL_CHUNK_TOKENS": "2048",
         "SGLANG_TPU_MUSE_MK_SAL_SWA_CHUNK_TOKENS": "512",
         "SGLANG_TPU_MK_SAL_FP8_DOT": "1",
         # Batched RPA prefill attention (SEQ_ALONG_LANE only).
@@ -189,7 +190,7 @@ def _apply(patch: dict[str, dict]) -> dict:
     return config
 
 
-# Both P/D engines: the experimental spec worker is the only one serving DFlash on a PP prefill.
+# Both P/D engines.
 _PD: dict[str, dict] = {
     "server_args": {
         "disaggregation_transfer_backend": "raiden",
@@ -198,9 +199,6 @@ _PD: dict[str, dict] = {
         "dist_timeout": 3600,
     },
     "runtime_env": {
-        "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
-        # The experimental worker only simulates acceptance with fixed draft tokens.
-        "SGLANG_SIMULATE_ACC_TOKEN_MODE": "fixed",
         "SGLANG_WARMUP_TIMEOUT": "3600",
         # These JobSet variables describe the public router, not its engines.
         "HOST": None,

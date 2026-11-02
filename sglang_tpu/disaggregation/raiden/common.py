@@ -81,6 +81,10 @@ class RaidenKVCacheGroups:
     # Trailing tensors of full / swa that belong to a separate draft pool.
     num_draft_full: int = 0
     num_draft_swa: int = 0
+    # Per-rank KV head counts of the separate draft pool (equal to the draft's
+    # total_kv_heads on a TP=1 pipeline producer).
+    draft_kv_head_num: Optional[int] = None
+    draft_swa_kv_head_num: Optional[int] = None
     # Trailing full tensors after the draft's: the PD hidden pool (pd_hidden_pool.py).
     num_hidden_full: int = 0
     # Per-layer request-state tensors (GDN/Mamba rows or DSV4 compressor rings).
@@ -236,6 +240,8 @@ def get_raiden_kv_caches(
     full, swa = list(groups.full), list(groups.swa)
     full_ids, swa_ids = list(groups.full_layer_ids), list(groups.swa_layer_ids)
     num_draft_full = num_draft_swa = num_hidden_full = 0
+    draft_kv_head_num: Optional[int] = None
+    draft_swa_kv_head_num: Optional[int] = None
     if draft_pool is not None and draft_pool is not pool:
         draft_groups = group_one(draft_pool)
         num_draft_full, num_draft_swa = len(draft_groups.full), len(draft_groups.swa)
@@ -243,6 +249,10 @@ def get_raiden_kv_caches(
         swa.extend(draft_groups.swa)
         full_ids.extend(draft_groups.full_layer_ids)
         swa_ids.extend(draft_groups.swa_layer_ids)
+        full_draft_pool = getattr(draft_pool, "full_kv_pool", draft_pool)
+        swa_draft_pool = getattr(draft_pool, "swa_kv_pool", draft_pool)
+        draft_kv_head_num = getattr(full_draft_pool, "head_num", None)
+        draft_swa_kv_head_num = getattr(swa_draft_pool, "head_num", None)
 
     if hidden_pool is not None:
         full.append(hidden_pool.buffer)
@@ -286,6 +296,8 @@ def get_raiden_kv_caches(
         swa_layer_ids=swa_ids,
         num_draft_full=num_draft_full,
         num_draft_swa=num_draft_swa,
+        draft_kv_head_num=draft_kv_head_num,
+        draft_swa_kv_head_num=draft_swa_kv_head_num,
         num_hidden_full=num_hidden_full,
         state=state,
         state_type=state_type,

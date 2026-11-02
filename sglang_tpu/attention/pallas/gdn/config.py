@@ -18,7 +18,7 @@
 
 import dataclasses
 import enum
-from typing import Any
+from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -174,12 +174,23 @@ class GDNConfig:
         moves work from MXU to XLU. More value heads already means more
         XLU work, hence the smaller blocks there.
         """
-        # TODO(alynie): create a better heuristic to tune this value.
-        if self.num_v_heads == 64:
+        # Within-block forward substitution issues head_groups * B / 2 broadcasts
+        # per token. At 1 head group (<= 8 heads), B = 16 is optimal.
+        # - GDN issues O(1 / B) between-block solver matmuls per token, so scale
+        #   B inversely with head_groups (head_groups * B <= 16).
+        # - KDA also tiles Aqk and L into O(1 / B^2) sub-block matmuls per token,
+        #   so scale B^2 inversely with head_groups (head_groups * B**2 <= 16**2).
+        head_groups = pl.cdiv(self.num_v_heads, 8)
+        if self.is_kda:
+            for b in (16, 8, 4):
+                if head_groups * b * b <= 256:
+                    return b
             return 2
-        if self.num_v_heads == 32:
-            return 8
-        return 16
+        # GDN: between-block updates scale as 1 / B.
+        for b in (16, 8, 4):
+            if head_groups * b <= 16:
+                return b
+        return 2
 
     @property
     def use_recurrent(self) -> bool:
@@ -214,7 +225,10 @@ class GDNConfig:
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
         if self.is_kda and self.gate_lower_bound is not None:
             suffix += "_bounded"
-        return f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}{suffix}"
+        return (
+            f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}"
+            f"_b{self.seq_tile_size}_c{self.chunk_size}{suffix}"
+        )
 
     def get_metadata(self) -> dict[str, str | int | float]:
         cfgs_dict = dataclasses.asdict(self)
@@ -234,19 +248,31 @@ class GDNConfig:
 
     # Fraction of VMEM the kernel may use. A multi-token window holds one
     # state checkpoint per position in VMEM, so for large-head models the
-    # default 0.7 budget is not enough; those get a higher limit and the
+    # default 0.80 budget is not enough; those get a higher limit and the
     # wrapper sizes the tile against the same factor.
-    DEFAULT_VMEM_FRACTION = 0.7
-    WINDOWED_VMEM_FRACTION = 0.9
+    DEFAULT_VMEM_FRACTION: ClassVar[float] = 0.80
+    WINDOWED_VMEM_FRACTION: ClassVar[float] = 0.90
+    # Cap decode tiles at 16 sequences: larger tiles increase per-slot state DMA
+    # descriptors and register spills without reducing per-slot compute.
+    DECODE_TILE_SIZES: ClassVar[tuple[int, ...]] = (16, 8, 4, 2, 1)
+    MIXED_TILE_SIZES: ClassVar[tuple[int, ...]] = (128, 64, 32, 16, 8, 4, 2, 1)
 
-    def get_vmem_limit_bytes(self) -> int:
-        tpu_info = pltpu.get_tpu_info()
-        fraction = (
-            self.WINDOWED_VMEM_FRACTION
-            if self.window_size > 1
-            else self.DEFAULT_VMEM_FRACTION
+    @classmethod
+    def get_vmem_limit_bytes(
+        cls,
+        window_size: int = 1,
+        vmem_capacity_bytes: int | None = None,
+    ) -> int:
+        """Returns the VMEM limit for a kernel keeping window_size checkpoints."""
+        capacity = (
+            pltpu.get_tpu_info().vmem_capacity_bytes
+            if vmem_capacity_bytes is None
+            else vmem_capacity_bytes
         )
-        return int(fraction * tpu_info.vmem_capacity_bytes)
+        fraction = (
+            cls.WINDOWED_VMEM_FRACTION if window_size > 1 else cls.DEFAULT_VMEM_FRACTION
+        )
+        return int(fraction * capacity)
 
     def get_scratch_shape_dict(self) -> dict[str, Any]:
         conv_shape = (self.seq_tile_size, self.prev_kernel_size, 1, self.dim_size)
