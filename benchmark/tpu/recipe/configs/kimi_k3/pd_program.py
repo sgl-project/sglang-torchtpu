@@ -174,8 +174,9 @@ runtime_env.update(
         # measured with fp8 KV: seven drafts win only for a lone request; three
         # beat seven from two requests and beat plain steps through sixteen
         # (e.g. B8 1034 vs 851 tok/s, B16 1274 vs 995 at 131k context). Past
-        # sixteen, plain steps (no wider three-draft verify compiles; vLLM's
-        # schedule carries the last range's count into the tail).
+        # sixteen, plain steps (vLLM's schedule carries the last range's count
+        # into the tail); K3_PROGRAM_SPEC_SCHEDULE overrides it (three drafts
+        # verify up to 24 requests).
         "SGLANG_TPU_K3_PROGRAM_SPEC_SCHEDULE": os.environ.get(
             "K3_PROGRAM_SPEC_SCHEDULE", "1:1:7,2:16:3,17:64:0"
         ),
