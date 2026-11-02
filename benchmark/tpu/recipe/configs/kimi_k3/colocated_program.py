@@ -24,6 +24,8 @@ Environment:
                                     requests decode (0: the fixed interval)
     K3_PROGRAM_PREFILL_WAIT         seconds a prefill waits for decoding
                                     requests (0: off)
+    K3_PROGRAM_RUNNING              running requests (default twice the
+                                    concurrency, up to 64)
     K3_PROGRAM_KERNEL_EXTRA         more kernel settings (a=b;c=d)
     SGLANG_TPU_K3_PROGRAM_PRESHARDED pre-sharded weights directory
 """
@@ -41,6 +43,10 @@ PAGE_SIZE = 32 * (512 if KV_DTYPE.startswith("fp8") else 256)
 # Decoding requests, up to the 64 rows the programs' plain decode is checked
 # to; the prefill takes its share of the same slots.
 RUNNING = min(64, max(4, 2 * CONCURRENCY))
+# A session has one request in flight: K3_PROGRAM_RUNNING (e.g. the
+# concurrency) frees the state slots planned for the second (three blocks
+# each, sglang plans up to five a running request).
+RUNNING = int(os.environ.get("K3_PROGRAM_RUNNING", RUNNING))
 # Both programs' weights take ~80 GB of a rank's 96 GB (the shared experts 45,
 # two sets of dense weights 12, the prefill's sequence-parallel projections
 # 22.5): the pools are small, and every KDA state (a checkpoint, a running
@@ -94,7 +100,9 @@ server_args.update(
         # Checkpoints at the prefill's page-sized chunks only (the decode
         # program keeps its requests' KDA state; K3ProgramAlgo sets the same).
         "mamba_track_interval": PAGE_SIZE * (1 << 16),
-        "max_mamba_cache_size": CHECKPOINTS + 2 * RUNNING,
+        # sglang caps max_running_requests at a fifth of the slots under
+        # overlap scheduling.
+        "max_mamba_cache_size": max(CHECKPOINTS + 2 * RUNNING, 5 * RUNNING),
         "max_total_tokens": None,
         # Decode steps between prefill batches: a long prompt's chunks would
         # otherwise stop every decoding request on the engine until it ends.
