@@ -112,7 +112,6 @@ def make_req():
         last_node=1,
         lock_receipt=swa_receipt(node_id=1, swa_uuid=17),
         swa_prefix_lock_released=True,
-        swa_stale_window_floor=None,
         kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=64),
         _compute_max_prefix_len=lambda n: n - 1,
         finished=lambda: False,
