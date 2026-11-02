@@ -202,7 +202,7 @@ class TestExperimentalEagle3(CustomTestCase):
         )
         accept = SimpleNamespace(last_steps=torch.tensor([1, -1]))
         worker.draft = lambda *args: None
-        worker.verify = lambda *args: (None, accept)
+        worker.verify = lambda *args, grammar_barrier=None: (None, accept)
         worker.commit = lambda *args: None
         batch = SimpleNamespace(
             mamba_track_indices=torch.tensor([3, 0]),
