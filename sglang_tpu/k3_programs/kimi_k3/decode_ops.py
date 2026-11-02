@@ -53,10 +53,11 @@ PLAIN_BATCHES = (1, 2, 4, 8, 16, 24, 32, 48, 64, 128)
 
 
 def decode_batch_sizes(max_num_seqs: int) -> tuple[int, ...]:
-    """The plain batches below ``--max-num-seqs``, and itself."""
-    return tuple(
-        sorted({b for b in PLAIN_BATCHES if b < max_num_seqs} | {max_num_seqs})
-    )
+    """The plain batches below ``--max-num-seqs``, and the first holding it
+    (past eight rows the attention runs 8-row chunks: a batch of 12 or 20
+    does not compile, so such a limit pads to 16 or 24)."""
+    top = next((b for b in PLAIN_BATCHES if b >= max_num_seqs), max_num_seqs)
+    return tuple(sorted({b for b in PLAIN_BATCHES if b < max_num_seqs} | {top}))
 
 
 # Attention DP's compiled plain-decode batches (DP row ownership).
