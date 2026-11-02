@@ -97,9 +97,7 @@ def flash_attention_qk_softmax(
         # making causal masking (q_kv_diff >= offset) always True. We only need
         # to mask keys that exceed the local valid length (g3 cl/1005950290).
         kv_iota = lax.broadcasted_iota(jnp.int32, (1, 1, s), 2)
-        masks = [
-            kv_iota < kv_len_left[b_idx] for b_idx in range(cfgs.block.batch_size)
-        ]
+        masks = [kv_iota < kv_len_left[b_idx] for b_idx in range(cfgs.block.batch_size)]
     else:
         kv_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 2)
         q_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1)
@@ -153,7 +151,9 @@ def flash_attention_qk_softmax(
                 # Step 4:
                 #   q_kv_diff < sliding_window + offset
                 if global_q_k_gap is None:
-                    mask_b = jnp.logical_and(mask_b, q_kv_diff < sliding_window + offset)
+                    mask_b = jnp.logical_and(
+                        mask_b, q_kv_diff < sliding_window + offset
+                    )
                 else:
                     # Same in global positions: gap = q_global - (k_id + rank * page)
                     # at q_iota = kv_iota = 0 of the block; the stripe term adds

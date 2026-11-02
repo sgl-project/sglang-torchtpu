@@ -813,11 +813,15 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 return torch.tensor([0, 0, non_empty_bs], dtype=torch.int32)
             else:
                 # RPA v3: DECODE is [0, d0) -> [n, n, n]
-                return torch.tensor([non_empty_bs, non_empty_bs, non_empty_bs], dtype=torch.int32)
+                return torch.tensor(
+                    [non_empty_bs, non_empty_bs, non_empty_bs], dtype=torch.int32
+                )
         else:
             if self.kernel_spec.is_batched:
                 # Batched RPA: MIXED is [0, d0) -> [n, n, n]
-                return torch.tensor([non_empty_bs, non_empty_bs, non_empty_bs], dtype=torch.int32)
+                return torch.tensor(
+                    [non_empty_bs, non_empty_bs, non_empty_bs], dtype=torch.int32
+                )
             else:
                 # RPA v3: EXTEND is [d0, d1) -> [0, n, n]
                 return torch.tensor([0, non_empty_bs, non_empty_bs], dtype=torch.int32)

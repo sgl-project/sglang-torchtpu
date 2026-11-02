@@ -935,10 +935,10 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
     def test_accepts_up_to_eight_dcp_ranks(self):
         for dcp_size in (2, 4, 8):
             with self.subTest(dcp_size=dcp_size):
-                self._validate(
-                    self._args(dcp_size=dcp_size, chunked_prefill_size=4096)
-                )
-        self._assert_refused("(?i)decode-context-parallel-size", dcp_size=16, tp_size=16)
+                self._validate(self._args(dcp_size=dcp_size, chunked_prefill_size=4096))
+        self._assert_refused(
+            "(?i)decode-context-parallel-size", dcp_size=16, tp_size=16
+        )
 
     def test_chunk_check_uses_the_resolved_page_size(self):
         # An unset page resolves to the batched kernel's 256-token floor first.

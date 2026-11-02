@@ -197,16 +197,30 @@ class TestDcpOpContract(CustomTestCase):
         # decode-only selection reads the same batch with its chunk row
         # excluded ([0, 0, n] would be a batch of three decode rows).
         cases = (
-            (3, [4, 1, 1], [200, 300, 130],
-             [local_len(196), local_len(300), local_len(130)], [1, 1, 3], 0),
+            (
+                3,
+                [4, 1, 1],
+                [200, 300, 130],
+                [local_len(196), local_len(300), local_len(130)],
+                [1, 1, 3],
+                0,
+            ),
             (2, [4, 1, 1], [200, 300, 130], [200, 300, 130], [1, 1, 3], 2),
-            (3, [4, 1, 1], [200, 300, 130],
-             [local_len(196), local_len(300), local_len(130)], [1, 1, 3], 1),
+            (
+                3,
+                [4, 1, 1],
+                [200, 300, 130],
+                [local_len(196), local_len(300), local_len(130)],
+                [1, 1, 3],
+                1,
+            ),
             (2, [4, 1, 1], [200, 300, 130], [200, 300, 130], [1, 1, 1], 2),
         )
         for scope, q_lens, seq_lens, kv_lens, distribution, rpa_cases in cases:
             total_q = sum(q_lens)
-            cu_q_lens = torch.tensor([0] + list(torch.cumsum(torch.tensor(q_lens), 0)), dtype=torch.int32)
+            cu_q_lens = torch.tensor(
+                [0] + list(torch.cumsum(torch.tensor(q_lens), 0)), dtype=torch.int32
+            )
             out, lse = self.overload(
                 dev(self.NUM_TOKENS, self.NUM_Q_HEADS, self.HEAD_DIM),
                 dev(self.NUM_TOKENS, self.NUM_KV_HEADS, self.HEAD_DIM),
@@ -230,7 +244,9 @@ class TestDcpOpContract(CustomTestCase):
                 scope,
                 rpa_cases,
             )
-            self.assertEqual(tuple(out.shape), (self.NUM_TOKENS, self.NUM_Q_HEADS, self.HEAD_DIM))
+            self.assertEqual(
+                tuple(out.shape), (self.NUM_TOKENS, self.NUM_Q_HEADS, self.HEAD_DIM)
+            )
             self.assertTrue(torch.isfinite(out.float().cpu()[:total_q]).all(), scope)
             # Unprocessed rows report -inf; nothing may be NaN.
             self.assertFalse(torch.isnan(lse.cpu()).any(), scope)

@@ -241,7 +241,11 @@ def rpa_body(
     # Step 1: Fetch metadata.
     processed_q_len = []
     processed_kv_len = []
-    kv_len_left = [] if (cfgs.serve.cache_only or cfgs.serve.attention_scope.walks_cache_stripe) else None
+    kv_len_left = (
+        []
+        if (cfgs.serve.cache_only or cfgs.serve.attention_scope.walks_cache_stripe)
+        else None
+    )
     # NEW_TOKENS_ONLY: keys before this per-block bound are cached and masked.
     kv_new_start_left = [] if cfgs.serve.attention_scope.skips_cached_keys else None
     global_q_k_gap = None
@@ -302,9 +306,7 @@ def rpa_body(
             kv_left_frm_cache = kv_left
         elif cfgs.serve.attention_scope == configs.AttentionScope.STRIPED:
             k_len_global = (
-                kv_lens_global_ref[safe_s_idx]
-                if kv_lens_global_ref is not None
-                else 0
+                kv_lens_global_ref[safe_s_idx] if kv_lens_global_ref is not None else 0
             )
             page_size = cfgs.serve.page_size
             cp_size = cfgs.serve.cp_group_size

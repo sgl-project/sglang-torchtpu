@@ -23,7 +23,7 @@ from sglang.srt.runtime_context import get_parallel
 def dcp_q_head_sharding(attn_tp_rank: int, attn_tp_size: int) -> tuple[int, int, int]:
     """How a GQA/MHA attention layer shards its query heads under DCP.
 
-    Returns ``(q_tp_rank, q_tp_size, q_heads_factor)``. 
+    Returns ``(q_tp_rank, q_tp_size, q_heads_factor)``.
     With ``--dcp-replicate-q-proj``, Q is replicated across the dcp axis.
     """
     parallel = get_parallel()

@@ -154,7 +154,11 @@ def _fused_cache(
     slots, num_kv_heads, _ = slot_k.shape
     layout = _kv_layout(layout_name)
     shape = get_kv_cache_shape(
-        slots // page_size, page_size, num_kv_heads, HEAD_DIM, jnp.bfloat16,
+        slots // page_size,
+        page_size,
+        num_kv_heads,
+        HEAD_DIM,
+        jnp.bfloat16,
         kv_layout=layout,
     )
     kv = np.stack([slot_k, slot_v], axis=2).reshape(slots, 2 * num_kv_heads, HEAD_DIM)
@@ -162,7 +166,9 @@ def _fused_cache(
         # [pages, 2 * kv_heads, head_dim // packing, packing, page_size]
         _, _, hd_words, packing, _ = shape
         kv = np.pad(kv, ((0, 0), (0, 0), (0, hd_words * packing - HEAD_DIM)))
-        kv = kv.reshape(slots // page_size, page_size, 2 * num_kv_heads, hd_words, packing)
+        kv = kv.reshape(
+            slots // page_size, page_size, 2 * num_kv_heads, hd_words, packing
+        )
         return _to_bf16(np.ascontiguousarray(kv.transpose(0, 2, 3, 4, 1)))
     _, _, kv_words, packing, aligned_head_dim = shape
     kv = np.pad(
@@ -204,7 +210,7 @@ def _cache_row(cache: np.ndarray, page: int, slot: int, num_kv_heads: int):
 def _assert_cache_equal(
     got: np.ndarray,
     want: np.ndarray,
-    shard: "_PagedShard",
+    shard: _PagedShard,
     lengths,
     pages_per_seq: int,
     num_kv_heads: int,
@@ -661,7 +667,11 @@ class TestBatchedRpaDcpStripedDecode(_CloseAssertions):
         lse = np.zeros((num_seqs, geo.num_q_heads), np.float32)
         for seq, n in enumerate(self.SEQ_LENS):
             o, l = _dense_attention(
-                queries[seq : seq + 1], full_k[seq], full_v[seq], np.asarray([n - 1]), window
+                queries[seq : seq + 1],
+                full_k[seq],
+                full_v[seq],
+                np.asarray([n - 1]),
+                window,
             )
             out[seq], lse[seq] = o[0], l[0]
         return out, lse
@@ -688,7 +698,9 @@ class TestBatchedRpaDcpStripedDecode(_CloseAssertions):
             full_k, full_v, _ = self._data(geo)
             claimed = {}
             for rank in range(geo.cp):
-                _, cache_after, shard, owns, pages = self._run_rank(geo, rank, None, None)
+                _, cache_after, shard, owns, pages = self._run_rank(
+                    geo, rank, None, None
+                )
                 for seq, n in enumerate(self.SEQ_LENS):
                     if not owns[seq]:
                         continue
@@ -705,7 +717,10 @@ class TestBatchedRpaDcpStripedDecode(_CloseAssertions):
     def test_fused_striped_rejects_multi_token_decode(self):
         """STRIPED relies on one query per sequence; multi-token decode must use the 2-phase pair."""
         import jax.numpy as jnp
-        from sglang_tpu.attention.pallas.batched_rpa.wrapper import ragged_paged_attention
+
+        from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
+            ragged_paged_attention,
+        )
 
         shard = _paged_shard(
             [np.zeros((1, 2, HEAD_DIM), np.float32)],
@@ -779,6 +794,7 @@ class TestBatchedRpaDcpMixedPrefillAndDecode(_CloseAssertions):
 
     def _run_shards(self, geo: Geometry, window):
         import jax.numpy as jnp
+
         from sglang_tpu.attention.pallas.batched_rpa import configs
 
         prefix_k, prefix_v, chunk_k, chunk_v, queries = self._data(geo)
@@ -874,10 +890,12 @@ class TestBatchedRpaDcpMixedPrefillAndDecode(_CloseAssertions):
         out_phase2, lse_phase2 = _merge_by_lse(phase2_partials)
 
         # Merge Phase 2 and Phase 1
-        merged_out, merged_lse = _merge_by_lse([
-            (out_phase2, lse_phase2),
-            (phase1_out[:total_q], phase1_lse[:total_q]),
-        ])
+        merged_out, merged_lse = _merge_by_lse(
+            [
+                (out_phase2, lse_phase2),
+                (phase1_out[:total_q], phase1_lse[:total_q]),
+            ]
+        )
         return merged_out, merged_lse, caches_after, shards, owns_list, pages
 
     def _reference(self, geo: Geometry, window):
@@ -928,10 +946,16 @@ class TestBatchedRpaDcpMixedPrefillAndDecode(_CloseAssertions):
                             claimed[seq] = rank
                             j = _local_len(p, rank, geo.cp)
                             page = shard.page_indices[seq * pages + j // PAGE_SIZE]
-                            row = _cache_row(cache_after, page, j % PAGE_SIZE, geo.num_kv_heads)
+                            row = _cache_row(
+                                cache_after, page, j % PAGE_SIZE, geo.num_kv_heads
+                            )
                             label = f"{geo.name} rank {rank} seq {seq}"
-                            self.assert_out_close(row[:, 0], chunk_k[seq][0], label + " k")
-                            self.assert_out_close(row[:, 1], chunk_v[seq][0], label + " v")
+                            self.assert_out_close(
+                                row[:, 0], chunk_k[seq][0], label + " k"
+                            )
+                            self.assert_out_close(
+                                row[:, 1], chunk_v[seq][0], label + " v"
+                            )
             decode_seq_indices = [s for s, (_, c) in enumerate(self.SEQS) if c == 1]
             self.assertEqual(sorted(claimed), decode_seq_indices)
 
@@ -988,8 +1012,17 @@ class TestBatchedRpaDcpStripedChunkWrite(_CloseAssertions):
 
     LAYOUT_NAME = KV_LAYOUT_NAME
 
-    def _shard(self, geo: Geometry, rank: int, pages, prefix_k, prefix_v,
-               chunk_k, chunk_v, written):
+    def _shard(
+        self,
+        geo: Geometry,
+        rank: int,
+        pages,
+        prefix_k,
+        prefix_v,
+        chunk_k,
+        chunk_v,
+        written,
+    ):
         """This rank's stripe holding every prefix and, per ``written[s]``,
         sequence s's chunk too. Same rng per rank, so the stale filler and the
         page table are identical across the before/after shards."""
@@ -1002,12 +1035,17 @@ class TestBatchedRpaDcpStripedChunkWrite(_CloseAssertions):
             keys.append(full_k[positions])
             values.append(full_v[positions])
         return _paged_shard(
-            keys, values, pages, np.random.default_rng(900 + rank), geo.num_kv_heads,
+            keys,
+            values,
+            pages,
+            np.random.default_rng(900 + rank),
+            geo.num_kv_heads,
             layout_name=self.LAYOUT_NAME,
         )
 
     def _run(self, geo: Geometry, window):
         import jax.numpy as jnp
+
         from sglang_tpu.attention.pallas.batched_rpa import configs
 
         prefix_k, prefix_v, chunk_k, chunk_v, queries = self._data(geo)
@@ -1031,7 +1069,13 @@ class TestBatchedRpaDcpStripedChunkWrite(_CloseAssertions):
                 layout_name=self.LAYOUT_NAME,
             )
             before = self._shard(
-                geo, rank, pages, prefix_k, prefix_v, chunk_k, chunk_v,
+                geo,
+                rank,
+                pages,
+                prefix_k,
+                prefix_v,
+                chunk_k,
+                chunk_v,
                 [False] * num_seqs,
             )
             # Chunk pass: global lengths, this rank's stripe table.
@@ -1055,8 +1099,10 @@ class TestBatchedRpaDcpStripedChunkWrite(_CloseAssertions):
                 cache_c,
                 np.asarray(after_chunk.cache.astype(jnp.float32)),
                 after_chunk,
-                [_local_len(p + c if m else p, rank, geo.cp)
-                 for (p, c), m in zip(self.SEQS, multi)],
+                [
+                    _local_len(p + c if m else p, rank, geo.cp)
+                    for (p, c), m in zip(self.SEQS, multi)
+                ],
                 pages,
                 geo.num_kv_heads,
                 self.LAYOUT_NAME,
@@ -1124,8 +1170,13 @@ class TestBatchedRpaDcpStripedChunkWrite(_CloseAssertions):
                 values = np.concatenate([prefix_v[s], chunk_v[s]])
                 key_positions = None
             out, lse = _dense_attention(
-                q_seq, keys, values, p + np.arange(c), window,
-                causal=True, key_positions=key_positions,
+                q_seq,
+                keys,
+                values,
+                p + np.arange(c),
+                window,
+                causal=True,
+                key_positions=key_positions,
             )
             outs.append(out)
             lses.append(lse)
@@ -1163,7 +1214,9 @@ class TestBatchedRpaDcpStripedChunkWrite(_CloseAssertions):
 
 
 @unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
-class TestBatchedRpaDcpStripedChunkWriteSeqAlongLane(TestBatchedRpaDcpStripedChunkWrite):
+class TestBatchedRpaDcpStripedChunkWriteSeqAlongLane(
+    TestBatchedRpaDcpStripedChunkWrite
+):
     """The chunk write on the lane-major cache.
 
     SEQ_ALONG_LANE DMAs whole pages, so the chunk pass fetches the page the
