@@ -5,6 +5,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 import random
 import unittest
 from array import array
+from unittest import mock
 
 import torch
 
@@ -18,6 +19,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -81,7 +83,11 @@ class PrefillWorld:
         a.set_full_to_swa_mapping(full, swa)
         return full[:n]
 
-    def prefill(self, tokens: list[int], chunk: int) -> int:
+    def prefill(
+        self, tokens: list[int], chunk: int, *, decode: int = 0, output: int = 7
+    ) -> int:
+        """Returns the cached prefix length. ``decode`` output tokens (the first is
+        ``output``) get KV before the request finishes, so they enter the tree."""
         req = Req(
             rid=f"r{self.rid}",
             origin_input_text="",
@@ -107,8 +113,21 @@ class PrefillWorld:
             if pos < len(tokens):
                 checkpoint_kv_cache(req, self.cache)
                 req.init_next_round_input()
-        req.output_ids.append(7)
+        req.output_ids.append(output)
         checkpoint_kv_cache(req, self.cache)
+        if decode:
+            n = len(tokens)
+            # The first slots continue the prompt's last page.
+            rem = min(-n % PAGE, decode)
+            parts = []
+            if rem:
+                last = self.req_to_token_pool.req_to_token[row, n - 1 : n]
+                parts.append(last + torch.arange(1, rem + 1, dtype=last.dtype))
+            if decode > rem:
+                parts.append(self._alloc(decode - rem).to(torch.int32))
+            self.req_to_token_pool.write((row, slice(n, n + decode)), torch.cat(parts))
+            req.output_ids.extend([output + 1] * (decode - 1))
+            req.kv.kv_committed_len = req.kv.kv_allocated_len = n + decode
         req.finished_reason = FINISH_LENGTH(length=0)
         release_kv_cache(req, self.cache)
         return cached
@@ -155,6 +174,165 @@ class TestSWAEvictStaleWindowsFirst(unittest.TestCase):
         sessions = 12
         self.assertLess(self._full_hits(enabled=False, sessions=sessions), sessions)
         self.assertEqual(self._full_hits(enabled=True, sessions=sessions), sessions)
+
+    def _conversation_hits(
+        self, *, enabled: bool, conversations: int, turns: int
+    ) -> int:
+        """Revisits that hit the previous turn's whole prompt. Each turn's prompt is the
+        previous prompt plus three pages, and its output token completes a page that the
+        next turn does not send back, so every turn leaves an abandoned output leaf."""
+        w = self._world(enabled=enabled, swa_tokens=1536)
+        prompts = [_tokens(200 + c, 8 * PAGE - 1) for c in range(conversations)]
+        hits = 0
+        for turn in range(turns):
+            for c in range(conversations):
+                # The previous turn's prompt ends one token before a page boundary.
+                previous = len(prompts[c]) - 3 * PAGE
+                cached = w.prefill(prompts[c], self.CHUNK, decode=1)
+                hits += turn > 0 and cached == previous // PAGE * PAGE
+                prompts[c] = prompts[c] + _tokens(1000 * c + turn, 3 * PAGE)
+        w.cache.sanity_check()
+        return hits
+
+    def test_round_robin_conversations_survive_swa_pressure(self):
+        """Multi-turn conversations: the SWA pool fits every conversation's tail window but
+        not the windows of its earlier turns, which only an abandoned output leaf separates
+        from the current path."""
+        conversations, turns = 12, 8
+        revisits = conversations * (turns - 1)
+        self.assertEqual(
+            self._conversation_hits(
+                enabled=True, conversations=conversations, turns=turns
+            ),
+            revisits,
+        )
+        self.assertLess(
+            self._conversation_hits(
+                enabled=False, conversations=conversations, turns=turns
+            ),
+            revisits,
+        )
+        # The output leaves are what separate the earlier turns from the path.
+        with mock.patch.object(
+            SWAComponent, "_abandoned_output_chain", return_value=[]
+        ):
+            self.assertLess(
+                self._conversation_hits(
+                    enabled=True, conversations=conversations, turns=turns
+                ),
+                revisits,
+            )
+
+    def _evict_swa(self, w: PrefillWorld, num_tokens: int) -> None:
+        w.cache.evict(EvictParams(num_tokens=0, swa_num_tokens=num_tokens))
+
+    def test_other_conversation_tail_keeps_its_place(self):
+        """A leaf beside the path holding another conversation's prompt is not an
+        abandoned output: neither it nor the shared prefix above it is demoted."""
+        w = self._world(enabled=True)
+        shared = _tokens(1, 4 * PAGE)
+        for f in range(6):
+            w.prefill(_tokens(900 + f, 6 * PAGE - 1), 10000)
+        a = shared + _tokens(2, 4 * PAGE - 1)
+        w.prefill(a, 10000)
+        b = shared + _tokens(3, 4 * PAGE - 1)
+        w.prefill(b, 10000)
+        w.prefill(b + _tokens(4, 3 * PAGE), 10000)
+        # One older leaf's worth of SWA: the six unrelated leaves go first.
+        self._evict_swa(w, 4 * PAGE)
+        self.assertEqual(w.prefill(a + _tokens(5, 3 * PAGE), 10000), 7 * PAGE)
+        w.cache.sanity_check()
+
+    def test_shared_prefix_beside_a_cold_leaf_keeps_its_place(self):
+        """A new conversation still hits a shared prefix whose only other child is an
+        old one-turn conversation that never came back."""
+        w = self._world(enabled=True)
+        shared = _tokens(1, 4 * PAGE)
+        for f in range(6):
+            w.prefill(_tokens(900 + f, 6 * PAGE - 1), 10000)
+        w.prefill(shared + _tokens(7, 4 * PAGE - 1), 10000)
+        b = shared + _tokens(2, 4 * PAGE - 1)
+        w.prefill(b, 10000)
+        w.prefill(b + _tokens(3, 3 * PAGE), 10000)
+        self._evict_swa(w, PAGE)
+        self.assertEqual(w.prefill(shared + _tokens(4, 4 * PAGE - 1), 10000), 4 * PAGE)
+        w.cache.sanity_check()
+
+    def test_short_first_turn_beside_the_path_keeps_its_place(self):
+        """Another conversation whose first message after the shared prefix is under a
+        page ends in output much like a dropped reply; its prompt differs from the
+        path's, so it and the shared prefix keep their place."""
+        for evict in (2 * PAGE, 4 * PAGE):
+            w = self._world(enabled=True)
+            shared = _tokens(1, 4 * PAGE)
+            for f in range(6):
+                w.prefill(_tokens(900 + f, 6 * PAGE - 1), 10000, decode=1)
+            a = shared + _tokens(2, PAGE - 1)
+            w.prefill(a, 10000, decode=1)
+            b = shared + _tokens(3, 2 * PAGE - 1)
+            w.prefill(b, 10000, decode=1)
+            w.prefill(b + [7] + _tokens(4, 3 * PAGE), 10000, decode=1)
+            self._evict_swa(w, evict)
+            # A's next turn sends its reply back.
+            self.assertEqual(
+                w.prefill(a + [7] + _tokens(5, 3 * PAGE), 10000, decode=1), 5 * PAGE
+            )
+            self.assertEqual(
+                w.prefill(shared + _tokens(6, 4 * PAGE - 1), 10000, decode=1),
+                4 * PAGE,
+            )
+            w.cache.sanity_check()
+
+    def test_long_dropped_reply_is_crossed(self):
+        """A dropped reply longer than a window is split into a chain of output nodes;
+        the next turn still demotes it and the windows behind it."""
+        w = self._world(enabled=True)
+        prompt = _tokens(11, 8 * PAGE - 1)
+        # 15 prompt tokens and 65 output tokens past the last full page: 5 pages,
+        # more than one window, so the SWA leaf cap splits them.
+        w.prefill(prompt, self.CHUNK, decode=65)
+        reply = w.cache.tree_core.node_by_id(w.match(prompt + [7, 1]).last_device_node)
+        self.assertEqual(len(reply.children), 1)
+        demoted = []
+        lru = w.cache.tree_core.lru_lists[ComponentType.SWA]
+        with mock.patch.object(lru, "reset_node_lru", side_effect=demoted.append):
+            w.prefill(prompt + _tokens(12, 6 * PAGE), self.CHUNK, decode=1)
+        self.assertIn(reply, demoted)
+        self.assertIn(next(iter(reply.children.values())), demoted)
+        # The previous turn's window above the branch.
+        self.assertIn(reply.parent, demoted)
+
+    def test_other_reply_to_the_same_prompt_keeps_its_place(self):
+        """Two conversations open with the same message and get different replies; the
+        second reply is not a turn that dropped the first, so the first keeps its place."""
+        for evict in (PAGE, 4 * PAGE):
+            w = self._world(enabled=True)
+            shared = _tokens(1, 4 * PAGE)
+            for f in range(6):
+                w.prefill(_tokens(900 + f, 6 * PAGE - 1), 10000, decode=1)
+            first = shared + _tokens(2, PAGE - 1)
+            w.prefill(first, 10000, decode=1, output=7)
+            w.prefill(first, 10000, decode=1, output=8)
+            w.prefill(first + [8] + _tokens(4, 3 * PAGE), 10000, decode=1)
+            self._evict_swa(w, evict)
+            self.assertEqual(
+                w.prefill(first + [7] + _tokens(5, 3 * PAGE), 10000, decode=1),
+                5 * PAGE,
+            )
+            w.cache.sanity_check()
+
+    def test_output_sent_back_as_prompt_is_not_abandoned(self):
+        """A reply the next turn sends back verbatim is prompt from then on."""
+        w = self._world(enabled=True)
+        prompt = _tokens(11, 8 * PAGE - 1)
+        w.prefill(prompt, self.CHUNK, decode=1)
+        # The output page holds the prompt's last 15 tokens and the output token (7).
+        output_page = w.match(prompt + [7, 1]).last_device_node
+        node = w.cache.tree_core.node_by_id(output_page)
+        self.assertEqual(node.output_offset, PAGE - 1)
+        w.prefill(prompt + [7] + _tokens(12, 2 * PAGE), self.CHUNK)
+        self.assertIsNone(node.output_offset)
+        w.cache.sanity_check()
 
     def test_branch_window_is_not_stale(self):
         """A window another cached sequence branches from must survive stale-window

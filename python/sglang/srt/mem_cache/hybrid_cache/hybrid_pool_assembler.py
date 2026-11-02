@@ -1149,6 +1149,9 @@ def build_hybrid_mamba_stack(
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
+    kv_host_pool_fn: Optional[Callable[..., Any]] = None,
+    mamba_host_pool_fn: Optional[Callable[..., Any]] = None,
+    cache_controller_cls: type = HybridCacheController,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_id_max = (
         max(full_layer_mapping.keys() | mamba_layer_mapping.keys()) + 1
@@ -1174,13 +1177,21 @@ def build_hybrid_mamba_stack(
             for b in pool.qsa_compressed_k_buffer_pool
         )
         kv_host_size *= kv_bytes / (kv_bytes + index_bytes)
-    kv_host_pool = build_kv_host_pool(
-        kv_pool=kv_pool,
-        page_size=params.page_size,
-        use_mla=use_mla,
-        host_size=kv_host_size,
-        mtp_draft_device_pools=mtp_draft_device_pools,
-    )
+    if kv_host_pool_fn is None:
+        kv_host_pool = build_kv_host_pool(
+            kv_pool=kv_pool,
+            page_size=params.page_size,
+            use_mla=use_mla,
+            host_size=kv_host_size,
+            mtp_draft_device_pools=mtp_draft_device_pools,
+        )
+    else:
+        kv_host_pool = kv_host_pool_fn(
+            kv_pool=kv_pool,
+            page_size=params.page_size,
+            host_size=kv_host_size,
+            mtp_draft_device_pools=mtp_draft_device_pools,
+        )
     if mtp_draft_device_pools:
         full_layer_mapping = with_packed_draft_layer_mapping(
             full_layer_mapping,
@@ -1192,18 +1203,23 @@ def build_hybrid_mamba_stack(
     # page_first_kv_split (e.g. MLA + KDA hybrid on NPU). The Mamba/KDA state
     # pool has no separate K/V buffers, so kv_split does not apply; override
     # to page_first_direct.
-    mamba_layout = (
-        "page_first_direct"
-        if get_memory().hicache_mem_layout == "page_first_kv_split"
-        else get_memory().hicache_mem_layout
-    )
-    mamba_host_pool = MambaPoolHost(
-        mamba_pool,
-        get_memory().hicache_ratio,
-        mamba_host_size,
-        allocator_type=_get_allocator_type(),
-        layout=mamba_layout,
-    )
+    if mamba_host_pool_fn is None:
+        mamba_layout = (
+            "page_first_direct"
+            if get_memory().hicache_mem_layout == "page_first_kv_split"
+            else get_memory().hicache_mem_layout
+        )
+        mamba_host_pool = MambaPoolHost(
+            mamba_pool,
+            get_memory().hicache_ratio,
+            mamba_host_size,
+            allocator_type=_get_allocator_type(),
+            layout=mamba_layout,
+        )
+    else:
+        mamba_host_pool = mamba_host_pool_fn(
+            mamba_pool=mamba_pool, host_size=mamba_host_size
+        )
     entries = [
         build_pool_entry(
             name=PoolName.KV,
@@ -1243,7 +1259,7 @@ def build_hybrid_mamba_stack(
             )
         )
     host_pool_group = HostPoolGroup(entries)
-    cache_controller = HybridCacheController(
+    cache_controller = cache_controller_cls(
         params.token_to_kv_pool_allocator,
         host_pool_group,
         params.page_size,
@@ -1809,7 +1825,13 @@ class _DeepSeekV4Strategy(StackStrategy):
         )
 
 
-class _MambaStrategy(StackStrategy):
+class MambaStrategy(StackStrategy):
+    # A platform whose KV or state layout the built-in host pools cannot read
+    # subclasses this and overrides the three host-stack factories.
+    kv_host_pool_fn: Optional[Callable[..., Any]] = None
+    mamba_host_pool_fn: Optional[Callable[..., Any]] = None
+    cache_controller_cls: type = HybridCacheController
+
     def matches(self, kvcache, components):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
@@ -1857,6 +1879,9 @@ class _MambaStrategy(StackStrategy):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            kv_host_pool_fn=self.kv_host_pool_fn,
+            mamba_host_pool_fn=self.mamba_host_pool_fn,
+            cache_controller_cls=self.cache_controller_cls,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -2205,7 +2230,7 @@ class _DsaStrategy(StackStrategy):
 # Resolved first-to-last; _PlainKvStrategy is the catch-all fallback.
 _STRATEGIES: list[StackStrategy] = [
     _DeepSeekV4Strategy(),
-    _MambaStrategy(),
+    MambaStrategy(),
     _SwaStrategy(),
     _MambaSwaStrategy(),
     _DsaStrategy(),

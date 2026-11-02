@@ -286,14 +286,6 @@ def stage_prefill_tokens(original, batch):
     return batch.prefill_input_ids_cpu
 
 
-def extend_metadata_device(original, batch, device):
-    from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
-
-    if is_host_padded(batch.sampling_info):
-        return "cpu"
-    return original(batch, device)
-
-
 def alloc_extend(
     original,
     tree_cache,
@@ -545,11 +537,6 @@ def hook_specs():
         (
             "sglang.srt.managers.overlap_utils._stage_prefill_tokens",
             stage_prefill_tokens,
-            HookType.AROUND,
-        ),
-        (
-            "sglang.srt.model_executor.forward_batch_info._extend_metadata_device",
-            extend_metadata_device,
             HookType.AROUND,
         ),
         (

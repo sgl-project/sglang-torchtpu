@@ -963,8 +963,6 @@ class SWAComponent(TreeComponent):
         insert_params.set_evicted_seqlen(
             self.component_type, req.kv.get_evicted_seqlen(self.component_type)
         )
-        if self._evict_stale_windows_first and req.swa_stale_window_floor is None:
-            req.swa_stale_window_floor = req.kv.cache_protected_len
 
         # A recurrent checkpoint must stay attached to its exact token prefix.
         # Let MambaComponent select the insertion length for hybrid caches.
@@ -1029,17 +1027,16 @@ class SWAComponent(TreeComponent):
             self._evict_stale_windows_first
             and insert_result is not None
             and insert_result.last_device_node is not None
-            and req.swa_stale_window_floor is not None
         ):
             self._demote_stale_windows(
-                last_node=self.tree_core.node_by_id(insert_result.last_device_node),
-                floor=req.swa_stale_window_floor,
+                last_node=self.tree_core.node_by_id(insert_result.last_device_node)
             )
 
-    # Each chunk insert leaves one window of live SWA at the chunk boundary that the
-    # request can no longer free; move those behind its window to the SWA LRU end.
-    def _demote_stale_windows(self, *, last_node: UnifiedTreeNode, floor: int) -> None:
-        ct = self.component_type
+    # An insert leaves live SWA behind the request's sliding window: one window at each
+    # chunk boundary, and the earlier turns' windows once a new turn extends a
+    # conversation. The request can no longer free them; move those on its path to the
+    # SWA LRU end.
+    def _demote_stale_windows(self, *, last_node: UnifiedTreeNode) -> None:
         root = self.tree_core.root_node
         path = []
         node = last_node
@@ -1051,25 +1048,75 @@ class SWAComponent(TreeComponent):
         # Same bound as the INSERT_END refresh, so a demoted node is never one that
         # refresh just made MRU.
         window_bound = self.sliding_window_size + self.tree_core.page_size
-        lru = self.tree_core.lru_lists[ct]
         end = depth
         child = None
         for n in path:
-            start = end - len(n.key)
-            # Above a branch point the path is shared: another sequence's window may
-            # need these nodes.
-            if start < floor or any(c is not child for c in n.children.values()):
-                break
-            cd = n.component_data[ct]
-            if (
-                depth - end >= window_bound
-                and cd.value is not None
-                and cd.lock_ref == 0
-                and lru.in_list(n)
-            ):
-                lru.reset_node_lru(n)
+            num_others = len(n.children) - (child is not None)
+            abandoned: list[UnifiedTreeNode] = []
+            if num_others:
+                # Above a branch point the path is shared: another sequence's window
+                # may need these nodes. The exception is one abandoned output, such
+                # as a reply the client did not send back in its next turn.
+                if num_others > 1:
+                    break
+                other = next(c for c in n.children.values() if c is not child)
+                abandoned = self._abandoned_output_chain(other, child)
+                if not abandoned:
+                    break
+            if depth - end >= window_bound:
+                self._demote_swa(n)
+            # Demoted last, tail last, so the output goes before the window above it.
+            for x in abandoned:
+                self._demote_swa(x)
             child = n
-            end = start
+            end -= len(n.key)
+
+    def _abandoned_output_chain(
+        self, head: UnifiedTreeNode, path_child: Optional[UnifiedTreeNode]
+    ) -> list[UnifiedTreeNode]:
+        """The nodes of a request's dropped output, or [] if ``head`` is not one.
+
+        ``head`` holds less than a page of the request's prompt, then its generated
+        output, possibly continued by a chain of output-only nodes down to a leaf (an
+        SWA leaf is capped at one window). The path beside it repeats that prompt and
+        continues with prompt where the output began, so it is not another reply to
+        the same prompt. Nothing has matched, locked or pinned the chain since the
+        path was created."""
+        offset = head.output_offset
+        path_offset = path_child.created_output_offset if path_child else None
+        if not (
+            path_child is not None
+            and offset is not None
+            and 0 < offset < self.tree_core.page_size
+            and head.key.match(path_child.key) >= offset
+            and (path_offset is None or path_offset > offset)
+        ):
+            return []
+        chain = []
+        node = head
+        while True:
+            if (
+                (node is not head and node.output_offset != 0)
+                or node.last_access_time >= path_child.creation_time
+                or any(
+                    node.component_data[ct].lock_ref
+                    or node.component_data[ct].session_ref
+                    for ct in node.component_types
+                )
+            ):
+                return []
+            chain.append(node)
+            if not node.children:
+                return chain
+            if len(node.children) > 1:
+                return []
+            node = next(iter(node.children.values()))
+
+    def _demote_swa(self, node: UnifiedTreeNode) -> None:
+        cd = node.component_data[self.component_type]
+        lru = self.tree_core.lru_lists[self.component_type]
+        if cd.value is not None and cd.lock_ref == 0 and lru.in_list(node):
+            lru.reset_node_lru(node)
 
     # ---- HiCache Hooks ----
 

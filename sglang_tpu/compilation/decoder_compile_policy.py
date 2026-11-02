@@ -977,22 +977,23 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         # (_fit_pp_proxy_rows), so the program takes row views of them; warm
         # with the same views, or each bucket copies its view on first use.
         rows = self.max_padded_tokens()
+        transfer_dtype = getattr(
+            self.model_runner.model,
+            "pp_transfer_dtype",
+            self.model_runner.dtype,
+        )
 
-        def zeros(shape: tuple[int, int]) -> torch.Tensor:
+        def zeros(shape: tuple[int, int], dtype: torch.dtype) -> torch.Tensor:
             buffer = torch.zeros(
                 (rows, shape[1]),
-                dtype=getattr(
-                    self.model_runner.model,
-                    "pp_transfer_dtype",
-                    self.model_runner.dtype,
-                ),
+                dtype=dtype,
                 device=self.model_runner.device,
             )
             return buffer[: shape[0]]
 
         proxy = {
-            "hidden_states": zeros((num_tokens, hidden_size)),
-            "residual": zeros((num_tokens, hidden_size)),
+            "hidden_states": zeros((num_tokens, hidden_size), transfer_dtype),
+            "residual": zeros((num_tokens, hidden_size), transfer_dtype),
         }
         # Serving hands the aux capture slots on with the activations, so
         # trace them too or the graph signature differs from the real one.
@@ -1001,7 +1002,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         if num_aux:
             proxy[AUX_HIDDEN_STATES_PROXY_KEY] = zeros(
-                (num_tokens, hidden_size * num_aux)
+                (num_tokens, hidden_size * num_aux), self.model_runner.dtype
             )
         return {"pp_proxy_tensors": PPProxyTensors(proxy)}
 

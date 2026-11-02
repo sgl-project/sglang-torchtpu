@@ -1467,12 +1467,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         # Check every id, not just min/max: [1, 2.5, 3] has integer extremes.
         # bool is an Integral subclass but never a valid token id.
-        if any(
-            isinstance(token_id, bool) or not isinstance(token_id, numbers.Integral)
-            for token_id in input_ids
-        ):
-            raise ValueError("input_ids must be integers.")
-        min_id, max_id = min(input_ids), max(input_ids)
+        min_id = max_id = input_ids[0]
+        for token_id in input_ids:
+            if type(token_id) is not int and (
+                isinstance(token_id, bool) or not isinstance(token_id, numbers.Integral)
+            ):
+                raise ValueError("input_ids must be integers.")
+            if token_id < min_id:
+                min_id = token_id
+            elif token_id > max_id:
+                max_id = token_id
         vocab_size = self.model_config.vocab_size
         if min_id < 0 or max_id >= vocab_size:
             bad_id = min_id if min_id < 0 else max_id

@@ -73,9 +73,7 @@ class TestDSV4TPUHelpers(CustomTestCase):
     def test_cos_sin_and_compressor_indexer_cache_preparation(self):
         from sglang.srt.runtime_context import get_context
 
-        override = get_context().override_server_args(
-            dsv4_attn_backend="tpu_dsv4", page_size=256
-        )
+        override = get_context().override_server_args(page_size=256)
         override.install()
         self.addCleanup(override.restore)
 
