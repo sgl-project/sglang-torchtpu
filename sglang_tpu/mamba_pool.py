@@ -99,6 +99,22 @@ def checkpoint_snapshot_pairs(
     return src, dst, valid.sum(dtype=torch.int32).reshape(1)
 
 
+def write_state_rows(
+    state: torch.Tensor, rows: torch.Tensor, new: torch.Tensor, live: torch.Tensor
+) -> None:
+    """Scatter ``new`` [len(rows), ...] into int64 ``rows`` of ``state`` in place, skipping dead rows.
+
+    Keep this a row scatter: a dense whole-pool select compiles into full-pool
+    relayout copies per stream, scaling with max-running.
+    """
+    # Dead rows rewrite the null slot with its own value, so the duplicate
+    # indices all carry identical data and the scatter stays deterministic.
+    rows = torch.where(live, rows, 0)
+    new = new.reshape(rows.shape[0], *state.shape[1:]).to(state.dtype)
+    live = live.view(-1, *([1] * (state.dim() - 1)))
+    state.index_copy_(0, rows, torch.where(live, new, state[:1]))
+
+
 class TpuPerLayerState(msgspec.Struct, frozen=True):
     """GDN state held as one independent tensor per layer.
 

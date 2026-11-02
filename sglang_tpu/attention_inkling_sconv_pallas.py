@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang_tpu.attention_gdn_pallas import TpuGDNAttnBackend
 from sglang_tpu.envs import envs
+from sglang_tpu.mamba_pool import write_state_rows
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -341,17 +342,9 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
 
     def _write_state(self, state, slots, new, live=None):
         """Store each request's new window ``new`` [rows, K-1 * dim] in its row ``slots`` of ``state``."""
-        # Dense one-hot write, not index_copy_: padded rows all clamp to slot 0, and the
-        # duplicate-index scatter is nondeterministic once compiled.
-        num_slots = state.shape[0]
         if live is None:
             live = self._state_indices >= 0
-        onehot = (slots[:, None] == torch.arange(num_slots, device=new.device)[None]) & live[:, None]
-        scattered = torch.einsum("ns,nf->sf", onehot.float(), new)
-        flat = state.reshape(num_slots, -1)
-        state.copy_(
-            torch.where(onehot.any(0)[:, None], scattered, flat.float()).to(state.dtype).reshape(state.shape)
-        )
+        write_state_rows(state, slots, new, live)
 
     def forward_decode(self, *args, **kwargs):
         raise NotImplementedError("Inkling sconv streams run through run_sconv")
