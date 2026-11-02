@@ -25,7 +25,7 @@ from sglang.test.tpu.utils.pd_singlehost_base import PDSingleHostTestCase, peer_
 register_tpu_ci(
     # Both engines start in parallel (the single-host cold start was ~21 min
     # to ready), then ~10 min of dataset prep and ~5 min of eval.
-    est_time=3600,
+    est_time=2560,
     suite="tpu-integration",
     nightly=True,
     labels=["singlehost", "qwen3-vl-30b-a3b", "pd", "multimodal", "compile-tracer"],

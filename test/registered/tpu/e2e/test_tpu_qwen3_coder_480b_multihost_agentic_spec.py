@@ -25,7 +25,7 @@ from bench_matrix_base import build_bench_test
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(
-    est_time=1800,
+    est_time=1210,
     suite="nightly-tpu-multihost",
     nightly=True,
     labels=["multihost", "qwen3-coder-480b", "agentic", "spec"],

@@ -7,7 +7,7 @@ from sglang.test.tpu import GEMMA4_26B_A4B, make_model_config, make_runner
 from sglang.test.tpu.utils.accuracy_base import AccuracyTestCase, gate_server_failures
 
 register_tpu_ci(
-    est_time=7200,
+    est_time=2410,
     suite="nightly-tpu-accuracy-gemma4-26b-a4b-aime",
     nightly=True,
     labels=["singlehost", "gemma4-26b-a4b", "accuracy"],
