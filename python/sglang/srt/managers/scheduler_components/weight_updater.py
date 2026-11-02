@@ -410,17 +410,16 @@ class SchedulerWeightUpdaterManager:
             except Exception as e:
                 logger.exception("weight transport failed on this TP rank")
                 weights, error = [], f"TP rank {context.tp_rank}: {e}"
-            # no rank loads a bucket another rank failed to receive
-            success, message, _ = self._agree_across_tp_ranks(error=error, value=None)
-            counts = []
-            if success:
-                if weights:
-                    success, message = self._load_into_selected_runners(
-                        weights, recv_req.selector
-                    )
-                success, message, counts = self._agree_across_tp_ranks(
-                    error=None if success else message, value=len(weights)
+            if error is None and weights:
+                loaded, message = self._load_into_selected_runners(
+                    weights, recv_req.selector
                 )
+                if not loaded:
+                    error = f"TP rank {context.tp_rank}: {message}"
+            # only TP rank 0 replies, so its reply must carry every rank's outcome
+            success, message, counts = self._agree_across_tp_ranks(
+                error=error, value=len(weights)
+            )
             if success:
                 if any(counts):
                     self._session = msgspec.structs.replace(
