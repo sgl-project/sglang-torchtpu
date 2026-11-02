@@ -181,7 +181,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         calls.draft.assert_called_once_with(batch, bucket, rows, addressing)
         calls.verify.assert_called_once_with(batch, bucket, rows, drafts, addressing)
         calls.linear.assert_called_once_with(
-            batch=batch, accept=accept, verify_input=addressing
+            batch=batch, accept=accept, pre_verify_lens=bucket.state.seq_lens
         )
         calls.commit.assert_called_once_with(
             batch, bucket.state, rows, addressing, logits, accept
