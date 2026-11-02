@@ -11,11 +11,13 @@ bursts larger than the bucket keep it shedding.
 
 Every text request plants a random code at a random depth of a filler document
 and checks the answer for it, so a wrong answer under load reads as corrupted KV
-rather than noise. An answer cut off at max_tokens before naming the code proves
-nothing either way: it counts as truncated, which fails only a long-context
-probe, since a probe must come back answered. Image and video requests are load
-only: any HTTP status other than 200 or 429 fails them, their answers are not
-graded.
+rather than noise. Image requests ask for the color of a square and video
+requests for the colors of three phases, in order, and are checked the same way.
+An answer cut off at max_tokens before it names what was asked proves nothing
+either way: it counts as truncated, which fails only a long-context probe, since
+a probe must come back answered. Muse returns a reply cut off while it is still
+reasoning in reasoning_content alone, so the reasoning is graded when the
+content is empty.
 """
 
 import base64
@@ -44,8 +46,8 @@ TIMEOUT = "timeout"  # HTTP 408 (router queue timeout) or no answer in time.
 SERVER_ERROR = "server_error"  # HTTP 5xx.
 CLIENT_ERROR = "client_error"  # Any other 4xx.
 CONNECTION_ERROR = "connection_error"
-WRONG_ANSWER = "wrong_answer"  # Finished, but the planted code is missing.
-TRUNCATED = "truncated"  # Hit max_tokens before naming the code: inconclusive.
+WRONG_ANSWER = "wrong_answer"  # Finished without the planted code or colors.
+TRUNCATED = "truncated"  # Hit max_tokens before answering: inconclusive.
 HARNESS_ERROR = "harness_error"  # The client raised: a stopped client hides load.
 FAILURES = frozenset(
     {TIMEOUT, SERVER_ERROR, CLIENT_ERROR, CONNECTION_ERROR, WRONG_ANSWER, HARNESS_ERROR}
@@ -64,6 +66,13 @@ QUEUE_GAUGES = (
     "sglang:num_decode_transfer_queue_reqs",
     "sglang:num_decode_host_receive_queue_reqs",
 )
+# Requests that failed inside an engine. A labeled counter is exported only once
+# it first counts, so a missing one reads zero.
+FAILURE_COUNTERS = (
+    "sglang:num_aborted_requests_total",
+    "sglang:num_bootstrap_failed_reqs_total",
+    "sglang:num_transfer_failed_reqs_total",
+)
 
 FILLER_LINE = "The catalog contains ordinary folders and routine inventory records.\n"
 CODE_QUESTION = (
@@ -71,7 +80,9 @@ CODE_QUESTION = (
 )
 # No 0/O or 1/I, so a code read back correctly cannot differ by a lookalike.
 _CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-_COLORS = ("red", "green", "blue", "yellow", "purple", "orange")
+# The colors the Muse multimodal P/D test checks, each with one common name;
+# a purple square answered "violet" would grade as wrong.
+_COLORS = ("red", "green", "blue", "yellow")
 _METRIC_SAMPLE = re.compile(r"^([A-Za-z_:][A-Za-z0-9_:]*)(?:\{[^}]*\})?\s+(\S+)")
 
 
@@ -136,6 +147,33 @@ def scrape_engine(url: str, timeout: float = 10.0) -> EngineLoad:
     response = requests.get(url.rstrip("/") + "/metrics", timeout=timeout)
     response.raise_for_status()
     return engine_load_from_metrics(url, response.text)
+
+
+def failure_counts_from_metrics(text: str) -> dict[str, float]:
+    """Sum each failure counter over its label sets."""
+    counts = dict.fromkeys(FAILURE_COUNTERS, 0.0)
+    for line in text.splitlines():
+        match = _METRIC_SAMPLE.match(line)
+        if match and match.group(1) in counts:
+            counts[match.group(1)] += float(match.group(2))
+    return counts
+
+
+def scrape_failure_counts(url: str, timeout: float = 10.0) -> dict[str, float]:
+    response = requests.get(url.rstrip("/") + "/metrics", timeout=timeout)
+    response.raise_for_status()
+    return failure_counts_from_metrics(response.text)
+
+
+def failure_count_growth(
+    before: Mapping[str, float], after: Mapping[str, float]
+) -> dict[str, float]:
+    """The failure counters that rose between two scrapes, by how much."""
+    return {
+        name: after[name] - before[name]
+        for name in FAILURE_COUNTERS
+        if after[name] > before[name]
+    }
 
 
 class DrainResult(msgspec.Struct, frozen=True):
@@ -247,6 +285,13 @@ def answer_has_code(answer: str, code: str) -> bool:
     return code.upper() in answer.upper()
 
 
+def answer_names_colors(answer: str, colors: Sequence[str]) -> bool:
+    """Whether `answer` names `colors` in order, as whole words."""
+    words = iter(re.findall(r"[a-z]+", answer.lower()))
+    # Each `in` resumes the scan where the previous color was found.
+    return all(color in words for color in colors)
+
+
 class PromptSizer(msgspec.Struct, frozen=True):
     """Filler lines for a target prompt length, from two measured prompts."""
 
@@ -350,6 +395,7 @@ class ChatResult(msgspec.Struct, frozen=True):
     status: int
     latency_s: float
     text: str = ""
+    reasoning: str = ""
     finish_reason: str = ""
     prompt_tokens: int = 0
     detail: str = ""
@@ -392,7 +438,9 @@ def post_chat(
     try:
         body = response.json()
         choice = body["choices"][0]
-        text = choice["message"].get("content") or ""
+        message = choice["message"]
+        text = message.get("content") or ""
+        reasoning = message.get("reasoning_content") or ""
         finish_reason = choice.get("finish_reason") or ""
         prompt_tokens = int(body.get("usage", {}).get("prompt_tokens", 0))
     except (ValueError, KeyError, IndexError, TypeError) as exc:
@@ -407,9 +455,19 @@ def post_chat(
         response.status_code,
         latency,
         text=text,
+        reasoning=reasoning,
         finish_reason=finish_reason,
         prompt_tokens=prompt_tokens,
     )
+
+
+def answer_text(result: ChatResult) -> str:
+    """The reply to grade: its content, or its reasoning when the content is empty.
+
+    Muse returns a reply cut off while it is still reasoning in
+    reasoning_content alone.
+    """
+    return result.text if result.text.strip() else result.reasoning
 
 
 def post_chat_until_admitted(
@@ -755,12 +813,16 @@ class OverloadDriver:
             chat_template_kwargs=self.chat_template_kwargs,
         )
 
-    def _graded(self, result: ChatResult, code: str) -> ChatResult:
-        if result.category != OK or answer_has_code(result.text, code):
+    @staticmethod
+    def _graded(
+        result: ChatResult, *, want: str, correct: Callable[[str], bool]
+    ) -> ChatResult:
+        answer = answer_text(result)
+        if result.category != OK or correct(answer):
             return result
         category = TRUNCATED if result.finish_reason == "length" else WRONG_ANSWER
         return msgspec.structs.replace(
-            result, category=category, detail=f"want {code}: {result.text[-200:]}"
+            result, category=category, detail=f"want {want}: {answer[-200:]}"
         )
 
     def _client(self, index: int) -> None:
@@ -820,7 +882,9 @@ class OverloadDriver:
             code, filler_lines=self.sizer.lines_for(prompt_tokens), depth=rng.random()
         )
         result = self._post([{"type": "text", "text": document}], self.max_tokens)
-        return self._graded(result, code)
+        return self._graded(
+            result, want=code, correct=lambda answer: answer_has_code(answer, code)
+        )
 
     def _request(self, kind: str, rng: random.Random) -> ChatResult:
         if kind == "text":
@@ -829,23 +893,31 @@ class OverloadDriver:
             )[0]
             return self._text_request(rng, tokens)
         if kind == "image":
+            colors = (rng.choice(_COLORS),)
             content = [
-                image_part(rng.choice(_COLORS), size=rng.choice((224, 280, 392))),
+                image_part(colors[0], size=rng.choice((224, 280, 392))),
                 {
                     "type": "text",
                     "text": "What color is the square? Reply with its color only.",
                 },
             ]
         else:
+            colors = tuple(rng.sample(_COLORS, 3))
             content = [
-                video_part(rng.sample(_COLORS, 3), variant=rng.getrandbits(64)),
+                video_part(colors, variant=rng.getrandbits(64)),
                 {
                     "type": "text",
                     "text": "Name the square colors at the beginning, middle, "
-                    "and end of the video. Reply only with the three colors.",
+                    "and end of the video. Reply only with those three colors "
+                    "in temporal order.",
                 },
             ]
-        return self._post(content, self.max_tokens)
+        result = self._post(content, self.max_tokens)
+        return self._graded(
+            result,
+            want=", ".join(colors),
+            correct=lambda answer: answer_names_colors(answer, colors),
+        )
 
     def _probe(self, index: int, prompt_tokens: int, deadline: float) -> None:
         rng = random.Random(self.seed * 10007 + 7919 * (index + 1))
@@ -867,7 +939,9 @@ class OverloadDriver:
                 timeout=self.request_timeout_s,
                 chat_template_kwargs=self.chat_template_kwargs,
             )
-            result = self._graded(result, code)
+            result = self._graded(
+                result, want=code, correct=lambda answer: answer_has_code(answer, code)
+            )
         except Exception as exc:
             result = ChatResult(HARNESS_ERROR, 0, 0.0, detail=repr(exc))
         self._record("probe", result)

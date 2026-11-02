@@ -10,10 +10,13 @@ again. It passes when:
   the router sheds with a 429 is retried, never scored;
 * the overload holds while the first round runs (429s, or requests queued on an
   engine) and is shed with 429s only: no 5xx, timeouts or connection errors;
-* every text answer that finishes names its planted code, and the long-context
-  probes, up to the full 256K context, all complete with theirs;
+* every text answer that finishes names its planted code, every image and video
+  answer that finishes names its colors in order, and the long-context probes,
+  up to the full 256K context, all complete with their codes;
 * both engines drain to idle (nothing queued or running, KV usage back at its
   pre-load level) within the drain limit, and no process died;
+* neither engine counts an aborted request, or a failed P/D bootstrap or KV
+  transfer, while the flow runs;
 * the flow ends within an hour of the pair becoming healthy.
 
 A P/D engine does not shed load (max_queued_requests applies only without
@@ -46,9 +49,11 @@ from sglang_tpu.testing.overload_stress import (
     LoadMix,
     MetricsMonitor,
     OverloadDriver,
+    failure_count_growth,
     measure_prompt_sizer,
     post_chat,
     scrape_engine,
+    scrape_failure_counts,
     wait_until_idle,
 )
 
@@ -169,13 +174,12 @@ GSM8K_GATE = {
     "temperature": 0.0,
     "reasoning_effort": "low",
 }
-# Uncalibrated: Muse has no TPU MMMU-Pro score and its card is gated. The floor
-# sits well above the 10-option chance rate (0.10), so a broken image path fails
-# while the model's real score is still unknown; raise it once a run measures it.
+# Measured on TPU with this serving setup, 2026-11-02: 0.80 under overload and
+# 0.83 after the drain, on 100 items each.
 MMMU_PRO_GATE = {
     "dataset": "mmmu_pro_vision",
-    "baseline": 0.25,
-    "atol": 0.0,
+    "baseline": 0.80,
+    "atol": 0.10,
     "num_examples": EVAL_EXAMPLES,
     "num_threads": EVAL_THREADS,
     "max_tokens": 4096,
@@ -320,6 +324,24 @@ def run_quality_round(round_name: str, base_url: str) -> str | None:
     return None
 
 
+def failure_counters_per_engine(
+    engine_urls: Sequence[str], before: Mapping[str, Mapping[str, float]]
+) -> tuple[dict[str, dict[str, float]], list[str]]:
+    """Each engine's failure counters that rose since `before`, and the failures."""
+    growth: dict[str, dict[str, float]] = {}
+    failures = []
+    for url in engine_urls:
+        try:
+            grown = failure_count_growth(before[url], scrape_failure_counts(url))
+        except OSError as exc:
+            failures.append(f"cannot read the failure counters of {url}: {exc}")
+            continue
+        if grown:
+            growth[url] = grown
+            failures.append(f"{url} counted failed requests in the flow: {grown}")
+    return growth, failures
+
+
 def run_overload_flow(
     *,
     router_url: str,
@@ -333,6 +355,7 @@ def run_overload_flow(
     flow limit counts from there.
     """
     started = time.monotonic()
+    counters_before = {url: scrape_failure_counts(url) for url in engine_urls}
     usage_ceiling = (
         max(scrape_engine(url).token_usage for url in engine_urls) + IDLE_USAGE_MARGIN
     )
@@ -403,6 +426,10 @@ def run_overload_flow(
             f"{drain.loads} {drain.error or ''}"
         )
     failures += liveness_failures()
+    counter_growth, counter_failures = failure_counters_per_engine(
+        engine_urls, counters_before
+    )
+    failures += counter_failures
     if since_healthy_s > FLOW_LIMIT_S:
         failures.append(
             f"flow ended {since_healthy_s:.0f}s after the engines turned healthy, "
@@ -425,6 +452,7 @@ def run_overload_flow(
         "peak_queued_during_evals": peak_queued_during_evals,
         "metrics_scrape_errors": monitor.errors,
         "drain": {"idle": drain.idle, "waited_s": round(drain.waited_s)},
+        "engine_failure_counter_growth": counter_growth,
         "failures": failures,
     }
 
@@ -454,7 +482,7 @@ class TestMuseSparkPdOverloadIntegration(PDSingleHostTestCase):
             return
         # The engine alone, launched as the decode pod launches its own: the
         # inherited prefill path would start the group's mini load balancer,
-        # which has no admission cap.
+        # whose default policy has no admission cap.
         cls._launcher = cls._start_launcher(
             cls.config_module + ":PREFILL_CONFIG",
             {**cls.runtime_envs, "SGLANG_LAUNCHER_RANK": "0"},
@@ -635,6 +663,40 @@ class TestMuseSparkPdOverloadConfiguration(unittest.TestCase):
         decode_args = self.plans[DECODE_ROLE]["server_args"]
         self.assertFalse(any(name.startswith("hicache") for name in decode_args))
         self.assertNotIn("enable_hierarchical_cache", decode_args)
+
+    def test_both_engines_load_the_muse_multimodal_processor(self) -> None:
+        # Without these, each engine's tokenizer fails to start on Muse: its
+        # image and video processor ships in the TPU plugin, not in core sglang.
+        from sglang.srt.managers.multimodal_processor import (
+            PROCESSOR_MAPPING,
+            import_processors,
+        )
+
+        if REPO not in sys.path:
+            sys.path.insert(0, REPO)
+        from benchmark.tpu.recipe.configs.muse_spark.pd_singlehost_overload import (
+            DECODE_CONFIG,
+            PREFILL_CONFIG,
+        )
+
+        for role, config in (
+            (PREFILL_ROLE, PREFILL_CONFIG),
+            (DECODE_ROLE, DECODE_CONFIG),
+        ):
+            with self.subTest(role=role):
+                env = config["runtime_env"]
+                for name in (
+                    "SGLANG_EXTERNAL_MM_MODEL_ARCH",
+                    "SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE",
+                ):
+                    self.assertIn(name, self.plans[role]["runtime_env_keys"])
+                import_processors(
+                    env["SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"], overwrite=True
+                )
+                self.assertIn(
+                    env["SGLANG_EXTERNAL_MM_MODEL_ARCH"],
+                    {model_cls.__name__ for model_cls in PROCESSOR_MAPPING},
+                )
 
     def test_router_sheds_with_429_instead_of_queueing(self) -> None:
         command = router_command("http://p:30000", "http://d:30000")

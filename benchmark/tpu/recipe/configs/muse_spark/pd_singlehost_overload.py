@@ -47,6 +47,10 @@ _COMMON["server_args"].update(
     dist_timeout=3600,
 )
 _COMMON["runtime_env"].update(
+    # Muse's image and video processor ships in the TPU plugin; without these the
+    # tokenizer has no multimodal processor for the checkpoint's architecture.
+    SGLANG_EXTERNAL_MM_MODEL_ARCH="MuseSparkForConditionalGeneration",
+    SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE="sglang_tpu.multimodal",
     # A cold start writes tens of GB of executables into each of the tier-2 and
     # tier-3 compile caches, which CI keeps in the pod's 64Gi /dev/shm.
     ENABLE_COMPILE_CACHE="0",

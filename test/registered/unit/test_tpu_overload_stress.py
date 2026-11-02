@@ -9,15 +9,22 @@ contracts its verdict rests on are pinned here against an in-process fake router
 * every request queue the engine's metrics collector exports counts against the
   drain, a request in any of them keeps the engine busy, and an engine exporting
   no load gauges fails the check instead of reading idle;
-* an answer that finishes without its planted code is corruption; one cut off at
-  max_tokens before the code proves nothing, except that a long-context probe
+* an answer that finishes without its planted code, or without the colors of
+  the image or video it was sent in order, is corruption; one cut off at
+  max_tokens before it answers proves nothing, except that a long-context probe
   must come back answered; a shed request is not a failure, and a shed probe is
   sent again until it is answered;
+* Muse returns a reply cut off while it is still reasoning in reasoning_content
+  alone, so the reasoning is graded when the content is empty, never over it;
+* an engine failure counter is exported only once it first counts, and that
+  first count still reads as growth;
 * a sized prompt never exceeds its token budget, so the longest probe fits the
   context it is sized against.
 """
 
+import base64
 import importlib.util
+import io
 import json
 import re
 import threading
@@ -28,6 +35,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import av
+from PIL import Image, ImageColor
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.testing import overload_stress as stress
@@ -37,9 +47,14 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 _CODE = re.compile(r"The access code is ([A-Z0-9-]+)\.")
 
 
-def _completion(text: str, finish_reason: str = "stop") -> dict[str, Any]:
+def _completion(
+    text: str, finish_reason: str = "stop", reasoning: str | None = None
+) -> dict[str, Any]:
+    message = {"content": text}
+    if reasoning is not None:
+        message["reasoning_content"] = reasoning
     return {
-        "choices": [{"message": {"content": text}, "finish_reason": finish_reason}],
+        "choices": [{"message": message, "finish_reason": finish_reason}],
         "usage": {"prompt_tokens": 10},
     }
 
@@ -47,6 +62,29 @@ def _completion(text: str, finish_reason: str = "stop") -> dict[str, Any]:
 def _user_text(body: dict[str, Any]) -> str:
     content = body["messages"][0]["content"]
     return " ".join(part.get("text", "") for part in content if part["type"] == "text")
+
+
+def _media_colors(body: dict[str, Any]) -> list[str]:
+    """The square colors of the request's image or video, decoded, in order."""
+    part = body["messages"][0]["content"][0]
+    data = base64.b64decode(part[part["type"]]["url"].split(",", 1)[1])
+    if part["type"] == "image_url":
+        frames = [Image.open(io.BytesIO(data)).convert("RGB")]
+    else:
+        with av.open(io.BytesIO(data)) as container:
+            frames = [frame.to_image() for frame in container.decode(video=0)]
+    colors: list[str] = []
+    for frame in frames:
+        center = frame.getpixel((frame.width // 2, frame.height // 2))
+        color = min(
+            stress._COLORS,
+            key=lambda name: sum(
+                (a - b) ** 2 for a, b in zip(ImageColor.getrgb(name), center)
+            ),
+        )
+        if not colors or colors[-1] != color:
+            colors.append(color)
+    return colors
 
 
 class _FakeRouter:
@@ -178,6 +216,38 @@ class TestEngineDrain(CustomTestCase):
             stress.engine_load_from_metrics("e", "# HELP unrelated\nother_metric 0\n")
 
 
+class TestEngineFailureCounters(CustomTestCase):
+    def test_failure_counters_are_ones_the_engines_export(self):
+        # A misspelled counter is never exported, so it would read zero and pass
+        # every run; the collector is the list of names.
+        spec = importlib.util.find_spec("sglang.srt.observability.metrics_collector")
+        exported = set(
+            re.findall(r'name="(sglang:[a-z_]+)"', Path(spec.origin).read_text())
+        )
+        self.assertLessEqual(set(stress.FAILURE_COUNTERS), exported)
+
+    def test_a_counter_missing_until_its_first_count_reports_that_count(self):
+        before = stress.failure_counts_from_metrics(_metrics_text())
+        after = stress.failure_counts_from_metrics(
+            _metrics_text()
+            + 'sglang:num_transfer_failed_reqs_total{tp_rank="0"} 1.0\n'
+            + 'sglang:num_transfer_failed_reqs_total{tp_rank="1"} 2.0\n'
+        )
+
+        self.assertEqual(
+            stress.failure_count_growth(before, after),
+            {"sglang:num_transfer_failed_reqs_total": 3.0},
+        )
+        self.assertEqual(stress.failure_count_growth(after, after), {})
+
+
+class TestAnswerGrading(CustomTestCase):
+    def test_a_color_counts_only_as_a_whole_word(self):
+        # Reasoning text is full of words like "considered" that contain one.
+        self.assertTrue(stress.answer_names_colors("I considered it red.", ("red",)))
+        self.assertFalse(stress.answer_names_colors("I considered it.", ("red",)))
+
+
 class TestOverloadDriver(CustomTestCase):
     SIZER = stress.PromptSizer(tokens_per_line=17.25, overhead_tokens=50)
     TEXT_ONLY = stress.LoadMix(
@@ -187,11 +257,19 @@ class TestOverloadDriver(CustomTestCase):
         text_prompt_tokens=(512,),
         text_prompt_weights=(1.0,),
     )
+    MEDIA_ONLY = stress.LoadMix(
+        text=0.0,
+        image=1.0,
+        video=1.0,
+        text_prompt_tokens=(512,),
+        text_prompt_weights=(1.0,),
+    )
 
     def _run(
         self,
         router: _FakeRouter,
         *,
+        mix: stress.LoadMix | None = None,
         probes: tuple[int, ...] = (),
         burst_size: int = 0,
     ) -> stress.OverloadDriver:
@@ -200,7 +278,7 @@ class TestOverloadDriver(CustomTestCase):
             router.url,
             model="m",
             sizer=self.SIZER,
-            mix=self.TEXT_ONLY,
+            mix=mix or self.TEXT_ONLY,
             clients=2,
             probe_prompt_tokens=probes,
             max_tokens=16,
@@ -244,6 +322,54 @@ class TestOverloadDriver(CustomTestCase):
         self.assertEqual(len(failures), 1)
         self.assertIn("2048-token probe ended truncated", failures[0])
         self.assertGreater(driver.summary()["counts"]["text/truncated"], 0)
+
+    def test_reasoning_is_graded_only_when_the_content_is_empty(self):
+        # A probe cut off while reasoning had its code there and failed as
+        # truncated; reasoning must still not excuse a wrong content answer.
+        def replying(content: str, finish_reason: str) -> _FakeRouter:
+            def respond(count: int, body: dict) -> tuple[int, dict]:
+                code = _CODE.search(_user_text(body)).group(1)
+                return 200, _completion(
+                    content, finish_reason, reasoning=f"The code is {code}."
+                )
+
+            return _FakeRouter(respond)
+
+        driver = self._run(replying("", "length"), probes=(2048,))
+        self.assertEqual(driver.failures(), [])
+        self.assertEqual(driver.probe_results[2048].category, stress.OK)
+
+        failures = self._run(replying("ZZZZ-ZZZZ", "stop")).failures()
+        self.assertEqual(len(failures), 1)
+        self.assertIn("text/wrong_answer", failures[0])
+
+    def test_image_and_video_answers_must_name_their_colors_in_order(self):
+        cases = {
+            "in order": (
+                lambda colors: _completion(", ".join(colors)),
+                {"image/ok", "video/ok"},
+            ),
+            "reversed": (
+                lambda colors: _completion(", ".join(reversed(colors))),
+                {"image/ok", "video/wrong_answer"},
+            ),
+            "cut off": (
+                lambda colors: _completion("", "length"),
+                {"image/truncated", "video/truncated"},
+            ),
+        }
+        for name, (answer, outcomes) in cases.items():
+            with self.subTest(answer=name):
+                driver = self._run(
+                    _FakeRouter(
+                        lambda count, body, answer=answer: (
+                            200,
+                            answer(_media_colors(body)),
+                        )
+                    ),
+                    mix=self.MEDIA_ONLY,
+                )
+                self.assertEqual(set(driver.summary()["counts"]), outcomes)
 
     def test_shed_requests_pass_and_a_shed_probe_is_sent_again(self):
         seen_probes = set()
