@@ -7,10 +7,11 @@ on Google Cloud TPUs via the torch_tpu (PyTorch privateuse1) backend.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 from contextlib import AbstractContextManager, contextmanager
-from typing import TYPE_CHECKING, Any, Optional, Type
+from typing import TYPE_CHECKING, Any, Callable, Optional, Type
 
 import torch
 
@@ -25,6 +26,7 @@ from sglang_tpu.tpu_dma_hicache import is_tpu_dma_hicache_backend
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.server_args import ServerArgs
+    from sglang_tpu.weight_sync.shared_slice import SharedSlice
 
 logger = get_logger(__name__)
 
@@ -925,6 +927,8 @@ class TpuSRTPlatform(SRTPlatform):
     device_type: str = "tpu"
 
     supported_quantization: list[str] = []
+    # the TPU slice this worker shares with an RL trainer (SGLANG_TPU_SHARED_SLICE)
+    _shared_slice: Optional[SharedSlice] = None
 
     def get_traced_rank(
         self, rank: int, *, group_size: int | None = None
@@ -1178,6 +1182,20 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang_tpu.graph_runner.tpu_graph_runner import TpuGraphRunner
 
         return TpuGraphRunner
+
+    def get_weight_update_handlers(self) -> dict[str, Callable[..., Any]]:
+        if self._shared_slice is None:
+            return {}
+        from sglang_tpu.weight_sync.ici_receiver import (
+            ICI_RECEIVE_HANDLER,
+            receive_bucket,
+        )
+
+        return {
+            ICI_RECEIVE_HANDLER: functools.partial(
+                receive_bucket, shared_slice=self._shared_slice
+            )
+        }
 
     def get_quantization_config(
         self, quantization: str
@@ -1481,6 +1499,16 @@ class TpuSRTPlatform(SRTPlatform):
 
         import torch_tpu  # noqa: F401
 
+        from sglang_tpu.weight_sync import shared_slice
+
+        shared_slice_spec = shared_slice.SharedSliceSpec.from_env()
+        if shared_slice_spec is not None:
+            # before the first TPU op, so the runtime starts as a member of the slice
+            self._shared_slice = shared_slice.join(
+                shared_slice_spec,
+                job_rank=int(os.environ["RANK"]),
+                job_size=int(world_size),
+            )
         apply_tpu_patches()
         # Resolve after worker setup, before Dynamo can trace either helper.
         rank_slice._load()

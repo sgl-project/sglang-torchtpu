@@ -326,6 +326,10 @@ class TpuEnvs:
     # TODO: Remove once the issue gets resolved in libtpu version > 0.0.47
     # (likely 0.0.48).
     SGLANG_TPU_LIBTPU_WORKAROUND_FOR_ONLINE_QUANT_SCALE = EnvBool(True)
+    # "<job slice-rank offset>,<slice size>,<store host>:<store port>": share one
+    # TPU slice with an RL trainer that sends weights over ICI (weight_sync/).
+    # Empty: a slice of our own.
+    SGLANG_TPU_SHARED_SLICE = EnvStr("")
 
     @classmethod
     def names(cls) -> list[str]:
