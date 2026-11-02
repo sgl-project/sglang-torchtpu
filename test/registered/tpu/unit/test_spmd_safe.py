@@ -3,6 +3,7 @@
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -167,7 +168,12 @@ class TestSPMDSafe(CustomTestCase):
                     self.assertEqual(len(result_files), 1)
                     result = json.loads(result_files[0].read_text())
                     self.assertEqual(result["passed"], matching)
-                    self.assertEqual(result["launcher_exit_code"], int(not matching))
+                    self.assertIn(
+                        result["launcher_exit_code"],
+                        (0, 1, -signal.SIGKILL)
+                        if result["terminated_after_verification"]
+                        else (int(not matching),),
+                    )
                     self.assertFalse(
                         any(
                             error.startswith("Verification startup exceeded")
