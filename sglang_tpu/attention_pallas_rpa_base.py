@@ -547,15 +547,21 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
 
 def _fused_kv_operands(pool, layer_id: int) -> tuple[torch.Tensor, torch.Tensor | None]:
     """The kernel's KV cache tensor and, for a block-major bundle, its traced layer index."""
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
     from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
     from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
+    if isinstance(pool, HybridLinearKVPool):
+        # Skips the pool's per-layer HiCache wait: the forward already waited for
+        # the whole batch, and branching on the counter would guard the graph on it.
+        full_layer_id = pool.full_attention_layer_id_mapping[layer_id]
+        return pool.full_kv_pool.get_fused_kv_buffer(full_layer_id), None
     if isinstance(pool, SWAKVPool):
         layer_id, is_swa_layer = pool.layers_mapping[layer_id]
         pool = pool.swa_kv_pool if is_swa_layer else pool.full_kv_pool
     if isinstance(pool, TpuFusedMHATokenToKVPool):
         return pool.get_fused_kv_operands(layer_id)
-    # Wrappers such as HybridLinearKVPool proxy the per-layer buffer only.
+    # Other wrappers proxy the per-layer buffer only.
     return pool.get_fused_kv_buffer(layer_id), None
 
 

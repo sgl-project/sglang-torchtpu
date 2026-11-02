@@ -346,6 +346,8 @@ class PipelineTransfer:
 
     # The window link, when sliding-window layers have their own engine.
     swa: pp_swa.SwaLink | None = None
+    draft_kv_heads: int | None = None
+    draft_swa_kv_heads: int | None = None
 
     def __init__(self, manager, groups):
         from tpu_sync.api.torch.reshard_client import ReshardClient
@@ -356,6 +358,8 @@ class PipelineTransfer:
         self._check_support(raiden_service_pb2)
         self.hbm_mem_type = raiden_service_pb2.MEMORY_TYPE_HBM
         self.lock = threading.RLock()
+        self.draft_kv_heads = getattr(groups, "draft_kv_head_num", None)
+        self.draft_swa_kv_heads = getattr(groups, "draft_swa_kv_head_num", None)
         # A hybrid pool's sliding-window layers get an engine of their own.
         self.pools, swa_pools = pp_swa.split_manifest(pool_manifest(groups))
         self.tensors = list(groups.full)
@@ -779,6 +783,8 @@ class PipelineTransfer:
                 swa,
                 dst_attn_tp,
                 int(self.manager.kv_args.total_kv_head_num),
+                draft_total_kv_heads=self.draft_kv_heads,
+                draft_swa_total_kv_heads=self.draft_swa_kv_heads,
                 with_swa=with_swa,
             )
             self.client.register_request_blocks(

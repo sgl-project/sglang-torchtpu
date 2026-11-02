@@ -330,18 +330,6 @@ def apply_tpu_nvfp4_moe(
             "apply_router_weight_on_input is not supported on TPU yet."
         )
 
-    routed_scaling_factor = layer.moe_runner_config.routed_scaling_factor
-    if routed_scaling_factor is not None and routed_scaling_factor != 1.0:
-        # Neither the fused-RS nor the gmm_v2 combine applies it, and the
-        # reduction-layer interactions here are not validated with an
-        # rsf != 1 model. Refuse rather than serving the routed channels at
-        # the wrong magnitude.
-        raise NotImplementedError(
-            "routed_scaling_factor is not yet applied on the TPU NVFP4 path; "
-            "use the BF16 checkpoint or validate against a concrete model "
-            "first."
-        )
-
     if swiglu_limit is not None:
         if activation != "silu":
             raise ValueError("TPU clamped MoE requires silu activation")

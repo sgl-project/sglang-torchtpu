@@ -16,8 +16,9 @@
 # Source: src/vllm_torchtpu/kernels/gdn/v3/wrapper.py
 # SGLang changes: packed SMEM metadata and packed KDA weights operands, the
 # plain-decode compact path (no f32 copy, no row padding), and the batch
-# padding to lcm(packing, INVERT_BLOCK) with mixed_tile_size capped by it.
-# Synced with vllm-project/vllm-torchtpu#1927 (split state in/out windows).
+# padding to lcm(packing, INVERT_BLOCK).
+# Synced with vllm-project/vllm-torchtpu#1927 (split state in/out windows)
+# and #1999 (VMEM-sized decode and prefill tiles for GDN and KDA).
 
 import dataclasses
 import functools
@@ -35,6 +36,7 @@ from sglang_tpu.attention.pallas.gdn import (
     config,
     memory_ref,
     metadata,
+    tiling,
     vmem_ldst,
 )
 from sglang_tpu.kda_layout import kda_packed_weights_shape
@@ -373,6 +375,7 @@ def outer_kernel(
         "num_spec_tokens",
         "decode_tile_size",
         "mixed_tile_size",
+        "max_mixed_tile_size",
         "batched_only",
         "prefill_only",
         "zero_initialize_out",
@@ -416,9 +419,9 @@ def fused_conv1d_gdn(
     zero_initialize_out: bool = True,
     packed_weights: jax.Array | None = None,
     compute_precision: jnp.dtype = jnp.float32.dtype,
-    # TODO(kyuyeunk): Calculate tile size based on input dimensions.
-    decode_tile_size: int = 4,
-    mixed_tile_size: int = 64,
+    decode_tile_size: int | None = None,
+    mixed_tile_size: int | None = None,
+    max_mixed_tile_size: int | None = None,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -506,9 +509,12 @@ def fused_conv1d_gdn(
         zero_initialize_out: Whether to zero-initialize the output buffer before
             executing non-batched sequences.
         compute_precision: Computation precision dtype.
-        decode_tile_size: Tile size along sequence dimension for decode sequences.
-        mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
-            sequences.
+        decode_tile_size: Optional tile size override along the sequence
+            dimension for decode/verify sequences. When None, sized dynamically
+            by `tiling.get_tile_sizes`.
+        mixed_tile_size: Optional tile size override along the token/chunk
+            dimension for prefill/mixed sequences. When None, sized dynamically
+            by `tiling.get_tile_sizes`.
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
@@ -603,45 +609,33 @@ def fused_conv1d_gdn(
     # on whole blocks. Packing alignment alone truncates a 40-token chunk.
     batch_align = 1 if decode_only else math.lcm(packing, compute_gdn.INVERT_BLOCK)
     padded_batch_size = pl.cdiv(batch_size, batch_align) * batch_align
-    decode_tile_size = min(decode_tile_size, batch_size)
-    mixed_tile_size = min(mixed_tile_size, padded_batch_size)
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
+    window_size = num_spec_tokens + 1
+    decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
 
-    # Each sequence holds 1 input state slot plus `window` output checkpoint
-    # slots per buffer; size the tile so the double-buffered state windows fit
-    # in roughly half the kernel's scoped-VMEM limit.
-    window = num_spec_tokens + 1
-    num_buffers = config.GDNConfig.__dataclass_fields__["num_buffers"].default
-    state_positions = 1 + window
-    bytes_per_seq = (
-        # Recurrent states (fp32), the dominant term.
-        state_positions * n_v * d_k * d_v * 4
-        # Conv states (fp32).
-        + state_positions * (kernel_size - 1) * dim * 4
-        # qkv (fp32), b/a (fp32), out (act_out).
-        + window * (dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2)
+    decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
+        batch_size=batch_size,
+        num_seqs=num_seqs,
+        padded_batch_size=padded_batch_size,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        conv_state_dim_size=dim if conv_state is None else conv_state.shape[-1],
+        act_out_dtype=act_out_dtype,
+        recurrent_state_dtype=(
+            jnp.float32 if recurrent_state is None else recurrent_state.dtype
+        ),
+        num_lanes=num_lanes,
+        decode_vmem_limit_bytes=decode_vmem_limit_bytes,
+        mixed_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
+        window_size=window_size,
+        decode_tile_size=decode_tile_size,
+        mixed_tile_size=mixed_tile_size,
+        attention_mode=attention_mode,
+        max_mixed_tile_size=max_mixed_tile_size,
     )
-    vmem_fraction = (
-        config.GDNConfig.WINDOWED_VMEM_FRACTION
-        if window > 1
-        else config.GDNConfig.DEFAULT_VMEM_FRACTION
-    )
-    vmem_budget = int(vmem_fraction * pltpu.get_tpu_info().vmem_capacity_bytes)
-    tile_budget = (vmem_budget // 2) // num_buffers
-    decode_tile_size = max(1, min(decode_tile_size, tile_budget // bytes_per_seq))
-
-    if num_spec_tokens > 0:
-        if is_kda:
-            # Keep exactly one KDA sequence in each window tile.  The state
-            # pipeline issues one async recurrent-state DMA per sequence but
-            # shares a semaphore and drains the tile with one aggregate wait.
-            # Bounding only the total bytes is insufficient: TP32's four
-            # 3-head sequences have the same 6 MiB footprint as one TP8
-            # 12-head sequence, but the former still has four independent DMA
-            # starts and corrupts recurrent checkpoints in long-running
-            # serving.  A one-sequence tile is the only schedule validated for
-            # repeated rollback and slot reuse on v7, independent of TP size.
-            decode_tile_size = 1
 
     batch_padding_size = padded_batch_size - batch_size
     num_v_padding_size = aligned_num_v_heads - n_v
@@ -787,6 +781,8 @@ def fused_conv1d_gdn(
             in_out_spec = hbm_spec
             input_output_aliases[num_metadata + 3 + num_state_inputs] = 0
 
+        vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
+
         return pl.pallas_call(
             functools.partial(outer_kernel, cfg=cfg, metadata_layout=metadata_layout),
             out_shape=(out_shape, in_conv_state, in_recurrent_state),
@@ -805,7 +801,7 @@ def fused_conv1d_gdn(
             input_output_aliases=input_output_aliases,
             compiler_params=pltpu.CompilerParams(
                 disable_bounds_checks=True,
-                vmem_limit_bytes=cfg.get_vmem_limit_bytes(),
+                vmem_limit_bytes=vmem_limit_bytes,
             ),
             name=cfg.get_kernel_name(),
             metadata=cfg.get_metadata(),

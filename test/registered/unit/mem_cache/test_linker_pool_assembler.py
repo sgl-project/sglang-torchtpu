@@ -533,7 +533,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         kvcache = HybridLinearKVPool.__new__(HybridLinearKVPool)
         with self.assertRaisesRegex(
             ValueError,
-            "does not support the direct external linker: _MambaStrategy",
+            "does not support the direct external linker: MambaStrategy",
         ):
             resolve_hybrid_device_pool_group(
                 kvcache=kvcache,

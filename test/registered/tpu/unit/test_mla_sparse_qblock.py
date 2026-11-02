@@ -83,7 +83,7 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
         pi = jnp.asarray(1 + self.rng.permutation(max_seqs * pps), jnp.int32)
         raw = jnp.zeros((num_pages, PAGE, 2 * D), jnp.bfloat16)
         pooled = jnp.zeros(
-            (num_pages, PAGE // 4, 4, kp.pooled_record_bytes(D)), jnp.uint8
+            (num_pages, PAGE // KPOOL // 4, 4, kp.pooled_record_bytes(D)), jnp.uint8
         )
         cn = jnp.zeros((num_pages, PAGE, 4, 128), jnp.uint8)
         cr = jnp.zeros((num_pages, PAGE // 4, 4, 128), jnp.uint8)

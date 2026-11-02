@@ -195,6 +195,40 @@ class TestProfileInputs(CustomTestCase):
                     torch.equal(outputs[0]["hidden_states"], outputs[0]["residual"])
                 )
 
+    def test_later_stage_aux_proxy_keeps_runner_dtype_when_transfer_is_fp32(self):
+        from sglang.srt.layers.aux_hidden_states import AUX_HIDDEN_STATES_PROXY_KEY
+        from sglang_tpu.compilation import decoder_compile_policy
+
+        policy, slots = _policy()
+        policy._pp_profile_slots = slots
+        policy.model_runner.model = SimpleNamespace(
+            pp_transfer_dtype=torch.float32,
+            relays_pp_aux_hidden_states=True,
+        )
+        policy.model_runner.spec_aux_config = SimpleNamespace(
+            eagle_use_aux_hidden_state=False,
+            dflash_use_aux_hidden_state=True,
+            dflash_target_layer_ids=[1, 16],
+        )
+        sync_module = SimpleNamespace(synchronize=Mock())
+        with (
+            patch.dict(sys.modules, {"torch_tpu._internal.sync.sync": sync_module}),
+            patch.object(
+                decoder_compile_policy,
+                "max_extend_tokens",
+                return_value=40,
+            ),
+        ):
+            batch = SimpleNamespace(out_cache_loc=torch.zeros(1, dtype=torch.int32))
+            _, kwargs = set_profile_inputs(
+                policy, batch, (), {"pp_proxy_tensors": None}, 7, 12
+            )
+        tensors = kwargs["pp_proxy_tensors"].tensors
+        self.assertEqual(tensors["hidden_states"].dtype, torch.float32)
+        self.assertEqual(tensors["residual"].dtype, torch.float32)
+        self.assertEqual(tensors[AUX_HIDDEN_STATES_PROXY_KEY].dtype, torch.bfloat16)
+        self.assertEqual(tensors[AUX_HIDDEN_STATES_PROXY_KEY].shape, (40, 16))
+
 
 if __name__ == "__main__":
     unittest.main()

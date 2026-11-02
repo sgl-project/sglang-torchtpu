@@ -24,13 +24,12 @@ from sglang.srt.layers.moe.topk import (
 )
 from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import is_hip, is_npu, is_tpu, is_xpu
+from sglang.srt.utils import is_hip, is_npu, is_xpu
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_npu = is_npu()
-_is_tpu = is_tpu()
 _is_xpu = is_xpu()
 
 
@@ -177,9 +176,7 @@ class HashTopK(nn.Module):
             )
         else:
             topk_ids[:, :] = self.tid2eid[input_ids]
-            topk_weights[:, :] = scores.gather(
-                1, topk_ids[:, :].to(torch.int64) if _is_tpu else topk_ids[:, :]
-            )
+            topk_weights[:, :] = scores.gather(1, topk_ids[:, :])
             if self.score_func != "softmax":
                 topk_weights[:, :] /= (
                     topk_weights[:, :].sum(dim=-1, keepdim=True)
@@ -234,7 +231,7 @@ class HashTopK(nn.Module):
 
         if _is_xpu:
             topk_weights, topk_ids = self._forward_xpu(router_logits, input_ids)
-        elif not _is_tpu and envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
+        elif envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
             from sglang.kernels.ops.moe.dsv4 import hash_topk
 
             topk_weights, topk_ids = hash_topk(
@@ -247,7 +244,7 @@ class HashTopK(nn.Module):
             )
         else:
             topk_weights, topk_ids = self._forward_torch(router_logits, input_ids)
-        if _is_hip or _is_npu or _is_tpu:
+        if _is_hip or _is_npu:
             topk_weights = topk_weights.to(torch.float32)
 
         if self.apply_routed_scaling_factor_on_output:
@@ -299,19 +296,6 @@ class HashTopK(nn.Module):
             )
         if is_hip():
             _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
-        elif _is_tpu and num_token_non_padded is not None:
-            valid = (
-                torch.arange(topk_ids.shape[0], device=topk_ids.device).unsqueeze(1)
-                < num_token_non_padded
-            )
-            topk_ids = torch.where(valid, topk_ids, torch.full_like(topk_ids, -1))
-            topk_weights = torch.where(
-                valid, topk_weights, torch.zeros_like(topk_weights)
-            )
-            if recorder_topk_ids is not None:
-                recorder_topk_ids = torch.where(
-                    valid, recorder_topk_ids, torch.full_like(recorder_topk_ids, -1)
-                )
         else:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
             if recorder_topk_ids is not None:
