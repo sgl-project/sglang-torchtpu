@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 from contextlib import AbstractContextManager, contextmanager
-from typing import TYPE_CHECKING, Any, Optional, Type
+from typing import TYPE_CHECKING, Any, Callable, Optional, Type
 
 import torch
 
@@ -28,6 +28,7 @@ from sglang_tpu.tpu_dma_hicache import (
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.server_args import ServerArgs
+    from sglang_tpu.rl.setup import RlSetup
 
 logger = get_logger(__name__)
 
@@ -994,6 +995,8 @@ class TpuSRTPlatform(SRTPlatform):
     device_type: str = "tpu"
 
     supported_quantization: list[str] = []
+    # set by init_backend in engine workers
+    _rl_setup: Optional[RlSetup] = None
 
     def get_traced_rank(
         self, rank: int, *, group_size: int | None = None
@@ -1250,6 +1253,13 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang_tpu.graph_runner.tpu_graph_runner import TpuGraphRunner
 
         return TpuGraphRunner
+
+    def get_weight_update_handlers(self) -> dict[str, Callable[..., Any]]:
+        if self._rl_setup is None:
+            return {}
+        from sglang_tpu.rl.setup import weight_update_handlers
+
+        return weight_update_handlers(self._rl_setup)
 
     def get_quantization_config(
         self, quantization: str
@@ -1572,6 +1582,11 @@ class TpuSRTPlatform(SRTPlatform):
 
         import torch_tpu  # noqa: F401
 
+        from sglang_tpu.rl.setup import setup_worker
+
+        self._rl_setup = setup_worker(
+            job_rank=int(os.environ["RANK"]), job_size=int(world_size)
+        )
         apply_tpu_patches()
         # Resolve after worker setup, before Dynamo can trace either helper.
         rank_slice._load()
