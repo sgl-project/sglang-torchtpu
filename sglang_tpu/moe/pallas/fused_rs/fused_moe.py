@@ -179,12 +179,11 @@ def moe_gmm_local_rs_nodedup(
     my_id = group_offset[0] // num_local_experts
 
     # Compiler workaround for the non-SP fused remote-DMA graph: materialize
-    # IDs and weights from logical rank 0 in one BF16 psum and feed both
+    # IDs and weights from logical rank 0 in one psum and feed both
     # slices forward. Altering this dataflow can halt the compiled graph. This
     # should not be interpreted as evidence that routing IDs differ across
     # ranks; the ablations establish a lowering dependency, not its root cause.
-    # Backend selection limits this path to 256 experts, so IDs 0..255 are
-    # represented exactly in BF16.
+    # The psum runs in f32: bf16 only represents expert IDs up to 256 exactly.
     # TODO: Remove this block once the mixed communicating-Pallas core halt is
     # fixed at its root cause:
     # https://github.com/sgl-project/sglang-torchtpu/issues/308
@@ -192,7 +191,7 @@ def moe_gmm_local_rs_nodedup(
     if not sp_enabled:
         route_source = my_id == 0
         routing = jnp.stack(
-            (topk_indices.astype(jnp.bfloat16), topk_weights.astype(jnp.bfloat16)),
+            (topk_indices.astype(jnp.float32), topk_weights.astype(jnp.float32)),
             axis=-1,
         )
         routing = jax.lax.psum(

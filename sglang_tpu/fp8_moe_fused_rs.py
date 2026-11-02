@@ -23,6 +23,9 @@ from sglang_tpu.fused_rs_sequence_parallel import (
     prepare_tpu_fused_rs_post_expert_norm,
 )
 
+# Expert IDs cross the f32 routing psum in fused_rs/fused_moe.py exactly up to 2**24.
+_FUSED_RS_MAX_EXPERTS = 1 << 24
+
 
 def supports_fp8_fused_rs(
     *,
@@ -105,10 +108,10 @@ def fp8_fused_rs_unsupported_reason(
         ep_size = tp_size
     if ep_size <= 1:
         return f"expert parallel size must be greater than 1, got {ep_size}"
-    if num_experts > 256:
+    if num_experts > _FUSED_RS_MAX_EXPERTS:
         return (
-            "BF16 routing materialization supports at most 256 experts, got "
-            f"{num_experts}"
+            f"routing materialization supports at most {_FUSED_RS_MAX_EXPERTS} "
+            f"experts, got {num_experts}"
         )
     if pp_size != 1:
         return f"pipeline parallelism is not supported, got PP={pp_size}"
@@ -276,7 +279,13 @@ def _apply_fp8_fused_rs(
     topk_weights = topk_weights.to(x.dtype)
     topk_ids = topk_ids.to(torch.int32)
     valid = topk_ids >= 0
-    topk_ids = torch.where(valid, topk_ids, torch.zeros_like(topk_ids))
+    # Masked slots (-1) spread over all experts: id 0 would send every padding row to the
+    # one rank owning expert 0; an id past the last expert deadlocks the kernel's receive count.
+    spread_ids = (
+        torch.arange(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
+        % layer.num_experts
+    ).view_as(topk_ids)
+    topk_ids = torch.where(valid, topk_ids, spread_ids)
     topk_weights = topk_weights * valid.to(topk_weights.dtype)
 
     norm_weight = (

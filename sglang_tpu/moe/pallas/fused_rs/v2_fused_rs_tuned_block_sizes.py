@@ -202,6 +202,18 @@ def _all_m(tile):
     return {m_key: tile for m_key in _ALL_M_KEYS}
 
 
+def _all_m_act(tile, act):
+    """``_all_m`` for a non-silu activation key (the lookup keys M by ``f"{m}_{act}"``)."""
+    return {f"{m_key.split('_')[0]}_{act}": tile for m_key in _ALL_M_KEYS}
+
+
+# H4608-I2304 (padded to 2560) EP8, SiTU, W4A16 block-16: K1=4608, N1=5120, K2=2560, N2=4608.
+# Sweep at M=512..65536 (one 8192-token call = 65536 rows): every tile within 2% of the
+# default; the call is bound by the per-row direct-write loop (~0.7 us per local row), not
+# the GEMMs. Full-N single-buffered tiles: same speed, least VMEM.
+_H4608_I2304_FP4_EP8_SITU = (128, 4608, 2560, 2560, 4608, 1, 1)
+
+
 # H4096-I4096 expert TP8 (each expert's intermediate dim split 8 ways: w13 N=1024, w2
 # K=512 per device). Muse Spark microbench: tile_m 128 for the prefill calls (2048 tokens x
 # top-8 x 8 routed rows) beats the default 64, and 256 and 512.
@@ -529,6 +541,10 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
                 "k-4096_n-1024_g-256_lhs_quant_rhs_bs-16"
                 "+k-512_n-4096_g-256_lhs_quant_rhs_bs-16"
             ): _all_m(_H4096_I4096_EXPERT_TP8),
+            (
+                "k-4608_n-5120_g-48_lhs_quant_rhs_bs-16"
+                "+k-2560_n-6144_g-48_lhs_quant_rhs_bs-16"
+            ): _all_m_act(_H4608_I2304_FP4_EP8_SITU, "situ:4.0:25.0"),
             # H4096-I4096: H=4096, I=4096, E=256, EP=8 → g=32
             # Small M: full tiles (1,1). Large M (≥32768): smaller tiles
             # with W2 caching (2,2) for better pipelining.

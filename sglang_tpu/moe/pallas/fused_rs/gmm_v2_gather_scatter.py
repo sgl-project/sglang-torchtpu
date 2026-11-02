@@ -162,6 +162,15 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None) -> jax.Array:
             acc_gate = jnp.clip(acc_gate, max=limit)
             acc_up = jnp.clip(acc_up, min=-limit, max=limit)
             return (acc_gate * jax.nn.sigmoid(alpha * acc_gate)) * (acc_up + 1)
+        case str() if fuse_act.startswith("situ:"):
+            # Same SiTU as gmm_v2.situ_and_mul: "situ:{beta}:{linear_beta|none}".
+            _, beta_str, linear_beta_str = fuse_act.split(":")
+            beta = float(beta_str)
+            gate_act = beta * jnp.tanh(acc_gate / beta) * jax.nn.sigmoid(acc_gate)
+            if linear_beta_str != "none":
+                linear_beta = float(linear_beta_str)
+                acc_up = linear_beta * jnp.tanh(acc_up / linear_beta)
+            return gate_act * acc_up
         case _:
             raise NotImplementedError(f"Unsupported fuse_act: {fuse_act}")
 

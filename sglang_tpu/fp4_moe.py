@@ -352,7 +352,13 @@ def apply_tpu_nvfp4_moe(
         topk_weights = topk_weights.to(hidden_states.dtype)
         topk_ids = topk_ids.to(torch.int32)
         valid = topk_ids >= 0
-        topk_ids = torch.where(valid, topk_ids, torch.zeros_like(topk_ids))
+        # Masked slots (-1) spread over all experts: id 0 would send every padding row to the
+        # one rank owning expert 0; an id past the last expert deadlocks the kernel's receive count.
+        spread_ids = (
+            torch.arange(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
+            % layer.num_experts
+        ).view_as(topk_ids)
+        topk_ids = torch.where(valid, topk_ids, spread_ids)
         topk_weights = topk_weights * valid.to(topk_weights.dtype)
 
         post_expert_norm_weight = get_tpu_fused_rs_post_expert_norm_weight(layer)
