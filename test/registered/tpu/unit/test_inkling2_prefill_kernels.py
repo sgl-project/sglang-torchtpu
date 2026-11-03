@@ -17,6 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from sglang_tpu.inkling2_attn_res import attn_res_norm_jax
+from sglang_tpu.inkling2_sconv_prefill import sconv_taps_jax
 
 H = 4608
 T = 512
@@ -72,6 +73,38 @@ class TestInkling2AttnResKernel(unittest.TestCase):
                     diff = np.abs(np.asarray(got, np.float32) - np.asarray(want, np.float32))
                     self.assertLess(float(np.mean(diff > 1e-2 * (1 + np.abs(np.asarray(want, np.float32))))), 1e-3)
 
+
+def _taps_reference(x, pos, w_lag, use_residual, scale):
+    """attention_inkling_sconv_pallas._xla_sconv's in-forward taps (state taps zero)."""
+    xf = x.astype(jnp.float32)
+    acc = xf if use_residual else jnp.zeros_like(xf)
+    for lag in range(w_lag.shape[0]):
+        past = xf
+        if lag:
+            shifted = jnp.concatenate([jnp.zeros((lag, xf.shape[1])), xf])[: xf.shape[0]]
+            past = jnp.where(pos >= lag, shifted, 0.0)
+        acc = acc + w_lag[lag][None] * past
+    return (acc * scale).astype(x.dtype)
+
+
+@unittest.skipUnless(any("TPU" in d.device_kind for d in jax.devices()), "Requires JAX with a TPU device")
+class TestInkling2SconvTapsKernel(unittest.TestCase):
+    def test_matches_reference_across_tile_and_sequence_boundaries(self):
+        # Sequence starts inside a tile, on a tile boundary (256) and one row past it, so the
+        # halo rows and the pos mask are both exercised.
+        T, D = 1024, 4608
+        starts = [0, 5, 256, 257, 300, 700]
+        rows = np.arange(T)
+        seq_start = np.array(starts)[np.searchsorted(starts, rows, side="right") - 1]
+        pos = jnp.asarray((rows - seq_start)[:, None], jnp.int32)
+        k = jax.random.split(jax.random.PRNGKey(3), 2)
+        x = jax.random.normal(k[0], (T, D)).astype(jnp.bfloat16)
+        w_lag = jax.random.normal(k[1], (4, D))
+        for use_residual in (True, False):
+            scale = (4 + int(use_residual)) ** -0.5
+            got = sconv_taps_jax(x, pos, w_lag, use_residual=use_residual, scale=scale)
+            want = _taps_reference(x, pos, w_lag, use_residual, scale)
+            np.testing.assert_allclose(np.asarray(got, np.float32), np.asarray(want, np.float32), rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":
