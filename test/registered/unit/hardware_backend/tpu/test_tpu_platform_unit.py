@@ -30,6 +30,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+from sglang_tpu.rl import setup as rl_setup
 from sglang_tpu.tpu_platform import (
     TpuSRTPlatform,
     _validate_decode_context_parallel,
@@ -205,8 +206,12 @@ class TestTpuPlatformInitialization(CustomTestCase):
                     ("cache_key", os.environ["LIBTPU_INIT_ARGS"])
                 ),
             ),
-            patch(
-                "sglang_tpu.rl.setup.setup_worker",
+            # patch.object on the imported module: a test that patches sys.modules drops
+            # modules first imported inside it, and a dotted patch target would then
+            # resolve to that stale module object on Python 3.10
+            patch.object(
+                rl_setup,
+                "setup_worker",
                 side_effect=lambda **kwargs: calls.append(("rl_setup", kwargs)),
             ),
             patch(
