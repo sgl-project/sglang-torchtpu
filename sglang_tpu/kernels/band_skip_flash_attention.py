@@ -55,6 +55,7 @@ from sglang_tpu.kernels.flash_attention import (
     NUM_SUBLANES,
     TRANS_B_DIM_NUMBERS,
     SegmentIds,
+    _flash_attention_kernel_single_batch_single_step,
     _fwd_cost_estimate,
 )
 
@@ -157,47 +158,6 @@ def _band(qs_ref, cmin_ref, cmax_ref, kv_len):
     return jnp.where(empty, 0, lo), jnp.where(empty, nck, hi - lo + 1)
 
 
-def _dense_body(
-    h,
-    q_ref,
-    k_ref,
-    v_ref,
-    qs_ref,
-    ks_ref,
-    o_ref,
-    l_ref,
-    m_ref,
-    *,
-    sm_scale,
-    mask_value,
-    kv_len,
-):
-    """``_flash_attention_kernel_single_batch_single_step`` for head ``h`` of the block."""
-    q = q_ref[0, h]
-    k = k_ref[0, h]
-    s = jax.lax.dot_general(
-        q, k, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32
-    )
-    if sm_scale != 1.0:
-        s *= sm_scale
-    q_segment_ids = jnp.tile(qs_ref[0], (1, kv_len // NUM_LANES))
-    kv_segment_ids = ks_ref[0, :1]
-    mask = jnp.equal(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
-    s = s + jnp.where(mask, 0.0, mask_value)
-    m = jnp.max(s, axis=1)[:, None]
-    p = jnp.exp(s - m)
-    l = jnp.sum(p, axis=1)[:, None]
-    p /= l
-    if m_ref is not None:
-        m_ref[0, h] = lax.broadcast_in_dim(m, m_ref.shape[2:], range(2))
-    if l_ref is not None:
-        l_ref[0, h] = lax.broadcast_in_dim(l, l_ref.shape[2:], range(2))
-    v = v_ref[0, h]
-    o_ref[0, h] = jax.lax.dot(
-        p.astype(v.dtype), v, preferred_element_type=jnp.float32
-    ).astype(o_ref.dtype)
-
-
 def _static_band_widths(cfg: _Config, kv_len: int) -> tuple[int, ...]:
     """Band widths (in chunks) run as straight-line bodies: every width the band path
     takes (1 .. the dense threshold); wider bands run the dense body."""
@@ -223,7 +183,7 @@ def _band_static(
     mask_value,
 ):
     """The band of ``width`` chunks from chunk ``lo``, for every head of the step, as
-    one straight-line body: ``_dense_body``'s ops over the band's keys."""
+    one straight-line body: the dense body's ops over the band's keys."""
     W = width * CHUNK
     st = pl.multiple_of(lo * CHUNK, CHUNK)
     qseg = jnp.tile(qs_ref[0], (1, W // NUM_LANES))
@@ -272,7 +232,7 @@ def _dense_pipeline(
     mask_value,
     ring,
 ):
-    """``_dense_body`` for every head of the step as a software pipeline over units
+    """The dense body for every head of the step as a software pipeline over units
     (head, PIPE_ROWS-row block). Step s runs, per PIPE_TILE-key tile, the scores of
     unit s (QK, scale, mask, store, running max), the exps of unit s-1 (exp, store,
     running sum) and the PV of unit s-2 (divide, cast, PV_K-key dots). The row max and
@@ -537,19 +497,23 @@ def _band_skip_kernel(
             )
             return
         for h in range(H):
-            _dense_body(
-                h,
+            # The dense kernel's own body, for head h of the step.
+            _flash_attention_kernel_single_batch_single_step(
+                (0, h),
                 q_ref,
                 k_ref,
                 v_ref,
+                None,
                 qs_ref,
                 ks_ref,
                 o_ref,
                 l_ref,
                 m_ref,
+                causal=False,
                 sm_scale=sm_scale,
+                block_k=kv_len,
+                kv_seq_len=kv_len,
                 mask_value=mask_value,
-                kv_len=kv_len,
             )
 
 

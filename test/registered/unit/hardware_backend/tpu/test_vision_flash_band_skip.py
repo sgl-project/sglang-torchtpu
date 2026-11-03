@@ -1,8 +1,8 @@
-"""SGLANG_TPU_VISION_FLASH_BAND_SKIP and ``band_skip_flash_attention`` on CPU.
+"""SGLANG_TPU_VISION_FLASH_BAND_SKIP and ``band_skip_flash_attention``.
 
-Everything runs on the JAX CPU device, with Pallas in interpret mode. No TPU or
-torch_tpu is needed: the torch_tpu op registration is stubbed so the vision flash
-op's JAX body can be called directly.
+The first three groups run on the JAX CPU device, with Pallas in interpret mode. No
+TPU or torch_tpu is needed: the torch_tpu op registration is stubbed so the vision
+flash op's JAX body can be called directly.
 
 * Dispatch (no kernel runs): with the flag unset, the op has main's name and calls
   the dense ``flash_attention`` with main's arguments for every shape. With the flag
@@ -16,16 +16,19 @@ op's JAX body can be called directly.
 * Kernel numerics (float32): kv_len 3072 at q tile 256 (static band widths and the
   pipelined dense body) and kv_len 16384 at tile 128 (the band loop) against the
   reference and the dense kernel (single-step blocks, as main calls it there).
+* On a TPU-backed JAX (the TPU CI): the kernel compiled for the TPU, not
+  interpreted, at every config in ``_CONFIGS``, bit for bit against the dense kernel
+  on the same TPU, in bf16, on layouts that reach every body of each config.
 
 Byte identity with the dense kernel is a TPU claim (it relies on the TPU's
-reduction order); on CPU the two kernels differ by float rounding, so these tests
-check the masking, the band logic and the dispatch, not that claim.
+reduction order). On CPU the two kernels differ by float rounding, so the CPU groups
+check the masking, the band logic and the dispatch; the TPU group checks the claim.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
 
 register_cpu_ci(est_time=90, suite="base-a-test-cpu")
-register_tpu_ci(est_time=90, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=150, suite="stage-a-test-tpu-unit", chips=1)
 
 import contextlib
 import importlib.util
@@ -42,6 +45,20 @@ from sglang.test.test_utils import CustomTestCase
 _HAS_JAX = importlib.util.find_spec("jax") is not None
 _SCALE = 1.0 / 128**0.5
 _FLAG = "SGLANG_TPU_VISION_FLASH_BAND_SKIP"
+
+
+def _has_jax_tpu() -> bool:
+    if not _HAS_JAX:
+        return False
+    try:
+        import jax
+
+        return any(d.platform == "tpu" for d in jax.devices())
+    except Exception:  # pragma: no cover - no usable JAX backend
+        return False
+
+
+_HAS_JAX_TPU = _has_jax_tpu()
 
 
 @contextlib.contextmanager
@@ -138,11 +155,18 @@ def _cpu(x):
     return jax.device_put(x, jax.devices("cpu")[0])
 
 
-def _qkv(heads, kv_len, dtype, seed):
+def _tpu(x):
+    """``x`` committed to the first TPU device."""
+    import jax
+
+    return jax.device_put(x, next(d for d in jax.devices() if d.platform == "tpu"))
+
+
+def _qkv(heads, kv_len, dtype, seed, put=_cpu):
     rng = np.random.default_rng(seed)
     shape = (1, heads, kv_len, 128)
     return tuple(
-        _cpu(rng.standard_normal(shape, np.float32).astype(dtype)) for _ in range(3)
+        put(rng.standard_normal(shape, np.float32).astype(dtype)) for _ in range(3)
     )
 
 
@@ -162,8 +186,86 @@ def _f64(x):
     return np.asarray(x.astype("float32"), np.float64)
 
 
+def _band_widths(seg, block_q):
+    """Chunks in each q block's band (``band_tables``, the kernel's reference)."""
+    from sglang_tpu.kernels.band_skip_flash_attention import band_tables
+
+    ids = _cpu(seg[None])
+    return set(np.asarray(band_tables(ids, ids, block_q)[1]).tolist())
+
+
 # One bf16 ulp for |x| in [1, 2).
 _BF16_ULP = 2.0**-7
+
+# Layouts (segment ids, expected band widths) per (kv_len, block_q), chosen with
+# ``band_tables`` to reach each body of the kernel.
+_LAYOUTS = {
+    # 6 chunks of 512 keys: bands of 1-4 chunks take the static-width bodies,
+    # bands of 5-6 the pipelined dense body.
+    (3072, 256): {
+        "narrow segments": (_segments(3072, [400] * 7), {1, 2, 3}),
+        "one image": (_segments(3072, [2772]), {1, 6}),
+        "mixed": (_segments(3072, [1000, 300, 1500]), {1, 2, 3, 4, 5}),
+        # Ids in reverse order: a block's [min, max] id range meets chunks
+        # that share no id with it, so bands widen (and must stay exact).
+        "ids out of order": (
+            _segments(3072, [400] * 7, ids=range(6, -1, -1)),
+            {1, 3, 4, 5, 6},
+        ),
+    },
+    # Static widths 1-6, pipelined dense body 7-8.
+    (4096, 256): {
+        "mixed": (_segments(4096, [1000, 300, 1500, 1000]), {1, 2, 3, 4, 5, 6}),
+        "ids out of order": (
+            _segments(4096, [500] * 8, ids=range(7, -1, -1)),
+            {2, 3, 4, 5, 6, 7, 8},
+        ),
+    },
+    # Static widths 1-9, pipelined dense body 10-12.
+    (6144, 256): {
+        "narrow segments": (_segments(6144, [400] * 15), {1, 2, 3}),
+        "mixed": (_segments(6144, [2000, 500, 3000]), {2, 4, 5, 7, 8}),
+        "ids out of order": (
+            _segments(6144, [700] * 8, ids=range(7, -1, -1)),
+            {2, 3, 5, 6, 7, 9, 10, 11, 12},
+        ),
+    },
+    # Band loop (4 chunks per step, then 0-3 leftover chunks) up to 12 chunks,
+    # pipelined dense body (no ring) above.
+    (8192, 256): {
+        "wide bands": (_segments(8192, [3000, 3000, 1500]), {2, 4, 5, 6, 7, 10, 12}),
+        "mixed": (_segments(8192, [1500, 2100, 3700, 800]), {2, 3, 6, 8, 9, 13}),
+    },
+    # Band loop up to 18 chunks, dense body above.
+    (12288, 256): {
+        "wide bands": (_segments(12288, [3000] * 4), {1, 6, 7, 12, 13}),
+        "mixed": (
+            _segments(12288, [1700, 2900, 4500, 3000]),
+            {4, 6, 7, 9, 10, 15, 16},
+        ),
+        "large image": (_segments(12288, [9500, 2600]), {6, 19, 24}),
+    },
+    # The only config the default BLOCK_Q (0, tile 128) reaches. 32 chunks: bands
+    # of up to 24 run the band loop, wider ones the dense body.
+    (16384, 128): {
+        # Bands of 1-2 chunks: no loop step, leftover chunks only.
+        "narrow segments": (_segments(16384, [1024] * 15 + [700]), {1, 2}),
+        # Bands of 3-13 chunks: 0-3 loop steps, and 0-3 leftover chunks.
+        "wide bands": (_segments(16384, [3000] * 5), {3, 6, 7, 9, 12, 13}),
+        # Segment 0 split over the first and last chunk: its 8 blocks have
+        # 32-chunk bands (dense body), the 1024-token segments between have 2.
+        "split segment": (
+            np.concatenate(
+                [
+                    np.zeros(512, np.int32),
+                    np.repeat(np.arange(1, 16, dtype=np.int32), 1024),
+                    np.zeros(512, np.int32),
+                ]
+            ),
+            {2, 32},
+        ),
+    },
+}
 
 
 @unittest.skipUnless(_HAS_JAX, "requires JAX")
@@ -393,58 +495,80 @@ class TestBandSkipKernelNumerics(CustomTestCase):
             )
             np.testing.assert_allclose(out, _f64(expected), atol=1e-5, rtol=0)
 
-    def _band_widths(self, seg, block_q):
-        """Chunks in each q block's band (``band_tables``, the kernel's reference)."""
-        from sglang_tpu.kernels.band_skip_flash_attention import band_tables
-
-        ids = _cpu(seg[None])
-        return set(np.asarray(band_tables(ids, ids, block_q)[1]).tolist())
-
     def test_kv3072_tile256_layouts(self):
-        # 6 chunks of 512 keys: bands of 1-4 chunks take the static-width bodies,
-        # bands of 5-6 the pipelined dense body.
-        layouts = {
-            "narrow segments": (_segments(3072, [400] * 7), {1, 2, 3}),
-            "one image": (_segments(3072, [2772]), {1, 6}),
-            "mixed": (_segments(3072, [1000, 300, 1500]), {1, 2, 3, 4, 5}),
-            # Ids in reverse order: a block's [min, max] id range meets chunks
-            # that share no id with it, so bands widen (and must stay exact).
-            "ids out of order": (
-                _segments(3072, [400] * 7, ids=range(6, -1, -1)),
-                {1, 3, 4, 5, 6},
-            ),
-        }
-        for name, (seg, widths) in layouts.items():
+        # Static band widths and the pipelined dense body.
+        for name, (seg, widths) in _LAYOUTS[(3072, 256)].items():
             with self.subTest(layout=name):
-                self.assertEqual(self._band_widths(seg, 256), widths)
+                self.assertEqual(_band_widths(seg, 256), widths)
                 self._check(2, 3072, 256, seg)
 
     def test_kv16384_tile128_layouts(self):
-        # The only config the default BLOCK_Q (0, tile 128) reaches. 32 chunks:
-        # bands of up to 24 run the band loop (4 chunks per fori_loop step, then
-        # up to 3 leftover chunks), wider ones the dense body.
-        layouts = {
-            # Bands of 1-2 chunks: no loop step, leftover chunks only.
-            "narrow segments": (_segments(16384, [1024] * 15 + [700]), {1, 2}),
-            # Bands of 3-13 chunks: 0-3 loop steps, and 0-3 leftover chunks.
-            "wide bands": (_segments(16384, [3000] * 5), {3, 6, 7, 9, 12, 13}),
-            # Segment 0 split over the first and last chunk: its 8 blocks have
-            # 32-chunk bands (dense body), the 1024-token segments between have 2.
-            "split segment": (
-                np.concatenate(
-                    [
-                        np.zeros(512, np.int32),
-                        np.repeat(np.arange(1, 16, dtype=np.int32), 1024),
-                        np.zeros(512, np.int32),
-                    ]
-                ),
-                {2, 32},
-            ),
-        }
-        for name, (seg, widths) in layouts.items():
+        # The band loop and the dense body.
+        for name, (seg, widths) in _LAYOUTS[(16384, 128)].items():
             with self.subTest(layout=name):
-                self.assertEqual(self._band_widths(seg, 128), widths)
+                self.assertEqual(_band_widths(seg, 128), widths)
                 self._check(1, 16384, 128, seg)
+
+
+@unittest.skipUnless(_HAS_JAX_TPU, "requires a TPU-backed JAX")
+class TestBandSkipKernelOnTpu(CustomTestCase):
+    """``band_skip_flash_attention`` compiled for the TPU (a Mosaic custom call, not
+    interpret mode), bit for bit against the dense kernel on the same TPU, in bf16,
+    at every config in ``_CONFIGS``. The layouts reach every body of each config:
+    every static band width and the pipelined dense body (3072-6144); the band loop
+    with 0-3 loop steps and 0-3 leftover chunks, and the pipelined dense body without
+    the ring (8192); the band loop and the dense body (12288, 16384). Each call has
+    two head groups, so the second reads back the bands the first computed."""
+
+    def test_every_config_is_bitwise_dense(self):
+        import jax.numpy as jnp
+
+        from sglang_tpu.kernels.band_skip_flash_attention import (
+            _CONFIGS,
+            band_skip_flash_attention,
+        )
+        from sglang_tpu.kernels.flash_attention import (
+            BlockSizes,
+            SegmentIds,
+            flash_attention,
+        )
+
+        self.assertEqual(set(_LAYOUTS), set(_CONFIGS))
+        for (kv_len, block_q), layouts in _LAYOUTS.items():
+            heads = 2 * _CONFIGS[(kv_len, block_q)].heads_per_step
+            q, k, v = _qkv(heads, kv_len, jnp.bfloat16, seed=kv_len + 1, put=_tpu)
+            kwargs = dict(sm_scale=_SCALE, block_q=block_q)
+            with self.subTest(kv_len=kv_len, block_q=block_q, check="lowering"):
+                ids = _tpu(np.zeros((1, kv_len), np.int32))
+                lowered = band_skip_flash_attention.lower(
+                    q, k, v, SegmentIds(q=ids, kv=ids), **kwargs
+                )
+                self.assertIn("tpu_custom_call", lowered.as_text())
+            for name, (seg, widths) in layouts.items():
+                with self.subTest(kv_len=kv_len, block_q=block_q, layout=name):
+                    self.assertEqual(_band_widths(seg, block_q), widths)
+                    ids = _tpu(seg[None])
+                    segment_ids = SegmentIds(q=ids, kv=ids)
+                    out = np.asarray(
+                        band_skip_flash_attention(q, k, v, segment_ids, **kwargs)
+                    )
+                    dense = np.asarray(
+                        flash_attention(
+                            q,
+                            k,
+                            v,
+                            segment_ids=segment_ids,
+                            causal=False,
+                            sm_scale=_SCALE,
+                            block_sizes=BlockSizes(block_q, kv_len, kv_len, 1),
+                            vmem_limit_bytes=None,
+                        )
+                    )
+                    diff = np.abs(_f64(out) - _f64(dense)).max()
+                    self.assertTrue(
+                        np.array_equal(out.view(np.uint16), dense.view(np.uint16)),
+                        f"not bitwise; max |band-skip - dense| = {diff}",
+                    )
 
 
 if __name__ == "__main__":
