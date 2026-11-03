@@ -18,7 +18,6 @@ finished request.
 from __future__ import annotations
 
 import collections
-import logging
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -26,8 +25,6 @@ from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import MultimodalInputs
-
-logger = logging.getLogger(__name__)
 
 # Host time spent dropping parked features before one device wait.
 _DRAIN_BUDGET_NS = 4_000_000
@@ -49,26 +46,17 @@ class MMFeatureReleaser:
         self._pending: collections.deque = collections.deque()
 
     def release(self, mm_inputs: MultimodalInputs) -> None:
-        """Release a finished request's features like ``release_features``.
+        """Release a finished request's features with ``release_features``.
 
-        When enabled, the feature objects are parked instead of dropped here.
+        When enabled, the feature objects are parked first, so the call only
+        drops the items' references and the objects stay alive until drained.
         """
-        if not self.enabled:
-            mm_inputs.release_features()
-            return
         pending = self._pending
-        for item in mm_inputs.mm_items:
-            try:
-                item.release_transport_proxies()
-            except Exception:
-                logger.warning(
-                    "Failed to release an unused multimodal feature transport",
-                    exc_info=True,
-                )
-            finally:
-                if item.feature is not None:
-                    pending.append(item.feature)
-                item.feature = None
+        if self.enabled:
+            pending.extend(
+                item.feature for item in mm_inputs.mm_items if item.feature is not None
+            )
+        mm_inputs.release_features()
         while len(pending) > _MAX_PENDING:
             pending.popleft()
 

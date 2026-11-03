@@ -137,6 +137,27 @@ class TestMMFeatureReleaser(CustomTestCase):
         releaser.drain_all()
         self.assertEqual(_alive(refs), 0)
 
+    def test_release_goes_through_release_features(self):
+        original = MultimodalInputs.release_features
+        for mode, alive_after in (("", 0), ("incremental", 2)):
+            with self.subTest(mode=mode):
+                releaser = MMFeatureReleaser(mode)
+                mm_inputs, refs = _mm_inputs(2)
+
+                with patch.object(
+                    MultimodalInputs,
+                    "release_features",
+                    autospec=True,
+                    side_effect=original,
+                ) as release_features:
+                    releaser.release(mm_inputs)
+
+                release_features.assert_called_once_with(mm_inputs)
+                self.assertTrue(all(i.feature is None for i in mm_inputs.mm_items))
+                self.assertEqual(_alive(refs), alive_after)
+                releaser.drain_all()
+                self.assertEqual(_alive(refs), 0)
+
     def test_second_release_of_the_same_inputs_parks_nothing(self):
         releaser = MMFeatureReleaser("incremental")
         mm_inputs, _ = _mm_inputs(2)
