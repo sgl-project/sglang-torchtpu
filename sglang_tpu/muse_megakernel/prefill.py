@@ -165,6 +165,8 @@ def build_forward(c: PFConfig, axis: str = "model"):
                 k_scale=1.0,
                 v_scale=1.0,
                 kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+                # attn_out normalizes per head on-chip; never double-normalize inside RPA.
+                out_head_norm_eps=None,
             )
             lyr = jnp.full((1,), l, jnp.int32)
             x, xe, ids, tw = attn_out(

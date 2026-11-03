@@ -448,6 +448,7 @@ def rpa_body(
             processed_q_len=processed_q_len[0],
             processed_kv_len=processed_kv_len[0],
             cfgs=cfgs,
+            emit_store=False,
         )
         if cfgs.serve.skip_pad_q:
             # A partial q block (a sequence's last) skips its padded compute blocks.
@@ -468,12 +469,13 @@ def rpa_body(
 
         if not cfgs.serve.skip_full_tile_mask:
             run_tile(apply_mask=True)
-            return
-        full_tile = _full_tile(
-            step, schedule_ref, processed_q_len, processed_kv_len, cfgs
-        )
-        pl.when(full_tile)(lambda: run_tile(apply_mask=False))
-        pl.when(jnp.logical_not(full_tile))(lambda: run_tile(apply_mask=True))
+        else:
+            full_tile = _full_tile(
+                step, schedule_ref, processed_q_len, processed_kv_len, cfgs
+            )
+            pl.when(full_tile)(lambda: run_tile(apply_mask=False))
+            pl.when(jnp.logical_not(full_tile))(lambda: run_tile(apply_mask=True))
+        transposed.store_tile(step, schedule_ref, acc_scratch_ref, o_vref, cfgs=cfgs)
         return
 
     # Step 3: Perform compute, then step 4: write back outputs.
