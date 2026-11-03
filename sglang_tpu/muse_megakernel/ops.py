@@ -579,6 +579,15 @@ class MuseMegakernel(torch.nn.Module):
         unshifted = (
             1.02 * g.scale_query_by * g.head_dim * g.attn_scale <= K.UNSHIFTED_MAX
         )
+        chunk_pages = 2 * g.inter_local // page_size if kv_sal else self.chunk_pages
+        env_swa_tok = tpu_envs.SGLANG_TPU_MUSE_MK_SAL_SWA_CHUNK_TOKENS.get()
+        swa_chunk_pages = (
+            (env_swa_tok // page_size if env_swa_tok > 0 else (2 if opt else 0))
+            if kv_sal
+            else 0
+        )
+        if swa_chunk_pages >= chunk_pages:
+            swa_chunk_pages = 0
         attn_opt = 0
         if opt:
             attn_opt = (
@@ -624,7 +633,8 @@ class MuseMegakernel(torch.nn.Module):
             compact_rows=4 if (opt or rows <= _COMPACT4_MAX_ROWS) else 8,
             topk_iter=rows > 8,
             # SAL chunks are one expert w13 slot row of tokens (the ring is a view of those slots)
-            chunk_pages=2 * g.inter_local // page_size if kv_sal else self.chunk_pages,
+            chunk_pages=chunk_pages,
+            swa_chunk_pages=swa_chunk_pages,
             kv_packed=self.kv_packed and not kv_sal,
             kv_sal=kv_sal,
             kv_sal_fp8=kv_sal_fp8,
@@ -641,10 +651,20 @@ class MuseMegakernel(torch.nn.Module):
             attn_streams=_ATTN_STREAMS[
                 ("sal_fp8" if kv_sal_fp8 else "sal") if kv_sal else "fused"
             ],
+            attn_skip_idle_streams=opt
+            or tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_SKIP_IDLE.get(),
+            attn_col_mask=bool(swa_chunk_pages)
+            and (opt or tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_COL_MASK.get()),
+            fold_attn_scale=(opt or tpu_envs.SGLANG_TPU_MK_FOLD_ATTN_SCALE.get())
+            and math.frexp(g.attn_scale)[0] == 0.5,
             kv_group=_FUSED_KV_GROUP,
             row_tile=_ROW_TILE if tiled else 0,
             ex_opt=opt,
             ex_kperm=1 if getattr(self, "kperm", False) else 0,
+            ex_via_fp8=False,
+            alias_oy=tiled,
+            alias_p=tiled,
+            xfull_packed=False,
             attn_opt=attn_opt,
             tiled_vmem_y=2 if (opt and tiled) else 0,
             tiled_o_rot=opt and tiled,
@@ -654,16 +674,28 @@ class MuseMegakernel(torch.nn.Module):
             pair_o_rs=opt and tiled,
         )
         n_units = len(K.expert_units(cfg))
+        ex_split = (
+            4
+            if (opt and rows >= _EXPERT_SPLIT_MIN_ROWS and n_units <= _ARMS5_MAX_UNITS)
+            else 0
+        )
         cfg = msgspec.structs.replace(
             cfg,
-            compact_arms=_compact_arms(rows, n_units, opt=opt),
+            expert_split=ex_split,
+            compact_arms=_compact_arms(rows, n_units, opt=opt, expert_split=ex_split),
             compact_rows=(
-                4
-                if (opt and n_units <= _ARMS5_MAX_UNITS)
-                or (not opt and rows <= _COMPACT4_MAX_ROWS)
-                else 8
+                8
+                if (opt and ex_split > 0)
+                else (
+                    4
+                    if (opt and n_units <= _ARMS5_MAX_UNITS)
+                    or (not opt and rows <= _COMPACT4_MAX_ROWS)
+                    else 8
+                )
             ),
-            ex_issue_pairs=n_units <= _ARMS5_MAX_UNITS and rows <= _COMPACT4_MAX_ROWS,
+            ex_issue_pairs=n_units <= _ARMS5_MAX_UNITS
+            and (rows <= _COMPACT4_MAX_ROWS or (opt and not tiled)),
+            ex_bd_all=opt and not tiled and cfg.ex_kperm == 0,
         )
         if cfg.tiled_fold and tiled:
             do_fold = n_req * q > 2 and not (
@@ -675,27 +707,48 @@ class MuseMegakernel(torch.nn.Module):
                 fold_o=do_fold,
                 fold_f=do_fold,
             )
-        vys = (
-            (cfg.tiled_vmem_y, 1)
-            if (tiled and cfg.tiled_vmem_y >= 2)
-            else (cfg.tiled_vmem_y,)
-        )
-        for vy in vys:
-            base_cfg = (
-                msgspec.structs.replace(cfg, tiled_vmem_y=vy)
-                if vy != cfg.tiled_vmem_y
-                else cfg
+        if tiled:
+            vys = (
+                (cfg.tiled_vmem_y, 1) if cfg.tiled_vmem_y >= 2 else (cfg.tiled_vmem_y,)
             )
-            if tiled and vy >= 2:
-                budget = _TILED_VY2_VMEM_BUDGET
-            elif tiled and base_cfg.tiled_vmem_pads:
-                budget = _TILED_VPADS_VMEM_BUDGET
-            else:
-                budget = _SCRATCH_VMEM_BUDGET
-            for depth, cap in (
-                _TILED_DEPTH_RING_PREFERENCE if tiled else _DEPTH_RING_PREFERENCE
-            ):
-                if vy != vys[-1] and (depth < 3 or cap < 5):
+            plans = [
+                (
+                    msgspec.structs.replace(cfg, tiled_vmem_y=vy)
+                    if vy != cfg.tiled_vmem_y
+                    else cfg,
+                    _TILED_VY2_VMEM_BUDGET
+                    if vy >= 2
+                    else (
+                        _TILED_VPADS_VMEM_BUDGET
+                        if cfg.tiled_vmem_pads
+                        else _SCRATCH_VMEM_BUDGET
+                    ),
+                    _TILED_DEPTH_RING_PREFERENCE,
+                    vy != vys[-1],
+                )
+                for vy in vys
+            ]
+        elif opt:
+            # Prefer unaliased base scratch when the full 10-slot folded ring already
+            # fits in 48 MiB (<=16 rows, or 24 rows at q <= 4); enable VMEM pad/ysend
+            # aliasing + packed xfull when needed to keep the 10-slot ring (24 rows at
+            # q >= 5 and 32 rows).
+            plans = [
+                (cfg, _SCRATCH_VMEM_BUDGET, ((3, 11),), False),
+                (
+                    msgspec.structs.replace(
+                        cfg, alias_oy=True, alias_p=True, xfull_packed=True
+                    ),
+                    _OPT_BASE_VMEM_BUDGET,
+                    _DEPTH_RING_PREFERENCE,
+                    False,
+                ),
+            ]
+        else:
+            plans = [(cfg, _SCRATCH_VMEM_BUDGET, _DEPTH_RING_PREFERENCE, False)]
+        for base_cfg, budget, prefs, step_down_vy in plans:
+            for depth, cap in prefs:
+                if step_down_vy and (depth < 3 or cap < 5):
                     break
                 cand = msgspec.structs.replace(base_cfg, expert_depth=depth)
                 slots = K.fit_ring_slots(cand, cap=cap)
@@ -1003,6 +1056,7 @@ _PREFILL_ROW_ALIGN = 128
 # (verify attention): 24 rows of 6 compile at 46.8 MiB declared, 32 rows of 8 overflowed the
 # 60 MiB limit at 48.7 MiB (~11.5 MiB of temporaries).
 _SCRATCH_VMEM_BUDGET = 48 * 2**20
+_OPT_BASE_VMEM_BUDGET = 50 * 2**20
 # On libtpu 0.0.50 (2026-10-07), row-tiled LLO temporaries add ~10.5-11.0 MiB on top of
 # declared scratch; capping row-tiled budgets at 50 MiB keeps total scoped VMEM <= 60.5 MiB
 # under the 62 MiB v7x limit across rows=48..128 without LLO retry thrashing.
@@ -1011,14 +1065,14 @@ _TILED_VY2_VMEM_BUDGET = 50 * 2**20
 _ATTN_HOIST_GLOBAL_MIN_POS = 262144
 # (expert depth, ring cap): the ring is the largest divisor of the 30 dense tiles per layer up
 # to the cap (10, 6, 5, then 3). The folds need a stream depth of at least 3 (K.fold_fits), so
-# 5 slots or more: a 24-row step at q >= 5 or any 32-row step fits 6 slots at expert depth 3
-# (39-43 MiB declared) but not 10, and runs folded.
+# 5 slots or more.
 _DEPTH_RING_PREFERENCE = ((3, 11), (3, 6), (3, 5), (3, 4), (1, 4))
 # Row-tiled steps: deepest expert prefetch, then the largest dense ring that fits.
 _TILED_DEPTH_RING_PREFERENCE = tuple((d, s) for d in (3, 1) for s in range(11, 1, -1))
 # Measured device step (real geometry, random routing): the 8-row block-diag variant is
-# slower than the 4-row one at 8-24 rows and faster only at 48.
+# slower than the 4-row one at 8-24 rows and faster once expert_split >= 32 rows.
 _COMPACT4_MAX_ROWS = 24
+_EXPERT_SPLIT_MIN_ROWS = 32
 
 
 # Expert operand units (one leaf each in the expert-DMA layer walks) up to which the expert
@@ -1027,13 +1081,17 @@ _COMPACT4_MAX_ROWS = 24
 _ARMS5_MAX_UNITS = 8
 
 
-def _compact_arms(rows: int, n_units: int, *, opt: bool = True) -> tuple:
+def _compact_arms(
+    rows: int, n_units: int, *, opt: bool = True, expert_split: int = 0
+) -> tuple:
     """Compact expert row buckets, one code variant each (the full path is one more); a sixth
     variant overflows the instruction memory into overlay swaps."""
     if n_units > _ARMS5_MAX_UNITS:
         return ()
     if opt:
-        return (1, 2, 3, 4) if rows <= 8 else (1, 2, 4)
+        if rows <= 8:
+            return (1, 2, 3, 4)
+        return (1, 2, 4, 8) if expert_split > 0 else (1, 2, 4)
     if rows > _COMPACT4_MAX_ROWS:
         return ()
     return (1, 2, 3, 4) if rows <= 8 else (1, 2, 3, 5)

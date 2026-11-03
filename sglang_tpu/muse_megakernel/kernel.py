@@ -52,6 +52,7 @@ all-gather.
 import contextlib
 import functools
 import math
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -124,6 +125,11 @@ SMALL = dict(
     expert_gs_down=15,
 )
 SMALL_ROWS = 16
+# attn_preones: u32 rows per ring chunk (64 of K/V words + 8 of fp8 ones) and slot cap
+PREONES_ROWS = 72
+PREONES_MAX_SLOTS = 24
+# four e4m3 1.0 bytes in one u32 word
+_FP8_ONES_WORD = 0x38383838
 
 
 class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
@@ -277,12 +283,32 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     tiled_vmem_pads: bool = False
     tiled_fold: bool = False
     attn_opt: int = 0
+    # fp8 SAL global attention on steps of more than 64 attention rows per request: each ring
+    # chunk owns 72 u32 rows of the expert w13 slots ([K0; V0; K1; V1] then 8 rows of fp8 ones,
+    # written once per layer), so QK is one 256-deep dot on the raw chunk and PV one dot
+    # against [V0; K1; V1; ones] whose ones lanes give the softmax row sums on the MXU (one
+    # f32 accumulator, no VPU row-sum adds). The HBM pool layout is unchanged.
+    attn_preones: bool = False
+    # with attn_preones: queries go to the MXU as per-row-scaled fp8
+    attn_q_fp8: bool = False
+    # pipelined_opt loop carry for > 64 attention rows: 0 one lane-partial row sum per stream
+    # (NS x [M, 128]) and 2 accumulators; 1 one row sum (tree-summed per chunk) and one
+    # accumulator; 2 one row sum and 2 accumulators
+    attn_carry: int = 0
     alias_oy: bool = True
     alias_p: bool = True
     trim_sems: bool = True
     tiled_pair_y: int = 0
     pair_ag: int = 0
     pair_o_rs: bool = False
+    swa_chunk_pages: int = 0
+    attn_skip_idle_streams: bool = False
+    attn_col_mask: bool = False
+    fold_attn_scale: bool = False
+    expert_split: int = 0
+    xfull_packed: bool = False
+    ex_via_fp8: bool = False
+    ex_bd_all: bool = False
     vmem_limit_bytes: int = 62 * 2**20
 
     @property
@@ -349,7 +375,31 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
         )
 
     @property
+    def preones_slots(self):
+        """attn_preones ring chunks: 72-row slots of the expert w13 slots, at most 24."""
+        rows = (self.expert_depth + 1) * (self.expert_hidden // FP4_PACK)
+        return min(PREONES_MAX_SLOTS, rows // PREONES_ROWS)
+
+    @property
+    def use_sal_preones(self):
+        return bool(
+            self.attn_preones
+            and self.kv_sal
+            and self.kv_sal_fp8
+            and self.sal_fp8_dot >= 2
+            and self.attn_exp2
+            and self.attn_pipe
+            and self.kv_heads == 2
+            and self.head_dim == 64
+            and self.sal_words == 64
+            and self.chunk_pages * self.page_size == 2 * self.inter_local
+            and self.preones_slots >= 2 * self.attn_streams
+        )
+
+    @property
     def kv_ring(self):
+        if self.use_sal_preones:
+            return self.preones_slots
         if self.kv_sal:  # every chunk the expert w13 slots hold (sal_kv_view)
             return (
                 (self.expert_depth + 1)
@@ -357,6 +407,20 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
                 // self.sal_words
             )
         return 2 * self.kv_group
+
+    @property
+    def swa_kv_group(self):
+        """SWA chunks per prefetch group: half the ring counted in SWA sub-slots."""
+        return (
+            self.kv_ring
+            // 2
+            * (self.chunk_pages // (self.swa_chunk_pages or self.chunk_pages))
+        )
+
+    @property
+    def split_rows(self):
+        """expert_split's bound on the few-row loop's experts: no larger than its arms."""
+        return min(self.expert_split, self.compact_rows)
 
     @property
     def rows_per_dev(self):
@@ -373,6 +437,8 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
             "fp8 layers pair the expert slots"
         )
         assert self.compact_rows in (0, 1, 2, 4, 8)
+        assert self.expert_split in (0, 1, 2, 4)
+        assert not self.expert_split or self.vec_route
         arms = self.compact_arms
         assert all(1 <= a < b for a, b in zip(arms, arms[1:] + (1 << 30,)))
         # bf16-packed collective buffers are half the per-device width and must stay lane tiles
@@ -399,6 +465,15 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
             == 0
         )
         assert self.sal_fp8_dot == 0 or self.kv_sal_fp8
+        assert not self.swa_chunk_pages or (
+            self.kv_sal
+            and not self.use_sal_preones
+            and 0 < self.swa_chunk_pages < self.chunk_pages
+            and self.chunk_pages % self.swa_chunk_pages == 0
+            and (self.swa_chunk_pages * self.page_size) % LANE == 0
+        )
+        assert not self.attn_col_mask or self.swa_chunk_pages
+        assert not self.fold_attn_scale or math.frexp(self.attn_scale)[0] == 0.5
         # 1.02: bf16 rounding of q and k (1.07: fp8 k); exp(60) * 1M keys * |v| stays under f32 max
         assert not self.attn_unshifted or (
             (1.07 if self.kv_sal_fp8 else 1.02)
@@ -438,8 +513,10 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
                 )
             assert fold_fits(self)
         # sliding-window layers never refill the KV ring: a window's chunks must fit it
-        cpt = self.chunk_pages * self.page_size
-        assert (self.window + cpt - 2) // cpt + 1 <= self.kv_ring
+        swa_cp = self.swa_chunk_pages or self.chunk_pages
+        swa_cpt = swa_cp * self.page_size
+        swa_kr = 2 * self.swa_kv_group if self.swa_chunk_pages else self.kv_ring
+        assert (self.window + swa_cpt - 2) // swa_cpt + 1 <= swa_kr
         assert not self.row_tile or (
             self.rows % self.row_tile == 0
             and self.row_tile % 16 == 0
@@ -610,6 +687,31 @@ def _dispatch(idx, refs, fn, only=None):
     _select(idx, list(only), lambda k: fn(refs[k]))
 
 
+class _AttnGeom(NamedTuple):
+    """Chunk geometry of one attention body: ``cp`` pages per chunk, ``kr`` ring slots fetched in
+    groups of ``kg``. ``is_global`` is a Python bool when the body is specialized per layer
+    type, else the layer's traced flag."""
+
+    cp: int
+    kg: int
+    kr: int
+    is_global: Any
+
+
+def _sel(flag, a, b):
+    """``where(flag, a, b)``, resolved at trace time for a Python-bool flag."""
+    if isinstance(flag, bool):
+        return a if flag else b
+    return jnp.where(flag, a, b)
+
+
+def _in_window(is_global, cond):
+    """``is_global or cond``; None when every key is in range."""
+    if isinstance(is_global, bool):
+        return None if is_global else cond
+    return jnp.logical_or(is_global, cond)
+
+
 def perm_256(t, axis: int):
     """Permute each 256-slice along ``axis`` from (16, 16) to transposed (16, 16)."""
     axis = axis % t.ndim
@@ -670,18 +772,102 @@ def permute_expert_slab_kperm(slab: tuple):
     return (w13_p, w13s_p, w2_p, w2s)
 
 
-def _dequant_fp4(words, scale):
+# ex_kperm >= 3: largest dequantized fp4 weight after the block scales are normalized (e4m3
+# keeps its 3 mantissa bits down to 2^-6, so the weights stay in its normal range)
+WFP8_TARGET_MAX = 32.0
+_FP4_MAX = 6.0
+
+
+def expert_wfp8_globals(slab: tuple, target_max: float = WFP8_TARGET_MAX):
+    """Per-(rank, expert) (gate, up, down) globals of an fp4 slab: [rows] f32 each, such that
+    block scale / global keeps every dequantized weight at most target_max."""
+    _, w13s, _, w2s = slab
+    il = w13s.shape[-1] // 2
+
+    def f(s13, s2):
+        a13 = jnp.abs(s13.astype(jnp.float32)) * _FP4_MAX
+        a2 = jnp.abs(s2.astype(jnp.float32)) * _FP4_MAX
+        return tuple(
+            jnp.maximum(x, 1e-30) / target_max
+            for x in (
+                jnp.max(a13[..., :il], axis=(1, 2)),
+                jnp.max(a13[..., il:], axis=(1, 2)),
+                jnp.max(a2, axis=(1, 2)),
+            )
+        )
+
+    shd = jax.sharding.NamedSharding(
+        w13s.sharding.mesh, jax.sharding.PartitionSpec(w13s.sharding.spec[0])
+    )
+    return jax.block_until_ready(jax.jit(f, out_shardings=(shd, shd, shd))(w13s, w2s))
+
+
+def normalize_expert_slab_wfp8(slab: tuple, gs: tuple):
+    """Divides an fp4 slab's block scales by its (gate, up, down) globals (ex_kperm >= 3)."""
+    w13, w13s, w2, w2s = slab
+    il = w13s.shape[-1] // 2
+
+    def f(s13, s2, gg, gu, gd):
+        inv13 = jnp.concatenate(
+            [
+                jnp.broadcast_to((1.0 / gg)[:, None, None], s13[..., :il].shape),
+                jnp.broadcast_to((1.0 / gu)[:, None, None], s13[..., il:].shape),
+            ],
+            axis=-1,
+        )
+        s13n = (s13.astype(jnp.float32) * inv13).astype(s13.dtype)
+        s2n = (s2.astype(jnp.float32) / gd[:, None, None]).astype(s2.dtype)
+        return s13n, s2n
+
+    s13n, s2n = jax.block_until_ready(
+        jax.jit(f, out_shardings=(w13s.sharding, w2s.sharding))(w13s, w2s, *gs)
+    )
+    return (w13, s13n, w2, s2n)
+
+
+def apply_expert_gs_to_smalls(smalls, gs: tuple, kinds: tuple, tp: int, n_experts: int):
+    """Writes the (gate, up, down) globals into the fp4 layers' smalls rows expert_gs*."""
+    L = len(kinds)
+    E = n_experts
+    Ep = -(-E // LANE) * LANE
+    fp4 = jnp.array([k == "fp4" for k in kinds], dtype=jnp.bool_)
+
+    def f(sm, gg, gu, gd):
+        s4 = sm.reshape(tp, L, *sm.shape[1:])
+        r_up, r_dn = SMALL["expert_gs"], SMALL["expert_gs_down"]
+        bc = lambda g: jnp.broadcast_to(g.reshape(tp, 1, E), (tp, L, E))
+        up = s4[:, :, r_up, :]
+        new_up = up.at[:, :, 0:E].set(bc(gg)).at[:, :, Ep : Ep + E].set(bc(gu))
+        dn = s4[:, :, r_dn, :]
+        new_dn = dn.at[:, :, 0:E].set(bc(gd))
+        s4 = s4.at[:, :, r_up, :].set(jnp.where(fp4[None, :, None], new_up, up))
+        s4 = s4.at[:, :, r_dn, :].set(jnp.where(fp4[None, :, None], new_dn, dn))
+        return s4.reshape(sm.shape)
+
+    return jax.block_until_ready(jax.jit(f, out_shardings=smalls.sharding)(smalls, *gs))
+
+
+def _dequant_fp4(words, scale, via_fp8=False):
     """``[cw, N]`` u32 + ``[cw*8/16, N]`` scales -> ``[cw*8, N]`` bf16."""
     cw, n = words.shape
-    v = pltpu.bitcast(words, jnp.float4_e2m1fn).astype(jnp.bfloat16)
+    f4 = pltpu.bitcast(words, jnp.float4_e2m1fn)
+    v = (
+        f4.astype(jnp.float8_e4m3fn).astype(jnp.bfloat16)
+        if via_fp8
+        else f4.astype(jnp.bfloat16)
+    )
     gq = cw * FP4_PACK // FP4_GROUP
     s = scale if scale.dtype == jnp.bfloat16 else scale.astype(jnp.bfloat16)
     s = jnp.broadcast_to(s[:, None, :], (gq, FP4_GROUP, n)).reshape(cw * FP4_PACK, n)
     return v * s
 
 
-def _dequant_fp4_kperm(words, scale, via_fp8=False):
-    """Zero-shuffle NVFP4 dequant for K permuted as (B, r=16, g=16)."""
+def _dequant_fp4_kperm(words, scale, via_fp8=False, out_fp8=False):
+    """Zero-shuffle NVFP4 dequant for K permuted as (B, r=16, g=16).
+
+    ``out_fp8``: the dequantized weights go to the MXU as e4m3 (ex_kperm >= 3: the
+    block scales are normalized so every weight is at most WFP8_TARGET_MAX).
+    """
     cw, _ = words.shape
     nb = cw // 32
     f4 = pltpu.bitcast(words, jnp.float4_e2m1fn)
@@ -697,7 +883,8 @@ def _dequant_fp4_kperm(words, scale, via_fp8=False):
         base = b * 256
         for r in range(16):
             parts.append(v[base + r * 16 : base + (r + 1) * 16] * sb)
-    return jnp.concatenate(parts, axis=0)
+    res = jnp.concatenate(parts, axis=0)
+    return res.astype(jnp.float8_e4m3fn) if out_fp8 else res
 
 
 def _scale_rows(sslot, g0, gn, N, blk):
@@ -713,11 +900,15 @@ def _scale_rows(sslot, g0, gn, N, blk):
     return blk[g0 % 32 : g0 % 32 + gn], blk
 
 
-def _fp4_dot(x, wslot, sslot, K, N, chunk_words, fast_bf16=False, kperm=0):
+def _fp4_dot(
+    x, wslot, sslot, K, N, chunk_words, fast_bf16=False, kperm=0, via_fp8=False
+):
     kw = K // FP4_PACK
     acc = blk = None
     if kperm > 0:
         chunk_words = min(kw, 64)
+    elif fast_bf16:
+        chunk_words = min(kw, 32)
     use_bf16 = fast_bf16 or kperm > 0
     xb = (
         (x if x.dtype == jnp.bfloat16 else x.astype(jnp.bfloat16)) if use_bf16 else None
@@ -725,21 +916,21 @@ def _fp4_dot(x, wslot, sslot, K, N, chunk_words, fast_bf16=False, kperm=0):
     direct_bf16 = use_bf16 and sslot.dtype == jnp.bfloat16
     for c in range(0, kw, chunk_words):
         cw = min(chunk_words, kw - c)
+        g0 = c * FP4_PACK // FP4_GROUP
+        gq = cw * FP4_PACK // FP4_GROUP
         if direct_bf16:
-            sc = sslot[
-                pl.ds(c * FP4_PACK // FP4_GROUP, cw * FP4_PACK // FP4_GROUP),
-                pl.ds(0, N),
-            ]
+            sc = sslot[pl.ds(g0, gq), pl.ds(0, N)]
         else:
-            sc, blk = _scale_rows(
-                sslot, c * FP4_PACK // FP4_GROUP, cw * FP4_PACK // FP4_GROUP, N, blk
-            )
+            sc, blk = _scale_rows(sslot, g0, gq, N, blk)
         if kperm > 0:
             w = _dequant_fp4_kperm(
-                wslot[pl.ds(c, cw), pl.ds(0, N)], sc, via_fp8=(kperm == 2)
+                wslot[pl.ds(c, cw), pl.ds(0, N)],
+                sc,
+                via_fp8=(kperm == 2),
+                out_fp8=(kperm >= 3),
             )
         else:
-            w = _dequant_fp4(wslot[pl.ds(c, cw), pl.ds(0, N)], sc)
+            w = _dequant_fp4(wslot[pl.ds(c, cw), pl.ds(0, N)], sc, via_fp8=via_fp8)
         lhs = (
             xb[:, c * FP4_PACK : (c + cw) * FP4_PACK]
             if xb is not None
@@ -1185,7 +1376,6 @@ class _Coll:
             send_sem=self.ssems.at[i],
             recv_sem=self.rsems.at[i],
             device_id=(peer,),
-            device_id_type=pl.DeviceIdType.MESH,
         )
 
     def _local(self, fn, issued):
@@ -1279,7 +1469,6 @@ class _Coll:
                         send_sem=self.pair_ssems.at[ik],
                         recv_sem=self.pair_rsems.at[ik],
                         device_id=(partner,),
-                        device_id_type=pl.DeviceIdType.MESH,
                     )
                     for c_k in range(4)
                 ]
@@ -1317,7 +1506,6 @@ class _Coll:
             send_sem=self.ssems.at[self.kinds[kind]],
             recv_sem=rsems.at[dst_slot],
             device_id=(peer,),
-            device_id_type=pl.DeviceIdType.MESH,
         )
 
     def all_gather_blocks_start(self, kind, src_ref, slot, rsems):
@@ -1338,7 +1526,6 @@ class _Coll:
                 send_sem=self.pair_ssems.at[ik],
                 recv_sem=rsems.at[self.me],
                 device_id=(partner,),
-                device_id_type=pl.DeviceIdType.MESH,
             ).start()
             for d in (1, 2, 3):
                 peer = 2 * jnp.bitwise_xor(chip, d) + core
@@ -1379,7 +1566,6 @@ class _Coll:
                             send_sem=self.pair_ssems.at[ik],
                             recv_sem=rsems.at[k_other],
                             device_id=(self.me,),
-                            device_id_type=pl.DeviceIdType.MESH,
                         ).wait_recv()
                         pltpu.make_async_remote_copy(
                             src_ref=src_ref,
@@ -1387,7 +1573,6 @@ class _Coll:
                             send_sem=self.pair_ssems.at[ik],
                             recv_sem=rsems.at[self.me],
                             device_id=(partner,),
-                            device_id_type=pl.DeviceIdType.MESH,
                         ).wait_send()
 
                     @pl.when(pg != chip)
@@ -1403,7 +1588,6 @@ class _Coll:
                             send_sem=self.pair_ssems.at[ik],
                             recv_sem=rsems.at[k_self],
                             device_id=(partner,),
-                            device_id_type=pl.DeviceIdType.MESH,
                         )
                         relay.start()
                         pltpu.make_async_remote_copy(
@@ -1412,7 +1596,6 @@ class _Coll:
                             send_sem=self.pair_ssems.at[ik],
                             recv_sem=rsems.at[k_other],
                             device_id=(self.me,),
-                            device_id_type=pl.DeviceIdType.MESH,
                         ).wait_recv()
                         relay.wait_send()
 
@@ -1571,11 +1754,11 @@ def route_blocks(c):
 
 
 def route_rows(c):
-    """vec_route table rows: uniq, count, offset, perm fields, then n_u, then blk_end."""
-    return -(-(4 * route_blocks(c) + 2) // 8) * 8
+    """vec_route table rows: uniq, count, offset, perm fields, then n_u, then blk_end (and blk_mid)."""
+    return -(-(4 * route_blocks(c) + 2 + bool(c.split_rows)) // 8) * 8
 
 
-def _route_table(ids_list, n_live, K, Ep, NB, pair_key, n_keys):
+def _route_table(ids_list, n_live, K, Ep, NB, pair_key, n_keys, split=0):
     """vec_route table ``[route_rows, LANE]`` int32 from per-slot expert ids ``K x [R, 1]``.
 
     Distinct experts are ordered by (the smallest ``pair_key`` [P, 1] of their
@@ -1584,9 +1767,11 @@ def _route_table(ids_list, n_live, K, Ep, NB, pair_key, n_keys):
     (row, slot)
     counts, 2 offsets into field 3, 3 pairs as ``row * K + slot`` grouped by
     expert; row 4*NB
-    the distinct count; row 4*NB+1 lane b the experts whose key is <= b. Prefix
-    sums run on
-    the MXU (0/1 and counts <= R*K are exact in bf16, summed in f32).
+    the distinct count; row 4*NB+1 lane b the experts whose key is <= b. With
+    ``split``, experts of more than ``split`` pairs sort after the others of their
+    key, and row 4*NB+2 lane b counts the experts before key b's large ones.
+    Prefix sums run on the MXU (0/1 and counts <= R*K are exact in bf16, summed in
+    f32).
     """
     R = ids_list[0].shape[0]
     P = R * K
@@ -1605,6 +1790,9 @@ def _route_table(ids_list, n_live, K, Ep, NB, pair_key, n_keys):
     key = jnp.min(
         jnp.where(hit, pair_key.astype(f32), big), axis=0, keepdims=True
     )  # [1, Ep]
+    mult = 2 if split else 1
+    if split:
+        key = 2 * key + jnp.where(count > split, 1.0, 0.0)
     e_row = jax.lax.broadcasted_iota(jnp.int32, (1, Ep), 1).astype(f32)
     # per-expert values as columns, padded to a lane tile so the transpose is tile-aligned
     cols = jnp.transpose(
@@ -1663,13 +1851,22 @@ def _route_table(ids_list, n_live, K, Ep, NB, pair_key, n_keys):
     n_u = jnp.sum(jnp.where(present, 1, 0), axis=1, keepdims=True)
     b_lane = jax.lax.broadcasted_iota(jnp.int32, (Ep, LANE), 1).astype(f32)
     blk_end = jnp.sum(
-        jnp.where((pres_c > 0) & (key_c <= b_lane), 1, 0), axis=0, keepdims=True
+        jnp.where((pres_c > 0) & (key_c <= mult * b_lane + mult - 1), 1, 0),
+        axis=0,
+        keepdims=True,
     )
-    n_rows = -(-(4 * NB + 2) // 8) * 8
+    tail = [jnp.broadcast_to(n_u, (1, LANE)), blk_end]
+    if split:
+        tail.append(
+            jnp.sum(
+                jnp.where((pres_c > 0) & (key_c <= 2 * b_lane), 1, 0),
+                axis=0,
+                keepdims=True,
+            )
+        )
+    n_rows = -(-(4 * NB + len(tail)) // 8) * 8
     return jnp.concatenate(
-        rows
-        + [jnp.broadcast_to(n_u, (1, LANE)), blk_end]
-        + [jnp.zeros((n_rows - 4 * NB - 2, LANE), jnp.int32)],
+        rows + tail + [jnp.zeros((n_rows - 4 * NB - len(tail), LANE), jnp.int32)],
         axis=0,
     )
 
@@ -1752,29 +1949,36 @@ _SHARED_SCRATCH = (
 )
 
 
-def _alias_attn_p_ysend(c: MKConfig) -> bool:
-    """Whether piped attention's probabilities can borrow ysend (disjoint lifetimes)."""
+def _attn_p_ysend_streams(c: MKConfig) -> int:
+    """How many piped-attention streams can borrow ysend (disjoint lifetimes)."""
     cpt = c.chunk_pages * c.page_size
-    return (
+    if not (
         c.alias_p
-        and c.row_tile > 0
-        and c.tiled_vmem_y >= 1
+        and (c.row_tile == 0 or c.tiled_vmem_y >= 1)
         and c.attn_pipe
         and c.kv_sal
-        and c.attn_streams * c.rows_per_req <= c.rows
         and 2 * cpt <= c.expert_hidden // 2
         and cpt % LANE == 0
         and c.kv_heads * c.g == 2 * c.top_k
-    )
+    ):
+        return 0
+    return min(c.attn_streams, c.rows // c.rows_per_req)
+
+
+def _alias_attn_p_ysend(c: MKConfig) -> bool:
+    """Whether all piped-attention probabilities borrow ysend."""
+    return c.attn_pipe and _attn_p_ysend_streams(c) == c.attn_streams
 
 
 def _alias_pads_into_y(c: MKConfig) -> bool:
     """Whether pad_o_rs and pad_o_ag can borrow pad_y (pool_ag + f_ag separate lifetimes)."""
+    few = c.single_row_coll and c.n_req * c.rows_per_req <= c.few_rows_max
     return (
         c.alias_oy
-        and c.row_tile > 0
-        and c.tiled_vmem_pads
-        and c.tiled_vmem_y >= 2
+        and (
+            (c.row_tile == 0 and c.ex_opt and not few)
+            or (c.row_tile > 0 and c.tiled_vmem_pads and c.tiled_vmem_y >= 2)
+        )
         and c.rows_per_dev * c.top_k == c.rows
         and c.top_k == 8
         and (c.expert_hidden // 2) == 4 * (c.hidden_local // 2)
@@ -1986,15 +2190,26 @@ def _scratch_plan_base(cfg: MKConfig):
                 jnp.bfloat16,
             ),
         ),
-        # one per ring slot: a chunk's page copies all signal it, one wait takes the chunk
-        ("kv_chunk_sems", pltpu.SemaphoreType.DMA((c.kv_ring,))),
+        # one per (sub-)slot: a chunk's page copies all signal it, one wait takes the chunk
+        (
+            "kv_chunk_sems",
+            pltpu.SemaphoreType.DMA(
+                (
+                    max(c.kv_ring, 2 * c.swa_kv_group)
+                    if c.swa_chunk_pages
+                    else c.kv_ring,
+                )
+            ),
+        ),
         # attn_pipe: probabilities of the chunks in flight, double-buffered by loop iteration
         (
             "attn_p",
-            pltpu.VMEM(
+            pltpu.VMEM((1, 1, 8, LANE), jnp.bfloat16)
+            if _alias_attn_p_ysend(c)
+            else pltpu.VMEM(
                 (
                     2,
-                    c.attn_streams if c.attn_pipe else 1,
+                    (c.attn_streams - _attn_p_ysend_streams(c)) if c.attn_pipe else 1,
                     c.kv_heads * c.rows_per_req * c.g,
                     c.chunk_pages * c.page_size if c.attn_pipe else LANE,
                 ),
@@ -2018,8 +2233,12 @@ def _scratch_plan_base(cfg: MKConfig):
         ("ex_pos", pltpu.SMEM((R * K + 8,), jnp.int32)),
         ("perm", pltpu.SMEM((R * K + 8,), jnp.int32)),
         ("ex_of", pltpu.SMEM((c.n_experts_padded,), jnp.int32)),
-        ("xfull", pltpu.VMEM((R, He), jnp.float32)),
-        ("rank", pltpu.VMEM((R, c.n_experts_padded), jnp.int32)),
+        (
+            "xfull",
+            pltpu.VMEM((R, He // 2), jnp.uint32)
+            if c.xfull_packed
+            else pltpu.VMEM((R, He), jnp.float32),
+        ),
         ("ids_v", pltpu.VMEM((R, LANE), jnp.int32)),
         ("ids_s", pltpu.SMEM((R, LANE), jnp.int32)),
         ("ids_sem", pltpu.SemaphoreType.DMA((1,))),
@@ -2030,8 +2249,6 @@ def _scratch_plan_base(cfg: MKConfig):
         ("route_s", pltpu.SMEM((route_rows(c), LANE), jnp.int32)),
         ("route_sem", pltpu.SemaphoreType.DMA((1,))),
         # collective pads: bf16 pairs packed into u32 (_pack_bf16x2)
-        ("pad_o_rs", pltpu.VMEM((c.tp, R, c.hidden_local // 2), jnp.uint32)),
-        ("pad_o_ag", pltpu.VMEM((c.tp, R, c.hidden_local // 2), jnp.uint32)),
         (
             "pad_pool",
             pltpu.VMEM((c.tp, R, c.expert_hidden_local // 2), jnp.uint32),
@@ -2039,15 +2256,33 @@ def _scratch_plan_base(cfg: MKConfig):
         ("pad_y", pltpu.VMEM((c.tp, c.rows_per_dev, K, He // 2), jnp.uint32)),
         ("pad_u", pltpu.VMEM((c.tp, c.rows_per_dev, He // 2), jnp.uint32)),
         ("pad_f", pltpu.VMEM((c.tp, R, c.hidden_local // 2), jnp.uint32)),
-        ("row1_send", pltpu.VMEM((few_rows(c), H // 2), jnp.uint32)),
-        ("pad_o1", pltpu.VMEM((c.tp, few_rows(c), H // 2), jnp.uint32)),
-        (
-            "pad_f1",
-            pltpu.VMEM((c.tp, few_rows(c), c.hidden_local // 2), jnp.uint32),
-        ),
         ("coll_ssems", pltpu.SemaphoreType.DMA((8,))),
         ("coll_rsems", pltpu.SemaphoreType.DMA((8,))),
     ]
+    if not (c.ex_opt and c.topk_iter):
+        items += [("rank", pltpu.VMEM((R, c.n_experts_padded), jnp.int32))]
+    if not _alias_pads_into_y(c):
+        items += [
+            ("pad_o_rs", pltpu.VMEM((c.tp, R, c.hidden_local // 2), jnp.uint32)),
+            ("pad_o_ag", pltpu.VMEM((c.tp, R, c.hidden_local // 2), jnp.uint32)),
+        ]
+    if not (
+        c.ex_opt
+        and not (c.single_row_coll and c.n_req * c.rows_per_req <= c.few_rows_max)
+    ):
+        items += [
+            ("row1_send", pltpu.VMEM((few_rows(c), H // 2), jnp.uint32)),
+            ("pad_o1", pltpu.VMEM((c.tp, few_rows(c), H // 2), jnp.uint32)),
+            (
+                "pad_f1",
+                pltpu.VMEM((c.tp, few_rows(c), c.hidden_local // 2), jnp.uint32),
+            ),
+        ]
+    if c.pair_ag >= 1:
+        items += [
+            ("pair_ssems", pltpu.SemaphoreType.DMA((8,))),
+            ("pair_rsems", pltpu.SemaphoreType.DMA((8,))),
+        ]
     if c.fold_f or c.fold_o:
         items += [
             # fold LHS: the stream part [R, H] and per-column gains (row 0)
@@ -2062,6 +2297,9 @@ def _scratch_plan_base(cfg: MKConfig):
             # the fp8 layers' bf16 channel scales, which the e4m3 slabs cannot hold
             ("w13c", pltpu.VMEM((nslot, 2, 2 * Il), jnp.bfloat16)),
             ("w2c", pltpu.VMEM((nslot, 2, He), jnp.bfloat16)),
+        ]
+    if c.scale_fp8 or c.ex_kperm >= 3:
+        items += [
             # this layer's (gate, up, down) globals, one expert per lane
             ("gs_v", pltpu.VMEM((8, c.n_experts_padded), jnp.float32)),
         ]
@@ -2154,8 +2392,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
         tp_rank = meta_ref[1]
         me = jax.lax.axis_index(axis) if c.tp > 1 else 0
         can_pair_fold = bool(
-            c.row_tile
-            and c.pair_ag >= 1
+            c.pair_ag >= 1
             and c.tp == 8
             and all(_fold_g(c, g) == 2 for g in fold_groups(c))
         )
@@ -2187,7 +2424,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             S.get("coll_rsems"),
             order=c.coll_order,
             local_last=c.coll_local_last,
-            pair_ag=c.pair_ag if c.row_tile else 0,
+            pair_ag=c.pair_ag,
             pair_ssems=S.get("pair_ssems"),
             pair_rsems=S.get("pair_rsems"),
             can_pair_fold=can_pair_fold,
@@ -2247,7 +2484,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 pl.semaphore_signal(
                     barrier,
                     device_id=(jnp.mod(me + d, c.tp),),
-                    device_id_type=pl.DeviceIdType.MESH,
                 )
             pl.semaphore_wait(barrier, c.tp - 1)
 
@@ -2474,7 +2710,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
 
             in flight (fold_pool_router consumes it).
             """
-            kv_prologue(l, 0, is_global)
+            per_geom(is_global, lambda geo: kv_prologue(geo, l, 0))
+            fill_preones()
             with _scope("qkvg_mv"):
                 qkvg = qkvg_fn()
             qd, kd = c.q_dim, c.kv_dim
@@ -2555,11 +2792,14 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             with _scope("attn_core"):
                 n_req_live = jnp.minimum((n_live + q - 1) // q, c.n_req)
 
-                def req_loop(j, carry):
-                    request_attention_body(l, j, is_global, n_req_live)
-                    return carry
+                def run_geom(geo):
+                    def req_loop(j, carry):
+                        request_attention_body(geo, l, j, n_req_live)
+                        return carry
 
-                jax.lax.fori_loop(0, n_req_live, req_loop, 0)
+                    jax.lax.fori_loop(0, n_req_live, req_loop, 0)
+
+                per_geom(is_global, run_geom)
                 kv_out_cp.wait()
             attn = S["attn_buf"][...]
             attn = (
@@ -2604,33 +2844,57 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             with _scope("o_allreduce"):
                 return allreduce(o)
 
-        def req_geom(j, is_global):
+        def req_geom(geo, j):
             """First cache chunk and chunk count of request j (cached keys: [first_tok, p_lo))."""
+            cpt_g = geo.cp * ps
             r0 = j * q
             p_lo = pos_ref[r0]
-            first_tok = jnp.where(is_global, 0, jnp.maximum(p_lo - c.window + 1, 0))
-            first_ch = first_tok // cpt
+            first_tok = _sel(geo.is_global, 0, jnp.maximum(p_lo - c.window + 1, 0))
+            first_ch = first_tok // cpt_g
             n_ch = jnp.where(
                 jnp.logical_and(r0 < n_live, p_lo > 0),
-                (p_lo - 1) // cpt - first_ch + 1,
+                (p_lo - 1) // cpt_g - first_ch + 1,
                 0,
             )
             return p_lo, first_ch, n_ch
 
         KR = c.kv_ring
+        KG = KR // 2
+        geo_global = _AttnGeom(c.chunk_pages, KG, KR, True)
+        if c.swa_chunk_pages:
+            geo_swa = _AttnGeom(
+                c.swa_chunk_pages, c.swa_kv_group, 2 * c.swa_kv_group, False
+            )
 
-        def chunk_pages_of(j, ci, is_global):
+        def per_geom(is_global, fn):
+            """``fn(geometry)`` for a layer: one shared body, or with swa_chunk_pages a body per layer type."""
+            if not c.swa_chunk_pages:
+                fn(_AttnGeom(c.chunk_pages, KG, KR, is_global))
+            elif isinstance(is_global, bool):
+                fn(geo_global if is_global else geo_swa)
+            else:
+                pl.when(is_global)(lambda: fn(geo_global))
+                pl.when(jnp.logical_not(is_global))(lambda: fn(geo_swa))
+
+        def ring_at(geo, slot, pi):
+            """Ring entry and page of page ``pi`` of chunk slot ``slot``."""
+            f = c.chunk_pages // geo.cp
+            if f == 1:
+                return slot, pi
+            return slot // f, (slot % f) * geo.cp + pi
+
+        def chunk_pages_of(geo, j, ci):
             pages = []
-            for pi in range(c.chunk_pages):
-                pg_no = ci * c.chunk_pages + pi
+            for pi in range(geo.cp):
+                pg_no = ci * geo.cp + pi
                 ent = jnp.minimum(
                     j * c.pages_per_seq + jnp.minimum(pg_no, c.pages_per_seq - 1),
                     c.n_pages_entries - 1,
                 )
-                pages.append(jnp.where(is_global, pf_ref[ent], psw_ref[ent]))
+                pages.append(_sel(geo.is_global, pf_ref[ent], psw_ref[ent]))
             return pages
 
-        def issue_range(l, j, ci0, slot0, n, is_global):
+        def issue_range(geo, l, j, ci0, slot0, n):
             """Chunks ``ci0 ..
 
             ci0+n`` of request j into ring slots ``slot0 ..``: ONE layer branch-tree
@@ -2640,18 +2904,21 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
 
             def leaf(ref):
                 def one(u, carry):
-                    slot = (slot0 + u) % KR
-                    for pi, page in enumerate(chunk_pages_of(j, ci0 + u, is_global)):
+                    slot = (slot0 + u) % geo.kr
+                    for pi, page in enumerate(chunk_pages_of(geo, j, ci0 + u)):
                         pltpu.make_async_copy(
                             page_src(ref, page),
-                            chunk_dst(slot, pi),
+                            chunk_dst(geo, slot, pi),
                             S["kv_chunk_sems"].at[slot],
                         ).start()
                     return carry
 
                 jax.lax.fori_loop(0, n, one, 0)
 
-            _dispatch(l, KV, leaf)
+            only = None
+            if isinstance(geo.is_global, bool) and c.swa_chunk_pages:
+                only = [x for x in range(c.n_layers) if (x in gl) == geo.is_global]
+            _dispatch(l, KV, leaf, only)
 
         def kv_ring_ref():
             """The KV chunk ring.
@@ -2665,9 +2932,57 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 return S["w13"].reshape(c.kv_ring, c.sal_words, c.chunk_pages * ps)
             return S["kv_chunk"]
 
-        def chunk_dst(slot, pi):
+        use_po = c.use_sal_preones
+
+        def w13_flat():
+            return S["w13"].reshape(
+                (c.expert_depth + 1) * (c.expert_hidden // FP4_PACK), cpt
+            )
+
+        def po_row(slot, off=0):
+            if isinstance(slot, int):
+                return slot * PREONES_ROWS + off
+            return pl.multiple_of(slot * PREONES_ROWS + off, 8)
+
+        def ring_words(geo, slot, off=0, n=None):
+            """u32 rows [off, off + n) of a ring chunk (n: sal_words) as a ref."""
+            n = c.sal_words if n is None else n
+            e, p = ring_at(geo, slot, 0)
+            if use_po:
+                if geo.cp == c.chunk_pages:
+                    return w13_flat().at[pl.ds(po_row(e, off), n), :]
+                return w13_flat().at[
+                    pl.ds(po_row(e, off), n),
+                    pl.ds(pl.multiple_of(p * ps, LANE), geo.cp * ps),
+                ]
+            if geo.cp == c.chunk_pages:
+                if off == 0 and n == c.sal_words:
+                    return kv_ring_ref().at[e]
+                return kv_ring_ref().at[e, pl.ds(off, n), :]
+            if off == 0 and n == c.sal_words:
+                return kv_ring_ref().at[
+                    e, :, pl.ds(pl.multiple_of(p * ps, LANE), geo.cp * ps)
+                ]
+            return kv_ring_ref().at[
+                e, pl.ds(off, n), pl.ds(pl.multiple_of(p * ps, LANE), geo.cp * ps)
+            ]
+
+        def fill_preones():
+            """The fp8 ones rows of every attn_preones ring chunk (page DMAs never touch them)."""
+            if not use_po:
+                return
+            ones = jnp.full((8, cpt), _FP8_ONES_WORD, jnp.uint32)
+            wf = w13_flat()
+            for sl in range(KR):
+                wf[pl.ds(sl * PREONES_ROWS + c.sal_words, 8), :] = ones
+
+        def chunk_dst(geo, slot, pi):
+            if use_po:
+                e, p = ring_at(geo, slot, pi)
+                return w13_flat().at[pl.ds(po_row(e), c.sal_words), pl.ds(p * ps, ps)]
             if c.kv_sal:
-                return kv_ring_ref().at[slot, pl.ds(0, c.sal_words), pl.ds(pi * ps, ps)]
+                e, p = ring_at(geo, slot, pi)
+                return kv_ring_ref().at[e, :, pl.ds(p * ps, ps)]
             return S["kv_chunk"].at[slot, pi]
 
         def page_src(ref, page):
@@ -2675,16 +2990,20 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 return ref.at[page].bitcast(jnp.uint32).reshape(c.sal_words, ps)
             return ref.at[page]
 
-        def wait_chunk(slot):
+        def wait_chunk(geo, slot):
+            if use_po or c.kv_sal:
+                r = ring_words(geo, slot)
+                pltpu.make_async_copy(r, r, S["kv_chunk_sems"].at[slot]).wait()
+                return
             ring = kv_ring_ref()
             pltpu.make_async_copy(
                 ring.at[slot], ring.at[slot], S["kv_chunk_sems"].at[slot]
             ).wait()
 
-        def kv_prologue(l, j, is_global):
-            # the request's first kv_ring chunks
-            _, first_ch, n_ch = req_geom(j, is_global)
-            issue_range(l, j, first_ch, 0, jnp.minimum(n_ch, KR), is_global)
+        def kv_prologue(geo, l, j):
+            # the request's first geo.kr chunks
+            _, first_ch, n_ch = req_geom(geo, j)
+            issue_range(geo, l, j, first_ch, 0, jnp.minimum(n_ch, geo.kr))
 
         def rows_at(ref, r0, n):
             """``n`` rows from a dynamic start: one-row accesses, as a multi-row dynamic sublane
@@ -2697,7 +3016,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 else ref[pl.ds(r0, 1), :]
             )
 
-        def request_attention_body(l, j, is_global, n_req_live):
+        def request_attention_body(geo, l, j, n_req_live):
             """Both local KV heads in one MXU op per step: the query rows of all heads are
 
             stacked ``[hkv*q*g, .]`` (rows ``(h, t, gi)``). Padded pools: scored
@@ -2710,9 +3029,10 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             same-head
             pairs: one key row per token and no head mask.
             """
+            is_global, KR_g, cpt_g = geo.is_global, geo.kr, geo.cp * ps
             r0 = pl.multiple_of(j * q, q)
             qg = q * g
-            p_lo, first_ch, n_ch = req_geom(j, is_global)
+            p_lo, first_ch, n_ch = req_geom(geo, j)
             qrows = rows_at(S["qn_s"], r0, q)  # [q, q_dim]
 
             def qrow(h, t, gi):
@@ -2735,7 +3055,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             )  # [hkv*qg, hd or pd] f32
             if c.attn_exp2:  # scores in log2 units: p = exp2(score)
                 q2, sc = (q2_raw * (c.attn_scale * LOG2E)).astype(jnp.bfloat16), 1.0
-            elif c.attn_unshifted:  # power-of-two scale: exact
+            elif c.attn_unshifted or c.fold_attn_scale:  # power-of-two scale: exact
                 q2 = q2_raw.astype(jnp.bfloat16) * jnp.asarray(
                     c.attn_scale, jnp.bfloat16
                 )
@@ -2755,7 +3075,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 jnp.zeros((hkv * qg, LANE if c.attn_unshifted else 1), jnp.float32),
                 jnp.zeros((hkv * qg, c.attn_width), jnp.float32),
             )
-            col = jax.lax.broadcasted_iota(jnp.int32, (1, cpt * ph), 1)
+            col = jax.lax.broadcasted_iota(jnp.int32, (1, cpt_g * ph), 1)
             colhead = col % ph
             coltok = col // ph
             kdim = pd if c.packed_attn else hd
@@ -2792,12 +3112,12 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 return m_new, lsum, acc
 
             def sal_unpack(slot):
-                """A ring chunk -> K, V as [kv_dim, cpt], rows h * hd + dim, tokens on lanes."""
+                """A ring chunk -> K, V as [kv_dim, cpt_g], rows h * hd + dim, tokens on lanes."""
                 fp8_k = c.kv_sal_fp8 and c.sal_fp8_dot >= 1
                 fp8_v = c.kv_sal_fp8 and c.sal_fp8_dot >= 2
                 x8 = pltpu.bitcast(
-                    kv_ring_ref()[slot], c.kv_dtype
-                )  # [2 * kv_heads * hd, cpt]
+                    ring_words(geo, slot)[...], c.kv_dtype
+                )  # [2 * kv_heads * hd, cpt_g]
                 xb = None if (fp8_k and fp8_v) else x8.astype(jnp.bfloat16)
                 xk, xv = (x8 if fp8_k else xb), (x8 if fp8_v else xb)
                 kk = jnp.concatenate(
@@ -2816,7 +3136,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         S["kv_chunk"]
                         .at[slot]
                         .bitcast(jnp.uint32)
-                        .reshape(cpt * ph, pd)[...]
+                        .reshape(cpt_g * ph, pd)[...]
                     )  # rows (token, h)
                     # u32 -> u16 truncation keeps the low half
                     kk = pltpu.bitcast(u.astype(jnp.uint16), jnp.bfloat16)
@@ -2837,27 +3157,30 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
 
                 every row and skip the position and window masks.
                 """
-                slot = i % KR
+                slot = i % KR_g
                 ci = first_ch + i
                 kk, vk = chunk_kv(slot)
                 live = None if c.packed_attn else colhead == rowhead
                 if not clean:
-                    keypos = coltok + ci * cpt
-                    pos_live = (keypos < p_lo) & (keypos <= rowpos) & valid
-                    pos_live = pos_live & jnp.logical_or(
-                        is_global, rowpos - keypos < c.window
-                    )
+                    keypos = coltok + ci * cpt_g
+                    if c.attn_col_mask and is_global is True:
+                        pos_live = (keypos < p_lo) & valid
+                    else:
+                        pos_live = (keypos < p_lo) & (keypos <= rowpos) & valid
+                        in_win = _in_window(is_global, rowpos - keypos < c.window)
+                        if in_win is not None:
+                            pos_live = pos_live & in_win
                     live = pos_live if live is None else live & pos_live
                 with _scope("qk"):
                     s_ = qk(kk)
                 return (s_ if live is None else jnp.where(live, s_, NEG)), vk
 
             def refill(ref, v):
-                """Chunk v (clamped to the last one) into ring slot v % KR."""
-                slot = v % KR
+                """Chunk v (clamped to the last one) into ring slot v % KR_g."""
+                slot = v % KR_g
                 ci = first_ch + jnp.minimum(v, n_ch - 1)
-                for pi in range(c.chunk_pages):
-                    pg_no = ci * c.chunk_pages + pi
+                for pi in range(geo.cp):
+                    pg_no = ci * geo.cp + pi
                     ent = jnp.minimum(
                         j * c.pages_per_seq + jnp.minimum(pg_no, c.pages_per_seq - 1),
                         c.n_pages_entries - 1,
@@ -2865,7 +3188,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     page = pf_ref[ent]  # a global layer's table
                     pltpu.make_async_copy(
                         page_src(ref, page),
-                        chunk_dst(slot, pi),
+                        chunk_dst(geo, slot, pi),
                         S["kv_chunk_sems"].at[slot],
                     ).start()
 
@@ -2873,23 +3196,29 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 """Chunks 2k, 2k+1 as two independent online-softmax streams (two dependency
 
                 chains for the scheduler). With ref, the two slots just read take chunks
-                2k + KR, 2k + 1 + KR, issued straight-line so the copies' scalar work
-                overlaps
-                the vector work (a branch-tree walk to the layer's pool would split the
-                block).
+                2k + KR_g, 2k + 1 + KR_g, issued straight-line so the copies' scalar work
+                overlaps the vector work.
                 """
                 i0, i1 = 2 * k, 2 * k + 1
                 valid_b = i1 < n_ch
                 with _scope("kv_wait"):
-                    wait_chunk(i0 % KR)
+                    wait_chunk(geo, i0 % KR_g)
 
                     @pl.when(
                         valid_b
                     )  # an odd tail re-reads chunk i0, already waited for
                     def _():
-                        wait_chunk(i1 % KR)
+                        wait_chunk(geo, i1 % KR_g)
 
                 s_a, v_a = chunk_scores(i0, True, clean)
+                if c.attn_skip_idle_streams and not clean and ref is None:
+                    carry_b = jax.lax.cond(
+                        valid_b,
+                        lambda cr: online(cr, *chunk_scores(i1, True, False), c.kv_sal),
+                        lambda cr: cr,
+                        carry2[1],
+                    )
+                    return online(carry2[0], s_a, v_a, c.kv_sal), carry_b
                 s_b, v_b = chunk_scores(
                     i1 if clean else jnp.minimum(i1, n_ch - 1), valid_b, clean
                 )
@@ -2898,238 +3227,573 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     online(carry2[1], s_b, v_b, c.kv_sal),
                 )
                 if ref is not None:
-                    refill(ref, i0 + KR)
-                    refill(ref, i1 + KR)
+                    refill(ref, i0 + KR_g)
+                    refill(ref, i1 + KR_g)
                 return out
 
             # Global-layer chunks before a request's last one lie wholly in the past of every
             # verify row: chunks [0, n_clean) need only the cross-head mask.
-            n_clean = jnp.where(is_global, jnp.maximum(n_ch - 1, 0), 0)
-            # The first KR chunks come from kv_prologue. Global pairs [0, k_ref) refill the
-            # rest: all real chunks but the very last refill when n_ch - KR is odd (a copy of
-            # the last chunk, drained after the loops). Sliding-window layers never refill:
-            # their chunks fit the ring (validate()).
-            k_ref = jnp.clip((n_ch - KR + 1) // 2, 0, n_clean // 2)
-            extra = (k_ref > 0) & (2 * k_ref - 1 + KR >= n_ch)
-
-            def refill_loop(ref):
-                return jax.lax.fori_loop(
-                    0, k_ref, functools.partial(body, ref=ref, clean=True), (init, init)
-                )
-
-            def branch_layers(ids, fns):
-                """fns[i]() for l == ids[i], through a balanced tree of two-way branches."""
-                if len(fns) == 1:
-                    return fns[0]()
-                mid = len(fns) // 2
-                return jax.lax.cond(
-                    l < ids[mid],
-                    lambda: branch_layers(ids[:mid], fns[:mid]),
-                    lambda: branch_layers(ids[mid:], fns[mid:]),
-                )
-
+            n_clean = _sel(is_global, jnp.maximum(n_ch - 1, 0), 0)
             NS = c.attn_streams
             gls = sorted(c.global_layers)
-            alias_p = _alias_attn_p_ysend(c)
+            n_alias_p = _attn_p_ysend_streams(c)
 
-            def p_get(par, t):
-                if not alias_p:
-                    return S["attn_p"][par, t]
-                c0 = (
-                    par * cpt
-                    if isinstance(par, int)
-                    else pl.multiple_of(par * cpt, LANE)
-                )
-                return (
-                    S["ysend"]
-                    .bitcast(jnp.bfloat16)[pl.ds(t * q, q), :, pl.ds(c0, cpt)]
-                    .reshape(hkv * qg, cpt)
-                )
+            if not isinstance(n_clean, int):
+                # The first KR_g chunks come from kv_prologue. Global pairs [0, k_ref) refill the
+                # rest: all real chunks but the very last refill when n_ch - KR_g is odd (a copy of
+                # the last chunk, drained after the loops). Sliding-window layers never refill.
+                k_ref = jnp.clip((n_ch - KR_g + 1) // 2, 0, n_clean // 2)
+                extra = (k_ref > 0) & (2 * k_ref - 1 + KR_g >= n_ch)
 
-            def p_put(par, t, pb):
-                if not alias_p:
-                    S["attn_p"][par, t] = pb
-                    return
-                c0 = (
-                    par * cpt
-                    if isinstance(par, int)
-                    else pl.multiple_of(par * cpt, LANE)
-                )
-                S["ysend"].bitcast(jnp.bfloat16)[pl.ds(t * q, q), :, pl.ds(c0, cpt)] = (
-                    pb.reshape(q, 2 * c.top_k, cpt)
-                )
-
-            def qk_exp(i, lsum):
-                """Probabilities (bf16) of clean chunk i and the lane partials of their row sums."""
-                kk, _ = chunk_kv(i % KR)
-                with _scope("qk"):
-                    s_ = qk(kk)
-                with _scope("softmax"):
-                    pexp = jnp.exp2(s_) if c.attn_exp2 else jnp.exp(s_)
-                    for lt in range(cpt // LANE):
-                        lsum = lsum + pexp[:, lt * LANE : (lt + 1) * LANE]
-                return pexp.astype(jnp.bfloat16), lsum
-
-            def pv_chunk(i, pb):
-                _, vk = chunk_kv(i % KR)
-                with _scope("pv"):
-                    return pv(pb, vk, c.kv_sal)
-
-            def refill_global(v0):
-                """Chunks [v0, v0 + NS) that exist into their ring slots: one walk over the global
-
-                layers' pools, its leaf a small loop.
-                """
-                n = jnp.clip(n_ch - v0, 0, NS)
-
-                def leaf(ref):
-                    def one(u, carry):
-                        v = v0 + u
-                        for pi in range(c.chunk_pages):
-                            ent = jnp.minimum(
-                                j * c.pages_per_seq
-                                + jnp.minimum(
-                                    (first_ch + v) * c.chunk_pages + pi,
-                                    c.pages_per_seq - 1,
-                                ),
-                                c.n_pages_entries - 1,
-                            )
-                            pltpu.make_async_copy(
-                                page_src(ref, pf_ref[ent]),
-                                chunk_dst(v % KR, pi),
-                                S["kv_chunk_sems"].at[v % KR],
-                            ).start()
-                        return carry
-
-                    jax.lax.fori_loop(0, n, one, 0)
-
-                @pl.when(n > 0)
-                def _():
-                    _dispatch(l, KV, leaf, only=gls)
-
-            def refill_slot(ref, v):
-                """Chunk v (known < n_ch) into ring slot v % KR, straight-line."""
-                slot = v % KR
-                ci = first_ch + v
-                for pi in range(c.chunk_pages):
-                    pg_no = ci * c.chunk_pages + pi
-                    ent = jnp.minimum(
-                        j * c.pages_per_seq + jnp.minimum(pg_no, c.pages_per_seq - 1),
-                        c.n_pages_entries - 1,
-                    )
-                    pltpu.make_async_copy(
-                        page_src(ref, pf_ref[ent]),
-                        chunk_dst(slot, pi),
-                        S["kv_chunk_sems"].at[slot],
-                    ).start()
-
-            def pipelined_opt(n_it):
-                """Hoisted straight-line KV refill + 2-acc PV/QK pipeline (stack2 for q<=4)."""
-                M = hkv * qg
-                use_fp8_q = (
-                    c.attn_opt == 4
-                    and c.attn_exp2
-                    and c.kv_sal_fp8
-                    and c.sal_fp8_dot >= 1
-                )
-                if use_fp8_q:
-                    q_scaled = q2_raw * (c.attn_scale * LOG2E)
-                    q_max = jnp.maximum(
-                        jnp.max(jnp.abs(q_scaled), axis=1, keepdims=True), 1e-12
-                    )
-                    q_sc = q_max * (1.0 / 256.0)
-                    q_lhs = (q_scaled / q_sc).astype(jnp.float8_e4m3fn)
-                else:
-                    q_lhs = q2
-                    q_sc = sc
-                use_stack2 = M <= 64 and NS % 2 == 0
-                if use_stack2:
-                    zq = jnp.zeros((M, q_lhs.shape[1]), q_lhs.dtype)
-                    q2_blk = jnp.concatenate(
-                        [
-                            jnp.concatenate([q_lhs, zq], axis=1),
-                            jnp.concatenate([zq, q_lhs], axis=1),
-                        ],
-                        axis=0,
+                def refill_loop(ref):
+                    return jax.lax.fori_loop(
+                        0,
+                        k_ref,
+                        functools.partial(body, ref=ref, clean=True),
+                        (init, init),
                     )
 
-                def qk_exp_opt(i, lsum):
-                    kk, _ = chunk_kv(i % KR)
+                def branch_layers(ids, fns):
+                    """fns[i]() for l == ids[i], through a balanced tree of two-way branches."""
+                    if len(fns) == 1:
+                        return fns[0]()
+                    mid = len(fns) // 2
+                    return jax.lax.cond(
+                        l < ids[mid],
+                        lambda: branch_layers(ids[:mid], fns[:mid]),
+                        lambda: branch_layers(ids[mid:], fns[mid:]),
+                    )
+
+                def p_get(par, t):
+                    if t >= n_alias_p:
+                        return S["attn_p"][par, t - n_alias_p]
+                    c0 = (
+                        par * cpt_g
+                        if isinstance(par, int)
+                        else pl.multiple_of(par * cpt_g, LANE)
+                    )
+                    return (
+                        S["ysend"]
+                        .bitcast(jnp.bfloat16)[pl.ds(t * q, q), :, pl.ds(c0, cpt_g)]
+                        .reshape(hkv * qg, cpt_g)
+                    )
+
+                def p_put(par, t, pb):
+                    if t >= n_alias_p:
+                        S["attn_p"][par, t - n_alias_p] = pb
+                        return
+                    c0 = (
+                        par * cpt_g
+                        if isinstance(par, int)
+                        else pl.multiple_of(par * cpt_g, LANE)
+                    )
+                    S["ysend"].bitcast(jnp.bfloat16)[
+                        pl.ds(t * q, q), :, pl.ds(c0, cpt_g)
+                    ] = pb.reshape(q, 2 * c.top_k, cpt_g)
+
+                def qk_exp(i, lsum):
+                    """Probabilities (bf16) of clean chunk i and the lane partials of their row sums."""
+                    kk, _ = chunk_kv(i % KR_g)
                     with _scope("qk"):
-                        s_ = jax.lax.dot_general(
-                            q_lhs,
-                            kk,
-                            (((1,), (0,)), ((), ())),
-                            preferred_element_type=jnp.float32,
-                        )
-                        if use_fp8_q or q_sc != 1.0:
-                            s_ = s_ * q_sc
+                        s_ = qk(kk)
                     with _scope("softmax"):
                         pexp = jnp.exp2(s_) if c.attn_exp2 else jnp.exp(s_)
-                        for lt in range(cpt // LANE):
+                        for lt in range(cpt_g // LANE):
                             lsum = lsum + pexp[:, lt * LANE : (lt + 1) * LANE]
                     return pexp.astype(jnp.bfloat16), lsum
 
-                def qk_pair(i_a, i_b, ls0, ls1):
-                    ka, _ = chunk_kv(i_a % KR)
-                    kb_, _ = chunk_kv(i_b % KR)
-                    k_cat = jnp.concatenate([ka, kb_], axis=0)
-                    with _scope("qk"):
-                        sb = jax.lax.dot_general(
-                            q2_blk,
-                            k_cat,
-                            (((1,), (0,)), ((), ())),
-                            preferred_element_type=jnp.float32,
-                        )
-                        sa, sb_ = sb[:M], sb[M:]
-                        if use_fp8_q or q_sc != 1.0:
-                            sa, sb_ = sa * q_sc, sb_ * q_sc
-                    with _scope("softmax"):
-                        pa = jnp.exp2(sa) if c.attn_exp2 else jnp.exp(sa)
-                        pb = jnp.exp2(sb_) if c.attn_exp2 else jnp.exp(sb_)
-                        for lt in range(cpt // LANE):
-                            ls0 = ls0 + pa[:, lt * LANE : (lt + 1) * LANE]
-                            ls1 = ls1 + pb[:, lt * LANE : (lt + 1) * LANE]
-                    return pa.astype(jnp.bfloat16), pb.astype(jnp.bfloat16), ls0, ls1
-
-                def pv_pair(i_a, i_b, pa_b, pb_b):
-                    _, va = chunk_kv(i_a % KR)
-                    _, vb_ = chunk_kv(i_b % KR)
-                    p_cat = jnp.concatenate([pa_b, pb_b], axis=1)
-                    v_cat = jnp.concatenate([va, vb_], axis=1)
+                def pv_chunk(i, pb):
+                    _, vk = chunk_kv(i % KR_g)
                     with _scope("pv"):
-                        return jax.lax.dot_general(
-                            p_cat,
-                            v_cat,
-                            (((1,), (1,)), ((), ())),
-                            preferred_element_type=jnp.float32,
+                        return pv(pb, vk, c.kv_sal)
+
+                def refill_global(v0):
+                    """Chunks [v0, v0 + NS) that exist into their ring slots: one walk over the global
+
+                    layers' pools, its leaf a small loop.
+                    """
+                    n = jnp.clip(n_ch - v0, 0, NS)
+
+                    def leaf(ref):
+                        def one(u, carry):
+                            v = v0 + u
+                            for pi in range(geo.cp):
+                                ent = jnp.minimum(
+                                    j * c.pages_per_seq
+                                    + jnp.minimum(
+                                        (first_ch + v) * geo.cp + pi,
+                                        c.pages_per_seq - 1,
+                                    ),
+                                    c.n_pages_entries - 1,
+                                )
+                                pltpu.make_async_copy(
+                                    page_src(ref, pf_ref[ent]),
+                                    chunk_dst(geo, v % KR_g, pi),
+                                    S["kv_chunk_sems"].at[v % KR_g],
+                                ).start()
+                            return carry
+
+                        jax.lax.fori_loop(0, n, one, 0)
+
+                    @pl.when(n > 0)
+                    def _():
+                        _dispatch(l, KV, leaf, only=gls)
+
+                def refill_slot(ref, v):
+                    """Chunk v (known < n_ch) into ring slot v % KR_g, straight-line."""
+                    slot = v % KR_g
+                    ci = first_ch + v
+                    for pi in range(geo.cp):
+                        pg_no = ci * geo.cp + pi
+                        ent = jnp.minimum(
+                            j * c.pages_per_seq
+                            + jnp.minimum(pg_no, c.pages_per_seq - 1),
+                            c.n_pages_entries - 1,
                         )
+                        pltpu.make_async_copy(
+                            page_src(ref, pf_ref[ent]),
+                            chunk_dst(geo, slot, pi),
+                            S["kv_chunk_sems"].at[slot],
+                        ).start()
 
-                zl = jnp.zeros((M, LANE), jnp.float32)
-                za = jnp.zeros((M, c.attn_width), jnp.float32)
-                for t in range(NS):
-                    wait_chunk(t % KR)
-                if not use_stack2:
-                    lsums = []
+                def pipelined_po(n_it):
+                    """attn_preones clean-chunk pipeline (M > 64): QK on the raw [K0; V0; K1; V1] chunk
+                    with zero-interleaved queries, PV on [V0; K1; V1; ones] carrying one [M, 224]
+                    accumulator whose ones lanes hold the row sums."""
+                    M = hkv * qg
+                    qs = q2_raw * (c.attn_scale * LOG2E)
+                    if c.attn_q_fp8:
+                        q_max = jnp.maximum(
+                            jnp.max(jnp.abs(qs), axis=1, keepdims=True), 1e-12
+                        )
+                        q_sc = q_max * (1.0 / 256.0)
+                        q_l = (qs / q_sc).astype(jnp.float8_e4m3fn)
+                        q_scb = q_sc.astype(jnp.bfloat16)
+                    else:
+                        q_l = qs.astype(jnp.bfloat16)
+                        q_scb = None
+                    zq = jnp.zeros((M, hd), q_l.dtype)
+                    q_int = jnp.concatenate(
+                        [q_l[:, 0:hd], zq, q_l[:, hd : 2 * hd], zq], axis=1
+                    )  # [M, 4 * hd]
+                    AW = 3 * hd + 32  # [V0, K1, V1] lanes, then 32 row-sum lanes
+
+                    def qk_po(i):
+                        x8 = pltpu.bitcast(
+                            ring_words(geo, i % KR_g)[...], jnp.float8_e4m3fn
+                        )
+                        with _scope("qk"):
+                            s_ = jax.lax.dot_general(
+                                q_int,
+                                x8,
+                                (((1,), (0,)), ((), ())),
+                                preferred_element_type=jnp.float32,
+                            )
+                        with _scope("softmax"):
+                            if q_scb is not None:
+                                return jnp.exp2(s_.astype(jnp.bfloat16) * q_scb)
+                            return jnp.exp2(s_).astype(jnp.bfloat16)
+
+                    def pv_po(i, pb):
+                        v_aug = pltpu.bitcast(
+                            ring_words(geo, i % KR_g, hd // 4, AW // 4)[...],
+                            jnp.float8_e4m3fn,
+                        )  # [3 * hd + 32, cpt_g]
+                        with _scope("pv"):
+                            return jax.lax.dot_general(
+                                pb,
+                                v_aug,
+                                (((1,), (1,)), ((), ())),
+                                preferred_element_type=jnp.float32,
+                            )
+
                     for t in range(NS):
-                        pb, ls_ = qk_exp_opt(t, zl)
-                        p_put(0, t, pb)
-                        lsums.append(ls_)
+                        wait_chunk(geo, t % KR_g)
+                    for t in range(NS):
+                        p_put(0, t, qk_po(t))
 
-                    use_acc2 = R > 64
-
-                    def step_ns(k, carry, ref=None):
-                        lsums, accs = carry
+                    def step_po(k, ac, ref=None):
                         i0 = NS * k
                         par, npar = k % 2, (k + 1) % 2
                         with _scope("kv_wait"):
                             for t in range(NS):
-                                wait_chunk((i0 + NS + t) % KR)
-                        pbs = [p_get(par, t) for t in range(NS)]
+                                wait_chunk(geo, (i0 + NS + t) % KR_g)
+                        for t in range(NS):
+                            ac = ac + pv_po(i0 + t, p_get(par, t))
+                        for t in range(NS):
+                            p_put(npar, t, qk_po(i0 + NS + t))
+                        if ref is not None:
+                            for t in range(NS):
+                                refill_slot(ref, i0 + KR_g + t)
+                        else:
+                            refill_global(i0 + KR_g)
+                        return ac
+
+                    za = jnp.zeros((M, AW), jnp.float32)
+                    k_full = jnp.clip((n_ch - KR_g) // NS, 0, n_it - 1)
+                    if isinstance(l, int):
+                        ac = jax.lax.fori_loop(
+                            0, k_full, functools.partial(step_po, ref=KV[l]), za
+                        )
+                    elif R <= 64 or c.attn_opt == 5:
+                        ac = branch_layers(
+                            gls,
+                            [
+                                lambda r=KV[x]: jax.lax.fori_loop(
+                                    0, k_full, functools.partial(step_po, ref=r), za
+                                )
+                                for x in gls
+                            ],
+                        )
+                    else:
+                        ac, k_full = za, 0
+                    ac = jax.lax.fori_loop(k_full, n_it - 1, step_po, ac)
+                    i0 = NS * (n_it - 1)
+                    for t in range(NS):
+                        ac = ac + pv_po(i0 + t, p_get((n_it - 1) % 2, t))
+                    refill_global(i0 + KR_g)
+                    acc_out = jnp.concatenate(
+                        [ac[:, 0:hd], ac[:, 2 * hd : 3 * hd]], axis=1
+                    )
+                    l_out = jnp.concatenate(
+                        [
+                            ac[:, 3 * hd : 3 * hd + 32] * (1.0 / 32.0),
+                            jnp.zeros((M, LANE - 32), jnp.float32),
+                        ],
+                        axis=1,
+                    )
+                    return (init[0], l_out, acc_out), init
+
+                def pipelined_opt(n_it):
+                    """Hoisted straight-line KV refill + 2-acc PV/QK pipeline (stack2 for q<=4)."""
+                    M = hkv * qg
+                    if use_po and M > 64:
+                        return pipelined_po(n_it)
+                    use_fp8_q = (
+                        c.attn_opt == 4
+                        and c.attn_exp2
+                        and c.kv_sal_fp8
+                        and c.sal_fp8_dot >= 1
+                    )
+                    if use_fp8_q:
+                        q_scaled = q2_raw * (c.attn_scale * LOG2E)
+                        q_max = jnp.maximum(
+                            jnp.max(jnp.abs(q_scaled), axis=1, keepdims=True), 1e-12
+                        )
+                        q_sc = q_max * (1.0 / 256.0)
+                        q_lhs = (q_scaled / q_sc).astype(jnp.float8_e4m3fn)
+                    else:
+                        q_lhs = q2
+                        q_sc = sc
+                    use_stack2 = M <= 64 and NS % 2 == 0
+                    if use_stack2:
+                        zq = jnp.zeros((M, q_lhs.shape[1]), q_lhs.dtype)
+                        q2_blk = jnp.concatenate(
+                            [
+                                jnp.concatenate([q_lhs, zq], axis=1),
+                                jnp.concatenate([zq, q_lhs], axis=1),
+                            ],
+                            axis=0,
+                        )
+
+                    def qk_exp_opt(i, lsum):
+                        kk, _ = chunk_kv(i % KR_g)
+                        with _scope("qk"):
+                            s_ = jax.lax.dot_general(
+                                q_lhs,
+                                kk,
+                                (((1,), (0,)), ((), ())),
+                                preferred_element_type=jnp.float32,
+                            )
+                            if use_fp8_q or q_sc != 1.0:
+                                s_ = s_ * q_sc
+                        with _scope("softmax"):
+                            pexp = jnp.exp2(s_) if c.attn_exp2 else jnp.exp(s_)
+                            for lt in range(cpt_g // LANE):
+                                lsum = lsum + pexp[:, lt * LANE : (lt + 1) * LANE]
+                        return pexp.astype(jnp.bfloat16), lsum
+
+                    def qk_pair(i_a, i_b, ls0, ls1):
+                        ka, _ = chunk_kv(i_a % KR_g)
+                        kb_, _ = chunk_kv(i_b % KR_g)
+                        k_cat = jnp.concatenate([ka, kb_], axis=0)
+                        with _scope("qk"):
+                            sb = jax.lax.dot_general(
+                                q2_blk,
+                                k_cat,
+                                (((1,), (0,)), ((), ())),
+                                preferred_element_type=jnp.float32,
+                            )
+                            sa, sb_ = sb[:M], sb[M:]
+                            if use_fp8_q or q_sc != 1.0:
+                                sa, sb_ = sa * q_sc, sb_ * q_sc
+                        with _scope("softmax"):
+                            pa = jnp.exp2(sa) if c.attn_exp2 else jnp.exp(sa)
+                            pb = jnp.exp2(sb_) if c.attn_exp2 else jnp.exp(sb_)
+                            for lt in range(cpt_g // LANE):
+                                ls0 = ls0 + pa[:, lt * LANE : (lt + 1) * LANE]
+                                ls1 = ls1 + pb[:, lt * LANE : (lt + 1) * LANE]
+                        return (
+                            pa.astype(jnp.bfloat16),
+                            pb.astype(jnp.bfloat16),
+                            ls0,
+                            ls1,
+                        )
+
+                    def pv_pair(i_a, i_b, pa_b, pb_b):
+                        _, va = chunk_kv(i_a % KR_g)
+                        _, vb_ = chunk_kv(i_b % KR_g)
+                        p_cat = jnp.concatenate([pa_b, pb_b], axis=1)
+                        v_cat = jnp.concatenate([va, vb_], axis=1)
+                        with _scope("pv"):
+                            return jax.lax.dot_general(
+                                p_cat,
+                                v_cat,
+                                (((1,), (1,)), ((), ())),
+                                preferred_element_type=jnp.float32,
+                            )
+
+                    zl = jnp.zeros((M, LANE), jnp.float32)
+                    za = jnp.zeros((M, c.attn_width), jnp.float32)
+                    for t in range(NS):
+                        wait_chunk(geo, t % KR_g)
+                    if not use_stack2 and c.attn_carry:
+                        n_acc = 1 if c.attn_carry == 1 else 2
+
+                        def qk_tree(i):
+                            kk, _ = chunk_kv(i % KR_g)
+                            with _scope("qk"):
+                                s_ = jax.lax.dot_general(
+                                    q_lhs,
+                                    kk,
+                                    (((1,), (0,)), ((), ())),
+                                    preferred_element_type=jnp.float32,
+                                )
+                                if use_fp8_q or q_sc != 1.0:
+                                    s_ = s_ * q_sc
+                            with _scope("softmax"):
+                                if c.attn_carry == 3:
+                                    pb = jnp.exp2(s_.astype(jnp.bfloat16))
+                                    parts = [
+                                        pb[:, lt * LANE : (lt + 1) * LANE]
+                                        for lt in range(cpt_g // LANE)
+                                    ]
+                                    while len(parts) > 1:
+                                        parts = [
+                                            parts[j] + parts[j + 1]
+                                            for j in range(0, len(parts), 2)
+                                        ]
+                                    return pb, parts[0].astype(jnp.float32)
+                                pexp = jnp.exp2(s_) if c.attn_exp2 else jnp.exp(s_)
+                                parts = [
+                                    pexp[:, lt * LANE : (lt + 1) * LANE]
+                                    for lt in range(cpt_g // LANE)
+                                ]
+                                while len(parts) > 1:
+                                    parts = [
+                                        parts[j] + parts[j + 1]
+                                        for j in range(0, len(parts), 2)
+                                    ]
+                            return pexp.astype(jnp.bfloat16), parts[0]
+
+                        pair = c.attn_carry == 4
+                        if pair:
+                            zq_p = jnp.zeros((M, q_lhs.shape[1]), q_lhs.dtype)
+                            q_blk_p = jnp.concatenate(
+                                [
+                                    jnp.concatenate([q_lhs, zq_p], axis=1),
+                                    jnp.concatenate([zq_p, q_lhs], axis=1),
+                                ],
+                                axis=0,
+                            )
+
+                        def lane_tree(x):
+                            parts = [
+                                x[:, lt * LANE : (lt + 1) * LANE]
+                                for lt in range(cpt_g // LANE)
+                            ]
+                            while len(parts) > 1:
+                                parts = [
+                                    parts[j] + parts[j + 1]
+                                    for j in range(0, len(parts), 2)
+                                ]
+                            return parts[0]
+
+                        def qk_all(i_start, par):
+                            d = zl
+                            if not pair:
+                                for t in range(NS):
+                                    pb, dd = qk_tree(i_start + t)
+                                    p_put(par, t, pb)
+                                    d = d + dd
+                                return d
+                            for u in range(NS // 2):
+                                ka, _ = chunk_kv((i_start + 2 * u) % KR_g)
+                                kb2, _ = chunk_kv((i_start + 2 * u + 1) % KR_g)
+                                with _scope("qk"):
+                                    s2 = jax.lax.dot_general(
+                                        q_blk_p,
+                                        jnp.concatenate([ka, kb2], axis=0),
+                                        (((1,), (0,)), ((), ())),
+                                        preferred_element_type=jnp.float32,
+                                    )
+                                for h, s_ in enumerate((s2[:M], s2[M:])):
+                                    if use_fp8_q or q_sc != 1.0:
+                                        s_ = s_ * q_sc
+                                    with _scope("softmax"):
+                                        pe = (
+                                            jnp.exp2(s_) if c.attn_exp2 else jnp.exp(s_)
+                                        )
+                                        d = d + lane_tree(pe)
+                                    p_put(par, 2 * u + h, pe.astype(jnp.bfloat16))
+                            return d
+
+                        ls = qk_all(0, 0)
+
+                        def pv_all(i0, par, accs):
+                            accs = list(accs)
+                            if pair:
+                                for u in range(NS // 2):
+                                    _, va = chunk_kv((i0 + 2 * u) % KR_g)
+                                    _, vb2 = chunk_kv((i0 + 2 * u + 1) % KR_g)
+                                    pst = jnp.concatenate(
+                                        [p_get(par, 2 * u), p_get(par, 2 * u + 1)],
+                                        axis=0,
+                                    )
+                                    with _scope("pv"):
+                                        o2 = jax.lax.dot_general(
+                                            pst,
+                                            jnp.concatenate([va, vb2], axis=0),
+                                            (((1,), (1,)), ((), ())),
+                                            preferred_element_type=jnp.float32,
+                                        )
+                                    W = c.attn_width
+                                    accs[u % n_acc] = (
+                                        accs[u % n_acc] + o2[:M, :W] + o2[M:, W : 2 * W]
+                                    )
+                                return accs
+                            for t in range(NS):
+                                accs[t % n_acc] = accs[t % n_acc] + pv_chunk(
+                                    i0 + t, p_get(par, t)
+                                )
+                            return accs
+
+                        def step_c(k, carry, ref=None):
+                            ls, accs = carry
+                            i0 = NS * k
+                            par, npar = k % 2, (k + 1) % 2
+                            with _scope("kv_wait"):
+                                for t in range(NS):
+                                    wait_chunk(geo, (i0 + NS + t) % KR_g)
+                            accs = pv_all(i0, par, accs)
+                            ls = ls + qk_all(i0 + NS, npar)
+                            if ref is not None:
+                                for t in range(NS):
+                                    refill_slot(ref, i0 + KR_g + t)
+                            else:
+                                refill_global(i0 + KR_g)
+                            return ls, accs
+
+                        k_full = jnp.clip((n_ch - KR_g) // NS, 0, n_it - 1)
+                        init_c = (ls, [za] * n_acc)
+                        if isinstance(l, int):
+                            carry_c = jax.lax.fori_loop(
+                                0, k_full, functools.partial(step_c, ref=KV[l]), init_c
+                            )
+                        elif R <= 64 or c.attn_opt == 5:
+                            carry_c = branch_layers(
+                                gls,
+                                [
+                                    lambda r=KV[x]: jax.lax.fori_loop(
+                                        0,
+                                        k_full,
+                                        functools.partial(step_c, ref=r),
+                                        init_c,
+                                    )
+                                    for x in gls
+                                ],
+                            )
+                        else:
+                            carry_c, k_full = init_c, 0
+                        ls, accs = jax.lax.fori_loop(k_full, n_it - 1, step_c, carry_c)
+                        accs = pv_all(NS * (n_it - 1), (n_it - 1) % 2, accs)
+                        refill_global(NS * (n_it - 1) + KR_g)
+                        return (init[0], ls, sum(accs[1:], accs[0])), init
+                    if not use_stack2:
+                        lsums = []
+                        for t in range(NS):
+                            pb, ls_ = qk_exp_opt(t, zl)
+                            p_put(0, t, pb)
+                            lsums.append(ls_)
+
+                        use_acc2 = R > 64
+
+                        def step_ns(k, carry, ref=None):
+                            lsums, accs = carry
+                            i0 = NS * k
+                            par, npar = k % 2, (k + 1) % 2
+                            with _scope("kv_wait"):
+                                for t in range(NS):
+                                    wait_chunk(geo, (i0 + NS + t) % KR_g)
+                            pbs = [p_get(par, t) for t in range(NS)]
+                            if use_acc2:
+                                ac0, ac1 = accs
+                                for t, pb in enumerate(pbs):
+                                    dpv = pv_chunk(i0 + t, pb)
+                                    if t % 2 == 0:
+                                        ac0 = ac0 + dpv
+                                    else:
+                                        ac1 = ac1 + dpv
+                                accs = [ac0, ac1]
+                            else:
+                                accs = [
+                                    a + pv_chunk(i0 + t, pb)
+                                    for t, (a, pb) in enumerate(zip(accs, pbs))
+                                ]
+                            nxt = [qk_exp_opt(i0 + NS + t, lsums[t]) for t in range(NS)]
+                            for t in range(NS):
+                                p_put(npar, t, nxt[t][0])
+                            if ref is not None:
+                                for t in range(NS):
+                                    refill_slot(ref, i0 + KR_g + t)
+                            else:
+                                refill_global(i0 + KR_g)
+                            return [x[1] for x in nxt], accs
+
+                        k_full = jnp.clip((n_ch - KR_g) // NS, 0, n_it - 1)
+                        init_ns = (lsums, [za, za] if use_acc2 else [za] * NS)
+                        hoist_ns = (R <= 64 and not use_fp8_q) or c.attn_opt == 5
+                        if isinstance(l, int):
+                            carry_ns = jax.lax.fori_loop(
+                                0,
+                                k_full,
+                                functools.partial(step_ns, ref=KV[l]),
+                                init_ns,
+                            )
+                        elif hoist_ns:
+                            carry_ns = branch_layers(
+                                gls,
+                                [
+                                    lambda r=KV[x]: jax.lax.fori_loop(
+                                        0,
+                                        k_full,
+                                        functools.partial(step_ns, ref=r),
+                                        init_ns,
+                                    )
+                                    for x in gls
+                                ],
+                            )
+                        else:
+                            carry_ns = init_ns
+                            k_full = 0
+                        lsums, accs = jax.lax.fori_loop(
+                            k_full, n_it - 1, step_ns, carry_ns
+                        )
+                        i0 = NS * (n_it - 1)
                         if use_acc2:
                             ac0, ac1 = accs
-                            for t, pb in enumerate(pbs):
-                                dpv = pv_chunk(i0 + t, pb)
+                            for t in range(NS):
+                                dpv = pv_chunk(i0 + t, p_get((n_it - 1) % 2, t))
                                 if t % 2 == 0:
                                     ac0 = ac0 + dpv
                                 else:
@@ -3137,78 +3801,77 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                             accs = [ac0, ac1]
                         else:
                             accs = [
-                                a + pv_chunk(i0 + t, pb)
-                                for t, (a, pb) in enumerate(zip(accs, pbs))
+                                a + pv_chunk(i0 + t, p_get((n_it - 1) % 2, t))
+                                for t, a in enumerate(accs)
                             ]
-                        nxt = [qk_exp_opt(i0 + NS + t, lsums[t]) for t in range(NS)]
-                        for t in range(NS):
-                            p_put(npar, t, nxt[t][0])
+                        refill_global(i0 + KR_g)
+                        return (
+                            init[0],
+                            sum(lsums[1:], lsums[0]),
+                            sum(accs[1:], accs[0]),
+                        ), init
+
+                    ls0, ls1 = zl, zl
+                    for u in range(NS // 2):
+                        pa, pb, ls0, ls1 = qk_pair(2 * u, 2 * u + 1, ls0, ls1)
+                        p_put(0, 2 * u, pa)
+                        p_put(0, 2 * u + 1, pb)
+
+                    def step_body(k, carry, ref=None):
+                        ls0, ls1, ac0, ac1 = carry
+                        i0 = NS * k
+                        par, npar = k % 2, (k + 1) % 2
+                        with _scope("kv_wait"):
+                            for t in range(NS):
+                                wait_chunk(geo, (i0 + NS + t) % KR_g)
+                        for u in range(NS // 2):
+                            dpv = pv_pair(
+                                i0 + 2 * u,
+                                i0 + 2 * u + 1,
+                                p_get(par, 2 * u),
+                                p_get(par, 2 * u + 1),
+                            )
+                            if u % 2 == 0:
+                                ac0 = ac0 + dpv
+                            else:
+                                ac1 = ac1 + dpv
+                        for u in range(NS // 2):
+                            pa, pb, ls0, ls1 = qk_pair(
+                                i0 + NS + 2 * u, i0 + NS + 2 * u + 1, ls0, ls1
+                            )
+                            p_put(npar, 2 * u, pa)
+                            p_put(npar, 2 * u + 1, pb)
                         if ref is not None:
                             for t in range(NS):
-                                refill_slot(ref, i0 + KR + t)
+                                refill_slot(ref, i0 + KR_g + t)
                         else:
-                            refill_global(i0 + KR)
-                        return [x[1] for x in nxt], accs
+                            refill_global(i0 + KR_g)
+                        return ls0, ls1, ac0, ac1
 
-                    k_full = jnp.clip((n_ch - KR) // NS, 0, n_it - 1)
-                    init_ns = (lsums, [za, za] if use_acc2 else [za] * NS)
-                    hoist_ns = (R <= 64 and not use_fp8_q) or c.attn_opt == 5
+                    k_full = jnp.clip((n_ch - KR_g) // NS, 0, n_it - 1)
+                    init4 = (ls0, ls1, za, za)
                     if isinstance(l, int):
-                        carry_ns = jax.lax.fori_loop(
-                            0, k_full, functools.partial(step_ns, ref=KV[l]), init_ns
+                        carry4 = jax.lax.fori_loop(
+                            0, k_full, functools.partial(step_body, ref=KV[l]), init4
                         )
-                    elif hoist_ns:
-                        carry_ns = branch_layers(
+                    else:
+                        carry4 = branch_layers(
                             gls,
                             [
                                 lambda r=KV[x]: jax.lax.fori_loop(
                                     0,
                                     k_full,
-                                    functools.partial(step_ns, ref=r),
-                                    init_ns,
+                                    functools.partial(step_body, ref=r),
+                                    init4,
                                 )
                                 for x in gls
                             ],
                         )
-                    else:
-                        carry_ns = init_ns
-                        k_full = 0
-                    lsums, accs = jax.lax.fori_loop(k_full, n_it - 1, step_ns, carry_ns)
+                    ls0, ls1, ac0, ac1 = jax.lax.fori_loop(
+                        k_full, n_it - 1, step_body, carry4
+                    )
                     i0 = NS * (n_it - 1)
-                    if use_acc2:
-                        ac0, ac1 = accs
-                        for t in range(NS):
-                            dpv = pv_chunk(i0 + t, p_get((n_it - 1) % 2, t))
-                            if t % 2 == 0:
-                                ac0 = ac0 + dpv
-                            else:
-                                ac1 = ac1 + dpv
-                        accs = [ac0, ac1]
-                    else:
-                        accs = [
-                            a + pv_chunk(i0 + t, p_get((n_it - 1) % 2, t))
-                            for t, a in enumerate(accs)
-                        ]
-                    refill_global(i0 + KR)
-                    return (
-                        init[0],
-                        sum(lsums[1:], lsums[0]),
-                        sum(accs[1:], accs[0]),
-                    ), init
-
-                ls0, ls1 = zl, zl
-                for u in range(NS // 2):
-                    pa, pb, ls0, ls1 = qk_pair(2 * u, 2 * u + 1, ls0, ls1)
-                    p_put(0, 2 * u, pa)
-                    p_put(0, 2 * u + 1, pb)
-
-                def step_body(k, carry, ref=None):
-                    ls0, ls1, ac0, ac1 = carry
-                    i0 = NS * k
-                    par, npar = k % 2, (k + 1) % 2
-                    with _scope("kv_wait"):
-                        for t in range(NS):
-                            wait_chunk((i0 + NS + t) % KR)
+                    par = (n_it - 1) % 2
                     for u in range(NS // 2):
                         dpv = pv_pair(
                             i0 + 2 * u,
@@ -3220,143 +3883,105 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                             ac0 = ac0 + dpv
                         else:
                             ac1 = ac1 + dpv
-                    for u in range(NS // 2):
-                        pa, pb, ls0, ls1 = qk_pair(
-                            i0 + NS + 2 * u, i0 + NS + 2 * u + 1, ls0, ls1
-                        )
-                        p_put(npar, 2 * u, pa)
-                        p_put(npar, 2 * u + 1, pb)
-                    if ref is not None:
-                        for t in range(NS):
-                            refill_slot(ref, i0 + KR + t)
-                    else:
-                        refill_global(i0 + KR)
-                    return ls0, ls1, ac0, ac1
+                    refill_global(i0 + KR_g)
+                    return (init[0], ls0 + ls1, ac0 + ac1), init
 
-                k_full = jnp.clip((n_ch - KR) // NS, 0, n_it - 1)
-                init4 = (ls0, ls1, za, za)
-                if isinstance(l, int):
-                    carry4 = jax.lax.fori_loop(
-                        0, k_full, functools.partial(step_body, ref=KV[l]), init4
-                    )
-                else:
-                    carry4 = branch_layers(
-                        gls,
-                        [
-                            lambda r=KV[x]: jax.lax.fori_loop(
-                                0, k_full, functools.partial(step_body, ref=r), init4
-                            )
-                            for x in gls
-                        ],
-                    )
-                ls0, ls1, ac0, ac1 = jax.lax.fori_loop(
-                    k_full, n_it - 1, step_body, carry4
-                )
-                i0 = NS * (n_it - 1)
-                par = (n_it - 1) % 2
-                for u in range(NS // 2):
-                    dpv = pv_pair(
-                        i0 + 2 * u,
-                        i0 + 2 * u + 1,
-                        p_get(par, 2 * u),
-                        p_get(par, 2 * u + 1),
-                    )
-                    if u % 2 == 0:
-                        ac0 = ac0 + dpv
-                    else:
-                        ac1 = ac1 + dpv
-                refill_global(i0 + KR)
-                return (init[0], ls0 + ls1, ac0 + ac1), init
-
-            def pipelined(n_it):
-                """Clean chunks [0, NS * n_it), n_it >= 1: iteration k multiplies chunks NS*k..
-
-                by V while it scores chunks NS*(k+1).. (independent MXU chains), then
-                refills the slots its V just left with the chunks one iteration past the
-                ring.
-                """
-                zl = jnp.zeros((hkv * qg, LANE), jnp.float32)
-                for t in range(NS):
-                    wait_chunk(t % KR)
-                lsums = []
-                for t in range(NS):
-                    pb, ls_ = qk_exp(t, zl)
-                    p_put(0, t, pb)
-                    lsums.append(ls_)
-
-                def it(k, carry):
-                    lsums, accs = carry
-                    i0 = NS * k
-                    with _scope("kv_wait"):
-                        for t in range(NS):
-                            wait_chunk((i0 + NS + t) % KR)
-                    pbs = [p_get(k % 2, t) for t in range(NS)]
-                    accs = [
-                        a + pv_chunk(i0 + t, pb)
-                        for t, (a, pb) in enumerate(zip(accs, pbs))
-                    ]
-                    nxt = [qk_exp(i0 + NS + t, lsums[t]) for t in range(NS)]
+                def pipelined(n_it):
+                    """Clean chunks [0, NS * n_it), n_it >= 1."""
+                    zl = jnp.zeros((hkv * qg, LANE), jnp.float32)
                     for t in range(NS):
-                        p_put((k + 1) % 2, t, nxt[t][0])
-                    refill_global(i0 + KR)
-                    return [x[1] for x in nxt], accs
+                        wait_chunk(geo, t % KR_g)
+                    lsums = []
+                    for t in range(NS):
+                        pb, ls_ = qk_exp(t, zl)
+                        p_put(0, t, pb)
+                        lsums.append(ls_)
 
-                za = jnp.zeros((hkv * qg, c.attn_width), jnp.float32)
-                lsums, accs = jax.lax.fori_loop(0, n_it - 1, it, (lsums, [za] * NS))
-                i0 = NS * (n_it - 1)
-                accs = [
-                    a + pv_chunk(i0 + t, p_get((n_it - 1) % 2, t))
-                    for t, a in enumerate(accs)
-                ]
-                refill_global(i0 + KR)
-                return (init[0], sum(lsums[1:], lsums[0]), sum(accs[1:], accs[0])), init
+                    def it(k, carry):
+                        lsums, accs = carry
+                        i0 = NS * k
+                        with _scope("kv_wait"):
+                            for t in range(NS):
+                                wait_chunk(geo, (i0 + NS + t) % KR_g)
+                        pbs = [p_get(k % 2, t) for t in range(NS)]
+                        accs = [
+                            a + pv_chunk(i0 + t, pb)
+                            for t, (a, pb) in enumerate(zip(accs, pbs))
+                        ]
+                        nxt = [qk_exp(i0 + NS + t, lsums[t]) for t in range(NS)]
+                        for t in range(NS):
+                            p_put((k + 1) % 2, t, nxt[t][0])
+                        refill_global(i0 + KR_g)
+                        return [x[1] for x in nxt], accs
+
+                    za = jnp.zeros((hkv * qg, c.attn_width), jnp.float32)
+                    lsums, accs = jax.lax.fori_loop(0, n_it - 1, it, (lsums, [za] * NS))
+                    i0 = NS * (n_it - 1)
+                    accs = [
+                        a + pv_chunk(i0 + t, p_get((n_it - 1) % 2, t))
+                        for t, a in enumerate(accs)
+                    ]
+                    refill_global(i0 + KR_g)
+                    return (
+                        init[0],
+                        sum(lsums[1:], lsums[0]),
+                        sum(accs[1:], accs[0]),
+                    ), init
 
             with _scope("chunk_loop"):
-                if (
-                    c.attn_pipe
-                    and c.attn_opt in (3, 4, 5)
-                    and c.kv_sal
-                    and (c.row_tile > 0 or hkv * qg <= 64)
-                ):
-                    if not gls or (isinstance(l, int) and l not in gls):
-                        carry2, k0 = (init, init), 0
-                    else:
+                if isinstance(n_clean, int):
+                    (m_a, l_a, acc_a), (m_b, l_b, acc_b) = jax.lax.fori_loop(
+                        0, (n_ch + 1) // 2, body, (init, init)
+                    )
+                else:
+                    if (
+                        c.attn_pipe
+                        and c.attn_opt in (3, 4, 5)
+                        and c.kv_sal
+                        and (c.row_tile > 0 or hkv * qg <= 64)
+                    ):
+                        if not gls or (isinstance(l, int) and l not in gls):
+                            carry2, k0 = (init, init), 0
+                        else:
+                            n_it = n_clean // NS
+                            carry2 = jax.lax.cond(
+                                n_it > 0,
+                                lambda: pipelined_opt(n_it),
+                                lambda: (init, init),
+                            )
+                            k0 = n_it * NS // 2
+                    elif c.attn_pipe:
+                        # global chunks before the last one are clean; SWA layers have none
                         n_it = n_clean // NS
                         carry2 = jax.lax.cond(
-                            n_it > 0, lambda: pipelined_opt(n_it), lambda: (init, init)
+                            n_it > 0, lambda: pipelined(n_it), lambda: (init, init)
                         )
                         k0 = n_it * NS // 2
-                elif c.attn_pipe:
-                    # global chunks before the last one are clean; SWA layers have none
-                    n_it = n_clean // NS
-                    carry2 = jax.lax.cond(
-                        n_it > 0, lambda: pipelined(n_it), lambda: (init, init)
+                    elif isinstance(l, int):
+                        carry2 = refill_loop(KV[l]) if l in gls else (init, init)
+                        k0 = k_ref if l in gls else 0
+                    else:
+                        carry2 = jax.lax.cond(
+                            is_global,
+                            lambda: branch_layers(
+                                gls,
+                                [functools.partial(refill_loop, KV[x]) for x in gls],
+                            ),
+                            lambda: (init, init),
+                        )
+                        k0 = _sel(is_global, k_ref, 0)
+                    carry2 = jax.lax.fori_loop(
+                        k0, n_clean // 2, functools.partial(body, clean=True), carry2
                     )
-                    k0 = n_it * NS // 2
-                elif isinstance(l, int):
-                    carry2 = refill_loop(KV[l]) if l in gls else (init, init)
-                    k0 = k_ref if l in gls else 0
-                else:
-                    carry2 = jax.lax.cond(
-                        is_global,
-                        lambda: branch_layers(
-                            gls, [functools.partial(refill_loop, KV[x]) for x in gls]
-                        ),
-                        lambda: (init, init),
+                    (m_a, l_a, acc_a), (m_b, l_b, acc_b) = jax.lax.fori_loop(
+                        n_clean // 2, (n_ch + 1) // 2, body, carry2
                     )
-                    k0 = jnp.where(is_global, k_ref, 0)
-                carry2 = jax.lax.fori_loop(
-                    k0, n_clean // 2, functools.partial(body, clean=True), carry2
-                )
-                (m_a, l_a, acc_a), (m_b, l_b, acc_b) = jax.lax.fori_loop(
-                    n_clean // 2, (n_ch + 1) // 2, body, carry2
-                )
 
-                if not c.attn_pipe:
+                    if not c.attn_pipe:
 
-                    @pl.when(extra & is_global)
-                    def _():
-                        wait_chunk((2 * k_ref - 1 + KR) % KR)
+                        @pl.when(extra & is_global)
+                        def _():
+                            wait_chunk(geo, (2 * k_ref - 1 + KR_g) % KR_g)
 
                 if c.attn_unshifted:  # the streams just add
                     carry = (
@@ -3375,7 +4000,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             # before the qkv matvec)
             @pl.when(j + 1 < n_req_live)
             def _():
-                kv_prologue(l, j + 1, is_global)
+                kv_prologue(geo, l, j + 1)
 
             # the request's own new rows (causal within a verify block), padded to a sublane
             # tile (a 1-row operand does not lower), filler keys masked. Padded pools: key rows
@@ -3418,7 +4043,9 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             for t in range(q):
                 newpos = jnp.where(nt == t, pos_ref[r0 + t], newpos)
             live_new = head_ok & (newpos <= rowpos)
-            live_new = live_new & jnp.logical_or(is_global, rowpos - newpos < c.window)
+            in_win = _in_window(is_global, rowpos - newpos < c.window)
+            if in_win is not None:
+                live_new = live_new & in_win
             s_ = jax.lax.dot_general(
                 q2, kn, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
             )
@@ -3456,16 +4083,23 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
         NBR = route_blocks(c)
 
         def route_get(field, i):
-            """vec_route table entry (0 expert, 1 count, 2 offset, 3 pair, 5 y-block end)."""
-            if field == 5:
-                return S["route_s"][4 * NBR + 1, i]
+            """vec_route table entry (0 expert, 1 count, 2 offset, 3 pair, 5 y-block end, 6 blk_mid)."""
+            if field in (5, 6):
+                return S["route_s"][4 * NBR + 1 + (field == 6), i]
             return S["route_s"][field * NBR + i // LANE, i % LANE]
 
         def rget(name, i):
             if not c.vec_route:
                 return S[name][i]
             return route_get(
-                {"uniq": 0, "ex_cnt": 1, "ex_off": 2, "perm": 3, "blk_end": 5}[name],
+                {
+                    "uniq": 0,
+                    "ex_cnt": 1,
+                    "ex_off": 2,
+                    "perm": 3,
+                    "blk_end": 5,
+                    "blk_mid": 6,
+                }[name],
                 i,
             )
 
@@ -3483,7 +4117,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             else:
                 key = jnp.zeros((P, 1), jnp.int32)
             S["route_v"][...] = _route_table(
-                ids_list, n_live, K, c.n_experts_padded, NBR, key, c.tp
+                ids_list, n_live, K, c.n_experts_padded, NBR, key, c.tp, c.split_rows
             )
             cp = pltpu.make_async_copy(S["route_v"], S["route_s"], S["route_sem"].at[0])
             cp.start()
@@ -3616,7 +4250,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 chan = c.scale_fp8 and kind != "fp4"
                 S13 = S["w13c"] if chan else S["w13s"]
                 S2 = S["w2c"] if chan else S["w2s"]
-                gscale = c.scale_fp8 and kind == "fp4"
+                gscale = (c.scale_fp8 or c.ex_kperm >= 3) and kind == "fp4"
                 if gscale:
                     S["gs_v"][0:3, :] = jnp.concatenate(
                         [
@@ -3766,7 +4400,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 def do_prologue():
                     issue_experts(0, jnp.minimum(pdepth, n_u))
 
-                def ebody(i, carry):
+                def ebody(i, carry, part=None):
                     slot = i % nslot
 
                     if pairs:
@@ -3793,20 +4427,28 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
 
                     e = rget("uniq", i)
 
+                    def gather_x_base(ps_):
+                        if c.xfull_packed:
+                            packed = jnp.concatenate(
+                                [S["xfull"][pl.ds(p // K, 1), :] for p in ps_], axis=0
+                            )
+                            return _unpack_bf16x2(packed).astype(jnp.bfloat16)
+                        return jnp.concatenate(
+                            [S["xfull"][pl.ds(p // K, 1), :] for p in ps_], axis=0
+                        ).astype(jnp.bfloat16)
+
                     def full_expert():
                         with _scope("full_expert"):
                             full_expert_()
 
                     def busy_bucket(nrows):
                         off, cnt = rget("ex_off", i), rget("ex_cnt", i)
-                        pairs = [
+                        ps_ = [
                             rget("perm", off + jnp.minimum(j, cnt - 1))
                             for j in range(nrows)
                         ]
                         with _scope("ex_gather"):
-                            xc = jnp.concatenate(
-                                [S["xfull"][pl.ds(p // K, 1), :] for p in pairs], axis=0
-                            ).astype(jnp.bfloat16)
+                            xc = gather_x_base(ps_)
                         cw13 = (
                             64
                             if c.ex_opt and c.fp4_chunk_words == 128
@@ -3822,6 +4464,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                                 cw13,
                                 fast_bf16=c.ex_opt,
                                 kperm=c.ex_kperm,
+                                via_fp8=c.ex_via_fp8,
                             )
                         else:
                             gu = _fp8_dot(
@@ -3848,6 +4491,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                                 min(Il // FP4_PACK, 64 if c.ex_opt else 16),
                                 fast_bf16=c.ex_opt,
                                 kperm=c.ex_kperm,
+                                via_fp8=c.ex_via_fp8,
                             )
                         else:
                             y = _fp8_dot(
@@ -3860,7 +4504,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                             )
                         yp = _pack_bf16x2(y * g_down if gscale else y)
                         with _scope("ex_scatter"):
-                            for j, p in enumerate(pairs):
+                            for j, p in enumerate(ps_):
                                 S["ysend"].at[p // K][pl.ds(p % K, 1), :] = yp[
                                     j : j + 1
                                 ]
@@ -3881,6 +4525,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                                 cw13,
                                 fast_bf16=c.ex_opt,
                                 kperm=c.ex_kperm,
+                                via_fp8=c.ex_via_fp8,
                             )
                         else:
                             gu = _fp8_dot(
@@ -3907,6 +4552,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                                 min(Il // FP4_PACK, 64 if c.ex_opt else 16),
                                 fast_bf16=c.ex_opt,
                                 kperm=c.ex_kperm,
+                                via_fp8=c.ex_via_fp8,
                             )
                         else:
                             y = _fp8_dot(
@@ -3930,14 +4576,12 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         # with the rows; bucket rows past the expert's count repeat its last pair
                         bd_kc = c.blockdiag_kc
                         off, cnt = rget("ex_off", i), rget("ex_cnt", i)
-                        pairs = [
+                        ps_ = [
                             rget("perm", off + jnp.minimum(j, cnt - 1))
                             for j in range(nrows)
                         ]
                         with _scope("ex_gather"):
-                            xc = jnp.concatenate(
-                                [S["xfull"][pl.ds(p // K, 1), :] for p in pairs], axis=0
-                            ).astype(jnp.bfloat16)
+                            xc = gather_x_base(ps_)
                         with _scope("bd_w13"):
                             gu = _fp4_blockdiag_dot(
                                 xc,
@@ -3968,10 +4612,59 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         with _scope("ex_scatter"):
                             # a padded row repeats the last pair's row, so its write repeats that
                             # pair's identical write: no branch per row
-                            for j, p in enumerate(pairs):
+                            for j, p in enumerate(ps_):
                                 S["ysend"].at[p // K][pl.ds(p % K, 1), :] = yp[
                                     j : j + 1
                                 ]
+
+                    def bd_chunks():
+                        bd_kc = c.blockdiag_kc
+                        off, cnt = rget("ex_off", i), rget("ex_cnt", i)
+
+                        def bd_step(ch, carry_):
+                            ps_ = [
+                                rget("perm", off + jnp.minimum(ch * 8 + j, cnt - 1))
+                                for j in range(8)
+                            ]
+                            with _scope("ex_gather"):
+                                xc = gather_x_base(ps_)
+                            with _scope("bd_w13"):
+                                gu = _fp4_blockdiag_dot(
+                                    xc,
+                                    W13.at[slot],
+                                    S["w13s"].at[slot],
+                                    He,
+                                    2 * Il,
+                                    bd_kc,
+                                    kperm=bool(c.ex_kperm),
+                                )
+                                gate, up = gu[:, :Il], gu[:, Il:]
+                                if gscale:
+                                    g_gate, g_up, g_down = globals_of(e)
+                                    gate, up = gate * g_gate, up * g_up
+                                h = (gate * jax.nn.sigmoid(gate) * up).astype(
+                                    jnp.bfloat16
+                                )
+                            pl.when(ch == 0)(w2_wait)
+                            with _scope("bd_w2"):
+                                yc = _fp4_blockdiag_dot(
+                                    h,
+                                    W2.at[slot],
+                                    S["w2s"].at[slot],
+                                    Il,
+                                    He,
+                                    bd_kc,
+                                    kperm=bool(c.ex_kperm),
+                                )
+                                yp = _pack_bf16x2(yc * g_down if gscale else yc)
+                            with _scope("ex_scatter"):
+                                for j, p in enumerate(ps_):
+                                    S["ysend"].at[p // K][pl.ds(p % K, 1), :] = yp[
+                                        j : j + 1
+                                    ]
+                            return carry_
+
+                        jax.lax.fori_loop(0, (cnt + 7) // 8, bd_step, 0)
 
                     if kind == "fp4" and c.compact_rows:
                         cnt = rget("ex_cnt", i)
@@ -3982,7 +4675,9 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                             (b, functools.partial(compact_expert, b)) for b in buckets
                         ]
                         if buckets[-1] < R:
-                            if c.ex_opt and R <= 32:
+                            if c.ex_bd_all and c.ex_kperm == 0:
+                                arms.append((None, bd_chunks))
+                            elif c.ex_opt and R <= 48:
                                 for bb in (16, 24, 32):
                                     if buckets[-1] < bb < R:
                                         arms.append(
@@ -3993,6 +4688,17 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                                 arms.append((None, full_expert))
                         else:
                             arms[-1] = (None, arms[-1][1])
+                        if part == "few":
+                            arms = [
+                                a
+                                for a in arms
+                                if a[0] is not None and a[0] <= c.split_rows
+                            ]
+                            arms[-1] = (None, arms[-1][1])
+                        elif part == "many":
+                            arms = [
+                                a for a in arms if a[0] is None or a[0] > c.split_rows
+                            ]
 
                         def pick(arms):
                             if len(arms) == 1:
@@ -4028,7 +4734,28 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
 
                 def do_loop():
                     with _scope("experts"):
-                        jax.lax.fori_loop(0, n_u, ebody, jnp.int32(0))
+                        if c.split_rows and kind == "fp4":
+
+                            def group(g_, carry):
+                                lo = jnp.where(
+                                    g_ == 0, 0, rget("blk_end", jnp.maximum(g_ - 1, 0))
+                                )
+                                mid, hi = rget("blk_mid", g_), rget("blk_end", g_)
+                                carry = jax.lax.fori_loop(
+                                    lo, mid, functools.partial(ebody, part="few"), carry
+                                )
+                                return jax.lax.fori_loop(
+                                    mid,
+                                    hi,
+                                    functools.partial(ebody, part="many"),
+                                    carry,
+                                )
+
+                            jax.lax.fori_loop(
+                                0, c.tp if y_block else 1, group, jnp.int32(0)
+                            )
+                        else:
+                            jax.lax.fori_loop(0, n_u, ebody, jnp.int32(0))
 
                 return do_prologue, do_loop
 
@@ -4067,7 +4794,10 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 # every live (row, slot) gets exactly one expert output, written bf16-packed;
                 # rows past n_live stay zero
                 S["ysend"][...] = jnp.zeros((R, K, He // 2), jnp.uint32)
-                S["xfull"][...] = x_full.astype(jnp.float32)
+                if c.xfull_packed:
+                    S["xfull"][...] = _pack_bf16x2(x_full.astype(jnp.float32))
+                else:
+                    S["xfull"][...] = x_full.astype(jnp.float32)
 
             by_kind(1)
             # flushing inside the expert loop (once its prefetch ends) measured slower
@@ -4338,7 +5068,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 send_sem=S["tc_ssems"].at[tc_smap[send_kind or kind]],
                 recv_sem=S["tc_rsems"].at[tc_rmap[kind]],
                 device_id=(peer,),
-                device_id_type=pl.DeviceIdType.MESH,
             )
 
         def ag_tile_start(kind, src, pad, slot, t, sems):
@@ -4356,7 +5085,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     send_sem=S["tc_ssems"].at[_TC[kind]],
                     recv_sem=sems.at[t],
                     device_id=(coll._peer(d),),
-                    device_id_type=pl.DeviceIdType.MESH,
                 ).start()
 
         def ag_tile_ready(src, pad, sems):
@@ -4460,6 +5188,10 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 (jnp.zeros((1, Ep), f32), jnp.full((1, Ep), big, f32)),
             )
             present = count > 0
+            split = c.split_rows
+            mult = 2 if split else 1
+            if split:
+                key = 2 * key + jnp.where(count > split, 1.0, 0.0)
             e_row = jax.lax.broadcasted_iota(i32, (1, Ep), 1).astype(f32)
             cols = jnp.transpose(
                 jnp.concatenate(
@@ -4500,10 +5232,16 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             rv[4 * NB : 4 * NB + 1, :] = jnp.broadcast_to(n_u, (1, LANE))
             b_lane = jax.lax.broadcasted_iota(i32, (Ep, LANE), 1).astype(f32)
             rv[4 * NB + 1 : 4 * NB + 2, :] = jnp.sum(
-                jnp.where((pres_c > 0) & (key_c <= b_lane), 1, 0),
+                jnp.where((pres_c > 0) & (key_c <= mult * b_lane + mult - 1), 1, 0),
                 axis=0,
                 keepdims=True,
             )
+            if split:
+                rv[4 * NB + 2 : 4 * NB + 3, :] = jnp.sum(
+                    jnp.where((pres_c > 0) & (key_c <= 2 * b_lane), 1, 0),
+                    axis=0,
+                    keepdims=True,
+                )
             PT = RT * K
 
             def perm_tile(t, running):
@@ -4603,7 +5341,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
 
         def attention_tiled(l, use_rope, is_global, nxt, smr, pend=False):
             """Leaves the all-reduced o-proj output all-gathered in pad_o_ag (or in flight)."""
-            kv_prologue(l, 0, is_global)
+            per_geom(is_global, lambda geo: kv_prologue(geo, l, 0))
+            fill_preones()
             qd, kd = c.q_dim, c.kv_dim
             if pend:
                 psmr = S["smalls"].at[(l + 1) % 2]
@@ -4758,11 +5497,14 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             with _scope("attn_core"):
                 n_req_live = jnp.minimum((n_live + q - 1) // q, c.n_req)
 
-                def req_loop(j, carry):
-                    request_attention_body(l, j, is_global, n_req_live)
-                    return carry
+                def run_geom(geo):
+                    def req_loop(j, carry):
+                        request_attention_body(geo, l, j, n_req_live)
+                        return carry
 
-                jax.lax.fori_loop(0, n_req_live, req_loop, 0)
+                    jax.lax.fori_loop(0, n_req_live, req_loop, 0)
+
+                per_geom(is_global, run_geom)
                 kv_out_cp.wait()
 
             if c.ex_opt or c.tiled_vmem_pads:
@@ -4821,7 +5563,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     send_sem=S["pair_ssems"].at[6],
                     recv_sem=S["pair_rsems"].at[6],
                     device_id=(jnp.bitwise_xor(me, 1),),
-                    device_id_type=pl.DeviceIdType.MESH,
                 )
 
             def o_ship(ni, m):
@@ -5256,7 +5997,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                                 send_sem=S["ystage_sems"].at[b],
                                 recv_sem=y_rsem,
                                 device_id=(owner,),
-                                device_id_type=pl.DeviceIdType.MESH,
                             ).start()
 
                         return carry
@@ -5287,6 +6027,24 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             )
             cw2_fp4 = min(Il // FP4_PACK, 64 if c.ex_opt else 16)
             cw2_fp8 = min(Il // 4, 128 if c.ex_opt else 32)
+            # ex_kperm >= 3: normalized fp4 block scales, per-expert (gate, up, down) globals
+            gscale_t = c.ex_kperm >= 3 and kind == "fp4"
+            if gscale_t:
+                gs_mat = jnp.concatenate(
+                    [
+                        smr[SMALL["expert_gs"] : SMALL["expert_gs"] + 1, 0:Ep],
+                        smr[SMALL["expert_gs"] : SMALL["expert_gs"] + 1, Ep : 2 * Ep],
+                        smr[
+                            SMALL["expert_gs_down"] : SMALL["expert_gs_down"] + 1, 0:Ep
+                        ],
+                    ],
+                    axis=0,
+                )  # [3, Ep]
+
+            def globals_t(e):
+                lane = jax.lax.broadcasted_iota(jnp.int32, (3, Ep), 1)
+                g = jnp.sum(jnp.where(lane == e, gs_mat, 0.0), axis=1, keepdims=True)
+                return g[0:1], g[1:2], g[2:3]
 
             def ffn_rows(xc, slot, e, blockdiag, wait_w2=True):
                 """bf16 expert input rows -> packed bf16 output rows of this rank's slice."""
@@ -5310,6 +6068,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         cw13_fp4,
                         fast_bf16=c.ex_opt,
                         kperm=c.ex_kperm,
+                        via_fp8=c.ex_via_fp8,
                     )
                 else:
                     gu = _fp8_dot(
@@ -5321,6 +6080,9 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         c.fp4_chunk_words,
                     )
                 gate, up = gu[:, :Il], gu[:, Il:]
+                if gscale_t:
+                    g_gate, g_up, g_down = globals_t(e)
+                    gate, up = gate * g_gate, up * g_up
                 h = (gate * jax.nn.sigmoid(gate) * up).astype(bf16)
                 if split_w:
                     with _scope("ex_wait"):
@@ -5349,6 +6111,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         cw2_fp4,
                         fast_bf16=c.ex_opt,
                         kperm=c.ex_kperm,
+                        via_fp8=c.ex_via_fp8,
                     )
                 else:
                     y = _fp8_dot(
@@ -5359,6 +6122,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         He,
                         cw2_fp8,
                     )
+                if gscale_t:
+                    y = y * g_down
                 return _pack_bf16x2(y)
 
             def gather_x(pairs):
@@ -5383,7 +6148,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     lambda: pick_tree(arms[mid:], cnt),
                 )
 
-            def ebody(i, carry):
+            def ebody(i, carry, part=None):
                 slot = i % nslot
                 start_expert(i)
                 with _scope("ex_wait"):
@@ -5403,7 +6168,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         )
 
                 def full():
-                    CH = c.expert_chunk
+                    use_bd_chunk = c.ex_bd_all and kind == "fp4" and c.ex_kperm == 0
+                    CH = 8 if use_bd_chunk else c.expert_chunk
 
                     def full_one(nrows):
                         pairs = [
@@ -5421,7 +6187,11 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         ]
                         ystore(
                             ffn_rows(
-                                gather_x(pairs), slot, e, False, wait_w2=(ch == 0)
+                                gather_x(pairs),
+                                slot,
+                                e,
+                                use_bd_chunk,
+                                wait_w2=(ch == 0),
                             ),
                             pairs,
                             off + ch * CH,
@@ -5433,7 +6203,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         jax.lax.fori_loop(0, (cnt + CH - 1) // CH, chunk, 0)
 
                     with _scope("ex_full"):
-                        if c.ex_opt and vy >= 1:
+                        if c.ex_opt and vy >= 1 and not use_bd_chunk:
                             lo_b = c.compact_rows if kind == "fp4" else 0
                             raw_fb = (16, 24)
                             fb = tuple(b for b in raw_fb if lo_b < b <= R)
@@ -5450,10 +6220,19 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                             run_chunks()
 
                 if kind == "fp4" and c.compact_rows:
-                    arms = [
-                        (b, functools.partial(compact, b)) for b in compact_buckets(c)
-                    ]
-                    arms.append((None, full))
+                    buckets = compact_buckets(c)
+                    arms = [(b, functools.partial(compact, b)) for b in buckets]
+                    if buckets[-1] < R:
+                        arms.append((None, full))
+                    else:
+                        arms[-1] = (None, arms[-1][1])
+                    if part == "few":
+                        arms = [
+                            a for a in arms if a[0] is not None and a[0] <= c.split_rows
+                        ]
+                        arms[-1] = (None, arms[-1][1])
+                    elif part == "many":
+                        arms = [a for a in arms if a[0] is None or a[0] > c.split_rows]
                     pick_tree(arms, cnt)
                 else:
                     full()
@@ -5472,7 +6251,24 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 return carry
 
             with _scope("experts"):
-                jax.lax.fori_loop(0, n_u, ebody, jnp.int32(0))
+                if c.split_rows and kind == "fp4":
+                    n_groups = c.tp if (y_block and not use_pair_y) else 1
+
+                    def group(g_, carry):
+                        lo = jnp.where(
+                            g_ == 0, 0, rget("blk_end", jnp.maximum(g_ - 1, 0))
+                        )
+                        mid, hi = rget("blk_mid", g_), rget("blk_end", g_)
+                        carry = jax.lax.fori_loop(
+                            lo, mid, functools.partial(ebody, part="few"), carry
+                        )
+                        return jax.lax.fori_loop(
+                            mid, hi, functools.partial(ebody, part="many"), carry
+                        )
+
+                    jax.lax.fori_loop(0, n_groups, group, jnp.int32(0))
+                else:
+                    jax.lax.fori_loop(0, n_u, ebody, jnp.int32(0))
             if vy == 0:
                 ydrain(0)
                 ydrain(1)
@@ -5495,7 +6291,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                             send_sem=S["pair_ssems"].at[4],
                             recv_sem=S["pair_rsems"].at[4],
                             device_id=(partner_y,),
-                            device_id_type=pl.DeviceIdType.MESH,
                         )
                         for c_o in range(4)
                     ]
@@ -5540,7 +6335,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                             send_sem=S["pair_ssems"].at[5],
                             recv_sem=S["pair_rsems"].at[5],
                             device_id=(nb2_y,),
-                            device_id_type=pl.DeviceIdType.MESH,
                         )
                         c2b.start()
                         c2b.wait()
@@ -5597,7 +6391,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         send_sem=S["tc_ssems"].at[tc_smap["y"]],
                         recv_sem=S["tc_rsems"].at[tc_rmap["y"]],
                         device_id=(me,),
-                        device_id_type=pl.DeviceIdType.MESH,
                     )
 
                     def recv_row(_, carry):
@@ -5737,7 +6530,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                                 send_sem=S["tc_ssems"].at[_TC["u"]],
                                 recv_sem=u_osems.at[me],
                                 device_id=(coll._peer(d),),
-                                device_id_type=pl.DeviceIdType.MESH,
                             ).start()
 
                 def u_ready(t):
