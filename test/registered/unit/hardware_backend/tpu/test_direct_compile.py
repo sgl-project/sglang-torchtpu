@@ -247,6 +247,20 @@ class TestAuxHiddenStatePytree(CustomTestCase):
         self.assertIs(aux[1], second)
 
 
+class TestDonatedKVPoolInputs(CustomTestCase):
+    def test_donates_only_unshared_base_pool_tensors(self):
+        model, pool, view_base = torch.zeros(2), torch.zeros(2), torch.zeros(4)
+        shared, view = torch.zeros(2), view_base[:2]
+        # [model, kv: pool, shared, view, explicit: shared again]
+        inputs = [model, pool, shared, view, shared]
+        self.assertEqual(direct_compile._donated_kv_pool_inputs(inputs, 1, 3), [1])
+
+    def test_view_of_pool_tensor_blocks_its_donation(self):
+        pool = torch.zeros(4)
+        inputs = [pool, pool[:2]]
+        self.assertEqual(direct_compile._donated_kv_pool_inputs(inputs, 0, 1), [])
+
+
 class TestDirectCompile(CustomTestCase):
     def test_random_compiled_op_warmup_preserves_rng(self):
         torch_compile = torch.compile
@@ -1077,6 +1091,11 @@ class TestDirectCompile(CustomTestCase):
         self.assertEqual(
             traverse.call_args.kwargs["argument_layouts"],
             [[]] * len(retained_graph_inputs),
+        )
+        # The KV-pool input sits after the retained model inputs.
+        self.assertEqual(
+            traverse.call_args.kwargs["donated_inputs"],
+            [len(expected_model_inputs)],
         )
         model_inputs = next(iter(compiled.cache.values())).model_inputs
         self.assertEqual(len(model_inputs), len(expected_model_inputs))

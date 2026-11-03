@@ -6,7 +6,7 @@ import gzip
 import importlib.metadata
 import os
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -205,6 +205,7 @@ class SPMDCompiler:
         inputs,
         *,
         argument_layouts: list[list[int]],
+        donated_inputs: Sequence[int] = (),
         interface: ExecutableInterface | None = None,
         graph: str,
     ) -> Submission | SPMDCompiler:
@@ -221,7 +222,10 @@ class SPMDCompiler:
             raise ValueError(f"Invalid TPU compile owner: {graph}")
         submission.interface = interface
         submission.pending = tc.async_traverse_and_compile(
-            outputs, inputs, argument_layouts=interface.argument_layouts
+            outputs,
+            inputs,
+            argument_layouts=interface.argument_layouts,
+            donated_inputs=list(donated_inputs),
         )
         return submission
 
