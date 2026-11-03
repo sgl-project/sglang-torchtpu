@@ -58,6 +58,10 @@ class HostPaddedDraftInput(SpecInput):
             raise RuntimeError("TpuSpecWorker needs a host-resident req_to_token pool.")
         batch.maybe_evict_swa()
 
+        # Match EAGLE's relaxed penalty policy before the forward snapshot.
+        if batch.sampling_info.penalizer_orchestrator.is_required:
+            batch.cumulate_penalty_output_tokens()
+
         # The previous, not-yet-copied commit may be wider than the next step.
         # Reserve both windows at capacity so either adaptive transition fits.
         verify_window_rows = int(max_speculative_num_draft_tokens())
