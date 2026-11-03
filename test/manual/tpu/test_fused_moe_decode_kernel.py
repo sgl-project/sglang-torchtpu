@@ -9,8 +9,6 @@ os.environ.setdefault(
     "XLA_FLAGS",
     f"--xla_force_host_platform_device_count={os.environ.get('WORLD_SIZE', '8')}",
 )
-os.environ.setdefault("SGLANG_TPU_ENABLE_FUSED_MOE_DECODE_KERNEL", "1")
-os.environ.setdefault("SGLANG_TPU_MOE_IMPLEMENTATION", "fused_moe_decode")
 os.environ.setdefault("SGLANG_TPU_FUSED_MOE_DECODE_MAX_TOKENS", "256")
 
 import torch
@@ -19,6 +17,7 @@ import torch.nn as nn
 from torch_tpu._internal.distributed import tpu_distributed  # noqa: F401
 
 import sglang_tpu.moe.pallas.fused_moe_decode.fused_moe_decode_op as fmd_op
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.platforms import current_platform
 from sglang_tpu.moe.pallas.fused_moe_decode.fused_moe_decode_op import (
     apply_fused_moe_decode,
@@ -69,6 +68,10 @@ class DummySharedExperts(nn.Module):
 
 
 class DummyMoE(nn.Module):
+    # Stands in for a DeepseekV2MoE under a decoder layer that passes the
+    # predicate to its FFN boundary as summed_by_compute.
+    allow_tpu_fused_moe_decode = True
+
     def __init__(
         self,
         rank: int,
@@ -78,11 +81,13 @@ class DummyMoE(nn.Module):
         i_e: int,
         i_s: int,
         routed_scale: float,
+        swiglu_limit,
         device: torch.device,
     ):
         super().__init__()
         self.tp_size = world_size
         self.routed_scaling_factor = routed_scale
+        self.swiglu_limit = swiglu_limit
         self.experts = DummyExperts(e_local, h, i_e, device)
         self.shared_experts = DummySharedExperts(h, i_s, rank, device)
 
@@ -92,9 +97,103 @@ class DummyMoE(nn.Module):
         topk_w: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        if should_use_fused_moe_decode(self, hidden_states):
+        if should_use_fused_moe_decode(self, hidden_states, _DECODE_BATCH):
             return apply_fused_moe_decode(self, hidden_states, (topk_w, topk_ids, None))
         raise RuntimeError("Expected should_use_fused_moe_decode=True")
+
+
+_DECODE_BATCH = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+_EXTEND_BATCH = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+_VERIFY_BATCH = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+
+
+def _swiglu(gate_up: torch.Tensor, limit) -> torch.Tensor:
+    gate, up = gate_up.chunk(2, dim=-1)
+    if limit is not None:
+        gate = gate.clamp(max=limit)
+        up = up.clamp(min=-limit, max=limit)
+    return torch.nn.functional.silu(gate) * up
+
+
+def _check_case(
+    name: str,
+    *,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    e_local: int,
+    h: int,
+    i_e: int,
+    i_s: int,
+    routed_scale: float,
+    swiglu_limit,
+    token_sizes,
+) -> None:
+    top_k = 8
+    moe = DummyMoE(
+        rank, world_size, e_local, h, i_e, i_s, routed_scale, swiglu_limit, device
+    )
+    assert prepare_moe_layer_for_fused_decode(moe), name
+    assert moe._tpu_fused_moe_decode_swiglu_limit == swiglu_limit, name
+
+    x_small = torch.empty((16, h), dtype=torch.bfloat16, device=device)
+    x_257 = torch.empty((257, h), dtype=torch.bfloat16, device=device)
+    assert not should_use_fused_moe_decode(moe, x_257, _DECODE_BATCH), name
+    # Small non-decode batches keep the gmm_v2 path.
+    assert not should_use_fused_moe_decode(moe, x_small, _EXTEND_BATCH), name
+    assert not should_use_fused_moe_decode(moe, x_small, _VERIFY_BATCH), name
+    assert not should_use_fused_moe_decode(moe, x_small, None), name
+
+    compiled_moe = torch.compile(
+        moe, backend=current_platform.get_compile_backend(), fullgraph=True
+    )
+
+    for num_tokens in token_sizes:
+        torch.manual_seed(999 + num_tokens)
+        x_cpu = torch.randn(num_tokens, h, dtype=torch.bfloat16)
+        topk_ids_cpu = torch.randint(
+            0, world_size * e_local, (num_tokens, top_k), dtype=torch.int32
+        )
+        topk_w_cpu = torch.softmax(
+            torch.randn(num_tokens, top_k, dtype=torch.float32), dim=-1
+        ).to(torch.bfloat16)
+
+        x = x_cpu.to(device)
+        topk_ids = topk_ids_cpu.to(device)
+        topk_w = topk_w_cpu.to(device)
+
+        assert should_use_fused_moe_decode(moe, x, _DECODE_BATCH), name
+        out = compiled_moe(x, topk_w, topk_ids)
+
+        # Reference on the local rank followed by an all-reduce across ranks.
+        xf = x.float()
+        local_ids = topk_ids.long() - rank * e_local
+        local_routed = torch.zeros(num_tokens, h, dtype=torch.float32, device=device)
+        for ei in range(e_local):
+            coeff = ((local_ids == ei).float() * topk_w.float()).sum(dim=-1)
+            act = _swiglu(xf @ moe.experts.w13_deq[ei], swiglu_limit)
+            y = act @ moe.experts.w2_deq[ei]
+            local_routed += (coeff * routed_scale).unsqueeze(-1) * y
+
+        s_act = _swiglu(xf @ moe.shared_experts.gate_up_proj.w_deq, swiglu_limit)
+        local_shared = s_act @ moe.shared_experts.down_proj.w_deq
+        local_total = (local_routed + local_shared).to(torch.bfloat16)
+        dist.all_reduce(local_total, op=dist.ReduceOp.SUM)
+
+        cos = torch.nn.functional.cosine_similarity(
+            out.float().flatten(), local_total.float().flatten(), dim=0
+        ).item()
+        rel_l2 = (
+            (out.float() - local_total.float()).norm()
+            / local_total.float().norm().clamp_min(1e-6)
+        ).item()
+        assert cos > 0.99, f"[{name}] Low cosine similarity {cos} at T={num_tokens}"
+        assert rel_l2 < 0.08, f"[{name}] High relative L2 {rel_l2} at T={num_tokens}"
+        if rank == 0:
+            print(
+                f"[{name}] T={num_tokens} cos={cos:.5f} rel_l2={rel_l2:.4f}",
+                flush=True,
+            )
 
 
 def main():
@@ -111,84 +210,51 @@ def main():
         pp_size=1,
     )
 
-    # GLM-5.3-Flash TP8+EP8 dimensions:
-    # h = 2048, e_local = 128 // 8 = 16, i_e = 1536, i_s = 1536 // 8 = 192 (padded to 256)
-    e_local, h, i_e, i_s = 16, 2048, 1536, 192
-    routed_scale = 2.5
+    tokens_env = os.environ.get(
+        "SGLANG_TPU_FUSED_MOE_DECODE_TEST_TOKENS", "1,16,64,256"
+    )
+    token_sizes = [int(x) for x in tokens_env.split(",") if x.strip()]
 
     orig_get_parallel = fmd_op.get_parallel
+    orig_enabled = fmd_op.is_fused_moe_decode_enabled
     fmd_op.get_parallel = lambda: fake_parallel
+    # Stands in for `--moe-runner-backend pallas_tpu_fused_decode`.
+    fmd_op.is_fused_moe_decode_enabled = lambda: True
     try:
-        moe = DummyMoE(rank, world_size, e_local, h, i_e, i_s, routed_scale, device)
-        assert prepare_moe_layer_for_fused_decode(moe)
-        x_257 = torch.empty((257, h), dtype=torch.bfloat16, device=device)
-        assert not should_use_fused_moe_decode(moe, x_257)
-
-        compiled_moe = torch.compile(
-            moe, backend=current_platform.get_compile_backend(), fullgraph=True
+        # GLM-5.3-Flash at TP8+EP8: h = 4096, 288 routed experts -> e_local = 36,
+        # moe_intermediate_size = 2048, one shared expert -> i_s = 2048 / 8 = 256,
+        # routed_scaling_factor = 2.5, swiglu_limit = 10.0.
+        _check_case(
+            "glm53_flash",
+            rank=rank,
+            world_size=world_size,
+            device=device,
+            e_local=36,
+            h=4096,
+            i_e=2048,
+            i_s=256,
+            routed_scale=2.5,
+            swiglu_limit=10.0,
+            token_sizes=token_sizes,
         )
-
-        tokens_env = os.environ.get(
-            "SGLANG_TPU_FUSED_MOE_DECODE_TEST_TOKENS", "1,16,64,256"
+        # Unclamped SwiGLU with a shared-expert width that is not a multiple of
+        # 128 (i_s = 192 is zero-padded to 256 at preparation time).
+        _check_case(
+            "unclamped_padded_shared",
+            rank=rank,
+            world_size=world_size,
+            device=device,
+            e_local=16,
+            h=2048,
+            i_e=1536,
+            i_s=192,
+            routed_scale=2.5,
+            swiglu_limit=None,
+            token_sizes=[t for t in token_sizes if t <= 64] or token_sizes[:1],
         )
-        token_sizes = [int(x) for x in tokens_env.split(",") if x.strip()]
-
-        for num_tokens in token_sizes:
-            torch.manual_seed(999 + num_tokens)
-            x_cpu = torch.randn(num_tokens, h, dtype=torch.bfloat16)
-            topk_ids_cpu = torch.randint(
-                0, world_size * e_local, (num_tokens, 8), dtype=torch.int32
-            )
-            topk_w_cpu = torch.softmax(
-                torch.randn(num_tokens, 8, dtype=torch.float32), dim=-1
-            ).to(torch.bfloat16)
-
-            x = x_cpu.to(device)
-            topk_ids = topk_ids_cpu.to(device)
-            topk_w = topk_w_cpu.to(device)
-
-            assert should_use_fused_moe_decode(moe, x)
-            out = compiled_moe(x, topk_w, topk_ids)
-
-            # Reference on local rank followed by all-reduce across 8 ranks
-            xf = x.float()
-            local_routed = torch.zeros(
-                num_tokens, h, dtype=torch.float32, device=device
-            )
-            exp_start = rank * e_local
-            for slot in range(8):
-                e_idx = topk_ids[:, slot] - exp_start
-                valid = (e_idx >= 0) & (e_idx < e_local)
-                if valid.any():
-                    for t in range(num_tokens):
-                        if bool(valid[t].item()):
-                            ei = int(e_idx[t].item())
-                            gu = xf[t : t + 1] @ moe.experts.w13_deq[ei]
-                            g, u = gu.chunk(2, dim=-1)
-                            act = torch.nn.functional.silu(g) * u
-                            y = act @ moe.experts.w2_deq[ei]
-                            local_routed[t : t + 1] += (
-                                topk_w[t, slot].float() * routed_scale * y
-                            )
-
-            s_gu = xf @ moe.shared_experts.gate_up_proj.w_deq
-            sg, su = s_gu.chunk(2, dim=-1)
-            s_act = torch.nn.functional.silu(sg) * su
-            local_shared = s_act @ moe.shared_experts.down_proj.w_deq
-            local_total = (local_routed + local_shared).to(torch.bfloat16)
-            dist.all_reduce(local_total, op=dist.ReduceOp.SUM)
-
-            cos = torch.nn.functional.cosine_similarity(
-                out.float().flatten(), local_total.float().flatten(), dim=0
-            ).item()
-            rel_l2 = (
-                (out.float() - local_total.float()).norm()
-                / local_total.float().norm().clamp_min(1e-6)
-            ).item()
-            assert cos > 0.99, f"Low cosine similarity {cos} at T={num_tokens}"
-            assert rel_l2 < 0.08, f"High relative L2 {rel_l2} at T={num_tokens}"
     finally:
         fmd_op.get_parallel = orig_get_parallel
+        fmd_op.is_fused_moe_decode_enabled = orig_enabled
 
     print(f"FUSED_MOE_DECODE_KERNEL_PASS rank={rank}", flush=True)
 

@@ -3,25 +3,29 @@
 # NOTE: do *not* add `from __future__ import annotations` here —
 # `sglang_tpu.pallas_jax_op.cpu_export_jax_op` / `torch_tpu._internal.pallas.jax_op`
 # inspects `param.annotation is jax.Array` at registration time.
-"""PyTorch custom-op registration, config helpers, and model integration for `fused_moe_decode`.
+"""PyTorch custom-op registration and model integration for `fused_moe_decode`.
 
-Enables switching MoE implementations via either:
-  1. Server argument: `--moe-runner-backend pallas_tpu_fused_decode`
-  2. Environment variable: `SGLANG_TPU_MOE_IMPLEMENTATION=fused_moe_decode`
-     or `SGLANG_TPU_ENABLE_FUSED_MOE_DECODE_KERNEL=1`
+Enabled with `--moe-runner-backend pallas_tpu_fused_decode`.
 
-For decode batches (`num_tokens <= SGLANG_TPU_FUSED_MOE_DECODE_MAX_TOKENS`,
-default `256` as an example threshold), eligible MoE layers execute the
-single-kernel `fused_moe_decode` Pallas op (fusing TopK mask + sparse expert
-gather + routed gate/up/SwiGLU/down + shared expert MLP + cross-device
-All-Reduce). Batches with `num_tokens > SGLANG_TPU_FUSED_MOE_DECODE_MAX_TOKENS`
-automatically use the standard `gmm_v2` prefill path.
+Eligible MoE layers then run the single-kernel `fused_moe_decode` Pallas op
+(fusing TopK mask + sparse expert gather + routed gate/up/SwiGLU/down + shared
+expert MLP + cross-device all-reduce) for `ForwardMode.DECODE` batches with
+`num_tokens <= SGLANG_TPU_FUSED_MOE_DECODE_MAX_TOKENS` (default `256`). Every
+other batch (extend/prefill, mixed chunked prefill, speculative target-verify
+and draft-extend, and decode batches above the threshold) uses the regular
+`gmm_v2` path.
+
+Because the kernel returns an already all-reduced output, the decoder layer
+must tell its FFN boundary not to sum it again (`summed_by_compute`). Only MoE
+blocks whose decoder layer does that set `allow_tpu_fused_moe_decode = True`
+(`DeepseekV2DecoderLayer` and `Glm5NextDecoderLayer`); others are never
+prepared.
 """
 
 import functools
 import logging
 from threading import Lock
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -29,23 +33,12 @@ from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.runtime_context import get_parallel
 from sglang_tpu.rank_local import traced_rank
 
-if TYPE_CHECKING:
-    pass
-
 logger = logging.getLogger(__name__)
 
 _OPS: dict[tuple, Callable] = {}
 _OPS_LOCK = Lock()
 
 _DEFAULT_MESH_AXIS = "model"
-
-_FUSED_DECODE_BACKEND_NAMES = frozenset(
-    {
-        "fused_moe_decode",
-        "pallas_tpu_fused_decode",
-        "tpu_fused_moe_decode",
-    }
-)
 
 
 def _own_storage(tensor: torch.Tensor) -> torch.Tensor:
@@ -71,31 +64,10 @@ def _own_storage(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def is_fused_moe_decode_enabled() -> bool:
-    """Return True if the fused MoE decode kernel is enabled via env or runner config."""
-    from sglang_tpu.envs import envs as tpu_envs
+    """Return True if `--moe-runner-backend pallas_tpu_fused_decode` is selected."""
+    from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
-    if tpu_envs.SGLANG_TPU_ENABLE_FUSED_MOE_DECODE_KERNEL.get():
-        return True
-    moe_impl = tpu_envs.SGLANG_TPU_MOE_IMPLEMENTATION.get().strip().lower()
-    if moe_impl in _FUSED_DECODE_BACKEND_NAMES:
-        return True
-
-    try:
-        from sglang.srt.layers.moe.utils import get_moe_runner_backend
-
-        runner_backend = get_moe_runner_backend()
-        if runner_backend is not None:
-            if getattr(runner_backend, "is_pallas_tpu_fused_decode", lambda: False)():
-                return True
-            if str(runner_backend).strip().lower() in _FUSED_DECODE_BACKEND_NAMES:
-                return True
-    except (ImportError, AttributeError, RuntimeError) as exc:
-        logger.warning(
-            "Failed to query get_moe_runner_backend() for fused_moe_decode: %s",
-            exc,
-        )
-
-    return False
+    return get_moe_runner_backend().is_pallas_tpu_fused_decode()
 
 
 def get_fused_moe_decode_max_tokens() -> int:
@@ -117,7 +89,6 @@ def _build_op(
     routed_scaling_factor: float,
     swiglu_limit: Optional[float] = None,
     has_shared: bool = True,
-    reduce_output: bool = True,
     axis_name: str = _DEFAULT_MESH_AXIS,
 ) -> Callable:
     import jax
@@ -136,7 +107,7 @@ def _build_op(
         if swiglu_limit is None
         else f"{swiglu_limit:.6g}".replace(".", "_").replace("-", "m")
     )
-    mode_tag = f"s{int(has_shared)}_r{int(reduce_output)}"
+    mode_tag = f"s{int(has_shared)}"
     op_name = (
         f"sglang_tpu_pallas::fused_moe_decode_tp{world_size}_s{scale_tag}"
         f"_l{limit_tag}_{mode_tag}_{axis_name}"
@@ -170,7 +141,7 @@ def _build_op(
                 s_w1_scale,
                 s_w2,
                 s_w2_scale,
-                None,
+                None,  # shared_gate_weight: no sigmoid shared-expert gate
                 topk_weights,
                 topk_ids,
                 n_ranks=world_size,
@@ -178,7 +149,6 @@ def _build_op(
                 routed_scale=routed_scaling_factor,
                 swiglu_limit=swiglu_limit,
                 has_shared=True,
-                reduce_output=reduce_output,
             )
 
         sharded_fn = jax.shard_map(
@@ -248,7 +218,7 @@ def _build_op(
             None,
             None,
             None,
-            None,
+            None,  # shared_gate_weight
             topk_weights,
             topk_ids,
             n_ranks=world_size,
@@ -256,7 +226,6 @@ def _build_op(
             routed_scale=routed_scaling_factor,
             swiglu_limit=swiglu_limit,
             has_shared=False,
-            reduce_output=reduce_output,
         )
 
     sharded_routed_fn = jax.shard_map(
@@ -302,7 +271,6 @@ def _get_op(
     routed_scaling_factor: float,
     swiglu_limit: Optional[float] = None,
     has_shared: bool = True,
-    reduce_output: bool = True,
     axis_name: str = _DEFAULT_MESH_AXIS,
 ) -> Callable:
     key = (
@@ -310,7 +278,6 @@ def _get_op(
         float(routed_scaling_factor),
         None if swiglu_limit is None else float(swiglu_limit),
         bool(has_shared),
-        bool(reduce_output),
         str(axis_name),
     )
     op = _OPS.get(key)
@@ -329,14 +296,14 @@ def _resolve_swiglu_limit(
     experts: Optional[torch.nn.Module] = None,
     shared: Optional[torch.nn.Module] = None,
 ) -> Optional[float]:
-    """Resolve optional SwiGLU activation clamping threshold (`swiglu_limit`).
+    """Resolve the optional SwiGLU clamp threshold (`swiglu_limit`).
 
-    Some MoE architectures (such as models setting `moe_runner_config.swiglu_limit`
-    or `gemm1_clamp_limit`) clamp the gate and up projections before the SwiGLU
-    nonlinearity (`gate = min(gate, limit)`, `up = clip(up, -limit, limit)`) to
-    prevent activation overflow in low-precision formats. Returns `None` when
-    standard unclamped SwiGLU (`silu(gate) * up`) is used (e.g., DeepSeek-V2/V3,
-    GLM-5.3-Flash).
+    Models with `config.swiglu_limit` clamp the gate and up projections before
+    the SwiGLU nonlinearity (`gate = min(gate, limit)`,
+    `up = clip(up, -limit, limit)`); `DeepseekV2MoE` forwards it to `FusedMoE`,
+    where it lands in `moe_runner_config.swiglu_limit`. GLM-5.3-Flash sets
+    `swiglu_limit = 10.0`. Returns `None` for unclamped SwiGLU
+    (`silu(gate) * up`), e.g. DeepSeek-V2/V3.
     """
     for obj in (
         moe_layer,
@@ -365,12 +332,10 @@ def _resolve_rank_tensor(
     return layer._fmd_rank
 
 
-def prepare_fp8_fused_moe_decode(layer: torch.nn.Module) -> bool:
+def _prepare_fp8_routed_experts(layer: torch.nn.Module) -> bool:
     """Prepare routed FP8 MoE scale & rank buffers on `layer` (`FusedMoE`)."""
     if getattr(layer, "_fmd_routed_prepared", False):
         return True
-    if not is_fused_moe_decode_enabled():
-        return False
     if getattr(layer, "weight_block_size", None) is not None:
         return False
 
@@ -389,19 +354,34 @@ def prepare_fp8_fused_moe_decode(layer: torch.nn.Module) -> bool:
     # prefill (> max_tokens), and register float32 buffers for Pallas async DMA.
     w1_s_f32 = _own_storage(w13_scale.data.to(torch.float32).contiguous())
     w2_s_f32 = _own_storage(w2_scale.data.to(torch.float32).contiguous())
-    parallel = get_parallel()
-    ep_rank = int(parallel.moe_ep_rank)
-    world_size = int(max(1, parallel.moe_ep_size))
+    ep_rank = int(get_parallel().moe_ep_rank)
     rank_tensor = torch.tensor([ep_rank], dtype=torch.int32, device=w13.data.device)
 
     layer.register_buffer("_fmd_w1_scale", w1_s_f32, persistent=False)
     layer.register_buffer("_fmd_w2_scale", w2_s_f32, persistent=False)
     layer.register_buffer("_fmd_rank", rank_tensor, persistent=False)
     layer._fmd_routed_prepared = True
-    layer._fmd_max_tokens = get_fused_moe_decode_max_tokens()
-    layer._fmd_ep_rank = ep_rank
-    layer._fmd_world_size = world_size
     return True
+
+
+def _static_ineligibility_reason(moe_layer: torch.nn.Module) -> Optional[str]:
+    """Why `moe_layer`'s forward could never take the fused path, or None.
+
+    These are per-layer properties fixed at construction, so they are checked
+    once here instead of at every forward.
+    """
+    if not getattr(moe_layer, "allow_tpu_fused_moe_decode", False):
+        return "decoder layer does not pass summed_by_compute to its FFN boundary"
+    if getattr(moe_layer, "is_hash", False):
+        return "hash-routed MoE layer"
+    gate = getattr(moe_layer, "gate", None)
+    if getattr(gate, "e_score_correction_bias_vl", None) is not None:
+        return "vision top-k routing"
+    if getattr(moe_layer, "_enable_a2a_moe", False):
+        return "all-to-all (DeepEP/mega MoE) dispatch"
+    if getattr(moe_layer, "_shared_expert_tp1", False):
+        return "replicated (TP1) shared expert"
+    return None
 
 
 def prepare_moe_layer_for_fused_decode(moe_layer: torch.nn.Module) -> bool:
@@ -410,6 +390,12 @@ def prepare_moe_layer_for_fused_decode(moe_layer: torch.nn.Module) -> bool:
         return True
     moe_layer._tpu_fused_moe_decode_checked = True
     if not is_fused_moe_decode_enabled():
+        return False
+    reason = _static_ineligibility_reason(moe_layer)
+    if reason is not None:
+        logger.debug(
+            "fused_moe_decode disabled for %s: %s", type(moe_layer).__name__, reason
+        )
         return False
 
     parallel = get_parallel()
@@ -421,7 +407,7 @@ def prepare_moe_layer_for_fused_decode(moe_layer: torch.nn.Module) -> bool:
     experts = getattr(moe_layer, "experts", None)
     if experts is None:
         return False
-    if not prepare_fp8_fused_moe_decode(experts):
+    if not _prepare_fp8_routed_experts(experts):
         return False
 
     h = int(experts.w13_weight.shape[1])
@@ -492,13 +478,7 @@ def prepare_moe_layer_for_fused_decode(moe_layer: torch.nn.Module) -> bool:
     swiglu_limit = _resolve_swiglu_limit(moe_layer, experts, shared)
 
     # Eagerly build the custom op outside torch.compile / Dynamo tracing.
-    _get_op(
-        tp_size,
-        routed_scaling_factor,
-        swiglu_limit,
-        has_shared=has_shared,
-        reduce_output=True,
-    )
+    _get_op(tp_size, routed_scaling_factor, swiglu_limit, has_shared=has_shared)
 
     moe_layer._tpu_fused_moe_decode_ready = True
     moe_layer._tpu_fused_moe_decode_has_shared = has_shared
@@ -507,7 +487,6 @@ def prepare_moe_layer_for_fused_decode(moe_layer: torch.nn.Module) -> bool:
     moe_layer._tpu_fused_moe_decode_routed_scale = routed_scaling_factor
     moe_layer._tpu_fused_moe_decode_swiglu_limit = swiglu_limit
     moe_layer._tpu_fused_moe_decode_max_tokens = get_fused_moe_decode_max_tokens()
-    experts._tpu_fused_moe_decode_layer_prepared = True
     return True
 
 
@@ -516,55 +495,42 @@ def prepare_model_for_fused_moe_decode(model: torch.nn.Module) -> int:
     if not is_fused_moe_decode_enabled():
         return 0
 
-    prepared_moe_layer_count = 0
-    prepared_routed_count = 0
+    prepared = 0
     for module in model.modules():
-        if hasattr(module, "experts") and hasattr(module, "topk"):
+        if getattr(module, "allow_tpu_fused_moe_decode", False):
             if prepare_moe_layer_for_fused_decode(module):
-                prepared_moe_layer_count += 1
+                prepared += 1
 
-    parallel = get_parallel()
-    world_size = max(1, parallel.moe_ep_size)
-    for module in model.modules():
-        if getattr(module, "_tpu_fused_moe_decode_layer_prepared", False):
-            continue
-        if hasattr(module, "w13_weight") and hasattr(module, "w2_weight"):
-            if prepare_fp8_fused_moe_decode(module):
-                swiglu_limit = _resolve_swiglu_limit(module, module, None)
-                routed_scale = float(getattr(module, "routed_scaling_factor", 1.0))
-                _get_op(
-                    world_size,
-                    routed_scale,
-                    swiglu_limit,
-                    has_shared=False,
-                    reduce_output=False,
-                )
-                module._fmd_standalone_ready = True
-                module._fmd_world_size = world_size
-                prepared_routed_count += 1
-
-    total = prepared_moe_layer_count + prepared_routed_count
-    if total > 0:
+    if prepared > 0:
         logger.info(
-            "Prepared TPU fused_moe_decode kernel on %d MoE layers "
-            "and %d standalone FusedMoE layers (max_tokens=%d).",
-            prepared_moe_layer_count,
-            prepared_routed_count,
+            "Prepared TPU fused_moe_decode kernel on %d MoE layers (max_tokens=%d).",
+            prepared,
             get_fused_moe_decode_max_tokens(),
         )
-    return total
+    return prepared
 
 
 def should_use_fused_moe_decode(
     moe_layer: torch.nn.Module,
     hidden_states: torch.Tensor,
+    forward_batch,
 ) -> bool:
-    """Return True when `moe_layer` should execute `fused_moe_decode` for `hidden_states`."""
+    """Return True when `moe_layer` should execute `fused_moe_decode` for this batch.
+
+    Callers must use the same answer both to dispatch the MoE forward and as the
+    FFN boundary's `summed_by_compute`; see `DeepseekV2MoE.use_tpu_fused_moe_decode`.
+    """
     if not getattr(moe_layer, "_tpu_fused_moe_decode_ready", False):
         if not getattr(moe_layer, "_tpu_fused_moe_decode_checked", False):
             prepare_moe_layer_for_fused_decode(moe_layer)
         if not getattr(moe_layer, "_tpu_fused_moe_decode_ready", False):
             return False
+
+    # Only plain decode steps: extend / mixed chunked-prefill / speculative
+    # verify batches can also be <= max_tokens but have not been benchmarked
+    # with this kernel, so they keep using gmm_v2.
+    if forward_batch is None or not forward_batch.forward_mode.is_decode():
+        return False
 
     num_tokens = int(hidden_states.shape[0])
     max_tokens = int(getattr(moe_layer, "_tpu_fused_moe_decode_max_tokens", 256))
@@ -596,13 +562,7 @@ def apply_fused_moe_decode(
     ep_rank = int(moe_layer._tpu_fused_moe_decode_ep_rank)
     rank = _resolve_rank_tensor(experts, ep_rank, world_size)
 
-    op = _get_op(
-        world_size,
-        routed_scale,
-        swiglu_limit,
-        has_shared=has_shared,
-        reduce_output=True,
-    )
+    op = _get_op(world_size, routed_scale, swiglu_limit, has_shared=has_shared)
     if has_shared:
         return op(
             hidden_states,
@@ -626,58 +586,5 @@ def apply_fused_moe_decode(
         experts._fmd_w1_scale,
         experts.w2_weight,
         experts._fmd_w2_scale,
-        rank,
-    )
-
-
-def should_use_routed_fused_moe_decode(
-    layer: torch.nn.Module,
-    hidden_states: torch.Tensor,
-    *,
-    block_quant: bool,
-    no_combine: bool,
-) -> bool:
-    """Return True for standalone `FusedMoE` layers (when not fused at parent MoE block)."""
-    if block_quant or no_combine:
-        return False
-    if getattr(layer, "_tpu_fused_moe_decode_layer_prepared", False):
-        return False
-    if not getattr(layer, "_fmd_routed_prepared", False):
-        return False
-    num_tokens = int(hidden_states.shape[0])
-    max_tokens = int(getattr(layer, "_fmd_max_tokens", 256))
-    return 0 < num_tokens <= max_tokens
-
-
-def apply_routed_fused_moe_decode(
-    layer: torch.nn.Module,
-    hidden_states: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    *,
-    swiglu_limit: Optional[float] = None,
-) -> torch.Tensor:
-    """Execute routed-only `fused_moe_decode` (without shared expert or all-reduce)."""
-    world_size = int(layer._fmd_world_size)
-    ep_rank = int(layer._fmd_ep_rank)
-    rank = _resolve_rank_tensor(layer, ep_rank, world_size)
-    routed_scale = 1.0  # StandardRunner scales topk_weights or post-scales outside
-    if swiglu_limit is not None:
-        swiglu_limit = float(swiglu_limit)
-    op = _get_op(
-        world_size,
-        routed_scale,
-        swiglu_limit,
-        has_shared=False,
-        reduce_output=False,
-    )
-    return op(
-        hidden_states,
-        topk_ids.to(torch.int32),
-        topk_weights.to(torch.float32),
-        layer.w13_weight,
-        layer._fmd_w1_scale,
-        layer.w2_weight,
-        layer._fmd_w2_scale,
         rank,
     )

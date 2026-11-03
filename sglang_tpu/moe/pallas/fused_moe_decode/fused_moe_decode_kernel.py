@@ -5,7 +5,8 @@
 Ported from vllm-torchtpu (`vllm_torchtpu/kernels/experimental/fused_moe_decode/fused_moe_decode_kernel.py`)
 with extensions for `sglang-torchtpu`:
   - Optional `swiglu_limit` clamping on both routed and shared SwiGLU activations
-    (used by GLM-5.3-Flash / DeepSeek-V2.5 / Glm5Next where `swiglu_limit = 10.0`).
+    (`gate = min(gate, limit)`, `up = clip(up, -limit, limit)`). GLM-5.3-Flash
+    (`Glm5Next`) sets `swiglu_limit = 10.0`; DeepSeek-V2/V3 leave it unset.
   - Safe handling of negative `topk_ids` (`-1` padding) prior to subtracting
     `expert_start`.
   - Support for both shared+routed (`has_shared=True`) and routed-only
@@ -365,6 +366,16 @@ def _token_side_bytes(m, h, i_s, experts, n_ranks, wt):
 
 
 def plan_weight_ring(m, h, i, i_s, experts, n_ranks, weight_dtype, i_block=None):
+    """Choose the routed-expert weight ring: `(ib, nb)`.
+
+    `ib is None` streams whole experts (`w1` + `w2` + scales per slot); this is
+    used when a 3-deep ring of whole experts fits in VMEM
+    (`3 * _unit_bytes(h, i) <= vmem_capacity`) or no block width divides `i`.
+    Otherwise each slot holds an `ib`-wide slice of the intermediate dimension,
+    with `ib` the widest of `_I_BLOCKS` (or the explicit `i_block`) that divides
+    `i` and still leaves room for 3 slots next to the token-side buffers and
+    `_VMEM_RESERVE`. `nb` is the ring depth, clamped to `[3, _NUM_BUFFERS]`.
+    """
     wt = jnp.dtype(weight_dtype).itemsize
     capacity = pltpu.get_tpu_info().vmem_capacity_bytes
     if i_block is None:
