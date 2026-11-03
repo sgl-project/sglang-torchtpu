@@ -1007,6 +1007,7 @@ def _initialize(groups, *, bounded_staging=True, real_budget=False):
         _max_request_blocks=lambda: 64,
         _swa_max_request_blocks=lambda: 3,
         _slot_ceiling=lambda: 64,
+        _bounded_staging=False,
     )
 
     def num_slots(tensors, max_blocks, engines=1, **budget):
@@ -1026,6 +1027,7 @@ def _initialize(groups, *, bounded_staging=True, real_budget=False):
         return 4 if max_blocks == 3 else 6
 
     manager._num_slots = num_slots
+    manager._rank_budget_bytes = lambda: RaidenKVManager._rank_budget_bytes(manager)
 
     class Engine:
         def __init__(self, **kwargs):

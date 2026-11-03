@@ -419,7 +419,7 @@ class SamplingBatchInfo:
     def update_penalties(self):
         if self.penalizer_orchestrator.is_required:
             self.acc_additive_penalties = torch.zeros(
-                (len(self.temperatures), self.vocab_size),
+                (len(self), self.vocab_size),
                 dtype=torch.float32,
                 device=self.device,
             )
