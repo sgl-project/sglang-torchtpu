@@ -99,18 +99,37 @@ def checkpoint_snapshot_pairs(
     return src, dst, valid.sum(dtype=torch.int32).reshape(1)
 
 
+def read_state_rows(state: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+    """``state[rows]`` for in-range ``rows``, without touching the rest of the pool."""
+    if state.device.type != "tpu":
+        return state.index_select(0, rows.long())
+    from sglang_tpu.mamba_state_rows import state_row_read_op
+
+    pool, out = state_row_read_op()(state, rows.to(torch.int32))
+    state.copy_(pool)
+    return out
+
+
 def write_state_rows(
     state: torch.Tensor, rows: torch.Tensor, new: torch.Tensor, live: torch.Tensor
 ) -> None:
-    """Scatter ``new`` [len(rows), ...] into int64 ``rows`` of ``state`` in place, skipping dead rows.
+    """Write ``new`` [len(rows), ...] into ``rows`` of ``state`` in place, skipping dead rows.
 
-    Keep this a row scatter: a dense whole-pool select compiles into full-pool
-    relayout copies per stream, scaling with max-running.
+    Live rows must be distinct. On TPU the rows are DMAed into the donated pool:
+    an XLA scatter relayouts the whole pool per call, scaling with the slot count.
     """
-    # Dead rows rewrite the null slot with its own value, so the duplicate
-    # indices all carry identical data and the scatter stays deterministic.
-    rows = torch.where(live, rows, 0)
     new = new.reshape(rows.shape[0], *state.shape[1:]).to(state.dtype)
+    if state.device.type == "tpu":
+        from sglang_tpu.mamba_state_rows import state_row_write_op
+
+        state.copy_(
+            state_row_write_op()(
+                state, rows.to(torch.int32), live.to(torch.int32), new
+            )
+        )
+        return
+    # Dead rows rewrite the null slot with its own value, keeping the scatter deterministic.
+    rows = torch.where(live, rows, 0).long()
     live = live.view(-1, *([1] * (state.dim() - 1)))
     state.index_copy_(0, rows, torch.where(live, new, state[:1]))
 

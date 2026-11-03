@@ -48,6 +48,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.mamba_pool import (
     AT_SLOT,
     TpuMambaPool,
+    read_state_rows,
     verify_track_steps,
     write_state_rows,
 )
@@ -509,6 +510,13 @@ class TestWriteStateRows(CustomTestCase):
         rows = torch.tensor([17, 18, 19, 17, 18, 19, 33, 34])
         live = torch.tensor([True, True, True, False, False, False, True, True])
         self._check(rows, live)
+
+
+class TestReadStateRows(CustomTestCase):
+    def test_reads_rows_in_order_with_repeats(self):
+        state = torch.randn(9, 3, 1, 16)
+        rows = torch.tensor([4, 0, 4, 8], dtype=torch.int32)
+        torch.testing.assert_close(read_state_rows(state, rows), state[rows.long()])
 
 
 if __name__ == "__main__":

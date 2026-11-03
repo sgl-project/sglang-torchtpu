@@ -28,7 +28,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang_tpu.attention_gdn_pallas import TpuGDNAttnBackend
 from sglang_tpu.envs import envs
 from sglang_tpu.inkling2_sconv_prefill import sconv_taps_tpu, supports_sconv_taps
-from sglang_tpu.mamba_pool import write_state_rows
+from sglang_tpu.mamba_pool import read_state_rows, write_state_rows
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -180,6 +180,10 @@ def build_sconv_pallas_op():
     return custom_op
 
 
+def _pallas_sconv() -> bool:
+    return envs.SGLANG_TPU_ENABLE_INKLING_SCONV_PALLAS.get()
+
+
 class TpuInklingSconvBackend(TpuGDNAttnBackend):
     """Inkling's per-request conv-state streams on the fused sconv kernel.
 
@@ -211,9 +215,15 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
     ) -> torch.Tensor:
         """y ``[T, dim]`` for x ``[T, dim]``; updates the stream's state slots."""
         state = self.sconv_state(layer_id=layer_id, stream=stream)
+        if not _pallas_sconv():
+            return self._xla_conv(
+                x, state, weight=weight, dyn=dyn, use_residual=use_residual
+            )
         # Read before the conv rewrites the slot rows a window may reach back into.
         snapshot = self._track_snapshot(x, state)
-        y = self._conv(x, state, weight=weight, dyn=dyn, use_residual=use_residual)
+        y = self._pallas_conv(
+            x, state, weight=weight, dyn=dyn, use_residual=use_residual
+        )
         if snapshot is not None:
             write_state_rows(state, *snapshot)
         return y
@@ -238,7 +248,7 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
         lags = torch.arange(hist, device=x.device)
         tokens = ends[:, None] - hist + lags[None]
         slots = self._state_indices[:num_seqs].clamp(0, state.shape[0] - 1).long()
-        prior = state.index_select(0, slots).reshape(num_seqs, hist, dim)
+        prior = read_state_rows(state, slots).reshape(num_seqs, hist, dim)
         # A fresh request has no prior state; where, so stale rows cannot leak NaN.
         has_state = (self._seq_lens[:num_seqs] - (qsl[1:] - starts)) > 0
         prior = torch.where(has_state[:, None, None], prior, torch.zeros_like(prior))
@@ -252,21 +262,16 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
         live = (ends >= 0) & (track_slots > 0)
         return track_slots, window, live
 
-    def _conv(self, x, state, *, weight, dyn, use_residual):
-        if not envs.SGLANG_TPU_ENABLE_INKLING_SCONV_PALLAS.get():
-            if self._num_spec_tokens:
-                xla_sconv = self._xla_sconv_verify
-            elif self._is_decode:
-                xla_sconv = self._xla_sconv_decode
-            else:
-                xla_sconv = self._xla_sconv
-            return xla_sconv(
-                x,
-                state=state,
-                weight=weight,
-                dyn=dyn,
-                use_residual=use_residual,
-            )
+    def _xla_conv(self, x, state, *, weight, dyn, use_residual):
+        # Each path writes its radix snapshot rows with its own slot rows: one in-place write per stream.
+        args = dict(state=state, weight=weight, dyn=dyn, use_residual=use_residual)
+        if self._num_spec_tokens:
+            return self._xla_sconv_verify(x, **args)
+        if self._is_decode:
+            return self._xla_sconv_decode(x, **args)
+        return self._xla_sconv(x, snapshot=self._track_snapshot(x, state), **args)
+
+    def _pallas_conv(self, x, state, *, weight, dyn, use_residual):
         state_rows, read_offsets = self._state_rows()
         return self._sconv_op(
             x.contiguous(),
@@ -284,8 +289,8 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
             num_spec_tokens=self._num_spec_tokens,
         )
 
-    def _xla_sconv(self, x, *, state, weight, dyn, use_residual):
-        """The sconv kernel's math in XLA ops; reads and writes ``state``'s slot rows."""
+    def _xla_sconv(self, x, *, state, weight, dyn, use_residual, snapshot=None):
+        """The sconv kernel's math in XLA ops; reads and writes ``state``'s slot rows (and ``snapshot``'s)."""
         assert self._num_spec_tokens == 0, "XLA sconv has no speculative verify path"
         num_tokens, dim = x.shape
         kernel_size = dyn.shape[2] if dyn is not None else weight.shape[-1]
@@ -300,7 +305,7 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
         has_state = (self._seq_lens[:num_seqs] - q_lens) > 0
         slots = self._state_indices.clamp(0, state.shape[0] - 1).long()
         # [seqs * hist, dim], oldest row first per sequence.
-        old = state.index_select(0, slots).reshape(num_seqs, hist, dim).float()
+        old = read_state_rows(state, slots).reshape(num_seqs, hist, dim).float()
         # where, not a multiply: a recycled slot's stale rows must not leak NaN/Inf.
         old = torch.where(has_state[:, None, None], old, torch.zeros_like(old)).reshape(num_seqs * hist, dim)
         xf = x.float()
@@ -354,7 +359,7 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
         new = torch.where(
             (offs >= 0).reshape(-1)[:, None], x.index_select(0, x_rows).float(), old.index_select(0, state_rows)
         )
-        self._write_state(state, slots, new.reshape(num_seqs, hist * dim))
+        self._write_state(state, slots, new.reshape(num_seqs, hist * dim), extra=snapshot)
         return y
 
     def _xla_sconv_decode(self, x, *, state, weight, dyn, use_residual):
@@ -363,7 +368,7 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
         kernel_size = dyn.shape[2] if dyn is not None else weight.shape[-1]
         hist = kernel_size - 1
         slots = self._state_indices.clamp(0, state.shape[0] - 1).long()
-        old = state.index_select(0, slots).reshape(num_seqs, hist, dim).float()
+        old = read_state_rows(state, slots).reshape(num_seqs, hist, dim).float()
         old = torch.where((self._seq_lens[:num_seqs] > 1)[:, None, None], old, torch.zeros_like(old))
         # [seqs, K, dim], oldest first; the new token is the last tap.
         window = torch.cat((old, x.float()[:, None]), dim=1)
@@ -377,7 +382,7 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
         acc = (window * w).sum(1)
         if use_residual:
             acc = acc + x.float()
-        self._write_state(state, slots, window[:, 1:].reshape(num_seqs, hist * dim))
+        self._write_decode_state(state, slots, window[:, 1:].reshape(num_seqs, hist * dim))
         scale = (kernel_size * (2 if dyn is not None else 1) + int(use_residual)) ** -0.5
         return (acc * scale).to(x.dtype)
 
@@ -394,7 +399,7 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
         bases, offsets = self._state_rows()
         bases = bases[:num_seqs].long()
         read_rows = (bases + offsets[:num_seqs].long()).clamp(0, state.shape[0] - 1)
-        old = state.index_select(0, read_rows).reshape(num_seqs, hist, dim).float()
+        old = read_state_rows(state, read_rows).reshape(num_seqs, hist, dim).float()
         # [seqs, hist + width, dim], oldest first; a verify always continues a request.
         seq = torch.cat((old, x.float().view(num_seqs, width, dim)), dim=1)
         # [seqs, width, K, dim]: the conv window ending at each verify position.
@@ -417,10 +422,26 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
         scale = (kernel_size * (2 if dyn is not None else 1) + int(use_residual)) ** -0.5
         return (acc * scale).to(x.dtype)
 
-    def _write_state(self, state, slots, new, live=None):
-        """Store each request's new window ``new`` [rows, K-1 * dim] in its row ``slots`` of ``state``."""
+    def _write_decode_state(self, state, slots, new):
+        """``_write_state``; a decode's radix snapshot is its post-token state, so the same rows."""
+        snapshot = None
+        if self._track_end is not None:
+            track_slots = self._track_indices[: slots.shape[0]].long()
+            snapshot = (track_slots, new, (self._track_end >= 0) & (track_slots > 0))
+        self._write_state(state, slots, new, extra=snapshot)
+
+    def _write_state(self, state, slots, new, live=None, extra=None):
+        """Store each request's new window ``new`` [rows, K-1 * dim] in its row ``slots`` of ``state``.
+
+        ``extra`` (rows, windows, live) is written in the same call; its live rows must differ from ``slots``.
+        """
         if live is None:
             live = self._state_indices >= 0
+        if extra is not None:
+            rows, windows, extra_live = extra
+            slots = torch.cat((slots.long(), rows.long()))
+            new = torch.cat((new.reshape(new.shape[0], -1), windows.reshape(windows.shape[0], -1).to(new.dtype)))
+            live = torch.cat((live, extra_live))
         write_state_rows(state, slots, new, live)
 
     def forward_decode(self, *args, **kwargs):
