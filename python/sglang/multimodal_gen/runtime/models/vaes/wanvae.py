@@ -33,7 +33,6 @@ from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
     get_decode_parallel_world_size,
-    get_sp_parallel_rank,
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
@@ -46,6 +45,7 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     disable_spatial_parallel_decode,
     gather_and_trim_height,
     gather_height_for_global_op,
+    spatial_parallel_decode_disabled,
     split_for_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import (
@@ -596,27 +596,23 @@ def up_block_forward(self, x):
 
 def split_for_parallel_encode(
     x: torch.Tensor, downsample_count: int, world_size: int, rank: int
-):
-    orig_height = x.shape[-2]
-    expected_height = orig_height // (2**downsample_count)
-    factor = world_size * (2**downsample_count)
-    pad_h = (factor - orig_height % factor) % factor
-    if pad_h:
-        x = F.pad(x, (0, 0, 0, pad_h, 0, 0))
-    expected_local_height = (orig_height + pad_h) // (2**downsample_count) // world_size
-    x = torch.chunk(x, world_size, dim=-2)[rank]
-    return x, expected_height, expected_local_height
+) -> tuple[torch.Tensor, int] | None:
+    """Give each rank whole downsampling blocks of the height.
 
-
-def ensure_local_height(x: torch.Tensor, expected_local_height: int | None):
-    if expected_local_height is None:
-        return x
-    if x.shape[-2] < expected_local_height:
-        pad = expected_local_height - x.shape[-2]
-        return F.pad(x, (0, 0, 0, pad, 0, 0))
-    if x.shape[-2] > expected_local_height:
-        return x[..., :expected_local_height, :].contiguous()
-    return x
+    Shards then line up with the strided convs, so the result matches the
+    unsharded encoder. Returns None when the height does not split that way.
+    """
+    block = 2**downsample_count
+    blocks, leftover_rows = divmod(x.shape[-2], block)
+    if leftover_rows or blocks < world_size:
+        return None
+    # The torch.tensor_split partition WanAttentionBlock re-chunks to
+    # (chunk_height_for_parallel_decode), so ranks keep their rows across it.
+    base, extra = divmod(blocks, world_size)
+    sizes = [base + (i < extra) for i in range(world_size)]
+    start = sum(sizes[:rank]) * block
+    x = x[..., start : start + sizes[rank] * block, :].contiguous()
+    return x, blocks
 
 
 @contextmanager
@@ -981,9 +977,13 @@ class WanEncoder3d(nn.Module):
         dims = [dim * u for u in [1] + dim_mult]
         scale = 1.0
 
+        # Encode shards only under sequence parallelism, as before: with one SP
+        # rank (CFG-, TP- or PP-only launches) every rank encodes the whole
+        # input. When it shards, the input splits over the decode group, the
+        # ranks the sharded convs and height gathers run over.
         world_size = 1
-        if dist.is_initialized():
-            world_size = get_sp_world_size()
+        if dist.is_initialized() and get_sp_world_size() > 1:
+            world_size = get_decode_parallel_world_size()
 
         if use_parallel_encode and world_size > 1:
             CausalConv3d = SpatialParallelCausalConv3d
@@ -1043,18 +1043,27 @@ class WanEncoder3d(nn.Module):
         self.gradient_checkpointing = False
         self.world_size = 1
         self.rank = 0
-        if dist.is_initialized():
-            self.world_size = get_sp_world_size()
-            self.rank = get_sp_parallel_rank()
+        if world_size > 1:
+            self.world_size = world_size
+            self.rank = get_decode_parallel_rank()
 
     def forward(self, x):
-        expected_local_height = None
-        expected_height = None
-        if self.use_parallel_encode and self.world_size > 1:
-            x, expected_height, expected_local_height = split_for_parallel_encode(
-                x, self.downsample_count, self.world_size, self.rank
-            )
+        # Inside disable_spatial_parallel_decode() the convs run unsharded, so
+        # a split input would return one rank's shard.
+        if spatial_parallel_decode_disabled() or not (
+            self.use_parallel_encode and self.world_size > 1
+        ):
+            return self._forward(x)
+        split = split_for_parallel_encode(
+            x, self.downsample_count, self.world_size, self.rank
+        )
+        if split is None:
+            with disable_spatial_parallel_decode():
+                return self._forward(x)
+        x, expected_height = split
+        return gather_and_trim_height(self._forward(x), expected_height)
 
+    def _forward(self, x):
         _feat_cache = feat_cache.get()
         _feat_idx = feat_idx.get()
         if _feat_cache is not None:
@@ -1071,8 +1080,6 @@ class WanEncoder3d(nn.Module):
             x = layer(x)
 
         ## middle
-        if self.use_parallel_encode and self.world_size > 1:
-            x = ensure_local_height(x, expected_local_height)
         x = self.mid_block(x)
 
         ## head
@@ -1089,9 +1096,6 @@ class WanEncoder3d(nn.Module):
             feat_idx.set(_feat_idx)
         else:
             x = self.conv_out(x)
-
-        if self.use_parallel_encode and self.world_size > 1:
-            x = gather_and_trim_height(x, expected_height)
         return x
 
 
