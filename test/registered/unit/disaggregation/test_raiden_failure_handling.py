@@ -2380,3 +2380,68 @@ class TestAnnounceSendFailureIsContained(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGdnPushReshardRefusal(unittest.TestCase):
+    """GDN state cannot be push-resharded: a hybrid GDN room fed by several
+    prefill ranks fails cleanly on both sides instead of raising (#1671)."""
+
+    TWO_SOURCES = [
+        {"rank_ip": "10.0.0.1", "rank_port": 4444},
+        {"rank_ip": "10.0.0.3", "rank_port": 4444},
+    ]
+
+    def _decode(self, state_engine):
+        mgr = _decode_manager()
+        mgr._state_engine = state_engine
+        mgr._dynamic_host_staging = True
+        mgr.request_status = {ROOM: KVPoll.Bootstrapping}
+        mgr.room_has_active_io = lambda room: False
+        mgr._swa_blocks_from_state_indices = lambda state_indices: []
+        mgr._state_rows_from_state_indices = lambda state_indices: ()
+        mgr.register_decode_request = Mock()
+        recv = _receiver(mgr)
+        recv.bootstrap_infos = self.TWO_SOURCES
+        return recv, mgr
+
+    def test_decode_fails_the_room_instead_of_raising(self):
+        recv, mgr = self._decode(state_engine=Mock())
+        with patch.object(RaidenKVReceiver, "_send_abort_notification") as notify:
+            recv.send_metadata([1, 2])
+        mgr.register_decode_request.assert_not_called()
+        self.assertEqual(recv.conclude_state, KVPoll.Failed)
+        self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
+        self.assertIn("GDN", mgr.failure_records[ROOM])
+        # The prefill sources are told to release the room.
+        notify.assert_called_once_with()
+
+    def test_decode_without_gdn_still_reshards(self):
+        recv, mgr = self._decode(state_engine=None)
+        recv.send_metadata([1, 2])
+        mgr.register_decode_request.assert_called_once()
+        self.assertEqual(mgr.check_status(ROOM), KVPoll.WaitingForInput)
+
+    def test_decode_with_one_source_is_not_refused(self):
+        recv, mgr = self._decode(state_engine=Mock())
+        recv.bootstrap_infos = self.TWO_SOURCES[:1]
+        recv.send_metadata([1, 2])
+        mgr.register_decode_request.assert_called_once()
+
+    def test_prefill_answers_room_failed_instead_of_raising(self):
+        mgr = _prefill_manager()
+        mgr._state_engine = Mock()
+        mgr.request_status = {ROOM: KVPoll.WaitingForInput}
+        mgr._prefill.held_chunks[ROOM] = [(0, [1, 2])]
+        mgr._dispatch(
+            ReshardReq(
+                ROOM, "10.0.0.2", 5555, "10.0.0.2:31000", [1, 2], 2, [], ""
+            ).to_frames()
+        )
+        self.assertEqual(mgr.request_status[ROOM], KVPoll.Failed)
+        self.assertIn("GDN", mgr.failure_records[ROOM])
+        self.assertNotIn(ROOM, mgr._prefill.reshard_req)
+        [(endpoint, frames)] = _sent_frames(mgr)
+        self.assertEqual(endpoint, "tcp://10.0.0.2:5555")
+        failed = RoomFailed.from_frames(frames)
+        self.assertEqual(failed.room, ROOM)
+        self.assertIn("GDN", failed.reason)

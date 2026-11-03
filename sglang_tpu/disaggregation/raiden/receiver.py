@@ -226,6 +226,31 @@ class RaidenReceiverMixin:
 
     # ----- decode side -------------------------------------------------------
 
+    def push_reshard_refusal(self, num_sources: int) -> Optional[str]:
+        """Why this decode cannot take a room fed by ``num_sources`` prefill
+        ranks, or None if it can.
+
+        Asymmetric attention TP (decode attn TP < prefill attn TP) feeds one
+        decode rank from several prefill ranks, each pushing its head-slice
+        strided into the wider decode block. The plan stages in host blocks
+        raiden allocates for it, which only per-transfer staging provides.
+        """
+        if self._pipeline is not None or num_sources == 1:
+            return None
+        if self._state_engine is not None:
+            return (
+                "Raiden push resharding does not move GDN (linear-attention) "
+                f"state yet (got {num_sources} prefill sources for one decode "
+                "rank); use equal attention TP on prefill and decode."
+            )
+        if not self._dynamic_host_staging:
+            return (
+                f"Raiden asymmetric attention TP (got {num_sources} prefill "
+                "sources for one decode rank) needs per-transfer host staging; "
+                "do not set SGLANG_RAIDEN_DYNAMIC_HOST_STAGING=0."
+            )
+        return None
+
     def register_decode_request(
         self,
         room: int,
@@ -242,24 +267,9 @@ class RaidenReceiverMixin:
             )
             return
         if len(bootstrap_infos) != 1:
-            if self._state_engine is not None:
-                raise NotImplementedError(
-                    "Raiden push resharding does not move GDN (linear-attention) "
-                    f"state yet (got {len(bootstrap_infos)} prefill sources for "
-                    "one decode rank); use equal attention TP on prefill and decode."
-                )
-            # Asymmetric attention TP (decode attn TP < prefill attn TP): one
-            # decode rank is fed by several prefill ranks, each pushing its
-            # head-slice strided into the wider decode block. The plan stages
-            # in host blocks raiden allocates for it, which only per-transfer
-            # staging provides.
-            if not self._dynamic_host_staging:
-                raise NotImplementedError(
-                    "Raiden asymmetric attention TP (got "
-                    f"{len(bootstrap_infos)} prefill sources for one decode "
-                    "rank) needs per-transfer host staging; do not set "
-                    "SGLANG_RAIDEN_DYNAMIC_HOST_STAGING=0."
-                )
+            refusal = self.push_reshard_refusal(len(bootstrap_infos))
+            if refusal is not None:
+                raise NotImplementedError(refusal)
             if not local_blocks:
                 # Full prefix-cache hit: decode already holds every page,
                 # nothing to receive. A hybrid model's sliding-window pages sit
@@ -1352,6 +1362,12 @@ class RaidenKVReceiver(CommonKVReceiver):
         decode_prefix_len: Optional[int] = None,
     ):
         if self.conclude_state == KVPoll.Failed:
+            return
+        # Refuse here rather than let register_decode_request raise: this runs
+        # on the scheduler thread, and an exception would take down the decode.
+        refusal = self.kv_mgr.push_reshard_refusal(len(self.bootstrap_infos))
+        if refusal is not None:
+            self._conclude_failed(reason=refusal)
             return
         self.kv_mgr.register_decode_request(
             self.bootstrap_room,
