@@ -55,8 +55,10 @@ _HANG_HINT = (
     "(the regression of torch_tpu#4227 / #4242)."
 )
 # torch_tpu launchers that print the TORCH_TPU_* launch env for a single host,
-# newest first. singlehost_wrapper was removed from torch_tpu on 2026-09-24.
+# newest first. singlehost_wrapper was removed from torch_tpu on 2026-09-24 and
+# environment was renamed to distributed in 0.2.1.
 _LAUNCH_ENV_MODULES = (
+    "torch_tpu._internal.distributed.distributed",
     "torch_tpu._internal.distributed.environment",
     "torch_tpu._internal.distributed.launchers.singlehost_wrapper",
 )
@@ -67,9 +69,16 @@ _LAUNCH_ENV_KEYS = {
 }
 
 
+def _has_module(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except ModuleNotFoundError:
+        return False
+
+
 def _device_count() -> int:
     try:
-        if importlib.util.find_spec("torch_tpu") is None:
+        if not _has_module("torch_tpu"):
             return 0
         from torch_tpu._internal.utils import hardware
 
@@ -79,10 +88,7 @@ def _device_count() -> int:
 
 
 def _launch_env(env: dict[str, str]) -> dict[str, str]:
-    module = next(
-        (m for m in _LAUNCH_ENV_MODULES if importlib.util.find_spec(m) is not None),
-        None,
-    )
+    module = next((m for m in _LAUNCH_ENV_MODULES if _has_module(m)), None)
     if module is None:
         raise AssertionError(f"torch_tpu has none of {_LAUNCH_ENV_MODULES}")
     completed = subprocess.run(
@@ -348,7 +354,7 @@ def _run_distributed_worker(case: str, stage_size: int) -> None:
     else:
         raise ValueError(f"unknown case {case!r}")
 
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
     reports: list = [None] * world_size
     dist.all_gather_object(reports, (rank, failures), group=cpu_group)
     faulthandler.cancel_dump_traceback_later()
