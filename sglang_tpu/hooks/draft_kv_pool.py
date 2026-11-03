@@ -56,10 +56,14 @@ def draft_cell_size_per_token(
     from sglang.srt.runtime_context import get_spec
     from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
+    # No draft backend: the draft runner allocates the target's pool class.
     pool_cls = _draft_pool_cls(get_spec().speculative_draft_attention_backend)
+    if pool_cls is None:
+        from sglang.srt.platforms import current_platform
+
+        pool_cls = current_platform.get_mha_kv_pool_cls()
     if (
-        pool_cls is None
-        or not issubclass(pool_cls, TpuFusedMHATokenToKVPool)
+        not issubclass(pool_cls, TpuFusedMHATokenToKVPool)
         or draft_num_layers <= 0
     ):
         return generic

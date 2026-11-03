@@ -67,6 +67,7 @@ def select_verify_rows(
     committed_lens: torch.Tensor,
     seq_lens: torch.Tensor,
     num_rows: int | None = None,
+    swa_verify_cache_candidates: torch.Tensor | None = None,
 ) -> VerifyRows:
     """Select active rows; the worker warms its capacity/width combinations."""
     if num_rows is None:
@@ -76,11 +77,18 @@ def select_verify_rows(
     )
     offsets = torch.arange(num_rows, device=seq_lens.device, dtype=seq_lens.dtype)
     positions = seq_lens[:, None] + offsets
+    swa_cache_locs = None
+    if swa_verify_cache_candidates is not None:
+        swa_cache_locs = select_dflash_verify_cache_locs_tpu(
+            swa_verify_cache_candidates, seq_lens, committed_lens, num_rows
+        )
     return VerifyRows(
         positions=positions,
         cache_locs=cache_locs,
         flat_positions=positions.reshape(-1),
         flat_cache_locs=cache_locs.reshape(-1),
+        swa_cache_locs=swa_cache_locs,
+        swa_flat_cache_locs=None if swa_cache_locs is None else swa_cache_locs.reshape(-1),
     )
 
 

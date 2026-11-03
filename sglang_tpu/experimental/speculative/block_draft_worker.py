@@ -12,12 +12,14 @@ from sglang.srt.layers.utils.common import PPMissingLayer
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.runtime_context import get_disagg
-from sglang_tpu.dflash_draft_kv_write import dflash_write_draft_kv
+from sglang_tpu.dflash_draft_kv_write import (
+    dflash_write_draft_kv,
+    draft_fused_pools,
+)
 from sglang_tpu.experimental.compilation.block_compile_policy import (
     TpuBlockSpecDecodeCompilePolicyMixin,
 )
 from sglang_tpu.experimental.speculative.draft_worker import TpuDraftWorker
-from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
 # (step_logits [pbs, V], step_idx) -> sampled [pbs] tokens.
 DraftSampler = Callable[[torch.Tensor, int], torch.Tensor]
@@ -37,7 +39,8 @@ class TpuBlockDraftWorker(TpuDraftWorker):
 
     block_width: int
     mask_token_id: int
-    requires_full_kv_pool = True
+    # The writer routes window layers to the SWA sub-pool of a hybrid draft.
+    requires_full_kv_pool = False
 
     @abstractmethod
     def sample_drafts(
@@ -86,6 +89,8 @@ class TpuBlockDraftWorker(TpuDraftWorker):
         cache_loc: torch.Tensor,
         cache_loc_2d: torch.Tensor | None = None,
         commit_lens: torch.Tensor | None = None,
+        swa_cache_loc: torch.Tensor | None = None,
+        swa_cache_loc_2d: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Project target hidden into the draft context KV (extend: all rows; commit: accepted).
 
@@ -98,6 +103,8 @@ class TpuBlockDraftWorker(TpuDraftWorker):
             positions=positions,
             cache_loc_2d=cache_loc_2d,
             commit_lens=commit_lens,
+            swa_cache_loc=swa_cache_loc,
+            swa_cache_loc_2d=swa_cache_loc_2d,
         )
         assert tail is not None
         return tail
@@ -110,14 +117,13 @@ class TpuBlockDraftWorker(TpuDraftWorker):
         positions: torch.Tensor,
         cache_loc_2d: torch.Tensor | None = None,
         commit_lens: torch.Tensor | None = None,
+        swa_cache_loc: torch.Tensor | None = None,
+        swa_cache_loc_2d: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # The fused rpa_v3 pool forbids set_kv_buffer (write_target_hidden_kv);
         # dense DFlash and DSpark drafts share one K/V layout and Pallas writer.
         kv_pool = self.model_runner.token_to_kv_pool
-        if not isinstance(kv_pool, TpuFusedMHATokenToKVPool):
-            raise TypeError(
-                f"{type(self).__name__} needs TpuFusedMHATokenToKVPool, got {type(kv_pool)}."
-            )
+        full_pool, _ = draft_fused_pools(kv_pool)
         draft_model = self._draft_model()
         dflash_write_draft_kv(
             draft_model=draft_model,
@@ -128,9 +134,11 @@ class TpuBlockDraftWorker(TpuDraftWorker):
             cache_loc_2d=cache_loc_2d,
             commit_lens=commit_lens,
             max_num_reqs=self.model_runner.req_to_token_pool.size,
+            swa_cache_loc=swa_cache_loc,
+            swa_cache_loc_2d=swa_cache_loc_2d,
         )
         # Read inside the compiled writer, after the write: the TPU KV free fence's tail.
-        return kv_pool.kv_buffer[-1][0, 0, 0, 0, :1]
+        return full_pool.kv_buffer[-1][0, 0, 0, 0, :1]
 
     def _draft_model(self) -> DFlashDraftModel:
         model = self.model_runner.model

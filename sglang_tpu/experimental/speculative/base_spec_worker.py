@@ -27,6 +27,7 @@ when the batch composition changes; only the scheduler-facing result is live bs.
 from __future__ import annotations
 
 import contextlib
+import functools
 import itertools
 from abc import abstractmethod
 from collections.abc import Callable, Sequence
@@ -365,16 +366,18 @@ class TpuSpecWorker(BaseSpecWorker):
             for width, pbs in itertools.product(self.verify_widths(), bucket_sizes):
                 # The generic spec-op context only knows the active width. The
                 # worker owns the full-capacity candidate shape used in serving.
+                window = (pbs, 2 * self.verify_window_rows)
                 warmup_compiled_op(
                     select_verify_rows,
-                    torch.zeros(
-                        (pbs, 2 * self.verify_window_rows),
-                        dtype=torch.int64,
-                        device=self.device,
-                    ),
+                    torch.zeros(window, dtype=torch.int64, device=self.device),
                     torch.zeros((pbs,), dtype=torch.int64, device=self.device),
                     torch.zeros((pbs,), dtype=torch.int64, device=self.device),
                     width,
+                    *(
+                        (torch.zeros(window, dtype=torch.int64, device=self.device),)
+                        if self.draft_swa_translate is not None
+                        else ()
+                    ),
                 )
                 # Eager ops compile per input layout, so bump finalize_accept's output.
                 next_seq_lens = self._warmup_accept(pbs, width).next_seq_lens
@@ -393,6 +396,16 @@ class TpuSpecWorker(BaseSpecWorker):
             zeros(padded_bs),
             torch.ones((padded_bs,), dtype=torch.bool, device=self.device),
         )
+
+    @property
+    def draft_swa_translate(self):
+        """Host slot translation into the draft's SWA sub-pool; None for a full-pool draft."""
+        from sglang_tpu.dflash_draft_kv_write import translate_draft_swa_locs
+
+        pool = self._draft_worker.draft_runner.token_to_kv_pool
+        if not isinstance(pool, SWAKVPool):
+            return None
+        return lambda loc: translate_draft_swa_locs(pool, loc, None)[0]
 
     @property
     def retraction_draft_kv_pools(self) -> tuple[KVCache, ...]:
@@ -692,7 +705,7 @@ class TpuSpecWorker(BaseSpecWorker):
         bs = batch.seq_lens.shape[0]
         padded_bs = self._decode_bucket(batch, bs)
         verify_input = TpuSpecVerifyInput.from_batch(
-            batch, self.num_verify_rows, padded_bs
+            batch, self.num_verify_rows, padded_bs, swa_translate=self.draft_swa_translate
         )
         bucket = self._bucket_state(batch, padded_bs, verify_input)
         # req_to_token is host-resident on TPU; the host gathered the candidate
@@ -702,6 +715,7 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_input.committed_lens,
             bucket.state.seq_lens,
             self.num_verify_rows,
+            verify_input.swa_verify_cache_candidates,
         )
         committed, logits_output, accept = self.step(batch, bucket, rows, verify_input)
         next_state = committed.state
@@ -799,6 +813,7 @@ class TpuSpecWorker(BaseSpecWorker):
         """
         padded_bs = self._decode_bucket(batch, 0)
         verify_input = TpuSpecVerifyInput.idle(
+            hybrid_draft=self.draft_swa_translate is not None,
             verify_window_rows=self.verify_window_rows,
             padded_bs=padded_bs,
             device=self.device,
@@ -816,6 +831,7 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_input.committed_lens,
             state.seq_lens,
             self.num_verify_rows,
+            verify_input.swa_verify_cache_candidates,
         )
         # The forwards' preparation writes these; the idle batch must stay idle.
         with overridden_fields(

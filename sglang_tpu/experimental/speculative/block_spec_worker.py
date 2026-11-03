@@ -203,6 +203,8 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 cache_loc=rows.flat_cache_locs,
                 cache_loc_2d=rows.cache_locs,
                 commit_lens=accept.accept_lens,
+                swa_cache_loc=rows.swa_flat_cache_locs,
+                swa_cache_loc_2d=rows.swa_cache_locs,
             )
             last_rows, live = verify_last_rows(accept.accept_lens, self.num_verify_rows)
             self._block_draft_worker.seed_recurrent_context(
@@ -260,14 +262,25 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         positions = pad_rows(positions_cpu, padded_rows).to(
             self.device, non_blocking=True
         )
-        cache_loc = pad_rows(cache_loc_cpu, padded_rows).to(
-            self.device, non_blocking=True
-        )
+        cache_loc_cpu = pad_rows(cache_loc_cpu, padded_rows)
+        cache_loc = cache_loc_cpu.to(self.device, non_blocking=True)
+        # Translated on the host, where the mapping lives: no device sync.
+        swa_cache_loc = None
+        if self.draft_swa_translate is not None:
+            # The appender was warmed with cache_loc's dtype for both slot inputs.
+            swa_cache_loc = (
+                self.draft_swa_translate(cache_loc_cpu)
+                .to(cache_loc_cpu.dtype)
+                .to(self.device, non_blocking=True)
+            )
         # Must inject before returning: the scheduler may update radix afterward,
         # invalidating out_cache_loc.
         with self._block_draft_worker.draft_context():
             kv_fence_tail = self._block_draft_worker.write_draft_kv(
-                target_hidden=target_hidden, positions=positions, cache_loc=cache_loc
+                target_hidden=target_hidden,
+                positions=positions,
+                cache_loc=cache_loc,
+                swa_cache_loc=swa_cache_loc,
             )
             if batch.reqs:
                 self._seed_after_extend(batch, target_hidden)
@@ -398,6 +411,21 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                             (padded_bs * width,),
                             dtype=torch.int64,
                             device=self.device,
+                        ),
+                        # A hybrid draft serves rows with SWA slots; warm that tree shape.
+                        **(
+                            dict(
+                                swa_cache_locs=torch.zeros(
+                                    block_shape, dtype=torch.int64, device=self.device
+                                ),
+                                swa_flat_cache_locs=torch.zeros(
+                                    (padded_bs * width,),
+                                    dtype=torch.int64,
+                                    device=self.device,
+                                ),
+                            )
+                            if self.draft_swa_translate is not None
+                            else {}
                         ),
                     ),
                     torch.zeros((padded_bs,), dtype=torch.int64, device=self.device),

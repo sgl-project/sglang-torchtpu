@@ -28,8 +28,8 @@ class TpuDraftWorker(ABC):
     """
 
     num_drafts: int
-    # The draft KV writer needs one fused full-attention pool; sliding-window draft
-    # layers then keep every token and apply their window as an attention mask.
+    # True: one fused full-attention pool for every draft layer; sliding-window
+    # layers keep every token and apply their window as an attention mask.
     requires_full_kv_pool = False
 
     def __init__(self, target_runner: ModelRunner) -> None:
