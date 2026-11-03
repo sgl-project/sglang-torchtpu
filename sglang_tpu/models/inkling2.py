@@ -44,6 +44,12 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 from sglang.tml.config import Inkling2MMConfig, Inkling2ModelConfig
 from sglang_tpu.compilation.hybrid_linear_direct_compile import ConvStateModule
+from sglang_tpu.envs import envs
+from sglang_tpu.inkling2_attn_res import (
+    attn_res_norm_tpu,
+    register_inkling2_attn_res_op,
+    supports_attn_res_norm,
+)
 from sglang_tpu.models.inkling2_quant import FP8_BLOCK, TpuInkling2QuantConfig
 
 logger = logging.getLogger(__name__)
@@ -151,6 +157,10 @@ class Inkling2AttnRes(nn.Module):
             [nn.Parameter(torch.zeros(h), requires_grad=False) for _ in range(n)]
         )
         self.output_query = nn.Parameter(torch.zeros(h), requires_grad=False)
+        # The kernel implements the RMSNorm without a pre-affine scale.
+        self.use_pallas = envs.SGLANG_TPU_INKLING2_ATTN_RES_PALLAS.get() and not config.pre_norm_pre_affine
+        if self.use_pallas:
+            register_inkling2_attn_res_op()
 
     def is_block_boundary(self, layer_idx: int) -> bool:
         return layer_idx % self.block_size == 0
@@ -185,6 +195,41 @@ class _AttnResState:
             count = 1 if layer_idx in self.attn_res.local_layer_ids else 3
             return (value,) * count
         return self._mix(self.blocks, self.partial, self.attn_res.attn_queries[layer_idx - 1])
+
+    def _mix_normed(self, sources, addend, query, norms):
+        """Normed bf16 sub-layer inputs from the Pallas kernel, or None when it does not apply."""
+        if not self.attn_res.use_pallas or not supports_attn_res_norm(self.partial.shape[0], len(sources)):
+            return None
+        queries = query.float().reshape(len(norms), -1) * self.partial.shape[-1] ** -0.5
+        weights = torch.stack([norm.weight.float() for norm in norms])
+        out = attn_res_norm_tpu(
+            sources,
+            addend,
+            queries,
+            weights,
+            normalize=self.attn_res.normalize_values,
+            eps_res=_ATTN_RES_EPS,
+            eps_norm=norms[0].eps,
+        )
+        return tuple(out.unbind(0))
+
+    def attention_input_normed(self, layer_idx: int, norms) -> tuple:
+        if self.blocks:
+            query = self.attn_res.attn_queries[layer_idx - 1]
+            out = self._mix_normed([*self.blocks, self.partial], None, query, norms)
+            if out is not None:
+                return out
+        return tuple(norm(stream) for norm, stream in zip(norms, self.attention_input(layer_idx)))
+
+    def mlp_input_normed(self, layer_idx: int, attn_output: torch.Tensor, norm) -> torch.Tensor:
+        query = self.attn_res.mlp_queries[layer_idx]
+        if self.attn_res.is_block_boundary(layer_idx):
+            out = self._mix_normed([*self.blocks, self.partial, attn_output], None, query, (norm,))
+        else:
+            out = self._mix_normed([*self.blocks, self.partial], attn_output, query, (norm,))
+        if out is not None:
+            return out[0]
+        return norm(self.mlp_input(layer_idx, attn_output))
 
     def mlp_input(self, layer_idx: int, attn_output: torch.Tensor) -> torch.Tensor:
         query = self.attn_res.mlp_queries[layer_idx]
@@ -493,18 +538,17 @@ class Inkling2DecoderLayer(nn.Module):
         self.mlp_sconv = Inkling2ShortConv(stream=SconvType.MLP, **full)
 
     def forward(self, state: _AttnResState, positions, forward_batch: ForwardBatch):
-        streams = state.attention_input(self.layer_id)
         if self.is_local:
-            x = self.attn_norm(streams[0])
+            (x,) = state.attention_input_normed(self.layer_id, (self.attn_norm,))
             sources = AttentionSources(x, x, x)
         else:
             sources = AttentionSources(
-                self.q_input_norm(streams[0]),
-                self.k_input_norm(streams[1]),
-                self.v_input_norm(streams[2]),
+                *state.attention_input_normed(
+                    self.layer_id, (self.q_input_norm, self.k_input_norm, self.v_input_norm)
+                )
             )
         attention = self.attn_sconv(self.attn(sources, positions, forward_batch))
-        mlp_input = self.mlp_norm(state.mlp_input(self.layer_id, attention))
+        mlp_input = state.mlp_input_normed(self.layer_id, attention, self.mlp_norm)
         if is_dp_attention_enabled():
             # Experts run on every DP group's tokens; sconv state is per request, so scatter back first.
             # Gathered padding rows are zero, so no pad mask (the local count would mask other groups).

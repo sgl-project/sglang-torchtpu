@@ -28,6 +28,8 @@ class TpuEnvs:
     SGLANG_TPU_ENABLE_INKLING_SCONV_PALLAS = EnvBool(False)
     # Inkling2: serve NVFP4 experts packed (W4A16 fused-RS) instead of block FP8.
     SGLANG_TPU_INKLING2_NVFP4_EXPERTS = EnvBool(False)
+    # Inkling2 prefill: block AttnRes + the following RMSNorm as one Pallas kernel.
+    SGLANG_TPU_INKLING2_ATTN_RES_PALLAS = EnvBool(True)
     # Host heap (see host_heap_trim.py)
     SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED = EnvBool(True)
     # Seconds between periodic trims. 0 turns the periodic trim off.
