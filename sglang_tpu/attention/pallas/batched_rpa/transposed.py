@@ -34,6 +34,7 @@ once per (sequence, q block) in VMEM.
 """
 
 import math
+import os
 
 import jax
 import jax.experimental.pallas as pl
@@ -44,6 +45,24 @@ from jax import lax
 from sglang_tpu.attention.pallas.batched_rpa import configs, utils
 
 LOG2E = 1.0 / math.log(2.0)
+
+# Minimax cubic for 2^f on [0, 1): max rel. error ~1e-4 (below bf16's 2^-8).
+_EXP2_C = (1.0, 0.69583356, 0.22606716, 0.07802460)
+
+
+def _exp2_valu(s: jax.Array) -> jax.Array:
+    """exp2 on the VALU (no EUP): 2^floor(x) via the exponent bits times a cubic.
+
+    Lets a share of the softmax exponentials bypass the single EUP, which is the
+    binding unit of the unshifted streaming tile.
+    """
+    x = jnp.maximum(s.astype(jnp.float32), -126.0)
+    xi = jnp.floor(x)
+    f = x - xi
+    c0, c1, c2, c3 = _EXP2_C
+    poly = c0 + f * (c1 + f * (c2 + f * c3))
+    scale = lax.bitcast_convert_type((xi.astype(jnp.int32) + 127) << 23, jnp.float32)
+    return (poly * scale).astype(s.dtype)
 
 
 def refresh_qt(
@@ -99,8 +118,10 @@ def tile(
     q_rows: jax.Array | None = None,
 ):
     """``q_rows``: the q block's real queries when it may be partial. Its compute blocks
-    then run in a loop over 128-token groups up to the last query; the groups past it
-    only set m to -inf, so the next q block starts clean (acc stays finite)."""
+    then run in a loop over skip_group_tokens groups up to the last query. With
+    no_max this is the unshifted streaming tile (skipped groups keep acc == 0, which
+    store() clears after every q block); else ``_tile_shifted``, where the groups past
+    the last query only set m to -inf, so the next q block starts clean."""
     heads = cfgs.aligned_num_q_heads_per_kv_head
     hd = cfgs.aligned_kv_head_dim
     bkv = cfgs.bkv_sz
@@ -115,6 +136,201 @@ def tile(
         q_iota = lax.broadcasted_iota(jnp.int32, (bkv, lanes), 1) // heads
         q_kv_diff = q_iota - kv_iota
 
+    # Partial q blocks (skip_pad_q): groups of compute blocks covering
+    # skip_group_tokens tokens; only the groups up to the last real query run.
+    group_tokens = skip_group_tokens(cfgs)
+    per_group = group_tokens // cfgs.bq_c_sz
+    n_groups = cfgs.bq_sz // group_tokens
+    grouped = q_rows is not None and n_groups > 1
+    group_lanes = group_tokens * heads
+    if grouped:
+        live_groups = jnp.clip((q_rows + group_tokens - 1) // group_tokens, 1, n_groups)
+
+    if no_max:
+        # Unshifted softmax (QK-normed models: |base-2 score| <= ~64, so exp2
+        # cannot overflow bf16 / the f32 sums): stream the tile in key chunks so a
+        # chunk's scores and probabilities never leave vregs, and drop the running
+        # max, its reduction and the alpha rescale. acc is cleared after each
+        # finished q block in store(), so the skipped groups of a partial q block
+        # need no reset (their acc stays zero; store() guards their l == 0).
+        # Largest chunk <= the requested one that divides bkv (SWA layers keep
+        # their own searched bkv, e.g. 768 with a 512 request -> 256).
+        kc = math.gcd(bkv, min(bkv, cfgs.serve.transposed_key_chunk or bkv))
+        chunk_vt = cfgs.serve.transposed_chunk_vt
+        for kv_head in range(cfgs.model.num_kv_heads):
+            kh = k[0, kv_head]  # [hd, bkv] fp8
+            ones_rows = cfgs.acct_scratch_shape[1] - hd
+            vt = None
+            if not chunk_vt:
+                vt = jnp.concatenate(
+                    [
+                        v[0, kv_head].astype(jnp.bfloat16),
+                        jnp.ones((ones_rows, bkv), jnp.bfloat16),
+                    ],
+                    axis=0,
+                )  # [acc rows, bkv]
+
+            def q_chunk(
+                bq_start, cs, kh=kh, vt=vt, kv_head=kv_head, ones_rows=ones_rows
+            ):
+                qt = qt_ref[kv_head, :, cs]  # [hd, lanes] fp8
+                o_t = None
+                for c0 in range(0, bkv, kc):
+                    s = lax.dot_general(
+                        kh[:, c0 : c0 + kc],
+                        qt,
+                        (((0,), (0,)), ((), ())),
+                        preferred_element_type=(
+                            jnp.bfloat16
+                            if cfgs.serve.transposed_s_bf16
+                            else jnp.float32
+                        ),
+                    ).astype(jnp.bfloat16)  # [kc, lanes]
+                    if apply_mask:
+                        diff = q_kv_diff[c0 : c0 + kc]
+                        mask = diff >= offset - bq_start
+                        if (window := cfgs.model.sliding_window) is not None:
+                            mask = jnp.logical_and(
+                                mask, diff < window + offset - bq_start
+                            )
+                        s = jnp.where(mask, s, cfgs.model.mask_value)
+                    every = cfgs.serve.transposed_valu_exp2_every
+                    if every and (c0 // kc) % every == every - 1:
+                        p = _exp2_valu(s)  # this chunk's exponentials on the VALU
+                    else:
+                        p = jnp.exp2(s)  # [kc, lanes] bf16 on the EUP
+                    if chunk_vt:
+                        # Only this chunk's V^T (+ ones rows) is live: fewer vregs held
+                        # across the q-chunk loop (the whole [acc rows, bkv] spills).
+                        vt_c = jnp.concatenate(
+                            [
+                                v[0, kv_head, :, c0 : c0 + kc].astype(jnp.bfloat16),
+                                jnp.ones((ones_rows, kc), jnp.bfloat16),
+                            ],
+                            axis=0,
+                        )
+                    else:
+                        vt_c = vt[:, c0 : c0 + kc]
+                    part = lax.dot_general(
+                        vt_c,
+                        p,
+                        (((1,), (0,)), ((), ())),
+                        preferred_element_type=jnp.float32,
+                    )  # [acc rows, lanes]
+                    o_t = part if o_t is None else o_t + part
+                acc_ref[kv_head, :, cs] = acc_ref[kv_head, :, cs] + o_t
+
+            n_qc = cfgs.bq_sz // cfgs.bq_c_sz
+            loop_unroll = int(os.environ.get("SGLANG_TPU_RPA_QCHUNK_LOOP", "0"))
+            if grouped:
+                # Live groups only (the loop is already rolled, so the
+                # SGLANG_TPU_RPA_QCHUNK_LOOP unroll does not apply here).
+                def run_group(g, carry, q_chunk=q_chunk):
+                    for j in range(per_group):
+                        bq_start = g * group_tokens + j * cfgs.bq_c_sz
+                        lane0 = pl.multiple_of(g * group_lanes + j * lanes, lanes)
+                        q_chunk(bq_start, pl.ds(lane0, lanes))
+                    return carry
+
+                lax.fori_loop(0, live_groups, run_group, 0)
+            elif loop_unroll and n_qc > 1:
+                # Rolled q-chunk loop (unroll factor loop_unroll): the fully unrolled
+                # one overflows IMEM at bq 1024 (Percale: 4.04 of 4 MiB).
+                def body(i, carry, q_chunk=q_chunk):
+                    bq_start = i * cfgs.bq_c_sz
+                    cs = pl.ds(pl.multiple_of(i * lanes, lanes), lanes)
+                    q_chunk(bq_start, cs)
+                    return carry
+
+                lax.fori_loop(0, n_qc, body, 0, unroll=min(loop_unroll, n_qc))
+            else:
+                for bq_start in range(0, cfgs.bq_sz, cfgs.bq_c_sz):
+                    q_chunk(bq_start, slice(bq_start * heads, bq_start * heads + lanes))
+    else:
+        _tile_shifted(
+            step,
+            k,
+            v,
+            schedule_ref,
+            m_ref,
+            acc_ref,
+            qt_ref,
+            q_kv_diff=q_kv_diff if apply_mask else None,
+            offset=offset,
+            apply_mask=apply_mask,
+            cfgs=cfgs,
+            grouped=grouped,
+            live_groups=live_groups if grouped else None,
+        )
+
+    is_last_k = schedule_ref.is_last_k[step, 0] == 1
+
+    def store():
+        outs = []
+        for kv_head in range(cfgs.model.num_kv_heads):
+            acc = acc_ref[kv_head]  # [acc rows, rows]
+            l = acc[hd : hd + 1]
+            if no_max and cfgs.serve.skip_pad_q:
+                # Skipped groups keep acc == 0 (l == 0): output 0 there, not NaN.
+                # Exact for real rows, whose l >= 2^-64 (a query sees its own key).
+                l = jnp.maximum(l, 1e-30)
+            o_t = acc[:hd] * pl.reciprocal(l, approx=True)
+            if cfgs.serve.out_head_norm_eps is not None:
+                o_t = utils.head_norm(
+                    o_t.astype(cfgs.serve.dtype_out),
+                    0,
+                    cfgs.model.head_dim,
+                    cfgs.serve.out_head_norm_eps,
+                )
+            pad = cfgs.aligned_q_head_dim - hd
+            if pad:
+                o_t = jnp.concatenate([o_t, jnp.zeros((pad, rows), o_t.dtype)], axis=0)
+            outs.append(
+                o_t.T.astype(cfgs.serve.dtype_out)
+            )  # [rows, aligned_q_head_dim]
+        out = jnp.stack(outs, axis=0)
+        o_u32_vref = o_vref.at[0].bitcast(jnp.uint32)
+        out_ref = o_u32_vref.reshape(-1, cfgs.aligned_q_head_dim)
+        out = pltpu.bitcast(out, out_ref.dtype).reshape(out_ref.shape)
+        utils.strided_store(out_ref, 0, out_ref.shape[0], 1, out)
+        if no_max:
+            # No alpha == 0 restart without a running max: clear for the next block.
+            acc_ref[...] = jnp.zeros_like(acc_ref)
+
+    lax.cond(is_last_k, store, lambda: None)
+
+
+def _tile_shifted(
+    step,
+    k,
+    v,
+    schedule_ref,
+    m_ref,
+    acc_ref,
+    qt_ref,
+    *,
+    q_kv_diff,
+    offset,
+    apply_mask,
+    cfgs,
+    grouped=False,
+    live_groups=None,
+):
+    """The online-softmax transposed tile (running base-2 max).
+
+    With ``grouped`` (skip_pad_q on a partial q block) the compute blocks run in a
+    loop over the ``live_groups`` groups up to the last query; the groups past it
+    only set m to -inf, so the next q block starts clean (acc stays finite).
+    """
+    heads = cfgs.aligned_num_q_heads_per_kv_head
+    hd = cfgs.aligned_kv_head_dim
+    bkv = cfgs.bkv_sz
+    lanes = cfgs.bq_c_sz * heads
+    group_tokens = skip_group_tokens(cfgs)
+    per_group = group_tokens // cfgs.bq_c_sz
+    n_groups = cfgs.bq_sz // group_tokens
+    group_lanes = group_tokens * heads
+
     def block(kv_head, kh, vt, bq_start, cs):
         """One compute block: queries [bq_start, bq_start + bq_c_sz) of the q block,
         lanes ``cs`` (a static slice, or a pl.ds at a traced lane offset)."""
@@ -122,8 +338,7 @@ def tile(
         s = lax.dot_general(
             kh, qt, (((0,), (0,)), ((), ())), preferred_element_type=jnp.float32
         )  # [bkv, lanes]
-        if not no_max:
-            s = s.astype(jnp.bfloat16)
+        s = s.astype(jnp.bfloat16)
         if apply_mask:
             # key index kv_iota + processed_kv_len <= query index
             # q_iota + bq_start + processed_q_len, i.e. q_kv_diff >= offset - bq_start.
@@ -132,33 +347,28 @@ def tile(
                 mask = jnp.logical_and(mask, q_kv_diff < window + offset - bq_start)
             s = jnp.where(mask, s, cfgs.model.mask_value)
         m_prev = m_ref[kv_head, :, cs]  # [1, lanes]
-        if no_max:
-            # Bounded scores: m is -inf at a q block's first k block (alpha clears
-            # acc and l) and 0 after; s stays f32 up to exp2.
-            m_new = jnp.maximum(m_prev, 0.0)
-            alpha = jnp.exp2(m_prev - m_new)
-            p = jnp.exp2(s).astype(jnp.bfloat16)  # [bkv, lanes]
+        m_cur = jnp.max(s, axis=0, keepdims=True).astype(jnp.float32)
+        m_new = jnp.maximum(m_prev, m_cur)
+        alpha = jnp.exp2(m_prev - m_new)
+        p = jnp.exp2(s - m_new.astype(jnp.bfloat16))  # [bkv, lanes] bf16
+        if cfgs.serve.transposed_fp8_p:
+            # p in (0, 1] and V fp8: one 8-bit MXU pass for O^T (and l).
+            o_t = lax.dot_general(
+                vt.astype(jnp.float8_e4m3fn),
+                p.astype(jnp.float8_e4m3fn),
+                (((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
         else:
-            m_cur = jnp.max(s, axis=0, keepdims=True).astype(jnp.float32)
-            m_new = jnp.maximum(m_prev, m_cur)
-            alpha = jnp.exp2(m_prev - m_new)
-            p = jnp.exp2(s - m_new.astype(jnp.bfloat16))  # [bkv, lanes] bf16
-        o_t = lax.dot_general(
-            vt, p, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
-        )  # [acc rows, lanes]: O^T rows, then the row sums
+            o_t = lax.dot_general(
+                vt, p, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+            )  # [acc rows, lanes]: O^T rows, then the row sums
         acc_ref[kv_head, :, cs] = alpha * acc_ref[kv_head, :, cs] + o_t
         # A finished q block starts its next one from -inf (alpha == 0 then
         # clears acc and l).
         m_ref[kv_head, :, cs] = jnp.where(
             schedule_ref.is_last_k[step, 0], -jnp.inf, m_new
         )
-
-    # Partial q blocks: groups of compute blocks covering skip_group_tokens tokens.
-    group_tokens = skip_group_tokens(cfgs)
-    per_group = group_tokens // cfgs.bq_c_sz
-    n_groups = cfgs.bq_sz // group_tokens
-    grouped = q_rows is not None and n_groups > 1
-    group_lanes = group_tokens * heads
 
     for kv_head in range(cfgs.model.num_kv_heads):
         kh = k[0, kv_head]  # [hd, bkv] fp8, contracted on dim 0: the MXU LHS
@@ -190,35 +400,5 @@ def tile(
             )
             return carry
 
-        live_groups = jnp.clip((q_rows + group_tokens - 1) // group_tokens, 1, n_groups)
         lax.fori_loop(0, live_groups, run_group, 0)
         lax.fori_loop(live_groups, n_groups, reset_group, 0)
-
-    is_last_k = schedule_ref.is_last_k[step, 0] == 1
-
-    def store():
-        outs = []
-        for kv_head in range(cfgs.model.num_kv_heads):
-            acc = acc_ref[kv_head]  # [acc rows, rows]
-            l = acc[hd : hd + 1]
-            o_t = acc[:hd] * pl.reciprocal(l, approx=True)
-            if cfgs.serve.out_head_norm_eps is not None:
-                o_t = utils.head_norm(
-                    o_t.astype(cfgs.serve.dtype_out),
-                    0,
-                    cfgs.model.head_dim,
-                    cfgs.serve.out_head_norm_eps,
-                )
-            pad = cfgs.aligned_q_head_dim - hd
-            if pad:
-                o_t = jnp.concatenate([o_t, jnp.zeros((pad, rows), o_t.dtype)], axis=0)
-            outs.append(
-                o_t.T.astype(cfgs.serve.dtype_out)
-            )  # [rows, aligned_q_head_dim]
-        out = jnp.stack(outs, axis=0)
-        o_u32_vref = o_vref.at[0].bitcast(jnp.uint32)
-        out_ref = o_u32_vref.reshape(-1, cfgs.aligned_q_head_dim)
-        out = pltpu.bitcast(out, out_ref.dtype).reshape(out_ref.shape)
-        utils.strided_store(out_ref, 0, out_ref.shape[0], 1, out)
-
-    lax.cond(is_last_k, store, lambda: None)

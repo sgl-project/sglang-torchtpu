@@ -31,6 +31,7 @@ Note: batched_rpa is build on top / derived from RPA3.
 
 import dataclasses
 import math
+import os
 
 import jax
 import jax.numpy as jnp
@@ -518,6 +519,10 @@ def calculate_block_sizes(
     # way out short of a code patch. Rounded up to a whole page: a k block below
     # one page yields an empty DMA schedule leaf and fails Mosaic compilation.
     forced_bkv = envs.SGLANG_TPU_FORCE_RPA_PREFILL_BKV.get()
+    # Global (full-context) layers only: SWA layers keep their searched k block
+    # (a large forced bkv slows the 2048-token window).
+    if forced_bkv is not None and model_cfgs.sliding_window is not None:
+        forced_bkv = None
     if forced_bkv is not None:
         page = serve_cfgs.page_size
         aligned = max(page, -(-int(forced_bkv) // page) * page)
@@ -525,6 +530,39 @@ def calculate_block_sizes(
     else:
         prefill_block_sizes = cover_whole_pages(prefill_block_sizes)
 
+    # Tuning: q compute-chunk (bq_c) and q block (bq) overrides for prefill;
+    # bq_c sets the lanes of one transposed score chunk (bq_c * q heads per kv).
+    forced_bq = tpu_envs.SGLANG_TPU_FORCE_RPA_PREFILL_BQ.get()
+    if forced_bq is not None and model_cfgs.sliding_window is None:
+        prefill_block_sizes = dataclasses.replace(
+            prefill_block_sizes,
+            bq_sz=int(forced_bq),
+            bq_c_sz=math.gcd(prefill_block_sizes.bq_c_sz, int(forced_bq)),
+        )
+    forced_bq_c = tpu_envs.SGLANG_TPU_FORCE_RPA_PREFILL_BQ_C.get()
+    if forced_bq_c is not None and model_cfgs.sliding_window is None:
+        prefill_block_sizes = dataclasses.replace(
+            prefill_block_sizes,
+            bq_c_sz=math.gcd(int(forced_bq_c), prefill_block_sizes.bq_sz),
+        )
+    # Tuning: SWA-layer prefill overrides (the global-layer ones above skip SWA).
+    # Muse Spark serves bq 1024 / bkv 512; unset or 0 keeps the searched size (the
+    # default here, unlike the Google3 fork, so other sliding-window models keep theirs).
+    swa_bq = int(os.environ.get("MUSE_RPA_SWA_BQ", "0") or 0)
+    swa_bkv = int(os.environ.get("MUSE_RPA_SWA_BKV", "0") or 0)
+    if model_cfgs.sliding_window is not None and (swa_bq or swa_bkv):
+        if swa_bkv:
+            page = serve_cfgs.page_size
+            prefill_block_sizes = dataclasses.replace(
+                prefill_block_sizes,
+                bkv_sz=max(page, -(-int(swa_bkv) // page) * page),
+            )
+        if swa_bq:
+            prefill_block_sizes = dataclasses.replace(
+                prefill_block_sizes,
+                bq_sz=int(swa_bq),
+                bq_c_sz=math.gcd(prefill_block_sizes.bq_c_sz, int(swa_bq)),
+            )
     return decode_block_sizes, prefill_block_sizes
 
 
@@ -732,6 +770,11 @@ def ragged_paged_attention(
             and attention_sink is None
             and not return_lse
         ),
+        transposed_key_chunk=tpu_envs.SGLANG_TPU_RPA_TRANSPOSED_KEY_CHUNK.get(),
+        transposed_valu_exp2_every=tpu_envs.SGLANG_TPU_RPA_VALU_EXP2_EVERY.get(),
+        transposed_fp8_p=tpu_envs.SGLANG_TPU_RPA_TRANSPOSED_FP8_P.get(),
+        transposed_chunk_vt=tpu_envs.SGLANG_TPU_RPA_CHUNK_VT.get(),
+        transposed_s_bf16=tpu_envs.SGLANG_TPU_RPA_S_BF16.get(),
         transposed=(
             tpu_envs.SGLANG_TPU_RPA_TRANSPOSED.get()
             and kv_layout == configs.KVLayout.SEQ_ALONG_LANE

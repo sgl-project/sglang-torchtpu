@@ -107,6 +107,16 @@ class ServingConfigs:
     # Per-head RMS norm of the output rows (weightless, this eps), applied to the
     # output-dtype values as a model's following norm would (Muse Spark).
     out_head_norm_eps: float | None = None
+    # Transposed tile with no_max: keys per streamed chunk (None: the whole bkv).
+    transposed_key_chunk: int | None = None
+    # Unshifted streaming tile: every Nth key chunk's exp2 runs on the VALU (0: none).
+    transposed_valu_exp2_every: int = 0
+    # Shifted transposed tile: the PV (O^T) matmul in fp8 (p in (0, 1], fp8 V).
+    transposed_fp8_p: bool = False
+    # Unshifted streaming tile: build V^T (+ ones rows) per key chunk, not per tile.
+    transposed_chunk_vt: bool = False
+    # Unshifted streaming tile: the QK matmul pops bf16 scores (no f32->bf16 pass).
+    transposed_s_bf16: bool = False
 
     @property
     def pages_per_seq(self) -> int:
