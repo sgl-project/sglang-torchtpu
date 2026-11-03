@@ -356,7 +356,7 @@ class CompiledFunction:
                 # Submit eager input preparation without waiting for buffers.
                 # Symbolic arguments keep layout queries from blocking compilation.
                 synchronize(tensors, wait=False)
-                args, kwargs = tree_util.tree_map(
+                args, placeholders = tree_util.tree_map(
                     lambda value: (
                         tpu_torch_compile.placeholder_like(value)
                         if _is_tpu_tensor(value)
@@ -364,6 +364,8 @@ class CompiledFunction:
                     ),
                     (args, kwargs),
                 )
+                # tree_map sorts dict keys; keep the caller's keyword order.
+                kwargs = {name: placeholders[name] for name in kwargs}
         artifact = self._get_artifact(args, kwargs, async_compile=async_compile)
         return PendingCall(artifact.wait_for_compile)
 
