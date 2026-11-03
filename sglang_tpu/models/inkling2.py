@@ -58,6 +58,9 @@ logger = logging.getLogger(__name__)
 _QKVR_PROJECTIONS = ("wq_du", "wk_dv", "wv_dv", "wr_du", "gate_attn", "attn_sink_proj")
 _ATTN_RES_EPS = 1e-6
 _L2_CLIP_EPS = 1e-6
+# Prefill-sized batches route 1/tp of the rows per rank; below this the gather costs more.
+# Arbitrary; measured only at 8192.
+_SHARDED_ROUTE_MIN_TOKENS = 1024
 
 
 def _rms(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -473,6 +476,10 @@ class Inkling2MoE(nn.Module):
         self.selection_bias = nn.Parameter(
             torch.zeros(self.num_experts, dtype=torch.float32), requires_grad=False
         )
+        # A buffer (graph input) keeps the rank out of the traced graph.
+        self.register_buffer(
+            "_route_rank", torch.tensor([get_parallel().attn_tp_rank], dtype=torch.int32), persistent=False
+        )
         self.experts = FusedMoE(
             num_experts=self.num_experts,
             hidden_size=config.hidden_size,
@@ -501,8 +508,24 @@ class Inkling2MoE(nn.Module):
             topk_weights=weights, topk_ids=topk_ids.to(torch.int32), router_logits=logits
         )
 
+    def _route_sharded(self, x: torch.Tensor) -> StandardTopKOutput:
+        """_route on this rank's 1/tp of the rows, gathered: routing is per row, so bit-identical."""
+        group = get_parallel().attn_tp_group
+        rows = x.shape[0] // group.world_size
+        mine = x.view(group.world_size, rows, x.shape[-1]).index_select(0, self._route_rank).squeeze(0)
+        topk = self._route(mine)
+        return StandardTopKOutput(
+            topk_weights=group.all_gather(topk.topk_weights, dim=0),
+            topk_ids=group.all_gather(topk.topk_ids, dim=0),
+            router_logits=None,
+        )
+
     def forward(self, x: torch.Tensor, num_token_non_padded: Optional[torch.Tensor]) -> torch.Tensor:
-        topk = self._route(x)
+        tp = get_parallel().attn_tp_size
+        if tp > 1 and x.shape[0] >= _SHARDED_ROUTE_MIN_TOKENS and x.shape[0] % tp == 0:
+            topk = self._route_sharded(x)
+        else:
+            topk = self._route(x)
         if num_token_non_padded is not None:
             # Bucket-padding rows hold stale values; under EP they must not reach the experts.
             pad = (torch.arange(x.shape[0], device=x.device) >= num_token_non_padded)[:, None]
