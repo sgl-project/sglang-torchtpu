@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import math
 
 import jax
 import jax.experimental.pallas as pl
@@ -169,6 +170,11 @@ def calculate_and_store_out(
             )
         if cfgs.model.has_attention_sink:
             batch_l = add_attention_sink(batch_l, batch_m, sink_ref)
+        if cfgs.serve.ones_v:
+            # l rode along in the accumulator lanes above the head.
+            h = cfgs.aligned_kv_head_dim
+            batch_l = batch_acc[..., h : 2 * h]
+            batch_acc = batch_acc[..., :h]
         if cfgs.serve.cache_only:
             # A row that attended no key keeps l == 0 and outputs 0.
             batch_l = jnp.where(batch_l == 0, jnp.ones_like(batch_l), batch_l)
@@ -379,89 +385,141 @@ def rpa_body(
     # Stack to (batch, num_heads, bkv_sz, num_lanes)
     k = jnp.stack(k_b, axis=0)
     v = jnp.stack(v_b, axis=0)
-
-    # Step 3: Perform compute.
-    m_val = m_scratch_ref[...]
-    l_val = l_scratch_ref[...]
-    acc_val = acc_scratch_ref[...]
-
-    l_new_list = []
-    m_new_list = []
-    acc_new_list = []
-
-    prev_p = prev_alpha_list = prev_q_slice = None
-    for bq_start in range(0, cfgs.bq_sz, cfgs.bq_c_sz):
-        bq_end = min(bq_start + cfgs.bq_c_sz, cfgs.bq_sz)
-        q_start = bq_start * cfgs.aligned_num_q_heads_per_kv_head
-        q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
-        q_slice = slice(q_start, q_end)
-
-        p, alpha_list, m_next, l_next, m_lanes = (
-            flash_attention.flash_attention_qk_softmax(
-                step,
-                q[:, :, q_slice],
-                k,
-                m_val[:, q_slice],
-                l_val[:, q_slice],
-                schedule_ref.is_last_k,
-                processed_q_len=processed_q_len,
-                processed_kv_len=processed_kv_len,
-                cfgs=cfgs,
-                bq_start=bq_start,
-                kv_len_left=kv_len_left,
-                global_q_k_gap=global_q_k_gap,
-            )
+    if cfgs.serve.ones_v:
+        # [B, KV, H, S] -> [B, KV, lanes, S]: the PV matmul then returns
+        # sum(p) in the lanes above the head, for free on an MXU that pads H.
+        assert cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+        ones_rows = cfgs.acc_width - v.shape[-2]
+        assert ones_rows > 0, v.shape
+        v = jnp.concatenate(
+            [v, jnp.ones((*v.shape[:-2], ones_rows, v.shape[-1]), v.dtype)],
+            axis=-2,
         )
-        m_scratch_ref[:, q_slice] = m_next
-        l_scratch_ref[:, q_slice] = l_next[-1]
-        l_new_list.append(l_next)
-        m_new_list.append(m_lanes)
 
-        if prev_p is not None:
-            o_next = flash_attention.flash_attention_pv(
-                prev_p,
-                v,
-                prev_alpha_list,
-                acc_val[:, prev_q_slice],
-                cfgs=cfgs,
+    # Step 3: Perform compute, then step 4: write back outputs.
+    fast_tiles = (
+        cfgs.serve.skip_full_tile_mask
+        and cfgs.batch_size == 1
+        and kv_len_left is None
+        and global_q_k_gap is None
+    )
+    fold_sm_scale = (
+        fast_tiles
+        and cfgs.serve.scale_q is None
+        and math.frexp(cfgs.model.sm_scale)[0] == 0.5
+    ) or (cfgs.serve.exp2_softmax and cfgs.serve.scale_q is None)
+
+    def compute_and_store(apply_mask: bool):
+        m_val = m_scratch_ref[...]
+        l_val = l_scratch_ref[...]
+        acc_val = acc_scratch_ref[...]
+
+        l_new_list = []
+        m_new_list = []
+        acc_new_list = []
+
+        prev_p = prev_alpha_list = prev_q_slice = None
+        for bq_start in range(0, cfgs.bq_sz, cfgs.bq_c_sz):
+            bq_end = min(bq_start + cfgs.bq_c_sz, cfgs.bq_sz)
+            q_start = bq_start * cfgs.aligned_num_q_heads_per_kv_head
+            q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
+            q_slice = slice(q_start, q_end)
+
+            p, alpha_list, m_next, l_next, m_lanes = (
+                flash_attention.flash_attention_qk_softmax(
+                    step,
+                    q[:, :, q_slice],
+                    k,
+                    m_val[:, q_slice],
+                    l_val[:, q_slice],
+                    schedule_ref.is_last_k,
+                    processed_q_len=processed_q_len,
+                    processed_kv_len=processed_kv_len,
+                    cfgs=cfgs,
+                    bq_start=bq_start,
+                    kv_len_left=kv_len_left,
+                    global_q_k_gap=global_q_k_gap,
+                    apply_mask=apply_mask,
+                    fold_sm_scale=fold_sm_scale,
+                )
             )
-            acc_scratch_ref[:, prev_q_slice] = o_next[-1]
-            acc_new_list.append(o_next)
+            m_scratch_ref[:, q_slice] = m_next
+            if not cfgs.serve.ones_v:
+                l_scratch_ref[:, q_slice] = l_next[-1]
+            l_new_list.append(l_next)
+            m_new_list.append(m_lanes)
 
-        prev_p = p
-        prev_alpha_list = alpha_list
-        prev_q_slice = q_slice
+            if prev_p is not None:
+                o_next = flash_attention.flash_attention_pv(
+                    prev_p,
+                    v,
+                    prev_alpha_list,
+                    acc_val[:, prev_q_slice],
+                    cfgs=cfgs,
+                )
+                acc_scratch_ref[:, prev_q_slice] = o_next[-1]
+                acc_new_list.append(o_next)
 
-    assert prev_p is not None
-    o_next = flash_attention.flash_attention_pv(
-        prev_p,
-        v,
-        prev_alpha_list,
-        acc_val[:, prev_q_slice],
-        cfgs=cfgs,
-    )
-    acc_scratch_ref[:, prev_q_slice] = o_next[-1]
-    acc_new_list.append(o_next)
+            prev_p = p
+            prev_alpha_list = alpha_list
+            prev_q_slice = q_slice
 
-    l_next = jnp.concatenate(l_new_list, axis=2)
-    acc_next = jnp.concatenate(acc_new_list, axis=2)
-    m_lanes = None
-    if cfgs.model.has_attention_sink or cfgs.serve.return_lse:
-        m_lanes = jnp.concatenate(m_new_list, axis=2)
+        assert prev_p is not None
+        o_next = flash_attention.flash_attention_pv(
+            prev_p,
+            v,
+            prev_alpha_list,
+            acc_val[:, prev_q_slice],
+            cfgs=cfgs,
+        )
+        acc_scratch_ref[:, prev_q_slice] = o_next[-1]
+        acc_new_list.append(o_next)
 
-    # Step 4: Write back outputs.
-    calculate_and_store_out(
-        step,
-        schedule_ref,
-        acc_next,
-        l_next,
-        o_vref,
-        m_list=m_lanes,
-        sink_ref=sink_ref,
-        lse_vref=lse_vref,
-        lse_stage_ref=lse_stage_ref,
-        cfgs=cfgs,
-    )
+        l_next = jnp.concatenate(l_new_list, axis=2)
+        acc_next = jnp.concatenate(acc_new_list, axis=2)
+        m_lanes = None
+        if cfgs.model.has_attention_sink or cfgs.serve.return_lse:
+            m_lanes = jnp.concatenate(m_new_list, axis=2)
+
+        calculate_and_store_out(
+            step,
+            schedule_ref,
+            acc_next,
+            l_next,
+            o_vref,
+            m_list=m_lanes,
+            sink_ref=sink_ref,
+            lse_vref=lse_vref,
+            lse_stage_ref=lse_stage_ref,
+            cfgs=cfgs,
+        )
+
+    if not fast_tiles:
+        compute_and_store(apply_mask=True)
+        return
+    full_tile = _full_tile(step, schedule_ref, processed_q_len, processed_kv_len, cfgs)
+
+    @pl.when(full_tile)
+    def _():
+        compute_and_store(apply_mask=False)
+
+    @pl.when(jnp.logical_not(full_tile))
+    def _():
+        compute_and_store(apply_mask=True)
+
+
+def _full_tile(step, schedule_ref, processed_q_len, processed_kv_len, cfgs):
+    # The tile needs no mask when its last key precedes its first query and, with
+    # a sliding window, its last query still sees its first key.
+    is_valid = schedule_ref.s_idx[step, 0] != -1
+    first_q, first_k = processed_q_len[0], processed_kv_len[0]
+    full_tile = jnp.logical_and(is_valid, first_q >= first_k + cfgs.bkv_sz - 1)
+    if cfgs.model.sliding_window is not None:
+        full_tile = jnp.logical_and(
+            full_tile,
+            first_q + cfgs.bq_sz - 1 - first_k < cfgs.model.sliding_window,
+        )
+    return full_tile
 
 
 # Define main kernel.

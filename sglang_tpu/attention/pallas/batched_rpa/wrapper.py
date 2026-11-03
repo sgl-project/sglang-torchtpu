@@ -328,7 +328,10 @@ def calculate_block_sizes(
             carry_rows = (
                 model_cfgs.num_kv_heads * bq_sz * aligned_num_q_heads_per_kv_head
             )
-            total_bytes += carry_rows * (2 * num_lanes) * 4
+            extra_acc_lanes = (
+                max(0, num_lanes - aligned_kv_head_dim) if serve_cfgs.ones_v else 0
+            )
+            total_bytes += carry_rows * (2 * num_lanes + extra_acc_lanes) * 4
 
         return total_bytes
 
@@ -764,6 +767,21 @@ def ragged_paged_attention(
         skip_kv_write=skip_kv_write,
         return_lse=return_lse,
         cp_group_size=cp_group_size,
+        skip_full_tile_mask=envs.SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK.get(),
+        # Base-2 m and l would reach the soft cap, the sink term and the LSE.
+        exp2_softmax=(
+            envs.SGLANG_TPU_RPA_EXP2_SOFTMAX.get()
+            and soft_cap is None
+            and attention_sink is None
+            and not return_lse
+        ),
+        ones_v=(
+            envs.SGLANG_TPU_RPA_ONES_V.get()
+            and kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+            and head_dim <= 64
+            and attention_sink is None
+            and not return_lse
+        ),
     )
 
     q_hbm, new_kv_hbm = prepare_inputs(
