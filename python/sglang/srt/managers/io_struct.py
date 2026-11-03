@@ -2152,8 +2152,9 @@ class PluginWeightUpdateReqInput(BaseReq, kw_only=True):
 class PluginWeightUpdateReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
-    # how many tensors each TP rank received and loaded, in rank order
-    loaded_tensor_counts: List[int] = []
+    # how many tensors each TP rank received, in rank order; load_weights skips names the
+    # model does not know, so this is not a count of parameters written
+    received_tensor_counts: List[int] = []
 
     @classmethod
     def merged(cls, replies: List[PluginWeightUpdateReqOutput]):
@@ -2165,7 +2166,7 @@ class PluginWeightUpdateReqOutput(BaseReq, kw_only=True):
         return cls(
             success=success,
             message=" | ".join(reply.message for reply in replies),
-            loaded_tensor_counts=replies[0].loaded_tensor_counts if success else [],
+            received_tensor_counts=replies[0].received_tensor_counts if success else [],
         )
 
 

@@ -113,6 +113,7 @@ def _runner(result=(True, "ok")):
         "load_weights_from_distributed",
     ):
         getattr(runner.weight_updater, method).return_value = result
+    runner.weight_updater.load_rejection.return_value = None
     return runner
 
 
@@ -390,7 +391,7 @@ class TestPluginWeightUpdate(_WeightUpdaterManagerTestBase):
         )
 
         self.assertTrue(output.success)
-        self.assertEqual(output.loaded_tensor_counts, [1])
+        self.assertEqual(output.received_tensor_counts, [1])
         target.weight_updater.load_weights_from_distributed.assert_called_once_with(
             weights
         )
@@ -415,8 +416,10 @@ class TestPluginWeightUpdate(_WeightUpdaterManagerTestBase):
                     run_post_load=run_post_load
                 )
 
-    def test_a_failed_receive_loads_nothing_and_keeps_the_cache_and_version(self):
-        """No rank loads a bucket that a rank failed to receive."""
+    def test_a_failed_receive_loads_nothing_on_its_rank_and_keeps_the_cache_and_version(
+        self,
+    ):
+        """A rank that failed to receive loads nothing; the request fails and the old KV and version stay."""
 
         def broken(*, context, payload):
             raise ValueError("no receive buffers")
@@ -432,6 +435,52 @@ class TestPluginWeightUpdate(_WeightUpdaterManagerTestBase):
         self.assertIn("no receive buffers", output.message)
         target.weight_updater.load_weights_from_distributed.assert_not_called()
         self.assertEqual((self.flushes, self.recorded), ([], []))
+
+    def test_rank_0_reports_another_ranks_failure_from_the_gather(self):
+        """Only rank 0 replies: a failure gathered from rank 1 fails the request after rank 0 loaded."""
+        gathered = [(1, None), (0, "TP rank 1: no receive buffers")]
+        target = _runner()
+        manager = self._manager_serving(
+            {"ici": lambda *, context, payload: [("w", object())]}, target=target
+        )
+
+        with (
+            patch(
+                "torch.distributed.all_gather_object",
+                side_effect=lambda outputs, obj, group: outputs.__setitem__(
+                    slice(None), gathered
+                ),
+            ),
+            get_parallel().override(tp_rank=0, tp_size=2),
+        ):
+            output = manager.plugin_weight_update(
+                PluginWeightUpdateReqInput(handler="ici", weight_version="3")
+            )
+
+        self.assertFalse(output.success)
+        self.assertIn("TP rank 1", output.message)
+        self.assertIn("other TP ranks have loaded", output.message)
+        self.assertEqual(output.received_tensor_counts, [])
+        target.weight_updater.load_weights_from_distributed.assert_called_once()
+        self.assertEqual((self.flushes, self.recorded), ([], []))
+
+    def test_a_runner_that_rejects_loads_fails_the_request_before_the_transport_runs(
+        self,
+    ):
+        """The weight-cache and derived-weight guards cover direct writes too, so they run first."""
+        called = []
+        target = _runner()
+        target.weight_updater.load_rejection.return_value = (
+            "[weight_cache] plugin_weight_update is not supported"
+        )
+
+        output = self._manager_serving(
+            {"ici": lambda *, context, payload: called.append(1) or []}, target=target
+        ).plugin_weight_update(PluginWeightUpdateReqInput(handler="ici"))
+
+        self.assertFalse(output.success)
+        self.assertIn("weight_cache", output.message)
+        self.assertEqual(called, [])
 
     def test_transport_state_persists_across_calls(self):
         """A transport that registers buffers in one call must find them in the next."""
@@ -470,7 +519,7 @@ class TestPluginWeightUpdateReply(CustomTestCase):
     def test_attention_dp_leaders_replies_merge_like_the_distributed_route(self):
         """Under attention DP the tokenizer gets one reply per leader; one failure fails the request."""
         ok = PluginWeightUpdateReqOutput(
-            success=True, message="Success", loaded_tensor_counts=[3, 3]
+            success=True, message="Success", received_tensor_counts=[3, 3]
         )
         failed = PluginWeightUpdateReqOutput(
             success=False, message="TP rank 1: no receive buffers"
@@ -480,11 +529,11 @@ class TestPluginWeightUpdateReply(CustomTestCase):
         merged_failed = PluginWeightUpdateReqOutput.merged([ok, failed])
 
         self.assertEqual(
-            (merged_ok.success, merged_ok.loaded_tensor_counts), (True, [3, 3])
+            (merged_ok.success, merged_ok.received_tensor_counts), (True, [3, 3])
         )
         self.assertFalse(merged_failed.success)
         self.assertIn("no receive buffers", merged_failed.message)
-        self.assertEqual(merged_failed.loaded_tensor_counts, [])
+        self.assertEqual(merged_failed.received_tensor_counts, [])
 
 
 if __name__ == "__main__":

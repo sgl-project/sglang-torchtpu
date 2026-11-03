@@ -1477,7 +1477,7 @@ async def plugin_weight_update(
     content = {
         "success": reply.success,
         "message": reply.message,
-        "loaded_tensor_counts": reply.loaded_tensor_counts,
+        "received_tensor_counts": reply.received_tensor_counts,
     }
     if reply.success:
         return ORJSONResponse(content, status_code=200)

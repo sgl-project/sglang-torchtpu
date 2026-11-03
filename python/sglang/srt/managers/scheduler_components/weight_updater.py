@@ -5,7 +5,17 @@ import time
 import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+)
 
 import msgspec
 import torch
@@ -52,6 +62,9 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils.weight_checker import overall_checksum
 
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
 logger = logging.getLogger(__name__)
 
 
@@ -88,7 +101,7 @@ class PluginWeightUpdateContext(msgspec.Struct, frozen=True):
 
     # (role, model runner) of each runner the request selects: "target", then any "draft"
     # runners; read-only, except a transport that writes parameters itself
-    runners: List[Tuple[str, Any]]
+    runners: List[Tuple[str, ModelRunner]]
     tp_rank: int
     tp_size: int
     # per-rank storage kept across calls (e.g. registered receive buffers)
@@ -397,8 +410,15 @@ class SchedulerWeightUpdaterManager:
                 success=False,
                 message=f"this platform has no weight-update handler {recv_req.handler!r}",
             )
+        runners = self._select_runners(recv_req.selector)
+        # The load-side guards, before the transport runs: they are startup-determined and
+        # rank-uniform, and a transport that writes parameters itself never reaches a load.
+        for _, runner in runners:
+            rejection = runner.weight_updater.load_rejection("plugin_weight_update")
+            if rejection is not None:
+                return PluginWeightUpdateReqOutput(success=False, message=rejection)
         context = PluginWeightUpdateContext(
-            runners=self._select_runners(recv_req.selector),
+            runners=runners,
             tp_rank=get_parallel().tp_rank,
             tp_size=get_parallel().tp_size,
             state=self._plugin_state,
@@ -418,7 +438,7 @@ class SchedulerWeightUpdaterManager:
                     error = f"TP rank {context.tp_rank}: {message}"
             # only TP rank 0 replies, so its reply must carry every rank's outcome
             success, message, counts = self._agree_across_tp_ranks(
-                error=error, value=len(weights)
+                error=error, count=len(weights)
             )
             if success:
                 if any(counts):
@@ -427,25 +447,28 @@ class SchedulerWeightUpdaterManager:
                     )
                 self.flush_cache_after_weight_update(recv_req)
                 self.record_weight_version_after_update(recv_req.weight_version)
+            else:
+                # each rank loads before the gather, so the ranks that did not fail already have
+                message += "; the other TP ranks have loaded the bucket, redo it or retire the engine"
             return PluginWeightUpdateReqOutput(
                 success=success,
                 message=message,
-                loaded_tensor_counts=counts if success else [],
+                received_tensor_counts=counts if success else [],
             )
 
     def _agree_across_tp_ranks(
-        self, *, error: Optional[str], value: Any
-    ) -> Tuple[bool, str, List[Any]]:
+        self, *, error: Optional[str], count: int
+    ) -> Tuple[bool, str, List[int]]:
         """Every rank reaches this gather, so one rank's failure fails all of them."""
-        outcomes: List[Any] = [None] * get_parallel().tp_size
+        outcomes: List[Tuple[int, Optional[str]]] = [(0, None)] * get_parallel().tp_size
         torch.distributed.all_gather_object(
-            outcomes, (value, error), group=self.tp_cpu_group
+            outcomes, (count, error), group=self.tp_cpu_group
         )
         errors = [error for _, error in outcomes if error is not None]
         return (
             not errors,
             " | ".join(errors) or "Success",
-            [value for value, _ in outcomes],
+            [count for count, _ in outcomes],
         )
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
