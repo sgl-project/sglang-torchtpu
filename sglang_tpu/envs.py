@@ -272,8 +272,8 @@ class TpuEnvs:
     SGLANG_TPU_RPA_OUT_HEAD_NORM_EPS = EnvFloat(None)
     # Transposed tiles with SGLANG_TPU_RPA_NO_MAX run an unshifted streaming softmax
     # (no running max, no alpha rescale) over key chunks of this many keys (the largest
-    # divisor of the k block up to it). Muse Spark serves 1536, the whole k block.
-    SGLANG_TPU_RPA_TRANSPOSED_KEY_CHUNK = EnvInt(256)
+    # divisor of the k block up to it); unset streams the whole k block up to 1536 keys.
+    SGLANG_TPU_RPA_TRANSPOSED_KEY_CHUNK = EnvInt(None)
     # Rejected experiments of the unshifted / transposed tiles (kept for A/B): every Nth
     # key chunk's exp2 on the VALU, fp8 PV in the shifted tile, V^T per key chunk, bf16
     # QK scores. Rolled q-chunk loop: SGLANG_TPU_RPA_QCHUNK_LOOP (transposed.py).
@@ -282,9 +282,8 @@ class TpuEnvs:
     SGLANG_TPU_RPA_CHUNK_VT = EnvBool(False)
     SGLANG_TPU_RPA_S_BF16 = EnvBool(False)
     # Pin the RPA prefill q block / q compute chunk of full-attention layers (bq_c is
-    # reduced to a divisor of bq); unset means the wrapper's search. Sliding-window
-    # layers: MUSE_RPA_SWA_BQ. Muse Spark's 4096-token chunks serve bq 1024: the
-    # searched 768 pads every request's rows to whole q blocks (4096 -> 4608).
+    # reduced to a divisor of bq); unset uses calculate_block_sizes's power-of-2 search
+    # (e.g. bq=1024, bkv=1536 on Muse Spark global layers and 512:512 on window=2048).
     SGLANG_TPU_FORCE_RPA_PREFILL_BQ = EnvInt(None)
     SGLANG_TPU_FORCE_RPA_PREFILL_BQ_C = EnvInt(None)
 

@@ -101,6 +101,61 @@ def skip_group_tokens(cfgs: configs.RpaConfigs) -> int:
     return per * cfgs.bq_c_sz
 
 
+def store_tile(
+    step: jax.Array,
+    schedule_ref,
+    acc_ref: jax.Ref,
+    o_vref: jax.Ref,
+    *,
+    cfgs: configs.RpaConfigs,
+):
+    """Normalizes and writes the completed q block on its final k step.
+
+    Factored out so ``kernel.py`` emits ``store()`` once after the
+    ``full_tile`` / ``partial_q`` dispatch instead of duplicating it in up to
+    four branches (keeping IMEM well inside Percale's 4 MiB limit at bq=1024).
+    """
+    heads = cfgs.aligned_num_q_heads_per_kv_head
+    hd = cfgs.aligned_kv_head_dim
+    rows = cfgs.bq_sz * heads
+    no_max = cfgs.serve.no_max
+    is_last_k = schedule_ref.is_last_k[step, 0] == 1
+
+    def store():
+        outs = []
+        for kv_head in range(cfgs.model.num_kv_heads):
+            acc = acc_ref[kv_head]  # [acc rows, rows]
+            l = acc[hd : hd + 1]
+            if no_max and cfgs.serve.skip_pad_q:
+                # Skipped groups keep acc == 0 (l == 0): output 0 there, not NaN.
+                # Exact for real rows, whose l >= 2^-64 (a query sees its own key).
+                l = jnp.maximum(l, 1e-30)
+            o_t = acc[:hd] * pl.reciprocal(l, approx=True)
+            if cfgs.serve.out_head_norm_eps is not None:
+                o_t = utils.head_norm(
+                    o_t.astype(cfgs.serve.dtype_out),
+                    0,
+                    cfgs.model.head_dim,
+                    cfgs.serve.out_head_norm_eps,
+                )
+            pad = cfgs.aligned_q_head_dim - hd
+            if pad:
+                o_t = jnp.concatenate([o_t, jnp.zeros((pad, rows), o_t.dtype)], axis=0)
+            outs.append(
+                o_t.T.astype(cfgs.serve.dtype_out)
+            )  # [rows, aligned_q_head_dim]
+        out = jnp.stack(outs, axis=0)
+        o_u32_vref = o_vref.at[0].bitcast(jnp.uint32)
+        out_ref = o_u32_vref.reshape(-1, cfgs.aligned_q_head_dim)
+        out = pltpu.bitcast(out, out_ref.dtype).reshape(out_ref.shape)
+        utils.strided_store(out_ref, 0, out_ref.shape[0], 1, out)
+        if no_max:
+            # No alpha == 0 restart without a running max: clear for the next block.
+            acc_ref[...] = jnp.zeros_like(acc_ref)
+
+    lax.cond(is_last_k, store, lambda: None)
+
+
 def tile(
     step: jax.Array,
     k: jax.Array,  # [1, KV, aligned_kv_head_dim, bkv] fp8
@@ -116,17 +171,17 @@ def tile(
     apply_mask: bool,
     cfgs: configs.RpaConfigs,
     q_rows: jax.Array | None = None,
+    emit_store: bool = True,
 ):
     """``q_rows``: the q block's real queries when it may be partial. Its compute blocks
     then run in a loop over skip_group_tokens groups up to the last query. With
     no_max this is the unshifted streaming tile (skipped groups keep acc == 0, which
-    store() clears after every q block); else ``_tile_shifted``, where the groups past
-    the last query only set m to -inf, so the next q block starts clean."""
+    store_tile() clears after every q block); else ``_tile_shifted``, where the groups
+    past the last query only set m to -inf, so the next q block starts clean."""
     heads = cfgs.aligned_num_q_heads_per_kv_head
     hd = cfgs.aligned_kv_head_dim
     bkv = cfgs.bkv_sz
     lanes = cfgs.bq_c_sz * heads
-    rows = cfgs.bq_sz * heads
     offset = processed_kv_len - processed_q_len  # kv index of the first query
     # QK-normed q and k bound |s| (log2 units) far inside exp2's range.
     no_max = cfgs.serve.no_max
@@ -142,20 +197,20 @@ def tile(
     per_group = group_tokens // cfgs.bq_c_sz
     n_groups = cfgs.bq_sz // group_tokens
     grouped = q_rows is not None and n_groups > 1
-    group_lanes = group_tokens * heads
-    if grouped:
-        live_groups = jnp.clip((q_rows + group_tokens - 1) // group_tokens, 1, n_groups)
+    live_groups = (
+        jnp.clip((q_rows + group_tokens - 1) // group_tokens, 1, n_groups)
+        if grouped
+        else None
+    )
 
     if no_max:
         # Unshifted softmax (QK-normed models: |base-2 score| <= ~64, so exp2
         # cannot overflow bf16 / the f32 sums): stream the tile in key chunks so a
         # chunk's scores and probabilities never leave vregs, and drop the running
         # max, its reduction and the alpha rescale. acc is cleared after each
-        # finished q block in store(), so the skipped groups of a partial q block
-        # need no reset (their acc stays zero; store() guards their l == 0).
-        # Largest chunk <= the requested one that divides bkv (SWA layers keep
-        # their own searched bkv, e.g. 768 with a 512 request -> 256).
-        kc = math.gcd(bkv, min(bkv, cfgs.serve.transposed_key_chunk or bkv))
+        # finished q block in store_tile(), so skipped groups keep acc == 0.
+        kc_cap = cfgs.serve.transposed_key_chunk or min(bkv, 1536)
+        kc = math.gcd(bkv, min(bkv, kc_cap))
         chunk_vt = cfgs.serve.transposed_chunk_vt
         for kv_head in range(cfgs.model.num_kv_heads):
             kh = k[0, kv_head]  # [hd, bkv] fp8
@@ -222,27 +277,49 @@ def tile(
 
             n_qc = cfgs.bq_sz // cfgs.bq_c_sz
             loop_unroll = int(os.environ.get("SGLANG_TPU_RPA_QCHUNK_LOOP", "0"))
+            # Masked boundary tiles run at most 1-2 times per q block on global
+            # layers; rolling them when total compute blocks > 32 keeps hot
+            # full_tile 100% unrolled while holding kernel IMEM well inside
+            # Percale's 4 MiB budget at bq=1024.
+            mask_loop_unroll = (
+                4
+                if (
+                    apply_mask
+                    and not loop_unroll
+                    and n_qc * cfgs.model.num_kv_heads > 32
+                )
+                else loop_unroll
+            )
             if grouped:
-                # Live groups only (the loop is already rolled, so the
-                # SGLANG_TPU_RPA_QCHUNK_LOOP unroll does not apply here).
-                def run_group(g, carry, q_chunk=q_chunk):
-                    for j in range(per_group):
-                        bq_start = g * group_tokens + j * cfgs.bq_c_sz
-                        lane0 = pl.multiple_of(g * group_lanes + j * lanes, lanes)
+                sub = math.gcd(per_group, 2 if apply_mask else 4)
+                steps_per_group = per_group // sub
+                sub_tokens = sub * cfgs.bq_c_sz
+                sub_lanes = sub * lanes
+
+                def run_group(
+                    s_idx,
+                    carry,
+                    q_chunk=q_chunk,
+                    sub=sub,
+                    sub_tokens=sub_tokens,
+                    sub_lanes=sub_lanes,
+                ):
+                    for j in range(sub):
+                        bq_start = s_idx * sub_tokens + j * cfgs.bq_c_sz
+                        lane0 = pl.multiple_of(s_idx * sub_lanes + j * lanes, lanes)
                         q_chunk(bq_start, pl.ds(lane0, lanes))
                     return carry
 
-                lax.fori_loop(0, live_groups, run_group, 0)
-            elif loop_unroll and n_qc > 1:
-                # Rolled q-chunk loop (unroll factor loop_unroll): the fully unrolled
-                # one overflows IMEM at bq 1024 (Percale: 4.04 of 4 MiB).
+                lax.fori_loop(0, live_groups * steps_per_group, run_group, 0)
+            elif mask_loop_unroll and n_qc > 1:
+
                 def body(i, carry, q_chunk=q_chunk):
                     bq_start = i * cfgs.bq_c_sz
                     cs = pl.ds(pl.multiple_of(i * lanes, lanes), lanes)
                     q_chunk(bq_start, cs)
                     return carry
 
-                lax.fori_loop(0, n_qc, body, 0, unroll=min(loop_unroll, n_qc))
+                lax.fori_loop(0, n_qc, body, 0, unroll=min(mask_loop_unroll, n_qc))
             else:
                 for bq_start in range(0, cfgs.bq_sz, cfgs.bq_c_sz):
                     q_chunk(bq_start, slice(bq_start * heads, bq_start * heads + lanes))
@@ -260,44 +337,11 @@ def tile(
             apply_mask=apply_mask,
             cfgs=cfgs,
             grouped=grouped,
-            live_groups=live_groups if grouped else None,
+            live_groups=live_groups,
         )
 
-    is_last_k = schedule_ref.is_last_k[step, 0] == 1
-
-    def store():
-        outs = []
-        for kv_head in range(cfgs.model.num_kv_heads):
-            acc = acc_ref[kv_head]  # [acc rows, rows]
-            l = acc[hd : hd + 1]
-            if no_max and cfgs.serve.skip_pad_q:
-                # Skipped groups keep acc == 0 (l == 0): output 0 there, not NaN.
-                # Exact for real rows, whose l >= 2^-64 (a query sees its own key).
-                l = jnp.maximum(l, 1e-30)
-            o_t = acc[:hd] * pl.reciprocal(l, approx=True)
-            if cfgs.serve.out_head_norm_eps is not None:
-                o_t = utils.head_norm(
-                    o_t.astype(cfgs.serve.dtype_out),
-                    0,
-                    cfgs.model.head_dim,
-                    cfgs.serve.out_head_norm_eps,
-                )
-            pad = cfgs.aligned_q_head_dim - hd
-            if pad:
-                o_t = jnp.concatenate([o_t, jnp.zeros((pad, rows), o_t.dtype)], axis=0)
-            outs.append(
-                o_t.T.astype(cfgs.serve.dtype_out)
-            )  # [rows, aligned_q_head_dim]
-        out = jnp.stack(outs, axis=0)
-        o_u32_vref = o_vref.at[0].bitcast(jnp.uint32)
-        out_ref = o_u32_vref.reshape(-1, cfgs.aligned_q_head_dim)
-        out = pltpu.bitcast(out, out_ref.dtype).reshape(out_ref.shape)
-        utils.strided_store(out_ref, 0, out_ref.shape[0], 1, out)
-        if no_max:
-            # No alpha == 0 restart without a running max: clear for the next block.
-            acc_ref[...] = jnp.zeros_like(acc_ref)
-
-    lax.cond(is_last_k, store, lambda: None)
+    if emit_store:
+        store_tile(step, schedule_ref, acc_ref, o_vref, cfgs=cfgs)
 
 
 def _tile_shifted(
