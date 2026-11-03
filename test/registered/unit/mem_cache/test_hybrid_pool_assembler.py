@@ -139,7 +139,8 @@ class TestHybridStageLayerMappings(CustomTestCase):
                 {"full": {3: 0}, "swa": {0: 2, 1: 0, 2: 1}},
             ),
             (
-                            "build_hybrid_mamba_swa_stack",
+                MambaSwaStrategy,
+                "build_hybrid_mamba_swa_stack",
                 {"full": {3: 0}, "swa": {0: 2, 1: 0, 2: 1}, "mamba": {0: 1, 3: 0}},
             ),
         ]
