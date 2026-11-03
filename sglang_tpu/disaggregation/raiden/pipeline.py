@@ -721,9 +721,9 @@ class PipelineTransfer:
     def offer_part(self, room: int, start: int, block_ids: list[int]) -> None:
         """Offer full-attention pages that are final before the prefill ends.
 
-        Pages gather until they make part_min_pages; runs larger than the
-        staging capacity are split into separate native transfers. The decode
-        pulls each part while the pipeline keeps computing. Pages still
+        Pages gather until they make part_min_pages; each such run registers
+        as its own native transfer once the decode has named the room, and the
+        decode pulls it while the pipeline keeps computing. Pages still
         gathering when the prefill ends ride the closing transfer.
         """
         if not self.early_parts or not block_ids:
@@ -745,28 +745,22 @@ class PipelineTransfer:
                     f"Raiden pipeline room {room} offered pages out of order"
                 )
             p_blocks = p_blocks + [int(b) for b in block_ids]
+            if len(p_blocks) < self.part_min_pages:
+                state["pending"] = (p_start, p_blocks)
+                return
             state["pending"] = None
-            while len(p_blocks) >= min(self.part_min_pages, self.max_blocks):
-                pages, p_blocks = (
-                    p_blocks[: self.max_blocks],
-                    p_blocks[self.max_blocks :],
-                )
-                part = dict(
-                    index=len(state["parts"]),
-                    start=p_start,
-                    full=pages,
-                    registered=False,
-                    replied=set(),
-                    done=False,
-                    expires=time.monotonic() + mgr._timeout_s,
-                )
-                state["parts"].append(part)
-                p_start += len(pages)
-                state["offered"] = p_start
-                self._reply_part(room, part)
-                if room in self.failed:
-                    return
-            state["pending"] = (p_start, p_blocks) if p_blocks else None
+            part = dict(
+                index=len(state["parts"]),
+                start=p_start,
+                full=p_blocks,
+                registered=False,
+                replied=set(),
+                done=False,
+                expires=time.monotonic() + mgr._timeout_s,
+            )
+            state["parts"].append(part)
+            state["offered"] = p_start + len(p_blocks)
+            self._reply_part(room, part)
 
     def _dst_attn_tp(self, room) -> int:
         widths = {int(meta["attn_tp_size"]) for meta in self.replies[room].values()}

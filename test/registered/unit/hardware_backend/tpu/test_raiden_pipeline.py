@@ -14,7 +14,10 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu.disaggregation.raiden.common import get_raiden_kv_caches
+from sglang_tpu.disaggregation.raiden.common import (
+    RaidenKVCacheGroups,
+    get_raiden_kv_caches,
+)
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 from sglang_tpu.disaggregation.raiden.host_pool import (
     StagingAdmission,
@@ -37,7 +40,9 @@ from sglang_tpu.disaggregation.raiden.pp_common import (
     is_swa_pool,
     source_spans,
 )
+from sglang_tpu.disaggregation.raiden.sender import RaidenKVSender
 from sglang_tpu.disaggregation.raiden.serde import MessageTag, RoomFailed
+from sglang_tpu.envs import envs
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -1034,6 +1039,77 @@ class TestPipelineLifetimes(unittest.TestCase):
         )
 
 
+class TestContextParallelPipeline(unittest.TestCase):
+    def test_only_cp_zero_can_source_pipeline_pages(self):
+        pipe = PipelineTransfer.__new__(PipelineTransfer)
+        native = SimpleNamespace(
+            StartTransferRequest=SimpleNamespace(
+                DESCRIPTOR=SimpleNamespace(fields_by_name={"wire_pool_indices": None})
+            )
+        )
+        for producer, cp_rank, all_ranks, accepted in (
+            (True, 0, False, True),
+            (True, 1, False, False),
+            (True, 0, True, False),
+            (False, 0, False, False),
+        ):
+            with self.subTest(producer=producer, cp_rank=cp_rank, all_ranks=all_ranks):
+                pipe.producer = producer
+                pipe.manager = SimpleNamespace(
+                    attn_cp_size=4,
+                    attn_cp_rank=cp_rank,
+                    enable_all_cp_ranks_for_transfer=all_ranks,
+                    attn_tp_size=1,
+                    pp_size=4,
+                )
+                if accepted:
+                    pipe._check_support(native)
+                else:
+                    with self.assertRaisesRegex(ValueError, "CP rank 0"):
+                        pipe._check_support(native)
+
+    def test_cp_follower_keeps_pages_without_starting_a_native_engine(self):
+        manager = RaidenKVManager.__new__(RaidenKVManager)
+        manager._pipeline_enabled = True
+        manager._pipeline = None
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
+        manager.is_dummy_cp_rank = True
+        manager.chunked_transfer = True
+        buffer = Bf16Buffer()
+        with patch(
+            "sglang_tpu.disaggregation.raiden.pipeline.PipelineTransfer"
+        ) as start:
+            manager.set_kv_caches(RaidenKVCacheGroups(full=[buffer], swa=[]))
+        start.assert_not_called()
+        self.assertIsNone(manager._pipeline)
+        self.assertFalse(manager.chunked_transfer)
+        self.assertIs(manager._kv_caches[0], buffer)
+
+    def test_cp_follower_matches_source_page_lifetime(self):
+        sender = RaidenKVSender.__new__(RaidenKVSender)
+        sender.kv_mgr = SimpleNamespace(
+            _pipeline=None, _pipeline_enabled=True, is_dummy_cp_rank=True
+        )
+        for stage_parts, early_close in ((False, False), (True, False), (False, True)):
+            with (
+                self.subTest(stage_parts=stage_parts, early_close=early_close),
+                envs.SGLANG_RAIDEN_PIPELINE_STAGE_PARTS.override(stage_parts),
+                envs.SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE.override(early_close),
+                get_context().override_server_args(pp_async_batch_depth=1),
+            ):
+                pipe = PipelineTransfer.__new__(PipelineTransfer)
+                pipe.producer = True
+                pipe._init_overlap_state()
+                try:
+                    self.assertEqual(
+                        sender.pages_exposed_before_result,
+                        pipe.stage_parts or pipe.early_close,
+                    )
+                finally:
+                    if pipe.fence_executor is not None:
+                        pipe.fence_executor.shutdown(wait=True)
+
+
 class TestPipelineInitialization(unittest.TestCase):
     def setUp(self):
         override = get_context().override_server_args(
@@ -1055,21 +1131,34 @@ class TestPipelineInitialization(unittest.TestCase):
             self._initialize(legacy=True)
         self.assertEqual(local_ranks.call_args.args[3], 2)
 
-    def _initialize(self, legacy=False):
+    def test_dp_replicas_keep_separate_native_namespaces(self):
+        first = self._initialize(dp_size=2, dp_rank=0)
+        second = self._initialize(dp_size=2, dp_rank=1)
+        self.assertEqual(first.engine.native_args["node_id"], 0)
+        self.assertEqual(second.engine.native_args["node_id"], 0)
+        self.assertNotEqual(
+            first.engine.native_args["local_control_port"],
+            second.engine.native_args["local_control_port"],
+        )
+        self.assertNotEqual(first.store.raiden_id, second.store.raiden_id)
+        self.assertNotEqual(first.controller, second.controller)
+        self.assertNotEqual(first.unit.job_replica_id, second.unit.job_replica_id)
+
+    def _initialize(self, legacy=False, dp_size=1, dp_rank=0):
         events = []
         buffers = groups(full=(0,), swa=())
         manager = SimpleNamespace(
             disaggregation_mode="decode",
             attn_tp_size=1,
             attn_tp_rank=0,
-            attn_dp_size=1,
+            attn_dp_size=dp_size,
             system_dp_size=1,
             attn_cp_size=1,
             pp_size=1,
             pp_rank=0,
             local_ip="10.0.0.1",
-            _control_port=31000,
-            _local_rank=0,
+            _control_port=31000 + dp_rank,
+            _local_rank=dp_rank,
             _timeout_s=120,
             server_args=SimpleNamespace(speculative_algorithm=None, nnodes=1),
             kv_args=SimpleNamespace(page_size=128),
@@ -1093,6 +1182,7 @@ class TestPipelineInitialization(unittest.TestCase):
             for tensor in kwargs["kv_caches"]:
                 tensor.materialized = True
             return SimpleNamespace(
+                native_args=kwargs,
                 transfer_address="10.0.0.1:31001",
                 listener_address="10.0.0.1:31002",
                 register_pools=Mock(
@@ -1128,9 +1218,10 @@ class TestPipelineInitialization(unittest.TestCase):
             ),
             "tpu_sync.api.torch.reshard_store": SimpleNamespace(
                 RaidenId=lambda **kwargs: kwargs,
-                ReshardStore=lambda *args, **kwargs: SimpleNamespace(
-                    reshard_service_port=32000,
-                    raiden_controller_address="10.0.0.1:32001",
+                ReshardStore=lambda raiden_id, **kwargs: SimpleNamespace(
+                    raiden_id=raiden_id,
+                    reshard_service_port=32000 + dp_rank,
+                    raiden_controller_address=f"10.0.0.1:{32010 + dp_rank}",
                 ),
             ),
             "tpu_sync.rpc": SimpleNamespace(
@@ -1157,6 +1248,7 @@ class TestPipelineInitialization(unittest.TestCase):
                 pipe.pools, staging_leases=2, staging_blocks_per_pool=[4]
             )
         pipe.executor.shutdown(wait=False)
+        return pipe
 
     def test_layout_is_measured_after_native_materializes_the_cache(self):
         self._initialize()
