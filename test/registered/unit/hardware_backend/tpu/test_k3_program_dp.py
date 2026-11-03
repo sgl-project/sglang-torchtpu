@@ -158,5 +158,62 @@ class TestDpAllocator(CustomTestCase):
         self.assertIsNone(self._extend(alloc, self.PAGE))  # group 0 has no page left
 
 
+class TestSwapOp(CustomTestCase):
+    def test_swap_moves_landed_rows_to_the_group_on_32_devices(self):
+        """The swap body under shard_map on 32 host devices (a subprocess:
+        the device count is fixed at jax import)."""
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        script = textwrap.dedent(
+            """
+            import os
+            os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=32"
+            os.environ["JAX_PLATFORMS"] = "cpu"
+            import numpy as np, jax, jax.numpy as jnp
+            from jax.sharding import Mesh, PartitionSpec as P
+            from sglang_tpu.k3_programs import sglang_dp as dp
+            N = 24
+            mesh = Mesh(np.asarray(jax.devices()[:32]), ("tp",))
+            plan = dp.DpPages(pages=16, num_blocks=N)
+            reqs = []
+            for group, length in ((0, 40000), (1, 70000)):
+                region, other = list(plan.region(group)), list(plan.region(1 - group))
+                blocks = -(-length // dp.PAGE_TOKENS)
+                reqs.append((group, length, region[1:1 + blocks],
+                             other[-dp.landing_pages_needed(blocks):]))
+            pool = np.zeros((32, N, 8), np.uint8)
+            for group, length, pages, landing in reqs:
+                chunks = -(-length // dp.CHUNK_TOKENS)
+                for rank in range(32):
+                    for j, row in enumerate(plan.transfer_rows(rank, pages, landing)):
+                        k = 32 * j + rank
+                        if k < chunks:
+                            pool[rank, row] = [group + 1, k % 256, k // 256, 0, 0, 0, 0, 0]
+            jobs = [(*plan.swap_rows(p, l), g) for g, _, p, l in reqs]
+            s, d, g = dp.swap_operands(jobs)
+            fn = jax.jit(jax.shard_map(dp.swap_body("tp"), mesh=mesh,
+                in_specs=(P(), P(), P(), P("tp")), out_specs=(P("tp"),), check_vma=False))
+            (out,) = fn(jnp.asarray(s), jnp.asarray(d), jnp.asarray(g),
+                        jnp.asarray(pool.reshape(32 * N, 8)))
+            out = np.asarray(out).reshape(32, N, 8)
+            for group, length, pages, landing in reqs:
+                table = plan.table_row(pages, length, -(-length // dp.GROUP_BLOCK_TOKENS))
+                for k in range(-(-length // dp.CHUNK_TOKENS)):
+                    ident = int(table[k // 16])
+                    cell = out[16 * group + k % 16, ident % N]
+                    assert (cell[0], cell[1], cell[2]) == (group + 1, k % 256, k // 256), (group, k)
+            print("OK")
+            """
+        )
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+        result = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, env=env, timeout=600
+        )
+        self.assertIn("OK", result.stdout, result.stderr[-3000:])
+
+
 if __name__ == "__main__":
     unittest.main()

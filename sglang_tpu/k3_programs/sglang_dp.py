@@ -134,3 +134,58 @@ class DpPages:
 def landing_pages_needed(pages: int) -> int:
     """Landing pages a request of ``pages`` pages takes in the other group."""
     return -(-pages // 2)
+
+
+# ------------------------------------------------------------ the swap op
+SWAP_BUCKETS = (16, 64, 256, 1024)  # swap entries a call, padded
+
+
+def swap_bucket(entries: int) -> int:
+    for bucket in SWAP_BUCKETS:
+        if entries <= bucket:
+            return bucket
+    raise ValueError(f"{entries} swap rows exceed {SWAP_BUCKETS[-1]}")
+
+
+def swap_operands(
+    jobs: Sequence[tuple[Sequence[int], Sequence[int], int]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(source rows, destination rows, destination group)``, padded to a
+    bucket with entries that write nowhere (group -1), from ``(sources,
+    destinations, group)`` per request (:meth:`DpPages.swap_rows`)."""
+    sources = [s for job in jobs for s in job[0]]
+    destinations = [d for job in jobs for d in job[1]]
+    groups = [job[2] for job in jobs for _ in job[0]]
+    size = swap_bucket(max(len(sources), 1))
+    pad = size - len(sources)
+    return (
+        np.asarray(sources + [0] * pad, np.int32),
+        np.asarray(destinations + [0] * pad, np.int32),
+        np.asarray(groups + [-1] * pad, np.int32),
+    )
+
+
+def swap_body(axis: str = "tp"):
+    """The per-rank body (inside a ``shard_map`` over ``axis``, 32 ranks):
+    each rank sends its pools' source rows to its partner in the other group
+    (rank ``r`` to ``r + 16 mod 32``) and writes what it receives at the
+    destination rows of the entries whose destination group is its own."""
+    import jax
+    import jax.numpy as jnp
+
+    perm = [(r, (r + GROUP_RANKS) % (GROUPS * GROUP_RANKS)) for r in range(GROUPS * GROUP_RANKS)]
+
+    def body(sources, destinations, groups, *pools):
+        mine = jax.lax.axis_index(axis) // GROUP_RANKS
+        write = groups == mine
+        out = []
+        for pool in pools:
+            words = pool.view(jnp.uint8) if pool.dtype.itemsize == 1 else pool
+            sent = words[sources]
+            got = jax.lax.ppermute(sent, axis, perm)
+            mask = write.reshape((-1,) + (1,) * (sent.ndim - 1))
+            words = words.at[destinations].set(jnp.where(mask, got, words[destinations]))
+            out.append(words.view(pool.dtype) if words.dtype != pool.dtype else words)
+        return tuple(out)
+
+    return body
