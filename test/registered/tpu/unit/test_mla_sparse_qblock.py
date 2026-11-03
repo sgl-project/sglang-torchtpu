@@ -18,8 +18,10 @@ try:
     import jax.numpy as jnp
     import numpy as np
 
+    _HAS_JAX = True
     _HAS_TPU = any(d.platform == "tpu" for d in jax.devices())
 except Exception:  # pragma: no cover - non-TPU host
+    _HAS_JAX = False
     _HAS_TPU = False
 
 D, KPOOL, PAGE, IH, TOPK, W, QH = 128, 4, 128, 32, 2048, 2176, 8
@@ -144,13 +146,16 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
         )
         return args, ref
 
-    def _check(self, args, ref, sm_scale, k_scale, query_block=256):
+    def _check(
+        self, args, ref, sm_scale, k_scale, query_block=256, per_token_selection=False
+    ):
         out = self.qblock(
             *args,
             sm_scale=sm_scale,
             k_scale=k_scale,
             kpool=KPOOL,
             query_block=query_block,
+            per_token_selection=per_token_selection,
         )
         cu, dist = args[7], args[8]
         n = int(cu[dist[2]])
@@ -167,6 +172,11 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
         seqs = [(1024, 2500), (600, 1800), (0, 2049), (0, 1)]
         args, ref = self._case(seqs, 8192, 6, 4096, 0.08, 0.75)
         self._check(args, ref, 0.08, 0.75)
+
+    def test_per_token_selection_words(self):
+        seqs = [(1024, 2500), (600, 1800), (0, 2049), (0, 1)]
+        args, ref = self._case(seqs, 8192, 6, 4096, 0.08, 0.75)
+        self._check(args, ref, 0.08, 0.75, per_token_selection=True)
 
     def test_64_heads_128_query_blocks(self):
         # 64 heads per chip (GLM-5.3-Flash at attention TP1) take 128-query
@@ -213,6 +223,71 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
             kpool=KPOOL,
             query_block=mq.QUERY_BLOCK,
         ).compile()
+
+
+@unittest.skipUnless(_HAS_JAX, "requires JAX")
+class TestQblockSelectionWords(CustomTestCase):
+    """Per-token selection words equal the per-block-entry ones (runs on CPU)."""
+
+    def _rows(self, rng, pos, width):
+        # A pooled-indexer row: selected pools' tokens (any order), the open
+        # pool's tail, then -1.
+        pool_len = (pos + 1) // KPOOL
+        n_pick = TOPK // KPOOL
+        picked = np.arange(pool_len)
+        if pool_len > n_pick:
+            picked = rng.choice(pool_len, n_pick, replace=False)
+        toks = (picked[:, None] * KPOOL + np.arange(KPOOL)).reshape(-1)
+        tail = pool_len * KPOOL + np.arange((pos + 1) % KPOOL)
+        row = np.full(width, -1, np.int32)
+        row[: toks.size] = toks
+        row[toks.size : toks.size + tail.size] = tail
+        return row
+
+    def test_matches_per_entry_words(self):
+        from sglang_tpu.attention.pallas import mla_sparse_qblock as mq
+
+        rng = np.random.default_rng(0)
+        # (prefix, q_len) per request: past 512 pools, odd tails, a request
+        # straddling block boundaries, and unused request slots.
+        seqs = [(3001, 700), (0, 130), (17, 61)]
+        num_tokens, max_seqs, ctx, qb = 1024, 8, 10240, 128
+        topk = np.full((num_tokens, W), -1, np.int32)
+        cu, kv = [0], []
+        for prefix, q_len in seqs:
+            for i in range(q_len):
+                topk[cu[-1] + i] = self._rows(rng, prefix + i, W)
+            cu.append(cu[-1] + q_len)
+            kv.append(prefix + q_len)
+        cu += [cu[-1]] * (max_seqs - len(seqs))
+        kv += [0] * (max_seqs - len(seqs))
+        cu, kv = jnp.asarray(cu, jnp.int32), jnp.asarray(kv, jnp.int32)
+        dist = jnp.asarray([0, 0, len(seqs)], jnp.int32)
+
+        num_blocks = (num_tokens + max_seqs * (qb - 1)) // qb
+        _, start, count, _, _, _ = mq._query_blocks(
+            cu, kv, dist, query_block=qb, num_blocks=num_blocks, num_tokens=num_tokens
+        )
+        r = jnp.arange(qb, dtype=jnp.int32)
+        is_row = r[None, :] < count[:, None]
+        tok = jnp.where(is_row, start[:, None] + r[None, :], 0)
+        pages_pad = -(-(-(-ctx // PAGE)) // 8) * 8
+        words = [
+            np.asarray(
+                mq._selection_words(
+                    jnp.asarray(topk),
+                    tok,
+                    is_row,
+                    kpool=KPOOL,
+                    pages_pad=pages_pad,
+                    per_token=per_token,
+                )
+            )
+            for per_token in (False, True)
+        ]
+        self.assertEqual(words[0].shape, (num_blocks, pages_pad, qb))
+        self.assertTrue(words[0].any())
+        np.testing.assert_array_equal(words[0], words[1])
 
 
 if __name__ == "__main__":

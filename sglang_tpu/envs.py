@@ -65,6 +65,12 @@ class TpuEnvs:
     # Vision: run single-sequence "tpu" vision attention through block-skipping splash
     # (attention/vision_splash.py); False keeps the segment-id flash op.
     SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION = EnvBool(False)
+    # Query-blocked sparse MLA prefill: build each query's per-page selection
+    # words once per token and gather them into the block layout, instead of
+    # once per (padded) block entry. Same words; the block layout has a padded
+    # block per request slot, so the per-entry compare-OR does ~3x the work at
+    # an 8192-token prefill. False keeps the per-entry form.
+    SGLANG_TPU_QBLOCK_PER_TOKEN_SELECTION = EnvBool(True)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.

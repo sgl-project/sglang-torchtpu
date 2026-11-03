@@ -134,6 +134,7 @@ def sparse_mla_attention_fused(
     k_scale: float,
     qblock_kpool: int = 0,
     gather_chunk_tokens: int = DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE,
+    qblock_per_token_selection: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Run one step: store the new tokens in the cache, then attend.
 
@@ -205,6 +206,7 @@ def sparse_mla_attention_fused(
             k_scale=k_scale,
             kpool=qblock_kpool,
             query_block=query_block,
+            per_token_selection=qblock_per_token_selection,
         )
         return out, cache_nope, cache_rope
 
