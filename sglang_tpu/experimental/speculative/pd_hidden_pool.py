@@ -132,8 +132,9 @@ class PdHiddenPool:
             flat = self.buffer.flatten(0, 1)
             for src, dst, n in segments.T.tolist():
                 flat[dst : dst + n] = rows[src : src + n]
-        # Read after the write, so copying it waits for the rows to land.
-        return self.buffer[0, 0, 0, 0, :1]
+        # Read after the write, so copying it waits for the rows to land. A clone, not a
+        # view: the copy thread may read it after a later write donates the buffer.
+        return self.buffer[0, 0, 0, 0, :1].clone()
 
     def read(self, cache_loc: torch.Tensor) -> torch.Tensor:
         """[len(cache_loc), feature_size] rows of these slots, joined over attention TP."""

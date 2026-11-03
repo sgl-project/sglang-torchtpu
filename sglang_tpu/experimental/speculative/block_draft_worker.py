@@ -172,7 +172,8 @@ class TpuBlockDraftWorker(TpuDraftWorker):
             max_num_reqs=self.model_runner.req_to_token_pool.size,
         )
         # Read inside the compiled writer, after the write: the TPU KV free fence's tail.
-        return kv_pool.kv_buffer[-1][0, 0, 0, 0, :1]
+        # A clone, not a view: the copy thread reads it after the next step donates the pool.
+        return kv_pool.kv_buffer[-1][0, 0, 0, 0, :1].clone()
 
     def _draft_model(self) -> DFlashDraftModel:
         model = self.model_runner.model
