@@ -1594,7 +1594,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         group's heads; the gate multiplies the attention output, which holds
         this rank's heads only (the ``attn_dcp_rank``-th block).
         """
-        if self.q_heads_factor == 1:
+        if getattr(self, "q_heads_factor", 1) == 1:
             return gate
         num_tokens = gate.shape[0]
         gate = gate.reshape(num_tokens, self.num_q_heads_proj, self.head_dim)
@@ -1617,7 +1617,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            gate = self._own_heads_gate(gate)
+            if hasattr(self, "_own_heads_gate"):
+                gate = self._own_heads_gate(gate)
             if _is_npu:
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
                 attn_output = npu_fused_sigmoid_mul(attn_output, gate_val.contiguous())
