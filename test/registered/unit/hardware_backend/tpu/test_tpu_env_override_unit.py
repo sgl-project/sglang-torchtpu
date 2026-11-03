@@ -1,9 +1,10 @@
-"""Unit tests for TPU LIBTPU_INIT_ARGS env overrides.
+"""Unit tests for TPU env overrides.
 
-Covers the override contract: default flags are appended, the VMEM
-prefetch serialization applies only to small explicit KV pools, and a
+Covers the LIBTPU_INIT_ARGS override contract: default flags are appended, the
+VMEM prefetch serialization applies only to small explicit KV pools, and a
 caller-supplied value for the same flag name — even a different value —
-is never clobbered or duplicated.
+is never clobbered or duplicated. Also covers the TPU_PREMAPPED_BUFFER_SIZE
+default that the launcher writes for spawned workers.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -11,12 +12,16 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import os
+import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.env_override import (
     _DECODE_CP_SPARSE_CORE_OVERRIDES,
+    _DEFAULT_TPU_PREMAPPED_BUFFER_SIZE,
+    _TPU_PREMAPPED_BUFFER_SIZE,
     _VMEM_PREFETCH_MIN_LAYERS,
     _VMEM_PREFETCH_OVERRIDES,
     _VMEM_PREFETCH_SAFE_MIN_TOKENS,
@@ -109,6 +114,46 @@ class TestLibtpuInitArgsOverrides(CustomTestCase):
                     args = os.environ["LIBTPU_INIT_ARGS"].split()
                 for flag in _DECODE_CP_SPARSE_CORE_OVERRIDES:
                     self.assertEqual(flag in args, expected)
+
+
+class TestPremappedBufferSizeDefault(CustomTestCase):
+    """The launcher writes the premapped-pool default so spawned workers
+    have it before torch_tpu initializes PJRT (issue #1394)."""
+
+    def _apply(self, initial: str | None) -> str | None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(_TPU_PREMAPPED_BUFFER_SIZE, None)
+            if initial is not None:
+                os.environ[_TPU_PREMAPPED_BUFFER_SIZE] = initial
+            apply_tpu_env_overrides()
+            return os.environ.get(_TPU_PREMAPPED_BUFFER_SIZE)
+
+    def test_unset_gets_default(self):
+        self.assertEqual(self._apply(None), str(_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE))
+
+    def test_user_value_wins(self):
+        # 0 is a valid user choice: it turns the pool off on purpose.
+        for value in ("17179869184", "0"):
+            with self.subTest(value=value):
+                self.assertEqual(self._apply(value), value)
+
+    def test_spawned_child_inherits_default(self):
+        # The default must reach the process environment, not just
+        # os.environ's mapping, so that workers spawned afterwards inherit it.
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(_TPU_PREMAPPED_BUFFER_SIZE, None)
+            apply_tpu_env_overrides()
+            child = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    f"import os; print(os.environ.get({_TPU_PREMAPPED_BUFFER_SIZE!r}))",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        self.assertEqual(child.stdout.strip(), str(_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE))
 
 
 if __name__ == "__main__":

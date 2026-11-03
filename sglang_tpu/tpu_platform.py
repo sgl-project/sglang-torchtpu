@@ -63,8 +63,6 @@ def _validate_startup_cleanup_control(server_args, previous):
         )
 
 
-# Default size for libtpu's premapped (pinned, DMA-mapped) host staging pool.
-_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 # Flush torch_tpu's lazy host->device weight-copy graph once this much work accumulates,
 # so it materializes in chunks rather than all at once, which may cause HBM OOMs.
 _LOAD_WEIGHT_SYNC_BYTES = 2 << 30  # 2 GiB
@@ -1539,8 +1537,13 @@ class TpuSRTPlatform(SRTPlatform):
         # synchronize) called by SGLang's generic runtime bootstrap.
         os.environ.setdefault("TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS", "1")
 
-        # Size libtpu's premapped (pinned, DMA-mapped) host staging pool. This is
-        # read by libtpu at init, so it MUST be set before `import torch_tpu`.
+        # Size libtpu's premapped (pinned, DMA-mapped) host staging pool.
+        # torch_tpu reads it when it first initializes PJRT, so it must be set
+        # before any device use. The launcher already set it before spawning
+        # workers (env_override.apply_tpu_env_overrides); this is the fallback
+        # for workers started without it.
+        from sglang_tpu.env_override import _DEFAULT_TPU_PREMAPPED_BUFFER_SIZE
+
         os.environ.setdefault(
             "TPU_PREMAPPED_BUFFER_SIZE", str(_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE)
         )
