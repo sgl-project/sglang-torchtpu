@@ -10,7 +10,8 @@ each of those into a red PR instead:
     reachable from exactly one job (a red job must name its test);
   * nightly-accuracy / nightly-perf MODEL_CONFIGs carry the required identity
     fields (`id`, `display_name`, `model`), ids are unique, and perf measures
-    through a recipe launch + bench_serving sweep only;
+    through a recipe launch + bench_serving sweep only (or, for cold-start
+    timing, the recipe's own bring-up via startup_timing);
   * the id rename registry (dashboard_aliases.json) is well-formed: acyclic,
     targets live, and no live id is aliased away;
   * `kind` labels use only the contract values (accuracy/performance/info) --
@@ -514,10 +515,15 @@ class TestNightlyConfigLabelLint(CustomTestCase):
             )
             self.assertFalse(launch.get("external"), path.name)
             for gate in config["gates"]:
+                # startup_timing measures the recipe's own bring-up (cold
+                # precompile, #1041): the launch IS the measurement, so there is
+                # no request load to sweep. It still serves through the recipe.
                 self.assertTrue(
-                    "sweep" in gate or gate.get("smoke"),
-                    f"{path.name}: perf gates are sweeps or smoke legs only, "
-                    f"got {gate.get('label') or gate.get('dataset')}",
+                    "sweep" in gate
+                    or gate.get("smoke")
+                    or gate.get("dataset") == "startup_timing",
+                    f"{path.name}: perf gates are sweeps, smoke legs or "
+                    f"startup_timing only, got {gate.get('label') or gate.get('dataset')}",
                 )
             # Smoke-precedes-sweep ordering and sweep shape are enforced by
             # build_gates itself; building the real config exercises that.

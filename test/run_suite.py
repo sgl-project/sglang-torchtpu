@@ -237,6 +237,8 @@ NIGHTLY_SUITES = {
         "nightly-tpu-perf-gpt-oss-120b-c64",
         "nightly-tpu-perf-gpt-oss-120b-eagle3-c64",
         "nightly-tpu-perf-gpt-oss-120b-dflash-c64",
+        # Cold-start precompile time (compile cache off): bring-up is the measurement.
+        "nightly-tpu-perf-gpt-oss-120b-precompile",
         "nightly-tpu-perf-gpt-oss-20b",
         "nightly-tpu-perf-deepseek-r1-0528",
         "nightly-tpu-perf-deepseek-v3-1",
