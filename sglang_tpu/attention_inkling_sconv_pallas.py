@@ -302,7 +302,7 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
             torch.arange(num_seqs, device=x.device, dtype=torch.int32)[:, None] * hist + (hist + offs).clamp(0, hist - 1)
         ).reshape(-1).long()
         new = torch.where(
-            (offs >= 0).reshape(-1)[:, None], xf.index_select(0, x_rows), old.index_select(0, state_rows)
+            (offs >= 0).reshape(-1)[:, None], x.index_select(0, x_rows).float(), old.index_select(0, state_rows)
         )
         self._write_state(state, slots, new.reshape(num_seqs, hist * dim))
         return y
