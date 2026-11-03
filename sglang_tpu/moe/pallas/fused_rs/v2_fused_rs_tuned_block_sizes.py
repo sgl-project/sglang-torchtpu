@@ -208,10 +208,18 @@ def _all_m_act(tile, act):
 
 
 # H4608-I2304 (padded to 2560) EP8, SiTU, W4A16 block-16: K1=4608, N1=5120, K2=2560, N2=4608.
-# Sweep at M=512..65536 (one 8192-token call = 65536 rows): every tile within 2% of the
-# default; the call is bound by the per-row direct-write loop (~0.7 us per local row), not
-# the GEMMs. Full-N single-buffered tiles: same speed, least VMEM.
+# Eager sweep, random routing (v7x, 2026-11-03): M=65536 (one 8192-token chunk) 2.61 ms at
+# tile_m 128, 2.30 at 256, 3.44 at 64, VMEM overflow at 512; M=8192 1.05 at 128, 1.41 at 256.
 _H4608_I2304_FP4_EP8_SITU = (128, 4608, 2560, 2560, 4608, 1, 1)
+_H4608_I2304_FP4_EP8_SITU_LARGE_M = (256, 4608, 2560, 2560, 4608, 1, 1)
+
+
+def _h4608_i2304_fp4_ep8_situ(act):
+    out = _all_m_act(_H4608_I2304_FP4_EP8_SITU, act)
+    for key in out:
+        if int(key.split("_")[0]) >= 65536:
+            out[key] = _H4608_I2304_FP4_EP8_SITU_LARGE_M
+    return out
 
 
 # H4096-I4096 expert TP8 (each expert's intermediate dim split 8 ways: w13 N=1024, w2
@@ -563,7 +571,7 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
             (
                 "k-4608_n-5120_g-48_lhs_quant_rhs_bs-16"
                 "+k-2560_n-6144_g-48_lhs_quant_rhs_bs-16"
-            ): _all_m_act(_H4608_I2304_FP4_EP8_SITU, "situ:4.0:25.0"),
+            ): _h4608_i2304_fp4_ep8_situ("situ:4.0:25.0"),
             # H4096-I4096: H=4096, I=4096, E=256, EP=8 → g=32
             # Small M: full tiles (1,1). Large M (≥32768): smaller tiles
             # with W2 caching (2,2) for better pipelining.
