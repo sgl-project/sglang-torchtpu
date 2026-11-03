@@ -51,6 +51,22 @@ class TpuOOTPlatform(TpuPlatform):
         return SPLASH_ATTN_BACKEND_NAME
 
     @classmethod
+    def oot_attn_backend_serves(
+        cls, supported_attention_backends: set[AttentionBackendEnum]
+    ) -> bool:
+        # A ring launch selects the splash backend globally, so every layer
+        # that takes TORCH_SDPA (DiT and text encoder alike) runs it, as with
+        # an explicit --attention-backend tpu_splash_attn, which the recipes
+        # pass. Shapes its kernels do not cover, such as prompts up to 512
+        # tokens and ragged causal attention, run SDPA.
+        return AttentionBackendEnum.TORCH_SDPA in supported_attention_backends
+
+    @classmethod
+    def get_ring_capable_attention_backends(cls) -> tuple[str, ...]:
+        # Rings by K/V all-gather; TPU has no p2p for the core ring backends.
+        return (SPLASH_ATTN_BACKEND_NAME,)
+
+    @classmethod
     def supports_safetensors_device_load(cls) -> bool:
         # safetensors rejects 'tpu:N'.
         return False
