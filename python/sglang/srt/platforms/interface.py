@@ -257,11 +257,7 @@ class SRTPlatform(DeviceMixin):
         return False
 
     def dcp_replicates_q_heads(self) -> bool:
-        """Whether ``--dcp-replicate-q-proj`` applies to GQA/MHA attention here:
-        the Q projection is then sharded like K/V, over
-        attn_tp_size // attn_dcp_size, so each rank projects its DCP group's
-        query heads itself and the attention backend needs no per-layer Q
-        all-gather. See ``layers.dcp.layout.dcp_q_head_sharding``."""
+        """Whether ``--dcp-replicate-q-proj`` applies to GQA/MHA attention."""
         return False
 
     # TODO(yinlin09): needs an upstream seam issue; carry it as a sglang_tpu/hooks/

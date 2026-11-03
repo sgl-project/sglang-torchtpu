@@ -726,8 +726,7 @@ def _validate_decode_context_parallel(server_args) -> None:
     ):
         raise ValueError(
             "--decode-context-parallel-size > 1 on TPU supports only a bf16 or fp8 "
-            "KV cache (--kv-cache-dtype bfloat16 or fp8_e4m3), got --kv-cache-dtype "
-            f"{cfg.kv_cache_dtype}."
+            f"KV cache (--kv-cache-dtype bfloat16, fp8_e4m3, or fp8_e5m2), got --kv-cache-dtype {cfg.kv_cache_dtype}."
         )
     chunk = cfg.chunked_prefill_size
     if chunk is None:
@@ -1248,8 +1247,6 @@ class TpuSRTPlatform(SRTPlatform):
         return True
 
     def dcp_replicates_q_heads(self) -> bool:
-        # The batched RPA DCP path attends with the group's gathered query
-        # heads; a Q projection sharded like K/V hands them over directly.
         return True
 
     def supports_moe_dp_pipeline_stages(self) -> bool:

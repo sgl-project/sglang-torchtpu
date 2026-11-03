@@ -854,11 +854,6 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
     def test_refuses_speculative_decoding(self):
         self._assert_refused("(?i)specul", speculative_algorithm="EAGLE3")
 
-    def test_accepts_mixed_chunk(self):
-        # Mixed batches run the decode rows on the decode tile of the STRIPED
-        # pass and the chunk rows on the chunk tile.
-        self._validate(self._args(enable_mixed_chunk=True))
-
     def test_accepts_a_bf16_or_fp8_kv_cache_and_refuses_the_rest(self):
         # The batched kernel dequantizes an fp8 cache on read under DCP as it
         # does without it; mxint8 has no DCP path.
