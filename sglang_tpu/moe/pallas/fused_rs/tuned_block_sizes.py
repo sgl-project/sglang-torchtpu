@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 import jax.numpy as jnp
 
@@ -124,6 +125,10 @@ def get_fused_rs_tuned_block_sizes(
         and n1 > k1  # EP holds whole experts: N1 = 2 x intermediate > hidden
     ):
         result = tuple(int(x) for x in override.split(","))
+    # Tuning override for any fused-RS call (tile_m,k1,n1,k2,n2,w1_bufs,w2_bufs).
+    forced = os.environ.get("MUSE_FUSED_RS_TILES")
+    if forced:
+        result = tuple(int(x) for x in forced.split(","))
     if fp8_direct_write and result[0] > 64:
         result = (64,) + tuple(result[1:])
     return result

@@ -21,6 +21,7 @@ before the post-kernel top-k weighted reduction.
 """
 
 import functools
+import os
 
 import jax
 from jax import numpy as jnp
@@ -37,6 +38,7 @@ from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
 from sglang_tpu.moe.pallas.fused_rs.post_combine import (
     fused_post_combine,
     pair_post_combine,
+    pair_post_combine_scatter,
     supports_fused_post_combine,
 )
 from sglang_tpu.moe.pallas.fused_rs.utils import (
@@ -67,10 +69,10 @@ def _assert_fused_rs_smem_safe(size_m: int) -> None:
     assert size_m < _FUSED_RS_MAX_SAFE_SIZE_M, (
         f"gmm_v2_fused_rs SMEM OOM at size_m={size_m} (>= "
         f"{_FUSED_RS_MAX_SAFE_SIZE_M}). Per-row scalar-prefetch arrays "
-        f"would exceed the 1 MB SMEM budget. Reduce "
-        f"max-num-batched-tokens × top_k, switch to ep_backend "
-        f"'gmm_ep_dma'/'gmm_ep_original', or increase tp so m per chip "
-        f"is smaller."
+        "would exceed the 1 MB SMEM budget. Reduce "
+        "max-num-batched-tokens × top_k, switch to ep_backend "
+        "'gmm_ep_dma'/'gmm_ep_original', or increase tp so m per chip "
+        "is smaller."
     )
 
 
@@ -86,7 +88,10 @@ def _assert_fused_rs_smem_safe(size_m: int) -> None:
 
 
 def _compute_rs_routing(topk_indices, *, num_experts, topk):
-    """Inline routing for the RS path. Computes:
+    """Inline routing for the RS path.
+
+    Computes:
+
       - lhs_indices: int32[size_m] — gather indices (token ID per row)
       - group_sizes: int32[num_experts] — rows per expert
       - output_indices: int32[size_m] — = lhs_indices for EP
@@ -153,27 +158,20 @@ def _pair_post_combine(
 ) -> jax.Array:
     """[chunk, hidden]: sum the source blocks, post-expert norm, top-k weighted sum.
 
-    Rank r is the r-th row owned by this rank in the kernel's row order (expert-sorted,
-    then token-sorted); the weighted sum maps ranks back to tokens with a 0/1 matmul.
+    Rank r is the r-th row owned by this rank in the kernel's row order
+    (expert-sorted,
+    then token-sorted); the weighted sum maps ranks back to tokens with a 0/1
+    matmul.
     """
     rows = chunk_size * topk
-    if tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_LOCAL_RANKS.get():
-        # The kernel's row order is a stable sort by expert of the flat (token, slot)
-        # index; this rank's rows keep that order, so a stable sort of its own pairs,
-        # carrying the index and weight, gives the same ranks without the global sort.
-        local_ids = jax.lax.dynamic_slice_in_dim(
+    fused_scatter = os.environ.get("MUSE_PF_FUSED_SCATTER_COMBINE", "1") != "0"
+    if fused_scatter:
+        local_topk = jax.lax.dynamic_slice_in_dim(
             topk_indices, my_id * chunk_size, chunk_size, axis=0
-        ).reshape(-1)
-        _, flat, weight = jax.lax.sort(
-            (
-                local_ids,
-                jnp.arange(rows, dtype=jnp.int32),
-                topk_weights.astype(jnp.float32).reshape(-1),
-            ),
-            num_keys=1,
-            is_stable=True,
         )
-        token = flat // topk
+        local_flat = jnp.argsort(local_topk.reshape(-1))
+        token = local_flat // topk
+        weight = topk_weights.astype(jnp.float32)[token, local_flat % topk]
     else:
         flat_sorted = jnp.argsort(topk_indices.reshape(-1))
         owned = (flat_sorted // topk) // chunk_size == my_id
@@ -181,6 +179,25 @@ def _pair_post_combine(
         token = flat // topk - my_id * chunk_size
         weight = topk_weights.astype(jnp.float32)[token, flat % topk]
     out_dtype = jnp.result_type(recv.dtype, topk_weights.dtype)
+    if (
+        fused_scatter
+        and post_expert_norm_weight is not None
+        and recv.ndim == 3
+        and rows % 8 == 0
+        and chunk_size >= 8
+        and chunk_size % 8 == 0
+        and chunk_size <= 1024
+    ):
+        return pair_post_combine_scatter(
+            recv,
+            post_expert_norm_weight,
+            weight,
+            token,
+            rows=rows,
+            chunk_size=chunk_size,
+            eps=1e-8,
+            out_dtype=out_dtype,
+        )
     if post_expert_norm_weight is not None and recv.ndim == 3:
         weighted = pair_post_combine(
             recv, post_expert_norm_weight, weight, rows=rows, eps=1e-8
@@ -240,10 +257,17 @@ def moe_gmm_local_rs_nodedup(
     then applies topk weights and reduces over the top_k dim post-kernel.
     """
     num_tokens = hidden_states_local.shape[0]
-    hidden_size = w2.shape[-1]
+    w1_shape = w1.shape[1:] if w1.ndim == 4 else w1.shape
+    w2_shape = w2.shape[1:] if w2.ndim == 4 else w2.shape
+    w1s_shape = (
+        (w1_scale.shape[1:] if w1.ndim == 4 else w1_scale.shape)
+        if w1_scale is not None
+        else None
+    )
+    hidden_size = w2_shape[-1]
     chunk_size = num_tokens // ep_size
-    num_experts = w1.shape[0] * ep_size  # global num_experts
-    num_local_experts = w1.shape[0]
+    num_experts = w1_shape[0] * ep_size  # global num_experts
+    num_local_experts = w1_shape[0]
     # Experts are assigned in contiguous, equal-sized blocks by logical rank.
     # Derive the rank from the offset already needed for routing instead of
     # carrying a second scalar through every compiled MoE call.
@@ -260,7 +284,12 @@ def moe_gmm_local_rs_nodedup(
     # fixed at its root cause:
     # https://github.com/sgl-project/sglang-torchtpu/issues/308
     # https://github.com/google-pytorch/torch_tpu/issues/2794
-    if not sp_enabled:
+    # MUSE_PF_SKIP_ROUTING_PSUM (default on in this fork; production: off) drops
+    # it: the JAX prefill program computes the same routing on every rank from
+    # the replicated stream, so the output is bit-identical, and it ran without
+    # a halt. Re-check in the serving graph before adopting it there.
+    skip_psum = os.environ.get("MUSE_PF_SKIP_ROUTING_PSUM", "0") != "0"
+    if not sp_enabled and not skip_psum:
         route_source = my_id == 0
         routing = jnp.stack(
             (topk_indices.astype(jnp.bfloat16), topk_weights.astype(jnp.bfloat16)),
@@ -272,6 +301,23 @@ def moe_gmm_local_rs_nodedup(
         )
         topk_indices = routing[..., 0].astype(jnp.int32)
         topk_weights = routing[..., 1].astype(topk_weights.dtype)
+
+    # Keep every routed id in [0, num_routed_experts). The Muse megakernel
+    # router (_topk_iter) returns id == E for a token whose router scores are
+    # NaN (no lane equals the NaN row max). The one-hot group_sizes drop such
+    # rows while the argsort row order keeps them, so each rank's local_start
+    # (= rank * valid rows) no longer lands on its block of rank * all rows:
+    # ranks then see different tiles, and the pair-exchange receive count (from
+    # the receiver's own tiles) no longer matches the pieces the peers send,
+    # halting gmm_v2_fused_rs with a nonzero recv_sem (scratch argument 27) at
+    # exit. Route such slots to expert 0 with weight 0 so the communication
+    # schedule stays consistent across ranks (the token's output is garbage
+    # either way: its router scores were NaN).
+    num_routed_experts = num_local_experts if expert_tp else num_experts
+    routed_ok = jnp.logical_and(topk_indices >= 0, topk_indices < num_routed_experts)
+    topk_indices = jnp.where(routed_ok, topk_indices, 0)
+    if topk_weights.shape == topk_indices.shape:
+        topk_weights = jnp.where(routed_ok, topk_weights, jnp.zeros_like(topk_weights))
 
     # Expert TP: every rank holds a 1/ep_size slice of every expert's
     # intermediate dim, addressed as virtual experts
@@ -287,7 +333,10 @@ def moe_gmm_local_rs_nodedup(
     if expert_tp:
         lhs_indices, group_sizes, output_indices, topk_slot_indices = (
             _compute_expert_tp_routing(
-                topk_indices, num_experts=num_local_experts, topk=topk, ep_size=ep_size
+                topk_indices,
+                num_experts=num_local_experts,
+                topk=topk,
+                ep_size=ep_size,
             )
         )
     else:
@@ -318,10 +367,10 @@ def moe_gmm_local_rs_nodedup(
     # leaking ``gather_sem`` on kernel exit.
     block_sizes = _select_fused_rs_block_sizes(
         size_m=size_m,
-        size_k1=w1.shape[1],
-        size_n1=w1.shape[2],
-        size_k2=w2.shape[1],
-        size_n2=w2.shape[2],
+        size_k1=w1_shape[1],
+        size_n1=w1_shape[2],
+        size_k2=w2_shape[1],
+        size_n2=w2_shape[2],
         size_group=num_local_experts,
         size_lhs_group=group_sizes.shape[0],
         ep_size=ep_size,
@@ -338,8 +387,8 @@ def moe_gmm_local_rs_nodedup(
         # entry here and can pick a different tile_m than the kernel -> the
         # max_num_gm undercount / gather_sem leak described above.
         quant_block_size=(
-            recover_quant_block_size(w1.shape[1], w1_scale.shape[1])
-            if w1_scale is not None
+            recover_quant_block_size(w1_shape[1], w1s_shape[1])
+            if w1s_shape is not None
             else None
         ),
         act_fn=activation,
@@ -556,7 +605,7 @@ def expert_parallel_gmm_rs(
         P(combine_partition_axes(MLP_DATA, expert_axis), None) if sp_enabled else P()
     )
     topk_i_spec = P(MLP_DATA, None) if sp_enabled else P()
-    num_experts = w1.shape[0]
+    num_experts = w1.shape[1] if w1.ndim == 4 else w1.shape[0]
     num_experts_per_shard = num_experts // ep_size
     group_offset = (
         group_offset_input
@@ -693,7 +742,9 @@ def fused_moe_func_rs(
     This replaces the standard EP pattern of psum (after kernel).
     """
     num_tokens, hidden_size = hidden_states.shape
-    global_num_experts, padded_hidden_size, _ = w1.shape
+    global_num_experts, padded_hidden_size, _ = (
+        w1.shape[1:] if w1.ndim == 4 else w1.shape
+    )
     dtype = hidden_states.dtype
 
     assert (num_tokens * topk) % 16 == 0
