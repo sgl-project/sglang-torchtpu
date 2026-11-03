@@ -20,7 +20,12 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import get_forward_context
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel, get_spec, process_model_config
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_parallel,
+    get_spec,
+    process_model_config,
+)
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
@@ -767,10 +772,13 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             return
         overall = time.perf_counter()
         self._precompile_draft_prefill_extend()
-        self._precompile_draft_decode(draft_attn_backend)
-        if fused_draft_forward is not None:
-            self._precompile_fused_draft_decode(draft_attn_backend, fused_draft_forward)
-        self._precompile_draft_extend(draft_extend_attn_backend)
+        if get_disagg().disaggregation_mode != "prefill":
+            self._precompile_draft_decode(draft_attn_backend)
+            if fused_draft_forward is not None:
+                self._precompile_fused_draft_decode(
+                    draft_attn_backend, fused_draft_forward
+                )
+            self._precompile_draft_extend(draft_extend_attn_backend)
         logger.info(
             "[spec compile policy] DRAFT precompile done in %.1fs.",
             time.perf_counter() - overall,

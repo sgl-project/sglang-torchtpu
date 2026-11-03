@@ -11,9 +11,11 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention_pallas_mla import TpuPallasMlaAttnBackend
 from sglang_tpu.attention_pallas_rpa_base import (
     _zero_inactive_rpa_rows,
 )
+from sglang_tpu.attention_pallas_rpa_batched import TpuPallasRpaBatchedAttnBackend
 from sglang_tpu.attention_pallas_rpa_v3 import (
     TpuPallasRpaV3AttnBackend,
 )
@@ -45,15 +47,42 @@ class TestDistributionWarmup(CustomTestCase):
 class TestPageTableSmemBudget(unittest.TestCase):
     def test_1m_context_default_batch_cap_exceeds_smem(self):
         # 1,052,672 tokens at page 64 -> 16,448 pages/seq; the default compile
-        # cap of 64 sequences needs 4.2 MB, far above the 1 MiB scoped SMEM.
+        # cap of 32 sequences needs 2.1 MB, above the 1 MiB scoped SMEM.
         pages = _get_pages_per_seq(1052672, 64)
         self.assertEqual(pages, 16448)
-        self.assertGreater(_page_table_smem_bytes(64, pages), _SCOPED_SMEM_BYTES)
+        self.assertGreater(_page_table_smem_bytes(32, pages), _SCOPED_SMEM_BYTES)
         self.assertLessEqual(_page_table_smem_bytes(8, pages), _SCOPED_SMEM_BYTES)
 
     def test_entries_padded_to_128(self):
         self.assertEqual(_page_table_smem_bytes(1, 1), 128 * 4)
         self.assertEqual(_page_table_smem_bytes(2, 100), 256 * 4)
+
+
+class TestSmemCapacity(CustomTestCase):
+    """max_smem_rows() bounds one kernel call's sequences by TPU scoped SMEM."""
+
+    def _rows(self, cls, pages_per_seq):
+        backend = object.__new__(cls)
+        backend._page_stride = 64
+        backend.max_context_len = pages_per_seq * 64
+        return backend.max_smem_rows()
+
+    def test_rpa_v3_keeps_xla_spill_reserve_free(self):
+        # 256K context at page 64 (#1557): 64 x 4097 overflows, 63 fits.
+        self.assertEqual(self._rows(TpuPallasRpaV3AttnBackend, 4097), 63)
+        # 64 x 4048 needs exactly 1 MiB - 8 KiB; 64 x 4050 cuts into the reserve.
+        self.assertEqual(self._rows(TpuPallasRpaV3AttnBackend, 4048), 64)
+        self.assertEqual(self._rows(TpuPallasRpaV3AttnBackend, 4050), 63)
+        # align_to_128(n + 1) jumps at n = 128, which 128 x 2024 page entries
+        # alone would still fit.
+        self.assertEqual(self._rows(TpuPallasRpaV3AttnBackend, 2024), 127)
+
+    def test_unmodeled_kernels_bound_only_the_page_table(self):
+        # 64 x 4090 page-table entries fit 1 MiB; RPA v3's other operands do not.
+        for cls in (TpuPallasRpaBatchedAttnBackend, TpuPallasMlaAttnBackend):
+            with self.subTest(cls=cls.__name__):
+                self.assertEqual(self._rows(cls, 4090), 64)
+        self.assertEqual(self._rows(TpuPallasRpaV3AttnBackend, 4090), 63)
 
 
 class TestAttentionPallasRpaV3(unittest.TestCase):
@@ -68,6 +97,8 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
         pool_width=None,
         req_to_token_device="cpu",
         cache_metadata=True,
+        is_generation=True,
+        **config,
     ):
         pool_width = self.POOL_WIDTH if pool_width is None else pool_width
         override = get_context().override_server_args(
@@ -76,6 +107,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             speculative_num_steps=None,
             speculative_eagle_topk=1,
             page_size=self.PAGE_SIZE,
+            **config,
         )
         override.install()
         self.addCleanup(override.restore)
@@ -103,6 +135,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             is_hybrid_swa=False,
             kv_cache_dtype=torch.bfloat16,
             is_draft_worker=False,
+            is_generation=is_generation,
             spec_algorithm=SpeculativeAlgorithm.EAGLE3,
         )
         with (
@@ -155,6 +188,26 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             2050,
         )
         self.assertLess(backend.max_context_len, self.POOL_WIDTH)
+
+    def test_uncompiled_backend_warns_when_batch_cap_overflows_smem(self):
+        # 2050 pages per sequence: RPA v3 fits 126 sequences per kernel call.
+        for compiled, is_generation in ((False, True), (True, False)):
+            with (
+                self.subTest(compiled=compiled, is_generation=is_generation),
+                self.assertLogs(
+                    "sglang_tpu.attention_pallas_rpa_base", "WARNING"
+                ) as logs,
+            ):
+                self._make_backend(
+                    is_generation=is_generation,
+                    enable_torch_compile=compiled,
+                    torch_compile_max_bs=128,
+                )
+            self.assertIn("fits at most 126 sequences", logs.output[0])
+
+    def test_compiled_decoder_backend_leaves_the_check_to_its_policy(self):
+        with self.assertNoLogs("sglang_tpu.attention_pallas_rpa_base", "WARNING"):
+            self._make_backend(enable_torch_compile=True, torch_compile_max_bs=128)
 
     def test_metadata_is_rebuilt_when_cache_is_off(self):
         """With the cache disabled, metadata is uploaded fresh every forward."""
