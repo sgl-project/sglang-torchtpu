@@ -3,7 +3,6 @@ from __future__ import annotations
 import bisect
 import dataclasses
 import logging
-import os
 from contextlib import nullcontext
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
@@ -473,41 +472,15 @@ def _deterministic_inference_enabled() -> bool:
 _GRAPH_POOL_BORROW_SLACK_BYTES = 64 << 20
 
 
-# SGLANG_TPU_LOGPROB_GRID_ROWS (0 = off): cut each request's scored (pruned) rows at
-# every multiple of this many rows from the request's first row in the forward, before
-# the input-logprob chunking. The eager epilogue (lm_head on power-of-two row buckets,
-# the logsumexp normalizer) rounds differently for different row counts, so a forward
-# longer than the grid (Q4096 chunked prefill) must hand it the same row sets as the
-# grid-sized forwards (Q2048) to stay bitwise. A no-op when no request has more rows in
-# one forward than the grid (every Q2048 forward).
-LOGPROB_GRID_ROWS = int(os.environ.get("SGLANG_TPU_LOGPROB_GRID_ROWS", "0") or 0)
-
-
-def logprob_grid_cuts(
-    start_lens: List[int], extend_lens: List[int], grid: int
-) -> List[int]:
-    """Offsets into the concatenated pruned rows where a request's rows reach a
-    multiple of ``grid`` (counted from its first row in this forward).
-
-    Request ``i`` contributes pruned rows ``[start_lens[i], extend_lens[i])``.
-    """
-    cuts: List[int] = []
-    base = 0
-    for start, extend in zip(start_lens, extend_lens):
-        k = start // grid + 1
-        while k * grid < extend:
-            cuts.append(base + k * grid - start)
-            k += 1
-        base += extend - start
-    return cuts
-
-
 def input_logprob_chunk_bounds(
     total: int, chunk_size: int, cuts: Optional[List[int]] = None
 ) -> List[Tuple[int, int]]:
     """Chunks ``[lo, hi)`` of ``total`` pruned rows: split at every cut, then each
     segment into ``chunk_size`` pieces from its own start. Without cuts this is the
-    uniform ``chunk_size`` split."""
+    uniform ``chunk_size`` split.
+
+    The cuts come from ``LogitsMetadata.input_logprob_chunk_cuts_cpu``, which core
+    never sets; a platform may set it to fix the row sets the epilogue sees."""
     edges = [0] + sorted(c for c in set(cuts or ()) if 0 < c < total) + [total]
     bounds: List[Tuple[int, int]] = []
     for lo, hi in zip(edges, edges[1:]):
@@ -569,12 +542,12 @@ class InputLogprobProcessor:
         else:
             chunk_size = self.logprobs_chunk_size
 
-        # SGLANG_TPU_LOGPROB_GRID_ROWS cuts follow per-rank rows, so DP-attention
-        # ignores them for the same reason.
-        grid_cuts = (
+        # Optional cuts (LogitsMetadata.input_logprob_chunk_cuts_cpu) follow
+        # per-rank rows, so DP-attention ignores them for the same reason.
+        chunk_cuts = (
             None
             if skip_chunking_for_dp_attn
-            else getattr(logits_metadata, "input_logprob_grid_cuts_cpu", None)
+            else getattr(logits_metadata, "input_logprob_chunk_cuts_cpu", None)
         )
 
         borrow_logprob_memory = False
@@ -593,7 +566,7 @@ class InputLogprobProcessor:
             get_logits_fn,
             logits_metadata,
             chunk_size,
-            grid_cuts=grid_cuts,
+            chunk_cuts=chunk_cuts,
             borrow_logprob_memory=borrow_logprob_memory,
             borrow_logits_memory=(
                 borrow_logprob_memory and not skip_chunking_for_dp_attn
@@ -648,13 +621,13 @@ class InputLogprobProcessor:
         get_logits_fn: Callable,
         logits_metadata: LogitsMetadata,
         chunk_size: int,
-        grid_cuts: Optional[List[int]] = None,
+        chunk_cuts: Optional[List[int]] = None,
         borrow_logprob_memory: bool = False,
         borrow_logits_memory: bool = False,
     ) -> Tuple[LogprobResult, torch.Tensor]:
         """Compute input logprobs chunk by chunk to cap peak memory."""
         total_size = pruned_states.shape[0]
-        chunk_bounds = input_logprob_chunk_bounds(total_size, chunk_size, grid_cuts)
+        chunk_bounds = input_logprob_chunk_bounds(total_size, chunk_size, chunk_cuts)
         num_chunks = len(chunk_bounds)
 
         sample_indices_cpu = logits_metadata.sample_indices_cpu

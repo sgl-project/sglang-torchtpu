@@ -5,6 +5,7 @@ Pure-logic tests: CPU tensors only, and the shim's import chain is torch_tpu-fre
 so this runs on the CPU CI runner. The helpers mirror the ones in
 test_compiled_forward_shim.py (kept local so this file stands alone)."""
 
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -168,6 +169,18 @@ class TestLogitRows(CustomTestCase):
         self.assertEqual(
             self._rules(self._fb(lens=(3, 0))), ["a request with no extend rows"]
         )
+
+    def test_flag_is_declared_in_the_plugin_envs(self):
+        from sglang_tpu.compilation.logit_rows import logit_rows_enabled
+
+        name = "SGLANG_TPU_FOUR_STAGE_LOGIT_ROWS"
+        self.assertIn(name, envs.names())
+        env = {k: v for k, v in os.environ.items() if k != name}
+        with patch.dict("os.environ", env, clear=True):
+            self.assertIs(logit_rows_enabled(), False)
+        for value, on in (("1", True), ("0", False)):
+            with patch.dict("os.environ", {name: value}):
+                self.assertIs(logit_rows_enabled(), on, value)
 
     def test_only_plain_extend_forwards_carry_rows(self):
         from sglang_tpu.compilation.logit_rows import takes_logit_rows

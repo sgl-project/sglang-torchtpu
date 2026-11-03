@@ -1,34 +1,40 @@
-"""SGLANG_TPU_LOGPROB_GRID_ROWS: input-logprob chunks of a long forward follow the 2048-row forward grid.
+"""SGLANG_TPU_LOGPROB_GRID_ROWS (sglang_tpu/hooks/logprob_grid.py): input-logprob chunks
+of a long forward follow the 2048-row forward grid.
 
 The eager input-logprob epilogue (lm_head on power-of-two row buckets, the logsumexp
-normalizer) rounds differently for different row counts. A scoring request whose scored
-rows cross a 2048-row boundary is split there by 2048-row forwards (Q2048) but not by
-4096-row forwards (Q4096), so Q4096 changed those rows' logprobs by an ulp (the Q4096
-vision gate: prompts with n_prompt 2042, L 2137 scored as 6 | 89 rows vs 95 rows).
-With the grid on, Q4096 hands the epilogue the same row sets as Q2048; under Q2048
-(no request has more than 2048 rows in one forward) the grid cuts nothing.
+normalizer) rounds differently for different row counts. A lone scoring request whose
+scored rows cross a 2048-row boundary is split there by 2048-row forwards (Q2048) but
+not by 4096-row forwards (Q4096), so Q4096 changed those rows' logprobs by an ulp (the
+Q4096 vision gate: prompts with n_prompt 2042, L 2137 scored as 6 | 89 rows vs 95 rows).
+With the grid on, a Q4096 forward holding one request hands the epilogue the same row
+sets as Q2048; under Q2048 (no request has more than 2048 rows in one forward) the grid
+cuts nothing. A forward holding several requests is not cut: the scheduler splits one
+prefill budget between them, so their Q2048 forwards do not start on each request's own
+grid multiples.
 """
 
-import importlib.util
 import os
+import pkgutil
 import random
-import sys
 import unittest
+import warnings
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
-from sglang.srt.layers import logits_processor as lp_mod
-from sglang.srt.layers import logprob_processor as lpp_mod
+from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.layers.logprob_processor import (
     InputLogprobProcessor,
     input_logprob_chunk_bounds,
-    logprob_grid_cuts,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.plugins.hook_registry import HookType, _wrap_fn
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.envs import envs
+from sglang_tpu.hooks import logprob_grid as hooks
+from sglang_tpu.hooks.logprob_grid import logprob_grid_cuts
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -153,35 +159,93 @@ class TestLogprobGridPlan(_CpuDefaultDevice, CustomTestCase):
                 _plan(prefix, length, start, 2048, 0),
             )
 
-    def test_cuts_are_relative_to_each_request(self):
-        # request A: 1000 scored rows, then B starting mid-forward with rows [100, 4096)
-        # of its own extend: B's cut sits at its own offset 2048 (pruned offset 1000 + 1948)
-        self.assertEqual(logprob_grid_cuts([0, 100], [1000, 4096], GRID), [1948 + 1000])
+    def test_cuts_of_a_lone_request(self):
+        # offsets into the request's pruned rows, counted from its first row
+        self.assertEqual(logprob_grid_cuts([100], [4096], GRID), [1948])
         self.assertEqual(logprob_grid_cuts([0], [8192], GRID), [2048, 4096, 6144])
         self.assertEqual(logprob_grid_cuts([3000], [8192], GRID), [1096, 3144])
         self.assertEqual(logprob_grid_cuts([2048], [4096], GRID), [])
 
-    def test_bounds(self):
-        self.assertEqual(input_logprob_chunk_bounds(95, 95, [6]), [(0, 6), (6, 95)])
-        self.assertEqual(
-            input_logprob_chunk_bounds(5000, 2048, None),
-            [(0, 2048), (2048, 4096), (4096, 5000)],
-        )
-        self.assertEqual(
-            input_logprob_chunk_bounds(5000, 2048, [100]),
-            [(0, 100), (100, 2148), (2148, 4196), (4196, 5000)],
-        )
-        self.assertEqual(input_logprob_chunk_bounds(0, 1, None), [])
+
+def _shared_budget_forwards(lengths, chunk):
+    """Chunked prefill with one shared budget: every request queued at once, in order;
+    each forward takes the next ``chunk`` extend rows, splitting a request at the end
+    of the budget. Each forward is a list of ``(request, first row, end row)``."""
+    out, cur, budget = [], [], chunk
+    for r, n in enumerate(lengths):
+        done = 0
+        while done < n:
+            take = min(budget, n - done)
+            cur.append((r, done, done + take))
+            done, budget = done + take, budget - take
+            if budget == 0:
+                out.append(cur)
+                cur, budget = [], chunk
+    return out + [cur] if cur else out
 
 
-def _bruteforce_cuts(start_lens, extend_lens, grid):
-    cuts, base = [], 0
-    for start, extend in zip(start_lens, extend_lens):
-        cuts += [
-            base + pos - start for pos in range(start + 1, extend) if pos % grid == 0
-        ]
-        base += extend - start
-    return cuts
+def _batch_plan(reqs, prefill_chunk, grid):
+    """The epilogue calls of requests ``[(length, logprob_start)]`` that share the
+    prefill budget, each call as its ``(request, row)`` pairs."""
+    calls = []
+    for forward in _shared_budget_forwards([n for n, _ in reqs], prefill_chunk):
+        rows, lp_rows, starts, extends = [], set(), [], []
+        for r, fs, fe in forward:
+            extend = fe - fs
+            start = min(max(reqs[r][1] - fs, 0), extend)
+            eff = start - 1 if start == extend else start
+            starts.append(start)
+            extends.append(extend)
+            rows += [(r, fs + i) for i in range(eff, extend)]
+            lp_rows.update((r, fs + i) for i in range(start, extend))
+        cuts = logprob_grid_cuts(starts, extends, grid) if grid else []
+        for lo, hi in input_logprob_chunk_bounds(
+            len(rows), _chunk_size(len(rows)), cuts
+        ):
+            chunk = tuple(rows[lo:hi])
+            if lp_rows.intersection(chunk):
+                calls.append(chunk)
+    return calls
+
+
+class TestLogprobGridSharedBudget(_CpuDefaultDevice, CustomTestCase):
+    def test_a_forward_with_several_requests_is_not_cut(self):
+        # Review case, scoring lengths [1024, 3072]: Q2048 runs [A, B[0:1024)] then
+        # [B[1024:3072)]; Q4096 runs both requests in one forward. A cut on B's own
+        # grid (B row 2048) would split B[1024:3072) in two. The forward is not cut,
+        # so it is chunked exactly as with the env off.
+        reqs = [(1024, 0), (3072, 0)]
+        self.assertEqual(logprob_grid_cuts([0, 0], [1024, 3072], GRID), [])
+        q4096 = _batch_plan(reqs, 4096, GRID)
+        self.assertEqual(q4096, _batch_plan(reqs, 4096, 0))
+        self.assertEqual(q4096, _batch_plan(reqs, 2048, 0))
+        self.assertEqual([len(call) for call in q4096], [2048, 2048])
+
+    def test_several_requests_keep_the_env_off_chunking(self):
+        # every Q4096 forward here holds two requests, so the grid changes nothing
+        for reqs in (
+            [(1024, 0), (3072, 2000)],  # B scored past the Q2048 split
+            [(1024, 1024), (3072, 0)],  # A asks for no input logprob
+            [(2000, 100), (2096, 1500)],
+            [(3000, 0), (1096, 500)],
+        ):
+            with self.subTest(reqs=reqs):
+                forwards = _shared_budget_forwards([n for n, _ in reqs], 4096)
+                self.assertTrue(all(len(forward) > 1 for forward in forwards))
+                self.assertEqual(
+                    _batch_plan(reqs, 4096, GRID), _batch_plan(reqs, 4096, 0)
+                )
+
+    def test_a_lone_request_still_follows_the_grid(self):
+        for reqs in ([(2137, 2042)], [(12800, 3000)], [(9000, 0)]):
+            with self.subTest(reqs=reqs):
+                self.assertEqual(
+                    _batch_plan(reqs, 4096, GRID), _batch_plan(reqs, 2048, 0)
+                )
+
+
+def _bruteforce_cuts(start, extend, grid):
+    return [pos - start for pos in range(start + 1, extend) if pos % grid == 0]
 
 
 class TestLogprobGridCuts(_CpuDefaultDevice, CustomTestCase):
@@ -203,12 +267,31 @@ class TestLogprobGridCuts(_CpuDefaultDevice, CustomTestCase):
             with self.subTest(start=start, extend=extend):
                 self.assertEqual(logprob_grid_cuts([start], [extend], GRID), cuts)
 
-    def test_request_boundaries_are_not_cuts(self):
-        # a request ending on a grid point, or the next one starting on it, adds no cut there
-        self.assertEqual(logprob_grid_cuts([0, 0], [4096, 100], GRID), [2048])
-        self.assertEqual(logprob_grid_cuts([0, 0], [1000, 3000], GRID), [3048])
-        self.assertEqual(logprob_grid_cuts([0, 2048], [100, 4097], GRID), [2148])
-        self.assertEqual(logprob_grid_cuts([5, 0], [6, 2049], GRID), [2049])
+    def test_a_forward_with_several_requests_is_not_cut(self):
+        for starts, extends in [
+            ([0, 100], [1000, 4096]),
+            ([0, 0], [4096, 100]),
+            ([0, 0], [1000, 3000]),
+            ([0, 2048], [100, 4097]),
+            ([5, 0], [6, 2049]),
+            ([0, 0], [1024, 3072]),
+            ([2042, 5], [2137, 5]),
+        ]:
+            with self.subTest(starts=starts, extends=extends):
+                self.assertEqual(logprob_grid_cuts(starts, extends, GRID), [])
+
+    def test_no_grid_or_no_rows(self):
+        self.assertEqual(logprob_grid_cuts([0], [8192], 0), [])
+        self.assertEqual(logprob_grid_cuts(None, None, GRID), [])
+        self.assertEqual(logprob_grid_cuts([], [], GRID), [])
+
+    def test_a_request_without_logprob_rows_keeps_its_last_row(self):
+        # start == extend: the pruned rows are the last row only, so nothing to cut
+        self.assertEqual(logprob_grid_cuts([4097], [4097], GRID), [])
+        self.assertEqual(
+            logprob_grid_cuts([4097], [4097], GRID),
+            logprob_grid_cuts([4096], [4097], GRID),
+        )
 
     def test_matches_bruteforce(self):
         grid = 8
@@ -216,7 +299,7 @@ class TestLogprobGridCuts(_CpuDefaultDevice, CustomTestCase):
             for start in range(extend):
                 self.assertEqual(
                     logprob_grid_cuts([start], [extend], grid),
-                    _bruteforce_cuts([start], [extend], grid),
+                    _bruteforce_cuts(start, extend, grid),
                     (start, extend),
                 )
         rng = random.Random(3)
@@ -225,85 +308,44 @@ class TestLogprobGridCuts(_CpuDefaultDevice, CustomTestCase):
                 rng.randrange(1, 4 * grid + 2) for _ in range(rng.randrange(1, 5))
             ]
             starts = [rng.randrange(0, e) for e in extends]
+            expected = (
+                _bruteforce_cuts(starts[0], extends[0], grid)
+                if len(extends) == 1
+                else []
+            )
             self.assertEqual(
-                logprob_grid_cuts(starts, extends, grid),
-                _bruteforce_cuts(starts, extends, grid),
-                (starts, extends),
+                logprob_grid_cuts(starts, extends, grid), expected, (starts, extends)
             )
 
 
-class TestLogprobChunkBounds(_CpuDefaultDevice, CustomTestCase):
-    def test_without_cuts_is_the_uniform_split(self):
-        # the env-off path: exactly the chunking before this change
-        for total in range(0, 70):
-            for chunk_size in range(1, 21):
-                n = (total + chunk_size - 1) // chunk_size
-                uniform = [
-                    (i * chunk_size, min((i + 1) * chunk_size, total)) for i in range(n)
-                ]
-                self.assertEqual(
-                    input_logprob_chunk_bounds(total, chunk_size, None), uniform
-                )
-                self.assertEqual(
-                    input_logprob_chunk_bounds(total, chunk_size, []), uniform
-                )
+class TestLogprobGridEnv(CustomTestCase):
+    """The variable is declared in sglang_tpu.envs; unset, empty or 0 registers no hook."""
 
-    def test_cut_order_duplicates_and_out_of_range(self):
-        expected = [(0, 100), (100, 2148), (2148, 4096), (4096, 5000)]
-        self.assertEqual(input_logprob_chunk_bounds(5000, 2048, [100, 4096]), expected)
-        self.assertEqual(
-            input_logprob_chunk_bounds(5000, 2048, [4096, 100, 100, 0, 5000, 7000]),
-            expected,
-        )
+    NAME = "SGLANG_TPU_LOGPROB_GRID_ROWS"
 
-    def test_properties(self):
-        rng = random.Random(5)
-        for _ in range(3000):
-            total = rng.randrange(0, 300)
-            chunk_size = rng.randrange(1, 64)
-            cuts = sorted(rng.sample(range(1, 300), rng.randrange(0, 6)))
-            bounds = input_logprob_chunk_bounds(total, chunk_size, cuts)
-            inside = [c for c in cuts if 0 < c < total]
-            edges = [0] + inside + [total]
-            # the chunks tile [0, total)
-            self.assertEqual(
-                [lo for lo, _ in bounds],
-                [0] + [hi for _, hi in bounds[:-1]] if bounds else [],
-            )
-            self.assertEqual(bounds[-1][1] if bounds else 0, total)
-            for lo, hi in bounds:
-                self.assertLess(lo, hi)
-                self.assertLessEqual(hi - lo, chunk_size)
-                # no chunk crosses a cut, and pieces start chunk_size apart from the segment start
-                seg = max(e for e in edges if e <= lo)
-                self.assertTrue(
-                    all(not (lo < c < hi) for c in inside), (total, chunk_size, cuts)
-                )
-                self.assertEqual((lo - seg) % chunk_size, 0, (total, chunk_size, cuts))
-
-
-class TestLogprobGridEnv(_CpuDefaultDevice, CustomTestCase):
-    """SGLANG_TPU_LOGPROB_GRID_ROWS is read at import; default (unset or empty) is off."""
-
-    def _load(self, value):
-        env = {
-            k: v for k, v in os.environ.items() if k != "SGLANG_TPU_LOGPROB_GRID_ROWS"
-        }
+    def _read(self, value):
+        env = {k: v for k, v in os.environ.items() if k != self.NAME}
         if value is not None:
-            env["SGLANG_TPU_LOGPROB_GRID_ROWS"] = value
-        name = "_logprob_grid_env_probe"
-        spec = importlib.util.spec_from_file_location(name, lpp_mod.__file__)
-        module = importlib.util.module_from_spec(spec)
-        with mock.patch.dict(os.environ, env, clear=True), mock.patch.dict(sys.modules):
-            sys.modules[name] = module
-            spec.loader.exec_module(module)
-        return module.LOGPROB_GRID_ROWS
+            env[self.NAME] = value
+        with mock.patch.dict(os.environ, env, clear=True), warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # "" is not an integer: default, warned
+            return envs.SGLANG_TPU_LOGPROB_GRID_ROWS.get(), hooks.hook_specs()
 
-    def test_env(self):
-        self.assertEqual(self._load(None), 0)
-        self.assertEqual(self._load(""), 0)
-        self.assertEqual(self._load("0"), 0)
-        self.assertEqual(self._load("2048"), 2048)
+    def test_off(self):
+        self.assertIn(self.NAME, envs.names())
+        for value in (None, "", "0"):
+            with self.subTest(value=value):
+                self.assertEqual(self._read(value), (0, []))
+
+    def test_on(self):
+        grid, specs = self._read("2048")
+        self.assertEqual(grid, 2048)
+        ((target, hook, hook_type),) = specs
+        self.assertIs(hook, hooks.record_logprob_grid_cuts)
+        self.assertIs(hook_type, HookType.AFTER)
+        self.assertEqual(
+            pkgutil.resolve_name(target), LogitsMetadata.from_forward_batch
+        )
 
 
 def _metadata(extend_lens, start_lens, ids):
@@ -340,18 +382,22 @@ def _row_count_dependent_logits(calls):
     return get_logits_fn
 
 
+def _processor():
+    proc = InputLogprobProcessor(vocab_size=VOCAB)
+    proc.enable_logprobs_chunk = True
+    proc.logprobs_chunk_size = CHUNK
+    proc.enable_fast_input_logprobs = True
+    return proc
+
+
 class TestLogprobGridProcessor(_CpuDefaultDevice, CustomTestCase):
     """The real InputLogprobProcessor with a row-count-dependent stub epilogue."""
 
-    def _score(self, states, ids, extend_lens, start_lens, cuts, dp_attn=False):
-        proc = InputLogprobProcessor(vocab_size=VOCAB)
-        proc.enable_logprobs_chunk = True
-        proc.logprobs_chunk_size = CHUNK
-        proc.enable_fast_input_logprobs = True
+    def _score(self, states, ids, extend_lens, start_lens, cuts):
         md, sample, lp_idx, t2s = _metadata(extend_lens, start_lens, ids)
-        md.input_logprob_grid_cuts_cpu = cuts
+        md.input_logprob_chunk_cuts_cpu = cuts
         calls = []
-        res, _ = proc.forward(
+        res, _ = _processor().forward(
             pruned_states=states,
             sample_indices=sample,
             input_logprob_indices=lp_idx,
@@ -359,7 +405,6 @@ class TestLogprobGridProcessor(_CpuDefaultDevice, CustomTestCase):
             lm_head=None,
             get_logits_fn=_row_count_dependent_logits(calls),
             logits_metadata=md,
-            skip_chunking_for_dp_attn=dp_attn,
         )
         return res.token_logprobs, calls
 
@@ -402,16 +447,6 @@ class TestLogprobGridProcessor(_CpuDefaultDevice, CustomTestCase):
                 self.assertEqual(calls_off != calls_2048, straddles)
                 self.assertEqual(not torch.equal(off, q2048), straddles)
 
-    def test_dp_attention_stays_single_chunk(self):
-        # DP-attention keeps one chunk (the collective schedule cannot follow per-rank rows)
-        torch.manual_seed(2)
-        rows = torch.randn(95, VOCAB)
-        ids = torch.randint(0, VOCAB, (95,))
-        _, calls = self._score(rows, ids, [2137], [2042], [6], dp_attn=True)
-        self.assertEqual(calls, [95])
-        _, calls = self._score(rows, ids, [2137], [2042], [6])
-        self.assertEqual(calls, [6, 89])
-
     def test_vision_gate_straddle(self):
         torch.manual_seed(0)
         rows = torch.randn(
@@ -446,38 +481,96 @@ class TestLogprobGridProcessor(_CpuDefaultDevice, CustomTestCase):
         self.assertTrue(torch.equal(on, off))
 
 
-class TestPrunedStatesSetsCuts(_CpuDefaultDevice, CustomTestCase):
-    """LogitsProcessor._get_pruned_states records the cuts only with the env on."""
+def _forward_batch(extend_lens, start_lens, return_logprob=True, mode=None):
+    n = len(extend_lens)
+    return SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND if mode is None else mode,
+        _original_forward_mode=None,
+        return_logprob=return_logprob,
+        top_logprobs_nums=[0] * n,
+        token_ids_logprobs=[None] * n,
+        extend_seq_lens_cpu=list(extend_lens),
+        extend_logprob_start_lens_cpu=list(start_lens),
+        extend_input_logprob_token_ids_gpu=torch.randint(0, VOCAB, (sum(extend_lens),)),
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+        next_token_logits_buffer=None,
+        extend_seq_lens=torch.tensor(extend_lens),
+        is_prefill_only=False,
+        attn_tp_sequence_sharded=False,
+        global_num_tokens_gpu=None,
+        dp_local_start_pos=None,
+        dp_local_num_tokens=None,
+        global_dp_buffer_len=None,
+        global_num_tokens_for_logprob_cpu=None,
+        global_num_tokens_for_logprob_gpu=None,
+        mm_input_embeds=None,
+        spec_info=None,
+    )
 
-    def _pruned(self, grid, start_lens=(2042, 5), extend_lens=(2137, 5)):
-        md = SimpleNamespace(
-            forward_mode=ForwardMode.EXTEND,
-            extend_return_logprob=True,
-            extend_logprob_start_lens_cpu=list(start_lens),
-            extend_seq_lens_cpu=list(extend_lens),
-            draft_extend_select_index=None,
+
+class TestLogprobGridHook(_CpuDefaultDevice, CustomTestCase):
+    """The AFTER hook on LogitsMetadata.from_forward_batch, wrapped the way
+    HookRegistry wraps a classmethod, then core's pruning and chunking."""
+
+    def _metadata(self, extend_lens, start_lens, grid=GRID, **kwargs):
+        from_forward_batch = _wrap_fn(
+            LogitsMetadata.__dict__["from_forward_batch"].__func__,
+            hooks.record_logprob_grid_cuts,
+            HookType.AFTER,
         )
-        hidden = torch.randn(sum(extend_lens), 4)
-        with mock.patch.object(lp_mod, "LOGPROB_GRID_ROWS", grid):
-            out = lp_mod.LogitsProcessor._get_pruned_states(
-                SimpleNamespace(), hidden, None, None, md
-            )
-        return out, md
+        forward_batch = _forward_batch(extend_lens, start_lens, **kwargs)
+        with envs.SGLANG_TPU_LOGPROB_GRID_ROWS.override(grid):
+            return from_forward_batch(LogitsMetadata, forward_batch)
 
-    def test_env_on(self):
-        (pruned, _, _, sample, lp_idx, _), md = self._pruned(GRID)
-        self.assertEqual(md.input_logprob_grid_cuts_cpu, [6])
-        self.assertEqual(pruned.shape[0], 95 + 1)
+    def _epilogue_calls(self, md):
+        hidden = torch.randn(sum(md.extend_seq_lens_cpu), VOCAB)
+        pruned, _, _, sample, lp_idx, t2s = LogitsProcessor._get_pruned_states(
+            SimpleNamespace(), hidden, None, None, md
+        )
+        calls = []
+        _processor().forward(
+            pruned_states=pruned,
+            sample_indices=sample,
+            input_logprob_indices=lp_idx,
+            token_to_seq_idx=t2s,
+            lm_head=None,
+            get_logits_fn=_row_count_dependent_logits(calls),
+            logits_metadata=md,
+        )
+        return calls
 
-    def test_env_on_after_a_zero_logprob_row_request(self):
-        # a request with no logprob row still contributes its last row to the pruned rows
-        (pruned, *_), md = self._pruned(GRID, (5, 2042), (5, 2137))
-        self.assertEqual(md.input_logprob_grid_cuts_cpu, [1 + 6])
-        self.assertEqual(pruned.shape[0], 1 + 95)
+    def test_a_lone_request_is_cut_on_its_grid(self):
+        md = self._metadata([2137], [2042])
+        self.assertEqual(md.input_logprob_chunk_cuts_cpu, [6])
+        self.assertEqual(self._epilogue_calls(md), [6, 89])
+        md = self._metadata([8192], [3000])
+        self.assertEqual(md.input_logprob_chunk_cuts_cpu, [1096, 3144])
+        self.assertEqual(self._epilogue_calls(md), [1096, 2048, 2048])
 
-    def test_env_off(self):
-        _, md = self._pruned(0)
-        self.assertIsNone(getattr(md, "input_logprob_grid_cuts_cpu", None))
+    def test_a_forward_with_several_requests_is_not_cut(self):
+        for extend_lens, start_lens, calls in [
+            ([2137, 5], [2042, 5], [96]),
+            ([5, 2137], [5, 2042], [96]),
+            ([1024, 3072], [0, 0], [2048, 2048]),
+        ]:
+            with self.subTest(extend_lens=extend_lens, start_lens=start_lens):
+                md = self._metadata(extend_lens, start_lens)
+                self.assertIsNone(md.input_logprob_chunk_cuts_cpu)
+                self.assertEqual(self._epilogue_calls(md), calls)
+
+    def test_other_forwards_keep_no_cuts(self):
+        cases = {
+            "rows fit the grid": dict(extend_lens=[2048], start_lens=[100]),
+            "no logprob request": dict(
+                extend_lens=[4096], start_lens=[0], return_logprob=False
+            ),
+            "no logprob row": dict(extend_lens=[4096], start_lens=[4096]),
+            "decode": dict(extend_lens=[1], start_lens=[0], mode=ForwardMode.DECODE),
+            "grid off": dict(extend_lens=[2137], start_lens=[2042], grid=0),
+        }
+        for name, case in cases.items():
+            with self.subTest(name):
+                self.assertIsNone(self._metadata(**case).input_logprob_chunk_cuts_cpu)
 
 
 if __name__ == "__main__":

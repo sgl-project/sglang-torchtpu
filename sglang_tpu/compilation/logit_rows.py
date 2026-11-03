@@ -3,25 +3,27 @@ forward can run the last decoder layer's FFN on those rows only (the Watermelon
 RMT four-stage path, "LR1").
 
 A prefill forward takes the logits of each request's last row only. With
-``SGLANG_TPU_FOUR_STAGE_LOGIT_ROWS=1`` the compiled-forward shim puts the rows
-on ``ForwardBatch.logit_rows`` before every EXTEND forward: one int32 ``[6]``
-device tensor, ``[row0, row1, row2, row3, count, identity]``, built on the
-host. The shape never changes and every EXTEND forward carries the field, so
-direct_compile lifts it as one more tensor input of the same EXTEND graph: no
-new specialization. ``identity`` set means "run the last layer on every row";
-the model reads only the tensor's values, never a Python branch on them.
+``SGLANG_TPU_FOUR_STAGE_LOGIT_ROWS=1`` (sglang_tpu.envs) the compiled-forward
+shim puts the rows on ``ForwardBatch.logit_rows`` before every EXTEND forward:
+one int32 ``[6]`` device tensor, ``[row0, row1, row2, row3, count, identity]``,
+built on the host. Core declares the field as an opaque optional tensor; this
+module owns the layout. The shape never changes and every EXTEND forward
+carries the field, so direct_compile lifts it as one more tensor input of the
+same EXTEND graph: no new specialization. ``identity`` set means "run the last
+layer on every row"; the model reads only the tensor's values, never a Python
+branch on them.
 
 This module has no TorchTPU dependency, so its rules run in the CPU tests.
 """
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
 
-ENV = "SGLANG_TPU_FOUR_STAGE_LOGIT_ROWS"
+from sglang_tpu.envs import envs
+
 # One row per request: a prefill forward holds at most --prefill-max-requests
 # requests (4 in the served recipes); more requests take the identity path.
 MAX_LOGIT_ROWS = 4
@@ -29,7 +31,7 @@ PACKED_WIDTH = MAX_LOGIT_ROWS + 2  # rows, count, identity
 
 
 def logit_rows_enabled() -> bool:
-    return os.environ.get(ENV) == "1"
+    return envs.SGLANG_TPU_FOUR_STAGE_LOGIT_ROWS.get()
 
 
 def takes_logit_rows(forward_batch: Any) -> bool:

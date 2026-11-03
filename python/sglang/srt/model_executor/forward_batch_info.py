@@ -661,10 +661,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     defer_logits_to_eager: bool = False
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
-    # TPU prefill logit rows (sglang_tpu/compilation/logit_rows.py): int32 [6]
-    # = each request's last row (4, padded), the count and the identity flag.
-    # Set by the TPU compiled-forward shim on EXTEND forwards only when
-    # SGLANG_TPU_FOUR_STAGE_LOGIT_ROWS=1; None otherwise.
+    # Optional platform-set tensor naming the rows whose logits this forward
+    # reads, for models that can skip work on the other rows. The platform that
+    # sets it owns its layout (e.g. sglang_tpu/compilation/logit_rows.py); core
+    # never reads it. A field, so tracers that flatten ForwardBatch see it as an
+    # input. None: not provided.
     logit_rows: Optional[torch.Tensor] = None
 
     # Gate for reusing the first MTP draft step's indexer topk across steps;
