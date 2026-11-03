@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
+import importlib.util
+import pathlib
 import sys
 import types
 import unittest
 from collections import defaultdict
-from test.registered.tpu.unit.test_disagg_raiden_transfer import (
-    RaidenRendezvousTestCase,
-    _fake_tpu_sync,
-    _FakeRaidenEngine,
-)
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -30,6 +27,20 @@ from sglang_tpu.disaggregation.raiden.serde import (
 from sglang_tpu.unified_kv_pool import AttnLayerSpec, TpuUnifiedSWAKVPool
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+_spec = importlib.util.spec_from_file_location(
+    "_disagg_raiden_transfer_harness",
+    pathlib.Path(__file__).resolve().parents[3]
+    / "tpu"
+    / "unit"
+    / "test_disagg_raiden_transfer.py",
+)
+_harness = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = _harness
+_spec.loader.exec_module(_harness)
+RaidenRendezvousTestCase = _harness.RaidenRendezvousTestCase
+_fake_tpu_sync = _harness._fake_tpu_sync
+_FakeRaidenEngine = _harness._FakeRaidenEngine
 
 
 def _pool(swa_layers=(1, 2, 4, 5, 6), *, head_num=2, dtype=torch.bfloat16):
