@@ -1036,22 +1036,24 @@ class RaidenSenderMixin:
             build_sender_request,
         )
 
-        geom = self._make_geometry(self.attn_tp_size, req_meta["dst_attn_tp"], swa=True)
-        req = build_sender_request(
-            pb2,
-            uuid=room,
-            req_id=swa_req_id,
-            peer=swa_push_endpoint,
-            prefill_rank=self.attn_tp_rank,
-            decode_rank=self.attn_tp_rank // geom.ratio,
-            geom=geom,
-            src_block_ids=swa_blocks,
-            dst_block_ids=decode_swa_blocks,
-            live_tokens=[self.kv_args.page_size] * n,
-        )
         engine = self._swa_engine
         fut = None
         try:
+            geom = self._make_geometry(
+                self.attn_tp_size, req_meta["dst_attn_tp"], swa=True
+            )
+            req = build_sender_request(
+                pb2,
+                uuid=room,
+                req_id=swa_req_id,
+                peer=swa_push_endpoint,
+                prefill_rank=self.attn_tp_rank,
+                decode_rank=self.attn_tp_rank // geom.ratio,
+                geom=geom,
+                src_block_ids=swa_blocks,
+                dst_block_ids=decode_swa_blocks,
+                live_tokens=[self.kv_args.page_size] * n,
+            )
             engine.register_active_plan(room, req, is_sender=True)
             host_blocks = engine.plan_host_blocks(room, swa_blocks)
             fut = engine.d2h(swa_blocks, host_blocks, [1] * len(swa_blocks))
@@ -1094,8 +1096,7 @@ class RaidenSenderMixin:
             reason = f"Raiden reshard SWA push for room {room} failed: {e}"
             logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
             with self._state_lock:
-                self._failed.add(str(room))
-                self.record_failure(room, reason)
+                self._fail_room_locked(room, reason)
         finally:
             if fut is not None and not fut.is_ready():
                 with self._state_lock:

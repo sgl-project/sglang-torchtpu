@@ -914,6 +914,7 @@ class RaidenReceiverMixin:
             if (
                 room not in self._decode.reshard_meta
                 or room in self._aborted
+                or str(room) in self._failed
                 or room in self._decode.final_seen
                 or room in self._decode.reshard_registered
             ):
@@ -1007,17 +1008,21 @@ class RaidenReceiverMixin:
         # fit the reshard RPC's signed int64 field.
         uuid = secrets.randbelow((1 << 63) - 1) + 1
         req_id = f"{room}#{index}"
-        req = build_receiver_request(
-            pb2,
-            uuid=uuid,
-            req_id=req_id,
-            peer=self._ensure_engine().transfer_address,
-            decode_rank=self.attn_tp_rank,
-            geom=self._make_geometry(src_attn_tp, self.attn_tp_size),
-            sources=sources,
-            dst_block_ids=dst,
-            live_tokens=[self.kv_args.page_size] * window.length,
-        )
+        try:
+            req = build_receiver_request(
+                pb2,
+                uuid=uuid,
+                req_id=req_id,
+                peer=self._ensure_engine().transfer_address,
+                decode_rank=self.attn_tp_rank,
+                geom=self._make_geometry(src_attn_tp, self.attn_tp_size),
+                sources=sources,
+                dst_block_ids=dst,
+                live_tokens=[self.kv_args.page_size] * window.length,
+            )
+        except Exception as e:
+            self._fail_reshard_plan_build(room, req_id, e)
+            return None
         payload = ReshardChunkReady(room=room, index=index, uuid=uuid).to_frames()
         if not self._publish_reshard_plan(
             room, req_id, uuid, req, payload, ready_endpoints
@@ -1038,6 +1043,7 @@ class RaidenReceiverMixin:
             if (
                 room not in self._decode.reshard_meta
                 or room in self._aborted
+                or str(room) in self._failed
                 or room in self._decode.final_seen
                 or room in self._decode.reshard_registered
             ):
@@ -1097,6 +1103,13 @@ class RaidenReceiverMixin:
                     sorted(partial),
                 )
         self._register_receiver_and_signal(room)
+
+    def _fail_reshard_plan_build(self, room: int, req_id: str, exc: Exception) -> None:
+        reason = f"Raiden receive failed: cannot build plan {req_id}: {exc}"
+        logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+        with self._state_lock:
+            if room in self._decode.reshard_meta:
+                self._fail_room_locked(room, reason)
 
     def _publish_reshard_plan(
         self,
@@ -1205,28 +1218,26 @@ class RaidenReceiverMixin:
                 return False
             sources.append((p_rank, pages[-n:]))
 
-        geom = self._make_geometry(src_attn_tp, self.attn_tp_size, swa=True)
-        req = build_receiver_request(
-            pb2,
-            uuid=room,
-            req_id=self._swa_req_id(room),
-            peer=self._swa_engine.transfer_address,
-            decode_rank=self.attn_tp_rank,
-            geom=geom,
-            sources=sources,
-            dst_block_ids=local_swa_blocks,
-            live_tokens=[self.kv_args.page_size] * n,
-        )
         try:
+            geom = self._make_geometry(src_attn_tp, self.attn_tp_size, swa=True)
+            req = build_receiver_request(
+                pb2,
+                uuid=room,
+                req_id=self._swa_req_id(room),
+                peer=self._swa_engine.transfer_address,
+                decode_rank=self.attn_tp_rank,
+                geom=geom,
+                sources=sources,
+                dst_block_ids=local_swa_blocks,
+                live_tokens=[self.kv_args.page_size] * n,
+            )
             self._swa_engine.register_active_plan(room, req, is_sender=False)
         except Exception as e:
             reason = f"Raiden reshard SWA receive: cannot stage plan {room}: {e}"
             logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
             with self._state_lock:
-                if room not in self._decode.reshard_meta:
-                    return False
-                self._failed.add(str(room))
-                self.record_failure(room, reason)
+                if room in self._decode.reshard_meta:
+                    self._fail_room_locked(room, reason)
             return False
         with self._state_lock:
             if room not in self._decode.reshard_meta or room in self._aborted:
@@ -1317,7 +1328,11 @@ class RaidenReceiverMixin:
             if unified_swa_sources is None:
                 return
 
-        geom = self._make_geometry(src_attn_tp, self.attn_tp_size)
+        try:
+            geom = self._make_geometry(src_attn_tp, self.attn_tp_size)
+        except Exception as e:
+            self._fail_reshard_plan_build(room, str(room), e)
+            return
         n = len(local_blocks)
         if self.chunked_transfer:
             # Only the pages no registered chunk plan covers are left to
@@ -1379,17 +1394,21 @@ class RaidenReceiverMixin:
                 n = len(local_blocks)
         live = [self.kv_args.page_size] * n
 
-        req = build_receiver_request(
-            pb2,
-            uuid=room,
-            req_id=str(room),
-            peer=self._ensure_engine().transfer_address,
-            decode_rank=self.attn_tp_rank,
-            geom=geom,
-            sources=sources,
-            dst_block_ids=local_blocks,
-            live_tokens=live,
-        )
+        try:
+            req = build_receiver_request(
+                pb2,
+                uuid=room,
+                req_id=str(room),
+                peer=self._ensure_engine().transfer_address,
+                decode_rank=self.attn_tp_rank,
+                geom=geom,
+                sources=sources,
+                dst_block_ids=local_blocks,
+                live_tokens=live,
+            )
+        except Exception as e:
+            self._fail_reshard_plan_build(room, str(room), e)
+            return
         # register_active_plan (dst_mem_type=HBM) arms the completion barrier from
         # the schedule (one block-push per (block, layer) across all writers) and
         # supplies the strided receive + auto-H2D-to-HBM geometry.

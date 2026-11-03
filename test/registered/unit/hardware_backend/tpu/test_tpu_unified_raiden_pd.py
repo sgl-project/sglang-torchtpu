@@ -339,6 +339,32 @@ class TestUnifiedRaidenPD(RaidenRendezvousTestCase):
                 dec._dispatch(bad.to_frames())
                 self.assertEqual(dec.request_status[room], KVPoll.Failed)
 
+            for via_chunk in (False, True):
+                with self.subTest(seq_along_lane_reshard=True, via_chunk=via_chunk):
+                    ps, dec = _trio(via_chunk)
+                    dec._seq_along_lane = True
+                    room = 8260 + int(via_chunk)
+                    dec.register_decode_request(
+                        room,
+                        [20],
+                        d_swa,
+                        None,
+                        [
+                            {"rank_ip": "127.0.0.1", "rank_port": p.rank_port}
+                            for p in ps
+                        ],
+                    )
+                    self._pump(*ps, dec)
+                    for p in ps:
+                        p.append_send_blocks(room, [1], swa_block_ids=p_swa)
+                        if via_chunk:
+                            p._announce_reshard_chunk(room, 0, [1], total_pages=1)
+                        p.finalize_send(room, aux_index=None)
+                    self._pump(*ps, dec)
+                    self.assertTrue(dec.is_failed(room))
+                    self.assertIn("5D token-major", dec.failure_records[room])
+                    self.assertEqual(ps[0]._engine.pushes, [])
+
 
 if __name__ == "__main__":
     unittest.main()
