@@ -619,7 +619,7 @@ class RaidenSenderMixin:
                 room not in self._prefill.reshard_finalized
                 or room not in self._prefill.send_blocks
                 or (
-                    self._swa_engine is not None
+                    (self._swa_engine is not None or self._unified_swa_pool is not None)
                     and room not in self._prefill.send_swa_blocks
                 )
                 or (
@@ -642,9 +642,12 @@ class RaidenSenderMixin:
         # unread blocks from leaking leases until deadline timeout.
         read_blocks = whole_pull_registration(blocks, decode_pages)
         swa_read_blocks = whole_pull_registration(swa_blocks, decode_swa_pages)
-        # Decode reads both engines concurrently or neither; suppress window
-        # registrations on full hits to prevent orphaned leases.
-        if not read_blocks:
+        if self._unified_swa_pool is not None:
+            read_blocks = read_blocks + swa_read_blocks
+            swa_read_blocks = []
+        elif not read_blocks:
+            # Decode reads both engines concurrently or neither; suppress window
+            # registrations on full hits to prevent orphaned leases.
             swa_read_blocks = []
         with self._announce_lock:
             # GDN state cannot be rebuilt from cached KV, so even a full prefix
@@ -812,6 +815,7 @@ class RaidenSenderMixin:
                 total_pages=total_pages,
                 blocks=block_ids,
                 src_rank=self._local_rank,
+                kv_layout=self.kv_layout,
             ).to_frames()
             endpoint = _tcp_endpoint(ip=addr[0], port=addr[1])
             self._send_multipart_locked(endpoint, payload)
@@ -877,6 +881,7 @@ class RaidenSenderMixin:
                 src_rank=self._local_rank,
                 aux_blob=aux_blob,
                 prefill_swa_blocks=swa_blocks,
+                kv_layout=self.kv_layout,
             ).to_frames()
             self._send_multipart_locked(endpoint, payload)
 
@@ -938,6 +943,33 @@ class RaidenSenderMixin:
                         and room in self._prefill.reshard_req
                     ):
                         self._completed_send.add(str(room))
+
+    def _pair_unified_reshard_swa_push(
+        self, room: int, req_meta: dict, swa_blocks: List[int]
+    ) -> Optional[tuple[List[int], List[int]]]:
+        decode_swa_blocks = list(req_meta.get("decode_swa_blocks") or [])
+        n_swa = len(decode_swa_blocks)
+        if not n_swa or not swa_blocks:
+            reason = (
+                f"Raiden reshard unified SWA push: hybrid room {room} has nothing to "
+                f"send (decode_pages={n_swa} local_pages={len(swa_blocks)})"
+            )
+            logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+            with self._state_lock:
+                self._failed.add(str(room))
+                self.record_failure(room, reason)
+            return None
+        if len(swa_blocks) < n_swa:
+            reason = (
+                f"Raiden reshard unified SWA push: prefill has {len(swa_blocks)} "
+                f"sliding-window pages, decode expects {n_swa}"
+            )
+            logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+            with self._state_lock:
+                self._failed.add(str(room))
+                self.record_failure(room, reason)
+            return None
+        return swa_blocks[-n_swa:], decode_swa_blocks
 
     def _run_reshard_swa_push(
         self, room: int, req_meta: dict, swa_blocks: List[int]
@@ -1109,6 +1141,17 @@ class RaidenSenderMixin:
         # settle.
         if chunk is None:
             self._run_reshard_swa_push(room, req_meta, swa_blocks)
+            if self._unified_swa_pool is not None:
+                unified_swa_pair = self._pair_unified_reshard_swa_push(
+                    room, req_meta, swa_blocks
+                )
+                if unified_swa_pair is None:
+                    return
+                swa_src, swa_dst = unified_swa_pair
+            else:
+                swa_src, swa_dst = [], []
+        else:
+            swa_src, swa_dst = [], []
 
         decode_blocks = req_meta["decode_blocks"]
         dst_attn_tp = req_meta["dst_attn_tp"]
@@ -1121,12 +1164,14 @@ class RaidenSenderMixin:
                 # covers; pushing this side's frontier instead could skip a
                 # chunk that lost its race mid-range on the decode.
                 uuid = room
-                if not ready_pages:
+                if not ready_pages and not swa_dst:
                     return
                 base = total_pages - n
-                prefill_blocks = [prefill_blocks[pg] for pg in ready_pages]
-                decode_blocks = [decode_blocks[pg - base] for pg in ready_pages]
-                n = len(ready_pages)
+                prefill_blocks = [prefill_blocks[pg] for pg in ready_pages] + swa_src
+                decode_blocks = [
+                    decode_blocks[pg - base] for pg in ready_pages
+                ] + swa_dst
+                n = len(decode_blocks)
             else:
                 req_id = f"{room}#{chunk}"
                 window = chunk_pull_window(start, len(prefill_blocks), total_pages, n)
@@ -1141,8 +1186,14 @@ class RaidenSenderMixin:
                 n = window.length
         else:
             uuid = room
-            if len(prefill_blocks) > n:
+            if not n:
+                prefill_blocks = []
+            elif len(prefill_blocks) > n:
                 prefill_blocks = prefill_blocks[-n:]
+            if swa_dst:
+                prefill_blocks = list(prefill_blocks) + swa_src
+                decode_blocks = list(decode_blocks) + swa_dst
+                n = len(decode_blocks)
         geom = self._make_geometry(self.attn_tp_size, dst_attn_tp)
         live = [self.kv_args.page_size] * n
 

@@ -31,8 +31,9 @@ from sglang_tpu.dsv4.dsv4_memory_pool import (
     TPUDeepSeekV4IndexerPool,
     TPUDeepSeekV4SWAKVPool,
 )
-from sglang_tpu.kv_pool import TpuBlockMajorMHATokenToKVPool
+from sglang_tpu.kv_pool import TpuBlockMajorMHATokenToKVPool, TpuSeqAlongLaneKVPool
 from sglang_tpu.mamba_pool import TpuMambaPool
+from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
 
 # One logger for the whole package, deliberately keeping the name of the module
 # this code used to live in: emitted record names and the existing test
@@ -96,6 +97,26 @@ class RaidenKVCacheGroups:
     # Optional host-side metadata pack/unpack hooks accompanying state_blocks.
     read_state_meta: Optional[Callable[[Sequence[int]], bytes]] = None
     write_state_meta: Optional[Callable[[Sequence[int], bytes], None]] = None
+    # Shared-buffer Full+SWA pool: SWA rides on the single full engine via companion pages.
+    unified_swa_pool: Optional[TpuUnifiedSWAKVPool] = None
+    # True when any KV pool uses the 5D token-minor SEQ_ALONG_LANE layout.
+    seq_along_lane: bool = False
+
+
+def _is_seq_along_lane_pool(pool: Optional[KVCache]) -> bool:
+    if pool is None:
+        return False
+    if isinstance(pool, TpuSeqAlongLaneKVPool):
+        return True
+    if isinstance(pool, TpuUnifiedSWAKVPool):
+        return isinstance(pool.kv_pool, TpuSeqAlongLaneKVPool)
+    if isinstance(pool, SWAKVPool):
+        return isinstance(pool.full_kv_pool, TpuSeqAlongLaneKVPool) or isinstance(
+            pool.swa_kv_pool, TpuSeqAlongLaneKVPool
+        )
+    if isinstance(pool, HybridLinearKVPool):
+        return isinstance(getattr(pool, "full_kv_pool", None), TpuSeqAlongLaneKVPool)
+    return False
 
 
 def _assert_root_buffers(name: str, buffers: Sequence[torch.Tensor]) -> None:
@@ -161,6 +182,21 @@ def get_raiden_kv_caches(
     """
 
     def group_one(current_pool: KVCache) -> RaidenKVCacheGroups:
+        if isinstance(current_pool, TpuUnifiedSWAKVPool):
+            shared_buffers = current_pool.kv_pool.page_buffers()
+            _assert_root_buffers("unified shared KV", shared_buffers)
+            full_ids = sorted(
+                layer
+                for layer, (_, swa) in current_pool.layers_mapping.items()
+                if not swa
+            )
+            return RaidenKVCacheGroups(
+                full=shared_buffers,
+                swa=[],
+                full_layer_ids=full_ids,
+                swa_layer_ids=[],
+                unified_swa_pool=current_pool,
+            )
         if isinstance(current_pool, DSV4TPUTokenToKVPool):
             dsv4_full: List[torch.Tensor] = []
             if isinstance(current_pool.c4_kv_pool, TPUDeepSeekV4CSAKVPool):
@@ -239,6 +275,7 @@ def get_raiden_kv_caches(
     groups = group_one(pool)
     full, swa = list(groups.full), list(groups.swa)
     full_ids, swa_ids = list(groups.full_layer_ids), list(groups.swa_layer_ids)
+    seq_along_lane = _is_seq_along_lane_pool(pool)
     num_draft_full = num_draft_swa = num_hidden_full = 0
     draft_kv_head_num: Optional[int] = None
     draft_swa_kv_head_num: Optional[int] = None
@@ -253,6 +290,7 @@ def get_raiden_kv_caches(
         swa_draft_pool = getattr(draft_pool, "swa_kv_pool", draft_pool)
         draft_kv_head_num = getattr(full_draft_pool, "head_num", None)
         draft_swa_kv_head_num = getattr(swa_draft_pool, "head_num", None)
+        seq_along_lane = seq_along_lane or _is_seq_along_lane_pool(draft_pool)
 
     if hidden_pool is not None:
         full.append(hidden_pool.buffer)
@@ -305,4 +343,6 @@ def get_raiden_kv_caches(
         committed_state_row=committed_state_row,
         read_state_meta=read_state_meta,
         write_state_meta=write_state_meta,
+        unified_swa_pool=groups.unified_swa_pool,
+        seq_along_lane=seq_along_lane,
     )

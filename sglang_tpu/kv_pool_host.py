@@ -26,6 +26,7 @@ from __future__ import annotations
 import functools
 import logging
 import math
+import sys
 import threading
 from collections import deque
 from dataclasses import dataclass, field
@@ -1012,6 +1013,9 @@ def _evict_swa_for_device_alloc(cache, required_size: int) -> None:
 
 class _TpuUnifiedSwaStrategy(StackStrategy):
     def matches(self, kvcache, components) -> bool:
+        pd_hicache = sys.modules.get("sglang_tpu.pd_decode_swa_hicache")
+        if pd_hicache is not None and pd_hicache.is_building_full_only_host_cache():
+            return False
         return isinstance(kvcache, TpuUnifiedSWAKVPool) and components == {
             ComponentType.FULL,
             ComponentType.SWA,

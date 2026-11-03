@@ -53,6 +53,7 @@ class MessageTag(bytes, enum.Enum):
 # so a decode refuses a prefill whose tag differs from its own.
 PER_LAYER_KV_LAYOUT = "per-layer"
 BLOCK_MAJOR_KV_LAYOUT = "block-major"
+UNIFIED_SWA_KV_LAYOUT = "unified-swa"
 
 
 def _require_port(port: int) -> None:
@@ -151,6 +152,7 @@ class ReshardBlocks(WireMessage):
     src_rank: int
     aux_blob: bytes
     prefill_swa_blocks: list[int]
+    kv_layout: str = PER_LAYER_KV_LAYOUT
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
@@ -178,6 +180,7 @@ class ReshardChunk(WireMessage):
     total_pages: int
     blocks: list[int]
     src_rank: int
+    kv_layout: str = PER_LAYER_KV_LAYOUT
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
