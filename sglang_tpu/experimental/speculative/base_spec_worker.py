@@ -69,7 +69,11 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.base_spec_worker import (
+    BaseSpecWorker,
+    HiCacheDraftMode,
+    HiCacheDraftPlan,
+)
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
@@ -413,6 +417,21 @@ class TpuSpecWorker(BaseSpecWorker):
         super().alloc_memory_pool(*args, **kwargs)
         # The scheduler builds this worker before any KV pool exists.
         self._draft_swa_translate = _draft_swa_translate(self._draft_worker)
+
+    def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
+        plan = super()._build_hicache_draft_plan()
+        if plan.mode != HiCacheDraftMode.SIDECAR:
+            return plan
+        from sglang_tpu.hybrid_linear_hicache import packs_draft_kv
+
+        runner = self.target_worker.model_runner
+        if not packs_draft_kv(runner, plan.device_pools):
+            return plan
+        # The host stack carries the draft KV on the target's pages.
+        runner.mtp_draft_device_pools = plan.device_pools
+        return HiCacheDraftPlan(
+            mode=HiCacheDraftMode.PACKED, device_pools=plan.device_pools
+        )
 
     @property
     def draft_swa_translate(self):

@@ -63,6 +63,37 @@ class TestHiCacheAutoSize(CustomTestCase):
                     4096 + 1024 + expected_sidecar_bytes,
                 )
 
+    def test_packed_hybrid_draft_counts_both_sub_pools(self):
+        # A packed hybrid draft rides target full pages and target SWA pages.
+        def pool(size, nbytes):
+            return Mock(
+                spec=MHATokenToKVPool,
+                size=size,
+                host_capacity_bytes=None,
+                get_kv_size_bytes=Mock(return_value=nbytes),
+            )
+
+        target = Mock(
+            spec=SWAKVPool,
+            size=128,
+            full_kv_pool=pool(128, 4096),
+            swa_kv_pool=pool(32, 1024),
+        )
+        draft = Mock(
+            spec=SWAKVPool, full_kv_pool=pool(128, 256), swa_kv_pool=pool(32, 64)
+        )
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=Mock(get_kvcache=Mock(return_value=target)),
+            page_size=2,
+            mtp_draft_device_pools=(draft,),
+        )
+        plan = Mock(mode="packed", device_pools=(draft,))
+        self.assertEqual(
+            sizing._estimate_hicache_bytes(params, plan), 4096 + 1024 + 256 + 64
+        )
+
     def test_unified_views_are_sized_from_host_capacity(self):
         """Unified sub-pools answer get_kv_size_bytes with zero (UnifiedKVPool
         logs the shared buffer once) and publish host_capacity_bytes instead,

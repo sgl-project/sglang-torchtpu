@@ -662,11 +662,10 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
                     TpuDmaMambaSwaStrategy().matches(kvcache, components), expected
                 )
 
-    def test_swa_state_strategy_builds_dma_state_pool_and_controller(self):
-        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+    @staticmethod
+    def _swa_state_stack_fixture(drafts):
         from sglang_tpu import hybrid_linear_hicache
 
-        state_host = MagicMock()
         memory = SimpleNamespace(
             hicache_io_backend="raiden",
             hicache_size=0,
@@ -678,13 +677,13 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
         )
         kvcache = SimpleNamespace(
             start_layer=0,
-            layers_mapping={0: (0, False), 1: (0, True)},
-            full_kv_pool=object(),
-            swa_kv_pool=object(),
+            layers_mapping={0: (0, False), 1: (0, True), 2: (1, True)},
+            full_kv_pool=SimpleNamespace(layer_num=1, size=1024),
+            swa_kv_pool=SimpleNamespace(layer_num=2, size=256),
         )
         allocator = SimpleNamespace(alloc=MagicMock(), free=MagicMock())
         params = SimpleNamespace(
-            mtp_draft_device_pools=(),
+            mtp_draft_device_pools=drafts,
             req_to_token_pool=SimpleNamespace(
                 mamba_pool=object(), mamba_map={0: 0, 1: 1}, mamba_allocator=allocator
             ),
@@ -692,38 +691,120 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
             tp_cache_group=None,
             pp_cache_group=None,
         )
-        build = lambda strategy: strategy.build(
-            cache=SimpleNamespace(page_size=128),
-            kvcache=kvcache,
-            params=params,
-            server_args=None,
-            load_cache_event=None,
-        )
-        with (
+        host_cls = MagicMock(side_effect=lambda *a, **kw: MagicMock(kw=kw))
+        patches = (
             patch.object(hybrid_linear_hicache, "get_memory", return_value=memory),
             patch.object(hybrid_pool_assembler, "get_memory", return_value=memory),
-            patch.object(
-                hybrid_pool_assembler,
-                "build_kv_host_pool",
-                side_effect=lambda **kw: MagicMock(label=kw["pool_label"]),
+            patch(
+                "sglang_tpu.kv_pool_host.tpu_dma_host_kv_pool_cls",
+                return_value=host_cls,
             ),
             patch(
                 "sglang_tpu.kv_pool_host.tpu_dma_mamba_pool_host_cls",
-                return_value=MagicMock(return_value=state_host),
+                return_value=MagicMock(return_value=MagicMock(name="state_host")),
             ),
             patch.object(
                 hybrid_linear_hicache.TpuDmaMambaSwaStrategy, "cache_controller_cls"
-            ) as controller,
-        ):
-            result = build(hybrid_linear_hicache.TpuDmaMambaSwaStrategy())
-            params.mtp_draft_device_pools = (object(),)
-            with self.assertRaisesRegex(NotImplementedError, "packed MTP draft"):
-                build(hybrid_linear_hicache.TpuDmaMambaSwaStrategy())
-        self.assertIs(result.cache_controller, controller.return_value)
-        self.assertIs(result.component_host_pools[ComponentType.MAMBA], state_host)
+            ),
+        )
+
+        def build():
+            return hybrid_linear_hicache.TpuDmaMambaSwaStrategy().build(
+                cache=SimpleNamespace(page_size=128),
+                kvcache=kvcache,
+                params=params,
+                server_args=None,
+                load_cache_event=None,
+            )
+
+        return patches, build, kvcache
+
+    def test_swa_state_strategy_builds_dma_state_pool_and_controller(self):
+        from contextlib import ExitStack
+
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        patches, build, _ = self._swa_state_stack_fixture(())
+        with ExitStack() as stack:
+            mocks = [stack.enter_context(p) for p in patches]
+            result = build()
+        self.assertIs(result.cache_controller, mocks[-1].return_value)
+        self.assertIs(
+            result.component_host_pools[ComponentType.MAMBA],
+            mocks[3].return_value.return_value,
+        )
         self.assertEqual(
             set(result.host_pool_group.entry_map),
             {PoolName.KV, PoolName.SWA, PoolName.MAMBA},
+        )
+        for name, label in ((PoolName.KV, "full"), (PoolName.SWA, "swa")):
+            entry = result.host_pool_group.entry_map[name]
+            self.assertEqual(entry.packed_draft_device_pools, ())
+            self.assertEqual(entry.host_pool.kw["pool_label"], label)
+            self.assertEqual(entry.host_pool.kw["mtp_draft_device_pools"], ())
+
+    def test_swa_state_strategy_packs_a_hybrid_draft_on_kv_and_swa_pages(self):
+        """A DSPARK draft whose window layers live in its own SWA sub-pool (slots
+        translated through the target's mapping) rides both target host pools, so a
+        host hit restores the draft KV of the prefix with the target's."""
+        from contextlib import ExitStack
+
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        draft = object.__new__(SWAKVPool)
+        draft.full_kv_pool = SimpleNamespace(layer_num=1, size=1024)
+        draft.swa_kv_pool = SimpleNamespace(layer_num=2, size=256)
+        patches, build, kvcache = self._swa_state_stack_fixture((draft,))
+        with ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            result = build()
+        kv_entry = result.host_pool_group.entry_map[PoolName.KV]
+        swa_entry = result.host_pool_group.entry_map[PoolName.SWA]
+        self.assertEqual(kv_entry.packed_draft_device_pools, (draft.full_kv_pool,))
+        self.assertEqual(swa_entry.packed_draft_device_pools, (draft.swa_kv_pool,))
+        self.assertEqual(
+            kv_entry.host_pool.kw["mtp_draft_device_pools"], (draft.full_kv_pool,)
+        )
+        self.assertEqual(
+            swa_entry.host_pool.kw["mtp_draft_device_pools"], (draft.swa_kv_pool,)
+        )
+        # Transfer layer 3 (after target layers 0-2) is the draft, after each pool.
+        self.assertEqual(kv_entry.layer_mapper(3), kvcache.full_kv_pool.layer_num)
+        self.assertEqual(swa_entry.layer_mapper(3), kvcache.swa_kv_pool.layer_num)
+
+    def test_swa_state_strategy_rejects_a_draft_swa_pool_off_the_target_slots(self):
+        from contextlib import ExitStack
+
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        draft = object.__new__(SWAKVPool)
+        draft.full_kv_pool = SimpleNamespace(layer_num=1, size=1024)
+        draft.swa_kv_pool = SimpleNamespace(layer_num=2, size=1024)
+        patches, build, _ = self._swa_state_stack_fixture((draft,))
+        with ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            with self.assertRaisesRegex(NotImplementedError, "sized like the target"):
+                build()
+
+    def test_swa_state_strategy_drops_empty_draft_sub_pools(self):
+        from contextlib import ExitStack
+
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        draft = object.__new__(SWAKVPool)
+        draft.full_kv_pool = SimpleNamespace(layer_num=0, size=1024)
+        draft.swa_kv_pool = SimpleNamespace(layer_num=2, size=256)
+        patches, build, _ = self._swa_state_stack_fixture((draft,))
+        with ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            result = build()
+        entries = result.host_pool_group.entry_map
+        self.assertEqual(entries[PoolName.KV].packed_draft_device_pools, ())
+        self.assertEqual(
+            entries[PoolName.SWA].packed_draft_device_pools, (draft.swa_kv_pool,)
         )
 
     def test_split_pool_host_sizing_matches_its_allocation(self):
@@ -776,6 +857,82 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
                 else:
                     with self.assertRaisesRegex(ValueError, error):
                         call()
+
+
+class TestPackedDraftPlan(CustomTestCase):
+    """A block draft over a hybrid SWA + state target packs onto the target pages
+    instead of the sidecar path, which carries only the draft's SWA layers."""
+
+    @staticmethod
+    def _runner(*, mamba=True):
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        return SimpleNamespace(
+            token_to_kv_pool=object.__new__(SWAKVPool),
+            req_to_token_pool=SimpleNamespace(mamba_pool=object() if mamba else None),
+            mtp_draft_device_pools=(),
+        )
+
+    def _plan(self, runner, base_plan, io_backend="raiden"):
+        from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+        from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
+
+        class _Worker(TpuSpecWorker):
+            pass
+
+        _Worker.__abstractmethods__ = frozenset()
+        worker = object.__new__(_Worker)
+        worker._target_worker = SimpleNamespace(model_runner=runner)
+        with (
+            patch.object(
+                BaseSpecWorker, "_build_hicache_draft_plan", return_value=base_plan
+            ),
+            patch(
+                "sglang_tpu.hybrid_linear_hicache.get_memory",
+                return_value=SimpleNamespace(hicache_io_backend=io_backend),
+            ),
+        ):
+            return worker._build_hicache_draft_plan()
+
+    def test_hybrid_draft_over_swa_state_target_is_packed(self):
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from sglang.srt.speculative.base_spec_worker import (
+            HiCacheDraftMode,
+            HiCacheDraftPlan,
+        )
+
+        draft = object.__new__(SWAKVPool)
+        sidecar = HiCacheDraftPlan(HiCacheDraftMode.SIDECAR, (draft,))
+        runner = self._runner()
+        plan = self._plan(runner, sidecar)
+        self.assertEqual(plan.mode, HiCacheDraftMode.PACKED)
+        self.assertEqual(plan.device_pools, (draft,))
+        self.assertEqual(runner.mtp_draft_device_pools, (draft,))
+
+    def test_other_targets_and_engines_keep_the_base_plan(self):
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from sglang.srt.speculative.base_spec_worker import (
+            HiCacheDraftMode,
+            HiCacheDraftPlan,
+        )
+
+        draft = object.__new__(SWAKVPool)
+        sidecar = HiCacheDraftPlan(HiCacheDraftMode.SIDECAR, (draft,))
+        cases = (
+            ("no state pool", self._runner(mamba=False), sidecar, "raiden"),
+            ("torch_tpu engine", self._runner(), sidecar, "torch_tpu"),
+            ("no draft", self._runner(), HiCacheDraftPlan(), "raiden"),
+            (
+                "non-pool draft",
+                self._runner(),
+                HiCacheDraftPlan(HiCacheDraftMode.SIDECAR, (object(),)),
+                "raiden",
+            ),
+        )
+        for name, runner, base_plan, io_backend in cases:
+            with self.subTest(name):
+                self.assertIs(self._plan(runner, base_plan, io_backend), base_plan)
+                self.assertEqual(runner.mtp_draft_device_pools, ())
 
 
 class TestRecurrentStateGate(CustomTestCase):
