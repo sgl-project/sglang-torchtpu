@@ -57,7 +57,7 @@ class BatchedPenalizerOrchestrator:
         Cumulate a token history into rows of this batch (rows[i] gets tokens[i]
         as successive output tokens, the same bits as cumulate_output_tokens
         feeding them one step at a time). Used for a request prefilled again
-        after a retraction (SGLANG_TPU_DETERMINISTIC_PENALTY_TOKENS v2).
+        after a retraction (SGLANG_DETERMINISTIC_PENALTY_TOKENS).
         """
         for penalizer in self.penalizers.values():
             penalizer.seed_history(rows, tokens)

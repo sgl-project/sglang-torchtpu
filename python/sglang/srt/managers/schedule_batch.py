@@ -56,7 +56,6 @@ ScheduleBatch -> ForwardBatch
 import copy
 import dataclasses
 import logging
-import os
 import re
 import sys
 from array import array
@@ -170,21 +169,9 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 _MM_HASH_MASK = (1 << 64) - 1
 
 logger = logging.getLogger(__name__)
-# SGLANG_TPU_DETERMINISTIC_PENALTY_TOKENS v2: decode steps whose det-penalty
-# token was not on the host yet (logged, rate-limited).
+# SGLANG_DETERMINISTIC_PENALTY_TOKENS: decode steps whose penalty token was not
+# on the host yet (logged, rate-limited).
 _DET_PENALTY_MISSING = [0]
-
-# Overlap scheduling penalizes, at each decode step, req.output_ids[-1] from host
-# state, which lags the device token by 0 or 1 step depending on when the
-# previous result was processed, and falls back to the last prompt token when
-# the first sampled token is not processed yet. Which token is penalized then
-# depends on batch composition and host timing. With this flag the token is
-# chosen by the request's own step count, as a request decoding alone gets it:
-# the last input token of its prefill at the first decode step, then the token
-# fed one step earlier (output_ids[n0 + d - 1]).
-_TPU_DETERMINISTIC_PENALTY_TOKENS = os.environ.get(
-    "SGLANG_TPU_DETERMINISTIC_PENALTY_TOKENS", "0"
-).lower() in ("1", "true")
 
 _is_hip = is_hip()
 
@@ -2843,7 +2830,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         reqs = self.reqs
         input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
-        if _TPU_DETERMINISTIC_PENALTY_TOKENS:
+        if self._uses_deterministic_penalty_tokens():
             for r, ids in zip(reqs, input_ids):
                 if len(ids):
                     r.pen_prefill_last_token = int(ids[-1])
@@ -3120,13 +3107,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self,
             self.model_config.vocab_size,
         )
-        if _TPU_DETERMINISTIC_PENALTY_TOKENS:
+        if self._uses_deterministic_penalty_tokens():
             self._seed_retracted_penalty_history(reqs)
 
     def _seed_retracted_penalty_history(self, reqs) -> None:
-        """SGLANG_TPU_DETERMINISTIC_PENALTY_TOKENS (v2): a request prefilled
-        again after a retraction joins with a fresh penalizer row, which drops
-        the history its uninterrupted decode had cumulated, so its later tokens
+        """SGLANG_DETERMINISTIC_PENALTY_TOKENS: a request prefilled again after
+        a retraction joins with a fresh penalizer row, which drops the history
+        its uninterrupted overlap decode had cumulated, so its later tokens
         would depend on when it was retracted. Seed the row with exactly that
         history: the first prefill's last input token, then every output token
         but the last (the next decode step cumulates that one as this prefill's
@@ -3690,9 +3677,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
         self.mamba_lazy_spec_track_positions_cpu = track_positions
 
+    def _uses_deterministic_penalty_tokens(self) -> bool:
+        """SGLANG_DETERMINISTIC_PENALTY_TOKENS, for overlap decode without
+        speculative decoding.
+
+        Overlap scheduling penalizes, at each decode step, req.output_ids[-1] from
+        host state, which lags the device token by 0 or 1 step depending on when
+        the previous result was processed, and falls back to the last prompt token
+        when the first sampled token is not processed yet. Which token is
+        penalized then depends on batch composition and host timing. With this
+        option the token is chosen by the request's own step count, as a request
+        decoding alone gets it (_deterministic_penalty_token), and a request
+        prefilled again after a retraction gets that history back
+        (_seed_retracted_penalty_history).
+
+        Both follow the overlap decode pattern of one token per step, so other
+        modes keep the default rule: without overlap it already penalizes the
+        token fed at each step, and speculative decoding can commit several
+        tokens per step.
+        """
+        return (
+            envs.SGLANG_DETERMINISTIC_PENALTY_TOKENS.get()
+            and self.enable_overlap
+            and self.spec_algorithm.is_none()
+        )
+
     @staticmethod
     def _deterministic_penalty_token(req) -> int:
-        """SGLANG_TPU_DETERMINISTIC_PENALTY_TOKENS: the token a request decoding
+        """SGLANG_DETERMINISTIC_PENALTY_TOKENS: the token a request decoding
         alone under overlap scheduling penalizes at this decode step (its prefill's
         last input token first, then the token it was fed one step earlier),
         independent of when the scheduler processed its previous results."""
@@ -3728,7 +3740,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # real token is relayed via future_map and resolved at forward
         # entry. So take the last output token from Req directly
         # (origin_input_ids[-1] on the first decode, before any output).
-        if _TPU_DETERMINISTIC_PENALTY_TOKENS and self.enable_overlap:
+        if self._uses_deterministic_penalty_tokens():
             last_tokens = [self._deterministic_penalty_token(req) for req in self.reqs]
         else:
             last_tokens = [

@@ -1,4 +1,4 @@
-"""SGLANG_TPU_DETERMINISTIC_PENALTY_TOKENS v2 (penaltylib seed_history): a request
+"""SGLANG_DETERMINISTIC_PENALTY_TOKENS (penaltylib seed_history): a request
 prefilled again after a retraction gets a fresh penalizer row. seed_history must
 leave that row with the bits the step-by-step path gives (cumulate_output_tokens
 once per decode step), for every penalizer, and leave other rows untouched, so

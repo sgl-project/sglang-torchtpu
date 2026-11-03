@@ -678,6 +678,11 @@ class Envs:
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     # Opt-in: keep receiving prefill requests while forward results are pending.
     SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
+    # Opt-in, overlap decode without speculative decoding: penalize the token a
+    # request decoding alone would penalize at each step, whatever the host has
+    # processed so far, and give a request prefilled again after a retraction
+    # that penalty history back (ScheduleBatch._uses_deterministic_penalty_tokens).
+    SGLANG_DETERMINISTIC_PENALTY_TOKENS = EnvBool(False)
 
     # ===================================================================
     # Radix and sparse KV caches
