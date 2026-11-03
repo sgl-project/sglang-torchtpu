@@ -166,7 +166,7 @@ def run_case(name):
     else:
         raise ValueError(name)
 
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
     _log(rank, "device sync done, entering cpu barrier")
     dist.barrier(group=cpu_pg)
     _log(rank, f"{name} {'PASS' if not bad else f'MISMATCH {bad}'}")
@@ -193,9 +193,12 @@ def main():
         import torch.multiprocessing as mp
 
         try:  # The module moved between nightlies.
-            from torch_tpu._internal.distributed.launchers import environment
+            from torch_tpu._internal.distributed import distributed as environment
         except ImportError:
-            from torch_tpu._internal.distributed import environment
+            try:
+                from torch_tpu._internal.distributed import environment
+            except ImportError:
+                from torch_tpu._internal.distributed.launchers import environment
 
         os.environ.pop("JOB_COMPLETION_INDEX", None)
         for k in (
