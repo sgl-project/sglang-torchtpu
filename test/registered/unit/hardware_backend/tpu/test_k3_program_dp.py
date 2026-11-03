@@ -91,5 +91,72 @@ class TestGoldenLayout(CustomTestCase):
             plan.transfer_rows(16, [1, 2], [3])
 
 
+class TestDpAllocator(CustomTestCase):
+    PAGE = 16
+
+    def _allocator(self, pages=8):
+        import torch
+
+        from sglang_tpu.k3_programs.sglang_dp_alloc import K3DpPagedAllocator
+
+        return K3DpPagedAllocator(
+            size=pages * self.PAGE,
+            page_size=self.PAGE,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=None,
+            need_sort=True,
+        )
+
+    def _extend(self, alloc, tokens, last_loc=-1, prefix=0):
+        import torch
+
+        return alloc.alloc_extend(
+            prefix_lens=torch.tensor([prefix]),
+            prefix_lens_cpu=torch.tensor([prefix]),
+            seq_lens=torch.tensor([tokens]),
+            seq_lens_cpu=torch.tensor([tokens]),
+            last_loc=torch.tensor([last_loc]),
+            extend_num_tokens=tokens - prefix,
+        )
+
+    def test_a_request_stays_in_its_group(self):
+        alloc = self._allocator()
+        g0 = alloc.assign("a")
+        g1 = alloc.assign("b")
+        self.assertNotEqual(g0, g1)  # balanced by live requests
+        alloc.pending_group = g0
+        a = self._extend(alloc, 3 * self.PAGE)
+        pages_a = sorted({int(x) // self.PAGE for x in a.tolist()})
+        self.assertEqual({alloc.group_of_page(p) for p in pages_a}, {g0})
+        alloc.pending_group = g1
+        b = self._extend(alloc, 2 * self.PAGE + 1)
+        pages_b = {int(x) // self.PAGE for x in b.tolist()}
+        self.assertEqual({alloc.group_of_page(p) for p in pages_b}, {g1})
+        # Decoding past a page boundary takes the next page from the same group.
+        import torch
+
+        out = alloc.alloc_decode(
+            seq_lens=torch.tensor([3 * self.PAGE + 1]),
+            seq_lens_cpu=torch.tensor([3 * self.PAGE + 1]),
+            last_loc=torch.tensor([int(a[-1])]),
+        )
+        self.assertEqual(alloc.group_of_page(int(out[0]) // self.PAGE), g0)
+
+    def test_landing_pages_and_capacity(self):
+        alloc = self._allocator(pages=8)
+        alloc.pending_group = 0
+        self._extend(alloc, 4 * self.PAGE)  # group 0 full
+        self.assertEqual(alloc.free_in_group(0), 0)
+        self.assertEqual(alloc.available_size(), 0)  # the fuller group bounds both
+        landing = alloc.alloc_landing(1, 2)
+        self.assertEqual({alloc.group_of_page(int(p)) for p in landing}, {1})
+        self.assertIsNone(alloc.alloc_landing(1, 3))
+        alloc.free_landing(landing)
+        alloc.merge_and_sort_free()
+        self.assertEqual(alloc.free_in_group(1), 4)
+        self.assertIsNone(self._extend(alloc, self.PAGE))  # group 0 has no page left
+
+
 if __name__ == "__main__":
     unittest.main()
