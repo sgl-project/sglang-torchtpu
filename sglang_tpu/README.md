@@ -195,7 +195,9 @@ zero launches.
   at 16384 rows, and one zero residual per bucket. The KV budget reserves this
   worst case, and each stage checks at start-up that it fits next to the KV
   cache, failing with the size it needs if not.
-- Not supported with DP attention or prefill context parallelism.
+- Context-parallel stages (PP x PCP) size each receive from their local rows.
+  Multi-device stages need a torch_tpu that starts them. Not supported with
+  DP attention.
 
 ## Fixed-cohort benchmark gate
 
