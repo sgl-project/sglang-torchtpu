@@ -517,8 +517,9 @@ class KVCacheConfigurator:
         # on the RPA decode path, but nothing establishes that the other TPU
         # backends are exempt, and the cost of refusing a working config is a
         # startup error while the cost of missing one is a silent hang.
-        if self.device == "tpu" and swa_max_total_num_tokens is not None:
-            align_tokens = self.pool_page_size * 8
+        page_multiple = current_platform.swa_pool_page_multiple()
+        if page_multiple > 1 and swa_max_total_num_tokens is not None:
+            align_tokens = self.pool_page_size * page_multiple
             aligned = (swa_max_total_num_tokens // align_tokens) * align_tokens
             if aligned == 0:
                 raise ValueError(

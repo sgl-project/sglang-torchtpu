@@ -113,6 +113,11 @@ def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+# The compiled decode reads the SWA pool correctly only at a page count that is
+# a multiple of 8 (sublane tiling); pool sizing aligns to it.
+SWA_POOL_PAGE_MULTIPLE = 8
+
+
 class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     """MHA KV pool with the fused 5D layout consumed by the Pallas kernel.
 

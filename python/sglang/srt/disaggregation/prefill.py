@@ -1056,10 +1056,9 @@ class SchedulerDisaggregationPrefillMixin:
                         continue
 
                 self.checkpoint_disagg_prefill(req)
-                if (
-                    self.transfer_backend == TransferBackend.RAIDEN
-                    and get_parallel().pp_size > 1
-                ):
+                if self.transfer_backend == TransferBackend.RAIDEN:
+                    # Raiden sends only the window; free the pages beyond it now so
+                    # a request waiting for the decode cannot starve the next chunk.
                     self._release_swa_beyond_window(req)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:

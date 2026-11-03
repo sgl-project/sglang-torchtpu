@@ -21,6 +21,7 @@ message naming the 8-page minimum.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -29,14 +30,18 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 PAGE_SIZE = 512
 
 
-def _swa_pool_tokens(swa_tokens, *, device="tpu", page_size=PAGE_SIZE):
-    """Run _derive_pool_sizes over a hybrid-SWA config and report the SWA size."""
+def _swa_pool_tokens(swa_tokens, *, page_multiple=8, page_size=PAGE_SIZE):
+    """Run _derive_pool_sizes over a hybrid-SWA config and report the SWA size.
+
+    ``page_multiple`` is the platform's answer to ``swa_pool_page_multiple()``
+    (8 on TPU, 1 elsewhere)."""
     from sglang.srt import runtime_context as rc
+    from sglang.srt.mem_cache import kv_cache_configurator
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
     fake = SimpleNamespace(
-        device=device,
+        device="cpu",
         is_hybrid_swa=True,
         is_draft_worker=False,
         loc_space_scale=1,
@@ -49,7 +54,14 @@ def _swa_pool_tokens(swa_tokens, *, device="tpu", page_size=PAGE_SIZE):
         full_max_total_num_tokens=32768,
         swa_max_total_num_tokens=swa_tokens,
     )
-    with rc.get_context().override_server_args(page_size=page_size):
+    with (
+        rc.get_context().override_server_args(page_size=page_size),
+        patch.object(
+            kv_cache_configurator.current_platform,
+            "swa_pool_page_multiple",
+            return_value=page_multiple,
+        ),
+    ):
         sizes = KVCacheConfigurator._derive_pool_sizes(fake, config=config)
     return sizes.swa_max_total_num_tokens
 
@@ -64,10 +76,10 @@ class TestSWAPageAlignment(unittest.TestCase):
             with self.subTest(pages=pages):
                 self.assertEqual(_swa_pool_tokens(pages * PAGE_SIZE), pages * PAGE_SIZE)
 
-    def test_non_tpu_device_is_untouched(self):
-        """The tiling constraint is a TPU property; other devices keep their size."""
+    def test_platform_without_a_page_multiple_is_untouched(self):
+        """A platform answering 1 keeps the pool size as computed."""
         self.assertEqual(
-            _swa_pool_tokens(34 * PAGE_SIZE, device="cuda"), 34 * PAGE_SIZE
+            _swa_pool_tokens(34 * PAGE_SIZE, page_multiple=1), 34 * PAGE_SIZE
         )
 
     def test_pool_below_the_floor_is_refused_at_startup(self):
