@@ -40,13 +40,45 @@ class TestKvPackHeads(unittest.TestCase):
         out = _unpack_out_heads(_attend(qp, kp, vp, d**-0.5), hkv, d)
         torch.testing.assert_close(out, ref, rtol=0, atol=1e-12)
 
-    def test_pack_rule(self):
+    def test_multi_group_packed_attention_matches_per_head(self):
+        torch.manual_seed(1)
+        T, hq, hkv, d, pack = 13, 128, 16, 64, 2
+        q, k, v = (torch.randn(T, h, d, dtype=torch.float64) for h in (hq, hkv, hkv))
+        ref = _attend(q, k, v, d**-0.5)
+        qp, kp, vp = _pack_qkv_heads(q, k, v, pack)
+        self.assertEqual(
+            (qp.shape, kp.shape, vp.shape),
+            ((T, hq, 128), (T, 8, 128), (T, 8, 128)),
+        )
+        out = _unpack_out_heads(_attend(qp, kp, vp, d**-0.5), pack, d, hkv)
+        torch.testing.assert_close(out, ref, rtol=0, atol=1e-12)
+
+    def test_pack_rule_and_pool_bytes(self):
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
         with tpu_envs.SGLANG_TPU_KV_PACK_HEADS.override(True):
             self.assertEqual(kv_pack_heads(2, 64, 128), 2)
+            self.assertEqual(kv_pack_heads(4, 64, 128), 2)
+            self.assertEqual(kv_pack_heads(16, 64, 128), 2)
             self.assertEqual(kv_pack_heads(1, 128, 128), 1)  # nothing to pack
-            self.assertEqual(kv_pack_heads(4, 64, 128), 1)  # does not fit one row
+            self.assertEqual(kv_pack_heads(3, 64, 128), 1)  # odd head count
+            self.assertEqual(kv_pack_heads(4, 96, 128), 1)  # non-exact lane fit
+            packed_bytes = TpuFusedMHATokenToKVPool.kv_bytes_per_token_per_layer(
+                num_kv_heads=16,
+                head_dim=64,
+                v_head_dim=64,
+                store_dtype=torch.float8_e4m3fn,
+            )
         with tpu_envs.SGLANG_TPU_KV_PACK_HEADS.override(False):
             self.assertEqual(kv_pack_heads(2, 64, 128), 1)
+            self.assertEqual(kv_pack_heads(16, 64, 128), 1)
+            unpacked_bytes = TpuFusedMHATokenToKVPool.kv_bytes_per_token_per_layer(
+                num_kv_heads=16,
+                head_dim=64,
+                v_head_dim=64,
+                store_dtype=torch.float8_e4m3fn,
+            )
+        self.assertEqual(packed_bytes * 2, unpacked_bytes)
 
 
 if __name__ == "__main__":
