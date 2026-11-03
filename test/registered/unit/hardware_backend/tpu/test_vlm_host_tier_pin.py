@@ -7,12 +7,16 @@ dropped when the write-back completes or fails. No TPU: a fake device module
 stands in for the worker's stream/event, and a manual pool decides when
 write-backs land.
 
-The last section checks that the server tier is built only when one process
-is the whole engine (tp_size == 1 and pp_size == 1).
+The bounds section checks that queued write-backs hold at most the device
+budget (or one write-back's buffers, when nothing else is queued) and that
+upload sources are kept only while their upload runs. The last
+section checks that the server tier is built only when one process is the whole
+engine (tp_size == 1 and pp_size == 1).
 """
 
 import contextlib
 import hashlib
+import weakref
 
 import pytest
 import torch
@@ -22,7 +26,7 @@ from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu import mm_schedule_tpu
-from sglang_tpu.mm_embedding import PaddedEmbedding
+from sglang_tpu.mm_embedding import PaddedEmbedding, split_embedding
 
 register_cpu_ci(est_time=8, suite="stage-a-test-cpu-intel")
 
@@ -36,11 +40,16 @@ class _FakeDeviceModule:
             self.device = device
 
     class Event:
+        done = True  # what query() reports; a test sets False for a running upload
+
         def record(self):
             pass
 
         def synchronize(self):
             pass
+
+        def query(self):
+            return type(self).done
 
     @staticmethod
     def stream(_stream):
@@ -87,8 +96,11 @@ def make_tier(monkeypatch):
     )
     made = []
 
-    def make(pin=True, cap_bytes=1 << 20, verify=False):
-        tier = mm_schedule_tpu._VlmHostTier(cap_bytes, verify, 1e9, pin_pending=pin)
+    # The pin tests use a device budget that never binds; the budget has its own tests.
+    def make(pin=True, cap_bytes=1 << 20, verify=False, pending_cap_bytes=1 << 20):
+        tier = mm_schedule_tpu._VlmHostTier(
+            cap_bytes, verify, 1e9, pin_pending=pin, pending_cap_bytes=pending_cap_bytes
+        )
         tier._pool.shutdown(wait=True)
         tier._pool = _ManualPool()
         made.append(tier)
@@ -138,8 +150,8 @@ def test_pending_write_back_is_served_from_the_pin(make_tier, kind):
 def test_flag_off_keeps_the_v1_miss_while_pending(make_tier):
     tier = make_tier(pin=False)
     tier.write_back(("h", 6), _padded(6, 2, 1))
-    assert tier._pending_emb == {}
-    assert [fn for fn, _ in tier._pool.jobs] == [tier._copy_to_host]  # the v1 job
+    assert tier._pending_emb == {}  # the job holds the embedding, nothing else does
+    assert [fn for fn, _ in tier._pool.jobs] == [tier._write_back_job]
     assert tier.lookup(("h", 6), torch.device("cpu")) is None
     assert tier.c["host_miss"] == 1 and tier.c["pin_hit"] == 0
 
@@ -207,6 +219,7 @@ def test_failed_write_back_releases_the_pin(make_tier, monkeypatch, value):
     tier._pool.run()
     assert tier.c["wb_error"] == 1
     assert tier._pending_emb == {} and tier._pending == set()
+    assert tier._pending_bytes == 0 and tier._pending_bufs == {}
     _poison_(emb, value)
     assert tier.lookup(("h", 6), torch.device("cpu")) is None
 
@@ -222,6 +235,7 @@ def test_pin_is_dropped_even_if_the_job_raises(make_tier, monkeypatch):
     with pytest.raises(RuntimeError):
         tier._pool.run()
     assert tier._pending_emb == {}
+    assert tier._pending_bytes == 0 and tier._pending_bufs == {}
     assert tier.lookup(("h", 6), torch.device("cpu")) is None
 
 
@@ -253,6 +267,7 @@ def test_too_big_write_back_releases_the_pin(make_tier):
     tier._pool.run()
     assert tier.c["wb_too_big"] == 1
     assert tier._pending_emb == {}
+    assert tier._pending_bytes == 0 and tier._pending_bufs == {}
     assert tier.lookup(("h", 6), torch.device("cpu")) is None
 
 
@@ -338,8 +353,13 @@ def _step(encoder, requests):
 
 @pytest.fixture
 def scheduler_tier(make_tier, monkeypatch):
-    def install(pin, verify=False, device_cache_bytes=None):
-        tier = make_tier(pin=pin, cap_bytes=1 << 20, verify=verify)
+    def install(pin, verify=False, device_cache_bytes=None, pending_cap_bytes=1 << 20):
+        tier = make_tier(
+            pin=pin,
+            cap_bytes=1 << 20,
+            verify=verify,
+            pending_cap_bytes=pending_cap_bytes,
+        )
         monkeypatch.setattr(mm_schedule_tpu, "_HOST_TIER", tier)
         monkeypatch.setattr(mm_schedule_tpu, "_HOST_TIER_INIT", True)
         monkeypatch.setattr(mm_schedule, "embedding_cache", None)
@@ -430,6 +450,176 @@ def test_flag_on_without_pending_write_back_is_unchanged(scheduler_tier):
     assert on_tier.c["pin_hit"] == 0
     assert on_tier.c["host_hit"] == off_tier.c["host_hit"] == 1
     assert [_bits(e) for e in on_out] == [_bits(e) for e in off_out]
+
+
+# ---- bounds: device bytes held by queued write-backs, host bytes held by uploads ----
+
+
+@pytest.mark.parametrize("pin", [False, True])
+def test_write_backs_past_the_device_budget_are_skipped(make_tier, pin):
+    # Copies fall behind: a queued write-back keeps its device buffers alive and
+    # device-cache eviction cannot reclaim them, so the queue stops at the budget.
+    one = _padded(6, 2, 0).storage_nbytes()
+    tier = make_tier(pin=pin, pending_cap_bytes=3 * one)
+    embs = [_padded(6, 2, i) for i in range(10)]
+    for i, emb in enumerate(embs):
+        tier.write_back(("k", i), emb)
+    queued = {("k", 0), ("k", 1), ("k", 2)}
+    assert len(tier._pool.jobs) == 3 and tier._pending_bytes == 3 * one
+    assert tier.c["wb_submit"] == 3 and tier.c["wb_skip_backlog"] == 7
+    assert tier._pending == queued
+    assert set(tier._pending_emb) == (queued if pin else set())
+    assert tier.lookup(("k", 5), torch.device("cpu")) is None  # skipped: a plain miss
+    tier._pool.run()
+    assert tier._pending_bytes == 0 and tier._pending_bufs == {}
+    assert set(tier._lru) == queued
+    tier.write_back(("k", 5), embs[5])  # room again once the copies have landed
+    assert tier.c["wb_submit"] == 4
+
+
+@pytest.mark.parametrize("kind", ["padded", "tensor"])
+def test_a_buffer_shared_by_write_backs_is_charged_once(make_tier, kind):
+    # The split rows of one encoder output keep one buffer alive, not one each.
+    if kind == "padded":
+        whole = _padded(12, 4, 1)
+        nbytes = whole.storage_nbytes()
+    else:
+        whole = torch.randn(12, HIDDEN)
+        nbytes = whole.untyped_storage().nbytes()
+    tier = make_tier(pin=True, pending_cap_bytes=nbytes)
+    for i, part in enumerate(split_embedding(whole, [5, 7])):
+        tier.write_back(("k", i), part)
+    assert tier.c["wb_submit"] == 2 and tier.c["wb_skip_backlog"] == 0
+    assert tier._pending_bytes == nbytes and len(tier._pending_bufs) == 1
+    tier._pool.run()
+    assert tier._pending_bytes == 0 and tier._pending_bufs == {}
+
+
+@pytest.mark.parametrize("kind", ["padded", "tensor"])
+def test_an_output_past_the_budget_still_enters_an_empty_queue(make_tier, kind):
+    # Nothing is queued, so there is no backlog: the rows of one encoder output
+    # larger than the budget are all written back. Only a write-back that would
+    # add to them while they are queued is skipped.
+    if kind == "padded":
+        whole = _padded(16, 4, 1)
+        nbytes = whole.storage_nbytes()
+    else:
+        whole = torch.randn(16, HIDDEN)
+        nbytes = whole.untyped_storage().nbytes()
+    tier = make_tier(pin=True, pending_cap_bytes=nbytes - 1)
+    for i, row in enumerate(split_embedding(whole, [1] * 16)):
+        tier.write_back(("k", i), row)
+    assert tier.c["wb_submit"] == 16 and tier.c["wb_skip_backlog"] == 0
+    assert tier._pending_bytes == nbytes and len(tier._pending_bufs) == 1
+    tier.write_back(("other", 1), _padded(1, 1, 2))
+    assert tier.c["wb_skip_backlog"] == 1 and ("other", 1) not in tier._pending
+    tier._pool.run()
+    assert len(tier._lru) == 16
+    assert tier._pending_bytes == 0 and tier._pending_bufs == {}
+
+
+def test_default_device_budget_is_the_device_cache_budget(scheduler_tier):
+    # No explicit budget: queued write-backs hold at most what the device cache may.
+    one = _padded(100, 3, 0).storage_nbytes()
+    tier = scheduler_tier(
+        True, device_cache_bytes=one + one // 2, pending_cap_bytes=None
+    )
+    enc = _Encoder()
+    out = _step(enc, [([_image(0xA, 0, 99), _image(0xB, 100, 199)], 0, 200)])
+    assert enc.encoded == [0xA, 0xB]
+    assert tier.c["wb_submit"] == 1 and tier.c["wb_skip_backlog"] == 1
+    assert tier._pending == {(0xA, 100)}
+    tier._pool.run()
+    assert list(tier._lru) == [(0xA, 100)]
+    # The skip changes only what the host tier keeps, not the LM input.
+    want = [_padded(100, 3, 0xA).to_host(), _padded(100, 3, 0xB).to_host()]
+    assert _bits(out) == _bits(torch.cat(want))
+
+
+def _check_upload_bytes(tier):
+    # The running count of LRU bytes that uploads read matches a scan of the LRU.
+    assert tier._busy_bytes == sum(e.nbytes for e in tier._lru.values() if e.uploads)
+    assert tier._size + tier._orphan_bytes <= tier.cap
+
+
+def test_finished_uploads_release_their_host_sources(make_tier):
+    # Host hits on many distinct entries under a one-entry cap: once each upload
+    # has finished, no host copy outside the LRU stays alive.
+    tier = make_tier(pin=False, cap_bytes=_padded(6, 2, 0).storage_nbytes())
+    refs = []
+    for i in range(300):
+        tier.write_back(("k", i), _padded(6, 2, i))
+        tier._pool.run()
+        refs.extend(weakref.ref(b) for b in tier._lru[("k", i)].buffers)
+        hit = tier.lookup(("k", i), torch.device("cpu"))
+        assert hit is not None and hit[1] is not None
+        del hit
+    live = [r() for r in refs if r() is not None]
+    assert len(live) == 1 and live[0] is tier._lru[("k", 299)].buffers[0]
+    assert tier.c["host_hit"] == 300 and tier.c["wb_no_room"] == 0
+    assert len(tier._uploads) <= 1 and tier._orphan_bytes == 0
+    _check_upload_bytes(tier)
+
+
+def test_an_entry_evicted_during_its_upload_counts_against_the_cap(
+    make_tier, monkeypatch
+):
+    a, b, c = _padded(6, 2, 1), _padded(6, 2, 2), _padded(6, 2, 3)
+    big = _padded(14, 2, 4)  # as big as the cap
+    tier = make_tier(pin=False, cap_bytes=big.storage_nbytes())
+    assert 2 * a.storage_nbytes() == tier.cap
+    tier.write_back(("a", 6), a)
+    tier._pool.run()
+    monkeypatch.setattr(_FakeDeviceModule.Event, "done", False)  # A's upload runs
+    served, entry_a = tier.lookup(("a", 6), torch.device("cpu"))
+    source = weakref.ref(entry_a.buffers[0])
+    for key, emb in ((("b", 6), b), (("c", 6), c)):
+        tier.write_back(key, emb)
+        tier._pool.run()
+    # C fits beside A's upload, so A and B leave the LRU. A's upload still reads
+    # it, so its bytes keep counting against the cap.
+    assert list(tier._lru) == [("c", 6)] and tier._orphan_bytes == entry_a.nbytes
+    assert tier.c["evict"] == 2 and tier.c["wb_no_room"] == 0
+    _check_upload_bytes(tier)
+    # On CPU the "upload" returns the source itself; drop the test's references.
+    del served, entry_a
+    assert source() is not None  # still held for the running upload
+    tier.write_back(("big", 14), big)
+    tier._pool.run()
+    # BIG does not fit beside A's bytes: it is dropped and C is kept.
+    assert list(tier._lru) == [("c", 6)] and tier.c["wb_no_room"] == 1
+    monkeypatch.setattr(_FakeDeviceModule.Event, "done", True)  # the upload ends
+    tier.write_back(("big", 14), big)
+    tier._pool.run()
+    assert list(tier._lru) == [("big", 14)] and tier._orphan_bytes == 0
+    assert not tier._uploads and tier._busy_bytes == 0
+    assert source() is None
+
+
+def test_idle_entries_survive_a_write_back_that_cannot_fit(make_tier, monkeypatch):
+    # Four idle entries fill the cap; D's upload starts; then a write-back as big
+    # as the cap lands. It cannot fit beside D's upload, so nothing is evicted.
+    one = _padded(6, 2, 0).storage_nbytes()
+    tier = make_tier(pin=False, cap_bytes=4 * one)
+    keys = [(k, 6) for k in "abcd"]
+    for i, key in enumerate(keys):
+        tier.write_back(key, _padded(6, 2, i))
+        tier._pool.run()
+    monkeypatch.setattr(_FakeDeviceModule.Event, "done", False)  # D's upload runs
+    assert tier.lookup(("d", 6), torch.device("cpu")) is not None
+    big = _padded(30, 2, 9)
+    assert big.storage_nbytes() == tier.cap
+    tier.write_back(("big", 30), big)
+    tier._pool.run()
+    assert list(tier._lru) == keys
+    assert tier.c["evict"] == 0 and tier.c["wb_no_room"] == 1
+    assert tier._busy_bytes == one and tier._orphan_bytes == 0
+    _check_upload_bytes(tier)
+    monkeypatch.setattr(_FakeDeviceModule.Event, "done", True)  # the upload ends
+    tier.write_back(("big", 30), big)
+    tier._pool.run()
+    assert list(tier._lru) == [("big", 30)] and tier.c["evict"] == 4
+    assert not tier._uploads and tier._busy_bytes == 0
 
 
 # ---- server tier: single-process engines only ----

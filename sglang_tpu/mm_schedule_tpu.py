@@ -80,18 +80,41 @@ def _move_items_to_device(
 #                                     failed), so it holds no memory the job does not already hold.
 # Write-back: after an encode is inserted into the device cache, one worker thread copies the item's buffers to the
 # host (non_blocking D2H on the worker's own TPU stream + event sync, as sglang_tpu.result_copy_worker does), so the
-# scheduler thread only enqueues. Lookup: on a device miss, a host hit is uploaded (non_blocking H2D, host source kept
-# referenced) and re-inserted into the device cache where a device hit would have been used. Bytes are copied, never
-# recomputed: a served host entry is bit-identical to the encode that produced it.
+# scheduler thread only enqueues. A queued write-back keeps its device buffers alive, so while write-backs are queued
+# a new one is taken only if the queued total stays within the device cache's own budget (SGLANG_VLM_CACHE_SIZE_MB; a
+# buffer shared by several write-backs counts once). An empty queue always takes one, so the queue holds at most
+# max(budget, one write-back's buffers). Past it a write-back is skipped ("wb_skip_backlog") and the item stays
+# device-only, as without a tier.
+# Lookup: on a device miss, a host hit is uploaded (non_blocking H2D) and re-inserted into the device cache where a
+# device hit would have been used. The host source of an upload is kept only until an event recorded after the upload
+# completes; an entry the LRU evicts before then still counts against SGLANG_VLM_HOST_TIER_MB until it completes. A
+# write-back that cannot fit beside the bytes of running uploads is dropped ("wb_no_room") without evicting anything.
+# Bytes are copied, never recomputed: a served host entry is bit-identical to the encode that produced it.
 # Engines: the tier is built only when one scheduler process is the whole engine (tp_size == 1 and pp_size == 1);
 # see _single_process_engine.
 class _HostEntry:
-    __slots__ = ("buffers", "spans", "nbytes")
+    __slots__ = ("buffers", "spans", "nbytes", "uploads")
 
     def __init__(self, buffers, spans, nbytes):
         self.buffers = buffers  # host tensors
         self.spans = spans  # PaddedEmbedding: tuple of (buffer index, start, length); plain tensor: None
         self.nbytes = nbytes
+        # Uploads that may still read the buffers (see _VlmHostTier._release_uploads).
+        self.uploads = 0
+
+
+def _device_buffers(emb: MultimodalEmbedding) -> Dict[int, torch.Tensor]:
+    """The tensors whose storage an embedding keeps alive, by identity.
+
+    A view counts as its base, so the split rows of one encoder output share one
+    buffer, as the spans of one padded output do.
+    """
+    if isinstance(emb, PaddedEmbedding):
+        tensors = [span.buffer for span in emb.spans]
+    else:
+        tensors = [emb]
+    bases = [t if t._base is None else t._base for t in tensors]
+    return {id(b): b for b in bases}
 
 
 def _sha256_rows(t: torch.Tensor) -> str:
@@ -106,6 +129,7 @@ class _VlmHostTier:
         verify: bool,
         stats_s: float,
         pin_pending: Optional[bool] = None,
+        pending_cap_bytes: Optional[int] = None,
     ):
         self.cap = cap_bytes
         self.verify = verify and cap_bytes > 0
@@ -123,7 +147,18 @@ class _VlmHostTier:
         self._lru: collections.OrderedDict = collections.OrderedDict()
         self._size = 0
         self._pending = set()
-        self._recent_sources = collections.deque(maxlen=256)
+        # Device bytes that queued write-backs keep alive, at most _pending_cap
+        # (None: the device cache budget). id(buffer) -> [buffer, nbytes, holders].
+        self._pending_cap = pending_cap_bytes
+        self._pending_bytes = 0
+        self._pending_bufs: Dict[int, list] = {}
+        # Host hits whose upload may still read the host buffers, oldest first:
+        # (event recorded after the upload, key, entry).
+        self._uploads: collections.deque = collections.deque()
+        # Host bytes an upload may still read: LRU entries with uploads > 0
+        # (_busy_bytes) and entries the LRU evicted meanwhile (_orphan_bytes).
+        self._busy_bytes = 0
+        self._orphan_bytes = 0
         self._pool = None
         if cap_bytes > 0:
             self._dm = torch.get_device_module("tpu")
@@ -150,24 +185,56 @@ class _VlmHostTier:
 
     # ---- write-back (scheduler thread enqueues; worker copies) ----
     def write_back(self, key, emb: MultimodalEmbedding) -> None:
+        bufs = _device_buffers(emb)
         with self._lock:
             if key in self._lru or key in self._pending:
                 self.c["wb_skip_present"] += 1
                 return
+            new_bytes = sum(
+                b.untyped_storage().nbytes()
+                for i, b in bufs.items()
+                if i not in self._pending_bufs
+            )
+            budget = self._pending_cap
+            if budget is None:
+                budget = mm_schedule.embedding_cache.max_size
+            # An empty queue always takes the write-back, and buffers that are
+            # already queued cost nothing more, so an encoder output larger than
+            # the budget can still reach the host tier.
+            if (
+                self._pending_bytes
+                and new_bytes
+                and self._pending_bytes + new_bytes > budget
+            ):
+                # The copies are behind: the item stays device-only, as without a tier.
+                self.c["wb_skip_backlog"] += 1
+                return
+            for i, b in bufs.items():
+                held = self._pending_bufs.setdefault(
+                    i, [b, b.untyped_storage().nbytes(), 0]
+                )
+                held[2] += 1
+            self._pending_bytes += new_bytes
             self._pending.add(key)
             if self.pin_pending:
                 self._pending_emb[key] = emb
             self.c["wb_submit"] += 1
-        job = self._copy_and_unpin if self.pin_pending else self._copy_to_host
-        self._pool.submit(job, key, emb, time.perf_counter_ns())
+        self._pool.submit(self._write_back_job, key, emb, time.perf_counter_ns())
 
-    def _copy_and_unpin(self, key, emb, t_sub: int) -> None:
+    def _write_back_job(self, key, emb, t_sub: int) -> None:
         try:
             self._copy_to_host(key, emb, t_sub)
         finally:
-            # After the job: the key is now in the LRU (preferred by lookup) or was dropped (too big / failed).
+            # After the job: the key is now in the LRU (preferred by lookup) or was
+            # dropped (too big / failed). The job no longer needs emb.
             with self._lock:
                 self._pending_emb.pop(key, None)
+                for i in _device_buffers(emb):
+                    held = self._pending_bufs[i]
+                    held[2] -= 1
+                    if held[2] == 0:
+                        del self._pending_bufs[i]
+                        self._pending_bytes -= held[1]
 
     def _copy_to_host(self, key, emb, t_sub: int) -> None:
         try:
@@ -192,9 +259,21 @@ class _VlmHostTier:
             if entry.nbytes > self.cap:
                 self.c["wb_too_big"] += 1
                 return
-            while self._size + entry.nbytes > self.cap and self._lru:
+            self._release_uploads()
+            if self._busy_bytes + self._orphan_bytes + entry.nbytes > self.cap:
+                # Running uploads hold the room: evicting the idle entries would
+                # not make enough, so keep them and drop this write-back.
+                self.c["wb_no_room"] += 1
+                return
+            while (
+                self._size + self._orphan_bytes + entry.nbytes > self.cap and self._lru
+            ):
                 _, old = self._lru.popitem(last=False)
                 self._size -= old.nbytes
+                if old.uploads:
+                    # An upload still reads it: its bytes stay held until the upload ends.
+                    self._busy_bytes -= old.nbytes
+                    self._orphan_bytes += old.nbytes
                 self.c["evict"] += 1
             self._lru[key] = entry
             self._size += entry.nbytes
@@ -225,9 +304,13 @@ class _VlmHostTier:
         pending write-back is copying is served (STRADDLE-PIN)."""
         pinned = None
         with self._lock:
+            self._release_uploads()
             entry = self._lru.get(key)
             if entry is not None:
                 self._lru.move_to_end(key)
+                if not entry.uploads:
+                    self._busy_bytes += entry.nbytes
+                entry.uploads += 1
             elif self.pin_pending:
                 pinned = self._pending_emb.get(key)
         if pinned is not None:
@@ -238,8 +321,11 @@ class _VlmHostTier:
             return None
         t0 = time.perf_counter_ns()
         dev_bufs = [b.to(device, non_blocking=True) for b in entry.buffers]
-        # Keep the host sources of non_blocking uploads alive.
-        self._recent_sources.append(entry.buffers)
+        # Keep the host sources of the non_blocking uploads alive until they complete.
+        event = self._dm.Event()
+        event.record()
+        with self._lock:
+            self._uploads.append((event, key, entry))
         if entry.spans is None:
             emb = dev_bufs[0]
         else:
@@ -253,6 +339,21 @@ class _VlmHostTier:
         self.c["h2d_bytes"] += entry.nbytes
         self.c["h2d_enqueue_ns"] += time.perf_counter_ns() - t0
         return emb, entry
+
+    def _release_uploads(self) -> None:
+        """Drop the host sources of finished uploads. Caller holds _lock.
+
+        Uploads are queued in issue order, so the scan stops at the first one
+        still running; the ones after it are released by a later call.
+        """
+        while self._uploads and self._uploads[0][0].query():
+            _, key, entry = self._uploads.popleft()
+            entry.uploads -= 1
+            if entry.uploads == 0:
+                if self._lru.get(key) is entry:
+                    self._busy_bytes -= entry.nbytes
+                else:
+                    self._orphan_bytes -= entry.nbytes
 
     # ---- verification (SGLANG_VLM_HOST_TIER_VERIFY=1) ----
     def verify_pin(
