@@ -92,7 +92,7 @@ class SharedSliceReceiver(WeightUpdateReceiver):
         # the trainer packs a bucket into one int16 buffer: many small sends crash libtpu's
         # CopyToRemoteDevice, single large ones are fine
         packed = torch.empty((offset + size) // 2, dtype=torch.int16, device=device)
-        # torch_tpu keys a transfer by (src, dst, tag) and never forgets a key: tags must not repeat
+        # the tag also keys the names the paired trainer rank posts for this bucket
         self._next_tag += 1
         self._backend.recv([packed], self._src_slice_rank, self._next_tag).wait()
         # wait() returns once the buffer is announced, not once the data lands; a read waits for it,
