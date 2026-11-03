@@ -1634,7 +1634,19 @@ def get_default_block_sizes(
         vmem_budget = int(vmem_limit_bytes * _budget_frac)
         # The DECODE query tile never shrinks below the static row count.
         min_bq_sz = decode_query_size if case == RpaCase.DECODE else 1
+        min_prefill_bkv_sz = (
+            bkv_alignment if case == RpaCase.DECODE else max(bkv_csz, bkv_alignment)
+        )
         while bq_sz > min_bq_sz or bkv_sz > bkv_alignment:
+            # Once prefill shrinks bkv_sz to a single compute sub-tile
+            # (bkv_sz == bkv_csz), PV reuses dead QK^T registers in XLA's
+            # schedule; tpu7x VMEM dumps measure 38.35 MiB (60.0%) where the
+            # static sum estimates 42.50 MiB (66.4%).
+            eff_budget = (
+                int(vmem_limit_bytes * 0.67)
+                if case != RpaCase.DECODE and bkv_sz <= min_prefill_bkv_sz
+                else vmem_budget
+            )
             vmem_est = get_vmem_estimate_bytes(
                 actual_num_kv_heads,
                 actual_num_q_heads_per_kv_head,
@@ -1646,13 +1658,24 @@ def get_default_block_sizes(
                 use_custom_mask=use_custom_mask,
                 bkv_csz=bkv_csz,
             )
-            if vmem_est <= vmem_budget:
+            if vmem_est <= eff_budget:
                 break
             # A query tile already at its floor cannot shrink; the KV tile must,
-            # or the loop never terminates.
-            if bkv_sz > bq_sz * bkv_alignment or bq_sz <= min_bq_sz:
+            # or the loop never terminates. On high-head-count PP prefill
+            # (e.g. 128 Q / 16 KV heads), bkv_x2 at bkv_sz=2048 alone consumes
+            # 34 MiB of a 38.4 MiB budget; shrink bkv_sz toward bkv_csz once
+            # bq_sz reaches 64 instead of collapsing bq_sz to 8.
+            if (
+                bkv_sz > bq_sz * bkv_alignment
+                or bq_sz <= min_bq_sz
+                or (
+                    case != RpaCase.DECODE
+                    and bq_sz <= 64
+                    and bkv_sz > min_prefill_bkv_sz
+                )
+            ):
                 bkv_sz = max(bkv_sz // 2, bkv_alignment)
-                bkv_csz = bkv_sz
+                bkv_csz = min(bkv_csz, bkv_sz)
             else:
                 bq_sz = max(bq_sz // 2, min_bq_sz)
                 bq_csz = bq_sz

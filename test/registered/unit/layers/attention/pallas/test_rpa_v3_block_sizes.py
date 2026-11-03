@@ -83,6 +83,34 @@ class TestTpu7xPrefillBlocks(CustomTestCase):
         )
         self.assertEqual((blocks["bq_sz"], blocks["bkv_sz"]), (64, 2048))
 
+    def test_high_head_count_pp8_shrinks_bkv_before_collapsing_bq(self):
+        """Muse Spark PP=8 (TP=1) runs 128 query heads over 16 KV heads per
+        core. At bkv_sz=2048, bkv_x2 alone consumes 34 MiB of a 38.4 MiB
+        budget and previously collapsed bq_sz to 8 (70.49 ms/layer). Shrinking
+        bkv_sz down to bkv_csz=512 keeps bq_sz=64 (18.05 ms/layer, 38.35 MiB
+        measured VMEM on tpu7x) across bf16 KV, fp8 KV, and 8-head packed KV."""
+        for num_kv_heads, head_dim, kv_dtype in (
+            (16, 64, jnp.bfloat16),
+            (16, 64, jnp.float8_e4m3fn),
+            (8, 128, jnp.float8_e4m3fn),
+        ):
+            blocks = _block_sizes(
+                num_q_heads=128,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                kv_dtype=kv_dtype,
+                vmem_limit=TPU7X_VMEM,
+            )
+            self.assertEqual(
+                (
+                    blocks["bq_sz"],
+                    blocks["bkv_sz"],
+                    blocks["bq_csz"],
+                    blocks["bkv_csz"],
+                ),
+                (64, 512, 64, 512),
+            )
+
 
 def _decode_block_sizes(*, num_q_heads, num_kv_heads, head_dim, kv_dtype, vmem_limit):
     """Decode-case blocks for a 32k-context batch at page 128."""
