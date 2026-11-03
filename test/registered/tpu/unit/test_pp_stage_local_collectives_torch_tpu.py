@@ -289,8 +289,6 @@ def _run_distributed_worker(case: str, stage_size: int) -> None:
     ]
     stage = rank // stage_size
     group = stage_groups[stage]
-    if hasattr(spmd_util, "make_standalone"):
-        spmd_util.make_standalone(group)
     stage_ranks = range(stage * stage_size, (stage + 1) * stage_size)
     device = torch.device("tpu")
     launches = stage + 1
