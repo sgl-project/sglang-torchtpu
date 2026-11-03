@@ -64,6 +64,9 @@ class Case(msgspec.Struct, frozen=True):
     n_req: int
     q: int
     ctx: tuple  # cached tokens per request
+    expert_group: int = 0
+    # not in DEFAULT_CASES (run with --cases)
+    opt_in: bool = False
 
 
 CASES = {
@@ -71,32 +74,42 @@ CASES = {
     for c in (
         Case("fused_c1q1_s", "fused", 1, 1, (2500,)),
         Case("fused_c2q8_s", "fused", 2, 8, (3000, 1800)),
-        Case("fused_c2q1_l", "fused", 2, 1, (20000, 17321)),
-        Case("sal_c2q1_s", "sal", 2, 1, (2600, 1100)),
+        Case("fused_c2q1_l", "fused", 2, 1, (20000, 17321), expert_group=2),
+        Case("sal_c2q1_s", "sal", 2, 1, (2600, 1100), expert_group=2),
         Case("sal_c1q8_l", "sal", 1, 8, (20000,)),
         Case("sal_c2q8_s", "sal", 2, 8, (2900, 2047)),
         Case("salfp8_c1q1_s", "sal_fp8", 1, 1, (2100,)),
-        Case("salfp8_c2q8_l", "sal_fp8", 2, 8, (20000, 13000)),
+        Case("salfp8_c2q8_l", "sal_fp8", 2, 8, (20000, 13000), expert_group=2),
         Case("salfp8_c2q8_s", "sal_fp8", 2, 8, (1500, 3100)),
         # past the 32-chunk (32k-token) KV ring: the pipelined loop refills it
         Case("salfp8_c2q8_xl", "sal_fp8", 2, 8, (70000, 41000)),
+        # 40 live rows padded to 48: the row-tiled program (MKConfig.row_tile)
+        Case(
+            "salfp8_c5q8_s",
+            "sal_fp8",
+            5,
+            8,
+            (1500, 3100, 900, 2200, 1700),
+            expert_group=2,
+            opt_in=True,
+        ),
     )
 }
-DEFAULT_CASES = tuple(CASES)
+DEFAULT_CASES = tuple(c for c in CASES if not CASES[c].opt_in)
 # (case, flag=value): the kernel run with the flag toggled must be bit-identical to the
-# default run; "repeat" reruns the default (run-to-run determinism, e.g. of the fold_f / fold_o
-# verify steps). vec_route=False is not listed: its outputs differ from vec_route=True by ~1 bf16
-# ulp in the expert branch (both match the reference equally well). Folded steps need xor peers,
-# so coll_order='ring' runs on a decode step.
+# default run; "expert_group=N" restacks the expert operands instead of an MKConfig field and
+# "repeat" reruns the default (run-to-run determinism). vec_route=False is not listed: its
+# outputs differ from vec_route=True by ~1 bf16 ulp in the expert branch (both match the
+# reference equally well); pass --exact vec_route=False to see it.
 DEFAULT_EXACT = (
     ("fused_c2q8_s", "repeat"),
     ("fused_c2q8_s", "y_block_send=False"),
     ("fused_c2q8_s", "o_rs_streamed=False"),
-    ("fused_c2q8_s", "topk_iter=True"),
-    ("fused_c2q1_l", "coll_order='ring'"),
-    ("salfp8_c2q8_l", "repeat"),
-    ("salfp8_c2q8_l", "y_block_send=False"),
-    ("salfp8_c2q8_l", "lazy_dense=False"),
+    ("fused_c2q8_s", "o_rs_rotate=False"),
+    ("fused_c2q8_s", "coll_order='ring'"),
+    ("fused_c2q8_s", "expert_group=2"),
+    ("salfp8_c2q8_s", "y_block_send=False"),
+    ("salfp8_c2q8_s", "o_rs_streamed=False"),
 )
 
 
@@ -328,7 +341,10 @@ class StepInputs(msgspec.Struct):
 
 def step_inputs(case: Case) -> StepInputs:
     ps = _PAGES[case.kv]
+    # ops.step_rows: the TP size, and past 32 rows the 16-row tile of the row-tiled program
     rows = -(-case.n_req * case.q // TP) * TP
+    if rows > 32:
+        rows = -(-case.n_req * case.q // math.lcm(16, TP)) * math.lcm(16, TP)
     n_live = case.n_req * case.q
     pps = -(-(max(case.ctx) + case.q) // ps)
     swa_pages = _SWA_TOKENS // ps
@@ -393,6 +409,7 @@ class _Runner:
         mk.max_position = max_position
         mk.chunk_pages = ops._CHUNK_PAGES
         mk.kv_packed = True
+        mk.expert_groups = ()
         mk.scale_fp8 = False
         mk._ops = {}
         self.mk = mk
@@ -443,8 +460,27 @@ class _Runner:
             by_name[name] = torch.stack([d[name] for d in dense])
         return [by_name[n].to(self.device) for n in K.WEIGHT_NAMES]
 
-    def experts(self) -> list:
-        return [t for slabs in self.per_layer_experts for t in slabs]
+    def experts(self, expert_group: int) -> list:
+        groups = self.ops.expert_groups_of(self.kinds, expert_group)
+        self.mk.expert_groups = groups
+        if not groups:
+            return [t for slabs in self.per_layer_experts for t in slabs]
+        cfg = SimpleNamespace(n_layers=self.n_layers, expert_groups=groups)
+        refs = []
+        for unit in self.K.expert_units(cfg):
+            if unit[0] == "layer":
+                refs += self.per_layer_experts[unit[1]]
+            else:
+                for j in range(4):
+                    refs.append(
+                        torch.stack(
+                            [
+                                self.per_layer_experts[li][j]
+                                for li in range(unit[1], unit[2])
+                            ]
+                        )
+                    )
+        return refs
 
     def pools(self, case: Case, st: StepInputs) -> list:
         return [
@@ -457,10 +493,12 @@ class _Runner:
             for l in range(self.n_layers)
         ]
 
-    def step(self, case: Case, st: StepInputs, kv: list, overrides: dict):
+    def step(
+        self, case: Case, st: StepInputs, kv: list, expert_group: int, overrides: dict
+    ):
         """(hidden [rows, H] bf16, aux [rows, L * H] bf16, the MKConfig used); kv updated in place."""
         self.overrides = dict(overrides)
-        experts = self.experts()
+        experts = self.experts(expert_group)
         d = self.device
         meta = torch.tensor([st.n_live, self.rank], dtype=torch.int32, device=d)
         capture = list(range(self.n_layers))
@@ -609,7 +647,7 @@ class _LayerRef:
             live &= pos[:, None] - allpos[None, :] < WINDOW
         g = Q_HEADS // KV_HEADS
         qh = qn[rows].reshape(q, KV_HEADS, g, HEAD_DIM)
-        # the kernel's query rounding and exponent base (MKConfig.attn_unshifted / fold_attn_scale)
+        # the kernel's query rounding and exponent base (MKConfig.attn_exp2 / attn_unshifted)
         if self.attn_mode == "exp2":
             qs, sc, base = _bf(qh * (ATTN_SCALE * LOG2E)), 1.0, 2.0
         elif self.attn_mode == "unshifted":
@@ -809,7 +847,7 @@ def run_case(
         raise ValueError(f"{case.name} needs {st.max_position} rope rows")
     t0 = time.time()
     kv = runner.pools(case, st)
-    hid, aux, cfg = runner.step(case, st, kv, base)
+    hid, aux, cfg = runner.step(case, st, kv, case.expert_group, base)
     new_kv = runner.new_kv(case, st, kv)
     t_kernel = time.time() - t0
     cdir = os.path.join(out_dir, case.name)
@@ -818,10 +856,15 @@ def run_case(
     for flag in exact:
         k, v = _parse_flag(flag) if flag != "repeat" else (flag, None)
         if k == "repeat":  # run-to-run determinism of the default variant
-            hid2, aux2, cfg2 = runner.step(case, st, kv, base)
+            hid2, aux2, cfg2 = runner.step(case, st, kv, case.expert_group, base)
             applied = cfg2 == cfg
+        elif k == "expert_group":
+            hid2, aux2, cfg2 = runner.step(case, st, kv, v, base)
+            applied = cfg2.expert_groups == runner.ops.expert_groups_of(runner.kinds, v)
         else:
-            hid2, aux2, cfg2 = runner.step(case, st, kv, {**base, k: v})
+            hid2, aux2, cfg2 = runner.step(
+                case, st, kv, case.expert_group, {**base, k: v}
+            )
             applied = getattr(cfg2, k) == v and getattr(cfg, k) != v
         if os.environ.get("MK_NUMERICS_DUMP") == "1":
             torch.save(aux2, f"{cdir}/exact_{len(exact_res)}_rank{rank}.pt")
@@ -865,11 +908,10 @@ def run_case(
         )
         out = aux0[:n, l * HIDDEN : (l + 1) * HIDDEN]
         new_kv_l = torch.stack([data[d]["new_kv"][l] for d in range(TP)])
-        # unshifted attention exponentiates in base 2; a folded scale rounds q as unshifted
         attn_mode = (
             "exp2"
-            if cfg.attn_unshifted
-            else ("unshifted" if cfg.fold_attn_scale else "shifted")
+            if cfg.attn_exp2
+            else ("unshifted" if cfg.attn_unshifted else "shifted")
         )
         res = check_layer(
             l,

@@ -856,6 +856,7 @@ class MuseSparkForConditionalGeneration(nn.Module):
             )
         # The megakernel path also takes the fp8 weight-only LM head.
         self.lm_head.quant_method = TpuFp8LmHeadMethod(self.lm_head)
+        torch.accelerator.synchronize()
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.embed_tokens

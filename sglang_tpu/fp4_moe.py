@@ -439,12 +439,23 @@ def apply_tpu_nvfp4_moe(
             chunk_weights = weights_by_partition[:, token_start:token_end].flatten(0, 1)
             chunk_ids = ids_by_partition[:, token_start:token_end].flatten(0, 1)
 
+            stacked_w13 = getattr(layer, "_stacked_w13_weight", None)
             output = fused_moe_rs_gather(
                 hidden_states=chunk_hidden,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
+                w1=stacked_w13 if stacked_w13 is not None else layer.w13_weight,
+                w2=layer._stacked_w2_weight
+                if stacked_w13 is not None
+                else layer.w2_weight,
+                w1_scale=(
+                    layer._stacked_w13_weight_scale
+                    if stacked_w13 is not None
+                    else layer.w13_weight_scale
+                ),
+                w2_scale=(
+                    layer._stacked_w2_weight_scale
+                    if stacked_w13 is not None
+                    else layer.w2_weight_scale
+                ),
                 topk_weights=chunk_weights,
                 topk_ids=chunk_ids,
                 post_expert_norm_weight=post_expert_norm_weight,
