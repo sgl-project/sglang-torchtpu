@@ -209,7 +209,8 @@ class TpuSpecWorker(BaseSpecWorker):
             # (--sampling-backend pytorch).
             runner.sampler = TpuSampler()
         self._draft_worker = draft_worker
-        self._draft_swa_translate = _draft_swa_translate(draft_worker)
+        # Resolved in alloc_memory_pool: the draft KV pool does not exist yet.
+        self._draft_swa_translate = None
         self.num_drafts = num_drafts
         self.num_verify_rows = num_drafts + 1
         self.device = target_worker.device
@@ -407,6 +408,11 @@ class TpuSpecWorker(BaseSpecWorker):
             zeros(padded_bs),
             torch.ones((padded_bs,), dtype=torch.bool, device=self.device),
         )
+
+    def alloc_memory_pool(self, *args, **kwargs):
+        super().alloc_memory_pool(*args, **kwargs)
+        # The scheduler builds this worker before any KV pool exists.
+        self._draft_swa_translate = _draft_swa_translate(self._draft_worker)
 
     @property
     def draft_swa_translate(self):
