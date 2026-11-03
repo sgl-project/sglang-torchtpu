@@ -395,6 +395,32 @@ def calculate_block_sizes(
         if bkv_sz == 0:
             raise ValueError("Cannot find block sizes that fit within VMEM limit.")
 
+        # When query-side buffers fill VMEM (e.g. 64 query heads on one chip under
+        # PP with TP=1), lockstep growth stops at its first step, bq_sz == bkv_sz
+        # == MXU width, with VMEM left over. Spend it on one more q block of keys
+        # (bkv_sz = 2 * bq_sz): each q block takes half the KV steps, and the causal
+        # diagonal still ends on a k block edge. Only full-attention layers with at
+        # least 8 q heads per KV head measured faster: with fewer, the bq_c_sz that
+        # Step 3 picks for the wider block slows bf16 KV, and a sliding window reads
+        # more keys outside the window. Wider ratios are not measured. Also skip the
+        # step when sequences in this pool are too short to fill the wider block,
+        # and when it is not a whole number of pages (cover_whole_pages would cut it
+        # after Step 3 picks bq_c_sz for it).
+        if (
+            fixed_bq_sz is None
+            and bq_sz == mxu_column_size
+            and model_cfgs.sliding_window is None
+            and model_cfgs.num_q_heads_per_kv_head >= 8
+        ):
+            grown_bkv_sz = 2 * bq_sz
+            if (
+                grown_bkv_sz <= serve_cfgs.pages_per_seq * serve_cfgs.page_size
+                and grown_bkv_sz % serve_cfgs.page_size == 0
+                and calculate_vmem_usage(batch_size, n_buffer, bq_sz, grown_bkv_sz)
+                < capped_vmem_limit_bytes
+            ):
+                bkv_sz = grown_bkv_sz
+
         # Step 3: Given current tile size, calculate compute tile size.
         if fixed_bq_sz is not None:
             return configs.BlockSizes(
