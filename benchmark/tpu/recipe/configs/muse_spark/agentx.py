@@ -70,6 +70,13 @@ GOLDEN_AL = {
 }
 
 
+# --mk-decode: only the decode megakernel's Waves 1-4 and expert grouping (PR #1909). No KPERM:
+# it rewrites the fp4 experts for a dequant path the recipe's SGLANG_TPU_FP4_DEQUANT_VIA_FP8=1 skips.
+MK_DECODE_ENV = {
+    "SGLANG_TPU_MUSE_MK_EXPERT_GROUP": "15",
+    "SGLANG_TPU_MUSE_MK_OPT": "1",
+}
+
 # --mk-prefill: extend steps run the megakernel's prefill program (PR #1909), with
 # the decode Waves 1-4, expert grouping and the fused-RS/RPA settings it was measured on.
 MK_PREFILL_ENV = {
@@ -123,7 +130,12 @@ def megakernel_rows(running, verify, adaptive):
 
 
 def config_for(
-    conc, *, draft_model_path=None, simulate_acceptance=True, mk_prefill=False
+    conc,
+    *,
+    draft_model_path=None,
+    simulate_acceptance=True,
+    mk_prefill=False,
+    mk_decode=False,
 ):
     """The server config for one AgentX concurrency.
 
@@ -294,6 +306,8 @@ def config_for(
                 "SGLANG_SIMULATE_ACC_TOKEN_MODE": "real-draft-token",
             }
         )
+    if mk_decode:
+        env.update(MK_DECODE_ENV)
     if mk_prefill:
         env.update(MK_PREFILL_ENV)
     return config
@@ -313,12 +327,18 @@ def main(argv=None):
         action="store_true",
         help="megakernel prefill program and its settings (MK_PREFILL_ENV)",
     )
+    parser.add_argument(
+        "--mk-decode",
+        action="store_true",
+        help="decode megakernel Waves 1-4 and expert grouping only (MK_DECODE_ENV)",
+    )
     args = parser.parse_args(argv)
     config = config_for(
         args.conc,
         draft_model_path=args.draft_model_path,
         simulate_acceptance=not args.eval,
         mk_prefill=args.mk_prefill,
+        mk_decode=args.mk_decode,
     )
     print(json.dumps(config, indent=2))
 

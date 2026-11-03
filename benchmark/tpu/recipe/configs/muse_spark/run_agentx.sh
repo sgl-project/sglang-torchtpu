@@ -30,6 +30,8 @@ SERVER_HF_OFFLINE=${SERVER_HF_OFFLINE:-1}
 CHIPS=${CHIPS:-4}
 # MK_PREFILL=1: the megakernel prefill program (agentx.py --mk-prefill).
 MK_PREFILL_FLAG=$([[ "${MK_PREFILL:-0}" == 1 ]] && echo --mk-prefill || true)
+# MK_DECODE=1: only the decode megakernel's Waves 1-4 and expert grouping (agentx.py --mk-decode).
+MK_DECODE_FLAG=$([[ "${MK_DECODE:-0}" == 1 ]] && echo --mk-decode || true)
 # AIPerf at the revision the submission's harness pinned, in its own venv: it must
 # not share site-packages with the server.
 AIPERF_REPO=https://github.com/SemiAnalysisAI/aiperf.git
@@ -45,7 +47,7 @@ render() {  # conc out_dir: the launcher config and its resolved command
     mkdir -p "$out"
     (cd "$REPO" && HF_HUB_OFFLINE=$SERVER_HF_OFFLINE TRANSFORMERS_OFFLINE=$SERVER_HF_OFFLINE \
         "$PYTHON" -m benchmark.tpu.recipe.configs.muse_spark.agentx --conc "$conc" \
-        --draft-model-path "$MUSE_WINDOWED_DRAFT_DIR" ${MK_PREFILL_FLAG} > "$out/server_config.json")
+        --draft-model-path "$MUSE_WINDOWED_DRAFT_DIR" ${MK_PREFILL_FLAG} ${MK_DECODE_FLAG} > "$out/server_config.json")
     (cd "$REPO" && HF_HUB_OFFLINE=$SERVER_HF_OFFLINE TRANSFORMERS_OFFLINE=$SERVER_HF_OFFLINE \
         MODEL="$MODEL" PORT="$PORT" \
         "$PYTHON" -m benchmark.tpu.launch_server --config "@$out/server_config.json" --dry-run \
