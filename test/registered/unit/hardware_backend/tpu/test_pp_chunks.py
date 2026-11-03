@@ -87,6 +87,20 @@ def test_profile_points_skip_prefixes_beyond_the_schedule_capacity():
     assert chunk_pairs(None, 16384, 32768) == 0
 
 
+def test_profile_points_shift_prefixes_past_hybrid_swa_sliding_window():
+    # Muse Spark PP=8 uses max_tokens=1024 and sliding_window=2048.
+    # Unshifted prefixes (1024, 2048) include the 6-SWA-layer ramp-up between
+    # p=1024 and p=2048; shifting to (2048, 3072) samples purely FA growth.
+    buckets = [256, 512, 1024]
+    points = profile_points(buckets, 1024, 131072, None, min_prefix=2048)
+    assert [p for p in points if p[1] == 0] == [(b, 0) for b in buckets]
+    assert (1024, 2048) in points and (1024, 3072) in points
+    assert (1024, 1024) not in points
+    # When context_len is too short to fit shifted + 2 * max_tokens, fall back.
+    short_points = profile_points(buckets, 1024, 3072, None, min_prefix=2048)
+    assert (1024, 1024) in short_points
+
+
 def test_fit_takes_the_slowest_stage_and_removes_the_causal_term():
     model = _model()
     assert model.attn_ms_per_token_pair == pytest.approx(ATTN, rel=1e-6)
