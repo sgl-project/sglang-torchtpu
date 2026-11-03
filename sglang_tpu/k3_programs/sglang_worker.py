@@ -44,7 +44,7 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang_tpu.k3_programs import sglang_bridge as bridge
-from sglang_tpu.k3_programs import sglang_step
+from sglang_tpu.k3_programs import sglang_dp, sglang_step
 from sglang_tpu.k3_programs.program import MegakernelProgram, StepInput
 
 logger = logging.getLogger(__name__)
@@ -233,6 +233,20 @@ def prefill_deferral_rounds(prefill_rows: int, running: int, share: float) -> in
     return max(1, min(512, math.ceil(prefill_s * (1 - share) / share / decode_s)))
 
 
+def dp_pages(plan) -> "sglang_dp.DpPages | None":
+    """The DP2 page regions over ``plan``'s KV pages under ``attention_dp=2``
+    (None without attention DP)."""
+    from sglang_tpu.k3_programs.kimi_k3.config import active
+
+    if active().attention_dp == 1:
+        return None
+    if active().attention_dp != sglang_dp.GROUPS:
+        raise ValueError(f"K3 decode: attention DP{active().attention_dp} is unsupported (DP2 only)")
+    if plan.layout.tokens_per_block != sglang_dp.CHUNK_TOKENS:
+        raise ValueError("K3 decode: attention DP2 runs with the fp8 KV cache (512 tokens a row)")
+    return sglang_dp.DpPages(plan.kv_blocks // 2 * 2, plan.num_blocks)
+
+
 class StepClock:
     """Where a role's steps spend host time: each phase between marks, and
     the gap since the previous step (the scheduler's own work; gaps over a
@@ -312,6 +326,13 @@ class DecodeSteps:
         self.plan = plan
         self.table_width = table_width
         self.schedule = schedule
+        # Attention DP2 (sglang_dp): two ids a page, 8192-token table blocks;
+        # ``swap`` moves rows landed on the other group (set at build).
+        self.dp = dp_pages(plan)
+        self.table_tokens = (
+            sglang_dp.GROUP_BLOCK_TOKENS if self.dp else plan.logical_block_tokens
+        )
+        self.swap = None
         self._live: set[str] = set()
         self._departed: dict[str, None] = {}
         self._prompts = _Prompts()
@@ -344,6 +365,7 @@ class DecodeSteps:
         the KV sglang allocated); the program tracks its position itself."""
         scheduled = 1 + drafts_for(self.schedule, len(reqs))
         requests = []
+        swaps: list = []
         for req in reqs:
             if req.rid in self._departed:
                 # The program dropped its KDA state when it left the batch; the
@@ -380,7 +402,25 @@ class DecodeSteps:
                 token_ids = np.concatenate((prompt, np.asarray(outputs, np.int32)))
             # Near the context limit the scheduled (and lagging) extent can
             # pass the last page the tables hold; the program stops there.
-            end = min(end, self.table_width * self.plan.logical_block_tokens)
+            end = min(end, self.table_width * self.table_tokens)
+            slot = int(req.kv.mamba_pool_idx.reshape(-1)[0])
+            if self.dp is None:
+                tables = bridge.block_tables(
+                    starts[req.kv.req_pool_idx], end, slot, self.plan, self.table_width
+                )
+            else:
+                row = starts[req.kv.req_pool_idx]
+                pages = (
+                    np.asarray(row[: -(-end // sglang_dp.PAGE_TOKENS)], np.int64)
+                    // sglang_dp.PAGE_TOKENS
+                )
+                tables = (
+                    self.dp.table_row(pages, end, self.table_width),
+                    *bridge.kda_table_rows(slot, self.plan),
+                )
+                transfer = getattr(req, "_k3_dp_transfer", None)
+                if req.rid not in self._live and transfer is not None and len(transfer[1]):
+                    swaps.append((req, transfer))
             requests.append(
                 sglang_step.request_input(
                     rid=req.rid,
@@ -389,16 +429,12 @@ class DecodeSteps:
                     num_prompt_tokens=len(prompt),
                     computed=computed,
                     scheduled=scheduled,
-                    block_tables=bridge.block_tables(
-                        starts[req.kv.req_pool_idx],
-                        end,
-                        int(req.kv.mamba_pool_idx.reshape(-1)[0]),
-                        self.plan,
-                        self.table_width,
-                    ),
+                    block_tables=tables,
                     sampling_params=req.sampling_params,
                 )
             )
+        if swaps:
+            self._swap(swaps)
         current = {req.rid for req in reqs}
         finished, self._live = self._live - current, current
         self._forget(finished)
@@ -406,6 +442,25 @@ class DecodeSteps:
         tokens = self.program.step(StepInput(requests, finished)).tokens
         self.clock.mark("dispatch")
         return tokens[: len(reqs)]
+
+    def _swap(self, swaps) -> None:
+        """Move each new request's rows that landed on the other DP group to
+        its own group (one op), then give the landing pages back (held until
+        the step that reads them has run)."""
+        from sglang_tpu.k3_programs import sglang_dp_alloc
+
+        if self.swap is None:
+            raise RuntimeError("K3 decode: DP2 transfers landed rows but no swap op is bound")
+        jobs = []
+        for _, (pages, landing) in swaps:
+            sources, destinations = self.dp.swap_rows(pages, landing)
+            jobs.append((sources, destinations, self.dp.group(int(pages[0]))))
+        self.swap(jobs)
+        allocator = sglang_dp_alloc.active()
+        for req, (pages, landing) in swaps:
+            if allocator is not None:
+                allocator.free_landing(torch.as_tensor(np.asarray(landing, np.int32)))
+            req._k3_dp_transfer = (pages, ())
 
     def _forget(self, finished: set[str]) -> None:
         self._prompts.drop(finished)

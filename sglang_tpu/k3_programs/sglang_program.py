@@ -208,8 +208,14 @@ def _role_steps(role, program, config, pool):
     compiled."""
     from sglang_tpu.k3_programs.sglang_worker import DecodeSteps, PrefillSteps
 
+    from sglang_tpu.k3_programs import sglang_dp
+    from sglang_tpu.k3_programs.sglang_worker import dp_pages
+
     plan = pool.plan
-    width = -(-config.max_model_len // plan.logical_block_tokens)
+    # Attention DP2 (decode only): table entries are DCP16 blocks.
+    dp = dp_pages(plan) if role == "decode" else None
+    table_tokens = sglang_dp.GROUP_BLOCK_TOKENS if dp else plan.logical_block_tokens
+    width = -(-config.max_model_len // table_tokens)
     # The prefill reads a prefix hit's KDA state from its page's column.
     kda_block = plan.layout.tokens_per_block if role == "prefill" else None
     groups = bridge.kv_groups(
@@ -218,6 +224,7 @@ def _role_steps(role, program, config, pool):
         width,
         draft_layers=bridge.DSPARK_DRAFT_LAYERS,
         kda_block_size=kda_block,
+        mla_block_tokens=table_tokens,
     )
     program.bind_kv_caches(pool.caches, groups)
     program.warmup()
@@ -243,12 +250,15 @@ def _role_steps(role, program, config, pool):
             kv_pool=pool,
             state_pool=pool.state_pool,
         )
-    return DecodeSteps(
+    steps = DecodeSteps(
         program,
         plan,
         table_width=width,
         schedule=config.num_speculative_tokens_per_batch_size,
     )
+    if dp is not None:
+        steps.swap = sglang_dp.make_swapper(program)
+    return steps
 
 
 def build_steps(target_worker):

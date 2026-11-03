@@ -103,6 +103,23 @@ k3_program_prefill_wait
        prefill/decode priority).
   Remove when: that seam exists.
 
+k3_program_dp_allocator / k3_program_dp_prealloc / k3_program_dp_transfer_rows /
+k3_program_dp_admission / k3_program_dp_release
+  Why: under attention DP2 (SGLANG_TPU_K3_PROGRAM_ATTENTION_DP=2) the decode's
+       two DCP16 groups each hold their own requests' pages, while the
+       prefill's DCP32 rows reach the decode rank of the same index
+       (k3_programs/sglang_dp.py); core's allocator and transfer know one id
+       space and one destination list for every rank.
+  How: AROUND TpuSRTPlatform.get_paged_allocator_cls returns
+       K3DpPagedAllocator; AROUND DecodePreallocQueue._pre_alloc places the
+       request in a group and takes its landing pages in the other one;
+       AROUND _transfer_page_indices gives each rank its destination rows;
+       AROUND _required_alloc_tokens reserves the landing pages too; AFTER
+       release_kv_cache releases the request's group and landing pages.
+  Upstream PR or issue: <to be filed> (allocator regions and per-rank
+       transfer destinations for attention DP on P/D).
+  Remove when: those seams exist.
+
 k3_program_prefill_share
   Why: a colocated engine's prefill batches stop its decoding requests, and
        --prefill-decode-interval defers the next prefill by a fixed number of
@@ -319,6 +336,99 @@ def k3_program_prefill_wait(original, scheduler: Any, *args, **kwargs) -> bool:
     return original(scheduler, *args, **kwargs)
 
 
+def _dp2() -> bool:
+    from sglang_tpu.envs import envs as tpu_envs
+
+    return tpu_envs.SGLANG_TPU_K3_PROGRAM_ATTENTION_DP.get() == 2
+
+
+def _dp_allocator(queue: Any):
+    from sglang_tpu.k3_programs.sglang_dp_alloc import K3DpPagedAllocator
+
+    allocator = queue.token_to_kv_pool_allocator
+    return allocator if isinstance(allocator, K3DpPagedAllocator) else None
+
+
+def k3_program_dp_allocator(original, platform: Any, *args, **kwargs) -> type:
+    """AROUND TpuSRTPlatform.get_paged_allocator_cls."""
+    if _dp2():
+        from sglang_tpu.k3_programs.sglang_dp_alloc import K3DpPagedAllocator
+
+        return K3DpPagedAllocator
+    return original(platform, *args, **kwargs)
+
+
+def k3_program_dp_prealloc(original, queue: Any, req: Any, *args, **kwargs):
+    """AROUND DecodePreallocQueue._pre_alloc."""
+    allocator = _dp_allocator(queue)
+    if allocator is None:
+        return original(queue, req, *args, **kwargs)
+    from sglang_tpu.k3_programs import sglang_dp
+
+    group = allocator.assign(req.rid)
+    allocator.pending_group = group
+    try:
+        kv_loc = original(queue, req, *args, **kwargs)
+    finally:
+        allocator.pending_group = None
+    pages = -(-int(kv_loc.numel()) // allocator.page_size)
+    landing = allocator.alloc_landing(1 - group, sglang_dp.landing_pages_needed(pages))
+    if landing is None:
+        raise RuntimeError(
+            f"K3 decode DP2: no landing pages left in group {1 - group} for "
+            f"request {req.rid} ({pages} pages)"
+        )
+    req._k3_dp_landing = landing
+    return kv_loc
+
+
+def k3_program_dp_transfer_rows(original, queue: Any, decode_req: Any, kv_indices, page_size):
+    """AROUND DecodePreallocQueue._transfer_page_indices."""
+    pages = original(queue, decode_req, kv_indices, page_size)
+    allocator = _dp_allocator(queue)
+    if allocator is None:
+        return pages
+    import numpy as np
+
+    from sglang_tpu.k3_programs import sglang_dp
+
+    req = decode_req.req
+    landing = [int(p) for p in getattr(req, "_k3_dp_landing", ())]
+    plan = allocator.get_kvcache().plan
+    layout = sglang_dp.DpPages(allocator.dp_pages, plan.num_blocks)
+    page_list = [int(p) for p in pages]
+    req._k3_dp_transfer = (page_list, landing)
+    rows = layout.transfer_rows(int(queue.tp_rank), page_list, landing)
+    return np.asarray(rows, dtype=np.int32)
+
+
+def k3_program_dp_admission(original, queue: Any, *args, **kwargs) -> int:
+    """AROUND DecodePreallocQueue._required_alloc_tokens: landing pages too."""
+    tokens = original(queue, *args, **kwargs)
+    if _dp_allocator(queue) is None:
+        return tokens
+    page = queue.token_to_kv_pool_allocator.page_size
+    pages = -(-tokens // page)
+    return tokens + -(-pages // 2) * page
+
+
+def k3_program_dp_release(result: Any, req: Any, *args, **kwargs) -> None:
+    """AFTER mem_cache.common.release_kv_cache."""
+    from sglang_tpu.k3_programs import sglang_dp_alloc
+
+    allocator = sglang_dp_alloc.active()
+    if allocator is None:
+        return result
+    landing = getattr(req, "_k3_dp_landing", None)
+    transfer = getattr(req, "_k3_dp_transfer", None)
+    if landing is not None and (transfer is None or len(transfer[1])):
+        # Not swapped yet (the request left before its first decode step).
+        allocator.free_landing(landing)
+    req._k3_dp_landing = None
+    allocator.release(req.rid)
+    return result
+
+
 def skip_k3_program_backends(original, model_runner: Any, *args, **kwargs) -> None:
     """AROUND ModelRunner.init_attention_backends."""
     if not k3_program_active():
@@ -387,6 +497,31 @@ def hook_specs() -> list[tuple]:
             "sglang.srt.managers.scheduler.Scheduler._should_defer_prefill",
             k3_program_prefill_wait,
             HookType.AROUND,
+        ),
+        (
+            "sglang_tpu.tpu_platform.TpuSRTPlatform.get_paged_allocator_cls",
+            k3_program_dp_allocator,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.disaggregation.decode.DecodePreallocQueue._pre_alloc",
+            k3_program_dp_prealloc,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.disaggregation.decode.DecodePreallocQueue._transfer_page_indices",
+            k3_program_dp_transfer_rows,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.disaggregation.decode.DecodePreallocQueue._required_alloc_tokens",
+            k3_program_dp_admission,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.mem_cache.common.release_kv_cache",
+            k3_program_dp_release,
+            HookType.AFTER,
         ),
         (
             "sglang.srt.model_executor.model_runner.ModelRunner.init_attention_backends",

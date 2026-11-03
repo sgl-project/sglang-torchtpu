@@ -189,3 +189,58 @@ def swap_body(axis: str = "tp"):
         return tuple(out)
 
     return body
+
+
+def make_swapper(program):
+    """The swap over a DP2 decode program's pools (the 24 unified pools and
+    the DSpark draft's): ``swap(jobs)`` with ``(sources, destinations,
+    group)`` per request, each bucket's op compiled at build. The pools keep
+    their tensors (and the transfer's registered buffers): donated, then
+    adopted in place as the program's own ops do."""
+    import torch
+    from jax.sharding import PartitionSpec as P
+
+    from sglang_tpu.k3_programs.bridge import register_op
+    from sglang_tpu.k3_programs.kimi_k3.decode_ops import AXIS
+
+    ops = program.ops
+    draft = getattr(program, "draft", None)
+
+    def pools():
+        return list(ops.unified_pools) + list(getattr(draft, "pools", ()) or ())
+
+    count = len(pools())
+    built = {}
+
+    def op_for(size):
+        if size not in built:
+            built[size] = register_op(
+                f"pallas::k3_dp_swap{size}x{count}",
+                ops.mesh,
+                swap_body(AXIS),
+                (P(), P(), P()) + (P(AXIS),) * count,
+                (P(AXIS),) * count,
+                donate_argnums=tuple(range(3, 3 + count)),
+                export_key=repr(("k3_dp_swap", size, count)),
+            )
+        return built[size]
+
+    def swap(jobs) -> None:
+        sources, destinations, groups = swap_operands(jobs)
+        current = pools()
+        fresh = op_for(len(sources))(
+            torch.from_numpy(sources).to("tpu"),
+            torch.from_numpy(destinations).to("tpu"),
+            torch.from_numpy(groups).to("tpu"),
+            *current,
+        )
+        for old, new in zip(current, fresh, strict=True):
+            if new is not old:
+                old.set_(new)
+
+    previous = 0
+    for size in SWAP_BUCKETS:  # compile and run each bucket once, writing nowhere
+        rows = [0] * (previous + 1)
+        swap([(rows, rows, -1)])
+        previous = size
+    return swap

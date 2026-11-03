@@ -23,20 +23,36 @@ from sglang_tpu.allocator_tpu import (
 from sglang_tpu.k3_programs import sglang_dp as dp
 
 
+_ACTIVE: list = []
+
+
+def active() -> "K3DpPagedAllocator | None":
+    """The process's DP2 allocator (the decode's), once built."""
+    return _ACTIVE[-1] if _ACTIVE else None
+
+
 class K3DpPagedAllocator(TpuPagedTokenToKVPoolAllocator):
     """Region-aware pages for the two DP groups."""
 
     def clear(self) -> None:
         super().clear()
         if self.num_pages % dp.GROUPS:
-            raise ValueError(f"DP2 needs an even number of KV pages, not {self.num_pages}")
+            # An odd last page stays out of both regions.
+            self.free_pages = self.free_pages[self.free_pages <= self.num_pages // 2 * 2]
+            self.page_is_free[self.num_pages] = False
         self.group_requests = [0] * dp.GROUPS
         self.request_group: dict[str, int] = {}
+        if self not in _ACTIVE:
+            _ACTIVE.append(self)
 
     # ------------------------------------------------------------ regions
     @property
     def per_group(self) -> int:
         return self.num_pages // dp.GROUPS
+
+    @property
+    def dp_pages(self) -> int:
+        return self.per_group * dp.GROUPS
 
     def group_of_page(self, page: int) -> int:
         return (int(page) - 1) // self.per_group

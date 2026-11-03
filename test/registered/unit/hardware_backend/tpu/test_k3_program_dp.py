@@ -215,5 +215,75 @@ class TestSwapOp(CustomTestCase):
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
 
 
+class TestDpHooks(CustomTestCase):
+    PAGE = 16
+
+    def setUp(self):
+        import torch
+        from types import SimpleNamespace
+
+        from sglang_tpu.k3_programs.sglang_dp_alloc import K3DpPagedAllocator
+
+        self.kvcache = SimpleNamespace(plan=SimpleNamespace(num_blocks=40))
+        self.alloc = K3DpPagedAllocator(
+            size=16 * self.PAGE, page_size=self.PAGE, dtype=torch.bfloat16,
+            device="cpu", kvcache=self.kvcache, need_sort=True,
+        )
+        self.queue = SimpleNamespace(token_to_kv_pool_allocator=self.alloc, tp_rank=0)
+
+    def _prealloc(self, rid, tokens):
+        import torch
+        from types import SimpleNamespace
+
+        from sglang_tpu.hooks import k3_program as hooks
+
+        req = SimpleNamespace(rid=rid)
+
+        def original(queue, req, *args, **kwargs):
+            return self.alloc.alloc_extend(
+                prefix_lens=torch.tensor([0]), prefix_lens_cpu=torch.tensor([0]),
+                seq_lens=torch.tensor([tokens]), seq_lens_cpu=torch.tensor([tokens]),
+                last_loc=torch.tensor([-1]), extend_num_tokens=tokens,
+            )
+
+        kv = hooks.k3_program_dp_prealloc(original, self.queue, req)
+        return req, kv
+
+    def test_prealloc_transfer_rows_and_release(self):
+        import numpy as np
+        from types import SimpleNamespace
+
+        from sglang_tpu.hooks import k3_program as hooks
+        from sglang_tpu.k3_programs import sglang_dp as dp
+
+        req, kv = self._prealloc("a", 3 * self.PAGE)
+        pages = sorted({int(x) // self.PAGE for x in kv.tolist()})
+        group = self.alloc.group_of_page(pages[0])
+        self.assertIsNone(self.alloc.pending_group)
+        landing = [int(p) for p in req._k3_dp_landing]
+        self.assertEqual(len(landing), 2)
+        self.assertEqual({self.alloc.group_of_page(p) for p in landing}, {1 - group})
+        layout = dp.DpPages(self.alloc.dp_pages, 40)
+        for rank in (0, 5, 16, 31):
+            self.queue.tp_rank = rank
+            rows = hooks.k3_program_dp_transfer_rows(
+                lambda q, d, k, p: np.asarray(pages, np.int32),
+                self.queue, SimpleNamespace(req=req), None, self.PAGE,
+            )
+            self.assertEqual(rows.tolist(), layout.transfer_rows(rank, pages, landing))
+        self.assertEqual(req._k3_dp_transfer, (pages, landing))
+        free_before = self.alloc.free_in_group(1 - group)
+        hooks.k3_program_dp_release(None, req)
+        self.alloc.merge_and_sort_free()
+        self.assertEqual(self.alloc.free_in_group(1 - group), free_before + 2)
+        self.assertEqual(self.alloc.group_requests, [0, 0])
+
+    def test_admission_reserves_landing_pages(self):
+        from sglang_tpu.hooks import k3_program as hooks
+
+        need = hooks.k3_program_dp_admission(lambda q, **k: 3 * self.PAGE, self.queue, fill_len=48, prefix_len=0)
+        self.assertEqual(need, 3 * self.PAGE + 2 * self.PAGE)
+
+
 if __name__ == "__main__":
     unittest.main()

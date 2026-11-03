@@ -291,20 +291,23 @@ def kv_groups(
     table_width: int,
     draft_layers: int = 0,
     kda_block_size: int | None = None,
+    mla_block_tokens: int | None = None,
 ) -> list[KVGroup]:
     """The groups the programs bind: the MLA layers' pages (with the draft
     layers', read through the same tables), then the three KDA groups. A KDA
     group's block spans the whole context (one column: the request's state
     block), or ``kda_block_size`` tokens: the prefill program reads a prefix
     hit's state from column ``hit // block_size - 1`` (vLLM's ``align``
-    mode), so a prefill with prefix caching takes a column per page."""
+    mode), so a prefill with prefix caching takes a column per page.
+    ``mla_block_tokens``: an MLA table entry's tokens (attention DP2's 8192:
+    a DCP16 block, sglang_dp) instead of a logical block."""
     kda_size = kda_block_size or max(context_len, 1)
     kda_width = -(-max(context_len, 1) // kda_size)
     return [
         KVGroup(
             tuple(mla_layer_name(layer) for layer in MLA)
             + tuple(draft_layer_name(i) for i in range(draft_layers)),
-            plan.logical_block_tokens,
+            mla_block_tokens or plan.logical_block_tokens,
             table_width,
         ),
         *(

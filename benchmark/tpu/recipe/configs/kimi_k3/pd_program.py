@@ -25,6 +25,8 @@ Environment:
     K3_PROGRAM_DECODE_RUNNING       the decode's running requests (default
                                     twice the concurrency, up to 64)
     K3_PROGRAM_KERNEL_EXTRA         more kernel settings (a=b;c=d)
+    K3_PROGRAM_ATTENTION_DP         1 (default) or 2: the decode's attention
+                                    data parallelism (two DCP16 groups)
     SGLANG_TPU_K3_PROGRAM_PRESHARDED pre-sharded weights directory
 """
 
@@ -51,6 +53,9 @@ RUNNING = min(64, max(4, 2 * CONCURRENCY)) if ROLE == "decode" else max(4, CONCU
 # with their KV already transferred.
 if ROLE == "decode":
     RUNNING = int(os.environ.get("K3_PROGRAM_DECODE_RUNNING", RUNNING))
+# Attention DP2 on the decode (k3_programs/sglang_dp.py): two DCP16 groups,
+# three drafts up to 32 requests (16 a group).
+ATTENTION_DP = int(os.environ.get("K3_PROGRAM_ATTENTION_DP", "1")) if ROLE == "decode" else 1
 # A prefill chunk is one page: every full chunk ends on a KDA checkpoint the
 # prefix cache keeps (the programs' windows split it as they need).
 PREFILL_CHUNK = PAGE_SIZE
@@ -105,8 +110,11 @@ server_args.update(
 if ROLE == "decode":
     # The decode keeps finished turns' KV pages, and a session's next turn
     # transfers only the pages past that prefix (KV only: the transfer delivers
-    # each request's KDA state; sglang_decode_cache).
-    DECODE_PREFIX_CACHE = os.environ.get("K3_PROGRAM_DECODE_PREFIX_CACHE", "1") == "1"
+    # each request's KDA state; sglang_decode_cache). Not under attention DP2
+    # (a prefix hit would have to be in the request's group).
+    DECODE_PREFIX_CACHE = (
+        os.environ.get("K3_PROGRAM_DECODE_PREFIX_CACHE", "1") == "1" and ATTENTION_DP == 1
+    )
     CONFIG["runtime_env"]["SGLANG_TPU_K3_PROGRAM_ENABLE_DECODE_PREFIX_CACHE"] = (
         "1" if DECODE_PREFIX_CACHE else "0"
     )
@@ -178,14 +186,23 @@ runtime_env.update(
         # into the tail); K3_PROGRAM_SPEC_SCHEDULE overrides it (three drafts
         # verify up to 24 requests).
         "SGLANG_TPU_K3_PROGRAM_SPEC_SCHEDULE": os.environ.get(
-            "K3_PROGRAM_SPEC_SCHEDULE", "1:1:7,2:16:3,17:64:0"
+            "K3_PROGRAM_SPEC_SCHEDULE",
+            "1:32:3,33:128:0" if ATTENTION_DP == 2 else "1:1:7,2:16:3,17:64:0",
         ),
         # Overlap scheduling on the decode (the prefill stays synchronous).
         "SGLANG_TPU_K3_PROGRAM_OPT_OVERLAP": os.environ.get("K3_PROGRAM_OVERLAP", "1"),
         # Reading the pre-shard from GCS (gcsfuse): more concurrent ranges per
         # file; K3_PROGRAM_KERNEL_EXTRA appends kernel settings (a=b;c=d).
         "SGLANG_TPU_K3_PROGRAM_KERNEL_CONFIG": ";".join(
-            filter(None, ("read_streams=16", os.environ.get("K3_PROGRAM_KERNEL_EXTRA")))
+            filter(
+                None,
+                (
+                    "read_streams=16",
+                    "attention_dp=2;dcp_group=16" if ATTENTION_DP == 2 else None,
+                    os.environ.get("K3_PROGRAM_KERNEL_EXTRA"),
+                ),
+            )
         ),
+        "SGLANG_TPU_K3_PROGRAM_ATTENTION_DP": str(ATTENTION_DP),
     }
 )
