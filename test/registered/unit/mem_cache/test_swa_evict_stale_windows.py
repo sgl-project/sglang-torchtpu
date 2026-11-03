@@ -2,16 +2,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-import importlib.util
-import os
 import random
 import unittest
 from array import array
-from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
+from swa_cache_world import cpu_ci_tree_core_selection
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
@@ -161,39 +159,6 @@ class PrefillWorld:
 def _tokens(seed: int, n: int) -> list[int]:
     rng = random.Random(seed)
     return [rng.randrange(1, 50000) for _ in range(n)]
-
-
-@contextmanager
-def _cpu_ci_tree_core_selection(rust_factory):
-    """Select the TreeCore as CPU CI does: the default backend ("rust"), the
-    prebuilt Rust extension, SGLANG_RUST_BUILD_MODE=never, Linux and a
-    supported torch, so only a fallback reason keeps a cache on the Python
-    TreeCore. No SWA option is set on entry. ``rust_factory`` stands in for the
-    extension, which this test never loads."""
-    module = tree_core_registry._RUST_TREE_CORE_MODULE
-    find_spec = importlib.util.find_spec
-
-    def bundled_find_spec(name, *args, **kwargs):
-        return object() if name == module else find_spec(name, *args, **kwargs)
-
-    with (
-        mock.patch.dict(os.environ),
-        mock.patch.object(tree_core_registry.sys, "platform", "linux"),
-        mock.patch.object(tree_core_registry.torch, "__version__", "2.14.1"),
-        mock.patch.object(
-            tree_core_registry.importlib.util, "find_spec", bundled_find_spec
-        ),
-        mock.patch.dict(tree_core_registry._TREE_CORE_REGISTRY, {"rust": rust_factory}),
-    ):
-        for flag in (
-            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND,
-            envs.SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST,
-            envs.SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS,
-            envs.SGLANG_OPT_SWA_CAP,
-        ):
-            flag.clear()
-        envs.SGLANG_RUST_BUILD_MODE.set("never")
-        yield
 
 
 class TestSWAEvictStaleWindowsFirst(unittest.TestCase):
@@ -480,7 +445,7 @@ class TestSWADemoteFinalWindows(unittest.TestCase):
         the first-visit media window survives there."""
         rust = mock.MagicMock(side_effect=AssertionError("Rust TreeCore selected"))
         with (
-            _cpu_ci_tree_core_selection(rust),
+            cpu_ci_tree_core_selection(rust),
             envs.SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS.override(True),
             self.assertLogs(tree_core_registry.logger, "INFO") as logs,
         ):
@@ -500,7 +465,7 @@ class TestSWADemoteFinalWindows(unittest.TestCase):
     def test_flag_unset_keeps_the_rust_tree_core(self):
         """With the flag unset, an SWA cache gets the Rust TreeCore, as on main."""
         rust = mock.MagicMock()
-        with _cpu_ci_tree_core_selection(rust):
+        with cpu_ci_tree_core_selection(rust):
             w = PrefillWorld(full_tokens=32768, swa_tokens=8192)
         rust.assert_called_once_with(mock.ANY, w.cache.components)
         self.assertEqual(w.cache._tree_core_backend, "rust")

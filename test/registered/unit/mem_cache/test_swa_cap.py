@@ -1,177 +1,41 @@
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
-import importlib.util
 import os
 import random
 import unittest
 from array import array
-from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
+from swa_cache_world import (
+    PAGE,
+    POISON,
+    SWA,
+    WINDOW,
+    KVWorld,
+    cpu_ci_tree_core_selection,
+    kv_value,
+)
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams, MatchPrefixParams
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
+from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache import tree_core_registry
-from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-
-# The served 2047-token window on 512-token pages, scaled 1/32: a window spans
-# four 16-token pages and reads [seqlen - 64, seqlen).
-PAGE, WINDOW = 16, 63
-SWA = ComponentType.SWA
-POISON = 30000.0  # large finite poison (a NaN would hide in comparisons)
 
 
-def _value(token: int, pos: int) -> float:
-    """The KV a cold prefill writes for ``token`` at ``pos`` (exact in BF16)."""
-    return float((token * 31 + pos * 7) % 251 + 1)
-
-
-@contextmanager
-def _cpu_ci_tree_core_selection(rust_factory):
-    """Select the TreeCore as CPU CI does: the default backend ("rust"), the
-    prebuilt Rust extension, SGLANG_RUST_BUILD_MODE=never, Linux and a
-    supported torch, so only a fallback reason keeps a cache on the Python
-    TreeCore. No SWA option is set on entry. ``rust_factory`` stands in for the
-    extension, which this test never loads."""
-    module = tree_core_registry._RUST_TREE_CORE_MODULE
-    find_spec = importlib.util.find_spec
-
-    def bundled_find_spec(name, *args, **kwargs):
-        return object() if name == module else find_spec(name, *args, **kwargs)
-
-    with (
-        mock.patch.dict(os.environ),
-        mock.patch.object(tree_core_registry.sys, "platform", "linux"),
-        mock.patch.object(tree_core_registry.torch, "__version__", "2.14.1"),
-        mock.patch.object(
-            tree_core_registry.importlib.util, "find_spec", bundled_find_spec
-        ),
-        mock.patch.dict(tree_core_registry._TREE_CORE_REGISTRY, {"rust": rust_factory}),
-    ):
-        for flag in (
-            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND,
-            envs.SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST,
-            envs.SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS,
-            envs.SGLANG_OPT_SWA_CAP,
-        ):
-            flag.clear()
-        envs.SGLANG_RUST_BUILD_MODE.set("never")
-        yield
-
-
-class DecodeWorld:
+class DecodeWorld(KVWorld):
     """A real UnifiedRadixCache driven like the scheduler drives a running
     request: admission match + lock, chunked prefill with checkpoint_kv_cache,
     then decode steps (one KV slot per token, no tree insert) with CAP's
-    cap_release, and release_kv_cache at the finish. Every slot gets the cold
-    value of its token, so a reused slot can be checked against a recompute."""
-
-    def __init__(self, *, full_tokens: int, swa_tokens: int, pin_python: bool = True):
-        set_global_server_args_for_scheduler(
-            ServerArgs(model_path="dummy", page_size=PAGE)
-        )
-        self.req_to_token_pool = ReqToTokenPool(
-            size=32, max_context_len=8192, device="cpu", enable_memory_saver=False
-        )
-        self.kv_pool = SWAKVPool(
-            size=full_tokens,
-            size_swa=swa_tokens,
-            page_size=PAGE,
-            dtype=torch.bfloat16,
-            head_num=1,
-            head_dim=8,
-            swa_attention_layer_ids=[0, 2],
-            full_attention_layer_ids=[1],
-            device="cpu",
-        )
-        self.allocator = SWATokenToKVPoolAllocator(
-            size=full_tokens,
-            size_swa=swa_tokens,
-            page_size=PAGE,
-            dtype=torch.bfloat16,
-            device="cpu",
-            kvcache=self.kv_pool,
-            need_sort=False,
-        )
-        # The helpers read tree nodes (tree_core.node_by_id), which only the
-        # Python TreeCore exposes; TPU always uses it. pin_python=False leaves
-        # the backend to the deployment's selection.
-        with (
-            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("python")
-            if pin_python
-            else nullcontext()
-        ):
-            self.cache = UnifiedRadixCache(
-                params=CacheInitParams(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.allocator,
-                    page_size=PAGE,
-                    disable=False,
-                    sliding_window_size=WINDOW,
-                    tree_components=(ComponentType.FULL, ComponentType.SWA),
-                    eviction_policy="lru",
-                )
-            )
-        self.rid = 0
-
-    # -- KV values
-    def _write(
-        self, full: torch.Tensor, tokens: list[int], positions: list[int]
-    ) -> None:
-        vals = torch.tensor(
-            [_value(t, p) for t, p in zip(tokens, positions)], dtype=torch.float32
-        ).to(torch.bfloat16)
-        swa = self.allocator.translate_loc_from_full_to_swa(full)
-        for buf in self.kv_pool.full_kv_pool.k_buffer:
-            buf[full] = vals.view(-1, 1, 1).expand(-1, buf.shape[1], buf.shape[2])
-        for buf in self.kv_pool.swa_kv_pool.k_buffer:
-            buf[swa] = vals.view(-1, 1, 1).expand(-1, buf.shape[1], buf.shape[2])
-
-    def poison_free_swa(self) -> None:
-        """Poison every free SWA slot (a released page must never be read)."""
-        a = self.allocator.swa_attn_allocator
-        pages = (
-            a.free_pages
-            if a.release_pages is None or len(a.release_pages) == 0
-            else torch.cat((a.free_pages, a.release_pages))
-        )
-        slots = (pages.view(-1, 1) * PAGE + torch.arange(PAGE).view(1, -1)).view(-1)
-        for buf in self.kv_pool.swa_kv_pool.k_buffer:
-            buf[slots] = POISON
-
-    def swa_values(self, full: torch.Tensor) -> list[float]:
-        swa = self.allocator.translate_loc_from_full_to_swa(full)
-        return self.kv_pool.swa_kv_pool.k_buffer[0][swa, 0, 0].float().tolist()
-
-    def full_values(self, full: torch.Tensor) -> list[float]:
-        return self.kv_pool.full_kv_pool.k_buffer[0][full, 0, 0].float().tolist()
-
-    def _alloc(self, tokens: list[int], start: int) -> torch.Tensor:
-        n = len(tokens)
-        aligned = (n + PAGE - 1) // PAGE * PAGE
-        self.allocator.evict_to_free_tokens(self.cache, aligned)
-        a = self.allocator
-        full = a.full_attn_allocator.alloc(aligned)
-        swa = a.swa_attn_allocator.alloc(aligned)
-        assert full is not None and swa is not None, "pool exhausted"
-        a.set_full_to_swa_mapping(full, swa)
-        self._write(full[:n], tokens, list(range(start, start + n)))
-        return full[:n]
+    cap_release, and release_kv_cache at the finish."""
 
     # -- request lifecycle
     def admit(self, tokens: list[int], chunk: int, media=None) -> Req:
@@ -211,27 +75,11 @@ class DecodeWorld:
         req.cached = cached
         return req
 
-    def _next_token(self, req: Req) -> int:
-        return 1 + (len(req.origin_input_ids) * 13 + len(req.output_ids) * 17) % 40000
-
     def decode(self, req: Req, steps: int, cap_every: int = 0) -> None:
-        """``steps`` decode steps (a new page at each page boundary, else the
-        next slot of the last page); with ``cap_every`` the scheduler's SWA work
+        """``steps`` decode steps; with ``cap_every`` the scheduler's SWA work
         runs at that interval: the out-of-window eviction, then cap_release."""
-        row = req.kv.req_pool_idx
         for _ in range(steps):
-            pos = req.seqlen - 1  # the KV of the last token
-            tok = req.output_ids[-1]
-            if pos % PAGE == 0:
-                full = self._alloc([tok], pos)
-            else:
-                prev = self.req_to_token_pool.req_to_token[row, pos - 1].to(torch.int64)
-                full = (prev + 1).view(1)
-                self._write(full, [tok], [pos])
-            self.req_to_token_pool.write((row, slice(pos, pos + 1)), full)
-            req.kv.kv_committed_len = req.kv.kv_allocated_len = pos + 1
-            req.output_ids.append(self._next_token(req))
-            req.decode_batch_idx = getattr(req, "decode_batch_idx", 0) + 1
+            self.decode_step(req)
             if cap_every and req.decode_batch_idx % cap_every == 0:
                 self.cache.evict_sliding_windows(
                     req, req.seqlen - 1, eviction_interval=1
@@ -241,16 +89,6 @@ class DecodeWorld:
     def finish(self, req: Req) -> None:
         req.finished_reason = FINISH_LENGTH(length=0)
         release_kv_cache(req, self.cache)
-
-    def evict(self, swa_tokens: int, full_tokens: int = 0) -> None:
-        self.cache.evict(EvictParams(num_tokens=full_tokens, swa_num_tokens=swa_tokens))
-
-    def match(self, tokens: list[int]):
-        return self.cache.match_prefix(
-            MatchPrefixParams(
-                key=RadixKey(array("q", tokens), None, limit=len(tokens) - 1)
-            )
-        )
 
     # -- inspection
     def locked_range(self, req: Req) -> tuple[int, int] | None:
@@ -400,7 +238,7 @@ class TestSWACap(unittest.TestCase):
         self.assertEqual(
             got,
             [
-                float(torch.tensor(_value(t, lo + i)).to(torch.bfloat16))
+                float(torch.tensor(kv_value(t, lo + i)).to(torch.bfloat16))
                 for i, t in enumerate(toks)
             ],
         )
@@ -431,7 +269,7 @@ class TestSWACap(unittest.TestCase):
                 continue
             full = m.device_indices.to(torch.int64)
             want = [
-                float(torch.tensor(_value(t, p)).to(torch.bfloat16))
+                float(torch.tensor(kv_value(t, p)).to(torch.bfloat16))
                 for p, t in enumerate(toks[:n])
             ]
             self.assertEqual(
@@ -504,6 +342,279 @@ class TestSWACap(unittest.TestCase):
         self.assertEqual(w.locked_range(req), before)
 
 
+class _Admitted(Exception):
+    """Stops a prefill pass at batch creation, after its admission loop."""
+
+
+class TestSWACapAnchorReclaim(unittest.TestCase):
+    """CAP media anchors are cache-owned locks (a FULL root path plus an SWA
+    window), so memory pressure reclaims them. The case from review, scaled: a
+    finished media request's anchor holds 59% of the FULL pool, nothing runs,
+    and an unrelated 512-token prompt (50% of the pool) waits."""
+
+    CHUNK = 64
+    BOUNDARY = 38 * PAGE  # the media end: 608 of 1024 FULL tokens
+
+    def _pressured_world(self) -> DecodeWorld:
+        with (
+            envs.SGLANG_OPT_SWA_CAP.override(True),
+            envs.SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS.override(1),
+        ):
+            w = DecodeWorld(full_tokens=1024, swa_tokens=1024)
+        r = w.admit(
+            _tokens(1, self.BOUNDARY + 2 * PAGE),
+            self.CHUNK,
+            media=(64, self.BOUNDARY),
+        )
+        w.decode(r, 70, cap_every=32)
+        w.finish(r)
+        w.evict(swa_tokens=10**6, full_tokens=10**6)  # all that is evictable
+        self.assertEqual(len(w.cache._cap_anchors), 1)
+        self.assertEqual(w.cache.full_protected_size(), self.BOUNDARY)
+        return w
+
+    def _parked_chunk_world(self) -> tuple[DecodeWorld, Req]:
+        """The parked-chunk case from review, scaled: 4 anchors hold 384 of
+        528 SWA tokens. A 320-token prompt is admitted with them present (its
+        first chunk needs 143 of the 144 SWA tokens left) and runs that chunk.
+        Then 80 remain, less than the window plus two pages a continuation
+        keeps free, so add_chunked_req parks its next chunk."""
+        with (
+            envs.SGLANG_OPT_SWA_CAP.override(True),
+            envs.SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS.override(4),
+        ):
+            w = DecodeWorld(full_tokens=8192, swa_tokens=528)
+        for i in range(4):
+            r = w.admit(_tokens(50 + i, 12 * PAGE), self.CHUNK, media=(96, 160))
+            w.finish(r)
+        w.evict(swa_tokens=10**6, full_tokens=10**6)  # all that is evictable
+        self.assertEqual(len(w.cache._cap_anchors), 4)
+        self.assertEqual(w.cache.swa_protected_size(), 384)
+        req = self._req(_tokens(4, 20 * PAGE))
+        req.init_next_round_input(tree_cache=w.cache)
+        adder = self._adder(w, rem_chunk_tokens=self.CHUNK)
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        self.assertIs(adder.new_chunked_req, req, "admitted, in chunks")
+        # Its first chunk, as DecodeWorld.admit runs one.
+        w.req_to_token_pool.alloc([req])
+        req.lock_receipt = w.cache.inc_lock_ref(req.last_node).to_dec_params()
+        w.req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, self.CHUNK)),
+            w._alloc(list(req.origin_input_ids[: self.CHUNK]), 0),
+        )
+        req.kv.kv_committed_len = req.kv.kv_allocated_len = self.CHUNK
+        checkpoint_kv_cache(req, w.cache)
+        self.assertEqual(
+            w.allocator.swa_available_size() + w.cache.swa_evictable_size(), 80
+        )
+        return w, req
+
+    @staticmethod
+    def _anchors_flag():
+        """SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS while the scheduler code runs;
+        patch.dict restores the env even when the body raises."""
+        return mock.patch.dict(os.environ, {"SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS": "1"})
+
+    def _req(self, tokens: list[int]) -> Req:
+        return Req(
+            rid=f"q{tokens[0]}",
+            origin_input_text="",
+            origin_input_ids=array("q", tokens),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=16),
+        )
+
+    def _big(self) -> Req:
+        return self._req(_tokens(2, 32 * PAGE))
+
+    def _adder(self, w: DecodeWorld, rem_chunk_tokens=None) -> PrefillAdder:
+        """A real PrefillAdder, nothing running."""
+        return PrefillAdder(
+            page_size=PAGE,
+            tree_cache=w.cache,
+            token_to_kv_pool_allocator=w.allocator,
+            running_batch=None,
+            new_token_ratio=1.0,
+            rem_input_tokens=8192,
+            rem_chunk_tokens=rem_chunk_tokens,
+        )
+
+    def _admission(self, w: DecodeWorld, req: Req) -> AddReqResult:
+        """One admission check by a real PrefillAdder, nothing running."""
+        req.init_next_round_input(tree_cache=w.cache)
+        return self._adder(w).add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+    def _prefill_pass(self, w: DecodeWorld, waiting: list[Req], chunked_req=None):
+        """One real Scheduler prefill pass (its admission loop with a real
+        PrefillAdder) over ``waiting``, nothing running. With ``chunked_req``
+        the pass first continues that request in CHUNK-token chunks."""
+        s = Scheduler.__new__(Scheduler)
+        s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
+        s.enable_priority_preemption = False
+        s.is_hybrid_swa = True
+        s.waiting_queue = list(waiting)
+        s.chunked_req = chunked_req
+        s.min_free_slots_delayer = None
+        s.get_num_allocatable_reqs = lambda *args, **kwargs: 8
+        s.policy = SimpleNamespace(
+            calc_priority=lambda *args, **kwargs: None,
+            shortest_prefill_chunk_limit=lambda *args, **kwargs: None,
+        )
+        s.processed_tokens_counter = None
+        s.chunked_prefill_size = None if chunked_req is None else self.CHUNK
+        s.dynamic_chunk_sizer = None
+        s.tp_worker = SimpleNamespace(model_runner=SimpleNamespace(attn_backend=None))
+        s._tpu_pp_chunk_cost = None
+        s.page_size = PAGE
+        s.tree_cache = w.cache
+        s.token_to_kv_pool_allocator = w.allocator
+        s.req_to_token_pool = w.req_to_token_pool
+        s.new_token_ratio_tracker = SimpleNamespace(current=1.0)
+        s.max_prefill_tokens = 8192
+        s.is_mixed_chunk = False
+        s.priority_scheduling_preemption_threshold = 0
+        s.max_prefill_bs = 0
+        s.max_running_requests = 8
+        s.dllm_config = None
+        s.enable_lora = False
+        s.disaggregation_mode = DisaggregationMode.NULL
+        s.enable_hicache_storage = False
+        s.enable_lmcache = False
+        s.enable_hierarchical_cache = False
+        s.enable_unified_cache_external_linker = False
+        s.truncation_align_size = None
+        s._dynamic_first_chunk_cap = lambda req: None
+        s.model_config = s.spec_algorithm = None
+        s.enable_overlap = False
+        return Scheduler._get_new_batch_prefill_raw(
+            s,
+            prefill_delayer_single_pass=None,
+            running_batch=ScheduleBatch(reqs=[], batch_is_full=False),
+        )
+
+    def test_release_cap_anchor_least_recently_used_first(self):
+        with (
+            envs.SGLANG_OPT_SWA_CAP.override(True),
+            envs.SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS.override(2),
+        ):
+            w = DecodeWorld(full_tokens=8192, swa_tokens=2048)
+        sys_prompt = _tokens(11, 6 * PAGE)
+        anchors = []
+        for i in range(2):
+            r = w.admit(
+                sys_prompt + _tokens(30 + i, 4 * PAGE) + _tokens(40 + i, 2 * PAGE),
+                self.CHUNK,
+                media=(96, 160),
+            )
+            anchors.append(
+                w.cache.tree_core.node_by_id(next(reversed(w.cache._cap_anchors)))
+            )
+            w.finish(r)
+        self.assertEqual(len(w.cache._cap_anchors), 2)
+        self.assertTrue(w.cache.release_cap_anchor())
+        self.assertEqual(anchors[0].component_data[SWA].lock_ref, 0)
+        self.assertGreaterEqual(anchors[1].component_data[SWA].lock_ref, 1)
+        self.assertTrue(w.cache.release_cap_anchor())
+        self.assertFalse(w.cache.release_cap_anchor(), "no anchor left")
+        self.assertEqual(w.cache.full_protected_size(), 0)
+        self.assertEqual(w.cache.swa_protected_size(), 0)
+        w.cache.sanity_check()
+
+    def test_the_anchor_alone_blocks_admission(self):
+        """Control: the anchored path is protected, so admission never counts
+        it and eviction never frees it; the prompt is refused on every check."""
+        w = self._pressured_world()
+        big = self._big()
+        for _ in range(3):
+            self.assertEqual(self._admission(w, big), AddReqResult.NO_TOKEN)
+        self.assertEqual(len(w.cache._cap_anchors), 1)
+
+    def test_blocked_prefill_pass_releases_the_anchor(self):
+        """A pass that admits nothing for lack of memory releases the anchor,
+        and the next admission check takes the prompt."""
+        w = self._pressured_world()
+        big = self._big()
+        with self._anchors_flag():
+            batch, _ = self._prefill_pass(w, [big])
+        self.assertIsNone(batch)
+        self.assertEqual(w.cache._cap_anchors, {})
+        self.assertEqual(w.cache.full_protected_size(), 0)
+        self.assertEqual(self._admission(w, big), AddReqResult.CONTINUE)
+
+    def test_flag_unset_blocked_pass_is_as_on_main(self):
+        """With SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS unset a blocked pass never
+        calls the release."""
+        w = self._pressured_world()
+        with mock.patch.object(w.cache, "release_cap_anchor") as release:
+            batch, _ = self._prefill_pass(w, [self._big()])
+        self.assertIsNone(batch)
+        release.assert_not_called()
+        self.assertEqual(len(w.cache._cap_anchors), 1)
+
+    def test_pass_that_admits_keeps_the_anchor(self):
+        """A pass that admits a request makes progress: the NO_TOKEN of the
+        prompt behind it leaves the anchor alone."""
+        w = self._pressured_world()
+        small = self._req(_tokens(3, 8 * PAGE))
+        with (
+            self._anchors_flag(),
+            mock.patch.object(ScheduleBatch, "init_new", side_effect=_Admitted),
+            self.assertRaises(_Admitted),
+        ):
+            self._prefill_pass(w, [small, self._big()])
+        self.assertEqual(len(w.cache._cap_anchors), 1)
+
+    def test_parked_chunk_pass_releases_an_anchor(self):
+        """A pass with a parked chunk and an empty waiting queue admits
+        nothing for lack of memory too: it releases one anchor, and the pass
+        after it takes the chunk. With the flag unset the pass is as on main."""
+        w, req = self._parked_chunk_world()
+        batch, _ = self._prefill_pass(w, [], chunked_req=req)
+        self.assertIsNone(batch, "the next chunk is parked")
+        self.assertEqual(len(w.cache._cap_anchors), 4, "flag unset: as on main")
+        with self._anchors_flag():
+            batch, _ = self._prefill_pass(w, [], chunked_req=req)
+        self.assertIsNone(batch)
+        self.assertEqual(len(w.cache._cap_anchors), 3, "one anchor released")
+        with (
+            self._anchors_flag(),
+            mock.patch.object(
+                ScheduleBatch, "init_new", side_effect=_Admitted
+            ) as init_new,
+            self.assertRaises(_Admitted),
+        ):
+            self._prefill_pass(w, [], chunked_req=req)
+        self.assertEqual(init_new.call_args.args[0], [req], "the chunk is taken")
+        self.assertEqual(len(w.cache._cap_anchors), 3)
+
+    def test_decode_step_that_does_not_fit_releases_the_anchor(self):
+        """ScheduleBatch.check_decode_mem releases the anchor before the retract
+        loop would take a running request; a step that fits keeps it."""
+        w = self._pressured_world()
+
+        def check(num_tokens: int) -> bool:
+            batch = SimpleNamespace(
+                new_tokens_required_next_decode=lambda selected: num_tokens,
+                reqs=[],
+                token_to_kv_pool_allocator=w.allocator,
+                tree_cache=w.cache,
+                spec_algorithm=None,
+            )
+            return ScheduleBatch.check_decode_mem(batch)
+
+        free = w.allocator.full_available_size()
+        with self._anchors_flag():
+            self.assertTrue(check(free))
+        self.assertEqual(len(w.cache._cap_anchors), 1, "a step that fits keeps it")
+        self.assertFalse(check(free + 6 * PAGE), "flag unset: as on main")
+        self.assertEqual(len(w.cache._cap_anchors), 1)
+        with self._anchors_flag():
+            self.assertTrue(check(free + 6 * PAGE))
+        self.assertEqual(w.cache._cap_anchors, {})
+        w.cache.sanity_check()
+
+
 class TestSWACapTreeCoreFallback(unittest.TestCase):
     """SGLANG_OPT_SWA_CAP is a Rust-fallback reason (tree_core_registry): with
     it set, an SWA cache gets the Python TreeCore even where CPU CI picks Rust,
@@ -515,7 +626,7 @@ class TestSWACapTreeCoreFallback(unittest.TestCase):
     def test_cap_set_selects_the_python_tree_core(self):
         rust = mock.MagicMock(side_effect=AssertionError("Rust TreeCore selected"))
         with (
-            _cpu_ci_tree_core_selection(rust),
+            cpu_ci_tree_core_selection(rust),
             envs.SGLANG_OPT_SWA_CAP.override(True),
             self.assertLogs(tree_core_registry.logger, "INFO") as logs,
         ):
@@ -540,7 +651,7 @@ class TestSWACapTreeCoreFallback(unittest.TestCase):
 
     def test_cap_unset_keeps_the_rust_tree_core(self):
         rust = mock.MagicMock()
-        with _cpu_ci_tree_core_selection(rust):
+        with cpu_ci_tree_core_selection(rust):
             w = DecodeWorld(full_tokens=8192, swa_tokens=4096, pin_python=False)
         rust.assert_called_once_with(mock.ANY, w.cache.components)
         self.assertEqual(w.cache._tree_core_backend, "rust")
@@ -642,7 +753,7 @@ class TestSWACapText(unittest.TestCase):
         if n:
             full = m.device_indices.to(torch.int64)
             want = [
-                float(torch.tensor(_value(t, p)).to(torch.bfloat16))
+                float(torch.tensor(kv_value(t, p)).to(torch.bfloat16))
                 for p, t in enumerate(prompt[:n])
             ]
             self.assertEqual(w.full_values(full), want)
@@ -688,7 +799,7 @@ class TestSWACapText(unittest.TestCase):
             self.assertEqual(
                 w.swa_values(full),
                 [
-                    float(torch.tensor(_value(t, lo + i)).to(torch.bfloat16))
+                    float(torch.tensor(kv_value(t, lo + i)).to(torch.bfloat16))
                     for i, t in enumerate(toks)
                 ],
             )

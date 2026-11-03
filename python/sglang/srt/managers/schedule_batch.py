@@ -3400,12 +3400,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if selected_indices is None
             else [self.reqs[i] for i in selected_indices]
         )
-        return self.token_to_kv_pool_allocator.check_decode_capacity(
-            num_tokens=num_tokens,
-            tree_cache=self.tree_cache,
-            requests=requests,
-            spec_algorithm=self.spec_algorithm,
-        )
+
+        def fits() -> bool:
+            return self.token_to_kv_pool_allocator.check_decode_capacity(
+                num_tokens=num_tokens,
+                tree_cache=self.tree_cache,
+                requests=requests,
+                spec_algorithm=self.spec_algorithm,
+            )
+
+        ok = fits()
+        # CAP media anchors (SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS) are cache-owned
+        # locks: release them, least recently used first, before a decode step
+        # that does not fit retracts running requests.
+        while (
+            not ok
+            and envs.SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS.get() > 0
+            and hasattr(self.tree_cache, "release_cap_anchor")
+            and self.tree_cache.release_cap_anchor()
+        ):
+            ok = fits()
+        return ok
 
     def retract_decode(
         self, *, draft_kv_pools: tuple[KVCache, ...] = ()

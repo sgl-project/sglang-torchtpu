@@ -4285,6 +4285,11 @@ class Scheduler(
                 self.page_size,
             )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+        # add_chunked_req parks a next chunk that does not fit: it returns the
+        # request without adding it to the batch.
+        memory_blocked = (
+            self.chunked_req is not None and self.chunked_req not in adder.can_run_list
+        )
 
         if self.enable_lora:
             running_loras = {
@@ -4392,6 +4397,7 @@ class Scheduler(
                         )
                     else:
                         running_batch.batch_is_full = True
+                    memory_blocked = True
                 # revert matched mamba idx to avoid memory leak, if req is not added.
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
@@ -4415,6 +4421,16 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            # CAP media anchors (SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS) are
+            # cache-owned locks: a pass that admits nothing for lack of memory
+            # (a NO_TOKEN, or a parked chunk) releases the least recently used
+            # one, so the next pass can evict it.
+            if (
+                memory_blocked
+                and envs.SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS.get() > 0
+                and hasattr(self.tree_cache, "release_cap_anchor")
+            ):
+                self.tree_cache.release_cap_anchor()
             return None, running_batch
 
         can_run_set = set(can_run_list)

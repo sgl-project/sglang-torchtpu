@@ -1065,8 +1065,20 @@ class UnifiedRadixCache(BasePrefixCache):
             node.id
         ).to_dec_params()
         while len(self._cap_anchors) > swa.cap_media_anchors:
-            old_id = next(iter(self._cap_anchors))
-            self.tree_core.dec_lock_ref(old_id, self._cap_anchors.pop(old_id))
+            self.release_cap_anchor()
+
+    def release_cap_anchor(self) -> bool:
+        """Release the least recently used CAP media anchor; False if the cache
+        holds none. Anchors are cache-owned locks, so memory pressure reclaims
+        them: a prefill pass that admits nothing for lack of memory (a NO_TOKEN,
+        or a parked chunk) releases one, and a decode step that does not fit
+        releases them before the retract loop takes running requests
+        (ScheduleBatch.check_decode_mem)."""
+        if not self._cap_anchors:
+            return False
+        old_id = next(iter(self._cap_anchors))
+        self.tree_core.dec_lock_ref(old_id, self._cap_anchors.pop(old_id))
+        return True
 
     def dec_swa_lock_only(
         self,

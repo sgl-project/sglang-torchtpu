@@ -9,32 +9,16 @@ from array import array
 from unittest import mock
 
 import torch
+from swa_cache_world import PAGE, POISON, SWA, WINDOW, KVWorld, kv_value
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams, MatchPrefixParams
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 # The served shape scaled 1/32: 512-token pages -> 16, the 2047-token window
 # (global_attn_cfg 2048 - 1) -> 63, 2048-token chunks -> 64, 4096 -> 128.
-PAGE, WINDOW = 16, 63
 WIN_CHUNK, BIG_CHUNK = 64, 128
-SWA = ComponentType.SWA
-POISON = 30000.0  # large finite poison (a NaN would hide in comparisons)
-
-
-def _value(token: int, pos: int) -> float:
-    """The KV a cold prefill writes for ``token`` at ``pos`` (exact in BF16)."""
-    return float((token * 31 + pos * 7) % 251 + 1)
 
 
 def _bf16(x: float) -> float:
@@ -46,102 +30,21 @@ def _tokens(seed: int, n: int) -> list[int]:
     return [rng.randrange(1, 50000) for _ in range(n)]
 
 
-class PrefillWorld:
+class PrefillWorld(KVWorld):
     """A real UnifiedRadixCache driven like the scheduler drives a request:
     admission match + lock, chunked prefill with checkpoint_kv_cache after
     every chunk, decode steps (one KV slot per token), release_kv_cache at the
     finish. Every slot gets the cold value of its token."""
 
     def __init__(self, *, keep: bool, full_tokens=8192, swa_tokens=4096):
-        set_global_server_args_for_scheduler(
-            ServerArgs(model_path="dummy", page_size=PAGE)
-        )
+        super().__init__(full_tokens=full_tokens, swa_tokens=swa_tokens)
         self.keep = keep
-        self.req_to_token_pool = ReqToTokenPool(
-            size=32, max_context_len=8192, device="cpu", enable_memory_saver=False
-        )
-        self.kv_pool = SWAKVPool(
-            size=full_tokens,
-            size_swa=swa_tokens,
-            page_size=PAGE,
-            dtype=torch.bfloat16,
-            head_num=1,
-            head_dim=8,
-            swa_attention_layer_ids=[0, 2],
-            full_attention_layer_ids=[1],
-            device="cpu",
-        )
-        self.allocator = SWATokenToKVPoolAllocator(
-            size=full_tokens,
-            size_swa=swa_tokens,
-            page_size=PAGE,
-            dtype=torch.bfloat16,
-            device="cpu",
-            kvcache=self.kv_pool,
-            need_sort=False,
-        )
-        # The helpers read tree nodes (tree_core.node_by_id), which only the
-        # Python TreeCore exposes; TPU always uses it.
-        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("python"):
-            self.cache = UnifiedRadixCache(
-                params=CacheInitParams(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.allocator,
-                    page_size=PAGE,
-                    disable=False,
-                    sliding_window_size=WINDOW,
-                    tree_components=(ComponentType.FULL, ComponentType.SWA),
-                    eviction_policy="lru",
-                )
-            )
-        self.rid = 0
 
     def _env(self):
         # patch.dict restores the env even when the body raises
         return mock.patch.dict(
             os.environ, {"SGLANG_OPT_SWA_KEEP_PREFILL_CHUNK_WINDOWS": str(self.keep)}
         )
-
-    # -- KV values
-    def _write(self, full: torch.Tensor, tokens: list[int], start: int) -> None:
-        vals = torch.tensor(
-            [_value(t, start + i) for i, t in enumerate(tokens)], dtype=torch.float32
-        ).to(torch.bfloat16)
-        swa = self.allocator.translate_loc_from_full_to_swa(full)
-        for buf in self.kv_pool.full_kv_pool.k_buffer:
-            buf[full] = vals.view(-1, 1, 1).expand(-1, buf.shape[1], buf.shape[2])
-        for buf in self.kv_pool.swa_kv_pool.k_buffer:
-            buf[swa] = vals.view(-1, 1, 1).expand(-1, buf.shape[1], buf.shape[2])
-
-    def poison_free_swa(self) -> None:
-        a = self.allocator.swa_attn_allocator
-        pages = (
-            a.free_pages
-            if a.release_pages is None or len(a.release_pages) == 0
-            else torch.cat((a.free_pages, a.release_pages))
-        )
-        slots = (pages.view(-1, 1) * PAGE + torch.arange(PAGE).view(1, -1)).view(-1)
-        for buf in self.kv_pool.swa_kv_pool.k_buffer:
-            buf[slots] = POISON
-
-    def swa_values(self, full: torch.Tensor) -> list[float]:
-        swa = self.allocator.translate_loc_from_full_to_swa(full)
-        return self.kv_pool.swa_kv_pool.k_buffer[0][swa, 0, 0].float().tolist()
-
-    def full_values(self, full: torch.Tensor) -> list[float]:
-        return self.kv_pool.full_kv_pool.k_buffer[0][full, 0, 0].float().tolist()
-
-    def _alloc(self, tokens: list[int], start: int) -> torch.Tensor:
-        n = len(tokens)
-        aligned = (n + PAGE - 1) // PAGE * PAGE
-        self.allocator.evict_to_free_tokens(self.cache, aligned)
-        a = self.allocator
-        full = a.full_attn_allocator.alloc(aligned)
-        swa = a.swa_attn_allocator.alloc(aligned)
-        assert full is not None and swa is not None, "pool exhausted"
-        a.set_full_to_swa_mapping(full, swa)
-        self._write(full[:n], tokens, start)
-        return full[:n]
 
     # -- request lifecycle
     def admit(self, tokens: list[int], chunk: int, outputs=()) -> Req:
@@ -187,31 +90,14 @@ class PrefillWorld:
             req.chunk_ends.append(pos)
             return req
 
-    def _next_token(self, req: Req) -> int:
-        return 1 + (len(req.origin_input_ids) * 13 + len(req.output_ids) * 17) % 40000
-
     def decode(self, req: Req, steps: int, evict_every: int = 0) -> list[int]:
         """``steps`` decode steps; with ``evict_every`` the scheduler's decode
         out-of-window eviction runs at that interval. Returns the request's SWA
         eviction cursor after every step."""
         cursors = []
-        row = req.kv.req_pool_idx
         with self._env():
             for _ in range(steps):
-                pos = req.seqlen - 1
-                tok = req.output_ids[-1]
-                if pos % PAGE == 0:
-                    full = self._alloc([tok], pos)
-                else:
-                    prev = self.req_to_token_pool.req_to_token[row, pos - 1].to(
-                        torch.int64
-                    )
-                    full = (prev + 1).view(1)
-                    self._write(full, [tok], pos)
-                self.req_to_token_pool.write((row, slice(pos, pos + 1)), full)
-                req.kv.kv_committed_len = req.kv.kv_allocated_len = pos + 1
-                req.output_ids.append(self._next_token(req))
-                req.decode_batch_idx = getattr(req, "decode_batch_idx", 0) + 1
+                self.decode_step(req)
                 if evict_every and req.decode_batch_idx % evict_every == 0:
                     self.cache.evict_sliding_windows(
                         req, req.seqlen - 1, eviction_interval=1
@@ -223,16 +109,6 @@ class PrefillWorld:
         with self._env():
             req.finished_reason = FINISH_LENGTH(length=0)
             release_kv_cache(req, self.cache)
-
-    def evict(self, swa_tokens: int, full_tokens: int = 0) -> None:
-        self.cache.evict(EvictParams(num_tokens=full_tokens, swa_num_tokens=swa_tokens))
-
-    def match(self, tokens: list[int]):
-        return self.cache.match_prefix(
-            MatchPrefixParams(
-                key=RadixKey(array("q", tokens), None, limit=len(tokens) - 1)
-            )
-        )
 
     def match_profile(self, tokens: list[int], seed: int) -> list[int]:
         """Matched length of ``tokens[:k]`` + a fresh page, for every k."""
@@ -450,7 +326,7 @@ class TestKeepPrefillChunkWindows(unittest.TestCase):
         for o in others:
             w.finish(o)
         w.poison_free_swa()
-        want = [_bf16(_value(t, p)) for p, t in enumerate(base)]
+        want = [_bf16(kv_value(t, p)) for p, t in enumerate(base)]
         for k in (64, 80, 96, 112, 192, 208, 224, 240):
             m = w.match(base[:k] + _tokens(60 + k, PAGE))
             n = len(m.device_indices)
