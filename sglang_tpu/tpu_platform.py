@@ -464,7 +464,9 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
     their next iteration. The scheduler must therefore receive and forward
     the last stage's outputs before it launches a forward, not after: that is
     the async-batch-depth 1 order (depth 0 does the ring exchange after the
-    forward and the two waits form a cycle). A stage of several devices runs
+    forward and the two waits form a cycle). The buffered hand-off
+    (SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF) pairs no launches and takes any
+    depth of at least 1, defaulting to 1 as well. A stage of several devices runs
     its own collectives over the stage's devices (this needs a torch_tpu that
     compiles a collective for its device group only), while the hand-off
     stays the one collective every stage launches.
@@ -476,12 +478,29 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
 
     cfg = resolving_view(server_args)
     pp = cfg.pp_size
-    if cfg.pp_async_batch_depth > 1:
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if pp > 1 and tpu_envs.SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF.get():
+        # The buffered hand-off pairs no launches, so any depth of at least 1
+        # works; it runs at depth 1 like the wave unless asked. Deeper
+        # scheduler loops (vllm-torchtpu #2527 keeps stages // 2 extra steps)
+        # measured 2-6% slower on GPT-OSS-120B PP8 prefill.
+        if cfg.pp_async_batch_depth < 1:
+            logger.info(
+                "Pipeline parallelism on TPU with the buffered hand-off runs "
+                "with --pp-async-batch-depth 1 (got %d); set it higher to keep "
+                "more micro-batches in flight.",
+                cfg.pp_async_batch_depth,
+            )
+            declare_resolution(
+                server_args, "tpu.apply_server_args_defaults", pp_async_batch_depth=1
+            )
+    elif cfg.pp_async_batch_depth > 1:
         raise NotImplementedError(
             "Pipeline parallelism on TPU requires --pp-async-batch-depth 1 "
             "so output delivery and activation hand-offs keep the same pace."
         )
-    if cfg.pp_async_batch_depth < 1:
+    elif cfg.pp_async_batch_depth < 1:
         logger.info(
             "Pipeline parallelism on TPU runs with --pp-async-batch-depth 1 "
             "(got %d): the ICI hand-off needs the last stage's outputs "

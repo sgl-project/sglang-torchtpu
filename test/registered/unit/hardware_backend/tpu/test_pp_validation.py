@@ -139,6 +139,31 @@ class TestPipelineParallelValidation(CustomTestCase):
         _apply(args)
         self.assertEqual(args.pp_async_batch_depth, 0)
 
+    def test_buffered_handoff_defaults_to_async_batch_depth_one(self):
+        """The buffered hand-off runs at depth 1 like the wave unless asked;
+        deeper loops measured slower on GPT-OSS-120B PP8 prefill."""
+        with envs.SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF.override(True):
+            for pp in (8, 4, 2):
+                with self.subTest(pp=pp):
+                    args = _args(pp_size=pp, tp_size=1, enable_torch_compile=True)
+                    _apply(args)
+                    self.assertEqual(resolution_result(args, "pp_async_batch_depth"), 1)
+
+    def test_buffered_keeps_an_explicit_async_batch_depth(self):
+        with envs.SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF.override(True):
+            for depth in (1, 2, 6):
+                with self.subTest(depth=depth):
+                    args = _args(
+                        pp_size=8,
+                        tp_size=1,
+                        enable_torch_compile=True,
+                        pp_async_batch_depth=depth,
+                    )
+                    _apply(args)
+                    self.assertEqual(
+                        resolution_result(args, "pp_async_batch_depth"), depth
+                    )
+
     def test_pipeline_validation_honors_prior_resolution(self):
         args = _args(enable_torch_compile=True)
         declare_resolution(args, "test.pipeline", pp_size=8)
