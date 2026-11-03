@@ -70,6 +70,35 @@ GOLDEN_AL = {
 }
 
 
+# --mk-prefill: extend steps run the megakernel's prefill program (PR #1909), with
+# the decode Waves 1-4, expert grouping and the fused-RS/RPA settings it was measured on.
+MK_PREFILL_ENV = {
+    "SGLANG_TPU_MUSE_MK_EXPERT_GROUP": "15",
+    "SGLANG_TPU_MUSE_MK_OPT": "1",
+    "SGLANG_TPU_MUSE_MK_KPERM": "1",
+    "SGLANG_TPU_MK_SAL_FP8_DOT": "2",
+    "SGLANG_TPU_MUSE_MK_PREFILL": "1",
+    "SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER": "1",
+    "MUSE_PF_STAGE_GAP": "1",
+    "MUSE_PF_2D_RS": "1",
+    "MUSE_PF_2D_AG": "1",
+    "MUSE_FUSED_RS_FAST_ISSUE": "1",
+    "MUSE_FUSED_RS_FWD_PSUM": "1",
+    "MUSE_FUSED_RS_DIRECT_STAGE": "2",
+    "MUSE_PF_FUSED_SCATTER_COMBINE": "1",
+    "MUSE_PF_MOE_KPERM": "1",
+    "SGLANG_TPU_FUSED_RS_WEIGHT_PINGPONG": "1",
+    "SGLANG_TPU_FP4_DEQUANT_VIA_FP8": "0",
+    "SGLANG_TPU_RPA_NO_MAX": "1",
+    "SGLANG_TPU_RPA_TRANSPOSED": "1",
+    "SGLANG_TPU_RPA_TRANSPOSED_KEY_CHUNK": "1536",
+    "SGLANG_TPU_FORCE_RPA_PREFILL_BQ": "1024",
+    "SGLANG_TPU_FORCE_RPA_PREFILL_BKV": "1536",
+    "MUSE_RPA_SWA_BQ": "1024",
+    "MUSE_RPA_SWA_BKV": "512",
+}
+
+
 def compile_bs(running, verify, adaptive):
     """Batch buckets: 1, the request cap, and every count whose verify step fills
     the megakernel's 8-row tiles exactly (above 8 requests only multiples of 4);
@@ -93,7 +122,9 @@ def megakernel_rows(running, verify, adaptive):
     return -(-rows // 8) * 8
 
 
-def config_for(conc, *, draft_model_path=None, simulate_acceptance=True):
+def config_for(
+    conc, *, draft_model_path=None, simulate_acceptance=True, mk_prefill=False
+):
     """The server config for one AgentX concurrency.
 
     simulate_acceptance=False verifies for real (evals); throughput runs commit
@@ -263,6 +294,8 @@ def config_for(conc, *, draft_model_path=None, simulate_acceptance=True):
                 "SGLANG_SIMULATE_ACC_TOKEN_MODE": "real-draft-token",
             }
         )
+    if mk_prefill:
+        env.update(MK_PREFILL_ENV)
     return config
 
 
@@ -275,11 +308,17 @@ def main(argv=None):
     parser.add_argument(
         "--eval", action="store_true", help="verify for real (no simulated acceptance)"
     )
+    parser.add_argument(
+        "--mk-prefill",
+        action="store_true",
+        help="megakernel prefill program and its settings (MK_PREFILL_ENV)",
+    )
     args = parser.parse_args(argv)
     config = config_for(
         args.conc,
         draft_model_path=args.draft_model_path,
         simulate_acceptance=not args.eval,
+        mk_prefill=args.mk_prefill,
     )
     print(json.dumps(config, indent=2))
 
