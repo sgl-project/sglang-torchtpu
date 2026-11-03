@@ -47,13 +47,14 @@ from sglang_tpu.attention.pallas.rpa_rel_bias import (
 from sglang_tpu.attention.pallas.util import (
     align_to,
     cdiv,
-    get_dtype_bitwidth,
     get_dtype_packing,
     get_tpu_version,
     next_power_of_2,
 )
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
+# The softmax runs in base 2: logits, rel bias, m and sinks are scaled by log2(e).
+LOG2E = 1.4426950408889634
 DEFAULT_VMEM_LIMIT_BYTES = 120 * 1024 * 1024  # 120MB
 logger = logging.getLogger(__name__)
 
@@ -269,7 +270,6 @@ def get_vmem_estimate_bytes(
 ):
     q_packing = get_dtype_packing(q_dtype)
     kv_packing = get_dtype_packing(kv_dtype)
-    out_bits = get_dtype_bitwidth(q_dtype) if q_dtype != jnp.float32 else 32
     num_q_heads_per_kv_head = align_to(actual_num_q_heads_per_kv_head, q_packing)
     bkv_stride = cdiv(actual_num_kv_heads * 2, kv_packing)
     if has_bank_conflicts(bkv_stride):
@@ -285,11 +285,11 @@ def get_vmem_estimate_bytes(
         * (2 * actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * head_dim)
         * (32 // q_packing)
         +
-        # l_ref + m_ref (out_dtype, not float32)
-        2 * (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * 128) * out_bits
+        # l_ref + m_ref (f32)
+        2 * (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * 128) * 32
         +
-        # acc_ref (out_dtype)
-        (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * head_dim) * out_bits
+        # acc_ref (f32)
+        (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * head_dim) * 32
     )
 
     if use_custom_mask:
@@ -399,6 +399,8 @@ def _ragged_paged_attention_kernel_loop(
     bkv_csz,  # bkv compute size
     case: RpaCase = RpaCase.MIXED,
     skip_kv_mask: bool = False,
+    pad_lane_rowsum: bool = False,
+    sliding_window_chunk_skip: bool = True,
     rel_extent: int | None = None,
     rel_window: int | None = None,
     token_sink: bool = False,
@@ -425,6 +427,9 @@ def _ragged_paged_attention_kernel_loop(
         q_packing,
         _,
     ) = q_hbm_ref.shape
+    # With pad_lane_rowsum, V's last (padding) lane holds ones, so P @ V also
+    # sums P and the running sum l lives in that lane of acc (scaled by v_scale).
+    rowsum_lane = head_dim - 1 if pad_lane_rowsum else None
     (
         total_num_pages,
         page_size,
@@ -484,6 +489,7 @@ def _ragged_paged_attention_kernel_loop(
         effective_kv_len,
         xai_temperature_reg=None,
         custom_mask_data=None,
+        apply_masks=True,
         rel_r=None,  # [actual_bq_csz * num_q_heads_per_kv_head, REL_LANES]
     ):
         assert len(q.shape) == 2
@@ -513,6 +519,10 @@ def _ragged_paged_attention_kernel_loop(
             s_scale *= k_scale
         if q_scale is not None:
             s_scale *= q_scale
+        # exp(x) lowers to exp2(x * log2e); folding log2e into the score scale
+        # saves that multiply on every score. The rel bias table is pre-scaled to match.
+        if soft_cap is None:
+            s_scale *= LOG2E
 
         s *= s_scale
 
@@ -536,7 +546,7 @@ def _ragged_paged_attention_kernel_loop(
             )
 
         if soft_cap is not None:
-            s = soft_cap * jnp.tanh(s / soft_cap)
+            s = (soft_cap * LOG2E) * jnp.tanh(s / soft_cap)
 
         # Do not use int16 here unless every intermediate is proven to fit:
         # positions overflow at context lengths >= 32,768, and
@@ -552,7 +562,7 @@ def _ragged_paged_attention_kernel_loop(
         v_span = processed_kv_len_int + lax.broadcasted_iota(int_ty, v.shape, 0)
 
         mask = None
-        if use_causal_mask:
+        if use_causal_mask and apply_masks:
             assert not skip_kv_mask
             mask = mask_and(mask, q_span >= k_span)
         elif custom_mask_data is not None:
@@ -562,11 +572,11 @@ def _ragged_paged_attention_kernel_loop(
             )
             mask = mask_and(mask, custom_mask_expanded == 1)
 
-        if not skip_kv_mask:
+        if not skip_kv_mask and apply_masks:
             mask = mask_and(mask, k_span < effective_kv_len_int)
             v = jnp.where(v_span < effective_kv_len_int, v, 0.0)
 
-        if sliding_window is not None:
+        if sliding_window is not None and apply_masks:
             mask = mask_and(mask, q_span < k_span + sliding_window)
 
         if mask is not None:
@@ -576,12 +586,13 @@ def _ragged_paged_attention_kernel_loop(
         m_prev = m_ref[...].astype(jnp.float32)
         m_curr = jnp.maximum(m_prev, s_rowmax)
         m_ref[...] = m_curr.astype(out_dtype)
-        p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
+        p = jnp.exp2(s - broadcast_minor(m_curr, s.shape))
 
-        p_rowsum = jnp.sum(p, axis=1, keepdims=True)
-        exp_m_diff = jnp.exp(m_prev - m_curr)
-        l_prev = l_ref[...].astype(jnp.float32)
-        l_ref[...] = (exp_m_diff * l_prev + p_rowsum).astype(out_dtype)
+        exp_m_diff = jnp.exp2(m_prev - m_curr)
+        if rowsum_lane is None:
+            p_rowsum = jnp.sum(p, axis=1, keepdims=True)
+            l_prev = l_ref[...].astype(jnp.float32)
+            l_ref[...] = (exp_m_diff * l_prev + p_rowsum).astype(out_dtype)
 
         return p, v, exp_m_diff
 
@@ -974,6 +985,12 @@ def _ragged_paged_attention_kernel_loop(
                 # (pretend we've already seen a virtual token with logit = sink_value).
                 m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
                 l_ref[...] = jnp.full_like(l_ref, 1.0)
+                if rowsum_lane is not None:
+                    lane = lax.broadcasted_iota(jnp.int32, acc_ref.shape, 2)
+                    l_init = 1.0 if v_scale is None else v_scale
+                    acc_ref[...] = jnp.where(lane == rowsum_lane, l_init, 0.0).astype(
+                        acc_ref.dtype
+                    )
                 for kv_head_idx in range(actual_num_kv_heads):
                     sinks = attention_sink_ref[
                         kv_head_idx
@@ -982,12 +999,18 @@ def _ragged_paged_attention_kernel_loop(
                     lm_size = actual_bq_sz * num_q_heads_per_kv_head
                     sink_tiled = jnp.tile(sinks, (actual_bq_sz, 1))
                     m_ref.at[kv_head_idx, pl.ds(lm_start, lm_size)][...] = (
-                        sink_tiled.astype(out_dtype)
-                    )
+                        sink_tiled * LOG2E
+                    ).astype(out_dtype)
             elif token_sink:
                 # m is seeded from the query lanes once this bq has arrived.
                 m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
                 l_ref[...] = jnp.full_like(l_ref, 1.0)
+                if rowsum_lane is not None:
+                    lane = lax.broadcasted_iota(jnp.int32, acc_ref.shape, 2)
+                    l_init = 1.0 if v_scale is None else v_scale
+                    acc_ref[...] = jnp.where(lane == rowsum_lane, l_init, 0.0).astype(
+                        acc_ref.dtype
+                    )
             else:
                 l_ref[...] = jnp.full_like(l_ref, 0.0)
                 m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
@@ -1072,8 +1095,8 @@ def _ragged_paged_attention_kernel_loop(
                         for kv_head_idx in range(actual_num_kv_heads):
                             rows = load_bq(bq_sem_idx, kv_head_idx, 0, actual_bq_sz)
                             m_ref.at[kv_head_idx, pl.ds(0, lm_size)][...] = (
-                                token_sink_rows(rows[:, head_dim:]).astype(out_dtype)
-                            )
+                                token_sink_rows(rows[:, head_dim:]) * LOG2E
+                            ).astype(out_dtype)
 
                 # Wait for cur bkv
                 offset, update_sz = wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
@@ -1120,9 +1143,19 @@ def _ragged_paged_attention_kernel_loop(
                 @pl.loop(0, max_num_loops, unroll=False)
                 def attention_loop(idx):
                     bkv_start = idx * bkv_csz
+                    chunk_has_keys = bkv_start < effective_bkv_sz
+                    if sliding_window is not None and sliding_window_chunk_skip:
+                        # A kept KV block is computed from its first key; a compute
+                        # chunk that ends before the window of this query block's
+                        # first row is masked for every row (key k is visible from
+                        # query q iff q < k + window), so it cannot change the output.
+                        window_start = processed_q_len - sliding_window + 1
+                        chunk_end = processed_kv_len + bkv_start + bkv_csz
+                        chunk_has_keys = jnp.logical_and(
+                            chunk_has_keys, chunk_end > window_start
+                        )
 
-                    @pl.when(bkv_start < effective_bkv_sz)
-                    def _():
+                    def compute_sub_blocks(apply_masks):
                         for bq_start in range(0, actual_bq_sz, actual_bq_csz):
                             # Slice custom mask for this compute sub-block
                             cur_mask_data = None
@@ -1191,6 +1224,7 @@ def _ragged_paged_attention_kernel_loop(
                                                 effective_kv_len=effective_kv_len,
                                                 xai_temperature_reg=cur_xai_temp,
                                                 custom_mask_data=sub_mask_data,
+                                                apply_masks=apply_masks,
                                                 rel_r=rel_r_c,
                                             )
                                         )
@@ -1224,14 +1258,45 @@ def _ragged_paged_attention_kernel_loop(
                                 def _():
                                     compute_tile(with_rel_bias=False)
 
+                    in_range = chunk_has_keys
+                    if not use_causal_mask:
+                        pl.when(in_range)(lambda: compute_sub_blocks(True))
+                        return
+                    # Most prefill blocks are fully visible to every query in the
+                    # bq block and skip the ~3 mask ops per score. Branch here,
+                    # not between QK and softmax: a branch there splits the LLO
+                    # basic block and serializes the two q sub-blocks.
+                    kv_first = processed_kv_len + bkv_start
+                    kv_last = kv_first + (bkv_csz - 1)
+                    fully_visible = jnp.logical_and(
+                        kv_last <= processed_q_len, kv_last < effective_kv_len
+                    )
+                    if sliding_window is not None:
+                        q_last = processed_q_len + (actual_bq_sz - 1)
+                        fully_visible = jnp.logical_and(
+                            fully_visible, q_last < kv_first + sliding_window
+                        )
+                    pl.when(jnp.logical_and(in_range, fully_visible))(
+                        lambda: compute_sub_blocks(False)
+                    )
+                    pl.when(jnp.logical_and(in_range, jnp.logical_not(fully_visible)))(
+                        lambda: compute_sub_blocks(True)
+                    )
+
             # Load acc and calculate final output.
             acc = acc_ref[...]
-            l = broadcast_minor(l_ref[...], acc.shape)  # noqa
+            if rowsum_lane is None:
+                l = broadcast_minor(l_ref[...], acc.shape)  # noqa
+            else:
+                l_lane = acc[..., rowsum_lane : rowsum_lane + 1]
+                if v_scale is not None:
+                    l_lane = l_lane / v_scale
+                l = jnp.broadcast_to(l_lane, acc.shape)  # noqa
             out = (
                 acc * pl.reciprocal(l, approx=True)
-                if (l.dtype == jnp.float32 and out_dtype != jnp.float32)
+                if (l.dtype == jnp.float32 and o_hbm_ref.dtype != jnp.float32)
                 else lax.div(acc, l)
-            ).astype(out_dtype)
+            ).astype(o_hbm_ref.dtype)
 
             # Wait for previous bo to be fully sent before storing new bo.
             bo_sem_idx = sem_ids_ref[2]
@@ -1737,7 +1802,14 @@ def get_default_block_sizes(
             else:
                 bq_sz = min(2048 // num_q_heads_per_kv_head, max_q // 2)
                 bkv_sz = min(2048, max_kv // 2)
-                bq_csz = min(1024 // num_q_heads_per_kv_head, max_q // 2)
+                # ~1024 real score rows per compute tile. A non-power-of-2 group (6 q heads
+                # per KV head) rounds the tile up: (256, 2048, 256, 512) took 8.4 ms vs
+                # 10.0 at bq_csz 128 for an 8192-token chunk at kv 98k (tpu7x, rel bias).
+                bq_csz = min(
+                    next_power_of_2(cdiv(1024, actual_num_q_heads_per_kv_head)),
+                    bq_sz,
+                    max_q // 2,
+                )
                 bkv_csz = (
                     min(512, align_to(max_kv // 2, page_size))
                     if max_kv > 1
@@ -1751,6 +1823,20 @@ def get_default_block_sizes(
     bkv_sz = align_to(bkv_sz, bkv_alignment)
     bq_csz = max(1, bq_csz)
     bkv_csz = align_to(bkv_csz, bkv_alignment)
+
+    # A window shorter than a KV compute chunk: one query compute chunk needs
+    # only bq_csz + sliding_window - 1 keys, so use one query chunk per query
+    # block, a window-sized KV compute chunk (the skip granularity) and the
+    # default KV compute chunk as the KV block. Measured on tpu7x for gpt-oss
+    # (window 128): 1.18-1.36x faster than the full-attention blocks.
+    if (
+        case != RpaCase.DECODE
+        and sliding_window is not None
+        and bq_csz + sliding_window - 1 <= bkv_csz
+    ):
+        bq_sz = bq_csz
+        bkv_sz = min(bkv_sz, bkv_csz)
+        bkv_csz = min(align_to(next_power_of_2(sliding_window), bkv_alignment), bkv_sz)
 
     # Reduce block sizes if VMEM estimate exceeds limit.
     # Use a fraction of vmem_limit as margin for shapes the estimate has not
@@ -1851,8 +1937,10 @@ def get_vmem_limit():
         "vmem_limit_bytes",
         "out_dtype",
         "skip_kv_mask",
+        "pad_lane_rowsum",
         "disable_semaphore_checks",
         "debug_mode",
+        "_sliding_window_chunk_skip",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache_fused"),
 )
@@ -1889,8 +1977,12 @@ def ragged_paged_attention(
     vmem_limit_bytes: int | None = None,
     out_dtype=None,
     skip_kv_mask: bool = False,
+    pad_lane_rowsum: bool = False,
     disable_semaphore_checks: bool = True,
     debug_mode: bool = False,
+    # Private: False restores computing KV chunks left of the sliding window.
+    # The output is identical; it exists so benchmarks and tests can A/B the skip.
+    _sliding_window_chunk_skip: bool = True,
 ):
     """Ragged paged attention with fused KV cache.
 
@@ -1912,6 +2004,9 @@ def ragged_paged_attention(
         ``[0, extent)`` adds ``rel_r[i, h] . rel_proj[:, d]`` to the score.
       token_sink: per-token, per-head sink logits; exclusive with
         ``attention_sink``.
+      pad_lane_rowsum: compute the softmax row sum on the MXU through a ones
+        column in V's last padding lane. No-op when head_dim is already a
+        multiple of 128.
       causal: 1 for causal mask. 0 for non-causal: apply ``custom_mask`` when
         given, else attend bidirectionally (every query sees all ``kv_lens``
         keys, still subject to ``sliding_window``).
@@ -2003,8 +2098,10 @@ def ragged_paged_attention(
     num_page_indices = page_indices.shape[0]
     pages_per_seq = num_page_indices // max_num_seqs
     num_q_heads_per_kv_head = num_q_heads_per_kv_head_per_q_packing * q_packing
+    # Dtype of the m / l / acc scratch, not of the output (which follows q).
+    # bf16 accumulators lose ~2^-9 per KV block and the error grows with context.
     if out_dtype is None:
-        out_dtype = jnp.float32 if q.dtype == jnp.float32 else jnp.bfloat16
+        out_dtype = jnp.float32
 
     # Prepare custom mask.
     if custom_mask is not None:
@@ -2076,7 +2173,12 @@ def ragged_paged_attention(
             rel_window = rel_window_width(
                 bkv_csz=rel_sub_tile(bkv_csz), bq_csz=bq_csz
             )
-            rel_table = build_rel_window_table(rel_proj, window=rel_window)
+            # The bias is added to the base-2 logits, so it carries the same
+            # log2(e) as s_scale; under soft_cap it is scaled after tanh instead.
+            rel_table = build_rel_window_table(
+                rel_proj if soft_cap is not None else rel_proj.astype(jnp.float32) * LOG2E,
+                window=rel_window,
+            )
 
         out_specs = [
             pl.BlockSpec(memory_space=pltpu.HBM),
@@ -2173,6 +2275,8 @@ def ragged_paged_attention(
         )
         if sliding_window is not None:
             scope_name += f"-sw_{sliding_window}"
+            if not _sliding_window_chunk_skip:
+                scope_name += "-noskip"
 
         kernel = pl.pallas_call(
             functools.partial(
@@ -2193,6 +2297,8 @@ def ragged_paged_attention(
                 bkv_csz=bkv_csz,
                 case=case,
                 skip_kv_mask=skip_kv_mask,
+                pad_lane_rowsum=pad_lane_rowsum and actual_head_dim < head_dim,
+                sliding_window_chunk_skip=_sliding_window_chunk_skip,
                 rel_extent=rel_extent,
                 rel_window=rel_window,
                 token_sink=token_sink is not None,
