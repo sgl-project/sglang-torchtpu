@@ -214,6 +214,25 @@ _H4608_I2304_FP4_EP8_SITU = (128, 4608, 2560, 2560, 4608, 1, 1)
 _H4608_I2304_FP4_EP8_SITU_LARGE_M = (256, 4608, 2560, 2560, 4608, 1, 1)
 
 
+# Same layers' channelwise-FP8 experts (Inkling2's MXFP8 layers, block = all of K): K1=4608,
+# N1=4608, K2=2304, N2=4608. Eager sweep as above: M=65536 4.07 ms on the default
+# (64, 4608, 1024, 2304, 1536, 2, 2), 2.93 at (128, 4608, 2304, 2304, 4608, 1, 1), 2.51 at
+# tile_m 256; M=8192 1.27 / 1.23 / 1.55. Smaller M was not measured and keeps the default.
+_H4608_I2304_FP8_CH_EP8_SITU_MID_M = (128, 4608, 2304, 2304, 4608, 1, 1)
+_H4608_I2304_FP8_CH_EP8_SITU_LARGE_M = (256, 4608, 2304, 2304, 4608, 1, 1)
+
+
+def _h4608_i2304_fp8_ch_ep8_situ(act):
+    out = {}
+    for key in _ALL_M_KEYS:
+        m = int(key.split("_")[0])
+        if m >= 65536:
+            out[f"{m}_{act}"] = _H4608_I2304_FP8_CH_EP8_SITU_LARGE_M
+        elif m >= 8192:
+            out[f"{m}_{act}"] = _H4608_I2304_FP8_CH_EP8_SITU_MID_M
+    return out
+
+
 def _h4608_i2304_fp4_ep8_situ(act):
     out = _all_m_act(_H4608_I2304_FP4_EP8_SITU, act)
     for key in out:
@@ -448,6 +467,10 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
         # FP8 (lhs bf16 × rhs fp8)
         # ---------------------------------------------------------------------
         "lhs_bfloat16_rhs_float8_e4m3fn": {
+            (
+                "k-4608_n-4608_g-48_lhs_quant_rhs_bs-4608"
+                "+k-2304_n-6144_g-48_lhs_quant_rhs_bs-4608"
+            ): _h4608_i2304_fp8_ch_ep8_situ("situ:4.0:25.0"),
             (
                 "k-4096_n-1024_g-256_lhs_quant_rhs_bs-2048"
                 "+k-512_n-4096_g-256_lhs_quant_rhs_bs-2048"
