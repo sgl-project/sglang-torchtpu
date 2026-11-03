@@ -17,7 +17,7 @@ from sglang.test.tpu import run_model_config
 from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
 
 register_tpu_ci(
-    est_time=1800,
+    est_time=480,
     suite="nightly-tpu-perf-gpt-oss-20b",
     nightly=True,
     labels=["singlehost", "gpt-oss-20b", "perf"],

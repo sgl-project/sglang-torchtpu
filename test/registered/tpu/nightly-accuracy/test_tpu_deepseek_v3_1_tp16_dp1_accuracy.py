@@ -14,7 +14,7 @@ from sglang.test.tpu.utils.accuracy_base import (
 )
 
 register_tpu_ci(
-    est_time=7200,
+    est_time=4630,
     suite="nightly-tpu-multihost-accuracy",
     nightly=True,
     labels=["multihost", "deepseek-v3-1", "accuracy"],

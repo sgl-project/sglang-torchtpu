@@ -14,7 +14,7 @@ from sglang.test.tpu.utils.accuracy_base import (
 )
 
 register_tpu_ci(
-    est_time=10800,
+    est_time=4130,
     suite="nightly-tpu-multihost-accuracy",
     nightly=True,
     labels=["multihost", "deepseek-r1", "accuracy"],
@@ -26,7 +26,7 @@ MULTIHOST_LAUNCH = {
     "weights_pvc": "model-weights",
     # Which accuracy-test-tpu.yml lane runs this file.
     "schedule": "nightly",
-    "timeout_per_file": 10800,
+    "timeout_per_file": 4130,
 }
 
 BASE_URL = os.environ.get("BASE_URL", DEFAULT_URL_FOR_TEST)

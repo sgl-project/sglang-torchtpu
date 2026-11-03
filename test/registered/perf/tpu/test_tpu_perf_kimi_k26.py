@@ -31,7 +31,7 @@ from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
 
 # Measured in CI: 1734 s to healthy, then 160 requests at ~13.6 s.
 register_tpu_ci(
-    est_time=7200,
+    est_time=4410,
     suite="nightly-tpu-perf-kimi-k26",
     nightly=True,
     labels=["singlehost", "kimi-k2.6", "perf"],

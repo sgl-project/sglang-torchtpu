@@ -16,7 +16,7 @@ from sglang.test.tpu import run_model_config
 from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
 
 register_tpu_ci(
-    est_time=1800,
+    est_time=2580,
     suite="nightly-tpu-perf-glm-5-3-flash-mtp-mk",
     nightly=True,
     labels=["singlehost", "glm-5.3-flash", "spec", "perf"],

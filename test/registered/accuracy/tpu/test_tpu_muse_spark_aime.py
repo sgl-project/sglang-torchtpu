@@ -8,7 +8,7 @@ from sglang.test.tpu.utils.accuracy_base import AccuracyTestCase
 
 register_tpu_ci(
     # Leave queueing time behind the other Muse quality jobs.
-    est_time=9000,
+    est_time=7150,
     suite="nightly-tpu-accuracy-muse-spark-aime",
     nightly=True,
     labels=["singlehost", "muse-spark-open-816b-a42b", "accuracy"],

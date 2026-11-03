@@ -8,7 +8,7 @@ from sglang.test.tpu.utils.accuracy_base import AccuracyTestCase, gate_server_fa
 from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
 
 register_tpu_ci(
-    est_time=7200,
+    est_time=2660,
     suite="nightly-tpu-accuracy-qwen3-8-27b-aime",
     nightly=True,
     labels=["singlehost", "qwen3.8-27b", "accuracy"],

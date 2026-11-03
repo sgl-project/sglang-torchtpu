@@ -13,7 +13,7 @@ from sglang.test.tpu.utils.accuracy_base import (
 )
 
 register_tpu_ci(
-    est_time=2700,
+    est_time=580,
     suite="nightly-tpu-accuracy-gpt-oss-120b-gsm8k",
     nightly=True,
     labels=["singlehost", "gpt-oss-120b", "accuracy"],

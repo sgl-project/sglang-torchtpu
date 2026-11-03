@@ -57,7 +57,7 @@ from sglang.test.tpu import model_config_main
 # compile below) plus one sweep leg. Drives the JobSet poll budget, so an
 # under-estimate kills the run. Not auto-refreshed: update_est_time.py omits tpu.
 register_tpu_ci(
-    est_time=1800,
+    est_time=550,
     suite="nightly-tpu-perf-gpt-oss-120b",
     nightly=True,
     labels=["singlehost", "gpt-oss-120b", "perf"],
