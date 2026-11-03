@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.disaggregation.raiden.common import get_raiden_kv_caches
@@ -778,8 +779,6 @@ class TestPipelineLifetimes(unittest.TestCase):
     def test_matching_pipeline_rejects_different_stage_layer_subsets(self):
         """A topology mismatch found on the listener thread fails the room at
         once instead of leaving it to wait out the transfer deadline."""
-        from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
-
         # The second tag set names this stage's layers in the block-major layout.
         for tags in (["fa.l12", "swa.l13"], ["fa.l6+1", "swa.l7+1"]):
             with self.subTest(tags=tags):
@@ -788,6 +787,7 @@ class TestPipelineLifetimes(unittest.TestCase):
                 meta = pipe.receives[7].sources[3] | {"pool_tags": tags}
                 manager = RaidenKVManager.__new__(RaidenKVManager)
                 manager.attn_tp_rank = 0
+                manager.disaggregation_mode = DisaggregationMode.DECODE
                 manager._pipeline_enabled = True
                 manager._pipeline_init_lock = threading.Lock()
                 manager._pipeline = pipe
@@ -1165,10 +1165,10 @@ class TestPipelineInitialization(unittest.TestCase):
         self._initialize(legacy=True)
 
     def test_bootstrap_messages_wait_for_pool_initialization(self):
-        from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
-
         manager = RaidenKVManager.__new__(RaidenKVManager)
         manager.attn_tp_rank = 0
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
+        manager.is_dummy_cp_rank = False
         manager._pipeline_enabled = True
         manager._pipeline_init_lock = threading.Lock()
         manager._pipeline_messages = []

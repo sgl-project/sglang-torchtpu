@@ -389,7 +389,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             enable_prefill_cp=False,
             enable_hierarchical_cache=False,
             tpu_compile_tracer="dynamo",
-            json_model_override_args=None,
+            json_model_override_args="{}",
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
@@ -751,10 +751,10 @@ class TestPrefillContextParallelValidation(CustomTestCase):
             (
                 dict(architectures=("Qwen3VLMoeForConditionalGeneration",)),
                 {},
-                "supports Qwen3MoeForCausalLM and GptOssForCausalLM",
+                "supports GptOssForCausalLM and Qwen3MoeForCausalLM",
             ),
             (
-                dict(attention_backend="pallas_tpu_rpa_v3"),
+                dict(attention_backend="pallas_tpu"),
                 {},
                 "requires --attention-backend pallas_tpu_rpa_batched",
             ),
