@@ -78,9 +78,12 @@ class TestMuseMegakernelConfig(CustomTestCase):
             ):
                 with self.subTest(q=q, n_req=n_req, **flags, **pool):
                     cfg = _config(_megakernel(**flags), q, n_req, **pool)
-                    self.assertLessEqual(
-                        K.scratch_vmem_bytes(cfg), ops._SCRATCH_VMEM_BUDGET
+                    budget = (
+                        ops._OPT_BASE_VMEM_BUDGET
+                        if (cfg.alias_oy or cfg.alias_p or cfg.xfull_packed)
+                        else ops._SCRATCH_VMEM_BUDGET
                     )
+                    self.assertLessEqual(K.scratch_vmem_bytes(cfg), budget)
                     self.assertEqual(cfg.stream_depth, cfg.ring_slots - 1)
                     self.assertEqual(cfg.row_tile, 0)
                     # pipelined attention: two iterations of chunks in use, refills in flight
@@ -101,17 +104,42 @@ class TestMuseMegakernelConfig(CustomTestCase):
             self.assertEqual(ops.step_rows(tokens, 8), rows)
 
     def test_folded_verify_steps_keep_a_deep_enough_ring(self):
-        # 24 rows at q >= 5 and every 32-row step: no 10-slot ring fits the budget; a 6-slot
-        # one does and keeps the folds (a 3-slot ring is too short for them).
+        # <=16 rows and 24 rows at q <= 4 fit the 10-slot ring unaliased in 48 MiB;
+        # 24 rows at q >= 5 and 32-row steps turn on pad/ysend aliasing + packed xfull
+        # so they also keep the full 10-slot folded ring inside 50 MiB.
+        cfg_24_q4 = _config(_megakernel(), 4, 6, **_FP8_SAL)
+        self.assertEqual(cfg_24_q4.ring_slots, 10)
+        self.assertFalse(
+            cfg_24_q4.alias_oy or cfg_24_q4.alias_p or cfg_24_q4.xfull_packed
+        )
+        self.assertLessEqual(K.scratch_vmem_bytes(cfg_24_q4), ops._SCRATCH_VMEM_BUDGET)
         for q, n_req in ((8, 3), (6, 4), (8, 4), (4, 8)):
             with self.subTest(q=q, n_req=n_req):
                 cfg = _config(_megakernel(), q, n_req, **_FP8_SAL)
                 self.assertTrue(cfg.fold_f and cfg.fold_o)
                 self.assertTrue(K.fold_fits(cfg))
-                self.assertGreaterEqual(cfg.ring_slots, 5)
+                self.assertEqual(cfg.ring_slots, 10)
+                self.assertTrue(cfg.alias_oy and cfg.alias_p and cfg.xfull_packed)
                 self.assertLessEqual(
-                    K.scratch_vmem_bytes(cfg), ops._SCRATCH_VMEM_BUDGET
+                    K.scratch_vmem_bytes(cfg), ops._OPT_BASE_VMEM_BUDGET
                 )
+
+    def test_wave5_expert_split_swa_and_kperm0_bd_all(self):
+        groups = ops.expert_groups_of(_KINDS, 15)
+        cfg_24 = _config(_megakernel(expert_groups=groups), 8, 3, **_FP8_SAL)
+        self.assertEqual(cfg_24.expert_split, 0)
+        self.assertEqual(cfg_24.compact_arms, (1, 2, 4))
+        self.assertEqual(cfg_24.swa_chunk_pages, 2)
+        self.assertTrue(cfg_24.attn_skip_idle_streams and cfg_24.attn_col_mask)
+        cfg_32 = _config(_megakernel(expert_groups=groups), 4, 8, **_FP8_SAL)
+        self.assertEqual(cfg_32.expert_split, 4)
+        self.assertEqual(cfg_32.compact_rows, 8)
+        self.assertEqual(cfg_32.compact_arms, (1, 2, 4, 8))
+        self.assertFalse(cfg_32.ex_bd_all)
+        cfg_32_kperm0 = _config(
+            _megakernel(expert_groups=groups, kperm=False), 4, 8, **_FP8_SAL
+        )
+        self.assertTrue(cfg_32_kperm0.ex_bd_all)
 
     def test_row_tiled_steps(self):
         # Steps past 32 rows run the row-tiled program: rows a multiple of the row tile,
