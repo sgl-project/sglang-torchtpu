@@ -160,6 +160,16 @@ def _check_draft_lm_head_group(draft_model: nn.Module, *, attn_tp_size: int) -> 
         )
 
 
+def _draft_swa_translate(draft_worker):
+    """Host slot translation into the draft's SWA sub-pool; None for a full-pool draft."""
+    from sglang_tpu.dflash_draft_kv_write import translate_draft_swa_locs
+
+    pool = draft_worker.draft_runner.token_to_kv_pool
+    if not isinstance(pool, SWAKVPool):
+        return None
+    return lambda loc: translate_draft_swa_locs(pool, loc, None)[0]
+
+
 class TpuSpecWorker(BaseSpecWorker):
     """Speculative decoding as draft -> verify -> commit.
 
@@ -199,6 +209,7 @@ class TpuSpecWorker(BaseSpecWorker):
             # (--sampling-backend pytorch).
             runner.sampler = TpuSampler()
         self._draft_worker = draft_worker
+        self._draft_swa_translate = _draft_swa_translate(draft_worker)
         self.num_drafts = num_drafts
         self.num_verify_rows = num_drafts + 1
         self.device = target_worker.device
@@ -400,12 +411,7 @@ class TpuSpecWorker(BaseSpecWorker):
     @property
     def draft_swa_translate(self):
         """Host slot translation into the draft's SWA sub-pool; None for a full-pool draft."""
-        from sglang_tpu.dflash_draft_kv_write import translate_draft_swa_locs
-
-        pool = self._draft_worker.draft_runner.token_to_kv_pool
-        if not isinstance(pool, SWAKVPool):
-            return None
-        return lambda loc: translate_draft_swa_locs(pool, loc, None)[0]
+        return self._draft_swa_translate
 
     @property
     def retraction_draft_kv_pools(self) -> tuple[KVCache, ...]:

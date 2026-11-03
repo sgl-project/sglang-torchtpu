@@ -113,6 +113,7 @@ class TestExperimentalEagle3(CustomTestCase):
             carry_size=3, carry=torch.zeros((3, 3))
         )
         worker._draft_runner = SimpleNamespace(dtype=torch.float32)
+        worker._draft_swa_translate = None
         buckets = SimpleNamespace(buckets=[1, 2], max_val=2, next_bucket=lambda bs: bs)
         selections = []
         drafts = []
