@@ -85,6 +85,14 @@ class ServingConfigs:
     skip_kv_write: bool = False
     return_lse: bool = False
     cp_group_size: int | None = None
+    # Prefill tiles whose every key precedes every query (and lies inside the
+    # sliding window) run without the mask, and a power-of-two sm_scale is folded
+    # into q; both are exact.
+    skip_full_tile_mask: bool = False
+    # Softmax variants (env-gated in the wrapper): exp2 with log2e folded into the
+    # q scale; row sums from ones rows appended to V (l rides in the accumulator).
+    exp2_softmax: bool = False
+    ones_v: bool = False
 
     @property
     def pages_per_seq(self) -> int:
@@ -365,11 +373,18 @@ class RpaConfigs:
 
     @property
     def acc_scratch_shape(self):
+        # With ones_v the accumulator is a full vreg wide: the head in the low
+        # lanes, the row sum l in the lanes above it.
+        width = self.acc_width if self.serve.ones_v else self.aligned_kv_head_dim
         return (
             self.model.num_kv_heads,
             self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
-            self.aligned_kv_head_dim,
+            width,
         )
+
+    @property
+    def acc_width(self) -> int:
+        return pltpu.get_tpu_info().num_lanes
 
     @property
     def max_schedule_size_multiplier(self) -> int:

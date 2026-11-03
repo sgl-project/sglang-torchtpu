@@ -691,6 +691,223 @@ class TestKernelBlockSizes(CustomTestCase):
                         vmem_limit_bytes=vmem_limit_bytes,
                     )
 
+    def test_prefill_fast_tile_predicate_and_exp2_ones_v_parity(self):
+        """Verify _full_tile causal & SWA boundaries, exp2_softmax + fold_sm_scale,
+        and ones_v MXU row-sum recovery against standard flash_attention."""
+        from types import SimpleNamespace
+
+        import jax
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import (
+            configs,
+            flash_attention,
+            kernel,
+            utils,
+        )
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        block = configs.BlockSizes(
+            bq_sz=64, bq_c_sz=16, bkv_sz=512, batch_size=1, n_buffer=3
+        )
+        sched = SimpleNamespace(s_idx=jnp.asarray([[0], [-1]], jnp.int32))
+
+        with tpu_info_for_cpu_export():
+            fa_cfgs = configs.RpaConfigs(
+                block=block,
+                model=configs.ModelConfigs(
+                    num_q_heads=128,
+                    num_kv_heads=16,
+                    head_dim=64,
+                    mask_value=-1e30,
+                    sm_scale=0.125,
+                ),
+                serve=configs.ServingConfigs(
+                    num_seqs=1,
+                    num_page_indices=64,
+                    total_q_tokens=1024,
+                    dtype_q=jnp.bfloat16,
+                    dtype_kv=jnp.bfloat16,
+                    dtype_out=jnp.bfloat16,
+                    page_size=256,
+                    kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+                    skip_full_tile_mask=True,
+                ),
+                mode=configs.RpaCase.MIXED,
+                vmem_limit_bytes=64 << 20,
+            )
+            # Interior tile: first_q = 511 >= first_k (0) + 512 - 1 -> full_tile True
+            self.assertTrue(
+                bool(
+                    kernel._full_tile(
+                        0, sched, [jnp.int32(511)], [jnp.int32(0)], fa_cfgs
+                    )
+                )
+            )
+            # Diagonal-straddling tile: first_q = 510 < 511 -> full_tile False
+            self.assertFalse(
+                bool(
+                    kernel._full_tile(
+                        0, sched, [jnp.int32(510)], [jnp.int32(0)], fa_cfgs
+                    )
+                )
+            )
+            # Padded sentinel step (s_idx == -1) -> full_tile False
+            self.assertFalse(
+                bool(
+                    kernel._full_tile(
+                        1, sched, [jnp.int32(1024)], [jnp.int32(0)], fa_cfgs
+                    )
+                )
+            )
+
+            # Sliding window W=2048: last_q - first_k = (first_q + 63) - 0 < 2048
+            swa_cfgs = configs.RpaConfigs(
+                block=block,
+                model=configs.ModelConfigs(
+                    num_q_heads=128,
+                    num_kv_heads=16,
+                    head_dim=64,
+                    mask_value=-1e30,
+                    sm_scale=0.125,
+                    sliding_window=2048,
+                ),
+                serve=fa_cfgs.serve,
+                mode=configs.RpaCase.MIXED,
+                vmem_limit_bytes=64 << 20,
+            )
+            self.assertTrue(
+                bool(
+                    kernel._full_tile(
+                        0, sched, [jnp.int32(1984)], [jnp.int32(0)], swa_cfgs
+                    )
+                )
+            )
+            self.assertFalse(
+                bool(
+                    kernel._full_tile(
+                        0, sched, [jnp.int32(1985)], [jnp.int32(0)], swa_cfgs
+                    )
+                )
+            )
+
+            # Numerical parity: baseline vs (apply_mask=False + fold_sm_scale + exp2 + ones_v)
+            rng = jax.random.key(7)
+            kq, kk, kv = jax.random.split(rng, 3)
+            tq = 16 * 8  # bq_c_sz=16 * 8 q_heads_per_kv_head = 128
+            q = jax.random.normal(kq, (1, 2, tq, 64), dtype=jnp.bfloat16)
+            k = jax.random.normal(kk, (1, 2, 64, 512), dtype=jnp.bfloat16)
+            v = jax.random.normal(kv, (1, 2, 64, 512), dtype=jnp.bfloat16)
+            is_last_k = jnp.asarray([[0], [1]], dtype=jnp.int32)
+
+            base_serve = configs.ServingConfigs(
+                num_seqs=1,
+                num_page_indices=8,
+                total_q_tokens=64,
+                dtype_q=jnp.bfloat16,
+                dtype_kv=jnp.bfloat16,
+                dtype_out=jnp.bfloat16,
+                page_size=256,
+                kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+            )
+            opt_serve = configs.ServingConfigs(
+                num_seqs=1,
+                num_page_indices=8,
+                total_q_tokens=64,
+                dtype_q=jnp.bfloat16,
+                dtype_kv=jnp.bfloat16,
+                dtype_out=jnp.bfloat16,
+                page_size=256,
+                kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+                skip_full_tile_mask=True,
+                exp2_softmax=True,
+                ones_v=True,
+            )
+            small_model = configs.ModelConfigs(
+                num_q_heads=16,
+                num_kv_heads=2,
+                head_dim=64,
+                mask_value=-1e30,
+                sm_scale=0.125,
+            )
+            base_cfgs = configs.RpaConfigs(
+                block=block,
+                model=small_model,
+                serve=base_serve,
+                mode=configs.RpaCase.MIXED,
+                vmem_limit_bytes=64 << 20,
+            )
+            opt_cfgs = configs.RpaConfigs(
+                block=block,
+                model=small_model,
+                serve=opt_serve,
+                mode=configs.RpaCase.MIXED,
+                vmem_limit_bytes=64 << 20,
+            )
+            self.assertEqual(opt_cfgs.acc_scratch_shape[-1], 128)
+
+            # Run 2 interior steps (k=0, k=512 for first_q=2048) and compare normalized output
+            m_b = jnp.full((2, tq, 128), -jnp.inf, dtype=jnp.float32)
+            l_b = jnp.zeros((2, tq, 128), dtype=jnp.float32)
+            acc_b = jnp.zeros((2, tq, 64), dtype=jnp.float32)
+
+            m_o = jnp.full((2, tq, 128), -jnp.inf, dtype=jnp.float32)
+            l_o = jnp.zeros((2, tq, 128), dtype=jnp.float32)
+            acc_o = jnp.zeros((2, tq, 128), dtype=jnp.float32)
+            v_ones = jnp.concatenate(
+                [v, jnp.ones((1, 2, 64, 512), dtype=v.dtype)], axis=-2
+            )
+
+            for step_i, first_k in enumerate((0, 512)):
+                p_b, alpha_b, m_b, l_next_b, _ = (
+                    flash_attention.flash_attention_qk_softmax(
+                        jnp.int32(step_i),
+                        q,
+                        k,
+                        m_b,
+                        l_b,
+                        is_last_k,
+                        processed_q_len=[jnp.int32(2048)],
+                        processed_kv_len=[jnp.int32(first_k)],
+                        cfgs=base_cfgs,
+                        bq_start=0,
+                        apply_mask=True,
+                        fold_sm_scale=False,
+                    )
+                )
+                l_b = l_next_b[-1]
+                acc_b = flash_attention.flash_attention_pv(
+                    p_b, v, alpha_b, acc_b, cfgs=base_cfgs
+                )[-1]
+
+                p_o, alpha_o, m_o, _, _ = flash_attention.flash_attention_qk_softmax(
+                    jnp.int32(step_i),
+                    q,
+                    k,
+                    m_o,
+                    l_o,
+                    is_last_k,
+                    processed_q_len=[jnp.int32(2048)],
+                    processed_kv_len=[jnp.int32(first_k)],
+                    cfgs=opt_cfgs,
+                    bq_start=0,
+                    apply_mask=False,
+                    fold_sm_scale=True,
+                )
+                acc_o = flash_attention.flash_attention_pv(
+                    p_o, v_ones, alpha_o, acc_o, cfgs=opt_cfgs
+                )[-1]
+
+            out_base = acc_b / utils.broadcast_minor(l_b, acc_b.shape)
+            out_opt = acc_o[..., :64] / utils.broadcast_minor(
+                acc_o[..., 64:128], acc_b.shape
+            )
+            cos = float(
+                jnp.sum(out_base * out_opt)
+                / (jnp.linalg.norm(out_base) * jnp.linalg.norm(out_opt))
+            )
+            self.assertGreater(cos, 0.9999)
+
 
 if __name__ == "__main__":
     unittest.main()

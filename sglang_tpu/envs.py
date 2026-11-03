@@ -329,6 +329,17 @@ class TpuEnvs:
     # and the step runs more blocks than it needs. Rounded up to a page
     # multiple. Unset (None) means the wrapper's own search decides.
     SGLANG_TPU_FORCE_RPA_PREFILL_BKV = EnvInt(None)
+    # Batched RPA prefill fast paths (see attention/pallas/batched_rpa/):
+    # - SKIP_FULL_TILE_MASK: skip causal/sliding-window mask construction on
+    #   interior KV tiles proven fully visible at tile entry, and fold exact
+    #   power-of-two sm_scale into Q.
+    # - EXP2_SOFTMAX: use base-2 exp2 softmax with sm_scale * log2(e) folded
+    #   into Q when soft_cap, attention_sink, and return_lse are inactive.
+    # - ONES_V: on SEQ_ALONG_LANE with head_dim <= 64, append ones rows to V
+    #   into unused MXU lane padding [d:2d] so PV computes softmax row sums l.
+    SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK = EnvBool(False)
+    SGLANG_TPU_RPA_EXP2_SOFTMAX = EnvBool(False)
+    SGLANG_TPU_RPA_ONES_V = EnvBool(False)
     # Hack to workaround libtpu bug in 0.0.46 and 0.0.47 causing performance
     # regression in fused MoE with reduce scatter.
     # TODO: Remove once the issue gets resolved in libtpu version > 0.0.47
