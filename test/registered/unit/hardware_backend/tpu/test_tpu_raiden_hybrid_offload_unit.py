@@ -916,9 +916,9 @@ class TestDraftCounterRegistration(CustomTestCase):
 
 
 class TestKVFreeFenceCoverage(CustomTestCase):
-    def test_state_slot_load_waits_for_in_flight_forwards(self):
-        """A freed Mamba state slot is not held by the KV free fence, so a load
-        into one must wait until no in-flight forward can still write it."""
+    def test_state_slot_load_does_not_sync_the_device(self):
+        """State slots load through device-queue-ordered torch copies, which land
+        after any in-flight forward that still writes a freed slot: no device sync."""
         ctrl = _make_controller()
         mamba = _FakeEntry(PoolName.MAMBA, _FakeHostPool(page_size=1), object())
         ctrl.mem_pool_host.entries.append(mamba)
@@ -939,7 +939,7 @@ class TestKVFreeFenceCoverage(CustomTestCase):
         )
         ctrl.load_queue.append(op)
         ctrl.start_loading()
-        ctrl.kv_free_fence.wait_for_in_flight.assert_called_once()
+        ctrl.kv_free_fence.wait_for_in_flight.assert_not_called()
         self.assertEqual(len(mamba.host_pool.loads), 1)
 
     def test_pool_outside_the_offload_set_is_rejected(self):
@@ -1000,6 +1000,63 @@ class TestDraftSidecarPlatformHook(CustomTestCase):
         fake_platform.get_mha_kv_pool_host_cls.assert_called_once_with(pool)
         self.assertIsInstance(host_pool, _RecordingPool)
         self.assertEqual(built["kwargs"]["pool_label"], "draft")
+
+
+class TestStateSlotOffload(CustomTestCase):
+    """Compiled forwards rebind the state tensors to new device buffers, so state
+    slots move through the tensors live at transfer time, every stream of a slot."""
+
+    DIMS = (4, 4, 2, 8)
+
+    def _pool(self):
+        from sglang.srt.configs.inkling import (
+            InklingConvCacheParams,
+            InklingConvStateShape,
+        )
+        from sglang_tpu.mamba_pool import TpuMambaPool
+
+        cp = InklingConvCacheParams(
+            shape=InklingConvStateShape(
+                conv=[(3, d) for d in self.DIMS], temporal=(0, 0, 0)
+            ),
+            layers=[0, 1],
+        )
+        return TpuMambaPool(
+            size=6,
+            spec_state_size=2,
+            cache_params=cp,
+            mamba_layer_ids=[0, 1],
+            device="cpu",
+        )
+
+    @staticmethod
+    def _rebind(pool):
+        pool.set_state([t.clone() for t in pool.get_state()])
+
+    def test_round_trip_reads_and_writes_the_live_tensors(self):
+        from sglang_tpu.kv_pool_host import StateSlotTransfer, TpuDMAMambaPoolHost
+
+        pool = self._pool()
+        host = TpuDMAMambaPoolHost(pool, 2.0, 0)
+        self.assertIsInstance(host.transfer, StateSlotTransfer)
+        # Rebound after the host pool bound its transfer, as by a serving forward.
+        self._rebind(pool)
+        for i, t in enumerate(pool.get_state()):
+            for slot in (1, 2, 3):
+                t[slot].fill_(100 * slot + i)
+        host_slots = host.alloc(3)
+        host.backup_from_device_all_layer(
+            pool, host_slots, torch.tensor([3, 1, 2]), "raiden"
+        ).synchronize()
+        self._rebind(pool)
+        for t in pool.get_state():
+            t.zero_()
+        host.load_all_layer(pool, host_slots, torch.tensor([6, 4, 5])).synchronize()
+        for i, t in enumerate(pool.get_state()):
+            for src, dst in ((3, 6), (1, 4), (2, 5)):
+                self.assertTrue(torch.all(t[dst] == 100 * src + i), (i, dst))
+            for untouched in (0, 1, 2, 3):
+                self.assertTrue(torch.all(t[untouched] == 0), (i, untouched))
 
 
 class TestDispatch(CustomTestCase):
