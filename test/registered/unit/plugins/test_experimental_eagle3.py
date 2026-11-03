@@ -209,9 +209,12 @@ class TestExperimentalEagle3(CustomTestCase):
             tree_cache=SimpleNamespace(page_size=64),
         )
         bucket = SimpleNamespace(state=SimpleNamespace(seq_lens=torch.tensor([63, 0])))
-        verify_input = SimpleNamespace(committed_lens=torch.tensor([60, 0]))
+        verify_input = SimpleNamespace(
+            verify_cache_candidates=torch.zeros((2, 8), dtype=torch.int64),
+            committed_lens=torch.tensor([60, 0]),
+        )
         with patch.object(base_spec_worker, "mamba_track_grid", return_value=64):
-            TpuSpecWorker.step(worker, batch, bucket, None, verify_input)
+            TpuSpecWorker.step(worker, batch, bucket, verify_input)
         self.assertEqual(snapshots[0].tolist(), [0, -1])
 
     def test_flag_routes_eagle3_and_leaves_other_algorithms_alone(self):

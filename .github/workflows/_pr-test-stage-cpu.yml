@@ -25,7 +25,7 @@ on:
         type: string
         required: true
       run_timeout_minutes:
-        description: 'timeout-minutes for the Run test step. Required so compute_partitions.py can read it from pr-test.yml without a duplicated default constant.'
+        description: 'Partition-planning budget in minutes, read by compute_partitions.py from pr-test.yml. Per-commit CPU tests have a separate 20-minute execution cap for cold builds and imports; other suites retain this timeout.'
         type: string
         required: true
       rust_ext_artifact:
@@ -148,8 +148,10 @@ jobs:
           curl --fail --silent --show-error --max-time 15 --retry 3 --retry-delay 2 \
             "$URL" -o /tmp/partition-model.json
 
+      # Per-commit live estimates can omit cold native builds and Python imports.
+      # Keep that reserve out of planning; longer weekly suites retain their cap.
       - name: Run test
-        timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
+        timeout-minutes: ${{ inputs.self_name == 'base-a-test-cpu' && 20 || fromJson(inputs.run_timeout_minutes) }}
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ fromJson(inputs.check_changes).continue_on_error == 'true' && '--continue-on-error' || '' }}
           # Normalized to a literal true/false: EnvBool rejects an empty string,

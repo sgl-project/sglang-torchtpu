@@ -242,7 +242,8 @@ case "$BENCH_MODEL" in
         LIBTPU_INIT_ARGS=${LIBTPU_INIT_ARGS:-"$(source "$TPU_BENCH_DIR/common_env.sh" >/dev/null 2>&1 \
             && echo "$LIBTPU_INIT_ARGS") --xla_tpu_enable_sparse_core_collective_offload_all_gather=false"}
         export LIBTPU_INIT_ARGS
-        MODEL_EXTRA_ARGS="--moe-runner-backend pallas_tpu_fused_rs \
+        export LOCAL_SIZE=${LOCAL_SIZE:-8}
+        MODEL_EXTRA_ARGS="--weight-loader-prefetch-checkpoints --moe-runner-backend pallas_tpu_fused_rs \
 --swa-full-tokens-ratio 0.125 --reasoning-parser muse --watchdog-timeout 3600"
         ;;
     *)
