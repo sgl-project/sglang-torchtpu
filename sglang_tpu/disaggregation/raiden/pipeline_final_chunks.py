@@ -7,6 +7,8 @@ them to the host. For every request whose final chunk a forward computes:
 - with stage groups (SGLANG_RAIDEN_PIPELINE_STAGE_PARTS), this stage's share
   registers once a host copy of one element of the forward's output lands
   (PipelineTransfer.make_fence);
+- with early parts (SGLANG_RAIDEN_PIPELINE_EARLY_PARTS), every launch records a
+  completion fence that parts offered afterwards wait for (PipelineTransfer.offer_part);
 - with SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE, this stage's share of the closing
   transfer registers at launch on stages before the last, and at the token
   copy on the last stage. That copy completes after the last stage's forward,
@@ -27,6 +29,14 @@ from sglang_tpu.disaggregation.raiden.sender import RaidenKVSender
 from sglang_tpu.disaggregation.raiden.serde import read_aux_blob
 
 logger = logging.getLogger(__name__)
+
+
+def _forward_output(result, last_stage: bool):
+    """A tensor the stage's forward writes: sampled tokens on the last stage, the
+    hand-off activations on the others."""
+    if last_stage:
+        return result.next_token_ids
+    return next(iter(result.pp_hidden_states_proxy_tensors.tensors.values()))
 
 
 class _HeldShare(NamedTuple):
@@ -58,6 +68,17 @@ class FinalChunks:
     def launched(self, scheduler, mb_id: int, batch, result) -> None:
         """This stage launched ``batch`` in microbatch slot ``mb_id``."""
         transfer = self.transfer
+        mgr = transfer.manager
+        last_stage = mgr.pp_rank == mgr.pp_size - 1
+        if transfer.early_parts:
+            # The host offers a chunk's pages before this stage's device has
+            # necessarily run the forward that writes them; parts offered from
+            # now on wait for this forward, and earlier ones whose forward is done
+            # are announced.
+            transfer.last_fence = transfer.make_fence(
+                _forward_output(result, last_stage)
+            )
+            transfer.advance_parts()
         if not (transfer.stage_parts or transfer.early_close):
             return
         # Register stage parts whose fences completed since the last launch.
@@ -71,17 +92,14 @@ class FinalChunks:
         ]
         if not finals:
             return
-        mgr = transfer.manager
-        last_stage = mgr.pp_rank == mgr.pp_size - 1
         fence = None
         if transfer.stage_parts:
-            output = (
-                result.next_token_ids
-                if last_stage
-                else next(iter(result.pp_hidden_states_proxy_tensors.tensors.values()))
-            )
             # One completion fence per forward, shared by its requests.
-            fence = transfer.make_fence(output)
+            fence = (
+                transfer.last_fence
+                if transfer.early_parts
+                else transfer.make_fence(_forward_output(result, last_stage))
+            )
         held = []
         for index, req in finals:
             room = req.disagg_kv_sender.bootstrap_room

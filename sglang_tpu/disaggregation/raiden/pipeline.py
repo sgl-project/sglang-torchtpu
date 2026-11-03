@@ -477,9 +477,13 @@ class PipelineTransfer:
             concurrent.futures.ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="raiden-stage-fence"
             )
-            if self.stage_parts
+            if self.stage_parts or (self.early_parts and self.producer)
             else None
         )
+        # Producer: completion fence of the latest forward this stage launched.
+        # Early parts wait for it, since the host offers a chunk's pages before
+        # the device has necessarily run the forward that writes them.
+        self.last_fence: concurrent.futures.Future | None = None
 
     def _check_support(self, raiden_service_pb2) -> None:
         """Reject topologies and native builds the pipeline transfer cannot serve."""
@@ -748,6 +752,9 @@ class PipelineTransfer:
                 replied=set(),
                 done=False,
                 expires=time.monotonic() + mgr._timeout_s,
+                # One device stream: once the latest launched forward completes,
+                # every earlier write to these pages has too.
+                fence=getattr(self, "last_fence", None),
             )
             state["parts"].append(part)
             state["offered"] = p_start + len(p_blocks)
@@ -836,6 +843,13 @@ class PipelineTransfer:
     def _reply_part(self, room, part) -> None:
         if not self.replies.get(room) or room in self.failed:
             return
+        fence = part.get("fence")
+        if fence is not None:
+            # Raiden reads the pages straight from HBM: announce them only once
+            # the forward that wrote them has completed (advance_parts retries).
+            if not fence.done():
+                return
+            part["fence"] = None
         if not part["registered"]:
             if not self._register_blocks(
                 room,
@@ -851,6 +865,28 @@ class PipelineTransfer:
             part=part["index"], start=part["start"], full=len(part["full"])
         )
         self._announce(room, part, payload, b"", "replied")
+
+    def advance_parts(self) -> None:
+        """Announce every early part whose fence has completed since it was offered."""
+        if not self.early_parts:
+            return
+        with self.lock:
+            for room, state in list(self.early.items()):
+                for part in state["parts"]:
+                    if part.get("fence") is not None:
+                        self._reply_part(room, part)
+
+    def _flush_parts(self, room) -> None:
+        """Announce a room's early parts before its closing transfer. At the result
+        point every forward of the request has completed, so their fences resolve."""
+        for part in self.early.get(room, {}).get("parts", []):
+            fence = part.get("fence")
+            if fence is not None:
+                try:
+                    fence.result()
+                except Exception:
+                    pass
+                self._reply_part(room, part)
 
     # ----- producer: stage groups ------------------------------------------
 
@@ -1048,6 +1084,9 @@ class PipelineTransfer:
                 self.sent[room] = self._closing_entry(
                     room, [int(b) for b in full], [int(b) for b in swa], aux
                 )
+            # Parts whose forward is done go out ahead of the closing share; the
+            # decode waits for the rest (it expects the closing share's count).
+            self.advance_parts()
             self._reply(room)
 
     def finalize_send(self, room: int, aux_index: int | None) -> bool:
@@ -1102,7 +1141,8 @@ class PipelineTransfer:
                     )
                 return False
             # Registration calls the controller, so it runs outside the
-            # manager's state lock.
+            # manager's state lock. Parts announce before the closing transfer.
+            self._flush_parts(room)
             if self.stage_parts:
                 self._advance_stage(room)
             else:
@@ -1837,6 +1877,7 @@ class PipelineTransfer:
     def _poll_producer(self) -> None:
         mgr = self.manager
         self._expire_parts()
+        self.advance_parts()
         for room, entry in list(self.stage.items()):
             if not entry["ready"] and room not in self.failed:
                 self._advance_stage(room)
