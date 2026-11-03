@@ -342,7 +342,14 @@ def source_fields(transfer) -> dict:
 
 
 def register_twin(
-    transfer, *, req_id: str, uuid: int, swa: list[int], dst_attn_tp: int
+    transfer,
+    *,
+    req_id: str,
+    uuid: int,
+    swa: list[int],
+    dst_attn_tp: int,
+    dcp_size: int = 1,
+    full_count: int | None = None,
 ) -> None:
     """Register the window pages of ``req_id``, if any, as its twin. A twin
     that cannot register cancels the transfer's own registration, which
@@ -366,6 +373,8 @@ def register_twin(
                 draft_total_kv_heads=transfer.draft_kv_heads,
                 draft_swa_total_kv_heads=transfer.draft_swa_kv_heads,
                 with_swa=True,
+                dcp_size=dcp_size,
+                full_count=full_count,
             ),
         )
     except Exception:
@@ -465,7 +474,7 @@ def _twin_key(key) -> tuple:
 
 
 def twin_destination(
-    transfer, request, *, swa_count: int, only_tags=None
+    transfer, request, *, swa_count: int, only_tags=None, full_count: int = 0
 ) -> dict | None:
     """Destination blocks of a transfer's twin: None when it has none."""
     if transfer.swa is None or not swa_count:
@@ -478,6 +487,8 @@ def twin_destination(
         count=0,
         source_swa_count=swa_count,
         only_tags=only_tags,
+        dcp_size=transfer.dcp_size,
+        full_count=full_count,
     )
 
 

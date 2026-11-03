@@ -346,6 +346,8 @@ class PipelineTransfer:
 
     # The window link, when sliding-window layers have their own engine.
     swa: pp_swa.SwaLink | None = None
+    # The decode's DCP size; 1 on the producer and on a decode without DCP.
+    dcp_size: int = 1
     draft_kv_heads: int | None = None
     draft_swa_kv_heads: int | None = None
 
@@ -355,6 +357,10 @@ class PipelineTransfer:
 
         self.manager = manager
         self.producer = manager.disaggregation_mode == DisaggregationMode.PREFILL
+        # Decode context parallelism shards each request's KV by token position
+        # over a slice of the decode's TP group (dcp_token_spans).
+        if not self.producer:
+            self.dcp_size = int(getattr(manager, "dcp_size", 1) or 1)
         self._check_support(raiden_service_pb2)
         self.hbm_mem_type = raiden_service_pb2.MEMORY_TYPE_HBM
         self.lock = threading.RLock()
@@ -768,11 +774,17 @@ class PipelineTransfer:
             state["offered"] = p_start + len(p_blocks)
             self._reply_part(room, part)
 
-    def _dst_attn_tp(self, room) -> int:
-        widths = {int(meta["attn_tp_size"]) for meta in self.replies[room].values()}
+    def _dst_layout(self, room) -> tuple[int, int]:
+        """The consumer's attention TP and DCP size (1 for a consumer that
+        reports none)."""
+        widths = {
+            (int(meta["attn_tp_size"]), int(meta.get("dcp_size", 1)))
+            for meta in self.replies[room].values()
+        }
         if len(widths) != 1:
             raise ValueError(
-                "Raiden pipeline consumers of one request disagree on attention TP"
+                "Raiden pipeline consumers of one request disagree on attention "
+                "TP or DCP"
             )
         return widths.pop()
 
@@ -785,12 +797,19 @@ class PipelineTransfer:
         full: list[int],
         swa: list[int],
         with_swa: bool,
+        start: int = 0,
     ) -> bool:
         """Register one transfer's pages, sliced for the consumer's attention
-        TP, and its window twin; a registration that cannot be made fails the
-        room."""
+        TP (and DCP), and its window twin; a registration that cannot be made
+        fails the room. ``start`` is the transfer's first full-attention page."""
         try:
-            dst_attn_tp = self._dst_attn_tp(room)
+            dst_attn_tp, dcp_size = self._dst_layout(room)
+            if dcp_size > 1 and start:
+                raise ValueError(
+                    "a DCP decode takes whole transfers; serve it without "
+                    "SGLANG_RAIDEN_PIPELINE_EARLY_PARTS"
+                )
+            full_count = start + len(full)
             spans = part_spans(
                 self.pools,
                 self.tensors,
@@ -801,6 +820,8 @@ class PipelineTransfer:
                 draft_total_kv_heads=self.draft_kv_heads,
                 draft_swa_total_kv_heads=self.draft_swa_kv_heads,
                 with_swa=with_swa,
+                dcp_size=dcp_size,
+                full_count=full_count,
             )
             self.client.register_request_blocks(
                 req_id=req_id,
@@ -811,7 +832,13 @@ class PipelineTransfer:
             )
             if with_swa:
                 pp_swa.register_twin(
-                    self, req_id=req_id, uuid=uuid, swa=swa, dst_attn_tp=dst_attn_tp
+                    self,
+                    req_id=req_id,
+                    uuid=uuid,
+                    swa=swa,
+                    dst_attn_tp=dst_attn_tp,
+                    dcp_size=dcp_size,
+                    full_count=full_count,
                 )
         except Exception as error:
             self._fail_room(
@@ -859,6 +886,7 @@ class PipelineTransfer:
                 full=part["full"],
                 swa=[],
                 with_swa=False,
+                start=part["start"],
             ):
                 return
             part["registered"] = True
@@ -956,6 +984,7 @@ class PipelineTransfer:
                 full=full,
                 swa=entry["swa"],
                 with_swa=True,
+                start=entry["start"],
             ):
                 return
             entry["registered"] = True
@@ -1177,6 +1206,7 @@ class PipelineTransfer:
                 full=item["full"],
                 swa=item["swa"],
                 with_swa=True,
+                start=item["start"],
             ):
                 self.retired.add(room)
                 return
@@ -1215,7 +1245,11 @@ class PipelineTransfer:
             )
         endpoint = NetworkAddress(mgr.local_ip, mgr.rank_port).to_tcp()
         consumer = json.dumps(
-            dict(attn_tp_size=mgr.attn_tp_size, attn_tp_rank=mgr.attn_tp_rank)
+            dict(
+                attn_tp_size=mgr.attn_tp_size,
+                attn_tp_rank=mgr.attn_tp_rank,
+                dcp_size=self.dcp_size,
+            )
         ).encode()
         for info in infos:
             peer = NetworkAddress(info["rank_ip"], int(info["rank_port"])).to_tcp()
@@ -1408,8 +1442,14 @@ class PipelineTransfer:
             start=start,
             count=source_full,
             source_swa_count=source_swa,
+            dcp_size=self.dcp_size,
         )
-        twin = pp_swa.twin_destination(self, request, swa_count=source_swa)
+        twin = pp_swa.twin_destination(
+            self,
+            request,
+            swa_count=source_swa,
+            full_count=start + source_full,
+        )
         if twin is not None and not (
             args["transfer_pool_tags"] or twin["transfer_pool_tags"]
         ):
@@ -1510,6 +1550,7 @@ class PipelineTransfer:
                     start=start,
                     count=count,
                     source_swa_count=None,
+                    dcp_size=self.dcp_size,
                 ),
             )
         return True
@@ -1561,9 +1602,14 @@ class PipelineTransfer:
                 count=count,
                 source_swa_count=swa_count,
                 only_tags=group_tags,
+                dcp_size=self.dcp_size,
             )
             twin = pp_swa.twin_destination(
-                self, request, swa_count=swa_count, only_tags=group_tags
+                self,
+                request,
+                swa_count=swa_count,
+                only_tags=group_tags,
+                full_count=start + count,
             )
             reason = pp_swa.unplaceable(args, twin)
             if reason is not None:

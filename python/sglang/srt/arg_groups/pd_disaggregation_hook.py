@@ -4,6 +4,7 @@ import logging
 import os
 from typing import TYPE_CHECKING, Any
 
+from sglang.srt import platforms
 from sglang.srt.arg_groups.arg_utils import record_fields
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
@@ -82,15 +83,20 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     if cfg.disaggregation_mode == "decode" and cfg.dcp_size > 1:
         # Fake transfer moves no KV and is only used for synthetic decode
         # benchmarks, so it does not need the DCP relayout from Mooncake/NIXL.
+        # Through the module attribute, so it resolves the platform at call time.
+        platform_backends = platforms.current_platform.pd_dcp_transfer_backends()
         if cfg.disaggregation_transfer_backend not in (
             "mooncake",
             "nixl",
             "ascend",
             "fake",
+            *platform_backends,
         ):
             raise ValueError(
                 "PD decode DCP requires --disaggregation-transfer-backend "
-                "mooncake, nixl, ascend, or fake for synthetic benchmarking, got "
+                "mooncake, nixl, ascend, "
+                + "".join(f"{name}, " for name in platform_backends)
+                + "or fake for synthetic benchmarking, got "
                 f"{cfg.disaggregation_transfer_backend!r}."
             )
 

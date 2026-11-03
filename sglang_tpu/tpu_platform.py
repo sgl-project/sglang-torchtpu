@@ -842,6 +842,18 @@ _DCP_ATTENTION_BACKEND = "pallas_tpu_rpa_batched"
 _UNSET_CHUNKED_PREFILL_SIZE = 4096
 
 
+def _raiden_pipeline_decode(cfg) -> bool:
+    """Whether a server is a decode on the Raiden pipeline transfer, which hands
+    each DCP rank its token shard by named layer pools (pp_common.dcp_token_spans)."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    return (
+        cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_transfer_backend == "raiden"
+        and tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get()
+    )
+
+
 def _validate_decode_context_parallel(server_args) -> None:
     """Refuse the server-arg combinations TPU decode context parallelism does
     not implement.
@@ -904,10 +916,11 @@ def _validate_decode_context_parallel(server_args) -> None:
             "--enable-prefill-cp is not supported with "
             "--decode-context-parallel-size > 1 on TPU."
         )
-    if cfg.disaggregation_mode != "null":
+    if cfg.disaggregation_mode != "null" and not _raiden_pipeline_decode(cfg):
         raise ValueError(
             "--disaggregation-mode is not supported with "
-            "--decode-context-parallel-size > 1 on TPU (got "
+            "--decode-context-parallel-size > 1 on TPU, except a decode on the "
+            "Raiden pipeline transfer (SGLANG_RAIDEN_PIPELINE_TRANSFER=1) (got "
             f"{cfg.disaggregation_mode!r})."
         )
     if cfg.enable_hierarchical_cache:
@@ -1485,6 +1498,13 @@ class TpuSRTPlatform(SRTPlatform):
         # The batched RPA DCP path addresses every pool through the widened
         # location space and replicates K/V heads within a DCP group.
         return True
+
+    def pd_dcp_transfer_backends(self) -> tuple[str, ...]:
+        # The Raiden pipeline transfer shards each request's KV by token for a
+        # DCP decode (disaggregation/raiden/pp_common.dcp_token_spans).
+        from sglang_tpu.envs import envs as tpu_envs
+
+        return ("raiden",) if tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get() else ()
 
     def supports_moe_dp_pipeline_stages(self) -> bool:
         return True
