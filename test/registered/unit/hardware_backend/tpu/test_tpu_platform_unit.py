@@ -206,6 +206,10 @@ class TestTpuPlatformInitialization(CustomTestCase):
                 ),
             ),
             patch(
+                "sglang_tpu.rl.setup.setup_worker",
+                side_effect=lambda **kwargs: calls.append(("rl_setup", kwargs)),
+            ),
+            patch(
                 "sglang_tpu.patches.apply_tpu_patches",
                 side_effect=lambda: calls.append(("patch", None)),
             ),
@@ -220,7 +224,8 @@ class TestTpuPlatformInitialization(CustomTestCase):
         ):
             self.platform.init_backend()
 
-        # The compile cache key must see the flags _prepare_tpu_env appends.
+        # The compile cache key must see the flags _prepare_tpu_env appends, and the RL
+        # setup (a shared slice joins before the first TPU op) runs right after torch_tpu.
         self.assertEqual(
             calls,
             [
@@ -230,6 +235,7 @@ class TestTpuPlatformInitialization(CustomTestCase):
                     {"resolve_single_host_topology": True},
                 ),
                 ("cache_key", "--xla_user=1 --xla_override=0"),
+                ("rl_setup", {"job_size": 16}),
                 ("patch", None),
                 ("rank_slice", None),
                 ("traced_rank", None),

@@ -51,7 +51,7 @@ class TestCheckLayout(CustomTestCase):
 class TestWeightUpdateHandlers(CustomTestCase):
     def test_only_a_worker_in_a_shared_slice_serves_the_ici_receiver(self):
         with patch.dict("os.environ", {"SGLANG_TPU_SHARED_SLICE": ""}):
-            outside = setup_worker(job_rank=0, job_size=1)
+            outside = setup_worker(job_size=1)
         inside = RlSetup(shared_slice=SimpleNamespace())
 
         self.assertEqual(weight_update_handlers(outside), {})

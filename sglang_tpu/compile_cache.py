@@ -81,6 +81,8 @@ _ENV_FIELDS_NOT_KEYED = frozenset(
         "SGLANG_TPU_PP_DYNAMIC_CHUNKS",
         # Profiler scope.
         "SGLANG_TPU_PROFILE_NUM_CHIPS",
+        # Which slice an RL trainer shares with this engine; the programs are the same.
+        "SGLANG_TPU_SHARED_SLICE",
         "SGLANG_TPU_PROFILE_NUM_SPARSE_CORES",
         "SGLANG_TPU_PROFILE_PYTHON_TRACER",
         # KV transfer timeout.

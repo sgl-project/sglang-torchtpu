@@ -1584,9 +1584,7 @@ class TpuSRTPlatform(SRTPlatform):
 
         from sglang_tpu.rl.setup import setup_worker
 
-        self._rl_setup = setup_worker(
-            job_rank=int(os.environ["RANK"]), job_size=int(world_size)
-        )
+        self._rl_setup = setup_worker(job_size=int(world_size))
         apply_tpu_patches()
         # Resolve after worker setup, before Dynamo can trace either helper.
         rank_slice._load()

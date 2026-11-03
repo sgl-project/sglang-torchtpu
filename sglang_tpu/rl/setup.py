@@ -8,6 +8,7 @@ its handler here.
 from __future__ import annotations
 
 import functools
+import os
 from typing import Any, Callable, Optional
 
 import msgspec
@@ -21,16 +22,15 @@ class RlSetup(msgspec.Struct, frozen=True):
     shared_slice: Optional[shared_slice.SharedSlice]
 
 
-def setup_worker(*, job_rank: int, job_size: int) -> RlSetup:
+def setup_worker(*, job_size: int) -> RlSetup:
     """Must run after importing torch_tpu and before the worker's first TPU op."""
     spec = shared_slice.SharedSliceSpec.from_env()
+    if spec is None:
+        return RlSetup(shared_slice=None)
+    # the worker bootstrap sets RANK (pp_rank * tp_size + tp_rank) before init_backend
     return RlSetup(
-        shared_slice=(
-            None
-            if spec is None
-            else shared_slice.join_shared_slice(
-                spec, job_rank=job_rank, job_size=job_size
-            )
+        shared_slice=shared_slice.join_shared_slice(
+            spec, job_rank=int(os.environ["RANK"]), job_size=job_size
         )
     )
 

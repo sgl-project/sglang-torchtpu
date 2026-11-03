@@ -43,25 +43,30 @@ def receive_bucket(
     _, target = context.runners[0]
     transfers = payload["receives"][shared_slice.job_rank]
     buffers = []
-    # post every receive first, so no sender waits on another's transfer
-    for transfer in transfers:
-        buffer = torch.empty(
-            transfer["num_bytes"] // _BUFFER_DTYPE.itemsize,
-            dtype=_BUFFER_DTYPE,
-            device=target.device,
-        )
-        # recv rebinds `buffer` to the received storage, so views come only after it
-        shared_slice.backend.recv(
-            [buffer], transfer["src_slice_rank"], payload["tag"]
-        ).wait()
-        buffers.append(buffer)
-    named_tensors = []
-    for transfer, buffer in zip(transfers, buffers):
+    try:
+        # post every receive first, so no sender waits on another's transfer
+        for transfer in transfers:
+            buffer = torch.empty(
+                transfer["num_bytes"] // _BUFFER_DTYPE.itemsize,
+                dtype=_BUFFER_DTYPE,
+                device=target.device,
+            )
+            # recv rebinds `buffer` to the received storage, so views come only after it
+            shared_slice.backend.recv(
+                [buffer], transfer["src_slice_rank"], payload["tag"]
+            ).wait()
+            buffers.append(buffer)
+    finally:
         # wait() returns once the receive is posted, not once the data lands; a read
-        # waits for it, and freeing the buffer before that crashes the sender
-        buffer[:1].cpu()
-        named_tensors += unpack_bucket(buffer, transfer["tensors"])
-    return named_tensors
+        # waits for it, and freeing a posted buffer before that crashes the sender,
+        # so every posted buffer is fenced even when a later post failed
+        for buffer in buffers:
+            buffer[:1].cpu()
+    return [
+        named_tensor
+        for transfer, buffer in zip(transfers, buffers)
+        for named_tensor in unpack_bucket(buffer, transfer["tensors"])
+    ]
 
 
 def unpack_bucket(
