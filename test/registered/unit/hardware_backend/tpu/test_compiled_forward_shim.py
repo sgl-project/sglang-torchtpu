@@ -1384,7 +1384,7 @@ class TestReconcileTpuBatchLimits(CustomTestCase):
         )
 
     def test_default_neither_set(self):
-        # Nothing requested -> ceiling and concurrency default to 64 (NOT the
+        # Nothing requested -> ceiling and concurrency default to 32 (NOT the
         # ~2048 memory estimate), no explicit bucket list.
         self.assertEqual(
             self._r(),
@@ -1399,12 +1399,12 @@ class TestReconcileTpuBatchLimits(CustomTestCase):
         self.assertEqual(self._r(torch_compile_max_bs=8), (8, None, 8))
 
     def test_max_running_requests_grows_ceiling(self):
-        # --max-running-requests 128 -> grid ceiling 128, served (not clamped 64).
+        # --max-running-requests 128 -> grid ceiling 128, served (not clamped 32).
         self.assertEqual(self._r(max_running_requests=128), (128, None, 128))
 
     def test_max_running_requests_below_default_caps_grid(self):
         # --max-running-requests 4 with no explicit compile limit -> the grid
-        # stops at 4 instead of compiling dead shapes up to 64.
+        # stops at 4 instead of compiling dead shapes up to 32.
         self.assertEqual(self._r(max_running_requests=4), (4, None, 4))
 
     def test_dp_attention_derives_per_worker_cap(self):

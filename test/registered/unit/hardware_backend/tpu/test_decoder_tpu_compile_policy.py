@@ -25,6 +25,7 @@ from sglang.srt.configs.mamba_utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
@@ -59,6 +60,8 @@ from sglang.srt.speculative.spec_info import SpecInputType, SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import sampler as tpu_sampler_module
 from sglang_tpu.attention_gdn_pallas import GdnTracedMetadata, TpuGDNAttnBackend
+from sglang_tpu.attention_pallas_rpa_batched import TpuPallasRpaBatchedAttnBackend
+from sglang_tpu.attention_pallas_rpa_v3 import TpuPallasRpaV3AttnBackend
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.compilation.compiled_forward_shim import (
     CompiledForwardShim,
@@ -881,6 +884,198 @@ class TestDecoderOutputUnpadding(CustomTestCase):
         self.assertEqual(forward_batch.input_ids.shape[0], 3)
 
 
+def _rpa_leaf(cls, *, pages_per_seq, page_size=64):
+    """An RPA backend with only the fields its SMEM capacity reads."""
+    backend = object.__new__(cls)
+    backend.page_size = page_size
+    backend._page_stride = page_size
+    backend.max_context_len = pages_per_seq * page_size
+    return backend
+
+
+class TestAttentionSmemCheck(_PolicyTestCase):
+    """install() refuses a grid that overflows RPA scoped SMEM before any warmup
+    compiles (sglang-torchtpu#1557)."""
+
+    # 256K context at page 64: RPA v3 fits 63 sequences per kernel call.
+    PAGES = 4097
+
+    def _check(self, attn_backend, *, bs_buckets=(1, 8, 64), extend_bs=None):
+        model_runner = _model_runner()
+        model_runner.attn_backend = attn_backend
+        policy = _make_policy(
+            model_runner, token_buckets=(64, 1 << 18), bs_buckets=bs_buckets
+        )
+        policy.extend_bs = extend_bs or max(bs_buckets)
+        policy._check_attention_smem()
+
+    def test_decode_ladder_above_capacity_names_the_largest_safe_cap(self):
+        backend = _rpa_leaf(TpuPallasRpaV3AttnBackend, pages_per_seq=self.PAGES)
+        with self.assertRaisesRegex(
+            ValueError,
+            r"fits at most 63 .* needs 64\. Lower --max-running-requests to <= 63 ",
+        ):
+            self._check(backend)
+        self._check(backend, bs_buckets=(1, 8, 63))
+        huge = _rpa_leaf(TpuPallasRpaV3AttnBackend, pages_per_seq=1 << 18)
+        with self.assertRaisesRegex(
+            ValueError,
+            r"fits at most 0 .* Raise --page-size or lower --context-length\.",
+        ):
+            self._check(huge, bs_buckets=(1,))
+
+    def test_prefill_server_checks_prefill_batches_only(self):
+        self.publish_config(disaggregation_mode="prefill")
+        backend = _rpa_leaf(TpuPallasRpaV3AttnBackend, pages_per_seq=self.PAGES)
+        self._check(backend, extend_bs=8)
+        with self.assertRaisesRegex(
+            ValueError, "Lower --prefill-max-requests to <= 63,"
+        ):
+            self._check(backend, extend_bs=64)
+        # DFlash/DSpark prefill servers only compile the draft KV writer.
+        model_runner = _model_runner()
+        model_runner.attn_backend = backend
+        model_runner.is_draft_worker = True
+        model_runner.spec_algorithm = SpeculativeAlgorithm.DFLASH
+        policy = _make_policy(
+            model_runner, token_buckets=(64, 1 << 18), bs_buckets=(1, 8, 64)
+        )
+        policy.extend_bs = 64
+        policy._check_attention_smem()
+
+    def test_attention_dp_remedy_matches_reconcile_rounding(self):
+        # 496 // 8 = 62 rows per worker, already a multiple of attn_tp_size 2.
+        backend = _rpa_leaf(TpuPallasRpaV3AttnBackend, pages_per_seq=self.PAGES)
+        for dp_overrides in (
+            dict(
+                tp_size=16,
+                moe_tp_size=16,
+                attn_dp_size=8,
+                attn_tp_size=2,
+                attn_dp_enabled=True,
+            ),
+            # draft_tp_context narrows attn_dp_size to 1 but keeps num_dp_ranks.
+            dict(
+                tp_size=2,
+                moe_tp_size=2,
+                attn_dp_size=1,
+                num_dp_ranks=8,
+                attn_tp_size=2,
+                attn_dp_enabled=True,
+            ),
+        ):
+            with (
+                self.subTest(**dp_overrides),
+                get_parallel().override(**dp_overrides),
+                self.assertRaisesRegex(
+                    ValueError,
+                    r"--max-running-requests to <= 496 \(and any --torch-compile-max-bs "
+                    r"or --tpu-compile-bs value to <= 62\)",
+                ),
+            ):
+                self._check(backend)
+
+    def test_context_parallel_rows_count_twice_per_request(self):
+        backend = _rpa_leaf(TpuPallasRpaV3AttnBackend, pages_per_seq=self.PAGES)
+        with (
+            patch.object(
+                DecoderTpuCompilePolicy,
+                "_extend_cp_compile_cases",
+                return_value=[(1024, 32)],
+            ),
+            self.assertRaisesRegex(
+                ValueError, "Lower --prefill-max-requests to <= 31,"
+            ),
+        ):
+            self._check(backend, bs_buckets=(1, 8, 32))
+
+    def test_rpa_backends_behind_attention_wrappers_are_checked(self):
+        rpa = _rpa_leaf(TpuPallasRpaV3AttnBackend, pages_per_seq=self.PAGES)
+        hybrid_linear = object.__new__(HybridLinearAttnBackend)
+        hybrid_linear.attn_backend_list = [rpa, object.__new__(TpuGDNAttnBackend)]
+        split = object.__new__(HybridAttnBackend)
+        split.prefill_backend = rpa
+        split.decode_backend = _rpa_leaf(
+            TpuPallasRpaBatchedAttnBackend, pages_per_seq=4000
+        )
+        for wrapper in (hybrid_linear, split):
+            with (
+                self.subTest(wrapper=type(wrapper).__name__),
+                self.assertRaisesRegex(
+                    ValueError, "TpuPallasRpaV3AttnBackend fits at most 63"
+                ),
+            ):
+                self._check(wrapper)
+
+    def test_split_prefill_backend_is_checked_against_prefill_batches_only(self):
+        # 4064 pages: RPA v3 fits 63 rows, the batched page table fits 64.
+        split = object.__new__(HybridAttnBackend)
+        split.prefill_backend = _rpa_leaf(
+            TpuPallasRpaV3AttnBackend, pages_per_seq=4064, page_size=256
+        )
+        split.decode_backend = _rpa_leaf(
+            TpuPallasRpaBatchedAttnBackend, pages_per_seq=4064, page_size=256
+        )
+        self._check(split, extend_bs=8)
+        with (
+            get_context().override_server_args(enable_mixed_chunk=True),
+            self.assertRaisesRegex(
+                ValueError, "Lower --max-running-requests to <= 63 "
+            ),
+        ):
+            self._check(split, extend_bs=8)
+        self.publish_config(disaggregation_mode="decode")
+        self._check(split)
+        with (
+            get_context().override_server_args(speculative_algorithm="EAGLE3"),
+            self.assertRaisesRegex(
+                ValueError, "Lower --max-running-requests to <= 63 "
+            ),
+        ):
+            self._check(split)
+
+    def test_page_table_only_kernels_warn_instead_of_raising(self):
+        backend = _rpa_leaf(TpuPallasRpaBatchedAttnBackend, pages_per_seq=self.PAGES)
+        with self.assertLogs(
+            "sglang_tpu.compilation.decoder_compile_policy", "WARNING"
+        ) as logs:
+            self._check(backend)
+        self.assertIn("TpuPallasRpaBatchedAttnBackend fits at most 63", logs.output[0])
+
+    def test_install_refuses_the_grid(self):
+        model = SimpleNamespace(forward=MagicMock(), prepare_forward_batch=MagicMock())
+        self.publish_config(
+            chunked_prefill_size=None, max_prefill_tokens=2048, torch_compile_max_bs=64
+        )
+        model_runner = SimpleNamespace(
+            model=model,
+            attn_backend=_rpa_leaf(TpuPallasRpaV3AttnBackend, pages_per_seq=self.PAGES),
+            is_draft_worker=False,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
+            model_config=SimpleNamespace(context_len=4096),
+            server_args=SimpleNamespace(
+                unsafe_save_torch_compile_bundle=None,
+                unsafe_load_torch_compile_bundle=None,
+            ),
+        )
+        policy = DecoderTpuCompilePolicy(model_runner=model_runner, owner=model)
+        with (
+            patch(
+                "sglang_tpu.compilation.decoder_compile_policy.build_bucketers",
+                return_value=(
+                    Bucketer(name="Token", buckets=[64, 2048]),
+                    Bucketer(name="Bs", buckets=[16, 32, 64]),
+                ),
+            ),
+            patch(
+                "sglang_tpu.compilation.decoder_compile_policy.torch.compile",
+                return_value=MagicMock(),
+            ),
+            self.assertRaisesRegex(ValueError, "fits at most 63"),
+        ):
+            policy.install()
+
+
 class TestInstallExtendCap(_PolicyTestCase):
     def _install_policy(self, *, prefill_max_requests, dp_attention):
         model = SimpleNamespace(
@@ -896,6 +1091,7 @@ class TestInstallExtendCap(_PolicyTestCase):
         )
         model_runner = SimpleNamespace(
             model=model,
+            attn_backend=None,
             forward=MagicMock(),
             is_draft_worker=False,
             pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
@@ -949,6 +1145,7 @@ class TestInstallExtendCap(_PolicyTestCase):
         )
         model_runner = SimpleNamespace(
             model=model,
+            attn_backend=None,
             forward=MagicMock(),
             is_draft_worker=False,
             pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
@@ -999,6 +1196,7 @@ class TestInstallExtendCap(_PolicyTestCase):
         )
         model_runner = SimpleNamespace(
             model=model,
+            attn_backend=None,
             forward=MagicMock(),
             is_draft_worker=False,
             pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
@@ -1057,6 +1255,7 @@ class TestInstallExtendCap(_PolicyTestCase):
         )
         model_runner = SimpleNamespace(
             model=model,
+            attn_backend=None,
             forward=MagicMock(),
             is_draft_worker=True,
             pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
@@ -1112,6 +1311,7 @@ class TestInstallExtendCap(_PolicyTestCase):
         )
         model_runner = SimpleNamespace(
             model=model,
+            attn_backend=None,
             forward=MagicMock(),
             is_draft_worker=True,
             pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
@@ -4128,6 +4328,37 @@ class TestDraftPrecompile(_SpecPolicyTestCase):
         policy.precompile_draft(SimpleNamespace(attn_backends=[]), _FakeAttnBackend())
 
         self.assertEqual(mr.model.forward.call_count, 0)
+
+    def test_draft_worker_pd_prefill_skips_decode_and_draft_extend(self):
+        mr = _spec_model_runner(is_draft_worker=True)
+        policy = _make_spec_policy(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
+        step_backends = [_FakeAttnBackend() for _ in range(3)]
+        draft_attn_backend = SimpleNamespace(attn_backends=step_backends)
+        draft_extend_attn_backend = _FakeAttnBackend()
+        fused_calls = []
+
+        with (
+            get_context().override_server_args(disaggregation_mode="prefill"),
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                moe_tp_size=2,
+                moe_tp_rank=1,
+            ),
+        ):
+            policy.precompile_draft(
+                draft_attn_backend,
+                draft_extend_attn_backend,
+                fused_draft_forward=lambda fb: fused_calls.append(fb.batch_size),
+            )
+
+        self.assertEqual(mr.model.forward.call_count, 2)
+        self.assertEqual(mr.attn_backend.calls, [(8, 4), (64, 4)])
+        self.assertEqual([len(b.calls) for b in step_backends], [0, 0, 0])
+        self.assertEqual(draft_extend_attn_backend.calls, [])
+        self.assertEqual(fused_calls, [])
 
     def test_fused_draft_warms_every_batch_bucket(self):
         mr = _spec_model_runner(is_draft_worker=True)

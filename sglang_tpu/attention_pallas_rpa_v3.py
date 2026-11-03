@@ -79,6 +79,14 @@ def _invoke_v3_kernel(
     )
 
 
+def _get_smem_estimate_bytes(max_num_seqs: int, pages_per_seq: int) -> int:
+    # ragged_paged_attention_v3's nine int32 scalar-prefetch operands, each padded
+    # to 128 entries; pure Python because that kernel module imports jax.
+    n = max_num_seqs
+    entries = (n, n * pages_per_seq, n + 1, n + 1, n + 1, 3, 3, 4, 6)
+    return sum((count + 127) // 128 * 128 * 4 for count in entries)
+
+
 RPA_V3_SPEC = RpaKernelSpec(
     op_name="sglang_tpu_pallas::ragged_paged_attention",
     import_kernel=_import_v3_kernel,
@@ -87,6 +95,7 @@ RPA_V3_SPEC = RpaKernelSpec(
     uses_cu_kv_lens=True,
     is_batched=False,
     supports_decode_query_size=True,
+    smem_estimate_bytes=_get_smem_estimate_bytes,
 )
 
 

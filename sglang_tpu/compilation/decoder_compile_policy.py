@@ -17,6 +17,8 @@ from torch.utils._pytree import tree_leaves
 from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import DecoderCompilePolicy
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 from sglang.srt.layers.aux_hidden_states import (
     AUX_HIDDEN_STATES_PROXY_KEY,
     AuxHiddenStateList,
@@ -44,12 +46,14 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_schedule,
+    get_spec,
     max_prefill_buffer_tokens,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang_tpu._logging import get_logger
+from sglang_tpu.attention_pallas_rpa_base import BaseTpuPallasRpaAttnBackend
 from sglang_tpu.compilation import aot_fast_runtime_wrapper
 from sglang_tpu.compilation.attention_rank_inputs import (
     get_attention_rank_tensors,
@@ -151,6 +155,27 @@ def forward_bucketers(server_args: Any, *, context_len: int) -> tuple[Any, Any]:
         max_t=max_extend_tokens(context_len=context_len),
         max_b=get_exec().graph.torch_compile_max_bs,
     )
+
+
+def rpa_leaves(
+    backend: object, *, phase: Literal["prefill", "decode"] | None = None
+) -> list[BaseTpuPallasRpaAttnBackend]:
+    """The RPA backends that ``backend`` runs, through attention wrappers; with
+    ``phase``, only the side of a prefill/decode split that serves it."""
+    if isinstance(backend, BaseTpuPallasRpaAttnBackend):
+        return [backend]
+    if isinstance(backend, HybridAttnBackend):
+        children = {
+            None: [backend.prefill_backend, backend.decode_backend],
+            "prefill": [backend.prefill_backend],
+            "decode": [backend.decode_backend],
+        }[phase]
+    elif isinstance(backend, AttentionBackend):
+        # Hybrid linear-attention wrappers (GDN, KDA) list their children.
+        children = backend.attn_backend_list or []
+    else:
+        children = []
+    return [leaf for child in children for leaf in rpa_leaves(child, phase=phase)]
 
 
 def max_extend_tokens(*, context_len: int) -> int:
@@ -740,6 +765,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 get_schedule().prefill_max_requests or b_bucketer.max_val,
                 b_bucketer.max_val,
             )
+        self._check_attention_smem()
 
         outer_model = self.model_runner.model
         existing_prep = getattr(outer_model, "prepare_forward_batch", None)
@@ -770,6 +796,91 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             self.b_bucketer.name,
         )
         return True
+
+    def _check_attention_smem(self) -> None:
+        assert self.b_bucketer is not None
+        attn_backend = self.model_runner.attn_backend
+        leaves = rpa_leaves(attn_backend)
+        if not leaves:
+            return
+        disagg_mode = get_disagg().disaggregation_mode
+        if (
+            self.model_runner.is_draft_worker
+            and disagg_mode == "prefill"
+            and self.model_runner.spec_algorithm.is_dflash_family()
+        ):
+            # DFlash/DSpark prefill servers only compile the draft KV writer.
+            return
+        prefill_leaves = rpa_leaves(attn_backend, phase="prefill")
+        # Speculative verify and draft extend can route decode-ladder batches
+        # to a split's prefill side.
+        spec_active = (
+            self.model_runner.is_draft_worker
+            or get_spec().speculative_algorithm is not None
+        )
+        decode_leaves = rpa_leaves(
+            attn_backend, phase=None if spec_active else "decode"
+        )
+        # (rows, rows per request, capped by --prefill-max-requests). Extend and
+        # mixed caps never exceed the decode ladder compiled on the same leaf.
+        extend_families = {
+            (bs, 1, mode == ForwardMode.EXTEND)
+            for _, bs, mode in self._extend_compile_cases()
+        }
+        cp_families = {(2 * bs, 2, True) for _, bs in self._extend_cp_compile_cases()}
+        for backend in leaves:
+            runs_decode = disagg_mode != "prefill" and backend in decode_leaves
+            runs_prefill = disagg_mode != "decode" and backend in prefill_leaves
+            families = set()
+            if runs_decode:
+                families.add((self.b_bucketer.max_val, 1, False))
+            elif runs_prefill:
+                families |= extend_families
+            if runs_prefill:
+                families |= cp_families
+            max_rows = backend.max_smem_rows()
+            over = sorted((f for f in families if f[0] > max_rows), reverse=True)
+            if not over:
+                continue
+            remedies = dict.fromkeys(
+                self._smem_remedy(cap=max_rows // per_req, pmr_capped=pmr_capped)
+                for _, per_req, pmr_capped in over
+            )
+            message = (
+                f"{type(backend).__name__} fits at most {max_rows} sequence rows "
+                f"per kernel call in TPU scoped SMEM ({backend.max_context_len} "
+                f"tokens, page size {backend.page_size}), but the compile grid "
+                f"needs {over[0][0]}. {' '.join(remedies)}"
+            )
+            assert backend.kernel_spec is not None
+            if backend.kernel_spec.smem_estimate_bytes is None:
+                # Only the page table is modeled, a lower bound: even max_rows may
+                # not fit, so warn rather than refuse with an uncalibrated remedy.
+                logger.warning(message)
+            else:
+                raise ValueError(message)
+
+    def _smem_remedy(self, *, cap: int, pmr_capped: bool) -> str:
+        parallel = get_parallel()
+        if pmr_capped and cap > 0 and not parallel.attn_dp_enabled:
+            return f"Lower --prefill-max-requests to <= {cap}, or raise --page-size."
+        # reconcile_tpu_batch_limits rounds each attention-DP worker's rows up to
+        # a multiple of attn_tp_size; draft_tp_context narrows attn_dp_size to 1
+        # while retaining the deployment's num_dp_ranks.
+        tp = parallel.attn_tp_size if parallel.attn_dp_enabled else 1
+        dp = (
+            max(parallel.num_dp_ranks, parallel.attn_dp_size)
+            if parallel.attn_dp_enabled
+            else 1
+        )
+        per_worker = cap // tp * tp
+        if per_worker == 0:
+            return "Raise --page-size or lower --context-length."
+        return (
+            "Lower --max-running-requests to <= "
+            f"{per_worker * dp} (and any --torch-compile-max-bs "
+            f"or --tpu-compile-bs value to <= {per_worker}), or raise --page-size."
+        )
 
     def _uses_eager_draft_coordinator(self) -> bool:
         return self.model_runner.is_draft_worker and hasattr(
