@@ -1506,10 +1506,22 @@ class TpuSRTPlatform(SRTPlatform):
         if not isinstance(model, KimiK3LinearForCausalLM):
             return
         from sglang_tpu.hooks.attn_residual import prepare_attn_residual_kernel
+        from sglang_tpu.kimi_k3.logits_gather import (
+            bind_logits_allreduce_gather,
+            bind_logits_oneshot_gather,
+        )
+        from sglang_tpu.kimi_k3.oproj_row import bind_oproj_row
+        from sglang_tpu.kimi_k3.param_layout import store_decode_params
         from sglang_tpu.kimi_k3.static_fp8 import bind_static_fp8
 
         prepare_attn_residual_kernel(model)
         bind_static_fp8(model)
+        bind_oproj_row(model)
+        # The one-shot gather wraps the all-reduce one: bs1 decode takes the
+        # one-shot kernel, every other gather the all-reduce.
+        bind_logits_allreduce_gather(model)
+        bind_logits_oneshot_gather(model)
+        store_decode_params(model)
 
     # ------------------------------------------------------------------
     # Initialization

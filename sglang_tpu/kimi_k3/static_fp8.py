@@ -26,12 +26,14 @@ from typing import NamedTuple, Optional
 import torch
 from torch import nn
 
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.fp8_linear import (
     StaticFp8Weight,
     pad_static_fp8_n,
     quantize_rmsnorm_fed_weight,
     register_static_fp8_gemv_op,
     static_fp8_gemv_enabled,
+    static_fp8_gemv_with_weight,
 )
 from sglang_tpu.kernels.static_fp8_gemv import MAX_TOKENS as STATIC_FP8_GEMV_MAX_TOKENS
 from sglang_tpu.kimi_k3 import STATIC_FP8_PARTS as PARTS
@@ -114,10 +116,99 @@ class HostSplitUp(NamedTuple):
 
     weight: StaticFp8Weight
     op: object
+    # The op's build argument, for the prefetching and fused-tail variants.
+    op_used: int = 0
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         w = self.weight
         return self.op(x, w.weight, w.out_scale, w.inv_x)
+
+
+class PrefetchSlot:
+    """Hands a prefetched weight from layer i's MoE to layer i+1's attention
+    within one forward (both run only for single-token batches)."""
+
+    def __init__(self):
+        self.value: list = []
+
+
+class HostSplitUpPrefetch(NamedTuple):
+    """HostSplitUp whose kernel also copies the next layer's KDA qkvg fp8
+    weight into a VMEM output during the host exchange; that copy goes to
+    ``slot`` for the next layer's PrefetchedQkvg."""
+
+    weight: StaticFp8Weight
+    op: object
+    next_weight: torch.Tensor
+    slot: PrefetchSlot
+    # The op's build argument (for the fused-tail variant).
+    op_used: int = 0
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.weight
+        out, copy = self.op(x, w.weight, w.out_scale, w.inv_x, self.next_weight)
+        self.slot.value.clear()
+        self.slot.value.append(copy)
+        return out
+
+
+class PrefetchedQkvg(NamedTuple):
+    """The KDA qkvg StaticFp8Weight, reading the VMEM copy the previous
+    layer's latent up-proj made when there is one (same GEMV, same math)."""
+
+    w: StaticFp8Weight
+    slot: PrefetchSlot
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if self.slot.value:
+            prefetched = self.slot.value.pop()
+            if x.shape[0] == 1:
+                out = static_fp8_gemv_with_weight(x, self.w, prefetched)
+                if out is not None:
+                    return out
+        return self.w(x)
+
+
+def _bind_qkvg_prefetch(layers, layout) -> int:
+    """Pair each host-split latent up-proj with the next layer's KDA qkvg
+    GEMV (SGLANG_TPU_K3_QKVG_PREFETCH). Returns the number of pairs."""
+    from sglang.srt.models.kimi_k3 import KimiK3DeltaAttention, KimiK3MoE
+
+    if (
+        layout is None
+        or not tpu_envs.SGLANG_TPU_K3_QKVG_PREFETCH.get()
+        or not static_fp8_gemv_enabled()
+    ):
+        return 0
+    max_bytes = tpu_envs.SGLANG_TPU_K3_QKVG_PREFETCH_MAX_KIB.get() * 1024
+    world, local, _ = layout
+    pairs = 0
+    for prev, nxt in zip(layers, layers[1:]):
+        moe = getattr(prev, "mlp", None)
+        attn = getattr(nxt, "self_attn", None)
+        if not isinstance(moe, KimiK3MoE) or not isinstance(attn, KimiK3DeltaAttention):
+            continue
+        up = moe._host_split_latent_up
+        qkvg = attn._static_fp8_qkvg
+        if not isinstance(up, HostSplitUp) or not isinstance(qkvg, StaticFp8Weight):
+            continue
+        nw = qkvg.weight
+        if nw.numel() * nw.element_size() > max_bytes:
+            continue
+        slot = PrefetchSlot()
+        w = up.weight
+        moe._host_split_latent_up = HostSplitUpPrefetch(
+            weight=w,
+            op=host_split_op(
+                world, local, w.weight.shape[1], up.op_used, prefetch=True
+            ),
+            next_weight=nw,
+            slot=slot,
+            op_used=up.op_used,
+        )
+        attn._static_fp8_qkvg = PrefetchedQkvg(qkvg, slot)
+        pairs += 1
+    return pairs
 
 
 # (hosts, ranks per host) the host split was measured on: tpu7x 2x2x4, TP32 =
@@ -154,8 +245,6 @@ def _host_split_layout() -> Optional[tuple[int, int, int]]:
     split applies, else None. Called once per process from bind_static_fp8,
     on every rank that selected static fp8 parts (all of them when the switch
     is on: static_fp8_parts requires moe_front and latent_up)."""
-    from sglang_tpu.envs import envs as tpu_envs
-
     enabled = tpu_envs.SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV.get()
     _check_ranks_agree(enabled)
     if not enabled:
@@ -247,6 +336,7 @@ def _bind_host_split(moe, in_norm_weight, down, gate_up, up, layout) -> None:
             moe._host_split_latent_up = HostSplitUp(
                 weight=weight,
                 op=host_split_op(world, local, weight.weight.shape[1], used),
+                op_used=used,
             )
 
 
@@ -306,6 +396,33 @@ def _bind_linear(owner, attr: str, linear: Optional[nn.Module], norm: nn.Module)
     return 1, _release(linear)
 
 
+class DecodeFence(NamedTuple):
+    """order_after for single-token batches only; other batches pass through.
+
+    The KDA [q, k, v, g] GEMV's weight-load wait is a decode effect. Validated
+    bit-exact at bs1 (13-layer greedy, 4 prompts x 64 tokens); fencing a
+    1024-token prefill chunk changed XLA's fusions and the logits, and batches
+    of 2..32 tokens are not validated, so they keep the unfenced graph.
+    """
+
+    op: object
+    max_tokens: int = 1
+
+    def __call__(self, x: torch.Tensor, *deps: torch.Tensor):
+        if 0 < x.shape[0] <= self.max_tokens:
+            return self.op(x, *deps)
+        return (x, *deps)
+
+
+def _upcast_norm_weight(norm: Optional[nn.Module]) -> None:
+    """Store an RMSNorm weight in f32. The norm multiplies f32 activations by
+    it, and a bf16 weight costs a separate convert op per layer per step; the
+    upcast is exact, so the output is unchanged."""
+    if norm is None or norm.cast_x_before_out_mul:
+        return
+    norm.weight.data = norm.weight.data.float()
+
+
 def bind_static_fp8(model: nn.Module) -> None:
     """Bind the selected static fp8 GEMVs on every Kimi-K3 decoder layer.
 
@@ -349,6 +466,7 @@ def bind_static_fp8(model: nn.Module) -> None:
                 )
                 spreads[part].append(_g_spread(norm_w))
             freed += f
+            _upcast_norm_weight(layer.mlp.routed_expert_norm)
         attn = layer.self_attn
         norm = layer.input_layernorm
         if (
@@ -360,6 +478,10 @@ def bind_static_fp8(model: nn.Module) -> None:
                 attn, "_static_fp8_qkvg", getattr(attn, "fused_qkvg_proj", None), norm
             )
             counts["kda_qkvg"] += n
+            if n and tpu_envs.SGLANG_TPU_K3_KDA_GATES_FIRST.get():
+                from sglang_tpu.kimi_k3.order_op import order_op
+
+                attn._qkvg_order_after = DecodeFence(order_op(3))
             if n:
                 spreads["kda_qkvg"].append(_g_spread(norm.weight))
             freed += f
@@ -397,12 +519,23 @@ def bind_static_fp8(model: nn.Module) -> None:
             spread_summary,
         )
     if layout is not None:
+        qkvg_prefetch = _bind_qkvg_prefetch(list(model.model.layers), layout)
+        tail = 0
+        if tpu_envs.SGLANG_TPU_K3_LATENT_UP_ATTN_RES.get():
+            from sglang_tpu.kimi_k3 import latent_up_tail
+
+            tail = latent_up_tail.bind(list(model.model.layers), layout)
         logger.info(
             "Kimi-K3 host-split single-token GEMVs (host-local index %d of %d) "
-            "bound per part (layers): %s",
+            "bound per part (layers): %s; "
+            "next-layer KDA qkvg prefetch in latent_up: %d layers; "
+            "MoE tail add + next-layer attention-residual aggregation in "
+            "latent_up: %d layers",
             layout[2],
             layout[1],
             split_counts,
+            qkvg_prefetch,
+            tail,
         )
     unbound = sorted(part for part, n in counts.items() if n == 0)
     if unbound:

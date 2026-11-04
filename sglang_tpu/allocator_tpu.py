@@ -34,7 +34,12 @@ import torch
 
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.utils import get_num_new_pages
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_free_fence import HeldPages
+
+# Decode steps where no request starts a new page compute out_cache_loc as
+# last_loc + 1 directly (skips ~8 tiny host torch ops). Identical values.
+_ALLOC_DECODE_FAST_PATH = tpu_envs.SGLANG_TPU_ALLOC_DECODE_FAST_PATH.get()
 
 
 def alloc_extend_vectorized_cpu(
@@ -289,7 +294,14 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         # ``per_req_new_page[i]`` = page-ID assigned to req i if it
         # needs a fresh page, else 0 (multiplied by 0 in the formula
         # below — the sentinel is harmless).
-        per_req_new_page = torch.zeros(bs, dtype=torch.int32, device="cpu")
+        fast = (
+            _ALLOC_DECODE_FAST_PATH
+            and num_new_pages == 0
+            and last_loc.device.type == "cpu"
+        )
+        per_req_new_page = (
+            None if fast else torch.zeros(bs, dtype=torch.int32, device="cpu")
+        )
         if num_new_pages > 0:
             new_page_ids = self.free_pages[:num_new_pages]
             start_new_pages = torch.cumsum(need_new_pages, 0) - need_new_pages
@@ -303,9 +315,14 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if last_loc.device.type == "cpu":
             # Host-resident: last_loc is host, so run the formula on CPU and
             # H2D once (no per-bucket device compile of the allocator formula).
-            host_indices = (last_loc + 1) * (1 - need_new_pages) + (
-                per_req_new_page * self.page_size * need_new_pages
-            )
+            if fast:
+                # No request crosses a page: the formula is last_loc + 1
+                # (same dtype as the full formula's result).
+                host_indices = last_loc + 1
+            else:
+                host_indices = (last_loc + 1) * (1 - need_new_pages) + (
+                    per_req_new_page * self.page_size * need_new_pages
+                )
             if out_indices_cpu is not None:
                 out_indices_cpu.copy_(host_indices)
             out_indices = (

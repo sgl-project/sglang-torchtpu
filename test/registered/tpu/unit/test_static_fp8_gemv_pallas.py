@@ -62,6 +62,24 @@ class TestStaticFp8GemvPallas(CustomTestCase):
             for m in (1, 4, 16):
                 self._case(m, k, n, seed=k + n + m)
 
+    def test_vmem_weight_bit_identical(self):
+        """vmem_weight reads the same K blocks in place: bit-identical."""
+        from sglang_tpu.kernels.static_fp8_gemv import block_k, static_fp8_gemv_jax
+
+        rng = np.random.default_rng(5)
+        k, n = 7168, 1536
+        x = jnp.asarray(rng.standard_normal((1, k)) * 0.5, jnp.bfloat16)
+        w = jnp.asarray(rng.standard_normal((k, n)) * 64, jnp.float32).astype(
+            jnp.float8_e4m3fn
+        )
+        s = jnp.asarray(rng.uniform(1e-4, 1e-3, n), jnp.float32)
+        inv = jnp.asarray([FP8_MAX / 4.0], jnp.float32)
+        bk = block_k(k, n)
+        f = jax.jit(static_fp8_gemv_jax, static_argnums=(4, 5))
+        a = f(x, w, s, inv, bk, False)
+        b = f(x, w, s, inv, bk, True)
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
 
 if __name__ == "__main__":
     unittest.main()

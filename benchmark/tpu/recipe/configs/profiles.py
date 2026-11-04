@@ -29,6 +29,8 @@ def _profile(
     concurrency: int,
     prefill_tokens: int,
     decode_bs: tuple[int, ...] = (),
+    context_length: int | None = None,
+    max_total_tokens: int | None = None,
 ) -> dict:
     """One profile, with the sizing derived from the shape it names.
 
@@ -36,8 +38,13 @@ def _profile(
     in-flight request at full length plus one prefill chunk of slack, which keeps
     a late arrival from waiting on an eviction. `decode_bs` adds decode buckets
     below the concurrency, for a server whose traffic is often a single request.
+    `context_length` and `max_total_tokens` replace the derived values where a
+    measured configuration pinned them.
     """
-    context_length = input_tokens + output_tokens + 64
+    if context_length is None:
+        context_length = input_tokens + output_tokens + 64
+    if max_total_tokens is None:
+        max_total_tokens = concurrency * context_length + prefill_tokens
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -49,7 +56,7 @@ def _profile(
             "torch_compile_max_bs": concurrency,
             "tpu_compile_tokens": [prefill_tokens],
             "tpu_compile_bs": [*decode_bs, concurrency],
-            "max_total_tokens": concurrency * context_length + prefill_tokens,
+            "max_total_tokens": max_total_tokens,
         },
     }
 
@@ -93,6 +100,19 @@ PROFILES = {
     # sweeps concurrency (recipe/bench_matrix/config.sh).
     "agentic": _profile(
         input_tokens=32768, output_tokens=1024, concurrency=16, prefill_tokens=8192
+    ),
+    # 128K context up to 64 requests, as measured on Kimi-K3.1 (16 chips): the
+    # context is exactly 128K + 8K, and the pool bound is a cap far above what
+    # HBM holds (mem_fraction_static sizes it, ~532K tokens), not one full
+    # context per request.
+    "long_128k_c64": _profile(
+        input_tokens=131072,
+        output_tokens=8192,
+        concurrency=64,
+        prefill_tokens=4096,
+        decode_bs=(1, 2, 4, 8, 16, 32),
+        context_length=131072 + 8192,
+        max_total_tokens=4000000,
     ),
 }
 

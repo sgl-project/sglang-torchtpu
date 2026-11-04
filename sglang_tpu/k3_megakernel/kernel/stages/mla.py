@@ -44,6 +44,35 @@ _MASK = float(jnp.finfo(jnp.bfloat16).min)
 
 
 REPLICATED = 2176  # w1 columns every rank needs: q_a 1536 | kv_c 512 | k_pe 64 | 0 64
+# K3.1 DSA layers (``MlaStage(dsa=True)``): two more replicated 128-column blocks for the indexer's
+# replicated input projections, so w1 = q_a | kv_c | k_pe | 0 | idx_wk (128) | idx_weights_proj (32) | 0 (96)
+# | g_proj. ``W1Split.per`` stays ceil(19 / 8) = 3 blocks per lane at 8 lanes (no extra per-lane stream).
+IDX_K = 2176  # indexer key projection wk: [H, 128] -> key (pre-LayerNorm)
+IDX_W = 2304  # indexer weights_proj: [H, 32] (head weights, unscaled; padded to 128 columns)
+REPLICATED_DSA = 2432
+IDX_HEADS, IDX_DIM = 32, 128  # index heads x head dim (wq_b: [32 * 128, 1536])
+
+
+def replicated_cols(dsa: bool) -> int:
+    return REPLICATED_DSA if dsa else REPLICATED
+
+
+class DsaRefs:
+    """Per-layer DSA inputs the stack hands to ``MlaStage.body`` / ``body_rows`` on K3.1 (``dsa=True``).
+
+    idx_caches: the index-key pools, same convention as the latent ``caches`` (per-layer refs
+                ``u8[pages, 32, 4, 256]``, or one stacked ``[n_mla, pages, 32, 4, 256]``); ``which`` = MLA index.
+                Record per token (native ``index_key_cache_shape``): 128 e4m3 key bytes | 1 UE8M0 scale byte |
+                zero padding; token t is at ``[pages[t // 128], (t % 128) // 4, t % 4]``.
+    idx_qb    : HBM ref ``[n_mla, 1536, 512]`` (dense dtype) = wq_b rows of index heads 4 * lane .. 4 * lane + 3,
+                transposed; layer ``which`` at ``idx_qb.at[which]`` (``idx_qb_s`` its e4m3 column scales or None).
+    knorm_w / knorm_b: f32 ``[1, 128]`` values of the key LayerNorm (eps 1e-5).
+    The w1 projection ``y`` already holds ``wk x`` (columns ``IDX_K:IDX_K+128``) and ``weights_proj x``
+    (``IDX_W:IDX_W+32``, unscaled), every column on every rank."""
+
+    def __init__(self, idx_caches, idx_qb, idx_qb_s, knorm_w, knorm_b):
+        self.idx_caches, self.idx_qb, self.idx_qb_s = idx_caches, idx_qb, idx_qb_s
+        self.knorm_w, self.knorm_b = knorm_w, knorm_b
 
 
 class W1Split(msgspec.Struct, frozen=True):
@@ -53,10 +82,11 @@ class W1Split(msgspec.Struct, frozen=True):
     Each column's dot and K-chunking are unchanged, so the values are bit-identical."""
 
     lanes: int
+    replicated: int = REPLICATED  # REPLICATED_DSA on K3.1 DSA layers
 
     @property
     def blocks(self) -> int:
-        return REPLICATED // 128
+        return self.replicated // 128
 
     @property
     def per(self) -> int:
@@ -83,7 +113,7 @@ class W1Split(msgspec.Struct, frozen=True):
 
 
 class SplitW1Projection:
-    """``x @ w1`` (all ``2176 + hd`` columns) from this lane's replicated slice ``rep``, the
+    """``x @ w1`` (all ``replicated + hd`` columns) from this lane's replicated slice ``rep``, the
     in-host gather of the other lanes' slices and this rank's g_proj columns ``gate``."""
 
     def __init__(self, split: W1Split, rep, gate, gather):
@@ -127,8 +157,11 @@ class MlaStage:
         kv_window: bool = False,
         block_pages: int = BLOCK_PAGES,
         rows: int = 1,
+        dsa: bool = False,
     ):
-        """``early_kv`` starts the first KV block's page DMAs before the projections;
+        """``dsa``: K3.1 DSA layer weights (w1 carries the indexer's wk / weights_proj blocks, see
+        ``REPLICATED_DSA``; the stack also passes ``DsaRefs`` to ``body`` / ``body_rows``).
+        ``early_kv`` starts the first KV block's page DMAs before the projections;
         ``async_write`` leaves the new token's cache write in flight (``wait_new`` drains it).
         ``kv_window``: the KV buffer is zeroed once per call (``clear_kv``) and only the last
         fetched page is masked / patched with the new token, in place; the cache write then
@@ -142,6 +175,10 @@ class MlaStage:
         # only the online-softmax blocking (f32 reordering).
         assert 16 % block_pages == 0, block_pages
         self.bp = block_pages
+        # K3.1 sparse-MLA softmax numerics (as the native mla_sparse kernel): f32 scores (no bf16
+        # rounding) and/or f32 probabilities in p @ kv_c. Default: K3 / sglang dense decode numerics.
+        self.score_f32 = False
+        self.pv_f32 = False
         self.skip_core = (
             False  # benchmark-only: no attention over the cache, no cache write
         )
@@ -154,11 +191,16 @@ class MlaStage:
         )
         self.relax = relax
         self.rows = rows
+        self.dsa = dsa
+        self.rep = replicated_cols(dsa)  # g_proj column offset in w1
+        # DSA selection hook (``stages.dsa.DsaStage``): None = dense MLA over every cached token,
+        # which is exactly native K3.1 while kv_len <= index_topk (2048). See ``_dsa_select``.
+        self.dsa_stage = None
         self.heads = heads // topo.world
         self.hd = self.heads * 128
         self.out = OutProjSpec(topo, self.hd, hidden, relax, rows=rows)
         self.streams = (
-            (hidden, 2176 + self.hd),
+            (hidden, self.rep + self.hd),
             (1536, 2 * self.hd),
             self.out.weight_shape,
         )
@@ -332,9 +374,12 @@ class MlaStage:
         sems,
         acc_ref,
         started=False,
+        select=None,
     ):
         """``ql`` [h, 512], ``qp`` [h, 128] bf16; the new token (index kv_len-1) is patched
-        into its block before use. Returns bf16-valued o_lat [h, 512]."""
+        into its block before use. Returns bf16-valued o_lat [h, 512]. ``select(b, col)`` (DSA,
+        optional): bool, broadcastable to the block's scores ``[h, n_tok]`` (``col`` = absolute token
+        positions), False masks the token out like a position past kv_len."""
         n_tok = self.bp * PAGE
         n_pages = (kv_len + PAGE - 1) // PAGE
         n_blocks = (kv_len + n_tok - 1) // n_tok
@@ -371,16 +416,18 @@ class MlaStage:
             s = s + jax.lax.dot_general(
                 qp, tok[:, LATENT:], _NT, preferred_element_type=jnp.float32
             )
-            s = bf16(s * SM_SCALE)
+            s = s * SM_SCALE if self.score_f32 else bf16(s * SM_SCALE)
             col = b * n_tok + jax.lax.broadcasted_iota(jnp.int32, s.shape, 1)
             s = jnp.where(col < kv_len, s, _MASK)
+            if select is not None:
+                s = jnp.where(select(b, col), s, _MASK)
             m_new = jnp.maximum(m, jnp.max(s, axis=1, keepdims=True))
             p = jnp.exp(s - m_new)
             alpha = jnp.exp(m - m_new)
             l_new = alpha * l + jnp.sum(p, axis=1, keepdims=True)
             pv = jax.lax.dot_general(
-                p.astype(jnp.bfloat16),
-                tok[:, :LATENT],
+                p if self.pv_f32 else p.astype(jnp.bfloat16),
+                tok[:, :LATENT].astype(jnp.float32) if self.pv_f32 else tok[:, :LATENT],
                 DN,
                 preferred_element_type=jnp.float32,
             )
@@ -447,11 +494,23 @@ class MlaStage:
 
     # ----- speculative verify: R rows at positions kv0 - 1 .. kv0 + R - 2 -----
     def attend_rows(
-        self, ql, qp, new_rows, caches, which, pages_ref, kv0, kv_buf, sems, acc_ref
+        self,
+        ql,
+        qp,
+        new_rows,
+        caches,
+        which,
+        pages_ref,
+        kv0,
+        kv_buf,
+        sems,
+        acc_ref,
+        select=None,
     ):
         """``attend`` for R query rows (``ql`` [h * R, 512] / ``qp`` [h * R, 128] head-major); row r sees
         the cache up to its own token at ``kv0 - 1 + r``. Per row the arithmetic is ``attend``'s at
-        kv_len ``kv0 + r`` (masked columns and blocks add exact zeros)."""
+        kv_len ``kv0 + r`` (masked columns and blocks add exact zeros). ``select(b, col)`` (DSA): bool
+        broadcastable to ``[h * R, n_tok]`` (row i is query row ``i % R``), see ``attend``."""
         rows = new_rows.shape[0]
         kv_end = kv0 + rows - 1
         n_tok = self.bp * PAGE
@@ -482,16 +541,18 @@ class MlaStage:
             s = s + jax.lax.dot_general(
                 qp, tok[:, LATENT:], _NT, preferred_element_type=jnp.float32
             )
-            s = bf16(s * SM_SCALE)
+            s = s * SM_SCALE if self.score_f32 else bf16(s * SM_SCALE)
             col = b * n_tok + jax.lax.broadcasted_iota(jnp.int32, s.shape, 1)
             s = jnp.where(col < lim, s, _MASK)
+            if select is not None:
+                s = jnp.where(select(b, col), s, _MASK)
             m_new = jnp.maximum(m, jnp.max(s, axis=1, keepdims=True))
             p = jnp.exp(s - m_new)
             alpha = jnp.exp(m - m_new)
             l_new = alpha * l + jnp.sum(p, axis=1, keepdims=True)
             pv = jax.lax.dot_general(
-                p.astype(jnp.bfloat16),
-                tok[:, :LATENT],
+                p if self.pv_f32 else p.astype(jnp.bfloat16),
+                tok[:, :LATENT].astype(jnp.float32) if self.pv_f32 else tok[:, :LATENT],
                 DN,
                 preferred_element_type=jnp.float32,
             )
@@ -577,6 +638,35 @@ class MlaStage:
                     op=op,
                 )
 
+    def _dsa_select(self, dsa, **kw):
+        """DSA hook, called after the w1 projection and before attention: ``None`` (dense attention
+        over all cached tokens) unless a DSA stage is attached. The stage
+        (``self.dsa_stage.decode(dsa, x=, y=, q_lora=, which=, pages_ref=, kv_len=)`` for B1,
+        ``.rows(dsa, x=, y=, q_lora=, which=, pages_ref=, kv0=)`` for R rows) writes the new token(s)'
+        index keys and returns the ``select`` callable of ``attend`` / ``attend_rows`` (or None when
+        every token is selected, e.g. kv_len <= 2048)."""
+        if dsa is None or self.dsa_stage is None:
+            return None
+        if "kv0" in kw:
+            return self.dsa_stage.rows(dsa, **kw)
+        return self.dsa_stage.decode(dsa, **kw)
+
+    def _dsa_begin(self, dsa, **kw):
+        """DSA phase 1 (before the w1 projection): start the stage's DMAs (``DsaStage.begin``)."""
+        if dsa is not None and self.dsa_stage is not None and self.dsa_stage.early:
+            self.dsa_stage.begin(dsa, **kw)
+
+    def _dsa_ready(self):
+        """DSA phase 3 (after the q path, before attend): gather finish + selection."""
+        if self.dsa_stage is not None:
+            self.dsa_stage.ready()
+
+    def _dsa_finish(self, select):
+        """Drains the DSA stage's index-key write (after the last use of its mask)."""
+        if self.dsa_stage is not None and self.dsa_stage.last_run is not None:
+            self.dsa_stage.last_run.finish()
+            self.dsa_stage.last_run = None
+
     def body_rows(
         self,
         x,
@@ -597,15 +687,20 @@ class MlaStage:
         wsem,
         acc_ref,
         out_proj,
+        dsa=None,
     ):
         """``body`` for ``x`` bf16 [R, H] at kv lengths ``kv0 .. kv0 + R - 1`` (speculative verify)."""
         hd, h = self.hd, self.heads
         rows = x.shape[0]
+        self._dsa_begin(dsa, which=which, pages_ref=pages_ref, kv0=kv0)
         y = w1.matmul(x, prefetched=False)
         q = rmsnorm(bf16(y[:, :1536]), qnorm, self.eps)
         kvc = rmsnorm(bf16(y[:, 1536:2048]), kvnorm, self.eps)
         kpe = bf16(y[:, 2048:2176])
-        gate = bf16(y[:, 2176 : 2176 + hd])
+        gate = bf16(y[:, self.rep : self.rep + hd])
+        select = self._dsa_select(
+            dsa, x=x, y=y, q_lora=q, which=which, pages_ref=pages_ref, kv0=kv0
+        )
         new_rows = jnp.concatenate([kvc, kpe], axis=1).astype(jnp.bfloat16)  # [R, 640]
         qq = bf16(qb.matmul(q.astype(jnp.bfloat16), prefetched=False))
         qn = qq[:, :hd].astype(jnp.bfloat16)
@@ -623,6 +718,7 @@ class MlaStage:
             axis=0,
         ).astype(jnp.bfloat16)  # [h * R, 512], head-major
         qp = jnp.concatenate([qp[:, i * 128 : (i + 1) * 128] for i in range(h)], axis=0)
+        self._dsa_ready()
         if self.skip_core:  # benchmark-only
             o_lat = jnp.zeros((h * rows, LATENT), jnp.float32)
         else:
@@ -638,8 +734,10 @@ class MlaStage:
                     kv_buf,
                     sems,
                     acc_ref,
+                    select=select,
                 )
                 self.write_rows(new_rows, caches, which, pages_ref, kv0, word_ref, wsem)
+                self._dsa_finish(select)
         o_lat = o_lat.astype(jnp.bfloat16)
         attn = jnp.concatenate(
             [
@@ -677,15 +775,20 @@ class MlaStage:
         wsem,
         acc_ref,
         out_proj,
+        dsa=None,
     ):
         hd, h = self.hd, self.heads
         if self.early_kv:
             self.start_kv(caches, which, pages_ref, kv_len, kv_buf, sems)
+        self._dsa_begin(dsa, which=which, pages_ref=pages_ref, kv0=kv_len)
         y = w1.matmul(x, prefetched=False)
         q = rmsnorm(bf16(y[:, :1536]), qnorm, self.eps)
         kvc = rmsnorm(bf16(y[:, 1536:2048]), kvnorm, self.eps)
         kpe = bf16(y[:, 2048:2176])  # 64 k_pe + 64 zero columns
-        gate = bf16(y[:, 2176 : 2176 + hd])
+        gate = bf16(y[:, self.rep : self.rep + hd])
+        select = self._dsa_select(
+            dsa, x=x, y=y, q_lora=q, which=which, pages_ref=pages_ref, kv_len=kv_len
+        )
         new_row = jnp.concatenate([kvc, kpe], axis=1).astype(jnp.bfloat16)  # [1, 640]
         qq = bf16(qb.matmul(q.astype(jnp.bfloat16), prefetched=False))
         qn, qp = qq[:, :hd], qq[:, hd:]
@@ -699,6 +802,7 @@ class MlaStage:
             ],
             axis=0,
         ).astype(jnp.bfloat16)
+        self._dsa_ready()
         if self.skip_core:
             if self.early_kv:
                 self._wait_block(
@@ -725,10 +829,12 @@ class MlaStage:
                     sems,
                     acc_ref,
                     started=self.early_kv,
+                    select=select,
                 )
                 self.write_new(
                     new_row, caches, which, pages_ref, kv_len, kv_buf, word_ref, wsem
                 )
+                self._dsa_finish(select)
         o_lat = o_lat.astype(jnp.bfloat16)
         attn = jnp.concatenate(
             [

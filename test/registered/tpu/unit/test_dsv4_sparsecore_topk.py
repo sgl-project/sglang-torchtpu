@@ -208,7 +208,7 @@ def _run(scores: np.ndarray, k: int, row_lengths: np.ndarray) -> np.ndarray:
 # doubled.
 SHAPES = [
     pytest.param(64, N_SHORT, 2048, 1, id="p1-b64-n10240"),
-    pytest.param(16, N_SHORT, 2048, 2, id="p2-b16-n10240"),
+    pytest.param(16, N_SHORT, 2048, 1, id="p1-b16-n10240"),
     pytest.param(16, N_128K, 2048, 8, id="p8-b16-n133120"),
     pytest.param(64, N_128K, 2048, 8, id="p8-b64-n133120"),
     pytest.param(16, N_128K, 512, 8, id="p8-b16-n133120-k512"),
@@ -441,6 +441,8 @@ def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[int | None]:
         return out, out
 
     monkeypatch.setattr(sc_module, "_sc_topk_direct", _stub)
+    # Only the partitioned path: the short-row branches would add their own calls.
+    monkeypatch.setattr(sc_module, "_short_rows_fast_path", lambda: False)
     sc_module.sparsecore_topk.__wrapped__(jnp.zeros((b, n), jnp.float32), k, **kwargs)
     return seen
 
@@ -519,3 +521,56 @@ def test_scheduling_group_ids_do_not_change_the_selection(kind):
         np.sort(np.take_along_axis(scores, np.maximum(plain, 0), axis=1), axis=1),
         np.sort(np.take_along_axis(scores, np.maximum(grouped, 0), axis=1), axis=1),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Long-context pools (Kimi-K3.1 DSA, b=1 decode / short prefill chunks).
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("n", [65536, 163840])
+def test_partition_count_keeps_stage_two_in_one_slice_at_b1(n):
+    """At b=1 the doubling loop used to grow P until stage 2's P * k candidates
+    passed one slice; stage 2 then recursed into the jitted function, which JAX
+    rejects (compile crash at context >= 64K)."""
+    k = 2048
+    p = _pick_partition(1, n, k)
+    assert p * min(k, n // p) <= MAX_SLICE_WORDS, p
+    rng = np.random.default_rng(SEED)
+    scores = _scores("random", 1, n, rng)
+    for length in (n, n // 3):
+        row_lengths = np.full(1, length, np.int32)
+        assert _mismatch(scores, _run(scores, k, row_lengths), k, row_lengths) is None
+
+
+def _run_short_rows(scores, k, row_lengths, enabled: bool) -> np.ndarray:
+    from sglang_tpu.envs import envs as tpu_envs
+
+    # A fresh jit: the env is read at trace time.
+    fn = jax.jit(sc_module.sparsecore_topk.__wrapped__, static_argnames=("k",))
+    with tpu_envs.SGLANG_TPU_SCTOPK_SHORT_ROWS.override(enabled):
+        return np.asarray(
+            jax.block_until_ready(
+                fn(jnp.asarray(scores), k=k, row_lengths=jnp.asarray(row_lengths))
+            )
+        )
+
+
+@pytest.mark.parametrize("max_len", [4096, 32768, 40000])
+def test_short_rows_take_one_slice_with_the_same_selection(max_len):
+    """Rows whose valid prefix fits one slice run one pass over the narrowest
+    4096-wide bucket; the selection equals the partitioned path's. 4096 is a
+    bucket boundary, 32768 the slice boundary; a row past one slice (40000)
+    keeps the partitioned path."""
+    b, n, k = 16, N_128K, 2048
+    assert _pick_partition(b, n, k) > 1
+    rng = np.random.default_rng(SEED)
+    scores = _scores("random", b, n, rng)
+    row_lengths = np.array(
+        [max_len - (i * 997) % max(1, max_len // 2) for i in range(b)], np.int32
+    )
+    row_lengths[0] = max_len
+    fast = _run_short_rows(scores, k, row_lengths, True)
+    slow = _run_short_rows(scores, k, row_lengths, False)
+    assert _mismatch(scores, fast, k, row_lengths) is None
+    np.testing.assert_array_equal(np.sort(fast, axis=1), np.sort(slow, axis=1))

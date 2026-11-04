@@ -953,6 +953,16 @@ def sparse_ragged_paged_attention(
     return out
 
 
+def _spread(hashed: jax.Array, bound: int) -> jax.Array:
+    """Map arbitrary int32 values into [0, bound) to spread padding reads.
+
+    TPU has no integer divider, so ``%`` by a non-power-of-two constant lowers
+    to a multiply-shift sequence per element. Masking to the largest power of
+    two <= bound spreads the reads just as well.
+    """
+    return hashed & ((1 << (bound.bit_length() - 1)) - 1)
+
+
 def prepare_gather_indices(
     topk_indices: jax.Array,  # i32[max_num_tokens, csa_topk]
     page_indices: jax.Array | None,  # i32[max_num_seqs * pages_per_seq]
@@ -991,14 +1001,14 @@ def prepare_gather_indices(
         )
 
         # Scatter "-1" padding across the cache to avoid read hot spots.
-        scattered_page_ids = (flat_element_index * 104729) % total_num_pages
-        scattered_token_offset = (flat_element_index * 15485863) % page_size
+        scattered_page_ids = _spread(flat_element_index * 104729, total_num_pages)
+        scattered_token_offset = _spread(flat_element_index * 15485863, page_size)
         page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
         token_offset = jnp.where(is_padding, scattered_token_offset, token_offset)
         physical_indices = page_ids * page_size + token_offset
     else:
         total_tokens = total_num_pages * page_size
-        scattered_physical = (flat_element_index * 15485863) % total_tokens
+        scattered_physical = _spread(flat_element_index * 15485863, total_tokens)
         physical_indices = jnp.where(is_padding, scattered_physical, topk_indices)
 
     physical_indices = physical_indices.astype(jnp.int32)

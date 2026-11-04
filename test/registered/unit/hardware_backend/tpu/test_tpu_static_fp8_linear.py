@@ -284,6 +284,7 @@ class _Norm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.rand(width) + 0.5)
         self.variance_size_override = variance_size_override
+        self.cast_x_before_out_mul = False
 
 
 def _linear(n, k, unquantized=True):

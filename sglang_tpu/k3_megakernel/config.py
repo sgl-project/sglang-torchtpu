@@ -85,12 +85,37 @@ class MoeLayout(msgspec.Struct, frozen=True):
     dims: K3Dims
     topo: Topology
     replicas: int = 0
+    # Weight loading only: ``ckpt_blocks[h]`` = the checkpoint's expert block (of E/H experts) that kernel
+    # host h serves, for EP-local checkpoints whose hosts hold their blocks in another order than the
+    # kernel's host order. Kernel expert e then is checkpoint
+    # expert ``ckpt_expert(e)``; the router columns / bias are permuted the same way (``expert_perm``),
+    # so routing and the MoE sum are unchanged up to the f32 order of the combine. () = identity.
+    ckpt_blocks: tuple = ()
 
     def __post_init__(self):
         if not 0 <= self.replicas <= self.experts_per_host:
             raise ValueError(
                 f"expert replicas {self.replicas} not in [0, {self.experts_per_host}]"
             )
+        if self.ckpt_blocks and sorted(self.ckpt_blocks) != list(
+            range(self.topo.hosts)
+        ):
+            raise ValueError(
+                f"ckpt_blocks {self.ckpt_blocks} is not a permutation of {self.topo.hosts} host blocks"
+            )
+
+    def ckpt_expert(self, expert: int) -> int:
+        """Checkpoint id of kernel expert ``expert``."""
+        if not self.ckpt_blocks:
+            return expert
+        eh = self.experts_per_host
+        return self.ckpt_blocks[expert // eh] * eh + expert % eh
+
+    def expert_perm(self):
+        """Checkpoint id of every kernel expert (router column / bias order), or None for identity."""
+        if not self.ckpt_blocks:
+            return None
+        return [self.ckpt_expert(e) for e in range(self.dims.num_experts)]
 
     @property
     def experts_per_host(self) -> int:

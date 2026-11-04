@@ -44,5 +44,7 @@ CONFIG["runtime_env"].update(
         # fp8 dense weights, bf16 reduction transport, o_proj reduced through the
         # chip pair; GSM8K-checked (see the cookbook page).
         "SGLANG_TPU_OPT_K3_MEGAKERNEL_RELAX": "dense_fp8,pair_oproj,bf16_transport",
+        # SGLANG_TPU_K3_MEGAKERNEL_PREFILL_BLOCK stays at its default 8: 16 is
+        # validated only on Kimi-K3.1, not on this model.
     }
 )

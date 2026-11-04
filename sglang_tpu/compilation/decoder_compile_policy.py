@@ -50,6 +50,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang_tpu._logging import get_logger
+from sglang_tpu.compilation import aot_fast_runtime_wrapper
 from sglang_tpu.compilation.attention_rank_inputs import (
     get_attention_rank_tensors,
     use_attention_rank_tensors,
@@ -788,6 +789,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             or server_args.unsafe_load_torch_compile_bundle is not None
         )
         compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile
+        aot_fast_runtime_wrapper.install_from_env()
         # The bundle Compiler installs its own guard filter for restorable guards.
         options = None if use_bundle else _guard_filter_options(server_args)
         return compiler(
@@ -2180,6 +2182,8 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             return super()._extend_serving_variants()
         # "text_ids" warms positional token-ID calls used by text-only serving,
         # in addition to the input_embeds calls used by multimodal serving.
+        if tpu_envs.SGLANG_TPU_VL_TEXT_ONLY_EXTEND.get():
+            return ("text_ids",)
         return (*self._extend_input_variants(), "text_ids")
 
     def _direct_compile_specialization_key(

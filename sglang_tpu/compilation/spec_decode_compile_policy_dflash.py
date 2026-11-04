@@ -164,11 +164,17 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         from sglang.srt.runtime_context import get_parallel
 
         # The TPU KV appender projects target hidden states outside draft_tp_context,
-        # so a row-parallel fc would reduce over the wrong group under DP attention.
-        if envs.SGLANG_DFLASH_ROW_PARALLEL_FC.get() and get_parallel().attn_dp_enabled:
-            raise NotImplementedError(
-                "SGLANG_DFLASH_ROW_PARALLEL_FC is not supported with DP attention on TPU"
-            )
+        # so a row/column-parallel fc would reduce or gather over the wrong group under
+        # DP attention.
+        if get_parallel().attn_dp_enabled:
+            for flag in (
+                envs.SGLANG_DFLASH_ROW_PARALLEL_FC,
+                envs.SGLANG_DFLASH_COLUMN_PARALLEL_FC,
+            ):
+                if flag.get():
+                    raise NotImplementedError(
+                        f"{flag.name} is not supported with DP attention on TPU"
+                    )
         model = self.model_runner.model
         if tpu_envs.SGLANG_TPU_DFLASH_FP8_DRAFT.get():
             from sglang_tpu.fp8_weight_linear import (
