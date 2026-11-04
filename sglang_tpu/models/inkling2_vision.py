@@ -19,13 +19,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import VisionAttention, VisionTpuAttention
 from sglang.srt.utils import add_prefix
 
-# ViT rows (native patches plus one CLS per image) a bucket holds; multiples of
-# the flash kernel's 128-row block. 16384 rows is a 64x64 merged grid and the
-# largest the flash kernel fits in VMEM; the processor downscales bigger images.
-ROW_BUCKETS = (512, 2048, 8192, 16384)
+# ViT rows (native patches plus one CLS per image) a bucket holds; the processor
+# downscales images that do not fit the largest.
+ROW_BUCKETS = (512, 2048, 8192, 16384, 32768, 65536)
 
 _CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 _CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
@@ -71,6 +70,13 @@ class Inkling2VisionLayer(nn.Module):
             use_data_parallel=True,
             prefix=add_prefix("self_attn", prefix),
         )
+        if type(self.self_attn.qkv_backend) is VisionTpuAttention:
+            # Splash skips the padding blocks and keeps VMEM flat past 16k rows.
+            from sglang_tpu.attention.vision_splash import VisionTpuSplashAttention
+
+            self.self_attn.qkv_backend = VisionTpuSplashAttention(
+                head_dim, heads, heads, flatten_batch=True, softmax_scale=head_dim**-0.5
+            )
         if not getattr(self.self_attn.qkv_backend, "supports_segment_ids", False):
             raise ValueError(
                 "Inkling2 vision needs an mm attention backend that honors segment_ids; "
