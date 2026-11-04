@@ -280,6 +280,30 @@ class TestDpHooks(CustomTestCase):
         self.assertEqual(self.alloc.free_in_group(1 - group), free_before + 2)
         self.assertEqual(self.alloc.group_requests, [0, 0])
 
+    def test_a_request_lifecycle_returns_every_page(self):
+        """Prealloc, transfer rows, the swap's landing release, core's page
+        free and the release hook: availability is whole again (staged pages
+        count: the leak check reads it)."""
+        import numpy as np
+        import torch
+        from types import SimpleNamespace
+
+        from sglang_tpu.hooks import k3_program as hooks
+
+        full = self.alloc.available_size()
+        req, kv = self._prealloc("a", 5)
+        pages = sorted({int(x) // self.PAGE for x in kv.tolist()})
+        hooks.k3_program_dp_transfer_rows(
+            lambda q, d, k, p: np.asarray(pages, np.int32),
+            self.queue, SimpleNamespace(req=req), None, self.PAGE,
+        )
+        self.assertLess(self.alloc.available_size(), full)
+        self.alloc.free_landing(torch.as_tensor(np.asarray(req._k3_dp_transfer[1], np.int32)))
+        req._k3_dp_transfer = (req._k3_dp_transfer[0], ())
+        self.alloc.free(kv)
+        hooks.k3_program_dp_release(None, req)
+        self.assertEqual(self.alloc.available_size(), full)
+
     def test_admission_reserves_landing_pages(self):
         from sglang_tpu.hooks import k3_program as hooks
 

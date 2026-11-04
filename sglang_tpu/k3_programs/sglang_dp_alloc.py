@@ -64,7 +64,7 @@ class K3DpPagedAllocator(TpuPagedTokenToKVPoolAllocator):
     def free_in_group(self, group: int, *, held: bool = False) -> int:
         """Free pages of ``group``'s region (``held``: and those the free
         fence holds until in-flight forwards finish)."""
-        lists = [self.free_pages]
+        lists = [self.free_pages, *getattr(self, "staged_pages", ())]
         if self.release_pages is not None and len(self.release_pages):
             lists.append(self.release_pages)
         if held:
