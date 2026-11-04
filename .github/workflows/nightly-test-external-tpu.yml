@@ -1,5 +1,5 @@
 name: Nightly Test (External TPU)
-run-name: Read live ${{ inputs.model }} page-cache trial logs
+run-name: Read live ${{ inputs.model }} one-reader prefetch logs
 on:
   workflow_dispatch:
     inputs:
@@ -20,7 +20,7 @@ jobs:
       TARGET_MODEL: ${{ inputs.model }}
       EXTERNAL_NODEPOOL_2X2X2_1: ${{ secrets.EXTERNAL_NODEPOOL_2X2X2_1 }}
       EXTERNAL_NODEPOOL_2X2X2_3: ${{ secrets.EXTERNAL_NODEPOOL_2X2X2_3 }}
-      CANDIDATE_IMAGE: us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu@sha256:4cba0731aab850af74de3caf5b583044f5b8a74a758e1be9906c29796b8a097f
+      CANDIDATE_IMAGE: us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu@sha256:531cb2e1e509622cd9d034df2871da71bc83fe0d200af18aa642e5456c10f728
     steps:
       - uses: actions/checkout@v4
         with:
@@ -47,7 +47,7 @@ jobs:
                   if pod['status']['phase'] == 'Running'
                   and pod['spec'].get('nodeSelector', {}).get('cloud.google.com/gke-nodepool') == os.environ['EXTERNAL_NODEPOOL_2X2X2_1' if os.environ['TARGET_MODEL'] == 'gpt' else 'EXTERNAL_NODEPOOL_2X2X2_3']
                   and any(c['image'] == os.environ['CANDIDATE_IMAGE'] for c in pod['spec']['containers'])
-                  and pod['metadata']['labels'].get('jobset.sigs.k8s.io/jobset-name', '').startswith(os.environ['TARGET_MODEL'] + '-prefetch-pagecache-')]
+                  and pod['metadata']['labels'].get('jobset.sigs.k8s.io/jobset-name', '').startswith('selfhost-1-' if os.environ['TARGET_MODEL'] == 'gpt' else 'selfhost-3-')]
           assert len(pods) == 1, f'Expected one running candidate pod, found {len(pods)}'
           print(pods[0]['metadata']['name'])
           PY
