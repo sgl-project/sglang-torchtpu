@@ -301,7 +301,10 @@ jobs:
           if-no-files-found: error
 
   publish-image:
-    needs: [resolve, build, smoke, scan, wheels]
+    # The image is gated on its own build, smoke and scan; the wheels only gate
+    # the GitHub Release (their dependency check cannot reach every index the
+    # image installs from).
+    needs: [resolve, build, smoke, scan]
     if: inputs.target != 'none'
     runs-on: ubuntu-latest
     # Required reviewers on this environment are the approval step. It also holds
