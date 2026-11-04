@@ -246,21 +246,23 @@ class TestPlatformAllowsTheK3HostTier(CustomTestCase):
     def test_hierarchical_cache_passes_only_under_k3_program(self):
         from sglang_tpu.tpu_platform import TpuSRTPlatform
 
+        # Server-args resolution: the spec namespace is not published yet, so
+        # the check reads the view's speculative algorithm.
         view = SimpleNamespace(
             enable_mixed_chunk=False,
             disable_radix_cache=False,
             mamba_radix_cache_strategy="extra_buffer",
             enable_hierarchical_cache=True,
             enable_int8_mamba_checkpoint=False,
+            speculative_algorithm=None,
         )
-        with mock.patch("sglang_tpu.tpu_platform._k3_program_selected", return_value=False):
-            with self.assertRaisesRegex(ValueError, "hierarchical-cache"):
-                TpuSRTPlatform().validate_mamba_prefix_cache(view)
-        with mock.patch("sglang_tpu.tpu_platform._k3_program_selected", return_value=True):
+        with self.assertRaisesRegex(ValueError, "hierarchical-cache"):
             TpuSRTPlatform().validate_mamba_prefix_cache(view)
-            view.enable_int8_mamba_checkpoint = True  # still refused
-            with self.assertRaisesRegex(ValueError, "int8-mamba-checkpoint"):
-                TpuSRTPlatform().validate_mamba_prefix_cache(view)
+        view.speculative_algorithm = "K3_PROGRAM"
+        TpuSRTPlatform().validate_mamba_prefix_cache(view)
+        view.enable_int8_mamba_checkpoint = True  # still refused
+        with self.assertRaisesRegex(ValueError, "int8-mamba-checkpoint"):
+            TpuSRTPlatform().validate_mamba_prefix_cache(view)
 
 
 class _StubPrefill:
