@@ -21,7 +21,7 @@ class _ModelRegistry:
     # Keyed by model_arch
     models: Dict[str, Union[Type[nn.Module], str]] = field(default_factory=dict)
     _default_models_loaded: bool = True
-    _pending_packages: List[Tuple[str, bool]] = field(default_factory=list)
+    _pending_packages: List[Tuple[str, bool, bool]] = field(default_factory=list)
 
     def _load_models(self):
         if not self._default_models_loaded:
@@ -29,13 +29,28 @@ class _ModelRegistry:
             self._default_models_loaded = True
 
         while self._pending_packages:
-            package_name, strict = self._pending_packages[0]
-            self._register_classes(import_model_classes(package_name, strict=strict))
+            package_name, strict, overwrite = self._pending_packages[0]
+            self._register_classes(
+                import_model_classes(package_name, strict=strict), overwrite=overwrite
+            )
             self._pending_packages.pop(0)
 
-    def register_lazy(self, package_name: str, strict: bool = False):
+    def _load_pending_overwrites(self):
+        # An overwriting package wins over the defaults whenever they load, so
+        # it can be imported without importing the default catalog.
+        while self._pending_packages and self._pending_packages[0][2]:
+            package_name, strict, _ = self._pending_packages[0]
+            self.models.update(import_model_classes(package_name, strict=strict))
+            self._pending_packages.pop(0)
+        # One queued behind a plain package must wait for it, in order.
+        if any(overwrite for _, _, overwrite in self._pending_packages):
+            self._load_models()
+
+    def register_lazy(
+        self, package_name: str, overwrite: bool = False, strict: bool = False
+    ):
         """Defer package imports and duplicate checks until catalog loading."""
-        self._pending_packages.append((package_name, strict))
+        self._pending_packages.append((package_name, strict, overwrite))
 
     def register(
         self, package_name: str, overwrite: bool = False, strict: bool = False
@@ -103,6 +118,8 @@ class _ModelRegistry:
         self,
         architectures: Union[str, List[str]],
     ) -> Tuple[Type[nn.Module], str]:
+        # A pending overwrite may replace an arch the fast path would return.
+        self._load_pending_overwrites()
         # Fast startup path: resolve registered models without importing defaults.
         if architectures:
             first_arch = (
