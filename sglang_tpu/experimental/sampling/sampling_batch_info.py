@@ -7,6 +7,7 @@ from typing import Callable
 
 import torch
 
+from sglang.srt.sampling.penaltylib import repetition_penalty
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.utils.common import is_pin_memory_available
 
@@ -109,3 +110,43 @@ class HostPaddedSamplingInfo(SamplingBatchInfo):
             if (value := getattr(self, name)) is not None
         }
         return dataclasses.replace(self, **moved)
+
+    def device_penalties(
+        self, rows: int
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """(additive, scaling) penalty snapshots at rows, padded neutrally (0 and 1).
+
+        The snapshot holds the live rows. Like the shared penalizer state it comes
+        from, its pad is eager and compiles once per new live size.
+        """
+        return (
+            self._pad_penalty_rows(self.acc_additive_penalties, rows, 0.0),
+            self._pad_penalty_rows(self.acc_scaling_penalties, rows, 1.0),
+        )
+
+    def _apply_pre_grammar_logits_transforms(self, logits: torch.Tensor) -> None:
+        # Extend logits keep the bucket rows; the penalty state has the live rows.
+        additive, scaling = self.device_penalties(logits.shape[0])
+        if additive is not None:
+            logits.add_(additive)
+        if scaling is not None:
+            # Looked up at call time: core wraps it in torch.compile, and the TPU
+            # platform unwraps the module attribute only after this import.
+            repetition_penalty.apply_scaling_penalties(logits, scaling)
+        if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
+            self.penalizer_orchestrator.apply(logits[: len(self)])
+
+    def _pad_penalty_rows(
+        self, value: torch.Tensor | None, rows: int, fill: float
+    ) -> torch.Tensor | None:
+        if value is None:
+            return None
+        value = value[: self.real_batch_size]
+        if value.device.type == "cpu":
+            pin = is_pin_memory_available(self.device)
+            return _pad_host_rows(value, rows, fill, pin).to(
+                self.device, non_blocking=True
+            )
+        return torch.nn.functional.pad(
+            value, (0, 0, 0, rows - value.shape[0]), value=fill
+        )
