@@ -18,6 +18,8 @@ The kernel reads either of two KV cache layouts, chosen once here from
 # NOTE: do *not* add ``from __future__ import annotations`` here (see
 # attention_pallas_rpa_base for why torch_tpu's jax_op needs real annotations).
 
+import torch
+
 from sglang_tpu.attention_pallas_rpa_base import (
     BaseTpuPallasRpaAttnBackend,
     PallasForwardMetadata,
@@ -147,6 +149,38 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
         self._pp_schedule_runner = model_runner if parallel.pp_size > 1 else None
         self._cp_schedule_runner = model_runner if parallel.attn_cp_size > 1 else None
 
+        self._cp_op = None
+        from sglang_tpu.batched_rpa_cp import PcpBatchedMetadata
+
+        self.pcp_forward_metadata = PcpBatchedMetadata.create_empty(self.device)
+        if parallel.attn_cp_size > 1:
+            from sglang.srt.layers.cp.zigzag import set_zigzag_tpu_layout
+            from sglang_tpu.batched_rpa_cp import (
+                build_batched_rpa_cp_op,
+                build_batched_rpa_pcp_ring_op,
+                build_cp_all_gather_op,
+            )
+            from sglang_tpu.envs import envs as tpu_envs
+
+            self._cp_op = build_batched_rpa_cp_op()
+            if tpu_envs.SGLANG_TPU_CP_PAGE_LAYOUT.get():
+                replicated = tpu_envs.SGLANG_TPU_PCP_REPLICATED_PREFILL.get()
+                pool_align = tpu_envs.SGLANG_TPU_PCP_POOL_ALIGN.get()
+                set_zigzag_tpu_layout(
+                    page_align=self.page_size,
+                    balance_pairs=True,
+                    pool_align=replicated and pool_align,
+                )
+                if replicated:
+                    from sglang_tpu.kv_row_write import ensure_kv_row_ops
+
+                    ensure_kv_row_ops()
+                else:
+                    build_batched_rpa_pcp_ring_op(
+                        parallel.attn_cp_size, parallel.attn_tp_size
+                    )
+                build_cp_all_gather_op(parallel.attn_cp_size, parallel.attn_tp_size)
+
     def init_forward_metadata(self, forward_batch):
         cp_layout = get_tpu_cp_layout(forward_batch)
         if cp_layout is not None:
@@ -163,3 +197,109 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
 
             check_batch_schedule(self._pp_schedule_runner, self, forward_batch)
         super().init_forward_metadata(forward_batch)
+
+        from sglang.srt.layers.cp.utils import is_cp_active
+        from sglang.srt.runtime_context import get_parallel
+
+        if get_parallel().attn_cp_size > 1 and is_cp_active(forward_batch):
+            from sglang_tpu.batched_rpa_cp import (
+                build_pcp_batched_metadata,
+            )
+
+            self.pcp_forward_metadata = build_pcp_batched_metadata(
+                seq_lens=self.forward_metadata.seq_lens,
+                prefix_lens=self.forward_metadata.prefix_lens,
+                page_indices=self.forward_metadata.page_indices,
+                page_size=self.page_size,
+                cp_size=get_parallel().attn_cp_size,
+                cp_rank=get_parallel().attn_cp_rank,
+                device=self.device,
+                forward_batch=forward_batch,
+            )
+        else:
+            self.pcp_forward_metadata = None
+
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer,
+        forward_batch,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.cp.utils import is_cp_active
+        from sglang.srt.runtime_context import get_parallel
+
+        if get_parallel().attn_cp_size > 1 and is_cp_active(forward_batch):
+            return self._forward_cp_extend(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                pcp_meta=self.pcp_forward_metadata,
+                **kwargs,
+            )
+        return super().forward_extend(
+            q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs
+        )
+
+    def _forward_cp_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer,
+        forward_batch,
+        pcp_meta=None,
+        **kwargs,
+    ) -> torch.Tensor:
+        from sglang_tpu.batched_rpa_cp import batched_rpa_pcp_forward
+
+        num_tokens = q.shape[0]
+        q = q.view(num_tokens, layer.tp_q_head_num, layer.qk_head_dim)
+        k = k.view(num_tokens, layer.tp_k_head_num, layer.qk_head_dim)
+        v = v.view(num_tokens, layer.tp_v_head_num, layer.v_head_dim)
+        if layer.v_head_dim < layer.qk_head_dim:
+            v = torch.nn.functional.pad(v, (0, layer.qk_head_dim - layer.v_head_dim))
+        kv_cache = self.token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
+
+        if self.kv_cache_quant_dtype is not None:
+            k_scale = layer.k_scale_float if layer.k_scale_float is not None else 1.0
+            v_scale = layer.v_scale_float if layer.v_scale_float is not None else 1.0
+            from sglang_tpu.attention_pallas_rpa_base import _quantize_kv_to_fp8
+
+            fp8_dtype = self.kv_cache_quant_dtype
+            quantize_kv = lambda k_, v_: (
+                _quantize_kv_to_fp8(k_, k_scale, fp8_dtype),
+                _quantize_kv_to_fp8(v_, v_scale, fp8_dtype),
+            )
+        else:
+            k_scale = None
+            v_scale = None
+            quantize_kv = None
+
+        pcp_meta = (
+            pcp_meta
+            or self.pcp_forward_metadata
+            or getattr(self.forward_metadata, "pcp_metadata", None)
+        )
+        out = batched_rpa_pcp_forward(
+            self._cp_op,
+            q,
+            k,
+            v,
+            kv_cache,
+            layer,
+            forward_batch,
+            pcp_meta,
+            self.forward_metadata,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            sinks=kwargs.get("sinks"),
+            quantize_kv=quantize_kv,
+        )
+        out = out.reshape(num_tokens, layer.tp_q_head_num, -1)[..., : layer.v_head_dim]
+        return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)

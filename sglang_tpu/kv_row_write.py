@@ -212,3 +212,121 @@ def write_rows_torch(
     flat = kv.flatten(0, 1)
     for src, dst, n in segments[:, : int(num_segments)].T.tolist():
         flat[dst : dst + n] = rows[src : src + n]
+
+
+_OPS: dict = {}
+
+
+def _build_scatter_ops():
+    import jax
+    import jax.numpy as jnp
+    from torch_tpu._internal import pallas as _torch_pallas
+
+    from sglang_tpu.kv_page_write import read_pages, write_pages
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    def write_rows_scatter(block_ids, row_dst, rows, kv):
+        n = block_ids.shape[0]
+        page = kv.shape[1]
+        pages = read_pages(block_ids, kv)  # [n, page, ...] pool dtype
+        flat = pages.reshape(n * page, -1)
+        flat = flat.at[row_dst].set(rows.astype(flat.dtype))
+        return write_pages(block_ids, flat.reshape(n, *kv.shape[1:]), kv)
+
+    rows_kernel = _torch_pallas.custom_jax_kernel(
+        write_rows_scatter,
+        name="jax_kv_write_rows_scatter",
+        donate_argnums=(3,),
+        input_output_aliases={3: 0},
+        warn_deprecated=False,
+    )
+
+    @torch.library.custom_op(
+        "sglang_tpu::kv_write_rows_scatter", mutates_args=("kv",), device_types=["tpu"]
+    )
+    def kv_write_rows_scatter(
+        block_ids: torch.Tensor,
+        row_dst: torch.Tensor,
+        rows: torch.Tensor,
+        kv: torch.Tensor,
+    ) -> None:
+        with tpu_info_for_cpu_export():
+            rows_kernel(block_ids, row_dst, rows, kv)
+
+    @kv_write_rows_scatter.register_fake
+    def _(
+        block_ids: torch.Tensor,
+        row_dst: torch.Tensor,
+        rows: torch.Tensor,
+        kv: torch.Tensor,
+    ) -> None:
+        return None
+
+    _OPS["write_rows"] = kv_write_rows_scatter
+
+    # ---- page-granular variant (layout aligned to the pool pages) --------
+    def write_pages_from_rows(
+        block_ids, page_src, boundary_pos, boundary_lead, rows, kv
+    ):
+        """kv[block_ids[i]] = rows.pages[page_src[i]], except that page
+        block_ids[boundary_pos[j]] keeps its first boundary_lead[j] rows."""
+        page = kv.shape[1]
+        n = block_ids.shape[0]
+        pages = rows.astype(kv.dtype).reshape(-1, page, rows.shape[-1])[
+            page_src
+        ]  # [n, page, E]
+        keep = read_pages(block_ids[boundary_pos], kv).reshape(
+            boundary_pos.shape[0], page, -1
+        )
+        row_ids = jax.lax.broadcasted_iota(
+            jnp.int32, (boundary_pos.shape[0], page, 1), 1
+        )
+        blended = jnp.where(
+            row_ids < boundary_lead[:, None, None], keep, pages[boundary_pos]
+        )
+        pages = pages.at[boundary_pos].set(blended)
+        return write_pages(block_ids, pages.reshape(n, *kv.shape[1:]), kv)
+
+    pages_kernel = _torch_pallas.custom_jax_kernel(
+        write_pages_from_rows,
+        name="jax_kv_write_pages_from_rows",
+        donate_argnums=(5,),
+        input_output_aliases={5: 0},
+        warn_deprecated=False,
+    )
+
+    @torch.library.custom_op(
+        "sglang_tpu::kv_write_pages_from_rows",
+        mutates_args=("kv",),
+        device_types=["tpu"],
+    )
+    def kv_write_pages_from_rows(
+        block_ids: torch.Tensor,
+        page_src: torch.Tensor,
+        boundary_pos: torch.Tensor,
+        boundary_lead: torch.Tensor,
+        rows: torch.Tensor,
+        kv: torch.Tensor,
+    ) -> None:
+        with tpu_info_for_cpu_export():
+            pages_kernel(block_ids, page_src, boundary_pos, boundary_lead, rows, kv)
+
+    @kv_write_pages_from_rows.register_fake
+    def _(block_ids, page_src, boundary_pos, boundary_lead, rows, kv) -> None:
+        return None
+
+    _OPS["write_pages_from_rows"] = kv_write_pages_from_rows
+
+
+def ensure_kv_row_ops():
+    """Build the ops once (outside torch.compile); returns the registry."""
+    if not _OPS:
+        _build_scatter_ops()
+        from sglang_tpu.kv_page_write import (
+            get_read_pages_op,
+            get_write_pages_op,
+        )
+
+        get_read_pages_op()
+        get_write_pages_op()
+    return _OPS
