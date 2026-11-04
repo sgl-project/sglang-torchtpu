@@ -1220,6 +1220,16 @@ class Req(ReqDllmMixin):
         self.storage_prefetch_last_match_len: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
+        # Matched prefix length at this request's first radix insert, set only
+        # under SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS or
+        # SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS: final-window demotion stops here, and
+        # media past it is a first visit.
+        self.swa_stale_window_floor: Optional[int] = None
+        # End (exclusive) of the last multimodal item's tokens, read at the first
+        # radix insert (SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS); None for text.
+        self.swa_media_end: Optional[int] = None
+        # CAP media anchor taken for this request (SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS).
+        self.swa_media_anchored: bool = False
         # Logical-page KV sharding: rotation base of the chain this request
         # extends (owner of position-page P is (base + P) % shard_size).
         # Refreshed at every sharded alloc — read through last_node, or drawn
@@ -1991,6 +2001,9 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.lock_receipt = DecLockRefParams()
         self.swa_prefix_lock_released = False
+        self.swa_stale_window_floor = None
+        self.swa_media_end = None
+        self.swa_media_anchored = False
         self.swa_branching_seqlen = None
         self.extend_range = None
         self.dllm_initialized = False
@@ -3387,12 +3400,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if selected_indices is None
             else [self.reqs[i] for i in selected_indices]
         )
-        return self.token_to_kv_pool_allocator.check_decode_capacity(
-            num_tokens=num_tokens,
-            tree_cache=self.tree_cache,
-            requests=requests,
-            spec_algorithm=self.spec_algorithm,
-        )
+
+        def fits() -> bool:
+            return self.token_to_kv_pool_allocator.check_decode_capacity(
+                num_tokens=num_tokens,
+                tree_cache=self.tree_cache,
+                requests=requests,
+                spec_algorithm=self.spec_algorithm,
+            )
+
+        ok = fits()
+        # CAP media anchors (SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS) are cache-owned
+        # locks: release them, least recently used first, before a decode step
+        # that does not fit retracts running requests.
+        while (
+            not ok
+            and envs.SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS.get() > 0
+            and hasattr(self.tree_cache, "release_cap_anchor")
+            and self.tree_cache.release_cap_anchor()
+        ):
+            ok = fits()
+        return ok
 
     def retract_decode(
         self, *, draft_kv_pools: tuple[KVCache, ...] = ()
@@ -4029,6 +4057,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
             eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
+            # CAP (SGLANG_OPT_SWA_CAP): right-size the prompt-end window lock and
+            # run the out-of-window eviction every CAP interval.
+            cap_interval = (
+                max(1, envs.SGLANG_OPT_SWA_CAP_INTERVAL.get())
+                if envs.SGLANG_OPT_SWA_CAP.get()
+                and hasattr(self.tree_cache, "cap_release")
+                else None
+            )
+            if cap_interval is not None:
+                eviction_interval = cap_interval
             swa_evict_due = self._swa_eviction_trigger(
                 sliding_window_size, eviction_interval
             )
@@ -4052,6 +4090,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                                 eviction_interval if has_auxiliary_swa else 1
                             ),
                         )
+
+                    if (
+                        cap_interval is not None
+                        and req.decode_batch_idx >= 1
+                        and req.decode_batch_idx % cap_interval == 0
+                        and req.kv.holds_kv
+                    ):
+                        self.tree_cache.cap_release(req)
 
                     # The next query, at seqlen - 1, reads down to seqlen - 1 - W;
                     # past cache_protected_len the prefix SWA lock is unused, so it
