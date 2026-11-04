@@ -18,6 +18,7 @@ lines of a startup log::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -57,10 +58,17 @@ def load_cost_profile(path: str | Path) -> Callable[[str], float]:
     return lambda graph: families.get(graph_family(graph), default)
 
 
-def estimator_from_env() -> Callable[[str], float] | None:
-    """The configured profile's estimate, or None for round-robin owners."""
+def estimator_from_env() -> tuple[Callable[[str], float] | None, str]:
+    """The configured profile's estimate and content digest.
+
+    ``(None, "")`` when unset: round-robin owners. Ranks compare the digest
+    because they assign owners independently.
+    """
     path = tpu_envs.SGLANG_TPU_SHARED_COMPILE_COST_PROFILE.get().strip()
-    return load_cost_profile(path) if path else None
+    if not path:
+        return None, ""
+    digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    return load_cost_profile(path), digest
 
 
 def build_cost_profile(lines: Iterable[str]) -> dict:

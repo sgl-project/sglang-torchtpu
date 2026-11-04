@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.compilation import shared_compile_cost
+from sglang_tpu.compilation import shared_compile_cost, spmd_compiler
 from sglang_tpu.compilation.spmd_compiler import SPMDCompiler
 
 register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit", chips=1)
@@ -129,14 +129,82 @@ class TestSharedCompileCostProfile(CustomTestCase):
     def test_estimator_follows_the_environment(self):
         env = "SGLANG_TPU_SHARED_COMPILE_COST_PROFILE"
         with patch.dict(os.environ, {env: ""}):
-            self.assertIsNone(shared_compile_cost.estimator_from_env())
+            self.assertEqual(shared_compile_cost.estimator_from_env(), (None, ""))
         self.path.write_text(
             json.dumps({"schema_version": 1, "default_seconds": 2, "families": {}})
         )
         with patch.dict(os.environ, {env: str(self.path)}):
-            self.assertEqual(
-                shared_compile_cost.estimator_from_env()("any:[[[1]]]"), 2.0
+            estimate, digest = shared_compile_cost.estimator_from_env()
+        self.assertEqual(estimate("any:[[[1]]]"), 2.0)
+        self.assertEqual(len(digest), 64)
+
+
+class TestSharedCompileProfileAgreement(CustomTestCase):
+    """Every rank loads the same profile, or every rank fails startup."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = Path(directory.name)
+        self.path = self.directory / "profile.json"
+        self.path.write_text(
+            json.dumps({"schema_version": 1, "default_seconds": 2, "families": {}})
+        )
+
+    def _start(self, profile, peer=lambda record: record, **kwargs):
+        """Rank 0 of two; ``peer`` maps rank 0's gathered record to rank 1's."""
+        env = {
+            "SGLANG_TPU_SHARED_COMPILE_COST_PROFILE": profile,
+            "VERIFY_SPMD_SAFE_DUMP_DIR": str(self.directory),
+        }
+        gather = lambda compiler, record: [record, peer(record)]  # noqa: E731
+        with (
+            patch.dict(os.environ, env),
+            patch.object(spmd_compiler.dist, "get_rank", return_value=0),
+            patch.object(spmd_compiler.dist, "get_world_size", return_value=2),
+            patch.object(
+                spmd_compiler.device_mesh,
+                "get_device_assignment",
+                return_value=[0, 1],
+            ),
+            patch.object(SPMDCompiler, "gather", gather),
+        ):
+            compiler = SPMDCompiler(None, **kwargs)
+        if compiler._serializer is not None:
+            compiler._serializer.shutdown()
+        return compiler
+
+    def test_ranks_sharing_a_profile_load_it(self):
+        compiler = self._start(str(self.path))
+        self.assertEqual(compiler._estimate("any:[[[1]]]"), 2.0)
+
+    def test_a_rank_that_cannot_load_the_profile_fails_every_rank(self):
+        # Rank 0 reports its failure through the gather instead of raising
+        # while rank 1 waits in it.
+        peer_runtime = {"cost_profile": "0" * 64}
+        with self.assertRaisesRegex(
+            ValueError,
+            "Incompatible SPMD compilation configuration: rank 0: cannot load "
+            "the shared compile cost profile: FileNotFoundError",
+        ):
+            self._start(
+                str(self.directory / "missing.json"),
+                peer=lambda record: (peer_runtime, None),
             )
+
+    def test_ranks_with_different_profiles_fail(self):
+        def peer(record):
+            runtime, error = record
+            return dict(runtime, cost_profile="0" * 64), error
+
+        with self.assertRaisesRegex(ValueError, "cost_profile differs across ranks"):
+            self._start(str(self.path), peer=peer)
+
+    def test_verification_does_not_load_the_profile(self):
+        compiler = self._start(
+            str(self.directory / "missing.json"), verify_spmd_safe=True
+        )
+        self.assertIsNone(compiler._estimate)
 
 
 if __name__ == "__main__":

@@ -132,7 +132,8 @@ class SPMDCompiler:
         self.mlirs: dict[str, str] = {}
         self.argument_layouts: dict[str, list[list[int]]] = {}
         # Trace-cost estimate per graph, or None for round-robin owners.
-        self._estimate = estimator_from_env()
+        # Verification never assigns owners, so only sharing loads a profile.
+        self._estimate: Callable[[str], float] | None = None
         self._estimated_load = [0.0] * self.size
         self.trace_seconds: dict[str, float] = {}
         """Owner-only trace time of each graph this rank traced."""
@@ -146,7 +147,12 @@ class SPMDCompiler:
             return
         runtime = None
         error: str | None = None
+        stage = "load the shared compile cost profile"
         try:
+            # Ranks assign owners independently, so a rank that cannot load the
+            # profile, or loads a different one, must fail every rank below.
+            self._estimate, cost_profile = estimator_from_env()
+            stage = "identify the compiler runtime"
             mapping = [int(value) for value in device_mesh.get_device_assignment()]
             runtime = dict(
                 device_assignment=mapping,
@@ -156,11 +162,12 @@ class SPMDCompiler:
                 },
                 XLA_FLAGS=os.environ.get("XLA_FLAGS", ""),
                 LIBTPU_INIT_ARGS=os.environ.get("LIBTPU_INIT_ARGS", ""),
+                cost_profile=cost_profile,
             )
             if self.size != len(mapping) or self.size != dist.get_world_size():
                 error = "only the full TPU TP group is supported"
         except Exception as caught:
-            error = f"cannot identify the compiler runtime: {type(caught).__name__}: {caught}"
+            error = f"cannot {stage}: {type(caught).__name__}: {caught}"
         records = self.gather((runtime, error))
         reasons = [
             f"rank {rank}: {reason}"
