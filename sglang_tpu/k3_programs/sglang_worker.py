@@ -421,6 +421,8 @@ class DecodeSteps:
                     np.asarray(row[: -(-end // sglang_dp.PAGE_TOKENS)], np.int64)
                     // sglang_dp.PAGE_TOKENS
                 )
+                if (pages == 0).any():  # past the KV sglang allocated so far
+                    pages = pages[: int(np.argmax(pages == 0))]
                 if req.rid in self._live and req.rid in self.colo:
                     self.colo.extend(req.rid, pages, end)
                 else:

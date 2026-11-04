@@ -229,19 +229,20 @@ class ColoRows:
         self._end[rid] = max(self._end[rid], int(end))
 
     def table_row(self, rid: str, seq_len: int, width: int) -> np.ndarray:
-        """The request's MLA block-table row (ids ``g N + row``), 0-padded."""
+        """The request's MLA block-table row (ids ``g N + row``), 0-padded
+        (the null block past its pages: tokens past the KV sglang allocated,
+        which a step may write, as without DP)."""
         used = -(-int(seq_len) // GROUP_BLOCK_TOKENS)
         if used > width:
             raise ValueError(f"{seq_len} tokens need {used} blocks; the table holds {width}")
         group, pages, b = self.group[rid], self._pages[rid], self._b[rid]
-        if -(-used // GROUPS) > len(pages):
-            raise ValueError(f"{len(pages)} pages do not cover {seq_len} tokens")
         base = group * self.num_blocks
         ids = []
         for page, brow in zip(pages, b):
             pair = (page, brow) if group == 0 else (brow, page)
             ids += [base + pair[0], base + pair[1]]
         row = np.zeros(width, np.int32)
+        used = min(used, len(ids))
         row[:used] = ids[:used]
         return row
 
