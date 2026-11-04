@@ -35,11 +35,11 @@ STATE = (
 )
 
 
-def _req(rep, freq, pres, min_new):
+def _req(repetition, frequency, presence, min_new):
     req = MagicMock()
-    req.sampling_params.repetition_penalty = rep
-    req.sampling_params.frequency_penalty = freq
-    req.sampling_params.presence_penalty = pres
+    req.sampling_params.repetition_penalty = repetition
+    req.sampling_params.frequency_penalty = frequency
+    req.sampling_params.presence_penalty = presence
     req.sampling_params.min_new_tokens = min_new
     req.sampling_params.stop_token_ids = {3}
     req.eos_token_ids = {5}

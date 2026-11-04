@@ -3116,8 +3116,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         its uninterrupted overlap decode had cumulated, so its later tokens
         would depend on when it was retracted. Seed the row with exactly that
         history: the first prefill's last input token, then every output token
-        but the last (the next decode step cumulates that one as this prefill's
-        last input token)."""
+        but the last (the next decode step will cumulate that one as this
+        prefill's last input token)."""
         orchestrator = self.sampling_info.penalizer_orchestrator
         if orchestrator is None or not orchestrator.is_required:
             return

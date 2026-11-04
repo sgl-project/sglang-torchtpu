@@ -214,8 +214,9 @@ class TestSupportedModes(CustomTestCase):
 class TestSeedRetractedPenaltyHistory(CustomTestCase):
     def test_seeds_the_overlap_history_of_retracted_requests_only(self):
         # Outputs [101, 102]: overlap decode cumulated the last prompt token and
-        # 101 before sampling the next token; the next decode step cumulates 102
-        # as the re-prefill's last input token. A fresh request is not seeded.
+        # 101 before sampling the next token; the next decode step will cumulate
+        # 102 as the last input token of the re-prefill. A fresh request is not
+        # seeded.
         seen = []
         batch = _batch([], seen)
         reqs = [_req([], 0), _req([101, 102], 0)]
