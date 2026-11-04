@@ -212,14 +212,25 @@ def _all_m_act(tile, act):
 # tile_m 128, 2.30 at 256, 3.44 at 64, VMEM overflow at 512; M=8192 1.05 at 128, 1.41 at 256.
 _H4608_I2304_FP4_EP8_SITU = (128, 4608, 2560, 2560, 4608, 1, 1)
 _H4608_I2304_FP4_EP8_SITU_LARGE_M = (256, 4608, 2560, 2560, 4608, 1, 1)
+# Decode / MTP verify (M <= 4096, i.e. <= 512 tokens): half-N, double-buffered so the next
+# expert's weight DMA overlaps the current GEMM. Eager xprof, random top-8, us per call
+# M=256/1024/2048/4096: 346/608/656/703 -> 320/562/628/694; M=64 ties the default (164).
+_H4608_I2304_FP4_EP8_SITU_DECODE = (32, 4608, 1280, 2560, 2304, 2, 2)
 
 
 # Same layers' channelwise-FP8 experts (Inkling2's MXFP8 layers, block = all of K): K1=4608,
 # N1=4608, K2=2304, N2=4608. Eager sweep as above: M=65536 4.07 ms on the default
 # (64, 4608, 1024, 2304, 1536, 2, 2), 2.93 at (128, 4608, 2304, 2304, 4608, 1, 1), 2.51 at
-# tile_m 256; M=8192 1.27 / 1.23 / 1.55. Smaller M was not measured and keeps the default.
+# tile_m 256; M=8192 1.27 / 1.23 / 1.55.
 _H4608_I2304_FP8_CH_EP8_SITU_MID_M = (128, 4608, 2304, 2304, 4608, 1, 1)
 _H4608_I2304_FP8_CH_EP8_SITU_LARGE_M = (256, 4608, 2304, 2304, 4608, 1, 1)
+# Decode / MTP verify (M <= 4096): same eager method, us per call M=64/256/1024/2048/4096:
+# default 247/482/848/894/904 -> 200/388/676/716/726. tile_m 64/128 and thirds-N lose; full-N
+# double-buffered overflows VMEM.
+_H4608_I2304_FP8_CH_EP8_SITU_DECODE = (32, 4608, 1152, 2304, 2304, 2, 2)
+
+# Routed-row keys of decode-sized calls (tokens padded to multiples of 8, x top-8).
+_DECODE_M = [64, 128, 256, 512, 1024, 2048, 4096]
 
 
 def _h4608_i2304_fp8_ch_ep8_situ(act):
@@ -230,6 +241,8 @@ def _h4608_i2304_fp8_ch_ep8_situ(act):
             out[f"{m}_{act}"] = _H4608_I2304_FP8_CH_EP8_SITU_LARGE_M
         elif m >= 8192:
             out[f"{m}_{act}"] = _H4608_I2304_FP8_CH_EP8_SITU_MID_M
+    for m in _DECODE_M:
+        out[f"{m}_{act}"] = _H4608_I2304_FP8_CH_EP8_SITU_DECODE
     return out
 
 
@@ -238,6 +251,8 @@ def _h4608_i2304_fp4_ep8_situ(act):
     for key in out:
         if int(key.split("_")[0]) >= 65536:
             out[key] = _H4608_I2304_FP4_EP8_SITU_LARGE_M
+    for m in _DECODE_M:
+        out[f"{m}_{act}"] = _H4608_I2304_FP4_EP8_SITU_DECODE
     return out
 
 
