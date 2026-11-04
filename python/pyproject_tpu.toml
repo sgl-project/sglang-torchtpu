@@ -21,6 +21,9 @@ dependencies = [
   "anyio>=4.13.0",
   "blobfile==3.0.0",
   "av",
+  # SGLang decodes video with torchcodec or, failing that, decord; this stack
+  # ships neither, so without it every video request fails to decode.
+  "decord2==3.4.0",
   "build",
   "compressed-tensors",
   "datasets",
