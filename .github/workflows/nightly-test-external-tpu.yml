@@ -53,6 +53,8 @@ jobs:
           PYCPU
           kubectl -n default logs -c gke-gcsfuse-sidecar "$(cat /tmp/candidate-pod)" --tail=300 > /tmp/gcsfuse-raw.log 2>&1 || true
           kubectl -n default exec -c gke-gcsfuse-sidecar "$(cat /tmp/candidate-pod)" -- /bin/sh -c 'cat /sys/fs/cgroup/cpu.stat; cat /sys/fs/cgroup/memory.current; cat /sys/fs/cgroup/memory.max' >> /tmp/resources-raw.log 2>&1 || true
+          kubectl -n default exec -c test "$(cat /tmp/candidate-pod)" -- python3 -c 'import json,os,pathlib,urllib.request; v=os.statvfs("/"); print("ROOT_DISK",json.dumps({"total":v.f_blocks*v.f_frsize,"available":v.f_bavail*v.f_frsize})); print("MEMINFO",json.dumps({k:v.strip() for k,v in (l.split(":",1) for l in pathlib.Path("/proc/meminfo").read_text().splitlines()) if k in ("MemTotal","MemAvailable","Cached","Shmem")})); print("CGROUP",json.dumps({n:pathlib.Path("/sys/fs/cgroup/"+n).read_text() for n in ("memory.current","memory.max","cpu.stat") if pathlib.Path("/sys/fs/cgroup/"+n).exists()})); print(urllib.request.urlopen("http://127.0.0.1:62990/metrics",timeout=10).read().decode())' > /tmp/storage-metrics-raw.log 2>&1 || true
+          python3 -u .github/tpu-ci/external/sanitize_logs.py < /tmp/storage-metrics-raw.log > storage-metrics.log
           python3 -u .github/tpu-ci/external/sanitize_logs.py < /tmp/resources-raw.log > resources.log
           python3 -u .github/tpu-ci/external/sanitize_logs.py < /tmp/gcsfuse-raw.log > gcsfuse-live.log
           kubectl -n default logs -c test "$(cat /tmp/candidate-pod)" --timestamps --tail=10000 > /tmp/qwen-live-raw.log
@@ -72,6 +74,7 @@ jobs:
           path: |
             qwen-live.log
             resources.log
+            storage-metrics.log
             gcsfuse-live.log
           if-no-files-found: ignore
           retention-days: 1
