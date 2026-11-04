@@ -1,7 +1,12 @@
 name: Nightly Test (External TPU)
-run-name: Read live Qwen prefetch logs
+run-name: Read live ${{ inputs.model }} page-cache trial logs
 on:
   workflow_dispatch:
+    inputs:
+      model:
+        type: choice
+        default: qwen
+        options: [qwen, gpt]
 permissions:
   contents: read
   id-token: write
@@ -12,6 +17,8 @@ jobs:
     env:
       EXTERNAL_CLUSTER: ${{ secrets.EXTERNAL_CLUSTER }}
       EXTERNAL_PROJECT: ${{ secrets.EXTERNAL_PROJECT }}
+      TARGET_MODEL: ${{ inputs.model }}
+      EXTERNAL_NODEPOOL_2X2X2_1: ${{ secrets.EXTERNAL_NODEPOOL_2X2X2_1 }}
       EXTERNAL_NODEPOOL_2X2X2_3: ${{ secrets.EXTERNAL_NODEPOOL_2X2X2_3 }}
       CANDIDATE_IMAGE: us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu@sha256:4cba0731aab850af74de3caf5b583044f5b8a74a758e1be9906c29796b8a097f
     steps:
@@ -38,9 +45,9 @@ jobs:
           import json, os
           pods = [pod for pod in json.load(open('/tmp/pods.json'))['items']
                   if pod['status']['phase'] == 'Running'
-                  and pod['spec'].get('nodeSelector', {}).get('cloud.google.com/gke-nodepool') == os.environ['EXTERNAL_NODEPOOL_2X2X2_3']
+                  and pod['spec'].get('nodeSelector', {}).get('cloud.google.com/gke-nodepool') == os.environ['EXTERNAL_NODEPOOL_2X2X2_1' if os.environ['TARGET_MODEL'] == 'gpt' else 'EXTERNAL_NODEPOOL_2X2X2_3']
                   and any(c['image'] == os.environ['CANDIDATE_IMAGE'] for c in pod['spec']['containers'])
-                  and pod['metadata']['labels'].get('jobset.sigs.k8s.io/jobset-name', '').startswith('qwen-prefetch-pagecache-')]
+                  and pod['metadata']['labels'].get('jobset.sigs.k8s.io/jobset-name', '').startswith(os.environ['TARGET_MODEL'] + '-prefetch-pagecache-')]
           assert len(pods) == 1, f'Expected one running candidate pod, found {len(pods)}'
           print(pods[0]['metadata']['name'])
           PY
