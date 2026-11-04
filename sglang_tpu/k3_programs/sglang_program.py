@@ -230,6 +230,11 @@ def _role_steps(role, program, config, pool):
         kda_block_size=kda_block,
         mla_block_tokens=table_tokens,
     )
+    if role == "decode":
+        # sglang's pools hold each TP rank's share (the prefill's DCP pages
+        # and KDA heads, and Raiden pairs equal TP ranks), and a device's TP
+        # rank need not be its kernel mesh position.
+        program.kv_by_tp_rank = True
     program.bind_kv_caches(pool.caches, groups)
     program.warmup()
     if role == "prefill":
@@ -261,6 +266,7 @@ def _role_steps(role, program, config, pool):
         schedule=config.num_speculative_tokens_per_batch_size,
     )
     if dp is not None:
+        sglang_dp.check_rank_order(program.destination_ranks)
         steps.swap = sglang_dp.make_swapper(program)
     return steps
 

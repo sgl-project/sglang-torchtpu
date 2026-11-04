@@ -72,6 +72,20 @@ def _golden(seq_len, group, decode_pages, landing, prefill_rows, num_blocks=24, 
         assert decode[rank, num_blocks - 1] == 10_000 + rank
 
 
+class TestRankOrder(CustomTestCase):
+    def test_tp_ranks_by_position_must_keep_groups_and_partners(self):
+        dp.check_rank_order(None)
+        # The v7x hosts' order: TP ranks 0 1 6 7 2 3 4 5 at positions 8h..8h+7.
+        block = [0, 1, 6, 7, 2, 3, 4, 5]
+        dp.check_rank_order([8 * h + r for h in range(4) for r in block])
+        with self.assertRaisesRegex(RuntimeError, "DP groups"):
+            dp.check_rank_order([(p + 16) % 32 if p < 8 else p for p in range(32)])
+        swapped = list(range(32))
+        swapped[0], swapped[1] = 1, 0  # partners 0/16 no longer one group rank
+        with self.assertRaisesRegex(RuntimeError, "swap partners"):
+            dp.check_rank_order(swapped)
+
+
 class TestGoldenLayout(CustomTestCase):
     def test_every_chunk_reads_back_in_either_group(self):
         lengths = (1, 511, 512, 8192, 8193, 16384, 16385, 40000, 65536)

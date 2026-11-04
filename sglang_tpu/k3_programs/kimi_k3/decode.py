@@ -168,6 +168,9 @@ class KimiDecoder:
         self._ring_reports = 4
         self._importer: KdaImporter | None = None
         self.destination_ranks: tuple[int, ...] | None = None
+        # Pools addressed by TP rank (sglang) rather than mesh position
+        # (vLLM's connector ships in mesh order); see bind_kv_caches.
+        self.kv_by_tp_rank = False
         self._saw_request = False
         self._pages: int | None = None
         self._num_blocks = 0
@@ -198,17 +201,27 @@ class KimiDecoder:
         self.destination_ranks = (
             None if perm is None else tuple(q for _, q in sorted(perm))
         )
+        # ``kv_by_tp_rank``: the pools hold the device's TP rank's share (the
+        # prefill's DCP pages and KDA head shard, sent rank to rank by TP
+        # rank, as sglang does): the pages are owned by TP rank and the
+        # states move to the mesh position whose kernel rank owns the heads.
+        by_tp = self.kv_by_tp_rank and perm is not None
+        state_perm = tuple(perm) if by_tp else None
         # One importer per ops (it registers torch ops, whose names are
         # process-global), shared by the decoders over them.
         self._importer = self.ops.cached_op(
-            ("kda_importer", None),
+            ("kda_importer", state_perm),
             lambda: KdaImporter(
-                self.ops.mesh, None, self.ops.attention_dp, self.ops.num_slots
+                self.ops.mesh, state_perm, self.ops.attention_dp, self.ops.num_slots
             ),
         )
         num_blocks = self._importer.bind(caches, self.config.kv_cache_dtype)
         self._num_blocks = num_blocks
-        self.ops.use_unified_pools(self._importer.raw_pools, self._importer.mla_raw)
+        self.ops.use_unified_pools(
+            self._importer.raw_pools,
+            self._importer.mla_raw,
+            self.destination_ranks if by_tp else None,
+        )
         if self.draft is not None and hasattr(self.draft, "bind_pools"):
             assert self.ops.pool_map is not None
             # The MLA draft: the target's LM head and embedding, and pools

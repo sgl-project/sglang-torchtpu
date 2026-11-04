@@ -131,6 +131,24 @@ class DpPages:
             raise ValueError(f"KV page {page} is outside 1 .. {self.pages}")
 
 
+def check_rank_order(ranks: Sequence[int] | None) -> None:
+    """The transfer rows and the swap address ranks by TP rank (``ranks[p]``:
+    mesh position ``p``'s, None: equal), the kernel's DP groups and the swap's
+    partners by mesh position: each position's TP rank must be in the
+    position's group, and partners ``p``, ``p + 16`` must be one group rank."""
+    world = GROUPS * GROUP_RANKS
+    ranks = tuple(range(world)) if ranks is None else tuple(ranks)
+    for p in range(world):
+        partner = (p + GROUP_RANKS) % world
+        if ranks[p] // GROUP_RANKS != p // GROUP_RANKS or ranks[partner] != (
+            ranks[p] + GROUP_RANKS
+        ) % world:
+            raise RuntimeError(
+                f"K3 decode DP2: TP ranks by mesh position {list(ranks)} do not "
+                "keep the DP groups and swap partners"
+            )
+
+
 def landing_pages_needed(pages: int) -> int:
     """Landing pages a request of ``pages`` pages takes in the other group."""
     return -(-pages // 2)
