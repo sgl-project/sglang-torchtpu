@@ -1731,6 +1731,31 @@ def dynamic_validate_inputs(
                 )
 
 
+def _tpu7x_fp8_single_kv_decode_blocks(
+    bkv_sz,
+    bkv_csz,
+    decode_query_size,
+    sliding_window,
+    max_kv,
+    max_num_seqs,
+    bkv_alignment,
+):
+    """DECODE (bkv_sz, bkv_csz) for one fp8 KV head of 5-8 query heads per core."""
+    # 8-row verify, full attention: 0-19% faster than the VMEM-shrunk 4096 block.
+    if sliding_window is None:
+        if decode_query_size == 8 and max_kv >= 8192:
+            return 8192, 4096
+    # 1-row window layers, >= 16 seqs: 2-window block, window-wide compute; 15-40% faster.
+    elif (
+        decode_query_size == 1
+        and max_num_seqs >= 16
+        and sliding_window % bkv_alignment == 0
+        and sliding_window % 512 == 0
+    ):
+        return 2 * sliding_window, sliding_window
+    return bkv_sz, bkv_csz
+
+
 def get_default_block_sizes(
     q_dtype,
     kv_dtype,
@@ -1872,6 +1897,24 @@ def get_default_block_sizes(
                 bq_csz = bq_sz
             bkv_sz = align_to(bkv_sz, bkv_alignment)
             bkv_csz = align_to(bkv_csz, bkv_alignment)
+
+    if (
+        tpu_version == 7
+        and case == RpaCase.DECODE
+        and kv_packing == 4
+        and actual_num_kv_heads == 1
+        and num_q_heads_per_kv_head == 8
+        and 128 <= page_size <= 512
+    ):
+        bkv_sz, bkv_csz = _tpu7x_fp8_single_kv_decode_blocks(
+            bkv_sz,
+            bkv_csz,
+            decode_query_size,
+            sliding_window,
+            max_kv,
+            max_num_seqs,
+            bkv_alignment,
+        )
 
     # Ensure csz <= sz.
     bkv_csz = min(bkv_csz, bkv_sz)

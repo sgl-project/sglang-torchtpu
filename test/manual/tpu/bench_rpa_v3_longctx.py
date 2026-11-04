@@ -82,8 +82,16 @@ def build_inputs(
     new_v = new_v.astype(kv_dtype)
     slots = (2 + kv_packing - 1) // kv_packing * kv_packing
     kv_shape = (total_pages, PAGE_SIZE, slots // kv_packing, kv_packing, HEAD_DIM)
+    # Random seed pages tiled to the full pool: 1M-token caches do not fit a bf16 temp.
+    seed_pages = min(total_pages, 64)
+    reps = (total_pages + seed_pages - 1) // seed_pages
     kv_fused = [
-        jax.random.normal(kk, kv_shape, jnp.bfloat16).astype(kv_dtype)
+        jnp.tile(
+            jax.random.normal(kk, (seed_pages,) + kv_shape[1:], jnp.bfloat16).astype(
+                kv_dtype
+            ),
+            (reps, 1, 1, 1, 1),
+        )[:total_pages]
         for kk in jax.random.split(k_c, layers)
     ]
 
@@ -162,6 +170,22 @@ def _run_layers(
         )
         new_caches.append(cache)
     return out, new_caches
+
+
+_last_default = [None]
+_orig_default_block_sizes = rpa_mod.get_default_block_sizes
+
+
+def _recording_default_block_sizes(*args, **kw):
+    out = _orig_default_block_sizes(*args, **kw)
+    if kw.get("case") == rpa_mod.RpaCase.DECODE:
+        _last_default[0] = tuple(
+            out[k] for k in ("bq_sz", "bkv_sz", "bq_csz", "bkv_csz")
+        )
+    return out
+
+
+rpa_mod.get_default_block_sizes = _recording_default_block_sizes
 
 
 def run_once(inputs, *, rows, blocks, sliding_window, k_scale, v_scale):
@@ -261,7 +285,7 @@ def main():
                     dt /= a.layers
                     tokens = bs * kv_len
                     gbs = tokens * token_bytes / dt / 1e9
-                    note = ""
+                    note = f" ={_last_default[0]}" if blocks is None else ""
                     if a.check:
                         o = np.asarray(out[: bs * rows].astype(jnp.float32))
                         if ref is None:
