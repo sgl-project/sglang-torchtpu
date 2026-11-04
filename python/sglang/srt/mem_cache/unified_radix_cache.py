@@ -1073,7 +1073,10 @@ class UnifiedRadixCache(BasePrefixCache):
         them: a prefill pass that admits nothing for lack of memory (a NO_TOKEN,
         or a parked chunk) releases one, and a decode step that does not fit
         releases them before the retract loop takes running requests
-        (ScheduleBatch.check_decode_mem)."""
+        (ScheduleBatch.check_decode_mem). On a PD decode server, a
+        preallocation pass that has reserved nothing releases them until its
+        next request fits (DecodePreallocQueue.pop_preallocated and
+        resume_retracted_reqs)."""
         if not self._cap_anchors:
             return False
         old_id = next(iter(self._cap_anchors))

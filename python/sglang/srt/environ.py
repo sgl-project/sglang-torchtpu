@@ -718,6 +718,8 @@ class Envs:
     # pressure: a prefill pass that admits nothing for lack of memory (a request
     # refused with NO_TOKEN, or a chunked request's next chunk parked) releases
     # one, and a decode step that does not fit releases them before retracting.
+    # On a PD decode server, a preallocation pass that has reserved nothing
+    # releases them until its next request fits.
     SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS = EnvInt(0)
     # CAP for requests without media (they have no media anchor, and their reuse
     # is an exact repeat of the whole prompt, which needs the prompt-end window):

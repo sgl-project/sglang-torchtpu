@@ -2,6 +2,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
+import contextlib
 import os
 import random
 import unittest
@@ -20,14 +21,17 @@ from swa_cache_world import (
     kv_value,
 )
 
+from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.allocator import paged
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
 from sglang.srt.mem_cache.unified_cache import tree_core_registry
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 
@@ -346,6 +350,19 @@ class _Admitted(Exception):
     """Stops a prefill pass at batch creation, after its admission loop."""
 
 
+class _NaiveAllocExtend:
+    """CPU stand-in for the Triton alloc_extend kernel of the paged
+    allocator: alloc_extend_naive, its reference implementation."""
+
+    def __getitem__(self, grid):
+        def run(prefix_lens, seq_lens, last_loc, free_pages, out, _bs, page_size):
+            paged.alloc_extend_naive(
+                prefix_lens, seq_lens, last_loc, free_pages, out, page_size, out.device
+            )
+
+        return run
+
+
 class TestSWACapAnchorReclaim(unittest.TestCase):
     """CAP media anchors are cache-owned locks (a FULL root path plus an SWA
     window), so memory pressure reclaims them. The case from review, scaled: a
@@ -373,12 +390,9 @@ class TestSWACapAnchorReclaim(unittest.TestCase):
         self.assertEqual(w.cache.full_protected_size(), self.BOUNDARY)
         return w
 
-    def _parked_chunk_world(self) -> tuple[DecodeWorld, Req]:
-        """The parked-chunk case from review, scaled: 4 anchors hold 384 of
-        528 SWA tokens. A 320-token prompt is admitted with them present (its
-        first chunk needs 143 of the 144 SWA tokens left) and runs that chunk.
-        Then 80 remain, less than the window plus two pages a continuation
-        keeps free, so add_chunked_req parks its next chunk."""
+    def _swa_pressured_world(self) -> DecodeWorld:
+        """4 anchors hold 384 of 528 SWA tokens (96 each), nothing runs, and
+        everything else is evicted."""
         with (
             envs.SGLANG_OPT_SWA_CAP.override(True),
             envs.SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS.override(4),
@@ -390,6 +404,15 @@ class TestSWACapAnchorReclaim(unittest.TestCase):
         w.evict(swa_tokens=10**6, full_tokens=10**6)  # all that is evictable
         self.assertEqual(len(w.cache._cap_anchors), 4)
         self.assertEqual(w.cache.swa_protected_size(), 384)
+        return w
+
+    def _parked_chunk_world(self) -> tuple[DecodeWorld, Req]:
+        """The parked-chunk case from review, scaled: 4 anchors hold 384 of
+        528 SWA tokens. A 320-token prompt is admitted with them present (its
+        first chunk needs 143 of the 144 SWA tokens left) and runs that chunk.
+        Then 80 remain, less than the window plus two pages a continuation
+        keeps free, so add_chunked_req parks its next chunk."""
+        w = self._swa_pressured_world()
         req = self._req(_tokens(4, 20 * PAGE))
         req.init_next_round_input(tree_cache=w.cache)
         adder = self._adder(w, rem_chunk_tokens=self.CHUNK)
@@ -613,6 +636,137 @@ class TestSWACapAnchorReclaim(unittest.TestCase):
             self.assertTrue(check(free + 6 * PAGE))
         self.assertEqual(w.cache._cap_anchors, {})
         w.cache.sanity_check()
+
+    def _pd_decode_queue(self, w: DecodeWorld) -> DecodePreallocQueue:
+        """A real DecodePreallocQueue (PD decode with the decode radix cache)
+        on the world's cache and pools, nothing running. Only the scheduler
+        fields and the transfer plumbing are faked; sending the KV destination
+        to prefill is recorded instead."""
+        q = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        q.pp_size = 1
+        q.queue, q.pending_reqs, q.retracted_queue = [], [], []
+        q.num_reserved_decode_tokens = PAGE
+        q.req_to_token_pool = w.req_to_token_pool
+        q.token_to_kv_pool = w.kv_pool
+        q.token_to_kv_pool_allocator = w.allocator
+        q.tree_cache = w.cache
+        q.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
+            available_size=lambda: 8
+        )
+        q.transfer_queue = SimpleNamespace(queue=[])
+        q.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
+        q.scheduler = SimpleNamespace(
+            running_batch=SimpleNamespace(reqs=[]),
+            waiting_queue=[],
+            last_batch=None,
+            enable_priority_scheduling=False,
+            enable_hisparse=False,
+            enable_lora=False,
+            enable_decode_hicache=False,
+            sliding_window_size=WINDOW,
+            tp_worker=SimpleNamespace(is_hybrid_swa=True),
+        )
+        q._resolve_pending_reqs = lambda: None
+        q._update_handshake_waiters = lambda *args: None
+        q._send_kv_metadata = mock.Mock()
+        return q
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _pd_decode_config():
+        """The decode radix cache on, and the paged allocator's Triton
+        alloc_extend kernel replaced by its CPU reference."""
+        with (
+            get_context().override_server_args(
+                page_size=PAGE, disaggregation_decode_enable_radix_cache=True
+            ),
+            mock.patch.object(paged, "alloc_extend_kernel", _NaiveAllocExtend()),
+        ):
+            yield
+
+    def _pd_decode_pass(self, q: DecodePreallocQueue, reqs: list[Req]) -> list[str]:
+        """One real pop_preallocated pass over ``reqs`` (all waiting for their
+        KV destination); the rids it preallocated."""
+        q.queue = [
+            DecodeRequest(req=r, kv_receiver=None, waiting_for_input=True) for r in reqs
+        ]
+        with self._pd_decode_config():
+            preallocated, failed = q.pop_preallocated()
+        self.assertEqual(failed, [])
+        return [d.req.rid for d in preallocated]
+
+    def test_idle_pd_decode_prealloc_releases_the_anchor(self):
+        """The case from review on a PD decode server: with nothing running,
+        the anchor alone keeps DecodePreallocQueue.pop_preallocated from
+        reserving the prompt (with the flag unset, as on main, on every pass).
+        With the flag set, the first pass releases the anchor, refreshes its
+        budget and preallocates the prompt."""
+        w = self._pressured_world()
+        q = self._pd_decode_queue(w)
+        big = self._big()
+        for _ in range(3):
+            self.assertEqual(self._pd_decode_pass(q, [big]), [], "flag unset")
+        self.assertEqual(len(w.cache._cap_anchors), 1)
+        q._send_kv_metadata.assert_not_called()
+        with self._anchors_flag():
+            self.assertEqual(self._pd_decode_pass(q, [big]), [big.rid])
+        self.assertEqual(w.cache._cap_anchors, {})
+        q._send_kv_metadata.assert_called_once()
+        self.assertEqual(len(q._send_kv_metadata.call_args.args[1]), 32 * PAGE)
+
+    def test_pd_decode_pass_that_preallocates_keeps_the_anchor(self):
+        """As in prefill admission, a pass that preallocates a request makes
+        progress and leaves the anchor alone; the next pass, with nothing
+        preallocated yet, releases it for the waiting prompt."""
+        w = self._pressured_world()
+        q = self._pd_decode_queue(w)
+        small, big = self._req(_tokens(3, 8 * PAGE)), self._big()
+        with self._anchors_flag():
+            self.assertEqual(self._pd_decode_pass(q, [small, big]), [small.rid])
+        self.assertEqual(len(w.cache._cap_anchors), 1)
+        q.transfer_queue.queue = [SimpleNamespace(req=small, host_staged=False)]
+        with self._anchors_flag():
+            self.assertEqual(self._pd_decode_pass(q, [big]), [big.rid])
+        self.assertEqual(w.cache._cap_anchors, {})
+
+    def test_pd_decode_prealloc_releases_only_the_anchors_it_needs(self):
+        """The SWA side: a 512-token prompt with 128 new tokens reserves its
+        64-token SWA tail plus 128, 192 of the 144 SWA tokens left. Releasing
+        the least recently used anchor (96 tokens) is enough, so the pass
+        releases that one only and preallocates the prompt."""
+        w = self._swa_pressured_world()
+        q = self._pd_decode_queue(w)
+        anchors = list(w.cache._cap_anchors)
+        req = self._big()
+        req.sampling_params.max_new_tokens = 128
+        self.assertEqual(self._pd_decode_pass(q, [req]), [], "flag unset")
+        self.assertEqual(list(w.cache._cap_anchors), anchors)
+        with self._anchors_flag():
+            self.assertEqual(self._pd_decode_pass(q, [req]), [req.rid])
+        self.assertEqual(list(w.cache._cap_anchors), anchors[1:])
+
+    def test_idle_pd_decode_resume_releases_the_anchor(self):
+        """DecodePreallocQueue.resume_retracted_reqs has the same admission
+        check: a retracted request is resumed once the anchor is released."""
+        w = self._pressured_world()
+        q = self._pd_decode_queue(w)
+        req = self._big()
+        req.output_ids.append(7)
+        req.is_retracted = True
+        q.retracted_queue = [req]
+        with (
+            self._pd_decode_config(),
+            mock.patch("sglang.srt.disaggregation.decode.restore_kv_cache") as restore,
+        ):
+            self.assertEqual(q.resume_retracted_reqs(), [], "flag unset")
+            self.assertEqual(len(w.cache._cap_anchors), 1)
+            with self._anchors_flag():
+                resumed = q.resume_retracted_reqs()
+        self.assertEqual([r.rid for r in resumed], [req.rid])
+        self.assertEqual(w.cache._cap_anchors, {})
+        self.assertEqual(q.retracted_queue, [])
+        self.assertIs(restore.call_args.args[0], req)
+        self.assertFalse(req.is_retracted)
 
 
 class TestSWACapTreeCoreFallback(unittest.TestCase):
