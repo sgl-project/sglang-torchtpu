@@ -152,6 +152,11 @@ class TpuEnvs:
     # Muse Spark: whole-decoder Pallas megakernel for decode and DFlash target-verify
     # steps, with fp8 dense weight copies and an fp8 weight-only LM head.
     SGLANG_TPU_MUSE_MEGAKERNEL = EnvBool(False)
+    # Muse NVFP4: keep the BF16 experts of the first and last layers BF16, on fused-RS
+    # or gmm_v2. By default they are quantized to FP8 on host at load, as are all
+    # experts of a BF16 checkpoint. The Muse megakernel reads only fp4 or fp8 experts,
+    # so it cannot be combined with this.
+    SGLANG_TPU_ENABLE_MUSE_BF16_FIRST_LAST_LAYER_EXPERTS = EnvBool(False)
     # Fused KV pool stores a rank's heads side by side in one 128-lane row when they
     # fit exactly (e.g. 2 x head_dim 64): half the bytes of a zero-padded row per head.
     SGLANG_TPU_KV_PACK_HEADS = EnvBool(False)

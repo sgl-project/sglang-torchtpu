@@ -9,8 +9,11 @@ result back. The residual stream is kept in fp32.
 
 NVFP4 experts run through the Pallas fused-RS kernel, which applies the
 post-expert norm, the weighted combine and the cross-rank reduction. The BF16
-experts of the first and last layer are quantized to FP8 at load and take the
-FP8 fused-RS kernel. This module is the text decoder; ``muse_spark_omni`` adds
+experts of the first and last layer are quantized to FP8 on host at load and take
+the FP8 fused-RS kernel. The opt-in
+``SGLANG_TPU_ENABLE_MUSE_BF16_FIRST_LAST_LAYER_EXPERTS`` keeps them BF16 on
+fused-RS when supported, otherwise the BF16 grouped GEMM and
+``_combine_slots`` do those steps. This module is the text decoder; ``muse_spark_omni`` adds
 the vision tower on top of it and is the registered architecture. Audio tower
 weights are skipped.
 """
@@ -42,6 +45,7 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod, fp8_dtype
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptQuantConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import PPMissingLayer, copy_or_rebind_param
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -55,6 +59,7 @@ from sglang.srt.utils import add_prefix, make_pp_layers
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.expert_loading import _wait_for
 from sglang_tpu.fp8_moe import _free_replaced_storage
+from sglang_tpu.fp8_moe_fused_rs import apply_fp8_fused_rs, prepare_fp8_fused_rs
 
 logger = logging.getLogger(__name__)
 
@@ -415,6 +420,70 @@ class _HostQuantizedFp8Config(Fp8Config):
         return super().get_quant_method(layer, prefix)
 
 
+class MuseTpuBf16MoEMethod(UnquantizedFusedMoEMethod):
+    """Runs BF16 experts on fused-RS, which applies Muse's post-expert norm.
+
+    Only expert TP is supported, because the BF16 kernel does not compile under
+    expert parallelism. Other backends, and the auto backend on layouts fused-RS
+    does not support, keep the unquantized path.
+    """
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        from sglang.srt.layers.moe import get_moe_runner_backend
+
+        super().process_weights_after_loading(layer)
+        self.handles_moe_reduction = False
+        backend = get_moe_runner_backend()
+        if backend.is_auto() or backend.is_pallas_tpu_fused_rs():
+            if get_parallel().moe_ep_size > 1:
+                layer.__dict__["_tpu_fused_rs_unsupported_reason"] = (
+                    "BF16 fused-RS requires an expert parallel size of 1"
+                )
+            else:
+                self.handles_moe_reduction = prepare_fp8_fused_rs(layer)
+            if backend.is_pallas_tpu_fused_rs() and not self.handles_moe_reduction:
+                raise ValueError(
+                    "TPU BF16 fused-RS is not supported: "
+                    f"{layer._tpu_fused_rs_unsupported_reason}"
+                )
+
+    def forward_tpu(self, layer, dispatch_output):
+        if not self.handles_moe_reduction:
+            return super().forward_tpu(layer, dispatch_output)
+        return apply_fp8_fused_rs(
+            layer=layer,
+            dispatch_output=dispatch_output,
+            activation=self.moe_runner_config.activation,
+            swiglu_limit=self.moe_runner_config.gemm1_clamp_limit,
+        )
+
+
+def _experts_quant_config(
+    quant_config: Optional[QuantizationConfig], experts_prefix: str
+) -> Optional[QuantizationConfig]:
+    """Quantization of a layer's experts, or None to keep them BF16.
+
+    Muse NVFP4 excludes only the first and last layers.
+    """
+    if _uses_quantized_experts(quant_config, experts_prefix):
+        return quant_config
+    # A BF16 checkpoint has no NVFP4 layers, so the flag would reach every layer.
+    if (
+        quant_config is not None
+        and tpu_envs.SGLANG_TPU_ENABLE_MUSE_BF16_FIRST_LAST_LAYER_EXPERTS.get()
+    ):
+        if tpu_envs.SGLANG_TPU_MUSE_MEGAKERNEL.get():
+            raise ValueError(
+                "SGLANG_TPU_ENABLE_MUSE_BF16_FIRST_LAST_LAYER_EXPERTS cannot be "
+                "combined with SGLANG_TPU_MUSE_MEGAKERNEL, which reads only fp4 "
+                "or fp8 experts"
+            )
+        return None
+    # Quantized on host during load, so single-device PP stages never hold the
+    # 12 GiB BF16 stack in HBM.
+    return _HostQuantizedFp8Config()
+
+
 class MuseSparkMoE(nn.Module):
     def __init__(
         self,
@@ -432,6 +501,7 @@ class MuseSparkMoE(nn.Module):
         if config.post_norm_eps != _FUSED_RS_POST_EXPERT_NORM_EPS:
             raise ValueError("The fused-RS post-expert norm assumes eps=1e-8")
         self.tp_size = parallel.tp_size
+        self.moe_tp_size = parallel.moe_tp_size
         self.num_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
         self.route_scale = config.routed_scaling_factor
@@ -498,6 +568,10 @@ class MuseSparkMoE(nn.Module):
         )
         experts_prefix = add_prefix("experts", prefix)
         self.quantized_experts = _uses_quantized_experts(quant_config, experts_prefix)
+        experts_quant_config = _experts_quant_config(quant_config, experts_prefix)
+        experts_quant_method = None
+        if experts_quant_config is None:
+            experts_quant_method = MuseTpuBf16MoEMethod()
         self.experts = FusedMoE(
             num_experts=self.num_experts,
             hidden_size=self.expert_hidden_size,
@@ -505,13 +579,8 @@ class MuseSparkMoE(nn.Module):
             layer_id=layer_idx,
             top_k=self.top_k,
             reduce_results=False,
-            # BF16 experts are quantized to FP8 on host during load: the BF16
-            # grouped GEMM in the same executable as fused-RS and the distributed
-            # TopK sampler core-halts the TPU at startup, and streaming directly
-            # into FP8 avoids holding a 12 GiB BF16 stack on single-device PP stages.
-            quant_config=(
-                quant_config if self.quantized_experts else _HostQuantizedFp8Config()
-            ),
+            quant_config=experts_quant_config,
+            quant_method=experts_quant_method,
             prefix=experts_prefix,
             activation="silu",
             # Per-slot outputs: the post-expert norm runs before the combine.
@@ -549,9 +618,15 @@ class MuseSparkMoE(nn.Module):
     ) -> torch.Tensor:
         # slot_outputs: [num_tokens, top_k, expert_hidden]; non-local slots are 0,
         # and a zero row stays zero through the norm.
+        dtype = slot_outputs.dtype
+        if self.moe_tp_size > 1:
+            # Expert TP: each rank holds a partial output, so sum before the norm,
+            # in fp32 like the fused-RS kernel. That is 2 * top_k times the bytes of
+            # summing the combined output, acceptable off the fused-RS path.
+            slot_outputs = tensor_model_parallel_all_reduce(slot_outputs.float())
         normed = self.post_expert_norm(slot_outputs)
-        combined = (normed * topk_weights.unsqueeze(-1)).to(normed.dtype).sum(dim=1)
-        if self.tp_size > 1:
+        combined = (normed * topk_weights.unsqueeze(-1)).to(dtype).sum(dim=1)
+        if self.tp_size > 1 and self.moe_tp_size == 1:
             combined = tensor_model_parallel_all_reduce(combined)
         return combined
 
