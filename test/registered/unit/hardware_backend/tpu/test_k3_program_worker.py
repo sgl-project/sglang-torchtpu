@@ -79,6 +79,46 @@ def _req_to_token(rows, pages_per_row, context=4 * STEP):
     return table
 
 
+class TestColocatedDpSteps(CustomTestCase):
+    """Colocated attention DP2: a request's B rows on its first decode step
+    (the partner halves copied in), DCP16 tables, B rows for new pages, and
+    its decode-written halves copied back when it leaves."""
+
+    def test_b_rows_through_a_request(self):
+        from sglang_tpu.k3_programs import sglang_dp as dp
+
+        page = dp.PAGE_TOKENS
+        plan = bridge.UnifiedPoolPlan(60, 4, pools.cache_layout("fp8_e4m3"), dp_rows=8)
+        program = StubProgram()
+        steps = worker.DecodeSteps(program, plan, table_width=8, schedule=SCHEDULE)
+        steps.dp, steps.table_tokens = None, dp.GROUP_BLOCK_TOKENS
+        steps.colo = dp.ColoRows(plan.num_blocks, plan.dp_row_base, plan.dp_rows)
+        jobs = []
+        steps.swap = jobs.append
+        r2t = np.zeros((2, 4 * page), np.int32)
+        for k, p in enumerate((3, 6, 9)):
+            r2t[1, k * page : (k + 1) * page] = np.arange(p * page, (p + 1) * page)
+        base = plan.dp_row_base
+        req = _req("a", prompt=page + 5, output=[7], committed=page + 5, pool_idx=1, slot=2)
+        steps.step([req], r2t[:, ::page])
+        self.assertEqual(jobs, [[([3, 6], [base, base + 1], 0)]])
+        (row,) = program.inputs[-1].requests
+        # page + 5 + 8 scheduled tokens touch three DCP16 blocks: A, B, A.
+        self.assertEqual(row.block_tables[0].tolist(), [3, base, 6, 0, 0, 0, 0, 0])
+        req.output_ids += [8] * page
+        req.kv.kv_committed_len = 2 * page + 3
+        steps.step([req], r2t[:, ::page])
+        self.assertEqual(len(jobs), 1)  # a new page's B row needs no copy
+        (row,) = program.inputs[-1].requests
+        self.assertEqual(row.block_tables[0].tolist()[:5], [3, base, 6, base + 1, 9])
+        steps.colo_release("a")
+        # Decode-written pages (index 1 on) back to the partners' rows.
+        self.assertEqual(jobs[-1], [([base + 1, base + 2], [6, 9], 1)])
+        self.assertEqual(steps.colo.free_rows(0), 8)
+        steps.step([], r2t[:, ::page])  # "a" finishes: already released
+        self.assertEqual(len(jobs), 2)
+
+
 class TestDecodeSteps(CustomTestCase):
     def setUp(self):
         self.plan = bridge.UnifiedPoolPlan(40, 4, pools.cache_layout("auto"))

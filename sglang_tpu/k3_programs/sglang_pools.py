@@ -23,6 +23,7 @@ as replicated across ranks, and these are sent rank to rank.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -46,6 +47,16 @@ def _prefix_tails() -> int:
     from sglang_tpu.envs import envs as tpu_envs
 
     return int(tpu_envs.SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS.get() or 0)
+
+
+def _colocated_dp_share() -> float:
+    """B rows per KV page under colocated attention DP2 (0 otherwise)."""
+    from sglang_tpu.envs import envs as tpu_envs
+    from sglang_tpu.k3_programs.sglang_program import COLOCATED, server_role
+
+    if tpu_envs.SGLANG_TPU_K3_PROGRAM_ATTENTION_DP.get() != 2 or server_role() != COLOCATED:
+        return 0.0
+    return float(tpu_envs.SGLANG_TPU_K3_PROGRAM_DP_ROW_SHARE.get())
 
 
 def _copy_rows(tensors, src: torch.Tensor, dst: torch.Tensor) -> None:
@@ -211,14 +222,16 @@ class K3UnifiedKVPool:
             )
         pages = -(-size // page_size)
         tails = _prefix_tails()
+        dp_rows = math.ceil(pages * _colocated_dp_share())
         num_blocks = (
             1
             + bridge.KDA_PER_POOL * (state.size + 1)
             + pages
             + (1 + bridge.KDA_PER_POOL) * tails
+            + dp_rows
         )
         self.plan = bridge.UnifiedPoolPlan(
-            num_blocks, state.size, layout, tail_slots=tails
+            num_blocks, state.size, layout, tail_slots=tails, dp_rows=dp_rows
         )
         self.caches = bridge.allocate_pools(
             self.plan, device, draft_layers=bridge.DSPARK_DRAFT_LAYERS
@@ -254,7 +267,9 @@ class K3UnifiedKVPool:
         layout = cache_layout(program_kv_cache_dtype(kv_cache_dtype))
         pools = len(MLA) + bridge.DSPARK_DRAFT_LAYERS
         tokens = bridge.TP_SIZE * layout.tokens_per_block
-        return pools * _block_bytes(program_kv_cache_dtype(kv_cache_dtype)) // tokens
+        block = pools * _block_bytes(program_kv_cache_dtype(kv_cache_dtype))
+        # Colocated DP2's B rows ride on the KV pages' budget.
+        return int(block * (1 + _colocated_dp_share())) // tokens
 
     def raw_pools(self) -> list[torch.Tensor]:
         """The distinct tensors: 24 unified pools, then the draft's."""

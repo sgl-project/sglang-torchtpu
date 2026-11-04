@@ -307,6 +307,14 @@ class StepClock:
         self.rows = 0
 
 
+_COLO_STEPS: list = []
+
+
+def colo_steps() -> "DecodeSteps | None":
+    """The process's colocated DP2 decode steps (B rows), once built."""
+    return _COLO_STEPS[-1] if _COLO_STEPS else None
+
+
 class DecodeSteps:
     """A decode program's steps from sglang requests (no sglang objects
     beyond the requests' fields, so it runs on CPU against a stub program)."""
@@ -333,6 +341,8 @@ class DecodeSteps:
             sglang_dp.GROUP_BLOCK_TOKENS if self.dp else plan.logical_block_tokens
         )
         self.swap = None
+        # Colocated attention DP2 (sglang_dp.ColoRows, set at build): B rows.
+        self.colo: sglang_dp.ColoRows | None = None
         self._live: set[str] = set()
         self._departed: dict[str, None] = {}
         self._prompts = _Prompts()
@@ -366,6 +376,7 @@ class DecodeSteps:
         scheduled = 1 + drafts_for(self.schedule, len(reqs))
         requests = []
         swaps: list = []
+        jobs: list = []  # colocated DP2 copies before the step
         for req in reqs:
             if req.rid in self._departed:
                 # The program dropped its KDA state when it left the batch; the
@@ -404,7 +415,21 @@ class DecodeSteps:
             # pass the last page the tables hold; the program stops there.
             end = min(end, self.table_width * self.table_tokens)
             slot = int(req.kv.mamba_pool_idx.reshape(-1)[0])
-            if self.dp is None:
+            if self.colo is not None:
+                row = starts[req.kv.req_pool_idx]
+                pages = (
+                    np.asarray(row[: -(-end // sglang_dp.PAGE_TOKENS)], np.int64)
+                    // sglang_dp.PAGE_TOKENS
+                )
+                if req.rid in self._live and req.rid in self.colo:
+                    self.colo.extend(req.rid, pages, end)
+                else:
+                    jobs.append(self.colo.admit(req.rid, pages, computed, end))
+                tables = (
+                    self.colo.table_row(req.rid, end, self.table_width),
+                    *bridge.kda_table_rows(slot, self.plan),
+                )
+            elif self.dp is None:
                 tables = bridge.block_tables(
                     starts[req.kv.req_pool_idx], end, slot, self.plan, self.table_width
                 )
@@ -435,6 +460,8 @@ class DecodeSteps:
             )
         if swaps:
             self._swap(swaps)
+        if jobs:
+            self._run_jobs(jobs)
         current = {req.rid for req in reqs}
         finished, self._live = self._live - current, current
         self._forget(finished)
@@ -462,7 +489,23 @@ class DecodeSteps:
                 allocator.free_landing(torch.as_tensor(np.asarray(landing, np.int32)))
             req._k3_dp_transfer = (pages, ())
 
+    def _run_jobs(self, jobs) -> None:
+        if self.swap is None:
+            raise RuntimeError("K3 decode: DP2 B rows need the swap op, none is bound")
+        jobs = [job for job in jobs if job is not None and len(job[0])]
+        if jobs:
+            self.swap(jobs)
+
+    def colo_release(self, rid: str) -> None:
+        """Colocated DP2: request ``rid`` left (its KV goes to the radix
+        cache): its decode-written halves back to the DCP32 rows, now, ahead
+        of any prefill reading them; its B rows freed."""
+        if self.colo is not None and rid in self.colo:
+            self._run_jobs([self.colo.release(rid)])
+
     def _forget(self, finished: set[str]) -> None:
+        for rid in finished:
+            self.colo_release(rid)
         self._prompts.drop(finished)
         for rid in finished:
             self._departed[rid] = None
@@ -473,6 +516,8 @@ class DecodeSteps:
         """Drop every request's state (a cache flush)."""
         if self._live:
             self.program.step(StepInput((), set(self._live)))
+        for rid in list(self._live):
+            self.colo_release(rid)
         self._prompts.drop(self._live)
         self._live = set()
         self._departed.clear()

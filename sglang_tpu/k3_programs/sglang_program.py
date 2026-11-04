@@ -268,6 +268,13 @@ def _role_steps(role, program, config, pool):
     if dp is not None:
         sglang_dp.check_rank_order(program.destination_ranks)
         steps.swap = sglang_dp.make_swapper(program)
+        if server_role() == COLOCATED:
+            # The prefill keeps DCP32 pages; decoding requests add B rows.
+            from sglang_tpu.k3_programs import sglang_worker
+
+            steps.dp = None
+            steps.colo = sglang_dp.ColoRows(plan.num_blocks, plan.dp_row_base, plan.dp_rows)
+            sglang_worker._COLO_STEPS.append(steps)
     return steps
 
 

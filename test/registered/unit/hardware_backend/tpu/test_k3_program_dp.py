@@ -105,6 +105,87 @@ class TestGoldenLayout(CustomTestCase):
             plan.transfer_rows(16, [1, 2], [3])
 
 
+def _apply_job(pools, job):
+    """The swap op on a host model: ``pools[rank][row]``; rank ``r`` sends
+    its ``sources`` rows to ``r + 16``, which writes them at
+    ``destinations`` when ``group`` is its own."""
+    sources, destinations, group = job
+    sent = {r: [pools[r].get(s) for s in sources] for r in range(RANKS)}
+    for r in range(RANKS):
+        if r // dp.GROUP_RANKS == group:
+            partner = (r + dp.GROUP_RANKS) % RANKS
+            for d, value in zip(destinations, sent[partner]):
+                pools[r][d] = value
+
+
+class TestColocatedDp(CustomTestCase):
+    N = 40  # pool rows; B rows 30..39
+
+    def _rows(self, rows=10):
+        return dp.ColoRows(self.N, self.N - rows, rows)
+
+    def test_every_chunk_round_trips_through_decode_and_back(self):
+        """DCP32 prefill rows -> admission copy -> DCP16 reads of every chunk
+        on the request's group, decode writes on the group, release -> the
+        DCP32 rows hold every chunk for the next prefill."""
+        chunk = dp.CHUNK_TOKENS
+        lengths = (1, 511, 512, 8192, 8193, 16384, 16385, 40000)
+        for first_group, prompt in itertools.product((0, 1), lengths):
+            with self.subTest(group=first_group, prompt=prompt):
+                rows = self._rows()
+                if first_group == 1:
+                    rows.admit("other", [9], 1, 1)  # group 0 busy: the next takes 1
+                total = prompt + 3 * chunk + 7  # decode-written tokens after
+                pages = [20 - j for j in range(-(-total // dp.PAGE_TOKENS))]
+                pools = [dict() for _ in range(RANKS)]
+                # The prefill: chunk k on rank k % 32 at row pages[k // 32].
+                for k in range(-(-prompt // chunk)):
+                    pools[k % RANKS][pages[k // RANKS]] = ("P", k)
+                filled = pages[: -(-prompt // dp.PAGE_TOKENS)]
+                job = rows.admit("r", filled, prompt, prompt + 1)
+                group = rows.group["r"]
+                self.assertEqual(group, first_group)
+                _apply_job(pools, job)
+                rows.extend("r", pages, total)
+                table = rows.table_row("r", total, width=16)
+                self.assertTrue(all(int(i) // self.N == group for i in table[table > 0]))
+
+                def entry(k):  # DCP16 on the group: member k % 16, block k // 16
+                    rank = group * dp.GROUP_RANKS + k % dp.GROUP_RANKS
+                    return rank, int(table[k // dp.GROUP_RANKS]) % self.N
+
+                for k in range(-(-prompt // chunk)):
+                    rank, row = entry(k)
+                    self.assertEqual(pools[rank].get(row), ("P", k), (k, rank, row))
+                for k in range(prompt // chunk, -(-total // chunk)):  # decode writes
+                    rank, row = entry(k)
+                    pools[rank][row] = ("D", k) if k >= -(-prompt // chunk) else ("P", k)
+                _apply_job(pools, rows.release("r"))
+                for k in range(-(-total // chunk)):  # the next prefill's DCP32 reads
+                    kind = "P" if k < -(-prompt // chunk) else "D"
+                    self.assertEqual(pools[k % RANKS].get(pages[k // RANKS]), (kind, k), k)
+
+    def test_rows_groups_and_reuse(self):
+        rows = self._rows(rows=4)
+        job = rows.admit("a", [5, 6], dp.PAGE_TOKENS + 1, dp.PAGE_TOKENS + 2)
+        self.assertEqual(rows.group["a"], 0)
+        self.assertEqual(job[0], [5, 6])
+        self.assertEqual(job[2], 0)
+        self.assertEqual(rows.admit("b", [7], 10, 11)[2], 1)  # balanced
+        self.assertEqual(rows.free_rows(0), 2)
+        self.assertEqual(rows.free_rows(1), 3)
+        with self.assertRaisesRegex(RuntimeError, "B rows"):
+            rows.extend("a", [5, 6, 8, 9, 10], 5 * dp.PAGE_TOKENS)
+        with self.assertRaisesRegex(RuntimeError, "pages changed"):
+            rows.extend("a", [5, 7], 2 * dp.PAGE_TOKENS)
+        back = rows.release("a")  # decode wrote page index 1 only
+        self.assertEqual(back[1], [6])
+        self.assertEqual(back[2], 1)
+        self.assertEqual(rows.free_rows(0), 4)
+        self.assertIsNone(rows.release("a"))
+        self.assertIn("b", rows)
+
+
 class TestDpAllocator(CustomTestCase):
     PAGE = 16
 

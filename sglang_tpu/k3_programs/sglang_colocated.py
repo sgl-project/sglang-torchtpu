@@ -37,6 +37,22 @@ SHARED_DENSE = {
 }
 
 
+def shared_dense() -> dict[str, tuple[str, ...]]:
+    """The dense families the prefill takes from the decode program: under
+    attention DP the decode holds several head shards of some KDA and MLA
+    families (``ATTENTION_DP_WEIGHTS``), so the prefill keeps its own."""
+    from sglang_tpu.k3_programs.kimi_k3.config import active
+
+    if getattr(active(), "attention_dp", 1) == 1:
+        return SHARED_DENSE
+    from sglang_tpu.k3_programs.kimi_k3.kernels.decode_megakernel import ATTENTION_DP_WEIGHTS
+
+    return {
+        group: tuple(n for n in names if n not in ATTENTION_DP_WEIGHTS)
+        for group, names in SHARED_DENSE.items()
+    }
+
+
 @contextlib.contextmanager
 def _no_expert_jobs(rank_loader: Any):
     """The rank loader without the expert families' read jobs."""
@@ -63,7 +79,7 @@ class _SharedExpertLoader:
             for group, name, array in self._loader.iter_prefill_rank(*args, **kwargs):
                 if name.split("@", 1)[0] in EXPERT_FAMILIES:
                     continue
-                if name in SHARED_DENSE.get(group, ()):
+                if name in shared_dense().get(group, ()):
                     continue
                 yield group, name, array
 
@@ -84,7 +100,7 @@ def share_experts(prefiller: Any, decoder: Any) -> None:
     experts = {name: decoder.ops.weights[name] for name in EXPERT_FAMILIES}
     dense = {
         group: {name: decoder.ops.weights[name] for name in names}
-        for group, names in SHARED_DENSE.items()
+        for group, names in shared_dense().items()
     }
     program = prefiller.program
     program._rank_loader = _SharedExpertLoader(program._rank_loader)

@@ -162,9 +162,12 @@ class TpuEnvs:
     # waits up to this many scheduler rounds in a row (each prefill batch
     # stops every decoding request; rounds keep TP ranks in step). 0: off.
     SGLANG_TPU_K3_PROGRAM_PREFILL_WAIT_ROUNDS = EnvInt(0)
-    # K3_PROGRAM P/D decode: attention data parallelism (1, or 2: two DCP16
-    # groups, k3_programs/sglang_dp.py). Set on the decode only.
+    # K3_PROGRAM decode program: attention data parallelism (1, or 2: two
+    # DCP16 groups, k3_programs/sglang_dp.py). A P/D server sets it on the
+    # decode only; a colocated server's decode program takes it.
     SGLANG_TPU_K3_PROGRAM_ATTENTION_DP = EnvInt(1)
+    # Colocated attention DP2: B rows reserved per KV page (sglang_dp.ColoRows).
+    SGLANG_TPU_K3_PROGRAM_DP_ROW_SHARE = EnvFloat(0.5)
 
     # Host padding is unconditional; this routes speculative batches to the
     # experimental spec worker, which keeps their metadata on the host as well.

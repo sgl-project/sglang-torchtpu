@@ -26,6 +26,9 @@ Environment:
                                     decoding requests (0: off)
     K3_PROGRAM_RUNNING              running requests (default twice the
                                     concurrency, up to 64)
+    K3_PROGRAM_ATTENTION_DP         1 (default) or 2: the decode program's
+                                    attention DP (two DCP16 groups)
+    K3_PROGRAM_DP_ROW_SHARE         DP2 B rows per KV page (default 0.5)
     K3_PROGRAM_KERNEL_EXTRA         more kernel settings (a=b;c=d)
     SGLANG_TPU_K3_PROGRAM_PRESHARDED pre-sharded weights directory
 """
@@ -47,6 +50,9 @@ RUNNING = min(64, max(4, 2 * CONCURRENCY))
 # concurrency) frees the state slots planned for the second (three blocks
 # each, sglang plans up to five a running request).
 RUNNING = int(os.environ.get("K3_PROGRAM_RUNNING", RUNNING))
+# Attention DP2 on the decode program (sglang_tpu/k3_programs/sglang_dp.py,
+# ColoRows): the prefill keeps its DCP32 pages, decoding requests add B rows.
+ATTENTION_DP = int(os.environ.get("K3_PROGRAM_ATTENTION_DP", "1"))
 # Both programs' weights take ~80 GB of a rank's 96 GB (the shared experts 45,
 # two sets of dense weights 12, the prefill's sequence-parallel projections
 # 22.5): the pools are small, and every KDA state (a checkpoint, a running
@@ -151,6 +157,7 @@ runtime_env.update(
                     "read_streams=16".format(
                         ep=os.environ.get("K3_PROGRAM_EXPERT_PARALLEL", "16")
                     ),
+                    "attention_dp=2;dcp_group=16" if ATTENTION_DP == 2 else None,
                     os.environ.get("K3_PROGRAM_KERNEL_EXTRA"),
                 ),
             )
@@ -160,8 +167,11 @@ runtime_env.update(
             "K3_PROGRAM_SIMULATE_ACC_LENGTHS", "7:3.78,3:2.87,1:1.84"
         ),
         "SGLANG_TPU_K3_PROGRAM_SPEC_SCHEDULE": os.environ.get(
-            "K3_PROGRAM_SPEC_SCHEDULE", "1:1:7,2:16:3,17:64:0"
+            "K3_PROGRAM_SPEC_SCHEDULE",
+            "1:32:3,33:128:0" if ATTENTION_DP == 2 else "1:1:7,2:16:3,17:64:0",
         ),
+        "SGLANG_TPU_K3_PROGRAM_ATTENTION_DP": str(ATTENTION_DP),
+        "SGLANG_TPU_K3_PROGRAM_DP_ROW_SHARE": os.environ.get("K3_PROGRAM_DP_ROW_SHARE", "0.5"),
         # Overlap scheduling: the decode program's next step launches while
         # the scheduler processes the last one's tokens.
         "SGLANG_TPU_K3_PROGRAM_OPT_OVERLAP": os.environ.get("K3_PROGRAM_OVERLAP", "1"),

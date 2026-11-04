@@ -356,8 +356,11 @@ def _dp_allocator(queue: Any):
 
 
 def k3_program_dp_allocator(original, platform: Any, *args, **kwargs) -> type:
-    """AROUND TpuSRTPlatform.get_paged_allocator_cls."""
-    if _dp2():
+    """AROUND TpuSRTPlatform.get_paged_allocator_cls (the P/D decode's
+    regions; a colocated server keeps sglang's allocator, sglang_dp.ColoRows)."""
+    from sglang_tpu.k3_programs.sglang_program import server_role
+
+    if _dp2() and k3_program_active() and server_role() == "decode":
         from sglang_tpu.k3_programs.sglang_dp_alloc import K3DpPagedAllocator
 
         return K3DpPagedAllocator
@@ -421,8 +424,13 @@ def k3_program_dp_admission(original, queue: Any, *args, **kwargs) -> int:
 
 def k3_program_dp_release(result: Any, req: Any, *args, **kwargs) -> None:
     """AFTER mem_cache.common.release_kv_cache."""
-    from sglang_tpu.k3_programs import sglang_dp_alloc
+    from sglang_tpu.k3_programs import sglang_dp_alloc, sglang_worker
 
+    steps = sglang_worker.colo_steps()
+    if steps is not None:
+        # Colocated DP2: the request's decode-written halves back to the
+        # DCP32 rows the radix cache now holds, before any prefill reads them.
+        steps.colo_release(req.rid)
     allocator = sglang_dp_alloc.active()
     if allocator is None:
         return result

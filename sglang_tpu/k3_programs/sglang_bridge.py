@@ -78,6 +78,9 @@ class UnifiedPoolPlan:
     # Prefix tails (sglang_tails): a KV block and a KDA state slot each, after
     # the state blocks, outside sglang's allocators.
     tail_slots: int = 0
+    # Colocated attention DP2 (sglang_dp.ColoRows): rows after the tails,
+    # outside sglang's allocators, each a B row on either DP group's ranks.
+    dp_rows: int = 0
 
     def __post_init__(self) -> None:
         if self.state_slots < 1 or self.kv_blocks < 1:
@@ -95,7 +98,7 @@ class UnifiedPoolPlan:
     @property
     def kv_blocks(self) -> int:
         """KV logical blocks: sglang's KV pages 1 .. kv_blocks."""
-        return self.num_blocks - 1 - self.state_blocks - self.tail_blocks
+        return self.num_blocks - 1 - self.state_blocks - self.tail_blocks - self.dp_rows
 
     @property
     def tail_blocks(self) -> int:
@@ -123,6 +126,11 @@ class UnifiedPoolPlan:
             + KDA_PER_POOL * tail
             + group
         )
+
+    @property
+    def dp_row_base(self) -> int:
+        """The first colocated-DP2 row (after the tails)."""
+        return self.state_base + self.state_blocks + self.tail_blocks
 
     @property
     def state_base(self) -> int:

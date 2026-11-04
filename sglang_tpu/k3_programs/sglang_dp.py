@@ -154,6 +154,113 @@ def landing_pages_needed(pages: int) -> int:
     return -(-pages // 2)
 
 
+# ------------------------------------------------------------ colocated DP2
+class ColoRows:
+    """Attention DP2 on a colocated server. The prefill keeps sglang's DCP32
+    pages (page ``p`` is row ``p`` on every rank: chunk ``32 j + r`` on rank
+    ``r``), so the radix cache and the prefill's prefix reads are as without
+    DP. A decoding request of DP group ``g`` also holds a B row per page on its
+    group's ranks: group rank ``q``'s copy of chunk ``32 j + 16 (1 - g) + q``,
+    the half its partner ``16 (1 - g) + q`` holds in row ``p``. Its DCP16
+    block ``2 j + g`` is row ``p``, block ``2 j + 1 - g`` its B row.
+
+    B rows come from rows sglang does not allocate (``UnifiedPoolPlan.dp_rows``),
+    one free list a group (a row id serves either group's ranks). A request's
+    first decode step copies its prompt pages' partner halves into its B rows;
+    its steps write both halves of new tokens on its group (the A half in row
+    ``p``); when it leaves, its decode-written pages' B rows go back to the
+    partners' rows ``p`` (the radix cache holds DCP32 pages) and are freed.
+    Jobs are the swap op's ``(sources, destinations, destination group)``."""
+
+    def __init__(self, num_blocks: int, base: int, rows: int) -> None:
+        if rows < 1:
+            raise ValueError("colocated DP2 needs reserved B rows (UnifiedPoolPlan.dp_rows)")
+        self.num_blocks = int(num_blocks)
+        self._free = [list(range(base + rows - 1, base - 1, -1)) for _ in range(GROUPS)]
+        self.group: dict[str, int] = {}
+        self._b: dict[str, list[int]] = {}
+        self._pages: dict[str, list[int]] = {}
+        self._first: dict[str, int] = {}  # first decode-written page index
+        self._end: dict[str, int] = {}
+
+    def __contains__(self, rid: str) -> bool:
+        return rid in self.group
+
+    def free_rows(self, group: int) -> int:
+        return len(self._free[group])
+
+    def _pick(self) -> int:
+        live = [0] * GROUPS
+        for g in self.group.values():
+            live[g] += 1
+        return min(range(GROUPS), key=lambda g: (live[g], -len(self._free[g]), g))
+
+    def _take(self, group: int, count: int) -> list[int]:
+        if count > len(self._free[group]):
+            raise RuntimeError(
+                f"K3 decode DP2: {count} B rows wanted, {len(self._free[group])} left "
+                f"in group {group} (raise K3_PROGRAM_DP_ROWS)"
+            )
+        return [self._free[group].pop() for _ in range(count)]
+
+    def admit(self, rid: str, pages, computed: int, end: int):
+        """A request's first decode step with its ``pages`` (sglang KV pages,
+        covering ``end`` tokens) and ``computed`` prompt tokens: its group, B
+        rows, and the job copying its prompt pages' partner halves."""
+        if rid in self.group:
+            raise RuntimeError(f"K3 decode DP2: request {rid} admitted twice")
+        group = self._pick()
+        pages = [int(p) for p in pages]
+        b = self._take(group, len(pages))
+        self.group[rid], self._b[rid], self._pages[rid] = group, b, pages
+        self._first[rid], self._end[rid] = int(computed) // PAGE_TOKENS, int(end)
+        filled = -(-int(computed) // PAGE_TOKENS)
+        return (pages[:filled], b[:filled], group)
+
+    def extend(self, rid: str, pages, end: int) -> None:
+        """A running request's ``pages`` (new ones at the end) covering ``end``."""
+        pages = [int(p) for p in pages]
+        held = self._pages[rid]
+        if pages[: len(held)] != held[: len(pages)]:
+            raise RuntimeError(f"K3 decode DP2: request {rid}'s pages changed: {held} -> {pages}")
+        if len(pages) > len(held):
+            self._b[rid] += self._take(self.group[rid], len(pages) - len(held))
+            self._pages[rid] = pages
+        self._end[rid] = max(self._end[rid], int(end))
+
+    def table_row(self, rid: str, seq_len: int, width: int) -> np.ndarray:
+        """The request's MLA block-table row (ids ``g N + row``), 0-padded."""
+        used = -(-int(seq_len) // GROUP_BLOCK_TOKENS)
+        if used > width:
+            raise ValueError(f"{seq_len} tokens need {used} blocks; the table holds {width}")
+        group, pages, b = self.group[rid], self._pages[rid], self._b[rid]
+        if -(-used // GROUPS) > len(pages):
+            raise ValueError(f"{len(pages)} pages do not cover {seq_len} tokens")
+        base = group * self.num_blocks
+        ids = []
+        for page, brow in zip(pages, b):
+            pair = (page, brow) if group == 0 else (brow, page)
+            ids += [base + pair[0], base + pair[1]]
+        row = np.zeros(width, np.int32)
+        row[:used] = ids[:used]
+        return row
+
+    def release(self, rid: str):
+        """A request leaving: the job writing its decode-written pages' B rows
+        back to the partners' rows (None if it decoded no page), its B rows
+        freed (later jobs reuse them after this one, in device order)."""
+        if rid not in self.group:
+            return None
+        group = self.group.pop(rid)
+        b, pages = self._b.pop(rid), self._pages.pop(rid)
+        first, end = self._first.pop(rid), self._end.pop(rid)
+        last = min(len(pages), -(-end // PAGE_TOKENS))
+        self._free[group] += b[::-1]
+        if last <= first:
+            return None
+        return (b[first:last], pages[first:last], 1 - group)
+
+
 # ------------------------------------------------------------ the swap op
 SWAP_BUCKETS = (16, 64, 256)  # swap entries a call, padded (longer swaps run in parts)
 
