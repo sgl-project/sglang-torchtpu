@@ -128,6 +128,18 @@ def _assert_root_buffers(name: str, buffers: Sequence[torch.Tensor]) -> None:
             )
 
 
+def _assert_tpu_page_tile_aligned(name: str, buffers: Sequence[torch.Tensor]) -> None:
+    for idx, buf in enumerate(buffers):
+        if not isinstance(buf, torch.Tensor):
+            continue
+        if buf.ndim < 3 or buf.shape[-2] % 8 != 0 or buf.shape[-1] % 128 != 0:
+            raise RuntimeError(
+                f"Raiden TPU page DMA requires {name}[{idx}] shape {tuple(buf.shape)} "
+                "to have minor tile dims (multiple of 8, multiple of 128) so "
+                "pages never interleave inside XLA (8, 128) HBM tiles."
+            )
+
+
 def kv_layout_of(tensors: Sequence[torch.Tensor]) -> str:
     """The P/D layout tag of the registered full-attention KV tensors."""
     if any(len(tensor.shape) == _BLOCK_MAJOR_KV_RANK for tensor in tensors):
@@ -197,6 +209,14 @@ def get_raiden_kv_caches(
                 swa_layer_ids=[],
                 unified_swa_pool=current_pool,
             )
+        if hasattr(current_pool, "raiden_full_buffers"):
+            dsv41_full = list(current_pool.raiden_full_buffers())
+            dsv41_swa = list(current_pool.raiden_swa_buffers())
+            _assert_root_buffers("DSV4.1 full KV", dsv41_full)
+            _assert_root_buffers("DSV4.1 SWA KV", dsv41_swa)
+            _assert_tpu_page_tile_aligned("DSV4.1 full KV", dsv41_full)
+            _assert_tpu_page_tile_aligned("DSV4.1 SWA KV", dsv41_swa)
+            return RaidenKVCacheGroups(full=dsv41_full, swa=dsv41_swa)
         if isinstance(current_pool, DSV4TPUTokenToKVPool):
             dsv4_full: List[torch.Tensor] = []
             if isinstance(current_pool.c4_kv_pool, TPUDeepSeekV4CSAKVPool):
@@ -303,7 +323,13 @@ def get_raiden_kv_caches(
     committed_state_row = None
     read_state_meta = None
     write_state_meta = None
-    if isinstance(pool, DSV4TPUTokenToKVPool):
+    if hasattr(pool, "raiden_state_buffers"):
+        state = list(pool.raiden_state_buffers())
+        _assert_root_buffers("DSV4.1 pair state", state)
+        _assert_tpu_page_tile_aligned("DSV4.1 pair state", state)
+        state_type = StateType.DSV4_REQUEST_STATE
+        state_max_blocks = int(getattr(pool, "raiden_state_max_blocks", 1))
+    elif isinstance(pool, DSV4TPUTokenToKVPool):
         state = [
             p.state_buffer
             for p in (*pool.compress_state_pools, *pool.indexer_compress_state_pools)

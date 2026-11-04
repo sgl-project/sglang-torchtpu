@@ -254,9 +254,14 @@ class DeepseekV4ForCausalLM(CoreCausalLM):
 
     def __init__(self, config, quant_config=None, prefix=""):
         nn.Module.__init__(self)
-        if get_disagg().disaggregation_mode != "null":
+        disagg = get_disagg()
+        if (
+            disagg.disaggregation_mode != "null"
+            and disagg.disaggregation_transfer_backend != "raiden"
+        ):
             raise NotImplementedError(
-                "V4.1 word caches and C2 pending-pair state do not support P/D transfer"
+                "V4.1 P/D disaggregation on TPU requires "
+                "--disaggregation-transfer-backend raiden"
             )
         if not config.hc_pre_from_prev_sublayer:
             raise ValueError("V4.1 requires shifted mHC")

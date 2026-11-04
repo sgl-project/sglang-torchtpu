@@ -421,10 +421,14 @@ def gather_csa2_kv_sc(
             raise ValueError("CSA2 word banks must be INT32 [records,128]")
         if (
             not bank.shape[0]
-            or scale.shape != bank.shape[:1]
+            or scale.ndim != 1
+            or scale.shape[0] < bank.shape[0]
+            or scale.shape[0] % bank.shape[0]
             or scale.dtype != jnp.float32
         ):
-            raise ValueError("CSA2 scale banks must be nonempty FP32 [records]")
+            raise ValueError(
+                "CSA2 scale banks must be nonempty FP32 [records * scale_step]"
+            )
     if records.ndim != 2 or records.shape[1] != 512 or records.dtype != jnp.int32:
         raise ValueError("CSA2 selection IDs must be INT32 [T,512]")
     if not records.size:
@@ -486,11 +490,25 @@ def _gather_sc_banked(words, scales, records):
                     for bank in range(len(words)):
                         local = selected - split if bank else selected
                         own = (local >= 0) & (local < word_refs[bank].shape[0])
-                        indexed = plsc.Indices(
+                        scale_step = (
+                            scale_refs[bank].shape[0] // word_refs[bank].shape[0]
+                        )
+                        word_idx = plsc.Indices(
                             jnp.where(own, local, -1), ignored_value=-1
                         )
-                        for kind, (src, dst) in enumerate(
-                            ((word_refs[bank], word_buf), (scale_refs[bank], scale_buf))
+                        scale_idx = (
+                            word_idx
+                            if scale_step == 1
+                            else plsc.Indices(
+                                jnp.where(own, local * scale_step, -1),
+                                ignored_value=-1,
+                            )
+                        )
+                        for kind, (src, dst, indexed) in enumerate(
+                            (
+                                (word_refs[bank], word_buf, word_idx),
+                                (scale_refs[bank], scale_buf, scale_idx),
+                            )
                         ):
                             copy = pltpu.make_async_copy(
                                 src.at[indexed],
@@ -596,8 +614,13 @@ def publish_csa2_kv(
     for bank, scale_bank in zip(banks, scale_banks, strict=True):
         if bank.ndim != 2 or bank.shape[1] != 128 or bank.dtype != jnp.int32:
             raise ValueError("Publication words must be INT32 [records,128]")
-        if scale_bank.shape != bank.shape[:1] or scale_bank.dtype != jnp.float32:
-            raise ValueError("Publication scales must be FP32 [records]")
+        if (
+            scale_bank.ndim != 1
+            or scale_bank.shape[0] < bank.shape[0]
+            or scale_bank.shape[0] % bank.shape[0]
+            or scale_bank.dtype != jnp.float32
+        ):
+            raise ValueError("Publication scales must be FP32 [records * scale_step]")
     if records.dtype != jnp.int32 or records.shape != latent.shape[:1]:
         raise ValueError("Publication records must be INT32 [N]")
     encoded, encoded_scales = encode_csa2_kv(latent)
@@ -629,11 +652,22 @@ def publish_csa2_kv(
                 valid = (selected[...] >= base) & (
                     selected[...] < base + banks[bank].shape[0]
                 )
-                indices = plsc.Indices(
-                    jnp.where(valid, selected[...] - base, -1), ignored_value=-1
+                local = selected[...] - base
+                scale_step = scale_banks[bank].shape[0] // banks[bank].shape[0]
+                word_idx = plsc.Indices(jnp.where(valid, local, -1), ignored_value=-1)
+                scale_idx = (
+                    word_idx
+                    if scale_step == 1
+                    else plsc.Indices(
+                        jnp.where(valid, local * scale_step, -1),
+                        ignored_value=-1,
+                    )
                 )
-                for kind, (src, dst) in enumerate(
-                    ((word, out_words[bank]), (scale, out_scales[bank]))
+                for kind, (src, dst, indices) in enumerate(
+                    (
+                        (word, out_words[bank], word_idx),
+                        (scale, out_scales[bank], scale_idx),
+                    )
                 ):
                     copy = pltpu.make_async_copy(
                         src, dst.at[indices], sem.at[bank, kind]

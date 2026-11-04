@@ -148,21 +148,80 @@ def test_pool_factory_uses_fp8_even_for_core_force_fp4_selector():
         assert kwargs == {"record_alignment": 256}
 
 
-@pytest.mark.parametrize("storage,per_record", [(64, 652), (128, 648)])
-def test_plugin_budget_matches_physical_packed_pages(storage, per_record):
+@pytest.mark.parametrize("storage", [64, 128])
+def test_plugin_budget_matches_physical_packed_pages(storage):
     budget = definition("sglang_tpu/hooks/dsv41.py", "cache_bytes", {})
-    config = SimpleNamespace(attn_head_dim=512, stage_owner_layers={1: [20], 2: [2]})
+    c2_state = definition("sglang_tpu/hooks/dsv41.py", "c2_state_bytes", {})
+    c1_per_record, c2_per_record = 672, 704
+    config = SimpleNamespace(
+        page_size=256,
+        attn_head_dim=512,
+        stage_owner_layers={1: [20], 2: [2]},
+        ring_sizes={2: 2},
+        _get_num_req_slots=lambda max_reqs: max_reqs + 1,
+    )
     module = SimpleNamespace(DSV41_INDEX_PAGE_SIZE=storage)
     with patch.dict(
         sys.modules, {"sglang.srt.mem_cache.deepseek_v4_memory_pool": module}
     ):
-        assert budget(100, config) == 100 + per_record + per_record / 2
+        assert budget(100, config) == 100 + c1_per_record + c2_per_record / 2
         config.stage_owner_layers = {1: [20]}
-        assert budget(0, config) == per_record
-        config.stage_owner_layers = {2: [2]}
-        assert budget(0, config) == per_record / 2
+        assert budget(0, config) == c1_per_record
+        assert c2_state(lambda *_: 0, config, 16) == 0
+        config.stage_owner_layers = {2: [2, 6]}
+        assert budget(0, config) == 2 * (c2_per_record / 2)
+        assert c2_state(lambda *_: -1, config, 16) == 18 * 8 * 1024 * 4 * 2
         config.stage_owner_layers = {4: [1], 128: [3]}
         assert budget(100, config) == 100
+        assert c2_state(lambda *_: 77, config, 16) == 77
+
+
+@pytest.mark.parametrize(
+    "ratio,storage,expected_rows,expected_stride",
+    [(1, 64, 72, 18), (2, 64, 40, 20), (1, 128, 72, 36), (2, 128, 40, 40)],
+)
+def test_full_page_major_index_pool_and_strided_geometry(
+    ratio, storage, expected_rows, expected_stride
+):
+    pool_type = definition(
+        "sglang_tpu/dsv41/memory_pool.py", "PackedFP8IndexPool", {"torch": torch}
+    )
+    scheduler_records = 256 // ratio
+    full_pages = 10
+    pool = pool_type(
+        full_pages * scheduler_records,
+        storage,
+        128,
+        2,
+        "cpu",
+        record_alignment=scheduler_records,
+        full_pages=full_pages,
+    )
+    assert pool.page_stride == expected_stride
+    assert pool.k_pages[0]._base is None
+    assert pool.k_pages[0].shape == (full_pages, expected_rows, 128)
+    assert pool.k_buffer[0]._base is pool.k_pages[0]
+    assert pool.k_buffer[0].shape == (pool.num_pages * expected_stride, 128)
+    geometry = definition(
+        "sglang_tpu/dsv41/custom_ops.py",
+        "index_geometry",
+        {"jnp": jnp, "PackedFP8Layout": layout_type()},
+    )
+    physical, layout = geometry(
+        pool.k_buffer[0],
+        jnp.array([[1, 3, -1]], jnp.int32),
+        scheduler_records,
+        storage,
+        pool.page_stride,
+    )
+    parts = scheduler_records // storage
+    np.testing.assert_array_equal(
+        physical,
+        [[*range(parts, 2 * parts), *range(3 * parts, 4 * parts), *([-1] * parts)]],
+    )
+    assert layout.page_size == storage
+    assert layout.page_stride == expected_stride
+    layout.validate((pool.k_buffer[0].shape[0],))
 
 
 def test_publish_preserves_pool_identity_and_supplies_physical_page_size():
@@ -189,6 +248,28 @@ def test_publish_preserves_pool_identity_and_supplies_physical_page_size():
     assert [x.data_ptr() for x in (latent, scales, index)] == identities
     assert torch.all(latent == 1) and torch.all(scales == 2) and torch.all(index == 3)
     assert seen == [64]
+
+    words_3d = torch.zeros((2, 8, 128), dtype=torch.int32)
+    scales_3d = torch.zeros((2, 8, 128), dtype=torch.float32)
+    index_3d = torch.zeros((2, 18, 128), dtype=torch.int32)
+    root_pool = SimpleNamespace(
+        low_ratio_root=lambda layer, **kw: index_3d if kw.get("index") else words_3d,
+        low_ratio_scale_root=lambda layer: scales_3d,
+        index_page_records=lambda layer: 64,
+        index_page_stride=lambda layer: 18,
+    )
+    root_ops = SimpleNamespace(
+        compressed=lambda w, s, *_: (w + 5, s + 6),
+        index=lambda w, *_: w + 7,
+    )
+    root_ids = [x.data_ptr() for x in (words_3d, scales_3d, index_3d)]
+    publish(root_ops, root_pool, 20, None, None, None, None)
+    assert [x.data_ptr() for x in (words_3d, scales_3d, index_3d)] == root_ids
+    assert (
+        torch.all(words_3d == 5)
+        and torch.all(scales_3d == 6)
+        and torch.all(index_3d == 7)
+    )
 
 
 def test_candidate_reuse_is_scoped_by_source_and_publication():

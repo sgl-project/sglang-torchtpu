@@ -58,7 +58,7 @@ def inverse_rope(cos_sin, positions):
     return jnp.stack((cos, sin), 1)
 
 
-def index_geometry(words, pages, page_records, storage_records):
+def index_geometry(words, pages, page_records, storage_records, page_stride: int = 0):
     """Expand scheduler pages to the allocator's physical FP8 page geometry."""
     if page_records % storage_records:
         raise ValueError("Scheduler index pages must contain whole storage pages")
@@ -68,8 +68,12 @@ def index_geometry(words, pages, page_records, storage_records):
         pages[..., None] * parts + jnp.arange(parts, dtype=jnp.int32),
         -1,
     ).reshape(pages.shape[0], -1)
-    rows = (33 * storage_records + 127) // 128
-    return physical, PackedFP8Layout(words.shape[0] // rows, page_size=storage_records)
+    stride = page_stride or ((33 * storage_records + 127) // 128)
+    return physical, PackedFP8Layout(
+        words.shape[0] // stride,
+        page_stride=stride,
+        page_size=storage_records,
+    )
 
 
 def select(
@@ -87,6 +91,7 @@ def select(
     publish: bool,
     filter_candidates: bool,
     layer_id: int,
+    page_stride: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     """Dense paged scoring: sources, unfiltered layers and covering consumers.
 
@@ -94,7 +99,9 @@ def select(
     prepare_main_records requires (the epic FP8 path's precompacted records).
     """
     del layer_id
-    physical, layout = index_geometry(words, pages, page_records, storage_records)
+    physical, layout = index_geometry(
+        words, pages, page_records, storage_records, page_stride
+    )
     live = (requests >= 0) & (requests < pages.shape[0])
     batch_max = jnp.max(jnp.where(live, lengths, 0), initial=0).reshape(1)
     return select_fp8_indexer_jax(
@@ -124,13 +131,16 @@ def prepare_index(
     page_records: int,
     storage_records: int,
     block_size: int,
+    page_stride: int = 0,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Gather each query pair's candidate union once per K source and publication.
 
     Requires each request's query rows to be contiguous, as both forward modes
     build them; invalid rows (-1) may follow.
     """
-    physical, layout = index_geometry(words, pages, page_records, storage_records)
+    physical, layout = index_geometry(
+        words, pages, page_records, storage_records, page_stride
+    )
     return prepare_fp8_candidates(
         (words,),
         physical,
@@ -346,13 +356,23 @@ def register_ops():
         publish,
         filter_candidates,
         layer_id,
+        page_stride=0,
     ):
+        del page_stride
         width = min(topk, pages.shape[1] * page_records)
         return lengths.new_empty((q.shape[0], width)), torch.empty_like(candidates)
 
     def fake_prepare(
-        words, pages, requests, candidates, page_records, storage_records, block_size
+        words,
+        pages,
+        requests,
+        candidates,
+        page_records,
+        storage_records,
+        block_size,
+        page_stride=0,
     ):
+        del page_stride
         # Epic indexer_fp8.fake_prepare: one group per query bounds the pairing.
         tokens, count = candidates.shape
         key_pages = (2 * count * block_size + 127) // 128
@@ -402,6 +422,7 @@ class CacheOps(NamedTuple):
     compressed: object
     index: object
     swa: object
+    pair_state: object = None
 
 
 @cache
@@ -410,8 +431,10 @@ def register_cache_ops():
 
     from sglang_tpu.kernels.deepseek_v41.csa2.cache import (
         publish_csa2_kv,
-        scatter_index_keys,
         write_swa_word_pool,
+    )
+    from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.cache import (
+        write_fp8_records,
     )
     from sglang_tpu.pallas_jax_op import cpu_export_jax_op
 
@@ -423,7 +446,10 @@ def register_cache_ops():
         after: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
         words, scales, _ = jax.lax.optimization_barrier((words, scales, after))
-        return publish_csa2_kv(words, scales, records, values)
+        new_words, new_scales = publish_csa2_kv(
+            words.reshape(-1, 128), scales.reshape(-1), records, values
+        )
+        return new_words.reshape(words.shape), new_scales.reshape(scales.shape)
 
     def index(
         words: jax.Array,
@@ -431,9 +457,19 @@ def register_cache_ops():
         values: jax.Array,
         after: jax.Array,
         page_records: int,
+        page_stride: int = 0,
     ) -> jax.Array:
         words, _ = jax.lax.optimization_barrier((words, after))
-        return scatter_index_keys(words, records, values, page_records=page_records)
+        words_2d = words.reshape(-1, 128)
+        stride = page_stride or ((33 * page_records + 127) // 128)
+        layout = PackedFP8Layout(
+            words_2d.shape[0] // stride,
+            page_stride=stride,
+            page_size=page_records,
+        )
+        return write_fp8_records((words_2d,), records, values, layout)[0].reshape(
+            words.shape
+        )
 
     def swa(
         words: jax.Array,
@@ -441,7 +477,72 @@ def register_cache_ops():
         values: jax.Array,
         page_size: int,
     ) -> jax.Array:
-        return write_swa_word_pool(words, records, values, page_size=page_size)
+        return write_swa_word_pool(
+            words.reshape(-1, 128), records, values, page_size=page_size
+        ).reshape(words.shape)
+
+    def pair_state(
+        state: jax.Array,
+        kv: jax.Array,
+        score: jax.Array,
+        req: jax.Array,
+        positions: jax.Array,
+        valid: jax.Array,
+        ring_size: int,
+    ) -> tuple[jax.Array, jax.Array]:
+        dim = kv.shape[-1]
+        ring_stride = state.shape[1] if state.ndim == 3 else ring_size
+        flat_state = state.reshape(-1, state.shape[-1])
+        state_rows = flat_state.shape[0]
+        previous = req * ring_stride + jnp.mod(positions - 1, ring_size)
+        previous = jnp.where(valid & (positions > 0), previous, state_rows - 1)
+        carried = flat_state[previous]
+        in_batch = jnp.concatenate(
+            [
+                jnp.zeros((1,), dtype=jnp.bool_),
+                valid[1:]
+                & valid[:-1]
+                & (req[1:] == req[:-1])
+                & (positions[1:] == positions[:-1] + 1),
+            ]
+        )
+        previous_kv = jnp.where(
+            in_batch[:, None], jnp.roll(kv, 1, axis=0), carried[:, :dim]
+        )
+        previous_score = jnp.where(
+            in_batch[:, None],
+            jnp.roll(score, 1, axis=0),
+            carried[:, dim : 2 * dim],
+        )
+        previous_score = jnp.where(
+            (valid & (jnp.mod(positions, 2) == 1))[:, None],
+            previous_score,
+            score,
+        )
+        weights = jax.nn.softmax(jnp.stack([previous_score, score], axis=1), axis=1)
+        pooled = jnp.sum(jnp.stack([previous_kv, kv], axis=1) * weights, axis=1)
+
+        keep = valid
+        if kv.shape[0] > ring_size:
+            keep = jnp.concatenate(
+                [
+                    valid[:-ring_size]
+                    & ((req[:-ring_size] != req[ring_size:]) | ~valid[ring_size:]),
+                    valid[-ring_size:],
+                ]
+            )
+        slots = jnp.where(
+            keep, req * ring_stride + jnp.mod(positions, ring_size), state_rows - 1
+        )
+        kept_kv = jnp.where(keep[:, None], kv, jnp.zeros_like(kv))
+        kept_score = jnp.where(keep[:, None], score, jnp.full_like(score, -jnp.inf))
+        update = jnp.concatenate([kept_kv, kept_score], axis=-1)
+        if flat_state.shape[1] > update.shape[1]:
+            update = jnp.pad(
+                update, ((0, 0), (0, flat_state.shape[1] - update.shape[1]))
+            )
+        updated = flat_state.at[slots].set(update).reshape(state.shape)
+        return updated, pooled
 
     compressed_op = cpu_export_jax_op(
         "sglang_tpu_pallas::dsv41_publish_compressed",
@@ -459,17 +560,50 @@ def register_cache_ops():
         "sglang_tpu_pallas::dsv41_publish_swa", swa, donate_argnums=(0,)
     )
     swa_op.register_fake(lambda words, *_: torch.empty_like(words))
-    return CacheOps(compressed_op, index_op, swa_op)
+    pair_state_op = cpu_export_jax_op(
+        "sglang_tpu_pallas::dsv41_publish_pair_state",
+        pair_state,
+        donate_argnums=(0,),
+    )
+    pair_state_op.register_fake(
+        lambda state, kv, *_: (torch.empty_like(state), torch.empty_like(kv))
+    )
+    return CacheOps(compressed_op, index_op, swa_op, pair_state_op)
 
 
 def publish_source(ops, pool, layer_id, records, latent, key, after):
     """Preserve pool tensor identity and serialize reuse after its last gather."""
-    words = pool.low_ratio_cache(layer_id)
-    scales = pool.low_ratio_scales(layer_id)
-    new_words, new_scales = ops.compressed(words, scales, records, latent, after)
-    words.copy_(new_words)
-    scales.copy_(new_scales)
-    index = pool.low_ratio_cache(layer_id, index=True)
-    index.copy_(
-        ops.index(index, records, key, after, pool.index_page_records(layer_id))
+    root_fn = getattr(pool, "low_ratio_root", None)
+    scale_root_fn = getattr(pool, "low_ratio_scale_root", None)
+    words_root = (
+        pool.low_ratio_cache(layer_id) if root_fn is None else root_fn(layer_id)
     )
+    scales_root = (
+        pool.low_ratio_scales(layer_id)
+        if scale_root_fn is None
+        else scale_root_fn(layer_id)
+    )
+    new_words, new_scales = ops.compressed(
+        words_root, scales_root, records, latent, after
+    )
+    words_root.copy_(new_words)
+    scales_root.copy_(new_scales)
+    index_root = (
+        pool.low_ratio_cache(layer_id, index=True)
+        if root_fn is None
+        else root_fn(layer_id, index=True)
+    )
+    stride_fn = getattr(pool, "index_page_stride", None)
+    new_index = (
+        ops.index(index_root, records, key, after, pool.index_page_records(layer_id))
+        if stride_fn is None
+        else ops.index(
+            index_root,
+            records,
+            key,
+            after,
+            pool.index_page_records(layer_id),
+            stride_fn(layer_id),
+        )
+    )
+    index_root.copy_(new_index)

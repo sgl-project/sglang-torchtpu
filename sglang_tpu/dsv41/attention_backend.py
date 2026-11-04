@@ -16,17 +16,31 @@ from sglang_tpu.dsv41.custom_ops import (
 )
 
 
-def pair_compress(kv, score, req, positions, valid, state, ring_size):
+def pair_compress(kv, score, req, positions, valid, state, ring_size, cache_ops=None):
     """Pair adjacent positions, including an even token from the previous chunk.
 
     Read the old ring before writing this chunk. Only its last ``ring_size`` rows
     per request may write live slots; discarded and padded rows use the spare row.
     The returned value is meaningful only at odd, valid positions.
     """
+    pair_state_op = getattr(cache_ops, "pair_state", None)
+    if pair_state_op is not None:
+        new_state, pooled = pair_state_op(
+            state, kv, score, req, positions, valid, ring_size
+        )
+        state.copy_(new_state)
+        return pooled
     dim = kv.shape[-1]
-    previous = req * ring_size + (positions - 1) % ring_size
-    previous = torch.where(valid & (positions > 0), previous, state.shape[0] - 1)
-    carried = state[previous]
+    if state.ndim == 3:
+        ring_stride = state.shape[1]
+        flat_state = state.view(state.shape[0] * ring_stride, state.shape[2])
+    else:
+        ring_stride = ring_size
+        flat_state = state
+    state_rows = flat_state.shape[0]
+    previous = req * ring_stride + (positions - 1) % ring_size
+    previous = torch.where(valid & (positions > 0), previous, state_rows - 1)
+    carried = flat_state[previous]
     in_batch = torch.cat(
         [
             valid.new_zeros(1),
@@ -38,7 +52,7 @@ def pair_compress(kv, score, req, positions, valid, state, ring_size):
     )
     previous_kv = torch.where(in_batch[:, None], torch.roll(kv, 1, 0), carried[:, :dim])
     previous_score = torch.where(
-        in_batch[:, None], torch.roll(score, 1, 0), carried[:, dim:]
+        in_batch[:, None], torch.roll(score, 1, 0), carried[:, dim : 2 * dim]
     )
     # A missing partner must not create NaNs in unused even/padding rows.
     previous_score = torch.where(
@@ -56,12 +70,14 @@ def pair_compress(kv, score, req, positions, valid, state, ring_size):
                 valid[-ring_size:],
             ]
         )
-    slots = torch.where(
-        keep, req * ring_size + positions % ring_size, state.shape[0] - 1
-    )
-    state.index_copy_(0, slots.to(torch.int64), torch.cat([kv, score], -1))
-    state[-1, :dim] = 0
-    state[-1, dim:] = float("-inf")
+    slots = torch.where(keep, req * ring_stride + positions % ring_size, state_rows - 1)
+    kept_kv = torch.where(keep[:, None], kv, kv.new_zeros(()))
+    kept_score = torch.where(keep[:, None], score, score.new_full((), float("-inf")))
+    update = torch.cat([kept_kv, kept_score], -1)
+    if flat_state.shape[1] > update.shape[1]:
+        update = F.pad(update, (0, flat_state.shape[1] - update.shape[1]))
+    updated = flat_state.index_copy(0, slots.to(torch.int64), update)
+    state.copy_(updated.view_as(state))
     return pooled
 
 
@@ -188,8 +204,9 @@ class DSV41TPUAttnBackend(DSV4TPUAttnBackend):
                     metadata.token_requests,
                     pos,
                     metadata.valid,
-                    state.kv_score_buffer.kv_score,
+                    getattr(state, "state_buffer", state.kv_score_buffer.kv_score),
                     state.ring_size,
+                    getattr(self, "cache_ops", None),
                 )
             latent = layer.compressor.finish(kv)
             group_pos = pos - pos % ratio
@@ -238,6 +255,8 @@ class DSV41TPUAttnBackend(DSV4TPUAttnBackend):
             lengths = torch.where(metadata.valid, (pos + 1) // ratio, 0).int()
             page_records = self.page_size // ratio
             storage_records = pool.index_page_records(layer.layer_id)
+            stride_fn = getattr(pool, "index_page_stride", None)
+            stride_args = () if stride_fn is None else (stride_fn(layer.layer_id),)
             # Even no-candidate layers use the same D128 FP8 scorer geometry.
             block_size = max(8, indexer.candidate_block_size)
             words = pool.low_ratio_cache(layer.layer_id, index=True)
@@ -253,6 +272,7 @@ class DSV41TPUAttnBackend(DSV4TPUAttnBackend):
                     page_records,
                     storage_records,
                     block_size,
+                    *stride_args,
                 )
                 prepared = metadata.prepared_index.get(cache_key)
                 if prepared is None:
@@ -264,6 +284,7 @@ class DSV41TPUAttnBackend(DSV4TPUAttnBackend):
                         page_records,
                         storage_records,
                         block_size,
+                        *stride_args,
                     )
                     metadata.prepared_index[cache_key] = prepared
                 selected = self.ops.select_prepared(
@@ -292,6 +313,7 @@ class DSV41TPUAttnBackend(DSV4TPUAttnBackend):
                     publish,
                     consume,
                     layer.layer_id,
+                    *stride_args,
                 )
                 if publish:
                     metadata.candidates = blocks
@@ -312,8 +334,15 @@ class DSV41TPUAttnBackend(DSV4TPUAttnBackend):
                 metadata.valid,
                 self.page_size,
             )
-        swa = pool.get_swa_buffer(layer.layer_id)
-        swa.copy_(self.cache_ops.swa(swa, metadata.swa_records, k, self.page_size))
+        swa_root_fn = getattr(pool, "swa_root", None)
+        swa_root = (
+            pool.get_swa_buffer(layer.layer_id)
+            if swa_root_fn is None
+            else swa_root_fn(layer.layer_id)
+        )
+        new_swa = self.cache_ops.swa(swa_root, metadata.swa_records, k, self.page_size)
+        swa_root.copy_(new_swa)
+        swa = swa_root.view(-1, 128)
         sink = layer.attn_sink.float()
         common = (swa, starts, pos, sink, layer.freqs_cis, metadata.swa_metadata)
         if not layer.compress_ratio:
