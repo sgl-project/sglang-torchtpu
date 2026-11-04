@@ -394,7 +394,8 @@ def k3_program_dp_transfer_rows(original, queue: Any, decode_req: Any, kv_indice
 
     req = decode_req.req
     landing = [int(p) for p in getattr(req, "_k3_dp_landing", ())]
-    plan = allocator.get_kvcache().plan
+    pool = allocator.get_kvcache()
+    plan = getattr(pool, "plan", None) or pool.full_kv_pool.plan  # HybridLinearKVPool
     layout = sglang_dp.DpPages(allocator.dp_pages, plan.num_blocks)
     page_list = [int(p) for p in pages]
     req._k3_dp_transfer = (page_list, landing)
