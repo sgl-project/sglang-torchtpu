@@ -63,11 +63,20 @@ def test_parent_preserves_ports_and_rejects_global_barrier(monkeypatch, tp_size)
     monkeypatch.delenv("TORCH_TPU_INTERNAL_HANDSHAKE_PORT", raising=False)
     monkeypatch.delenv("SGLANG_TPU_DP_SESSION_PORT", raising=False)
     monkeypatch.setenv("LIBTPU_INIT_ARGS", "--unrelated=false")
-    pick = Mock(side_effect=range(12340, 12350))
-    monkeypatch.setattr(dp_replicas.portpicker, "pick_unused_port", pick)
+    slicebuilder = Mock(
+        return_value={
+            "TORCH_TPU_SLICEBUILDER_ADDRESSES": ",".join(
+                f"localhost:{port}" for port in range(12340, 12348)
+            )
+        }
+    )
+    monkeypatch.setattr(dp_replicas, "compute_single_host_tpu_env", slicebuilder)
+    pick = Mock(side_effect=[12348, 12349])
+    monkeypatch.setattr(dp_replicas, "get_free_port", pick)
     dp_replicas.prepare_host_session(8 // tp_size, tp_size)
     dp_replicas.prepare_host_session(8 // tp_size, tp_size)
-    assert pick.call_count == 10
+    slicebuilder.assert_called_once_with(8)
+    assert pick.call_count == 2
     assert len(os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")) == 8
     assert os.environ["SGLANG_TPU_DP_SESSION_PORT"] == "12349"
     assert (
@@ -210,7 +219,7 @@ def test_parent_rejects_inherited_addresses_for_another_session(monkeypatch, tp_
 def test_single_engine_needs_no_replica_session(monkeypatch):
     monkeypatch.delenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", raising=False)
     pick = Mock()
-    monkeypatch.setattr(dp_replicas.portpicker, "pick_unused_port", pick)
+    monkeypatch.setattr(dp_replicas, "get_free_port", pick)
     dp_replicas.prepare_host_session(1, 1)
     pick.assert_not_called()
     assert "TORCH_TPU_SLICEBUILDER_ADDRESSES" not in os.environ

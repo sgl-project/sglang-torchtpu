@@ -14,10 +14,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 
-import portpicker
 import torch
 import torch.distributed as dist
 
+from sglang.srt.utils.network import get_free_port
 from sglang_tpu.envs import envs
 from sglang_tpu.patches import (
     _resolve_single_host_tpu_topology,
@@ -63,7 +63,7 @@ def prepare_host_session(dp_size: int, tp_size: int) -> None:
     # Pick these once in the parent; all spawned workers inherit the same ports.
     for name in ("TORCH_TPU_INTERNAL_HANDSHAKE_PORT", "SGLANG_TPU_DP_SESSION_PORT"):
         if name not in os.environ:
-            os.environ[name] = str(portpicker.pick_unused_port())
+            os.environ[name] = str(get_free_port())
 
 
 def validate_dp_replicas(cfg) -> None:
