@@ -21,10 +21,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
 from benchmark.tpu.launch_server import load_recipe, plan_launch  # noqa: E402
-from benchmark.tpu.recipe.configs.muse_spark import (  # noqa: E402
-    agentx_summary,
-    windowed_draft,
-)
+from benchmark.tpu.recipe.configs.muse_spark import agentx_summary  # noqa: E402
 
 # Where things live, not how they are served.
 LOCATION_FLAGS = ("--model-path", "--speculative-draft-model-path", "--host", "--port")
@@ -63,26 +60,12 @@ class TestAgentxRecipes(unittest.TestCase):
                 self.assertEqual(rendered_flags, {**COMMON_FLAGS, **flags})
                 self.assertEqual(rendered_env, {**COMMON_ENV, **env})
 
-    def test_windowed_draft_declares_the_sliding_windows(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            snapshot, out = Path(tmp, "snapshot"), Path(tmp, "out")
-            snapshot.mkdir()
-            config = {"num_hidden_layers": 2, "layer_types": ["sliding_attention"] * 2}
-            (snapshot / "config.json").write_text(json.dumps(config))
-            (snapshot / "model.safetensors").write_text("weights")
-            windowed_draft.write_windowed_draft(snapshot, out)
-            written = json.loads((out / "config.json").read_text())
-            self.assertEqual(
-                written,
-                {**config, "is_hybrid_swa": True, "hybrid_layer_pattern": [1, 1]},
-            )
-            self.assertEqual(
-                (out / "model.safetensors").resolve(),
-                (snapshot / "model.safetensors").resolve(),
-            )
-            config["layer_types"][0] = "full_attention"
-            with self.assertRaises(ValueError):
-                windowed_draft.windowed_config(config)
+    def test_serves_the_published_draft(self):
+        plan = plan_launch(
+            load_recipe("recipe/configs/muse_spark/agentx_c22.py"), inherited={}
+        )
+        i = plan.command.index("--speculative-draft-model-path")
+        self.assertEqual(plan.command[i + 1], "RadixArk/Muse-Spark-Open-DFlash2")
 
     def test_summary_definitions(self):
         def record(start_s, e2e_s, ttft_s, prompt, completion, **extra):

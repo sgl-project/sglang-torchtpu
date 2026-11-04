@@ -11,9 +11,8 @@ traces against it.
 Every point runs fp8 KV in the SEQ_ALONG_LANE layout (batched RPA prefill,
 megakernel decode, 256-token pages) with host KV offload through HiCache over
 raiden, FCFS admission, and DFlash verifying 8 tokens, narrowing to 4 once
-enough requests decode together. The draft is served through a windowed copy of
-its config (windowed_draft.py), so its KV lives in the target's sliding-window
-slots. Acceptance is pinned to the AgentX golden acceptance length.
+enough requests decode together. Every layer of the DFlash2 draft is sliding-window
+attention, so the engine keeps its KV in the target's sliding-window slots. Acceptance is pinned to the AgentX golden acceptance length.
 
 Print any profile, swept or not, as a launcher JSON config:
 
@@ -25,7 +24,6 @@ import json
 from copy import deepcopy
 
 from benchmark.tpu.recipe.configs.muse_spark.agentic import CONFIG as AGENTIC_CONFIG
-from benchmark.tpu.recipe.configs.muse_spark.windowed_draft import default_dir
 
 SWEPT = (1, 7, 9, 10, 16, 22)
 
@@ -120,7 +118,8 @@ def config_for(conc, *, draft_model_path=None, simulate_acceptance=True):
             # metadata in host RAM: three fit beside the ratio-2.0 host pool, so
             # a typical turn runs a smaller graph than a padded 4096 one.
             "tpu_compile_tokens": [4096] if large else [1024, 2048, 4096],
-            "speculative_draft_model_path": draft_model_path or default_dir(),
+            "speculative_draft_model_path": draft_model_path
+            or args["speculative_draft_model_path"],
             "speculative_num_draft_tokens": verify,
             "speculative_draft_attention_backend": "pallas_tpu_rpa_v3",
             "schedule_policy": "fcfs",
@@ -128,7 +127,7 @@ def config_for(conc, *, draft_model_path=None, simulate_acceptance=True):
             "page_size": 256,
             "kv_cache_dtype": "fp8_e4m3",
             "attention_backend": "pallas_tpu_rpa_batched",
-            # The windowed draft frees its full-context KV for the target's pool.
+            # The draft's sliding-window KV frees full-context KV for the target's pool.
             "mem_fraction_static": 0.95,
             "swa_full_tokens_ratio": 0.0625,
             "enable_hierarchical_cache": True,
@@ -270,7 +269,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--conc", type=int, required=True)
     parser.add_argument(
-        "--draft-model-path", help="default: windowed_draft.py's directory"
+        "--draft-model-path", help="default: RadixArk/Muse-Spark-Open-DFlash2"
     )
     parser.add_argument(
         "--eval", action="store_true", help="verify for real (no simulated acceptance)"

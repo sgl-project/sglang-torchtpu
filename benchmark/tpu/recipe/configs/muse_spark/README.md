@@ -10,7 +10,6 @@ submission's launch flags and environment (see [Equivalence](#equivalence)).
 | --- | --- |
 | `agentx.py` | The profile table and `config_for(conc)`, on top of `agentic.py` and `server.py`. |
 | `agentx_c<N>.py` | The server config of one swept point (`CONFIG = config_for(N)`). |
-| `windowed_draft.py` | Writes the draft directory the configs serve from (below). |
 | `run_agentx.sh` | The sweep driver: per point, boot, replay with AIPerf, summarize, stop. |
 | `agentx_summary.py` | The headline metrics from one AIPerf run. |
 
@@ -31,7 +30,7 @@ earlier 1M profile, is retired: `agentx.py` replaces it.
 - **Weights**: `meta-models/Muse-Spark-Open-816B-A42B-NVFP4` is gated on the Hub
   (access is approved by hand). Request access, then download it once:
   `hf download meta-models/Muse-Spark-Open-816B-A42B-NVFP4`. The draft,
-  `RadixArk/Muse-Spark-Open-DFlash2`, is public; `windowed_draft.py` downloads it.
+  `RadixArk/Muse-Spark-Open-DFlash2`, is public; the server downloads it.
 - **Client**: [AIPerf](https://github.com/SemiAnalysisAI/aiperf) at commit
   `754356e9a39acc6cc6afb242d123bb57c3fb6f75`, with its `inferencex-agentx-mvp`
   scenario, and the trace corpus
@@ -77,14 +76,12 @@ compiles every graph first; later boots reuse the compile cache.
 | `MODEL` | the Hub id | or a local snapshot directory; also the tokenizer |
 | `PORT` | `30000` | |
 | `RUN_DIR` | `agentx_runs/<UTC time>` | |
-| `MUSE_WINDOWED_DRAFT_DIR` | `~/.cache/sglang/muse-spark-open-dflash2-windowed` | |
 | `CHIPS` | `4` | the per-chip denominator |
 | `PRINT_ONLY` | `0` | `1`: render each point's launch plan and AIPerf command, run nothing |
 
 ### One point by hand
 
 ```bash
-python3 -m benchmark.tpu.recipe.configs.muse_spark.windowed_draft
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
     python3 -m benchmark.tpu.launch_server --config recipe/configs/muse_spark/agentx_c22.py
 ```
@@ -162,12 +159,10 @@ All points share the same base:
 
 The other rows of `agentx.py`'s table were not swept; they are kept for reruns.
 
-**The windowed draft.** Every layer of the DFlash2 draft is 2048-token
-sliding-window, but its config does not say so, so SGLang would give it
-full-context KV. `windowed_draft.py` writes a directory that symlinks the
-snapshot's files and holds a `config.json` with `is_hybrid_swa` and an all-SWA
-`hybrid_layer_pattern`. The draft's KV then lives in the target's sliding-window
-slots. Its output is byte-identical to the submission's rewrite.
+**The draft's sliding windows.** Every layer of the DFlash2 draft is 2048-token
+sliding-window attention (its config's `layer_types`). The engine reads that from
+the config itself and keeps the draft's KV in the target's sliding-window slots,
+as the submission did through a rewritten copy of the config.
 
 ## Reading the numbers
 

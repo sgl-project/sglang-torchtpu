@@ -24,7 +24,6 @@ RUN_DIR=${RUN_DIR:-$REPO/agentx_runs/$(date -u +%Y%m%d_%H%M%SZ)}
 # Weights and tokenizer: the Hub id (from the HF cache) or a local snapshot directory.
 MODEL=${MODEL:-meta-models/Muse-Spark-Open-816B-A42B-NVFP4}
 SERVED_MODEL_NAME=meta-models/Muse-Spark-Open-816B-A42B-NVFP4
-export MUSE_WINDOWED_DRAFT_DIR=${MUSE_WINDOWED_DRAFT_DIR:-$HOME/.cache/sglang/muse-spark-open-dflash2-windowed}
 # The server reads weights from the local cache only, as the submitted runs did.
 SERVER_HF_OFFLINE=${SERVER_HF_OFFLINE:-1}
 CHIPS=${CHIPS:-4}
@@ -43,7 +42,7 @@ render() {  # conc out_dir: the launcher config and its resolved command
     mkdir -p "$out"
     (cd "$REPO" && HF_HUB_OFFLINE=$SERVER_HF_OFFLINE TRANSFORMERS_OFFLINE=$SERVER_HF_OFFLINE \
         "$PYTHON" -m benchmark.tpu.recipe.configs.muse_spark.agentx --conc "$conc" \
-        --draft-model-path "$MUSE_WINDOWED_DRAFT_DIR" > "$out/server_config.json")
+        > "$out/server_config.json")
     (cd "$REPO" && HF_HUB_OFFLINE=$SERVER_HF_OFFLINE TRANSFORMERS_OFFLINE=$SERVER_HF_OFFLINE \
         MODEL="$MODEL" PORT="$PORT" \
         "$PYTHON" -m benchmark.tpu.launch_server --config "@$out/server_config.json" --dry-run \
@@ -135,8 +134,6 @@ if [[ "${PRINT_ONLY:-0}" == 1 ]]; then
     exit 0
 fi
 
-(cd "$REPO" && "$PYTHON" -m benchmark.tpu.recipe.configs.muse_spark.windowed_draft \
-    --out "$MUSE_WINDOWED_DRAFT_DIR")
 install_aiperf
 # Fetch the traces once into the HF cache; AIPerf reads them from there.
 "$AIPERF_VENV/bin/hf" download --repo-type dataset "$TRACES_DATASET" >/dev/null
