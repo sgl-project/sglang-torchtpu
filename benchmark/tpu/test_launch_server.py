@@ -5,11 +5,52 @@ import unittest
 from benchmark.tpu.launch_server import (
     LaunchConfig,
     load_recipe,
+    plan_launch,
     resolve_server,
 )
 
 
 class TestRuntimeEnvironment(unittest.TestCase):
+    def test_nightly_checks_final_extra_args_before_enabling_prefetch(self):
+        for extra_args, enabled in (
+            (["--base-gpu-id", "4"], False),
+            (["--use-ray"], False),
+            (["--weight-loader-disable-mmap"], True),
+        ):
+            with self.subTest(extra_args=extra_args):
+                plan = plan_launch(
+                    {
+                        "server_args": {"model_path": "checkpoint", "tp_size": 8},
+                        "extra_args": extra_args,
+                    },
+                    {"CI_WEIGHT_LOADER_PREFETCH": "1"},
+                )
+                self.assertEqual(
+                    "--weight-loader-prefetch-checkpoints" in plan.command, enabled
+                )
+                if enabled:
+                    self.assertNotIn("--weight-loader-disable-mmap", plan.command)
+                    self.assertFalse(
+                        plan.config.server_args["weight_loader_disable_mmap"]
+                    )
+                else:
+                    self.assertNotIn("LOCAL_SIZE", plan.env)
+
+    def test_nightly_prefetch_reaches_python_recipe_launches(self):
+        plan = plan_launch(
+            {
+                "server_args": {
+                    "model_path": "checkpoint",
+                    "tp_size": 8,
+                    "weight_loader_disable_mmap": True,
+                }
+            },
+            {"CI_WEIGHT_LOADER_PREFETCH": "1"},
+        )
+        self.assertIn("--weight-loader-prefetch-checkpoints", plan.command)
+        self.assertNotIn("--weight-loader-disable-mmap", plan.command)
+        self.assertEqual(plan.env["LOCAL_SIZE"], "8")
+
     def config(self, **runtime_envs):
         return LaunchConfig(
             {

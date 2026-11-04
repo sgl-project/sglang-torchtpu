@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from benchmark.tpu.ci_checkpoint_prefetch import configure_checkpoint_prefetch
 from benchmark.tpu.recipe.configs.config_eval import server_args_to_cli
 
 TPU_ROOT = Path(__file__).absolute().parent
@@ -602,6 +603,8 @@ def plan_launch(config, inherited=None, runtime_envs=None):
     command, env = server_command(
         LaunchConfig(resolved.server_args, {}, resolved.extra_args), env
     )
+    command, env, prefetch_settings = configure_checkpoint_prefetch(command, env)
+    resolved.server_args.update(prefetch_settings)
     return LaunchPlan(resolved, command, env, hosts, router, urls)
 
 
