@@ -7,6 +7,7 @@ imported. libtpu reads ``LIBTPU_INIT_ARGS`` at load time.
 
 from __future__ import annotations
 
+import ctypes.util
 import os
 
 from sglang_tpu._logging import get_logger
@@ -98,6 +99,15 @@ _TCMALLOC_LIBRARIES = (
     "/usr/lib/aarch64-linux-gnu/libtcmalloc_minimal.so.4",
     "/usr/lib/aarch64-linux-gnu/libtcmalloc.so.4",
 )
+# Loader-search fallback for installs outside the Debian multiarch dirs
+# (RHEL /usr/lib64, conda, pip-installed gperftools).
+_TCMALLOC_LIBRARY_NAMES = ("tcmalloc_minimal", "tcmalloc")
+# An LD_PRELOAD entry naming one of these already replaces malloc. The first
+# preloaded allocator wins malloc/free, so tcmalloc must not go in front.
+_MALLOC_REPLACEMENTS = ("tcmalloc", "jemalloc", "mimalloc", "tbbmalloc")
+# Set after the missing-library warning so spawned ranks, which inherit the
+# environment and run these overrides again, do not repeat it.
+_TCMALLOC_MISSING_WARNED = "_SGLANG_TPU_TCMALLOC_MISSING_WARNED"
 
 # Smallest KV pool (in tokens) observed safe with the default prefetch depth
 # on the largest supported dense stack (36-layer gpt-oss at TP=8): 4096 pages
@@ -139,24 +149,49 @@ def _set_renamed_compilation_cache_envs() -> list[str]:
     return added
 
 
+def _find_tcmalloc() -> str | None:
+    """Return a loadable tcmalloc for LD_PRELOAD, or None if none is installed."""
+    library = next((path for path in _TCMALLOC_LIBRARIES if os.path.exists(path)), None)
+    if library is not None:
+        return library
+    for name in _TCMALLOC_LIBRARY_NAMES:
+        library = ctypes.util.find_library(name)
+        if library is not None:
+            return library
+    return None
+
+
+def _preloads_malloc_replacement(preload: str) -> bool:
+    entries = preload.replace(" ", ":").split(":")
+    return any(
+        allocator in os.path.basename(entry)
+        for entry in entries
+        for allocator in _MALLOC_REPLACEMENTS
+    )
+
+
 def _preload_tcmalloc_for_spawned_ranks() -> str | None:
     """Add tcmalloc to LD_PRELOAD for processes spawned after this call.
 
-    Returns the library added, or None when it is disabled, already preloaded,
-    or not installed. An existing LD_PRELOAD is kept after tcmalloc.
+    Returns the library added, or None when it is disabled, another malloc
+    replacement is already preloaded, or tcmalloc is not installed. Other
+    LD_PRELOAD entries are kept after tcmalloc.
     """
     if not tpu_envs.SGLANG_TPU_PRELOAD_TCMALLOC.get():
         return None
     preload = os.environ.get(_LD_PRELOAD, "")
-    if "tcmalloc" in preload:
+    if _preloads_malloc_replacement(preload):
         return None
-    library = next((path for path in _TCMALLOC_LIBRARIES if os.path.exists(path)), None)
+    library = _find_tcmalloc()
     if library is None:
-        logger.warning(
-            "TPU env_override: libtcmalloc is not installed, so scheduler ranks "
-            "use glibc malloc and keep about 1.25 GiB more RSS each after a "
-            "cold start (#1817). Install libtcmalloc-minimal4 to fix it."
-        )
+        if _TCMALLOC_MISSING_WARNED not in os.environ:
+            os.environ[_TCMALLOC_MISSING_WARNED] = "1"
+            logger.warning(
+                "TPU env_override: libtcmalloc is not installed, so scheduler "
+                "ranks use glibc malloc and keep about 1.25 GiB more RSS each "
+                "after a cold start (#1817). Install libtcmalloc-minimal4 to "
+                "fix it."
+            )
         return None
     os.environ[_LD_PRELOAD] = f"{library}:{preload}" if preload else library
     return library

@@ -210,6 +210,9 @@ _FORWARD_ENV_NAMES = frozenset(
         "LIBTPU_INIT_ARGS",
         "XLA_FLAGS",
         "TPU_PREMAPPED_BUFFER_SIZE",
+        # env_override puts tcmalloc here for the scheduler ranks (#1817); an
+        # actor reads it only at exec, so it must arrive via runtime_env.
+        "LD_PRELOAD",
     }
 )
 # Never forward, even when a prefix matches: these are per-chip/per-node (Ray sets

@@ -245,6 +245,7 @@ class TestForwardedDriverEnv(CustomTestCase):
             "LIBTPU_INIT_ARGS": "--xla_tpu_scoped_vmem_limit_kib=65536",
             "XLA_FLAGS": "--xla_dump_to=/tmp",
             "TPU_PREMAPPED_BUFFER_SIZE": "4294967296",
+            "LD_PRELOAD": "/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4",
         }
         self.assertEqual(_forwarded_driver_env(env), env)
 
