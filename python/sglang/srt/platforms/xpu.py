@@ -10,7 +10,7 @@ from sglang.srt.platforms.device_mixin import (
     DeviceMixin,
     PlatformEnum,
 )
-from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +93,12 @@ class XpuDeviceMixin(DeviceMixin):
 
 class XpuSRTPlatform(XpuDeviceMixin, SRTPlatform):
     """Default in-tree XPU SRT platform."""
+
+    capabilities = PlatformCapabilities(
+        supports_triton=True,
+        graph_capture=True,
+        piecewise_graph=True,
+    )
 
     def supports_fp8(self) -> bool:
         return False

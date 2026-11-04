@@ -91,7 +91,13 @@ does not move backwards.
   the in-tree default byte-for-byte, gates differing behavior on
   `is_out_of_tree()`, stays under ~300 lines, and ships a CPU unit test with a
   fake platform. Flag a PR that bundles the seam with the feature using it;
-  ask for the split.
+  ask for the split. That rule targets PRs meant for upstream. A fork-only PR
+  that moves existing TPU behavior out of shared code may add the seam it needs
+  together with the plugin code adopting it, when the seam and the adoption sit
+  in separate commits and the seam commit alone meets the rules above. A seam
+  whose first consumer is a later PR in the same open stack is allowed when the
+  description names that PR. The exception lapses for a seam once it is
+  proposed upstream: that PR is split as above.
 - Cleanup: once a seam has merged upstream and arrived through the sync, the
   follow-up must delete the hook and the core branch. A pin bump that leaves
   them in place is incomplete.
