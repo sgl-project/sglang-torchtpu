@@ -42,17 +42,17 @@ from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
-from sglang_tpu.cp_forward import (
+from sglang_tpu.envs import envs
+from sglang_tpu.layers.cp.cp_forward import (
     cp_local_embeds,
     cp_token_inputs,
     get_tpu_cp_layout,
     pinned_extend_seq_lens_cpu,
 )
-from sglang_tpu.envs import envs
 
 if TYPE_CHECKING:
     from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
-    from sglang_tpu.kv_pool_host import TpuFusedMHATokenToKVPoolHost
+    from sglang_tpu.mem_cache.pool_host.kv_pool_host import TpuFusedMHATokenToKVPoolHost
 
 logger = get_logger(__name__)
 
@@ -1339,10 +1339,10 @@ def build_bucketers(
             name="TokenBucketer", min_val=64, max_val=max_t, power=2
         )
 
-    from sglang_tpu.pp_chunks import uses_dynamic_chunks
+    from sglang_tpu.managers.pp_chunks import uses_dynamic_chunks
 
     if uses_dynamic_chunks():
-        from sglang_tpu.pp_chunks import (
+        from sglang_tpu.managers.pp_chunks import (
             chunk_buckets,
             chunk_granularity,
         )

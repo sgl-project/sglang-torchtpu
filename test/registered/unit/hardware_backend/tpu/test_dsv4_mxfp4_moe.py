@@ -23,14 +23,14 @@ from torch.nn.parameter import Parameter
 from sglang.srt.layers.quantization.fp8 import cast_e2m1fn_to_e4m3fn
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope
-from sglang_tpu.fp8_moe import (
+from sglang_tpu.layers.quantization.fp8_moe import (
     _FP4_E2M1_LUT,
     _FP4_E2M1_THRESHOLDS,
     _TPU_FP4_BLOCK_SIZE,
     _dequantize_dsv4_mxfp4_block32,
     prepare_tpu_fp8_moe_weights,
 )
-from sglang_tpu.fp8_moe_fused_rs import _prepare_fp8_fused_rs
+from sglang_tpu.layers.quantization.fp8_moe_fused_rs import _prepare_fp8_fused_rs
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -471,7 +471,7 @@ class TestDsv4Mxfp4MoeWeights(CustomTestCase):
         """Verify DeepSeek-V4-Pro shared_experts sub-block TP=16 sharding (`3072 // 16 = 192`)."""
         from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
         from sglang.srt.runtime_context import get_context
-        from sglang_tpu.fp8_linear import (
+        from sglang_tpu.layers.quantization.fp8_linear import (
             compute_tpu_fp8_linear_scale_shape,
             prepare_tpu_fp8_linear_weights,
         )

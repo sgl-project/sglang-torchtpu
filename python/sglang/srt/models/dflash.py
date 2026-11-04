@@ -864,7 +864,7 @@ class DFlashDraftModel(nn.Module):
         step conditions on the anchor token in input_ids; DFlash2 also returns
         the candidate lattice it walked.
         """
-        from sglang_tpu.dflash_utils_tpu import (
+        from sglang_tpu.speculative.dflash_utils_tpu import (
             argmax_draft_tokens_tpu,
         )
 

@@ -42,7 +42,7 @@ from absl.testing import parameterized
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.dsv4.core_attention import mla_swa
+from sglang_tpu.layers.attention.dsv4.core_attention import mla_swa
 
 # DeepSeek-V4-Flash geometry: window 128, page 128, 2 pages per block, so
 # bkv_sz == 256 >= sliding_window selects the batched decode kernel.

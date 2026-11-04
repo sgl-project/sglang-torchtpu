@@ -45,7 +45,7 @@ from sglang.srt.configs.mamba_utils import (
 )
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.mamba_pool import AT_SLOT, TpuMambaPool, verify_track_steps
+from sglang_tpu.mem_cache.mamba_pool import AT_SLOT, TpuMambaPool, verify_track_steps
 
 
 def _make_cache_params(n_kq, n_v, d_k, d_v, K, layers):

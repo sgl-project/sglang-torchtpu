@@ -24,13 +24,13 @@ from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import published_topology
-from sglang_tpu import pp_chunk_scheduler, pp_profile
-from sglang_tpu.pp_chunk_scheduler import (
+from sglang_tpu.managers import pp_chunk_scheduler, pp_profile
+from sglang_tpu.managers.pp_chunk_scheduler import (
     TpuPipelinePrefillAdder,
     pending_step_limit,
     profile_and_install_cost_model,
 )
-from sglang_tpu.pp_chunks import StepCostModel
+from sglang_tpu.managers.pp_chunks import StepCostModel
 
 
 @pytest.fixture(autouse=True)

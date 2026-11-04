@@ -26,8 +26,8 @@ from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu import mm_schedule_tpu
-from sglang_tpu.mm_embedding import PaddedEmbedding, split_embedding
+from sglang_tpu.managers import mm_schedule_tpu
+from sglang_tpu.managers.mm_embedding import PaddedEmbedding, split_embedding
 
 register_cpu_ci(est_time=8, suite="stage-a-test-cpu-intel")
 

@@ -19,7 +19,7 @@ from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu import mm_schedule_tpu
+from sglang_tpu.managers import mm_schedule_tpu
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

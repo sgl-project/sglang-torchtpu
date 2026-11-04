@@ -9,7 +9,7 @@ import torch.distributed as dist
 from sglang.srt.layers.moe.tpu_moe_utils import mask_tpu_moe_non_local_experts
 from sglang.srt.platforms import current_platform
 from sglang_tpu.compilation.direct_compile import direct_compile
-from sglang_tpu.rank_local import rank_slice
+from sglang_tpu.distributed.rank_local import rank_slice
 
 
 def compile_local(fn, args):

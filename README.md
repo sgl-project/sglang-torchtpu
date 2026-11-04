@@ -144,7 +144,7 @@ TPU kernels, memory management, and backend integrations live in `sglang_tpu/`.
 Contributions are welcome in model support, kernel optimizations, serving features, benchmarks, and documentation.
 
 1. Read the [contributor guide](CONTRIBUTING.md) for development setup and the pull request workflow.
-2. Explore the [TPU backend](sglang_tpu/README.md) and [speculative decoding developer guide](sglang_tpu/experimental/speculative/README.md).
+2. Explore the [TPU backend](sglang_tpu/README.md) and [speculative decoding developer guide](sglang_tpu/speculative/README.md).
 3. Add coverage for your changes and include accuracy or performance results where relevant.
 
 CPU-only unit tests run without a TPU:

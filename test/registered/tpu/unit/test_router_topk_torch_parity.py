@@ -24,7 +24,7 @@ E, K, SCALE = 896, 16, 2.5
 class TestRouterTopkTorchParity(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        from sglang_tpu.moe import router_topk_tpu as rt
+        from sglang_tpu.layers.moe import router_topk_tpu as rt
 
         rt.register_router_topk_op()
         cls.rt = rt

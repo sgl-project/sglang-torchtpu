@@ -1,6 +1,6 @@
-"""Moved to :mod:`sglang_tpu.dsv4.rope`; alias kept for in-flight branches, delete once they merge."""
+"""Moved to :mod:`sglang_tpu.layers.attention.dsv4.rope`; alias kept for in-flight branches, delete once they merge."""
 
 import importlib
 import sys
 
-sys.modules[__name__] = importlib.import_module("sglang_tpu.dsv4.rope")
+sys.modules[__name__] = importlib.import_module("sglang_tpu.layers.attention.dsv4.rope")

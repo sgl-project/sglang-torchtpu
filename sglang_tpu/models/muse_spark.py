@@ -57,9 +57,12 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel, process_model_config
 from sglang.srt.utils import add_prefix, make_pp_layers
 from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.expert_loading import _wait_for
-from sglang_tpu.fp8_moe import _free_replaced_storage
-from sglang_tpu.fp8_moe_fused_rs import apply_fp8_fused_rs, prepare_fp8_fused_rs
+from sglang_tpu.layers.quantization.fp8_moe import _free_replaced_storage
+from sglang_tpu.layers.quantization.fp8_moe_fused_rs import (
+    apply_fp8_fused_rs,
+    prepare_fp8_fused_rs,
+)
+from sglang_tpu.model_loader.expert_loading import _wait_for
 
 logger = logging.getLogger(__name__)
 
@@ -370,7 +373,7 @@ class _HostQuantizedFp8MoEMethod(Fp8MoEMethod):
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         from sglang.srt.layers.moe import get_moe_runner_backend
-        from sglang_tpu.fp8_moe import prepare_tpu_fp8_moe_weights
+        from sglang_tpu.layers.quantization.fp8_moe import prepare_tpu_fp8_moe_weights
 
         prepare_tpu_fp8_moe_weights(
             layer,
@@ -381,7 +384,9 @@ class _HostQuantizedFp8MoEMethod(Fp8MoEMethod):
         )
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto() or moe_runner_backend.is_pallas_tpu_fused_rs():
-            from sglang_tpu.fp8_moe_fused_rs import prepare_fp8_fused_rs
+            from sglang_tpu.layers.quantization.fp8_moe_fused_rs import (
+                prepare_fp8_fused_rs,
+            )
 
             self.handles_moe_reduction = prepare_fp8_fused_rs(layer)
             if self.handles_moe_reduction and get_parallel().tp_rank == 0:
@@ -522,7 +527,7 @@ class MuseSparkMoE(nn.Module):
         self.e_score_correction_bias = nn.Parameter(
             torch.zeros(self.num_experts, dtype=torch.float32), requires_grad=False
         )
-        from sglang_tpu.moe.expert_tp import is_fused_moe_rs_expert_tp
+        from sglang_tpu.layers.moe.expert_tp import is_fused_moe_rs_expert_tp
 
         # With expert TP, the small decode-sized projection outputs are gathered
         # by the one-shot Pallas all-gather, as the fused-RS output is.
@@ -530,7 +535,9 @@ class MuseSparkMoE(nn.Module):
             parallel.moe_ep_size, parallel.moe_tp_size, parallel.tp_size
         )
         if self.oneshot_gather:
-            from sglang_tpu.oneshot_collectives import get_oneshot_all_gather_op
+            from sglang_tpu.distributed.oneshot_collectives import (
+                get_oneshot_all_gather_op,
+            )
 
             get_oneshot_all_gather_op(self.tp_size)
             self.register_buffer(
@@ -635,7 +642,7 @@ class MuseSparkMoE(nn.Module):
         if shard.numel() * shard.element_size() > 256 * 1024:
             # Prefill-sized shards: XLA's bandwidth-oriented all-gather.
             return tensor_model_parallel_all_gather(shard.contiguous())
-        from sglang_tpu.oneshot_collectives import oneshot_all_gather
+        from sglang_tpu.distributed.oneshot_collectives import oneshot_all_gather
 
         tokens, cols = shard.shape
         full = oneshot_all_gather(
@@ -919,8 +926,8 @@ class MuseSparkForConditionalGeneration(nn.Module):
         experts it reads, and before the KV pool is sized, so the budget counts them."""
         if not self._megakernel_enabled:
             return
-        from sglang_tpu.fp8_lm_head import TpuFp8LmHeadMethod
-        from sglang_tpu.muse_megakernel.ops import MuseMegakernel
+        from sglang_tpu.layers.quantization.fp8_lm_head import TpuFp8LmHeadMethod
+        from sglang_tpu.models.muse_megakernel.ops import MuseMegakernel
 
         self._megakernel = MuseMegakernel.from_model(self)
         # The megakernel path also takes the fp8 weight-only LM head.

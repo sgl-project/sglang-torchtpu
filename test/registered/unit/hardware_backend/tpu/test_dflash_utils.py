@@ -13,21 +13,21 @@ import torch
 
 import sglang.srt.managers.overlap_utils as overlap_utils
 import sglang.srt.speculative.dflash_info_v2 as dflash_info_v2
-import sglang_tpu.dflash_utils_tpu as dflash_utils_tpu
+import sglang_tpu.speculative.dflash_utils_tpu as dflash_utils_tpu
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang_tpu.dflash_utils_tpu import (
+from sglang_tpu.managers.overlap_utils_tpu import (
+    resolve_device_accept_seq_lens_tpu,
+)
+from sglang_tpu.speculative.dflash_utils_tpu import (
     DeviceVerifyBlockSelector,
     argmax_draft_tokens_tpu,
     build_dflash_draft_block,
     gather_dflash_candidate_window,
     select_dflash_verify_cache_locs_tpu,
 )
-from sglang_tpu.experimental.speculative.spec_ops import select_verify_rows
-from sglang_tpu.overlap_utils_tpu import (
-    resolve_device_accept_seq_lens_tpu,
-)
+from sglang_tpu.speculative.spec_ops import select_verify_rows
 
 BLOCK_SIZE = 4
 MAX_CTX = 64

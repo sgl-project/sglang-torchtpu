@@ -25,7 +25,7 @@ _KERNELS: list = []
 def route_glm_flash_megakernel(result: None, runner: Any, *args, **kwargs) -> None:
     """AFTER TpuGraphRunner.__init__: wrap the compiled (fullgraph) model.forward."""
     from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
-    from sglang_tpu.glm_flash_megakernel import ops
+    from sglang_tpu.models.glm_flash_megakernel import ops
 
     model = runner.model
     # The MTP draft has its own graph runner; the kernel serves the target.

@@ -22,7 +22,7 @@ from sglang_tpu.disaggregation.raiden.serde import (
     BLOCK_MAJOR_KV_LAYOUT,
     PER_LAYER_KV_LAYOUT,
 )
-from sglang_tpu.dsv4.dsv4_memory_pool import (
+from sglang_tpu.layers.attention.dsv4.dsv4_memory_pool import (
     _TPU_STATE_SLOT_STRIDE_PAGES,
     DSV4TPUTokenToKVPool,
     TPUCompressStatePool,
@@ -31,8 +31,8 @@ from sglang_tpu.dsv4.dsv4_memory_pool import (
     TPUDeepSeekV4IndexerPool,
     TPUDeepSeekV4SWAKVPool,
 )
-from sglang_tpu.kv_pool import TpuBlockMajorMHATokenToKVPool
-from sglang_tpu.mamba_pool import TpuMambaPool
+from sglang_tpu.mem_cache.kv_pool import TpuBlockMajorMHATokenToKVPool
+from sglang_tpu.mem_cache.mamba_pool import TpuMambaPool
 
 # One logger for the whole package, deliberately keeping the name of the module
 # this code used to live in: emitted record names and the existing test
@@ -229,7 +229,7 @@ def get_raiden_kv_caches(
         )
 
     # Lazy: the experimental spec package loads after the platform.
-    from sglang_tpu.experimental.speculative.pd_hidden_pool import get_pd_hidden_pool
+    from sglang_tpu.speculative.pd_hidden_pool import get_pd_hidden_pool
 
     hidden_pool = get_pd_hidden_pool() if draft_pool is not None else None
     if hidden_pool is not None:

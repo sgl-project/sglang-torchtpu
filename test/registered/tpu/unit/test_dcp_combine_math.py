@@ -22,7 +22,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.attention_pallas_rpa_dcp import (
+from sglang_tpu.layers.attention.attention_pallas_rpa_dcp import (
     gather_heads,
     merge_across_ranks,
     merge_lse,

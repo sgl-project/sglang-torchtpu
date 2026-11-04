@@ -20,37 +20,41 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.envs import envs
-from sglang_tpu.experimental.compilation.chain_compile_policy import (
+from sglang_tpu.compilation.chain_compile_policy import (
     TpuChainSpecDecodeCompilePolicyMixin,
     _hidden_only_logits,
 )
-from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
-from sglang_tpu.experimental.speculative import (
+from sglang_tpu.envs import envs
+from sglang_tpu.hooks.experimental_spec import (
+    keep_host_padded_extend_outputs,
+)
+from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
+from sglang_tpu.sampling.sampling_batch_info import HostPaddedSamplingInfo
+from sglang_tpu.speculative import (
     base_spec_worker,
     chain_spec_worker,
     spec_ops,
 )
-from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
-from sglang_tpu.experimental.speculative.chain_draft_input import (
+from sglang_tpu.speculative.base_spec_worker import TpuSpecWorker
+from sglang_tpu.speculative.chain_draft_input import (
     chain_draft_forward_input,
 )
-from sglang_tpu.experimental.speculative.chain_draft_worker import (
+from sglang_tpu.speculative.chain_draft_worker import (
     TpuChainDraftWorker,
 )
-from sglang_tpu.experimental.speculative.chain_info import HostPaddedChainDraftInput
-from sglang_tpu.experimental.speculative.chain_spec_worker import (
+from sglang_tpu.speculative.chain_info import HostPaddedChainDraftInput
+from sglang_tpu.speculative.chain_spec_worker import (
     TpuChainSpecWorker,
     _attach_pd_seeds,
     fill_sampled_tails,
     fold_prompt_tail_embeds,
     shift_prompt_tokens,
 )
-from sglang_tpu.experimental.speculative.eagle3 import eagle3_draft_worker
-from sglang_tpu.experimental.speculative.eagle3.eagle3_draft_worker import (
+from sglang_tpu.speculative.eagle3 import eagle3_draft_worker
+from sglang_tpu.speculative.eagle3.eagle3_draft_worker import (
     TpuEagle3DraftWorker,
 )
-from sglang_tpu.experimental.speculative.spec_ops import (
+from sglang_tpu.speculative.spec_ops import (
     _filtered_target_probs,
     accept_candidates_step,
     accept_drafts_candidates,
@@ -62,16 +66,12 @@ from sglang_tpu.experimental.speculative.spec_ops import (
     accept_top_k_candidates_step,
     finalize_accept,
 )
-from sglang_tpu.experimental.speculative.spec_types import (
+from sglang_tpu.speculative.spec_types import (
     DraftResult,
     SpecState,
     TpuSpecVerifyInput,
 )
-from sglang_tpu.experimental.speculative.spec_utils import pad_rows
-from sglang_tpu.hooks.experimental_spec import (
-    keep_host_padded_extend_outputs,
-)
-from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
+from sglang_tpu.speculative.spec_utils import pad_rows
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -286,7 +286,7 @@ class TestExperimentalEagle3(CustomTestCase):
         )
         kept, trimmed = outputs(), outputs()
         with patch(
-            "sglang_tpu.experimental.sampling.sampling_batch_info.is_host_padded",
+            "sglang_tpu.sampling.sampling_batch_info.is_host_padded",
             side_effect=lambda info: info is batch.sampling_info,
         ):
             keep_host_padded_extend_outputs(trim, batch, kept)
@@ -619,7 +619,7 @@ class TestExperimentalEagle3(CustomTestCase):
     def test_greedy_rows_do_not_switch_the_batch_onto_the_filter(self):
         """Greedy rows set core's need_top_k_sampling (top_k = 1); only sampled
         rows' filters may route verify through the full-vocab target filter."""
-        from sglang_tpu.experimental.speculative.base_spec_worker import (
+        from sglang_tpu.speculative.base_spec_worker import (
             _sampled_row_filters,
         )
 
@@ -699,8 +699,7 @@ class TestExperimentalEagle3(CustomTestCase):
                 return_value=SimpleNamespace(buckets=[4]),
             ),
             patch(
-                "sglang_tpu.experimental.speculative.base_spec_worker."
-                "warmup_compiled_op",
+                "sglang_tpu.speculative.base_spec_worker.warmup_compiled_op",
                 lambda op, *args: calls.append(args),
             ),
         ):

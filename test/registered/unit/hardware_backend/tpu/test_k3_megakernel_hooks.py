@@ -127,7 +127,10 @@ class TestK3MegakernelHooks(CustomTestCase):
         importlib.util.find_spec("jax"), "kernel_options checks StackKernel's signature"
     )
     def test_serving_refuses_debug_and_broken_kernel_options(self):
-        from sglang_tpu.k3_megakernel.ops import SERVING_KERNEL_OPTIONS, kernel_options
+        from sglang_tpu.models.k3_megakernel.ops import (
+            SERVING_KERNEL_OPTIONS,
+            kernel_options,
+        )
 
         serving = dict(allowed=SERVING_KERNEL_OPTIONS)
         self.assertEqual(kernel_options("moe_ring=6", **serving), {"moe_ring": 6})
@@ -136,7 +139,7 @@ class TestK3MegakernelHooks(CustomTestCase):
                 kernel_options(bad, **serving)
 
     def test_prefill_rows_cover_every_extend(self):
-        from sglang_tpu.k3_megakernel.ops import prefill_rows
+        from sglang_tpu.models.k3_megakernel.ops import prefill_rows
 
         self.assertEqual(prefill_rows(1024, "auto"), 1024)
         for size, mode in ((-1, "auto"), (None, "auto"), (1020, "rows")):
@@ -151,8 +154,8 @@ class TestK3MegakernelHooks(CustomTestCase):
             Mamba2StateDType,
             Mamba2StateShape,
         )
-        from sglang_tpu.k3_megakernel.ops import kda_state_rows
-        from sglang_tpu.mamba_pool import TpuMambaPool
+        from sglang_tpu.mem_cache.mamba_pool import TpuMambaPool
+        from sglang_tpu.models.k3_megakernel.ops import kda_state_rows
 
         shape = Mamba2StateShape.create(
             tp_world_size=1, intermediate_size=1024, n_groups=2, num_heads=8,

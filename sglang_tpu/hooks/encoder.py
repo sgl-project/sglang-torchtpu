@@ -85,7 +85,7 @@ def encode_indices_within_patch_budget(
         return original(
             encoder, mm_feature, preprocess_result, indices, modality, get_feature_fn
         )
-    from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
+    from sglang_tpu.multimodal.vit_tpu_compile_runner import (
         precompiled_max_patch_count,
     )
 

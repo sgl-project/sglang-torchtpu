@@ -22,18 +22,18 @@ from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.disaggregation.raiden import common as raiden_common
 from sglang_tpu.disaggregation.raiden import pipeline as raiden_pipeline
 from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.experimental import runs_draft_prompt_pass
-from sglang_tpu.experimental.speculative import pd_draft_prefill, pd_hidden_pool
-from sglang_tpu.experimental.speculative.pd_draft_prefill import (
-    prebuilt_extend_groups,
-)
-from sglang_tpu.experimental.speculative.pd_hidden_pool import (
-    PdHiddenPool,
-    hidden_lanes,
-)
 from sglang_tpu.hooks.experimental_spec import (
     budget_pd_hidden_pool,
     reject_overlong_pd_draft_prompt,
+)
+from sglang_tpu.speculative import pd_draft_prefill, pd_hidden_pool
+from sglang_tpu.speculative.experimental_spec import runs_draft_prompt_pass
+from sglang_tpu.speculative.pd_draft_prefill import (
+    prebuilt_extend_groups,
+)
+from sglang_tpu.speculative.pd_hidden_pool import (
+    PdHiddenPool,
+    hidden_lanes,
 )
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")

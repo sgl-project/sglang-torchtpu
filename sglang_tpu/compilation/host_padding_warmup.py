@@ -14,7 +14,7 @@ def warmup_sequence_lengths(device, batch_buckets):
 
 @torch.no_grad()
 def warmup_host_relay(runner, bucketer, max_live, *, extend_cap):
-    from sglang_tpu.host_padding_relay import HostPaddingFutureMap
+    from sglang_tpu.managers.host_padding_relay import HostPaddingFutureMap
 
     relay = HostPaddingFutureMap(
         runner.device,

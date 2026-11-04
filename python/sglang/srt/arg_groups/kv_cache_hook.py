@@ -372,7 +372,7 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "--disaggregation-decode-retraction-backup=host_pool requires "
             "--disable-priority-preemption when priority scheduling is enabled."
         )
-    from sglang_tpu.tpu_dma_hicache import is_tpu_dma_hicache_backend
+    from sglang_tpu.mem_cache.tpu_dma_hicache import is_tpu_dma_hicache_backend
 
     if (
         cfg.disaggregation_decode_retraction_backup == "host_pool"

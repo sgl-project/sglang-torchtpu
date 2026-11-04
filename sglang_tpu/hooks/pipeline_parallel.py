@@ -3,7 +3,7 @@
 
 check_pipeline_parallel_compat
   Why: Core's PP check admits only EAGLE and DSPARK, but the TPU target relays
-       the Eagle3 and DFlash aux captures across stages (see sglang_tpu.pp_wave).
+       the Eagle3 and DFlash aux captures across stages (see sglang_tpu.distributed.pp_wave).
   How: AROUND check_pipeline_parallel_compat; EAGLE3 runs the core check as
        EAGLE, DFLASH on the experimental worker as DSPARK (a PD prefill that
        only seeds the draft KV), every other configuration runs it unchanged.
@@ -41,7 +41,7 @@ class _AsAlgorithm:
 
 
 def check_pipeline_parallel_compat(original: Callable[[Any], None], cfg: Any) -> None:
-    from sglang_tpu.experimental import experimental_spec_enabled
+    from sglang_tpu.speculative.experimental_spec import experimental_spec_enabled
 
     algorithm = cfg.speculative_algorithm
     # The rest of TPU's PP checks run in TpuSRTPlatform.apply_server_args_defaults.

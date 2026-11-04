@@ -18,8 +18,8 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang_tpu import mm_embed_tpu
-from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
+from sglang_tpu.managers import mm_embed_tpu
+from sglang_tpu.multimodal.vit_tpu_compile_runner import (
     Qwen3VLVisionTpuCompilePolicy,
     VisionPaddingContext,
     ViTTpuCompileRunner,

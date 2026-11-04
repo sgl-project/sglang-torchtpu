@@ -27,7 +27,7 @@ class TestNodeNormalization(unittest.TestCase):
 
         from sglang.srt.arg_groups.overrides import resolving_view
         from sglang.srt.server_args import ServerArgs
-        from sglang_tpu import node_normalization as normalization
+        from sglang_tpu.entrypoints import node_normalization as normalization
 
         hosts = tuple(
             filter(None, os.environ.get("TPU_WORKER_HOSTNAMES", "").split(","))

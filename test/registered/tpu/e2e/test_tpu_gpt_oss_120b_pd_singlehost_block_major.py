@@ -90,10 +90,10 @@ DISAGG_TRANSFER_BACKEND = "raiden"
 HICACHE_IO_BACKEND = "raiden"
 
 BLOCK_MAJOR_ENV = "SGLANG_TPU_USE_BLOCK_MAJOR_KV"
-# Logged by sglang_tpu/kv_pool.py once per pool per rank.
+# Logged by sglang_tpu/mem_cache/kv_pool.py once per pool per rank.
 BUNDLE_LINE = "Allocating block-major TPU KV bundle"
 FUSED_LINE = "Allocating fused TPU KV buffers"
-# Logged by sglang_tpu/raiden_transfer.py when the host tier is up.
+# Logged by sglang_tpu/mem_cache/raiden_transfer.py when the host tier is up.
 RAIDEN_READY_MARKER = "Raiden KV transfer ready"
 
 # Measured 0.97 accuracy on this topology; 0.80 serves as the CI passing floor.

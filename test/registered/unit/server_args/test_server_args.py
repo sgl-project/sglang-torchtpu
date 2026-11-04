@@ -110,7 +110,7 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     CustomTestCase,
 )
-from sglang_tpu import tpu_platform
+from sglang_tpu.platforms import tpu_platform
 
 register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 register_cpu_ci(est_time=11, suite="stage-b-test-cpu-intel")

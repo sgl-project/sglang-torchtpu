@@ -8,10 +8,10 @@ import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu.attention_pallas_rpa_base import (
+from sglang_tpu.envs import envs
+from sglang_tpu.layers.attention.attention_pallas_rpa_base import (
     BaseTpuPallasRpaAttnBackend,
 )
-from sglang_tpu.envs import envs
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

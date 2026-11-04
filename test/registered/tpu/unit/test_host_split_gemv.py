@@ -1,4 +1,4 @@
-"""Host-split single-token GEMV (sglang_tpu/kernels/host_split_gemv.py) on one host's
+"""Host-split single-token GEMV (sglang_tpu/layers/quantization/pallas/host_split_gemv.py) on one host's
 devices.
 
 The ranks-per-host split is a kernel parameter, so one host's TensorCores
@@ -69,7 +69,10 @@ class TestHostSplitGemv(CustomTestCase):
         return x, w, scale, inv, router
 
     def _reference(self, k, n, x, w, scale, inv, router=None):
-        from sglang_tpu.kernels.static_fp8_gemv import block_k, static_fp8_gemv_jax
+        from sglang_tpu.layers.quantization.pallas.static_fp8_gemv import (
+            block_k,
+            static_fp8_gemv_jax,
+        )
 
         def per_rank(x, w, s, inv):
             return static_fp8_gemv_jax(x, w, s, inv, block_k(k, n))[:1]
@@ -86,7 +89,9 @@ class TestHostSplitGemv(CustomTestCase):
     def test_front_gathers_latent_and_router_columns(self):
         """Kimi-K3 front: 512 latent columns and 128 router experts from all but
         one rank of each host, plus this rank's own shared gate_up columns."""
-        from sglang_tpu.kernels.host_split_gemv import host_split_gemv_local
+        from sglang_tpu.layers.quantization.pallas.host_split_gemv import (
+            host_split_gemv_local,
+        )
 
         world = len(_DEVICES)
         k, n, cols = 7168, 896, 512
@@ -107,7 +112,9 @@ class TestHostSplitGemv(CustomTestCase):
             self.assertLess(np.abs(got - want).max() / np.abs(want).max(), 1e-2)
 
     def test_up_gathers_all_ranks(self):
-        from sglang_tpu.kernels.host_split_gemv import host_split_gemv_local
+        from sglang_tpu.layers.quantization.pallas.host_split_gemv import (
+            host_split_gemv_local,
+        )
 
         world = len(_DEVICES)
         k, n = 3584, 896

@@ -225,7 +225,7 @@ HOOKS: list[tuple] = [
         HookType.AFTER,
     ),
     (
-        "sglang_tpu.graph_runner.tpu_graph_runner.TpuGraphRunner.__init__",
+        "sglang_tpu.model_executor.runner.tpu_graph_runner.TpuGraphRunner.__init__",
         route_glm_flash_megakernel,
         HookType.AFTER,
     ),

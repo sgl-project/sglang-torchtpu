@@ -27,7 +27,8 @@ class TestDraftKvPoolHook(CustomTestCase):
             speculative_draft_attention_backend="pallas_tpu_rpa_v3",
         )
         with patch(
-            "sglang_tpu.tpu_platform._mha_kv_pool_cls", return_value="rpa pool"
+            "sglang_tpu.platforms.tpu_platform._mha_kv_pool_cls",
+            return_value="rpa pool",
         ) as pool_cls:
             self.assertEqual(draft_mha_pool_class(original, draft), "rpa pool")
         pool_cls.assert_called_once_with("pallas_tpu_rpa_v3")

@@ -71,7 +71,7 @@ from sglang.srt.utils.common import is_cuda_alike
 from sglang.utils import is_in_ci
 
 if TYPE_CHECKING:
-    from sglang_tpu.ep_local_expert_reader import (
+    from sglang_tpu.model_loader.ep_local_expert_reader import (
         EpLocalExpertReader,
     )
 
@@ -1141,7 +1141,7 @@ def _ep_local_expert_reader(
     shards (no range, mmap on, or no checkpoint index)."""
     if local_expert_range is None:
         return None
-    from sglang_tpu.ep_local_expert_reader import (
+    from sglang_tpu.model_loader.ep_local_expert_reader import (
         EpLocalExpertReader,
     )
 

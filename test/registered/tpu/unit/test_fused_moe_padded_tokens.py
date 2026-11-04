@@ -203,7 +203,7 @@ class TestFusedMoEPaddedTokens(CustomTestCase):
         return self._weights[key]
 
     def _fn(self, kind, route_name, ep, local_ids, thr, sc, no_combine):
-        from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
+        from sglang_tpu.layers.moe.pallas.fused_moe_op import _fused_moe_jax
 
         key = (kind, route_name, ep, local_ids, thr, sc, no_combine)
         if key not in self._fns:
@@ -245,7 +245,7 @@ class TestFusedMoEPaddedTokens(CustomTestCase):
                 )
             )
 
-            gmm_mod = importlib.import_module("sglang_tpu.moe.pallas.gmm_v2")
+            gmm_mod = importlib.import_module("sglang_tpu.layers.moe.pallas.gmm_v2")
             poisoned = _poisoned_gmm(gmm_mod.gmm_v2)
 
             def run(hidden, ids, w):

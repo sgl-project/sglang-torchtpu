@@ -29,11 +29,11 @@ import torch
 
 from sglang.srt.utils.common import is_pin_memory_available
 from sglang_tpu.envs import envs
-from sglang_tpu.row_pad import row_bucket
 from sglang_tpu.sampling.padded_logits import (
     PaddedRepetitionPenalizer,
     padded_greedy_sample,
 )
+from sglang_tpu.utils.row_pad import row_bucket
 
 
 def cumulate_penalty_output_tokens(original, batch):

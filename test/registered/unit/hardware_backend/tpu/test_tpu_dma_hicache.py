@@ -14,8 +14,8 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.pool_host import base as host_base
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.kv_pool_host import tpu_dma_host_kv_pool_cls
-from sglang_tpu.tpu_dma_hicache import (
+from sglang_tpu.mem_cache.pool_host.kv_pool_host import tpu_dma_host_kv_pool_cls
+from sglang_tpu.mem_cache.tpu_dma_hicache import (
     NOOP_EVENT,
     is_tpu_dma_hicache_backend,
     register_tpu_dma_hicache_backend,
@@ -54,10 +54,10 @@ class TestTpuDMAKVTransfer(CustomTestCase):
     def test_engines_select_the_tpu_controllers(self):
         with (
             patch(
-                "sglang_tpu.tpu_dma_hybrid_cache_controller.TpuDMAHybridCacheController"
+                "sglang_tpu.mem_cache.hybrid_cache.tpu_dma_hybrid_cache_controller.TpuDMAHybridCacheController"
             ) as hybrid,
             patch(
-                "sglang_tpu.tpu_dma_cache_controller.TpuDMAHiCacheController"
+                "sglang_tpu.managers.tpu_dma_cache_controller.TpuDMAHiCacheController"
             ) as single,
         ):
             HybridCacheController.create_for_backend(io_backend=ENGINE)
@@ -130,7 +130,7 @@ class TestTpuDMAKVTransfer(CustomTestCase):
                 host_base, "available_host_memory_bytes", return_value=1 << 42
             ),
             patch(
-                "sglang_tpu.kv_pool_host.sync_fixed_hicache_size",
+                "sglang_tpu.mem_cache.pool_host.kv_pool_host.sync_fixed_hicache_size",
                 side_effect=lambda raw_size, host_size: min(raw_size, 1500),
             ) as sync_mock,
         ):

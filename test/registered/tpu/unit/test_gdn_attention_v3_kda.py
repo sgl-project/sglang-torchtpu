@@ -1,6 +1,6 @@
 """Correctness tests for the KDA mode of the fused Conv1D + GDN kernel.
 
-The kernel lives in ``sglang_tpu.attention.pallas.gdn`` (public entry
+The kernel lives in ``sglang_tpu.layers.attention.pallas.gdn`` (public entry
 ``fused_conv1d_gdn`` with ``attention_mode=AttentionMode.KDA``). The KDA gate is
 per-channel, ``kq_head_dim`` times wider than GDN's per-head scalar, so it takes
 its own BlockSpec, VMEM load and gate activation.
@@ -342,7 +342,7 @@ def _reachable_tile_batches(
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
 
-    from sglang_tpu.attention.pallas.gdn import compute_gdn, config, tiling
+    from sglang_tpu.layers.attention.pallas.gdn import compute_gdn, config, tiling
 
     if attention_mode is None:
         attention_mode = config.AttentionMode.GDN
@@ -422,7 +422,7 @@ class TestGDNAttentionV3KDA(CustomTestCase):
     KERNEL_SIZE = 4
 
     def _kernel(self):
-        from sglang_tpu.attention.pallas.gdn import fused_conv1d_gdn
+        from sglang_tpu.layers.attention.pallas.gdn import fused_conv1d_gdn
 
         return fused_conv1d_gdn
 
@@ -486,7 +486,7 @@ class TestGDNAttentionV3KDA(CustomTestCase):
         )
 
     def test_kda_matches_the_recurrence(self):
-        from sglang_tpu.attention.pallas.gdn import config
+        from sglang_tpu.layers.attention.pallas.gdn import config
 
         kernel = self._kernel()
         for name, query_lens, context_lens, distribution, extra in _SHAPES:
@@ -533,7 +533,7 @@ class TestGDNAttentionV3KDA(CustomTestCase):
     def test_speculative_window_checkpoints(self):
         """8-token verify windows: reads resume at ``base + read_offset``, each
         real token checkpoints to ``base + t``, unused window slots stay intact."""
-        from sglang_tpu.attention.pallas.gdn import config
+        from sglang_tpu.layers.attention.pallas.gdn import config
 
         num_spec_tokens = 7
         window = num_spec_tokens + 1
@@ -635,7 +635,7 @@ class TestGDNAttentionV3KDA(CustomTestCase):
 
     def test_rejects_invalid_gate_bound(self):
         """The entry point's gate guards, which all fail silently if dropped."""
-        from sglang_tpu.attention.pallas.gdn import config
+        from sglang_tpu.layers.attention.pallas.gdn import config
 
         n_kq = n_v = 4
         d_k, d_v, kernel_size = self.D_K, self.D_V, self.KERNEL_SIZE
@@ -701,7 +701,7 @@ class TestGDNAttentionV3KDA(CustomTestCase):
         """KDA VMEM accounting and tile picks across TP/DP/MTP regimes."""
         from jax.experimental.pallas import tpu as pltpu
 
-        from sglang_tpu.attention.pallas.gdn import config, tiling
+        from sglang_tpu.layers.attention.pallas.gdn import config, tiling
 
         num_lanes = pltpu.get_tpu_info().num_lanes
         d_k = d_v = 128
@@ -746,7 +746,7 @@ class TestGDNAttentionV3KDA(CustomTestCase):
 
     def test_kda_spec_decode_dynamic_tiling_head_splits(self):
         """Multi-sequence KDA spec verify tiles across served head splits."""
-        from sglang_tpu.attention.pallas.gdn import config
+        from sglang_tpu.layers.attention.pallas.gdn import config
 
         kernel = self._kernel()
         d_k, d_v, kernel_size = self.D_K, self.D_V, self.KERNEL_SIZE
@@ -833,7 +833,7 @@ class TestGDNAttentionV3KDA(CustomTestCase):
 
     def test_kda_spec_window_multi_sequence_tile(self):
         """Multi-sequence KDA spec verify tile matches decode_tile_size=1."""
-        from sglang_tpu.attention.pallas.gdn import config
+        from sglang_tpu.layers.attention.pallas.gdn import config
 
         kernel = self._kernel()
         d_k, d_v, kernel_size = self.D_K, self.D_V, self.KERNEL_SIZE
@@ -901,7 +901,7 @@ class TestGDNAttentionV3KDA(CustomTestCase):
 
     def test_kda_head_dense_prefill_c64_execution(self):
         """32-head KDA prefill runs dynamically at C=64 without VMEM overflow."""
-        from sglang_tpu.attention.pallas.gdn import config
+        from sglang_tpu.layers.attention.pallas.gdn import config
 
         kernel = self._kernel()
         query_lens = [128, 64]
@@ -922,7 +922,7 @@ class TestGDNAttentionV3KDA(CustomTestCase):
 
     def test_every_reachable_tile_matches_recurrence(self):
         """Every reachable (T, C) tile pair across served KDA heads matches recurrence."""
-        from sglang_tpu.attention.pallas.gdn import config
+        from sglang_tpu.layers.attention.pallas.gdn import config
 
         kernel = self._kernel()
         for n_kq, n_v in _SERVED_KDA_HEADS:

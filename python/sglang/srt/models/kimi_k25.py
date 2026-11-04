@@ -604,7 +604,7 @@ class MoonViT3dEncoder(nn.Module):
         # rope/cu_seqlens preamble and tpool_patch_merger stay eager.
         self.graph_runners = None
         if _is_tpu:
-            from sglang_tpu.graph_runner.moonvit_tpu_compile_runner import (
+            from sglang_tpu.multimodal.moonvit_tpu_compile_runner import (
                 MoonVitTpuCompileRunner,
             )
 
@@ -685,7 +685,7 @@ if _is_tpu:
     # Register MoonViT's encoder as a torch.compile boundary for the TPU graph
     # runner to discover (inert unless --enable-torch-compile).
     from sglang.srt.compilation.support_torch_compile import support_torch_compile
-    from sglang_tpu.graph_runner.moonvit_tpu_compile_runner import (
+    from sglang_tpu.multimodal.moonvit_tpu_compile_runner import (
         MoonVitTpuCompilePolicy,
     )
 

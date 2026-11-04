@@ -481,10 +481,10 @@ class HiCacheController:
         copy-worker threads instead of device streams)."""
         if kwargs.get("io_backend") == "torch_tpu":
             return TpuHiCacheController(*args, **kwargs)
-        from sglang_tpu.tpu_dma_hicache import is_tpu_dma_hicache_backend
+        from sglang_tpu.mem_cache.tpu_dma_hicache import is_tpu_dma_hicache_backend
 
         if is_tpu_dma_hicache_backend(kwargs.get("io_backend")):
-            from sglang_tpu.tpu_dma_cache_controller import (
+            from sglang_tpu.managers.tpu_dma_cache_controller import (
                 TpuDMAHiCacheController,
             )
 
@@ -1532,7 +1532,7 @@ class TpuHiCacheController(HiCacheController):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        from sglang_tpu.kv_copy_worker import TpuKvCopyWorker
+        from sglang_tpu.managers.kv_copy_worker import TpuKvCopyWorker
 
         # Whole-batch gate instead of the per-layer device-stream counter; the
         # base already registered a LayerDoneCounter, so swap + re-register.

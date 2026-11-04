@@ -18,7 +18,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang_tpu.experimental import (
+from sglang_tpu.speculative.experimental_spec import (
     is_experimental_chain,
     is_experimental_spec_worker,
 )
@@ -34,19 +34,19 @@ def select_experimental_spec_worker(
     if (
         is_experimental_chain(algorithm) or is_experimental_spec_worker(algorithm)
     ) and not parallel.pp_group.is_last_rank:
-        from sglang_tpu.experimental.speculative.pipeline_stage_worker import (
+        from sglang_tpu.speculative.pipeline_stage_worker import (
             TpuPipelineStageWorker,
         )
 
         return TpuPipelineStageWorker
     if is_experimental_chain(algorithm):
-        from sglang_tpu.experimental.speculative.chain_spec_worker import (
+        from sglang_tpu.speculative.chain_spec_worker import (
             TpuChainSpecWorker,
         )
 
         return TpuChainSpecWorker
     if is_experimental_spec_worker(algorithm):
-        from sglang_tpu.experimental.speculative.block_spec_worker import (
+        from sglang_tpu.speculative.block_spec_worker import (
             TpuBlockSpecWorker,
         )
 

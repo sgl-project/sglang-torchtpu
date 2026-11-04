@@ -1,6 +1,6 @@
-"""Moved to :mod:`sglang_tpu.sampler`; alias kept for in-flight branches, delete once they merge."""
+"""Moved to :mod:`sglang_tpu.layers.sampler`; alias kept for in-flight branches, delete once they merge."""
 
 import importlib
 import sys
 
-sys.modules[__name__] = importlib.import_module("sglang_tpu.sampler")
+sys.modules[__name__] = importlib.import_module("sglang_tpu.layers.sampler")

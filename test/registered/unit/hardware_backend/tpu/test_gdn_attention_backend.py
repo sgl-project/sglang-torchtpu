@@ -1,7 +1,7 @@
 """Unit tests for the TPU GDN attention backend's metadata (CPU-runnable).
 
 These cover the pure-Python/torch part of
-``sglang_tpu.attention_gdn_pallas.TpuGDNAttnBackend`` that
+``sglang_tpu.layers.attention.linear.attention_gdn_pallas.TpuGDNAttnBackend`` that
 needs no JAX / torch_tpu / TPU device: the ``distribution`` dispatch vector the
 fused kernel keys on.
 
@@ -36,7 +36,7 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.attention_gdn_pallas import TpuGDNAttnBackend
+from sglang_tpu.layers.attention.linear.attention_gdn_pallas import TpuGDNAttnBackend
 
 
 class _BackendNoInit(TpuGDNAttnBackend):
@@ -310,7 +310,7 @@ class TestGDNSlotBookkeepingWarmup(CustomTestCase):
             mamba_pool=SimpleNamespace(clear_slots=Mock()),
         )
         with patch(
-            "sglang_tpu.attention_gdn_pallas.get_disagg",
+            "sglang_tpu.layers.attention.linear.attention_gdn_pallas.get_disagg",
             return_value=SimpleNamespace(disaggregation_mode=disaggregation_mode),
         ):
             backend._warmup_slot_bookkeeping()
@@ -330,7 +330,7 @@ class TestGDNRequestTilePadding(CustomTestCase):
     def test_partial_verify_tiles_have_inert_metadata_rows(self):
         import jax.numpy as jnp
 
-        from sglang_tpu.attention.pallas.gdn.metadata import (
+        from sglang_tpu.layers.attention.pallas.gdn.metadata import (
             compute_batched_seq_metadata,
         )
 

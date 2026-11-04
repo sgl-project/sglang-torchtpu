@@ -1,6 +1,6 @@
 """Correctness tests for the vendored Pallas fused Conv1D + GDN kernel.
 
-The kernel lives in ``sglang_tpu.attention.pallas.gdn`` (public entry
+The kernel lives in ``sglang_tpu.layers.attention.pallas.gdn`` (public entry
 ``fused_conv1d_gdn``). These tests build small ragged batches and compare the
 kernel output and updated conv/recurrent state against an in-file pure-JAX
 eager reference that runs the gated-delta-rule sequence-by-sequence.
@@ -344,7 +344,7 @@ def _reachable_tile_batches(
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
 
-    from sglang_tpu.attention.pallas.gdn import compute_gdn, config, tiling
+    from sglang_tpu.layers.attention.pallas.gdn import compute_gdn, config, tiling
 
     if attention_mode is None:
         attention_mode = config.AttentionMode.GDN
@@ -480,7 +480,7 @@ class TestGDNAttentionV3(CustomTestCase):
     ]
 
     def _kernel(self):
-        from sglang_tpu.attention.pallas.gdn import fused_conv1d_gdn
+        from sglang_tpu.layers.attention.pallas.gdn import fused_conv1d_gdn
 
         return jax.jit(
             fused_conv1d_gdn,
@@ -715,7 +715,7 @@ class TestGDNAttentionV3(CustomTestCase):
         state checkpoint per window position lands at `base + t`, matching a
         token-by-token eager reference. Prefill sequences in the same batch
         keep the original PER_SEQ behavior (read/write the base slot)."""
-        from sglang_tpu.attention.pallas.gdn import wrapper
+        from sglang_tpu.layers.attention.pallas.gdn import wrapper
 
         kq_head_dim = 128
         v_head_dim = 128
@@ -886,7 +886,7 @@ class TestGDNAttentionV3(CustomTestCase):
 
     def test_batched_decode_initial_state_parity(self):
         """Multi-tile batched decode keeps every sequence's own state."""
-        from sglang_tpu.attention.pallas.gdn import wrapper
+        from sglang_tpu.layers.attention.pallas.gdn import wrapper
 
         n_kq, n_v, d_k, d_v, kernel_size = 2, 8, 128, 128, 4
         dim = 2 * n_kq * d_k + n_v * d_v
@@ -956,7 +956,7 @@ class TestGDNAttentionV3(CustomTestCase):
     def test_spec_window_checkpoints_multi_tile(self):
         """W=8 verify over several multi-sequence tiles writes each sequence's
         own checkpoints, including checkpoint 0."""
-        from sglang_tpu.attention.pallas.gdn import wrapper
+        from sglang_tpu.layers.attention.pallas.gdn import wrapper
 
         n_kq, n_v, d_k, d_v, kernel_size = 2, 4, 128, 128, 4
         dim = 2 * n_kq * d_k + n_v * d_v
@@ -1050,7 +1050,7 @@ class TestGDNAttentionV3(CustomTestCase):
 
     def test_dynamic_tiling_with_mixed_and_decode_parity(self):
         """Dynamic tile sizing matches explicit static tile overrides on TPU."""
-        from sglang_tpu.attention.pallas.gdn import wrapper
+        from sglang_tpu.layers.attention.pallas.gdn import wrapper
 
         d_k, d_v = self.KQ_HEAD_DIM, self.V_HEAD_DIM
         kernel_size = self.KERNEL_SIZE
@@ -1138,7 +1138,7 @@ class TestGDNAttentionV3(CustomTestCase):
 
     def test_gdn_v3_dynamic_tiling_spec_verify_matches_static(self):
         """SPEC verify with dynamic decode tile (>1) matches static tile=1."""
-        from sglang_tpu.attention.pallas.gdn import wrapper
+        from sglang_tpu.layers.attention.pallas.gdn import wrapper
 
         n_kq, n_v = 2, 8
         d_k = d_v = 128
@@ -1226,7 +1226,7 @@ class TestGDNAttentionV3(CustomTestCase):
 
     def test_per_seq_boundary_read_after_write(self):
         """Multi-sequence PER_SEQ batch where sequence boundary crosses tiles."""
-        from sglang_tpu.attention.pallas.gdn import wrapper
+        from sglang_tpu.layers.attention.pallas.gdn import wrapper
 
         n_kq, n_v = 2, 8
         d_k = d_v = 128
@@ -1294,7 +1294,7 @@ class TestGDNAttentionV3(CustomTestCase):
 
     def test_qwen3_5_397b_parallelism_execution(self):
         """End-to-end TPU execution across Qwen3.5-397B TP8/DP4TP2/DP8 head counts."""
-        from sglang_tpu.attention.pallas.gdn import wrapper
+        from sglang_tpu.layers.attention.pallas.gdn import wrapper
 
         d_k = d_v = 128
         kernel_size = 4
@@ -1366,7 +1366,7 @@ class TestGDNAttentionV3(CustomTestCase):
 
     def test_every_reachable_tile_matches_reference(self):
         """Every reachable (T, C) tile pair across served GDN heads matches reference."""
-        from sglang_tpu.attention.pallas.gdn import config, wrapper
+        from sglang_tpu.layers.attention.pallas.gdn import config, wrapper
 
         d_k = d_v = 128
         kernel_size = 4
@@ -1579,7 +1579,7 @@ class TestGDNTileSelection(CustomTestCase):
         """Tile selection across Qwen3.5-397B TP8, DP4TP2, and DP8 topologies."""
         from jax.experimental.pallas import tpu as pltpu
 
-        from sglang_tpu.attention.pallas.gdn import config, tiling
+        from sglang_tpu.layers.attention.pallas.gdn import config, tiling
 
         def _check():
             num_lanes = pltpu.get_tpu_info().num_lanes
@@ -1636,7 +1636,7 @@ class TestGDNTileSelection(CustomTestCase):
         """Declared VMEM bytes equal create_allocs + scratch + weights to 0 B."""
         from jax.experimental.pallas import tpu as pltpu
 
-        from sglang_tpu.attention.pallas.gdn import config, memory_ref, tiling
+        from sglang_tpu.layers.attention.pallas.gdn import config, memory_ref, tiling
 
         def _check():
             num_lanes = pltpu.get_tpu_info().num_lanes
@@ -1741,7 +1741,7 @@ class TestGDNTileSelection(CustomTestCase):
         """Split state in/out slots (state_slots = 1 + W = 2 at W=1) are counted."""
         from jax.experimental.pallas import tpu as pltpu
 
-        from sglang_tpu.attention.pallas.gdn import config, tiling
+        from sglang_tpu.layers.attention.pallas.gdn import config, tiling
 
         def _check():
             num_lanes = pltpu.get_tpu_info().num_lanes
@@ -1782,7 +1782,7 @@ class TestGDNTileSelection(CustomTestCase):
         """KDA VMEM accounting, tile picks, and solver block sizes across TP/DP/MTP."""
         from jax.experimental.pallas import tpu as pltpu
 
-        from sglang_tpu.attention.pallas.gdn import config, memory_ref, tiling
+        from sglang_tpu.layers.attention.pallas.gdn import config, memory_ref, tiling
 
         def _check():
             num_lanes = pltpu.get_tpu_info().num_lanes
@@ -2050,8 +2050,12 @@ class TestGDNTileSelection(CustomTestCase):
         """GDN triangular_block_size is always a power of two and mixed_tile_size respects max_mixed_tile_size."""
         importlib = __import__("importlib")
         pltpu = importlib.import_module("jax.experimental.pallas.tpu")
-        config = importlib.import_module("sglang_tpu.attention.pallas.gdn.config")
-        tiling = importlib.import_module("sglang_tpu.attention.pallas.gdn.tiling")
+        config = importlib.import_module(
+            "sglang_tpu.layers.attention.pallas.gdn.config"
+        )
+        tiling = importlib.import_module(
+            "sglang_tpu.layers.attention.pallas.gdn.tiling"
+        )
 
         def _check():
             dtypes = config.Dtypes(
@@ -2153,7 +2157,7 @@ class TestGDNStatePipelineRace(CustomTestCase):
         from jax.experimental.pallas import tpu as pltpu
         from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
-        from sglang_tpu.attention.pallas.gdn import wrapper
+        from sglang_tpu.layers.attention.pallas.gdn import wrapper
 
         n_kq, n_v, d_k, d_v, kernel_size = 1, 2, 128, 128, 4
         dim = 2 * n_kq * d_k + n_v * d_v

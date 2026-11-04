@@ -146,7 +146,7 @@ class TestPallasFusedMoEEager(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         _maybe_init_tpu_runtime()
-        from sglang_tpu.moe.pallas.fused_moe_op import (
+        from sglang_tpu.layers.moe.pallas.fused_moe_op import (
             _build_fused_moe_op,
         )
 
@@ -157,7 +157,7 @@ class TestPallasFusedMoEEager(unittest.TestCase):
         cls.dtype = torch.bfloat16
 
     def _run(self, hidden, w1, w2, topk_weights, topk_ids, activation):
-        from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
+        from sglang_tpu.layers.moe.pallas.fused_moe_op import fused_moe_call
 
         return fused_moe_call(
             hidden_states=hidden,
@@ -350,7 +350,7 @@ class TestPallasFusedMoETorchCompile(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         _maybe_init_tpu_runtime()
-        from sglang_tpu.moe.pallas.fused_moe_op import (
+        from sglang_tpu.layers.moe.pallas.fused_moe_op import (
             _build_fused_moe_op,
         )
 
@@ -359,7 +359,7 @@ class TestPallasFusedMoETorchCompile(unittest.TestCase):
         cls.dtype = torch.bfloat16
 
     def _compiled_callable(self, activation: str):
-        from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
+        from sglang_tpu.layers.moe.pallas.fused_moe_op import fused_moe_call
 
         def _run(hidden, w1, w2, topk_weights, topk_ids):
             return fused_moe_call(
@@ -376,7 +376,7 @@ class TestPallasFusedMoETorchCompile(unittest.TestCase):
 
     def test_compile_silu_runs_and_matches_eager(self):
         """Compiled path is bit-stable vs eager and matches the CPU reference."""
-        from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
+        from sglang_tpu.layers.moe.pallas.fused_moe_op import fused_moe_call
 
         m, k, n, g, topk = 32, 128, 128, 4, 2
         hidden, w1, w2, w_tk, ids = _make_inputs(

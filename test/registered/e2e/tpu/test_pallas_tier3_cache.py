@@ -49,7 +49,7 @@ _WORKER = textwrap.dedent("""
     import jax.numpy as jnp
     from jax.experimental import pallas as pl
 
-    from sglang_tpu.pallas_jax_op import cpu_export_jax_op
+    from sglang_tpu.utils.pallas_jax_op import cpu_export_jax_op
 
     def add_kernel(value_ref, output_ref):
         output_ref[...] = value_ref[...] + KERNEL_INCREMENT

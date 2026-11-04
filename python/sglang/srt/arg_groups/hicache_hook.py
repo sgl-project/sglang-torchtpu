@@ -154,7 +154,7 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
 
 
 def resolve_layout_io_compatibility(server_args: Any):
-    from sglang_tpu.tpu_dma_hicache import is_tpu_dma_hicache_backend
+    from sglang_tpu.mem_cache.tpu_dma_hicache import is_tpu_dma_hicache_backend
 
     cfg = resolving_view(server_args)
     tpu_dma = is_tpu_dma_hicache_backend(cfg.hicache_io_backend)
@@ -172,7 +172,7 @@ def resolve_layout_io_compatibility(server_args: Any):
         # Offload copies the device KV pool, so the pool and every attention
         # backend reading it must support this io backend. Read through the
         # module: plugins patch its helpers to register backends and pools.
-        from sglang_tpu import tpu_platform
+        from sglang_tpu.platforms import tpu_platform
 
         tpu_platform.validate_kv_offload_pools(
             io_backend=cfg.hicache_io_backend,

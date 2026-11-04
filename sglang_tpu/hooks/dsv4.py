@@ -97,7 +97,7 @@ import torch
 
 def build_tpu_dsv4_kv_pool(original, kvc, *args, **kwargs):
     import sglang.srt.mem_cache.kv_cache_configurator as kvc_mod
-    from sglang_tpu.dsv4.dsv4_memory_pool import DSV4TPUTokenToKVPool
+    from sglang_tpu.layers.attention.dsv4.dsv4_memory_pool import DSV4TPUTokenToKVPool
 
     with patch.object(kvc_mod, "DeepSeekV4TokenToKVPool", DSV4TPUTokenToKVPool):
         pool = original(kvc, *args, **kwargs)
@@ -109,7 +109,7 @@ def build_tpu_dsv4_kv_pool(original, kvc, *args, **kwargs):
 
 def get_tpu_dsv4_bytes_per_swa_token(original, configurator) -> float:
     del original
-    from sglang_tpu.dsv4.dsv4_memory_pool import DSV4TPUTokenToKVPool
+    from sglang_tpu.layers.attention.dsv4.dsv4_memory_pool import DSV4TPUTokenToKVPool
 
     return DSV4TPUTokenToKVPool.bytes_per_swa_token(
         num_layers_total=configurator.num_layers_total
@@ -118,7 +118,7 @@ def get_tpu_dsv4_bytes_per_swa_token(original, configurator) -> float:
 
 def get_tpu_dsv4_bytes_per_full_token(original, configurator) -> float:
     del original
-    from sglang_tpu.dsv4.dsv4_memory_pool import DSV4TPUTokenToKVPool
+    from sglang_tpu.layers.attention.dsv4.dsv4_memory_pool import DSV4TPUTokenToKVPool
 
     swa_ratio = (
         0
@@ -138,7 +138,7 @@ def get_tpu_dsv4_c128_state_fixed_bytes(
     original, configurator, max_running_requests: int
 ) -> int:
     del original
-    from sglang_tpu.dsv4.dsv4_memory_pool import DSV4TPUTokenToKVPool
+    from sglang_tpu.layers.attention.dsv4.dsv4_memory_pool import DSV4TPUTokenToKVPool
 
     return DSV4TPUTokenToKVPool.c128_state_fixed_bytes(
         num_req_slots=configurator._get_num_req_slots(max_running_requests),
@@ -151,7 +151,7 @@ def get_tpu_dsv4_fixed_c4_state_bytes(
     original, configurator, max_running_requests: int
 ) -> int:
     del original
-    from sglang_tpu.dsv4.dsv4_memory_pool import DSV4TPUTokenToKVPool
+    from sglang_tpu.layers.attention.dsv4.dsv4_memory_pool import DSV4TPUTokenToKVPool
 
     return DSV4TPUTokenToKVPool.c4_state_fixed_bytes(
         num_req_slots=configurator._get_num_req_slots(max_running_requests),

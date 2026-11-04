@@ -756,7 +756,7 @@ draft to a local directory, then run on every host; the API comes up on the
 host of JAX process 0:
 
 ```bash
-bash sglang_tpu/k3_megakernel/server/run4h.sh k3mk --port 30000 --capacity 16384 \
+bash sglang_tpu/models/k3_megakernel/server/run4h.sh k3mk --port 30000 --capacity 16384 \
     --spec-draft dspark --draft-path /path/to/Kimi-K3-DSpark --spec-rounds 32 -- \
     --ckpt /path/to/Kimi-K3 --layers 93 --expert-load stream --expert-load-procs 48 \
     --relax dense_fp8,pair_oproj,expert_replicas=48 --kernel-opt wire_relax=bf16_transport

@@ -68,7 +68,7 @@ class TestGlmFlashMegakernelSnapshot(CustomTestCase):
     would have snapshotted it; a skipped row writes only the null slot 0."""
 
     def _kernel(self, q: int):
-        from sglang_tpu.glm_flash_megakernel.ops import GlmFlashMegakernel
+        from sglang_tpu.models.glm_flash_megakernel.ops import GlmFlashMegakernel
 
         mk = object.__new__(GlmFlashMegakernel)
         mk.Q, mk.spec = q, SimpleNamespace(kda_layers=[0])

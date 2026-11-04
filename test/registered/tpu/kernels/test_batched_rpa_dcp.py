@@ -85,7 +85,7 @@ KV_LAYOUT_NAME = os.environ.get("SGLANG_TEST_KV_LAYOUT", "HEAD_ALONG_SUBLANE")
 
 
 def _kv_layout(name: str = KV_LAYOUT_NAME):
-    from sglang_tpu.attention.pallas.batched_rpa import configs
+    from sglang_tpu.layers.attention.pallas.batched_rpa import configs
 
     return configs.KVLayout[name]
 
@@ -103,14 +103,14 @@ DCP8 = Geometry("dcp8", num_q_heads=64, num_kv_heads=8, cp=8)
 
 def _small_decode_blocks():
     """One page per k block, so long shards span several k blocks."""
-    from sglang_tpu.attention.pallas.batched_rpa.configs import BlockSizes
+    from sglang_tpu.layers.attention.pallas.batched_rpa.configs import BlockSizes
 
     return BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=PAGE_SIZE, batch_size=8, n_buffer=3)
 
 
 def _small_prefill_blocks():
     """Several q blocks per chunk, two compute tiles per q block, two lanes."""
-    from sglang_tpu.attention.pallas.batched_rpa.configs import BlockSizes
+    from sglang_tpu.layers.attention.pallas.batched_rpa.configs import BlockSizes
 
     return BlockSizes(bq_sz=128, bq_c_sz=64, bkv_sz=PAGE_SIZE, batch_size=2, n_buffer=3)
 
@@ -147,7 +147,7 @@ def _fused_cache(
     sublane axis (HEAD_ALONG_SUBLANE) or the lane axis (SEQ_ALONG_LANE)."""
     import jax.numpy as jnp
 
-    from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
+    from sglang_tpu.layers.attention.pallas.batched_rpa.wrapper import (
         get_kv_cache_shape,
     )
 
@@ -281,7 +281,7 @@ def _run_kernel(queries, keys, values, shard, cu_q_lens, distribution, **kwargs)
     """Call the kernel and return every output as a float32 numpy array."""
     import jax.numpy as jnp
 
-    from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
+    from sglang_tpu.layers.attention.pallas.batched_rpa.wrapper import (
         ragged_paged_attention,
     )
 
@@ -718,7 +718,7 @@ class TestBatchedRpaDcpStripedDecode(_CloseAssertions):
         """STRIPED relies on one query per sequence; multi-token decode must use the 2-phase pair."""
         import jax.numpy as jnp
 
-        from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
+        from sglang_tpu.layers.attention.pallas.batched_rpa.wrapper import (
             ragged_paged_attention,
         )
 
@@ -795,7 +795,7 @@ class TestBatchedRpaDcpMixedPrefillAndDecode(_CloseAssertions):
     def _run_shards(self, geo: Geometry, window):
         import jax.numpy as jnp
 
-        from sglang_tpu.attention.pallas.batched_rpa import configs
+        from sglang_tpu.layers.attention.pallas.batched_rpa import configs
 
         prefix_k, prefix_v, chunk_k, chunk_v, queries = self._data(geo)
         num_seqs = len(self.SEQS)
@@ -1046,7 +1046,7 @@ class TestBatchedRpaDcpStripedChunkWrite(_CloseAssertions):
     def _run(self, geo: Geometry, window):
         import jax.numpy as jnp
 
-        from sglang_tpu.attention.pallas.batched_rpa import configs
+        from sglang_tpu.layers.attention.pallas.batched_rpa import configs
 
         prefix_k, prefix_v, chunk_k, chunk_v, queries = self._data(geo)
         cu_q_lens, new_k, new_v = self._new_kv(geo, chunk_k, chunk_v)
@@ -1661,7 +1661,7 @@ class TestBatchedRpaDcpServingShapesFitVmem(unittest.TestCase):
         import jax
         import jax.numpy as jnp
 
-        from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
+        from sglang_tpu.layers.attention.pallas.batched_rpa.wrapper import (
             get_kv_cache_shape,
             ragged_paged_attention,
         )
@@ -1786,7 +1786,7 @@ class TestBatchedRpaFlagsOff(_CloseAssertions):
         """The in-repo v3 reference on one sequence held in contiguous pages."""
         import jax.numpy as jnp
 
-        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
+        from sglang_tpu.layers.attention.pallas.ragged_paged_attention_v3 import (
             ref_ragged_paged_attention,
         )
 

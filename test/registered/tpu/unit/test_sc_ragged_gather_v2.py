@@ -24,8 +24,8 @@ import numpy as np
 from absl.testing import parameterized
 from jax._src import test_util as jtu
 
-from sglang_tpu.compile_cache import initialize_jax_compile_cache
-from sglang_tpu.moe.pallas.sparse_core.ragged_gather_v2 import ragged_gather_v2
+from sglang_tpu.compilation.compile_cache import initialize_jax_compile_cache
+from sglang_tpu.layers.moe.pallas.sparse_core.ragged_gather_v2 import ragged_gather_v2
 
 initialize_jax_compile_cache()
 

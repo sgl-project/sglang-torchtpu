@@ -137,7 +137,7 @@ How many steps:
   (`SGLANG_TPU_PROFILE_AUTO_STEPS` steps each) into
   `SGLANG_TORCH_PROFILER_DIR`. It is meant for P/D engines and CI. It records
   whatever runs first, not a warmed-up steady state. See
-  `sglang_tpu/profile_auto.py`.
+  `sglang_tpu/utils/profile_auto.py`.
 
 ## Step 3: Check the files
 

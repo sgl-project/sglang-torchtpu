@@ -21,7 +21,7 @@ from sglang.srt.sampling.penaltylib import repetition_penalty
 from sglang.srt.sampling.penaltylib.repetition_penalty import (
     BatchedRepetitionPenalizer,
 )
-from sglang_tpu.row_pad import pad_rows, row_bucket
+from sglang_tpu.utils.row_pad import pad_rows, row_bucket
 
 
 class PaddedRepetitionPenalizer(BatchedRepetitionPenalizer):

@@ -18,7 +18,7 @@ from sglang.test.test_utils import CustomTestCase
 try:
     from fastapi.testclient import TestClient
 
-    from sglang_tpu.k3_megakernel.server import app as srv
+    from sglang_tpu.models.k3_megakernel.server import app as srv
 except ImportError:  # pragma: no cover
     srv = None
 

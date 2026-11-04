@@ -10,11 +10,11 @@ import torch
 
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu.experimental.speculative.block_info import HostPaddedBlockDraftInput
-from sglang_tpu.result_copy_worker import (
+from sglang_tpu.managers.result_copy_worker import (
     TpuAsyncCopyEvent,
     TPUAsyncCopyWorker,
 )
+from sglang_tpu.speculative.block_info import HostPaddedBlockDraftInput
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

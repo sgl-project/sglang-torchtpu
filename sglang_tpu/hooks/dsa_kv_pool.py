@@ -25,7 +25,7 @@ def _split_pool_bytes(kvc, *, layer_ids, all_index_layers: bool) -> int:
         get_dsa_index_head_dim,
         get_dsa_index_kpool,
     )
-    from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
+    from sglang_tpu.mem_cache.kv_pool import TpuSplitMLATokenToKVPool
 
     hf_config = kvc.model_config.hf_config
     return TpuSplitMLATokenToKVPool.bytes_per_token(
@@ -54,7 +54,7 @@ def _attention_layer_ids(kvc):
 def size_tpu_dsa_kv_pool(result: None, configurator, kvc, *args, **kwargs) -> None:
     from sglang.srt.configs.model_config import is_deepseek_dsa
     from sglang.srt.platforms import current_platform
-    from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
+    from sglang_tpu.mem_cache.kv_pool import TpuSplitMLATokenToKVPool
 
     if (
         not is_deepseek_dsa(kvc.model_config.hf_config)

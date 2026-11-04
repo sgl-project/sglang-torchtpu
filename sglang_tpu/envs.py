@@ -130,7 +130,7 @@ class TpuEnvs:
     SGLANG_TPU_HOST_PADDING_NO_D2H = EnvBool(True)
 
     # Speculative decoding
-    # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker and MTP
+    # Route DFLASH/DSPARK to sglang_tpu.speculative.block_spec_worker.TpuBlockSpecWorker and MTP
     # and EAGLE3 to TpuChainSpecWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
     SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(True)
     # Every N verify steps, TP ranks compare a digest of their committed tokens and
@@ -180,7 +180,7 @@ class TpuEnvs:
     SGLANG_TPU_VISION_FLASH_BAND_SKIP = EnvBool(False)
 
     # Largest decode batch (tokens) that `--moe-runner-backend pallas_tpu_fused_decode`
-    # runs with the fused MoE decode kernel (`sglang_tpu/moe/pallas/fused_moe_decode`);
+    # runs with the fused MoE decode kernel (`sglang_tpu/layers/moe/pallas/fused_moe_decode`);
     # larger batches use gmm_v2.
     SGLANG_TPU_FUSED_MOE_DECODE_MAX_TOKENS = EnvInt(256)
 

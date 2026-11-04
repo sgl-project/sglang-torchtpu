@@ -13,9 +13,9 @@ from sglang_tpu import hooks
 from sglang_tpu.compilation.encoder_compile_policy import (
     install_vision_compile_policies,
 )
-from sglang_tpu.graph_runner import vit_tpu_compile_runner
 from sglang_tpu.hooks import encoder as encoder_hooks
-from sglang_tpu.tpu_platform import TpuSRTPlatform
+from sglang_tpu.multimodal import vit_tpu_compile_runner
+from sglang_tpu.platforms.tpu_platform import TpuSRTPlatform
 
 register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
 

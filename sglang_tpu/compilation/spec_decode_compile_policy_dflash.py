@@ -39,8 +39,8 @@ from sglang_tpu.compilation.recompilation_checker import (
 from sglang_tpu.compilation.spec_decode_compile_policy import (
     BaseSpecDecodeCompilePolicyMixin,
 )
-from sglang_tpu.dflash_utils_tpu import build_dflash_draft_block
 from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.speculative.dflash_utils_tpu import build_dflash_draft_block
 
 logger = get_logger(__name__)
 
@@ -171,7 +171,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             )
         model = self.model_runner.model
         if tpu_envs.SGLANG_TPU_DFLASH_FP8_DRAFT.get():
-            from sglang_tpu.fp8_weight_linear import (
+            from sglang_tpu.layers.quantization.fp8_weight_linear import (
                 install_fp8_linears,
                 install_fp8_plain_linears,
             )
@@ -183,7 +183,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 num_fp8,
             )
         from sglang.srt.runtime_context import get_parallel
-        from sglang_tpu.twoshot_all_reduce import install_twoshot_all_reduce
+        from sglang_tpu.distributed.twoshot_all_reduce import install_twoshot_all_reduce
 
         logger.info(
             "[spec compile policy] DFLASH draft: %d two-shot all-reduces.",

@@ -34,7 +34,7 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
         # GLM-5.3-Flash's q-block prefill: NoPE + RoPE query lanes, the
         # recipe's 128-token pages, and the most pages per request the op
         # lets this kernel take.
-        from sglang_tpu.attention.pallas import mla_sparse_fused as fused
+        from sglang_tpu.layers.attention.pallas import mla_sparse_fused as fused
 
         return dict(
             q_width=fused.NOPE_DIM + fused.ROPE_DIM,
@@ -45,11 +45,11 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        from sglang_tpu.attention.pallas import dsa_kpool_topk as kp
-        from sglang_tpu.attention.pallas.mla_sparse_fused import (
+        from sglang_tpu.layers.attention.pallas import dsa_kpool_topk as kp
+        from sglang_tpu.layers.attention.pallas.mla_sparse_fused import (
             sparse_mla_attention_fused,
         )
-        from sglang_tpu.attention.pallas.mla_sparse_qblock import (
+        from sglang_tpu.layers.attention.pallas.mla_sparse_qblock import (
             sparse_mla_prefill_qblock,
         )
 
@@ -172,7 +172,9 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
         # 64 heads per chip (GLM-5.3-Flash at attention TP1) take 128-query
         # blocks, since 64 x 256 score rows do not fit in VMEM. 8 and 32 heads
         # per chip (TP8, TP2) keep 256.
-        from sglang_tpu.attention.pallas.mla_sparse_fused import qblock_query_block
+        from sglang_tpu.layers.attention.pallas.mla_sparse_fused import (
+            qblock_query_block,
+        )
 
         def query_block(heads):
             return qblock_query_block(heads, **self._glm_shape())
@@ -187,7 +189,7 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
     def test_largest_shape_within_vmem_estimate_compiles(self):
         # The op trusts the VMEM estimate, so the most heads it allows at the
         # default query block (35 at 256 queries on tpu7x) must compile.
-        from sglang_tpu.attention.pallas import mla_sparse_qblock as mq
+        from sglang_tpu.layers.attention.pallas import mla_sparse_qblock as mq
 
         shape = self._glm_shape()
         heads = max(

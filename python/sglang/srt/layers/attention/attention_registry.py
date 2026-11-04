@@ -467,7 +467,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
                 )
             if is_tpu():
-                from sglang_tpu.attention_gdn_pallas import (
+                from sglang_tpu.layers.attention.linear.attention_gdn_pallas import (
                     TpuGDNAttnBackend,
                 )
 
@@ -544,7 +544,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 linear_attn_backend = AscendKDAAttnBackend(runner)
                 hybrid_backend_cls = AscendKDAHybridLinearAttnBackend
             elif is_tpu():
-                from sglang_tpu.attention_kda_pallas import (
+                from sglang_tpu.layers.attention.linear.attention_kda_pallas import (
                     TpuKDAAttnBackend,
                 )
 
@@ -591,14 +591,14 @@ def create_intel_xpu_backend(runner):
 
 @register_attention_backend("pallas_tpu_flash")
 def create_pallas_tpu_flash_backend(runner):
-    from sglang_tpu.attention_pallas import TpuPallasAttnBackend
+    from sglang_tpu.layers.attention.attention_pallas import TpuPallasAttnBackend
 
     return TpuPallasAttnBackend(runner)
 
 
 @register_attention_backend("pallas_tpu_rpa_v3")
 def create_pallas_tpu_rpa_v3_backend(runner):
-    from sglang_tpu.attention_pallas_rpa_v3 import (
+    from sglang_tpu.layers.attention.attention_pallas_rpa_v3 import (
         TpuPallasRpaV3AttnBackend,
     )
 
@@ -607,7 +607,7 @@ def create_pallas_tpu_rpa_v3_backend(runner):
 
 @register_attention_backend("pallas_tpu_rpa_batched")
 def create_pallas_tpu_rpa_batched_backend(runner):
-    from sglang_tpu.attention_pallas_rpa_batched import (
+    from sglang_tpu.layers.attention.attention_pallas_rpa_batched import (
         TpuPallasRpaBatchedAttnBackend,
     )
 
@@ -616,7 +616,7 @@ def create_pallas_tpu_rpa_batched_backend(runner):
 
 @register_attention_backend("pallas_tpu_mla")
 def create_pallas_tpu_mla_backend(runner):
-    from sglang_tpu.attention_pallas_mla import (
+    from sglang_tpu.layers.attention.attention_pallas_mla import (
         TpuPallasMlaAttnBackend,
     )
 

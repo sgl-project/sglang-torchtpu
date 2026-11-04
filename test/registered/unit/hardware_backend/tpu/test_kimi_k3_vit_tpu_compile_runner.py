@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.envs import envs
-from sglang_tpu.graph_runner.kimi_k3_vit_tpu_compile_runner import (
+from sglang_tpu.multimodal.kimi_k3_vit_tpu_compile_runner import (
     KimiK3VitTpuCompileRunner,
     merge_window_order,
     patch_buckets,

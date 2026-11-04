@@ -18,7 +18,7 @@ from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
     ForwardMode,
     PPProxyTensors,
 )
-from sglang_tpu.pp_wave import PPWave  # noqa: E402
+from sglang_tpu.distributed.pp_wave import PPWave  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

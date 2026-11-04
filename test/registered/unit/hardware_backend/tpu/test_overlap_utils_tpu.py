@@ -14,7 +14,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang_tpu import patches
-from sglang_tpu.overlap_utils_tpu import (
+from sglang_tpu.managers.overlap_utils_tpu import (
     flush_direct_handoff_tpu,
     resolve_direct_handoff_tpu,
 )

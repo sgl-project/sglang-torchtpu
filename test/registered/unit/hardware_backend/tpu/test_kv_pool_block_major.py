@@ -16,13 +16,13 @@ import torch
 
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.attention_pallas_rpa_base import _fused_kv_operands
 from sglang_tpu.disaggregation.raiden.common import get_raiden_kv_caches
-from sglang_tpu.kv_pool import (
+from sglang_tpu.layers.attention.attention_pallas_rpa_base import _fused_kv_operands
+from sglang_tpu.mem_cache.kv_pool import (
     TpuBlockMajorMHATokenToKVPool,
     TpuFusedMHATokenToKVPool,
 )
-from sglang_tpu.tpu_platform import _check_block_major_supported
+from sglang_tpu.platforms.tpu_platform import _check_block_major_supported
 
 HEAD_NUM = 1
 HEAD_DIM = 128
@@ -232,7 +232,7 @@ class TestBlockMajorRaidenTransfer(CustomTestCase):
         saved = {name: sys.modules.get(name) for name in stubs}
         sys.modules.update(stubs)
         try:
-            from sglang_tpu.raiden_transfer import RaidenKVTransfer
+            from sglang_tpu.mem_cache.raiden_transfer import RaidenKVTransfer
 
             transfer = RaidenKVTransfer(pool, num_host_pages=8)
         finally:
@@ -366,7 +366,7 @@ class TestBlockMajorStartupCheck(CustomTestCase):
             default_cuda_graph_config,
         )
         from sglang_tpu.envs import envs as tpu_envs
-        from sglang_tpu.tpu_platform import TpuSRTPlatform
+        from sglang_tpu.platforms.tpu_platform import TpuSRTPlatform
 
         args = SimpleNamespace(
             dtype=None,

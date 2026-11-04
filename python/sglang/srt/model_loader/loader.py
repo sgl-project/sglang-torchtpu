@@ -446,7 +446,7 @@ class DefaultModelLoader(BaseModelLoader):
         def init_new(cls, model_config: ModelConfig, model):
             local_expert_range = None
             if _is_tpu:
-                from sglang_tpu.ep_local_expert_reader import (
+                from sglang_tpu.model_loader.ep_local_expert_reader import (
                     tpu_local_routed_expert_range,
                 )
 
@@ -1127,7 +1127,7 @@ class DefaultModelLoader(BaseModelLoader):
                 quant_method.process_weights_after_loading(module)
             _drain_device_transients_after_module_load()
         if target_device.type == "tpu":
-            from sglang_tpu.moe.pallas.fused_moe_decode.fused_moe_decode_op import (
+            from sglang_tpu.layers.moe.pallas.fused_moe_decode.fused_moe_decode_op import (
                 prepare_model_for_fused_moe_decode,
             )
 
