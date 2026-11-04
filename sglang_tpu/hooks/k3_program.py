@@ -104,7 +104,7 @@ k3_program_prefill_wait
   Remove when: that seam exists.
 
 k3_program_dp_allocator / k3_program_dp_prealloc / k3_program_dp_transfer_rows /
-k3_program_dp_admission / k3_program_dp_release
+k3_program_dp_admission / k3_program_dp_release / k3_program_dp_group_cap
   Why: under attention DP2 (SGLANG_TPU_K3_PROGRAM_ATTENTION_DP=2) the decode's
        two DCP16 groups each hold their own requests' pages, while the
        prefill's DCP32 rows reach the decode rank of the same index
@@ -422,6 +422,51 @@ def k3_program_dp_admission(original, queue: Any, *args, **kwargs) -> int:
     return tokens + -(-pages // 2) * page
 
 
+def dp_group_room(running, waiting, group_of, cap: int):
+    """Split ``waiting`` (in order) into the requests a DP2 decode may start
+    now and those held back: at most ``cap`` running requests a group
+    (``group_of(req)``: its group, None: no group), so the compiled batch
+    stays the smallest that holds both halves."""
+    count = [0, 0]
+    for req in running:
+        g = group_of(req)
+        if g is not None:
+            count[g] += 1
+    take, held = [], []
+    for req in waiting:
+        g = group_of(req)
+        if g is None or count[g] < cap:
+            take.append(req)
+            if g is not None:
+                count[g] += 1
+        else:
+            held.append(req)
+    return take, held
+
+
+def k3_program_dp_group_cap(original, scheduler: Any, running_batch: Any, *args, **kwargs):
+    """AROUND SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch: a
+    P/D DP2 decode starts a transferred request only while its group has
+    room (half the running requests), as groups are fixed at prealloc."""
+    from sglang_tpu.k3_programs import sglang_dp_alloc
+
+    allocator = sglang_dp_alloc.active()
+    if allocator is None or not scheduler.waiting_queue:
+        return original(scheduler, running_batch, *args, **kwargs)
+    cap = -(-int(scheduler.max_running_requests) // 2)
+    running = list(getattr(running_batch, "reqs", None) or ())
+    take, held = dp_group_room(
+        running, list(scheduler.waiting_queue), lambda r: allocator.request_group.get(r.rid), cap
+    )
+    if not held:
+        return original(scheduler, running_batch, *args, **kwargs)
+    scheduler.waiting_queue = take
+    try:
+        return original(scheduler, running_batch, *args, **kwargs)
+    finally:
+        scheduler.waiting_queue = held + list(scheduler.waiting_queue)
+
+
 def k3_program_dp_release(result: Any, req: Any, *args, **kwargs) -> None:
     """AFTER mem_cache.common.release_kv_cache."""
     from sglang_tpu.k3_programs import sglang_dp_alloc, sglang_worker
@@ -537,6 +582,11 @@ def hook_specs() -> list[tuple]:
             "sglang.srt.mem_cache.common.release_kv_cache",
             k3_program_dp_release,
             HookType.AFTER,
+        ),
+        (
+            "sglang.srt.disaggregation.decode.SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch",
+            k3_program_dp_group_cap,
+            HookType.AROUND,
         ),
         (
             "sglang.srt.model_executor.model_runner.ModelRunner.init_attention_backends",

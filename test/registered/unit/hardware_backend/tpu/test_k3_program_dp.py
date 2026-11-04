@@ -186,6 +186,21 @@ class TestColocatedDp(CustomTestCase):
         self.assertIn("b", rows)
 
 
+class TestDpGroupCap(CustomTestCase):
+    def test_a_full_group_holds_its_requests_back(self):
+        from types import SimpleNamespace
+
+        from sglang_tpu.hooks.k3_program import dp_group_room
+
+        groups = {"r0": 0, "r1": 0, "r2": 1, "w0": 0, "w1": 1, "w2": 0, "w3": 1, "w4": None}
+        req = {rid: SimpleNamespace(rid=rid) for rid in groups}
+        running = [req[r] for r in ("r0", "r1", "r2")]
+        waiting = [req[r] for r in ("w0", "w1", "w2", "w3", "w4")]
+        take, held = dp_group_room(running, waiting, lambda r: groups[r.rid], cap=2)
+        self.assertEqual([r.rid for r in take], ["w1", "w4"])  # group 0 full; group 1 one more
+        self.assertEqual([r.rid for r in held], ["w0", "w2", "w3"])
+
+
 class TestDpAllocator(CustomTestCase):
     PAGE = 16
 
