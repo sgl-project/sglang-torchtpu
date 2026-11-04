@@ -289,6 +289,13 @@ class K3UnifiedKVPool:
     def get_kv_size_bytes(self) -> int:
         return sum(t.numel() * t.element_size() for t in self.raw_pools())
 
+    layer_transfer_counter = None
+
+    def register_layer_transfer_counter(self, counter) -> None:
+        """The HiCache load counter (sglang_hicache): the program's worker
+        waits on HybridLinearKVPool's, which hands this pool None."""
+        self.layer_transfer_counter = counter
+
     def get_contiguous_buf_infos(self) -> bridge.BufInfos:
         return bridge.kv_buf_infos(self.caches, self.plan)
 

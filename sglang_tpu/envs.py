@@ -168,6 +168,9 @@ class TpuEnvs:
     SGLANG_TPU_K3_PROGRAM_ATTENTION_DP = EnvInt(1)
     # Colocated attention DP2: B rows reserved per KV page (sglang_dp.ColoRows).
     SGLANG_TPU_K3_PROGRAM_DP_ROW_SHARE = EnvFloat(0.5)
+    # K3_PROGRAM host tier (k3_programs/sglang_hicache.py): KDA checkpoints the
+    # host holds beside its KV pages (three host blocks each).
+    SGLANG_TPU_K3_PROGRAM_HICACHE_CHECKPOINTS = EnvInt(512)
 
     # Host padding is unconditional; this routes speculative batches to the
     # experimental spec worker, which keeps their metadata on the host as well.

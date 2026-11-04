@@ -841,6 +841,10 @@ class K3ProgramWorker(BaseSpecWorker):
         )
         clock.mark("guard")
         if prefill:
+            # A prefix reloaded from the host tier (sglang_hicache) lands
+            # before the program reads it; sglang waits in the target
+            # worker's forward, which K3_PROGRAM never runs.
+            self._wait_host_loads(batch)
             state_pool = self.req_to_token_pool.mamba_pool
             # A prefix hit's cached state into the request's slot (sglang's
             # model runner does this before a forward; the program reads it).
@@ -901,6 +905,14 @@ class K3ProgramWorker(BaseSpecWorker):
             speculative_num_draft_tokens=WIDTH,
             speculative_output_stride=WIDTH,
         )
+
+    def _wait_host_loads(self, batch) -> None:
+        """Wait for the host-tier loads ``batch`` consumes (none: no wait)."""
+        counter = getattr(self._target_worker, "hicache_layer_transfer_counter", None)
+        if counter is None:
+            return
+        counter.set_consumer(getattr(batch, "hicache_consumer_index", -1))
+        counter.wait()
 
     @staticmethod
     def _track_checkpoints(batch, state_pool) -> None:

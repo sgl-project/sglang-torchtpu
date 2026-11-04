@@ -150,6 +150,23 @@ else:
         max_mamba_cache_size=PREFILL_CHECKPOINTS,
         max_total_tokens=None,
     )
+    # A host-DRAM tier for the prefix cache (k3_programs/sglang_hicache.py):
+    # K3_PROGRAM_HICACHE_GB of host blocks a rank (8 ranks share a host), with
+    # K3_PROGRAM_HICACHE_CHECKPOINTS KDA checkpoints among them. Off by default.
+    HICACHE_GB = int(os.environ.get("K3_PROGRAM_HICACHE_GB", "0"))
+    if HICACHE_GB > 0:
+        server_args.update(
+            enable_hierarchical_cache=True,
+            hicache_io_backend="raiden",
+            hicache_mem_layout="page_first_fused",
+            hicache_write_policy=os.environ.get(
+                "K3_PROGRAM_HICACHE_WRITE_POLICY", "write_through"
+            ),
+            hicache_size=HICACHE_GB,
+        )
+        CONFIG["runtime_env"]["SGLANG_TPU_K3_PROGRAM_HICACHE_CHECKPOINTS"] = os.environ.get(
+            "K3_PROGRAM_HICACHE_CHECKPOINTS", "512"
+        )
 runtime_env = CONFIG["runtime_env"]
 # The sglang decoder kernels' switches: the program replaces the decoder.
 for key in (

@@ -216,8 +216,11 @@ def size_k3_program_pools(result: None, configurator, kvc, *args, **kwargs) -> N
 
         sglang_dp_debug.install()
     from sglang.srt.runtime_context import get_model
+    from sglang_tpu.k3_programs import sglang_hicache
     from sglang_tpu.k3_programs.sglang_pools import K3UnifiedKVPool
 
+    # The host tier's stack for the unified radix cache built after the pools.
+    sglang_hicache.install()
     configurator._cell_size = K3UnifiedKVPool.bytes_per_token(
         get_model().kv_cache_dtype
     )

@@ -1143,6 +1143,10 @@ class TpuSRTPlatform(SRTPlatform):
         # Host and int8 stores expect stacked GPU-layout states; TPU owns
         # independent kernel-layout tensors per layer.
         for flag in ("enable_hierarchical_cache", "enable_int8_mamba_checkpoint"):
+            if flag == "enable_hierarchical_cache" and _k3_program_selected():
+                # The Kimi-K3 programs' states sit in their unified pools,
+                # which their host tier copies (k3_programs/sglang_hicache.py).
+                continue
             if getattr(view, flag):
                 raise ValueError(
                     f"--{flag.replace('_', '-')} is not supported for TPU GDN prefix caching. "
