@@ -1,5 +1,6 @@
 """CPU checks for checkpoint settings applied by nightly test launchers."""
 
+import ast
 import json
 import os
 import subprocess
@@ -124,6 +125,23 @@ class TestCheckpointPrefetch(unittest.TestCase):
             self.assertEqual(output[0], "8")
             self.assertIn(payload, output)
             self.assertFalse(marker.exists())
+
+    def test_test_utils_loads_prefetch_by_path(self):
+        # Tests run as `python3 test/registered/...` have no repo root on
+        # sys.path, so popen_launch_server must not `import benchmark`; it loads
+        # the file relative to test_utils.py instead.
+        test_utils = (
+            Path(__file__).resolve().parents[3] / "python/sglang/test/test_utils.py"
+        )
+        imported = set()
+        for node in ast.walk(ast.parse(test_utils.read_text())):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                imported.add(node.module.split(".")[0])
+        self.assertNotIn("benchmark", imported)
+        script = test_utils.parents[3] / "benchmark/tpu/ci_checkpoint_prefetch.py"
+        self.assertTrue(script.is_file(), script)
 
 
 if __name__ == "__main__":
