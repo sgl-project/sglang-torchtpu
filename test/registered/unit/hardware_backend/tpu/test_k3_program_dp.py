@@ -193,7 +193,7 @@ class TestSwapOp(CustomTestCase):
                         if k < chunks:
                             pool[rank, row] = [group + 1, k % 256, k // 256, 0, 0, 0, 0, 0]
             jobs = [(*plan.swap_rows(p, l), g) for g, _, p, l in reqs]
-            s, d, g = dp.swap_operands(jobs)
+            ((s, d, g),) = dp.swap_operands(jobs)
             fn = jax.jit(jax.shard_map(dp.swap_body("tp"), mesh=mesh,
                 in_specs=(P(), P(), P(), P("tp")), out_specs=(P("tp"),), check_vma=False))
             (out,) = fn(jnp.asarray(s), jnp.asarray(d), jnp.asarray(g),

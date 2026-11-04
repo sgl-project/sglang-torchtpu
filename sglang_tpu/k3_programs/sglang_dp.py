@@ -137,7 +137,7 @@ def landing_pages_needed(pages: int) -> int:
 
 
 # ------------------------------------------------------------ the swap op
-SWAP_BUCKETS = (16, 64, 256, 1024)  # swap entries a call, padded
+SWAP_BUCKETS = (16, 64, 256)  # swap entries a call, padded (longer swaps run in parts)
 
 
 def swap_bucket(entries: int) -> int:
@@ -149,20 +149,29 @@ def swap_bucket(entries: int) -> int:
 
 def swap_operands(
     jobs: Sequence[tuple[Sequence[int], Sequence[int], int]],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """``(source rows, destination rows, destination group)``, padded to a
-    bucket with entries that write nowhere (group -1), from ``(sources,
-    destinations, group)`` per request (:meth:`DpPages.swap_rows`)."""
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """``(source rows, destination rows, destination group)`` per call, each
+    padded to a bucket with entries that write nowhere (group -1), from
+    ``(sources, destinations, group)`` per request (:meth:`DpPages.swap_rows`);
+    more entries than the largest bucket run in several calls."""
     sources = [s for job in jobs for s in job[0]]
     destinations = [d for job in jobs for d in job[1]]
     groups = [job[2] for job in jobs for _ in job[0]]
-    size = swap_bucket(max(len(sources), 1))
-    pad = size - len(sources)
-    return (
-        np.asarray(sources + [0] * pad, np.int32),
-        np.asarray(destinations + [0] * pad, np.int32),
-        np.asarray(groups + [-1] * pad, np.int32),
-    )
+    largest = SWAP_BUCKETS[-1]
+    calls = []
+    for start in range(0, max(len(sources), 1), largest):
+        part = slice(start, start + largest)
+        src, dst, grp = sources[part], destinations[part], groups[part]
+        size = swap_bucket(max(len(src), 1))
+        pad = size - len(src)
+        calls.append(
+            (
+                np.asarray(src + [0] * pad, np.int32),
+                np.asarray(dst + [0] * pad, np.int32),
+                np.asarray(grp + [-1] * pad, np.int32),
+            )
+        )
+    return calls
 
 
 def swap_body(axis: str = "tp"):
@@ -194,9 +203,10 @@ def swap_body(axis: str = "tp"):
 def make_swapper(program):
     """The swap over a DP2 decode program's pools (the 24 unified pools and
     the DSpark draft's): ``swap(jobs)`` with ``(sources, destinations,
-    group)`` per request, each bucket's op compiled at build. The pools keep
-    their tensors (and the transfer's registered buffers): donated, then
-    adopted in place as the program's own ops do."""
+    group)`` per request. One op a pool and bucket (a pool's rows only:
+    tens of MB transient), compiled at build. The pools keep their tensors
+    (and the transfer's registered buffers): donated, then adopted in place
+    as the program's own ops do."""
     import torch
     from jax.sharding import PartitionSpec as P
 
@@ -209,34 +219,29 @@ def make_swapper(program):
     def pools():
         return list(ops.unified_pools) + list(getattr(draft, "pools", ()) or ())
 
-    count = len(pools())
     built = {}
 
     def op_for(size):
         if size not in built:
             built[size] = register_op(
-                f"pallas::k3_dp_swap{size}x{count}",
+                f"pallas::k3_dp_swap{size}",
                 ops.mesh,
                 swap_body(AXIS),
-                (P(), P(), P()) + (P(AXIS),) * count,
-                (P(AXIS),) * count,
-                donate_argnums=tuple(range(3, 3 + count)),
-                export_key=repr(("k3_dp_swap", size, count)),
+                (P(), P(), P(), P(AXIS)),
+                (P(AXIS),),
+                donate_argnums=(3,),
+                export_key=repr(("k3_dp_swap", size)),
             )
         return built[size]
 
     def swap(jobs) -> None:
-        sources, destinations, groups = swap_operands(jobs)
-        current = pools()
-        fresh = op_for(len(sources))(
-            torch.from_numpy(sources).to("tpu"),
-            torch.from_numpy(destinations).to("tpu"),
-            torch.from_numpy(groups).to("tpu"),
-            *current,
-        )
-        for old, new in zip(current, fresh, strict=True):
-            if new is not old:
-                old.set_(new)
+        for sources, destinations, groups in swap_operands(jobs):
+            op = op_for(len(sources))
+            operands = [torch.from_numpy(a).to("tpu") for a in (sources, destinations, groups)]
+            for pool in pools():
+                (fresh,) = op(*operands, pool)
+                if fresh is not pool:
+                    pool.set_(fresh)
 
     previous = 0
     for size in SWAP_BUCKETS:  # compile and run each bucket once, writing nowhere
