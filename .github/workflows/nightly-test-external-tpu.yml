@@ -1,5 +1,5 @@
 name: Nightly Test (External TPU)
-run-name: Read live ${{ inputs.model }} one-reader prefetch logs
+run-name: Read live ${{ inputs.model }} CI-only prefetch logs
 on:
   workflow_dispatch:
     inputs:
@@ -20,7 +20,7 @@ jobs:
       TARGET_MODEL: ${{ inputs.model }}
       EXTERNAL_NODEPOOL_2X2X2_1: ${{ secrets.EXTERNAL_NODEPOOL_2X2X2_1 }}
       EXTERNAL_NODEPOOL_2X2X2_3: ${{ secrets.EXTERNAL_NODEPOOL_2X2X2_3 }}
-      CANDIDATE_IMAGE: us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu@sha256:531cb2e1e509622cd9d034df2871da71bc83fe0d200af18aa642e5456c10f728
+      CANDIDATE_IMAGE: us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu@sha256:62beddeb9dd4a069ec0ed66d0ee5e16e47999368c78a956a09fa404e11dad8dc
     steps:
       - uses: actions/checkout@v4
         with:
