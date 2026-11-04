@@ -40,7 +40,7 @@ jobs:
                   if pod['status']['phase'] == 'Running'
                   and pod['spec'].get('nodeSelector', {}).get('cloud.google.com/gke-nodepool') == os.environ['EXTERNAL_NODEPOOL_2X2X2_3']
                   and any(c['image'] == os.environ['CANDIDATE_IMAGE'] for c in pod['spec']['containers'])
-                  and pod['metadata']['labels'].get('jobset.sigs.k8s.io/jobset-name', '').startswith('selfhost-3-')]
+                  and pod['metadata']['labels'].get('jobset.sigs.k8s.io/jobset-name', '').startswith('qwen-prefetch-mt-')]
           assert len(pods) == 1, f'Expected one running candidate pod, found {len(pods)}'
           print(pods[0]['metadata']['name'])
           PY
