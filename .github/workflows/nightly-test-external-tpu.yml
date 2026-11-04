@@ -1,129 +1,47 @@
-# Nightly TPU e2e on the external cluster. Builds the image ONCE (same _tpu-build as the
-# in-project nightly; the external cluster's nodes pull it from the Project A Artifact
-# Registry), then discovers the `external-nightly-*` work and runs it as ONE matrix job PER
-# SLICE. The external cluster has no Kueue, so discovery buckets launch groups across each
-# shape's slices: slices run in PARALLEL (one job each), and the groups on a slice run serially
-# inside that job. Weights are served from the Project A GCS bucket over gcsfuse.
-# See .github/tpu-ci/external/README.md.
-#
 name: Nightly Test (External TPU)
-
-on:
-  schedule:
-    - cron: "30 10 * * *"   # 10:30 UTC daily; staggered after the in-project nightly (00:30 PT)
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: "Git ref to test"
-        required: false
-        default: main
-      test_filter:
-        description: "Space-separated substrings of test file paths; runs only matching files"
-        required: false
-        default: ""
-        type: string
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
-
+run-name: Checkpoint prefetch with parallel loading
+'on':
+  workflow_dispatch: null
+permissions:
+  contents: read
+  id-token: write
 jobs:
-  build:
-    uses: ./.github/workflows/_tpu-build.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-    permissions:
-      contents: read
-      id-token: write
-
-  # Discover the external-nightly work, bucketed into one entry PER SLICE (test-owned launch
-  # specs + round-robin over the shape's slices).
-  discover:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      slices: ${{ steps.d.outputs.slices }}
-      pairs: ${{ steps.d.outputs.pairs }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || 'main' }}
-      - id: d
-        env:
-          TEST_FILTER: ${{ inputs.test_filter }}
-        run: |
-          set -euo pipefail
-          python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
-          slices="$(python3 .github/tpu-ci/external/render_external_jobset.py --list-groups)"
-          if [ -n "$TEST_FILTER" ]; then
-            slices="$(jq -c --arg f "$TEST_FILTER" \
-                        '($f | split(" ") | map(select(. != ""))) as $fs
-                         | [.[] | .groups |= map(
-                             .files |= (split(" ") | map(select(. as $p | any($fs[]; . as $s | $p | contains($s)))) | join(" "))
-                             | select(.files != ""))
-                                | select(.groups != [])]' <<< "$slices")"
-            if [ "$slices" = "[]" ]; then
-              echo "::error::test_filter matched no external tests"
-              exit 1
-            fi
-          fi
-          # Slice-pair rows (P/D whose roles each fill a slice) run after the single-slice
-          # rows: the cluster has no gang scheduling, so a pair overlapping a slice job
-          # gets half-placed and its pods time out waiting for peers left Pending.
-          pairs="$(jq -c '[.[] | select(.nodepool_var_decode)]' <<< "$slices")"
-          slices="$(jq -c '[.[] | select(.nodepool_var_decode | not)]' <<< "$slices")"
-          echo "slices=$slices" >> "$GITHUB_OUTPUT"
-          echo "pairs=$pairs" >> "$GITHUB_OUTPUT"
-          echo "discovered external-nightly slices: $slices"
-          echo "discovered external-nightly slice pairs: $pairs"
-          # `|| true`: under set -e a bare `[ ... ] &&` as the step's last command
-          # fails the step the moment tests ARE discovered (the scaffold-era bug
-          # never fired because slices was always []).
-          [ "$slices$pairs" = "[][]" ] && echo "No external-nightly-* tests registered yet; run will be skipped." || true
-
-  # One matrix job PER SLICE (parallel across slices). Each runs its bucketed groups serially.
-  run:
-    needs: [build, discover]
-    if: needs.discover.outputs.slices != '[]'
-    strategy:
-      fail-fast: false
-      matrix:
-        slice: ${{ fromJSON(needs.discover.outputs.slices) }}
-    name: ${{ matrix.slice.name }}
+  gpt-prefetch-multithread:
     uses: ./.github/workflows/_external-tpu-test.yml
     with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
-      suite: ${{ matrix.slice.suite }}
-      slice_name: ${{ matrix.slice.name }}
-      nodepool_var: ${{ matrix.slice.nodepool_var }}
-      nodepool_var_decode: ${{ matrix.slice.nodepool_var_decode || '' }}
-      groups_json: ${{ toJSON(matrix.slice.groups) }}
+      ref: 4cfdbfae398f2fe056403f5b24e8fdfc9f1ea019
+      image: us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu@sha256:4cba0731aab850af74de3caf5b583044f5b8a74a758e1be9906c29796b8a097f
+      suite: external-nightly-1host
+      slice_name: gpt-prefetch-multithread-trial
+      nodepool_var: EXTERNAL_NODEPOOL_2X2X2_1
+      groups_json: '[{"suite":"external-nightly-1host","mode":"exec","name":"gpt-prefetch-multithread-trial","run_name":"gpt-prefetch-mt","files":"test/registered/tpu/e2e/test_tpu_gpt_oss_120b_singlehost_prefix_cache_kv_offload_spec.py","timeout_per_file":3600,"cmd":"if
+        [ \"$RANK\" = \"0\" ]; then unset TPU_WORKER_ID TPU_WORKER_HOSTNAMES TPU_PROCESS_ADDRESSES
+        TPU_TOPOLOGY TPU_TOPOLOGY_WRAP TPU_TOPOLOGY_ALT TPU_HOST_BOUNDS TPU_ACCELERATOR_TYPE;
+        for v in $(compgen -e | grep \"^MEGASCALE\"); do unset \"$v\"; done; timeout
+        3600 python3 -c ''import json,runpy; m=runpy.run_path(''\"''\"''test/registered/tpu/e2e/test_tpu_gpt_oss_120b_singlehost_prefix_cache_kv_offload_spec.py''\"''\"'');
+        m[\"LAUNCH_ENV\"][\"EXTRA_ARGS\"] += \" --model-loader-extra-config \" + json.dumps({\"enable_multithread_load\":True},separators=(\",\",\":\"));
+        m[\"model_config_main\"](m[\"MODEL_CONFIG\"],base_url=m[\"BASE_URL\"])'';
+        else true; fi"}]'
     secrets: inherit
     permissions:
       contents: read
       id-token: write
-
-  # Slice-pair rows, once every single-slice row is done (see the discover step).
-  run-pairs:
-    needs: [build, discover, run]
-    if: ${{ !cancelled() && needs.discover.outputs.pairs != '[]' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        slice: ${{ fromJSON(needs.discover.outputs.pairs) }}
-    name: ${{ matrix.slice.name }}
+  qwen-prefetch-multithread:
     uses: ./.github/workflows/_external-tpu-test.yml
     with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
-      suite: ${{ matrix.slice.suite }}
-      slice_name: ${{ matrix.slice.name }}
-      nodepool_var: ${{ matrix.slice.nodepool_var }}
-      nodepool_var_decode: ${{ matrix.slice.nodepool_var_decode }}
-      groups_json: ${{ toJSON(matrix.slice.groups) }}
+      ref: 4cfdbfae398f2fe056403f5b24e8fdfc9f1ea019
+      image: us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu@sha256:4cba0731aab850af74de3caf5b583044f5b8a74a758e1be9906c29796b8a097f
+      suite: external-nightly-1host
+      slice_name: qwen-prefetch-multithread-trial
+      nodepool_var: EXTERNAL_NODEPOOL_2X2X2_3
+      groups_json: '[{"suite":"external-nightly-1host","mode":"exec","name":"qwen-prefetch-multithread-trial","run_name":"qwen-prefetch-mt","files":"test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_singlehost_prefix_cache_kv_offload_gsm8k.py","timeout_per_file":3600,"cmd":"if
+        [ \"$RANK\" = \"0\" ]; then unset TPU_WORKER_ID TPU_WORKER_HOSTNAMES TPU_PROCESS_ADDRESSES
+        TPU_TOPOLOGY TPU_TOPOLOGY_WRAP TPU_TOPOLOGY_ALT TPU_HOST_BOUNDS TPU_ACCELERATOR_TYPE;
+        for v in $(compgen -e | grep \"^MEGASCALE\"); do unset \"$v\"; done; timeout
+        3600 python3 -c ''import json,runpy; m=runpy.run_path(''\"''\"''test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_singlehost_prefix_cache_kv_offload_gsm8k.py''\"''\"'');
+        m[\"LAUNCH_ENV\"][\"EXTRA_ARGS\"] += \" --model-loader-extra-config \" + json.dumps({\"enable_multithread_load\":True},separators=(\",\",\":\"));
+        m[\"model_config_main\"](m[\"MODEL_CONFIG\"],base_url=m[\"BASE_URL\"])'';
+        else true; fi"}]'
     secrets: inherit
     permissions:
       contents: read
