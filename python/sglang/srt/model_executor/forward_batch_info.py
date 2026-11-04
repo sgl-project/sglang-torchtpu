@@ -661,6 +661,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     defer_logits_to_eager: bool = False
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
+    # Optional platform-set tensor naming the rows whose logits this forward
+    # reads, for models that can skip work on the other rows. The platform that
+    # sets it owns its layout (e.g. sglang_tpu/compilation/logit_rows.py); core
+    # never reads it. A field, so tracers that flatten ForwardBatch see it as an
+    # input. None: not provided.
+    logit_rows: Optional[torch.Tensor] = None
 
     # Gate for reusing the first MTP draft step's indexer topk across steps;
     # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
