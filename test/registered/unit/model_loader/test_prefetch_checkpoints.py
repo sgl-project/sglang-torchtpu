@@ -248,6 +248,26 @@ class TestPrefetchCheckpoints(CustomTestCase):
 
         self.assertEqual(sorted(loaded_paths), sorted(paths[1::3]))
 
+    @patch("torch.distributed.is_initialized", return_value=True)
+    def test_prefetch_covers_all_shards_with_a_physical_device_offset(self, _):
+        paths = [f"model-{i:05d}.safetensors" for i in range(12)]
+        loaded_paths = []
+        with (
+            patch("threading.Thread", _InlineThread),
+            patch("concurrent.futures.ThreadPoolExecutor", _InlineExecutor),
+            patch("concurrent.futures.wait", side_effect=_wait_all),
+            patch(
+                "sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file",
+                side_effect=lambda path, cancel_event: loaded_paths.append(path),
+            ),
+        ):
+            for device in range(4, 8):
+                group = SimpleNamespace(local_rank=device, local_size=4)
+                with get_parallel().override(world_group=group):
+                    _prefetch_all_checkpoints(paths, num_threads=2).wait()
+
+        self.assertEqual(sorted(loaded_paths), paths)
+
     @patch("torch.distributed.is_initialized", return_value=False)
     def test_prefetch_handle_cancels_before_scheduling_next_shard(self, _):
         paths = [f"model-{i:05d}.safetensors" for i in range(3)]

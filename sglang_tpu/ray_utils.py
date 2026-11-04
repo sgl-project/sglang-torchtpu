@@ -290,6 +290,14 @@ def tpu_actor_runtime_env(server_args) -> dict:
     there is nothing to inject, so actors fall back to their own pod env.
     """
     env_vars = _forwarded_driver_env()
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if tpu_envs.SGLANG_TPU_WEIGHT_LOADER_PREFETCH.get():
+        from sglang.srt.arg_groups.overrides import resolving_view
+
+        cfg = resolving_view(server_args)
+        # Ray has resolved --nnodes 0 by the time scheduler actors are created.
+        env_vars["LOCAL_SIZE"] = str(cfg.tp_size * cfg.pp_size // cfg.nnodes)
     # Computed slice env overrides any forwarded/inherited copy. Inject an empty
     # string too (single-host on a multi-host slice), so the actor overrides the
     # slice-wide value inherited from `ray start` rather than falling back to it --

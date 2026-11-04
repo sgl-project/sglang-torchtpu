@@ -405,6 +405,62 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
 
         return resolution_result(args, field)
 
+    def test_checkpoint_prefetch_is_opt_in(self):
+        args = self._args(
+            weight_loader_prefetch_checkpoints=False,
+            weight_loader_disable_mmap=True,
+            weight_loader_drop_cache_after_load=True,
+        )
+        with tpu_envs.SGLANG_TPU_WEIGHT_LOADER_PREFETCH.override(False):
+            self._apply(args)
+        self.assertFalse(self._resolved(args, "weight_loader_prefetch_checkpoints"))
+        self.assertTrue(self._resolved(args, "weight_loader_disable_mmap"))
+        self.assertTrue(self._resolved(args, "weight_loader_drop_cache_after_load"))
+
+    def test_checkpoint_prefetch_uses_every_local_tp_and_pp_rank(self):
+        for tp, pp, nodes, local_size in (
+            (1, 1, 1, "1"),
+            (8, 1, 1, "8"),
+            (16, 1, 2, "8"),
+            (1, 8, 1, "8"),
+            (2, 8, 2, "8"),
+        ):
+            with (
+                self.subTest(tp=tp, pp=pp, nodes=nodes),
+                tpu_envs.SGLANG_TPU_WEIGHT_LOADER_PREFETCH.override(True),
+                patch.dict(os.environ, {"LOCAL_SIZE": "99"}),
+            ):
+                args = self._args(
+                    tp_size=tp,
+                    pp_size=pp,
+                    nnodes=nodes,
+                    ep_size=1,
+                    pp_async_batch_depth=1,
+                    enable_torch_compile=True,
+                    weight_loader_prefetch_checkpoints=False,
+                    weight_loader_disable_mmap=True,
+                    weight_loader_drop_cache_after_load=True,
+                )
+                self._apply(args)
+                self.assertTrue(
+                    self._resolved(args, "weight_loader_prefetch_checkpoints")
+                )
+                self.assertFalse(self._resolved(args, "weight_loader_disable_mmap"))
+                self.assertFalse(
+                    self._resolved(args, "weight_loader_drop_cache_after_load")
+                )
+                self.assertEqual(os.environ["LOCAL_SIZE"], local_size)
+
+    def test_checkpoint_prefetch_defers_ray_node_count_discovery(self):
+        args = self._args(use_ray=True, tp_size=16, nnodes=0)
+        with (
+            tpu_envs.SGLANG_TPU_WEIGHT_LOADER_PREFETCH.override(True),
+            patch.dict(os.environ, {"LOCAL_SIZE": "99"}),
+        ):
+            self._apply(args)
+            self.assertTrue(self._resolved(args, "weight_loader_prefetch_checkpoints"))
+            self.assertEqual(os.environ["LOCAL_SIZE"], "99")
+
     def test_rejects_optimistic_prefill_on_raiden_pd(self):
         """Optimistic prefill on raiden parks KV for requests the decode has
         no pages for, and deadlocked the PD pools under burst load."""

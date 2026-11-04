@@ -1013,8 +1013,9 @@ def _prefetch_all_checkpoints(
     # across nodes, but page cache is not shared across nodes.
     if torch.distributed.is_initialized():
         world_group = get_parallel().world_group
-        local_rank = world_group.local_rank
         local_world_size = world_group.local_size or get_parallel().launch_world_size
+        # Co-located engines can use physical device IDs with a base offset.
+        local_rank = world_group.local_rank % local_world_size
     else:
         local_rank = 0
         local_world_size = 1

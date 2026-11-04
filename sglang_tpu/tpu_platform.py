@@ -1021,6 +1021,7 @@ class TpuSRTPlatform(SRTPlatform):
             Phase,
             with_phase,
         )
+        from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.hooks.dsv4 import register_tpu_dsv4_resolution_hooks
         from sglang_tpu.kimi_k3 import check_static_fp8_spec_batch, static_fp8_parts
         from sglang_tpu.patches import _prepare_tpu_env
@@ -1031,6 +1032,18 @@ class TpuSRTPlatform(SRTPlatform):
         # weights have loaded (its binder runs post-load).
         parts = static_fp8_parts()
         cfg = resolving_view(server_args)
+        if tpu_envs.SGLANG_TPU_WEIGHT_LOADER_PREFETCH.get():
+            declare_resolution(
+                server_args,
+                "tpu.apply_server_args_defaults",
+                weight_loader_prefetch_checkpoints=True,
+                weight_loader_disable_mmap=False,
+                weight_loader_drop_cache_after_load=False,
+            )
+            # Count PP as well as TP; page cache is shared only within a host.
+            # Ray can defer node-count discovery until after argument resolution.
+            if cfg.nnodes > 0:
+                os.environ["LOCAL_SIZE"] = str(cfg.tp_size * cfg.pp_size // cfg.nnodes)
         if "latent_up" in parts:
             check_static_fp8_spec_batch(
                 parts,

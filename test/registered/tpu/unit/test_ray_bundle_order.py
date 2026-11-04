@@ -228,6 +228,16 @@ class TestTpuActorRuntimeEnv(CustomTestCase):
             {"TORCH_TPU_SLICEBUILDER_ADDRESSES": "localhost:1"},
         )
 
+    @mock.patch.dict(os.environ, {"SGLANG_TPU_WEIGHT_LOADER_PREFETCH": "1"}, clear=True)
+    def test_checkpoint_prefetch_uses_discovered_node_count(self):
+        from sglang.srt.arg_groups.overrides import declare_resolution
+
+        args = _server_args(tp_size=16, pp_size=1, nnodes=0)
+        declare_resolution(args, "ray node discovery", nnodes=2)
+        env = tpu_actor_runtime_env(args)["runtime_env"]["env_vars"]
+        self.assertEqual(env["LOCAL_SIZE"], "8")
+        self.assertEqual(env["SGLANG_TPU_WEIGHT_LOADER_PREFETCH"], "1")
+
 
 class TestForwardedDriverEnv(CustomTestCase):
     """Ray drops the launcher's runtime env on scheduler actors (they inherit only

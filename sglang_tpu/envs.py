@@ -26,6 +26,8 @@ EnvField._allow_set_name = True
 
 
 class TpuEnvs:
+    # Share nightly checkpoint reads through each host's page cache.
+    SGLANG_TPU_WEIGHT_LOADER_PREFETCH = EnvBool(False)
     # Opt-in, request-tagged benchmark admission (benchmark_batch_gate.py).
     # Zero preserves ordinary scheduling, including continuous batching.
     SGLANG_TPU_BENCHMARK_BATCH_SIZE = EnvInt(0)
