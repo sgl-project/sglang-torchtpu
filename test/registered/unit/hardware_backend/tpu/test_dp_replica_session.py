@@ -2,6 +2,7 @@
 """CPU checks for replica isolation and failed-startup rank restoration."""
 
 import os
+import sys
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -290,3 +291,7 @@ def test_worker_prepares_replicas_at_every_tp_size(monkeypatch, tp_size):
     assert session.timeout_seconds == 17
     assert "TPU_VISIBLE_DEVICES" not in os.environ
     assert "SGLANG_TPU_PD_COLOCATED" not in os.environ
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
