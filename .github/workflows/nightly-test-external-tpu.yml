@@ -1,130 +1,63 @@
-# Nightly TPU e2e on the external cluster. Builds the image ONCE (same _tpu-build as the
-# in-project nightly; the external cluster's nodes pull it from the Project A Artifact
-# Registry), then discovers the `external-nightly-*` work and runs it as ONE matrix job PER
-# SLICE. The external cluster has no Kueue, so discovery buckets launch groups across each
-# shape's slices: slices run in PARALLEL (one job each), and the groups on a slice run serially
-# inside that job. Weights are served from the Project A GCS bucket over gcsfuse.
-# See .github/tpu-ci/external/README.md.
-#
 name: Nightly Test (External TPU)
-
+run-name: Read live Qwen prefetch logs
 on:
-  schedule:
-    - cron: "30 10 * * *"   # 10:30 UTC daily; staggered after the in-project nightly (00:30 PT)
   workflow_dispatch:
-    inputs:
-      ref:
-        description: "Git ref to test"
-        required: false
-        default: main
-      test_filter:
-        description: "Space-separated substrings of test file paths; runs only matching files"
-        required: false
-        default: ""
-        type: string
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
-
+permissions:
+  contents: read
+  id-token: write
 jobs:
-  build:
-    uses: ./.github/workflows/_tpu-build.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-    permissions:
-      contents: read
-      id-token: write
-
-  # Discover the external-nightly work, bucketed into one entry PER SLICE (test-owned launch
-  # specs + round-robin over the shape's slices).
-  discover:
-    needs: build
+  read-live-log:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      slices: ${{ steps.d.outputs.slices }}
-      pairs: ${{ steps.d.outputs.pairs }}
+    timeout-minutes: 10
+    env:
+      EXTERNAL_CLUSTER: ${{ secrets.EXTERNAL_CLUSTER }}
+      EXTERNAL_PROJECT: ${{ secrets.EXTERNAL_PROJECT }}
+      EXTERNAL_NODEPOOL_2X2X2_3: ${{ secrets.EXTERNAL_NODEPOOL_2X2X2_3 }}
+      CANDIDATE_IMAGE: us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu@sha256:4cba0731aab850af74de3caf5b583044f5b8a74a758e1be9906c29796b8a097f
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || 'main' }}
-      - id: d
-        env:
-          TEST_FILTER: ${{ inputs.test_filter }}
+          ref: 4cfdbfae398f2fe056403f5b24e8fdfc9f1ea019
+          persist-credentials: false
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/180183988733/locations/global/workloadIdentityPools/github/providers/github-oidc-v2
+          service_account: tpu-ci@sglang-torchtpu.iam.gserviceaccount.com
+      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.EXTERNAL_CLUSTER }}
+          location: us-central1
+          project_id: ${{ env.EXTERNAL_PROJECT }}
+          use_dns_based_endpoint: true
+      - name: Read only the running candidate pod log
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
-          slices="$(python3 .github/tpu-ci/external/render_external_jobset.py --list-groups)"
-          if [ -n "$TEST_FILTER" ]; then
-            slices="$(jq -c --arg f "$TEST_FILTER" \
-                        '($f | split(" ") | map(select(. != ""))) as $fs
-                         | [.[] | .groups |= map(
-                             .files |= (split(" ") | map(select(. as $p | any($fs[]; . as $s | $p | contains($s)))) | join(" "))
-                             | select(.files != ""))
-                                | select(.groups != [])]' <<< "$slices")"
-            if [ "$slices" = "[]" ]; then
-              echo "::error::test_filter matched no external tests"
-              exit 1
-            fi
-          fi
-          # Slice-pair rows (P/D whose roles each fill a slice) run after the single-slice
-          # rows: the cluster has no gang scheduling, so a pair overlapping a slice job
-          # gets half-placed and its pods time out waiting for peers left Pending.
-          pairs="$(jq -c '[.[] | select(.nodepool_var_decode)]' <<< "$slices")"
-          slices="$(jq -c '[.[] | select(.nodepool_var_decode | not)]' <<< "$slices")"
-          echo "slices=$slices" >> "$GITHUB_OUTPUT"
-          echo "pairs=$pairs" >> "$GITHUB_OUTPUT"
-          echo "discovered external-nightly slices: $slices"
-          echo "discovered external-nightly slice pairs: $pairs"
-          # `|| true`: under set -e a bare `[ ... ] &&` as the step's last command
-          # fails the step the moment tests ARE discovered (the scaffold-era bug
-          # never fired because slices was always []).
-          [ "$slices$pairs" = "[][]" ] && echo "No external-nightly-* tests registered yet; run will be skipped." || true
-
-  # One matrix job PER SLICE (parallel across slices). Each runs its bucketed groups serially.
-  run:
-    needs: [build, discover]
-    if: needs.discover.outputs.slices != '[]'
-    strategy:
-      fail-fast: false
-      matrix:
-        slice: ${{ fromJSON(needs.discover.outputs.slices) }}
-    name: ${{ matrix.slice.name }}
-    uses: ./.github/workflows/_external-tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
-      suite: ${{ matrix.slice.suite }}
-      slice_name: ${{ matrix.slice.name }}
-      nodepool_var: ${{ matrix.slice.nodepool_var }}
-      nodepool_var_decode: ${{ matrix.slice.nodepool_var_decode || '' }}
-      groups_json: ${{ toJSON(matrix.slice.groups) }}
-    secrets: inherit
-    permissions:
-      contents: read
-      id-token: write
-
-  # Slice-pair rows, once every single-slice row is done (see the discover step).
-  run-pairs:
-    needs: [build, discover, run]
-    if: ${{ !cancelled() && needs.discover.outputs.pairs != '[]' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        slice: ${{ fromJSON(needs.discover.outputs.pairs) }}
-    name: ${{ matrix.slice.name }}
-    uses: ./.github/workflows/_external-tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
-      suite: ${{ matrix.slice.suite }}
-      slice_name: ${{ matrix.slice.name }}
-      nodepool_var: ${{ matrix.slice.nodepool_var }}
-      nodepool_var_decode: ${{ matrix.slice.nodepool_var_decode }}
-      groups_json: ${{ toJSON(matrix.slice.groups) }}
-    secrets: inherit
-    permissions:
-      contents: read
-      id-token: write
+          kubectl -n default get pods -l app=external-tpu-ci -o json > /tmp/pods.json
+          python3 - <<'PY' > /tmp/candidate-pod
+          import json, os
+          pods = [pod for pod in json.load(open('/tmp/pods.json'))['items']
+                  if pod['status']['phase'] == 'Running'
+                  and pod['spec'].get('nodeSelector', {}).get('cloud.google.com/gke-nodepool') == os.environ['EXTERNAL_NODEPOOL_2X2X2_3']
+                  and any(c['image'] == os.environ['CANDIDATE_IMAGE'] for c in pod['spec']['containers'])
+                  and pod['metadata']['labels'].get('jobset.sigs.k8s.io/jobset-name', '').startswith('selfhost-3-')]
+          assert len(pods) == 1, f'Expected one running candidate pod, found {len(pods)}'
+          print(pods[0]['metadata']['name'])
+          PY
+          kubectl -n default logs -c test "$(cat /tmp/candidate-pod)" --timestamps --tail=10000 > /tmp/qwen-live-raw.log
+          python3 -u .github/tpu-ci/external/sanitize_logs.py < /tmp/qwen-live-raw.log > qwen-live.log
+          python3 - <<'PY'
+          from pathlib import Path
+          lines = Path('qwen-live.log').read_text(errors='replace').splitlines()
+          selected = [line for line in lines if len(line) < 1000 and any(word in line for word in ('Load weight', 'Loading safetensors', 'TIMINGS', 'Accuracy [', 'Traceback', 'ERROR', 'prefetch'))]
+          print('\n'.join(selected[-80:]))
+          print('Last log lines:')
+          print('\n'.join(line[:1000] for line in lines[-15:]))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qwen-prefetch-live-log
+          path: qwen-live.log
+          if-no-files-found: ignore
+          retention-days: 1
