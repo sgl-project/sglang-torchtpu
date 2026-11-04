@@ -16,6 +16,7 @@ engine (tp_size == 1 and pp_size == 1).
 
 import contextlib
 import hashlib
+import sys
 import weakref
 
 import pytest
@@ -662,3 +663,7 @@ def test_multi_process_engine_encodes_every_device_miss(monkeypatch):
             _step(enc, [([_image(h, 0, 99)], 0, 128)])
     assert mm_schedule_tpu._HOST_TIER is None
     assert enc.encoded == [0xA, 0xB, 0xA]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
