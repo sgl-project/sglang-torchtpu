@@ -44,6 +44,17 @@ jobs:
           assert len(pods) == 1, f'Expected one running candidate pod, found {len(pods)}'
           print(pods[0]['metadata']['name'])
           PY
+          kubectl -n default get pod "$(cat /tmp/candidate-pod)" -o json > /tmp/candidate-spec.json
+          python3 - <<'PYCPU' > /tmp/resources-raw.log
+          import json
+          pod = json.load(open('/tmp/candidate-spec.json'))
+          for c in pod['spec'].get('initContainers', []) + pod['spec']['containers']:
+              print(c['name'], json.dumps(c.get('resources', {})))
+          PYCPU
+          kubectl -n default logs -c gke-gcsfuse-sidecar "$(cat /tmp/candidate-pod)" --tail=300 > /tmp/gcsfuse-raw.log 2>&1 || true
+          kubectl -n default exec -c gke-gcsfuse-sidecar "$(cat /tmp/candidate-pod)" -- /bin/sh -c 'cat /sys/fs/cgroup/cpu.stat; cat /sys/fs/cgroup/memory.current; cat /sys/fs/cgroup/memory.max' >> /tmp/resources-raw.log 2>&1 || true
+          python3 -u .github/tpu-ci/external/sanitize_logs.py < /tmp/resources-raw.log > resources.log
+          python3 -u .github/tpu-ci/external/sanitize_logs.py < /tmp/gcsfuse-raw.log > gcsfuse-live.log
           kubectl -n default logs -c test "$(cat /tmp/candidate-pod)" --timestamps --tail=10000 > /tmp/qwen-live-raw.log
           python3 -u .github/tpu-ci/external/sanitize_logs.py < /tmp/qwen-live-raw.log > qwen-live.log
           python3 - <<'PY'
@@ -58,6 +69,9 @@ jobs:
         if: always()
         with:
           name: qwen-prefetch-live-log
-          path: qwen-live.log
+          path: |
+            qwen-live.log
+            resources.log
+            gcsfuse-live.log
           if-no-files-found: ignore
           retention-days: 1
