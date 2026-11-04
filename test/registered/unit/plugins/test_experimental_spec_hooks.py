@@ -14,7 +14,11 @@ import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardMode,
+    LogitsOutputMode,
+)
 from sglang.srt.plugins.hook_registry import HookRegistry, _propagate_patch
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -253,7 +257,8 @@ class TestExperimentalSpecHooks(CustomTestCase):
         )
         metadata = SimpleNamespace()
         accepted = object()
-        batch, rows, addressing = object(), object(), object()
+        batch = SimpleNamespace(sampling_info=None)
+        rows, addressing = object(), object()
         with (
             patch.object(worker, "make_verify_input", return_value=metadata) as make,
             patch.object(
@@ -379,6 +384,61 @@ class TestExperimentalSpecHooks(CustomTestCase):
         with patch.object(repetition_penalty, "apply_scaling_penalties", rebound):
             info._apply_pre_grammar_logits_transforms(torch.ones(2, 4))
         rebound.assert_called_once()
+
+    def test_verify_applies_penalties_on_full_vocab_before_accept(self):
+        """A penalized batch verifies on full-vocabulary logits even when the accept
+        could read only the target's top-k, since penalties can reorder it. A live
+        penalizer (no overlap snapshot) is snapshotted first."""
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker.num_verify_rows = 2
+        worker._simulate_acc_len = 0
+        worker._verify_top_k_width = 64
+        worker._rank_check_interval = 0
+        draft = DraftResult(
+            torch.tensor([[1]]), None, torch.tensor([1]), torch.tensor([0, 1])
+        )
+        bucket = SimpleNamespace(
+            state=SimpleNamespace(seq_lens=torch.tensor([4])),
+            live_mask=torch.tensor([True]),
+            temperatures=None,
+            top_ks=None,
+        )
+        for live_penalizer in (False, True):
+            with self.subTest(live_penalizer=live_penalizer):
+                orchestrator = (
+                    SimpleNamespace(is_required=True) if live_penalizer else None
+                )
+                sampling_info = SimpleNamespace(
+                    penalizer_orchestrator=orchestrator,
+                    update_penalties=MagicMock(),
+                    device_penalties=lambda rows: (None, torch.full((rows, 4), 2.0)),
+                )
+                logits = SimpleNamespace(
+                    next_token_logits=torch.full((2, 4), 4.0),
+                    has_next_token_global_top_k=False,
+                )
+                with (
+                    patch.object(worker, "make_verify_input"),
+                    patch.object(
+                        worker, "_forward_target_verify", return_value=logits
+                    ) as forward,
+                    patch.object(base_spec_worker, "accept_greedy_step") as accept,
+                ):
+                    worker.verify(
+                        SimpleNamespace(sampling_info=sampling_info),
+                        bucket,
+                        object(),
+                        draft,
+                        object(),
+                    )
+                self.assertEqual(
+                    forward.call_args.kwargs["logits_output_mode"],
+                    LogitsOutputMode.FULL_VOCAB,
+                )
+                torch.testing.assert_close(
+                    accept.call_args.args[0], torch.full((2, 4), 2.0)
+                )
+                self.assertEqual(sampling_info.update_penalties.called, live_penalizer)
 
     def setUp(self):
         super().setUp()
@@ -1582,21 +1642,28 @@ class TestExperimentalSpecHooks(CustomTestCase):
         worker._bsearch_filtering = True
         check(batch=batch(top_k=1 << 30, top_p=0.9), pp_proxy_tensors=None)
 
-        penalized = batch(top_k=1 << 30, top_p=0.9)
-        penalized.sampling_info.acc_additive_penalties = torch.full((2, 32), -0.5)
-        with self.assertRaisesRegex(NotImplementedError, "penalties"):
-            check(batch=penalized, pp_proxy_tensors=None)
-        worker.supports_additive_penalties = True
-        check(batch=penalized, pp_proxy_tensors=None)
-        for name, value in (
-            ("acc_scaling_penalties", torch.ones(2, 32)),
-            ("logit_bias", torch.zeros(2, 32)),
+        # Verify applies every penalty form (a generation config's
+        # repetition_penalty used to kill every scheduler); logit_bias is refused.
+        plain = batch(top_k=1 << 30, top_p=0.9)
+        penalties = (
+            ("acc_additive_penalties", torch.full((2, 32), -0.5)),
+            ("acc_scaling_penalties", torch.full((2, 32), 1.05)),
             ("penalizer_orchestrator", SimpleNamespace(is_required=True)),
-        ):
-            with self.subTest(unsupported=name):
-                with patch.object(penalized.sampling_info, name, value):
+        )
+        for name, value in penalties:
+            with self.subTest(admitted=name):
+                with patch.object(plain.sampling_info, name, value):
+                    check(batch=plain, pp_proxy_tensors=None)
+        with patch.object(plain.sampling_info, "logit_bias", torch.zeros(2, 32)):
+            with self.assertRaisesRegex(NotImplementedError, "logit_bias"):
+                check(batch=plain, pp_proxy_tensors=None)
+        # A subclass whose verify skips the snapshots opts out and is refused.
+        worker.supports_penalties = False
+        for name, value in penalties:
+            with self.subTest(refused=name):
+                with patch.object(plain.sampling_info, name, value):
                     with self.assertRaisesRegex(NotImplementedError, "penalties"):
-                        check(batch=penalized, pp_proxy_tensors=None)
+                        check(batch=plain, pp_proxy_tensors=None)
 
     def test_block_draft_input_relays_through_the_future_map(self):
         """RelayPayload.from_draft_input reads the EAGLE seed slots of every draft
