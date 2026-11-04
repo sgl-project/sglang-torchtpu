@@ -174,6 +174,11 @@ class TpuEnvs:
     SGLANG_TPU_VISION_FLASH_BLOCK_Q = EnvInt(0)
     SGLANG_TPU_VISION_FLASH_BLOCK_Q_MAX_SEQ = EnvInt(4096)
 
+    # Largest decode batch (tokens) that `--moe-runner-backend pallas_tpu_fused_decode`
+    # runs with the fused MoE decode kernel (`sglang_tpu/moe/pallas/fused_moe_decode`);
+    # larger batches use gmm_v2.
+    SGLANG_TPU_FUSED_MOE_DECODE_MAX_TOKENS = EnvInt(256)
+
     # Raiden PD disaggregation
     # Base control port. Each local rank reserves consecutive control/data
     # ports for full KV, SWA KV, and recurrent state.
