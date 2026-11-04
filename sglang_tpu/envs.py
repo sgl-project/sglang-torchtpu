@@ -346,6 +346,10 @@ class TpuEnvs:
     # (sampling/padded_logits.py). Same per-row ops, so the same tokens. Opt-in:
     # speculative decoding expands the penalties per request.
     SGLANG_TPU_PADDED_LOGITS_SAMPLING = EnvBool(False)
+    # Shared compilation (--use-spmd-compile): a trace-cost profile JSON that
+    # assigns each shared graph to the least-loaded rank (shared_compile_cost.py).
+    # Empty: round-robin owners.
+    SGLANG_TPU_SHARED_COMPILE_COST_PROFILE = EnvStr("")
 
     @classmethod
     def names(cls) -> list[str]:

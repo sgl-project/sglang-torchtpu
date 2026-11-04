@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import importlib.metadata
+import math
 import os
 import time
 from collections.abc import Callable, Iterator
@@ -22,6 +23,7 @@ from torch_tpu._internal.distributed import device_mesh
 
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.graph_identity import canonical, digest
+from sglang_tpu.compilation.shared_compile_cost import estimator_from_env
 
 logger = get_logger(__name__)
 T = TypeVar("T")
@@ -104,8 +106,10 @@ def _prepare_executable(
 class SPMDCompiler:
     """Coordinate shared compilation or graph verification for a warmup queue.
 
-    Sharing assigns each named specialization to a rank in round-robin order.
-    Only that rank traces and compiles it; ``finish`` distributes the executable
+    Sharing assigns each named specialization to one rank: the rank with the
+    least estimated trace work so far under a cost profile
+    (``shared_compile_cost``), else round-robin. Only that rank traces and
+    compiles it; ``finish`` distributes the executable
     and binds it to every rank's local inputs and callbacks. All ranks must
     enqueue the same keys in the same order.
 
@@ -127,6 +131,11 @@ class SPMDCompiler:
         self.submissions: dict[str, Submission] = {}
         self.mlirs: dict[str, str] = {}
         self.argument_layouts: dict[str, list[list[int]]] = {}
+        # Trace-cost estimate per graph, or None for round-robin owners.
+        self._estimate = estimator_from_env()
+        self._estimated_load = [0.0] * self.size
+        self.trace_seconds: dict[str, float] = {}
+        """Owner-only trace time of each graph this rank traced."""
         self.directory = (
             Path(os.environ["VERIFY_SPMD_SAFE_DUMP_DIR"]) if verify_spmd_safe else None
         )
@@ -197,7 +206,19 @@ class SPMDCompiler:
             return
         if graph in self.submissions:
             raise ValueError(f"Duplicate shared TPU graph name: {graph}")
-        self.submissions[graph] = Submission(owner=len(self.submissions) % self.size)
+        if self._estimate is None:
+            owner = len(self.submissions) % self.size
+        else:
+            cost = float(self._estimate(graph))
+            if not math.isfinite(cost) or cost < 0:
+                raise ValueError(f"Invalid shared TPU graph cost {cost!r}: {graph}")
+            owner = min(range(self.size), key=self._estimated_load.__getitem__)
+            self._estimated_load[owner] += cost
+        self.submissions[graph] = Submission(owner=owner)
+
+    def record_trace(self, graph: str, seconds: float) -> None:
+        """Record how long the owner took to trace and submit ``graph``."""
+        self.trace_seconds[graph] = seconds
 
     def compile(
         self,
@@ -247,10 +268,16 @@ class SPMDCompiler:
         assignments = [(graph, item.owner) for graph, item in self.submissions.items()]
         if any(peer != assignments for peer in self.gather(assignments)):
             raise ValueError("Shared TPU graph order or owners differ across ranks")
+        traces = self.gather(self.trace_seconds)
         start = time.perf_counter()
         if self.rank == 0:
             for graph, owner in assignments:
-                logger.info("[shared_compile] owner=%d graph=%s", owner, graph)
+                logger.info(
+                    "[shared_compile] owner=%d trace=%.3fs graph=%s",
+                    owner,
+                    traces[owner].get(graph, math.nan),
+                    graph,
+                )
         self._distribute()
         logger.info(
             "[shared_compile] compile/distribute wait=%.3fs",
@@ -401,3 +428,5 @@ class SPMDCompiler:
         self.submissions.clear()
         self.mlirs.clear()
         self.argument_layouts.clear()
+        self.trace_seconds.clear()
+        self._estimated_load = [0.0] * self.size

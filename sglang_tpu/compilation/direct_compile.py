@@ -415,6 +415,7 @@ class CompiledFunction:
             )
             if spmd_compiler is not None:
                 spmd_compiler.enqueue(graph)
+            trace_start = time.perf_counter()
             artifact = self._compile(
                 args,
                 kwargs,
@@ -422,6 +423,12 @@ class CompiledFunction:
                 spmd_compiler=spmd_compiler,
                 graph=graph,
             )
+            if (
+                spmd_compiler is not None
+                and not spmd_compiler.verify_spmd_safe
+                and spmd_compiler.submissions[graph].owner == spmd_compiler.rank
+            ):
+                spmd_compiler.record_trace(graph, time.perf_counter() - trace_start)
             self.cache[key] = artifact
         return artifact
 
