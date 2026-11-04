@@ -361,6 +361,32 @@ class TestDpHooks(CustomTestCase):
         kv = hooks.k3_program_dp_prealloc(original, self.queue, req)
         return req, kv
 
+    def test_a_prefix_hit_stays_in_its_group(self):
+        import torch
+        from types import SimpleNamespace
+
+        from sglang_tpu.hooks import k3_program as hooks
+
+        first, kv = self._prealloc("a", 2 * self.PAGE)
+        prefix_group = self.alloc.group_of_page(int(kv[0]) // self.PAGE)
+        self.alloc.assign("other", 1 - prefix_group)  # balance would pick the prefix's group anyway
+        self.alloc.assign("other2", 1 - prefix_group)  # now it would not
+        req = SimpleNamespace(rid="b")
+        prefix = kv[: self.PAGE]
+
+        def original(queue, req, *args, **kwargs):
+            return self.alloc.alloc_extend(
+                prefix_lens=torch.tensor([self.PAGE]), prefix_lens_cpu=torch.tensor([self.PAGE]),
+                seq_lens=torch.tensor([3 * self.PAGE]), seq_lens_cpu=torch.tensor([3 * self.PAGE]),
+                last_loc=torch.tensor([int(prefix[-1])]), extend_num_tokens=2 * self.PAGE,
+            )
+
+        out = hooks.k3_program_dp_prealloc(original, self.queue, req, prefix, self.PAGE, self.PAGE)
+        self.assertEqual(self.alloc.request_group["b"], prefix_group)
+        self.assertEqual({self.alloc.group_of_page(int(x) // self.PAGE) for x in out.tolist()}, {prefix_group})
+        self.assertEqual(len(req._k3_dp_landing), 1)  # the two suffix pages only
+        self.assertEqual({self.alloc.group_of_page(int(p)) for p in req._k3_dp_landing}, {1 - prefix_group})
+
     def test_prealloc_transfer_rows_and_release(self):
         import numpy as np
         from types import SimpleNamespace

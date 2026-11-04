@@ -110,11 +110,9 @@ server_args.update(
 if ROLE == "decode":
     # The decode keeps finished turns' KV pages, and a session's next turn
     # transfers only the pages past that prefix (KV only: the transfer delivers
-    # each request's KDA state; sglang_decode_cache). Not under attention DP2
-    # (a prefix hit would have to be in the request's group).
-    DECODE_PREFIX_CACHE = (
-        os.environ.get("K3_PROGRAM_DECODE_PREFIX_CACHE", "1") == "1" and ATTENTION_DP == 1
-    )
+    # each request's KDA state; sglang_decode_cache). Under attention DP2 a hit
+    # keeps the request in the group holding its pages.
+    DECODE_PREFIX_CACHE = os.environ.get("K3_PROGRAM_DECODE_PREFIX_CACHE", "1") == "1"
     CONFIG["runtime_env"]["SGLANG_TPU_K3_PROGRAM_ENABLE_DECODE_PREFIX_CACHE"] = (
         "1" if DECODE_PREFIX_CACHE else "0"
     )

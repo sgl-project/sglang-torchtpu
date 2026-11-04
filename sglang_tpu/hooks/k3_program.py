@@ -377,7 +377,14 @@ def k3_program_dp_prealloc(original, queue: Any, req: Any, *args, **kwargs):
         return original(queue, req, *args, **kwargs)
     from sglang_tpu.k3_programs import sglang_dp
 
-    group = allocator.assign(req.rid)
+    # A decode prefix hit (sglang_decode_cache) keeps the request in the
+    # group holding its cached pages; only the suffix is transferred.
+    prefix_indices = args[0] if args else kwargs.get("prefix_indices")
+    prefix_len = int((args[1] if len(args) > 1 else kwargs.get("prefix_len")) or 0)
+    group = None
+    if prefix_len > 0 and prefix_indices is not None and len(prefix_indices):
+        group = allocator.group_of_page(int(prefix_indices[0]) // allocator.page_size)
+    group = allocator.assign(req.rid, group)
     allocator.pending_group = group
     try:
         kv_loc = original(queue, req, *args, **kwargs)
