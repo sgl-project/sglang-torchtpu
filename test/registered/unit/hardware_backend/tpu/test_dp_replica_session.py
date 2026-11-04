@@ -2,7 +2,9 @@
 """CPU checks for replica isolation and failed-startup rank restoration."""
 
 import os
+import subprocess
 import sys
+import textwrap
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -26,6 +28,60 @@ def reset_session(monkeypatch):
     monkeypatch.setattr(dp_replicas, "_active_session", None)
     monkeypatch.setenv("SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "0")
     monkeypatch.delenv("TPU_VISIBLE_DEVICES", raising=False)
+
+
+@pytest.mark.parametrize("first_module", ["sglang_tpu.envs", "sglang.srt.platforms"])
+def test_platform_discovery_without_portpicker(first_module):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                """
+                import importlib
+                import importlib.metadata
+                import sys
+                from types import SimpleNamespace
+                from unittest.mock import patch
+
+                import torch
+
+                sys.modules["portpicker"] = None
+                entry_points = importlib.metadata.entry_points
+                plugin = SimpleNamespace(
+                    name="replica_test",
+                    load=lambda: lambda: "sglang_tpu.tpu_platform:TpuSRTPlatform",
+                )
+
+                def discover(*args, **kwargs):
+                    if kwargs.get("group") == "sglang.srt.platforms":
+                        return [plugin]
+                    return entry_points(*args, **kwargs)
+
+                with patch("importlib.metadata.entry_points", discover):
+                    importlib.import_module(sys.argv[1])
+                    from sglang.srt.platforms import current_platform
+                    from sglang_tpu.dp_replicas import get_free_port
+                    from sglang_tpu.envs import envs
+
+                    assert current_platform.is_tpu()
+                    assert get_free_port() > 0
+                    assert envs.SGLANG_TPU_DP_SESSION_PORT.get() == 12349
+                """
+            ),
+            first_module,
+        ],
+        env={
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join(sys.path),
+            "SGLANG_PLATFORM": "replica_test",
+            "SGLANG_TPU_DP_SESSION_PORT": "12349",
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_tp4_ep4_groups_never_cross_engines():

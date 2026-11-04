@@ -17,16 +17,22 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 
-from sglang.srt.utils.network import get_free_port
-from sglang_tpu.envs import envs
-from sglang_tpu.patches import (
-    _resolve_single_host_tpu_topology,
-    compute_single_host_tpu_env,
-)
+from sglang.utils import LazyImport
 
 logger = logging.getLogger(__name__)
 _BARRIER_FLAG = "--xla_jf_emit_global_barrier_at_start"
 _active_session: ReplicaSession | None = None
+
+# Platform discovery can reach this module while envs or srt.utils is importing.
+# patches also imports envs, so resolve these helpers only during worker setup.
+envs = LazyImport("sglang_tpu.envs", "envs")
+get_free_port = LazyImport("sglang.srt.utils.network", "get_free_port")
+_resolve_single_host_tpu_topology = LazyImport(
+    "sglang_tpu.patches", "_resolve_single_host_tpu_topology"
+)
+compute_single_host_tpu_env = LazyImport(
+    "sglang_tpu.patches", "compute_single_host_tpu_env"
+)
 
 
 def get_replica_session() -> ReplicaSession | None:
