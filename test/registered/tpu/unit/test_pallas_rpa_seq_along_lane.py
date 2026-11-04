@@ -289,6 +289,133 @@ class TestPrefillBlockSizes(CustomTestCase):
         self.assertEqual(tp2_blocks.bq_sz, 512)
         self.assertEqual(tp2_blocks.bkv_sz, 512)
 
+    def test_128_head_pp8_shrinks_bq_and_grows_bkv(self):
+        """Muse Spark PP8 (128q/16kv, d=64) overflows bq_sz=256 and bq_sz=128
+        with f32 carries; prefill shrinks bq_sz to 64 while preserving triple
+        buffering and grows full-attention bkv_sz to 512 (keeping SWA at 256)."""
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        for kv_layout in (
+            configs.KVLayout.SEQ_ALONG_LANE,
+            configs.KVLayout.HEAD_ALONG_SUBLANE,
+        ):
+            for dtype_kv in (jnp.float8_e4m3fn, jnp.bfloat16):
+                with tpu_info_for_cpu_export():
+                    full_model = configs.ModelConfigs(
+                        num_q_heads=128,
+                        num_kv_heads=16,
+                        head_dim=64,
+                        mask_value=float("-inf"),
+                    )
+                    swa_model = configs.ModelConfigs(
+                        num_q_heads=128,
+                        num_kv_heads=16,
+                        head_dim=64,
+                        mask_value=float("-inf"),
+                        sliding_window=2048,
+                    )
+                    serve = configs.ServingConfigs(
+                        num_seqs=8,
+                        num_page_indices=8 * 256,
+                        total_q_tokens=1024,
+                        dtype_q=jnp.bfloat16,
+                        dtype_kv=dtype_kv,
+                        dtype_out=jnp.bfloat16,
+                        page_size=256,
+                        kv_layout=kv_layout,
+                    )
+                    _, full_prefill = wrapper.calculate_block_sizes(
+                        full_model, serve, 67108864
+                    )
+                    _, swa_prefill = wrapper.calculate_block_sizes(
+                        swa_model, serve, 67108864
+                    )
+                    rpa_cfg = configs.RpaConfigs(
+                        model=full_model,
+                        serve=serve,
+                        block=full_prefill,
+                        mode=configs.RpaCase.MIXED,
+                        vmem_limit_bytes=67108864,
+                    )
+                    self.assertGreaterEqual(
+                        rpa_cfg.max_schedule_size_multiplier * rpa_cfg.max_steps_ub,
+                        rpa_cfg.static_max_steps,
+                    )
+                self.assertEqual(
+                    (
+                        full_prefill.bq_sz,
+                        full_prefill.bq_c_sz,
+                        full_prefill.bkv_sz,
+                        full_prefill.batch_size,
+                        full_prefill.n_buffer,
+                    ),
+                    (64, 16, 512, 1, 3),
+                )
+                self.assertEqual(
+                    (swa_prefill.bq_sz, swa_prefill.bkv_sz, swa_prefill.n_buffer),
+                    (64, 256, 3),
+                )
+
+    def test_flash_attention_carries_remain_float32_at_long_context(self):
+        """With bf16 carries, l_prev == 4096.0 + 1.0 rounds back to 4096.0;
+        f32 carries preserve incremental row sums across 64K+ prefix tiles."""
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs, flash_attention
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        with tpu_info_for_cpu_export():
+            model = configs.ModelConfigs(
+                num_q_heads=8,
+                num_kv_heads=1,
+                head_dim=64,
+                mask_value=float("-inf"),
+            )
+            serve = configs.ServingConfigs(
+                num_seqs=1,
+                num_page_indices=256,
+                total_q_tokens=16,
+                dtype_q=jnp.bfloat16,
+                dtype_kv=jnp.bfloat16,
+                dtype_out=jnp.bfloat16,
+                page_size=256,
+                kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+            )
+            block = configs.BlockSizes(
+                bq_sz=16, bq_c_sz=16, bkv_sz=256, batch_size=1, n_buffer=3
+            )
+            cfgs = configs.RpaConfigs(
+                model=model,
+                serve=serve,
+                block=block,
+                mode=configs.RpaCase.MIXED,
+                vmem_limit_bytes=67108864,
+            )
+            q = jnp.zeros((1, 1, 128, 64), dtype=jnp.bfloat16)
+            k = jnp.zeros((1, 1, 64, 256), dtype=jnp.bfloat16)
+            m_prev = jnp.zeros((1, 128, 128), dtype=jnp.float32)
+            l_prev = jnp.full((1, 128, 128), 65536.0, dtype=jnp.float32)
+            is_last_k = jnp.zeros((1, 1), dtype=jnp.int32)
+            p, _, m_out, l_out, _ = flash_attention.flash_attention_qk_softmax(
+                jnp.int32(0),
+                q,
+                k,
+                m_prev,
+                l_prev,
+                is_last_k,
+                processed_q_len=[jnp.int32(65536)],
+                processed_kv_len=[jnp.int32(0)],
+                cfgs=cfgs,
+                bq_start=0,
+            )
+            self.assertEqual(p.dtype, jnp.bfloat16)
+            self.assertEqual(m_out.dtype, jnp.float32)
+            self.assertEqual(l_out.dtype, jnp.float32)
+            self.assertTrue(bool(jnp.all(l_out == 65536.0 + 256.0)))
+
     def test_k_block_grows_by_at_most_one_q_block(self):
         """Wider bkv_sz / bq_sz ratios are unmeasured, so 32q/2kv stops at 512
         even though VMEM would fit a wider k block."""
