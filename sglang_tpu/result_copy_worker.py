@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import torch
 
-if TYPE_CHECKING:
-    from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 
 
 class TpuAsyncCopyEvent:
@@ -42,6 +43,19 @@ class TpuAsyncCopyEvent:
         return self.event.query()
 
 
+def _draft_tail(result: GenerationBatchResult) -> Optional[torch.Tensor]:
+    """Tail: a small tensor produced after the step's last KV write; copying it
+    to host makes copy_done cover those writes, so the KV free fence can free pages."""
+    draft_input = result.next_draft_input
+    if isinstance(draft_input, HostPaddedDraftInput):
+        # The experimental worker's commit also writes KV after verify;
+        # idle steps write no freeable KV and carry none.
+        return draft_input.kv_fence_tail
+    if isinstance(draft_input, EagleDraftInput):
+        return draft_input.topk_index
+    return None
+
+
 class TPUAsyncCopyWorker:
     """Keep TPU buffer-materialization waits off the scheduler thread.
 
@@ -71,7 +85,7 @@ class TPUAsyncCopyWorker:
         Consumers must call result.copy_done.synchronize() before reading the results.
         """
         event = result.copy_done
-        tail = self._draft_tail(result) if self.copy_draft_tail else None
+        tail = _draft_tail(result) if self.copy_draft_tail else None
         if tail is not None and tail._base is not None:
             # A view of a pool the next step donates: clone it here, on the scheduler's
             # stream ahead of that step, so the copy thread never reads a donated buffer.
@@ -84,21 +98,6 @@ class TPUAsyncCopyWorker:
     def close(self) -> None:
         """Drain copy submissions and stop the worker; transfers may still be pending."""
         self.executor.shutdown(wait=True)
-
-    @staticmethod
-    def _draft_tail(result: GenerationBatchResult) -> Optional[torch.Tensor]:
-        """The draft-side tensor whose copy makes copy_done cover the step's KV writes."""
-        from sglang.srt.speculative.eagle_info import EagleDraftInput
-        from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
-
-        draft_input = result.next_draft_input
-        if isinstance(draft_input, HostPaddedDraftInput):
-            # The experimental worker's commit also writes KV after verify;
-            # idle steps write no freeable KV and carry none.
-            return draft_input.kv_fence_tail
-        if isinstance(draft_input, EagleDraftInput):
-            return draft_input.topk_index
-        return None
 
     @torch.inference_mode()
     def _copy(
