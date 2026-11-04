@@ -24,8 +24,8 @@ if not ModelRegistry.is_arch_supported(Inkling2ForConditionalGeneration.__name__
 
 logger = logging.getLogger(__name__)
 
-# Native patches per image the encoder can hold: the largest row bucket minus the CLS row.
-MAX_IMAGE_PATCHES = ROW_BUCKETS[-1] - 1
+# 40px patches per image the encoder can hold: each is 2x2 native ViT rows, plus one CLS row.
+MAX_IMAGE_PATCHES = (ROW_BUCKETS[-1] - 1) // 4
 
 
 def fit_image_size(width: int, height: int, patch: int, max_patches: int) -> tuple[int, int]:
