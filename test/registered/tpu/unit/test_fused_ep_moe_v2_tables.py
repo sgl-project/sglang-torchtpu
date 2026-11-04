@@ -68,8 +68,8 @@ def _cpu_backend():
         yield
 
 
-# One decode-sized and one prefill-sized geometry, both at the 397B expert
-# layout the serving path uses (512 experts over 8 shards, top-10).
+# One decode-sized and one prefill-sized geometry, both at the 512-expert,
+# top-10 layout of the 397B model vLLM-TorchTPU serves (8 shards).
 GEOMETRIES = [
     pytest.param(8, 64, 64, 10, id="decode_t64_ep8_g64"),
     pytest.param(8, 512, 64, 10, id="prefill_t512_ep8_g64"),

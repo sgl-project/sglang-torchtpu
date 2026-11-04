@@ -75,7 +75,7 @@ def _require_eight_devices():
     pytest IMPORTS the module -- during collection, before markers deselect
     anything -- and `jax.device_count()` builds the PJRT client to answer.
     libtpu is process-exclusive, so a client built in the pytest parent locks
-    every child out: `tests/conftest.py` puts vLLM workers in SPAWNED
+    every child out: tests that start an engine run its workers in SPAWNED
     processes, and they all die with "pjrt client not initialized". Merely
     collecting this file was enough to take down every engine-starting test in
     the same pytest run, whether or not any test here was selected.
@@ -91,8 +91,9 @@ def _require_eight_devices():
         )
 
 
-# The expert-parallel width, and the tile height the serving adapter passes
-# the kernel as its capacity (moe_fused_ep._TILE_M upstream).
+# The expert-parallel width, and the tile height a serving caller passes the
+# kernel as its capacity (vLLM-TorchTPU's moe_fused_ep._TILE_M; the SGLang
+# DeepSeek-V4.1 caller also passes 128).
 EP = 8
 CAPACITY = 128
 
@@ -645,8 +646,8 @@ def test_padded_tokens_on_pallas_combine_and_all_padded_warmup(
         np.zeros_like(masked[~valid_mask]),
     )
 
-    # All-padded batch (as in vLLM `_dummy_run` warmup): every row on every
-    # shard is non-finite.
+    # All-padded batch (as in a warmup or idle-rank dummy forward): every row
+    # on every shard is non-finite.
     gating_all_nan = jax.device_put(np.full_like(gating_host, np.nan), token_sharding)
     all_padded_out = np.asarray(
         fused_ep_moe_v2(x, w1, w2, w1_scale, w2_scale, gating_all_nan, **common)
@@ -817,12 +818,13 @@ def test_any_mesh_axis_name_works():
 
     Upstream reads this shard's index with ``lax.axis_index(kernel.AXIS)``,
     with AXIS a module constant, so a mesh named anything else traced the whole
-    kernel and then died on "unbound axis name: d". vllm-torchtpu passes the
+    kernel and then died on "unbound axis name: d". This port passes the
     index in as an i32 operand instead -- it has to, because ``lax.axis_index``
     lowers to ``partition-id`` and XLA rejects that when torch_tpu recompiles
-    the exported module. The layer's own collectives take their axis from the
-    mesh it is handed, so nothing is left that hardcodes a name. Held here so
-    the freedom is stated, and so a revert to axis_index fails loudly.
+    the module exported by ``sglang_tpu.pallas_jax_op``. The layer's own
+    collectives take their axis from the mesh it is handed, so nothing is
+    left that hardcodes a name. Held here so the freedom is stated, and so a
+    revert to axis_index fails loudly.
     """
     mesh = Mesh(np.asarray(jax.devices()[:EP]), axis_names=("ep",))
     w1, w2, w1_scale, w2_scale = _make_weights(

@@ -165,8 +165,8 @@ LADDER_ARGS = (TILE_M, ROWS_ALLOC, 8, 8)
 def test_the_height_ladder():
     """The built-in ladder splits the tile into 128-row rungs.
 
-    The upstream override env var is not ported, so only its unset case is
-    kept here.
+    vLLM-TorchTPU's MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE is not ported, so
+    only its unset case is kept here.
     """
     rungs = kernel.tile_height_rungs(*LADDER_ARGS)
 
