@@ -136,11 +136,16 @@
 /test/registered/unit/hardware_backend/tpu/ @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD @benliangw @brianseung-google
 /benchmark/tpu/                         @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD @benliangw @brianseung-google
 
+# TPU attention backends (non-Pallas files included). Kept above the kernel
+# lists so their narrower owner lists still win on last match.
+/sglang_tpu/attention/                  @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD @benliangw @brianseung-google @lk-chen
+/sglang_tpu/attention*.py               @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD @benliangw @brianseung-google @lk-chen
+
 # TPU kernels (Pallas attention / MoE / quantized matmul / KV write)
-/sglang_tpu/attention/pallas                             @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD @benliangw
+/sglang_tpu/attention/pallas                             @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD @benliangw @lk-chen
 /sglang_tpu/moe/pallas                                   @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD @benliangw
 /sglang_tpu/kernels                        @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD @benliangw
-/sglang_tpu/attention_*pallas*.py          @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD @benliangw
+/sglang_tpu/attention_*pallas*.py          @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD @benliangw @lk-chen
 /sglang_tpu/pallas_*.py                    @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD @benliangw
 /sglang_tpu/*_moe*.py                      @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD @benliangw
 /sglang_tpu/fp8_linear.py                  @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD @benliangw
