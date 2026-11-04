@@ -11,8 +11,8 @@ Remove when: the configurator queries pool storage sizes and shifted mHC uses Mh
 
 
 def cache_bytes(result, configurator):
-    if not configurator._is_tpu_dsv4:
-        return result
+    # The plugin's DSV4 budget hook already owns this method on TPU; V4 configs
+    # have no C1/C2 owner layers, so the sum below adds nothing for them.
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DSV41_INDEX_PAGE_SIZE
 
     # Match PackedFP8IndexPool: feature-major E4M3 plus one FP32 scale,

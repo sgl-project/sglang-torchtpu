@@ -156,9 +156,7 @@ def test_pool_factory_uses_fp8_even_for_core_force_fp4_selector():
 @pytest.mark.parametrize("storage,per_record", [(64, 652), (128, 648)])
 def test_plugin_budget_matches_physical_packed_pages(storage, per_record):
     budget = definition("sglang_tpu/hooks/dsv41.py", "cache_bytes", {})
-    config = SimpleNamespace(
-        _is_tpu_dsv4=True, attn_head_dim=512, stage_owner_layers={1: [20], 2: [2]}
-    )
+    config = SimpleNamespace(attn_head_dim=512, stage_owner_layers={1: [20], 2: [2]})
     module = SimpleNamespace(DSV41_INDEX_PAGE_SIZE=storage)
     with patch.dict(
         sys.modules, {"sglang.srt.mem_cache.deepseek_v4_memory_pool": module}
@@ -168,7 +166,7 @@ def test_plugin_budget_matches_physical_packed_pages(storage, per_record):
         assert budget(0, config) == per_record
         config.stage_owner_layers = {2: [2]}
         assert budget(0, config) == per_record / 2
-        config._is_tpu_dsv4 = False
+        config.stage_owner_layers = {4: [1], 128: [3]}
         assert budget(100, config) == 100
 
 
