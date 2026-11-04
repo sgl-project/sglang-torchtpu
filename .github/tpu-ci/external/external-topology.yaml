@@ -21,7 +21,7 @@ weights:
   # gcsfuse mount tuned for safetensors weight loading. cache-file-for-range-read turns the
   # loader's many small seeky reads into one whole-file sequential download into a bounded,
   # node-local file cache; every subsequent read hits local disk. See README.
-  mount_options: "implicit-dirs,file-cache:max-size-mb:102400,file-cache:cache-file-for-range-read:true"
+  mount_options: "implicit-dirs,file-cache:max-size-mb:102400,file-cache:cache-file-for-range-read:true,file-cache:exclude-regex:.*[.]safetensors$"
   ephemeral_storage_limit: 120Gi
   # Loaders mmap the checkpoint (page cache, reclaimable). --weight-loader-disable-mmap copied
   # every shard into anonymous RSS and OOM-killed 480B loads on the host.
