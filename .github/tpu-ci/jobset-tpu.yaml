@@ -168,6 +168,14 @@ ${WEIGHTS_VOLUME}
 
                       if [ "$NNODES" -le 1 ]; then
                         # Single-host: each test self-launches its own server.
+                        # Tier-3 compile cache on the shared bucket so servers reuse
+                        # executables across test files and runs; entries are content-keyed,
+                        # the per-runtime directory only lets stale versions expire.
+                        rt=$(python3 -c 'from importlib.metadata import version as v; print("torch_tpu-%s_libtpu-%s" % (v("torch_tpu"), v("libtpu")))')
+                        export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="/compile-cache/torch_tpu_tier3/$rt"
+                        export TORCH_TPU_TIER3_ROOT="$TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"
+                        export SGLANG_CI_KEEP_TIER3_COMPILE_CACHE=1
+                        mkdir -p "$TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"
                         exec python3 test/run_suite.py --hw tpu --suite ${SUITE} ${NIGHTLY_FLAG} ${PARTITION_FLAGS} ${TEST_FILE_FLAG} ${CHIP_WORKERS_FLAG} --timeout-per-file ${TIMEOUT_PER_FILE}
                       fi
 

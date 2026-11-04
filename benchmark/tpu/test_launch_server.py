@@ -149,6 +149,19 @@ class TestRuntimeEnvironment(unittest.TestCase):
         _, env = resolve_server(self.config(), {})
         self.assertNotIn(sentinel, env)
 
+    def test_cache_off_drops_inherited_tier3_root(self):
+        # TPU CI exports a shared tier-3 root to every server; a recipe that
+        # turns the cache off must not keep writing to it.
+        tier3 = "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"
+        _, env = resolve_server(
+            self.config(), {"ENABLE_COMPILE_CACHE": "0", tier3: "/compile-cache/t3"}
+        )
+        self.assertNotIn(tier3, env)
+        _, env = resolve_server(
+            self.config(**{tier3: "/explicit"}), {"ENABLE_COMPILE_CACHE": "0"}
+        )
+        self.assertEqual(env[tier3], "/explicit")
+
     def test_migrated_recipes_include_shell_runtime_defaults(self):
         for recipe in (
             "gpt_oss_120b/singlehost_spec.py",

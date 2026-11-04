@@ -391,6 +391,9 @@ class Envs:
     # ===================================================================
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
+    # Keep TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT between test files instead of
+    # wiping it; set by TPU CI when that root is the shared bucket-backed cache.
+    SGLANG_CI_KEEP_TIER3_COMPILE_CACHE = EnvBool(False)
     # Set to true by the check-changes CI job when a PR touches no Rust workspace
     # inputs; default false so local and scheduled runs never skip the cargo tests.
     SGLANG_SKIP_RUST_TESTS = EnvBool(False)
