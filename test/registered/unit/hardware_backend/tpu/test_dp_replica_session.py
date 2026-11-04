@@ -270,7 +270,10 @@ def test_bad_session_topology_is_rejected_before_device_work(monkeypatch, tp_siz
 
 
 @pytest.mark.parametrize("tp_size", [1, 4])
-def test_worker_prepares_replicas_at_every_tp_size(monkeypatch, tp_size):
+@pytest.mark.parametrize("disaggregation_mode", ["null", "prefill", "decode"])
+def test_worker_prepares_replicas_at_every_tp_size(
+    monkeypatch, tp_size, disaggregation_mode
+):
     cfg = SimpleNamespace(
         dp_size=8 // tp_size,
         tp_size=tp_size,
@@ -286,7 +289,7 @@ def test_worker_prepares_replicas_at_every_tp_size(monkeypatch, tp_size):
         moe_dp_size=1,
         shared_experts_tp_size=None,
         speculative_algorithm=None,
-        disaggregation_mode="null",
+        disaggregation_mode=disaggregation_mode,
         dist_timeout=17,
     )
     monkeypatch.delenv("SGLANG_PLATFORM", raising=False)

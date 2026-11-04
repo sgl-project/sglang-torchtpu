@@ -81,9 +81,6 @@ def validate_dp_replicas(cfg) -> None:
         "no speculative decoding with TP>1": (
             cfg.tp_size == 1 or cfg.speculative_algorithm is None
         ),
-        "unified serving with TP>1": (
-            cfg.tp_size == 1 or cfg.disaggregation_mode == "null"
-        ),
         "TP1 on the single-host test platform": (
             os.environ.get("SGLANG_PLATFORM") != "tpu_single_host" or cfg.tp_size == 1
         ),
