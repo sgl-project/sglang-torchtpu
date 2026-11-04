@@ -26,6 +26,22 @@ if TYPE_CHECKING:
 __all__ = ["SRTPlatform", "PlatformEnum"]
 
 
+class WeightUpdateReceiver:
+    """Receives online weight updates over a platform transport instead of a torch.distributed broadcast."""
+
+    def receive(
+        self,
+        names: list[str],
+        dtypes: list[str | torch.dtype],
+        shapes: list[list[int]],
+        device: torch.device | str,
+    ) -> list[tuple[str, torch.Tensor]]:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        pass
+
+
 class SRTPlatform(DeviceMixin):
     """
     Base class for SRT hardware platform backends.
@@ -89,6 +105,22 @@ class SRTPlatform(DeviceMixin):
         """Return the full device-graph backend class for this platform."""
         return None
 
+    def get_weight_update_handlers(self) -> dict[str, Callable[..., Any]]:
+        """Weight transports this platform serves through /plugin_weight_update, by name.
+
+        A handler is the receive half of a weight update, like
+        ``receive_weights_from_distributed``: ``handler(context=PluginWeightUpdateContext,
+        payload=dict)`` runs on every TP rank inside a begin/end_weight_update session and
+        returns the ``(name, tensor)`` pairs it received. The core loads them into the
+        selected runners exactly as /update_weights_from_distributed does. A handler that
+        writes parameters itself (through ``context.runners``) returns ``[]``, so
+        end_weight_update runs post_load_weights, as after peer (p2p) writes. An exception
+        on any rank fails the request on all ranks, after the ranks that succeeded have
+        loaded their share, so the caller redoes the bucket or retires the engine; the
+        transport owns its timeouts.
+        """
+        return {}
+
     def get_mha_kv_pool_cls(self) -> type:
         """Return the MHA KV pool class for this platform."""
         raise NotImplementedError
@@ -132,6 +164,12 @@ class SRTPlatform(DeviceMixin):
         from sglang.srt.mem_cache.memory_pool import MambaPool
 
         return MambaPool
+
+    def create_weight_update_receiver(
+        self, backend: str, *, tp_rank: int
+    ) -> Optional[WeightUpdateReceiver]:
+        """A receiver for weight-update groups of this ``backend``; None means a torch.distributed group."""
+        return None
 
     def get_mla_kv_pool_cls(self) -> type:
         """Return the MLA KV pool class for this platform."""
@@ -254,6 +292,10 @@ class SRTPlatform(DeviceMixin):
         """Whether decode context parallelism widens every KV allocator (SWA
         included) by attn_dcp_size and shards every layer's K/V heads across
         attn_tp_size // attn_dcp_size, not only the full-attention paged pool."""
+        return False
+
+    def dcp_replicates_q_heads(self) -> bool:
+        """Whether ``--dcp-replicate-q-proj`` applies to GQA/MHA attention."""
         return False
 
     # TODO(yinlin09): needs an upstream seam issue; carry it as a sglang_tpu/hooks/

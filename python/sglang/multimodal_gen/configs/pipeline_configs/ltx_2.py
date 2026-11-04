@@ -420,6 +420,7 @@ class LTX2PipelineConfig(PipelineConfig):
         batch.sp_video_valid_token_count = int(valid_local_frames) * int(
             tokens_per_frame
         )
+        batch.sp_video_padded = bool(pad_frames)
 
         return latents, True
 
@@ -467,6 +468,7 @@ class LTX2PipelineConfig(PipelineConfig):
         batch.sp_audio_latent_num_frames = int(local_frames)
         batch.sp_audio_start_frame = int(start_frame)
         batch.sp_audio_valid_token_count = int(valid_local_frames)
+        batch.sp_audio_padded = bool(pad_frames)
         return audio_latents, True
 
     def can_shard_audio_latents_for_sp(self, audio_latents) -> bool:

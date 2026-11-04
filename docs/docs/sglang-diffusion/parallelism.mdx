@@ -81,8 +81,17 @@ mis-mapped layout stays numerically correct and silently loses the performance
   ring adds an outer row split on top of Ulysses's inner one.
 - Ring requires an attention backend that declares
   `supports_ring_rotation()` — the per-hop merge needs the kernel's softmax
-  LSE. `fa` and `sage_attn` declare it; the launcher auto-selects `fa` when
-  unset.
+  LSE. `fa` and `sage_attn` declare it, and the launcher auto-selects `fa`
+  when unset; on TPU the ring backend is `tpu_splash_attn` (auto-selected).
+  Its kernel resumes the softmax across K/V shards itself
+  (`AttentionImpl.forward_ring_resume`), so the ring all-gathers K/V, attends
+  the local shard first while the gather runs, and needs no merge pass;
+  rank-dependent shard choices reach the kernel as device data. Every device
+  then holds the ring group's whole K/V (memory traded for not needing p2p).
+  Which TPU path a layer takes: plain
+  and tail-padded attention (Wan, LTX-2) use this all-gather ring; the
+  replicated-prefix/-suffix paths (FLUX.2, Z-Image) still use the templated
+  ring with an LSE merge.
 - `USPAttention`'s masked/tail-padded text path and its replicated-prefix,
   -suffix, and -kv-prefix paths all support ring: the sharded K/V rotates
   through the ring while the tail-pad or replicated portion is attended

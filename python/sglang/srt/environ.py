@@ -1372,6 +1372,11 @@ class Envs:
     # materializing the full-vocab log-softmax. Escape hatch only; the two
     # paths are mathematically identical.
     SGLANG_ENABLE_FAST_INPUT_LOGPROBS = EnvBool(True)
+    # Keep the repetition-penalty state at a power-of-two row count, so its
+    # [rows, vocab] filter and merge gathers have one shape per row-bucket pair
+    # instead of one per exact (old, new) batch-size pair. Helps backends that
+    # compile per input shape. Live rows keep their exact values.
+    SGLANG_BUCKETED_PENALTY_ROWS = EnvBool(False)
 
     # ===================================================================
     # Deterministic inference and all-reduce
@@ -1470,6 +1475,10 @@ class Envs:
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
+    # "incremental": drop finished requests' multimodal features a few at a
+    # time before device-result waits instead of all at once when they finish
+    # (scheduler_components/mm_feature_releaser.py). Outputs are unchanged.
+    SGLANG_ASYNC_MM_FEATURE_RELEASE = EnvStr("")
 
     # ===================================================================
     # Multimodal CUDA IPC transport

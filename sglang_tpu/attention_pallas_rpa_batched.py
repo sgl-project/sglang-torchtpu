@@ -129,7 +129,7 @@ RPA_BATCHED_SPEC = RpaKernelSpec(
     invoke_kernel=_invoke_batched_kernel,
     supports_attention_sink=True,
     uses_cu_kv_lens=False,
-    extend_distribution_mask=(0, 0, 1),  # [0, 0, n] (MIXED-only)
+    is_batched=True,
     min_page_size=_MIN_PAGE_SIZE,
 )
 

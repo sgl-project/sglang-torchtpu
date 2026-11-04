@@ -961,6 +961,57 @@ class DeepseekV2MoE(nn.Module):
             and not get_exec().moe.enable_eplb
         )
 
+    # Set by decoder layers that pass `use_tpu_fused_moe_decode()` to their FFN
+    # boundary as `summed_by_compute`. The TPU fused MoE decode kernel
+    # all-reduces in-kernel, so under any other decoder layer the boundary would
+    # sum its output a second time; those layers leave this False.
+    allow_tpu_fused_moe_decode: bool = False
+
+    def use_tpu_fused_moe_decode(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch],
+        skip_shared_experts: bool = False,
+    ) -> bool:
+        """Whether `forward` runs the TPU fused MoE decode kernel, whose output
+        is already summed over the TP/EP group.
+
+        The single eligibility predicate for that path: `forward` dispatches on
+        it, and the decoder layer passes it to the FFN boundary as
+        `summed_by_compute`, so the two cannot diverge.
+        """
+        if not _is_tpu or skip_shared_experts:
+            return False
+        from sglang_tpu.moe.pallas.fused_moe_decode.fused_moe_decode_op import (
+            should_use_fused_moe_decode,
+        )
+
+        return should_use_fused_moe_decode(self, hidden_states, forward_batch)
+
+    def _forward_tpu_fused_moe_decode(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        gemm_output_zero_allocator: BumpAllocator = None,
+    ) -> torch.Tensor:
+        from sglang_tpu.moe.pallas.fused_moe_decode.fused_moe_decode_op import (
+            apply_fused_moe_decode,
+        )
+
+        dispatch_info = (
+            ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+            if get_exec().moe.enable_eplb and not self.is_nextn
+            else None
+        )
+        router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+        topk_output = self.topk(
+            hidden_states,
+            router_logits,
+            num_token_non_padded=forward_batch.moe_num_token_non_padded(),
+            expert_location_dispatch_info=dispatch_info,
+        )
+        return apply_fused_moe_decode(self, hidden_states, topk_output)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -970,6 +1021,13 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
     ) -> torch.Tensor:
+        if self.use_tpu_fused_moe_decode(
+            hidden_states, forward_batch, skip_shared_experts
+        ):
+            return self._forward_tpu_fused_moe_decode(
+                hidden_states, forward_batch, gemm_output_zero_allocator
+            )
+
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
         if should_use_mega_moe(self, hidden_states):
@@ -2698,6 +2756,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                 is_nextn=is_nextn,
                 reduce_results=False,
             )
+            # forward() passes use_tpu_fused_moe_decode() as summed_by_compute.
+            self.mlp.allow_tpu_fused_moe_decode = True
         else:
             if is_dense_ffn_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
@@ -2869,7 +2929,17 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             _mlp_ctx = nullcontext()
 
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit, _mlp_ctx:
+        # The TPU fused MoE decode kernel returns an already-summed output.
+        summed_by_compute = isinstance(
+            self.mlp, DeepseekV2MoE
+        ) and self.mlp.use_tpu_fused_moe_decode(hidden_states, forward_batch)
+
+        with (
+            self.ffn_boundary.exit(
+                forward_batch, summed_by_compute=summed_by_compute
+            ) as ffn_exit,
+            _mlp_ctx,
+        ):
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,
