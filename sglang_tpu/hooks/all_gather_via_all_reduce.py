@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""All-gather through the in-place all-reduce in compiled TPU graphs.
+"""All-gather through the in-place all-reduce in Dynamo-traced TPU graphs.
 
 all_gather_into_tensor
   Why: under the Dynamo tracer the reg_all_gather_into_tensor custom op returns
@@ -8,11 +8,12 @@ all_gather_into_tensor
        the logits, which shows up as a wrong first token after prefill
        (sgl-project/sglang-torchtpu#1700). The in-place all-reduce compiles
        correctly.
-  How: AROUND GroupCoordinator.all_gather_into_tensor; while a graph is traced
-       (torch.compiler.is_compiling(), set by both the Dynamo and the direct
-       tracer), the gather is rebuilt from one all-reduce over a zero-padded
-       [world, *block] buffer (sglang_tpu.all_gather_via_all_reduce). Eager
-       calls use the original.
+  How: AROUND GroupCoordinator.all_gather_into_tensor; while Dynamo traces
+       (torch.compiler.is_dynamo_compiling()), the gather is rebuilt from one
+       all-reduce over a zero-padded [world, *block] buffer
+       (sglang_tpu.all_gather_via_all_reduce). Eager calls and direct-tracer
+       graphs use the original: the direct tracer has no defect, and its SPMD
+       shared executables must not bake in the rank index.
   Upstream PR or issue: sgl-project/sglang-torchtpu#1700 (TorchTPU compiled
        all_gather_into_tensor across chips).
   Remove when: the compiled all_gather_into_tensor returns the same blocks as

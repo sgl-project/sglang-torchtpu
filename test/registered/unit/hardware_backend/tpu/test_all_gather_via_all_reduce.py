@@ -1,10 +1,10 @@
 """CPU contract for the all-reduce-based TP all-gather (sgl-project/sglang-torchtpu#1700).
 
 The TPU hook rebuilds GroupCoordinator.all_gather_into_tensor from the in-place
-all-reduce while a graph is traced. These tests simulate a TP group on CPU and
-check that the result equals the concatenation a correct all-gather writes
-(bit-identical except that -0.0 becomes +0.0), and that eager calls keep the
-native collective.
+all-reduce while Dynamo traces a graph. These tests simulate a TP group on CPU
+and check that the result equals the concatenation a correct all-gather writes
+(bit-identical except that -0.0 becomes +0.0), and that eager calls and the
+direct tracer keep the native collective.
 """
 
 import unittest
@@ -101,23 +101,47 @@ class TestGatherBlocksViaAllReduce(CustomTestCase):
 
 
 class TestAllGatherIntoTensorAround(CustomTestCase):
-    def test_compiled_call_writes_the_gather_into_output(self):
-        blocks = _blocks(8, (8, 18992), torch.bfloat16)
+    def setUp(self):
+        super().setUp()
+        torch._dynamo.reset()
+        self.addCleanup(torch._dynamo.reset)
+
+    def test_dynamo_traced_call_writes_the_gather_into_output(self):
+        blocks = _blocks(8, (8, 64), torch.bfloat16)
         group = _SimulatedGroup(blocks, 3)
-        output = torch.empty(64, 18992, dtype=torch.bfloat16)
+        output = torch.empty(64, 64, dtype=torch.bfloat16)
         original = mock.Mock()
-        with mock.patch.object(torch.compiler, "is_compiling", return_value=True):
-            agar.all_gather_into_tensor_around(original, group, output, blocks[3])
+
+        @torch.compile(backend="eager")
+        def traced(output, block):
+            agar.all_gather_into_tensor_around(original, group, output, block)
+
+        traced(output, blocks[3])
+
         original.assert_not_called()
         self.assertTrue(torch.equal(output, torch.cat(blocks, dim=0)))
+
+    def test_direct_tracer_call_uses_the_native_collective(self):
+        # The direct tracer sets this flag while tracing
+        # (sglang_tpu/compilation/direct_compile.py). Its SPMD shared
+        # executables must not bake in rank_in_group, so it keeps the native
+        # gather.
+        group = mock.Mock(world_size=8, rank_in_group=3)
+        output = torch.empty(16, 4)
+        block = torch.ones(2, 4)
+        original = mock.Mock(return_value=None)
+        with mock.patch.object(torch.compiler, "_is_compiling_flag", True):
+            self.assertTrue(torch.compiler.is_compiling())
+            agar.all_gather_into_tensor_around(original, group, output, block)
+        original.assert_called_once_with(group, output, block)
+        group.all_reduce.assert_not_called()
 
     def test_eager_call_uses_the_native_collective(self):
         group = mock.Mock(world_size=8)
         output = torch.empty(16, 4)
         block = torch.ones(2, 4)
         original = mock.Mock(return_value=None)
-        with mock.patch.object(torch.compiler, "is_compiling", return_value=False):
-            agar.all_gather_into_tensor_around(original, group, output, block)
+        agar.all_gather_into_tensor_around(original, group, output, block)
         original.assert_called_once_with(group, output, block)
         group.all_reduce.assert_not_called()
 
@@ -126,7 +150,9 @@ class TestAllGatherIntoTensorAround(CustomTestCase):
         output = torch.empty(2, 4)
         block = torch.ones(2, 4)
         original = mock.Mock(return_value=None)
-        with mock.patch.object(torch.compiler, "is_compiling", return_value=True):
+        with mock.patch.object(
+            torch.compiler, "is_dynamo_compiling", return_value=True
+        ):
             agar.all_gather_into_tensor_around(original, group, output, block)
         original.assert_called_once_with(group, output, block)
 

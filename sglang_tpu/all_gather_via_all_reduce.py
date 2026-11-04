@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TP all-gather built from the in-place all-reduce, for compiled TPU graphs.
+"""TP all-gather built from the in-place all-reduce, for Dynamo-traced TPU graphs.
 
 Under the Dynamo tracer, ``GroupCoordinator.all_gather_into_tensor`` lowers to
 the ``reg_all_gather_into_tensor`` custom op. On a TP group that spans more than
@@ -14,11 +14,13 @@ index and the group sums the buffers. Adding zero leaves every value unchanged,
 so the result equals a correct all-gather; the only bit-level difference is that
 a -0.0 element comes back as +0.0.
 
-The hook keys on ``torch.compiler.is_compiling()``, which both TPU tracers set
-while tracing (the direct tracer sets ``torch.compiler._is_compiling_flag`` in
-``sglang_tpu/compilation/direct_compile.py``). So compiled graphs from either
-tracer use this path, and eager calls keep the native all-gather. The direct
-tracer did not show the defect, and the rewrite is value-preserving there too.
+The hook keys on ``torch.compiler.is_dynamo_compiling()``, so only graphs the
+Dynamo tracer builds take this path. The direct tracer and eager calls keep the
+native all-gather. The direct tracer never showed the defect, and it must not
+take this path: ``blocks[group.rank_in_group]`` is a Python int that the direct
+tracer bakes into the graph, and ``--use-spmd-compile`` ships one owner rank's
+executable to every rank. Dynamo specializes each rank's graph on its own rank
+(see ``sglang_tpu/rank_local.py``), so the constant is correct there.
 """
 
 from __future__ import annotations
@@ -56,11 +58,11 @@ def all_gather_into_tensor_around(
 ) -> None:
     """AROUND hook for ``GroupCoordinator.all_gather_into_tensor``.
 
-    Only traced calls (``torch.compiler.is_compiling()``, set by both TPU
-    tracers) on a multi-rank group take the all-reduce path; eager calls and
-    single-rank groups call the original collective.
+    Only Dynamo-traced calls on a multi-rank group take the all-reduce path.
+    Eager calls, direct-tracer graphs and single-rank groups call the original
+    collective.
     """
-    if not torch.compiler.is_compiling() or group.world_size == 1:
+    if not torch.compiler.is_dynamo_compiling() or group.world_size == 1:
         return original(group, output, input)
     output.copy_(gather_blocks_via_all_reduce(group, input).view(output.shape))
     return None
