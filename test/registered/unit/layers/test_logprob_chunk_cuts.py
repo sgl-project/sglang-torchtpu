@@ -15,33 +15,19 @@ from unittest import mock
 import torch
 
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sglang.srt.layers.logprob_processor import (
-    InputLogprobProcessor,
-    input_logprob_chunk_bounds,
-)
+from sglang.srt.layers.logprob_processor import input_logprob_chunk_bounds
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.logprob_test_utils import CpuDefaultDeviceMixin, score_input_logprobs
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-
-
-class _CpuDefaultDevice:
-    """Build this module's tensors on the CPU even if an earlier test in the same
-    process left another default device (torch.set_default_device) behind."""
-
-    def setUp(self):
-        super().setUp()
-        device = torch.device("cpu")
-        device.__enter__()
-        self.addCleanup(device.__exit__, None, None, None)
-
 
 CHUNK = 2048  # SGLANG_LOGPROB_CHUNK_SIZE
 VOCAB = 13
 
 
-class TestLogprobChunkBounds(_CpuDefaultDevice, CustomTestCase):
+class TestLogprobChunkBounds(CpuDefaultDeviceMixin, CustomTestCase):
     def test_without_cuts_is_the_uniform_split(self):
         # no cuts: exactly the chunking before the cuts existed
         for total in range(0, 70):
@@ -103,63 +89,20 @@ class TestLogprobChunkBounds(_CpuDefaultDevice, CustomTestCase):
                 self.assertEqual((lo - seg) % chunk_size, 0, (total, chunk_size, cuts))
 
 
-def _metadata(extend_lens, start_lens, ids):
-    sample, lp_idx, pruned_lens, t2s = [], [], [], []
-    sample_pt, lp_pt = -1, 0
-    for i, (extend, start) in enumerate(zip(extend_lens, start_lens)):
-        eff = start - 1 if extend == start else start
-        rows = extend - eff
-        t2s += [i] * rows
-        sample_pt += rows
-        sample.append(sample_pt)
-        lp_idx += [lp_pt + j for j in range(extend - start)]
-        lp_pt += rows
-        pruned_lens.append(extend - start)
-    md = SimpleNamespace(
-        sample_indices_cpu=sample,
-        input_logprob_indices_cpu=lp_idx,
-        extend_return_top_logprob=False,
-        extend_token_ids_logprob=False,
-        top_logprobs_nums=[0] * len(extend_lens),
-        extend_logprob_pruned_lens_cpu=pruned_lens,
-        extend_input_logprob_token_ids_gpu=ids[: len(lp_idx)],
-        token_ids_logprobs=[None] * len(extend_lens),
-    )
-    return md, torch.tensor(sample), torch.tensor(lp_idx), t2s
-
-
-def _row_count_dependent_logits(calls):
-    def get_logits_fn(states, lm_head, logits_metadata, **kwargs):
-        calls.append(states.shape[0])
-        # emulate an epilogue whose rounding depends on the row count of the call
-        return states.float() * (1.0 + 1e-6 * states.shape[0])
-
-    return get_logits_fn
-
-
-class TestInputLogprobChunkCuts(_CpuDefaultDevice, CustomTestCase):
+class TestInputLogprobChunkCuts(CpuDefaultDeviceMixin, CustomTestCase):
     """The real InputLogprobProcessor with a row-count-dependent stub epilogue."""
 
     def _score(self, states, ids, extend_lens, start_lens, cuts, dp_attn=False):
-        proc = InputLogprobProcessor(vocab_size=VOCAB)
-        proc.enable_logprobs_chunk = True
-        proc.logprobs_chunk_size = CHUNK
-        proc.enable_fast_input_logprobs = True
-        md, sample, lp_idx, t2s = _metadata(extend_lens, start_lens, ids)
-        if cuts is not None:
-            md.input_logprob_chunk_cuts_cpu = cuts
-        calls = []
-        res, _ = proc.forward(
-            pruned_states=states,
-            sample_indices=sample,
-            input_logprob_indices=lp_idx,
-            token_to_seq_idx=t2s,
-            lm_head=None,
-            get_logits_fn=_row_count_dependent_logits(calls),
-            logits_metadata=md,
+        return score_input_logprobs(
+            states,
+            ids,
+            extend_lens,
+            start_lens,
+            cuts,
+            vocab_size=VOCAB,
+            chunk_size=CHUNK,
             skip_chunking_for_dp_attn=dp_attn,
         )
-        return res.token_logprobs, calls
 
     def test_cuts_split_the_epilogue_calls(self):
         torch.manual_seed(0)
@@ -205,7 +148,7 @@ class TestInputLogprobChunkCuts(_CpuDefaultDevice, CustomTestCase):
                 self.assertTrue(torch.equal(unset, empty))
 
 
-class TestCoreSetsNoCuts(_CpuDefaultDevice, CustomTestCase):
+class TestCoreSetsNoCuts(CpuDefaultDeviceMixin, CustomTestCase):
     """Core only honours the cuts; it reads no TPU variable and never sets them."""
 
     def test_pruned_states_leave_the_cuts_unset(self):

@@ -24,31 +24,22 @@ from unittest import mock
 import torch
 
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sglang.srt.layers.logprob_processor import (
-    InputLogprobProcessor,
-    input_logprob_chunk_bounds,
-)
+from sglang.srt.layers.logprob_processor import input_logprob_chunk_bounds
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.plugins.hook_registry import HookType, _wrap_fn
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.logprob_test_utils import (
+    CpuDefaultDeviceMixin,
+    chunked_input_logprob_processor,
+    row_count_dependent_logits,
+    score_input_logprobs,
+)
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.envs import envs
 from sglang_tpu.hooks import logprob_grid as hooks
 from sglang_tpu.hooks.logprob_grid import logprob_grid_cuts
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
-
-
-class _CpuDefaultDevice:
-    """Build this module's tensors on the CPU even if an earlier test in the same
-    process left another default device (torch.set_default_device) behind."""
-
-    def setUp(self):
-        super().setUp()
-        device = torch.device("cpu")
-        device.__enter__()
-        self.addCleanup(device.__exit__, None, None, None)
-
 
 GRID = 2048
 CHUNK = 2048  # SGLANG_LOGPROB_CHUNK_SIZE
@@ -107,7 +98,7 @@ CASES = [
 ]
 
 
-class TestLogprobGridPlan(_CpuDefaultDevice, CustomTestCase):
+class TestLogprobGridPlan(CpuDefaultDeviceMixin, CustomTestCase):
     def test_q4096_with_grid_matches_q2048(self):
         for prefix, length, start in CASES:
             with self.subTest(prefix=prefix, length=length, start=start):
@@ -208,7 +199,7 @@ def _batch_plan(reqs, prefill_chunk, grid):
     return calls
 
 
-class TestLogprobGridSharedBudget(_CpuDefaultDevice, CustomTestCase):
+class TestLogprobGridSharedBudget(CpuDefaultDeviceMixin, CustomTestCase):
     def test_a_forward_with_several_requests_is_not_cut(self):
         # Review case, scoring lengths [1024, 3072]: Q2048 runs [A, B[0:1024)] then
         # [B[1024:3072)]; Q4096 runs both requests in one forward. A cut on B's own
@@ -248,7 +239,7 @@ def _bruteforce_cuts(start, extend, grid):
     return [pos - start for pos in range(start + 1, extend) if pos % grid == 0]
 
 
-class TestLogprobGridCuts(_CpuDefaultDevice, CustomTestCase):
+class TestLogprobGridCuts(CpuDefaultDeviceMixin, CustomTestCase):
     def test_boundaries(self):
         for start, extend, cuts in [
             (0, 2047, []),
@@ -348,65 +339,19 @@ class TestLogprobGridEnv(CustomTestCase):
         )
 
 
-def _metadata(extend_lens, start_lens, ids):
-    sample, lp_idx, pruned_lens, t2s = [], [], [], []
-    sample_pt, lp_pt = -1, 0
-    for i, (extend, start) in enumerate(zip(extend_lens, start_lens)):
-        eff = start - 1 if extend == start else start
-        rows = extend - eff
-        t2s += [i] * rows
-        sample_pt += rows
-        sample.append(sample_pt)
-        lp_idx += [lp_pt + j for j in range(extend - start)]
-        lp_pt += rows
-        pruned_lens.append(extend - start)
-    md = SimpleNamespace(
-        sample_indices_cpu=sample,
-        input_logprob_indices_cpu=lp_idx,
-        extend_return_top_logprob=False,
-        extend_token_ids_logprob=False,
-        top_logprobs_nums=[0] * len(extend_lens),
-        extend_logprob_pruned_lens_cpu=pruned_lens,
-        extend_input_logprob_token_ids_gpu=ids[: len(lp_idx)],
-        token_ids_logprobs=[None] * len(extend_lens),
-    )
-    return md, torch.tensor(sample), torch.tensor(lp_idx), t2s
-
-
-def _row_count_dependent_logits(calls):
-    def get_logits_fn(states, lm_head, logits_metadata, **kwargs):
-        calls.append(states.shape[0])
-        # emulate an epilogue whose rounding depends on the row count of the call
-        return states.float() * (1.0 + 1e-6 * states.shape[0])
-
-    return get_logits_fn
-
-
-def _processor():
-    proc = InputLogprobProcessor(vocab_size=VOCAB)
-    proc.enable_logprobs_chunk = True
-    proc.logprobs_chunk_size = CHUNK
-    proc.enable_fast_input_logprobs = True
-    return proc
-
-
-class TestLogprobGridProcessor(_CpuDefaultDevice, CustomTestCase):
+class TestLogprobGridProcessor(CpuDefaultDeviceMixin, CustomTestCase):
     """The real InputLogprobProcessor with a row-count-dependent stub epilogue."""
 
     def _score(self, states, ids, extend_lens, start_lens, cuts):
-        md, sample, lp_idx, t2s = _metadata(extend_lens, start_lens, ids)
-        md.input_logprob_chunk_cuts_cpu = cuts
-        calls = []
-        res, _ = _processor().forward(
-            pruned_states=states,
-            sample_indices=sample,
-            input_logprob_indices=lp_idx,
-            token_to_seq_idx=t2s,
-            lm_head=None,
-            get_logits_fn=_row_count_dependent_logits(calls),
-            logits_metadata=md,
+        return score_input_logprobs(
+            states,
+            ids,
+            extend_lens,
+            start_lens,
+            cuts,
+            vocab_size=VOCAB,
+            chunk_size=CHUNK,
         )
-        return res.token_logprobs, calls
 
     def _serve(self, hidden, ids, prefix, length, logprob_start, prefill_chunk, grid):
         """A lone scoring request's prompt logprobs over its chunked-prefill forwards."""
@@ -508,7 +453,7 @@ def _forward_batch(extend_lens, start_lens, return_logprob=True, mode=None):
     )
 
 
-class TestLogprobGridHook(_CpuDefaultDevice, CustomTestCase):
+class TestLogprobGridHook(CpuDefaultDeviceMixin, CustomTestCase):
     """The AFTER hook on LogitsMetadata.from_forward_batch, wrapped the way
     HookRegistry wraps a classmethod, then core's pruning and chunking."""
 
@@ -528,13 +473,13 @@ class TestLogprobGridHook(_CpuDefaultDevice, CustomTestCase):
             SimpleNamespace(), hidden, None, None, md
         )
         calls = []
-        _processor().forward(
+        chunked_input_logprob_processor(VOCAB, CHUNK).forward(
             pruned_states=pruned,
             sample_indices=sample,
             input_logprob_indices=lp_idx,
             token_to_seq_idx=t2s,
             lm_head=None,
-            get_logits_fn=_row_count_dependent_logits(calls),
+            get_logits_fn=row_count_dependent_logits(calls),
             logits_metadata=md,
         )
         return calls
