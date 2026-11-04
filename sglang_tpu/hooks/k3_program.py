@@ -478,7 +478,11 @@ def k3_program_hicache_layout(original, server_args: Any, *args, **kwargs):
     from sglang.srt.arg_groups.overrides import resolving_view
 
     cfg = resolving_view(server_args)
-    if str(getattr(cfg, "speculative_algorithm", None) or "").upper() != "K3_PROGRAM":
+    if (
+        str(getattr(cfg, "speculative_algorithm", None) or "").upper() != "K3_PROGRAM"
+        or not cfg.enable_hierarchical_cache
+    ):
+        # (A P/D decode normalizes HiCache knobs without a host tier.)
         return original(server_args, *args, **kwargs)
     from sglang_tpu.tpu_dma_hicache import is_tpu_dma_hicache_backend
 
