@@ -105,6 +105,9 @@ def run_case(name):
         pairs = [dist.new_group(ranks=[2 * s, 2 * s + 1]) for s in range(STAGES)]
         pg = pairs[stage]
     quads = [dist.new_group(ranks=list(range(4 * q, 4 * q + 4))) for q in (0, 1)]
+    if hasattr(spmd_util, "make_standalone"):
+        spmd_util.make_standalone(pg)
+        spmd_util.make_standalone(quads[rank // 4])
     _log(rank, f"groups ready, pair members {dist.get_process_group_ranks(pg)}")
 
     def _ar(x, group):
