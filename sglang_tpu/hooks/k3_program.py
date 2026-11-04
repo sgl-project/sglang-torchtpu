@@ -209,6 +209,12 @@ def size_k3_program_pools(result: None, configurator, kvc, *args, **kwargs) -> N
     """AFTER DefaultPoolConfigurator.__init__."""
     if not k3_program_active():
         return result
+    import os
+
+    if os.environ.get("K3_DP_DEBUG") == "1":
+        from sglang_tpu.k3_programs import sglang_dp_debug
+
+        sglang_dp_debug.install()
     from sglang.srt.runtime_context import get_model
     from sglang_tpu.k3_programs.sglang_pools import K3UnifiedKVPool
 
