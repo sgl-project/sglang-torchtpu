@@ -146,16 +146,13 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
         )
         return args, ref
 
-    def _check(
-        self, args, ref, sm_scale, k_scale, query_block=256, per_token_selection=False
-    ):
+    def _check(self, args, ref, sm_scale, k_scale, query_block=256):
         out = self.qblock(
             *args,
             sm_scale=sm_scale,
             k_scale=k_scale,
             kpool=KPOOL,
             query_block=query_block,
-            per_token_selection=per_token_selection,
         )
         cu, dist = args[7], args[8]
         n = int(cu[dist[2]])
@@ -172,11 +169,6 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
         seqs = [(1024, 2500), (600, 1800), (0, 2049), (0, 1)]
         args, ref = self._case(seqs, 8192, 6, 4096, 0.08, 0.75)
         self._check(args, ref, 0.08, 0.75)
-
-    def test_per_token_selection_words(self):
-        seqs = [(1024, 2500), (600, 1800), (0, 2049), (0, 1)]
-        args, ref = self._case(seqs, 8192, 6, 4096, 0.08, 0.75)
-        self._check(args, ref, 0.08, 0.75, per_token_selection=True)
 
     def test_64_heads_128_query_blocks(self):
         # 64 heads per chip (GLM-5.3-Flash at attention TP1) take 128-query
@@ -227,7 +219,24 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
 
 @unittest.skipUnless(_HAS_JAX, "requires JAX")
 class TestQblockSelectionWords(CustomTestCase):
-    """Per-token selection words equal the per-block-entry ones (runs on CPU)."""
+    """Per-token selection words equal ones built per block entry (runs on CPU)."""
+
+    @staticmethod
+    def _per_entry_words(topk_indices, tok, is_row, *, kpool, pages_pad):
+        # Reference: the words built from each block entry's own row gather.
+        from sglang_tpu.attention.pallas import mla_sparse_qblock as mq
+
+        g = jnp.arange(pages_pad, dtype=jnp.int32)
+        first_tok = topk_indices[:, ::kpool][tok]  # [nb, qb, width / kpool]
+        sel = jnp.where(is_row[..., None] & (first_tok >= 0), first_tok // kpool, -1)
+        page = jnp.where(sel >= 0, sel // mq._WORD_BITS, -1)
+        bit = jnp.where(sel >= 0, jnp.left_shift(1, sel % mq._WORD_BITS), 0)
+        return jax.lax.reduce(
+            jnp.where(page[:, None] == g[None, :, None, None], bit[:, None], 0),
+            np.dtype(mq._WORD_DTYPE).type(0),
+            jax.lax.bitwise_or,
+            (3,),
+        )  # [nb, pages_pad, qb]
 
     def _rows(self, rng, pos, width):
         # A pooled-indexer row: selected pools' tokens (any order), the open
@@ -274,16 +283,9 @@ class TestQblockSelectionWords(CustomTestCase):
         pages_pad = -(-(-(-ctx // PAGE)) // 8) * 8
         words = [
             np.asarray(
-                mq._selection_words(
-                    jnp.asarray(topk),
-                    tok,
-                    is_row,
-                    kpool=KPOOL,
-                    pages_pad=pages_pad,
-                    per_token=per_token,
-                )
+                fn(jnp.asarray(topk), tok, is_row, kpool=KPOOL, pages_pad=pages_pad)
             )
-            for per_token in (False, True)
+            for fn in (self._per_entry_words, mq._selection_words)
         ]
         self.assertEqual(words[0].shape, (num_blocks, pages_pad, qb))
         self.assertTrue(words[0].any())

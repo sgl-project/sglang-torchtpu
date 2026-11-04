@@ -305,61 +305,40 @@ def _query_blocks(
     return req, start, count, first_pos, ends[-1].astype(jnp.int32), t_row
 
 
-def _selection_words(topk_indices, tok, is_row, *, kpool, pages_pad, per_token):
+def _selection_words(topk_indices, tok, is_row, *, kpool, pages_pad):
     """member[b, g, q]: query q's selection word for page g, ``[nb, pages, qb]``.
 
     One pool id per entry: column ``c * kpool`` of a row is the first token of
     a pool. Padding rows (``is_row`` false) get no bits. A compare-OR, not a
     scatter (scatters with this many updates are slow on the TPU).
 
-    ``per_token`` builds the words once per token, ``[num_tokens, pages]``, and
-    gathers whole word rows into the block layout. A query's words depend only
-    on its own row, so this is bit-identical to building them per block entry,
-    but the compare-OR runs over ``num_tokens`` rows instead of
-    ``num_blocks * qb``: the block layout reserves a padded last block per
-    possible request (95 blocks for 32 live at an 8192-token prefill with 64
-    request slots), and the compare-OR was the largest op of a GLM-5.3-Flash
-    prefill. The row gather reads ``pages`` words per query instead of the
-    ``width / kpool`` entries the per-entry form gathers.
+    A query's words depend only on its own row, so they are built once per
+    token, ``[num_tokens, pages]``, and whole word rows are gathered into the
+    block layout. Building them per block entry instead would run the
+    compare-OR over ``num_blocks * qb`` rows: the block layout reserves a padded
+    last block per possible request (95 blocks for 32 live at an 8192-token
+    prefill with 64 request slots), which made it the largest op of a
+    GLM-5.3-Flash prefill. The row gather also reads ``pages`` words per query
+    rather than ``width / kpool`` entries.
     """
     g = jnp.arange(pages_pad, dtype=jnp.int32)
-    zero = np.dtype(_WORD_DTYPE).type(0)
-    if per_token:
-        first_tok = topk_indices[:, ::kpool]  # [num_tokens, width / kpool]
-        sel = jnp.where(first_tok >= 0, first_tok // kpool, -1)
-        page = jnp.where(sel >= 0, sel // _WORD_BITS, -1)
-        bit = jnp.where(sel >= 0, jnp.left_shift(1, sel % _WORD_BITS), 0)
-        words = lax.reduce(
-            jnp.where(page[:, None, :] == g[None, :, None], bit[:, None, :], 0),
-            zero,
-            lax.bitwise_or,
-            (2,),
-        )  # [num_tokens, pages_pad]
-        member = jnp.where(is_row[..., None], words[tok], 0)  # [nb, qb, pages]
-        return member.transpose(0, 2, 1)
-
-    first_tok = topk_indices[:, ::kpool][tok]  # [num_blocks, qb, width / kpool]
-    sel = jnp.where(is_row[..., None] & (first_tok >= 0), first_tok // kpool, -1)
+    first_tok = topk_indices[:, ::kpool]  # [num_tokens, width / kpool]
+    sel = jnp.where(first_tok >= 0, first_tok // kpool, -1)
     page = jnp.where(sel >= 0, sel // _WORD_BITS, -1)
     bit = jnp.where(sel >= 0, jnp.left_shift(1, sel % _WORD_BITS), 0)
-    return lax.reduce(
-        jnp.where(page[:, None] == g[None, :, None, None], bit[:, None], 0),
-        zero,
+    words = lax.reduce(
+        jnp.where(page[:, None, :] == g[None, :, None], bit[:, None, :], 0),
+        np.dtype(_WORD_DTYPE).type(0),
         lax.bitwise_or,
-        (3,),
-    )  # [num_blocks, pages_pad, qb]
+        (2,),
+    )  # [num_tokens, pages_pad]
+    member = jnp.where(is_row[..., None], words[tok], 0)  # [nb, qb, pages_pad]
+    return member.transpose(0, 2, 1)
 
 
 @functools.partial(
     jax.jit,
-    static_argnames=(
-        "sm_scale",
-        "k_scale",
-        "kpool",
-        "query_block",
-        "interpret",
-        "per_token_selection",
-    ),
+    static_argnames=("sm_scale", "k_scale", "kpool", "query_block", "interpret"),
 )
 def sparse_mla_prefill_qblock(
     ql_nope: jax.Array,  # bf16[num_tokens, num_q_heads, 512]
@@ -377,16 +356,13 @@ def sparse_mla_prefill_qblock(
     kpool: int,
     query_block: int = QUERY_BLOCK,
     interpret: bool = False,
-    per_token_selection: bool = False,
 ) -> jax.Array:
     """Sparse MLA attention over pooled DSA selections, ``query_block`` at a time.
 
     Same result as ``sparse_ragged_paged_attention`` on the same rows (up to
     bf16 rounding of the softmax weights), for rows in the pooled indexer's
     format: selected pools' tokens, then the open pool's tail, then ``-1``.
-    The cache must already hold this step's tokens. ``per_token_selection``
-    builds the selection words per token instead of per block entry (same
-    words; see ``_selection_words``).
+    The cache must already hold this step's tokens.
 
     Returns ``bf16[num_tokens, num_q_heads, 512]``; rows of padding tokens are 0.
     """
@@ -430,7 +406,6 @@ def sparse_mla_prefill_qblock(
         is_row,
         kpool=kpool,
         pages_pad=pages_pad,
-        per_token=per_token_selection,
     )  # [num_blocks, pages_pad, qb]
 
     # Each block's page union in ascending order, compacted to the front.

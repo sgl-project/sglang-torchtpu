@@ -62,9 +62,7 @@ def topk_row_width(hf_config) -> int:
 
 
 def _build_pallas_sparse_mla_kernel_op(
-    qblock_kpool: int = 0,
-    gather_chunk_tokens: Optional[int] = None,
-    qblock_per_token_selection: bool = False,
+    qblock_kpool: int = 0, gather_chunk_tokens: Optional[int] = None
 ):
     """Register the sparse MLA step as a torch custom op, once per process.
 
@@ -74,7 +72,7 @@ def _build_pallas_sparse_mla_kernel_op(
     kernels find pages with a fixed stride, and they use one scale for both
     keys and values.
     """
-    key = (qblock_kpool, gather_chunk_tokens, qblock_per_token_selection)
+    key = (qblock_kpool, gather_chunk_tokens)
     if key in _PALLAS_SPARSE_MLA_OPS:
         return _PALLAS_SPARSE_MLA_OPS[key]
 
@@ -95,10 +93,6 @@ def _build_pallas_sparse_mla_kernel_op(
         # qblock_kpool > 0 sends prefill batches through the query-blocked kernel
         # (sparse_mla_attention_fused); it changes the body, so it is in the name.
         op_name += f"_qblock{qblock_kpool}"
-        if qblock_per_token_selection:
-            # Per-token selection words (same words, different body).
-            op_name += "_ptsel"
-            chunk_kwargs["qblock_per_token_selection"] = True
 
     # custom_jax_kernel reads this function's signature: every tensor has to
     # be a positional parameter annotated ``jax.Array``. The JAX step cannot be
@@ -256,9 +250,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         )
 
         self._prefill_op = _build_pallas_sparse_mla_kernel_op(
-            self._kpool,
-            QBLOCK_GATHER_CHUNK_TOKENS,
-            tpu_envs.SGLANG_TPU_QBLOCK_PER_TOKEN_SELECTION.get(),
+            self._kpool, QBLOCK_GATHER_CHUNK_TOKENS
         )
         return _build_pallas_sparse_mla_kernel_op(0, QBLOCK_GATHER_CHUNK_TOKENS)
 
