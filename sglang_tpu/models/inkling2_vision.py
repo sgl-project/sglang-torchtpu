@@ -23,9 +23,9 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.utils import add_prefix
 
 # ViT rows (native patches plus one CLS per image) a bucket holds; multiples of
-# the flash kernel's 128-row block. 16384 rows is a 64x64 merged grid. The
-# processor downscales images that would not fit the largest bucket.
-ROW_BUCKETS = (512, 2048, 8192, 16384, 32768)
+# the flash kernel's 128-row block. 16384 rows is a 64x64 merged grid and the
+# largest the flash kernel fits in VMEM; the processor downscales bigger images.
+ROW_BUCKETS = (512, 2048, 8192, 16384)
 
 _CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 _CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
