@@ -424,6 +424,13 @@ class RaidenKVManager(
                 "prefill, and SGLANG_RAIDEN_PIPELINE_TRANSFER on the decode)."
             )
         if self._pipeline_enabled:
+            if (
+                self.disaggregation_mode == DisaggregationMode.PREFILL
+                and self.is_dummy_cp_rank
+            ):
+                # CP rank 0 holds the stage's gathered KV and is its sole source.
+                self.chunked_transfer = False
+                return
             if self._state_kv_caches:
                 raise NotImplementedError(
                     "Raiden pipeline transfer does not move GDN (linear-attention) "
@@ -1185,6 +1192,13 @@ class RaidenKVManager(
             if not self._pipeline_enabled:
                 raise ValueError(
                     "Raiden pipeline transfer requires a pipeline-parallel prefill"
+                )
+            if (
+                self.disaggregation_mode == DisaggregationMode.PREFILL
+                and self.is_dummy_cp_rank
+            ):
+                raise ValueError(
+                    "Raiden pipeline transfer sources each stage from CP rank 0"
                 )
             with self._pipeline_init_lock:
                 if self._pipeline is None:

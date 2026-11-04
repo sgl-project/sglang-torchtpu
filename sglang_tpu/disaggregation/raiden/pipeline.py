@@ -484,8 +484,15 @@ class PipelineTransfer:
     def _check_support(self, raiden_service_pb2) -> None:
         """Reject topologies and native builds the pipeline transfer cannot serve."""
         manager = self.manager
-        if manager.attn_cp_size != 1:
-            raise ValueError("Raiden pipeline transfer requires attention CP=1")
+        if manager.attn_cp_size != 1 and not (
+            self.producer
+            and manager.attn_cp_rank == 0
+            and not manager.enable_all_cp_ranks_for_transfer
+        ):
+            raise ValueError(
+                "Raiden pipeline transfer takes attention CP>1 only on a prefill "
+                "whose CP rank 0 is each stage's sole source"
+            )
         if self.producer and (manager.attn_tp_size != 1 or manager.pp_size <= 1):
             raise ValueError(
                 "Raiden pipeline transfer requires a pipeline producer with "
@@ -638,7 +645,9 @@ class PipelineTransfer:
         manager = self.manager
         return KVCacheManager(
             kv_caches=tensors,
-            node_id=manager._local_rank,
+            # The receiver indexes senders by transfer worker, excluding CP
+            # replicas that never send; the tensors identify the TPU device.
+            node_id=self.rank,
             local_control_port=manager._control_port + port_offset,
             max_blocks=max_blocks,
             num_slots=slots,

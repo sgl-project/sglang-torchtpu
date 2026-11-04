@@ -40,6 +40,7 @@ from sglang_tpu.disaggregation.raiden.serde import (
     decode_text,
     read_aux_blob,
 )
+from sglang_tpu.envs import envs
 
 if TYPE_CHECKING:
     from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
@@ -1244,7 +1245,15 @@ class RaidenKVSender(CommonKVSender):
         # keeps them out of the radix cache: stage groups and early close
         # register a pipeline stage's pages at the final chunk's launch.
         pipeline = self.kv_mgr._pipeline
-        return pipeline is not None and (pipeline.stage_parts or pipeline.early_close)
+        if pipeline is not None:
+            return pipeline.stage_parts or pipeline.early_close
+        # Followers must make the same radix-cache lifetime decision as CP0.
+        if self.kv_mgr._pipeline_enabled and self.kv_mgr.is_dummy_cp_rank:
+            return bool(
+                envs.SGLANG_RAIDEN_PIPELINE_STAGE_PARTS.get()
+                or envs.SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE.get()
+            )
+        return False
 
     def __init__(
         self,

@@ -4,11 +4,12 @@ These tests mock torch_tpu so they can run on any machine without TPU hardware.
 """
 
 import builtins
+import json
 import os
 import sys
 import unittest
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 import torch.compiler.config as compiler_config
@@ -28,6 +29,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu import tpu_platform
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 from sglang_tpu.tpu_platform import (
@@ -389,7 +391,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             enable_prefill_cp=False,
             enable_hierarchical_cache=False,
             tpu_compile_tracer="dynamo",
-            json_model_override_args=None,
+            json_model_override_args="{}",
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
@@ -688,7 +690,9 @@ class TestPrefillContextParallelValidation(CustomTestCase):
     _apply = TestTpuPlatformServerDefaults._apply
     _resolved = TestTpuPlatformServerDefaults._resolved
 
-    def _apply_cp(self, architectures=("Qwen3MoeForCausalLM",), **overrides):
+    def _apply_cp(
+        self, architectures=("Qwen3MoeForCausalLM",), config_loader=None, **overrides
+    ):
         fields = dict(
             tp_size=8,
             attn_cp_size=8,
@@ -707,9 +711,46 @@ class TestPrefillContextParallelValidation(CustomTestCase):
         with patch(
             "sglang.srt.utils.hf_transformers.config.get_config",
             return_value=hf_config,
+            side_effect=config_loader,
         ):
             self._apply(args)
         return args
+
+    def test_registered_gathered_experts_require_matching_ep(self):
+        architecture = "ExternalTextForCausalLM"
+        with (
+            patch.object(tpu_platform, "_PREFILL_CP_ARCHITECTURES", set()),
+            patch.object(tpu_platform, "_PREFILL_CP_EP_ARCHITECTURES", set()),
+        ):
+            tpu_platform.register_prefill_cp_architecture(architecture)
+            with self.assertRaisesRegex(NotImplementedError, "--moe-dp-size 8"):
+                self._apply_cp(architectures=(architecture,), moe_dp_size=1, ep_size=8)
+            tpu_platform.register_prefill_cp_architecture(
+                architecture, expert_parallel=True
+            )
+            self._apply_cp(architectures=(architecture,), moe_dp_size=1, ep_size=8)
+            with self.assertRaisesRegex(NotImplementedError, "--moe-dp-size 8"):
+                self._apply_cp(architectures=(architecture,), moe_dp_size=1, ep_size=4)
+
+    def test_rpa_v3_accepts_architecture_from_model_override(self):
+        overrides = {"architectures": ["Qwen3MoeForCausalLM"]}
+        loader = Mock(
+            side_effect=lambda *args, model_override_args, **kwargs: SimpleNamespace(
+                **model_override_args
+            )
+        )
+        args = self._apply_cp(
+            config_loader=loader,
+            json_model_override_args=json.dumps(overrides),
+            attention_backend="pallas_tpu_rpa_v3",
+        )
+        loader.assert_any_call(
+            "model",
+            trust_remote_code=False,
+            revision=None,
+            model_override_args=overrides,
+        )
+        self.assertEqual(self._resolved(args, "attention_backend"), "pallas_tpu_rpa_v3")
 
     def test_resolves_the_cp_backend_and_turns_off_sparse_core_gathers(self):
         """On the current libtpu the context-parallel forward returns wrong tokens
@@ -751,10 +792,10 @@ class TestPrefillContextParallelValidation(CustomTestCase):
             (
                 dict(architectures=("Qwen3VLMoeForConditionalGeneration",)),
                 {},
-                "supports Qwen3MoeForCausalLM and GptOssForCausalLM",
+                "supports GptOssForCausalLM and Qwen3MoeForCausalLM",
             ),
             (
-                dict(attention_backend="pallas_tpu_rpa_v3"),
+                dict(attention_backend="pallas_tpu"),
                 {},
                 "requires --attention-backend pallas_tpu_rpa_batched",
             ),
