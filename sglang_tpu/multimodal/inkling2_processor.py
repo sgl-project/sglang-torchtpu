@@ -48,14 +48,19 @@ class RowCappedImageProcessor(Inkling2ImageProcessor):
 
     def _encode(self, image, image_token_id, expected_size=None, virtual_size=None):
         if virtual_size is None:
-            width, height = Image.open(io.BytesIO(_load_image_bytes(image))).size
-            fitted = fit_image_size(width, height, self.patch_size, self.max_patches)
-            if fitted != (width, height):
-                logger.warning(
-                    "Inkling2 image %dx%d exceeds %d patches; downscaled to %dx%d",
-                    width, height, self.max_patches, *fitted,
-                )
-                virtual_size = fitted
+            data = _load_image_bytes(image)
+            with Image.open(io.BytesIO(data)) as decoded:
+                width, height = decoded.size
+                fitted = fit_image_size(width, height, self.patch_size, self.max_patches)
+                if fitted != (width, height):
+                    logger.warning(
+                        "Inkling2 image %dx%d exceeds %d patches; downscaled to %dx%d",
+                        width, height, self.max_patches, *fitted,
+                    )
+                    # PIL Lanczos here; the reference resize needs numba, absent on TPU hosts.
+                    buf = io.BytesIO()
+                    decoded.convert("RGBA").resize(fitted, Image.LANCZOS).save(buf, format="PNG")
+                    image = buf.getvalue()
         return super()._encode(image, image_token_id, expected_size, virtual_size)
 
 

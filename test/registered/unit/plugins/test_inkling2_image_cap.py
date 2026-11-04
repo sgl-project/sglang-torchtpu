@@ -17,16 +17,17 @@ class TestInkling2ImageCap(CustomTestCase):
         from sglang_tpu.multimodal.inkling2_processor import fit_image_size
 
         self.assertEqual(fit_image_size(800, 600, 40, 4000), (800, 600))
-        w, h = fit_image_size(5120, 5760, 40, 32767)
+        self.assertEqual(fit_image_size(5120, 5760, 40, 32767), (5120, 5760))  # 18432 patches fit
+        w, h = fit_image_size(10000, 9000, 40, 32767)  # 56250 patches do not
         self.assertLessEqual((-(-w // 40)) * (-(-h // 40)), 32767)
-        self.assertAlmostEqual(w / h, 5120 / 5760, places=2)
-        self.assertGreater(w * h, 0.8 * 32767 * 1600)
+        self.assertAlmostEqual(w / h, 10000 / 9000, places=2)
+        self.assertGreater(w * h, 0.85 * 32767 * 1600)
 
     def test_oversized_image_is_capped(self):
         from sglang_tpu.multimodal.inkling2_processor import MAX_IMAGE_PATCHES, RowCappedImageProcessor
 
         buf = io.BytesIO()
-        Image.new("RGB", (5120, 5760), (200, 30, 30)).save(buf, format="PNG")
+        Image.new("RGB", (10000, 9000), (200, 30, 30)).save(buf, format="PNG")
         span = RowCappedImageProcessor()._encode(buf.getvalue(), 200005)
         _, rows, cols = span.vision_grid_thw[0].tolist()
         self.assertLessEqual(rows * cols, MAX_IMAGE_PATCHES)
