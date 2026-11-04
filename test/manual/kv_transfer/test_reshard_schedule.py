@@ -75,7 +75,9 @@ class ReshardGeometryTest(unittest.TestCase):
     def test_geometry_8_to_4_concat(self):
         # total_kv_heads=8 >= src_tp=8: distinct heads, decode rank concatenates
         # its two prefill ranks at offsets 0 and 512, dst per-token width 1024.
-        geom = rs.ReshardGeometry(src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=8, **_BF16)
+        geom = rs.ReshardGeometry(
+            src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=8, **_BF16
+        )
         self.assertEqual(geom.ratio, 2)
         # prefill 0 -> decode 0, writer 0 (offset 0); prefill 1 -> decode 0 (offset 512).
         for p, r, exp_dst_off in [(0, 0, 0), (1, 0, 512), (6, 3, 0), (7, 3, 512)]:
@@ -88,7 +90,9 @@ class ReshardGeometryTest(unittest.TestCase):
         # total_kv_heads=4 < src_tp=8: heads replicated across prefill ranks. Both
         # of decode rank r's sources hold the SAME head, landing at offset 0 with
         # dst per-token width 512 (1 head/token). Whole-block, idempotent.
-        geom = rs.ReshardGeometry(src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=4, **_BF16)
+        geom = rs.ReshardGeometry(
+            src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=4, **_BF16
+        )
         for p, r in [(0, 0), (1, 0), (6, 3), (7, 3)]:
             src_off, size, src_stride, dst_off, dst_stride = geom.entry_bytes(p, r)
             self.assertEqual(src_off, 0)
@@ -112,7 +116,9 @@ class ReshardGeometryTest(unittest.TestCase):
 class SenderRequestTest(unittest.TestCase):
     def test_sender_concat_dst_placement(self):
         # 8 kv-heads: prefill rank 1 -> decode rank 0, second writer at offset 512.
-        geom = rs.ReshardGeometry(src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=8, **_BF16)
+        geom = rs.ReshardGeometry(
+            src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=8, **_BF16
+        )
         req = rs.build_sender_request(
             _Pb2,
             uuid=42,
@@ -140,7 +146,9 @@ class SenderRequestTest(unittest.TestCase):
         self.assertEqual(entries[2].count, 300)  # tail page
 
     def test_length_mismatch_raises(self):
-        geom = rs.ReshardGeometry(src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=8, **_BF16)
+        geom = rs.ReshardGeometry(
+            src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=8, **_BF16
+        )
         with self.assertRaises(ValueError):
             rs.build_sender_request(
                 _Pb2,
@@ -158,7 +166,9 @@ class SenderRequestTest(unittest.TestCase):
 
 class ReceiverRequestTest(unittest.TestCase):
     def test_receiver_concat_two_writers_8heads(self):
-        geom = rs.ReshardGeometry(src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=8, **_BF16)
+        geom = rs.ReshardGeometry(
+            src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=8, **_BF16
+        )
         req = rs.build_receiver_request(
             _Pb2,
             uuid=42,
@@ -179,7 +189,9 @@ class ReceiverRequestTest(unittest.TestCase):
 
     def test_receiver_replication_two_writers_qwen3(self):
         # 4 kv-heads: both writers land the same head at offset 0 (idempotent).
-        geom = rs.ReshardGeometry(src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=4, **_BF16)
+        geom = rs.ReshardGeometry(
+            src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=4, **_BF16
+        )
         req = rs.build_receiver_request(
             _Pb2,
             uuid=7,
@@ -200,7 +212,9 @@ class ReceiverRequestTest(unittest.TestCase):
         # Decode rank 2 is fed by prefill ranks 4 and 5. The receiver picks a
         # source's schedule by the pushing node's id, so the schedules must be
         # keyed by prefill rank (4, 5), not by writer position (0, 1).
-        geom = rs.ReshardGeometry(src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=4, **_BF16)
+        geom = rs.ReshardGeometry(
+            src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=4, **_BF16
+        )
         req = rs.build_receiver_request(
             _Pb2,
             uuid=9,

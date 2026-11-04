@@ -64,7 +64,6 @@ def source_ranks_for(decode_rank: int, ratio: int) -> List[int]:
     return list(range(decode_rank * ratio, (decode_rank + 1) * ratio))
 
 
-
 def head_bytes(fused_layer_tensor: FusedKVLayerTensor) -> int:
     """Bytes of one kv-head's K+V values, padding slots excluded; the per-head
     granule of a ReshardGeometry built with the tensor's kv_packing."""
@@ -205,7 +204,6 @@ class ReshardGeometry:
             dh_start * self.hp_bytes,  # dst_offset
             self.token_bytes(self.dst_tp),  # dst_stride (dst per-token width)
         )
-
 
     def check_decode_rank(self, decode_rank: int) -> None:
         """Raise ``entry_bytes``' error for any source of ``decode_rank``, so a

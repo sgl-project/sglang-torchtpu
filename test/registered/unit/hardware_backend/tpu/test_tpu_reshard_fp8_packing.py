@@ -45,7 +45,6 @@ PAD = 0xFD  # a byte no KV value takes (values are < 251)
 PHYSICAL_LAYOUT = "packed"
 
 
-
 class _Entry:
     pass
 
@@ -103,9 +102,7 @@ def _manager(tensor, local_tp):
     mgr.attn_tp_size = local_tp
     mgr._kv_caches = [tensor]
     mgr._swa_kv_caches = []
-    mgr.kv_args = SimpleNamespace(
-        total_kv_head_num=TOTAL_KV_HEADS, page_size=PAGE_SIZE
-    )
+    mgr.kv_args = SimpleNamespace(total_kv_head_num=TOTAL_KV_HEADS, page_size=PAGE_SIZE)
     return mgr
 
 
@@ -254,9 +251,7 @@ class TestTpuReshardFp8Packing(unittest.TestCase):
                 for local, head in enumerate(heads):
                     for kv in (0, 1):
                         slot = 2 * local + kv
-                        bad = np.argwhere(
-                            got[:live, slot] != want[:live, slot]
-                        )
+                        bad = np.argwhere(got[:live, slot] != want[:live, slot])
                         if bad.size:
                             token = int(bad[0][0])
                             self.fail(
@@ -278,11 +273,15 @@ class TestTpuReshardFp8Packing(unittest.TestCase):
         """GPT-OSS-120B fp8, prefill TP8 -> decode TP8 DP2 (attention TP4).
         One fp8 head per prefill rank cannot be placed into a decode pack it
         shares with another rank's head by any strided copy: refuse it."""
-        with self.assertRaisesRegex(ValueError, "Partial FP8 head packs are unsupported"):
+        with self.assertRaisesRegex(
+            ValueError, "Partial FP8 head packs are unsupported"
+        ):
             self._check(torch.float8_e4m3fn, 8, 4)
 
     def test_fp8_fan_in_8_to_2(self):
-        with self.assertRaisesRegex(ValueError, "Partial FP8 head packs are unsupported"):
+        with self.assertRaisesRegex(
+            ValueError, "Partial FP8 head packs are unsupported"
+        ):
             self._check(torch.float8_e4m3fn, 8, 2)
 
     def test_partial_pack_message_tp8_to_attn_tp4(self):
