@@ -55,6 +55,7 @@ def engine_config(
     speculative_tokens: int = 0,
     schedule: Sequence[tuple[int, int, int]] | None = DEFAULT_DSPARK_SCHEDULE,
     simulate_acc_lengths: dict[int, float] | None = None,
+    attention_dp: int = 1,
 ) -> MegakernelEngineConfig:
     """The program configuration for ``role``.
 
@@ -95,7 +96,7 @@ def engine_config(
     return MegakernelEngineConfig(
         role=role,
         tensor_parallel_size=TP_SIZE,
-        decode_context_parallel_size=DCP_SIZE,
+        decode_context_parallel_size=DCP_SIZE // attention_dp,
         block_size=block_size,
         max_num_seqs=max_running_requests,
         max_model_len=context_length,
@@ -106,4 +107,5 @@ def engine_config(
         synthetic_acceptance_rates_by_width=by_width,
         kv_cache_dtype=kv_cache_dtype,
         cp_kv_cache_interleave_size=block_size,
+        attention_dp=attention_dp,
     )

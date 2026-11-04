@@ -129,6 +129,10 @@ def server_engine_config(role: str | None = None):
         simulate_acc_lengths=parse_acc_lengths(
             tpu_envs.SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS.get()
         ),
+        # Attention DP2 on the decode only (sglang_dp).
+        attention_dp=(
+            tpu_envs.SGLANG_TPU_K3_PROGRAM_ATTENTION_DP.get() if role == "decode" else 1
+        ),
     )
 
 
