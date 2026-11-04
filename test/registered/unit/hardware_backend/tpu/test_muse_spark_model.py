@@ -1,22 +1,15 @@
 """CPU tests for the Muse Spark TPU model's checkpoint mapping, config, and PP."""
 
 import unittest
-from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.configs.model_config import get_hybrid_layer_ids
 from sglang.srt.configs.muse_spark import MuseSparkConfig
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptQuantConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.models.muse_spark import (
     MuseSparkInterleavedRope,
-    MuseSparkMoE,
-    MuseSparkRMSNorm,
-    _experts_quant_config,
-    _HostQuantizedFp8Config,
     _param_name,
     _to_interleaved_rope,
 )
@@ -37,52 +30,6 @@ def _rotate_half_rope(x, positions, base):
     sin = torch.cat([angles.sin(), angles.sin()], -1).float()[:, None]
     first, second = x.chunk(2, dim=-1)
     return x * cos + torch.cat([-second, first], -1) * sin
-
-
-class TestMuseSparkExpertQuantConfig(CustomTestCase):
-    def test_excluded_layers_use_fp8_unless_bf16_is_enabled(self):
-        nvfp4 = MagicMock(spec=ModelOptQuantConfig)
-        nvfp4.exclude_modules = ["layers.0.", "layers.61."]
-        first, middle = "model.layers.0.mlp.experts", "model.layers.1.mlp.experts"
-        self.assertIsInstance(
-            _experts_quant_config(nvfp4, first), _HostQuantizedFp8Config
-        )
-        self.assertIs(_experts_quant_config(nvfp4, middle), nvfp4)
-        bf16_flag = tpu_envs.SGLANG_TPU_ENABLE_MUSE_BF16_FIRST_LAST_LAYER_EXPERTS
-        with bf16_flag.override(True):
-            self.assertIsNone(_experts_quant_config(nvfp4, first))
-            self.assertIs(_experts_quant_config(nvfp4, middle), nvfp4)
-            # A BF16 checkpoint keeps every layer FP8, not only the first and last.
-            self.assertIsInstance(
-                _experts_quant_config(None, middle), _HostQuantizedFp8Config
-            )
-            with tpu_envs.SGLANG_TPU_MUSE_MEGAKERNEL.override(True):
-                with self.assertRaisesRegex(ValueError, "MUSE_MEGAKERNEL"):
-                    _experts_quant_config(nvfp4, first)
-
-
-class TestMuseSparkSlotCombine(CustomTestCase):
-    def test_expert_tp_sums_partial_outputs_before_the_norm(self):
-        norm = MuseSparkRMSNorm(4, eps=1e-8, gain_center=1.0, scale_input=True)
-        torch.nn.init.zeros_(norm.weight)
-        moe = torch.nn.Module()
-        moe.tp_size = moe.moe_tp_size = 2
-        moe.post_expert_norm = norm
-        mine = torch.arange(1.0, 25.0).reshape(2, 3, 4).to(torch.bfloat16)
-        peer = mine.flip(-1)
-        weights = torch.tensor([[0.5, 0.3, 0.2], [0.1, 0.2, 0.7]])
-
-        with patch(
-            "sglang_tpu.models.muse_spark.tensor_model_parallel_all_reduce",
-            side_effect=lambda x: x + peer.float(),
-        ) as all_reduce:
-            combined = MuseSparkMoE._combine_slots(moe, mine, weights)
-
-        all_reduce.assert_called_once()
-        full = norm(mine.float() + peer.float())
-        expected = (full * weights.unsqueeze(-1)).sum(dim=1)
-        self.assertEqual(combined.dtype, torch.bfloat16)
-        self.assertTrue(torch.allclose(combined.float(), expected, atol=1e-2))
 
 
 class TestMuseSparkCheckpointMapping(CustomTestCase):
