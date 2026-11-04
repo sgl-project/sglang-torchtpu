@@ -123,7 +123,7 @@ class TestBatchedRpaKernel(unittest.TestCase):
         kv_lens = jnp.asarray([kv_len], dtype=jnp.int32)
         cu_q_lens = jnp.asarray([0, 1], dtype=jnp.int32)
         page_indices = jnp.asarray(page_indices_host.reshape(-1))
-        distribution = jnp.ones((3,), dtype=jnp.int32)
+        distribution = jnp.asarray([0, 0, 1], dtype=jnp.int32)  # one decode row
         sm_scale = 1.0 / math.sqrt(self.HEAD_DIM)
 
         expected = ref_ragged_paged_attention(
@@ -337,10 +337,11 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
         kv_lens_padded[:num_seqs] = kv_lens
         cu_q_lens_padded = np.full(max_num_seqs + 1, total_tokens, dtype=np.int32)
         cu_q_lens_padded[: num_seqs + 1] = cu_q_lens
+        # [mixed, mixed + prefill, total]: decode rows are the tail range.
         if decode:
-            distribution = [num_seqs, num_seqs, num_seqs]
-        else:
             distribution = [0, 0, num_seqs]
+        else:
+            distribution = [num_seqs, num_seqs, num_seqs]
         sm_scale = 1.0 / math.sqrt(head_dim)
 
         def _reference(attention_sink):

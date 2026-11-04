@@ -123,6 +123,7 @@ class RadixAttention(nn.Module):
         self.tp_q_head_num = num_heads
         self.tp_k_head_num = num_kv_heads
         self.tp_v_head_num = num_kv_heads
+        self.dcp_q_heads_factor = 1
         self.head_dim = head_dim
         self.qk_head_dim = head_dim
         self.v_head_dim = v_head_dim if v_head_dim != -1 else head_dim
