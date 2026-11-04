@@ -276,6 +276,110 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertIs(target["forward_batch"].spec_info, metadata)
         self.assertTrue(target["is_verify"])
 
+    def test_verify_penalties_match_core_on_every_verify_row(self):
+        """Each request's penalty row applies to all its verify rows: core EAGLE's
+        relaxed rule (repeat_interleave, then the pre-grammar transforms)."""
+        from sglang.srt.sampling.penaltylib.repetition_penalty import (
+            apply_scaling_penalties,
+        )
+        from sglang_tpu.experimental.speculative.spec_ops import (
+            apply_verify_penalties,
+        )
+
+        torch.manual_seed(0)
+        pbs, width, vocab = 3, 4, 8
+        logits = torch.randn(pbs * width, vocab)
+        additive = torch.randn(pbs, vocab)
+        scaling = torch.rand(pbs, vocab) + 0.5
+        for add, scale in ((additive, scaling), (None, scaling), (additive, None)):
+            with self.subTest(additive=add is not None, scaling=scale is not None):
+                expected = logits.clone()
+                if add is not None:
+                    expected += add.repeat_interleave(width, dim=0)
+                if scale is not None:
+                    apply_scaling_penalties(
+                        expected, scale.repeat_interleave(width, dim=0)
+                    )
+                torch.testing.assert_close(
+                    apply_verify_penalties(logits, add, scale, width), expected
+                )
+        neutral = apply_verify_penalties(
+            logits, torch.zeros(pbs, vocab), torch.ones(pbs, vocab), width
+        )
+        torch.testing.assert_close(neutral, logits)
+
+    def test_penalty_snapshot_pads_live_rows_neutrally(self):
+        """Pad rows of the bucket get additive 0 and scaling 1, so they stay unchanged."""
+        from sglang_tpu.experimental.sampling.sampling_batch_info import (
+            HostPaddedSamplingInfo,
+        )
+
+        info = object.__new__(HostPaddedSamplingInfo)
+        info.device = "cpu"
+        info.real_batch_size = 2
+        info.acc_additive_penalties = torch.full((2, 4), -0.5)
+        info.acc_scaling_penalties = torch.full((2, 4), 1.05)
+        additive, scaling = info.device_penalties(4)
+        torch.testing.assert_close(
+            additive, torch.tensor([[-0.5] * 4] * 2 + [[0.0] * 4] * 2)
+        )
+        torch.testing.assert_close(
+            scaling, torch.tensor([[1.05] * 4] * 2 + [[1.0] * 4] * 2)
+        )
+        info.acc_additive_penalties = None
+        self.assertIsNone(info.device_penalties(4)[0])
+
+    def test_extend_sampling_penalizes_live_rows_of_bucket_logits(self):
+        """Extend logits keep the bucket rows while the penalty state has the live
+        rows; core's transform then failed "size of tensor a (8) must match the size
+        of tensor b (2)" and killed every scheduler at c16."""
+        from sglang_tpu.experimental.sampling.sampling_batch_info import (
+            HostPaddedSamplingInfo,
+        )
+
+        info = object.__new__(HostPaddedSamplingInfo)
+        info.device = "cpu"
+        info.real_batch_size = 2
+        info.acc_additive_penalties = torch.full((2, 4), -1.0)
+        info.acc_scaling_penalties = torch.full((2, 4), 2.0)
+        info.penalizer_orchestrator = None
+        logits = torch.full((4, 4), 4.0)
+        info._apply_pre_grammar_logits_transforms(logits)
+        torch.testing.assert_close(
+            logits, torch.tensor([[1.5] * 4] * 2 + [[4.0] * 4] * 2)
+        )
+
+        # Without the overlap scheduler the live penalizer sees only the live rows.
+        info.acc_additive_penalties = info.acc_scaling_penalties = None
+        info.penalizer_orchestrator = SimpleNamespace(
+            is_required=True, apply=lambda rows: rows.mul_(0.5)
+        )
+        logits = torch.full((4, 4), 4.0)
+        info._apply_pre_grammar_logits_transforms(logits)
+        torch.testing.assert_close(
+            logits, torch.tensor([[2.0] * 4] * 2 + [[4.0] * 4] * 2)
+        )
+
+    def test_extend_scaling_uses_the_platform_rebound_helper(self):
+        """Core wraps apply_scaling_penalties in torch.compile and the TPU platform
+        rebinds the module attribute to the plain function at startup; a copy bound
+        at import kept the compiled one and hit fail_on_recompile while serving."""
+        from sglang.srt.sampling.penaltylib import repetition_penalty
+        from sglang_tpu.experimental.sampling.sampling_batch_info import (
+            HostPaddedSamplingInfo,
+        )
+
+        info = object.__new__(HostPaddedSamplingInfo)
+        info.device = "cpu"
+        info.real_batch_size = 1
+        info.acc_additive_penalties = None
+        info.acc_scaling_penalties = torch.full((1, 4), 2.0)
+        info.penalizer_orchestrator = None
+        rebound = MagicMock()
+        with patch.object(repetition_penalty, "apply_scaling_penalties", rebound):
+            info._apply_pre_grammar_logits_transforms(torch.ones(2, 4))
+        rebound.assert_called_once()
+
     def setUp(self):
         super().setUp()
         # enterContext is 3.11+; CI runs 3.10.
