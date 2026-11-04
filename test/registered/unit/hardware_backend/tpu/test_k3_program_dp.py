@@ -149,6 +149,8 @@ class TestDpAllocator(CustomTestCase):
         self._extend(alloc, 4 * self.PAGE)  # group 0 full
         self.assertEqual(alloc.free_in_group(0), 0)
         self.assertEqual(alloc.available_size(), 0)  # the fuller group bounds both
+        idle = self._allocator(pages=9)  # an odd last page: idle availability is all of it
+        self.assertEqual(idle.available_size(), 9 * self.PAGE)
         landing = alloc.alloc_landing(1, 2)
         self.assertEqual({alloc.group_of_page(int(p)) for p in landing}, {1})
         self.assertIsNone(alloc.alloc_landing(1, 3))

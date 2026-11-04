@@ -61,19 +61,23 @@ class K3DpPagedAllocator(TpuPagedTokenToKVPoolAllocator):
         low = 1 + group * self.per_group
         return (pages >= low) & (pages < low + self.per_group)
 
-    def free_in_group(self, group: int) -> int:
-        free = self._region_mask(self.free_pages, group).sum()
-        released = (
-            self._region_mask(self.release_pages, group).sum()
-            if self.release_pages is not None and len(self.release_pages)
-            else 0
-        )
-        return int(free) + int(released)
+    def free_in_group(self, group: int, *, held: bool = False) -> int:
+        """Free pages of ``group``'s region (``held``: and those the free
+        fence holds until in-flight forwards finish)."""
+        lists = [self.free_pages]
+        if self.release_pages is not None and len(self.release_pages):
+            lists.append(self.release_pages)
+        if held:
+            lists += [ids for _, ids in self.held_pages._entries]
+        return sum(int(self._region_mask(pages, group).sum()) for pages in lists)
 
     def available_size(self):
         """What any one request can count on: the fuller group's free pages
-        bound both groups."""
-        return dp.GROUPS * min(self.free_in_group(g) for g in range(dp.GROUPS)) * self.page_size
+        bound both groups (all of them when idle, as the leak check expects,
+        an odd last page included)."""
+        per_group = min(self.free_in_group(g, held=True) for g in range(dp.GROUPS))
+        odd = self.num_pages - self.dp_pages
+        return (dp.GROUPS * per_group + odd) * self.page_size
 
     def pick_group(self) -> int:
         """A new request's group: fewest live requests, then most free pages."""
