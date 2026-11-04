@@ -472,6 +472,25 @@ def _deterministic_inference_enabled() -> bool:
 _GRAPH_POOL_BORROW_SLACK_BYTES = 64 << 20
 
 
+def input_logprob_chunk_bounds(
+    total: int, chunk_size: int, cuts: Optional[List[int]] = None
+) -> List[Tuple[int, int]]:
+    """Chunks ``[lo, hi)`` of ``total`` pruned rows: split at every cut, then each
+    segment into ``chunk_size`` pieces from its own start. Without cuts this is the
+    uniform ``chunk_size`` split.
+
+    The cuts come from ``LogitsMetadata.input_logprob_chunk_cuts_cpu``, which core
+    never sets; a platform may set it to fix the row sets the epilogue sees."""
+    edges = [0] + sorted(c for c in set(cuts or ()) if 0 < c < total) + [total]
+    bounds: List[Tuple[int, int]] = []
+    for lo, hi in zip(edges, edges[1:]):
+        start = lo
+        while start < hi:
+            bounds.append((start, min(start + chunk_size, hi)))
+            start += chunk_size
+    return bounds
+
+
 class InputLogprobProcessor:
     """Input (prefill) logprob processing: single-pass or chunked.
 
@@ -523,6 +542,14 @@ class InputLogprobProcessor:
         else:
             chunk_size = self.logprobs_chunk_size
 
+        # Optional cuts (LogitsMetadata.input_logprob_chunk_cuts_cpu) follow
+        # per-rank rows, so DP-attention ignores them for the same reason.
+        chunk_cuts = (
+            None
+            if skip_chunking_for_dp_attn
+            else getattr(logits_metadata, "input_logprob_chunk_cuts_cpu", None)
+        )
+
         borrow_logprob_memory = False
         if pruned_states.is_cuda:
             borrow_logprob_memory = self._can_borrow_logprob_memory(
@@ -539,6 +566,7 @@ class InputLogprobProcessor:
             get_logits_fn,
             logits_metadata,
             chunk_size,
+            chunk_cuts=chunk_cuts,
             borrow_logprob_memory=borrow_logprob_memory,
             borrow_logits_memory=(
                 borrow_logprob_memory and not skip_chunking_for_dp_attn
@@ -593,12 +621,14 @@ class InputLogprobProcessor:
         get_logits_fn: Callable,
         logits_metadata: LogitsMetadata,
         chunk_size: int,
+        chunk_cuts: Optional[List[int]] = None,
         borrow_logprob_memory: bool = False,
         borrow_logits_memory: bool = False,
     ) -> Tuple[LogprobResult, torch.Tensor]:
         """Compute input logprobs chunk by chunk to cap peak memory."""
         total_size = pruned_states.shape[0]
-        num_chunks = (total_size + chunk_size - 1) // chunk_size
+        chunk_bounds = input_logprob_chunk_bounds(total_size, chunk_size, chunk_cuts)
+        num_chunks = len(chunk_bounds)
 
         sample_indices_cpu = logits_metadata.sample_indices_cpu
         input_logprob_indices_cpu = logits_metadata.input_logprob_indices_cpu
@@ -630,10 +660,7 @@ class InputLogprobProcessor:
 
             fused_kernel, fused_max_k = row_logsumexp_topk, FUSED_TOPK_MAX_K
 
-        for i in range(num_chunks):
-            start_idx = i * chunk_size
-            end_idx = min((i + 1) * chunk_size, total_size)
-
+        for i, (start_idx, end_idx) in enumerate(chunk_bounds):
             # Notify lm_head LoRA about the current chunk so it can swap
             # to the precomputed per-chunk batch_info.  This is a no-op
             # for non-LoRA lm_head modules.

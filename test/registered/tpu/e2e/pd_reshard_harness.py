@@ -6,18 +6,10 @@ balancer. Prefill uses attention TP=16; decode uses DP=2 with attention TP=8 per
 replica, so the KV transfer reshards 16 prefill shards onto 8 decode shards per
 replica via FAN_IN (2:1).
 
-Everything both models share lives here -- profiles, engine launch, role
-dispatch, probes and gsm8k. The dashboard contract is one job to one test file,
-so each model gets a thin sibling that carries the registration and calls
-main():
-
-  test_tpu_gpt_oss_120b_pd_multihost_kv_offload_resharding.py     -> main("gpt_oss_120b")
-  test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py -> main("qwen3_coder_480b")
-
-Keeping both profiles here rather than in those files keeps the model matrix in
-one place; a file selects one by key. This module registers itself as a disabled
-helper, since run_suite requires a registration from every file under
-test/registered but this one owns no row.
+Profiles, engine launch, role dispatch, probes and GSM8K live here. The Qwen3
+nightly wrapper selects its profile with main("qwen3_coder_480b"); the GPT-OSS
+profile remains available for manual runs. This module registers as a disabled
+helper because it owns no test row.
 
 What each verification proves:
   * quality:       gsm8k through the LB must clear the model's accuracy floor
@@ -444,6 +436,8 @@ def _common_launch_env(
         "TPU_TELEMETRY_INTERVAL_SEC": "86400",
         "TPU_DIAGNOSTIC_HARVESTER_INTERVAL_SEC": "86400",
         "PYTHON": PYTHON,
+        # Raiden's reshard push needs a host buffer per layer.
+        "SGLANG_TPU_RAIDEN_STAGING_LAYERS": "0",
         **profile.extra_launch_env,
     }
 

@@ -114,6 +114,43 @@ class TestWanTI2VHelpers(unittest.TestCase):
         self.assertTrue(torch.all(timestep[:, :4] == 0))
         self.assertTrue(torch.all(timestep[:, 4:] == 1000))
 
+    def test_expanded_timestep_matches_across_sp_ranks(self):
+        full_mask = torch.ones(1, 3, 4, 4, dtype=torch.bfloat16)
+        full_mask[:, 0] = 0
+        t = torch.tensor(999.0)
+
+        def expand(rank, latent_frames, mask):
+            batch = SimpleNamespace(
+                raw_latent_shape=(1, 16, 3, 4, 4),
+                latents=torch.empty(1, 16, latent_frames, 4, 4),
+            )
+            # Building timesteps must not consult the SP rank at all.
+            with patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_ti2v.get_sp_parallel_rank",
+                side_effect=AssertionError("consulted the SP rank"),
+            ):
+                return expand_wan_ti2v_timestep(
+                    batch,
+                    t,
+                    torch.bfloat16,
+                    seq_len=12,
+                    reserved_frames_mask=mask,
+                    patch_size=(1, 2, 2),
+                )
+
+        single_device = expand(0, 3, full_mask)
+        self.assertTrue(torch.all(single_device[:, :4] == 0))
+        # 999 is not a bfloat16 value; every rank rounds it the same way.
+        self.assertTrue(torch.all(single_device[:, 4:] == t.to(torch.bfloat16)))
+
+        # Latents not sharded: every rank holds and embeds the whole video.
+        for rank in range(3):
+            self.assertTrue(torch.equal(expand(rank, 3, full_mask), single_device))
+
+        # Latents sharded over time: rank r holds frame r.
+        shards = [expand(r, 1, full_mask[:, r : r + 1]) for r in range(3)]
+        self.assertTrue(torch.equal(torch.cat(shards, dim=1), single_device))
+
     def test_video_latent_sp_padding_is_trimmed_on_time_dim(self):
         batch = SimpleNamespace(raw_latent_shape=(1, 16, 21, 4, 4))
         latents = torch.empty(1, 16, 22, 4, 4)

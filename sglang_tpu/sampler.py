@@ -10,7 +10,9 @@ from typing import NamedTuple, Optional
 
 import torch
 
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.sampler import (
+    SYNC_TOKEN_IDS_ACROSS_TP,
     Sampler,
     _SamplingMaskCapture,
     _select_sampling_mask_rows,
@@ -558,6 +560,23 @@ class TpuSampler(Sampler):
         batch_next_token_ids = batch_next_token_ids.to(torch.int64)
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
         return batch_next_token_ids
+
+    def _sync_token_ids_across_tp(
+        self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
+    ):
+        if not (SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars):
+            return
+        parallel = get_parallel()
+        if is_dp_attention_enabled():
+            # A TPU subgroup collective launches on every device of the slice, and
+            # only some DP groups hold grammar requests: a grammar-only sync hangs.
+            if not SYNC_TOKEN_IDS_ACROSS_TP:
+                return
+            tp_group = parallel.attn_tp_group
+        else:
+            tp_group = parallel.tp_group
+        # Broadcast, not MIN all-reduce: TPU has no MIN all-reduce.
+        tp_group.broadcast(batch_next_token_ids, src=0)
 
     def _sample_from_probs(
         self,

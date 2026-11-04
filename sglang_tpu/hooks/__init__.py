@@ -55,6 +55,7 @@ from sglang_tpu.hooks.kimi_k3_vision import (
     encode_with_k3_vision_runner,
     pass_through_projected_features,
 )
+from sglang_tpu.hooks.logprob_grid import hook_specs as logprob_grid_hooks
 from sglang_tpu.hooks.mhc import (
     hc_ffn_post_pre,
     hc_post,
@@ -66,6 +67,9 @@ from sglang_tpu.hooks.moe_topk import (
     biased_grouped_topk,
     biased_topk,
     register_router_topk,
+)
+from sglang_tpu.hooks.padded_logits_sampling import (
+    hook_specs as padded_logits_sampling_hooks,
 )
 from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
@@ -312,6 +316,10 @@ HOOKS.extend(hicache_swa_metrics_hooks())
 HOOKS.extend(swa_miss_metrics_hooks())
 
 HOOKS.extend(hook_specs())
+
+HOOKS.extend(padded_logits_sampling_hooks())
+
+HOOKS.extend(logprob_grid_hooks())
 
 _registered = False
 

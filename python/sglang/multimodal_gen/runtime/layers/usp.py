@@ -968,3 +968,72 @@ def _ring_attention_varlen(
             pending_ops = None
             cur = nxt
     return out_acc.to(q.dtype)
+
+
+def allgather_kv_ring_attn(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_impl: "AttentionImpl",
+    kv_real_len: int | None = None,
+) -> torch.Tensor:
+    """Ring attention over all-gathered K/V; inputs and output are [B, S, H, D].
+
+    The local shard is attended first so the gather can overlap it; each later
+    shard resumes the softmax inside the attention kernel
+    (``AttentionImpl.forward_ring_resume``), so there is no merge pass.
+
+    Ring rank ``r`` holds keys ``[r * S, (r + 1) * S)``. With tail padding,
+    keys from ``kv_real_len`` on are skipped and the query rows past it are
+    zeroed. Which shard is local and how many real keys each shard holds
+    depend on the rank, so they reach the kernel as device data: ranks running
+    collectives inside one compiled program must compile the same program.
+
+    Nothing rotates: K/V of the whole ring group stay resident on every device
+    (about ``2 * S_total * H_kv * D`` elements), and only the local shard's
+    compute (1/R of the layer) can hide the gathers. Bytes on the wire equal a
+    p2p ring's; this trades memory for not needing p2p, which TPU lacks.
+    Query and key shards may differ in length (cross-attention between two
+    sequence-sharded streams, e.g. LTX-2 video and audio); query rows past
+    ``kv_real_len`` are zeroed only for self-attention.
+    """
+    ring_pg = get_sp_group().ring_group
+    assert ring_pg is not None, "Ring process group is not initialized."
+    world_size = dist.get_world_size(group=ring_pg)
+    batch, shard_len, kv_heads = key.shape[:3]
+    self_attention = query.shape[1] == shard_len
+    padded = kv_real_len is not None and kv_real_len < world_size * shard_len
+    if kv_real_len is None:
+        kv_real_len = world_size * shard_len
+    # This rank's ring position as data: an all-to-all of [0, .., R-1] hands
+    # rank r the value r. Issued before the K/V gathers it gates. A per-process
+    # constant tensor would skip the collective, but a compiler may fold it
+    # into a rank-specialised program, which breaks one-program-per-rank.
+    positions = torch.arange(world_size, dtype=torch.float32, device=key.device)
+    rank_t = ft_c.all_to_all_single(positions, None, None, group=ring_pg)
+    # Heads-major shards, the kernel's layout: the gathered K/V need no
+    # relayout.
+    query = query.transpose(1, 2).contiguous()
+    key = key.transpose(1, 2).contiguous()
+    value = value.transpose(1, 2).contiguous()
+    keys = ft_c.all_gather_tensor(key, 0, group=ring_pg)
+    values = ft_c.all_gather_tensor(value, 0, group=ring_pg)
+    rank_t = _maybe_wait(rank_t)[0].to(torch.int32)
+
+    def kv_info(shard_t: torch.Tensor, row_offset_t: torch.Tensor) -> torch.Tensor:
+        real = (kv_real_len - shard_t * shard_len).clamp(0, shard_len)
+        return torch.stack([row_offset_t, real]).to(torch.int32)
+
+    out, carry = attn_impl.forward_ring_resume(
+        query, key, value, kv_info(rank_t, torch.zeros_like(rank_t))
+    )
+    keys, values = _maybe_wait(keys), _maybe_wait(values)
+    for step in range(1, world_size):
+        peer_t = (rank_t + step) % world_size
+        out, carry = attn_impl.forward_ring_resume(
+            query, keys, values, kv_info(peer_t, peer_t * batch * kv_heads), carry
+        )
+    if padded and self_attention:
+        rows = rank_t * shard_len + torch.arange(shard_len, device=out.device)
+        out = torch.where((rows < kv_real_len)[:, None], out, 0)
+    return out.transpose(1, 2)

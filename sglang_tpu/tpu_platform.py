@@ -480,13 +480,13 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
         cfg.tp_size == 2
         and cfg.attn_cp_size == 1
         and cfg.attn_dp_size == 1
-        and cfg.ep_size == 1
+        and cfg.ep_size in (1, 2)
     )
     if cfg.tp_size > 1 and cfg.attn_cp_size != cfg.tp_size and not stage_is_tp_pair:
         raise NotImplementedError(
             "Pipeline parallelism on TPU requires --tp-size 1, a tensor-parallel "
-            "pair (--tp-size 2 with --attn-cp-size 1, no DP attention or expert "
-            "parallelism) or --attn-cp-size equal to --tp-size (got --tp-size "
+            "pair (--tp-size 2 with --attn-cp-size 1, --ep-size 1 or 2, "
+            "no DP attention) or --attn-cp-size equal to --tp-size (got --tp-size "
             f"{cfg.tp_size} with --attn-cp-size {cfg.attn_cp_size} and --pp-size "
             f"{pp})."
         )
@@ -882,12 +882,6 @@ def _validate_decode_context_parallel(server_args) -> None:
             "--decode-context-parallel-size > 1 on TPU (got "
             f"{cfg.speculative_algorithm!r})."
         )
-    if cfg.enable_mixed_chunk:
-        raise ValueError(
-            "--enable-mixed-chunk is not supported with "
-            "--decode-context-parallel-size > 1 on TPU: the DCP attention runs "
-            "plain decode and extend batches only."
-        )
     if cfg.attn_dp_size > 1:
         raise ValueError(
             "DP attention (--attn-dp-size > 1) is not supported with "
@@ -922,12 +916,6 @@ def _validate_decode_context_parallel(server_args) -> None:
             "LSEs and sums the outputs with zero-padded all-reduces, got "
             f"{cfg.dcp_comm_backend!r}."
         )
-    if cfg.dcp_replicate_q_proj:
-        raise ValueError(
-            "--dcp-replicate-q-proj is not supported with "
-            "--decode-context-parallel-size > 1 on TPU: it only applies to the "
-            "a2a/fi_a2a exchange on MLA attention."
-        )
     if not cfg.enable_torch_compile:
         raise ValueError(
             "--enable-torch-compile is required with "
@@ -945,17 +933,17 @@ def _validate_decode_context_parallel(server_args) -> None:
             "--decode-context-parallel-size > 1 on TPU: the DCP attention "
             "metadata is built from a host-resident req_to_token."
         )
-    if _uses_seq_along_lane_kv():
+    if cfg.kv_cache_dtype not in (
+        "auto",
+        "bf16",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+        "fp8_e5m2",
+    ):
         raise ValueError(
-            "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV=1 is not supported with "
-            "--decode-context-parallel-size > 1 on TPU: the DCP KV write "
-            "targets the token-major fused KV cache."
-        )
-    if cfg.kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
-        raise ValueError(
-            "--decode-context-parallel-size > 1 on TPU supports only a bf16 KV "
-            "cache (--kv-cache-dtype bfloat16), got --kv-cache-dtype "
-            f"{cfg.kv_cache_dtype}."
+            "--decode-context-parallel-size > 1 on TPU supports only a bf16 or fp8 "
+            f"KV cache (--kv-cache-dtype bfloat16, fp8_e4m3, or fp8_e5m2), got --kv-cache-dtype {cfg.kv_cache_dtype}."
         )
     chunk = cfg.chunked_prefill_size
     if chunk is None:
@@ -970,9 +958,9 @@ def _validate_decode_context_parallel(server_args) -> None:
         )
     # TODO(yinlin09): lift once DCP4/DCP8 pass the e2e gate on the pinned stack;
     # DCP8 served on torch_tpu 0.1.1.dev20260914 with libtpu 0.0.47.
-    if dcp_size > 2:
+    if dcp_size > 8:
         raise ValueError(
-            "--decode-context-parallel-size must be 1 or 2 on TPU, got "
+            "--decode-context-parallel-size must be 1, 2, 4 or 8 on TPU, got "
             f"{dcp_size}: with more ranks the forward stalls in warmup with the "
             "SparseCore gather offloads off and returns wrong first tokens with "
             "them on."
@@ -1339,6 +1327,13 @@ class TpuSRTPlatform(SRTPlatform):
                 "TPU GDN/KDA prefix caching requires mamba_chunk_size=64."
             )
 
+    def create_weight_update_receiver(self, backend: str, *, tp_rank: int):
+        from sglang_tpu import shared_slice
+
+        if backend != shared_slice.BACKEND_NAME:
+            return None
+        return shared_slice.receiver(tp_rank)
+
     def get_mamba_pool_cls(self) -> type:
         # Hybrid GDN models (Qwen3.5 / Qwen3-Next) store their recurrent state
         # in a TPU-native, Pallas-kernel-layout pool.
@@ -1486,6 +1481,9 @@ class TpuSRTPlatform(SRTPlatform):
         # location space and replicates K/V heads within a DCP group.
         return True
 
+    def dcp_replicates_q_heads(self) -> bool:
+        return True
+
     def supports_moe_dp_pipeline_stages(self) -> bool:
         return True
 
@@ -1527,6 +1525,13 @@ class TpuSRTPlatform(SRTPlatform):
                 "TorchTPU backend initialization requires worker WORLD_SIZE. "
                 "Initialize it from the scheduler worker bootstrap."
             )
+        from sglang_tpu import shared_slice
+
+        shared = shared_slice.spec()
+        if shared is not None:
+            # libtpu builds the whole slice, trainer included, from these
+            job = shared_slice.enter_slice_env(shared)
+            world_size = os.environ["WORLD_SIZE"]
 
         # Keep c10d_functional collectives inside the compiled graph. torch_tpu
         # defaults to materializing collective tensors by forcing graph breaks, which
@@ -1583,6 +1588,8 @@ class TpuSRTPlatform(SRTPlatform):
             from sglang_tpu.fp8_linear import register_fp8_linear_small_m_op
 
             register_fp8_linear_small_m_op()
+        if shared is not None:
+            shared_slice.join(shared, job)
         # Set before registering: importing the model registry imports model_runner,
         # which calls init_backend again on the OOT path.
         self._backend_initialized = True
@@ -1640,11 +1647,7 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang_tpu.pp_stage_chips import (
             validate_chips_for_pp,
         )
-        from sglang_tpu.pp_stage_groups import (
-            make_stage_groups_standalone,
-        )
 
-        make_stage_groups_standalone(get_parallel())
         validate_chips_for_pp(get_parallel())
         # Before the first collective and before torch.compile traces the model.
         from sglang_tpu.twolevel_allreduce import register_from_parallel_state
@@ -1681,6 +1684,12 @@ class TpuSRTPlatform(SRTPlatform):
         return float(total - free)
 
     def get_device(self, device_id: int = 0) -> torch.device:
+        from sglang_tpu import shared_slice
+
+        # a worker on a shared slice sees only its own device, at index 0; joining
+        # started PJRT, so torch_tpu checks the index against that one device
+        if shared_slice.joined():
+            return torch.device("tpu", 0)
         return torch.device("tpu", device_id)
 
     def set_device(self, device: torch.device) -> None:

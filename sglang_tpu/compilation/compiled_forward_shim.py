@@ -32,6 +32,12 @@ from sglang_tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
 )
+from sglang_tpu.compilation.logit_rows import (
+    build_logit_rows,
+    identity_reasons,
+    logit_rows_enabled,
+    takes_logit_rows,
+)
 from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
@@ -864,6 +870,9 @@ class CompiledForwardShim:
         # it is frozen for this shim's lifetime. Caching it also keeps the
         # disabled path at a single attribute read per forward.
         self._prompt_logprob_enabled = envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
+        # LR1 logit rows (sglang_tpu/compilation/logit_rows.py): read once, like
+        # the prompt-logprob flag, since it decides the EXTEND graph's inputs.
+        self._logit_rows_enabled = logit_rows_enabled()
         runner = policy.model_runner
         # Draft models read the multimodal embeds inside their forward.
         self._draft_worker = bool(
@@ -1067,6 +1076,26 @@ class CompiledForwardShim:
             if rejection is not None:
                 raise NotImplementedError(rejection)
         saved: dict[str, Any] = {}
+        if self._logit_rows_enabled and takes_logit_rows(forward_batch):
+            # Every EXTEND forward carries the packed rows (one fixed-shape
+            # tensor input of the same graph). Read the batch's own capture
+            # mode and logprob request before they are rewritten below.
+            real_b = getattr(forward_batch, _REAL_B_KEY, None)
+            identity = bool(
+                identity_reasons(
+                    forward_batch,
+                    wants_input_logprob=wants_input_logprob,
+                    capture_hidden_mode=forward_batch.capture_hidden_mode,
+                    real_b=real_b,
+                )
+            )
+            saved["logit_rows"] = forward_batch.logit_rows
+            forward_batch.logit_rows = build_logit_rows(
+                forward_batch,
+                identity=identity,
+                real_b=real_b,
+                device=forward_batch.input_ids.device,
+            )
         if self._prompt_logprob_enabled and forward_batch.forward_mode.is_extend():
             saved["capture_hidden_mode"] = forward_batch.capture_hidden_mode
             forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
@@ -1142,6 +1171,21 @@ class CompiledForwardShim:
                         args=args, input_ids=input_ids, forward_batch=forward_batch
                     )
             out = fn(input_ids, positions, forward_batch, *args, **kwargs)
+            if isinstance(out, PendingCall) and "logit_rows" in saved:
+                # A deferred call (direct_compile.warmup_async) reads its tensor
+                # inputs from forward_batch only when it runs, after the finally
+                # below has restored logit_rows; it was traced with the rows, so
+                # the rows go back on the batch for exactly that run.
+                deferred, rows = out, forward_batch.logit_rows
+
+                def run_with_logit_rows() -> Any:
+                    previous = _pin_fields(forward_batch, {"logit_rows": rows})
+                    try:
+                        return deferred.wait()
+                    finally:
+                        _restore_fields(forward_batch, previous)
+
+                out = PendingCall(run_with_logit_rows)
             if isinstance(out, PendingCall):
                 finalize_fields = {key: getattr(forward_batch, key) for key in saved}
                 finalize_fields["is_prefill_only"] = forward_batch.is_prefill_only

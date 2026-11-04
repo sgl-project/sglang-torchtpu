@@ -152,6 +152,11 @@ class TpuEnvs:
     # Muse Spark: whole-decoder Pallas megakernel for decode and DFlash target-verify
     # steps, with fp8 dense weight copies and an fp8 weight-only LM head.
     SGLANG_TPU_MUSE_MEGAKERNEL = EnvBool(False)
+    # Muse NVFP4: keep the BF16 experts of the first and last layers BF16, on fused-RS
+    # or gmm_v2. By default they are quantized to FP8 on host at load, as are all
+    # experts of a BF16 checkpoint. The Muse megakernel reads only fp4 or fp8 experts,
+    # so it cannot be combined with this.
+    SGLANG_TPU_ENABLE_MUSE_BF16_FIRST_LAST_LAYER_EXPERTS = EnvBool(False)
     # Fused KV pool stores a rank's heads side by side in one 128-lane row when they
     # fit exactly (e.g. 2 x head_dim 64): half the bytes of a zero-padded row per head.
     SGLANG_TPU_KV_PACK_HEADS = EnvBool(False)
@@ -160,6 +165,24 @@ class TpuEnvs:
     # Both P/D servers must agree; tpu_platform refuses the configurations that
     # read layer by layer.
     SGLANG_TPU_USE_BLOCK_MAJOR_KV = EnvBool(False)
+    # Vision encoder flash attention: q tile (0 = the kernel's default blocks).
+    # The kernel keeps a single k step (block_k = kv_len, softmax over the whole
+    # row); 256 is bit-exact with the default tile on tpu7x, 512+ differ at bf16
+    # rounding level. Applied only while kv_len <=
+    # SGLANG_TPU_VISION_FLASH_BLOCK_Q_MAX_SEQ: a 256-row q tile at the 8K-16K
+    # image buckets halted the TPU during warmup.
+    SGLANG_TPU_VISION_FLASH_BLOCK_Q = EnvInt(0)
+    SGLANG_TPU_VISION_FLASH_BLOCK_Q_MAX_SEQ = EnvInt(4096)
+    # Vision encoder flash attention: compute only the key chunks whose segments
+    # meet each query block (band-skip kernel). Byte-identical to the dense
+    # kernel at the shapes it covers (kv_len 3072-12288 at a 256-row q tile,
+    # 16384 at the default 128); other shapes keep the dense kernel.
+    SGLANG_TPU_VISION_FLASH_BAND_SKIP = EnvBool(False)
+
+    # Largest decode batch (tokens) that `--moe-runner-backend pallas_tpu_fused_decode`
+    # runs with the fused MoE decode kernel (`sglang_tpu/moe/pallas/fused_moe_decode`);
+    # larger batches use gmm_v2.
+    SGLANG_TPU_FUSED_MOE_DECODE_MAX_TOKENS = EnvInt(256)
 
     # Raiden PD disaggregation
     # Base control port. Each local rank reserves consecutive control/data
@@ -173,8 +196,13 @@ class TpuEnvs:
     # Threads pushing resharded KV off the listener thread.
     SGLANG_RAIDEN_PUSH_WORKERS = EnvInt(1)
 
-    # Host staging budget per node, split across local ranks and engines.
-    SGLANG_RAIDEN_HOST_POOL_GB = EnvFloat(128.0)
+    # Host staging budget per node, split across local ranks.
+    SGLANG_RAIDEN_HOST_POOL_GB = EnvFloat(24.0)
+    # Host layer buffers across full-attention and SWA engines, split by layer
+    # count with at least one each. 0 keeps full mirrors.
+    # More buffers, or 0, make each slot larger. Raise SGLANG_RAIDEN_HOST_POOL_GB
+    # with it to keep the slot count and concurrent transfers.
+    SGLANG_TPU_RAIDEN_STAGING_LAYERS = EnvInt(8)
     # Maximum pages per request. 0 derives the limit from the context/window.
     SGLANG_RAIDEN_MAX_BLOCKS = EnvInt(0)
     SGLANG_RAIDEN_SWA_MAX_BLOCKS = EnvInt(0)
@@ -258,6 +286,15 @@ class TpuEnvs:
     # of the request. Off keeps the extend graph and the serving path exactly as
     # they are today, and a request asking for prompt logprobs is rejected.
     SGLANG_TPU_ENABLE_PROMPT_LOGPROB = EnvBool(False)
+    # Cut the eager input-logprob chunks of a forward holding one request at every
+    # multiple of this many rows from the request's first row (hooks/logprob_grid.py),
+    # so a prefill chunk larger than the grid hands the epilogue the same row sets as
+    # grid-sized chunks. 0 registers no hook.
+    SGLANG_TPU_LOGPROB_GRID_ROWS = EnvInt(0)
+    # Put each request's logit row on ForwardBatch.logit_rows before every plain
+    # EXTEND forward (compilation/logit_rows.py), for models that run their last
+    # layer on those rows only. Off leaves the field None.
+    SGLANG_TPU_FOUR_STAGE_LOGIT_ROWS = EnvBool(False)
     # Preserve FP32 expert scales and apply GMM partial scales in FP32.
     SGLANG_TPU_FP8_MOE_FP32_SCALES = EnvBool(False)
     # Store INT4 MoE group scales as f32 instead of bf16 (66 MB per layer per
@@ -326,6 +363,17 @@ class TpuEnvs:
     # TODO: Remove once the issue gets resolved in libtpu version > 0.0.47
     # (likely 0.0.48).
     SGLANG_TPU_LIBTPU_WORKAROUND_FOR_ONLINE_QUANT_SCALE = EnvBool(True)
+
+    # Sampling
+    # Keep the repetition-penalty state padded to the power-of-two logits row
+    # bucket and run the scaling penalty and greedy argmax on the padded logits
+    # (sampling/padded_logits.py). Same per-row ops, so the same tokens. Opt-in:
+    # speculative decoding expands the penalties per request.
+    SGLANG_TPU_PADDED_LOGITS_SAMPLING = EnvBool(False)
+    # Shared compilation (--use-spmd-compile): a trace-cost profile JSON that
+    # assigns each shared graph to the least-loaded rank (shared_compile_cost.py).
+    # Empty: round-robin owners.
+    SGLANG_TPU_SHARED_COMPILE_COST_PROFILE = EnvStr("")
 
     @classmethod
     def names(cls) -> list[str]:
