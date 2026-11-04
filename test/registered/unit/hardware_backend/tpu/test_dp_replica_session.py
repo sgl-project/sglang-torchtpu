@@ -290,7 +290,7 @@ def test_tp1_session_keeps_distributed_initialization_engine_local(monkeypatch):
     )
     seen = []
     tensor = Mock()
-    tensor.sum.return_value.item.side_effect = lambda: seen.append(dict(os.environ))
+    tensor.item.side_effect = lambda: seen.append(dict(os.environ))
     monkeypatch.setattr(dp_replicas.torch, "ones", lambda *args, **kwargs: tensor)
     initialize = Mock()
     create_group = Mock()

@@ -168,7 +168,7 @@ class ReplicaSession:
                 )
             os.environ["TORCH_TPU_TOPOLOGY"] = topology
             # Materialize PJRT while its environment still describes the host.
-            torch.ones(1, device="tpu").sum().item()
+            torch.ones(1, device="tpu").item()
             if self.tp_size == 1:
                 # No TPU collectives: SGLang creates a separate singleton Gloo
                 # world per engine after restoring its local rank below.
