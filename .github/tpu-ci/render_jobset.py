@@ -288,6 +288,7 @@ def main():
         pvc = a.weights_pvc
         vals = {
             "IMAGE": a.image,
+            "CHECKPOINT_PREFETCH": "1" if a.nightly or a.lane == "nightly" else "0",
             "ACTIVE_DEADLINE": str(_PD_ACTIVE_DEADLINE),
             "EXEC_CMD": a.exec_cmd,
             "TEST_FILES": a.files,
@@ -374,6 +375,7 @@ def main():
     pvc = a.weights_pvc
     vals = {
         "IMAGE": a.image,
+        "CHECKPOINT_PREFETCH": "1" if a.nightly or a.lane == "nightly" else "0",
         "ACTIVE_DEADLINE": str(active_deadline),
         "EXEC_CMD": a.exec_cmd,
         "HOSTS": str(hosts),

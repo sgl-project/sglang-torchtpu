@@ -22,7 +22,10 @@ cc_binary(
 
 py_library(
     name = "launcher",
-    srcs = ["launch_server.py"],
+    srcs = [
+        "ci_checkpoint_prefetch.py",
+        "launch_server.py",
+    ],
     data = [
         "dump_meta.py",
         ":libtpu_telemetry_stub.so",
