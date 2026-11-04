@@ -20,7 +20,7 @@ from typing import Any, Mapping
 import requests
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.ci.metrics import dump_metric
+from sglang.test.test_utils import dump_metric
 from sglang.test.tpu import MUSE_SPARK
 from sglang.test.tpu.utils.kv_offload_probe import (
     generate_with_cache_report,
