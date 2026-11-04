@@ -174,6 +174,8 @@ def worker_forward(original, worker, batch, *args, **kwargs):
         return original(worker, batch, *args, **kwargs)
     if batch is None:
         raise NotImplementedError("Host Engram needs a scheduled request batch")
+    # prepare does not wait for step N's sampled token; the first Engram staging
+    # call does, after batch build, metadata and segment A are issued.
     requests, positions = coordinator.prepare(batch)
     try:
         result = original(worker, batch, *args, **kwargs)

@@ -14,6 +14,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any
 
+import msgspec
 import numpy as np
 import torch
 
@@ -92,21 +93,41 @@ class PendingTokens:
         return int(self._tokens[entry[2]])
 
 
+class DeferredEngramInputs(msgspec.Struct, frozen=True):
+    """HostEngramInputs windows with holes for tokens whose copies are in flight.
+    Each hole is (request, position, flat cell indices into tokens).
+    """
+
+    tokens: np.ndarray
+    positions: np.ndarray
+    holes: list
+
+    def resolve(self, pending: PendingTokens | None) -> HostEngramInputs:
+        """Fill the holes from the previous step's result; waits for its copy."""
+        if self.holes:
+            flat = self.tokens.reshape(-1)
+            for req, position, cells in self.holes:
+                flat[cells] = pending.read(req, position)
+        return HostEngramInputs(tokens=self.tokens, positions=self.positions)
+
+
 def capture_inputs(
     requests,
     starts: list[int],
     lengths: list[int],
     ngram: int,
     pending: PendingTokens | None = None,
-) -> HostEngramInputs:
+) -> DeferredEngramInputs:
     """Snapshot only each scheduled chunk and its n-1 predecessors.
 
     ``starts`` must come from the scheduled batch (prefix_lens for extend,
     seq_lens_cpu - 1 for decode). Request output_ids can lag by one under
-    overlap; only that missing token is resolved from the previous result.
+    overlap; a hole marks that missing token.
+    Capture never waits for the previous step's sampled-token copy.
     """
-    windows, all_positions = [], []
+    windows, all_positions, holes = [], [], []
     shifts = np.arange(ngram, dtype=np.int64)
+    row_base = 0
     for req, start, length in zip(requests, starts, lengths, strict=True):
         if start < 0 or length < 0:
             raise ValueError("Engram chunk start and length must be non-negative")
@@ -121,18 +142,24 @@ def capture_inputs(
         source = list(prompt[lo : min(stop, prompt_len)])
         if stop > prompt_len:
             source.extend(output[max(0, lo - prompt_len) : stop - prompt_len])
+        missing = []
         for position in range(max(lo, known_end), stop):
             if pending is None:
                 raise RuntimeError(
                     f"Engram input token at position {position} is not available on host"
                 )
-            source.append(pending.read(req, position))
+            missing.append((position, len(source)))
+            source.append(-1)
         positions = np.arange(start, stop, dtype=np.int64)
         past = positions[:, None] - shifts
         indices = np.maximum(past - lo, 0)
         windows.append(np.asarray(source, dtype=np.int64)[indices])
         all_positions.append(positions)
-    return HostEngramInputs(
+        for position, slot in missing:
+            rows, cols = np.nonzero(indices == slot)
+            holes.append((req, position, (row_base + rows) * ngram + cols))
+        row_base += length
+    return DeferredEngramInputs(
         tokens=(
             np.concatenate(windows) if windows else np.empty((0, ngram), dtype=np.int64)
         ),
@@ -141,6 +168,7 @@ def capture_inputs(
             if all_positions
             else np.empty(0, dtype=np.int64)
         ),
+        holes=holes,
     )
 
 
@@ -255,6 +283,8 @@ class HostEngramCoordinator:
         self.pending: PendingTokens | None = None
         self.hashes: torch.Tensor | None = None
         self.started = False
+        # This step's windows while the previous step's sampled token is in flight.
+        self.deferred: DeferredEngramInputs | None = None
 
     def prepare(self, batch) -> tuple[list, list[int]]:
         if not batch.spec_algorithm.is_none():
@@ -274,13 +304,29 @@ class HostEngramCoordinator:
         else:
             raise NotImplementedError(f"Host Engram does not support {mode}")
         requests = list(batch.reqs)
-        inputs = capture_inputs(requests, starts, lengths, self.ngram, self.pending)
-        self.hashes = hash_on_host(inputs, **self.tables, pad_id=self.pad_id)
+        self.hashes = None
+        self.deferred = capture_inputs(
+            requests, starts, lengths, self.ngram, self.pending
+        )
+        if not self.deferred.holes:
+            self.resolve()
         self.started = True
         return requests, [s + n for s, n in zip(starts, lengths, strict=True)]
 
+    def resolve(self) -> torch.Tensor | None:
+        """Fill the holes from the previous step's result, waiting for its copy, then hash.
+
+        Later calls in the same step return the same hashes without waiting.
+        """
+        if self.deferred is not None:
+            inputs = self.deferred.resolve(self.pending)
+            self.hashes = hash_on_host(inputs, **self.tables, pad_id=self.pad_id)
+            self.deferred = None
+        return self.hashes
+
     def begin_step(self, padded_tokens: int) -> None:
-        if self.hashes is not None and self.hashes.shape[0] > padded_tokens:
+        pending = self.hashes if self.deferred is None else self.deferred.tokens
+        if pending is not None and pending.shape[0] > padded_tokens:
             raise ValueError("Host Engram rows exceed the padded local token count")
         self.padded_tokens = padded_tokens
 
@@ -291,7 +337,7 @@ class HostEngramCoordinator:
         its previous tensor through the runtime, so staging cannot overwrite an
         in-flight reader. The blocking copy completes before the next dispatch.
         """
-        hashes = self.hashes
+        hashes = self.resolve()
         if hashes is None:
             if self.started:
                 raise RuntimeError("Host Engram forward has no prepared request inputs")
@@ -319,3 +365,4 @@ class HostEngramCoordinator:
 
     def clear_step(self) -> None:
         self.hashes = None
+        self.deferred = None
