@@ -92,6 +92,10 @@ class WanVAEConfig(VAEConfig):
     def auto_parallel_decode_prefers_spatial_shard(self) -> bool:
         return True
 
+    def auto_parallel_decode_shards_without_p2p(self) -> bool:
+        # Faster with all-gathered halos than decoding on one rank.
+        return True
+
     def get_vae_scale_factor(self):
         # Wan VAE does not expose block_out_channels like SD-style VAEs.
         # Its spatial downsample factor is explicitly defined by scale_factor_spatial.

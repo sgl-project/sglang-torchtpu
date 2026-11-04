@@ -10,7 +10,10 @@ issuing pulls the pool cannot seat.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+import logging
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 class StagingAdmission:
@@ -114,12 +117,14 @@ def _exceeds(pages: int, capacity: Optional[int]) -> bool:
     return pages > 0 and (capacity is None or pages > capacity)
 
 
-def slot_host_bytes(kv_caches: List[Any], max_blocks: int) -> int:
+def slot_host_bytes(
+    kv_caches: List[Any], max_blocks: int, layers: Optional[int] = None
+) -> int:
     """Host staging bytes one transfer slot reserves.
 
-    Raiden allocates ``max_blocks`` pages of host memory for every layer, so a
-    slot costs the widest layer's page times the layer count times the per-slot
-    block budget.
+    Raiden allocates ``max_blocks`` pages of host memory for each of ``layers``
+    host buffers, every layer by default, so a slot costs the widest layer's
+    page times the buffer count times the per-slot block budget.
     """
     page_bytes = 0
     for buf in kv_caches:
@@ -127,7 +132,29 @@ def slot_host_bytes(kv_caches: List[Any], max_blocks: int) -> int:
         for dim in buf.shape[1:]:
             layer_bytes *= int(dim)
         page_bytes = max(page_bytes, layer_bytes)
-    return page_bytes * len(kv_caches) * max_blocks
+    return page_bytes * (len(kv_caches) if layers is None else layers) * max_blocks
+
+
+# SWA and state slots per full-attention slot, for dynamic staging only (fixed
+# slots use one). Shorter transfers share full-attention pages, but each fills
+# a whole window. Picked by hand, not measured. Ideally about the typical
+# prefill length over the sliding window, so SWA slots don't cap concurrent
+# transfers.
+WINDOW_SLOTS_PER_FULL_SLOT = 8
+
+
+def split_staging_layers(layers: Sequence[int], total: int) -> List[int]:
+    """Host layer buffers per engine, ``total`` split roughly by layer count. 0
+    keeps every layer.
+
+    For example, Muse Spark has 16 full-attention and 46 SWA layers, so
+    ``split_staging_layers([16, 46], 8)`` returns ``[2, 6]``, and a total of 0
+    returns ``[16, 46]``. One buffer runs each layer's copy and send back to
+    back, two overlap them.
+    """
+    if total <= 0:
+        return list(layers)
+    return [min(n, max(1, round(total * n / sum(layers)))) for n in layers]
 
 
 def ranks_per_node(
@@ -179,16 +206,17 @@ def node_worker_rank(
 
 
 def slots_within_budget(budget_bytes: float, slot_bytes: int, ceiling: int) -> int:
-    """Slots that fit ``budget_bytes``, at most ``ceiling``.
+    """Slots that fit ``budget_bytes``, at most ``ceiling`` and at least one.
 
-    Raises ``ValueError`` when not even one slot fits: the pool cannot be
-    allocated within the budget, so the configuration has to change.
+    One slot that does not fit is still allocated, over the budget, so a
+    max-length transfer can always run.
     """
     if slot_bytes > budget_bytes:
-        raise ValueError(
-            "raiden host staging: one transfer slot needs "
-            f"{slot_bytes / 1024**3:.2f} GiB but this engine's share of "
-            f"SGLANG_RAIDEN_HOST_POOL_GB is {budget_bytes / 1024**3:.2f} GiB; "
-            "raise SGLANG_RAIDEN_HOST_POOL_GB or lower the context length"
+        logger.warning(
+            "raiden host staging: one transfer slot needs %.2f GiB, over this "
+            "engine's %.2f GiB share of SGLANG_RAIDEN_HOST_POOL_GB; allocating "
+            "one slot anyway",
+            slot_bytes / 1024**3,
+            budget_bytes / 1024**3,
         )
     return max(1, min(ceiling, int(budget_bytes // max(1, slot_bytes))))

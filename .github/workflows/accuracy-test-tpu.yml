@@ -34,7 +34,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, full-set, day-10am, day-5pm, gpt-oss-120b, muse-spark, gpt-oss-20b, gemma4, deepseek-r1-0528, deepseek-v3-1, kimi-k26, qwen3-5-397b, qwen3-8-27b, glm-5-3-flash]
+        options: [all, full-set, day-10am, day-5pm, gpt-oss-120b, muse-spark, gemma4, deepseek-r1-0528, deepseek-v3-1, kimi-k26, qwen3-5-397b, qwen3-8-27b, glm-5-3-flash]
       test_filter:
         description: "Substring of a multihost test file path; runs only matching tests"
         required: false
@@ -186,26 +186,6 @@ jobs:
       nightly: true
       weights_pvc: model-weights
       timeout_per_file: 14400
-    permissions:
-      contents: read
-      id-token: write
-
-  accuracy-gpt-oss-20b:
-    needs: [build, plan]
-    if: >-
-      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","full-set","day-10am","gpt-oss-20b"]'), needs.plan.outputs.model) }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      lane: nightly
-      hosts: 1
-      suite: nightly-tpu-accuracy-gpt-oss-20b
-      run_name: accuracy-gpt-oss-20b
-      nightly: true
-      weights_pvc: model-weights
-      timeout_per_file: 10800
     permissions:
       contents: read
       id-token: write

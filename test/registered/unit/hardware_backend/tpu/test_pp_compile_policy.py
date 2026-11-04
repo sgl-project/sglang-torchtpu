@@ -504,5 +504,113 @@ class TestShimProxyCheck(CustomTestCase):
         self.assertNotIn("pp_proxy_tensors", compiled.call_args.kwargs)
 
 
+class TestVLStageWarmupGuards(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        for name in ("is_dp_attention_enabled", "enable_num_token_non_padded"):
+            predicate = patch.object(decoder_compile_policy, name, return_value=False)
+            predicate.start()
+            self.addCleanup(predicate.stop)
+
+    def test_outer_eager_vl_wrapper_warms_embedding_only_on_first_and_logits_only_on_last(
+        self,
+    ):
+        from sglang_tpu.compilation.decoder_compile_policy import (
+            EagerLogitsCase,
+            Qwen3VLDecoderTpuCompilePolicy,
+        )
+
+        for first, last, exp_embed, exp_logits in (
+            (True, False, True, False),
+            (False, False, False, False),
+            (False, True, False, True),
+        ):
+            with self.subTest(first=first, last=last):
+                runner = _model_runner(_pp_group(first=first, last=last))
+                embed = torch.nn.Embedding(8, _HIDDEN)
+                embed_spy = MagicMock(wraps=embed)
+                embed_spy.num_embeddings = 8
+                inner = SimpleNamespace(
+                    logits_processor=None,
+                    get_input_embeddings=(
+                        (lambda s=embed_spy: s)
+                        if first
+                        else MagicMock(side_effect=RuntimeError("PPMissingLayer embed"))
+                    ),
+                )
+                runner.model = SimpleNamespace(language_model=inner)
+                policy = Qwen3VLDecoderTpuCompilePolicy(
+                    model_runner=runner,
+                    t_bucketer=Bucketer(name="Token", buckets=[64]),
+                    b_bucketer=Bucketer(name="Bs", buckets=[1]),
+                    owner=inner,
+                )
+                policy._extend_compile_cases = lambda: [(8, 1, ForwardMode.EXTEND)]
+                policy._eager_warmup_logits = MagicMock(return_value=torch.zeros(1, 8))
+                with patch.object(DecoderTpuCompilePolicy, "_warmup_host_padding"):
+                    policy._warmup_host_padding()
+                self.assertEqual(embed_spy.called, exp_embed)
+                self.assertEqual(policy._eager_warmup_logits.called, exp_logits)
+
+                policy._eager_warmup_logits.reset_mock()
+                policy.warmup_eager_logits(
+                    [
+                        EagerLogitsCase(
+                            num_tokens=8,
+                            bs=1,
+                            mode=ForwardMode.EXTEND,
+                            capture_hidden_mode=CaptureHiddenMode.NULL,
+                            spec_info=None,
+                        )
+                    ]
+                )
+                self.assertEqual(policy._eager_warmup_logits.called, exp_logits)
+
+    def test_inner_owned_vl_wrapper_skips_outer_eager_warmup_on_non_last_stages(self):
+        from sglang_tpu.compilation.decoder_compile_policy import (
+            EagerLogitsCase,
+            Qwen3VLDecoderTpuCompilePolicy,
+        )
+
+        runner = _model_runner(_pp_group(first=True, last=False))
+        inner = SimpleNamespace(
+            logits_processor=object(),
+            get_input_embeddings=MagicMock(
+                side_effect=AssertionError("should not warm outer embedding")
+            ),
+        )
+        runner.model = SimpleNamespace(language_model=inner)
+        policy = Qwen3VLDecoderTpuCompilePolicy(
+            model_runner=runner,
+            t_bucketer=Bucketer(name="Token", buckets=[64]),
+            b_bucketer=Bucketer(name="Bs", buckets=[1]),
+            owner=inner,
+        )
+        policy._extend_compile_cases = lambda: [(8, 1, ForwardMode.EXTEND)]
+        policy._eager_warmup_logits = MagicMock(
+            side_effect=AssertionError("PPMissingLayer lm_head on stage 0")
+        )
+        with patch.object(DecoderTpuCompilePolicy, "_warmup_host_padding"):
+            policy._warmup_host_padding()
+        policy.warmup_eager_logits(
+            [
+                EagerLogitsCase(
+                    num_tokens=8,
+                    bs=1,
+                    mode=ForwardMode.EXTEND,
+                    capture_hidden_mode=CaptureHiddenMode.NULL,
+                    spec_info=None,
+                )
+            ]
+        )
+        with patch.object(
+            DecoderTpuCompilePolicy,
+            "_sampling_warmup_logits",
+            return_value=torch.zeros(2, 8),
+        ) as base_logits:
+            policy._sampling_warmup_logits(2)
+        base_logits.assert_called_once_with(2)
+
+
 if __name__ == "__main__":
     unittest.main()
