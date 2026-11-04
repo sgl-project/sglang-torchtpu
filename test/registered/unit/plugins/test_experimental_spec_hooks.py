@@ -23,18 +23,6 @@ from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope
 from sglang_tpu.envs import envs
-from sglang_tpu.experimental import register_host_batch_padder, uses_host_batch
-from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
-from sglang_tpu.experimental.speculative import base_spec_worker, draft_info, spec_types
-from sglang_tpu.experimental.speculative.block_info import (
-    HostPaddedBlockDraftInput,
-)
-from sglang_tpu.experimental.speculative.block_spec_worker import TpuBlockSpecWorker
-from sglang_tpu.experimental.speculative.chain_info import HostPaddedChainDraftInput
-from sglang_tpu.experimental.speculative.spec_types import (
-    DraftResult,
-    TpuSpecVerifyInput,
-)
 from sglang_tpu.hooks.experimental_spec import (
     alloc_extend,
     hook_specs,
@@ -42,6 +30,21 @@ from sglang_tpu.hooks.experimental_spec import (
     kimi_spec_defaults,
 )
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
+from sglang_tpu.sampling.sampling_batch_info import HostPaddedSamplingInfo
+from sglang_tpu.speculative import base_spec_worker, draft_info, spec_types
+from sglang_tpu.speculative.block_info import (
+    HostPaddedBlockDraftInput,
+)
+from sglang_tpu.speculative.block_spec_worker import TpuBlockSpecWorker
+from sglang_tpu.speculative.chain_info import HostPaddedChainDraftInput
+from sglang_tpu.speculative.experimental_spec import (
+    register_host_batch_padder,
+    uses_host_batch,
+)
+from sglang_tpu.speculative.spec_types import (
+    DraftResult,
+    TpuSpecVerifyInput,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -61,7 +64,7 @@ def _module_init(self):
 
 def _tpu_sampler():
     from sglang.srt.layers.sampler import Sampler
-    from sglang_tpu.sampler import TpuSampler
+    from sglang_tpu.layers.sampler import TpuSampler
 
     with patch.object(Sampler, "__init__", _module_init):
         return TpuSampler()
@@ -253,7 +256,9 @@ class TestExperimentalSpecHooks(CustomTestCase):
         stack.enter_context(
             envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True)
         )
-        stack.enter_context(patch("sglang_tpu.experimental._host_batch_padder", None))
+        stack.enter_context(
+            patch("sglang_tpu.speculative.experimental_spec._host_batch_padder", None)
+        )
         register_host_batch_padder(_pad)
         # Exercise the real registry's descriptor handling and import propagation,
         # then restore every patched binding so this test cannot affect other tests.
@@ -396,7 +401,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
     def test_host_padding_follows_the_worker_not_the_algorithm(self):
         """Without a TpuSpecWorker (no registered padder) batches keep core's rows;
         with one, every algorithm's batches are host padded."""
-        with patch("sglang_tpu.experimental._host_batch_padder", None):
+        with patch("sglang_tpu.speculative.experimental_spec._host_batch_padder", None):
             batch = self.batch([2, 5, 8])
         self.assertIs(type(batch.sampling_info), SamplingBatchInfo)
         self.assertFalse(hasattr(batch, "host_pad_bs"))
@@ -425,7 +430,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertIs(batch.input_ids, prompt)
         self.assertIsNone(batch.prefill_input_ids_cpu)
         self.assertEqual(_extend_metadata_device(batch, "meta"), "cpu")
-        with patch("sglang_tpu.experimental._host_batch_padder", None):
+        with patch("sglang_tpu.speculative.experimental_spec._host_batch_padder", None):
             plain = self.batch([2])
         self.assertEqual(_extend_metadata_device(plain, "meta"), "meta")
         captured = {}
@@ -450,10 +455,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
             )
 
     def test_worker_publishes_plugin_owned_draft_state(self):
-        from sglang_tpu.experimental.speculative.block_spec_worker import (
+        from sglang_tpu.speculative.block_spec_worker import (
             TpuBlockSpecWorker,
         )
-        from sglang_tpu.experimental.speculative.spec_types import SpecState
+        from sglang_tpu.speculative.spec_types import SpecState
 
         state = SpecState(
             torch.tensor([4, 5]), torch.tensor([10, 20]), torch.tensor([1, 2])
@@ -510,7 +515,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
             )
 
     def test_either_flag_enables_the_experimental_worker(self):
-        from sglang_tpu.experimental import (
+        from sglang_tpu.speculative.experimental_spec import (
             is_experimental_mtp,
             is_experimental_spec_worker,
         )
@@ -534,7 +539,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         is still initializing; pulling in sglang_tpu.hooks there (whose PP hooks
         import Scheduler) killed every TPU scheduler with a circular import."""
         code = (
-            "import sys, sglang_tpu.overlap_utils_tpu; "
+            "import sys, sglang_tpu.managers.overlap_utils_tpu; "
             "sys.exit(int(any(m.startswith('sglang_tpu.hooks') for m in sys.modules)))"
         )
         result = subprocess.run([sys.executable, "-c", code], capture_output=True)
@@ -560,7 +565,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertEqual(hot & on, hot)
 
     def test_chain_draft_prompt_reads_the_next_token_of_each_row(self):
-        from sglang_tpu.experimental.speculative.chain_spec_worker import (
+        from sglang_tpu.speculative.chain_spec_worker import (
             fill_sampled_tails,
             shift_prompt_tokens,
         )
@@ -584,11 +589,11 @@ class TestExperimentalSpecHooks(CustomTestCase):
     def test_chain_draft_rows_hand_rpa_the_pre_row_length(self):
         """TARGET_VERIFY RPA adds the row width itself; a post-row length let draft
         steps attend stale draft KV and cut chain acceptance by ~13%."""
-        from sglang_tpu.experimental.speculative.spec_ops import (
+        from sglang_tpu.speculative.spec_ops import (
             build_chain_block_inputs,
             build_draft_block_inputs,
         )
-        from sglang_tpu.experimental.speculative.spec_types import VerifyRows
+        from sglang_tpu.speculative.spec_types import VerifyRows
 
         seq_lens = torch.tensor([10, 20, 0])
         live = torch.tensor([True, True, False])
@@ -614,13 +619,6 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertEqual(block.seq_lens.tolist(), [14, 24, 0])
 
     def test_mtp_takes_the_chain_paths_only_when_enabled(self):
-        from sglang_tpu.experimental import is_experimental_spec_worker
-        from sglang_tpu.experimental.speculative.block_spec_worker import (
-            TpuBlockSpecWorker,
-        )
-        from sglang_tpu.experimental.speculative.chain_spec_worker import (
-            TpuChainSpecWorker,
-        )
         from sglang_tpu.hooks.experimental_spec import (
             need_topk,
             prepare_spec_decode,
@@ -629,6 +627,13 @@ class TestExperimentalSpecHooks(CustomTestCase):
             supports_tpu_direct_compile,
         )
         from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
+        from sglang_tpu.speculative.block_spec_worker import (
+            TpuBlockSpecWorker,
+        )
+        from sglang_tpu.speculative.chain_spec_worker import (
+            TpuChainSpecWorker,
+        )
+        from sglang_tpu.speculative.experimental_spec import is_experimental_spec_worker
 
         mtp = SpeculativeAlgorithm.from_string("NEXTN")
         spec_args = SimpleNamespace(speculative_algorithm="NEXTN")
@@ -770,10 +775,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
     def test_pp_stages_before_the_last_get_no_draft(self):
         """Under PP only the last stage hosts the draft; an earlier stage building one
         would bind the target embedding or lm_head its stage does not hold."""
-        from sglang_tpu.experimental.speculative.pipeline_stage_worker import (
+        from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
+        from sglang_tpu.speculative.pipeline_stage_worker import (
             TpuPipelineStageWorker,
         )
-        from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
 
         earlier_stage = SimpleNamespace(pp_group=SimpleNamespace(is_last_rank=False))
         algorithms = (
@@ -803,7 +808,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         """PP runs a PD prefill without overlap; decode relays through FutureMap,
         so a non-overlap decode must still refuse host padding."""
         batch = SimpleNamespace(enable_overlap=False)
-        with patch("sglang_tpu.experimental._host_batch_padder", _pad):
+        with patch("sglang_tpu.speculative.experimental_spec._host_batch_padder", _pad):
             for mode, allowed in (
                 ("prefill", True),
                 ("decode", False),
@@ -858,7 +863,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
     def test_sampler_samples_live_logits_at_the_host_bucket(self):
         """An outer logits processor emits 3 live rows; HOST_PADDED sampling
         params sit at bucket 4, and sampling still returns the bucket rows."""
-        from sglang_tpu.sampler import TpuSampler
+        from sglang_tpu.layers.sampler import TpuSampler
 
         sampler = _tpu_sampler()
         info = HostPaddedSamplingInfo(
@@ -893,11 +898,11 @@ class TestExperimentalSpecHooks(CustomTestCase):
         """A plain Sampler (--sampling-backend pytorch) cannot read HOST_PADDED
         host params, so the worker swaps in TpuSampler."""
         from sglang.srt.layers.sampler import Sampler
-        from sglang_tpu.experimental.speculative import base_spec_worker
-        from sglang_tpu.experimental.speculative.block_spec_worker import (
+        from sglang_tpu.layers.sampler import TpuSampler
+        from sglang_tpu.speculative import base_spec_worker
+        from sglang_tpu.speculative.block_spec_worker import (
             TpuBlockSpecWorker,
         )
-        from sglang_tpu.sampler import TpuSampler
 
         class _Stop(Exception):
             pass
@@ -932,8 +937,8 @@ class TestExperimentalSpecHooks(CustomTestCase):
         """Under DP attention, prefill coordination or a skipped MLP sync lets one
         rank prefill while another decodes; the worker must refuse, not desync."""
         from sglang.srt.environ import envs as srt_envs
-        from sglang_tpu.experimental.speculative import base_spec_worker
-        from sglang_tpu.experimental.speculative.block_spec_worker import (
+        from sglang_tpu.speculative import base_spec_worker
+        from sglang_tpu.speculative.block_spec_worker import (
             TpuBlockSpecWorker,
         )
 
@@ -992,10 +997,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
         """An idle DP rank runs the active step's forwards and syncs in order (the
         greedy draft, verify, commit) on all-padding rows; a skipped one leaves
         its peers hanging in the collective."""
-        from sglang_tpu.experimental.speculative.block_spec_worker import (
+        from sglang_tpu.speculative.block_spec_worker import (
             TpuBlockSpecWorker,
         )
-        from sglang_tpu.experimental.speculative.spec_types import (
+        from sglang_tpu.speculative.spec_types import (
             DraftResult,
             SpecState,
         )
@@ -1034,7 +1039,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
     def test_target_token_sync_has_one_shape_on_every_dp_rank(self):
         """Every DP rank must issue extend's target-token sync at one shape; an idle
         rank (no rows) syncing a different shape than its peers hangs them."""
-        from sglang_tpu.experimental.speculative.block_spec_worker import (
+        from sglang_tpu.speculative.block_spec_worker import (
             TpuBlockSpecWorker,
         )
 
@@ -1055,8 +1060,8 @@ class TestExperimentalSpecHooks(CustomTestCase):
     def test_idle_draft_prefill_runs_the_peers_token_bucket(self):
         """An idle DP rank's draft prefill pads to the token bucket its peers run;
         the synced live counts would pick other attention collectives and hang."""
-        from sglang_tpu.experimental.speculative import chain_spec_worker
-        from sglang_tpu.experimental.speculative.chain_spec_worker import (
+        from sglang_tpu.speculative import chain_spec_worker
+        from sglang_tpu.speculative.chain_spec_worker import (
             TpuChainSpecWorker,
         )
 
@@ -1082,7 +1087,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         shard inside its attention-TP group: acceptance collapses with no error. A
         head sharded over the draft's own group (built in its scope) is fine."""
         from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-        from sglang_tpu.experimental.speculative.base_spec_worker import (
+        from sglang_tpu.speculative.base_spec_worker import (
             _check_draft_lm_head_group,
         )
 
@@ -1111,7 +1116,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
     def test_block_dp_attention_drafts_greedy(self):
         """Under DP attention the block draft never samples: peers and idle ranks
         must issue the same draft sync, and sampled requests take target-only accept."""
-        from sglang_tpu.experimental.speculative.block_spec_worker import (
+        from sglang_tpu.speculative.block_spec_worker import (
             TpuBlockSpecWorker,
         )
 
@@ -1144,7 +1149,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
     def test_tpu_opts_experimental_spec_into_dp_attention(self):
         """Core rejects DFLASH with DP attention unless the platform opts in; every
         experimental worker serves DP attention, core's DFlash worker does not."""
-        from sglang_tpu.tpu_platform import TpuSRTPlatform
+        from sglang_tpu.platforms.tpu_platform import TpuSRTPlatform
 
         platform = TpuSRTPlatform()
         for enabled in (True, False):
@@ -1163,12 +1168,12 @@ class TestExperimentalSpecHooks(CustomTestCase):
         """A PD decode server's prebuilt batch must carry the experimental input
         type (decode prep and filter/merge reject core's), built on host: core's
         device-side seed ops compile once per live bs."""
-        from sglang_tpu.experimental.speculative.chain_info import (
-            HostPaddedChainDraftInput,
-        )
         from sglang_tpu.hooks.experimental_spec import (
             build_disagg_block_input,
             build_disagg_eagle_input,
+        )
+        from sglang_tpu.speculative.chain_info import (
+            HostPaddedChainDraftInput,
         )
 
         def core(*args):
@@ -1217,7 +1222,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         for algorithm in (SpeculativeAlgorithm.EAGLE, SpeculativeAlgorithm.EAGLE3):
             seeded = []
             with patch(
-                "sglang_tpu.experimental._pd_carry_seeder",
+                "sglang_tpu.speculative.experimental_spec._pd_carry_seeder",
                 lambda indices, hidden: seeded.append((indices, hidden)),
             ):
                 chain = build_disagg_eagle_input(
@@ -1261,7 +1266,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         )
         from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
         from sglang_tpu.hooks.experimental_spec import _reset_pd_checkpoints
-        from sglang_tpu.mamba_pool import TpuMambaPool
+        from sglang_tpu.mem_cache.mamba_pool import TpuMambaPool
 
         shape = Mamba2StateShape.create(
             tp_world_size=1,
@@ -1299,7 +1304,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
     def test_pd_carry_seed_writes_at_the_batch_bucket(self):
         """The decode-side carry write must keep the warmed bucket shape; padded
         rows land on the reserved pool row 0."""
-        from sglang_tpu.experimental.speculative.chain_spec_worker import (
+        from sglang_tpu.speculative.chain_spec_worker import (
             TpuChainSpecWorker,
         )
 
@@ -1317,7 +1322,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertEqual(carry[0].tolist(), [0.0, 0.0])
 
     def _retraction_worker(self, draft_pool, *, mode="decode", backup="cpu_tensor"):
-        from sglang_tpu.experimental.speculative.block_spec_worker import (
+        from sglang_tpu.speculative.block_spec_worker import (
             TpuBlockSpecWorker,
         )
 
@@ -1329,7 +1334,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
             disaggregation_mode=mode, disaggregation_decode_retraction_backup=backup
         )
         get_disagg = patch(
-            "sglang_tpu.experimental.speculative.base_spec_worker.get_disagg",
+            "sglang_tpu.speculative.base_spec_worker.get_disagg",
             return_value=disagg,
         )
         return worker, get_disagg
@@ -1400,7 +1405,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         """Filtered sampling needs the sort-free filter (the sort-based target
         keeps different boundary ties), but greedy rows (top_k = 1) do not; custom
         logit processors are refused per batch, not at startup."""
-        from sglang_tpu.experimental.speculative.block_spec_worker import (
+        from sglang_tpu.speculative.block_spec_worker import (
             TpuBlockSpecWorker,
         )
 
@@ -1657,7 +1662,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
     def test_block_spec_worker_init_cuda_graphs_skips_decode_warmups_only_on_pp_non_decode(
         self,
     ):
-        from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
+        from sglang_tpu.speculative.base_spec_worker import TpuSpecWorker
 
         all_warmups = ["base", "block", "sampling", "extend", "snapshot"]
         cases = (
@@ -1683,15 +1688,15 @@ class TestExperimentalSpecHooks(CustomTestCase):
                         side_effect=lambda c=calls: c.append("base"),
                     ),
                     patch(
-                        "sglang_tpu.experimental.speculative.block_spec_worker.get_parallel",
+                        "sglang_tpu.speculative.block_spec_worker.get_parallel",
                         return_value=SimpleNamespace(pp_size=pp_size),
                     ),
                     patch(
-                        "sglang_tpu.experimental.speculative.block_spec_worker.get_disagg",
+                        "sglang_tpu.speculative.block_spec_worker.get_disagg",
                         return_value=SimpleNamespace(disaggregation_mode=mode),
                     ),
                     patch(
-                        "sglang_tpu.experimental.speculative.block_spec_worker.snapshot_recompilation_baseline",
+                        "sglang_tpu.speculative.block_spec_worker.snapshot_recompilation_baseline",
                         side_effect=lambda c=calls: c.append("snapshot"),
                     ),
                 ):

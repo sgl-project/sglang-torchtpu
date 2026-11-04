@@ -175,7 +175,7 @@ def _mxint8_draft_per_token(
     kvc, head_num: int, head_dim: int, *, is_swa: bool = False
 ) -> int:
     """Physical bytes/token of a draft layer, before DCP capacity replication."""
-    from sglang_tpu.kv_mxint8 import (
+    from sglang_tpu.mem_cache.kv_mxint8 import (
         cache_bytes_per_token,
     )
 
@@ -428,7 +428,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes."""
         if self.kv_cache_dtype_str == "mxint8":
-            from sglang_tpu.kv_mxint8 import (
+            from sglang_tpu.mem_cache.kv_mxint8 import (
                 cache_bytes_per_token,
             )
 
@@ -793,7 +793,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         self._enable_unified_memory = get_memory().enable_unified_memory
 
         if self.kv_cache_dtype_str == "mxint8":
-            from sglang_tpu.kv_mxint8 import (
+            from sglang_tpu.mem_cache.kv_mxint8 import (
                 cache_bytes_per_token,
             )
 

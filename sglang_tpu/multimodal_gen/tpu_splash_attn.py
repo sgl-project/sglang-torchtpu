@@ -78,10 +78,10 @@ def _check_splash_available() -> bool:
             splash_attention_kernel,
         )
 
-        from sglang_tpu.pallas_export import (
+        from sglang_tpu.utils.pallas_export import (
             get_pallas_tpu_device_kind,
         )
-        from sglang_tpu.pallas_jax_op import (  # noqa: F401
+        from sglang_tpu.utils.pallas_jax_op import (  # noqa: F401
             cpu_export_jax_op,
         )
 
@@ -629,7 +629,7 @@ def _register_ops() -> None:
         try:
             import jax
 
-            from sglang_tpu.pallas_jax_op import cpu_export_jax_op
+            from sglang_tpu.utils.pallas_jax_op import cpu_export_jax_op
 
             def flash(
                 q: jax.Array, k: jax.Array, v: jax.Array, scale: float

@@ -26,8 +26,11 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang_tpu.attention_gdn_pallas import GdnTracedMetadata, TpuGDNAttnBackend
-from sglang_tpu.mamba_pool import TpuMambaPool
+from sglang_tpu.layers.attention.linear.attention_gdn_pallas import (
+    GdnTracedMetadata,
+    TpuGDNAttnBackend,
+)
+from sglang_tpu.mem_cache.mamba_pool import TpuMambaPool
 
 
 class HybridLinearKVPoolState:

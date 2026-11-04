@@ -65,7 +65,7 @@ from sglang_tpu.disaggregation.raiden.conn import (
     RaidenKVReceiver,
     RaidenKVSender,
 )
-from sglang_tpu.dsv4.dsv4_memory_pool import (
+from sglang_tpu.layers.attention.dsv4.dsv4_memory_pool import (
     _TPU_STATE_SLOT_STRIDE_PAGES,
     DSV4TPUTokenToKVPool,
     TPUCompressStatePool,

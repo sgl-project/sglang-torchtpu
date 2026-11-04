@@ -73,7 +73,7 @@ def _text_config():
 
 
 def _spec():
-    from sglang_tpu.glm_flash_megakernel.config import Glm53FlashSpec
+    from sglang_tpu.models.glm_flash_megakernel.config import Glm53FlashSpec
 
     raw = {
         "model_type": "glm5_next",
@@ -96,8 +96,8 @@ class TestGlmFlashMegakernelConfig(CustomTestCase):
         import jax.numpy as jnp
         from jax.experimental.pallas import tpu as pltpu
 
-        from sglang_tpu.glm_flash_megakernel.kernel import decode as D
-        from sglang_tpu.glm_flash_megakernel.layout import KernelLayout
+        from sglang_tpu.models.glm_flash_megakernel.kernel import decode as D
+        from sglang_tpu.models.glm_flash_megakernel.layout import KernelLayout
 
         spec = _spec()
         for n_query in (1, 4):

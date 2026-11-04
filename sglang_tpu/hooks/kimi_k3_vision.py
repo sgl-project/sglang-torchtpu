@@ -7,7 +7,7 @@ pass_through_projected_features
        the patch embedding, position-embedding interpolation, RoPE lookup,
        encoder layers, merger and projector while serving (the TODO in
        KimiK3ForConditionalGeneration.get_image_feature). The TPU runner and
-       its compile policy (sglang_tpu.graph_runner.kimi_k3_vit_tpu_compile_runner)
+       its compile policy (sglang_tpu.multimodal.kimi_k3_vit_tpu_compile_runner)
        must stay out of core, which cannot import sglang_tpu.
   How: AFTER kimi_k3_vl.MoonViT3dEncoder.__init__ attaches the runner as the
        encoder's graph_runners, where KimiK3VisionTpuCompilePolicy (declared in
@@ -38,7 +38,7 @@ class ProjectedImageFeatures(list):
 
 def attach_k3_vision_runner(result: None, encoder: Any, *args, **kwargs) -> None:
     """AFTER MoonViT3dEncoder.__init__ (Kimi-K3's): give the encoder its TPU runner."""
-    from sglang_tpu.graph_runner.kimi_k3_vit_tpu_compile_runner import (
+    from sglang_tpu.multimodal.kimi_k3_vit_tpu_compile_runner import (
         KimiK3VitTpuCompileRunner,
     )
 

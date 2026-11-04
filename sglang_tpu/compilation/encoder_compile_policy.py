@@ -8,7 +8,7 @@ import logging
 import torch
 
 from sglang.srt.compilation.support_torch_compile import get_torch_compile_policy
-from sglang_tpu.graph_runner.vit_tpu_compile_runner import VisionTpuCompilePolicy
+from sglang_tpu.multimodal.vit_tpu_compile_runner import VisionTpuCompilePolicy
 
 logger = logging.getLogger(__name__)
 

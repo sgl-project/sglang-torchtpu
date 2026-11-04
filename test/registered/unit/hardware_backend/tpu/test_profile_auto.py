@@ -28,8 +28,8 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu import profile_auto as tpu
 from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.utils import profile_auto as tpu
 
 
 @contextlib.contextmanager

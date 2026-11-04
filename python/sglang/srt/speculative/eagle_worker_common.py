@@ -49,7 +49,7 @@ _is_npu = is_npu()
 _is_tpu = is_tpu()
 
 if _is_tpu:
-    from sglang_tpu.eagle_utils_tpu import (
+    from sglang_tpu.speculative.eagle_utils_tpu import (
         device_accept_verify_cache_locs_tpu,
         draft_extend_positions_tpu,
         prepare_draft_cache_locs_tpu,

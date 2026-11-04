@@ -25,7 +25,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import patches
-from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
 from sglang_tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
@@ -60,7 +59,8 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
 )
 from sglang_tpu.envs import envs
-from sglang_tpu.tpu_platform import TpuSRTPlatform
+from sglang_tpu.mem_cache.allocator.allocator_tpu import TpuPagedTokenToKVPoolAllocator
+from sglang_tpu.platforms.tpu_platform import TpuSRTPlatform
 
 # Pure-logic tests: CPU tensors only, and the shim's import chain is
 # torch_tpu-free, so this runs on the CPU CI runner (no TPU required).

@@ -32,7 +32,7 @@ _SKIP_REASON = "Requires a TPU visible to torch.accelerator"
 
 
 def _make_pools(layer_num=LAYER_NUM, seed=0):
-    from sglang_tpu.kv_pool import (
+    from sglang_tpu.mem_cache.kv_pool import (
         TpuBlockMajorMHATokenToKVPool,
         TpuFusedMHATokenToKVPool,
     )
@@ -93,8 +93,10 @@ class TestBundledKernelMatchesFused(CustomTestCase):
     TOLERANCE = 2e-2
 
     def _run(self, seqs, *, decode):
-        from sglang_tpu.attention_pallas_rpa_base import _build_pallas_kernel_op
-        from sglang_tpu.attention_pallas_rpa_v3 import RPA_V3_SPEC
+        from sglang_tpu.layers.attention.attention_pallas_rpa_base import (
+            _build_pallas_kernel_op,
+        )
+        from sglang_tpu.layers.attention.attention_pallas_rpa_v3 import RPA_V3_SPEC
 
         op = _build_pallas_kernel_op(RPA_V3_SPEC)
         fused, bm = _make_pools()

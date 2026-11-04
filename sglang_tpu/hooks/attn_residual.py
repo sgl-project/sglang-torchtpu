@@ -2,7 +2,7 @@
 """Kimi-K3 attention-residual decode kernel (opt-in).
 
 register_attn_residual_ops
-  Why: the TPU Pallas decode kernel (sglang_tpu.kimi_attn_residual) must stay
+  Why: the TPU Pallas decode kernel (sglang_tpu.layers.kimi_attn_residual) must stay
        out of core, and its custom ops must exist before torch.compile traces
        the model.
   How: AFTER KimiK3LinearModel.__init__ registers the kernel's custom ops and
@@ -20,7 +20,7 @@ import importlib
 from types import ModuleType
 from typing import Any
 
-_KERNEL_MODULE = "sglang_tpu.kimi_attn_residual"
+_KERNEL_MODULE = "sglang_tpu.layers.kimi_attn_residual"
 
 # The kernel module once a model with attention residuals was built with the
 # flag set, else None. Aggregation checks this module global, a constant under

@@ -10,8 +10,8 @@ import pytest
 
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu import page_cache
 from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.utils import page_cache
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 

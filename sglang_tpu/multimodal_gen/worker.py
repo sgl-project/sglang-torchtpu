@@ -26,7 +26,7 @@ def configure_compile_cache() -> None:
     kernel sources, compiler flags, stack versions and chip. Call once per
     worker after distributed initialization and before the first compile.
     """
-    from sglang_tpu.compile_cache import (
+    from sglang_tpu.compilation.compile_cache import (
         add_tpu_kernel_inputs_to_compile_cache_key,
         add_tpu_rank_assignment_to_compile_cache_key,
     )

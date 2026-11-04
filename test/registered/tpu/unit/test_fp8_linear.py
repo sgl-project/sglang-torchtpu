@@ -13,7 +13,7 @@ from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.fp8_linear import (
+from sglang_tpu.layers.quantization.fp8_linear import (
     _requantize_tpu_block_fp8_to_channelwise,
     _small_m_supports,
     apply_tpu_fp8_linear,
@@ -22,7 +22,7 @@ from sglang_tpu.fp8_linear import (
     register_fp8_linear_small_m_op,
     tpu_w8a8_block_fp8_linear,
 )
-from sglang_tpu.fp8_moe import (
+from sglang_tpu.layers.quantization.fp8_moe import (
     _requantize_tpu_fp8_moe_block_to_channelwise,
 )
 

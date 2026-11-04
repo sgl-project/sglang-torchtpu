@@ -48,10 +48,10 @@ import msgspec
 import numpy as np
 
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.attention.pallas.mla_ragged_paged_attention_v2 import (
+from sglang_tpu.layers.attention.pallas.mla_ragged_paged_attention_v2 import (
     mla_ragged_paged_attention,
 )
-from sglang_tpu.attention.pallas.mla_sparse_fused import (
+from sglang_tpu.layers.attention.pallas.mla_sparse_fused import (
     NOPE_DIM,
     ROPE_DIM,
     sparse_mla_attention_fused,

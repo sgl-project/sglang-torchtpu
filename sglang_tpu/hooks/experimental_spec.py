@@ -28,7 +28,8 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.runtime_context import get_disagg, get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang_tpu._logging import get_logger
-from sglang_tpu.experimental import (
+from sglang_tpu.speculative.draft_info import HostPaddedDraftInput
+from sglang_tpu.speculative.experimental_spec import (
     experimental_spec_enabled,
     get_host_batch_padder,
     is_experimental_chain,
@@ -36,7 +37,6 @@ from sglang_tpu.experimental import (
     is_experimental_spec_worker,
     uses_host_batch,
 )
-from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 
 logger = get_logger(__name__)
 
@@ -66,7 +66,7 @@ def sampling_from_batch(
     original, cls, batch, vocab_size, *, sampling_params_on_cpu=False
 ):
     if uses_host_batch(batch):
-        from sglang_tpu.experimental.sampling.sampling_batch_info import (
+        from sglang_tpu.sampling.sampling_batch_info import (
             HostPaddedSamplingInfo,
         )
 
@@ -123,7 +123,7 @@ def filter_spec_input(original, batch, keep_indices, keep_indices_device):
             # A PP PD prefill keeps the relayed draft state on host; index it there.
             keep_indices_device = torch.tensor(keep_indices, dtype=torch.int64)
         return original(batch, keep_indices, keep_indices_device)
-    from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
+    from sglang_tpu.speculative.draft_info import HostPaddedDraftInput
 
     assert isinstance(batch.spec_info, HostPaddedDraftInput)
     batch.spec_info.filter_batch(
@@ -136,7 +136,7 @@ def filter_spec_input(original, batch, keep_indices, keep_indices_device):
 def merge_spec_input(original, batch, other):
     if not _relays_rows(batch):
         return original(batch, other)
-    from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
+    from sglang_tpu.speculative.draft_info import HostPaddedDraftInput
 
     assert isinstance(batch.spec_info, HostPaddedDraftInput)
     batch.spec_info.merge_batch(other.spec_info, future_indices=batch.req_pool_indices)
@@ -148,7 +148,7 @@ def prepare_spec_decode(original, batch):
     # plans the bucketed verify window.
     if not uses_host_batch(batch) or batch.spec_algorithm.is_dflash_family():
         return original(batch)
-    from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
+    from sglang_tpu.speculative.draft_info import HostPaddedDraftInput
 
     assert isinstance(batch.spec_info, HostPaddedDraftInput)
     batch.spec_info.prepare_for_decode(batch)
@@ -167,11 +167,14 @@ def build_disagg_eagle_input(
     # worker (MTP, EAGLE3) keeps the draft hidden in its carry table instead.
     if not uses_host_batch(batch):
         return original(batch, last_tokens_tensor, future_map)
-    from sglang_tpu.experimental import get_pd_carry_seeder, pd_decode_draft_prefill
-    from sglang_tpu.experimental.speculative.chain_info import (
+    from sglang_tpu.speculative.chain_info import (
         HostPaddedChainDraftInput,
     )
-    from sglang_tpu.experimental.speculative.pd_draft_prefill import (
+    from sglang_tpu.speculative.experimental_spec import (
+        get_pd_carry_seeder,
+        pd_decode_draft_prefill,
+    )
+    from sglang_tpu.speculative.pd_draft_prefill import (
         get_pd_draft_prefiller,
     )
 
@@ -203,11 +206,11 @@ def build_disagg_block_input(
     # the PD transfer of the draft pool, or comes from the shipped hidden rows.
     if not uses_host_batch(batch):
         return original(batch, last_tokens_tensor, future_map)
-    from sglang_tpu.experimental import pd_decode_draft_prefill
-    from sglang_tpu.experimental.speculative.block_info import (
+    from sglang_tpu.speculative.block_info import (
         HostPaddedBlockDraftInput,
     )
-    from sglang_tpu.experimental.speculative.pd_draft_prefill import (
+    from sglang_tpu.speculative.experimental_spec import pd_decode_draft_prefill
+    from sglang_tpu.speculative.pd_draft_prefill import (
         get_pd_draft_prefiller,
     )
 
@@ -241,7 +244,7 @@ def _reset_pd_checkpoints(batch: ScheduleBatch) -> None:
     # The transferred GDN state lands in each slot's own row, but a reused decode
     # slot keeps its previous read offset; prebuilt skips extend's reset.
     from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
-    from sglang_tpu.mamba_pool import TpuMambaPool
+    from sglang_tpu.mem_cache.mamba_pool import TpuMambaPool
 
     pool = batch.req_to_token_pool
     if not isinstance(pool, HybridReqToTokenPool):
@@ -324,7 +327,7 @@ def keep_host_padded_extend_outputs(original, forward_batch, logits_output):
     # and hidden at the token bucket; DP attention's unpadding would trim them
     # to the live rows, which the samplers and the draft prefill do not take.
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
-    from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
+    from sglang_tpu.sampling.sampling_batch_info import is_host_padded
 
     sampling_info = forward_batch.sampling_info
     if (
@@ -341,21 +344,21 @@ def keep_host_padded_extend_outputs(original, forward_batch, logits_output):
 
 
 def sample_draft_tokens(original, model, hidden_states, input_ids):
-    from sglang_tpu.experimental import experimental_spec_enabled
+    from sglang_tpu.speculative.experimental_spec import experimental_spec_enabled
 
     if not experimental_spec_enabled():
         return original(model, hidden_states, input_ids)
-    from sglang_tpu.experimental.models.dspark import sample_draft_tokens as sample
+    from sglang_tpu.speculative.dspark.dspark import sample_draft_tokens as sample
 
     return sample(model, hidden_states, input_ids)
 
 
 def sample_dflash2_draft_tokens(original, model, hidden_states, input_ids):
-    from sglang_tpu.experimental import experimental_spec_enabled
+    from sglang_tpu.speculative.experimental_spec import experimental_spec_enabled
 
     if not experimental_spec_enabled():
         return original(model, hidden_states, input_ids)
-    from sglang_tpu.experimental.models.dflash2 import sample_draft_tokens as sample
+    from sglang_tpu.speculative.dflash.dflash2 import sample_draft_tokens as sample
 
     return sample(model, hidden_states, input_ids)
 
@@ -402,7 +405,7 @@ def spec_need_hidden_states(original):
 
 def kimi_spec_defaults(original, server_args):
     from sglang.srt.arg_groups.overrides import resolving_view
-    from sglang_tpu.experimental import experimental_spec_enabled
+    from sglang_tpu.speculative.experimental_spec import experimental_spec_enabled
 
     cfg = resolving_view(server_args)
     if cfg.speculative_algorithm == "DSPARK" and experimental_spec_enabled():
@@ -414,8 +417,8 @@ def budget_pd_hidden_pool(result, kvc):
     """Count the PD hidden pool in the KV budget of the server that builds it."""
     from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
     from sglang.srt.runtime_context import get_parallel
-    from sglang_tpu.experimental import pd_decode_draft_prefill
-    from sglang_tpu.experimental.speculative.pd_draft_prefill import (
+    from sglang_tpu.speculative.experimental_spec import pd_decode_draft_prefill
+    from sglang_tpu.speculative.pd_draft_prefill import (
         pd_hidden_bytes_per_token,
     )
 
@@ -449,7 +452,7 @@ def reject_overlong_pd_draft_prompt(original, queue, req) -> bool:
     from http import HTTPStatus
 
     from sglang.srt.disaggregation.utils import prepare_abort
-    from sglang_tpu.experimental.speculative.pd_draft_prefill import (
+    from sglang_tpu.speculative.pd_draft_prefill import (
         pd_draft_prompt_cap,
     )
 

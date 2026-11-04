@@ -37,7 +37,7 @@ from einops import rearrange
 from sglang.srt.layers.attention.vision import VisionTpuAttention
 from sglang.srt.utils import is_tpu
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.attention.vision_splash import VisionTpuSplashAttention
+from sglang_tpu.layers.attention.vision_splash import VisionTpuSplashAttention
 
 
 def _ref_token_attention(q, k, v, seg, scale):
@@ -182,7 +182,9 @@ class TestVisionSplashJax(CustomTestCase):
         import jax.numpy as jnp
         import numpy as np
 
-        from sglang_tpu.attention_pallas import _vision_splash_block_map
+        from sglang_tpu.layers.attention.attention_pallas import (
+            _vision_splash_block_map,
+        )
 
         with self._cpu():
             mask, nxt = _vision_splash_block_map(
@@ -222,7 +224,9 @@ class TestVisionSplashJax(CustomTestCase):
         self._check_body(out_of_order.repeat_interleave(1024), h=1, d=16, seed=9)
 
     def test_block_sizes_reject_lengths_off_the_128_grid(self):
-        from sglang_tpu.attention_pallas import _vision_splash_block_sizes
+        from sglang_tpu.layers.attention.attention_pallas import (
+            _vision_splash_block_sizes,
+        )
 
         for bad in (0, 100, 1000):
             with self.subTest(seq_len=bad):
@@ -234,7 +238,9 @@ class TestVisionSplashJax(CustomTestCase):
         # flash op), so the op takes batch 1 only.
         import jax.numpy as jnp
 
-        from sglang_tpu.attention_pallas import _vision_splash_attention
+        from sglang_tpu.layers.attention.attention_pallas import (
+            _vision_splash_attention,
+        )
 
         q = jnp.zeros((2, 1, 1024, 16), jnp.float32)
         with self._cpu():
@@ -253,7 +259,9 @@ class TestVisionSplashJax(CustomTestCase):
         import jax.numpy as jnp
         import numpy as np
 
-        from sglang_tpu.attention_pallas import _vision_splash_attention
+        from sglang_tpu.layers.attention.attention_pallas import (
+            _vision_splash_attention,
+        )
 
         torch.manual_seed(seed)
         seg = seg[None]
@@ -308,7 +316,7 @@ class TestVisionSplashOnTpu(CustomTestCase):
     def test_backend_registration_is_opt_in(self):
         from sglang.srt.layers.attention.vision import QKV_BACKEND_IMPL
         from sglang_tpu.envs import envs as tpu_envs
-        from sglang_tpu.tpu_platform import _register_attention_backends
+        from sglang_tpu.platforms.tpu_platform import _register_attention_backends
 
         flag = tpu_envs.SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION
         for enabled, expected in (

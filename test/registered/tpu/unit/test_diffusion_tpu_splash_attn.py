@@ -628,8 +628,8 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
                 self._assert_accurate(got, q, k, v, 128**-0.5, False)
 
     def test_registration_failure_falls_back_to_sdpa(self):
-        from sglang_tpu import pallas_jax_op
         from sglang_tpu.multimodal_gen import tpu_splash_attn as tsa
+        from sglang_tpu.utils import pallas_jax_op
 
         with (
             patch.object(tsa, "_FLASH_OP", None),

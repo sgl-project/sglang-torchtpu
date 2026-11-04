@@ -36,4 +36,4 @@ def activate():
         return None
 
     logger.info("TPU plugin detected (torch_tpu installable).")
-    return "sglang_tpu.tpu_platform:TpuSRTPlatform"
+    return "sglang_tpu.platforms.tpu_platform:TpuSRTPlatform"

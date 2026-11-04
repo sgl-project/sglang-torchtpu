@@ -22,6 +22,12 @@ from sglang.srt.compilation.support_torch_compile import (
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase, enter_scope
+from sglang_tpu.compilation.block_compile_policy import (
+    TpuBlockSpecDecodeCompilePolicyMixin,
+)
+from sglang_tpu.compilation.chain_compile_policy import (
+    TpuChainSpecDecodeCompilePolicyMixin,
+)
 from sglang_tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
@@ -37,14 +43,8 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
 )
 from sglang_tpu.compilation.warmup_queue import collect_warmups
 from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.experimental.compilation.block_compile_policy import (
-    TpuBlockSpecDecodeCompilePolicyMixin,
-)
-from sglang_tpu.experimental.compilation.chain_compile_policy import (
-    TpuChainSpecDecodeCompilePolicyMixin,
-)
-from sglang_tpu.graph_runner import tpu_graph_runner
-from sglang_tpu.graph_runner.tpu_graph_runner import (
+from sglang_tpu.model_executor.runner import tpu_graph_runner
+from sglang_tpu.model_executor.runner.tpu_graph_runner import (
     TpuGraphRunner,
     _augment_spec_policy,
 )
@@ -138,7 +138,7 @@ class TestTpuGraphRunner(CustomTestCase):
         self.mock_cache_key = enter_scope(
             self,
             patch(
-                "sglang_tpu.graph_runner.tpu_graph_runner."
+                "sglang_tpu.model_executor.runner.tpu_graph_runner."
                 "add_tpu_rank_assignment_to_compile_cache_key"
             ),
         )
@@ -149,12 +149,12 @@ class TestTpuGraphRunner(CustomTestCase):
         self.mock_precompile = precompile_patcher.start()
         self.addCleanup(precompile_patcher.stop)
         dispatch_patcher = patch(
-            "sglang_tpu.graph_runner.tpu_graph_runner._resolve_fused_op_dispatch"
+            "sglang_tpu.model_executor.runner.tpu_graph_runner._resolve_fused_op_dispatch"
         )
         dispatch_patcher.start()
         self.addCleanup(dispatch_patcher.stop)
         platform_patcher = patch(
-            "sglang_tpu.graph_runner.tpu_graph_runner.current_platform",
+            "sglang_tpu.model_executor.runner.tpu_graph_runner.current_platform",
             SimpleNamespace(device_type="tpu"),
         )
         platform_patcher.start()
@@ -250,7 +250,7 @@ class TestTpuGraphRunner(CustomTestCase):
         runner.spec_algorithm = SpeculativeAlgorithm.EAGLE
         # Exercise discovery independently of device-specific speculative tracing.
         with patch(
-            "sglang_tpu.graph_runner.tpu_graph_runner._augment_spec_policy",
+            "sglang_tpu.model_executor.runner.tpu_graph_runner._augment_spec_policy",
             side_effect=lambda cls, _: cls,
         ):
             TpuGraphRunner(runner)
@@ -361,7 +361,7 @@ class TestTpuGraphRunner(CustomTestCase):
                     model = self._annotate(_model_with(forward=MagicMock()))
                     scope = collect_warmups() if global_queue else nullcontext()
                     with patch(
-                        "sglang_tpu.graph_runner.tpu_graph_runner.logger.info",
+                        "sglang_tpu.model_executor.runner.tpu_graph_runner.logger.info",
                         side_effect=record_log,
                     ):
                         with scope:

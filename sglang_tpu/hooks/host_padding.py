@@ -7,8 +7,8 @@ Remove when: upstream provides backend factories for these staging decisions.
 """
 
 from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_schedule
-from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
-from sglang_tpu.host_padding import _can_stage_forward_metadata, _enabled
+from sglang_tpu.compilation.host_padding import _can_stage_forward_metadata, _enabled
+from sglang_tpu.sampling.sampling_batch_info import is_host_padded
 
 
 def sampling_from_batch(
@@ -50,8 +50,8 @@ def _stages_spec_metadata(batch) -> bool:
     its lengths and request rows on host, so filtering and bucket padding never
     compile per batch size on the device. The worker is on whenever
     SGLANG_TPU_HOST_PADDING_NO_D2H or SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER is."""
-    # Lazy: sglang_tpu.experimental imports spec_info, which loads after the platform.
-    from sglang_tpu.experimental import uses_host_batch
+    # Lazy: sglang_tpu.speculative.experimental_spec imports spec_info, which loads after the platform.
+    from sglang_tpu.speculative.experimental_spec import uses_host_batch
 
     # Overlap batches resolve seq_lens on the device through the FutureMap.
     return uses_host_batch(batch) and not batch.enable_overlap
@@ -80,7 +80,7 @@ def create_future_map(original, algorithm, device, req_to_token_pool, *args, **k
         algorithm.is_none()
         and getattr(req_to_token_pool, "_tpu_relay_bucketer", None) is not None
     ):
-        from sglang_tpu.host_padding_relay import HostPaddingFutureMap
+        from sglang_tpu.managers.host_padding_relay import HostPaddingFutureMap
 
         return HostPaddingFutureMap(
             device, algorithm, req_to_token_pool, *args, **kwargs
@@ -89,7 +89,7 @@ def create_future_map(original, algorithm, device, req_to_token_pool, *args, **k
 
 
 def resolve_forward_inputs(original, batch, future_map):
-    from sglang_tpu.host_padding_relay import HostPaddingFutureMap
+    from sglang_tpu.managers.host_padding_relay import HostPaddingFutureMap
 
     if (
         isinstance(future_map, HostPaddingFutureMap)
@@ -104,7 +104,7 @@ def resolve_forward_inputs(original, batch, future_map):
 
 
 def relay_forward_payload(original, scheduler, batch, future_indices, result):
-    from sglang_tpu.host_padding_relay import HostPaddingFutureMap
+    from sglang_tpu.managers.host_padding_relay import HostPaddingFutureMap
 
     padded = (
         isinstance(scheduler.future_map, HostPaddingFutureMap)

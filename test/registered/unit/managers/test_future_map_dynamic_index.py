@@ -34,7 +34,7 @@ from sglang.srt.managers.overlap_utils import (
     FutureMap,
     _device_use_dynamic_index,
 )
-from sglang_tpu.overlap_utils_tpu import (
+from sglang_tpu.managers.overlap_utils_tpu import (
     _select_device_accept_cache_locs,
     device_accept_resolved_tpu,
 )

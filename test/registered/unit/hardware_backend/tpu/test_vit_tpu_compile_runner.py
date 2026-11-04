@@ -15,8 +15,8 @@ from sglang.srt.observability.compile_timing import CompileTimingRecorder
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang_tpu.compilation import direct_compile
 from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.graph_runner import vit_tpu_compile_runner as vit_runner
-from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
+from sglang_tpu.multimodal import vit_tpu_compile_runner as vit_runner
+from sglang_tpu.multimodal.vit_tpu_compile_runner import (
     Qwen3VLVisionTpuCompilePolicy,
     VisionPaddingContext,
     VisionTpuCompilePolicy,

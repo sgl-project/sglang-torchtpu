@@ -39,7 +39,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.patches import compute_single_host_tpu_env
-from sglang_tpu.ray_utils import (
+from sglang_tpu.ray.ray_utils import (
     _forwarded_driver_env,
     _resolve_bundle_order_from_probes,
     redact_env_for_log,
@@ -418,7 +418,7 @@ class TestDetectTpuNnodes(CustomTestCase):
     """
 
     def test_counts_only_alive_tpu_nodes(self):
-        from sglang_tpu import ray_utils
+        from sglang_tpu.ray import ray_utils
 
         nodes = [
             {"Alive": True, "Resources": {"TPU": 4}},
@@ -430,7 +430,7 @@ class TestDetectTpuNnodes(CustomTestCase):
             self.assertEqual(ray_utils.detect_tpu_nnodes(), 2)
 
     def test_returns_zero_on_error(self):
-        from sglang_tpu import ray_utils
+        from sglang_tpu.ray import ray_utils
 
         with mock.patch.object(
             ray_utils.ray, "nodes", side_effect=RuntimeError("boom")

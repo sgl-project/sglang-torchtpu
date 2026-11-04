@@ -16,7 +16,7 @@ import torch
 import torch_tpu  # noqa: F401
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang_tpu.dsa_indexer_tpu import build_dsa_kpool_topk_op
+from sglang_tpu.layers.attention.dsa.dsa_indexer_tpu import build_dsa_kpool_topk_op
 
 register_tpu_ci(est_time=60, suite="stage-a-test-tpu-unit", chips=1)
 

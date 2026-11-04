@@ -1108,7 +1108,7 @@ class Engine(EngineScoreMixin, EngineBase):
             resolve_auto_parsers(server_args)
 
         if resolving_view(server_args).device == "tpu":
-            from sglang_tpu.node_normalization import (
+            from sglang_tpu.entrypoints.node_normalization import (
                 prepare_tpu_environment,
             )
 
@@ -1310,7 +1310,7 @@ class Engine(EngineScoreMixin, EngineBase):
         with ExitStack() as stack:
             owns_base_port = envs.SGLANG_RUST_SERVER.get() and node_hosts_rust_server()
             if not owns_base_port and get_device().device == "tpu":
-                from sglang_tpu.leader_forwarding import (
+                from sglang_tpu.entrypoints.leader_forwarding import (
                     forward_normalized_leader,
                 )
 

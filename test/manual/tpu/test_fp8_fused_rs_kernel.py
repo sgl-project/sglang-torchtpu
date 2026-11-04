@@ -169,7 +169,7 @@ def main():
         # that routing IDs diverge or need to be canonicalized.
         kernel_topk_weights = topk_weights * (rank + 1)
 
-    from sglang_tpu.moe.pallas.fused_moe_rs_op import (
+    from sglang_tpu.layers.moe.pallas.fused_moe_rs_op import (
         _build_fused_moe_rs_op,
         fused_moe_rs_call,
         fused_moe_rs_padded_tokens,

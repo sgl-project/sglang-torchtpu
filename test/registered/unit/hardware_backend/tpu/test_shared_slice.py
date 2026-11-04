@@ -1,4 +1,4 @@
-"""CPU contracts of the ICI weight-update receiver (sglang_tpu.shared_slice)."""
+"""CPU contracts of the ICI weight-update receiver (sglang_tpu.weight_sync.shared_slice)."""
 
 import json
 import os
@@ -10,8 +10,8 @@ import torch
 from sglang.srt.platforms.interface import SRTPlatform, WeightUpdateReceiver
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu import shared_slice
-from sglang_tpu.tpu_platform import TpuSRTPlatform
+from sglang_tpu.platforms.tpu_platform import TpuSRTPlatform
+from sglang_tpu.weight_sync import shared_slice
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

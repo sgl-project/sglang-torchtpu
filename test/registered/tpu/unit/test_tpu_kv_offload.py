@@ -46,8 +46,8 @@ PAGE_SIZE = 16
 
 def _make_pools(size=256, layer_num=2, head_num=2, head_dim=64):
     """Build a (device_pool, host_pool) pair on TPU."""
-    from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
-    from sglang_tpu.kv_pool_host import TpuFusedMHATokenToKVPoolHost
+    from sglang_tpu.mem_cache.kv_pool import TpuFusedMHATokenToKVPool
+    from sglang_tpu.mem_cache.pool_host.kv_pool_host import TpuFusedMHATokenToKVPoolHost
 
     dev = TpuFusedMHATokenToKVPool(
         size=size,
@@ -133,7 +133,7 @@ def _make_controller(target_dev, target_host):
         BatchDoneCounter,
         TpuHiCacheController,
     )
-    from sglang_tpu.kv_copy_worker import TpuKvCopyWorker
+    from sglang_tpu.managers.kv_copy_worker import TpuKvCopyWorker
 
     controller = TpuHiCacheController.__new__(TpuHiCacheController)
     controller.io_backend = "torch_tpu"
@@ -165,8 +165,10 @@ class TestTpuFusedHostPool(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
-        from sglang_tpu.kv_pool_host import TpuFusedMHATokenToKVPoolHost
+        from sglang_tpu.mem_cache.kv_pool import TpuFusedMHATokenToKVPool
+        from sglang_tpu.mem_cache.pool_host.kv_pool_host import (
+            TpuFusedMHATokenToKVPoolHost,
+        )
 
         cls.device_pool = TpuFusedMHATokenToKVPool(
             size=cls.SIZE,
@@ -338,7 +340,7 @@ class TestTpuSeqAlongLaneCpuCopy(CustomTestCase):
     PAGE_SIZE = 256
 
     def _make_pool(self):
-        from sglang_tpu.kv_pool import TpuSeqAlongLaneKVPool
+        from sglang_tpu.mem_cache.kv_pool import TpuSeqAlongLaneKVPool
 
         pool = TpuSeqAlongLaneKVPool(
             size=self.PAGE_SIZE * 4,

@@ -64,17 +64,17 @@ from jax.experimental.pallas import tpu as pltpu  # noqa: E402
 
 
 def _import_gmm_v2():
-    """Import gmm_v2 without executing ``sglang_tpu.moe.pallas``'s ``__init__``:
+    """Import gmm_v2 without executing ``sglang_tpu.layers.moe.pallas``'s ``__init__``:
     that imports ``fused_moe_op``, which imports torch_tpu at module scope, and
     this process must not start the torch_tpu runtime next to JAX's own TPU
     client. gmm_v2 itself only needs JAX and ``sglang.srt.environ``."""
-    for name in ("sglang_tpu.moe", "sglang_tpu.moe.pallas"):
+    for name in ("sglang_tpu.layers.moe", "sglang_tpu.layers.moe.pallas"):
         if name not in sys.modules:
             spec = importlib.util.find_spec(name)
             pkg = types.ModuleType(name)
             pkg.__path__ = list(spec.submodule_search_locations)
             sys.modules[name] = pkg
-    return importlib.import_module("sglang_tpu.moe.pallas.gmm_v2")
+    return importlib.import_module("sglang_tpu.layers.moe.pallas.gmm_v2")
 
 
 gmm = _import_gmm_v2()

@@ -4,11 +4,11 @@ import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu.eagle_utils_tpu import (
+from sglang_tpu.speculative.eagle_utils_tpu import (
     fused_draft_extend_select_argmax_func,
     last_accepted_row_indices,
 )
-from sglang_tpu.spec_op_warmup import (
+from sglang_tpu.speculative.spec_op_warmup import (
     SpecOpWarmupContext,
     make_draft_extend_select_args,
 )

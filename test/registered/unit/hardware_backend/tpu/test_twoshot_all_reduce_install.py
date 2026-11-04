@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from sglang.srt.layers.linear import RowParallelLinear
-from sglang_tpu import twoshot_all_reduce
+from sglang_tpu.distributed import twoshot_all_reduce
 
 
 class _Row(RowParallelLinear):

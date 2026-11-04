@@ -7,8 +7,8 @@ from types import SimpleNamespace as NS
 import pytest
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu import benchmark_batch_gate
-from sglang_tpu.benchmark_batch_gate import BenchmarkBatchGate
+from sglang_tpu.managers import benchmark_batch_gate
+from sglang_tpu.managers.benchmark_batch_gate import BenchmarkBatchGate
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

@@ -134,7 +134,9 @@ does not move backwards.
 `sglang_tpu/` at the repo root is the TPU backend, installed as the plugin
 `sglang-tpu` next to the fork in `python/` (`sglang_tpu/README.md`).
 
-- New TPU-only modules go in `sglang_tpu/`, never under `python/sglang/srt/`.
+- New TPU-only modules go in `sglang_tpu/`, never under `python/sglang/srt/`,
+  in the subpackage that mirrors the core path they extend (`mem_cache/`,
+  `layers/attention/`, ...); the package root holds only plugin plumbing.
   The vacated paths hold re-export shims; do not add code to them.
 - Core must not import `sglang_tpu` or grow new `is_tpu()` branches.
   `tools/plugin/check_tpu_branches.py` (a pre-commit hook) ratchets both

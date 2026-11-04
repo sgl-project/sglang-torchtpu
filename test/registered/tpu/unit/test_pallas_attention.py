@@ -44,7 +44,7 @@ class TestPallasHelpers(CustomTestCase):
     """Pure logic — no TPU required."""
 
     def test_bucket_kv_len_boundaries(self):
-        from sglang_tpu.attention_pallas import (
+        from sglang_tpu.layers.attention.attention_pallas import (
             _PAGE_SIZE,
             _bucket_kv_len,
         )
@@ -63,12 +63,16 @@ class TestPallasHelpers(CustomTestCase):
             self.assertGreaterEqual(_bucket_kv_len(n), n)
 
     def test_vision_flash_block_q_off_keeps_default_blocks(self):
-        from sglang_tpu.attention_pallas import _vision_flash_block_sizes
+        from sglang_tpu.layers.attention.attention_pallas import (
+            _vision_flash_block_sizes,
+        )
 
         self.assertIsNone(_vision_flash_block_sizes(0, 4096, 4096, 4096))
 
     def test_vision_flash_block_q_keeps_one_k_step(self):
-        from sglang_tpu.attention_pallas import _vision_flash_block_sizes
+        from sglang_tpu.layers.attention.attention_pallas import (
+            _vision_flash_block_sizes,
+        )
 
         blocks = _vision_flash_block_sizes(256, 4096, 4096, 4096)
         self.assertEqual(blocks.block_q, 256)
@@ -78,14 +82,16 @@ class TestPallasHelpers(CustomTestCase):
         self.assertEqual(_vision_flash_block_sizes(256, 4096, 128, 128).block_q, 128)
 
     def test_vision_flash_block_q_stops_above_max_seq(self):
-        from sglang_tpu.attention_pallas import _vision_flash_block_sizes
+        from sglang_tpu.layers.attention.attention_pallas import (
+            _vision_flash_block_sizes,
+        )
 
         self.assertIsNone(_vision_flash_block_sizes(256, 4096, 8192, 8192))
 
     def test_maybe_expand_kv_heads(self):
         import torch
 
-        from sglang_tpu.attention_pallas import (
+        from sglang_tpu.layers.attention.attention_pallas import (
             _maybe_expand_kv_heads,
         )
 
@@ -147,7 +153,7 @@ class TestPallasFlashTokenSlotPadding(CustomTestCase):
         import torch
 
         from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-        from sglang_tpu.attention_pallas import (
+        from sglang_tpu.layers.attention.attention_pallas import (
             _pad_token_slots,
         )
 
@@ -171,7 +177,7 @@ class TestPallasFlashTokenSlotPadding(CustomTestCase):
     def test_padding_helper_also_slices(self):
         import torch
 
-        from sglang_tpu.attention_pallas import (
+        from sglang_tpu.layers.attention.attention_pallas import (
             _pad_token_slots,
         )
 
@@ -204,7 +210,7 @@ class TestFlashKernelNumerics(CustomTestCase):
     def _check(self, H, Sq, Skv, D, causal, tol=2e-2):
         import torch
 
-        from sglang_tpu.attention_pallas import (
+        from sglang_tpu.layers.attention.attention_pallas import (
             _attend,
             _get_flash_op,
         )
@@ -239,8 +245,8 @@ class TestVisionFlashBlockQNumerics(CustomTestCase):
     tiles stay within one bf16 ulp of them."""
 
     def _vision_flash(self, q, k, v, seg, scale, block_q):
-        from sglang_tpu.attention_pallas import _get_vision_flash_op
         from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.layers.attention.attention_pallas import _get_vision_flash_op
 
         with tpu_envs.SGLANG_TPU_VISION_FLASH_BLOCK_Q.override(block_q):
             op = _get_vision_flash_op(scale)
@@ -284,7 +290,7 @@ class TestPagedKernelNumerics(CustomTestCase):
         import numpy as np
         import torch
 
-        from sglang_tpu.attention_pallas import (
+        from sglang_tpu.layers.attention.attention_pallas import (
             _get_paged_op,
         )
 
@@ -340,7 +346,7 @@ class TestPallasFlashDecodePaddingNumerics(CustomTestCase):
         import numpy as np
         import torch
 
-        from sglang_tpu.attention_pallas import (
+        from sglang_tpu.layers.attention.attention_pallas import (
             TpuPallasAttnBackend,
             _bucket_kv_len,
         )

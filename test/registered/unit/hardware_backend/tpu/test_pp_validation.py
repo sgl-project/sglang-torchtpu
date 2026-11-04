@@ -20,15 +20,15 @@ from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state imp
     SpecAuxHiddenStateConfig,
 )
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu import pp_stage_chips
+from sglang_tpu.distributed import pp_stage_chips
+from sglang_tpu.distributed.pp_wave import num_relayed_aux_slots
 from sglang_tpu.envs import envs
 from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
     skip_spec_op_precompile_without_draft,
 )
-from sglang_tpu.pp_scheduler import _check_aux_capture_relay
-from sglang_tpu.pp_wave import num_relayed_aux_slots
-from sglang_tpu.tpu_platform import TpuSRTPlatform
+from sglang_tpu.managers.pp_scheduler import _check_aux_capture_relay
+from sglang_tpu.platforms.tpu_platform import TpuSRTPlatform
 
 
 def _args(**overrides):

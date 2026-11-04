@@ -263,10 +263,10 @@ class HybridCacheController(BaseHiCacheController):
         (e.g. raiden) has no device streams and drives per-pool all-layer DMAs,
         so it needs its own controller class.
         """
-        from sglang_tpu.tpu_dma_hicache import is_tpu_dma_hicache_backend
+        from sglang_tpu.mem_cache.tpu_dma_hicache import is_tpu_dma_hicache_backend
 
         if is_tpu_dma_hicache_backend(kwargs.get("io_backend")):
-            from sglang_tpu.tpu_dma_hybrid_cache_controller import (
+            from sglang_tpu.mem_cache.hybrid_cache.tpu_dma_hybrid_cache_controller import (
                 TpuDMAHybridCacheController,
             )
 

@@ -60,8 +60,8 @@ class TestMuseVision(unittest.TestCase):
             muse_spark_vision.NaViTBlock(32, 64, 2, True)
 
     def test_vision_features_preserve_device_buffer_through_host_placement(self):
-        from sglang_tpu.mm_embed_tpu import _place_mm_rows
-        from sglang_tpu.mm_embedding import PaddedEmbedding, split_embedding
+        from sglang_tpu.managers.mm_embed_tpu import _place_mm_rows
+        from sglang_tpu.managers.mm_embedding import PaddedEmbedding, split_embedding
         from sglang_tpu.models.muse_spark_omni import (
             MuseSparkForConditionalGeneration as Omni,
         )
@@ -103,7 +103,7 @@ class TestMuseVision(unittest.TestCase):
         torch.testing.assert_close(union, mask)
 
     def test_encoder_owns_host_feature_transfer_before_dp_assignment(self):
-        from sglang_tpu import mm_schedule_tpu
+        from sglang_tpu.managers import mm_schedule_tpu
 
         class HostEncoder:
             keeps_mm_features_on_host = True

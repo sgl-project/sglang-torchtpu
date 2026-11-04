@@ -16,9 +16,9 @@ from unittest.mock import MagicMock, patch
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope
-from sglang_tpu import host_heap_trim as tpu
-from sglang_tpu import page_cache
 from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.utils import host_heap_trim as tpu
+from sglang_tpu.utils import page_cache
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 register_tpu_ci(est_time=2, suite="stage-a-test-tpu-unit", chips=1)

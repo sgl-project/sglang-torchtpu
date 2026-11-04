@@ -15,7 +15,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.profiler import (
+from sglang_tpu.utils.profiler import (
     _tpu_profile_options,
     start_tpu_profile,
     stop_tpu_profile,
@@ -225,7 +225,7 @@ def test_stage_tpu_profile_synchronizes_before_stopping(tmp_path):
             side_effect=lambda: calls.append("synchronize"),
         ),
         patch(
-            "sglang_tpu.profiler.stop_tpu_profile",
+            "sglang_tpu.utils.profiler.stop_tpu_profile",
             side_effect=lambda actual: calls.append(("stop", actual)),
         ),
     ):
@@ -246,7 +246,7 @@ def test_non_stage_tpu_profile_stops_without_synchronizing(tmp_path):
             side_effect=lambda: calls.append("synchronize"),
         ),
         patch(
-            "sglang_tpu.profiler.stop_tpu_profile",
+            "sglang_tpu.utils.profiler.stop_tpu_profile",
             side_effect=lambda actual: calls.append(("stop", actual)),
         ),
     ):

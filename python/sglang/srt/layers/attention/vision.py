@@ -52,7 +52,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
 if _is_tpu:
-    from sglang_tpu.attention_pallas import _get_vision_flash_op
+    from sglang_tpu.layers.attention.attention_pallas import _get_vision_flash_op
 
 if _is_cuda:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache

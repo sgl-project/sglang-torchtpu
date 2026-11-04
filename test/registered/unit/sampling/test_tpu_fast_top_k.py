@@ -24,11 +24,10 @@ from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu import sampler as tpu_sampler_module
-from sglang_tpu import top_k as tpu_top_k_module
 from sglang_tpu.envs import envs
-from sglang_tpu.row_pad import pad_rows, row_bucket
-from sglang_tpu.sampler import (
+from sglang_tpu.layers import sampler as tpu_sampler_module
+from sglang_tpu.layers import top_k as tpu_top_k_module
+from sglang_tpu.layers.sampler import (
     MAX_DISTRIBUTED_TOP_K,
     TpuSampler,
     distributed_top_k_candidate_width,
@@ -36,7 +35,7 @@ from sglang_tpu.sampler import (
     sample_from_global_top_k_logits,
     select_logits_output_mode,
 )
-from sglang_tpu.top_k import (
+from sglang_tpu.layers.top_k import (
     PallasDistributedTopKConfig,
     PallasDistributedTopKNegotiation,
     TpuVocabShard,
@@ -45,6 +44,7 @@ from sglang_tpu.top_k import (
     supports_distributed_tpu_top_k,
     tpu_top_k,
 )
+from sglang_tpu.utils.row_pad import pad_rows, row_bucket
 
 
 def _forward_batch(*, batch_size=1, **info_overrides):
@@ -227,7 +227,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
                 return_value=True,
             ),
             patch(
-                "sglang_tpu.sampler.get_parallel",
+                "sglang_tpu.layers.sampler.get_parallel",
                 return_value=SimpleNamespace(tp_group=group, attn_tp_group=group),
             ) as get_group,
             patch.object(
@@ -236,7 +236,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
                 return_value=PallasDistributedTopKNegotiation(config, None),
             ) as negotiate,
             patch(
-                "sglang_tpu.distributed_topk_pallas."
+                "sglang_tpu.layers.distributed_topk_pallas."
                 "register_pallas_distributed_top_k_op"
             ) as register,
         ):
@@ -293,7 +293,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
                 return_value=True,
             ),
             patch(
-                "sglang_tpu.sampler.get_parallel",
+                "sglang_tpu.layers.sampler.get_parallel",
                 return_value=SimpleNamespace(tp_group=group, attn_tp_group=group),
             ),
             patch.object(
@@ -302,7 +302,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
                 return_value=PallasDistributedTopKNegotiation(config, None),
             ),
             patch(
-                "sglang_tpu.distributed_topk_pallas."
+                "sglang_tpu.layers.distributed_topk_pallas."
                 "register_pallas_distributed_top_k_op"
             ),
         ):
@@ -566,7 +566,7 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
                     return weights.argmax(-1).to(torch.int32)
 
                 with (
-                    patch("sglang_tpu.top_k.tpu_top_k", side_effect=torch.topk),
+                    patch("sglang_tpu.layers.top_k.tpu_top_k", side_effect=torch.topk),
                     patch.object(
                         tpu_sampler_module, "sampling_from_probs_torch", sample
                     ),
@@ -726,7 +726,7 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
 
         with (
             patch(
-                "sglang_tpu.top_k.tpu_top_k",
+                "sglang_tpu.layers.top_k.tpu_top_k",
                 side_effect=_padded_top_k(global_top_k_probs, global_top_k_token_ids),
             ),
             patch.object(
@@ -765,7 +765,7 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
                 tpu_sampler_module, "_use_bsearch_filtering", return_value=True
             ),
             patch(
-                "sglang_tpu.sampling_mask.tpu_filter_probs",
+                "sglang_tpu.layers.sampling_mask.tpu_filter_probs",
                 return_value=filtered,
             ) as filter_probs,
             patch.object(
@@ -814,11 +814,11 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
                 tpu_sampler_module, "_use_bsearch_filtering", return_value=True
             ),
             patch(
-                "sglang_tpu.top_k.tpu_top_k",
+                "sglang_tpu.layers.top_k.tpu_top_k",
                 side_effect=_padded_top_k(global_top_k_probs, global_top_k_token_ids),
             ) as top_k,
             patch(
-                "sglang_tpu.sampling_mask.tpu_filter_probs",
+                "sglang_tpu.layers.sampling_mask.tpu_filter_probs",
                 return_value=filtered_block,
             ) as filter_probs,
             patch.object(
@@ -866,7 +866,7 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
             patch.object(
                 tpu_sampler_module, "_use_bsearch_filtering", return_value=False
             ),
-            patch("sglang_tpu.top_k.tpu_top_k") as top_k,
+            patch("sglang_tpu.layers.top_k.tpu_top_k") as top_k,
             patch.object(
                 tpu_sampler_module,
                 "top_k_top_p_min_p_sampling_from_probs_torch",
@@ -892,7 +892,7 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
 
         with (
             patch(
-                "sglang_tpu.top_k.tpu_top_k",
+                "sglang_tpu.layers.top_k.tpu_top_k",
                 side_effect=_padded_top_k(global_top_k_probs, global_top_k_token_ids),
             ) as top_k,
             patch.object(
@@ -1328,7 +1328,7 @@ class TestHostSamplingWarmupCoverage(CustomTestCase):
     VOCAB = 128
 
     def _kernel_calls(self, infos):
-        from sglang_tpu import sampling_mask as sampling_mask_module
+        from sglang_tpu.layers import sampling_mask as sampling_mask_module
         from sglang_tpu.sampling import warmup as warmup_module
 
         calls = set()

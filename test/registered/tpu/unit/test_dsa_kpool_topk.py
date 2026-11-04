@@ -25,8 +25,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.attention.pallas import dsa_kpool_topk as kp
-from sglang_tpu.attention.pallas.kpool_compress import compress_and_store
+from sglang_tpu.layers.attention.pallas import dsa_kpool_topk as kp
+from sglang_tpu.layers.attention.pallas.kpool_compress import compress_and_store
 
 # The kernel needs whole 128-token pages; TOPK keeps 16 of up to 128 pools.
 D, HEADS, KPOOL, PAGE, PAGES_PER_SEQ, TOPK = 128, 8, 4, 128, 4, 64

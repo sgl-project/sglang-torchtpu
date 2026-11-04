@@ -4,7 +4,7 @@
 register_mhc_ops, wire_hc_ffn_post_pre, hc_pre, hc_ffn_post_pre, hc_post
   Why: hc_pre / hc_post pick their implementation with in-module aiter and
        TileLang gates and have no backend seam, and the TPU Pallas kernel
-       (sglang_tpu.mhc) must stay out of core.
+       (sglang_tpu.layers.mhc) must stay out of core.
   How: AFTER Glm5NextDecoderLayer.__init__ registers the kernel's custom ops
        before torch.compile traces the model. BEFORE MHCState.__init__ hands a
        Glm5NextDecoderLayer's state its hc_ffn_post_pre, which the layer
@@ -22,7 +22,7 @@ from __future__ import annotations
 from types import ModuleType
 from typing import Any, Callable
 
-# sglang_tpu.mhc once a GLM-5.3-Flash mHC layer was built with the flag set,
+# sglang_tpu.layers.mhc once a GLM-5.3-Flash mHC layer was built with the flag set,
 # else None: a module global, constant under torch.compile.
 _kernel: ModuleType | None = None
 
@@ -52,7 +52,7 @@ def register_mhc_ops(result: None, layer: Any, *args, **kwargs) -> None:
     global _kernel
     if _kernel is not None or not layer.config.mhc or not _enabled():
         return
-    import sglang_tpu.mhc as kernel
+    import sglang_tpu.layers.mhc as kernel
 
     kernel.register_ops()
     _kernel = kernel

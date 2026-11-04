@@ -9,7 +9,7 @@ import pytest
 jax = pytest.importorskip("jax")
 
 from sglang.test.ci.ci_register import register_tpu_ci  # noqa: E402
-from sglang_tpu.kv_row_write import (  # noqa: E402
+from sglang_tpu.mem_cache.kv_row_write import (  # noqa: E402
     kv_write_segments,
     write_rows,
 )

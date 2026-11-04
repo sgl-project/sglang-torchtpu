@@ -31,7 +31,7 @@ def extract(path, names, ns):
 class TestFp32MoeScales(unittest.TestCase):
     def test_scale_math_and_production_parity(self):
         ns = extract(
-            "sglang_tpu/moe/pallas/gmm_v2.py",
+            "sglang_tpu/layers/moe/pallas/gmm_v2.py",
             {"_scale_quantized_partial"},
             {"jnp": jnp},
         )
@@ -67,7 +67,7 @@ class TestFp32MoeScales(unittest.TestCase):
                 "envs": NS(SGLANG_TPU_FP8_MOE_FP32_SCALES=NS(get=lambda: enabled)),
             }
             extract(
-                "sglang_tpu/fp8_moe.py",
+                "sglang_tpu/layers/quantization/fp8_moe.py",
                 {"_own_storage", "_to_tpu_fp8_moe_scale_layout"},
                 ns,
             )

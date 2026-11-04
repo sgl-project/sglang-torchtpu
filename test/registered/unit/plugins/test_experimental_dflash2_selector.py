@@ -11,7 +11,7 @@ import torch._dynamo.config
 from sglang.srt.models.dflash import CandidateSelector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.experimental.models.dflash2 import (
+from sglang_tpu.speculative.dflash.dflash2 import (
     build_lattice,
     dense_logits,
     lattice_path_rows,
@@ -20,7 +20,7 @@ from sglang_tpu.experimental.models.dflash2 import (
     walk_lattice,
     walk_lattice_sampled,
 )
-from sglang_tpu.experimental.speculative.spec_ops import STREAM_DRAFT, hash_uniforms
+from sglang_tpu.speculative.spec_ops import STREAM_DRAFT, hash_uniforms
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

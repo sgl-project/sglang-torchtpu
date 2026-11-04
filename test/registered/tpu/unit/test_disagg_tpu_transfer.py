@@ -1303,7 +1303,7 @@ class TestPinnedHostPool(CustomTestCase):
 @_TPU_CONNECTOR_RETIRED
 class TestTpuTransferOnDevice(CustomTestCase):
     def test_device_gather_scatter_roundtrip(self):
-        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+        from sglang_tpu.mem_cache.kv_pool import TpuFusedMHATokenToKVPool
 
         kwargs = dict(
             size=64,
@@ -1340,7 +1340,7 @@ class TestTpuTransferOnDevice(CustomTestCase):
         """Zero-copy pinned-staging path (#1/#4): gather_pages_to_stage ->
         memoryview bytes (the wire) -> scatter_stage_from_host, byte-exact."""
         from sglang_tpu.disaggregation.tpu.host_staging import PinnedHostPool
-        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+        from sglang_tpu.mem_cache.kv_pool import TpuFusedMHATokenToKVPool
 
         kwargs = dict(
             size=64,
@@ -1384,7 +1384,7 @@ class TestTpuTransferOnDevice(CustomTestCase):
         those StageBufs directly (no second copy), then releases them to the
         pool. Byte-exact, and the buffers return to the pool for reuse."""
         from sglang_tpu.disaggregation.tpu.host_staging import PinnedHostPool, StageBuf
-        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+        from sglang_tpu.mem_cache.kv_pool import TpuFusedMHATokenToKVPool
 
         kwargs = dict(
             size=64,
@@ -1461,7 +1461,7 @@ class TestTpuKVManagerStagingOnDevice(CustomTestCase):
 
     def _make_device_pair(self, async_d2h, n_channels):
         from sglang_tpu.disaggregation.tpu.host_staging import PinnedHostPool
-        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+        from sglang_tpu.mem_cache.kv_pool import TpuFusedMHATokenToKVPool
 
         src = TpuFusedMHATokenToKVPool(**self.POOL_KWARGS)
         dst = TpuFusedMHATokenToKVPool(**self.POOL_KWARGS)
@@ -1597,7 +1597,7 @@ class TestPrepareForPrebuiltTpuPadding(CustomTestCase):
 
 class TestTpuPagedTokenToKVPoolAllocatorCpuAssertion(CustomTestCase):
     def test_free_cpu_tensor_succeeds(self):
-        from sglang_tpu.allocator_tpu import (
+        from sglang_tpu.mem_cache.allocator.allocator_tpu import (
             TpuPagedTokenToKVPoolAllocator,
         )
 
@@ -1623,7 +1623,7 @@ class TestTpuPagedTokenToKVPoolAllocatorCpuAssertion(CustomTestCase):
         allocator.free_group_end()
 
     def test_free_non_cpu_tensor_converts_to_cpu(self):
-        from sglang_tpu.allocator_tpu import (
+        from sglang_tpu.mem_cache.allocator.allocator_tpu import (
             TpuPagedTokenToKVPoolAllocator,
         )
 

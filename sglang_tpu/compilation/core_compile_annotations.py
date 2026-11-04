@@ -44,7 +44,7 @@ def _bailing_vl_decoder_policy() -> type[CompilePolicy]:
 
 
 def _kimi_k3_vision_policy() -> type[CompilePolicy]:
-    from sglang_tpu.graph_runner.kimi_k3_vit_tpu_compile_runner import (
+    from sglang_tpu.multimodal.kimi_k3_vit_tpu_compile_runner import (
         KimiK3VisionTpuCompilePolicy,
     )
 

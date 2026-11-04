@@ -28,7 +28,7 @@ from sglang.srt.managers.cache_controller import storage_model_name
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.kv_pool_host import TpuFusedMHATokenToKVPoolHost
+from sglang_tpu.mem_cache.pool_host.kv_pool_host import TpuFusedMHATokenToKVPoolHost
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -295,7 +295,9 @@ class TestStorageFormatTagFromRealPools(CustomTestCase):
 
     @staticmethod
     def _pools(pool_cls, dtype):
-        from sglang_tpu.kv_pool_host import TpuFusedMHATokenToKVPoolHost
+        from sglang_tpu.mem_cache.pool_host.kv_pool_host import (
+            TpuFusedMHATokenToKVPoolHost,
+        )
 
         # The seq-along-lane pool asks Pallas for the chip's sublane count,
         # which needs a TPU; stand in tpu7x's 8 sublanes so the pool builds on
@@ -305,7 +307,8 @@ class TestStorageFormatTagFromRealPools(CustomTestCase):
             return -(-head_dim // tile) * tile
 
         with patch(
-            "sglang_tpu.kv_pool._seq_along_lane_head_dim", _head_dim_without_tpu
+            "sglang_tpu.mem_cache.kv_pool._seq_along_lane_head_dim",
+            _head_dim_without_tpu,
         ):
             dev = pool_cls(
                 size=4 * PAGE_SIZE,
@@ -328,7 +331,10 @@ class TestStorageFormatTagFromRealPools(CustomTestCase):
         return dev, host
 
     def test_tag_names_the_live_layout_dtype_and_dims(self):
-        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool, TpuSeqAlongLaneKVPool
+        from sglang_tpu.mem_cache.kv_pool import (
+            TpuFusedMHATokenToKVPool,
+            TpuSeqAlongLaneKVPool,
+        )
 
         cases = (
             (TpuFusedMHATokenToKVPool, "token-major"),

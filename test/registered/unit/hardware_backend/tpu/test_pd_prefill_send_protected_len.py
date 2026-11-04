@@ -37,8 +37,8 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
-from sglang_tpu.tpu_platform import TpuSRTPlatform
+from sglang_tpu.mem_cache.allocator.allocator_tpu import TpuPagedTokenToKVPoolAllocator
+from sglang_tpu.platforms.tpu_platform import TpuSRTPlatform
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

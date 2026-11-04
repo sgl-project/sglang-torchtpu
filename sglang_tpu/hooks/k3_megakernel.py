@@ -123,7 +123,7 @@ def attach_k3_megakernel(result: None, causal_lm: Any, *args, **kwargs) -> None:
     """AFTER KimiK3LinearForCausalLM.post_load_weights."""
     if not _enabled():
         return
-    from sglang_tpu.k3_megakernel.ops import build_runtime
+    from sglang_tpu.models.k3_megakernel.ops import build_runtime
 
     if _owns_weights():
         _check_server_args()

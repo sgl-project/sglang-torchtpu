@@ -59,7 +59,7 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardReady,
     ReshardReq,
 )
-from sglang_tpu.mamba_pool import TpuMambaPool
+from sglang_tpu.mem_cache.mamba_pool import TpuMambaPool
 
 
 def _polled(sent=(), received=(), failed=(), completed_ns=None):
@@ -1076,7 +1076,7 @@ class TestRaidenBlockMajorEngine(RaidenRendezvousTestCase):
 
     def test_each_engine_registers_one_bundle(self):
         from sglang_tpu.disaggregation.raiden.host_pool import slot_host_bytes
-        from sglang_tpu.kv_pool import (
+        from sglang_tpu.mem_cache.kv_pool import (
             TpuBlockMajorMHATokenToKVPool,
             TpuFusedMHATokenToKVPool,
         )

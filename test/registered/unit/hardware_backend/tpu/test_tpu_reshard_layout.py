@@ -7,7 +7,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
-from sglang_tpu.kv_pool import (
+from sglang_tpu.mem_cache.kv_pool import (
     TpuBlockMajorMHATokenToKVPool,
     TpuFusedMHATokenToKVPool,
 )

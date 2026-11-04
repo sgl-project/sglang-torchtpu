@@ -192,7 +192,7 @@ def layout_fingerprint(
 def _ships_pd_hidden() -> bool:
     """Whether this P/D pair moves draft-input hidden rows instead of draft KV."""
     from sglang.srt.runtime_context import get_spec
-    from sglang_tpu.experimental import pd_decode_draft_prefill
+    from sglang_tpu.speculative.experimental_spec import pd_decode_draft_prefill
 
     return pd_decode_draft_prefill() and get_spec().speculative_algorithm is not None
 

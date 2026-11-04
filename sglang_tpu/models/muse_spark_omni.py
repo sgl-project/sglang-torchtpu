@@ -21,8 +21,8 @@ from sglang.srt.multimodal.mm_utils import (
     get_dp_encoder_lb_assignment,
 )
 from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang_tpu.mm_embed_tpu import embed_mm_inputs_tpu
-from sglang_tpu.mm_embedding import PaddedEmbedding
+from sglang_tpu.managers.mm_embed_tpu import embed_mm_inputs_tpu
+from sglang_tpu.managers.mm_embedding import PaddedEmbedding
 from sglang_tpu.models.muse_spark import MuseSparkForConditionalGeneration as TextModel
 from sglang_tpu.models.muse_spark import _rms_normalize, _to_interleaved_rope
 from sglang_tpu.models.muse_spark_vision import (

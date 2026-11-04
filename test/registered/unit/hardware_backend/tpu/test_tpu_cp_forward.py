@@ -13,11 +13,11 @@ from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.attention_pallas_rpa_batched import (
+from sglang_tpu.compilation.bucketer import Bucketer
+from sglang_tpu.layers.attention.attention_pallas_rpa_batched import (
     TpuPallasRpaBatchedAttnBackend,
 )
-from sglang_tpu.compilation.bucketer import Bucketer
-from sglang_tpu.cp_forward import (
+from sglang_tpu.layers.cp.cp_forward import (
     TpuCpBatchLayout,
     cp_last_token_rows,
     get_tpu_cp_layout,
@@ -26,17 +26,17 @@ from sglang_tpu.cp_forward import (
     prepare_tpu_cp_forward_batch,
     wrap_cp_embedding_forward,
 )
-from sglang_tpu.cp_layout import (
+from sglang_tpu.layers.cp.cp_layout import (
     build_tpu_cp_layout,
     local_row_count,
     warmup_request_lengths,
 )
-from sglang_tpu.kv_row_write import kv_write_segments
-from sglang_tpu.tpu_platform import TpuSRTPlatform
+from sglang_tpu.mem_cache.kv_row_write import kv_write_segments
+from sglang_tpu.platforms.tpu_platform import TpuSRTPlatform
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-_CP_FORWARD = "sglang_tpu.cp_forward"
+_CP_FORWARD = "sglang_tpu.layers.cp.cp_forward"
 
 # Two requests shorter than the 8 zigzag blocks of CP 4: the 6-token one ends
 # in the late block of rank 2, the 3-token one in the early block of rank 2.

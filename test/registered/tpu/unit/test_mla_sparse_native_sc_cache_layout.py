@@ -25,7 +25,7 @@ import unittest
 import numpy as np
 from absl.testing import absltest
 
-from sglang_tpu.attention.pallas.mla_sparse import native_sc_cache_layout
+from sglang_tpu.layers.attention.pallas.mla_sparse import native_sc_cache_layout
 
 
 class NativeScCacheLayoutTest(absltest.TestCase):

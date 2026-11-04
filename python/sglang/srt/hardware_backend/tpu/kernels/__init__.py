@@ -1,3 +1,1 @@
-"""Moved to :mod:`sglang_tpu.kernels`; re-export kept for in-flight branches, delete once they merge."""
-
-from sglang_tpu.kernels import *  # noqa: F401,F403
+"""Moved to :mod:`sglang_tpu.layers.attention.pallas`, :mod:`sglang_tpu.layers.pallas`, :mod:`sglang_tpu.layers.quantization.pallas` and :mod:`sglang_tpu.distributed.pallas`; package kept for the submodule aliases, delete once in-flight branches merge."""

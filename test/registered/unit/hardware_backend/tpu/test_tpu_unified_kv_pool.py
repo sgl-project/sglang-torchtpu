@@ -11,8 +11,8 @@ import torch
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool, TpuSeqAlongLaneKVPool
-from sglang_tpu.unified_kv_pool import (
+from sglang_tpu.mem_cache.kv_pool import TpuFusedMHATokenToKVPool, TpuSeqAlongLaneKVPool
+from sglang_tpu.mem_cache.unified_kv_pool import (
     AttnLayerSpec,
     TpuUnifiedSWAKVPool,
     UnifiedPageLayout,
@@ -160,7 +160,7 @@ class TestTpuUnifiedSWAKVPoolStorage(unittest.TestCase):
             self.assertTrue(torch.all(pool.get_state()[j % 8][p] == float(10 + j)))
 
         # Verify Raiden retraction backup stages Full pages via handle while SWA uses row-copy
-        from sglang_tpu.raiden_kv_backup import RaidenKVBackupHandle
+        from sglang_tpu.mem_cache.raiden_kv_backup import RaidenKVBackupHandle
 
         saved_indices = []
         restored = []
@@ -188,7 +188,7 @@ class TestTpuUnifiedSWAKVPoolStorage(unittest.TestCase):
 
         # Verify TpuSeqAlongLaneKVPool saves 50% HBM vs TpuFusedMHATokenToKVPool at head_num=1 in fp8
         with patch(
-            "sglang_tpu.kv_pool._seq_along_lane_head_dim",
+            "sglang_tpu.mem_cache.kv_pool._seq_along_lane_head_dim",
             side_effect=lambda *, head_dim, kv_packing: (
                 ((head_dim + 8 * kv_packing - 1) // (8 * kv_packing)) * (8 * kv_packing)
             ),

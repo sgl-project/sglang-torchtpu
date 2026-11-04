@@ -33,15 +33,15 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.kv_free_fence import KVFreeFence, fence_hicache_backups
-from sglang_tpu.kv_pool_host import (
+from sglang_tpu.mem_cache.hybrid_cache.tpu_dma_hybrid_cache_controller import (
+    TpuDMAHybridCacheController,
+)
+from sglang_tpu.mem_cache.kv_free_fence import KVFreeFence, fence_hicache_backups
+from sglang_tpu.mem_cache.pool_host.kv_pool_host import (
     TPU_DMA_LAYOUT,
     TpuDMAHostKVPool,
 )
-from sglang_tpu.raiden_transfer import RaidenKVTransfer
-from sglang_tpu.tpu_dma_hybrid_cache_controller import (
-    TpuDMAHybridCacheController,
-)
+from sglang_tpu.mem_cache.raiden_transfer import RaidenKVTransfer
 
 
 class _FakeFuture:
@@ -507,7 +507,7 @@ class TestAssemblerPlatformHook(CustomTestCase):
 class TestSplitDsaAndStateOffload(CustomTestCase):
     @staticmethod
     def _split_pool():
-        from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
+        from sglang_tpu.mem_cache.kv_pool import TpuSplitMLATokenToKVPool
 
         return TpuSplitMLATokenToKVPool(
             size=64,
@@ -528,8 +528,8 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
         per-layer states, so the TPU stack must win exactly when it can copy them."""
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
         from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-        from sglang_tpu.hybrid_linear_hicache import TpuDmaMambaStrategy
-        from sglang_tpu.mamba_pool import TpuMambaPool
+        from sglang_tpu.mem_cache.hybrid_linear_hicache import TpuDmaMambaStrategy
+        from sglang_tpu.mem_cache.mamba_pool import TpuMambaPool
 
         tpu_kvcache = object.__new__(HybridLinearKVPool)
         tpu_kvcache.mamba_pool = object.__new__(TpuMambaPool)
@@ -546,7 +546,7 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
             with (
                 self.subTest(io_backend=io_backend, components=components),
                 patch(
-                    "sglang_tpu.hybrid_linear_hicache.get_memory",
+                    "sglang_tpu.mem_cache.hybrid_linear_hicache.get_memory",
                     return_value=SimpleNamespace(hicache_io_backend=io_backend),
                 ),
             ):
@@ -557,7 +557,7 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
     def test_strategy_builds_dma_host_pools_and_controller(self):
         from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
         from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-        from sglang_tpu import hybrid_linear_hicache
+        from sglang_tpu.mem_cache import hybrid_linear_hicache
 
         kv_host, state_host = MagicMock(), MagicMock()
         memory = SimpleNamespace(
@@ -594,11 +594,11 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
             patch.object(hybrid_linear_hicache, "get_memory", return_value=memory),
             patch.object(hybrid_pool_assembler, "get_memory", return_value=memory),
             patch(
-                "sglang_tpu.kv_pool_host.tpu_dma_host_kv_pool_cls",
+                "sglang_tpu.mem_cache.pool_host.kv_pool_host.tpu_dma_host_kv_pool_cls",
                 return_value=MagicMock(return_value=kv_host),
             ) as kv_host_cls,
             patch(
-                "sglang_tpu.kv_pool_host.tpu_dma_mamba_pool_host_cls",
+                "sglang_tpu.mem_cache.pool_host.kv_pool_host.tpu_dma_mamba_pool_host_cls",
                 return_value=MagicMock(return_value=state_host),
             ),
             patch.object(
@@ -635,9 +635,9 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
     def test_split_pool_host_sizing_matches_its_allocation(self):
         """A host page holds every DSA buffer of the page, so host bytes per token
         must equal what the device pool allocates per token."""
-        from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
-        from sglang_tpu.kv_pool_host import TpuDMAHostKVPool
-        from sglang_tpu.tpu_dma_hicache import page_major_tensors
+        from sglang_tpu.mem_cache.kv_pool import TpuSplitMLATokenToKVPool
+        from sglang_tpu.mem_cache.pool_host.kv_pool_host import TpuDMAHostKVPool
+        from sglang_tpu.mem_cache.tpu_dma_hicache import page_major_tensors
 
         split = self._split_pool()
         tensors = page_major_tensors(split)
@@ -654,7 +654,7 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
         )
 
     def test_mla_offload_needs_a_hybrid_model_dma_engine_and_split_pool(self):
-        from sglang_tpu import tpu_platform
+        from sglang_tpu.platforms import tpu_platform
 
         cases = (
             ("raiden", "pallas_tpu_mla_sparse", (), True, None),
@@ -687,7 +687,9 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
 class TestRecurrentStateGate(CustomTestCase):
     def test_layer_wait_waits_for_the_batch(self):
         """Eager state copies on a prefix hit wait per layer through wait_until."""
-        from sglang_tpu.tpu_dma_hybrid_cache_controller import BatchGateCounter
+        from sglang_tpu.mem_cache.hybrid_cache.tpu_dma_hybrid_cache_controller import (
+            BatchGateCounter,
+        )
 
         counter = BatchGateCounter()
         event = MagicMock()
@@ -699,7 +701,9 @@ class TestRecurrentStateGate(CustomTestCase):
     def test_layer_wait_is_skipped_inside_a_compiled_forward(self):
         """In-graph KV accessors must not read the counter; the forward waited
         before entering the graph."""
-        from sglang_tpu.tpu_dma_hybrid_cache_controller import BatchGateCounter
+        from sglang_tpu.mem_cache.hybrid_cache.tpu_dma_hybrid_cache_controller import (
+            BatchGateCounter,
+        )
 
         counter = BatchGateCounter()
         event = MagicMock()
@@ -713,7 +717,9 @@ class TestRecurrentStateGate(CustomTestCase):
         """The compiled forward reads state through _layer_state; consulting the
         offload counter there guards the graph on it, so registering the counter
         after warmup recompiles every graph at serve time."""
-        from sglang_tpu.attention_gdn_pallas import TpuGDNAttnBackend
+        from sglang_tpu.layers.attention.linear.attention_gdn_pallas import (
+            TpuGDNAttnBackend,
+        )
 
         class _Pool:
             mamba_map = {7: 2}
@@ -731,7 +737,9 @@ class TestRecurrentStateGate(CustomTestCase):
         """The RPA backend reads a hybrid model's full-attention KV inside the
         compiled forward; consulting the offload counter there guards the graph."""
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-        from sglang_tpu.attention_pallas_rpa_base import _fused_kv_operands
+        from sglang_tpu.layers.attention.attention_pallas_rpa_base import (
+            _fused_kv_operands,
+        )
 
         class _Pool(HybridLinearKVPool):
             @property

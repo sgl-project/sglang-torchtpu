@@ -27,11 +27,11 @@ import torch
 from sglang.srt.managers.cache_controller import BatchDoneCounter
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import CacheOperation
-from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
-from sglang_tpu.kv_pool_host import TpuDMAHostKVPool
-from sglang_tpu.tpu_dma_hybrid_cache_controller import (
+from sglang_tpu.mem_cache.hybrid_cache.tpu_dma_hybrid_cache_controller import (
     TpuDMAHybridCacheController,
 )
+from sglang_tpu.mem_cache.kv_pool import TpuFusedMHATokenToKVPool
+from sglang_tpu.mem_cache.pool_host.kv_pool_host import TpuDMAHostKVPool
 
 DEVICE = "tpu:0"
 PAGE_SIZE = 16

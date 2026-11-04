@@ -60,12 +60,14 @@ from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu import pd_decode_swa_hicache as tpu
-from sglang_tpu.tpu_dma_hybrid_cache_controller import TpuDMAHybridCacheController
+from sglang_tpu.disaggregation import pd_decode_swa_hicache as tpu
+from sglang_tpu.mem_cache.hybrid_cache.tpu_dma_hybrid_cache_controller import (
+    TpuDMAHybridCacheController,
+)
 
 ASSEMBLER = "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler"
 BUILDER = "sglang.srt.mem_cache.kv_cache_builder"
-TPU = "sglang_tpu.pd_decode_swa_hicache"
+TPU = "sglang_tpu.disaggregation.pd_decode_swa_hicache"
 
 
 @contextlib.contextmanager

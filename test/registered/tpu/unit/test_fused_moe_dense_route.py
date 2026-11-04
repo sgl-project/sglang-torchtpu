@@ -162,9 +162,9 @@ class TestFusedMoEDenseRoute(CustomTestCase):
     def _fused(self, kind, route, m, ep, ids, w, *, use_route=True, threshold):
         import importlib
 
-        from sglang_tpu.moe.pallas import fused_moe_op
+        from sglang_tpu.layers.moe.pallas import fused_moe_op
 
-        gmm_mod = importlib.import_module("sglang_tpu.moe.pallas.gmm_v2")
+        gmm_mod = importlib.import_module("sglang_tpu.layers.moe.pallas.gmm_v2")
 
         e_local, e_global, offset, topk, _, act = ROUTES[route]
         (w1, w2, w1_s, w2_s), _ = self._weights_for(kind, route)
@@ -251,7 +251,7 @@ class TestFusedMoEDenseRoute(CustomTestCase):
     def test_rank_route_cap(self):
         """At top-16 (no token padding) 128 tokens route 2048 rows, the cap;
         129 do not. The threshold leaves both on the dense path."""
-        from sglang_tpu.moe.pallas import fused_moe_op
+        from sglang_tpu.layers.moe.pallas import fused_moe_op
 
         topk = ROUTES["k3"][3]
         cap_m = fused_moe_op._RANK_PERMUTE_MAX_ROWS // topk

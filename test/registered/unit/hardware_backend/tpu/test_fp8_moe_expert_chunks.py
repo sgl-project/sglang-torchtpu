@@ -7,7 +7,8 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu import expert_loading, fp8_moe
+from sglang_tpu.layers.quantization import fp8_moe
+from sglang_tpu.model_loader import expert_loading
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
