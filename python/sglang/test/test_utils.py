@@ -559,6 +559,27 @@ def _subprocess_popen_with_outputs(
     return process
 
 
+def _load_checkpoint_prefetch() -> Optional[ModuleType]:
+    """Load benchmark/tpu/ci_checkpoint_prefetch.py from the repo root.
+
+    benchmark/ is not part of the sglang package, so `import benchmark` only works
+    when the repo root is on sys.path (it is not when a test runs as
+    `python3 test/registered/...`). Returns None when the file is absent.
+    """
+    path = (
+        Path(__file__).resolve().parents[3]
+        / "benchmark"
+        / "tpu"
+        / "ci_checkpoint_prefetch.py"
+    )
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("ci_checkpoint_prefetch", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _launch_server_process(
     command: List[str],
     env: dict,
@@ -714,9 +735,13 @@ def popen_launch_server(
         env.get("CI_WEIGHT_LOADER_PREFETCH") == "1"
         and server_module == "sglang.launch_server"
     ):
-        from benchmark.tpu.ci_checkpoint_prefetch import configure_checkpoint_prefetch
-
-        command, env, _ = configure_checkpoint_prefetch(command, env)
+        prefetch = _load_checkpoint_prefetch()
+        if prefetch is None:
+            print(
+                "CI_WEIGHT_LOADER_PREFETCH=1 but ci_checkpoint_prefetch.py is missing"
+            )
+        else:
+            command, env, _ = prefetch.configure_checkpoint_prefetch(command, env)
 
     print(f"command={shlex.join(command)}")
 
