@@ -470,6 +470,30 @@ def k3_program_dp_group_cap(original, scheduler: Any, running_batch: Any, *args,
         scheduler.waiting_queue = held + list(scheduler.waiting_queue)
 
 
+def k3_program_hicache_layout(original, server_args: Any, *args, **kwargs):
+    """AROUND arg_groups.hicache_hook.resolve_layout_io_compatibility: the
+    K3 programs' host tier (k3_programs/sglang_hicache.py) copies their own
+    unified pools over a TPU DMA engine, not an MHA fused pool or an RPA
+    backend's; it needs the fused page layout and no L3 storage."""
+    from sglang.srt.arg_groups.overrides import resolving_view
+
+    cfg = resolving_view(server_args)
+    if str(getattr(cfg, "speculative_algorithm", None) or "").upper() != "K3_PROGRAM":
+        return original(server_args, *args, **kwargs)
+    from sglang_tpu.tpu_dma_hicache import is_tpu_dma_hicache_backend
+
+    if not is_tpu_dma_hicache_backend(cfg.hicache_io_backend):
+        raise ValueError(
+            f"K3_PROGRAM's host tier copies over a TPU DMA io backend (raiden), "
+            f"not {cfg.hicache_io_backend!r}"
+        )
+    if cfg.hicache_mem_layout != "page_first_fused":
+        raise ValueError("K3_PROGRAM's host tier needs --hicache-mem-layout page_first_fused")
+    if cfg.hicache_storage_backend is not None:
+        raise ValueError("K3_PROGRAM's host tier has no L3 storage path")
+    return None
+
+
 def k3_program_dp_release(result: Any, req: Any, *args, **kwargs) -> None:
     """AFTER mem_cache.common.release_kv_cache."""
     from sglang_tpu.k3_programs import sglang_dp_alloc, sglang_worker
@@ -585,6 +609,11 @@ def hook_specs() -> list[tuple]:
             "sglang.srt.mem_cache.common.release_kv_cache",
             k3_program_dp_release,
             HookType.AFTER,
+        ),
+        (
+            "sglang.srt.arg_groups.hicache_hook.resolve_layout_io_compatibility",
+            k3_program_hicache_layout,
+            HookType.AROUND,
         ),
         (
             "sglang.srt.disaggregation.decode.SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch",
