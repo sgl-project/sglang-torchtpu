@@ -290,8 +290,8 @@ def _accept_drafts_rejection_sampling(
     p_draft = torch.where(vocab_onehot, p[:, :n], 0).sum(-1)
     q_draft = torch.where(vocab_onehot, q, 0).sum(-1)
     u = torch.rand_like(p_draft)
-    # u <= p / q without dividing by q.
-    sample_ok = (u * q_draft <= p_draft) & verify_mask
+    # u <= p / q without dividing by q; p = 0 (a grammar-masked draft) never passes.
+    sample_ok = (u * q_draft <= p_draft) & (p_draft > 0) & verify_mask
     sample_num_correct = _leading_true(sample_ok)
 
     p_at = pick(p, sample_num_correct)
@@ -376,8 +376,10 @@ def accept_drafts_target_only(
     p_draft = torch.where(draft_tokens[..., None] == vocab, p[:, :n], 0).sum(-1)
     u = torch.rand_like(p_draft)
     sample_ok = (
-        (u * threshold_acc <= p_draft) | (p_draft >= threshold_single)
-    ) & verify_mask
+        ((u * threshold_acc <= p_draft) | (p_draft >= threshold_single))
+        & (p_draft > 0)
+        & verify_mask
+    )
     sample_num_correct = _leading_true(sample_ok)
 
     p_at = pick(p, sample_num_correct)
@@ -394,6 +396,20 @@ def accept_drafts_target_only(
         torch.where(greedy, greedy_num_correct, sample_num_correct),
         torch.where(greedy, greedy_bonus, sample_bonus),
     )
+
+
+@compiled_op()
+def apply_grammar_bitmask(
+    target_logits: torch.Tensor, bitmask: torch.Tensor
+) -> torch.Tensor:
+    """target_logits [rows, V] with -inf where the packed int32 bitmask [rows, ceil(V / 32)] bit is 0.
+
+    The owning worker warms it per (batch bucket, verify width).
+    """
+    vocab = target_logits.shape[-1]
+    shifts = torch.arange(32, device=bitmask.device, dtype=bitmask.dtype)
+    allowed = ((bitmask[:, :, None] >> shifts) & 1).bool().flatten(1)[:, :vocab]
+    return target_logits.masked_fill(~allowed, float("-inf"))
 
 
 @compiled_op(warmup=lambda ctx: _finalize_warmup_args(ctx))

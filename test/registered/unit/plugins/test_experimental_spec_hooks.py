@@ -117,7 +117,8 @@ class TestExperimentalSpecHooks(CustomTestCase):
         )
         metadata = SimpleNamespace()
         accepted = object()
-        batch, rows, addressing = object(), object(), object()
+        batch = SimpleNamespace(has_grammar=False)
+        rows, addressing = object(), object()
         with (
             patch.object(worker, "make_verify_input", return_value=metadata) as make,
             patch.object(
