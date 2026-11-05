@@ -15,6 +15,7 @@ from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferMetric
 from sglang.srt.disaggregation.common.conn import CommonKVManager, KVTransferError
 from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -1151,6 +1152,20 @@ class TestGroupFailureDrainGate(unittest.TestCase):
     """The MIN reduction must not turn one rank's Failed into page release
     on a rank whose transfer still runs."""
 
+    def setUp(self):
+        super().setUp()
+        # The count-agreement collective is covered with real gloo ranks in
+        # test_transfer_poll_rank_desync; here the reduce sequence is isolated.
+        check_count = patch.object(
+            envs.SGLANG_DISAGGREGATION_POLL_CHECK_COUNT, "get", return_value=False
+        )
+        check_count.start()
+        self.addCleanup(check_count.stop)
+
+    @staticmethod
+    def _completed_work():
+        return Mock(wait=Mock(return_value=True))
+
     def _gate(self, polls, pollers):
         from unittest.mock import patch as _patch
 
@@ -1159,7 +1174,9 @@ class TestGroupFailureDrainGate(unittest.TestCase):
         # Single-process stand-in: the all_reduce over the drain bits is an
         # identity, so the local bits are the group verdict.
         with _patch("sglang.srt.disaggregation.utils.dist") as dist:
-            dist.all_reduce = lambda t, op=None, group=None: None
+            dist.all_reduce = lambda t, op=None, group=None, async_op=False: (
+                self._completed_work()
+            )
             return _gate_group_failure_on_drain(polls, pollers, [object()])
 
     def test_failed_is_withheld_while_any_rank_is_undrained(self):
@@ -1206,13 +1223,14 @@ class TestGroupFailureDrainGate(unittest.TestCase):
         )
         reduce_count = 0
 
-        def all_reduce(tensor, op=None, group=None):
+        def all_reduce(tensor, op=None, group=None, async_op=False):
             nonlocal reduce_count
             reduce_count += 1
             events.append(("reduce", group))
             # A CP peer contributes the failure on the second status leg.
             if reduce_count == 2:
                 tensor.fill_(int(KVPoll.Failed))
+            return self._completed_work()
 
         with (
             patch("sglang.srt.disaggregation.utils.dist") as dist,
@@ -1250,12 +1268,13 @@ class TestGroupFailureDrainGate(unittest.TestCase):
         )
         reduce_count = 0
 
-        def all_reduce(tensor, op=None, group=None):
+        def all_reduce(tensor, op=None, group=None, async_op=False):
             nonlocal reduce_count
             reduce_count += 1
             events.append(("reduce", group))
             if reduce_count == 2:
                 tensor.fill_(int(KVPoll.Failed))
+            return self._completed_work()
 
         with (
             patch("sglang.srt.disaggregation.utils.dist") as dist,
