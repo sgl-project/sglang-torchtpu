@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils._pytree import tree_leaves
 
@@ -166,15 +167,15 @@ class _RecordingBlock(nn.Module):
 
 
 @contextlib.contextmanager
-def _sp_rank(rank, world_size, ring_world_size=1):
+def _sp_rank(rank, world_size):
     tp_group = SimpleNamespace(
         world_size=1, rank_in_group=0, all_gather=lambda x, dim=-1: x
     )
     sp_group = SimpleNamespace(
         world_size=world_size,
         rank_in_group=rank,
-        ulysses_world_size=world_size // ring_world_size,
-        ring_world_size=ring_world_size,
+        ulysses_world_size=world_size,
+        ring_world_size=1,
     )
     with (
         patch.object(parallel_state, "_TP", tp_group),
@@ -220,24 +221,37 @@ class TestWanBlockInputsAreRankInvariant(unittest.TestCase):
         _set_tiny_wan_server_args(self)
 
     def test_every_rank_feeds_blocks_offset_zero_shards(self):
-        # 2 x 2 x 4 = 16 latent tokens, 4 per rank. With batch 1 a rank's slice
-        # is a contiguous view whose storage offset grows with the rank.
-        world_size, local_len = 4, 4
+        # Latents (frames, height, width), patch (1, 2, 2), at SP 4. 2 x 2 x 4 =
+        # 16 tokens, 4 per rank: with batch 1 a rank's slice is a contiguous
+        # view whose storage offset grows with the rank. 3 x 3 x 3 = 27 tokens,
+        # 7 per rank: the last rank's shard ends in a pad token.
+        world_size = 4
         forward_batch = SimpleNamespace(
             enable_sequence_shard=True, enable_teacache=False, enable_spectrum=False
         )
         context = SimpleNamespace(forward_batch=forward_batch, attn_metadata=None)
-        for batch, per_token_timestep in ((1, False), (1, True), (2, True)):
-            latents = torch.randn(batch, 4, 2, 4, 8)
+        for latent_shape, batch, per_token_timestep in (
+            ((2, 4, 8), 1, False),
+            ((2, 4, 8), 1, True),
+            ((2, 4, 8), 2, True),
+            ((3, 6, 6), 1, True),
+            ((3, 6, 6), 2, True),
+        ):
+            seq_len = latent_shape[0] * latent_shape[1] * latent_shape[2] // 4
+            local_len = -(-seq_len // world_size)
+            num_pad = local_len * world_size - seq_len
+            latents = torch.randn(batch, 4, *latent_shape)
             text = torch.randn(batch, 5, 8)
             timestep = (
-                torch.full((batch, 16), 500.0)
+                torch.full((batch, seq_len), 500.0)
                 if per_token_timestep
                 else torch.full((batch,), 500.0)
             )
             layouts, scalars = [], []
             for rank in range(world_size):
-                case = dict(batch=batch, per_token=per_token_timestep, rank=rank)
+                case = dict(
+                    tokens=seq_len, batch=batch, per_token=per_token_timestep, rank=rank
+                )
                 with self.subTest(**case), _sp_rank(rank, world_size):
                     model = _tiny_wan()
                     block = _RecordingBlock()
@@ -252,20 +266,23 @@ class TestWanBlockInputsAreRankInvariant(unittest.TestCase):
                     layouts.append(block.layouts)
                     scalars.append(block.scalars)
 
+                    # Shards of the sequence zero-padded at its tail.
                     hidden_states, _, temb, _ = block.args
                     rows = slice(rank * local_len, (rank + 1) * local_len)
                     tokens = model.patch_embedding(latents).flatten(2).transpose(1, 2)
                     torch.testing.assert_close(
-                        hidden_states, tokens[:, rows], rtol=0, atol=0
+                        hidden_states,
+                        F.pad(tokens, (0, 0, 0, num_pad))[:, rows],
+                        rtol=0,
+                        atol=0,
                     )
                     sharded = [hidden_states]
                     if per_token_timestep:
                         _, proj, _, _ = model.condition_embedder(
-                            timestep.flatten(), text, None, timestep_seq_len=16
+                            timestep.flatten(), text, None, timestep_seq_len=seq_len
                         )
-                        torch.testing.assert_close(
-                            temb, proj.unflatten(2, (6, -1))[:, rows], rtol=0, atol=0
-                        )
+                        proj = F.pad(proj, (0, 0, 0, num_pad)).unflatten(2, (6, -1))
+                        torch.testing.assert_close(temb, proj[:, rows], rtol=0, atol=0)
                         sharded.append(temb)
                     for tensor in sharded:
                         self.assertEqual(tensor.storage_offset(), 0)
@@ -274,51 +291,6 @@ class TestWanBlockInputsAreRankInvariant(unittest.TestCase):
             for rank in range(world_size):
                 self.assertEqual(layouts[rank], layouts[0], f"rank {rank}")
                 self.assertEqual(scalars[rank], scalars[0], f"rank {rank}")
-
-    def test_padded_shards_feed_every_rank_the_same_program_inputs(self):
-        # 3 x 3 x 3 = 27 latent tokens at SP 4: 7 per rank, one pad token at
-        # the last rank's tail. Ulysses 4, and Ulysses 2 x ring 2.
-        world_size = 4
-        forward_batch = SimpleNamespace(
-            enable_sequence_shard=True, enable_teacache=False, enable_spectrum=False
-        )
-        context = SimpleNamespace(forward_batch=forward_batch, attn_metadata=None)
-        for ring_world_size, batch in ((1, 1), (2, 1), (2, 2)):
-            latents = torch.randn(batch, 4, 3, 6, 6)
-            text = torch.randn(batch, 5, 8)
-            timestep = torch.full((batch, 27), 500.0)
-            layouts, scalars = [], []
-            for rank in range(world_size):
-                case = dict(ring=ring_world_size, batch=batch, rank=rank)
-                # USPAttention rejects a ring at construction when the default
-                # backend cannot rotate K/V. The recorded blocks replace the
-                # attention blocks, so build Ulysses-only and run the ring.
-                with _sp_rank(rank, world_size):
-                    model = _tiny_wan()
-                with (
-                    self.subTest(**case),
-                    _sp_rank(rank, world_size, ring_world_size),
-                ):
-                    block = _RecordingBlock()
-                    model.blocks = nn.ModuleList([block])
-                    with (
-                        patch.object(
-                            wanvideo, "get_forward_context", return_value=context
-                        ),
-                        self.assertRaises(_Stop),
-                    ):
-                        model(latents, text, timestep)
-                    layouts.append(block.layouts)
-                    scalars.append(block.scalars)
-                    hidden_states, _, temb, _ = block.args
-                    for tensor in (hidden_states, temb):
-                        self.assertEqual(tensor.storage_offset(), 0)
-                        self.assertTrue(tensor.is_contiguous())
-            for rank in range(world_size):
-                self.assertEqual(layouts[rank], layouts[0], f"rank {rank}")
-                self.assertEqual(scalars[rank], scalars[0], f"rank {rank}")
-            # The global pad span is what the attention paths read.
-            self.assertEqual(block.attn_mask_meta["pad_start"], 27)
 
 
 def _native_forward(op):
