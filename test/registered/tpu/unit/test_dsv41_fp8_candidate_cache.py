@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Candidate metadata and packed-page gather regressions (no checkpoint)."""
+"""Candidate pairing metadata and packed-page gather regressions (no checkpoint).
+
+The metadata contract is checked on whichever backend runs the test: the host
+reference partition on CPU, the SparseCore kernels on TPU.
+"""
 
 import os
+import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
@@ -18,83 +23,100 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from sglang_tpu.kernels.index_selection.block_max import representative_block_max
-from sglang_tpu.kernels.index_selection.fp8_candidate_cache import (
-    canonical_candidate_blocks,
+from sglang_tpu.kernels.index_selection.fp8.cache import PackedFP8Layout
+from sglang_tpu.kernels.index_selection.fp8.candidates import (
     gather_candidate_keys,
+    prepare_candidate_metadata,
 )
-from sglang_tpu.kernels.index_selection.packed_fp8_cache import PackedFP8Layout
 
 
-@pytest.mark.parametrize("page_size", [4, 8, 64, 128, 256])
-@pytest.mark.parametrize("width", [127, 129, 1048576])
-def test_candidate_metadata(page_size, width):
-    pages = (width + page_size - 1) // page_size
-    table = np.arange(3 * pages, dtype=np.int32).reshape(3, pages) % pages
-    table[0, 0] = -1
-    table[2, -1] = pages  # allocated-owner bound, not just table bound
-    candidates = np.random.default_rng(3).integers(
-        -2, (width + 7) // 8 + 2, (3, 2048), dtype=np.int32
-    )
-    offsets = jnp.array([0, 3, 3, 9], jnp.int32)
-    actual, physical = jax.jit(
-        lambda c, t: canonical_candidate_blocks(
-            c, t, offsets, block=8, width=width, cache_pages=pages, page_size=page_size
-        )
-    )(jnp.asarray(candidates), jnp.asarray(table))
-    expected = np.full((3, 2048), -1, np.int32)
-    for row in range(3):
-        good = []
-        for b in sorted(set(candidates[row].tolist())):
-            if row == 1 or not 0 <= b < (width + 7) // 8:
+def _expected_group_starts(owners, groups):
+    """Even-sized requests pair adjacent queries; odd and invalid rows stay single."""
+    starts, row = [], 0
+    while row < len(owners):
+        end = row + 1
+        while end < len(owners) and owners[end] == owners[row]:
+            end += 1
+        size = end - row
+        paired = 0 <= owners[row] < groups and size % 2 == 0
+        starts.extend(range(row, end, 2 if paired else 1))
+        row = end
+    return starts
+
+
+# Per-request query counts: decode, uniform and mixed speculative widths,
+# empty requests, and prefill-sized requests on both sides of the 4096-query
+# switch between compare_all and nonzero offsets.
+@pytest.mark.parametrize(
+    "counts",
+    [
+        (1, 1, 1, 1),
+        (2, 2, 2, 2),
+        (3, 3, 3, 3),
+        (6, 6, 6, 6),
+        (1, 2, 3, 6),
+        (5, 0, 6, 1),
+        (64, 0, 63, 1),
+        (4096, 0, 4097, 0),
+    ],
+)
+def test_candidate_metadata_pairs_queries_per_request(counts):
+    width, block, count, page_size = 4096, 8, 128, 128
+    groups = len(counts)
+    owners = np.concatenate(
+        [np.repeat(np.arange(groups, dtype=np.int32), counts), [-1, -1, -1]]
+    ).astype(np.int32)
+    tokens = owners.size
+    per_request = width // page_size
+    layout = PackedFP8Layout(groups * per_request, page_size=page_size)
+    table = np.random.default_rng(5).permutation(layout.pages)
+    table = table.reshape(groups, per_request).astype(np.int32)
+    table[1, 3] = -1  # Blocks on a missing page are dropped from every union.
+    blocks = width // block
+    # Pair members overlap in [64, 128): A-only, shared and B-only all occur.
+    candidates = np.stack(
+        [np.arange(count) + (0 if row % 2 == 0 else 64) for row in range(tokens)]
+    ).astype(np.int32)
+    candidates[:, -1] = blocks + 5  # Out-of-range IDs are ignored.
+
+    metadata = jax.jit(
+        lambda p, c, r: prepare_candidate_metadata(p, c, r, layout, block, width)
+    )(jnp.asarray(table), jnp.asarray(candidates), jnp.asarray(owners))
+    offsets = np.asarray(metadata.offsets)
+    ids = np.asarray(metadata.candidate_block_ids)
+    spans = np.asarray(metadata.block_spans)
+
+    starts = _expected_group_starts(owners, groups)
+    expected_offsets = np.full(tokens + 1, tokens, np.int32)
+    expected_offsets[: len(starts)] = starts
+    np.testing.assert_array_equal(offsets, expected_offsets)
+    np.testing.assert_array_equal(np.asarray(metadata.valid_queries), owners >= 0)
+
+    for group in range(len(starts)):
+        members = range(offsets[group], offsets[group + 1])
+        for member, row in enumerate(members):
+            owner = owners[row]
+            got = ids[row][ids[row] >= 0]
+            if owner < 0:
+                assert got.size == 0, row
                 continue
-            if all(
-                0 <= table[row, k // page_size] < pages
-                for k in range(b * 8, min(b * 8 + 8, width), min(8, page_size))
-            ):
-                good.append(b)
-        expected[row, : len(good)] = good
-    np.testing.assert_array_equal(actual, expected)
-    parts = max(1, 8 // page_size)
-    expected_physical = np.full((3, 2048 * parts), -1, np.int32)
-    fragment = min(8, page_size)
-    for row in range(3):
-        for column, b in enumerate(expected[row]):
-            if b < 0:
-                continue
-            for part in range(parts):
-                token = b * 8 + part * fragment
-                page_column = token // page_size
-                if page_column < pages and 0 <= table[row, page_column] < pages:
-                    expected_physical[row, column * parts + part] = (
-                        table[row, page_column] * (page_size // fragment)
-                        + token % page_size // fragment
-                    )
-    np.testing.assert_array_equal(physical, expected_physical)
-
-
-@pytest.mark.parametrize("width", [256, 4352, 1048576])
-def test_block_max(width):
-    if jax.default_backend() != "tpu":
-        pytest.skip("SparseCore execution requires TPU")
-    scores = np.random.default_rng(17).normal(size=(4, width)).astype(np.float32)
-    rows = np.array([3, 0, 1, -1, 4], np.int32)
-    actual = jax.jit(lambda s, r: representative_block_max(s, r, block=8))(
-        jnp.asarray(scores), jnp.asarray(rows)
-    )
-    expected = scores[[3, 0, 1, 0, 0]].reshape(5, -1, 8).max(-1)
-    expected[3:] = -np.inf
-    np.testing.assert_array_equal(actual, expected)
-
-
-def test_block_max_empty():
-    out = representative_block_max(
-        jnp.zeros((0, 256), jnp.float32), jnp.array([0, -1], jnp.int32), block=8
-    )
-    np.testing.assert_array_equal(out, np.full((2, 32), -np.inf, np.float32))
-    assert representative_block_max(
-        jnp.zeros((3, 0), jnp.float32), jnp.array([0], jnp.int32), block=8
-    ).shape == (1, 0)
+            pages = table[owner]
+            wanted = {
+                b
+                for b in candidates[row]
+                if 0 <= b < blocks and pages[b * block // page_size] >= 0
+            }
+            assert set(got.tolist()) == wanted, (row, member)
+            assert np.unique(got).size == got.size
+            # Each query's window is two ascending segments split at spans[1].
+            split = spans[row, 1]
+            assert np.all(np.diff(got[:split]) > 0) and np.all(np.diff(got[split:]) > 0)
+        if len(members) == 2:
+            # Both members address the same shared union slots.
+            first, second = (ids[row][ids[row] >= 0] for row in members)
+            a_only, shared = spans[members[0], 1], spans[members[1], 1]
+            assert spans[members[1], 0] == a_only
+            np.testing.assert_array_equal(first[a_only:], second[:shared])
 
 
 @pytest.mark.parametrize("banks_count", [1, 2])
@@ -104,36 +126,44 @@ def test_candidate_gather(banks_count, page_size, fragments):
     if jax.default_backend() != "tpu":
         pytest.skip("SparseCore execution requires TPU")
     # Nonzero page offset/stride proves that physical addressing does not
-    # accidentally depend on tightly packed source pages.
-    # A 64-key page occupies 16.5 owner rows, rounded up to 17; the
-    # final half-row is padding, not part of the next physical page.
+    # accidentally depend on tightly packed source pages. A 64-key page
+    # occupies 16.5 owner rows, rounded up to 17.
     page_rows = PackedFP8Layout(8, page_size=page_size).page_rows
     layout = PackedFP8Layout(
         8, page_stride=page_rows + 1, page_offset=1, page_size=page_size
     )
-    owner_rows = 8 * layout.page_stride
+    owner_rows = 8 * layout.page_stride + 1
     raw = np.arange(owner_rows * 128, dtype=np.int32).reshape(owner_rows, 128) + 19
-    banks = tuple(jnp.asarray(b) for b in np.split(raw, banks_count))
+    split = 1 + 4 * layout.page_stride  # Bank boundary between whole pages.
+    banks = (
+        (jnp.asarray(raw),)
+        if banks_count == 1
+        else (jnp.asarray(raw[:split]), jnp.asarray(raw[split:]))
+    )
     ids = np.random.default_rng(19).integers(
-        -1, layout.pages * (page_size // 8) + 1, (3, fragments), dtype=np.int32
+        -1, layout.pages * (page_size // 8), (3, fragments), dtype=np.int32
     )
     ids[:, ::7] = -1
-    offsets = jnp.array([0, 3, 3, 3], jnp.int32)  # two trailing empty groups
+    offsets = jnp.array([0, 3, 3, 3], jnp.int32)  # Two trailing empty groups.
     out = jax.jit(
         lambda b, p: gather_candidate_keys(b, p, offsets, block=8, layout=layout)
     )(banks, jnp.asarray(ids))
-    expected = np.zeros((3, fragments // 16, 33, 128), np.int32)
-    for row in range(1):
-        for i, physical in enumerate(ids[row]):
-            if not 0 <= physical < layout.pages * (page_size // 8):
-                continue
-            page, fragment = divmod(int(physical), page_size // 8)
-            base = layout.page_offset + page * layout.page_stride
-            for field in range(33):
-                start = base * 128 + field * page_size + fragment * 8
-                expected[row, i // 16, field, i % 16 * 8 : (i % 16 + 1) * 8] = (
-                    raw.reshape(-1)[start : start + 8]
-                )
-    expected = expected.reshape(-1, 128)
-    assert out.shape == expected.shape
-    np.testing.assert_array_equal(out, expected)
+    assert out.shape == (3 * fragments // 16 * 33, 128)
+    out = np.asarray(out).reshape(3, fragments // 16, 33, 128)
+    # Only valid fragments of live groups are defined; skipped tiles and
+    # ignored fragments are left uninitialized by the gather.
+    for i, physical in enumerate(ids[0]):
+        if physical < 0:
+            continue
+        page, fragment = divmod(int(physical), page_size // 8)
+        base = layout.page_offset + page * layout.page_stride
+        for field in range(33):
+            start = base * 128 + field * page_size + fragment * 8
+            np.testing.assert_array_equal(
+                out[0, i // 16, field, i % 16 * 8 : (i % 16 + 1) * 8],
+                raw.reshape(-1)[start : start + 8],
+            )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))

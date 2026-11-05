@@ -1,3 +1,6 @@
+# Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
+# Source: src/vllm_torchtpu/kernels/deepseek_v41/index_selection/fp8/cache.py
+# Revision: 42c35ec6166a19b3f0db90f31807cc3df44602ec (epic/dsv41)
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Feature-major FP8 pages with an in-page FP32 scale per key.
@@ -14,10 +17,11 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from .tuned_block_sizes import PACKED_FP8_WRITE_BATCH
-
 PAGE_RECORDS = 128
 PAGE_ROWS = 33
+
+# Stage up to 128 touched pages, stopping at the sorted invalid-record tail.
+PACKED_FP8_WRITE_BATCH = 128
 
 
 def quantize_index_rows(values: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -117,13 +121,57 @@ def write_fp8_records(
         axis=1,
     )
     base, columns, valid = _record_addresses(records, layout)
-    return write_packed_pages(
-        banks,
-        jnp.where(valid, base, -1),
-        columns,
-        values,
-        page_size=layout.page_size,
+    if jax.default_backend() == "tpu":
+        return write_packed_pages(
+            banks,
+            jnp.where(valid, base, -1),
+            columns,
+            values,
+            page_size=layout.page_size,
+        )
+    updated = []
+    offset = 0
+    for bank in banks:
+        words = (
+            base[:, None] * PAGE_RECORDS
+            + jnp.arange(PAGE_ROWS)[None, :] * layout.page_size
+            + columns[:, None]
+        )
+        local = words // PAGE_RECORDS - offset
+        active = valid[:, None] & (local >= 0) & (local < bank.shape[0])
+        local = jnp.where(active, local, bank.shape[0])
+        updated.append(bank.at[local, words % PAGE_RECORDS].set(values, mode="drop"))
+        offset += bank.shape[0]
+    return tuple(updated)
+
+
+def read_fp8_records(
+    banks: tuple[jax.Array, ...], records: jax.Array, layout: PackedFP8Layout
+) -> jax.Array:
+    """Decode selected records to BF16 for eager consumers; invalid slots are zero."""
+    layout.validate(tuple(bank.shape[0] for bank in banks))
+    shape = records.shape
+    base, columns, valid = _record_addresses(records.reshape(-1), layout)
+    addresses = (
+        base[:, None] * PAGE_RECORDS
+        + jnp.arange(PAGE_ROWS)[None, :] * layout.page_size
+        + columns[:, None]
     )
+    words = jnp.zeros(addresses.shape, jnp.int32)
+    offset = 0
+    for bank in banks:
+        local = addresses // PAGE_RECORDS - offset
+        active = valid[:, None] & (local >= 0) & (local < bank.shape[0])
+        gathered = bank[jnp.clip(local, 0, bank.shape[0] - 1), addresses % PAGE_RECORDS]
+        words = jnp.where(active, gathered, words)
+        offset += bank.shape[0]
+    bits = (words[:, :32, None].astype(jnp.uint32) >> (jnp.arange(4) * 8)) & 255
+    values = jax.lax.bitcast_convert_type(
+        bits.astype(jnp.uint8).reshape(-1, PAGE_RECORDS), jnp.float8_e4m3fn
+    )
+    scales = jax.lax.bitcast_convert_type(words[:, 32], jnp.float32)
+    result = (values.astype(jnp.float32) * scales[:, None]).astype(jnp.bfloat16)
+    return jnp.where(valid[:, None], result, 0).reshape(*shape, PAGE_RECORDS)
 
 
 def write_packed_pages(
@@ -133,6 +181,7 @@ def write_packed_pages(
     values: jax.Array,
     *,
     page_size: int | None = None,
+    interpret: bool = False,
 ) -> tuple[jax.Array, ...]:
     """Update unique token slots in one or two banks using global row bases."""
     count, fields = values.shape
@@ -274,5 +323,6 @@ def write_packed_pages(
             ),
         ),
         input_output_aliases={3 + i: i for i in range(len(banks))},
+        interpret=pltpu.InterpretParams() if interpret else False,
         name="write_packed_fp8_pages",
     )(bases, columns, values, *banks)

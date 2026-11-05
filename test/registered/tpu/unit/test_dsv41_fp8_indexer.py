@@ -20,14 +20,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from sglang_tpu.kernels.index_selection.fp8_paged_mqa_logits import fp8_paged_mqa_logits
-from sglang_tpu.kernels.index_selection.packed_fp8_cache import (
+from sglang_tpu.kernels.index_selection.fp8.cache import (
     PAGE_RECORDS,
     PAGE_ROWS,
     PackedFP8Layout,
     quantize_index_rows,
     write_fp8_records,
 )
+from sglang_tpu.kernels.index_selection.fp8.dense_logits import fp8_paged_mqa_logits
 
 
 def read_fp8_records(
