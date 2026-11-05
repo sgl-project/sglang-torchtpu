@@ -29,7 +29,7 @@ from sglang.multimodal_gen.runtime.managers import gpu_worker
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     set_forward_context,
 )
-from sglang.multimodal_gen.runtime.models.dits import wanvideo
+from sglang.multimodal_gen.runtime.models.dits import wanvideo, zimage
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
@@ -102,6 +102,7 @@ class TestSpmdSafeRegions(unittest.TestCase):
         self.assertIsNone(Platform().prepare_spmd_region_wrapper())
         self.assertFalse(BaseDiT._compile_regions_spmd_safe)
         self.assertTrue(wanvideo.WanTransformer3DModel._compile_regions_spmd_safe)
+        self.assertTrue(zimage.ZImageTransformer2DModel._compile_regions_spmd_safe)
 
 
 class TestFusionBarrier(unittest.TestCase):
@@ -145,7 +146,6 @@ class _Stop(Exception):
 class _RecordingBlock(nn.Module):
     def forward(self, *args, attn_mask_meta=None, **kwargs):
         self.args = args
-        self.attn_mask_meta = attn_mask_meta
         # A program depends only on the meta entries it reads, and the
         # attention paths read the global pad span, never the rank-local
         # entries (the tests that use _RankInvariantMeta check them).
