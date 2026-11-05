@@ -172,8 +172,10 @@ class TpuBlockDraftWorker(TpuDraftWorker):
             max_num_reqs=self.model_runner.req_to_token_pool.size,
         )
         # Read inside the compiled writer, after the write: the TPU KV free fence's tail.
-        # Reduce a slice of the two untiled leading dims: returning an indexed view of the
-        # pool lowers to an as_strided that relayouts the whole tiled layer on every write.
+        # A new tensor, not a view of the pool: the copy thread reads it after the
+        # next step donates the pool, and an indexed view lowers to an as_strided
+        # that relayouts the whole tiled layer on every write. Reducing a slice of
+        # the two untiled leading dims avoids both.
         return kv_pool.kv_buffer[-1][:1, :1].to(torch.float32).sum(dim=(1, 2, 3, 4))
 
     def _draft_model(self) -> DFlashDraftModel:

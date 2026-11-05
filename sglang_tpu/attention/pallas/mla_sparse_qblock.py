@@ -305,6 +305,37 @@ def _query_blocks(
     return req, start, count, first_pos, ends[-1].astype(jnp.int32), t_row
 
 
+def _selection_words(topk_indices, tok, is_row, *, kpool, pages_pad):
+    """member[b, g, q]: query q's selection word for page g, ``[nb, pages, qb]``.
+
+    One pool id per entry: column ``c * kpool`` of a row is the first token of
+    a pool. Padding rows (``is_row`` false) get no bits. A compare-OR, not a
+    scatter (scatters with this many updates are slow on the TPU).
+
+    A query's words depend only on its own row, so they are built once per
+    token, ``[num_tokens, pages]``, and whole word rows are gathered into the
+    block layout. Building them per block entry instead would run the
+    compare-OR over ``num_blocks * qb`` rows: the block layout reserves a padded
+    last block per possible request (95 blocks for 32 live at an 8192-token
+    prefill with 64 request slots), which made it the largest op of a
+    GLM-5.3-Flash prefill. The row gather also reads ``pages`` words per query
+    rather than ``width / kpool`` entries.
+    """
+    g = jnp.arange(pages_pad, dtype=jnp.int32)
+    first_tok = topk_indices[:, ::kpool]  # [num_tokens, width / kpool]
+    sel = jnp.where(first_tok >= 0, first_tok // kpool, -1)
+    page = jnp.where(sel >= 0, sel // _WORD_BITS, -1)
+    bit = jnp.where(sel >= 0, jnp.left_shift(1, sel % _WORD_BITS), 0)
+    words = lax.reduce(
+        jnp.where(page[:, None, :] == g[None, :, None], bit[:, None, :], 0),
+        np.dtype(_WORD_DTYPE).type(0),
+        lax.bitwise_or,
+        (2,),
+    )  # [num_tokens, pages_pad]
+    member = jnp.where(is_row[..., None], words[tok], 0)  # [nb, qb, pages_pad]
+    return member.transpose(0, 2, 1)
+
+
 @functools.partial(
     jax.jit,
     static_argnames=("sm_scale", "k_scale", "kpool", "query_block", "interpret"),
@@ -367,20 +398,14 @@ def sparse_mla_prefill_qblock(
     tok = jnp.where(is_row, start[:, None] + r[None, :], 0)
     qpos = jnp.where(is_row, first_pos[:, None] + r[None, :], -1)
 
-    # One pool id per entry: column c * kpool is the first token of a pool.
-    first_tok = topk_indices[:, ::kpool][tok]  # [num_blocks, qb, width / kpool]
-    sel = jnp.where(is_row[..., None] & (first_tok >= 0), first_tok // kpool, -1)
-    page = jnp.where(sel >= 0, sel // _WORD_BITS, -1)
-    bit = jnp.where(sel >= 0, jnp.left_shift(1, sel % _WORD_BITS), 0)
-    # member[b, g, q]: query q's selection word for page g. A compare-OR, not a
-    # scatter (scatters with this many updates are slow on the TPU).
     pages_pad = _align(pages_per_seq, _SUBLANES)
     g = jnp.arange(pages_pad, dtype=jnp.int32)
-    member = lax.reduce(
-        jnp.where(page[:, None] == g[None, :, None, None], bit[:, None], 0),
-        np.dtype(_WORD_DTYPE).type(0),
-        lax.bitwise_or,
-        (3,),
+    member = _selection_words(
+        topk_indices,
+        tok,
+        is_row,
+        kpool=kpool,
+        pages_pad=pages_pad,
     )  # [num_blocks, pages_pad, qb]
 
     # Each block's page union in ascending order, compacted to the front.
