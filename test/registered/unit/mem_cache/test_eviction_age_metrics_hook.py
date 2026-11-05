@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.plugins.hook_registry import HookType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.hicache_write_back_copy_ahead import evict_with_copy_ahead
 from sglang_tpu.hooks import HOOKS, eviction_age_metrics
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -59,8 +60,13 @@ def _collector():
     collector.labels = {"model_name": "m"}
     eviction_age_metrics.add_eviction_age_counters(None, collector)
 
-    def sample(pool, last_copy=True):
-        labels = {"model_name": "m", "pool": pool, "last_copy": str(last_copy).lower()}
+    def sample(pool, last_copy=True, stale=False):
+        labels = {
+            "model_name": "m",
+            "pool": pool,
+            "last_copy": str(last_copy).lower(),
+            "stale": str(stale).lower(),
+        }
         tokens = registry.get_sample_value("sglang:eviction_age_tokens_total", labels)
         seconds = registry.get_sample_value(
             "sglang:eviction_age_token_seconds_total", labels
@@ -108,6 +114,20 @@ class TestDeviceEvictionAge(CustomTestCase):
                 other = "kv" if pool == "swa" else "swa"
                 self.assertEqual(sample(other), (None, None))
 
+    def test_write_back_copy_ahead_eviction_is_reported(self):
+        """Copy-ahead replaces the cache's eviction entry point; its walks must
+        still reach the counters."""
+        with _hooks_applied():
+            cache, allocator, sample = self._cache()
+            cache._write_back_copy_ahead = SimpleNamespace(pending_node_ids=[])
+            with mock.patch("time.monotonic", return_value=100.0):
+                self._insert(cache, allocator, list(range(1, 17)))
+            with mock.patch("time.monotonic", return_value=130.0):
+                evict_with_copy_ahead(cache, EvictParams(swa_num_tokens=16))
+        tokens, seconds = sample("swa")
+        self.assertGreater(tokens, 0)
+        self.assertAlmostEqual(seconds, 30.0 * tokens)
+
     def test_match_that_splits_a_node_restarts_full_kv_age(self):
         """A match diverging inside a node refreshes both halves, so their age
         counts from the split, not from the insert."""
@@ -123,6 +143,53 @@ class TestDeviceEvictionAge(CustomTestCase):
                 cache.evict(EvictParams(num_tokens=8))
         self.assertEqual(sample("kv"), (8, 8 * 100.0))
 
+    def test_demoted_window_is_stale_until_moved_off_the_eviction_end(self):
+        """A window moved to the eviction end and evicted from there is stale; a
+        later match, or a session-coverage move off that end, clears it."""
+        seq = list(range(1, 17))
+        for moved_by in (None, "match", "session_coverage"):
+            with self.subTest(moved_by=moved_by), _hooks_applied():
+                cache, allocator, sample = self._cache()
+                with mock.patch("time.monotonic", return_value=100.0):
+                    self._insert(cache, allocator, seq)
+                node = cache.tree_core.root_node
+                while node.children:
+                    node = next(iter(node.children.values()))
+                with mock.patch("time.monotonic", return_value=110.0):
+                    cache.tree_core.lru_lists[ComponentType.SWA].reset_node_lru(node)
+                with mock.patch("time.monotonic", return_value=120.0):
+                    if moved_by == "match":
+                        cache.match_prefix(
+                            MatchPrefixParams(key=RadixKey(array("q", seq)))
+                        )
+                    elif moved_by == "session_coverage":
+                        swa = cache.tree_core.components_by_type[ComponentType.SWA]
+                        swa._refresh_session_partition(node)
+                with mock.patch("time.monotonic", return_value=130.0):
+                    cache.evict(EvictParams(swa_num_tokens=len(seq)))
+                stale_tokens, _ = sample("swa", stale=True)
+                if moved_by is None:
+                    self.assertEqual(stale_tokens, len(node.key))
+                else:
+                    self.assertIsNone(stale_tokens)
+                    self.assertGreater(sample("swa", stale=False)[0], 0)
+
+    def test_split_of_a_demoted_node_keeps_both_halves_stale(self):
+        with _hooks_applied():
+            cache, allocator, sample = self._cache()
+            with mock.patch("time.monotonic", return_value=100.0):
+                self._insert(cache, allocator, list(range(1, 17)))
+            leaf = cache.tree_core.root_node
+            while leaf.children:
+                leaf = next(iter(leaf.children.values()))
+            demoted_tokens = len(leaf.key)
+            with mock.patch("time.monotonic", return_value=110.0):
+                cache.tree_core.lru_lists[ComponentType.SWA].reset_node_lru(leaf)
+                cache.tree_core._split_node(leaf.key, leaf, demoted_tokens // 2)
+            with mock.patch("time.monotonic", return_value=130.0):
+                cache.evict(EvictParams(swa_num_tokens=16))
+        self.assertEqual(sample("swa", stale=True)[0], demoted_tokens)
+
 
 class _Core:
     """Hashable, weak-referenceable stand-in; the hook keys its state by tree core."""
@@ -131,12 +198,23 @@ class _Core:
         self.lru_lists = lru_lists
 
 
+class _Node(SimpleNamespace):
+    """Weak-referenceable stand-in; the hook keys demotion marks by node."""
+
+    __hash__ = object.__hash__
+
+
 class TestHostEvictionAge(CustomTestCase):
     """Host victims through the recording hook, with stand-ins: the HiCache
     fixture needs an accelerator."""
 
     def setUp(self):
-        self.core = _Core({ComponentType.SWA: SimpleNamespace(_pt=ComponentType.SWA)})
+        self.core = _Core(
+            {
+                ct: SimpleNamespace(_pt=ct)
+                for ct in (ComponentType.FULL, ComponentType.SWA)
+            }
+        )
         self.addCleanup(eviction_age_metrics._walks.pop, self.core, None)
         self.addCleanup(eviction_age_metrics._pending.pop, self.core, None)
 
@@ -152,9 +230,7 @@ class TestHostEvictionAge(CustomTestCase):
         lru_wall = [0.0] * (2 * len(ComponentType))
         lru_wall[ComponentType.SWA] = 40.0
         lru_wall[ComponentType.SWA + len(ComponentType)] = 90.0
-        return SimpleNamespace(
-            component_data=data, last_access_wall=10.0, lru_wall=lru_wall
-        )
+        return _Node(component_data=data, last_access_wall=10.0, lru_wall=lru_wall)
 
     def _record(self, walk, comp_type, node, freed):
         eviction_age_metrics._walks[self.core] = walk
@@ -171,7 +247,7 @@ class TestHostEvictionAge(CustomTestCase):
             self._node(device_value=[1]),
             (0, 4),
         )
-        self.assertEqual(dropped_duplicate, {("host_swa", False): [4, 4 * 60.0]})
+        self.assertEqual(dropped_duplicate, {("host_swa", False, False): [4, 4 * 60.0]})
         eviction_age_metrics._pending.pop(self.core)
         forgotten = self._record(
             (ComponentType.SWA, True),
@@ -179,7 +255,17 @@ class TestHostEvictionAge(CustomTestCase):
             self._node(device_value=None),
             (0, 4),
         )
-        self.assertEqual(forgotten, {("host_swa", True): [4, 4 * 60.0]})
+        self.assertEqual(forgotten, {("host_swa", True, False): [4, 4 * 60.0]})
+
+    def test_window_demoted_on_device_is_stale_on_host(self):
+        """The demotion mark outlives the device copy, so the host eviction of a
+        window demoted and unused since is stale too."""
+        node = self._node(device_value=None)
+        eviction_age_metrics._demoted_at[node] = {ComponentType.SWA: 50.0}
+        recorded = self._record(
+            (ComponentType.SWA, True), ComponentType.SWA, node, (0, 4)
+        )
+        self.assertEqual(recorded, {("host_swa", True, True): [4, 4 * 60.0]})
 
     def test_host_kv_leaf_is_aged_from_last_access(self):
         recorded = self._record(
@@ -188,7 +274,7 @@ class TestHostEvictionAge(CustomTestCase):
             self._node(device_value=None),
             (0, 8),
         )
-        self.assertEqual(recorded, {("host_kv", True): [8, 8 * 90.0]})
+        self.assertEqual(recorded, {("host_kv", True, False): [8, 8 * 90.0]})
 
     def test_cascades_and_other_layers_are_not_recorded(self):
         """A host walk's cascade into another pool, and device frees during a host
