@@ -257,42 +257,48 @@ class TestMiniMaxH3LiveLength(CustomTestCase):
             self.assertEqual(block_forward.call_args.kwargs["max_seqlen"], max_seqlen)
 
 
+def _tiny_block():
+    """One DiT block with a live-length attention, and a runner taking `used`."""
+    _init_parallel_state()
+    torch.manual_seed(0)
+    seq_len = 128
+    arch = _tiny_arch()
+    block = dit.MiniMaxH3DiTBlock(arch, None, prefix="blocks.0")
+    for param in block.parameters():
+        param.data.normal_(0, 0.02)
+    attn = block.attn
+    attn._attention_impl = _DeviceLiveLengthAttention(attn.softmax_scale)
+    attn._attention_backend_enum = AttentionBackendEnum.TORCH_SDPA
+
+    num_timesteps = 2
+    adaln_input = torch.randn(num_timesteps, arch.time_embed_dim).bfloat16()
+    combined = torch.randint(
+        0, num_timesteps * MINIMAX_H3_ADALN_MODALITY_NUM, (seq_len,)
+    )
+    freqs = torch.randn(seq_len, arch.rope_inv_freq_len * 6)
+    rope_cache = (
+        dit._rope_cos_sin_cache(freqs, dtype=torch.bfloat16),
+        torch.arange(seq_len),
+    )
+    x = torch.randn(seq_len, arch.hidden_size).bfloat16()
+
+    def run(module, used):
+        return module(
+            x.clone(),
+            adaln_input=adaln_input,
+            combined_indices=combined,
+            rope_cache=rope_cache,
+            cu_seqlens=torch.tensor([0, used, seq_len], dtype=torch.int32),
+            cu_seqlens_host=None,
+            max_seqlen=seq_len,
+        )
+
+    return block, run
+
+
 class TestMiniMaxH3CompiledBlock(CustomTestCase):
-    def test_block_compiles_once_across_live_lengths(self):
-        _init_parallel_state()
-        torch.manual_seed(0)
-        seq_len = 128
-        arch = _tiny_arch()
-        block = dit.MiniMaxH3DiTBlock(arch, None, prefix="blocks.0")
-        for param in block.parameters():
-            param.data.normal_(0, 0.02)
-        attn = block.attn
-        attn._attention_impl = _DeviceLiveLengthAttention(attn.softmax_scale)
-        attn._attention_backend_enum = AttentionBackendEnum.TORCH_SDPA
-
-        num_timesteps = 2
-        adaln_input = torch.randn(num_timesteps, arch.time_embed_dim).bfloat16()
-        combined = torch.randint(
-            0, num_timesteps * MINIMAX_H3_ADALN_MODALITY_NUM, (seq_len,)
-        )
-        freqs = torch.randn(seq_len, arch.rope_inv_freq_len * 6)
-        rope_cache = (
-            dit._rope_cos_sin_cache(freqs, dtype=torch.bfloat16),
-            torch.arange(seq_len),
-        )
-        x = torch.randn(seq_len, arch.hidden_size).bfloat16()
-
-        def run(module, used):
-            return module(
-                x.clone(),
-                adaln_input=adaln_input,
-                combined_indices=combined,
-                rope_cache=rope_cache,
-                cu_seqlens=torch.tensor([0, used, seq_len], dtype=torch.int32),
-                cu_seqlens_host=None,
-                max_seqlen=seq_len,
-            )
-
+    def test_block_compiles_once_across_live_lengths_marked_spmd_safe(self):
+        block, run = _tiny_block()
         graphs = []
 
         def counting_backend(graph_module, example_inputs):
@@ -305,7 +311,25 @@ class TestMiniMaxH3CompiledBlock(CustomTestCase):
             )
             for used in (100, 77, 128):
                 torch.testing.assert_close(run(compiled, used), run(block, used))
-        self.assertEqual(len(graphs), 1)
+            (graph,) = graphs
+            # torch_tpu keeps the collectives of an spmd-safe graph in one program.
+            ops = [n for n in graph.graph.nodes if n.op == "call_function"]
+            self.assertTrue(ops)
+            for node in ops:
+                self.assertEqual(node.meta.get("custom"), {"spmd_safe": True}, node)
+
+    def test_eager_block_enters_no_spmd_safe_region(self):
+        # spmd_safe's eager branch syncs every block's inputs and outputs.
+        from torch_tpu._internal.distributed import tpu_distributed
+
+        block, run = _tiny_block()
+        with (
+            _installed(),
+            patch.object(tpu_distributed, "enter_spmd_safe_region") as enter_region,
+            torch.no_grad(),
+        ):
+            run(block, 100)
+        enter_region.assert_not_called()
 
     def test_refiner_blocks_stay_eager(self):
         with _installed():

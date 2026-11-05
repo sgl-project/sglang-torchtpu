@@ -16,11 +16,11 @@ Runtime patch, tracked debt:
   carry zero RoPE positions and stay in ``cu_seqlens``' trailing segment),
   (2) compiles only the 50 DiT blocks: the refiner runs once per request,
   eager, (3) rebinds ``_minimax_h3_attention_core_bcg`` to the undecorated
-  core, and (4) marks the blocks spmd-safe, so each block keeps its
-  collectives in one program (every rank runs the same block graph). The
-  attention backend reads the live length on device
-  (``trailing_padding_on_device``), so the blocks take no host bounds and
-  compile once per padded length.
+  core, and (4) marks the blocks spmd-safe while compiling, so each compiled
+  block keeps its collectives in one program (every rank runs the same block
+  graph); eager blocks run unmarked. The attention backend reads the live
+  length on device (``trailing_padding_on_device``), so the blocks take no
+  host bounds and compile once per padded length.
 - Upstream PR or issue: none.
 - Remove when: the H3 packed builder takes a platform-provided alignment, the
   refiner pads to a bucket, the attention break point is skipped where BCG
@@ -28,6 +28,14 @@ Runtime patch, tracked debt:
 """
 
 from __future__ import annotations
+
+import functools
+
+import torch
+
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 # Most prompt lengths of one video size share a 512 bucket; the padding costs
 # at most 511 extra rows next to ~32k packed rows at 1344x768x4s.
@@ -40,26 +48,33 @@ def _is_dit_block(name: str, module: object) -> bool:
     return is_block(name, module) and not name.startswith("token_refiner.")
 
 
-# The annotation is not part of torch's compile cache key.
-_SPMD_SAFE_CACHE_TAG = "minimax-h3-spmd-safe-blocks-v1"
-
-
 def _mark_blocks_spmd_safe(block_cls) -> None:
-    import torch.compiler.config as compiler_config
-
+    """Annotate compiled block graphs spmd-safe; eager calls take the plain
+    forward, since spmd_safe's eager branch syncs every block's inputs and
+    outputs. The compile cache key already covers the annotation: the TPU
+    kernel-inputs tag hashes this file and the torch_tpu version."""
+    if getattr(block_cls.forward, "__spmd_safe_for_tpu__", False):
+        return
     try:
         from torch_tpu._internal.distributed.spmd_util import spmd_safe
     except ImportError:
-        # A private torch_tpu API: without it, blocks keep split collectives.
+        # A private API: without it, compiled blocks keep split collectives.
+        logger.warning_once(
+            "torch_tpu has no spmd_safe; compiled MiniMax-H3 blocks keep "
+            "their collectives split."
+        )
         return
-    if getattr(block_cls.forward, "__spmd_safe_for_tpu__", False):
-        return
-    forward = spmd_safe(block_cls.forward)
-    forward.__spmd_safe_for_tpu__ = True
-    block_cls.forward = forward
-    tags = [t for t in str(compiler_config.cache_key_tag or "").split("|") if t]
-    if _SPMD_SAFE_CACHE_TAG not in tags:
-        compiler_config.cache_key_tag = "|".join([*tags, _SPMD_SAFE_CACHE_TAG])
+    forward = block_cls.forward
+    marked = spmd_safe(forward)
+
+    @functools.wraps(forward)
+    def forward_spmd_safe_when_compiling(*args, **kwargs):
+        if torch.compiler.is_compiling():
+            return marked(*args, **kwargs)
+        return forward(*args, **kwargs)
+
+    forward_spmd_safe_when_compiling.__spmd_safe_for_tpu__ = True
+    block_cls.forward = forward_spmd_safe_when_compiling
 
 
 def install() -> None:
