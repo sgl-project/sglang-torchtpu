@@ -373,7 +373,8 @@ class TestDrainAfterRequest(unittest.TestCase):
         def fail():
             raise RuntimeError("forward failed")
 
-        events, (output,) = self._serve(drain=True, forward=fail, num_requests=1)
+        with self.assertLogs(gpu_worker.logger, "ERROR"):
+            events, (output,) = self._serve(drain=True, forward=fail, num_requests=1)
         self.assertEqual(events, ["forward"])
         self.assertIn("forward failed", output.error)
 
