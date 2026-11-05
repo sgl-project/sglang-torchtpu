@@ -961,7 +961,16 @@ class USPAttention(nn.Module):
             self.skip_sequence_parallel or skip_sequence_parallel_override
         )
         head_pad = self._ulysses_head_pad(
-            q, k, attn_mask, effective_skip_sp, qkv_pre_all_to_all, q_prefix
+            q,
+            k,
+            attn_mask=attn_mask,
+            skip_sp=effective_skip_sp,
+            qkv_pre_all_to_all=qkv_pre_all_to_all,
+            q_prefix=q_prefix,
+            seq_lens=seq_lens,
+            num_replicated_prefix=num_replicated_prefix,
+            num_replicated_suffix=num_replicated_suffix,
+            num_replicated_kv_prefix=num_replicated_kv_prefix,
         )
         if head_pad:
             # Zero heads attend uniformly to zero values and are cut again.
@@ -2046,14 +2055,19 @@ class USPAttention(nn.Module):
                 scale=self.softmax_scale,
             ).transpose(1, 2)
 
-    @staticmethod
     def _ulysses_head_pad(
+        self,
         q: torch.Tensor,
         k: torch.Tensor,
+        *,
         attn_mask: torch.Tensor | None,
         skip_sp: bool,
         qkv_pre_all_to_all: bool,
         q_prefix: torch.Tensor | None,
+        seq_lens: list[int] | None,
+        num_replicated_prefix: int,
+        num_replicated_suffix: int,
+        num_replicated_kv_prefix: int,
     ) -> int:
         """Zero heads to append so the head count divides by the Ulysses degree
         (e.g. Z-Image's 30 heads at Ulysses 8); 0 where padding does not apply."""
@@ -2072,6 +2086,23 @@ class USPAttention(nn.Module):
         # sp = Ulysses x ring: heads that divide by sp divide by the Ulysses degree.
         sp_world_size = get_sequence_parallel_world_size()
         if sp_world_size <= 1 or q.shape[2] % sp_world_size == 0:
+            return 0
+        if (
+            self.sp_attention_mode == "kv_gather"
+            and seq_lens is None
+            and _kv_gather_unsupported_reason(
+                qkv_pre_all_to_all=qkv_pre_all_to_all,
+                replicated_mode_count=_count_active_replicated_modes(
+                    num_replicated_prefix,
+                    num_replicated_suffix,
+                    num_replicated_kv_prefix,
+                ),
+                attn_mask=attn_mask,
+                num_replicated_kv_prefix=num_replicated_kv_prefix,
+            )
+            is None
+        ):
+            # The K/V gather keeps every head local.
             return 0
         return -q.shape[2] % (sp_world_size // get_ring_parallel_world_size())
 

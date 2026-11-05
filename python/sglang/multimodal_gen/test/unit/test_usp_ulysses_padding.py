@@ -67,16 +67,27 @@ def _ulysses(degree, exchanged_heads):
         yield
 
 
-def _head_pad(world_size, heads=30, kv_heads=None, **kwargs):
+def _head_pad(world_size, heads=30, kv_heads=None, mode="ulysses", **kwargs):
     q = torch.empty(1, 4, heads, 8)
     k = torch.empty(1, 4, kv_heads or heads, 8)
-    args = dict(attn_mask=None, skip_sp=False, qkv_pre_all_to_all=False, q_prefix=None)
+    attn = _attention()
+    attn.sp_attention_mode = mode
+    args = dict(
+        attn_mask=None,
+        skip_sp=False,
+        qkv_pre_all_to_all=False,
+        q_prefix=None,
+        seq_lens=None,
+        num_replicated_prefix=0,
+        num_replicated_suffix=0,
+        num_replicated_kv_prefix=0,
+    )
     args.update(kwargs)
     with (
         patch.object(layer, "get_sequence_parallel_world_size", lambda: world_size * 2),
         patch.object(layer, "get_ring_parallel_world_size", lambda: 2),
     ):
-        return USPAttention._ulysses_head_pad(q, k, **args)
+        return attn._ulysses_head_pad(q, k, **args)
 
 
 class TestUlyssesPadding(unittest.TestCase):
@@ -141,6 +152,31 @@ class TestUlyssesPadding(unittest.TestCase):
             out = _attention().forward(q, q, q, num_replicated_suffix=2)
         self.assertEqual(suffix_calls, [(4, 2)])
         self.assertEqual(out.shape, q.shape)
+
+    def test_kv_gather_keeps_every_head(self):
+        # The gather exchanges K/V along the sequence; no head is split.
+        gathered_heads = []
+
+        def kv_gather(q, *args):
+            gathered_heads.append(q.shape[2])
+            return q
+
+        attn = _attention()
+        attn.sp_attention_mode = "kv_gather"
+        q = torch.randn(1, 4, 3, 8)
+        with (
+            _ulysses(4, []),
+            patch.object(
+                USPAttention, "_forward_with_kv_gather", side_effect=kv_gather
+            ),
+        ):
+            attn.forward(q, q, q)
+        self.assertEqual(gathered_heads, [3])
+        # The calls it leaves to the Ulysses exchange still pad: varlen, and
+        # auto mode's fallback for a float mask.
+        self.assertEqual(_head_pad(8, mode="kv_gather", seq_lens=[4]), 2)
+        float_mask = torch.ones(1, 4)
+        self.assertEqual(_head_pad(8, mode="kv_gather", attn_mask=float_mask), 2)
 
     def test_pads_to_a_multiple_of_the_ulysses_degree(self):
         self.assertEqual(_head_pad(8), 2)  # Z-Image: 30 heads -> 32
