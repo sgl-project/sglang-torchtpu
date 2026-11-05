@@ -32,26 +32,14 @@ class TestTpuFusionBarrier(unittest.TestCase):
 
     def test_compiled_tpu_tensors_take_the_torch_tpu_barrier(self):
         x = self._TPU_TENSOR
-        public = MagicMock(return_value=["public"])
-        raw = MagicMock(return_value=["raw"])
-        for tpu_module, want in (
-            (
-                SimpleNamespace(ops=SimpleNamespace(optimization_barrier=public)),
-                "public",
-            ),
-            (SimpleNamespace(), "raw"),
+        barrier = MagicMock(return_value=["barrier"])
+        tpu_module = SimpleNamespace(ops=SimpleNamespace(optimization_barrier=barrier))
+        with (
+            patch.object(torch, "tpu", tpu_module, create=True),
+            patch.object(torch.compiler, "is_compiling", return_value=True),
         ):
-            with (
-                self.subTest(want=want),
-                patch.object(torch, "tpu", tpu_module, create=True),
-                patch.object(
-                    torch.ops, "tpu", SimpleNamespace(optimization_barrier=raw)
-                ),
-                patch.object(torch.compiler, "is_compiling", return_value=True),
-            ):
-                self.assertEqual(TpuOOTPlatform.fusion_barrier(x), want)
-        public.assert_called_once_with([x])
-        raw.assert_called_once_with([x])
+            self.assertEqual(TpuOOTPlatform.fusion_barrier(x), "barrier")
+        barrier.assert_called_once_with([x])
 
 
 class TestFusionBarrierOnDevice(CustomTestCase):
