@@ -17,9 +17,15 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPAImpl
 from sglang.multimodal_gen.runtime.models.dits import minimax_h3 as dit
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
     packed_sequence,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
+    MINIMAX_H3_AUDIO_ROW_WIDTH,
+    MINIMAX_H3_VIDEO_ROW_WIDTH,
+    MiniMaxH3DenoiseBranch,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages import (
     comfyui_step,
@@ -90,6 +96,23 @@ def _packed(text_len, builder=None):
     )
 
 
+def _tiny_arch():
+    hidden = 256
+    return MiniMaxH3DiTArchConfig(
+        num_layers=1,
+        token_refiner_num_layers=1,
+        hidden_size=hidden,
+        num_attention_heads=2,
+        attention_head_dim=128,
+        ffn_hidden_size=512,
+        text_dim=64,
+        time_embed_hidden_size=64,
+        time_embed_dim=64,
+        adaln_out_features=18 * hidden,
+        final_adaln_out_features=2 * hidden,
+    )
+
+
 class _DeviceLiveLengthAttention:
     """Reads the live length from cu_seqlens on device, like the TPU kernel:
     padding keys are masked and padding rows output zeros."""
@@ -152,20 +175,81 @@ class TestMiniMaxH3LiveLength(CustomTestCase):
         model.blocks = torch.nn.ModuleList([torch.nn.Identity()])
         self.assertFalse(model._attention_reads_live_length())
 
+    def test_forward_gives_blocks_no_host_bounds_for_a_live_length_attention(self):
+        # Host bounds or a live max_seqlen would key each compiled block on
+        # the prompt length; attention without the live length keeps both.
+        _init_parallel_state()
+        torch.manual_seed(0)
+        arch = _tiny_arch()
+        model = dit.MiniMaxH3DiTModel(
+            config=MiniMaxH3DiTConfig(arch_config=arch), hf_config={}, quant_config=None
+        )
+        for param in model.parameters():
+            param.data.normal_(0, 0.02)
+        attn = model.blocks[0].attn
+        host_bounds_impl = SDPAImpl(
+            num_heads=attn.num_heads,
+            head_size=attn.head_dim,
+            causal=False,
+            softmax_scale=attn.softmax_scale,
+        )
+        # Resolved, as forward would: every attention (the refiner's too) has
+        # an impl, so forward keeps the ones installed here.
+        for module in model.modules():
+            if isinstance(module, dit.MiniMaxH3Attention):
+                module._attention_impl = host_bounds_impl
+        model._resolved_attention_backend = AttentionBackendEnum.TORCH_SDPA
+        packed = packed_sequence.minimax_h3_packed_sequence(
+            text_len=20,
+            latent_t=1,
+            latent_h=4,
+            latent_w=4,
+            audio_t=2,
+            include_keyframe_cond=False,
+        )
+        seq_len, cu = packed["seq_len"], packed["cu_seqlens"]
+        kwargs = MiniMaxH3DenoiseBranch(
+            packed=packed,
+            text_embeddings=torch.randn(20, arch.text_dim).bfloat16(),
+            token_tags=packed["token_tags"],
+            device=torch.device("cpu"),
+        ).forward_kwargs(
+            video_rows=torch.randn(
+                packed["img_pos"].numel(), MINIMAX_H3_VIDEO_ROW_WIDTH
+            ),
+            audio_rows=torch.randn(
+                packed["audio_pos"].numel(), MINIMAX_H3_AUDIO_ROW_WIDTH
+            ),
+            step_timesteps=(torch.tensor([0.5]), torch.zeros(seq_len).long(), None),
+        )
+        for impl, cu_seqlens_host, max_seqlen in (
+            (_DeviceLiveLengthAttention(attn.softmax_scale), None, seq_len),
+            (host_bounds_impl, tuple(cu.tolist()), int(cu[1])),
+        ):
+            attn._attention_impl = impl
+            with (
+                patch.object(
+                    dit.MiniMaxH3DiTBlock,
+                    "forward",
+                    autospec=True,
+                    side_effect=dit.MiniMaxH3DiTBlock.forward,
+                ) as block_forward,
+                torch.no_grad(),
+            ):
+                model(**kwargs)
+            self.assertEqual(block_forward.call_count, arch.num_layers)
+            self.assertEqual(
+                block_forward.call_args.kwargs["cu_seqlens_host"], cu_seqlens_host
+            )
+            self.assertEqual(block_forward.call_args.kwargs["max_seqlen"], max_seqlen)
+
 
 class TestMiniMaxH3CompiledBlock(CustomTestCase):
     def test_block_compiles_once_across_live_lengths(self):
         _init_parallel_state()
         torch.manual_seed(0)
-        hidden, seq_len = 256, 128
-        arch = MiniMaxH3DiTArchConfig(
-            hidden_size=hidden,
-            num_attention_heads=2,
-            attention_head_dim=128,
-            ffn_hidden_size=512,
-            time_embed_dim=64,
-            adaln_out_features=18 * hidden,
-        )
+        seq_len = 128
+        arch = _tiny_arch()
         block = dit.MiniMaxH3DiTBlock(arch, None, prefix="blocks.0")
         for param in block.parameters():
             param.data.normal_(0, 0.02)
@@ -183,7 +267,7 @@ class TestMiniMaxH3CompiledBlock(CustomTestCase):
             dit._rope_cos_sin_cache(freqs, dtype=torch.bfloat16),
             torch.arange(seq_len),
         )
-        x = torch.randn(seq_len, hidden).bfloat16()
+        x = torch.randn(seq_len, arch.hidden_size).bfloat16()
 
         def run(module, used):
             return module(
