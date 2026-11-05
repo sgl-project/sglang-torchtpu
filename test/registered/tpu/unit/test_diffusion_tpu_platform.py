@@ -1,15 +1,25 @@
-"""TPU CI entry for the sglang-diffusion (multimodal_gen) TPU platform tests."""
+"""TPU CI entry for the sglang-diffusion (multimodal_gen) TPU platform tests,
+and for the core platform-detection, attention-selector and server-args cases
+the TPU platform relies on."""
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=40, suite="stage-a-test-tpu-unit", chips=1)
 
 import unittest
 
 import torch
 
 from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
+from sglang.multimodal_gen.test.unit.test_attention_backend_selector import (  # noqa: F401
+    TestAttentionBackendFallback,
+)
+from sglang.multimodal_gen.test.unit.test_platform_detection import (  # noqa: F401
+    TestDiffusionPlatformPlugins,
+    TestPlatformPriority,
+)
 from sglang.multimodal_gen.test.unit.test_server_args import (  # noqa: F401
+    TestRingCapableAttentionBackends,
     TestTpuDistributedArgs,
 )
 from sglang.multimodal_gen.test.unit.test_tpu_platform import (  # noqa: F401
