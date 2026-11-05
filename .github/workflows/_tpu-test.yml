@@ -60,6 +60,12 @@ on:
         required: false
         type: number
         default: 0
+      # Single-host: keep torch_tpu's tier-3 compile cache on the compile-cache
+      # bucket across test files and runs (render_jobset.py --shared-compile-cache).
+      shared_compile_cache:
+        required: false
+        type: boolean
+        default: false
       partition_id:
         required: false
         type: number
@@ -160,6 +166,7 @@ jobs:
           IN_WEIGHTS_PVC: ${{ inputs.weights_pvc }}
           IN_TIMEOUT_PER_FILE: ${{ inputs.timeout_per_file }}
           IN_TPU_CHIP_WORKERS: ${{ inputs.tpu_chip_workers }}
+          IN_SHARED_COMPILE_CACHE_FLAG: ${{ inputs.shared_compile_cache && '--shared-compile-cache' || '' }}
           IN_PARTITION_ID: ${{ inputs.partition_id }}
           IN_PARTITION_SIZE: ${{ inputs.partition_size }}
           IN_RUN_NAME: ${{ inputs.run_name }}
@@ -188,6 +195,7 @@ jobs:
             --weights-pvc "$IN_WEIGHTS_PVC" \
             --timeout-per-file "$IN_TIMEOUT_PER_FILE" \
             --tpu-chip-workers "$IN_TPU_CHIP_WORKERS" \
+            ${IN_SHARED_COMPILE_CACHE_FLAG:+"$IN_SHARED_COMPILE_CACHE_FLAG"} \
             --partition-id "$IN_PARTITION_ID" \
             --partition-size "$IN_PARTITION_SIZE" \
             --name "$IN_RUN_NAME" \

@@ -331,6 +331,8 @@ else
     # it. "disabled" is torch_tpu's sentinel for really off. An explicit value
     # still wins.
     export TORCH_TPU_TIER2_COMPILATION_CACHE="${TORCH_TPU_TIER2_COMPILATION_CACHE:-disabled}"
+    # Off must also drop a tier-3 root inherited from the pod (TPU CI sets one).
+    unset TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT
 fi
 
 # LIBTPU_INIT_ARGS (XLA/libtpu TP/EP serving tuning + DP-attention hardening) is

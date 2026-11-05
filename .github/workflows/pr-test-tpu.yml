@@ -173,6 +173,8 @@ jobs:
       # Most unit tests are registered chips=1 and run four at a time, each
       # pinned to one chip of the slice. Whole-node tests follow sequentially.
       tpu_chip_workers: 4
+      # Keep XLA executables on the compile-cache bucket across files and runs.
+      shared_compile_cache: true
     permissions:
       contents: read
       id-token: write
@@ -185,6 +187,7 @@ jobs:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
       image: ${{ needs.build.outputs.digest }}
       suite: stage-b-test-tpu-4-v7
+      shared_compile_cache: true
       platform: tpu_oot
       weights_pvc: model-weights
     permissions:

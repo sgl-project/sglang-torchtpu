@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from sglang.srt.debug_utils import cuda_coredump
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import kill_process_tree
 from sglang.test.ci.ci_register import CIRegistry
 from sglang.test.ci.skip_guard import command_for_test_file
@@ -246,7 +247,8 @@ def _clear_compilation_caches():
                 pass
 
     tier3_root = os.environ.get("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT")
-    if tier3_root and os.path.exists(tier3_root):
+    keep_tier3 = envs.SGLANG_CI_KEEP_TIER3_COMPILE_CACHE.get()
+    if tier3_root and not keep_tier3 and os.path.exists(tier3_root):
         try:
             shutil.rmtree(tier3_root, ignore_errors=True)
             os.makedirs(tier3_root, exist_ok=True)
