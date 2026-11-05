@@ -10,8 +10,6 @@ into their first store, compiling at whatever shape the first batch has.
 budget_pd_hidden_pool: the KV budget does not know the PD hidden pool built after
 it (SGLANG_TPU_PD_DECODE_DRAFT_PREFILL); add its bytes per full-pool token to the
 default or hybrid SWA configurator and reject the configurators it does not size.
-reject_overlong_pd_draft_prompt: the decode's draft prompt pass takes a whole
-prompt in one extend bucket; abort a longer one at admission, before its KV transfer.
 Upstream seam issue: not filed (local prototype). Before proposing upstream,
 replace these hooks with agreed factories/overrides for the extracted operations.
 Remove when: the experiment is removed or those upstream seams are available.
@@ -460,33 +458,6 @@ def budget_pd_hidden_pool(result, kvc):
     return result
 
 
-def reject_overlong_pd_draft_prompt(original, queue, req) -> bool:
-    """Abort just a prompt longer than the decode's draft prompt pass takes, before
-    its KV transfer, instead of raising in the decode loop."""
-    if original(queue, req):
-        return True
-    from http import HTTPStatus
-
-    from sglang.srt.disaggregation.utils import prepare_abort
-    from sglang_tpu.experimental.speculative.pd_draft_prefill import (
-        pd_draft_prompt_cap,
-    )
-
-    cap = pd_draft_prompt_cap()
-    # Conservative: the pass covers the prompt past any decode-side cached prefix.
-    if cap is None or len(req.origin_input_ids) <= cap:
-        return False
-    message = (
-        f"Request {req.rid} has a {len(req.origin_input_ids)}-token prompt; "
-        "SGLANG_TPU_PD_DECODE_DRAFT_PREFILL runs the draft over a whole prompt, up "
-        f"to the decode's largest extend bucket {cap} (--tpu-compile-tokens)."
-    )
-    logger.error(message)
-    prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-    queue.scheduler.output_streamer.stream_output([req], req.return_logprob)
-    return True
-
-
 def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
@@ -542,11 +513,6 @@ def hook_specs():
             "sglang.srt.model_executor.pool_configurator.create_memory_pool_configurator",
             budget_pd_hidden_pool,
             HookType.AFTER,
-        ),
-        (
-            "sglang.srt.disaggregation.decode.DecodePreallocQueue._check_if_req_exceed_kv_capacity",
-            reject_overlong_pd_draft_prompt,
-            HookType.AROUND,
         ),
         (
             "sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.from_schedule_batch",

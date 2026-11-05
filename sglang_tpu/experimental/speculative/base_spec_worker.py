@@ -290,10 +290,7 @@ class TpuSpecWorker(BaseSpecWorker):
         pool = build_pd_hidden_pool(self.target_worker.model_runner)
         register_pd_hidden_pool(pool)
         if disagg_mode == "decode":
-            register_pd_draft_prefiller(
-                self.prefill_draft_from_pd,
-                max_prompt_tokens=self._pd_draft_max_prompt_tokens,
-            )
+            register_pd_draft_prefiller(self.prefill_draft_from_pd)
         return pool
 
     @property
@@ -318,12 +315,6 @@ class TpuSpecWorker(BaseSpecWorker):
             target_hidden, segments=segments.to(self.device, non_blocking=True)
         )
 
-    def _pd_draft_max_prompt_tokens(self) -> int:
-        """The decode draft prompt pass takes a prompt in one extend bucket."""
-        t_bucketer = self._compile_policy().t_bucketer
-        assert t_bucketer is not None
-        return t_bucketer.max_val
-
     def prefill_draft_from_pd(self, batch: ScheduleBatch) -> None:
         """Draft prompt pass of a PD decode's prebuilt batch, from the shipped hidden rows."""
         assert self._pd_hidden_pool is not None
@@ -333,7 +324,10 @@ class TpuSpecWorker(BaseSpecWorker):
         cap = compile_policy._extend_compile_cap()
         vocab_size = self.target_worker.model_runner.model_config.vocab_size
         for group in prebuilt_extend_groups(
-            batch, max_tokens=t_bucketer.max_val, max_reqs=cap
+            batch.extend_lens,
+            self.pd_draft_prompt_starts(batch),
+            max_tokens=t_bucketer.max_val,
+            max_reqs=cap,
         ):
             view = prebuilt_extend_view(batch, group, vocab_size=vocab_size)
             # The draft graphs and writer were warmed with the allocator's dtype.
@@ -357,6 +351,10 @@ class TpuSpecWorker(BaseSpecWorker):
                 cache_loc=cache_loc,
                 bonus_tokens=bonus_tokens,
             )
+
+    def pd_draft_prompt_starts(self, batch: ScheduleBatch) -> list[int]:
+        """Per request, the extend offset the decode draft prompt pass starts at."""
+        return [0] * len(batch.reqs)
 
     def extend_draft_from_hidden(
         self,

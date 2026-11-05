@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -25,17 +26,18 @@ from sglang_tpu.disaggregation.raiden import pipeline as raiden_pipeline
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.experimental import runs_draft_prompt_pass
 from sglang_tpu.experimental.speculative import pd_draft_prefill, pd_hidden_pool
+from sglang_tpu.experimental.speculative.block_spec_worker import TpuBlockSpecWorker
 from sglang_tpu.experimental.speculative.pd_draft_prefill import (
+    DraftPromptChunk,
     prebuilt_extend_groups,
+    prebuilt_extend_view,
+    swa_mapped_starts,
 )
 from sglang_tpu.experimental.speculative.pd_hidden_pool import (
     PdHiddenPool,
     hidden_lanes,
 )
-from sglang_tpu.hooks.experimental_spec import (
-    budget_pd_hidden_pool,
-    reject_overlong_pd_draft_prompt,
-)
+from sglang_tpu.hooks.experimental_spec import budget_pd_hidden_pool, hook_specs
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -207,15 +209,209 @@ class TestDraftPromptPassPlacement(CustomTestCase):
                 self.assertTrue(runs_draft_prompt_pass("null"))
 
     def test_groups_pack_requests_under_the_bucket_and_cap(self):
-        batch = SimpleNamespace(extend_lens=[3000, 3000, 3000, 100, 100, 100])
-        groups = prebuilt_extend_groups(batch, max_tokens=8192, max_reqs=2)
-        self.assertEqual([list(g) for g in groups], [[0, 1], [2, 3], [4, 5]])
-        groups = prebuilt_extend_groups(batch, max_tokens=6000, max_reqs=8)
-        self.assertEqual([list(g) for g in groups], [[0, 1], [2, 3, 4, 5]])
-        with self.assertRaises(AssertionError):
-            prebuilt_extend_groups(
-                SimpleNamespace(extend_lens=[9000]), max_tokens=8192, max_reqs=8
-            )
+        lens = [3000, 3000, 3000, 100, 100, 100]
+
+        def reqs(groups):
+            return [[chunk.req for chunk in group] for group in groups]
+
+        groups = prebuilt_extend_groups(lens, [0] * 6, max_tokens=8192, max_reqs=2)
+        self.assertEqual(reqs(groups), [[0, 1], [2, 3], [4, 5]])
+        groups = prebuilt_extend_groups(lens, [0] * 6, max_tokens=6000, max_reqs=8)
+        self.assertEqual(reqs(groups), [[0, 1], [2, 3, 4, 5]])
+
+    def test_a_long_prompt_runs_in_bucket_chunks(self):
+        groups = prebuilt_extend_groups(
+            [100, 19000, 100], [0, 0, 0], max_tokens=8192, max_reqs=8
+        )
+        chunk = DraftPromptChunk
+        self.assertEqual(
+            groups,
+            [
+                [chunk(req=0, start=0, length=100)],
+                [chunk(req=1, start=0, length=8192)],
+                [chunk(req=1, start=8192, length=8192)],
+                # The tail packs with the next request.
+                [chunk(req=1, start=16384, length=2616), chunk(2, 0, 100)],
+            ],
+        )
+
+    def test_starts_skip_the_head_of_a_prompt(self):
+        groups = prebuilt_extend_groups([20, 5], [12, 0], max_tokens=8, max_reqs=8)
+        self.assertEqual(
+            groups,
+            [
+                [DraftPromptChunk(req=0, start=12, length=8)],
+                [DraftPromptChunk(req=1, start=0, length=5)],
+            ],
+        )
+
+    def test_swa_mapped_starts_take_the_mapped_suffix(self):
+        swa_loc = torch.tensor([0, 0, 7, 8, 9, 3, 4, 0, 5])
+        self.assertEqual(swa_mapped_starts(swa_loc, [5, 2]), [2, 0])
+        with self.assertRaisesRegex(RuntimeError, "holes"):
+            swa_mapped_starts(swa_loc, [5, 4])
+
+    def test_no_admission_hook_aborts_long_prompts(self):
+        targets = [target for target, _, _ in hook_specs()]
+        self.assertFalse(
+            [target for target in targets if "exceed_kv_capacity" in target]
+        )
+
+
+def _prebuilt_batch(prefix_lens: list[int], extend_lens: list[int], slots):
+    reqs = [
+        SimpleNamespace(
+            origin_input_ids=list(range(1000 * i, 1000 * i + prefix + extend)),
+            output_ids=[90 + i],
+            multimodal_inputs=None,
+        )
+        for i, (prefix, extend) in enumerate(zip(prefix_lens, extend_lens))
+    ]
+    return SimpleNamespace(
+        reqs=reqs,
+        prefix_lens=prefix_lens,
+        extend_lens=extend_lens,
+        out_cache_loc=torch.tensor(slots, dtype=torch.int64),
+        req_pool_indices_cpu=torch.arange(1, len(reqs) + 1),
+        seq_lens_cpu=torch.tensor(
+            [p + e for p, e in zip(prefix_lens, extend_lens)], dtype=torch.int64
+        ),
+    )
+
+
+class _Bucketer:
+    def __init__(self, buckets: list[int]) -> None:
+        self.buckets = buckets
+        self.max_val = buckets[-1]
+
+    def next_bucket(self, n: int) -> int:
+        return next(b for b in self.buckets if b >= n)
+
+
+class TestChunkedDraftPromptPass(CustomTestCase):
+    """The decode draft pass over prompts longer than the largest extend bucket."""
+
+    BUCKETS, CAP = [4, 8], 2
+    PREFIX, EXTEND = [2, 0, 0], [19, 5, 6]
+
+    def setUp(self):
+        super().setUp()
+        sampling = patch.object(
+            pd_draft_prefill.SamplingBatchInfo,
+            "from_schedule_batch",
+            lambda batch, vocab_size: None,
+        )
+        sampling.start()
+        self.addCleanup(sampling.stop)
+        # Slot 0 is the padding slot; real slots are shuffled and nonzero.
+        self.slots = (torch.randperm(63)[: sum(self.EXTEND)] + 1).tolist()
+        self.batch = _prebuilt_batch(self.PREFIX, self.EXTEND, self.slots)
+
+    def _worker(self, full_to_swa: torch.Tensor | None):
+        hidden_pool = PdHiddenPool(
+            num_pages=16,
+            page_size=4,
+            feature_size=FEATURE,
+            total_kv_heads=KV_HEADS,
+            attn_tp_size=1,
+            attn_tp_group=None,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+        )
+        hidden_pool.buffer.copy_(torch.randn(hidden_pool.buffer.shape))
+        t_bucketer = _Bucketer(self.BUCKETS)
+        policy = SimpleNamespace(
+            t_bucketer=t_bucketer,
+            b_bucketer=_Bucketer([1, 2, 4]),
+            _extend_compile_cap=lambda: self.CAP,
+            live_cache_loc_dtype=lambda: torch.int64,
+        )
+        self.writes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+        def write_draft_kv(*, target_hidden, positions, cache_loc):
+            self.assertIn(target_hidden.shape[0], self.BUCKETS)
+            self.writes.append((target_hidden, positions, cache_loc))
+
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker.device = "cpu"
+        worker._pd_hidden_pool = hidden_pool
+        worker._compile_policy = lambda: policy
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(model_config=SimpleNamespace(vocab_size=64))
+        )
+        worker._block_draft_worker = SimpleNamespace(
+            full_to_swa=full_to_swa,
+            draft_context=contextlib.nullcontext,
+            write_draft_kv=write_draft_kv,
+        )
+        return worker
+
+    def _written(self) -> dict[int, tuple[int, torch.Tensor]]:
+        """Draft slot -> (position, hidden row) over every chunk, padding dropped."""
+        written = {}
+        for hidden, positions, cache_loc in self.writes:
+            for row, slot in enumerate(cache_loc.tolist()):
+                if slot != 0:
+                    self.assertNotIn(slot, written)
+                    written[slot] = (int(positions[row]), hidden[row])
+        return written
+
+    def _expected(self, worker, draft_slot) -> dict[int, tuple[int, torch.Tensor]]:
+        """The single-pass result: each prompt token's row at its full slot."""
+        expected, offset = {}, 0
+        for prefix, extend in zip(self.PREFIX, self.EXTEND):
+            for i in range(extend):
+                full_slot = self.slots[offset + i]
+                if draft_slot(full_slot) != 0:
+                    row = worker._pd_hidden_pool.read(torch.tensor([full_slot]))[0]
+                    expected[draft_slot(full_slot)] = (prefix + i, row)
+            offset += extend
+        return expected
+
+    def _assert_same(self, written, expected):
+        self.assertEqual(sorted(written), sorted(expected))
+        for slot, (position, row) in expected.items():
+            self.assertEqual(written[slot][0], position)
+            torch.testing.assert_close(written[slot][1], row)
+
+    def test_chunks_cover_every_prompt_token_once(self):
+        worker = self._worker(full_to_swa=None)
+        worker.prefill_draft_from_pd(self.batch)
+        # 19 tokens at bucket 8: 8, 8, then the 3-token tail with request 1.
+        self.assertEqual(len(self.writes), 4)
+        self._assert_same(self._written(), self._expected(worker, lambda s: s))
+
+    def test_a_windowed_draft_writes_the_swa_tail(self):
+        full_to_swa = torch.zeros(64, dtype=torch.int64)
+        # The decode maps request 0's last 4 tokens and requests 1 and 2 whole.
+        mapped = self.slots[15:]
+        full_to_swa[torch.tensor(mapped)] = torch.arange(100, 100 + len(mapped))
+        worker = self._worker(full_to_swa=full_to_swa)
+        worker.prefill_draft_from_pd(self.batch)
+        self._assert_same(
+            self._written(), self._expected(worker, lambda s: int(full_to_swa[s]))
+        )
+
+    def test_a_short_chunk_is_the_views_chunked_request(self):
+        chunks = [DraftPromptChunk(req=1, start=0, length=5)]
+        chunks.append(DraftPromptChunk(req=0, start=0, length=3))
+        view = prebuilt_extend_view(self.batch, chunks, vocab_size=64)
+        self.assertEqual(view.prefix_lens, [0, 2])
+        self.assertEqual(view.seq_lens_cpu.tolist(), [5, 5])
+        self.assertEqual(
+            view.input_ids.tolist(), [1000, 1001, 1002, 1003, 1004, 2, 3, 4]
+        )
+        self.assertEqual(
+            view.out_cache_loc.tolist(), self.slots[19:24] + self.slots[:3]
+        )
+        self.assertEqual(view.req_pool_indices_cpu.tolist(), [2, 1])
+        self.assertIs(view.chunked_req, self.batch.reqs[0])
+        self.assertEqual(view.chunked_req_next_prompt_token, 5)
+        tail = [DraftPromptChunk(req=0, start=16, length=3)]
+        view = prebuilt_extend_view(self.batch, tail, vocab_size=64)
+        self.assertEqual(view.input_ids.tolist(), [18, 19, 20])
+        self.assertIsNone(view.chunked_req)
+        self.assertIsNone(view.chunked_req_next_prompt_token)
 
 
 def _kvc(**overrides):
@@ -330,31 +526,6 @@ def _hybrid_swa_configurator(
         setattr(configurator, name, value)
     configurator._recompute_cell_size()
     return configurator
-
-
-class TestOverlongPromptAbort(CustomTestCase):
-    def _admit(self, prompt_len: int, cap: int | None):
-        queue = SimpleNamespace(
-            scheduler=SimpleNamespace(
-                output_streamer=SimpleNamespace(stream_output=lambda *args: None)
-            )
-        )
-        req = SimpleNamespace(
-            rid="r", origin_input_ids=[0] * prompt_len, return_logprob=False
-        )
-        prompt_cap = None if cap is None else (lambda: cap)
-        with patch.object(pd_draft_prefill, "_pd_draft_prompt_cap", prompt_cap):
-            rejected = reject_overlong_pd_draft_prompt(
-                lambda queue, req: False, queue, req
-            )
-        return rejected, req
-
-    def test_only_the_long_prompt_is_aborted(self):
-        rejected, req = self._admit(9000, cap=8192)
-        self.assertTrue(rejected)
-        self.assertEqual(req.finished_reason.status_code, 400)
-        self.assertFalse(self._admit(8192, cap=8192)[0])
-        self.assertFalse(self._admit(9000, cap=None)[0])
 
 
 if __name__ == "__main__":
