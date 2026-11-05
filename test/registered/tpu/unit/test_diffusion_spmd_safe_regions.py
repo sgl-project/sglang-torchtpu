@@ -6,7 +6,7 @@ install the diffusion runtime; the torch_tpu wrapper check needs torch_tpu.
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit", chips=1)
 
 import importlib.util
 import sys
@@ -18,6 +18,7 @@ import torch.compiler.config as compiler_config
 
 from sglang.multimodal_gen.test.unit.test_spmd_safe_regions import (  # noqa: F401
     TestSpmdSafeRegions,
+    TestWanBlockCompilesAsOneGraph,
     TestWanBlockInputsAreRankInvariant,
 )
 from sglang_tpu.multimodal_gen.platform import TpuOOTPlatform

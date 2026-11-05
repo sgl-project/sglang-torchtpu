@@ -2,6 +2,7 @@
 inputs Wan feeds its blocks, and the fusion barrier."""
 
 import contextlib
+import inspect
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -10,12 +11,20 @@ import torch
 from torch import nn
 from torch.utils._pytree import tree_leaves
 
+from sglang.kernels.ops.diffusion.common.fallback_torch import (
+    fuse_scale_shift_kernel_native,
+)
 from sglang.multimodal_gen.configs.models.dits.wanvideo import (
     WanVideoArchConfig,
     WanVideoConfig,
 )
 from sglang.multimodal_gen.runtime import server_args as server_args_module
 from sglang.multimodal_gen.runtime.distributed import parallel_state
+from sglang.multimodal_gen.runtime.layers import layernorm
+from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    set_forward_context,
+)
 from sglang.multimodal_gen.runtime.models.dits import wanvideo
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.platforms.interface import Platform
@@ -174,18 +183,22 @@ def _tiny_wan():
     return model
 
 
+def _set_tiny_wan_server_args(test):
+    previous = server_args_module._global_server_args
+    server_args_module.set_global_server_args(
+        SimpleNamespace(
+            attention_backend=None,
+            attention_backend_config=None,
+            kv_gather_degree=1,
+            sp_split_auto=False,
+        )
+    )
+    test.addCleanup(server_args_module.set_global_server_args, previous)
+
+
 class TestWanBlockInputsAreRankInvariant(unittest.TestCase):
     def setUp(self):
-        previous = server_args_module._global_server_args
-        server_args_module.set_global_server_args(
-            SimpleNamespace(
-                attention_backend=None,
-                attention_backend_config=None,
-                kv_gather_degree=1,
-                sp_split_auto=False,
-            )
-        )
-        self.addCleanup(server_args_module.set_global_server_args, previous)
+        _set_tiny_wan_server_args(self)
 
     def test_every_rank_feeds_blocks_offset_zero_shards(self):
         # 2 x 2 x 4 = 16 latent tokens, 4 per rank. With batch 1 a rank's slice
@@ -242,6 +255,54 @@ class TestWanBlockInputsAreRankInvariant(unittest.TestCase):
             for rank in range(world_size):
                 self.assertEqual(layouts[rank], layouts[0], f"rank {rank}")
                 self.assertEqual(scalars[rank], scalars[0], f"rank {rank}")
+
+
+def _native_forward(op):
+    # TPU's dispatch: forward_native, whose nested torch.compile is off on TPU.
+    return inspect.unwrap(type(op).forward_native).__get__(op)
+
+
+class TestWanBlockCompilesAsOneGraph(unittest.TestCase):
+    """A graph break inside a Wan block splits its SPMD-safe region, so the
+    region's collectives run in separate programs again."""
+
+    def setUp(self):
+        _set_tiny_wan_server_args(self)
+        torch._dynamo.reset()
+        self.addCleanup(torch._dynamo.reset)
+
+    def test_wrapped_blocks_compile_with_fullgraph(self):
+        forward_batch = SimpleNamespace(
+            enable_sequence_shard=False, enable_teacache=False, enable_spectrum=False
+        )
+        with (
+            _sp_rank(0, 1),
+            patch.object(CustomOp, "dispatch_forward", _native_forward),
+            # The fallback TPU selects; the CPU default calls sgl_kernel.
+            patch.object(
+                layernorm, "fuse_scale_shift_kernel", fuse_scale_shift_kernel_native
+            ),
+            set_forward_context(
+                current_timestep=0, attn_metadata=None, forward_batch=forward_batch
+            ),
+            torch.no_grad(),
+        ):
+            model = _tiny_wan()
+            text = torch.randn(1, 5, 8)
+            latents = torch.randn(1, 4, 2, 4, 8)
+            timesteps = (torch.full((1,), 500.0), torch.full((1, 16), 500.0))
+            eager = [model(latents, text, timestep) for timestep in timesteps]
+            with patch(f"{_COMPILE}.current_platform") as platform:
+                platform.prepare_spmd_region_wrapper.return_value = _wrap_region
+                compile_matching_submodules(
+                    model,
+                    compile_kwargs=dict(backend="eager", fullgraph=True, dynamic=False),
+                )
+            for timestep, expected in zip(timesteps, eager):
+                with self.subTest(timestep_shape=tuple(timestep.shape)):
+                    torch.testing.assert_close(
+                        model(latents, text, timestep), expected, rtol=0, atol=0
+                    )
 
 
 if __name__ == "__main__":
