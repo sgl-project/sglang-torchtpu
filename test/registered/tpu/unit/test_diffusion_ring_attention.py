@@ -1,0 +1,339 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Unit tests for the TPU Pallas diffusion ring attention kernel and tile selector."""
+
+from sglang.test.ci.ci_register import register_tpu_ci
+
+register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit", chips=1)
+
+import functools
+import importlib.util
+import os
+import subprocess
+import sys
+import unittest
+
+if "--xla_force_host_platform_device_count=" not in os.environ.get("XLA_FLAGS", ""):
+    os.environ["XLA_FLAGS"] = (
+        f"{os.environ.get('XLA_FLAGS', '')} --xla_force_host_platform_device_count=8"
+    ).strip()
+
+import numpy as np
+
+from sglang_tpu.multimodal_gen import diffusion_ring_attention
+
+
+def _has_jax() -> bool:
+    return importlib.util.find_spec("jax") is not None
+
+
+def _has_tpu_v7x_pair() -> bool:
+    if not _has_jax():
+        return False
+    import jax
+
+    return (
+        jax.default_backend() == "tpu"
+        and len(jax.devices()) >= 2
+        and "7x" in jax.devices()[0].device_kind.lower()
+    )
+
+
+def _fp32_attention_reference(
+    q_bf16, k_bf16, v_bf16, scale: float
+) -> np.ndarray:
+    qf = np.asarray(q_bf16, dtype=np.float32).transpose(0, 2, 1, 3)
+    rep = q_bf16.shape[2] // k_bf16.shape[2]
+    kf = np.repeat(np.asarray(k_bf16, dtype=np.float32), rep, axis=2).transpose(
+        0, 2, 1, 3
+    )
+    vf = np.repeat(np.asarray(v_bf16, dtype=np.float32), rep, axis=2).transpose(
+        0, 2, 1, 3
+    )
+    scores = np.matmul(qf, np.swapaxes(kf, -1, -2)) * scale
+    scores -= scores.max(axis=-1, keepdims=True)
+    probs = np.exp(scores)
+    probs /= probs.sum(axis=-1, keepdims=True)
+    return np.matmul(probs, vf).transpose(0, 2, 1, 3)
+
+
+class TestRingAttentionBlocks(unittest.TestCase):
+    def test_tuned_wan22_blocks_match_table(self):
+        blocks = diffusion_ring_attention.Blocks.for_shard(18900, 4, use_fixed_m=True)
+        self.assertEqual(
+            (
+                blocks.block_q,
+                blocks.block_kv,
+                blocks.block_kv_compute,
+                blocks.block_q_sub,
+            ),
+            (19200, 3328, 3328, 3200),
+        )
+        online = diffusion_ring_attention.Blocks.for_shard(18900, 4, use_fixed_m=False)
+        self.assertEqual(
+            (
+                online.block_q,
+                online.block_kv,
+                online.block_kv_compute,
+                online.block_q_sub,
+            ),
+            (19200, 2816, 2816, 3840),
+        )
+
+    def test_untuned_wan22_sweep_shapes_fit_vmem(self):
+        # All [480p, 720p] x [1..15]s shards at ring=4 and ring=8 resolve valid tiles within v7x VMEM.
+        for ring_size in (4, 8):
+            for tokens_per_latent_frame in (390 * 4, 900 * 4):
+                for sec in range(1, 16):
+                    latent_frames = 4 * sec + 1
+                    shard_len = (latent_frames * tokens_per_latent_frame) // ring_size
+                    for use_fixed_m in (True, False):
+                        blocks = diffusion_ring_attention.Blocks.for_shard(
+                            shard_len, ring_size, use_fixed_m=use_fixed_m
+                        )
+                        q_sub = (
+                            blocks.block_q_sub
+                            or diffusion_ring_attention.auto_block_q_sub(blocks.block_q)
+                        )
+                        self.assertEqual(blocks.block_q % q_sub, 0)
+                        self.assertEqual(q_sub % 128, 0)
+                        self.assertEqual(blocks.block_kv % blocks.block_kv_compute, 0)
+                        ubq, ubkv, ubkvc, uqs = (
+                            diffusion_ring_attention.select_untuned_blocks(
+                                shard_len, use_fixed_m=use_fixed_m
+                            )
+                        )
+                        if shard_len > 34_000:
+                            self.assertLess(ubq, shard_len)
+                        single_buf = diffusion_ring_attention.is_single_buffered_q(
+                            ubq, shard_len
+                        )
+                        est = diffusion_ring_attention.estimate_vmem_bytes(
+                            ubq,
+                            uqs,
+                            ubkv,
+                            ubkvc,
+                            single_buffered_q=single_buf,
+                        )
+                        self.assertLessEqual(
+                            est, diffusion_ring_attention.VMEM_LIMIT_BYTES
+                        )
+
+    def test_single_buffered_q_and_head_dim_scaling(self):
+        self.assertFalse(diffusion_ring_attention.is_single_buffered_q(4608, 4500))
+        self.assertTrue(diffusion_ring_attention.is_single_buffered_q(5120, 5070))
+        self.assertFalse(diffusion_ring_attention.is_single_buffered_q(23040, 45900))
+        v64 = diffusion_ring_attention.estimate_vmem_bytes(
+            8192, 2048, 2560, head_dim=64
+        )
+        v128 = diffusion_ring_attention.estimate_vmem_bytes(
+            8192, 2048, 2560, head_dim=128
+        )
+        self.assertLess(v64, v128)
+        b64 = diffusion_ring_attention.Blocks.for_shard(
+            5070, 4, head_dim=64, use_fixed_m=True
+        )
+        self.assertEqual(b64.block_q % (b64.block_q_sub or 128), 0)
+
+
+@unittest.skipUnless(_has_jax(), "jax not installed")
+class TestRingFixedMOperands(unittest.TestCase):
+    def test_constant_row0_and_gate_eligibility(self):
+        import jax.numpy as jnp
+
+        qn = jnp.array([5.0, 12.0, 10.65], dtype=jnp.float32)
+        kn = jnp.array([10.0, 10.0, 10.0], dtype=jnp.float32)
+        mk = np.asarray(diffusion_ring_attention.ring_fixed_m_operands(qn, kn))
+        self.assertEqual(mk.shape, (2, 3))
+        np.testing.assert_allclose(mk[0], [106.0, 106.0, 106.0])
+        np.testing.assert_allclose(mk[1], [1.0, 0.0, 1.0])
+
+
+@unittest.skipUnless(_has_jax(), "jax not installed")
+class TestRingAttentionInterpret(unittest.TestCase):
+    def test_ring4_interpret_multiblock_matches_fp32_reference(self):
+        import jax
+
+        cpu_devices = jax.devices("cpu")
+        if len(cpu_devices) < 4:
+            # Another test initialized JAX's CPU backend before XLA_FLAGS took effect.
+            xla_flags = " ".join(
+                tok
+                for tok in os.environ.get("XLA_FLAGS", "").split()
+                if not tok.startswith("--xla_force_host_platform_device_count=")
+            )
+            env = {
+                **os.environ,
+                "JAX_PLATFORMS": "cpu",
+                "XLA_FLAGS": f"{xla_flags} --xla_force_host_platform_device_count=8".strip(),
+            }
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    os.path.abspath(__file__),
+                    "TestRingAttentionInterpret.test_ring4_interpret_multiblock_matches_fp32_reference",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+            return
+
+        import jax.numpy as jnp
+        from jax._src.pallas.mosaic.interpret import interpret_pallas_call as ipc
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+        # ring_size=4 separates upstream from downstream; shard_len=310 with
+        # bq=256, q_sub=256, bkv=128 exercises 3 KV blocks (_run_full + per-block
+        # _reload_own + ragged KV tail), 2 Q passes, n_q == 1 hybrid last body,
+        # batch=2, and GQA 4:2 with mixed fixed-m / online heads.
+        rng = np.random.default_rng(0)
+        ring_size = 4
+        shard_len = 310
+        batch = 2
+        seq_len = ring_size * shard_len
+        head_dim = 128
+        scale = head_dim**-0.5
+        pinned = {
+            "block_q": 256,
+            "block_kv": 128,
+            "block_kv_compute": 128,
+            "block_q_sub": 256,
+        }
+
+        q_np = rng.standard_normal((batch, seq_len, 4, head_dim), dtype=np.float32)
+        q_np[:, :, 3, :] *= 8.0
+        k_np = rng.standard_normal((batch, seq_len, 2, head_dim), dtype=np.float32)
+        v_np = rng.standard_normal((batch, seq_len, 2, head_dim), dtype=np.float32)
+
+        q_bf16 = jnp.asarray(q_np, dtype=jnp.bfloat16)
+        k_bf16 = jnp.asarray(k_np, dtype=jnp.bfloat16)
+        v_bf16 = jnp.asarray(v_np, dtype=jnp.bfloat16)
+        ref = _fp32_attention_reference(q_bf16, k_bf16, v_bf16, scale)
+
+        axis_names = ("batch", "ring", "uly")
+        mesh = Mesh(np.asarray(cpu_devices[:ring_size]).reshape(1, ring_size, 1), axis_names)
+        spec = PartitionSpec(*axis_names)
+        sharding = NamedSharding(mesh, spec)
+
+        def _put(x, heads: int):
+            reshaped = jnp.swapaxes(
+                x.reshape(batch, ring_size, shard_len, heads, head_dim), 0, 1
+            )
+            return jax.device_put(reshaped[None, :, None, :, :, :, :], sharding)
+
+        q_in, k_in, v_in = _put(q_bf16, 4), _put(k_bf16, 2), _put(v_bf16, 2)
+
+        for use_fixed_m in (True, False):
+            with self.subTest(use_fixed_m=use_fixed_m):
+                pltpu.reset_tpu_interpret_mode_state()
+                fn = jax.jit(
+                    jax.shard_map(
+                        functools.partial(
+                            diffusion_ring_attention.ring_attention_sharded,
+                            ring_axis="ring",
+                            axis_names=axis_names,
+                            scale=scale,
+                            use_fixed_m=use_fixed_m,
+                            pinned=pinned,
+                            interpret=pltpu.InterpretParams(detect_races=True),
+                        ),
+                        mesh=mesh,
+                        in_specs=(spec, spec, spec),
+                        out_specs=spec,
+                        check_vma=False,
+                    )
+                )
+                out_sharded = np.asarray(fn(q_in, k_in, v_in), dtype=np.float32)[
+                    0, :, 0
+                ]
+                out = np.swapaxes(out_sharded, 0, 1).reshape(
+                    batch, seq_len, 4, head_dim
+                )
+                self.assertFalse(
+                    ipc.races is not None and ipc.races.races_found,
+                    "Pallas interpret detected a DMA or semaphore race",
+                )
+                self.assertTrue(np.all(np.isfinite(out)))
+                rel_l2 = float(np.linalg.norm(out - ref) / np.linalg.norm(ref))
+                self.assertLess(rel_l2, 7e-3)
+
+
+@unittest.skipUnless(_has_tpu_v7x_pair(), "requires TPU v7x with >= 2 TensorCores")
+class TestRingAttentionOnDevice(unittest.TestCase):
+    def test_sharded_ring_matches_fp32_reference(self):
+        import jax
+        import jax.numpy as jnp
+        from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+        rng = np.random.default_rng(0)
+        shard_len = 390
+        ring_size = 2
+        seq_len = ring_size * shard_len
+        head_dim = 128
+        scale = head_dim**-0.5
+
+        q_np = rng.standard_normal((1, seq_len, 4, head_dim), dtype=np.float32)
+        # Head 3 exceeds FIXED_M_RING_SAFE_BOUND so one launch exercises both fixed-m and online fallback.
+        q_np[:, :, 3, :] *= 8.0
+        k_np = rng.standard_normal((1, seq_len, 2, head_dim), dtype=np.float32)
+        v_np = rng.standard_normal((1, seq_len, 2, head_dim), dtype=np.float32)
+
+        q_bf16 = jnp.asarray(q_np, dtype=jnp.bfloat16)
+        k_bf16 = jnp.asarray(k_np, dtype=jnp.bfloat16)
+        v_bf16 = jnp.asarray(v_np, dtype=jnp.bfloat16)
+        ref = _fp32_attention_reference(q_bf16, k_bf16, v_bf16, scale)
+
+        axis_names = ("batch", "ring", "uly")
+        mesh = Mesh(np.asarray(jax.devices()[:2]).reshape(1, 2, 1), axis_names)
+        spec = PartitionSpec(*axis_names)
+        sharding = NamedSharding(mesh, spec)
+
+        q_in = jax.device_put(
+            q_bf16.reshape(1, ring_size, shard_len, 4, head_dim)[
+                :, :, None, None, :, :, :
+            ],
+            sharding,
+        )
+        k_in = jax.device_put(
+            k_bf16.reshape(1, ring_size, shard_len, 2, head_dim)[
+                :, :, None, None, :, :, :
+            ],
+            sharding,
+        )
+        v_in = jax.device_put(
+            v_bf16.reshape(1, ring_size, shard_len, 2, head_dim)[
+                :, :, None, None, :, :, :
+            ],
+            sharding,
+        )
+
+        for use_fixed_m in (True, False):
+            with self.subTest(use_fixed_m=use_fixed_m):
+                fn = jax.jit(
+                    jax.shard_map(
+                        functools.partial(
+                            diffusion_ring_attention.ring_attention_sharded,
+                            ring_axis="ring",
+                            axis_names=axis_names,
+                            scale=scale,
+                            use_fixed_m=use_fixed_m,
+                        ),
+                        mesh=mesh,
+                        in_specs=(spec, spec, spec),
+                        out_specs=spec,
+                        check_vma=False,
+                    )
+                )
+                out = np.asarray(fn(q_in, k_in, v_in), dtype=np.float32)[
+                    0, :, 0, 0
+                ].reshape(1, seq_len, 4, head_dim)
+                self.assertTrue(np.all(np.isfinite(out)))
+                rel_l2 = float(np.linalg.norm(out - ref) / np.linalg.norm(ref))
+                self.assertLess(rel_l2, 7e-3)
+
+
+if __name__ == "__main__":
+    unittest.main()
