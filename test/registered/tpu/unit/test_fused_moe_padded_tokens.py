@@ -31,6 +31,7 @@ ROUTES = {
     "qwen3_coder": (20, 160, 3, 8, 2048),  # EP8, top-8, recipe threshold
     "qwen35": (64, 512, 2, 10, 1024),  # EP8, top-10, recipe threshold
     "k3": (28, 896, 5, 16, 512),  # EP32, top-16, recipe threshold
+    "glm53": (36, 288, 3, 8, 512),  # GLM-5.3-Flash EP8, top-8, recipe threshold
 }
 
 
@@ -369,6 +370,40 @@ class TestFusedMoEPaddedTokens(CustomTestCase):
                         dense=False,
                         sc=sc,
                         no_combine=True,
+                    )
+
+    def test_live_nonfinite_token_stays_local(self):
+        """A live token with a non-finite hidden state or routing weight must not
+        change any other token's output, on the one-hot and the gather paths."""
+        cases = (
+            ("glm53", 64, True),  # one-hot permute, gather combine (c=64 decode)
+            ("glm53", 20, True),  # one-hot permute and combine
+            ("k3", 20, True),
+            ("glm53", 64, False),
+        )
+        for (route_name, m, dense), ep in itertools.product(cases, (True, False)):
+            thr = ROUTES[route_name][4] if dense else 0
+            run = self._fn("bf16", route_name, ep, False, thr, 0, False)
+            rng = np.random.default_rng(31 * m + thr)
+            ids, w = _routing(m, ROUTES[route_name], ep, rng)
+            hidden = rng.standard_normal((m, H)).astype(np.float32)
+            clean = run(hidden, ids, w)
+            bad_tok = m // 3
+            others = np.arange(m) != bad_tok
+            for poison in ("hidden_nan", "hidden_inf", "weight_nan"):
+                tag = f"{route_name} m={m} thr={thr} ep={ep} {poison}"
+                bad_h, bad_w = hidden.copy(), w.copy()
+                if poison == "hidden_nan":
+                    bad_h[bad_tok] = np.nan
+                elif poison == "hidden_inf":
+                    bad_h[bad_tok, ::5] = np.inf
+                else:
+                    bad_w[bad_tok, 0] = np.nan
+                with self.subTest(tag):
+                    bad = run(bad_h, ids, bad_w)
+                    self.assertTrue(np.all(np.isfinite(bad[others])), tag)
+                    np.testing.assert_array_equal(
+                        bad[others], clean[others], err_msg=tag
                     )
 
     def test_local_ids_with_dropped_slots_match_global_ids(self):
