@@ -11,7 +11,7 @@ import sys
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(
-    est_time=300,
+    est_time=500,
     suite="stage-a-test-tpu-unit",
     chips=1,
     labels=["singlehost", "deepseek-v4.1-flash", "accuracy", "compile"],
