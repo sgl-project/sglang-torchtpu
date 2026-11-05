@@ -335,5 +335,235 @@ class TestRingAttentionOnDevice(unittest.TestCase):
                 self.assertLess(rel_l2, 7e-3)
 
 
+class TestRingMeshSpec(unittest.TestCase):
+    def _check_spec(
+        self,
+        world_size: int,
+        ring_ranks: list[int],
+        replica_ranks: list[int] | None = None,
+    ):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from sglang_tpu.multimodal_gen import tpu_splash_attn
+
+        if replica_ranks is None:
+            replica_ranks = list(range(world_size))
+        replica = SimpleNamespace(
+            ranks=replica_ranks,
+            world_size=len(replica_ranks),
+            device_group=None,
+        )
+        sp = SimpleNamespace(ring_world_size=len(ring_ranks), ring_group=object())
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch.object(
+                tpu_splash_attn, "model_parallel_is_initialized", return_value=True
+            ),
+            patch.object(tpu_splash_attn, "get_sp_group", return_value=sp),
+            patch.object(tpu_splash_attn, "get_replica_group", return_value=replica),
+            patch("torch.distributed.get_world_size", return_value=world_size),
+            patch("torch.distributed.get_process_group_ranks", return_value=ring_ranks),
+        ):
+            return tpu_splash_attn._resolve_ring_mesh_spec()
+
+    def test_regular_grids_resolve(self):
+        self.assertEqual(self._check_spec(8, [0, 1, 2, 3]), (2, 4, 1))
+        self.assertEqual(self._check_spec(8, [4, 5, 6, 7]), (2, 4, 1))
+        self.assertEqual(self._check_spec(8, [0, 2]), (2, 2, 2))
+        self.assertEqual(self._check_spec(8, [5, 7]), (2, 2, 2))
+        self.assertEqual(self._check_spec(8, list(range(8))), (1, 8, 1))
+
+    def test_replica_submesh_resolves_per_dp_replica(self):
+        # dp_size=2 over world_size=8: each replica has 4 ranks.
+        self.assertEqual(
+            self._check_spec(8, [0, 1, 2, 3], replica_ranks=[0, 1, 2, 3]), (1, 4, 1)
+        )
+        self.assertEqual(
+            self._check_spec(8, [4, 5, 6, 7], replica_ranks=[4, 5, 6, 7]), (1, 4, 1)
+        )
+        self.assertEqual(
+            self._check_spec(8, [5, 7], replica_ranks=[4, 5, 6, 7]), (1, 2, 2)
+        )
+        # Ring ranks outside the replica group are rejected.
+        self.assertIsNone(
+            self._check_spec(8, [0, 1, 2, 3], replica_ranks=[4, 5, 6, 7])
+        )
+
+    def test_non_grid_or_trivial_returns_none(self):
+        from sglang_tpu.multimodal_gen import tpu_splash_attn
+
+        self.assertIsNone(tpu_splash_attn._resolve_ring_mesh_spec())
+        self.assertIsNone(self._check_spec(8, [0]))
+        self.assertIsNone(self._check_spec(8, [2, 4]))
+        self.assertIsNone(self._check_spec(8, [0, 3, 5, 7]))
+
+
+class TestRingAttentionDispatch(unittest.TestCase):
+    def test_capability_flags(self):
+        from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
+            SDPAImpl,
+        )
+        from sglang_tpu.multimodal_gen.tpu_splash_attn import TpuSplashAttentionImpl
+
+        self.assertTrue(TpuSplashAttentionImpl.supports_ring())
+        self.assertFalse(SDPAImpl.supports_ring())
+
+    def test_env_switch_disables_ring_kernel(self):
+        from unittest.mock import patch
+
+        from sglang_tpu.multimodal_gen import tpu_splash_attn
+        from sglang_tpu.multimodal_gen.tpu_splash_attn import TpuSplashAttentionImpl
+
+        with (
+            patch.dict(os.environ, {"SGLANG_TPU_ENABLE_DIFFUSION_RING_KERNEL": "0"}),
+            patch.object(tpu_splash_attn, "_check_splash_available", return_value=True),
+            patch.object(tpu_splash_attn, "_register_ops", side_effect=lambda: None),
+            patch.object(tpu_splash_attn, "_FLASH_OP", object()),
+            patch.object(
+                tpu_splash_attn, "_resolve_ring_mesh_spec"
+            ) as mock_resolve_mesh,
+        ):
+            impl = TpuSplashAttentionImpl(
+                num_heads=4, head_size=128, causal=False, softmax_scale=128**-0.5
+            )
+            self.assertIsNone(impl._ring_op)
+            self.assertIsNone(impl._short_2d_ring_op)
+            mock_resolve_mesh.assert_not_called()
+
+    def test_splash_impl_forward_ring_guards_and_reshape(self):
+        from types import SimpleNamespace
+
+        import torch
+
+        from sglang_tpu.multimodal_gen.tpu_splash_attn import TpuSplashAttentionImpl
+
+        class _FakeTpuTensor(torch.Tensor):
+            @property
+            def device(self):
+                return SimpleNamespace(type="tpu")
+
+            @device.setter
+            def device(self, _value):
+                pass
+
+        seen = {}
+
+        def fake_op(q, k, v):
+            seen["shapes"] = (tuple(q.shape), tuple(k.shape), tuple(v.shape))
+            return q + 1
+
+        impl = TpuSplashAttentionImpl.__new__(TpuSplashAttentionImpl)
+        impl.causal = False
+        impl._ring_op = fake_op
+        impl._short_2d_ring_op = None
+
+        cpu_q = torch.zeros((1, 256, 4, 128), dtype=torch.bfloat16)
+        self.assertIsNone(impl.forward_ring(cpu_q, cpu_q, cpu_q))
+
+        tpu_q = cpu_q.as_subclass(_FakeTpuTensor)
+        tpu_k_short = torch.zeros((1, 128, 4, 128), dtype=torch.bfloat16).as_subclass(
+            _FakeTpuTensor
+        )
+        self.assertIsNone(impl.forward_ring(tpu_q, tpu_k_short, tpu_k_short))
+        self.assertIsNone(impl.forward_ring(tpu_k_short, tpu_k_short, tpu_k_short))
+
+        tpu_gqa_k = torch.zeros((1, 256, 2, 128), dtype=torch.bfloat16).as_subclass(
+            _FakeTpuTensor
+        )
+        out = impl.forward_ring(tpu_q, tpu_gqa_k, tpu_gqa_k)
+        self.assertIsNotNone(out)
+        self.assertEqual(tuple(out.shape), (1, 256, 4, 128))
+        self.assertEqual(
+            seen["shapes"],
+            (
+                (1, 1, 1, 1, 256, 4, 128),
+                (1, 1, 1, 1, 256, 2, 128),
+                (1, 1, 1, 1, 256, 2, 128),
+            ),
+        )
+
+        # Short shards (q_seq <= 4096) with even head counts dispatch to _short_2d_ring_op.
+        impl._short_2d_ring_op = lambda q, k, v: q + 2
+        short_q = torch.zeros((1, 3510, 4, 128), dtype=torch.bfloat16).as_subclass(
+            _FakeTpuTensor
+        )
+        self.assertTrue(torch.all(impl.forward_ring(short_q, short_q, short_q) == 2))
+        long_q = torch.zeros((1, 4290, 4, 128), dtype=torch.bfloat16).as_subclass(
+            _FakeTpuTensor
+        )
+        self.assertTrue(torch.all(impl.forward_ring(long_q, long_q, long_q) == 1))
+        odd_k = torch.zeros((1, 1950, 1, 128), dtype=torch.bfloat16).as_subclass(
+            _FakeTpuTensor
+        )
+        odd_q = torch.zeros((1, 1950, 3, 128), dtype=torch.bfloat16).as_subclass(
+            _FakeTpuTensor
+        )
+        self.assertTrue(torch.all(impl.forward_ring(odd_q, odd_k, odd_k) == 1))
+
+    def test_usp_attention_prefers_forward_ring_and_falls_back(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import torch
+
+        from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
+        from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+
+        layer_mod = "sglang.multimodal_gen.runtime.layers.attention.layer"
+        obj = USPAttention.__new__(USPAttention)
+        obj.skip_sequence_parallel = False
+        obj.sp_attention_mode = "ulysses"
+        obj.sp_attention_mode_is_auto = False
+        obj.softmax_scale = 0.125
+        obj.backend = AttentionBackendEnum.OOT
+        obj.causal = False
+        obj.dropout_p = 0.0
+        obj.enable_packed_qkv_input_a2a = False
+
+        q = torch.randn(1, 8, 2, 8)
+        calls = []
+
+        def run_with_ring_return(ring_ret):
+            obj.attn_impl = SimpleNamespace(
+                supports_ring=lambda: True,
+                forward_ring=lambda qc, kc, vc: calls.append("ring") or ring_ret,
+                supports_ring_resume=lambda: True,
+            )
+            with (
+                patch(
+                    f"{layer_mod}.get_forward_context",
+                    return_value=SimpleNamespace(attn_metadata=None),
+                ),
+                patch(f"{layer_mod}.get_sequence_parallel_world_size", return_value=4),
+                patch(f"{layer_mod}.get_ulysses_parallel_world_size", return_value=1),
+                patch(f"{layer_mod}.get_ring_parallel_world_size", return_value=4),
+                patch(
+                    f"{layer_mod}._usp_input_all_to_all_qkv",
+                    side_effect=lambda qc, kc, vc: (qc, kc, vc),
+                ),
+                patch(
+                    f"{layer_mod}._usp_output_all_to_all",
+                    side_effect=lambda t, head_dim: t,
+                ),
+                patch(
+                    f"{layer_mod}.allgather_kv_ring_attn",
+                    side_effect=lambda qc, kc, vc, attn_impl: (
+                        calls.append("allgather") or torch.zeros_like(qc)
+                    ),
+                ),
+            ):
+                return obj.forward(q, q, q)
+
+        out_fast = run_with_ring_return(torch.ones_like(q))
+        self.assertEqual(calls, ["ring"])
+        self.assertTrue(torch.all(out_fast == 1))
+
+        calls.clear()
+        out_fallback = run_with_ring_return(None)
+        self.assertEqual(calls, ["ring", "allgather"])
+        self.assertTrue(torch.all(out_fallback == 0))
+
+
 if __name__ == "__main__":
     unittest.main()
