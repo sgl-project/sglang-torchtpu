@@ -245,7 +245,7 @@ def scatter_index_keys(
     page_records: int,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Quantize new index K and update packed FP8 pages in their aliased owners."""
-    from sglang_tpu.kernels.index_selection.packed_fp8_cache import (
+    from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.cache import (
         PackedFP8Layout,
         write_fp8_records,
     )

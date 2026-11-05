@@ -57,7 +57,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.dsv41.kernels.cache import gather_csa2_kv_sc
+from sglang_tpu.kernels.deepseek_v41.csa2.cache import gather_csa2_kv_sc
 
 
 # JAX 0.10.2 uses explicit MRB addresses, not ACC memory refs.
