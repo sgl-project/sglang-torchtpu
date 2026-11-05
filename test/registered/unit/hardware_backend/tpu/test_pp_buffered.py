@@ -35,6 +35,7 @@ from sglang_tpu.compilation.decoder_compile_policy import (  # noqa: E402
 from sglang_tpu.envs import envs as tpu_envs  # noqa: E402
 from sglang_tpu.pp_buffered import (  # noqa: E402
     _MAX_RECEIVES,
+    _POST_LOG_EVERY,
     PPBufferedHandoff,
     Transport,
 )
@@ -346,6 +347,19 @@ class TestPPBufferedHandoffBounds(unittest.TestCase):
             )
         with self.assertRaises(ValueError):
             handoff.merge({"residual": tensors["residual"]})
+
+    def test_post_time_log_covers_one_window(self):
+        handoff = make_handoff(1, 2, FakeNet())
+        with self.assertLogs("sglang_tpu.pp_buffered", level="INFO") as logs:
+            # One slow post in the first window, then a fast second window.
+            handoff._note_post(0.050)
+            for _ in range(2 * _POST_LOG_EVERY - 1):
+                handoff._note_post(0.001)
+        lines = [m for m in (r.getMessage() for r in logs.records) if "posted" in m]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("50.000 ms max", lines[0])
+        self.assertIn("1.000 ms max", lines[1])
+        self.assertIn("1.000 ms mean", lines[1])
 
     def test_rows_outside_the_buffer_are_refused(self):
         handoff = make_handoff(1, 2, FakeNet(), max_rows=32)

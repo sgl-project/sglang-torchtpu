@@ -226,7 +226,8 @@ class PPBufferedHandoff:
         # Zero residuals by padded row count, each its own storage: a view of
         # one larger tensor would be copied out before every forward.
         self._zero_residuals: dict[int, torch.Tensor] = {}
-        # Time posting receives holds the scheduler thread (_note_post).
+        # Time posting receives holds the scheduler thread (_note_post), over
+        # the current logging window.
         self._post_count = 0
         self._post_total_s = 0.0
         self._post_max_s = 0.0
@@ -329,19 +330,24 @@ class PPBufferedHandoff:
 
     def _note_post(self, seconds: float) -> None:
         """Track how long posting a receive holds the scheduler thread (the
-        allocation and a store round trip), logged every _POST_LOG_EVERY."""
+        allocation and a store round trip). Every _POST_LOG_EVERY posts, log
+        the mean and max of that window and start a new one, so one slow post
+        shows up in one log line only."""
         self._post_count += 1
         self._post_total_s += seconds
         self._post_max_s = max(self._post_max_s, seconds)
         if self._post_count % _POST_LOG_EVERY == 0:
             logger.info(
-                "buffered hand-off stage %d: %d receives posted, %.3f ms mean, "
-                "%.3f ms max on the scheduler thread",
+                "buffered hand-off stage %d: %d receives posted; the last %d took "
+                "%.3f ms mean, %.3f ms max on the scheduler thread",
                 self.rank,
                 self._post_count,
-                1000 * self._post_total_s / self._post_count,
+                _POST_LOG_EVERY,
+                1000 * self._post_total_s / _POST_LOG_EVERY,
                 1000 * self._post_max_s,
             )
+            self._post_total_s = 0.0
+            self._post_max_s = 0.0
 
     def _zero_residual(self, rows: int) -> torch.Tensor:
         zero = self._zero_residuals.get(rows)
