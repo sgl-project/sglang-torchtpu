@@ -196,19 +196,25 @@ class TestRuntimeEnvironment(unittest.TestCase):
         """A PP prefill must run without the megakernel (the model rejects it under PP)."""
         from benchmark.tpu.recipe.configs.muse_spark.agentic import get_config
 
-        prefill, decode = (get_config(24, mode=m) for m in ("prefill", "decode"))
-        self.assertEqual(prefill["server_args"]["pp_size"], 2)
+        prefill, decode = (get_config(32, mode=m) for m in ("prefill", "decode"))
+        self.assertEqual(prefill["server_args"]["pp_size"], 8)
+        self.assertEqual(prefill["server_args"]["tp_size"], 1)
+        self.assertEqual(decode["server_args"]["max_running_requests"], 32)
         for config in (prefill, decode):
             # A rank != 0 in a one-host group makes launch_server start nothing.
             self.assertEqual(config["runtime_env"]["SGLANG_LAUNCHER_RANK"], "0")
         self.assertEqual(prefill["runtime_env"]["SGLANG_TPU_MUSE_MEGAKERNEL"], "0")
-        self.assertEqual(decode["runtime_env"]["SGLANG_TPU_MUSE_MEGAKERNEL"], "1")
+        # 256-row steps exceed the megakernel's 32-row cap.
+        self.assertEqual(decode["runtime_env"]["SGLANG_TPU_MUSE_MEGAKERNEL"], "0")
+        for config in (prefill, decode):
+            self.assertEqual(config["server_args"]["kv_cache_dtype"], "bfloat16")
         self.assertEqual(decode["runtime_env"]["SGLANG_RAIDEN_PIPELINE_TRANSFER"], "1")
         for config, mode in ((prefill, "prefill"), (decode, "decode")):
             self.assertEqual(config["server_args"]["disaggregation_mode"], mode)
         self.assertNotIn("disaggregation_mode", get_config(24)["server_args"])
-        with self.assertRaises(ValueError):
-            get_config(24, mode="router")
+        for concurrency, mode in ((24, "router"), (24, "decode")):
+            with self.assertRaises(ValueError):
+                get_config(concurrency, mode=mode)
 
 
 if __name__ == "__main__":

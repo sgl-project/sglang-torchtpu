@@ -5,8 +5,8 @@ applies its _Patch: KV layout (bf16 at c4/c8, fp8 1M-context elsewhere), running
 requests, prefill/decode interval and megakernel row cap. The mode picks the engine:
 
 - mixed: one TP8 server, prefill and decode together.
-- prefill / decode: one Raiden P/D engine each, a PP2 x TP4 prefill host feeding a TP8
-  megakernel decode host.
+- prefill / decode: one Raiden P/D engine each, a PP8 prefill host feeding a TP8 decode
+  host, with bf16 KV and their own per-concurrency patches.
 
 Every mode serves DFlash on the experimental spec worker, the only one that runs it on
 a PP prefill.
@@ -150,11 +150,17 @@ def _patch(
     prefill_decode_interval: int = 128,
     # A step is max_running_requests x DRAFT_TOKENS rows; past 32 the megakernel needs
     # its large-step program, and larger steps run the slow native decoder.
-    mk_max_rows: int = 32,
+    # None serves every step on the native decoder.
+    mk_max_rows: int | None = 32,
 ) -> dict[str, dict]:
     rows = max_running_requests * DRAFT_TOKENS
-    if rows > mk_max_rows:
+    if mk_max_rows is not None and rows > mk_max_rows:
         raise ValueError(f"{rows} rows per step > mk_max_rows {mk_max_rows}")
+    megakernel_env = (
+        {"SGLANG_TPU_MUSE_MEGAKERNEL": "0"}
+        if mk_max_rows is None
+        else {"SGLANG_TPU_MUSE_MK_MAX_ROWS": str(mk_max_rows)}
+    )
     return {
         "server_args": {
             **kv["server_args"],
@@ -163,10 +169,7 @@ def _patch(
             "tpu_compile_bs": list(range(1, max_running_requests + 1)),
             "prefill_decode_interval": prefill_decode_interval,
         },
-        "runtime_env": {
-            **kv["runtime_env"],
-            "SGLANG_TPU_MUSE_MK_MAX_ROWS": str(mk_max_rows),
-        },
+        "runtime_env": {**kv["runtime_env"], **megakernel_env},
     }
 
 
@@ -180,6 +183,19 @@ _PATCHES_BY_CONCURRENCY: dict[int, dict[str, dict]] = {
     24: _patch(6, mk_max_rows=48),
     28: _patch(6, mk_max_rows=48),
     32: _patch(6, prefill_decode_interval=16, mk_max_rows=48),
+}
+
+
+# Raiden splits PP8 KV by head for a TP8 decode, which leaves one draft head per rank;
+# fp8 KV needs an even count, so P/D runs bf16, pool sized by HBM.
+_PD_BF16_KV: dict[str, dict] = {
+    "server_args": {"kv_cache_dtype": "bfloat16"},
+    "runtime_env": {},
+}
+
+# The decode megakernel caps a step at 32 rows (4 requests), so r32 decodes natively.
+_PD_PATCHES_BY_CONCURRENCY: dict[int, dict[str, dict]] = {
+    32: _patch(32, kv=_PD_BF16_KV, mk_max_rows=None),
 }
 
 
@@ -212,19 +228,20 @@ _ROLES: dict[str, dict[str, dict]] = {
     "prefill": {
         "server_args": {
             "disaggregation_mode": "prefill",
-            # Raiden's pipeline producer needs attention TP=1 (DP attention), while NVFP4
-            # MoE needs fused-RS expert TP > 1; PP rejects the overlap schedule.
-            "tp_size": 4,
-            "dp_size": 4,
-            "enable_dp_attention": True,
-            # The DFlash draft shares the target head, sharded over attention TP under DP.
-            "enable_dp_lm_head": True,
+            # Raiden's pipeline producer needs attention TP=1; PP rejects the overlap schedule.
+            "tp_size": 1,
             "ep_size": 1,
-            "pp_size": 2,
+            "pp_size": 8,
+            # Fused-RS needs TP/EP > 1; auto picks stock Pallas gmm_v2 at PP8/EP1.
+            "moe_runner_backend": "auto",
             "disable_overlap_schedule": True,
         },
-        # The megakernel runs the whole decoder in one kernel, so it cannot be staged.
-        "runtime_env": {"SGLANG_TPU_MUSE_MEGAKERNEL": "0"},
+        "runtime_env": {
+            # The megakernel runs the whole decoder in one kernel, so it cannot be staged.
+            "SGLANG_TPU_MUSE_MEGAKERNEL": "0",
+            # Stages 0 and 7 also hold the BF16->FP8 boundary layers, embed and lm_head.
+            "SGLANG_PP_LAYER_PARTITION": "7,8,8,8,8,8,8,7",
+        },
     },
     "decode": {
         "server_args": {
@@ -239,13 +256,14 @@ _ROLES: dict[str, dict[str, dict]] = {
 
 
 def get_config(concurrency: int, mode: str = "mixed") -> dict:
-    if concurrency not in _PATCHES_BY_CONCURRENCY:
-        raise ValueError(
-            f"no patch for concurrency {concurrency}; defined: {sorted(_PATCHES_BY_CONCURRENCY)}"
-        )
     if mode not in MODES:
         raise ValueError(f"mode {mode!r} is not one of {MODES}")
-    config = _apply(_PATCHES_BY_CONCURRENCY[concurrency])
+    patches = _PATCHES_BY_CONCURRENCY if mode == "mixed" else _PD_PATCHES_BY_CONCURRENCY
+    if concurrency not in patches:
+        raise ValueError(
+            f"no {mode} patch for concurrency {concurrency}; defined: {sorted(patches)}"
+        )
+    config = _apply(patches[concurrency])
     if mode != "mixed":
         for patch in (_PD, _ROLES[mode]):
             for section, overrides in patch.items():
