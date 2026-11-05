@@ -185,6 +185,9 @@ jobs:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
       image: ${{ needs.build.outputs.digest }}
       suite: stage-b-test-tpu-4-v7
+      # Unit tests compile small, mostly distinct programs; the bucket cache only
+      # pays off for the serving suite (warm run: -10 % suite wall on CDK and CI).
+      shared_compile_cache: true
       platform: tpu_oot
       weights_pvc: model-weights
     permissions:

@@ -188,6 +188,14 @@ def main():
             "the slice the job already holds. 0 or 1 keeps the whole node per test."
         ),
     )
+    ap.add_argument(
+        "--shared-compile-cache",
+        action="store_true",
+        help=(
+            "Single-host only: keep torch_tpu's tier-3 compile cache on the "
+            "compile-cache bucket across test files and runs."
+        ),
+    )
     ap.add_argument("--partition-id", type=int, default=-1)
     ap.add_argument("--partition-size", type=int, default=0)
     ap.add_argument(
@@ -401,6 +409,7 @@ def main():
         # Sweeps trimmed for the gate run whole on the nightly; see
         # python/sglang/test/ci/gate_matrix.py.
         "FULL_MATRIX": "1" if a.nightly else "0",
+        "SHARED_COMPILE_CACHE": "1" if a.shared_compile_cache else "0",
         "LAUNCH_SCRIPT": a.launch_script,
         "TEST_FILES": a.files,
         "WEIGHTS_VOLUME": WEIGHTS_VOLUME_TMPL.format(pvc=pvc) if pvc else "",
