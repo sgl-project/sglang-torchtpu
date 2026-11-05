@@ -48,7 +48,7 @@ def kv_layout():
 
     Read at trace time, not per token, so a plain lookup is fine here.
     """
-    from sglang_tpu.attention.pallas.batched_rpa import configs
+    from sglang_tpu.kernels.ops.attention.batched_rpa import configs
 
     if uses_seq_along_lane_kv():
         return configs.KVLayout.SEQ_ALONG_LANE
@@ -56,7 +56,7 @@ def kv_layout():
 
 
 def _import_batched_kernel():
-    from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
+    from sglang_tpu.kernels.ops.attention.batched_rpa.wrapper import (
         ragged_paged_attention,
     )
 

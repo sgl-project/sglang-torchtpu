@@ -51,7 +51,7 @@ def dflash_write_draft_kv(
         raise NotImplementedError("DFLASH draft KV writes need an unpacked KV pool")
     # kv_fused_rope_write imports jax eagerly; keep the span math and the rope
     # gather above importable without it.
-    from sglang_tpu.kv_fused_rope_write import (
+    from sglang_tpu.kernels.ops.kvcache.kv_fused_rope_write import (
         fused_rope_write_kv,
     )
 

@@ -66,7 +66,7 @@ def register_ops() -> None:
 
         import jax
 
-        from sglang_tpu.kernels.mhc import mhc_site, param_row
+        from sglang_tpu.kernels.ops.layernorm.mhc import mhc_site, param_row
         from sglang_tpu.pallas_jax_op import cpu_export_jax_op
 
         def _pre(

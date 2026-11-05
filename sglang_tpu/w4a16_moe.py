@@ -166,7 +166,7 @@ def apply_tpu_w4a16_moe(
 ):
     """Run TPU W4A16 MoE through the Pallas fused grouped-GEMM backend."""
     # Lazy: the Pallas bridge imports torch_tpu, which the CPU test runner lacks.
-    from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
+    from sglang_tpu.kernels.ops.moe.fused_moe_op import fused_moe_call
 
     if apply_router_weight_on_input:
         raise NotImplementedError(

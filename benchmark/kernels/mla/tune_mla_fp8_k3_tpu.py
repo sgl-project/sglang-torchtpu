@@ -1,7 +1,7 @@
 """Tune the TPU MLA kernel's block sizes for Kimi-K3 TP32 with an fp8 KV cache.
 
 Runs on one tpu7x core and prints the rows of
-sglang_tpu/attention/pallas/tuned_block_sizes_mla.py for 4 q heads per shard
+sglang_tpu/kernels/ops/attention/tuned_block_sizes_mla.py for 4 q heads per shard
 (3 padded to 4), kv_lora 512, rope 64, page 128, bf16 queries and
 float8_e4m3fn KV. Same rule as the bf16 Kimi-K3 rows: per token bucket, the
 config with the smallest worst-case slowdown against the best config of each
@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sglang_tpu.attention.pallas.mla_ragged_paged_attention_v2 import (
+from sglang_tpu.kernels.ops.attention.mla_ragged_paged_attention_v2 import (
     get_kv_cache_shape,
     mla_ragged_paged_attention,
 )

@@ -14,14 +14,14 @@ Copyright 2025 The SGLang Team
 Licensed under the Apache License, Version 2.0
 
 Ragged paged attention, MLA attention, fused MoE kernels and tuned block-size
-tables under sglang_tpu/attention/pallas/ and sglang_tpu/moe/pallas/.
+tables under sglang_tpu/kernels/ops/attention/ and sglang_tpu/kernels/ops/moe/.
 
 -------------------------------------------------------------------------------
 Helion
 https://github.com/pytorch/helion
 Copyright (c) Meta Platforms, Inc. and affiliates.
 
-The bitonic Top-K network in sglang_tpu/kernels/distributed_topk.py is a
+The bitonic Top-K network in sglang_tpu/kernels/ops/sampling/distributed_topk.py is a
 specialization of Helion's Pallas Top-K lowering
 (helion/_compiler/pallas/topk_impl.py), distributed under the following
 license:

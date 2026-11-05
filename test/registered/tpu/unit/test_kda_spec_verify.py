@@ -32,8 +32,8 @@ DIM = 3 * N_V * D
 @unittest.skipUnless(_HAS_TPU, "requires a JAX TPU backend")
 class TestKdaSpecVerify(CustomTestCase):
     def _kernel(self, num_spec_tokens, batched_only=True):
-        from sglang_tpu.attention.pallas.gdn import wrapper
-        from sglang_tpu.attention.pallas.gdn.config import AttentionMode
+        from sglang_tpu.kernels.ops.attention.gdn import wrapper
+        from sglang_tpu.kernels.ops.attention.gdn.config import AttentionMode
 
         def run(qkv, b, a, conv, rec, packed, qsl, idx, dist, seq_lens, offsets):
             return wrapper.fused_conv1d_gdn(

@@ -7,7 +7,7 @@ backend calls ``indexer_forward`` in this module. It has two parts:
 * In torch: the indexer's linear layers and the rotary embedding.
 * In one custom op per layer: quantize the queries and keys, store the keys in
   the layer's index-key cache, and pick the top-k keys for each query. The JAX
-  code for that op is in ``sglang_tpu.attention.pallas.dsa_index_topk``.
+  code for that op is in ``sglang_tpu.kernels.ops.attention.dsa_index_topk``.
 
 The attention backend owns the cache and the per-forward metadata and passes
 them to the op. This module keeps no state except the registered op.
@@ -44,7 +44,7 @@ def build_dsa_index_topk_op():
     import jax  # noqa: F401  (force loud failure if JAX is missing)
     from torch_tpu._internal import pallas as _torch_pallas
 
-    from sglang_tpu.attention.pallas.dsa_index_topk import dsa_indexer_step
+    from sglang_tpu.kernels.ops.attention.dsa_index_topk import dsa_indexer_step
 
     op_name = "sglang_tpu_pallas::dsa_index_topk"
 
@@ -191,7 +191,7 @@ def build_dsa_index_topk_split_op():
     import jax  # noqa: F401  (force loud failure if JAX is missing)
     from torch_tpu._internal import pallas as _torch_pallas
 
-    from sglang_tpu.attention.pallas.dsa_index_topk import dsa_indexer_step
+    from sglang_tpu.kernels.ops.attention.dsa_index_topk import dsa_indexer_step
 
     op_name = "sglang_tpu_pallas::dsa_index_topk_split"
 
@@ -397,7 +397,7 @@ def build_dsa_kpool_topk_op():
     import jax  # noqa: F401  (force loud failure if JAX is missing)
     from torch_tpu._internal import pallas as _torch_pallas
 
-    from sglang_tpu.attention.pallas.dsa_kpool_topk import kpool_indexer_step
+    from sglang_tpu.kernels.ops.attention.dsa_kpool_topk import kpool_indexer_step
 
     op_name = "sglang_tpu_pallas::dsa_kpool_topk"
 

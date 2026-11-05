@@ -363,10 +363,10 @@ class TestGDNAttentionOp(CustomTestCase):
 
     @unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON_JAX_TPU)
     def test_op_matches_kernel_and_mutates_state(self):
-        from sglang_tpu.attention.pallas.gdn import fused_conv1d_gdn
         from sglang_tpu.attention_gdn_pallas import (
             build_gdn_pallas_op,
         )
+        from sglang_tpu.kernels.ops.attention.gdn import fused_conv1d_gdn
 
         n_kq, n_v, d_k, d_v, K = self.N_KQ, self.N_V, self.D_K, self.D_V, self.K
         # Mixed batch: 2 decode + 1 prefill.
@@ -515,11 +515,11 @@ class TestGDNAttentionOp(CustomTestCase):
     @unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON_JAX_TPU)
     def test_kda_op_matches_kernel(self):
         """The op forwards KDA mode and the gate bound to the kernel unchanged."""
-        from sglang_tpu.attention.pallas.gdn import fused_conv1d_gdn
-        from sglang_tpu.attention.pallas.gdn.config import AttentionMode
         from sglang_tpu.attention_gdn_pallas import (
             build_gdn_pallas_op,
         )
+        from sglang_tpu.kernels.ops.attention.gdn import fused_conv1d_gdn
+        from sglang_tpu.kernels.ops.attention.gdn.config import AttentionMode
 
         args, (n_kq, n_v, d_k, d_v, K) = self._kda_case()
         (conv_ref, rec_ref), out_ref = fused_conv1d_gdn(

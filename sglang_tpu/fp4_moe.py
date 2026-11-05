@@ -30,7 +30,7 @@ from sglang_tpu.fused_rs_sequence_parallel import (
     prepare_fused_moe_sequence_parallel_input,
     prepare_tpu_fused_rs_post_expert_norm,
 )
-from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
+from sglang_tpu.kernels.ops.moe.fused_moe_op import fused_moe_call
 
 # Block-512 matches the original FP8 activation quantization block. Both stock
 # Pallas gmm_v2 and fused-RS additionally support block-256 with W4A8 and blocks
@@ -257,7 +257,7 @@ def prepare_tpu_nvfp4_moe_weights(
         )
 
     if use_fused_rs:
-        from sglang_tpu.moe.pallas.fused_moe_rs_op import (
+        from sglang_tpu.kernels.ops.moe.fused_moe_rs_op import (
             prepare_fused_moe_rs,
         )
 
@@ -352,7 +352,7 @@ def apply_tpu_nvfp4_moe(
         activation = f"silu_and_mul_clamp:{float(swiglu_limit)}"
 
     if use_fused_rs:
-        from sglang_tpu.moe.pallas.fused_moe_rs_op import (
+        from sglang_tpu.kernels.ops.moe.fused_moe_rs_op import (
             fused_moe_rs_gather,
         )
 

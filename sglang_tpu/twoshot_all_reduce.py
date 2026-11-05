@@ -34,7 +34,9 @@ def _build_op(world_size: int) -> Callable:
     import jax
     from jax.sharding import PartitionSpec as P
 
-    from sglang_tpu.kernels.twoshot_all_reduce import twoshot_all_reduce
+    from sglang_tpu.kernels.ops.communication.twoshot_all_reduce import (
+        twoshot_all_reduce,
+    )
     from sglang_tpu.pallas_jax_op import cpu_export_jax_op
 
     mesh = _get_mesh(world_size)

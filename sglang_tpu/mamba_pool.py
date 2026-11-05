@@ -6,7 +6,7 @@ conv/ssm buffers with CUDA-specific machinery (memory-saver regions, custom
 NVLink mem pools, fp8 quirks, CUDA-only speculative buffers) and in the layout
 expected by the Triton GDN kernels. This subclass reallocates the two state
 buffers on the TPU device in the layout expected by the fused Pallas kernel
-:func:`sglang_tpu.attention.pallas.gdn.fused_conv1d_gdn`:
+:func:`sglang_tpu.kernels.ops.attention.gdn.fused_conv1d_gdn`:
 
 * ``conv``:      ``[size + 1, kernel_size - 1, 1, conv_dim]`` (one per layer)
 * ``recurrent``: ``[size + 1, num_v_heads, d_k, d_v]``        (one per layer)
@@ -357,7 +357,7 @@ class TpuMambaPool(MambaPool):
                     0, track_slots[valid].long(), state.index_select(0, src)
                 )
             return
-        from sglang_tpu.mamba_state_copy import (
+        from sglang_tpu.kernels.ops.mamba.mamba_state_copy import (
             compiled_state_copy,
             copy_bucket_size,
         )
@@ -375,7 +375,7 @@ class TpuMambaPool(MambaPool):
     def warmup_snapshot_checkpoints(self, batch_size: int, track_grid: int) -> None:
         """Compile and load the post-verify radix snapshot for one padded batch size."""
         from sglang.srt.compilation.compiled_op import warmup_compiled_op
-        from sglang_tpu.mamba_state_copy import copy_bucket_size
+        from sglang_tpu.kernels.ops.mamba.mamba_state_copy import copy_bucket_size
 
         req_pool_indices = torch.zeros(
             batch_size, dtype=torch.int64, device=self.device
@@ -436,7 +436,7 @@ class TpuMambaPool(MambaPool):
                     0, dst_indices.long(), state.index_select(0, src_indices.long())
                 )
             return
-        from sglang_tpu.mamba_state_copy import (
+        from sglang_tpu.kernels.ops.mamba.mamba_state_copy import (
             compiled_state_copy,
             copy_bucket_size,
         )
@@ -460,7 +460,7 @@ class TpuMambaPool(MambaPool):
             return
         from torch_tpu._internal.sync.sync import synchronize
 
-        from sglang_tpu.mamba_state_copy import (
+        from sglang_tpu.kernels.ops.mamba.mamba_state_copy import (
             compiled_state_copy,
             copy_bucket_size,
         )

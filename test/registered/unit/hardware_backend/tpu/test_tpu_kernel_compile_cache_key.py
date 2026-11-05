@@ -37,10 +37,10 @@ class TestKernelInputsDigest(CustomTestCase):
 
     def setUp(self):
         self.root = Path(enter_scope(self, tempfile.TemporaryDirectory()))
-        self.write("sglang_tpu/kv_page_write.py", "out = pages\n")
-        self.write("sglang_tpu/attention/pallas/kernel.py", "block = 128\n")
+        self.write("sglang_tpu/kernels/ops/kvcache/kv_page_write.py", "out = pages\n")
+        self.write("sglang_tpu/kernels/ops/attention/kernel.py", "block = 128\n")
         self.write(
-            "sglang_tpu/moe/pallas/gmm.py",
+            "sglang_tpu/kernels/ops/moe/gmm.py",
             "FP32 = tpu_envs.SGLANG_TPU_FP8_MOE_FP32_SCALES.get()\n",
         )
         self.write(
@@ -95,9 +95,9 @@ class TestKernelInputsDigest(CustomTestCase):
 
     def test_kernel_source_edits_change_the_digest(self):
         for path in (
-            "sglang_tpu/kv_page_write.py",
-            "sglang_tpu/attention/pallas/kernel.py",
-            "sglang_tpu/moe/pallas/gmm.py",
+            "sglang_tpu/kernels/ops/kvcache/kv_page_write.py",
+            "sglang_tpu/kernels/ops/attention/kernel.py",
+            "sglang_tpu/kernels/ops/moe/gmm.py",
             "sglang/srt/layers/moe/tpu_moe_utils.py",
         ):
             with self.subTest(path=path):
@@ -112,8 +112,8 @@ class TestKernelInputsDigest(CustomTestCase):
         (self.root / "sglang_tpu/kernels/new_kernel.py").unlink()
 
         # Moving a file changes the key even with identical contents.
-        old = self.root / "sglang_tpu/attention/pallas/kernel.py"
-        old.rename(self.root / "sglang_tpu/attention/pallas/renamed.py")
+        old = self.root / "sglang_tpu/kernels/ops/attention/kernel.py"
+        old.rename(self.root / "sglang_tpu/kernels/ops/attention/renamed.py")
         self.assertNotEqual(self.digest(), self.base)
 
     def test_code_outside_the_kernel_sources_is_left_to_the_fx_key(self):

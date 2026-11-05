@@ -29,7 +29,7 @@ from sglang.srt.layers.rotary_embedding.yarn import YaRNScalingRotaryEmbedding
 from sglang_tpu.dflash_draft_kv_write import (
     get_contiguous_slot_spans,
 )
-from sglang_tpu.kv_fused_rope_write import (
+from sglang_tpu.kernels.ops.kvcache.kv_fused_rope_write import (
     fused_rope_write_kv,
     fused_rope_write_kv_ref,
 )

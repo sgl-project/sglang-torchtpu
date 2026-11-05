@@ -13,7 +13,7 @@ so it is worth pinning directly: ``[bs, bs, bs]`` for a pure-decode batch,
 int32, and cached per ``(is_decode, bs, device)``.
 
 Kernel/numerics (including mixed prefill+decode batches) are gated on TPU by
-``test/registered/tpu/unit/test_gdn_attention_v3.py`` (kernel vs. eager reference)
+``test/registered/tpu/kernels/ops/attention/test_gdn_attention_v3.py`` (kernel vs. eager reference)
 and ``test_gdn_attention_op.py`` (bridge op + state write-back). This file only
 pins the CPU-side metadata contract.
 
@@ -330,7 +330,7 @@ class TestGDNRequestTilePadding(CustomTestCase):
     def test_partial_verify_tiles_have_inert_metadata_rows(self):
         import jax.numpy as jnp
 
-        from sglang_tpu.attention.pallas.gdn.metadata import (
+        from sglang_tpu.kernels.ops.attention.gdn.metadata import (
             compute_batched_seq_metadata,
         )
 

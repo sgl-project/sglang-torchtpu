@@ -35,7 +35,9 @@ from sglang_tpu.fp8_linear import (
     static_fp8_gemv_enabled,
     static_fp8_gemv_with_weight,
 )
-from sglang_tpu.kernels.static_fp8_gemv import MAX_TOKENS as STATIC_FP8_GEMV_MAX_TOKENS
+from sglang_tpu.kernels.ops.gemm.static_fp8_gemv import (
+    MAX_TOKENS as STATIC_FP8_GEMV_MAX_TOKENS,
+)
 from sglang_tpu.kimi_k3 import STATIC_FP8_PARTS as PARTS
 from sglang_tpu.kimi_k3 import static_fp8_parts as selected_parts
 from sglang_tpu.kimi_k3.host_split_op import host_split_op
@@ -98,7 +100,7 @@ def _release(*linears: nn.Module) -> int:
 
 class HostSplitFront(NamedTuple):
     """Single-token MoE front split across the ranks of a host: one kernel
-    (sglang_tpu/kernels/host_split_gemv.py) runs this rank's latent down-proj columns
+    (sglang_tpu/kernels/ops/gemm/host_split_gemv.py) runs this rank's latent down-proj columns
     and shared gate_up in one fp8 GEMV, its router-gate experts in bf16, and
     the host exchange. Returns (latent, router logits, shared gate_up)."""
 

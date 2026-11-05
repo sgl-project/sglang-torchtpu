@@ -294,7 +294,7 @@ export SGLANG_TPU_INT4_MOE_MODE=vmem-fp8
 
 This mode keeps packed INT4 expert weights in HBM. At load time it prepares
 normalized group scales and output-channel scales. The existing
-`sglang/srt/layers/moe/pallas/gmm_v2.py` unpacks and scales each weight tile in
+`sglang_tpu/kernels/ops/moe/gmm_v2.py` unpacks and scales each weight tile in
 VMEM, converts it to FP8, and multiplies it by activations quantized in K=512
 groups. It restores output-channel scales before the optional fused activation.
 This is W4A8 compute with BF16 partial accumulation; no second GMM implementation

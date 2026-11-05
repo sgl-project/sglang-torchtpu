@@ -39,18 +39,18 @@ import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.attention.pallas import dsa_index_topk as dit
-from sglang_tpu.attention.pallas import mla_sparse_fused as mfs
-from sglang_tpu.attention.pallas.dsa_key_store import store_keys_pallas
-from sglang_tpu.attention.pallas.mla_sparse import kv_cache_utils as kcu
-from sglang_tpu.attention.pallas.mla_sparse.kernel import (
-    TENSORCORE_CACHE_LAYOUT,
-    sparse_ragged_paged_attention,
-)
-from sglang_tpu.attention.pallas.util import quantize_fp8_ue8m0
 from sglang_tpu.k3_megakernel.config import Topology
 from sglang_tpu.k3_megakernel.kernel.stages import dsa as D
 from sglang_tpu.k3_megakernel.kernel.stages.mla import SM_SCALE, MlaStage
+from sglang_tpu.kernels.ops.attention import dsa_index_topk as dit
+from sglang_tpu.kernels.ops.attention import mla_sparse_fused as mfs
+from sglang_tpu.kernels.ops.attention.dsa_key_store import store_keys_pallas
+from sglang_tpu.kernels.ops.attention.mla_sparse import kv_cache_utils as kcu
+from sglang_tpu.kernels.ops.attention.mla_sparse.kernel import (
+    TENSORCORE_CACHE_LAYOUT,
+    sparse_ragged_paged_attention,
+)
+from sglang_tpu.kernels.ops.attention.util import quantize_fp8_ue8m0
 
 H, DH, K = D.HEADS, D.HEAD_DIM, D.TOPK
 WEIGHT_SCALE = DH**-0.5

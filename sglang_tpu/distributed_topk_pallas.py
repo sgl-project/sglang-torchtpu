@@ -7,10 +7,10 @@ from threading import Lock
 
 import torch
 
-from sglang_tpu.kernels.distributed_topk import (
+from sglang_tpu.kernels.ops.sampling.distributed_topk import (
     SUPPORTED_WORLD_SIZES,
 )
-from sglang_tpu.kernels.distributed_topk import (
+from sglang_tpu.kernels.ops.sampling.distributed_topk import (
     distributed_top_k as distributed_top_k_kernel,
 )
 

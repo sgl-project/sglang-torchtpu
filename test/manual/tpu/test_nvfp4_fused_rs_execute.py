@@ -193,8 +193,8 @@ def main() -> None:
     from sglang_tpu.fp4_moe import (
         prepare_tpu_nvfp4_moe_weights,
     )
-    from sglang_tpu.moe.pallas import fused_moe_rs_op
-    from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
+    from sglang_tpu.kernels.ops.moe import fused_moe_rs_op
+    from sglang_tpu.kernels.ops.moe.fused_moe_op import fused_moe_call
 
     global_experts = 256
     local_experts = global_experts // world_size

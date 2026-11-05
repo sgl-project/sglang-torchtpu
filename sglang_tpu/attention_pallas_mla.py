@@ -2,7 +2,7 @@
 """Pallas MLA (Multi-head Latent Attention) backend for the TPU torch_tpu platform.
 
 Wraps the JAX/Pallas MLA v2 ragged-paged-attention kernel
-(``sglang_tpu.attention.pallas.mla_ragged_paged_attention_v2``, vendored
+(``sglang_tpu.kernels.ops.attention.mla_ragged_paged_attention_v2``, vendored
 from sglang-jax, itself adapted from vllm/tpu-inference) and exposes it as a
 PyTorch custom op, mirroring ``attention_pallas_rpa_v3``. Selected via
 ``--attention-backend pallas_tpu_mla``; used by MLA models (DeepSeek V2/V3).
@@ -78,7 +78,7 @@ def _build_pallas_mla_kernel_op():
     import jax  # noqa: F401  (force loud failure if JAX is missing)
     from torch_tpu._internal import pallas as _torch_pallas
 
-    from sglang_tpu.attention.pallas.mla_ragged_paged_attention_v2 import (
+    from sglang_tpu.kernels.ops.attention.mla_ragged_paged_attention_v2 import (
         mla_ragged_paged_attention as _jax_mla,
     )
 

@@ -39,7 +39,6 @@ MODULE_SCAN_ROOT = "python/sglang"
 #: Re-export shims at the vacated paths; they import the plugin by design.
 SHIM_PATHS = (
     "python/sglang/srt/hardware_backend/tpu/",
-    "python/sglang/srt/layers/attention/pallas/",
     "python/sglang/srt/layers/moe/pallas/",
     "python/sglang/srt/disaggregation/tpu/",
     "python/sglang/srt/disaggregation/raiden/",

@@ -61,7 +61,7 @@ def _runtime(backend="pallas_tpu_fused_rs", pp_size=1, ep_size=1):
         # The sys.modules patch drops modules first imported inside it, so resolve
         # the live module; Python 3.10's patch("a.b.c") can hit a stale a.b.
         for module, name in (
-            ("sglang_tpu.moe.pallas.fused_moe_rs_op", "_build_fused_moe_rs_op"),
+            ("sglang_tpu.kernels.ops.moe.fused_moe_rs_op", "_build_fused_moe_rs_op"),
             ("sglang_tpu.oneshot_collectives", "get_oneshot_all_gather_op"),
         ):
             stack.enter_context(patch.object(importlib.import_module(module), name))
@@ -127,7 +127,7 @@ class TestBf16MoeFusedRs(CustomTestCase):
             method.moe_runner_config = layer.moe_runner_config
             method.process_weights_after_loading(layer)
             with patch(
-                "sglang_tpu.moe.pallas.fused_moe_rs_op.fused_moe_rs_gather",
+                "sglang_tpu.kernels.ops.moe.fused_moe_rs_op.fused_moe_rs_gather",
                 return_value=x * 3,
             ) as kernel:
                 result = method.forward_tpu(layer, dispatch)

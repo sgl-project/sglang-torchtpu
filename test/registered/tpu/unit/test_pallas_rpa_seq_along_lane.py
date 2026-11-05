@@ -31,12 +31,12 @@ class TestKvLayoutSelection(CustomTestCase):
     """One flag picks the layout, and the KV pool has to follow it."""
 
     def test_defaults_to_token_major(self):
-        from sglang_tpu.attention.pallas.batched_rpa import configs
+        from sglang_tpu.kernels.ops.attention.batched_rpa import configs
 
         self.assertEqual(kv_layout(), configs.KVLayout.HEAD_ALONG_SUBLANE)
 
     def test_flag_selects_seq_along_lane(self):
-        from sglang_tpu.attention.pallas.batched_rpa import configs
+        from sglang_tpu.kernels.ops.attention.batched_rpa import configs
 
         with envs.SGLANG_TPU_USE_SEQ_ALONG_LANE_KV.override(True):
             self.assertEqual(kv_layout(), configs.KVLayout.SEQ_ALONG_LANE)
@@ -206,7 +206,7 @@ class TestPrefillBlockSizes(CustomTestCase):
     ):
         import jax.numpy as jnp
 
-        from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
+        from sglang_tpu.kernels.ops.attention.batched_rpa import configs, wrapper
         from sglang_tpu.pallas_export import (
             tpu_info_for_cpu_export,
         )
@@ -362,7 +362,7 @@ class TestKernelBlockSizes(CustomTestCase):
     ):
         import jax.numpy as jnp
 
-        from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
+        from sglang_tpu.kernels.ops.attention.batched_rpa import configs, wrapper
         from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
         num_q_heads, num_kv_heads, head_dim, cp_group_size = geometry
@@ -394,7 +394,7 @@ class TestKernelBlockSizes(CustomTestCase):
         keys from the wrong pages from its second block on."""
         import jax.numpy as jnp
 
-        from sglang_tpu.attention.pallas.batched_rpa import configs
+        from sglang_tpu.kernels.ops.attention.batched_rpa import configs
 
         layouts = (configs.KVLayout.HEAD_ALONG_SUBLANE, configs.KVLayout.SEQ_ALONG_LANE)
         for page_size, kv_layout, dtype_kv, geometry in itertools.product(
@@ -422,7 +422,7 @@ class TestKernelBlockSizes(CustomTestCase):
         the kernel reads bq_sz == 1 as a decode-only block."""
         import jax.numpy as jnp
 
-        from sglang_tpu.attention.pallas.batched_rpa import configs
+        from sglang_tpu.kernels.ops.attention.batched_rpa import configs
 
         shrunk = 0
         for vmem_mib in range(30, 46):
@@ -445,7 +445,7 @@ class TestKernelBlockSizes(CustomTestCase):
         cached pages; a prefill-only call reads none."""
         import jax.numpy as jnp
 
-        from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
+        from sglang_tpu.kernels.ops.attention.batched_rpa import configs, wrapper
         from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
         page_size, num_seqs, pages_per_seq = 512, 4, 4
@@ -502,7 +502,7 @@ class TestKernelBlockSizes(CustomTestCase):
         import jax
         import jax.numpy as jnp
 
-        from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
+        from sglang_tpu.kernels.ops.attention.batched_rpa import configs, wrapper
         from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
         page_size, num_seqs, pages_per_seq, vmem_limit_bytes = 256, 4, 2, 1 << 20
@@ -545,7 +545,7 @@ class TestKernelBlockSizes(CustomTestCase):
         answered with a buffer count below one."""
         import jax.numpy as jnp
 
-        from sglang_tpu.attention.pallas.batched_rpa import configs
+        from sglang_tpu.kernels.ops.attention.batched_rpa import configs
 
         for vmem_limit_bytes in (1 << 18, 1 << 19, 1 << 20, 1 << 21):
             with self.subTest(vmem_limit_bytes=vmem_limit_bytes):

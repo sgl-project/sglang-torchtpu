@@ -62,8 +62,9 @@ sglang_tpu/
   platform.py            TpuOOTPlatform (identity + the gate-required methods)
   tpu_platform.py        TpuSRTPlatform, the in-tree identity (moved here as-is)
   envs.py  hooks/  compat/
-  attention/pallas/      Pallas attention kernels (was layers/attention/pallas)
-  moe/pallas/            Pallas MoE kernels (was layers/moe/pallas)
+  kernels/ops/<group>/   Pallas kernels by computation (attention, moe, gemm,
+                         communication, sampling, layernorm, kvcache, mamba);
+                         tests in test/registered/tpu/kernels/ops/<group>/
   disaggregation/{tpu,raiden}/
   graph_runner/          decode graph runner + ViT compile runners
   <everything else>      was python/sglang/srt/hardware_backend/tpu/
@@ -71,7 +72,8 @@ sglang_tpu/
 
 The old paths under `python/sglang/srt/` are one-file re-export shims so
 in-flight branches keep importing; they are deleted once the open-PR backlog
-drains. Do not add code to them.
+drains. Do not add code to them. The kernel shims are gone except
+`srt/layers/moe/pallas/{fused_moe_op,gmm_v2}`, which core `mxfp4_tpu_util` needs.
 
 `tools/plugin/inventory.py` lists every hook and runtime patch with the core
 attributes it replaces; `tools/plugin/scoreboard.py` prints every debt counter
@@ -84,12 +86,20 @@ of the migration. The TPU Plugin Scoreboard workflow publishes both daily.
    inside an `is_tpu()` guard is tolerated during the migration and counted by
    the ratchet lint (`tools/plugin/check_tpu_branches.py`); the baseline may
    only go down.
-3. Prefer, in order: an existing platform method or capability flag; a registry
+3. Kernels (anything launching a Pallas kernel) go in `kernels/ops/<group>/`, grouped
+   by computation as in upstream `sglang.kernels.ops` (`deepseek_v41/` predates
+   the split and counts as its own group). A kernel imports only its own group,
+   `vmem_limit`, `envs`, `pallas_export`, `pallas_jax_op` and `_logging`;
+   custom-op registration, layers and backends live outside and call in. Tests
+   in `test/registered/tpu/kernels/` follow the same rule (plus `sglang.test`).
+   `tools/plugin/check_tpu_kernel_layout.py` enforces this against a baseline
+   that may only shrink.
+4. Prefer, in order: an existing platform method or capability flag; a registry
    populated from `init_backend()` (`register_attention_backend`,
    `BaseFusedOp.register_oot_forward`); a resolution hook; subclass-and-override
    through a factory; a seam PR upstream carried as a `hooks/` entry until it
    merges. A new `is_tpu()` branch in core needs a linked upstream seam issue.
-4. Env vars: declare new TPU-only variables in `sglang_tpu/envs.py`. The
+5. Env vars: declare new TPU-only variables in `sglang_tpu/envs.py`. The
    existing `SGLANG_TPU_*` entries stay in `sglang.srt.environ` until their
    core readers move; never declare one name in both registries.
 

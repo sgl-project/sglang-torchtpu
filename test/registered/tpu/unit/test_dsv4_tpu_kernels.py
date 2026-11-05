@@ -438,7 +438,7 @@ class TestDSV4TPUPallasKernels(CustomTestCase):
             _dequantize_dsv4_mxfp4_block32,
             prepare_tpu_fp8_moe_weights,
         )
-        from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
+        from sglang_tpu.kernels.ops.moe.fused_moe_op import fused_moe_call
 
         enter_scope(self, get_parallel().override(tp_size=1))
         override = get_context().override_server_args(

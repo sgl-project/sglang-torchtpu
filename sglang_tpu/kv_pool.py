@@ -448,7 +448,7 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         layer buffer in place; a page that ``indices`` only partly covers is
         read back first and merged on device.
         """
-        from sglang_tpu.kv_page_write import write_pages_torch
+        from sglang_tpu.kernels.ops.kvcache.kv_page_write import write_pages_torch
         from sglang_tpu.raiden_kv_backup import (
             RaidenKVBackupHandle,
         )
@@ -765,7 +765,7 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
         """Restore host rows with page-bounded device writes."""
-        from sglang_tpu.kv_page_write import write_pages_torch
+        from sglang_tpu.kernels.ops.kvcache.kv_page_write import write_pages_torch
         from sglang_tpu.raiden_kv_backup import (
             RaidenKVBackupHandle,
         )
@@ -926,7 +926,7 @@ class TpuBlockMajorMHATokenToKVPool(TpuFusedMHATokenToKVPool):
         # Regroups into full bundle rows and writes directly to kv_bundle via
         # write_pages_torch; the op donates its destination buffer, so mutating
         # a view would not update the bundle.
-        from sglang_tpu.kv_page_write import write_pages_torch
+        from sglang_tpu.kernels.ops.kvcache.kv_page_write import write_pages_torch
         from sglang_tpu.raiden_kv_backup import RaidenKVBackupHandle
 
         if isinstance(kv_cache_cpu, RaidenKVBackupHandle):

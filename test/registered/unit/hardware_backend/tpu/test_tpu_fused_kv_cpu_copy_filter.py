@@ -229,7 +229,7 @@ class TestKvPageWriteKernel(CustomTestCase):
     def test_kernel_writes_only_listed_blocks(self):
         import jax.numpy as jnp
 
-        from sglang_tpu.kv_page_write import write_pages
+        from sglang_tpu.kernels.ops.kvcache.kv_page_write import write_pages
 
         kv = jnp.arange(6 * 4 * 2 * 1 * 8, dtype=jnp.float32).reshape(6, 4, 2, 1, 8)
         kv = kv.astype(jnp.bfloat16)
