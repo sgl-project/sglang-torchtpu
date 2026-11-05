@@ -14,6 +14,7 @@ from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state imp
 from sglang.srt.model_executor.pool_configurator import (
     DefaultPoolConfigurator,
     HybridSWAPoolConfigurator,
+    SWAChunkCapPoolConfigurator,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -280,9 +281,55 @@ class TestHiddenPoolKvBudget(CustomTestCase):
             )
         self.assertEqual(configurator._cell_size, 1000)
 
+    def test_hybrid_swa_counts_the_row_per_full_token(self):
+        row = PdHiddenPool.bytes_per_token(
+            feature_size=FEATURE,
+            total_kv_heads=KV_HEADS,
+            attn_tp_size=1,
+            dtype=torch.bfloat16,
+        )
+        # A windowed draft: its KV lives in the SWA slots, so _draft_cell_size is 0.
+        configurator = budget_pd_hidden_pool(_hybrid_swa_configurator(), _kvc())
+        self.assertEqual(configurator._draft_cell_size, row)
+        self.assertEqual(
+            configurator._cell_size, _hybrid_swa_configurator()._cell_size + row
+        )
+
     def test_a_budget_it_cannot_size_is_rejected(self):
-        with self.assertRaisesRegex(NotImplementedError, "HybridSWAPoolConfigurator"):
-            budget_pd_hidden_pool(_configurator(HybridSWAPoolConfigurator), _kvc())
+        for configurator in (
+            _hybrid_swa_configurator(SWAChunkCapPoolConfigurator),
+            _hybrid_swa_configurator(full_layers=0),
+            _hybrid_swa_configurator(unified=True),
+        ):
+            with self.assertRaisesRegex(
+                NotImplementedError, type(configurator).__name__
+            ):
+                budget_pd_hidden_pool(configurator, _kvc())
+
+
+def _hybrid_swa_configurator(
+    cls=HybridSWAPoolConfigurator, *, full_layers: int = 4, unified: bool = False
+):
+    configurator = object.__new__(cls)
+    fields = dict(
+        _full_per_token=100,
+        _full_layers_num=full_layers,
+        _swa_per_token=100,
+        _swa_layers_num=12,
+        _swa_full_tokens_ratio=0.0625,
+        _draft_full_per_token=50,
+        _draft_full_layers_num=0,
+        _draft_swa_per_token=50,
+        _draft_swa_layers_num=0,
+        _draft_swa_full_layers_num=0,
+        _draft_cell_size=0,
+        _draft_swa_cell_size=300,
+        _enable_unified_memory=unified,
+    )
+    for name, value in fields.items():
+        setattr(configurator, name, value)
+    configurator._recompute_cell_size()
+    return configurator
 
 
 class TestOverlongPromptAbort(CustomTestCase):

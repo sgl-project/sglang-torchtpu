@@ -8,8 +8,8 @@ serves DSPARK and DFLASH on the TPU KDA checkpoint verify, so it skips both.
 materialize_future_map: the live FutureMap's lazy torch.empty buffers would fuse
 into their first store, compiling at whatever shape the first batch has.
 budget_pd_hidden_pool: the KV budget does not know the PD hidden pool built after
-it (SGLANG_TPU_PD_DECODE_DRAFT_PREFILL); add its bytes per token to the default
-configurator's cell size and reject the configurators it does not size.
+it (SGLANG_TPU_PD_DECODE_DRAFT_PREFILL); add its bytes per full-pool token to the
+default or hybrid SWA configurator and reject the configurators it does not size.
 reject_overlong_pd_draft_prompt: the decode's draft prompt pass takes a whole
 prompt in one extend bucket; abort a longer one at admission, before its KV transfer.
 Upstream seam issue: not filed (local prototype). Before proposing upstream,
@@ -415,7 +415,10 @@ def kimi_spec_defaults(original, server_args):
 
 def budget_pd_hidden_pool(result, kvc):
     """Count the PD hidden pool in the KV budget of the server that builds it."""
-    from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+    from sglang.srt.model_executor.pool_configurator import (
+        DefaultPoolConfigurator,
+        HybridSWAPoolConfigurator,
+    )
     from sglang.srt.runtime_context import get_parallel
     from sglang_tpu.experimental import pd_decode_draft_prefill
     from sglang_tpu.experimental.speculative.pd_draft_prefill import (
@@ -432,15 +435,28 @@ def budget_pd_hidden_pool(result, kvc):
         or parallel.pp_rank != parallel.pp_size - 1
     ):
         return result
-    if type(result) is not DefaultPoolConfigurator:
-        raise NotImplementedError(
-            "SGLANG_TPU_PD_DECODE_DRAFT_PREFILL sizes its hidden pool in the default "
-            f"KV budget only, not {type(result).__name__}; pass "
-            "--disable-hybrid-swa-memory."
-        )
-    result._cell_size += pd_hidden_bytes_per_token(
+    hidden_bytes = pd_hidden_bytes_per_token(
         kvc.spec_aux_config, kvc.model_config, kvc.model_dtype
     )
+    if type(result) is DefaultPoolConfigurator:
+        result._cell_size += hidden_bytes
+    elif (
+        type(result) is HybridSWAPoolConfigurator
+        and result._full_layers_num > 0
+        and not result._enable_unified_memory
+    ):
+        # The rows page like the full-attention pool, so they cost per full token;
+        # _draft_cell_size is the full-token term outside the SWA ratio.
+        result._draft_cell_size += hidden_bytes
+        result._recompute_cell_size()
+    else:
+        # SWAChunkCap and unified memory size the full pool outside _cell_size, and
+        # an all-SWA pool has no full pages; the TPU unified pool rejects PD itself.
+        raise NotImplementedError(
+            "SGLANG_TPU_PD_DECODE_DRAFT_PREFILL sizes its hidden pool in the default "
+            "or non-unified hybrid SWA KV budget with full-attention layers, not "
+            f"{type(result).__name__}."
+        )
     return result
 
 
