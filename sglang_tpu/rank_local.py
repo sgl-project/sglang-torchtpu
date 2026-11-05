@@ -84,16 +84,20 @@ def rank_slice(
     if traced is None:
         return tensor.tensor_split(parts, dim)[rank]
     mesh_size = len(get_device_assignment())
-    supported = (rank_stride == 1 and parts == 2) or parts * rank_stride == mesh_size
-    if rank_stride < 1 or not supported or tensor.shape[dim] % parts:
-        raise ValueError("rank_slice requires an evenly divided full-mesh dimension")
+    if (
+        rank_stride < 1
+        or parts < 1
+        or (not (rank_stride == 1 and parts == 2) and mesh_size % (parts * rank_stride))
+        or tensor.shape[dim] % parts
+    ):
+        raise ValueError("rank_slice requires evenly divided contiguous rank groups")
     selected_rank = dist.get_rank()
     if rank_to_device is not None:
         if sorted(rank_to_device) != list(range(mesh_size)):
             raise ValueError("rank_to_device must be a full-mesh permutation")
         selected_rank = rank_to_device[selected_rank]
     if rank != selected_rank // rank_stride % parts:
-        raise ValueError("Rank inputs require full-mesh logical rank order")
+        raise ValueError("Rank inputs require contiguous logical rank order")
     # RoPE positions are int64; JAX's default export would narrow them to int32.
     with jax.enable_x64():
         return _slice_op(rank_to_device)(tensor, traced, dim, parts, rank_stride)

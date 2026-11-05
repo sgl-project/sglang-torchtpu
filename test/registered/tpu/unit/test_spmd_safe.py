@@ -26,6 +26,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.compilation import spmd_compiler
 from sglang_tpu.compilation.direct_compile import direct_compile
 from sglang_tpu.compilation.warmup_queue import collect_warmups
+from sglang_tpu.rank_local import rank_slice
 from sglang_tpu.testing.spmd_safe import run_recipes, verify_startup
 
 register_tpu_ci(
@@ -282,13 +283,14 @@ def _run_subgroup_checks(group, device_group) -> None:
     rank, size = dist.get_rank(group), dist.get_world_size(group)
     engine = dist.get_rank() // size
     traced = []
-    value = torch.full(
-        (128, 128), dist.get_rank() + 1, dtype=torch.float32, device="tpu"
-    )
+    value = (
+        torch.arange(128 * size, dtype=torch.float32).repeat(128, 1)
+        + (dist.get_rank() + 1) * 128 * size
+    ).to("tpu")
 
     def forward(value, factor):
         traced.append(factor)
-        result = value * factor + engine
+        result = rank_slice(value, -1, size, rank) * factor + engine
         dist.all_reduce(result, group=device_group)
         return result
 
@@ -297,6 +299,7 @@ def _run_subgroup_checks(group, device_group) -> None:
         specialization_key=lambda value, factor: factor,
         name="test/subgroup.forward",
         spmd_safe=True,
+        lift_rank=True,
     )
     factors = (2, 3, 4)
     with get_context().override_server_args(use_spmd_compile=True):
@@ -308,9 +311,9 @@ def _run_subgroup_checks(group, device_group) -> None:
         )
         for factor in factors:
             total = sum(range(engine * size + 1, (engine + 1) * size + 1))
-            expected = torch.full(
-                (128, 128), total * factor + engine * size, dtype=torch.float32
-            )
+            columns = torch.arange(128, dtype=torch.float32) * size
+            total = columns + 128 * sum(range(size)) + total * 128 * size
+            expected = (total * factor + engine * size).repeat(128, 1)
             checks.assertTrue(torch.equal(compiled(value, factor).cpu(), expected))
     print(f"SPMD subgroup {engine} rank {rank}: shared collectives passed", flush=True)
 
