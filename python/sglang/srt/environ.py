@@ -669,6 +669,10 @@ class Envs:
     # Decode steps before the next chunk of a prompt left mid-prefill; unset waits the full
     # --prefill-decode-interval, so a long prompt's TTFT grows by one interval per chunk.
     SGLANG_PREFILL_DECODE_INTERVAL_CHUNKED = EnvInt(None)
+    # "TARGET:MIN": while fewer than TARGET requests decode and prefill work waits, the
+    # --prefill-decode-interval ends after MIN decode steps, so admission fills the decode
+    # batch; at TARGET or more running the full interval applies. Admission order is unchanged.
+    SGLANG_PREFILL_DECODE_INTERVAL_ADAPTIVE = EnvStr(None)
     # Force delay_sample_func for all overlap decode (not just grammar mode),
     # allowing CPU result processing to overlap with subsequent forward computation
     # and reducing the impact of sampling overhead on the critical path.
@@ -841,6 +845,19 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # After a TP-wide HiCache ack poll in which no rank had a ready ack, poll only every
+    # this many scheduler steps until a poll finds one (then every step again); ranks stay
+    # in lockstep. 0 or 1 polls every step. Applies without PP, storage or linker only.
+    SGLANG_HICACHE_QUIET_SYNC_EVERY = EnvInt(0)
+    # Log one line per admitted request that must compute at least this many prompt
+    # tokens: its Full-KV hit (device + host), the hit after the sliding-window check,
+    # the host load-back promised vs loaded, and the final prefix. 0 disables (log-only).
+    SGLANG_RECOMPUTE_DIAG_MIN_TOKENS = EnvInt(0)
+    # SWA host pool eviction: first evict windows that a later match walked past to a
+    # deeper usable point (superseded turn ends, stride checkpoints of active paths),
+    # then fall back to LRU. An idle session's last turn-end window is never walked
+    # past, so it outlives them.
+    SGLANG_HICACHE_SWA_HOST_EVICT_PASSED_FIRST = EnvBool(False)
     # Hybrid-SWA host pools: fraction of --hicache-size given to the SWA pool. Unset splits
     # by device pool bytes; a cached prefix needs only its last window of SWA KV.
     SGLANG_HICACHE_SWA_HOST_FRACTION = EnvFloat(None)
@@ -1491,6 +1508,9 @@ class Envs:
     # With --enable-mixed-chunk, a decoding request joins a mixed batch with its whole
     # DFLASH verify block (drafted first) instead of a single-token decode.
     SGLANG_DFLASH_MIXED_VERIFY = EnvBool(False)
+    # A spec tail that finishes inside a mixed batch commits its last run before its KV
+    # is released, as in decode; without it the radix tree misses the run's tokens.
+    SGLANG_MIXED_TAIL_COMMIT_ON_FINISH = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
