@@ -8,20 +8,42 @@ import jax
 import jax.numpy as jnp
 import torch
 
-from sglang_tpu.dsv41.kernels.cache import (
+from sglang_tpu.kernels.deepseek_v4.o_projection import wo_a_projection
+from sglang_tpu.kernels.deepseek_v41.csa2.cache import (
     prepare_main_records,
     prepare_swa_metadata,
     swa_word_pages,
 )
-from sglang_tpu.dsv41.kernels.csa2 import csa2, csa2_gather_chunk_size, csa2_pipeline
-from sglang_tpu.dsv41.kernels.o_projection import wo_a_projection
-from sglang_tpu.kernels.index_selection.packed_fp8_cache import PackedFP8Layout
-from sglang_tpu.kernels.index_selection.selection import (
-    RequestCandidates,
-    prepare_selection,
-    select_dense,
-    select_prepared,
+from sglang_tpu.kernels.deepseek_v41.csa2.csa2 import (
+    csa2,
+    csa2_gather_chunk_size,
+    csa2_pipeline,
 )
+from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.cache import PackedFP8Layout
+from sglang_tpu.kernels.deepseek_v41.index_selection.selection import (
+    prepare_fp8_candidates,
+    select_fp8_indexer_jax,
+    select_fp8_prepared,
+)
+
+# Candidate scoring gathers whole blocks; the epic route supports these sizes.
+PREPARED_BLOCK_SIZES = (8, 16, 32, 64, 128)
+
+
+def uses_prepared_candidates(candidate_count, block_size, score_width):
+    """Static epic routing: rescore gathered candidates only when they filter.
+
+    When the candidates cover the whole context, publication returns its input
+    unchanged and filtering is an identity, so consumers score densely.
+    """
+    return (
+        block_size in PREPARED_BLOCK_SIZES
+        and 0 < candidate_count * block_size < score_width
+    )
+
+
+def _layout_args(layout):
+    return (layout.pages, layout.page_stride, layout.page_offset, layout.page_size)
 
 
 def inverse_rope(cos_sin, positions):
@@ -63,23 +85,34 @@ def select(
     topk: int,
     block_size: int,
     publish: bool,
+    filter_candidates: bool,
     layer_id: int,
 ) -> tuple[jax.Array, jax.Array]:
+    """Dense paged scoring: sources, unfiltered layers and covering consumers.
+
+    Selections are unordered with -1 at the tail, the valid prefix that
+    prepare_main_records requires (the epic FP8 path's precompacted records).
+    """
     del layer_id
     physical, layout = index_geometry(words, pages, page_records, storage_records)
-    return select_dense(
+    live = (requests >= 0) & (requests < pages.shape[0])
+    batch_max = jnp.max(jnp.where(live, lengths, 0), initial=0).reshape(1)
+    return select_fp8_indexer_jax(
         q,
-        weights,
         (words,),
         physical,
-        requests,
+        weights,
         lengths,
         candidates,
-        layout=layout,
-        score_width=pages.shape[1] * page_records,
-        topk=topk,
-        block_size=block_size,
-        publish=publish,
+        requests,
+        batch_max,
+        _layout_args(layout),
+        topk,
+        block_size,
+        publish,
+        filter_candidates,
+        True,
+        pages.shape[1] * page_records,
     )
 
 
@@ -87,28 +120,25 @@ def prepare_index(
     words: jax.Array,
     pages: jax.Array,
     requests: jax.Array,
-    lengths: jax.Array,
     candidates: jax.Array,
     page_records: int,
     storage_records: int,
-    topk: int,
     block_size: int,
-    max_queries: int,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Gather each query pair's candidate union once per K source and publication.
+
+    Requires each request's query rows to be contiguous, as both forward modes
+    build them; invalid rows (-1) may follow.
+    """
     physical, layout = index_geometry(words, pages, page_records, storage_records)
-    return tuple(
-        prepare_selection(
-            (words,),
-            physical,
-            requests,
-            lengths,
-            candidates,
-            layout=layout,
-            score_width=pages.shape[1] * page_records,
-            topk=topk,
-            block_size=block_size,
-            max_queries_per_request=max_queries,
-        )
+    return prepare_fp8_candidates(
+        (words,),
+        physical,
+        candidates,
+        requests,
+        _layout_args(layout),
+        block_size,
+        pages.shape[1] * page_records,
     )
 
 
@@ -118,11 +148,9 @@ def select_index_prepared(
     lengths: jax.Array,
     keys: jax.Array,
     block_ids: jax.Array,
-    pages: jax.Array,
-    requests: jax.Array,
-    candidates: jax.Array,
+    offsets: jax.Array,
     valid: jax.Array,
-    bypass: jax.Array,
+    spans: jax.Array,
     score_width: int,
     topk: int,
     block_size: int,
@@ -130,14 +158,15 @@ def select_index_prepared(
 ) -> jax.Array:
     # Keep operands flat: cpu_export_jax_op does not map nested torch inputs.
     del layer_id
-    return select_prepared(
+    return select_fp8_prepared(
         q,
         weights,
         lengths,
-        RequestCandidates(keys, block_ids, pages, requests, candidates, valid, bypass),
-        score_width=score_width,
-        topk=topk,
-        block_size=block_size,
+        (keys, block_ids, offsets, valid, spans),
+        topk,
+        block_size,
+        True,
+        score_width,
     )
 
 
@@ -315,41 +344,24 @@ def register_ops():
         topk,
         block_size,
         publish,
+        filter_candidates,
         layer_id,
     ):
-        return lengths.new_empty((q.shape[0], topk)), torch.empty_like(candidates)
+        width = min(topk, pages.shape[1] * page_records)
+        return lengths.new_empty((q.shape[0], width)), torch.empty_like(candidates)
 
     def fake_prepare(
-        words,
-        pages,
-        requests,
-        lengths,
-        candidates,
-        page_records,
-        storage_records,
-        topk,
-        block_size,
-        max_queries,
+        words, pages, requests, candidates, page_records, storage_records, block_size
     ):
-        width = pages.shape[1] * page_records
-        blocks = (width + block_size - 1) // block_size
-        prefix = (min(topk, width) + block_size - 1) // block_size
-        capacity = min(
-            blocks, min(requests.numel(), max_queries) * candidates.shape[1] + prefix
-        )
-        alignment = 128 // block_size
-        capacity = (max(1, capacity) + alignment - 1) // alignment * alignment
-        groups = pages.shape[0]
-        compact_pages = capacity * block_size // 128
-        key_rows = groups * compact_pages * 33 if groups and requests.numel() else 33
+        # Epic indexer_fp8.fake_prepare: one group per query bounds the pairing.
+        tokens, count = candidates.shape
+        key_pages = (2 * count * block_size + 127) // 128
         return (
-            words.new_empty((key_rows, 128)),
-            requests.new_empty((groups, capacity)),
-            pages.new_empty((groups, compact_pages)),
-            torch.empty_like(requests),
-            torch.empty_like(candidates),
-            requests.new_empty(requests.shape, dtype=torch.bool),
-            requests.new_empty((), dtype=torch.bool),
+            words.new_empty((tokens * key_pages * 33, 128)),
+            candidates.new_empty(candidates.shape),
+            requests.new_empty((tokens + 1,)),
+            requests.new_empty((tokens,), dtype=torch.bool),
+            requests.new_empty((tokens, 2)),
         )
 
     def fake_prepared(
@@ -358,17 +370,15 @@ def register_ops():
         lengths,
         keys,
         block_ids,
-        pages,
-        requests,
-        candidates,
+        offsets,
         valid,
-        bypass,
+        spans,
         score_width,
         topk,
         block_size,
         layer_id,
     ):
-        return lengths.new_empty((q.shape[0], topk))
+        return lengths.new_empty((q.shape[0], min(topk, score_width)))
 
     definitions = (
         ("select", select, fake_select),
@@ -398,7 +408,7 @@ class CacheOps(NamedTuple):
 def register_cache_ops():
     import jax
 
-    from sglang_tpu.dsv41.kernels.cache import (
+    from sglang_tpu.kernels.deepseek_v41.csa2.cache import (
         publish_csa2_kv,
         scatter_index_keys,
         write_swa_word_pool,

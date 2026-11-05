@@ -12,6 +12,7 @@ from sglang_tpu.dsv41.custom_ops import (
     publish_source,
     register_cache_ops,
     register_ops,
+    uses_prepared_candidates,
 )
 
 
@@ -132,15 +133,12 @@ class DSV41TPUAttnBackend(DSV4TPUAttnBackend):
             return
         if forward_batch.forward_mode.is_decode_or_idle():
             rows = torch.arange(bs, dtype=torch.int32)
-            metadata.index_max_queries = 1
         elif forward_batch.forward_mode.is_extend_without_speculative():
             lengths = torch.as_tensor(
                 forward_batch.extend_seq_lens_cpu, dtype=torch.int32
             )
             if lengths.numel() < bs:
                 lengths = torch.nn.functional.pad(lengths, (0, bs - lengths.numel()))
-            # Use T rather than a per-batch host value: avoids extra graph variants.
-            metadata.index_max_queries = tokens
             rows = torch.repeat_interleave(
                 torch.arange(bs, dtype=torch.int32), lengths[:bs]
             )
@@ -243,7 +241,10 @@ class DSV41TPUAttnBackend(DSV4TPUAttnBackend):
             # Even no-candidate layers use the same D128 FP8 scorer geometry.
             block_size = max(8, indexer.candidate_block_size)
             words = pool.low_ratio_cache(layer.layer_id, index=True)
-            if consume:
+            score_width = metadata.full_pages.shape[1] * page_records
+            if consume and uses_prepared_candidates(
+                candidates.shape[1], block_size, score_width
+            ):
                 source = pool.source_layer_of(layer.layer_id)
                 cache_key = (
                     source,
@@ -259,13 +260,10 @@ class DSV41TPUAttnBackend(DSV4TPUAttnBackend):
                         words,
                         metadata.full_pages,
                         metadata.index_requests,
-                        lengths,
                         candidates,
                         page_records,
                         storage_records,
-                        self.index_topk,
                         block_size,
-                        metadata.index_max_queries,
                     )
                     metadata.prepared_index[cache_key] = prepared
                 selected = self.ops.select_prepared(
@@ -273,7 +271,7 @@ class DSV41TPUAttnBackend(DSV4TPUAttnBackend):
                     weights,
                     lengths,
                     *prepared,
-                    metadata.full_pages.shape[1] * page_records,
+                    score_width,
                     self.index_topk,
                     block_size,
                     layer.layer_id,
@@ -292,6 +290,7 @@ class DSV41TPUAttnBackend(DSV4TPUAttnBackend):
                     self.index_topk,
                     block_size,
                     publish,
+                    consume,
                     layer.layer_id,
                 )
                 if publish:
