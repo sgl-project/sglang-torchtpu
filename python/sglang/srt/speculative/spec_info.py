@@ -182,7 +182,8 @@ class SpeculativeAlgorithm(Enum):
     def supports_kv_free_fence(self, *, copies_draft_tail: bool) -> bool:
         """Whether some tensor a forward's result copies to host is computed
         after the forward's last KV write, as the TPU KV free fence requires.
-        ``copies_draft_tail``: the copy includes the EAGLE draft input's topk."""
+        ``copies_draft_tail``: the copy includes the EAGLE draft input's topk,
+        or the DFLASH draft input's draft_kv_write_tail."""
         # Their next tokens are computed after their last KV write.
         if self in (
             SpeculativeAlgorithm.NONE,
@@ -190,11 +191,13 @@ class SpeculativeAlgorithm(Enum):
             SpeculativeAlgorithm.UNO,
         ):
             return True
-        # EAGLE's draft extend writes KV after verify and computes the topk.
+        # EAGLE's draft extend writes KV after verify and computes the topk;
+        # DFLASH's draft KV append writes after verify and outputs the tail.
         return copies_draft_tail and self in (
             SpeculativeAlgorithm.EAGLE,
             SpeculativeAlgorithm.EAGLE3,
             SpeculativeAlgorithm.STANDALONE,
+            SpeculativeAlgorithm.DFLASH,
         )
 
     def has_draft_kv(self) -> bool:

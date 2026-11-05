@@ -6,6 +6,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 
@@ -26,8 +27,11 @@ class TpuAsyncCopyEvent:
 
     def synchronize(self) -> None:
         """Wait for submission and transfer, propagating worker errors."""
-        self.submitted.result()
-        self.event.synchronize()
+        from sglang_tpu.diag_timing import timed as _dt
+        with _dt("4a_copy_submit_wait"):
+            self.submitted.result()
+        with _dt("4b_copy_event_wait"):
+            self.event.synchronize()
 
     def query(self) -> bool:
         """Return whether synchronize() would return without blocking.
@@ -53,6 +57,9 @@ def _draft_tail(result: GenerationBatchResult) -> Optional[torch.Tensor]:
         return draft_input.kv_fence_tail
     if isinstance(draft_input, EagleDraftInput):
         return draft_input.topk_index
+    if isinstance(draft_input, DFlashDraftInputV2):
+        # The DFLASH v2 draft KV append runs after verify.
+        return draft_input.draft_kv_write_tail
     return None
 
 

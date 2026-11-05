@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import jax
 import jax.numpy as jnp
 from jax import lax
 
 from sglang_tpu.attention.pallas.batched_rpa import configs, utils
+
+LOG2E = 1.0 / math.log(2.0)
 
 
 def flash_attention_qk_softmax(
@@ -33,15 +37,21 @@ def flash_attention_qk_softmax(
     bq_start: int,
     kv_len_left: list[jax.Array] | None = None,  # [B]
     global_q_k_gap: list[jax.Array] | None = None,  # [B]
-    kv_new_start_left: list[jax.Array] | None = None,  # [B]
+    apply_mask: bool = True,
+    fold_sm_scale: bool = False,
 ):
     """Flash attention kernel.
 
-    ``kv_new_start_left[b]`` (NEW_TOKENS_ONLY) is the block-relative index of
-    the sequence's first new key; keys before it are cached, unfetched and
-    masked out.
+    ``apply_mask=False`` is for tiles the caller proved fully visible;
+    ``fold_sm_scale`` scales q instead of the scores (exact for a power of two).
     """
     b, k_heads, tq, h_size = q.shape
+    exp2 = cfgs.serve.exp2_softmax
+    exp_fn = jnp.exp2 if exp2 else jnp.exp
+    # With exp2 the scores carry log2e, so exp2(x) == exp(x / log2e).
+    score_scale = cfgs.model.sm_scale * (LOG2E if exp2 else 1.0)
+    if fold_sm_scale:
+        q = q * jnp.asarray(score_scale, q.dtype)
 
     if cfgs.serve.scale_q is not None:
         q = q / cfgs.serve.scale_q
@@ -70,8 +80,12 @@ def flash_attention_qk_softmax(
         )
     qk = qk.astype(cfgs.serve.dtype_out).reshape(b, k_heads, tq, s)
 
-    qk *= cfgs.model.sm_scale
-    if cfgs.serve.scale_k is not None:
+    if not fold_sm_scale:
+        qk *= score_scale
+    # A unit K scale is the identity; skip the multiply.
+    if cfgs.serve.scale_k is not None and not (
+        isinstance(cfgs.serve.scale_k, (int, float)) and cfgs.serve.scale_k == 1
+    ):
         qk *= cfgs.serve.scale_k
     if cfgs.serve.scale_q is not None:
         qk *= cfgs.serve.scale_q
@@ -82,120 +96,73 @@ def flash_attention_qk_softmax(
     qk_masked = []
     masks = []
 
-    sliding_window = cfgs.model.sliding_window
-    is_pure_prefix = (
-        cfgs.serve.attention_scope == configs.AttentionScope.CACHE_ONLY
-        or (
-            cfgs.serve.attention_scope == configs.AttentionScope.STRIPED
-            and cfgs.serve.decode_query_size == 1
-        )
-    )
-    if is_pure_prefix and sliding_window is None and kv_new_start_left is None:
-        assert kv_len_left is not None
-        # In pure prefix cache attention without sliding window (CACHE_ONLY or
-        # single-token STRIPED), all queries attend to all prior cached tokens,
-        # making causal masking (q_kv_diff >= offset) always True. We only need
-        # to mask keys that exceed the local valid length (g3 cl/1005950290).
-        kv_iota = lax.broadcasted_iota(jnp.int32, (1, 1, s), 2)
-        masks = [kv_iota < kv_len_left[b_idx] for b_idx in range(cfgs.block.batch_size)]
-    else:
-        kv_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 2)
-        q_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1)
-        q_iota //= cfgs.aligned_num_q_heads_per_kv_head
-        q_kv_diff = q_iota - kv_iota
-        if global_q_k_gap is not None:
-            # Page-striped cache: local key j holds global position
-            # j + (j // page_size) * (cp_group_size - 1) * page_size + rank * page_size.
-            # The rank term is scalar and lives in global_q_k_gap; the local-index
-            # part is computed per batch element below from the block's first key.
-            lp = cfgs.serve.page_size_log2
-            stripe_gap = (cfgs.serve.cp_group_size - 1) << lp
-
-        for b_idx in range(cfgs.block.batch_size):
-            # NOTE: Goal is to compute q_len >= kv_len. But we want to utilize scalar
-            # compute as much as possible before involving vector compute. Therefore, we
-            # break down a computational steps into following equations to separate out
-            # scalar and vector compute.
-            # q_len = q_iota + (bq_start + processed_q_len)
-            # kv_len = kv_iota + processed_kv_len
-            # Step 1: q_len >= kv_len:
-            # Step 2:
-            #   q_iota + (bq_start + processed_q_len)
-            #   >= kv_iota + processed_kv_len
-            # Step 3:
-            #   q_iota - kv_iota
-            #   >= processed_kv_len - (bq_start + processed_q_len)
-            # Step 4:
-            #   q_kv_delta = q_iota - kv_iota
-            #   offset = processed_kv_len - (bq_start + processed_q_len)
-            offset = processed_kv_len[b_idx] - (bq_start + processed_q_len[b_idx])
-            if kv_len_left is None:
-                mask_b = q_kv_diff >= offset
-            else:
-                # Every cached key precedes every query; keys past kv_len are stale.
-                mask_b = kv_iota < kv_len_left[b_idx]
-            if kv_new_start_left is not None:
-                mask_b = jnp.logical_and(mask_b, kv_iota >= kv_new_start_left[b_idx])
-
-            if sliding_window is not None:
-                # NOTE: Goal is to compute q_len < sliding_window + kv_len. And similar
-                # to above, we want to minimize vector compute. Therefore, we break
-                # down computes into following steps.
-                # Step 1: q_len < sliding_window + kv_len
-                # Step 2:
-                #   q_iota + (bq_start + processed_q_len)
-                #   < sliding_window + kv_iota + processed_kv_len
-                # Step 3:
-                #   q_iota - kv_iota
-                #   < sliding_window + processed_kv_len - (bq_start + processed_q_len)
-                # Step 4:
-                #   q_kv_diff < sliding_window + offset
-                if global_q_k_gap is None:
-                    mask_b = jnp.logical_and(
-                        mask_b, q_kv_diff < sliding_window + offset
-                    )
-                else:
-                    # Same in global positions: gap = q_global - (k_id + rank * page)
-                    # at q_iota = kv_iota = 0 of the block; the stripe term adds
-                    # (cp - 1) pages per local page of the key's local index.
-                    local_key = kv_iota + processed_kv_len[b_idx]
-                    q_kv_diff_global = q_kv_diff - (local_key >> lp) * stripe_gap
-                    window_offset = sliding_window - (bq_start + global_q_k_gap[b_idx])
-                    mask_b = jnp.logical_and(mask_b, q_kv_diff_global < window_offset)
-
-            masks.append(mask_b)
+    kv_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 2)
+    q_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1)
+    q_iota //= cfgs.aligned_num_q_heads_per_kv_head
+    q_kv_diff = q_iota - kv_iota
+    if global_q_k_gap is not None:
+        # Local key j holds global position j * cp_group_size + cp_rank.
+        q_kv_diff_global = q_iota - cfgs.serve.cp_group_size * kv_iota
 
     for b_idx in range(cfgs.block.batch_size):
-        qk_masked.append(jnp.where(masks[b_idx], qk[b_idx], cfgs.model.mask_value))
+        if not apply_mask:
+            # The unused iotas above are dead code once no tile reads them.
+            qk_masked.append(qk[b_idx])
+            continue
+        # NOTE: Goal is to compute q_len >= kv_len. But we want to utilize scalar
+        # compute as much as possible before involving vector compute. Therefore, we
+        # break down a computational steps into following equations to separate out
+        # scalar and vector compute.
+        # q_len = q_iota + (bq_start + processed_q_len)
+        # kv_len = kv_iota + processed_kv_len
+        # Step 1: q_len >= kv_len:
+        # Step 2:
+        #   q_iota + (bq_start + processed_q_len)
+        #   >= kv_iota + processed_kv_len
+        # Step 3:
+        #   q_iota - kv_iota
+        #   >= processed_kv_len - (bq_start + processed_q_len)
+        # Step 4:
+        #   q_kv_delta = q_iota - kv_iota
+        #   offset = processed_kv_len - (bq_start + processed_q_len)
+        offset = processed_kv_len[b_idx] - (bq_start + processed_q_len[b_idx])
+        if kv_len_left is None:
+            mask_b = q_kv_diff >= offset
+        else:
+            # Every cached key precedes every query; keys past kv_len are stale.
+            mask_b = kv_iota < kv_len_left[b_idx]
+
+        if (sliding_window := cfgs.model.sliding_window) is not None:
+            # NOTE: Goal is to compute q_len < sliding_window + kv_len. And similar
+            # to above, we want to minimize vector compute. Therefore, we break
+            # down computes into following steps.
+            # Step 1: q_len < sliding_window + kv_len
+            # Step 2:
+            #   q_iota + (bq_start + processed_q_len)
+            #   < sliding_window + kv_iota + processed_kv_len
+            # Step 3:
+            #   q_iota - kv_iota
+            #   < sliding_window + processed_kv_len - (bq_start + processed_q_len)
+            # Step 4:
+            #   q_kv_diff < sliding_window + offset
+            if global_q_k_gap is None:
+                mask_b = jnp.logical_and(mask_b, q_kv_diff < sliding_window + offset)
+            else:
+                # Same in global positions, with gap = q_global - k_global at
+                # q_iota = kv_iota = 0 of the block.
+                window_offset = sliding_window - (bq_start + global_q_k_gap[b_idx])
+                mask_b = jnp.logical_and(mask_b, q_kv_diff_global < window_offset)
+
+        masks.append(mask_b)
+        qk_masked.append(jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value))
     qk = jnp.stack(qk_masked, axis=0)
-    return _softmax_stats(
-        step,
-        qk,
-        masks,
-        m_prev,
-        l_prev,
-        is_last_k,
-        zero_masked=kv_len_left is not None,
-        cfgs=cfgs,
-    )
 
-
-def _softmax_stats(
-    step: jax.Array,
-    qk: jax.Array,  # [B, KV, TQ, S], masked
-    masks: list[jax.Array],  # B * ([KV, TQ, S] or [1, 1, S])
-    m_prev: jax.Array,
-    l_prev: jax.Array,
-    is_last_k: jax.Ref,
-    *,
-    zero_masked: bool,
-    cfgs: configs.RpaConfigs,
-):
-    """Online-softmax statistics of a masked ``qk`` block, carried across the
-    batch lanes in order. ``zero_masked`` zeroes p on the masked keys (a row
-    with no key in range then keeps l == 0 instead of weighting masked keys by
-    exp(mask_value - mask_value)); the scopes whose rows can be empty set it."""
-    m_curr = jnp.max(qk, axis=-1, keepdims=True)
+    if cfgs.serve.no_max:
+        # A zero max: m is -inf at a q block's first k block (alpha clears l and acc)
+        # and 0 after, so p is exp(s) and no row-max barrier sits between QK and exp.
+        m_curr = jnp.zeros(qk.shape[:-1] + (1,), qk.dtype)
+    else:
+        m_curr = jnp.max(qk, axis=-1, keepdims=True)
 
     alpha_list = []
     m_next_list = []
@@ -203,15 +170,24 @@ def _softmax_stats(
     for b_idx in range(cfgs.block.batch_size):
         m_curr_b = m_curr[b_idx]
         m_next_b = jnp.maximum(m_prev, m_curr_b)
-        alpha_b = jnp.exp(m_prev - m_next_b)
+        alpha_b = exp_fn(m_prev - m_next_b)
         alpha_list.append(alpha_b)
         m_next_list.append(m_next_b)
         m_prev = jnp.where(is_last_k[step, b_idx], -jnp.inf, m_next_b)
 
     m_next = jnp.stack(m_next_list, axis=0)
-    p = jnp.exp(qk - utils.broadcast_minor(m_next, qk.shape))
-    if zero_masked:
+    # m is an f32 carry; the scores and p stay in the output dtype.
+    if cfgs.serve.no_max:
+        p = exp_fn(qk)
+    else:
+        p = exp_fn(qk - utils.broadcast_minor(m_next, qk.shape).astype(qk.dtype))
+    if kv_len_left is not None:
+        # A row with no key in range keeps l == 0 rather than weighting masked
+        # keys by exp(mask_value - mask_value).
         p = jnp.where(jnp.stack(masks, axis=0), p, 0)
+    if cfgs.serve.ones_v:
+        # The PV matmul produces the row sums (ones rows in V); l is unused.
+        return p, alpha_list, m_prev, jnp.stack([l_prev] * b, axis=0), m_next
     p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out)
 
     l_next_list = []

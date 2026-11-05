@@ -16,6 +16,7 @@ decode-phase draft extension run on the kernel's DECODE range with a static
 
 from typing import Optional
 
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.attention_pallas_rpa_base import (
     BaseTpuPallasRpaAttnBackend,
     PallasForwardMetadata,
@@ -76,6 +77,7 @@ def _invoke_v3_kernel(
         k_scale=k_scale,
         v_scale=v_scale,
         decode_query_size=decode_query_size,
+        pad_lane_rowsum=tpu_envs.SGLANG_TPU_ENABLE_RPA_PAD_LANE_ROWSUM.get(),
     )
 
 

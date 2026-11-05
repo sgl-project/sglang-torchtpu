@@ -7,6 +7,7 @@ import math
 import os
 import sys
 import unittest
+import unittest.mock
 
 import numpy as np
 
@@ -123,7 +124,7 @@ class TestBatchedRpaKernel(unittest.TestCase):
         kv_lens = jnp.asarray([kv_len], dtype=jnp.int32)
         cu_q_lens = jnp.asarray([0, 1], dtype=jnp.int32)
         page_indices = jnp.asarray(page_indices_host.reshape(-1))
-        distribution = jnp.asarray([0, 0, 1], dtype=jnp.int32)  # one decode row
+        distribution = jnp.ones((3,), dtype=jnp.int32)
         sm_scale = 1.0 / math.sqrt(self.HEAD_DIM)
 
         expected = ref_ragged_paged_attention(
@@ -337,11 +338,10 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
         kv_lens_padded[:num_seqs] = kv_lens
         cu_q_lens_padded = np.full(max_num_seqs + 1, total_tokens, dtype=np.int32)
         cu_q_lens_padded[: num_seqs + 1] = cu_q_lens
-        # [mixed, mixed + prefill, total]: decode rows are the tail range.
         if decode:
-            distribution = [0, 0, num_seqs]
-        else:
             distribution = [num_seqs, num_seqs, num_seqs]
+        else:
+            distribution = [0, 0, num_seqs]
         sm_scale = 1.0 / math.sqrt(head_dim)
 
         def _reference(attention_sink):
@@ -545,6 +545,75 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
                     sliding_window=sliding_window,
                     seq_along_lane=seq_along_lane,
                 )
+
+    def test_seq_along_lane_softmax_variants(self):
+        """exp2 softmax and ones-in-V row sums match the reference on the fp8
+        SEQ_ALONG_LANE prefill path they are meant for, with and without a window."""
+        import jax
+
+        from sglang_tpu.envs import envs as tpu_envs
+
+        variants = (
+            {"SGLANG_TPU_RPA_EXP2_SOFTMAX": "1"},
+            {"SGLANG_TPU_RPA_ONES_V": "1"},
+            {"SGLANG_TPU_RPA_EXP2_SOFTMAX": "1", "SGLANG_TPU_RPA_ONES_V": "1"},
+            {"SGLANG_TPU_RPA_ONES_V": "1", "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1"},
+        )
+        for env in variants:
+            for sliding_window in (None, 128):
+                with (
+                    self.subTest(env=env, sliding_window=sliding_window),
+                    unittest.mock.patch.dict(os.environ, env),
+                ):
+                    # The wrapper reads the flags while tracing; drop cached traces.
+                    jax.clear_caches()
+                    self.assertTrue(all(getattr(tpu_envs, name).get() for name in env))
+                    self._check(
+                        seqs=self.EXTEND_SEQS,
+                        padded_tokens=self.EXTEND_TOKENS,
+                        kv_dtype_name="float8_e4m3fn",
+                        k_scale=1.0,
+                        v_scale=1.0,
+                        sliding_window=sliding_window,
+                        seq_along_lane=True,
+                    )
+        jax.clear_caches()
+
+    def test_seq_along_lane_transposed(self):
+        """The transposed prefill tile (scores^T, fp8 q) tracks the reference on
+        the fp8 SEQ_ALONG_LANE path, with and without a window and the mask skip."""
+        import jax
+
+        from sglang_tpu.envs import envs as tpu_envs
+
+        variants = (
+            {"SGLANG_TPU_RPA_TRANSPOSED": "1"},
+            {
+                "SGLANG_TPU_RPA_TRANSPOSED": "1",
+                "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1",
+            },
+        )
+        # fp8 q: a few percent of relative error on the scores, see transposed.py.
+        self.TOLERANCE = 0.3
+        for env in variants:
+            for sliding_window in (None, 128):
+                with (
+                    self.subTest(env=env, sliding_window=sliding_window),
+                    unittest.mock.patch.dict(os.environ, env),
+                ):
+                    jax.clear_caches()
+                    self.assertTrue(all(getattr(tpu_envs, name).get() for name in env))
+                    self._check(
+                        seqs=self.EXTEND_SEQS,
+                        padded_tokens=self.EXTEND_TOKENS,
+                        kv_dtype_name="float8_e4m3fn",
+                        k_scale=1.0,
+                        v_scale=1.0,
+                        sliding_window=sliding_window,
+                        seq_along_lane=True,
+                    )
+        jax.clear_caches()
+        del self.TOLERANCE
 
 
 if __name__ == "__main__":

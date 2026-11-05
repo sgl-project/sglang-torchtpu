@@ -24,22 +24,6 @@ def align_to(a, b):
     return pl.cdiv(a, b) * b
 
 
-def cp_local_cache_len(global_kv_cache_len, cp_group_size, cp_rank, page_size):
-    """Number of cache tokens owned by this CP rank under page striping.
-
-    Page p lives on rank p % cp_group_size.
-    """
-    super_page = cp_group_size * page_size
-    full_tokens = (global_kv_cache_len // super_page) * page_size
-    rem_tokens = jnp.maximum(
-        0,
-        jnp.minimum(
-            page_size, (global_kv_cache_len % super_page) - cp_rank * page_size
-        ),
-    )
-    return full_tokens + rem_tokens
-
-
 def broadcast_minor(src, shape):
     """Broadcasts 'src' to 'shape' in the minor dimension."""
     if src.shape == shape:
@@ -158,3 +142,11 @@ def has_bank_conflicts(stride: int, distance=24, num_banks=32) -> bool:
             return True
         banks.add(bank)
     return False
+
+
+def head_norm(out: jax.Array, axis: int, head_dim: int, eps: float) -> jax.Array:
+    """Weightless RMS norm over a head's ``head_dim`` values along ``axis`` (zero
+    padding beyond them adds nothing), of ``out`` as rounded to its dtype."""
+    x = out.astype(jnp.float32)
+    ms = jnp.sum(x * x, axis=axis, keepdims=True) / head_dim
+    return (x * jax.lax.rsqrt(ms + eps)).astype(out.dtype)
