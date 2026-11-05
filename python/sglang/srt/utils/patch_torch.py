@@ -195,6 +195,40 @@ def monkey_patch_torch_tpu_env(
     os.environ.setdefault("MASTER_PORT", "29500")
 
 
+def _init_backend_in_shared_pjrt_session(current_platform, pjrt_world_size: str):
+    """Join a host-wide PJRT session as one worker, then restore the engine's ranks.
+
+    A tpu7x host lease only accepts a session over all of its TensorCores, so
+    engines smaller than the host (TP1 or TP2 per chip) and idle placeholder
+    workers on the remaining cores form one session of
+    `SGLANG_TPU_PJRT_WORLD_SIZE` workers. This engine's scheduler joins as worker
+    `SGLANG_TPU_PJRT_RANK` (default: its RANK), or as worker
+    `SGLANG_TPU_PJRT_RANK_BASE` + RANK for a multi-rank engine. torch_tpu reads
+    WORLD_SIZE and RANK once at client creation, so they are overridden only
+    until the client exists and the engine's own values are restored before
+    torch.distributed starts.
+    """
+    keys = ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE")
+    saved = {k: os.environ.get(k) for k in keys}
+    pjrt_rank = os.environ.get("SGLANG_TPU_PJRT_RANK", saved["RANK"] or "0")
+    rank_base = os.environ.get("SGLANG_TPU_PJRT_RANK_BASE")
+    if rank_base:
+        pjrt_rank = str(int(rank_base) + int(saved["RANK"] or 0))
+    os.environ["WORLD_SIZE"] = os.environ["LOCAL_WORLD_SIZE"] = pjrt_world_size
+    os.environ["RANK"] = os.environ["LOCAL_RANK"] = pjrt_rank
+    logger.info(
+        f"PJRT client init with WORLD_SIZE={pjrt_world_size}, RANK={pjrt_rank}"
+    )
+    current_platform.init_backend()
+    # Materialize the PJRT client now (device allocation is lazy) so it is
+    # created with the session WORLD_SIZE/RANK, not the restored engine ranks.
+    torch.ones(1, device="tpu").sum().item()
+    for k, v in saved.items():
+        if v is not None:
+            os.environ[k] = v
+    logger.info(f"PJRT client ready on device {torch.tpu.current_device()}")
+
+
 def initialize_torch_tpu_worker(
     server_args, tp_rank: int, pp_rank: int = 0, dp_rank: Optional[int] = None
 ):
@@ -209,7 +243,16 @@ def initialize_torch_tpu_worker(
 
     current_platform.prepare_worker(server_args, tp_rank, pp_rank, dp_rank)
     monkey_patch_torch_tpu_env(server_args, tp_rank, pp_rank, dp_rank=dp_rank)
-    current_platform.init_backend()
+    pjrt_world_size = os.environ.get("SGLANG_TPU_PJRT_WORLD_SIZE")
+    if pjrt_world_size:
+        if cfg.dp_size > 1:
+            raise ValueError(
+                "SGLANG_TPU_PJRT_WORLD_SIZE joins one engine to a host-wide PJRT "
+                "session; --dp-size replicas already share one, so set only one"
+            )
+        _init_backend_in_shared_pjrt_session(current_platform, pjrt_world_size)
+    else:
+        current_platform.init_backend()
 
     try:
         import torch_tpu._internal.compile._backend as _tpu_compile_backend
