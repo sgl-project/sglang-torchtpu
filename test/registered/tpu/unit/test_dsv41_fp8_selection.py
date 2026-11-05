@@ -313,9 +313,13 @@ def test_candidate_scoring_matches_dense_reference_real_tpu(counts, route, unord
         )
         selected = np.asarray(select(f["q"], f["weights"]))
         # A prepared union is reused by later layers with other queries.
-        np.testing.assert_array_equal(
-            np.asarray(select(f["q"], f["weights"] * 2)), selected
-        )
+        # Unordered selection fixes the set, not its order.
+        reused = np.asarray(select(f["q"], f["weights"] * 2))
+        if unordered:
+            reused, expected = _sorted_ids(reused), _sorted_ids(selected)
+        else:
+            expected = selected
+        np.testing.assert_array_equal(reused, expected)
     else:
         selected = np.asarray(
             _select(
