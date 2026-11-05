@@ -164,8 +164,9 @@ class Platform:
         """Decorator for --regional-compile regions that every rank runs with the
         same graph (the model sets ``_compile_regions_spmd_safe``). The regions
         should trace as one graph each. May configure process-wide compile
-        state the wrapper needs (e.g. a cache-key tag); call it once, before
-        compiling."""
+        state the wrapper needs (e.g. a cache-key tag), so it must be
+        idempotent: compile_matching_submodules calls it once per compiled
+        model."""
         return None
 
     def get_compile_options(self, module: torch.nn.Module) -> dict[str, object] | None:
