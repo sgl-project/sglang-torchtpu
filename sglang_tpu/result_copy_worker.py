@@ -28,6 +28,7 @@ class TpuAsyncCopyEvent:
     def synchronize(self) -> None:
         """Wait for submission and transfer, propagating worker errors."""
         from sglang_tpu.diag_timing import timed as _dt
+
         with _dt("4a_copy_submit_wait"):
             self.submitted.result()
         with _dt("4b_copy_event_wait"):

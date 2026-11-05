@@ -618,7 +618,9 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 commit_lens=commit_lens,
             )
 
-    def make_null_spec_info(self, draft_token_num: int | None = None) -> DFlashVerifyInput:
+    def make_null_spec_info(
+        self, draft_token_num: int | None = None
+    ) -> DFlashVerifyInput:
         """Create null DFlash verify input metadata for compilation.
 
         Returns:
@@ -635,7 +637,9 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
-    def make_verify_spec_info(self, draft_token_num: int | None = None) -> DFlashVerifyInput:
+    def make_verify_spec_info(
+        self, draft_token_num: int | None = None
+    ) -> DFlashVerifyInput:
         """Create dummy DFlash verify input metadata for TARGET_VERIFY compilation.
 
         Returns:
@@ -659,13 +663,22 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
     def narrow_verify_shapes(self) -> dict[int, list[int]]:
         """Adaptive verify widths below the block -> the batch buckets that run them."""
         assert self.b_bucketer is not None
-        return adaptive_verify_shapes(self._adaptive_verify_rules, self.b_bucketer.buckets)
+        return adaptive_verify_shapes(
+            self._adaptive_verify_rules, self.b_bucketer.buckets
+        )
 
     def _precompile_target_verify(self) -> list[PendingCall]:
         pending = super()._precompile_target_verify()
-        shapes = [(bs, w) for w, buckets in self.narrow_verify_shapes().items() for bs in buckets]
+        shapes = [
+            (bs, w)
+            for w, buckets in self.narrow_verify_shapes().items()
+            for bs in buckets
+        ]
         if shapes:
-            logger.info("[spec compile policy] TARGET_VERIFY narrow widths: (bs, width) %s", shapes)
+            logger.info(
+                "[spec compile policy] TARGET_VERIFY narrow widths: (bs, width) %s",
+                shapes,
+            )
         for bs, width in shapes:
             warmup = self._run_one(
                 num_tokens=bs * width,
@@ -823,7 +836,9 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         draft_token_num = self.draft_token_num
         # (bs, verify width): the full block where some batch verifies it, plus narrow widths.
         shapes = [(bs, draft_token_num) for bs in self.full_verify_buckets()] + [
-            (bs, w) for w, buckets in self.narrow_verify_shapes().items() for bs in buckets
+            (bs, w)
+            for w, buckets in self.narrow_verify_shapes().items()
+            for bs in buckets
         ]
         target_hidden_size = self.dflash_target_hidden_size
         device = self.model_runner.device
@@ -911,7 +926,9 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         draft_token_num = self.draft_token_num
         # (bs, block width): the full block everywhere, plus the adaptive narrow blocks.
         shapes = [(bs, draft_token_num) for bs in bs_buckets] + [
-            (bs, w) for w, buckets in self.narrow_verify_shapes().items() for bs in buckets
+            (bs, w)
+            for w, buckets in self.narrow_verify_shapes().items()
+            for bs in buckets
         ]
         logger.info(
             "[spec compile policy] DFLASH DRAFT VERIFY: %d shapes ((bs, width)=%s)",

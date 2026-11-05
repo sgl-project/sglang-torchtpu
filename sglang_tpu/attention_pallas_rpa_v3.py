@@ -16,12 +16,12 @@ decode-phase draft extension run on the kernel's DECODE range with a static
 
 from typing import Optional
 
-from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.attention_pallas_rpa_base import (
     BaseTpuPallasRpaAttnBackend,
     PallasForwardMetadata,
     RpaKernelSpec,
 )
+from sglang_tpu.envs import envs as tpu_envs
 
 __all__ = [
     "PallasForwardMetadata",

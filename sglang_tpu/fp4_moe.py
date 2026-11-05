@@ -18,13 +18,13 @@ from sglang.srt.layers.quantization.mxfp4_tpu_util import (
     _pad_last_axis,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.expert_loading import _wait_for
 from sglang_tpu.fp8_moe import (
     _clear_replaced_param,
     _free_replaced_storage,
     _own_storage,
 )
-from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.fused_rs_sequence_parallel import (
     get_tpu_fused_rs_post_expert_norm_weight,
     has_tpu_fused_rs_post_expert_norm,

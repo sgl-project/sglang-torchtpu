@@ -685,7 +685,8 @@ class MuseMegakernel(torch.nn.Module):
             topk_xpose=opt and rows >= 64,
             pair_y_stream=opt and tiled and rows > 64,
             ex_gs_smem=False,
-            ex_w2_stage=opt and (tiled or (rows >= 32 and bool(getattr(self, "kperm", False)))),
+            ex_w2_stage=opt
+            and (tiled or (rows >= 32 and bool(getattr(self, "kperm", False)))),
             # fp8 x fp8 expert LHS loses accuracy at R >= 256 (8K cc=64 verify).
             ex_lhs_fp8=1 if (opt and (tiled or rows >= 32) and rows <= 128) else 0,
             expert_chunk=64 if (opt and tiled and rows > 128) else 32,

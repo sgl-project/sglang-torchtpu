@@ -32,16 +32,24 @@ def parse_adaptive_verify(spec: str, block_size: int) -> tuple[VerifyWidthRule, 
             continue
         parts = item.split(":")
         if len(parts) not in (2, 3):
-            raise ValueError(f"adaptive verify rule {item!r}: expected MIN_BS:WIDTH[:ACC_LEN]")
+            raise ValueError(
+                f"adaptive verify rule {item!r}: expected MIN_BS:WIDTH[:ACC_LEN]"
+            )
         min_bs, width = int(parts[0]), int(parts[1])
         accept_length = float(parts[2]) if len(parts) == 3 else None
         if min_bs < 1 or width < 2:
-            raise ValueError(f"adaptive verify rule {item!r}: need MIN_BS >= 1 and WIDTH >= 2")
+            raise ValueError(
+                f"adaptive verify rule {item!r}: need MIN_BS >= 1 and WIDTH >= 2"
+            )
         if accept_length is not None and not 1.0 <= accept_length <= width:
-            raise ValueError(f"adaptive verify rule {item!r}: ACC_LEN must be in [1, WIDTH]")
+            raise ValueError(
+                f"adaptive verify rule {item!r}: ACC_LEN must be in [1, WIDTH]"
+            )
         if width < block_size:
             rules.append(
-                VerifyWidthRule(min_bs=min_bs, width=width, simulate_accept_length=accept_length)
+                VerifyWidthRule(
+                    min_bs=min_bs, width=width, simulate_accept_length=accept_length
+                )
             )
     rules.sort(key=lambda r: r.min_bs)
     if len({r.min_bs for r in rules}) != len(rules):
@@ -68,7 +76,9 @@ def full_verify_buckets(
     ordered = sorted(buckets)
     out = []
     for prev, bucket in zip([0] + ordered[:-1], ordered):
-        if any(select_verify_width(rules, bs) is None for bs in range(prev + 1, bucket + 1)):
+        if any(
+            select_verify_width(rules, bs) is None for bs in range(prev + 1, bucket + 1)
+        ):
             out.append(bucket)
     return out
 

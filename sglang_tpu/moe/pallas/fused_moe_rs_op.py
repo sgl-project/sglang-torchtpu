@@ -223,10 +223,22 @@ def _build_fused_moe_rs_op(global_scales: bool = False):
             expert_tp: bool,
         ) -> jax.Array:
             return _run(
-                hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids,
-                post_expert_norm_weight, group_offset, w1_global_scale,
-                w2_global_scale, topk, activation, has_post_expert_norm,
-                fp8_direct_write, expert_tp,
+                hidden_states,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                topk_weights,
+                topk_ids,
+                post_expert_norm_weight,
+                group_offset,
+                w1_global_scale,
+                w2_global_scale,
+                topk,
+                activation,
+                has_post_expert_norm,
+                fp8_direct_write,
+                expert_tp,
             )
 
         def _fake_impl(
@@ -269,9 +281,22 @@ def _build_fused_moe_rs_op(global_scales: bool = False):
             expert_tp: bool,
         ) -> jax.Array:
             return _run(
-                hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids,
-                post_expert_norm_weight, group_offset, None, None, topk, activation,
-                has_post_expert_norm, fp8_direct_write, expert_tp,
+                hidden_states,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                topk_weights,
+                topk_ids,
+                post_expert_norm_weight,
+                group_offset,
+                None,
+                None,
+                topk,
+                activation,
+                has_post_expert_norm,
+                fp8_direct_write,
+                expert_tp,
             )
 
         def _fake_impl(
@@ -339,11 +364,11 @@ def fused_moe_rs_call(
         post_expert_norm_weight,
         group_offset,
     )
-    statics = (topk, activation, has_post_expert_norm, fp8_direct_write, expert_tp)
+    static_args = (topk, activation, has_post_expert_norm, fp8_direct_write, expert_tp)
     if w1_global_scale is None:
-        return _build_fused_moe_rs_op()(*tensors, *statics)
+        return _build_fused_moe_rs_op()(*tensors, *static_args)
     return _build_fused_moe_rs_op(global_scales=True)(
-        *tensors, w1_global_scale, w2_global_scale, *statics
+        *tensors, w1_global_scale, w2_global_scale, *static_args
     )
 
 

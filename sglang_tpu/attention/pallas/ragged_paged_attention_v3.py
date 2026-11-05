@@ -41,7 +41,6 @@ from sglang_tpu.attention.pallas.util import (
     get_tpu_version,
     next_power_of_2,
 )
-
 from sglang_tpu.envs import envs as _tpu_envs
 
 # head_dim is padded to this before it becomes the KV cache's minor (lane) axis; must match
