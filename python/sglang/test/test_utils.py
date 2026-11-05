@@ -714,7 +714,7 @@ def popen_launch_server(
         env.get("CI_WEIGHT_LOADER_PREFETCH") == "1"
         and server_module == "sglang.launch_server"
     ):
-        from benchmark.tpu.ci_checkpoint_prefetch import configure_checkpoint_prefetch
+        from sglang.test.ci.checkpoint_prefetch import configure_checkpoint_prefetch
 
         command, env, _ = configure_checkpoint_prefetch(command, env)
 

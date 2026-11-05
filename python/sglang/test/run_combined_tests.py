@@ -1,4 +1,5 @@
 import time
+from contextlib import nullcontext
 from typing import List, Optional, Union
 
 from sglang.test.accuracy_test_runner import (
@@ -105,7 +106,7 @@ def run_combined_tests(
     all_results = []
     all_passed = True
 
-    for model in models:
+    for model_index, model in enumerate(models):
         print("\n" + "=" * 80)
         print(f"TESTING MODEL CONFIG: {model.model_path}")
         print(f"  TP Size: {model.tp_size}")
@@ -138,9 +139,10 @@ def run_combined_tests(
                 all_passed = False
                 model_result["errors"].append(perf_result.error)
 
-            # Wait for GPU memory and port cleanup
-            print("\nWaiting 20 seconds for resource cleanup...")
-            time.sleep(20)
+            # Performance tests own their server regardless of model.launcher.
+            if run_accuracy or run_tool_call or model_index + 1 < len(models):
+                print("\nWaiting 20 seconds for resource cleanup...")
+                time.sleep(20)
 
         # Run accuracy tests. Each call brings the server up; a model config
         # supplying a keep-alive launcher pays that cost only once.
@@ -156,9 +158,12 @@ def run_combined_tests(
                     all_passed = False
                     model_result["errors"].append(acc_result.error)
 
-            # Wait for GPU memory and port cleanup
-            print("\nWaiting 20 seconds for resource cleanup...")
-            time.sleep(20)
+            # Fixture-owned servers stay alive; final phases need no handoff.
+            if model.launcher is not nullcontext and (
+                run_tool_call or model_index + 1 < len(models)
+            ):
+                print("\nWaiting 20 seconds for resource cleanup...")
+                time.sleep(20)
 
         # Run tool call test
         if run_tool_call:
@@ -172,8 +177,10 @@ def run_combined_tests(
                 all_passed = False
                 model_result["errors"].extend(tc_result.failures)
 
-            print("\nWaiting 20 seconds for resource cleanup...")
-            time.sleep(20)
+            # Tool-call tests also launch and stop their own server.
+            if model_index + 1 < len(models):
+                print("\nWaiting 20 seconds for resource cleanup...")
+                time.sleep(20)
 
         all_results.append(model_result)
 
