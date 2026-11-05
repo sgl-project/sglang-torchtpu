@@ -57,12 +57,21 @@ BASE_STEP_MAX_ROWS = 32
 _ROW_TILE = 16
 
 
+def _dev_int(name: str, default: int) -> int:
+    """A tuning knob for kernel sweeps (anvil --env); unset means the tuned default."""
+    return int(os.environ.get(name, default))
+
+
+def _row_tile() -> int:
+    return _dev_int("SGLANG_TPU_MUSE_MK_DEV_ROW_TILE", _ROW_TILE)
+
+
 def step_rows(n_tokens: int, tp: int) -> int:
     """Padded rows of a step: a multiple of the TP size; row-tiled steps also of the row tile
     (each device then owns rows / tp rows of the expert reduce-scatter and u all-gather)."""
     rows = _round_up(n_tokens, tp)
     if rows > BASE_STEP_MAX_ROWS:
-        rows = _round_up(n_tokens, math.lcm(_ROW_TILE, tp))
+        rows = _round_up(n_tokens, math.lcm(_row_tile(), tp))
     return rows
 
 
@@ -658,7 +667,7 @@ class MuseMegakernel(torch.nn.Module):
             fold_attn_scale=(opt or tpu_envs.SGLANG_TPU_MK_FOLD_ATTN_SCALE.get())
             and math.frexp(g.attn_scale)[0] == 0.5,
             kv_group=_FUSED_KV_GROUP,
-            row_tile=_ROW_TILE if tiled else 0,
+            row_tile=_row_tile() if tiled else 0,
             ex_opt=opt,
             ex_kperm=1 if getattr(self, "kperm", False) else 0,
             ex_via_fp8=opt,
@@ -677,7 +686,11 @@ class MuseMegakernel(torch.nn.Module):
             tiled_o_rot=opt and tiled,
             tiled_fold=opt and tiled and fold_env,
             pair_ag=1 if (opt and tiled) else 0,
-            tiled_pair_y=_default_tiled_pair_y(rows) if (opt and tiled) else 0,
+            tiled_pair_y=_dev_int(
+                "SGLANG_TPU_MUSE_MK_DEV_TILED_PAIR_Y", _default_tiled_pair_y(rows)
+            )
+            if (opt and tiled)
+            else 0,
             pair_o_rs=opt and tiled,
             alias_oag_f=opt and tiled,
             sal_kv_split=opt and kv_sal and kv_sal_fp8,
@@ -689,7 +702,10 @@ class MuseMegakernel(torch.nn.Module):
             and (tiled or (rows >= 32 and bool(getattr(self, "kperm", False)))),
             # fp8 x fp8 expert LHS loses accuracy at R >= 256 (8K cc=64 verify).
             ex_lhs_fp8=1 if (opt and (tiled or rows >= 32) and rows <= 128) else 0,
-            expert_chunk=64 if (opt and tiled and rows > 128) else 32,
+            expert_chunk=_dev_int(
+                "SGLANG_TPU_MUSE_MK_DEV_EXPERT_CHUNK",
+                64 if (opt and tiled and rows > 128) else 32,
+            ),
         )
         n_units = len(K.expert_units(cfg))
         ex_split = (
