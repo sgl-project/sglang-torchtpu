@@ -202,7 +202,11 @@ plans the one transfer that fills all ranks. A slice must be whole 32-bit
 packs of the fused page, so BF16 KV takes any head count per rank and FP8
 KV needs an even head count per rank. The rank-4 RPA-seq pool
 (`[blocks, 2 * kv_heads, head_dim, page]`) keeps a head's K and V rows
-adjacent, so each rank's slice is one contiguous run per page.
+adjacent, so each rank's slice is one contiguous run per page. So does the
+SEQ_ALONG_LANE pool (`SGLANG_TPU_USE_SEQ_ALONG_LANE_KV`, page size a multiple of
+128), whose packing rides head_dim, so FP8 takes any head count per rank; it is
+named by its pool, has its own layout fingerprint, and a decode in the other
+layout fails each transfer at planning. The PD hidden pool stays fused beside it.
 
 This path requires a tpu-sync with PP pool resharding: per-layer pool
 pairing, sender-local pool indices on the wire, registered transfer ranks,
