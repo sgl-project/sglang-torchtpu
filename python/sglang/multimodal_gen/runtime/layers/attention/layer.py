@@ -2057,13 +2057,8 @@ class USPAttention(nn.Module):
     ) -> int:
         """Zero heads to append so the head count divides by the Ulysses degree
         (e.g. Z-Image's 30 heads at Ulysses 8); 0 where padding does not apply."""
-        # Ulysses degree; the same split the exchanges use (sp = ulysses x ring).
-        world_size = (
-            get_sequence_parallel_world_size() // get_ring_parallel_world_size()
-        )
         if (
-            world_size <= 1
-            or skip_sp
+            skip_sp
             or qkv_pre_all_to_all
             or q_prefix is not None
             or k.shape[2] != q.shape[2]
@@ -2074,7 +2069,11 @@ class USPAttention(nn.Module):
             )
         ):
             return 0
-        return -q.shape[2] % world_size
+        # sp = Ulysses x ring: heads that divide by sp divide by the Ulysses degree.
+        sp_world_size = get_sequence_parallel_world_size()
+        if sp_world_size <= 1 or q.shape[2] % sp_world_size == 0:
+            return 0
+        return -q.shape[2] % (sp_world_size // get_ring_parallel_world_size())
 
     def forward_with_replicated_kv_prefix(
         self,
