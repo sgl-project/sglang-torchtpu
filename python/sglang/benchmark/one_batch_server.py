@@ -949,7 +949,7 @@ def run_one_case(
             f"served fewer prompts, so throughput uses the actual count."
         )
 
-    if input_len_list or dataset_name in REPLAY_TEXT_DATASETS:
+    if dataset_name in REPLAY_TEXT_DATASETS:
         total_input_tokens = sum(len(ids) for ids in input_ids)
     else:
         total_input_tokens = batch_size * input_len
