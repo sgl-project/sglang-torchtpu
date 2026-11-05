@@ -70,7 +70,7 @@ from sglang_tpu.moe.pallas.fused_moe_v2.token_parallel import (
 )
 
 # The scoring functions the router can apply to the gate logits. These
-# mirror `layers/adapter/moe_routing._apply_scoring_fn` exactly.
+# mirror the `scoring_func` branches in python/sglang/srt/layers/moe/topk.py.
 SCORING_FNS = ("softmax", "sigmoid", "sqrtsoftplus")
 
 
