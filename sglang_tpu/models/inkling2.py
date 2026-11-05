@@ -4,7 +4,7 @@
 Each layer: Block AttnRes over completed residual blocks -> RMSNorm -> attention
 (K/V short convolutions, L2-clipped Q/K/R, learned relative logits, output gate
 and per-token sink) -> attention-output sconv -> Block AttnRes -> RMSNorm -> MoE
--> MLP-output sconv. See python/sglang/tml/ARCHITECTURE.md.
+-> MLP-output sconv.
 
 Attention runs on the RPA v3 Pallas kernel with its relative-bias and
 per-token-sink inputs; short convolutions run on the TPU sconv backend; experts
