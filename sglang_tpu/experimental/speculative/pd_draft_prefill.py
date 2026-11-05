@@ -75,11 +75,13 @@ def pd_hidden_bytes_per_token(
 
 def build_pd_hidden_pool(target_runner: ModelRunner) -> PdHiddenPool:
     """A hidden pool paged like the target's full-attention KV pages."""
-    full = get_raiden_kv_caches(target_runner.token_to_kv_pool).full
+    kv_pool = target_runner.token_to_kv_pool
+    full = get_raiden_kv_caches(kv_pool).full
     parallel = get_parallel()
     return PdHiddenPool(
         num_pages=int(full[0].shape[0]),
-        page_size=int(full[0].shape[1]),
+        # Not full[0].shape[1]: a SEQ_ALONG_LANE page keeps its tokens on the last axis.
+        page_size=kv_pool.page_size,
         feature_size=draft_feature_size(
             target_runner.spec_aux_config, target_runner.model_config.hidden_size
         ),

@@ -200,6 +200,26 @@ class TestRaidenCarriesHiddenNotDraftKv(CustomTestCase):
         self.assertEqual(groups.num_hidden_full, 0)
 
 
+class TestBuildHiddenPool(CustomTestCase):
+    def test_pages_follow_a_seq_along_lane_pool(self):
+        # [num_blocks, 2 * kv_heads, head_dim words, packing, page_size].
+        sal_layer = torch.zeros((5, 2 * KV_HEADS, 4, 2, 256), dtype=torch.uint8)
+        runner = SimpleNamespace(
+            token_to_kv_pool=SimpleNamespace(page_size=256),
+            spec_aux_config=_kvc().spec_aux_config,
+            model_config=_kvc().model_config,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+        )
+        groups = SimpleNamespace(full=[sal_layer])
+        with (
+            patch.object(pd_draft_prefill, "get_raiden_kv_caches", lambda _: groups),
+            get_parallel().override(attn_tp_size=1),
+        ):
+            pool = pd_draft_prefill.build_pd_hidden_pool(runner)
+        self.assertEqual(tuple(pool.buffer.shape[:2]), (5, 256))
+
+
 class TestDraftPromptPassPlacement(CustomTestCase):
     def test_flag_moves_the_prompt_pass_from_prefill_to_decode(self):
         for flag, prefill, decode in ((False, True, False), (True, False, True)):
