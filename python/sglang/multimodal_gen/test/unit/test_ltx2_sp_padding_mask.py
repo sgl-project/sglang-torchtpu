@@ -5,6 +5,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.runtime.models.dits.ltx_2 import apply_split_rotary_emb
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising import (
     LTX2DenoisingStage,
 )
@@ -111,6 +112,31 @@ class TestLtx2SpPaddingMask(unittest.TestCase):
         batch = SimpleNamespace(sp_video_valid_token_count=8)
         mask = _video_self_attention_mask(batch, seq_len=8, batch_size=1)
         self.assertTrue(mask.all())
+
+
+class TestLtx2SplitRotaryEmb(unittest.TestCase):
+    def test_matches_a_per_head_reference(self):
+        # q/k arrive as [b, t, h * d], cos/sin as [b, h, t, d / 2]. With h == t,
+        # cos/sin left in head-major order still broadcast and rotate token i
+        # of head j by head i's angles for token j, silently.
+        gen = torch.Generator().manual_seed(0)
+        batch, half = 2, 4
+        for heads, tokens in ((3, 5), (4, 4)):
+            with self.subTest(heads=heads, tokens=tokens):
+                x = torch.randn(batch, tokens, heads * 2 * half, generator=gen)
+                cos, sin = (
+                    torch.randn(batch, heads, tokens, half, generator=gen)
+                    for _ in range(2)
+                )
+                want = torch.empty_like(x)
+                for head in range(heads):
+                    cols = slice(head * 2 * half, (head + 1) * 2 * half)
+                    first, second = x[..., cols].chunk(2, dim=-1)
+                    c, s = cos[:, head], sin[:, head]
+                    want[..., cols] = torch.cat(
+                        (first * c - second * s, second * c + first * s), dim=-1
+                    )
+                torch.testing.assert_close(apply_split_rotary_emb(x, (cos, sin)), want)
 
 
 if __name__ == "__main__":
