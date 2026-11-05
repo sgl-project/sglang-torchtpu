@@ -218,6 +218,45 @@ class TestViTTpuCompileRunner(unittest.TestCase):
             self.assertEqual(policy.run(torch.arange(4)).tolist(), [0, 2])
             self.assertEqual(len(policy.compiled_fn.cache), 2)
 
+    def test_direct_subgroups_require_shared_compilation(self):
+        policy = _DirectVisionPolicy(
+            nn.Identity(),
+            model_runner=SimpleNamespace(
+                server_args=SimpleNamespace(tpu_compile_tracer="direct")
+            ),
+        )
+        for initialized, tp_size, world_size, shared, expected in (
+            (False, 1, 1, False, False),
+            (True, 2, 16, False, False),
+            (True, 1, 16, False, False),
+            (True, 4, 8, False, False),
+            (True, 4, 8, True, True),
+            (True, 16, 16, False, True),
+        ):
+            with (
+                self.subTest(tp_size=tp_size, world_size=world_size, shared=shared),
+                envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True),
+                patch("torch.distributed.is_initialized", return_value=initialized),
+                patch("torch.distributed.get_world_size", return_value=world_size),
+                patch.object(
+                    vit_runner,
+                    "get_parallel",
+                    return_value=SimpleNamespace(
+                        tp_group=SimpleNamespace(world_size=tp_size)
+                    ),
+                ),
+                patch.object(
+                    vit_runner,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        graph=SimpleNamespace(use_spmd_compile=shared)
+                    ),
+                ),
+                patch.object(direct_compile, "direct_compile") as compile_mock,
+            ):
+                policy._compile_method(lambda x: x, use_bundle=False)
+                self.assertIs(compile_mock.call_args.kwargs["lift_rank"], expected)
+
     def test_default_policy_keeps_dynamo_with_async_enabled(self):
         policy = _FakeVisionPolicy()
         with (
