@@ -132,22 +132,61 @@ class _DeviceLiveLengthAttention:
 
 
 class TestMiniMaxH3PackedSequence(CustomTestCase):
-    def test_pads_to_512_and_keeps_layout(self):
+    def test_pads_to_a_multiple_of_512_and_keeps_layout(self):
+        # 68 latent rows: used 128, 198 and 318 share the first bucket, 512 is
+        # aligned already, 668 takes the second.
+        buckets = {60: 512, 130: 512, 250: 512, 444: 512, 600: 1024}
         pristine = _PRISTINE["minimax_h3_packed_sequence"]
-        reference = {t: _packed(t, pristine) for t in (60, 130, 250)}
+        reference = {t: _packed(t, pristine) for t in buckets}
         self.assertNotEqual({r["seq_len"] for r in reference.values()}, {512})
+        ref2va_args = dict(
+            text_len=60,
+            latent_t=3,
+            latent_h=8,
+            latent_w=8,
+            audio_t=10,
+            ref_blocks=[{"kind": "image", "latent_h": 8, "latent_w": 8}],
+        )
+        ref2va = _PRISTINE["minimax_h3_packed_sequence_ref2va_blocks"](**ref2va_args)
+        empty = torch.zeros(0, dtype=torch.long)
+        comfyui_layout = {
+            "seq_len": 600,
+            "position_ids": torch.ones(600, 3),
+            "segments": [(0, 600, "text")],
+            "img_pos": empty,
+            "img_update": empty.bool(),
+            "audio_pos": empty,
+            "audio_update": empty.bool(),
+        }
         builders = {n: getattr(packed_sequence, n) for n in _BUILDERS}
         with _installed():
             layouts = {text_len: _packed(text_len) for text_len in reference}
+            other_layouts = (
+                (
+                    packed_sequence.minimax_h3_packed_sequence_ref2va_blocks(
+                        **ref2va_args
+                    ),
+                    int(ref2va["cu_seqlens"][1]),
+                    512,
+                ),
+                (comfyui_step.comfyui_layout_to_packed(comfyui_layout), 600, 1024),
+            )
             self.assertIs(
                 comfyui_step.minimax_h3_packed_sequence,
                 packed_sequence.minimax_h3_packed_sequence,
             )
-        self.assertEqual({p["seq_len"] for p in layouts.values()}, {512})
+        for packed, used, seq_len in other_layouts:
+            self.assertEqual(packed["seq_len"], seq_len)
+            self.assertEqual(packed["cu_seqlens"].tolist(), [0, used, seq_len])
+            self.assertTrue((packed["img_position_ids"][used:] == 0).all())
+            self.assertTrue((packed["token_tags"][used:] == -1).all())
         for text_len, packed in layouts.items():
             ref = reference[text_len]
             used = int(ref["cu_seqlens"][1])
-            self.assertEqual(packed["cu_seqlens"].tolist(), [0, used, 512])
+            self.assertEqual(packed["seq_len"], buckets[text_len])
+            self.assertEqual(
+                packed["cu_seqlens"].tolist(), [0, used, buckets[text_len]]
+            )
             torch.testing.assert_close(
                 packed["img_position_ids"][: ref["seq_len"]], ref["img_position_ids"]
             )
