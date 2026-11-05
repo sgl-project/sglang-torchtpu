@@ -216,9 +216,7 @@ def _init_backend_in_shared_pjrt_session(current_platform, pjrt_world_size: str)
         pjrt_rank = str(int(rank_base) + int(saved["RANK"] or 0))
     os.environ["WORLD_SIZE"] = os.environ["LOCAL_WORLD_SIZE"] = pjrt_world_size
     os.environ["RANK"] = os.environ["LOCAL_RANK"] = pjrt_rank
-    logger.info(
-        f"PJRT client init with WORLD_SIZE={pjrt_world_size}, RANK={pjrt_rank}"
-    )
+    logger.info(f"PJRT client init with WORLD_SIZE={pjrt_world_size}, RANK={pjrt_rank}")
     current_platform.init_backend()
     # Materialize the PJRT client now (device allocation is lazy) so it is
     # created with the session WORLD_SIZE/RANK, not the restored engine ranks.
