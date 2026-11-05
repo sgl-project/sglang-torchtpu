@@ -1,16 +1,17 @@
 """Wan2.2-TI2V-5B text-to-video on one TPU chip (nightly).
 
-Mirrors ``test/registered/xpu/test_xpu_zimage_turbo.py``: the diffusion server
-harness is device-agnostic and picks the TPU platform up through
-``current_platform`` at server launch. No TPU perf or consistency baseline
-exists yet, so the guard is a decodable video with the requested frame count.
+The diffusion server harness is device-agnostic and picks the TPU platform up
+through ``current_platform`` at server launch. With no TPU perf or consistency
+baseline, the guard is the decoded video itself: the requested frame count and
+size, and pixel statistics that blank, NaN, frozen and noise videos fail, noise
+including a random latent decoded by the VAE.
 """
 
 from __future__ import annotations
 
 import io
-import logging
 
+import numpy as np
 import pytest
 import torch
 
@@ -30,8 +31,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
 
-logger = logging.getLogger(__name__)
-
 # est_time covers a cold Hugging Face pull; /weights is used when hydrated.
 register_tpu_ci(
     est_time=2700,
@@ -41,6 +40,18 @@ register_tpu_ci(
 )
 
 NUM_FRAMES = 9
+FRAME_SHAPE = (480, 832, 3)
+# Bounds on the decoded uint8 frames after the server's libx264 save. This
+# request measures std 86, temporal diff 4.2 and neighbour ratio 0.037 (CPU run,
+# same seed); real Wan2.2 TPU videos cut to 9x480x832 measure std 39-79,
+# temporal diff 1.0-33 and neighbour ratio 0.012-0.056.
+# Pixel std: black, constant and NaN output (cast to black) measure 0.
+MIN_PIXEL_STD = 10.0
+# Mean |frame[t+1] - frame[t]|: frozen copies of those videos measure 0.02 at most.
+MIN_TEMPORAL_DIFF = 0.1
+# Mean |pixel - right neighbour| / std: a random latent decoded by the VAE, what
+# a DiT or scheduler that never denoises yields, measures 0.13.
+MAX_NEIGHBOUR_DIFF_RATIO = 0.08
 
 TPU_WAN22_CASES = [
     DiffusionTestCase(
@@ -65,11 +76,32 @@ TPU_WAN22_CASES = [
 ]
 
 
-def _decoded_frame_count(video_bytes: bytes) -> int:
+def _decode_frames(video_bytes: bytes) -> np.ndarray:
+    """Every frame as RGB uint8, ``[frames, height, width, 3]``."""
     import av
 
     with av.open(io.BytesIO(video_bytes)) as container:
-        return sum(1 for _ in container.decode(video=0))
+        return np.stack(
+            [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
+        )
+
+
+def _assert_plausible_video(frames: np.ndarray) -> None:
+    expected_shape = (NUM_FRAMES, *FRAME_SHAPE)
+    assert frames.shape == expected_shape, (
+        f"decoded {frames.shape}, expected {expected_shape}"
+    )
+    pixels = frames.astype(np.float32)
+    std = float(pixels.std())
+    temporal = float(np.abs(np.diff(pixels, axis=0)).mean())
+    ratio = float(np.abs(np.diff(pixels, axis=2)).mean()) / max(std, 1e-6)
+    print(
+        f"video {frames.shape}: mean {pixels.mean():.2f}, std {std:.2f}, "
+        f"temporal diff {temporal:.3f}, neighbour diff {ratio:.3f} x std"
+    )
+    assert std > MIN_PIXEL_STD, f"pixel std {std:.2f}: blank or constant frames"
+    assert temporal > MIN_TEMPORAL_DIFF, f"temporal diff {temporal:.3f}: frozen video"
+    assert ratio < MAX_NEIGHBOUR_DIFF_RATIO, f"neighbour diff {ratio:.3f} x std: noise"
 
 
 @pytest.mark.skipif(not hasattr(torch, "tpu"), reason="torch_tpu found no TPU")
@@ -84,6 +116,7 @@ class TestWan22TI2V5BTPU(DiffusionServerBase):
         self,
         case: DiffusionTestCase,
         diffusion_server: ServerContext,
+        capsys: pytest.CaptureFixture[str],
     ):
         generate_fn = get_generate_fn(
             model_path=case.server_args.model_path,
@@ -99,9 +132,10 @@ class TestWan22TI2V5BTPU(DiffusionServerBase):
 
         self._test_v1_models_endpoint(diffusion_server, case)
 
-        frames = _decoded_frame_count(content)
-        logger.info("decoded %d frames, %d bytes", frames, len(content))
-        assert frames == NUM_FRAMES, f"expected {NUM_FRAMES} frames, decoded {frames}"
+        frames = _decode_frames(content)
+        # Uncaptured, so the stats of passing runs reach the nightly log too.
+        with capsys.disabled():
+            _assert_plausible_video(frames)
 
 
 if __name__ == "__main__":
