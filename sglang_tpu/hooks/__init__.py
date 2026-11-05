@@ -35,11 +35,7 @@ from sglang_tpu.hooks.encoder import (
     reject_encoder_dp,
 )
 from sglang_tpu.hooks.experimental_spec import hook_specs
-from sglang_tpu.hooks.glm_flash_megakernel import (
-    drop_freed_glm_flash_megakernel_request,
-    flush_glm_flash_megakernel_request,
-    route_glm_flash_megakernel,
-)
+from sglang_tpu.hooks.glm_flash_megakernel import route_glm_flash_megakernel
 from sglang_tpu.hooks.hicache_swa_metrics import hook_specs as hicache_swa_metrics_hooks
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
 from sglang_tpu.hooks.k3_megakernel import (
@@ -243,16 +239,6 @@ HOOKS: list[tuple] = [
         "sglang_tpu.graph_runner.tpu_graph_runner.TpuGraphRunner.__init__",
         route_glm_flash_megakernel,
         HookType.AFTER,
-    ),
-    (
-        "sglang.srt.mem_cache.memory_pool.ReqToTokenPool.free_rows",
-        drop_freed_glm_flash_megakernel_request,
-        HookType.BEFORE,
-    ),
-    (
-        "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.checkpoint",
-        flush_glm_flash_megakernel_request,
-        HookType.BEFORE,
     ),
     (
         "sglang.srt.models.glm5_next.Glm5NextDecoderLayer._hc_pre",
