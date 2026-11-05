@@ -452,6 +452,23 @@ class TestPPBufferedHandoffProbe(unittest.TestCase):
         self.assertEqual(verdicts, [True, True, True])
         self.assertTrue(all(handoff.transfers == 1 for handoff in handoffs))
 
+    def test_probe_pattern_is_exact_and_distinct_on_large_worlds(self):
+        handoff = make_handoff(0, 2, FakeNet())
+        patterns = {}
+        for rank in range(256):
+            pattern = handoff._probe_pattern(rank, 64, 256, torch.float32)
+            # Every value survives bfloat16 unchanged, at any rank.
+            self.assertTrue(
+                torch.equal(pattern.to(torch.bfloat16).float(), pattern), rank
+            )
+            patterns[rank] = pattern
+        for rank in range(256):
+            for other in range(rank + 1, min(rank + 128, 256)):
+                self.assertFalse(torch.equal(patterns[rank], patterns[other]))
+        # A transposed square block does not compare equal.
+        square = handoff._probe_pattern(15, 128, 128, torch.float32)
+        self.assertFalse(torch.equal(square, square.t()))
+
 
 class TestReceiveProxy(unittest.TestCase):
     def test_scheduler_receive_takes_the_batch_padded_rows(self):

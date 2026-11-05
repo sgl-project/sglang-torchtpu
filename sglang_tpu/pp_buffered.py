@@ -588,12 +588,14 @@ class PPBufferedHandoff:
     def _probe_pattern(
         self, global_rank: int, rows: int, width: int, dtype: torch.dtype
     ) -> torch.Tensor:
-        """What the self-test sends from ``global_rank``: its rank plus one,
-        plus sixteenths that vary along both axes, so a transposed or padded
-        layout does not compare equal. Exact in bfloat16."""
+        """What the self-test sends from ``global_rank``: values in [1, 2) in
+        steps of 1/128, which bfloat16 holds exactly at any rank, varying
+        along both axes so a transposed or padded layout does not compare
+        equal. The rank shifts the phase, so senders whose global ranks differ
+        by less than 128 send different patterns."""
         r = torch.arange(rows, dtype=torch.float32).unsqueeze(1)
         c = torch.arange(width, dtype=torch.float32).unsqueeze(0)
-        pattern = float(global_rank + 1) + torch.remainder(3 * r + c, 16) / 16
+        pattern = 1 + torch.remainder(3 * r + c + 7 * global_rank, 128) / 128
         return pattern.to(dtype)
 
     def probe(self) -> bool:
