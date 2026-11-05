@@ -98,6 +98,7 @@ class SWAComponent(TreeComponent):
         self.full_window_pages = (
             self.sliding_window_size + params.page_size - 1
         ) // params.page_size
+        self._evict_device_preserve_tails = False
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
 
@@ -713,9 +714,30 @@ class SWAComponent(TreeComponent):
     def eviction_priority(self, is_leaf: bool) -> int:
         return 0 if is_leaf else 1
 
+    def _is_branch_tail(self, node: UnifiedTreeNode) -> bool:
+        """Whether removing this node can break a branch's last live SWA window."""
+        window = self.full_window_pages * self.tree_core.page_size
+        pending = [(node, 0)]
+        while pending:
+            current, distance = pending.pop()
+            if distance >= window:
+                continue
+            if not current.children:
+                return True
+            for child in current.children.values():
+                if child.component_data[self.component_type].value is None:
+                    # The node before a tombstone is also a reusable endpoint.
+                    return True
+                pending.append((child, distance + len(child.key)))
+        return False
+
     def _evict_device_start(self, request_cnt: int) -> None:
         """Begin the device-eviction walk from this component's LRU cursor."""
         self._evict_device_request_cnt = request_cnt
+        # Session partitions retain their existing eviction priority contract.
+        self._evict_device_preserve_tails = (
+            not self.tree_core.enable_session_radix_cache
+        )
         if self.tree_core.enable_session_radix_cache:
             lru = self.tree_core.lru_lists[self.component_type]
             lru.cursor_begin()
@@ -748,6 +770,20 @@ class SWAComponent(TreeComponent):
             self._evict_device_cursor = (
                 lru.cursor_next() if enabled else lru.get_lru_no_lock()
             )
+        if (
+            self._evict_device_preserve_tails
+            and tracker[ct] < self._evict_device_request_cnt
+        ):
+            while self._evict_device_cursor is not None and self._is_branch_tail(
+                self._evict_device_cursor
+            ):
+                self._evict_device_cursor = lru.get_prev_no_lock(
+                    self._evict_device_cursor
+                )
+            if self._evict_device_cursor is None:
+                # Tails remain evictable when reclaiming older windows is insufficient.
+                self._evict_device_preserve_tails = False
+                self._evict_device_cursor = lru.get_lru_no_lock()
         if (
             tracker[ct] >= self._evict_device_request_cnt
             or self._evict_device_cursor is None
@@ -812,6 +848,7 @@ class SWAComponent(TreeComponent):
         if self.tree_core.enable_session_radix_cache:
             self.tree_core.lru_lists[self.component_type].cursor_end()
         self._evict_device_cursor = None
+        self._evict_device_preserve_tails = False
 
     def acquire_component_lock(
         self,
