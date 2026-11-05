@@ -122,13 +122,13 @@ class _DeviceLiveLengthAttention:
 class TestMiniMaxH3PackedSequence(CustomTestCase):
     def test_pads_to_a_multiple_of_512_and_keeps_layout(self):
         # 68 latent rows: used 128, 198 and 318 share the first bucket, 512 is
-        # aligned already, 668 takes the second.
+        # aligned already, 668 and ref2va's 684 (an image ref) take the second.
         buckets = {60: 512, 130: 512, 250: 512, 444: 512, 600: 1024}
         reference = {t: _packed(t) for t in buckets}
         # The core builders' own padding: the buckets below come from install().
         self.assertNotEqual(reference[600]["seq_len"], 1024)
         ref2va_args = dict(
-            text_len=60,
+            text_len=600,
             latent_t=3,
             latent_h=8,
             latent_w=8,
@@ -154,7 +154,7 @@ class TestMiniMaxH3PackedSequence(CustomTestCase):
                         **ref2va_args
                     ),
                     int(ref2va["cu_seqlens"][1]),
-                    512,
+                    1024,
                 ),
                 (comfyui_step.comfyui_layout_to_packed(comfyui_layout), 600, 1024),
             )
