@@ -799,7 +799,11 @@ class MuseMegakernel(torch.nn.Module):
                 (cfg, _SCRATCH_VMEM_BUDGET, ((3, 11),), False),
                 (
                     msgspec.structs.replace(
-                        cfg, alias_oy=True, alias_p=True, xfull_packed=True
+                        cfg,
+                        alias_oy=True,
+                        alias_p=True,
+                        xfull_packed=True,
+                        vmem_limit_bytes=_OPT_ALIASED_VMEM_LIMIT,
                     ),
                     _OPT_BASE_VMEM_BUDGET,
                     _DEPTH_RING_PREFERENCE,
@@ -1119,6 +1123,9 @@ _PREFILL_ROW_ALIGN = 128
 # 60 MiB limit at 48.7 MiB (~11.5 MiB of temporaries).
 _SCRATCH_VMEM_BUDGET = 48 * 2**20
 _OPT_BASE_VMEM_BUDGET = 50 * 2**20
+# 32 rows of 8 at that budget needed 60.25 MiB with temporaries; scoped VMEM may go to the
+# 62 MiB v7x limit, so the aliased plan takes it rather than a smaller ring.
+_OPT_ALIASED_VMEM_LIMIT = 62 * 2**20
 # On libtpu 0.0.50 (2026-10-07), row-tiled LLO temporaries add ~10.5-11.0 MiB on top of
 # declared scratch; capping row-tiled budgets at 50 MiB keeps total scoped VMEM <= 60.5 MiB
 # under the 62 MiB v7x limit across rows=48..128 without LLO retry thrashing.
