@@ -465,6 +465,11 @@ def prepare_moe_layer_for_fused_decode(moe_layer: torch.nn.Module) -> bool:
             sw2_buf = _own_storage(s_w2.data.contiguous())
 
         s2s_buf = _own_storage(s2s_raw.contiguous())
+        # torch_tpu re-materializes these device-built [1, N] scales with an
+        # eager `execute_as_strided` program before every compiled call (a
+        # device clone does not avoid it); a buffer moved from the host does.
+        s1s_buf = s1s_buf.cpu().to(s1s_buf.device)
+        s2s_buf = s2s_buf.cpu().to(s2s_buf.device)
         experts.register_buffer("_fmd_sw1", sw1_buf, persistent=False)
         experts.register_buffer("_fmd_s1s", s1s_buf, persistent=False)
         experts.register_buffer("_fmd_sw2", sw2_buf, persistent=False)
