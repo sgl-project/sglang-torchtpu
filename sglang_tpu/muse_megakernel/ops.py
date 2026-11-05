@@ -661,7 +661,14 @@ class MuseMegakernel(torch.nn.Module):
             row_tile=_ROW_TILE if tiled else 0,
             ex_opt=opt,
             ex_kperm=1 if getattr(self, "kperm", False) else 0,
-            ex_via_fp8=False,
+            ex_via_fp8=opt,
+            bd_n_tile=1024 if opt else 0,
+            vec_dequant_kperm=opt,
+            attn_carry=2 if opt else 0,
+            alias_tiled_temps=opt and tiled,
+            combine_loop=opt and tiled,
+            untiled_max_rows=48 if opt else 128,
+            y_quant=1 if (opt and tiled) else 0,
             alias_oy=tiled,
             alias_p=tiled,
             xfull_packed=False,
@@ -672,6 +679,18 @@ class MuseMegakernel(torch.nn.Module):
             pair_ag=1 if (opt and tiled) else 0,
             tiled_pair_y=_default_tiled_pair_y(rows) if (opt and tiled) else 0,
             pair_o_rs=opt and tiled,
+            alias_oag_f=opt and tiled,
+            alias_vmem_arenas=opt and tiled and rows >= 64,
+            alias_lhs_ysend=opt and tiled and rows >= 80,
+            dense_fp8_lhs=False,
+            sal_kv_split=opt and kv_sal and kv_sal_fp8,
+            attn_head_fp8=0,
+            topk_xpose=opt and rows >= 64,
+            pair_y_stream=opt and tiled and rows > 64,
+            ex_gs_smem=False,
+            ex_w2_stage=opt and (tiled or (rows >= 32 and bool(getattr(self, "kperm", False)))),
+            ex_lhs_fp8=1 if (opt and (tiled or rows >= 32) and rows <= 256) else 0,
+            expert_chunk=64 if (opt and tiled and rows > 128) else 32,
         )
         n_units = len(K.expert_units(cfg))
         ex_split = (
@@ -679,13 +698,16 @@ class MuseMegakernel(torch.nn.Module):
             if (opt and rows >= _EXPERT_SPLIT_MIN_ROWS and n_units <= _ARMS5_MAX_UNITS)
             else 0
         )
+        use_c8 = tiled or not cfg.ex_w2_stage
         cfg = msgspec.structs.replace(
             cfg,
             expert_split=ex_split,
-            compact_arms=_compact_arms(rows, n_units, opt=opt, expert_split=ex_split),
+            compact_arms=_compact_arms(
+                rows, n_units, opt=opt, expert_split=ex_split, use_c8=use_c8
+            ),
             compact_rows=(
                 8
-                if (opt and ex_split > 0)
+                if (opt and ex_split > 0 and use_c8)
                 else (
                     4
                     if (opt and n_units <= _ARMS5_MAX_UNITS)
@@ -711,23 +733,84 @@ class MuseMegakernel(torch.nn.Module):
             vys = (
                 (cfg.tiled_vmem_y, 1) if cfg.tiled_vmem_y >= 2 else (cfg.tiled_vmem_y,)
             )
-            plans = [
-                (
+            plans = []
+            for vy in vys:
+                c_vy = (
                     msgspec.structs.replace(cfg, tiled_vmem_y=vy)
                     if vy != cfg.tiled_vmem_y
-                    else cfg,
+                    else cfg
+                )
+                b_vy = (
                     _TILED_VY2_VMEM_BUDGET
                     if vy >= 2
                     else (
                         _TILED_VPADS_VMEM_BUDGET
                         if cfg.tiled_vmem_pads
                         else _SCRATCH_VMEM_BUDGET
-                    ),
-                    _TILED_DEPTH_RING_PREFERENCE,
-                    vy != vys[-1],
+                    )
                 )
-                for vy in vys
-            ]
+                if vy >= 2 and c_vy.tiled_vmem_pads and not c_vy.h_stream_hbm:
+                    plans.append((c_vy, b_vy, ((3, 11),), True))
+                    plans.append(
+                        (
+                            msgspec.structs.replace(c_vy, h_stream_hbm=True),
+                            b_vy,
+                            ((3, 11),),
+                            True,
+                        )
+                    )
+                    plans.append((c_vy, b_vy, _TILED_DEPTH_RING_PREFERENCE, vy != vys[-1]))
+                    plans.append(
+                        (
+                            msgspec.structs.replace(c_vy, h_stream_hbm=True),
+                            b_vy,
+                            _TILED_DEPTH_RING_PREFERENCE,
+                            vy != vys[-1],
+                        )
+                    )
+                else:
+                    plans.append((c_vy, b_vy, _TILED_DEPTH_RING_PREFERENCE, vy != vys[-1]))
+            if cfg.tiled_vmem_y >= 1 and cfg.alias_oag_f:
+                plans.append(
+                    (
+                        msgspec.structs.replace(
+                            cfg,
+                            tiled_vmem_y=1,
+                            tiled_vmem_pads=False,
+                            tiled_o_rot=False,
+                            fold_o=False,
+                            fold_f=False,
+                            pair_ag=0,
+                            pair_o_rs=False,
+                            tiled_pair_y=0,
+                            y_block_send=True,
+                            attn_streams=min(cfg.attn_streams, 4),
+                        ),
+                        _TILED_VY2_VMEM_BUDGET,
+                        _TILED_DEPTH_RING_PREFERENCE,
+                        True,
+                    )
+                )
+            plans.append(
+                (
+                    msgspec.structs.replace(
+                        cfg,
+                        tiled_vmem_y=0,
+                        tiled_vmem_pads=False,
+                        tiled_o_rot=False,
+                        fold_o=False,
+                        fold_f=False,
+                        pair_ag=0,
+                        pair_o_rs=False,
+                        tiled_pair_y=0,
+                        y_block_send=False,
+                        attn_streams=min(cfg.attn_streams, 4),
+                    ),
+                    _OPT_BASE_VMEM_BUDGET,
+                    _TILED_DEPTH_RING_PREFERENCE,
+                    False,
+                )
+            )
         elif opt:
             # Prefer unaliased base scratch when the full 10-slot folded ring already
             # fits in 48 MiB (<=16 rows, or 24 rows at q <= 4); enable VMEM pad/ysend
@@ -1082,7 +1165,12 @@ _ARMS5_MAX_UNITS = 8
 
 
 def _compact_arms(
-    rows: int, n_units: int, *, opt: bool = True, expert_split: int = 0
+    rows: int,
+    n_units: int,
+    *,
+    opt: bool = True,
+    expert_split: int = 0,
+    use_c8: bool = True,
 ) -> tuple:
     """Compact expert row buckets, one code variant each (the full path is one more); a sixth
     variant overflows the instruction memory into overlay swaps."""
@@ -1091,7 +1179,7 @@ def _compact_arms(
     if opt:
         if rows <= 8:
             return (1, 2, 3, 4)
-        return (1, 2, 4, 8) if expert_split > 0 else (1, 2, 4)
+        return (1, 2, 4, 8) if (expert_split > 0 and use_c8) else (1, 2, 4)
     if rows > _COMPACT4_MAX_ROWS:
         return ()
     return (1, 2, 3, 4) if rows <= 8 else (1, 2, 3, 5)
