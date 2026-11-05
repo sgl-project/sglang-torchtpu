@@ -75,9 +75,14 @@ class KernelConfig:
     km_issue: int = 2
     embed_2d: bool = False
     init_streams: bool = False
+    # K-major weight tile width; the packed weights are shared by every bucket, so
+    # a server sets it once (None: 512 for a one-row kernel, else 256).
+    km_tile: int | None = None
 
     @property
     def km_cols(self) -> int:
+        if self.km_tile is not None:
+            return self.km_tile
         return 512 if self.rows == 1 else 256
 
     @property

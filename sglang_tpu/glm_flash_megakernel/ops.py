@@ -82,6 +82,7 @@ class GlmFlashMegakernel:
         self.max_len = max_len
         self.pages_per_seq = table_pages
         self.max_req = max(1, max_rows // n_query)
+        km_tile = 512 if self.max_req * n_query == 1 else 256
         self.cfgs = {
             b: D.KernelConfig(
                 max_len=max_len,
@@ -90,6 +91,7 @@ class GlmFlashMegakernel:
                 page_size=page_size,
                 table_pages=table_pages,
                 embed_2d=True,
+                km_tile=km_tile,
             )
             for b in _buckets(self.max_req)
         }
