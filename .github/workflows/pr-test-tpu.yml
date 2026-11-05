@@ -76,6 +76,7 @@ jobs:
               - 'python/sglang/multimodal_gen/runtime/distributed/parallel_state.py'
               - 'python/sglang/multimodal_gen/runtime/disaggregation/transport/manager.py'
               - 'python/sglang/multimodal_gen/runtime/managers/memory_managers/layerwise_offload.py'
+              - 'python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/stages/denoising.py'
               - 'python/sglang/multimodal_gen/test/unit/test_tpu_*.py'
               - 'python/sglang/multimodal_gen/test/unit/test_platform_detection.py'
               - 'python/pyproject_tpu.toml'

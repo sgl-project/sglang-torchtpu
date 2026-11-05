@@ -3,7 +3,7 @@
 
 import contextlib
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages import (
     comfyui_step,
+    denoising,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
@@ -368,6 +369,24 @@ class TestMiniMaxH3CompiledBlock(CustomTestCase):
         self.assertEqual(
             compiled, {f"blocks.{i}" for i in range(model.arch.num_layers)}
         )
+
+
+class TestMiniMaxH3FullLoopPlatform(CustomTestCase):
+    def test_full_loop_admits_tpu_and_rejects_an_unlisted_platform(self):
+        listed = ("is_cuda", "is_hip", "is_cpu", "is_mps", "is_npu", "is_xpu")
+        past_gate = RuntimeError("past the platform gate")
+        for is_tpu, error in ((True, "past the platform gate"), (False, "requires")):
+            platform = Mock(**{f"{name}.return_value": False for name in listed})
+            platform.is_tpu.return_value = is_tpu
+            platform.get_local_torch_device.side_effect = past_gate
+            with (
+                patch.object(denoising, "current_platform", platform),
+                patch.object(denoising, "_resolve_full_loop_context"),
+                self.assertRaisesRegex(RuntimeError, error),
+            ):
+                denoising.MiniMaxH3DenoisingStage._run_full_loop(
+                    None, batch=None, server_args=None
+                )
 
 
 if __name__ == "__main__":
