@@ -31,11 +31,13 @@ register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
 def _graph_config(
     *,
     tpu_compile_tracer: str,
+    use_spmd_compile: bool = False,
     unsafe_save_torch_compile_bundle: str | None = None,
     unsafe_load_torch_compile_bundle: str | None = None,
 ):
     graph = SimpleNamespace(
         tpu_compile_tracer=tpu_compile_tracer,
+        use_spmd_compile=use_spmd_compile,
         unsafe_save_torch_compile_bundle=unsafe_save_torch_compile_bundle,
         unsafe_load_torch_compile_bundle=unsafe_load_torch_compile_bundle,
     )
@@ -219,12 +221,7 @@ class TestViTTpuCompileRunner(unittest.TestCase):
             self.assertEqual(len(policy.compiled_fn.cache), 2)
 
     def test_direct_subgroups_require_shared_compilation(self):
-        policy = _DirectVisionPolicy(
-            nn.Identity(),
-            model_runner=SimpleNamespace(
-                server_args=SimpleNamespace(tpu_compile_tracer="direct")
-            ),
-        )
+        policy = _DirectVisionPolicy(nn.Identity())
         for initialized, tp_size, world_size, shared, expected in (
             (False, 1, 1, False, False),
             (True, 2, 16, False, False),
@@ -245,13 +242,7 @@ class TestViTTpuCompileRunner(unittest.TestCase):
                         tp_group=SimpleNamespace(world_size=tp_size)
                     ),
                 ),
-                patch.object(
-                    vit_runner,
-                    "get_exec",
-                    return_value=SimpleNamespace(
-                        graph=SimpleNamespace(use_spmd_compile=shared)
-                    ),
-                ),
+                _graph_config(tpu_compile_tracer="direct", use_spmd_compile=shared),
                 patch.object(direct_compile, "direct_compile") as compile_mock,
             ):
                 policy._compile_method(lambda x: x, use_bundle=False)
