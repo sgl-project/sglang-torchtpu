@@ -8,13 +8,13 @@ submission's launch flags and environment (see [Equivalence](#equivalence)).
 
 | File | What it is |
 | --- | --- |
-| `agentx.py` | The profile table and `config_for(conc)`, on top of `agentic.py` and `server.py`. |
+| `agentx.py` | The profile table and `config_for(conc)`, on top of `agentx_base.py` and `server.py`. |
 | `agentx_c<N>.py` | The server config of one swept point (`CONFIG = config_for(N)`). |
 | `windowed_draft.py` | Writes the draft directory the configs serve from (below). |
 | `run_agentx.sh` | The sweep driver: per point, boot, replay with AIPerf, summarize, stop. |
 | `agentx_summary.py` | The headline metrics from one AIPerf run. |
 
-`agentic.py` stays the single-session (cc=1, 256K) recipe. `agentic_1m.py`, an
+`agentx_base.py` is the single-session (cc=1, 256K) base; `agentic.py` is the P/D-capable `get_config(concurrency, mode)` recipe. `agentic_1m.py`, an
 earlier 1M profile, is retired: `agentx.py` replaces it.
 
 ## What you need

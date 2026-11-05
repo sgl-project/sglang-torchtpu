@@ -1,7 +1,7 @@
 """Muse Spark AgentX on one tpu7x host (tp8, 4 chips) at the model's native 1M context.
 
 The per-concurrency server configs of the AgentX sweep at concurrency 1, 7, 9, 10,
-16 and 22, as one profile table on top of agentic.py. agentx_c<N>.py is the config
+16 and 22, as one profile table on top of agentx_base.py. agentx_c<N>.py is the config
 of one swept point; README.md shows how to boot a point and replay the AgentX
 traces against it.
 
@@ -24,7 +24,7 @@ import argparse
 import json
 from copy import deepcopy
 
-from benchmark.tpu.recipe.configs.muse_spark.agentic import CONFIG as AGENTIC_CONFIG
+from benchmark.tpu.recipe.configs.muse_spark.agentx_base import CONFIG as AGENTIC_CONFIG
 from benchmark.tpu.recipe.configs.muse_spark.windowed_draft import default_dir
 
 SWEPT = (1, 7, 9, 10, 16, 22)

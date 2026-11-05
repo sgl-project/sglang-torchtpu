@@ -29,7 +29,9 @@ from benchmark.tpu.recipe.configs.muse_spark import (  # noqa: E402
 # Where things live, not how they are served.
 LOCATION_FLAGS = ("--model-path", "--speculative-draft-model-path", "--host", "--port")
 # Set by the caller's environment (base.py), or by the launcher for compile caches.
-CALLER_ENV = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "SGLANG_PLATFORM")
+CALLER_ENV = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "SGLANG_PLATFORM", "LOCAL_SIZE")
+# Load-time only: main's server.py prefetches checkpoint shards; serving is unchanged.
+LOAD_FLAGS = ("--weight-loader-prefetch-checkpoints",)
 
 
 def render(conc):
@@ -45,6 +47,8 @@ def render(conc):
             flags[flag].append(arg)
     for name in LOCATION_FLAGS:
         flags.pop(name)
+    for name in LOAD_FLAGS:
+        flags.pop(name, None)
     # The launcher's single-host mode adds ServerArgs' own default.
     assert flags.pop("--nnodes") == ["1"]
     env = {
@@ -190,7 +194,6 @@ COMMON_ENV = {
     "SGLANG_TPU_FUSED_RS_STAGING_SLOTS": "10",
     "SGLANG_TPU_FUSED_RS_WEIGHT_PINGPONG": "1",
     "SGLANG_TPU_HICACHE_TRIM_BEFORE_ALLOC": "1",
-    "SGLANG_TPU_HOST_PADDING": "1",
     "SGLANG_TPU_KV_PACK_HEADS": "1",
     "SGLANG_TPU_MK_FOLD_ATTN_SCALE": "1",
     "SGLANG_TPU_MK_SAL_FP8_DOT": "2",
