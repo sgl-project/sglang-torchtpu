@@ -41,7 +41,7 @@ def layout_type():
     from dataclasses import dataclass
 
     return definition(
-        "sglang_tpu/kernels/index_selection/packed_fp8_cache.py",
+        "sglang_tpu/kernels/deepseek_v41/index_selection/fp8/cache.py",
         "PackedFP8Layout",
         {"dataclass": dataclass, "PAGE_ROWS": 33, "PAGE_RECORDS": 128},
     )
@@ -82,7 +82,7 @@ def test_query_is_fp8_and_matches_writer_quantization():
         {"torch": torch},
     )
     writer_quantize = definition(
-        "sglang_tpu/kernels/index_selection/packed_fp8_cache.py",
+        "sglang_tpu/kernels/deepseek_v41/index_selection/fp8/cache.py",
         "quantize_index_rows",
         {"jax": jax, "jnp": jnp},
     )
@@ -101,33 +101,28 @@ def test_query_is_fp8_and_matches_writer_quantization():
     np.testing.assert_array_equal(scale.numpy(), np.asarray(expected_scale))
 
 
-@pytest.mark.parametrize("tokens,max_queries", [(8, 1), (128, 128)])
-def test_prepare_fake_shapes_follow_union_capacity(tokens, max_queries):
+@pytest.mark.parametrize("tokens,block", [(0, 8), (8, 8), (128, 16)])
+def test_prepare_fake_matches_prepared_candidates(tokens, block):
+    """One group per query bounds the pairing, as in the epic fake."""
     fake = definition(
         "sglang_tpu/dsv41/custom_ops.py", "fake_prepare", {"torch": torch}, nested=True
     )
-    groups, columns, count, block, topk = 8, 128, 2048, 8, 512
+    count = 2048
     words = torch.empty((17 * 1024, 128), dtype=torch.int32)
-    pages = torch.empty((groups, columns), dtype=torch.int32)
+    pages = torch.empty((8, 128), dtype=torch.int32)
     requests = torch.empty(tokens, dtype=torch.int32)
     candidates = torch.empty((tokens, count), dtype=torch.int32)
-    result = fake(
-        words, pages, requests, requests, candidates, 128, 64, topk, block, max_queries
-    )
-    width = columns * 128
-    capacity = min(width // block, min(tokens, max_queries) * count + topk // block)
-    capacity = (max(1, capacity) + 15) // 16 * 16
+    result = fake(words, pages, requests, candidates, 128, 64, block)
+    key_pages = (2 * count * block + 127) // 128
     shapes = [
-        (groups * capacity * block // 128 * 33, 128),
-        (groups, capacity),
-        (groups, capacity * block // 128),
-        (tokens,),
+        (tokens * key_pages * 33, 128),
         (tokens, count),
+        (tokens + 1,),
         (tokens,),
-        (),
+        (tokens, 2),
     ]
     assert [tuple(x.shape) for x in result] == shapes
-    assert [x.dtype for x in result] == [torch.int32] * 5 + [torch.bool] * 2
+    assert [x.dtype for x in result] == [torch.int32] * 3 + [torch.bool, torch.int32]
 
 
 def test_pool_factory_uses_fp8_even_for_core_force_fp4_selector():
@@ -170,21 +165,6 @@ def test_plugin_budget_matches_physical_packed_pages(storage, per_record):
         assert budget(100, config) == 100
 
 
-@pytest.mark.parametrize("tokens,groups", [(0, 8), (8, 0), (0, 0)])
-def test_prepare_fake_empty_owner_matches_kernel(tokens, groups):
-    fake = definition(
-        "sglang_tpu/dsv41/custom_ops.py", "fake_prepare", {"torch": torch}, nested=True
-    )
-    words = torch.empty((17, 128), dtype=torch.int32)
-    pages = torch.empty((groups, 8), dtype=torch.int32)
-    requests = torch.empty(tokens, dtype=torch.int32)
-    candidates = torch.empty((tokens, 128), dtype=torch.int32)
-    result = fake(words, pages, requests, requests, candidates, 128, 64, 512, 8, 1)
-    assert result[0].shape == (33, 128)
-    assert result[1].shape[0] == groups
-    assert result[3].shape == (tokens,)
-
-
 def test_publish_preserves_pool_identity_and_supplies_physical_page_size():
     publish = definition("sglang_tpu/dsv41/custom_ops.py", "publish_source", {})
     latent = torch.zeros((4, 128), dtype=torch.int32)
@@ -224,6 +204,11 @@ def test_candidate_reuse_is_scoped_by_source_and_publication():
             "torch": torch,
             "quantize_index_query": quantize,
             "apply_tpu_dsv4_rope": lambda q, *args: q,
+            "uses_prepared_candidates": definition(
+                "sglang_tpu/dsv41/custom_ops.py",
+                "uses_prepared_candidates",
+                {"PREPARED_BLOCK_SIZES": (8, 16, 32, 64, 128)},
+            ),
         },
         nested=True,
     )
@@ -236,7 +221,6 @@ def test_candidate_reuse_is_scoped_by_source_and_publication():
         index_versions={},
         candidate_version=1,
         prepared_index={},
-        index_max_queries=1,
         low_indices={},
     )
     words = torch.zeros((17, 128), dtype=torch.int32)
@@ -248,7 +232,7 @@ def test_candidate_reuse_is_scoped_by_source_and_publication():
 
     def prepare(*args):
         calls.append("gather")
-        return (torch.zeros(1),) * 7
+        return (torch.zeros(1),) * 5
 
     ops = SimpleNamespace(
         prepare_index=prepare,
