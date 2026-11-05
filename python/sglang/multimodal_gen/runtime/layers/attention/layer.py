@@ -1272,20 +1272,11 @@ class USPAttention(nn.Module):
                     ).transpose(1, 2)
 
             if get_ring_parallel_world_size() > 1:
-                if (
-                    meta_only_pad
-                    and q.shape[0] == 1
-                    and self.backend == AttentionBackendEnum.FA
-                ):
-                    return self._forward_ring_tail_pad(q, k, v, attn_mask_meta)
-                if (
-                    meta_only_pad
-                    and not self.causal
-                    and self.attn_impl.supports_ring_resume()
-                ):
-                    return self._forward_allgather_ring_tail_pad(
-                        q, k, v, attn_mask_meta
-                    )
+                ring_tail_pad = (
+                    self._ring_tail_pad_forward(q.shape[0]) if meta_only_pad else None
+                )
+                if ring_tail_pad is not None:
+                    return ring_tail_pad(q, k, v, attn_mask_meta)
                 raise NotImplementedError(
                     "USPAttention masked path supports ring parallelism only "
                     "for tail-pad metadata, on the FA backend at batch 1 or on "
@@ -1555,12 +1546,19 @@ class USPAttention(nn.Module):
         current parallel layout; the masked path's ring branch raises for it
         otherwise. A caller that cannot honour the padding attends to the pad
         keys instead, as without the metadata."""
-        if get_ring_parallel_world_size() == 1:
-            return True
-        # The ring branches of forward's masked path.
-        return (self.backend == AttentionBackendEnum.FA and batch_size == 1) or (
-            not self.causal and self.attn_impl.supports_ring_resume()
+        return (
+            get_ring_parallel_world_size() == 1
+            or self._ring_tail_pad_forward(batch_size) is not None
         )
+
+    def _ring_tail_pad_forward(self, batch_size: int):
+        """The ring path of forward's masked branch for tail-pad metadata
+        alone, or None where that branch raises."""
+        if self.backend == AttentionBackendEnum.FA and batch_size == 1:
+            return self._forward_ring_tail_pad
+        if not self.causal and self.attn_impl.supports_ring_resume():
+            return self._forward_allgather_ring_tail_pad
+        return None
 
     def _forward_ring_tail_pad(
         self,
