@@ -112,22 +112,21 @@ class TestUlyssesPadding(unittest.TestCase):
         ).transpose(1, 2)
         self.assertEqual(out.shape, q.shape)
         torch.testing.assert_close(out[:, : self.real], want)
-        return attn.attn_impl.kv_lens, out, exchanged_heads
+        return attn.attn_impl.kv_lens, exchanged_heads
 
     def test_selected_backend_attends_over_the_real_key_prefix(self):
-        kv_lens, out, _ = self._tail_pad_forward(AttentionBackendEnum.TORCH_SDPA)
+        kv_lens, _ = self._tail_pad_forward(AttentionBackendEnum.TORCH_SDPA)
         self.assertEqual(kv_lens, [self.real])
-        self.assertTrue(torch.all(out[:, self.real :] == 0))
 
     def test_sparse_backend_keeps_the_masked_fallback(self):
         # Sparse kernels need K/V as long as Q: the gathered-mask SDPA serves them.
-        kv_lens, _, _ = self._tail_pad_forward(AttentionBackendEnum.SLIDING_TILE_ATTN)
+        kv_lens, _ = self._tail_pad_forward(AttentionBackendEnum.SLIDING_TILE_ATTN)
         self.assertEqual(kv_lens, [])
 
     def test_padded_heads_cross_the_exchange_and_are_cut_after_it(self):
         # Z-Image's 30 heads at Ulysses 8, scaled down: 3 heads at Ulysses 4
         # enter the exchange as 4 and every real head comes back.
-        kv_lens, _, exchanged_heads = self._tail_pad_forward(
+        kv_lens, exchanged_heads = self._tail_pad_forward(
             AttentionBackendEnum.TORCH_SDPA, heads=3, degree=4
         )
         self.assertEqual(exchanged_heads, [4])

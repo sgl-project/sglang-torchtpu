@@ -940,7 +940,9 @@ class USPAttention(nn.Module):
             attn_mask_meta: optional metadata for the varlen FA fast path.
                 Callers may pass ``build_varlen_mask_meta(attn_mask)`` or a
                 known contiguous padding gap. Masked query rows are zero-filled
-                on output (differs from SDPA semantics).
+                on output (differs from SDPA semantics). Tail-pad metadata
+                alone (``tail_attn_meta``, no mask) leaves the pad query rows
+                unspecified; callers trim them.
 
         Note: Replicated tensors are not supported in this implementation.
         When skip_sequence_parallel=True (set at construction time), all SP
@@ -1384,11 +1386,6 @@ class USPAttention(nn.Module):
                 out = self.attn_impl.forward(
                     q, k[:, :meta_pad_start], v[:, :meta_pad_start], ctx_attn_metadata
                 )
-                # Not an in-place write into the impl's output buffer.
-                real_rows = (
-                    torch.arange(out.shape[1], device=out.device) < meta_pad_start
-                )
-                out = torch.where(real_rows[None, :, None, None], out, 0)
                 if sp_size > 1:
                     out = _usp_output_all_to_all(out, head_dim=2)
                 return out
