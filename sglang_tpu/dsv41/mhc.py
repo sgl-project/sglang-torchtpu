@@ -52,7 +52,7 @@ def pack_mix_weight(weight: torch.Tensor) -> torch.Tensor:
 @cache
 def register_ops():
     """Register once during model construction, before Dynamo sees the loop."""
-    from sglang_tpu.dsv41.kernels.mhc import (
+    from sglang_tpu.kernels.deepseek_v41.mhc.delayed import (
         _post_jax,
         delayed_post_pre_flat_jax,
         delayed_pre_flat_jax,
