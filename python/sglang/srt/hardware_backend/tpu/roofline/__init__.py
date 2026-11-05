@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Analytical TPU serving roofline: hardware specs, step floors, and layout solver."""
+"""Analytical TPU serving roofline, step floor, layout solver, and SGLang CLI emitter."""
 
 from __future__ import annotations
 
@@ -22,6 +22,15 @@ from .collectives import (
     collective_ici_hops,
     submesh_for_group,
     torus_collective_s,
+)
+from .emit import (
+    SOLVE_SCHEMA,
+    build_solve_payload,
+    emit_ceiling_rows,
+    emit_launch_args,
+    point_launch_args,
+    pool_cli_args,
+    top_layouts,
 )
 from .geometry import LAYER_FAMILIES, ModelGeometry, from_hf_config, supports
 from .hf_loader import Dtypes, dtypes_from_hf_config, load_hf_config
@@ -35,6 +44,7 @@ from .modules import (
     supports_fused_rs,
     uniform_pp_stage_geometries,
 )
+from .report import MAX_EMBEDDED_CANDIDATES, render_html, write_html
 from .serving import ConcurrencyRow, plan
 from .solver import (
     DEFAULT_GPU_MEMORY_UTILIZATION,
@@ -68,7 +78,9 @@ __all__ = [
     "EXAMPLE_SCENARIOS",
     "EXAMPLE_SLO_TIERS",
     "LAYER_FAMILIES",
+    "MAX_EMBEDDED_CANDIDATES",
     "PREFIX_HIT_SWEEP_GRID",
+    "SOLVE_SCHEMA",
     "TOPOLOGIES",
     "TPU_SMEM_PAGE_TABLE_LIMIT_BYTES",
     "ChipSpec",
@@ -89,9 +101,12 @@ __all__ = [
     "StepShape",
     "TrafficScenario",
     "build_example_scenario",
+    "build_solve_payload",
     "collective_ici_hops",
     "default_page_size",
     "dtypes_from_hf_config",
+    "emit_ceiling_rows",
+    "emit_launch_args",
     "ep_busiest_experts",
     "experts_touched",
     "from_hf_config",
@@ -102,6 +117,9 @@ __all__ = [
     "load_hf_config",
     "pass_costs",
     "plan",
+    "point_launch_args",
+    "pool_cli_args",
+    "render_html",
     "solve_serving_plan",
     "spec_cycle_floor",
     "step_floor",
@@ -109,6 +127,8 @@ __all__ = [
     "supports",
     "supports_fused_rs",
     "sweep_prefix_hit_crossover",
+    "top_layouts",
     "torus_collective_s",
     "uniform_pp_stage_geometries",
+    "write_html",
 ]
