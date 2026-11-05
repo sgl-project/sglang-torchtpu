@@ -1,7 +1,7 @@
-"""GPT-OSS-20B single-host cache/offload and quality gate.
+"""GPT-OSS-20B single-host cache/offload and quality check under write_through.
 
-The PR gate verifies device-cache reuse, Raiden host offload of prompt and
-decode KV, and basic GSM8K quality. The 120B variant provides broader nightly coverage.
+Verifies device-cache reuse, Raiden host offload of prompt and decode KV,
+and basic GSM8K quality. The PR gate runs the write_back copy.
 """
 
 import os
@@ -10,11 +10,13 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
 from sglang.test.tpu.utils.accuracy_base import recipe_server_args
 from sglang.test.tpu.utils.kv_offload_probe import kv_offload_runner
+from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
 
-# Expected runtime includes model download, compilation, and the eviction probe.
+# Expected runtime includes model load, compilation, and the eviction probe.
 register_tpu_ci(
     est_time=280,
-    suite="stage-b-test-tpu-4-v7",
+    suite="nightly-tpu-4-v7",
+    nightly=True,
     labels=["singlehost", "gpt-oss-20b", "prefix-cache", "kv-offload"],
 )
 
@@ -38,6 +40,8 @@ MODEL_CONFIG = {
     "variant": "TP8+EP8+HiCache-raiden",
     "launch": {
         "config": CONFIG_MODULE,
+        # The CI weights mount; the recipe's Hub id would download the model.
+        "env": {"MODEL": resolve_tpu_model_path("openai/gpt-oss-20b")},
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "gpt-oss-20b-prefix-cache-kv-offload-e2e",
     },

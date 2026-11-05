@@ -22,7 +22,7 @@ try:
 except Exception:  # pragma: no cover - non-TPU host
     _HAS_TPU = False
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit", chips=1)
 
 # GLM-5.3-Flash KDA per TP8 rank: 8 heads of 128, short conv 4, bounded gate.
 N_V, D, K, LOWER = 8, 128, 4, -5.0

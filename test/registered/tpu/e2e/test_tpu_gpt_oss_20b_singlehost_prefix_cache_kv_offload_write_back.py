@@ -1,6 +1,6 @@
 """GPT-OSS-20B single-host cache/offload gate under the write_back policy.
 
-The write_through gate backs every prefix up at insert; this one backs a prefix
+The write_through variant backs every prefix up at insert; this one backs a prefix
 up only near eviction, through the copy-ahead window or, past it, at eviction.
 The probe's host reload therefore covers write_back's copies of prompt and
 decode KV, and GSM8K the quality after it.
@@ -12,8 +12,9 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
 from sglang.test.tpu.utils.accuracy_base import recipe_server_args
 from sglang.test.tpu.utils.kv_offload_probe import kv_offload_runner
+from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
 
-# Expected runtime includes model download, compilation, and the eviction probe.
+# Expected runtime includes model load, compilation, and the eviction probe.
 register_tpu_ci(
     est_time=280,
     suite="stage-b-test-tpu-4-v7",
@@ -40,6 +41,8 @@ MODEL_CONFIG = {
     "variant": "TP8+EP8+HiCache-raiden-write-back",
     "launch": {
         "config": CONFIG_MODULE,
+        # The CI weights mount; the recipe's Hub id would download the model.
+        "env": {"MODEL": resolve_tpu_model_path("openai/gpt-oss-20b")},
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "gpt-oss-20b-prefix-cache-kv-offload-write-back-e2e",
     },

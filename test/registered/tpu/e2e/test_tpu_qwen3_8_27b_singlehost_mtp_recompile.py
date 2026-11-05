@@ -1,4 +1,4 @@
-"""Qwen3.8-27B MTP PR gate: the experimental spec worker serves with no XLA compile.
+"""Qwen3.8-27B MTP, radix off: the experimental spec worker serves with no XLA compile.
 
 Requests of staggered lengths drain the batch through every live size, so a
 program keyed on live rows instead of the batch bucket compiles mid-serving and
@@ -18,7 +18,8 @@ from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
 
 register_tpu_ci(
     est_time=900,
-    suite="stage-b-test-tpu-4-v7",
+    suite="nightly-tpu-4-v7",
+    nightly=True,
     labels=["singlehost", "qwen3.8-27b", "spec", "compile"],
 )
 

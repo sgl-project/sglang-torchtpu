@@ -43,8 +43,10 @@ from sglang.test.test_utils import CustomTestCase
 register_tpu_ci(
     # One runtime start (minutes on the CI slice) plus five short cases.
     est_time=600,
-    suite="stage-a-test-tpu-unit",
-    chips=4,
+    # Nightly: only a torch-tpu bump can break this, so run it on bump PRs too.
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    labels=["singlehost", "infra", "collectives"],
 )
 
 # (case, stage size) in run order. A hang stops the cases after it.

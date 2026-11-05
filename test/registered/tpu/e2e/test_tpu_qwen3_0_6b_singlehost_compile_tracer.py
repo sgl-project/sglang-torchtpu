@@ -1,4 +1,7 @@
-"""End-to-end tests for the TPU compilation tracers."""
+"""End-to-end tests for the direct TPU compilation tracer.
+
+The smoke test checks that dynamo is the default.
+"""
 
 import sys
 import unittest
@@ -36,15 +39,13 @@ EAGLE3_DRAFT_MODEL = "AngelSlim/Qwen3-1.7B_eagle3"
 class TestTpuQwen306bSinglehostCompileTracer(CustomTestCase):
     def _run_server(
         self,
-        tracer,
         *,
         model=MODEL,
         overrides=None,
         expect_speculative_decoding=False,
     ):
         config = deepcopy(CONFIG)
-        if tracer == "direct":
-            config["server_args"]["tpu_compile_tracer"] = "direct"
+        config["server_args"]["tpu_compile_tracer"] = "direct"
         config["server_args"].update(overrides or {})
         # The helper supplies the model and URL-derived connection flags.
         for name in ("model_path", "host", "port"):
@@ -86,22 +87,18 @@ class TestTpuQwen306bSinglehostCompileTracer(CustomTestCase):
                 f"{DEFAULT_URL_FOR_TEST}/server_info", timeout=30
             ).json()
             state = server_info["internal_states"][0]
-            self.assertEqual(state["tpu_compile_tracer"], tracer)
+            self.assertEqual(state["tpu_compile_tracer"], "direct")
             return state
         finally:
             kill_process_tree(process.pid, wait_timeout=30)
 
-    def test_dynamo_is_default(self):
-        self._run_server("dynamo")
-
     def test_direct_bypasses_dynamo_and_aot_autograd(self):
-        state = self._run_server("direct")
+        state = self._run_server()
         self.assertEqual(state["torch_compile_dynamo_frames"], 0)
         self.assertEqual(state["torch_compile_aot_autograd_graphs"], 0)
 
     def test_direct_with_eagle3(self):
         state = self._run_server(
-            "direct",
             model=EAGLE3_MODEL,
             overrides={
                 "attention_backend": "pallas_tpu_rpa_v3",
