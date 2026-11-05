@@ -173,10 +173,12 @@ class TpuOOTPlatform(TpuPlatform):
 
     @classmethod
     def drain_device_queue_after_request(cls) -> bool:
-        # Without it Wan2.2-A14B hangs in its second warmup request: 7 of 8
-        # ranks block in a host-to-device copy behind collectives one rank
-        # never queued (4 of 4 runs, torch_tpu 0.2.0rc4 and 0.2.0). Output
-        # and warm latency are unchanged.
+        # Workaround for torch_tpu 0.2.0rc4 and 0.2.0: seeding torch.Generator("tpu")
+        # does a blocking host-to-device copy that waits behind queued collectives.
+        # Wan2.2-A14B's second request hung with 7 of 8 ranks in that copy while the
+        # 8th waited in a host all_reduce (4 of 4 runs; warm latency is unchanged).
+        # test_diffusion_wan22_ti2v_5b.py seeds on the CPU for the same copy; remove
+        # both once a TPU Generator seeds without blocking.
         return True
 
     @classmethod
