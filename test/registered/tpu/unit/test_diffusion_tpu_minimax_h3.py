@@ -44,7 +44,9 @@ from sglang_tpu.multimodal_gen import minimax_h3, worker
 from sglang_tpu.multimodal_gen.tpu_splash_attn import TpuSplashAttentionImpl
 
 # The TPU lane installs the diffusion_tpu extras (cache-dit) the H3 DiT imports.
-register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit", chips=1)
+# Whole node, not chips=1: the parallel-state setup runs the TPU worker
+# bootstrap, which opens a chip outside the chip-parallel TPU_VISIBLE_CHIPS pin.
+register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit")
 
 
 def _init_parallel_state():
