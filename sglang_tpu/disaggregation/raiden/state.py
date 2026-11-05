@@ -117,3 +117,7 @@ class DecodeState:
     reshard_swa_sources: Dict[int, Dict[int, List[int]]] = field(default_factory=dict)
     reshard_meta: Dict[int, dict] = field(default_factory=dict)
     reshard_registered: Set[int] = field(default_factory=set)
+
+    # Closing receive plans waiting for host staging, by room: (parked at,
+    # admission charges, publish arguments).
+    reshard_parked: Dict[int, tuple] = field(default_factory=dict)
