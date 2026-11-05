@@ -199,17 +199,26 @@ def _fit_pp_proxy_rows(proxy: Any, input_ids: Any, forward_batch: Any) -> Any:
     The ICI wave delivers the previous stage's activations at its fixed buffer
     size (the largest token bucket), so a longer proxy is trimmed to this
     stage's padded token count; a shorter one means the two stages padded to
-    different buckets and is rejected.
+    different buckets and is rejected. The buffered hand-off receives exactly
+    the padded token count the scheduler derived from the batch, so any other
+    row count there means that derivation and this padding disagree.
     """
     reference = input_ids if input_ids is not None else forward_batch.input_ids
     if reference is None:
         return proxy
     expected = int(reference.shape[0])
+    exact = envs.SGLANG_USE_TPU_PP_BUFFERED_HANDOFF.get()
     tensors = {}
     trimmed = False
     for name, tensor in proxy.tensors.items():
         if isinstance(tensor, torch.Tensor):
             rows = int(tensor.shape[0])
+            if exact and rows != expected:
+                raise ValueError(
+                    f"pp_proxy_tensors[{name!r}] has {rows} rows but the padded "
+                    f"batch has {expected} input tokens; the buffered hand-off "
+                    "received a different row count than the forward pads to."
+                )
             if rows < expected:
                 raise ValueError(
                     f"pp_proxy_tensors[{name!r}] has {rows} rows but the padded "
@@ -566,6 +575,65 @@ def _pad_mamba_tracking(forward_batch: Any, pad_b: int) -> None:
     forward_batch._tpu_mamba_tracking_cpu = originals
 
 
+def speculative_tokens_per_req(forward_mode: Any, spec_info: Any) -> int | None:
+    """The fixed speculative width a verify or draft-extend forward pads each
+    request to; None for every other forward."""
+    if spec_info is None:
+        return None
+    if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
+        return spec_info.num_tokens_per_req
+    return None
+
+
+def forward_pad_shape(
+    forward_mode: Any,
+    real_q: int,
+    real_b: int,
+    num_tokens_per_req: int | None,
+    t_bucketer: Bucketer,
+    b_bucketer: Bucketer,
+    extend_bs: int | None = None,
+) -> tuple[int, int]:
+    """The (tokens, batch) bucket shape a forward of ``real_q`` tokens over
+    ``real_b`` requests is padded to, without DP attention (whose ranks agree
+    on one shape). ``num_tokens_per_req`` is the speculative width of a verify
+    or draft-extend forward, None otherwise. A decode forward's ``real_q`` is
+    its batch size."""
+    is_draft_extend_v2 = forward_mode.is_draft_extend_v2()
+    if forward_mode.is_decode():
+        return b_bucketer.next_bucket(real_q), b_bucketer.next_bucket(real_b)
+    if forward_mode.is_mixed():
+        extend_cap = _extend_batch_cap(t_bucketer, b_bucketer, extend_bs)
+        mixed_cap = _extend_batch_cap(t_bucketer, b_bucketer, b_bucketer.max_val)
+        pad_b = extend_cap if real_b <= extend_cap else mixed_cap
+        if real_b > pad_b:
+            raise ValueError(
+                f"TPU mixed batch size {real_b} exceeds its compile cap {pad_b}. "
+                "Increase --torch-compile-max-bs to cover the largest mixed batch."
+            )
+        return t_bucketer.next_bucket(max(real_q, pad_b)), pad_b
+    if forward_mode.is_target_verify() and num_tokens_per_req is not None:
+        # Verify is decode-like: batch follows the bs bucket (not pinned to the
+        # cap), with a fixed speculative width per request.
+        pad_b = b_bucketer.next_bucket(real_b)
+        return pad_b * num_tokens_per_req, pad_b
+    if is_draft_extend_v2 and num_tokens_per_req is not None:
+        pad_b = b_bucketer.next_bucket(real_b)
+        assert num_tokens_per_req > 0, (
+            f"DRAFT_EXTEND_V2 requires num_tokens_per_req > 0, got {num_tokens_per_req}"
+        )
+        return pad_b * num_tokens_per_req, pad_b
+    # Prefill/extend is precompiled at a fixed batch cap to avoid compiling
+    # the full token_bucket x batch_bucket cross product.
+    pad_b = _extend_batch_cap(t_bucketer, b_bucketer, extend_bs)
+    if real_b > pad_b:
+        raise ValueError(
+            f"TPU extend batch size {real_b} exceeds its compile cap {pad_b}. "
+            "Set --prefill-max-requests to at least the largest extend batch."
+        )
+    return t_bucketer.next_bucket(max(real_q, pad_b)), pad_b
+
+
 def _pad_forward_batch_inputs(
     forward_batch: Any,
     t_bucketer: Bucketer,
@@ -588,48 +656,18 @@ def _pad_forward_batch_inputs(
         pad_t, pad_b, real_q_out, real_b_out = _dp_attn_prepare_padding(
             forward_batch, t_bucketer, b_bucketer, real_q, real_b
         )
-    elif is_decode:
-        pad_t = b_bucketer.next_bucket(real_q)
-        pad_b = b_bucketer.next_bucket(real_b)
-        real_q_out, real_b_out = real_q, real_b
-    elif forward_batch.forward_mode.is_mixed():
-        extend_cap = _extend_batch_cap(t_bucketer, b_bucketer, extend_bs)
-        mixed_cap = _extend_batch_cap(t_bucketer, b_bucketer, b_bucketer.max_val)
-        pad_b = extend_cap if real_b <= extend_cap else mixed_cap
-        if real_b > pad_b:
-            raise ValueError(
-                f"TPU mixed batch size {real_b} exceeds its compile cap {pad_b}. "
-                "Increase --torch-compile-max-bs to cover the largest mixed batch."
-            )
-        pad_t = t_bucketer.next_bucket(max(real_q, pad_b))
-        real_q_out, real_b_out = real_q, real_b
-    elif (
-        forward_batch.forward_mode.is_target_verify()
-        and forward_batch.spec_info is not None
-    ):
-        # Verify is decode-like: batch follows the bs bucket (not pinned to the
-        # cap), with a fixed speculative width per request.
-        pad_b = b_bucketer.next_bucket(real_b)
-        pad_t = pad_b * forward_batch.spec_info.num_tokens_per_req
-        real_q_out, real_b_out = real_q, real_b
-    elif is_draft_extend_v2 and forward_batch.spec_info is not None:
-        pad_b = b_bucketer.next_bucket(real_b)
-        num_tokens_per_req = forward_batch.spec_info.num_tokens_per_req
-        assert num_tokens_per_req > 0, (
-            f"DRAFT_EXTEND_V2 requires num_tokens_per_req > 0, got {num_tokens_per_req}"
-        )
-        pad_t = pad_b * num_tokens_per_req
-        real_q_out, real_b_out = real_q, real_b
     else:
-        # Prefill/extend is precompiled at a fixed batch cap to avoid compiling
-        # the full token_bucket x batch_bucket cross product.
-        pad_b = _extend_batch_cap(t_bucketer, b_bucketer, extend_bs)
-        if real_b > pad_b:
-            raise ValueError(
-                f"TPU extend batch size {real_b} exceeds its compile cap {pad_b}. "
-                "Set --prefill-max-requests to at least the largest extend batch."
-            )
-        pad_t = t_bucketer.next_bucket(max(real_q, pad_b))
+        pad_t, pad_b = forward_pad_shape(
+            forward_batch.forward_mode,
+            real_q,
+            real_b,
+            speculative_tokens_per_req(
+                forward_batch.forward_mode, forward_batch.spec_info
+            ),
+            t_bucketer,
+            b_bucketer,
+            extend_bs,
+        )
         real_q_out, real_b_out = real_q, real_b
 
     _pad_batch_fields(

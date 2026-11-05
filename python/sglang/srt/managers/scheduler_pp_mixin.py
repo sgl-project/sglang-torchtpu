@@ -101,7 +101,8 @@ class SchedulerPPMixin:
     # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
     # init_pp_loop_state overwrites it per instance.
     _pp_spec_relay: bool = False
-    # The TPU ICI hand-off; init_pp_loop_state builds it on TPU only.
+    # The TPU stage hand-off (the ICI wave, or the buffered hand-off);
+    # init_pp_loop_state builds it on TPU only.
     _pp_wave = None
 
     @DynamicGradMode()
@@ -160,7 +161,7 @@ class SchedulerPPMixin:
                 self._pp_begin_iteration(cur_batch is not None)
                 if cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy()
+                    pp_proxy_tensors = self._pp_recv_proxy(cur_batch)
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -187,6 +188,9 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                send_after_launch = self._pp_hands_off_after_launch()
+                if send_after_launch:
+                    self._pp_send_proxy(result if cur_batch else None)
                 if exchange_outputs_before_forward:
                     self._pp_send_deferred_output(next_first_rank_mb_id)
                 if not exchange_outputs_before_forward:
@@ -210,7 +214,8 @@ class SchedulerPPMixin:
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
-                self._pp_send_proxy(result if cur_batch else None)
+                if not send_after_launch:
+                    self._pp_send_proxy(result if cur_batch else None)
                 self._pp_process_freeze_gc(recv_reqs)
 
                 self.pp_outputs = next_pp_outputs
@@ -234,13 +239,16 @@ class SchedulerPPMixin:
         if self._pp_wave is not None:
             self._pp_wave.begin_iteration(has_forward)
 
-    def _pp_recv_proxy(self: Scheduler) -> Optional[PPProxyTensors]:
+    def _pp_recv_proxy(
+        self: Scheduler, batch: ScheduleBatch
+    ) -> Optional[PPProxyTensors]:
         """This iteration's activations from the previous stage (None on the
-        first stage). Over the wave they arrive at its row count; the
-        compiled forward shim trims them to the batch's token bucket."""
+        first stage). Over the wave they arrive at its row count and the
+        compiled forward shim trims them to the batch's token bucket; over
+        the buffered hand-off they arrive at that bucket."""
         if self._pp_wave is None:
             return self._pp_recv_proxy_tensors()
-        tensors = self._pp_wave.receive()
+        tensors = self._pp_wave.receive_batch(batch)
         return None if tensors is None else PPProxyTensors(tensors)
 
     def _pp_process_freeze_gc(self: Scheduler, recv_reqs: List) -> None:
@@ -264,6 +272,14 @@ class SchedulerPPMixin:
         if result is None or self.pp_group.is_last_rank:
             return
         self._pp_send_proxy_to_next_stage(result)
+
+    def _pp_hands_off_after_launch(self: Scheduler) -> bool:
+        """Whether this iteration's activations go to the next stage right
+        after its forward is launched. The wave sends at the end of the
+        iteration, where its launch order across stages needs it; the
+        buffered hand-off pairs no launches, so waiting behind the output
+        relay and an older micro-batch's results only delays the next stage."""
+        return bool(getattr(self._pp_wave, "hands_off_after_launch", False))
 
     def _pp_output_send_deferred(self: Scheduler) -> bool:
         """Over the wave the last stage sends the previous outputs after it
@@ -397,7 +413,7 @@ class SchedulerPPMixin:
                 self._pp_begin_iteration(cur_batch is not None)
                 if cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy()
+                    pp_proxy_tensors = self._pp_recv_proxy(cur_batch)
 
                 if get_parallel().pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -419,6 +435,9 @@ class SchedulerPPMixin:
                         self.last_rank_comm_queue,
                     )
                     self._pp_pd_stage_ready(mb_id, cur_batch, result)
+                send_after_launch = self._pp_hands_off_after_launch()
+                if send_after_launch:
+                    self._pp_send_proxy(result if cur_batch else None)
                 if get_parallel().pp_async_batch_depth > 0:
                     self._pp_pd_send_deferred_output(next_first_rank_mb_id)
                 if get_parallel().pp_async_batch_depth == 0:
@@ -473,7 +492,8 @@ class SchedulerPPMixin:
                     self.send_req_work, send_bootstrapped_work, send_transfer_work = (
                         control
                     )
-                self._pp_send_proxy(result if cur_batch else None)
+                if not send_after_launch:
+                    self._pp_send_proxy(result if cur_batch else None)
                 self._pp_process_freeze_gc(recv_reqs)
 
                 self.pp_outputs = next_pp_outputs
@@ -601,7 +621,7 @@ class SchedulerPPMixin:
                     server_is_idle = False
                     pp_proxy_tensors = None
                     if has_forward:
-                        pp_proxy_tensors = self._pp_recv_proxy()
+                        pp_proxy_tensors = self._pp_recv_proxy(cur_batch)
 
                 # early send output if possible
                 if get_parallel().pp_async_batch_depth > 0:
@@ -622,6 +642,9 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                send_after_launch = self._pp_hands_off_after_launch()
+                if send_after_launch:
+                    self._pp_send_proxy(result if has_forward else None)
 
                 if get_parallel().pp_async_batch_depth > 0:
                     self._pp_send_deferred_output(next_first_rank_mb_id)
@@ -707,7 +730,8 @@ class SchedulerPPMixin:
                         send_prealloc_work,
                         send_transfer_work,
                     ) = control
-                self._pp_send_proxy(result if has_forward else None)
+                if not send_after_launch:
+                    self._pp_send_proxy(result if has_forward else None)
                 self._pp_process_freeze_gc(recv_reqs)
 
                 self.pp_outputs = next_pp_outputs

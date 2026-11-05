@@ -174,6 +174,28 @@ clearing, JAX cache clearing, CPU-backend release, garbage collection before
 freezing and startup heap trimming. File-cache release retains its separate
 opt-outs.
 
+## Pipeline stage hand-off
+
+Pipeline stages hand activations on in lockstep by default (`pp_wave.py`): one
+collective-permute that every device launches in the same order, so each round
+lasts as long as the slowest forward in flight and the pipeline drains with
+zero launches.
+
+- `SGLANG_USE_TPU_PP_BUFFERED_HANDOFF=1` selects the buffered hand-off
+  (`pp_buffered.py`). Each stage sends a forward's output to the same column of
+  the next stage with a point-to-point send as soon as the forward is launched,
+  so a stage waits only for its own input.
+- `SGLANG_TPU_PP_BUFFERED_SEND_DEPTH` (default `2`) caps the forwards a stage
+  queues for sending before it blocks.
+- Needs torch_tpu 0.2.0 and libtpu 0.0.50 or later; a start-up self-test checks
+  the routing and the bytes and fails fast otherwise.
+- HBM: a device holds up to `7 + SGLANG_TPU_PP_BUFFERED_SEND_DEPTH` hand-off
+  buffers of the largest token bucket x hidden size (plus the aux capture slots
+  under Eagle3 or DFlash) in the model dtype, about 94 MiB each for GPT-OSS-120B
+  at 16384 rows. They are not reserved before the KV cache is sized, so leave
+  that headroom in `--mem-fraction-static`.
+- Not supported with DP attention or prefill context parallelism.
+
 ## Fixed-cohort benchmark gate
 
 - Enable with `SGLANG_TPU_BENCHMARK_BATCH_SIZE=N` (default: `0`, disabled).

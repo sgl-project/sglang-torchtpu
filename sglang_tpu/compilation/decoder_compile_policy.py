@@ -67,6 +67,8 @@ from sglang_tpu.compilation.compiled_forward_shim import (
     _pad_forward_batch_inputs,
     _restore_forward_batch_inputs,
     build_bucketers,
+    forward_pad_shape,
+    speculative_tokens_per_req,
 )
 from sglang_tpu.compilation.frame_stack import (
     call_with_reserved_frame_stack,
@@ -565,6 +567,26 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         assert self.b_bucketer is not None
         return _extend_batch_cap(self.t_bucketer, self.b_bucketer, self.extend_bs)
 
+    def forward_rows(
+        self, forward_mode: ForwardMode, real_q: int, real_b: int, spec_info: Any
+    ) -> int:
+        """The token rows a forward of ``real_q`` tokens over ``real_b``
+        requests is padded to (prepare_forward_batch), for a stage that must
+        size its pipeline receive before the forward. Not for context-parallel
+        or DP-attention forwards, whose padding depends on other ranks."""
+        assert self.t_bucketer is not None
+        assert self.b_bucketer is not None
+        pad_t, _ = forward_pad_shape(
+            forward_mode,
+            real_q,
+            real_b,
+            speculative_tokens_per_req(forward_mode, spec_info),
+            self.t_bucketer,
+            self.b_bucketer,
+            self.extend_bs,
+        )
+        return pad_t
+
     def max_padded_tokens(self) -> int:
         """The most token rows a forward is padded to: the last token bucket,
         or the last batch bucket for a decode batch."""
@@ -980,7 +1002,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         # Serving trims the wave's max-bucket buffers to the batch's bucket
         # (_fit_pp_proxy_rows), so the program takes row views of them; warm
         # with the same views, or each bucket copies its view on first use.
-        rows = self.max_padded_tokens()
+        # The buffered hand-off receives each tensor at the bucket itself.
+        buffered = tpu_envs.SGLANG_USE_TPU_PP_BUFFERED_HANDOFF.get()
         transfer_dtype = getattr(
             self.model_runner.model,
             "pp_transfer_dtype",
@@ -988,12 +1011,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
 
         def zeros(shape: tuple[int, int], dtype: torch.dtype) -> torch.Tensor:
+            rows = shape[0] if buffered else self.max_padded_tokens()
             buffer = torch.zeros(
                 (rows, shape[1]),
                 dtype=dtype,
                 device=self.model_runner.device,
             )
-            return buffer[: shape[0]]
+            return buffer if buffered else buffer[: shape[0]]
 
         proxy = {
             "hidden_states": zeros((num_tokens, hidden_size), transfer_dtype),
