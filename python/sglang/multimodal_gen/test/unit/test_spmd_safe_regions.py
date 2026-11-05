@@ -314,9 +314,8 @@ class TestWanBlockCompilesAsOneGraph(unittest.TestCase):
 
 class TestDrainAfterRequest(unittest.TestCase):
     """When the platform asks, every rank drains its device queue after each
-    request whose forward returned, warmups included. On TPU a skipped drain
-    hung Wan2.2-A14B's second warmup request on the ranks that do not return
-    the output."""
+    request whose forward returned, warmups included: on TPU a skipped drain
+    hung Wan2.2-A14B's second warmup request with 7 of its 8 ranks blocked."""
 
     def _serve(self, *, drain, forward, num_requests, output_rank=True, warmup=False):
         events = []
