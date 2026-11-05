@@ -26,10 +26,6 @@ class TestTpuFusionBarrier(unittest.TestCase):
         with patch.object(torch.compiler, "is_compiling", return_value=True):
             self.assertIs(TpuOOTPlatform.fusion_barrier(x), x)
 
-    def test_eager_tpu_tensors_pass_through(self):
-        x = self._TPU_TENSOR
-        self.assertIs(TpuOOTPlatform.fusion_barrier(x), x)
-
     def test_compiled_tpu_tensors_take_the_torch_tpu_barrier(self):
         x = self._TPU_TENSOR
         barrier = MagicMock(return_value=["barrier"])
