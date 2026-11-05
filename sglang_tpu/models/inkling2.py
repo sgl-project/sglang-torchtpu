@@ -877,6 +877,8 @@ class Inkling2ForConditionalGeneration(nn.Module):
         prefix = name.split(".mlp.experts.", 1)[0] + ".mlp.experts."
         leaf = name[len(prefix):]
         precision = self.quant_config.expert_precision(prefix) if self.quant_config else "bf16"
+        # Narrow to this rank's experts first: the conversions below then touch 1/EP of the stack.
+        tensor = _ep_slice(tensor, self.text_config.n_routed_experts)
         if precision == "fp8_block":  # stored ready to use: FP8 weights and their block scales
             _copy_expert_slice(params[name], tensor)
             loaded.add(name)
@@ -903,7 +905,7 @@ class Inkling2ForConditionalGeneration(nn.Module):
         if leaf.startswith("w13"):
             tensor = _deinterleave_gate_up(tensor)
         if precision in ("nvfp4", "mxfp8"):
-            tensor, scale_inv = _quant_block_fp8(_ep_slice(tensor, self.text_config.n_routed_experts))
+            tensor, scale_inv = _quant_block_fp8(tensor)
             _copy_expert_slice(params[target + "_scale_inv"], scale_inv)
             loaded.add(target + "_scale_inv")
         _copy_expert_slice(params[target], tensor)
@@ -934,7 +936,7 @@ class Inkling2ForConditionalGeneration(nn.Module):
     def _take_nvfp4(self, prefix, leaf, tensor):
         """(weight leaf, BF16 [E, N, K]) once weight, block scale, amax and denominator arrived."""
         weight_leaf = leaf.split("_weight", 1)[0] + "_weight"
-        self._pending[prefix + leaf] = _ep_slice(tensor, self.text_config.n_routed_experts)
+        self._pending[prefix + leaf] = tensor
         parts = [prefix + weight_leaf + s for s in ("", "_scale", "_amax", "_outer_scale_denominator")]
         if any(p not in self._pending for p in parts):
             return None
