@@ -207,7 +207,12 @@ class TestRuntimeEnvironment(unittest.TestCase):
         self.assertEqual(decode["runtime_env"]["SGLANG_TPU_MUSE_MEGAKERNEL"], "1")
         self.assertEqual(decode["runtime_env"]["SGLANG_TPU_MUSE_MK_MAX_ROWS"], "256")
         for config in (prefill, decode):
-            self.assertEqual(config["server_args"]["kv_cache_dtype"], "bfloat16")
+            self.assertEqual(config["server_args"]["kv_cache_dtype"], "fp8_e4m3")
+            env = config["runtime_env"]
+            self.assertEqual(env["SGLANG_TPU_PD_DECODE_DRAFT_PREFILL"], "1")
+            self.assertEqual(env["SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER"], "1")
+            self.assertNotIn("SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY", env)
+        self.assertEqual(prefill["runtime_env"]["SGLANG_TPU_MUSE_PREFILL_SP"], "0")
         self.assertEqual(decode["runtime_env"]["SGLANG_RAIDEN_PIPELINE_TRANSFER"], "1")
         for config, mode in ((prefill, "prefill"), (decode, "decode")):
             self.assertEqual(config["server_args"]["disaggregation_mode"], mode)
