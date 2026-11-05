@@ -33,11 +33,15 @@ from sglang_tpu.compilation.decoder_compile_policy import (  # noqa: E402
     DecoderTpuCompilePolicy,
 )
 from sglang_tpu.envs import envs as tpu_envs  # noqa: E402
+from sglang_tpu.hooks.pp_buffered_kv_budget import (  # noqa: E402
+    reserve_pp_buffered_handoff,
+)
 from sglang_tpu.pp_buffered import (  # noqa: E402
     _MAX_RECEIVES,
     _POST_LOG_EVERY,
     PPBufferedHandoff,
     Transport,
+    hbm_reserve_bytes,
 )
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -78,6 +82,8 @@ class FakeTransport(Transport):
         self.send_gate = send_gate
         self.synced = []
         self.flushed_all = 0
+        self.checked = []
+        self.fail_check = False
 
     def recv_list(self, tensors, src, tag):
         with self.net.cv:
@@ -124,6 +130,11 @@ class FakeTransport(Transport):
 
     def fence(self):
         return FakeFence(self.synced)
+
+    def check_free(self, nbytes, device):
+        self.checked.append(nbytes)
+        if self.fail_check:
+            raise RuntimeError("RESOURCE_EXHAUSTED: out of HBM")
 
 
 def make_handoff(
@@ -435,6 +446,104 @@ class TestWarmup(unittest.TestCase):
         self.assertNotIn((2, 128), last)
 
 
+class TestHbmReserve(unittest.TestCase):
+    def test_worst_case_counts_receives_sends_and_zero_residuals(self):
+        # GPT-OSS-120B PP8 at 16384 rows: 7 receives + 3 sends of 94 MiB, plus
+        # one zero residual per bucket (512..16384 tokens, 8..64 requests).
+        transfer = 16384 * 2880 * 2
+        zero_rows = 512 + 1024 + 2048 + 4096 + 8192 + 16384 + 8 + 16 + 32 + 64
+        args = dict(
+            max_rows=16384,
+            hidden=2880,
+            dtype=torch.bfloat16,
+            aux_dtype=torch.bfloat16,
+            depth=2,
+            zero_residual_rows=zero_rows,
+        )
+        plain = hbm_reserve_bytes(num_aux=0, **args)
+        self.assertEqual(plain, 10 * transfer + zero_rows * 2880 * 2)
+        self.assertAlmostEqual(plain / (1 << 30), 1.05, places=2)
+        # Three Eagle3 aux slots travel in the same transfers.
+        self.assertEqual(
+            hbm_reserve_bytes(num_aux=3, **args), 40 * transfer + zero_rows * 2880 * 2
+        )
+
+    def test_start_up_check_allocates_the_worst_case(self):
+        handoff = make_handoff(1, 2, FakeNet(), max_rows=64, depth=2)
+        checked = handoff.check_hbm(zero_residual_rows=96)
+        self.assertEqual(checked, handoff.reserve_bytes(96))
+        self.assertEqual(handoff._transport.checked, [checked])
+
+    def test_start_up_check_fails_with_the_size_it_needs(self):
+        handoff = make_handoff(1, 2, FakeNet(), max_rows=64)
+        handoff._transport.fail_check = True
+        with self.assertRaisesRegex(RuntimeError, "worst case of .* GiB"):
+            handoff.check_hbm(zero_residual_rows=96)
+
+
+class TestKvBudgetReserve(unittest.TestCase):
+    def _kvc(self, *, pp_size=8, is_draft_worker=False):
+        return SimpleNamespace(
+            pp_size=pp_size,
+            is_draft_worker=is_draft_worker,
+            model=SimpleNamespace(),
+            model_config=SimpleNamespace(context_len=4096, hidden_size=16),
+            model_dtype=torch.bfloat16,
+            server_args=SimpleNamespace(),
+            spec_aux_config=SpecAuxHiddenStateConfig(),
+        )
+
+    def test_buffered_handoff_takes_its_worst_case_off_the_kv_budget(self):
+        original = Mock(return_value=10 << 30)
+        with (
+            tpu_envs.SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF.override(True),
+            patch.object(
+                pp_scheduler, "buffered_handoff_reserve_bytes", return_value=1 << 30
+            ) as reserve,
+        ):
+            self.assertEqual(
+                reserve_pp_buffered_handoff(original, self._kvc()), 9 << 30
+            )
+        reserve.assert_called_once()
+
+    def test_budget_is_unchanged_without_the_switch_one_stage_or_for_a_draft(self):
+        cases = [
+            (False, self._kvc()),
+            (True, self._kvc(pp_size=1)),
+            (True, self._kvc(is_draft_worker=True)),
+        ]
+        for switch, kvc in cases:
+            with (
+                self.subTest(switch=switch, pp=kvc.pp_size, draft=kvc.is_draft_worker),
+                tpu_envs.SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF.override(switch),
+                patch.object(pp_scheduler, "buffered_handoff_reserve_bytes") as reserve,
+            ):
+                original = Mock(return_value=10 << 30)
+                self.assertEqual(reserve_pp_buffered_handoff(original, kvc), 10 << 30)
+                reserve.assert_not_called()
+
+    def test_reserve_uses_the_forward_buckets_and_transfer_dtype(self):
+        kvc = self._kvc()
+        kvc.model = SimpleNamespace(pp_transfer_dtype=torch.float32)
+        buckets = (
+            Bucketer(name="Token", buckets=[64, 256]),
+            Bucketer(name="Bs", buckets=[1, 32]),
+        )
+        with patch(
+            "sglang_tpu.compilation.decoder_compile_policy.forward_bucketers",
+            return_value=buckets,
+        ):
+            got = pp_scheduler.buffered_handoff_reserve_bytes(
+                model=kvc.model,
+                model_config=kvc.model_config,
+                model_dtype=kvc.model_dtype,
+                server_args=kvc.server_args,
+                spec_aux_config=kvc.spec_aux_config,
+            )
+        # 256 rows of 16 fp32 columns, 7 receives + 3 sends; zeros for 64+256+1+32 rows.
+        self.assertEqual(got, 10 * 256 * 16 * 4 + (64 + 256 + 1 + 32) * 16 * 4)
+
+
 class TestPPBufferedHandoffProbe(unittest.TestCase):
     def test_probe_checks_the_sender(self):
         net = FakeNet()
@@ -574,6 +683,8 @@ class TestBufferedHandoffWiring(unittest.TestCase):
         self.assertEqual(kwargs["aux_dtype"], torch.bfloat16)
         self.assertEqual(kwargs["depth"], 2)
         self.assertTrue(callable(kwargs["rows_of"]))
+        # The start-up memory check covers one zero residual per bucket.
+        handoff.return_value.check_hbm.assert_called_once_with(64 + 256 + 1 + 32)
 
     def test_wave_stays_the_default(self):
         scheduler, _ = self._scheduler()

@@ -11,7 +11,11 @@ from torch import nn
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.pp_buffered import PPBufferedHandoff, build_pp_buffered_handoff
+from sglang_tpu.pp_buffered import (
+    PPBufferedHandoff,
+    build_pp_buffered_handoff,
+    hbm_reserve_bytes,
+)
 from sglang_tpu.pp_wave import PPWave, build_pp_wave, num_relayed_aux_slots
 
 if TYPE_CHECKING:
@@ -100,6 +104,8 @@ def build_scheduler_pp_wave(scheduler: Scheduler) -> PPWave | PPBufferedHandoff:
             depth=tpu_envs.SGLANG_TPU_PP_BUFFERED_SEND_DEPTH.get(),
             rows_of=lambda batch: pp_forward_rows(scheduler, batch),
         )
+        assert policy.t_bucketer is not None and policy.b_bucketer is not None
+        wave.check_hbm(_zero_residual_rows(policy.t_bucketer, policy.b_bucketer))
     else:
         wave = build_pp_wave(
             pp_group=scheduler.pp_group,
@@ -128,6 +134,40 @@ def build_scheduler_pp_wave(scheduler: Scheduler) -> PPWave | PPBufferedHandoff:
         )
     snapshot_recompilation_baseline()
     return wave
+
+
+def _zero_residual_rows(t_bucketer: Any, b_bucketer: Any) -> int:
+    """Rows of the zero residuals the buffered hand-off keeps, one per row
+    count a forward hands on: its token bucket, or its batch bucket when
+    decoding."""
+    return sum({*t_bucketer.buckets, *b_bucketer.buckets})
+
+
+def buffered_handoff_reserve_bytes(
+    *,
+    model: nn.Module,
+    model_config: Any,
+    model_dtype: torch.dtype,
+    server_args: Any,
+    spec_aux_config: Any,
+) -> int:
+    """The buffered hand-off's worst-case device memory (hbm_reserve_bytes),
+    from what the KV budget knows before the compile policy and the hand-off
+    exist; the hand-off checks the same bound at start-up (check_hbm)."""
+    from sglang_tpu.compilation.decoder_compile_policy import forward_bucketers
+
+    t_bucketer, b_bucketer = forward_bucketers(
+        server_args, context_len=model_config.context_len
+    )
+    return hbm_reserve_bytes(
+        max_rows=max(t_bucketer.max_val, b_bucketer.max_val),
+        hidden=int(model_config.hidden_size),
+        num_aux=num_relayed_aux_slots(spec_aux_config, model),
+        dtype=getattr(model, "pp_transfer_dtype", model_dtype),
+        aux_dtype=model_dtype,
+        depth=tpu_envs.SGLANG_TPU_PP_BUFFERED_SEND_DEPTH.get(),
+        zero_residual_rows=_zero_residual_rows(t_bucketer, b_bucketer),
+    )
 
 
 def pp_forward_rows(scheduler: Scheduler, batch: ScheduleBatch) -> int:

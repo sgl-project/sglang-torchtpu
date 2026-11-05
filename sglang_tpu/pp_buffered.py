@@ -146,6 +146,15 @@ class Transport:
 
         synchronize(list(tensors), wait=True)
 
+    def check_free(self, nbytes: int, device: torch.device) -> None:
+        """Allocates ``nbytes`` on ``device``, waits until the buffer exists
+        and frees it; raises if the device cannot hold it."""
+        from torch_tpu._internal.sync.sync import synchronize
+
+        probe = torch.zeros((nbytes,), dtype=torch.uint8, device=device)
+        synchronize([probe], wait=True)
+        del probe
+
     def fence(self) -> Any:
         """A device event for all work submitted so far."""
         from torch_tpu._internal.stream.streams import TpuEvent
@@ -153,6 +162,31 @@ class Transport:
         event = TpuEvent()
         event.record()
         return event
+
+
+def hbm_reserve_bytes(
+    *,
+    max_rows: int,
+    hidden: int,
+    num_aux: int,
+    dtype: torch.dtype,
+    aux_dtype: torch.dtype,
+    depth: int,
+    zero_residual_rows: int,
+) -> int:
+    """An upper bound on the device memory a stage's buffered hand-off holds
+    beyond the model and the KV cache. Landing: up to _MAX_RECEIVES posted
+    receives. Outgoing: up to ``depth`` transfers queued for sending plus the
+    one end_iteration builds while it waits for room. Each is one transfer
+    of every carried tensor at ``max_rows`` rows. Zero residuals: one per
+    padded row count, ``zero_residual_rows`` rows in all. The first stage
+    posts no receives and the last sends nothing, so they hold less; the KV
+    capacity is the minimum over stages, so the bound is the same for all."""
+    transfer = max_rows * hidden * (dtype.itemsize + num_aux * aux_dtype.itemsize)
+    landing = _MAX_RECEIVES * transfer
+    outgoing = (depth + 1) * transfer
+    zero = zero_residual_rows * hidden * dtype.itemsize
+    return landing + outgoing + zero
 
 
 class PPBufferedHandoff:
@@ -554,6 +588,37 @@ class PPBufferedHandoff:
             self._thread = None
             self._closing = False
         self._raise_send_failure()
+
+    def reserve_bytes(self, zero_residual_rows: int) -> int:
+        """hbm_reserve_bytes for this stage's hand-off."""
+        return hbm_reserve_bytes(
+            max_rows=self.max_rows,
+            hidden=self.hidden,
+            num_aux=self.num_aux,
+            dtype=self.dtype,
+            aux_dtype=self.aux_dtype,
+            depth=self.depth,
+            zero_residual_rows=zero_residual_rows,
+        )
+
+    def check_hbm(self, zero_residual_rows: int) -> int:
+        """At start-up, checks that the device can hold the hand-off's worst
+        case (reserve_bytes) on top of the model and the KV cache, so a
+        shortfall fails here rather than as an out-of-memory error under load.
+        Returns the bytes checked."""
+        nbytes = self.reserve_bytes(zero_residual_rows)
+        try:
+            self._transport.check_free(nbytes, self.device)
+        except Exception as exc:
+            raise RuntimeError(
+                f"buffered hand-off stage {self.rank}: the device cannot hold the "
+                f"hand-off's worst case of {nbytes / (1 << 30):.2f} GiB "
+                f"({_MAX_RECEIVES} receives and {self.depth + 1} sends of "
+                f"{self.max_rows} rows) next to the KV cache. Lower "
+                "--mem-fraction-static or --max-total-tokens, or "
+                "SGLANG_TPU_PP_BUFFERED_SEND_DEPTH."
+            ) from exc
+        return nbytes
 
     # -- warmup and self-test -------------------------------------------------
     def warmup_merge(self, row_buckets: Iterable[int]) -> None:
