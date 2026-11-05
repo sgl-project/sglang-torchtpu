@@ -940,7 +940,8 @@ def gather_candidate_keys(
 
                 if per_page == lanes:
                     for i in range(0, group, lanes):
-                        chosen = selected.reshape(-1)[pl.ds(index * group + i, lanes)]
+                        # JAX 0.10.2 Mosaic cannot flatten a 2D VMEM ref; index rows.
+                        chosen = selected[index, pl.ds(i, lanes)]
                         any_valid = any_valid | (chosen >= 0)
                         for bank, base, valid in addresses(chosen):
                             for field in range(PAGE_ROWS):
@@ -951,9 +952,7 @@ def gather_candidate_keys(
                                 ] = jnp.where(valid, base + field * source_per_page, -1)
                 else:
                     for i in range(0, group, lanes):
-                        any_valid |= (
-                            selected.reshape(-1)[pl.ds(index * group + i, lanes)] >= 0
-                        )
+                        any_valid |= selected[index, pl.ds(i, lanes)] >= 0
 
                     @plsc.parallel_loop(0, span, lanes, unroll=8)
                     def fragment_addresses(i):
@@ -963,8 +962,9 @@ def gather_candidate_keys(
                             segment // (PAGE_ROWS * per_page) * per_page
                             + segment % per_page
                         )
+                        # column < group: every lane stays in metadata row `index`.
                         chosen = plsc.load_gather(
-                            selected.reshape(-1), [index * group + column]
+                            selected, [jnp.full((lanes,), index, jnp.int32), column]
                         )
                         for bank, source, valid in addresses(chosen):
                             read_ids[slot, bank, pl.ds(i, lanes)] = jnp.where(

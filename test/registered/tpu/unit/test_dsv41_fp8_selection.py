@@ -413,11 +413,15 @@ def test_million_key_topk_maps_only_winners_real_tpu():
     """The full mapping is too large for SparseCore VMEM; map only winners."""
     assert jax.default_backend() == "tpu"
     width, block, k = 1048576, 8, 512
-    scores = jnp.arange(width, dtype=jnp.float32)[None, :]
+    lengths = jnp.array([width - 3], jnp.int32)
+    # The gathered scorer writes -inf outside each query window, and the
+    # lax.top_k fallback relies on that rather than on valid_lengths.
+    scores = jnp.where(
+        jnp.arange(width) < lengths[0], jnp.arange(width, dtype=jnp.float32), -jnp.inf
+    )[None, :]
     # Strictly increasing, noncontiguous logical blocks distinguish identity
     # from the actual compact->logical mapping, including at the final page.
     mapping = (jnp.arange(width // block, dtype=jnp.int32) * 2 + 5)[None, :]
-    lengths = jnp.array([width - 3], jnp.int32)
     selected = jax.jit(
         lambda: _select_candidate_tokens(
             scores,
