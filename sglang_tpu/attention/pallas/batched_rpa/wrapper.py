@@ -31,6 +31,7 @@ Note: batched_rpa is build on top / derived from RPA3.
 
 import dataclasses
 import math
+import os
 
 import jax
 import jax.numpy as jnp
@@ -230,10 +231,18 @@ def calculate_block_sizes(
 
     # Calculate aligned model dimensions.
     aligned_head_dim = utils.align_to(model_cfgs.head_dim, num_lanes)
+    aligned_kv_head_dim = utils.align_to(
+        model_cfgs.head_dim, num_lanes // serve_cfgs.packing_kv
+    )
     aligned_num_q_heads_per_kv_head = utils.align_to(
         model_cfgs.num_q_heads_per_kv_head, serve_cfgs.packing_q
     )
     aligned_num_q_heads = aligned_num_q_heads_per_kv_head * model_cfgs.num_kv_heads
+    transposed_prefill = (
+        serve_cfgs.transposed
+        and serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+        and aligned_kv_head_dim <= mxu_column_size
+    )
 
     bkv_stride = pl.cdiv(model_cfgs.num_kv_heads * 2, serve_cfgs.packing_kv)
     if utils.has_bank_conflicts(bkv_stride):
@@ -297,13 +306,27 @@ def calculate_block_sizes(
         loaded_bq_size = bq_sz * model_cfgs.num_q_heads * aligned_head_dim
         loaded_bkv_size = bkv_sz * model_cfgs.num_kv_heads * aligned_head_dim
 
-        # Calculate peak memory requirement of output - which is attention weight.
-        qk_size = bq_sz * bkv_sz * model_cfgs.num_q_heads
-
         # Convert to bytes.
         loaded_bq_bytes = loaded_bq_size * q_bytes
         loaded_bkv_bytes = loaded_bkv_size * kv_bytes
-        qk_bytes = qk_size * out_bytes
+        if transposed_prefill and batch_size == 1 and bq_sz > 1:
+            # Transposed prefill streams one KV head and one MXU-wide compute
+            # block (lanes_c = max(num_lanes, mxu_column_size)) at a time, plus
+            # qt_scratch [KV, aligned_kv_head_dim, bq_sz * heads_per_kv] in VMEM.
+            lanes_c = max(num_lanes, mxu_column_size)
+            qt_bytes = (
+                model_cfgs.num_kv_heads
+                * aligned_kv_head_dim
+                * bq_sz
+                * aligned_num_q_heads_per_kv_head
+                * kv_bytes
+            )
+            vt_bytes = (aligned_kv_head_dim + 2 * tpu_info.num_sublanes) * bkv_sz * 2
+            qk_bytes = bkv_sz * lanes_c * (4 + 2) + vt_bytes + qt_bytes
+        else:
+            # Calculate peak memory requirement of output - which is attention weight.
+            qk_size = bq_sz * bkv_sz * model_cfgs.num_q_heads
+            qk_bytes = qk_size * out_bytes
 
         # Sum up all compute memory usage.
         compute_bytes = loaded_bq_bytes + loaded_bkv_bytes + qk_bytes
@@ -372,44 +395,107 @@ def calculate_block_sizes(
     ) -> configs.BlockSizes:
         """Loop through different block sizes to find the most optimal one."""
 
-        bkv_sz = bkv_stride = mxu_column_size
-        if fixed_bq_sz is None:
-            bq_sz = bq_stride = bkv_sz
-        else:
-            bq_sz = fixed_bq_sz
-            bq_stride = 0
-        # Step 1: Lower batch_size and/or n_buffer if even the smallest bq and bkv
-        # size can trigger OOM.
-        batch_size, n_buffer = fit_lanes_and_buffers(
-            max_batch_size, max_n_buffer, bq_sz, bkv_sz
-        )
-
-        # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
-        while (
-            calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
-            < capped_vmem_limit_bytes
-        ):
-            # Unless bq is a fixed value, we want to ensure bq size is the same as bkv
-            # size. When using causal masking, if bq size is larger than bkv size,
-            # entire kv tile can be masked out for some query tokens. Similarly, if
-            # bkv size is larger than bq size, entire query tile can be masked out for
-            # some kv tokens.
-            bkv_sz += bkv_stride
-            bq_sz += bq_stride
-
-        # Rollback one step since the last attempted value triggered OOM.
-        bkv_sz -= bkv_stride
-        bq_sz -= bq_stride
-
-        # Indicates OOM was triggered from the starting bkv size.
-        if bkv_sz == 0:
-            raise ValueError("Cannot find block sizes that fit within VMEM limit.")
-
-        # Step 3: Given current tile size, calculate compute tile size.
         if fixed_bq_sz is not None:
+            bkv_sz = bkv_stride = mxu_column_size
+            bq_sz = fixed_bq_sz
+            batch_size, n_buffer = fit_lanes_and_buffers(
+                max_batch_size, max_n_buffer, bq_sz, bkv_sz
+            )
+            while (
+                calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
+                < capped_vmem_limit_bytes
+            ):
+                bkv_sz += bkv_stride
+            bkv_sz -= bkv_stride
+            if bkv_sz == 0:
+                raise ValueError("Cannot find block sizes that fit within VMEM limit.")
             return configs.BlockSizes(
                 bq_sz=bq_sz,
                 bq_c_sz=bq_sz,
+                bkv_sz=bkv_sz,
+                batch_size=batch_size,
+                n_buffer=n_buffer,
+            )
+
+        # Prefill block search: choose power-of-2 bq_sz so bq_sz cleanly divides
+        # power-of-2 chunked-prefill token buckets (e.g. 512, 1024, 2048, 4096),
+        # bq_c_sz, and skip_pad_q_group without padding full chunks to partial
+        # tail blocks (as non-power-of-2 768 or 1280 does). Then decouple bkv_sz
+        # to grow in page-aligned steps within VMEM/VREG/sliding-window bounds.
+        page = serve_cfgs.page_size
+        bkv_step = max(page, utils.align_to(mxu_column_size, page))
+        total_q_pow2 = max(
+            2, 1 << max(1, (max(2, serve_cfgs.total_q_tokens) - 1).bit_length())
+        )
+        min_bq_pow2 = 1 << (mxu_column_size - 1).bit_length()
+        bq_sz = min(min_bq_pow2, total_q_pow2)
+        bkv_sz = mxu_column_size
+        batch_size, n_buffer = fit_lanes_and_buffers(
+            max_batch_size, max_n_buffer, bq_sz, bkv_sz
+        )
+        if (
+            bkv_sz < bkv_step
+            and calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_step)
+            < capped_vmem_limit_bytes
+        ):
+            bkv_sz = bkv_step
+
+        max_bq_sz = total_q_pow2
+        max_bkv_sz = 1 << 20
+        if transposed_prefill and batch_size == 1:
+            # Keep hot full_tile unrolled MXU compute blocks <= 64 (~2 MiB of
+            # Percale's 4 MiB IMEM): each block covers target_lanes query-head rows.
+            target_lanes = max(num_lanes, mxu_column_size)
+            imem_row_cap = max(bq_sz, (64 * target_lanes) // aligned_num_q_heads)
+            max_bq_imem = 1 << (imem_row_cap.bit_length() - 1)
+            max_bq_sz = min(max_bq_sz, max_bq_imem)
+            # V^T [acc_rows, bkv_sz] bf16 stays in VREGs across q chunks up to
+            # 6 * mxu_column_size (1536 on v7x) for no_max, or 4 * mxu_column_size
+            # when online-softmax scores s [bkv_sz, target_lanes] f32 are also live.
+            vreg_k_cols = 6 if serve_cfgs.no_max else 4
+            max_bkv_sz = utils.align_to(vreg_k_cols * mxu_column_size, page)
+
+        if model_cfgs.sliding_window is not None:
+            # Bound sliding-window tiles to ~window / 4 (power of 2, >= 1 page) so
+            # boundary tiles do not waste masked work outside the causal band
+            # (e.g. window=2048 -> bq_sz=512, bkv_sz=512).
+            win_q = max(2, model_cfgs.sliding_window // 4)
+            swa_pow2 = 1 << (win_q.bit_length() - 1)
+            max_bq_sz = min(max_bq_sz, max(min(256, total_q_pow2), swa_pow2))
+            max_bkv_sz = min(max_bkv_sz, max(page, utils.align_to(swa_pow2, page)))
+
+        if bkv_sz >= bkv_step:
+            while bq_sz * 2 <= max_bq_sz:
+                next_bq = bq_sz * 2
+                next_bkv = min(max_bkv_sz, max(bkv_sz, utils.align_to(next_bq, page)))
+                if (
+                    calculate_vmem_usage(batch_size, n_buffer, next_bq, next_bkv)
+                    >= capped_vmem_limit_bytes
+                ):
+                    break
+                bq_sz, bkv_sz = next_bq, next_bkv
+
+            while bkv_sz + bkv_step <= max_bkv_sz:
+                next_bkv = bkv_sz + bkv_step
+                if (
+                    calculate_vmem_usage(batch_size, n_buffer, bq_sz, next_bkv)
+                    >= capped_vmem_limit_bytes
+                ):
+                    break
+                bkv_sz = next_bkv
+
+        if transposed_prefill and batch_size == 1 and bq_sz > 1:
+            # Fill one full MXU column width (256 lanes on v7x) per transposed
+            # compute chunk so K @ Q^T and V^T @ P^T run at 100% MXU lane occupancy.
+            target_lanes = max(num_lanes, mxu_column_size)
+            lane_unit = max(1, num_lanes // aligned_num_q_heads_per_kv_head)
+            target_bq_c = utils.align_to(
+                max(1, target_lanes // aligned_num_q_heads_per_kv_head), lane_unit
+            )
+            best_bq_c_sz = math.gcd(bq_sz, min(bq_sz, target_bq_c))
+            return configs.BlockSizes(
+                bq_sz=bq_sz,
+                bq_c_sz=best_bq_c_sz,
                 bkv_sz=bkv_sz,
                 batch_size=batch_size,
                 n_buffer=n_buffer,
@@ -518,6 +604,10 @@ def calculate_block_sizes(
     # way out short of a code patch. Rounded up to a whole page: a k block below
     # one page yields an empty DMA schedule leaf and fails Mosaic compilation.
     forced_bkv = envs.SGLANG_TPU_FORCE_RPA_PREFILL_BKV.get()
+    # Global (full-context) layers only: SWA layers keep their searched k block
+    # (a large forced bkv slows the 2048-token window).
+    if forced_bkv is not None and model_cfgs.sliding_window is not None:
+        forced_bkv = None
     if forced_bkv is not None:
         page = serve_cfgs.page_size
         aligned = max(page, -(-int(forced_bkv) // page) * page)
@@ -525,6 +615,39 @@ def calculate_block_sizes(
     else:
         prefill_block_sizes = cover_whole_pages(prefill_block_sizes)
 
+    # Tuning: q compute-chunk (bq_c) and q block (bq) overrides for prefill;
+    # bq_c sets the lanes of one transposed score chunk (bq_c * q heads per kv).
+    forced_bq = tpu_envs.SGLANG_TPU_FORCE_RPA_PREFILL_BQ.get()
+    if forced_bq is not None and model_cfgs.sliding_window is None:
+        prefill_block_sizes = dataclasses.replace(
+            prefill_block_sizes,
+            bq_sz=int(forced_bq),
+            bq_c_sz=math.gcd(prefill_block_sizes.bq_c_sz, int(forced_bq)),
+        )
+    forced_bq_c = tpu_envs.SGLANG_TPU_FORCE_RPA_PREFILL_BQ_C.get()
+    if forced_bq_c is not None and model_cfgs.sliding_window is None:
+        prefill_block_sizes = dataclasses.replace(
+            prefill_block_sizes,
+            bq_c_sz=math.gcd(int(forced_bq_c), prefill_block_sizes.bq_sz),
+        )
+    # Tuning: SWA-layer prefill overrides (the global-layer ones above skip SWA).
+    # Muse Spark serves bq 1024 / bkv 512; unset or 0 keeps the searched size (the
+    # default here, unlike the Google3 fork, so other sliding-window models keep theirs).
+    swa_bq = int(os.environ.get("MUSE_RPA_SWA_BQ", "0") or 0)
+    swa_bkv = int(os.environ.get("MUSE_RPA_SWA_BKV", "0") or 0)
+    if model_cfgs.sliding_window is not None and (swa_bq or swa_bkv):
+        if swa_bkv:
+            page = serve_cfgs.page_size
+            prefill_block_sizes = dataclasses.replace(
+                prefill_block_sizes,
+                bkv_sz=max(page, -(-int(swa_bkv) // page) * page),
+            )
+        if swa_bq:
+            prefill_block_sizes = dataclasses.replace(
+                prefill_block_sizes,
+                bq_sz=int(swa_bq),
+                bq_c_sz=math.gcd(prefill_block_sizes.bq_c_sz, int(swa_bq)),
+            )
     return decode_block_sizes, prefill_block_sizes
 
 
@@ -550,6 +673,7 @@ def calculate_block_sizes(
         "skip_kv_write",
         "return_lse",
         "cp_group_size",
+        "out_head_norm_eps",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
@@ -586,6 +710,7 @@ def ragged_paged_attention(
     cp_group_size: int | None = None,
     cp_rank: jax.Array | None = None,
     kv_lens_global: jax.Array | None = None,
+    out_head_norm_eps: float | None = -1.0,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -732,6 +857,11 @@ def ragged_paged_attention(
             and attention_sink is None
             and not return_lse
         ),
+        transposed_key_chunk=tpu_envs.SGLANG_TPU_RPA_TRANSPOSED_KEY_CHUNK.get(),
+        transposed_valu_exp2_every=tpu_envs.SGLANG_TPU_RPA_VALU_EXP2_EVERY.get(),
+        transposed_fp8_p=tpu_envs.SGLANG_TPU_RPA_TRANSPOSED_FP8_P.get(),
+        transposed_chunk_vt=tpu_envs.SGLANG_TPU_RPA_CHUNK_VT.get(),
+        transposed_s_bf16=tpu_envs.SGLANG_TPU_RPA_S_BF16.get(),
         transposed=(
             tpu_envs.SGLANG_TPU_RPA_TRANSPOSED.get()
             and kv_layout == configs.KVLayout.SEQ_ALONG_LANE
@@ -745,7 +875,11 @@ def ragged_paged_attention(
         ),
         skip_pad_q=tpu_envs.SGLANG_TPU_RPA_SKIP_PAD_Q.get(),
         skip_pad_q_group=tpu_envs.SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP.get(),
-        out_head_norm_eps=tpu_envs.SGLANG_TPU_RPA_OUT_HEAD_NORM_EPS.get(),
+        out_head_norm_eps=(
+            tpu_envs.SGLANG_TPU_RPA_OUT_HEAD_NORM_EPS.get()
+            if out_head_norm_eps is not None and out_head_norm_eps < 0
+            else out_head_norm_eps
+        ),
     )
 
     q_hbm, new_kv_hbm = prepare_inputs(

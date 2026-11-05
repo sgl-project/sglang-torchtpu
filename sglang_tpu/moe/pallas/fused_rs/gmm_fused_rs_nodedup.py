@@ -3,7 +3,8 @@
 """Fused GMM kernel with ICI direct-write reduce-scatter.
 
 Each chip ICI-sends its GMM2 output directly to the correct (token, topk_index)
-position in the destination chip's output buffer. No recv buffer, no scatter-add,
+position in the destination chip's output buffer. No recv buffer, no
+scatter-add,
 no topk weighting inside the kernel. The reduction (topk_weight × sum) happens
 as a trivial post-kernel JAX operation.
 
@@ -26,12 +27,6 @@ from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.envs import envs as tpu_envs
-
-# Profiling only: comma list of nocompute/nogather/pairnoadd/pairnowrite/pairnofwd/pairnosend/fwdskip<k> drops that
-# part of the kernel (wrong output). fwdskip<k> (run table only) drops the forward to chip my_chip + k.
-_ABLATE = frozenset(
-    x for x in os.environ.get("SGLANG_TPU_FUSED_RS_ABLATE", "").split(",") if x
-)
 from sglang_tpu.moe.pallas.fused_rs.gmm_v2_gather_scatter import (
     Dimensions,
     FusedDims,
@@ -265,6 +260,28 @@ def _select_fused_rs_block_sizes(
             fp8_direct_write=fp8_direct_write,
         )
     )
+    # --- Step 4b: bound the W1/W2 VMEM buffers by their real element width ---
+    # calculate_tiling sizes the RHS tiles for the quantized width. Unquantized
+    # (bf16) experts at a large hidden size can otherwise get W1/W2 buffers that
+    # exceed VMEM. Halve tile_n (then tile_k) until each buffer set fits 16 MiB;
+    # quantized tiles already fit.
+    if not is_quantized:
+        w_bytes = jax.dtypes.itemsize_bits(w1_dtype) // 8
+        budget = 16 * 1024 * 1024
+        n1_cols = lambda: tile_n1 * 2 if act_fn else tile_n1
+        while (
+            num_w1_bufs * tile_k1 * n1_cols() * w_bytes > budget and tile_n1 > num_lanes
+        ):
+            tile_n1 //= 2
+        while (
+            num_w1_bufs * tile_k1 * n1_cols() * w_bytes > budget
+            and tile_k1 > 2 * num_lanes
+        ):
+            tile_k1 //= 2
+        while (
+            num_w2_bufs * tile_k2 * tile_n2 * w_bytes > budget and tile_n2 > num_lanes
+        ):
+            tile_n2 //= 2
     # --- Step 5: Alignment post-processing ---
     k_align1 = num_lanes
     if tile_k1 % k_align1 != 0:
@@ -403,7 +420,9 @@ def _precompute_fused_rs_metadata(
     tile_in_group = gm - (_select(tiles_end) - _select(tiles))
     first = _select(starts)
     m_offset = jnp.where(
-        tile_in_group == 0, first, first - first % sublane + tile_in_group * tile_m
+        tile_in_group == 0,
+        first,
+        first - first % sublane + tile_in_group * tile_m,
     )
     valid = gm < num_gm
     gm_group = jnp.where(valid, group, 0)
@@ -511,10 +530,11 @@ def kernel_main_fused_rs(
     pair_sum_ref=None,  # VMEM (staging_slots, tile_m, N2//NL, NL): own + sibling partials per slot
     pair_recv_sem_ref=None,  # REGULAR (_PAIR_RING,): sibling pieces landed in a ring slot
     pair_credit_ref=None,  # REGULAR (1,): ring slots the sibling has freed
-    pair_relay: bool = False,  # relay the diagonal chip's runs through a neighbor (run table)
-    relay_ring_ref=None,  # VMEM (2, tile_m, N2//NL, NL): relayed rows, one slot per direction
-    relay_recv_sem_ref=None,  # REGULAR (2,): relayed pieces landed, per direction
-    relay_credit_ref=None,  # REGULAR (2,): relay slots the neighbor has freed, per direction
+    pair_fp8_ref=None,  # VMEM (staging_slots, tile_m, N2//NL, NL) e4m3: pair sums to forward
+    out_fp8_ref=None,  # HBM e4m3 twin of out_buf_ref: cross-chip blocks land here
+    pair_fp8_inv_scale: float = 1.0,
+    pair_send_fp8_ref=None,  # VMEM (staging_slots, tile_m, N2//NL, NL) e4m3: partials to the sibling
+    pair_self_count_ref=None,  # SMEM (1,): pieces sent to self (ablations)
 ):
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write kernel.
 
@@ -534,14 +554,6 @@ def kernel_main_fused_rs(
     """
     dims = fused_dims
     num_lanes = pltpu.get_tpu_info().num_lanes
-    # GMM2 writes the staging slot itself (one k step, no fp8 write path); the slot's
-    # previous writes are then awaited before GMM2 instead of before the relayout.
-    gmm2_row_out = (
-        tpu_envs.SGLANG_TPU_FUSED_RS_GMM2_ROW_OUT.get()
-        and dims.size_k2 // tile_k2 == 1
-        and not fp8_direct_write
-        and "nocompute" not in _ABLATE
-    )
     my_rank = group_offset_ref[0] // dims.size_group
     my_id = my_rank
     max_num_gm = max_num_gm_ref[0]
@@ -592,14 +604,49 @@ def kernel_main_fused_rs(
                 jnp.int32(0),
             )
 
+    # Timing ablations only (wrong numerics), MUSE_FUSED_RS_ABLATE comma list:
+    #   selfx   cross-chip pair-sum copies go to this core's own out_buf
+    #   selfsib the sibling-block copies go to this core's own out_buf
+    #   noring  the on-chip ring of sibling partials is neither sent nor waited
+    #           for (the ring holds zeros)
+    #   nocomm  = selfx + selfsib + noring: no bytes leave the core
+    #   nopsum  no pair sum (the forwarded rows are stale; produces NaN)
+    #   self / selfp: the ring (and sibling block) target this core too. A remote
+    #           copy to self moves VMEM->VMEM at only ~32 GB/s, so these are slow
+    #           and are not a no-communication proxy.
+    _abl_early = set(os.environ.get("MUSE_FUSED_RS_ABLATE", "").split(","))
+    _nocomm = "nocomm" in _abl_early
+    _self_ring = bool(_abl_early & {"self", "selfp"}) and pair_exchange
+    _self_sib = (
+        bool(_abl_early & {"self", "selfp", "selfsib"}) or _nocomm
+    ) and pair_exchange
+    _self_cross = (bool(_abl_early & {"self", "selfx"}) or _nocomm) and pair_exchange
+    _no_ring = ("noring" in _abl_early or _nocomm) and pair_exchange
+    _no_psum = "nopsum" in _abl_early
+    # MUSE_FUSED_RS_FWD_PSUM (default on; same numerics): pair-sum only the rows
+    # this core forwards to another chip, not the whole tile.
+    _fwd_psum = os.environ.get("MUSE_FUSED_RS_FWD_PSUM", "1") == "1"
+    # MUSE_FUSED_RS_FAST_ISSUE (default on; same numerics): issue the owner-run
+    # DMAs for the 5 owners that receive from this core only, each with a static
+    # source and receive block, instead of predicating all 8 owners twice.
+    _fast_issue = (
+        os.environ.get("MUSE_FUSED_RS_FAST_ISSUE", "1") == "1"
+        and not (_self_sib or _self_cross or _self_ring)
+        and pair_fp8_ref is None
+    )
     if pair_exchange:
-        sibling = jnp.bitwise_xor(my_id, 1)
+        sibling = my_id if _self_ring else jnp.bitwise_xor(my_id, 1)
+    if pair_self_count_ref is not None:
+        pair_self_count_ref[0] = jnp.int32(0)
+    if _no_ring:
+        for _r in range(_PAIR_RING):
+            pair_ring_ref[_r] = jnp.zeros(pair_ring_ref.shape[1:], pair_ring_ref.dtype)
 
     @jax.named_scope("sync_barrier_signal")
     def sync_barrier_signal():
         barrier_sem = pltpu.get_barrier_semaphore()
         for i in range(ep_size):
-            pltpu.semaphore_signal(
+            pl.semaphore_signal(
                 barrier_sem,
                 device_id={ep_axis_name: jnp.int32(i)},
                 device_id_type=pltpu.DeviceIdType.MESH,
@@ -608,7 +655,7 @@ def kernel_main_fused_rs(
     @jax.named_scope("sync_barrier_wait")
     def sync_barrier_wait():
         barrier_sem = pltpu.get_barrier_semaphore()
-        pltpu.semaphore_wait(barrier_sem, ep_size)
+        pl.semaphore_wait(barrier_sem, ep_size)
 
     def sync_barrier():
         sync_barrier_signal()
@@ -735,6 +782,14 @@ def kernel_main_fused_rs(
         w2_packed = w2_ref.bitcast(jnp.uint32)
     else:
         w2_packed = w2_ref
+    if w1_ref.ndim == 4:
+        _layer_idx = group_offset_ref[1]
+        w1_packed = w1_packed.at[_layer_idx]
+        w2_packed = w2_packed.at[_layer_idx]
+        if w1_scale_ref is not None:
+            w1_scale_ref = w1_scale_ref.at[_layer_idx]
+        if w2_scale_ref is not None:
+            w2_scale_ref = w2_scale_ref.at[_layer_idx]
 
     num_k1 = dims.size_k1 // tile_k1
     num_k2 = dims.size_k2 // tile_k2
@@ -754,9 +809,15 @@ def kernel_main_fused_rs(
     nqb2 = cfgs2.num_quant_blocks_per_tile_k if has_scale else 0
     w1_dma_n = tile_n1 * 2 if act_fn else tile_n1
 
+    # Timing ablations only (wrong numerics), comma list: nocompute / nogmm1 /
+    # nogmm2 skip GMM compute, nowdma skips the expert-weight DMAs.
+    _ablate = set(os.environ.get("MUSE_FUSED_RS_ABLATE", "").split(","))
+
     # --- Weight DMA helpers ---
     @jax.named_scope("start_w1_dma")
     def start_w1_dma(buf_id, expert_id, n_id, k_id=0):
+        if "nowdma" in _ablate:
+            return
         if act_fn and num_n1 > 1:
             # Fix: with fuse_act, w1 is [all_gate | all_up] along N.
             # Load tile_n1 from gate + tile_n1 from up into buf as [gate|up].
@@ -781,7 +842,9 @@ def kernel_main_fused_rs(
         else:
             pltpu.make_async_copy(
                 src_ref=w1_packed.at[
-                    expert_id, pl.ds(k_id * pk1, pk1), pl.ds(n_id * w1_dma_n, w1_dma_n)
+                    expert_id,
+                    pl.ds(k_id * pk1, pk1),
+                    pl.ds(n_id * w1_dma_n, w1_dma_n),
                 ],
                 dst_ref=w1_buf_ref.at[buf_id],
                 sem=w1_sem_ref.at[buf_id],
@@ -834,6 +897,8 @@ def kernel_main_fused_rs(
 
     @jax.named_scope("start_w2_dma")
     def start_w2_dma(buf_id, expert_id, n_id, k_id=0):
+        if "nowdma" in _ablate:
+            return
         pltpu.make_async_copy(
             src_ref=w2_packed.at[
                 expert_id, pl.ds(k_id * pk2, pk2), pl.ds(n_id * tile_n2, tile_n2)
@@ -861,6 +926,8 @@ def kernel_main_fused_rs(
 
     @jax.named_scope("wait_w1_dma")
     def wait_w1_dma(buf_id):
+        if "nowdma" in _ablate:
+            return
         pltpu.make_async_copy(
             src_ref=w1_buf_ref.at[buf_id],
             dst_ref=w1_buf_ref.at[buf_id],
@@ -881,6 +948,8 @@ def kernel_main_fused_rs(
 
     @jax.named_scope("wait_w2_dma")
     def wait_w2_dma(buf_id):
+        if "nowdma" in _ablate:
+            return
         pltpu.make_async_copy(
             src_ref=w2_buf_ref.at[buf_id],
             dst_ref=w2_buf_ref.at[buf_id],
@@ -899,9 +968,27 @@ def kernel_main_fused_rs(
                 sem=w2_sem_ref.at[buf_id],
             ).wait()
 
+    _sls_out = pltpu.get_tpu_info().get_sublane_tiling(out_dtype)
+    # MUSE_FUSED_RS_DIRECT_STAGE (default "2"; bit-identical): stream GMM2's
+    # 256-col bf16 tiles directly into 3D scatter_staging_3x_ref per 1024-col
+    # sublane-aligned group (mode "2" shares LHS loads across the 4 col blocks),
+    # avoiding the 2 MiB f32 acc_list VREG spill, tiled_out_2x_ref roundtrip, and
+    # reshape_gmm2_output pass.
+    _direct_stage = (
+        os.environ.get("MUSE_FUSED_RS_DIRECT_STAGE", "2") in ("1", "2")
+        and num_n2 * num_k2 == 1
+        and dims.original_n2 == dims.size_n2
+        and not has_bias
+        and cfgs2.fuse_act is None
+        and cfgs2.rhs_cfgs.quant_dtype is not None
+        and tile_n2 % (_sls_out * num_lanes) == 0
+    )
+
     # --- GMM compute helpers ---
     @jax.named_scope("compute_gmm1_tile")
     def compute_gmm1_tile(buf_id, n_id, k_id, gm_id, m_rows):
+        if _ablate & {"nocompute", "nogmm1"}:
+            return
         sem_id = gm_id % 2
         _cfgs1 = dataclasses.replace(
             cfgs1, tiles=dataclasses.replace(cfgs1.tiles, tile_m=m_rows)
@@ -948,23 +1035,34 @@ def kernel_main_fused_rs(
 
     @jax.named_scope("compute_gmm2_tile")
     def compute_gmm2_tile(buf_id, n_id, k_id, gm_id, m_rows):
+        if _ablate & {"nocompute", "nogmm2"}:
+            return
         sem_id = gm_id % 2
         _cfgs2 = dataclasses.replace(
             cfgs2, tiles=dataclasses.replace(cfgs2.tiles, tile_m=m_rows)
         )
         lhs_data = intermediate_ref[
-            pl.ds(0, m_rows // dims.size_lhs_sublane), :, pl.ds(k_id * tile_k2, tile_k2)
+            pl.ds(0, m_rows // dims.size_lhs_sublane),
+            :,
+            pl.ds(k_id * tile_k2, tile_k2),
         ]
         w2_tile = w2_buf_ref.at[buf_id]
         w2_sc = w2_scale_buf_ref.at[buf_id] if has_scale else None
+        gmm2_dst = (
+            scatter_staging_3x_ref.at[gm_id % staging_slots, pl.ds(0, m_rows), :, :]
+            if _direct_stage
+            else tiled_out_2x_ref.at[
+                sem_id, pl.ds(0, m_rows), pl.ds(n_id * tile_n2, tile_n2)
+            ]
+        )
         inner_kernel(
             lhs_data,
             WeightsRef(
-                weight=w2_tile, scale=w2_sc, bias=w2_bias_buf_ref if has_bias else None
+                weight=w2_tile,
+                scale=w2_sc,
+                bias=w2_bias_buf_ref if has_bias else None,
             ),
-            tiled_out_2x_ref.at[
-                sem_id, pl.ds(0, m_rows), pl.ds(n_id * tile_n2, tile_n2)
-            ],
+            gmm2_dst,
             partial_out2_ref,
             shared_acc_ref.at[pl.ds(0, m_rows), pl.ds(0, tile_n2)],
             fused_metadata_ref,
@@ -976,15 +1074,6 @@ def kernel_main_fused_rs(
             _num_k=num_k2,
             _gm_id=0,
             _n_id=n_id,
-            row_out_ref=(
-                scatter_staging_3x_ref.at[
-                    gm_id % staging_slots,
-                    pl.ds(0, m_rows),
-                    pl.ds(n_id * tile_n2 // num_lanes, tile_n2 // num_lanes),
-                ]
-                if gmm2_row_out
-                else None
-            ),
         )
 
     # Initialize per-slot DMA counts to 0.
@@ -1017,18 +1106,14 @@ def kernel_main_fused_rs(
     # (0.5 B/param); fp8 (1 B) / bf16 (2 B) weight buffers are 2-4x larger and, on
     # tight configs (e.g. EP8 E_32 M_256), leave less than the bucket transient of
     # VMEM free -> scoped-VMEM OOM. All measured bucketing gains are on fp4 (the
-    # prod decode dtype) anyway, so only bucket when the weights are fp4.
+    # usual decode dtype) anyway, so only bucket when the weights are fp4.
     _w_qdt = cfgs1.rhs_cfgs.quant_dtype
     _weight_is_fp4 = _w_qdt is not None and jax.dtypes.itemsize_bits(_w_qdt) <= 4
     if (only := tpu_envs.SGLANG_TPU_FUSED_RS_M_BUCKETS.get()) is not None:
-        # The exact bucket set (multiples of the sublane tiling, tile_m always kept).
-        # Every bucket variant is a full copy of the GMM code: fewer keeps it in
-        # instruction memory; sizes between 128 and 256 trim MXU padding when tiles
-        # run ~130-200 rows (4096-token prefill at ~128 rows per expert).
+        # every bucket variant is a full copy of the GMM code; fewer keeps it in
+        # instruction memory
         keep = {int(b) for b in only.split(",") if b}
-        M_BUCKETS = sorted(
-            {b for b in keep if _sls_b <= b <= tile_m and b % _sls_b == 0} | {tile_m}
-        )
+        M_BUCKETS = [b for b in M_BUCKETS if b in keep or b == tile_m]
     _USE_BUCKETS = len(M_BUCKETS) > 1 and _weight_is_fp4
 
     # --- Main padded gm loop ---
@@ -1065,14 +1150,20 @@ def kernel_main_fused_rs(
     @jax.named_scope("pair_send")
     def _pair_send(gm_id, stg_id, row0, num_valid):
         """Ship tile gm_id's valid partial rows to the sibling's ring slot (power-of-two DMAs)."""
-        ring_slot = gm_id % _PAIR_RING
-        if "pairnosend" in _ABLATE:
+        if _no_ring:
             return
+        ring_slot = gm_id % _PAIR_RING
 
         @pl.when(gm_id >= _PAIR_RING)
         def _():
             pl.semaphore_wait(pair_credit_ref.at[0], 1)  # the sibling freed this slot
 
+        if pair_send_fp8_ref is not None:
+            pair_send_fp8_ref[stg_id] = jnp.clip(
+                scatter_staging_3x_ref[stg_id].astype(jnp.float32) * pair_fp8_inv_scale,
+                -448.0,
+                448.0,
+            ).astype(jnp.float8_e4m3fn)
         off = jnp.int32(0)
         for b in pair_pieces:
             has = (num_valid & b) != 0
@@ -1080,9 +1171,11 @@ def kernel_main_fused_rs(
             @pl.when(has)
             def _(b=b, off=off):
                 pltpu.make_async_remote_copy(
-                    src_ref=scatter_staging_3x_ref.at[
-                        stg_id, pl.ds(row0 + off, b), :, :
-                    ],
+                    src_ref=(
+                        pair_send_fp8_ref
+                        if pair_send_fp8_ref is not None
+                        else scatter_staging_3x_ref
+                    ).at[stg_id, pl.ds(row0 + off, b), :, :],
                     dst_ref=pair_ring_ref.at[ring_slot, pl.ds(row0 + off, b), :, :],
                     send_sem=send_sems_ref.at[stg_id],
                     recv_sem=pair_recv_sem_ref.at[ring_slot],
@@ -1093,214 +1186,18 @@ def kernel_main_fused_rs(
             off = off + jnp.where(has, b, 0)
         gm_id_ref[1 + stg_id] = gm_id_ref[1 + stg_id] + _pair_count_pieces(num_valid)
 
-    relay_diag = tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_RELAY_DIAG.get()
-    pair_window_add = tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_WINDOW_ADD.get()
-    pair_run_add = tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_RUN_ADD.get() and _pair_run_table()
-    # Row windows for the pair / relay adds: rows are the untiled leading dim of a slot, so
-    # any window size and start work; pick the smallest that covers the rows needed.
-    window_rows = [b for b in (8, 16, 32, 64, 128, 256, 512) if b < tile_m] + [tile_m]
-
-    def _row_window(n, fn):
-        """fn(B) for the smallest window size B >= n (n <= tile_m)."""
-        idx = jnp.int32(0)
-        for b in window_rows[:-1]:
-            idx += (n > b).astype(jnp.int32)
-        lax.switch(idx, [(lambda b=b: (fn(b), jnp.int32(0))[1]) for b in window_rows])
-
-    def _issue_pieces(
-        run_len, src_ref, src_row, dst_ref, dst_row, d, send_sem, recv_sem
-    ):
-        """Power-of-two DMAs for one run; returns the number issued."""
-        n = jnp.int32(0)
-        for b in pair_pieces:
-            has = (run_len & b) != 0
-            off = run_len & ~(2 * b - 1)
-
-            @pl.when(has)
-            def _(b=b, off=off):
-                pltpu.make_async_remote_copy(
-                    src_ref=src_ref.at[pl.ds(src_row + off, b), :, :],
-                    dst_ref=dst_ref.at[pl.ds(dst_row + off, b), :, :],
-                    send_sem=send_sem,
-                    recv_sem=recv_sem,
-                    device_id={ep_axis_name: d},
-                    device_id_type=pltpu.DeviceIdType.MESH,
-                ).start()
-
-            n = n + has.astype(jnp.int32)
-        return n
-
-    @jax.named_scope("relay_send")
-    def _relay_send(g, stg, row0, run_len, src_off, relay_dir, relay_chip):
-        """Tile g's diagonal run (pair sums) to the same rows of the neighbor's relay slot."""
-        d = 2 * relay_chip + my_id % 2
-        n = _issue_pieces(
-            run_len,
-            pair_sum_ref.at[stg],
-            row0 + src_off,
-            relay_ring_ref.at[relay_dir],
-            row0 + src_off,
-            d,
-            send_sems_ref.at[stg],
-            relay_recv_sem_ref.at[relay_dir],
-        )
-        gm_id_ref[1 + stg] = gm_id_ref[1 + stg] + n
-
-    @jax.named_scope("relay_finish")
-    def _relay_finish(g):
-        """Add the rows a neighbor relayed for tile g into this core's held run and send it."""
-        num_chips = ep_size // 2
-        my_chip = my_id // 2
-        relay_dir = g % 2
-        relay_s = 1 - 2 * relay_dir
-        k = jnp.where(relay_dir == 0, 1, 3)
-        t = 1 + k
-        stg = g % staging_slots
-        n_targets = num_chips + 1
-        at = pair_meta_base + g * n_targets + t
-        run_len = group_start_ref[at]
-        src_off = group_start_ref[at + pair_meta_stride]
-        rank = group_start_ref[at + 2 * pair_meta_stride]
-        m_st = metadata_ref.gm_id_to_m_offset[g]
-        row0 = m_st % _sls_pair
-        n_pieces = _pair_count_pieces(run_len)
-
-        @pl.when(n_pieces > 0)
-        def _():
-            pl.semaphore_wait(relay_recv_sem_ref.at[relay_dir], n_pieces)
-
-        lo = row0 + src_off
-
-        def _add(b):
-            start = jnp.minimum(lo, tile_m - b)
-            rows = start + lax.broadcasted_iota(jnp.int32, (b, 1, 1), 0)
-            inside = jnp.logical_and(rows >= lo, rows < lo + run_len)
-            own = pair_sum_ref[stg, pl.ds(start, b)]
-            pair_sum_ref[stg, pl.ds(start, b)] = jnp.where(
-                inside,
-                (
-                    own.astype(jnp.float32)
-                    + relay_ring_ref[relay_dir, pl.ds(start, b)].astype(jnp.float32)
-                ).astype(own.dtype),
-                own,
-            )
-
-        with jax.named_scope("relay_add"):
-
-            @pl.when(run_len > 0)
-            def _():
-                _row_window(run_len, _add)
-
-        src_chip = (my_chip - relay_s + num_chips) % num_chips
-        pltpu.semaphore_signal(
-            relay_credit_ref.at[relay_dir],
-            device_id={ep_axis_name: 2 * src_chip + my_id % 2},
-            device_id_type=pltpu.DeviceIdType.MESH,
-        )
-        owner = 2 * ((my_chip + k) % num_chips) + my_id % 2
-        block = jnp.where(relay_dir == 0, 3, 2)
-        rows_per_block = out_buf_ref.shape[0] // num_chips
-        n = _issue_pieces(
-            run_len,
-            pair_sum_ref.at[stg],
-            row0 + src_off,
-            out_buf_ref,
-            block * rows_per_block + rank,
-            owner,
-            send_sems_ref.at[stg],
-            recv_sem_ref.at[0],
-        )
-        gm_id_ref[1 + stg] = gm_id_ref[1 + stg] + n
-
-    @jax.named_scope("pair_issue")
-    def _pair_issue_table(g, stg, row0, my_chip, num_chips, rows_per_block):
-        """Issue tile g's runs from the precomputed table: own and sibling rows carry this
-        core's partial; the run for chip my_chip + k carries the pair sum to the core of
-        this parity there, into that owner's receive block 1 + (num_chips - k) % num_chips."""
-        n_targets = num_chips + 1
-        stride = pair_meta_stride
-        sent = jnp.int32(0)
-        if pair_relay:
-            # even tiles relay through chip + 1 and hold back the k = 1 run (it gets the
-            # rows chip - 1 relays); odd tiles mirror that through chip - 1 and k = 3
-            relay_dir = g % 2
-            relay_s = 1 - 2 * relay_dir
-            relay_chip = (my_chip + relay_s + num_chips) % num_chips
-
-            @pl.when(g >= 2)
-            def _():
-                pl.semaphore_wait(relay_credit_ref.at[relay_dir], 1)
-
-        for t in range(n_targets):
-            at = pair_meta_base + g * n_targets + t
-            run_len = group_start_ref[at]
-            src_off = group_start_ref[at + stride]
-            rank = group_start_ref[at + 2 * stride]
-            if t == 0:
-                d, block, src = my_id, 0, scatter_staging_3x_ref
-            elif t == 1:
-                d, block, src = jnp.bitwise_xor(my_id, 1), 1, scatter_staging_3x_ref
-            else:
-                k = t - 1
-                d = 2 * ((my_chip + k) % num_chips) + my_id % 2
-                block = 1 + (num_chips - k) % num_chips
-                src = pair_sum_ref
-                if "pairnofwd" in _ABLATE or f"fwdskip{k}" in _ABLATE:
-                    continue
-                if pair_relay:
-                    if k == relay_diag:
-                        _relay_send(
-                            g, stg, row0, run_len, src_off, relay_dir, relay_chip
-                        )
-                        continue
-                    # owners see the two neighbor blocks: from chip - 1 -> 3, chip + 1 -> 2
-                    block = 3 if k == 1 else 2
-                    held = relay_dir == (0 if k == 1 else 1)
-                    # the held run goes out from _relay_finish once the relayed rows are in
-                    run_len = jnp.where(held, 0, run_len)
-            dst0 = block * rows_per_block + rank
-
-            def _pieces(
-                sizes, *, run_len=run_len, src_off=src_off, dst0=dst0, d=d, src=src
-            ):
-                n = jnp.int32(0)
-                for b in sizes:
-                    has = (run_len & b) != 0
-                    # rows of the larger pieces before this one
-                    off = run_len & ~(2 * b - 1)
-
-                    @pl.when(has)
-                    def _(b=b, off=off):
-                        pltpu.make_async_remote_copy(
-                            src_ref=src.at[stg, pl.ds(row0 + src_off + off, b), :, :],
-                            dst_ref=out_buf_ref.at[pl.ds(dst0 + off, b), :, :],
-                            send_sem=send_sems_ref.at[stg],
-                            recv_sem=recv_sem_ref.at[0],
-                            device_id={ep_axis_name: d},
-                            device_id_type=pltpu.DeviceIdType.MESH,
-                        ).start()
-
-                    n = n + has.astype(jnp.int32)
-                return n
-
-            big = [b for b in pair_pieces if b >= 32]
-            small = [b for b in pair_pieces if b < 32]
-            if big:
-                # most runs are a few dozen rows: test the large pieces only when needed
-                sent = sent + lax.cond(
-                    run_len >= 32, lambda: _pieces(big), lambda: jnp.int32(0)
-                )
-            sent = sent + _pieces(small)
-        gm_id_ref[1 + stg] = gm_id_ref[1 + stg] + sent
-
     @jax.named_scope("pair_finish")
     def _pair_finish(g):
         """Tile g: add the sibling's partial rows, free its ring slot, write each owner's run.
 
-        Rows of a tile are token-sorted, so the rows of each owner form one run whose ranks
-        among that owner's rows are consecutive. A run goes to the owner's receive block
-        for this source: own rows (block 0) and the sibling's (block 1) carry one core's
-        partial; another chip's run carries the pair sum from the core of the owner's parity.
+        Rows of a tile are token-sorted, so the rows of each owner form one run
+        whose ranks
+        among that owner's rows are consecutive. A run goes to the owner's receive
+        block
+        for this source: own rows (block 0) and the sibling's (block 1) carry one
+        core's
+        partial; another chip's run carries the pair sum from the core of the
+        owner's parity.
         """
         stg = g % staging_slots
         ring_slot = g % _PAIR_RING
@@ -1308,73 +1205,180 @@ def kernel_main_fused_rs(
         m_en = metadata_ref.gm_id_to_m_offset[g + 1]
         row0 = m_st % _sls_pair
         n_pieces = _pair_count_pieces(m_en - m_st)
+        my_chip = my_id // 2
+        num_chips = ep_size // 2
+        rows_per_block = out_buf_ref.shape[0] // (num_chips + 1)
 
-        with jax.named_scope("pair_wait"):
+        if (
+            _fast_issue
+            and _fwd_psum
+            and not _no_psum
+            and pair_fp8_ref is None
+            and pair_send_fp8_ref is None
+        ):
+            my_core = my_id % 2
+            base = pair_meta_base + g * ep_size
+            lens = [group_start_ref[base + d] for d in range(ep_size)]
 
-            @pl.when(jnp.logical_and(n_pieces > 0, "pairnosend" not in _ABLATE))
+            def _src_off_fast(d):
+                acc = jnp.int32(0)
+                for e in range(ep_size):
+                    acc = acc + jnp.where(e < d, lens[e], 0)
+                return acc
+
+            def _psum_one(r):
+                pair_sum_ref[stg, r] = (
+                    scatter_staging_3x_ref[stg, r].astype(jnp.float32)
+                    + pair_ring_ref[ring_slot, r].astype(jnp.float32)
+                ).astype(pair_sum_ref.dtype)
+
+            sent = jnp.int32(0)
+            # Issue local/sibling DMAs BEFORE waiting on the sibling ring slot.
+            for d, block in ((my_id, 0), (jnp.bitwise_xor(my_id, 1), 1)):
+                run_len = lens[d] if isinstance(d, int) else group_start_ref[base + d]
+                rank = group_start_ref[
+                    pair_meta_base + pair_meta_stride + g * ep_size + d
+                ]
+                src_off = _src_off_fast(d)
+                dst0 = block * rows_per_block + rank
+                off = jnp.int32(0)
+                for b in pair_pieces:
+                    has = (run_len & b) != 0
+
+                    @pl.when(has)
+                    def _(b=b, off=off, d=d, dst0=dst0, src_off=src_off):
+                        pltpu.make_async_remote_copy(
+                            src_ref=scatter_staging_3x_ref.at[
+                                stg, pl.ds(row0 + src_off + off, b), :, :
+                            ],
+                            dst_ref=out_buf_ref.at[pl.ds(dst0 + off, b), :, :],
+                            send_sem=send_sems_ref.at[stg],
+                            recv_sem=recv_sem_ref.at[0],
+                            device_id={ep_axis_name: d},
+                            device_id_type=pltpu.DeviceIdType.MESH,
+                        ).start()
+
+                    off = off + jnp.where(has, b, 0)
+                    sent = sent + has.astype(jnp.int32)
+
+            @pl.when(jnp.logical_and(n_pieces > 0, not _no_ring))
             def _():
                 pl.semaphore_wait(pair_recv_sem_ref.at[ring_slot], n_pieces)
 
-        if "pairnoadd" not in _ABLATE:
-            with jax.named_scope("pair_add"):
-                if pair_run_add:
-                    # pair sums only leave in this core's forwarded runs (targets 2..):
-                    # one row window per run; extra rows in a window get correct sums too
-                    n_targets = ep_size // 2 + 1
-                    for t in range(2, n_targets):
-                        at = pair_meta_base + g * n_targets + t
-                        run_len = group_start_ref[at]
-                        lo = row0 + group_start_ref[at + pair_meta_stride]
+            # Stream each cross-chip role's pair sum and immediately launch its ICI DMA.
+            for k in range(1, num_chips):
+                d_chip = jax.lax.rem(my_chip + k, num_chips)
+                d = d_chip * 2 + my_core
+                block = 1 + (num_chips - k) % num_chips
+                run_len = group_start_ref[base + d]
+                rank = group_start_ref[
+                    pair_meta_base + pair_meta_stride + g * ep_size + d
+                ]
+                src_off = _src_off_fast(d)
+                dst0 = block * rows_per_block + rank
+                off = jnp.int32(0)
+                for b in pair_pieces:
+                    has = (run_len & b) != 0
 
-                        def _add(b, lo=lo):
-                            start = jnp.minimum(lo, tile_m - b)
-                            pair_sum_ref[stg, pl.ds(start, b)] = (
-                                scatter_staging_3x_ref[stg, pl.ds(start, b)].astype(
-                                    jnp.float32
-                                )
-                                + pair_ring_ref[ring_slot, pl.ds(start, b)].astype(
-                                    jnp.float32
-                                )
-                            ).astype(pair_sum_ref.dtype)
+                    @pl.when(has)
+                    def _(b=b, off=off, d=d, dst0=dst0, src_off=src_off):
+                        r_base = row0 + src_off + off
+                        if b <= 8:
+                            for u in range(b):
+                                _psum_one(r_base + u)
+                        else:
 
-                        @pl.when(run_len > 0)
-                        def _(run_len=run_len, _add=_add):
-                            _row_window(run_len, _add)
+                            def _psum8(k8, c, r_base=r_base):
+                                for u in range(8):
+                                    _psum_one(r_base + k8 * 8 + u)
+                                return c
 
-                elif pair_window_add:
-                    # only rows [0, row0 + valid) are ever sent or relayed
+                            lax.fori_loop(0, b // 8, _psum8, 0)
+                        pltpu.make_async_remote_copy(
+                            src_ref=pair_sum_ref.at[stg, pl.ds(r_base, b), :, :],
+                            dst_ref=out_buf_ref.at[pl.ds(dst0 + off, b), :, :],
+                            send_sem=send_sems_ref.at[stg],
+                            recv_sem=recv_sem_ref.at[0],
+                            device_id={ep_axis_name: d},
+                            device_id_type=pltpu.DeviceIdType.MESH,
+                        ).start()
 
-                    def _add(b):
-                        pair_sum_ref[stg, pl.ds(0, b)] = (
-                            scatter_staging_3x_ref[stg, pl.ds(0, b)].astype(jnp.float32)
-                            + pair_ring_ref[ring_slot, pl.ds(0, b)].astype(jnp.float32)
+                    off = off + jnp.where(has, b, 0)
+                    sent = sent + has.astype(jnp.int32)
+
+            if not _no_ring:
+                pl.semaphore_signal(
+                    pair_credit_ref.at[0],
+                    device_id={ep_axis_name: sibling},
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                )
+            gm_id_ref[1 + stg] = gm_id_ref[1 + stg] + sent
+            return
+
+        @pl.when(jnp.logical_and(n_pieces > 0, not _no_ring))
+        def _():
+            pl.semaphore_wait(pair_recv_sem_ref.at[ring_slot], n_pieces)
+
+        if _no_psum:
+            pass
+        elif _fwd_psum and pair_fp8_ref is None and pair_send_fp8_ref is None:
+            # Only the rows this core forwards to another chip need the pair sum:
+            # the runs of the owners of this core's parity on the other chips (3 of
+            # the tile's 8 owner runs). Rows are a leading (untiled) dim, so a run
+            # is summed row by row at its dynamic offset.
+            def _owner_psum(d, src_off):
+                run_len = group_start_ref[pair_meta_base + g * ep_size + d]
+                fwd = jnp.logical_and(d // 2 != my_chip, (d % 2) == (my_id % 2))
+
+                @pl.when(jnp.logical_and(fwd, run_len > 0))
+                def _():
+                    def _one(r):
+                        pair_sum_ref[stg, r] = (
+                            scatter_staging_3x_ref[stg, r].astype(jnp.float32)
+                            + pair_ring_ref[ring_slot, r].astype(jnp.float32)
                         ).astype(pair_sum_ref.dtype)
 
-                    _row_window(row0 + m_en - m_st, _add)
-                else:
-                    pair_sum_ref[stg] = (
-                        scatter_staging_3x_ref[stg].astype(jnp.float32)
-                        + pair_ring_ref[ring_slot].astype(jnp.float32)
-                    ).astype(pair_sum_ref.dtype)
-        if "pairnosend" not in _ABLATE:
-            pltpu.semaphore_signal(
+                    base = row0 + src_off
+
+                    def _row8(k, c):
+                        for u in range(8):
+                            _one(base + k * 8 + u)
+                        return c
+
+                    def _row(i, c):
+                        _one(base + i)
+                        return c
+
+                    n8 = run_len // 8
+                    lax.fori_loop(0, n8, _row8, 0)
+                    lax.fori_loop(n8 * 8, run_len, _row, 0)
+
+                return src_off + run_len
+
+            lax.fori_loop(0, ep_size, _owner_psum, jnp.int32(0))
+        else:
+            _ring = pair_ring_ref[ring_slot].astype(jnp.float32)
+            if pair_send_fp8_ref is not None:
+                _ring = _ring * (1.0 / pair_fp8_inv_scale)
+            _psum = scatter_staging_3x_ref[stg].astype(jnp.float32) + _ring
+            if pair_fp8_ref is not None:
+                # Experimental: cross-chip pair sums travel as e4m3 (static scale).
+                pair_fp8_ref[stg] = jnp.clip(
+                    _psum * pair_fp8_inv_scale, -448.0, 448.0
+                ).astype(jnp.float8_e4m3fn)
+            else:
+                pair_sum_ref[stg] = _psum.astype(pair_sum_ref.dtype)
+        if not _no_ring:
+            pl.semaphore_signal(
                 pair_credit_ref.at[0],
                 device_id={ep_axis_name: sibling},
                 device_id_type=pltpu.DeviceIdType.MESH,
             )
-        if "pairnowrite" in _ABLATE:
-            return
-        my_chip = my_id // 2
         num_chips = ep_size // 2
-        rows_per_block = out_buf_ref.shape[0] // (
-            num_chips if pair_relay else num_chips + 1
-        )
-        if _pair_run_table():
-            _pair_issue_table(g, stg, row0, my_chip, num_chips, rows_per_block)
-            return
+        rows_per_block = out_buf_ref.shape[0] // (num_chips + 1)
 
         def _owner(d, carry):
-            src_off, sent = carry
+            src_off, sent, self_sent = carry
             run_len = group_start_ref[pair_meta_base + g * ep_size + d]
             rank = group_start_ref[pair_meta_base + pair_meta_stride + g * ep_size + d]
             d_chip = d // 2
@@ -1387,8 +1391,11 @@ def kernel_main_fused_rs(
             )
             dst0 = block * rows_per_block + rank
             send = jnp.logical_and(same_chip | forward, run_len > 0)
-            if "pairnofwd" in _ABLATE:
-                send = jnp.logical_and(send, ~forward)
+            tgt = d
+            if _self_sib:
+                tgt = jnp.where(same_chip, my_id, tgt)
+            if _self_cross:
+                tgt = jnp.where(same_chip, tgt, my_id)
             off = jnp.int32(0)
             for b in pair_pieces:
                 has = jnp.logical_and(send, (run_len & b) != 0)
@@ -1402,30 +1409,84 @@ def kernel_main_fused_rs(
                         dst_ref=out_buf_ref.at[pl.ds(dst0 + off, b), :, :],
                         send_sem=send_sems_ref.at[stg],
                         recv_sem=recv_sem_ref.at[0],
-                        device_id={ep_axis_name: d},
+                        device_id={ep_axis_name: tgt},
                         device_id_type=pltpu.DeviceIdType.MESH,
                     ).start()
 
                 @pl.when(jnp.logical_and(has, forward))
                 def _(b=b, off=off):
+                    fwd_src = pair_fp8_ref if pair_fp8_ref is not None else pair_sum_ref
+                    fwd_dst = out_fp8_ref if out_fp8_ref is not None else out_buf_ref
                     pltpu.make_async_remote_copy(
-                        src_ref=pair_sum_ref.at[
-                            stg, pl.ds(row0 + src_off + off, b), :, :
-                        ],
-                        dst_ref=out_buf_ref.at[pl.ds(dst0 + off, b), :, :],
+                        src_ref=fwd_src.at[stg, pl.ds(row0 + src_off + off, b), :, :],
+                        dst_ref=fwd_dst.at[pl.ds(dst0 + off, b), :, :],
                         send_sem=send_sems_ref.at[stg],
                         recv_sem=recv_sem_ref.at[0],
-                        device_id={ep_axis_name: d},
+                        device_id={ep_axis_name: tgt},
                         device_id_type=pltpu.DeviceIdType.MESH,
                     ).start()
 
                 off = off + jnp.where((run_len & b) != 0, b, 0)
                 sent = sent + has.astype(jnp.int32)
-            return src_off + run_len, sent
+                self_sent = self_sent + jnp.logical_and(has, tgt == my_id).astype(
+                    jnp.int32
+                )
+            return src_off + run_len, sent, self_sent
 
-        with jax.named_scope("pair_issue"):
-            _, sent = lax.fori_loop(0, ep_size, _owner, (jnp.int32(0), jnp.int32(0)))
+        if _fast_issue:
+            # Only the 5 owners this core sends to (itself, its sibling and the
+            # same-parity core of each other chip), each with a static source and
+            # receive block, one predicated DMA per power-of-two piece (45 predicated
+            # DMA starts per tile instead of 144).
+            my_core = my_id % 2
+            base = pair_meta_base + g * ep_size
+            lens = [group_start_ref[base + d] for d in range(ep_size)]
+
+            def _src_off(d):
+                acc = jnp.int32(0)
+                for e in range(ep_size):
+                    acc = acc + jnp.where(e < d, lens[e], 0)
+                return acc
+
+            roles = [(my_id, 0, False), (jnp.bitwise_xor(my_id, 1), 1, False)]
+            for k in range(1, num_chips):
+                d_chip = jax.lax.rem(my_chip + k, num_chips)
+                roles.append(
+                    (d_chip * 2 + my_core, 1 + (num_chips - k) % num_chips, True)
+                )
+            sent = jnp.int32(0)
+            for d, block, fwd in roles:
+                run_len = group_start_ref[base + d]
+                rank = group_start_ref[
+                    pair_meta_base + pair_meta_stride + g * ep_size + d
+                ]
+                src_off = _src_off(d)
+                dst0 = block * rows_per_block + rank
+                src = pair_sum_ref if fwd else scatter_staging_3x_ref
+                off = jnp.int32(0)
+                for b in pair_pieces:
+                    has = (run_len & b) != 0
+
+                    @pl.when(has)
+                    def _(b=b, off=off, src=src, d=d, dst0=dst0, src_off=src_off):
+                        pltpu.make_async_remote_copy(
+                            src_ref=src.at[stg, pl.ds(row0 + src_off + off, b), :, :],
+                            dst_ref=out_buf_ref.at[pl.ds(dst0 + off, b), :, :],
+                            send_sem=send_sems_ref.at[stg],
+                            recv_sem=recv_sem_ref.at[0],
+                            device_id={ep_axis_name: d},
+                            device_id_type=pltpu.DeviceIdType.MESH,
+                        ).start()
+
+                    off = off + jnp.where(has, b, 0)
+                    sent = sent + has.astype(jnp.int32)
+        else:
+            _, sent, self_sent = lax.fori_loop(
+                0, ep_size, _owner, (jnp.int32(0), jnp.int32(0), jnp.int32(0))
+            )
         gm_id_ref[1 + stg] = gm_id_ref[1 + stg] + sent
+        if pair_self_count_ref is not None and not _fast_issue:
+            pair_self_count_ref[0] = pair_self_count_ref[0] + self_sent
 
     @jax.named_scope("gm_loop_body")
     def gm_loop_body(gm_id, _):
@@ -1618,8 +1679,7 @@ def kernel_main_fused_rs(
                 # ns % num_w1_bufs == buf_id, so starting the next DMA first
                 # would overwrite the tile this matmul is still reading (WAR
                 # race between the refill DMA and compute -> nondeterminism).
-                if "nocompute" not in _ABLATE:
-                    _dispatch(compute_gmm1_tile, buf_id, _n1, _k1, gm_id)
+                _dispatch(compute_gmm1_tile, buf_id, _n1, _k1, gm_id)
                 if step + num_w1_bufs < total_w1_steps:
                     ns = step + num_w1_bufs
                     start_w1_dma(ns % num_w1_bufs, expert_id, ns // num_k1, ns % num_k1)
@@ -1677,10 +1737,9 @@ def kernel_main_fused_rs(
                         out_dtype
                     ).reshape(m_sub, dims.size_lhs_sublane, dims.size_k2)
 
-                if "nocompute" not in _ABLATE:
-                    _dispatch(_interlude)
+                _dispatch(_interlude)
 
-            if defer_writes and gmm2_row_out:
+            if _direct_stage and defer_writes:
                 wait_staging_slot_writes(stg_id)
 
             # GMM2 loop.
@@ -1695,8 +1754,7 @@ def kernel_main_fused_rs(
                     wait_w2_dma(buf_id)
 
                 # See GMM1 loop: consume the slot before refilling it (WAR).
-                if "nocompute" not in _ABLATE:
-                    _dispatch(compute_gmm2_tile, buf_id, _n2, _k2, gm_id)
+                _dispatch(compute_gmm2_tile, buf_id, _n2, _k2, gm_id)
                 if step + num_w2_bufs < total_w2_steps:
                     ns = step + num_w2_bufs
                     start_w2_dma(ns % num_w2_bufs, expert_id, ns // num_k2, ns % num_k2)
@@ -1711,22 +1769,22 @@ def kernel_main_fused_rs(
             _sls = pltpu.get_tpu_info().get_sublane_tiling(out_dtype)
             _ml = m_st % _sls
 
-            if defer_writes and not gmm2_row_out:
-                wait_staging_slot_writes(stg_id)
+            if not _direct_stage:
+                if defer_writes:
+                    wait_staging_slot_writes(stg_id)
 
-            with jax.named_scope("reshape_gmm2_output"):
-                # Only the bucket's rows: the rows sent below all lie under it, and the
-                # packed-row relayout costs ~1 us per 256 rows.
-                def _relayout(m_rows):
-                    scatter_staging_3x_ref[stg_id, pl.ds(0, m_rows)] = tiled_out_2x_ref[
-                        sem_id, pl.ds(0, m_rows)
-                    ].reshape(
-                        m_rows,
-                        scatter_staging_3x_ref.shape[2],
-                        scatter_staging_3x_ref.shape[3],
-                    )
+                with jax.named_scope("reshape_gmm2_output"):
+                    # Only the bucket's rows: the rows sent below all lie under it, and the
+                    # packed-row relayout costs ~1 us per 256 rows.
+                    def _relayout(m_rows):
+                        scatter_staging_3x_ref[stg_id, pl.ds(0, m_rows)] = (
+                            tiled_out_2x_ref[sem_id, pl.ds(0, m_rows)].reshape(
+                                m_rows,
+                                scatter_staging_3x_ref.shape[2],
+                                scatter_staging_3x_ref.shape[3],
+                            )
+                        )
 
-                if not gmm2_row_out:
                     _dispatch(_relayout)
 
             # Step 10: Direct-write — single pass over valid rows only.
@@ -1743,12 +1801,6 @@ def kernel_main_fused_rs(
                 @pl.when(gm_id >= 1)
                 def _():
                     _pair_finish(gm_id - 1)
-
-                if pair_relay:
-
-                    @pl.when(gm_id >= 2)
-                    def _():
-                        _relay_finish(gm_id - 2)
 
             @jax.named_scope("direct_write_rows")
             def _do_direct_write():
@@ -1937,48 +1989,30 @@ def kernel_main_fused_rs(
         def _():
             _pair_finish(local_num_gm - 1)
 
-        if pair_relay:
-
-            @pl.when(local_num_gm >= 2)
-            def _():
-                _relay_finish(local_num_gm - 2)
-
-            @pl.when(local_num_gm >= 1)
-            def _():
-                _relay_finish(local_num_gm - 1)
-
     if defer_writes:
         # A kernel must not exit with DMAs or semaphores outstanding.
         for _s in range(staging_slots):
             wait_staging_slot_writes(_s)
-    if pair_exchange:
+    if pair_exchange and not _no_ring:
         # one credit per tile the sibling consumed; the first _PAIR_RING were never waited
-        @pl.when(jnp.logical_and(local_num_gm > 0, "pairnosend" not in _ABLATE))
+        @pl.when(local_num_gm > 0)
         def _():
             pl.semaphore_wait(
                 pair_credit_ref.at[0], jnp.minimum(local_num_gm, _PAIR_RING)
             )
 
-        if pair_relay:
-            # each direction's last relayed tile was never waited before a reuse
-            for _dir in range(2):
-
-                @pl.when(local_num_gm > _dir)
-                def _(_dir=_dir):
-                    pl.semaphore_wait(relay_credit_ref.at[_dir], 1)
-
     # Post-Scatter Cross-Rank Optical Barrier
     sync_barrier()
 
-    # Drain incoming receive semaphores using in-kernel computed total_recv
-    # (write-dropping ablations change the receive count: pairnowrite receives nothing,
-    # pairnofwd only the own and sibling blocks of the ep // 2 + 1)
-    if "pairnofwd" in _ABLATE and pair_exchange:
-        total_recv = total_recv // (ep_size // 2 + 1) * 2
-    if any(a.startswith("fwdskip") for a in _ABLATE) and pair_exchange:
-        total_recv = total_recv // (ep_size // 2 + 1) * (ep_size // 2)
+    if pair_self_count_ref is not None:
+        # self-target ablation: own pieces plus whatever real senders still send
+        # (selfx: the sibling's block; selfp: the three cross-chip forwarders)
+        per_source = total_recv // (ep_size // 2 + 1)
+        others = (0 if _self_sib else 1) + (0 if _self_cross else 3)
+        total_recv = pair_self_count_ref[0] + others * per_source
 
-    @pl.when(jnp.logical_and(total_recv > 0, "pairnowrite" not in _ABLATE))
+    # Drain incoming receive semaphores using in-kernel computed total_recv
+    @pl.when(total_recv > 0)
     def _():
         pl.semaphore_wait(recv_sem_ref.at[0], total_recv)
         if fp8_direct_write:
@@ -2150,9 +2184,12 @@ def _pair_exchange_metadata(
 ) -> tuple[jax.Array, int, int]:
     """Append per-(tile, owner) run lengths and ranks to the local-rows metadata.
 
-    A local row's owner is its token's rank; rows are expert-sorted then token-sorted,
-    so each tile holds one consecutive run per owner. The receive count becomes the
-    DMA pieces arriving from every source block (self, sibling, one core per other chip).
+    A local row's owner is its token's rank; rows are expert-sorted then
+    token-sorted,
+    so each tile holds one consecutive run per owner. The receive count becomes
+    the
+    DMA pieces arriving from every source block (self, sibling, one core per other
+    chip).
     """
     tokens = local_idx // top_k if pack_indices else local_idx
     owner = tokens // chunk_size
@@ -2174,36 +2211,11 @@ def _pair_exchange_metadata(
     total_recv = num_blocks * jnp.sum(pieces)
     head = group_start.at[2].set(total_recv.astype(jnp.int32))
     base = head.shape[0]
-    if _pair_run_table():
-        # Runs this rank issues per tile, in _pair_targets order: (length, offset in the
-        # tile, rank among the owner's rows). Rows of a tile are token-sorted, so a run
-        # starts after the runs of all lower owners.
-        src_off = jnp.cumsum(run_len, axis=1) - run_len
-        targets = _pair_targets(my_rank, ep_size)
-        cols = [jnp.take(a, targets, axis=1) for a in (run_len, src_off, run_rank)]
-        stride = num_slots * len(targets)
-        meta = jnp.concatenate([head] + [c.reshape(-1) for c in cols])
-        return meta.astype(jnp.int32), base, stride
     stride = num_slots * ep_size
     meta = jnp.concatenate([head, run_len.reshape(-1), run_rank.reshape(-1)]).astype(
         jnp.int32
     )
     return meta, base, stride
-
-
-def _pair_run_table() -> bool:
-    return tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_RUN_TABLE.get()
-
-
-def _pair_targets(my_id, ep_size: int):
-    """Owners a rank sends runs to under pair exchange: itself, its sibling, then the core
-    of its parity on chip (my_chip + k) % num_chips for k = 1.. num_chips - 1."""
-    num_chips = ep_size // 2
-    my_chip, parity = my_id // 2, my_id % 2
-    return jnp.stack(
-        [my_id, jnp.bitwise_xor(my_id, 1)]
-        + [2 * ((my_chip + k) % num_chips) + parity for k in range(1, num_chips)]
-    ).astype(jnp.int32)
 
 
 # =============================================================================
@@ -2266,13 +2278,16 @@ def gmm_v2_fused_rs(
 ) -> jax.Array:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
 
-    ``pair_exchange`` (expert TP, logical ranks 2c and 2c+1 on one chip): for a row
-    owned on another chip, the core of the owner's parity adds its sibling's partial
+    ``pair_exchange`` (expert TP, logical ranks 2c and 2c+1 on one chip): for a
+    row
+    owned on another chip, the core of the owner's parity adds its sibling's
+    partial
     (sent on-chip into a VMEM ring) to its own and sends the pair sum; the other
     core sends nothing for that row. out_buf is then zero-initialized.
 
     ``local_rows`` (expert TP only): the scalar-prefetched row indices hold just
-    this device's contiguous block of routed rows instead of all ``ep_size`` blocks.
+    this device's contiguous block of routed rows instead of all ``ep_size``
+    blocks.
     ``skip_out_zero`` (expert TP): do not zero out_buf before the writes.
     ``tiled_output``: return the bf16 result in the kernel's own
     (rows, size_n2 // 128, 128) layout when N2 is unpadded, so a row-split
@@ -2281,8 +2296,11 @@ def gmm_v2_fused_rs(
     Output: (chunk_size * top_k, size_n2) per chip — raw expert contributions.
     Post-kernel reduction applies topk_weights and sums over top_k dim.
     """
-    size_group, size_k1, size_n1 = w1.shape
-    _, size_k2, size_n2 = w2.shape
+    stacked = w1.ndim == 4
+    w1_shape = w1.shape[1:] if stacked else w1.shape
+    w2_shape = w2.shape[1:] if stacked else w2.shape
+    size_group, size_k1, size_n1 = w1_shape
+    _, size_k2, size_n2 = w2_shape
     size_m = lhs_indices.shape[0]
     chunk_size = output_size // ep_size
     # Rows the kernel indexes; tile selection keeps the global size_m to match
@@ -2292,8 +2310,10 @@ def gmm_v2_fused_rs(
     is_quantized = w1_scale is not None
     if is_quantized:
         assert w2_scale is not None
-        rhs1_quant_block_size = recover_quant_block_size(size_k1, w1_scale.shape[1])
-        rhs2_quant_block_size = recover_quant_block_size(size_k2, w2_scale.shape[1])
+        w1s_shape = w1_scale.shape[1:] if stacked else w1_scale.shape
+        w2s_shape = w2_scale.shape[1:] if stacked else w2_scale.shape
+        rhs1_quant_block_size = recover_quant_block_size(size_k1, w1s_shape[1])
+        rhs2_quant_block_size = recover_quant_block_size(size_k2, w2s_shape[1])
         quant_block_size = rhs1_quant_block_size
         # Scales stay in their stored dtype when it is bf16 or fp32: the matmul
         # casts each tile slice, while a full-tensor cast here would re-copy
@@ -2303,14 +2323,16 @@ def gmm_v2_fused_rs(
             if w1_scale.dtype in (jnp.bfloat16, jnp.float32, jnp.float8_e4m3fn)
             else jnp.dtype(jnp.float32)
         )
-        w1_scale = w1_scale.astype(scale_dtype)
-        w2_scale = w2_scale.astype(scale_dtype)
-        if w1_scale.ndim != w2_scale.ndim or w1_scale.ndim not in (3, 4):
+        if w1_scale.dtype != scale_dtype:
+            w1_scale = w1_scale.astype(scale_dtype)
+        if w2_scale.dtype != scale_dtype:
+            w2_scale = w2_scale.astype(scale_dtype)
+        if len(w1s_shape) != len(w2s_shape) or len(w1s_shape) not in (3, 4):
             raise ValueError(
                 "fused-RS scales must both be [E, K_blocks, N] or "
                 f"[E, K_blocks, 1, N], got {w1_scale.shape} and {w2_scale.shape}"
             )
-        scale_has_unit_dim = w1_scale.ndim == 4
+        scale_has_unit_dim = len(w1s_shape) == 4
     else:
         rhs1_quant_block_size = size_k1
         rhs2_quant_block_size = size_k2
@@ -2420,16 +2442,18 @@ def gmm_v2_fused_rs(
         hidden_states = jnp.pad(hidden_states, ((0, 0), (0, k_pad)))
 
     # Pad N1 (and propagate to K2 since GMM2's K is GMM1's intermediate size).
+    lead_pads = ((0, 0),) if stacked else ()
+    s_axis = 2 if stacked else 1
     if aligned_n1 != size_n1:
         n1_pad = aligned_n1 - size_n1
-        w1 = jnp.pad(w1, ((0, 0), (0, 0), (0, n1_pad)))
+        w1 = jnp.pad(w1, lead_pads + ((0, 0), (0, 0), (0, n1_pad)))
         if is_quantized:
             w1_scale = jnp.pad(
                 w1_scale, ((0, 0),) * (w1_scale.ndim - 1) + ((0, n1_pad),)
             )
         new_k2 = aligned_n1 // 2
         if new_k2 != size_k2:
-            w2 = jnp.pad(w2, ((0, 0), (0, new_k2 - size_k2), (0, 0)))
+            w2 = jnp.pad(w2, lead_pads + ((0, 0), (0, new_k2 - size_k2), (0, 0)))
             size_k2 = new_k2
         size_n1 = aligned_n1
 
@@ -2443,31 +2467,33 @@ def gmm_v2_fused_rs(
     if is_quantized:
         nqb1 = -(-tile_k1 // rhs1_quant_block_size)
         total_scale_blocks1 = (size_k1 // tile_k1) * nqb1
-        if w1_scale.shape[1] < total_scale_blocks1:
+        if w1_scale.shape[s_axis] < total_scale_blocks1:
+            last1 = w1_scale[:, :, -1:] if stacked else w1_scale[:, -1:]
             w1_scale = jnp.concatenate(
                 [
                     w1_scale,
                     jnp.repeat(
-                        w1_scale[:, -1:],
-                        total_scale_blocks1 - w1_scale.shape[1],
-                        axis=1,
+                        last1,
+                        total_scale_blocks1 - w1_scale.shape[s_axis],
+                        axis=s_axis,
                     ),
                 ],
-                axis=1,
+                axis=s_axis,
             )
         nqb2 = -(-tile_k2 // rhs2_quant_block_size)
         total_scale_blocks2 = (size_k2 // tile_k2) * nqb2
-        if w2_scale.shape[1] < total_scale_blocks2:
+        if w2_scale.shape[s_axis] < total_scale_blocks2:
+            last2 = w2_scale[:, :, -1:] if stacked else w2_scale[:, -1:]
             w2_scale = jnp.concatenate(
                 [
                     w2_scale,
                     jnp.repeat(
-                        w2_scale[:, -1:],
-                        total_scale_blocks2 - w2_scale.shape[1],
-                        axis=1,
+                        last2,
+                        total_scale_blocks2 - w2_scale.shape[s_axis],
+                        axis=s_axis,
                     ),
                 ],
-                axis=1,
+                axis=s_axis,
             )
     else:
         total_scale_blocks1 = 0
@@ -2515,6 +2541,15 @@ def gmm_v2_fused_rs(
     rhs2_packing = (32 // jax.dtypes.itemsize_bits(w2.dtype)) if is_quantized else 1
     lhs1_quant_block_size = min(256 if rhs1_quant_block_size < 512 else 512, size_k1)
     lhs2_quant_block_size = min(256 if rhs2_quant_block_size < 512 else 512, size_k2)
+    # W4A16 (fp4 rhs with small scale blocks, bf16 lhs): the lhs block is only
+    # the matmul K granularity (scales are folded into the rhs), so a larger one
+    # cuts the per-block f32 accumulator adds. Tuning override.
+    _w4a16_k = int(os.environ.get("MUSE_FUSED_RS_W4A16_KBLOCK", "0"))
+    if _w4a16_k and is_quantized and jnp.dtype(w1.dtype) == jnp.float4_e2m1fn:
+        if rhs1_quant_block_size < 256:
+            lhs1_quant_block_size = min(_w4a16_k, tile_k1)
+        if rhs2_quant_block_size < 256:
+            lhs2_quant_block_size = min(_w4a16_k, tile_k2)
 
     cfgs1 = GmmConfigs(
         dims=Dimensions(
@@ -2592,6 +2627,17 @@ def gmm_v2_fused_rs(
     # Scratch shapes.
     max_num_gm_static = size_group + pl.cdiv(kernel_size_m, tile_m) - 1
     n2_cols = aligned_n2 // num_lanes
+    _sls_out = pltpu.get_tpu_info().get_sublane_tiling(out_dtype)
+    _host_direct_stage = (
+        not fp8_direct_write
+        and os.environ.get("MUSE_FUSED_RS_DIRECT_STAGE", "2") in ("1", "2")
+        and (fused_dims.original_n2 // tile_n2) * (fused_dims.size_k2 // tile_k2) == 1
+        and fused_dims.original_n2 == fused_dims.size_n2
+        and not has_bias
+        and cfgs2.fuse_act is None
+        and cfgs2.rhs_cfgs.quant_dtype is not None
+        and tile_n2 % (_sls_out * num_lanes) == 0
+    )
 
     scratch_shapes = [
         # metadata_ref
@@ -2610,8 +2656,11 @@ def gmm_v2_fused_rs(
         pltpu.VMEM((tile_m, size_n1 // 2 if act_fn else size_n1), jnp.float32),
         # intermediate_ref
         pltpu.VMEM((tile_m // size_lhs_sublane, size_lhs_sublane, size_k2), out_dtype),
-        # tiled_out_2x_ref
-        pltpu.VMEM((2, tile_m, aligned_n2), out_dtype),
+        # tiled_out_2x_ref (dead when _direct_stage writes straight to scatter_staging_3x_ref)
+        pltpu.VMEM(
+            (1, _sls_out, num_lanes) if _host_direct_stage else (2, tile_m, aligned_n2),
+            out_dtype,
+        ),
         # scatter_staging_3x_ref — 4D: first-dim selects the staging slot,
         # avoids dynamic offset that triggers Mosaic VMEM tiling alignment error.
         pltpu.VMEM((staging_slots, tile_m, n2_cols, num_lanes), out_dtype),
@@ -2621,7 +2670,8 @@ def gmm_v2_fused_rs(
         pltpu.VMEM((size_lhs_sublane, tile_n2), jnp.float32),
         # shared_acc_ref
         pltpu.VMEM(
-            (tile_m, max(tile_n1 * 2 if act_fn else tile_n1, tile_n2)), jnp.float32
+            (tile_m, max(tile_n1 * 2 if act_fn else tile_n1, tile_n2)),
+            jnp.float32,
         ),
         # gather_sem_ref
         pltpu.SemaphoreType.DMA((2,)),
@@ -2777,14 +2827,7 @@ def gmm_v2_fused_rs(
             group_start = group_start - row_offset
 
     pair_meta_base = pair_meta_stride = 0
-    pair_relay = (
-        pair_exchange
-        and _pair_run_table()
-        and ep_size == 8
-        and tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_RELAY.get()
-    )
-    # own, sibling, then one block per other chip (only the two neighbors under relay)
-    num_pair_blocks = ep_size // 2 if pair_relay else ep_size // 2 + 1
+    num_pair_blocks = ep_size // 2 + 1
     if pair_exchange:
         group_start, pair_meta_base, pair_meta_stride = _pair_exchange_metadata(
             group_start,
@@ -2854,7 +2897,6 @@ def gmm_v2_fused_rs(
         pair_exchange=pair_exchange,
         pair_meta_base=pair_meta_base,
         pair_meta_stride=pair_meta_stride,
-        pair_relay=pair_relay,
     )
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.HBM),  # hidden_states_3d
@@ -2880,7 +2922,12 @@ def gmm_v2_fused_rs(
                 **{
                     k: v
                     for k, v in kernel_kwargs.items()
-                    if k not in ("pair_exchange", "pair_relay")
+                    if k
+                    not in (
+                        "pair_exchange",
+                        "pair_meta_base",
+                        "pair_meta_stride",
+                    )
                 },
             ),
             out_shape=(out_buf_init, out_scale_init),
@@ -2909,22 +2956,45 @@ def gmm_v2_fused_rs(
             pltpu.SemaphoreType.REGULAR((_PAIR_RING,)),
             pltpu.SemaphoreType.REGULAR((1,)),
         ]
-        if pair_relay:
+
+        pair_fp8_mode = os.environ.get("MUSE_FUSED_RS_PAIR_FP8", "0")
+        pair_fp8 = pair_fp8_mode in ("1", "2")
+        pair_send_fp8 = pair_fp8_mode == "2"
+        if pair_send_fp8:
+            # the sibling ring receives e4m3 partials
+            scratch_shapes[-4] = pltpu.VMEM(
+                (_PAIR_RING, tile_m, n2_cols, num_lanes), jnp.float8_e4m3fn
+            )
+        pair_fp8_scale = float(os.environ.get("MUSE_FUSED_RS_PAIR_FP8_SCALE", "1.0"))
+        if pair_fp8:
             scratch_shapes = scratch_shapes + [
-                pltpu.VMEM((2, tile_m, n2_cols, num_lanes), out_dtype),
-                pltpu.SemaphoreType.REGULAR((2,)),
-                pltpu.SemaphoreType.REGULAR((2,)),
+                pltpu.VMEM(
+                    (staging_slots, tile_m, n2_cols, num_lanes), jnp.float8_e4m3fn
+                )
             ]
+        if pair_send_fp8:
+            scratch_shapes = scratch_shapes + [
+                pltpu.VMEM(
+                    (staging_slots, tile_m, n2_cols, num_lanes), jnp.float8_e4m3fn
+                )
+            ]
+        _abl = set(os.environ.get("MUSE_FUSED_RS_ABLATE", "").split(","))
+        self_ablate = bool(_abl & {"self", "selfx", "selfp", "selfsib", "nocomm"})
+        if self_ablate:
+            scratch_shapes = scratch_shapes + [pltpu.SMEM((1,), jnp.int32)]
 
         def kernel_fn(*refs, _base=kernel_fn):
-            relay = {}
-            if pair_relay:
-                *refs, ring_r, recv_r, credit_r = refs
-                relay = dict(
-                    relay_ring_ref=ring_r,
-                    relay_recv_sem_ref=recv_r,
-                    relay_credit_ref=credit_r,
-                )
+            refs = list(refs)
+            extra = {}
+            if self_ablate:
+                extra["pair_self_count_ref"] = refs.pop()
+            if pair_fp8:
+                # refs: 9 scalar prefetch + 7 inputs, then out_buf, out_fp8, scratch.
+                extra["out_fp8_ref"] = refs.pop(17)
+                if pair_send_fp8:
+                    extra["pair_send_fp8_ref"] = refs.pop()
+                extra["pair_fp8_ref"] = refs.pop()
+                extra["pair_fp8_inv_scale"] = 1.0 / pair_fp8_scale
             *base, ring, pair_sum, pair_recv, credit = refs
             _base(
                 *base,
@@ -2932,8 +3002,42 @@ def gmm_v2_fused_rs(
                 pair_sum_ref=pair_sum,
                 pair_recv_sem_ref=pair_recv,
                 pair_credit_ref=credit,
-                **relay,
+                **extra,
             )
+
+        if pair_fp8:
+            out_fp8_init = jax.ShapeDtypeStruct(out_buf_init.shape, jnp.float8_e4m3fn)
+            result, result_fp8 = pl.pallas_call(
+                kernel_fn,
+                out_shape=(out_buf_init, out_fp8_init),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=9,
+                    in_specs=in_specs,
+                    out_specs=[
+                        pl.BlockSpec(memory_space=pltpu.HBM),
+                        pl.BlockSpec(memory_space=pltpu.HBM),
+                    ],
+                    scratch_shapes=scratch_shapes,
+                ),
+                compiler_params=compiler_params,
+                name=pallas_name + "-pairfp8",
+            )(*pallas_inputs)
+            # Blocks 0 (own) and 1 (sibling) stay bf16; blocks 2.. (other chips)
+            # arrived as e4m3 pair sums.
+            rows_per_block = out_buf_init.shape[0] // num_pair_blocks
+            cut = 2 * rows_per_block
+            result = jnp.concatenate(
+                [
+                    result[:cut],
+                    (result_fp8[cut:].astype(jnp.float32) * pair_fp8_scale).astype(
+                        result.dtype
+                    ),
+                ],
+                axis=0,
+            )
+            if tiled_output and aligned_n2 == size_n2:
+                return result
+            return result.reshape(result.shape[0], aligned_n2)[:, :size_n2]
 
     result = pl.pallas_call(
         kernel_fn,
@@ -3002,7 +3106,8 @@ def run_gmm_fused_rs(
         group_sizes: int32[num_experts] — rows per expert.
         lhs_indices: int32[size_m] — gather indices into hidden_states.
         output_indices: int32[size_m] — scatter indices (global token IDs).
-        topk_weights: float32[num_tokens, top_k] — topk weights for post-kernel reduction.
+        topk_weights: float32[num_tokens, top_k] — topk weights for post-kernel
+          reduction.
         topk_indices: int32[size_m] — per-row topk slot (0..top_k-1).
         ep_size: number of expert-parallel chips.
         mesh: JAX Mesh.

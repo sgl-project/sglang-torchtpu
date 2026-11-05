@@ -202,6 +202,10 @@ class TestPrefillBlockSizes(CustomTestCase):
         head_dim=128,
         page_size=256,
         ctx_pages=133,
+        total_q_tokens=4096,
+        sliding_window=None,
+        transposed=False,
+        no_max=False,
     ):
         import jax.numpy as jnp
 
@@ -214,18 +218,21 @@ class TestPrefillBlockSizes(CustomTestCase):
             num_q_heads=num_q_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
+            sliding_window=sliding_window,
             mask_value=float("-inf"),
         )
         with tpu_info_for_cpu_export():
             serve = configs.ServingConfigs(
                 num_seqs=32,
                 num_page_indices=32 * ctx_pages,
-                total_q_tokens=4096,
+                total_q_tokens=total_q_tokens,
                 dtype_q=jnp.bfloat16,
                 dtype_kv=jnp.float8_e4m3fn,
                 dtype_out=jnp.bfloat16,
                 page_size=page_size,
                 kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+                transposed=transposed,
+                no_max=no_max,
             )
             _, prefill = wrapper.calculate_block_sizes(model, serve, 67108864)
         return prefill
@@ -260,9 +267,49 @@ class TestPrefillBlockSizes(CustomTestCase):
         self.assertEqual(
             self._resolve(num_q_heads=64, num_kv_heads=8, head_dim=64).bq_c_sz, 16
         )
-        # 8q/1kv with bq_sz=1280 must keep power-of-2 bq_c_sz=64 instead of 1280//32=40.
+        # 8q/1kv picks power-of-2 bq_sz=1024 and power-of-2 bq_c_sz=32.
+        b_8q = self._resolve(num_q_heads=8, num_kv_heads=1, head_dim=64)
+        self.assertEqual(b_8q.bq_sz, 1024)
+        self.assertEqual(b_8q.bq_c_sz, 32)
+
+    def test_prefill_q_block_is_power_of_two_and_transposed_decouples_bkv(self):
+        for nq, nkv, hd in [
+            (64, 8, 64),
+            (32, 4, 64),
+            (16, 2, 64),
+            (8, 1, 64),
+            (4, 1, 128),
+        ]:
+            blocks = self._resolve(num_q_heads=nq, num_kv_heads=nkv, head_dim=hd)
+            self.assertEqual(blocks.bq_sz & (blocks.bq_sz - 1), 0)
+        for total_q, expected_bq in [
+            (4096, 1024),
+            (2048, 1024),
+            (1024, 1024),
+            (512, 512),
+            (256, 256),
+        ]:
+            blocks = self._resolve(
+                num_q_heads=16,
+                num_kv_heads=2,
+                head_dim=64,
+                total_q_tokens=total_q,
+                transposed=True,
+                no_max=True,
+            )
+            self.assertEqual(
+                (blocks.bq_sz, blocks.bkv_sz, blocks.bq_c_sz), (expected_bq, 1536, 32)
+            )
+        swa_blocks = self._resolve(
+            num_q_heads=16,
+            num_kv_heads=2,
+            head_dim=64,
+            sliding_window=2048,
+            transposed=True,
+            no_max=True,
+        )
         self.assertEqual(
-            self._resolve(num_q_heads=8, num_kv_heads=1, head_dim=64).bq_c_sz, 64
+            (swa_blocks.bq_sz, swa_blocks.bkv_sz, swa_blocks.bq_c_sz), (512, 512, 32)
         )
 
     def test_k_block_is_a_page_multiple(self):

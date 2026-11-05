@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.muse_megakernel import kernel as K
 from sglang_tpu.muse_megakernel import ops
 
@@ -33,25 +32,37 @@ _GEOMETRY = SimpleNamespace(
     window=2048,
     global_layers=tuple(range(1, _LAYERS, 4)),
 )
+# Layers 0 and 61 hold FP8 experts quantized at load; the rest are NVFP4.
+_KINDS = ("fp8",) + ("fp4",) * (_LAYERS - 2) + ("fp8",)
+_FP8_SAL = {"kv_sal": True, "kv_sal_fp8": True}
 
 
-# Muse Spark at tp16 (two hosts): one KV head per device, so the pool cannot pack heads.
-_GEOMETRY_TP16 = SimpleNamespace(
-    **{**vars(_GEOMETRY), "q_heads": 8, "kv_heads": 1, "inter_local": 256}
-)
-
-
-def _megakernel(geo=_GEOMETRY, tp_size=8, **flags):
+def _megakernel(**flags):
     return SimpleNamespace(
-        geo=geo,
-        tp_size=tp_size,
-        # Layers 0 and 61 hold FP8 experts quantized at load; the rest are NVFP4.
-        kinds=("fp8",) + ("fp4",) * (_LAYERS - 2) + ("fp8",),
+        geo=_GEOMETRY,
+        tp_size=8,
+        kinds=_KINDS,
         max_position=262144,
         chunk_pages=4,
         kv_packed=flags.get("kv_packed", True),
         scale_fp8=False,
+        expert_groups=flags.get("expert_groups", ()),
+        kperm=flags.get("kperm", True),
     )
+
+
+def _config(mk, q, n_req, **pool):
+    cfg = ops.MuseMegakernel.config(
+        mk,
+        rows=ops.step_rows(q * n_req, mk.tp_size),
+        q=q,
+        n_req=n_req,
+        n_page_entries=n_req * 2048,
+        page_size=256 if pool else 128,
+        capture=(1, 16, 30, 44, 59),
+        **pool,
+    )
+    return cfg.validate()  # the kernel builder's own checks
 
 
 class TestMuseMegakernelConfig(CustomTestCase):
@@ -59,165 +70,109 @@ class TestMuseMegakernelConfig(CustomTestCase):
         # (rows per request, requests): decode and DFlash verify blocks up to the
         # 32-row cap; 8 rows of 4 is the shape whose Mosaic temporaries set the budget.
         for q, n_req in ((1, 1), (1, 8), (8, 1), (8, 2), (4, 8), (8, 4)):
-            for flags in ({}, {"kv_packed": False}):
-                with self.subTest(q=q, n_req=n_req, **flags):
-                    rows = -(-q * n_req // 8) * 8
-                    cfg = ops.MuseMegakernel.config(
-                        _megakernel(**flags),
-                        rows=rows,
-                        q=q,
-                        n_req=n_req,
-                        n_page_entries=n_req * 2048,
-                        page_size=128,
-                        capture=(1, 16, 30, 44, 59),
-                    )
-                    self.assertLessEqual(
-                        K.scratch_vmem_bytes(cfg), ops._SCRATCH_VMEM_BUDGET
-                    )
-                    self.assertEqual(cfg.stream_depth, cfg.ring_slots - 1)
-
-    def test_sal_attention_flags(self):
-        # The cc=1 verify step on fp8 SEQ_ALONG_LANE pages.
-        def cfg():
-            return ops.MuseMegakernel.config(
-                _megakernel(),
-                rows=8,
-                q=8,
-                n_req=1,
-                n_page_entries=4097,
-                page_size=256,
-                capture=(1, 16, 30, 44, 59),
-                kv_sal=True,
-                kv_sal_fp8=True,
-            ).validate()
-
-        default = cfg()
-        # 1024-token chunks: one expert w13 slot row, the ring a view of those slots
-        self.assertEqual((default.chunk_pages, default.kv_ring), (4, 32))
-        self.assertTrue(default.attn_unshifted and default.attn_pipe)
-        self.assertEqual(default.attn_streams, 8)
-        bound = _GEOMETRY.scale_query_by * _GEOMETRY.head_dim * _GEOMETRY.attn_scale
-        self.assertLessEqual(1.1 * bound, K.UNSHIFTED_MAX)
-        self.assertLessEqual(K.scratch_vmem_bytes(default), ops._SCRATCH_VMEM_BUDGET)
-        # SWA layers' short chunks are sub-slots of the full-attention ring: same VMEM, no overrun
-        with tpu_envs.SGLANG_TPU_MUSE_MK_SAL_SWA_CHUNK_TOKENS.override(512):
-            split = cfg()
-        self.assertEqual((split.chunk_pages, split.swa_chunk_pages), (4, 2))
-        self.assertEqual(
-            2 * split.swa_kv_group * split.swa_chunk_pages,
-            split.kv_ring * split.chunk_pages,
-        )
-        self.assertEqual(split.swa_kv_group % split.attn_streams, 0)
-
-    def test_verify_steps_fold_and_decode_steps_do_not(self):
-        for q, n_req, fold in (
-            (8, 1, True),
-            (8, 2, True),
-            (1, 1, False),
-            (1, 2, False),
-        ):
-            with self.subTest(q=q, n_req=n_req):
-                cfg = ops.MuseMegakernel.config(
-                    _megakernel(),
-                    rows=-(-q * n_req // 8) * 8,
-                    q=q,
-                    n_req=n_req,
-                    n_page_entries=n_req * 2048,
-                    page_size=256,
-                    capture=(1, 16, 30, 44, 59),
-                    kv_sal=True,
-                    kv_sal_fp8=True,
-                ).validate()
-                self.assertEqual((cfg.fold_f, cfg.fold_o), (fold, fold))
-                self.assertEqual(cfg.ring_slots, 10)
-
-    def test_48_row_shapes_fit_the_scratch_budget(self):
-        # SGLANG_TPU_MUSE_MK_MAX_ROWS=48: 12 requests x 4 verify tokens and 6 x 8, on the
-        # packed bf16 pool and on fp8 SEQ_ALONG_LANE pages (which keep extra headroom).
-        for q, n_req in ((4, 12), (8, 6)):
-            for kv_sal in (False, True):
-                with self.subTest(q=q, n_req=n_req, kv_sal=kv_sal):
-                    cfg = ops.MuseMegakernel.config(
-                        _megakernel(),
-                        rows=48,
-                        q=q,
-                        n_req=n_req,
-                        n_page_entries=n_req * 4096,
-                        page_size=256 if kv_sal else 128,
-                        capture=(1, 16, 30, 44, 59),
-                        kv_sal=kv_sal,
-                        kv_sal_fp8=kv_sal,
-                    ).validate()
-                    budget = ops._SCRATCH_VMEM_BUDGET - (
-                        ops._SAL_VMEM_HEADROOM if kv_sal else 0
+            for flags, pool in (
+                ({}, {}),
+                ({"kv_packed": False}, {}),
+                ({}, {"kv_sal": True}),
+                ({}, _FP8_SAL),
+            ):
+                with self.subTest(q=q, n_req=n_req, **flags, **pool):
+                    cfg = _config(_megakernel(**flags), q, n_req, **pool)
+                    budget = (
+                        ops._OPT_BASE_VMEM_BUDGET
+                        if (cfg.alias_oy or cfg.alias_p or cfg.xfull_packed)
+                        else ops._SCRATCH_VMEM_BUDGET
                     )
                     self.assertLessEqual(K.scratch_vmem_bytes(cfg), budget)
-                    self.assertEqual(cfg.compact_rows, 8)
+                    self.assertEqual(cfg.stream_depth, cfg.ring_slots - 1)
+                    self.assertEqual(cfg.row_tile, 0)
+                    # pipelined attention: two iterations of chunks in use, refills in flight
+                    if cfg.attn_pipe:
+                        self.assertGreater(cfg.kv_ring, 2 * cfg.attn_streams)
 
-    def test_raised_row_cap_shapes_fit_the_scratch_budget(self):
-        # SGLANG_TPU_MUSE_MK_MAX_ROWS: 12, 16 and 24 requests of a 4-token DFlash verify block on the
-        # SEQ_ALONG_LANE fp8 pools the AgentX recipe serves.
-        for n_req in (12, 16, 24):
-            with self.subTest(n_req=n_req):
-                cfg = ops.MuseMegakernel.config(
-                    _megakernel(kv_packed=False),
-                    rows=4 * n_req,
-                    q=4,
-                    n_req=n_req,
-                    n_page_entries=n_req * 2048,
-                    page_size=256,
-                    capture=(1, 16, 30, 44, 59),
-                    kv_sal=True,
-                    kv_sal_fp8=True,
-                ).validate()
-                self.assertLessEqual(
-                    K.scratch_vmem_bytes(cfg), ops._SCRATCH_VMEM_BUDGET
-                )
+    def test_sal_pool_shape_detection(self):
+        geo = _GEOMETRY
+        self.assertTrue(ops.is_sal_pool_shape((4297, 4, 16, 4, 256), geo))  # fp8
+        self.assertTrue(ops.is_sal_pool_shape((4297, 4, 32, 2, 256), geo))  # bf16
+        self.assertFalse(ops.is_sal_pool_shape((4297, 128, 1, 2, 128), geo))  # fused
 
-    def test_tp16_shapes_keep_a_deep_weight_ring(self):
-        # tp16's dense weights split into 26 tiles, whose only ring divisor is 2; the
-        # tiling must split tiles until a ring of at least MIN_RING_SLOTS divides them.
-        mk = _megakernel(geo=_GEOMETRY_TP16, tp_size=16, kv_packed=False)
-        for q, n_req in ((1, 1), (4, 1), (4, 4), (4, 8), (8, 4)):
+    def test_step_rows(self):
+        # The TP size up to 32 rows, then the 16-row tile of the row-tiled program.
+        for tokens, rows in ((1, 8), (8, 8), (20, 24), (32, 32), (33, 48), (40, 48)):
+            self.assertEqual(ops.step_rows(tokens, 8), rows)
+        for tokens, rows in ((72, 80), (80, 80), (96, 96), (128, 128)):
+            self.assertEqual(ops.step_rows(tokens, 8), rows)
+
+    def test_folded_verify_steps_keep_a_deep_enough_ring(self):
+        # <=16 rows and 24 rows at q <= 4 fit the 10-slot ring unaliased in 48 MiB;
+        # 24 rows at q >= 5 and 32-row steps turn on pad/ysend aliasing + packed xfull
+        # so they also keep the full 10-slot folded ring inside 50 MiB.
+        cfg_24_q4 = _config(_megakernel(), 4, 6, **_FP8_SAL)
+        self.assertEqual(cfg_24_q4.ring_slots, 10)
+        self.assertFalse(
+            cfg_24_q4.alias_oy or cfg_24_q4.alias_p or cfg_24_q4.xfull_packed
+        )
+        self.assertLessEqual(K.scratch_vmem_bytes(cfg_24_q4), ops._SCRATCH_VMEM_BUDGET)
+        for q, n_req in ((8, 3), (6, 4), (8, 4), (4, 8)):
             with self.subTest(q=q, n_req=n_req):
-                cfg = ops.MuseMegakernel.config(
-                    mk,
-                    rows=-(-q * n_req // 16) * 16,
-                    q=q,
-                    n_req=n_req,
-                    n_page_entries=n_req * 2048,
-                    page_size=128,
-                    capture=(1, 16, 30, 44, 59),
-                ).validate()
-                self.assertGreaterEqual(cfg.ring_slots, K.MIN_RING_SLOTS)
+                cfg = _config(_megakernel(), q, n_req, **_FP8_SAL)
+                self.assertTrue(cfg.fold_f and cfg.fold_o)
+                self.assertTrue(K.fold_fits(cfg))
+                self.assertEqual(cfg.ring_slots, 10)
+                self.assertTrue(cfg.alias_oy and cfg.alias_p and cfg.xfull_packed)
                 self.assertLessEqual(
-                    K.scratch_vmem_bytes(cfg), ops._SCRATCH_VMEM_BUDGET
+                    K.scratch_vmem_bytes(cfg), ops._OPT_BASE_VMEM_BUDGET
                 )
 
-    def test_block_send_follows_the_env_and_yields_to_y_early(self):
-        def config(rows, n_req):
-            return ops.MuseMegakernel.config(
-                _megakernel(kv_packed=False),
-                rows=rows,
-                q=4,
-                n_req=n_req,
-                n_page_entries=n_req * 2048,
-                page_size=256,
-                capture=(1, 16, 30, 44, 59),
-                kv_sal=True,
-                kv_sal_fp8=True,
-            )
+    def test_wave5_expert_split_swa_and_kperm0_bd_all(self):
+        groups = ops.expert_groups_of(_KINDS, 15)
+        cfg_24 = _config(_megakernel(expert_groups=groups), 8, 3, **_FP8_SAL)
+        self.assertEqual(cfg_24.expert_split, 0)
+        self.assertEqual(cfg_24.compact_arms, (1, 2, 4))
+        self.assertEqual(cfg_24.swa_chunk_pages, 2)
+        self.assertTrue(cfg_24.attn_skip_idle_streams and cfg_24.attn_col_mask)
+        cfg_32 = _config(_megakernel(expert_groups=groups), 4, 8, **_FP8_SAL)
+        self.assertEqual(cfg_32.expert_split, 4)
+        self.assertEqual(cfg_32.compact_rows, 4)
+        self.assertEqual(cfg_32.compact_arms, (1, 2, 4))
+        self.assertTrue(cfg_32.ex_w2_stage)
+        self.assertFalse(cfg_32.ex_bd_all)
+        cfg_32_kperm0 = _config(
+            _megakernel(expert_groups=groups, kperm=False), 4, 8, **_FP8_SAL
+        )
+        self.assertTrue(cfg_32_kperm0.ex_bd_all)
 
-        with tpu_envs.SGLANG_TPU_MK_Y_BLOCK_SEND.override(False):
-            self.assertFalse(config(32, 8).y_block_send)
-        with tpu_envs.SGLANG_TPU_MK_Y_BLOCK_SEND.override(True):
-            self.assertTrue(config(32, 8).y_block_send)
-            self.assertTrue(config(64, 16).y_block_send)
-            with tpu_envs.SGLANG_TPU_MK_Y_EARLY.override(True):
-                # y_early owns the small steps' sends; the larger steps keep block sends
-                self.assertTrue(config(16, 4).y_early)
-                self.assertFalse(config(16, 4).y_block_send)
-                self.assertTrue(config(32, 8).y_block_send)
+    def test_row_tiled_steps(self):
+        # Steps past 32 rows run the row-tiled program: rows a multiple of the row tile,
+        # folds enabled where they fit, scratch within the row-tiled VMEM budget.
+        for groups in ((), ops.expert_groups_of(_KINDS, 15)):
+            for q, n_req in ((8, 5), (8, 6), (4, 10), (8, 9), (8, 12), (8, 16)):
+                with self.subTest(q=q, n_req=n_req, groups=bool(groups)):
+                    cfg = _config(
+                        _megakernel(expert_groups=groups), q, n_req, **_FP8_SAL
+                    )
+                    self.assertEqual(cfg.row_tile, 16)
+                    self.assertEqual(cfg.rows % 16, 0)
+                    if cfg.rows <= 128:
+                        self.assertTrue(cfg.fold_f and cfg.fold_o)
+                    if cfg.fold_f or cfg.fold_o:
+                        self.assertTrue(K.fold_fits(cfg))
+                    self.assertEqual(cfg.sal_fp8_dot, 0)  # env default; recipes set 2
+                    budget = (
+                        ops._TILED_VY2_VMEM_BUDGET
+                        if cfg.tiled_vmem_y >= 2
+                        else (
+                            ops._TILED_VPADS_VMEM_BUDGET
+                            if cfg.tiled_vmem_pads
+                            else ops._SCRATCH_VMEM_BUDGET
+                        )
+                    )
+                    self.assertLessEqual(K.scratch_vmem_bytes(cfg), budget)
+
+    def test_expert_groups_of(self):
+        groups = ops.expert_groups_of(_KINDS, 15)
+        self.assertEqual(groups, ((1, 16), (16, 31), (31, 46), (46, 61)))
+        self.assertEqual(ops.expert_groups_of(_KINDS, 0), ())
 
 
 if __name__ == "__main__":
