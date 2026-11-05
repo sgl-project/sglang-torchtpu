@@ -1,4 +1,4 @@
-"""Convert moonrise's routed experts (NVFP4 / MXFP8) to block-FP8 once, so TPU boots skip host requant.
+"""Convert Inkling2's routed experts (NVFP4 / MXFP8) to block-FP8 once, so TPU boots skip host requant.
 
 Usage (CPU only; run with JAX_PLATFORMS=cpu TORCH_DEVICE_BACKEND_AUTOLOAD=0, python -m sglang_tpu.models.inkling2_convert_fp8):
   ... SRC DST --layers 0-23 [--rest]    # one host per layer range

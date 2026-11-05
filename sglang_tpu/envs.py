@@ -24,7 +24,7 @@ class TpuEnvs:
     SGLANG_TPU_RELEASE_CHECKPOINT_PAGE_CACHE = EnvBool(True)
     SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS = EnvBool(True)
     # Inkling short convolution on the Pallas kernel instead of XLA ops. Off: the Pallas
-    # path gives wrong compiled output for moonrise (misc/moonrise.md, 2026-10-30).
+    # path gives wrong compiled output for Inkling2 (2026-10-30).
     SGLANG_TPU_ENABLE_INKLING_SCONV_PALLAS = EnvBool(False)
     # Inkling2: serve NVFP4 experts packed (W4A16 fused-RS) instead of block FP8.
     SGLANG_TPU_INKLING2_NVFP4_EXPERTS = EnvBool(False)

@@ -20,7 +20,7 @@ from sglang_tpu.dflash_draft_kv_write import (
 
 def _hybrid_pool(mapping: torch.Tensor) -> SWAKVPool:
     pool = MagicMock(spec=SWAKVPool)
-    # moonrise MTP: local layers 0, 1, 3, 4 around one global layer.
+    # Inkling2 MTP: local layers 0, 1, 3, 4 around one global layer.
     pool.layers_mapping = {0: (0, True), 1: (1, True), 2: (0, False), 3: (2, True), 4: (3, True)}
     pool.translate_loc_from_full_to_swa = lambda loc: mapping[loc.to(torch.long)]
     return pool
