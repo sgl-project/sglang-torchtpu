@@ -23,6 +23,9 @@ class Inkling2ModelConfig(InklingModelConfig):
         mlp_up_softcap: float = 0.0,
         **kwargs: Any,
     ) -> None:
+        # Newer checkpoints spell the block size n_layers_per_attn_res_block; it wins when present.
+        if "n_layers_per_attn_res_block" in kwargs:
+            n_layers_per_attnres_block = int(kwargs.pop("n_layers_per_attn_res_block"))
         fixed = dict(
             use_embed_norm=True,
             use_sconv=True,
@@ -111,6 +114,17 @@ class Inkling2MMConfig(InklingMMConfig):
         self.vision_config = vision_config
         self.mtp_config = mtp_config
         PretrainedConfig.__init__(self, **kwargs)
+
+
+class Inkling2Config(Inkling2MMConfig):
+    """Newer checkpoints set model_type "inkling2" on the same multimodal schema."""
+
+    model_type = "inkling2"
+
+    # transformers 5 synthesizes an __init__ for a subclass without one, and that
+    # version keeps text_config as a dict; forward to the parent explicitly.
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
 
 
 class Inkling2MTPConfig(PretrainedConfig):

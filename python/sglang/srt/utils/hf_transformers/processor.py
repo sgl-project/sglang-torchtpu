@@ -258,7 +258,7 @@ def get_processor(
         return get_tokenizer(
             tokenizer_name, trust_remote_code=trust_remote_code, revision=revision
         )
-    if config.model_type == "inkling2_mm_model":
+    if config.model_type in ("inkling2_mm_model", "inkling2"):
         from sglang.tml.processor import Inkling2Processor
 
         return Inkling2Processor.from_pretrained(
