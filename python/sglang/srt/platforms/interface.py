@@ -20,6 +20,7 @@ from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 if TYPE_CHECKING:
     import torch
 
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 # Re-export for convenience
@@ -324,6 +325,19 @@ class SRTPlatform(DeviceMixin):
         bind kernel-specific weights here. It can run more than once per model
         (from ``load_weights``, a multimodal wrapper or a weight update), so
         implementations must be idempotent."""
+        pass
+
+    def get_group_coordinator_cls(self) -> Type[GroupCoordinator]:
+        """Coordinator used for WORLD and model-parallel groups."""
+        # parallel_state imports the platform registry during initialization.
+        from sglang.srt.distributed.parallel_state import GroupCoordinator
+
+        return GroupCoordinator
+
+    def prepare_worker(
+        self, server_args, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
+    ) -> None:
+        """Configure this worker's backend coordinates before device initialization."""
         pass
 
     def on_warmup_complete(self) -> None:

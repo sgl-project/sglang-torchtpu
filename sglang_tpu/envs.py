@@ -26,6 +26,8 @@ EnvField._allow_set_name = True
 
 
 class TpuEnvs:
+    # Parent-selected rendezvous port for the host-wide DP replica process group.
+    SGLANG_TPU_DP_SESSION_PORT = EnvInt(None)
     # Opt-in, request-tagged benchmark admission (benchmark_batch_gate.py).
     # Zero preserves ordinary scheduling, including continuous batching.
     SGLANG_TPU_BENCHMARK_BATCH_SIZE = EnvInt(0)

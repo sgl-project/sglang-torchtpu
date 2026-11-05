@@ -288,6 +288,14 @@ class GroupCoordinator:
     torch_symm_mem_comm: Optional[Any]  # Torch symm mem communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
 
+    @staticmethod
+    def get_distributed_world_size() -> int:
+        """Size of the distributed world exposed to this engine."""
+        return torch.distributed.get_world_size()
+
+    def _new_group(self, ranks, **kwargs) -> ProcessGroup:
+        return torch.distributed.new_group(ranks, **kwargs)
+
     def __init__(
         self,
         group_ranks: List[List[int]],
@@ -378,7 +386,7 @@ class GroupCoordinator:
 
                 active_ranks = pg_active_ranks[: len(ranks)]
                 active_ranks_cpu = pg_active_ranks_cpu[: len(ranks)]
-                device_group = torch.distributed.new_group(
+                device_group = self._new_group(
                     ranks,
                     backend="mooncake",
                     pg_options=dev_opts,
@@ -386,7 +394,7 @@ class GroupCoordinator:
                     group_desc=f"{group_name}:device",
                     use_local_synchronization=use_local_synchronization,
                 )
-                cpu_group = torch.distributed.new_group(
+                cpu_group = self._new_group(
                     ranks,
                     backend="mooncake-cpu",
                     pg_options=cpu_opts,
@@ -400,7 +408,7 @@ class GroupCoordinator:
                 )
                 active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
                 pg_options = get_torch_distributed_pg_options(group_name)
-                device_group = torch.distributed.new_group(
+                device_group = self._new_group(
                     ranks,
                     backend=torch_distributed_backend,
                     pg_options=pg_options,
@@ -410,7 +418,7 @@ class GroupCoordinator:
                 )
                 # a group with `gloo` backend, to allow direct coordination
                 # between processes through the CPU.
-                cpu_group = torch.distributed.new_group(
+                cpu_group = self._new_group(
                     ranks,
                     backend="gloo",
                     timeout=gloo_timeout,
@@ -2160,7 +2168,7 @@ def init_world_group(
     recovered_rank: bool = False,
     max_world_size: Optional[int] = None,
 ) -> GroupCoordinator:
-    return GroupCoordinator(
+    return platforms.current_platform.get_group_coordinator_cls()(
         group_ranks=[ranks],
         local_rank=local_rank,
         torch_distributed_backend=backend,
@@ -2204,7 +2212,7 @@ def init_model_parallel_group(
         use_custom_allreduce = False
         use_mscclpp_allreduce = False
         use_torch_symm_mem_allreduce = False
-    return GroupCoordinator(
+    return platforms.current_platform.get_group_coordinator_cls()(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
@@ -2571,8 +2579,9 @@ def init_distributed_environment(
         else:
             local_rank = rank
     global _WORLD
+    coordinator_cls = platforms.current_platform.get_group_coordinator_cls()
     if _WORLD is None:
-        ranks = list(range(torch.distributed.get_world_size()))
+        ranks = list(range(coordinator_cls.get_distributed_world_size()))
         _WORLD = init_world_group(
             ranks=ranks,
             local_rank=local_rank,
@@ -2581,7 +2590,7 @@ def init_distributed_environment(
             max_world_size=max_world_size,
         )
     else:
-        assert _WORLD.world_size == torch.distributed.get_world_size(), (
+        assert _WORLD.world_size == coordinator_cls.get_distributed_world_size(), (
             "world group already initialized with a different world size"
         )
     # Publish WORLD before model-parallel initialization reads its local rank.
@@ -2665,7 +2674,7 @@ def initialize_model_parallel(
     world_size: int = (
         tensor_model_parallel_size * pipeline_model_parallel_size
         if recovered_rank or rank_offset > 0
-        else torch.distributed.get_world_size()
+        else get_world_group().world_size
     )
 
     if world_size != tensor_model_parallel_size * pipeline_model_parallel_size:
