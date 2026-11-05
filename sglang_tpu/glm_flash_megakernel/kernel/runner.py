@@ -107,6 +107,32 @@ def weight_spec(name: str) -> P:
     return P(*parts)
 
 
+def _scatter_index_rows(spec, cfg, meta, pos, tab, nraw, nrec, raw, rec):
+    """Write the step's raw index rows and the records of the pools it closes with
+    XLA scatters (sub-tile slices a DMA cannot address); dropped rows get page -1."""
+    R, Q, B = cfg.rows, cfg.n_query, cfg.n_req
+    ps, kp, pps = cfg.page_size, spec.index_kpool, cfg.pages_per_seq
+    r = jnp.arange(R, dtype=jnp.int32)
+    b, qi = r // Q, r % Q
+    live = b < meta[0]
+    tok = pos[b] + qi
+    tpage = jnp.where(live, tab[b * pps + jnp.minimum(tok // ps, pps - 1)], -1)
+    fp0, fresh = PL.closing_pools(pos[b], Q, kp)
+    ptok = (fp0 + qi) * kp
+    rpage = jnp.where(
+        live & (qi < fresh), tab[b * pps + jnp.minimum(ptok // ps, pps - 1)], -1
+    )
+    ri = (ptok % ps) // kp
+    raw_out = [
+        raw[d].at[tpage, tok % ps].set(nraw[d], mode="drop") for d in range(len(raw))
+    ]
+    rec_out = [
+        rec[d].at[rpage, ri // 4, ri % 4].set(nrec[d], mode="drop")
+        for d in range(len(rec))
+    ]
+    return raw_out, rec_out
+
+
 def make_decode(spec, layout, small_map, small_f32_map, mesh, cfg: D.KernelConfig):
     """`shard(step_inputs, init_streams, weights, pools) -> (logits, hidden, pools)`."""
     tp = layout.tp
@@ -135,7 +161,7 @@ def make_decode(spec, layout, small_map, small_f32_map, mesh, cfg: D.KernelConfi
         jax.ShapeDtypeStruct((R, H), jnp.bfloat16),
         jax.ShapeDtypeStruct((n_dsa, R, spec.kv_lora_rank), jnp.bfloat16),
         jax.ShapeDtypeStruct((n_dsa, R, 2 * spec.index_head_dim), jnp.bfloat16),
-        jax.ShapeDtypeStruct((n_dsa, R, spec.index_head_dim), jnp.float32),
+        jax.ShapeDtypeStruct((n_dsa, B, 8, spec.index_head_dim), jnp.float32),
         jax.ShapeDtypeStruct((n_kda, R, hkda, dh, dh), jnp.float32),
         jax.ShapeDtypeStruct((n_kda, R, k1, 1, 3 * qsh), jnp.float32),
     )
@@ -163,15 +189,22 @@ def make_decode(spec, layout, small_map, small_f32_map, mesh, cfg: D.KernelConfi
             jnp.float8_e4m3fn
         )
         nkv8 = jax.lax.bitcast_convert_type(nkv8, jnp.uint8).reshape(n_dsa, R, 4, 128)
+        npk = npk[:, :, :Q].reshape(n_dsa, R, spec.index_head_dim)
         nrec = jnp.stack(
             [PL.pool_records(npk[d], rec_bytes) for d in range(n_dsa)]
         )
-        new = write_rows(meta, pos, tab, ckrow, nkv8, nraw, nrec, recur, conv, *ps)
-        new_pools, i = {}, 0
-        for n in POOL_ORDER:
-            new_pools[n] = list(new[i : i + len(pools[n])])
-            i += len(pools[n])
-        return logits, hidden, new_pools
+        raw_out, rec_out = _scatter_index_rows(
+            spec, cfg, meta, pos, tab, nraw, nrec, pools["raw"], pools["records"]
+        )
+        dma_pools = [*pools["nope"], *pools["temporal"], *pools["conv"]]
+        new = write_rows(meta, pos, tab, ckrow, nkv8, recur, conv, *dma_pools)
+        return logits, hidden, {
+            "nope": list(new[:n_dsa]),
+            "raw": raw_out,
+            "records": rec_out,
+            "temporal": list(new[n_dsa : n_dsa + n_kda]),
+            "conv": list(new[n_dsa + n_kda :]),
+        }
 
     wspec = {n: weight_spec(n) for n in PACKED_ORDER}
     wspec.update({n: [weight_spec(n)] * n_moe for n in EXPERT_LISTS})

@@ -259,7 +259,7 @@ def scratch_shapes(spec, layout, cfg: KernelConfig):
     moesh = spec.moe_intermediate_size // tp
     TR = cfg.tile_rows
     L = cfg.max_len
-    R, Q = cfg.rows, cfg.n_query
+    R, Q, B = cfg.rows, cfg.n_query, cfg.n_req
     TK = cfg.attn_tile
     PT = TK // kp
     slab_rows = layout.small_rows()
@@ -320,17 +320,18 @@ def scratch_shapes(spec, layout, cfg: KernelConfig):
         pltpu.VMEM((H // 128, max(1, moesh // 128)), F32),
         pltpu.VMEM((spec.n_routed_experts, 2 * moesh // 128, H // 128), F32),
         pltpu.VMEM((spec.n_routed_experts, H // 128, max(1, moesh // 128)), F32),
-        # Per-row values the per-request loops read back by dynamic row.
-        pltpu.VMEM((R, kvl), BF16),
-        pltpu.VMEM((R, 2 * idh), BF16),
-        pltpu.VMEM((R, nh * qk), F32),
+        # Per-row values the per-request loops index by request: [n_req, rows padded to a
+        # tile, cols], so the only dynamic index is the tile-aligned leading one.
+        pltpu.VMEM((B, 16, kvl), BF16),
+        pltpu.VMEM((B, 16, 2 * idh), BF16),
+        pltpu.VMEM((B, 8, nh * qk), F32),
         pltpu.VMEM((R * hi, idh), F32),
-        pltpu.VMEM((R, hi), F32),
-        pltpu.VMEM((R, nh * vd), BF16),
-        pltpu.VMEM((R, qsh), F32),
-        pltpu.VMEM((R, 3 * qsh), F32),
-        pltpu.VMEM((R, 2 * qsh), F32),
-        pltpu.VMEM((R, hkda), F32),
+        pltpu.VMEM((B, 8, hi), F32),
+        pltpu.VMEM((B, 16, nh * vd), BF16),
+        pltpu.VMEM((B, 8, qsh), F32),
+        pltpu.VMEM((B, 8, 3 * qsh), F32),
+        pltpu.VMEM((B, 8, 2 * qsh), F32),
+        pltpu.VMEM((B, 8, hkda), F32),
         pltpu.SemaphoreType.DMA,
         pltpu.SemaphoreType.DMA,
         pltpu.SemaphoreType.DMA,
@@ -762,6 +763,17 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 )
             return jnp.concatenate(outs, axis=0)
 
+        def rows_to(buf, val):
+            """[R, cols] -> buf[b] = rows of request b, zero-padded to the buffer's tile."""
+            pad = buf.shape[1] - Q
+            for b in range(B):
+                blk = val[b * Q : (b + 1) * Q].astype(buf.dtype)
+                buf[b] = jnp.pad(blk, ((0, pad), (0, 0)))
+
+        def rows_from(buf):
+            """The inverse: [R, cols] from the requests' live rows."""
+            return jnp.concatenate([buf[b, pl.ds(0, Q), :] for b in range(B)], axis=0)
+
         # KDA checkpoints: slot `qi % 2` of stq / cvq streams to the output rows; a
         # slot is reused only after its transfer is waited.
         def ck_start(slot, k_i, r):
@@ -803,10 +815,9 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             gg_all = K.matvec_bf16(g_low, fgb[qsh:])
             beta_all = jax.nn.sigmoid(K.matvec_bf16(x, bpv[...]))
 
-            qkvb[...] = qkv
-            fgb2[:, :qsh] = f + dtv[...]
-            fgb2[:, qsh:] = gg_all
-            btb[...] = beta_all
+            rows_to(qkvb, qkv)
+            rows_to(fgb2, jnp.concatenate([f + dtv[...], gg_all], axis=1))
+            rows_to(btb, beta_all)
             decay = jnp.exp(alv[...]).reshape(hkda, 1)
             lb = spec.linear_lower_bound
             cw = cwv[...].astype(F32)
@@ -838,7 +849,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     elif Q > qi:
                         pl.when(b > 0)(lambda slot=slot: ck_wait(slot))
                     r = r0 + qi
-                    x1 = qkvb[pl.ds(r, 1), :].reshape(1, 1, 3 * qsh)
+                    x1 = qkvb[b, pl.ds(qi, 1), :].reshape(1, 1, 3 * qsh)
                     conv_out, new_conv = K.conv_step(
                         cv3[...] if qi == 0 else cvq[prev], x1, cw
                     )
@@ -848,7 +859,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     kv_ = co[0, qsh : 2 * qsh].reshape(hkda, dh)
                     vv = co[0, 2 * qsh :].reshape(hkda, dh)
 
-                    graw = fgb2[pl.ds(r, 1), pl.ds(0, qsh)].reshape(hkda, dh)
+                    graw = fgb2[b, pl.ds(qi, 1), pl.ds(0, qsh)].reshape(hkda, dh)
                     glog = (
                         (lb * jax.nn.sigmoid(decay * graw))
                         if lb is not None
@@ -861,7 +872,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                             )
                         )
                     )
-                    beta = btb[pl.ds(r, 1), :][0]
+                    beta = btb[b, pl.ds(qi, 1), :][0]
                     new_state, out = K.kda_step(
                         st[...] if qi == 0 else stq[prev], qv, kv_, vv, glog, beta
                     )
@@ -872,9 +883,9 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                         jnp.mean(jnp.square(out), axis=-1, keepdims=True) + eps
                     )
                     y = y * o_norm
-                    gg = fgb2[pl.ds(r, 1), pl.ds(qsh, qsh)].reshape(hkda, dh)
+                    gg = fgb2[b, pl.ds(qi, 1), pl.ds(qsh, qsh)].reshape(hkda, dh)
                     y = y * jax.nn.sigmoid(gg)
-                    ysb[pl.ds(r, 1), :] = y.reshape(1, qsh)
+                    ysb[b, pl.ds(qi, 1), :] = y.reshape(1, qsh)
                 return carry
 
             jax.lax.fori_loop(0, B, per_req, 0)
@@ -885,7 +896,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     w_ko,
                     k_i,
                     qsh,
-                    ysb[...],
+                    rows_from(ysb),
                     FP8_KDA,
                     warmed=True,
                     scale=ksc[:, 3 * qsh :] if FP8_KDA else None,
@@ -960,10 +971,10 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             o_nraw[d_i] = raw_new
             ks = ksc_ref[d_i]
             # In fp8 units, rounded as the pool will hold them.
-            nkvb[...] = (kv_new.astype(F32) * (1.0 / ks)).astype(f8).astype(BF16)
-            nrawb[...] = raw_new
-            qallb[...] = q_all
-            hwb[...] = hw_all
+            rows_to(nkvb, (kv_new.astype(F32) * (1.0 / ks)).astype(f8).astype(BF16))
+            rows_to(nrawb, raw_new)
+            rows_to(qallb, q_all)
+            rows_to(hwb, hw_all)
             for r in range(R):
                 iqb[pl.ds(r * hi, hi), :] = PL.rotate(
                     iq_all[r].reshape(hi, idh), hmat
@@ -1004,7 +1015,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 rr = jax.lax.broadcasted_iota(jnp.int32, (32, 1), 0) + w0
                 rawv = rawb[...]
                 for qi in range(Q):
-                    rawv = jnp.where(rr == p + qi, nrawb[pl.ds(r0 + qi, 1), :], rawv)
+                    rawv = jnp.where(rr == p + qi, nrawb[b, pl.ds(qi, 1), :], rawv)
                 pk_blk, _ = K.indexer_pool_keys(
                     rawv[:, :idh], rawv[:, idh:], ape, last, kp
                 )
@@ -1017,7 +1028,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     for i in range(Q)
                 ]
                 for i in range(Q):
-                    o_npk[d_i, pl.ds(r0 + i, 1), :] = keys[i]
+                    o_npk[d_i, b, pl.ds(i, 1), :] = keys[i]
                 return fp0, fresh, keys
 
             def rec_fetch(b, t, slot):
@@ -1050,7 +1061,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 """Top-k pool mask of each query into `scr`, scoring the pooled records."""
                 nts = last // TK + 1
                 iq_cat = iqb[pl.ds(pl.multiple_of(r0 * hi, hi), Q * hi), :]
-                hw_q = hwb[pl.ds(r0, Q), :]
+                hw_q = hwb[b, pl.ds(0, Q), :]
                 if Q > 1:
                     hcol = jax.lax.broadcasted_iota(jnp.int32, (Q, Q * hi), 1)
                     hrow = jax.lax.broadcasted_iota(jnp.int32, (Q, Q * hi), 0)
@@ -1094,8 +1105,9 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     )
                 scr[...] = chosen.astype(F32)  # the scores are not needed again
 
-            def allowed_rows(p, tok_ids, t):
-                """[Q, width] token mask of each query over tile `t` (or the new rows when t is None)."""
+            def allowed_rows(p, tok_ids, t, before=None):
+                """[Q, width] f32 0/1 token mask of each query over tile `t` (or the new
+                rows when t is None); one-row bool masks do not concatenate."""
                 rows = []
                 for qi in range(Q):
                     p_q = p + qi
@@ -1117,13 +1129,20 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                         tail_count = jax.lax.rem(p_q + 1, kp)
                         tail_lo = p_q + 1 - tail_count
                         sel = sel | ((tok_ids >= tail_lo) & (tail_count > 0))
-                    rows.append(sel & (tok_ids <= p_q))
+                    sel = sel & (tok_ids <= p_q)
+                    if before is not None:
+                        sel = sel & before
+                    rows.append(jnp.where(sel, 1.0, 0.0).astype(F32))
                 return jnp.concatenate(rows, axis=0) if Q > 1 else rows[0]
+
+            def heads(mask_rows):
+                """[Q, width] 0/1 -> bool [nh * Q, width] in the (head, query) row order."""
+                return jnp.tile(mask_rows, (nh, 1)) > 0.5
 
             def attend(b, r0, p):
                 """Online softmax over the request's pool tiles, then its own new rows."""
                 nta = (p + TK - 1) // TK
-                qrows = qallb[pl.ds(r0, Q), :]
+                qrows = qallb[b, pl.ds(0, Q), :]
                 q_abs = jnp.concatenate(
                     [
                         dot(
@@ -1162,8 +1181,8 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     kvt_b = PL.unpack_nope(kvw[slot])
                     tids = tok + t * TK
                     # Rows at or past p hold stale draft tokens; the step's own rows follow.
-                    allowed = allowed_rows(p, tids, t) & (tids < p)
-                    return step(carry, kvt_b, jnp.tile(allowed, (nh, 1)))
+                    allowed = allowed_rows(p, tids, t, before=tids < p)
+                    return step(carry, kvt_b, heads(allowed))
 
                 init = (
                     jnp.full((nh * Q, 1), -jnp.inf, F32),
@@ -1172,17 +1191,18 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 )
                 with _scope("dsa_attend"):
                     carry = jax.lax.fori_loop(0, nta, attend_tile, init)
-                # The new rows as one 16-row block (a one-row MXU operand does not lower).
+                # The new rows as one 16-row block (a one-row MXU operand does not lower);
+                # the pad rows are zero and masked.
                 new_tok = p + jax.lax.broadcasted_iota(jnp.int32, (1, 16), 1)
                 allowed = allowed_rows(p, new_tok, None)
-                kn = jnp.pad(nkvb[pl.ds(r0, Q), :], ((0, 16 - Q), (0, 0)))
-                _, l_f, a_f = step(carry, kn, jnp.tile(allowed, (nh, 1)))
+                _, l_f, a_f = step(carry, nkvb[b], heads(allowed))
                 outs = []
                 for h in range(nh):
                     lat = a_f[h * Q : (h + 1) * Q] / (l_f[h * Q : (h + 1) * Q] + 1e-30)
                     w_vc = kvbf[h * per + qk : (h + 1) * per].astype(BF16)
                     outs.append(dot(lat, w_vc, ((1,), (1,))) * ks)
-                attb[pl.ds(r0, Q), :] = jnp.concatenate(outs, axis=1).astype(BF16)
+                out = jnp.concatenate(outs, axis=1).astype(BF16)
+                attb[b] = jnp.pad(out, ((0, 16 - Q), (0, 0)))
 
             def per_req(b, carry):
                 r0 = pl.multiple_of(b * Q, Q)
@@ -1200,7 +1220,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     w_do,
                     d_i,
                     nh * vd,
-                    attb[...],
+                    rows_from(attb),
                     True,
                     scale=psc[:, o_off : o_off + H],
                 )
@@ -1537,7 +1557,8 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             )
             return s_
 
-        streams = jax.lax.fori_loop(0, full_periods, period, streams)
+        if full_periods > 0:
+            streams = jax.lax.fori_loop(0, full_periods, period, streams)
 
         for L in range(spec.first_k_dense_replace + 4 * full_periods, n_layers):
             kind = "kda" if spec.layer_types[L] == "linear_attention" else "dsa"
