@@ -118,50 +118,31 @@ class _Stop(Exception):
     """Ends the forward once block 0's inputs are recorded."""
 
 
-# Rank-local entries of the shared tail-pad meta. Only the CUDA varlen-FA
-# K/V-gather path reads it; the paths compiled in spmd_safe regions mask from
-# the global pad_start/pad_end instead.
-_RANK_LOCAL_META_KEYS = frozenset({"local_pad"})
-
-
 class _RecordingBlock(nn.Module):
     def forward(self, *args, **kwargs):
         self.args = args
+        leaves = tree_leaves((args, kwargs))
         self.layouts = [
             (tuple(leaf.shape), leaf.stride(), leaf.storage_offset())
-            for leaf in tree_leaves((args, kwargs))
+            for leaf in leaves
             if isinstance(leaf, torch.Tensor)
         ]
         # Dynamo specializes on Python scalars it reads, so a rank-dependent
         # scalar changes the program even when every tensor layout matches.
-        meta = kwargs.get("attn_mask_meta") or {}
-        rest = {k: v for k, v in kwargs.items() if k != "attn_mask_meta"}
-        self.scalars = (
-            [
-                leaf
-                for leaf in tree_leaves((args, rest))
-                if not isinstance(leaf, torch.Tensor)
-            ],
-            {
-                key: value
-                for key, value in meta.items()
-                if not isinstance(value, torch.Tensor)
-                and key not in _RANK_LOCAL_META_KEYS
-            },
-        )
+        self.scalars = [leaf for leaf in leaves if not isinstance(leaf, torch.Tensor)]
         raise _Stop
 
 
 @contextlib.contextmanager
-def _sp_rank(rank, world_size, ring_world_size=1):
+def _sp_rank(rank, world_size):
     tp_group = SimpleNamespace(
         world_size=1, rank_in_group=0, all_gather=lambda x, dim=-1: x
     )
     sp_group = SimpleNamespace(
         world_size=world_size,
         rank_in_group=rank,
-        ulysses_world_size=world_size // ring_world_size,
-        ring_world_size=ring_world_size,
+        ulysses_world_size=world_size,
+        ring_world_size=1,
     )
     with (
         patch.object(parallel_state, "_TP", tp_group),
@@ -218,7 +199,7 @@ class TestWanBlockInputsAreRankInvariant(unittest.TestCase):
                 if per_token_timestep
                 else torch.full((batch,), 500.0)
             )
-            layouts = []
+            layouts, scalars = [], []
             for rank in range(world_size):
                 case = dict(batch=batch, per_token=per_token_timestep, rank=rank)
                 with self.subTest(**case), _sp_rank(rank, world_size):
@@ -233,6 +214,7 @@ class TestWanBlockInputsAreRankInvariant(unittest.TestCase):
                     ):
                         model(latents, text, timestep)
                     layouts.append(block.layouts)
+                    scalars.append(block.scalars)
 
                     hidden_states, _, temb, _ = block.args
                     rows = slice(rank * local_len, (rank + 1) * local_len)
@@ -252,9 +234,10 @@ class TestWanBlockInputsAreRankInvariant(unittest.TestCase):
                     for tensor in sharded:
                         self.assertEqual(tensor.storage_offset(), 0)
                         self.assertTrue(tensor.is_contiguous())
-            # Same shapes, strides and offsets for every tensor on every rank.
-            for rank, layout in enumerate(layouts):
-                self.assertEqual(layout, layouts[0], f"rank {rank}")
+            # Same shapes, strides, offsets and non-tensor arguments on every rank.
+            for rank in range(world_size):
+                self.assertEqual(layouts[rank], layouts[0], f"rank {rank}")
+                self.assertEqual(scalars[rank], scalars[0], f"rank {rank}")
 
 
 if __name__ == "__main__":
