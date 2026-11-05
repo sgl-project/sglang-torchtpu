@@ -260,6 +260,77 @@ def sparse_mla_attention_fused(
     return out[..., :NOPE_DIM], cache_nope, cache_rope
 
 
+def qblock_tokens_supported(
+    num_tokens: int, pages_per_seq: int, page_size: int
+) -> bool:
+    """Whether sparse_mla_prefill_fused_tokens takes the query-blocked kernel."""
+    return (
+        num_tokens >= QBLOCK_MIN_TOKENS
+        and num_tokens % 128 == 0
+        and pages_per_seq <= QBLOCK_TOKENS_MAX_PAGES_PER_SEQ
+        and page_size % 128 == 0
+        and page_size & (page_size - 1) == 0
+    )
+
+
+def sparse_mla_prefill_window(
+    ql_nope: jax.Array,  # bf16[window, all heads, 512]
+    q_pe: jax.Array,  # bf16[window, all heads, 64]
+    new_kv_c: jax.Array,  # fp8[max_num_tokens, 512]
+    new_k_pe: jax.Array,  # fp8[max_num_tokens, 64]
+    cache_nope: jax.Array,  # u8[num_pages, page_size, 4, 128]
+    cache_rope: jax.Array,  # u8[num_pages, page_size // 4, 4, 128]
+    kv_lens: jax.Array,  # i32[max_num_seqs]; already counts this step's tokens
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1], of the whole batch
+    window_cu_q_lens: jax.Array,  # i32[max_num_seqs + 1], of the window
+    distribution: jax.Array,  # i32[3]; [2] is the number of real requests
+    topk_indices: jax.Array,  # i32[window, index_topk], the window's rows
+    *,
+    sm_scale: float,
+    k_scale: float,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Store every token of the step, then attend one window of it.
+
+    SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT: each attention-TP rank passes
+    its window's queries for every head and the indexer rows it selected for
+    them. ``window_cu_q_lens`` is ``clip(cu_q_lens - window_start, 0,
+    window)``: each request keeps its slot, with its tokens inside the window.
+    Each (token, head) then goes through the per-query path of
+    ``sparse_mla_attention_fused`` as it does there: the same gathered cache
+    rows, mask and softmax.
+
+    Returns ``(output, cache_nope, cache_rope)``: ``[window, all heads, 512]``
+    and the two updated buffers.
+    """
+    cache_nope, cache_rope = _store_step(
+        cache_nope,
+        cache_rope,
+        new_kv_c,
+        new_k_pe,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+    )
+    out = sparse_ragged_paged_attention(
+        jnp.concatenate([ql_nope, q_pe], axis=-1),
+        cache_nope,
+        cache_rope,
+        topk_indices,
+        page_indices,
+        window_cu_q_lens,
+        distribution,
+        sm_scale=sm_scale,
+        k_scale=k_scale,
+        cache_layout=TENSORCORE_CACHE_LAYOUT,
+        gather_and_attention_chunk_size=min(
+            DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE, max(64, ql_nope.shape[0])
+        ),
+    )
+    return out[..., :NOPE_DIM], cache_nope, cache_rope
+
+
 def sparse_mla_prefill_fused_tokens(
     ql_nope: jax.Array,  # bf16[num_q_heads, max_num_tokens, 512], head-major
     q_pe: jax.Array,  # bf16[num_q_heads, max_num_tokens, 64], head-major
@@ -289,13 +360,7 @@ def sparse_mla_prefill_fused_tokens(
     num_tokens = ql_nope.shape[1]
     page_size = cache_nope.shape[1]
     pages_per_seq = page_indices.shape[0] // (cu_q_lens.shape[0] - 1)
-    if (
-        num_tokens >= QBLOCK_MIN_TOKENS
-        and num_tokens % 128 == 0
-        and pages_per_seq <= QBLOCK_TOKENS_MAX_PAGES_PER_SEQ
-        and page_size % 128 == 0
-        and page_size & (page_size - 1) == 0
-    ):
+    if qblock_tokens_supported(num_tokens, pages_per_seq, page_size):
         cache_nope, cache_rope = _store_step(
             cache_nope,
             cache_rope,
