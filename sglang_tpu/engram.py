@@ -180,7 +180,11 @@ def pack_rows(
     padded_tokens: int,
     block_size: int = _FP8_BLOCK_SIZE,
 ) -> torch.Tensor:
-    """Gather CPU bytes into one flat int32 upload, with zero-output padding."""
+    """Gather CPU bytes into one flat int32 upload, with zero-output padding.
+
+    Single-threaded NumPy, not torch: torch's intra-op thread pool made this
+    gather cost milliseconds on a host shared by 8 scheduler processes.
+    """
     if sys.byteorder != "little":
         raise RuntimeError("Packed Engram staging requires a little-endian host")
     if any(t.device.type != "cpu" for t in (weight, scale, indices)):
@@ -196,21 +200,20 @@ def pack_rows(
     scale_bytes = heads * blocks
     # Interleave payload and scales per token, so graph padding has whole rows.
     row_bytes = raw_bytes + ((scale_bytes + 3) // 4) * 4
-    packed = torch.zeros((padded_tokens, row_bytes), dtype=torch.uint8, device="cpu")
-    packed[:, raw_bytes:].fill_(_INVALID_SCALE)
+    packed = np.zeros((padded_tokens, row_bytes), dtype=np.uint8)
+    packed[:, raw_bytes:] = _INVALID_SCALE
     if tokens and rows:
-        local = indices.to(torch.int64) - row_start
+        local = indices.numpy().astype(np.int64, copy=False) - row_start
         owned = (local >= 0) & (local < rows)
-        local = local.clamp(0, rows - 1).reshape(-1)
-        raw = weight.view(torch.uint8).index_select(0, local).view(tokens, -1)
-        scales = scale.view(torch.uint8).index_select(0, local)
-        scales = scales.view(tokens, heads, blocks)
-        scales.masked_fill_(~owned.unsqueeze(-1), _INVALID_SCALE)
-        packed[:tokens, :raw_bytes].copy_(raw)
-        packed[:tokens, raw_bytes : raw_bytes + scale_bytes].copy_(
-            scales.reshape(tokens, -1)
+        local = np.clip(local, 0, rows - 1).reshape(-1)
+        raw = np.take(weight.view(torch.uint8).numpy(), local, axis=0)
+        scales = np.take(scale.view(torch.uint8).numpy(), local, axis=0)
+        scales[~owned.reshape(-1)] = _INVALID_SCALE
+        packed[:tokens, :raw_bytes] = raw.reshape(tokens, raw_bytes)
+        packed[:tokens, raw_bytes : raw_bytes + scale_bytes] = scales.reshape(
+            tokens, scale_bytes
         )
-    return packed.view(torch.int32).reshape(-1)
+    return torch.from_numpy(packed).view(torch.int32).reshape(-1)
 
 
 def unpack_rows(
