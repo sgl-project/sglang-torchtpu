@@ -36,6 +36,7 @@ from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.multimodal_gen import minimax_h3, worker
+from sglang_tpu.multimodal_gen.tpu_splash_attn import TpuSplashAttentionImpl
 
 # The TPU lane installs the diffusion_tpu extras (cache-dit) the H3 DiT imports.
 register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit", chips=1)
@@ -187,6 +188,27 @@ class TestMiniMaxH3LiveLength(CustomTestCase):
         # Cache-DiT swaps the block list for its wrapper while it runs.
         model.blocks = torch.nn.ModuleList([torch.nn.Identity()])
         self.assertFalse(model._attention_reads_live_length())
+
+    def test_live_length_attention_without_host_bounds_needs_its_kernel(self):
+        # SDPA would read the dropped host bounds back and compile once per
+        # live length; host bounds (the refiner's) keep per-segment SDPA.
+        impl = TpuSplashAttentionImpl(
+            num_heads=2,
+            head_size=128,
+            causal=False,
+            softmax_scale=128**-0.5,
+            packed_trailing_padding=True,
+        )
+        # As on a tpu7x worker; host tensors fail the kernel's input checks.
+        impl.trailing_padding_on_device = True
+        q = torch.zeros(512, 2, 128, dtype=torch.bfloat16)
+        cu = torch.tensor([0, 300, 512], dtype=torch.int32)
+        with self.assertRaisesRegex(ValueError, "without host bounds"):
+            impl.forward_varlen(q, q, q, cu_seqlens=cu, max_seqlen=512)
+        out = impl.forward_varlen(
+            q, q, q, cu_seqlens=cu, max_seqlen=300, cu_seqlens_host=(0, 300, 512)
+        )
+        self.assertEqual(out.shape, q.shape)
 
     def test_forward_gives_blocks_no_host_bounds_for_a_live_length_attention(self):
         # Host bounds or a live max_seqlen would key each compiled block on

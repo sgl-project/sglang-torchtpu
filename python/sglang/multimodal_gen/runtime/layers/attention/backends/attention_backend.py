@@ -115,6 +115,10 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
 
 class AttentionImpl(ABC, Generic[T]):
+    # forward_varlen reads a packed [0, used, total] layout's live length from
+    # cu_seqlens on device, so callers may pass no host bounds.
+    trailing_padding_on_device: bool = False
+
     @abstractmethod
     def __init__(
         self,

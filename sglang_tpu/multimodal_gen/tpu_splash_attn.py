@@ -1181,18 +1181,17 @@ class TpuSplashAttentionImpl(SDPAImpl):
         # cu_seqlens = [0, used, total] without host bounds: rows [used, total)
         # are padding. Callers that pass host bounds (e.g. H3's token refiner,
         # whose length varies per prompt) keep the per-segment SDPA path.
-        if (
-            self.trailing_padding_on_device
-            and cu_seqlens_host is None
-            and not self.causal
-            and query.device.type == "tpu"
-            and cu_seqlens.shape == (3,)
-            and query.shape[0] >= 512
-            and key.shape[0] == query.shape[0]
-        ):
+        if self.trailing_padding_on_device and cu_seqlens_host is None:
             # [S, H, D] views in the kernel's [B, H, S, D] terms, for the checks.
             q, k, v = (t.transpose(0, 1).unsqueeze(0) for t in (query, key, value))
-            if _kernel_input_fallback_reason(q, k, v) is None:
+            if (
+                not self.causal
+                and query.device.type == "tpu"
+                and cu_seqlens.shape == (3,)
+                and query.shape[0] >= 512
+                and key.shape[0] == query.shape[0]
+                and _kernel_input_fallback_reason(q, k, v) is None
+            ):
                 # [S, H * D] rows: one lane-dense copy of a strided view, where
                 # .contiguous() pads 7 heads to 8 sublanes and the kernel's
                 # reshape then relayouts again.
@@ -1204,6 +1203,14 @@ class TpuSplashAttentionImpl(SDPAImpl):
                     query.shape[1],
                 )
                 return output.view(query.shape)
+            # The caller dropped its host bounds for this kernel; SDPA would
+            # read them back and compile once per live length.
+            raise ValueError(
+                "live-length attention without host bounds needs the kernel: "
+                f"q {tuple(query.shape)} {query.dtype} on {query.device}, "
+                f"k {tuple(key.shape)}, cu_seqlens {tuple(cu_seqlens.shape)}, "
+                f"causal={self.causal}"
+            )
         # Packed segment lengths vary per request. Each new length compiles
         # under either backend (dynamic=False); SDPA skips the Pallas trace,
         # export and Mosaic compile on top of that, so segments stay on SDPA.

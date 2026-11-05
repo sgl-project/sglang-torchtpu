@@ -2239,9 +2239,11 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         """Whether the block attention reads the live length from cu_seqlens
         on device. Cache-DiT swaps ``blocks`` for its wrapper while it runs;
         host bounds are kept then."""
-        attn = getattr(self.blocks[0], "attn", None)
-        impl = getattr(attn, "_attention_impl", None)
-        return bool(getattr(impl, "trailing_padding_on_device", False))
+        block = self.blocks[0]
+        if not isinstance(block, MiniMaxH3DiTBlock):
+            return False
+        impl = block.attn._attention_impl
+        return impl is not None and impl.trailing_padding_on_device
 
     def _mark_missing_params_required(self) -> None:
         for _, param in self.named_parameters():
