@@ -66,6 +66,7 @@ from sglang_tpu.disaggregation.raiden.common import (
     kv_layout_of,
     logger,
 )
+from sglang_tpu.disaggregation.raiden.decode_dram_offload import DecodeDramOffload
 from sglang_tpu.disaggregation.raiden.host_pool import (
     WINDOW_SLOTS_PER_FULL_SLOT,
     StagingAdmission,
@@ -161,6 +162,8 @@ class RaidenKVManager(
 
     # The legacy transport unless set_kv_caches builds a pipeline transfer.
     _pipeline = None
+    # Off unless __init__ finds the offload switch on.
+    decode_dram_offload: Optional[DecodeDramOffload] = None
     _pipeline_enabled = False
     # Host layer buffers per transfer, from SGLANG_TPU_RAIDEN_STAGING_LAYERS.
     _staging_layers_total = 0
@@ -200,6 +203,14 @@ class RaidenKVManager(
             ReshardChunkReady.TAG: self._on_reshard_chunk_ready,
             RoomFailed.TAG: self._on_room_failed,
         }
+        # KV offload to decode DRAM; None when the switch is off.
+        self.decode_dram_offload = (
+            DecodeDramOffload(self)
+            if tpu_envs.SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM.get()
+            else None
+        )
+        if self.decode_dram_offload is not None:
+            self._message_handlers.update(self.decode_dram_offload.message_handlers())
 
         self._engine: Optional[Any] = None  # raiden KVCacheManager
         self._swa_engine: Optional[Any] = None
@@ -815,6 +826,8 @@ class RaidenKVManager(
         return start, tail
 
     def _drain_engine(self) -> None:
+        if self.decode_dram_offload is not None:
+            self.decode_dram_offload.drain_host_reads()
         if self._pipeline is not None:
             sent, received, failed = self._pipeline.poll()
             with self._state_lock:
@@ -1157,6 +1170,15 @@ class RaidenKVManager(
         # new bootstrap fields (its endpoint rides in the per-request reply).
         super().register_to_bootstrap()
 
+    def create_decode_prefix_puller(self, scheduler):
+        if self._prefill is None or self.decode_dram_offload is None:
+            return None
+        from sglang_tpu.pd_victim_push import VictimPrefixPuller
+
+        return VictimPrefixPuller(
+            kv_manager=self.decode_dram_offload, scheduler=scheduler
+        )
+
     # ----- rendezvous (ZMQ over the existing per-rank PULL socket) -----------
 
     def _listen(self) -> None:
@@ -1332,6 +1354,11 @@ class RaidenKVManager(
         if self._pipeline is not None:
             return self._pipeline.active(room)
         with self._state_lock:
+            if (
+                self.decode_dram_offload is not None
+                and self.decode_dram_offload.host_read_pending_locked(room)
+            ):
+                return True
             if self._pulling is not None:
                 for key in self._pulling.rooms():
                     if self._is_room_transfer(
@@ -1369,6 +1396,10 @@ class RaidenKVManager(
             # still delivering keeps its receiver plan, each with the
             # completion that will settle it, until the engine reports it.
             held: Set[str] = set()
+            if self.decode_dram_offload is not None:
+                held.update(
+                    k for k in self.decode_dram_offload.host_reads if belongs(k)
+                )
             if self._pulling is not None:
                 for key in self._pulling.rooms():
                     if not belongs(key):
@@ -1463,6 +1494,8 @@ class RaidenKVManager(
                     self._decode.reshard_registered,
                 ):
                     table.discard(room)
+            if self.decode_dram_offload is not None:
+                self.decode_dram_offload.forget_room_locked(room)
             if clear_failure_record:
                 # Failure publication takes _state_lock before failure_lock as
                 # well, so clear and publication have one total order.
