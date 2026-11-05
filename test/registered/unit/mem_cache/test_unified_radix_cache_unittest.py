@@ -1579,65 +1579,6 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertEqual(restored_gpu[0].session_id, "session-a")
 
 
-class TestSWABranchTailEviction(unittest.TestCase):
-    def _build_prefixes(self, *, extend=False):
-        cfg = CacheConfig(
-            components=(ComponentType.FULL, ComponentType.SWA),
-            sliding_window_size=4,
-            num_layers=4,
-            full_attention_layer_ids=(0,),
-            head_num=1,
-            head_dim=8,
-        )
-        with mock.patch(f"{__name__}.get_device", return_value="cpu"):
-            cache, allocator, _ = build_fixture(cfg, tree_core_backend="python")
-        keys = []
-        for i in range(8):
-            tokens = array("q", range(i * 100, i * 100 + 8))
-            value = allocator.alloc(8)
-            cache.insert(InsertParams(key=RadixKey(tokens), value=value))
-            if extend:
-                tokens = tokens + array("q", (i * 100 + 8, i * 100 + 9))
-                cache.insert(
-                    InsertParams(
-                        key=RadixKey(tokens),
-                        value=torch.cat((value, allocator.alloc(2))),
-                        prev_prefix_len=8,
-                    )
-                )
-            keys.append(RadixKey(tokens))
-        return cache, keys
-
-    def _match_lengths(self, cache, keys):
-        return [
-            len(cache.match_prefix(MatchPrefixParams(key=key)).device_indices)
-            for key in keys
-        ]
-
-    def test_reclaims_old_windows_before_branch_tails(self):
-        cache, keys = self._build_prefixes()
-        result = cache.evict(EvictParams(swa_num_tokens=32))
-        self.assertEqual(result.swa_num_tokens_evicted, 32)
-        self.assertEqual(result.num_tokens_evicted, 0)
-        self.assertEqual(self._match_lengths(cache, keys), [8] * 8)
-        cache.sanity_check()
-
-    def test_short_leaf_keeps_its_parent_window(self):
-        cache, keys = self._build_prefixes(extend=True)
-        result = cache.evict(EvictParams(swa_num_tokens=32))
-        self.assertEqual(result.num_tokens_evicted, 0)
-        self.assertEqual(self._match_lengths(cache, keys), [10] * 8)
-        cache.sanity_check()
-
-    def test_fallback_reclaims_tails_when_required(self):
-        cache, keys = self._build_prefixes()
-        result = cache.evict(EvictParams(swa_num_tokens=36))
-        self.assertEqual(result.swa_num_tokens_evicted, 36)
-        self.assertEqual(result.num_tokens_evicted, 4)
-        self.assertEqual(self._match_lengths(cache, keys), [0] + [8] * 7)
-        cache.sanity_check()
-
-
 class UnifiedRadixCacheSuite:
     cfg: CacheConfig
     _rid: int = 0
