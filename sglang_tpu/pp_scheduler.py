@@ -60,7 +60,7 @@ def _check_buffered_supported(scheduler: Scheduler) -> None:
         unsupported.append("prefill context parallelism")
     if unsupported:
         raise NotImplementedError(
-            "SGLANG_USE_TPU_PP_BUFFERED_HANDOFF does not support "
+            "SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF does not support "
             f"{' or '.join(unsupported)}: their forwards pad to a shape agreed "
             "with other ranks, which a stage cannot size its receive for. Unset "
             "it to use the lockstep wave."
@@ -69,7 +69,7 @@ def _check_buffered_supported(scheduler: Scheduler) -> None:
 
 def build_scheduler_pp_wave(scheduler: Scheduler) -> PPWave | PPBufferedHandoff:
     """The stage's hand-off, the lockstep wave or, with
-    SGLANG_USE_TPU_PP_BUFFERED_HANDOFF, the buffered hand-off; sized to the largest
+    SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF, the buffered hand-off; sized to the largest
     batch a compiled forward can hand on."""
     from sglang_tpu.compilation.decoder_compile_policy import (
         DecoderTpuCompilePolicy,
@@ -86,7 +86,7 @@ def build_scheduler_pp_wave(scheduler: Scheduler) -> PPWave | PPBufferedHandoff:
         _check_aux_capture_relay(model_runner.model)
     num_aux = num_relayed_aux_slots(aux_config, model_runner.model)
     dtype = getattr(model_runner.model, "pp_transfer_dtype", model_runner.dtype)
-    if tpu_envs.SGLANG_USE_TPU_PP_BUFFERED_HANDOFF.get():
+    if tpu_envs.SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF.get():
         _check_buffered_supported(scheduler)
         wave = build_pp_buffered_handoff(
             pp_group=scheduler.pp_group,

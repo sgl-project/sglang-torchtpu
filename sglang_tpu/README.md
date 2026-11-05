@@ -181,7 +181,7 @@ collective-permute that every device launches in the same order, so each round
 lasts as long as the slowest forward in flight and the pipeline drains with
 zero launches.
 
-- `SGLANG_USE_TPU_PP_BUFFERED_HANDOFF=1` selects the buffered hand-off
+- `SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF=1` selects the buffered hand-off
   (`pp_buffered.py`). Each stage sends a forward's output to the same column of
   the next stage with a point-to-point send as soon as the forward is launched,
   so a stage waits only for its own input.

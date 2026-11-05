@@ -207,7 +207,7 @@ def _fit_pp_proxy_rows(proxy: Any, input_ids: Any, forward_batch: Any) -> Any:
     if reference is None:
         return proxy
     expected = int(reference.shape[0])
-    exact = envs.SGLANG_USE_TPU_PP_BUFFERED_HANDOFF.get()
+    exact = envs.SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF.get()
     tensors = {}
     trimmed = False
     for name, tensor in proxy.tensors.items():

@@ -1003,7 +1003,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         # (_fit_pp_proxy_rows), so the program takes row views of them; warm
         # with the same views, or each bucket copies its view on first use.
         # The buffered hand-off receives each tensor at the bucket itself.
-        buffered = tpu_envs.SGLANG_USE_TPU_PP_BUFFERED_HANDOFF.get()
+        buffered = tpu_envs.SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF.get()
         transfer_dtype = getattr(
             self.model_runner.model,
             "pp_transfer_dtype",

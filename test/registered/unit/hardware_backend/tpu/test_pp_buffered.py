@@ -488,7 +488,7 @@ class TestReceiveProxy(unittest.TestCase):
 
 
 class TestBufferedHandoffWiring(unittest.TestCase):
-    """SGLANG_USE_TPU_PP_BUFFERED_HANDOFF: what it builds, what it refuses, and the shapes
+    """SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF: what it builds, what it refuses, and the shapes
     the compiled forward is warmed up and checked with."""
 
     def _scheduler(self):
@@ -529,7 +529,7 @@ class TestBufferedHandoffWiring(unittest.TestCase):
         scheduler, _ = self._scheduler()
         dp, cp = self._no_cross_rank_padding()
         with (
-            tpu_envs.SGLANG_USE_TPU_PP_BUFFERED_HANDOFF.override(True),
+            tpu_envs.SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF.override(True),
             dp,
             cp,
             patch.object(pp_scheduler, "build_pp_buffered_handoff") as handoff,
@@ -562,7 +562,7 @@ class TestBufferedHandoffWiring(unittest.TestCase):
         ):
             with (
                 self.subTest(needle=needle),
-                tpu_envs.SGLANG_USE_TPU_PP_BUFFERED_HANDOFF.override(True),
+                tpu_envs.SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF.override(True),
                 patch(
                     "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
                     return_value=dp_on,
@@ -581,7 +581,7 @@ class TestBufferedHandoffWiring(unittest.TestCase):
         proxy = PPProxyTensors(
             {"hidden_states": torch.zeros(16, 2), "residual": torch.zeros(16, 2)}
         )
-        with tpu_envs.SGLANG_USE_TPU_PP_BUFFERED_HANDOFF.override(True):
+        with tpu_envs.SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF.override(True):
             with self.assertRaisesRegex(ValueError, "buffered hand-off"):
                 _fit_pp_proxy_rows(proxy, torch.zeros(8), None)
             self.assertIs(_fit_pp_proxy_rows(proxy, torch.zeros(16), None), proxy)
@@ -591,7 +591,7 @@ class TestBufferedHandoffWiring(unittest.TestCase):
 
     def test_warmup_proxies_are_whole_tensors_under_the_buffered_handoff(self):
         _, policy = self._scheduler()
-        with tpu_envs.SGLANG_USE_TPU_PP_BUFFERED_HANDOFF.override(True):
+        with tpu_envs.SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF.override(True):
             buffered_proxy = policy._pp_warmup_kwargs(64)["pp_proxy_tensors"]
         wave_proxy = policy._pp_warmup_kwargs(64)["pp_proxy_tensors"]
         for name in ("hidden_states", "residual"):

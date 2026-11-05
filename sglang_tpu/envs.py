@@ -357,7 +357,7 @@ class TpuEnvs:
 
     # Pipeline parallelism: hand activations between stages point to point
     # (isend/irecv, pp_buffered.py) instead of the lockstep collective-permute wave.
-    SGLANG_USE_TPU_PP_BUFFERED_HANDOFF = EnvBool(False)
+    SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF = EnvBool(False)
     # Buffered hand-off: forwards a stage may queue for sending before it blocks.
     SGLANG_TPU_PP_BUFFERED_SEND_DEPTH = EnvInt(2)
 

@@ -108,7 +108,7 @@ def set_profile_inputs(policy, batch, args, kwargs, tokens, prefix):
         # so a chunk-sized proxy here would trace a row count serving never
         # repeats. The buffered hand-off delivers whole tensors at the
         # padded bucket itself, so profile those.
-        if tpu_envs.SGLANG_USE_TPU_PP_BUFFERED_HANDOFF.get():
+        if tpu_envs.SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF.get():
             rows = policy.forward_rows(ForwardMode.EXTEND, tokens, 1, None)
         else:
             rows = max_extend_tokens(context_len=runner.model_config.context_len)

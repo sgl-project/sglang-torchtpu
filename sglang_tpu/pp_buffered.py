@@ -2,7 +2,7 @@
 """Buffered point-to-point hand-off of activations between pipeline stages.
 
 The alternative to the lockstep wave (``pp_wave``), enabled with
-``SGLANG_USE_TPU_PP_BUFFERED_HANDOFF=1``. Each device sends a forward's output
+``SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF=1``. Each device sends a forward's output
 to the device that holds the same token rows in the next stage, its column,
 with a process-group send, and that device takes it with a receive. A
 transfer involves only the two devices at its ends and runs no program on
@@ -86,8 +86,9 @@ _POST_LOG_EVERY = 500
 _WIRE_WIDTH = 128
 
 _LIBTPU_REQUIREMENT = (
-    "SGLANG_USE_TPU_PP_BUFFERED_HANDOFF needs a libtpu whose device transfers land in the "
-    "posted receive, as libtpu 0.0.50 and later do with torch_tpu 0.2.0 and later"
+    "SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF needs a libtpu whose device transfers "
+    "land in the posted receive, as libtpu 0.0.50 and later do with torch_tpu "
+    "0.2.0 and later"
 )
 
 
