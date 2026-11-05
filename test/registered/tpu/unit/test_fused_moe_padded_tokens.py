@@ -364,10 +364,11 @@ class TestFusedMoEPaddedTokens(CustomTestCase):
                     self.assertTrue(np.all(np.isfinite(bad[others])))
                     np.testing.assert_array_equal(bad[others], clean[others])
 
-    def test_permute_follows_the_gather_combine(self):
-        # m < threshold <= m * topk: the combine gathers, so the permute must
-        # too. A one-hot permute feeding the SparseCore combine gave wrong
-        # tokens on Kimi-K3 whenever moe_front or latent_up ran static fp8.
+    def test_gather_permute_with_the_sparse_core_combine(self):
+        # m < threshold <= m * topk: the permute is one-hot and the combine
+        # gathers. With gather_permute_with_sc_combine (Kimi-K3 static fp8
+        # moe_front / latent_up) and the SparseCore combine, the permute gathers
+        # too: the one-hot permute feeding that combine gave wrong tokens there.
         from sglang_tpu.moe.pallas import fused_moe_op
 
         e_local, e_global, rank, topk, thr = ROUTES["k3"]
@@ -377,8 +378,8 @@ class TestFusedMoEPaddedTokens(CustomTestCase):
         w1, w2, kw, _ = self._weights_for("bf16", "k3")
         rng = np.random.default_rng(m)
         hidden = jnp.asarray(rng.standard_normal((m, H)), jnp.bfloat16)
-        for ep, sc in itertools.product((True, False), (0, 1)):
-            with self.subTest(ep=ep, sc=sc):
+        for ep, sc, force in itertools.product((True, False), (0, 1), (0, 1)):
+            with self.subTest(ep=ep, sc=sc, force=force):
                 ids, w = _routing(m, ROUTES["k3"], ep, rng)
                 route_kw = (
                     dict(
@@ -406,6 +407,7 @@ class TestFusedMoEPaddedTokens(CustomTestCase):
                             use_sc_gather=sc,
                             w_quant_bits=kw["w_quant_bits"],
                             permute_dense_threshold=threshold,
+                            gather_permute_with_sc_combine=force,
                             **route_kw,
                         )
                     )
@@ -417,10 +419,13 @@ class TestFusedMoEPaddedTokens(CustomTestCase):
                     return np.asarray(out.astype(jnp.float32)), classes
 
                 mixed, classes = run(thr)
-                # Traced (the group-size count is a one-hot over experts), with
-                # no one-hot over the m tokens.
+                # Traced (the group-size count is a one-hot over experts); a
+                # one-hot over the m tokens is the permute.
                 self.assertTrue(classes)
-                self.assertNotIn(m, classes)
+                if sc and force:
+                    self.assertNotIn(m, classes)
+                else:
+                    self.assertIn(m, classes)
                 gather, _ = run(0)
                 np.testing.assert_array_equal(mixed, gather)
 

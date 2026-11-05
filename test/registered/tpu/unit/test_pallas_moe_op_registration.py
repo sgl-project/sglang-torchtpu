@@ -166,6 +166,7 @@ class TestPallasMoeCallContract(CustomTestCase):
             None,  # w1_channel_scale (vmem-fp8 only)
             None,  # w2_channel_scale (vmem-fp8 only)
             None,  # expert_group_offset_tensor (lifted when trace_rank is active)
+            0,  # gather_permute_with_sc_combine (Kimi-K3 static fp8 sets it)
         )
 
     def test_lifts_expert_group_offset_when_trace_rank_is_active(self):

@@ -511,6 +511,7 @@ def _fused_moe_jax(
     w1_channel_scale=None,
     w2_channel_scale=None,
     expert_group_offset_tensor=None,
+    gather_permute_with_sc_combine=0,
 ):
     """Production fused-MoE kernel body. Exported by ``_build_fused_moe_op``.
 
@@ -657,13 +658,17 @@ def _fused_moe_jax(
         )  # pad -> weight 0
         m = m_pad
 
-    # The dense (one-hot matmul) permute and un-permute run below the dense
-    # threshold in routed rows (m*topk), and always together: a one-hot permute
-    # feeding the SparseCore combine (m < threshold <= m*topk) gave wrong tokens
-    # on Kimi-K3 whenever moe_front or latent_up ran static fp8, while either
-    # path end to end was right. m*topk < threshold implies m < threshold.
-    use_dense_permute = (m * topk) < permute_dense_threshold
-    use_dense_unpermute = use_dense_permute and not no_combine
+    # The one-hot permute runs below the threshold in tokens (m), the one-hot
+    # combine below it in routed rows (m*topk); between the two the combine
+    # gathers. gather_permute_with_sc_combine moves the permute to the gather
+    # there when the combine is the SparseCore one (see its env var).
+    use_dense_unpermute = (m * topk) < permute_dense_threshold and not no_combine
+    use_dense_permute = m < permute_dense_threshold and not (
+        gather_permute_with_sc_combine
+        and use_sc_gather
+        and not no_combine
+        and not use_dense_unpermute
+    )
     hidden_states, topk_ids, topk_weights = _drop_invalid_slots(
         hidden_states,
         topk_ids,
@@ -1051,6 +1056,7 @@ def _build_fused_moe_op():
         w1_channel_scale: Optional[jax.Array] = None,
         w2_channel_scale: Optional[jax.Array] = None,
         expert_group_offset_tensor: Optional[jax.Array] = None,
+        gather_permute_with_sc_combine: int = 0,
     ) -> jax.Array:
         return _fused_moe_jax(
             hidden_states,
@@ -1073,6 +1079,7 @@ def _build_fused_moe_op():
             w1_channel_scale,
             w2_channel_scale,
             expert_group_offset_tensor,
+            gather_permute_with_sc_combine,
         )
 
     custom_op = jax_op(op_name, _wrapped)
@@ -1098,6 +1105,7 @@ def _build_fused_moe_op():
         w1_channel_scale: Optional[torch.Tensor] = None,
         w2_channel_scale: Optional[torch.Tensor] = None,
         expert_group_offset_tensor: Optional[torch.Tensor] = None,
+        gather_permute_with_sc_combine: int = 0,
     ):
         if no_combine:
             return hidden_states.new_empty(
@@ -1216,4 +1224,5 @@ def fused_moe_call(
         w1_channel_scale,
         w2_channel_scale,
         expert_group_offset_tensor,
+        int(tpu_envs.SGLANG_TPU_FORCE_MOE_GATHER_PERMUTE_WITH_SC_COMBINE.get()),
     )
