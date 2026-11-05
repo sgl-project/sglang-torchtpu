@@ -214,6 +214,10 @@ class TestRuntimeEnvironment(unittest.TestCase):
             self.assertNotIn("SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY", env)
         self.assertEqual(prefill["runtime_env"]["SGLANG_TPU_MUSE_PREFILL_SP"], "0")
         self.assertEqual(decode["runtime_env"]["SGLANG_RAIDEN_PIPELINE_TRANSFER"], "1")
+        # HiCache on a decode needs its radix tree; without it the decode refuses to start.
+        self.assertTrue(
+            decode["server_args"]["disaggregation_decode_enable_radix_cache"]
+        )
         for config, mode in ((prefill, "prefill"), (decode, "decode")):
             self.assertEqual(config["server_args"]["disaggregation_mode"], mode)
         self.assertNotIn("disaggregation_mode", get_config(24)["server_args"])

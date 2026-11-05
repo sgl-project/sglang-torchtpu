@@ -275,6 +275,8 @@ _ROLES: dict[str, dict[str, dict]] = {
     "decode": {
         "server_args": {
             "disaggregation_mode": "decode",
+            # HiCache needs the radix tree, which a decode only keeps when asked.
+            "disaggregation_decode_enable_radix_cache": True,
             # The decode HiCache (pd_decode_swa_hicache) rejects host_pool retraction.
             "disaggregation_decode_retraction_backup": "cpu_tensor",
         },
