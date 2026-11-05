@@ -265,6 +265,44 @@ class TestTpuPlatformInitialization(CustomTestCase):
 
         self.assertEqual(registered, ["sglang_tpu.models"])
 
+    def _init_backend_with_premapped(self, value: str | None):
+        """Run init_backend with the premapped env var set to ``value``
+        (None: unset) and return its final value and the platform's logs."""
+        with (
+            patch.dict(os.environ, {"WORLD_SIZE": "1"}, clear=False),
+            patch.dict(sys.modules, {"torch_tpu": ModuleType("torch_tpu")}),
+            patch("sglang_tpu.patches._prepare_tpu_env"),
+            patch(
+                "sglang_tpu.compile_cache.add_tpu_kernel_inputs_to_compile_cache_key"
+            ),
+            patch("sglang_tpu.patches.apply_tpu_patches"),
+            patch("sglang_tpu.tpu_platform.rank_slice._load"),
+            patch("sglang_tpu.tpu_platform.traced_rank._load"),
+            patch("sglang.srt.models.registry.ModelRegistry.register_lazy"),
+            self.assertLogs("sglang_tpu.tpu_platform", level="INFO") as logs,
+        ):
+            os.environ.pop("TPU_PREMAPPED_BUFFER_SIZE", None)
+            if value is not None:
+                os.environ["TPU_PREMAPPED_BUFFER_SIZE"] = value
+            # Fresh instance: init_backend is a no-op once it has run.
+            TpuSRTPlatform().init_backend()
+            return os.environ.get("TPU_PREMAPPED_BUFFER_SIZE"), logs.output
+
+    def test_worker_falls_back_to_default_premapped_size(self):
+        # A worker started without the launcher's default still sets it
+        # before torch_tpu initializes PJRT.
+        final, logs = self._init_backend_with_premapped(None)
+        self.assertEqual(final, str(4 * 1024 * 1024 * 1024))
+        self.assertTrue(any("4.00 GiB" in line for line in logs), logs)
+
+    def test_worker_keeps_inherited_premapped_size(self):
+        # Inherited from the launcher or set by the user; 0 turns the pool off.
+        for value, shown in (("17179869184", "16.00 GiB"), ("0", "0.00 GiB")):
+            with self.subTest(value=value):
+                final, logs = self._init_backend_with_premapped(value)
+                self.assertEqual(final, value)
+                self.assertTrue(any(shown in line for line in logs), logs)
+
 
 class TestTpuCompileCache(CustomTestCase):
     def test_reports_tier1_cache_misses(self):

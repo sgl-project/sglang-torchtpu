@@ -15,6 +15,10 @@ logger = get_logger(__name__)
 
 _LIBTPU_INIT_ARGS = "LIBTPU_INIT_ARGS"
 
+_TPU_PREMAPPED_BUFFER_SIZE = "TPU_PREMAPPED_BUFFER_SIZE"
+# Default size for libtpu's premapped (pinned, DMA-mapped) host staging pool.
+_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
+
 # Mirror legacy compilation-cache env vars to their renamed counterparts.
 # TODO(wyzhang): Remove after the TorchTPU upgrade completes.
 _COMPILATION_CACHE_ENV_RENAMES = (
@@ -121,9 +125,33 @@ def _set_renamed_compilation_cache_envs() -> list[str]:
     return added
 
 
+def _set_default_premapped_buffer_size() -> bool:
+    """Default ``TPU_PREMAPPED_BUFFER_SIZE`` for processes spawned after this call.
+
+    torch_tpu reads the variable once, when it first initializes PJRT; if it
+    is unset then, the pool is off. The launcher sets it before it spawns
+    workers, so every worker has it before any device use, including code
+    that touches the device before ``TpuSRTPlatform.init_backend``. Older
+    torch_tpu read it during ``import torch`` and wrote ``"0"`` into the C
+    environment; writing ``os.environ`` here also replaces that inherited
+    ``"0"`` (sglang-torchtpu#1394). A value the user set, including ``0``, is
+    kept. Returns whether the default was written.
+    """
+    if _TPU_PREMAPPED_BUFFER_SIZE in os.environ:
+        return False
+    os.environ[_TPU_PREMAPPED_BUFFER_SIZE] = str(_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE)
+    return True
+
+
 def apply_tpu_env_overrides() -> None:
     """Apply TPU env overrides."""
     os.environ.setdefault("TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS", "1")
+    if _set_default_premapped_buffer_size():
+        logger.info(
+            "TPU env_override set %s=%d for spawned workers.",
+            _TPU_PREMAPPED_BUFFER_SIZE,
+            _DEFAULT_TPU_PREMAPPED_BUFFER_SIZE,
+        )
     added = _set_renamed_compilation_cache_envs()
     if added:
         logger.info(
