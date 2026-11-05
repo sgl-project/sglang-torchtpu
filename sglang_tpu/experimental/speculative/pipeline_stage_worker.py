@@ -29,6 +29,10 @@ from sglang_tpu.experimental import register_host_batch_padder
 
 
 class TpuPipelineStageWorker(BaseSpecWorker):
+    # Same answer as the last stage's TpuSpecWorker, so the scheduler intake
+    # gate (sglang_tpu/patches.py) rejects a logprob request on every PP rank.
+    supports_logprobs = False
+
     def __init__(
         self,
         server_args: ServerArgs,

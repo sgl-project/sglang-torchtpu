@@ -819,14 +819,16 @@ class TestExperimentalSpecHooks(CustomTestCase):
                         with self.assertRaisesRegex(ValueError, "overlap"):
                             initialize_host_batch(SimpleNamespace(enable_overlap=False))
 
-    def test_kimi_spec_defaults_yield_only_to_experimental_dspark(self):
+    def test_kimi_spec_defaults_yield_only_to_experimental_block_spec(self):
         def original(server_args):
             raise ValueError("core refused")
 
         for algo, experimental, passes in (
             ("DSPARK", True, True),
             ("DSPARK", False, False),
-            ("DFLASH", True, False),
+            ("DFLASH", True, True),
+            ("DFLASH", False, False),
+            ("EAGLE", True, False),
         ):
             args = SimpleNamespace(speculative_algorithm=algo)
             with (

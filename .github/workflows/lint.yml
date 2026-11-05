@@ -50,7 +50,8 @@ jobs:
         run: |
           python -E -S -B scripts/ci/tpu/render_recipe.py \
             --check docs/cookbook/autoregressive/OpenAI/GPT-OSS.mdx \
-            --check docs/cookbook/autoregressive/Moonshotai/Kimi-K3.mdx
+            --check docs/cookbook/autoregressive/Moonshotai/Kimi-K3.mdx \
+            --check docs/cookbook/autoregressive/Moonshotai/Kimi-K3.1-Pro.mdx
 
       - name: Install pre-commit hook
         run: |

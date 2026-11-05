@@ -74,8 +74,8 @@ from sglang_tpu.k3_megakernel.kernel.stages.head import (
 from sglang_tpu.k3_megakernel.kernel.stages.kda import HEAD_DIM, KdaStage
 from sglang_tpu.k3_megakernel.kernel.stages.mla import (
     PAGE,
-    REPLICATED,
     ROW,
+    DsaRefs,
     MlaStage,
     SplitW1Projection,
     W1Split,
@@ -125,6 +125,21 @@ HBM_INPUTS = (
     "expert_down",
     "expert_down_scale",
 )
+# K3.1 DSA (``StackSpec.dsa_layers``): the indexer's per-lane wq_b slice, ``[n_mla, 1536, 512]`` (HBM).
+DSA_INPUTS = ("mla_idx_qb",)
+# Index-key cache record layout per page (native ``index_key_cache_shape``): 128 tokens as
+# [32 rows, 4 tokens, 256 bytes] u8 (128 e4m3 key bytes | UE8M0 scale byte | zeros).
+IDX_PAGE_SHAPE = (PAGE // 4, 4, 256)
+
+
+# K-chunk rows of the mla_idx_qb stream (1536 rows).
+_IDX_QB_CHUNK = 512
+
+
+def dsa_inputs(spec) -> tuple[str, ...]:
+    return DSA_INPUTS if spec.dsa_layers else ()
+
+
 # Stream keys whose buffers live in the VMEM arena (StackKernel._plan_arena).
 _ARENA_KEYS = ("dense_gu", "kda_proj", "mla_w1", "mla_g", "mla_qb")
 # Region M (``moe_region_m``): the MoE's dense streams in one raw buffer, latent_up overlaying
@@ -139,6 +154,8 @@ SMALL_FAMILIES = (
     "kda_onorm",
     "mla_qnorm",
     "mla_kvnorm",
+    "mla_idx_knorm_w",
+    "mla_idx_knorm_b",
     "router_bias",
     "latent_norm",
 )
@@ -152,7 +169,7 @@ class VecLayout(msgspec.Struct, frozen=True):
     rows 6..9  : KDA conv taps ``[4, 3hd]`` (tap 0 oldest)
     row 10     : KDA dt_bias (hd) | A_log per channel (hd) | o_norm (128)
     row 11     : MoE latent norm (latent) | router bias (2 * router_pad), for this layer's MoE
-    row 12     : MLA q_a norm (1536) | kv_a norm (512)
+    row 12     : MLA q_a norm (1536) | kv_a norm (512) | DSA index-key LayerNorm weight (128) | bias (128)
     """
 
     hidden: int
@@ -167,7 +184,7 @@ class VecLayout(msgspec.Struct, frozen=True):
         assert (
             3 * self.kda_hd <= self.hidden and 2 * self.kda_hd + HEAD_DIM <= self.hidden
         )
-        assert self.latent + 2 * self.router_pad <= self.hidden and 2048 <= self.hidden
+        assert self.latent + 2 * self.router_pad <= self.hidden and 2304 <= self.hidden
 
     @property
     def cells(self) -> dict:
@@ -182,21 +199,26 @@ class VecLayout(msgspec.Struct, frozen=True):
             "router_bias": (self.MOE, 1, lat, 2 * self.router_pad),
             "qnorm": (self.MLA, 1, 0, 1536),
             "kvnorm": (self.MLA, 1, 1536, 512),
+            "idx_knorm_w": (self.MLA, 1, 2048, 128),
+            "idx_knorm_b": (self.MLA, 1, 2176, 128),
         }
 
 
 def state_inputs(spec, stacked: bool = False) -> tuple[str, ...]:
     """sglang's per-layer pools, passed one tensor per layer: KDA conv ``[slots, 3, 1, 3hd]`` f32,
-    KDA recurrent ``[slots, h, 128, 128]`` f32, MLA latent ``[pages, 64, 2, 640]`` bf16.
+    KDA recurrent ``[slots, h, 128, 128]`` f32, MLA latent ``[pages, 64, 2, 640]`` bf16, and on K3.1
+    (``spec.dsa_layers``) the DSA index keys ``[pages, 32, 4, 256]`` u8 per MLA layer (``IDX_PAGE_SHAPE``).
     ``stacked``: one tensor per family with a leading layer axis (``[n_kda, slots, ...]``,
     ``[n_mla, pages, ...]``), indexed by the traced KDA / MLA index."""
+    dsa = bool(spec.dsa_layers)
     if stacked:
-        return ("kda_conv", "kda_rec", "mla_cache")
+        return ("kda_conv", "kda_rec", "mla_cache") + (("mla_idx",) if dsa else ())
     nk, nm = len(spec.kda_layers), len(spec.mla_layers)
     return (
         tuple(f"kda_conv_{k}" for k in range(nk))
         + tuple(f"kda_rec_{k}" for k in range(nk))
         + tuple(f"mla_cache_{j}" for j in range(nm))
+        + (tuple(f"mla_idx_{j}" for j in range(nm)) if dsa else ())
     )
 
 
@@ -217,6 +239,7 @@ def input_names(
         SMEM_INPUTS
         + vmem
         + HBM_INPUTS
+        + dsa_inputs(spec)
         + head
         + scale_inputs(spec)
         + state_inputs(spec, stacked)
@@ -230,6 +253,18 @@ class StackSpec(msgspec.Struct, frozen=True):
     dims: K3Dims = K3Dims()
     block_size: int = 12  # attn_res_block_size: bank write on layer % block_size == 0
     relax: Relax = Relax()
+    # K3.1: 0-based DSA layers (``dsa_config.dsa_layers``); every one is an MLA layer and, with
+    # index_topk_freq 1, they are all of them (``model_io.dsa_layers`` checks). () = Kimi-K3.
+    dsa_layers: tuple[int, ...] = ()
+    # Weight loading only (``config.MoeLayout.ckpt_blocks``): checkpoint expert block held by each
+    # kernel host (EP-local checkpoints); () = identity.
+    expert_blocks: tuple[int, ...] = ()
+
+    def __post_init__(self):
+        if self.dsa_layers and tuple(self.dsa_layers) != tuple(self.mla_layers):
+            raise ValueError(
+                f"DSA layers {self.dsa_layers} must equal the MLA layers {self.mla_layers}"
+            )
 
     @property
     def kda_layers(self) -> tuple[int, ...]:
@@ -279,6 +314,9 @@ def pack_inputs(spec: StackSpec, w: dict) -> dict:
     put("onorm", spec.kda_layers, w["kda_onorm"])
     put("qnorm", spec.mla_layers, w["mla_qnorm"])
     put("kvnorm", spec.mla_layers, w["mla_kvnorm"])
+    if spec.dsa_layers:
+        put("idx_knorm_w", spec.mla_layers, w["mla_idx_knorm_w"])
+        put("idx_knorm_b", spec.mla_layers, w["mla_idx_knorm_b"])
     moe_layers = range(1, spec.num_layers)
     put("latent_norm", moe_layers, w["latent_norm"])
     put("router_bias", moe_layers, w["router_bias"])
@@ -439,6 +477,7 @@ class StackKernel:
         mla_kv_block_pages: int = 4,
         kda_mxu: bool = False,
         moe_up_tree: bool = False,
+        down_scale_rows: int = 0,
         kda_fast_core: bool = False,
         kda_ckpt_all: bool | str = True,
         fused_head: bool = True,
@@ -448,6 +487,14 @@ class StackKernel:
         verify_mode: str = "loop",
         prefill_blocks: int = 0,
         capture_mixture: bool = False,
+        dsa_select: bool = True,
+        dsa_capacity: int = 16384,
+        dsa_contiguous: bool = True,
+        dsa_slots: int = 4,
+        dsa_early: bool = True,
+        dsa_sel_bits: int = 4,
+        dsa_compact: bool = True,
+        mla_score_f32: bool | None = None,
     ):
         """SMEM ``meta`` = [kv_len, KDA state row]; ``pages`` is the request's page table
         padded to a multiple of 16 entries.
@@ -624,6 +671,7 @@ class StackKernel:
             fast_topk=moe_fast_topk,
             single_rows=moe_single_rows,
             down_dequant=moe_down_dequant,
+            down_scale_rows=down_scale_rows,
             debug=frozenset(x for x in moe_debug.split(",") if x)
             | frozenset(k for k in debug_skip if k.startswith("moe_")),
         )
@@ -645,8 +693,54 @@ class StackKernel:
             kv_window=mla_kv_window,
             block_pages=mla_kv_block_pages,
             rows=self.R,
+            dsa=bool(spec.dsa_layers),
         )
         self.kda.skip_core = self.mla.skip_core = "attn_core" in debug_skip
+        # DSA defaults (fastest on the 13L TP8 8k proxy): dsa_contiguous (identity page table: one
+        # DMA per 16-page scoring block; the index pool is padded to whole blocks), dsa_compact
+        # (u8[pages, 33, 4, 128] index keys: half the bytes of the native record), dsa_slots 4,
+        # dsa_sel_bits 4, dsa_early (DMAs before w1). dsa_contiguous needs an identity page table
+        # (standalone engine, kernel-owned pools); pass False for real paged tables.
+        # K3.1 DSA (spec.dsa_layers): the indexer stage (stages/dsa.py) selects the top-2048
+        # keys per row as a mask on the dense MLA (``MlaStage._dsa_select``); ``dsa_select=False`` keeps
+        # dense MLA over every key (exact while kv_len <= 2048; index keys are then not written).
+        # ``dsa_capacity``: tokens of the score scratch (>= the engine's capacity). ``mla_score_f32``
+        # (default: on with DSA): f32 attention scores as native sparse MLA.
+        self.dsa = None
+        # Index-key pool page shape and page multiple (``model_io.state_shapes``).
+        self.idx_page_shape, self.idx_pool_multiple = IDX_PAGE_SHAPE, 1
+        if spec.dsa_layers:
+            self.mla.score_f32 = True if mla_score_f32 is None else mla_score_f32
+            if dsa_select:
+                from sglang_tpu.k3_megakernel.kernel.stages.dsa import DsaStage
+
+                self.dsa = DsaStage(
+                    rows=self.R,
+                    capacity=dsa_capacity,
+                    contiguous=dsa_contiguous,
+                    slots=dsa_slots,
+                    sel_bits=dsa_sel_bits,
+                    compact=dsa_compact,
+                )
+                self.idx_page_shape = self.dsa.page_shape
+                # contiguous scoring DMAs: the index pool is padded to whole scoring blocks
+                self.idx_pool_multiple = self.dsa.bp if dsa_contiguous else 1
+                self.dsa.early = (
+                    dsa_early  # DMAs / idx_qb before w1, gather overlaps the q path
+                )
+                self.mla.dsa_stage = self.dsa
+                lanes = topo.lanes
+                self._idx_cols = 4096 // lanes  # this lane's index heads x 128
+                self._idx_qb_chunk = _IDX_QB_CHUNK
+                self.dsa_gather = AllGatherSpec(
+                    Topology(1, lanes),
+                    self.R,
+                    transport=jnp.bfloat16,
+                    cols=self._idx_cols,
+                    by_cols=self.R > 1,
+                )
+        elif mla_score_f32:
+            self.mla.score_f32 = True
         # Remote copies to other hosts issued first (issue order only, same bits).
         collectives.FAR_FIRST[0] = far_first
         # Verify rows + pair_oproj: one host gather of both o_proj halves.
@@ -688,7 +782,7 @@ class StackKernel:
                 stream_slots = {"attn_out": parts, **(stream_slots or {})}
             else:
                 stream_slots = {"attn_out": 3, **(stream_slots or {})}
-        self.w1_split = W1Split(topo.lanes) if mla_w1_split else None
+        self.w1_split = W1Split(topo.lanes, ml.rep) if mla_w1_split else None
         self.w1_gather = (
             AllGatherSpec(
                 Topology(1, topo.lanes), flat_rows(self.R, self.w1_split.width)
@@ -714,12 +808,12 @@ class StackKernel:
         stream_slots = {**(moe_stream_slots or {}), **(stream_slots or {})}
         chunks = {}
         if self.w1_split is None:
-            uses.append(("mla_w1", d.hidden, REPLICATED + ml.hd))
+            uses.append(("mla_w1", d.hidden, ml.rep + ml.hd))
         else:
             # Same K-chunks as the unsplit w1, so every column accumulates in the same order.
             budget = stream_budgets.get("mla_w1", stream_budget)
             c0 = stream_chunk(
-                d.hidden, REPLICATED + ml.hd, jnp.dtype(rx.dense_dtype).itemsize, budget
+                d.hidden, ml.rep + ml.hd, jnp.dtype(rx.dense_dtype).itemsize, budget
             )
             uses += [
                 ("mla_w1", d.hidden, self.w1_split.width),
@@ -846,7 +940,7 @@ class StackKernel:
             ((ring, d.latent, 2 * li), jnp.float8_e4m3fn),
             ((ring, 1, 2 * li), jnp.float32),
             ((ring, li // 2, d.latent), jnp.uint8),
-            ((ring, li // 32, d.latent), jnp.uint8),
+            ((ring, self.moe.down_scale_rows, d.latent), jnp.uint8),
         ]
 
     def _mla_arena_shapes(self):
@@ -1054,6 +1148,17 @@ class StackKernel:
         s["w1_gather"] = (
             self.w1_gather.scratch_shapes() if self.w1_split is not None else []
         )
+        s["dsa"] = (
+            self.dsa.scratch()
+            + [
+                # mla_idx_qb stream: [1536, cols] in _IDX_QB_CHUNK-row K-chunks, 2 slots
+                pltpu.VMEM((2, self._idx_qb_chunk, self._idx_cols), jnp.bfloat16),
+                pltpu.SemaphoreType.DMA((2,)),
+            ]
+            + self.dsa_gather.scratch_shapes()
+            if self.dsa is not None
+            else []
+        )
         s["attn_out"] = (
             self.kda.out.scratch_shapes() if self.spec.relax.pair_oproj else []
         )
@@ -1142,6 +1247,13 @@ class StackKernel:
             self._w1_start = pl.multiple_of(self.w1_split.start_block(lane) * 128, 128)
             self._w1_gather = AllGather(self.w1_gather, me, *sc["w1_gather"])
             self._w1_gather.init()
+        if self.dsa is not None:
+            d_sc = sc["dsa"]
+            n_st = len(self.dsa.scratch())
+            gather = AllGather(self.dsa_gather, me, *d_sc[n_st + 2 :])
+            gather.init()
+            self.dsa.attach(d_sc[:n_st], qb_refs=d_sc[n_st : n_st + 2], gather=gather)
+            self.dsa.last_run = None
         x0_copy = None
         if self.fused_head:
             self._x0_v, x0_sem, head_sems, *exchange = sc["head"]
@@ -1206,10 +1318,14 @@ class StackKernel:
                 [r["kda_rec"]],
                 [r["mla_cache"]],
             )
+            self._idx_pools = [r["mla_idx"]] if self.spec.dsa_layers else None
         else:
             conv_pools = [r[f"kda_conv_{k}"] for k in range(nk)]
             rec_pools = [r[f"kda_rec_{k}"] for k in range(nk)]
             self._mla_pools = [r[f"mla_cache_{j}"] for j in range(nm)]
+            self._idx_pools = (
+                [r[f"mla_idx_{j}"] for j in range(nm)] if self.spec.dsa_layers else None
+            )
         self._state = _KdaStateIO(
             conv_pools,
             rec_pools,
@@ -1367,7 +1483,7 @@ class StackKernel:
         if key == "mla_w1" and self.w1_split is not None:
             cols = (self._w1_start, self.w1_split.width)
         elif key == "mla_g":
-            name, cols = "mla_w1", (REPLICATED, self.mla.hd)
+            name, cols = "mla_w1", (self.mla.rep, self.mla.hd)
         st = self._stream(key, name, idx, cols=cols)
         return (
             self._stream(key, name, idx, prefetched=st.slots, cols=cols)
@@ -1623,6 +1739,20 @@ class StackKernel:
             self._wsem,
             self._oacc_v,
             self._attn_out,
+            dsa=self._dsa_refs(l, j),
+        )
+
+    def _dsa_refs(self, l, j):
+        """K3.1: this DSA layer's index-key pools, wq_b slice and key LayerNorm (``stages.mla.DsaRefs``)."""
+        if not self.spec.dsa_layers:
+            return None
+        r = self._r
+        return DsaRefs(
+            self._idx_pools,
+            r["mla_idx_qb"],
+            r.get("mla_idx_qb_s"),
+            self._vec(l, "idx_knorm_w")[...],
+            self._vec(l, "idx_knorm_b")[...],
         )
 
     def _in_norm(self, x, w):
@@ -1970,7 +2100,11 @@ class StackKernel:
             **{n: pltpu.VMEM for n in VMEM_INPUTS},
             **{
                 n: pltpu.HBM
-                for n in HBM_INPUTS + HEAD_INPUTS + scale_inputs(spec) + states
+                for n in HBM_INPUTS
+                + dsa_inputs(spec)
+                + HEAD_INPUTS
+                + scale_inputs(spec)
+                + states
             },
         }
         if (

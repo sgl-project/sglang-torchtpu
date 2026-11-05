@@ -111,13 +111,22 @@ class TestTpuOOTPlatformContract(CustomTestCase):
                 calls.prepare,
             ),
             patch("sglang_tpu.kimi_k3.static_fp8.bind_static_fp8", calls.bind),
+            patch(
+                "sglang_tpu.kimi_k3.logits_gather.bind_logits_allreduce_gather",
+                calls.logits,
+            ),
+            patch("sglang_tpu.kimi_k3.param_layout.store_decode_params", calls.store),
         ):
             self.platform.process_model_after_loading(torch.nn.Linear(1, 1))
             self.assertEqual(calls.mock_calls, [])
             model = KimiK3LinearForCausalLM.__new__(KimiK3LinearForCausalLM)
             self.platform.process_model_after_loading(model)
-        # The fp8 binder releases weights, so it runs last.
-        self.assertEqual([c[0] for c in calls.mock_calls], ["prepare", "bind"])
+        # The fp8 binder releases weights, so it runs after the attn-res prep;
+        # store_decode_params only touches the KDA o_norm weights it keeps; the
+        # logits gather binder only wraps the logits processor.
+        self.assertEqual(
+            [c[0] for c in calls.mock_calls], ["prepare", "bind", "logits", "store"]
+        )
         self.assertTrue(all(c.args == (model,) for c in calls.mock_calls))
         self.assertFalse(self.platform.is_cuda())
         self.assertFalse(self.platform.is_cpu())

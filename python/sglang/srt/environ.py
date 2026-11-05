@@ -1466,6 +1466,9 @@ class Envs:
     # Shard the DFLASH draft's context projection (K * hidden -> hidden) across TP by its
     # input dim instead of replicating it; same math plus one all-reduce.
     SGLANG_DFLASH_ROW_PARALLEL_FC = EnvBool(False)
+    # Shard it by its output dim instead and all-gather the projected rows: no extra
+    # reduction. Not bitwise vs the replicated fc (K summation order, bf16 output rounding).
+    SGLANG_DFLASH_COLUMN_PARALLEL_FC = EnvBool(False)
     # DFlash2 conv on flat [tokens, hidden] rows, the per-group deltas widened to channels
     # by one exact 0/1 matmul per sublayer; needs groups to be a multiple of 128.
     SGLANG_DFLASH_CONV_MATMUL_EXPAND = EnvBool(False)

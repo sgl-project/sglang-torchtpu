@@ -26,6 +26,7 @@ commit, and regenerating must not restate it.
 
 import argparse
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -119,7 +120,8 @@ def render(config_module: str, profile_name: str) -> str:
     ]
     env = extra_runtime_env(config.get("runtime_env", {}))
     for name, value in sorted(env.items()):
-        lines.append(f"export {name}={value}")
+        # Quoted: a value such as LIBTPU_INIT_ARGS holds spaces.
+        lines.append(f"export {name}={shlex.quote(str(value))}")
     if env:
         lines.append("")
     lines.append("python3 -m sglang.launch_server \\")

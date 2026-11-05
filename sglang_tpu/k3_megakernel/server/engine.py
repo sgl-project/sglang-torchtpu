@@ -141,6 +141,8 @@ class Engine:
             raise ValueError(
                 f"--kernel-opt {refused}: benchmark-only, runtime-set or unsupported in serving"
             )
+        if self.spec.dsa_layers:  # DSA score scratch covers the request slot
+            kw["dsa_capacity"] = capacity
         self.kernel = StackKernel(self.spec, **kw)
         pkw = {
             k: v
