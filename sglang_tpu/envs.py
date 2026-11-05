@@ -273,6 +273,11 @@ class TpuEnvs:
     # image buckets halted the TPU during warmup.
     SGLANG_TPU_VISION_FLASH_BLOCK_Q = EnvInt(0)
     SGLANG_TPU_VISION_FLASH_BLOCK_Q_MAX_SEQ = EnvInt(4096)
+    # Vision encoder flash attention: compute only the key chunks whose segments
+    # meet each query block (band-skip kernel). Byte-identical to the dense
+    # kernel at the shapes it covers (kv_len 3072-12288 at a 256-row q tile,
+    # 16384 at the default 128); other shapes keep the dense kernel.
+    SGLANG_TPU_VISION_FLASH_BAND_SKIP = EnvBool(False)
 
     # Largest decode batch (tokens) that `--moe-runner-backend pallas_tpu_fused_decode`
     # runs with the fused MoE decode kernel (`sglang_tpu/moe/pallas/fused_moe_decode`);
@@ -392,6 +397,15 @@ class TpuEnvs:
     # of the request. Off keeps the extend graph and the serving path exactly as
     # they are today, and a request asking for prompt logprobs is rejected.
     SGLANG_TPU_ENABLE_PROMPT_LOGPROB = EnvBool(False)
+    # Cut the eager input-logprob chunks of a forward holding one request at every
+    # multiple of this many rows from the request's first row (hooks/logprob_grid.py),
+    # so a prefill chunk larger than the grid hands the epilogue the same row sets as
+    # grid-sized chunks. 0 registers no hook.
+    SGLANG_TPU_LOGPROB_GRID_ROWS = EnvInt(0)
+    # Put each request's logit row on ForwardBatch.logit_rows before every plain
+    # EXTEND forward (compilation/logit_rows.py), for models that run their last
+    # layer on those rows only. Off leaves the field None.
+    SGLANG_TPU_FOUR_STAGE_LOGIT_ROWS = EnvBool(False)
     # Preserve FP32 expert scales and apply GMM partial scales in FP32.
     SGLANG_TPU_FP8_MOE_FP32_SCALES = EnvBool(False)
     # Store INT4 MoE group scales as f32 instead of bf16 (66 MB per layer per
