@@ -3,6 +3,7 @@ inputs Wan feeds its blocks, the fusion barrier and the per-request drain."""
 
 import contextlib
 import inspect
+import itertools
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -313,16 +314,18 @@ class TestWanBlockCompilesAsOneGraph(unittest.TestCase):
 
 class TestDrainAfterRequest(unittest.TestCase):
     """When the platform asks, every rank drains its device queue after each
-    request whose forward returned; on TPU a skipped drain hung the next one."""
+    request whose forward returned, warmups included. On TPU a skipped drain
+    hung Wan2.2-A14B's second warmup request on the ranks that do not return
+    the output."""
 
-    def _serve(self, *, drain, forward, num_requests):
+    def _serve(self, *, drain, forward, num_requests, output_rank=True, warmup=False):
         events = []
         worker = gpu_worker.GPUWorker.__new__(gpu_worker.GPUWorker)
         worker.pipeline = SimpleNamespace(
             forward=lambda req, server_args: (events.append("forward"), forward())[1]
         )
         worker.server_args = SimpleNamespace()
-        worker.is_output_rank = True
+        worker.is_output_rank = output_rank
         worker._release_warmup_pool_before_serving = False
         worker._realtime_sessions = SimpleNamespace(attach=lambda _req: None)
         requests = [
@@ -333,6 +336,9 @@ class TestDrainAfterRequest(unittest.TestCase):
             )
             for i in range(num_requests)
         ]
+        if warmup:
+            for req in requests:
+                req.set_as_warmup()
         platform = gpu_worker.current_platform
         with (
             patch.object(platform, "is_cpu", return_value=True),
@@ -349,11 +355,18 @@ class TestDrainAfterRequest(unittest.TestCase):
         return events, outputs
 
     def test_every_finished_forward_drains_when_the_platform_asks(self):
-        for drain, expected in ((True, ["forward", "drain"]), (False, ["forward"])):
-            with self.subTest(drain=drain):
+        for drain, output_rank, warmup in itertools.product(
+            (True, False), (True, False), (False, True)
+        ):
+            with self.subTest(drain=drain, output_rank=output_rank, warmup=warmup):
                 events, _ = self._serve(
-                    drain=drain, forward=OutputBatch, num_requests=2
+                    drain=drain,
+                    forward=OutputBatch,
+                    num_requests=2,
+                    output_rank=output_rank,
+                    warmup=warmup,
                 )
+                expected = ["forward", "drain"] if drain else ["forward"]
                 self.assertEqual(events, expected * 2)
 
     def test_a_failed_forward_returns_its_error_without_a_drain(self):
