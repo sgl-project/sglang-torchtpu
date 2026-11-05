@@ -91,6 +91,8 @@ class TestFusionBarrier(unittest.TestCase):
 
     def test_wan_ffn_runs_the_barrier_between_the_activation_and_fc_out(self):
         calls = []
+        fc_out_inputs = []
+        barrier_out = torch.full((2,), 7.0)
 
         def step(name, value):
             calls.append(name)
@@ -98,7 +100,7 @@ class TestFusionBarrier(unittest.TestCase):
 
         mlp = SimpleNamespace(
             fc_in=lambda x: (step("fc_in", x), None),
-            fc_out=lambda x: (step("fc_out", x), None),
+            fc_out=lambda x: (fc_out_inputs.append(x), (step("fc_out", x), None))[1],
             _apply_activation=lambda x, bias, use_fused_bias_gelu: step("act", x),
         )
         with (
@@ -107,11 +109,13 @@ class TestFusionBarrier(unittest.TestCase):
             patch.object(
                 wanvideo.current_platform,
                 "fusion_barrier",
-                side_effect=lambda x: step("barrier", x),
+                side_effect=lambda x: (step("barrier", x), barrier_out)[1],
             ),
         ):
             wanvideo._WanGELUMLP.forward(mlp, torch.ones(2))
         self.assertEqual(calls, ["fc_in", "act", "barrier", "fc_out"])
+        # A compiler drops a barrier whose result is unused.
+        self.assertIs(fc_out_inputs[0], barrier_out)
 
 
 class _Stop(Exception):
