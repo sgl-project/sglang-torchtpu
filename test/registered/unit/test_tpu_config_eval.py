@@ -254,6 +254,27 @@ class TestAccuracyRecipes(unittest.TestCase):
         self.assertEqual(declared, set(self.MULTIHOST))
 
 
+class TestKimiK3Recipes(unittest.TestCase):
+    def test_host_launch_switches_stay_on_the_k31_native_decode(self):
+        """The host-side decode launch switches and the VMEM right-size were
+        validated only on the Kimi-K3.1 per-op native decode (the right-size
+        changes Kimi-K3's greedy output); no Kimi-K3 recipe may set them."""
+        from benchmark.tpu.recipe.configs.kimi_k3_1.server import (
+            NATIVE_DECODE_HOST_ENV,
+        )
+
+        self.assertEqual(len(NATIVE_DECODE_HOST_ENV), 4)
+        native = load_recipe("recipe/configs/kimi_k3_1/server.py")
+        for key, value in NATIVE_DECODE_HOST_ENV.items():
+            self.assertEqual(native["runtime_env"][key], value)
+        for recipe in ("server.py", "server_mk.py", "dspark.py", "dspark_mk.py"):
+            with self.subTest(recipe=recipe):
+                config = load_recipe(f"recipe/configs/kimi_k3/{recipe}")
+                self.assertFalse(
+                    set(NATIVE_DECODE_HOST_ENV) & set(config["runtime_env"])
+                )
+
+
 class TestWorkloadProfiles(unittest.TestCase):
     """A profile sizes a workload; it must not restate how a model is served."""
 
@@ -295,6 +316,7 @@ class TestRenderedCookbookCommands(unittest.TestCase):
     PAGES = (
         "docs/cookbook/autoregressive/OpenAI/GPT-OSS.mdx",
         "docs/cookbook/autoregressive/Moonshotai/Kimi-K3.mdx",
+        "docs/cookbook/autoregressive/Moonshotai/Kimi-K3.1-Pro.mdx",
     )
 
     def test_generated_blocks_parse_as_server_args(self):

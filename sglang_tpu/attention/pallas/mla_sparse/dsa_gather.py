@@ -196,12 +196,13 @@ def main_kernel(
     )(indices_hbm_ref, valid_indices_ref)
 
 
-@functools.partial(jax.jit)
+@functools.partial(jax.jit, static_argnames=("num_row_subchunks",))
 def dsa_gather(
     nope_cache: jax.Array,
     rope_cache: jax.Array,
     indices: jax.Array,
     num_valid_indices: jax.Array | None = None,
+    num_row_subchunks: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Fused SparseCore gather of the nope and rope caches.
 
@@ -216,6 +217,9 @@ def dsa_gather(
       indices: (N,) int32. Token indices into the caches.
       num_valid_indices: Optional (1,) or scalar int32. Number of valid indices
         to gather. Subcores assigned to indices beyond this count skip gathering.
+      num_row_subchunks: Subchunks of `num_lanes` rows each subcore gathers per
+        block; a multiple of 4. None picks the smallest block that covers N,
+        up to 32 subchunks.
 
     Returns:
       nope_out: (N, WORD_BYTES, TILE_LANE_BYTES) uint8. Each token's nope tile
@@ -259,7 +263,15 @@ def dsa_gather(
     # pipeline step to keep multiple gather DMAs in flight.
     # See `outer_pipeline` for details.
     num_streams = 4
-    num_row_subchunks = 32
+    if num_row_subchunks is None:
+        # Each subcore owns num_row_subchunks * num_lanes consecutive rows, so
+        # a block bigger than out_size leaves subcores idle: with 32 subchunks a
+        # decode step's 2048 rows would all land on 4 of the 32 subcores.
+        num_row_subchunks = num_streams
+        while num_row_subchunks < 32 and (
+            row_subchunk_size * num_row_subchunks * num_cores < out_size
+        ):
+            num_row_subchunks *= 2
     assert num_row_subchunks % num_streams == 0, (
         f"{num_streams=} must divide {num_row_subchunks=}."
     )

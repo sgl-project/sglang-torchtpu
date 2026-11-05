@@ -11,9 +11,14 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
+from sglang_tpu.hooks.all_gather_via_all_reduce import all_gather_into_tensor
 from sglang_tpu.hooks.attn_residual import register_attn_residual_ops
 from sglang_tpu.hooks.attn_tp import device_supports_input_scattered
 from sglang_tpu.hooks.cpu_pinning import bind_rank_cpu_set, pin_scheduler_main_thread
+from sglang_tpu.hooks.dflash_mla import (
+    dflash_mla_head_dims,
+    select_dflash_mla_attention,
+)
 from sglang_tpu.hooks.draft_kv_pool import (
     draft_cell_size_per_token,
     draft_mha_pool_class,
@@ -43,11 +48,13 @@ from sglang_tpu.hooks.k3_megakernel import (
     load_k3_non_layer_weights,
     prepare_k3_capture_kernels,
     skip_k3_decoder_layers,
+    skip_k31_indexer_load_check,
 )
 from sglang_tpu.hooks.kda_weights import (
     bind_glm5_next_kda_weights,
     rehome_kimi_k3_kda_weights,
 )
+from sglang_tpu.hooks.kimi_k3_latent_up import kimi_k3_latent_up_tail_add3
 from sglang_tpu.hooks.kimi_k3_vision import (
     attach_k3_vision_runner,
     bind_k3_vision_runner,
@@ -81,6 +88,9 @@ from sglang_tpu.hooks.swa_miss_metrics import hook_specs as swa_miss_metrics_hoo
 from sglang_tpu.hooks.twolevel_allreduce import all_reduce as twolevel_all_reduce
 from sglang_tpu.hooks.twolevel_allreduce import (
     merged_moe_all_reduce as twolevel_merged_moe_all_reduce,
+)
+from sglang_tpu.hooks.twolevel_allreduce import (
+    row_parallel_linear_forward as twolevel_row_parallel_linear_forward,
 )
 
 logger = logging.getLogger(__name__)
@@ -167,6 +177,11 @@ HOOKS: list[tuple] = [
         "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
         attach_k3_megakernel,
         HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM._check_dsa_indexer_loaded",
+        skip_k31_indexer_load_check,
+        HookType.AROUND,
     ),
     (
         "sglang.srt.models.kimi_k3.KimiK3LinearModel.forward",
@@ -260,8 +275,23 @@ HOOKS: list[tuple] = [
         HookType.AROUND,
     ),
     (
+        "sglang.srt.distributed.parallel_state.GroupCoordinator.all_gather_into_tensor",
+        all_gather_into_tensor,
+        HookType.AROUND,
+    ),
+    (
         "sglang.srt.models.kimi_k3.merged_moe_all_reduce",
         twolevel_merged_moe_all_reduce,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.kimi_k3._add3",
+        kimi_k3_latent_up_tail_add3,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.layers.linear.RowParallelLinear.forward",
+        twolevel_row_parallel_linear_forward,
         HookType.AROUND,
     ),
     (
@@ -293,6 +323,16 @@ HOOKS: list[tuple] = [
         "sglang.srt.speculative.dflash_utils.dflash_draft_cell_size_per_token",
         draft_cell_size_per_token,
         HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.dflash.DFlashDecoderLayer.__init__",
+        select_dflash_mla_attention,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.configs.model_config.ModelConfig._derive_model_shapes",
+        dflash_mla_head_dims,
+        HookType.AFTER,
     ),
     (
         "sglang.srt.speculative.spec_tp_sync.SpecTpSync.sync",

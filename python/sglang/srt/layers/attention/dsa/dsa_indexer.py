@@ -233,6 +233,26 @@ def _make_eager_idle_topk_result(
     )
 
 
+def _check_indexer_variant_supported(skip_rope: bool, apply_hadamard: bool) -> None:
+    """Reject the rope-free / Hadamard-free indexer on the CUDA/ROCm/NPU/XPU paths.
+
+    Kimi-K3.1's indexer (``index_rope_dim=0``, ``index_apply_hadamard=False``,
+    bf16-rounded head gate) is only implemented by the attention backend that
+    overrides ``forward_indexer``. The forwards below would call the absent
+    ``rotary_emb``, apply the Hadamard rotation and skip the bf16 head-gate
+    rounding, so fail at model build instead of crashing (or silently
+    diverging) on the first request.
+    """
+    if not (skip_rope or not apply_hadamard):
+        return
+    if _is_cuda or _is_hip or _is_npu or _is_xpu:
+        raise NotImplementedError(
+            "DSA indexer without RoPE (index_rope_dim=0) or without the Hadamard "
+            "rotation (index_apply_hadamard=False), as used by Kimi-K3.1, is not "
+            "implemented on CUDA/ROCm/NPU/XPU yet."
+        )
+
+
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
@@ -281,6 +301,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         config=None,
     ):
         super().__init__()
+        index_rope_dim = getattr(config, "index_rope_dim", None)
+        if index_rope_dim is not None:
+            rope_head_dim = index_rope_dim
+        self.skip_rope = rope_head_dim == 0
+        self.apply_hadamard = getattr(config, "index_apply_hadamard", True)
+        # Without the Hadamard rotation the reference rounds the head gate
+        # (weights_proj(x) * n_heads**-0.5) to bf16 before the fp32 q-scale fold.
+        self.bf16_head_gate = not self.apply_hadamard
+        _check_indexer_variant_supported(self.skip_rope, self.apply_hadamard)
+        k_norm_eps = getattr(config, "index_k_norm_eps", None)
         self.hidden_size = hidden_size
         self.n_heads = index_n_heads
         self.head_dim = index_head_dim
@@ -295,6 +325,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             _is_cuda
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
             and not is_neox_style
+            and not self.skip_rope
         )
         index_k_uses_rmsnorm = (
             config is not None
@@ -307,6 +338,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
         self.use_aiter_fused_fp8_writer = (
             aiter_fused_fp8_requested
+            and not self.skip_rope
             and not index_k_uses_rmsnorm
             and fused_fp8_writer_geometry_supported(
                 self.head_dim, self.rope_head_dim, self.block_size
@@ -356,8 +388,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 params_dtype=torch.bfloat16,
                 prefix=add_prefix("weights_proj", prefix),
             )
+        k_norm_eps_kwargs = {} if k_norm_eps is None else {"eps": k_norm_eps}
         if index_k_uses_rmsnorm:
-            self.k_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim, **k_norm_eps_kwargs)
         else:
             self.k_norm = LayerNorm(
                 self.head_dim,
@@ -366,15 +399,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     if self.use_aiter_fused_fp8_writer
                     else (torch.bfloat16 if _use_aiter else torch.float32)
                 ),
+                **k_norm_eps_kwargs,
             )
-        self.rotary_emb = get_rope_wrapper(
-            rope_head_dim,
-            rotary_dim=rope_head_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,  # type: ignore
-            rope_scaling=rope_scaling,
-            is_neox_style=is_neox_style,
-            device=get_device().device,
+        self.rotary_emb = (
+            None
+            if self.skip_rope
+            else get_rope_wrapper(
+                rope_head_dim,
+                rotary_dim=rope_head_dim,
+                max_position=max_position_embeddings,
+                base=rope_theta,  # type: ignore
+                rope_scaling=rope_scaling,
+                is_neox_style=is_neox_style,
+                device=get_device().device,
+            )
         )
         if self.use_aiter_fused_fp8_writer and not (
             hasattr(self.rotary_emb, "cos_cache")

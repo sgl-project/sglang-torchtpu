@@ -35,8 +35,8 @@ from sglang_tpu._logging import get_logger as init_logger
 # whose accounting decides what it may declare.
 from sglang_tpu.moe.pallas.fused_moe_v2 import host
 
-# The clamped GPT-OSS activation is the grouped-matmul kernel's own tested
-# implementation, called here rather than copied.
+# The clamped activations are copied from vLLM-TorchTPU's grouped-matmul
+# kernel (kernels/megablox/gmm_v2.py) into activations.py.
 from sglang_tpu.moe.pallas.fused_moe_v2.activations import (
     silu_and_mul_with_clamp,
     swigluoai,
@@ -67,8 +67,7 @@ FP4_OUTPUT_CHUNK = 256
 # an expert's short tail tile stops computing a full tile_m of rows nothing
 # will commit. Every rung is another copy of the body in the program text --
 # which is why this is a handful of heights and not one per ROWBLK -- and the
-# top rung is always tile_m, so a full tile is unchanged. Overridable per
-# process by MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE, read at BUILD time.
+# top rung is always tile_m, so a full tile is unchanged.
 HEIGHT_RUNGS = 4
 # DMA priority the weight refills take, so that they stay off the in-order
 # queue the token gather issues on.
@@ -96,11 +95,10 @@ N_VISIT_TABLES = 1  # the visit list; its count is a row of the table below
 N_COUNT_TABLES = 1  # shard_count_vector: [N_COUNTS, ep] i32
 # This shard's index along the expert-parallel axis, as an i32[1] operand.
 # Upstream reads it with `lax.axis_index`, which lowers to `partition-id`;
-# vllm-torchtpu reaches this kernel through torch_tpu's `jax.export` bridge,
-# which recompiles the serialized module and whose SPMD partitioner rejects
-# that instruction ("partitionId instruction is not supported for SPMD
-# partitioning"). Passing the index as data is what the PCP streaming kernels
-# in this tree already do for the same reason.
+# SGLang reaches this kernel through `sglang_tpu.pallas_jax_op`'s `jax.export`
+# bridge, which torch_tpu recompiles and whose SPMD partitioner rejects that
+# instruction ("partitionId instruction is not supported for SPMD
+# partitioning"). vLLM-TorchTPU passes the index as data for the same reason.
 N_RANK_TABLES = 1
 N_PREFETCH = (
     N_TRANSPORT_TABLES
@@ -849,7 +847,7 @@ def _build_fused_ep_moe_kernel(
         #   recv_row_off == push_dst << ROWBLK_SHIFT -- `recv_base` is a cumsum
         #     of ALIGNED run lengths, so the row offset is the block offset in
         #     rows. Asserted over eight shards and several routings by
-        #     tests/kernels/fused_moe/test_fused_ep_moe_v2_tables.py; that test
+        #     test/registered/tpu/unit/test_fused_ep_moe_v2_tables.py; that test
         #     is what keeps this derivation honest if recv_base ever changes to
         #     track true lengths.
         (commit_start_sm, commit_len_sm, contrib_off_sm, push_dst_sm) = (

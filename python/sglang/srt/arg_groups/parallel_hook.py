@@ -213,7 +213,10 @@ def handle_shared_experts_tp(server_args: Any):
             "--shared-experts-tp-size requires a Kimi-K3 model configuration."
         )
     model_arch = model_config_of(server_args).hf_config.architectures[0]
-    if model_arch != "KimiK3ForConditionalGeneration":
+    if model_arch not in (
+        "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
+    ):
         raise ValueError("--shared-experts-tp-size is only supported for Kimi-K3.")
     if cfg.moe_a2a_backend not in (
         "deepep",

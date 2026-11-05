@@ -1,4 +1,4 @@
-"""Nightly prefetch must reach every pod, including both P/D roles."""
+"""CI prefetch must reach every pod, including both P/D roles."""
 
 import json
 import os
@@ -59,14 +59,10 @@ class TestCheckpointPrefetch(unittest.TestCase):
             ),
         )
         for mode in modes:
-            for nightly, expected in (
-                ((), "0"),
-                (("--nightly",), "1"),
-                (("--lane", "nightly"), "1"),
-            ):
+            for nightly in ((), ("--nightly",), ("--lane", "nightly")):
                 with self.subTest(mode=mode, nightly=bool(nightly)):
                     values = self.pod_settings(renderer, *mode, *nightly)
-                    self.assertEqual(values, [expected] * len(values))
+                    self.assertEqual(values, ["1"] * len(values))
                     self.assertEqual(len(values), 2 if "--exec" in mode else 1)
 
     def test_external_nightly_all_launch_modes(self):

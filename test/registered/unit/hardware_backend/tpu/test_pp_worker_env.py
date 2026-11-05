@@ -157,6 +157,7 @@ class TestPipelineGroupCommunicators(CustomTestCase):
         world = Mock()
         world.device_group = Mock()
         world.local_rank = 0
+        world.world_size = 8
         with (
             # initialize_model_parallel reads the widths from the published config.
             published_topology(tp_size=1, pp_size=8),

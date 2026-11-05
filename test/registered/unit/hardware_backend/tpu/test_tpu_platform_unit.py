@@ -8,7 +8,7 @@ import os
 import sys
 import unittest
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.compiler.config as compiler_config
@@ -17,6 +17,7 @@ from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.arg_groups.parallel_hook import handle_elastic_ep
 from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.arg_groups.serving_hook import handle_other_validations
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -24,12 +25,15 @@ from sglang.srt.model_executor.cuda_graph_config import (
     default_cuda_graph_config,
 )
 from sglang.srt.platforms.device_mixin import PlatformEnum
+from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.dp_replicas import ReplicaSession
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+from sglang_tpu.replica_group import ReplicaGroupCoordinator
 from sglang_tpu.tpu_platform import (
     TpuSRTPlatform,
     _validate_decode_context_parallel,
@@ -217,6 +221,7 @@ class TestTpuPlatformInitialization(CustomTestCase):
                 "sglang_tpu.tpu_platform.traced_rank._load",
                 side_effect=lambda: calls.append(("traced_rank", None)),
             ),
+            patch("sglang_tpu.tpu_platform._register_models"),
         ):
             self.platform.init_backend()
 
@@ -239,12 +244,11 @@ class TestTpuPlatformInitialization(CustomTestCase):
     def test_reentry_during_model_registration_registers_once(self):
         """init_backend re-entered while registering models (model_runner's OOT import
         hook does this) must not register the TPU models a second time."""
-        registered = []
+        session = MagicMock()
+        self.platform._dp_replica_session = session
 
-        def register(package_name):
-            registered.append(package_name)
-            if len(registered) == 1:
-                self.platform.init_backend()
+        def register():
+            self.platform.init_backend()
 
         with (
             patch.dict(os.environ, {"WORLD_SIZE": "1"}, clear=False),
@@ -257,13 +261,51 @@ class TestTpuPlatformInitialization(CustomTestCase):
             patch("sglang_tpu.tpu_platform.rank_slice._load"),
             patch("sglang_tpu.tpu_platform.traced_rank._load"),
             patch(
-                "sglang.srt.models.registry.ModelRegistry.register_lazy",
+                "sglang_tpu.tpu_platform._register_models",
                 side_effect=register,
-            ),
+            ) as register_models,
         ):
             self.platform.init_backend()
 
-        self.assertEqual(registered, ["sglang_tpu.models"])
+        register_models.assert_called_once_with()
+        session.initialize.assert_called_once_with()
+        session.initialize.return_value.__enter__.assert_called_once_with()
+        session.initialize.return_value.__exit__.assert_called_once_with(
+            None, None, None
+        )
+        self.assertIsNone(self.platform._dp_replica_session)
+
+    def test_replicas_reject_a_shared_trainer_slice_before_native_setup(self):
+        self.platform._dp_replica_session = ReplicaSession(1, 2, 4, 2, device=4)
+        with (
+            patch.dict(
+                os.environ,
+                {"RANK": "0", "WORLD_SIZE": "4", "SGLANG_TPU_SHARED_SLICE": "4,16,h:1"},
+            ),
+            patch("sglang_tpu.shared_slice.enter_slice_env") as enter_slice,
+            patch("sglang_tpu.patches._prepare_tpu_env") as prepare,
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "cannot share a slice with a trainer"
+            ):
+                self.platform.init_backend()
+            self.assertEqual(os.environ["RANK"], "0")
+            self.assertEqual(os.environ["WORLD_SIZE"], "4")
+        enter_slice.assert_not_called()
+        prepare.assert_not_called()
+
+
+class TestTpuReplicaGroupSelection(CustomTestCase):
+    def test_replica_coordinator_requires_active_session(self):
+        platform = TpuSRTPlatform()
+        session = ReplicaSession(1, 2, 4, 2, device=6)
+        with patch("sglang_tpu.dp_replicas._active_session", None):
+            self.assertIs(platform.get_group_coordinator_cls(), GroupCoordinator)
+        with patch("sglang_tpu.dp_replicas._active_session", session):
+            self.assertIs(platform.get_group_coordinator_cls(), ReplicaGroupCoordinator)
+
+    def test_default_platform_leaves_group_creation_to_sglang(self):
+        self.assertIs(SRTPlatform().get_group_coordinator_cls(), GroupCoordinator)
 
 
 class TestTpuCompileCache(CustomTestCase):
@@ -388,6 +430,8 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             attn_cp_size=1,
             enable_prefill_cp=False,
             enable_hierarchical_cache=False,
+            enable_page_major_kv_layout=False,
+            enable_unified_memory=False,
             tpu_compile_tracer="dynamo",
             json_model_override_args=None,
         )
@@ -928,6 +972,8 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
             use_ray=False,
             hicache_io_backend=None,
             max_total_tokens=None,
+            enable_page_major_kv_layout=False,
+            enable_unified_memory=False,
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)

@@ -26,6 +26,8 @@ EnvField._allow_set_name = True
 
 
 class TpuEnvs:
+    # Parent-selected rendezvous port for the host-wide DP replica process group.
+    SGLANG_TPU_DP_SESSION_PORT = EnvInt(None)
     # Opt-in, request-tagged benchmark admission (benchmark_batch_gate.py).
     # Zero preserves ordinary scheduling, including continuous batching.
     SGLANG_TPU_BENCHMARK_BATCH_SIZE = EnvInt(0)
@@ -44,11 +46,46 @@ class TpuEnvs:
     # Run those static fp8 GEMVs as one Pallas kernel for decode-sized batches
     # (kernels/static_fp8_gemv.py); False keeps the XLA fp8 dot for every batch.
     SGLANG_TPU_ENABLE_K3_STATIC_FP8_PALLAS_GEMV = EnvBool(True)
+    # Kimi-K3: gather the TP-sharded logits by an all-reduce of a zero-padded
+    # buffer instead of XLA's all-gather (kimi_k3/logits_gather.py); bit-identical.
+    # XLA's all-gather returned wrong logits in the batched-prefill graph of
+    # Kimi-K3.1 at TP32 (wrong first tokens), so this is on by default.
+    SGLANG_TPU_LOGITS_GATHER_ALLREDUCE = EnvBool(True)
+    # Kimi-K3 KDA decode: fence the static fp8 [q, k, v, g] GEMV behind the
+    # b_proj / f_a / f_b GEMVs (an XLA optimization barrier, same values) so
+    # they run while its weight prefetch is in flight (kimi_k3/order_op.py).
+    SGLANG_TPU_K3_KDA_GATES_FIRST = EnvBool(True)
+    # Single-token o_proj input fenced as a [1, K] row (kimi_k3/oproj_row.py).
+    SGLANG_TPU_K3_OPROJ_ROW = EnvBool(False)
+    # Single-token decode logits all-gathered by the one-shot Pallas kernel
+    # instead of XLA's all-gather (kimi_k3/logits_gather.py); bit-identical.
+    SGLANG_TPU_LOGITS_ONESHOT_GATHER = EnvBool(False)
     # Kimi-K3 single-token decode: split the replicated latent down / up-proj
     # and router gate GEMVs by output columns across the ranks of a host and
     # exchange the columns inside the host (host_split_gemv.py). Needs
     # SGLANG_TPU_K3_STATIC_FP8 moe_front and latent_up (checked at startup).
     SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV = EnvBool(False)
+    # Kimi-K3 single-token decode with the host split: the latent up-proj
+    # kernel (end of layer i's MoE) also copies layer i+1's KDA [q, k, v, g]
+    # fp8 weight HBM -> VMEM during its host exchange, so the qkvg GEMV reads it
+    # from VMEM instead of waiting for XLA's late prefetch (TP32: 4.2 us per
+    # KDA layer). Same arithmetic (bit-identical). Weights larger than
+    # SGLANG_TPU_K3_QKVG_PREFETCH_MAX_KIB are not prefetched.
+    SGLANG_TPU_K3_QKVG_PREFETCH = EnvBool(False)
+    SGLANG_TPU_K3_QKVG_PREFETCH_MAX_KIB = EnvInt(16384)
+    # Kimi-K3 single-token decode: the host-split latent up-proj kernel also
+    # does the MoE tail add (up + shared) + prefix and the next layer's
+    # attention-side attention-residual aggregation (latent_up_tail.py). Same
+    # ops, same order. Needs the host split and the attention-residual kernel.
+    SGLANG_TPU_K3_LATENT_UP_ATTN_RES = EnvBool(False)
+    # Decode Pallas kernels (static fp8 GEMV, host-split GEMV, single-token
+    # MoE) request their computed working set as scoped VMEM instead of a
+    # fixed 40-48 MiB, leaving XLA room to prefetch weights across them
+    # (sglang_tpu/kernels/vmem_limit.py). Same kernel source, but a smaller
+    # limit can change Mosaic's tiling of the single-token MoE kernel and with
+    # it the f32 summation order (13L Kimi-K3 greedy differs; Kimi-K3.1 is
+    # bit-identical), so it is off by default and set by the Kimi-K3.1 recipe.
+    SGLANG_TPU_PALLAS_VMEM_RIGHTSIZE = EnvBool(False)
     # MoE: one fused kernel for single-token packed-MXFP4 decode
     # (moe/pallas/single_token_moe.py); False keeps the gmm_v2 path.
     SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL = EnvBool(True)
@@ -58,10 +95,27 @@ class TpuEnvs:
     # FP8 linear: one W8A8 kernel for decode-sized batches (kernels/fp8_linear_small_m.py);
     # False keeps the XLA path.
     SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL = EnvBool(False)
-    # Sparse MLA: pooled-DSA batches of 512+ tokens (prefill) through the
-    # query-blocked kernel (attention/pallas/mla_sparse_qblock.py), which fetches
-    # each block's union of selected pages once; False keeps the per-query kernel.
+    # Sparse MLA: DSA extend batches of 512+ tokens (prefill, no speculative
+    # decoding) through a query-blocked kernel, which fetches a block of queries'
+    # pages once and masks each query's selection, instead of gathering every
+    # query's rows: pooled DSA (GLM-5.3-Flash) attention/pallas/mla_sparse_qblock.py,
+    # plain DSA (Kimi-K3.1) attention/pallas/mla_sparse_qblock_tokens.py. The
+    # flag thus also switches every plain-DSA (index kpool == 1) model's prefill,
+    # not only pooled DSA. Not bit-exact with the per-query kernel (summation
+    # order); False keeps it.
     SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL = EnvBool(False)
+    # DSA indexer token split for prefill (EXTEND / MIXED batches of at least
+    # _MIN_TOKENS tokens; the minimum is also 32 rows per rank): every
+    # attention-TP rank stores the index keys of all tokens but scores and
+    # top-k-selects only its contiguous slice of ceil(T / attn_tp) query rows
+    # (rounded up to 8); an int32 all-reduce over the attention-TP group puts
+    # the [T, topk] rows together (attention_pallas_mla_sparse.py). Same rows
+    # bit for bit; attention is unchanged. _MAX_ROWS caps the rows per rank
+    # (the all-reduce buffer is [attn_tp, rows, topk] int32 per DSA layer);
+    # larger batches keep the replicated path, as do decode and verify.
+    SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT = EnvBool(False)
+    SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT_MIN_TOKENS = EnvInt(1024)
+    SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT_MAX_ROWS = EnvInt(512)
     # Vision: run single-sequence "tpu" vision attention through block-skipping splash
     # (attention/vision_splash.py); False keeps the segment-id flash op.
     SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION = EnvBool(False)
@@ -83,10 +137,51 @@ class TpuEnvs:
     # decoder_compile_policy._guard_filter_options). Assumes module state is
     # fixed after warmup.
     SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER = EnvBool(False)
+    # Serving-time decode forwards of a dynamo-compiled decoder run only
+    # Dynamo's differentiating guards (tensor shapes/dtypes and every guard
+    # that failed during warmup) instead of the full guard set, once warmup
+    # froze compilation with fail_on_recompile. Picks the same precompiled
+    # graph; saves ~0.1-0.3 ms of host time per decode step.
+    SGLANG_TPU_DECODE_SKIP_GUARD_EVAL = EnvBool(False)
+    # Compiled (dynamo + AOTAutograd) inference graphs whose input mutations
+    # are plain data mutations (KV / recurrent state) use a lean AOTAutograd
+    # runtime wrapper that copies all updated inputs back with one
+    # torch._foreach_copy_ instead of torch's per-input epilogue
+    # (aot_fast_runtime_wrapper.py). Same copies, so identical results.
+    SGLANG_TPU_AOT_LEAN_RUNTIME_WRAPPER = EnvBool(False)
+    # torch_tpu split executables with a single partition (no graph-splitting
+    # collectives) call their compiled executable directly instead of through
+    # the split FX GraphModule's Python forward (aot_fast_runtime_wrapper.py).
+    SGLANG_TPU_SPLIT_EXEC_DIRECT_CALL = EnvBool(False)
+    # 1: Dynamo installs nn.Module parameters / buffers as graph attributes
+    # (install_free_tensors, narrowed to _parameters/_buffers); 2: every tensor
+    # reached through an nn.Module (e.g. static-fp8 packed weights held as plain
+    # attributes), still not globals / nonlocals / forward inputs. AOTAutograd
+    # lifts them once instead of Dynamo's bytecode re-reading ~3000 attribute
+    # chains per decode call (aot_fast_runtime_wrapper.py). A parameter object
+    # replaced after compile is not noticed (in-place updates are).
+    SGLANG_TPU_DYNAMO_PARAMS_AS_GRAPH_ATTRS = EnvInt(0)
+    # TpuPagedTokenToKVPoolAllocator.alloc_decode: when no request crosses a
+    # page boundary, out_cache_loc = last_loc + 1 without the full host formula.
+    SGLANG_TPU_ALLOC_DECODE_FAST_PATH = EnvBool(False)
     # Two-level one-shot Pallas all-reduce for single-token TP decode tensors
     # (twolevel_allreduce.py): host-local exchange, then cross-host. Applies
     # when TP spans the whole world; everything else keeps XLA's all-reduce.
     SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE = EnvBool(False)
+    # That all-reduce: the in-host phase waits only for the host's peers; the
+    # cross-host barrier is checked just before the cross-host phase, so its
+    # latency overlaps the in-host exchange (twolevel_allreduce._kernel). Same
+    # sums. Only changes anything with more than one host.
+    SGLANG_TPU_TWOLEVEL_ALLREDUCE_SPLIT_BARRIER = EnvBool(False)
+    # That all-reduce: Kimi-K3's merged MoE reduce also applies the routed
+    # latent RMSNorm in the kernel (one op instead of the reduce + two norm
+    # fusions). The norm runs on the [1, H] row, which reproduces XLA's f32
+    # summation order (bit-identical).
+    SGLANG_TPU_TWOLEVEL_ALLREDUCE_FUSE_LATENT_NORM = EnvBool(True)
+    # That all-reduce: the attention o_proj reduce of a Kimi-K3 attention-residual
+    # layer also runs the MLP-side aggregation (kimi_attn_res_decode with the
+    # pending add) in the same kernel. Same ops in the same order (exact).
+    SGLANG_TPU_TWOLEVEL_ALLREDUCE_FUSE_ATTN_RES = EnvBool(True)
     # MoE router: one Pallas kernel for the biased sigmoid top-k of decode-sized
     # batches (kernels/router_topk.py); False keeps the generic top-k.
     SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL = EnvBool(True)
@@ -111,9 +206,13 @@ class TpuEnvs:
     # k3_megakernel/ops.py SERVING_KERNEL_OPTIONS. wire_relax adds the wire relaxations
     # (bf16_transport, host_bf16, oproj_flat) without touching the weight layout.
     SGLANG_TPU_K3_MEGAKERNEL_KERNEL_OPTS = EnvStr("")
-    # Kimi-K3 megakernel prefill kernel: "auto" (8-token rows blocks when --chunked-prefill-size is
-    # a multiple of 8, else one stack pass per token), "rows" or "loop".
+    # Kimi-K3 megakernel prefill kernel: "auto" (rows blocks when --chunked-prefill-size is a
+    # multiple of the block, else one stack pass per token), "rows" or "loop".
     SGLANG_TPU_K3_MEGAKERNEL_PREFILL = EnvStr("auto")
+    # Tokens per rows-mode prefill block, a multiple of 8. Each block streams every layer's
+    # weights once, so a larger block amortizes that over more tokens; VMEM bounds it (93L TP32
+    # fits 32, 13L TP8 fits 16). 8 is the previous behaviour.
+    SGLANG_TPU_K3_MEGAKERNEL_PREFILL_BLOCK = EnvInt(8)
     # Kimi-K3 megakernel verify kernel (speculative serving): "rows" or "loop" (one stack pass per
     # row, bit-identical to decode steps; parity checks).
     SGLANG_TPU_K3_MEGAKERNEL_VERIFY = EnvStr("rows")
@@ -121,6 +220,9 @@ class TpuEnvs:
     # hold their expert set in host memory at once (lower it when host RAM peaks during load).
     SGLANG_TPU_K3_MEGAKERNEL_EXPERT_LOAD_PROCS = EnvInt(8)
     SGLANG_TPU_K3_MEGAKERNEL_EXPERT_LOAD_SLOTS = EnvInt(4)
+    # "layer": copy each MoE layer's experts into a preallocated device array (host peak ~2 layers
+    # per rank); "whole": build the rank's whole expert set in host memory, upload once.
+    SGLANG_TPU_K3_MEGAKERNEL_EXPERT_UPLOAD = EnvStr("layer")
     # Dev only: with the megakernel on, keep sglang's decoder layers (and its prefill path) for
     # A/B comparisons; the default lets the kernel own the decoder weights.
     SGLANG_TPU_K3_MEGAKERNEL_KEEP_SGLANG_WEIGHTS = EnvBool(False)
@@ -183,6 +285,17 @@ class TpuEnvs:
     # runs with the fused MoE decode kernel (`sglang_tpu/moe/pallas/fused_moe_decode`);
     # larger batches use gmm_v2.
     SGLANG_TPU_FUSED_MOE_DECODE_MAX_TOKENS = EnvInt(256)
+
+    # DSA indexer, decode-sized batches: quantize and store the index keys with
+    # one Pallas kernel (attention/pallas/dsa_key_store.py, same bytes as the
+    # XLA path); False keeps the XLA whole-row scatter for every batch.
+    SGLANG_TPU_DSA_PALLAS_KEY_STORE = EnvBool(True)
+    # SparseCore top-k (dsv4/sparsecore_topk.py): when every row's valid prefix fits
+    # one slice, run a single pass over the narrowest 4096-wide bucket instead of the
+    # partitioned top-k; long-context pools pad rows to the max context. Selects the
+    # same set of indices, but their order (and so the sparse-MLA summation order
+    # downstream) can differ from the partitioned path.
+    SGLANG_TPU_SCTOPK_SHORT_ROWS = EnvBool(True)
 
     # Raiden PD disaggregation
     # Base control port. Each local rank reserves consecutive control/data
@@ -319,12 +432,18 @@ class TpuEnvs:
     # distribution against the reference path.
     SGLANG_TPU_ENABLE_BSEARCH_SAMPLING = EnvBool(True)
     # Vision-encoder precompile ladder. Unset uses the computed square-grid
-    # ladder; set-but-empty disables precompile entirely.
+    # ladder (Kimi-K3 with vision splash attention defaults to a ladder up to
+    # 66564); set-but-empty disables precompile entirely.
     SGLANG_TPU_VIT_PRECOMPILE_SIZES = EnvTuple(tuple())
     SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES = EnvInt(4900)
     # Override the computed ladder's rung count, trading compiles against
     # padding waste. Unset leaves each encoder on the count it picked.
     SGLANG_TPU_VIT_NUM_PRECOMPILE_BUCKETS = EnvInt(None)
+    # Text-only serving of a VL decoder: warm only the token-id ("text_ids") EXTEND graphs, not
+    # the input_embeds ones. Each variant is a separate large graph (Kimi-K3.1 93L TP32: about
+    # 100 GB of host RAM per host to compile them). Compilation is frozen after warmup, so
+    # scheduler intake rejects multimodal requests with a 400 (sglang_tpu/patches.py).
+    SGLANG_TPU_VL_TEXT_ONLY_EXTEND = EnvBool(False)
     # MoE: offload the gather in permute and unpermute to SparseCore.
     SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)
     # MoE: gather on the TensorCore below this many routed rows (tokens x topk);
@@ -363,6 +482,9 @@ class TpuEnvs:
     # TODO: Remove once the issue gets resolved in libtpu version > 0.0.47
     # (likely 0.0.48).
     SGLANG_TPU_LIBTPU_WORKAROUND_FOR_ONLINE_QUANT_SCALE = EnvBool(True)
+    # Share one page pool between full-attention and sliding-window KV on TPU
+    # (equivalent to --enable-unified-memory; see unified_kv_pool.py).
+    SGLANG_TPU_UNIFIED_KV_POOL = EnvBool(False)
 
     # Sampling
     # Keep the repetition-penalty state padded to the power-of-two logits row
