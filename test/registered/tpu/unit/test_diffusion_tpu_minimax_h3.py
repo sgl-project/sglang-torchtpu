@@ -3,7 +3,7 @@
 
 import contextlib
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import DEFAULT, Mock, patch
 
 import torch
 
@@ -382,11 +382,15 @@ class TestMiniMaxH3CompiledBlock(CustomTestCase):
         block, run = _tiny_block()
         with (
             _installed(),
-            patch.object(tpu_distributed, "enter_spmd_safe_region") as enter_region,
+            patch.multiple(
+                tpu_distributed,
+                enter_spmd_safe_region=DEFAULT,
+                exit_spmd_safe_region=DEFAULT,
+            ) as region,
             torch.no_grad(),
         ):
             run(block, 100)
-        enter_region.assert_not_called()
+        region["enter_spmd_safe_region"].assert_not_called()
 
     def test_only_the_dit_blocks_compile(self):
         # The refiner's blocks also match is_block and run at the prompt length.
