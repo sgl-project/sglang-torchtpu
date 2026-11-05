@@ -64,26 +64,18 @@ def source_ranks_for(decode_rank: int, ratio: int) -> List[int]:
     return list(range(decode_rank * ratio, (decode_rank + 1) * ratio))
 
 
-def head_pair_bytes(fused_layer_tensor: FusedKVLayerTensor) -> int:
-    """Bytes of one kv-head's contiguous K+V run in a fused KV layer tensor.
-
-    Independent of the per-rank kv-head count, so it matches on prefill and
-    decode. ``tensor.shape = [num_blocks, page_size, kv_heads_packed,
-    kv_packing, padded_head_dim]``.
-    """
-    shape = fused_layer_tensor.shape
-    return int(shape[3]) * int(shape[4]) * fused_layer_tensor.element_size()
-
-
 def head_bytes(fused_layer_tensor: FusedKVLayerTensor) -> int:
-    """Bytes of one kv-head's K+V values, padding lanes excluded; the per-head
+    """Bytes of one kv-head's K+V values, padding slots excluded; the per-head
     granule of a ReshardGeometry built with the tensor's kv_packing."""
     shape = fused_layer_tensor.shape
     return 2 * int(shape[4]) * fused_layer_tensor.element_size()
 
 
 def per_rank_head_count(fused_layer_tensor: FusedKVLayerTensor) -> int:
-    """kv_heads_packed (this rank's kv-head count) of a fused KV layer tensor."""
+    """kv_heads_packed (``shape[2]``): the number of 32-bit packs per token of a
+    fused KV layer tensor. That equals this rank's kv-head count only for bf16
+    (one head per pack); an fp8 pack holds two heads, so for a kv-head count
+    use ``ReshardGeometry.heads_per_rank``."""
     return int(fused_layer_tensor.shape[2])
 
 
@@ -149,8 +141,9 @@ class ReshardGeometry:
         dst_tp: int,
         hp_bytes: int,
         total_kv_heads: int,
-        kv_packing: int = 2,
-        element_size: int = 2,
+        *,
+        kv_packing: int,
+        element_size: int,
     ):
         self.src_tp = src_tp
         self.dst_tp = dst_tp
@@ -163,27 +156,64 @@ class ReshardGeometry:
             raise ValueError("Raiden head-pair bytes must contain whole K/V elements")
         self.kv_packing = kv_packing
         self.element_size = element_size
+        # Padded head-dim lanes; one lane of a pack is one 32-bit word.
+        self.padded_head_dim = hp_bytes // (2 * element_size)
+
+    def heads_per_rank(self, tp: int) -> int:
+        return max(1, self.total_kv_heads // tp)
+
+    def token_bytes(self, tp: int) -> int:
+        """Per-token byte width of a rank's fused KV row at attention TP ``tp``:
+        its ``2 * heads`` K/V slots rounded up to whole 32-bit packs."""
+        packs = -(-2 * self.heads_per_rank(tp) // self.kv_packing)
+        return packs * self.kv_packing * self.padded_head_dim * self.element_size
+
+    def check_token_bytes(self, tp: int, actual: int, what: str) -> None:
+        """Fail loudly when a rank's real per-token width (``tensor.stride(1) *
+        element_size``) is not what this geometry computes for it."""
+        expected = self.token_bytes(tp)
+        if int(actual) != expected:
+            raise ValueError(
+                f"Raiden reshard geometry expects a {expected} B per-token KV row "
+                f"for {self.heads_per_rank(tp)} kv-head(s) at attention TP {tp} "
+                f"(kv_packing={self.kv_packing}, element_size="
+                f"{self.element_size}, padded_head_dim={self.padded_head_dim}), but the "
+                f"{what} KV tensor's row is {actual} B"
+            )
 
     def entry_bytes(self, prefill_rank: int, decode_rank: int):
-        """Byte (src_offset, size, src_stride, dst_offset, dst_stride) for the
-        prefill_rank -> decode_rank contribution, per token."""
+        """Return the (src_offset, size, src_stride, dst_offset, dst_stride) 5-tuple for one reshard table entry."""
         sh_start, num_heads, dh_start, src_hpr, dst_hpr = head_slice_params(
             self.src_tp, self.dst_tp, prefill_rank, decode_rank, self.total_kv_heads
         )
-        # A 32-bit pack holds kv_packing // 2 heads, and a rank's padded last
-        # pack still spans its per-token width.
         heads_per_pack = max(1, self.kv_packing // 2)
-        if any(n % heads_per_pack for n in (sh_start, dh_start, num_heads)):
-            raise ValueError("Partial FP8 head packs are unsupported")
-        src_hpr = -(-src_hpr // heads_per_pack) * heads_per_pack
-        dst_hpr = -(-dst_hpr // heads_per_pack) * heads_per_pack
+        whole_packs = num_heads % heads_per_pack == 0 or (
+            sh_start + num_heads == src_hpr and dh_start + num_heads == dst_hpr
+        )
+        if sh_start % heads_per_pack or dh_start % heads_per_pack or not whole_packs:
+            raise ValueError(
+                f"Partial FP8 head packs are unsupported: {self.src_tp} -> "
+                f"{self.dst_tp} splits a {self.kv_packing}-slot pack across ranks "
+                f"({src_hpr} src head(s) vs {dst_hpr} dst head(s))."
+            )
+        packed_heads = -(-num_heads // heads_per_pack) * heads_per_pack
         return (
             sh_start * self.hp_bytes,  # src_offset
-            num_heads * self.hp_bytes,  # size
-            src_hpr * self.hp_bytes,  # src_stride (src per-token width)
+            packed_heads * self.hp_bytes,  # size
+            self.token_bytes(self.src_tp),  # src_stride (src per-token width)
             dh_start * self.hp_bytes,  # dst_offset
-            dst_hpr * self.hp_bytes,  # dst_stride (dst per-token width)
+            self.token_bytes(self.dst_tp),  # dst_stride (dst per-token width)
         )
+
+    def check_decode_rank(self, decode_rank: int) -> None:
+        """Raise ``entry_bytes``' error for any source of ``decode_rank``, so a
+        decode can refuse an unsupported reshard before asking for the KV."""
+        if self.src_tp >= self.dst_tp:
+            sources = source_ranks_for(decode_rank % self.dst_tp, self.ratio)
+        else:
+            sources = [decode_rank % self.dst_tp * self.src_tp // self.dst_tp]
+        for prefill_rank in sources:
+            self.entry_bytes(prefill_rank, decode_rank)
 
 
 def _add_entry(

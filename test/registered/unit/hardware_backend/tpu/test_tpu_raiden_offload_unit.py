@@ -1935,7 +1935,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
     def _geometry(src_tp, dst_tp):
         from sglang_tpu.disaggregation.raiden.reshard_schedule import ReshardGeometry
 
-        return ReshardGeometry(src_tp, dst_tp, 1024, 8)
+        return ReshardGeometry(src_tp, dst_tp, 1024, 8, kv_packing=2, element_size=2)
 
     def _prefill(self):
         mgr = object.__new__(RaidenKVManager)

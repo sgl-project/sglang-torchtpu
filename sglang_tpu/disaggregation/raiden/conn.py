@@ -365,7 +365,7 @@ class RaidenKVManager(
         from sglang_tpu.disaggregation.raiden.pp_common import _BLOCK_MAJOR_KV_RANK
         from sglang_tpu.disaggregation.raiden.reshard_schedule import (
             ReshardGeometry,
-            head_pair_bytes,
+            head_bytes,
         )
 
         tensors = self._swa_kv_caches if swa else self._kv_caches
@@ -386,11 +386,74 @@ class RaidenKVManager(
                 f"{dst_attn_tp} on decode. Run both at equal attention TP or "
                 "unset SGLANG_TPU_USE_BLOCK_MAJOR_KV on both."
             )
-        hp = head_pair_bytes(tensor)
+        hp = head_bytes(tensor)
         # Distinct model kv-head count (model_config.get_total_num_kv_heads()),
         # set on both the prefill and decode KVArgs.
         total_kv_heads = int(self.kv_args.total_kv_head_num)
-        return ReshardGeometry(src_attn_tp, dst_attn_tp, hp, total_kv_heads)
+        geometry = ReshardGeometry(
+            src_attn_tp,
+            dst_attn_tp,
+            hp,
+            total_kv_heads,
+            kv_packing=int(tensor.shape[3]),
+            element_size=tensor.element_size(),
+        )
+        self._check_reshard_layout(geometry, tensor, src_attn_tp, dst_attn_tp)
+        return geometry
+
+    def _check_reshard_layout(
+        self, geometry, tensor, src_attn_tp: int, dst_attn_tp: int
+    ) -> None:
+        """Verify that the tensor's actual stride matches the geometry's computed token width."""
+        from sglang_tpu.disaggregation.raiden.pp_common import _FUSED_KV_RANK
+
+        local_tp = int(self.attn_tp_size)
+        if local_tp not in (src_attn_tp, dst_attn_tp):
+            raise ValueError(
+                f"Raiden reshard {src_attn_tp}->{dst_attn_tp} built on a rank at "
+                f"attention TP {local_tp}"
+            )
+        page_size = int(self.kv_args.page_size)
+        if (
+            len(tensor.shape) != _FUSED_KV_RANK
+            or int(tensor.shape[1]) != page_size
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError(
+                "Raiden push resharding requires the token-major fused KV pool "
+                "[num_blocks, page_size, kv_heads_packed, kv_packing, head_dim]; "
+                f"got shape {tuple(tensor.shape)} stride {tuple(tensor.stride())} "
+                f"with page_size {page_size}"
+            )
+        if tpu_envs.SGLANG_TPU_KV_PACK_HEADS.get():
+            # Packed heads sit side by side along head_dim, so a kv-head is not
+            # a K/V slot pair the head-slice math can address.
+            raise ValueError(
+                "Raiden push resharding does not support SGLANG_TPU_KV_PACK_HEADS"
+            )
+        geometry.check_token_bytes(
+            local_tp, tensor.stride(1) * tensor.element_size(), "local"
+        )
+
+    def finer_decode_refusal(self, prefill_attn_tp: int) -> Optional[str]:
+        """Return a refusal reason if decode attention TP exceeds prefill TP without head replication."""
+        attn_tp = int(self.attn_tp_size)
+        if not prefill_attn_tp or prefill_attn_tp >= attn_tp:
+            return None
+        if getattr(self, "is_mla_backend", False) or getattr(
+            self, "is_hybrid_mla_backend", False
+        ):
+            return None
+        total_kv_heads = int(self.kv_args.total_kv_head_num)
+        prefill_heads = max(1, total_kv_heads // prefill_attn_tp)
+        decode_heads = max(1, total_kv_heads // attn_tp)
+        if prefill_heads == decode_heads:
+            return None
+        return (
+            f"Cannot serve decode attention TP {attn_tp} from prefill attention TP "
+            f"{prefill_attn_tp}: each decode rank needs {decode_heads} heads per "
+            f"page, got {prefill_heads}."
+        )
 
     # ----- engine lifecycle -------------------------------------------------
 
