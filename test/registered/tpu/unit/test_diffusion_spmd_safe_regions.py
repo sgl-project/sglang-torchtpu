@@ -72,7 +72,7 @@ class TestTpuSpmdRegionWrapper(unittest.TestCase):
 
 class TestTpuRequestDrain(unittest.TestCase):
     def test_every_request_drains(self):
-        # Without it Wan2.2-A14B's second request hangs; see the hook.
+        # Without it Wan2.2-A14B's second warmup request hangs; see the hook.
         self.assertTrue(TpuOOTPlatform.drain_device_queue_after_request())
 
 
