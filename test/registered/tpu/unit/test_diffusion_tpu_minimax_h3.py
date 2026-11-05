@@ -2,7 +2,6 @@
 """Tests for sglang_tpu's MiniMax H3 patches (sglang_tpu.multimodal_gen.minimax_h3)."""
 
 import contextlib
-import inspect
 import unittest
 from unittest.mock import patch
 
@@ -41,10 +40,6 @@ from sglang_tpu.multimodal_gen import minimax_h3, worker
 # The TPU lane installs the diffusion_tpu extras (cache-dit) the H3 DiT imports.
 register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit", chips=1)
 
-_BUILDERS = ("minimax_h3_packed_sequence", "minimax_h3_packed_sequence_ref2va_blocks")
-# The unpadded builders, even if a worker init already installed the patches.
-_PRISTINE = {n: inspect.unwrap(getattr(packed_sequence, n)) for n in _BUILDERS}
-
 
 def _init_parallel_state():
     """Distributed init without the TPU worker's process-wide runtime patches."""
@@ -59,34 +54,21 @@ def _init_parallel_state():
 def _installed():
     """Run install() with every patched name restored afterwards."""
     with contextlib.ExitStack() as stack:
-        for module, names in (
-            (packed_sequence, _BUILDERS),
-            (comfyui_step, _BUILDERS + ("comfyui_layout_to_packed",)),
-            (dit, ("_minimax_h3_attention_core_bcg",)),
+        for target, name in (
+            (packed_sequence, "MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT"),
+            (comfyui_step, "MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT"),
+            (dit, "_minimax_h3_attention_core_bcg"),
+            (dit.MiniMaxH3DiTModel, "_compile_conditions"),
+            (dit.MiniMaxH3DiTBlock, "forward"),
         ):
-            stack.enter_context(
-                patch.multiple(module, **{n: getattr(module, n) for n in names})
-            )
-        stack.enter_context(
-            patch.object(
-                dit.MiniMaxH3DiTModel,
-                "_compile_conditions",
-                dit.MiniMaxH3DiTModel._compile_conditions,
-            )
-        )
-        stack.enter_context(
-            patch.object(
-                dit.MiniMaxH3DiTBlock, "forward", dit.MiniMaxH3DiTBlock.forward
-            )
-        )
+            stack.enter_context(patch.object(target, name, getattr(target, name)))
         minimax_h3.install()
         minimax_h3.install()  # idempotent
         yield
 
 
-def _packed(text_len, builder=None):
-    builder = builder or packed_sequence.minimax_h3_packed_sequence
-    return builder(
+def _packed(text_len):
+    return packed_sequence.minimax_h3_packed_sequence(
         text_len=text_len,
         latent_t=3,
         latent_h=8,
@@ -136,9 +118,9 @@ class TestMiniMaxH3PackedSequence(CustomTestCase):
         # 68 latent rows: used 128, 198 and 318 share the first bucket, 512 is
         # aligned already, 668 takes the second.
         buckets = {60: 512, 130: 512, 250: 512, 444: 512, 600: 1024}
-        pristine = _PRISTINE["minimax_h3_packed_sequence"]
-        reference = {t: _packed(t, pristine) for t in buckets}
-        self.assertNotEqual({r["seq_len"] for r in reference.values()}, {512})
+        reference = {t: _packed(t) for t in buckets}
+        # The core builders' own padding: the buckets below come from install().
+        self.assertNotEqual(reference[600]["seq_len"], 1024)
         ref2va_args = dict(
             text_len=60,
             latent_t=3,
@@ -147,7 +129,7 @@ class TestMiniMaxH3PackedSequence(CustomTestCase):
             audio_t=10,
             ref_blocks=[{"kind": "image", "latent_h": 8, "latent_w": 8}],
         )
-        ref2va = _PRISTINE["minimax_h3_packed_sequence_ref2va_blocks"](**ref2va_args)
+        ref2va = packed_sequence.minimax_h3_packed_sequence_ref2va_blocks(**ref2va_args)
         empty = torch.zeros(0, dtype=torch.long)
         comfyui_layout = {
             "seq_len": 600,
@@ -158,7 +140,6 @@ class TestMiniMaxH3PackedSequence(CustomTestCase):
             "audio_pos": empty,
             "audio_update": empty.bool(),
         }
-        builders = {n: getattr(packed_sequence, n) for n in _BUILDERS}
         with _installed():
             layouts = {text_len: _packed(text_len) for text_len in reference}
             other_layouts = (
@@ -170,10 +151,6 @@ class TestMiniMaxH3PackedSequence(CustomTestCase):
                     512,
                 ),
                 (comfyui_step.comfyui_layout_to_packed(comfyui_layout), 600, 1024),
-            )
-            self.assertIs(
-                comfyui_step.minimax_h3_packed_sequence,
-                packed_sequence.minimax_h3_packed_sequence,
             )
         for packed, used, seq_len in other_layouts:
             self.assertEqual(packed["seq_len"], seq_len)
@@ -188,15 +165,12 @@ class TestMiniMaxH3PackedSequence(CustomTestCase):
                 packed["cu_seqlens"].tolist(), [0, used, buckets[text_len]]
             )
             torch.testing.assert_close(
-                packed["img_position_ids"][: ref["seq_len"]], ref["img_position_ids"]
+                packed["img_position_ids"][:used], ref["img_position_ids"][:used]
             )
-            self.assertTrue((packed["img_position_ids"][ref["seq_len"] :] == 0).all())
+            self.assertTrue((packed["img_position_ids"][used:] == 0).all())
             self.assertTrue((packed["token_tags"][used:] == -1).all())
             for key in ("img_pos", "audio_pos", "text_pos", "update_mask"):
                 torch.testing.assert_close(packed[key], ref[key])
-        # Restored after the test.
-        for name, builder in builders.items():
-            self.assertIs(getattr(packed_sequence, name), builder)
 
 
 class TestMiniMaxH3LiveLength(CustomTestCase):

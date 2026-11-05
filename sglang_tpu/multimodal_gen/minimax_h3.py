@@ -11,16 +11,16 @@ Runtime patch, tracked debt:
   graphs; BCG is CUDA-only. torch_tpu also splits a compiled graph at every
   collective (5 programs per block, one per side of its two Ulysses
   all-to-alls).
-- How: :func:`install` (1) wraps the packed-sequence builders (and the
-  ComfyUI step's references to them) so the padded length is a multiple of
-  512 (padding rows are tagged padding, carry zero RoPE positions and stay in
-  ``cu_seqlens``' trailing segment), (2) compiles only the 50 DiT blocks: the
-  refiner runs once per request, eager, (3) rebinds
-  ``_minimax_h3_attention_core_bcg`` to the undecorated core, and (4) marks
-  the blocks spmd-safe, so each block keeps its collectives in one program
-  (every rank runs the same block graph). The attention
-  backend reads the live length on device (``trailing_padding_on_device``),
-  so the blocks take no host bounds and compile once per padded length.
+- How: :func:`install` (1) sets the alignment the packed-sequence builders
+  and the ComfyUI layout read to 512 rows (padding rows are tagged padding,
+  carry zero RoPE positions and stay in ``cu_seqlens``' trailing segment),
+  (2) compiles only the 50 DiT blocks: the refiner runs once per request,
+  eager, (3) rebinds ``_minimax_h3_attention_core_bcg`` to the undecorated
+  core, and (4) marks the blocks spmd-safe, so each block keeps its
+  collectives in one program (every rank runs the same block graph). The
+  attention backend reads the live length on device
+  (``trailing_padding_on_device``), so the blocks take no host bounds and
+  compile once per padded length.
 - Upstream PR or issue: none.
 - Remove when: the H3 packed builder takes a platform-provided alignment, the
   refiner pads to a bucket, the attention break point is skipped where BCG
@@ -29,45 +29,9 @@ Runtime patch, tracked debt:
 
 from __future__ import annotations
 
-import functools
-
-import torch
-
 # Most prompt lengths of one video size share a 512 bucket; the padding costs
 # at most 511 extra rows next to ~32k packed rows at 1344x768x4s.
 TPU_PACKED_SEQUENCE_ALIGNMENT = 512
-
-
-def pad_packed_sequence(packed: dict, alignment: int) -> dict:
-    """Extend a packed layout's trailing padding to a multiple of ``alignment``."""
-    seq_len = int(packed["seq_len"])
-    padded = (seq_len + alignment - 1) // alignment * alignment
-    if padded == seq_len:
-        return packed
-    extra = padded - seq_len
-    out = dict(packed)
-    out["seq_len"] = padded
-    positions = packed["img_position_ids"]
-    out["img_position_ids"] = torch.cat(
-        (positions, positions.new_zeros(extra, *positions.shape[1:]))
-    )
-    tags = packed["token_tags"]
-    out["token_tags"] = torch.cat((tags, tags.new_full((extra,), -1)))
-    cu_seqlens = packed["cu_seqlens"].clone()
-    cu_seqlens[-1] = padded
-    out["cu_seqlens"] = cu_seqlens
-    return out
-
-
-def _padded(builder):
-    @functools.wraps(builder)
-    def build(*args, **kwargs):
-        return pad_packed_sequence(
-            builder(*args, **kwargs), TPU_PACKED_SEQUENCE_ALIGNMENT
-        )
-
-    build.__wrapped_for_tpu__ = True
-    return build
 
 
 def _is_dit_block(name: str, module: object) -> bool:
@@ -107,19 +71,16 @@ def install() -> None:
         comfyui_step,
     )
 
-    for name in (
-        "minimax_h3_packed_sequence",
-        "minimax_h3_packed_sequence_ref2va_blocks",
-    ):
-        builder = getattr(packed_sequence, name)
-        if not getattr(builder, "__wrapped_for_tpu__", False):
-            builder = _padded(builder)
-            setattr(packed_sequence, name, builder)
-        setattr(comfyui_step, name, builder)
-    if not getattr(comfyui_step.comfyui_layout_to_packed, "__wrapped_for_tpu__", False):
-        comfyui_step.comfyui_layout_to_packed = _padded(
-            comfyui_step.comfyui_layout_to_packed
-        )
+    # The builders read the alignment when called. Reading it first raises on
+    # a rename; a multiple of it keeps the DiT's sequence-parallel admission,
+    # which checks the core alignment, valid.
+    for module in (packed_sequence, comfyui_step):
+        if TPU_PACKED_SEQUENCE_ALIGNMENT % module.MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT:
+            raise ValueError(
+                f"{TPU_PACKED_SEQUENCE_ALIGNMENT} rows is not a multiple of "
+                f"{module.__name__}.MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT"
+            )
+        module.MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT = TPU_PACKED_SEQUENCE_ALIGNMENT
     dit.MiniMaxH3DiTModel._compile_conditions = [_is_dit_block]
     dit._minimax_h3_attention_core_bcg = dit._minimax_h3_attention_core_impl
     _mark_blocks_spmd_safe(dit.MiniMaxH3DiTBlock)
