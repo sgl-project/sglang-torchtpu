@@ -133,8 +133,9 @@ class TestMuseMegakernelConfig(CustomTestCase):
         self.assertTrue(cfg_24.attn_skip_idle_streams and cfg_24.attn_col_mask)
         cfg_32 = _config(_megakernel(expert_groups=groups), 4, 8, **_FP8_SAL)
         self.assertEqual(cfg_32.expert_split, 4)
-        self.assertEqual(cfg_32.compact_rows, 8)
-        self.assertEqual(cfg_32.compact_arms, (1, 2, 4, 8))
+        self.assertEqual(cfg_32.compact_rows, 4)
+        self.assertEqual(cfg_32.compact_arms, (1, 2, 4))
+        self.assertTrue(cfg_32.ex_w2_stage)
         self.assertFalse(cfg_32.ex_bd_all)
         cfg_32_kperm0 = _config(
             _megakernel(expert_groups=groups, kperm=False), 4, 8, **_FP8_SAL
@@ -152,7 +153,7 @@ class TestMuseMegakernelConfig(CustomTestCase):
                     )
                     self.assertEqual(cfg.row_tile, 16)
                     self.assertEqual(cfg.rows % 16, 0)
-                    if cfg.rows <= 96:
+                    if cfg.rows <= 128:
                         self.assertTrue(cfg.fold_f and cfg.fold_o)
                     if cfg.fold_f or cfg.fold_o:
                         self.assertTrue(K.fold_fits(cfg))
