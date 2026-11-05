@@ -113,6 +113,9 @@ class PrefillServerInfo:
     enable_dsa_cache_layer_split: bool = False
     dsv41_spec_layout: Optional[dict] = None
     decode_allocation_policy: str = "early"
+    # KV pool layout (KVArgs.kv_layout). The bootstrap server omits it when
+    # None so decodes without this field still parse the reply.
+    kv_layout: Optional[str] = None
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -1369,6 +1372,7 @@ class CommonKVManager(BaseKVManager):
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "dsv41_spec_layout": self.dsv41_spec_layout,
+            "kv_layout": self.kv_args.kv_layout,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
             # Self-register the HTTP API port so the decode can derive the PD
@@ -2504,6 +2508,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.dsv41_spec_layout: Optional[dict] = None
+        self.kv_layout: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
@@ -2589,6 +2594,13 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             )
         self.dsv41_spec_layout = dsv41_spec_layout
         self.decode_allocation_policy = policy
+
+        kv_layout = data.get("kv_layout")
+        if self._registered_count and self.kv_layout != kv_layout:
+            return web.Response(
+                text="KV layout differs across prefill ranks", status=400
+            )
+        self.kv_layout = kv_layout
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -2681,6 +2693,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 page_size=self.page_size,
                 kv_cache_dtype=self.kv_cache_dtype,
                 dsv41_spec_layout=self.dsv41_spec_layout,
+                kv_layout=self.kv_layout,
                 follow_bootstrap_room=(
                     self.follow_bootstrap_room
                     if self.follow_bootstrap_room is not None
@@ -2693,6 +2706,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             payload = dataclasses.asdict(info)
             if info.dsv41_spec_layout is None:
                 payload.pop("dsv41_spec_layout")
+            if info.kv_layout is None:
+                payload.pop("kv_layout")
             return web.json_response(payload, status=200)
 
         if not self._is_ready():
