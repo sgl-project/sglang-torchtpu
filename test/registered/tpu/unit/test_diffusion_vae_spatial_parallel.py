@@ -8,6 +8,7 @@ import unittest
 
 from sglang.multimodal_gen.test.unit.test_decoding_stage_parallelism import (  # noqa: F401
     TestDecodeUsesEveryRank,
+    TestDecodingStageParallelism,
     TestMovaDecodingStageParallelism,
 )
 from sglang.multimodal_gen.test.unit.test_vae_spatial_parallel_decode import (  # noqa: F401
