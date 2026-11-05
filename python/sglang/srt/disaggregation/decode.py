@@ -372,6 +372,11 @@ class DecodeRequest:
     hicache_restore_lock_receipt: Optional[DecLockRefParams] = None
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
+    # The prefill was told which prefix pages this decode holds (or that none are).
+    prefix_offer_sent: bool = False
+    # Hybrid SWA: (node, receipt) tree lock on the offered prefix and window,
+    # held while the request is in the transfer queue.
+    prefix_offer_lock: Optional[Tuple[Any, DecLockRefParams]] = None
 
     @property
     def seqlen(self) -> int:
@@ -2552,6 +2557,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # or timed out. Entries:
         # (decode_req, start_time, deadline, metadata_idx, required_acks).
         self._deferred_releases: List[Tuple[DecodeRequest, float, float, int, int]] = []
+        # Prefix pages this decode offered to the prefill, pinned past the
+        # request's queue exit while the prefill's native read of them is
+        # still registered on any rank: room -> (node, dec-lock params).
+        self._offer_pins_pending: dict = {}
+        self._kv_mgr = None
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -2787,14 +2797,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if not self.queue:
             return []
 
+        checked_reqs = [
+            decode_req
+            for decode_req in self.queue
+            if rids_to_check is None or decode_req.req.rid in rids_to_check
+        ]
         if self.scheduler.enable_decode_hicache:
-            self._process_hicache_local_restores(
-                [
-                    decode_req
-                    for decode_req in self.queue
-                    if rids_to_check is None or decode_req.req.rid in rids_to_check
-                ]
-            )
+            self._process_hicache_local_restores(checked_reqs)
+        self._offer_resident_prefixes(checked_reqs)
 
         if self.enable_staging:
             polls = self._poll_with_staging()
@@ -2926,6 +2936,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
+        self._retire_prefix_offer_locks(
+            [self.queue[i] for i in indices_to_remove if i not in deferred_indices]
+        )
         for i in indices_to_remove:
             if i in deferred_indices:
                 # Held for deferred release; metadata buffer freed at resolve time.
@@ -2949,6 +2962,138 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         return transferred_reqs
 
+    def _offer_resident_prefixes(self, decode_reqs: List[DecodeRequest]) -> None:
+        """Name to the prefill the prompt prefix pages this decode holds in HBM,
+        once any host restore of them has landed, so the prefill can pull them.
+        Runs on every rank over the same requests, so tree locks agree."""
+        for decode_req in decode_reqs:
+            if decode_req.prefix_offer_sent:
+                continue
+            if not decode_req.kv_receiver.prefix_offer_pending:
+                continue
+            prefix_match = decode_req.prefix_match
+            if prefix_match is None:
+                decode_req.kv_receiver.offer_resident_prefix([])
+                decode_req.prefix_offer_sent = True
+                continue
+            if self.scheduler.enable_decode_hicache:
+                status = decode_req.hicache_restore_status
+                if status == HiCacheRestoreResult.PENDING:
+                    continue
+                if status == HiCacheRestoreResult.FAILED:
+                    decode_req.kv_receiver.offer_resident_prefix([])
+                    decode_req.prefix_offer_sent = True
+                    continue
+            # The manager outlives the receiver (dropped when a request fails);
+            # the offered pages' pin follows its native reports.
+            self._kv_mgr = getattr(decode_req.kv_receiver, "kv_mgr", self._kv_mgr)
+            if self.tree_cache.supports_swa():
+                decode_req.prefix_offer_lock = (
+                    decode_req.kv_receiver.offer_window_prefix(
+                        tree_cache=self.tree_cache,
+                        allocator=self.scheduler.token_to_kv_pool_allocator,
+                        req=decode_req.req,
+                        window_size=self.scheduler.sliding_window_size,
+                    )
+                )
+                decode_req.prefix_offer_sent = True
+                continue
+            indices = prefix_match.prefix_indices
+            if decode_req.hicache_restored_kv_indices is not None:
+                indices = torch.cat([indices, decode_req.hicache_restored_kv_indices])
+            page_size = self.scheduler.token_to_kv_pool_allocator.page_size
+            # The prefill matches and pulls whole pages, so a partial last page
+            # is left to its own compute.
+            resident_len = (prefix_match.decode_prefix_len // page_size) * page_size
+            resident = indices[: min(resident_len, len(indices))]
+            node = getattr(prefix_match, "last_device_node", None)
+            if (
+                len(resident) > 0
+                and node is not None
+                and decode_req.prefix_offer_lock is None
+            ):
+                # The prefill reads these pages natively; the request's own
+                # pin ends with the request, the read may not (see
+                # _retire_prefix_offer_locks).
+                decode_req.prefix_offer_lock = (
+                    node,
+                    self.tree_cache.inc_lock_ref(node).to_dec_params(),
+                )
+            decode_req.kv_receiver.offer_resident_prefix(
+                kv_to_page_indices(resident, page_size).tolist()
+            )
+            decode_req.prefix_offer_sent = True
+
+    def _release_prefix_offer_lock(self, decode_req: DecodeRequest) -> None:
+        # Runs as the request leaves the queue, a step every rank agrees on.
+        if decode_req.prefix_offer_lock is not None:
+            self.tree_cache.dec_lock_ref(*decode_req.prefix_offer_lock)
+            decode_req.prefix_offer_lock = None
+
+    def _agree_max(self, flags: List[int]) -> List[int]:
+        """The per-entry maximum over ranks; identical entry order everywhere."""
+        if not flags:
+            return []
+        values = torch.tensor(flags, dtype=torch.int32)
+        group = getattr(self, "gloo_group", None)
+        if (
+            group is not None
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(group) > 1
+        ):
+            torch.distributed.all_reduce(
+                values, op=torch.distributed.ReduceOp.MAX, group=group
+            )
+        return values.tolist()
+
+    def _retire_prefix_offer_locks(self, decode_reqs: List[DecodeRequest]) -> None:
+        """Release the offered-prefix pins of requests leaving the queue, or
+        keep them while the prefill's native read of those pages is still
+        registered on any rank.
+
+        Forward receive success does not imply the reverse read settled: a
+        prefill that timed out of the pull and recomputed leaves the native
+        source registration active, and the request's own pin ends with the
+        request. A Python deadline cannot prove the pages reusable, so the pin
+        follows the native terminal report, agreed across ranks so the tree
+        stays identical everywhere (raiden's own deadline bounds the wait).
+
+        Every leaving request then passes _release_prefix_offer_lock, pinned
+        or not: backends hang their own per-request offer state on that hook.
+        """
+        held = [r for r in decode_reqs if r.prefix_offer_lock is not None]
+        flags = []
+        for decode_req in held:
+            mgr = getattr(decode_req.kv_receiver, "kv_mgr", None) or self._kv_mgr
+            if mgr is not None:
+                self._kv_mgr = mgr
+            flags.append(
+                int(
+                    mgr is not None
+                    and mgr.room_has_active_io(decode_req.req.bootstrap_room)
+                )
+            )
+        for decode_req, active in zip(held, self._agree_max(flags)):
+            if active:
+                room = decode_req.req.bootstrap_room
+                self._offer_pins_pending[room] = decode_req.prefix_offer_lock
+                decode_req.prefix_offer_lock = None
+        for decode_req in decode_reqs:
+            self._release_prefix_offer_lock(decode_req)
+
+    def _resolve_offer_pins(self) -> None:
+        """Release pins whose native reads every rank now sees settled."""
+        if not self._offer_pins_pending or self._kv_mgr is None:
+            return
+        drain = getattr(self._kv_mgr, "_drain_engine", None)
+        if drain is not None:
+            drain()
+        rooms = list(self._offer_pins_pending)
+        flags = [int(self._kv_mgr.room_has_active_io(room)) for room in rooms]
+        for room, active in zip(rooms, self._agree_max(flags)):
+            if not active:
+                self.tree_cache.dec_lock_ref(*self._offer_pins_pending.pop(room))
+
     def _defer_release(self, decode_req: DecodeRequest) -> None:
         start_time = time.monotonic()
         deadline = start_time + self.deferred_kv_release_timeout
@@ -2966,6 +3111,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
 
     def _do_release(self, decode_req: DecodeRequest, idx: int) -> None:
+        self._retire_prefix_offer_locks([decode_req])
         room = decode_req.req.bootstrap_room
         if self.enable_staging and self.staging_handler.is_staging_room(room):
             self.staging_handler.unregister_decode_req(room)
@@ -2978,7 +3124,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.kv_receiver = None
 
     def has_pending_deferred_releases(self) -> bool:
-        return bool(self._deferred_releases)
+        return bool(self._deferred_releases) or bool(self._offer_pins_pending)
 
     def num_pending_deferred_releases(self) -> int:
         return len(self._deferred_releases)
@@ -2994,6 +3140,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def resolve_deferred_releases(self) -> None:
         """Release drained transfers; device destinations may also time out."""
+        self._resolve_offer_pins()
         if not self._deferred_releases:
             return
         host_ready = torch.tensor(
@@ -3067,6 +3214,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.queue.clear()
         # Pool is being torn down; drop held entries without per-request release.
         self._deferred_releases.clear()
+        self._offer_pins_pending.clear()
 
     def resume_memory_occupation(self):
         """Queues are already cleared on release; new transfers can be accepted."""

@@ -645,6 +645,9 @@ class _FakeIdxAllocator:
 def _make_queue(timeout=30.0, enable_metrics=False):
     q = DecodeTransferQueue.__new__(DecodeTransferQueue)
     q._deferred_releases = []
+    q._offer_pins_pending = {}
+    q._kv_mgr = None
+    q.gloo_group = None
     q.deferred_kv_release_timeout = timeout
     q.enable_host_receive = False
     q.enable_staging = False
@@ -673,6 +676,8 @@ def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
         req=SimpleNamespace(bootstrap_room=room),
         kv_receiver=receiver,
         metadata_buffer_index=idx,
+        prefix_offer_sent=True,
+        prefix_offer_lock=None,
     )
 
 
@@ -889,6 +894,8 @@ def _make_failed_req(mgr, room, idx, abort_notified, notifiable=True):
         req=SimpleNamespace(bootstrap_room=room, rid=f"r{room}", return_logprob=False),
         kv_receiver=receiver,
         metadata_buffer_index=idx,
+        prefix_offer_sent=True,
+        prefix_offer_lock=None,
         hicache_restore_status=None,
         host_staged=False,
     )
@@ -981,3 +988,81 @@ class TestBackendOptIn(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOfferedPrefixPins(CustomTestCase):
+    """The pin on a device prefix the decode offered to the prefill follows the
+    native read of those pages, not the request's queue membership."""
+
+    def _req(self, room, mgr, lock):
+        return SimpleNamespace(
+            req=SimpleNamespace(bootstrap_room=room),
+            kv_receiver=SimpleNamespace(kv_mgr=mgr),
+            prefix_offer_lock=lock,
+        )
+
+    def test_pin_is_released_at_queue_exit_when_the_read_settled(self):
+        q = _make_queue()
+        q.tree_cache = SimpleNamespace(dec_lock_ref=MagicMock())
+        mgr = SimpleNamespace(room_has_active_io=MagicMock(return_value=False))
+        req = self._req(7, mgr, ("node", "params"))
+        q._retire_prefix_offer_locks([req])
+        q.tree_cache.dec_lock_ref.assert_called_once_with("node", "params")
+        self.assertIsNone(req.prefix_offer_lock)
+        self.assertFalse(q.has_pending_deferred_releases())
+
+    def test_pin_outlives_queue_exit_while_the_reverse_read_is_registered(self):
+        # Forward receive success does not settle the prefill's reverse read:
+        # a prefill that timed out and recomputed leaves the native source
+        # registration active, and the pages must not be handed back under it.
+        q = _make_queue()
+        q.tree_cache = SimpleNamespace(dec_lock_ref=MagicMock())
+        active = {"io": True}
+        mgr = SimpleNamespace(
+            room_has_active_io=lambda room: active["io"], _drain_engine=MagicMock()
+        )
+        req = self._req(7, mgr, ("node", "params"))
+        q._retire_prefix_offer_locks([req])
+        q.tree_cache.dec_lock_ref.assert_not_called()
+        self.assertIsNone(req.prefix_offer_lock)
+        self.assertTrue(q.has_pending_deferred_releases())
+        # The request is gone; only the native terminal report frees the pin.
+        q.resolve_deferred_releases()
+        q.tree_cache.dec_lock_ref.assert_not_called()
+        active["io"] = False
+        q.resolve_deferred_releases()
+        q.tree_cache.dec_lock_ref.assert_called_once_with("node", "params")
+        self.assertFalse(q.has_pending_deferred_releases())
+        mgr._drain_engine.assert_called()
+
+    def test_every_leaving_request_reaches_the_release_hook(self):
+        # The plugin drops its own per-request offer state (host offers,
+        # window restores) in a wrapper of _release_prefix_offer_lock, so the
+        # hook runs for a request without a device pin and for one whose pin
+        # stays behind for the native read.
+        q = _make_queue()
+        q.tree_cache = SimpleNamespace(dec_lock_ref=MagicMock())
+        mgr = SimpleNamespace(room_has_active_io=lambda room: room == 8)
+        unpinned = self._req(7, mgr, None)
+        kept = self._req(8, mgr, ("node", "params"))
+        released = []
+        q._release_prefix_offer_lock = released.append
+        q._retire_prefix_offer_locks([unpinned, kept])
+        self.assertEqual(released, [unpinned, kept])
+        self.assertIn(8, q._offer_pins_pending)
+        self.assertIsNone(kept.prefix_offer_lock)
+
+    def test_failed_request_release_keeps_the_pin_the_same_way(self):
+        q = _make_queue()
+        q.tree_cache = SimpleNamespace(dec_lock_ref=MagicMock())
+        mgr = SimpleNamespace(
+            room_has_active_io=MagicMock(return_value=True),
+            clear_deferred_abort_state=MagicMock(),
+        )
+        req = self._req(9, mgr, ("node", "params"))
+        req.kv_receiver = MagicMock(kv_mgr=mgr)
+        req.metadata_buffer_index = 0
+        q._release_request = MagicMock()
+        q._do_release(req, 0)
+        q.tree_cache.dec_lock_ref.assert_not_called()
+        self.assertIn(9, q._offer_pins_pending)
