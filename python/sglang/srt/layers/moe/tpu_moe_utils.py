@@ -13,21 +13,6 @@ INT4_MOE_MODE_VMEM_BF16 = "vmem-bf16"
 INT4_MOE_MODE_VMEM_FP8 = "vmem-fp8"
 
 
-def tpu_moe_activation(
-    activation: str,
-    *,
-    gemm1_alpha: Optional[float],
-    gemm1_clamp_limit: Optional[float],
-) -> str:
-    """Pallas MoE activation name; SiTU carries its (beta, linear_beta) inline."""
-    if activation != "situ":
-        return activation
-    if gemm1_alpha is None:
-        raise ValueError("SiTU MoE requires gemm1_alpha (SiTU beta).")
-    linear_beta = "none" if gemm1_clamp_limit is None else gemm1_clamp_limit
-    return f"situ:{gemm1_alpha}:{linear_beta}"
-
-
 def resolve_int4_moe_mode() -> Optional[str]:
     """The INT4 MoE mode from the environment, validated.
 

@@ -20,7 +20,6 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.tpu_moe_utils import tpu_moe_activation
 from sglang.srt.layers.moe.utils import (
     FlashinferA2ADispatchType,
     get_flashinfer_a2a_dispatch_type,
@@ -3536,11 +3535,7 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         return apply_tpu_nvfp4_moe(
             layer=layer,
             dispatch_output=dispatch_output,
-            activation=tpu_moe_activation(
-                self.moe_runner_config.activation,
-                gemm1_alpha=self.moe_runner_config.gemm1_alpha,
-                gemm1_clamp_limit=self.moe_runner_config.gemm1_clamp_limit,
-            ),
+            activation=self.moe_runner_config.activation,
             apply_router_weight_on_input=(
                 self.moe_runner_config.apply_router_weight_on_input
             ),
