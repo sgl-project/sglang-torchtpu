@@ -16,11 +16,12 @@ Runtime patch, tracked debt:
   carry zero RoPE positions and stay in ``cu_seqlens``' trailing segment),
   (2) compiles only the 50 DiT blocks: the refiner runs once per request,
   eager, (3) rebinds ``_minimax_h3_attention_core_bcg`` to the undecorated
-  core, and (4) marks the blocks spmd-safe while compiling, so each compiled
-  block keeps its collectives in one program (every rank runs the same block
-  graph); eager blocks run unmarked. The attention backend reads the live
-  length on device (``trailing_padding_on_device``), so the blocks take no
-  host bounds and compile once per padded length.
+  core, and (4) marks each block spmd-safe when it compiles as its own region
+  (``--regional-compile``), so each compiled block keeps its collectives in
+  one program (every rank runs the same block graph); eager blocks and a
+  whole-DiT compile run unmarked. The attention backend reads the live length
+  on device (``trailing_padding_on_device``), so the blocks take no host
+  bounds and compile once per padded length.
 - Upstream PR or issue: none.
 - Remove when: the H3 packed builder takes a platform-provided alignment, the
   refiner pads to a bucket, the attention break point is skipped where BCG
@@ -49,10 +50,12 @@ def _is_dit_block(name: str, module: object) -> bool:
 
 
 def _mark_blocks_spmd_safe(block_cls) -> None:
-    """Annotate compiled block graphs spmd-safe; eager calls take the plain
-    forward, since spmd_safe's eager branch syncs every block's inputs and
-    outputs. The compile cache key already covers the annotation: the TPU
-    kernel-inputs tag hashes this file and the torch_tpu version."""
+    """Annotate a block's graph spmd-safe when the block compiles as its own
+    region: regional compile sets the block's ``_compiled_call_impl``, a
+    whole-DiT compile does not. Eager calls take the plain forward, since
+    spmd_safe's eager branch syncs every block's inputs and outputs. The
+    compile cache key already covers the annotation: the TPU kernel-inputs tag
+    hashes this file and the torch_tpu version."""
     if getattr(block_cls.forward, "__spmd_safe_for_tpu__", False):
         return
     try:
@@ -68,13 +71,14 @@ def _mark_blocks_spmd_safe(block_cls) -> None:
     marked = spmd_safe(forward)
 
     @functools.wraps(forward)
-    def forward_spmd_safe_when_compiling(*args, **kwargs):
-        if torch.compiler.is_compiling():
+    def forward_spmd_safe_as_a_region(*args, **kwargs):
+        # args[0] is the block; this signature keeps the graph's input names.
+        if torch.compiler.is_compiling() and args[0]._compiled_call_impl is not None:
             return marked(*args, **kwargs)
         return forward(*args, **kwargs)
 
-    forward_spmd_safe_when_compiling.__spmd_safe_for_tpu__ = True
-    block_cls.forward = forward_spmd_safe_when_compiling
+    forward_spmd_safe_as_a_region.__spmd_safe_for_tpu__ = True
+    block_cls.forward = forward_spmd_safe_as_a_region
 
 
 def install() -> None:

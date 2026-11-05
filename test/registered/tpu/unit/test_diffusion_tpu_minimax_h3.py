@@ -31,6 +31,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     denoising,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils import torch_compile
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
 )
@@ -322,27 +323,57 @@ def _tiny_block():
     return block, run
 
 
+class _OneBlockDiT(torch.nn.Module):
+    """One block under the DiT's compile conditions."""
+
+    def __init__(self, block):
+        super().__init__()
+        self.blocks = torch.nn.ModuleList([block])
+        self._compile_conditions = dit.MiniMaxH3DiTModel._compile_conditions
+
+    def forward(self, *args, **kwargs):
+        return self.blocks[0](*args, **kwargs)
+
+
+def _compiled_block_ops(regional):
+    """The ops of one block compiled as the denoising stage compiles a DiT, by
+    region or whole; the one graph matches eager across live lengths."""
+    block, run = _tiny_block()
+    graphs = []
+
+    def counting_backend(graph_module, example_inputs):
+        graphs.append(graph_module)
+        return graph_module.forward
+
+    compile_kwargs = dict(backend=counting_backend, fullgraph=True, dynamic=False)
+    registry = torch_compile.CompiledModuleRegistry()
+    with _installed(), torch.no_grad():
+        eager = {used: run(block, used) for used in (100, 77, 128)}
+        model = _OneBlockDiT(block)
+        if regional:
+            registry.compile_regions_once(model, compile_kwargs=compile_kwargs)
+        else:
+            registry.compile_once(model, compile_kwargs=compile_kwargs)
+        for used, out in eager.items():
+            torch.testing.assert_close(run(model, used), out)
+    (graph,) = graphs
+    return [n for n in graph.graph.nodes if n.op == "call_function"]
+
+
 class TestMiniMaxH3CompiledBlock(CustomTestCase):
-    def test_block_compiles_once_across_live_lengths_marked_spmd_safe(self):
-        block, run = _tiny_block()
-        graphs = []
+    def test_regional_block_compiles_once_across_live_lengths_marked_spmd_safe(self):
+        # torch_tpu keeps the collectives of an spmd-safe graph in one program.
+        ops = _compiled_block_ops(regional=True)
+        self.assertTrue(ops)
+        for node in ops:
+            self.assertEqual(node.meta.get("custom"), {"spmd_safe": True}, node)
 
-        def counting_backend(graph_module, example_inputs):
-            graphs.append(graph_module)
-            return graph_module.forward
-
-        with _installed(), torch.no_grad():
-            compiled = torch.compile(
-                block, backend=counting_backend, fullgraph=True, dynamic=False
-            )
-            for used in (100, 77, 128):
-                torch.testing.assert_close(run(compiled, used), run(block, used))
-            (graph,) = graphs
-            # torch_tpu keeps the collectives of an spmd-safe graph in one program.
-            ops = [n for n in graph.graph.nodes if n.op == "call_function"]
-            self.assertTrue(ops)
-            for node in ops:
-                self.assertEqual(node.meta.get("custom"), {"spmd_safe": True}, node)
+    def test_whole_dit_compile_leaves_blocks_unmarked(self):
+        # The mark is for one program per block, not one per DiT.
+        ops = _compiled_block_ops(regional=False)
+        self.assertTrue(ops)
+        for node in ops:
+            self.assertNotIn("spmd_safe", node.meta.get("custom", {}), node)
 
     def test_eager_block_enters_no_spmd_safe_region(self):
         # spmd_safe's eager branch syncs every block's inputs and outputs.
