@@ -34,6 +34,9 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
 )
+from sglang.multimodal_gen.test.unit.test_minimax_h3_encoder_device import (  # noqa: F401
+    TestMiniMaxH3EncoderTextPositions,
+)
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.multimodal_gen import minimax_h3, worker

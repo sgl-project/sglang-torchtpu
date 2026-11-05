@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -7,6 +8,7 @@ from sglang.multimodal_gen.runtime.models.encoders import minimax_h3_qwen3vl
 from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLEncoder,
 )
+from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLModel
 
 
 class TestMiniMaxH3EncoderDevice(unittest.TestCase):
@@ -45,6 +47,52 @@ class TestMiniMaxH3EncoderDevice(unittest.TestCase):
             minimax_h3_qwen3vl, "get_local_torch_device", return_value=cpu
         ):
             self.assertEqual(encoder.device, cpu)
+
+
+class _PositionsSeen(Exception):
+    pass
+
+
+class _LanguageModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed_tokens = torch.nn.Embedding(32, 8)
+
+    def forward(self, *, position_ids, **kwargs):
+        raise _PositionsSeen(position_ids)
+
+
+class TestMiniMaxH3EncoderTextPositions(unittest.TestCase):
+    def test_text_only_positions_match_the_model_fallback(self):
+        """Text-only positions resolved on the host, before the transfer, equal
+        the ones Qwen3VLModel.forward computes on device when given none."""
+        model = Qwen3VLModel.__new__(Qwen3VLModel)
+        torch.nn.Module.__init__(model)
+        model.config = SimpleNamespace(
+            vision_config=SimpleNamespace(spatial_merge_size=2),
+            image_token_id=30,
+            video_token_id=31,
+            vision_start_token_id=29,
+            output_attentions=False,
+            output_hidden_states=False,
+            use_return_dict=True,
+        )
+        model.rope_deltas = None
+        model.language_model = _LanguageModel()
+        ids = torch.randint(0, 29, (1, 11))
+        with self.assertRaises(_PositionsSeen) as fallback:
+            model(input_ids=ids, attention_mask=torch.ones_like(ids))
+        encoder = MiniMaxH3Qwen3VLEncoder.__new__(MiniMaxH3Qwen3VLEncoder)
+        torch.nn.Module.__init__(encoder)
+        encoder.model = model
+        with (
+            mock.patch.object(
+                minimax_h3_qwen3vl, "get_local_torch_device", return_value=ids.device
+            ),
+            self.assertRaises(_PositionsSeen) as host,
+        ):
+            encoder.encode_ids(ids[0])
+        torch.testing.assert_close(host.exception.args[0], fallback.exception.args[0])
 
 
 if __name__ == "__main__":
