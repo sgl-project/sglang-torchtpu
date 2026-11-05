@@ -1,5 +1,5 @@
 """Regional-compile hooks: the SPMD-safe opt-in contract, the rank-invariant
-inputs Wan feeds its blocks, and the fusion barrier."""
+inputs Wan feeds its blocks, the fusion barrier and the per-request drain."""
 
 import contextlib
 import inspect
@@ -18,15 +18,21 @@ from sglang.multimodal_gen.configs.models.dits.wanvideo import (
     WanVideoArchConfig,
     WanVideoConfig,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime import server_args as server_args_module
 from sglang.multimodal_gen.runtime.distributed import parallel_state
 from sglang.multimodal_gen.runtime.layers import layernorm
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
+from sglang.multimodal_gen.runtime.managers import gpu_worker
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     set_forward_context,
 )
 from sglang.multimodal_gen.runtime.models.dits import wanvideo
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+    OutputBatch,
+    Req,
+)
 from sglang.multimodal_gen.runtime.platforms.interface import Platform
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     compile_matching_submodules,
@@ -303,6 +309,60 @@ class TestWanBlockCompilesAsOneGraph(unittest.TestCase):
                     torch.testing.assert_close(
                         model(latents, text, timestep), expected, rtol=0, atol=0
                     )
+
+
+class TestDrainAfterRequest(unittest.TestCase):
+    """When the platform asks, every rank drains its device queue after each
+    request whose forward returned; on TPU a skipped drain hung the next one."""
+
+    def _serve(self, *, drain, forward, num_requests):
+        events = []
+        worker = gpu_worker.GPUWorker.__new__(gpu_worker.GPUWorker)
+        worker.pipeline = SimpleNamespace(
+            forward=lambda req, server_args: (events.append("forward"), forward())[1]
+        )
+        worker.server_args = SimpleNamespace()
+        worker.is_output_rank = True
+        worker._release_warmup_pool_before_serving = False
+        worker._realtime_sessions = SimpleNamespace(attach=lambda _req: None)
+        requests = [
+            Req(
+                sampling_params=SamplingParams(
+                    request_id=f"req-{i}", save_output=False, suppress_logs=True
+                )
+            )
+            for i in range(num_requests)
+        ]
+        platform = gpu_worker.current_platform
+        with (
+            patch.object(platform, "is_cpu", return_value=True),
+            patch.object(
+                platform, "drain_device_queue_after_request", return_value=drain
+            ),
+            patch.object(
+                torch.accelerator,
+                "synchronize",
+                side_effect=lambda: events.append("drain"),
+            ),
+        ):
+            outputs = [worker.execute_forward([req]) for req in requests]
+        return events, outputs
+
+    def test_every_finished_forward_drains_when_the_platform_asks(self):
+        for drain, expected in ((True, ["forward", "drain"]), (False, ["forward"])):
+            with self.subTest(drain=drain):
+                events, _ = self._serve(
+                    drain=drain, forward=OutputBatch, num_requests=2
+                )
+                self.assertEqual(events, expected * 2)
+
+    def test_a_failed_forward_returns_its_error_without_a_drain(self):
+        def fail():
+            raise RuntimeError("forward failed")
+
+        events, (output,) = self._serve(drain=True, forward=fail, num_requests=1)
+        self.assertEqual(events, ["forward"])
+        self.assertIn("forward failed", output.error)
 
 
 if __name__ == "__main__":

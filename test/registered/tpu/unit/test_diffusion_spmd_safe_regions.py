@@ -1,4 +1,4 @@
-"""TPU CI entry for the SPMD-safe regional-compile tests.
+"""TPU CI entry for the SPMD-safe regional-compile and request-drain tests.
 
 Mostly host-only checks, registered here because the CPU CI image does not
 install the diffusion runtime; the torch_tpu wrapper check needs torch_tpu.
@@ -17,6 +17,7 @@ from unittest.mock import patch
 import torch.compiler.config as compiler_config
 
 from sglang.multimodal_gen.test.unit.test_spmd_safe_regions import (  # noqa: F401
+    TestDrainAfterRequest,
     TestSpmdSafeRegions,
     TestWanBlockCompilesAsOneGraph,
     TestWanBlockInputsAreRankInvariant,
@@ -71,6 +72,12 @@ class TestTpuSpmdRegionWrapper(unittest.TestCase):
 
         with compiler_config.patch(cache_key_tag=""):
             self.assertIs(TpuOOTPlatform().prepare_spmd_region_wrapper(), spmd_safe)
+
+
+class TestTpuRequestDrain(unittest.TestCase):
+    def test_every_request_drains(self):
+        # Without it Wan2.2-A14B's second request hangs; see the hook.
+        self.assertTrue(TpuOOTPlatform.drain_device_queue_after_request())
 
 
 if __name__ == "__main__":
