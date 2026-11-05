@@ -212,7 +212,14 @@ class ExitPolicy:
         """Decide once, before the FFN runs, what completes its output's sum:
         the next layer's input, or this layer's postprocess step.
         ``summed_by_compute``: see ``ffn_exit``."""
-        dp_step = self._dp_reduce_scatter_step(forward_batch, steps)
+        # Compute that sums the output over its whole group leaves every rank
+        # with every token's sum, so under attention DP only the scatter back
+        # to this rank's tokens remains, not a summing reduce-scatter.
+        dp_step = (
+            None
+            if summed_by_compute
+            else self._dp_reduce_scatter_step(forward_batch, steps)
+        )
         sum_in_reduce_scatter = self._sum_in_reduce_scatter(steps, dp_step)
         complete_now = partial(
             self._complete_now,
@@ -226,8 +233,8 @@ class ExitPolicy:
             and not summed_by_compute,
         )
         if summed_by_compute:
-            # A deferred all-reduce or any summing reduce-scatter (attention DP,
-            # CP or input-scattered) would sum the output again.
+            # A deferred all-reduce or a summing reduce-scatter (CP or
+            # input-scattered) would sum the output again.
             _check_not_summed_twice(sum_in_reduce_scatter)
             return ExitDecision(
                 defer_moe_finalize=False,
@@ -351,7 +358,8 @@ class ExitPolicy:
 
         ``summed_by_compute`` marks an FFN whose compute already summed its
         output (TPU fused-RS experts): the boundary skips the sum, and still
-        runs the move and write-back. It is per call, not on the
+        runs the move and write-back; under attention DP that move is the
+        plain scatter back to this rank's tokens. It is per call, not on the
         ``OutputContract``, because ``handles_moe_reduction`` is only known
         after ``process_weights_after_loading``, once the plan is fixed."""
         return FfnExit(
