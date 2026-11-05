@@ -353,12 +353,21 @@ class TestMiniMaxH3CompiledBlock(CustomTestCase):
             run(block, 100)
         enter_region.assert_not_called()
 
-    def test_refiner_blocks_stay_eager(self):
+    def test_only_the_dit_blocks_compile(self):
+        # The refiner's blocks also match is_block and run at the prompt length.
+        _init_parallel_state()
+        with torch.device("meta"):
+            model = dit.MiniMaxH3DiTModel(
+                config=MiniMaxH3DiTConfig(arch_config=_tiny_arch()),
+                hf_config={},
+                quant_config=None,
+            )
         with _installed():
             (condition,) = dit.MiniMaxH3DiTModel._compile_conditions
-            block = torch.nn.Linear(1, 1)
-            self.assertTrue(condition("blocks.7", block))
-            self.assertFalse(condition("token_refiner.blocks.0", block))
+            compiled = {n for n, m in model.named_modules() if condition(n, m)}
+        self.assertEqual(
+            compiled, {f"blocks.{i}" for i in range(model.arch.num_layers)}
+        )
 
 
 if __name__ == "__main__":
