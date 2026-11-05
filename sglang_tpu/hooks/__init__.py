@@ -34,6 +34,7 @@ from sglang_tpu.hooks.encoder import (
     install_encoder_vision_compile,
     reject_encoder_dp,
 )
+from sglang_tpu.hooks.eviction_age_metrics import hook_specs as eviction_age_hooks
 from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.glm_flash_megakernel import (
     drop_freed_glm_flash_megakernel_request,
@@ -348,6 +349,8 @@ HOOKS.extend(host_padding_hooks())
 HOOKS.extend(hicache_swa_metrics_hooks())
 
 HOOKS.extend(swa_miss_metrics_hooks())
+
+HOOKS.extend(eviction_age_hooks())
 
 HOOKS.extend(hook_specs())
 
