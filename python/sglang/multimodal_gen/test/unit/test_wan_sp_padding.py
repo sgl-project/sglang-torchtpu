@@ -17,6 +17,9 @@ from sglang.multimodal_gen.runtime.distributed import parallel_state
 from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
 from sglang.multimodal_gen.runtime.models.dits import wanvideo
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.test.unit.test_usp_attention_kv_gather import (
+    _RankInvariantMeta,
+)
 
 _LAYER = "sglang.multimodal_gen.runtime.layers.attention.layer"
 _SP_SIZE = 4
@@ -34,6 +37,8 @@ class _RecordingSelfAttention(USPAttention):
         nn.Module.__init__(self)
         self.backend = backend
         self.causal = False
+        self.skip_sequence_parallel = False
+        self.sp_attention_mode = "ulysses"
         self.attn_impl = SimpleNamespace(supports_ring_resume=lambda: ring_resume)
         self.calls = []
 
@@ -57,21 +62,6 @@ class _NonMaskingSelfAttention(nn.Module):
 class _PassThroughNorm(nn.Module):
     def forward(self, x, shift, scale):
         return x
-
-
-class _RankInvariantMeta(dict):
-    """Tail meta whose rank-local pad count must not be read: the ring and
-    K/V-gather paths run the same program on every rank."""
-
-    def get(self, key, default=None):
-        if key == "local_pad":
-            raise AssertionError("read the rank-local pad count")
-        return super().get(key, default)
-
-    def __getitem__(self, key):
-        if key == "local_pad":
-            raise AssertionError("read the rank-local pad count")
-        return super().__getitem__(key)
 
 
 @contextlib.contextmanager
@@ -186,58 +176,52 @@ class TestWanSequenceShardPadding(unittest.TestCase):
 
     def test_padded_ulysses_ring_shards_pass_tail_meta(self):
         # U2 x R2 with an all-gather ring backend, as the Wan2.2-A14B recipe:
-        # every rank passes the global span.
-        for rank in range(_SP_SIZE):
-            with self.subTest(rank=rank):
-                (call,) = self._self_attention_calls(
-                    _PADDED,
-                    rank,
-                    AttentionBackendEnum.OOT,
-                    ulysses=2,
-                    ring_resume=True,
-                )
-                meta = call["attn_mask_meta"]
-                self.assertEqual((meta["pad_start"], meta["pad_end"]), (27, 28))
+        # every rank passes the global span, and forward hands the ring the
+        # real key count without reading the rank-local pad count.
+        ring_attention = _RecordingSelfAttention(
+            AttentionBackendEnum.OOT, ring_resume=True
+        )
+        kv_real_lens = []
 
-    def test_padded_ulysses_ring_meta_reaches_the_allgather_ring(self):
-        for rank in range(_SP_SIZE):
-            with self.subTest(rank=rank):
-                (call,) = self._self_attention_calls(
-                    _PADDED,
-                    rank,
-                    AttentionBackendEnum.OOT,
-                    ulysses=2,
-                    ring_resume=True,
-                )
-                attn = USPAttention.__new__(USPAttention)
-                nn.Module.__init__(attn)
-                attn.skip_sequence_parallel = False
-                attn.sp_attention_mode = "ulysses"
-                attn.sp_attention_mode_is_auto = False
-                attn.backend = AttentionBackendEnum.OOT
-                attn.causal = False
-                attn.attn_impl = SimpleNamespace(supports_ring_resume=lambda: True)
-                q = torch.randn(1, 7, 2, 8)
-                meta = _RankInvariantMeta(call["attn_mask_meta"])
-                with (
-                    patch(
-                        f"{_LAYER}.get_forward_context",
-                        return_value=SimpleNamespace(attn_metadata=None),
-                    ),
-                    patch(
-                        f"{_LAYER}.get_sequence_parallel_world_size",
-                        return_value=_SP_SIZE,
-                    ),
-                    patch(f"{_LAYER}.get_ring_parallel_world_size", return_value=2),
-                    patch.object(
-                        USPAttention,
-                        "_forward_allgather_ring_tail_pad",
-                        side_effect=lambda q, k, v, attn_mask_meta: q,
-                    ) as allgather_ring,
-                ):
-                    attn.forward(q, q, q, attn_mask_meta=meta)
-                ((_, _, _, routed_meta), _) = allgather_ring.call_args
-                self.assertEqual(routed_meta["pad_start"], 27)
+        def allgather_ring(q, k, v, *, attn_impl, kv_real_len):
+            kv_real_lens.append(kv_real_len)
+            return q
+
+        with (
+            patch(
+                f"{_LAYER}.get_forward_context",
+                return_value=SimpleNamespace(attn_metadata=None),
+            ),
+            patch(
+                f"{_LAYER}._usp_input_all_to_all_qkv",
+                side_effect=lambda q, k, v: (q, k, v),
+            ),
+            patch(
+                f"{_LAYER}._usp_output_all_to_all", side_effect=lambda t, head_dim: t
+            ),
+            patch(f"{_LAYER}.allgather_kv_ring_attn", side_effect=allgather_ring),
+        ):
+            for rank in range(_SP_SIZE):
+                with self.subTest(rank=rank):
+                    (call,) = self._self_attention_calls(
+                        _PADDED,
+                        rank,
+                        AttentionBackendEnum.OOT,
+                        ulysses=2,
+                        ring_resume=True,
+                    )
+                    meta = call["attn_mask_meta"]
+                    self.assertEqual((meta["pad_start"], meta["pad_end"]), (27, 28))
+                    q = torch.randn(1, 7, 2, 8)
+                    with _sp_rank(rank, ulysses=2):
+                        USPAttention.forward(
+                            ring_attention,
+                            q,
+                            q,
+                            q,
+                            attn_mask_meta=_RankInvariantMeta(meta),
+                        )
+        self.assertEqual(kv_real_lens, [27] * _SP_SIZE)
 
     def test_ring_backends_without_tail_support_attend_the_pad_keys(self):
         # A sage_attn ring has no real-length clamp, and FA's clamps batch 1

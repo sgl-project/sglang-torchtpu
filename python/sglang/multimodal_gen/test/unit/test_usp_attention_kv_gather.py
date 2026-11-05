@@ -62,6 +62,24 @@ def _reference_attention(q, k, v, scale, key_mask=None, query_mask=None):
     return out
 
 
+class _RankInvariantMeta(dict):
+    """Tail-pad meta whose rank-local entries fail when read: the pad span is
+    the same on every rank, the per-rank pad count is not, and a path compiled
+    in an spmd-safe region must run the same program on every rank."""
+
+    rank_local_keys = frozenset({"local_pad"})
+
+    def get(self, key, default=None):
+        if key in self.rank_local_keys:
+            raise AssertionError(f"read the rank-local {key}")
+        return super().get(key, default)
+
+    def __getitem__(self, key):
+        if key in self.rank_local_keys:
+            raise AssertionError(f"read the rank-local {key}")
+        return super().__getitem__(key)
+
+
 class TestUSPAttentionKVGather(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(0)
@@ -156,19 +174,6 @@ class TestUSPAttentionKVGather(unittest.TestCase):
         torch.testing.assert_close(out, expected)
 
     def test_tail_pad_meta_attends_the_global_real_prefix_on_every_rank(self):
-        class _RankInvariantMeta(dict):
-            # The span is the same on every rank; the per-rank pad count is not
-            # and must not reach the program (spmd-safe compiled regions).
-            def get(self, key, default=None):
-                if key == "local_pad":
-                    raise AssertionError("read the rank-local pad count")
-                return super().get(key, default)
-
-            def __getitem__(self, key):
-                if key == "local_pad":
-                    raise AssertionError("read the rank-local pad count")
-                return super().__getitem__(key)
-
         real, local_len, world = 5, 3, 2
         full_k = torch.randn(2, local_len * world, self.heads, self.head_dim)
         full_v = torch.randn(2, local_len * world, self.heads, self.head_dim)

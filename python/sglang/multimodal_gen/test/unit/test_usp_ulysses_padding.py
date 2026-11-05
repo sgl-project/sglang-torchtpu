@@ -12,6 +12,9 @@ import torch.nn.functional as F
 from sglang.multimodal_gen.runtime.layers.attention import layer
 from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.test.unit.test_usp_attention_kv_gather import (
+    _RankInvariantMeta,
+)
 
 _LAYER = "sglang.multimodal_gen.runtime.layers.attention.layer"
 
@@ -96,11 +99,9 @@ class TestUlyssesPadding(unittest.TestCase):
     def _tail_pad_forward(self, backend, heads=2, degree=2):
         torch.manual_seed(0)
         q, k, v = (torch.randn(1, self.real + self.pad, heads, 8) for _ in range(3))
-        meta = {
-            "pad_start": self.real,
-            "pad_end": self.real + self.pad,
-            "local_pad": self.pad,
-        }
+        meta = _RankInvariantMeta(
+            pad_start=self.real, pad_end=self.real + self.pad, local_pad=self.pad
+        )
         attn, exchanged_heads = _attention(backend), []
         with _ulysses(degree, exchanged_heads):
             out = attn.forward(q, k, v, attn_mask_meta=meta)

@@ -38,6 +38,9 @@ from sglang.multimodal_gen.runtime.platforms.interface import Platform
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     compile_matching_submodules,
 )
+from sglang.multimodal_gen.test.unit.test_usp_attention_kv_gather import (
+    _RankInvariantMeta,
+)
 
 _COMPILE = "sglang.multimodal_gen.runtime.utils.torch_compile"
 
@@ -138,20 +141,17 @@ class _Stop(Exception):
     """Ends the forward once block 0's inputs are recorded."""
 
 
-# Rank-local entries of the shared tail-pad meta. Only the CUDA varlen-FA
-# K/V-gather path reads it; the paths compiled in spmd_safe regions mask from
-# the global pad_start/pad_end instead.
-_RANK_LOCAL_META_KEYS = frozenset({"local_pad"})
-
-
 class _RecordingBlock(nn.Module):
     def forward(self, *args, attn_mask_meta=None, **kwargs):
         self.args = args
         self.attn_mask_meta = attn_mask_meta
+        # A program depends only on the meta entries it reads, and the
+        # attention paths read the global pad span, never the rank-local
+        # entries (the tests that use _RankInvariantMeta check them).
         meta = {
             key: value
             for key, value in (attn_mask_meta or {}).items()
-            if key not in _RANK_LOCAL_META_KEYS
+            if key not in _RankInvariantMeta.rank_local_keys
         }
         leaves = tree_leaves((args, kwargs, meta))
         self.layouts = [
