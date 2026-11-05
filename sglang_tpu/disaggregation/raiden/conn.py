@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import inspect
 import math
 import os
 import threading
@@ -131,6 +132,18 @@ def _describe_failure(
     if transfer.reason is not None:
         parts.append(f"reason={transfer.reason}")
     return " ".join(parts)
+
+
+def _accepts_staging_layers() -> bool:
+    """Whether the installed tpu-sync KVCacheManager takes num_staging_layers
+    (google/tpu-sync#1402); older wheels only keep full host mirrors."""
+    from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
+
+    parameters = inspect.signature(KVCacheManager).parameters.values()
+    return any(
+        p.name == "num_staging_layers" or p.kind is inspect.Parameter.VAR_KEYWORD
+        for p in parameters
+    )
 
 
 class RaidenKVManager(
@@ -457,6 +470,16 @@ class RaidenKVManager(
     def _build_engine(self) -> None:
         if self._engine is not None or self._kv_caches is None:
             return
+        if self._staging_layers_total and not _accepts_staging_layers():
+            # TODO(chenjincheng): Remove once tpu-sync-torch is pinned past
+            # google/tpu-sync#1489; this pin predates num_staging_layers.
+            logger.warning(
+                "%s=%d ignored: the installed tpu-sync-torch KVCacheManager has "
+                "no num_staging_layers; keeping full host mirrors.",
+                tpu_envs.SGLANG_TPU_RAIDEN_STAGING_LAYERS.name,
+                self._staging_layers_total,
+            )
+            self._staging_layers_total = 0
         max_blocks = self._max_request_blocks()
         engines = [(self._kv_caches, max_blocks)]
         if self._swa_kv_caches:
@@ -560,6 +583,9 @@ class RaidenKVManager(
         from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
 
         endpoint = NetworkAddress(host=self.local_ip, port=port).to_host_port_str()
+        options = {}
+        if _accepts_staging_layers():
+            options["num_staging_layers"] = staging_layers
         engine = KVCacheManager(
             kv_caches=kv_caches,
             node_id=self._local_rank,
@@ -568,7 +594,7 @@ class RaidenKVManager(
             num_slots=num_slots,
             timeout_s=self._timeout_s,
             parallelism=self._transfer_parallelism,
-            num_staging_layers=staging_layers,
+            **options,
         )
         return endpoint, engine
 
