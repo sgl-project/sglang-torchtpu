@@ -162,6 +162,7 @@ class TestRaidenCarriesHiddenNotDraftKv(CustomTestCase):
                 groups.full,
                 layout,
                 ships_pd_hidden=False,
+                seq_along_lane=False,
             )
             for groups in (with_hidden, without)
         ]
@@ -176,15 +177,16 @@ class TestRaidenCarriesHiddenNotDraftKv(CustomTestCase):
             swa=[],
             swa_layer_ids=[],
             num_draft_swa=0,
+            seq_along_lane=False,
         )
         layout = lambda tensor: ((4, 3, 2, 1, 0), ((2, 128),), 16)  # noqa: E731
         pools = raiden_pipeline.pool_manifest(groups)
         self.assertNotEqual(
             raiden_pipeline.layout_fingerprint(
-                pools, groups.full, layout, ships_pd_hidden=True
+                pools, groups.full, layout, ships_pd_hidden=True, seq_along_lane=False
             ),
             raiden_pipeline.layout_fingerprint(
-                pools, groups.full, layout, ships_pd_hidden=False
+                pools, groups.full, layout, ships_pd_hidden=False, seq_along_lane=False
             ),
         )
 

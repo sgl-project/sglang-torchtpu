@@ -31,7 +31,7 @@ from sglang_tpu.dsv4.dsv4_memory_pool import (
     TPUDeepSeekV4IndexerPool,
     TPUDeepSeekV4SWAKVPool,
 )
-from sglang_tpu.kv_pool import TpuBlockMajorMHATokenToKVPool
+from sglang_tpu.kv_pool import TpuBlockMajorMHATokenToKVPool, TpuSeqAlongLaneKVPool
 from sglang_tpu.mamba_pool import TpuMambaPool
 
 # One logger for the whole package, deliberately keeping the name of the module
@@ -96,6 +96,9 @@ class RaidenKVCacheGroups:
     # Optional host-side metadata pack/unpack hooks accompanying state_blocks.
     read_state_meta: Optional[Callable[[Sequence[int]], bytes]] = None
     write_state_meta: Optional[Callable[[Sequence[int], bytes], None]] = None
+    # Target (and travelling draft) pools are TpuSeqAlongLaneKVPool; the PD hidden
+    # pool stays fused.
+    seq_along_lane: bool = False
 
 
 def _assert_root_buffers(name: str, buffers: Sequence[torch.Tensor]) -> None:
@@ -141,6 +144,24 @@ def _block_major_groups(pool: KVCache) -> Optional[RaidenKVCacheGroups]:
     _assert_root_buffers("block-major full KV", groups.full)
     _assert_root_buffers("block-major SWA KV", groups.swa)
     return groups
+
+
+def _is_seq_along_lane(pool: KVCache) -> bool:
+    """Whether pool's KV pages are SEQ_ALONG_LANE; a rank-5 page reads the same in
+    either layout, so this is the only way Raiden tells them apart."""
+    if isinstance(pool, SWAKVPool):
+        sub_pools = [pool.full_kv_pool, pool.swa_kv_pool]
+    elif isinstance(pool, HybridLinearKVPool):
+        sub_pools = [pool.full_kv_pool]
+    else:
+        sub_pools = [pool]
+    flags = {isinstance(sub, TpuSeqAlongLaneKVPool) for sub in sub_pools}
+    if len(flags) != 1:
+        raise ValueError(
+            "Raiden needs one KV page layout per pool; the full-attention and "
+            "sliding-window sub-pools differ on SEQ_ALONG_LANE"
+        )
+    return flags.pop()
 
 
 def get_raiden_kv_caches(
@@ -237,6 +258,7 @@ def get_raiden_kv_caches(
         draft_pool = None
 
     groups = group_one(pool)
+    seq_along_lane = _is_seq_along_lane(pool)
     full, swa = list(groups.full), list(groups.swa)
     full_ids, swa_ids = list(groups.full_layer_ids), list(groups.swa_layer_ids)
     num_draft_full = num_draft_swa = num_hidden_full = 0
@@ -244,6 +266,11 @@ def get_raiden_kv_caches(
     draft_swa_kv_head_num: Optional[int] = None
     if draft_pool is not None and draft_pool is not pool:
         draft_groups = group_one(draft_pool)
+        if _is_seq_along_lane(draft_pool) != seq_along_lane:
+            raise NotImplementedError(
+                "Raiden moves draft KV in the target's page layout; the draft and "
+                "target pools differ on SEQ_ALONG_LANE"
+            )
         num_draft_full, num_draft_swa = len(draft_groups.full), len(draft_groups.swa)
         full.extend(draft_groups.full)
         swa.extend(draft_groups.swa)
@@ -305,4 +332,5 @@ def get_raiden_kv_caches(
         committed_state_row=committed_state_row,
         read_state_meta=read_state_meta,
         write_state_meta=write_state_meta,
+        seq_along_lane=seq_along_lane,
     )
