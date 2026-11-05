@@ -212,6 +212,8 @@ def _build_stub_text_stage(
     stage._capture_slots_by_layer = {}
     stage.start_layer = start_layer
     stage.end_layer = end_layer
+    stage.prefill_sp_min_tokens = None
+    stage.tp_size = 1
     stage.embed_tokens = (
         (
             ref_embed
@@ -252,7 +254,7 @@ def _build_stub_text_stage(
         torch.nn.init.normal_(layer.post_feedforward_residual_gate.gate, std=0.5)
         layer.post_feedforward_residual_gate.precompute_coefficients()
 
-        def _fwd(positions, stream, forward_batch, lyr=layer):
+        def _fwd(positions, stream, forward_batch, sequence_parallel, lyr=layer):
             attn_in = lyr.input_layernorm(stream).to(torch.bfloat16)
             stream = lyr.post_attention_residual_gate(
                 stream,
@@ -421,6 +423,82 @@ class TestMuseSparkPipelineParallel(CustomTestCase):
             if end < 62:
                 self.assertTrue(fn(stub, "model.layers.61.mlp.gate.weight"))
 
+    def test_sequence_parallel_prefill_hands_off_the_whole_stream(self):
+        """Under SP the next PP stage takes its own token shard, so a non-last stage
+        gathers the shards before the handoff; the result matches PP1 without SP."""
+        import threading
+        from types import SimpleNamespace
+
+        import sglang_tpu.models.muse_spark as muse_mod
+
+        torch.manual_seed(7)
+        num_layers, tp_size = 4, 2
+        capture_ids = [3, 1]
+        ref = _build_stub_text_stage(
+            num_layers, 0, num_layers, is_first=True, is_last=True
+        )
+        ref._set_layers_to_capture(capture_ids)
+        input_ids = torch.tensor([1, 7, 13, 29])
+        positions = torch.arange(4)
+        ref_hidden, ref_aux = ref(input_ids, positions, None)
+
+        def _rank_stages(rank: int):
+            stages = []
+            for s, e in ((0, 2), (2, 4)):
+                st = _build_stub_text_stage(
+                    num_layers,
+                    s,
+                    e,
+                    is_first=(s == 0),
+                    is_last=(e == num_layers),
+                    ref_layers=list(ref.layers),
+                    ref_embed=ref.embed_tokens,
+                    ref_norm=ref.norm,
+                )
+                st._set_layers_to_capture(capture_ids)
+                st.prefill_sp_min_tokens = 1
+                st.tp_size = tp_size
+                st.register_buffer(
+                    "_tp_rank_t", torch.tensor([rank], dtype=torch.int32)
+                )
+                stages.append(st)
+            return stages
+
+        barrier = threading.Barrier(tp_size)
+        slots: list = [None] * tp_size
+        local = threading.local()
+
+        def _lockstep_gather(shard: torch.Tensor) -> torch.Tensor:
+            slots[local.rank] = shard
+            barrier.wait()
+            full = torch.cat(slots, dim=0)
+            barrier.wait()
+            return full
+
+        extend = SimpleNamespace(forward_mode=SimpleNamespace(is_extend=lambda: True))
+        outputs: dict = {}
+
+        def _run(rank: int):
+            local.rank = rank
+            first, last = _rank_stages(rank)
+            proxy = first(input_ids, positions, extend)
+            outputs[rank] = (
+                proxy,
+                last(input_ids, positions, extend, pp_proxy_tensors=proxy),
+            )
+
+        with patch.object(muse_mod, "_gather_tokens", _lockstep_gather):
+            threads = [threading.Thread(target=_run, args=(r,)) for r in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        for rank in range(tp_size):
+            proxy, (hidden, aux) = outputs[rank]
+            self.assertEqual(proxy.tensors["hidden_states"].shape[0], 4)
+            torch.testing.assert_close(hidden, ref_hidden)
+            torch.testing.assert_close(aux, ref_aux)
+
     def test_make_pp_layers_builds_muse_spark_text_model_stages(self):
         import os
         from types import SimpleNamespace
@@ -473,6 +551,8 @@ class TestMuseSparkPipelineParallel(CustomTestCase):
             fake_parallel = SimpleNamespace(
                 pp_rank=pp_rank,
                 pp_size=8,
+                tp_rank=0,
+                tp_size=1,
                 pp_group=SimpleNamespace(
                     world_size=8,
                     rank_in_group=pp_rank,

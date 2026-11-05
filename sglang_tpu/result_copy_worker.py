@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Optional
 
 import torch
 
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 
@@ -26,8 +28,12 @@ class TpuAsyncCopyEvent:
 
     def synchronize(self) -> None:
         """Wait for submission and transfer, propagating worker errors."""
-        self.submitted.result()
-        self.event.synchronize()
+        from sglang.srt.utils.diag_timing import timed as _dt
+
+        with _dt("4a_copy_submit_wait"):
+            self.submitted.result()
+        with _dt("4b_copy_event_wait"):
+            self.event.synchronize()
 
     def query(self) -> bool:
         """Return whether synchronize() would return without blocking.
@@ -53,6 +59,9 @@ def _draft_tail(result: GenerationBatchResult) -> Optional[torch.Tensor]:
         return draft_input.kv_fence_tail
     if isinstance(draft_input, EagleDraftInput):
         return draft_input.topk_index
+    if isinstance(draft_input, DFlashDraftInputV2):
+        # The DFLASH draft KV append runs after verify.
+        return draft_input.draft_kv_write_tail
     return None
 
 
@@ -86,6 +95,9 @@ class TPUAsyncCopyWorker:
         """
         event = result.copy_done
         tail = _draft_tail(result) if self.copy_draft_tail else None
+        # DIAG (remove): SGLANG_TPU_DIAG_SKIP_DRAFT_TAIL=1 skips the tail copy.
+        if os.environ.get("SGLANG_TPU_DIAG_SKIP_DRAFT_TAIL") == "1":
+            tail = None
         if tail is not None and tail._base is not None:
             # A view of a pool the next step donates: clone it here, on the scheduler's
             # stream ahead of that step, so the copy thread never reads a donated buffer.

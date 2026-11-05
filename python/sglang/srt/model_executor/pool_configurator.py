@@ -920,6 +920,14 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 )
 
         self._draft_cell_size = _dflash_draft_cell_size(kvc)
+        # A hybrid-SWA DFLASH draft keeps its KV in the target's SWA slots.
+        self._draft_swa_cell_size = 0
+        if kvc.spec_aux_config.dflash_draft_kv_is_swa:
+            if self._enable_unified_memory:
+                raise ValueError(
+                    "A hybrid-SWA DFLASH draft does not support unified memory."
+                )
+            self._draft_swa_cell_size, self._draft_cell_size = self._draft_cell_size, 0
 
         self._recompute_cell_size()
 
@@ -933,6 +941,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 + self._draft_swa_per_token * self._draft_swa_layers_num
                 + self._draft_swa_per_token * self._draft_swa_full_layers_num
                 + self._draft_cell_size
+                + self._draft_swa_cell_size
             )
         else:
             self._cell_size = (
@@ -943,6 +952,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 * (
                     self._swa_per_token * self._swa_layers_num
                     + self._draft_swa_per_token * self._draft_swa_layers_num
+                    + self._draft_swa_cell_size
                 )
                 + self._draft_cell_size
             )
@@ -957,6 +967,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             + self._draft_swa_per_token
             * (self._draft_swa_layers_num + self._draft_swa_full_layers_num)
             + self._draft_cell_size
+            + self._draft_swa_cell_size
         )
 
     def _draft_pool_bytes_per_token(self) -> int:
@@ -1067,6 +1078,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         return ceil_align(self._pipeline_swa_tokens, page_size) * (
             self._swa_per_token * self._swa_layers_num
             + self._draft_swa_per_token * self._draft_swa_layers_num
+            + self._draft_swa_cell_size
         )
 
     def calculate_pool_sizes(

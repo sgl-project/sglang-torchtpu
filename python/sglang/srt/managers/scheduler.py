@@ -220,6 +220,7 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     Req,
     ScheduleBatch,
+    mixed_tail_width,
     retract_all,
 )
 from sglang.srt.managers.schedule_policy import (
@@ -393,6 +394,8 @@ else:
 
 
 logger = logging.getLogger(__name__)
+from sglang.srt.utils.diag_timing import maybe_log as _dlog  # DIAG
+from sglang.srt.utils.diag_timing import timed as _dt
 
 
 def _prewarm_hccl_group(device, group, device_module):
@@ -1362,6 +1365,21 @@ class Scheduler(
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
         self.prefill_decode_interval = get_schedule().prefill_decode_interval or 0
         self._prefill_decode_interval_remaining = 0
+        self.prefill_chunk_share_min_tokens = (
+            envs.SGLANG_PREFILL_CHUNK_SHARE_MIN_TOKENS.get()
+        )
+        # DP attention keeps the interval in lockstep across ranks, whose running
+        # batches differ, so only non-DP schedulers may skip it locally.
+        self.prefill_decode_interval_skip_idle = (
+            envs.SGLANG_PREFILL_DECODE_INTERVAL_SKIP_IDLE.get()
+            and not self.require_mlp_sync
+        )
+        # Like skip-idle, a per-rank chunked request would split the DP cadence.
+        self.prefill_decode_interval_chunked = (
+            None
+            if self.require_mlp_sync
+            else envs.SGLANG_PREFILL_DECODE_INTERVAL_CHUNKED.get()
+        )
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -1415,8 +1433,11 @@ class Scheduler(
         if sizer.profile_and_fit():
             self.dynamic_chunk_sizer = sizer
 
-    def _should_defer_prefill(self) -> bool:
+    def _should_defer_prefill(self, running_batch: ScheduleBatch) -> bool:
         if self._prefill_decode_interval_remaining == 0:
+            return False
+        if self.prefill_decode_interval_skip_idle and running_batch.is_empty():
+            self._prefill_decode_interval_remaining = 0
             return False
 
         self._prefill_decode_interval_remaining -= 1
@@ -1435,7 +1456,12 @@ class Scheduler(
             else batch.forward_mode.is_extend()
         )
         if is_extend:
-            self._prefill_decode_interval_remaining = self.prefill_decode_interval
+            self._prefill_decode_interval_remaining = (
+                self.prefill_decode_interval_chunked
+                if self.prefill_decode_interval_chunked is not None
+                and self.chunked_req is not None
+                else self.prefill_decode_interval
+            )
 
     def init_metrics_reporter(self) -> None:
         # Override point for deployments that need a specialized reporter.
@@ -1850,15 +1876,20 @@ class Scheduler(
             or draft_runner.model.config.vocab_size
         )
 
-        precompile_spec_v2_ops(
-            device=torch.device(self.tp_worker.model_runner.device),
-            physical_batch_buckets=compile_policy.b_bucketer.buckets,
-            num_verify_tokens=compile_policy.draft_token_num,
-            vocab_size=self.model_config.vocab_size,
-            draft_vocab_size=draft_vocab_size,
-            hidden_size=hidden_size,
-            hidden_dtype=hidden_dtype,
-        )
+        verify_shapes = {
+            compile_policy.draft_token_num: compile_policy.full_verify_buckets(),
+            **compile_policy.narrow_verify_shapes(),
+        }
+        for num_verify_tokens, buckets in verify_shapes.items():
+            precompile_spec_v2_ops(
+                device=torch.device(self.tp_worker.model_runner.device),
+                physical_batch_buckets=buckets,
+                num_verify_tokens=num_verify_tokens,
+                vocab_size=self.model_config.vocab_size,
+                draft_vocab_size=draft_vocab_size,
+                hidden_size=hidden_size,
+                hidden_dtype=hidden_dtype,
+            )
 
     def maybe_init_ngram_embedding(self):
         self.ngram_embedding_manager = (
@@ -2122,15 +2153,18 @@ class Scheduler(
                 break
 
             # Receive requests
-            self.ingest_requests()
+            _dlog()
+            with _dt("1_ingest"):
+                self.ingest_requests()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
             # Get the next batch to run
-            plan = self.get_next_batch_to_run(
-                running_batch=self.running_batch, last_batch=self.last_batch
-            )
+            with _dt("2_get_next_batch"):
+                plan = self.get_next_batch_to_run(
+                    running_batch=self.running_batch, last_batch=self.last_batch
+                )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
@@ -2166,7 +2200,9 @@ class Scheduler(
                 break
 
             # Receive requests
-            self.ingest_requests()
+            _dlog()
+            with _dt("1_ingest"):
+                self.ingest_requests()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -2177,9 +2213,10 @@ class Scheduler(
                 assert len(self.result_queue) <= 1
 
             # Get the next batch to run
-            plan = self.get_next_batch_to_run(
-                running_batch=self.running_batch, last_batch=self.last_batch
-            )
+            with _dt("2_get_next_batch"):
+                plan = self.get_next_batch_to_run(
+                    running_batch=self.running_batch, last_batch=self.last_batch
+                )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
@@ -2204,7 +2241,8 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                batch_result = self.run_batch(batch)
+                with _dt("3_run_batch"):
+                    batch_result = self.run_batch(batch)
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
@@ -2217,7 +2255,8 @@ class Scheduler(
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch:
-                    pop_and_process()
+                    with _dt("4_process_last"):
+                        pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
@@ -3965,7 +4004,10 @@ class Scheduler(
             or self.enable_unified_cache_external_linker
             or self.enable_lmcache
         ):
-            self.tree_cache.check_hicache_events()
+            from sglang.srt.utils.diag_timing import timed as _dt
+
+            with _dt("2a_hicache_events"):
+                self.tree_cache.check_hicache_events()
             if self.enable_hicache_storage and should_retry_storage_prefetch:
                 self._process_storage_prefetch_retries()
 
@@ -4054,7 +4096,7 @@ class Scheduler(
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
-        elif self._should_defer_prefill():
+        elif self._should_defer_prefill(running_batch):
             new_batch = None
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
@@ -4272,7 +4314,11 @@ class Scheduler(
             self.new_token_ratio_tracker.current,
             self.max_prefill_tokens,
             chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            (
+                running_bs * mixed_tail_width(self.spec_algorithm)
+                if self.is_mixed_chunk
+                else 0
+            ),
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,
@@ -4371,6 +4417,13 @@ class Scheduler(
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
+            if (
+                self.chunked_req is not None
+                and self.prefill_chunk_share_min_tokens
+                and not self.policy.fits_shared_chunk(req, adder.rem_chunk_tokens or 0)
+            ):
+                # A long prompt waits for its own turn instead of ending the scan.
+                continue
             req.init_next_round_input(self.tree_cache)
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
