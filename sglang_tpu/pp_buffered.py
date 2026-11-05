@@ -42,6 +42,13 @@ fences until at most ``_MAX_RECEIVES`` receive calls are outstanding. The
 scheduler loop can run several micro-batches ahead of the device, so this
 bound is not implied by the loop.
 
+The scheduler thread never waits on a device fence to post: a receive that
+must wait for a flag is handed to a posting thread, as in vllm-torchtpu, and
+the scheduler waits for it only right before launching the forward, after
+its other work between the two (the output relay). A receive that needs no
+fence wait (fences that have passed are dropped first, without waiting) is
+posted on the scheduler thread, which avoids a thread hop per forward.
+
 The sender hands its output on from a helper thread. ``end_iteration``
 submits the ops that produce the outgoing tensors and queues the transfer;
 the helper waits until the tensors exist on the device (a send reads the
@@ -58,6 +65,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterable
+from concurrent.futures import Future
 from typing import Any
 
 import torch
@@ -164,6 +172,13 @@ class Transport:
         return event
 
 
+def _passed(fence: Any) -> bool:
+    """Whether a device fence has passed, without waiting; a fence that cannot
+    tell counts as not passed."""
+    query = getattr(fence, "query", None)
+    return bool(query()) if query is not None else False
+
+
 def hbm_reserve_bytes(
     *,
     max_rows: int,
@@ -265,6 +280,7 @@ class PPBufferedHandoff:
         self._post_count = 0
         self._post_total_s = 0.0
         self._post_max_s = 0.0
+        self._thread_posts = 0
         self._ones: dict[torch.dtype, torch.Tensor] = {}
         # Sends queued for the helper thread, the one in progress first.
         self._cv = threading.Condition()
@@ -272,6 +288,19 @@ class PPBufferedHandoff:
         self._closing = False
         self._error: BaseException | None = None
         self._thread: threading.Thread | None = None
+        # Receives queued for the posting thread, in transfer order.
+        self._post_cv = threading.Condition()
+        self._to_post: deque[tuple[int, int, Future]] = deque()
+        self._post_closing = False
+        # The posting thread is working on a receive it has taken off the queue.
+        self._posting = False
+        self._post_error: BaseException | None = None
+        self._post_thread: threading.Thread | None = None
+        # Time the scheduler waits for a queued receive to be posted, over the
+        # current logging window (_note_wait).
+        self._wait_count = 0
+        self._wait_total_s = 0.0
+        self._wait_max_s = 0.0
 
     # -- helpers --------------------------------------------------------------
     @staticmethod
@@ -291,11 +320,18 @@ class PPBufferedHandoff:
                 raise RuntimeError(
                     f"buffered hand-off stage {self.rank}: the send thread failed"
                 ) from self._error
+        with self._post_cv:
+            if self._post_error is not None:
+                raise RuntimeError(
+                    f"buffered hand-off stage {self.rank}: the posting thread failed"
+                ) from self._post_error
 
     def _wait_for_receive_flags(self) -> None:
         """Waits until posting one more transfer keeps at most
         _MAX_RECEIVES receive calls outstanding (one per transfer: its
-        tensors are posted together)."""
+        tensors are posted together). Runs on the posting thread; the
+        scheduler thread appends a fence after each forward that received,
+        and has launched every earlier forward before it queues a post."""
         while self._landing and len(self._landing) + 1 > _MAX_RECEIVES:
             _, fence = self._landing.popleft()
             with torch.profiler.record_function("pp_buffered_wait_receive_flags"):
@@ -345,9 +381,12 @@ class PPBufferedHandoff:
             return x
         return x.reshape(rows, width) * self._one(x.dtype)
 
-    def _post(self, transfer: int, rows: int) -> tuple[torch.Tensor, ...]:
+    def _post(
+        self, transfer: int, rows: int, *, threaded: bool = False
+    ) -> tuple[torch.Tensor, ...]:
         """Posts the receives of one transfer of ``rows`` rows and returns the
-        tensors they land in, in their wire shapes."""
+        tensors they land in, in their wire shapes. ``threaded``: called from
+        the posting thread (for the post-time log)."""
         self._check_rows(transfer, rows)
         started = time.perf_counter()
         received = [
@@ -359,29 +398,51 @@ class PPBufferedHandoff:
         # The work does not wait for the data; the forward that reads the
         # tensors runs after they land.
         self._transport.recv_list(received, src=self.prev, tag=self._tag(transfer))
-        self._note_post(time.perf_counter() - started)
+        self._note_post(time.perf_counter() - started, threaded=threaded)
         return tuple(received)
 
-    def _note_post(self, seconds: float) -> None:
-        """Track how long posting a receive holds the scheduler thread (the
-        allocation and a store round trip). Every _POST_LOG_EVERY posts, log
-        the mean and max of that window and start a new one, so one slow post
-        shows up in one log line only."""
+    def _note_post(self, seconds: float, *, threaded: bool = False) -> None:
+        """Track how long posting a receive takes (the allocation and a store
+        round trip), on the scheduler thread or, when ``threaded``, on the
+        posting thread. Every _POST_LOG_EVERY posts, log the mean and max of
+        that window and how many posts took the thread, and start a new
+        window, so one slow post shows up in one log line only."""
         self._post_count += 1
+        self._thread_posts += int(threaded)
         self._post_total_s += seconds
         self._post_max_s = max(self._post_max_s, seconds)
         if self._post_count % _POST_LOG_EVERY == 0:
             logger.info(
                 "buffered hand-off stage %d: %d receives posted; the last %d took "
-                "%.3f ms mean, %.3f ms max on the scheduler thread",
+                "%.3f ms mean, %.3f ms max, %d of them on the posting thread",
                 self.rank,
                 self._post_count,
                 _POST_LOG_EVERY,
                 1000 * self._post_total_s / _POST_LOG_EVERY,
                 1000 * self._post_max_s,
+                self._thread_posts,
             )
             self._post_total_s = 0.0
             self._post_max_s = 0.0
+            self._thread_posts = 0
+
+    def _note_wait(self, seconds: float) -> None:
+        """Track how long the scheduler waits for its queued receive to be
+        posted before launching the forward, logged per window as _note_post."""
+        self._wait_count += 1
+        self._wait_total_s += seconds
+        self._wait_max_s = max(self._wait_max_s, seconds)
+        if self._wait_count % _POST_LOG_EVERY == 0:
+            logger.info(
+                "buffered hand-off stage %d: the scheduler waited for the last %d "
+                "receives to be posted %.3f ms mean, %.3f ms max",
+                self.rank,
+                _POST_LOG_EVERY,
+                1000 * self._wait_total_s / _POST_LOG_EVERY,
+                1000 * self._wait_max_s,
+            )
+            self._wait_total_s = 0.0
+            self._wait_max_s = 0.0
 
     def _zero_residual(self, rows: int) -> torch.Tensor:
         zero = self._zero_residuals.get(rows)
@@ -403,9 +464,11 @@ class PPBufferedHandoff:
             self.forwards += 1
             self._current = self.transfers
 
-    def receive(self, rows: int) -> dict[str, torch.Tensor] | None:
-        """Before a forward of ``rows`` padded tokens: post its receives and
-        return the incoming activations; None on stage 0."""
+    def post_receive(self, rows: int) -> Callable[[], dict[str, torch.Tensor]] | None:
+        """Before a forward of ``rows`` padded tokens: queue its receives for
+        the posting thread and return a callable that waits until they are
+        posted and returns the incoming activations; None on stage 0. Call it
+        right before the forward is launched."""
         if not self._has_batch:
             raise RuntimeError(
                 f"buffered hand-off stage {self.rank}: receive() outside an "
@@ -413,28 +476,111 @@ class PPBufferedHandoff:
             )
         if self.rank == 0:
             return None
-        self._wait_for_receive_flags()
-        with torch.profiler.record_function("pp_buffered_post"):
-            received = self._post(self._current, rows)
+        transfer = self._current
+        self._check_rows(transfer, rows)
+        landing: Future = Future()
+        with self._post_cv:
+            idle = not self._to_post and not self._posting
+            if idle:
+                # Fences that have already passed free their receive flags
+                # without a wait.
+                while self._landing and _passed(self._landing[0][1]):
+                    self._landing.popleft()
+            # With the posting thread idle and a receive flag free, the post
+            # needs no fence wait, so it runs here, without a thread hop.
+            inline = idle and len(self._landing) + 1 <= _MAX_RECEIVES
+        if inline:
+            try:
+                with torch.profiler.record_function("pp_buffered_post"):
+                    landing.set_result(self._post(transfer, rows))
+            except BaseException as exc:
+                raise RuntimeError(
+                    f"buffered hand-off stage {self.rank}: posting transfer "
+                    f"{transfer} failed"
+                ) from exc
+        else:
+            if self._post_thread is None:
+                self._post_thread = threading.Thread(
+                    target=self._post_loop, name="pp-buffered-post", daemon=True
+                )
+                self._post_thread.start()
+            with self._post_cv:
+                self._to_post.append((transfer, rows, landing))
+                self._post_cv.notify_all()
         self._received_this_iteration = True
-        for x in received:
-            self._transport.wait_landed(x)
-        return self.unpack(
-            tuple(
-                self._from_wire(x, rows, width)
-                for x, width in zip(received, self.widths)
-            ),
-            rows,
-        )
 
-    def receive_batch(self, batch: Any) -> dict[str, torch.Tensor] | None:
-        """receive() at the padded token count of ``batch``'s forward."""
+        def wait() -> dict[str, torch.Tensor]:
+            started = time.perf_counter()
+            with torch.profiler.record_function("pp_buffered_wait_posted"):
+                error = landing.exception()
+            self._note_wait(time.perf_counter() - started)
+            if error is not None:
+                raise RuntimeError(
+                    f"buffered hand-off stage {self.rank}: posting transfer "
+                    f"{transfer} failed"
+                ) from error
+            received = landing.result()
+            for x in received:
+                self._transport.wait_landed(x)
+            return self.unpack(
+                tuple(
+                    self._from_wire(x, rows, width)
+                    for x, width in zip(received, self.widths)
+                ),
+                rows,
+            )
+
+        return wait
+
+    def receive(self, rows: int) -> dict[str, torch.Tensor] | None:
+        """post_receive and wait for it: the incoming activations of a forward
+        of ``rows`` padded tokens; None on stage 0."""
+        pending = self.post_receive(rows)
+        return None if pending is None else pending()
+
+    def receive_batch(self, batch: Any) -> Callable[[], dict[str, torch.Tensor]] | None:
+        """post_receive at the padded token count of ``batch``'s forward. The
+        scheduler calls the result right before launching the forward
+        (scheduler_pp_mixin._pp_launch_batch)."""
         if self.rank == 0:
-            return self.receive(0)
+            return self.post_receive(0)
         assert self.rows_of is not None, (
             "the buffered hand-off needs rows_of to size receives"
         )
-        return self.receive(self.rows_of(batch))
+        return self.post_receive(self.rows_of(batch))
+
+    def _post_loop(self) -> None:
+        """The posting thread: posts queued receives in transfer order, each
+        once at most _MAX_RECEIVES stay outstanding."""
+        while True:
+            with self._post_cv:
+                self._post_cv.wait_for(
+                    lambda: bool(self._to_post) or self._post_closing
+                )
+                if not self._to_post:
+                    return
+                transfer, rows, landing = self._to_post.popleft()
+                self._posting = True
+            try:
+                self._wait_for_receive_flags()
+                with torch.profiler.record_function("pp_buffered_post"):
+                    received = self._post(transfer, rows, threaded=True)
+            except BaseException as exc:  # re-raised on the scheduler thread
+                logger.exception(
+                    "buffered hand-off stage %d: posting transfer %d failed",
+                    self.rank,
+                    transfer,
+                )
+                with self._post_cv:
+                    self._post_error = exc
+                    failed = [landing, *(queued[2] for queued in self._to_post)]
+                    self._to_post.clear()
+                for future in failed:
+                    future.set_exception(exc)
+                return
+            with self._post_cv:
+                self._posting = False
+            landing.set_result(received)
 
     def unpack(
         self, received: tuple[torch.Tensor, ...], rows: int
@@ -578,8 +724,15 @@ class PPBufferedHandoff:
                 self._cv.notify_all()
 
     def close(self) -> None:
-        """Waits until every queued send is done, stops the send thread and
-        raises its failure."""
+        """Waits until every queued post and send is done, stops the posting
+        and send threads and raises their failure."""
+        if self._post_thread is not None:
+            with self._post_cv:
+                self._post_closing = True
+                self._post_cv.notify_all()
+            self._post_thread.join()
+            self._post_thread = None
+            self._post_closing = False
         if self._thread is not None:
             with self._cv:
                 self._closing = True

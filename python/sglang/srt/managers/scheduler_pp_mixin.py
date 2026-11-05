@@ -4,7 +4,7 @@ import logging
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed
@@ -241,15 +241,19 @@ class SchedulerPPMixin:
 
     def _pp_recv_proxy(
         self: Scheduler, batch: ScheduleBatch
-    ) -> Optional[PPProxyTensors]:
+    ) -> Union[PPProxyTensors, Callable[[], dict], None]:
         """This iteration's activations from the previous stage (None on the
         first stage). Over the wave they arrive at its row count and the
         compiled forward shim trims them to the batch's token bucket; over
-        the buffered hand-off they arrive at that bucket."""
+        the buffered hand-off they arrive at that bucket, as a callable that
+        waits for the receive its own thread posts (_pp_launch_batch calls
+        it right before the forward)."""
         if self._pp_wave is None:
             return self._pp_recv_proxy_tensors()
         tensors = self._pp_wave.receive_batch(batch)
-        return None if tensors is None else PPProxyTensors(tensors)
+        if tensors is None or callable(tensors):
+            return tensors
+        return PPProxyTensors(tensors)
 
     def _pp_process_freeze_gc(self: Scheduler, recv_reqs: List) -> None:
         requests = [req for req in recv_reqs if isinstance(req, FreezeGCReq)]
@@ -2058,6 +2062,10 @@ class SchedulerPPMixin:
         mb_metadata: List[Optional[PPBatchMetadata]],
         last_rank_comm_queue: deque,
     ):
+        if callable(pp_proxy_tensors):
+            # A receive the buffered hand-off is posting: wait for it now, after
+            # the work between _pp_recv_proxy and the launch.
+            pp_proxy_tensors = PPProxyTensors(pp_proxy_tensors())
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 if self.use_overlap_streams:

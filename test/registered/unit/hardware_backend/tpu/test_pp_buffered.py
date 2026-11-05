@@ -1,7 +1,9 @@
 """The point-to-point pipeline hand-off (sglang_tpu/pp_buffered.py) over a fake
 in-process transport."""
 
+import contextlib
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -72,6 +74,10 @@ class FakeFence:
 
     def synchronize(self):
         self.log.append(self)
+
+    def query(self):
+        # Not known to have passed: a post past the bound waits on it.
+        return False
 
 
 class FakeTransport(Transport):
@@ -372,6 +378,20 @@ class TestPPBufferedHandoffBounds(unittest.TestCase):
         self.assertIn("1.000 ms max", lines[1])
         self.assertIn("1.000 ms mean", lines[1])
 
+    def test_post_time_log_counts_threaded_posts_in_their_window(self):
+        handoff = make_handoff(1, 2, FakeNet())
+        with self.assertLogs("sglang_tpu.pp_buffered", level="INFO") as logs:
+            # The window's last post is the threaded one: it counts in this
+            # window's line, not the next.
+            for _ in range(_POST_LOG_EVERY - 1):
+                handoff._note_post(0.001)
+            handoff._note_post(0.001, threaded=True)
+            for _ in range(_POST_LOG_EVERY):
+                handoff._note_post(0.001)
+        lines = [m for m in (r.getMessage() for r in logs.records) if "posted" in m]
+        self.assertIn("1 of them on the posting thread", lines[0])
+        self.assertIn("0 of them on the posting thread", lines[1])
+
     def test_rows_outside_the_buffer_are_refused(self):
         handoff = make_handoff(1, 2, FakeNet(), max_rows=32)
         handoff.begin_iteration(True)
@@ -579,10 +599,150 @@ class TestPPBufferedHandoffProbe(unittest.TestCase):
         self.assertFalse(torch.equal(square, square.t()))
 
 
+class TestPostingThread(unittest.TestCase):
+    @staticmethod
+    def _recording(handoff):
+        """Record which thread posts each receive. No sender here: what is
+        tested is where the post runs, not the data."""
+        posted_on = []
+        recv_list = handoff._transport.recv_list
+
+        def record_thread(tensors, src, tag):
+            posted_on.append(threading.current_thread().name)
+            return recv_list(tensors, src, tag)
+
+        handoff._transport.recv_list = record_thread
+        handoff._transport.wait_landed = lambda tensor: None
+        return posted_on
+
+    @staticmethod
+    def _gate_fences(handoff):
+        gate = threading.Event()
+
+        class GatedFence:
+            def __init__(self, log):
+                self.log = log
+
+            def synchronize(self):
+                gate.wait(10)
+                self.log.append(self)
+
+            def query(self):
+                return gate.is_set()
+
+        handoff._transport.fence = lambda: GatedFence(handoff._transport.synced)
+        return gate
+
+    def test_post_without_a_fence_wait_runs_inline(self):
+        handoff = make_handoff(1, 2, FakeNet())
+        posted_on = self._recording(handoff)
+        handoff.begin_iteration(True)
+        pending = handoff.post_receive(8)
+        self.assertTrue(callable(pending))
+        tensors = pending()
+        self.assertEqual(tuple(tensors["hidden_states"].shape), (8, HIDDEN))
+        self.assertEqual(posted_on, [threading.current_thread().name])
+        self.assertIsNone(handoff._post_thread)
+
+    def test_a_post_that_waits_on_a_fence_runs_on_the_posting_thread(self):
+        # With 7 receives outstanding, the next post waits for the oldest
+        # forward's fence; it does so on the posting thread, and queuing it
+        # returns at once.
+        net = FakeNet()
+        handoff = make_handoff(1, 2, net)
+        posted_on = self._recording(handoff)
+        gate = self._gate_fences(handoff)
+        for _ in range(_MAX_RECEIVES):
+            handoff.begin_iteration(True)
+            handoff.receive(8)
+            handoff.end_iteration(None)
+        handoff.begin_iteration(True)
+        pending = handoff.post_receive(8)
+        # The post is held behind the fence, off this thread.
+        time.sleep(0.2)
+        self.assertEqual(len(net.posted), _MAX_RECEIVES)
+        gate.set()
+        pending()
+        self.assertEqual(len(handoff._transport.synced), 1)
+        self.assertEqual(posted_on[-1], "pp-buffered-post")
+        self.assertEqual(set(posted_on[:-1]), {threading.current_thread().name})
+        handoff.close()
+
+    def test_an_inline_post_failure_raises_at_once(self):
+        handoff = make_handoff(1, 2, FakeNet())
+
+        def fail(tensors, src, tag):
+            raise RuntimeError("store unavailable")
+
+        handoff._transport.recv_list = fail
+        handoff.begin_iteration(True)
+        with self.assertRaisesRegex(RuntimeError, "posting transfer 1 failed"):
+            handoff.post_receive(8)
+
+    def test_landed_fences_let_the_post_run_inline(self):
+        # Seven receives outstanding, but their forwards have all completed:
+        # the next post drops those fences without a wait and runs inline.
+        handoff = make_handoff(1, 2, FakeNet())
+        posted_on = self._recording(handoff)
+        gate = self._gate_fences(handoff)
+        gate.set()
+        for _ in range(_MAX_RECEIVES + 1):
+            handoff.begin_iteration(True)
+            handoff.receive(8)
+            handoff.end_iteration(None)
+        self.assertEqual(set(posted_on), {threading.current_thread().name})
+        self.assertEqual(handoff._transport.synced, [])
+        self.assertIsNone(handoff._post_thread)
+
+    def test_a_threaded_post_failure_surfaces_on_the_scheduler_thread(self):
+        handoff = make_handoff(1, 2, FakeNet())
+        self._recording(handoff)
+        gate = self._gate_fences(handoff)
+        for _ in range(_MAX_RECEIVES):
+            handoff.begin_iteration(True)
+            handoff.receive(8)
+            handoff.end_iteration(None)
+
+        def fail(tensors, src, tag):
+            raise RuntimeError("store unavailable")
+
+        handoff._transport.recv_list = fail
+        handoff.begin_iteration(True)
+        pending = handoff.post_receive(8)
+        gate.set()
+        with self.assertRaisesRegex(RuntimeError, "posting transfer 8 failed"):
+            pending()
+        with self.assertRaisesRegex(RuntimeError, "posting thread failed"):
+            handoff.begin_iteration(True)
+
+    def test_launch_waits_for_the_pending_receive(self):
+        scheduler = SchedulerPPMixin()
+        scheduler.forward_stream_ctx = contextlib.nullcontext()
+        scheduler.use_overlap_streams = False
+        seen = []
+
+        class Stop(Exception):
+            pass
+
+        def run_batch(batch, proxy):
+            seen.append(proxy)
+            raise Stop
+
+        scheduler.run_batch = run_batch
+        tensors = {"hidden_states": torch.ones(2, HIDDEN)}
+        with self.assertRaises(Stop):
+            scheduler._pp_launch_batch(
+                0, SimpleNamespace(reqs=[]), lambda: tensors, [None], None
+            )
+        self.assertIsInstance(seen[0], PPProxyTensors)
+        self.assertIs(seen[0].tensors, tensors)
+
+
 class TestReceiveProxy(unittest.TestCase):
     def test_scheduler_receive_takes_the_batch_padded_rows(self):
         handoff = make_handoff(1, 2, FakeNet())
-        handoff.receive = Mock(return_value={"hidden_states": torch.zeros(1)})
+        tensors = {"hidden_states": torch.zeros(1)}
+        handoff.post_receive = Mock(return_value=lambda: tensors)
         policy = Mock()
         policy.forward_rows.return_value = 128
         scheduler = SchedulerPPMixin()
@@ -600,8 +760,10 @@ class TestReceiveProxy(unittest.TestCase):
         )
         proxy = scheduler._pp_recv_proxy(batch)
         policy.forward_rows.assert_called_once_with(ForwardMode.EXTEND, 100, 2, None)
-        handoff.receive.assert_called_once_with(128)
-        self.assertIn("hidden_states", proxy.tensors)
+        handoff.post_receive.assert_called_once_with(128)
+        # A pending receive, waited for by _pp_launch_batch.
+        self.assertTrue(callable(proxy))
+        self.assertIs(proxy(), tensors)
 
     def test_first_stage_receives_nothing(self):
         handoff = make_handoff(0, 2, FakeNet())

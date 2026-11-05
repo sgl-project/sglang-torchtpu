@@ -63,7 +63,7 @@ class _NullTransport(Transport):
         pass
 
     def fence(self):
-        return SimpleNamespace(synchronize=lambda: None)
+        return SimpleNamespace(synchronize=lambda: None, query=lambda: True)
 
 
 def run_loop(
@@ -186,6 +186,9 @@ def run_loop(
 
     def launch(mb_id, cur_batch, proxy, metadata, queue):
         record("launch", cur_batch)
+        if callable(proxy):
+            # As _pp_launch_batch: wait for the buffered hand-off's receive.
+            proxy = PPProxyTensors(proxy())
         if cur_batch.forward_mode.is_prebuilt():
             assert proxy is None
         elif use_wave and rank != 0:
