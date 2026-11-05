@@ -204,8 +204,8 @@ class TestRuntimeEnvironment(unittest.TestCase):
             # A rank != 0 in a one-host group makes launch_server start nothing.
             self.assertEqual(config["runtime_env"]["SGLANG_LAUNCHER_RANK"], "0")
         self.assertEqual(prefill["runtime_env"]["SGLANG_TPU_MUSE_MEGAKERNEL"], "0")
-        # 256-row steps exceed the megakernel's 32-row cap.
-        self.assertEqual(decode["runtime_env"]["SGLANG_TPU_MUSE_MEGAKERNEL"], "0")
+        self.assertEqual(decode["runtime_env"]["SGLANG_TPU_MUSE_MEGAKERNEL"], "1")
+        self.assertEqual(decode["runtime_env"]["SGLANG_TPU_MUSE_MK_MAX_ROWS"], "256")
         for config in (prefill, decode):
             self.assertEqual(config["server_args"]["kv_cache_dtype"], "bfloat16")
         self.assertEqual(decode["runtime_env"]["SGLANG_RAIDEN_PIPELINE_TRANSFER"], "1")

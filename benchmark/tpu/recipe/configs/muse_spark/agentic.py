@@ -6,7 +6,8 @@ requests, prefill/decode interval and megakernel row cap. The mode picks the eng
 
 - mixed: one TP8 server, prefill and decode together.
 - prefill / decode: one Raiden P/D engine each, a PP8 prefill host feeding a TP8 decode
-  host, with bf16 KV and their own per-concurrency patches.
+  host, with bf16 KV and their own per-concurrency patches (c32: r32 on the row-tiled
+  decode megakernel).
 
 Every mode serves DFlash on the experimental spec worker, the only one that runs it on
 a PP prefill.
@@ -150,17 +151,11 @@ def _patch(
     prefill_decode_interval: int = 128,
     # A step is max_running_requests x DRAFT_TOKENS rows; past 32 the megakernel needs
     # its large-step program, and larger steps run the slow native decoder.
-    # None serves every step on the native decoder.
-    mk_max_rows: int | None = 32,
+    mk_max_rows: int = 32,
 ) -> dict[str, dict]:
     rows = max_running_requests * DRAFT_TOKENS
-    if mk_max_rows is not None and rows > mk_max_rows:
+    if rows > mk_max_rows:
         raise ValueError(f"{rows} rows per step > mk_max_rows {mk_max_rows}")
-    megakernel_env = (
-        {"SGLANG_TPU_MUSE_MEGAKERNEL": "0"}
-        if mk_max_rows is None
-        else {"SGLANG_TPU_MUSE_MK_MAX_ROWS": str(mk_max_rows)}
-    )
     return {
         "server_args": {
             **kv["server_args"],
@@ -169,7 +164,10 @@ def _patch(
             "tpu_compile_bs": list(range(1, max_running_requests + 1)),
             "prefill_decode_interval": prefill_decode_interval,
         },
-        "runtime_env": {**kv["runtime_env"], **megakernel_env},
+        "runtime_env": {
+            **kv["runtime_env"],
+            "SGLANG_TPU_MUSE_MK_MAX_ROWS": str(mk_max_rows),
+        },
     }
 
 
@@ -193,9 +191,20 @@ _PD_BF16_KV: dict[str, dict] = {
     "runtime_env": {},
 }
 
-# The decode megakernel caps a step at 32 rows (4 requests), so r32 decodes natively.
+# Wave7 decode megakernel (PR #1909): steps above 32 rows run its row-tiled program,
+# and steps above 24 rows run experts with few live rows in their own loop.
+_PD_MK_DECODE_ENV: dict[str, str] = {
+    "SGLANG_TPU_MUSE_MK_OPT": "1",
+    "SGLANG_TPU_MUSE_MK_EXPERT_GROUP": "15",
+    "SGLANG_TPU_MUSE_MK_EXPERT_SPLIT": "4",
+}
+
 _PD_PATCHES_BY_CONCURRENCY: dict[int, dict[str, dict]] = {
-    32: _patch(32, kv=_PD_BF16_KV, mk_max_rows=None),
+    32: _patch(
+        32,
+        kv={**_PD_BF16_KV, "runtime_env": _PD_MK_DECODE_ENV},
+        mk_max_rows=32 * DRAFT_TOKENS,
+    ),
 }
 
 
