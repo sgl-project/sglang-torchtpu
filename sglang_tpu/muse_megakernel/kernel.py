@@ -327,9 +327,6 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     sal_kv_split: bool = False
     attn_head_fp8: int = 0
     alias_oag_f: bool = False
-    alias_vmem_arenas: bool = False
-    alias_lhs_ysend: bool = False
-    h_stream_hbm: bool = False
     vmem_limit_bytes: int = 60 * 2**20
 
     @property
@@ -655,13 +652,11 @@ def _topk_xpose(sc, bias, k, router_eps, route_scale):
             else jnp.concatenate([sc, jnp.zeros((LANE - br, E), jnp.float32)], axis=0)
     )
     s_t = jnp.transpose(sc_pad + bias)  # [E, LANE]
-    idx_t = jax.lax.broadcasted_iota(jnp.int32, (E, LANE), 0).astype(jnp.float32)
+    idx_t = jax.lax.broadcasted_iota(jnp.int32, (E, LANE), 0)
     ids_rows = []
     for _ in range(k):
         m = jnp.max(s_t, axis=0, keepdims=True)
-        sel = jnp.min(
-                jnp.where(s_t == m, idx_t, jnp.float32(E)), axis=0, keepdims=True
-        )
+        sel = jnp.min(jnp.where(s_t == m, idx_t, E), axis=0, keepdims=True)
         ids_rows.append(sel)
         s_t = jnp.where(idx_t == sel, -jnp.inf, s_t)
     sc_t = jnp.transpose(sc_pad)  # [E, LANE]
@@ -669,18 +664,23 @@ def _topk_xpose(sc, bias, k, router_eps, route_scale):
             jnp.sum(jnp.where(idx_t == sel, sc_t, 0.0), axis=0, keepdims=True)
             for sel in ids_rows
     ]
-    ids_t = jnp.concatenate(ids_rows, axis=0)  # [k, LANE] f32 (exact int < E)
-    wsel_t = jnp.concatenate(wsel_rows, axis=0)  # [k, LANE] f32
+    wsel_t = jnp.concatenate(wsel_rows, axis=0)  # [k, LANE]
     wsel_t = (
             wsel_t / (jnp.sum(wsel_t, axis=0, keepdims=True) + router_eps) * route_scale
     )
     ids_full = jnp.transpose(
-            jnp.concatenate([ids_t, jnp.zeros((LANE - k, LANE), jnp.float32)], axis=0)
-    )  # [LANE, LANE] f32
+            jnp.concatenate(
+                    [
+                            jnp.concatenate(ids_rows, axis=0),
+                            jnp.zeros((LANE - k, LANE), jnp.int32),
+                    ],
+                    axis=0,
+            )
+    )  # [LANE, LANE] int32
     wsel_full = jnp.transpose(
             jnp.concatenate([wsel_t, jnp.zeros((LANE - k, LANE), jnp.float32)], axis=0)
     )  # [LANE, LANE] f32
-    return ids_full[:br].astype(jnp.int32), wsel_full[:br]
+    return ids_full[:br], wsel_full[:br]
 
 
 def _pack_xfull_256(x):
@@ -1297,13 +1297,9 @@ def _fp4_blockdiag_dot(
                 z_lhs,
         )
 
-    # At A >= 4 (rows >= 64), cap column tile at 512 (or 256 at A >= 8: [128, 256] f32 = 32 vregs)
-    # and compute make_lhs(c0) on the fly so %v never spills on the 64-vreg v7x file.
-    bd_tn = (
-            min(n_tile, 256 if A >= 8 else 512)
-            if (n_tile > 0 and A >= 4)
-            else n_tile
-    )
+    # At A >= 4 (rows >= 64), cap column tile at 512 ([64, 512] f32 = 32 vregs) and
+    # compute make_lhs(c0) on the fly so %v never spills on the 64-vreg v7x file.
+    bd_tn = min(n_tile, 512) if (n_tile > 0 and A >= 4) else n_tile
     if bd_tn > 0 and N > bd_tn and A >= 4:
         cols = []
         for n0 in range(0, N, bd_tn):
@@ -1652,47 +1648,21 @@ class _WeightStream:
         for l, t, next_l in held:
             self.refill(l, t, next_l)
 
-    def mv_fold(
-            self,
-            l,
-            names,
-            next_l,
-            G,
-            bw,
-            wait_block,
-            lhs_block,
-            stage_refs=None,
-            stage_refs_p1=None,
-            lhs_strip=None,
-            strip_r=0,
-            full_r=0,
-    ):
+    def mv_fold(self, l, names, next_l, G, bw, wait_block, lhs_block):
         """Matvecs of the fold group names over arriving K blocks of width bw.
 
         Group j holds the G physical blocks k = ((own // G) ^ j) * G + i; per block,
         wait_block(k) waits for it and lhs_block(k) gives the bf16 LHS of its K rows
         (any row
-        count). Returns name -> unscaled f32 [rows, N] (or None when stage_refs
-        stages [rows, tn] tiles in VMEM to avoid VREG spills at large R).
+        count). Returns name -> unscaled f32 [rows, N].
         """
         own = self.k_rot[names[0]][0]
         geo = {n: self.ranges[n] for n in names}
-        acc = (
-                {n: [False] * geo[n][4] for n in names}
-                if stage_refs is not None
-                else {n: [None] * geo[n][4] for n in names}
-        )
+        acc = {n: [None] * geo[n][4] for n in names}
         t, t_end = min(geo[n][0] for n in names), max(geo[n][1] for n in names)
 
         def group_of(u):
             return self.tiles[u][1] // (G * bw // self.tiles[u][3])
-
-        def col_slices_of(tn):
-            if tn <= 640:
-                return ((0, tn),)
-            if tn <= 1152:
-                return ((0, 512), (512, tn - 512))
-            return tuple((c0, min(512, tn - c0)) for c0 in range(0, tn, 512))
 
         while t < t_end:
             # one group: the consecutive tiles of its K blocks (dense_tiles order)
@@ -1707,140 +1677,7 @@ class _WeightStream:
             for i in range(G):
                 k = pg * G + i
                 wait_block(k)
-                if stage_refs is not None and lhs_strip is not None:
-                    active_u = [
-                            u
-                            for u in gt
-                            if i // (self.tiles[u][3] // bw)
-                            == self.tiles[u][1] % (G // (self.tiles[u][3] // bw))
-                    ]
-                    for r0 in range(0, full_r, strip_r):
-                        sr = min(strip_r, full_r - r0)
-                        lhs_s = lhs_strip(k, r0, sr)
-                        ms = lhs_s.shape[0]
-                        has_fp8 = (
-                                self.fp8_lhs
-                                and ms >= 32
-                                and any(
-                                        jnp.dtype(self.tiles[u][5]) == jnp.dtype(jnp.float8_e4m3fn)
-                                        for u in active_u
-                                )
-                        )
-                        xf_d, xsc_d = (
-                                _quant_fp8_rows(lhs_s) if has_fp8 else (None, None)
-                        )
-                        for u in active_u:
-                            name, ki, ni, tk, tn, dt = self.tiles[u]
-                            bpt = tk // bw
-                            rw0 = (i % bpt) * bw
-                            is_fp8_u = (
-                                    xf_d is not None
-                                    and jnp.dtype(dt) == jnp.dtype(jnp.float8_e4m3fn)
-                            )
-                            sref = stage_refs[name][ni]
-                            srefs_p1 = (
-                                    stage_refs_p1[name][ni]
-                                    if stage_refs_p1 is not None
-                                    else None
-                            )
-                            for ci, (c0, tc) in enumerate(col_slices_of(tn)):
-                                w = self.buf.at[u % self.slots].bitcast(dt)[
-                                        pl.ds(rw0, bw), pl.ds(c0, tc)
-                                ]
-                                if is_fp8_u:
-                                    part = (
-                                            jnp.dot(xf_d, w, preferred_element_type=jnp.float32)
-                                            * xsc_d
-                                    )
-                                else:
-                                    part = jnp.dot(
-                                            lhs_s, w, preferred_element_type=jnp.float32
-                                    )
-                                if ms == 2 * sr:
-                                    p0, p1 = part[:sr], part[sr:]
-                                    if srefs_p1 is not None:
-                                        sref1 = srefs_p1[ci]
-                                        if acc[name][ni]:
-                                            p0 = sref[pl.ds(r0, sr), pl.ds(c0, tc)] + p0
-                                            p1 = sref1[pl.ds(r0, sr), pl.ds(0, tc)] + p1
-                                        sref[pl.ds(r0, sr), pl.ds(c0, tc)] = p0
-                                        sref1[pl.ds(r0, sr), pl.ds(0, tc)] = p1
-                                    else:
-                                        if acc[name][ni]:
-                                            p0 = sref[pl.ds(r0, sr), pl.ds(c0, tc)] + p0
-                                            p1 = sref[pl.ds(full_r + r0, sr), pl.ds(c0, tc)] + p1
-                                        sref[pl.ds(r0, sr), pl.ds(c0, tc)] = p0
-                                        sref[pl.ds(full_r + r0, sr), pl.ds(c0, tc)] = p1
-                                else:
-                                    if acc[name][ni]:
-                                        part = sref[pl.ds(r0, sr), pl.ds(c0, tc)] + part
-                                    sref[pl.ds(r0, sr), pl.ds(c0, tc)] = part
-                    for u in active_u:
-                        name, _, ni, _, _, _ = self.tiles[u]
-                        acc[name][ni] = True
-                    continue
                 lhs = lhs_block(k)
-                if stage_refs is not None:
-                    m_tot = lhs.shape[0]
-                    mr = 32 if (m_tot >= 32 and m_tot % 32 == 0) else m_tot
-                    has_fp8 = (
-                            self.fp8_lhs
-                            and mr >= 32
-                            and any(
-                                    jnp.dtype(self.tiles[u][5]) == jnp.dtype(jnp.float8_e4m3fn)
-                                    and i // (self.tiles[u][3] // bw)
-                                    == self.tiles[u][1] % (G // (self.tiles[u][3] // bw))
-                                    for u in gt
-                            )
-                    )
-                    q_strips = [
-                            _quant_fp8_rows(lhs[m0 : m0 + mr]) if has_fp8 else None
-                            for m0 in range(0, m_tot, mr)
-                    ]
-                    for u in gt:
-                        name, ki, ni, tk, tn, dt = self.tiles[u]
-                        bpt = tk // bw
-                        s = ki % (G // bpt)
-                        if i // bpt != s:
-                            continue
-                        r0 = (i % bpt) * bw
-                        is_fp8_u = (
-                                self.fp8_lhs
-                                and mr >= 32
-                                and jnp.dtype(dt) == jnp.dtype(jnp.float8_e4m3fn)
-                        )
-                        sref = stage_refs[name][ni]
-                        for c0, tc in col_slices_of(tn):
-                            w = self.buf.at[u % self.slots].bitcast(dt)[
-                                    pl.ds(r0, bw), pl.ds(c0, tc)
-                            ]
-                            for si, m0 in enumerate(range(0, m_tot, mr)):
-                                if is_fp8_u:
-                                    xf_d, xsc_d = q_strips[si]
-                                    part = (
-                                            jnp.dot(xf_d, w, preferred_element_type=jnp.float32)
-                                            * xsc_d
-                                    )
-                                else:
-                                    part = jnp.dot(
-                                            lhs[m0 : m0 + mr],
-                                            w,
-                                            preferred_element_type=jnp.float32,
-                                    )
-                                if acc[name][ni]:
-                                    part = sref[pl.ds(m0, mr), pl.ds(c0, tc)] + part
-                                sref[pl.ds(m0, mr), pl.ds(c0, tc)] = part
-                        acc[name][ni] = True
-                    continue
-                xf_all = xsc_all = None
-                if self.fp8_lhs and lhs.shape[0] >= 32:
-                    if any(
-                            jnp.dtype(self.tiles[u][5]) == jnp.dtype(jnp.float8_e4m3fn)
-                            and i // (self.tiles[u][3] // bw)
-                            == self.tiles[u][1] % (G // (self.tiles[u][3] // bw))
-                            for u in gt
-                    ):
-                        xf_all, xsc_all = _quant_fp8_rows(lhs)
                 for u in gt:
                     name, ki, ni, tk, tn, dt = self.tiles[u]
                     bpt = tk // bw
@@ -1852,12 +1689,12 @@ class _WeightStream:
                             pl.ds(r0, bw), pl.ds(0, tn)
                     ]
                     if (
-                            xf_all is not None
+                            self.fp8_lhs
                             and jnp.dtype(dt) == jnp.dtype(jnp.float8_e4m3fn)
+                            and lhs.shape[0] >= 32
                     ):
-                        part = (
-                                jnp.dot(xf_all, w, preferred_element_type=jnp.float32) * xsc_all
-                        )
+                        xf_d, xsc_d = _quant_fp8_rows(lhs)
+                        part = jnp.dot(xf_d, w, preferred_element_type=jnp.float32) * xsc_d
                     else:
                         part = jnp.dot(lhs, w, preferred_element_type=jnp.float32)
                     acc[name][ni] = (
@@ -1865,8 +1702,6 @@ class _WeightStream:
                     )
             for u in gt:
                 self.refill(l, u, next_l)
-        if stage_refs is not None:
-            return None
         return {
                 n: a[0] if len(a) == 1 else jnp.concatenate(a, axis=1)
                 for n, a in acc.items()
@@ -2579,12 +2414,10 @@ def _can_w2_attn_scratch(c: MKConfig) -> bool:
             and c.kv_heads == 2
             and c.head_dim == 64
             and 2 * c.kv_heads * c.rows_per_req * c.g > LANE
-            and (c.rows_per_req * c.g == 64 or c.attn_head_fp8 >= 2)
+            and c.rows_per_req * c.g <= 64
             and c.chunk_pages * c.page_size == 1024
-            and (c.expert_depth + 1) * (c.inter_local // FP4_PACK)
-            >= (192 if c.attn_head_fp8 >= 2 else 64)
-            and c.expert_hidden
-            >= (4 * c.attn_streams * LANE if c.attn_head_fp8 >= 2 else 4 * LANE)
+            and (c.expert_depth + 1) * (c.inter_local // FP4_PACK) >= 192
+            and c.expert_hidden >= 4 * c.attn_streams * LANE
     )
 
 
@@ -2636,42 +2469,8 @@ def _alias_attn_p_ysend(c: MKConfig) -> bool:
     return c.attn_pipe and _attn_p_ysend_streams(c) == c.attn_streams
 
 
-def _alias_vmem_arenas(c: MKConfig) -> bool:
-    """Whether row-tiled steps use 4-slab pad_y + ysend[:, :, 512:1024] collective pads."""
-    return bool(
-            c.alias_vmem_arenas
-            and c.row_tile > 0
-            and c.tiled_vmem_pads
-            and c.tiled_vmem_y >= 2
-            and c.tiled_pair_y >= 1
-            and c.tp == 8
-            and c.top_k == 8
-            and c.rows_per_dev * c.top_k == c.rows
-            and y_words(c) >= 2 * (c.hidden_local // 2)
-            and c.expert_hidden_local <= c.hidden_local
-    )
-
-
-def _alias_tiled_lhs_ysend(c: MKConfig) -> bool:
-    """Whether row-tiled lhs [R, H] bf16 aliases ysend[:, :, 0:512] with small ex_lhs."""
-    return bool(
-            c.alias_lhs_ysend
-            and _alias_vmem_arenas(c)
-            and c.hidden == c.tp * c.hidden_local
-            and c.q_dim == c.hidden_local
-    )
-
-
-def _alias_acc_into_y(c: MKConfig) -> bool:
-    """Reserved for S['acc'] aliasing into pad_y; disabled as S['acc'] fits in 52 MiB."""
-    del c
-    return False
-
-
 def _alias_pads_into_y(c: MKConfig) -> bool:
     """Whether pad_o_rs and pad_o_ag can borrow pad_y (pool_ag + f_ag separate lifetimes)."""
-    if _alias_vmem_arenas(c):
-        return False
     few = c.single_row_coll and c.n_req * c.rows_per_req <= c.few_rows_max
     return (
             c.alias_oy
@@ -2688,8 +2487,7 @@ def _alias_pads_into_y(c: MKConfig) -> bool:
 def _alias_oag_into_f(c: MKConfig) -> bool:
     """Whether pad_o_ag can borrow pad_f when pad_y is in HBM (vy < 2)."""
     return bool(
-            not _alias_vmem_arenas(c)
-            and c.alias_oag_f
+            c.alias_oag_f
             and c.alias_oy
             and c.row_tile > 0
             and c.tiled_vmem_pads
@@ -2762,23 +2560,13 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
     vpads = c.tiled_vmem_pads
     vy = c.tiled_vmem_y
     alias_oy = _alias_pads_into_y(c)
-    alias_arenas = _alias_vmem_arenas(c)
-    alias_lhs = _alias_tiled_lhs_ysend(c)
-    alias_acc_y = _alias_acc_into_y(c)
     pmem = vmem if vpads else hbm
     ob_n = 4 if (c.tiled_o_rot or c.pair_o_rs) else 2
     items = [(n, base[n]) for n in _SHARED_SCRATCH] + [
             ("rtab", vmem((R, 2 * c.head_dim), f32)),
             ("rope_blk", vmem((8, 8, 2 * c.head_dim), f32)),
-            (
-                    "ex_lhs",
-                    vmem((c.expert_chunk, He + c.inter_local), jnp.bfloat16),
-            )
-            if alias_lhs
-            else ("lhs", vmem((R, H), jnp.bfloat16)),
-            ("ex_acc", vmem((c.expert_chunk, 2 * c.inter_local), f32))
-            if alias_acc_y
-            else ("acc", vmem((R, max(c.qkvg_dim, Hl, Hel, c.n_experts_padded)), f32)),
+            ("lhs", vmem((R, H), jnp.bfloat16)),
+            ("acc", vmem((R, max(c.qkvg_dim, Hl, Hel, c.n_experts_padded)), f32)),
     ]
     if not _alias_tiled_xfull_q(c):
         items += [("qn_s", vmem((R, c.q_dim), f32))]
@@ -2794,20 +2582,17 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
             ("wsel_v", vmem((R, LANE), f32)),
             ("wk_s", vmem((owner_window_rows(c), K, LANE), f32)),
             ("xfull", vmem((R, He // 2), u32)),
+            ("pool_send", vmem((R, Hel // 2), u32)),
     ]
-    if not alias_arenas:
-        items += [("pool_send", vmem((R, Hel // 2), u32))]
     if not _alias_tiled_obuf_ysend(c):
         items += [("o_buf", vmem((ob_n, R, Hl // 2), u32))]
-    items += [("o_send", vmem((R, Hl // 2), u32))]
-    if not alias_arenas:
-        items += [("f_send", vmem((R, Hl // 2), u32))]
-    items += [("u_send", vmem((Rc, He // 2), u32))]
-    need_hbm_pass = not vpads
-    if need_hbm_pass:
+    items += [
+            ("o_send", vmem((R, Hl // 2), u32)),
+            ("f_send", vmem((R, Hl // 2), u32)),
+            ("u_send", vmem((Rc, He // 2), u32)),
+    ]
+    if not vpads:
         items += [("bin", vmem((2, RT, H), jnp.bfloat16))]
-    if c.h_stream_hbm:
-        items += [("hs_tile", vmem((RT, H), f32))]
     items += [
             ("btile", vmem((RT, H), jnp.bfloat16)),
             ("tile_sems", pltpu.SemaphoreType.DMA((_TS_N,))),
@@ -2826,35 +2611,29 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
             ("route_v", vmem((route_rows(c), LANE), jnp.int32)),
             ("route_s", smem((route_rows(c), LANE), jnp.int32)),
             ("route_sem", pltpu.SemaphoreType.DMA((1,))),
-            ("h_stream", (hbm if c.h_stream_hbm else pmem)((R, H), f32)),
+            ("h_stream", pmem((R, H), f32)),
     ]
     if not (c.vec_route and c.trim_sems):
         items += [("ids_sem", pltpu.SemaphoreType.DMA((1,)))]
     if c.ex_gs_smem and (c.scale_fp8 or c.ex_kperm >= 3):
         items += [("gs_s", smem((8, c.n_experts_padded), f32))]
-    if not alias_oy and not alias_arenas:
+    if not alias_oy:
         items += [("pad_o_rs", pmem((tp, R, Hl // 2), u32))]
         if not _alias_oag_into_f(c):
             items += [("pad_o_ag", pmem((tp, R, Hl // 2), u32))]
     n_tc_s = len(_TC_VPADS_S) if (vpads and c.trim_sems) else len(_TC)
     n_tc_r = len(_TC_VPADS_R) if (vpads and c.trim_sems) else len(_TC)
-    if not alias_arenas:
-        items += [("pad_pool", pmem((tp, R, Hel // 2), u32))]
     items += [
+            ("pad_pool", pmem((tp, R, Hel // 2), u32)),
             (
                     "pad_y",
-                    (vmem if vy >= 2 else hbm)(
-                            (4 if alias_arenas else tp, Rc, K, yw), u32
-                    ),
+                    (vmem if vy >= 2 else hbm)((tp, Rc, K, yw), u32),
             ),
             (
                     "pad_u",
                     vmem((tp, Rc, He // 2), u32) if vpads else hbm((R, He // 2), u32),
             ),
-    ]
-    if not alias_arenas:
-        items += [("pad_f", pmem((tp, R, Hl // 2), u32))]
-    items += [
+            ("pad_f", pmem((tp, R, Hl // 2), u32)),
             ("tc_ssems", pltpu.SemaphoreType.DMA((n_tc_s,))),
             ("tc_rsems", pltpu.SemaphoreType.DMA((n_tc_r,))),
     ]
@@ -2867,15 +2646,10 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
                 # pipelined u all-gather: per owner
                 ("uag_osems", pltpu.SemaphoreType.DMA((tp,))),
         ]
-    elif need_hbm_pass:
-        items += [("pass_sems", pltpu.SemaphoreType.DMA((2, 4)))]
-    if need_hbm_pass:
+    if not vpads:
         items += [
                 ("sin", vmem((2, RT, H), f32)),
                 ("sout", vmem((2, RT, H), f32)),
-        ]
-    if not vpads:
-        items += [
                 ("ptile", vmem((2, tp, RT, Hl // 2), u32)),
                 ("utile", vmem((2, RT, He // 2), u32)),
                 ("pltile", vmem((2, tp, RT, Hel // 2), u32)),
@@ -2893,7 +2667,7 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
             ]
     if c.fold_f or c.fold_o:
         items += [
-                ("fold_v", vmem((8 + RT if c.h_stream_hbm else 8, H), f32)),
+                ("fold_v", vmem((8, H), f32)),
                 ("o_rsems", pltpu.SemaphoreType.DMA((tp,))),
                 ("f_rsems", pltpu.SemaphoreType.DMA((tp,))),
         ]
@@ -3190,26 +2964,12 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
         S = dict(zip(hnames, rest[L + 3 : L + 3 + nh]))
         S.update(zip(snames, rest[L + 3 + nh :]))
         yw = y_words(c)
-        alias_arenas = _alias_vmem_arenas(c)
-        alias_lhs = _alias_tiled_lhs_ysend(c)
-        if alias_arenas:
-            ys8 = S["ysend"].reshape(c.tp, R, yw)
-            S["pad_o_rs"] = ys8.at[:, :, pl.ds(Hl // 2, Hl // 2)]
-            S["pad_o_ag"] = ys8.at[:, :, pl.ds(Hl // 2, Hl // 2)]
-            S["pad_pool"] = ys8.at[:, :, pl.ds(Hl // 2, Hel // 2)]
-            S["pad_f"] = ys8.at[:, :, pl.ds(Hl // 2, Hl // 2)]
-            S["f_send"] = S["o_send"]
-            S["pool_send"] = S["o_send"].at[:, pl.ds(0, Hel // 2)]
-        elif _alias_pads_into_y(c):
+        if _alias_pads_into_y(c):
             py3 = S["pad_y"].reshape(c.tp, R, yw)
             S["pad_o_rs"] = py3.at[:, :, pl.ds(0, Hl // 2)]
             S["pad_o_ag"] = py3.at[:, :, pl.ds(Hl // 2, Hl // 2)]
         elif _alias_oag_into_f(c):
             S["pad_o_ag"] = S["pad_f"]
-        if _alias_acc_into_y(c):
-            py_f32 = S["pad_y"].bitcast(jnp.float32).reshape(4, R, yw)
-            S["acc"] = py_f32.at[0]
-            S["acc_hi"] = py_f32.at[1]
         if _alias_tiled_xfull_q(c):
             S["qn_s"] = S["xfull"].bitcast(jnp.float32).at[:, pl.ds(0, c.q_dim)]
         if _alias_tiled_padu_attn(c):
@@ -3224,18 +2984,11 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             S["vb_s"] = S["wsel_v"]
         if _alias_tiled_obuf_ysend(c):
             ob_n = 4 if (c.tiled_o_rot or c.pair_o_rs) else 2
-            if alias_lhs:
-                S["o_buf"] = (
-                        S["ysend"]
-                        .reshape(c.tp, R, yw)
-                        .at[pl.ds(c.tp - ob_n, ob_n), :, pl.ds(0, Hl // 2)]
-                )
-            else:
-                S["o_buf"] = (
-                        S["ysend"]
-                        .reshape(ob_n, (R * K) // ob_n, yw)
-                        .at[:, pl.ds(0, R), pl.ds(0, Hl // 2)]
-                )
+            S["o_buf"] = (
+                    S["ysend"]
+                    .reshape(ob_n, (R * K) // ob_n, yw)
+                    .at[:, pl.ds(0, R), pl.ds(0, Hl // 2)]
+            )
         n_live = meta_ref[0]
         tp_rank = meta_ref[1]
         me = jax.lax.axis_index(axis) if c.tp > 1 else 0
@@ -3329,18 +3082,14 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             jax.lax.fori_loop(0, c.n_experts_padded, clear_seen, 0)
         # Entry barrier: no peer's remote write lands in this device's VMEM before it has
         # entered the kernel. The call aliases nothing, so its collective_id costs no copy.
-        barrier = pltpu.get_barrier_semaphore() if c.tp > 1 else None
-
-        def tp_barrier():
-            if c.tp > 1:
-                for d in range(1, c.tp):
-                    pl.semaphore_signal(
-                            barrier,
-                            device_id=(jnp.mod(me + d, c.tp),),
-                    )
-                pl.semaphore_wait(barrier, c.tp - 1)
-
-        tp_barrier()
+        if c.tp > 1:
+            barrier = pltpu.get_barrier_semaphore()
+            for d in range(1, c.tp):
+                pl.semaphore_signal(
+                        barrier,
+                        device_id=(jnp.mod(me + d, c.tp),),
+                )
+            pl.semaphore_wait(barrier, c.tp - 1)
 
         def single_row(x, multi, one):
             """``multi(x)`` -> [R, H], or in a step of at most few_rows_max rows ``one(x)``'s [F, H]
@@ -4065,13 +3814,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     keypos = coltok + ci * cpt_g
                     if c.attn_col_mask and is_global is True:
                         pos_live = (keypos < p_lo) & valid
-                    elif c.ex_opt and c.packed_attn and hkv > 1:
-                        rp1 = rowpos[:qg]
-                        pl1 = (keypos < p_lo) & (keypos <= rp1) & valid
-                        in_win = _in_window(is_global, rp1 - keypos < c.window)
-                        if in_win is not None:
-                            pl1 = pl1 & in_win
-                        pos_live = jnp.concatenate([pl1] * hkv, axis=0)
                     else:
                         pos_live = (keypos < p_lo) & (keypos <= rowpos) & valid
                         in_win = _in_window(is_global, rowpos - keypos < c.window)
@@ -4490,18 +4232,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         )
 
                     use_stack2 = M <= 64 and NS % 2 == 0
-                    use_head_stack2 = bool(
-                            not use_stack2
-                            and M <= LANE
-                            and hkv == 2
-                            and qg <= 64
-                            and NS % 2 == 0
-                            and c.kv_sal
-                            and c.sal_kv_split
-                            and c.packed_attn
-                            and not _can_w2_attn_scratch(c)
-                    )
-                    use_any_stack2 = use_stack2 or use_head_stack2
                     if use_stack2:
                         zq = jnp.zeros((M, q_lhs.shape[1]), q_lhs.dtype)
                         q2_blk = jnp.concatenate(
@@ -4511,21 +4241,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                                 ],
                                 axis=0,
                         )
-                    elif use_head_stack2:
-                        w_hd_s = hd // c.sal_pack
-                        zq_h = jnp.zeros((qg, hd), q_lhs.dtype)
-                        q2_h_blks = []
-                        for h in range(hkv):
-                            qh_s = q_lhs[h * qg : (h + 1) * qg, h * hd : (h + 1) * hd]
-                            q2_h_blks.append(
-                                    jnp.concatenate(
-                                            [
-                                                    jnp.concatenate([qh_s, zq_h], axis=1),
-                                                    jnp.concatenate([zq_h, qh_s], axis=1),
-                                            ],
-                                            axis=0,
-                                    )
-                            )
 
                     def qk_exp_opt(i, lsum):
                         kk = chunk_k(i % KR_g)
@@ -4548,50 +4263,19 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         return pexp.astype(jnp.bfloat16), lsum
 
                     def qk_pair(i_a, i_b, ls0, ls1):
-                        if use_head_stack2:
-                            sl_a, sl_b = i_a % KR_g, i_b % KR_g
-                            sa_parts, sb_parts = [], []
-                            for h in range(hkv):
-                                with _scope("kv_unpack"):
-                                    ka_h = pltpu.bitcast(
-                                            ring_words(geo, sl_a, 2 * h * w_hd_s, w_hd_s)[...],
-                                            c.kv_dtype,
-                                    )
-                                    kb_h = pltpu.bitcast(
-                                            ring_words(geo, sl_b, 2 * h * w_hd_s, w_hd_s)[...],
-                                            c.kv_dtype,
-                                    )
-                                    if c.sal_fp8_dot == 0:
-                                        ka_h = ka_h.astype(jnp.bfloat16)
-                                        kb_h = kb_h.astype(jnp.bfloat16)
-                                    kh_cat = jnp.concatenate([ka_h, kb_h], axis=0)
-                                with _scope("qk"):
-                                    sh_2 = jax.lax.dot_general(
-                                            q2_h_blks[h],
-                                            kh_cat,
-                                            (((1,), (0,)), ((), ())),
-                                            preferred_element_type=jnp.float32,
-                                    )
-                                sa_parts.append(sh_2[:qg])
-                                sb_parts.append(sh_2[qg:])
-                            sa = jnp.concatenate(sa_parts, axis=0)
-                            sb_ = jnp.concatenate(sb_parts, axis=0)
+                        ka = chunk_k(i_a % KR_g)
+                        kb_ = chunk_k(i_b % KR_g)
+                        k_cat = jnp.concatenate([ka, kb_], axis=0)
+                        with _scope("qk"):
+                            sb = jax.lax.dot_general(
+                                    q2_blk,
+                                    k_cat,
+                                    (((1,), (0,)), ((), ())),
+                                    preferred_element_type=jnp.float32,
+                            )
+                            sa, sb_ = sb[:M], sb[M:]
                             if use_fp8_q or q_sc != 1.0:
                                 sa, sb_ = sa * q_sc, sb_ * q_sc
-                        else:
-                            ka = chunk_k(i_a % KR_g)
-                            kb_ = chunk_k(i_b % KR_g)
-                            k_cat = jnp.concatenate([ka, kb_], axis=0)
-                            with _scope("qk"):
-                                sb = jax.lax.dot_general(
-                                        q2_blk,
-                                        k_cat,
-                                        (((1,), (0,)), ((), ())),
-                                        preferred_element_type=jnp.float32,
-                                )
-                                sa, sb_ = sb[:M], sb[M:]
-                                if use_fp8_q or q_sc != 1.0:
-                                    sa, sb_ = sa * q_sc, sb_ * q_sc
                         with _scope("softmax"):
                             pa = jnp.exp2(sa) if c.attn_exp2 else jnp.exp(sa)
                             pb = jnp.exp2(sb_) if c.attn_exp2 else jnp.exp(sb_)
@@ -4628,7 +4312,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     za = jnp.zeros((M, c.attn_width), jnp.float32)
                     for t in range(NS):
                         wait_chunk(geo, t % KR_g)
-                    if not use_any_stack2 and _can_w2_attn_scratch(c):
+                    if not use_stack2 and _can_w2_attn_scratch(c):
                         w_hd = hd // c.sal_pack
                         w2_rows = (c.expert_depth + 1) * (c.inter_local // FP4_PACK)
                         w2_f32 = S["w2"].bitcast(jnp.float32).reshape(w2_rows, He)
@@ -4880,7 +4564,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                                 axis=0,
                         )
                         return (init[0], ls_out, acc_out), init
-                    if not use_any_stack2 and c.attn_carry:
+                    if not use_stack2 and c.attn_carry:
                         n_acc = 1 if c.attn_carry == 1 else 2
 
                         def qk_tree(i):
@@ -5053,7 +4737,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         accs = pv_all(NS * (n_it - 1), (n_it - 1) % 2, accs)
                         refill_global(NS * (n_it - 1) + KR_g)
                         return (init[0], ls, sum(accs[1:], accs[0])), init
-                    if not use_any_stack2:
+                    if not use_stack2:
                         lsums = []
                         for t in range(NS):
                             pb, ls_ = qk_exp_opt(t, zl)
@@ -5208,7 +4892,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         carry4 = jax.lax.fori_loop(
                                 0, k_full, functools.partial(step_body, ref=KV[l]), init4
                         )
-                    elif R <= 64 or c.attn_opt == 5:
+                    else:
                         carry4 = branch_layers(
                                 gls,
                                 [
@@ -5221,8 +4905,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                                         for x in gls
                                 ],
                         )
-                    else:
-                        carry4, k_full = init4, 0
                     ls0, ls1, ac0, ac1 = jax.lax.fori_loop(
                             k_full, n_it - 1, step_body, carry4
                     )
@@ -5299,7 +4981,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                             and (
                                     c.row_tile > 0
                                     or hkv * qg <= 64
-                                    or c.sal_kv_split
                                     or c.attn_carry > 0
                                     or c.attn_q_fp8
                                     or c.attn_p_fp8
@@ -6633,7 +6314,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             )[0:1]
             rv = S["route_v"]
             rv[...] = jnp.zeros(rv.shape, i32)
-            for b in range(min(NB, Ep // LANE)):
+            for b in range(NB):
                 u_lane = jax.lax.broadcasted_iota(i32, (Ep, LANE), 1) + b * LANE
                 m = (pres_c > 0) & (pos_c == u_lane)
                 for f, v in enumerate((id_c, cnt_c, off_c)):
@@ -6682,39 +6363,15 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 dest = (
                         jnp.sum(onehot * (off_e + running), axis=1, keepdims=True) + rank
                 ).astype(i32)
-                if NB > 8 and NB % 8 == 0:
-
-                    def accum_perm8(bg, c_):
-                        r_bg = pl.multiple_of(3 * NB + 8 * bg, 8)
-                        rows8 = []
-                        for bi in range(8):
-                            b_idx = 8 * bg + bi
-                            t_lane = (
-                                    jax.lax.broadcasted_iota(i32, (PT, LANE), 1) + b_idx * LANE
-                            )
-                            rows8.append(
-                                    jnp.sum(
-                                            jnp.where((dest == t_lane) & live, enc, 0),
-                                            axis=0,
-                                            keepdims=True,
-                                    )
-                            )
-                        rv[pl.ds(r_bg, 8), :] = rv[pl.ds(r_bg, 8), :] + jnp.concatenate(
-                                rows8, axis=0
-                        )
-                        return c_
-
-                    jax.lax.fori_loop(0, NB // 8, accum_perm8, 0)
-                else:
-                    for b in range(NB):
-                        t_lane = jax.lax.broadcasted_iota(i32, (PT, LANE), 1) + b * LANE
-                        rv[3 * NB + b : 3 * NB + b + 1, :] = rv[
-                                3 * NB + b : 3 * NB + b + 1, :
-                        ] + jnp.sum(
-                                jnp.where((dest == t_lane) & live, enc, 0),
-                                axis=0,
-                                keepdims=True,
-                        )
+                for b in range(NB):
+                    t_lane = jax.lax.broadcasted_iota(i32, (PT, LANE), 1) + b * LANE
+                    rv[3 * NB + b : 3 * NB + b + 1, :] = rv[
+                            3 * NB + b : 3 * NB + b + 1, :
+                    ] + jnp.sum(
+                            jnp.where((dest == t_lane) & live, enc, 0),
+                            axis=0,
+                            keepdims=True,
+                    )
                 return running + jnp.sum(onehot, axis=0, keepdims=True)
 
             jax.lax.fori_loop(0, NT, perm_tile, jnp.zeros((1, Ep), f32))
@@ -6722,51 +6379,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             cp.start()
             cp.wait()
             return S["route_s"][4 * NB, 0]
-
-        def hs_load(rs):
-            if not c.h_stream_hbm:
-                return S["h_stream"][rs]
-            dma(S["h_stream"].at[rs], S["hs_tile"], _TS_AUX)
-            return S["hs_tile"][...]
-
-        def hs_store(rs, val):
-            if not c.h_stream_hbm:
-                S["h_stream"][rs] = val
-                return
-            S["hs_tile"][...] = val
-            dma(S["hs_tile"], S["h_stream"].at[rs], _TS_AUX)
-
-        ys_lo = (
-                S["ysend"].reshape(c.tp, R, yw).at[:, :, pl.ds(0, Hl // 2)]
-                if alias_lhs
-                else None
-        )
-
-        def lhs_get_slice(r0, mr, k_col0, tk):
-            if not alias_lhs:
-                return S["lhs"][pl.ds(r0, mr), pl.ds(k_col0, tk)]
-            assert k_col0 % Hl == 0 and tk % Hl == 0
-            b0 = k_col0 // Hl
-            nb = tk // Hl
-            if nb == 1:
-                return _unpack_bf16x2(ys_lo[b0, pl.ds(r0, mr)]).astype(bf16)
-            return jnp.concatenate(
-                    [
-                            _unpack_bf16x2(ys_lo[b0 + b_i, pl.ds(r0, mr)]).astype(bf16)
-                            for b_i in range(nb)
-                    ],
-                    axis=1,
-            )
-
-        def lhs_set_slice(rs, val, n_cols=H):
-            if not alias_lhs:
-                S["lhs"][rs, pl.ds(0, n_cols)] = val
-                return
-            assert n_cols % Hl == 0
-            for b_i in range(n_cols // Hl):
-                ys_lo[b_i, rs] = _pack_bf16x2(
-                        val[:, b_i * Hl : (b_i + 1) * Hl].astype(f32)
-                )
 
         def mv_tiled(l, name, nxt, smr, col_off=None, on_col=None):
             """S["lhs"] [R, K] @ W_l[name] -> S["acc"] columns (scaled fp8); on_col(ni, col) once
@@ -6777,18 +6389,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             t0, t1, tk, tn, nn, dt = ws.ranges[name]
             nk = (t1 - t0) // nn
             is_fp8 = jnp.dtype(dt) == jnp.dtype(jnp.float8_e4m3fn)
-            if c.dense_fp8_lhs and is_fp8 and R >= 64:
-                MR = 32 if R % 32 == 0 else RT
-            else:
-                MR = min(R, c.mv_rows)
+            MR = min(R, c.mv_rows)
             assert R % MR == 0
-            use_q_lhs = bool(c.dense_fp8_lhs and is_fp8 and MR >= 16)
-            hoist_q = None
-            if use_q_lhs and nk == 1 and nn > 1:
-                hoist_q = [
-                        _quant_fp8_rows(lhs_get_slice(m0, MR, 0, tk))
-                        for m0 in range(0, R, MR)
-                ]
             for t in range(t0, t1):
                 with _scope("ring_wait"):
                     ws._copy(l, t).wait()
@@ -6796,16 +6398,14 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 col = ws.phys_col(name, ni)
                 c0 = ni * tn if col_off is None else col_off(ni)
                 w = ws.buf.at[t % ws.slots].bitcast(dt)[pl.ds(0, tk), pl.ds(0, tn)]
-                for si, m0 in enumerate(range(0, R, MR)):
-                    if hoist_q is not None:
-                        xf_d, xsc_d = hoist_q[si]
-                        part = jnp.dot(xf_d, w, preferred_element_type=f32) * xsc_d
-                    elif use_q_lhs:
-                        xf_d, xsc_d = _quant_fp8_rows(lhs_get_slice(m0, MR, ki * tk, tk))
+                for m0 in range(0, R, MR):
+                    lhs_sub = S["lhs"][pl.ds(m0, MR), pl.ds(ki * tk, tk)]
+                    if c.dense_fp8_lhs and is_fp8 and MR >= 32:
+                        xf_d, xsc_d = _quant_fp8_rows(lhs_sub)
                         part = jnp.dot(xf_d, w, preferred_element_type=f32) * xsc_d
                     else:
                         part = jnp.dot(
-                                lhs_get_slice(m0, MR, ki * tk, tk),
+                                lhs_sub,
                                 w,
                                 preferred_element_type=f32,
                         )
@@ -6827,10 +6427,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
         def tiled_fold_lhs(pad):
             def lhs(k):
                 cols = pl.ds(pl.multiple_of(k * Hl, LANE), Hl)
-                if alias_lhs:
-                    part = _unpack_bf16x2(ys_lo[k]).astype(bf16)
-                else:
-                    part = S["lhs"][:, cols]
+                part = S["lhs"][:, cols]
                 if pad is None:
                     return part
                 blk = (_unpack_bf16x2(S[pad][k]) * S["fold_v"][0:1, cols]).astype(bf16)
@@ -6838,35 +6435,11 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
 
             return lhs
 
-        def tiled_fold_lhs_strip(pad):
-            def lhs_strip(k, r0, sr):
-                cols = pl.ds(pl.multiple_of(k * Hl, LANE), Hl)
-                if alias_lhs:
-                    part = _unpack_bf16x2(ys_lo[k, pl.ds(r0, sr)]).astype(bf16)
-                else:
-                    part = S["lhs"][pl.ds(r0, sr), cols]
-                if pad is None:
-                    return part
-                blk = (
-                        _unpack_bf16x2(S[pad][k, pl.ds(r0, sr)]) * S["fold_v"][0:1, cols]
-                ).astype(bf16)
-                return jnp.concatenate([part, blk], axis=0)
-
-            return lhs_strip
-
         def attention_tiled(l, use_rope, is_global, nxt, smr, pend=False):
             """Leaves the all-reduced o-proj output all-gathered in pad_o_ag (or in flight)."""
             per_geom(is_global, lambda geo: kv_prologue(geo, l, 0))
             fill_preones()
             qd, kd = c.q_dim, c.kv_dim
-            use_py_fold = bool(
-                    c.tiled_vmem_y >= 2
-                    and R >= 64
-                    and c.qkvg_dim == 2304
-                    and S["pad_y"].shape[0] >= 4
-                    and yw >= 640
-            )
-            fold_sr = 32 if R % 32 == 0 else RT
             if pend:
                 psmr = S["smalls"].at[(l + 1) % 2]
                 g_pa = smr[SMALL["pre_attn_w"] : SMALL["pre_attn_w"] + 1, :H]
@@ -6875,50 +6448,19 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 p_pfw = psmr[SMALL["post_ffn_w"] : SMALL["post_ffn_w"] + 1, :H]
                 for t in range(R // RT):
                     rs = pl.ds(t * RT, RT)
-                    lhs_set_slice(rs, (p_alpha * hs_load(rs) * g_pa).astype(bf16))
+                    S["lhs"][rs] = (p_alpha * S["h_stream"][rs] * g_pa).astype(bf16)
                 S["fold_v"][0:1, :] = p_beta * p_pfw * g_pa
                 wait_block, finish = f_blocks()
-                if use_py_fold:
-                    py4 = S["pad_y"].bitcast(f32).reshape(S["pad_y"].shape[0], R, yw)
-                    q_stage = {
-                            "wqkvg": [
-                                    S["acc"].at[:, pl.ds(0, c.qkvg_dim // 2)],
-                                    S["acc"].at[:, pl.ds(c.qkvg_dim // 2, c.qkvg_dim // 2)],
-                            ]
-                    }
-                    q_stage_p1 = {
-                            "wqkvg": [
-                                    [py4.at[0, :, pl.ds(0, 512)], py4.at[1, :, pl.ds(0, 640)]],
-                                    [py4.at[2, :, pl.ds(0, 512)], py4.at[3, :, pl.ds(0, 640)]],
-                            ]
-                    }
-                    with _scope("qkvg_fold"):
-                        ws.mv_fold(
-                                l,
-                                ("wqkvg",),
-                                nxt,
-                                _fold_g(c, ("wqkvg",)),
-                                Hl,
-                                wait_block,
-                                None,
-                                stage_refs=q_stage,
-                                stage_refs_p1=q_stage_p1,
-                                lhs_strip=tiled_fold_lhs_strip("pad_f"),
-                                strip_r=fold_sr,
-                                full_r=R,
-                        )
-                    acc_q = None
-                else:
-                    with _scope("qkvg_fold"):
-                        acc_q = ws.mv_fold(
-                                l,
-                                ("wqkvg",),
-                                nxt,
-                                _fold_g(c, ("wqkvg",)),
-                                Hl,
-                                wait_block,
-                                tiled_fold_lhs("pad_f"),
-                        )["wqkvg"]
+                with _scope("qkvg_fold"):
+                    acc_q = ws.mv_fold(
+                            l,
+                            ("wqkvg",),
+                            nxt,
+                            _fold_g(c, ("wqkvg",)),
+                            Hl,
+                            wait_block,
+                            tiled_fold_lhs("pad_f"),
+                    )["wqkvg"]
                 finish()
                 wq_sc = smr[SMALL["wqkvg_s"] : SMALL["wqkvg_s"] + 1, : c.qkvg_dim]
                 for t in range(R // RT):
@@ -6928,71 +6470,30 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     s_f = jax.lax.rsqrt(
                             jnp.mean(jnp.square(y), axis=-1, keepdims=True) + c.post_eps
                     )
-                    s = p_alpha * hs_load(rs) + p_beta * (y * s_f).astype(bf16).astype(
-                            f32
-                    )
+                    s = p_alpha * S["h_stream"][rs] + p_beta * (y * s_f).astype(
+                            bf16
+                    ).astype(f32)
                     capture_tile(l - 1, rs, s)
-                    hs_store(rs, s)
+                    S["h_stream"][rs] = s
                     r_inv = jax.lax.rsqrt(
                             jnp.mean(jnp.square(s), axis=-1, keepdims=True) + c.rms_eps
                     )
-                    if use_py_fold:
-                        aq0 = S["acc"][rs, pl.ds(0, c.qkvg_dim)]
-                        aq1 = jnp.concatenate(
-                                [
-                                        py4[0, rs, pl.ds(0, 512)],
-                                        py4[1, rs, pl.ds(0, 640)],
-                                        py4[2, rs, pl.ds(0, 512)],
-                                        py4[3, rs, pl.ds(0, 640)],
-                                ],
-                                axis=1,
-                        )
-                    else:
-                        aq0, aq1 = acc_q[r0:r1], acc_q[R + r0 : R + r1]
                     S["acc"][rs, pl.ds(0, c.qkvg_dim)] = (
-                            r_inv * (aq0 + s_f * aq1) * wq_sc
+                            r_inv * (acc_q[r0:r1] + s_f * acc_q[R + r0 : R + r1]) * wq_sc
                     )
             elif c.fold_f:
-                if use_py_fold:
-                    q_stage = {
-                            "wqkvg": [
-                                    S["acc"].at[:, pl.ds(0, c.qkvg_dim // 2)],
-                                    S["acc"].at[:, pl.ds(c.qkvg_dim // 2, c.qkvg_dim // 2)],
-                            ]
-                    }
-                    with _scope("qkvg_mv"):
-                        ws.mv_fold(
-                                l,
-                                ("wqkvg",),
-                                nxt,
-                                _fold_g(c, ("wqkvg",)),
-                                Hl,
-                                lambda k: None,
-                                None,
-                                stage_refs=q_stage,
-                                lhs_strip=tiled_fold_lhs_strip(None),
-                                strip_r=fold_sr,
-                                full_r=R,
-                        )
-                    wq_sc = smr[SMALL["wqkvg_s"] : SMALL["wqkvg_s"] + 1, : c.qkvg_dim]
-                    for t in range(R // RT):
-                        rs = pl.ds(t * RT, RT)
-                        S["acc"][rs, pl.ds(0, c.qkvg_dim)] = (
-                                S["acc"][rs, pl.ds(0, c.qkvg_dim)] * wq_sc
-                        )
-                else:
-                    with _scope("qkvg_mv"):
-                        acc_q = ws.mv_fold(
-                                l,
-                                ("wqkvg",),
-                                nxt,
-                                _fold_g(c, ("wqkvg",)),
-                                Hl,
-                                lambda k: None,
-                                tiled_fold_lhs(None),
-                        )["wqkvg"]
-                    wq_sc = smr[SMALL["wqkvg_s"] : SMALL["wqkvg_s"] + 1, : c.qkvg_dim]
-                    S["acc"][:, pl.ds(0, c.qkvg_dim)] = acc_q * wq_sc
+                with _scope("qkvg_mv"):
+                    acc_q = ws.mv_fold(
+                            l,
+                            ("wqkvg",),
+                            nxt,
+                            _fold_g(c, ("wqkvg",)),
+                            Hl,
+                            lambda k: None,
+                            tiled_fold_lhs(None),
+                    )["wqkvg"]
+                wq_sc = smr[SMALL["wqkvg_s"] : SMALL["wqkvg_s"] + 1, : c.qkvg_dim]
+                S["acc"][:, pl.ds(0, c.qkvg_dim)] = acc_q * wq_sc
             else:
                 with _scope("qkvg_mv"):
                     mv_tiled(l, "wqkvg", nxt, smr)
@@ -7109,13 +6610,9 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         .astype(f32)
                 )
                 og_all = S["acc"][:, pl.ds(qd + 2 * kd, qd)]
-                lhs_set_slice(
-                        pl.ds(0, R),
-                        (jax.nn.sigmoid(og_all.astype(bf16).astype(f32)) * attn_all).astype(
-                                bf16
-                        ),
-                        qd,
-                )
+                S["lhs"][:, pl.ds(0, qd)] = (
+                        jax.nn.sigmoid(og_all.astype(bf16).astype(f32)) * attn_all
+                ).astype(bf16)
             else:
 
                 def o_in_tile(rows, t):
@@ -7125,11 +6622,9 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                             .astype(f32)
                     )
                     og = S["acc"][rows, pl.ds(qd + 2 * kd, qd)]
-                    lhs_set_slice(
-                            rows,
-                            (jax.nn.sigmoid(og.astype(bf16).astype(f32)) * attn).astype(bf16),
-                            qd,
-                    )
+                    S["lhs"][rows, pl.ds(0, qd)] = (
+                            jax.nn.sigmoid(og.astype(bf16).astype(f32)) * attn
+                    ).astype(bf16)
 
                 for_tiles(o_in_tile)
             # o-proj column tile m is reduce-scatter block m; two (or four) send buffers alternate
@@ -7213,8 +6708,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     else:
                         pl.when(me == m)(lambda: o_lc(b).start())
 
-            if alias_arenas:
-                tp_barrier()
             with _scope("o_mv"):
                 mv_tiled(l, "wo", nxt, smr, col_off=lambda ni: 0, on_col=o_ship)
             with _scope("o_allreduce"):
@@ -7261,8 +6754,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         for d in range(5, 8):
                             mine = mine + _unpack_bf16x2(S["pad_o_rs"][d, rs])
                         S["o_send"][rs] = _pack_bf16x2(mine)
-                    if alias_arenas:
-                        tp_barrier()
                     if c.fold_o:
                         coll.all_gather_blocks_start("o_ag", S["o_send"], me, S["o_rsems"])
                     else:
@@ -7287,8 +6778,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                             for d in range(1, c.tp):
                                 mine = mine + _unpack_bf16x2(S["pad_o_rs"][d, rs])
                             S["o_send"][rs] = _pack_bf16x2(mine)
-                        if alias_arenas:
-                            tp_barrier()
                         if c.fold_o:
                             coll.all_gather_blocks_start(
                                     "o_ag", S["o_send"], me, S["o_rsems"]
@@ -7431,48 +6920,20 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 a_beta = smr[SMALL["attn_beta"] : SMALL["attn_beta"] + 1, :H]
                 for t in range(R // RT):
                     rs = pl.ds(t * RT, RT)
-                    lhs_set_slice(rs, (a_alpha * hs_load(rs) * g_pf).astype(bf16))
+                    S["lhs"][rs] = (a_alpha * S["h_stream"][rs] * g_pf).astype(bf16)
                 S["fold_v"][0:1, :] = a_beta * g_pf
                 wait_block, finish = o_blocks()
                 names = ("wpool", "wrouter")
-                use_py_pr = bool(vy >= 2 and R >= 64)
-                pr_sr = 32 if R % 32 == 0 else RT
-                if use_py_pr:
-                    py_pr = (
-                            S["pad_y"]
-                            .bitcast(f32)
-                            .reshape(S["pad_y"].shape[0] // 2, 2 * R, yw)
+                with _scope("pool_router_fold"):
+                    acc_pr = ws.mv_fold(
+                            l,
+                            names,
+                            nxt,
+                            _fold_g(c, names),
+                            Hl,
+                            wait_block,
+                            tiled_fold_lhs("pad_o_ag"),
                     )
-                    pr_stage = {
-                            "wpool": [py_pr.at[0, :, pl.ds(0, Hel)]],
-                            "wrouter": [py_pr.at[1, :, pl.ds(0, Ep)]],
-                    }
-                    with _scope("pool_router_fold"):
-                        ws.mv_fold(
-                                l,
-                                names,
-                                nxt,
-                                _fold_g(c, names),
-                                Hl,
-                                wait_block,
-                                None,
-                                stage_refs=pr_stage,
-                                lhs_strip=tiled_fold_lhs_strip("pad_o_ag"),
-                                strip_r=pr_sr,
-                                full_r=R,
-                        )
-                    acc_pr = None
-                else:
-                    with _scope("pool_router_fold"):
-                        acc_pr = ws.mv_fold(
-                                l,
-                                names,
-                                nxt,
-                                _fold_g(c, names),
-                                Hl,
-                                wait_block,
-                                tiled_fold_lhs("pad_o_ag"),
-                        )
                 finish()
                 wp_sc = smr[SMALL["wpool_s"] : SMALL["wpool_s"] + 1, :Hel]
                 for t in range(R // RT):
@@ -7482,29 +6943,30 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     s_a = jax.lax.rsqrt(
                             jnp.mean(jnp.square(a_val), axis=-1, keepdims=True) + c.post_eps
                     )
-                    s = a_alpha * hs_load(rs) + a_beta * (a_val * s_a).astype(
+                    s = a_alpha * S["h_stream"][rs] + a_beta * (a_val * s_a).astype(
                             bf16
                     ).astype(f32)
-                    hs_store(rs, s)
+                    S["h_stream"][rs] = s
                     r_inv = jax.lax.rsqrt(
                             jnp.mean(jnp.square(s), axis=-1, keepdims=True) + c.rms_eps
                     )
-                    if use_py_pr:
-                        wp0 = py_pr[0, pl.ds(r0, RT), pl.ds(0, Hel)]
-                        wp1 = py_pr[0, pl.ds(R + r0, RT), pl.ds(0, Hel)]
-                        wr0 = py_pr[1, pl.ds(r0, RT), pl.ds(0, Ep)]
-                        wr1 = py_pr[1, pl.ds(R + r0, RT), pl.ds(0, Ep)]
-                    else:
-                        wp0, wp1 = acc_pr["wpool"][r0:r1], acc_pr["wpool"][R + r0 : R + r1]
-                        wr0 = acc_pr["wrouter"][r0:r1]
-                        wr1 = acc_pr["wrouter"][R + r0 : R + r1]
                     pooled_t = (
-                            (r_inv * (wp0 + s_a * wp1) * wp_sc).astype(bf16).astype(f32)
+                            (
+                                    r_inv
+                                    * (
+                                            acc_pr["wpool"][r0:r1]
+                                            + s_a * acc_pr["wpool"][R + r0 : R + r1]
+                                    )
+                                    * wp_sc
+                            )
+                            .astype(bf16)
+                            .astype(f32)
                     )
                     S["pool_send"][rs] = _pack_bf16x2(pooled_t)
-                    S["acc"][rs, pl.ds(0, Ep)] = r_inv * (wr0 + s_a * wr1)
-                if alias_arenas:
-                    tp_barrier()
+                    S["acc"][rs, pl.ds(0, Ep)] = r_inv * (
+                            acc_pr["wrouter"][r0:r1]
+                            + s_a * acc_pr["wrouter"][R + r0 : R + r1]
+                    )
                 pool_wait = coll.all_gather_start("pool", S["pool_send"], tp_rank)
             else:
                 with _scope("pool_mv"):
@@ -7521,8 +6983,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
 
                     for_tiles(pool_tile)
                 if vpads:
-                    if alias_arenas:
-                        tp_barrier()
                     pool_wait = coll.all_gather_start("pool", S["pool_send"], tp_rank)
                 else:
                     pool_wait = ag_start(
@@ -7798,21 +7258,20 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 can_fp8_x = bool(
                         prequant_x and not blockdiag and nrows >= 32 and nrows % 32 == 0
                 )
-                elhs = S["ex_lhs"] if alias_lhs else S["lhs"]
                 can_stage_ex = bool(
                         c.ex_w2_stage
                         and not blockdiag
                         and nrows >= 16
                         and nrows % 16 == 0
-                        and nrows <= elhs.shape[0]
-                        and He + Il <= elhs.shape[1]
+                        and nrows <= R
+                        and He + Il <= H
                         and 2 * Il <= S["acc"].shape[1]
                 )
                 if can_stage_ex:
                     pq_chunks = []
                     for s0 in range(0, nrows, 16):
                         ps16 = [pair_fn(s0 + j) for j in range(16)]
-                        elhs[pl.ds(s0, 16), pl.ds(0, He)] = gather_x(ps16)
+                        S["lhs"][pl.ds(s0, 16), pl.ds(0, He)] = gather_x(ps16)
                         if prequant_x:
                             pq_chunks.append(pq_sc_of(ps16))
                     pq_sc = jnp.concatenate(pq_chunks, axis=0) if prequant_x else None
@@ -7820,7 +7279,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     w13_post_sc = pq_sc if (prequant_x and not can_fp8_x) else None
 
                     def x_stage_chunk_fn(c_w, cw_w, out_fp8):
-                        w_x = elhs[
+                        w_x = S["lhs"][
                                 pl.ds(0, nrows),
                                 pl.ds(c_w * FP4_PACK, cw_w * FP4_PACK),
                         ]
@@ -7898,11 +7357,11 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                                 jnp.zeros_like(amax),
                                 jnp.float32(448.0) / jnp.maximum(amax, jnp.float32(1e-30)),
                         )
-                        elhs[pl.ds(0, nrows), pl.ds(He + 256, 256)] = (
+                        S["lhs"][pl.ds(0, nrows), pl.ds(He + 256, 256)] = (
                                 h1 * inv_h
                         ).astype(bf16)
                         h0_r = S["acc"][pl.ds(0, nrows), pl.ds(0, 256)]
-                        elhs[pl.ds(0, nrows), pl.ds(He, 256)] = (
+                        S["lhs"][pl.ds(0, nrows), pl.ds(He, 256)] = (
                                 h0_r * inv_h
                         ).astype(bf16)
                     else:
@@ -7912,20 +7371,20 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                             up_ = S["acc"][pl.ds(0, nrows), pl.ds(Il + c_h, th)]
                             if gscale_t:
                                 gt, up_ = gt * g_gate, up_ * g_up
-                            elhs[pl.ds(0, nrows), pl.ds(He + c_h, th)] = (
+                            S["lhs"][pl.ds(0, nrows), pl.ds(He + c_h, th)] = (
                                     gt * jax.nn.sigmoid(gt) * up_
                             ).astype(bf16)
                         h_pq_sc = None
                     wait_w2_if_needed(slot, wait_w2)
 
                     def h_chunk_fn(c_w, cw_w, out_fp8):
-                        w_h = elhs[
+                        w_h = S["lhs"][
                                 pl.ds(0, nrows),
                                 pl.ds(He + c_w * FP4_PACK, cw_w * FP4_PACK),
                         ]
                         return w_h.astype(jnp.float8_e4m3fn) if out_fp8 else w_h
 
-                    y_stage = elhs.at[pl.ds(0, nrows), pl.ds(0, He)]
+                    y_stage = S["lhs"].at[pl.ds(0, nrows), pl.ds(0, He)]
                     if kind == "fp4":
                         _fp4_dot(
                                 None,
@@ -7961,7 +7420,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                                 nrows=nrows,
                         )
                     for s0 in range(0, nrows, 16):
-                        yp = _pack_y(elhs[pl.ds(s0, 16), pl.ds(0, He)], c)
+                        yp = _pack_y(S["lhs"][pl.ds(s0, 16), pl.ds(0, He)], c)
                         if vy >= 1:
                             for j in range(16):
                                 p = pair_fn(s0 + j)
@@ -8290,19 +7749,16 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                                     + _unpack_y(pad_y[c_o], c),
                                     c,
                             )
-                    py_off = 0 if alias_arenas else 4
-                    if alias_arenas:
-                        tp_barrier()
                     if c.tiled_pair_y >= 2:
                         m1_y = jnp.where(core_y == 0, 2, 1).astype(jnp.int32)
                         m2_y = 3 - m1_y
                         nb1_y = 2 * jnp.bitwise_xor(chip_y, m1_y) + core_y
                         nb2_y = 2 * jnp.bitwise_xor(chip_y, m2_y) + core_y
                         c2a = [
-                                rcopy(ysend_blk(nb1_y), pad_y.at[py_off + 0], nb1_y, "y"),
+                                rcopy(ysend_blk(nb1_y), pad_y.at[4], nb1_y, "y"),
                                 rcopy(
                                         ysend_blk(2 * jnp.bitwise_xor(chip_y, 3) + core_y),
-                                        pad_y.at[py_off + 1],
+                                        pad_y.at[5],
                                         nb1_y,
                                         "y",
                                 ),
@@ -8316,24 +7772,23 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         if c.combine_loop:
 
                             def pair_c2_row(r, carry_):
-                                pad_y.at[py_off + 3, r][...] = _pack_y(
+                                pad_y.at[7, r][...] = _pack_y(
                                         _unpack_y(S["ysend"].at[nb2_y * Rc + r][...], c)
-                                        + _unpack_y(pad_y.at[py_off + 1, r][...], c),
+                                        + _unpack_y(pad_y.at[5, r][...], c),
                                         c,
                                 )
                                 return carry_
 
                             jax.lax.fori_loop(0, Rc, pair_c2_row, 0)
                         else:
-                            pad_y[py_off + 3] = _pack_y(
-                                    _unpack_y(ysend_blk(nb2_y)[...], c)
-                                    + _unpack_y(pad_y[py_off + 1], c),
+                            pad_y[7] = _pack_y(
+                                    _unpack_y(ysend_blk(nb2_y)[...], c) + _unpack_y(pad_y[5], c),
                                     c,
                             )
-                        pad_y[py_off + 1] = ysend_blk(me)[...]
+                        pad_y[5] = ysend_blk(me)[...]
                         c2b = pltpu.make_async_remote_copy(
-                                src_ref=pad_y.at[py_off + 3],
-                                dst_ref=pad_y.at[py_off + 2],
+                                src_ref=pad_y.at[7],
+                                dst_ref=pad_y.at[6],
                                 send_sem=S["pair_ssems"].at[5],
                                 recv_sem=S["pair_rsems"].at[5],
                                 device_id=(nb2_y,),
@@ -8341,11 +7796,11 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         c2b.start()
                         c2b.wait()
                     else:
-                        pad_y[py_off + chip_y] = ysend_blk(me)[...]
+                        pad_y[4 + chip_y] = ysend_blk(me)[...]
                         yc_cps = [
                                 rcopy(
                                         ysend_blk(2 * jnp.bitwise_xor(chip_y, d) + core_y),
-                                        pad_y.at[py_off + chip_y],
+                                        pad_y.at[4 + chip_y],
                                         2 * jnp.bitwise_xor(chip_y, d) + core_y,
                                         "y",
                                 )
@@ -8419,15 +7874,10 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 )
                 S["wk_s"][...] = jnp.broadcast_to(wk, (win, K, LANE))
                 if vy >= 2:
-                    py_c_off = 0 if alias_arenas else 4
                     y_slabs = (
-                            (py_c_off, py_c_off + 1, py_c_off + 2)
+                            (4, 5, 6)
                             if (use_pair_y and c.tiled_pair_y >= 2)
-                            else (
-                                    (py_c_off, py_c_off + 1, py_c_off + 2, py_c_off + 3)
-                                    if use_pair_y
-                                    else tuple(range(c.tp))
-                            )
+                            else ((4, 5, 6, 7) if use_pair_y else tuple(range(c.tp)))
                     )
                     if c.combine_loop:
 
@@ -8520,10 +7970,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             if vpads:
                 with _scope("u_ag"):
                     padu = coll.all_gather(
-                            "u",
-                            S["u_send"],
-                            me,
-                            live=None if alias_arenas else (lambda m: m * Rc < n_live),
+                            "u", S["u_send"], me, live=lambda m: m * Rc < n_live
                     )
                     if c.combine_loop and R % 16 == 0:
 
@@ -8531,11 +7978,9 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                             r_ok16 = (
                                     r0 + jax.lax.broadcasted_iota(jnp.int32, (16, 1), 0)
                             ) < n_live
-                            lhs_set_slice(
-                                    pl.ds(r0, 16),
-                                    jnp.where(r_ok16, _unpack_bf16x2(raw16), 0.0).astype(bf16),
-                                    He,
-                            )
+                            S["lhs"][pl.ds(r0, 16), pl.ds(0, He)] = jnp.where(
+                                    r_ok16, _unpack_bf16x2(raw16), 0.0
+                            ).astype(bf16)
 
                         if Rc % 16 == 0:
 
@@ -8572,11 +8017,9 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     else:
                         upk = jnp.concatenate([padu[d] for d in range(c.tp)], axis=0)
                         r_ok = jax.lax.broadcasted_iota(jnp.int32, (R, 1), 0) < n_live
-                        lhs_set_slice(
-                                pl.ds(0, R),
-                                jnp.where(r_ok, _unpack_bf16x2(upk), 0.0).astype(bf16),
-                                He,
-                        )
+                        S["lhs"][:, pl.ds(0, He)] = jnp.where(
+                                r_ok, _unpack_bf16x2(upk), 0.0
+                        ).astype(bf16)
             else:
                 # u all-gather, pipelined by owner: the unpool pass loads a row tile once
                 # its owners' rows have landed (each owner signals its own semaphore)
@@ -8634,7 +8077,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
 
                 def unpool_tile(rows, t, v):
                     u = jnp.where(tile_live(t), _unpack_bf16x2(v[0][...]), 0.0)
-                    lhs_set_slice(rows, u.astype(bf16), He)
+                    S["lhs"][rows, pl.ds(0, He)] = u.astype(bf16)
                     return []
 
                 with _scope("u_ag"):
@@ -8666,8 +8109,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     S["f_send"][...] = _pack_bf16x2(
                             S["acc"][:, pl.ds(0, Hl)].astype(bf16).astype(f32)
                     )
-                if alias_arenas:
-                    tp_barrier()
                 if c.fold_f and nxt is not None:
                     coll.all_gather_blocks_start("f", S["f_send"], tp_rank, S["f_rsems"])
                 else:
@@ -8716,17 +8157,15 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 if c.tiled_vmem_pads:
                     for t in range(R // RT):
                         rs = pl.ds(t * RT, RT)
-                        lhs_set_slice(
-                                rs,
-                                _rms(hs_load(rs), c.rms_eps, row("pre_attn_w")).astype(bf16),
-                        )
+                        S["lhs"][rs] = _rms(
+                                S["h_stream"][rs], c.rms_eps, row("pre_attn_w")
+                        ).astype(bf16)
                 else:
 
                     def pre_attn_tile(rows, t, v):
-                        lhs_set_slice(
-                                rows,
-                                _rms(v[0][...], c.rms_eps, row("pre_attn_w")).astype(bf16),
-                        )
+                        S["lhs"][rows] = _rms(
+                                v[0][...], c.rms_eps, row("pre_attn_w")
+                        ).astype(bf16)
                         return []
 
                     tile_pass([(stream_view, S["sin"])], pre_attn_tile)
@@ -8739,11 +8178,11 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 if c.tiled_vmem_pads:
                     for t in range(R // RT):
                         rs = pl.ds(t * RT, RT)
-                        s = row("attn_alpha") * hs_load(rs) + row("attn_beta") * _rms(
+                        s = row("attn_alpha") * S["h_stream"][rs] + row("attn_beta") * _rms(
                                 gathered_tile(S["pad_o_ag"].at[:, rs]), c.post_eps
                         ).astype(bf16).astype(f32)
-                        hs_store(rs, s)
-                        lhs_set_slice(rs, _rms(s, c.rms_eps, row("pre_ffn_w")).astype(bf16))
+                        S["h_stream"][rs] = s
+                        S["lhs"][rs] = _rms(s, c.rms_eps, row("pre_ffn_w")).astype(bf16)
                 else:
                     oag_rdy = ag_tile_ready(S["o_send"], S["pad_o_ag"], S["oag_tsems"])
 
@@ -8751,9 +8190,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         s = row("attn_alpha") * v[1][...] + row("attn_beta") * _rms(
                                 gathered_tile(v[0]), c.post_eps
                         ).astype(bf16).astype(f32)
-                        lhs_set_slice(
-                                rows, _rms(s, c.rms_eps, row("pre_ffn_w")).astype(bf16)
-                        )
+                        S["lhs"][rows] = _rms(s, c.rms_eps, row("pre_ffn_w")).astype(bf16)
                         return [s]
 
                     tile_pass(
@@ -8770,12 +8207,12 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 if c.tiled_vmem_pads:
                     for t in range(R // RT):
                         rs = pl.ds(t * RT, RT)
-                        s = row("ffn_alpha") * hs_load(rs) + row("ffn_beta") * _rms(
+                        s = row("ffn_alpha") * S["h_stream"][rs] + row("ffn_beta") * _rms(
                                 gathered_tile(S["pad_f"].at[:, rs]) * row("post_ffn_w"),
                                 c.post_eps,
                         ).astype(bf16).astype(f32)
                         capture_tile(l, rs, s)
-                        hs_store(rs, s)
+                        S["h_stream"][rs] = s
                 else:
                     fag_rdy = ag_tile_ready(S["f_send"], S["pad_f"], S["fag_tsems"])
 
@@ -8826,34 +8263,12 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             jax.lax.fori_loop(0, R // 8, rope_round, 0)
 
             # embedding: weightless RMS norm of the bf16 rows, kept in bf16 precision
-            if c.tiled_vmem_pads and not c.h_stream_hbm:
-                if alias_lhs:
-                    for t in range(R // RT):
-                        rs = pl.ds(t * RT, RT)
-                        dma(emb_ref.at[rs], S["btile"], _TS_AUX)
-                        S["h_stream"][rs] = (
-                                _rms(S["btile"][...].astype(f32), c.rms_eps)
-                                .astype(bf16)
-                                .astype(f32)
-                        )
-                else:
-                    dma(emb_ref, S["lhs"], _TS_AUX)
-                    for t in range(R // RT):
-                        rs = pl.ds(t * RT, RT)
-                        S["h_stream"][rs] = (
-                                _rms(S["lhs"][rs].astype(f32), c.rms_eps)
-                                .astype(bf16)
-                                .astype(f32)
-                        )
-            elif c.tiled_vmem_pads and c.h_stream_hbm:
+            if c.tiled_vmem_pads:
+                dma(emb_ref, S["lhs"], _TS_AUX)
                 for t in range(R // RT):
                     rs = pl.ds(t * RT, RT)
-                    dma(emb_ref.at[rs], S["btile"], _TS_AUX)
-                    hs_store(
-                            rs,
-                            _rms(S["btile"][...].astype(f32), c.rms_eps)
-                            .astype(bf16)
-                            .astype(f32),
+                    S["h_stream"][rs] = (
+                            _rms(S["lhs"][rs].astype(f32), c.rms_eps).astype(bf16).astype(f32)
                     )
             else:
 
@@ -8899,7 +8314,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             dma(W["final_norm"], S["final_norm"], _TS_OUT)
 
             # final norm on the bf16-cast stream, as the native path
-            if c.tiled_vmem_pads and not (alias_lhs or c.h_stream_hbm):
+            if c.tiled_vmem_pads:
                 if ncap == 0:
                     S["btile"][...] = jnp.zeros((RT, H), bf16)
                 for t in range(R // RT):
@@ -8913,24 +8328,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     )
                     S["lhs"][rs] = jnp.where(tile_live(t), hidden, 0.0).astype(bf16)
                 dma(S["lhs"], hid_out, _TS_OUT)
-            elif c.tiled_vmem_pads:
-                if ncap == 0:
-                    S["btile"][...] = jnp.zeros((RT, H), bf16)
-                    for t in range(R // RT):
-                        dma(
-                                S["btile"].at[:, pl.ds(0, LANE)],
-                                aux_out.at[pl.ds(t * RT, RT)],
-                                _TS_AUX,
-                        )
-                for t in range(R // RT):
-                    rs = pl.ds(t * RT, RT)
-                    hidden = _rms(
-                            hs_load(rs).astype(bf16).astype(f32),
-                            c.rms_eps,
-                            S["final_norm"][0:1, :],
-                    )
-                    S["btile"][...] = jnp.where(tile_live(t), hidden, 0.0).astype(bf16)
-                    dma(S["btile"], hid_out.at[rs], _TS_OUT)
             else:
 
                 def final_tile(rows, t, v):

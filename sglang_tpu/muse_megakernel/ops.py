@@ -680,16 +680,14 @@ class MuseMegakernel(torch.nn.Module):
             tiled_pair_y=_default_tiled_pair_y(rows) if (opt and tiled) else 0,
             pair_o_rs=opt and tiled,
             alias_oag_f=opt and tiled,
-            alias_vmem_arenas=opt and tiled and rows >= 64,
-            alias_lhs_ysend=opt and tiled and rows >= 80,
-            dense_fp8_lhs=False,
             sal_kv_split=opt and kv_sal and kv_sal_fp8,
-            attn_head_fp8=0,
+            attn_head_fp8=1 if (opt and kv_sal and kv_sal_fp8) else 0,
             topk_xpose=opt and rows >= 64,
             pair_y_stream=opt and tiled and rows > 64,
             ex_gs_smem=False,
             ex_w2_stage=opt and (tiled or (rows >= 32 and bool(getattr(self, "kperm", False)))),
-            ex_lhs_fp8=1 if (opt and (tiled or rows >= 32) and rows <= 256) else 0,
+            # fp8 x fp8 expert LHS loses accuracy at R >= 256 (8K cc=64 verify).
+            ex_lhs_fp8=1 if (opt and (tiled or rows >= 32) and rows <= 128) else 0,
             expert_chunk=64 if (opt and tiled and rows > 128) else 32,
         )
         n_units = len(K.expert_units(cfg))
@@ -749,27 +747,7 @@ class MuseMegakernel(torch.nn.Module):
                         else _SCRATCH_VMEM_BUDGET
                     )
                 )
-                if vy >= 2 and c_vy.tiled_vmem_pads and not c_vy.h_stream_hbm:
-                    plans.append((c_vy, b_vy, ((3, 11),), True))
-                    plans.append(
-                        (
-                            msgspec.structs.replace(c_vy, h_stream_hbm=True),
-                            b_vy,
-                            ((3, 11),),
-                            True,
-                        )
-                    )
-                    plans.append((c_vy, b_vy, _TILED_DEPTH_RING_PREFERENCE, vy != vys[-1]))
-                    plans.append(
-                        (
-                            msgspec.structs.replace(c_vy, h_stream_hbm=True),
-                            b_vy,
-                            _TILED_DEPTH_RING_PREFERENCE,
-                            vy != vys[-1],
-                        )
-                    )
-                else:
-                    plans.append((c_vy, b_vy, _TILED_DEPTH_RING_PREFERENCE, vy != vys[-1]))
+                plans.append((c_vy, b_vy, _TILED_DEPTH_RING_PREFERENCE, vy != vys[-1]))
             if cfg.tiled_vmem_y >= 1 and cfg.alias_oag_f:
                 plans.append(
                     (
