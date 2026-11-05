@@ -622,12 +622,12 @@ class RaidenKVManager(
             Every engine gets at least one slot, even over the budget.
 
         Example:
-            With a 24 GiB node budget and eight local ranks, each rank gets 3 GiB.
+            With a 128 GiB node budget and eight local ranks, each rank gets 16 GiB.
             For Muse Spark with two full-attention buffers and six SWA buffers:
                 Full slot: 2 * 1120 pages * 128 KiB = 280 MiB.
                 SWA slot:  6 *    9 pages * 128 KiB = 6.75 MiB.
-            Fixed-slot mode fits floor(3072 / 286.75) = 10 slots per engine,
-            returning [(10, 2), (10, 6)].
+            Fixed-slot mode fits floor(16384 / 286.75) = 57 slots per engine,
+            returning [(57, 2), (57, 6)].
         """
         slot_bytes = []
         for (tensors, max_blocks), num_layers in zip(engines, layers):

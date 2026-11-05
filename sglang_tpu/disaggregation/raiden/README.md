@@ -121,7 +121,7 @@ KV, decode prefix-cache reuse, `dst_tp > src_tp`.
 |-----|---------|---------|
 | `SGLANG_RAIDEN_PIPELINE_TRANSFER` | `0` | named layer pools for a PP producer and a DP, TP, or matching-PP consumer; set to `1` on a decode that is not itself a pipeline |
 | `SGLANG_RAIDEN_KV_PORT` | `31000` | base control port, kept clear of the default serving ports; local rank uses `base + 6*node_worker_rank` over every PP/CP/DP replica's TP ranks (data = `+1`, SWA engine control/data = `+2`/`+3`, GDN state engine control/data = `+4`/`+5`) |
-| `SGLANG_RAIDEN_HOST_POOL_GB` | `24` | host staging budget in GiB per node, split across local ranks. Each rank sizes all of its engines together (see below). Each engine gets at least one slot; when one max-length transfer does not fit, it still gets one slot, over the budget, and logs a warning with both sizes |
+| `SGLANG_RAIDEN_HOST_POOL_GB` | `128` | host staging budget in GiB per node, split across local ranks. Each rank sizes all of its engines together (see below). Each engine gets at least one slot; when one max-length transfer does not fit, it still gets one slot, over the budget, and logs a warning with both sizes |
 | `SGLANG_TPU_RAIDEN_STAGING_LAYERS` | `8` | host layer buffers across the full-attention and SWA engines, split by their layer counts with at least one each (`8` gives Muse Spark 2 + 6). `0` keeps full mirrors, which asymmetric TP needs on prefill and decode |
 | `SGLANG_RAIDEN_MAX_BLOCKS` | `0` (auto) | full-attention max pages/request; auto = `ceil(context_len/page_size)` |
 | `SGLANG_RAIDEN_SWA_MAX_BLOCKS` | `0` (auto) | SWA max pages/request; auto includes one page for an unaligned window start |
@@ -145,11 +145,11 @@ Each rank's budget sizes all of its engines together:
   `--disaggregation-decode-extra-slots`, since a rank cannot claim more, so
   staging RAM can stay below the budget.
 - The `host staging` log line reports the plan, for example
-  `slots=[9, 72] layers=[2, 6] of [16, 46]` for Muse Spark at TP16 on two
-  hosts with the 24 GiB default budget, 8 layers, and at least 72 requests.
+  `slots=[49, 392] layers=[2, 6] of [16, 46]` for Muse Spark at TP16 on two
+  hosts with the 128 GiB default budget, 8 layers, and at least 392 requests.
 
 Pipeline and block-major transfers and `SGLANG_TPU_RAIDEN_STAGING_LAYERS=0`
-keep full mirrors under the same 24 GiB default, so they get far fewer slots;
+keep full mirrors under the same 128 GiB default, so they get far fewer slots;
 raise `SGLANG_RAIDEN_HOST_POOL_GB` for more concurrent transfers. Asymmetric TP
 requires dynamic staging and `SGLANG_TPU_RAIDEN_STAGING_LAYERS=0` on prefill and
 decode. The prefill learns the decode's TP only from its first request, so with

@@ -61,7 +61,7 @@ class TestBuildEngines(CustomTestCase):
         module.KVCacheManager = Engine
         self.stack.enter_context(patch.dict(sys.modules, {module.__name__: module}))
 
-    def _built(self, *, dynamic, layers=8, slot_ceiling=256):
+    def _built(self, *, dynamic, layers=8, slot_ceiling=512):
         manager = object.__new__(RaidenKVManager)
         manager._engine = None
         manager._kv_caches = [_Buffer() for _ in range(16)]
@@ -88,35 +88,35 @@ class TestBuildEngines(CustomTestCase):
         return manager, sizes
 
     def test_fixed_slots_share_one_count(self):
-        # 3 GiB per rank over a 280 MiB full plus a 6.75 MiB SWA slot.
+        # 16 GiB per rank over a 280 MiB full plus a 6.75 MiB SWA slot.
         manager, sizes = self._built(dynamic=False)
-        self.assertEqual(sizes, [(10, 2), (10, 6)])
+        self.assertEqual(sizes, [(57, 2), (57, 6)])
         self.assertTrue(manager._bounded_staging)
-        self.assertEqual(manager._pulling.capacity, 10 * 1120)
-        self.assertEqual(manager._pulling.swa_capacity, 10 * 9)
+        self.assertEqual(manager._pulling.capacity, 57 * 1120)
+        self.assertEqual(manager._pulling.swa_capacity, 57 * 9)
 
     def test_dynamic_staging_gives_windows_eight_slots_per_full_slot(self):
-        # 3 GiB per rank over 280 MiB plus eight 6.75 MiB slots.
+        # 16 GiB per rank over 280 MiB plus eight 6.75 MiB slots.
         manager, sizes = self._built(dynamic=True)
-        self.assertEqual(sizes, [(9, 2), (72, 6)])
-        self.assertEqual(manager._pulling.swa_capacity, 72 * 9)
+        self.assertEqual(sizes, [(49, 2), (392, 6)])
+        self.assertEqual(manager._pulling.swa_capacity, 392 * 9)
 
     def test_slots_stop_at_what_requests_can_claim(self):
-        # The budget fits (9, 72), but a rank cannot claim more than 24 slots.
+        # The budget fits (49, 392), but a rank cannot claim more than 24 slots.
         _, sizes = self._built(dynamic=True, slot_ceiling=24)
-        self.assertEqual(sizes, [(9, 2), (24, 6)])
+        self.assertEqual(sizes, [(24, 2), (24, 6)])
 
     def test_zero_layers_keep_full_mirrors(self):
-        # The default 3 GiB per rank fits one 2240 MiB full plus eight 51.75 MiB
+        # The default 16 GiB per rank fits six 2240 MiB full plus 48 51.75 MiB
         # SWA mirrors.
         manager, sizes = self._built(dynamic=True, layers=0)
-        self.assertEqual(sizes, [(1, 16), (8, 46)])
+        self.assertEqual(sizes, [(6, 16), (48, 46)])
         self.assertFalse(manager._bounded_staging)
 
     def test_configured_budget_applies_to_full_mirrors(self):
-        with envs.SGLANG_RAIDEN_HOST_POOL_GB.override(64):
+        with envs.SGLANG_RAIDEN_HOST_POOL_GB.override(24):
             _, sizes = self._built(dynamic=True, layers=0)
-        self.assertEqual(sizes, [(3, 16), (24, 46)])
+        self.assertEqual(sizes, [(1, 16), (8, 46)])
 
     def test_bounded_decode_rejects_an_asymmetric_prefill(self):
         manager = object.__new__(RaidenKVManager)
@@ -161,7 +161,7 @@ class TestBuildEngines(CustomTestCase):
         self.stack.enter_context(patch.object(module, "KVCacheManager", OldEngine))
         manager, sizes = self._built(dynamic=True)
         # Same full-mirror plan as SGLANG_TPU_RAIDEN_STAGING_LAYERS=0.
-        self.assertEqual(sizes, [(1, None), (8, None)])
+        self.assertEqual(sizes, [(6, None), (48, None)])
         self.assertEqual(manager._staging_layers_total, 0)
         self.assertFalse(manager._bounded_staging)
 
