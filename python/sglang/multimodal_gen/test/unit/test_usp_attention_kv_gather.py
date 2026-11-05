@@ -193,14 +193,7 @@ class TestUSPAttentionKVGather(unittest.TestCase):
                 )
                 # Two gathers (K and V) and no third for a mask; the selected
                 # impl attends the real-key prefix, without masked SDPA.
-                with (
-                    patch.object(self.attn.attn_impl, "forward", recording_forward),
-                    patch.object(
-                        USPAttention,
-                        "_kv_gather_masked_sdpa",
-                        side_effect=AssertionError("masked SDPA"),
-                    ),
-                ):
+                with patch.object(self.attn.attn_impl, "forward", recording_forward):
                     out = self._run(q, q, q, [full_k, full_v], attn_mask_meta=meta)
                 self.assertEqual(kv_lengths, [(real, real)])
                 expected = _reference_attention(

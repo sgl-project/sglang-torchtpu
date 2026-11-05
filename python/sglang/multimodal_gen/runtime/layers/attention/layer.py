@@ -1688,8 +1688,8 @@ class USPAttention(nn.Module):
             and not use_varlen_fa
             and not (num_replicated_prefix or num_replicated_suffix)
         ):
-            pad_start = attn_mask_meta.get("pad_start", attn_mask_meta.get("gap_start"))
-            pad_end = attn_mask_meta.get("pad_end", attn_mask_meta.get("gap_end"))
+            pad_start = attn_mask_meta.get("pad_start")
+            pad_end = attn_mask_meta.get("pad_end")
             if pad_start is not None and pad_end == k.shape[1]:
                 # Tail padding only: attend over the global real-key prefix
                 # with the selected backend. Every rank slices the same span,
@@ -1796,16 +1796,6 @@ class USPAttention(nn.Module):
                 query_len,
             )
 
-        out = self._kv_gather_masked_sdpa(q, k, v, key_mask)
-        return out * attn_mask[:, :, None, None]
-
-    def _kv_gather_masked_sdpa(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        key_mask: torch.Tensor,
-    ) -> torch.Tensor:
         q_ = q.transpose(1, 2)
         k_ = k.transpose(1, 2)
         v_ = v.transpose(1, 2)
@@ -1825,7 +1815,7 @@ class USPAttention(nn.Module):
             else nullcontext()
         )
         with sdpa_context:
-            return torch.nn.functional.scaled_dot_product_attention(
+            out = torch.nn.functional.scaled_dot_product_attention(
                 q_,
                 k_,
                 v_,
@@ -1834,6 +1824,7 @@ class USPAttention(nn.Module):
                 is_causal=False,
                 scale=self.softmax_scale,
             ).transpose(1, 2)
+        return out * attn_mask[:, :, None, None]
 
     def _forward_with_replicated_prefix(
         self,
