@@ -27,6 +27,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.test_utils import CustomTestCase
 
 try:
@@ -47,6 +48,17 @@ def _has_tpu_via_jax() -> bool:
 
 
 _SKIP_REASON = "Requires torch_tpu + JAX with a TPU backend visible to jax.devices()"
+
+
+def _ep_layout(*, moe_tp_size: int) -> dict:
+    """World rank 3 of a TP group spanning the world, with four EP ranks."""
+    return dict(
+        tp_rank=3,
+        tp_size=4 * moe_tp_size,
+        moe_dp_size=1,
+        moe_ep_size=4,
+        moe_tp_size=moe_tp_size,
+    )
 
 
 @unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON)
@@ -171,6 +183,7 @@ class TestPallasMoeCallContract(CustomTestCase):
         with (
             patch.object(fused_moe_op, "_build_fused_moe_op", return_value=op),
             patch("sglang_tpu.rank_local.dist.get_rank", return_value=3),
+            get_parallel().override(**_ep_layout(moe_tp_size=1)),
             trace_rank(rank_tensor),
         ):
             fused_moe_op.fused_moe_call(
@@ -191,33 +204,29 @@ class TestPallasMoeCallContract(CustomTestCase):
         torch.testing.assert_close(offset_tensor, torch.tensor([6], dtype=torch.int32))
 
     def test_lifts_expert_group_offset_by_the_traced_ep_rank(self):
-        """EP < TP: world rank 3 is EP rank 1 when moe_tp_size is 2, which the
-        world-rank lift cannot express; the caller's traced EP rank sets it."""
+        """EP < TP: with moe_tp_size 2, world rank 3 is EP rank 1, so its window
+        starts at expert 2. The world-rank lift (3 % 4) raised here."""
         import sglang_tpu.moe.pallas.fused_moe_op as fused_moe_op
         from sglang_tpu.rank_local import trace_rank
 
         t = torch.empty(2, 8, dtype=torch.bfloat16)
         op = Mock(return_value=t)
-        call = dict(
-            hidden_states=t,
-            w1=torch.empty(2, 8, 16, dtype=torch.bfloat16),
-            w2=torch.empty(2, 8, 8, dtype=torch.bfloat16),
-            topk_weights=torch.empty(2, 2, dtype=torch.bfloat16),
-            topk_ids=torch.empty(2, 2, dtype=torch.int32),
-            topk=2,
-            activation="silu",
-            global_num_experts=8,
-            expert_group_offset=2,
-        )
         with (
             patch.object(fused_moe_op, "_build_fused_moe_op", return_value=op),
             patch("sglang_tpu.rank_local.dist.get_rank", return_value=3),
+            get_parallel().override(**_ep_layout(moe_tp_size=2)),
             trace_rank(torch.tensor([3], dtype=torch.int32)),
         ):
-            with self.assertRaisesRegex(ValueError, "contiguous logical rank groups"):
-                fused_moe_op.fused_moe_call(**call)
             fused_moe_op.fused_moe_call(
-                **call, traced_ep_rank=torch.tensor([1], dtype=torch.int32)
+                hidden_states=t,
+                w1=torch.empty(2, 8, 16, dtype=torch.bfloat16),
+                w2=torch.empty(2, 8, 8, dtype=torch.bfloat16),
+                topk_weights=torch.empty(2, 2, dtype=torch.bfloat16),
+                topk_ids=torch.empty(2, 2, dtype=torch.int32),
+                topk=2,
+                activation="silu",
+                global_num_experts=8,
+                expert_group_offset=2,
             )
 
         self.assertEqual(op.call_args.args[13], 0)

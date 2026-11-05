@@ -123,9 +123,9 @@ def check_moe_ep_rank_below_tp(cpu_group):
             w, i = mask_tpu_moe_non_local_experts(
                 weights, ids, num_local, ep_rank, traced_ep_rank=traced
             )
-            # The FP8 and W4A16 paths lift their expert window offset instead.
+            # The bf16, FP8 and W4A16 paths lift their expert window offset.
             static, offset = _resolve_expert_group_offset(
-                ep_rank * num_local, ep_size * num_local, num_local, traced
+                ep_rank * num_local, ep_size * num_local, num_local
             )
             assert static == 0
             return traced, w, i, offset

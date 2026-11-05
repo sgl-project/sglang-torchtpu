@@ -1118,28 +1118,22 @@ def _resolve_expert_group_offset(
     expert_group_offset: int,
     global_num_experts: int,
     num_local_experts: int,
-    traced_ep_rank: Optional[torch.Tensor] = None,
 ) -> tuple[int, Optional[torch.Tensor]]:
     """Lift the EP rank's expert window offset into a tensor input under
     ``trace_rank`` so every EP rank traces identical MLIR (``spmd_safe``).
 
     Outside a rank-parameterized trace (eager, dynamo, EP=1) the offset stays a
-    static int and the op signature is unchanged. A caller that knows the MoE
-    layout passes ``traced_ep_rank`` (``traced_moe_ep_rank``), which also holds
-    for EP < TP. Without it the lift relies on
-    ``moe_ep_rank == world_rank % ep_size`` (EP == TP), and ``traced_rank``
-    raises if that breaks.
+    static int and the op signature is unchanged. Inside one, the offset is
+    ``traced_moe_ep_rank() * num_local_experts``, which follows the MoE layout
+    for EP == TP and EP < TP alike. Every caller (bf16, FP8, W4A16) passes
+    ``moe_ep_rank * num_local_experts``.
     """
     if global_num_experts <= num_local_experts:
         # EP=1: no window, and no new op input so the trace is unchanged.
         return expert_group_offset, None
-    if traced_ep_rank is not None:
-        return 0, (traced_ep_rank * num_local_experts).to(dtype=torch.int32).reshape(1)
-    from sglang_tpu.rank_local import traced_rank
+    from sglang_tpu.moe.ep_rank import traced_moe_ep_rank
 
-    ep_size = global_num_experts // num_local_experts
-    ep_rank = expert_group_offset // num_local_experts
-    rank = traced_rank(ep_rank, group_size=ep_size)
+    rank = traced_moe_ep_rank()
     if rank is None:
         return expert_group_offset, None
     return 0, (rank * num_local_experts).to(dtype=torch.int32).reshape(1)
@@ -1161,7 +1155,6 @@ def fused_moe_call(
     no_combine: bool = False,
     global_num_experts: int = 0,
     expert_group_offset: int = 0,
-    traced_ep_rank: Optional[torch.Tensor] = None,
     w_quant_bits: int = 0,
     w1_channel_scale: Optional[torch.Tensor] = None,
     w2_channel_scale: Optional[torch.Tensor] = None,
@@ -1201,7 +1194,6 @@ def fused_moe_call(
         expert_group_offset,
         global_num_experts,
         int(w1.shape[0]),
-        traced_ep_rank,
     )
     return op(
         hidden_states,

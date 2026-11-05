@@ -22,7 +22,6 @@ from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import get_parallel
 from sglang_tpu.fp8_moe import _own_storage
-from sglang_tpu.moe.ep_rank import traced_moe_ep_rank
 
 
 def _free_replaced_storage(old: torch.Tensor, new: torch.Tensor) -> None:
@@ -216,7 +215,6 @@ def apply_tpu_w4a16_moe(
         no_combine=no_combine,
         global_num_experts=global_num_experts,
         expert_group_offset=expert_group_offset,
-        traced_ep_rank=traced_moe_ep_rank(),
         w_quant_bits=4,
         w1_channel_scale=getattr(layer, "w13_vmem_channel_scale", None),
         w2_channel_scale=getattr(layer, "w2_vmem_channel_scale", None),
