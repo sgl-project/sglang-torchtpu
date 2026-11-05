@@ -23,8 +23,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from sglang_tpu.kernels.index_selection.fp8.cache import PackedFP8Layout
-from sglang_tpu.kernels.index_selection.fp8.candidates import (
+from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.cache import PackedFP8Layout
+from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.candidates import (
     gather_candidate_keys,
     prepare_candidate_metadata,
 )

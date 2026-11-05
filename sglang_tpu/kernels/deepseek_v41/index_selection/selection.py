@@ -24,21 +24,21 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import xla_metadata
 
-from sglang_tpu.kernels.index_selection import publication, streaming_topk
-from sglang_tpu.kernels.index_selection.fp8.cache import PackedFP8Layout
-from sglang_tpu.kernels.index_selection.fp8.candidates import (
+from sglang_tpu.kernels.deepseek_v41.index_selection import publication, streaming_topk
+from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.cache import PackedFP8Layout
+from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.candidates import (
     PreparedCandidates,
     prepare_candidates,
 )
-from sglang_tpu.kernels.index_selection.fp8.dense_logits import (
+from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.dense_logits import (
     fp8_paged_mqa_logits,
     supports_candidate_publication,
 )
-from sglang_tpu.kernels.index_selection.fp8.sparse_logits import (
+from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.sparse_logits import (
     candidate_windows,
     fp8_gathered_mqa_logits,
 )
-from sglang_tpu.kernels.index_selection.fp8.tuned import (
+from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.tuned import (
     PACKED_FP8_MQA_CONFIG,
     indexer_query_rows,
     paged_mqa_key_tile,

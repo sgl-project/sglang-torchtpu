@@ -24,7 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from sglang_tpu.kernels.index_selection.streaming_topk import (
+from sglang_tpu.kernels.deepseek_v41.index_selection.streaming_topk import (
     streaming_topk,
 )
 

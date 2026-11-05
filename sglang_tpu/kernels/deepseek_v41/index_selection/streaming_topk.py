@@ -25,7 +25,7 @@ from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
-from sglang_tpu.kernels.index_selection.tuned_block_sizes import (
+from sglang_tpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import (
     STREAMING_TOPK_CONFIG,
     StreamingTopKConfig,
 )
