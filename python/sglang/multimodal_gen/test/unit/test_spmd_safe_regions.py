@@ -1,7 +1,9 @@
 """Regional-compile hooks: the SPMD-safe opt-in contract, the rank-invariant
-inputs Wan feeds its blocks, and the fusion barrier."""
+inputs Wan feeds its blocks, the fusion barrier and the per-request drain."""
 
 import contextlib
+import inspect
+import itertools
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -10,14 +12,28 @@ import torch
 from torch import nn
 from torch.utils._pytree import tree_leaves
 
+from sglang.kernels.ops.diffusion.common.fallback_torch import (
+    fuse_scale_shift_kernel_native,
+)
 from sglang.multimodal_gen.configs.models.dits.wanvideo import (
     WanVideoArchConfig,
     WanVideoConfig,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime import server_args as server_args_module
 from sglang.multimodal_gen.runtime.distributed import parallel_state
+from sglang.multimodal_gen.runtime.layers import layernorm
+from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
+from sglang.multimodal_gen.runtime.managers import gpu_worker
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    set_forward_context,
+)
 from sglang.multimodal_gen.runtime.models.dits import wanvideo
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+    OutputBatch,
+    Req,
+)
 from sglang.multimodal_gen.runtime.platforms.interface import Platform
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     compile_matching_submodules,
@@ -91,6 +107,8 @@ class TestFusionBarrier(unittest.TestCase):
 
     def test_wan_ffn_runs_the_barrier_between_the_activation_and_fc_out(self):
         calls = []
+        fc_out_inputs = []
+        barrier_out = torch.full((2,), 7.0)
 
         def step(name, value):
             calls.append(name)
@@ -98,7 +116,7 @@ class TestFusionBarrier(unittest.TestCase):
 
         mlp = SimpleNamespace(
             fc_in=lambda x: (step("fc_in", x), None),
-            fc_out=lambda x: (step("fc_out", x), None),
+            fc_out=lambda x: (fc_out_inputs.append(x), (step("fc_out", x), None))[1],
             _apply_activation=lambda x, bias, use_fused_bias_gelu: step("act", x),
         )
         with (
@@ -107,11 +125,13 @@ class TestFusionBarrier(unittest.TestCase):
             patch.object(
                 wanvideo.current_platform,
                 "fusion_barrier",
-                side_effect=lambda x: step("barrier", x),
+                side_effect=lambda x: (step("barrier", x), barrier_out)[1],
             ),
         ):
             wanvideo._WanGELUMLP.forward(mlp, torch.ones(2))
         self.assertEqual(calls, ["fc_in", "act", "barrier", "fc_out"])
+        # A compiler drops a barrier whose result is unused.
+        self.assertIs(fc_out_inputs[0], barrier_out)
 
 
 class _Stop(Exception):
@@ -125,30 +145,23 @@ _RANK_LOCAL_META_KEYS = frozenset({"local_pad"})
 
 
 class _RecordingBlock(nn.Module):
-    def forward(self, *args, **kwargs):
+    def forward(self, *args, attn_mask_meta=None, **kwargs):
         self.args = args
+        self.attn_mask_meta = attn_mask_meta
+        meta = {
+            key: value
+            for key, value in (attn_mask_meta or {}).items()
+            if key not in _RANK_LOCAL_META_KEYS
+        }
+        leaves = tree_leaves((args, kwargs, meta))
         self.layouts = [
             (tuple(leaf.shape), leaf.stride(), leaf.storage_offset())
-            for leaf in tree_leaves((args, kwargs))
+            for leaf in leaves
             if isinstance(leaf, torch.Tensor)
         ]
         # Dynamo specializes on Python scalars it reads, so a rank-dependent
         # scalar changes the program even when every tensor layout matches.
-        meta = kwargs.get("attn_mask_meta") or {}
-        rest = {k: v for k, v in kwargs.items() if k != "attn_mask_meta"}
-        self.scalars = (
-            [
-                leaf
-                for leaf in tree_leaves((args, rest))
-                if not isinstance(leaf, torch.Tensor)
-            ],
-            {
-                key: value
-                for key, value in meta.items()
-                if not isinstance(value, torch.Tensor)
-                and key not in _RANK_LOCAL_META_KEYS
-            },
-        )
+        self.scalars = [leaf for leaf in leaves if not isinstance(leaf, torch.Tensor)]
         raise _Stop
 
 
@@ -189,18 +202,22 @@ def _tiny_wan():
     return model
 
 
+def _set_tiny_wan_server_args(test):
+    previous = server_args_module._global_server_args
+    server_args_module.set_global_server_args(
+        SimpleNamespace(
+            attention_backend=None,
+            attention_backend_config=None,
+            kv_gather_degree=1,
+            sp_split_auto=False,
+        )
+    )
+    test.addCleanup(server_args_module.set_global_server_args, previous)
+
+
 class TestWanBlockInputsAreRankInvariant(unittest.TestCase):
     def setUp(self):
-        previous = server_args_module._global_server_args
-        server_args_module.set_global_server_args(
-            SimpleNamespace(
-                attention_backend=None,
-                attention_backend_config=None,
-                kv_gather_degree=1,
-                sp_split_auto=False,
-            )
-        )
-        self.addCleanup(server_args_module.set_global_server_args, previous)
+        _set_tiny_wan_server_args(self)
 
     def test_every_rank_feeds_blocks_offset_zero_shards(self):
         # 2 x 2 x 4 = 16 latent tokens, 4 per rank. With batch 1 a rank's slice
@@ -218,7 +235,7 @@ class TestWanBlockInputsAreRankInvariant(unittest.TestCase):
                 if per_token_timestep
                 else torch.full((batch,), 500.0)
             )
-            layouts = []
+            layouts, scalars = [], []
             for rank in range(world_size):
                 case = dict(batch=batch, per_token=per_token_timestep, rank=rank)
                 with self.subTest(**case), _sp_rank(rank, world_size):
@@ -233,6 +250,7 @@ class TestWanBlockInputsAreRankInvariant(unittest.TestCase):
                     ):
                         model(latents, text, timestep)
                     layouts.append(block.layouts)
+                    scalars.append(block.scalars)
 
                     hidden_states, _, temb, _ = block.args
                     rows = slice(rank * local_len, (rank + 1) * local_len)
@@ -252,9 +270,10 @@ class TestWanBlockInputsAreRankInvariant(unittest.TestCase):
                     for tensor in sharded:
                         self.assertEqual(tensor.storage_offset(), 0)
                         self.assertTrue(tensor.is_contiguous())
-            # Same shapes, strides and offsets for every tensor on every rank.
-            for rank, layout in enumerate(layouts):
-                self.assertEqual(layout, layouts[0], f"rank {rank}")
+            # Same shapes, strides, offsets and non-tensor arguments on every rank.
+            for rank in range(world_size):
+                self.assertEqual(layouts[rank], layouts[0], f"rank {rank}")
+                self.assertEqual(scalars[rank], scalars[0], f"rank {rank}")
 
     def test_padded_shards_feed_every_rank_the_same_program_inputs(self):
         # 3 x 3 x 3 = 27 latent tokens at SP 4: 7 per rank, one pad token at
@@ -299,7 +318,121 @@ class TestWanBlockInputsAreRankInvariant(unittest.TestCase):
                 self.assertEqual(layouts[rank], layouts[0], f"rank {rank}")
                 self.assertEqual(scalars[rank], scalars[0], f"rank {rank}")
             # The global pad span is what the attention paths read.
-            self.assertEqual(scalars[0][1]["pad_start"], 27)
+            self.assertEqual(block.attn_mask_meta["pad_start"], 27)
+
+
+def _native_forward(op):
+    # TPU's dispatch: forward_native, whose nested torch.compile is off on TPU.
+    return inspect.unwrap(type(op).forward_native).__get__(op)
+
+
+class TestWanBlockCompilesAsOneGraph(unittest.TestCase):
+    """A graph break inside a Wan block splits its SPMD-safe region, so the
+    region's collectives run in separate programs again."""
+
+    def setUp(self):
+        _set_tiny_wan_server_args(self)
+        torch._dynamo.reset()
+        self.addCleanup(torch._dynamo.reset)
+
+    def test_wrapped_blocks_compile_with_fullgraph(self):
+        forward_batch = SimpleNamespace(
+            enable_sequence_shard=False, enable_teacache=False, enable_spectrum=False
+        )
+        with (
+            _sp_rank(0, 1),
+            patch.object(CustomOp, "dispatch_forward", _native_forward),
+            # The fallback TPU selects; the CPU default calls sgl_kernel.
+            patch.object(
+                layernorm, "fuse_scale_shift_kernel", fuse_scale_shift_kernel_native
+            ),
+            set_forward_context(
+                current_timestep=0, attn_metadata=None, forward_batch=forward_batch
+            ),
+            torch.no_grad(),
+        ):
+            model = _tiny_wan()
+            text = torch.randn(1, 5, 8)
+            latents = torch.randn(1, 4, 2, 4, 8)
+            timesteps = (torch.full((1,), 500.0), torch.full((1, 16), 500.0))
+            eager = [model(latents, text, timestep) for timestep in timesteps]
+            with patch(f"{_COMPILE}.current_platform") as platform:
+                platform.prepare_spmd_region_wrapper.return_value = _wrap_region
+                compile_matching_submodules(
+                    model,
+                    compile_kwargs=dict(backend="eager", fullgraph=True, dynamic=False),
+                )
+            for timestep, expected in zip(timesteps, eager):
+                with self.subTest(timestep_shape=tuple(timestep.shape)):
+                    torch.testing.assert_close(
+                        model(latents, text, timestep), expected, rtol=0, atol=0
+                    )
+
+
+class TestDrainAfterRequest(unittest.TestCase):
+    """When the platform asks, every rank drains its device queue after each
+    request whose forward returned, warmups included: on TPU a skipped drain
+    hung Wan2.2-A14B's second warmup request with 7 of its 8 ranks blocked."""
+
+    def _serve(self, *, drain, forward, num_requests, output_rank=True, warmup=False):
+        events = []
+        worker = gpu_worker.GPUWorker.__new__(gpu_worker.GPUWorker)
+        worker.pipeline = SimpleNamespace(
+            forward=lambda req, server_args: (events.append("forward"), forward())[1]
+        )
+        worker.server_args = SimpleNamespace()
+        worker.is_output_rank = output_rank
+        worker._release_warmup_pool_before_serving = False
+        worker._realtime_sessions = SimpleNamespace(attach=lambda _req: None)
+        requests = [
+            Req(
+                sampling_params=SamplingParams(
+                    request_id=f"req-{i}", save_output=False, suppress_logs=True
+                )
+            )
+            for i in range(num_requests)
+        ]
+        if warmup:
+            for req in requests:
+                req.set_as_warmup()
+        platform = gpu_worker.current_platform
+        with (
+            patch.object(platform, "is_cpu", return_value=True),
+            patch.object(
+                platform, "drain_device_queue_after_request", return_value=drain
+            ),
+            patch.object(
+                torch.accelerator,
+                "synchronize",
+                side_effect=lambda: events.append("drain"),
+            ),
+        ):
+            outputs = [worker.execute_forward([req]) for req in requests]
+        return events, outputs
+
+    def test_every_finished_forward_drains_when_the_platform_asks(self):
+        for drain, output_rank, warmup in itertools.product(
+            (True, False), (True, False), (False, True)
+        ):
+            with self.subTest(drain=drain, output_rank=output_rank, warmup=warmup):
+                events, _ = self._serve(
+                    drain=drain,
+                    forward=OutputBatch,
+                    num_requests=2,
+                    output_rank=output_rank,
+                    warmup=warmup,
+                )
+                expected = ["forward", "drain"] if drain else ["forward"]
+                self.assertEqual(events, expected * 2)
+
+    def test_a_failed_forward_returns_its_error_without_a_drain(self):
+        def fail():
+            raise RuntimeError("forward failed")
+
+        with self.assertLogs(gpu_worker.logger, "ERROR"):
+            events, (output,) = self._serve(drain=True, forward=fail, num_requests=1)
+        self.assertEqual(events, ["forward"])
+        self.assertIn("forward failed", output.error)
 
 
 if __name__ == "__main__":

@@ -123,8 +123,8 @@ class _WanGELUMLP(MLP):
                 bias,
                 use_fused_bias_gelu=nvfp4_bias_gelu_active(self),
             )
-        # Keep the activation in fc_in's epilogue: XLA would otherwise fuse it
-        # into fc_out as a slower matmul prologue.
+        # Keep the activation in fc_in's epilogue: a graph compiler would
+        # otherwise fuse it into fc_out as a slower matmul prologue.
         x = current_platform.fusion_barrier(x)
         x, _ = self.fc_out(x)
         return x
@@ -1048,8 +1048,8 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_block]
     _compile_conditions = [is_block]
     # SP ranks feed each block equal-length shards at storage offset 0 (see
-    # forward; torch_tpu keys executables on input storage offsets), so all
-    # ranks compile the same block program.
+    # forward; some compiled backends key executables on input storage
+    # offsets), so all ranks compile the same block program.
     _compile_regions_spmd_safe = True
     param_names_mapping = WanVideoConfig().param_names_mapping
     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
@@ -1265,9 +1265,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 batch_size, self.sp_size, local_seq_len, hidden_states.shape[2]
             )
             # A fresh shard: a view starts at a rank-dependent storage offset,
-            # which torch_tpu keys compiled executables on. Unconditional on
-            # purpose: the copy is negligible elsewhere and keeps one trace on
-            # every platform.
+            # which some compiled backends key executables on. Unconditional
+            # on purpose: the copy is negligible on the others and keeps one
+            # trace on every platform.
             hidden_states = hidden_states[:, sp_rank, :, :].clone(
                 memory_format=torch.contiguous_format
             )

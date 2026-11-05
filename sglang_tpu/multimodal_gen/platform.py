@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
 )
 from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang_tpu.compile_cache import append_compile_cache_key_tag
 from sglang_tpu.multimodal_gen import worker
 
 logger = init_logger(__name__)
@@ -124,8 +125,6 @@ class TpuOOTPlatform(TpuPlatform):
         # collectives in one program. A whole-DiT program needs too much
         # scratch, so only regions. The ranks must run identical programs: the
         # fused collectives otherwise hang or exchange the wrong data.
-        import torch.compiler.config as compiler_config
-
         try:
             from torch_tpu._internal.distributed.spmd_util import spmd_safe
         except ImportError:
@@ -138,12 +137,7 @@ class TpuOOTPlatform(TpuPlatform):
 
         # The region annotation is not part of the compile cache key; keep
         # persisted executables of the two region policies apart.
-        tag = "spmd-safe-regions-v1"
-        existing_tag = str(compiler_config.cache_key_tag or "")
-        if tag not in existing_tag.split("|"):
-            compiler_config.cache_key_tag = (
-                f"{existing_tag}|{tag}" if existing_tag else tag
-            )
+        append_compile_cache_key_tag("spmd-safe-regions-v1")
         return spmd_safe
 
     def apply_server_args_defaults(self, server_args) -> None:
@@ -173,10 +167,12 @@ class TpuOOTPlatform(TpuPlatform):
 
     @classmethod
     def drain_device_queue_after_request(cls) -> bool:
-        # Without it Wan2.2-A14B hangs in its second warmup request: 7 of 8
-        # ranks block in a host-to-device copy behind collectives one rank
-        # never queued (4 of 4 runs, torch_tpu 0.2.0rc4 and 0.2.0). Output
-        # and warm latency are unchanged.
+        # Workaround for torch_tpu 0.2.0rc4 and 0.2.0: seeding torch.Generator("tpu")
+        # does a blocking host-to-device copy that waits behind queued collectives.
+        # Wan2.2-A14B's second warmup request hung with 7 of 8 ranks in that copy
+        # while the 8th waited in a host all_reduce (4 of 4 runs; warm latency is
+        # unchanged). test_diffusion_wan22_ti2v_5b.py seeds on the CPU for the same
+        # copy; remove both once a TPU Generator seeds without blocking.
         return True
 
     @classmethod
@@ -184,8 +180,4 @@ class TpuOOTPlatform(TpuPlatform):
         # Only a compiled XLA program fuses; in eager the barrier would copy x.
         if x.device.type != "tpu" or not torch.compiler.is_compiling():
             return x
-        barrier = getattr(getattr(torch.tpu, "ops", None), "optimization_barrier", None)
-        if barrier is None:
-            # torch_tpu releases before torch.tpu.ops expose only the raw op.
-            barrier = torch.ops.tpu.optimization_barrier
-        return barrier([x])[0]
+        return torch.tpu.ops.optimization_barrier([x])[0]
