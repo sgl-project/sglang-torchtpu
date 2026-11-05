@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
 )
 from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang_tpu.compile_cache import append_compile_cache_key_tag
 from sglang_tpu.multimodal_gen import worker
 
 logger = init_logger(__name__)
@@ -124,8 +125,6 @@ class TpuOOTPlatform(TpuPlatform):
         # collectives in one program. A whole-DiT program needs too much
         # scratch, so only regions. The ranks must run identical programs: the
         # fused collectives otherwise hang or exchange the wrong data.
-        import torch.compiler.config as compiler_config
-
         try:
             from torch_tpu._internal.distributed.spmd_util import spmd_safe
         except ImportError:
@@ -138,12 +137,7 @@ class TpuOOTPlatform(TpuPlatform):
 
         # The region annotation is not part of the compile cache key; keep
         # persisted executables of the two region policies apart.
-        tag = "spmd-safe-regions-v1"
-        existing_tag = str(compiler_config.cache_key_tag or "")
-        if tag not in existing_tag.split("|"):
-            compiler_config.cache_key_tag = (
-                f"{existing_tag}|{tag}" if existing_tag else tag
-            )
+        append_compile_cache_key_tag("spmd-safe-regions-v1")
         return spmd_safe
 
     def apply_server_args_defaults(self, server_args) -> None:

@@ -43,18 +43,14 @@ def _torch_tpu_stubs(spmd_safe=None):
 class TestTpuSpmdRegionWrapper(unittest.TestCase):
     def test_wrapper_tags_the_compile_cache_once(self):
         spmd_safe = object()
-        stubs = _torch_tpu_stubs(spmd_safe)
-        for user_tag, expected in (("", _CACHE_TAG), ("user", f"user|{_CACHE_TAG}")):
-            with (
-                self.subTest(user_tag=user_tag),
-                patch.dict(sys.modules, stubs),
-                compiler_config.patch(cache_key_tag=user_tag),
-            ):
-                for _ in range(2):
-                    self.assertIs(
-                        TpuOOTPlatform().prepare_spmd_region_wrapper(), spmd_safe
-                    )
-                self.assertEqual(compiler_config.cache_key_tag, expected)
+        with (
+            patch.dict(sys.modules, _torch_tpu_stubs(spmd_safe)),
+            compiler_config.patch(cache_key_tag="user"),
+        ):
+            # Once per compiled model: Wan2.2-A14B compiles two transformers.
+            for _ in range(2):
+                self.assertIs(TpuOOTPlatform().prepare_spmd_region_wrapper(), spmd_safe)
+            self.assertEqual(compiler_config.cache_key_tag, f"user|{_CACHE_TAG}")
 
     def test_torch_tpu_without_spmd_safe_leaves_regions_unwrapped(self):
         # spmd_safe is a private torch_tpu API: without it, regions compile
