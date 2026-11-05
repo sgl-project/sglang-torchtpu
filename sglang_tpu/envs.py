@@ -482,6 +482,9 @@ class TpuEnvs:
     # TODO: Remove once the issue gets resolved in libtpu version > 0.0.47
     # (likely 0.0.48).
     SGLANG_TPU_LIBTPU_WORKAROUND_FOR_ONLINE_QUANT_SCALE = EnvBool(True)
+    # Share one page pool between full-attention and sliding-window KV on TPU
+    # (equivalent to --enable-unified-memory; see unified_kv_pool.py).
+    SGLANG_TPU_UNIFIED_KV_POOL = EnvBool(False)
 
     # Sampling
     # Keep the repetition-penalty state padded to the power-of-two logits row
