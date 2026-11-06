@@ -95,7 +95,7 @@ of the migration. The TPU Plugin Scoreboard workflow publishes both daily.
 
 ## Hooks
 
-`hooks.register` is declared by both distributions (`tpu_hooks` in `python/`,
+`core_hooks.register` is declared by both distributions (`tpu_hooks` in `python/`,
 `tpu_oot_hooks` here): `SGLANG_PLATFORM=tpu` skips every general plugin of
 `sglang-tpu`, so mode A needs its own entry point. `register()` runs once per
 process and only on TPU, since every host installs the plugin.
@@ -110,6 +110,50 @@ CI picks the mode per lane (`render_jobset.py --platform`, the `platform`
 input of `_tpu-test.yml`), so each test runs in one mode only: the PR gate
 (stage-a, stage-b) and the single-host nightly (`nightly-tpu-4-v7`) run mode B;
 the multi-host, P/D, accuracy, perf, combo and external lanes stay on mode A.
+
+## P/D KV offload from prefill DRAM to decode DRAM
+
+Prefill stays the primary prefix cache. Before host pressure discards a cold
+cached branch, prefill pushes its full-attention KV from its own DRAM into the
+DRAM of the decode that served the branch. No HBM page and no staging slot is
+used on either role, and both HiCache write policies are supported. The decode
+keeps pushed branches only; it does not cache its own generation requests.
+
+Enable HiCache on both roles with `--enable-hierarchical-cache
+--hicache-io-backend raiden` and decode radix caching with
+`--disaggregation-decode-enable-radix-cache`, then set one switch on both
+roles:
+
+```bash
+SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM=1
+```
+
+Unsupported settings are refused, never run without the offload. An engine
+stops at start, naming the setting, with: a hybrid sliding-window model, a
+GDN/Mamba model, the unified KV pool, pipeline parallelism (`--pp-size` above
+1) or the Raiden pipeline transfer, context or data parallelism,
+speculative decoding, `--sleep-on-idle`, a transfer or HiCache I/O backend
+other than raiden, an
+L3 storage backend, HiCache or the radix cache off, the Rust radix tree, or a
+tpu-sync build without the host-to-host read API
+([google/tpu-sync@32568d35](https://github.com/google/tpu-sync/commit/32568d35)
+or later). A pair fails its requests with the reason when the switch is on for
+one role only or when the roles differ in attention-TP size (resharding).
+
+A decode whose DRAM is full declines a push; that is back-pressure, counted in
+the `[victim-push]` log line. A prefill starts pushes only while it has a
+request queued or running, so an engine left alone settles its transfers (a
+declined or unanswered push within 60 s) and goes idle. A cache flush is
+refused while transfers are in flight and can be retried. The Raiden socket I/O
+timeouts default to disabled and the native session deadline does not interrupt
+a blocked TCP operation: without them, a peer host that vanishes mid-transfer
+without closing its connections keeps this engine's pages pinned and the engine
+non-idle. Set them on both roles (either role sends KV):
+
+```bash
+export TPU_RAIDEN_PREFILL_{HANDSHAKE_ACK_READ,FINAL_ACK_READ,PAYLOAD_READ,HANDSHAKE_WRITE,PAYLOAD_WRITE}_TIMEOUT_S=60
+export TPU_RAIDEN_DECODE_{HANDSHAKE_READ,PAYLOAD_READ,ACK_WRITE,PAYLOAD_WRITE}_TIMEOUT_S=60
+```
 
 ## Muse Spark multimodal
 
