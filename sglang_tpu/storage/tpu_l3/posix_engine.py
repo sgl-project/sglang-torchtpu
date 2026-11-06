@@ -159,10 +159,34 @@ class PosixFileEngine:
             self._total += page.nbytes - (old[1] if old else 0)
         return True
 
+    def _stat_fallback(self, key: str) -> Optional[Tuple[str, int, int]]:
+        """Index files written by other processes sharing this root_dir.
+
+        MLA models store one shared copy per page (all ranks use the same
+        key suffix), so a rank that never wrote the page must still see it.
+        """
+        rel = self._relpath(key)
+        try:
+            st = os.stat(os.path.join(self.root_dir, rel))
+        except OSError:
+            return None
+        entry = (rel, st.st_size, time.monotonic_ns())
+        with self._lock:
+            if key not in self._index:
+                self._index[key] = entry
+                self._total += st.st_size
+        return entry
+
     def _read_one(self, key: str, dst: memoryview) -> bool:
         with self._lock:
             entry = self._index.get(key)
         if entry is None:
+            entry = self._stat_fallback(key)
+            if entry is None:
+                return False
+        # A file from an incompatible layout (page bytes differ) is a miss,
+        # never a partial read into live KV.
+        if entry[1] != dst.nbytes:
             return False
         rel = entry[0]
         try:
@@ -216,13 +240,30 @@ class PosixFileEngine:
         return list(self._executor.map(self._read_one, keys, dsts))
 
     def exists(self, keys: List[str]) -> int:
-        with self._lock:
-            n = 0
-            for key in keys:
-                if key not in self._index:
-                    break
-                n += 1
+        n = 0
+        for key in keys:
+            with self._lock:
+                hit = key in self._index
+            if not hit:
+                hit = self._stat_fallback(key) is not None
+            if not hit:
+                break
+            n += 1
         return n
+
+    def clear(self) -> bool:
+        """Delete every file this engine owns and reset the index."""
+        with self._lock:
+            rels = [rel for rel, _s, _n in self._index.values()]
+            self._index.clear()
+            self._total = 0
+        ok = True
+        for rel in rels:
+            try:
+                os.unlink(os.path.join(self.root_dir, rel))
+            except OSError:
+                ok = False
+        return ok
 
     def close(self) -> None:
         with self._lock:

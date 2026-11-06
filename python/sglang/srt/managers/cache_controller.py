@@ -714,8 +714,10 @@ class HiCacheController:
                     "simm",
                     "mori",
                     "tensorcast",
-                    "tpu_l3",
                 ]
+                # Backends (e.g. plugin-registered) may opt into the zero-copy
+                # v1 interface with a class attribute instead of a core list entry.
+                or getattr(self.storage_backend, "supports_zero_copy", False)
             ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))

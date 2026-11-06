@@ -66,6 +66,20 @@ class TpuOOTPlatform(TpuSRTPlatform):
             logger.debug("Deferring TPU backend init to the worker bootstrap.")
             return
         super().init_backend()
+        self._register_tpu_storage_backends()
+
+    @staticmethod
+    def _register_tpu_storage_backends() -> None:
+        """Register TPU-only HiCache storage backends with the core factory."""
+        from sglang.srt.mem_cache.storage.backend_factory import (
+            StorageBackendFactory,
+        )
+
+        StorageBackendFactory.register_backend(
+            "tpu_l3",
+            "sglang_tpu.storage.tpu_l3.tpu_l3_backend",
+            "TpuHiCacheL3Backend",
+        )
 
     def get_dsa_kv_pool_cls(self) -> type:
         # Reached from kv_cache_configurator._build_oot_dsa_kv_pool. That builder

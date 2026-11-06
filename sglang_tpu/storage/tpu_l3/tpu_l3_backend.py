@@ -25,13 +25,14 @@ purely on the registered host pool's CPU tensor.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import Any, List, Optional
 
 import torch  # guaranteed wherever sglang runs; engines stay torch-free
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
-from sglang.srt.mem_cache.storage.tpu_l3.posix_engine import PosixFileEngine
+from sglang_tpu.storage.tpu_l3.posix_engine import PosixFileEngine
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,10 @@ def _build_engine(engine: str, engine_config: dict):
 
 class TpuHiCacheL3Backend(HiCacheStorage):
     """HiCacheStorage over whole-page opaque host-pool pages."""
+
+    # Opts into the controller's zero-copy v1 page path (batch_set_v1 /
+    # batch_get_v1) without a core-side backend-name list entry.
+    supports_zero_copy = True
 
     def __init__(self, storage_config: Any, kwargs: Optional[dict] = None):
         self.storage_config = storage_config
@@ -79,6 +84,14 @@ class TpuHiCacheL3Backend(HiCacheStorage):
     # -- sglang wiring ---------------------------------------------------- #
 
     def register_mem_pool_host(self, mem_pool_host) -> None:
+        # Pages are addressed as kv_buffer[slot // page_size]; that only holds
+        # for the TPU fused page-first host pool. Refuse anything else rather
+        # than silently backing up and restoring the wrong bytes.
+        layout = getattr(mem_pool_host, "layout", None)
+        if layout != "page_first_fused":
+            raise ValueError(
+                f"tpu_l3 requires a page_first_fused host pool, got layout={layout!r}"
+            )
         super().register_mem_pool_host(mem_pool_host)
         self.page_size = int(mem_pool_host.page_size)
         self._ensure_engine()
@@ -87,6 +100,14 @@ class TpuHiCacheL3Backend(HiCacheStorage):
         with self._lock:
             if self._engine is None:
                 engine, engine_config = self._engine_spec
+                # Namespace each rank's files under its key suffix: ranks
+                # sharing one root_dir must not index, account, or evict each
+                # other's pages. Ranks with identical suffixes (MLA) share the
+                # namespace and see each other's files via the stat fallback.
+                engine_config = dict(engine_config)
+                engine_config["root_dir"] = os.path.join(
+                    engine_config["root_dir"], self.key_suffix.lstrip("_") or "default"
+                )
                 self._engine = _build_engine(engine, engine_config)
 
     # -- page views -------------------------------------------------------- #
@@ -157,9 +178,11 @@ class TpuHiCacheL3Backend(HiCacheStorage):
     def exists(self, key) -> bool:
         return self._engine.exists(self._suffix_keys([key])) == 1
 
-    def clear(self) -> None:
-        # Capacity-bounded engines evict on their own; nothing to flush.
-        pass
+    def clear(self) -> bool:
+        # Delete this rank's namespace (index + files). Other ranks' files
+        # live under their own suffix directories and are untouched.
+        self._ensure_engine()
+        return self._engine.clear()
 
     def close(self) -> None:
         if self._engine is not None:
