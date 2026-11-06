@@ -922,10 +922,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 )
         else:
             if self.kernel_spec.is_batched:
-                # Batched RPA: MIXED is [0, d0) -> [n, n, n]
-                return torch.tensor(
-                    [non_empty_bs, non_empty_bs, non_empty_bs], dtype=torch.int32
-                )
+                # Batched RPA: MIXED is [d1, d2) -> [0, 0, n]; [0, d0) is the DECODE
+                # pass, whose one-row q tile and schedule bound do not fit a chunk.
+                return torch.tensor([0, 0, non_empty_bs], dtype=torch.int32)
             else:
                 # RPA v3: EXTEND is [d0, d1) -> [0, n, n]
                 return torch.tensor([0, non_empty_bs, non_empty_bs], dtype=torch.int32)

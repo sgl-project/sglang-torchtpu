@@ -307,11 +307,11 @@ class TestPallasRpaDcpMetadataExtend(CustomTestCase):
         self.assertTrue(torch.equal(meta.cu_q_lens.to(torch.int32), expected))
 
     def test_extend_distribution_is_the_chunk_range_only(self):
-        # Pure extend keeps the batched layout [n, n, n]: every row, the
+        # Pure extend is the kernel's MIXED range [0, 0, n]: every row, the
         # one-token row included, runs on the chunk tile.
         n = len(self.SEQ_LENS)
         meta = self._meta(0)
-        self.assertEqual(meta.distribution.tolist(), [n, n, n])
+        self.assertEqual(meta.distribution.tolist(), [0, 0, n])
 
 
 @_requires_dcp_helpers
