@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import logging
+import socket
 import threading
 import time
 from collections import defaultdict
@@ -82,6 +83,26 @@ def _get_bootstrap_session(bootstrap_addr: str) -> requests.Session:
         )
         sessions[bootstrap_addr] = session
     return session
+
+
+def _resolve_bootstrap_host(addr: str) -> str:
+    # Cluster DNS can briefly fail to resolve a name that resolves before and
+    # after, e.g. a headless Service's pod record while its endpoints change.
+    na = NetworkAddress.parse(addr)
+    max_attempts, initial_delay, max_delay = 8, 1.0, 30.0
+    for attempt in range(1, max_attempts):
+        try:
+            return na.resolved().host
+        except ValueError as e:
+            if not isinstance(e.__cause__, socket.gaierror):
+                raise
+            delay = min(initial_delay * 2 ** (attempt - 1), max_delay)
+            logger.warning(
+                f"Bootstrap host lookup attempt {attempt}/{max_attempts} failed, "
+                f"retrying in {delay:.0f}s: {e}"
+            )
+            time.sleep(delay)
+    return na.resolved().host
 
 
 class KVTransferError(Exception):
@@ -1340,7 +1361,7 @@ class CommonKVManager(BaseKVManager):
         """Register prefill server info to bootstrap server via HTTP PUT."""
         if self.dist_init_addr:
             # Multi-node case: bootstrap server's host is dist_init_addr
-            host = NetworkAddress.parse(self.dist_init_addr).resolved().host
+            host = _resolve_bootstrap_host(self.dist_init_addr)
         else:
             # Single-node case: bootstrap server's host is the same as http server's host
             host = self.bootstrap_host
