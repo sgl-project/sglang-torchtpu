@@ -7,6 +7,8 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
 from . import decode as D
+from . import pools as PL
+from .writeback import row_write_call
 
 # Must match the argument order of `decode.kernel`.
 WEIGHT_ORDER = [
@@ -43,9 +45,12 @@ WEIGHT_ORDER = [
     "kda_scale",
 ]
 
-# sglang's per-layer expert tensors: lists in `weights`, passed after the caches.
+# sglang's per-layer expert tensors: lists in `weights`, passed after the pools.
 EXPERT_LISTS = ("expert_gate_up", "expert_down")
 PACKED_ORDER = [n for n in WEIGHT_ORDER if n not in EXPERT_LISTS]
+
+# Serving's per-layer pools, in the order the kernel takes them (one array per layer).
+POOL_ORDER = ("nope", "raw", "records", "temporal", "conv")
 
 # K-major packed weights ([L, slots, rows, cols]) hold each rank's blocks on the slot axis.
 _REPLICATED = {
@@ -63,7 +68,7 @@ _SPLIT = {
     "kda_o": (4, 1),
     "kda_fg_b": (3, 1),
     "kda_dt_bias": (3, 2),
-    "kda_conv": (3, 2),
+    "kda_conv": (4, 3),
     "kda_b": (3, 1),
     "kda_a_log": (3, 2),
     "kda_scale": (3, 2),
@@ -83,6 +88,14 @@ _SPLIT = {
     "dense_down": (4, 1),
     "dense_scale": (3, 2),
 }
+# Each rank holds its own shard of the mamba state; the DSA pools are replicated.
+_POOL_SPECS = {
+    "nope": P(None, None, None, None),
+    "raw": P(None, None, None),
+    "records": P(None, None, None, None),
+    "temporal": P(None, D.AXIS, None, None),
+    "conv": P(None, None, None, D.AXIS),
+}
 
 
 def weight_spec(name: str) -> P:
@@ -94,152 +107,124 @@ def weight_spec(name: str) -> P:
     return P(*parts)
 
 
-# n_query > 1: recur/conv are [L, Q, ...], the state after each query; a step reads pos[1].
-CACHE_ORDER = ["kv", "idx_key", "idx_gate", "recur", "conv"]
-N_DSA_CACHES = 3
-KERNEL_CACHES = CACHE_ORDER[:N_DSA_CACHES] + ["idx_pool"] + CACHE_ORDER[N_DSA_CACHES:]
-N_KDSA = N_DSA_CACHES + 1
+def _scatter_index_rows(spec, cfg, meta, pos, tab, nraw, nrec, raw, rec):
+    """Write the step's raw index rows and the records of the pools it closes with
+    XLA scatters (sub-tile slices a DMA cannot address); dropped rows get page -1."""
+    R, Q, B = cfg.rows, cfg.n_query, cfg.n_req
+    ps, kp, pps = cfg.page_size, spec.index_kpool, cfg.pages_per_seq
+    r = jnp.arange(R, dtype=jnp.int32)
+    b, qi = r // Q, r % Q
+    live = b < meta[0]
+    tok = pos[b] + qi
+    tpage = jnp.where(live, tab[b * pps + jnp.minimum(tok // ps, pps - 1)], -1)
+    fp0, fresh = PL.closing_pools(pos[b], Q, kp)
+    ptok = (fp0 + qi) * kp
+    rpage = jnp.where(
+        live & (qi < fresh), tab[b * pps + jnp.minimum(ptok // ps, pps - 1)], -1
+    )
+    ri = (ptok % ps) // kp
+    raw_out = [
+        raw[d].at[tpage, tok % ps].set(nraw[d], mode="drop") for d in range(len(raw))
+    ]
+    rec_out = [
+        rec[d].at[rpage, ri // 4, ri % 4].set(nrec[d], mode="drop")
+        for d in range(len(rec))
+    ]
+    return raw_out, rec_out
 
 
 def make_decode(spec, layout, small_map, small_f32_map, mesh, cfg: D.KernelConfig):
-    """`shard(tok, pos, init_streams, weights, dsa_caches, kda_caches)` and its helpers."""
+    """`shard(step_inputs, init_streams, weights, pools) -> (logits, hidden, pools)`."""
     tp = layout.tp
     slab = D.SlabIndex(small_map, small_f32_map, spec)
     kernel = D.build(spec, layout, cfg, slab)
-    write_rows = D.row_write_call(spec, cfg)
-    n_dsa = len(spec.dsa_layers)
+    write_rows = row_write_call(spec, cfg)
+    n_dsa, n_kda = len(spec.dsa_layers), len(spec.kda_layers)
     n_moe = sum(t == "sparse" for t in spec.mlp_layer_types)
     n_w = len(PACKED_ORDER)
+    n_pool = 3 * n_dsa + 2 * n_kda
+    R, Q, B = cfg.rows, cfg.n_query, cfg.n_req
+    H = spec.hidden_size
+    hkda, dh = spec.linear_num_heads // tp, spec.linear_head_dim
+    k1, qsh = spec.linear_conv_kernel_dim - 1, spec.kda_qkv_dim // tp
+    rec_bytes = PL.record_bytes(spec.index_head_dim)
+    # tok, pos, meta, page table, state rows, k_scales
+    n_smem = 6
     in_specs = (
-        [pl.BlockSpec(memory_space=pltpu.SMEM)] * 2
+        [pl.BlockSpec(memory_space=pltpu.SMEM)] * n_smem
         + [pl.BlockSpec(memory_space=pltpu.VMEM)]
         + [pl.BlockSpec(memory_space=pl.ANY)]
-        * (n_w + len(KERNEL_CACHES) + len(EXPERT_LISTS) * n_moe)
+        * (n_w + n_pool + len(EXPERT_LISTS) * n_moe)
+    )
+    out_shape = (
+        jax.ShapeDtypeStruct((R, layout.vocab_padded // tp), jnp.float32),
+        jax.ShapeDtypeStruct((R * spec.hc_mult, H), jnp.bfloat16),
+        jax.ShapeDtypeStruct((R, H), jnp.bfloat16),
+        jax.ShapeDtypeStruct((n_dsa, R, spec.kv_lora_rank), jnp.bfloat16),
+        jax.ShapeDtypeStruct((n_dsa, R, 2 * spec.index_head_dim), jnp.bfloat16),
+        jax.ShapeDtypeStruct((n_dsa, B, 8, spec.index_head_dim), jnp.float32),
+        jax.ShapeDtypeStruct((n_kda, R, hkda, dh, dh), jnp.float32),
+        jax.ShapeDtypeStruct((n_kda, R, k1, 1, 3 * qsh), jnp.float32),
+    )
+    out_specs = (pl.BlockSpec(memory_space=pltpu.VMEM),) * 6 + (
+        pl.BlockSpec(memory_space=pl.ANY),
+    ) * 2
+    call = pl.pallas_call(
+        kernel,
+        out_shape=out_shape,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        scratch_shapes=D.scratch_shapes(spec, layout, cfg),
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=cfg.vmem_mib * 2**20),
+        name=f"glm_flash_mk_r{R}_q{Q}",
     )
 
-    def make_call(cache_structs):
-        # XLA copies operands aliased by a kernel with remote DMA, so KDA states are
-        # fresh outputs; a capped run (n_layers) aliases them to keep skipped layers.
-        n_lead = 3 + n_w
-        aliases = (
-            {n_lead + i: 3 + i for i in range(N_KDSA, len(KERNEL_CACHES))}
-            if cfg.n_layers is not None
-            else {}
-        )
-        return pl.pallas_call(
-            kernel,
-            out_shape=(
-                jax.ShapeDtypeStruct(
-                    (cfg.n_query, layout.vocab_padded // tp), jnp.float32
-                ),
-                jax.ShapeDtypeStruct(
-                    (cfg.n_query * spec.hc_mult, spec.hidden_size), jnp.bfloat16
-                ),
-                jax.ShapeDtypeStruct((cfg.n_query, spec.hidden_size), jnp.bfloat16),
-            )
-            + tuple(
-                jax.ShapeDtypeStruct((n_dsa, cfg.n_query, c.shape[-1]), c.dtype)
-                for c in cache_structs[:N_KDSA]
-            )
-            + tuple(cache_structs[N_KDSA:]),
-            in_specs=in_specs,
-            out_specs=(pl.BlockSpec(memory_space=pltpu.VMEM),) * (3 + N_KDSA)
-            + tuple(pl.BlockSpec(memory_space=pl.ANY) for _ in KERNEL_CACHES[N_KDSA:]),
-            scratch_shapes=D.scratch_shapes(spec, layout, cfg),
-            input_output_aliases=aliases,
-            compiler_params=pltpu.CompilerParams(vmem_limit_bytes=cfg.vmem_mib * 2**20),
-        )
-
-    def body(tok, pos, init_streams, warrays, dsa_caches, kda_caches):
-        caches = {**dsa_caches, **kda_caches}
+    def body(tok, pos, meta, tab, srow, ckrow, k_scales, init_streams, warrays, pools):
         ws = [warrays[n] for n in PACKED_ORDER]
-        cs = [caches[n] for n in KERNEL_CACHES]
+        ps = [p for n in POOL_ORDER for p in pools[n]]
         experts = [w for n in EXPERT_LISTS for w in warrays[n]]
-        call = make_call([jax.ShapeDtypeStruct(c.shape, c.dtype) for c in cs])
-        out = call(tok, pos, init_streams, *ws, *cs, *experts)
-        new_rows = out[3 : 3 + N_KDSA]
-        dsa = write_rows(pos, *new_rows, *cs[:N_KDSA])
-        new = dict(zip(KERNEL_CACHES, (*dsa, *out[3 + N_KDSA :])))
-        return out[0], out[1], out[2], new
+        out = call(
+            tok, pos, meta, tab, srow, k_scales, init_streams, *ws, *ps, *experts
+        )
+        logits, _, hidden, nkv, nraw, npk, recur, conv = out
+        # fp8 bytes as the nope pool holds them: kv / k_scale per layer.
+        nkv8 = (nkv.astype(jnp.float32) / k_scales[:, None, None]).astype(
+            jnp.float8_e4m3fn
+        )
+        nkv8 = jax.lax.bitcast_convert_type(nkv8, jnp.uint8).reshape(n_dsa, R, 4, 128)
+        npk = npk[:, :, :Q].reshape(n_dsa, R, spec.index_head_dim)
+        nrec = jnp.stack([PL.pool_records(npk[d], rec_bytes) for d in range(n_dsa)])
+        raw_out, rec_out = _scatter_index_rows(
+            spec, cfg, meta, pos, tab, nraw, nrec, pools["raw"], pools["records"]
+        )
+        dma_pools = [*pools["nope"], *pools["temporal"], *pools["conv"]]
+        new = write_rows(meta, pos, tab, ckrow, nkv8, recur, conv, *dma_pools)
+        return (
+            logits,
+            hidden,
+            {
+                "nope": list(new[:n_dsa]),
+                "raw": raw_out,
+                "records": rec_out,
+                "temporal": list(new[n_dsa : n_dsa + n_kda]),
+                "conv": list(new[n_dsa + n_kda :]),
+            },
+        )
 
     wspec = {n: weight_spec(n) for n in PACKED_ORDER}
     wspec.update({n: [weight_spec(n)] * n_moe for n in EXPERT_LISTS})
-    cspec = {
-        "kv": P(None, None, None),
-        "idx_key": P(None, None, None),
-        "idx_gate": P(None, None, None),
-        "idx_pool": P(None, None, None),
-        "recur": P(None, D.AXIS, None, None),
-        "conv": P(None, None, D.AXIS),
+    pspec = {
+        n: [_POOL_SPECS[n]] * (n_dsa if n in ("nope", "raw", "records") else n_kda)
+        for n in POOL_ORDER
     }
-    if cfg.n_query > 1:
-        cspec["recur"] = P(None, None, D.AXIS, None, None)
-        cspec["conv"] = P(None, None, None, D.AXIS)
-    dsa_names = KERNEL_CACHES[:N_KDSA]
-    kda_names = KERNEL_CACHES[N_KDSA:]
-    dspec = {n: cspec[n] for n in dsa_names}
-    kspec = {n: cspec[n] for n in kda_names}
     shard = jax.shard_map(
         body,
         mesh=mesh,
-        in_specs=(P(), P(), P(None, None), wspec, dspec, kspec),
-        out_specs=(P(None, D.AXIS), P(None, None), P(None, None), cspec),
+        in_specs=(P(), P(), P(), P(), P(), P(), P(), P(None, None), wspec, pspec),
+        out_specs=(P(None, D.AXIS), P(None, None), pspec),
         check_vma=False,
     )
-
-    # Every DSA layer plus the MTP layer (index num_hidden_layers).
-    ape_off, ape_rows, ape_shape = small_map["indexer_ape"]
-    ape_layers = list(spec.dsa_layers) + [spec.num_hidden_layers]
-    ape_n = 1
-    for d_ in ape_shape:
-        ape_n *= d_
-
-    def init_ip(ik, ig, smalls):
-        apes = [
-            smalls[L, ape_off : ape_off + ape_rows]
-            .reshape(-1)[:ape_n]
-            .reshape(ape_shape)
-            .astype(jnp.float32)
-            for L in ape_layers
-        ]
-        return D.init_pool_keys(spec, ik, ig, apes)
-
-    def pool_records(ik, ig, smalls, pools):
-        """Serving's index-key records of `pools` [P], one row per target DSA layer."""
-        from sglang_tpu.attention.pallas.dsa_kpool_topk import (
-            _pool_records,
-            compress_pools,
-            pooled_record_bytes,
-        )
-
-        kp, d = spec.index_kpool, spec.index_head_dim
-        rows = (pools[:, None] * kp + jnp.arange(kp)[None, :]).reshape(-1)
-        out = []
-        for i, L in enumerate(spec.dsa_layers):
-            ape = (
-                smalls[L, ape_off : ape_off + ape_rows]
-                .reshape(-1)[:ape_n]
-                .reshape(ape_shape)
-                .astype(jnp.float32)
-            )
-            keys = ik[i][rows].reshape(-1, kp, d)
-            gates = ig[i][rows].reshape(-1, kp, d)
-            out.append(
-                _pool_records(compress_pools(keys, gates, ape), pooled_record_bytes(d))
-            )
-        return jnp.stack(out)
-
-    return _Step(
-        shard=shard,
-        init_ip=init_ip,
-        pool_records=pool_records,
-        wspec=wspec,
-        dspec=dspec,
-        kspec=kspec,
-        dsa_names=dsa_names,
-        kda_names=kda_names,
-        step_caches=KERNEL_CACHES,
-    )
+    return _Step(shard=shard, wspec=wspec, pspec=pspec)
 
 
 class _Step:
