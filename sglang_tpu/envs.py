@@ -355,6 +355,12 @@ class TpuEnvs:
     # at the final chunk's launch, the last stage once its tokens are copied.
     SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE = EnvBool(False)
 
+    # Prefill-driven decode reservations over Raiden/early, enabled on both peers.
+    SGLANG_ENABLE_DISAGG_PREFILL_DRIVEN = EnvBool(False)
+    # Selected, unstarted requests (unanswered or READY). 0 derives the default
+    # from scheduler capacity; positive overrides are clamped to that capacity.
+    SGLANG_DISAGG_PREFILL_DRIVEN_SLOTS = EnvInt(0)
+
     # raiden KV-offload backend
     # Seconds a raiden DMA may stay pending, from each blocking wait or, when
     # polled, from issue. Past it the scheduler exits with TimeoutError, so keep

@@ -74,6 +74,15 @@ def _validate_startup_cleanup_control(server_args, previous):
         )
 
 
+@register_resolution_hook("handle_pd_disaggregation")
+def _validate_prefill_driven_reservation(server_args, previous):
+    previous(server_args)
+    # Lazy: the platform registry is still discovering this module.
+    from sglang_tpu.disaggregation.prefill_driven import validate
+
+    validate(_resolving_view(server_args))
+
+
 # Default size for libtpu's premapped (pinned, DMA-mapped) host staging pool.
 _DEFAULT_TPU_PREMAPPED_BUFFER_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 # Flush torch_tpu's lazy host->device weight-copy graph once this much work accumulates,

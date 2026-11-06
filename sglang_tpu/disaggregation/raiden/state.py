@@ -5,6 +5,7 @@ locks. Native I/O leases, abort tombstones, and completion tracking stay on the
 manager because they can survive protocol-state cleanup.
 """
 
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Tuple
 
@@ -69,6 +70,19 @@ class PrefillState:
     reshard_replied_at: Dict[int, float] = field(default_factory=dict)
     reshard_pushed: Set[int] = field(default_factory=set)
 
+    # prefill_driven: the decode rank that registered a room (BOOTSTRAP), the
+    # latest ask to reserve it, and the rooms whose decode answered BUSY.
+    registered_decodes: Dict[int, str] = field(default_factory=dict)
+    registered_at: Dict[int, float] = field(default_factory=dict)
+    decode_room_counts: Counter[str] = field(default_factory=Counter)
+    # Decode rank -> time of its last message, and the ranks that let an ask
+    # time out with no message meanwhile. Their rooms fail without waiting for
+    # their own ask, until the rank is heard again.
+    decode_heard_at: Dict[str, float] = field(default_factory=dict)
+    silent_decodes: Set[str] = field(default_factory=set)
+    reserve_requested_at: Dict[int, float] = field(default_factory=dict)
+    reserve_busy: Set[int] = field(default_factory=set)
+
 
 @dataclass
 class DecodeState:
@@ -117,3 +131,6 @@ class DecodeState:
     reshard_swa_sources: Dict[int, Dict[int, List[int]]] = field(default_factory=dict)
     reshard_meta: Dict[int, dict] = field(default_factory=dict)
     reshard_registered: Set[int] = field(default_factory=set)
+
+    # prefill_driven: rooms with an unanswered RESERVE in the allocation queue.
+    reserve_held: Set[int] = field(default_factory=set)
