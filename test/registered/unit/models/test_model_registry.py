@@ -108,6 +108,26 @@ class TestLazyDefaultModels(CustomTestCase):
         self.assertIs(self.registry.resolve_model_cls("BackendArch")[0], _ExternalModel)
         self.assertIs(self.registry.resolve_model_cls("DefaultArch")[0], _ExternalModel)
 
+    def test_lazy_overwrite_replaces_loaded_arch_before_fast_path(self):
+        self.registry.get_supported_archs()
+        self.import_calls.clear()
+        self.registry.register_lazy("another.models", overwrite=True)
+        self.assertEqual(self.import_calls, [])
+
+        self.assertIs(self.registry.resolve_model_cls("DefaultArch")[0], _ExternalModel)
+        self.assertEqual(self.import_calls, ["another.models"])
+        self.assertIs(self.registry.resolve_model_cls("DefaultArch")[0], _ExternalModel)
+        self.assertEqual(self.import_calls, ["another.models"])
+
+    def test_lazy_overwrite_keeps_defaults_deferred(self):
+        self.registry.register_lazy("another.models", overwrite=True)
+        self.assertIs(self.registry.resolve_model_cls("DefaultArch")[0], _ExternalModel)
+        self.assertEqual(self.import_calls, ["another.models"])
+
+        self.registry.get_supported_archs()
+        self.assertEqual(self.import_calls, ["another.models", DEFAULT_PACKAGE])
+        self.assertIs(self.registry.resolve_model_cls("DefaultArch")[0], _ExternalModel)
+
     def test_lazy_duplicate_still_fails_when_catalog_is_loaded(self):
         self.registry.register_lazy("another.models")
         for _ in range(2):
