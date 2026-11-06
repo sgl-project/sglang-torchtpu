@@ -22,20 +22,21 @@ e.g. `./ltx2.sh --warmup-resolutions 1280x720`.
 
 ## Performance
 
-tpu7x 2x2x1, steady-state request (the first two requests compile and warm up), seed 42. E2E and peak HBM come from a default run;
+tpu7x 2x2x1, torch_tpu 0.2.0, libtpu 0.0.50, steady-state request (the first two requests compile and warm up), seed 42. E2E and peak HBM come from a default run;
 denoise step and VAE decode from a run with `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1`, which synchronizes the device at
 stage boundaries (otherwise queued denoising work is counted in the decode stage).
 
 | Model | Request | Cores | E2E | Denoise step | VAE decode | Peak HBM / core |
 | :--- | :--- | :---: | ---: | ---: | ---: | ---: |
-| FLUX.2-klein-4B | T2I 1024x1024, 4 steps | 1 | 0.44 s | 0.076 s | 0.10 s | 24.8 GB |
-| FLUX.2-klein-4B | T2I 1024x1024, 4 steps | 4 | 0.30 s | 0.044 s | 0.10 s | 19.2 GB |
-| Z-Image-Turbo | T2I 1024x1024, 9 steps | 1 | 0.93 s | 0.089 s | 0.10 s | 29.2 GB |
+| FLUX.2-klein-4B | T2I 1024x1024, 4 steps | 1 | 0.43 s | 0.075 s | 0.10 s | 24.8 GB |
+| FLUX.2-klein-4B | T2I 1024x1024, 4 steps | 4 | 0.32 s | 0.047 s | 0.10 s | 19.2 GB |
+| Z-Image-Turbo | T2I 1024x1024, 9 steps | 1 | 0.97 s | 0.094 s | 0.10 s | 29.2 GB |
 | Z-Image-Turbo | T2I 1024x1024, 9 steps | 8 | 0.36 s | 0.026 s | 0.10 s | 22.4 GB |
 | Wan2.2-TI2V-5B | T2V 1280x704, 121 frames, 20 steps | 8 | 10.1 s | 0.251 s | 3.9 s | 30.1 GB |
 | Wan2.2-TI2V-5B | I2V 960x928 (from a square image), 121 frames, 20 steps | 8 | 11.8 s | 0.316 s | 4.1 s | 64.3 GB |
-| Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 20 steps | 8 | 60.2 s | 2.77 s | 4.0 s | 68.8 GB |
-| Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.6 s | 0.731 s | 2.0 s | 64.3 GB |
+| Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 20 steps | 8 | 60.3 s | 2.77 s | 4.0 s | 68.8 GB |
+| Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 115.6 s | 2.77 s | 4.0 s | 68.8 GB |
+| Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.4 s | 0.730 s | 1.9 s | 64.3 GB |
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
 
 
