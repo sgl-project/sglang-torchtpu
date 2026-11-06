@@ -1426,6 +1426,26 @@ def run_benchmark_internal(
         print("=" * 8 + " Warmup Begin " + "=" * 8)
         print(f"Warmup with batch_size={batch_size_unique}")
         for bs in batch_size_unique:
+            kv_footprint_bs = (
+                bs if effective_running_cap is None else min(bs, effective_running_cap)
+            )
+            # Do not warm batches that every measured shape will skip.
+            if should_skip_due_to_max_running_requests(
+                bs, skip_max_running_requests_threshold
+            ) or all(
+                should_skip_due_to_token_capacity(
+                    kv_footprint_bs,
+                    il,
+                    ol,
+                    skip_token_capacity_threshold,
+                    bench_args.input_len_list,
+                    num_dp_ranks,
+                )
+                for il, ol in itertools.product(
+                    bench_args.input_len, bench_args.output_len
+                )
+            ):
+                continue
             run_one_case(
                 base_url,
                 batch_size=bs,
