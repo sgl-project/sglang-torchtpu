@@ -40,7 +40,14 @@ import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=1300, suite="stage-a-test-tpu-unit", chips=4)
+# The full numerical sweep took 34m02s in PR #1962; retain it on nightly.
+register_tpu_ci(
+    est_time=2042,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    chips=4,
+    labels=["singlehost", "infra"],
+)
 
 if __name__ == "__main__":
     import pytest

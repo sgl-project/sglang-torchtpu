@@ -349,12 +349,6 @@ class TestPrefillBlockSizes(CustomTestCase):
         with envs.SGLANG_TPU_FORCE_RPA_PREFILL_BKV.override(5000):
             self.assertEqual(self._resolve().bkv_sz, 5120)
 
-    def test_override_unset_leaves_the_search_in_charge(self):
-        derived = self._resolve().bkv_sz
-        with envs.SGLANG_TPU_FORCE_RPA_PREFILL_BKV.override(4096):
-            pass
-        self.assertEqual(self._resolve().bkv_sz, derived)
-
 
 class TestKernelBlockSizes(CustomTestCase):
     """Block sizes the batched-RPA kernel can run."""

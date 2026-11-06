@@ -318,6 +318,11 @@ class KVCacheConfigurator:
         self.draft_swa_full_capacity = self.is_hybrid_swa_mtp_draft and bool(
             self.layer_info.swa_attention_layer_ids
         )
+        if (
+            self.kv_cache_dtype_str == "mxint8"
+            and current_platform.unified_kv_pool_enabled(self)
+        ):
+            self.kv_full_layout = "blocked"
 
     def _validate_mxint8(self) -> None:
         """Backend extensions must override this before configurator construction."""
@@ -349,7 +354,9 @@ class KVCacheConfigurator:
 
     @property
     def kv_swa_layout(self) -> str | None:
-        return "merged" if self.kv_cache_dtype_str == "mxint8" else None
+        if self.kv_cache_dtype_str != "mxint8":
+            return None
+        return "blocked" if current_platform.unified_kv_pool_enabled(self) else "merged"
 
     def _mxint8_pool_kwargs(self) -> dict:
         if self.kv_cache_dtype_str != "mxint8":

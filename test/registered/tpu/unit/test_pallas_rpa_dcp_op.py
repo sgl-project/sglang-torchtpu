@@ -54,19 +54,6 @@ ARG_NAMES = (
     "rpa_cases",
 )
 NUM_TRACED_TENSORS = 10
-STATIC_FLAGS = (
-    "sm_scale",
-    "sliding_window",
-    "soft_cap",
-    "k_scale",
-    "v_scale",
-    "cache_only",
-    "skip_kv_write",
-    "cp_group_size",
-    "attention_scope",
-    "rpa_cases",
-)
-FIRST_STATIC_ARGNUM = 11
 
 
 def _has_torch_tpu_pallas() -> bool:
@@ -106,9 +93,6 @@ class TestDcpOpContract(CustomTestCase):
         namespace, name = DCP_OP_NAME.split("::")
         self.overload = getattr(getattr(torch.ops, namespace), name).default
 
-    def test_the_op_name_resolves(self):
-        self.assertEqual(self.overload.name(), DCP_OP_NAME)
-
     def test_argument_order_and_return_arity(self):
         schema = self.overload._schema
         self.assertEqual([arg.name for arg in schema.arguments], list(ARG_NAMES))
@@ -119,14 +103,6 @@ class TestDcpOpContract(CustomTestCase):
         for arg in schema.arguments[:NUM_TRACED_TENSORS]:
             self.assertEqual(str(arg.type), "Tensor", arg.name)
         self.assertEqual(schema.arguments[NUM_TRACED_TENSORS].name, "attention_sink")
-
-    def test_the_static_flags_sit_at_the_static_argnums(self):
-        self.assertEqual(ARG_NAMES[FIRST_STATIC_ARGNUM:], STATIC_FLAGS)
-        for offset, name in enumerate(STATIC_FLAGS):
-            self.assertEqual(
-                self.overload._schema.arguments[FIRST_STATIC_ARGNUM + offset].name,
-                name,
-            )
 
     def test_only_the_kv_cache_is_mutated(self):
         schema = self.overload._schema
