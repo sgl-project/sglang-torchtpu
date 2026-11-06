@@ -188,6 +188,40 @@ def test_chunked_prefill_selection_real_tpu(longest):
     _assert_tied_selection(selected, lengths, np.ones(tokens, bool), k, ordered=False)
 
 
+# 17 six-query tiles (> 16) enter pipeline_score_topk's lax.fori_loop while
+# width = 24576 (> 2 * 8192) exercises multi-block SparseCore streaming_topk.
+def test_fori_loop_pipelined_selection_real_tpu():
+    assert jax.default_backend() == "tpu"
+    tokens, width, block, k, count = 102, 24576, 8, 512, 128
+    layout = PackedFP8Layout(width // 128)
+    pages = jnp.arange(layout.pages, dtype=jnp.int32).reshape(1, -1)
+    owners = np.zeros(tokens, dtype=np.int32)
+    lengths = (width - tokens + 1 + np.arange(tokens)).astype(np.int32)
+    selected, published = map(
+        np.asarray,
+        _select(
+            jnp.zeros((tokens, 32, 128), jnp.float8_e4m3fn),
+            jnp.ones((tokens, 32), jnp.float32),
+            _zero_banks(layout),
+            pages,
+            jnp.asarray(lengths),
+            jnp.full((tokens, count), -1, jnp.int32),
+            jnp.asarray(owners),
+            layout,
+            candidate_write=True,
+            unordered=True,
+        ),
+    )
+    _assert_tied_selection(selected, lengths, np.ones(tokens, bool), k, ordered=False)
+    for row, length in enumerate(lengths):
+        chosen = published[row][published[row] >= 0]
+        blocks = (int(length) + block - 1) // block
+        assert blocks - 1 in chosen, row
+        assert (
+            chosen.size == min(count, blocks) and np.unique(chosen).size == chosen.size
+        )
+
+
 def _candidate_fixture(counts, short, seed=371):
     rng = np.random.default_rng(seed)
     width, page_size, block, count, padding = 4096, 128, 8, 128, 3

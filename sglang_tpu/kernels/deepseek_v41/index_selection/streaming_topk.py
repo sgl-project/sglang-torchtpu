@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import functools
 import math
-import random
 from typing import NamedTuple
 
 import jax
@@ -69,15 +68,30 @@ class _BufferSizes(NamedTuple):
     capacity: int
     id_capacity: int
     resident_bytes: int
-    order_width: int
+
+
+def _block_visit_order(num_blocks: int) -> tuple[int, int, int]:
+    """Return `(tail, stride, offset)` permuting scan blocks `1..num_blocks - 1`.
+
+    Computing the permutation arithmetically on SparseCore avoids passing a
+    constant HBM order buffer, which XLA loop hoisting can materialize outside
+    HBM where SparseCore lowering cannot resolve an HBM buffer for it.
+    """
+    if num_blocks <= 2:
+        return 1, 1, 0
+    tail = num_blocks - 1
+    offset = (tail * 3) // 8
+    max_stride = max(1, (int(jnp.iinfo(jnp.int32).max) - offset) // tail)
+    stride = min(max_stride, max(1, round(tail * 0.6180339887498949)))
+    while math.gcd(stride, tail) != 1:
+        stride = 1 if stride >= max_stride else stride + 1
+    return tail, stride, offset
 
 
 def _buffer_sizes(k, width, block_size, threshold, mapping_width, info, sc):
     config = STREAMING_TOPK_CONFIG.get(
         (info.generation, width, k), StreamingTopKConfig()
     )
-    blocks = pl.cdiv(width, block_size)
-    order_width = pl.cdiv(blocks, info.num_lanes) * info.num_lanes if blocks > 2 else 0
     output_width = pl.cdiv(k, info.num_lanes) * info.num_lanes
     bootstrap_width = min(block_size, config.bootstrap_multiplier * k)
     chunk_size = math.gcd(block_size, bootstrap_width)
@@ -85,7 +99,7 @@ def _buffer_sizes(k, width, block_size, threshold, mapping_width, info, sc):
     id_capacity = max(capacity, output_width + mapping_width)
     word_bytes = jnp.dtype(jnp.int32).itemsize
     resident_bytes = word_bytes * (
-        capacity + id_capacity + 2 * k + RADIX_BUCKETS + sc.num_lanes + order_width
+        capacity + id_capacity + 2 * k + RADIX_BUCKETS + sc.num_lanes
     )
     return _BufferSizes(
         output_width,
@@ -94,7 +108,6 @@ def _buffer_sizes(k, width, block_size, threshold, mapping_width, info, sc):
         capacity,
         id_capacity,
         resident_bytes,
-        order_width,
     )
 
 
@@ -189,12 +202,16 @@ def streaming_topk(
     mapped = logical_blocks is not None
     mapping_width = 0
     if logical_blocks is not None:
-        if (
-            valid_lengths is None
-            or valid_lengths.ndim != 2
-            or logical_blocks.ndim != 2
-            or logical_blocks.dtype != jnp.int32
+        invalid_lengths = (
+            start_request is not None or logical_blocks.shape[0] != batch_size
+            if valid_lengths is None
+            else valid_lengths.ndim != 2
             or logical_blocks.shape[0] < valid_lengths.shape[0]
+        )
+        if (
+            logical_blocks.ndim != 2
+            or invalid_lengths
+            or logical_blocks.dtype != jnp.int32
             or not logical_blocks.shape[1]
             or valid_width % logical_blocks.shape[1]
         ):
@@ -202,8 +219,7 @@ def streaming_topk(
                 "logical_blocks must be int32 [requests, blocks] covering "
                 "the request/query length window, with blocks dividing N"
             )
-        assert valid_lengths is not None
-        queries = valid_lengths.shape[1]
+        queries = 1 if valid_lengths is None else valid_lengths.shape[1]
         records_per_block = valid_width // logical_blocks.shape[1]
         mapping_width = pl.cdiv(logical_blocks.shape[1], hbm_alignment) * hbm_alignment
         logical_blocks = jnp.pad(
@@ -228,24 +244,21 @@ def streaming_topk(
     lanes = info.num_lanes
     if any(n % lanes for n in (k, block_size, reconstruct_threshold)):
         raise ValueError("k, block_size and reconstruct_threshold must be lane-aligned")
+    has_lengths = valid_lengths is not None
+    # Omit constant full-width length buffers so enclosing loops cannot hoist a
+    # constant HBM operand into non-HBM storage before SparseCore lowering.
     lengths = (
-        jnp.full((batch_size,), valid_width, jnp.int32)
-        if valid_lengths is None
-        else jnp.clip(valid_lengths.reshape(-1), 0, valid_width)
+        (
+            jnp.pad(
+                jnp.clip(valid_lengths.reshape(-1), 0, valid_width),
+                (0, -batch_size % hbm_alignment),
+            ),
+        )
+        if has_lengths
+        else ()
     )
-    lengths = jnp.pad(lengths, (0, -batch_size % hbm_alignment))
     num_blocks = pl.cdiv(width, block_size)
-    # One or two blocks have fixed order; no visit table or DMA is needed.
-    order_width = (
-        pl.cdiv(num_blocks, hbm_alignment) * hbm_alignment if num_blocks > 2 else 0
-    )
-    block_order = ()
-    if order_width:
-        order = list(range(1, num_blocks))
-        random.Random(0).shuffle(order)
-        order.insert(0, 0)
-        order.extend([0] * (order_width - num_blocks))
-        block_order = (jnp.asarray(order, jnp.int32),)
+    order_tail, order_stride, order_offset = _block_visit_order(num_blocks)
     sizes = _buffer_sizes(
         k,
         valid_width,
@@ -262,7 +275,6 @@ def streaming_topk(
         capacity,
         id_capacity,
         resident_bytes,
-        _,
     ) = sizes
     histogram_size = RADIX_BUCKETS
     id_digits = max(1, pl.cdiv((valid_width - 1).bit_length(), RADIX_BITS))
@@ -302,7 +314,6 @@ def streaming_topk(
             pltpu.VMEM((k,), jnp.int32),
             pltpu.VMEM((histogram_size,), jnp.int32),
             pltpu.VMEM((lanes,), jnp.int32),
-            (pltpu.VMEM((order_width,), jnp.int32),) if order_width else (),
             pltpu.SemaphoreType.DMA((buffers,)),
             pltpu.SemaphoreType.DMA,
         ),
@@ -311,8 +322,7 @@ def streaming_topk(
     )
     def kernel(
         scores_ref,
-        lengths_ref,
-        order_refs,
+        lengths_refs,
         mapping_refs,
         start_refs,
         out_indices_ref,
@@ -326,16 +336,12 @@ def streaming_topk(
             selected_ids,
             histogram,
             row_length,
-            order_scratch,
             block_sems,
             sem,
         ) = scratch
         candidates = candidate_banks.at[pl.ds(0, capacity)]
         candidate_ids = id_banks.at[pl.ds(0, id_capacity)]
         lane_ids = jnp.arange(lanes, dtype=jnp.int32)
-        if order_width:
-            visit_order = order_scratch[0]
-            pltpu.async_copy(order_refs[0], visit_order, sem).wait()
         request_start = 0
         if mapped:
             logical_blocks_ref = mapping_refs[0]
@@ -619,12 +625,19 @@ def streaming_topk(
             )
 
         def lookup(position):
-            indices = jnp.full((lanes,), jnp.minimum(position, num_blocks - 1))
-            return plsc.load_gather(visit_order, [indices])[0]
+            clamped = jnp.minimum(position, jnp.int32(num_blocks - 1))
+            if num_blocks <= 2:
+                return jnp.maximum(clamped, jnp.int32(0))
+            step = jnp.maximum(clamped - jnp.int32(1), jnp.int32(0))
+            shuffled = jnp.int32(1) + jax.lax.rem(
+                step * jnp.int32(order_stride) + jnp.int32(order_offset),
+                jnp.int32(order_tail),
+            )
+            return jnp.where(clamped <= 0, jnp.int32(0), shuffled)
 
         def next_valid(position, length):
-            if not order_width:
-                return position, jnp.minimum(position, num_blocks - 1)
+            if num_blocks <= 2:
+                return position, jnp.minimum(position, jnp.int32(num_blocks - 1))
 
             def cond(state):
                 step, block_id = state
@@ -673,10 +686,17 @@ def streaming_topk(
 
         @pl.loop(first_row, batch_size, step=row_stride)
         def process_row(row):
-            pltpu.async_copy(
-                lengths_ref.at[pl.ds(row // lanes * lanes, lanes)], row_length, sem
-            ).wait()
-            length = plsc.load_gather(row_length, [jnp.full((lanes,), row % lanes)])[0]
+            if has_lengths:
+                pltpu.async_copy(
+                    lengths_refs[0].at[pl.ds(row // lanes * lanes, lanes)],
+                    row_length,
+                    sem,
+                ).wait()
+                length = plsc.load_gather(
+                    row_length, [jnp.full((lanes,), row % lanes)]
+                )[0]
+            else:
+                length = jnp.int32(valid_width)
             row_blocks = pl.cdiv(length, block_size)
 
             def prime():
@@ -968,9 +988,7 @@ def streaming_topk(
         if mapped and start_request is not None
         else ()
     )
-    result = kernel(
-        scores, lengths, block_order, (logical_blocks,) if mapped else (), start
-    )
+    result = kernel(scores, lengths, (logical_blocks,) if mapped else (), start)
     if output_width != k:
         result = result[:, :k]
     if scheduling_group_id is not None:
