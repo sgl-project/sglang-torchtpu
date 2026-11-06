@@ -41,6 +41,7 @@ def route_glm_flash_megakernel(result: None, runner: Any, *args, **kwargs) -> No
         n_query,
         tpu_envs.SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_ROWS.get(),
         runner.model_runner.attn_backend,
+        call_rows=tpu_envs.SGLANG_TPU_GLM_FLASH_MEGAKERNEL_CALL_ROWS.get(),
     )
     mk.radix_snapshots = not args.disable_radix_cache
     model._tpu_glm_flash_mk = mk

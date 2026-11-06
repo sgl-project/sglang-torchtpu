@@ -41,7 +41,14 @@ def _buckets(max_req: int) -> list[int]:
 
 class GlmFlashMegakernel:
     def __init__(
-        self, model, model_path: str, max_len: int, n_query: int, max_rows: int, backend
+        self,
+        model,
+        model_path: str,
+        max_len: int,
+        n_query: int,
+        max_rows: int,
+        backend,
+        call_rows: int | None = None,
     ):
         import jax
         from jax.sharding import NamedSharding
@@ -82,6 +89,9 @@ class GlmFlashMegakernel:
         self.max_len = max_len
         self.pages_per_seq = table_pages
         self.max_req = max(1, max_rows // n_query)
+        # Requests per kernel call; a larger batch is split into calls of this size.
+        call_rows = max_rows if call_rows is None else min(call_rows, max_rows)
+        self.call_req = max(1, call_rows // n_query)
         km_tile = 512 if self.max_req * n_query == 1 else 256
 
         def cfg_for(b):
@@ -101,7 +111,7 @@ class GlmFlashMegakernel:
                 km_issue=1 if big else 2,
             )
 
-        self.cfgs = {b: cfg_for(b) for b in _buckets(self.max_req)}
+        self.cfgs = {b: cfg_for(b) for b in _buckets(self.call_req)}
         cfg0 = next(iter(self.cfgs.values()))
         weights = build_weights(model, spec, layout, cfg0, tp, rank)
         # Packing leaves dtype and shape views, which every call would re-materialise.
@@ -206,7 +216,7 @@ class GlmFlashMegakernel:
             )
         self._meta = {
             b: torch.tensor([b] + [0] * 7, dtype=torch.int32, device=device)
-            for b in range(1, self.max_req + 1)
+            for b in range(1, self.call_req + 1)
         }
         # Set when the radix cache is on: only then does serving snapshot KDA state.
         self.radix_snapshots = False
@@ -227,22 +237,31 @@ class GlmFlashMegakernel:
     def _bucket(self, bs: int) -> int:
         return min(b for b in self.cfgs if b >= bs)
 
+    def _calls(self, bs: int) -> list[tuple[int, int]]:
+        """(first request, count) of each kernel call covering `bs` requests."""
+        out, b0 = [], 0
+        while b0 < bs:
+            n = min(self.call_req, bs - b0)
+            out.append((b0, n))
+            b0 += n
+        return out
+
     @staticmethod
     def _pad(t: torch.Tensor, n: int) -> torch.Tensor:
         return torch.nn.functional.pad(t, (0, n - t.shape[0]))
 
-    def _step_inputs(self, input_ids, positions, forward_batch, bucket: int):
-        """The kernel's SMEM inputs for this batch, padded to `bucket` requests."""
+    def _step_inputs(self, input_ids, positions, forward_batch, b0: int, n: int, bucket: int):
+        """The kernel's SMEM inputs for requests [b0, b0 + n), padded to `bucket` requests."""
         Q, bs = self.Q, forward_batch.batch_size
         rows = bucket * Q
-        device = self.device
-        tok = self._pad(input_ids.to(torch.int32), rows)
-        pos = self._pad(positions.to(torch.int32).reshape(bs, Q)[:, 0], bucket)
-        req_rows = forward_batch.req_pool_indices
+        r0, r1 = b0 * Q, (b0 + n) * Q
+        tok = self._pad(input_ids[r0:r1].to(torch.int32), rows)
+        pos = self._pad(positions[r0:r1].to(torch.int32).reshape(n, Q)[:, 0], bucket)
+        req_rows = forward_batch.req_pool_indices[b0 : b0 + n]
         # [padded_bs * pages_per_seq] from the sparse backend, one row per request.
         tab = self._full.forward_metadata.page_indices.reshape(-1, self.pages_per_seq)
-        tab = tab[:bs].reshape(-1)
-        tab = self._pad(tab.to(torch.int32), rows // Q * self.pages_per_seq)
+        tab = tab[b0 : b0 + n].reshape(-1)
+        tab = self._pad(tab.to(torch.int32), bucket * self.pages_per_seq)
         slots, _ = self._lin._slot_indices(req_rows)
         srow = self._mamba.committed_state_rows(slots, req_rows).to(torch.int32)
         if Q > 1:
@@ -252,7 +271,7 @@ class GlmFlashMegakernel:
         return (
             tok,
             pos,
-            self._meta[bs],
+            self._meta[n],
             tab,
             self._pad(srow, bucket),
             self._pad(ckrow, rows),
@@ -283,12 +302,17 @@ class GlmFlashMegakernel:
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
         bs = forward_batch.batch_size
-        bucket = self._bucket(bs)
-        inputs = self._step_inputs(input_ids, positions, forward_batch, bucket)
-        out = self.calls[bucket](*inputs, *self.weights, *self.pool_list, *self.experts)
-        n = bs * self.Q
-        logits = tensor_model_parallel_all_gather(out[0][:n], dim=-1)[:, : self.vocab]
-        hidden = out[1][:n]
+        logits, hidden = [], []
+        # A batch beyond one call's rows runs as several calls (each streams the weights).
+        for b0, n in self._calls(bs):
+            bucket = self._bucket(n)
+            inputs = self._step_inputs(input_ids, positions, forward_batch, b0, n, bucket)
+            out = self.calls[bucket](*inputs, *self.weights, *self.pool_list, *self.experts)
+            logits.append(out[0][: n * self.Q])
+            hidden.append(out[1][: n * self.Q])
+        logits = torch.cat(logits) if len(logits) > 1 else logits[0]
+        hidden = torch.cat(hidden) if len(hidden) > 1 else hidden[0]
+        logits = tensor_model_parallel_all_gather(logits, dim=-1)[:, : self.vocab]
         if self.radix_snapshots and self.Q == 1:
             self._decode_snapshot(forward_batch)
         return LogitsProcessorOutput(next_token_logits=logits, hidden_states=hidden)

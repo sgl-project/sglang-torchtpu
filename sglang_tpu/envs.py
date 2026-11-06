@@ -189,10 +189,12 @@ class TpuEnvs:
     # as one Pallas call per device (glm_flash_megakernel/); other steps run the
     # model as usual. ..._MAX_LEN caps the request length the kernel takes
     # (default: the context length); ..._MAX_ROWS the rows (requests x draft
-    # tokens) of one step: 16 fits tpu7x's 64 MiB VMEM, 32 does not (measured).
+    # tokens) of one step; a larger step runs as several calls of at most
+    # ..._CALL_ROWS rows each (32 fits tpu7x's 64 MiB VMEM, 64 does not; measured).
     SGLANG_TPU_GLM_FLASH_MEGAKERNEL = EnvBool(False)
     SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_LEN = EnvInt(None)
-    SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_ROWS = EnvInt(16)
+    SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_ROWS = EnvInt(32)
+    SGLANG_TPU_GLM_FLASH_MEGAKERNEL_CALL_ROWS = EnvInt(32)
     # Pin each scheduler's main thread to one CPU of its rank's set and keep its
     # other threads off that physical core (hooks/cpu_pinning.py).
     SGLANG_TPU_ENABLE_SCHEDULER_THREAD_PINNING = EnvBool(False)
