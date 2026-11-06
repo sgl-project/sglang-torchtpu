@@ -582,6 +582,7 @@ class TestSenderBootstrapTimeout(unittest.TestCase):
         mgr.finish_bootstrap_if_decode_requested = types.MethodType(
             RaidenKVManager.finish_bootstrap_if_decode_requested, mgr
         )
+        mgr.dram_offload_channel = None
         mgr.fail_decode_silence = types.MethodType(
             RaidenKVManager.fail_decode_silence, mgr
         )
