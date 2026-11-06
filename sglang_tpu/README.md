@@ -115,9 +115,11 @@ the multi-host, P/D, accuracy, perf, combo and external lanes stay on mode A.
 
 Prefill stays the primary prefix cache. Before host pressure discards a cold
 cached branch, prefill pushes its full-attention KV from its own DRAM into the
-DRAM of the decode that served the branch. No HBM page and no staging slot is
-used on either role, and both HiCache write policies are supported. The decode
-keeps pushed branches only; it does not cache its own generation requests.
+DRAM of the decode that served the branch. When the branch returns and misses
+on prefill, prefill recalls it from decode DRAM into its own DRAM, and normal
+admission loads it into HBM. No HBM page and no staging slot is used on either
+role, and both HiCache write policies are supported. The decode keeps pushed
+branches only; it does not cache its own generation requests.
 
 Enable HiCache on both roles with `--enable-hierarchical-cache
 --hicache-io-backend raiden` and decode radix caching with

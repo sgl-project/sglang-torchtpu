@@ -38,6 +38,9 @@ from sglang_tpu.disaggregation.decode_dram_offload import (
     radix_host_ops,
     startup_validation,
 )
+from sglang_tpu.disaggregation.decode_dram_offload.prefill_dram_prefix_puller import (
+    PrefillDramPrefixPuller,
+)
 from sglang_tpu.disaggregation.decode_dram_offload.rank_lockstep import (
     DramOffloadWorkerContext,
     RankLockstep,
@@ -46,6 +49,8 @@ from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager, RaidenKVSender
 from sglang_tpu.disaggregation.raiden.dram_offload_channel import DramOffloadChannel
 from sglang_tpu.disaggregation.raiden.serde import (
+    PrefixPull,
+    PrefixReady,
     PullReq,
     ReshardReq,
     RoomFailed,
@@ -85,19 +90,15 @@ class FakeHostTransfer:
         self.reads: dict[str, dict] = {}
         self.registration_error: Exception | None = None
         self.read_error: Exception | None = None
-        self.registration_result = True
 
     def host_control_address(self, local_ip: str) -> str:
         return "10.0.0.5:9000"
 
-    def register_read(
-        self, req_id: str, uuid: int, block_ids: list[int], *, source: str = "device"
-    ) -> bool:
+    def register_read(self, req_id: str, uuid: int, block_ids: list[int]) -> None:
         if self.registration_error is not None:
             raise self.registration_error
-        self.registrations[req_id] = (uuid, list(block_ids), source)
+        self.registrations[req_id] = (uuid, list(block_ids))
         self.results[req_id] = None
-        return self.registration_result
 
     def start_read(
         self,
@@ -106,8 +107,6 @@ class FakeHostTransfer:
         remote_endpoint,
         remote_block_ids: list[int],
         local_block_ids: list[int],
-        *,
-        destination: str = "device",
     ) -> None:
         if self.read_error is not None:
             raise self.read_error
@@ -116,7 +115,6 @@ class FakeHostTransfer:
             remote_endpoint=remote_endpoint,
             remote_block_ids=list(remote_block_ids),
             local_block_ids=list(local_block_ids),
-            destination=destination,
         )
         self.results[req_id] = None
 
@@ -306,16 +304,14 @@ def push_channel(host):
 
     def register(req_id, uuid, pages):
         try:
-            transfer.register_read(req_id, uuid, pages, source="host")
+            transfer.register_read(req_id, uuid, pages)
         except RuntimeError:
             return False
         return True
 
     def start(req_id, uuid, endpoint, remote, local):
         try:
-            transfer.start_read(
-                req_id, uuid, endpoint, remote, local, destination="host"
-            )
+            transfer.start_read(req_id, uuid, endpoint, remote, local)
         except RuntimeError:
             return False
         return True
@@ -362,7 +358,9 @@ class PrefillPusherFixture:
         ):
             insert_tokens(self.cache, self.allocator, tokens)
             self.peers[room] = decode
-            self.pusher.note_decode_of(pushed_req(room=room, tokens=tokens))
+            self.pusher.note_decode_of(
+                pushed_req(room=room, tokens=tokens), recalled=False
+            )
         self.cache.evict(EvictParams(num_tokens=16))
 
     def offer_once(self):
@@ -405,7 +403,6 @@ class DecodeReceiverFixture:
         read = next(iter(self.host.transfer.reads.values()))
         self.assertEqual(read["remote_endpoint"], "producer:9000")
         self.assertEqual(read["remote_block_ids"], list(range(8)))
-        self.assertEqual(read["destination"], "host")
         self.assertEqual(len(read["local_block_ids"]), len(self.c))
 
     def answered(self):
@@ -414,7 +411,96 @@ class DecodeReceiverFixture:
         return self.mgr.send_victim_ack.call_args.kwargs["stored"]
 
 
+# ---------------------------------------------------------------------------
+# Recall: the prefill puller and the decode queue core_hooks
+# ---------------------------------------------------------------------------
+
 ROOM = 7
+
+
+def recall_channel(*, offer_pages: int, refused: bool = False):
+    """A channel double whose decode offered ``offer_pages`` pages for every
+    room. The test sets ``ready`` (the decode's READY, uuid 0 refuses) and
+    ``read_done`` (None while the read runs) as the handshake proceeds."""
+    channel = MagicMock()
+    channel.taken = set()
+    channel.ready = (0 if refused else 11, "10.0.0.2:5")
+    channel.read_done = False
+
+    def take(room):
+        if room in channel.taken:
+            return None
+        channel.taken.add(room)
+        return list(range(offer_pages))
+
+    channel.prefix_ready.side_effect = lambda room: channel.ready
+    channel.take_prefix_offer.side_effect = take
+    channel.ask_prefix_pull.return_value = True
+    channel.prefix_req_id.side_effect = lambda room: f"{room}#px"
+    channel.start_host_read.return_value = True
+    channel.poll_host_read.side_effect = lambda req_id: channel.read_done
+    return channel
+
+
+class HostRecallEdgeCasesFixture:
+    def _build(self, *, host_capacity: int, mgr):
+        cache, allocator = full_cache(kv_size=64, host_capacity=host_capacity)
+        cache.tree_core.is_write_back = cache.is_write_back = False
+        puller = PrefillDramPrefixPuller(offload_context(cache=cache, channel=mgr))
+        puller._max_inflight_tokens = 1 << 20
+        return cache, allocator, puller
+
+    def _fill_host_with_a_device_copy(self, cache, allocator, *, lock: bool):
+        tokens = list(range(100, 116))
+        insert_tokens(cache, allocator, tokens)
+        node = root_node(cache, 100)
+        host = cache.cache_controller.host
+        cache.tree_core.commit_backup(node.id, host.alloc(len(node.key)), {})
+        cache.tree_core._update_duplicate_tracking(node)
+        if lock:
+            cache.inc_host_lock_ref(node.id)
+        self.assertEqual(host.available_size(), 0)
+        return host
+
+    def _req(self):
+        return SimpleNamespace(
+            bootstrap_room=ROOM,
+            origin_input_ids=list(range(200, 232)),
+            extra_key=None,
+            cache_salt=None,
+        )
+
+
+class RecallLifecycleFixture:
+    def _scripted(self):
+        """A channel that offers 16 pages once and lets the test set the READY
+        and the read's outcome as the handshake proceeds."""
+        mgr = recall_channel(offer_pages=16)
+        mgr.ready = None
+        return mgr
+
+    def _advance_to_pulling(self, puller, mgr, req):
+        puller.advance([req], waiting_reqs=[])
+        plan = puller._plans[ROOM]
+        self.assertEqual((plan.req_id, plan.new_indices), (None, None))
+        mgr.ask_prefix_pull.assert_called_once()
+        # Host pages are reserved only once READY is in.
+        puller.advance([req], waiting_reqs=[])
+        self.assertIsNone(plan.new_indices)
+        mgr.ready, mgr.read_done = (11, "10.0.0.2:5"), None
+        puller.advance([req], waiting_reqs=[])
+        self.assertEqual(plan.req_id, f"{ROOM}#px")
+        self.assertEqual(len(plan.new_indices), 16)
+        return plan
+
+
+class DecodeQueueHooksFixture:
+    def _queue(self, *rids):
+        reqs = [
+            SimpleNamespace(req=SimpleNamespace(rid=rid, bootstrap_room=n))
+            for n, rid in enumerate(rids)
+        ]
+        return SimpleNamespace(queue=reqs, tree_cache=None), reqs
 
 
 # ---------------------------------------------------------------------------
@@ -422,29 +508,15 @@ ROOM = 7
 # ---------------------------------------------------------------------------
 
 
-def _engine_manager():
-    mgr = RaidenKVManager.__new__(RaidenKVManager)
-    mgr.pp_size = mgr.attn_cp_size = mgr.attn_dp_size = mgr.system_dp_size = 1
-    mgr.attn_tp_size = 8
-    mgr._pipeline_enabled = False
-    mgr._state_kv_caches = ()
-    mgr._swa_kv_caches = []
-    mgr.kv_args = SimpleNamespace(page_size=64, kv_cache_dtype_str="fp8_e4m3")
-    return mgr
-
-
 def _tree_cache():
     cache = MagicMock(spec=UnifiedRadixCache)
     cache.tree_core = MagicMock(spec=UnifiedTreeCore)
-    cache.cache_controller = object()
     return cache
 
 
 def supported_engine():
     """A prefill or decode engine in a setting the offload supports."""
     return SimpleNamespace(
-        kv_manager=_engine_manager(),
-        tree_cache=_tree_cache(),
         scheduler=SimpleNamespace(
             server_args=SimpleNamespace(
                 disable_radix_cache=False,
@@ -455,6 +527,10 @@ def supported_engine():
                 attn_dp_size=1,
             ),
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            tree_cache=_tree_cache(),
+            model_config=SimpleNamespace(
+                is_hybrid_swa=False, is_hybrid_swa_compress=False
+            ),
         ),
         memory=SimpleNamespace(
             hicache_io_backend="raiden",
@@ -467,42 +543,36 @@ def supported_engine():
             optimistic_prefill_attempts=0,
         ),
         device=SimpleNamespace(sleep_on_idle=False),
+        parallel=SimpleNamespace(attn_cp_size=1),
+        # What the pool configurator's GDN/Mamba predicate returns.
+        mambaish=None,
         missing_api=[],
     )
 
 
-def validate_engine_as(engine, role="prefill", switch=True, args_only=False):
+def validate_engine_as(engine, role="prefill"):
     with ExitStack() as stack:
-        # Not SWITCH.override: it does not restore the variable when the body
-        # raises, and a refusal raises.
-        stack.enter_context(patch.dict("os.environ", {SWITCH.name: str(int(switch))}))
+        for name in ("memory", "disagg", "device", "parallel"):
+            stack.enter_context(
+                patch(
+                    f"sglang.srt.runtime_context.get_{name}",
+                    return_value=getattr(engine, name),
+                )
+            )
         stack.enter_context(
-            patch("sglang.srt.runtime_context.get_memory", return_value=engine.memory)
-        )
-        stack.enter_context(
-            patch("sglang.srt.runtime_context.get_disagg", return_value=engine.disagg)
-        )
-        stack.enter_context(
-            patch("sglang.srt.runtime_context.get_device", return_value=engine.device)
+            patch(
+                "sglang.srt.configs.hybrid_arch.mambaish_config",
+                return_value=engine.mambaish,
+            )
         )
         stack.enter_context(
             patch.object(
                 startup_validation,
-                "missing_tpu_sync_host_api",
+                "_missing_tpu_sync_host_api",
                 return_value=engine.missing_api,
             )
         )
-        if args_only:
-            startup_validation.validate_engine_args(
-                role=role, scheduler=engine.scheduler
-            )
-        else:
-            startup_validation.validate_engine(
-                role=role,
-                scheduler=engine.scheduler,
-                kv_manager=engine.kv_manager,
-                tree_cache=engine.tree_cache,
-            )
+        startup_validation.validate_engine_args(role=role, scheduler=engine.scheduler)
 
 
 # ---------------------------------------------------------------------------
@@ -630,14 +700,49 @@ def decode_manager():
     return mgr
 
 
-def pull_req(kv_offload=False):
+def pull_req(prefix_blocks=(3, 4, 5, 6), kv_offload=False):
     return PullReq(
         room=ROOM,
         decode_ip="10.0.0.2",
         decode_port=5555,
         decode_pages=4,
+        prefix_blocks=list(prefix_blocks),
         kv_offload=kv_offload,
     ).to_frames()
+
+
+def register_decode(mgr, offered=()):
+    """Send the room's PULL_REQ, after the decode offered ``offered`` pages."""
+    if mgr.dram_offload_channel is not None:
+        mgr.dram_offload_channel.offer_resident_prefix(ROOM, list(offered))
+    mgr.register_decode_request(ROOM, [21, 22, 23], [], None, [PREFILL_INFO])
+
+
+class DecodeOffersItsPrefixFixture:
+    def _served(self, mgr, first_page, num_pages):
+        """The decode's PREFIX_READY to a PREFIX_PULL of the given range."""
+        mgr._dispatch(
+            PrefixPull(
+                room=ROOM, first_page=first_page, num_pages=num_pages
+            ).to_frames()
+        )
+        endpoint, frames = sent_frames(mgr)[-1]
+        self.assertEqual(endpoint, PREFILL_ADDR)
+        return PrefixReady.from_frames(frames)
+
+
+class PrefillRecallsIntoItsHostPagesFixture:
+    def _armed(self):
+        """A prefill manager whose decode offered pages [3, 4, 5, 6] for ROOM."""
+        mgr = prefill_manager()
+        sender_on(mgr)
+        mgr._dispatch(pull_req())
+        self.assertEqual(mgr.dram_offload_channel.take_prefix_offer(ROOM), [3, 4, 5, 6])
+        return mgr
+
+    @staticmethod
+    def _ready():
+        return PrefixReady(room=ROOM, uuid=99, endpoint=DECODE_RAIDEN)
 
 
 # ---------------------------------------------------------------------------
@@ -651,12 +756,10 @@ class FakeNativeManager:
     def __init__(self) -> None:
         self.registered: tuple | None = None
         self.started: tuple | None = None
-        self.registration_needed = True
         self.reports: deque[SimpleNamespace] = deque()
 
     def register_read(self, req_id, uuid, block_ids, *, source):
         self.registered = (req_id, uuid, block_ids, source)
-        return self.registration_needed
 
     def start_read(
         self,
@@ -705,4 +808,3 @@ class RaidenHostTransferFixture:
         self.transfer._mgr = self.native
         self.transfer._host_transfers = {}
         self.transfer._host_control_port = 12345
-        self.transfer._parallelism = 4

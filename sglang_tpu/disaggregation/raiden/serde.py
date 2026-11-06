@@ -45,6 +45,11 @@ class MessageTag(bytes, enum.Enum):
 
     ROOM_FAILED = b"RAIDEN_ROOM_FAILED"  # prefill -> decode: room already failed
 
+    # Decode-held prefix pull: the prefill reuses KV the decode already holds
+    # in RAM. PULL_REQ names the pages the decode offers.
+    PREFIX_PULL = b"RAIDEN_PREFIX_PULL"  # prefill -> decode: register this page range
+    PREFIX_READY = b"RAIDEN_PREFIX_READY"  # decode -> prefill: registered, pull now
+
     # Victim push: the prefill hands a session it is about to evict to the decode
     # that served it (decode_dram_offload/prefill_dram_victim_pusher.py).
     VICTIM_PUSH = b"RAIDEN_VICTIM_PUSH"  # prefill -> decode: host pages offered
@@ -66,7 +71,7 @@ def _require_port(port: int) -> None:
         raise ValueError(f"invalid decode_port: expected 1..65535, got {port}")
 
 
-class PullReq(WireMessage):
+class PullReq(WireMessage, omit_defaults=True):
     """Ask a prefill rank to publish one room's KV blocks."""
 
     TAG: ClassVar[bytes] = MessageTag.PULL_REQ
@@ -77,8 +82,13 @@ class PullReq(WireMessage):
     # Window pages the decode allocated for the room; the sender registers
     # only the window blocks it will read.
     decode_swa_pages: int = 0
+    # Host page ids of the prompt prefix the decode holds in RAM and offers
+    # the prefill for recall, in prompt order; empty offers nothing.
+    prefix_blocks: list[int] = msgspec.field(default_factory=list)
     # Whether the decode runs with the KV offload to decode DRAM switched on.
-    # The prefill fails the room when its own switch differs.
+    # The prefill fails the room when its own switch differs. Defaults are
+    # omitted on the wire, so a prefill from before these fields accepts a
+    # decode with the switch off.
     kv_offload: bool = False
 
     def __post_init__(self) -> None:
@@ -86,6 +96,35 @@ class PullReq(WireMessage):
         require_non_negative(self.decode_pages, "decode_pages")
         require_non_negative(self.decode_swa_pages, "decode_swa_pages")
         _require_port(self.decode_port)
+
+
+class PrefixPull(WireMessage):
+    """Ask the decode to register offered pages [first_page, first_page + num_pages)."""
+
+    TAG: ClassVar[bytes] = MessageTag.PREFIX_PULL
+    room: int
+    first_page: int
+    num_pages: int
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+        require_non_negative(self.first_page, "first_page")
+        if self.num_pages < 1:
+            raise ValueError(f"invalid num_pages: expected >= 1, got {self.num_pages}")
+
+
+class PrefixReady(WireMessage):
+    """Confirm the requested prefix pages are registered for the prefill's read."""
+
+    TAG: ClassVar[bytes] = MessageTag.PREFIX_READY
+    room: int
+    # uuid 0 is a refusal: the prefill computes the prompt.
+    uuid: int
+    endpoint: str
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+        require_non_negative(self.uuid, "uuid")
 
 
 class VictimPush(WireMessage):
@@ -159,7 +198,7 @@ class Chunk(WireMessage):
         require_non_negative(self.total_pages, "total_pages")
 
 
-class ReshardReq(WireMessage):
+class ReshardReq(WireMessage, omit_defaults=True):
     """Request a push transfer into an asymmetric-TP decode layout."""
 
     TAG: ClassVar[bytes] = MessageTag.RESHARD_REQ
@@ -171,6 +210,9 @@ class ReshardReq(WireMessage):
     dst_attn_tp: int
     decode_swa_blocks: list[int]
     swa_push_endpoint: str
+    # Whether the decode runs with the KV offload to decode DRAM switched on;
+    # the prefill fails the room when the switch is on on either side.
+    kv_offload: bool = False
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
