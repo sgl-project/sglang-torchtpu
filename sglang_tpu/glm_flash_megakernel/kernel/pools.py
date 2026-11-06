@@ -14,7 +14,10 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.glm_flash_megakernel.layout import closing_pools, record_bytes  # noqa: F401
+from sglang_tpu.glm_flash_megakernel.layout import (  # noqa: F401
+    closing_pools,
+    record_bytes,
+)
 
 F32 = jnp.float32
 BF16 = jnp.bfloat16
