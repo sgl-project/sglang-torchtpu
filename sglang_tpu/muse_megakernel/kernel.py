@@ -303,6 +303,9 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     pair_ag: int = 0
     pair_o_rs: bool = False
     swa_chunk_pages: int = 0
+    # pages_swa stays in HBM and each step DMAs every request's window of it into SMEM: at
+    # 1M context and cc >= 28 the two page tables would crowd the 1 MiB SMEM out
+    swa_window_table: bool = False
     attn_skip_idle_streams: bool = False
     attn_col_mask: bool = False
     fold_attn_scale: bool = False
@@ -451,6 +454,10 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
 
     def validate(self):
         assert self.rows % self.tp == 0 and self.rows >= self.tp
+        # windows are DMA'd in TABLE_ALIGN-entry units; only the SAL kv write reads them
+        assert not self.swa_window_table or (
+            self.kv_sal and table_entries_padded(self) >= swa_window_entries(self)
+        )
         assert self.n_req * self.rows_per_req <= self.rows
         assert 1 <= self.stream_depth <= self.ring_slots - 1
         assert "fp8" not in self.expert_kinds or (self.expert_depth + 1) % 2 == 0, (
@@ -880,6 +887,30 @@ class _AttnGeom(NamedTuple):
     kg: int
     kr: int
     is_global: Any
+
+
+# A dynamic DMA offset into a 1-D int32 HBM ref (one 128-lane tile per row) must be a whole
+# number of lane tiles: Mosaic rejects word-aligned (8-entry) offsets there. The table is
+# padded to whole tiles so an aligned window can reach its last entries.
+TABLE_ALIGN = LANE
+
+
+def table_entries_padded(c) -> int:
+    return -(-c.n_pages_entries // TABLE_ALIGN) * TABLE_ALIGN
+
+
+def pad_table(c, table):
+    """pages_swa for swa_window_table kernels: whole TABLE_ALIGN tiles (pad never read)."""
+    return jnp.pad(table, (0, table_entries_padded(c) - table.shape[0]))
+
+
+def swa_window_entries(c) -> int:
+    """pages_swa entries one request's window is read from: the window's chunks (validate()
+    bounds them by the SWA ring), widened so the DMA starts on a TABLE_ALIGN boundary."""
+    cp = c.swa_chunk_pages or c.chunk_pages
+    cpt = cp * c.page_size
+    pages = ((c.window + cpt - 2) // cpt + 1) * cp
+    return -(-(pages + TABLE_ALIGN - 1) // TABLE_ALIGN) * TABLE_ALIGN
 
 
 def _sel(flag, a, b):
@@ -2486,7 +2517,14 @@ def _alias_tiled_obuf_ysend(c: MKConfig) -> bool:
 
 
 def scratch_plan(cfg: MKConfig):
-    return _scratch_plan_tiled(cfg) if cfg.row_tile else _scratch_plan_base(cfg)
+    plan = _scratch_plan_tiled(cfg) if cfg.row_tile else _scratch_plan_base(cfg)
+    if cfg.swa_window_table:
+        plan = plan + [
+            ("psw_win", pltpu.SMEM((cfg.n_req * swa_window_entries(cfg),), jnp.int32)),
+            ("psw_base", pltpu.SMEM((cfg.n_req,), jnp.int32)),
+            ("psw_sem", pltpu.SemaphoreType.DMA((1,))),
+        ]
+    return plan
 
 
 def _scratch_plan_tiled(c: MKConfig) -> list:
@@ -2949,6 +2987,47 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
         n_live = meta_ref[0]
         tp_rank = meta_ref[1]
         me = jax.lax.axis_index(axis) if c.tp > 1 else 0
+        if c.swa_window_table:
+            # every request's sliding window of pages_swa (HBM) into SMEM, once per step: the
+            # SWA layers share one table, and a request's window spans few of its entries
+            wn = swa_window_entries(c)
+            swa_cpt = (c.swa_chunk_pages or c.chunk_pages) * ps
+
+            def swa_win_copy(j):  # psw_base counts TABLE_ALIGN-entry units
+                start = pl.multiple_of(S["psw_base"][j] * TABLE_ALIGN, TABLE_ALIGN)
+                return pltpu.make_async_copy(
+                    psw_ref.at[pl.ds(start, wn)],
+                    S["psw_win"].at[pl.ds(j * wn, wn)],
+                    S["psw_sem"].at[0],
+                )
+
+            def swa_win_start(j, carry):
+                p_lo = pos_ref[j * q]
+                first_pg = (
+                    jnp.maximum(p_lo - c.window + 1, 0) // swa_cpt * (swa_cpt // ps)
+                )
+                ent = j * c.pages_per_seq + first_pg
+                S["psw_base"][j] = jnp.minimum(
+                    ent // TABLE_ALIGN, (table_entries_padded(c) - wn) // TABLE_ALIGN
+                )
+                swa_win_copy(j).start()
+                return carry
+
+            def swa_win_wait(j, carry):
+                swa_win_copy(j).wait()
+                return carry
+
+            jax.lax.fori_loop(0, c.n_req, swa_win_start, 0)
+            jax.lax.fori_loop(0, c.n_req, swa_win_wait, 0)
+
+        def swa_page(j, ent):
+            """pages_swa[ent], an entry of request j's window."""
+            if not c.swa_window_table:
+                return psw_ref[ent]
+            wn = swa_window_entries(c)
+            base = S["psw_base"][j] * TABLE_ALIGN
+            return S["psw_win"][j * wn + jnp.clip(ent - base, 0, wn - 1)]
+
         can_pair_fold = bool(
             c.pair_ag >= 1
             and c.tp == 8
@@ -3450,7 +3529,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     j * c.pages_per_seq + jnp.minimum(pg_no, c.pages_per_seq - 1),
                     c.n_pages_entries - 1,
                 )
-                pages.append(_sel(geo.is_global, pf_ref[ent], psw_ref[ent]))
+                pages.append(_sel(geo.is_global, pf_ref[ent], swa_page(j, ent)))
             return pages
 
         def issue_range(geo, l, j, ci0, slot0, n):
@@ -8564,7 +8643,8 @@ def megakernel_call(cfg: MKConfig, axis: str = "model"):
         f = pl.pallas_call(
             kernel,
             out_shape=out_shape,
-            in_specs=[smem] * 4
+            in_specs=[smem] * 3
+            + [hbm if cfg.swa_window_table else smem]
             + [hbm if cfg.row_tile else vmem]
             + [hbm]
             * (nw + n_expert_refs(cfg) + L),  # emb: bf16 rows, or the f32 stream
@@ -8577,6 +8657,8 @@ def megakernel_call(cfg: MKConfig, axis: str = "model"):
             ),
             name=f"muse_megakernel_r{cfg.rows}_q{cfg.rows_per_req}",
         )
+        if cfg.swa_window_table:
+            pages_swa = pad_table(cfg, pages_swa)
         out = f(meta, pos, pages_full, pages_swa, emb, *weights, *experts, *kv)
         return tuple(out[:3])
 
@@ -8605,10 +8687,14 @@ def _kv_write_sal_call(cfg: MKConfig):
     L, R, ps, q = cfg.n_layers, cfg.rows, cfg.page_size, cfg.rows_per_req
     gl = set(cfg.global_layers)
     nw = cfg.sal_words
+    # with swa_window_table: a request's (at most two) pages_swa entries, from an aligned DMA
+    KVW = 2 * TABLE_ALIGN
 
     def kernel(meta_ref, pos_ref, pf_ref, psw_ref, newkv, *rest):
         kv_out = rest[L : 2 * L]
         blk, new_v, rsem, wsem, nsem = rest[2 * L : 2 * L + 5]
+        if cfg.swa_window_table:
+            swin, sbase, ssem = rest[2 * L + 5 : 2 * L + 8]
         n_live = meta_ref[0]
         cp = pltpu.make_async_copy(newkv, new_v, nsem.at[0])
         cp.start()
@@ -8618,10 +8704,23 @@ def _kv_write_sal_call(cfg: MKConfig):
         n_req_live = jnp.minimum((n_live + q - 1) // q, cfg.n_req)
 
         def page_of(l, j, pg_no):
-            tab = pf_ref if l in gl else psw_ref
-            return tab[
-                jnp.minimum(j * cfg.pages_per_seq + pg_no, cfg.n_pages_entries - 1)
-            ]
+            ent = jnp.minimum(j * cfg.pages_per_seq + pg_no, cfg.n_pages_entries - 1)
+            if l in gl:
+                return pf_ref[ent]
+            if not cfg.swa_window_table:
+                return psw_ref[ent]
+            return swin[jnp.clip(ent - sbase[0] * TABLE_ALIGN, 0, KVW - 1)]
+
+        def load_swa(j, first):
+            unit = jnp.minimum(
+                (j * cfg.pages_per_seq + first) // TABLE_ALIGN,
+                (table_entries_padded(cfg) - KVW) // TABLE_ALIGN,
+            )
+            sbase[0] = unit  # in TABLE_ALIGN-entry units, the DMA offset's alignment
+            start = pl.multiple_of(unit * TABLE_ALIGN, TABLE_ALIGN)
+            cp = pltpu.make_async_copy(psw_ref.at[pl.ds(start, KVW)], swin, ssem.at[0])
+            cp.start()
+            cp.wait()
 
         def rmw(j, pg_no):
             for l in range(L):
@@ -8661,6 +8760,8 @@ def _kv_write_sal_call(cfg: MKConfig):
         def req(j, carry):
             first = pos_ref[j * q] // ps
             last = pos_ref[jnp.minimum(j * q + q - 1, n_live - 1)] // ps
+            if cfg.swa_window_table:
+                load_swa(j, first)
             rmw(j, first)
             pl.when(last != first)(lambda: rmw(j, last))
             return carry
@@ -8672,10 +8773,14 @@ def _kv_write_sal_call(cfg: MKConfig):
     blk_bytes = L * math.prod(cfg.sal_block) * jnp.dtype(cfg.kv_dtype).itemsize
 
     def call(meta, pos, pages_full, pages_swa, newkv, *kv):
+        if cfg.swa_window_table:
+            pages_swa = pad_table(cfg, pages_swa)
         return pl.pallas_call(
             kernel,
             out_shape=[jax.ShapeDtypeStruct(k.shape, k.dtype) for k in kv],
-            in_specs=[smem] * 4 + [hbm] * (1 + L),
+            in_specs=[smem] * 3
+            + [hbm if cfg.swa_window_table else smem]
+            + [hbm] * (1 + L),
             out_specs=[hbm] * L,
             scratch_shapes=[
                 pltpu.VMEM((L, *cfg.sal_block), cfg.kv_dtype),
@@ -8683,7 +8788,16 @@ def _kv_write_sal_call(cfg: MKConfig):
                 pltpu.SemaphoreType.DMA((L,)),
                 pltpu.SemaphoreType.DMA((L,)),
                 pltpu.SemaphoreType.DMA((1,)),
-            ],
+            ]
+            + (
+                [
+                    pltpu.SMEM((KVW,), jnp.int32),
+                    pltpu.SMEM((1,), jnp.int32),
+                    pltpu.SemaphoreType.DMA((1,)),
+                ]
+                if cfg.swa_window_table
+                else []
+            ),
             input_output_aliases={5 + i: i for i in range(L)},
             compiler_params=pltpu.CompilerParams(
                 vmem_limit_bytes=blk_bytes + 16 * 2**20
