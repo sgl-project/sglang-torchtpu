@@ -53,8 +53,10 @@ AGENTIC_CONFIG["runtime_env"].update(
         "SGLANG_SPEC_TP_SYNC": "rng",
         "SGLANG_TPU_ALLOW_SPEC_RECOMPILE": "1",
         # Adaptive verify and real-draft-token acceptance exist only on the core
-        # DFlash worker; the experimental one is the default now.
+        # DFlash worker; either flag routes DFLASH to the experimental one, and both
+        # default on.
         "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "0",
+        "SGLANG_TPU_HOST_PADDING_NO_D2H": "0",
     }
 )
 
