@@ -37,13 +37,21 @@ class StagingAdmission:
         capacity: int,
         swa_capacity: Optional[int] = None,
         state_capacity: Optional[int] = None,
+        draft_full_capacity: Optional[int] = None,
+        draft_swa_capacity: Optional[int] = None,
     ):
         self.capacity = max(1, int(capacity))
         self.swa_capacity = None if swa_capacity is None else max(1, int(swa_capacity))
         self.state_capacity = (
             None if state_capacity is None else max(1, int(state_capacity))
         )
-        self._in_flight: Dict[Any, Tuple[int, int, int]] = {}
+        self.draft_full_capacity = (
+            None if draft_full_capacity is None else max(1, int(draft_full_capacity))
+        )
+        self.draft_swa_capacity = (
+            None if draft_swa_capacity is None else max(1, int(draft_swa_capacity))
+        )
+        self._in_flight: Dict[Any, Tuple[int, int, int, int, int]] = {}
         self._waiting: Optional[Any] = None
 
     def __len__(self) -> int:
@@ -58,32 +66,52 @@ class StagingAdmission:
         return self._waiting
 
     def pages(self) -> int:
-        return sum(pages for pages, _, _ in self._in_flight.values())
+        return sum(pages for pages, _, _, _, _ in self._in_flight.values())
 
     def swa_pages(self) -> int:
-        return sum(swa_pages for _, swa_pages, _ in self._in_flight.values())
+        return sum(swa_pages for _, swa_pages, _, _, _ in self._in_flight.values())
 
     def state_pages(self) -> int:
-        return sum(state_pages for _, _, state_pages in self._in_flight.values())
+        return sum(state_pages for _, _, state_pages, _, _ in self._in_flight.values())
+
+    def draft_full_pages(self) -> int:
+        return sum(dfull for _, _, _, dfull, _ in self._in_flight.values())
+
+    def draft_swa_pages(self) -> int:
+        return sum(dswa for _, _, _, _, dswa in self._in_flight.values())
 
     def admit(
-        self, key: Any, pages: int, swa_pages: int = 0, state_pages: int = 0
+        self,
+        key: Any,
+        pages: int,
+        swa_pages: int = 0,
+        state_pages: int = 0,
+        draft_full_pages: int = 0,
+        draft_swa_pages: int = 0,
     ) -> bool:
         """Reserves ``pages`` of the pool (``swa_pages`` of the sliding-window
-        pool, ``state_pages`` of the GDN state pool) for ``key``. False means
-        try again later."""
+        pool, ``state_pages`` of the GDN state pool, plus any draft pools) for
+        ``key``. False means try again later."""
         if key in self._in_flight:
             return True
-        pages, swa_pages, state_pages = int(pages), int(swa_pages), int(state_pages)
+        pages = int(pages)
+        swa_pages = int(swa_pages)
+        state_pages = int(state_pages)
+        draft_full_pages = int(draft_full_pages)
+        draft_swa_pages = int(draft_swa_pages)
         if (
             pages > self.capacity
             or _exceeds(swa_pages, self.swa_capacity)
             or _exceeds(state_pages, self.state_capacity)
+            or _exceeds(draft_full_pages, self.draft_full_capacity)
+            or _exceeds(draft_swa_pages, self.draft_swa_capacity)
         ):
             raise ValueError(
                 f"read {key!r} needs {pages} pages, {swa_pages} sliding-window "
-                f"pages and {state_pages} state rows, more than the pool holds "
-                f"({self.capacity}, {self.swa_capacity} and {self.state_capacity})"
+                f"pages, {state_pages} state rows, {draft_full_pages} draft full "
+                f"pages and {draft_swa_pages} draft SWA pages, more than the pool holds "
+                f"({self.capacity}, {self.swa_capacity}, {self.state_capacity}, "
+                f"{self.draft_full_capacity} and {self.draft_swa_capacity})"
             )
         if self._waiting is not None and self._waiting != key:
             return False
@@ -94,11 +122,26 @@ class StagingAdmission:
                 state_pages > 0
                 and self.state_pages() + state_pages > self.state_capacity
             )
+            or (
+                draft_full_pages > 0
+                and self.draft_full_pages() + draft_full_pages
+                > self.draft_full_capacity
+            )
+            or (
+                draft_swa_pages > 0
+                and self.draft_swa_pages() + draft_swa_pages > self.draft_swa_capacity
+            )
         ):
             self._waiting = key
             return False
         self._waiting = None
-        self._in_flight[key] = (pages, swa_pages, state_pages)
+        self._in_flight[key] = (
+            pages,
+            swa_pages,
+            state_pages,
+            draft_full_pages,
+            draft_swa_pages,
+        )
         return True
 
     def release(self, key: Any) -> None:

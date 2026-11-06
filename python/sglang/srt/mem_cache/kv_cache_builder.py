@@ -107,11 +107,16 @@ def prepare_hicache_staging(
     prepare(runner.token_to_kv_pool, runner.mtp_draft_device_pools)
     if draft_plan is not None and draft_plan.mode == HiCacheDraftMode.SIDECAR:
         for pool in draft_plan.device_pools:
-            # SWA sidecars follow only the draft's SWA component.
-            prepare(
-                pool.swa_kv_pool if isinstance(pool, BaseSWAKVPool) else pool,
-                sidecar=True,
-            )
+            if isinstance(pool, SWAKVPool):
+                if pool.full_kv_pool.layer_num > 0:
+                    prepare(pool.full_kv_pool, sidecar=True)
+                if pool.swa_kv_pool.layer_num > 0:
+                    prepare(pool.swa_kv_pool, sidecar=True)
+            else:
+                prepare(
+                    pool.swa_kv_pool if isinstance(pool, BaseSWAKVPool) else pool,
+                    sidecar=True,
+                )
 
 
 def maybe_register_hicache_draft(

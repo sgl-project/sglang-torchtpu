@@ -31,6 +31,20 @@ derive_unified_draft_pool_sizes, attach_unified_draft_kv_pool
   Upstream PR or issue: not filed yet.
   Remove when: BaseTokenToKVPoolAllocator declares draft pool sizing and
        attachment hooks upstream.
+
+build_unified_hicache_draft_plan, bind_unified_swa_draft_host_pool
+  Why: TpuUnifiedSWAKVPool splits Full and M_T-group SWA pages inside one
+       device buffer, so MTP draft pools cannot pack into its page-major DMA
+       transfer and must offload via DRAFT / DRAFT_SWA sidecars; compact
+       DRAFT_SWA host/device pages also require TpuDMAUnifiedHostKVPool page
+       translators bound after build_swa_draft_pools constructs the host pool.
+  How: AROUND BaseSpecWorker._build_hicache_draft_plan forces SIDECAR mode for
+       single-runner drafts on TpuUnifiedSWAKVPool and rejects multi-runner MTP;
+       AFTER hybrid_pool_assembler.build_swa_draft_pools calls
+       target_swa_host_pool.bind_draft_swa_sidecar on TpuDMAUnifiedHostKVPool.
+  Upstream PR or issue: not filed yet.
+  Remove when: KVCache and BaseKVPoolHost expose first-class HiCache draft
+       packing and sidecar-binding protocols upstream.
 """
 
 from __future__ import annotations
@@ -124,3 +138,66 @@ def attach_unified_draft_kv_pool(original, configurator, *args, **kwargs):
             alloc.attach_draft_kv_pool(configurator, kwargs["token_to_kv_pool"])
             return alloc
     return original(configurator, *args, **kwargs)
+
+
+def build_unified_hicache_draft_plan(original, worker):
+    target_runner = getattr(
+        getattr(worker, "target_worker", None), "model_runner", None
+    )
+    target_pool = getattr(target_runner, "token_to_kv_pool", None)
+    if target_pool is not None:
+        from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
+
+        if isinstance(target_pool, TpuUnifiedSWAKVPool):
+            from sglang.srt.runtime_context import get_disagg, get_memory
+            from sglang.srt.speculative.base_spec_worker import (
+                HiCacheDraftMode,
+                HiCacheDraftPlan,
+            )
+
+            target_runner.mtp_draft_device_pools = ()
+            if not (
+                get_memory().enable_hierarchical_cache
+                or get_memory().enable_unified_cache_external_linker
+                or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+            ):
+                return HiCacheDraftPlan()
+            draft_runners = worker._draft_model_runners()
+            if not draft_runners:
+                return HiCacheDraftPlan()
+            if (
+                "InklingForConditionalGenerationMTP"
+                in draft_runners[0].model_config.hf_config.architectures
+            ):
+                raise NotImplementedError(
+                    "HiCache does not support Inkling MTP draft state yet."
+                )
+            if len(draft_runners) > 1:
+                raise NotImplementedError(
+                    "Multi-runner MTP HiCache offload is not supported on unified SWA KV pools."
+                )
+            if get_memory().enable_unified_cache_external_linker:
+                raise NotImplementedError(
+                    "The external linker only supports packed draft KV caches."
+                )
+            return HiCacheDraftPlan(
+                mode=HiCacheDraftMode.SIDECAR,
+                device_pools=(draft_runners[0].token_to_kv_pool,),
+            )
+    return original(worker)
+
+
+def bind_unified_swa_draft_host_pool(result, *, draft_kv_pool, tree_cache):
+    _, entries = result
+    if entries:
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+        from sglang_tpu.kv_pool_host import TpuDMAUnifiedHostKVPool
+
+        swa_entry = tree_cache.cache_controller.mem_pool_host.entry_map.get(
+            PoolName.SWA
+        )
+        if swa_entry is not None and isinstance(
+            swa_entry.host_pool, TpuDMAUnifiedHostKVPool
+        ):
+            swa_entry.host_pool.bind_draft_swa_sidecar(entries[0].host_pool)
+    return result
