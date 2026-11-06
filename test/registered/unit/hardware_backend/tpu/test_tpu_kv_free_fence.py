@@ -1,5 +1,6 @@
 """KV pages freed under overlap stay out of non-forward allocations until the
-forwards in flight at free time are processed."""
+forwards in flight at free time are processed, and KV backups wait for the
+forwards writing their pages, also under pipeline parallelism."""
 
 import ast
 import functools
@@ -9,6 +10,7 @@ import textwrap
 import unittest
 import warnings
 from array import array
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Tuple
@@ -35,6 +37,7 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -42,7 +45,11 @@ from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.allocator_tpu import (
     TpuPagedTokenToKVPoolAllocator,
 )
-from sglang_tpu.kv_free_fence import install_kv_free_fence
+from sglang_tpu.kv_free_fence import (
+    KVFreeFence,
+    deferred_dma_read,
+    install_kv_free_fence,
+)
 
 register_cpu_ci(est_time=45, suite="base-a-test-cpu")
 
@@ -596,6 +603,128 @@ def _attribute_calls(func: ast.FunctionDef | ast.AsyncFunctionDef) -> List[ast.C
         for node in ast.walk(func)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     ]
+
+
+class _LaunchEvent:
+    """A launch event that only reports completion; blocking on it fails."""
+
+    def __init__(self, done=False):
+        self.done = done
+
+    def query(self):
+        return self.done
+
+    def synchronize(self):
+        raise AssertionError("the scheduler blocked on a launch event")
+
+
+def _no_device_sync():
+    raise AssertionError("the scheduler synchronized the device")
+
+
+def _launch_polled(fence, done=False):
+    forward = SimpleNamespace(copy_done=_LaunchEvent(done))
+    fence.on_batch_formed()
+    fence.on_forward_launched(forward)
+    return forward.copy_done
+
+
+class TestRetireCompleted(CustomTestCase):
+    def test_reads_wait_for_the_forwards_formed_before_them(self):
+        fence = KVFreeFence(synchronize_device=_no_device_sync)
+        ran = []
+        first = _launch_polled(fence)
+        fence.after_in_flight(lambda: ran.append("a"))
+        second = _launch_polled(fence)
+        fence.after_in_flight(lambda: ran.append("b"))
+
+        fence.retire_completed()
+        self.assertEqual(ran, [])
+        first.done = True
+        fence.retire_completed()
+        self.assertEqual(ran, ["a"])
+        second.done = True
+        fence.retire_completed()
+        self.assertEqual(ran, ["a", "b"])
+
+    def test_a_later_forward_finishing_first_releases_nothing(self):
+        fence = KVFreeFence(synchronize_device=_no_device_sync)
+        ran = []
+        first = _launch_polled(fence)
+        second = _launch_polled(fence)
+        fence.after_in_flight(lambda: ran.append("read"))
+
+        second.done = True
+        fence.retire_completed()
+        self.assertEqual(ran, [])
+        first.done = True
+        fence.retire_completed()
+        self.assertEqual(ran, ["read"])
+
+
+class TestPPLoopWiring(CustomTestCase):
+    def test_backup_of_a_running_chunk_waits_for_its_launch_event(self):
+        """A PP stage forms chunk 2 right after launching chunk 1; the backup
+        of chunk 1 queued while forming chunk 2 must wait for chunk 1's
+        forward, and is issued by polling, never by blocking."""
+        fence = KVFreeFence(synchronize_device=_no_device_sync)
+        chunk_1_launch = Mock(query=Mock(side_effect=[False, True]))
+        chunk_1_launch.synchronize.side_effect = AssertionError("blocked")
+        launch_events = [chunk_1_launch, _LaunchEvent()]
+        plans = ["chunk 1", "chunk 2", None]
+        issued = []
+        issued_at_intake = []
+
+        def form_batch(**kwargs):
+            batch = plans.pop(0)
+            if batch == "chunk 2":
+                deferred_dma_read(fence, lambda: issued.append("chunk 1 backup"))
+                self.assertEqual(issued, [])
+            return SimpleNamespace(running_batch=None, batch_to_run=batch)
+
+        def intake():
+            issued_at_intake.append(list(issued))
+            if len(issued_at_intake) > 3:
+                raise _StopLoop
+            return []
+
+        def init_loop_state():
+            scheduler.pp_loop_size = 2
+            scheduler.mbs = [None, None]
+            scheduler.last_mbs = [None, None]
+            scheduler.running_mbs = [None, None]
+            scheduler.mb_metadata = [None, None]
+            scheduler.last_rank_comm_queue = deque()
+            scheduler.launch_event = None
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.pp_kv_read_fence = fence
+        scheduler.pp_group = SimpleNamespace(is_last_rank=True)
+        scheduler.init_pp_loop_state = init_loop_state
+        scheduler.ingest_requests = intake
+        scheduler.get_next_batch_to_run = form_batch
+        scheduler._pp_launch_batch = lambda *args: (object(), launch_events.pop(0))
+        scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = Mock(
+            return_value=(None, None, Mock())
+        )
+        for name in (
+            "_pp_begin_iteration",
+            "_pp_recv_proxy",
+            "_pp_commit_proxy_send_work",
+            "_pp_process_batch_result",
+            "_pp_send_proxy",
+            "on_idle",
+        ):
+            setattr(scheduler, name, Mock())
+
+        with get_parallel().override(pp_size=2, pp_async_batch_depth=0):
+            with self.assertRaises(_StopLoop):
+                Scheduler.event_loop_pp(scheduler)
+        # Chunk 1 is still running at the second intake; the poll ahead of
+        # the third issues its backup.
+        self.assertEqual(
+            issued_at_intake, [[], [], ["chunk 1 backup"], ["chunk 1 backup"]]
+        )
 
 
 class TestTpuImportOrder(CustomTestCase):
