@@ -21,6 +21,7 @@ from sglang.test.ci.ci_register import (
     collect_tests,
 )
 from sglang.test.ci.ci_utils import derive_timeout_per_file, run_unittest_files
+from sglang.test.ci.execution_budget import run_with_execution_budget
 
 # Defensive fallback in case sglang is loaded from an external environment missing TPU
 if not hasattr(HWBackend, "TPU"):
@@ -624,6 +625,12 @@ def main():
         ),
     )
     parser.add_argument(
+        "--execution-budget-minutes",
+        type=float,
+        default=0,
+        help="Fail after the whole suite finishes if its execution exceeds this budget. 0 disables the check.",
+    )
+    parser.add_argument(
         "--continue-on-error",
         action="store_true",
         default=False,
@@ -707,7 +714,9 @@ def main():
                 f"but got {args.auto_partition_id}"
             )
 
-    exit_code = run_a_suite(args)
+    exit_code = run_with_execution_budget(
+        lambda: run_a_suite(args), args.execution_budget_minutes
+    )
     sys.exit(exit_code)
 
 
