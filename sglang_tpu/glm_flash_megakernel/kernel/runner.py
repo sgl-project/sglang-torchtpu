@@ -153,7 +153,8 @@ def make_decode(spec, layout, small_map, small_f32_map, mesh, cfg: D.KernelConfi
     in_specs = (
         [pl.BlockSpec(memory_space=pltpu.SMEM)] * n_smem
         + [pl.BlockSpec(memory_space=pltpu.VMEM)]
-        + [pl.BlockSpec(memory_space=pl.ANY)] * (n_w + n_pool + len(EXPERT_LISTS) * n_moe)
+        + [pl.BlockSpec(memory_space=pl.ANY)]
+        * (n_w + n_pool + len(EXPERT_LISTS) * n_moe)
     )
     out_shape = (
         jax.ShapeDtypeStruct((R, layout.vocab_padded // tp), jnp.float32),
@@ -182,7 +183,9 @@ def make_decode(spec, layout, small_map, small_f32_map, mesh, cfg: D.KernelConfi
         ws = [warrays[n] for n in PACKED_ORDER]
         ps = [p for n in POOL_ORDER for p in pools[n]]
         experts = [w for n in EXPERT_LISTS for w in warrays[n]]
-        out = call(tok, pos, meta, tab, srow, k_scales, init_streams, *ws, *ps, *experts)
+        out = call(
+            tok, pos, meta, tab, srow, k_scales, init_streams, *ws, *ps, *experts
+        )
         logits, _, hidden, nkv, nraw, npk, recur, conv = out
         # fp8 bytes as the nope pool holds them: kv / k_scale per layer.
         nkv8 = (nkv.astype(jnp.float32) / k_scales[:, None, None]).astype(
@@ -190,21 +193,23 @@ def make_decode(spec, layout, small_map, small_f32_map, mesh, cfg: D.KernelConfi
         )
         nkv8 = jax.lax.bitcast_convert_type(nkv8, jnp.uint8).reshape(n_dsa, R, 4, 128)
         npk = npk[:, :, :Q].reshape(n_dsa, R, spec.index_head_dim)
-        nrec = jnp.stack(
-            [PL.pool_records(npk[d], rec_bytes) for d in range(n_dsa)]
-        )
+        nrec = jnp.stack([PL.pool_records(npk[d], rec_bytes) for d in range(n_dsa)])
         raw_out, rec_out = _scatter_index_rows(
             spec, cfg, meta, pos, tab, nraw, nrec, pools["raw"], pools["records"]
         )
         dma_pools = [*pools["nope"], *pools["temporal"], *pools["conv"]]
         new = write_rows(meta, pos, tab, ckrow, nkv8, recur, conv, *dma_pools)
-        return logits, hidden, {
-            "nope": list(new[:n_dsa]),
-            "raw": raw_out,
-            "records": rec_out,
-            "temporal": list(new[n_dsa : n_dsa + n_kda]),
-            "conv": list(new[n_dsa + n_kda :]),
-        }
+        return (
+            logits,
+            hidden,
+            {
+                "nope": list(new[:n_dsa]),
+                "raw": raw_out,
+                "records": rec_out,
+                "temporal": list(new[n_dsa : n_dsa + n_kda]),
+                "conv": list(new[n_dsa + n_kda :]),
+            },
+        )
 
     wspec = {n: weight_spec(n) for n in PACKED_ORDER}
     wspec.update({n: [weight_spec(n)] * n_moe for n in EXPERT_LISTS})

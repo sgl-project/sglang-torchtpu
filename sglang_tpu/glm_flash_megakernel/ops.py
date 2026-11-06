@@ -137,7 +137,9 @@ class GlmFlashMegakernel:
             "temporal": [
                 self._req_pool.mamba2_layer_cache(L).temporal for L in spec.kda_layers
             ],
-            "conv": [self._req_pool.mamba2_layer_cache(L).conv[0] for L in spec.kda_layers],
+            "conv": [
+                self._req_pool.mamba2_layer_cache(L).conv[0] for L in spec.kda_layers
+            ],
         }
         self.pool_list = [p for n in R.POOL_ORDER for p in self.pools[n]]
         k_scales = []
@@ -229,7 +231,10 @@ class GlmFlashMegakernel:
             return False
         # A request longer than the kernel's page table continues on the model.
         seq_lens_cpu = forward_batch.seq_lens_cpu
-        if seq_lens_cpu is not None and int(seq_lens_cpu[:bs].max()) + self.Q > self.max_len:
+        if (
+            seq_lens_cpu is not None
+            and int(seq_lens_cpu[:bs].max()) + self.Q > self.max_len
+        ):
             return False
         mode = forward_batch.forward_mode
         if self.Q > 1:
@@ -252,7 +257,9 @@ class GlmFlashMegakernel:
     def _pad(t: torch.Tensor, n: int) -> torch.Tensor:
         return torch.nn.functional.pad(t, (0, n - t.shape[0]))
 
-    def _step_inputs(self, input_ids, positions, forward_batch, b0: int, n: int, bucket: int):
+    def _step_inputs(
+        self, input_ids, positions, forward_batch, b0: int, n: int, bucket: int
+    ):
         """The kernel's SMEM inputs for requests [b0, b0 + n), padded to `bucket` requests."""
         Q, bs = self.Q, forward_batch.batch_size
         rows = bucket * Q
@@ -291,12 +298,17 @@ class GlmFlashMegakernel:
 
         slots, _ = self._lin._slot_indices(forward_batch.req_pool_indices)
         dst = self._lin._translate_mamba_indices(forward_batch.mamba_track_indices)
-        dst = torch.where(mask.to(dst.device), dst, torch.zeros_like(dst)).to(torch.int32)
+        dst = torch.where(mask.to(dst.device), dst, torch.zeros_like(dst)).to(
+            torch.int32
+        )
         src = slots.to(torch.int32)
         bucket = copy_bucket_size(src.shape[0])
         count = torch.tensor([src.shape[0]], dtype=torch.int32, device=src.device)
         compiled_state_copy()(
-            self._mamba._copy_states(), self._pad(src, bucket), self._pad(dst, bucket), count
+            self._mamba._copy_states(),
+            self._pad(src, bucket),
+            self._pad(dst, bucket),
+            count,
         )
 
     def forward(self, input_ids, positions, forward_batch):
@@ -308,8 +320,12 @@ class GlmFlashMegakernel:
         # A batch beyond one call's rows runs as several calls (each streams the weights).
         for b0, n in self._calls(bs):
             bucket = self._bucket(n)
-            inputs = self._step_inputs(input_ids, positions, forward_batch, b0, n, bucket)
-            out = self.calls[bucket](*inputs, *self.weights, *self.pool_list, *self.experts)
+            inputs = self._step_inputs(
+                input_ids, positions, forward_batch, b0, n, bucket
+            )
+            out = self.calls[bucket](
+                *inputs, *self.weights, *self.pool_list, *self.experts
+            )
             logits.append(out[0][: n * self.Q])
             hidden.append(out[1][: n * self.Q])
         logits = torch.cat(logits) if len(logits) > 1 else logits[0]

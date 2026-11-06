@@ -458,7 +458,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
         fnv,
         rsb,
         agb,
-        ags,
+        agsrc,
         macc,
         sendb,
         embv,
@@ -499,8 +499,12 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
         def slab_copies(L, par, part=slice(None)):
             sl = 0 if SLAB1 else par
             cps = [
-                lambda: pltpu.make_async_copy(w_smalls.at[L], sm2.at[sl], sslab.at[par, 0]),
-                lambda: pltpu.make_async_copy(w_smallsf.at[L], smf2.at[par], sslab.at[par, 1]),
+                lambda: pltpu.make_async_copy(
+                    w_smalls.at[L], sm2.at[sl], sslab.at[par, 0]
+                ),
+                lambda: pltpu.make_async_copy(
+                    w_smallsf.at[L], smf2.at[par], sslab.at[par, 1]
+                ),
             ]
             return [mk() for mk in cps[part]]
 
@@ -566,8 +570,8 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
 
         def allgather(rows):
             """[R, hsh] on each device -> [R, H] f32 in mesh rank order."""
-            ags[...] = rows.astype(BF16)
-            return ag_round(_parity(), ags).astype(F32)
+            agsrc[...] = rows.astype(BF16)
+            return ag_round(_parity(), agsrc).astype(F32)
 
         def allreduce(rows):
             """[r, H] partial sums on each device -> [r, H] totals (bf16-rounded, as serving's)."""
@@ -578,8 +582,8 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 sendb[...] = rows.astype(BF16)
                 cps = []
                 rs_send(par, 0, H, cps)
-                ags[...] = rs_finish(par, cps).astype(BF16)
-                return ag_round(par, ags).astype(F32)[: rows.shape[0]]
+                agsrc[...] = rs_finish(par, cps).astype(BF16)
+                return ag_round(par, agsrc).astype(F32)[: rows.shape[0]]
 
         S = cfg.slots if cfg.ring else 1
         PF = cfg.prefetch if cfg.ring else 0
@@ -628,7 +632,9 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             rows = (2 if fp8 else 1) * H
             return rows // K_ if n_out is None else km_blocks(K_, n_out, rows, KM_TILE)
 
-        def mv_km(w, idx, K_, x, fp8=False, warmed=False, scale=None, n_out=None, out=None):
+        def mv_km(
+            w, idx, K_, x, fp8=False, warmed=False, scale=None, n_out=None, out=None
+        ):
             """x [R, K] @ K-major W [K, N] -> [R, N] f32, times the per-channel `scale` if given;
             with `out` each column tile is stored into that ref instead of concatenated."""
             n, mk = km_copies(w, idx, fp8)
@@ -675,8 +681,8 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     mk(s_ + KM_PF + 1).start()
                 rs_send(par, s_ * k * KM_TILE, k * KM_TILE, cps)
             with _scope("allreduce"):
-                ags[...] = rs_finish(par, cps).astype(BF16)
-                return ag_round(par, ags).astype(F32)[: x.shape[0]]
+                agsrc[...] = rs_finish(par, cps).astype(BF16)
+                return ag_round(par, agsrc).astype(F32)[: x.shape[0]]
 
         if cfg.init_streams:
             streams = in_streams[...]
@@ -786,8 +792,12 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
         # KDA checkpoints: slot `qi % 2` of stq / cvq streams to the output rows; a
         # slot is reused only after its transfer is waited.
         def ck_start(slot, k_i, r):
-            pltpu.make_async_copy(stq.at[slot], o_recur.at[k_i, r], sck.at[slot, 0]).start()
-            pltpu.make_async_copy(cvq.at[slot], o_conv.at[k_i, r], sck.at[slot, 1]).start()
+            pltpu.make_async_copy(
+                stq.at[slot], o_recur.at[k_i, r], sck.at[slot, 0]
+            ).start()
+            pltpu.make_async_copy(
+                cvq.at[slot], o_conv.at[k_i, r], sck.at[slot, 1]
+            ).start()
 
         def ck_wait(slot):
             PL.wait_dma(stq.at[slot], sck.at[slot, 0])
@@ -985,9 +995,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             rows_to(qallb, q_all)
             rows_to(hwb, hw_all)
             for r in range(R):
-                iqb[pl.ds(r * hi, hi), :] = PL.rotate(
-                    iq_all[r].reshape(hi, idh), hmat
-                )
+                iqb[pl.ds(r * hi, hi), :] = PL.rotate(iq_all[r].reshape(hi, idh), hmat)
             _wait(kvb_cp, "w_wait")
             # Read kv_b per head from the ref: a whole-block f32 value is an 8 MiB spill.
             scaling = qk**-0.5 * ks
@@ -1048,7 +1056,10 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                         n_dsa,
                         lambda d, i=i, pg=pg: pltpu.make_async_copy(
                             PL.record_page(p_rec[d], pg, RPP, rec_bytes),
-                            rkw.at[slot, pl.ds(i * (RPP // PL.WORD_BYTES), RPP // PL.WORD_BYTES)],
+                            rkw.at[
+                                slot,
+                                pl.ds(i * (RPP // PL.WORD_BYTES), RPP // PL.WORD_BYTES),
+                            ],
                             sgrp.at[6 + slot],
                         ).start(),
                     )
@@ -1392,7 +1403,9 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                         jnp.dot(x.astype(BF16), r8a[sl], preferred_element_type=F32)
                         * egsr[sl]
                     )
-                    act = K.swiglu_clamped(h[:, :moesh], h[:, moesh:], spec.swiglu_limit)
+                    act = K.swiglu_clamped(
+                        h[:, :moesh], h[:, moesh:], spec.swiglu_limit
+                    )
                     y = (
                         jnp.dot(act.astype(BF16), r8d[sl], preferred_element_type=F32)
                         * edsr[sl]

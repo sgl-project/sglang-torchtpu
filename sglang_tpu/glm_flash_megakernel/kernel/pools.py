@@ -51,7 +51,9 @@ def nope_page(pool, page, page_size):
 
 def record_page(pool, page, records_per_page, record_bytes):
     """HBM ref of one page's pooled records as `u32 [records/4, record_bytes]`."""
-    return pool.bitcast(U32).at[page].reshape(records_per_page // WORD_BYTES, record_bytes)
+    return (
+        pool.bitcast(U32).at[page].reshape(records_per_page // WORD_BYTES, record_bytes)
+    )
 
 
 def unpack_nope(words, k_scale_dtype=BF16):
