@@ -632,7 +632,7 @@ class TestMeasuredTiles(CustomTestCase):
         total_q_tokens,
         sliding_window=None,
         has_attention_sink=False,
-        transposed=False,
+        **serve_flags,
     ):
         import jax.numpy as jnp
 
@@ -657,16 +657,18 @@ class TestMeasuredTiles(CustomTestCase):
                 dtype_out=jnp.bfloat16,
                 page_size=256,
                 kv_layout=kv_layout,
-                transposed=transposed,
-                no_max=transposed,
-                skip_full_tile_mask=transposed,
-                skip_pad_q=transposed,
                 skip_pad_q_group=256,
+                **serve_flags,
             )
             decode, prefill = wrapper.calculate_block_sizes(model, serve, 1 << 26)
         for blocks in (decode, prefill):
             self.assertGreaterEqual(blocks.n_buffer, 2)
         return decode, prefill
+
+    # The RPA flags agentic.py sets for Muse.
+    MUSE_FLAGS = dict(
+        exp2_softmax=True, ones_v=True, transposed=True, skip_full_tile_mask=True
+    )
 
     @staticmethod
     def _tile(blocks):
@@ -694,7 +696,7 @@ class TestMeasuredTiles(CustomTestCase):
             num_seqs=4,
             pages_per_seq=123,
             total_q_tokens=4352,
-            transposed=True,
+            **self.MUSE_FLAGS,
         )
         decode, prefill = self._block_sizes(**kw)
         self.assertEqual(self._tile(prefill), (128, 16, 512, 1, 3))
@@ -729,7 +731,8 @@ class TestMeasuredTiles(CustomTestCase):
 
     def test_single_row_bf16_call(self):
         """16q/8kv bf16, one sequence of 9 pages (the batched-RPA kernel test):
-        the 768 square mixed tile took 65.4 MiB; 512 x 512 takes 39.5 MiB."""
+        the 768 square mixed tile took 65.4 MiB; 512 x 512 takes 39.5 MiB. With
+        8 query tokens the q block stays at the 256 MXU width."""
         import jax.numpy as jnp
 
         from sglang_tpu.attention.pallas.batched_rpa import configs
@@ -744,8 +747,43 @@ class TestMeasuredTiles(CustomTestCase):
             pages_per_seq=9,
             total_q_tokens=8,
         )
-        self.assertEqual(self._tile(prefill), (512, 64, 512, 1, 3))
+        self.assertEqual(self._tile(prefill), (256, 64, 256, 1, 3))
         self.assertEqual(self._tile(decode), (1, 1, 512, 8, 3))
+        _, long_chunk = self._block_sizes(
+            num_q_heads=16,
+            num_kv_heads=8,
+            head_dim=128,
+            dtype_kv=jnp.bfloat16,
+            kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+            num_seqs=1,
+            pages_per_seq=9,
+            total_q_tokens=4352,
+        )
+        self.assertEqual(self._tile(long_chunk), (512, 64, 512, 1, 3))
+
+    def test_muse_tp8_target_verify(self):
+        """16q/2kv fp8 transposed without no_max, 64 query tokens (Muse TP8
+        target verify): the old 1536 square tile took 86.2 MiB, its running max
+        spilling; 64 tokens keep the q block at 256 (11.2 MiB with 512 keys). A
+        4352-token chunk grows to 1024 x 1024."""
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs
+
+        kw = dict(
+            num_q_heads=16,
+            num_kv_heads=2,
+            head_dim=64,
+            dtype_kv=jnp.float8_e4m3fn,
+            kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+            num_seqs=8,
+            pages_per_seq=130,
+            **self.MUSE_FLAGS,
+        )
+        _, verify = self._block_sizes(total_q_tokens=64, **kw)
+        self.assertEqual(self._tile(verify), (256, 32, 512, 1, 3))
+        _, chunk = self._block_sizes(total_q_tokens=4352, **kw)
+        self.assertEqual(self._tile(chunk), (1024, 32, 1024, 1, 3))
 
     def test_packed_fp8_decode_counts_the_unpacked_k_copy(self):
         """8q/1kv fp8 head-along-sublane decode unpacks K to bf16: 4864 keys over 8

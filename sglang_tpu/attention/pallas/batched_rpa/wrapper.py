@@ -298,6 +298,11 @@ def _spill_bytes(cfgs: configs.RpaConfigs) -> int:
             cfgs.batch_size * num_kv_heads * cfgs.bkv_sz * cfgs.aligned_q_head_dim * 2
         )
         spill = 0.48 * rows_f32 + 1.17 * keys_bf16 + 0.043 * scores_f32
+        lanes = cfgs.bq_c_sz * cfgs.aligned_num_q_heads_per_kv_head
+        if not cfgs.serve.no_max and lanes > pltpu.get_tpu_info().num_lanes:
+            # The running max over a compute block wider than a vreg spills its
+            # bf16 scores: about half an f32 copy of a KV head's q-block scores.
+            spill += 0.48 * scores_f32 / num_kv_heads
         if cfgs.model.sliding_window is not None:
             # The window mask: about one f32 copy of a KV head's q-block scores.
             spill += 0.91 * scores_f32 / num_kv_heads
@@ -444,8 +449,14 @@ def calculate_block_sizes(
         # entire kv tile can be masked out for some query tokens. Similarly, if
         # bkv size is larger than bq size, entire query tile can be masked out for
         # some kv tokens.
-        while (bq_stride or bkv_stride) and fits(
-            batch_size, n_buffer, bq_sz + bq_stride, bkv_sz + bkv_stride
+        # A q block past the call's padded query tokens only adds masked rows.
+        max_bq_sz = max(
+            mxu_column_size, utils.align_to(serve_cfgs.total_q_tokens, mxu_column_size)
+        )
+        while (
+            (bq_stride or bkv_stride)
+            and bq_sz + bq_stride <= max_bq_sz
+            and fits(batch_size, n_buffer, bq_sz + bq_stride, bkv_sz + bkv_stride)
         ):
             bkv_sz += bkv_stride
             bq_sz += bq_stride
