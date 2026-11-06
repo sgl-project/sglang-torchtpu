@@ -2902,7 +2902,13 @@ def gmm_v2_fused_rs(
                 **{
                     k: v
                     for k, v in kernel_kwargs.items()
-                    if k not in ("pair_exchange", "pair_relay")
+                    if k
+                    not in (
+                        "pair_exchange",
+                        "pair_relay",
+                        "pair_meta_base",
+                        "pair_meta_stride",
+                    )
                 },
             ),
             out_shape=(out_buf_init, out_scale_init),
