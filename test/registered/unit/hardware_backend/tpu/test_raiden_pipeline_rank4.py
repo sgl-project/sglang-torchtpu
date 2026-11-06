@@ -448,6 +448,77 @@ def test_producer_missing_heads_is_refused():
         )
 
 
+def _sal_swa_pool(*, heads: int, swa_ids, full_ids, swa_pages: int):
+    with patch("sglang_tpu.kv_pool._seq_along_lane_head_dim", _head_dim_without_tpu):
+        return SWAKVPool(
+            size=6 * PAGE,
+            size_swa=swa_pages * PAGE,
+            page_size=PAGE,
+            dtype=torch.float8_e4m3fn,
+            head_num=heads,
+            head_dim=HEAD_DIM,
+            swa_attention_layer_ids=swa_ids,
+            full_attention_layer_ids=full_ids,
+            device="cpu",
+            token_to_kv_pool_class=TpuSeqAlongLaneKVPool,
+        )
+
+
+def test_windowed_sal_draft_window_is_sliced_by_draft_heads():
+    """An all-SWA 8-head draft beside a 16-head SAL target (Muse Spark + DFlash2):
+    each TP8 rank gets its one draft head of every window page, byte for byte."""
+    dst_tp, draft_heads, draft_layers = 8, 8, 2
+    target = _sal_swa_pool(heads=HEADS, swa_ids=[0], full_ids=[1], swa_pages=3)
+    draft = _sal_swa_pool(
+        heads=draft_heads,
+        swa_ids=list(range(draft_layers)),
+        full_ids=[],
+        swa_pages=3,
+    )
+    with patch.object(pd_hidden_pool, "_pd_hidden_pool", None):
+        groups = raiden_common.get_raiden_kv_caches(target, draft_pool=draft)
+    assert groups.seq_along_lane
+    assert (groups.num_draft_full, groups.num_draft_swa) == (0, draft_layers)
+    assert groups.draft_swa_kv_head_num == draft_heads
+    pools = pl.pool_manifest(groups)
+    assert [p["tag"] for p in pools] == [
+        "fa.l1",
+        "swa.l0",
+        "draft.swa.l0",
+        "draft.swa.l1",
+    ]
+    _, swa_pools = ps.split_manifest(pools)
+    for index, tensor in enumerate(groups.swa):
+        _randomize(tensor, seed=index)
+    window_blocks, dst_blocks = [2, 1], [1, 0]
+    spans = pp_common.part_spans(
+        swa_pools,
+        groups.swa,
+        [5, 4],
+        window_blocks,
+        dst_tp,
+        HEADS,
+        seq_along_lane=True,
+        draft_total_kv_heads=groups.draft_kv_head_num,
+        draft_swa_total_kv_heads=groups.draft_swa_kv_head_num,
+        with_swa=True,
+    )
+    assert [s.tag for s in spans] == ["swa.l0", "draft.swa.l0", "draft.swa.l1"]
+    for pool_spans, src in zip(spans[1:], groups.swa[1:]):
+        assert pool_spans.block_ids == window_blocks
+        consumers = [
+            _sal_swa_pool(
+                heads=1, swa_ids=[0], full_ids=[], swa_pages=3
+            ).swa_kv_pool.get_fused_kv_buffer(0)
+            for _ in range(dst_tp)
+        ]
+        _land(pool_spans, src, consumers, dst_blocks)
+        for rank, consumer in enumerate(consumers):
+            for s, d in zip(window_blocks, dst_blocks):
+                want = src[s, 2 * rank : 2 * rank + 2].view(torch.uint8)
+                assert torch.equal(consumer[d].view(torch.uint8), want), (rank, s)
+
+
 def test_draft_pool_in_another_layout_is_refused():
     target = _pool(TpuSeqAlongLaneKVPool, heads=HEADS, dtype=torch.bfloat16, pages=2)
     draft = _pool(TpuFusedMHATokenToKVPool, heads=8, dtype=torch.bfloat16, pages=2)
