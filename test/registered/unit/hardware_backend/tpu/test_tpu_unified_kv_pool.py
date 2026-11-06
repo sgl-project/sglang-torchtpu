@@ -12,6 +12,12 @@ from unittest.mock import MagicMock, call, patch
 
 import torch
 
+from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.disaggregation.utils import (
+    get_kv_transfer_buf_infos,
+    setup_state_kv_args,
+)
 from sglang.srt.managers.cache_controller import BatchDoneCounter
 from sglang.srt.mem_cache import hicache_auto_size as sizing
 from sglang.srt.mem_cache.allocator import swa
@@ -819,11 +825,59 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
         ):
             self.assertTrue(unified_kv_pool_enabled(base))
 
+        for mode in ("prefill", "decode"):
+            with self._cfg_patches(
+                disaggregation_mode=mode,
+                disaggregation_transfer_backend="raiden",
+            ):
+                self.assertTrue(unified_kv_pool_enabled(base))
+            with self._cfg_patches(
+                disaggregation_mode=mode,
+                disaggregation_transfer_backend="raiden",
+                enable_hierarchical_cache=True,
+                hicache_io_backend="raiden",
+            ):
+                self.assertTrue(unified_kv_pool_enabled(base))
+
+        with (
+            self._cfg_patches(
+                disaggregation_mode="prefill",
+                disaggregation_transfer_backend="raiden",
+            ),
+            tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.override(True),
+        ):
+            with self.assertRaisesRegex(ValueError, "--enable-unified-memory"):
+                unified_kv_pool_enabled(base)
+
         for ctx_overrides in (
             dict(pp_size=2),
             dict(dcp_size=2, tp_size=2),
             dict(attn_cp_size=2, tp_size=2),
             dict(disaggregation_mode="prefill"),
+            dict(
+                disaggregation_mode="decode",
+                disaggregation_transfer_backend="mooncake",
+            ),
+            dict(
+                disaggregation_mode="prefill",
+                disaggregation_transfer_backend="raiden",
+                enable_pd_role_switch=True,
+            ),
+            dict(
+                disaggregation_mode="decode",
+                disaggregation_transfer_backend="raiden",
+                disaggregation_decode_enable_offload_kvcache=True,
+            ),
+            dict(
+                disaggregation_mode="decode",
+                disaggregation_transfer_backend="raiden",
+                disaggregation_decode_retraction_backup="host_pool",
+            ),
+            dict(
+                disaggregation_mode="decode",
+                disaggregation_transfer_backend="raiden",
+                disaggregation_decode_host_receive_threshold=0.5,
+            ),
             dict(enable_hierarchical_cache=True, hicache_io_backend="kernel"),
             dict(enable_hierarchical_cache=True, hicache_io_backend="torch_tpu"),
             dict(
@@ -1786,6 +1840,61 @@ class TestTpuUnifiedDMAHiCache(unittest.TestCase):
         finally:
             hybrid_pool_assembler._STRATEGIES[:] = saved_strategies
             sizing._SIZEABLE_POOLS = saved_sizeable
+
+    def test_pd_decode_prealloc_buf_infos_and_expand_swa_pages(self):
+        pool = TpuUnifiedSWAKVPool(
+            size=128,
+            page_size=4,
+            dtype=torch.bfloat16,
+            full=AttnLayerSpec(head_num=2, head_dim=128, layer_ids=[0, 3]),
+            swa=AttnLayerSpec(head_num=2, head_dim=128, layer_ids=[1, 2, 4, 5, 6]),
+            device="cpu",
+        )
+        req_pool = ReqToTokenPool(
+            size=4, max_context_len=128, device="cpu", enable_memory_saver=False
+        )
+        alloc = TpuUnifiedSWATokenToKVPoolAllocator(
+            size=128,
+            page_size=4,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=pool,
+            need_sort=False,
+            req_to_token_pool=req_pool,
+        )
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.token_to_kv_pool = pool
+        queue.token_to_kv_pool_allocator = alloc
+        self.assertTrue(queue._uses_swa_tail_prealloc())
+
+        kv_args = KVArgs()
+        (
+            kv_args.kv_data_ptrs,
+            kv_args.kv_data_lens,
+            kv_args.kv_item_lens,
+        ) = get_kv_transfer_buf_infos(pool)
+        setup_state_kv_args(kv_args, pool)
+        self.assertEqual(
+            (kv_args.kv_data_ptrs, kv_args.kv_data_lens, kv_args.kv_item_lens),
+            pool.kv_pool.get_contiguous_buf_infos(),
+        )
+        self.assertEqual(kv_args.state_types, [StateType.SWA])
+        self.assertEqual(kv_args.state_item_lens, [[]])
+
+        self.assertEqual(pool.expand_swa_pages([]), [])
+        swa_toks = alloc.swa_attn_allocator.alloc(8)
+        swa_pages = (swa_toks[::4] // 4).tolist()
+        self.assertEqual(
+            pool.expand_swa_pages(swa_pages),
+            [
+                swa_pages[0],
+                int(pool.swa_group_pages[0, swa_pages[0]]),
+                int(pool.swa_group_pages[1, swa_pages[0]]),
+                swa_pages[1],
+                int(pool.swa_group_pages[0, swa_pages[1]]),
+                int(pool.swa_group_pages[1, swa_pages[1]]),
+            ],
+        )
 
 
 if __name__ == "__main__":

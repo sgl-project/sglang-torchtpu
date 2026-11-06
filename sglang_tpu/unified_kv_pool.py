@@ -179,7 +179,9 @@ def _unsupported_reason(kvc) -> Optional[str]:
     or ``None`` when supported."""
     parallel = get_parallel()
     memory = get_memory()
-    disagg_mode = get_disagg().disaggregation_mode
+    disagg = get_disagg()
+    disagg_mode = disagg.disaggregation_mode
+    disagg_backend = getattr(disagg, "disaggregation_transfer_backend", None)
     pool_cls = kvc._tpu_mha_pool_class()
     checks = (
         (not kvc.is_hybrid_swa, "requires a hybrid SWA model."),
@@ -211,8 +213,34 @@ def _unsupported_reason(kvc) -> Optional[str]:
             "does not support decode context parallelism.",
         ),
         (
-            disagg_mode != "null",
-            f"does not support PD disaggregation (disaggregation_mode={disagg_mode!r}).",
+            disagg_mode not in ("null", "prefill", "decode"),
+            f"does not support disaggregation_mode={disagg_mode!r}.",
+        ),
+        (
+            disagg_mode != "null" and disagg_backend != "raiden",
+            "with PD disaggregation requires --disaggregation-transfer-backend raiden, "
+            f"got {disagg_backend!r}.",
+        ),
+        (
+            getattr(disagg, "enable_pd_role_switch", False),
+            "does not support --enable-pd-role-switch.",
+        ),
+        (
+            getattr(disagg, "disaggregation_decode_enable_offload_kvcache", False),
+            "does not support --disaggregation-decode-enable-offload-kvcache.",
+        ),
+        (
+            getattr(disagg, "disaggregation_decode_retraction_backup", None)
+            == "host_pool",
+            "does not support --disaggregation-decode-retraction-backup host_pool.",
+        ),
+        (
+            getattr(disagg, "disaggregation_decode_host_receive_threshold", 0.0) > 0,
+            "does not support --disaggregation-decode-host-receive-threshold > 0.",
+        ),
+        (
+            disagg_mode != "null" and tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get(),
+            "does not support SGLANG_RAIDEN_PIPELINE_TRANSFER.",
         ),
         (
             memory.enable_hierarchical_cache
@@ -439,8 +467,22 @@ class TpuUnifiedSWAKVPool(BaseSWAKVPool):
     def get_kv_size_bytes(self) -> Tuple[int, int]:
         return self.kv_pool.get_kv_size_bytes()
 
+    def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        return self.kv_pool.get_contiguous_buf_infos()
+
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         return [], [], []
+
+    def expand_swa_pages(self, page_ids: Sequence[int]) -> List[int]:
+        """Expand logical SWA page IDs into ``[token_page, group_slot]`` physical page IDs."""
+        if not page_ids:
+            return []
+        if self.swa_group_pages.shape[0] == 0:
+            return [int(x) for x in page_ids]
+        base = torch.as_tensor(page_ids, dtype=torch.long)
+        companions = self.swa_group_pages[:, base].to(torch.long)
+        expanded = torch.cat([base.unsqueeze(0), companions], dim=0)
+        return expanded.T.reshape(-1).tolist()
 
     def _map_swa_group_indices(
         self, group: int, swa_indices_cpu: torch.Tensor
