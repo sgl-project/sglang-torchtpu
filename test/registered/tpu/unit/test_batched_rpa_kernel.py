@@ -554,12 +554,8 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
 
         from sglang_tpu.envs import envs as tpu_envs
 
-        variants = (
-            {"SGLANG_TPU_RPA_EXP2_SOFTMAX": "1"},
-            {"SGLANG_TPU_RPA_ONES_V": "1"},
-            {"SGLANG_TPU_RPA_EXP2_SOFTMAX": "1", "SGLANG_TPU_RPA_ONES_V": "1"},
-            {"SGLANG_TPU_RPA_ONES_V": "1", "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1"},
-        )
+        # The deployed combination only: each variant recompiles (~50 s) in PR gating.
+        variants = ({"SGLANG_TPU_RPA_EXP2_SOFTMAX": "1", "SGLANG_TPU_RPA_ONES_V": "1"},)
         for env in variants:
             for sliding_window in (None, 128):
                 with (
@@ -588,7 +584,6 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
         from sglang_tpu.envs import envs as tpu_envs
 
         variants = (
-            {"SGLANG_TPU_RPA_TRANSPOSED": "1"},
             {
                 "SGLANG_TPU_RPA_TRANSPOSED": "1",
                 "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1",

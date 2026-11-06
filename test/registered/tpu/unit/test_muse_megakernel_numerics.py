@@ -18,7 +18,7 @@ from pathlib import Path
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_tpu_ci(est_time=420, suite="stage-a-test-tpu-unit", chips=4)
+register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit", chips=4)
 
 
 class TestMuseMegakernelNumerics(CustomTestCase):
@@ -29,7 +29,10 @@ class TestMuseMegakernelNumerics(CustomTestCase):
             (
                 "eval $(python3 -m torch.tpu.distributed)",
                 "export TORCH_TPU_TOPOLOGY TORCH_TPU_SLICEBUILDER_ADDRESSES WORLD_SIZE",
-                f'torchrun --nproc_per_node="$WORLD_SIZE" {shlex.quote(str(worker))}',
+                f'torchrun --nproc_per_node="$WORLD_SIZE" {shlex.quote(str(worker))} '
+                # PR gating: fused verify, the deployed fp8 SAL pool and the KV ring past
+                # 32k tokens; the worker's default runs every case.
+                "--cases fused_c2q8_s salfp8_c2q8_s salfp8_c2q8_xl",
             )
         )
         env = os.environ.copy()
