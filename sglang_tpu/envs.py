@@ -310,7 +310,7 @@ class TpuEnvs:
     SGLANG_RAIDEN_PUSH_WORKERS = EnvInt(1)
 
     # Host staging budget per node, split across local ranks.
-    SGLANG_RAIDEN_HOST_POOL_GB = EnvFloat(128.0)
+    SGLANG_RAIDEN_HOST_POOL_GB = EnvFloat(64.0)
     # Host layer buffers across full-attention and SWA engines, split by layer
     # count with at least one each. 0 keeps full mirrors.
     # More buffers, or 0, make each slot larger. Raise SGLANG_RAIDEN_HOST_POOL_GB
