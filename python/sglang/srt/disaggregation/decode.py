@@ -3380,6 +3380,17 @@ class SchedulerDisaggregationDecodeMixin:
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_decode_queue(self: Scheduler):
+        # A collective or native poll can block before a model batch exists.
+        # Advance on entry so a long idle period cannot look like a stalled poll.
+        self._decode_queue_watchdog_counter += 1
+        self._decode_queue_watchdog_active = True
+        try:
+            self._process_decode_queue()
+        finally:
+            self._decode_queue_watchdog_counter += 1
+            self._decode_queue_watchdog_active = False
+
+    def _process_decode_queue(self: Scheduler):
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 
