@@ -11,9 +11,10 @@ silently regress:
   * _patch_support_triton_for_tpu (else the Triton path crashes on TPU
     with "0 active drivers");
   * paged-decode slot padding stays local to pallas_tpu_flash and uses the
-    allocator's reserved physical KV slot 0;
-  * Both Pallas backend names appear in the attention registry (else
-    "pallas_tpu_flash" / "pallas_tpu_rpa_v3" are unknown).
+    allocator's reserved physical KV slot 0.
+
+Registration of both Pallas backend names is covered by
+test_pallas_rpa_v3_dispatch.py.
 
 The numeric tests need TPU + torch_tpu and are skipped otherwise. The
 helper / patch tests run anywhere.
@@ -177,20 +178,6 @@ class TestPallasFlashTokenSlotPadding(CustomTestCase):
 
         slots = torch.tensor([[11, 12, 13]], dtype=torch.int32)
         self.assertTrue(torch.equal(_pad_token_slots(slots, 2), slots[:, :2]))
-
-
-class TestPallasRegistration(CustomTestCase):
-    """Both Pallas backend names must be registered in the attention
-    registry at module import time (same convention as ascend / intel_xpu)."""
-
-    def test_registered(self):
-        from sglang.srt.layers.attention.attention_registry import (
-            ATTENTION_BACKENDS,
-        )
-
-        for name in ("pallas_tpu_flash", "pallas_tpu_rpa_v3"):
-            self.assertIn(name, ATTENTION_BACKENDS)
-            self.assertTrue(callable(ATTENTION_BACKENDS[name]))
 
 
 @unittest.skipIf(_skip_if_no_tpu(), "torch_tpu not available")

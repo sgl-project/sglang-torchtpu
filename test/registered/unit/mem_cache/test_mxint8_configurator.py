@@ -77,6 +77,7 @@ class TestMXINT8Configurator(CustomTestCase):
         self.platform_pool = Mock(name="platform_pool")
         self.platform = SimpleNamespace(
             get_mha_kv_pool_cls=Mock(return_value=self.platform_pool),
+            unified_kv_pool_enabled=lambda *_: False,
             build_swa_kv_pool=lambda *_, **__: None,
             is_cpu=lambda: False,
         )
@@ -269,6 +270,133 @@ class TestMXINT8Configurator(CustomTestCase):
             self.assertEqual(backend_pool.call_args.kwargs["layer_num"], 1)
             self.platform.get_mha_kv_pool_cls.assert_not_called()
         self._assert_preflight_error()
+
+    def test_unified_kv_pool_uses_blocked_mxint8_layout_and_forwards_pool_kwargs(
+        self,
+    ):
+        from sglang.srt.mem_cache.allocator import swa
+        from sglang_tpu import unified_kv_pool
+        from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
+        from sglang_tpu.unified_kv_pool import (
+            AttnLayerSpec,
+            TpuUnifiedSWAKVPool,
+            TpuUnifiedSWATokenToKVPoolAllocator,
+        )
+
+        class _StubMXINT8Pool(TpuFusedMHATokenToKVPool):
+            pass
+
+        unified_pool_cls = Mock(name="unified_pool_cls")
+        tpu_platform = TpuSRTPlatform()
+        self.platform.unified_kv_pool_enabled = Mock(
+            side_effect=tpu_platform.unified_kv_pool_enabled
+        )
+        self.platform.build_swa_kv_pool = tpu_platform.build_swa_kv_pool
+
+        for ps, heads, dim in (
+            (128, 1, 64),
+            (256, 4, 128),
+            (512, 1, 64),
+        ):
+            with (
+                self.subTest(page_size=ps, heads=heads, dim=dim),
+                get_context().override_server_args(
+                    page_size=ps,
+                    tp_size=1,
+                    pp_size=1,
+                    dcp_size=1,
+                    attn_cp_size=1,
+                    disaggregation_mode="null",
+                    enable_hierarchical_cache=False,
+                    enable_unified_cache_external_linker=False,
+                    enable_unified_memory=False,
+                ),
+                tpu_envs.SGLANG_TPU_UNIFIED_KV_POOL.override(True),
+                get_parallel().override(
+                    attn_tp_size=1, attn_dcp_size=1, dcp_enabled=False
+                ),
+                patch.object(swa, "_is_tpu", True),
+                patch.object(
+                    swa,
+                    "TpuPagedTokenToKVPoolAllocator",
+                    TpuPagedTokenToKVPoolAllocator,
+                    create=True,
+                ),
+                patch.object(self.configurator, "_validate_mxint8", return_value=None),
+                patch.object(
+                    self.configurator, "_tpu_mha_pool_class", lambda _: _StubMXINT8Pool
+                ),
+            ):
+                kvc = self._make(
+                    is_hybrid_swa=True,
+                    page_size=ps,
+                    sliding_window_size=ps,
+                    spec_algorithm=SpeculativeAlgorithm.from_string(None),
+                    model_config=SimpleNamespace(
+                        has_asymmetric_kv=False,
+                        get_num_kv_heads=lambda *_, h=heads: h,
+                        get_swa_num_kv_heads=lambda *_, h=heads: h,
+                        head_dim=dim,
+                        v_head_dim=dim,
+                        swa_head_dim=dim,
+                        swa_v_head_dim=dim,
+                        hf_text_config=SimpleNamespace(
+                            num_key_value_heads=heads, swa_num_key_value_heads=heads
+                        ),
+                        swa_attention_layer_ids=[1],
+                        full_attention_layer_ids=[0],
+                        hf_config=SimpleNamespace(),
+                    ),
+                )
+                self.assertEqual(kvc.kv_full_layout, "blocked")
+                self.assertEqual(kvc.kv_swa_layout, "blocked")
+                with patch.object(
+                    unified_kv_pool, "TpuUnifiedSWAKVPool", unified_pool_cls
+                ):
+                    kvc._build_tpu_swa_kv_pool(
+                        full_max_total_num_tokens=4096, swa_max_total_num_tokens=4096
+                    )
+                call_kwargs = unified_pool_cls.call_args.kwargs
+                self.assertIs(call_kwargs["token_to_kv_pool_class"], _StubMXINT8Pool)
+                self.assertEqual(
+                    call_kwargs["pool_kwargs"],
+                    {
+                        "kv_cache_dtype_str": "mxint8",
+                        "kv_group_size": 16,
+                        "kv_layout": "blocked",
+                    },
+                )
+                real_pool = TpuUnifiedSWAKVPool(
+                    size=8 * ps,
+                    page_size=ps,
+                    dtype=torch.bfloat16,
+                    full=AttnLayerSpec(head_num=heads, head_dim=dim, layer_ids=[0]),
+                    swa=AttnLayerSpec(head_num=heads, head_dim=dim, layer_ids=[1]),
+                    device="cpu",
+                )
+                real_alloc = TpuUnifiedSWATokenToKVPoolAllocator(
+                    size=8 * ps,
+                    page_size=ps,
+                    dtype=torch.bfloat16,
+                    device="cpu",
+                    kvcache=real_pool,
+                    need_sort=False,
+                )
+                self.platform.unified_kv_pool_enabled.reset_mock()
+                self.assertEqual(
+                    kvc.hybrid_swa_token_capacity(
+                        allocator=real_alloc,
+                        full_capacity=8 * ps,
+                        swa_capacity=8 * ps,
+                    ),
+                    8 * ps - 2 * ps,
+                )
+                # hybrid_swa_token_capacity computes directly off allocator without
+                # re-running platform unified_kv_pool_enabled validation.
+                self.platform.unified_kv_pool_enabled.assert_not_called()
 
 
 if __name__ == "__main__":
