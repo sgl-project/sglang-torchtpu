@@ -333,6 +333,9 @@ class CompiledFunction:
 
     def warmup_async(self, *args: Any, **kwargs: Any) -> PendingCall:
         queue = current_warmup_queue()
+        if queue is not None and queue.verify and not self._spmd_safe:
+            # Verification compares shared model graphs and never runs these helpers.
+            return PendingCall(lambda: None)
         if self._spmd_safe and queue is not None and queue.spmd_compiler is not None:
             # Snapshot reused containers while retaining their local tensor buffers.
             args, kwargs = tree_util.tree_map(lambda value: value, (args, kwargs))
@@ -343,8 +346,12 @@ class CompiledFunction:
         self, *args: Any, async_compile: bool = False, **kwargs: Any
     ) -> PendingCall:
         """Compile without executing; shared input binding completes at queue join."""
-        queue = current_warmup_queue() if self._spmd_safe else None
-        shared = queue is not None and queue.spmd_compiler is not None
+        queue = current_warmup_queue()
+        if queue is not None and queue.verify and not self._spmd_safe:
+            return PendingCall(lambda: None)
+        shared = (
+            self._spmd_safe and queue is not None and queue.spmd_compiler is not None
+        )
         # Shared compilation validates real input layouts on every rank.
         if async_compile and not shared:
             tensors = [

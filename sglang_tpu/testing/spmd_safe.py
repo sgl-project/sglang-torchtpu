@@ -38,6 +38,7 @@ def verify_startup(
     root.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix="spmd-", dir=root))
     errors = []
+    terminated_after_verification = False
     with subprocess.Popen(
         command,
         env={
@@ -48,30 +49,53 @@ def verify_startup(
         start_new_session=True,
     ) as process:
         try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            errors.append(f"Verification startup exceeded {timeout}s")
+            deadline = time.monotonic() + timeout
+            while len(list(directory.glob("worker-*.json"))) < local_world_size:
+                if process.poll() is not None:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    errors.append(f"Verification startup exceeded {timeout}s")
+                    break
+                try:
+                    process.wait(timeout=min(0.1, remaining))
+                except subprocess.TimeoutExpired:
+                    continue
+
+            results = [
+                json.loads(path.read_text()) for path in directory.glob("worker-*.json")
+            ]
+            errors.extend(
+                dict.fromkeys(error for item in results for error in item["errors"])
+            )
+            ranks = sorted(item["rank"] for item in results)
+            if not len(ranks) == len(set(ranks)) == local_world_size or any(
+                not 0 <= rank < world_size for rank in ranks
+            ):
+                errors.append(
+                    f"Expected {local_world_size} distinct local ranks, got {ranks}"
+                )
+            keys = results[0]["keys"] if results else []
+            if not keys or any(
+                not item["passed"]
+                or item["world_size"] != world_size
+                or item["keys"] != keys
+                for item in results
+            ):
+                errors.append(
+                    "SPMD verification failed or reported inconsistent results"
+                )
+            terminated_after_verification = (
+                len(results) == local_world_size and process.poll() is None
+            )
         finally:
             # Include descendants when a recipe uses a shell or launcher process.
             with suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)
     # A normal serving launcher may exit 1 on EOF when verification workers stop
     # before readiness. Only complete successful worker records admit that exit.
-    if process.returncode not in (0, 1):
+    if not terminated_after_verification and process.returncode not in (0, 1):
         errors.append(f"Server launcher exited with code {process.returncode}")
-    results = [json.loads(path.read_text()) for path in directory.glob("worker-*.json")]
-    errors.extend(dict.fromkeys(error for item in results for error in item["errors"]))
-    ranks = sorted(item["rank"] for item in results)
-    if not len(ranks) == len(set(ranks)) == local_world_size or any(
-        not 0 <= rank < world_size for rank in ranks
-    ):
-        errors.append(f"Expected {local_world_size} distinct local ranks, got {ranks}")
-    keys = results[0]["keys"] if results else []
-    if not keys or any(
-        not item["passed"] or item["world_size"] != world_size or item["keys"] != keys
-        for item in results
-    ):
-        errors.append("SPMD verification failed or reported inconsistent results")
     result = {
         "passed": not errors,
         "ranks": ranks,
@@ -80,6 +104,7 @@ def verify_startup(
         "artifacts": str(directory),
         "errors": errors,
         "launcher_exit_code": process.returncode,
+        "terminated_after_verification": terminated_after_verification,
     }
     payload = json.dumps(result, sort_keys=True, separators=(",", ":"))
     # Publish the completion marker only after all its contents are visible.

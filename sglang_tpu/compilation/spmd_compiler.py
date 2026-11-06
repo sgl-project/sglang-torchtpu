@@ -353,11 +353,12 @@ class SPMDCompiler:
             "layout_differences": layout_differences,
             "errors": errors,
         }
-        (self.directory / f"worker-{self.global_rank}.json").write_text(
-            canonical(result) + "\n"
-        )
-        # Every worker has retained its evidence before the parent observes exits.
+        marker = self.directory / f"worker-{self.global_rank}.json.tmp"
+        marker.write_text(canonical(result) + "\n")
+        # Parents may stop the launcher as soon as all local results are visible.
+        # Retain every rank's diagnostics and finish collectives before publishing.
         dist.barrier(group=self._verification_group or self.group)
+        marker.replace(self.directory / f"worker-{self.global_rank}.json")
         if self.rank == 0:
             logger.info("SPMD_VERIFICATION_GRAPHS %s", canonical(result))
         # Verification never executes pending calls or announces server readiness.
