@@ -290,18 +290,21 @@ def tpu_actor_runtime_env(server_args) -> dict:
     there is nothing to inject, so actors fall back to their own pod env.
     """
     env_vars = _forwarded_driver_env()
+    from sglang.srt.arg_groups.model_override_base import resolving_view
+
+    cfg = resolving_view(server_args)
     # Computed slice env overrides any forwarded/inherited copy. Inject an empty
     # string too (single-host on a multi-host slice), so the actor overrides the
     # slice-wide value inherited from `ray start` rather than falling back to it --
     # only None (GPU / discovery failed) means "don't inject, use the pod env".
-    if server_args.tpu_worker_hostnames is not None:
-        env_vars["TPU_WORKER_HOSTNAMES"] = server_args.tpu_worker_hostnames
-    if server_args.torch_tpu_slicebuilder_addresses:
+    if cfg.tpu_worker_hostnames is not None:
+        env_vars["TPU_WORKER_HOSTNAMES"] = cfg.tpu_worker_hostnames
+    if cfg.torch_tpu_slicebuilder_addresses:
         env_vars["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = (
-            server_args.torch_tpu_slicebuilder_addresses
+            cfg.torch_tpu_slicebuilder_addresses
         )
-    if server_args.torch_tpu_topology:
-        env_vars["TORCH_TPU_TOPOLOGY"] = server_args.torch_tpu_topology
+    if cfg.torch_tpu_topology:
+        env_vars["TORCH_TPU_TOPOLOGY"] = cfg.torch_tpu_topology
     if not env_vars:
         return {}
     return {"runtime_env": {"env_vars": env_vars}}
