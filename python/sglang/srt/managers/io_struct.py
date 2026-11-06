@@ -901,13 +901,25 @@ class GenerateReqInput:
         elif isinstance(self.bootstrap_port, list):
             self.bootstrap_port = self.bootstrap_port * self.parallel_sample_num
 
-        # Normalize bootstrap_room
+        # Normalize bootstrap_room: one room per expanded request, since PD pairs
+        # the prefill and decode copies of a sample by room.
         if self.bootstrap_room is None:
             self.bootstrap_room = [None] * num
         elif not isinstance(self.bootstrap_room, list):
             self.bootstrap_room = [self.bootstrap_room + i for i in range(num)]
-        elif isinstance(self.bootstrap_room, list):
-            self.bootstrap_room = self.bootstrap_room * self.parallel_sample_num
+        elif len(self.bootstrap_room) == num:
+            pass
+        elif len(self.bootstrap_room) == self.batch_size:
+            self.bootstrap_room = [
+                room if room is None else room + j
+                for j in range(self.parallel_sample_num)
+                for room in self.bootstrap_room
+            ]
+        else:
+            raise ValueError(
+                f"bootstrap_room has {len(self.bootstrap_room)} entries; expected "
+                f"one per prompt ({self.batch_size}) or one per sample ({num})."
+            )
 
         # Normalize bootstrap_pair_key
         if self.bootstrap_pair_key is None:
