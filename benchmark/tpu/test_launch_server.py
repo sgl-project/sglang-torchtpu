@@ -214,6 +214,7 @@ class TestRuntimeEnvironment(unittest.TestCase):
             self.assertNotIn("SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY", env)
         self.assertEqual(prefill["runtime_env"]["SGLANG_TPU_MUSE_PREFILL_SP"], "0")
         self.assertIsNone(prefill["runtime_env"]["SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS"])
+        self.assertEqual(prefill["server_args"]["max_total_tokens"], 1048576)
         self.assertEqual(decode["runtime_env"]["SGLANG_RAIDEN_PIPELINE_TRANSFER"], "1")
         # HiCache on a decode needs its radix tree; without it the decode refuses to start.
         self.assertTrue(

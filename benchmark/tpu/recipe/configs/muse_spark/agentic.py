@@ -261,6 +261,9 @@ _ROLES: dict[str, dict[str, dict]] = {
             "pp_size": 8,
             # Fused-RS needs TP/EP > 1; auto picks stock Pallas gmm_v2 at PP8/EP1.
             "moe_runner_backend": "auto",
+            # Covers the ~990K-token AgentX prompts and leaves the last stage headroom for
+            # the PD hidden pool, which is allocated after the KV budget is taken.
+            "max_total_tokens": 1048576,
             "disable_overlap_schedule": True,
         },
         "runtime_env": {
