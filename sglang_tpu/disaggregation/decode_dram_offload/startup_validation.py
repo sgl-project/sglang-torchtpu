@@ -1,10 +1,10 @@
 """Refuse settings the KV offload to decode DRAM does not support.
 
-The offload moves full-attention KV between the two roles' HiCache host
-pools, rank to rank. Anything it cannot
-move or agree on is refused here with the setting to change, at engine start
-on either role. A pair whose engines disagree fails its requests instead (the
-raiden channel, ``raiden/dram_offload_channel.py``). Nothing degrades to "no offload"
+The offload moves full-attention KV between the two roles' HiCache host pools,
+rank to rank. Anything it cannot move or agree on is refused here with the
+setting to change, at engine start on either role, before the transfer manager
+is built. A pair whose engines disagree fails its requests instead (the raiden
+channel, ``raiden/dram_offload_channel.py``). Nothing degrades to "no offload"
 silently.
 """
 
@@ -22,16 +22,7 @@ class UnsupportedDramOffloadConfig(ValueError):
     """The switch is on with a setting the offload does not support."""
 
 
-def _refuse(problems: List[str], *, where: str) -> None:
-    if problems:
-        raise UnsupportedDramOffloadConfig(
-            f"{_SWITCH.name}=1 is not supported on this {where}: "
-            + "; ".join(problems)
-            + f" (change the setting or unset {_SWITCH.name})"
-        )
-
-
-def missing_tpu_sync_host_api() -> List[str]:
+def _missing_tpu_sync_host_api() -> List[str]:
     """Host-to-host read parameters the installed tpu-sync lacks."""
     from tpu_sync.api.torch import kv_cache_manager
 
@@ -48,12 +39,21 @@ def missing_tpu_sync_host_api() -> List[str]:
     ]
 
 
-def _args_problems(*, role: str, scheduler: Any) -> List[str]:
-    """Settings known before the transfer manager exists."""
-    from sglang.srt.runtime_context import get_device, get_disagg, get_memory
+def _problems(*, role: str, scheduler: Any) -> List[str]:
+    from sglang.srt.configs.hybrid_arch import mambaish_config
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    from sglang.srt.runtime_context import (
+        get_device,
+        get_disagg,
+        get_memory,
+        get_parallel,
+    )
 
     memory = get_memory()
     server_args = scheduler.server_args
+    model_config = scheduler.model_config
+    tree_cache = scheduler.tree_cache
     requirements = [
         (
             server_args.disaggregation_transfer_backend == "raiden",
@@ -96,6 +96,11 @@ def _args_problems(*, role: str, scheduler: Any) -> List[str]:
             "the unified KV pool (--enable-unified-memory) is not supported",
         ),
         (
+            isinstance(tree_cache, UnifiedRadixCache)
+            and isinstance(tree_cache.tree_core, UnifiedTreeCore),
+            "the Python unified radix tree is required (the Rust tree core is not supported)",
+        ),
+        (
             server_args.pp_size == 1,
             f"pipeline parallelism is not supported (--pp-size {server_args.pp_size})",
         ),
@@ -110,12 +115,30 @@ def _args_problems(*, role: str, scheduler: Any) -> List[str]:
             "data parallelism is not supported",
         ),
         (
+            get_parallel().attn_cp_size == 1,
+            "context parallelism is not supported",
+        ),
+        (
             scheduler.spec_algorithm.is_none(),
             "speculative decoding is not supported",
         ),
+        # The pool configurator picks the hybrid pools by these two predicates
+        # (mem_cache/kv_cache_configurator.py), so they name exactly the
+        # engines whose transfer manager would hold recurrent-state or
+        # sliding-window tensors besides the full-attention KV.
+        (
+            mambaish_config(model_config) is None,
+            "models with recurrent state (GDN/Mamba) are not supported",
+        ),
+        (
+            not (model_config.is_hybrid_swa or model_config.is_hybrid_swa_compress),
+            "hybrid sliding-window models are not supported: only "
+            "full-attention KV is offloaded, and such a model cannot resume "
+            "from it without its window",
+        ),
     ]
     problems = [reason for ok, reason in requirements if not ok]
-    missing = missing_tpu_sync_host_api()
+    missing = _missing_tpu_sync_host_api()
     if missing:
         problems.append(
             "the installed tpu-sync has no host-to-host read API (missing "
@@ -125,62 +148,16 @@ def _args_problems(*, role: str, scheduler: Any) -> List[str]:
     return problems
 
 
-def _manager_problems(*, kv_manager: Any, tree_cache: Any) -> List[str]:
-    """Facts only the transfer manager and the tree hold."""
-    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-    from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
-
-    if not isinstance(kv_manager, RaidenKVManager):
-        return ["--disaggregation-transfer-backend must be raiden"]
-    python_tree = isinstance(tree_cache, UnifiedRadixCache) and isinstance(
-        tree_cache.tree_core, UnifiedTreeCore
-    )
-    requirements = [
-        (
-            python_tree,
-            "the Python unified radix tree is required (the Rust tree core is not supported)",
-        ),
-        (
-            python_tree and tree_cache.cache_controller is not None,
-            "--enable-hierarchical-cache is required on both roles",
-        ),
-        (
-            kv_manager.attn_cp_size == 1,
-            "context parallelism is not supported",
-        ),
-        (
-            not kv_manager._state_kv_caches,
-            "models with recurrent state (GDN/Mamba) are not supported",
-        ),
-        (
-            not kv_manager._swa_kv_caches,
-            "hybrid sliding-window models are not supported: only "
-            "full-attention KV is offloaded, and such a model cannot resume "
-            "from it without its window",
-        ),
-    ]
-    return [reason for ok, reason in requirements if not ok]
-
-
 def validate_engine_args(*, role: str, scheduler: Any) -> None:
-    """Raise UnsupportedDramOffloadConfig for a setting known from the server
-    arguments alone. Called before the transfer manager is built: a refusal
-    then leaves no transport thread behind, and the engine exits at once
-    (a pipeline transfer started before the check held the engine's log
-    pipe for minutes after the refusal)."""
-    if not _SWITCH.get():
-        return
-    _refuse(_args_problems(role=role, scheduler=scheduler), where=f"{role} engine")
-
-
-def validate_engine(*, role: str, kv_manager: Any, tree_cache: Any) -> None:
-    """Raise UnsupportedDramOffloadConfig for a setting only the transfer
-    manager and the tree show. ``role`` is "prefill" or "decode". Called once
-    the manager holds the model's KV pools, after ``validate_engine_args``."""
-    if not _SWITCH.get():
-        return
-    _refuse(
-        _manager_problems(kv_manager=kv_manager, tree_cache=tree_cache),
-        where=f"{role} engine",
-    )
+    """Raise UnsupportedDramOffloadConfig for a setting the offload does not
+    support. ``role`` is "prefill" or "decode". Called before the transfer
+    manager is built: a refusal then leaves no transport thread behind, and
+    the engine exits at once (a pipeline transfer started before the check
+    held the engine's log pipe for minutes after the refusal)."""
+    problems = _problems(role=role, scheduler=scheduler)
+    if problems:
+        raise UnsupportedDramOffloadConfig(
+            f"{_SWITCH.name}=1 is not supported on this {role} engine: "
+            + "; ".join(problems)
+            + f" (change the setting or unset {_SWITCH.name})"
+        )

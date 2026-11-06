@@ -22,7 +22,7 @@ from sglang_tpu.disaggregation.decode_dram_offload import (
     prefill_dram_victim_pusher,
     radix_host_ops,
 )
-from sglang_tpu.disaggregation.decode_dram_offload.dram_offload_extension import (
+from sglang_tpu.disaggregation.decode_dram_offload.dram_offload_hooks import (
     DecodeDramOffloadExtension,
     PrefillDramOffloadExtension,
 )
@@ -87,7 +87,7 @@ class TestPrefillPusher(PrefillPusherFixture, CustomTestCase):
         self.assertEqual(sent["decode"], ("10.0.0.1", 5001))
         self.assertEqual(sent["tokens"], self.a)
         registrations = list(self.host.transfer.registrations.values())
-        self.assertEqual(registrations, [(sent["uuid"], sent["blocks"], "host")])
+        self.assertEqual(registrations, [(sent["uuid"], sent["blocks"])])
         # The decode stored the push; the native registration has not reported.
         self.replies[sent["seq"]] = True
         self.pusher.advance(serving=True)
@@ -120,7 +120,7 @@ class TestPrefillPusher(PrefillPusherFixture, CustomTestCase):
         match splits nodes, so that rank matches too and only routes nothing."""
         forked = self.a[:4] + [900, 901, 902, 903]
         self.assertEqual(len(root_node(self.cache, self.a[0]).key), 8)
-        self.pusher.note_decode_of(pushed_req(room=9, tokens=forked))
+        self.pusher.note_decode_of(pushed_req(room=9, tokens=forked), recalled=False)
         self.assertEqual(len(root_node(self.cache, self.a[0]).key), 4)
         self.assertEqual(len(self.pusher._routes), 2)
 
@@ -142,7 +142,7 @@ class TestPrefillPusher(PrefillPusherFixture, CustomTestCase):
         insert_tokens(cache, allocator, [1, 2, 3, 4, 20, 21, 22, 23])
         shared = root_node(cache, 1)
         self.assertIsNotNone(shared.component_data[FULL].value)
-        pusher.note_decode_of(pushed_req(room=1, tokens=session))
+        pusher.note_decode_of(pushed_req(room=1, tokens=session), recalled=False)
         pusher.advance(serving=True)
         pushed = channel.send_victim_push.call_args.kwargs["blocks"]
         self.assertEqual(len(pushed), 8)
@@ -170,7 +170,7 @@ class TestPrefillPusher(PrefillPusherFixture, CustomTestCase):
         session = [1, 2, 3, 4, 10, 11, 12, 13]
         insert_tokens(cache, allocator, session)
         self.assertIsNotNone(root_node(cache, 1).write_through_pending_id)
-        pusher.note_decode_of(pushed_req(room=1, tokens=session))
+        pusher.note_decode_of(pushed_req(room=1, tokens=session), recalled=False)
         pusher.advance(serving=True)
         channel.send_victim_push.assert_not_called()
         cache.cache_controller.start_writing()
@@ -222,6 +222,14 @@ class TestDecodeReceiver(DecodeReceiverFixture, CustomTestCase):
         self.assertFalse(self.host.transfer.reads)
 
 
+def _prefill_end():
+    return PrefillDramOffloadExtension(recall=MagicMock(), push=MagicMock())
+
+
+def _decode_end():
+    return DecodeDramOffloadExtension(landing=MagicMock(), source=MagicMock())
+
+
 class TestPrefillQueueHooks(CustomTestCase):
     """The plugin's wrappers of the prefill bootstrap queue and scheduler:
     core is unchanged, so every step of the prefill's end is driven here."""
@@ -239,15 +247,22 @@ class TestPrefillQueueHooks(CustomTestCase):
         return queue, patch.object(dram_offload_hooks, "_extension", return_value=extension)
 
     def test_queue_step_is_driven_before_and_settled_after(self):
-        for returned, bootstrapped in ((["a"], ["a"]), ((["a"], ["failed"]), ["a"])):
+        for returned in (["a"], (["a"], ["failed"])):
             with self.subTest(returned=returned):
                 calls = []
-                extension = MagicMock()
-                extension.before_bootstrap_step.side_effect = lambda *a, **k: (
-                    calls.append("advance")
+                extension = _prefill_end()
+                extension.recall.advance.side_effect = lambda *a, **k: calls.append(
+                    "recall"
                 )
-                extension.after_bootstrap_step.side_effect = lambda **k: calls.append(
-                    "after"
+                extension.push.advance.side_effect = lambda **k: calls.append("push")
+                extension.recall.insert_recalled_host_prefix.side_effect = lambda req: (
+                    calls.append("insert") or True
+                )
+                extension.push.note_decode_of.side_effect = lambda *a, **k: (
+                    calls.append("note")
+                )
+                extension.recall.drop_departed.side_effect = lambda q: calls.append(
+                    "drop"
                 )
                 upstream = MagicMock(
                     side_effect=lambda *a, **k: calls.append("pop") or returned
@@ -258,19 +273,26 @@ class TestPrefillQueueHooks(CustomTestCase):
                         upstream, queue, return_failed_reqs=True
                     )
                 self.assertEqual(result, returned)
-                self.assertEqual(calls, ["advance", "pop", "after"])
-                extension.before_bootstrap_step.assert_called_once_with(
-                    queue.queue, waiting_reqs=["waiting"], serving=True
+                self.assertEqual(
+                    calls, ["recall", "push", "pop", "insert", "note", "drop"]
                 )
-                extension.after_bootstrap_step.assert_called_once_with(
-                    bootstrapped=bootstrapped, queued=queue.queue
+                extension.recall.advance.assert_called_once_with(
+                    queue.queue, waiting_reqs=["waiting"]
                 )
+                extension.push.advance.assert_called_once_with(serving=True)
+                extension.recall.insert_recalled_host_prefix.assert_called_once_with(
+                    "a"
+                )
+                extension.push.note_decode_of.assert_called_once_with(
+                    "a", recalled=True
+                )
+                extension.recall.drop_departed.assert_called_once_with(queue.queue)
                 upstream.assert_called_once_with(queue, return_failed_reqs=True)
 
     def test_engine_serves_while_a_request_is_queued_or_running(self):
         for running in (False, True):
             with self.subTest(running=running):
-                extension = MagicMock()
+                extension = _prefill_end()
                 queue, found = self._queue(extension, queued=False, running=running)
                 with found:
                     dram_offload_hooks._pop_bootstrapped(MagicMock(return_value=[]), queue)
@@ -280,16 +302,18 @@ class TestPrefillQueueHooks(CustomTestCase):
 
     def test_memory_release_first_lets_go_of_the_pages_of_the_prefill_end(self):
         calls = []
-        extension = MagicMock()
-        extension.release_all.side_effect = lambda: calls.append("release")
+        extension = _prefill_end()
+        extension.push.release_all.side_effect = lambda: calls.append("push")
+        extension.recall.release_all.side_effect = lambda: calls.append("recall")
         upstream = MagicMock(side_effect=lambda q: calls.append("upstream"))
         queue, found = self._queue(extension)
         with found:
             dram_offload_hooks._release_memory_occupation(upstream, queue)
-        self.assertEqual(calls, ["release", "upstream"])
+        self.assertEqual(calls, ["push", "recall", "upstream"])
 
     def test_paused_engine_still_drains_and_is_not_idle_while_pages_are_held(self):
-        extension = MagicMock(spec=PrefillDramOffloadExtension)
+        extension = _prefill_end()
+        extension.push.has_pushes_in_flight.return_value = False
         scheduler = SimpleNamespace(
             tree_cache="tree", disaggregation_mode=DisaggregationMode.PREFILL
         )
@@ -297,14 +321,14 @@ class TestPrefillQueueHooks(CustomTestCase):
             dram_offload_hooks._record_scheduler_state_for_paused_engine(MagicMock(), scheduler)
             extension.settle_host_transfers.assert_called_once_with()
             upstream = MagicMock(return_value=True)
-            extension.holds_host_pages_outside_tree.return_value = True
+            extension.recall.holds_host_landing_pages.return_value = True
             self.assertFalse(dram_offload_hooks._is_fully_idle(upstream, scheduler))
             # A health check asks about running requests only, or a probe of
             # an engine that only pushes would wait for a request to answer.
             self.assertTrue(
                 dram_offload_hooks._is_fully_idle(upstream, scheduler, for_health_check=True)
             )
-            extension.holds_host_pages_outside_tree.return_value = False
+            extension.recall.holds_host_landing_pages.return_value = False
             self.assertTrue(dram_offload_hooks._is_fully_idle(upstream, scheduler))
             # Busy for core's own reasons: the extension is not asked.
             upstream.return_value = False
@@ -315,10 +339,32 @@ class TestPrefillQueueHooks(CustomTestCase):
             dram_offload_hooks._record_scheduler_state_for_paused_engine(upstream, scheduler)
             upstream.assert_called_once_with(scheduler)
 
+    def test_memory_release_for_a_weight_update_waits_for_transfers_in_flight(self):
+        """The weight updater asserts an idle engine; pages held outside the
+        tree right after the last request must not fail that assertion."""
+        extension = _prefill_end()
+        extension.recall.holds_host_landing_pages.side_effect = [True, True, False]
+        extension.push.has_pushes_in_flight.return_value = False
+        scheduler = SimpleNamespace(
+            tree_cache="tree", disaggregation_mode=DisaggregationMode.PREFILL
+        )
+        updater = SimpleNamespace(scheduler=scheduler)
+        upstream = MagicMock(return_value="released")
+        with (
+            patch.object(dram_offload_hooks, "_extension", return_value=extension),
+            patch.object(dram_offload_hooks.time, "sleep"),
+        ):
+            result = dram_offload_hooks._release_memory_occupation_weights(
+                upstream, updater, "req"
+            )
+        self.assertEqual(result, "released")
+        self.assertEqual(extension.push.retire_settled_pushes.call_count, 2)
+        upstream.assert_called_once_with(updater, "req")
+
     def test_paused_decode_settles_its_landings_so_that_it_can_be_flushed(self):
         # The decode queues are not stepped while paused; without this tick a
         # granted landing keeps the engine non-idle for the whole pause.
-        extension = MagicMock(spec=DecodeDramOffloadExtension)
+        extension = _decode_end()
         scheduler = SimpleNamespace(
             tree_cache="tree", disaggregation_mode=DisaggregationMode.DECODE
         )
@@ -329,42 +375,36 @@ class TestPrefillQueueHooks(CustomTestCase):
 
 class TestOffloadIsAnExtensionOfTheL2Controller(CustomTestCase):
     """The decode DRAM offload hangs off the cache's L2 controller, so the
-    cache dram_offload_hooks reach every worker through it and a cache without it is left
+    cache hooks reach every worker through it and a cache without it is left
     alone."""
 
     def test_cache_reset_first_lets_go_of_every_page_the_extension_holds(self):
         cache, _ = full_cache(host_capacity=32)
         calls = []
-        offload = MagicMock()
-        offload.before_cache_reset.side_effect = lambda: calls.append("release")
         upstream = MagicMock(side_effect=lambda c: calls.append("reset"))
         # Without the extension the reset is upstream's.
         dram_offload_hooks._reset_cache(upstream, cache)
         self.assertEqual(calls, ["reset"])
-        cache.cache_controller.decode_dram_extension = offload
-        dram_offload_hooks._reset_cache(upstream, cache)
-        self.assertEqual(calls, ["reset", "release", "reset"])
+        prefill, decode = _prefill_end(), _decode_end()
+        for extension, workers in (
+            (prefill, (prefill.push, prefill.recall)),
+            (decode, (decode.landing, decode.source)),
+        ):
+            calls.clear()
+            for order, worker in enumerate(workers):
+                worker.release_all.side_effect = lambda order=order: calls.append(order)
+            cache.cache_controller.decode_dram_extension = extension
+            dram_offload_hooks._reset_cache(upstream, cache)
+            self.assertEqual(calls, [0, 1, "reset"])
         # A refusal (a peer may still read or write a page) stops the reset.
-        offload.before_cache_reset.side_effect = RuntimeError("pinned")
+        decode.landing.release_all.side_effect = RuntimeError("pinned")
         with self.assertRaises(RuntimeError):
             dram_offload_hooks._reset_cache(upstream, cache)
-        self.assertEqual(upstream.call_count, 2)
-
-    def test_reset_lets_go_of_the_pages_of_either_role(self):
-        prefill = PrefillDramOffloadExtension.__new__(PrefillDramOffloadExtension)
-        prefill.push = MagicMock()
-        prefill.before_cache_reset()
-        prefill.push.release_all.assert_called_once_with()
-        prefill.push.clear_push_routes.assert_called_once_with()
-        decode = DecodeDramOffloadExtension.__new__(DecodeDramOffloadExtension)
-        decode.landing = MagicMock()
-        decode.before_cache_reset()
-        decode.landing.drain_host_landings.assert_called_once_with()
+        self.assertEqual(upstream.call_count, 3)
 
     def test_checkpoint_tells_the_pusher_which_decode_served_the_branch(self):
         cache, _ = full_cache(host_capacity=32)
-        prefill = PrefillDramOffloadExtension.__new__(PrefillDramOffloadExtension)
-        prefill.push = MagicMock()
+        prefill = _prefill_end()
         cache.cache_controller.decode_dram_extension = prefill
         upstream = MagicMock(return_value="done")
         self.assertEqual(dram_offload_hooks._checkpoint(upstream, cache, "req"), "done")
