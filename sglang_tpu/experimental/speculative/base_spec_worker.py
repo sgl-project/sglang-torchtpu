@@ -287,7 +287,10 @@ class TpuSpecWorker(BaseSpecWorker):
             raise NotImplementedError(
                 "SGLANG_TPU_PD_DECODE_DRAFT_PREFILL does not support DP attention."
             )
-        pool = build_pd_hidden_pool(self.target_worker.model_runner)
+        pool = build_pd_hidden_pool(
+            self.target_worker.model_runner,
+            paged_by_swa=self.pd_hidden_full_to_swa() is not None,
+        )
         register_pd_hidden_pool(pool)
         if disagg_mode == "decode":
             register_pd_draft_prefiller(self.prefill_draft_from_pd)
@@ -309,7 +312,7 @@ class TpuSpecWorker(BaseSpecWorker):
         cache_loc_cpu = batch.out_cache_loc
         assert cache_loc_cpu.device.type == "cpu", cache_loc_cpu.device
         segments = self._pd_hidden_pool.write_segments(
-            cache_loc_cpu, target_hidden.shape[0]
+            self._pd_hidden_slots(cache_loc_cpu), target_hidden.shape[0]
         )
         return self._pd_hidden_pool.write(
             target_hidden, segments=segments.to(self.device, non_blocking=True)
@@ -331,13 +334,13 @@ class TpuSpecWorker(BaseSpecWorker):
         ):
             view = prebuilt_extend_view(batch, group, vocab_size=vocab_size)
             # The draft graphs and writer were warmed with the allocator's dtype.
-            view.out_cache_loc = view.out_cache_loc.to(
-                compile_policy.live_cache_loc_dtype()
-            )
+            live_dtype = compile_policy.live_cache_loc_dtype()
+            view.out_cache_loc = view.out_cache_loc.to(live_dtype)
             padded_tokens = t_bucketer.next_bucket(max(view.extend_num_tokens, cap))
-            cache_loc = pad_rows(view.out_cache_loc, padded_tokens).to(
-                self.device, non_blocking=True
-            )
+            # Hidden rows and draft KV share a slot: SWA for a windowed draft, else full.
+            cache_loc = pad_rows(
+                self._pd_hidden_slots(view.out_cache_loc).to(live_dtype), padded_tokens
+            ).to(self.device, non_blocking=True)
             bonus_tokens = padded_h2d(
                 torch.tensor(
                     [req.output_ids[-1] for req in view.reqs], dtype=torch.int64
@@ -355,6 +358,26 @@ class TpuSpecWorker(BaseSpecWorker):
     def pd_draft_prompt_starts(self, batch: ScheduleBatch) -> list[int]:
         """Per request, the extend offset the decode draft prompt pass starts at."""
         return [0] * len(batch.reqs)
+
+    def pd_hidden_full_to_swa(self) -> torch.Tensor | None:
+        """Host full-to-SWA slot map when the draft KV, and so the hidden pool, lives
+        in the target's SWA slots; None pages the hidden pool by full slots."""
+        return None
+
+    def _pd_hidden_slots(self, cache_loc_cpu: torch.Tensor) -> torch.Tensor:
+        """The hidden pool slots of these host full KV slots."""
+        assert self._pd_hidden_pool is not None
+        full_to_swa = self.pd_hidden_full_to_swa()
+        if (full_to_swa is not None) != self._pd_hidden_pool.paged_by_swa:
+            raise RuntimeError(
+                "The PD hidden pool was built for "
+                f"{'SWA' if self._pd_hidden_pool.paged_by_swa else 'full'} slots, "
+                "but the draft's full-to-SWA map "
+                f"{'is missing' if full_to_swa is None else 'appeared'}."
+            )
+        if full_to_swa is None:
+            return cache_loc_cpu
+        return full_to_swa[cache_loc_cpu].to(cache_loc_cpu.dtype)
 
     def extend_draft_from_hidden(
         self,

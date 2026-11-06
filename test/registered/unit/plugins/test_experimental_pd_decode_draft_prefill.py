@@ -23,6 +23,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.disaggregation.raiden import common as raiden_common
 from sglang_tpu.disaggregation.raiden import pipeline as raiden_pipeline
+from sglang_tpu.disaggregation.raiden import pp_common, pp_swa
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.experimental import runs_draft_prompt_pass
 from sglang_tpu.experimental.speculative import pd_draft_prefill, pd_hidden_pool
@@ -46,9 +47,15 @@ PAGES, PAGE = 4, 4
 FEATURE = 3 * 160
 
 
-def _pool(attn_tp_size: int, group=None) -> PdHiddenPool:
+def _pool(
+    attn_tp_size: int,
+    group=None,
+    *,
+    num_pages: int = PAGES,
+    paged_by_swa: bool = False,
+) -> PdHiddenPool:
     return PdHiddenPool(
-        num_pages=PAGES,
+        num_pages=num_pages,
         page_size=PAGE,
         feature_size=FEATURE,
         total_kv_heads=KV_HEADS,
@@ -56,6 +63,7 @@ def _pool(attn_tp_size: int, group=None) -> PdHiddenPool:
         attn_tp_group=group,
         dtype=torch.bfloat16,
         device=torch.device("cpu"),
+        paged_by_swa=paged_by_swa,
     )
 
 
@@ -102,6 +110,15 @@ class TestPdHiddenPool(CustomTestCase):
         prefill, hidden = self._shipped(slots)
         self.assertTrue(torch.equal(prefill.read(torch.tensor(slots)), hidden))
         self.assertEqual(prefill.buffer.flatten(0, 1)[0].abs().sum().item(), 0.0)
+
+    def test_rows_mapped_to_the_padding_slot_are_not_written(self):
+        """A windowed draft maps tokens left of the window to SWA slot 0."""
+        prefill = _pool(attn_tp_size=1)
+        hidden = torch.randn(5, FEATURE).to(torch.bfloat16)
+        slots = torch.tensor([0, 0, 6, 7, 9])
+        prefill.write(hidden, segments=prefill.write_segments(slots, 5))
+        self.assertEqual(prefill.buffer.flatten(0, 1)[0].abs().sum().item(), 0.0)
+        torch.testing.assert_close(prefill.read(slots[2:]), hidden[2:])
 
     def test_tp_decode_joins_the_head_slices_raiden_hands_each_rank(self):
         """Raiden gives decode rank r kv head r of every row; the read joins them."""
@@ -174,6 +191,7 @@ class TestRaidenCarriesHiddenNotDraftKv(CustomTestCase):
             full_layer_ids=[0],
             num_draft_full=0,
             num_hidden_full=0,
+            num_hidden_swa=0,
             swa=[],
             swa_layer_ids=[],
             num_draft_swa=0,
@@ -202,24 +220,165 @@ class TestRaidenCarriesHiddenNotDraftKv(CustomTestCase):
         self.assertEqual(groups.num_hidden_full, 0)
 
 
-class TestBuildHiddenPool(CustomTestCase):
-    def test_pages_follow_a_seq_along_lane_pool(self):
-        # [num_blocks, 2 * kv_heads, head_dim words, packing, page_size].
-        sal_layer = torch.zeros((5, 2 * KV_HEADS, 4, 2, 256), dtype=torch.uint8)
-        runner = SimpleNamespace(
-            token_to_kv_pool=SimpleNamespace(page_size=256),
-            spec_aux_config=_kvc().spec_aux_config,
-            model_config=_kvc().model_config,
-            dtype=torch.bfloat16,
-            device=torch.device("cpu"),
+SWA_PAGES = 2
+
+
+def _hybrid_target() -> SimpleNamespace:
+    """Layer 0 full attention on PAGES pages, layer 1 sliding window on SWA_PAGES."""
+    return SimpleNamespace(
+        start_layer=0,
+        layer_num=2,
+        layers_mapping={0: (0, False), 1: (0, True)},
+        get_fused_kv_buffer=lambda layer: torch.zeros(
+            SWA_PAGES if layer else PAGES, PAGE, 8, 2, 128
+        ),
+    )
+
+
+class TestRaidenMovesWindowedHiddenWithTheWindow(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        hidden = _pool(attn_tp_size=1, num_pages=SWA_PAGES, paged_by_swa=True)
+        with patch.object(pd_hidden_pool, "_pd_hidden_pool", hidden):
+            target = _hybrid_target()
+            self.groups = raiden_common.get_raiden_kv_caches(target, draft_pool=target)
+        self.hidden = hidden
+        self.pools = raiden_pipeline.pool_manifest(self.groups)
+
+    def test_the_hidden_pool_joins_the_swa_group(self):
+        self.assertEqual(
+            (self.groups.num_hidden_full, self.groups.num_hidden_swa), (0, 1)
         )
-        groups = SimpleNamespace(full=[sal_layer])
+        self.assertIs(self.groups.swa[-1], self.hidden.buffer)
+        self.assertEqual(
+            [pool["tag"] for pool in self.pools], ["fa.l0", "swa.l1", "pdhid.swa.l0"]
+        )
+        full, swa = pp_swa.split_manifest(self.pools)
+        self.assertEqual([p["tag"] for p in full], ["fa.l0"])
+        self.assertEqual([p["tag"] for p in swa], ["swa.l1", "pdhid.swa.l0"])
+
+    def test_it_moves_the_window_pages(self):
+        full, window = [1, 2, 3], [1]
+        spans = pp_common.part_spans(
+            self.pools,
+            self.groups.full + self.groups.swa,
+            full,
+            window,
+            1,
+            KV_HEADS,
+            seq_along_lane=False,
+            with_swa=True,
+        )
+        self.assertEqual(spans[-1].tag, "pdhid.swa.l0")
+        self.assertEqual(spans[-1].block_ids, window)
+        dst = pp_common.part_destination_blocks(
+            self.pools, [3, 2, 1], [1], start=0, count=3, source_swa_count=1
+        )
+        self.assertEqual(dst["transfer_pool_tags"], ["fa.l0", "swa.l1", "pdhid.swa.l0"])
+        self.assertEqual(dst["dst_block_counts"], [3, 1, 1])
+        # Early parts carry no window pages, so no hidden rows either.
+        early = pp_common.part_spans(
+            self.pools,
+            self.groups.full + self.groups.swa,
+            full,
+            window,
+            1,
+            KV_HEADS,
+            seq_along_lane=False,
+            with_swa=False,
+        )
+        self.assertEqual([entry.tag for entry in early], ["fa.l0"])
+
+    def test_a_tp_decode_slices_it_by_the_target_heads(self):
+        (entry,) = pp_common.head_slice_spans(
+            self.pools[-1:],
+            [self.hidden.buffer],
+            [3],
+            [1],
+            KV_HEADS,
+            KV_HEADS,
+            seq_along_lane=False,
+        )
+        self.assertEqual(entry.block_ids, [1])
+        row = self.hidden.buffer[0, 0, 0].numel() * 2
+        self.assertEqual({s.size_bytes for s in entry.spans}, {row})
+        self.assertEqual(
+            sorted(s.dst_unit_ordinal for s in entry.spans), list(range(KV_HEADS))
+        )
+
+    def test_a_page_count_off_the_swa_pool_is_rejected(self):
+        hidden = _pool(attn_tp_size=1, num_pages=PAGES, paged_by_swa=True)
+        with (
+            patch.object(pd_hidden_pool, "_pd_hidden_pool", hidden),
+            self.assertRaisesRegex(RuntimeError, "SWA KV block counts"),
+        ):
+            target = _hybrid_target()
+            raiden_common.get_raiden_kv_caches(target, draft_pool=target)
+
+
+def _runner(kv_pool, **aux) -> SimpleNamespace:
+    return SimpleNamespace(
+        token_to_kv_pool=kv_pool,
+        spec_aux_config=SpecAuxHiddenStateConfig(
+            eagle_use_aux_hidden_state=True,
+            eagle_aux_hidden_state_layer_ids=[1, 2, 3],
+            **aux,
+        ),
+        model_config=_kvc().model_config,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+
+
+class _FakeSwaPool(pd_draft_prefill.SWAKVPool):
+    def __init__(self, page_size: int) -> None:
+        self.page_size = page_size
+
+
+class TestBuildHiddenPool(CustomTestCase):
+    def _build(self, runner, groups, *, paged_by_swa: bool) -> PdHiddenPool:
         with (
             patch.object(pd_draft_prefill, "get_raiden_kv_caches", lambda _: groups),
             get_parallel().override(attn_tp_size=1),
         ):
-            pool = pd_draft_prefill.build_pd_hidden_pool(runner)
+            return pd_draft_prefill.build_pd_hidden_pool(
+                runner, paged_by_swa=paged_by_swa
+            )
+
+    def test_pages_follow_a_seq_along_lane_pool(self):
+        # [num_blocks, 2 * kv_heads, head_dim words, packing, page_size].
+        sal_layer = torch.zeros((5, 2 * KV_HEADS, 4, 2, 256), dtype=torch.uint8)
+        runner = _runner(SimpleNamespace(page_size=256))
+        groups = SimpleNamespace(full=[sal_layer], swa=[])
+        pool = self._build(runner, groups, paged_by_swa=False)
         self.assertEqual(tuple(pool.buffer.shape[:2]), (5, 256))
+        self.assertFalse(pool.paged_by_swa)
+
+    def test_a_windowed_draft_pages_by_the_swa_pool(self):
+        groups = SimpleNamespace(
+            full=[torch.zeros((40, 256, 1, 2, 128))],
+            swa=[torch.zeros((3, 256, 1, 2, 128))],
+        )
+        runner = _runner(_FakeSwaPool(256), dflash_draft_kv_is_swa=True)
+        pool = self._build(runner, groups, paged_by_swa=True)
+        self.assertEqual(tuple(pool.buffer.shape[:2]), (3, 256))
+        self.assertTrue(pool.paged_by_swa)
+
+    def test_paging_that_disagrees_with_the_budget_is_rejected(self):
+        groups = SimpleNamespace(
+            full=[torch.zeros((40, 256, 1, 2, 128))],
+            swa=[torch.zeros((3, 256, 1, 2, 128))],
+        )
+        for paged_by_swa, draft_kv_is_swa in ((True, False), (False, True)):
+            runner = _runner(_FakeSwaPool(256), dflash_draft_kv_is_swa=draft_kv_is_swa)
+            with self.assertRaisesRegex(RuntimeError, "dflash_draft_kv_is_swa"):
+                self._build(runner, groups, paged_by_swa=paged_by_swa)
+
+    def test_a_stage_without_swa_pages_is_rejected(self):
+        groups = SimpleNamespace(full=[torch.zeros((40, 256, 1, 2, 128))], swa=[])
+        runner = _runner(SimpleNamespace(page_size=256))
+        with self.assertRaisesRegex(RuntimeError, "SWA KV"):
+            self._build(runner, groups, paged_by_swa=True)
 
 
 class TestDraftPromptPassPlacement(CustomTestCase):
@@ -339,6 +498,7 @@ class TestChunkedDraftPromptPass(CustomTestCase):
             attn_tp_group=None,
             dtype=torch.bfloat16,
             device=torch.device("cpu"),
+            paged_by_swa=full_to_swa is not None,
         )
         hidden_pool.buffer.copy_(torch.randn(hidden_pool.buffer.shape))
         t_bucketer = _Bucketer(self.BUCKETS)
@@ -379,14 +539,15 @@ class TestChunkedDraftPromptPass(CustomTestCase):
         return written
 
     def _expected(self, worker, draft_slot) -> dict[int, tuple[int, torch.Tensor]]:
-        """The single-pass result: each prompt token's row at its full slot."""
+        """The single-pass result: each prompt token's row, read and written at its
+        draft slot (the full slot, or the SWA slot of a windowed draft)."""
         expected, offset = {}, 0
         for prefix, extend in zip(self.PREFIX, self.EXTEND):
             for i in range(extend):
-                full_slot = self.slots[offset + i]
-                if draft_slot(full_slot) != 0:
-                    row = worker._pd_hidden_pool.read(torch.tensor([full_slot]))[0]
-                    expected[draft_slot(full_slot)] = (prefix + i, row)
+                slot = draft_slot(self.slots[offset + i])
+                if slot != 0:
+                    row = worker._pd_hidden_pool.read(torch.tensor([slot]))[0]
+                    expected[slot] = (prefix + i, row)
             offset += extend
         return expected
 
@@ -403,16 +564,51 @@ class TestChunkedDraftPromptPass(CustomTestCase):
         self.assertEqual(len(self.writes), 4)
         self._assert_same(self._written(), self._expected(worker, lambda s: s))
 
-    def test_a_windowed_draft_writes_the_swa_tail(self):
+    def _window_map(self) -> torch.Tensor:
         full_to_swa = torch.zeros(64, dtype=torch.int64)
         # The decode maps request 0's last 4 tokens and requests 1 and 2 whole.
         mapped = self.slots[15:]
-        full_to_swa[torch.tensor(mapped)] = torch.arange(100, 100 + len(mapped))
+        full_to_swa[torch.tensor(mapped)] = torch.randperm(63)[: len(mapped)] + 1
+        return full_to_swa
+
+    def test_a_windowed_draft_reads_and_writes_the_swa_tail(self):
+        full_to_swa = self._window_map()
         worker = self._worker(full_to_swa=full_to_swa)
         worker.prefill_draft_from_pd(self.batch)
         self._assert_same(
             self._written(), self._expected(worker, lambda s: int(full_to_swa[s]))
         )
+
+    def test_the_prefill_writes_rows_the_decode_reads_at_swa_slots(self):
+        full_to_swa = self._window_map()
+        prefill = self._worker(full_to_swa=full_to_swa)
+        prefill._pd_hidden_pool.buffer.zero_()
+        hidden = torch.randn(32, FEATURE).to(torch.bfloat16)
+        prefill.write_pd_hidden(self.batch, hidden)
+        mapped = full_to_swa[self.batch.out_cache_loc]
+        torch.testing.assert_close(
+            prefill._pd_hidden_pool.read(mapped[15:]), hidden[15:30]
+        )
+        # Tokens left of the window map to slot 0 and are dropped.
+        flat = prefill._pd_hidden_pool.buffer.flatten(0, 1)
+        self.assertEqual(flat[0].abs().sum().item(), 0.0)
+        decode = self._worker(full_to_swa=full_to_swa)
+        decode._pd_hidden_pool.buffer.copy_(prefill._pd_hidden_pool.buffer)
+        decode.prefill_draft_from_pd(self.batch)
+        written = self._written()
+        self.assertEqual(sorted(written), sorted(mapped[15:].tolist()))
+        for row, slot in enumerate(mapped[15:].tolist()):
+            torch.testing.assert_close(written[slot][1], hidden[15 + row])
+
+    def test_a_pool_paged_unlike_the_draft_is_rejected(self):
+        worker = self._worker(full_to_swa=None)
+        worker._block_draft_worker.full_to_swa = self._window_map()
+        with self.assertRaisesRegex(RuntimeError, "full-to-SWA map appeared"):
+            worker.prefill_draft_from_pd(self.batch)
+        worker = self._worker(full_to_swa=self._window_map())
+        worker._block_draft_worker.full_to_swa = None
+        with self.assertRaisesRegex(RuntimeError, "full-to-SWA map is missing"):
+            worker.write_pd_hidden(self.batch, torch.zeros(32, FEATURE))
 
     def test_a_short_chunk_is_the_views_chunked_request(self):
         chunks = [DraftPromptChunk(req=1, start=0, length=5)]
@@ -512,6 +708,32 @@ class TestHiddenPoolKvBudget(CustomTestCase):
         self.assertEqual(
             configurator._cell_size, _hybrid_swa_configurator()._cell_size + row
         )
+
+    def test_a_windowed_draft_counts_the_row_per_swa_token(self):
+        row = PdHiddenPool.bytes_per_token(
+            feature_size=FEATURE,
+            total_kv_heads=KV_HEADS,
+            attn_tp_size=1,
+            dtype=torch.bfloat16,
+        )
+        aux = SpecAuxHiddenStateConfig(
+            eagle_use_aux_hidden_state=True,
+            eagle_aux_hidden_state_layer_ids=[1, 2, 3],
+            dflash_draft_kv_is_swa=True,
+        )
+        base = _hybrid_swa_configurator()
+        configurator = budget_pd_hidden_pool(
+            _hybrid_swa_configurator(), _kvc(spec_aux_config=aux)
+        )
+        self.assertEqual(configurator._draft_cell_size, 0)
+        self.assertEqual(configurator._draft_swa_cell_size, 300 + row)
+        self.assertEqual(configurator._cell_size, base._cell_size + 0.0625 * row)
+        # Full-token capacity of one budget: the row costs 1/16 per full token.
+        per_full = budget_pd_hidden_pool(_hybrid_swa_configurator(), _kvc())
+        budget = 1 << 30
+        # 400 + 0.0625 * (1200 + 300 + 4096) vs 400 + 0.0625 * 1500 + 4096 bytes.
+        self.assertEqual(int(budget // configurator._cell_size), 1_432_133)
+        self.assertEqual(int(budget // per_full._cell_size), 233_943)
 
     def test_a_budget_it_cannot_size_is_rejected(self):
         for configurator in (

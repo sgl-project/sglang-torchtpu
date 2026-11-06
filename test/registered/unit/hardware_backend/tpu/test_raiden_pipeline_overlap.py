@@ -164,6 +164,7 @@ def make(mode, pp_rank, pp_size, controller, bus, name, heads, stage_parts=False
         swa_layer_ids=[2 * pp_rank if mode == DisaggregationMode.PREFILL else 0],
         num_draft_full=0,
         num_hidden_full=0,
+        num_hidden_swa=0,
         num_draft_swa=0,
         seq_along_lane=False,
     )

@@ -4,6 +4,8 @@ With SGLANG_TPU_PD_DECODE_DRAFT_PREFILL the prefill skips the draft over the pro
 and writes each prompt token's packed target hidden (EAGLE3 aux layers, DFlash
 target layers) into this buffer instead; Raiden moves it with the target KV under
 the same page ids, and the decode reads it back to build the draft KV and carry.
+A windowed draft (draft KV in the target's SWA slots) only reads the window tail,
+so its buffer pages like the SWA pool and Raiden moves it with the window pages.
 
 The buffer is laid out as one extra fused KV layer, [num_pages, page_size,
 heads, 2, lanes], so Raiden's PP -> TP reshard moves it unchanged: a token's row
@@ -19,7 +21,10 @@ import numpy as np
 import torch
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang_tpu._logging import get_logger
 from sglang_tpu.kv_row_write import kv_write_segments
+
+logger = get_logger(__name__)
 
 _LANES = 128
 # bf16 packs two values per 32-bit word, the fused layout's K/V pair axis.
@@ -51,6 +56,8 @@ class PdHiddenPool:
       buffer: [num_pages, page_size, local_heads, 2, lanes] bf16; local_heads is
         this rank's share of total_kv_heads (all of them on a prefill stage).
       feature_size: Real width of a row; the tail lanes are padding.
+      paged_by_swa: Slots are the target's SWA slots (a windowed draft), not its
+        full-attention slots.
     """
 
     def __init__(
@@ -64,12 +71,14 @@ class PdHiddenPool:
         attn_tp_group: GroupCoordinator | None,
         dtype: torch.dtype,
         device: torch.device,
+        paged_by_swa: bool = False,
     ) -> None:
         if dtype != torch.bfloat16:
             raise NotImplementedError(
                 f"The PD hidden pool packs bf16 like the fused KV pool, got {dtype}."
             )
         self.feature_size = feature_size
+        self.paged_by_swa = paged_by_swa
         self.total_kv_heads = total_kv_heads
         self.attn_tp_size = attn_tp_size
         self._attn_tp_group = attn_tp_group
@@ -83,6 +92,13 @@ class PdHiddenPool:
             (num_pages, page_size, self.local_heads, _PACKING, self.lanes),
             dtype=dtype,
             device=device,
+        )
+        logger.info(
+            "PD hidden pool: %d pages x %d tokens (%s slots), %.2f GiB",
+            num_pages,
+            page_size,
+            "SWA" if paged_by_swa else "full",
+            self.buffer.numel() * self.buffer.element_size() / 2**30,
         )
         self._row_width = total_kv_heads * _PACKING * self.lanes
         self._span_write: Callable[..., None] | None = None
@@ -102,10 +118,10 @@ class PdHiddenPool:
         """Host [3, num_rows] (source row, slot, length) runs of num_rows rows whose
         first len(cache_loc_cpu) are real; unused runs have length 0."""
         slots = np.zeros(num_rows, dtype=np.int64)
-        valid = np.zeros(num_rows, dtype=bool)
         live = cache_loc_cpu.numel()
         slots[:live] = cache_loc_cpu.numpy()
-        valid[:live] = True
+        # Slot 0 is the padding slot: bucket rows, and SWA-paged tokens left of the window.
+        valid = slots != 0
         segments, _ = kv_write_segments(slots, valid)
         return segments
 

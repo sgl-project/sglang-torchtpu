@@ -75,7 +75,13 @@ def pool_manifest(groups: Any) -> list[dict]:
             groups.num_draft_full,
             groups.num_hidden_full,
         ),
-        ("swa", groups.swa, groups.swa_layer_ids, groups.num_draft_swa, 0),
+        (
+            "swa",
+            groups.swa,
+            groups.swa_layer_ids,
+            groups.num_draft_swa,
+            groups.num_hidden_swa,
+        ),
     ):
         if len(tensors) != len(layer_ids):
             raise ValueError(f"Raiden {kind} pools need one global layer ID per tensor")

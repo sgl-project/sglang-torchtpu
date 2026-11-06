@@ -176,10 +176,11 @@ Both raiden roles serve every algorithm with the same spec flags.
   moves with the target KV in place of the draft KV; the decode reads it back
   and runs the draft over the prompt on each prebuilt batch (`pd_draft_prefill.py`),
   a prompt longer than the largest extend bucket in successive bucket-sized chunks.
-  The buffer pages like the full KV pool and the KV budget counts it per full
-  token, in the default or hybrid SWA configurator (not SWAChunkCap or unified
-  memory). A windowed (all-SWA) draft writes the target's SWA slots, so the pass
-  covers only the SWA tail the decode preallocates. Both ends must set the flag:
+  The buffer pages like the draft KV, in the default or hybrid SWA configurator
+  (not SWAChunkCap or unified memory): by full slots and per full token, or, for
+  a windowed (all-SWA) draft, by the target's SWA slots and per SWA token, moved
+  with the window pages; the pass covers only the SWA tail the decode
+  preallocates. Both ends must set the flag:
   it enters the Raiden layout fingerprint. Needs the Raiden pipeline transfer; no
   DP attention.
 - DP attention on the decode: the decode ranks pull their own requests' KV, which

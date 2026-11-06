@@ -14,10 +14,12 @@ import numpy as np
 import pytest
 import torch
 
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.disaggregation.raiden import common as raiden_common
 from sglang_tpu.disaggregation.raiden import pipeline as pl
 from sglang_tpu.disaggregation.raiden import pp_common
+from sglang_tpu.disaggregation.raiden import pp_swa as ps
 from sglang_tpu.experimental.speculative import pd_hidden_pool
 from sglang_tpu.experimental.speculative.pd_hidden_pool import PdHiddenPool
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool, TpuSeqAlongLaneKVPool
@@ -33,6 +35,7 @@ def _groups(full, swa, full_ids, swa_ids):
         swa_layer_ids=swa_ids,
         num_draft_full=0,
         num_hidden_full=0,
+        num_hidden_swa=0,
         num_draft_swa=0,
         seq_along_lane=False,
     )
@@ -231,6 +234,7 @@ def test_sliding_window_pool_is_sliced_like_the_full_pool():
         swa_layer_ids=[0],
         num_draft_full=0,
         num_hidden_full=0,
+        num_hidden_swa=0,
         num_draft_swa=0,
     )
     src = groups.swa[0]
@@ -309,6 +313,84 @@ def test_pd_hidden_rows_round_trip_beside_seq_along_lane_kv():
     reader = hidden(dst_tp, group)
     reader.buffer = decode[0].buffer
     assert torch.equal(reader.read(loc), rows)
+
+
+def test_windowed_pd_hidden_rows_ride_the_window_pages_beside_sal_kv():
+    """A windowed draft's hidden pool pages like the SWA pool and crosses with the
+    window twin; its per-rank slices rejoin on a TP8 decode."""
+    feature, full_pages, swa_pages, dst_tp = 3 * 1024, 6, 3, 8
+    with patch("sglang_tpu.kv_pool._seq_along_lane_head_dim", _head_dim_without_tpu):
+        producer = SWAKVPool(
+            size=full_pages * PAGE,
+            size_swa=swa_pages * PAGE,
+            page_size=PAGE,
+            dtype=torch.float8_e4m3fn,
+            head_num=HEADS,
+            head_dim=HEAD_DIM,
+            swa_attention_layer_ids=[0],
+            full_attention_layer_ids=[1],
+            device="cpu",
+            token_to_kv_pool_class=TpuSeqAlongLaneKVPool,
+        )
+    window_pages = int(raiden_common.get_raiden_kv_caches(producer).swa[0].shape[0])
+
+    def hidden(attn_tp_size, group=None):
+        return PdHiddenPool(
+            num_pages=window_pages,
+            page_size=PAGE,
+            feature_size=feature,
+            total_kv_heads=HEADS,
+            attn_tp_size=attn_tp_size,
+            attn_tp_group=group,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+            paged_by_swa=True,
+        )
+
+    prefill_hidden = hidden(1)
+    # SWA slots of the window tail; slot 0 marks a token left of the window.
+    slots = torch.tensor([0, PAGE * 2 + 3, PAGE * 2 + 4, PAGE + 9])
+    rows = torch.randn(len(slots), feature).to(torch.bfloat16)
+    prefill_hidden.write(
+        rows, segments=prefill_hidden.write_segments(slots, len(slots))
+    )
+    with patch.object(pd_hidden_pool, "_pd_hidden_pool", prefill_hidden):
+        groups = raiden_common.get_raiden_kv_caches(producer, draft_pool=producer)
+    assert (groups.num_hidden_full, groups.num_hidden_swa) == (0, 1)
+    pools = pl.pool_manifest(groups)
+    assert [p["tag"] for p in pools] == ["fa.l1", "swa.l0", "pdhid.swa.l0"]
+    _, swa_pools = ps.split_manifest(pools)
+    full_blocks, window_blocks = [5, 4, 3, 1], [2, 1]
+    spans = pp_common.part_spans(
+        swa_pools,
+        groups.swa,
+        full_blocks,
+        window_blocks,
+        dst_tp,
+        HEADS,
+        seq_along_lane=True,
+        with_swa=True,
+    )
+    assert spans[-1].tag == "pdhid.swa.l0" and spans[-1].block_ids == window_blocks
+    decode = [hidden(dst_tp) for _ in range(dst_tp)]
+    dst_blocks = [1, 3]
+    _land(spans[-1], groups.swa[-1], [d.buffer for d in decode], dst_blocks)
+
+    remap = dict(zip(window_blocks, dst_blocks))
+    live = slots[1:]
+    loc = torch.tensor([remap[int(s) // PAGE] * PAGE + int(s) % PAGE for s in live])
+    locals_ = [
+        d.buffer.flatten(0, 1).index_select(0, loc).reshape(len(live), -1)
+        for d in decode
+    ]
+    group = SimpleNamespace(
+        all_gather=lambda tensor, dim: torch.cat(
+            [t.unsqueeze(0) for t in locals_], dim=dim
+        )
+    )
+    reader = hidden(dst_tp, group)
+    reader.buffer = decode[0].buffer
+    assert torch.equal(reader.read(loc), rows[1:])
 
 
 def test_fingerprint_names_the_layout_and_ignores_per_rank_heads():

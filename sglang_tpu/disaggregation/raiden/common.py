@@ -85,8 +85,10 @@ class RaidenKVCacheGroups:
     # total_kv_heads on a TP=1 pipeline producer).
     draft_kv_head_num: Optional[int] = None
     draft_swa_kv_head_num: Optional[int] = None
-    # Trailing full tensors after the draft's: the PD hidden pool (pd_hidden_pool.py).
+    # Trailing full / swa tensors after the draft's: the PD hidden pool
+    # (pd_hidden_pool.py), in swa when a windowed draft pages it by SWA slots.
     num_hidden_full: int = 0
+    num_hidden_swa: int = 0
     # Per-layer request-state tensors (GDN/Mamba rows or DSV4 compressor rings).
     state: List[torch.Tensor] = field(default_factory=list)
     state_type: StateType = StateType.MAMBA
@@ -261,7 +263,7 @@ def get_raiden_kv_caches(
     seq_along_lane = _is_seq_along_lane(pool)
     full, swa = list(groups.full), list(groups.swa)
     full_ids, swa_ids = list(groups.full_layer_ids), list(groups.swa_layer_ids)
-    num_draft_full = num_draft_swa = num_hidden_full = 0
+    num_draft_full = num_draft_swa = num_hidden_full = num_hidden_swa = 0
     draft_kv_head_num: Optional[int] = None
     draft_swa_kv_head_num: Optional[int] = None
     if draft_pool is not None and draft_pool is not pool:
@@ -282,9 +284,14 @@ def get_raiden_kv_caches(
         draft_swa_kv_head_num = getattr(swa_draft_pool, "head_num", None)
 
     if hidden_pool is not None:
-        full.append(hidden_pool.buffer)
-        full_ids.append(0)
-        num_hidden_full = 1
+        # The uniform block count check below holds the rows to their page group.
+        tensors, ids = (swa, swa_ids) if hidden_pool.paged_by_swa else (full, full_ids)
+        tensors.append(hidden_pool.buffer)
+        ids.append(0)
+        if hidden_pool.paged_by_swa:
+            num_hidden_swa = 1
+        else:
+            num_hidden_full = 1
 
     state: List[torch.Tensor] = []
     state_type = StateType.MAMBA
@@ -326,6 +333,7 @@ def get_raiden_kv_caches(
         draft_kv_head_num=draft_kv_head_num,
         draft_swa_kv_head_num=draft_swa_kv_head_num,
         num_hidden_full=num_hidden_full,
+        num_hidden_swa=num_hidden_swa,
         state=state,
         state_type=state_type,
         state_max_blocks=state_max_blocks,

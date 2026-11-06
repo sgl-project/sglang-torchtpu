@@ -17,6 +17,7 @@ import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
@@ -73,14 +74,31 @@ def pd_hidden_bytes_per_token(
     )
 
 
-def build_pd_hidden_pool(target_runner: ModelRunner) -> PdHiddenPool:
-    """A hidden pool paged like the target's full-attention KV pages."""
+def build_pd_hidden_pool(
+    target_runner: ModelRunner, *, paged_by_swa: bool
+) -> PdHiddenPool:
+    """A hidden pool paged like the target's SWA pages when paged_by_swa (a windowed
+    draft), else like its full-attention pages."""
     kv_pool = target_runner.token_to_kv_pool
-    full = get_raiden_kv_caches(kv_pool).full
+    draft_kv_is_swa = target_runner.spec_aux_config.dflash_draft_kv_is_swa
+    if isinstance(kv_pool, SWAKVPool) and paged_by_swa != draft_kv_is_swa:
+        # budget_pd_hidden_pool sized the rows per SWA or full token by this flag.
+        raise RuntimeError(
+            f"The PD hidden pool pages by {'SWA' if paged_by_swa else 'full'} slots "
+            f"but the KV budget sized it by dflash_draft_kv_is_swa={draft_kv_is_swa}."
+        )
+    groups = get_raiden_kv_caches(kv_pool)
+    kind = "SWA" if paged_by_swa else "full-attention"
+    pages = groups.swa if paged_by_swa else groups.full
+    if not pages:
+        raise RuntimeError(
+            f"The PD hidden pool pages like the target's {kind} KV, which this "
+            "stage does not hold."
+        )
     parallel = get_parallel()
     return PdHiddenPool(
-        num_pages=int(full[0].shape[0]),
-        # Not full[0].shape[1]: a SEQ_ALONG_LANE page keeps its tokens on the last axis.
+        num_pages=int(pages[0].shape[0]),
+        # Not pages[0].shape[1]: a SEQ_ALONG_LANE page keeps its tokens on the last axis.
         page_size=kv_pool.page_size,
         feature_size=draft_feature_size(
             target_runner.spec_aux_config, target_runner.model_config.hidden_size
@@ -90,6 +108,7 @@ def build_pd_hidden_pool(target_runner: ModelRunner) -> PdHiddenPool:
         attn_tp_group=parallel.attn_tp_group if parallel.attn_tp_size > 1 else None,
         dtype=target_runner.dtype,
         device=target_runner.device,
+        paged_by_swa=paged_by_swa,
     )
 
 

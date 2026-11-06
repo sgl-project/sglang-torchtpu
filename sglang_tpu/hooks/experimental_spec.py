@@ -8,8 +8,9 @@ serves DSPARK and DFLASH on the TPU KDA checkpoint verify, so it skips both.
 materialize_future_map: the live FutureMap's lazy torch.empty buffers would fuse
 into their first store, compiling at whatever shape the first batch has.
 budget_pd_hidden_pool: the KV budget does not know the PD hidden pool built after
-it (SGLANG_TPU_PD_DECODE_DRAFT_PREFILL); add its bytes per full-pool token to the
-default or hybrid SWA configurator and reject the configurators it does not size.
+it (SGLANG_TPU_PD_DECODE_DRAFT_PREFILL); add its bytes per full-pool token (per SWA
+token for a windowed draft) to the default or hybrid SWA configurator and reject
+the configurators it does not size.
 Upstream seam issue: not filed (local prototype). Before proposing upstream,
 replace these hooks with agreed factories/overrides for the extracted operations.
 Remove when: the experiment is removed or those upstream seams are available.
@@ -443,9 +444,12 @@ def budget_pd_hidden_pool(result, kvc):
         and result._full_layers_num > 0
         and not result._enable_unified_memory
     ):
-        # The rows page like the full-attention pool, so they cost per full token;
-        # _draft_cell_size is the full-token term outside the SWA ratio.
-        result._draft_cell_size += hidden_bytes
+        # The rows page like the draft KV: per SWA token (inside the ratio) for a
+        # windowed draft, else per full token (build_pd_hidden_pool).
+        if kvc.spec_aux_config.dflash_draft_kv_is_swa:
+            result._draft_swa_cell_size += hidden_bytes
+        else:
+            result._draft_cell_size += hidden_bytes
         result._recompute_cell_size()
     else:
         # SWAChunkCap and unified memory size the full pool outside _cell_size, and

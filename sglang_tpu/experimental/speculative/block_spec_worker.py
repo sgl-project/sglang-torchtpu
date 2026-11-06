@@ -291,7 +291,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             cache_loc_cpu = batch.out_cache_loc
             assert cache_loc_cpu.device.type == "cpu", cache_loc_cpu.device
             full_to_swa = self._block_draft_worker.full_to_swa
-            if full_to_swa is not None and not self.ships_pd_hidden:
+            if full_to_swa is not None:
                 cache_loc_cpu = full_to_swa[cache_loc_cpu].to(cache_loc_cpu.dtype)
         positions = pad_rows(positions_cpu, padded_rows).to(
             self.device, non_blocking=True
@@ -345,15 +345,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         bonus_tokens: torch.Tensor,
     ) -> None:
         del bonus_tokens
-        full_to_swa = self._block_draft_worker.full_to_swa
-        if full_to_swa is not None:
-            # The hidden rows sit at full slots; a windowed draft writes the SWA slots.
-            cache_loc_cpu = batch.out_cache_loc
-            assert cache_loc_cpu.device.type == "cpu", cache_loc_cpu.device
-            cache_loc = pad_rows(
-                full_to_swa[cache_loc_cpu].to(cache_loc_cpu.dtype),
-                target_hidden.shape[0],
-            ).to(self.device, non_blocking=True)
+        # cache_loc is already the draft's slots (_pd_hidden_slots): SWA when windowed.
         positions = pad_rows(
             prompt_positions(
                 prefix_lens=batch.prefix_lens, extend_lens=batch.extend_lens
@@ -364,6 +356,9 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             self._block_draft_worker.write_draft_kv(
                 target_hidden=target_hidden, positions=positions, cache_loc=cache_loc
             )
+
+    def pd_hidden_full_to_swa(self) -> torch.Tensor | None:
+        return self._block_draft_worker.full_to_swa
 
     def pd_draft_prompt_starts(self, batch: ScheduleBatch) -> list[int]:
         full_to_swa = self._block_draft_worker.full_to_swa
