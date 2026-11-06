@@ -5,14 +5,19 @@ native read (PREFIX_READY). Also the pair-level refusals: a peer with the
 switch in the other state, and a decode that needs a resharded transfer.
 Manager fixtures come from test_raiden_failure_handling.py."""
 
+import errno
+import time
 import unittest
 from types import SimpleNamespace
+
+import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.disaggregation.raiden.dram_offload_channel import DramOffloadChannel
 from sglang_tpu.disaggregation.raiden.serde import (
+    MessageTag,
     PrefixPull,
     PrefixReady,
     PullReq,
@@ -318,6 +323,176 @@ class TestHostReadPollDeadline(CustomTestCase):
         channel.drain_host_reads()
         self.assertFalse(channel.host_prefix_pending(ROOM))
         self.assertFalse(mgr.room_has_active_io(ROOM))
+
+
+# ---- Lower-priority cases: less common paths, wire round trips, wording ----
+
+
+class TestPrefixPullWire(CustomTestCase):
+    def test_defaults_stay_off_the_wire_for_peers_from_before_the_fields(self):
+        """An older prefill forbids unknown fields; a decode with the switch
+        off and nothing to offer must still be served by it."""
+        req = PullReq(room=ROOM, decode_ip="10.0.0.2", decode_port=5555, decode_pages=2)
+        payload = req.to_frames()[1]
+        self.assertNotIn(b"kv_offload", payload)
+        self.assertNotIn(b"prefix_blocks", payload)
+        self.assertIn(
+            b"kv_offload",
+            PullReq(
+                room=ROOM,
+                decode_ip="10.0.0.2",
+                decode_port=5555,
+                decode_pages=2,
+                kv_offload=True,
+            ).to_frames()[1],
+        )
+        reshard = ReshardReq(
+            room=ROOM,
+            decode_ip="10.0.0.2",
+            decode_port=5555,
+            push_endpoint="10.0.0.2:31030",
+            decode_blocks=[1],
+            dst_attn_tp=2,
+            decode_swa_blocks=[],
+            swa_push_endpoint="",
+        )
+        self.assertNotIn(b"kv_offload", reshard.to_frames()[1])
+        self.assertEqual(ReshardReq.from_frames(reshard.to_frames()), reshard)
+
+    def test_pull_req_without_prefix_fields_offers_nothing(self):
+        # A decode without the feature encodes no prefix fields.
+        legacy = PullReq(
+            room=ROOM, decode_ip="10.0.0.2", decode_port=5555, decode_pages=4
+        )
+        req = PullReq.from_frames(legacy.to_frames())
+        self.assertEqual((req.prefix_blocks, req.kv_offload), ([], False))
+
+    def test_messages_round_trip(self):
+        for msg in (
+            PullReq(
+                room=ROOM,
+                decode_ip="10.0.0.2",
+                decode_port=5555,
+                decode_pages=4,
+                prefix_blocks=[3, 4, 5],
+                kv_offload=True,
+            ),
+            PrefixPull(room=ROOM, first_page=1, num_pages=2),
+            PrefixReady(room=ROOM, uuid=99, endpoint=DECODE_RAIDEN),
+        ):
+            with self.subTest(message=type(msg).__name__):
+                self.assertEqual(type(msg).from_frames(msg.to_frames()), msg)
+
+    def test_invalid_and_unknown_fields_are_rejected(self):
+        with self.assertRaises(ValueError):
+            PrefixPull(room=ROOM, first_page=0, num_pages=0)
+        with self.assertRaises(ValueError):
+            PrefixPull(room=-1, first_page=0, num_pages=1)
+        payload = b'{"room": 7, "first_page": 0, "num_pages": 1, "extra": 1}'
+        with self.assertRaises(ValueError):
+            PrefixPull.from_frames([MessageTag.PREFIX_PULL, payload])
+
+
+class TestDecodeOffersItsPrefixExtra(DecodeOffersItsPrefixFixture, CustomTestCase):
+    def test_unreachable_prefill_costs_only_the_recall(self):
+        mgr = decode_manager()
+        register_decode(mgr, offered=[3, 4])
+        mgr._send_multipart_locked.side_effect = zmq.ZMQError(errno.EHOSTUNREACH)
+        mgr._dispatch(PrefixPull(room=ROOM, first_page=0, num_pages=2).to_frames())
+        self.assertFalse(mgr.is_failed(ROOM))
+        # Any other errno is not one room's problem.
+        mgr._send_multipart_locked.side_effect = zmq.ZMQError(zmq.ETERM)
+        with self.assertRaises(zmq.ZMQError):
+            mgr._dispatch(PrefixPull(room=ROOM, first_page=0, num_pages=2).to_frames())
+
+    def test_unservable_pull_is_refused_with_no_pages(self):
+        def past_the_offer(mgr):
+            pass
+
+        def aborted(mgr):
+            mgr._aborted[ROOM] = time.time()
+
+        def rejected_registration(mgr):
+            host_transfer_of(mgr).register_read.side_effect = RuntimeError("injected")
+
+        for arm, first_page in (
+            (past_the_offer, 1),
+            (aborted, 0),
+            (rejected_registration, 0),
+        ):
+            with self.subTest(arm.__name__):
+                mgr = decode_manager()
+                register_decode(mgr, offered=[3, 4])
+                arm(mgr)
+                sent = len(sent_frames(mgr))
+                ready = self._served(mgr, first_page, 2)
+                self.assertEqual((ready.uuid, ready.endpoint), (0, ""))
+                self.assertEqual(len(sent_frames(mgr)), sent + 1)
+                self.assertEqual(mgr.dram_offload_channel._reads, {})
+                self.assertFalse(mgr.room_has_active_io(ROOM))
+                self.assertFalse(mgr.is_failed(ROOM))
+                self.assertEqual(mgr.failure_records, {})
+
+
+class TestPrefillWaitsForTheRecallExtra(CustomTestCase):
+    def test_offer_is_handed_out_once(self):
+        mgr = prefill_manager()
+        sender_on(mgr)
+        mgr._dispatch(pull_req(prefix_blocks=(3, 4)))
+        self.assertEqual(mgr.dram_offload_channel.take_prefix_offer(ROOM), [3, 4])
+        self.assertIsNone(mgr.dram_offload_channel.take_prefix_offer(ROOM))
+        # The gate stays shut until the puller settles the room.
+        self.assertFalse(mgr.finish_bootstrap_if_decode_requested(ROOM))
+
+    def test_unsettled_pull_is_given_up_after_the_bootstrap_timeout(self):
+        mgr = prefill_manager()
+        mgr.bootstrap_timeout = 0.5
+        sender = sender_on(mgr)
+        mgr._dispatch(pull_req())
+        self.assertEqual(sender.poll(), KVPoll.Bootstrapping)
+        mgr.dram_offload_channel._recalls[ROOM].offered_at = time.time() - 1
+        self.assertEqual(sender.poll(), KVPoll.WaitingForInput)
+        self.assertIsNone(mgr.dram_offload_channel.take_prefix_offer(ROOM))
+        self.assertNotIn(ROOM, mgr.failure_records)
+
+
+class TestPrefillRecallsIntoItsHostPagesExtra(
+    PrefillRecallsIntoItsHostPagesFixture, CustomTestCase
+):
+    def test_ready_for_a_room_without_an_offer_is_dropped(self):
+        mgr = prefill_manager()
+        sender_on(mgr)
+        mgr._dispatch(self._ready().to_frames())
+        self.assertIsNone(mgr.dram_offload_channel.prefix_ready(ROOM))
+        self.assertEqual(mgr.dram_offload_channel._recalls, {})
+
+    def test_read_is_refused_after_abort(self):
+        mgr = self._armed()
+        mgr._aborted[ROOM] = time.time()
+        self.assertFalse(
+            mgr.dram_offload_channel.start_host_read(
+                PX, 99, DECODE_RAIDEN, [4, 5], [40, 41]
+            )
+        )
+        host_transfer_of(mgr).start_read.assert_not_called()
+        self.assertEqual(mgr.dram_offload_channel._reads, {})
+
+    def test_a_read_settling_after_its_room_was_cleared_leaves_no_record(self):
+        for report in ("received", "failed"):
+            with self.subTest(report=report):
+                mgr = self._armed()
+                offload = mgr.dram_offload_channel
+                offload.start_host_read(PX, 99, DECODE_RAIDEN, [4, 5], [40, 41])
+                # As the sender's clear() does.
+                mgr.clear_status(ROOM)
+                mgr.clear_room(ROOM)
+                # The native read outlives the room until it reports.
+                self.assertIsNone(offload.poll_host_read(PX))
+                host_transfer_of(mgr).poll_transfer.return_value = report
+                offload.drain_host_reads()
+                host_transfer_of(mgr).forget_transfer.assert_called_once_with(PX)
+                self.assertIs(offload.poll_host_read(PX), False)
+                self.assertEqual(offload._reads, {})
 
 
 if __name__ == "__main__":

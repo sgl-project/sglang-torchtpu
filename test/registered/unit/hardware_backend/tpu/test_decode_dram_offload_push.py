@@ -14,7 +14,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.disaggregation.decode_dram_offload import (
@@ -26,6 +28,7 @@ from sglang_tpu.disaggregation.decode_dram_offload.dram_offload_hooks import (
     DecodeDramOffloadExtension,
     PrefillDramOffloadExtension,
 )
+from sglang_tpu.disaggregation.raiden.serde import VictimAck, VictimPush
 from sglang_tpu.testing.decode_dram_offload import (
     FULL,
     DecodeReceiverFixture,
@@ -244,7 +247,9 @@ class TestPrefillQueueHooks(CustomTestCase):
                 running_batch=SimpleNamespace(is_empty=lambda: not running),
             ),
         )
-        return queue, patch.object(dram_offload_hooks, "_extension", return_value=extension)
+        return queue, patch.object(
+            dram_offload_hooks, "_extension", return_value=extension
+        )
 
     def test_queue_step_is_driven_before_and_settled_after(self):
         for returned in (["a"], (["a"], ["failed"])):
@@ -295,10 +300,10 @@ class TestPrefillQueueHooks(CustomTestCase):
                 extension = _prefill_end()
                 queue, found = self._queue(extension, queued=False, running=running)
                 with found:
-                    dram_offload_hooks._pop_bootstrapped(MagicMock(return_value=[]), queue)
-                extension.before_bootstrap_step.assert_called_once_with(
-                    [], waiting_reqs=[], serving=running
-                )
+                    dram_offload_hooks._pop_bootstrapped(
+                        MagicMock(return_value=[]), queue
+                    )
+                extension.push.advance.assert_called_once_with(serving=running)
 
     def test_memory_release_first_lets_go_of_the_pages_of_the_prefill_end(self):
         calls = []
@@ -318,15 +323,20 @@ class TestPrefillQueueHooks(CustomTestCase):
             tree_cache="tree", disaggregation_mode=DisaggregationMode.PREFILL
         )
         with patch.object(dram_offload_hooks, "_extension", return_value=extension):
-            dram_offload_hooks._record_scheduler_state_for_paused_engine(MagicMock(), scheduler)
-            extension.settle_host_transfers.assert_called_once_with()
+            dram_offload_hooks._record_scheduler_state_for_paused_engine(
+                MagicMock(), scheduler
+            )
+            extension.recall.free_settled_host_landings.assert_called_once_with()
+            extension.push.retire_settled_pushes.assert_called_once_with()
             upstream = MagicMock(return_value=True)
             extension.recall.holds_host_landing_pages.return_value = True
             self.assertFalse(dram_offload_hooks._is_fully_idle(upstream, scheduler))
             # A health check asks about running requests only, or a probe of
             # an engine that only pushes would wait for a request to answer.
             self.assertTrue(
-                dram_offload_hooks._is_fully_idle(upstream, scheduler, for_health_check=True)
+                dram_offload_hooks._is_fully_idle(
+                    upstream, scheduler, for_health_check=True
+                )
             )
             extension.recall.holds_host_landing_pages.return_value = False
             self.assertTrue(dram_offload_hooks._is_fully_idle(upstream, scheduler))
@@ -336,7 +346,9 @@ class TestPrefillQueueHooks(CustomTestCase):
         # An engine without the prefill end is left to core.
         with patch.object(dram_offload_hooks, "_extension", return_value=None):
             upstream = MagicMock()
-            dram_offload_hooks._record_scheduler_state_for_paused_engine(upstream, scheduler)
+            dram_offload_hooks._record_scheduler_state_for_paused_engine(
+                upstream, scheduler
+            )
             upstream.assert_called_once_with(scheduler)
 
     def test_memory_release_for_a_weight_update_waits_for_transfers_in_flight(self):
@@ -369,8 +381,11 @@ class TestPrefillQueueHooks(CustomTestCase):
             tree_cache="tree", disaggregation_mode=DisaggregationMode.DECODE
         )
         with patch.object(dram_offload_hooks, "_extension", return_value=extension):
-            dram_offload_hooks._record_scheduler_state_for_paused_engine(MagicMock(), scheduler)
-        extension.settle_host_transfers.assert_called_once_with()
+            dram_offload_hooks._record_scheduler_state_for_paused_engine(
+                MagicMock(), scheduler
+            )
+        extension.source.settle_offers.assert_called_once_with()
+        extension.landing.finish_agreed_landings.assert_called_once_with()
 
 
 class TestOffloadIsAnExtensionOfTheL2Controller(CustomTestCase):
@@ -409,6 +424,326 @@ class TestOffloadIsAnExtensionOfTheL2Controller(CustomTestCase):
         upstream = MagicMock(return_value="done")
         self.assertEqual(dram_offload_hooks._checkpoint(upstream, cache, "req"), "done")
         prefill.push.track_host_leaf.assert_called_once_with("req")
+
+
+# ---- Lower-priority cases: less common paths, wire round trips, wording ----
+
+
+class TestWire(CustomTestCase):
+    def test_push_and_ack_round_trip(self):
+        for msg in (
+            VictimPush(
+                prefill="ab12",
+                seq=3,
+                ack_endpoint="tcp://10.0.0.9:7000",
+                tokens=[1, 2],
+                blocks=[4, 5],
+                uuid=9,
+                address="10.0.0.1:9000",
+            ),
+            VictimAck(seq=3, stored=True),
+            VictimAck(seq=4, stored=False),
+        ):
+            self.assertEqual(type(msg).from_frames(msg.to_frames()), msg)
+
+
+class TestPrefillPusherExtra(PrefillPusherFixture, CustomTestCase):
+    def test_declined_offer_retains_registration_pin_until_native_failed(self):
+        sent = self.offer_once()
+        self.replies[sent["seq"]] = False
+        self.pusher.advance(serving=True)
+        self.assertIn(sent["seq"], self.pusher._pushes)
+        self.cache.evict_host(32, FULL)
+        self.assertEqual(host_hit(self.cache, self.a), 8)
+        self.host.transfer.complete("failed")
+        self.pusher.advance(serving=True)
+        self.assertNotIn(sent["seq"], self.pusher._pushes)
+        self.assertEqual(self.pusher.stats["stored"], 0)
+        self.cache.evict_host(32, FULL)
+        self.assertEqual(host_hit(self.cache, self.a), 0)
+
+    def test_ack_timeout_does_not_release_pages_still_registered_with_native(self):
+        sent = self.offer_once()
+        with patch.object(prefill_dram_victim_pusher, "_ACK_TIMEOUT_S", -1):
+            self.pusher.advance(serving=True)
+        self.assertIn(sent["seq"], self.pusher._pushes)
+        self.cache.evict_host(32, FULL)
+        self.assertEqual(host_hit(self.cache, self.a), 8)
+        self.host.transfer.complete("failed")
+        self.pusher.advance(serving=True)
+        self.assertNotIn(sent["seq"], self.pusher._pushes)
+
+    def test_memory_release_refuses_while_a_push_is_in_flight(self):
+        sent = self.offer_once()
+        with self.assertRaisesRegex(RuntimeError, "not idle"):
+            self.pusher.release_all()
+        self.cache.evict_host(32, FULL)
+        self.assertEqual(host_hit(self.cache, self.a), 8)
+        self.replies[sent["seq"]] = False
+        self.host.transfer.complete("failed")
+        self.pusher.advance(serving=False)
+        self.pusher.release_all()
+        self.assertEqual(len(self.pusher._routes), 0)
+
+    def test_device_only_session_is_not_offered(self):
+        c = list(range(300, 308))
+        insert_tokens(self.cache, self.allocator, c)
+        self.peers[3] = ("10.0.0.3", 5003)
+        self.pusher.note_decode_of(pushed_req(room=3, tokens=c), recalled=False)
+        for _ in range(3):
+            self.pusher.advance(serving=True)
+            self.host.transfer.complete("failed")
+            seq = self.mgr.send_victim_push.call_args.kwargs["seq"]
+            self.replies[seq] = False
+        offered = [c.kwargs["tokens"] for c in self.mgr.send_victim_push.call_args_list]
+        self.assertNotIn(c, offered)
+
+    def test_no_offer_without_host_pressure(self):
+        with patch.object(prefill_dram_victim_pusher, "_PUSH_FULL_FREE_TOKENS", 0):
+            for _ in range(3):
+                self.pusher.advance(serving=True)
+        self.mgr.send_victim_push.assert_not_called()
+        self.assertFalse(self.host.transfer.registrations)
+
+
+class TestDecodeReceiverExtra(DecodeReceiverFixture, CustomTestCase):
+    def test_read_that_cannot_start_is_answered_as_not_stored(self):
+        self.host.transfer.read_error = RuntimeError("injected")
+        self.round()
+        self.assertEqual(self.receiver.stats["granted"], 1)
+        self.assertFalse(self.receiver.has_host_landings())
+        self.assertEqual(self.host.used, 0)
+        self.assertFalse(self.answered())
+
+    def test_cache_reset_refuses_while_a_landing_is_in_flight(self):
+        self.granted()
+        with self.assertRaisesRegex(RuntimeError, "not idle"):
+            self.receiver.release_all()
+        self.assertEqual(self.host.used, 8)
+        self.host.transfer.complete("failed")
+        self.round()
+        self.receiver.release_all()
+        self.assertEqual(self.host.used, 0)
+
+
+class TestDecodeFlushWaitsForDeferredReleases(CustomTestCase):
+    """A decode cache reset must wait for pages the transfer queue still owns."""
+
+    def _scheduler(self, *, deferred: bool, mode=DisaggregationMode.DECODE):
+        queue = SimpleNamespace(has_pending_deferred_releases=lambda: deferred)
+        return SimpleNamespace(
+            disaggregation_mode=mode, disagg_decode_transfer_queue=queue
+        )
+
+    def test_pinned_offers_keep_the_decode_non_idle_for_a_flush(self):
+        upstream = MagicMock(return_value=True)
+        scheduler = self._scheduler(deferred=True)
+        self.assertFalse(dram_offload_hooks._is_fully_idle(upstream, scheduler))
+        # Health checks only ask about running work, as upstream does.
+        self.assertTrue(
+            dram_offload_hooks._is_fully_idle(
+                upstream, scheduler, for_health_check=True
+            )
+        )
+        upstream.assert_called_with(
+            scheduler, for_health_check=True, ignore_waiting=False
+        )
+
+    def test_released_pages_and_other_roles_defer_to_upstream(self):
+        upstream = MagicMock(return_value=True)
+        self.assertTrue(
+            dram_offload_hooks._is_fully_idle(upstream, self._scheduler(deferred=False))
+        )
+        self.assertTrue(
+            dram_offload_hooks._is_fully_idle(
+                upstream,
+                self._scheduler(deferred=True, mode=DisaggregationMode.NULL),
+            )
+        )
+        upstream.return_value = False
+        self.assertFalse(
+            dram_offload_hooks._is_fully_idle(upstream, self._scheduler(deferred=False))
+        )
+
+    def test_scheduler_idle_check_is_wrapped(self):
+        self.assertIn(
+            (Scheduler, "is_fully_idle", dram_offload_hooks._is_fully_idle),
+            dram_offload_hooks._patch_targets(),
+        )
+
+
+class TestRecallLandingReclaimsHostDuplicates(CustomTestCase):
+    """A recall lands in the prefill's RAM; under write-through that RAM is
+    full of copies of pages the device still holds, which host eviction
+    never takes. The puller reclaims those copies for the landing."""
+
+    def _write_through_cache(self):
+        cache, allocator = full_cache(kv_size=64, host_capacity=16)
+        cache.tree_core.is_write_back = cache.is_write_back = False
+        tokens = list(range(100, 116))
+        insert_tokens(cache, allocator, tokens)
+        node = root_node(cache, 100)
+        host = cache.cache_controller.host
+        cache.tree_core.commit_backup(node.id, host.alloc(len(node.key)), {})
+        # The write-through ack registers the duplicate in production.
+        cache.tree_core._update_duplicate_tracking(node)
+        return cache, host, tokens
+
+    def test_host_only_eviction_frees_nothing_but_the_reclaim_does(self):
+        cache, host, tokens = self._write_through_cache()
+        self.assertEqual(host.available_size(), 0)
+        self.assertEqual(cache.evict_host(8, FULL), 0)
+        freed = radix_host_ops.reclaim_full_host_duplicates(cache, 8)
+        self.assertGreaterEqual(freed, 8)
+        self.assertGreaterEqual(host.available_size(), 8)
+        # The device copy is untouched: the prompt still hits in HBM.
+        self.assertEqual(device_hit(cache, tokens), 16)
+
+    def test_a_duplicate_whose_children_are_on_device_is_taken(self):
+        cache, host, tokens = self._write_through_cache()
+        _, allocator = cache, cache.token_to_kv_pool_allocator
+        insert_tokens(cache, allocator, tokens + [8] * 8)  # a device child
+        self.assertGreaterEqual(
+            radix_host_ops.reclaim_full_host_duplicates(cache, 8), 8
+        )
+
+    def test_a_duplicate_below_another_duplicate_is_taken_tip_first(self):
+        # Write-through host prefixes stay closed under ancestors: the child's
+        # copy goes first, the parent's only once no child has a host copy.
+        cache, host, tokens = self._write_through_cache()
+        _, allocator = cache, cache.token_to_kv_pool_allocator
+        host.capacity += 8
+        child_tokens = tokens + [8] * 8
+        insert_tokens(cache, allocator, child_tokens)
+        child = root_node(cache, 100).children[
+            next(iter(root_node(cache, 100).children))
+        ]
+        cache.tree_core.commit_backup(child.id, host.alloc(len(child.key)), {})
+        cache.tree_core._update_duplicate_tracking(child)
+        self.assertEqual(host.available_size(), 0)
+        freed = radix_host_ops.reclaim_full_host_duplicates(cache, 8)
+        self.assertEqual(freed, 8)  # the child's copy, not the parent's
+        parent = root_node(cache, 100)
+        self.assertTrue(parent.backuped)
+        self.assertFalse(child.backuped)
+        self.assertEqual(
+            radix_host_ops.reclaim_full_host_duplicates(cache, 16), 16
+        )  # now the parent is a host tip and goes too
+
+    def test_combined_demand_takes_the_child_then_the_parent_in_one_call(self):
+        # A landing larger than the first eligible tip: the pass that takes the
+        # child makes the parent eligible, and the same call must take it too
+        # instead of leaving the recall to fail with enough reclaimable RAM.
+        cache, host, tokens = self._write_through_cache()
+        _, allocator = cache, cache.token_to_kv_pool_allocator
+        host.capacity += 8
+        child_tokens = tokens + [8] * 8
+        insert_tokens(cache, allocator, child_tokens)
+        child = root_node(cache, 100).children[
+            next(iter(root_node(cache, 100).children))
+        ]
+        cache.tree_core.commit_backup(child.id, host.alloc(len(child.key)), {})
+        cache.tree_core._update_duplicate_tracking(child)
+        self.assertEqual(host.available_size(), 0)
+        self.assertEqual(radix_host_ops.reclaim_full_host_duplicates(cache, 16), 24)
+        self.assertGreaterEqual(host.available_size(), 16)
+        self.assertFalse(root_node(cache, 100).backuped)
+        self.assertFalse(child.backuped)
+
+    def test_a_duplicate_with_a_host_only_child_is_left_alone(self):
+        # Deleting its device leaf later would orphan the subtree below it.
+        cache, host, tokens = self._write_through_cache()
+        from array import array as _array
+
+        from sglang.srt.mem_cache.radix_cache import RadixKey as _RadixKey
+
+        host.capacity += 8
+        radix_host_ops.insert_host_prefix(
+            cache, _RadixKey(_array("q", tokens + [7] * 8)), host.alloc(8), 1
+        )
+        self.assertEqual(radix_host_ops.reclaim_full_host_duplicates(cache, 8), 0)
+
+    def test_reclaim_is_a_no_op_without_pressure(self):
+        cache, host, _ = self._write_through_cache()
+        self.assertEqual(radix_host_ops.reclaim_full_host_duplicates(cache, 0), 0)
+        self.assertEqual(host.available_size(), 0)
+
+
+class TestEvictionWalkSkipsDeletedLeaves(CustomTestCase):
+    """A leaf the eviction walk deleted earlier in the same walk may be
+    yielded again; the wrapper skips it instead of raising KeyError."""
+
+    def test_missing_leaf_is_skipped_and_present_leaf_is_evicted(self):
+        cache, allocator = full_cache(kv_size=32, host_capacity=32)
+        insert_tokens(cache, allocator, list(range(100, 108)))
+        node = root_node(cache, 100)
+        upstream = MagicMock(return_value="evicted")
+        self.assertEqual(
+            dram_offload_hooks._evict_device_leaf(upstream, cache, node.id, {}),
+            "evicted",
+        )
+        upstream.assert_called_once_with(cache, node.id, {})
+        upstream.reset_mock()
+        self.assertIsNone(
+            dram_offload_hooks._evict_device_leaf(upstream, cache, 10**9, {})
+        )
+        upstream.assert_not_called()
+
+    def _unbacked_parent_of_a_host_only_child(self):
+        cache, allocator = full_cache(kv_size=32, host_capacity=32)
+        tokens = list(range(100, 108))
+        insert_tokens(cache, allocator, tokens)
+        node = root_node(cache, 100)
+        host = cache.cache_controller.host
+        from array import array as _array
+
+        from sglang.srt.mem_cache.radix_cache import RadixKey as _RadixKey
+
+        # Core's host insert alone: insert_host_prefix would back the parent
+        # up with the received pages, which is the shape this walk must still
+        # handle when it arises otherwise (a reclaimed duplicate, a failed
+        # backup).
+        key = _RadixKey(_array("q", tokens + [7] * 8))
+        cache.tree_core.insert_host(
+            cache.tree_core.root_node.id,
+            key,
+            host.alloc(16),
+            radix_host_ops._page_hashes(list(key.token_ids), 1),
+        )
+        self.assertFalse(node.backuped)
+        return cache, node
+
+    def test_unbacked_parent_of_a_host_only_child_stays_on_device_write_through(self):
+        cache, node = self._unbacked_parent_of_a_host_only_child()
+        cache.tree_core.is_write_back = cache.is_write_back = False
+        upstream = MagicMock(return_value="evicted")
+        self.assertIsNone(
+            dram_offload_hooks._evict_device_leaf(upstream, cache, node.id, {})
+        )
+        upstream.assert_not_called()
+
+    def test_unbacked_parent_of_a_host_only_child_is_backed_up_under_write_back(self):
+        # write_back backs the node up before the demote (no orphan), so the
+        # wrapper must let the step run: skipping it leaves every session's
+        # leaf on the device after a recall landing and the walk frees nothing.
+        cache, node = self._unbacked_parent_of_a_host_only_child()
+        self.assertTrue(cache.is_write_back)
+        upstream = MagicMock(return_value="backup")
+        self.assertEqual(
+            dram_offload_hooks._evict_device_leaf(upstream, cache, node.id, {}),
+            "backup",
+        )
+        upstream.assert_called_once_with(cache, node.id, {})
+
+    def test_walk_is_wrapped(self):
+        self.assertIn(
+            (
+                UnifiedRadixCache,
+                "_evict_device_leaf",
+                dram_offload_hooks._evict_device_leaf,
+            ),
+            dram_offload_hooks._patch_targets(),
+        )
 
 
 if __name__ == "__main__":
