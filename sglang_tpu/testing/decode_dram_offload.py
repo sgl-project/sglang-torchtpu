@@ -412,7 +412,7 @@ class DecodeReceiverFixture:
 
 
 # ---------------------------------------------------------------------------
-# Recall: the prefill puller and the decode queue core_hooks
+# Recall: the prefill puller and the decode queue dram_offload_hooks
 # ---------------------------------------------------------------------------
 
 ROOM = 7
