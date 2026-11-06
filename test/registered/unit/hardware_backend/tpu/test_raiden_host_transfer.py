@@ -13,6 +13,7 @@ from sglang_tpu import raiden_transfer
 from sglang_tpu.raiden_transfer import RaidenKVTransfer
 from sglang_tpu.testing.decode_dram_offload import (
     RaidenHostTransferFixture,
+    native_report,
 )
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
@@ -155,6 +156,32 @@ class TestHostControlPortRace(RaidenHostTransferFixture, CustomTestCase):
             ]
         base = 31000 + raiden_transfer.HOST_POOL_CONTROL_PORT_OFFSET
         self.assertEqual(firsts, [base + 2, base + 3, 50001])
+
+
+# ---- Lower-priority cases: less common paths, wire round trips, wording ----
+
+
+class TestRaidenHostTransferExtra(RaidenHostTransferFixture, CustomTestCase):
+    def test_poll_keeps_other_victims_terminal_reports(self) -> None:
+        """Draining a manager for A must not steal B's one-shot completion."""
+        self.transfer.register_read("a", 1, [1])
+        self.transfer.start_read("b", 2, "peer:9000", [1], [2])
+        self.native.reports.append(native_report(sent=["a"], received=["b"]))
+        self.assertEqual(self.transfer.poll_transfer("a"), "sent")
+        self.assertEqual(self.transfer.poll_transfer("b"), "received")
+        self.assertEqual(self.transfer.poll_transfer("a"), "sent")
+        self.transfer.forget_transfer("a")
+        self.assertNotIn("a", self.transfer._host_transfers)
+        self.assertEqual(self.transfer.poll_transfer("b"), "received")
+
+    def test_control_address_uses_advertised_host_and_control_port(self) -> None:
+        self.assertEqual(
+            self.transfer.host_control_address("10.0.0.2"), "10.0.0.2:12345"
+        )
+        self.assertEqual(
+            self.transfer.host_control_address("2001:db8::1"),
+            "[2001:db8::1]:12345",
+        )
 
 
 if __name__ == "__main__":
