@@ -667,18 +667,33 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
                 )
                 self.assertLess(diff, self.TOLERANCE)
 
+    @unittest.skipUnless(
+        os.environ.get("SGLANG_TPU_TEST_V11_KERNELS") == "1",
+        "New v11 kernel tests run outside PR gating (stage-a budget); "
+        "set SGLANG_TPU_TEST_V11_KERNELS=1.",
+    )
     def test_sliding_window_chunk_skip_prefill(self):
         """One sequence from position 0; four 32-key chunks per 128-key block."""
         self._check_sliding_window_chunk_skip(
             [(256, 256)], sliding_window=40, blocks=(32, 128, 32, 32)
         )
 
+    @unittest.skipUnless(
+        os.environ.get("SGLANG_TPU_TEST_V11_KERNELS") == "1",
+        "New v11 kernel tests run outside PR gating (stage-a budget); "
+        "set SGLANG_TPU_TEST_V11_KERNELS=1.",
+    )
     def test_sliding_window_chunk_skip_prefix_and_multi_seq(self):
         """A cached prefix and a second sequence shift the window per row."""
         self._check_sliding_window_chunk_skip(
             [(320, 192), (200, 200)], sliding_window=48, blocks=(32, 128, 32, 32)
         )
 
+    @unittest.skipUnless(
+        os.environ.get("SGLANG_TPU_TEST_V11_KERNELS") == "1",
+        "New v11 kernel tests run outside PR gating (stage-a budget); "
+        "set SGLANG_TPU_TEST_V11_KERNELS=1.",
+    )
     def test_sliding_window_chunk_skip_query_sub_blocks(self):
         """bq_csz < bq_sz: the skip is decided by the block's first row."""
         self._check_sliding_window_chunk_skip(

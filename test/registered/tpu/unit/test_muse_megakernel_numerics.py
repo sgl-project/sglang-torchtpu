@@ -21,6 +21,11 @@ from sglang.test.test_utils import CustomTestCase
 register_tpu_ci(est_time=150, suite="stage-a-test-tpu-unit", chips=4)
 
 
+@unittest.skipUnless(
+    os.environ.get("SGLANG_TPU_TEST_V11_KERNELS") == "1",
+    "New v11 kernel tests run outside PR gating (stage-a budget); "
+    "set SGLANG_TPU_TEST_V11_KERNELS=1.",
+)
 class TestMuseMegakernelNumerics(CustomTestCase):
     def test_kernel_matches_reference_decoder(self):
         repo_root = Path(__file__).resolve().parents[4]

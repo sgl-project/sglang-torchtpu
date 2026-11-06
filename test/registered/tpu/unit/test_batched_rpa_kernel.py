@@ -548,9 +548,9 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
                 )
 
     @unittest.skipUnless(
-        os.environ.get("SGLANG_TPU_TEST_RPA_VARIANTS") == "1",
-        "Each variant recompiles (~60 s); outside the PR-gating budget, "
-        "run with SGLANG_TPU_TEST_RPA_VARIANTS=1.",
+        os.environ.get("SGLANG_TPU_TEST_V11_KERNELS") == "1",
+        "New v11 kernel tests run outside PR gating (stage-a budget); "
+        "set SGLANG_TPU_TEST_V11_KERNELS=1.",
     )
     def test_seq_along_lane_softmax_variants(self):
         """exp2 softmax and ones-in-V row sums match the reference on the fp8
@@ -581,9 +581,9 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
         jax.clear_caches()
 
     @unittest.skipUnless(
-        os.environ.get("SGLANG_TPU_TEST_RPA_VARIANTS") == "1",
-        "Each variant recompiles (~60 s); outside the PR-gating budget, "
-        "run with SGLANG_TPU_TEST_RPA_VARIANTS=1.",
+        os.environ.get("SGLANG_TPU_TEST_V11_KERNELS") == "1",
+        "New v11 kernel tests run outside PR gating (stage-a budget); "
+        "set SGLANG_TPU_TEST_V11_KERNELS=1.",
     )
     def test_seq_along_lane_transposed(self):
         """The transposed prefill tile (scores^T, fp8 q) tracks the reference on
