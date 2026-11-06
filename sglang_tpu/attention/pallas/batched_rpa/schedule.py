@@ -522,7 +522,8 @@ def compute_metadata(
 
     `cfgs.serve.cache_only` reads the whole `kv_len` from the cache too, but the
     queries follow every key: no causal bound, and every q block gets at least
-    one k block. `cp_rank_ref` / `kv_lens_global_ref` (with `cp_group_size`)
+    one k block. Without `cfgs.serve.causal` every q block runs to the last k
+    block; the sliding window still sets the first. `cp_rank_ref` / `kv_lens_global_ref` (with `cp_group_size`)
     move the sliding window to global positions.
     """
 
@@ -595,7 +596,12 @@ def compute_metadata(
 
         # Writeback logic: each new k block is written back by the first q block
         # that attends to it.
-        q_wb = jnp.maximum(0, (kv_len_start - (k_len - q_len))) // cfgs.bq_sz
+        if cfgs.serve.causal:
+            q_wb = jnp.maximum(0, (kv_len_start - (k_len - q_len))) // cfgs.bq_sz
+        else:
+            # Non-causal q block 0 visits every k block from its window start on,
+            # which precedes the first new token.
+            q_wb = 0
 
         do_writeback = jnp.where((new_sz > 0) & (q_idx == q_wb), 1, 0)
         if cfgs.serve.skip_kv_write:
@@ -730,6 +736,9 @@ def compute_metadata(
             # No causal bound. One k block always runs, so a q block with no key
             # in range still writes output 0 and LSE -inf.
             end_k_idx = jnp.maximum(num_k, start_k_idx + 1)
+        elif not cfgs.serve.causal:
+            # Queries also see the keys after them, up to kv_len.
+            end_k_idx = num_k
         else:
             end_k_idx_causal = (
                 k_len - q_len + q_idx * cfgs.bq_sz + q_sz_task - 1

@@ -177,7 +177,7 @@ def calculate_and_store_out(
             h = cfgs.aligned_kv_head_dim
             batch_l = batch_acc[..., h : 2 * h]
             batch_acc = batch_acc[..., :h]
-        if cfgs.serve.cache_only:
+        if cfgs.serve.cache_only or not cfgs.serve.causal:
             # A row that attended no key keeps l == 0 and outputs 0.
             batch_l = jnp.where(batch_l == 0, jnp.ones_like(batch_l), batch_l)
         batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
@@ -254,7 +254,8 @@ def rpa_body(
     # Step 1: Fetch metadata.
     processed_q_len = []
     processed_kv_len = []
-    kv_len_left = [] if cfgs.serve.cache_only else None
+    # Without the causal bound, kv_len is the only upper bound on the keys.
+    kv_len_left = [] if cfgs.serve.cache_only or not cfgs.serve.causal else None
     global_q_k_gap = None
     if cfgs.serve.cp_group_size is not None and cfgs.model.sliding_window is not None:
         global_q_k_gap = []
@@ -379,9 +380,10 @@ def rpa_body(
                 k_head_loaded = utils.strided_load(
                     k_head_ref, 0, pack_dim, 1, dtype=cfgs.serve.dtype_kv
                 )
-                v_head_loaded = utils.strided_load(
-                    v_head_ref, 0, pack_dim, 1, dtype=cfgs.serve.dtype_kv
-                )
+                v_head_loaded = utils.strided_load(v_head_ref, 0, pack_dim, 1)
+                if not cfgs.serve.causal:
+                    v_head_loaded = _zero_stale_lanes(v_head_loaded, kv_len_left[b_idx])
+                v_head_loaded = pltpu.bitcast(v_head_loaded, cfgs.serve.dtype_kv)
 
                 k_head = k_head_loaded[:, : cfgs.bkv_sz]
                 v_head = v_head_loaded[:, : cfgs.bkv_sz]
@@ -589,6 +591,15 @@ def rpa_body(
     @pl.when(jnp.logical_not(full_tile))
     def _():
         compute_and_store(apply_mask=True)
+
+
+def _zero_stale_lanes(v_u32: jax.Array, kv_len_left: jax.Array) -> jax.Array:
+    """Zeroes the token lanes past kv_len of packed seq-along-lane V words.
+
+    Masked p is 0 there, but 0 * NaN from a stale page tail is still NaN.
+    """
+    lane = lax.broadcasted_iota(jnp.int32, v_u32.shape, 1)
+    return jnp.where(lane < kv_len_left, v_u32, jnp.zeros((), v_u32.dtype))
 
 
 def _full_tile(step, schedule_ref, processed_q_len, processed_kv_len, cfgs):

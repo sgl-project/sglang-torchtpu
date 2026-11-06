@@ -307,6 +307,35 @@ class TestBatchedRpaKernelArguments(CustomTestCase):
             )
         self.assertIs(kernel.call_args.kwargs["attention_sink"], sinks)
 
+    def test_non_causal_reaches_the_kernel(self):
+        from sglang_tpu import attention_pallas_rpa_batched
+
+        for use_causal_mask in (True, False):
+            kernel = Mock(return_value="out")
+            with patch.object(
+                attention_pallas_rpa_batched, "kv_layout", return_value="layout"
+            ):
+                attention_pallas_rpa_batched._invoke_batched_kernel(
+                    kernel,
+                    queries="q",
+                    keys="k",
+                    values="v",
+                    kv_cache_fused="cache",
+                    kv_lens="kv_lens",
+                    page_indices="pages",
+                    cu_q_lens="cu_q_lens",
+                    cu_kv_lens="cu_kv_lens",
+                    distribution="distribution",
+                    attention_sink=None,
+                    sm_scale=0.125,
+                    sliding_window=2048,
+                    soft_cap=None,
+                    k_scale=None,
+                    v_scale=None,
+                    use_causal_mask=use_causal_mask,
+                )
+            self.assertIs(kernel.call_args.kwargs["use_causal_mask"], use_causal_mask)
+
 
 class TestMixedVerifyTailsLast(CustomTestCase):
     """SGLANG_TPU_MIXED_VERIFY_TAILS_LAST: the tails stay last and no row moves."""

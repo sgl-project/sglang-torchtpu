@@ -85,11 +85,6 @@ def _invoke_batched_kernel(
     decode_query_size=1,
     use_causal_mask=True,
 ):
-    if not use_causal_mask:
-        raise NotImplementedError(
-            "pallas_tpu_rpa_batched supports only causal attention; "
-            "use pallas_tpu_rpa_v3."
-        )
     # cu_kv_lens is not consumed by the batched kernel.
     # It builds its schedule inline and has no per-mode dispatch to skip, so
     # the argument the shared shell passes for kernels that do is
@@ -112,7 +107,8 @@ def _invoke_batched_kernel(
             soft_cap=soft_cap,
             k_scale=k_scale,
             v_scale=v_scale,
-            use_causal_mask=True,
+            # Non-causal (DFlash draft layers) needs SEQ_ALONG_LANE; the kernel raises otherwise.
+            use_causal_mask=use_causal_mask,
             # The kernel owns the KV write; the backend never writes out of band.
             skip_kv_update=False,
             kv_layout=kv_layout(),

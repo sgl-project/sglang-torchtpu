@@ -747,7 +747,8 @@ def ragged_paged_attention(
             size of the hardware.
         debug_mode: Not used.
         out_dtype: Dtype of output. Defaults to dtype of queries.
-        use_causal_mask: Not used.
+        use_causal_mask: False lets each query see every key below kv_len, the
+            sliding window bounding only from below (RPA v3 causal=0).
         skip_kv_update: Cross-layer KV cache sharing. When True, this (shared)
             layer reads its entire K/V span from the cache slot written by its
             target layer earlier in the same forward pass, ignores its own k/v
@@ -781,8 +782,6 @@ def ragged_paged_attention(
     if kv_layout is None:
         kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
 
-    if not use_causal_mask:
-        raise ValueError("Only causal attention is supported.")
     if chunk_prefill_size is not None:
         raise ValueError("Specifying chunk prefill size is not supported.")
     if debug_mode:
@@ -833,6 +832,7 @@ def ragged_paged_attention(
         kv_layout=kv_layout,
         cache_only=cache_only,
         skip_kv_write=skip_kv_write,
+        causal=use_causal_mask,
         return_lse=return_lse,
         cp_group_size=cp_group_size,
         skip_full_tile_mask=tpu_envs.SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK.get(),
@@ -871,6 +871,8 @@ def ragged_paged_attention(
             and not return_lse
             and not cache_only
             and cp_group_size is None
+            # The transposed tile has only the causal mask.
+            and use_causal_mask
         ),
         skip_pad_q=tpu_envs.SGLANG_TPU_RPA_SKIP_PAD_Q.get(),
         skip_pad_q_group=tpu_envs.SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP.get(),
