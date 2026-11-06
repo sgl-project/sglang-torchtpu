@@ -29,7 +29,7 @@ from sglang.srt.speculative.eagle_info import (
 )
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.compilation import direct_compile
+from sglang_tpu.compilation import decoder_compile_policy, direct_compile
 from sglang_tpu.compilation.attention_rank_inputs import (
     use_attention_rank_tensors,
 )
@@ -1629,6 +1629,46 @@ class _RankModel(torch.nn.Module):
 class _RankPolicy(DecoderTpuCompilePolicy):
     def _direct_compile_specialization_key(self, metadata, input_ids, *args, **kwargs):
         return tuple(input_ids.shape)
+
+
+class TestPolicyRankLifting(unittest.TestCase):
+    def test_subgroups_require_shared_compilation(self):
+        model = torch.nn.Identity()
+        policy = _RankPolicy(
+            model_runner=SimpleNamespace(model=model, token_to_kv_pool=None),
+            owner=model,
+            tracer="direct",
+        )
+        for initialized, tp_size, world_size, shared, expected in (
+            (False, 1, 1, False, False),
+            (True, 2, 16, False, False),  # PP8/TP2
+            (True, 1, 16, False, False),  # PP16/TP1
+            (True, 4, 8, False, False),
+            (True, 4, 8, True, True),  # DP2/TP4 shared compilation
+            (True, 16, 16, False, True),
+        ):
+            with (
+                self.subTest(tp_size=tp_size, world_size=world_size, shared=shared),
+                patch("torch.distributed.is_initialized", return_value=initialized),
+                patch("torch.distributed.get_world_size", return_value=world_size),
+                patch.object(
+                    decoder_compile_policy,
+                    "get_parallel",
+                    return_value=SimpleNamespace(
+                        tp_group=SimpleNamespace(world_size=tp_size)
+                    ),
+                ),
+                patch.object(
+                    decoder_compile_policy,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        graph=SimpleNamespace(use_spmd_compile=shared)
+                    ),
+                ),
+                patch.object(direct_compile, "direct_compile") as compile_mock,
+            ):
+                policy._direct_compile(model.forward)
+                self.assertIs(compile_mock.call_args.kwargs["lift_rank"], expected)
 
 
 class TestAttentionRankTensorScope(unittest.TestCase):
