@@ -22,7 +22,7 @@ class TestGlmFlashMegakernelBuckets(CustomTestCase):
 class TestPoolBookkeeping(CustomTestCase):
     def test_record_bytes_match_the_pool_layout(self):
         """The kernel's record stride is the pool's: a mismatch reads the wrong pooled key."""
-        from sglang_tpu.glm_flash_megakernel.kernel import pools as PL
+        from sglang_tpu.glm_flash_megakernel import layout as PL
         from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
 
         for d in (64, 128, 256):
@@ -35,7 +35,7 @@ class TestPoolBookkeeping(CustomTestCase):
         and stores those and no others."""
         import numpy as np
 
-        from sglang_tpu.glm_flash_megakernel.kernel import pools as PL
+        from sglang_tpu.glm_flash_megakernel import layout as PL
 
         kp = 4
         for Q in (1, 2, 4):

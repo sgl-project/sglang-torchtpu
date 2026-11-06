@@ -14,6 +14,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang_tpu.glm_flash_megakernel.layout import closing_pools, record_bytes  # noqa: F401
+
 F32 = jnp.float32
 BF16 = jnp.bfloat16
 U8 = jnp.uint8
@@ -85,21 +87,6 @@ def rotate(x, h):
     """`hadamard_rotate` of bf16-rounded rows: exact +-1 products, f32 sums, then d**-0.5."""
     d = x.shape[-1]
     return jnp.dot(x.astype(BF16), h, preferred_element_type=F32) * (d**-0.5)
-
-
-def record_bytes(head_dim):
-    """Bytes per pooled record: key in whole 128-byte lanes plus one scale byte per lane, lane-rounded."""
-    lane = 128
-    key = -(-head_dim // lane) * lane
-    return -(-(key + key // lane) // lane) * lane
-
-
-def closing_pools(pos, Q, kp):
-    """(first pool, count) of the pools whose last token is one of pos .. pos+Q-1."""
-    first = (pos + kp) // kp - 1
-    first = jnp.where((first + 1) * kp - 1 >= pos, first, first + 1)
-    last = (pos + Q) // kp - 1
-    return first, jnp.maximum(last - first + 1, 0)
 
 
 def pool_records(keys, record_bytes):
