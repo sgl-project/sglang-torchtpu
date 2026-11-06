@@ -882,6 +882,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # Process the oldest batch result.
                 oldest_batch, oldest_batch_result = self.result_queue.popleft()
                 self.process_batch_result(oldest_batch, oldest_batch_result)
+                del oldest_batch, oldest_batch_result
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
