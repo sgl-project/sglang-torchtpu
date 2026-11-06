@@ -457,12 +457,17 @@ class TpuEnvs:
     SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS = EnvInt(0)
     # MoE: use onehot dense matmul for small permute and unpermute/combine
     # paths instead of gather. When set to 0, this is disabled. When set
-    # to a positive integer, this is the threshold for tokens per rank below
-    # which the dense matmul path is taken. Suggset to start with 1024 or 2048
-    # and tune from there. Below it, batches of up to 2048 routed rows also
-    # take the sort-free dense rank route, and one-token batches the
-    # route-meta kernel.
+    # to a positive integer, the permute is dense below this many tokens per
+    # rank and the combine below this many routed rows (tokens x topk).
+    # Suggest to start with 1024 or 2048 and tune from there. Below it,
+    # batches of up to 2048 routed rows also take the sort-free dense rank
+    # route, and one-token batches the route-meta kernel.
     SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD = EnvInt(0)
+    # MoE: where the permute is dense and the combine is the SparseCore gather
+    # (threshold / topk <= tokens < threshold), permute with the gather too.
+    # Set at startup by SGLANG_TPU_K3_STATIC_FP8 moe_front or latent_up: there a
+    # one-hot permute feeding the SparseCore combine gave wrong tokens.
+    SGLANG_TPU_FORCE_MOE_GATHER_PERMUTE_WITH_SC_COMBINE = EnvBool(False)
     # Turn off EP-local expert reads (models that opt in read only their EP
     # rank's routed experts with --weight-loader-disable-mmap).
     SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS = EnvBool(False)
