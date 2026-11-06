@@ -35,9 +35,9 @@ extra_args=(
   --tpu-compile-tracer direct
   --tpu-fp8-runtime channelwise
   --sampling-defaults openai
-  # Fuse the per-head q/k RMSNorms and the rotary embedding into one Pallas op
-  # which is faster than a series of separate ops.
-  --enable-fused-qk-norm-rope
+  # --enable-fused-qk-norm-rope is disabled: on head_dim-128 models (the only
+  # ones that actually run the fused Pallas op) it crashes the EXTEND precompile
+  # with a SparseCore UserFatal. Re-enable once the kernel is fixed.
 )
 export EXTRA_ARGS="${extra_args[*]}${EXTRA_ARGS:+ $EXTRA_ARGS}"
 
