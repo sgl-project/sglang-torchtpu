@@ -502,6 +502,12 @@ class TpuEnvs:
     # offload does not support are refused at startup
     # (disaggregation/decode_dram_offload/validate.py).
     SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM = EnvBool(False)
+    # P/D radix caches of a hybrid SWA model (see pd_decode_swa_hicache.py), one
+    # value on both roles. Decode: host RAM for this many sliding windows, the
+    # last window of each cached path. Prefill: back up only the last SWA window
+    # of each path to host RAM, so it can travel with an offloaded branch.
+    # Unset: 128 with the offload switch on, else 0 (full KV only in host RAM).
+    SGLANG_TPU_PD_SWA_HOST_WINDOWS = EnvInt(None)
 
     @classmethod
     def names(cls) -> list[str]:
