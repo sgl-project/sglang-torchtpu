@@ -1,4 +1,4 @@
-"""Health probes are acknowledged only by completed inference (S727567).
+"""Health probes are acknowledged only by completed inference.
 
 A prefill engine whose model execution stalled kept passing /health_generate
 because any scheduler message counted. Now every probe is registered with the

@@ -4,7 +4,7 @@ The handler registers its probe with the tokenizer manager and waits for a
 HealthCheckOutput that names the probe rid and carries the scheduler's
 incarnation and a completion sequence newer than the baseline recorded when
 the probe was registered. Any other message, including a legacy empty ack, a
-stale replay or an ack for another probe, leaves the probe failing (S727567).
+stale replay or an ack for another probe, leaves the probe failing.
 
 It also must not leave its abandoned probe's exception unretrieved: the cancel
 can lose against _stream_one_response's wait_for timeout, and nothing awaits
@@ -117,8 +117,8 @@ class TestHealthGenerateCompletionAck(CustomTestCase):
         self.assertEqual(unretrieved, [])
 
     def test_any_received_message_alone_fails(self):
-        # The pre-S727567 predicate: abort/control/error traffic bumps the
-        # receive timestamp while the model is stalled.
+        # The old predicate: abort/control/error traffic bumps the receive
+        # timestamp while the model is stalled.
         response, tokenizer_manager, _ = self.call_health_generate(
             _probe_that_acks(lambda rid: None, bump_tstamp=True)
         )
