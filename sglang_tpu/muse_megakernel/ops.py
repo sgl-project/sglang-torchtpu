@@ -745,6 +745,9 @@ class MuseMegakernel(torch.nn.Module):
                 fold_f=do_fold,
             )
         if tiled:
+            # Row-tiled plans at 128-192 rows of 8 need 60.1-60.9 MiB with LLO temporaries;
+            # scoped VMEM may go to the 62 MiB v7x limit, as the aliased base plan does.
+            cfg = msgspec.structs.replace(cfg, vmem_limit_bytes=_OPT_ALIASED_VMEM_LIMIT)
             vys = (
                 (cfg.tiled_vmem_y, 1) if cfg.tiled_vmem_y >= 2 else (cfg.tiled_vmem_y,)
             )
