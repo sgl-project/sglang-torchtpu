@@ -12,7 +12,15 @@ from pathlib import Path
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_tpu_ci(est_time=60, suite="stage-a-test-tpu-unit", chips=4)
+# Four ranks under torchrun hold every chip of the host (266 s in the PR gate),
+# which the stage-a budget cannot fit; run it nightly.
+register_tpu_ci(
+    est_time=270,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    chips=4,
+    labels=["singlehost", "infra", "compile"],
+)
 
 
 class TestRankLocal(CustomTestCase):
