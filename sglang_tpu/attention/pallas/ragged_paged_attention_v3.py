@@ -1785,6 +1785,7 @@ def get_vmem_limit():
         "d_block_sizes",
         "p_block_sizes",
         "m_block_sizes",
+        "mixed_max_q_len",
         "vmem_limit_bytes",
         "out_dtype",
         "skip_kv_mask",
@@ -1821,6 +1822,7 @@ def ragged_paged_attention(
     d_block_sizes: tuple[int, int, int, int] | None = None,
     p_block_sizes: tuple[int, int, int, int] | None = None,
     m_block_sizes: tuple[int, int, int, int] | None = None,
+    mixed_max_q_len: int | None = None,
     vmem_limit_bytes: int | None = None,
     out_dtype=None,
     skip_kv_mask: bool = False,
@@ -1864,6 +1866,8 @@ def ragged_paged_attention(
       d_block_sizes: block sizes for decode (bq_sz, bkv_sz, bq_csz, bkv_csz).
       p_block_sizes: block sizes for prefill.
       m_block_sizes: block sizes for mixed.
+      mixed_max_q_len: upper bound on any MIXED sequence's query rows; when set
+        (a ragged speculative verify), MIXED uses decode-shaped tiles.
       vmem_limit_bytes: vmem limit for the pallas kernel.
       debug_mode: if true, skip DMAs and flash attention.
 
@@ -2144,6 +2148,38 @@ def ragged_paged_attention(
         return run(scalar_prefetches, q, kv, kv_cache)
 
     def _prepare_block_sizes(block_sizes, case):
+        if block_sizes is None and case == RpaCase.MIXED and mixed_max_q_len:
+            # A ragged speculative verify: every sequence holds at most
+            # mixed_max_q_len queries over a decode-length context. One query
+            # tile per sequence and a 2048-token KV tile without inner chunking:
+            # on Qwen3-8B TP8 shapes (tpu7x) that is 92/186/312 us at ~1k/4k/8k
+            # contexts vs 143/436/766 us for prefill-shaped tiles; a 1024 tile
+            # ties at 1k but costs 254/463 us at 4k/8k.
+            bkv_alignment = max(
+                page_size, get_dtype_packing(kv_cache_fused_processed.dtype)
+            )
+            bkv_sz = align_to(min(2048, pages_per_seq * page_size), bkv_alignment)
+            # Same VMEM margin as the default MIXED tiles: many local KV heads
+            # (e.g. TP1) would not fit a 2048-token double-buffered KV tile.
+            vmem_budget = int(vmem_limit_bytes * 0.60)
+            while bkv_sz > bkv_alignment and vmem_budget < get_vmem_estimate_bytes(
+                actual_num_kv_heads,
+                actual_num_q_heads // actual_num_kv_heads,
+                head_dim,
+                mixed_max_q_len,
+                bkv_sz,
+                q.dtype,
+                kv_cache_fused_processed.dtype,
+                use_custom_mask=use_custom_mask,
+                bkv_csz=bkv_sz,
+            ):
+                bkv_sz = align_to(max(bkv_sz // 2, bkv_alignment), bkv_alignment)
+            return {
+                "bq_sz": mixed_max_q_len,
+                "bkv_sz": bkv_sz,
+                "bq_csz": mixed_max_q_len,
+                "bkv_csz": bkv_sz,
+            }
         if block_sizes is None:
             return get_default_block_sizes(
                 q.dtype,

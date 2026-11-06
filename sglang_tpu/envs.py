@@ -264,6 +264,11 @@ class TpuEnvs:
     # TpuBlockSpecWorker's candidate acceptance by block verification (Sun et al.
     # 2024, Algorithm 2) instead of token-wise rejection; lossless either way.
     SGLANG_TPU_SPEC_BLOCK_VERIFICATION = EnvBool(False)
+    # TpuBlockSpecWorker (DSpark) verify width per decode batch bucket, as
+    # "min_bs:width,...", e.g. "1:8,16:6,64:4": a bucket takes the width of the
+    # largest min_bs <= it. Width counts the root, in [2, gamma + 1]. Unset
+    # verifies all gamma drafts at every bucket.
+    SGLANG_TPU_SPEC_VERIFY_WIDTH_BY_BS = EnvStr(None)
     # PD on the experimental spec worker: the prefill ships the target's draft-input
     # hidden states (pd_hidden_pool.py) and the decode builds the draft KV and carry,
     # instead of the prefill running the draft over the prompt.

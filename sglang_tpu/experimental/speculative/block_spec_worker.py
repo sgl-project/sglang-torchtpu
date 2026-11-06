@@ -61,6 +61,7 @@ from sglang_tpu.experimental.speculative.spec_ops import (
     TARGET_CANDIDATES,
     build_draft_block_inputs,
     select_verify_rows,
+    truncate_drafts,
 )
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
@@ -76,6 +77,7 @@ from sglang_tpu.experimental.speculative.spec_utils import (
     padded_h2d,
     prompt_positions,
 )
+from sglang_tpu.experimental.speculative.verify_width import verify_width_table
 from sglang_tpu.sampler import distributed_top_k_candidate_width_for_model
 
 _DRAFT_WORKER_CLS: dict[SpeculativeAlgorithm, type[TpuBlockDraftWorker]] = {
@@ -126,6 +128,31 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=self._draft_block_width, device=self.device
         )
+        self._verify_width_table = verify_width_table(self.num_verify_rows)
+        if self._verify_width_table is not None:
+            self._check_verify_width_table_supported()
+
+    def _check_verify_width_table_supported(self) -> None:
+        if self._spec_algorithm != SpeculativeAlgorithm.DSPARK:
+            # DFlash2 builds its verify tokens and candidates at gamma.
+            raise NotImplementedError(
+                "SGLANG_TPU_SPEC_VERIFY_WIDTH_BY_BS supports only DSPARK."
+            )
+        if self._target_has_linear_attn:
+            # The linear-attention verify checkpoints assume the full width.
+            raise NotImplementedError(
+                "SGLANG_TPU_SPEC_VERIFY_WIDTH_BY_BS does not support linear-attention targets."
+            )
+
+    def verify_widths(self) -> tuple[int, ...]:
+        if self._verify_width_table is None:
+            return (self.num_verify_rows,)
+        return self._verify_width_table.reachable_widths(self._bucket_sizes())
+
+    def verify_width_for(self, padded_bs: int) -> int:
+        if self._verify_width_table is None:
+            return self.num_verify_rows
+        return self._verify_width_table.width_for(padded_bs)
 
     def init_cuda_graphs(self) -> None:
         super().init_cuda_graphs()
@@ -157,19 +184,23 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         del batch
         state = bucket.state
         bs = state.seq_lens.shape[0]
+        width = rows.cache_locs.shape[1]
         block_hidden, graph_draft_tokens, draft_lattice = self._forward_draft_block(
             state=state,
             live_mask=bucket.live_mask,
-            rows=rows,
+            rows=self._draft_block_rows(rows, verify_input, state.seq_lens),
             verify_input=verify_input,
         )
-        # No confidence budget yet: every bucket verifies all gamma drafts.
-        num_verify_drafts = self._all_drafts[bs]
+        # The draft block always drafts gamma; a narrower step verifies the first width - 1.
+        num_verify_drafts = self.num_verify_drafts(bs, width)
         temperatures, top_ks = bucket.temperatures, bucket.top_ks
         if temperatures is None or top_ks is None or not self._sampled_drafts:
             # The draft graph already drafted greedily (sample_draft_tokens_tpu).
+            draft_tokens, _ = self._truncate_drafts(
+                self._sync_greedy_drafts(graph_draft_tokens), None, width
+            )
             return DraftResult(
-                draft_tokens=self._sync_greedy_drafts(graph_draft_tokens),
+                draft_tokens=draft_tokens,
                 draft_logits=None,
                 num_verify_drafts=num_verify_drafts,
             )
@@ -181,13 +212,41 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             top_ks,
             target_candidates=bucket.target_candidates,
         )
+        if width != self.num_verify_rows:
+            assert sampled.verify_tokens is None and sampled.draft_candidates is None
+        draft_tokens, draft_logits = self._truncate_drafts(
+            sampled.draft_tokens, sampled.draft_logits, width
+        )
         return DraftResult(
-            draft_tokens=sampled.draft_tokens,
-            draft_logits=sampled.draft_logits,
+            draft_tokens=draft_tokens,
+            draft_logits=draft_logits,
             num_verify_drafts=num_verify_drafts,
             verify_tokens=sampled.verify_tokens,
             draft_candidates=sampled.draft_candidates,
         )
+
+    def _draft_block_rows(
+        self, rows: VerifyRows, verify_input: TpuSpecVerifyInput, seq_lens: torch.Tensor
+    ) -> VerifyRows:
+        """Full-width rows for the draft block, which writes draft KV into all gamma + 1 slots."""
+        if rows.cache_locs.shape[1] == self.num_verify_rows:
+            return rows
+        return select_verify_rows(
+            verify_input.verify_cache_candidates,
+            verify_input.committed_lens,
+            seq_lens,
+            self.num_verify_rows,
+        )
+
+    def _truncate_drafts(
+        self,
+        draft_tokens: torch.Tensor,
+        draft_logits: torch.Tensor | None,
+        width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if width == self.num_verify_rows:
+            return draft_tokens, draft_logits
+        return truncate_drafts(draft_tokens, draft_logits, width - 1)
 
     def _sample_draft_block(
         self,
@@ -240,7 +299,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 padded_h2d(swa_candidates, rows.cache_locs.shape[0], self.device),
                 verify_input.committed_lens,
                 state.seq_lens,
-                self.num_verify_rows,
+                rows.cache_locs.shape[1],
             )
         # Padded rows commit 0 tokens, so the writer skips them.
         with self._block_draft_worker.draft_context():
@@ -410,7 +469,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         return DFlashVerifyInput(
             draft_token=verify_tokens,
             positions=rows.flat_positions,
-            draft_token_num=self.num_verify_rows,
+            draft_token_num=rows.cache_locs.shape[1],
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             live_seq_lens_cpu=batch.seq_lens_cpu,
@@ -484,10 +543,10 @@ class TpuBlockSpecWorker(TpuSpecWorker):
 
     def _warmup_draft_block_inputs(self) -> None:
         # Width and mask token come from the draft config, so the shared spec-op grid cannot warm it.
+        # The draft block always reads full-width rows (_draft_block_rows).
+        width = self.num_verify_rows
         with torch.no_grad():
-            for width, padded_bs in itertools.product(
-                self.verify_widths(), self._bucket_sizes()
-            ):
+            for padded_bs in self._bucket_sizes():
                 block_shape = (padded_bs, width)
                 warmup_compiled_op(
                     build_draft_block_inputs,
@@ -515,6 +574,37 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                     self._mask_token_id,
                     self._draft_block_width,
                 )
+        self._warmup_narrow_width_drafts()
+
+    def _warmup_narrow_width_drafts(self) -> None:
+        """Full-width draft rows and greedy draft truncation for narrower verify widths."""
+        narrow = [w for w in self.verify_widths() if w != self.num_verify_rows]
+        if not narrow:
+            return
+        with torch.no_grad():
+            for padded_bs in self._bucket_sizes():
+                warmup_compiled_op(
+                    select_verify_rows,
+                    torch.zeros(
+                        (padded_bs, 2 * self.verify_window_rows),
+                        dtype=torch.int64,
+                        device=self.device,
+                    ),
+                    torch.zeros((padded_bs,), dtype=torch.int64, device=self.device),
+                    torch.zeros((padded_bs,), dtype=torch.int64, device=self.device),
+                    self.num_verify_rows,
+                )
+                for width in narrow:
+                    warmup_compiled_op(
+                        truncate_drafts,
+                        torch.zeros(
+                            (padded_bs, self.num_drafts),
+                            dtype=torch.int64,
+                            device=self.device,
+                        ),
+                        None,
+                        width - 1,
+                    )
 
     def _warmup_draft_sampling(self) -> None:
         """The eager sampled-draft chain, plus step's verify-token cat and logits cast."""
@@ -540,7 +630,9 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                     self.device
                 )
                 top_ks = torch.ones((padded_bs,), dtype=torch.int32).to(self.device)
-                for target_candidates in (False, True):
+                for target_candidates, width in itertools.product(
+                    (False, True), self.verify_widths()
+                ):
                     sampled = self._sample_draft_block(
                         block_hidden,
                         bonus_tokens,
@@ -549,13 +641,14 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                         top_ks,
                         target_candidates=target_candidates,
                     )
-                    torch.cat(
-                        [bonus_tokens[:, None], sampled.draft_tokens], dim=1
-                    ).cpu()
-                    if sampled.draft_logits is not None:
-                        sampled.draft_logits.float().cpu()
+                    draft_tokens, draft_logits = self._truncate_drafts(
+                        sampled.draft_tokens, sampled.draft_logits, width
+                    )
+                    torch.cat([bonus_tokens[:, None], draft_tokens], dim=1).cpu()
+                    if draft_logits is not None:
+                        draft_logits.float().cpu()
                         self._warmup_sampled_accept(
-                            padded_bs, sampled.draft_tokens, sampled.draft_logits
+                            padded_bs, draft_tokens, draft_logits
                         )
                     if sampled.draft_candidates is not None:
                         self._warmup_candidates_accept(

@@ -39,7 +39,7 @@ Design notes
 # annotation-introspection note in attention_pallas_rpa_v3.py.
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, ClassVar, Optional
 
 import torch
 
@@ -194,6 +194,11 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
     MLA kernel consumes the identical layout — and overrides only the op
     registration and the per-layer forward.
     """
+
+    # The MLA v2 kernel's decode passes take exactly the configured width, and it
+    # has not been validated on a ragged (compact) verify layout.
+    narrow_verify_decode_tiles: ClassVar[bool] = False
+    supports_ragged_verify: ClassVar[bool] = False
 
     def _build_kernel_op(self):
         # Hook called by ``super().__init__()`` to populate ``self._op``. Both
