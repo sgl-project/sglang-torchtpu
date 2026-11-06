@@ -69,8 +69,6 @@ class KernelConfig:
     attn_tile: int = 512
     fp8_kda: bool = True
     ch_experts: bool = True
-    # Round each rank's partial to bf16 before the sum, as serving's all-reduce does.
-    bf16_collectives: bool = True
     km_slots: int = 4
     km_issue: int = 2
     embed_2d: bool = False
@@ -241,18 +239,11 @@ def pick_tile(out_dim: int, want: int) -> int:
 
 
 def _flags(cfg: KernelConfig):
-    return (
-        cfg.fp8_kda,
-        cfg.ch_experts,
-        cfg.bf16_collectives,
-        cfg.km_cols,
-        cfg.km_slots,
-        cfg.km_issue,
-    )
+    return (cfg.fp8_kda, cfg.ch_experts, cfg.km_cols, cfg.km_slots, cfg.km_issue)
 
 
 def scratch_shapes(spec, layout, cfg: KernelConfig):
-    FP8_KDA, CH_EXPERTS, BF16_COLL, KM_TILE, KM_SLOTS, KM_PF = _flags(cfg)
+    FP8_KDA, CH_EXPERTS, KM_TILE, KM_SLOTS, KM_PF = _flags(cfg)
     tp = layout.tp
     H = spec.hidden_size
     qsh = spec.kda_qkv_dim // tp
@@ -269,11 +260,11 @@ def scratch_shapes(spec, layout, cfg: KernelConfig):
     PT = TK // kp
     slab_rows = layout.small_rows()
     k1 = spec.linear_conv_kernel_dim - 1
+    hsh = H // tp
 
     f8 = jnp.float8_e4m3fn
     u32 = jnp.uint32
     S = cfg.slots if cfg.ring else 1
-    small = (1, 1, 8, 128)
     # Positional: the order must match the kernel's scratch arguments.
     return [
         pltpu.VMEM((2, slab_rows, H), BF16),
@@ -313,11 +304,13 @@ def scratch_shapes(spec, layout, cfg: KernelConfig):
         pltpu.VMEM((1, hkda), F32),
         pltpu.VMEM((spec.n_routed_experts, H), BF16),
         pltpu.VMEM((1, H), BF16),
-        pltpu.VMEM(small if BF16_COLL else (2, tp, R, H), F32),
-        pltpu.VMEM((8, 128) if BF16_COLL else (R, H), F32),
+        # Collectives: partials travel as bf16 column blocks to their owner (reduce-scatter),
+        # the bf16 totals come back by all-gather; pads hold one H/tp block per peer.
+        pltpu.VMEM((2, tp, R, hsh), BF16),
+        pltpu.VMEM((2, tp, R, hsh), BF16),
+        pltpu.VMEM((R, hsh), BF16),
         pltpu.VMEM((R, H), F32),
-        pltpu.VMEM((2, tp, R, H) if BF16_COLL else small, BF16),
-        pltpu.VMEM((R, H) if BF16_COLL else (8, 128), BF16),
+        pltpu.VMEM((R, H), BF16),
         pltpu.VMEM((8 if cfg.embed_2d else 1, H // layout.tp), BF16),
         pltpu.VMEM((1, proj_scale_cols(spec, tp)), F32),
         # Exact-size scale buffers: a DMA into a slice of a VMEM buffer must be tile-aligned.
@@ -354,7 +347,7 @@ def scratch_shapes(spec, layout, cfg: KernelConfig):
 
 
 def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
-    FP8_KDA, CH_EXPERTS, BF16_COLL, KM_TILE, KM_SLOTS, KM_PF = _flags(cfg)
+    FP8_KDA, CH_EXPERTS, KM_TILE, KM_SLOTS, KM_PF = _flags(cfg)
     tp = layout.tp
     H = spec.hidden_size
     N = spec.hc_mult
@@ -458,10 +451,10 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
         alv,
         rtr,
         fnv,
-        ar,
-        sendv,
+        rsb,
+        agb,
+        ags,
         macc,
-        arb,
         sendb,
         embv,
         psc,
@@ -506,45 +499,78 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
         # DMA may land first. Pads alternate on a static parity: a peer is at most one round
         # ahead, and each loop body runs an even number of collectives.
         collective = [0]
+        if hsh % KM_TILE:
+            raise ValueError(f"km tile {KM_TILE} must divide the H/tp block {hsh}")
 
-        def _round(row_full, width):
-            """`row_full` is [R, H]; shorter payloads are zero-padded to the pad's fixed shape."""
+        def _parity():
             par = collective[0] % 2
             collective[0] += 1
-            if row_full.shape != (R, H):
-                row_full = jnp.pad(
-                    row_full, ((0, R - row_full.shape[0]), (0, H - row_full.shape[1]))
-                )
-            sbuf, rbuf = (sendb, arb) if BF16_COLL else (sendv, ar)
-            sbuf[...] = row_full.astype(sbuf.dtype)
-            local = pltpu.make_async_copy(sbuf, rbuf.at[par, me], sem)
-            local.start()
-            cps = []
+            return par
+
+        def rs_piece(par, lo, hi, cps):
+            """Send columns [lo, hi) of `sendb` (one owner's block) to the owner's pad slot `me`."""
+            d = lo // hsh
+            if hi > (d + 1) * hsh:
+                raise ValueError(f"columns [{lo}, {hi}) straddle owner blocks of {hsh}")
+            src = sendb.at[:, pl.ds(lo, hi - lo)]
+            dst = rsb.at[par, me, :, pl.ds(lo - d * hsh, hi - lo)]
+            local = pltpu.make_async_copy(src, dst, sem)
+            remote = pltpu.make_async_remote_copy(
+                src_ref=src, dst_ref=dst, send_sem=ssem, recv_sem=rsem, device_id=d
+            )
+            pl.when(me == d)(local.start)
+            pl.when(me != d)(remote.start)
+            cps.append((d, local, remote))
+
+        def rs_send(par, c0, width, cps):
+            """Columns [c0, c0 + width) of `sendb`, split at owner-block boundaries."""
+            for d in range(tp):
+                lo, hi = max(c0, d * hsh), min(c0 + width, (d + 1) * hsh)
+                if lo < hi:
+                    rs_piece(par, lo, hi, cps)
+
+        def rs_finish(par, cps):
+            """Wait the round's pieces; -> this rank's f32 column block [R, hsh]."""
+            for d, local, remote in cps:
+                pl.when(me == d)(local.wait)
+                pl.when(me != d)(remote.wait)
+            return jnp.sum(rsb[par].astype(F32), axis=0)
+
+        def ag_round(par, src):
+            """`src` [R, hsh] bf16 on each rank -> [R, H] bf16 in mesh rank order."""
+            cps = [pltpu.make_async_copy(src, agb.at[par, me], sem)]
             for d in range(1, tp):
-                peer = jax.lax.rem(me + d, tp)
-                cp = pltpu.make_async_remote_copy(
-                    src_ref=sbuf,
-                    dst_ref=rbuf.at[par, me],
-                    send_sem=ssem,
-                    recv_sem=rsem,
-                    device_id=peer,
+                cps.append(
+                    pltpu.make_async_remote_copy(
+                        src_ref=src,
+                        dst_ref=agb.at[par, me],
+                        send_sem=ssem,
+                        recv_sem=rsem,
+                        device_id=jax.lax.rem(me + d, tp),
+                    )
                 )
+            for cp in cps:
                 cp.start()
-                cps.append(cp)
-            local.wait()
             for cp in cps:
                 cp.wait()
-            return rbuf[par].astype(F32)
+            return jnp.concatenate([agb[par, d] for d in range(tp)], axis=1)
 
-        def allgather(rows, width):
-            """[R, width] on each device -> [R, tp*width] in mesh rank order."""
-            got = _round(rows, width)
-            return jnp.concatenate([got[d, :, :width] for d in range(tp)], axis=1)
+        def allgather(rows):
+            """[R, hsh] on each device -> [R, H] f32 in mesh rank order."""
+            ags[...] = rows.astype(BF16)
+            return ag_round(_parity(), ags).astype(F32)
 
         def allreduce(rows):
-            """[R, H] partial sums on each device -> [R, H] totals."""
+            """[r, H] partial sums on each device -> [r, H] totals (bf16-rounded, as serving's)."""
             with _scope("allreduce"):
-                return jnp.sum(_round(rows, H), axis=0)[: rows.shape[0]]
+                par = _parity()
+                if rows.shape[0] != R:
+                    rows = jnp.pad(rows, ((0, R - rows.shape[0]), (0, 0)))
+                sendb[...] = rows.astype(BF16)
+                cps = []
+                rs_send(par, 0, H, cps)
+                ags[...] = rs_finish(par, cps).astype(BF16)
+                return ag_round(par, ags).astype(F32)[: rows.shape[0]]
 
         S = cfg.slots if cfg.ring else 1
         PF = cfg.prefetch if cfg.ring else 0
@@ -593,32 +619,36 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             rows = (2 if fp8 else 1) * H
             return rows // K_ if n_out is None else km_blocks(K_, n_out, rows, KM_TILE)
 
-        def mv_km(w, idx, K_, x, fp8=False, warmed=False, scale=None, n_out=None):
-            """x [R, K] @ K-major W [K, N] -> [R, N] f32, times the per-channel `scale` if given."""
+        def mv_km(w, idx, K_, x, fp8=False, warmed=False, scale=None, n_out=None, out=None):
+            """x [R, K] @ K-major W [K, N] -> [R, N] f32, times the per-channel `scale` if given;
+            with `out` each column tile is stored into that ref instead of concatenated."""
             n, mk = km_copies(w, idx, fp8)
             k = km_k(K_, fp8, n_out)
             xb = x.astype(BF16)
 
             def use(s_, sl):
-                return jnp.concatenate(
-                    [
-                        jnp.dot(
-                            xb, km_block(s_, j, K_, fp8), preferred_element_type=F32
-                        )
-                        for j in range(k)
-                    ],
-                    axis=1,
-                )
+                parts = [
+                    jnp.dot(xb, km_block(s_, j, K_, fp8), preferred_element_type=F32)
+                    for j in range(k)
+                ]
+                if out is None:
+                    return jnp.concatenate(parts, axis=1)
+                for j, part in enumerate(parts):
+                    out[:, pl.ds((s_ * k + j) * KM_TILE, KM_TILE)] = part
+                return None
 
-            out = jnp.concatenate(_stream(n, mk, use, warmed, KM_PF), axis=1)
-            return out if scale is None else out * scale
+            parts = _stream(n, mk, use, warmed, KM_PF)
+            if out is not None:
+                return None
+            res = jnp.concatenate(parts, axis=1)
+            return res if scale is None else res * scale
 
         def mv_km_allreduce(w, idx, K_, x, fp8=False, warmed=False, scale=None):
-            """allreduce(mv_km(...)), each slot's columns sent as soon as they are computed."""
+            """allreduce(mv_km(...)), each slot's columns sent to their owner as computed."""
             n, mk = km_copies(w, idx, fp8)
             k = km_k(K_, fp8, H)
             xb = x.astype(BF16)
-            send, finish = _ar_pipe()
+            par, cps = _parity(), []
             if not warmed:
                 _warm(n, mk, KM_PF)
             for s_ in range(n):
@@ -630,49 +660,14 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     )
                     if scale is not None:
                         part = part * scale[:, c * KM_TILE : (c + 1) * KM_TILE]
-                    put_send(pl.ds(c * KM_TILE, KM_TILE), part)
+                    sendb[:, pl.ds(c * KM_TILE, KM_TILE)] = part.astype(BF16)
                 sinkhorn_bg()
                 if s_ + KM_PF + 1 < n:
                     mk(s_ + KM_PF + 1).start()
-                send(s_ * k * KM_TILE, k * KM_TILE)
-            return finish(x.shape[0])
-
-        def put_send(cols, v):
-            buf = sendb if BF16_COLL else sendv
-            buf[:, cols] = v.astype(buf.dtype)
-
-        def _ar_pipe():
-            """Allreduce sent in column groups: (send(c0, width), finish(rows)), same result as `_round`."""
-            par = collective[0] % 2
-            collective[0] += 1
-            cps = []
-
-            sbuf, rbuf = (sendb, arb) if BF16_COLL else (sendv, ar)
-
-            def send(c0, width):
-                src = sbuf.at[:, pl.ds(c0, width)]
-                dst = rbuf.at[par, me, :, pl.ds(c0, width)]
-                cps.append(pltpu.make_async_copy(src, dst, sem))
-                for d in range(1, tp):
-                    cps.append(
-                        pltpu.make_async_remote_copy(
-                            src_ref=src,
-                            dst_ref=dst,
-                            send_sem=ssem,
-                            recv_sem=rsem,
-                            device_id=jax.lax.rem(me + d, tp),
-                        )
-                    )
-                for c in cps[-tp:]:
-                    c.start()
-
-            def finish(rows):
-                with _scope("allreduce"):
-                    for c in cps:
-                        c.wait()
-                    return jnp.sum(rbuf[par].astype(F32), axis=0)[:rows]
-
-            return send, finish
+                rs_send(par, s_ * k * KM_TILE, k * KM_TILE, cps)
+            with _scope("allreduce"):
+                ags[...] = rs_finish(par, cps).astype(BF16)
+                return ag_round(par, ags).astype(F32)[: x.shape[0]]
 
         if cfg.init_streams:
             streams = in_streams[...]
@@ -698,7 +693,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 else:
                     _dma(w_embed.at[tok_ref[r]], embv, sem)
                     rows.append(embv[...].astype(F32))
-            emb = allgather(jnp.concatenate(rows, axis=0), hsh)
+            emb = allgather(jnp.concatenate(rows, axis=0))
             streams = jnp.concatenate(
                 [jnp.broadcast_to(emb[r : r + 1], (N, H)) for r in range(R)], axis=0
             ).astype(BF16)
@@ -1589,7 +1584,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
         )
         # The MTP draft reads this hidden (serving captures the same tensor).
         o_hidden[...] = hidden
-        o_logits[...] = mv_km(w_lm, 0, H, hidden)
+        mv_km(w_lm, 0, H, hidden, out=o_logits)
 
     if not cfg.ch_experts:
         raise NotImplementedError("the per-layer expert refs need ch_experts")

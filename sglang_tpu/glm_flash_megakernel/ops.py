@@ -83,8 +83,11 @@ class GlmFlashMegakernel:
         self.pages_per_seq = table_pages
         self.max_req = max(1, max_rows // n_query)
         km_tile = 512 if self.max_req * n_query == 1 else 256
-        self.cfgs = {
-            b: D.KernelConfig(
+
+        def cfg_for(b):
+            # Larger steps trade DMA ring depth for the VMEM their row-scaled buffers need.
+            big = b * n_query > 16
+            return D.KernelConfig(
                 max_len=max_len,
                 n_query=n_query,
                 n_req=b,
@@ -92,9 +95,13 @@ class GlmFlashMegakernel:
                 table_pages=table_pages,
                 embed_2d=True,
                 km_tile=km_tile,
+                slots=3 if big else 4,
+                prefetch=1 if big else 2,
+                km_slots=3 if big else 4,
+                km_issue=1 if big else 2,
             )
-            for b in _buckets(self.max_req)
-        }
+
+        self.cfgs = {b: cfg_for(b) for b in _buckets(self.max_req)}
         cfg0 = next(iter(self.cfgs.values()))
         weights = build_weights(model, spec, layout, cfg0, tp, rank)
         # Packing leaves dtype and shape views, which every call would re-materialise.
