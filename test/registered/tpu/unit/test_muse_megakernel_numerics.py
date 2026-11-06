@@ -18,14 +18,15 @@ from pathlib import Path
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_tpu_ci(est_time=150, suite="stage-a-test-tpu-unit", chips=4)
-
-
-@unittest.skipUnless(
-    os.environ.get("SGLANG_TPU_TEST_V11_KERNELS") == "1",
-    "New v11 kernel tests run outside PR gating (stage-a budget); "
-    "set SGLANG_TPU_TEST_V11_KERNELS=1.",
+register_tpu_ci(
+    est_time=420,
+    suite="stage-a-test-tpu-unit",
+    chips=4,
+    disabled="outside the stage-a budget; run by hand on 4 chips "
+    "(https://github.com/sgl-project/sglang-torchtpu/pull/1850)",
 )
+
+
 class TestMuseMegakernelNumerics(CustomTestCase):
     def test_kernel_matches_reference_decoder(self):
         repo_root = Path(__file__).resolve().parents[4]
@@ -34,10 +35,7 @@ class TestMuseMegakernelNumerics(CustomTestCase):
             (
                 "eval $(python3 -m torch.tpu.distributed)",
                 "export TORCH_TPU_TOPOLOGY TORCH_TPU_SLICEBUILDER_ADDRESSES WORLD_SIZE",
-                f'torchrun --nproc_per_node="$WORLD_SIZE" {shlex.quote(str(worker))} '
-                # PR gating: the deployed fp8 SAL pool, short and past the 32k-token KV ring;
-                # the worker's default runs every case.
-                "--cases salfp8_c2q8_s salfp8_c2q8_xl",
+                f'torchrun --nproc_per_node="$WORLD_SIZE" {shlex.quote(str(worker))}',
             )
         )
         env = os.environ.copy()
