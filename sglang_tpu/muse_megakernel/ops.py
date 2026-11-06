@@ -1158,10 +1158,11 @@ _OPT_ALIASED_VMEM_LIMIT = 62 * 2**20
 _TILED_VPADS_VMEM_BUDGET = 50 * 2**20
 _TILED_VY2_VMEM_BUDGET = 50 * 2**20
 _ATTN_HOIST_GLOBAL_MIN_POS = 262144
-# Both page tables in SMEM past this crowd out the kernel's own SMEM scratch (1 MiB in all):
-# pages_swa then stays in HBM and each step reads only the requests' windows of it. cc24 at
-# 1M context (768.4 KiB) still fits beside the scratch and keeps the whole table.
-_SMEM_PAGE_TABLES_BUDGET = 800 * 2**10
+# Past this, pages_swa stays in HBM and each step reads only the requests' windows of it.
+# Whole tables that still fit SMEM are slow: at 1M context q8 cc20/cc24 (640/768 KiB) ran
+# 10.8-16.9x slower than with the window table (bit-identical outputs); cc4-cc12 (<=384
+# KiB) cost 0-1.1% with it (anvil A/B, device time).
+_SMEM_PAGE_TABLES_BUDGET = 512 * 2**10
 # A VMEM-Y row-tiled plan squeezed to a 2-slot ring has no prefetch room, and its LLO spill
 # slots overflow VMEM (cc28 x q8: 49.5 MiB scratch + 16.2 MiB spills > 63.9 MiB); the
 # streamed-Y plan fits there with a 6-slot ring.
