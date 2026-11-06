@@ -103,19 +103,25 @@ spec:
                 valueFrom:
                   fieldRef:
                     fieldPath: metadata.labels['leaderworkerset.sigs.k8s.io/worker-index']
-              livenessProbe:
-                failureThreshold: 3000
+              startupProbe:
+                failureThreshold: 120
                 httpGet:
                   path: /health
                   port: 30000
-                initialDelaySeconds: 300
+                periodSeconds: 30
+                timeoutSeconds: 10
+              livenessProbe:
+                failureThreshold: 3
+                httpGet:
+                  path: /health
+                  port: 30000
                 periodSeconds: 60
                 successThreshold: 1
                 timeoutSeconds: 10
               readinessProbe:
-                failureThreshold: 20
+                failureThreshold: 3
                 httpGet:
-                  path: /health
+                  path: /health_generate
                   port: 30000
                 periodSeconds: 30
                 successThreshold: 1
@@ -301,20 +307,26 @@ spec:
                 valueFrom:
                   fieldRef:
                     fieldPath: metadata.labels['leaderworkerset.sigs.k8s.io/worker-index']
-              livenessProbe:
-                failureThreshold: 30000
+              startupProbe:
+                failureThreshold: 120
                 httpGet:
                   path: /health
                   port: 30000
-                initialDelaySeconds: 300
+                periodSeconds: 30
+                timeoutSeconds: 10
+              livenessProbe:
+                failureThreshold: 3
+                httpGet:
+                  path: /health
+                  port: 30000
                 periodSeconds: 60
                 successThreshold: 1
                 timeoutSeconds: 10
               name: sglang
               readinessProbe:
-                failureThreshold: 20
+                failureThreshold: 3
                 httpGet:
-                  path: /health
+                  path: /health_generate
                   port: 30000
                 periodSeconds: 30
                 successThreshold: 1

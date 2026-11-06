@@ -127,10 +127,24 @@ spec:
           ports:
           - containerPort: 30000
             protocol: TCP
-          readinessProbe:
-            periodSeconds: 30
-            tcpSocket:
+          startupProbe:
+            httpGet:
+              path: /health
               port: 30000
+            periodSeconds: 30
+            failureThreshold: 120
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 30000
+            periodSeconds: 60
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health_generate
+              port: 30000
+            periodSeconds: 30
+            failureThreshold: 3
           resources:
             limits:
               nvidia.com/gpu: "8"
@@ -434,10 +448,24 @@ spec:
           ports:
           - containerPort: 30000
             protocol: TCP
-          readinessProbe:
-            periodSeconds: 30
-            tcpSocket:
+          startupProbe:
+            httpGet:
+              path: /health
               port: 30000
+            periodSeconds: 30
+            failureThreshold: 120
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 30000
+            periodSeconds: 60
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health_generate
+              port: 30000
+            periodSeconds: 30
+            failureThreshold: 3
           resources:
             limits:
               nvidia.com/gpu: "8"
