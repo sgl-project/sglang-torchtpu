@@ -1,6 +1,7 @@
 """CPU-only regression checks for launcher topology and runtime defaults."""
 
 import unittest
+import unittest.mock
 
 from benchmark.tpu.launch_server import (
     LaunchConfig,
@@ -226,6 +227,36 @@ class TestRuntimeEnvironment(unittest.TestCase):
         for concurrency, mode in ((24, "router"), (24, "decode")):
             with self.assertRaises(ValueError):
                 get_config(concurrency, mode=mode)
+
+    def test_agentx_sal_draft_opt_in(self):
+        """--sal-draft moves both P/D ends together; the default keeps the hidden-row rebuild."""
+        from benchmark.tpu.recipe.configs.muse_spark.agentic import get_config, main
+
+        for mode in ("prefill", "decode"):
+            config = get_config(32, mode=mode, sal_draft=True)
+            self.assertEqual(
+                config["server_args"]["speculative_draft_attention_backend"],
+                "pallas_tpu_rpa_batched",
+            )
+            self.assertEqual(
+                config["runtime_env"]["SGLANG_TPU_PD_DECODE_DRAFT_PREFILL"], "0"
+            )
+            # The draft pool follows the draft backend: SEQ_ALONG_LANE needs this flag.
+            self.assertEqual(
+                config["runtime_env"]["SGLANG_TPU_USE_SEQ_ALONG_LANE_KV"], "1"
+            )
+            default = get_config(32, mode=mode)
+            self.assertEqual(
+                default["server_args"]["speculative_draft_attention_backend"],
+                "pallas_tpu_rpa_v3",
+            )
+        with self.assertRaises(ValueError):
+            get_config(24, sal_draft=True)
+        with unittest.mock.patch("builtins.print") as printed:
+            self.assertEqual(main(["decode", "32", "--sal-draft", "--dry-run"]), 0)
+        self.assertIn(
+            '"SGLANG_TPU_PD_DECODE_DRAFT_PREFILL": "0"', printed.call_args[0][0]
+        )
 
 
 if __name__ == "__main__":

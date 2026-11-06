@@ -5,12 +5,13 @@
 #   bash benchmark/tpu/recipe/muse_spark_agentx_launcher.sh prefill 16           # P/D: PP8 prefill
 #   bash benchmark/tpu/recipe/muse_spark_agentx_launcher.sh decode 16            # P/D: TP8 decode
 #   bash benchmark/tpu/recipe/muse_spark_agentx_launcher.sh decode 16 --dry-run  # print config only
+#   bash benchmark/tpu/recipe/muse_spark_agentx_launcher.sh prefill 32 --sal-draft  # P/D, SAL draft KV
 #
 # Everything else (weights, parallelism, envs) lives in configs/muse_spark/agentic.py.
 set -euo pipefail
 cd "$(dirname "$0")/../../.."   # recipe/ -> repo root
 
-usage="usage: $0 <mixed|prefill|decode> <concurrency> [--dry-run]"
+usage="usage: $0 <mixed|prefill|decode> <concurrency> [--dry-run] [--sal-draft]"
 MODE="${1:?$usage}"
 CONCURRENCY="${2:?$usage}"
 shift 2

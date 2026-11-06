@@ -10,7 +10,9 @@ requests, prefill/decode interval and megakernel row cap. The mode picks the eng
   (c32: r32 on the row-tiled decode megakernel).
 
 Every mode serves DFlash on the experimental spec worker, the only one that runs it on
-a PP prefill.
+a PP prefill. P/D modes take --sal-draft (get_config(sal_draft=True)) to run the draft
+on batched RPA, whose SEQ_ALONG_LANE draft KV Raiden ships instead of the decode
+rebuilding it from hidden rows; the default stays on the rebuild.
 
 The fp8 pool assumes a windowed draft: a DFlash2 config declaring is_hybrid_swa and
 an all-SWA hybrid_layer_pattern keeps the draft's KV in the target's SWA slots;
@@ -251,6 +253,13 @@ _PD: dict[str, dict] = {
     },
 }
 
+# P/D opt-in (--sal-draft): the non-causal draft on batched RPA keeps its KV in a
+# SEQ_ALONG_LANE pool, which Raiden ships across the PP8 -> TP8 head split itself.
+_SAL_DRAFT: dict[str, dict] = {
+    "server_args": {"speculative_draft_attention_backend": "pallas_tpu_rpa_batched"},
+    "runtime_env": {"SGLANG_TPU_PD_DECODE_DRAFT_PREFILL": "0"},
+}
+
 _ROLES: dict[str, dict[str, dict]] = {
     "prefill": {
         "server_args": {
@@ -292,9 +301,13 @@ _ROLES: dict[str, dict[str, dict]] = {
 }
 
 
-def get_config(concurrency: int, mode: str = "mixed") -> dict:
+def get_config(
+    concurrency: int, mode: str = "mixed", *, sal_draft: bool = False
+) -> dict:
     if mode not in MODES:
         raise ValueError(f"mode {mode!r} is not one of {MODES}")
+    if sal_draft and mode == "mixed":
+        raise ValueError("sal_draft ships draft KV between P/D engines; mixed has none")
     defined = _PATCHES_BY_CONCURRENCY if mode == "mixed" else _PD_RUNNING
     if concurrency not in defined:
         raise ValueError(
@@ -305,7 +318,8 @@ def get_config(concurrency: int, mode: str = "mixed") -> dict:
     else:
         config = _pd_config(concurrency)
     if mode != "mixed":
-        for patch in (_PD, _ROLES[mode]):
+        patches = (_PD, _ROLES[mode]) + ((_SAL_DRAFT,) if sal_draft else ())
+        for patch in patches:
             for section, overrides in patch.items():
                 config[section].update(deepcopy(overrides))
         # One engine on this host; launch_server starts no router for it.
@@ -337,8 +351,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("mode", choices=MODES)
     parser.add_argument("concurrency", type=int)
     parser.add_argument("--dry-run", action="store_true", help="print the config only")
+    parser.add_argument(
+        "--sal-draft",
+        action="store_true",
+        help="P/D: draft on batched RPA (SEQ_ALONG_LANE draft KV shipped by Raiden)",
+    )
     args = parser.parse_args(argv)
-    config = get_config(args.concurrency, mode=args.mode)
+    config = get_config(args.concurrency, mode=args.mode, sal_draft=args.sal_draft)
     config["server_args"].update(
         model_path=str(MODEL_ROOT / MODEL),
         served_model_name=MODEL,
@@ -350,7 +369,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         return 0
     _write_swa_draft(MODEL_ROOT)
-    path = Path(f"/tmp/muse_agentx_{args.mode}_c{args.concurrency}.json")
+    suffix = "_sal_draft" if args.sal_draft else ""
+    path = Path(f"/tmp/muse_agentx_{args.mode}_c{args.concurrency}{suffix}.json")
     path.write_text(json.dumps(config))
     from benchmark.tpu.launch_server import main as launch
 
