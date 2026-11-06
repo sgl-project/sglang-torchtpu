@@ -660,6 +660,11 @@ def _fused_moe_jax(
         max(global_num_experts, num_experts),
         zero_dropped_tokens=m < permute_dense_threshold,
     )
+    if m < permute_dense_threshold:
+        # The one-hot permute and combine are matmuls over every token and
+        # 0 * NaN is NaN, so zero a live token's non-finite values to keep them local.
+        hidden_states = jnp.where(jnp.isfinite(hidden_states), hidden_states, 0)
+        topk_weights = jnp.where(jnp.isfinite(topk_weights), topk_weights, 0)
 
     # Routing: build a permutation that puts rows of hidden_states in
     # expert-major order so a single grouped-matmul covers GMM1 / GMM2.
@@ -1136,9 +1141,8 @@ def _resolve_expert_group_offset(
 
     Outside a rank-parameterized trace (eager, dynamo, EP=1) the offset stays a
     static int and the op signature is unchanged. The lift relies on
-    ``moe_ep_rank == world_rank % ep_size``: ``direct_compile`` only enables
-    ``lift_rank`` when the TP group is the whole world, so the EP group is a
-    contiguous slice of it, and ``traced_rank`` raises if that ever breaks.
+    ``moe_ep_rank == world_rank % ep_size``; ``traced_rank`` raises when the
+    caller's expert group does not follow this contiguous rank order.
     """
     if global_num_experts <= num_local_experts:
         # EP=1: no window, and no new op input so the trace is unchanged.

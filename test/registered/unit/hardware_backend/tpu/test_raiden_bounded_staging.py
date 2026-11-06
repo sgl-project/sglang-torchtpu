@@ -84,7 +84,7 @@ class TestBuildEngines(CustomTestCase):
         manager._transfer_parallelism = 4
         manager.chunked_transfer = True
         manager._build_engine()
-        sizes = [(e["num_slots"], e["num_staging_layers"]) for e in self.engines]
+        sizes = [(e["num_slots"], e.get("num_staging_layers")) for e in self.engines]
         return manager, sizes
 
     def test_fixed_slots_share_one_count(self):
@@ -139,6 +139,31 @@ class TestBuildEngines(CustomTestCase):
         with envs.SGLANG_RAIDEN_HOST_POOL_GB.override(1):
             _, sizes = self._built(dynamic=True)
         self.assertEqual(sizes, [(1, 2), (8, 6)])
+
+    def test_tpu_sync_without_staging_layers_keeps_full_mirrors(self):
+        # A pinned tpu-sync-torch from before num_staging_layers existed.
+        engines = self.engines
+
+        class OldEngine:
+            def __init__(
+                self,
+                kv_caches,
+                node_id,
+                local_control_port,
+                max_blocks,
+                num_slots,
+                timeout_s,
+                parallelism,
+            ):
+                engines.append(dict(num_slots=num_slots))
+
+        module = sys.modules["tpu_sync.api.torch.kv_cache_manager"]
+        self.stack.enter_context(patch.object(module, "KVCacheManager", OldEngine))
+        manager, sizes = self._built(dynamic=True)
+        # Same full-mirror plan as SGLANG_TPU_RAIDEN_STAGING_LAYERS=0.
+        self.assertEqual(sizes, [(1, None), (8, None)])
+        self.assertEqual(manager._staging_layers_total, 0)
+        self.assertFalse(manager._bounded_staging)
 
 
 if __name__ == "__main__":

@@ -77,6 +77,7 @@ from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
     skip_spec_op_precompile_without_draft,
 )
+from sglang_tpu.hooks.pp_buffered_kv_budget import reserve_pp_buffered_handoff
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 from sglang_tpu.hooks.spec_tp_sync import broadcast_undeferred
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
@@ -88,6 +89,7 @@ from sglang_tpu.hooks.twolevel_allreduce import (
 from sglang_tpu.hooks.twolevel_allreduce import (
     row_parallel_linear_forward as twolevel_row_parallel_linear_forward,
 )
+from sglang_tpu.kv_pool_host import register_unified_hicache_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -301,6 +303,11 @@ HOOKS: list[tuple] = [
         HookType.AROUND,
     ),
     (
+        "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._profile_available_bytes",
+        reserve_pp_buffered_handoff,
+        HookType.AROUND,
+    ),
+    (
         "sglang.srt.model_executor.pool_configurator.DefaultPoolConfigurator.__init__",
         size_tpu_dsa_kv_pool,
         HookType.AFTER,
@@ -369,6 +376,7 @@ def register() -> None:
 
     register_muse_spark_processor()
     register_tpu_dsv4_resolution_hooks()
+    register_unified_hicache_strategy()
 
     from sglang.srt.plugins.hook_registry import HookRegistry
 
