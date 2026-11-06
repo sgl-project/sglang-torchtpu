@@ -323,6 +323,12 @@ class Platform:
         return False
 
     @classmethod
+    def supports_rank_subset_collectives(cls) -> bool:
+        """Whether a process subgroup's collectives can run while ranks outside
+        the subgroup do other work."""
+        return True
+
+    @classmethod
     def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
         return None
 

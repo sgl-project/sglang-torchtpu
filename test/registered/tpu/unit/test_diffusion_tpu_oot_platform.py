@@ -73,6 +73,10 @@ class TestOutOfTreeContract(CustomTestCase):
         self.assertFalse(TpuOOTPlatform.supports_safetensors_device_load())
         self.assertTrue(Platform.supports_safetensors_device_load())
 
+    def test_subgroup_collectives_need_every_rank(self):
+        self.assertFalse(TpuOOTPlatform.supports_rank_subset_collectives())
+        self.assertTrue(Platform.supports_rank_subset_collectives())
+
 
 class TestSplashBackend(CustomTestCase):
     def setUp(self):

@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising import (
     LTX2DenoisingStage,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -155,8 +156,12 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
     @property
     def parallelism_type(self) -> StageParallelismType:
         # Stage 2 is distilled and always runs with CFG disabled, so non-main
-        # CFG ranks only need the result when the decoder will use all ranks.
-        if self.server_args.enable_cfg_parallel:
+        # CFG ranks only need the result when the decoder will use all ranks,
+        # unless its Ulysses collectives need every rank.
+        if (
+            self.server_args.enable_cfg_parallel
+            and current_platform.supports_rank_subset_collectives()
+        ):
             if decode_uses_every_rank(self.vae):
                 return StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS
             return StageParallelismType.MAIN_RANK_ONLY
