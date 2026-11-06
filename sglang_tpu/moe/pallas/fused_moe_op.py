@@ -660,6 +660,11 @@ def _fused_moe_jax(
         max(global_num_experts, num_experts),
         zero_dropped_tokens=m < permute_dense_threshold,
     )
+    if m < permute_dense_threshold:
+        # The one-hot permute and combine are matmuls over every token and
+        # 0 * NaN is NaN, so zero a live token's non-finite values to keep them local.
+        hidden_states = jnp.where(jnp.isfinite(hidden_states), hidden_states, 0)
+        topk_weights = jnp.where(jnp.isfinite(topk_weights), topk_weights, 0)
 
     # Routing: build a permutation that puts rows of hidden_states in
     # expert-major order so a single grouped-matmul covers GMM1 / GMM2.
