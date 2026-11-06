@@ -95,6 +95,8 @@ from sglang_tpu.disaggregation.raiden.serde import (
     Chunk,
     MessageTag,
     PullReq,
+    Reserve,
+    ReserveBusy,
     ReshardBlocks,
     ReshardChunk,
     ReshardChunkReady,
@@ -170,6 +172,9 @@ class RaidenKVManager(
     instead of reimplementing the coordination.
     """
 
+    # Set from SGLANG_ENABLE_DISAGG_PREFILL_DRIVEN when the manager starts.
+    _prefill_driven = False
+
     # The legacy transport unless set_kv_caches builds a pipeline transfer.
     _pipeline = None
     _pipeline_enabled = False
@@ -213,7 +218,10 @@ class RaidenKVManager(
             ReshardChunk.TAG: self._on_reshard_chunk,
             ReshardChunkReady.TAG: self._on_reshard_chunk_ready,
             RoomFailed.TAG: self._on_room_failed,
+            Reserve.TAG: self._on_reserve,
+            ReserveBusy.TAG: self._on_reserve_busy,
         }
+        self._prefill_driven = tpu_envs.SGLANG_ENABLE_DISAGG_PREFILL_DRIVEN.get()
 
         self._engine: Optional[Any] = None  # raiden KVCacheManager
         self._swa_engine: Optional[Any] = None
@@ -1235,6 +1243,9 @@ class RaidenKVManager(
         if tag == MessageTag.ABORT:
             self._on_abort(msg)
             return
+        if tag == MessageTag.BOOTSTRAP:
+            self._on_decode_register(msg)
+            return
         if tag in (
             MessageTag.PIPELINE_REQ,
             MessageTag.PIPELINE_READY,
@@ -1413,6 +1424,11 @@ class RaidenKVManager(
         with self._state_lock:
             if self._prefill is not None:
                 self._prefill.reshard_replied_at.pop(room, None)
+                self._forget_decode_registration_locked(room)
+                self._prefill.reserve_requested_at.pop(room, None)
+                self._prefill.reserve_busy.discard(room)
+            if self._decode is not None:
+                self._decode.reserve_held.discard(room)
             # A read raiden still holds keeps its admission, and a push it is
             # still delivering keeps its receiver plan, each with the
             # completion that will settle it, until the engine reports it.

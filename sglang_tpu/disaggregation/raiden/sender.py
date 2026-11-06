@@ -31,6 +31,8 @@ from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
     PullReq,
+    Reserve,
+    ReserveBusy,
     ReshardBlocks,
     ReshardChunk,
     ReshardChunkReady,
@@ -84,7 +86,22 @@ class RaidenSenderMixin:
         decode_pages = req.decode_pages
         decode_swa_pages = req.decode_swa_pages
         with self._state_lock:
+            self._heard_from_decode_locked(self._prefill.registered_decodes.get(room))
             failed_reason = self._tombstone_reason_locked(room)
+            if (
+                failed_reason is None
+                and self._prefill_driven
+                and room not in self._prefill.reserve_requested_at
+            ):
+                # Only a decode running without the feature pulls unasked.
+                failed_reason = (
+                    "The decode pulled KV for a room this prefill never asked it "
+                    "to reserve. Set SGLANG_ENABLE_DISAGG_PREFILL_DRIVEN "
+                    "identically on both roles."
+                )
+                self._mark_aborted_locked(room)
+                self._fail_room_locked(room, failed_reason)
+                self.update_status(room, KVPoll.Failed)
             if failed_reason is None:
                 self._prefill.decode_addr[room] = (decode_ip, decode_port)
                 self._prefill.decode_pages[room] = decode_pages
@@ -133,6 +150,9 @@ class RaidenSenderMixin:
                 return
             self._mark_aborted_locked(room)
             if status is None:
+                # A room this rank never opened a sender for, such as a request
+                # rejected at intake, keeps only its decode's registration.
+                self._forget_decode_registration_locked(room)
                 return
             self._fail_room_unless_failed_locked(
                 room, "Aborted by decode-side abort notification."
@@ -189,6 +209,9 @@ class RaidenSenderMixin:
         with self._state_lock:
             addr = self._prefill.decode_addr.get(room)
             req = self._prefill.reshard_req.get(room)
+            registered = self._prefill.registered_decodes.get(room)
+        if registered is not None:
+            endpoints.append(registered)
         if addr is not None:
             endpoints.append(_tcp_endpoint(ip=addr[0], port=addr[1]))
         if req is not None:
@@ -205,6 +228,129 @@ class RaidenSenderMixin:
             )
         for endpoint in dict.fromkeys(endpoints):
             self._reply_room_failed(room=room, endpoint=endpoint, reason=reason)
+
+    # ----- prefill_driven reservation ---------------------------------------
+
+    def _on_decode_register(self, msg: List[bytes]) -> None:
+        """Record a decode that registered a room through the common BOOTSTRAP
+        message. A room with an ask outstanding is asked now: the decode just
+        arrived, or restarted and lost the earlier RESERVE."""
+        try:
+            _, room_frame, ip_frame, port_frame = msg[:4]
+            room = int(decode_text(room_frame, "room"))
+            endpoint = _tcp_endpoint(
+                ip=decode_text(ip_frame, "decode_ip"),
+                port=int(decode_text(port_frame, "decode_port")),
+            )
+        except ValueError as error:
+            logger.error("RaidenKVManager received malformed BOOTSTRAP: %s", error)
+            return
+        if not self._prefill_driven:
+            self._reply_room_failed(
+                room=room,
+                endpoint=endpoint,
+                reason="The decode uses prefill_driven reservation but this "
+                "prefill does not. Set SGLANG_ENABLE_DISAGG_PREFILL_DRIVEN "
+                "identically on both roles.",
+            )
+            return
+        with self._state_lock:
+            failed_reason = self._tombstone_reason_locked(room)
+            if failed_reason is None:
+                if self._prefill.registered_decodes.get(room) != endpoint:
+                    self._forget_decode_registration_locked(room)
+                    self._prefill.decode_room_counts[endpoint] += 1
+                self._prefill.registered_decodes[room] = endpoint
+                self._heard_from_decode_locked(endpoint)
+                # Latest, not first: a decode that registers again is owed a
+                # full timeout for the RESERVE it is about to get.
+                self._prefill.registered_at[room] = time.time()
+            asked = (
+                room in self._prefill.reserve_requested_at
+                and room not in self._prefill.reserve_busy
+            )
+        if failed_reason is not None:
+            self._reply_room_failed(room=room, endpoint=endpoint, reason=failed_reason)
+        elif asked:
+            self._send_reserve(room, [endpoint])
+
+    def request_decode_reservation(self, room: int) -> None:
+        """Ask the room's decode to reserve KV (prefill_driven), again after a
+        BUSY answer. A decode that has not registered yet is asked when it
+        does. The decode ignores a RESERVE for a room it already holds ready,
+        so a repeated ask is harmless."""
+        with self._state_lock:
+            if room in self._aborted:
+                return
+            self._prefill.reserve_requested_at[room] = time.time()
+            self._prefill.reserve_busy.discard(room)
+            registered = self._prefill.registered_decodes.get(room)
+        self._send_reserve(room, [registered] if registered is not None else [])
+
+    def _send_reserve(self, room: int, endpoints: List[str]) -> None:
+        payload = Reserve(room=room).to_frames()
+        for endpoint in endpoints:
+            try:
+                self._send_multipart_locked(endpoint, payload)
+            except zmq.ZMQError as exc:
+                if exc.errno not in ROOM_SCOPED_SEND_ERRNOS:
+                    raise
+                logger.error(
+                    "RaidenKVManager rank%d room %s: RESERVE to %s failed "
+                    "(errno %s), failing the room: %s",
+                    self.attn_tp_rank,
+                    room,
+                    endpoint,
+                    exc.errno,
+                    exc,
+                )
+                with self._state_lock:
+                    if room not in self._aborted:
+                        self._mark_aborted_locked(room)
+                        self._fail_room_locked(
+                            room, f"RESERVE to {endpoint} failed: {exc}"
+                        )
+                        self.update_status(room, KVPoll.Failed)
+
+    def _on_reserve_busy(self, msg: List[bytes]) -> None:
+        """The decode kept no reservation for the ask."""
+        note = ReserveBusy.from_frames(msg)
+        with self._state_lock:
+            if (
+                note.room in self._aborted
+                or note.room not in self._prefill.reserve_requested_at
+            ):
+                return
+            self._heard_from_decode_locked(
+                self._prefill.registered_decodes.get(note.room)
+            )
+            self._prefill.reserve_busy.add(note.room)
+
+    def _forget_decode_registration_locked(self, room: int) -> None:
+        endpoint = self._prefill.registered_decodes.pop(room, None)
+        self._prefill.registered_at.pop(room, None)
+        if endpoint is None:
+            return
+        self._prefill.decode_room_counts[endpoint] -= 1
+        if self._prefill.decode_room_counts[endpoint] <= 0:
+            # Keep liveness only while at least one room still uses this peer.
+            self._prefill.decode_room_counts.pop(endpoint, None)
+            self._prefill.decode_heard_at.pop(endpoint, None)
+            self._prefill.silent_decodes.discard(endpoint)
+
+    def _heard_from_decode_locked(self, endpoint: Optional[str]) -> None:
+        if endpoint is not None:
+            self._prefill.decode_heard_at[endpoint] = time.time()
+            self._prefill.silent_decodes.discard(endpoint)
+
+    def reservation_busy(self, room: int) -> bool:
+        with self._state_lock:
+            return room in self._prefill.reserve_busy
+
+    def decode_endpoint(self, room: int) -> Optional[str]:
+        """The registered decode rank of ``room``, or None before it registers."""
+        with self._state_lock:
+            return self._prefill.registered_decodes.get(room)
 
     def append_send_blocks(
         self,
@@ -496,20 +642,61 @@ class RaidenSenderMixin:
         with self._state_lock:
             if self._decode_asked_locked(room):
                 return False
+            reason = None
             if room in self._prefill.reshard_req:
                 started = self._prefill.reshard_replied_at.get(room)
+            elif self._prefill_driven:
+                started = self._prefill_driven_silence_start_locked(room, since)
+                reason = self._silent_decode_reason_locked(room)
             else:
                 started = since
-            if started is None or time.time() - started < timeout:
-                return False
+            if reason is None:
+                if started is None or time.time() - started < timeout:
+                    return False
+                reason = (
+                    f"Request {room} timed out after {time.time() - started:.1f}s "
+                    "waiting for the decode to ask for its KV"
+                )
+                registered = self._prefill.registered_decodes.get(room)
+                heard_at = self._prefill.decode_heard_at.get(registered, 0.0)
+                if registered is not None and time.time() - heard_at >= timeout:
+                    self._prefill.silent_decodes.add(registered)
             self._mark_aborted_locked(room)
-            self._fail_room_locked(
-                room,
-                f"Request {room} timed out after {time.time() - since:.1f}s "
-                "waiting for the decode to ask for its KV",
-            )
+            self._fail_room_locked(room, reason)
             self.update_status(room, KVPoll.Failed)
         return True
+
+    def _silent_decode_reason_locked(self, room: int) -> Optional[str]:
+        """prefill_driven: the room's decode let an ask time out and sent
+        nothing for a whole timeout. Asked in turn, its rooms would each wait
+        out the timeout, so they fail now. Any later message clears the mark."""
+        registered = self._prefill.registered_decodes.get(room)
+        if registered not in self._prefill.silent_decodes:
+            return None
+        return (
+            f"Request {room}: its decode {registered} stopped answering "
+            "reservation asks"
+        )
+
+    def _prefill_driven_silence_start_locked(
+        self, room: int, since: float
+    ) -> Optional[float]:
+        """Start of the decode's current debt under prefill_driven, or None
+        while the decode owes nothing.
+
+        Until it registers, the decode owes its BOOTSTRAP (counted from
+        ``since``). Once registered it owes nothing while the request waits in
+        the prefill's own queue or after it answered BUSY. After the prefill
+        asked it to reserve, it owes the pull request or a BUSY, counted from
+        the ask or, for an ask that waited for the registration, from the
+        registration.
+        """
+        if room not in self._prefill.registered_decodes:
+            return since
+        requested_at = self._prefill.reserve_requested_at.get(room)
+        if requested_at is None or room in self._prefill.reserve_busy:
+            return None
+        return max(requested_at, self._prefill.registered_at.get(room, requested_at))
 
     def _register_sender_read(
         self, room: int, engine: Any, req_id: str, uuid: int, block_ids: List[int]
@@ -1338,6 +1525,20 @@ class RaidenKVSender(CommonKVSender):
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         super().init(num_kv_indices, aux_index)
 
+    def request_decode_reservation(self) -> None:
+        if not self.kv_mgr.is_dummy_cp_rank:
+            self.kv_mgr.request_decode_reservation(self.bootstrap_room)
+
+    def reservation_busy(self) -> bool:
+        # Non-transfer CP ranks receive no replies and retain no reservation.
+        # True is their neutral vote in the all-rank MIN reduction of BUSY.
+        return self.kv_mgr.is_dummy_cp_rank or self.kv_mgr.reservation_busy(
+            self.bootstrap_room
+        )
+
+    def decode_endpoint(self) -> Optional[str]:
+        return self.kv_mgr.decode_endpoint(self.bootstrap_room)
+
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         self._last_chunk = last_chunk
         return num_pages > 0 or last_chunk
@@ -1443,6 +1644,9 @@ class RaidenKVSender(CommonKVSender):
         if self.kv_mgr.fail_decode_silence(
             self.bootstrap_room, self.init_time, self.kv_mgr.bootstrap_timeout
         ):
+            if self.kv_mgr._prefill_driven:
+                # This decode may be alive and waiting for the RESERVE.
+                self._tell_decode_room_failed()
             self.conclude_state = KVPoll.Failed
             return KVPoll.Failed
         return status

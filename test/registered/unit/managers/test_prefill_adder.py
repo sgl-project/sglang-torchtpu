@@ -184,6 +184,10 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(req.kv.cache_protected_len, 0)
         self.assertEqual(len(req.prefix_indices), 0)
         req.set_extend_range.assert_not_called()
+        self.assertEqual(
+            self.mock_tree_cache.inc_lock_ref.call_count,
+            self.mock_tree_cache.dec_lock_ref.call_count,
+        )
         self.assertEqual(adder.can_run_list, [])
         self.assertIsNone(adder.new_chunked_req)
         self.assertEqual(adder.rem_chunk_tokens, 128)
@@ -1152,6 +1156,18 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.kv_shard_block_bound_pages, 2)
         self.assertEqual(adder.kv_shard_chunk_pages, 1)
 
+    def test_sharded_scratch_can_be_checked_without_reserving(self):
+        adder = self.create_sharded_adder()
+        self.assertTrue(adder._kv_shard_reserve_scratch(12, 4, commit=False))
+        self.assertEqual(adder.kv_shard_block_bound_pages, 0)
+        self.assertEqual(adder.kv_shard_chunk_pages, 0)
+        self.assertTrue(adder._kv_shard_reserve_scratch(12, 4))
+        before = (adder.kv_shard_block_bound_pages, adder.kv_shard_chunk_pages)
+        adder._kv_shard_reserve_scratch(12, 4, commit=False)
+        self.assertEqual(
+            before, (adder.kv_shard_block_bound_pages, adder.kv_shard_chunk_pages)
+        )
+
     def _build_hybrid_swa_chunked_req(
         self,
         *,
@@ -1653,6 +1669,233 @@ class TestPrefillAdder(CustomTestCase):
             )
         )
         return req
+
+    def test_deferred_candidate_leaves_budget_for_a_later_ready_request(self):
+        delayer = _RecordingDelayer(allow=True)
+        adder = self._create_delayer_adder(
+            available_tokens=100_000, delayer=delayer, rem_chunk_tokens=1024
+        )
+        deferred = self._create_delayer_req(512)
+        ready = self._create_delayer_req(256)
+        adder.is_admission_ready = lambda req, extend_len: req is ready
+
+        result = adder.add_one_req(deferred, False, None)
+
+        self.assertEqual(adder.can_run_list, [])
+        self.assertEqual(result, AddReqResult.DEFERRED)
+        self.assertEqual(adder.rem_chunk_tokens, 1024)
+        self.assertEqual(adder.memory_budget.total_offset, 0)
+        deferred.set_extend_range.assert_not_called()
+        self.assertIsNone(adder.new_chunked_req)
+        self.assertEqual(delayer.calls, [])
+
+        adder.add_one_req(ready, False, None)
+
+        self.assertEqual(adder.can_run_list, [ready])
+        self.assertEqual(ready.extend_range.length, 256)
+        self.assertEqual(delayer.calls, [True])
+
+    def _deferred_scheduler_fixture(self):
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from sglang.srt.managers.scheduler import Scheduler
+
+        blocked, ready = self._create_delayer_req(512), self._create_delayer_req(256)
+        blocked.rid, ready.rid = "blocked", "ready"
+        blocked.lora_id, ready.lora_id = "a", "b"
+        for req in (blocked, ready):
+            req.token_indices_to_pool = req.beam_group = None
+            req.time_stats.set_forward_entry_time = MagicMock()
+            req.session = None
+            req.kv.mamba_pool_idx = torch.tensor(2)
+            req.kv.mamba_cow_src_index = 1
+            req.kv.mamba_needs_clear = True
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_token_allocator.available_size.return_value = 100_000
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        s = Scheduler.__new__(Scheduler)
+        s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
+        s.enable_priority_preemption = s.is_hybrid_swa = False
+        s.waiting_queue = [blocked, ready]
+        s.chunked_req = s.min_free_slots_delayer = s.dynamic_chunk_sizer = None
+        s.get_num_allocatable_reqs = lambda *a, **kw: 8
+        s.policy = SimpleNamespace(calc_priority=lambda *a, **kw: None)
+        s.processed_tokens_counter = 0
+        s.chunked_prefill_size = 1024
+        s.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                attn_backend=None,
+                prefill_aware_swa=False,
+            )
+        )
+        s._tpu_pp_chunk_cost = None
+        s.page_size = 1
+        s.tree_cache = self.mock_tree_cache
+        s.token_to_kv_pool_allocator = self.mock_token_allocator
+        self.mock_token_allocator.page_size = 1
+        s.req_to_token_pool = self.mock_tree_cache.req_to_token_pool
+        s.new_token_ratio_tracker = SimpleNamespace(current=1.0)
+        s.max_prefill_tokens = 1024
+        s.is_mixed_chunk = False
+        s.priority_scheduling_preemption_threshold = 0
+        s.max_prefill_bs = 0
+        s.max_running_requests = 8
+        s.dllm_config = None
+        s.enable_lora = True
+        s.lora_drainer = None
+        # A deferred adapter must not occupy the single available LoRA slot.
+        s.can_schedule_lora_req = lambda req, running: not running
+        s.disaggregation_mode = DisaggregationMode.PREFILL
+        s.req_to_token_pool.available_size.return_value = 8
+        s.enable_hicache_storage = s.enable_lmcache = False
+        s.enable_hierarchical_cache = s.enable_unified_cache_external_linker = False
+        s.truncation_align_size = None
+        s._dynamic_first_chunk_cap = lambda req: None
+        s.model_config = s.spec_algorithm = None
+        s.enable_overlap = s.enable_priority_scheduling = False
+        s.load_inquirer = MagicMock()
+        s.load_inquirer._get_num_pending_tokens.return_value = 0
+        return s, blocked, ready
+
+    def test_scheduler_backfills_after_deferred_lora_and_releases_match_state(self):
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.managers.scheduler import Scheduler
+
+        s, blocked, ready = self._deferred_scheduler_fixture()
+        batch = MagicMock()
+        batch.reqs = [ready]
+        with (
+            patch.object(
+                PrefillAdder,
+                "is_admission_ready",
+                lambda adder, req, work: req is ready,
+            ),
+            patch.object(PrefillAdder, "get_match_group_size", return_value=0),
+            patch.object(ScheduleBatch, "init_new", return_value=batch) as init_batch,
+        ):
+            actual, _ = Scheduler._get_new_batch_prefill_raw(
+                s,
+                None,
+                ScheduleBatch(reqs=[], batch_is_full=False),
+            )
+        self.assertIs(actual, batch)
+        self.assertEqual(init_batch.call_args.args[0], [ready])
+        self.assertEqual(s.waiting_queue, [blocked])
+        self.assertIsNone(blocked.kv.mamba_pool_idx)
+        self.assertIsNone(blocked.kv.mamba_cow_src_index)
+        self.assertFalse(blocked.kv.mamba_needs_clear)
+        s.req_to_token_pool.mamba_allocator.free.assert_called_once()
+        s.req_to_token_pool.mamba_allocator.alloc_group_begin.assert_called_once_with(0)
+        s.req_to_token_pool.mamba_allocator.alloc_group_end.assert_called_once()
+
+    def test_scheduler_requeues_preempted_requests_when_admission_defers(self):
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.managers.scheduler import Scheduler
+
+        s, blocked, _ = self._deferred_scheduler_fixture()
+        s.waiting_queue = [blocked]
+        s.enable_priority_preemption = True
+        s.get_num_allocatable_reqs = lambda *args, **kwargs: 0
+        victim = self._create_delayer_req(32)
+        s._add_request_to_queue = MagicMock()
+        running = ScheduleBatch(reqs=[], batch_is_full=False)
+        preempted = []
+
+        # Model preemption's ownership transition; use the actual scheduler
+        # loop and real adder for the subsequent deferred admission.
+        def preempt(adder, req):
+            preempted.append(req)
+            adder.preempt_list.append(victim)
+            return True
+
+        with (
+            patch.object(PrefillAdder, "preempt_to_schedule", preempt),
+            patch.object(PrefillAdder, "is_admission_ready", return_value=False),
+        ):
+            batch, _ = Scheduler._get_new_batch_prefill_raw(s, None, running)
+        self.assertIsNone(batch)
+        self.assertEqual(preempted, [blocked])
+        s._add_request_to_queue.assert_called_once_with(victim)
+
+    def test_deferred_host_hit_does_not_materialize_or_pin_its_kv(self):
+        adder = self._create_delayer_adder(
+            available_tokens=100_000, delayer=None, rem_chunk_tokens=1024
+        )
+        req = self._create_delayer_req(256)
+        req.prefix_indices = torch.empty(0, dtype=torch.int64)
+        req.host_hit_length = 192
+        req.best_match_node = req.last_node
+        req.needs_host_load_back.return_value = True
+        self.mock_tree_cache.init_load_back.return_value = (
+            torch.arange(192),
+            req.last_node,
+        )
+        selected_work = []
+
+        def defer(candidate, extend_len):
+            selected_work.append(extend_len)
+            return False
+
+        adder.is_admission_ready = defer
+        result = adder.add_one_req(req, False, None)
+
+        self.assertEqual(adder.can_run_list, [])
+        self.assertEqual(result, AddReqResult.DEFERRED)
+        self.assertEqual(selected_work, [64])
+        self.mock_tree_cache.init_load_back.assert_not_called()
+        self.assertEqual(adder.host_load_indices, [])
+        self.assertEqual(adder.memory_budget.total_offset, 0)
+        self.assertEqual(len(req.prefix_indices), 0)
+        req.set_extend_range.assert_not_called()
+
+    def test_deferred_session_keeps_its_owned_mamba_slot(self):
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.managers.scheduler import Scheduler
+
+        s, blocked, _ = self._deferred_scheduler_fixture()
+        s.waiting_queue = [blocked]
+        blocked.session = object()
+        slot = blocked.kv.mamba_pool_idx
+        with patch.object(PrefillAdder, "is_admission_ready", return_value=False):
+            batch, _ = Scheduler._get_new_batch_prefill_raw(
+                s, None, ScheduleBatch(reqs=[], batch_is_full=False)
+            )
+        self.assertIsNone(batch)
+        self.assertIs(blocked.kv.mamba_pool_idx, slot)
+        s.req_to_token_pool.mamba_allocator.free.assert_not_called()
+
+    def test_deferred_ignore_eos_preserves_projection_and_chunk_capacity(self):
+        for chunk, selected_tokens in ((None, 512), (1024, 512), (256, 256)):
+            for previous, max_new in ((None, 8), ([(9, 512)], 8), ([(9, 512)], 0)):
+                with self.subTest(chunk=chunk, previous=previous, max_new=max_new):
+                    adder = self._create_delayer_adder(
+                        available_tokens=100_000, delayer=None, rem_chunk_tokens=chunk
+                    )
+                    self.mock_tree_cache.disable = True
+                    adder.req_states = previous
+                    req = self._create_delayer_req(512)
+                    req.origin_input_ids = req.full_untruncated_fill_ids
+                    req.sampling_params.ignore_eos = True
+                    req.sampling_params.max_new_tokens = max_new
+                    seen = []
+
+                    def defer(candidate, extend_len):
+                        seen.append(extend_len)
+                        return False
+
+                    adder.is_admission_ready = defer
+                    result = adder.add_one_req(req, False, None)
+
+                    self.assertEqual(adder.can_run_list, [])
+                    self.assertEqual(result, AddReqResult.DEFERRED)
+                    self.assertEqual(seen, [selected_tokens])
+                    self.assertEqual(
+                        adder.req_states, None if previous is None else [(9, 512)]
+                    )
+                    self.assertEqual(adder.rem_chunk_tokens, chunk)
+                    self.assertEqual(adder.memory_budget.total_offset, 0)
+                    self.assertIsNone(adder.new_chunked_req)
+                    req.set_extend_range.assert_not_called()
 
     def test_add_chunked_req_non_hybrid_no_swa_reservation(self):
         # Non-hybrid path: the SWA-pool reservation must NOT apply, otherwise

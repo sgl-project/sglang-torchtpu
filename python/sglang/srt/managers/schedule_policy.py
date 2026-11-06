@@ -661,6 +661,7 @@ class AddReqResult(Enum):
     CONTINUE = auto()  # Continue to add requests
     NO_TOKEN = auto()  # No token left
     OTHER = auto()  # Other reasons to stop adding requests
+    DEFERRED = auto()  # Skip this candidate and keep filling the batch
 
 
 @dataclass(frozen=True, slots=True)
@@ -1087,9 +1088,12 @@ class PrefillAdder:
         # Persist the release receipt.
         req.lock_receipt = self.tree_cache.inc_lock_ref(req.last_node).to_dec_params()
 
-    def _kv_shard_reserve_scratch(self, prefix_len: int, extend_len: int) -> bool:
+    def _kv_shard_reserve_scratch(
+        self, prefix_len: int, extend_len: int, *, commit: bool = True
+    ) -> bool:
         """Reserve scratch or return False to defer; no-op when sharding is off.
 
+        With commit=False, only check feasibility and leave the budget intact.
         Prefixes use N * sum_i ceil(prefix_pages_i / N) pages; extends use
         sum_i ceil(extend_i / ps). A request must fit an empty batch or raise.
         """
@@ -1115,8 +1119,9 @@ class PrefillAdder:
                     "assembly scratch"
                 )
             return False
-        self.kv_shard_block_bound_pages = block
-        self.kv_shard_chunk_pages = chunk
+        if commit:
+            self.kv_shard_block_bound_pages = block
+            self.kv_shard_chunk_pages = chunk
         return True
 
     def add_dllm_staging_req(self, req: Req):
@@ -1300,7 +1305,10 @@ class PrefillAdder:
                     if tokens_left <= self.req_states[i][0]:
                         break
                 self.req_states.insert(i, (tokens_left, tokens_occupied))
+                return i
 
+        inserted_index = None
+        previous_req_states = self.req_states
         if self.req_states is None:
             self.req_states = []
             add_req_state(req)
@@ -1311,7 +1319,7 @@ class PrefillAdder:
                 add_req_state(r)
             self.req_states.sort(key=lambda x: x[0])
         else:
-            add_req_state(req, insert_sort=True)
+            inserted_index = add_req_state(req, insert_sort=True)
 
         if not self.is_hybrid_swa:
             # Skip this logic for swa. The SWA has different memory management, and
@@ -1326,6 +1334,22 @@ class PrefillAdder:
                 if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
                     return AddReqResult.NO_TOKEN
                 tokens_freed += tokens_occupied
+
+        extend_len = cand_extend_input_len
+        if self.dllm_config is not None:
+            extend_len = self._get_dllm_extend_len(req, 0)
+        elif self.rem_chunk_tokens is not None:
+            extend_len = min(extend_len, self.rem_chunk_tokens)
+        if (
+            extend_len > 0
+            and not (has_chunked_req and extend_len < cand_extend_input_len)
+            and not self.is_admission_ready(req, extend_len)
+        ):
+            if previous_req_states is None:
+                self.req_states = None
+            elif inserted_index is not None:
+                self.req_states.pop(inserted_index)
+            return AddReqResult.DEFERRED
 
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
@@ -1412,6 +1436,18 @@ class PrefillAdder:
 
         return self.budget_state()
 
+    def get_match_group_size(self, num_candidates: int) -> int:
+        """Slots to preallocate for prefix matching; zero matches one at a time."""
+        return num_candidates
+
+    def is_admission_ready(self, req: Req, extend_len: int) -> bool:
+        """Whether a feasible candidate can commit local prefill resources.
+
+        Returning False defers the request without consuming its batch budget;
+        later candidates may still run. The default admits every candidate.
+        """
+        return True
+
     def add_one_req(
         self,
         req: Req,
@@ -1460,6 +1496,9 @@ class PrefillAdder:
             # The scheduler tracks one partially prefilled request at a time.
             if has_chunked_req and admission.is_chunked:
                 return AddReqResult.OTHER
+
+            if not self.is_admission_ready(req, admission.extend_len):
+                return AddReqResult.DEFERRED
 
             # A rejected candidate must not report prefillable or queue H2D.
             if (self.prefill_delayer_single_pass is not None) and (

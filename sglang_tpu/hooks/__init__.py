@@ -81,6 +81,7 @@ from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
     skip_spec_op_precompile_without_draft,
 )
+from sglang_tpu.hooks.prefill_driven import hook_specs as prefill_driven_hooks
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 from sglang_tpu.hooks.spec_tp_sync import broadcast_undeferred
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
@@ -388,6 +389,8 @@ def register() -> None:
 
     from sglang.srt.plugins.hook_registry import HookRegistry
 
-    for target, hook, hook_type in HOOKS:
+    # Gated on an env var, so read at registration rather than at import.
+    hooks = HOOKS + prefill_driven_hooks()
+    for target, hook, hook_type in hooks:
         HookRegistry.register(target, hook, hook_type)
-    logger.info("sglang_tpu: registered %d hook(s).", len(HOOKS))
+    logger.info("sglang_tpu: registered %d hook(s).", len(hooks))

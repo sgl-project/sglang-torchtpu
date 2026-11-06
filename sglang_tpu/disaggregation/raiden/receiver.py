@@ -16,9 +16,14 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import numpy.typing as npt
+import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVReceiver, KVTransferError
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVReceiver,
+    KVTransferError,
+    PrefillServerInfo,
+)
 from sglang.srt.environ import envs
 from sglang_tpu.disaggregation.raiden.chunk_plan import chunk_pull_window
 from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
@@ -26,6 +31,8 @@ from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
     PullReq,
+    Reserve,
+    ReserveBusy,
     ReshardBlocks,
     ReshardChunk,
     ReshardChunkReady,
@@ -228,6 +235,51 @@ class RaidenReceiverMixin:
             self._mark_aborted_locked(room)
             self._fail_room_locked(room, note.reason, preserve_reason=True)
             self.update_status(room, KVPoll.Failed)
+
+    def _on_reserve(self, msg: List[bytes]) -> None:
+        """The prefill asked this rank to reserve KV for a room
+        (prefill_driven). The room turns WaitingForInput, and the scheduler
+        reserves its pages once every rank has been asked."""
+        note = Reserve.from_frames(msg)
+        room = note.room
+        with self._state_lock:
+            if room in self._aborted:
+                return
+            try:
+                status = self.check_status(room)
+            except KeyError:
+                # Cleared, or a restarted decode at the same address. The
+                # prefill fails the room when its pull request never comes.
+                logger.debug("RaidenKVManager RESERVE for unknown room %s", room)
+                return
+            if status not in (KVPoll.Bootstrapping, KVPoll.WaitingForInput):
+                return
+            self._decode.reserve_held.add(room)
+            self.update_status(room, KVPoll.WaitingForInput)
+
+    def reject_reservation(self, room: int, endpoints: List[str]) -> None:
+        """Answer the ask with BUSY and keep no reservation: the room waits
+        in Bootstrapping for the prefill's next ask."""
+        with self._state_lock, self._status_lock:
+            if room not in self._decode.reserve_held:
+                logger.debug("Ignoring BUSY for room %s without a held RESERVE", room)
+                return
+            self._decode.reserve_held.discard(room)
+            if self.request_status.get(room) == KVPoll.WaitingForInput:
+                self.request_status[room] = KVPoll.Bootstrapping
+        payload = ReserveBusy(room=room).to_frames()
+        for endpoint in endpoints:
+            self._send_multipart_locked(endpoint, payload)
+
+    def hold_for_reservation(self, room: int) -> None:
+        """prefill_driven: keep a room Bootstrapping until its RESERVE.
+
+        Core's early policy opens a room in WaitingForInput, and update_status
+        never moves a room back, so this resets the status directly.
+        """
+        with self._state_lock, self._status_lock:
+            if self.request_status.get(room) == KVPoll.WaitingForInput:
+                self.request_status[room] = KVPoll.Bootstrapping
 
     # ----- decode side -------------------------------------------------------
 
@@ -1439,6 +1491,22 @@ class RaidenReceiverMixin:
         )
 
 
+def prefill_driven_peer_mismatch(
+    prefill_info: PrefillServerInfo, *, decode_attn_tp_size: int
+) -> Optional[str]:
+    """Why a decode cannot pair with this prefill under prefill_driven, or
+    None. One prefill rank asks each decode rank to reserve. With unequal TP
+    ranks pair up several to one, and one RESERVE would ready only some."""
+    sources = prefill_info.required_prefill_response_num
+    if prefill_info.attn_tp_size == decode_attn_tp_size and sources == 1:
+        return None
+    return (
+        "prefill_driven requires equal attention TP on prefill and decode and one "
+        f"prefill source per decode rank: prefill attn_tp={prefill_info.attn_tp_size}, "
+        f"decode attn_tp={decode_attn_tp_size}, sources={sources}"
+    )
+
+
 class RaidenKVReceiver(CommonKVReceiver):
     # See RaidenKVSender: a group Failed waits for every rank's transfers.
     group_failure_requires_drain = True
@@ -1454,6 +1522,36 @@ class RaidenKVReceiver(CommonKVReceiver):
         # Bounds the wait before send_metadata, see _check_handshake_timeout.
         self._handshake_start = time.time()
         self._handshake_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+
+    def init(self, prefill_dp_rank: int):
+        super().init(prefill_dp_rank)
+        if self.kv_mgr._prefill_driven and self.conclude_state != KVPoll.Failed:
+            self._register_for_reservation()
+
+    def _register_for_reservation(self) -> None:
+        """prefill_driven: tell each prefill rank this room exists, then wait
+        in Bootstrapping for its RESERVE instead of reserving at arrival."""
+        reason = prefill_driven_peer_mismatch(
+            self.prefill_info, decode_attn_tp_size=self.kv_mgr.attn_tp_size
+        )
+        if reason is not None:
+            self._conclude_failed(reason=reason)
+            return
+        self.kv_mgr.hold_for_reservation(self.bootstrap_room)
+        try:
+            for info in self.bootstrap_infos:
+                sock, lock = self._connect_to_bootstrap_server(info)
+                with lock:
+                    sock.send_multipart(
+                        [
+                            b"BOOTSTRAP",
+                            str(self.bootstrap_room).encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                        ]
+                    )
+        except zmq.ZMQError:
+            self.abort()
 
     def send_metadata(
         self,
@@ -1505,6 +1603,18 @@ class RaidenKVReceiver(CommonKVReceiver):
                 f"{self.kv_mgr.waiting_timeout:.0f}s)",
             )
         return result
+
+    def reject_reservation(self) -> None:
+        """prefill_driven: this pass could not admit the room, tell the
+        prefill so it can ask for others now and this one again later."""
+        endpoints = [
+            _tcp_endpoint(ip=info["rank_ip"], port=info["rank_port"])
+            for info in self.bootstrap_infos
+        ]
+        try:
+            self.kv_mgr.reject_reservation(self.bootstrap_room, endpoints)
+        except zmq.ZMQError:
+            self.abort()
 
     def poll(self) -> KVPoll:
         """Every terminal condition is checked before any native read is

@@ -555,6 +555,7 @@ class TestSenderBootstrapTimeout(unittest.TestCase):
         mgr = SimpleNamespace(
             _drain_engine=lambda: None,
             is_dummy_cp_rank=False,
+            _prefill_driven=False,
             is_failed=lambda room: False,
             is_send_done=lambda room: False,
             request_status={ROOM: KVPoll.Bootstrapping},
