@@ -1,0 +1,16 @@
+Workaround for dense models (e.g. Qwen3-VL-8B) that fail to start with
+--enable-torch-compile at TP>1 on current main: initialize MoE flags for every
+model so the compiled forward never mutates them. Not a proposed fix.
+
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -985,8 +985,7 @@
+             "moe_top_k",
+             "moe_topk",
+         )
+-        if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
+-            initialize_moe_config()
++        initialize_moe_config()
+
+         # Initialize GEMM-related configuration for FP8 and FP4 backends.
+         initialize_fp8_gemm_config()
