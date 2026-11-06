@@ -121,14 +121,32 @@ def _invoke_batched_kernel(
 
     if decode_query_size == 1:
         return run(kv_cache_fused, distribution)
-    # The kernel's DECODE pass takes one row per sequence, so the width-wide verify
-    # sequences [0, distribution[0]) run as MIXED with verify-sized q blocks.
+    # The DECODE range [0, distribution[0]) holds the width-wide sequences (a verify
+    # batch, or a mixed-verify extend's tails, ordered first). The kernel's DECODE pass
+    # takes one row per sequence, so they run as MIXED with verify-sized q blocks; the
+    # remaining sequences then run as MIXED with the prefill blocks.
     import jax.numpy as jnp
 
     verify_dist = jnp.zeros_like(distribution).at[2].set(distribution[0])
     rest_dist = distribution.at[0].set(0)
     rows = jnp.arange(queries.shape[0])
     verify_rows = rows < cu_q_lens[distribution[0]]
+    if envs.SGLANG_TPU_MIXED_VERIFY_TAILS_LAST.get():
+        # A mixed-verify extend kept in batch order arrives as [0, p, n]: the tails are
+        # sequences [p, n), the verify pass's MIXED range, and the prefill pass takes
+        # [0, p). A decode-ordered [k, k, n] (k >= 1) keeps the split above.
+        tails_last = distribution[0] == 0
+        verify_dist = jnp.where(tails_last, rest_dist, verify_dist)
+        rest_dist = jnp.where(
+            tails_last,
+            jnp.zeros_like(distribution).at[2].set(distribution[1]),
+            rest_dist,
+        )
+        verify_rows = jnp.where(
+            tails_last,
+            (rows >= cu_q_lens[distribution[1]]) & (rows < cu_q_lens[distribution[2]]),
+            verify_rows,
+        )
     out_verify, kv_cache_fused = run(
         kv_cache_fused,
         verify_dist,
@@ -171,7 +189,10 @@ def _verify_blocks(*, decode_query_size: int, sliding_window: int | None):
 _MIN_PAGE_SIZE = 256
 
 RPA_BATCHED_SPEC = RpaKernelSpec(
-    op_name="sglang_tpu_pallas::ragged_paged_attention_batched",
+    # Compiled kernels are cached by op name and static args, not by what the body read
+    # from the environment, so the tails-last split gets its own op.
+    op_name="sglang_tpu_pallas::ragged_paged_attention_batched"
+    + ("_tails_last" if envs.SGLANG_TPU_MIXED_VERIFY_TAILS_LAST.get() else ""),
     import_kernel=_import_batched_kernel,
     invoke_kernel=_invoke_batched_kernel,
     supports_attention_sink=True,
@@ -188,12 +209,17 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
 
     def __init__(self, model_runner, speculative_step_id=0):
         super().__init__(model_runner, speculative_step_id)
+        from sglang.srt.managers.schedule_batch import mixed_tail_width
         from sglang.srt.runtime_context import get_parallel
 
         parallel = get_parallel()
-        if envs.SGLANG_TPU_RPA_BATCHED_VERIFY_BLOCKS.get():
-            # Verify batches then reach the kernel as uniform-width DECODE, which
-            # _invoke_batched_kernel runs as MIXED with verify-sized blocks.
+        if (
+            envs.SGLANG_TPU_RPA_BATCHED_VERIFY_BLOCKS.get()
+            or mixed_tail_width(model_runner.spec_algorithm) > 1
+        ):
+            # Verify batches (and mixed-verify tails) then reach the kernel as
+            # uniform-width DECODE, which _invoke_batched_kernel runs as MIXED with
+            # verify-sized blocks.
             self.decode_query_size = _resolve_decode_query_size(
                 supports_decode_query_size=True,
                 spec_enabled=not model_runner.spec_algorithm.is_none(),

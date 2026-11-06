@@ -263,10 +263,27 @@ class TpuEnvs:
     # experts of a BF16 checkpoint. The Muse megakernel reads only fp4 or fp8 experts,
     # so it cannot be combined with this.
     SGLANG_TPU_ENABLE_MUSE_BF16_FIRST_LAST_LAYER_EXPERTS = EnvBool(False)
+    # With the megakernel: prefill and other native-path steps run the dense linears and routers
+    # on the kernel's fp8 K-major copies (per-column scales, as in decode) and the bf16
+    # weights are freed for the KV pool.
+    SGLANG_TPU_MUSE_SHARED_DENSE = EnvBool(False)
+    # Muse Spark prefill sequence parallelism: extend forwards of at least MIN_TOKENS tokens
+    # keep the fp32 residual stream token-sharded over the TP group between layers.
+    SGLANG_TPU_MUSE_PREFILL_SP = EnvBool(False)
+    SGLANG_TPU_MUSE_PREFILL_SP_MIN_TOKENS = EnvInt(1024)
+    # Muse Spark: gather prefill-sized column shards with one all-gather along the column
+    # dim instead of a token-dim all-gather plus a transpose.
+    SGLANG_TPU_MUSE_GATHER_COLUMNS_DIM = EnvBool(False)
+    # Muse Spark rotary embedding by a one-lane roll on [tokens, heads * head_dim]
+    # instead of a [..., head_dim // 2, 2] pair view (same arithmetic).
+    SGLANG_TPU_MUSE_ROPE_ROLL = EnvBool(False)
     # Largest megakernel step in rows (running requests x verify tokens, padded to the
     # TP size); larger steps run the native decoder. Steps above 32 rows use the
     # large-step paths (ops._BASE_STEP_MAX_ROWS).
     SGLANG_TPU_MUSE_MK_MAX_ROWS = EnvInt(32)
+    # DFlash: verify only the first WIDTH tokens of each draft block once the decode batch
+    # reaches MIN_BS requests (dflash_adaptive_verify.py); "" verifies the full block.
+    SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY = EnvStr("")
     # > 0: megakernel sliding-window layers on SEQ_ALONG_LANE pools use KV chunks of this many
     # tokens (a divisor of the 2 * inter_local-token chunk); their 2048-token window gains nothing.
     SGLANG_TPU_MUSE_MK_SAL_SWA_CHUNK_TOKENS = EnvInt(0)
@@ -349,6 +366,9 @@ class TpuEnvs:
     SGLANG_TPU_MK_LARGE_STEP_VMEM_LIMIT_MB = EnvFloat(None)
     # Tuning only: force the 16-bit packed page tables on (1) or off (0); unset = by table size.
     SGLANG_TPU_MK_PACK_PAGE_TABLES = EnvInt(None)
+    # Fixed batch shape of MIXED (mixed-chunk) batches; unset = the largest bs bucket. Raise it
+    # when more requests decode inside mixed chunks than any decode bucket holds.
+    SGLANG_TPU_MIXED_MAX_BS = EnvInt(None)
     # Megakernel attention: fold a power-of-two attn_scale into the bf16 queries instead of
     # scaling every score (exact).
     SGLANG_TPU_MK_FOLD_ATTN_SCALE = EnvBool(False)
@@ -358,6 +378,9 @@ class TpuEnvs:
     # Megakernel KV write on SEQ_ALONG_LANE pools: all page read-modify-writes of a layer in
     # flight together, overlapped with the next layer's (MKConfig.kv_write_pipelined; exact).
     SGLANG_TPU_MUSE_MK_KV_WRITE_PIPELINED = EnvBool(False)
+    # Raiden HiCache transfers move each run of pages that is consecutive on both the
+    # device and the host as one segment instead of one segment per page.
+    SGLANG_TPU_RAIDEN_COALESCE_PAGES = EnvBool(False)
     # Fused-RS expert TP passes each device only its own block of routed rows, so a
     # call is no longer capped at 1/ep_size of the tokens and the expert weights are
     # streamed once per chunk rather than once per capped call.
@@ -419,6 +442,16 @@ class TpuEnvs:
     # with a q block of that width; the prefill block search otherwise pads each request's
     # rows to a ~2048-row block (16 x 8 rows at 150K context: 42 -> 2.2 ms per layer).
     SGLANG_TPU_RPA_BATCHED_VERIFY_BLOCKS = EnvBool(False)
+    # Batched RPA, mixed verify: keep the MIXED batch's order (prefill sequences, then the
+    # decoding tails) and run the tails as the verify pass's MIXED range, instead of
+    # permuting every layer's q/k/v rows to put the tails first and permuting the output back.
+    SGLANG_TPU_MIXED_VERIFY_TAILS_LAST = EnvBool(False)
+    # Raiden HiCache: per-rank host RAM budget (GB) for the full, SWA and draft host pools
+    # together, replacing the free-RAM / local-ranks sample taken as each rank arrives.
+    SGLANG_TPU_HICACHE_HOST_BUDGET_GB = EnvFloat(None)
+    # Raiden HiCache: before building the host pools, release freed heap pages and wait for
+    # every rank, so no rank allocates while a peer still holds its weight-loading buffers.
+    SGLANG_TPU_HICACHE_TRIM_BEFORE_ALLOC = EnvBool(False)
     # Batched RPA prefill: tiles whose keys all precede their queries skip the causal
     # (and sliding-window) mask, and a power-of-two sm_scale is folded into q. Exact.
     SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK = EnvBool(False)
