@@ -24,6 +24,8 @@ from sglang_tpu.hooks.dflash_mla import (
     select_dflash_mla_attention,
 )
 from sglang_tpu.hooks.draft_kv_pool import (
+    attach_unified_draft_kv_pool,
+    derive_unified_draft_pool_sizes,
     draft_cell_size_per_token,
     draft_mha_pool_class,
 )
@@ -319,6 +321,16 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._profile_available_bytes",
         reserve_pp_buffered_handoff,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._derive_pool_sizes",
+        derive_unified_draft_pool_sizes,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._build_token_to_kv_pool_allocator",
+        attach_unified_draft_kv_pool,
         HookType.AROUND,
     ),
     (
