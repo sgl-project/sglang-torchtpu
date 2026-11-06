@@ -644,6 +644,7 @@ class MuseMegakernel(torch.nn.Module):
             # SAL chunks are one expert w13 slot row of tokens (the ring is a view of those slots)
             chunk_pages=chunk_pages,
             swa_chunk_pages=swa_chunk_pages,
+            swa_window_table=_swa_window_table(kv_sal, n_page_entries),
             kv_packed=self.kv_packed and not kv_sal,
             kv_sal=kv_sal,
             kv_sal_fp8=kv_sal_fp8,
@@ -837,6 +838,12 @@ class MuseMegakernel(torch.nn.Module):
                     break
                 cand = msgspec.structs.replace(base_cfg, expert_depth=depth)
                 slots = K.fit_ring_slots(cand, cap=cap)
+                if (
+                    tiled
+                    and base_cfg.tiled_vmem_y >= 1
+                    and slots <= _TILED_VY_MIN_SLOTS
+                ):
+                    continue
                 cand = msgspec.structs.replace(
                     cand, ring_slots=slots, stream_depth=slots - 1
                 )
@@ -1151,6 +1158,25 @@ _OPT_ALIASED_VMEM_LIMIT = 62 * 2**20
 _TILED_VPADS_VMEM_BUDGET = 50 * 2**20
 _TILED_VY2_VMEM_BUDGET = 50 * 2**20
 _ATTN_HOIST_GLOBAL_MIN_POS = 262144
+# Both page tables in SMEM past this crowd out the kernel's own SMEM scratch (1 MiB in all):
+# pages_swa then stays in HBM and each step reads only the requests' windows of it. cc24 at
+# 1M context (768.4 KiB) still fits beside the scratch and keeps the whole table.
+_SMEM_PAGE_TABLES_BUDGET = 800 * 2**10
+# A VMEM-Y row-tiled plan squeezed to a 2-slot ring has no prefetch room, and its LLO spill
+# slots overflow VMEM (cc28 x q8: 49.5 MiB scratch + 16.2 MiB spills > 63.9 MiB); the
+# streamed-Y plan fits there with a 6-slot ring.
+_TILED_VY_MIN_SLOTS = 2
+
+
+def _swa_window_table(kv_sal: bool, n_page_entries: int) -> bool:
+    mode = tpu_envs.SGLANG_TPU_MUSE_MK_SWA_WINDOW_TABLE.get()
+    if mode not in ("auto", "0", "1"):
+        raise ValueError(f"SGLANG_TPU_MUSE_MK_SWA_WINDOW_TABLE={mode!r}: auto, 0 or 1")
+    if mode == "auto":
+        return kv_sal and 2 * 4 * n_page_entries > _SMEM_PAGE_TABLES_BUDGET
+    return mode == "1"
+
+
 # (expert depth, ring cap): the ring is the largest divisor of the 30 dense tiles per layer up
 # to the cap (10, 6, 5, then 3). The folds need a stream depth of at least 3 (K.fold_fits), so
 # 5 slots or more.

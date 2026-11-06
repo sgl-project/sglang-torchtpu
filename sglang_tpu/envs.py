@@ -537,6 +537,9 @@ class TpuEnvs:
     # chunk is masked by key column only (MKConfig.attn_col_mask).
     SGLANG_TPU_MUSE_MK_ATTN_SKIP_IDLE = EnvBool(False)
     SGLANG_TPU_MUSE_MK_ATTN_COL_MASK = EnvBool(False)
+    # pages_swa windows DMA'd into SMEM instead of the whole table: "auto" (when the two page
+    # tables exceed the SMEM budget), "1" or "0" (forced, e.g. to A/B the two paths)
+    SGLANG_TPU_MUSE_MK_SWA_WINDOW_TABLE = EnvStr("auto")
     # Experimental: the pipelined SAL attention loop (MKConfig.attn_pipe) on steps of 33-64 rows
     # too, not only up to _BASE_STEP_MAX_ROWS (12-16 decoding requests at 4-token verify).
     SGLANG_TPU_MUSE_MK_LARGE_STEP_ATTN_PIPE = EnvBool(False)
