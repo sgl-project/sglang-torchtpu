@@ -40,6 +40,7 @@ class SpecTpSyncSite(IntEnum):
     SPEC_DRAFT_GREEDY = 19
     SPEC_DRAFT_SAMPLE = 20
     SPEC_TARGET = 21
+    SPEC_VERIFY_DRAFTS = 22  # per-request verify caps scheduled from draft confidence
 
     @property
     def slug(self) -> str:

@@ -132,6 +132,11 @@ class TpuBlockDraftWorker(TpuDraftWorker):
             return pool
         return None
 
+    @property
+    def target_hidden_size(self) -> int:
+        """Row width of the target hidden the verify captures for the draft KV writer."""
+        return self._compile_policy().dflash_target_hidden_size
+
     def precompile_draft(self) -> None:
         self._compile_policy().precompile_draft(
             self.model_runner.attn_backend,
