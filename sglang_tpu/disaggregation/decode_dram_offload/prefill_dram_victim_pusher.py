@@ -120,14 +120,16 @@ class PrefillDramVictimPusher:
         self.stats = dict.fromkeys(("started", "stored", "declined"), 0)
         self._last_log = [0.0]
 
-    def note_decode_of(self, req: Any) -> None:
-        """Carry the actual decode peer to the request's cache checkpoint."""
+    def note_decode_of(self, req: Any, *, recalled: bool = False) -> None:
+        """Carry the actual decode peer to the request's cache checkpoint.
+        ``recalled``: the request's cached prefix was just read from that
+        decode, which therefore holds it."""
         peer = self._channel.decode_peer(req.bootstrap_room)
         if peer is not None:
             req._pd_victim_decode_peer = peer
-        self.track_host_leaf(req)
+        self.track_host_leaf(req, on_decode=recalled)
 
-    def track_host_leaf(self, req: Any) -> None:
+    def track_host_leaf(self, req: Any, *, on_decode: bool = False) -> None:
         # Set by record(); a request that never reached its commit has none.
         peer = getattr(req, "_pd_victim_decode_peer", None)
         node_id = req.last_node
@@ -148,6 +150,9 @@ class PrefillDramVictimPusher:
                 peer,
                 push_manifest(tokens, node.key.extra_key, node.key.cache_salt),
             )
+            if on_decode:
+                # Not pushed back at the length it was recalled at.
+                self._pushed_len[node] = len(tokens)
 
     def clear_push_routes(self) -> None:
         self._routes.clear()

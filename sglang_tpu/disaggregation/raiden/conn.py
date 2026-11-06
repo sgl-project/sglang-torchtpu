@@ -823,6 +823,8 @@ class RaidenKVManager(
         return start, tail
 
     def _drain_engine(self) -> None:
+        if self.dram_offload_channel is not None:
+            self.dram_offload_channel.drain_host_reads()
         if self._pipeline is not None:
             sent, received, failed = self._pipeline.poll()
             with self._state_lock:
@@ -1340,6 +1342,11 @@ class RaidenKVManager(
         if self._pipeline is not None:
             return self._pipeline.active(room)
         with self._state_lock:
+            if (
+                self.dram_offload_channel is not None
+                and self.dram_offload_channel.host_read_pending_locked(room)
+            ):
+                return True
             if self._pulling is not None:
                 for key in self._pulling.rooms():
                     if self._is_room_transfer(
@@ -1377,6 +1384,12 @@ class RaidenKVManager(
             # still delivering keeps its receiver plan, each with the
             # completion that will settle it, until the engine reports it.
             held: Set[str] = set()
+            if self.dram_offload_channel is not None:
+                held.update(
+                    k
+                    for k in self.dram_offload_channel.pending_host_reads_locked()
+                    if belongs(k)
+                )
             if self._pulling is not None:
                 for key in self._pulling.rooms():
                     if not belongs(key):
@@ -1471,6 +1484,8 @@ class RaidenKVManager(
                     self._decode.reshard_registered,
                 ):
                     table.discard(room)
+            if self.dram_offload_channel is not None:
+                self.dram_offload_channel.forget_room_locked(room)
             if clear_failure_record:
                 # Failure publication takes _state_lock before failure_lock as
                 # well, so clear and publication have one total order.

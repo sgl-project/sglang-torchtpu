@@ -9,6 +9,9 @@ Remove when: core supplies equivalent checkpoint and decode-queue callbacks.
 
 Installed only with SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM=1;
 startup_validation.py refuses the settings the offload does not support at startup.
+Sticky routing sends a session's next turn to the same decode, whose host
+prefix offer lets the prefill recall it into DRAM before ordinary HBM
+admission.
 """
 
 from __future__ import annotations
@@ -22,6 +25,9 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang_tpu.disaggregation.decode_dram_offload.dram_offload_extension import (
     PrefillDramOffloadExtension,
     attach_dram_offload_extension,
+)
+from sglang_tpu.disaggregation.decode_dram_offload.radix_host_ops import (
+    deletion_orphans_host_only_child,
 )
 from sglang_tpu.disaggregation.decode_dram_offload.startup_validation import (
     validate_engine,
@@ -129,6 +135,35 @@ def _decode_init_kv_manager(upstream: Callable, queue: DecodePreallocQueue) -> A
     return manager
 
 
+def _send_kv_metadata(
+    upstream: Callable,
+    queue: DecodePreallocQueue,
+    decode_req: Any,
+    kv_indices: Any,
+    page_size: int,
+    *args,
+    **kwargs,
+) -> Any:
+    """Wraps ``DecodePreallocQueue._send_kv_metadata``, which sends the
+    request's PULL_REQ: first pin the pushed prefix this decode holds in RAM
+    for the request, so that the PULL_REQ names its pages to the prefill.
+    Every rank pre-allocates the same requests in the same order in a step,
+    so the host pins agree. A request the decode holds no page of (a host
+    receive included) offers nothing."""
+    if kwargs.get("decode_prefix_len", 0) >= page_size:
+        _extension(queue.tree_cache).source.offer_host_prefix(decode_req)
+    return upstream(queue, decode_req, kv_indices, page_size, *args, **kwargs)
+
+
+def _pop_transferred(upstream: Callable, queue: DecodeTransferQueue, *args, **kwargs):
+    """Wraps ``DecodeTransferQueue.pop_transferred``: drop the offers of
+    requests that left the queue in this step. Runs on every rank over the
+    same requests, so the host pins agree."""
+    result = upstream(queue, *args, **kwargs)
+    _extension(queue.tree_cache).source.close_departed_offers()
+    return result
+
+
 def _resolve_deferred_releases(upstream: Callable, queue: DecodeTransferQueue) -> Any:
     """Wraps ``DecodeTransferQueue.resolve_deferred_releases``, which every rank
     runs each decode iteration: drive the decode's end of the extension."""
@@ -176,6 +211,16 @@ def _is_fully_idle(
     return True
 
 
+def _evict_device_leaf(upstream: Callable, cache: Any, node_id: Any, tracker: Any):
+    """Wraps ``UnifiedRadixCache._evict_device_leaf``: skip a leaf the walk
+    already deleted (it can yield an unbacked leaf twice), and keep an
+    unbacked leaf on the device while its deletion would orphan a host-only
+    child."""
+    if deletion_orphans_host_only_child(cache, node_id) in (None, True):
+        return None
+    return upstream(cache, node_id, tracker)
+
+
 def _checkpoint(upstream, cache, req, **kwargs):
     result = upstream(cache, req, **kwargs)
     extension = _extension(cache)
@@ -199,8 +244,10 @@ def _patch_targets() -> tuple[tuple[Any, str, Callable], ...]:
     return (
         (UnifiedRadixCache, "reset", _reset_cache),
         (UnifiedRadixCache, "checkpoint", _checkpoint),
+        (UnifiedRadixCache, "_evict_device_leaf", _evict_device_leaf),
         (DecodePreallocQueue, "add", _decode_add),
         (DecodePreallocQueue, "_init_kv_manager", _decode_init_kv_manager),
+        (DecodePreallocQueue, "_send_kv_metadata", _send_kv_metadata),
         (PrefillBootstrapQueue, "_init_kv_manager", _prefill_init_kv_manager),
         (PrefillBootstrapQueue, "pop_bootstrapped", _pop_bootstrapped),
         (
@@ -214,6 +261,7 @@ def _patch_targets() -> tuple[tuple[Any, str, Callable], ...]:
             "_record_scheduler_state_for_paused_engine",
             _record_scheduler_state_for_paused_engine,
         ),
+        (DecodeTransferQueue, "pop_transferred", _pop_transferred),
         (DecodeTransferQueue, "resolve_deferred_releases", _resolve_deferred_releases),
         (
             DecodeTransferQueue,

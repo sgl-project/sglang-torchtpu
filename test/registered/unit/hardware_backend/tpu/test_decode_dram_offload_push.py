@@ -352,14 +352,16 @@ class TestOffloadIsAnExtensionOfTheL2Controller(CustomTestCase):
 
     def test_reset_lets_go_of_the_pages_of_either_role(self):
         prefill = PrefillDramOffloadExtension.__new__(PrefillDramOffloadExtension)
-        prefill.push = MagicMock()
+        prefill.recall, prefill.push = MagicMock(), MagicMock()
         prefill.before_cache_reset()
         prefill.push.release_all.assert_called_once_with()
+        prefill.recall.release_all.assert_called_once_with()
         prefill.push.clear_push_routes.assert_called_once_with()
         decode = DecodeDramOffloadExtension.__new__(DecodeDramOffloadExtension)
-        decode.landing = MagicMock()
+        decode.landing, decode.source = MagicMock(), MagicMock()
         decode.before_cache_reset()
         decode.landing.drain_host_landings.assert_called_once_with()
+        decode.source.before_cache_reset.assert_called_once_with()
 
     def test_checkpoint_tells_the_pusher_which_decode_served_the_branch(self):
         cache, _ = full_cache(host_capacity=32)

@@ -38,6 +38,9 @@ from sglang_tpu.disaggregation.decode_dram_offload import (
     radix_host_ops,
     startup_validation,
 )
+from sglang_tpu.disaggregation.decode_dram_offload.prefill_dram_prefix_puller import (
+    PrefillDramPrefixPuller,
+)
 from sglang_tpu.disaggregation.decode_dram_offload.rank_lockstep import (
     DramOffloadWorkerContext,
     RankLockstep,
@@ -46,6 +49,8 @@ from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager, RaidenKVSender
 from sglang_tpu.disaggregation.raiden.dram_offload_channel import DramOffloadChannel
 from sglang_tpu.disaggregation.raiden.serde import (
+    PrefixPull,
+    PrefixReady,
     PullReq,
     ReshardReq,
     RoomFailed,
@@ -414,7 +419,96 @@ class DecodeReceiverFixture:
         return self.mgr.send_victim_ack.call_args.kwargs["stored"]
 
 
+# ---------------------------------------------------------------------------
+# Recall: the prefill puller and the decode queue core_hooks
+# ---------------------------------------------------------------------------
+
 ROOM = 7
+
+
+def recall_channel(*, offer_pages: int, refused: bool = False):
+    """A channel double whose decode offered ``offer_pages`` pages for every
+    room. The test sets ``ready`` (the decode's READY, uuid 0 refuses) and
+    ``read_done`` (None while the read runs) as the handshake proceeds."""
+    channel = MagicMock()
+    channel.taken = set()
+    channel.ready = (0 if refused else 11, "10.0.0.2:5")
+    channel.read_done = False
+
+    def take(room):
+        if room in channel.taken:
+            return None
+        channel.taken.add(room)
+        return list(range(offer_pages))
+
+    channel.prefix_ready.side_effect = lambda room: channel.ready
+    channel.take_prefix_offer.side_effect = take
+    channel.ask_prefix_pull.return_value = True
+    channel.prefix_req_id.side_effect = lambda room: f"{room}#px"
+    channel.start_host_read.return_value = True
+    channel.poll_host_read.side_effect = lambda req_id: channel.read_done
+    return channel
+
+
+class HostRecallEdgeCasesFixture:
+    def _build(self, *, host_capacity: int, mgr):
+        cache, allocator = full_cache(kv_size=64, host_capacity=host_capacity)
+        cache.tree_core.is_write_back = cache.is_write_back = False
+        puller = PrefillDramPrefixPuller(offload_context(cache=cache, channel=mgr))
+        puller._max_inflight_tokens = 1 << 20
+        return cache, allocator, puller
+
+    def _fill_host_with_a_device_copy(self, cache, allocator, *, lock: bool):
+        tokens = list(range(100, 116))
+        insert_tokens(cache, allocator, tokens)
+        node = root_node(cache, 100)
+        host = cache.cache_controller.host
+        cache.tree_core.commit_backup(node.id, host.alloc(len(node.key)), {})
+        cache.tree_core._update_duplicate_tracking(node)
+        if lock:
+            cache.inc_host_lock_ref(node.id)
+        self.assertEqual(host.available_size(), 0)
+        return host
+
+    def _req(self):
+        return SimpleNamespace(
+            bootstrap_room=ROOM,
+            origin_input_ids=list(range(200, 232)),
+            extra_key=None,
+            cache_salt=None,
+        )
+
+
+class RecallLifecycleFixture:
+    def _scripted(self):
+        """A channel that offers 16 pages once and lets the test set the READY
+        and the read's outcome as the handshake proceeds."""
+        mgr = recall_channel(offer_pages=16)
+        mgr.ready = None
+        return mgr
+
+    def _advance_to_pulling(self, puller, mgr, req):
+        puller.advance([req])
+        plan = puller._plans[ROOM]
+        self.assertEqual((plan.req_id, plan.new_indices), (None, None))
+        mgr.ask_prefix_pull.assert_called_once()
+        # Host pages are reserved only once READY is in.
+        puller.advance([req])
+        self.assertIsNone(plan.new_indices)
+        mgr.ready, mgr.read_done = (11, "10.0.0.2:5"), None
+        puller.advance([req])
+        self.assertEqual(plan.req_id, f"{ROOM}#px")
+        self.assertEqual(len(plan.new_indices), 16)
+        return plan
+
+
+class DecodeQueueHooksFixture:
+    def _queue(self, *rids):
+        reqs = [
+            SimpleNamespace(req=SimpleNamespace(rid=rid, bootstrap_room=n))
+            for n, rid in enumerate(rids)
+        ]
+        return SimpleNamespace(queue=reqs, tree_cache=None), reqs
 
 
 # ---------------------------------------------------------------------------
@@ -618,14 +712,49 @@ def decode_manager():
     return mgr
 
 
-def pull_req(kv_offload=False):
+def pull_req(prefix_blocks=(3, 4, 5, 6), kv_offload=False):
     return PullReq(
         room=ROOM,
         decode_ip="10.0.0.2",
         decode_port=5555,
         decode_pages=4,
+        prefix_blocks=list(prefix_blocks),
         kv_offload=kv_offload,
     ).to_frames()
+
+
+def register_decode(mgr, offered=()):
+    """Send the room's PULL_REQ, after the decode offered ``offered`` pages."""
+    if mgr.dram_offload_channel is not None:
+        mgr.dram_offload_channel.offer_resident_prefix(ROOM, list(offered))
+    mgr.register_decode_request(ROOM, [21, 22, 23], [], None, [PREFILL_INFO])
+
+
+class DecodeOffersItsPrefixFixture:
+    def _served(self, mgr, first_page, num_pages):
+        """The decode's PREFIX_READY to a PREFIX_PULL of the given range."""
+        mgr._dispatch(
+            PrefixPull(
+                room=ROOM, first_page=first_page, num_pages=num_pages
+            ).to_frames()
+        )
+        endpoint, frames = sent_frames(mgr)[-1]
+        self.assertEqual(endpoint, PREFILL_ADDR)
+        return PrefixReady.from_frames(frames)
+
+
+class PrefillRecallsIntoItsHostPagesFixture:
+    def _armed(self):
+        """A prefill manager whose decode offered pages [3, 4, 5, 6] for ROOM."""
+        mgr = prefill_manager()
+        sender_on(mgr)
+        mgr._dispatch(pull_req())
+        self.assertEqual(mgr.dram_offload_channel.take_prefix_offer(ROOM), [3, 4, 5, 6])
+        return mgr
+
+    @staticmethod
+    def _ready():
+        return PrefixReady(room=ROOM, uuid=99, endpoint=DECODE_RAIDEN)
 
 
 # ---------------------------------------------------------------------------
