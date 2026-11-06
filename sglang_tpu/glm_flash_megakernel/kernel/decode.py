@@ -1245,14 +1245,16 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 c.start()
             return early
 
-        def expert_copies(sl, gu, dn, gu_s=None, dn_s=None):
+        def expert_copies(sl, gu, dn, gu_s=None, dn_s=None, part=slice(None)):
+            """`part` picks the descriptors to build; an unused descriptor warns at trace."""
             if CH_EXPERTS:
-                return [
-                    pltpu.make_async_copy(gu, r8a.at[sl], s8a.at[sl]),
-                    pltpu.make_async_copy(dn, r8d.at[sl], s8d.at[sl]),
-                    pltpu.make_async_copy(gu_s, egsr.at[sl], s8s.at[0, sl]),
-                    pltpu.make_async_copy(dn_s, edsr.at[sl], s8s.at[1, sl]),
+                makers = [
+                    lambda: pltpu.make_async_copy(gu, r8a.at[sl], s8a.at[sl]),
+                    lambda: pltpu.make_async_copy(dn, r8d.at[sl], s8d.at[sl]),
+                    lambda: pltpu.make_async_copy(gu_s, egsr.at[sl], s8s.at[0, sl]),
+                    lambda: pltpu.make_async_copy(dn_s, edsr.at[sl], s8s.at[1, sl]),
                 ]
+                return [mk() for mk in makers[part]]
             return [
                 pltpu.make_async_copy(
                     gu, r8a.at[sl, pl.ds(0, 2 * moesh), pl.ds(0, H)], s8a.at[sl]
@@ -1311,7 +1313,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             # Entry 0 is the shared expert, whose copy moe_early already started.
             entries = [None] + list(range(n_slot))
 
-            def slot_copies(k, m=None):
+            def slot_copies(k, m=None, part=slice(None)):
                 """Slot k's copies from layer m's experts; any layer for a wait (same shapes)."""
                 e = entries[k]
                 if e is None:
@@ -1323,6 +1325,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     w_edn[m].at[safe[e]],
                     w_egus.at[pl.ds(base + safe[e], 1)],
                     w_edns.at[pl.ds(base + safe[e], 1)],
+                    part=part,
                 )
 
             n_e = len(entries)
@@ -1346,10 +1349,10 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
 
                         @pl.when(m_i == m)
                         def _(m=m):
-                            for c in slot_copies(k, m)[:2]:
+                            for c in slot_copies(k, m, part=slice(0, 2)):
                                 c.start()
 
-                    for c in slot_copies(k)[2:]:
+                    for c in slot_copies(k, part=slice(2, None)):
                         c.start()
 
                 when(k, go)
