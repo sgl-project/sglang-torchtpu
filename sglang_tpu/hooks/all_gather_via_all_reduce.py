@@ -8,12 +8,11 @@ all_gather_into_tensor
        the logits, which shows up as a wrong first token after prefill
        (sgl-project/sglang-torchtpu#1700). The in-place all-reduce compiles
        correctly.
-  How: AROUND GroupCoordinator.all_gather_into_tensor; while Dynamo traces
-       (torch.compiler.is_dynamo_compiling()), the gather is rebuilt from one
+  How: AROUND GroupCoordinator.all_gather_into_tensor; while Dynamo traces a
+       group that spans more than one chip, the gather is rebuilt from one
        all-reduce over a zero-padded [world, *block] buffer
-       (sglang_tpu.all_gather_via_all_reduce). Eager calls and direct-tracer
-       graphs use the original: the direct tracer has no defect, and its SPMD
-       shared executables must not bake in the rank index.
+       (sglang_tpu.all_gather_via_all_reduce). Eager mode, the direct tracer
+       and single-chip groups call the original.
   Upstream PR or issue: sgl-project/sglang-torchtpu#1700 (TorchTPU compiled
        all_gather_into_tensor across chips).
   Remove when: the compiled all_gather_into_tensor returns the same blocks as

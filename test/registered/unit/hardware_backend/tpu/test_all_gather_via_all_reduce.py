@@ -29,6 +29,7 @@ class _SimulatedGroup:
     def __init__(self, blocks: list[torch.Tensor], rank: int):
         self._blocks = blocks
         self.world_size = len(blocks)
+        self.ranks = list(range(len(blocks)))
         self.rank_in_group = rank
         self.reduced_shapes: list[tuple[int, ...]] = []
 
@@ -55,7 +56,7 @@ def _blocks(world_size: int, shape: tuple[int, ...], dtype: torch.dtype):
 
 
 class TestGatherBlocksViaAllReduce(CustomTestCase):
-    def test_matches_concatenation_bit_exactly(self):
+    def test_matches_concatenation(self):
         # Shard widths include 18992 (Qwen3 vocabulary 151936 / 8) and 37984
         # (/ 4), neither a multiple of 128.
         cases = [
@@ -80,6 +81,15 @@ class TestGatherBlocksViaAllReduce(CustomTestCase):
                     )
                     self.assertTrue(torch.equal(got, expected))
                     self.assertEqual(group.reduced_shapes, [(world_size, *shape)])
+
+    def test_negative_zero_comes_back_as_positive_zero(self):
+        blocks = [torch.tensor([[-0.0, 1.0]]), torch.tensor([[2.0, -0.0]])]
+        got = agar.gather_blocks_via_all_reduce(_SimulatedGroup(blocks, 0), blocks[0])
+        # Equal values: -0.0 == 0.0, so value equality holds.
+        self.assertTrue(torch.equal(got, torch.cat(blocks)))
+        # Not bit-equal: the sign of zero is lost.
+        self.assertFalse(torch.signbit(got[0, 0]).item())
+        self.assertFalse(torch.signbit(got[1, 1]).item())
 
     def test_preserves_non_finite_values(self):
         blocks = [
