@@ -268,6 +268,9 @@ _ROLES: dict[str, dict[str, dict]] = {
             "SGLANG_TPU_MUSE_MEGAKERNEL": "0",
             # Sequence-parallel prefill shards tokens over TP, which is 1 here.
             "SGLANG_TPU_MUSE_PREFILL_SP": "0",
+            # 512:512 was tuned at 2 KV heads per rank; at TP1's 16 it needs 94 MiB of VMEM,
+            # so let the batched RPA search size the sliding-window blocks.
+            "SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS": None,
             # Stages 0 and 7 also hold the BF16->FP8 boundary layers, embed and lm_head.
             "SGLANG_PP_LAYER_PARTITION": "7,8,8,8,8,8,8,7",
         },
