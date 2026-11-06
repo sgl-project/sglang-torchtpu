@@ -108,6 +108,10 @@ class DramOffloadWorkerContext(msgspec.Struct, frozen=True):
     # The raiden channel to the peer role (raiden/dram_offload_channel.py).
     channel: Any
     lockstep: RankLockstep
+    # Hybrid sliding-window models: the host pool of SWA windows and the
+    # window in tokens, rounded up to whole pages. None and 0 on other models.
+    swa_host_pool: Any = None
+    window_tokens: int = 0
 
 
 def push_manifest(tokens, extra_key=None, cache_salt=None, *geometry):

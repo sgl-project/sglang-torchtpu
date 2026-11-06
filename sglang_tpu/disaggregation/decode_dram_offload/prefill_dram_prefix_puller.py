@@ -1,5 +1,6 @@
 """Prefill side of the recall: pull a prefix the decode holds in its DRAM into
-the prefill's own DRAM (HiCache host pool).
+the prefill's own DRAM (HiCache host pool), with the sliding window that
+ends where the prefix ends on a hybrid model.
 
 The decode names the pushed prefix it holds in its PULL_REQ
 (decode_dram_prefix_offerer.py); the prefill reads the range it lacks over the
@@ -10,7 +11,7 @@ into HBM, so the recall uses no device page and no staging slot on either role.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import msgspec
 import torch
@@ -41,8 +42,9 @@ _MAX_INFLIGHT_POOL_FRACTION = 0.5
 class _PullProposal(msgspec.Struct, frozen=True):
     """What one rank could pull for a request, before the ranks agree."""
 
-    # The decode's page ids of the whole offered prefix.
+    # The decode's page ids of the whole offered prefix, and of its window.
     blocks: List[int]
+    swa_blocks: List[int]
     # This rank's own host-backed prefix: its last node, its pages and its
     # host KV indices per node.
     node: Any
@@ -65,9 +67,14 @@ class DramPrefixPullPlan(msgspec.Struct):
     # Host KV indices reserved for pages [first_page, M), None until every
     # rank has READY.
     new_indices: Any = None
-    # The native read's id once the decode's READY started it; None while the
-    # pull is only asked for.
-    req_id: Optional[str] = None
+    # Hybrid sliding-window models: the decode's page ids of the window that
+    # ends at M, and the host pages reserved for it.
+    swa_remote: List[int] = msgspec.field(default_factory=list)
+    swa_indices: Any = None
+    # The native reads that started; ``started`` once the decode's READY was
+    # acted on, while the pull is only asked for before.
+    read_ids: List[str] = msgspec.field(default_factory=list)
+    started: bool = False
     # Set once every rank saw the read settle: True only if it succeeded everywhere.
     agreed_done: Optional[bool] = None
 
@@ -78,8 +85,9 @@ class _RecalledPrefixPin(msgspec.Struct, frozen=True):
     req: Any
     node: Any
     receipt: Any
-    # Pulled tokens the lock keeps unevictable.
+    # Pulled tokens the lock keeps unevictable, full and window.
     num_tokens: int
+    swa_tokens: int
 
 
 class PrefillDramPrefixPuller:
@@ -94,8 +102,9 @@ class PrefillDramPrefixPuller:
 
     Every rank must make the same tree decisions, so each step of a recall
     (ask, allocate, start, insert, give up) is taken by all ranks in the same
-    scheduler step, after they reduced their local view. Only full-attention
-    KV is recalled; hybrid sliding-window models are refused at startup.
+    scheduler step, after they reduced their local view. A hybrid
+    sliding-window model's recall also reads the window that ends where the
+    offered prefix ends, into the SWA host pool.
     """
 
     def __init__(self, ctx: DramOffloadWorkerContext) -> None:
@@ -103,6 +112,8 @@ class PrefillDramPrefixPuller:
         self._cache = ctx.cache
         self._page_size = ctx.page_size
         self._host_pool = ctx.host_pool
+        self._swa_host_pool = ctx.swa_host_pool
+        self._window_pages = ctx.window_tokens // ctx.page_size
         self._lockstep = ctx.lockstep
         # Landing pages of in-flight recalls sit outside the tree until
         # commit, so they are capped to leave host room for the prefill's own
@@ -110,10 +121,15 @@ class PrefillDramPrefixPuller:
         self._max_inflight_tokens = int(
             _MAX_INFLIGHT_POOL_FRACTION * self._host_pool.size
         )
+        self._max_inflight_swa_tokens = (
+            int(_MAX_INFLIGHT_POOL_FRACTION * self._swa_host_pool.size)
+            if self._swa_host_pool is not None
+            else 0
+        )
         self._plans: Dict[int, DramPrefixPullPlan] = {}
         # Offers taken off the channel, until every rank holds the room's:
         # the listener thread can drop a room's channel state at any time.
-        self._offered: Dict[int, List[int]] = {}
+        self._offered: Dict[int, Tuple[List[int], List[int]]] = {}
         self._pins: Dict[int, _RecalledPrefixPin] = {}
         # Plans of dropped requests, in the same order on every rank: their
         # landings are freed once no rank's read can still write them.
@@ -167,40 +183,51 @@ class PrefillDramPrefixPuller:
         plan = self._plans.get(room)
         if plan is None:
             if room not in self._offered:
-                blocks = self._channel.take_prefix_offer(room)
-                if blocks is not None:
-                    self._offered[room] = blocks
+                offer = self._channel.take_prefix_offer(room)
+                if offer is not None:
+                    self._offered[room] = offer
             return [int(room in self._offered), 0, 0, 0]
-        if plan.req_id is None:
+        if not plan.started:
             ready = self._channel.prefix_ready(room)
             return [0, 0, 0, int(ready is not None)]
         if plan.agreed_done is not None:
             return [0, 0, 0, 0]
-        done = self._channel.poll_host_read(plan.req_id)
+        # A hybrid pull is settled once both its reads are, done if both are.
+        done = self._channel.poll_host_reads(plan.read_ids)
         return [0, int(done is not None), int(done is True), 0]
 
     def _propose_pull(self, req: Any) -> Optional[_PullProposal]:
         """What this rank could pull of the offer every rank holds; None when
         it needs nothing. Matching can split a node, so every rank matches."""
-        blocks = self._offered.pop(req.bootstrap_room)
+        blocks, swa_blocks = self._offered.pop(req.bootstrap_room)
         self.stats["offers"] += 1
         page = self._page_size
         tokens = len(blocks) * page
-        # The prefill computes at least the last prompt token.
-        if not 0 < tokens <= offer_limit(req=req, page_size=page):
+        # The prefill computes at least the last prompt token, and a hybrid
+        # model resumes at the offered length only with the window that ends
+        # there: the whole offer with its window, or nothing.
+        if not 0 < tokens <= offer_limit(req=req, page_size=page) or len(
+            swa_blocks
+        ) != min(len(blocks), self._window_pages):
             return None
         key = prefix_radix_key(req=req, num_tokens=tokens)
         match = self._cache.match_prefix(MatchPrefixParams(key=key))
         # Reuse the part of the prefix this engine already holds in host RAM.
         node, have, have_indices = host_backed_prefix(self._cache, key, tokens, page)
-        if (
-            len(match.device_indices) + match.host_hit_length >= tokens
-            or have >= tokens
-        ):
+        covered = len(match.device_indices) + match.host_hit_length >= tokens
+        if covered or (have >= tokens and not swa_blocks):
             self.stats["skipped_local_host"] += 1
             return None
+        if have >= tokens:
+            # The full KV is here and only the window is missing: read the
+            # full pages again with it, and the insert frees the duplicates.
+            node, have, have_indices = self._cache.tree_core.root_node, 0, []
         return _PullProposal(
-            blocks=blocks, node=node, have_pages=have // page, have_indices=have_indices
+            blocks=blocks,
+            swa_blocks=swa_blocks,
+            node=node,
+            have_pages=have // page,
+            have_indices=have_indices,
         )
 
     def _ask_decode_for_agreed_ranges(
@@ -212,6 +239,9 @@ class PrefillDramPrefixPuller:
         that holds more reads pages it has; the insert frees those."""
         page = self._page_size
         budget = (self._max_inflight_tokens - self._inflight_tokens()) // page
+        swa_budget = (
+            self._max_inflight_swa_tokens - self._inflight_swa_tokens()
+        ) // page
         # MIN of a value and of its negation gives its minimum and maximum.
         rows = [
             [0, 0, 0, 0]
@@ -219,19 +249,21 @@ class PrefillDramPrefixPuller:
             else [1, len(p.blocks), -len(p.blocks), p.have_pages]
             for p in proposals.values()
         ]
-        *agreed, (budget, _, _, _) = self._lockstep.reduce(
-            [*rows, [budget, 0, 0, 0]], dist.ReduceOp.MIN
+        *agreed, (budget, swa_budget, _, _) = self._lockstep.reduce(
+            [*rows, [budget, swa_budget, 0, 0]], dist.ReduceOp.MIN
         )
         asked = []
         for (room, proposal), (ok, want, neg_want, first) in zip(
             proposals.items(), agreed
         ):
             count = want - first
-            if not ok or want != -neg_want or count > budget:
+            window = min(want, self._window_pages)
+            if not ok or want != -neg_want or count > budget or window > swa_budget:
                 self.stats["over_budget"] += int(bool(ok) and want == -neg_want)
                 self._channel.resolve_prefix_pull(room)
                 continue
             budget -= count
+            swa_budget -= window
             have = (
                 torch.cat(proposal.have_indices)
                 if proposal.have_indices
@@ -242,6 +274,7 @@ class PrefillDramPrefixPuller:
                 num_pages=count,
                 remote=list(proposal.blocks[first:want]),
                 have_indices=have[: first * page],
+                swa_remote=list(proposal.swa_blocks),
                 locks=lock_host_path(self._cache, proposal.node),
             )
             asked.append(room)
@@ -295,6 +328,7 @@ class PrefillDramPrefixPuller:
             ),
             torch.cat([plan.have_indices, plan.new_indices]),
             self._page_size,
+            swa_indices=plan.swa_indices,
             reused_tokens=have,
         )
         inserted = (
@@ -307,15 +341,17 @@ class PrefillDramPrefixPuller:
                 node=node,
                 receipt=self._cache.inc_host_lock_ref(node).to_dec_params(),
                 num_tokens=plan.num_pages * self._page_size,
+                swa_tokens=len(plan.swa_remote) * self._page_size,
             )
             self.stats["pulls"] += 1
             self.stats["pulled_tokens"] += len(plan.new_indices)
         logger.info(
-            "[prefix-pull] room=%s pulled_tokens=%d have_tokens=%d inserted=%s "
-            "totals=%s",
+            "[prefix-pull] room=%s pulled_tokens=%d have_tokens=%d swa_tokens=%d "
+            "inserted=%s totals=%s",
             req.bootstrap_room,
             len(plan.new_indices),
             have,
+            len(plan.swa_remote) * self._page_size,
             inserted,
             self.stats,
         )
@@ -368,7 +404,7 @@ class PrefillDramPrefixPuller:
         keep = []
         for plan, (done,) in zip(self._zombies, settled):
             if done:
-                self._host_pool.free(plan.new_indices)
+                self._free_landing(plan)
             else:
                 keep.append(plan)
         self._zombies = keep
@@ -385,43 +421,80 @@ class PrefillDramPrefixPuller:
             + sum(len(p.new_indices) for p in self._zombies)
         )
 
+    def _inflight_swa_tokens(self) -> int:
+        """Window tokens reserved by pulls not yet admitted, zombies included."""
+        return self._page_size * sum(
+            len(p.swa_remote) for p in (*self._plans.values(), *self._zombies)
+        ) + sum(p.swa_tokens for p in self._pins.values())
+
     def _reserve_host_landing(self, room: int) -> bool:
         plan = self._plans[room]
-        pool = self._host_pool
-        tokens = plan.num_pages * self._page_size
-        short = self._lockstep.max(max(0, tokens - pool.available_size()))
-        if short:
-            freed = self._cache.evict_host(short, ComponentType.FULL)
-            if freed < short:
-                reclaim_full_host_duplicates(self._cache, short - freed)
-        landing = pool.alloc(tokens)
-        if not self._lockstep.all(landing is not None):
-            if landing is not None:
-                pool.free(landing)
+        landings = []
+        for pool, pages, component in (
+            (self._host_pool, plan.num_pages, ComponentType.FULL),
+            (self._swa_host_pool, len(plan.swa_remote), ComponentType.SWA),
+        ):
+            if not pages:
+                landings.append(None)
+                continue
+            tokens = pages * self._page_size
+            short = self._lockstep.max(max(0, tokens - pool.available_size()))
+            if short:
+                freed = self._cache.evict_host(short, component)
+                if freed < short and component == ComponentType.FULL:
+                    reclaim_full_host_duplicates(self._cache, short - freed)
+            landings.append(pool.alloc(tokens))
+        full, swa = landings
+        if not self._lockstep.all(
+            full is not None and (not plan.swa_remote or swa is not None)
+        ):
+            if full is not None:
+                self._host_pool.free(full)
+            if swa is not None:
+                self._swa_host_pool.free(swa)
             self.stats["no_memory"] += 1
             self._abandon_pull(room)
             return False
-        plan.new_indices = landing
+        plan.new_indices, plan.swa_indices = full, swa
         self._external_reads_outstanding = True
         return True
 
     def _start_read(self, room: int) -> bool:
         plan = self._plans[room]
+        plan.started = True
         # None once an abort dropped the room since the ranks agreed on READY.
         ready = self._channel.prefix_ready(room)
-        if ready is None or not ready[0]:
+        if ready is None:
             return False
-        uuid, endpoint = ready
-        req_id = self._channel.prefix_req_id(room)
-        if not self._channel.start_host_read(
-            req_id,
-            uuid,
-            endpoint,
-            plan.remote,
-            [int(p) for p in self._host_pool._to_page_ids(plan.new_indices)],
+        uuid, endpoint, swa_uuid, swa_endpoint = ready
+        if not uuid or bool(swa_uuid) != bool(plan.swa_remote):
+            return False
+        # A read that started keeps its landing owned also when the other one
+        # of the pull does not start.
+        for swa, read_uuid, address, remote, local, pool in (
+            (False, uuid, endpoint, plan.remote, plan.new_indices, self._host_pool),
+            (
+                True,
+                swa_uuid,
+                swa_endpoint,
+                plan.swa_remote,
+                plan.swa_indices,
+                self._swa_host_pool,
+            ),
         ):
-            return False
-        plan.req_id = req_id
+            if not remote:
+                continue
+            read_id = self._channel.prefix_req_id(room, swa=swa)
+            if not self._channel.start_host_read(
+                read_id,
+                read_uuid,
+                address,
+                remote,
+                [int(p) for p in pool._to_page_ids(local)],
+                swa=swa,
+            ):
+                return False
+            plan.read_ids.append(read_id)
         return True
 
     def _unpin(self, room: int) -> None:
@@ -451,8 +524,10 @@ class PrefillDramPrefixPuller:
             # Freed by resolve_deferred_releases, once every rank agrees.
             self._zombies.append(plan)
 
+    def _free_landing(self, plan: DramPrefixPullPlan) -> None:
+        self._host_pool.free(plan.new_indices)
+        if plan.swa_indices is not None:
+            self._swa_host_pool.free(plan.swa_indices)
+
     def _read_still_pending(self, plan: DramPrefixPullPlan) -> bool:
-        return (
-            plan.req_id is not None
-            and self._channel.poll_host_read(plan.req_id) is None
-        )
+        return self._channel.poll_host_reads(plan.read_ids) is None

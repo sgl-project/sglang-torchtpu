@@ -19,12 +19,14 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -261,6 +263,50 @@ def full_cache(*, kv_size=64, host_capacity=64):
     return cache, allocator
 
 
+HYBRID_PAGE = 64
+
+
+def hybrid_cache(*, window=128):
+    """A real paged FULL+SWA tree with a host pool for each; only the device
+    allocator and the transfers are doubles. Pages hold HYBRID_PAGE tokens."""
+    allocator = MagicMock(spec=SWATokenToKVPoolAllocator)
+    allocator.device = torch.device("cpu")
+    allocator.page_size = HYBRID_PAGE
+    allocator._swa_req_ring = False
+    allocator.translate_loc_from_full_to_swa.side_effect = lambda indices: indices
+    cache = UnifiedRadixCache(
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=MagicMock(spec=ReqToTokenPool),
+            token_to_kv_pool_allocator=allocator,
+            page_size=HYBRID_PAGE,
+            sliding_window_size=window,
+            tree_components=(FULL, ComponentType.SWA),
+            tree_core_backend="python",
+        )
+    )
+    controller = FakeRaidenController(host_capacity=4096)
+    controller.host.page_size = HYBRID_PAGE
+    swa = FakeHostPool(1024, page_size=HYBRID_PAGE)
+    cache.cache_controller = controller
+    # As on an engine without a storage backend, nothing drains the L3 release
+    # queue: a page handed to it would never return to its pool.
+    controller.append_host_mem_release = MagicMock(
+        side_effect=AssertionError("released through the undrained L3 queue")
+    )
+    cache.components[FULL]._full_kv_pool_host = controller.host
+    cache.components[ComponentType.SWA]._swa_kv_pool_host = swa
+    pools = {PoolName.KV: controller.host, PoolName.SWA: swa}
+    cache.host_pool_group = SimpleNamespace(
+        get_pool=pools.get,
+        free=lambda indices, pool=PoolName.KV: pools[pool].free(indices),
+    )
+    cache.tree_core.set_hicache_enabled()
+    cache.tree_core.has_swa_host_pool = True
+    cache.tree_core.is_write_back = cache.is_write_back = True
+    return cache, allocator
+
+
 def insert_tokens(cache, allocator, tokens):
     cache.insert(
         InsertParams(
@@ -300,39 +346,51 @@ def offload_context(*, cache, channel, page_size: int = 1) -> DramOffloadWorkerC
         page_size=page_size,
         channel=channel,
         lockstep=RankLockstep(),
+        swa_host_pool=radix_host_ops.swa_host_pool(cache),
+        window_tokens=radix_host_ops.window_tokens(cache, page_size),
     )
 
 
-def push_channel(host):
+def push_channel(host, swa_host=None):
     """A channel double for the push: messages are recorded, and native host
-    reads go to ``host``'s fake transfer, which the test completes."""
-    transfer = host.transfer
+    reads go to the fake transfer of ``host`` (of ``swa_host`` for the window
+    of a hybrid model), which the test completes."""
     channel = MagicMock()
+    # The transfer of each read, by request id.
+    transfers = {}
 
-    def register(req_id, uuid, pages):
+    def register(req_id, uuid, pages, *, swa=False):
+        transfer = (swa_host if swa else host).transfer
         try:
             transfer.register_read(req_id, uuid, pages, source="host")
         except RuntimeError:
             return False
+        transfers[req_id] = transfer
         return True
 
-    def start(req_id, uuid, endpoint, remote, local):
+    def start(req_id, uuid, endpoint, remote, local, *, swa=False):
+        transfer = (swa_host if swa else host).transfer
         try:
             transfer.start_read(
                 req_id, uuid, endpoint, remote, local, destination="host"
             )
         except RuntimeError:
             return False
+        transfers[req_id] = transfer
         return True
 
-    def poll(req_id):
-        status = transfer.poll_transfer(req_id)
-        return None if status is None else status != "failed"
+    def poll(req_ids):
+        statuses = [transfers[req_id].poll_transfer(req_id) for req_id in req_ids]
+        return None if None in statuses else "failed" not in statuses
+
+    def forget(req_ids):
+        for req_id in req_ids:
+            transfers.pop(req_id).forget_transfer(req_id)
 
     channel.register_host_read.side_effect = register
     channel.start_host_read.side_effect = start
-    channel.poll_host_read.side_effect = poll
-    channel.forget_host_read.side_effect = transfer.forget_transfer
+    channel.poll_host_reads.side_effect = poll
+    channel.forget_host_reads.side_effect = forget
     return channel
 
 
@@ -426,27 +484,35 @@ class DecodeReceiverFixture:
 ROOM = 7
 
 
-def recall_channel(*, offer_pages: int, refused: bool = False):
-    """A channel double whose decode offered ``offer_pages`` pages for every
-    room. The test sets ``ready`` (the decode's READY, uuid 0 refuses) and
-    ``read_done`` (None while the read runs) as the handshake proceeds."""
+def recall_channel(*, offer_pages: int, refused: bool = False, window_pages: int = 0):
+    """A channel double whose decode offered ``offer_pages`` pages (and, on a
+    hybrid model, the ``window_pages`` that end there) for every room. The
+    test sets ``ready`` (the decode's READY, uuid 0 refuses) and ``read_done``
+    (None while the reads run) as the handshake proceeds."""
     channel = MagicMock()
     channel.taken = set()
-    channel.ready = (0 if refused else 11, "10.0.0.2:5")
+    channel.ready = (
+        0 if refused else 11,
+        "10.0.0.2:5",
+        12 if window_pages and not refused else 0,
+        "10.0.0.2:6" if window_pages else "",
+    )
     channel.read_done = False
 
     def take(room):
         if room in channel.taken:
             return None
         channel.taken.add(room)
-        return list(range(offer_pages))
+        return list(range(offer_pages)), list(range(100, 100 + window_pages))
 
     channel.prefix_ready.side_effect = lambda room: channel.ready
     channel.take_prefix_offer.side_effect = take
     channel.ask_prefix_pull.return_value = True
-    channel.prefix_req_id.side_effect = lambda room: f"{room}#px"
+    channel.prefix_req_id.side_effect = lambda room, swa=False: (
+        f"{room}#pxs" if swa else f"{room}#px"
+    )
     channel.start_host_read.return_value = True
-    channel.poll_host_read.side_effect = lambda req_id: channel.read_done
+    channel.poll_host_reads.side_effect = lambda req_ids: channel.read_done
     return channel
 
 
@@ -490,14 +556,14 @@ class RecallLifecycleFixture:
     def _advance_to_pulling(self, puller, mgr, req):
         puller.advance([req])
         plan = puller._plans[ROOM]
-        self.assertEqual((plan.req_id, plan.new_indices), (None, None))
+        self.assertEqual((plan.started, plan.new_indices), (False, None))
         mgr.ask_prefix_pull.assert_called_once()
         # Host pages are reserved only once READY is in.
         puller.advance([req])
         self.assertIsNone(plan.new_indices)
-        mgr.ready, mgr.read_done = (11, "10.0.0.2:5"), None
+        mgr.ready, mgr.read_done = (11, "10.0.0.2:5", 0, ""), None
         puller.advance([req])
-        self.assertEqual(plan.req_id, f"{ROOM}#px")
+        self.assertEqual(plan.read_ids, [f"{ROOM}#px"])
         self.assertEqual(len(plan.new_indices), 16)
         return plan
 
@@ -530,6 +596,7 @@ def _engine_manager():
 def _tree_cache():
     cache = MagicMock(spec=UnifiedRadixCache)
     cache.tree_core = MagicMock(spec=UnifiedTreeCore)
+    cache.tree_core.has_swa_host_pool = False
     cache.cache_controller = object()
     return cache
 
@@ -689,12 +756,12 @@ def with_offload(mgr):
     mgr._send_multipart_locked = Mock()
     mgr.dram_offload_channel = DramOffloadChannel(mgr)
     mgr._message_handlers.update(mgr.dram_offload_channel.message_handlers())
-    mgr.dram_offload_channel.bind_host_pool(SimpleNamespace(transfer=transfer))
+    mgr.dram_offload_channel.bind_host_pools(SimpleNamespace(transfer=transfer))
     return mgr
 
 
 def host_transfer_of(mgr):
-    return mgr.dram_offload_channel._host_pool.transfer
+    return mgr.dram_offload_channel._host_pools[0].transfer
 
 
 def prefill_manager():
@@ -749,7 +816,9 @@ class PrefillRecallsIntoItsHostPagesFixture:
         mgr = prefill_manager()
         sender_on(mgr)
         mgr._dispatch(pull_req())
-        self.assertEqual(mgr.dram_offload_channel.take_prefix_offer(ROOM), [3, 4, 5, 6])
+        self.assertEqual(
+            mgr.dram_offload_channel.take_prefix_offer(ROOM), ([3, 4, 5, 6], [])
+        )
         return mgr
 
     @staticmethod

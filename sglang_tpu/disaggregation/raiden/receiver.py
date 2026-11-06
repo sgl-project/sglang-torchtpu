@@ -289,9 +289,12 @@ class RaidenReceiverMixin:
             if aux_index is not None:
                 self._decode.decode_aux_index[room] = aux_index
             prefix_blocks: List[int] = []
+            prefix_swa_blocks: List[int] = []
             if self.dram_offload_channel is not None:
-                prefix_blocks = self.dram_offload_channel.offered_blocks_locked(
-                    room, bootstrap_infos
+                prefix_blocks, prefix_swa_blocks = (
+                    self.dram_offload_channel.offered_blocks_locked(
+                        room, bootstrap_infos
+                    )
                 )
         payload = PullReq(
             room=room,
@@ -300,6 +303,7 @@ class RaidenReceiverMixin:
             decode_pages=len(local_blocks),
             decode_swa_pages=len(local_swa_blocks),
             prefix_blocks=prefix_blocks,
+            prefix_swa_blocks=prefix_swa_blocks,
             kv_offload=self.dram_offload_channel is not None,
         ).to_frames()
         for info in bootstrap_infos:

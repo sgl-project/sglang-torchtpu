@@ -84,6 +84,9 @@ class PullReq(WireMessage):
     # Host page ids of the prompt prefix the decode holds in RAM and offers
     # the prefill for recall, in prompt order; empty offers nothing.
     prefix_blocks: list[int] = msgspec.field(default_factory=list)
+    # Hybrid sliding-window models: the decode's host pages of the sliding
+    # window that ends where prefix_blocks end; empty on full-only models.
+    prefix_swa_blocks: list[int] = msgspec.field(default_factory=list)
     # Whether the decode runs with the KV offload to decode DRAM switched on.
     # The prefill fails the room when its own switch differs.
     kv_offload: bool = False
@@ -96,7 +99,8 @@ class PullReq(WireMessage):
 
 
 class PrefixPull(WireMessage):
-    """Ask the decode to register offered pages [first_page, first_page + num_pages)."""
+    """Ask the decode to register offered pages [first_page, first_page + num_pages),
+    and with them the whole offered window of a hybrid model."""
 
     TAG: ClassVar[bytes] = MessageTag.PREFIX_PULL
     room: int
@@ -118,10 +122,15 @@ class PrefixReady(WireMessage):
     # uuid 0 is a refusal: the prefill computes the prompt.
     uuid: int
     endpoint: str
+    # The window pages' registration on the decode's SWA host pool; uuid 0 on
+    # full-only models and on a refusal.
+    swa_uuid: int = 0
+    swa_endpoint: str = ""
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
         require_non_negative(self.uuid, "uuid")
+        require_non_negative(self.swa_uuid, "swa_uuid")
 
 
 class VictimPush(WireMessage):
@@ -141,6 +150,10 @@ class VictimPush(WireMessage):
     # The registered producer UUID and the control endpoint of its host pool.
     uuid: int = 0
     address: str = ""
+    # Hybrid sliding-window models: the page-aligned trailing SWA window in
+    # the producer's SWA host pool, registered under the same UUID there.
+    swa_blocks: list[int] = msgspec.field(default_factory=list)
+    swa_address: str = ""
     extra_key: Optional[str] = None
     cache_salt: Optional[str] = None
 

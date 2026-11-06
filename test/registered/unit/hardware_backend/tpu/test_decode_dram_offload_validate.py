@@ -57,7 +57,8 @@ _UNSUPPORTED = (
     ("kv_manager.system_dp_size", 2, "data parallelism"),
     ("kv_manager._state_kv_caches", (object(),), "GDN/Mamba"),
     ("scheduler.spec_algorithm.is_none", lambda: False, "speculative decoding"),
-    ("kv_manager._swa_kv_caches", [object()], "hybrid sliding-window models"),
+    # A hybrid model on a cache built without the host tier of windows.
+    ("kv_manager._swa_kv_caches", [object()], "needs a host tier of SWA windows"),
     ("missing_api", ["register_read(source=)"], "(missing register_read(source=))"),
 )
 
@@ -104,6 +105,20 @@ class TestEngineRefusals(CustomTestCase):
     def test_switch_off_checks_nothing(self):
         for path, value, _ in _UNSUPPORTED:
             validate_engine_as(_broken(path, value), switch=False)
+
+
+class TestHybridModels(CustomTestCase):
+    def test_hybrid_model_is_accepted_with_its_host_tier_of_windows(self):
+        engine = supported_engine()
+        engine.kv_manager._swa_kv_caches = [object()]
+        engine.tree_cache.tree_core.has_swa_host_pool = True
+        validate_engine_as(engine)
+        # A window cannot be cut to whole pages of one token.
+        engine.kv_manager.kv_args.page_size = 1
+        with self.assertRaisesRegex(
+            startup_validation.UnsupportedDramOffloadConfig, "--page-size > 1"
+        ):
+            validate_engine_as(engine)
 
 
 class TestTpuSyncHostApi(CustomTestCase):

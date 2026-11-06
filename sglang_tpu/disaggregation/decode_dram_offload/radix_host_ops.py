@@ -13,11 +13,19 @@ from typing import Any, List, Optional
 import torch
 
 from sglang.srt.mem_cache.common import page_align_floor
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.cache_action import FreeComponentHostSlot
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import CacheTransferPhase
 from sglang.srt.mem_cache.utils import get_hash_str
 
 _FULL = ComponentType.FULL
+_SWA = ComponentType.SWA
 
 
 def prefix_radix_key(*, req: Any, num_tokens: int) -> RadixKey:
@@ -59,19 +67,65 @@ def path_tokens(cache: Any, leaf: Any) -> List[int]:
     return tokens
 
 
-def host_pages(cache: Any, host_pool: Any, leaf: Any) -> Optional[List[int]]:
-    """The host page ids of a path's full KV in token order, or None unless
+def host_pages(
+    cache: Any,
+    host_pool: Any,
+    leaf: Any,
+    *,
+    component: ComponentType = _FULL,
+    tail_tokens: Optional[int] = None,
+) -> Optional[List[int]]:
+    """The host page ids of a path's KV in token order (of its last
+    ``tail_tokens`` with them, which may start inside a node), or None unless
     every node of it is backed up. A pending backup cannot be served yet."""
     root = cache.tree_core.root_node
     segments = []
+    remaining = tail_tokens
     node = leaf
-    while node is not root:
-        data = node.component_data[_FULL]
+    while node is not root and (remaining is None or remaining > 0):
+        data = node.component_data[component]
         if data.host_value is None or node.write_through_pending_id is not None:
             return None
-        segments.append(host_pool._to_page_ids(data.host_value))
+        count = len(node.key) if remaining is None else min(remaining, len(node.key))
+        segments.append(host_pool._to_page_ids(data.host_value[-count:]))
+        if remaining is not None:
+            remaining -= count
         node = node.parent
+    if remaining:
+        return None
     return [int(p) for segment in reversed(segments) for p in segment]
+
+
+def window_host_pages(
+    cache: Any, swa_host_pool: Any, leaf: Any, *, tokens: int, window_tokens: int
+) -> Optional[List[int]]:
+    """The SWA host pages of the window that ends ``tokens`` deep at ``leaf``;
+    [] on a full-only model, None if the window is not whole in host RAM."""
+    if not window_tokens:
+        return []
+    return host_pages(
+        cache,
+        swa_host_pool,
+        leaf,
+        component=_SWA,
+        tail_tokens=min(tokens, window_tokens),
+    )
+
+
+def swa_host_pool(cache: Any) -> Any:
+    """The host pool of SWA windows; None on a full-only model."""
+    if not cache.supports_swa():
+        return None
+    return cache.host_pool_group.get_pool(PoolName.SWA)
+
+
+def window_tokens(cache: Any, page_size: int) -> int:
+    """The sliding window in tokens, rounded up to whole pages; 0 on a
+    full-only model."""
+    if not cache.supports_swa():
+        return 0
+    window = cache.components[_SWA].sliding_window_size
+    return -(-window // page_size) * page_size
 
 
 def _page_hashes(tokens: List[int], page_size: int) -> List[str]:
@@ -114,9 +168,11 @@ def insert_host_prefix(
     indices: torch.Tensor,
     page_size: int,
     *,
+    swa_indices: Optional[torch.Tensor] = None,
     reused_tokens: int = 0,
 ) -> Any:
-    """Publish a settled full-KV receive as a host-only path.
+    """Publish a settled receive as a host-only path: its full KV, and with
+    ``swa_indices`` the SWA window that ends where it ends.
 
     ``indices[:reused_tokens]`` is an already-owned, host-pinned prefix. Only
     newly allocated duplicate slices may be released here. Nothing is made
@@ -133,10 +189,40 @@ def insert_host_prefix(
     cache._apply_cache_actions(result.cache_actions)
     if result.host_insert_dropped or result.inserted_host_node is None:
         full_pool.free(indices[reused_tokens:])
+        if swa_indices is not None:
+            swa_host_pool(cache).free(swa_indices)
         return result
     duplicates = max(reused_tokens, result.prefix_len)
     if duplicates > reused_tokens:
         full_pool.free(indices[reused_tokens:duplicates])
+    if swa_indices is not None:
+        # The window joins the inserted path through HiCache's prefetch commit.
+        actions = []
+        core.commit_hicache_transfers(
+            core.root_node.id,
+            CacheTransferPhase.PREFETCH,
+            {_SWA: [PoolTransfer(name=PoolName.SWA, host_indices=swa_indices)]},
+            cache_actions=actions,
+            insert_result=result,
+            pool_storage_result=PoolTransferResult(
+                kv_hit_pages=len(indices) // page_size,
+                extra_pool_hit_pages={PoolName.SWA: len(swa_indices) // page_size},
+            ),
+        )
+        # The commit drops the slices the path already holds a window for.
+        # Core releases them through the L3 release queue, which an engine
+        # without a storage backend never drains: free them here. They were
+        # never visible and their read has settled.
+        kept = []
+        for action in actions:
+            if (
+                isinstance(action, FreeComponentHostSlot)
+                and action.component_type == _SWA
+            ):
+                cache.components[_SWA].free_host_values(action.host_indices)
+            else:
+                kept.append(action)
+        cache._apply_cache_actions(kept)
     return result
 
 
@@ -265,17 +351,35 @@ def host_backed_prefix(cache: Any, key: RadixKey, num_tokens: int, page_size: in
     return node, have, list(reversed(indices))
 
 
-def deepest_host_backed_path(cache: Any, host_pool: Any, node_id: Any):
+def deepest_host_backed_path(
+    cache: Any,
+    host_pool: Any,
+    node_id: Any,
+    *,
+    swa_host_pool: Any = None,
+    window_tokens: int = 0,
+    page_size: int = 1,
+):
     """Walking up from ``node_id``: the first node whose whole path has its
-    FULL KV in host RAM, and that path's host page ids; (root, None) if none."""
+    FULL KV in host RAM and, on a hybrid model, the window that ends there
+    too; with that path's host page ids and window page ids. (root, None, [])
+    if there is none."""
     core = cache.tree_core
     node = core.node_by_id(node_id)
     while node is not core.root_node:
         pages = host_pages(cache, host_pool, node)
         if pages:
-            return node, pages
+            window = window_host_pages(
+                cache,
+                swa_host_pool,
+                node,
+                tokens=len(pages) * page_size,
+                window_tokens=window_tokens,
+            )
+            if window is not None:
+                return node, pages, window
         node = node.parent
-    return node, None
+    return node, None, []
 
 
 def deletion_orphans_host_only_child(cache: Any, node_id: Any) -> Optional[bool]:

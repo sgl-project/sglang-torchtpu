@@ -32,6 +32,7 @@ from sglang_tpu.disaggregation.decode_dram_offload.radix_host_ops import (
     mark_next_victim,
     path_tokens,
     unlock_host_path,
+    window_host_pages,
 )
 from sglang_tpu.disaggregation.decode_dram_offload.rank_lockstep import (
     DramOffloadWorkerContext,
@@ -44,6 +45,9 @@ logger = logging.getLogger(__name__)
 MAX_INFLIGHT = 4
 # Arbitrary: push once the host pool could take only about two more sessions.
 _PUSH_FULL_FREE_TOKENS = 65536
+# Arbitrary: on a hybrid model, also once the SWA host pool could take only
+# this many more windows.
+_PUSH_SWA_FREE_WINDOWS = 4
 # Arbitrary, well past one RAM-to-RAM push of a session and the decode's
 # agreement rounds.
 _ACK_TIMEOUT_S = 60.0
@@ -76,8 +80,10 @@ class _PushInFlight(msgspec.Struct):
     leaf: Any
     locks: List[Any]
     sent_at: float
-    # The native registration of the leaf's pages; None if it was refused.
-    read_id: Optional[str] = None
+    # The accepted native registrations of the leaf's pages (full, then the
+    # window of a hybrid model); ``registered`` once all were accepted.
+    read_ids: List[str] = msgspec.field(default_factory=list)
+    registered: bool = False
     # The decode's answer; False also once the offer could not be sent, timed
     # out or failed. The registration still drains before the push settles.
     stored: Optional[bool] = None
@@ -85,8 +91,8 @@ class _PushInFlight(msgspec.Struct):
     ok: Optional[bool] = None
 
 
-def victim_transfer_id(prefill: str, seq: int) -> str:
-    return f"victim:{prefill}:{seq}"
+def victim_transfer_id(prefill: str, seq: int, *, swa: bool = False) -> str:
+    return f"victim:{prefill}:{seq}" + (":swa" if swa else "")
 
 
 def _transfer_uuid(prefill: str, seq: int) -> int:
@@ -101,6 +107,8 @@ class PrefillDramVictimPusher:
         self._channel = ctx.channel
         self._cache = ctx.cache
         self._host_pool = ctx.host_pool
+        self._swa_host_pool = ctx.swa_host_pool
+        self._window_tokens = ctx.window_tokens
         self._page_size = ctx.page_size
         self._lockstep = ctx.lockstep
         # Incarnation shared by this prefill's ranks: independent prefills and
@@ -167,6 +175,14 @@ class PrefillDramVictimPusher:
         self._start_push_if_agreed(serving=serving)
         log_offload_stats(self.stats, "prefill", self._last_log)
 
+    def _under_host_pressure(self) -> bool:
+        host_free = self._cache.cache_controller.mem_pool_host.available_size()
+        return host_free < _PUSH_FULL_FREE_TOKENS or (
+            self._swa_host_pool is not None
+            and self._swa_host_pool.available_size()
+            < _PUSH_SWA_FREE_WINDOWS * self._window_tokens
+        )
+
     def has_pushes_in_flight(self) -> bool:
         return bool(self._pushes)
 
@@ -194,11 +210,10 @@ class PrefillDramVictimPusher:
                 push.stored = self._channel.victim_reply(push.seq)
                 if push.stored is None and now - push.sent_at > _ACK_TIMEOUT_S:
                     push.stored = False
-            sent = (
-                False
-                if push.read_id is None
-                else self._channel.poll_host_read(push.read_id)
-            )
+            # Accepted registrations drain even when another one was refused.
+            sent = self._channel.poll_host_reads(push.read_ids)
+            if sent is not None and not push.registered:
+                sent = False
             if sent is False:
                 push.stored = False
             if push.stored is not None and sent is not None and push.ok is None:
@@ -213,8 +228,7 @@ class PrefillDramVictimPusher:
                 self._finish_push(push, stored=bool(ok))
 
     def _finish_push(self, push: _PushInFlight, *, stored: bool) -> None:
-        if push.read_id is not None:
-            self._channel.forget_host_read(push.read_id)
+        self._channel.forget_host_reads(push.read_ids)
         del self._pushes[push.seq]
         unlock_host_path(self._cache, push.locks)
         self._channel.forget_victim(push.seq)
@@ -228,30 +242,38 @@ class PrefillDramVictimPusher:
     def _start_push_if_agreed(self, *, serving: bool) -> None:
         """Start a push in a step where every rank serves requests, is under
         host pressure, picked the same leaf and holds it whole in host RAM."""
-        host_free = self._cache.cache_controller.mem_pool_host.available_size()
         picked = (
             self._pick_coldest_host_leaf()
             if serving
             and len(self._pushes) < MAX_INFLIGHT
-            and host_free < _PUSH_FULL_FREE_TOKENS
+            and self._under_host_pressure()
             else None
         )
-        # [picked, the leaf's fingerprint (2 values), its tokens, its host pages]
-        row = [0, 0, 0, 0, 0]
+        # [picked, the leaf's fingerprint (2 values), its tokens, its host
+        # pages, its window pages]
+        row = [0, 0, 0, 0, 0, 0]
         if picked is not None:
             decode, leaf = picked
             path = path_tokens(self._cache, leaf)
             pages = host_pages(self._cache, self._host_pool, leaf)
+            swa_pages = window_host_pages(
+                self._cache,
+                self._swa_host_pool,
+                leaf,
+                tokens=len(path),
+                window_tokens=self._window_tokens,
+            )
             row = [
                 1,
                 *push_manifest(path, leaf.key.extra_key, leaf.key.cache_salt),
                 len(path),
                 -1 if pages is None else len(pages),
+                -1 if swa_pages is None else len(swa_pages),
             ]
         low, high = self._lockstep.min_max(row)
         if not low[0] or low[:4] != high[:4]:
             return
-        if low[4] != high[4] or pages is None:
+        if low[4:] != high[4:] or pages is None or swa_pages is None:
             return
         # Not again at this length, stored or not.
         self._pushed_len[leaf] = len(path)
@@ -259,7 +281,6 @@ class PrefillDramVictimPusher:
         self._next_seq += 1
         namespace = self._channel.victim_namespace
         uuid = _transfer_uuid(namespace, seq)
-        read_id = victim_transfer_id(namespace, seq)
         push = _PushInFlight(
             seq=seq,
             leaf=leaf,
@@ -268,14 +289,24 @@ class PrefillDramVictimPusher:
         )
         self._pushes[seq] = push
         self.stats["started"] += 1
-        if self._channel.register_host_read(read_id, uuid, pages):
-            push.read_id = read_id
-        if not self._lockstep.all(push.read_id is not None) or not (
+        # The window is registered under the same UUID, on its own pool.
+        for swa, part in ((False, pages), (True, swa_pages)):
+            read_id = victim_transfer_id(namespace, seq, swa=swa)
+            if part and not self._channel.register_host_read(
+                read_id, uuid, part, swa=swa
+            ):
+                break
+            if part:
+                push.read_ids.append(read_id)
+        else:
+            push.registered = True
+        if not self._lockstep.all(push.registered) or not (
             self._channel.send_victim_push(
                 decode=decode,
                 seq=seq,
                 tokens=path,
                 blocks=pages,
+                swa_blocks=swa_pages,
                 uuid=uuid,
                 extra_key=leaf.key.extra_key,
                 cache_salt=leaf.key.cache_salt,
@@ -295,9 +326,20 @@ class PrefillDramVictimPusher:
                 self._routes.pop(node, None)
             if not pushable or node in busy:
                 continue
-            if self._pushed_len.get(node) == depth_tokens(self._cache, node):
+            depth = depth_tokens(self._cache, node)
+            if self._pushed_len.get(node) == depth:
                 continue
-            if host_pages(self._cache, self._host_pool, node) is None:
+            if (
+                host_pages(self._cache, self._host_pool, node) is None
+                or window_host_pages(
+                    self._cache,
+                    self._swa_host_pool,
+                    node,
+                    tokens=depth,
+                    window_tokens=self._window_tokens,
+                )
+                is None
+            ):
                 continue
             candidates.append((node.last_access_time, fingerprint, peer, node))
         if not candidates:

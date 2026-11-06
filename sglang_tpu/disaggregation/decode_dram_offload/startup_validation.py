@@ -1,7 +1,7 @@
 """Refuse settings the KV offload to decode DRAM does not support.
 
-The offload moves full-attention KV between the two roles' HiCache host
-pools, rank to rank. Anything it cannot
+The offload moves full-attention KV (and a hybrid sliding-window model's last
+window) between the two roles' HiCache host pools, rank to rank. Anything it cannot
 move or agree on is refused here with the setting to change, at engine start
 on either role. A pair whose engines disagree fails its requests instead (the
 raiden channel, ``raiden/dram_offload_channel.py``). Nothing degrades to "no offload"
@@ -62,6 +62,7 @@ def validate_engine(
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
     from sglang.srt.runtime_context import get_device, get_disagg, get_memory
     from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
+    from sglang_tpu.pd_decode_swa_hicache import swa_host_windows
 
     where = f"{role} engine"
     # Without the raiden manager none of the engine facts below exist.
@@ -73,6 +74,7 @@ def validate_engine(
         tree_cache.tree_core, UnifiedTreeCore
     )
     hicache_on = python_tree and tree_cache.cache_controller is not None
+    hybrid_swa = bool(kv_manager._swa_kv_caches)
     requirements = [
         (
             not server_args.disable_radix_cache,
@@ -140,10 +142,15 @@ def validate_engine(
             "speculative decoding is not supported",
         ),
         (
-            not kv_manager._swa_kv_caches,
-            "hybrid sliding-window models are not supported: only "
-            "full-attention KV is offloaded, and such a model cannot resume "
-            "from it without its window",
+            not hybrid_swa
+            or (swa_host_windows() > 0 and int(kv_manager.kv_args.page_size) > 1),
+            "a hybrid sliding-window model needs SGLANG_TPU_PD_SWA_HOST_WINDOWS > 0 "
+            "and --page-size > 1",
+        ),
+        (
+            not hybrid_swa or not hicache_on or tree_cache.tree_core.has_swa_host_pool,
+            "a hybrid sliding-window model needs a host tier of SWA windows, "
+            "which this cache was built without",
         ),
     ]
     problems = [reason for ok, reason in requirements if not ok]

@@ -9,6 +9,7 @@ import errno
 import time
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import zmq
 
@@ -30,6 +31,7 @@ from sglang_tpu.testing.decode_dram_offload import (
     DECODE_ADDR,
     DECODE_RAIDEN,
     PREFILL_ADDR,
+    PREFILL_INFO,
     PX,
     ROOM,
     SWITCH,
@@ -125,6 +127,53 @@ class TestDecodeOffersItsPrefix(DecodeOffersItsPrefixFixture, CustomTestCase):
                 self.assertEqual(mgr.failure_records, {})
 
 
+class TestHybridWindowOnTheWire(DecodeOffersItsPrefixFixture, CustomTestCase):
+    """A hybrid sliding-window model offers and registers two page sets, each
+    on its own host pool: the full pages and the window that ends with them."""
+
+    def _hybrid_decode(self):
+        mgr = decode_manager()
+        swa = Mock()
+        swa.host_control_address.side_effect = lambda ip: f"{ip}:7002"
+        mgr.dram_offload_channel.bind_host_pools(
+            SimpleNamespace(transfer=host_transfer_of(mgr)),
+            SimpleNamespace(transfer=swa),
+        )
+        mgr.dram_offload_channel.offer_resident_prefix(ROOM, [3, 4, 5, 6], [8, 9])
+        mgr.register_decode_request(ROOM, [21, 22, 23], [], None, [PREFILL_INFO])
+        return mgr, swa
+
+    def test_pull_req_names_the_window_and_a_pull_registers_both_page_sets(self):
+        mgr, swa = self._hybrid_decode()
+        req = PullReq.from_frames(sent_frames(mgr)[-1][1])
+        self.assertEqual(
+            (req.prefix_blocks, req.prefix_swa_blocks), ([3, 4, 5, 6], [8, 9])
+        )
+        # The asked range of full pages, and always the whole window.
+        ready = self._served(mgr, 2, 2)
+        _, uuid, blocks = host_transfer_of(mgr).register_read.call_args.args
+        req_id, swa_uuid, swa_blocks = swa.register_read.call_args.args
+        self.assertEqual((blocks, req_id, swa_blocks), ([5, 6], f"{ROOM}#pxs", [8, 9]))
+        self.assertEqual(
+            ready,
+            PrefixReady(
+                room=ROOM,
+                uuid=uuid,
+                endpoint=DECODE_RAIDEN,
+                swa_uuid=swa_uuid,
+                swa_endpoint="10.0.0.2:7002",
+            ),
+        )
+        self.assertNotEqual(uuid, swa_uuid)
+
+    def test_refused_window_registration_refuses_the_whole_pull(self):
+        mgr, swa = self._hybrid_decode()
+        swa.register_read.side_effect = RuntimeError("injected")
+        ready = self._served(mgr, 0, 4)
+        self.assertEqual((ready.uuid, ready.swa_uuid), (0, 0))
+        self.assertFalse(mgr.is_failed(ROOM))
+
+
 class TestPrefillWaitsForTheRecall(CustomTestCase):
     def test_offered_pages_keep_the_room_bootstrapping(self):
         mgr = prefill_manager()
@@ -158,7 +207,8 @@ class TestPrefillRecallsIntoItsHostPages(
         )
         mgr._dispatch(self._ready().to_frames())
         self.assertEqual(
-            mgr.dram_offload_channel.prefix_ready(ROOM), (99, DECODE_RAIDEN)
+            mgr.dram_offload_channel.prefix_ready(ROOM),
+            (99, DECODE_RAIDEN, 0, ""),
         )
 
     def test_read_lands_in_host_pages_and_its_outcome_fails_no_room(self):
@@ -178,15 +228,15 @@ class TestPrefillRecallsIntoItsHostPages(
                     destination="host",
                 )
                 offload.drain_host_reads()
-                self.assertIsNone(offload.poll_host_read(PX))
+                self.assertIsNone(offload.poll_host_reads([PX]))
                 host_transfer_of(mgr).poll_transfer.return_value = report
                 offload.drain_host_reads()
-                self.assertIs(offload.poll_host_read(PX), done)
+                self.assertIs(offload.poll_host_reads([PX]), done)
                 self.assertFalse(mgr.is_failed(ROOM))
                 self.assertEqual(mgr.failure_records, {})
                 # The record goes with the room.
                 mgr.clear_room(ROOM)
-                self.assertIs(offload.poll_host_read(PX), False)
+                self.assertIs(offload.poll_host_reads([PX]), False)
                 self.assertEqual(offload._reads, {})
 
 
@@ -374,7 +424,7 @@ class TestPrefillWaitsForTheRecallExtra(CustomTestCase):
         mgr = prefill_manager()
         sender_on(mgr)
         mgr._dispatch(pull_req(prefix_blocks=(3, 4)))
-        self.assertEqual(mgr.dram_offload_channel.take_prefix_offer(ROOM), [3, 4])
+        self.assertEqual(mgr.dram_offload_channel.take_prefix_offer(ROOM), ([3, 4], []))
         self.assertIsNone(mgr.dram_offload_channel.take_prefix_offer(ROOM))
         # The gate stays shut until the puller settles the room.
         self.assertFalse(mgr.finish_bootstrap_if_decode_requested(ROOM))
@@ -422,11 +472,11 @@ class TestPrefillRecallsIntoItsHostPagesExtra(
                 mgr.clear_status(ROOM)
                 mgr.clear_room(ROOM)
                 # The native read outlives the room until it reports.
-                self.assertIsNone(offload.poll_host_read(PX))
+                self.assertIsNone(offload.poll_host_reads([PX]))
                 host_transfer_of(mgr).poll_transfer.return_value = report
                 offload.drain_host_reads()
                 host_transfer_of(mgr).forget_transfer.assert_called_once_with(PX)
-                self.assertIs(offload.poll_host_read(PX), False)
+                self.assertIs(offload.poll_host_reads([PX]), False)
                 self.assertEqual(offload._reads, {})
 
 

@@ -106,7 +106,7 @@ class RaidenSenderMixin:
                 self._prefill.decode_swa_pages[room] = decode_swa_pages
                 if self.dram_offload_channel is not None:
                     self.dram_offload_channel.accept_prefix_offer_locked(
-                        room, req.prefix_blocks
+                        room, req.prefix_blocks, req.prefix_swa_blocks
                     )
                 held = self._prefill.held_chunks.pop(room, [])
                 total_pages = self._prefill.send_total.get(room, 0)
