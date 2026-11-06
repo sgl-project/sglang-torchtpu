@@ -20,6 +20,9 @@ from sglang_tpu.dflash_draft_kv_write import dflash_write_draft_kv
 from sglang_tpu.experimental.compilation.block_compile_policy import (
     TpuBlockSpecDecodeCompilePolicyMixin,
 )
+from sglang_tpu.experimental.speculative.draft_kv_retention import (
+    selects_retained_extend_rows,
+)
 from sglang_tpu.experimental.speculative.draft_worker import TpuDraftWorker
 from sglang_tpu.experimental.speculative.spec_ops import sample_tokens
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
@@ -112,10 +115,54 @@ class TpuBlockDraftWorker(TpuDraftWorker):
         assert isinstance(allocator, SWATokenToKVPoolAllocator), type(allocator)
         return allocator.full_to_swa_index_mapping
 
+    @property
+    def draft_window(self) -> int:
+        """Sliding window of a windowed (all-SWA) draft, in tokens."""
+        window = self._draft_model().get_attention_sliding_window_size()
+        if window is None:
+            raise ValueError("A draft in the SWA pool needs sliding_attention layers.")
+        return window
+
     def precompile_draft(self) -> None:
         self._compile_policy().precompile_draft(
             self.model_runner.attn_backend, kv_writer=self._write_draft_kv_eager
         )
+        if self.full_to_swa is not None and selects_retained_extend_rows(
+            get_disagg().disaggregation_mode
+        ):
+            self._precompile_extend_row_gather()
+
+    def extend_row_bucket(self, num_rows: int) -> int:
+        """Token bucket the extend KV writer pads num_rows to."""
+        t_bucketer = self._compile_policy().t_bucketer
+        assert t_bucketer is not None
+        return t_bucketer.next_bucket(num_rows)
+
+    def gather_extend_rows(
+        self, target_hidden: torch.Tensor, row_index: torch.Tensor
+    ) -> torch.Tensor:
+        """Rows row_index (a [bucket] int32 device tensor) of the extend's target hidden."""
+        assert row_index.dtype == torch.int32, row_index.dtype
+        return torch.index_select(target_hidden, 0, row_index)
+
+    def _precompile_extend_row_gather(self) -> None:
+        # Every (hidden bucket, smaller row bucket) pair the extend can gather.
+        compile_policy = self._compile_policy()
+        t_bucketer = compile_policy.t_bucketer
+        assert t_bucketer is not None
+        device = self.model_runner.device
+        for rows in t_bucketer.buckets:
+            target_hidden = torch.zeros(
+                (rows, compile_policy.dflash_target_hidden_size),
+                dtype=self.model_runner.dtype,
+                device=device,
+            )
+            for kept in t_bucketer.buckets:
+                if kept < rows:
+                    self.gather_extend_rows(
+                        target_hidden,
+                        torch.zeros((kept,), dtype=torch.int32, device=device),
+                    )
 
     def write_draft_kv(
         self,

@@ -193,6 +193,7 @@ Both raiden roles serve every algorithm with the same spec flags.
   `supports_pd_decode_swa_hicache`), since its draft KV at position i is projected
   from the target hidden at i. Every DFlash-family draft keeps its KV in the
   HiCache draft sidecar.
+- Windowed (all-SWA) draft extend: projects only rows whose SWA slot outlives the extend (`draft_kv_retention.py`).
 - KV free fence: commit writes draft KV after the accept outputs the result
   copies, so commit and extend return an output of their last KV write as
   `kv_fence_tail` (MTP's draft hidden, EAGLE3's seed token, the block KV

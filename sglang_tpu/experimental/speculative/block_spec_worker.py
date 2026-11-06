@@ -54,6 +54,13 @@ from sglang_tpu.experimental.speculative.dflash.dflash_draft_worker import (
     TpuDflashDraftWorker,
 )
 from sglang_tpu.experimental.speculative.draft_forward import forward_draft_rows
+from sglang_tpu.experimental.speculative.draft_kv_retention import (
+    CachePublishing,
+    batch_extend_requests,
+    retained_extend_rows,
+    retention_for_cache,
+    selects_retained_extend_rows,
+)
 from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
     TpuDsparkDraftWorker,
 )
@@ -271,46 +278,15 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         if target_hidden is None:
             raise RuntimeError("Block-draft extend requires target hidden capture.")
         assert logits_output.hidden_states_token_indices is None
-        # finalize keeps HOST_PADDED hidden at the token bucket; pad the host rows to
-        # match and upload once. Padded rows write slot 0, like the target forward.
-        padded_rows = target_hidden.shape[0]
-        if not batch.reqs:
-            # A DP-attention rank without prompts (DP padding relabels its batch)
-            # still issues the draft KV write; all its rows are padding.
-            compile_policy = self.target_worker.model_runner.compile_policy
-            assert isinstance(compile_policy, DecoderTpuCompilePolicy)
-            positions_cpu = torch.zeros((padded_rows,), dtype=torch.int64)
-            # The writer was warmed with the allocator's dtype; idle batches carry int64.
-            cache_loc_cpu = torch.zeros(
-                (padded_rows,), dtype=compile_policy.live_cache_loc_dtype()
-            )
-        else:
-            positions_cpu = prompt_positions(
-                prefix_lens=batch.prefix_lens, extend_lens=batch.extend_lens
-            )
-            cache_loc_cpu = batch.out_cache_loc
-            assert cache_loc_cpu.device.type == "cpu", cache_loc_cpu.device
-            full_to_swa = self._block_draft_worker.full_to_swa
-            if full_to_swa is not None:
-                cache_loc_cpu = full_to_swa[cache_loc_cpu].to(cache_loc_cpu.dtype)
-        positions = pad_rows(positions_cpu, padded_rows).to(
-            self.device, non_blocking=True
-        )
-        cache_loc = pad_rows(cache_loc_cpu, padded_rows).to(
-            self.device, non_blocking=True
-        )
         # Must inject before returning: the scheduler may update radix afterward,
         # invalidating out_cache_loc.
         if self.ships_pd_hidden:
             # The decode projects these rows into its draft KV.
             kv_fence_tail = self.write_pd_hidden(batch, target_hidden)
         else:
-            with self._block_draft_worker.draft_context():
-                kv_fence_tail = self._block_draft_worker.write_draft_kv(
-                    target_hidden=target_hidden,
-                    positions=positions,
-                    cache_loc=cache_loc,
-                )
+            kv_fence_tail = self._write_extend_draft_kv(
+                batch, target_hidden=target_hidden, target_tokens=result.next_token_ids
+            )
         logits_output.hidden_states = None
         if not batch.reqs:
             return self._idle_extend_result(result)
@@ -324,6 +300,83 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         next_draft_input.kv_fence_tail = kv_fence_tail
         result.next_draft_input = next_draft_input
         return result
+
+    def _write_extend_draft_kv(
+        self,
+        batch: ScheduleBatch,
+        *,
+        target_hidden: torch.Tensor,
+        target_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project the extend rows whose draft KV can be read; returns the kv_fence_tail."""
+        # finalize keeps HOST_PADDED hidden at the token bucket; pad the host rows to
+        # match and upload once. Padded rows write slot 0, like the target forward.
+        padded_rows = target_hidden.shape[0]
+        positions_cpu, cache_loc_cpu = self._extend_rows_cpu(batch, padded_rows)
+        rows = self._retained_extend_rows(batch)
+        if rows is not None:
+            if rows.numel() == 0:
+                # No draft KV write: the target forward's KV writes precede its tokens.
+                return target_tokens
+            kept_rows = self._block_draft_worker.extend_row_bucket(rows.numel())
+            if kept_rows < padded_rows:
+                row_index = pad_rows(rows.to(torch.int32), kept_rows)
+                target_hidden = self._block_draft_worker.gather_extend_rows(
+                    target_hidden, row_index.to(self.device, non_blocking=True)
+                )
+                positions_cpu, cache_loc_cpu = positions_cpu[rows], cache_loc_cpu[rows]
+                padded_rows = kept_rows
+        positions = pad_rows(positions_cpu, padded_rows).to(
+            self.device, non_blocking=True
+        )
+        cache_loc = pad_rows(cache_loc_cpu, padded_rows).to(
+            self.device, non_blocking=True
+        )
+        with self._block_draft_worker.draft_context():
+            return self._block_draft_worker.write_draft_kv(
+                target_hidden=target_hidden, positions=positions, cache_loc=cache_loc
+            )
+
+    def _extend_rows_cpu(
+        self, batch: ScheduleBatch, padded_rows: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """CPU (positions, draft cache_loc) of the extend's live rows."""
+        if not batch.reqs:
+            # A DP-attention rank without prompts (DP padding relabels its batch)
+            # still issues the draft KV write; all its rows are padding.
+            compile_policy = self.target_worker.model_runner.compile_policy
+            assert isinstance(compile_policy, DecoderTpuCompilePolicy)
+            # The writer was warmed with the allocator's dtype; idle batches carry int64.
+            return torch.zeros((padded_rows,), dtype=torch.int64), torch.zeros(
+                (padded_rows,), dtype=compile_policy.live_cache_loc_dtype()
+            )
+        positions_cpu = prompt_positions(
+            prefix_lens=batch.prefix_lens, extend_lens=batch.extend_lens
+        )
+        cache_loc_cpu = batch.out_cache_loc
+        assert cache_loc_cpu.device.type == "cpu", cache_loc_cpu.device
+        full_to_swa = self._block_draft_worker.full_to_swa
+        if full_to_swa is not None:
+            cache_loc_cpu = full_to_swa[cache_loc_cpu].to(cache_loc_cpu.dtype)
+        return positions_cpu, cache_loc_cpu
+
+    def _retained_extend_rows(self, batch: ScheduleBatch) -> torch.Tensor | None:
+        """Live rows whose draft KV outlives the extend; None writes every row."""
+        disagg_mode = get_disagg().disaggregation_mode
+        if (
+            not batch.reqs
+            or self._block_draft_worker.full_to_swa is None
+            or not selects_retained_extend_rows(disagg_mode)
+        ):
+            return None
+        retention = retention_for_cache(
+            batch.tree_cache,
+            draft_window=self._block_draft_worker.draft_window,
+            disagg_mode=disagg_mode,
+        )
+        if retention.publishing is CachePublishing.EVERY_ROW:
+            return None
+        return retained_extend_rows(batch_extend_requests(batch), retention)
 
     def verify_top_k_width(self) -> int | None:
         # Negotiates on every TP rank here, at init, never inside a compiled verify.
