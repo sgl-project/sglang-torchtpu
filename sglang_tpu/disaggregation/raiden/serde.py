@@ -45,8 +45,13 @@ class MessageTag(bytes, enum.Enum):
 
     ROOM_FAILED = b"RAIDEN_ROOM_FAILED"  # prefill -> decode: room already failed
 
-    # CommonKVReceiver owns this backend-independent positional message.
+    # prefill_driven reservation.
+    RESERVE = b"RAIDEN_RESERVE"  # prefill -> decode: reserve KV for room R now
+    RESERVE_BUSY = b"RAIDEN_RESERVE_BUSY"  # decode -> prefill: not now, ask again
+
+    # CommonKVReceiver owns these backend-independent positional messages.
     ABORT = b"ABORT"  # decode -> prefill: room, decode ip, decode port
+    BOOTSTRAP = b"BOOTSTRAP"  # decode -> prefill: room, decode ip, decode port
 
 
 # KV layout tags. A peer of the other layout registers rows of another size,
@@ -212,6 +217,31 @@ class RoomFailed(WireMessage):
     TAG: ClassVar[bytes] = MessageTag.ROOM_FAILED
     room: int
     reason: str
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+
+
+class Reserve(WireMessage):
+    """Ask a decode rank to reserve KV for a room (prefill_driven reservation).
+
+    The decode answers with its usual PULL_REQ once the pages are reserved, or
+    with RESERVE_BUSY when it cannot admit the room now.
+    """
+
+    TAG: ClassVar[bytes] = MessageTag.RESERVE
+    room: int
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+
+
+class ReserveBusy(WireMessage):
+    """The decode kept no reservation for the ask (prefill_driven). The prefill
+    may ask for the room again later and for other rooms meanwhile."""
+
+    TAG: ClassVar[bytes] = MessageTag.RESERVE_BUSY
+    room: int
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")

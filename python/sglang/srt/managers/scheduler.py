@@ -4314,7 +4314,9 @@ class Scheduler(
 
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
-            mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+            mamba_allocator.alloc_group_begin(
+                adder.get_match_group_size(len(self.waiting_queue))
+            )
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
@@ -4389,7 +4391,7 @@ class Scheduler(
                 chunk_tokens_cap=self._dynamic_first_chunk_cap(req),
             )
 
-            if self.enable_lora:
+            if self.enable_lora and res != AddReqResult.DEFERRED:
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
@@ -4421,6 +4423,8 @@ class Scheduler(
                             req.kv.mamba_pool_idx.unsqueeze(-1)
                         )
                         req.kv.mamba_pool_idx = None
+                if res == AddReqResult.DEFERRED:
+                    continue
                 break
 
         if mamba_allocator is not None:
@@ -4429,6 +4433,9 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            # Preemption released these requests even when all candidates deferred.
+            for req in adder.preempt_list:
+                self._add_request_to_queue(req)
             # CAP media anchors (SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS) are
             # cache-owned locks: a pass that admits nothing for lack of memory
             # (a NO_TOKEN, or a parked chunk) releases the least recently used

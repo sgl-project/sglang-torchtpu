@@ -227,3 +227,71 @@ Gates whose OOT arm differs from the built-in platform:
   (`tpu`) and drops the mode; the built-in arm passes the mode to the default
   backend (inductor). Worker init turns off dynamo's automatic dynamic shapes,
   as `dynamic=False` would.
+
+## Experimental prefill-driven reservations
+
+`SGLANG_ENABLE_DISAGG_PREFILL_DRIVEN=1` on both P/D roles enables scheduler-led
+Raiden reservations with the `early` decode allocation policy. The flag defaults
+off. All unstarted requests enter ordinary prefill scheduling before decode
+allocates KV, so `shortest-prefill-first` compares actual uncached work, including
+warm conversation histories. The configured policy and execution budgets remain
+in effect.
+
+`SGLANG_DISAGG_PREFILL_DRIVEN_SLOTS=0` derives the reservation-pipeline limit from
+scheduler/request-pool capacity. A positive advanced override is clamped to that
+capacity; negative values fail startup. Each pass also respects current row,
+prefill batch and scheduling limits. These are the only two feature controls.
+
+One slot covers a selected request from RESERVE through its first prefill batch,
+including unanswered asks and READY awaiting local metadata or batch capacity.
+Starting prefill frees the slot; decode KV stays allocated for its normal
+transfer/execution lifecycle. Finalized READY is required for computation. A
+ready subset runs without waiting for other asks. BUSY retains no new allocation,
+frees the slot, and permits backfill; the request stays queued for selection and
+a new RESERVE after a short internal cooldown. Silence retains ownership until
+an answer or normal timeout/abort cleanup; there is no soft expiry.
+
+The controller shares effective slots across eligible decode destinations using
+an internal ceiling of `ceil(slots / destinations)`. Outstanding destinations
+count toward the share; a destination with only cooling-down BUSY requests does
+not reserve idle capacity. This mitigates interference from one slow decode;
+it cannot guarantee progress when all slots are held by unresponsive peers.
+BUSY cooldown uses twice the per-destination RTT EWMA, bounded to 10–100 ms;
+statistics report reservation traffic and observed RTT for tuning evaluation.
+They also report mean/max host scheduler-pass time (`pass_ms`, `max_pass_ms`)
+and the maximum waiting-queue depth. Pass timing includes scheduling and
+reservation collectives, excludes model execution and the idle fast path, and
+is cumulative since startup. Final statistics flush when the queue drains.
+Measure scheduler-pass latency versus pending-queue depth on TP>1 alongside
+TTFT and throughput. There is no separate reservation token budget or
+per-destination control.
+
+TP/CP ranks agree on request order, asks and BUSY credit release. READY ownership
+is recorded before metadata allocation. Decode retains its existing bootstrap
+deadline, including before RESERVE, so a prefill-side intake rejection cannot
+leave an orphan request forever. Existing timeout settings and cancellation
+cleanup apply; increasing N does not extend those deadlines.
+
+Startup rejects non-Raiden/non-early serving, aggregated mode, PP, PD multiplexing,
+runtime role switching, decoupled speculation, DSPARK, encoder disaggregation,
+staging buffers, the Rust bootstrap registry, priority preemption and overlapping
+LoRA loading. Raiden's existing startup validator also requires
+`--optimistic-prefill-attempts 0`. Peers must have equal attention TP and one
+prefill source per decode rank.
+
+The runtime `pause_generation(mode="retract")` operation fails retracted decode
+requests with HTTP 503 when generation resumes: their prefix KV cannot be
+recomputed through this reservation protocol. This mode is chosen through the
+pause API, so there is no startup pause-mode setting to reject.
+
+CPU tests cover slot lifecycle, actual scheduler/cache integration,
+protocol failure/cleanup and four-rank TP×CP agreement. Hardware and production
+performance validation are tracked separately in the experiment; CPU coverage
+alone does not establish TPU support or a production default.
+
+Small limits can expose allocation latency; large limits hold more decode memory
+ahead of execution. When prefill has no allocatable request rows, new reservation
+nominations wait for capacity; a control round trip can then sit on the admission
+path. Measuring this under saturation is required before adding more lookahead. A count limit treats small suffixes and large chunks equally.
+Warm multi-turn and mixed-workload measurements must establish the throughput,
+TTFT, control-message and KV-occupancy tradeoffs before enabling by default.
