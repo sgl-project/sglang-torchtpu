@@ -787,8 +787,9 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
                 ("use_mla_backend", True),
                 ("mambaish_config", object()),
                 ("hybrid_gdn_config", object()),
-                ("is_draft_worker", True),
-                ("spec_algorithm", SpeculativeAlgorithm.EAGLE),
+                ("spec_algorithm", SpeculativeAlgorithm.UNO),
+                ("spec_algorithm", SpeculativeAlgorithm.DFLASH),
+                ("spec_algorithm", SpeculativeAlgorithm.DSPARK),
                 ("pp_size", 2),
                 ("_tpu_mha_pool_class", lambda: MHATokenToKVPool),
                 ("_tpu_mha_pool_class", lambda: object),
@@ -798,6 +799,18 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
                 setattr(kvc, attr, val)
                 with self.assertRaises(ValueError):
                     unified_kv_pool_enabled(kvc)
+            kvc_draft = copy.copy(base)
+            kvc_draft.is_draft_worker = True
+            self.assertFalse(unified_kv_pool_enabled(kvc_draft))
+            for supported_spec in (
+                SpeculativeAlgorithm.EAGLE,
+                SpeculativeAlgorithm.EAGLE3,
+                SpeculativeAlgorithm.STANDALONE,
+                SpeculativeAlgorithm.NGRAM,
+            ):
+                kvc_spec = copy.copy(base)
+                kvc_spec.spec_algorithm = supported_spec
+                self.assertTrue(unified_kv_pool_enabled(kvc_spec))
             kvc_asym = self._make_mock_kvc()
             kvc_asym.model_config.has_asymmetric_kv = True
             with self.assertRaises(ValueError):
