@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import random
+import time
 from collections import deque
 from contextlib import nullcontext
+from datetime import timedelta
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
@@ -188,6 +190,39 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
                 polls[i] = int(KVPoll.Transferring)
 
 
+def _all_reduce_min_bounded(tensor: torch.Tensor, group: dist.ProcessGroup) -> None:
+    """MIN all_reduce that raises instead of parking when a peer never arrives.
+
+    The CPU group's own timeout is hours. A rank blocked in a native transfer
+    poll or holding a lock leaves every peer silent in this collective for
+    that long, with the scheduler loop stopped and nothing logged, while
+    health endpoints that do not depend on forward progress keep answering.
+    """
+    timeout_s = envs.SGLANG_DISAGGREGATION_POLL_ALLREDUCE_TIMEOUT.get()
+    if timeout_s <= 0:
+        dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=group)
+        return
+    work = dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=group, async_op=True)
+    deadline = time.monotonic() + timeout_s
+    try:
+        if work.wait(timeout=timedelta(seconds=timeout_s)):
+            return
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"Transfer-status all_reduce did not complete within {timeout_s}s on "
+            f"rank {dist.get_rank()}: {e}"
+        ) from e
+    # A backend whose wait() reports False instead of raising.
+    while not work.is_completed():
+        if time.monotonic() > deadline:
+            raise RuntimeError(
+                f"Transfer-status all_reduce did not complete within {timeout_s}s on "
+                f"rank {dist.get_rank()} (group size {dist.get_world_size(group)}): "
+                "a peer rank is not reaching the collective"
+            )
+        time.sleep(0.001)
+
+
 def _gate_group_failure_on_drain(polls, pollers, groups):
     """Quiesce a group-wide failure, then deliver it once every rank drains.
 
@@ -218,7 +253,7 @@ def _gate_group_failure_on_drain(polls, pollers, groups):
     if groups:
         drained_tensor = torch.tensor(drained, dtype=torch.uint8, device="cpu")
         for group in groups:
-            dist.all_reduce(drained_tensor, op=dist.ReduceOp.MIN, group=group)
+            _all_reduce_min_bounded(drained_tensor, group)
         drained = drained_tensor.tolist()
     for bit, i in zip(drained, gated):
         if not bit:
@@ -231,11 +266,33 @@ def _reduce_status_and_gate_group_failure(polls, pollers, groups):
     # A single-rank group has nothing to reduce.
     groups = [group for group in groups if dist.get_world_size(group) != 1]
     if groups:
+        _check_poll_count_agreement(len(polls), groups)
         tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
         for group in groups:
-            dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
+            _all_reduce_min_bounded(tensor_to_reduce, group)
         polls = tensor_to_reduce.tolist()
     return _gate_group_failure_on_drain(polls, pollers, groups)
+
+
+def _check_poll_count_agreement(count: int, groups: List[dist.ProcessGroup]) -> None:
+    """Fail loudly when ranks poll different numbers of requests.
+
+    Gloo completes a MIN all_reduce on the rank with the shortest tensor and
+    leaves every longer peer waiting for it indefinitely, so a rank whose
+    queue drifted from its peers by one request turns into a silent partial
+    hang rather than an error.
+    """
+    if not envs.SGLANG_DISAGGREGATION_POLL_CHECK_COUNT.get():
+        return
+    bounds = torch.tensor([count, -count], dtype=torch.int64, device="cpu")
+    for group in groups:
+        _all_reduce_min_bounded(bounds, group)
+    low, high = int(bounds[0]), -int(bounds[1])
+    if low != high:
+        raise RuntimeError(
+            f"Transfer-status poll count differs across ranks: this rank polls "
+            f"{count} requests, peers poll between {low} and {high}"
+        )
 
 
 def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:

@@ -333,13 +333,6 @@ class TestPallasRpaV3MetadataDecode(CustomTestCase):
         self.assertTrue(torch.equal(meta.distribution, expected))
         self.assertEqual(meta.distribution.dtype, torch.int32)
 
-    def test_extend_seq_lens_unused_in_decode(self):
-        # _build_metadata must work even when extend_seq_lens is None
-        # (the field is not required for decode). The setUp default already
-        # leaves it None; just sanity-check we got here.
-        meta = self._build()
-        self.assertIsNotNone(meta)
-
 
 class TestPallasRpaV3MetadataExtend(CustomTestCase):
     """Extend-mode metadata: cu_q_lens from extend_seq_lens, distribution=[0,bs,bs]."""

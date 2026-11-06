@@ -36,7 +36,7 @@ class TestKpoolServingOp(unittest.TestCase):
         results = []
         for call in (run, compiled):
             raw = torch.zeros(9, 128, 256, dtype=torch.bfloat16, device="tpu")
-            pooled = torch.full((9, 32, 4, 256), _FILL, dtype=torch.uint8, device="tpu")
+            pooled = torch.full((9, 8, 4, 256), _FILL, dtype=torch.uint8, device="tpu")
             lens = [0, 0]
             outputs = []
             # Ragged prefill (token-bucket bound), uniform verify (verify-width
@@ -76,10 +76,10 @@ class TestKpoolServingOp(unittest.TestCase):
                         # The caller's raw tensor holds this step's key rows.
                         self.assertEqual(float(raw_cpu[page, pos % 128, 0]), step + 1)
                         if pos % 4 == 3:
-                            # The caller's pooled tensor holds the closed pool.
-                            pool = pos // 4
-                            p_page = int(pages[r * 4 + pool // 128])
-                            record = pooled_cpu[p_page, pool % 128 // 4, pool % 4]
+                            # The caller's pooled tensor holds the closed pool,
+                            # in its tokens' page.
+                            pool = pos // 4 % 32
+                            record = pooled_cpu[page, pool // 4, pool % 4]
                             self.assertFalse(torch.all(record == _FILL))
                 outputs.append((out.cpu(), raw_cpu, pooled_cpu))
                 lens = after

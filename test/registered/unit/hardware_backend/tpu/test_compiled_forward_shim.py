@@ -1792,18 +1792,30 @@ class TestPromptLogprobIntakeGate(CustomTestCase):
     """The TPU patch finishes an unservable prompt-logprob request with 400 at
     scheduler intake; everything else reaches the queue untouched."""
 
-    def _enqueue(self, *, logprob_start_len, flag, return_logprob=True):
+    def _enqueue(
+        self,
+        *,
+        logprob_start_len,
+        flag,
+        return_logprob=True,
+        multimodal=False,
+        text_only=False,
+        scheduler=None,
+    ):
         req = Req("r", "", array("q", [1, 2, 3, 4]), SamplingParams(), return_logprob)
         req.logprob_start_len = logprob_start_len
+        if multimodal:
+            req.multimodal_inputs = MagicMock()
         queue = MagicMock()
         with (
             patch.object(Scheduler, "_add_request_to_queue", queue),
             envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(flag),
+            envs.SGLANG_TPU_VL_TEXT_ONLY_EXTEND.override(text_only),
             get_context().override_server_args(),
             get_parallel().override(tp_rank=0),
         ):
-            patches._patch_scheduler_reject_prompt_logprob()
-            Scheduler._add_request_to_queue(SimpleNamespace(), req)
+            patches._patch_scheduler_reject_unservable_requests()
+            Scheduler._add_request_to_queue(scheduler or SimpleNamespace(), req)
         queue.assert_called_once()
         return req
 
@@ -1832,6 +1844,60 @@ class TestPromptLogprobIntakeGate(CustomTestCase):
 
     def test_prompt_logprobs_pass_with_the_flag_on(self):
         self.assertIsNone(self._enqueue(logprob_start_len=0, flag=True).to_finish)
+
+    def test_multimodal_refused_on_a_text_only_vl_server(self):
+        req = self._enqueue(
+            logprob_start_len=-1, flag=False, multimodal=True, text_only=True
+        )
+        self.assertIsInstance(req.to_finish, FINISH_ABORT)
+        self.assertEqual(req.to_finish.status_code, HTTPStatus.BAD_REQUEST)
+        self.assertIn("SGLANG_TPU_VL_TEXT_ONLY_EXTEND", req.to_finish.message)
+
+    @staticmethod
+    def _spec_scheduler(supports_logprobs):
+        worker_cls = type("FakeSpecWorker", (), {})
+        if supports_logprobs is not None:
+            worker_cls.supports_logprobs = supports_logprobs
+        algorithm = SimpleNamespace(
+            is_none=lambda: False, create_worker=lambda server_args: worker_cls
+        )
+        return SimpleNamespace(spec_algorithm=algorithm, server_args=None)
+
+    def test_logprobs_refused_by_a_spec_worker_without_them(self):
+        req = self._enqueue(
+            logprob_start_len=-1,
+            flag=False,
+            scheduler=self._spec_scheduler(supports_logprobs=False),
+        )
+        self.assertIsInstance(req.to_finish, FINISH_ABORT)
+        self.assertEqual(req.to_finish.status_code, HTTPStatus.BAD_REQUEST)
+        self.assertIn("FakeSpecWorker", req.to_finish.message)
+
+    def test_logprobs_pass_spec_workers_that_serve_them(self):
+        # Upstream workers have no supports_logprobs attribute.
+        for supports in (True, None):
+            with self.subTest(supports_logprobs=supports):
+                req = self._enqueue(
+                    logprob_start_len=-1,
+                    flag=False,
+                    scheduler=self._spec_scheduler(supports),
+                )
+                self.assertIsNone(req.to_finish)
+        req = self._enqueue(
+            logprob_start_len=-1,
+            flag=False,
+            return_logprob=False,
+            scheduler=self._spec_scheduler(supports_logprobs=False),
+        )
+        self.assertIsNone(req.to_finish)
+
+    def test_text_only_flag_leaves_text_and_default_servers_alone(self):
+        self.assertIsNone(
+            self._enqueue(logprob_start_len=-1, flag=False, text_only=True).to_finish
+        )
+        self.assertIsNone(
+            self._enqueue(logprob_start_len=-1, flag=False, multimodal=True).to_finish
+        )
 
 
 class TestPinFields(CustomTestCase):

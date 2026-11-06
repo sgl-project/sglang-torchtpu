@@ -886,16 +886,22 @@ class TpuSpecWorker(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         bucket: BucketState,
-        rows: VerifyRows,
         verify_input: TpuSpecVerifyInput,
     ) -> tuple[CommitResult, LogitsProcessorOutput, AcceptResult]:
+        # Algorithms that only need these rows after drafting can fuse their preparation.
+        rows = select_verify_rows(
+            verify_input.verify_cache_candidates,
+            verify_input.committed_lens,
+            bucket.state.seq_lens,
+            self.num_verify_rows,
+        )
         draft_result = self.draft(batch, bucket, rows, verify_input)
         logits_output, accept = self.verify(
             batch, bucket, rows, draft_result, verify_input
         )
         if self._target_has_linear_attn:
             self._commit_linear_attn_states(
-                batch=batch, accept=accept, verify_input=verify_input
+                batch=batch, accept=accept, pre_verify_lens=bucket.state.seq_lens
             )
         committed = self.commit(
             batch, bucket.state, rows, verify_input, logits_output, accept
@@ -907,7 +913,7 @@ class TpuSpecWorker(BaseSpecWorker):
         *,
         batch: ScheduleBatch,
         accept: AcceptResult,
-        verify_input: TpuSpecVerifyInput,
+        pre_verify_lens: torch.Tensor,
     ) -> None:
         """Select each slot's verify checkpoint at its last accepted token, and
         the checkpoints radix tracking snapshots."""
@@ -916,8 +922,9 @@ class TpuSpecWorker(BaseSpecWorker):
         assert isinstance(attn_backend, HybridLinearAttnBackend), type(attn_backend)
         steps_to_track = None
         if batch.mamba_track_indices is not None:
+            # Device lengths: under overlap the host committed_lens trail by one commit.
             steps_to_track = verify_track_steps(
-                verify_input.committed_lens,
+                pre_verify_lens,
                 accept.last_steps,
                 mamba_track_grid(batch.tree_cache.page_size),
             )
@@ -963,15 +970,7 @@ class TpuSpecWorker(BaseSpecWorker):
             batch, self.num_verify_rows, padded_bs
         )
         bucket = self._bucket_state(batch, padded_bs, verify_input)
-        # req_to_token is host-resident on TPU; the host gathered the candidate
-        # slot window, so the block is picked on device without a D2H sync.
-        rows = select_verify_rows(
-            verify_input.verify_cache_candidates,
-            verify_input.committed_lens,
-            bucket.state.seq_lens,
-            self.num_verify_rows,
-        )
-        committed, logits_output, accept = self.step(batch, bucket, rows, verify_input)
+        committed, logits_output, accept = self.step(batch, bucket, verify_input)
         next_state = committed.state
         # The scheduler stores this key as the next spec_info.future_indices.
         self._bucket = bucket._replace(key=batch.req_pool_indices, state=next_state)
@@ -1563,19 +1562,24 @@ class TpuSpecWorker(BaseSpecWorker):
         *,
         bucket_state: SpecState,
         verify_input: TpuSpecVerifyInput,
-        kv_rows: int,
+        host_kv_rows: int | None,
         **overrides: Any,
     ) -> contextlib.AbstractContextManager[ScheduleBatch]:
         """batch with its row fields at the bucket, restored on exit, for code that reads them.
 
         init_new snapshots these; feeding the bucket rows leaves the shim nothing
         to pad. Padded rows hold pool row 0 and host KV length 0, inactive in RPA;
-        seq_lens_cpu bounds the KV length once kv_rows rows past seq_lens are
-        written. overrides set (and restore) further batch fields.
+        host_kv_rows bounds the extra KV rows written past seq_lens; None skips
+        host bounds for device-built attention metadata. overrides set (and
+        restore) further batch fields.
         """
         padded_bs = bucket_state.seq_lens.shape[0]
         assert verify_input.req_pool_indices_cpu.shape[0] == padded_bs
-        seq_lens_cpu, seq_lens_sum = verify_input.padded_kv_lens_after_rows(kv_rows)
+        seq_lens_cpu, seq_lens_sum = (
+            (None, None)
+            if host_kv_rows is None
+            else verify_input.padded_kv_lens_after_rows(host_kv_rows)
+        )
         multimodal_inputs = batch.multimodal_inputs
         if multimodal_inputs is not None:
             # Spec M-RoPE positions read one entry per (bucket) row.
@@ -1611,7 +1615,7 @@ class TpuSpecWorker(BaseSpecWorker):
             batch,
             bucket_state=bucket_state,
             verify_input=verify_input,
-            kv_rows=self.num_verify_rows,
+            host_kv_rows=self.num_verify_rows,
         ) as view:
             return self._prepare_verify_forward_batch(view, spec_info)
 

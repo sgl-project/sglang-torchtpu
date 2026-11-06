@@ -19,12 +19,13 @@ from sglang.srt.plugins.hook_registry import HookRegistry, _propagate_patch
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope
 from sglang_tpu.envs import envs
 from sglang_tpu.experimental import register_host_batch_padder, uses_host_batch
 from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
-from sglang_tpu.experimental.speculative import base_spec_worker, draft_info
+from sglang_tpu.experimental.speculative import base_spec_worker, draft_info, spec_types
 from sglang_tpu.experimental.speculative.block_info import (
     HostPaddedBlockDraftInput,
 )
@@ -96,6 +97,97 @@ def _state(rows):
 
 
 class TestExperimentalSpecHooks(CustomTestCase):
+    def test_bucket_view_builds_host_bounds_only_when_requested(self):
+        original = dict(
+            multimodal_inputs=None,
+            seq_lens=torch.tensor([5]),
+            seq_lens_cpu=torch.tensor([5]),
+            seq_lens_sum=5,
+            orig_seq_lens=torch.tensor([5]),
+            req_pool_indices=torch.tensor([1]),
+            req_pool_indices_cpu=torch.tensor([1]),
+        )
+        state = SimpleNamespace(
+            seq_lens=torch.tensor([6, 0]), req_pool_indices=torch.tensor([1, 0])
+        )
+        bounds = torch.tensor([10, 0])
+        for host_kv_rows, overrides in (
+            (4, {}),
+            (4, {"seq_lens_cpu": None}),
+            (None, {}),
+        ):
+            with self.subTest(host_kv_rows=host_kv_rows, overrides=overrides):
+                batch = SimpleNamespace(**original)
+                addressing = SimpleNamespace(
+                    req_pool_indices_cpu=torch.tensor([1, 0]),
+                    padded_kv_lens_after_rows=MagicMock(return_value=(bounds, 10)),
+                )
+                with base_spec_worker.TpuSpecWorker._bucket_view(
+                    batch,
+                    bucket_state=state,
+                    verify_input=addressing,
+                    host_kv_rows=host_kv_rows,
+                    **overrides,
+                ):
+                    self.assertIs(
+                        batch.seq_lens_cpu,
+                        overrides.get(
+                            "seq_lens_cpu", bounds if host_kv_rows is not None else None
+                        ),
+                    )
+                    self.assertEqual(
+                        batch.seq_lens_sum, 10 if host_kv_rows is not None else None
+                    )
+                    self.assertIs(batch.req_pool_indices, state.req_pool_indices)
+                for name, value in original.items():
+                    self.assertIs(getattr(batch, name), value)
+                if host_kv_rows is None:
+                    addressing.padded_kv_lens_after_rows.assert_not_called()
+                else:
+                    addressing.padded_kv_lens_after_rows.assert_called_once_with(4)
+
+    def test_step_selects_rows_before_drafting_and_commits_after_verification(self):
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker.num_verify_rows = 8
+        worker._target_has_linear_attn = True
+        batch, rows, drafts, logits, accept, committed = [object() for _ in range(6)]
+        bucket = SimpleNamespace(state=SimpleNamespace(seq_lens=object()))
+        addressing = SimpleNamespace(
+            verify_cache_candidates=object(), committed_lens=object()
+        )
+        calls = MagicMock()
+        calls.select.return_value = rows
+        calls.draft.return_value = drafts
+        calls.verify.return_value = logits, accept
+        calls.commit.return_value = committed
+        with (
+            patch.object(base_spec_worker, "select_verify_rows", calls.select),
+            patch.object(worker, "draft", calls.draft),
+            patch.object(worker, "verify", calls.verify),
+            patch.object(worker, "_commit_linear_attn_states", calls.linear),
+            patch.object(worker, "commit", calls.commit),
+        ):
+            result = worker.step(batch, bucket, addressing)
+        self.assertEqual(result, (committed, logits, accept))
+        self.assertEqual(
+            [entry[0] for entry in calls.mock_calls],
+            ["select", "draft", "verify", "linear", "commit"],
+        )
+        calls.select.assert_called_once_with(
+            addressing.verify_cache_candidates,
+            addressing.committed_lens,
+            bucket.state.seq_lens,
+            8,
+        )
+        calls.draft.assert_called_once_with(batch, bucket, rows, addressing)
+        calls.verify.assert_called_once_with(batch, bucket, rows, drafts, addressing)
+        calls.linear.assert_called_once_with(
+            batch=batch, accept=accept, pre_verify_lens=bucket.state.seq_lens
+        )
+        calls.commit.assert_called_once_with(
+            batch, bucket.state, rows, addressing, logits, accept
+        )
+
     def test_verify_passes_current_draft_metadata_to_target(self):
         worker = object.__new__(TpuBlockSpecWorker)
         worker.num_verify_rows = 2
@@ -727,14 +819,16 @@ class TestExperimentalSpecHooks(CustomTestCase):
                         with self.assertRaisesRegex(ValueError, "overlap"):
                             initialize_host_batch(SimpleNamespace(enable_overlap=False))
 
-    def test_kimi_spec_defaults_yield_only_to_experimental_dspark(self):
+    def test_kimi_spec_defaults_yield_only_to_experimental_block_spec(self):
         def original(server_args):
             raise ValueError("core refused")
 
         for algo, experimental, passes in (
             ("DSPARK", True, True),
             ("DSPARK", False, False),
-            ("DFLASH", True, False),
+            ("DFLASH", True, True),
+            ("DFLASH", False, False),
+            ("EAGLE", True, False),
         ):
             args = SimpleNamespace(speculative_algorithm=algo)
             with (
@@ -1369,6 +1463,49 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertIsNone(payload.topk_p)
         self.assertIsNone(payload.hidden_states)
 
+    def test_decode_prep_accumulates_penalties_before_forward_snapshot(self):
+        batch = self.batch([0, 1], spec_algorithm=SpeculativeAlgorithm.EAGLE)
+        for req in batch.reqs:
+            req.origin_input_ids = [1]
+            req.output_ids = []
+            req.kv = SimpleNamespace(kv_committed_len=4, kv_allocated_len=32)
+            req.decode_batch_idx = 0
+        batch.reqs[0].sampling_params.presence_penalty = 0.5
+        batch.reqs[0].sampling_params.frequency_penalty = 0.25
+        batch.reqs[0].sampling_params.top_p = 0.9
+        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(batch, 32)
+        batch.req_to_token_pool = SimpleNamespace(host_resident=True)
+        batch.token_to_kv_pool_allocator = SimpleNamespace(page_size=1)
+        snapshots = []
+        with (
+            patch.object(batch, "maybe_evict_swa"),
+            patch.object(
+                draft_info, "max_speculative_num_draft_tokens", return_value=4
+            ),
+            patch.object(draft_info.HostPaddedDraftInput, "_plan_verify_window"),
+        ):
+            for tokens, repeated_penalty in (([2], -0.75), ([2], -1.0), ([4, 5], -1.0)):
+                batch.reqs[0].output_ids.extend(tokens)
+                batch.reqs[1].output_ids.extend(tokens)
+                spec_prepare_for_decode(batch)
+                expected = torch.zeros(2, 32)
+                expected[0, 2] = repeated_penalty
+                if tokens == [4, 5]:
+                    # Match EAGLE's relaxed policy: only the last emitted token
+                    # is accumulated for each speculative decode preparation.
+                    expected[0, 5] = -0.75
+                accumulated = torch.zeros_like(expected)
+                batch.sampling_info.penalizer_orchestrator.accumulate_additive_penalties(
+                    accumulated
+                )
+                self.assertTrue(torch.equal(accumulated, expected))
+                snapshot = batch.sampling_info.copy_for_forward()
+                self.assertTrue(torch.equal(snapshot.acc_additive_penalties, expected))
+                self.assertIsNone(snapshot.penalizer_orchestrator)
+                snapshots.append(snapshot)
+        self.assertEqual(snapshots[0].acc_additive_penalties[0, 2].item(), -0.75)
+        self.assertEqual(snapshots[0].acc_additive_penalties[0, 5].item(), 0.0)
+
     def test_decode_prep_reserves_two_windows_and_keeps_committed_host_lengths(self):
         """prepare_for_decode reserves 2 * N tokens past the committed length,
         plans the verify window on host from the committed lengths, and refuses
@@ -1399,7 +1536,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
             enable_overlap=True,
             return_logprob=False,
             has_grammar=False,
-            sampling_info=None,
+            sampling_info=self.batch([1, 2]).sampling_info,
             spec_algorithm=SimpleNamespace(create_worker=worker_factory),
         )
         allocations = []
@@ -1445,11 +1582,55 @@ class TestExperimentalSpecHooks(CustomTestCase):
 
             # A shorter active step still trails a preceding full-width commit.
             batch.spec_info = draft
-            plan = TpuSpecVerifyInput.from_batch(batch, num_verify_rows=2, padded_bs=4)
-            self.assertEqual(plan.host_len_slack, num_draft_tokens)
-            self.assertEqual(plan.verify_cache_candidates.shape, (4, 6))
+            for padded_bs in (2, 4):
+                with self.subTest(padded_bs=padded_bs):
+                    plan = TpuSpecVerifyInput.from_batch(
+                        batch, num_verify_rows=2, padded_bs=padded_bs
+                    )
+                    self.assertEqual(plan.host_len_slack, num_draft_tokens)
+                    # A hybrid-SWA draft maps the live host rows to its SWA slots.
+                    self.assertIs(
+                        plan.verify_cache_candidates_cpu,
+                        draft.tpu_verify_cache_candidates,
+                    )
+                    self.assertEqual(plan.verify_cache_candidates.shape, (padded_bs, 6))
+                    self.assertEqual(
+                        plan.req_pool_indices.tolist(), [1, 2] + [0] * (padded_bs - 2)
+                    )
+                    if padded_bs == 2:
+                        self.assertIs(plan.req_pool_indices, batch.req_pool_indices)
             with self.assertRaisesRegex(ValueError, "reserved KV window"):
                 TpuSpecVerifyInput.from_batch(batch, num_verify_rows=4, padded_bs=4)
+
+            # Page-addressed attention still reserves both windows and keeps
+            # the host slack, but has no token-slot gather or device addressing.
+            with (
+                patch.object(
+                    HostPaddedBlockDraftInput, "needs_verify_cache_locs", False
+                ),
+                patch.object(
+                    draft_info,
+                    "gather_dflash_candidate_window",
+                    side_effect=AssertionError("unused token-slot gather"),
+                ),
+                patch.object(
+                    spec_types,
+                    "padded_h2d",
+                    side_effect=AssertionError("unused addressing upload"),
+                ),
+            ):
+                draft.prepare_for_decode(batch)
+                plan = TpuSpecVerifyInput.from_batch(
+                    batch, num_verify_rows=2, padded_bs=2
+                )
+                self.assertIsNone(plan.verify_cache_candidates)
+                self.assertIsNone(plan.committed_lens)
+                self.assertIs(plan.req_pool_indices, batch.req_pool_indices)
+                self.assertEqual(plan.host_len_slack, num_draft_tokens)
+                self.assertEqual(plan.seq_lens_cpu.tolist(), [5, 10])
+                self.assertEqual([r.kv.kv_allocated_len for r in reqs], [12, 20])
+                self.assertTrue(draft.tpu_host_seq_lens_is_committed)
+                self.assertEqual(len(allocations), 1)
 
             # Request validation and KV planning use the selected worker's
             # capability, including an input constructed outside the worker.
@@ -1464,6 +1645,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
             # ordinary N + 1 token commit bound.
             worker_factory.return_value = _LogprobBlockSpecWorker
             worker = object.__new__(_LogprobBlockSpecWorker)
+            worker._bsearch_filtering = True
             worker._check_supported(batch=batch, pp_proxy_tensors=None)
             draft.prepare_for_decode(batch)
             self.assertTrue(draft.tpu_host_seq_lens_is_committed)
@@ -1473,6 +1655,50 @@ class TestExperimentalSpecHooks(CustomTestCase):
             batch.req_to_token_pool.host_resident = False
             with self.assertRaisesRegex(RuntimeError, "host-resident"):
                 draft.prepare_for_decode(batch)
+
+    def test_block_spec_worker_init_cuda_graphs_skips_decode_warmups_only_on_pp_non_decode(
+        self,
+    ):
+        from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
+
+        all_warmups = ["base", "block", "sampling", "extend", "snapshot"]
+        cases = (
+            (1, "null", all_warmups),
+            (1, "prefill", all_warmups),
+            (1, "decode", all_warmups),
+            (8, "prefill", ["base", "extend", "snapshot"]),
+            (8, "null", ["base", "extend", "snapshot"]),
+            (8, "decode", all_warmups),
+        )
+        for pp_size, mode, expected in cases:
+            with self.subTest(pp_size=pp_size, mode=mode):
+                calls: list[str] = []
+                worker = object.__new__(TpuBlockSpecWorker)
+                worker._sampled_drafts = True
+                worker._warmup_draft_block_inputs = lambda c=calls: c.append("block")
+                worker._warmup_draft_sampling = lambda c=calls: c.append("sampling")
+                worker._warmup_extend_draft_inputs = lambda c=calls: c.append("extend")
+                with (
+                    patch.object(
+                        TpuSpecWorker,
+                        "init_cuda_graphs",
+                        side_effect=lambda c=calls: c.append("base"),
+                    ),
+                    patch(
+                        "sglang_tpu.experimental.speculative.block_spec_worker.get_parallel",
+                        return_value=SimpleNamespace(pp_size=pp_size),
+                    ),
+                    patch(
+                        "sglang_tpu.experimental.speculative.block_spec_worker.get_disagg",
+                        return_value=SimpleNamespace(disaggregation_mode=mode),
+                    ),
+                    patch(
+                        "sglang_tpu.experimental.speculative.block_spec_worker.snapshot_recompilation_baseline",
+                        side_effect=lambda c=calls: c.append("snapshot"),
+                    ),
+                ):
+                    worker.init_cuda_graphs()
+                self.assertEqual(calls, expected)
 
 
 if __name__ == "__main__":

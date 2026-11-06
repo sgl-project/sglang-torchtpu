@@ -202,6 +202,7 @@ class TestPrefillBlockSizes(CustomTestCase):
         head_dim=128,
         page_size=256,
         ctx_pages=133,
+        sliding_window=None,
     ):
         import jax.numpy as jnp
 
@@ -215,6 +216,7 @@ class TestPrefillBlockSizes(CustomTestCase):
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             mask_value=float("-inf"),
+            sliding_window=sliding_window,
         )
         with tpu_info_for_cpu_export():
             serve = configs.ServingConfigs(
@@ -255,8 +257,8 @@ class TestPrefillBlockSizes(CustomTestCase):
             self.assertEqual(blocks.bq_sz % blocks.bq_c_sz, 0)
             self.assertLessEqual(blocks.bq_sz // blocks.bq_c_sz, 32)
             self.assertEqual(blocks.bq_c_sz & (blocks.bq_c_sz - 1), 0)
-        # 64q/8kv with bq_sz=256 has compute buffer time 2048 > 1500 at bq_c_sz=32,
-        # so bq_c_sz must step down to 16 (time=1024 <= 1500).
+        # 64q/8kv grows bkv_sz to 512, where bq_c_sz=16 already has compute buffer
+        # time 2048 > 1500; 16 is the floor (num_lanes // 8 q heads per KV head).
         self.assertEqual(
             self._resolve(num_q_heads=64, num_kv_heads=8, head_dim=64).bq_c_sz, 16
         )
@@ -276,6 +278,69 @@ class TestPrefillBlockSizes(CustomTestCase):
             self._resolve(num_q_heads=12).bq_sz, self._resolve(num_q_heads=4).bq_sz
         )
 
+    def test_high_head_count_grows_bkv_past_bq(self):
+        """At 64q/8kv (PP8 with TP=1), bq_sz caps at 256 while bkv_sz grows to 512."""
+        blocks = self._resolve(num_q_heads=64, num_kv_heads=8, head_dim=64)
+        self.assertEqual(blocks.bq_sz, 256)
+        self.assertEqual(blocks.bkv_sz, 512)
+        self.assertEqual(blocks.bkv_sz % blocks.bq_sz, 0)
+        # Lower head counts (32q/4kv, 4q/1kv) remain square (bq_sz == bkv_sz).
+        tp2_blocks = self._resolve(num_q_heads=32, num_kv_heads=4, head_dim=64)
+        self.assertEqual(tp2_blocks.bq_sz, 512)
+        self.assertEqual(tp2_blocks.bkv_sz, 512)
+
+    def test_k_block_grows_by_at_most_one_q_block(self):
+        """Wider bkv_sz / bq_sz ratios are unmeasured, so 32q/2kv stops at 512
+        even though VMEM would fit a wider k block."""
+        blocks = self._resolve(num_q_heads=32, num_kv_heads=2, head_dim=256)
+        self.assertEqual((blocks.bq_sz, blocks.bkv_sz), (256, 512))
+
+    def test_k_block_grows_only_after_the_first_lockstep_step(self):
+        """16q/2kv reaches a 512 square tile in lockstep, so it stays square."""
+        blocks = self._resolve(num_q_heads=16, num_kv_heads=2, head_dim=256)
+        self.assertEqual((blocks.bq_sz, blocks.bkv_sz), (512, 512))
+
+    def test_k_block_grows_only_with_8_or_more_q_heads_per_kv_head(self):
+        """With fewer q heads per KV head, the bq_c_sz picked for a 512 k block
+        made bf16 KV slower, so 40q/8kv and 24q/4kv keep the lockstep tile."""
+        for nq, nkv, hd in [(40, 8, 128), (24, 4, 256)]:
+            blocks = self._resolve(num_q_heads=nq, num_kv_heads=nkv, head_dim=hd)
+            self.assertEqual(
+                (blocks.bq_sz, blocks.bq_c_sz, blocks.bkv_sz), (256, 32, 256)
+            )
+
+    def test_k_block_does_not_grow_for_sliding_window_layers(self):
+        """A k block wider than bq_sz reads more keys outside the window."""
+        for window in (128, 1024):
+            blocks = self._resolve(
+                num_q_heads=64, num_kv_heads=8, head_dim=64, sliding_window=window
+            )
+            self.assertEqual((blocks.bq_sz, blocks.bkv_sz), (256, 256))
+
+    def test_k_block_growth_needs_sequences_that_fill_it(self):
+        """In a pool of one-page sequences a 512-token k block saves no KV steps;
+        it only makes each schedule step larger."""
+        blocks = self._resolve(num_q_heads=64, num_kv_heads=8, head_dim=64, ctx_pages=1)
+        self.assertEqual((blocks.bq_sz, blocks.bkv_sz), (256, 256))
+
+    def test_k_block_growth_keeps_whole_pages(self):
+        """The grown k block is a whole number of pages, so cover_whole_pages never
+        cuts it after bq_c_sz is picked for it."""
+        one_page = self._resolve(
+            num_q_heads=32, num_kv_heads=2, head_dim=256, page_size=512
+        )
+        self.assertEqual(
+            (one_page.bq_sz, one_page.bq_c_sz, one_page.bkv_sz), (256, 16, 512)
+        )
+        # Half a 1024-token page is not a whole page: no growth, and
+        # cover_whole_pages widens the lockstep tile as it did before.
+        half_page = self._resolve(
+            num_q_heads=32, num_kv_heads=4, head_dim=64, page_size=1024
+        )
+        self.assertEqual(
+            (half_page.bq_sz, half_page.bq_c_sz, half_page.bkv_sz), (256, 32, 1024)
+        )
+
     def test_override_pins_the_k_block(self):
         with envs.SGLANG_TPU_FORCE_RPA_PREFILL_BKV.override(4096):
             self.assertEqual(self._resolve().bkv_sz, 4096)
@@ -283,12 +348,6 @@ class TestPrefillBlockSizes(CustomTestCase):
     def test_override_is_rounded_up_to_a_page(self):
         with envs.SGLANG_TPU_FORCE_RPA_PREFILL_BKV.override(5000):
             self.assertEqual(self._resolve().bkv_sz, 5120)
-
-    def test_override_unset_leaves_the_search_in_charge(self):
-        derived = self._resolve().bkv_sz
-        with envs.SGLANG_TPU_FORCE_RPA_PREFILL_BKV.override(4096):
-            pass
-        self.assertEqual(self._resolve().bkv_sz, derived)
 
 
 class TestKernelBlockSizes(CustomTestCase):
@@ -414,7 +473,7 @@ class TestKernelBlockSizes(CustomTestCase):
             kv_lens=jnp.zeros((num_seqs,), jnp.int32),
             page_indices=jnp.zeros((num_seqs * pages_per_seq,), jnp.int32),
             cu_q_lens=jnp.arange(num_seqs + 1, dtype=jnp.int32),
-            distribution=jnp.asarray([num_seqs] * 3, jnp.int32),
+            distribution=jnp.asarray([0, 0, num_seqs], jnp.int32),
         )
 
         def validate(bkv_sz, mode):

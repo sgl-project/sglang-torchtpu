@@ -405,7 +405,8 @@ class TestKernelSourcesAreHashed(CustomTestCase):
             any(_is_kernel_source(path) for path in _PACKAGE_ROOT.rglob("*.py")),
             "the kernel API detector matched nothing in sglang_tpu",
         )
-        # multimodal_gen has its own TPU runtime and does not use this key;
+        # multimodal_gen's TPU kernels live in sglang_tpu/multimodal_gen, whose
+        # workers use this key; its own tree runs JAX only in a benchmark.
         # sglang/test holds test helpers (e.g. Pallas mesh mocks), not kernels.
         excluded = (_SGLANG_ROOT / "multimodal_gen", _SGLANG_ROOT / "test")
         outside = [

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import os
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Optional, Type
 
 import torch
@@ -19,10 +19,21 @@ from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.utils import LazyImport
+from sglang_tpu import shared_slice
 from sglang_tpu._logging import get_logger
-from sglang_tpu.tpu_dma_hicache import is_tpu_dma_hicache_backend
+from sglang_tpu.dp_replicas import (
+    ReplicaSession,
+    get_replica_session,
+    prepare_host_session,
+    validate_dp_replicas,
+)
+from sglang_tpu.tpu_dma_hicache import (
+    is_tpu_dma_hicache_backend,
+    tpu_dma_hicache_backends,
+)
 
 if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.server_args import ServerArgs
 
@@ -32,6 +43,9 @@ logger = get_logger(__name__)
 # Platform discovery runs before worker bootstrap configures torch_tpu.
 rank_slice = LazyImport("sglang_tpu.rank_local", "rank_slice")
 traced_rank = LazyImport("sglang_tpu.rank_local", "traced_rank")
+_ReplicaGroupCoordinator = LazyImport(
+    "sglang_tpu.replica_group", "ReplicaGroupCoordinator"
+)
 # The resolving view imports the platform registry, which is still discovering us.
 _resolving_view = LazyImport("sglang.srt.arg_groups.overrides", "resolving_view")
 
@@ -156,6 +170,10 @@ def _check_block_major_supported(server_args) -> None:
             "SGLANG_TPU_USE_BLOCK_MAJOR_KV supports KV offload over the raiden "
             "HiCache backend only; got --hicache-io-backend "
             f"{cfg.hicache_io_backend!r}."
+        )
+    if cfg.enable_unified_memory:
+        raise ValueError(
+            "SGLANG_TPU_USE_BLOCK_MAJOR_KV does not support --enable-unified-memory."
         )
     if mambaish_config(model_config_of(server_args)) is not None:
         raise ValueError(
@@ -379,6 +397,72 @@ def _mha_kv_pool_cls(backend: str | None) -> type:
     return MHATokenToKVPool
 
 
+# The MLA backend whose (split, page-major) pool a DMA engine copies page by page;
+# only the hybrid linear-attention host stack (TpuDmaMambaStrategy) builds its host pool.
+_KV_OFFLOAD_MLA_BACKEND = "pallas_tpu_mla_sparse"
+
+
+def validate_kv_offload_pools(
+    *,
+    io_backend: str,
+    attention_backend: str | None,
+    attention_backends: tuple,
+    use_mla: bool,
+    hybrid_linear: bool,
+) -> None:
+    """Reject KV offload when the device pool or a backend reading it cannot
+    take ``io_backend``'s reloads."""
+    backends = tuple(dict.fromkeys((attention_backend, *attention_backends)))
+    if use_mla:
+        if (
+            hybrid_linear
+            and is_tpu_dma_hicache_backend(io_backend)
+            and backends == (_KV_OFFLOAD_MLA_BACKEND,)
+        ):
+            return
+        raise ValueError(
+            f"{io_backend} KV offloading supports only dense MHA models and "
+            f"hybrid linear-attention models on {_KV_OFFLOAD_MLA_BACKEND} with a "
+            "DMA io backend; this MLA model has no TPU host pool. Disable "
+            "--enable-hierarchical-cache, or serve without the TPU KV-offload "
+            "io backend."
+        )
+
+    pool_cls = _mha_kv_pool_cls(attention_backend)
+    if io_backend not in getattr(pool_cls, "kv_offload_io_backends", ()):
+        raise ValueError(
+            f"{io_backend} KV offloading does not support the "
+            f"{pool_cls.__name__} KV pool of attention backend "
+            f"{attention_backend!r}: the pool does not list this io "
+            "backend in kv_offload_io_backends. Re-run with an attention "
+            "backend whose pool does (in-tree: pallas_tpu_rpa_v3 or "
+            "pallas_tpu_rpa_batched), or disable KV offload."
+        )
+
+    # Reloaded KV lands through the reload-commit hook in the shared RPA
+    # backend base, so every backend that reads the pool must be an RPA
+    # backend. It must also read the pool's layout: the pool is built for
+    # the base backend only, and split prefill/decode backends share it.
+    for backend in backends:
+        if _rpa_kernel_spec(backend) is None:
+            raise ValueError(
+                f"{io_backend} KV offloading does not support "
+                f"attention backend {backend!r}: it is not a Pallas RPA "
+                "backend, so it never runs the HiCache reload-commit hook. "
+                "Re-run with RPA attention backends, or disable KV offload."
+            )
+        backend_pool_cls = _mha_kv_pool_cls(backend)
+        if backend_pool_cls is not pool_cls:
+            raise ValueError(
+                f"{io_backend} KV offloading does not support "
+                f"attention backend {backend!r} with --attention-backend "
+                f"{attention_backend!r}: it reads "
+                f"{backend_pool_cls.__name__}, but "
+                f"the shared KV pool is {pool_cls.__name__}. Re-run with "
+                "backends that use the same KV pool, or disable KV offload."
+            )
+
+
 def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
     """Reject server configurations pipeline parallelism on TPU cannot run,
     and pin the scheduler order the stage hand-off needs.
@@ -422,13 +506,13 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
         cfg.tp_size == 2
         and cfg.attn_cp_size == 1
         and cfg.attn_dp_size == 1
-        and cfg.ep_size == 1
+        and cfg.ep_size in (1, 2)
     )
     if cfg.tp_size > 1 and cfg.attn_cp_size != cfg.tp_size and not stage_is_tp_pair:
         raise NotImplementedError(
             "Pipeline parallelism on TPU requires --tp-size 1, a tensor-parallel "
-            "pair (--tp-size 2 with --attn-cp-size 1, no DP attention or expert "
-            "parallelism) or --attn-cp-size equal to --tp-size (got --tp-size "
+            "pair (--tp-size 2 with --attn-cp-size 1, --ep-size 1 or 2, "
+            "no DP attention) or --attn-cp-size equal to --tp-size (got --tp-size "
             f"{cfg.tp_size} with --attn-cp-size {cfg.attn_cp_size} and --pp-size "
             f"{pp})."
         )
@@ -593,6 +677,20 @@ def _apply_kv_cache_dtype_default(server_args) -> None:
         return
     declare_resolution(
         server_args, "tpu.apply_server_args_defaults", kv_cache_dtype="fp8_e4m3"
+    )
+
+
+def _resolve_unified_kv_pool(server_args) -> None:
+    """Resolve ``--enable-unified-memory`` on TPU without enabling CUDA unified memory."""
+    from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
+    from sglang_tpu.unified_kv_pool import UNIFIED_KV_POOL_RESOLUTION_SOURCE
+
+    if not resolving_view(server_args).enable_unified_memory:
+        return
+    declare_resolution(
+        server_args,
+        UNIFIED_KV_POOL_RESOLUTION_SOURCE,
+        enable_unified_memory=False,
     )
 
 
@@ -824,12 +922,6 @@ def _validate_decode_context_parallel(server_args) -> None:
             "--decode-context-parallel-size > 1 on TPU (got "
             f"{cfg.speculative_algorithm!r})."
         )
-    if cfg.enable_mixed_chunk:
-        raise ValueError(
-            "--enable-mixed-chunk is not supported with "
-            "--decode-context-parallel-size > 1 on TPU: the DCP attention runs "
-            "plain decode and extend batches only."
-        )
     if cfg.attn_dp_size > 1:
         raise ValueError(
             "DP attention (--attn-dp-size > 1) is not supported with "
@@ -864,12 +956,6 @@ def _validate_decode_context_parallel(server_args) -> None:
             "LSEs and sums the outputs with zero-padded all-reduces, got "
             f"{cfg.dcp_comm_backend!r}."
         )
-    if cfg.dcp_replicate_q_proj:
-        raise ValueError(
-            "--dcp-replicate-q-proj is not supported with "
-            "--decode-context-parallel-size > 1 on TPU: it only applies to the "
-            "a2a/fi_a2a exchange on MLA attention."
-        )
     if not cfg.enable_torch_compile:
         raise ValueError(
             "--enable-torch-compile is required with "
@@ -887,17 +973,17 @@ def _validate_decode_context_parallel(server_args) -> None:
             "--decode-context-parallel-size > 1 on TPU: the DCP attention "
             "metadata is built from a host-resident req_to_token."
         )
-    if _uses_seq_along_lane_kv():
+    if cfg.kv_cache_dtype not in (
+        "auto",
+        "bf16",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+        "fp8_e5m2",
+    ):
         raise ValueError(
-            "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV=1 is not supported with "
-            "--decode-context-parallel-size > 1 on TPU: the DCP KV write "
-            "targets the token-major fused KV cache."
-        )
-    if cfg.kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
-        raise ValueError(
-            "--decode-context-parallel-size > 1 on TPU supports only a bf16 KV "
-            "cache (--kv-cache-dtype bfloat16), got --kv-cache-dtype "
-            f"{cfg.kv_cache_dtype}."
+            "--decode-context-parallel-size > 1 on TPU supports only a bf16 or fp8 "
+            f"KV cache (--kv-cache-dtype bfloat16, fp8_e4m3, or fp8_e5m2), got --kv-cache-dtype {cfg.kv_cache_dtype}."
         )
     chunk = cfg.chunked_prefill_size
     if chunk is None:
@@ -912,9 +998,9 @@ def _validate_decode_context_parallel(server_args) -> None:
         )
     # TODO(yinlin09): lift once DCP4/DCP8 pass the e2e gate on the pinned stack;
     # DCP8 served on torch_tpu 0.1.1.dev20260914 with libtpu 0.0.47.
-    if dcp_size > 2:
+    if dcp_size > 8:
         raise ValueError(
-            "--decode-context-parallel-size must be 1 or 2 on TPU, got "
+            "--decode-context-parallel-size must be 1, 2, 4 or 8 on TPU, got "
             f"{dcp_size}: with more ranks the forward stalls in warmup with the "
             "SparseCore gather offloads off and returns wrong first tokens with "
             "them on."
@@ -973,6 +1059,11 @@ class TpuSRTPlatform(SRTPlatform):
         # weights have loaded (its binder runs post-load).
         _pin_moe_gather_permute_for_static_fp8(static_fp8_parts())
         cfg = resolving_view(server_args)
+        if cfg.enable_page_major_kv_layout:
+            raise ValueError(
+                "--enable-page-major-kv-layout is a CUDA-only layout flag and is "
+                "not supported on TPU."
+            )
         if cfg.pp_size > 1:
             _validate_pipeline_parallel_args(server_args)
         _validate_raiden_optimistic_prefill(
@@ -995,7 +1086,13 @@ class TpuSRTPlatform(SRTPlatform):
         # the libtpu/env overrides now so actors inherit them before importing
         # torch_tpu.
         # One device per scheduler process across all pipeline stages.
-        _prepare_tpu_env(cfg.tp_size * cfg.pp_size, setup_slicebuilder=not cfg.use_ray)
+        if cfg.dp_size > 1:
+            validate_dp_replicas(cfg)
+            prepare_host_session(cfg.dp_size, cfg.tp_size)
+        _prepare_tpu_env(
+            cfg.dp_size * cfg.tp_size * cfg.pp_size,
+            setup_slicebuilder=not cfg.use_ray,
+        )
 
         from sglang_tpu.env_override import (
             apply_decode_cp_sparse_core_override,
@@ -1155,6 +1252,7 @@ class TpuSRTPlatform(SRTPlatform):
         _apply_kv_cache_dtype_default(server_args)
         if _uses_block_major_kv():
             _check_block_major_supported(server_args)
+        _resolve_unified_kv_pool(server_args)
 
     # ------------------------------------------------------------------
     # Subsystem factory methods
@@ -1233,39 +1331,54 @@ class TpuSRTPlatform(SRTPlatform):
     supports_mamba_extra_buffer = True
 
     def supports_mamba_prefix_cache(self, model_config) -> bool:
-        from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+        from sglang.srt.configs.hybrid_arch import hybrid_gdn_config, hybrid_kda_config
 
-        # KDA shares GDN metadata setup, but does not pass snapshot tracking
-        # to its kernel yet. Only the GDN backend writes reusable checkpoints.
-        return hybrid_gdn_config(model_config) is not None
+        # GDN and KDA run the same kernel and pass it the same snapshot plan.
+        return (
+            hybrid_gdn_config(model_config) is not None
+            or hybrid_kda_config(model_config) is not None
+        )
 
     def validate_mamba_prefix_cache(self, view, hf_config=None) -> None:
         # Mixed-batch merging drops the tracking plan while requests retain
         # checkpoint depths, so the radix tree could cache unwritten states.
         if view.enable_mixed_chunk and not view.disable_radix_cache:
             raise ValueError(
-                "TPU GDN prefix caching does not support --enable-mixed-chunk. "
+                "TPU GDN/KDA prefix caching does not support --enable-mixed-chunk. "
                 "Remove --enable-mixed-chunk or use --disable-radix-cache."
             )
         # Lazy slot allocation/release has not been validated with TPU snapshots.
         if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
             raise ValueError(
-                "extra_buffer_lazy is not supported for TPU GDN prefix caching. "
+                "extra_buffer_lazy is not supported for TPU GDN/KDA prefix caching. "
                 "Use --mamba-radix-cache-strategy extra_buffer."
             )
-        # Host and int8 stores expect stacked GPU-layout states; TPU owns
-        # independent kernel-layout tensors per layer.
-        for flag in ("enable_hierarchical_cache", "enable_int8_mamba_checkpoint"):
-            if getattr(view, flag):
-                raise ValueError(
-                    f"--{flag.replace('_', '-')} is not supported for TPU GDN prefix caching. "
-                    "Use device-resident, uncompressed Mamba states."
-                )
+        # The torch-copy host and int8 stores expect stacked GPU-layout states;
+        # TPU owns per-layer kernel-layout tensors, which only a DMA engine moves.
+        if view.enable_hierarchical_cache and not is_tpu_dma_hicache_backend(
+            view.hicache_io_backend
+        ):
+            raise ValueError(
+                "TPU GDN/KDA prefix caching offloads states to host only with a "
+                f"DMA --hicache-io-backend ({', '.join(tpu_dma_hicache_backends())})."
+            )
+        if view.enable_int8_mamba_checkpoint:
+            raise ValueError(
+                "--enable-int8-mamba-checkpoint is not supported for TPU GDN/KDA prefix caching. "
+                "Use device-resident, uncompressed Mamba states."
+            )
         if hf_config is not None:
             text_config = getattr(hf_config, "text_config", hf_config)
             assert getattr(text_config, "mamba_chunk_size", 64) == 64, (
-                "TPU GDN prefix caching requires mamba_chunk_size=64."
+                "TPU GDN/KDA prefix caching requires mamba_chunk_size=64."
             )
+
+    def create_weight_update_receiver(self, backend: str, *, tp_rank: int):
+        from sglang_tpu import shared_slice
+
+        if backend != shared_slice.BACKEND_NAME:
+            return None
+        return shared_slice.receiver(tp_rank)
 
     def get_mamba_pool_cls(self) -> type:
         # Hybrid GDN models (Qwen3.5 / Qwen3-Next) store their recurrent state
@@ -1343,6 +1456,50 @@ class TpuSRTPlatform(SRTPlatform):
 
         return TpuPagedTokenToKVPoolAllocator
 
+    def unified_kv_pool_enabled(self, kvc) -> bool:
+        from sglang_tpu.unified_kv_pool import unified_kv_pool_enabled
+
+        return unified_kv_pool_enabled(kvc)
+
+    def create_memory_pool_configurator(self, kvc):
+        from sglang_tpu.unified_kv_pool import maybe_create_unified_pool_configurator
+
+        return maybe_create_unified_pool_configurator(kvc)
+
+    def build_swa_kv_pool(
+        self,
+        kvc,
+        *,
+        full_max_total_num_tokens: int | None,
+        swa_max_total_num_tokens: int | None,
+    ):
+        from sglang_tpu.unified_kv_pool import maybe_build_unified_kv_pool
+
+        return maybe_build_unified_kv_pool(
+            kvc,
+            full_max_total_num_tokens=full_max_total_num_tokens,
+            swa_max_total_num_tokens=swa_max_total_num_tokens,
+        )
+
+    def build_swa_kv_pool_allocator(
+        self,
+        kvc,
+        *,
+        sizes,
+        token_to_kv_pool,
+        req_to_token_pool,
+        need_sort: bool,
+    ):
+        from sglang_tpu.unified_kv_pool import maybe_build_unified_kv_pool_allocator
+
+        return maybe_build_unified_kv_pool_allocator(
+            kvc,
+            sizes=sizes,
+            token_to_kv_pool=token_to_kv_pool,
+            req_to_token_pool=req_to_token_pool,
+            need_sort=need_sort,
+        )
+
     def get_compile_backend(self, mode: str | None = None) -> str:
         return "tpu"
 
@@ -1414,6 +1571,9 @@ class TpuSRTPlatform(SRTPlatform):
         # location space and replicates K/V heads within a DCP group.
         return True
 
+    def dcp_replicates_q_heads(self) -> bool:
+        return True
+
     def supports_moe_dp_pipeline_stages(self) -> bool:
         return True
 
@@ -1430,80 +1590,147 @@ class TpuSRTPlatform(SRTPlatform):
         # to True once torch_tpu exposes real multi-stream execution.
         return False
 
+    def process_model_after_loading(self, model: torch.nn.Module) -> None:
+        from sglang.srt.models.kimi_k3 import KimiK3LinearForCausalLM
+
+        if not isinstance(model, KimiK3LinearForCausalLM):
+            return
+        from sglang_tpu.hooks.attn_residual import prepare_attn_residual_kernel
+        from sglang_tpu.kimi_k3.logits_gather import (
+            bind_logits_allreduce_gather,
+            bind_logits_oneshot_gather,
+        )
+        from sglang_tpu.kimi_k3.oproj_row import bind_oproj_row
+        from sglang_tpu.kimi_k3.param_layout import store_decode_params
+        from sglang_tpu.kimi_k3.static_fp8 import bind_static_fp8
+
+        prepare_attn_residual_kernel(model)
+        bind_static_fp8(model)
+        bind_oproj_row(model)
+        # The one-shot gather wraps the all-reduce one: bs1 decode takes the
+        # one-shot kernel, every other gather the all-reduce.
+        bind_logits_allreduce_gather(model)
+        bind_logits_oneshot_gather(model)
+        store_decode_params(model)
+
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
+
+    _dp_replica_session: Optional[ReplicaSession] = None
+
+    def prepare_worker(
+        self, server_args, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
+    ) -> None:
+        cfg = _resolving_view(server_args)
+        if cfg.dp_size <= 1:
+            return
+        validate_dp_replicas(cfg)
+        if dp_rank is None or not 0 <= dp_rank < cfg.dp_size:
+            raise ValueError(f"Invalid TPU engine DP rank: {dp_rank}")
+        self._dp_replica_session = ReplicaSession(
+            dp_rank,
+            cfg.dp_size,
+            cfg.tp_size,
+            cfg.ep_size,
+            dp_rank * cfg.tp_size + tp_rank,
+            cfg.dist_timeout or 7200,
+        )
+        # The session rank chooses the physical device. Engine-local co-location
+        # binding would put every replica on the first engine's devices.
+        os.environ.pop("SGLANG_TPU_PD_COLOCATED", None)
+        os.environ.pop("TPU_VISIBLE_DEVICES", None)
+
+    def get_group_coordinator_cls(self) -> Type[GroupCoordinator]:
+        if get_replica_session() is not None:
+            return _ReplicaGroupCoordinator._load()
+        return super().get_group_coordinator_cls()
 
     def init_backend(self) -> None:
         if getattr(self, "_backend_initialized", False):
             return
 
-        world_size = os.environ.get("WORLD_SIZE")
-        if world_size is None:
-            raise RuntimeError(
-                "TorchTPU backend initialization requires worker WORLD_SIZE. "
-                "Initialize it from the scheduler worker bootstrap."
+        session = self._dp_replica_session
+        context = session.initialize() if session is not None else nullcontext()
+        with context:
+            world_size = os.environ.get("WORLD_SIZE")
+            if world_size is None:
+                raise RuntimeError(
+                    "TorchTPU backend initialization requires worker WORLD_SIZE. "
+                    "Initialize it from the scheduler worker bootstrap."
+                )
+            shared = shared_slice.spec()
+            if shared is not None:
+                if session is not None:
+                    raise ValueError(
+                        "TPU engine DP cannot share a slice with a trainer"
+                    )
+                # libtpu builds the whole slice, trainer included, from these
+                job = shared_slice.enter_slice_env(shared)
+                world_size = os.environ["WORLD_SIZE"]
+
+            # Keep c10d_functional collectives inside the compiled graph. torch_tpu
+            # defaults to materializing collective tensors by forcing graph breaks, which
+            # crashes under torch.compile(fullgraph=True) at TP>1. Setting this to 0/false
+            # disables that guardrail for SPMD TP graphs.
+            os.environ.setdefault(
+                "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false"
+            )
+            # Allow legacy torch.tpu device APIs (e.g. set_device, is_available,
+            # synchronize) called by SGLang's generic runtime bootstrap.
+            os.environ.setdefault("TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS", "1")
+
+            # Size libtpu's premapped (pinned, DMA-mapped) host staging pool. This is
+            # read by libtpu at init, so it MUST be set before `import torch_tpu`.
+            os.environ.setdefault(
+                "TPU_PREMAPPED_BUFFER_SIZE", str(_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE)
+            )
+            premapped_bytes = int(os.environ["TPU_PREMAPPED_BUFFER_SIZE"])
+            # Log the effective size so it's in hand when debugging KV-offload OOMs.
+            logger.info(
+                "libtpu premapped host staging pool: %.2f GiB "
+                "(TPU_PREMAPPED_BUFFER_SIZE=%d); raise it if KV-offload H2D OOMs.",
+                premapped_bytes / (1024 * 1024 * 1024),
+                premapped_bytes,
             )
 
-        # Keep c10d_functional collectives inside the compiled graph. torch_tpu
-        # defaults to materializing collective tensors by forcing graph breaks, which
-        # crashes under torch.compile(fullgraph=True) at TP>1. Setting this to 0/false
-        # disables that guardrail for SPMD TP graphs.
-        os.environ.setdefault(
-            "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false"
-        )
-        # Allow legacy torch.tpu device APIs (e.g. set_device, is_available,
-        # synchronize) called by SGLang's generic runtime bootstrap.
-        os.environ.setdefault("TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS", "1")
+            from sglang_tpu.patches import (
+                _prepare_tpu_env,
+                apply_tpu_patches,
+            )
 
-        # Size libtpu's premapped (pinned, DMA-mapped) host staging pool. This is
-        # read by libtpu at init, so it MUST be set before `import torch_tpu`.
-        os.environ.setdefault(
-            "TPU_PREMAPPED_BUFFER_SIZE", str(_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE)
-        )
-        premapped_bytes = int(os.environ["TPU_PREMAPPED_BUFFER_SIZE"])
-        # Log the effective size so it's in hand when debugging KV-offload OOMs.
-        logger.info(
-            "libtpu premapped host staging pool: %.2f GiB "
-            "(TPU_PREMAPPED_BUFFER_SIZE=%d); raise it if KV-offload H2D OOMs.",
-            premapped_bytes / (1024 * 1024 * 1024),
-            premapped_bytes,
-        )
+            # WORLD_SIZE is authoritative only inside a scheduler worker. Validate
+            # the inherited launch environment here; any TorchTPU-dependent
+            # topology discovery is therefore confined to the worker.
+            _prepare_tpu_env(int(world_size), resolve_single_host_topology=True)
 
-        from sglang_tpu.patches import (
-            _prepare_tpu_env,
-            apply_tpu_patches,
-        )
+            from sglang_tpu.compile_cache import (
+                add_tpu_kernel_inputs_to_compile_cache_key,
+            )
 
-        # WORLD_SIZE is authoritative only inside a scheduler worker. Validate
-        # the inherited launch environment here; any TorchTPU-dependent
-        # topology discovery is therefore confined to the worker.
-        _prepare_tpu_env(int(world_size), resolve_single_host_topology=True)
+            # After _prepare_tpu_env: the key must see the final LIBTPU_INIT_ARGS.
+            add_tpu_kernel_inputs_to_compile_cache_key()
 
-        from sglang_tpu.compile_cache import (
-            add_tpu_kernel_inputs_to_compile_cache_key,
-        )
+            import torch_tpu  # noqa: F401
 
-        # After _prepare_tpu_env: the key must see the final LIBTPU_INIT_ARGS.
-        add_tpu_kernel_inputs_to_compile_cache_key()
+            apply_tpu_patches()
+            # Resolve after worker setup, before Dynamo can trace either helper.
+            rank_slice._load()
+            traced_rank._load()
+            _register_attention_backends()
+            from sglang_tpu.envs import envs as tpu_envs
 
-        import torch_tpu  # noqa: F401
+            if tpu_envs.SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL.get():
+                from sglang_tpu.fp8_linear import register_fp8_linear_small_m_op
 
-        apply_tpu_patches()
-        # Resolve after worker setup, before Dynamo can trace either helper.
-        rank_slice._load()
-        traced_rank._load()
-        _register_attention_backends()
-        from sglang_tpu.envs import envs as tpu_envs
-
-        if tpu_envs.SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL.get():
-            from sglang_tpu.fp8_linear import register_fp8_linear_small_m_op
-
-            register_fp8_linear_small_m_op()
-        # Set before registering: importing the model registry imports model_runner,
-        # which calls init_backend again on the OOT path.
-        self._backend_initialized = True
-        _register_models()
+                register_fp8_linear_small_m_op()
+            if shared is not None:
+                shared_slice.join(shared, job)
+            # Set before registering: importing the model registry imports model_runner,
+            # which calls init_backend again on the OOT path.
+            self._backend_initialized = True
+            _register_models()
+        self._dp_replica_session = None
 
     def on_warmup_complete(self) -> None:
         """Freeze torch.compile so serving-time recompiles raise."""
@@ -1557,11 +1784,7 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang_tpu.pp_stage_chips import (
             validate_chips_for_pp,
         )
-        from sglang_tpu.pp_stage_groups import (
-            make_stage_groups_standalone,
-        )
 
-        make_stage_groups_standalone(get_parallel())
         validate_chips_for_pp(get_parallel())
         # Before the first collective and before torch.compile traces the model.
         from sglang_tpu.twolevel_allreduce import register_from_parallel_state
@@ -1587,18 +1810,23 @@ class TpuSRTPlatform(SRTPlatform):
         # process before init_backend() runs in worker subprocesses.
         if not getattr(self, "_backend_initialized", False):
             return 0
-        _, limit = torch.accelerator.get_memory_info(self.get_device(device_id))
+        # The worker rank is a label; PJRT exposes its bound chiplet at index 0.
+        _, limit = torch.accelerator.get_memory_info(self.get_device(0))
         return int(limit)
 
     def get_current_memory_usage(self, device: Optional[torch.device] = None) -> float:
         if not getattr(self, "_backend_initialized", False):
             return 0.0
-        if device is None:
-            device = self.get_device(0)
-        free, total = torch.accelerator.get_memory_info(device)
+        free, total = torch.accelerator.get_memory_info(self.get_device(0))
         return float(total - free)
 
     def get_device(self, device_id: int = 0) -> torch.device:
+        from sglang_tpu import shared_slice
+
+        # a worker on a shared slice sees only its own device, at index 0; joining
+        # started PJRT, so torch_tpu checks the index against that one device
+        if shared_slice.joined():
+            return torch.device("tpu", 0)
         return torch.device("tpu", device_id)
 
     def set_device(self, device: torch.device) -> None:

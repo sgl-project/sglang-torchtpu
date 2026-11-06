@@ -1255,9 +1255,11 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
     Each layer that runs its own DSA indexer also gets an index-key buffer. It
     uses the same page table. A layer that reuses the previous layer's top-k
     result has no index-key buffer. With a pooled indexer (``index_kpool > 1``,
-    GLM-5.3-Flash) the index-key buffer holds one record per pool, at the pool's
-    position, and a raw buffer keeps each token's bf16 index key and
-    compression gate, ``[num_pages, page_size, 2 * index_head_dim]``.
+    GLM-5.3-Flash) the index-key buffer holds one record per pool, in the page of
+    the pool's tokens (``page_size // index_kpool`` records per page), so a
+    request never writes a page another request shares through the radix tree.
+    A raw buffer keeps each token's bf16 index key and compression gate,
+    ``[num_pages, page_size, 2 * index_head_dim]``.
 
     Only the ops write these buffers, and they update them in place. That is
     why the accessors of the flat MLA pool, which address tokens by index, are
@@ -1329,10 +1331,10 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
                 f"size ({self.size}) must be divisible by page_size "
                 f"({self.page_size}) for the TPU split MLA pool."
             )
-        if self.page_size % self.TOKENS_PER_ROW != 0:
+        if self.page_size % (self.TOKENS_PER_ROW * index_kpool) != 0:
             raise ValueError(
                 f"page_size ({self.page_size}) must be divisible by "
-                f"{self.TOKENS_PER_ROW} for the TPU split MLA pool."
+                f"{self.TOKENS_PER_ROW * index_kpool} for the TPU split MLA pool."
             )
         # Allocate one extra page. Token index 0 is the slot used for padded
         # tokens, and the TPU allocator hands out page IDs starting at 1, so
@@ -1347,7 +1349,7 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         cls, *, index_head_dim: int, index_key_layers: list[bool], index_kpool: int
     ) -> int:
         """Bytes one token takes across all layers' buffers, as allocated."""
-        index_bytes = cls.index_key_record_bytes(index_head_dim)
+        index_bytes = cls.index_key_record_bytes(index_head_dim) // index_kpool
         if index_kpool > 1:
             index_bytes += 2 * index_head_dim * torch.bfloat16.itemsize
         layer_bytes = cls.NOPE_BYTES + cls.LANE_BYTES
@@ -1382,7 +1384,7 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         )
         index_key_shape = (
             self.num_pages,
-            rows_per_page,
+            rows_per_page // self._index_kpool,
             self.TOKENS_PER_ROW,
             self.index_key_record_bytes(self._index_head_dim),
         )
@@ -1428,6 +1430,16 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         del self.rope_buffer
         del self.index_key_buffer
         del self.kpool_raw_buffer
+
+    def get_page_buffers(self, layer_id: int) -> list[torch.Tensor]:
+        """Layer ``layer_id``'s buffers in a fixed order: NoPE, RoPE, then the
+        index keys and raw key|gate when it has them. Each leads with
+        ``num_pages``, so a request's page ids address it in all of them."""
+        i = layer_id - self.start_layer
+        optional = (self.index_key_buffer[i], self.kpool_raw_buffer[i])
+        return [self.nope_buffer[i], self.rope_buffer[i]] + [
+            buf for buf in optional if buf is not None
+        ]
 
     def get_nope_cache(self, layer_id: int) -> torch.Tensor:
         return self.nope_buffer[layer_id - self.start_layer]

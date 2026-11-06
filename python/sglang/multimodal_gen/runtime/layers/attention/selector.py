@@ -371,6 +371,10 @@ def _is_backend_supported(
             AttentionBackendEnum.FA in supported_attention_backends
             and AttentionBackendEnum.TORCH_SDPA in supported_attention_backends
         )
+    if selected_backend == AttentionBackendEnum.OOT:
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+
+        return current_platform.oot_attn_backend_serves(supported_attention_backends)
     return False
 
 

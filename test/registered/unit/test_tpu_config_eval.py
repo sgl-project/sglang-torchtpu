@@ -254,6 +254,27 @@ class TestAccuracyRecipes(unittest.TestCase):
         self.assertEqual(declared, set(self.MULTIHOST))
 
 
+class TestKimiK3Recipes(unittest.TestCase):
+    def test_host_launch_switches_stay_on_the_k31_native_decode(self):
+        """The host-side decode launch switches and the VMEM right-size were
+        validated only on the Kimi-K3.1 per-op native decode (the right-size
+        changes Kimi-K3's greedy output); no Kimi-K3 recipe may set them."""
+        from benchmark.tpu.recipe.configs.kimi_k3_1.server import (
+            NATIVE_DECODE_HOST_ENV,
+        )
+
+        self.assertEqual(len(NATIVE_DECODE_HOST_ENV), 4)
+        native = load_recipe("recipe/configs/kimi_k3_1/server.py")
+        for key, value in NATIVE_DECODE_HOST_ENV.items():
+            self.assertEqual(native["runtime_env"][key], value)
+        for recipe in ("server.py", "server_mk.py", "dspark.py", "dspark_mk.py"):
+            with self.subTest(recipe=recipe):
+                config = load_recipe(f"recipe/configs/kimi_k3/{recipe}")
+                self.assertFalse(
+                    set(NATIVE_DECODE_HOST_ENV) & set(config["runtime_env"])
+                )
+
+
 class TestWorkloadProfiles(unittest.TestCase):
     """A profile sizes a workload; it must not restate how a model is served."""
 
@@ -295,6 +316,7 @@ class TestRenderedCookbookCommands(unittest.TestCase):
     PAGES = (
         "docs/cookbook/autoregressive/OpenAI/GPT-OSS.mdx",
         "docs/cookbook/autoregressive/Moonshotai/Kimi-K3.mdx",
+        "docs/cookbook/autoregressive/Moonshotai/Kimi-K3.1-Pro.mdx",
     )
 
     def test_generated_blocks_parse_as_server_args(self):
@@ -326,6 +348,93 @@ class TestRenderedCookbookCommands(unittest.TestCase):
                         self.fail(
                             f"{page}: server rejects its own command ({exit_code})"
                         )
+
+
+class TestMuseSparkPDPP8Recipe(unittest.TestCase):
+    """Muse Spark PP8 standalone and 1P(PP8)+1D(TP8) DFlash recipes parse cleanly."""
+
+    STANDALONE_RECIPE = "recipe/configs/muse_spark/server_pp8.py"
+    PD_RECIPE = (
+        "recipe/configs/muse_spark/pd_singlehost_pp8_prefix_cache_kv_offload_dflash.py"
+    )
+
+    def test_standalone_pp8_recipe_parses_as_server_args(self):
+        import argparse
+
+        from sglang.srt.server_args import ServerArgs
+
+        plan = plan_launch(load_recipe(self.STANDALONE_RECIPE), inherited={})
+        args = plan.config.server_args
+        self.assertEqual((args["pp_size"], args["tp_size"], args["ep_size"]), (8, 1, 1))
+        self.assertEqual(args["moe_runner_backend"], "auto")
+        self.assertTrue(args["disable_overlap_schedule"])
+        self.assertEqual(plan.env["SGLANG_PP_LAYER_PARTITION"], "7,8,8,8,8,8,8,7")
+        argv = plan.command[plan.command.index("sglang.launch_server") + 1 :]
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parser.parse_args(argv)
+
+    def test_pd_pp8_dflash_recipe_plans_prefill_router_and_decode(self):
+        import argparse
+
+        from sglang.srt.server_args import ServerArgs
+
+        group_topology = {
+            "SGLANG_LAUNCHER_HOSTNAMES": "prefill-0,decode-0",
+            "SGLANG_LAUNCHER_RANK": "0",
+            "SGLANG_HOST_IP": "10.0.0.1",
+        }
+        prefill_plan = plan_launch(
+            load_recipe(self.PD_RECIPE), inherited=group_topology
+        )
+        p_args = prefill_plan.config.server_args
+        self.assertEqual(p_args["disaggregation_mode"], "prefill")
+        self.assertEqual(
+            (p_args["pp_size"], p_args["tp_size"], p_args["ep_size"]), (8, 1, 1)
+        )
+        self.assertEqual(p_args["kv_cache_dtype"], "bfloat16")
+        self.assertEqual(p_args["speculative_algorithm"], "DFLASH")
+        self.assertEqual(
+            p_args["speculative_draft_model_path"],
+            "/weights/Muse-Spark-Open-DFlash2",
+        )
+        self.assertTrue(p_args["enable_hierarchical_cache"])
+        self.assertEqual(p_args["hicache_ratio"], 3)
+        self.assertEqual(p_args["swa_full_tokens_ratio"], 1.0)
+        self.assertEqual(
+            prefill_plan.env["SGLANG_PP_LAYER_PARTITION"], "7,8,8,8,8,8,8,7"
+        )
+        self.assertEqual(
+            prefill_plan.env["SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER"], "1"
+        )
+        self.assertIsNotNone(prefill_plan.router)
+        self.assertEqual(
+            prefill_plan.health_urls,
+            ("http://prefill-0:30000", "http://decode-0:30000"),
+        )
+
+        decode_plan = plan_launch(
+            load_recipe(f"{self.PD_RECIPE}:DECODE_CONFIG"),
+            inherited={"SGLANG_LAUNCHER_RANK": "0", "SGLANG_HOST_IP": "10.0.0.2"},
+        )
+        d_args = decode_plan.config.server_args
+        self.assertEqual(d_args["disaggregation_mode"], "decode")
+        self.assertEqual(
+            (d_args.get("pp_size", 1), d_args["tp_size"], d_args["ep_size"]), (1, 8, 1)
+        )
+        self.assertEqual(d_args["kv_cache_dtype"], "bfloat16")
+        self.assertEqual(
+            d_args["disaggregation_decode_retraction_backup"], "cpu_tensor"
+        )
+        self.assertEqual(decode_plan.env["SGLANG_RAIDEN_PIPELINE_TRANSFER"], "1")
+        self.assertIsNone(decode_plan.router)
+
+        for label, plan in (("prefill", prefill_plan), ("decode", decode_plan)):
+            with self.subTest(role=label):
+                argv = plan.command[plan.command.index("sglang.launch_server") + 1 :]
+                parser = argparse.ArgumentParser()
+                ServerArgs.add_cli_args(parser)
+                parser.parse_args(argv)
 
 
 if __name__ == "__main__":

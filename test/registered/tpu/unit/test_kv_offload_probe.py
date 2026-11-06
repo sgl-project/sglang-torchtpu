@@ -162,6 +162,17 @@ class TestDecodeTails(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "decode tails"):
             plan_eviction(**kwargs, tail_tokens=1024)
 
+    def test_swa_host_pool_bounds_the_fillers(self) -> None:
+        kwargs = dict(device_pool_tokens=8192, probe_tokens=1024, hicache_ratio=3.0)
+        self.assertEqual(plan_eviction(**kwargs).host_pool_tokens, 24576)
+        # The SWA host pool is the ratio times the smaller SWA device pool.
+        self.assertEqual(
+            plan_eviction(**kwargs, swa_full_tokens_ratio=0.8).host_pool_tokens,
+            19660,
+        )
+        with self.assertRaisesRegex(ValueError, "evicted from host"):
+            plan_eviction(**kwargs, swa_full_tokens_ratio=0.5)
+
     def test_matching_replays_pass(self) -> None:
         self.assertEqual(tail_failures(tails=[self._tail()]), [])
 

@@ -69,6 +69,7 @@ def build_scheduler_pp_wave(scheduler: Scheduler) -> PPWave:
         hidden=int(model_runner.model_config.hidden_size),
         num_aux=num_aux,
         dtype=getattr(model_runner.model, "pp_transfer_dtype", model_runner.dtype),
+        aux_dtype=model_runner.dtype,
         device=torch.device(model_runner.device),
     )
     # A forward hands on its token bucket, or its batch bucket when decoding.

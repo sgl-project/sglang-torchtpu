@@ -65,6 +65,14 @@ class TestOutOfTreeContract(CustomTestCase):
             Platform.get_device_communicator_cls(),
         )
 
+    def test_attention_output_is_exchanged_in_head_slabs(self):
+        self.assertTrue(TpuOOTPlatform.prefers_head_slab_output_exchange())
+        self.assertFalse(Platform.prefers_head_slab_output_exchange())
+
+    def test_safetensors_are_read_on_the_host(self):
+        self.assertFalse(TpuOOTPlatform.supports_safetensors_device_load())
+        self.assertTrue(Platform.supports_safetensors_device_load())
+
 
 class TestSplashBackend(CustomTestCase):
     def setUp(self):
@@ -84,6 +92,12 @@ class TestSplashBackend(CustomTestCase):
                 "sdpa.SDPABackend",
                 TpuOOTPlatform.get_attn_backend_cls_str(selected, 128, torch.bfloat16),
             )
+
+    def test_it_serves_layers_that_take_sdpa(self):
+        fa, sdpa = AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA
+        self.assertTrue(TpuOOTPlatform.oot_attn_backend_serves({fa, sdpa}))
+        self.assertFalse(TpuOOTPlatform.oot_attn_backend_serves({fa}))
+        self.assertFalse(Platform.oot_attn_backend_serves({fa, sdpa}))
 
     def test_explicit_selection_overrides_the_layer_preference_set(self):
         from sglang_tpu.multimodal_gen.tpu_splash_attn import (
@@ -167,6 +181,22 @@ class TestCompileDefaults(CustomTestCase):
             self.assertFalse(torch._dynamo.config.automatic_dynamic_shapes)
         base_init.assert_called_once_with()
         install.assert_called_once_with()
+
+
+class TestWorkerRuntimePatches(CustomTestCase):
+    def test_worker_registers_the_aten_fallbacks_and_patches(self):
+        # Ring attention merges replicated-token partials with logaddexp, which
+        # torch_tpu has no kernel for (test_aten_fallbacks_tpu checks the kernel).
+        from sglang_tpu import patches
+        from sglang_tpu.multimodal_gen import rope, worker
+
+        with (
+            patch.object(patches, "_register_aten_fallbacks") as aten_fallbacks,
+            patch.object(rope, "install") as rope_install,
+        ):
+            worker.install_runtime_patches()
+        aten_fallbacks.assert_called_once_with()
+        rope_install.assert_called_once_with()
 
 
 if __name__ == "__main__":

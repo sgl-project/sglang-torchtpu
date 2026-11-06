@@ -159,15 +159,31 @@ class _Decoder(nn.Module):
         object.__setattr__(self, "_owner", owner)
 
     @property
+    def pp_group(self):
+        return self._owner.pp_group
+
+    @property
     def logits_processor(self):
         return self._owner.logits_processor
 
     def get_input_embeddings(self):
         return self._owner.get_input_embeddings()
 
-    def forward(self, input_ids, positions, forward_batch, input_embeds=None):
+    def forward(
+        self,
+        input_ids,
+        positions,
+        forward_batch,
+        input_embeds=None,
+        pp_proxy_tensors=None,
+    ):
         return TextModel.forward(
-            self._owner, input_ids, positions, forward_batch, input_embeds
+            self._owner,
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
 
@@ -229,10 +245,16 @@ class MuseSparkForConditionalGeneration(TextModel):
 
     def __init__(self, config, quant_config=None, prefix=""):
         super().__init__(config, quant_config, prefix)
-        self._normalized_embedding = _NormalizedEmbedding(
-            self.model.embed_tokens, self.text_config.rms_norm_eps
+        self._normalized_embedding = (
+            _NormalizedEmbedding(self.model.embed_tokens, self.text_config.rms_norm_eps)
+            if self.pp_group.is_first_rank
+            else self.model.embed_tokens
         )
-        self.vision_enabled = bool(get_mm().enable_multimodal)
+        # Only pipeline stage 0 embeds token or multimodal inputs; non-first
+        # stages receive pp_proxy_tensors and skip constructing/compiling NaViT.
+        self.vision_enabled = (
+            bool(get_mm().enable_multimodal) and self.pp_group.is_first_rank
+        )
         if not self.vision_enabled:
             return
         from sglang.srt.compilation.support_torch_compile import support_torch_compile
@@ -270,9 +292,26 @@ class MuseSparkForConditionalGeneration(TextModel):
         return self._normalized_embedding
 
     @torch.no_grad()
-    def forward(self, input_ids, positions, forward_batch, input_embeds=None):
+    def forward(
+        self,
+        input_ids,
+        positions,
+        forward_batch,
+        input_embeds=None,
+        pp_proxy_tensors=None,
+    ):
         if not self.vision_enabled:
-            return super().forward(input_ids, positions, forward_batch, input_embeds)
+            if pp_proxy_tensors is None:
+                return super().forward(
+                    input_ids, positions, forward_batch, input_embeds
+                )
+            return super().forward(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
         if (
             input_ids is None
             or forward_batch.forward_mode.is_decode()

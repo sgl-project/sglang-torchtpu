@@ -60,7 +60,8 @@ For host and platform setup, see the
 pip install sglang sglang-tpu   # the TPU plugin pins its torch_tpu and libtpu
 ```
 
-The TPU recipes are not in the command panel; see [TPU (tpu7x) Deployment](#tpu) for the launch commands.
+The TPU recipes are not in the command panel; see [TPU (tpu7x) Deployment](#tpu) for the launch commands
+and [Kimi-K3.1-Pro](/cookbook/autoregressive/Moonshotai/Kimi-K3.1-Pro) for Kimi K3.1 Pro.
 
 </Tab>
 
@@ -499,6 +500,7 @@ SGLang serves Kimi-K3 on Google TPU through the `torch_tpu` plugin
 4 chips x 2 TensorCores, so the checkpoint runs tp32 over the four hosts of a
 2x2x4 slice. Every host runs the same command, adding its own
 `--node-rank <0-3> --dist-init-addr <node0-ip>:20000`.
+For Kimi K3.1 Pro on the same slice, see [Kimi-K3.1-Pro](/cookbook/autoregressive/Moonshotai/Kimi-K3.1-Pro).
 
 The commands below are generated from the serving recipes in
 `benchmark/tpu/recipe/configs/kimi_k3/`; editing one here fails a lint check --

@@ -36,6 +36,7 @@ from sglang_tpu.compilation.attention_rank_inputs import (
 from sglang_tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
+from sglang_tpu.compilation.graph_identity import _key_value, canonical
 from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.warmup_queue import collect_warmups
 
@@ -197,7 +198,7 @@ class TestPPProxyPytree(CustomTestCase):
 
 class TestAuxHiddenStatePytree(CustomTestCase):
     def test_aux_list_output_flattens_to_tensor_leaves_and_rebuilds(self):
-        """A target verify that returns (hidden, aux) for DFlash capture must trace.
+        """A target that returns (hidden, aux), for EAGLE3 or DFlash capture, must trace.
 
         Unregistered, the aux list is one opaque leaf and direct_compile rejects
         the output as a non-tensor.
@@ -230,21 +231,6 @@ def _make_pruning_function(model, kv_pool, callback_values, **compile_options):
         kv_pool=kv_pool,
         **compile_options,
     )
-
-
-class TestAuxHiddenStatePytree(CustomTestCase):
-    def test_aux_states_flatten_to_tensor_leaves_and_rebuild(self):
-        """An EAGLE3 target's (hidden, aux) output must reach direct_compile as
-        tensor leaves; an opaque list leaf fails its all-TPU-tensors check."""
-        hidden, first, second = torch.zeros(2), torch.ones(2), torch.full((2,), 2.0)
-        leaves, treespec = tree_util.tree_flatten(
-            (hidden, AuxHiddenStateList([first, second]))
-        )
-        self.assertEqual(len(leaves), 3)
-        self.assertTrue(all(isinstance(leaf, torch.Tensor) for leaf in leaves))
-        _, aux = tree_util.tree_unflatten(treespec, leaves)
-        self.assertIsInstance(aux, AuxHiddenStateList)
-        self.assertIs(aux[1], second)
 
 
 class TestDirectCompile(CustomTestCase):
@@ -382,6 +368,34 @@ class TestDirectCompile(CustomTestCase):
                     self.assertEqual(future.get.call_count, int(asynchronous))
                     execute.assert_not_called()
 
+    def test_async_precompile_keeps_keyword_order(self):
+        """Serving calls must find the graph warmed with the same keywords."""
+        compiled = direct_compile.direct_compile(
+            lambda value, *, b, a: value,
+            specialization_key=lambda value, **kwargs: tuple(kwargs),
+        )
+        orders = []
+
+        def get_artifact(args, kwargs, *, async_compile=False):
+            orders.append(list(kwargs))
+            return MagicMock()
+
+        with (
+            patch.object(direct_compile, "_is_tpu_tensor", return_value=True),
+            patch.object(direct_compile, "synchronize"),
+            patch.object(
+                direct_compile.tpu_torch_compile,
+                "placeholder_like",
+                side_effect=lambda value: value,
+            ),
+            patch.object(compiled, "_get_artifact", get_artifact),
+        ):
+            compiled.precompile(
+                torch.ones(2), async_compile=True, b=torch.ones(1), a=torch.ones(1)
+            )
+
+        self.assertEqual(orders, [["b", "a"]])
+
     def test_compiled_helper_inlines_inside_outer_dynamo_graph(self):
         @compiled_op()
         def add_one(x):
@@ -435,6 +449,45 @@ class TestDirectCompile(CustomTestCase):
                 op(b=b, a=a, scale=2)
 
         compile_fn.assert_called_once()
+
+    def test_spmd_safe_compiled_op_keys_graphs_by_rank_independent_values(self):
+        """spmd_safe names the direct graph after the helper and keys it by typed
+        values, without the argument structure."""
+        built = []
+
+        def capture(fn, **kwargs):
+            built.append(kwargs)
+            compiled = MagicMock(side_effect=fn)
+            compiled.cache = {}
+            return compiled
+
+        def scale(x, factor):
+            return x * factor
+
+        with (
+            patch("sglang.srt.compilation.compiled_op.is_tpu", return_value=True),
+            patch("sglang.srt.compilation.compiled_op.direct_compile", new=capture),
+            get_context().override_server_args(tpu_compile_tracer="direct"),
+            envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
+        ):
+            compiled_op(spmd_safe=True)(scale)(torch.ones(4), 2)
+
+        (kwargs,) = built
+        self.assertTrue(kwargs["spmd_safe"])
+        self.assertEqual(kwargs["name"], f"{__name__}.{scale.__qualname__}")
+        key = kwargs["specialization_key"]
+        x = torch.ones(4)
+        # --use-spmd-compile names each graph by the canonical key; 2, 2.0 and
+        # True compare equal but bake different constants into the graph.
+        names = {canonical(_key_value(key(x, factor))) for factor in (2, 2.0, True, 3)}
+        self.assertEqual(len(names), 4)
+        self.assertEqual(
+            canonical(_key_value(key(x, 2))), '[[[4],"torch.float32","cpu"],["int",2]]'
+        )
+        self.assertEqual(key(x, 2), key(x, factor=2))
+
+        with self.assertRaisesRegex(ValueError, "TPU generator"):
+            compiled_op(spmd_safe=True, uses_rng=True)
 
     @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
     def test_torch_tpu_cache_hit_for_equivalent_compilations(self):

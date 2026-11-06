@@ -167,6 +167,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PluginWeightUpdateReqInput,
     ProfileReq,
     PullWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
@@ -263,6 +264,9 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     RECORD_STEP_TIME,
     PrefillStats,
     SchedulerMetricsReporter,
+)
+from sglang.srt.managers.scheduler_components.mm_feature_releaser import (
+    MM_FEATURE_RELEASER,
 )
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
@@ -1945,6 +1949,10 @@ class Scheduler(
                     self.weight_updater.end_weight_update,
                 ),
                 (
+                    PluginWeightUpdateReqInput,
+                    self.weight_updater.plugin_weight_update,
+                ),
+                (
                     UpdateWeightsFromDistributedReqInput,
                     self.weight_updater.update_weights_from_distributed,
                 ),
@@ -2993,7 +3001,7 @@ class Scheduler(
             if req.session:
                 continue
             # For non-session requests, clear features and mm_inputs
-            mm_inputs.release_features()
+            MM_FEATURE_RELEASER.release(mm_inputs)
             req.multimodal_inputs = None
 
     def handle_generate_request(
@@ -4285,6 +4293,11 @@ class Scheduler(
                 self.page_size,
             )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+        # add_chunked_req parks a next chunk that does not fit: it returns the
+        # request without adding it to the batch.
+        memory_blocked = (
+            self.chunked_req is not None and self.chunked_req not in adder.can_run_list
+        )
 
         if self.enable_lora:
             running_loras = {
@@ -4392,6 +4405,7 @@ class Scheduler(
                         )
                     else:
                         running_batch.batch_is_full = True
+                    memory_blocked = True
                 # revert matched mamba idx to avoid memory leak, if req is not added.
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
@@ -4415,6 +4429,16 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            # CAP media anchors (SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS) are
+            # cache-owned locks: a pass that admits nothing for lack of memory
+            # (a NO_TOKEN, or a parked chunk) releases the least recently used
+            # one, so the next pass can evict it.
+            if (
+                memory_blocked
+                and envs.SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS.get() > 0
+                and hasattr(self.tree_cache, "release_cap_anchor")
+            ):
+                self.tree_cache.release_cap_anchor()
             return None, running_batch
 
         can_run_set = set(can_run_list)
@@ -5343,6 +5367,8 @@ class Scheduler(
     @scheduler_stage_method(SCHEDULER_STAGE_IDLE)
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
+        # Nothing is waiting on the device: drop parked multimodal features.
+        MM_FEATURE_RELEASER.drain_all()
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 

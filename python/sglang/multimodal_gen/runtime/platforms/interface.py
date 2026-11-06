@@ -164,6 +164,14 @@ class Platform:
         """Return backend-specific options for a diffusion module."""
         return None
 
+    def configure_compile_cache(self) -> None:
+        """Configure torch.compile caching for this worker.
+
+        Called once per worker after distributed initialization, before any
+        compilation.
+        """
+        pass
+
     def get_dispatch_key_name(self) -> str:
         """Return the behavioral dispatch key used by :class:`CustomOp`.
 
@@ -308,6 +316,13 @@ class Platform:
         return True
 
     @classmethod
+    def prefers_head_slab_output_exchange(cls) -> bool:
+        """Whether the Ulysses output all-to-all sends a heads-major attention
+        output as per-head slabs instead of relayouting it to sequence-major
+        first. Both give bit-identical values."""
+        return False
+
+    @classmethod
     def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
         return None
 
@@ -341,6 +356,21 @@ class Platform:
     def get_oot_attn_backend_name(cls) -> str | None:
         """The ``--attention-backend`` name of this platform's own backend
         (``AttentionBackendEnum.OOT``), or None when it has none."""
+        return None
+
+    @classmethod
+    def oot_attn_backend_serves(
+        cls, supported_attention_backends: set[AttentionBackendEnum]
+    ) -> bool:
+        """Whether automatic selection may give the OOT backend to a layer that
+        lists only ``supported_attention_backends``."""
+        return False
+
+    @classmethod
+    def get_ring_capable_attention_backends(cls) -> tuple[str, ...] | None:
+        """``--attention-backend`` names that run ring attention on this
+        platform, the first being the ``--ring-degree`` default; None keeps the
+        core list."""
         return None
 
     @classmethod

@@ -51,9 +51,31 @@ class TpuOOTPlatform(TpuPlatform):
         return SPLASH_ATTN_BACKEND_NAME
 
     @classmethod
+    def oot_attn_backend_serves(
+        cls, supported_attention_backends: set[AttentionBackendEnum]
+    ) -> bool:
+        # A ring launch selects the splash backend globally, so every layer
+        # that takes TORCH_SDPA (DiT and text encoder alike) runs it, as with
+        # an explicit --attention-backend tpu_splash_attn, which the recipes
+        # pass. Shapes its kernels do not cover, such as prompts up to 512
+        # tokens and ragged causal attention, run SDPA.
+        return AttentionBackendEnum.TORCH_SDPA in supported_attention_backends
+
+    @classmethod
+    def get_ring_capable_attention_backends(cls) -> tuple[str, ...]:
+        # Rings by K/V all-gather; TPU has no p2p for the core ring backends.
+        return (SPLASH_ATTN_BACKEND_NAME,)
+
+    @classmethod
     def supports_safetensors_device_load(cls) -> bool:
         # safetensors rejects 'tpu:N'.
         return False
+
+    @classmethod
+    def prefers_head_slab_output_exchange(cls) -> bool:
+        # torch_tpu relayouts a sequence-major staging copy around the
+        # collective; dense head slabs keep (8, 128) tiles unpadded.
+        return True
 
     @classmethod
     def get_attn_backend_cls_str(
@@ -80,6 +102,12 @@ class TpuOOTPlatform(TpuPlatform):
 
         torch._dynamo.config.automatic_dynamic_shapes = False
         worker.install_runtime_patches()
+
+    def configure_compile_cache(self) -> None:
+        # torch_tpu persists XLA executables in AOTAutogradCache, whose key sees
+        # neither the device assignment behind collectives, opaque Pallas kernel
+        # sources nor the XLA flags: a stale hit can hang or ignore new flags.
+        worker.configure_compile_cache()
 
     def get_compile_backend(self, mode: str | None = None) -> str:
         if mode is not None:

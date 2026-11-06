@@ -710,6 +710,14 @@ def popen_launch_server(
     if api_key:
         command += ["--api-key", api_key]
 
+    if (
+        env.get("CI_WEIGHT_LOADER_PREFETCH") == "1"
+        and server_module == "sglang.launch_server"
+    ):
+        from sglang.test.ci.checkpoint_prefetch import configure_checkpoint_prefetch
+
+        command, env, _ = configure_checkpoint_prefetch(command, env)
+
     print(f"command={shlex.join(command)}")
 
     # Track if offline mode was enabled for potential retry
