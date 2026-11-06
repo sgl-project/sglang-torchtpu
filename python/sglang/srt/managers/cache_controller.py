@@ -714,6 +714,7 @@ class HiCacheController:
                     "simm",
                     "mori",
                     "tensorcast",
+                    "tpu_l3",
                 ]
             ) or (
                 self.storage_backend_type == "dynamic"

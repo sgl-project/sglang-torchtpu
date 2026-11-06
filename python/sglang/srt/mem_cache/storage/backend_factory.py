@@ -194,6 +194,8 @@ class StorageBackendFactory:
             return backend_class(storage_config, mem_pool_host)
         elif backend_name == "tensorcast":
             return backend_class(storage_config)
+        elif backend_name == "tpu_l3":
+            return backend_class(storage_config)
         else:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
 
@@ -265,4 +267,10 @@ StorageBackendFactory.register_backend(
     "tensorcast",
     "sglang.srt.mem_cache.storage.tensorcast_store.tensorcast_store",
     "TensorcastStore",
+)
+
+StorageBackendFactory.register_backend(
+    "tpu_l3",
+    "sglang.srt.mem_cache.storage.tpu_l3.tpu_l3_backend",
+    "TpuHiCacheL3Backend",
 )
