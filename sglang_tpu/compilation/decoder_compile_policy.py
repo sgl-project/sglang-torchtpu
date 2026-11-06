@@ -951,8 +951,12 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         runner_model = self.model_runner.model
         # A wrapper may compile its language model with the logits processor
         # inside (Kimi); one that keeps the logits eager (Gemma4) does not.
+        # Bailing/Ling-3 VL mounts that inner model on `.model` instead.
+        inner_lm = getattr(runner_model, "language_model", None) or getattr(
+            runner_model, "model", None
+        )
         return self.owner is runner_model or (
-            self.owner is getattr(runner_model, "language_model", None)
+            self.owner is inner_lm
             and getattr(self.owner, "logits_processor", None) is not None
         )
 
