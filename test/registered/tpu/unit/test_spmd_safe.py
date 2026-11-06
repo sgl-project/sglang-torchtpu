@@ -26,6 +26,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.compilation import spmd_compiler
 from sglang_tpu.compilation.direct_compile import direct_compile
 from sglang_tpu.compilation.warmup_queue import collect_warmups
+from sglang_tpu.rank_local import rank_slice
 from sglang_tpu.testing.spmd_safe import run_recipes, verify_startup
 
 register_tpu_ci(
@@ -60,6 +61,23 @@ def _worker_command(mode: str) -> list[str]:
 
 
 class TestSPMDSafe(CustomTestCase):
+    def test_shared_compilation_isolated_to_tp_subgroups(self):
+        world_size = hardware.get_tpu_device_count()
+        self.assertGreaterEqual(world_size, 4)
+        subprocess.run(
+            _worker_command("shared-subgroups"),
+            env={
+                **os.environ,
+                "VERIFY_SPMD_SAFE": "0",
+                "JAX_PLATFORMS": "cpu",
+                "XLA_FLAGS": f"--xla_force_host_platform_device_count={world_size}",
+                "LIBTPU_INIT_ARGS": "--xla_jf_emit_global_barrier_at_start=false",
+                "SGLANG_TPU_SHARED_COMPILE_COST_PROFILE": "",
+            },
+            check=True,
+            timeout=600,
+        )
+
     def test_shared_compilation_checks_runtime_and_input_views(self):
         world_size = hardware.get_tpu_device_count()
         self.assertGreaterEqual(world_size, 2)
@@ -79,8 +97,9 @@ class TestSPMDSafe(CustomTestCase):
         world_size = hardware.get_tpu_device_count()
         self.assertGreaterEqual(world_size, 2)
         with tempfile.TemporaryDirectory() as temporary:
-            for mode in ("matching", "mlir", "layout"):
+            for mode in ("matching", "mlir", "layout", "matching-subgroups"):
                 with self.subTest(mode=mode):
+                    matching = mode.startswith("matching")
                     output = Path(temporary) / mode
 
                     def launch_recipe(recipe, directory):
@@ -93,11 +112,12 @@ class TestSPMDSafe(CustomTestCase):
                             env={
                                 "JAX_PLATFORMS": "cpu",
                                 "XLA_FLAGS": f"--xla_force_host_platform_device_count={world_size}",
+                                "LIBTPU_INIT_ARGS": "--xla_jf_emit_global_barrier_at_start=false",
                             },
                         )
 
                     status = run_recipes([mode], launch_recipe, output=output)
-                    self.assertEqual(status, int(mode != "matching"))
+                    self.assertEqual(status, int(not matching))
                     workers = [
                         json.loads(path.read_text())
                         for path in output.glob("*/spmd-*/worker-*.json")
@@ -107,7 +127,16 @@ class TestSPMDSafe(CustomTestCase):
                     )
                     for record in workers:
                         self.assertEqual(record["keys"], [_KEY])
-                        self.assertEqual(record["passed"], mode == "matching")
+                        self.assertEqual(record["passed"], matching)
+                        group_size = (
+                            world_size // 2
+                            if mode.endswith("subgroups")
+                            else world_size
+                        )
+                        base = record["rank"] // group_size * group_size
+                        self.assertEqual(
+                            record["group_ranks"], list(range(base, base + group_size))
+                        )
                         self.assertEqual(
                             set(record["differences"]),
                             {_KEY} if mode == "mlir" else set(),
@@ -115,6 +144,10 @@ class TestSPMDSafe(CustomTestCase):
                         self.assertEqual(
                             set(record["layout_differences"]),
                             {_KEY} if mode == "layout" else set(),
+                        )
+                    if mode == "matching-subgroups":
+                        self.assertEqual(
+                            len({w["mlir_hashes"][_KEY] for w in workers}), 2
                         )
                     if mode == "layout":
                         self.assertEqual(
@@ -126,17 +159,15 @@ class TestSPMDSafe(CustomTestCase):
                     result_files = list(output.glob("*/spmd-*/result.json"))
                     self.assertEqual(len(result_files), 1)
                     result = json.loads(result_files[0].read_text())
-                    self.assertEqual(result["passed"], mode == "matching")
-                    self.assertEqual(
-                        result["launcher_exit_code"], int(mode != "matching")
-                    )
+                    self.assertEqual(result["passed"], matching)
+                    self.assertEqual(result["launcher_exit_code"], int(not matching))
                     self.assertFalse(
                         any(
                             error.startswith("Verification startup exceeded")
                             for error in result["errors"]
                         )
                     )
-                    if mode != "matching":
+                    if not matching:
                         self.assertIn(json.dumps(_KEY), " ".join(result["errors"]))
 
 
@@ -247,10 +278,63 @@ def _run_shared_checks(group) -> None:
         )
 
 
+def _run_subgroup_checks(group, device_group) -> None:
+    checks = unittest.TestCase()
+    rank, size = dist.get_rank(group), dist.get_world_size(group)
+    engine = dist.get_rank() // size
+    traced = []
+    value = (
+        torch.arange(128 * size, dtype=torch.float32).repeat(128, 1)
+        + (dist.get_rank() + 1) * 128 * size
+    ).to("tpu")
+
+    def forward(value, factor):
+        traced.append(factor)
+        result = rank_slice(value, -1, size, rank) * factor + engine
+        dist.all_reduce(result, group=device_group)
+        return result
+
+    compiled = direct_compile(
+        forward,
+        specialization_key=lambda value, factor: factor,
+        name="test/subgroup.forward",
+        spmd_safe=True,
+        lift_rank=True,
+    )
+    factors = (2, 3, 4)
+    with get_context().override_server_args(use_spmd_compile=True):
+        with collect_warmups(group=group) as queue:
+            for factor in factors:
+                queue.calls.append(compiled.warmup_async(value, factor))
+        checks.assertEqual(
+            traced, [factor for i, factor in enumerate(factors) if i % size == rank]
+        )
+        for factor in factors:
+            total = sum(range(engine * size + 1, (engine + 1) * size + 1))
+            columns = torch.arange(128, dtype=torch.float32) * size
+            total = columns + 128 * sum(range(size)) + total * 128 * size
+            expected = (total * factor + engine * size).repeat(128, 1)
+            checks.assertTrue(torch.equal(compiled(value, factor).cpu(), expected))
+    print(f"SPMD subgroup {engine} rank {rank}: shared collectives passed", flush=True)
+
+
 def _run_worker(mode: str) -> None:
     dist.init_process_group(backend="tpu_dist")
     try:
-        group = dist.new_group(backend="gloo")
+        if mode.endswith("subgroups"):
+            size = dist.get_world_size() // 2
+            assert size >= 2 and dist.get_world_size() == size * 2
+            for base in (0, size):
+                ranks = list(range(base, base + size))
+                device = dist.new_group(ranks, backend="tpu_dist")
+                cpu = dist.new_group(ranks, backend="gloo")
+                if dist.get_rank() in ranks:
+                    group, device_group = cpu, device
+        else:
+            group = dist.new_group(backend="gloo")
+        if mode == "shared-subgroups":
+            _run_subgroup_checks(group, device_group)
+            raise SystemExit(0)
         if mode == "shared":
             _run_shared_checks(group)
             raise SystemExit(0)
@@ -260,7 +344,13 @@ def _run_worker(mode: str) -> None:
             value = torch.ones((128, 128)).to("tpu")
         observed = tc.get_device_layout_if_materialized(value)
         assert observed is not None and observed[0] == order, observed
-        constant = 2 if mode == "mlir" and rank == 1 else 1
+        constant = (
+            rank // size + 1
+            if mode == "matching-subgroups"
+            else 2
+            if mode == "mlir" and rank == 1
+            else 1
+        )
 
         def forward(value):
             return value + constant

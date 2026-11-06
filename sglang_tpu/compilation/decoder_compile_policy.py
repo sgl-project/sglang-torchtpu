@@ -840,10 +840,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             specialization_key=self._direct_compile_specialization_key,
             name=self.name,
             spmd_safe=self.spmd_safe,
+            # Subgroup rank inputs require the recipe's SPMD safety contract.
             lift_rank=(
                 torch.distributed.is_initialized()
-                and get_parallel().tp_group.world_size
-                == torch.distributed.get_world_size()
+                and (
+                    get_parallel().tp_group.world_size
+                    == torch.distributed.get_world_size()
+                    or get_exec().graph.use_spmd_compile
+                )
             ),
             model=model,
             model_extra_tensor_attrs=self.get_model_extra_tensor_attrs(),

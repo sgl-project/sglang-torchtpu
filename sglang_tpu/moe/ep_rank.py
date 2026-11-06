@@ -12,8 +12,9 @@ from sglang.srt.runtime_context import get_parallel
 def traced_moe_ep_rank() -> Optional[torch.Tensor]:
     """This rank's MoE EP index as a traced tensor, or None if it is not lifted.
 
-    Rank lifting requires the TP group to span the world, so the traced input
-    is the TP rank. Within a TP group, ranks are laid out as
+    The traced input is the global rank; TP groups (the whole world, or one
+    per data-parallel replica) are contiguous rank blocks, so it gives the TP
+    rank modulo the TP size. Within a TP group, ranks are laid out as
     ``(moe_dp_rank * moe_ep_size + moe_ep_rank) * moe_tp_size + moe_tp_rank``.
     """
     # Probe before get_parallel(): untraced callers may not have published it.
