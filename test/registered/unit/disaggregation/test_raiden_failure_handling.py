@@ -583,6 +583,7 @@ class TestSenderBootstrapTimeout(unittest.TestCase):
         mgr.finish_bootstrap_if_decode_requested = types.MethodType(
             RaidenKVManager.finish_bootstrap_if_decode_requested, mgr
         )
+        mgr.decode_dram_offload = None
         mgr.fail_decode_silence = types.MethodType(
             RaidenKVManager.fail_decode_silence, mgr
         )
@@ -735,6 +736,7 @@ class TestBootstrapQueueAdmission(unittest.TestCase):
             token_to_kv_pool_allocator=SimpleNamespace(page_size=32),
         )
         queue.ensure_metadata_buffer = Mock(return_value=True)
+        queue.decode_prefix_puller = None
         queue.queue = list(reqs)
         return queue
 
