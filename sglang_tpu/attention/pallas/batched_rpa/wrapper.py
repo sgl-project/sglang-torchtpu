@@ -219,6 +219,100 @@ def get_kv_cache_shape(
 # The q and KV refs pipeline with lookahead, which needs a second buffer.
 _MIN_N_BUFFER = 2
 
+# Smallest q block the search shrinks to before dropping buffers; the smallest
+# measured to compile and run on the batched kernel.
+_MIN_SHRUNK_BQ_SZ = 128
+
+# Headroom below the VMEM limit for _spill_bytes: the fit under-predicts Mosaic's
+# usage by up to 4.8 MiB (1.4 MiB on transposed tiles, none on decode), and
+# Mosaic's limit is 0.06 MiB under 64 MiB; the rest is slack for unfitted shapes.
+_VMEM_MARGIN_BYTES = 6 << 20
+
+
+def _carry_bytes(cfgs: configs.RpaConfigs) -> int:
+    """The m, l and acc scratch: f32, shared by the batch's lanes."""
+    tpu_info = pltpu.get_tpu_info()
+    if cfgs.use_transposed:
+        # m is one row per KV head, padded to a sublane tile.
+        return (
+            math.prod(cfgs.mt_scratch_shape) * tpu_info.num_sublanes * 4
+            + math.prod(cfgs.acct_scratch_shape) * 4
+            + math.prod(cfgs.qt_scratch_shape) * jnp.dtype(cfgs.serve.dtype_kv).itemsize
+        )
+    *acc_rows, acc_width = cfgs.acc_scratch_shape
+    acc_bytes = math.prod(acc_rows) * utils.align_to(acc_width, tpu_info.num_lanes) * 4
+    return 2 * math.prod(cfgs.lm_scratch_shape) * 4 + acc_bytes
+
+
+def _lse_bytes(cfgs: configs.RpaConfigs) -> int:
+    """f32 rows of lanes: two output buffers and the packed LSE math per (KV head,
+    token), and the per-(token, q head) staging; plus m per lane. Packed-array
+    counts fit to gpt-oss DCP2/DCP8 compiles; fewer let the DCP8 chunk pass
+    (8 q over 8 KV heads, sinks) overflow VMEM."""
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    num_kv_heads = cfgs.model.num_kv_heads
+    q_heads = cfgs.aligned_num_q_heads_per_kv_head
+    num_packed = 8 if cfgs.model.has_attention_sink else 3
+    lse_rows = (2 + num_packed) * num_kv_heads + q_heads
+    per_token = lse_rows * num_lanes * 4
+    per_token += (
+        num_kv_heads * q_heads * num_lanes * jnp.dtype(cfgs.serve.dtype_out).itemsize
+    )
+    return per_token * cfgs.bq_sz * cfgs.batch_size
+
+
+def _spill_bytes(cfgs: configs.RpaConfigs) -> int:
+    """VMEM Mosaic adds on top of buffers and carries (register spills, temporaries).
+
+    Least-squares fit on tpu7x to Mosaic's reported usage of the v11 kernel over
+    ~150 tiles of 12 geometries (both KV layouts, fp8/bf16 KV, 1-16 KV heads,
+    sinks, windows); refit when the kernel's compute changes.
+    """
+    num_kv_heads = cfgs.model.num_kv_heads
+    if cfgs.mode == configs.RpaCase.DECODE:
+        spill = (48 << 10) * cfgs.batch_size * num_kv_heads
+        if (
+            cfgs.serve.kv_layout == configs.KVLayout.HEAD_ALONG_SUBLANE
+            and jnp.dtype(cfgs.serve.dtype_kv).itemsize == 1
+        ):
+            # Packed fp8 K is unpacked to a bf16 copy of the tile.
+            spill += int(
+                1.1
+                * cfgs.batch_size
+                * cfgs.bkv_sz
+                * num_kv_heads
+                * cfgs.aligned_kv_head_dim
+                * 2
+            )
+        return spill
+    q_rows = (
+        cfgs.batch_size
+        * num_kv_heads
+        * cfgs.bq_sz
+        * cfgs.aligned_num_q_heads_per_kv_head
+    )
+    rows_f32 = q_rows * cfgs.aligned_q_head_dim * 4
+    scores_f32 = q_rows * cfgs.bkv_sz * 4
+    if cfgs.use_transposed:
+        keys_bf16 = (
+            cfgs.batch_size * num_kv_heads * cfgs.bkv_sz * cfgs.aligned_q_head_dim * 2
+        )
+        spill = 0.48 * rows_f32 + 1.17 * keys_bf16 + 0.043 * scores_f32
+        if cfgs.model.sliding_window is not None:
+            # The window mask: about one f32 copy of a KV head's q-block scores.
+            spill += 0.91 * scores_f32 / num_kv_heads
+        return int(spill)
+    chunk_scores_f32 = scores_f32 // cfgs.bq_sz * cfgs.bq_c_sz
+    spill = (
+        1.41 * rows_f32
+        + 0.23 * scores_f32
+        + 0.83 * chunk_scores_f32
+        + 2.59 * chunk_scores_f32 / num_kv_heads
+    )
+    if cfgs.model.has_attention_sink:
+        spill += 0.78 * rows_f32
+    return int(spill)
+
 
 def calculate_block_sizes(
     model_cfgs: configs.ModelConfigs,
@@ -231,238 +325,23 @@ def calculate_block_sizes(
     num_lanes = tpu_info.num_lanes
     mxu_column_size = tpu_info.mxu_column_size
 
-    # Calculate aligned model dimensions.
-    aligned_head_dim = utils.align_to(model_cfgs.head_dim, num_lanes)
     aligned_num_q_heads_per_kv_head = utils.align_to(
         model_cfgs.num_q_heads_per_kv_head, serve_cfgs.packing_q
     )
-    aligned_num_q_heads = aligned_num_q_heads_per_kv_head * model_cfgs.num_kv_heads
-
-    bkv_stride = pl.cdiv(model_cfgs.num_kv_heads * 2, serve_cfgs.packing_kv)
-    if utils.has_bank_conflicts(bkv_stride):
-        bkv_stride += 1
-    aligned_num_kv_heads_x2 = bkv_stride * serve_cfgs.packing_kv
-
     q_bytes = jnp.dtype(serve_cfgs.dtype_q).itemsize
     kv_bytes = jnp.dtype(serve_cfgs.dtype_kv).itemsize
     out_bytes = jnp.dtype(serve_cfgs.dtype_out).itemsize
+    usable_vmem_bytes = vmem_limit_bytes - _VMEM_MARGIN_BYTES
 
-    def calculate_vmem_usage(
-        batch_size: int, n_buffer: int, bq_sz: int, bkv_sz: int
-    ) -> int:
-        """Given tile size, calculate VMEM usage of the kernel."""
-
-        # Step 1: Calculate buffer sizes.
-
-        # Calculate size bq & bkv arrays for a single buffer.
-        bq_array_size = bq_sz * aligned_num_q_heads * aligned_head_dim
-        if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-            bkv_array_size = (
-                (bkv_sz + 2 * serve_cfgs.page_size)
-                * aligned_num_kv_heads_x2
-                * aligned_head_dim
-            )
-        else:
-            bkv_array_size = bkv_sz * aligned_num_kv_heads_x2 * aligned_head_dim
-
-        # Get output buffer size as well - which has same size as query size.
-        bo_array_size = bq_array_size
-
-        # Convert to bytes.
-        bq_bytes = bq_array_size * q_bytes
-        bkv_bytes = bkv_array_size * kv_bytes
-        bo_bytes = bo_array_size * out_bytes
-
-        # Account for multiple buffers. For output, we always use double buffer.
-        bq_bytes *= n_buffer
-        bkv_bytes *= n_buffer
-        bo_bytes *= 2
-
-        # Sum up all buffer memory usage.
-        buffer_bytes = bq_bytes + bkv_bytes + bo_bytes
-        if serve_cfgs.return_lse:
-            # f32 rows of lanes: two output buffers and the packed LSE math per
-            # (KV head, token), and the per-(token, q head) staging; plus m per
-            # lane. Packed-array counts fit to gpt-oss DCP2/DCP8 compiles; fewer
-            # let the DCP8 chunk pass (8 q over 8 KV heads, sinks) overflow VMEM.
-            num_kv_heads = model_cfgs.num_kv_heads
-            num_packed = 8 if model_cfgs.has_attention_sink else 3
-            lse_rows = (2 + num_packed) * num_kv_heads + aligned_num_q_heads_per_kv_head
-            lse_bytes = lse_rows * num_lanes * 4
-            lse_bytes += (
-                num_kv_heads * aligned_num_q_heads_per_kv_head * num_lanes * out_bytes
-            )
-            buffer_bytes += lse_bytes * bq_sz
-
-        # Step 2: Calculate worst case memory usage during computation.
-
-        # Calculate the size of loaded bq and bkv size.
-        loaded_bq_size = bq_sz * model_cfgs.num_q_heads * aligned_head_dim
-        loaded_bkv_size = bkv_sz * model_cfgs.num_kv_heads * aligned_head_dim
-
-        # Calculate peak memory requirement of output - which is attention weight.
-        qk_size = bq_sz * bkv_sz * model_cfgs.num_q_heads
-
-        # Convert to bytes.
-        loaded_bq_bytes = loaded_bq_size * q_bytes
-        loaded_bkv_bytes = loaded_bkv_size * kv_bytes
-        qk_bytes = qk_size * out_bytes
-
-        # Sum up all compute memory usage.
-        compute_bytes = loaded_bq_bytes + loaded_bkv_bytes + qk_bytes
-
-        # Step 3: Sum up all memory usage.
-        total_bytes = buffer_bytes + compute_bytes
-
-        # Account for batch size.
-        total_bytes *= batch_size
-
-        # The m, l and acc carries: f32 scratch per KV head and (token, q head)
-        # row, a lane tile wide, shared by the batch. The transposed tile (one
-        # sequence per tile) keeps them as rows of lanes instead. Counted only for
-        # the ones_v / transposed tiles tuned with this term: elsewhere the estimate
-        # stays as measured (it over-counts the score tile by bq_sz / bq_c_sz).
-        if serve_cfgs.ones_v or serve_cfgs.transposed:
-            carry_rows = (
-                model_cfgs.num_kv_heads * bq_sz * aligned_num_q_heads_per_kv_head
-            )
-            carry_width = 3 * num_lanes
-            if serve_cfgs.transposed and batch_size == 1:
-                carry_width = aligned_head_dim // 2 + 3 * tpu_info.num_sublanes
-            total_bytes += carry_rows * carry_width * 4
-
-        return total_bytes
-
-    def calculate_compute_buffer_time(
-        batch_size: int, bq_c_sz: int, bkv_sz: int
-    ) -> int:
-        """Calculate computational complexity of a single compute block."""
-
-        num_k_rows = pl.cdiv(bkv_sz, mxu_column_size)
-        num_k_cols = pl.cdiv(model_cfgs.head_dim, mxu_column_size)
-        num_k = num_k_rows * num_k_cols
-        num_muls = bq_c_sz * num_k * model_cfgs.num_q_heads
-
-        return batch_size * num_muls
-
-    # Even if we loose some potential performance, we want to avoid OOM at all
-    # costs. Therefore, we conservatively only use 80% of the VMEM budget.
-    capped_vmem_limit_bytes = vmem_limit_bytes * 0.8
-
-    def fit_lanes_and_buffers(
-        batch_size: int, n_buffer: int, bq_sz: int, bkv_sz: int
-    ) -> tuple[int, int]:
-        # Lanes go first; fewer buffers is the last resort. Lanes stop at one,
-        # buffers at two: a single-buffered lookahead ref skips the pipeline's
-        # prologue fetch, so block 0 is never fetched and the kernel hangs.
-        while (
-            batch_size > 1
-            and calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
-            > capped_vmem_limit_bytes
-        ):
-            batch_size -= 1
-        while (
-            n_buffer > _MIN_N_BUFFER
-            and calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
-            > capped_vmem_limit_bytes
-        ):
-            n_buffer -= 1
-        if (
-            calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
-            > capped_vmem_limit_bytes
-        ):
-            raise ValueError(
-                f"Cannot fit a {bq_sz=}, {bkv_sz=} tile within 80% of"
-                f" {vmem_limit_bytes=}."
-            )
-        return batch_size, n_buffer
-
-    def find_best_block_sizes(
-        max_batch_size: int, max_n_buffer: int, fixed_bq_sz: int | None = None
-    ) -> configs.BlockSizes:
-        """Loop through different block sizes to find the most optimal one."""
-
-        bkv_sz = bkv_stride = mxu_column_size
-        if fixed_bq_sz is None:
-            bq_sz = bq_stride = bkv_sz
-        else:
-            bq_sz = fixed_bq_sz
-            bq_stride = 0
-        # Step 1: Lower batch_size and/or n_buffer if even the smallest bq and bkv
-        # size can trigger OOM.
-        batch_size, n_buffer = fit_lanes_and_buffers(
-            max_batch_size, max_n_buffer, bq_sz, bkv_sz
-        )
-
-        # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
-        while (
-            calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
-            < capped_vmem_limit_bytes
-        ):
-            # Unless bq is a fixed value, we want to ensure bq size is the same as bkv
-            # size. When using causal masking, if bq size is larger than bkv size,
-            # entire kv tile can be masked out for some query tokens. Similarly, if
-            # bkv size is larger than bq size, entire query tile can be masked out for
-            # some kv tokens.
-            bkv_sz += bkv_stride
-            bq_sz += bq_stride
-
-        # Rollback one step since the last attempted value triggered OOM.
-        bkv_sz -= bkv_stride
-        bq_sz -= bq_stride
-
-        # Indicates OOM was triggered from the starting bkv size.
-        if bkv_sz == 0:
-            raise ValueError("Cannot find block sizes that fit within VMEM limit.")
-
-        # When query-side buffers fill VMEM (e.g. 64 query heads on one chip under
-        # PP with TP=1), lockstep growth stops at its first step, bq_sz == bkv_sz
-        # == MXU width, with VMEM left over. Spend it on one more q block of keys
-        # (bkv_sz = 2 * bq_sz): each q block takes half the KV steps, and the causal
-        # diagonal still ends on a k block edge. Only full-attention layers with at
-        # least 8 q heads per KV head measured faster: with fewer, the bq_c_sz that
-        # Step 3 picks for the wider block slows bf16 KV, and a sliding window reads
-        # more keys outside the window. Wider ratios are not measured. Also skip the
-        # step when sequences in this pool are too short to fill the wider block,
-        # and when it is not a whole number of pages (cover_whole_pages would cut it
-        # after Step 3 picks bq_c_sz for it).
-        if (
-            fixed_bq_sz is None
-            and bq_sz == mxu_column_size
-            and model_cfgs.sliding_window is None
-            and model_cfgs.num_q_heads_per_kv_head >= 8
-        ):
-            grown_bkv_sz = 2 * bq_sz
-            if (
-                grown_bkv_sz <= serve_cfgs.pages_per_seq * serve_cfgs.page_size
-                and grown_bkv_sz % serve_cfgs.page_size == 0
-                and calculate_vmem_usage(batch_size, n_buffer, bq_sz, grown_bkv_sz)
-                < capped_vmem_limit_bytes
-            ):
-                bkv_sz = grown_bkv_sz
-
-        # Step 3: Given current tile size, calculate compute tile size.
-        if fixed_bq_sz is not None:
-            return configs.BlockSizes(
-                bq_sz=bq_sz,
-                bq_c_sz=bq_sz,
-                bkv_sz=bkv_sz,
-                batch_size=batch_size,
-                n_buffer=n_buffer,
-            )
-
-        # Fixed threshold value based on hardware spec.
+    def compute_chunk_size(batch_size: int, bq_sz: int, bkv_sz: int) -> int:
+        # Each compute sub-tile reshapes Q to (bq_c_sz * aligned q heads per KV
+        # head, head_dim): a power-of-2 divisor of bq_sz, at least a lane tile.
+        # Fixed threshold based on hardware spec.
         # TODO(kyuyeunk): Use different threshold based on hardware and precision.
         threshold = 1500
-        # In flash_attention, each compute sub-tile reshapes Q to
-        # (bq_c_sz * aligned_num_q_heads_per_kv_head, head_dim), so keep
-        # bq_c_sz a power-of-2 divisor >= 1 full sublane tile (num_lanes)
-        # where possible, and return the divisor that satisfies threshold
-        # rather than the previous divisor that exceeded it.
         min_bq_c_sz = min(bq_sz, max(1, num_lanes // aligned_num_q_heads_per_kv_head))
-        max_num_bq_c = min(bq_sz, 32)
         best_bq_c_sz = bq_sz
-        for num_bq_c in range(1, max_num_bq_c + 1):
+        for num_bq_c in range(1, min(bq_sz, 32) + 1):
             bq_c_sz, bq_c_rem = divmod(bq_sz, num_bq_c)
             if bq_c_rem != 0:
                 continue
@@ -473,15 +352,138 @@ def calculate_block_sizes(
             ):
                 continue
             best_bq_c_sz = bq_c_sz
-            if (
-                calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz) <= threshold
-                or bq_c_sz <= min_bq_c_sz
-            ):
+            num_muls = (
+                batch_size
+                * bq_c_sz
+                * pl.cdiv(bkv_sz, mxu_column_size)
+                * pl.cdiv(model_cfgs.head_dim, mxu_column_size)
+                * model_cfgs.num_q_heads
+            )
+            if num_muls <= threshold or bq_c_sz <= min_bq_c_sz:
                 break
+        return best_bq_c_sz
 
+    def calculate_vmem_usage(
+        batch_size: int, n_buffer: int, bq_sz: int, bkv_sz: int
+    ) -> int:
+        """VMEM of the tile as compiled: buffers, carries and spills."""
+        cfgs = configs.RpaConfigs(
+            block=configs.BlockSizes(
+                bq_sz=bq_sz,
+                bq_c_sz=compute_chunk_size(batch_size, bq_sz, bkv_sz),
+                bkv_sz=bkv_sz,
+                batch_size=batch_size,
+                n_buffer=n_buffer,
+            ),
+            model=model_cfgs,
+            serve=serve_cfgs,
+            # The search runs the decode kernel with one-token q blocks only.
+            mode=configs.RpaCase.DECODE if bq_sz == 1 else configs.RpaCase.MIXED,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
+        q_tile = math.prod(cfgs.q_vmem_shape)
+        total_bytes = n_buffer * q_tile * q_bytes + 2 * q_tile * out_bytes
+        total_bytes += n_buffer * math.prod(cfgs.kv_vmem_shape) * kv_bytes
+        total_bytes += _carry_bytes(cfgs) + _spill_bytes(cfgs)
+        if serve_cfgs.return_lse:
+            total_bytes += _lse_bytes(cfgs)
+        return total_bytes
+
+    def fits(batch_size: int, n_buffer: int, bq_sz: int, bkv_sz: int) -> bool:
+        return (
+            calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
+            <= usable_vmem_bytes
+        )
+
+    def fit_tile(
+        batch_size: int, n_buffer: int, bq_sz: int, bkv_sz: int, min_bq_sz: int
+    ) -> tuple[int, int, int]:
+        # Lanes first, then halve the q block, and fewer buffers last. Buffers stop
+        # at two: a single-buffered lookahead ref skips the pipeline's prologue
+        # fetch, so block 0 is never fetched and the kernel hangs.
+        while batch_size > 1 and not fits(batch_size, n_buffer, bq_sz, bkv_sz):
+            batch_size -= 1
+        while bq_sz > min_bq_sz and not fits(batch_size, n_buffer, bq_sz, bkv_sz):
+            bq_sz = max(min_bq_sz, bq_sz // 2)
+        while n_buffer > _MIN_N_BUFFER and not fits(
+            batch_size, n_buffer, bq_sz, bkv_sz
+        ):
+            n_buffer -= 1
+        if not fits(batch_size, n_buffer, bq_sz, bkv_sz):
+            raise ValueError(
+                f"Cannot fit a {bq_sz=}, {bkv_sz=} tile with {_MIN_N_BUFFER} buffers"
+                f" within {vmem_limit_bytes=} less {_VMEM_MARGIN_BYTES=}."
+            )
+        return batch_size, bq_sz, n_buffer
+
+    def find_best_block_sizes(
+        max_batch_size: int, max_n_buffer: int, fixed_bq_sz: int | None = None
+    ) -> configs.BlockSizes:
+        """Loop through different block sizes to find the most optimal one."""
+
+        bkv_sz = bkv_stride = mxu_column_size
+        if fixed_bq_sz is None:
+            bq_sz = bq_stride = bkv_sz
+            min_bq_sz = min(bq_sz, _MIN_SHRUNK_BQ_SZ)
+        else:
+            bq_sz = min_bq_sz = fixed_bq_sz
+            bq_stride = 0
+        # Step 1: Lower batch_size, then bq_sz, then n_buffer if even the smallest
+        # tile can trigger OOM.
+        batch_size, bq_sz, n_buffer = fit_tile(
+            max_batch_size, max_n_buffer, bq_sz, bkv_sz, min_bq_sz
+        )
+        if bq_sz != bkv_sz and fixed_bq_sz is None:
+            # A shrunk q block did not fit at the MXU width; keep it.
+            bq_stride = 0
+            bkv_stride = 0
+
+        # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
+        # Unless bq is a fixed value, we want to ensure bq size is the same as bkv
+        # size. When using causal masking, if bq size is larger than bkv size,
+        # entire kv tile can be masked out for some query tokens. Similarly, if
+        # bkv size is larger than bq size, entire query tile can be masked out for
+        # some kv tokens.
+        while (bq_stride or bkv_stride) and fits(
+            batch_size, n_buffer, bq_sz + bq_stride, bkv_sz + bkv_stride
+        ):
+            bkv_sz += bkv_stride
+            bq_sz += bq_stride
+
+        # When query-side buffers fill VMEM (e.g. 64 query heads on one chip under
+        # PP with TP=1), lockstep growth stops at its first step, or the q block
+        # shrinks, with VMEM left over. Spend it on one more k block (bkv_sz = 2 *
+        # MXU width): each q block takes half the KV steps, and the causal
+        # diagonal still ends on a k block edge. Only full-attention layers with at
+        # least 8 q heads per KV head measured faster: with fewer, the bq_c_sz that
+        # Step 3 picks for the wider block slows bf16 KV, and a sliding window reads
+        # more keys outside the window. Wider ratios are not measured. Also skip the
+        # step when sequences in this pool are too short to fill the wider block,
+        # and when it is not a whole number of pages (cover_whole_pages would cut it
+        # after Step 3 picks bq_c_sz for it).
+        if (
+            fixed_bq_sz is None
+            and bq_sz <= mxu_column_size
+            and bkv_sz == mxu_column_size
+            and model_cfgs.sliding_window is None
+            and model_cfgs.num_q_heads_per_kv_head >= 8
+        ):
+            grown_bkv_sz = 2 * bkv_sz
+            if (
+                grown_bkv_sz <= serve_cfgs.pages_per_seq * serve_cfgs.page_size
+                and grown_bkv_sz % serve_cfgs.page_size == 0
+                and fits(batch_size, n_buffer, bq_sz, grown_bkv_sz)
+            ):
+                bkv_sz = grown_bkv_sz
+
+        # Step 3: the compute tile; a fixed bq_sz is its own compute tile.
         return configs.BlockSizes(
             bq_sz=bq_sz,
-            bq_c_sz=best_bq_c_sz,
+            bq_c_sz=(
+                bq_sz
+                if fixed_bq_sz is not None
+                else compute_chunk_size(batch_size, bq_sz, bkv_sz)
+            ),
             bkv_sz=bkv_sz,
             batch_size=batch_size,
             n_buffer=n_buffer,
@@ -515,29 +517,24 @@ def calculate_block_sizes(
                 block_sizes, bkv_sz=block_sizes.bkv_sz // page * page
             )
         # Growing the k block to one page needs VMEM the search did not budget.
-        # Like the search, keep the buffers and halve the q block first; a mixed
-        # q block stops at 2 tokens, since the kernel reads bq_sz == 1 as decode.
-        min_bq_sz = min(block_sizes.bq_sz, 2)
-        bq_sz = block_sizes.bq_sz
-        while (
-            bq_sz > min_bq_sz
-            and calculate_vmem_usage(1, block_sizes.n_buffer, bq_sz, page)
-            > capped_vmem_limit_bytes
-        ):
-            bq_sz = max(min_bq_sz, bq_sz // 2)
+        # Refit like the search; a mixed q block stops at 2 tokens, since the
+        # kernel reads bq_sz == 1 as decode.
         try:
-            batch_size, n_buffer = fit_lanes_and_buffers(
-                block_sizes.batch_size, block_sizes.n_buffer, bq_sz, page
+            batch_size, bq_sz, n_buffer = fit_tile(
+                block_sizes.batch_size,
+                block_sizes.n_buffer,
+                block_sizes.bq_sz,
+                page,
+                min_bq_sz=min(block_sizes.bq_sz, 2),
             )
         except ValueError as e:
             raise ValueError(
                 f"A one-page k block ({page=}) does not fit within VMEM limit;"
                 " a smaller page size may."
             ) from e
-        return dataclasses.replace(
-            block_sizes,
+        return configs.BlockSizes(
             bq_sz=bq_sz,
-            bq_c_sz=math.gcd(block_sizes.bq_c_sz, bq_sz),
+            bq_c_sz=compute_chunk_size(batch_size, bq_sz, page),
             bkv_sz=page,
             batch_size=batch_size,
             n_buffer=n_buffer,
