@@ -4,12 +4,18 @@ Upstream keeps the PD decode prefix cache of sliding-window models such as
 GPT-OSS in HBM only. On TPU with TPU DMA HiCache, this module also offloads it
 to host RAM:
 
-- Only full-attention KV goes to RAM. Sliding-window (SWA) KV stays on device,
+- Full-attention KV goes to RAM. A request's own restore loads only full KV,
   and prefill sends each request's SWA window fresh.
 - Decode cache hits stop where the SWA window starts, so prefill always sends
   the window and the new tokens.
+- With the KV offload to decode DRAM switched on
+  (SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM), RAM also keeps the last
+  SWA window of each cached path. Victim recall serves it from RAM;
+  device-based prefix offers restore it before remote reads.
 - With a draft (EAGLE3, DFlash, or DSpark on the experimental worker), the draft
   KV goes to RAM together with the full-attention KV.
+- With the same switch on, a PD prefill's RAM also keeps only the last SWA
+  window of each path.
 
 For every raiden PD decode prefix cache, sliding-window or not, a request that
 reuses pages of an unfinished RAM restore waits for it. Restores that load only
@@ -17,7 +23,7 @@ auxiliary state (no KV pages) are not tracked.
 
 ``install()`` wraps a few upstream functions and registers a host stack
 strategy. Except for the restore hold, each behaves exactly like upstream unless
-the decode cache is one of these full-only caches.
+the decode cache is one of these caches.
 """
 
 from __future__ import annotations
@@ -55,6 +61,7 @@ from sglang.srt.mem_cache.pool_host import HostPoolGroup
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import CacheTransferPhase
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     select_tree_core_backend,
@@ -62,6 +69,7 @@ from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_disagg, get_memory
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode, HiCacheDraftPlan
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.tpu_dma_hicache import (
     is_tpu_dma_hicache_backend,
     tpu_dma_hicache_backends,
@@ -73,8 +81,17 @@ logger = logging.getLogger(__name__)
 
 # Set by install(), which runs once per scheduler process.
 _is_installed = False
-# Decode caches with a full-only host pool, added by the host stack builder.
+# Decode caches whose requests restore only full KV from RAM, added by the
+# host stack builder.
 _full_only_host_caches: weakref.WeakSet[UnifiedRadixCache] = weakref.WeakSet()
+# The subset that also keeps the last SWA window of each path in RAM.
+_window_host_caches: weakref.WeakSet[UnifiedRadixCache] = weakref.WeakSet()
+# PD prefill caches whose RAM keeps only the last SWA window of each path.
+_path_end_prefill_caches: weakref.WeakSet[UnifiedRadixCache] = weakref.WeakSet()
+# Set only while the prefix offer restores a window (swa_window_restore()). The
+# SWA load-back and the strict match run only then: a request's own restore
+# anchors at its window start, usually an SWA tombstone, which LOAD_BACK asserts on.
+_swa_window_restore = False
 # Raiden PD decode prefix caches whose requests wait for unfinished restores.
 _restore_gated_caches: weakref.WeakSet[UnifiedRadixCache] = weakref.WeakSet()
 # Owned by _build_kv_cache for the duration of one cache build. While set, the
@@ -90,14 +107,37 @@ _load_device_pages: weakref.WeakKeyDictionary[Any, dict[int, torch.Tensor]] = (
 )
 
 
+def keeps_swa_windows_in_host() -> bool:
+    """Whether host RAM also keeps the last SWA window of each path, on either
+    role: the KV offload to decode DRAM moves a branch with its window."""
+    return bool(tpu_envs.SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM.get())
+
+
 def uses_full_only_host_cache(tree_cache: Any) -> bool:
-    """Whether ``tree_cache`` is a decode cache that keeps only full KV in RAM."""
+    """Whether ``tree_cache`` is a decode cache whose requests restore only full KV."""
     return tree_cache in _full_only_host_caches
 
 
 def is_building_full_only_host_cache() -> bool:
     """Whether the current thread/process is building a full-only PD decode host stack."""
     return _is_building_full_only_host_cache
+
+
+def uses_window_host_cache(tree_cache: Any) -> bool:
+    """Whether ``tree_cache`` also keeps the last SWA window of each path in RAM."""
+    return tree_cache in _window_host_caches
+
+
+@contextlib.contextmanager
+def swa_window_restore() -> Iterator[None]:
+    """Match and load back SWA windows as upstream does, for this block only."""
+    global _swa_window_restore
+    assert not _swa_window_restore, "nested SWA window restore"
+    _swa_window_restore = True
+    try:
+        yield
+    finally:
+        _swa_window_restore = False
 
 
 @contextlib.contextmanager
@@ -176,6 +216,17 @@ def _validate_full_only_host_cache_config(
             ),
             "EAGLE3, DFlash and DSpark draft KV must use the HiCache draft sidecar",
         ),
+        # The victim push and the host recall move FULL and SWA pages only;
+        # load-back derives DRAFT/DRAFT_SWA reads from the same host slots, so a
+        # transferred prefix would feed untransferred draft bytes to the draft
+        # model. Refuse the combination until sidecars travel with the pages.
+        (
+            hicache_draft_plan is None
+            or not tpu_envs.SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM.get(),
+            "the KV offload to decode DRAM does not transfer HiCache draft "
+            "sidecars yet; run the draft without a sidecar or unset "
+            "SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM",
+        ),
         # A packed draft lives inside the full KV pool, which this build does
         # not lay out for.
         (
@@ -232,8 +283,13 @@ def _build_kv_cache(
         hicache_draft_plan=hicache_draft_plan,
     )
     logger.info(
-        "PD decode SWA HiCache: the host pool holds full-attention KV only, "
-        "the SWA window of every request comes from prefill."
+        "PD decode SWA HiCache: requests restore full-attention KV from RAM, "
+        "their SWA window comes from prefill%s.",
+        (
+            "; host RAM keeps the last window of each path"
+            if keeps_swa_windows_in_host()
+            else ""
+        ),
     )
     # Upstream rejects decode SWA radix + HiCache before it builds the tree.
     # _create_tree_cache turns HiCache back on for this build.
@@ -247,6 +303,7 @@ def _create_tree_cache(upstream: Callable, ctx: TreeCacheBuildContext):
     if not _is_building_full_only_host_cache:
         cache = upstream(ctx)
         _gate_decode_restores(cache)
+        _maybe_enable_prefill_path_end_backup(cache)
         return cache
     draft_plan = _building_draft_plan
     # The match policy below is implemented for the Python tree core only.
@@ -280,17 +337,54 @@ def _create_tree_cache(upstream: Callable, ctx: TreeCacheBuildContext):
     return cache
 
 
-def _build_full_only_host_stack(
+def _create_cache_controller(
     *,
-    cache: UnifiedRadixCache,
-    kvcache: Any,
     params: Any,
+    host_pool_group: HostPoolGroup,
+    transfer_layer_id_max: int,
     load_cache_event: Any,
     storage_backend: Optional[str],
     storage_backend_extra_config: Optional[dict],
     prefetch_threshold: int,
     model_name: Optional[str],
     enable_storage_metrics: bool,
+) -> HybridCacheController:
+    memory = get_memory()
+    return HybridCacheController.create_for_backend(
+        params.token_to_kv_pool_allocator,
+        host_pool_group,
+        params.page_size,
+        params.tp_cache_group,
+        load_cache_event=load_cache_event,
+        attn_cp_group=params.attn_cp_cache_group,
+        attn_tp_group=params.attn_tp_cache_group,
+        pp_group=params.pp_cache_group,
+        write_policy=memory.hicache_write_policy,
+        io_backend=memory.hicache_io_backend,
+        storage_backend=storage_backend,
+        prefetch_threshold=prefetch_threshold,
+        model_name=model_name,
+        storage_backend_extra_config=storage_backend_extra_config,
+        transfer_layer_id_max=transfer_layer_id_max,
+        enable_storage_metrics=enable_storage_metrics,
+        host_memory_mode=memory.hicache_host_memory_mode,
+    )
+
+
+def _register_decode_host_cache(
+    cache: UnifiedRadixCache, cache_controller: HybridCacheController
+) -> None:
+    _full_only_host_caches.add(cache)
+    _restore_gated_caches.add(cache)
+    _load_device_pages[cache_controller] = {}
+
+
+def _build_full_only_host_stack(
+    *,
+    cache: UnifiedRadixCache,
+    kvcache: Any,
+    params: Any,
+    **controller_kwargs,
 ) -> hybrid_pool_assembler.StackBuildResult:
     """Build the RAM pool and its controller for full-attention KV only.
 
@@ -332,28 +426,13 @@ def _build_full_only_host_stack(
             )
         ]
     )
-    cache_controller = HybridCacheController.create_for_backend(
-        params.token_to_kv_pool_allocator,
-        host_pool_group,
-        params.page_size,
-        params.tp_cache_group,
-        load_cache_event=load_cache_event,
-        attn_cp_group=params.attn_cp_cache_group,
-        attn_tp_group=params.attn_tp_cache_group,
-        pp_group=params.pp_cache_group,
-        write_policy=memory.hicache_write_policy,
-        io_backend=memory.hicache_io_backend,
-        storage_backend=storage_backend,
-        prefetch_threshold=prefetch_threshold,
-        model_name=model_name,
-        storage_backend_extra_config=storage_backend_extra_config,
+    cache_controller = _create_cache_controller(
+        params=params,
+        host_pool_group=host_pool_group,
         transfer_layer_id_max=transfer_layer_id_max,
-        enable_storage_metrics=enable_storage_metrics,
-        host_memory_mode=memory.hicache_host_memory_mode,
+        **controller_kwargs,
     )
-    _full_only_host_caches.add(cache)
-    _restore_gated_caches.add(cache)
-    _load_device_pages[cache_controller] = {}
+    _register_decode_host_cache(cache, cache_controller)
     return hybrid_pool_assembler.StackBuildResult(
         host_pool_group=host_pool_group,
         cache_controller=cache_controller,
@@ -362,8 +441,80 @@ def _build_full_only_host_stack(
     )
 
 
+def _build_full_swa_host_stack(
+    *,
+    cache: UnifiedRadixCache,
+    kvcache: Any,
+    params: Any,
+    **controller_kwargs,
+) -> hybrid_pool_assembler.StackBuildResult:
+    """Build the full pool plus an SWA pool for the last window of each path,
+    both sized as upstream sizes a hybrid host stack (``--hicache-ratio``, or
+    ``--hicache-size`` split by device bytes), with the callbacks upstream's
+    SWA strategy uses. The controller is this module's, so the group is built
+    directly."""
+    assert not params.mtp_draft_device_pools, "packed MTP draft KV is not supported"
+    full_layer_mapping, swa_layer_mapping = hybrid_pool_assembler._swa_layer_mappings(
+        kvcache
+    )
+    transfer_layer_id_max = (
+        max(full_layer_mapping.keys() | swa_layer_mapping.keys()) + 1
+    )
+    allocator = params.token_to_kv_pool_allocator
+    memory = get_memory()
+    kv_host_size = swa_host_size = None
+    if (
+        memory.hicache_size > 0
+        and not hybrid_pool_assembler._uses_unified_page_envelope_host(
+            kvcache.full_kv_pool, kvcache.swa_kv_pool, False, ()
+        )
+    ):
+        kv_host_size, swa_host_size = hybrid_pool_assembler._split_hicache_size(
+            memory.hicache_size, (kvcache.full_kv_pool, kvcache.swa_kv_pool)
+        )
+    enable_unified_memory = memory.enable_unified_memory
+    host_pool_group = hybrid_pool_assembler.build_hybrid_swa_group(
+        page_size=params.page_size,
+        full_kv_pool=kvcache.full_kv_pool,
+        swa_kv_pool=kvcache.swa_kv_pool,
+        full_layer_mapping=full_layer_mapping,
+        swa_layer_mapping=swa_layer_mapping,
+        use_mla=False,
+        kv_host_size=kv_host_size,
+        swa_host_size=swa_host_size,
+        host_full_evict_fn=lambda n: cache.evict_host(n, ComponentType.FULL),
+        host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
+        device_swa_evict_fn=lambda n: hybrid_pool_assembler._evict_swa_for_device_alloc(
+            cache, n
+        ),
+        swa_attn_allocator=allocator.swa_attn_allocator,
+        swa_indices_from_anchor_fn=(
+            allocator.bind_swa_for_loaded_rows if enable_unified_memory else None
+        ),
+        swa_free_from_anchor_fn=allocator.free_swa if enable_unified_memory else None,
+    )
+    cache_controller = _create_cache_controller(
+        params=params,
+        host_pool_group=host_pool_group,
+        transfer_layer_id_max=transfer_layer_id_max,
+        **controller_kwargs,
+    )
+    _register_decode_host_cache(cache, cache_controller)
+    _window_host_caches.add(cache)
+    return hybrid_pool_assembler.StackBuildResult(
+        host_pool_group=host_pool_group,
+        cache_controller=cache_controller,
+        component_host_pools={
+            ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
+            ComponentType.SWA: host_pool_group.get_pool(PoolName.SWA),
+        },
+        pools_desc="Full + SWA (path-end windows)",
+    )
+
+
 class _FullOnlySwaStrategy(hybrid_pool_assembler.StackStrategy):
-    """Host stack of a full-only decode cache: full-attention KV only.
+    """Host stack of a full-only decode cache: full-attention KV, plus the last
+    SWA window of each path with the KV offload to decode DRAM on.
 
     ``install()`` registers it ahead of the built-in strategies. It matches only
     while ``_build_kv_cache`` builds a full-only cache, so every other cache keeps
@@ -392,16 +543,20 @@ class _FullOnlySwaStrategy(hybrid_pool_assembler.StackStrategy):
         model_name: Optional[str] = None,
         enable_storage_metrics: bool = False,
     ) -> hybrid_pool_assembler.StackBuildResult:
-        return _build_full_only_host_stack(
-            cache=cache,
-            kvcache=kvcache,
-            params=params,
+        controller_kwargs = dict(
             load_cache_event=load_cache_event,
             storage_backend=storage_backend,
             storage_backend_extra_config=storage_backend_extra_config,
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
             enable_storage_metrics=enable_storage_metrics,
+        )
+        if not keeps_swa_windows_in_host():
+            return _build_full_only_host_stack(
+                cache=cache, kvcache=kvcache, params=params, **controller_kwargs
+            )
+        return _build_full_swa_host_stack(
+            cache=cache, kvcache=kvcache, params=params, **controller_kwargs
         )
 
 
@@ -416,8 +571,11 @@ _FULL_ONLY_SWA_STRATEGY = _FullOnlySwaStrategy()
 def _create_swa_match_validator(
     upstream: Callable, component: SWAComponent, match_device_only: bool = False
 ) -> Callable:
-    """Wraps ``SWAComponent.create_match_validator``: SWA KV does not limit a match."""
-    if not uses_full_only_host_cache(component.cache):
+    """Wraps ``SWAComponent.create_match_validator``: SWA KV does not limit a match,
+    except in a window restore."""
+    if not uses_full_only_host_cache(component.cache) or (
+        _swa_window_restore and uses_window_host_cache(component.cache)
+    ):
         return upstream(component, match_device_only)
     component_type = component.component_type
 
@@ -435,6 +593,35 @@ def _create_swa_match_validator(
         return node.backuped or not node.evicted
 
     return validator
+
+
+def _finalize_swa_match_result(
+    upstream: Callable, component: SWAComponent, *args, **kwargs
+):
+    """Wraps ``SWAComponent.finalize_match_result_in_tree_core``: report no SWA
+    host hit outside a window restore, which alone loads SWA KV back."""
+    result = upstream(component, *args, **kwargs)
+    if _swa_window_restore or not uses_window_host_cache(component.cache):
+        return result
+    return result._replace(swa_host_hit_length=0)
+
+
+def _build_swa_hicache_transfers(
+    upstream: Callable,
+    component: SWAComponent,
+    node: Any,
+    phase: CacheTransferPhase,
+    **kwargs,
+):
+    """Wraps ``SWAComponent.build_hicache_transfers``: no SWA load-back outside a
+    window restore."""
+    if (
+        phase == CacheTransferPhase.LOAD_BACK
+        and not _swa_window_restore
+        and uses_window_host_cache(component.cache)
+    ):
+        return None
+    return upstream(component, node, phase, **kwargs)
 
 
 def _match_prefix_and_lock(
@@ -460,6 +647,87 @@ def _match_prefix_and_lock(
         result.last_device_node
     ).to_dec_params()
     return queue._build_decode_prefix_match(req, result)
+
+
+# ---------------------------------------------------------------------------
+# Host SWA windows
+# ---------------------------------------------------------------------------
+
+
+def _collect_unbacked_swa_nodes(
+    upstream: Callable, component: SWAComponent, node: Any
+) -> list:
+    """Wraps ``SWAComponent._collect_unbacked_swa_nodes``: back up SWA KV only
+    in the last window of a path.
+
+    A node is in it when it is a leaf, or when live SWA KV leads from it down
+    to a leaf in fewer than a window of tokens. Any other node's window is
+    stale, so eviction tombstones it without a copy.
+    """
+    tree_core = component.tree_core
+    cache = component.cache
+    if (
+        not (uses_window_host_cache(cache) or cache in _path_end_prefill_caches)
+        or not tree_core.has_swa_host_pool
+        or tree_core.is_host_memory_buffer_only
+    ):
+        return upstream(component, node)
+    window = component.sliding_window_size
+    tail = _live_swa_tail_to_leaf(
+        node, component_type=component.component_type, window=window
+    )
+    if tail is None:
+        return []
+    return _unbacked_swa_nodes_within(
+        node,
+        component_type=component.component_type,
+        root=tree_core.root_node,
+        num_tokens=window - tail,
+    )
+
+
+def _live_swa_tail_to_leaf(
+    node: Any, *, component_type: ComponentType, window: int
+) -> Optional[int]:
+    """Fewest tokens below ``node`` on a live-SWA path to a leaf, or None when
+    every such path is a window or longer."""
+    best: Optional[int] = None
+    stack = [(node, 0)]
+    while stack:
+        cur, below = stack.pop()
+        if not cur.children:
+            best = below if best is None else min(best, below)
+            continue
+        for child in cur.children.values():
+            child_below = below + len(child.key)
+            if (
+                child.component_data[component_type].value is not None
+                and child_below < window
+            ):
+                stack.append((child, child_below))
+    return best
+
+
+def _unbacked_swa_nodes_within(
+    node: Any, *, component_type: ComponentType, root: Any, num_tokens: int
+) -> list:
+    """Device-only SWA nodes in the ``num_tokens`` ending at ``node``, deepest
+    first. Same walk as upstream's window collection, with a shorter span."""
+    covered = 0
+    unbacked = []
+    cur = node
+    while cur is not root and covered < num_tokens:
+        if cur.write_through_pending_id is not None:
+            break
+        data = cur.component_data[component_type]
+        value = data.value if data.value is not None else data.host_value
+        if value is None:
+            break
+        covered += len(value)
+        if data.value is not None and data.host_value is None:
+            unbacked.append(cur)
+        cur = cur.parent
+    return unbacked
 
 
 # ---------------------------------------------------------------------------
@@ -570,6 +838,28 @@ def _gate_decode_restores(cache: Any) -> None:
         _load_device_pages[cache.cache_controller] = {}
 
 
+def _maybe_enable_prefill_path_end_backup(cache: Any) -> None:
+    """Register a hybrid PD prefill cache for path-end-only SWA backup; a cache
+    without an SWA component (a full-attention model) is left alone."""
+    if (
+        not keeps_swa_windows_in_host()
+        or get_disagg().disaggregation_mode != "prefill"
+        or not isinstance(cache, UnifiedRadixCache)
+        or ComponentType.SWA not in cache.components
+    ):
+        return
+    if not cache.tree_core.has_swa_host_pool:
+        logger.warning(
+            "the KV offload to decode DRAM cannot keep SWA windows on this "
+            "prefill: its cache has no host SWA pool."
+        )
+        return
+    _path_end_prefill_caches.add(cache)
+    logger.info(
+        "PD prefill SWA HiCache: host RAM keeps only the last SWA window of each path."
+    )
+
+
 def _controller_load(
     upstream: Callable,
     controller: TpuDMAHybridCacheController,
@@ -675,6 +965,21 @@ def _patch_targets() -> tuple[tuple[Any, str, Callable], ...]:
         # Decode never reads SWA KV from its cache, so missing SWA KV must not
         # end a match of full-attention KV.
         (SWAComponent, "create_match_validator", _create_swa_match_validator),
+        # A request's own restore loads only full KV: no SWA host hit and no
+        # SWA load-back outside a window restore.
+        (
+            SWAComponent,
+            "finalize_match_result_in_tree_core",
+            _finalize_swa_match_result,
+        ),
+        (SWAComponent, "build_hicache_transfers", _build_swa_hicache_transfers),
+        # Host RAM keeps only the last SWA window of each path, on a decode
+        # with host windows and an opted-in prefill.
+        (
+            SWAComponent,
+            "_collect_unbacked_swa_nodes",
+            _collect_unbacked_swa_nodes,
+        ),
         # Stop decode cache hits where the SWA window starts, so prefill always
         # sends the window.
         (DecodePreallocQueue, "_match_prefix_and_lock", _match_prefix_and_lock),
