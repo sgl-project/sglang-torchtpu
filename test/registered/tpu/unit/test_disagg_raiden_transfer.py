@@ -1043,15 +1043,15 @@ class TestRaidenStateEngine(RaidenRendezvousTestCase):
         self.assertEqual(m._pulling.state_capacity, 20)
 
     def test_each_rank_reserves_six_ports(self):
-        """Full, SWA and state engines at +0/+2/+4 of base + 6*local_rank."""
+        """Full, SWA, state, and draft engines reserve PORTS_PER_RANK (10) ports per rank."""
         m, built = self._build(attn_tp_rank=1, swa=True, state=True)
-        self.assertEqual(m._control_port, 32006)
+        self.assertEqual(m._control_port, 32010)
         self.assertEqual(
-            [kw["local_control_port"] for kw in built], [32006, 32008, 32010]
+            [kw["local_control_port"] for kw in built], [32010, 32012, 32014]
         )
-        self.assertEqual(m.raiden_endpoint, "127.0.0.1:32006")
-        self.assertEqual(m.swa_raiden_endpoint, "127.0.0.1:32008")
-        self.assertEqual(m.state_raiden_endpoint, "127.0.0.1:32010")
+        self.assertEqual(m.raiden_endpoint, "127.0.0.1:32010")
+        self.assertEqual(m.swa_raiden_endpoint, "127.0.0.1:32012")
+        self.assertEqual(m.state_raiden_endpoint, "127.0.0.1:32014")
 
 
 class TestRaidenBlockMajorEngine(RaidenRendezvousTestCase):

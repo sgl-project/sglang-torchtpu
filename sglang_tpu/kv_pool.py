@@ -978,6 +978,8 @@ class TpuBlockMajorMHATokenToKVPool(TpuFusedMHATokenToKVPool):
         self._synchronize_device()
 
     def get_contiguous_buf_infos(self):
+        if self.layer_num == 0:
+            return [], [], []
         # One item = one block's bundle row, every layer included.
         return (
             [self.kv_bundle.data_ptr()],

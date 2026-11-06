@@ -46,10 +46,12 @@ logger = logging.getLogger("sglang_tpu.disaggregation.raiden.conn")
 # pieces of this size keep the overlap while costing a few reads per request.
 CHUNK_ANNOUNCE_TOKENS = 8192
 
-# Ports each rank reserves: control+data for the full, SWA and GDN state engines.
-PORTS_PER_RANK = 6
+# Ports each rank reserves: control+data for full, SWA, state, draft_full, draft_swa.
+PORTS_PER_RANK = 10
 SWA_PORT_OFFSET = 2
 STATE_PORT_OFFSET = 4
+DRAFT_FULL_PORT_OFFSET = 6
+DRAFT_SWA_PORT_OFFSET = 8
 
 # Base of the per-rank control ports (`base + 6*local_rank`). Not 30000: that
 # puts rank 0 on the default HTTP serving port, and the engine wins the bind --
@@ -99,6 +101,10 @@ class RaidenKVCacheGroups:
     write_state_meta: Optional[Callable[[Sequence[int], bytes], None]] = None
     # Shared-buffer Full+SWA pool: SWA rides on the single full engine via companion pages.
     unified_swa_pool: Optional[TpuUnifiedSWAKVPool] = None
+    # Separate draft KV tensor groups when the target uses TpuUnifiedSWAKVPool.
+    draft_full: List[Any] = field(default_factory=list)
+    draft_swa: List[Any] = field(default_factory=list)
+    draft_swa_sidecar: Optional[Any] = None
     # True when any KV pool uses the 5D token-minor SEQ_ALONG_LANE layout.
     seq_along_lane: bool = False
 
@@ -142,8 +148,11 @@ def _block_major_groups(pool: KVCache) -> Optional[RaidenKVCacheGroups]:
     strided per-layer ``kv_buffer`` views are never registered.
     """
     if isinstance(pool, TpuBlockMajorMHATokenToKVPool):
+        has_layers = pool.layer_num > 0
         groups = RaidenKVCacheGroups(
-            full=pool.page_buffers(), swa=[], full_layer_ids=[pool.start_layer]
+            full=pool.page_buffers() if has_layers else [],
+            swa=[],
+            full_layer_ids=[pool.start_layer] if has_layers else [],
         )
     elif isinstance(pool, SWAKVPool) and isinstance(
         pool.full_kv_pool, TpuBlockMajorMHATokenToKVPool
@@ -152,8 +161,8 @@ def _block_major_groups(pool: KVCache) -> Optional[RaidenKVCacheGroups]:
         full_ids = sorted(layer for layer, (_, swa) in mapping.items() if not swa)
         swa_ids = sorted(layer for layer, (_, swa) in mapping.items() if swa)
         groups = RaidenKVCacheGroups(
-            full=pool.full_kv_pool.page_buffers(),
-            swa=pool.swa_kv_pool.page_buffers(),
+            full=pool.full_kv_pool.page_buffers() if full_ids else [],
+            swa=pool.swa_kv_pool.page_buffers() if swa_ids else [],
             full_layer_ids=full_ids[:1],
             swa_layer_ids=swa_ids[:1],
         )
@@ -279,13 +288,26 @@ def get_raiden_kv_caches(
     num_draft_full = num_draft_swa = num_hidden_full = 0
     draft_kv_head_num: Optional[int] = None
     draft_swa_kv_head_num: Optional[int] = None
+    draft_full: List[Any] = []
+    draft_swa: List[Any] = []
+    draft_swa_sidecar: Optional[Any] = None
     if draft_pool is not None and draft_pool is not pool:
         draft_groups = group_one(draft_pool)
-        num_draft_full, num_draft_swa = len(draft_groups.full), len(draft_groups.swa)
-        full.extend(draft_groups.full)
-        swa.extend(draft_groups.swa)
-        full_ids.extend(draft_groups.full_layer_ids)
-        swa_ids.extend(draft_groups.swa_layer_ids)
+        if groups.unified_swa_pool is not None:
+            draft_full = list(draft_groups.full)
+            draft_swa = list(draft_groups.swa)
+            draft_swa_sidecar = getattr(pool, "_draft_swa_sidecar", None)
+            _assert_root_buffers("unified draft full KV", draft_full)
+            _assert_root_buffers("unified draft SWA KV", draft_swa)
+        else:
+            num_draft_full, num_draft_swa = (
+                len(draft_groups.full),
+                len(draft_groups.swa),
+            )
+            full.extend(draft_groups.full)
+            swa.extend(draft_groups.swa)
+            full_ids.extend(draft_groups.full_layer_ids)
+            swa_ids.extend(draft_groups.swa_layer_ids)
         full_draft_pool = getattr(draft_pool, "full_kv_pool", draft_pool)
         swa_draft_pool = getattr(draft_pool, "swa_kv_pool", draft_pool)
         draft_kv_head_num = getattr(full_draft_pool, "head_num", None)
@@ -320,7 +342,13 @@ def get_raiden_kv_caches(
         state = pool.mamba_pool.get_state()
         committed_state_row = pool.mamba_pool.committed_row
 
-    for name, group in (("full KV", full), ("SWA KV", swa), ("GDN state", state)):
+    for name, group in (
+        ("full KV", full),
+        ("SWA KV", swa),
+        ("GDN state", state),
+        ("unified draft full KV", draft_full),
+        ("unified draft SWA KV", draft_swa),
+    ):
         block_counts = {int(buf.shape[0]) for buf in group}
         if len(block_counts) > 1:
             raise RuntimeError(
@@ -344,5 +372,8 @@ def get_raiden_kv_caches(
         read_state_meta=read_state_meta,
         write_state_meta=write_state_meta,
         unified_swa_pool=groups.unified_swa_pool,
+        draft_full=draft_full,
+        draft_swa=draft_swa,
+        draft_swa_sidecar=draft_swa_sidecar,
         seq_along_lane=seq_along_lane,
     )

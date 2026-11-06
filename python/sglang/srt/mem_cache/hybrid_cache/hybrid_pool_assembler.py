@@ -1586,7 +1586,10 @@ def build_swa_draft_pools(
         return [], []
     controller = tree_cache.cache_controller
     host_pool_group = controller.mem_pool_host
-    target_swa_host_pool = host_pool_group.entry_map[PoolName.SWA].host_pool
+    swa_entry = host_pool_group.entry_map.get(PoolName.SWA)
+    if swa_entry is None:
+        return [], []
+    target_swa_host_pool = swa_entry.host_pool
 
     if isinstance(target_swa_host_pool, DeepSeekV4PagedHostPool):
         _require_single_row_dsv4_swa_pages(
@@ -1636,9 +1639,28 @@ def build_hicache_draft_sidecars(
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Compose the full and SWA draft-sidecar paths."""
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
     assert len(draft_device_pools) == 1
     draft_kv_pool = draft_device_pools[0]
+    if isinstance(draft_kv_pool, SWAKVPool):
+        specs: list[SidecarPoolSpec] = []
+        entries: list[PoolEntry] = []
+        if draft_kv_pool.full_kv_pool.layer_num > 0:
+            f_specs, f_entries = build_full_draft_pools(
+                draft_kv_pool=draft_kv_pool.full_kv_pool,
+                tree_cache=tree_cache,
+            )
+            specs.extend(f_specs)
+            entries.extend(f_entries)
+        if draft_kv_pool.swa_kv_pool.layer_num > 0:
+            s_specs, s_entries = build_swa_draft_pools(
+                draft_kv_pool=draft_kv_pool,
+                tree_cache=tree_cache,
+            )
+            specs.extend(s_specs)
+            entries.extend(s_entries)
+        return specs, entries
     builder = (
         build_swa_draft_pools
         if isinstance(draft_kv_pool, BaseSWAKVPool)

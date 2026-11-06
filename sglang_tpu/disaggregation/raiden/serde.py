@@ -96,6 +96,10 @@ class Blocks(WireMessage):
     # Optional opaque host state metadata (e.g., DSV4 ring shifts).
     state_meta: bytes = b""
     kv_layout: str = PER_LAYER_KV_LAYOUT
+    # Optional unified-target speculative draft endpoints and SWA page ids.
+    draft_full_endpoint: str = ""
+    draft_swa_blocks: list[int] = msgspec.field(default_factory=list)
+    draft_swa_endpoint: str = ""
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")

@@ -212,6 +212,7 @@ class RaidenSenderMixin:
         block_ids: List[int],
         swa_block_ids: Optional[List[int]] = None,
         state_block_ids: Optional[List[int]] = None,
+        draft_swa_block_ids: Optional[List[int]] = None,
     ) -> Optional[int]:
         """Records a chunk's pages and returns its start index in the request.
 
@@ -231,6 +232,10 @@ class RaidenSenderMixin:
                 listed.update(block_ids)
                 if swa_block_ids is not None:
                     self._prefill.send_swa_blocks[room] = list(swa_block_ids)
+                if draft_swa_block_ids is not None:
+                    self._prefill.send_draft_swa_blocks[room] = list(
+                        draft_swa_block_ids
+                    )
                 if state_block_ids is not None:
                     self._prefill.send_state_rows[room] = list(state_block_ids)
                 return start
@@ -626,10 +631,15 @@ class RaidenSenderMixin:
                     self._state_engine is not None
                     and room not in self._prefill.send_state_rows
                 )
+                or (
+                    self._draft_swa_engine is not None
+                    and room not in self._prefill.send_draft_swa_blocks
+                )
                 or room not in self._prefill.decode_addr
             ):
                 return
             swa_blocks = list(self._prefill.send_swa_blocks.get(room, []))
+            draft_swa_blocks = list(self._prefill.send_draft_swa_blocks.get(room, []))
             state_rows = list(self._prefill.send_state_rows.get(room, []))
             blocks = list(self._prefill.send_blocks[room])
             addr = self._prefill.decode_addr[room]
@@ -642,6 +652,21 @@ class RaidenSenderMixin:
         # unread blocks from leaking leases until deadline timeout.
         read_blocks = whole_pull_registration(blocks, decode_pages)
         swa_read_blocks = whole_pull_registration(swa_blocks, decode_swa_pages)
+        draft_full_read_blocks = (
+            whole_pull_registration(blocks, decode_pages)
+            if self._draft_full_engine is not None
+            else []
+        )
+        decode_draft_swa_pages = (
+            decode_swa_pages // self._unified_swa_pool.layout.num_swa_groups
+            if self._unified_swa_pool is not None
+            else decode_swa_pages
+        )
+        draft_swa_read_blocks = (
+            whole_pull_registration(draft_swa_blocks, decode_draft_swa_pages)
+            if self._draft_swa_engine is not None
+            else []
+        )
         if self._unified_swa_pool is not None:
             read_blocks = read_blocks + swa_read_blocks
             swa_read_blocks = []
@@ -668,6 +693,22 @@ class RaidenSenderMixin:
                     room,
                     swa_read_blocks,
                 )
+            if self._draft_full_engine is not None and draft_full_read_blocks:
+                self._register_sender_read(
+                    room,
+                    self._draft_full_engine,
+                    self._draft_full_req_id(room),
+                    room,
+                    draft_full_read_blocks,
+                )
+            if self._draft_swa_engine is not None and draft_swa_read_blocks:
+                self._register_sender_read(
+                    room,
+                    self._draft_swa_engine,
+                    self._draft_swa_req_id(room),
+                    room,
+                    draft_swa_read_blocks,
+                )
             if read_blocks:
                 self._register_sender_read(
                     room, self._ensure_engine(), str(room), room, read_blocks
@@ -689,6 +730,9 @@ class RaidenSenderMixin:
                 state_endpoint=self.state_raiden_endpoint or "",
                 state_meta=state_meta,
                 kv_layout=self.kv_layout,
+                draft_full_endpoint=self.draft_full_raiden_endpoint or "",
+                draft_swa_blocks=draft_swa_blocks,
+                draft_swa_endpoint=self.draft_swa_raiden_endpoint or "",
             ).to_frames()
             try:
                 self._send_multipart_locked(endpoint, payload)
@@ -712,12 +756,22 @@ class RaidenSenderMixin:
                 self._completed_send.add(str(room))
             if self._swa_engine is not None and not swa_read_blocks:
                 self._completed_send.add(self._swa_req_id(room))
+            if self._draft_full_engine is not None and not draft_full_read_blocks:
+                self._completed_send.add(self._draft_full_req_id(room))
+            if self._draft_swa_engine is not None and not draft_swa_read_blocks:
+                self._completed_send.add(self._draft_swa_req_id(room))
 
     def _on_reshard_req(self, msg: List[bytes]) -> None:
         if self._state_engine is not None:
             raise NotImplementedError(
                 "Raiden push resharding does not move GDN (linear-attention) "
                 "state yet; use equal attention TP on prefill and decode."
+            )
+        if self._draft_full_engine is not None or self._draft_swa_engine is not None:
+            raise NotImplementedError(
+                "Raiden push resharding does not support speculative draft KV "
+                "over TpuUnifiedSWAKVPool yet; use equal attention TP on "
+                "prefill and decode."
             )
         req = ReshardReq.from_frames(msg)
         if self._bounded_staging:
@@ -1360,6 +1414,11 @@ class RaidenKVSender(CommonKVSender):
             if state_indices is not None
             else None
         )
+        draft_swa_blocks = (
+            self.kv_mgr._draft_swa_blocks_from_state_indices(state_indices)
+            if state_indices is not None
+            else None
+        )
         state_rows = (
             self.kv_mgr._state_rows_from_state_indices(state_indices)
             if state_indices is not None
@@ -1371,6 +1430,7 @@ class RaidenKVSender(CommonKVSender):
             blocks,
             swa_block_ids=swa_blocks,
             state_block_ids=state_rows,
+            draft_swa_block_ids=draft_swa_blocks,
         )
         if start is None:
             return  # aborted while this chunk was being computed
