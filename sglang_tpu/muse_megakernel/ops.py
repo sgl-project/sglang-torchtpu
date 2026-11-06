@@ -841,7 +841,10 @@ class MuseMegakernel(torch.nn.Module):
                 if (
                     tiled
                     and base_cfg.tiled_vmem_y >= 1
-                    and slots <= _TILED_VY_MIN_SLOTS
+                    and slots
+                    <= _dev_int(
+                        "SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_SLOTS", _TILED_VY_MIN_SLOTS
+                    )
                 ):
                     continue
                 cand = msgspec.structs.replace(
