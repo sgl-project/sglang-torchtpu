@@ -294,6 +294,7 @@ class RaidenReceiverMixin:
             decode_port=self.rank_port,
             decode_pages=len(local_blocks),
             decode_swa_pages=len(local_swa_blocks),
+            kv_offload=self.dram_offload_channel is not None,
         ).to_frames()
         for info in bootstrap_infos:
             endpoint = _tcp_endpoint(ip=info["rank_ip"], port=info["rank_port"])
