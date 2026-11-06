@@ -66,6 +66,7 @@ from sglang_tpu.disaggregation.raiden.common import (
     kv_layout_of,
     logger,
 )
+from sglang_tpu.disaggregation.raiden.dram_offload_channel import DramOffloadChannel
 from sglang_tpu.disaggregation.raiden.host_pool import (
     WINDOW_SLOTS_PER_FULL_SLOT,
     StagingAdmission,
@@ -109,6 +110,7 @@ from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
 
 if TYPE_CHECKING:
     from tpu_sync.api.torch.kv_cache_manager import SettledTransfer
+
 
 # Re-exported so that "from …raiden.conn import X" keeps resolving for the
 # callers and tests that predate the split into common/sender/receiver.
@@ -172,6 +174,9 @@ class RaidenKVManager(
 
     # The legacy transport unless set_kv_caches builds a pipeline transfer.
     _pipeline = None
+    # Channel of the KV offload to decode DRAM (offload.py); None unless
+    # __init__ finds the switch on.
+    dram_offload_channel: Optional[DramOffloadChannel] = None
     _pipeline_enabled = False
     # Host layer buffers per transfer, from SGLANG_TPU_RAIDEN_STAGING_LAYERS.
     _staging_layers_total = 0
@@ -214,6 +219,9 @@ class RaidenKVManager(
             ReshardChunkReady.TAG: self._on_reshard_chunk_ready,
             RoomFailed.TAG: self._on_room_failed,
         }
+        if tpu_envs.SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM.get():
+            self.dram_offload_channel = DramOffloadChannel(self)
+            self._message_handlers.update(self.dram_offload_channel.message_handlers())
 
         self._engine: Optional[Any] = None  # raiden KVCacheManager
         self._swa_engine: Optional[Any] = None

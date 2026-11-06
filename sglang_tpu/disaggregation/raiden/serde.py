@@ -9,7 +9,7 @@ from __future__ import annotations
 import ctypes
 import enum
 import struct
-from typing import ClassVar, List
+from typing import ClassVar, List, Optional
 
 import msgspec
 
@@ -45,6 +45,11 @@ class MessageTag(bytes, enum.Enum):
 
     ROOM_FAILED = b"RAIDEN_ROOM_FAILED"  # prefill -> decode: room already failed
 
+    # Victim push: the prefill hands a session it is about to evict to the decode
+    # that served it (decode_dram_offload/prefill_dram_victim_pusher.py).
+    VICTIM_PUSH = b"RAIDEN_VICTIM_PUSH"  # prefill -> decode: host pages offered
+    VICTIM_ACK = b"RAIDEN_VICTIM_ACK"  # decode -> prefill: stored, or declined
+
     # CommonKVReceiver owns this backend-independent positional message.
     ABORT = b"ABORT"  # decode -> prefill: room, decode ip, decode port
 
@@ -72,12 +77,45 @@ class PullReq(WireMessage):
     # Window pages the decode allocated for the room; the sender registers
     # only the window blocks it will read.
     decode_swa_pages: int = 0
+    # Whether the decode runs with the KV offload to decode DRAM switched on.
+    # The prefill fails the room when its own switch differs.
+    kv_offload: bool = False
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
         require_non_negative(self.decode_pages, "decode_pages")
         require_non_negative(self.decode_swa_pages, "decode_swa_pages")
         _require_port(self.decode_port)
+
+
+class VictimPush(WireMessage):
+    """A host-resident session the prefill is about to evict.
+
+    ``tokens`` are the session's first ``len(blocks) * page_size`` token ids
+    and ``blocks`` the host page ids holding their full KV on this rank;
+    ``prefill`` and ``seq`` are the same on every rank of the prefill engine.
+    """
+
+    TAG: ClassVar[bytes] = MessageTag.VICTIM_PUSH
+    prefill: str
+    seq: int
+    ack_endpoint: str
+    tokens: list[int]
+    blocks: list[int]
+    # The registered producer UUID and the control endpoint of its host pool.
+    uuid: int = 0
+    address: str = ""
+    extra_key: Optional[str] = None
+    cache_salt: Optional[str] = None
+
+
+class VictimAck(WireMessage):
+    """Whether every decode rank read the pushed pages and inserted the
+    session (``stored``), sent once the push is settled or declined."""
+
+    TAG: ClassVar[bytes] = MessageTag.VICTIM_ACK
+    seq: int
+    stored: bool
 
 
 class Blocks(WireMessage):

@@ -22,6 +22,7 @@ import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVSender, KVTransferError
+from sglang_tpu.disaggregation.raiden import dram_offload_channel as raiden_offload
 from sglang_tpu.disaggregation.raiden.chunk_plan import (
     chunk_pull_window,
     whole_pull_registration,
@@ -83,8 +84,22 @@ class RaidenSenderMixin:
         decode_port = req.decode_port
         decode_pages = req.decode_pages
         decode_swa_pages = req.decode_swa_pages
+        # One role offloading to a peer that does not take part would run
+        # without the offload and never say so.
+        switch_mismatch = raiden_offload.peer_switch_mismatch(
+            decode_enabled=req.kv_offload
+        )
         with self._state_lock:
             failed_reason = self._tombstone_reason_locked(room)
+            if failed_reason is None and switch_mismatch is not None:
+                logger.error(
+                    "RaidenKVManager rank%d room %s: %s",
+                    self.attn_tp_rank,
+                    room,
+                    switch_mismatch,
+                )
+                self._fail_room_locked(room, switch_mismatch)
+                failed_reason = switch_mismatch
             if failed_reason is None:
                 self._prefill.decode_addr[room] = (decode_ip, decode_port)
                 self._prefill.decode_pages[room] = decode_pages
@@ -731,6 +746,24 @@ class RaidenSenderMixin:
                 "Raiden asymmetric attention TP does not support staging layers to "
                 "reduce host staging RAM. Set SGLANG_TPU_RAIDEN_STAGING_LAYERS=0 on "
                 "prefill and decode to keep full mirrors."
+            )
+            with self._state_lock:
+                self._fail_room_locked(req.room, reason)
+            self._reply_room_failed(
+                room=req.room,
+                endpoint=_tcp_endpoint(ip=req.decode_ip, port=req.decode_port),
+                reason=reason,
+            )
+            return
+        reason = raiden_offload.resharding_refusal()
+        if reason is not None:
+            # A decode at another attention TP cannot take host pages rank to
+            # rank; serving it without the offload would hide that.
+            logger.error(
+                "RaidenKVManager rank%d room %s: %s",
+                self.attn_tp_rank,
+                req.room,
+                reason,
             )
             with self._state_lock:
                 self._fail_room_locked(req.room, reason)

@@ -910,6 +910,23 @@ def _patch_hicache_write_back_copy_ahead() -> None:
     hicache_write_back_copy_ahead.install()
 
 
+def _patch_decode_dram_offload() -> None:
+    """Make decode RAM the cache tier below prefill RAM.
+
+    Why: core has no disaggregation queue/cache lifecycle extension yet.
+    How: install the small wrappers listed in
+    disaggregation/decode_dram_offload/dram_offload_hooks.py (``_patch_targets``).
+    Upstream PR or issue: none yet; tracked with the hooks module.
+    Remove when: equivalent lifecycle callbacks are available upstream.
+    """
+    # Off: not even the modules' imports.
+    if not envs.SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM.get():
+        return
+    from sglang_tpu.disaggregation.decode_dram_offload import dram_offload_hooks
+
+    dram_offload_hooks.install()
+
+
 def _patch_pd_decode_async_prefill_info() -> None:
     """Fetch PD prefill parallel info off the decode scheduler thread.
 
@@ -1030,6 +1047,7 @@ def apply_tpu_patches() -> None:
     _patch_pd_decode_swa_hicache()
     _install_hybrid_linear_hicache()
     _patch_hicache_write_back_copy_ahead()
+    _patch_decode_dram_offload()
     _patch_pd_decode_async_prefill_info()
     from sglang_tpu.benchmark_batch_gate import install as install_benchmark_batch_gate
 
