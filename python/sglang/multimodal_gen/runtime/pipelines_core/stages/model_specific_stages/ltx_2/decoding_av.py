@@ -9,7 +9,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
@@ -147,9 +146,7 @@ class LTX2AVDecodingStage(DecodingStage):
                     except Exception:
                         pass
                     should_cast_vae = not vae_autocast_enabled
-                    # torch_tpu reports autocast as enabled but has no autocast conv
-                    # kernels, so the bf16 VAE would get the denoiser's fp32 latents.
-                    if not vae_autocast_enabled or current_platform.is_tpu():
+                    if not vae_autocast_enabled:
                         latents = latents.to(vae_dtype)
                     with temporary_module_dtype(
                         self.vae, vae_dtype, enabled=should_cast_vae

@@ -156,12 +156,12 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
     @property
     def parallelism_type(self) -> StageParallelismType:
         # Stage 2 is distilled and always runs with CFG disabled, so non-main
-        # CFG ranks only need the result when the decoder will use all ranks.
-        # On TPU every CFG rank runs it: torch_tpu launches subgroup collectives
-        # as slice-wide programs, so CFG rank 0's Ulysses all-to-alls would wait
-        # forever for the CFG ranks parked in the barrier. All ranks hold the
-        # same stage-2 inputs, so rank 0's result is unchanged.
-        if self.server_args.enable_cfg_parallel and not current_platform.is_tpu():
+        # CFG ranks only need the result when the decoder will use all ranks,
+        # unless its Ulysses collectives need every rank.
+        if (
+            self.server_args.enable_cfg_parallel
+            and current_platform.supports_rank_subset_collectives()
+        ):
             if decode_uses_every_rank(self.vae):
                 return StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS
             return StageParallelismType.MAIN_RANK_ONLY
