@@ -40,6 +40,9 @@ def _decode_manager():
     mgr._completed_send = set()
     mgr._completed_recv = set()
     mgr._send_done_at = {}
+    mgr._pull_sessions = {}
+    mgr._reshard_plans = {}
+    mgr._cleared_plans = set()
     mgr.waiting_timeout = TIMEOUT_S
     mgr._timeout_s = 120.0
     mgr._monotonic = Mock(return_value=1000.0)

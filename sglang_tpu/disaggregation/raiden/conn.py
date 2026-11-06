@@ -309,9 +309,8 @@ class RaidenKVManager(
         # a read only while the pool has room for it and leaves the rest in
         # the transfer queue.
         self._pulling: Optional[StagingAdmission] = None
-        # Reads of rooms the framework dropped while they were still in
-        # flight. Raiden cannot cancel a read, so the read keeps its admission
-        # until the engine reports it settled.
+        # Unsettled reads of cleared rooms; each keeps its staging admission
+        # until Raiden reports it settled, then drops its completion status.
         self._pulling_cleared: Set[str] = set()
         # Rooms this side gave up on, by when. The peer (or this side's own
         # compute) may still act on them; frames and send calls for a
@@ -319,11 +318,14 @@ class RaidenKVManager(
         # age out rather than leaving with the room, because frames can
         # arrive after the room is cleared.
         self._aborted: Dict[int, float] = {}
-        # Receiver plans of rooms the framework dropped while their push was
-        # still in flight, by request id. Raiden cannot cancel a push and
-        # keeps delivering into the plan, so the plan stays registered until
-        # the engine reports the push settled.
-        self._cleared_plans: Dict[str, int] = {}
+        # Unsettled, uncancelled pull reads per room, mapped to Raiden's uuid.
+        self._pull_sessions: Dict[int, Dict[str, int]] = {}
+        # Registered reshard receive plans of live rooms, kept until clear_room.
+        self._reshard_plans: Dict[int, Dict[str, int]] = {}
+        # Receive req_ids cancelled locally; suppresses repeat cancel and ERROR logs.
+        self._cancelled_recvs: Set[str] = set()
+        # Unsettled reshard plans of cleared rooms awaiting settlement cleanup.
+        self._cleared_plans: Set[str] = set()
         # Sender plans whose D2H stage timed out while the copy was still
         # running, as (uuid, room, future). Unregistering would free the
         # staging under the copy -- and the room's pages are what the copy
@@ -370,8 +372,6 @@ class RaidenKVManager(
                 thread_name_prefix="raiden-reshard-push",
             )
             self._reshard_push_lock = threading.Lock()
-        else:
-            self._reshard_plans: Dict[int, Dict[str, int]] = {}
         self._listener = threading.Thread(target=self._listen, daemon=True)
         self._listener.start()
 
@@ -890,9 +890,8 @@ class RaidenKVManager(
                         self._completed_send.add(rid)
                         if t.completed_ns is not None:
                             self._send_done_at[rid] = t.completed_ns / 1e9
-                    self._completed_recv.update(
-                        self._norm_req_id(t.req_id) for t in done_recv
-                    )
+                    done_recv_ids = {self._norm_req_id(t.req_id) for t in done_recv}
+                    self._completed_recv.update(done_recv_ids)
                     norm_failed = {self._norm_req_id(t.req_id) for t in failed}
                     superseded = self._superseded_sender_reads
                     real_failed = norm_failed - superseded
@@ -902,11 +901,10 @@ class RaidenKVManager(
                     failures, later_failures = self._record_native_failures_locked(
                         t for t in failed if self._norm_req_id(t.req_id) in real_failed
                     )
+                    self._retire_settled_receives_locked(done_recv_ids | real_failed)
                     self._release_pull_slots_locked()
                     self._settle_sender_reads_locked()
-                    settled_plans = self._settled_cleared_plans_locked()
-                for uuid in settled_plans:
-                    self._unregister_plan(uuid)
+                    self._drop_settled_cleared_plans_locked()
                 self._log_settled_transfers(
                     sent=[self._norm_req_id(t.req_id) for t in done_send],
                     received=[self._norm_req_id(t.req_id) for t in done_recv],
@@ -943,14 +941,23 @@ class RaidenKVManager(
         for transfer in ordered:
             failure = _describe_failure(side=side, transfer=transfer)
             room = self._room_of(transfer.req_id)
+            norm_id = self._norm_req_id(transfer.req_id)
+            bundle_key = self._pull_bundle_key(req_id=norm_id, room=room)
             key = transfer.req_id if room is None else room
-            if key in earliest:
+            # Local cancels settle as CANCELLED; log at DEBUG and keep primary cause.
+            is_local_cancel = (
+                norm_id in self._cancelled_recvs and transfer.code == "CANCELLED"
+            )
+            if key in earliest or is_local_cancel:
                 later.append(failure)
                 continue
             earliest[key] = failure
+            was_cleared = (
+                norm_id in self._cleared_plans or bundle_key in self._pulling_cleared
+            )
             with self._status_lock:
                 live = room is not None and room in self.request_status
-            if live:
+            if live and not was_cleared:
                 with self.failure_lock:
                     self.failure_records.setdefault(room, failure)
         return list(earliest.values()), later
@@ -1026,13 +1033,12 @@ class RaidenKVManager(
         return None if None in times else max(times)
 
     def _unregister_plan(self, uuid: int) -> None:
-        """Drops a receiver plan whose push has settled.
+        """Drops a parked sender plan once its D2H copy has settled.
 
         Raiden drops a timed-out plan itself, so one it no longer knows has
         already been dropped -- which is also why this can sweep both engines
-        unconditionally: a hybrid room registers the same uuid on each, and on
-        an engine that never held it the drop is the same no-op as for a plan
-        raiden already reaped.
+        unconditionally: on an engine that never held the uuid, the drop is the
+        same no-op as for a plan raiden already reaped.
         """
         for engine in (self._engine, self._swa_engine):
             if engine is None:
@@ -1136,6 +1142,13 @@ class RaidenKVManager(
         # room with a later Transferring write.
         with self._state_lock:
             super()._handle_node_failure(failed_bootstrap_addr)
+            to_cancel: List[Tuple[str, int]] = []
+            for room in set(self._pull_sessions) | set(self._reshard_plans):
+                with self._status_lock:
+                    failed_room = self.request_status.get(room) == KVPoll.Failed
+                if failed_room:
+                    to_cancel.extend(self._claim_room_cancels_locked(room))
+        self._cancel_receives(to_cancel)
         for endpoint in stale:
             self._disconnect_endpoint(endpoint)
 
@@ -1386,7 +1399,7 @@ class RaidenKVManager(
                         key, room
                     ) and not self._pull_settled_locked(key):
                         return True
-            for req_id in (getattr(self, "_reshard_plans", None) or {}).get(room, {}):
+            for req_id in self._reshard_plans.get(room, {}):
                 if (
                     req_id not in self._completed_recv
                     and req_id not in self._native_failed
@@ -1432,20 +1445,20 @@ class RaidenKVManager(
                 waiting = self._pulling.waiting
                 if waiting is not None and belongs(waiting):
                     self._pulling.forget(waiting)
-            settled_plans = []
-            plans = (getattr(self, "_reshard_plans", None) or {}).pop(room, {})
-            for req_id, uuid in plans.items():
-                if req_id in self._completed_recv or req_id in self._native_failed:
-                    settled_plans.append(uuid)
-                    continue
-                self._cleared_plans[req_id] = uuid
-                held.add(req_id)
+            to_cancel, settled_plans, held_plans = self._retire_room_receives_locked(
+                room
+            )
+            held.update(held_plans)
             self._completed_send.difference_update(
                 [k for k in self._completed_send if belongs(k)]
             )
             for key in [k for k in self._send_done_at if belongs(k)]:
                 del self._send_done_at[key]
-            for ids in (self._completed_recv, self._failed, self._native_failed):
+            for ids in (
+                self._completed_recv,
+                self._failed,
+                self._native_failed,
+            ):
                 ids.difference_update([k for k in ids if belongs(k) and k not in held])
             announced = self._decode.announced_at if self._decode is not None else None
             if announced is not None:
@@ -1516,8 +1529,9 @@ class RaidenKVManager(
                 # well, so clear and publication have one total order.
                 with self.failure_lock:
                     self.failure_records.pop(room, None)
-        for uuid in settled_plans:
-            self._unregister_plan(uuid)
+        self._cancel_receives(to_cancel)
+        for req_id, uuid in settled_plans:
+            self._unregister_recv_plan(req_id=req_id, uuid=uuid)
 
 
 class RaidenKVBootstrapServer(CommonKVBootstrapServer):

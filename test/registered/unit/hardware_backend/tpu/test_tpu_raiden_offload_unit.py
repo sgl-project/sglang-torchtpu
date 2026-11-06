@@ -32,7 +32,8 @@ import torch
 import zmq
 from google.protobuf.wrappers_pb2 import Int64Value
 
-from sglang.srt.disaggregation.base.conn import BaseKVSender, KVArgs, StateType
+from sglang.srt.disaggregation.base.conn import BaseKVSender, KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeReqToTokenPool
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -47,6 +48,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.disaggregation.raiden.conn import (
     DEFAULT_KV_PORT,
     RaidenKVManager,
+    RaidenKVReceiver,
     RaidenKVSender,
     get_raiden_kv_caches,
 )
@@ -72,19 +74,16 @@ from sglang_tpu.raiden_transfer import RaidenFutureEvent, RaidenKVTransfer
 from sglang_tpu.tpu_dma_hicache import NOOP_EVENT, CombinedFutureEvent
 
 
-def _polled(sent=(), received=(), failed=(), completed_ns=None):
+def _polled(sent=(), received=(), failed=(), completed_ns=None, details=None):
     """Fake poll_stats_with_details() result for the given req ids."""
+    defaults = dict(elapsed_ns=None, peer=None, code=None, reason=None, phase=None)
 
     def settled(ids):
         return [
             SimpleNamespace(
                 req_id=r,
                 completed_ns=completed_ns,
-                elapsed_ns=None,
-                peer=None,
-                code=None,
-                reason=None,
-                phase=None,
+                **{**defaults, **(details or {}).get(r, {})},
             )
             for r in ids
         ]
@@ -692,8 +691,10 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._decode.remote_endpoint = {room: "127.0.0.1:31020"}
         mgr._decode.remote_swa_endpoint = {room: "127.0.0.1:31022"}
         mgr.chunked_transfer = False
+        mgr._completed_recv = set()
         mgr._failed = set()
         mgr._native_failed = set()
+        mgr._pull_sessions = {}
 
         self.assertTrue(mgr.maybe_start_pull(room))
         mgr._engine.start_read.assert_called_once_with(
@@ -734,6 +735,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._native_failed = set()
+        mgr._pull_sessions = {}
         mgr.record_failure = Mock()
         mgr._decode.local_blocks = {room: list(range(1000, 1000 + full_pages))}
         mgr._decode.local_swa_blocks = {room: list(range(2000, 2000 + swa_pages))}
@@ -819,6 +821,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._native_failed = set()
+        mgr._pull_sessions = {}
         mgr._decode.local_blocks = {first: [8], second: [9]}
         mgr._decode.remote_blocks = {first: [1], second: [2]}
         mgr._decode.remote_endpoint = {r: "127.0.0.1:31020" for r in (first, second)}
@@ -860,6 +863,10 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._native_failed = set()
+        mgr._pull_sessions = {}
+        mgr._reshard_plans = {}
+        mgr._cancelled_recvs = set()
+        mgr._cleared_plans = set()
         mgr.attn_tp_rank = 0
         mgr.record_failure = Mock()
         # clear_room sweeps the reshard bookkeeping too.
@@ -1261,8 +1268,11 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._native_failed = set()
+        mgr._cancelled_recvs = set()
         mgr._pulling_cleared = set()
-        mgr._cleared_plans = {}
+        mgr._pull_sessions = {}
+        mgr._reshard_plans = {}
+        mgr._cleared_plans = set()
         mgr._stale_plans = []
         mgr._engine_poll_failing_since = {}
         # clear_room sweeps the reshard bookkeeping too.
@@ -1834,7 +1844,7 @@ class TestRaidenRoleStatePlacement(CustomTestCase):
                     self.assertIn(pending_copy, mgr._stale_plans)
                 else:
                     self.assertNotIn(room, mgr._reshard_plans)
-                    self.assertEqual(mgr._cleared_plans, {str(room): room})
+                    self.assertEqual(mgr._cleared_plans, {str(room)})
 
 
 class TestRaidenDefaultPort(CustomTestCase):
@@ -1930,12 +1940,13 @@ class TestRaidenChunkedResharding(CustomTestCase):
     ROOM = 41
     PREFILL_BLOCKS = list(range(100, 164))  # 64 pages, 4 chunks of 16
     DECODE_BLOCKS = list(range(200, 240))  # decode holds the last 40
+    CANCELLED_DETAIL = dict(code="CANCELLED", reason="receive plan unregistered")
 
     @staticmethod
-    def _geometry(src_tp, dst_tp):
+    def _geometry(src_tp, dst_tp, *, swa=False):
         from sglang_tpu.disaggregation.raiden.reshard_schedule import ReshardGeometry
 
-        return ReshardGeometry(src_tp, dst_tp, 1024, 8)
+        return ReshardGeometry(src_tp, dst_tp, 128 if swa else 1024, 8)
 
     def _prefill(self):
         mgr = object.__new__(RaidenKVManager)
@@ -1981,7 +1992,9 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr._pulling_cleared = set()
-        mgr._cleared_plans = {}
+        mgr._pull_sessions = {}
+        mgr._reshard_plans = {}
+        mgr._cleared_plans = set()
         mgr._stale_plans = []
         mgr._engine_poll_failing_since = {}
         mgr._socket = Mock()
@@ -2016,6 +2029,18 @@ class TestRaidenChunkedResharding(CustomTestCase):
             for c in mgr._socket.send_multipart.call_args_list
             if c.args[0][0] == tag
         ]
+
+    def _receiver(self, mgr: RaidenKVManager) -> RaidenKVReceiver:
+        recv = object.__new__(RaidenKVReceiver)
+        recv.kv_mgr = mgr
+        recv.bootstrap_room = self.ROOM
+        recv.bootstrap_infos = [
+            {"rank_ip": "10.0.0.10", "rank_port": 4444},
+            {"rank_ip": "10.0.0.11", "rank_port": 4444},
+        ]
+        recv.conclude_state = None
+        recv.abort_notified = False
+        return recv
 
     def test_only_acknowledged_chunks_leave_the_closing_span(self):
         # An announced but never-acknowledged chunk keeps its pages in the
@@ -2109,7 +2134,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
             )
         self.assertTrue(mgr.is_send_done(room))
 
-    def _decode(self):
+    def _decode(self, *, hybrid=False):
         mgr = object.__new__(RaidenKVManager)
         mgr._prefill = None
         mgr._decode = DecodeState()
@@ -2118,13 +2143,17 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._send_reads = {}
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
-        mgr.request_status = {}
+        mgr.request_status = {self.ROOM: KVPoll.WaitingForInput}
         mgr.chunked_transfer = True
         mgr._state_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
         mgr._engine = Mock(transfer_address="10.0.0.2:31000")
-        mgr._swa_engine = None
+        mgr._engine.poll_stats_with_details.return_value = _polled()
+        mgr._swa_engine = Mock(transfer_address="10.0.0.2:31002") if hybrid else None
+        if mgr._swa_engine is not None:
+            mgr._swa_engine.poll_stats_with_details.return_value = _polled()
+        mgr._swa_kv_caches = [object()] if hybrid else []
         mgr.kv_args = Mock(page_size=128)
         mgr.attn_tp_rank = 0
         mgr.attn_tp_size = 4
@@ -2134,6 +2163,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._decode.reshard_meta = {
             self.ROOM: dict(
                 local_blocks=list(self.DECODE_BLOCKS),
+                local_swa_blocks=[300, 301] if hybrid else [],
                 source_ranks=[0, 1],
                 src_attn_tp=8,
                 aux_index=None,
@@ -2143,16 +2173,15 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._decode.reshard_sources = {self.ROOM: {}}
         # Same shape for the window pool; _on_reshard_blocks records both.
         mgr._decode.reshard_swa_sources = {self.ROOM: {}}
+        mgr._pull_sessions = {}
         mgr._reshard_plans = {}
-        mgr._cleared_plans = {}
+        mgr._cancelled_recvs = set()
+        mgr._cleared_plans = set()
         mgr._stale_plans = []
         mgr._engine_poll_failing_since = {}
         mgr._pulling = None
-        mgr._aborted = {}
-        mgr._send_reads = {}
         mgr._pulling_cleared = set()
         mgr._decode.announced_at = {}
-        mgr._timeout_s = 120.0
         mgr._completed_send = set()
         mgr._send_done_at = {}
         mgr._completed_recv = set()
@@ -2200,14 +2229,16 @@ class TestRaidenChunkedResharding(CustomTestCase):
                 # StartTransferRequest.uuid uses protobuf's signed int64 range.
                 self.assertEqual(Int64Value(value=uuid).value, req.uuid)
 
-    def test_aborted_room_keeps_its_chunk_plan_until_the_push_settles(self):
+    def test_aborted_room_cancels_its_chunk_plan_and_absorbs_late_settlement(self):
         mgr, uuid = self._decode_with_chunk_plan()
         mgr._completed_send.add("41#0")
 
-        # The framework aborts the request while the sources are still pushing.
+        # Clearing an unsettled room cancels its receive plan immediately and
+        # tracks the id until raiden reports settlement.
         mgr.clear_room(self.ROOM)
-        mgr._engine.unregister_active_plan.assert_not_called()
-        self.assertEqual(mgr._cleared_plans, {"41#0": uuid})
+        mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
+        self.assertEqual(mgr._cleared_plans, {"41#0"})
+        self.assertIn("41#0", mgr._cancelled_recvs)
         self.assertNotIn(self.ROOM, mgr._reshard_plans)
         self.assertFalse(mgr._completed_send)
 
@@ -2216,38 +2247,58 @@ class TestRaidenChunkedResharding(CustomTestCase):
             return_value=_polled([], ["7#0"], [])
         )
         mgr._drain_engine()
-        mgr._engine.unregister_active_plan.assert_not_called()
+        mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
+        self.assertEqual(mgr._cleared_plans, {"41#0"})
 
-        # The push lands late: the plan goes, exactly once, with its record.
+        # Late settlement drops the cleared-plan record without re-unregistering.
         mgr._engine.poll_stats_with_details = Mock(
             return_value=_polled([], ["41#0"], [])
         )
         mgr._drain_engine()
         mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
-        self.assertEqual(mgr._cleared_plans, {})
+        self.assertEqual(mgr._cleared_plans, set())
+        self.assertNotIn("41#0", mgr._cancelled_recvs)
         self.assertNotIn("41#0", mgr._completed_recv)
         mgr._drain_engine()
         mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
 
-    def test_aborted_room_drops_its_chunk_plan_when_the_push_times_out(self):
-        mgr, uuid = self._decode_with_chunk_plan()
-        mgr.clear_room(self.ROOM)
-
-        # Raiden reports the timeout and has already dropped the plan itself.
-        mgr._engine.unregister_active_plan = Mock(
-            side_effect=RuntimeError(
-                f"KVCacheManager unregister_active_plan failed: Plan with "
-                f"UUID {uuid} is not registered"
+    def test_clear_room_handles_chunk_plan_failing_before_or_after_clear(self):
+        with self.subTest("settled_before_clear"):
+            mgr, uuid = self._decode_with_chunk_plan()
+            mgr._engine.poll_stats_with_details = Mock(
+                return_value=_polled([], [], ["41#0"])
             )
-        )
-        mgr._engine.poll_stats_with_details = Mock(
-            return_value=_polled([], [], ["41#0"])
-        )
-        mgr._drain_engine()
-        mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
-        self.assertEqual(mgr._cleared_plans, {})
-        self.assertFalse(mgr._failed)
-        self.assertNotIn(self.ROOM, mgr.failure_records)
+            mgr._drain_engine()
+            self.assertIn(self.ROOM, mgr.failure_records)
+            mgr._engine.unregister_active_plan = Mock(
+                side_effect=RuntimeError(
+                    f"KVCacheManager unregister_active_plan failed: Plan with "
+                    f"UUID {uuid} is not registered"
+                )
+            )
+            mgr.clear_room(self.ROOM)
+            mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
+            self.assertEqual(mgr._cleared_plans, set())
+            self.assertNotIn("41#0", mgr._cancelled_recvs)
+            self.assertFalse(mgr._failed)
+            self.assertNotIn(self.ROOM, mgr.failure_records)
+
+        with self.subTest("clear_before_late_failure_on_reused_room"):
+            mgr, uuid = self._decode_with_chunk_plan()
+            mgr.clear_room(self.ROOM)
+            mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
+            self.assertEqual(mgr._cleared_plans, {"41#0"})
+            self.assertIn("41#0", mgr._cancelled_recvs)
+            mgr.request_status[self.ROOM] = KVPoll.WaitingForInput
+            mgr._engine.poll_stats_with_details = Mock(
+                return_value=_polled([], [], ["41#0"])
+            )
+            mgr._drain_engine()
+            self.assertNotIn(self.ROOM, mgr.failure_records)
+            self.assertEqual(mgr._cleared_plans, set())
+            self.assertNotIn("41#0", mgr._cancelled_recvs)
+            self.assertFalse(mgr._failed)
+            mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
 
     def test_room_is_not_complete_while_closing_registration_is_pending(self):
         mgr, _ = self._decode_with_chunk_plan()
@@ -2303,7 +2354,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._completed_recv.add("41#0")
         mgr.clear_room(self.ROOM)
         mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
-        self.assertEqual(mgr._cleared_plans, {})
+        self.assertEqual(mgr._cleared_plans, set())
         self.assertFalse(mgr._completed_recv)
 
     def test_reshard_decode_chunk_failure_after_closing_push_fails_room(self):
@@ -2528,7 +2579,6 @@ class TestRaidenChunkedResharding(CustomTestCase):
         room = self.ROOM
         src = {0: list(range(100, 164)), 1: list(range(300, 364))}
         mgr = self._decode()
-        mgr.record_failure = Mock()
         mgr._engine.register_active_plan = Mock(
             side_effect=RuntimeError("RESOURCE_EXHAUSTED: no host blocks")
         )
@@ -2540,7 +2590,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
             mgr._on_reshard_chunk(chunk(0))
             mgr._on_reshard_chunk(chunk(1))
         self.assertTrue(mgr.is_failed(room))
-        self.assertIn("RESOURCE_EXHAUSTED", mgr.record_failure.call_args.args[1])
+        self.assertIn("RESOURCE_EXHAUSTED", mgr.failure_records[room])
         # The chunk is not admitted anywhere a completion could be faked from.
         self.assertEqual(mgr._decode.chunk_reads.get(room, []), [])
         self.assertEqual(mgr._reshard_plans.get(room, {}), {})
@@ -2677,6 +2727,347 @@ class TestRaidenChunkedResharding(CustomTestCase):
         )
         self.assertEqual(mgr._decode.chunk_reads[room], ["41#0", "41"])
         self.assertNotIn(room, mgr._decode.reshard_chunk_registering)
+
+    def test_reshard_hybrid_abort_cancels_chunk_closing_and_swa_once(self):
+        """Aborting a live hybrid chunked reshard cancels all armed plans once and
+        withholds Failed until every engine reports settlement."""
+        room = self.ROOM
+        src = {0: list(range(100, 164)), 1: list(range(300, 364))}
+        mgr = self._decode(hybrid=True)
+        with patch.dict(sys.modules, _pb2_modules()):
+            for rank in (0, 1):
+                mgr._on_reshard_chunk(
+                    _reshard_chunk_frames(room, 0, 24, 64, src[rank][24:32], rank)
+                )
+            chunk_uuid = mgr._reshard_plans[room]["41#0"]
+            for rank in (0, 1):
+                mgr._on_reshard_blocks(
+                    ReshardBlocks(
+                        room=room,
+                        prefill_blocks=src[rank],
+                        src_rank=rank,
+                        aux_blob=b"",
+                        prefill_swa_blocks=[500 + rank, 510 + rank],
+                    ).to_frames()
+                )
+        self.assertEqual(len(self._sent(mgr, MessageTag.RESHARD_CHUNK_READY)), 2)
+        self.assertEqual(len(self._sent(mgr, MessageTag.RESHARD_READY)), 2)
+        self.assertEqual(set(mgr._reshard_plans[room]), {"41#0", "41", "swa:41"})
+
+        recv = self._receiver(mgr)
+        with patch.object(RaidenKVReceiver, "_send_abort_notification"):
+            recv.abort()
+            self.assertCountEqual(
+                [c.args[0] for c in mgr._engine.unregister_active_plan.call_args_list],
+                [chunk_uuid, room],
+            )
+            mgr._swa_engine.unregister_active_plan.assert_called_once_with(room)
+            self.assertEqual(recv.poll(), KVPoll.Transferring)
+            self.assertTrue(mgr.room_has_active_io(room))
+
+            mgr._swa_engine.poll_stats_with_details.return_value = _polled(
+                failed=["swa:41"], details={"swa:41": self.CANCELLED_DETAIL}
+            )
+            self.assertEqual(recv.poll(), KVPoll.Transferring)
+            self.assertTrue(mgr.room_has_active_io(room))
+            mgr._swa_engine.poll_stats_with_details.return_value = _polled()
+
+            mgr._engine.poll_stats_with_details.return_value = _polled(
+                failed=["41#0", "41"],
+                details={
+                    "41#0": self.CANCELLED_DETAIL,
+                    "41": self.CANCELLED_DETAIL,
+                },
+            )
+            self.assertEqual(recv.poll(), KVPoll.Failed)
+            self.assertFalse(mgr.room_has_active_io(room))
+
+        with self.assertRaises(KVTransferError) as cm:
+            recv.failure_exception()
+        self.assertEqual(cm.exception.failure_reason, "Aborted by AbortReq.")
+        mgr.clear_room(room)
+        self.assertEqual(mgr._engine.unregister_active_plan.call_count, 2)
+        mgr._swa_engine.unregister_active_plan.assert_called_once_with(room)
+        self.assertEqual(mgr._cancelled_recvs, set())
+        self.assertEqual(mgr._cleared_plans, set())
+
+    def test_reshard_failure_cancels_previously_armed_plans(self):
+        """A reshard registration or SWA validation error cancels already-armed
+        chunk plans of the room and preserves an existing primary failure reason."""
+        room = self.ROOM
+        src = {0: list(range(100, 164)), 1: list(range(300, 364))}
+        for mode in (
+            "closing_stage_error",
+            "swa_short_pages",
+            "preserve_primary_chunk_fault",
+        ):
+            with self.subTest(mode=mode):
+                mgr = self._decode(hybrid=(mode == "swa_short_pages"))
+                with patch.dict(sys.modules, _pb2_modules()):
+                    for rank in (0, 1):
+                        mgr._on_reshard_chunk(
+                            _reshard_chunk_frames(
+                                room, 0, 24, 64, src[rank][24:32], rank
+                            )
+                        )
+                    chunk_uuid = mgr._reshard_plans[room]["41#0"]
+                    if mode == "preserve_primary_chunk_fault":
+                        for rank in (0, 1):
+                            mgr._on_reshard_chunk(
+                                _reshard_chunk_frames(
+                                    room, 1, 32, 64, src[rank][32:40], rank
+                                )
+                            )
+                        mgr._engine.poll_stats_with_details.return_value = _polled(
+                            failed=["41#1"],
+                            details={"41#1": dict(code="INTERNAL", reason="H2D fault")},
+                        )
+                        mgr._drain_engine()
+                        mgr._engine.poll_stats_with_details.return_value = _polled()
+                        mgr._engine.register_active_plan.side_effect = RuntimeError(
+                            "RESOURCE_EXHAUSTED: no host blocks"
+                        )
+                        for rank in (0, 1):
+                            mgr._on_reshard_chunk(
+                                _reshard_chunk_frames(
+                                    room, 2, 40, 64, src[rank][40:48], rank
+                                )
+                            )
+                    else:
+                        if mode == "closing_stage_error":
+                            mgr._engine.register_active_plan.side_effect = RuntimeError(
+                                "RESOURCE_EXHAUSTED: no host blocks"
+                            )
+                            swa_pages = []
+                        else:
+                            # Decode expects 2 SWA pages; sending 1 fails SWA staging.
+                            swa_pages = [500]
+                        for rank in (0, 1):
+                            mgr._on_reshard_blocks(
+                                ReshardBlocks(
+                                    room=room,
+                                    prefill_blocks=src[rank],
+                                    src_rank=rank,
+                                    aux_blob=b"",
+                                    prefill_swa_blocks=list(swa_pages),
+                                ).to_frames()
+                            )
+
+                mgr._engine.unregister_active_plan.assert_called_once_with(chunk_uuid)
+                self.assertEqual(self._sent(mgr, MessageTag.RESHARD_READY), [])
+                self.assertTrue(mgr.room_has_active_io(room))
+
+                mgr._engine.poll_stats_with_details.return_value = _polled(
+                    failed=["41#0"], details={"41#0": self.CANCELLED_DETAIL}
+                )
+                mgr._drain_engine()
+                self.assertFalse(mgr.room_has_active_io(room))
+                expected = {
+                    "closing_stage_error": "RESOURCE_EXHAUSTED",
+                    "swa_short_pages": "sliding-window pages",
+                    "preserve_primary_chunk_fault": "H2D fault",
+                }[mode]
+                self.assertIn(expected, mgr.failure_records[room])
+
+    def test_dead_room_during_reshard_registration_suppresses_ready_and_drains(self):
+        """An abort, native fault, or clear landing while a reshard plan registers
+        suppresses READY, cancels old and new plans, and cleans up settled state."""
+        room = self.ROOM
+        src = {0: list(range(100, 164)), 1: list(range(300, 364))}
+        for death in ("abort", "native_fault", "clear"):
+            with self.subTest(death=death):
+                mgr, uuid0 = self._decode_with_chunk_plan()
+                recv = self._receiver(mgr)
+
+                def kill_in_register(uuid, req, is_sender, _m=mgr, _r=recv, _d=death):
+                    if _d == "abort":
+                        _r.abort()
+                    elif _d == "native_fault":
+                        with _m._state_lock:
+                            _m._native_failed.add(f"{room}#9")
+                            _m._failed.add(f"{room}#9")
+                    else:
+                        _m.clear_room(room)
+
+                mgr._engine.register_active_plan.side_effect = kill_in_register
+                with (
+                    patch.dict(sys.modules, _pb2_modules()),
+                    patch.object(RaidenKVReceiver, "_send_abort_notification"),
+                ):
+                    for rank in (0, 1):
+                        mgr._on_reshard_chunk(
+                            _reshard_chunk_frames(
+                                room, 1, 32, 64, src[rank][32:40], rank
+                            )
+                        )
+                    uuid1 = mgr._engine.register_active_plan.call_args.args[0]
+                    self.assertEqual(
+                        len(self._sent(mgr, MessageTag.RESHARD_CHUNK_READY)), 2
+                    )
+                    self.assertCountEqual(
+                        [
+                            c.args[0]
+                            for c in mgr._engine.unregister_active_plan.call_args_list
+                        ],
+                        [uuid0, uuid1],
+                    )
+                    if death in ("abort", "native_fault"):
+                        mgr._engine.poll_stats_with_details.return_value = _polled(
+                            failed=["41#0"], details={"41#0": self.CANCELLED_DETAIL}
+                        )
+                        self.assertEqual(recv.poll(), KVPoll.Transferring)
+                        self.assertTrue(mgr.room_has_active_io(room))
+                        mgr._engine.poll_stats_with_details.return_value = _polled(
+                            failed=["41#1"], details={"41#1": self.CANCELLED_DETAIL}
+                        )
+                        self.assertEqual(recv.poll(), KVPoll.Failed)
+                        self.assertFalse(mgr.room_has_active_io(room))
+                    else:
+                        mgr._engine.poll_stats_with_details.return_value = _polled(
+                            failed=["41#0", "41#1"],
+                            details={
+                                "41#0": self.CANCELLED_DETAIL,
+                                "41#1": self.CANCELLED_DETAIL,
+                            },
+                        )
+                        mgr._drain_engine()
+                        self.assertEqual(mgr._cleared_plans, set())
+                        leaked = {
+                            k
+                            for k in (
+                                mgr._native_failed | mgr._failed | mgr._cancelled_recvs
+                            )
+                            if k.startswith(f"{room}#")
+                        }
+                        self.assertEqual(leaked, set())
+
+    def test_dead_room_during_swa_reshard_registration_suppresses_ready_and_drains(
+        self,
+    ):
+        """Room death during unlocked SWA reshard registration cancels armed chunk
+        and SWA plans, suppresses RESHARD_READY, and fences until settled."""
+        room = self.ROOM
+        src = {0: list(range(100, 164)), 1: list(range(300, 364))}
+        for death in ("abort", "native_fault", "clear"):
+            with self.subTest(death=death):
+                mgr = self._decode(hybrid=True)
+                recv = self._receiver(mgr)
+
+                def kill_in_swa(uuid, req, is_sender, _m=mgr, _r=recv, _d=death):
+                    if _d == "abort":
+                        _r.abort()
+                    elif _d == "native_fault":
+                        with _m._state_lock:
+                            _m._native_failed.add(f"{room}#9")
+                            _m._failed.add(f"{room}#9")
+                    else:
+                        _m.clear_room(room)
+
+                with (
+                    patch.dict(sys.modules, _pb2_modules()),
+                    patch.object(RaidenKVReceiver, "_send_abort_notification"),
+                ):
+                    for rank in (0, 1):
+                        mgr._on_reshard_chunk(
+                            _reshard_chunk_frames(
+                                room, 0, 24, 64, src[rank][24:32], rank
+                            )
+                        )
+                    uuid0 = mgr._reshard_plans[room]["41#0"]
+                    mgr._swa_engine.register_active_plan.side_effect = kill_in_swa
+                    for rank in (0, 1):
+                        mgr._on_reshard_blocks(
+                            ReshardBlocks(
+                                room=room,
+                                prefill_blocks=src[rank],
+                                src_rank=rank,
+                                aux_blob=b"",
+                                prefill_swa_blocks=[500 + rank, 510 + rank],
+                            ).to_frames()
+                        )
+                    self.assertEqual(self._sent(mgr, MessageTag.RESHARD_READY), [])
+                    mgr._engine.unregister_active_plan.assert_called_once_with(uuid0)
+                    mgr._swa_engine.unregister_active_plan.assert_called_once_with(room)
+                    mgr._engine.poll_stats_with_details.return_value = _polled(
+                        failed=["41#0"], details={"41#0": self.CANCELLED_DETAIL}
+                    )
+                    if death in ("abort", "native_fault"):
+                        self.assertEqual(recv.poll(), KVPoll.Transferring)
+                        self.assertTrue(mgr.room_has_active_io(room))
+                        mgr._engine.poll_stats_with_details.return_value = _polled()
+                        mgr._swa_engine.poll_stats_with_details.return_value = _polled(
+                            failed=[f"swa:{room}"],
+                            details={f"swa:{room}": self.CANCELLED_DETAIL},
+                        )
+                        self.assertEqual(recv.poll(), KVPoll.Failed)
+                        self.assertFalse(mgr.room_has_active_io(room))
+                    else:
+                        mgr._swa_engine.poll_stats_with_details.return_value = _polled(
+                            failed=[f"swa:{room}"],
+                            details={f"swa:{room}": self.CANCELLED_DETAIL},
+                        )
+                        mgr._drain_engine()
+                        self.assertEqual(mgr._cleared_plans, set())
+                        leaked = {
+                            k
+                            for k in (
+                                mgr._native_failed | mgr._failed | mgr._cancelled_recvs
+                            )
+                            if mgr._is_room_transfer(k, room)
+                        }
+                        self.assertEqual(leaked, set())
+
+    def test_dead_room_at_zero_missing_complement_suppresses_ready_and_cancels_swa(
+        self,
+    ):
+        """When chunks cover all full pages (missing == []), an abort or chunk
+        fault after SWA staging suppresses ReshardReady and cancels armed plans."""
+        room = self.ROOM
+        src = {0: list(range(100, 164)), 1: list(range(300, 364))}
+        for death in ("abort", "native_chunk_fault"):
+            with self.subTest(death=death):
+                mgr = self._decode(hybrid=True)
+                mgr._decode.reshard_meta[room]["local_blocks"] = list(range(200, 208))
+                recv = self._receiver(mgr)
+                orig_uncovered = mgr._uncovered_pages
+
+                def die_before_complement(
+                    total, covered, _orig=orig_uncovered, _m=mgr, _r=recv, _d=death
+                ):
+                    if _d == "abort":
+                        _r.abort()
+                    else:
+                        with _m._state_lock:
+                            _m._native_failed.add(f"{room}#9")
+                            _m._failed.add(f"{room}#9")
+                    return _orig(total, covered)
+
+                mgr._uncovered_pages = die_before_complement
+                with (
+                    patch.dict(sys.modules, _pb2_modules()),
+                    patch.object(RaidenKVReceiver, "_send_abort_notification"),
+                ):
+                    for rank in (0, 1):
+                        mgr._on_reshard_chunk(
+                            _reshard_chunk_frames(
+                                room, 0, 56, 64, src[rank][56:64], rank
+                            )
+                        )
+                    chunk_uuid = mgr._reshard_plans[room]["41#0"]
+                    for rank in (0, 1):
+                        mgr._on_reshard_blocks(
+                            ReshardBlocks(
+                                room=room,
+                                prefill_blocks=src[rank],
+                                src_rank=rank,
+                                aux_blob=b"",
+                                prefill_swa_blocks=[500 + rank, 510 + rank],
+                            ).to_frames()
+                        )
+
+                self.assertEqual(self._sent(mgr, MessageTag.RESHARD_READY), [])
+                mgr._engine.unregister_active_plan.assert_called_once_with(chunk_uuid)
+                mgr._swa_engine.unregister_active_plan.assert_called_once_with(room)
 
 
 class _FakeFuture:
@@ -2843,6 +3234,7 @@ class TestDecodeRadixPullRegistration(CustomTestCase):
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._native_failed = set()
+        mgr._pull_sessions = {}
         mgr._decode.local_blocks = {self.ROOM: list(local_blocks)}
         mgr._decode.remote_blocks = {self.ROOM: list(self.BLOCKS)}
         mgr._decode.remote_endpoint = {self.ROOM: "127.0.0.1:31020"}

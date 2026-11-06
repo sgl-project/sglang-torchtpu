@@ -12,7 +12,17 @@ from __future__ import annotations
 
 import secrets
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 import numpy as np
 import numpy.typing as npt
@@ -228,6 +238,8 @@ class RaidenReceiverMixin:
             self._mark_aborted_locked(room)
             self._fail_room_locked(room, note.reason, preserve_reason=True)
             self.update_status(room, KVPoll.Failed)
+            to_cancel = self._claim_room_cancels_locked(room)
+        self._cancel_receives(to_cancel)
 
     # ----- decode side -------------------------------------------------------
 
@@ -356,21 +368,123 @@ class RaidenReceiverMixin:
             for rid in (key, *self._paired_reads(key))
         )
 
-    def _settled_cleared_plans_locked(self) -> List[int]:
-        """Plan uuids of cleared rooms whose push the engine has now settled.
+    @staticmethod
+    def _pull_bundle_key(*, req_id: str, room: Optional[int]) -> str:
+        if room is not None and req_id.startswith(("swa:", "state:")):
+            return str(room)
+        return req_id
 
-        Their completion bookkeeping is dropped here, as nothing else will
-        read it; the caller unregisters the plans outside the lock.
-        """
-        uuids = []
-        for req_id, uuid in list(self._cleared_plans.items()):
+    def _recv_engine_for(self, req_id: str) -> Any:
+        if req_id.startswith("swa:"):
+            return self._swa_engine
+        if req_id.startswith("state:"):
+            return self._state_engine
+        return self._engine
+
+    def _unregister_recv_plan(
+        self,
+        *,
+        req_id: str,
+        uuid: int,
+        best_effort: bool = False,
+    ) -> None:
+        target = self._recv_engine_for(req_id)
+        if target is None:
+            return
+        # TODO(tpu-sync): pinned tpu-sync-torch cancels StartRead pulls here;
+        # wire a dedicated pull-cancel API before bumping tpu-sync-torch.
+        try:
+            target.unregister_active_plan(uuid)
+        except Exception as e:
+            if "not registered" in str(e).lower():
+                return
+            if not best_effort:
+                raise
+            logger.warning(
+                "RaidenKVManager rank%d cannot cancel receive %s: %s",
+                self.attn_tp_rank,
+                req_id,
+                e,
+            )
+
+    def _claim_room_cancels_locked(self, room: int) -> List[Tuple[str, int]]:
+        claimed: List[Tuple[str, int]] = []
+        for plans in (
+            self._pull_sessions.pop(room, {}),
+            self._reshard_plans.get(room, {}),
+        ):
+            for req_id, uuid in plans.items():
+                if (
+                    req_id in self._completed_recv
+                    or req_id in self._native_failed
+                    or req_id in self._cancelled_recvs
+                ):
+                    continue
+                # Callers record the room's primary reason or clear the room first,
+                # since _cancelled_recvs suppresses the follow-on CANCELLED record.
+                self._cancelled_recvs.add(req_id)
+                claimed.append((req_id, uuid))
+        return claimed
+
+    def _cancel_receives(self, items: Iterable[Tuple[str, int]]) -> None:
+        for req_id, uuid in items:
+            self._unregister_recv_plan(req_id=req_id, uuid=uuid, best_effort=True)
+
+    def _retire_settled_receives_locked(self, settled_ids: Iterable[str]) -> None:
+        for rid in settled_ids:
+            room = self._room_of(rid)
+            if room is not None:
+                room_pulls = self._pull_sessions.get(room)
+                if room_pulls is not None:
+                    room_pulls.pop(rid, None)
+                    if not room_pulls:
+                        self._pull_sessions.pop(room, None)
+            in_reshard = room is not None and rid in self._reshard_plans.get(room, {})
+            if not in_reshard and rid not in self._cleared_plans:
+                self._cancelled_recvs.discard(rid)
+
+    def _retire_room_receives_locked(
+        self, room: int
+    ) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]], Set[str]]:
+        to_cancel = self._claim_room_cancels_locked(room)
+        settled_plans: List[Tuple[str, int]] = []
+        held_plans: Set[str] = set()
+        for req_id, uuid in self._reshard_plans.pop(room, {}).items():
             if req_id in self._completed_recv or req_id in self._native_failed:
-                del self._cleared_plans[req_id]
+                if req_id in self._cancelled_recvs:
+                    self._cancelled_recvs.discard(req_id)
+                else:
+                    settled_plans.append((req_id, uuid))
+                continue
+            self._cleared_plans.add(req_id)
+            held_plans.add(req_id)
+        held_plans.update(
+            k for k in self._cleared_plans if self._is_room_transfer(k, room)
+        )
+        return to_cancel, settled_plans, held_plans
+
+    def _drop_settled_cleared_plans_locked(self) -> None:
+        for req_id in list(self._cleared_plans):
+            if req_id in self._completed_recv or req_id in self._native_failed:
+                self._cleared_plans.discard(req_id)
                 self._completed_recv.discard(req_id)
                 self._failed.discard(req_id)
                 self._native_failed.discard(req_id)
-                uuids.append(uuid)
-        return uuids
+                self._cancelled_recvs.discard(req_id)
+
+    def _room_died_locked(self, room: int) -> bool:
+        with self._status_lock:
+            status_failed = self.request_status.get(room) == KVPoll.Failed
+        return (
+            status_failed
+            or room in self._aborted
+            or self._is_failed_locked(room)
+            or (
+                self._decode is not None
+                and room not in self._decode.local_blocks
+                and room not in self._decode.reshard_meta
+            )
+        )
 
     def _release_pull_slots_locked(self) -> None:
         """Hand back the staging of reads that have settled."""
@@ -420,16 +534,27 @@ class RaidenReceiverMixin:
         local: List[int],
         unissued: Tuple[str, ...] = (),
     ) -> bool:
-        """Issue one admitted read; if the engine raises, fail the room.
+        """Issue one admitted read; cancel unsettled room reads on death or error.
 
         Runs inside the scheduler's poll, where an escaping exception would
         take down every request on this decode worker, or on the listener
-        thread, where the admitted read would never settle. Raiden raises from
-        ``start_read`` only before it registers the read, so it will never
-        report ``req_id`` -- nor the reads in ``unissued``, which this failure
-        keeps from being issued. They are settled here so the admission is
-        released, and the room concludes once its other reads settle.
+        thread, where the admitted read would never settle. If the room died
+        before issue or while ``start_read`` ran unlocked, unsettled reads of
+        the room are cancelled immediately. Raiden raises from ``start_read``
+        only before registering the read, so ``req_id`` and ``unissued`` are
+        settled locally to release admission while any already-issued sibling
+        reads are cancelled.
         """
+        with self._state_lock:
+            if self._room_died_locked(room):
+                self._native_failed.update((req_id, *unissued))
+                self._release_pull_slots_locked()
+                to_cancel = self._claim_room_cancels_locked(room)
+            else:
+                to_cancel = None
+        if to_cancel is not None:
+            self._cancel_receives(to_cancel)
+            return False
         try:
             engine.start_read(req_id, uuid, endpoint, remote, local)
         except Exception as e:
@@ -437,9 +562,28 @@ class RaidenReceiverMixin:
             logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
             with self._state_lock:
                 self._native_failed.update((req_id, *unissued))
-                self._fail_room_locked(room, reason)
+                if room in self._decode.local_blocks:
+                    self._fail_room_locked(room, reason, preserve_reason=True)
                 self._release_pull_slots_locked()
+                to_cancel = self._claim_room_cancels_locked(room)
+            self._cancel_receives(to_cancel)
             return False
+        bundle_key = self._pull_bundle_key(req_id=req_id, room=room)
+        with self._state_lock:
+            # Guard with bundle admission so a settled+cleared read cannot leak back in.
+            if (
+                self._pulling is not None
+                and bundle_key in self._pulling
+                and req_id not in self._completed_recv
+                and req_id not in self._native_failed
+            ):
+                self._pull_sessions.setdefault(room, {})[req_id] = uuid
+            to_cancel = (
+                self._claim_room_cancels_locked(room)
+                if self._room_died_locked(room)
+                else []
+            )
+        self._cancel_receives(to_cancel)
         logger.debug(
             "RaidenKVManager rank%d decode pull started | room=%s req_id=%s "
             "uuid=%d pages=%d from=%s",
@@ -979,16 +1123,13 @@ class RaidenReceiverMixin:
 
         spans = {(start, len(blocks)) for start, blocks in sources_map.values()}
         if len(spans) != 1:
-            reason = (
-                f"Raiden receive failed: room {room} chunk {index} announced "
-                f"with differing spans {sorted(spans)}"
+            self._fail_reshard_room(
+                room=room,
+                reason=(
+                    f"Raiden receive failed: room {room} chunk {index} announced "
+                    f"with differing spans {sorted(spans)}"
+                ),
             )
-            logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
-            with self._state_lock:
-                if room not in self._decode.reshard_meta:
-                    return None
-                self._failed.add(str(room))
-                self.record_failure(room, reason)
             return None
         start, length = spans.pop()
         with self._state_lock:
@@ -1105,11 +1246,10 @@ class RaidenReceiverMixin:
         self._register_receiver_and_signal(room)
 
     def _fail_reshard_plan_build(self, room: int, req_id: str, exc: Exception) -> None:
-        reason = f"Raiden receive failed: cannot build plan {req_id}: {exc}"
-        logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
-        with self._state_lock:
-            if room in self._decode.reshard_meta:
-                self._fail_room_locked(room, reason)
+        self._fail_reshard_room(
+            room=room,
+            reason=f"Raiden receive failed: cannot build plan {req_id}: {exc}",
+        )
 
     def _publish_reshard_plan(
         self,
@@ -1125,41 +1265,73 @@ class RaidenReceiverMixin:
         it and asks its sources to push, as one step.
 
         Registration runs outside the state lock and can fail when raiden
-        cannot stage the plan; the room can also be cleared meanwhile. The
-        plan is recorded and the push requested only under the lock that
+        cannot stage the plan; the room can also fail or be cleared meanwhile.
+        The plan is recorded and the push requested only under the lock that
         clearing takes, so a sender is never asked to push into pages the
         room no longer owns: a failed registration fails the room, and a
-        plan registered for a cleared room is dropped again.
+        plan registered for a dead or cleared room is cancelled until settled.
         """
         engine = self._ensure_engine()
         try:
             engine.register_active_plan(uuid, req, is_sender=False)
         except Exception as e:
-            reason = f"Raiden receive failed: cannot stage plan {req_id}: {e}"
-            logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
-            with self._state_lock:
-                if room not in self._decode.reshard_meta:
-                    # Cleared while registering: nothing reads a failure for
-                    # this room any more, so record none.
-                    return False
-                # State and reason land as one step, so a poll can never see
-                # the failure without its reason and a concurrent clear can
-                # never leave either behind.
-                self._failed.add(str(room))
-                self.record_failure(room, reason)
+            self._fail_reshard_room(
+                room=room,
+                reason=f"Raiden receive failed: cannot stage plan {req_id}: {e}",
+            )
             return False
         with self._state_lock:
-            if room in self._decode.reshard_meta and room not in self._aborted:
+            to_cancel = self._track_reshard_plan_locked(
+                room=room, req_id=req_id, uuid=uuid
+            )
+            if not to_cancel:
                 if record_read:
                     self._decode.chunk_reads.setdefault(room, []).append(req_id)
-                self._reshard_plans.setdefault(room, {})[req_id] = uuid
                 # Sent under the lock: after a clear wins it, no push can be
                 # requested for the pages the room gave back.
                 for endpoint in ready_endpoints:
                     self._send_multipart_locked(endpoint, ready_payload)
                 return True
-        self._unregister_plan(uuid)
+        self._cancel_receives(to_cancel)
         return False
+
+    def _fail_reshard_room(self, *, room: int, reason: str) -> None:
+        logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+        with self._state_lock:
+            if room not in self._decode.reshard_meta:
+                return
+            self._fail_room_locked(room, reason, preserve_reason=True)
+            to_cancel = self._claim_room_cancels_locked(room)
+        self._cancel_receives(to_cancel)
+
+    def _track_reshard_plan_locked(
+        self, *, room: int, req_id: str, uuid: int
+    ) -> List[Tuple[str, int]]:
+        if room not in self._decode.reshard_meta:
+            self._cleared_plans.add(req_id)
+            self._cancelled_recvs.add(req_id)
+            return [(req_id, uuid)]
+        self._reshard_plans.setdefault(room, {})[req_id] = uuid
+        if self._room_died_locked(room):
+            return self._claim_room_cancels_locked(room)
+        return []
+
+    def _commit_reshard_complement_locked(
+        self, *, room: int, has_closing_blocks: bool, ready_endpoints: List[str]
+    ) -> Tuple[bool, List[Tuple[str, int]]]:
+        if room not in self._decode.reshard_meta or self._room_died_locked(room):
+            return False, self._claim_room_cancels_locked(room)
+        # The closing read is owed from the moment the room can look
+        # complete: it is recorded before _final_seen so completion
+        # can never be inferred while its registration is pending.
+        if has_closing_blocks:
+            self._decode.chunk_reads.setdefault(room, []).append(str(room))
+        self._decode.final_seen.add(room)
+        if not has_closing_blocks:
+            payload = ReshardReady(room=room).to_frames()
+            for endpoint in ready_endpoints:
+                self._send_multipart_locked(endpoint, payload)
+        return has_closing_blocks, []
 
     def _register_reshard_swa_receiver(
         self,
@@ -1207,14 +1379,13 @@ class RaidenReceiverMixin:
         for p_rank in sorted(swa_sources_map):
             pages = swa_sources_map[p_rank]
             if len(pages) < n:
-                reason = (
-                    f"Raiden reshard SWA receive: source rank {p_rank} sent "
-                    f"{len(pages)} sliding-window pages, decode needs {n}"
+                self._fail_reshard_room(
+                    room=room,
+                    reason=(
+                        f"Raiden reshard SWA receive: source rank {p_rank} sent "
+                        f"{len(pages)} sliding-window pages, decode needs {n}"
+                    ),
                 )
-                logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
-                with self._state_lock:
-                    self._failed.add(str(room))
-                    self.record_failure(room, reason)
                 return False
             sources.append((p_rank, pages[-n:]))
 
@@ -1233,19 +1404,19 @@ class RaidenReceiverMixin:
             )
             self._swa_engine.register_active_plan(room, req, is_sender=False)
         except Exception as e:
-            reason = f"Raiden reshard SWA receive: cannot stage plan {room}: {e}"
-            logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
-            with self._state_lock:
-                if room in self._decode.reshard_meta:
-                    self._fail_room_locked(room, reason)
+            self._fail_reshard_room(
+                room=room,
+                reason=f"Raiden reshard SWA receive: cannot stage plan {room}: {e}",
+            )
             return False
+        swa_rid = self._swa_req_id(room)
         with self._state_lock:
-            if room not in self._decode.reshard_meta or room in self._aborted:
-                # Cleared while registering; drop the plan again so the pages
-                # cannot be written under their next owner.
-                self._unregister_plan(room)
-                return False
-            self._reshard_plans.setdefault(room, {})[self._swa_req_id(room)] = room
+            to_cancel = self._track_reshard_plan_locked(
+                room=room, req_id=swa_rid, uuid=room
+            )
+        if to_cancel:
+            self._cancel_receives(to_cancel)
+            return False
         # INFO for the same reason as the push: without it a skipped window and
         # a transferred one produce identical logs.
         logger.info(
@@ -1267,28 +1438,26 @@ class RaidenReceiverMixin:
     ) -> Optional[Dict[int, List[int]]]:
         n_swa = len(local_swa_blocks)
         if not n_swa or not swa_sources_map:
-            reason = (
-                f"Raiden reshard unified SWA receive: hybrid room {room} has "
-                f"nothing to receive (decode_pages={n_swa} "
-                f"sources={len(swa_sources_map)})"
+            self._fail_reshard_room(
+                room=room,
+                reason=(
+                    f"Raiden reshard unified SWA receive: hybrid room {room} has "
+                    f"nothing to receive (decode_pages={n_swa} "
+                    f"sources={len(swa_sources_map)})"
+                ),
             )
-            logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
-            with self._state_lock:
-                self._failed.add(str(room))
-                self.record_failure(room, reason)
             return None
         paired: Dict[int, List[int]] = {}
         for p_rank in sorted(swa_sources_map):
             pages = swa_sources_map[p_rank]
             if len(pages) < n_swa:
-                reason = (
-                    f"Raiden reshard unified SWA receive: source rank {p_rank} "
-                    f"sent {len(pages)} sliding-window pages, decode needs {n_swa}"
+                self._fail_reshard_room(
+                    room=room,
+                    reason=(
+                        f"Raiden reshard unified SWA receive: source rank {p_rank} "
+                        f"sent {len(pages)} sliding-window pages, decode needs {n_swa}"
+                    ),
                 )
-                logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
-                with self._state_lock:
-                    self._failed.add(str(room))
-                    self.record_failure(room, reason)
                 return None
             paired[p_rank] = pages[-n_swa:]
         return paired
@@ -1349,18 +1518,13 @@ class RaidenReceiverMixin:
                 unified_swa_sources is not None and bool(local_swa_blocks)
             )
             with self._state_lock:
-                if room not in self._decode.reshard_meta:
-                    return  # cleared while the complement was computed
-                # The closing read is owed from the moment the room can look
-                # complete: it is recorded before _final_seen so completion
-                # can never be inferred while its registration is pending.
-                if has_closing_blocks:
-                    self._decode.chunk_reads.setdefault(room, []).append(str(room))
-                self._decode.final_seen.add(room)
-            if not has_closing_blocks:
-                for endpoint in ready_endpoints:
-                    payload = ReshardReady(room=room).to_frames()
-                    self._send_multipart_locked(endpoint, payload)
+                need_closing, to_cancel = self._commit_reshard_complement_locked(
+                    room=room,
+                    has_closing_blocks=has_closing_blocks,
+                    ready_endpoints=ready_endpoints,
+                )
+            self._cancel_receives(to_cancel)
+            if not need_closing:
                 return
             sources = [
                 (
@@ -1533,7 +1697,12 @@ class RaidenKVReceiver(CommonKVReceiver):
             # The manager turned the room Transferring inside the admission.
             self._started = True
             return KVPoll.Transferring
-        return self.kv_mgr.check_status(self.bootstrap_room)
+        status = self.kv_mgr.check_status(self.bootstrap_room)
+        if status == KVPoll.Failed:
+            return self._conclude_failed(
+                notify=self.kv_mgr.is_failed(self.bootstrap_room)
+            )
+        return status
 
     def _check_handshake_timeout(self, status: KVPoll) -> Optional[str]:
         """Failure reason once the room has waited too long to ask the prefill
@@ -1593,8 +1762,8 @@ class RaidenKVReceiver(CommonKVReceiver):
         notify: bool = True,
         reason: Optional[str] = None,
     ) -> KVPoll:
-        """Terminalize the room: tombstone it so late frames cannot rebuild
-        it, and tell the prefill to release it.
+        """Terminalize the room: tombstone it, cancel unsettled receives, and
+        tell the prefill to release it.
 
         While raiden still holds one of the room's transfers, Failed is
         withheld -- the scheduler frees the room's pages on it, and the
@@ -1609,8 +1778,12 @@ class RaidenKVReceiver(CommonKVReceiver):
             if reason is not None:
                 self.kv_mgr._fail_room_unless_failed_locked(self.bootstrap_room, reason)
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-        if notify:
-            self._notify_prefill_abort()
+            to_cancel = self.kv_mgr._claim_room_cancels_locked(self.bootstrap_room)
+        try:
+            if notify:
+                self._notify_prefill_abort()
+        finally:
+            self.kv_mgr._cancel_receives(to_cancel)
         if self.kv_mgr.room_has_active_io(self.bootstrap_room):
             return KVPoll.Transferring
         self.conclude_state = KVPoll.Failed
