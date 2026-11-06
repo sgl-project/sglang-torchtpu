@@ -54,6 +54,14 @@ DEFAULT_TIMEOUT = 600
 REPLAY_TEXT_DATASETS = ("sharegpt", "custom")
 
 
+def get_last_gen_throughput(internal_states: List[dict]) -> float:
+    """Sum DP schedulers' recent decode rates; -1 means unavailable."""
+    throughputs = [state.get("last_gen_throughput") for state in internal_states]
+    if not throughputs or any(value is None for value in throughputs):
+        return -1
+    return sum(throughputs)
+
+
 def get_cache_tokens_from_metrics(url: str) -> Optional[tuple]:
     """
     Get cached_tokens_total and prompt_tokens_total from Prometheus /metrics endpoint.
@@ -967,14 +975,11 @@ def run_one_case(
         server_info = response.json()
         internal_states = server_info.get("internal_states", [])
         acc_length = -1
-        last_gen_throughput = -1
+        last_gen_throughput = get_last_gen_throughput(internal_states)
         for internal_state in internal_states:
             val_acc = internal_state.get("avg_spec_accept_length")
             if val_acc is not None:
                 acc_length = val_acc
-            val_thr = internal_state.get("last_gen_throughput")
-            if val_thr is not None:
-                last_gen_throughput = val_thr
 
     # Calculate cache hit rate from before/after metrics delta
     metrics_after = get_cache_tokens_from_metrics(url)
