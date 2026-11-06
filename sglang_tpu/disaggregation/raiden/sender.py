@@ -104,6 +104,10 @@ class RaidenSenderMixin:
                 self._prefill.decode_addr[room] = (decode_ip, decode_port)
                 self._prefill.decode_pages[room] = decode_pages
                 self._prefill.decode_swa_pages[room] = decode_swa_pages
+                if self.dram_offload_channel is not None:
+                    self.dram_offload_channel.accept_prefix_offer_locked(
+                        room, req.prefix_blocks
+                    )
                 held = self._prefill.held_chunks.pop(room, [])
                 total_pages = self._prefill.send_total.get(room, 0)
         if failed_reason is not None:
@@ -477,6 +481,11 @@ class RaidenSenderMixin:
         with self._state_lock:
             if room in self._aborted or not self._decode_requested_locked(room):
                 return False
+            if (
+                self.dram_offload_channel is not None
+                and self.dram_offload_channel.prefix_pull_open_locked(room)
+            ):
+                return False
             if self.request_status.get(room) == KVPoll.Bootstrapping:
                 self.update_status(room, KVPoll.WaitingForInput)
             return True
@@ -752,7 +761,7 @@ class RaidenSenderMixin:
                 reason=reason,
             )
             return
-        reason = raiden_offload.resharding_refusal()
+        reason = raiden_offload.resharding_refusal(decode_enabled=req.kv_offload)
         if reason is not None:
             # A decode at another attention TP cannot take host pages rank to
             # rank; serving it without the offload would hide that.

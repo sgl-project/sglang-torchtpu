@@ -1,12 +1,16 @@
 """The KV offload to decode DRAM refuses what it does not support.
 
 Every unsupported setting must stop the engine at start with a message that
-names the switch and the setting, on either role; a pair whose two engines
-disagree must fail its requests with the reason. A setting that silently
-runs without the offload fails here.
+names the switch and the setting, on either role, before the transfer manager
+is built; a pair whose two engines disagree must fail its requests with the
+reason. A setting that silently runs without the offload fails here.
 """
 
+import functools
+import sys
 import unittest
+from types import ModuleType
+from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -21,39 +25,25 @@ from sglang_tpu.testing.decode_dram_offload import (
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-import functools
-import re
-import sys
-import unittest
-from types import ModuleType
-from unittest.mock import patch
-
-from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.disaggregation.decode_dram_offload import (
-    startup_validation,
-)
-from sglang_tpu.testing.decode_dram_offload import (
-    SWITCH,
-    supported_engine,
-    validate_engine_as,
-)
-
 # (attribute of a supported engine, the value that breaks it, text the refusal
 # must contain)
 _UNSUPPORTED = (
-    ("kv_manager", object(), "--disaggregation-transfer-backend must be raiden"),
     ("scheduler.server_args.disable_radix_cache", True, "--disable-radix-cache"),
     ("disagg.optimistic_prefill_attempts", 1, "optimistic prefill is not supported"),
     ("device.sleep_on_idle", True, "--sleep-on-idle is not supported"),
-    ("tree_cache.tree_core", object(), "Python unified radix tree"),
-    ("tree_cache.cache_controller", None, "--enable-hierarchical-cache"),
+    ("scheduler.tree_cache.tree_core", object(), "Python unified radix tree"),
     ("memory.hicache_io_backend", "kernel", "--hicache-io-backend must be raiden"),
     ("memory.hicache_storage_backend", "file", "--hicache-storage-backend"),
     ("memory.enable_unified_memory", True, "--enable-unified-memory"),
-    ("kv_manager.attn_cp_size", 2, "context parallelism"),
-    ("kv_manager._state_kv_caches", (object(),), "GDN/Mamba"),
+    ("parallel.attn_cp_size", 2, "context parallelism"),
+    ("mambaish", object(), "GDN/Mamba"),
     ("scheduler.spec_algorithm.is_none", lambda: False, "speculative decoding"),
-    ("kv_manager._swa_kv_caches", [object()], "hybrid sliding-window models"),
+    ("scheduler.model_config.is_hybrid_swa", True, "hybrid sliding-window models"),
+    (
+        "scheduler.model_config.is_hybrid_swa_compress",
+        True,
+        "hybrid sliding-window models",
+    ),
     ("missing_api", ["register_read(source=)"], "(missing register_read(source=))"),
     (
         "scheduler.server_args.disaggregation_transfer_backend",
@@ -73,24 +63,6 @@ _UNSUPPORTED = (
     ("scheduler.server_args.dp_size", 2, "data parallelism"),
     ("scheduler.server_args.attn_dp_size", 2, "data parallelism"),
 )
-
-# Settings the server arguments alone decide: refused before the transfer
-# manager is built. The rest need the manager or the tree.
-_ARGS_ONLY = {
-    "scheduler.server_args.disable_radix_cache",
-    "disagg.optimistic_prefill_attempts",
-    "device.sleep_on_idle",
-    "memory.hicache_io_backend",
-    "memory.hicache_storage_backend",
-    "memory.enable_unified_memory",
-    "scheduler.spec_algorithm.is_none",
-    "missing_api",
-    "scheduler.server_args.disaggregation_transfer_backend",
-    "scheduler.server_args.enable_hierarchical_cache",
-    "scheduler.server_args.pp_size",
-    "scheduler.server_args.dp_size",
-    "scheduler.server_args.attn_dp_size",
-}
 
 
 def _broken(path, value):
@@ -132,34 +104,15 @@ class TestEngineRefusals(CustomTestCase):
         ):
             validate_engine_as(engine, role="decode")
 
-    def test_switch_off_checks_nothing(self):
-        for path, value, _ in _UNSUPPORTED:
-            validate_engine_as(_broken(path, value), switch=False)
-
-
-class TestArgumentRefusalsBeforeTheManager(CustomTestCase):
-    def test_argument_settings_are_refused_before_the_manager_and_the_rest_after(self):
-        for path, value, expected in _UNSUPPORTED:
-            with self.subTest(setting=path):
-                engine = _broken(path, value)
-                if path in _ARGS_ONLY:
-                    with self.assertRaisesRegex(
-                        startup_validation.UnsupportedDramOffloadConfig,
-                        re.escape(expected),
-                    ):
-                        validate_engine_as(engine, role="decode", args_only=True)
-                else:
-                    validate_engine_as(engine, role="decode", args_only=True)
-
-    def test_pipeline_transfer_env_is_refused_on_the_decode_before_the_manager(self):
+    def test_pipeline_transfer_env_is_refused_on_the_decode(self):
         engine = supported_engine()
         with patch.dict("os.environ", {"SGLANG_RAIDEN_PIPELINE_TRANSFER": "1"}):
-            validate_engine_as(engine, role="prefill", args_only=True)
+            validate_engine_as(engine, role="prefill")
             with self.assertRaisesRegex(
                 startup_validation.UnsupportedDramOffloadConfig,
                 "SGLANG_RAIDEN_PIPELINE_TRANSFER",
             ):
-                validate_engine_as(engine, role="decode", args_only=True)
+                validate_engine_as(engine, role="decode")
 
 
 class TestTpuSyncHostApi(CustomTestCase):
@@ -198,7 +151,7 @@ class TestTpuSyncHostApi(CustomTestCase):
         for manager, expected in ((Current, []), (Older, missing)):
             with self.subTest(manager.__name__), self._installed(manager):
                 self.assertEqual(
-                    startup_validation.missing_tpu_sync_host_api(), expected
+                    startup_validation._missing_tpu_sync_host_api(), expected
                 )
 
 

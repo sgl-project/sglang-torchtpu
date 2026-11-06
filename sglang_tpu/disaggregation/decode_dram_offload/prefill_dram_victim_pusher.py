@@ -24,7 +24,6 @@ import torch.distributed as dist
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang_tpu.disaggregation.decode_dram_offload.radix_host_ops import (
-    depth_tokens,
     host_pages,
     is_live_host_backed_leaf,
     leaf_of,
@@ -49,22 +48,20 @@ _PUSH_FULL_FREE_TOKENS = 65536
 _ACK_TIMEOUT_S = 60.0
 # Arbitrary: often enough to follow a sweep, rare enough to stay quiet.
 _LOG_INTERVAL_S = 30.0
-# Arbitrary: how long a cache flush waits for in-flight pushes to settle.
-DRAIN_TIMEOUT_S = 60.0
 
 # Victim paths take access stamps counting up from here, so they stay older
 # than any live node (the tree's counter starts at 0) yet never tie.
 _VICTIM_STAMP_BASE = -1.0e15
 
 
-def log_offload_stats(stats: Dict[str, int], role: str, last: List[float]) -> None:
+def log_offload_stats(stats: Dict[str, int], what: str, last: List[float]) -> None:
     now = time.monotonic()
     if now - last[0] < _LOG_INTERVAL_S:
         return
     last[0] = now
     logger.info(
-        "[victim-push] role=%s %s",
-        role,
+        "[dram-offload] %s %s",
+        what,
         " ".join(f"{k}={v}" for k, v in stats.items() if v),
     )
 
@@ -81,8 +78,6 @@ class _PushInFlight(msgspec.Struct):
     # The decode's answer; False also once the offer could not be sent, timed
     # out or failed. The registration still drains before the push settles.
     stored: Optional[bool] = None
-    # Set once the registration settled: whether the decode stored the push.
-    ok: Optional[bool] = None
 
 
 def victim_transfer_id(prefill: str, seq: int) -> str:
@@ -106,7 +101,7 @@ class PrefillDramVictimPusher:
         # Incarnation shared by this prefill's ranks: independent prefills and
         # restarts cannot alias push labels on one decode.
         epoch = self._lockstep.reduce([[secrets.randbits(62)]], dist.ReduceOp.MIN)[0][0]
-        self._channel.victim_namespace = f"{epoch:x}"
+        self._namespace = f"{epoch:x}"
         # Exact cached leaf -> (decode peer, semantic fingerprint). Weak keys
         # disappear with eviction and retain independent shared-prefix branches.
         self._routes = weakref.WeakKeyDictionary()
@@ -114,21 +109,21 @@ class PrefillDramVictimPusher:
         # Path length last pushed, or found unpushable, per session.
         self._pushed_len = weakref.WeakKeyDictionary()
         self._next_seq = 1
-        # Access stamps handed to victim paths: far below the tree's access
-        # counter (which starts at 0 and only grows), increasing per node.
         self._victim_stamp = _VICTIM_STAMP_BASE
         self.stats = dict.fromkeys(("started", "stored", "declined"), 0)
         self._last_log = [0.0]
 
-    def note_decode_of(self, req: Any) -> None:
-        """Carry the actual decode peer to the request's cache checkpoint."""
+    def note_decode_of(self, req: Any, *, recalled: bool) -> None:
+        """Carry the actual decode peer to the request's cache checkpoint.
+        ``recalled``: the request's cached prefix was just read from that
+        decode, which therefore holds it."""
         peer = self._channel.decode_peer(req.bootstrap_room)
         if peer is not None:
             req._pd_victim_decode_peer = peer
-        self.track_host_leaf(req)
+        self.track_host_leaf(req, on_decode=recalled)
 
-    def track_host_leaf(self, req: Any) -> None:
-        # Set by record(); a request that never reached its commit has none.
+    def track_host_leaf(self, req: Any, *, on_decode: bool = False) -> None:
+        # Set by note_decode_of(); a request that never reached its commit has none.
         peer = getattr(req, "_pd_victim_decode_peer", None)
         node_id = req.last_node
         if node_id is None:
@@ -148,10 +143,9 @@ class PrefillDramVictimPusher:
                 peer,
                 push_manifest(tokens, node.key.extra_key, node.key.cache_salt),
             )
-
-    def clear_push_routes(self) -> None:
-        self._routes.clear()
-        self._pushed_len.clear()
+            if on_decode:
+                # Not pushed back at the length it was recalled at.
+                self._pushed_len[node] = len(tokens)
 
     def advance(self, *, serving: bool) -> None:
         """Every bootstrap step, every rank; no tree decision uses a local
@@ -160,21 +154,18 @@ class PrefillDramVictimPusher:
         be flushed."""
         self.retire_settled_pushes()
         self._start_push_if_agreed(serving=serving)
-        log_offload_stats(self.stats, "prefill", self._last_log)
+        log_offload_stats(self.stats, "push", self._last_log)
 
     def has_pushes_in_flight(self) -> bool:
         return bool(self._pushes)
 
     def release_all(self) -> None:
-        """Keep source pins until every native registration has drained."""
-        for push in self._pushes.values():
-            push.stored, push.ok = False, None
-        self._lockstep.drain_until(
-            done=lambda: not self._pushes,
-            step=self.retire_settled_pushes,
-            timeout_s=DRAIN_TIMEOUT_S,
-            what="a victim read is in flight",
-        )
+        """Before a cache reset or memory release, which core issues only on
+        an idle engine: no push may be in flight."""
+        if self._pushes:
+            raise RuntimeError("victim pushes are in flight; the engine is not idle")
+        self._routes.clear()
+        self._pushed_len.clear()
 
     def retire_settled_pushes(self) -> None:
         """Retire the pushes whose outcome every rank has."""
@@ -196,9 +187,8 @@ class PrefillDramVictimPusher:
             )
             if sent is False:
                 push.stored = False
-            if push.stored is not None and sent is not None and push.ok is None:
-                push.ok = push.stored and sent
-            rows.append([int(push.ok is not None), int(push.ok is True)])
+            settled = push.stored is not None and sent is not None
+            rows.append([int(settled), int(settled and push.stored and sent)])
         # A rank that failed makes every rank treat the push as declined, so
         # no tree diverges.
         agreed = self._lockstep.reduce(rows, dist.ReduceOp.MIN)
@@ -234,27 +224,22 @@ class PrefillDramVictimPusher:
         # [picked, the leaf's fingerprint (2 values), its tokens, its host pages]
         row = [0, 0, 0, 0, 0]
         if picked is not None:
-            decode, leaf = picked
-            path = path_tokens(self._cache, leaf)
-            pages = host_pages(self._cache, self._host_pool, leaf)
+            decode, leaf, path, pages = picked
             row = [
                 1,
                 *push_manifest(path, leaf.key.extra_key, leaf.key.cache_salt),
                 len(path),
-                -1 if pages is None else len(pages),
+                len(pages),
             ]
         low, high = self._lockstep.min_max(row)
-        if not low[0] or low[:4] != high[:4]:
-            return
-        if low[4] != high[4] or pages is None:
+        if not low[0] or low != high:
             return
         # Not again at this length, stored or not.
         self._pushed_len[leaf] = len(path)
         seq = self._next_seq
         self._next_seq += 1
-        namespace = self._channel.victim_namespace
-        uuid = _transfer_uuid(namespace, seq)
-        read_id = victim_transfer_id(namespace, seq)
+        uuid = _transfer_uuid(self._namespace, seq)
+        read_id = victim_transfer_id(self._namespace, seq)
         push = _PushInFlight(
             seq=seq,
             leaf=leaf,
@@ -268,6 +253,7 @@ class PrefillDramVictimPusher:
         if not self._lockstep.all(push.read_id is not None) or not (
             self._channel.send_victim_push(
                 decode=decode,
+                prefill=self._namespace,
                 seq=seq,
                 tokens=path,
                 blocks=pages,
@@ -278,10 +264,13 @@ class PrefillDramVictimPusher:
         ):
             push.stored = False
 
-    def _pick_coldest_host_leaf(self) -> Optional[Tuple[Tuple[str, int], Any]]:
-        """(decode peer, leaf) of the oldest leaf owned by a known decode whose
-        whole path is in host RAM now. A leaf whose backup is still pending is
-        a candidate again once it completed."""
+    def _pick_coldest_host_leaf(
+        self,
+    ) -> Optional[Tuple[Tuple[str, int], Any, List[int], List[int]]]:
+        """(decode peer, leaf, its path tokens, its host pages) of the oldest
+        leaf owned by a known decode whose whole path is in host RAM now. A
+        leaf whose backup is still pending is a candidate again once it
+        completed."""
         busy = {push.leaf for push in self._pushes.values()}
         candidates = []
         for node, (peer, fingerprint) in list(self._routes.items()):
@@ -290,12 +279,16 @@ class PrefillDramVictimPusher:
                 self._routes.pop(node, None)
             if not pushable or node in busy:
                 continue
-            if self._pushed_len.get(node) == depth_tokens(self._cache, node):
+            path = path_tokens(self._cache, node)
+            if self._pushed_len.get(node) == len(path):
                 continue
-            if host_pages(self._cache, self._host_pool, node) is None:
+            pages = host_pages(self._cache, self._host_pool, node)
+            if pages is None:
                 continue
-            candidates.append((node.last_access_time, fingerprint, peer, node))
+            candidates.append(
+                (node.last_access_time, fingerprint, peer, node, path, pages)
+            )
         if not candidates:
             return None
-        _, _, peer, node = min(candidates, key=lambda x: x[:2])
-        return peer, node
+        _, _, peer, node, path, pages = min(candidates, key=lambda x: x[:2])
+        return peer, node, path, pages
