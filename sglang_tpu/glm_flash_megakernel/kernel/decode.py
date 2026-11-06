@@ -68,6 +68,11 @@ class KernelConfig:
     n_layers: int | None = None
     attn_tile: int = 512
     fp8_kda: bool = True
+    # Static layer indices: the period loop body spills ~36 MiB of VMEM at 32 rows.
+    unroll_periods: bool = False
+    # One bf16 slab buffer (saves slab_rows x H x 2 B); the next layer's slab streams in
+    # during this layer's MLP instead of its whole body.
+    single_slab: bool = False
     ch_experts: bool = True
     km_slots: int = 4
     km_issue: int = 2
@@ -267,7 +272,7 @@ def scratch_shapes(spec, layout, cfg: KernelConfig):
     S = cfg.slots if cfg.ring else 1
     # Positional: the order must match the kernel's scratch arguments.
     return [
-        pltpu.VMEM((2, slab_rows, H), BF16),
+        pltpu.VMEM((1 if cfg.single_slab else 2, slab_rows, H), BF16),
         pltpu.VMEM((2, 1, H), F32),
         # Each ring has its own semaphore array: two in-flight DMAs must not share a semaphore.
         pltpu.VMEM((KM_SLOTS, H, KM_TILE), BF16),
@@ -489,11 +494,15 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
         me = jax.lax.axis_index(AXIS)
         sm, smf = _Half(sm2), _Half(smf2)
 
-        def slab_copies(L, par):
-            return [
-                pltpu.make_async_copy(w_smalls.at[L], sm2.at[par], sslab.at[par, 0]),
-                pltpu.make_async_copy(w_smallsf.at[L], smf2.at[par], sslab.at[par, 1]),
+        SLAB1 = cfg.single_slab
+
+        def slab_copies(L, par, part=slice(None)):
+            sl = 0 if SLAB1 else par
+            cps = [
+                lambda: pltpu.make_async_copy(w_smalls.at[L], sm2.at[sl], sslab.at[par, 0]),
+                lambda: pltpu.make_async_copy(w_smallsf.at[L], smf2.at[par], sslab.at[par, 1]),
             ]
+            return [mk() for mk in cps[part]]
 
         # Each pad slot has one writer per round: never clear the pad locally, as a peer's
         # DMA may land first. Pads alternate on a static parity: a peer is at most one round
@@ -980,7 +989,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     iq_all[r].reshape(hi, idh), hmat
                 )
             _wait(kvb_cp, "w_wait")
-            kvbf = kvb[...].astype(F32)
+            # Read kv_b per head from the ref: a whole-block f32 value is an 8 MiB spill.
             scaling = qk**-0.5 * ks
             pcol = jax.lax.broadcasted_iota(jnp.int32, (PT, 1), 0)
             gidx = jax.lax.broadcasted_iota(
@@ -1147,7 +1156,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     [
                         dot(
                             qrows[:, h * qk : (h + 1) * qk],
-                            kvbf[h * per : h * per + qk].astype(BF16),
+                            kvb[pl.ds(h * per, qk), :],
                             ((1,), (0,)),
                         )
                         for h in range(nh)
@@ -1199,7 +1208,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 outs = []
                 for h in range(nh):
                     lat = a_f[h * Q : (h + 1) * Q] / (l_f[h * Q : (h + 1) * Q] + 1e-30)
-                    w_vc = kvbf[h * per + qk : (h + 1) * per].astype(BF16)
+                    w_vc = kvb[pl.ds(h * per + qk, vd), :]
                     outs.append(dot(lat, w_vc, ((1,), (1,))) * ks)
                 out = jnp.concatenate(outs, axis=1).astype(BF16)
                 attb[b] = jnp.pad(out, ((0, 16 - Q), (0, 0)))
@@ -1310,38 +1319,49 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             safe = jnp.minimum(idxs, nexp - 1)
             sc_route.__exit__(None, None, None)
 
-            # Entry 0 is the shared expert, whose copy moe_early already started.
-            entries = [None] + list(range(n_slot))
-
-            def slot_copies(k, m=None, part=slice(None)):
-                """Slot k's copies from layer m's experts; any layer for a wait (same shapes)."""
-                e = entries[k]
-                if e is None:
-                    return shared_copies(m_i)
-                m = m_cands[0] if m is None else m
-                return expert_copies(
-                    k % S,
-                    w_egu[m].at[safe[e]],
-                    w_edn[m].at[safe[e]],
-                    w_egus.at[pl.ds(base + safe[e], 1)],
-                    w_edns.at[pl.ds(base + safe[e], 1)],
-                    part=part,
-                )
-
-            n_e = len(entries)
+            # Entry 0 is the shared expert, whose copy moe_early already started;
+            # entry k >= 1 is union slot k - 1.
+            n_e = 1 + n_slot
             # R > 1: union ids are ascending with unused slots last, so only the first n_u run.
             guard = R > 1
             n_u = jnp.sum(union.astype(jnp.int32)) if guard else None
+            slot_lane = jax.lax.broadcasted_iota(jnp.int32, (1, n_slot), 1)
+            idx_row = idxs.reshape(1, n_slot)
+
+            def entry_ids(e):
+                """(routed id, fetch id) of union slot e; e may be traced."""
+                if isinstance(e, int):
+                    return idxs[e], safe[e]
+                i = jnp.sum(jnp.where(slot_lane == e, idx_row, 0))
+                return i, jnp.minimum(i, nexp - 1)
+
+            def is_shared(k):
+                return isinstance(k, int) and k == 0
+
+            def slot_copies(k, m=None, part=slice(None)):
+                """Entry k's copies from layer m's experts; any layer for a wait (same shapes)."""
+                if is_shared(k):
+                    return shared_copies(m_i)
+                m = m_cands[0] if m is None else m
+                _, s = entry_ids(k - 1)
+                return expert_copies(
+                    k % S,
+                    w_egu[m].at[s],
+                    w_edn[m].at[s],
+                    w_egus.at[pl.ds(base + s, 1)],
+                    w_edns.at[pl.ds(base + s, 1)],
+                    part=part,
+                )
 
             def when(k, fn):
-                if not guard or entries[k] is None:
+                if not guard or is_shared(k):
                     fn()
                 else:
-                    pl.when(entries[k] < n_u)(fn)
+                    pl.when(k - 1 < n_u)(fn)
 
             def start(k):
                 def go():
-                    if entries[k] is None or len(m_cands) == 1:
+                    if is_shared(k) or len(m_cands) == 1:
                         for c in slot_copies(k):
                             c.start()
                         return
@@ -1357,75 +1377,69 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
 
                 when(k, go)
 
+            def body(k):
+                sl = k % S
+                for c in slot_copies(k):
+                    _wait(c, "e_wait")
+                w_j = None
+                if not is_shared(k):
+                    i, s = entry_ids(k - 1)
+                    # A masked sum, since a dynamic lane extract does not lower.
+                    hit = jax.lax.broadcasted_iota(jnp.int32, (R, nexp), 1) == i
+                    w_j = jnp.sum(jnp.where(hit, wts, 0.0), axis=1, keepdims=True)
+                if CH_EXPERTS:
+                    h = (
+                        jnp.dot(x.astype(BF16), r8a[sl], preferred_element_type=F32)
+                        * egsr[sl]
+                    )
+                    act = K.swiglu_clamped(h[:, :moesh], h[:, moesh:], spec.swiglu_limit)
+                    y = (
+                        jnp.dot(act.astype(BF16), r8d[sl], preferred_element_type=F32)
+                        * edsr[sl]
+                    )
+                    return y if w_j is None else w_j * y
+                if is_shared(k):
+                    early[3].wait()
+                    early[4].wait()
+                    gs, dsc = s_sgu[...], s_sdn[...]
+                else:
+                    gs, dsc = egs[s], eds[s]
+                h = K.matvec_fp8(x, r8a[sl, : 2 * moesh, :H], gs, blk)
+                act = K.swiglu_clamped(h[:, :moesh], h[:, moesh:], spec.swiglu_limit)
+                y = K.matvec_fp8(act, r8d[sl, :H, :moesh], dsc, blk)
+                return y if w_j is None else w_j * y
+
             for k in range(1, min(PF + 1, n_e)):
                 start(k)
             if n_e > 1 and not CH_EXPERTS:
                 early[1].wait()
                 early[2].wait()
-            if guard:
-                macc[...] = jnp.zeros(macc.shape, F32)
-            for k in range(n_e):
-                sl = k % S
-                e = entries[k]
+            if not guard:
+                for k in range(n_e):
+                    acc = acc + body(k)
+                    sinkhorn_bg(2)
+                    if k + PF + 1 < n_e:
+                        start(k + PF + 1)
+                return allreduce(acc)
 
-                def body(k=k, sl=sl, e=e):
-                    for c in slot_copies(k):
-                        _wait(c, "e_wait")
-                    if CH_EXPERTS:
-                        w_j = None
-                        if e is not None:
-                            hit = (
-                                jax.lax.broadcasted_iota(jnp.int32, (R, nexp), 1)
-                                == idxs[e]
-                            )
-                            w_j = jnp.sum(
-                                jnp.where(hit, wts, 0.0), axis=1, keepdims=True
-                            )
-                        h = (
-                            jnp.dot(x.astype(BF16), r8a[sl], preferred_element_type=F32)
-                            * egsr[sl]
-                        )
-                        act = K.swiglu_clamped(
-                            h[:, :moesh], h[:, moesh:], spec.swiglu_limit
-                        )
-                        y = (
-                            jnp.dot(
-                                act.astype(BF16), r8d[sl], preferred_element_type=F32
-                            )
-                            * edsr[sl]
-                        )
-                        return y if w_j is None else w_j * y
-                    if e is None:
-                        early[3].wait()
-                        early[4].wait()
-                        gs, dsc, w_j = s_sgu[...], s_sdn[...], None
-                    else:
-                        gs, dsc = egs[safe[e]], eds[safe[e]]
-                        # A masked sum, since a dynamic lane extract does not lower.
-                        hit = (
-                            jax.lax.broadcasted_iota(jnp.int32, (R, nexp), 1) == idxs[e]
-                        )
-                        w_j = jnp.sum(jnp.where(hit, wts, 0.0), axis=1, keepdims=True)
-                    h = K.matvec_fp8(x, r8a[sl, : 2 * moesh, :H], gs, blk)
-                    act = K.swiglu_clamped(
-                        h[:, :moesh], h[:, moesh:], spec.swiglu_limit
-                    )
-                    y = K.matvec_fp8(act, r8d[sl, :H, :moesh], dsc, blk)
-                    return y if w_j is None else w_j * y
+            # One loop body for the union entries: unrolling 8 * R of them (each with a
+            # layer-select branch per period) spilled tens of MiB of VMEM at 32 rows.
+            macc[...] = body(0)
+            if PF + 1 < n_e:
+                start(PF + 1)
 
-                if guard:
+            def entry(k, c):
+                def run():
+                    macc[...] += body(k)
 
-                    def guarded(body=body):
-                        macc[...] += body()
-
-                    when(k, guarded)
-                else:
-                    acc = acc + body()
-                sinkhorn_bg(2)
+                when(k, run)
                 nxt = k + PF + 1
-                if nxt < n_e:
-                    start(nxt)
-            return allreduce(macc[...] if guard else acc)
+                pl.when(nxt < n_e)(lambda: start(nxt))
+                return c
+
+            jax.lax.fori_loop(1, n_e, entry, 0)
+            sinkhorn_bg(2 * n_e)
+            return allreduce(macc[...])
 
         def dense(x, d_i):
             _dma(w_dnsc.at[d_i], psc, sem2)
@@ -1450,22 +1464,26 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             """`next_kda`: start that KDA layer's qkv during this FFN; `prewarmed`: ours was started so."""
             slab_kind = f"{kind}_{'sparse' if mlp_kind == 'moe' else 'dense'}"
             par = L % 2 if par is None else par
-            sm.i = smf.i = par
+            sm.i, smf.i = (0 if SLAB1 else par), par
+
+            def prefetch(part):
+                def go():
+                    for c in slab_copies(L + 1, 1 - par, part):
+                        c.start()
+
+                if not isinstance(L, int):
+                    pl.when(L + 1 < n_layers)(go)
+                elif L + 1 < n_layers:
+                    go()
+
             with _scope("slab"):
                 if isinstance(L, int) and L == 0:
                     for c in slab_copies(L, par):
                         c.start()
                 for c in slab_copies(L, par):
                     c.wait()
-
-                def prefetch():
-                    for c in slab_copies(L + 1, 1 - par):
-                        c.start()
-
-                if not isinstance(L, int):
-                    pl.when(L + 1 < n_layers)(prefetch)
-                elif L + 1 < n_layers:
-                    prefetch()
+                # Single-buffered: the bf16 slab waits for this layer's last read (mhc_ffn).
+                prefetch(slice(1, None) if SLAB1 else slice(None))
             if kind == "kda":
                 if not prewarmed:
                     warm_km(w_kqkv, kda_ord(L), FP8_KDA)
@@ -1493,6 +1511,8 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 x = K.rms_norm(
                     x, slab.get(sm, "post_attention_layernorm").reshape(1, H), eps, BF16
                 )
+            if SLAB1:
+                prefetch(slice(0, 1))
             with _scope(mlp_kind):
                 m = (
                     moe(x, moe_ord(L), slab_kind, early, moe_cands or [moe_ord(L)])
@@ -1518,8 +1538,10 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
         def cands(j):
             return [moe_ord(f0 + 4 * q + j) for q in range(full_periods)]
 
-        def period(p, s_):  # noqa: ARG001 - p is the traced period index
+        def period(p, s_):
             base = f0 + 4 * p
+            # Unrolled: the layer is known, so one candidate and no select branches.
+            mc = (lambda j: [moe_ord(base + j)]) if isinstance(p, int) else cands
             s_ = layer(
                 s_,
                 base,
@@ -1527,7 +1549,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 "moe",
                 next_kda=base + 1,
                 par=f0 % 2,
-                moe_cands=cands(0),
+                moe_cands=mc(0),
             )
             s_ = layer(
                 s_,
@@ -1537,7 +1559,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 next_kda=base + 2,
                 prewarmed=True,
                 par=(f0 + 1) % 2,
-                moe_cands=cands(1),
+                moe_cands=mc(1),
             )
             s_ = layer(
                 s_,
@@ -1547,7 +1569,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 next_kda=base + 3,
                 prewarmed=True,
                 par=(f0 + 2) % 2,
-                moe_cands=cands(2),
+                moe_cands=mc(2),
             )
             s_ = layer(
                 s_,
@@ -1556,11 +1578,14 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 "moe",
                 prewarmed=True,
                 par=(f0 + 3) % 2,
-                moe_cands=cands(3),
+                moe_cands=mc(3),
             )
             return s_
 
-        if full_periods > 0:
+        if cfg.unroll_periods:
+            for p in range(full_periods):
+                streams = period(p, streams)
+        elif full_periods > 0:
             streams = jax.lax.fori_loop(0, full_periods, period, streams)
 
         for L in range(spec.first_k_dense_replace + 4 * full_periods, n_layers):

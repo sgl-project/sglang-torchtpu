@@ -109,6 +109,8 @@ class GlmFlashMegakernel:
                 prefetch=1 if big else 2,
                 km_slots=3 if big else 4,
                 km_issue=1 if big else 2,
+                unroll_periods=big,
+                single_slab=big,
             )
 
         self.cfgs = {b: cfg_for(b) for b in _buckets(self.call_req)}
