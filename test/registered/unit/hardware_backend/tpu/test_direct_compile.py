@@ -198,7 +198,7 @@ class TestPPProxyPytree(CustomTestCase):
 
 class TestAuxHiddenStatePytree(CustomTestCase):
     def test_aux_list_output_flattens_to_tensor_leaves_and_rebuilds(self):
-        """A target verify that returns (hidden, aux) for DFlash capture must trace.
+        """A target that returns (hidden, aux), for EAGLE3 or DFlash capture, must trace.
 
         Unregistered, the aux list is one opaque leaf and direct_compile rejects
         the output as a non-tensor.
@@ -231,21 +231,6 @@ def _make_pruning_function(model, kv_pool, callback_values, **compile_options):
         kv_pool=kv_pool,
         **compile_options,
     )
-
-
-class TestAuxHiddenStatePytree(CustomTestCase):
-    def test_aux_states_flatten_to_tensor_leaves_and_rebuild(self):
-        """An EAGLE3 target's (hidden, aux) output must reach direct_compile as
-        tensor leaves; an opaque list leaf fails its all-TPU-tensors check."""
-        hidden, first, second = torch.zeros(2), torch.ones(2), torch.full((2,), 2.0)
-        leaves, treespec = tree_util.tree_flatten(
-            (hidden, AuxHiddenStateList([first, second]))
-        )
-        self.assertEqual(len(leaves), 3)
-        self.assertTrue(all(isinstance(leaf, torch.Tensor) for leaf in leaves))
-        _, aux = tree_util.tree_unflatten(treespec, leaves)
-        self.assertIsInstance(aux, AuxHiddenStateList)
-        self.assertIs(aux[1], second)
 
 
 class TestDirectCompile(CustomTestCase):

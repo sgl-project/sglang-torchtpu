@@ -168,7 +168,7 @@ ${WEIGHTS_VOLUME}
 
                       if [ "$NNODES" -le 1 ]; then
                         # Single-host: each test self-launches its own server.
-                        exec python3 test/run_suite.py --hw tpu --suite ${SUITE} ${NIGHTLY_FLAG} ${PARTITION_FLAGS} ${TEST_FILE_FLAG} ${CHIP_WORKERS_FLAG} --timeout-per-file ${TIMEOUT_PER_FILE}
+                        exec python3 test/run_suite.py --hw tpu --suite ${SUITE} ${NIGHTLY_FLAG} ${PARTITION_FLAGS} ${TEST_FILE_FLAG} ${CHIP_WORKERS_FLAG} ${EXECUTION_BUDGET_FLAG} --timeout-per-file ${TIMEOUT_PER_FILE}
                       fi
 
                       # Multi-host: every host runs the launch group's recipe (owns model+config).

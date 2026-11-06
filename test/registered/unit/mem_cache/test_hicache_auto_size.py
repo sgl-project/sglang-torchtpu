@@ -190,6 +190,31 @@ class TestHiCacheAutoSize(CustomTestCase):
             resolution_result(explicit, "hicache_host_memory_fraction", 0.8)
         )
 
+    def test_register_sizeable_pool_enables_custom_pool_and_is_idempotent(self):
+        class _CustomDevicePool:
+            host_capacity_bytes = None
+
+            def get_kv_size_bytes(self) -> int:
+                return 8192
+
+        pool = _CustomDevicePool()
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=Mock(get_kvcache=Mock(return_value=pool)),
+            page_size=2,
+        )
+        with patch.object(sizing, "_SIZEABLE_POOLS", sizing._SIZEABLE_POOLS):
+            with self.assertRaisesRegex(
+                ValueError, "HiCache auto-sizing does not support _CustomDevicePool"
+            ):
+                sizing._estimate_hicache_bytes(params, None)
+
+            sizing.register_sizeable_pool(_CustomDevicePool)
+            sizing.register_sizeable_pool(_CustomDevicePool)
+            self.assertEqual(sizing._SIZEABLE_POOLS.count(_CustomDevicePool), 1)
+            self.assertEqual(sizing._estimate_hicache_bytes(params, None), 8192)
+
 
 if __name__ == "__main__":
     unittest.main()
