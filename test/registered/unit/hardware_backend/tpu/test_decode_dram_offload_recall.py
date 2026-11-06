@@ -43,6 +43,7 @@ from sglang_tpu.disaggregation.decode_dram_offload.rank_lockstep import (
 from sglang_tpu.disaggregation.raiden.dram_offload_channel import DramOffloadChannel
 from sglang_tpu.testing.decode_dram_offload import (
     FULL,
+    HYBRID_PAGE,
     PREFILL_INFO,
     ROOM,
     SWITCH,
@@ -53,6 +54,7 @@ from sglang_tpu.testing.decode_dram_offload import (
     device_hit,
     full_cache,
     host_hit,
+    hybrid_cache,
     insert_tokens,
     offload_context,
     prefill_manager,
@@ -126,7 +128,7 @@ class TestRecallLifecycle(
         plan = puller._plans[ROOM]
         self.assertEqual((plan.first_page, plan.num_pages), (4, 12))
         self.assertEqual(plan.remote, list(range(4, 16)))
-        mgr.ready, mgr.read_done = (11, "10.0.0.2:5"), None
+        mgr.ready, mgr.read_done = (11, "10.0.0.2:5", 0, ""), None
         puller.advance([req], waiting_reqs=[])
         mgr.read_done = True
         puller.advance([req], waiting_reqs=[])
@@ -418,7 +420,8 @@ class TestDecodeOffersWhatItHoldsInRam(CustomTestCase):
         self._pushed(cache, victim)
         source.offer_host_prefix(self._decode_req(victim + [1, 2, 3, 4]))
         manager.offer_resident_prefix.assert_called_once()
-        room, pages = manager.offer_resident_prefix.call_args.args
+        room, pages, swa_pages = manager.offer_resident_prefix.call_args.args
+        self.assertEqual(swa_pages, [])
         self.assertEqual((room, len(pages)), (ROOM, 16))
         self.assertIn(ROOM, source.offers)
         # Pinned for the prefill's read.
@@ -464,7 +467,7 @@ class TestDecodeOffersWhatItHoldsInRam(CustomTestCase):
         victim = list(range(300, 316))
         self._pushed(cache, victim)
         source.offer_host_prefix(self._decode_req(victim))
-        _, pages = manager.offer_resident_prefix.call_args.args
+        _, pages, _ = manager.offer_resident_prefix.call_args.args
         self.assertLess(len(pages), 16)
 
 
@@ -530,16 +533,20 @@ class TestPushThenRecallBetweenTwoEngines(CustomTestCase):
     workers and real raiden channels, with the messages handed over by the
     test. Only the native transfer is a double, completed by the test."""
 
-    def _engine(self, mgr):
-        cache, allocator = full_cache(kv_size=64, host_capacity=32)
+    def _engine(self, mgr, cache_and_allocator=None, *, page_size=1):
+        cache, allocator = cache_and_allocator or full_cache(
+            kv_size=64, host_capacity=32
+        )
         channel = mgr.dram_offload_channel
-        channel.bind_host_pool(cache.cache_controller.host)
+        ctx = offload_context(cache=cache, channel=channel, page_size=page_size)
+        channel.bind_host_pools(ctx.host_pool, ctx.swa_host_pool)
         return SimpleNamespace(
             mgr=mgr,
             cache=cache,
             allocator=allocator,
-            host=cache.cache_controller.host,
-            ctx=offload_context(cache=cache, channel=channel),
+            host=ctx.host_pool,
+            swa_host=ctx.swa_host_pool,
+            ctx=ctx,
             delivered=0,
         )
 
@@ -645,6 +652,112 @@ class TestPushThenRecallBetweenTwoEngines(CustomTestCase):
         self.assertFalse(holds(prefill))
 
 
+class TestHybridWindowTravelsWithTheBranch(TestPushThenRecallBetweenTwoEngines):
+    """A hybrid sliding-window model moves the window that ends where the
+    branch ends, through the SWA host pools, with the full pages."""
+
+    def test_hybrid_window_over_a_held_window_returns_its_pages(self):
+        """A branch that returns one page longer brings a window that overlaps
+        the one its path already holds. The overlap goes back to the SWA host
+        pool, not to the L3 release queue, which nothing drains here."""
+        page, window = HYBRID_PAGE, 2 * HYBRID_PAGE
+        cache, _ = hybrid_cache(window=window)
+        full = cache.cache_controller.host
+        swa = radix_host_ops.swa_host_pool(cache)
+        session = list(range(6 * page))
+        for pages in range(1, 7):
+            tokens = session[: pages * page]
+            radix_host_ops.insert_host_prefix(
+                cache,
+                RadixKey(array("q", tokens)),
+                full.alloc(len(tokens)),
+                page,
+                swa_indices=swa.alloc(min(len(tokens), window)),
+            )
+        self.assertEqual(full.used, len(session))
+        self.assertLessEqual(swa.used, len(session))
+        cache.evict_host(len(session), FULL)
+        cache.evict_host(len(session), ComponentType.SWA)
+        self.assertEqual((full.used, swa.used), (0, 0))
+
+    def test_hybrid_branch_is_pushed_and_recalled_with_its_window(self):
+        page, window = HYBRID_PAGE, 2 * HYBRID_PAGE
+        p = self._engine(prefill_manager(), hybrid_cache(window=window), page_size=page)
+        d = self._engine(decode_manager(), hybrid_cache(window=window), page_size=page)
+        prefill = PrefillDramOffloadExtension(
+            recall=PrefillDramPrefixPuller(p.ctx), push=PrefillDramVictimPusher(p.ctx)
+        )
+        queue = SimpleNamespace(queue=[], _deferred_releases=[])
+        decode = DecodeDramOffloadExtension(
+            landing=decode_dram_victim_receiver.DecodeDramVictimReceiver(d.ctx),
+            source=DecodeDramPrefixOfferer(d.ctx, queue),
+        )
+        session = list(range(4 * page))
+
+        # The prefill holds the session and its last window in host RAM only.
+        radix_host_ops.insert_host_prefix(
+            p.cache,
+            RadixKey(array("q", session)),
+            p.host.alloc(len(session)),
+            page,
+            swa_indices=p.swa_host.alloc(window),
+        )
+        p.mgr._prefill.decode_addr[1] = ("10.0.0.2", 5555)
+        self._commit(prefill, pushed_req(room=1, tokens=session))
+
+        # Push: four full pages and the two window pages, each to its pool.
+        self._prefill_step(prefill, [])
+        self._deliver(p, d)
+        (push,) = d.mgr.dram_offload_channel.received_pushes().values()
+        self.assertEqual((len(push.blocks), len(push.swa_blocks)), (4, 2))
+        for _ in range(decode_dram_victim_receiver._CADENCE):
+            self._decode_step(decode)
+        self.assertEqual((d.host.used, d.swa_host.used), (len(session), window))
+        for pool, status in (
+            (d.host, "received"),
+            (d.swa_host, "received"),
+            (p.host, "sent"),
+            (p.swa_host, "sent"),
+        ):
+            pool.transfer.complete(status)
+        for _ in range(decode_dram_victim_receiver._CADENCE):
+            self._decode_step(decode)
+        self._deliver(d, p)
+        self._prefill_step(prefill, [])
+        self.assertEqual(prefill.push.stats["stored"], 1)
+        p.cache.evict_host(len(session), FULL)
+        self.assertEqual(p.host.used, 0)
+
+        # The session returns one page longer: the decode offers its four
+        # pages with the window that ends there, and the prefill takes both.
+        req = pushed_req(room=ROOM, tokens=session + list(range(1000, 1000 + page)))
+        decode_req = SimpleNamespace(req=req)
+        queue.queue.append(decode_req)
+        decode.source.offer_host_prefix(decode_req)
+        sender = sender_on(p.mgr)
+        d.mgr.register_decode_request(ROOM, [21, 22, 23], [], None, [PREFILL_INFO])
+        with SWITCH.override(True):
+            self._deliver(d, p)
+        self._prefill_step(prefill, [req])
+        self._deliver(p, d)
+        self._deliver(d, p)
+        self._prefill_step(prefill, [req])
+        plan = prefill.recall._plans[ROOM]
+        self.assertEqual(plan.read_ids, [f"{ROOM}#px", f"{ROOM}#pxs"])
+        for pool, status in (
+            (p.host, "received"),
+            (p.swa_host, "received"),
+            (d.host, "sent"),
+            (d.swa_host, "sent"),
+        ):
+            pool.transfer.complete(status)
+        self._prefill_step(prefill, [req])
+        self.assertEqual(sender.poll(), KVPoll.WaitingForInput)
+        self._commit(prefill, req)
+        self.assertEqual(prefill.recall.stats["pulled_tokens"], len(session))
+        self.assertEqual((p.host.used, p.swa_host.used), (len(session), window))
+
+
 class TestReceivedPagesBackUpDeviceOnlyNodes(CustomTestCase):
     """Under write-back, a recalled branch inserted below a node that is on
     the device without a host copy would leave a subtree that eviction can
@@ -746,7 +859,7 @@ class TestHostRecallEdgeCasesExtra(HostRecallEdgeCasesFixture, CustomTestCase):
         plan = puller._plans[ROOM]
         self.assertEqual(puller.stats["no_memory"], 0)
         self.assertEqual(device_hit(cache, list(range(100, 116))), 16)
-        self.assertEqual(plan.req_id, f"{ROOM}#px")
+        self.assertEqual(plan.read_ids, [f"{ROOM}#px"])
         args = mgr.start_host_read.call_args.args
         self.assertEqual(args[0], f"{ROOM}#px")
         self.assertEqual(len(args[4]), 16)  # landing pages named to raiden

@@ -131,9 +131,9 @@ SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM=1
 ```
 
 Unsupported settings are refused, never run without the offload. An engine
-stops at start, naming the setting, with: a hybrid sliding-window model, a
-GDN/Mamba model, the unified KV pool, pipeline parallelism (`--pp-size` above
-1) or the Raiden pipeline transfer, context or data parallelism,
+stops at start, naming the setting, with: a GDN/Mamba model, the unified KV
+pool, pipeline parallelism (`--pp-size` above 1) or the Raiden pipeline
+transfer, context or data parallelism,
 speculative decoding, `--sleep-on-idle`, a transfer or HiCache I/O backend
 other than raiden, an
 L3 storage backend, HiCache or the radix cache off, the Rust radix tree, or a
@@ -141,6 +141,18 @@ tpu-sync build without the host-to-host read API
 ([google/tpu-sync@32568d35](https://github.com/google/tpu-sync/commit/32568d35)
 or later). A pair fails its requests with the reason when the switch is on for
 one role only or when the roles differ in attention-TP size (resharding).
+
+On a hybrid sliding-window model (GPT-OSS) the offload also moves the last
+sliding window of each branch, through an SWA host pool on both roles. The
+pool is sized as upstream sizes a hybrid host stack, by `--hicache-ratio` or
+a `--hicache-size` split by device bytes, and the model needs `--page-size`
+above 1. Such a model resumes at a length only with the window
+that ends there, and a branch carries one window, at its end: a prompt that
+extends an offloaded branch recalls it, a prompt that shares only its beginning
+does not. Under `write_back` a branch is offloaded once, whole, so requests
+that share a prefix and then diverge get no recall and lose hits to the
+offload; under `write_through` a growing branch is offloaded at successive
+lengths and they do recall.
 
 A decode whose DRAM is full declines a push; that is back-pressure, counted in
 the `[victim-push]` log line. A prefill starts pushes only while it has a

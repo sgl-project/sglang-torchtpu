@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from array import array
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import msgspec
 import torch.distributed as dist
@@ -44,8 +44,10 @@ _MAX_UNAGREED_ROUNDS = 8
 class _DramLanding(msgspec.Struct):
     push: Any
     indices: Any
-    # The native read into ``indices``; None where it could not start.
-    read_id: Optional[str] = None
+    # Host pages reserved for the window of a hybrid model.
+    swa_indices: Any = None
+    # The native reads that started, into ``indices`` and ``swa_indices``.
+    read_ids: List[str] = msgspec.field(default_factory=list)
     # A rank's read did not start: the pages wait for the reads that did,
     # then are freed.
     failed: bool = False
@@ -59,6 +61,8 @@ class DecodeDramVictimReceiver:
         self._cache = ctx.cache
         self._page_size = ctx.page_size
         self._host_pool = ctx.host_pool
+        self._swa_host_pool = ctx.swa_host_pool
+        self._window_tokens = ctx.window_tokens
         self._lockstep = ctx.lockstep
         self._iterations = 0
         self._rounds = 0
@@ -111,7 +115,11 @@ class DecodeDramVictimReceiver:
             (
                 *key,
                 *push_manifest(
-                    push.tokens, push.extra_key, push.cache_salt, len(push.blocks)
+                    push.tokens,
+                    push.extra_key,
+                    push.cache_salt,
+                    len(push.blocks),
+                    len(push.swa_blocks),
                 ),
             ): key
             for key, push in received.items()
@@ -138,30 +146,54 @@ class DecodeDramVictimReceiver:
 
     def _reserve_host_pages_and_read(self, key: Tuple[str, int], push: Any) -> bool:
         num_tokens = len(push.tokens)
-        pool = self._host_pool
+        swa_tokens = len(push.swa_blocks) * self._page_size
+        pool, swa_pool = self._host_pool, self._swa_host_pool
         # The manifest agreement made the push's tokens and blocks the same on
-        # every rank; the most host room any rank is short of is evicted.
-        short = self._lockstep.max(max(0, num_tokens - pool.available_size()))
+        # every rank; one collective finds the most host room any rank is
+        # short of in each pool.
+        short, swa_short = self._lockstep.reduce(
+            [
+                [
+                    max(0, num_tokens - pool.available_size()),
+                    max(0, swa_tokens - swa_pool.available_size()) if swa_tokens else 0,
+                ]
+            ],
+            dist.ReduceOp.MAX,
+        )[0]
         if short:
             self._cache.evict_host(short, ComponentType.FULL)
-        indices = alloc_host_pages_agreed(
-            lockstep=self._lockstep, pool=pool, num_tokens=num_tokens
+        if swa_short:
+            self._cache.evict_host(swa_short, ComponentType.SWA)
+        allocated = alloc_host_pages_agreed(
+            lockstep=self._lockstep,
+            pools=[(pool, num_tokens), (swa_pool, swa_tokens)],
         )
-        if indices is None:
+        if allocated is None:
             return False
-        landing = _DramLanding(push=push, indices=indices)
-        read_id = victim_transfer_id(push.prefill, push.seq)
-        if self._channel.start_host_read(
-            read_id,
-            push.uuid,
-            push.address,
-            list(push.blocks),
-            host_page_ids(self._host_pool, indices),
+        indices, swa_indices = allocated
+        landing = _DramLanding(push=push, indices=indices, swa_indices=swa_indices)
+        started = True
+        for swa, target, remote, local, address in (
+            (False, pool, push.blocks, indices, push.address),
+            (True, swa_pool, push.swa_blocks, swa_indices, push.swa_address),
         ):
-            landing.read_id = read_id
+            if not remote:
+                continue
+            read_id = victim_transfer_id(push.prefill, push.seq, swa=swa)
+            started = self._channel.start_host_read(
+                read_id,
+                push.uuid,
+                address,
+                list(remote),
+                host_page_ids(target, local),
+                swa=swa,
+            )
+            if not started:
+                break
+            landing.read_ids.append(read_id)
         # A rank whose read started cannot release its live destination, so
         # all ranks keep their allocations until the started reads settle.
-        landing.failed = not self._lockstep.all(landing.read_id is not None)
+        landing.failed = not self._lockstep.all(started)
         self._landings[key] = landing
         self.stats["granted"] += 1
         return True
@@ -176,11 +208,7 @@ class DecodeDramVictimReceiver:
         rows = []
         for key in keys:
             landing = self._landings[key]
-            received = (
-                False
-                if landing.read_id is None
-                else self._channel.poll_host_read(landing.read_id)
-            )
+            received = self._channel.poll_host_reads(landing.read_ids)
             rows.append(
                 [
                     int(received is not None),
@@ -192,12 +220,13 @@ class DecodeDramVictimReceiver:
             if not settled:
                 continue
             landing = self._landings.pop(key)
-            if landing.read_id is not None:
-                self._channel.forget_host_read(landing.read_id)
+            self._channel.forget_host_reads(landing.read_ids)
             if received:
                 stored = self._insert_host_only_branch(landing)
             else:
                 self._host_pool.free(landing.indices)
+                if landing.swa_indices is not None:
+                    self._swa_host_pool.free(landing.swa_indices)
                 self.stats["failed"] += 1
                 stored = False
             self._ack_prefill(landing.push, stored=stored)
@@ -213,6 +242,7 @@ class DecodeDramVictimReceiver:
             ),
             landing.indices,
             self._page_size,
+            swa_indices=landing.swa_indices,
         )
         if inserted is None:
             self.stats["dropped"] += 1
