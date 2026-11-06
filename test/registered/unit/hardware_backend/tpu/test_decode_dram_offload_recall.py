@@ -41,12 +41,14 @@ from sglang_tpu.testing.decode_dram_offload import (
     HostRecallEdgeCasesFixture,
     RecallLifecycleFixture,
     decode_manager,
+    device_hit,
     full_cache,
     host_hit,
     insert_tokens,
     offload_context,
     prefill_manager,
     pushed_req,
+    recall_channel,
     sender_on,
 )
 
@@ -606,6 +608,135 @@ class TestPushThenRecallBetweenTwoEngines(CustomTestCase):
         prefill.before_bootstrap_step([], serving=True)
         self.assertEqual(p.mgr._send_multipart_locked.call_count, sent)
         self.assertFalse(prefill.holds_host_pages_outside_tree())
+
+
+# ---- Lower-priority cases: less common paths, wire round trips, wording ----
+
+
+class TestHostRecallEdgeCasesExtra(HostRecallEdgeCasesFixture, CustomTestCase):
+    def _asked_and_ready(self, puller, req):
+        """Two steps: the range is agreed and asked for, then READY is acted on."""
+        puller.advance([req])
+        self.assertIn(ROOM, puller._plans)
+        puller.advance([req])
+
+    def test_no_host_room_abandons_the_recall_and_computes(self):
+        mgr = recall_channel(offer_pages=16)
+        cache, allocator, puller = self._build(host_capacity=16, mgr=mgr)
+        host = self._fill_host_with_a_device_copy(cache, allocator, lock=True)
+        self._asked_and_ready(puller, self._req())
+        self.assertEqual(puller.stats["no_memory"], 1)
+        self.assertNotIn(ROOM, puller._plans)
+        mgr.resolve_prefix_pull.assert_called_with(ROOM)
+        mgr.start_host_read.assert_not_called()
+        self.assertEqual(host.available_size(), 0)  # nothing leaked, nothing taken
+        self.assertFalse(puller.holds_host_landing_pages())
+
+    def test_room_is_made_by_reclaiming_a_copy_the_device_holds(self):
+        mgr = recall_channel(offer_pages=16)
+        mgr.read_done = None
+        cache, allocator, puller = self._build(host_capacity=16, mgr=mgr)
+        self._fill_host_with_a_device_copy(cache, allocator, lock=False)
+        self._asked_and_ready(puller, self._req())
+        plan = puller._plans[ROOM]
+        self.assertEqual(puller.stats["no_memory"], 0)
+        self.assertEqual(device_hit(cache, list(range(100, 116))), 16)
+        self.assertEqual(plan.req_id, f"{ROOM}#px")
+        args = mgr.start_host_read.call_args.args
+        self.assertEqual(args[0], f"{ROOM}#px")
+        self.assertEqual(len(args[4]), 16)  # landing pages named to raiden
+        self.assertTrue(puller.holds_host_landing_pages())
+
+    def test_refused_pull_is_abandoned(self):
+        mgr = recall_channel(offer_pages=16, refused=True)
+        cache, allocator, puller = self._build(host_capacity=32, mgr=mgr)
+        host = cache.cache_controller.host
+        self._asked_and_ready(puller, self._req())
+        self.assertEqual(puller.stats["failed"], 1)
+        self.assertNotIn(ROOM, puller._plans)
+        mgr.start_host_read.assert_not_called()
+        puller.free_settled_host_landings()
+        self.assertEqual(host.available_size(), 32)  # landing freed
+
+    def test_read_another_rank_could_not_start_is_given_up_by_all(self):
+        mgr = recall_channel(offer_pages=16)
+        mgr.read_done = None
+        cache, allocator, puller = self._build(host_capacity=32, mgr=mgr)
+        host = cache.cache_controller.host
+        req = self._req()
+        puller.advance([req])
+        reduce = puller._lockstep.reduce
+        # The start is the last agreement of the step: another rank reports 0.
+        calls = []
+
+        def another_rank_fails_to_start(rows, op):
+            calls.append(rows)
+            return [[0]] if len(calls) == 4 else reduce(rows, op)
+
+        with patch.object(
+            puller._lockstep, "reduce", side_effect=another_rank_fails_to_start
+        ):
+            puller.advance([req])
+        self.assertNotIn(ROOM, puller._plans)
+        mgr.resolve_prefix_pull.assert_called_with(ROOM)
+        # This rank's read did start: its landing stays owned until it settles.
+        self.assertEqual(host.available_size(), 16)
+        self.assertTrue(puller.holds_host_landing_pages())
+        mgr.read_done = False
+        puller.free_settled_host_landings()
+        self.assertEqual(host.available_size(), 32)
+
+    def test_read_that_fails_after_start_frees_the_landing_once_settled(self):
+        mgr = recall_channel(offer_pages=16)
+        mgr.read_done = None
+        cache, allocator, puller = self._build(host_capacity=32, mgr=mgr)
+        host = cache.cache_controller.host
+        req = self._req()
+        self._asked_and_ready(puller, req)
+        free_before = host.available_size()
+        # The decode leaves early (prealloc done) while raiden may still write.
+        puller.insert_recalled_host_prefix(req)
+        self.assertNotIn(ROOM, puller._plans)
+        self.assertEqual(host.available_size(), free_before)  # still owned
+        self.assertTrue(puller.holds_host_landing_pages())
+        mgr.read_done = False
+        puller.free_settled_host_landings()
+        self.assertEqual(host.available_size(), free_before + 16)
+        self.assertFalse(puller.holds_host_landing_pages())
+
+    def test_inflight_recalls_never_take_more_than_their_share_of_host_ram(self):
+        mgr = recall_channel(offer_pages=16)
+        cache, _, puller = self._build(host_capacity=32, mgr=mgr)
+        puller._max_inflight_tokens = 16
+        first, second = self._req(), self._req()
+        second.bootstrap_room = ROOM + 1
+        puller.advance([first, second])
+        self.assertIn(ROOM, puller._plans)
+        self.assertNotIn(ROOM + 1, puller._plans)
+        self.assertEqual(puller.stats["over_budget"], 1)
+        mgr.resolve_prefix_pull.assert_called_once_with(ROOM + 1)
+        mgr.ask_prefix_pull.assert_called_once_with(ROOM, 0, 16)
+
+
+class TestDecodeQueueHooksExtra(DecodeQueueHooksFixture, CustomTestCase):
+    def test_pop_releases_the_offers_of_departed_requests(self):
+        for rids in (("a", "b"), ()):
+            with self.subTest(queued=rids):
+                queue, _ = self._queue(*rids)
+                calls = []
+                upstream = MagicMock(
+                    side_effect=lambda q, r: calls.append("pop") or ["transferred"]
+                )
+                offload = SimpleNamespace(source=MagicMock())
+                offload.source.close_departed_offers.side_effect = lambda: calls.append(
+                    "release"
+                )
+                with patch.object(core_hooks, "_extension", return_value=offload):
+                    result = core_hooks._pop_transferred(upstream, queue, ["b"])
+                self.assertEqual(result, ["transferred"])
+                # A request can leave by abort while the queue is empty of work.
+                self.assertEqual(calls, ["pop", "release"])
+                upstream.assert_called_once_with(queue, ["b"])
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.disaggregation.decode_dram_offload import (
     startup_validation,
 )
+from sglang_tpu.disaggregation.raiden import dram_offload_channel as raiden_offload
 from sglang_tpu.testing.decode_dram_offload import (
     SWITCH,
     supported_engine,
@@ -143,6 +144,44 @@ class TestTpuSyncHostApi(CustomTestCase):
                 self.assertEqual(
                     startup_validation.missing_tpu_sync_host_api(), expected
                 )
+
+
+# ---- Lower-priority cases: less common paths, wire round trips, wording ----
+
+
+class TestEngineRefusalsExtra(CustomTestCase):
+    def test_every_problem_is_reported_at_once(self):
+        engine = supported_engine()
+        engine.memory.enable_unified_memory = True
+        engine.kv_manager.pp_size = 2
+        with self.assertRaises(
+            startup_validation.UnsupportedDramOffloadConfig
+        ) as raised:
+            validate_engine_as(engine)
+        self.assertIn("--enable-unified-memory", str(raised.exception))
+        self.assertIn("pipeline parallelism", str(raised.exception))
+
+
+class TestPairRefusals(CustomTestCase):
+    def test_switch_must_match_on_both_roles(self):
+        for mine, theirs in ((True, False), (False, True)):
+            with self.subTest(mine=mine, theirs=theirs), SWITCH.override(mine):
+                reason = raiden_offload.peer_switch_mismatch(decode_enabled=theirs)
+                self.assertIn("same value on both roles", reason)
+                self.assertIn(
+                    "on for " + ("this engine" if mine else "its decode"), reason
+                )
+        for value in (True, False):
+            with SWITCH.override(value):
+                self.assertIsNone(
+                    raiden_offload.peer_switch_mismatch(decode_enabled=value)
+                )
+
+    def test_resharding_is_refused_only_with_the_switch_on(self):
+        with SWITCH.override(True):
+            self.assertIn("resharding", raiden_offload.resharding_refusal())
+        with SWITCH.override(False):
+            self.assertIsNone(raiden_offload.resharding_refusal())
 
 
 if __name__ == "__main__":
