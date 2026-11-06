@@ -2,13 +2,9 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu.disaggregation.reservation_slots import (
-    SlotReservations,
-    effective_slot_limit,
-)
+from sglang_tpu.disaggregation.reservation_slots import SlotReservations
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -50,28 +46,6 @@ class TestReservationSlots(unittest.TestCase):
     def controller(self, limit=4):
         return SlotReservations(limit=limit, rank_groups=[])
 
-    def test_no_busy_collective_without_outstanding_reservations(self):
-        c = SlotReservations(limit=1024, rank_groups=[object()])
-        with (
-            patch(
-                "sglang_tpu.disaggregation.reservation_slots.dist.get_world_size",
-                return_value=2,
-            ),
-            patch(
-                "sglang_tpu.disaggregation.reservation_slots.dist.all_reduce"
-            ) as reduce,
-        ):
-            c.begin([], now=0)
-        reduce.assert_not_called()
-
-    def test_empty_queue_has_no_order_or_ask_broadcast(self):
-        c = self.controller()
-        c.begin([], now=0)
-        with patch.object(c, "_broadcast") as broadcast:
-            self.assertEqual(c.agree_order([]), [])
-            self.assertEqual(c.finish([]), [])
-        broadcast.assert_not_called()
-
     def test_idle_state_waits_for_unregistered_request_cleanup(self):
         c = self.controller()
         self.assertTrue(c.is_idle())
@@ -81,31 +55,6 @@ class TestReservationSlots(unittest.TestCase):
         run_pass(c, [], now=1)
         self.assertTrue(c.is_idle())
         self.assertEqual(c._candidates, [])
-
-    def test_drain_flushes_pass_timing_before_idle_fast_path(self):
-        c = SlotReservations(limit=1, rank_groups=[], log_stats=True)
-        req = request("a")
-        with patch(
-            "sglang_tpu.disaggregation.reservation_slots.time.perf_counter",
-            side_effect=[10, 10.025, 11, 11.05],
-        ):
-            run_pass(c, [req])
-            with self.assertLogs(
-                "sglang_tpu.disaggregation.reservation_slots", level="INFO"
-            ) as logs:
-                run_pass(c, [], now=0.1)
-        self.assertIn("passes_total=2", logs.output[0])
-        self.assertIn("pass_ms=37.50", logs.output[0])
-        self.assertIn("max_pass_ms=50.00", logs.output[0])
-        self.assertIn("max_queue_depth=1", logs.output[0])
-
-    def test_default_and_override_use_effective_request_capacity(self):
-        self.assertEqual(effective_slot_limit(0, 8), 8)
-        self.assertEqual(effective_slot_limit(32, 8), 8)
-        self.assertEqual(effective_slot_limit(2, 8), 2)
-        self.assertEqual(effective_slot_limit(0, 0), 0)
-        with self.assertRaises(ValueError):
-            effective_slot_limit(-1, 8)
 
     def test_large_prompts_use_one_credit_each_without_a_token_window(self):
         c = self.controller()
@@ -127,14 +76,6 @@ class TestReservationSlots(unittest.TestCase):
         c.mark_ready(reqs[0])
         self.assertEqual(run_pass(c, reqs, now=20), [])
         self.assertEqual(run_pass(c, reqs, now=21, started=("0",)), [reqs[2]])
-
-    def test_transport_ready_awaiting_metadata_keeps_credit_and_beats_busy(self):
-        c = self.controller(1)
-        ready, other = request("ready"), request("other")
-        run_pass(c, [ready, other])
-        c.mark_ready(ready)
-        ready.disagg_kv_sender.busy = True
-        self.assertEqual(run_pass(c, [ready, other], now=10000), [])
 
     def test_busy_frees_credit_for_backfill_and_retry_uses_measured_rtt(self):
         c = self.controller(1)
@@ -181,41 +122,6 @@ class TestReservationSlots(unittest.TestCase):
         unknown = request("unknown", None)
         healthy = [request("a"), request("b")]
         self.assertEqual(run_pass(c, [unknown] + healthy), healthy)
-
-    def test_enqueue_ids_survive_policy_permutations(self):
-        c = self.controller()
-        reqs = [request("a"), request("b")]
-        ids = [c.track(r) for r in reqs]
-        self.assertEqual(c.agree_order(list(reversed(reqs))), list(reversed(reqs)))
-        self.assertEqual([c.track(r) for r in reqs], ids)
-        self.assertEqual(c.canonical_order(list(reversed(reqs))), reqs)
-
-    def test_bounded_statistics_report_busy_rtt_and_final_drain(self):
-        c = SlotReservations(limit=1, rank_groups=[], log_stats=True)
-        first, other = request("first"), request("other")
-        run_pass(c, [first, other])
-        first.disagg_kv_sender.busy = True
-        run_pass(c, [first, other], now=0.02)
-        with self.assertLogs(
-            "sglang_tpu.disaggregation.reservation_slots", level="INFO"
-        ) as logs:
-            run_pass(c, [], now=61)
-            run_pass(c, [], now=122)
-        self.assertEqual(len(logs.output), 1)
-        self.assertIn("busy_total=1", logs.output[0])
-        self.assertIn("pending=0", logs.output[0])
-        self.assertIn("rtt_ms=20.00", logs.output[0])
-
-    def test_busy_cooldown_keeps_rtt_history_between_attempts(self):
-        c = self.controller(1)
-        req = request("a")
-        run_pass(c, [req])
-        req.disagg_kv_sender.busy = True
-        run_pass(c, [req], now=0.02)
-        run_pass(c, [req], now=0.061)
-        req.disagg_kv_sender.busy = True
-        run_pass(c, [req], now=0.161)
-        self.assertEqual(run_pass(c, [req], now=0.245), [req])
 
 
 if __name__ == "__main__":

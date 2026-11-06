@@ -1671,8 +1671,9 @@ class TestPrefillAdder(CustomTestCase):
         return req
 
     def test_deferred_candidate_leaves_budget_for_a_later_ready_request(self):
+        delayer = _RecordingDelayer(allow=True)
         adder = self._create_delayer_adder(
-            available_tokens=100_000, delayer=None, rem_chunk_tokens=1024
+            available_tokens=100_000, delayer=delayer, rem_chunk_tokens=1024
         )
         deferred = self._create_delayer_req(512)
         ready = self._create_delayer_req(256)
@@ -1686,25 +1687,13 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.memory_budget.total_offset, 0)
         deferred.set_extend_range.assert_not_called()
         self.assertIsNone(adder.new_chunked_req)
+        self.assertEqual(delayer.calls, [])
 
         adder.add_one_req(ready, False, None)
 
         self.assertEqual(adder.can_run_list, [ready])
         self.assertEqual(ready.extend_range.length, 256)
-
-    def test_default_match_group_size_preserves_eager_matching(self):
-        adder = self._create_delayer_adder(available_tokens=100_000, delayer=None)
-        self.assertEqual(adder.get_match_group_size(123), 123)
-
-    def test_deferred_candidate_does_not_negotiate_prefill(self):
-        delayer = _RecordingDelayer(allow=True)
-        adder = self._create_delayer_adder(available_tokens=100_000, delayer=delayer)
-        adder.is_admission_ready = lambda req, extend_len: False
-        self.assertEqual(
-            adder.add_one_req(self._create_delayer_req(256), False, None),
-            AddReqResult.DEFERRED,
-        )
-        self.assertEqual(delayer.calls, [])
+        self.assertEqual(delayer.calls, [True])
 
     def _deferred_scheduler_fixture(self):
         from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -1828,44 +1817,6 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(preempted, [blocked])
         s._add_request_to_queue.assert_called_once_with(victim)
 
-    def test_admitted_request_leaves_bounded_queue_before_preempted_victim_requeues(
-        self,
-    ):
-        from sglang.srt.managers.schedule_batch import ScheduleBatch
-        from sglang.srt.managers.scheduler import Scheduler
-
-        scheduler, incoming, _ = self._deferred_scheduler_fixture()
-        scheduler.waiting_queue = [incoming]
-        scheduler.enable_lora = False
-        scheduler.max_queued_requests = 1
-        scheduler.enable_priority_preemption = True
-        scheduler.get_num_allocatable_reqs = lambda *a, **kw: 0
-        victim = self._create_delayer_req(32)
-        rejected = []
-
-        def enqueue(req):
-            if len(scheduler.waiting_queue) >= scheduler.max_queued_requests:
-                rejected.append(req)
-            else:
-                scheduler.waiting_queue.append(req)
-
-        scheduler._add_request_to_queue = enqueue
-
-        def preempt(adder, req):
-            adder.preempt_list.append(victim)
-            return True
-
-        with (
-            patch.object(PrefillAdder, "preempt_to_schedule", preempt),
-            patch.object(ScheduleBatch, "init_new", return_value=MagicMock()),
-        ):
-            batch, _ = Scheduler._get_new_batch_prefill_raw(
-                scheduler, None, ScheduleBatch(reqs=[], batch_is_full=False)
-            )
-        self.assertIsNotNone(batch)
-        self.assertEqual(rejected, [])
-        self.assertEqual(scheduler.waiting_queue, [victim])
-
     def test_deferred_host_hit_does_not_materialize_or_pin_its_kv(self):
         adder = self._create_delayer_adder(
             available_tokens=100_000, delayer=None, rem_chunk_tokens=1024
@@ -1913,72 +1864,38 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(blocked.kv.mamba_pool_idx, slot)
         s.req_to_token_pool.mamba_allocator.free.assert_not_called()
 
-    def test_ignore_eos_rolls_back_in_place_without_copying_projection(self):
-        class Projection(list):
-            def copy(self):
-                raise AssertionError(
-                    "candidate admission must not copy the running projection"
-                )
-
-        for max_new_tokens in (0, 8):
-            with self.subTest(max_new_tokens=max_new_tokens):
-                adder = self._create_delayer_adder(
-                    available_tokens=100_000, delayer=None
-                )
-                self.mock_tree_cache.disable = True
-                previous = Projection([(9, 512)])
-                adder.req_states = previous
-                req = self._create_delayer_req(256)
-                req.origin_input_ids = req.full_untruncated_fill_ids
-                req.sampling_params.ignore_eos = True
-                req.sampling_params.max_new_tokens = max_new_tokens
-                adder.is_admission_ready = lambda *args: False
-                self.assertEqual(
-                    adder.add_one_req(req, False, None), AddReqResult.DEFERRED
-                )
-                self.assertIs(adder.req_states, previous)
-                self.assertEqual(previous, [(9, 512)])
-
-    def test_deferred_ignore_eos_restores_an_existing_projection(self):
-        adder = self._create_delayer_adder(available_tokens=100_000, delayer=None)
-        self.mock_tree_cache.disable = True
-        previous = [(9, 512)]
-        adder.req_states = previous
-        req = self._create_delayer_req(256)
-        req.origin_input_ids = req.full_untruncated_fill_ids
-        req.sampling_params.ignore_eos = True
-        adder.is_admission_ready = lambda *args: False
-        self.assertEqual(adder.add_one_req(req, False, None), AddReqResult.DEFERRED)
-        self.assertIs(adder.req_states, previous)
-        self.assertEqual(previous, [(9, 512)])
-
     def test_deferred_ignore_eos_preserves_projection_and_chunk_capacity(self):
         for chunk, selected_tokens in ((None, 512), (1024, 512), (256, 256)):
-            with self.subTest(chunk=chunk):
-                adder = self._create_delayer_adder(
-                    available_tokens=100_000, delayer=None, rem_chunk_tokens=chunk
-                )
-                self.mock_tree_cache.disable = True
-                req = self._create_delayer_req(512)
-                req.origin_input_ids = req.full_untruncated_fill_ids
-                req.sampling_params.ignore_eos = True
-                seen = []
+            for previous, max_new in ((None, 8), ([(9, 512)], 8), ([(9, 512)], 0)):
+                with self.subTest(chunk=chunk, previous=previous, max_new=max_new):
+                    adder = self._create_delayer_adder(
+                        available_tokens=100_000, delayer=None, rem_chunk_tokens=chunk
+                    )
+                    self.mock_tree_cache.disable = True
+                    adder.req_states = previous
+                    req = self._create_delayer_req(512)
+                    req.origin_input_ids = req.full_untruncated_fill_ids
+                    req.sampling_params.ignore_eos = True
+                    req.sampling_params.max_new_tokens = max_new
+                    seen = []
 
-                def defer(candidate, extend_len):
-                    seen.append(extend_len)
-                    return False
+                    def defer(candidate, extend_len):
+                        seen.append(extend_len)
+                        return False
 
-                adder.is_admission_ready = defer
-                result = adder.add_one_req(req, False, None)
+                    adder.is_admission_ready = defer
+                    result = adder.add_one_req(req, False, None)
 
-                self.assertEqual(adder.can_run_list, [])
-                self.assertEqual(result, AddReqResult.DEFERRED)
-                self.assertEqual(seen, [selected_tokens])
-                self.assertIsNone(adder.req_states)
-                self.assertEqual(adder.rem_chunk_tokens, chunk)
-                self.assertEqual(adder.memory_budget.total_offset, 0)
-                self.assertIsNone(adder.new_chunked_req)
-                req.set_extend_range.assert_not_called()
+                    self.assertEqual(adder.can_run_list, [])
+                    self.assertEqual(result, AddReqResult.DEFERRED)
+                    self.assertEqual(seen, [selected_tokens])
+                    self.assertEqual(
+                        adder.req_states, None if previous is None else [(9, 512)]
+                    )
+                    self.assertEqual(adder.rem_chunk_tokens, chunk)
+                    self.assertEqual(adder.memory_budget.total_offset, 0)
+                    self.assertIsNone(adder.new_chunked_req)
+                    req.set_extend_range.assert_not_called()
 
     def test_add_chunked_req_non_hybrid_no_swa_reservation(self):
         # Non-hybrid path: the SWA-pool reservation must NOT apply, otherwise

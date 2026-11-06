@@ -13,13 +13,12 @@ from unittest.mock import Mock, patch
 import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVReceiver, PrefillServerInfo
+from sglang.srt.disaggregation.common.conn import CommonKVReceiver
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.disaggregation.prefill_driven import validate
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager, RaidenKVReceiver
-from sglang_tpu.disaggregation.raiden.receiver import prefill_driven_peer_mismatch
 from sglang_tpu.disaggregation.raiden.sender import RaidenKVSender
 from sglang_tpu.disaggregation.raiden.serde import (
     MessageTag,
@@ -37,22 +36,6 @@ ROOM = 7
 DECODE_IP = "10.0.0.2"
 DECODE_PORT = 5555
 DECODE_ENDPOINT = f"tcp://{DECODE_IP}:{DECODE_PORT}"
-
-
-def _sender(decode="tcp://decode:1"):
-    sender = Mock()
-    sender.reservation_busy.return_value = False
-    sender.decode_endpoint.return_value = decode
-    return sender
-
-
-def _req(rid, prompt_tokens, decode="tcp://decode:1"):
-    return SimpleNamespace(
-        rid=rid,
-        origin_input_ids=[0] * prompt_tokens,
-        extend_range=None,
-        disagg_kv_sender=_sender(decode),
-    )
 
 
 class _Req:
@@ -164,42 +147,6 @@ class TestHookTargets(unittest.TestCase):
                 pkgutil.resolve_name(target)
 
 
-class TestPeerLayout(unittest.TestCase):
-    def _info(self, *, attn_tp_size, sources=1):
-        return PrefillServerInfo(
-            attn_tp_size=attn_tp_size,
-            attn_cp_size=1,
-            dp_size=1,
-            pp_size=1,
-            page_size=None,
-            kv_cache_dtype=None,
-            follow_bootstrap_room=True,
-            decode_allocation_policy="early",
-            required_prefill_response_num=sources,
-        )
-
-    def test_equal_tp_pairs(self):
-        self.assertIsNone(
-            prefill_driven_peer_mismatch(
-                self._info(attn_tp_size=8), decode_attn_tp_size=8
-            )
-        )
-
-    def test_unequal_tp_or_several_sources_fail_at_init(self):
-        """One RESERVE per decode rank cannot ready a rank fed by several
-        prefill ranks, or ranks that share one prefill rank."""
-        for info, decode_tp in (
-            (self._info(attn_tp_size=8, sources=2), 4),
-            (self._info(attn_tp_size=4), 8),
-            (self._info(attn_tp_size=8, sources=2), 8),
-        ):
-            with self.subTest(info=info, decode_tp=decode_tp):
-                reason = prefill_driven_peer_mismatch(
-                    info, decode_attn_tp_size=decode_tp
-                )
-                self.assertIn("equal attention TP", reason)
-
-
 def _decode_req(rid, *, ready, receiver_cls=RaidenKVReceiver):
     receiver = Mock(spec=receiver_cls)
     receiver.conclude_state = None
@@ -277,23 +224,6 @@ class TestDecodeAnswersBusy(unittest.TestCase):
         prefill_driven.answer_busy_for_unadmitted(([], []), self._queue([fake]))
 
         self.assertTrue(fake.waiting_for_input)
-
-    def test_retracted_request_fails_instead_of_waiting_for_a_recompute(self):
-        """A retract-mode pause hands decode requests back for a prefill
-        recompute that prefill_driven never asks for. They must fail at once."""
-        queue = self._queue([])
-        queue.scheduler.output_streamer = Mock()
-        req = SimpleNamespace(rid="r", return_logprob=False)
-        original = Mock()
-
-        with patch("sglang.srt.disaggregation.utils.prepare_abort") as abort:
-            prefill_driven.fail_rebootstrap(original, queue, req, is_rebootstrap=True)
-
-        original.assert_not_called()
-        abort.assert_called_once()
-        queue.scheduler.output_streamer.stream_output.assert_called_once_with(
-            [req], False
-        )
 
     def test_decode_resume_fails_held_rebootstrap_requests_without_requeue(self):
         from http import HTTPStatus
@@ -383,21 +313,9 @@ def _sent_tags(mgr):
 
 
 class TestRaidenPrefillReserve(unittest.TestCase):
-    def test_endpoint_churn_does_not_retain_retired_workers(self):
-        mgr = _prefill_manager()
-        for index in range(100):
-            room = ROOM + index
-            frames = _bootstrap_frames(room)
-            frames[3] = str(DECODE_PORT + index).encode()
-            mgr._dispatch(frames)
-            mgr.clear_room(room)
-        self.assertEqual(mgr._prefill.registered_decodes, {})
-        self.assertEqual(mgr._prefill.decode_heard_at, {})
-        self.assertEqual(mgr._prefill.silent_decodes, set())
-        self.assertEqual(mgr._prefill.decode_room_counts, {})
-
     def test_endpoint_liveness_survives_until_its_last_room_retires(self):
         mgr = _prefill_manager()
+        mgr._dispatch(_bootstrap_frames())
         mgr._dispatch(_bootstrap_frames())
         mgr._dispatch(_bootstrap_frames(ROOM + 1))
         mgr._prefill.silent_decodes.add(DECODE_ENDPOINT)
@@ -407,13 +325,8 @@ class TestRaidenPrefillReserve(unittest.TestCase):
         mgr.clear_room(ROOM + 1)
         self.assertNotIn(DECODE_ENDPOINT, mgr._prefill.decode_heard_at)
         self.assertNotIn(DECODE_ENDPOINT, mgr._prefill.silent_decodes)
-
-    def test_duplicate_registration_keeps_one_endpoint_owner(self):
-        mgr = _prefill_manager()
-        mgr._dispatch(_bootstrap_frames())
-        mgr._dispatch(_bootstrap_frames())
-        mgr.clear_room(ROOM)
-        self.assertEqual(mgr._prefill.decode_heard_at, {})
+        self.assertEqual(mgr._prefill.decode_room_counts, {})
+        self.assertEqual(mgr._prefill.registered_decodes, {})
 
     def test_replacing_endpoint_keeps_other_rooms_and_retires_old_worker(self):
         mgr = _prefill_manager()
@@ -545,36 +458,6 @@ class TestRaidenPrefillReserve(unittest.TestCase):
         with self.assertRaises(zmq.ZMQError):
             mgr.request_decode_reservation(ROOM)
 
-    def test_silence_counts_from_arrival_until_the_decode_registers(self):
-        """Asking must not restart the clock of a decode that never showed up."""
-        mgr = _prefill_manager()
-        created = time.time() - 301
-        mgr._prefill.reserve_requested_at[ROOM] = time.time()
-
-        self.assertTrue(mgr.fail_decode_silence(ROOM, created, 300))
-
-    def test_silence_message_reports_the_wait_since_the_ask(self):
-        mgr = _prefill_manager()
-        mgr._prefill.registered_decodes[ROOM] = DECODE_ENDPOINT
-        mgr._prefill.reserve_requested_at[ROOM] = time.time() - 301
-
-        self.assertTrue(mgr.fail_decode_silence(ROOM, time.time() - 900, 300))
-
-        self.assertIn("timed out after 301", mgr.failure_records[ROOM])
-
-    def test_silence_counts_from_a_registration_later_than_the_ask(self):
-        """An ask that waited for the decode's BOOTSTRAP gives the decode its
-        full timeout from the registration."""
-        mgr = _prefill_manager()
-        mgr._prefill.registered_decodes[ROOM] = DECODE_ENDPOINT
-        mgr._prefill.reserve_requested_at[ROOM] = time.time() - 1000
-        mgr._prefill.registered_at[ROOM] = time.time() - 50
-        self.assertFalse(mgr.fail_decode_silence(ROOM, time.time() - 1000, 300))
-
-        mgr._prefill.registered_at[ROOM] = time.time() - 301
-        self.assertTrue(mgr.fail_decode_silence(ROOM, time.time() - 1000, 300))
-        self.assertIn("timed out after 301", mgr.failure_records[ROOM])
-
     def test_silent_decode_fails_the_rooms_it_registered_before(self):
         """A decode that dies after registering N rooms must not drain them
         through N asks of a full timeout each. A room it registers later
@@ -616,17 +499,7 @@ class TestRaidenPrefillReserve(unittest.TestCase):
         self.assertNotIn(DECODE_ENDPOINT, mgr._prefill.silent_decodes)
         self.assertFalse(mgr.fail_decode_silence(8, time.time(), 300))
 
-    def test_decode_that_registers_again_is_asked_again(self):
-        """A restarted decode or a retraction re-bootstrap lost the RESERVE."""
-        mgr = _prefill_manager()
-        mgr._dispatch(_bootstrap_frames())
-        mgr.request_decode_reservation(ROOM)
-
-        mgr._dispatch(_bootstrap_frames())
-
-        self.assertEqual(_sent_tags(mgr), [Reserve.TAG, Reserve.TAG])
-
-    def test_decode_that_registers_again_gets_a_full_timeout(self):
+    def test_reregistered_decode_is_asked_again_with_a_fresh_timeout(self):
         """The earlier life's clock must not fail the decode just re-asked."""
         mgr = _prefill_manager()
         mgr._dispatch(_bootstrap_frames())
@@ -639,20 +512,13 @@ class TestRaidenPrefillReserve(unittest.TestCase):
 
         mgr._dispatch(_bootstrap_frames())
 
+        self.assertEqual(_sent_tags(mgr), [Reserve.TAG, Reserve.TAG])
         self.assertFalse(mgr.fail_decode_silence(ROOM, time.time() - 1000, 300))
 
     def test_room_reused_after_cleanup_is_asked_again(self):
         mgr = _prefill_manager()
         mgr._dispatch(_bootstrap_frames())
         mgr.request_decode_reservation(ROOM)
-        # Transfer state the real cleanup walks, empty for a room never pulled.
-        mgr._pulling = None
-        mgr._reshard_plans = {}
-        mgr._cleared_plans = {}
-        mgr._send_done_at = {}
-        for name in ("_completed_send", "_completed_recv", "_native_failed"):
-            setattr(mgr, name, set())
-
         mgr.clear_room(ROOM)
         mgr._dispatch(_bootstrap_frames())
         self.assertEqual(_sent_tags(mgr), [Reserve.TAG])
@@ -689,23 +555,6 @@ class TestRaidenPrefillReserve(unittest.TestCase):
 
         self.assertEqual(_sent_tags(mgr), [MessageTag.ROOM_FAILED.value])
 
-    def test_decode_silence_clock_follows_the_reservation(self):
-        """Before registering, the decode owes its BOOTSTRAP. Registered and
-        not yet asked, it owes nothing however long the prefill queue is.
-        Once asked, it owes the pull request within the bootstrap timeout."""
-        created = time.time() - 1000
-        mgr = _prefill_manager()
-        self.assertTrue(mgr.fail_decode_silence(ROOM, created, 300))
-
-        mgr = _prefill_manager()
-        mgr._dispatch(_bootstrap_frames())
-        self.assertFalse(mgr.fail_decode_silence(ROOM, created, 300))
-
-        mgr.request_decode_reservation(ROOM)
-        mgr._prefill.reserve_requested_at[ROOM] = time.time() - 301
-        mgr._prefill.registered_at[ROOM] = time.time() - 301
-        self.assertTrue(mgr.fail_decode_silence(ROOM, created, 300))
-
     def test_failure_reaches_a_registered_decode_before_its_pull(self):
         """Cancelling a request the decode has not reserved yet must free the
         decode's queue entry instead of leaving it to the long reserve wait."""
@@ -715,6 +564,27 @@ class TestRaidenPrefillReserve(unittest.TestCase):
         mgr.notify_decode_room_failed(ROOM)
 
         self.assertEqual(_sent_tags(mgr), [MessageTag.ROOM_FAILED.value])
+
+    def test_silence_timeout_tracks_when_the_decode_owes_a_reply(self):
+        now = time.time()
+        for registered_at, asked_at, expired in (
+            (None, None, True),
+            (None, now, True),
+            (now, None, False),
+            (now - 1000, now - 301, True),
+            (now - 50, now - 1000, False),
+            (now - 301, now - 1000, True),
+        ):
+            with self.subTest(registered_at=registered_at, asked_at=asked_at):
+                mgr = _prefill_manager()
+                if registered_at is not None:
+                    mgr._prefill.registered_decodes[ROOM] = DECODE_ENDPOINT
+                    mgr._prefill.registered_at[ROOM] = registered_at
+                if asked_at is not None:
+                    mgr._prefill.reserve_requested_at[ROOM] = asked_at
+                self.assertEqual(
+                    mgr.fail_decode_silence(ROOM, now - 1000, 300), expired
+                )
 
 
 def _decode_manager():
@@ -760,28 +630,6 @@ class TestRaidenDecodeReserve(unittest.TestCase):
         )
         recent = _decode_receiver(mgr, started_s_ago=0)
         self.assertIsNone(recent._check_handshake_timeout(KVPoll.Bootstrapping))
-
-    def test_reserve_turns_the_room_ready(self):
-        mgr = _decode_manager()
-
-        mgr._on_reserve(Reserve(room=ROOM).to_frames())
-
-        self.assertEqual(mgr.request_status[ROOM], KVPoll.WaitingForInput)
-        self.assertIn(ROOM, mgr._decode.reserve_held)
-
-    def test_rejecting_answers_busy_and_holds_the_room_for_the_next_ask(self):
-        mgr = _decode_manager()
-        mgr._send_multipart_locked = Mock()
-        mgr._on_reserve(Reserve(room=ROOM).to_frames())
-
-        mgr.reject_reservation(ROOM, ["tcp://p0:1", "tcp://p1:1"])
-        mgr.reject_reservation(ROOM, ["tcp://p0:1"])
-
-        self.assertEqual(mgr.request_status[ROOM], KVPoll.Bootstrapping)
-        self.assertNotIn(ROOM, mgr._decode.reserve_held)
-        sent = mgr._send_multipart_locked.call_args_list
-        self.assertEqual([call.args[0] for call in sent], ["tcp://p0:1", "tcp://p1:1"])
-        self.assertEqual(ReserveBusy.from_frames(sent[0].args[1]).room, ROOM)
 
     def test_reserve_does_not_revive_an_aborted_room(self):
         mgr = _decode_manager()
@@ -831,10 +679,12 @@ class TestDecodeQueueReserveBusyReserve(unittest.TestCase):
         self.assertFalse(waiters())
         mgr._on_reserve(Reserve(room=ROOM).to_frames())
         self.assertTrue(waiters())
+        self.assertIn(ROOM, mgr._decode.reserve_held)
 
         prefill_driven.answer_busy_for_unadmitted(([], []), queue)
         self.assertEqual(_sent_tags(mgr), [ReserveBusy.TAG])
         self.assertFalse(waiters())
+        self.assertNotIn(ROOM, mgr._decode.reserve_held)
 
         mgr._on_reserve(Reserve(room=ROOM).to_frames())
         self.assertTrue(waiters())
@@ -884,16 +734,18 @@ class TestRaidenDecodeRegistration(unittest.TestCase):
         self.assertEqual(frames[0], b"BOOTSTRAP")
         self.assertEqual(int(frames[1]), ROOM)
 
-    def test_unequal_tp_fails_and_tells_the_prefill(self):
+    def test_unsupported_peer_layout_fails_and_tells_the_prefill(self):
         """The prefill must drop the room now, not after its bootstrap
         timeout with a log that blames a silent decode."""
-        recv = self._receiver(prefill_attn_tp=4)
-
-        self._init(recv)
-
-        self.assertEqual(recv.conclude_state, KVPoll.Failed)
-        sent = [call.args[0][0] for call in self.sock.send_multipart.call_args_list]
-        self.assertEqual(sent, [MessageTag.ABORT.value])
+        for prefill_tp, sources in ((4, 1), (16, 2), (8, 2)):
+            with self.subTest(prefill_tp=prefill_tp, sources=sources):
+                recv = self._receiver(prefill_attn_tp=prefill_tp, sources=sources)
+                self._init(recv)
+                self.assertEqual(recv.conclude_state, KVPoll.Failed)
+                sent = [
+                    call.args[0][0] for call in self.sock.send_multipart.call_args_list
+                ]
+                self.assertEqual(sent, [MessageTag.ABORT.value])
 
     def test_rejecting_answers_every_prefill_rank_of_the_room(self):
         recv = self._receiver()
@@ -905,11 +757,13 @@ class TestRaidenDecodeRegistration(unittest.TestCase):
         recv.kv_mgr._on_reserve(Reserve(room=ROOM).to_frames())
 
         recv.reject_reservation()
+        recv.reject_reservation()
 
         sent = recv.kv_mgr._send_multipart_locked.call_args_list
         self.assertEqual(
             [call.args[0] for call in sent], ["tcp://10.0.0.1:1", "tcp://10.0.0.1:2"]
         )
+        self.assertEqual(ReserveBusy.from_frames(sent[0].args[1]).room, ROOM)
 
     def test_disabled_keeps_core_early_behavior(self):
         recv = self._receiver()

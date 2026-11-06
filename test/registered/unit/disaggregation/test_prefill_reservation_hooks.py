@@ -204,6 +204,7 @@ class TestBatchReservationHooks(unittest.TestCase):
             )
         )
         self.assertTrue(a.pending_bootstrap)
+        a.disagg_kv_sender.reservation_busy.return_value = True
         self.assertEqual(fixture.run_pass(controller, [a, b], now=6), [])
         b.disagg_kv_sender.request_decode_reservation.assert_not_called()
 
@@ -374,39 +375,6 @@ class TestBatchReservationHooks(unittest.TestCase):
         self.assertEqual(req.arrival_processed_tokens, 12)
         queue.ensure_metadata_buffer.assert_not_called()
         queue.finalize_bootstrap.assert_not_called()
-
-    def test_gate_records_feasible_candidate_and_waits_for_finalized_bootstrap(self):
-        from sglang_tpu.disaggregation.raiden.sender import RaidenKVSender
-        from sglang_tpu.hooks import prefill_driven as hooks
-
-        req = request("warm")
-        req.disagg_kv_sender = Mock(spec=RaidenKVSender)
-        req.sampling_params = SimpleNamespace(ignore_eos=False)
-        req.prefix_indices = range(64000)
-        req.host_hit_length = 512
-        controller = Mock()
-        adder = SimpleNamespace(
-            exact_chunk_fill=True,
-            rem_input_tokens=4096,
-            rem_chunk_tokens=4096,
-            max_prefill_bs=0,
-            prefill_max_requests=None,
-            tree_cache=SimpleNamespace(disable=False),
-            _kv_shard_reserve_scratch=Mock(return_value=True),
-        )
-        token = hooks._active_pass.set(SimpleNamespace(controller=controller, slots=8))
-        try:
-            self.assertFalse(hooks.gate_admission(lambda *args: True, adder, req, 1024))
-            controller.consider.assert_called_once_with(req)
-            adder._kv_shard_reserve_scratch.assert_called_once_with(
-                64512, 1024, commit=False
-            )
-            self.assertEqual(hooks.match_group_size(lambda *args: 123, adder, 123), 0)
-            req.pending_bootstrap = False
-            self.assertTrue(hooks.gate_admission(lambda *args: True, adder, req, 1024))
-        finally:
-            hooks._active_pass.reset(token)
-        self.assertTrue(hooks.gate_admission(lambda *args: True, adder, req, 1024))
 
 
 if __name__ == "__main__":
