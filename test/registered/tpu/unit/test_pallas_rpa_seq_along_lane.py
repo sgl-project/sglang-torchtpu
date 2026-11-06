@@ -420,7 +420,7 @@ class TestKernelBlockSizes(CustomTestCase):
                     self.assertEqual(blocks.bkv_sz % page_size, 0)
                     self.assertGreaterEqual(blocks.bkv_sz, page_size)
                     self.assertGreaterEqual(blocks.batch_size, 1)
-                    self.assertGreaterEqual(blocks.n_buffer, 1)
+                    self.assertGreaterEqual(blocks.n_buffer, 2)
                 self.assertGreater(block_sizes[1].bq_sz, 1)
 
     def test_grown_mixed_q_block_is_never_one_token(self):
@@ -431,7 +431,7 @@ class TestKernelBlockSizes(CustomTestCase):
         from sglang_tpu.attention.pallas.batched_rpa import configs
 
         shrunk = 0
-        for vmem_mib in range(30, 46):
+        for vmem_mib in range(60, 90):  # two buffers of a one-page k block fit from ~70
             try:
                 _, prefill = self._block_sizes(
                     page_size=1024,
@@ -445,6 +445,61 @@ class TestKernelBlockSizes(CustomTestCase):
             self.assertGreater(prefill.bq_sz, 1, f"{vmem_mib} MiB")
             shrunk += prefill.bq_sz < 256
         self.assertGreater(shrunk, 0)  # some budget must exercise the shrinking
+
+    def test_never_single_buffers(self):
+        """A single-buffered lookahead ref skips the pipeline prologue and hangs;
+        a budget that 2 buffers cannot fit must raise instead."""
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs
+
+        raised = 0
+        for vmem_mib in range(20, 64, 2):
+            for geometry in self.GEOMETRIES:
+                try:
+                    block_sizes = self._block_sizes(
+                        page_size=256,
+                        kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+                        dtype_kv=jnp.float8_e4m3fn,
+                        geometry=geometry,
+                        vmem_limit_bytes=vmem_mib << 20,
+                    )
+                except ValueError:
+                    raised += 1
+                    continue
+                for blocks in block_sizes:
+                    self.assertGreaterEqual(blocks.n_buffer, 2, (vmem_mib, geometry))
+        self.assertGreater(raised, 0)  # some budget must be too small
+
+    def test_attention_sink_prefill_keeps_triple_buffering(self):
+        """gpt-oss under attention CP (64q/8kv per rank, fp8, sinks) keeps a
+        triple-buffered 256 x 512 prefill tile."""
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        model = configs.ModelConfigs(
+            num_q_heads=64,
+            num_kv_heads=8,
+            head_dim=64,
+            mask_value=float("-inf"),
+            has_attention_sink=True,
+        )
+        with tpu_info_for_cpu_export():
+            serve = configs.ServingConfigs(
+                num_seqs=32,
+                num_page_indices=32 * 32,
+                total_q_tokens=512,
+                dtype_q=jnp.bfloat16,
+                dtype_kv=jnp.float8_e4m3fn,
+                dtype_out=jnp.bfloat16,
+                page_size=256,
+            )
+            _, prefill = wrapper.calculate_block_sizes(model, serve, 1 << 26)
+        self.assertEqual(
+            (prefill.bq_sz, prefill.bkv_sz, prefill.n_buffer), (256, 512, 3)
+        )
 
     def test_explicit_partial_page_k_block_is_refused(self):
         """An explicit k block must cover whole pages too when the call reads

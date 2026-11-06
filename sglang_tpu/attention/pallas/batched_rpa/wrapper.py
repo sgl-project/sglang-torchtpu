@@ -216,6 +216,10 @@ def get_kv_cache_shape(
     )
 
 
+# The q and KV refs pipeline with lookahead, which needs a second buffer.
+_MIN_N_BUFFER = 2
+
+
 def calculate_block_sizes(
     model_cfgs: configs.ModelConfigs,
     serve_cfgs: configs.ServingConfigs,
@@ -315,12 +319,17 @@ def calculate_block_sizes(
 
         # The m, l and acc carries: f32 scratch per KV head and (token, q head)
         # row, a lane tile wide, shared by the batch. The transposed tile (one
-        # sequence per tile) keeps them as rows of lanes instead.
-        carry_rows = model_cfgs.num_kv_heads * bq_sz * aligned_num_q_heads_per_kv_head
-        carry_width = 3 * num_lanes
-        if serve_cfgs.transposed and batch_size == 1:
-            carry_width = aligned_head_dim // 2 + 3 * tpu_info.num_sublanes
-        total_bytes += carry_rows * carry_width * 4
+        # sequence per tile) keeps them as rows of lanes instead. Counted only for
+        # the ones_v / transposed tiles tuned with this term: elsewhere the estimate
+        # stays as measured (it over-counts the score tile by bq_sz / bq_c_sz).
+        if serve_cfgs.ones_v or serve_cfgs.transposed:
+            carry_rows = (
+                model_cfgs.num_kv_heads * bq_sz * aligned_num_q_heads_per_kv_head
+            )
+            carry_width = 3 * num_lanes
+            if serve_cfgs.transposed and batch_size == 1:
+                carry_width = aligned_head_dim // 2 + 3 * tpu_info.num_sublanes
+            total_bytes += carry_rows * carry_width * 4
 
         return total_bytes
 
@@ -343,7 +352,9 @@ def calculate_block_sizes(
     def fit_lanes_and_buffers(
         batch_size: int, n_buffer: int, bq_sz: int, bkv_sz: int
     ) -> tuple[int, int]:
-        # Lanes go first; fewer buffers is the last resort. Neither drops below one.
+        # Lanes go first; fewer buffers is the last resort. Lanes stop at one,
+        # buffers at two: a single-buffered lookahead ref skips the pipeline's
+        # prologue fetch, so block 0 is never fetched and the kernel hangs.
         while (
             batch_size > 1
             and calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
@@ -351,7 +362,7 @@ def calculate_block_sizes(
         ):
             batch_size -= 1
         while (
-            n_buffer > 1
+            n_buffer > _MIN_N_BUFFER
             and calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
             > capped_vmem_limit_bytes
         ):
