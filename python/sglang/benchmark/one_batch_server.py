@@ -500,6 +500,7 @@ def _warmup_cache(
     image_data: Optional[List] = None,
     backend: str = "sglang",
     model_name: Optional[str] = None,
+    num_dp_ranks: int = 1,
 ):
     """Warm up the cache by sending prefix tokens to populate the radix/prefix cache.
 
@@ -512,6 +513,7 @@ def _warmup_cache(
         image_data: Optional image data for VLM models
         backend: Backend server type ("sglang" or "vllm")
         model_name: Model name (required for vllm backend)
+        num_dp_ranks: Number of SGLang DP ranks with separate prefix caches
     """
     cached_token_len = int(input_len * cache_hit_rate)
     if cached_token_len <= 0:
@@ -548,12 +550,25 @@ def _warmup_cache(
             cache_warmup_payload["image_data"] = image_data
         gen_url = url + "/generate"
 
-    warmup_response = requests.post(
-        gen_url,
-        json=cache_warmup_payload,
-        timeout=DEFAULT_TIMEOUT,
+    # An undersized batch may be measured on a different replica than it warmed.
+    # Populate every replica so the measurement does not depend on the router cursor.
+    warmup_ranks = (
+        range(num_dp_ranks)
+        if backend == "sglang" and len(input_ids) < num_dp_ranks
+        else [None]
     )
-    warmup_response.raise_for_status()
+    for rank in warmup_ranks:
+        payload = (
+            cache_warmup_payload
+            if rank is None
+            else {**cache_warmup_payload, "routed_dp_rank": rank}
+        )
+        warmup_response = requests.post(
+            gen_url,
+            json=payload,
+            timeout=DEFAULT_TIMEOUT,
+        )
+        warmup_response.raise_for_status()
     print("Cache warmup completed")
 
 
@@ -651,6 +666,7 @@ def run_one_case(
     apply_chat_template: bool = False,
     flush_hicache_storage: bool = False,
     input_len_list: str = "",
+    num_dp_ranks: int = 1,
 ):
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
@@ -842,6 +858,7 @@ def run_one_case(
             image_data=image_data,
             backend=backend,
             model_name=model_name,
+            num_dp_ranks=num_dp_ranks,
         )
 
     # Turn on profiler
@@ -1471,6 +1488,7 @@ def run_benchmark_internal(
                 model_name=model_name,
                 fake_prefill=bench_args.fake_prefill,
                 flush_hicache_storage=bench_args.flush_hicache_storage,
+                num_dp_ranks=num_dp_ranks,
                 lora_name=bench_args.lora_name,
                 lora_request_distribution=bench_args.lora_request_distribution,
                 lora_zipf_alpha=bench_args.lora_zipf_alpha,
@@ -1523,6 +1541,7 @@ def run_benchmark_internal(
                     model_name=model_name,
                     fake_prefill=bench_args.fake_prefill,
                     flush_hicache_storage=bench_args.flush_hicache_storage,
+                    num_dp_ranks=num_dp_ranks,
                     lora_name=bench_args.lora_name,
                     lora_request_distribution=bench_args.lora_request_distribution,
                     lora_zipf_alpha=bench_args.lora_zipf_alpha,
@@ -1587,6 +1606,7 @@ def run_benchmark_internal(
                             model_name=model_name,
                             fake_prefill=bench_args.fake_prefill,
                             flush_hicache_storage=bench_args.flush_hicache_storage,
+                            num_dp_ranks=num_dp_ranks,
                             lora_name=bench_args.lora_name,
                             lora_request_distribution=bench_args.lora_request_distribution,
                             lora_zipf_alpha=bench_args.lora_zipf_alpha,
