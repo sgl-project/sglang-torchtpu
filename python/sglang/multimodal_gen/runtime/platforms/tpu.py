@@ -68,6 +68,19 @@ class TpuPlatform(Platform):
 
     _worker_initialized: bool = False
 
+    def apply_server_args_defaults(self, server_args) -> None:
+        from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+            MiniMaxH3PipelineConfig,
+        )
+
+        # Full/base H3 opts in; keep other models' compilation defaults intact.
+        if type(server_args.pipeline_config) is not MiniMaxH3PipelineConfig:
+            return
+        if not server_args.is_arg_explicitly_set("enable_torch_compile"):
+            server_args.enable_torch_compile = True
+        if not server_args.is_arg_explicitly_set("regional_compile"):
+            server_args.regional_compile = server_args.enable_torch_compile
+
     @classmethod
     def get_local_torch_device(cls) -> torch.device:
         return torch.device("tpu", 0)
