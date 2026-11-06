@@ -355,6 +355,12 @@ class TpuEnvs:
     # at the final chunk's launch, the last stage once its tokens are copied.
     SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE = EnvBool(False)
 
+    # Pipeline parallelism: hand activations between stages point to point
+    # (isend/irecv, pp_buffered.py) instead of the lockstep collective-permute wave.
+    SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF = EnvBool(False)
+    # Buffered hand-off: forwards a stage may queue for sending before it blocks.
+    SGLANG_TPU_PP_BUFFERED_SEND_DEPTH = EnvInt(2)
+
     # raiden KV-offload backend
     # Seconds a raiden DMA may stay pending, from each blocking wait or, when
     # polled, from issue. Past it the scheduler exits with TimeoutError, so keep
