@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Torch ops for the Kimi-K3 host-split GEMV (sglang_tpu/kernels/host_split_gemv.py).
+"""Torch ops for the Kimi-K3 host-split GEMV (sglang_tpu/kernels/ops/gemm/host_split_gemv.py).
 
 The static fp8 binder (static_fp8.py) asks for one op per split shape at bind
 time, before torch.compile traces the model.
@@ -31,7 +31,7 @@ def _build(
     from jax.sharding import PartitionSpec as P
     from torch_tpu._internal.pallas import get_pallas_mesh
 
-    from sglang_tpu.kernels import host_split_gemv
+    from sglang_tpu.kernels.ops.gemm import host_split_gemv
     from sglang_tpu.pallas_jax_op import cpu_export_jax_op
 
     npf = int(prefetch)

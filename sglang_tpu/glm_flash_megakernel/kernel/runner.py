@@ -206,7 +206,7 @@ def make_decode(spec, layout, small_map, small_f32_map, mesh, cfg: D.KernelConfi
 
     def pool_records(ik, ig, smalls, pools):
         """Serving's index-key records of `pools` [P], one row per target DSA layer."""
-        from sglang_tpu.attention.pallas.dsa_kpool_topk import (
+        from sglang_tpu.kernels.ops.attention.dsa_kpool_topk import (
             _pool_records,
             compress_pools,
             pooled_record_bytes,

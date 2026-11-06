@@ -133,7 +133,7 @@ class TestGDNPrefixCache(CustomTestCase):
         self.assertEqual(graphs, counters["stats"]["unique_graphs"])
 
     def test_copy_skips_padding_and_large_slots(self):
-        from sglang_tpu.mamba_state_copy import compiled_state_copy
+        from sglang_tpu.kernels.ops.mamba.mamba_state_copy import compiled_state_copy
 
         # 32 MiB per slot exceeds VMEM on supported smaller TPU generations.
         original = torch.randn(4, 128, 256, 256)

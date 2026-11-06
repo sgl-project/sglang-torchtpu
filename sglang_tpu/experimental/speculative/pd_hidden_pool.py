@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang_tpu.kv_row_write import kv_write_segments
+from sglang_tpu.kernels.ops.kvcache.kv_row_write import kv_write_segments
 
 _LANES = 128
 # bf16 packs two values per 32-bit word, the fused layout's K/V pair axis.

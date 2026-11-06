@@ -31,7 +31,7 @@ from sglang_tpu.cp_layout import (
     local_row_count,
     warmup_request_lengths,
 )
-from sglang_tpu.kv_row_write import kv_write_segments
+from sglang_tpu.kernels.ops.kvcache.kv_row_write import kv_write_segments
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")

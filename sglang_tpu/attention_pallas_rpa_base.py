@@ -62,7 +62,7 @@ from sglang_tpu.cp_forward import (
 from sglang_tpu.cp_layout import TpuCpHostLayout
 from sglang_tpu.envs import envs
 from sglang_tpu.host_metadata_cache import HostMetadataCache
-from sglang_tpu.kv_row_write import (
+from sglang_tpu.kernels.ops.kvcache.kv_row_write import (
     get_write_rows_op,
     kv_write_segments,
     write_run_bound,

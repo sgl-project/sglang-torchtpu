@@ -13,7 +13,7 @@ from torch.nn.parameter import Parameter
 from sglang.srt.runtime_context import get_parallel
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.fp8_moe import _clear_replaced_param, _get_tpu_fp8_runtime
-from sglang_tpu.kernels import static_fp8_gemv as _static_fp8_gemv
+from sglang_tpu.kernels.ops.gemm import static_fp8_gemv as _static_fp8_gemv
 
 logger = logging.getLogger(__name__)
 
@@ -199,7 +199,9 @@ def prepare_tpu_fp8_linear_weights(
 
 def register_tpu_block_fp8_linear() -> None:
     """Register the Pallas block-FP8 matmul custom op before torch.compile tracing."""
-    from sglang_tpu.quantized_matmul import register_tpu_block_fp8_matmul_op
+    from sglang_tpu.kernels.ops.gemm.quantized_matmul import (
+        register_tpu_block_fp8_matmul_op,
+    )
 
     register_tpu_block_fp8_matmul_op()
 
@@ -418,7 +420,7 @@ def tpu_w8a8_block_fp8_linear(
     # TODO(torch_tpu#1831): try torch._scaled_mm_v2 once torch_tpu registers a
     # native block-scaled matmul op. Until then, keep true blockwise FP8 behind
     # one Pallas custom op, matching vllm-torchtpu's serving path.
-    from sglang_tpu.quantized_matmul import (
+    from sglang_tpu.kernels.ops.gemm.quantized_matmul import (
         blockwise_quantized_matmul,
     )
 
@@ -436,7 +438,7 @@ def tpu_w8a8_block_fp8_linear(
 
 
 def _small_m_supports(tokens: int, k: int, n: int) -> bool:
-    from sglang_tpu.kernels.fp8_linear_small_m import supports
+    from sglang_tpu.kernels.ops.gemm.fp8_linear_small_m import supports
 
     return supports(tokens, k, n)
 
@@ -448,7 +450,7 @@ def _get_fp8_linear_small_m_op() -> Callable:
 
     import jax
 
-    from sglang_tpu.kernels.fp8_linear_small_m import fp8_linear_small_m
+    from sglang_tpu.kernels.ops.gemm.fp8_linear_small_m import fp8_linear_small_m
     from sglang_tpu.pallas_jax_op import cpu_export_jax_op
 
     def _op(x: jax.Array, weight: jax.Array, weight_scale: jax.Array) -> jax.Array:

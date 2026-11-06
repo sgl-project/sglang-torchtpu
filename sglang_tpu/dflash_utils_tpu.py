@@ -19,7 +19,7 @@ from torch import nn
 from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.distributed import model_parallel_is_initialized
 from sglang.srt.runtime_context import get_parallel
-from sglang_tpu.kernels.distributed_topk import SUPPORTED_WORLD_SIZES
+from sglang_tpu.kernels.ops.sampling.distributed_topk import SUPPORTED_WORLD_SIZES
 from sglang_tpu.spec_op_warmup import (
     make_dflash_verify_argmax_args,
     make_dflash_verify_bookkeeping_args,

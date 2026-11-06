@@ -36,11 +36,11 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.kernels.band_skip_flash_attention import (
+from sglang_tpu.kernels.ops.attention.band_skip_flash_attention import (
     band_skip_config,
     band_skip_flash_attention,
 )
-from sglang_tpu.kernels.flash_attention import (
+from sglang_tpu.kernels.ops.attention.flash_attention import (
     BlockSizes,
     SegmentIds,
     flash_attention,

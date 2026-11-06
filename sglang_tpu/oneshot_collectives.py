@@ -26,7 +26,7 @@ def _build_all_gather_op(world_size: int) -> Callable:
     import jax
     from jax.sharding import PartitionSpec as P
 
-    from sglang_tpu.kernels.oneshot_all_gather import (
+    from sglang_tpu.kernels.ops.communication.oneshot_all_gather import (
         oneshot_all_gather,
     )
     from sglang_tpu.pallas_jax_op import cpu_export_jax_op

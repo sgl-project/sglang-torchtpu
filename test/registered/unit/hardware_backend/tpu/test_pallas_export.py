@@ -124,7 +124,7 @@ class TestPallasExportEnvironment(CustomTestCase):
     @unittest.skipUnless(importlib.util.find_spec("torch_tpu"), "requires TorchTPU")
     def test_mesh_builders_use_native_mesh_unchanged(self):
         from sglang_tpu import distributed_topk_pallas
-        from sglang_tpu.moe.pallas import fused_moe_rs_op
+        from sglang_tpu.kernels.ops.moe import fused_moe_rs_op
 
         for builder, args, axes, shape in (
             (distributed_topk_pallas._get_mesh, (8,), ("model",), (8,)),
@@ -230,7 +230,7 @@ class TestPallasExportEnvironment(CustomTestCase):
         through functions that take tensors only."""
         import torch
 
-        from sglang_tpu import (
+        from sglang_tpu.kernels.ops.kvcache import (
             kv_fused_rope_write,
             kv_page_write,
             kv_row_write,

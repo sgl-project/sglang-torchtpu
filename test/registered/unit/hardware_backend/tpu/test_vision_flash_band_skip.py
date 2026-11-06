@@ -188,7 +188,7 @@ def _f64(x):
 
 def _band_widths(seg, block_q):
     """Chunks in each q block's band (``band_tables``, the kernel's reference)."""
-    from sglang_tpu.kernels.band_skip_flash_attention import band_tables
+    from sglang_tpu.kernels.ops.attention.band_skip_flash_attention import band_tables
 
     ids = _cpu(seg[None])
     return set(np.asarray(band_tables(ids, ids, block_q)[1]).tolist())
@@ -304,7 +304,7 @@ class TestVisionFlashBandSkipDispatch(CustomTestCase):
     def _dense_call(self, q, block_q, max_seq):
         """The dense call as main makes it."""
         from sglang_tpu.attention_pallas import _vision_flash_block_sizes
-        from sglang_tpu.kernels.flash_attention import SegmentIds
+        from sglang_tpu.kernels.ops.attention.flash_attention import SegmentIds
 
         kv_len = q.shape[2]
         return (
@@ -338,7 +338,7 @@ class TestVisionFlashBandSkipDispatch(CustomTestCase):
 
     def test_flag_set_runs_band_skip_only_where_configured(self):
         from sglang_tpu.attention_pallas import _vision_flash_block_sizes
-        from sglang_tpu.kernels.flash_attention import SegmentIds
+        from sglang_tpu.kernels.ops.attention.flash_attention import SegmentIds
 
         for (block_q, max_seq), expected in self.BAND_SKIP.items():
             op = _get_op(block_q, max_seq, band_skip=True)
@@ -432,7 +432,10 @@ class TestVisionFlashBandSkipOpNumerics(CustomTestCase):
         import jax.numpy as jnp
 
         from sglang_tpu.attention_pallas import _vision_flash_block_sizes
-        from sglang_tpu.kernels.flash_attention import SegmentIds, flash_attention
+        from sglang_tpu.kernels.ops.attention.flash_attention import (
+            SegmentIds,
+            flash_attention,
+        )
 
         for kv_len, block_q in ((1024, 0), (1024, 256), (3072, 0), (3072, 256)):
             with self.subTest(kv_len=kv_len, block_q=block_q):
@@ -463,10 +466,10 @@ class TestBandSkipKernelNumerics(CustomTestCase):
     kernel, on layouts chosen to reach each of its bodies."""
 
     def _check(self, heads, kv_len, block_q, seg):
-        from sglang_tpu.kernels.band_skip_flash_attention import (
+        from sglang_tpu.kernels.ops.attention.band_skip_flash_attention import (
             band_skip_flash_attention,
         )
-        from sglang_tpu.kernels.flash_attention import (
+        from sglang_tpu.kernels.ops.attention.flash_attention import (
             BlockSizes,
             SegmentIds,
             flash_attention,
@@ -523,11 +526,11 @@ class TestBandSkipKernelOnTpu(CustomTestCase):
     def test_every_config_is_bitwise_dense(self):
         import jax.numpy as jnp
 
-        from sglang_tpu.kernels.band_skip_flash_attention import (
+        from sglang_tpu.kernels.ops.attention.band_skip_flash_attention import (
             _CONFIGS,
             band_skip_flash_attention,
         )
-        from sglang_tpu.kernels.flash_attention import (
+        from sglang_tpu.kernels.ops.attention.flash_attention import (
             BlockSizes,
             SegmentIds,
             flash_attention,

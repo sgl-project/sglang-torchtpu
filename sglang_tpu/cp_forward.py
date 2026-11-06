@@ -31,7 +31,7 @@ from sglang_tpu.cp_layout import (
     build_tpu_cp_layout,
     max_local_rows,
 )
-from sglang_tpu.kv_row_write import write_rows_torch
+from sglang_tpu.kernels.ops.kvcache.kv_row_write import write_rows_torch
 
 _LAYOUT_ATTR = "_tpu_cp_layout"
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)

@@ -3,7 +3,7 @@
 Two TPU attention backends share the ``pallas_tpu_*`` namespace:
 
 * ``pallas_tpu_rpa_v3`` (default) — wraps the vendored
-  :mod:`sglang_tpu.attention.pallas.ragged_paged_attention_v3` kernel
+  :mod:`sglang_tpu.kernels.ops.attention.ragged_paged_attention_v3` kernel
   and needs the fused 5D KV layout from
   :class:`sglang_tpu.kv_pool.TpuFusedMHATokenToKVPool`.
 * ``pallas_tpu_flash`` — wraps ``flash_attention`` for prefill/extend and

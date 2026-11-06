@@ -135,6 +135,13 @@ repos:
         entry: python3 tools/plugin/check_tpu_branches.py --files
         language: system
         files: ^python/sglang/.*\.py$
+      - id: check-tpu-kernel-layout
+        name: TPU kernel layout ratchet (kernels self-contained in sglang_tpu/kernels)
+        # Known exceptions in tools/plugin/tpu_kernel_layout_baseline.json; --write-baseline to change them.
+        entry: python3 tools/plugin/check_tpu_kernel_layout.py
+        language: system
+        files: ^(sglang_tpu/.*|test/registered/tpu/kernels/.*|tools/plugin/(check_tpu_kernel_layout\.py|tpu_kernel_layout_baseline\.json))$
+        pass_filenames: false
       - id: rustfmt-sgl-model-gateway
         name: rustfmt sgl-model-gateway (nightly)
         entry: bash -c 'rustup component add --toolchain nightly rustfmt >/dev/null && cd sgl-model-gateway && cargo +nightly fmt -- --check'

@@ -282,7 +282,7 @@ class TpuEnvs:
     SGLANG_TPU_VISION_FLASH_BAND_SKIP = EnvBool(False)
 
     # Largest decode batch (tokens) that `--moe-runner-backend pallas_tpu_fused_decode`
-    # runs with the fused MoE decode kernel (`sglang_tpu/moe/pallas/fused_moe_decode`);
+    # runs with the fused MoE decode kernel (`sglang_tpu/kernels/ops/moe/fused_moe_decode`);
     # larger batches use gmm_v2.
     SGLANG_TPU_FUSED_MOE_DECODE_MAX_TOKENS = EnvInt(256)
 

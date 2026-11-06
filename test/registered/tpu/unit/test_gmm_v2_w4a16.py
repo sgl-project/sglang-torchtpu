@@ -120,7 +120,7 @@ class TestGmmV2W4A16(CustomTestCase):
         return out
 
     def _run(self, dtype, dequantize_rhs=False, scale_dtype=None):
-        from sglang_tpu.moe.pallas.gmm_v2 import gmm_v2
+        from sglang_tpu.kernels.ops.moe.gmm_v2 import gmm_v2
 
         klhs, k13, k2 = jax.random.split(jax.random.key(0), 3)
         lhs = (jax.random.normal(klhs, (self.M, self.K), jnp.float32) * 0.3).astype(
@@ -174,7 +174,7 @@ class TestGmmV2W4A16(CustomTestCase):
         self._run(jnp.bfloat16, dequantize_rhs=True, scale_dtype=jnp.float32)
 
     def test_vmem_rejects_partial_scale_group(self):
-        from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, gmm_v2
+        from sglang_tpu.kernels.ops.moe.gmm_v2 import TileSizes, gmm_v2
 
         with self.assertRaisesRegex(ValueError, "multiple of the INT4 group size"):
             gmm_v2(

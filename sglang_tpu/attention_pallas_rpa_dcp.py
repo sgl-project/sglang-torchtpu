@@ -54,8 +54,8 @@ _OP_CACHE: dict = {}
 
 
 def _import_dcp_kernel():
-    from sglang_tpu.attention.pallas.batched_rpa import configs
-    from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
+    from sglang_tpu.kernels.ops.attention.batched_rpa import configs
+    from sglang_tpu.kernels.ops.attention.batched_rpa.wrapper import (
         ragged_paged_attention,
     )
 
@@ -64,7 +64,7 @@ def _import_dcp_kernel():
 
 def build_dcp_kernel_op(spec):
     """Register the batched ragged_paged_attention kernel (module
-    ``sglang_tpu.attention.pallas.batched_rpa.wrapper``) in its CP-aware form
+    ``sglang_tpu.kernels.ops.attention.batched_rpa.wrapper``) in its CP-aware form
     as a torch custom op for ``spec``'s backend.
 
     The op mirrors the base module's ``_build_pallas_kernel_op`` and adds the

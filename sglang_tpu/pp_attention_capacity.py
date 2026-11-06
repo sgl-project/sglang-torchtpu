@@ -25,8 +25,8 @@ def _capacity_for_shape(
     import jax.numpy as jnp
     from jax.experimental.pallas import tpu as pltpu
 
-    from sglang_tpu.attention.pallas.batched_rpa import configs
-    from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
+    from sglang_tpu.kernels.ops.attention.batched_rpa import configs
+    from sglang_tpu.kernels.ops.attention.batched_rpa.wrapper import (
         calculate_block_sizes,
     )
     from sglang_tpu.pallas_export import tpu_info_for_cpu_export

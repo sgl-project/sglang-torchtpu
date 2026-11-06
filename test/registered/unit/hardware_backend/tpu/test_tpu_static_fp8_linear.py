@@ -178,7 +178,7 @@ class TestStaticFp8PallasGemvHelpers(CustomTestCase):
         )
 
     def test_block_k_divides_k_and_fits_vmem(self):
-        from sglang_tpu.kernels.static_fp8_gemv import block_k
+        from sglang_tpu.kernels.ops.gemm.static_fp8_gemv import block_k
 
         # Kimi-K3 TP32 shapes: KDA qkvg, MoE front, latent up.
         for k, n in ((7168, 1536), (7168, 3968), (3584, 7168)):

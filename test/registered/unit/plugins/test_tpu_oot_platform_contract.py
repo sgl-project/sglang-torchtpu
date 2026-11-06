@@ -20,6 +20,8 @@ import ast
 import importlib.util
 import os
 import sys
+import tempfile
+import textwrap
 import unittest
 from typing import Optional
 from unittest.mock import MagicMock, patch
@@ -52,6 +54,7 @@ def _load_tool(filename: str, name: str):
 gate_audit = _load_tool("gate_audit.py", "_tpu_gate_audit")
 tpu_debt = _load_tool("check_tpu_branches.py", "_tpu_debt_ratchet")
 inventory = _load_tool("inventory.py", "_tpu_inventory")
+layout = _load_tool("check_tpu_kernel_layout.py", "_tpu_kernel_layout")
 
 
 # Gate-reachable methods the TPU platform does not answer; the list only shrinks.
@@ -739,6 +742,121 @@ class TestTpuPatchInventory(CustomTestCase):
             [],
             "Retarget a patch whose core attribute is gone; list one the patch adds "
             "on purpose in ADDED_BY_PATCHES, and drop it once core defines it.",
+        )
+
+
+class TestKernelLayoutRatchet(CustomTestCase):
+    """check_tpu_kernel_layout must catch every way a kernel or kernel test can come
+    to depend on code outside sglang_tpu/kernels, or kernel-test path selection
+    silently stops being sound."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        self.addCleanup(self._tmp.cleanup)
+        for pkg in (
+            "sglang_tpu",
+            "sglang_tpu/kernels/ops/moe",
+            "sglang_tpu/kernels/ops/attention",
+            "sglang_tpu/kernels/deepseek",
+            "sglang_tpu/dsv4",
+            "python/sglang/srt/layers",
+            "test/registered/tpu/kernels/ops/moe",
+        ):
+            self.write(f"{pkg}/__init__.py", "")
+        self.write("sglang_tpu/envs.py", "")
+        self.write("sglang_tpu/kernels/vmem_limit.py", "")
+        self.write("sglang_tpu/kernels/ops/attention/rpa.py", "")
+        self.write("sglang_tpu/kernels/deepseek/select.py", "")
+        self.write("sglang_tpu/dsv4/topk.py", "KVLayout = 1\n")
+        self.write("sglang_tpu/dsv4/rope.py", "")
+        self.write("python/sglang/srt/layers/util.py", "")
+
+    def write(self, rel, text):
+        path = os.path.join(self.root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write(textwrap.dedent(text))
+
+    def violations(self, baseline=layout.Layout([], {}, {})):
+        return layout.compare(layout.collect(self.root), baseline)[0]
+
+    def test_helpers_and_the_kernel_package_are_allowed(self):
+        self.write(
+            "sglang_tpu/kernels/ops/moe/gmm.py",
+            """
+            from sglang_tpu import envs
+            from sglang_tpu.kernels import vmem_limit
+            from sglang_tpu.kernels.ops import moe
+            from . import gmm_utils
+            from jax.experimental import pallas as pl
+            out = pl.pallas_call
+            """,
+        )
+        # A subpackage outside ops/ is a group of its own.
+        self.write(
+            "sglang_tpu/kernels/deepseek/topk.py",
+            "from sglang_tpu.kernels.deepseek import select\n",
+        )
+        self.assertEqual(self.violations(), [])
+
+    def test_outside_dependencies_are_caught_however_imported(self):
+        # Function-local, attribute, relative, and cross-group imports, and
+        # TensorCore and SparseCore kernels launched outside the package.
+        self.write(
+            "sglang_tpu/kernels/ops/moe/gmm.py",
+            """
+            def f():
+                from sglang.srt.layers import util
+            from sglang_tpu.dsv4.topk import KVLayout
+            from ....dsv4 import rope
+            from sglang_tpu.kernels.ops.attention import rpa
+            from sglang_tpu.kernels.deepseek import select
+            """,
+        )
+        self.write("sglang_tpu/stray.py", "pl.pallas_call(kernel)\n")
+        self.write("sglang_tpu/stray_sc.py", "out = pl.kernel(body, mesh=mesh)\n")
+        # A shared helper is held to the same rule as the kernels that import it.
+        self.write("sglang_tpu/envs.py", "from sglang.srt.layers import util\n")
+        self.write(
+            "test/registered/tpu/kernels/ops/moe/test_gmm.py",
+            "import sglang_tpu.dsv4.topk\nfrom sglang.test import test_utils\n",
+        )
+        current = layout.collect(self.root)
+        self.assertEqual(
+            current.kernel_imports,
+            {
+                "sglang_tpu/kernels/ops/moe/gmm.py": [
+                    "sglang.srt.layers.util",
+                    "sglang_tpu.dsv4.rope",
+                    "sglang_tpu.dsv4.topk",
+                    "sglang_tpu.kernels.deepseek.select",
+                    "sglang_tpu.kernels.ops.attention.rpa",
+                ],
+                "sglang_tpu/envs.py": ["sglang.srt.layers.util"],
+            },
+        )
+        self.assertEqual(
+            current.kernels_outside, ["sglang_tpu/stray.py", "sglang_tpu/stray_sc.py"]
+        )
+        self.assertEqual(
+            current.test_imports,
+            {
+                "test/registered/tpu/kernels/ops/moe/test_gmm.py": [
+                    "sglang_tpu.dsv4.topk"
+                ]
+            },
+        )
+        self.assertEqual(len(self.violations()), 5)
+        # Recorded exceptions pass; a new one in the same file still fails.
+        self.assertEqual(self.violations(baseline=current), [])
+        self.write("sglang_tpu/kernels/ops/moe/gmm.py", "import sglang_tpu.dsv4\n")
+        self.assertEqual(
+            self.violations(baseline=current),
+            [
+                "sglang_tpu/kernels/ops/moe/gmm.py: imports sglang_tpu.dsv4; "
+                "kernels import only their own group and the shared helpers."
+            ],
         )
 
 

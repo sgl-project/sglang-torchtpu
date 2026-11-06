@@ -2,7 +2,7 @@
 """Pallas Gated-DeltaNet (GDN) linear-attention op for the TPU torch_tpu platform.
 
 Wraps the fused Conv1D + gated-delta-rule JAX/Pallas kernel
-(``sglang_tpu.attention.pallas.gdn.fused_conv1d_gdn``) as a PyTorch
+(``sglang_tpu.kernels.ops.attention.gdn.fused_conv1d_gdn``) as a PyTorch
 custom op, so the hybrid Qwen3.5 / Qwen3-Next GDN layers can invoke it from
 PyTorch and trace it through ``torch.compile`` with ``backend="tpu"``.
 
@@ -108,8 +108,8 @@ def build_gdn_pallas_op():
     import jax  # noqa: F401  (force a loud failure if JAX is missing)
     from torch_tpu._internal import pallas as _torch_pallas
 
-    from sglang_tpu.attention.pallas.gdn import fused_conv1d_gdn
-    from sglang_tpu.attention.pallas.gdn.config import AttentionMode
+    from sglang_tpu.kernels.ops.attention.gdn import fused_conv1d_gdn
+    from sglang_tpu.kernels.ops.attention.gdn.config import AttentionMode
     from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
     # Shapes whose kernel is already compiled, so the export guard below can be

@@ -517,7 +517,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 with (
                     mock.patch.dict(
                         sys.modules,
-                        {"sglang_tpu.moe.pallas.fused_moe_rs_op": fused_rs_module},
+                        {"sglang_tpu.kernels.ops.moe.fused_moe_rs_op": fused_rs_module},
                     ),
                     mock.patch.object(
                         fp4_moe,
@@ -590,7 +590,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         with (
             mock.patch.dict(
                 sys.modules,
-                {"sglang_tpu.moe.pallas.fused_moe_rs_op": fused_rs_module},
+                {"sglang_tpu.kernels.ops.moe.fused_moe_rs_op": fused_rs_module},
             ),
             mock.patch.object(
                 fp4_moe, "_materialize_packed_fp4", side_effect=lambda value: value
@@ -626,7 +626,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         layer._tpu_fused_rs_has_post_expert_norm = False
         layer._tpu_fused_rs_group_offset = torch.tensor([0], dtype=torch.int32)
         layer.moe_ep_size = 1
-        from sglang_tpu.moe.pallas import fused_moe_rs_op
+        from sglang_tpu.kernels.ops.moe import fused_moe_rs_op
 
         # Autospec is intentional: it catches adapter/backend API skew during a
         # rebase instead of letting a permissive Mock accept removed keywords.
@@ -684,7 +684,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
 
                 with mock.patch.dict(
                     sys.modules,
-                    {"sglang_tpu.moe.pallas.fused_moe_rs_op": fused_rs_module},
+                    {"sglang_tpu.kernels.ops.moe.fused_moe_rs_op": fused_rs_module},
                 ):
                     result = fp4_moe.apply_tpu_nvfp4_moe(
                         layer=layer,
@@ -748,7 +748,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         with (
             mock.patch.dict(
                 sys.modules,
-                {"sglang_tpu.moe.pallas.fused_moe_rs_op": fused_rs_module},
+                {"sglang_tpu.kernels.ops.moe.fused_moe_rs_op": fused_rs_module},
             ),
             mock.patch.object(
                 fp4_moe,
@@ -807,7 +807,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         with (
             mock.patch.dict(
                 sys.modules,
-                {"sglang_tpu.moe.pallas.fused_moe_rs_op": fused_rs_module},
+                {"sglang_tpu.kernels.ops.moe.fused_moe_rs_op": fused_rs_module},
             ),
             mock.patch.object(
                 fp4_moe, "_materialize_packed_fp4", side_effect=lambda value: value
@@ -832,7 +832,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         with (
             mock.patch.dict(
                 sys.modules,
-                {"sglang_tpu.moe.pallas.fused_moe_rs_op": fused_rs_module},
+                {"sglang_tpu.kernels.ops.moe.fused_moe_rs_op": fused_rs_module},
             ),
             mock.patch.object(
                 fp4_moe, "_materialize_packed_fp4", side_effect=lambda value: value
@@ -843,8 +843,12 @@ class TestNvfp4Block512Contract(CustomTestCase):
 
     def test_fused_rs_group_offset_stays_model_sharded(self):
         repo_root = pathlib.Path(__file__).resolve().parents[5]
-        wrapper = (repo_root / "sglang_tpu/moe/pallas/fused_moe_rs_op.py").read_text()
-        body = (repo_root / "sglang_tpu/moe/pallas/fused_rs/fused_moe.py").read_text()
+        wrapper = (
+            repo_root / "sglang_tpu/kernels/ops/moe/fused_moe_rs_op.py"
+        ).read_text()
+        body = (
+            repo_root / "sglang_tpu/kernels/ops/moe/fused_rs/fused_moe.py"
+        ).read_text()
 
         self.assertIn("group_offset_input=group_offset", wrapper)
         self.assertIn("weight_p_spec,  # group_offset", body)
@@ -866,7 +870,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
     def test_fused_rs_selects_expected_activation_mode_by_group_size(self):
         import jax.numpy as jnp
 
-        from sglang_tpu.moe.pallas.fused_rs.gmm_v2_gather_scatter import (
+        from sglang_tpu.kernels.ops.moe.fused_rs.gmm_v2_gather_scatter import (
             get_maybe_quantize_lhs,
         )
 
@@ -1520,7 +1524,7 @@ class TestGmmV2PackedFp4BlockSizes(CustomTestCase):
         import jax
         import jax.numpy as jnp
 
-        from sglang_tpu.moe.pallas import gmm_v2
+        from sglang_tpu.kernels.ops.moe import gmm_v2
 
         lhs = jax.ShapeDtypeStruct((128, 1024), jnp.bfloat16)
         rhs = jax.ShapeDtypeStruct((2, 1024 // 2, 256), jnp.uint8)

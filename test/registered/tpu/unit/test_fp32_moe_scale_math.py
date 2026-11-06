@@ -31,7 +31,7 @@ def extract(path, names, ns):
 class TestFp32MoeScales(unittest.TestCase):
     def test_scale_math_and_production_parity(self):
         ns = extract(
-            "sglang_tpu/moe/pallas/gmm_v2.py",
+            "sglang_tpu/kernels/ops/moe/gmm_v2.py",
             {"_scale_quantized_partial"},
             {"jnp": jnp},
         )

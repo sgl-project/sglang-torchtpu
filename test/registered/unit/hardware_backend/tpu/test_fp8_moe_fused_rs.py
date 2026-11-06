@@ -179,7 +179,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
         )
 
         with patch(
-            "sglang_tpu.moe.pallas.fused_moe_rs_op.fused_moe_rs_gather",
+            "sglang_tpu.kernels.ops.moe.fused_moe_rs_op.fused_moe_rs_gather",
             return_value=torch.zeros_like(x),
         ) as fused:
             actual = apply_fp8_fused_rs(
@@ -216,7 +216,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
         )
 
         with patch(
-            "sglang_tpu.moe.pallas.fused_moe_rs_op.fused_moe_rs_gather",
+            "sglang_tpu.kernels.ops.moe.fused_moe_rs_op.fused_moe_rs_gather",
             return_value=torch.zeros_like(x),
         ) as fused:
             apply_fp8_fused_rs(

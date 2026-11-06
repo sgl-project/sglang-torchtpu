@@ -7,7 +7,7 @@ attends only over the keys the DSA indexer picked for it:
 * The indexer runs here too. One op per indexer layer stores that layer's
   index keys and returns the top-k rows (see ``dsa_indexer_tpu``).
 * The attention op takes those rows and runs the sparse MLA kernels
-  (``sglang_tpu.attention.pallas.mla_sparse``).
+  (``sglang_tpu.kernels.ops.attention.mla_sparse``).
 
 Everything else is inherited from ``pallas_tpu_mla``: how the model calls the
 backend, and the metadata built for each forward pass.
@@ -80,7 +80,7 @@ def _build_pallas_sparse_mla_kernel_op(
     import jax  # noqa: F401  (force loud failure if JAX is missing)
     from torch_tpu._internal import pallas as _torch_pallas
 
-    from sglang_tpu.attention.pallas.mla_sparse_fused import (
+    from sglang_tpu.kernels.ops.attention.mla_sparse_fused import (
         sparse_mla_attention_fused,
         sparse_mla_prefill_fused_tokens,
     )
@@ -354,7 +354,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             # long-context batches) and the decode op keep the default chunk.
             self._prefill_op = _build_pallas_sparse_mla_kernel_op(1)
             return _build_pallas_sparse_mla_kernel_op()
-        from sglang_tpu.attention.pallas.mla_sparse_fused import (
+        from sglang_tpu.kernels.ops.attention.mla_sparse_fused import (
             QBLOCK_GATHER_CHUNK_TOKENS,
         )
 

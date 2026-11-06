@@ -982,7 +982,7 @@ class DeepseekV2MoE(nn.Module):
         """
         if not _is_tpu or skip_shared_experts:
             return False
-        from sglang_tpu.moe.pallas.fused_moe_decode.fused_moe_decode_op import (
+        from sglang_tpu.kernels.ops.moe.fused_moe_decode.fused_moe_decode_op import (
             should_use_fused_moe_decode,
         )
 
@@ -994,7 +994,7 @@ class DeepseekV2MoE(nn.Module):
         forward_batch: ForwardBatch,
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
-        from sglang_tpu.moe.pallas.fused_moe_decode.fused_moe_decode_op import (
+        from sglang_tpu.kernels.ops.moe.fused_moe_decode.fused_moe_decode_op import (
             apply_fused_moe_decode,
         )
 

@@ -184,7 +184,7 @@ def negotiate_pallas_distributed_top_k_config(
     transport failure cannot safely become a rank-local fallback decision.
     """
 
-    from sglang_tpu.kernels.distributed_topk import (
+    from sglang_tpu.kernels.ops.sampling.distributed_topk import (
         MAX_DISTRIBUTED_TOP_K,
         SUPPORTED_WORLD_SIZES,
     )
@@ -394,7 +394,7 @@ def distributed_tpu_top_k(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run exact distributed TopK through the direct-HBM Pallas ring."""
 
-    from sglang_tpu.kernels.distributed_topk import (
+    from sglang_tpu.kernels.ops.sampling.distributed_topk import (
         MAX_DISTRIBUTED_TOP_K,
         SUPPORTED_WORLD_SIZES,
     )

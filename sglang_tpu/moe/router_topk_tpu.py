@@ -5,7 +5,7 @@
 TPU to an XLA sort over all experts plus a gather and reductions: 7 us per
 MoE layer for Kimi-K3's top-16 of 896 at batch 1. This kernel does sigmoid,
 the biased choice, k rounds of argmax-and-mask, the weight gather and the
-renormalization in VMEM (sglang_tpu/kernels/router_topk.py); this module
+renormalization in VMEM (sglang_tpu/kernels/ops/moe/router_topk.py); this module
 registers it as an op and routes eligible ``biased_topk_impl`` calls to it.
 
 Ties pick the lowest expert id, which ``torch.topk`` does not promise; the
@@ -35,7 +35,7 @@ _OP_READY = False
 def _build_op() -> Callable:
     import jax  # noqa: F401  (force loud failure if JAX is missing)
 
-    from sglang_tpu.kernels.router_topk import router_topk_jax
+    from sglang_tpu.kernels.ops.moe.router_topk import router_topk_jax
     from sglang_tpu.pallas_jax_op import cpu_export_jax_op
 
     def _wrapped(

@@ -574,7 +574,7 @@ def apply_tpu_fp8_moe(
     # layout helpers above -- pure host-side torch -- be unit-tested on the CPU
     # lane. See test/registered/unit/hardware_backend/tpu/
     # test_fp8_moe_scale_layout.py.
-    from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
+    from sglang_tpu.kernels.ops.moe.fused_moe_op import fused_moe_call
 
     # TODO(torch_tpu): try native torch._scaled_grouped_mm for channelwise
     # scales and torch._scaled_grouped_mm_v2 for block scales once torch_tpu

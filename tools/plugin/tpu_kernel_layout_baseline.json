@@ -1,0 +1,96 @@
+{
+  "kernel_imports": {
+    "sglang_tpu/envs.py": [
+      "sglang.srt.environ"
+    ],
+    "sglang_tpu/kernels/deepseek_v41/index_selection/selection.py": [
+      "sglang_tpu.dsv4.sparsecore_topk",
+      "sglang_tpu.dsv4.streamindex_topk.config"
+    ],
+    "sglang_tpu/kernels/ops/attention/dsa_index_topk.py": [
+      "sglang_tpu.dsv4.streamindex_topk",
+      "sglang_tpu.dsv4.streamindex_topk.streamindex_topk"
+    ],
+    "sglang_tpu/kernels/ops/attention/dsa_kpool_topk.py": [
+      "sglang_tpu.dsv4.streamindex_topk",
+      "sglang_tpu.dsv4.streamindex_topk.streamindex_topk"
+    ],
+    "sglang_tpu/kernels/ops/attention/gdn/wrapper.py": [
+      "sglang_tpu.kda_layout"
+    ],
+    "sglang_tpu/kernels/ops/attention/mla_sparse/native_sc_gather.py": [
+      "sglang_tpu.kernels.ops.moe.sparse_core.core_map_helper"
+    ],
+    "sglang_tpu/kernels/ops/gemm/host_split_gemv.py": [
+      "sglang_tpu.kimi_attn_residual"
+    ],
+    "sglang_tpu/kernels/ops/moe/fused_moe_decode/fused_moe_decode_op.py": [
+      "sglang.srt.layers.layer_boundary",
+      "sglang.srt.layers.moe.utils",
+      "sglang.srt.runtime_context",
+      "sglang_tpu.rank_local"
+    ],
+    "sglang_tpu/kernels/ops/moe/fused_moe_op.py": [
+      "sglang.srt.layers.moe.tpu_moe_utils",
+      "sglang_tpu.rank_local"
+    ],
+    "sglang_tpu/kernels/ops/moe/fused_moe_rs_op.py": [
+      "sglang.srt.runtime_context",
+      "sglang_tpu.moe.expert_tp",
+      "sglang_tpu.oneshot_collectives"
+    ]
+  },
+  "kernels_outside": [
+    "sglang_tpu/dsv4/compress_and_store/kernel.py",
+    "sglang_tpu/dsv4/compress_and_store/proj_and_save_state.py",
+    "sglang_tpu/dsv4/core_attention/csa_gather.py",
+    "sglang_tpu/dsv4/core_attention/mla.py",
+    "sglang_tpu/dsv4/core_attention/mla_swa.py",
+    "sglang_tpu/dsv4/core_attention/sparse_mla.py",
+    "sglang_tpu/dsv4/rope.py",
+    "sglang_tpu/dsv4/sparsecore_topk.py",
+    "sglang_tpu/dsv4/streamindex_topk/streamindex_topk.py",
+    "sglang_tpu/fp8_lm_head.py",
+    "sglang_tpu/fp8_weight_linear.py",
+    "sglang_tpu/glm_flash_megakernel/kernel/decode.py",
+    "sglang_tpu/glm_flash_megakernel/kernel/runner.py",
+    "sglang_tpu/k3_megakernel/kernel/stack.py",
+    "sglang_tpu/k3_megakernel/kernel/stages/common.py",
+    "sglang_tpu/k3_megakernel/kernel/stages/mla.py",
+    "sglang_tpu/k3_megakernel/kernel/stages/moe.py",
+    "sglang_tpu/k3_megakernel/ops.py",
+    "sglang_tpu/k3_megakernel/server/draft.py",
+    "sglang_tpu/k3_megakernel/server/draft_kernels.py",
+    "sglang_tpu/k3_megakernel/server/engine.py",
+    "sglang_tpu/kimi_attn_residual.py",
+    "sglang_tpu/multimodal_gen/tpu_splash_attn.py",
+    "sglang_tpu/muse_megakernel/kernel.py",
+    "sglang_tpu/twolevel_allreduce.py"
+  ],
+  "test_imports": {
+    "test/registered/tpu/kernels/ops/moe/test_fused_moe_dense_route.py": [
+      "sglang.srt.layers.quantization.mxfp4_tpu_util"
+    ],
+    "test/registered/tpu/kernels/ops/moe/test_fused_moe_padded_tokens.py": [
+      "sglang.srt.layers.quantization.mxfp4_tpu_util"
+    ],
+    "test/registered/tpu/kernels/ops/moe/test_fused_moe_route_meta.py": [
+      "sglang.srt.layers.quantization.mxfp4_tpu_util"
+    ],
+    "test/registered/tpu/kernels/ops/moe/test_fused_moe_sc_gather_odd_tokens.py": [
+      "sglang.srt.layers.quantization.mxfp4_tpu_util"
+    ],
+    "test/registered/tpu/kernels/ops/moe/test_fused_moe_situ_mxfp4.py": [
+      "sglang.srt.layers.quantization.mxfp4_tpu_util"
+    ],
+    "test/registered/tpu/kernels/ops/moe/test_sc_dense_gather_reduce.py": [
+      "sglang_tpu.compile_cache"
+    ],
+    "test/registered/tpu/kernels/ops/moe/test_sc_ragged_gather_reduce_v2.py": [
+      "sglang_tpu.compile_cache"
+    ],
+    "test/registered/tpu/kernels/ops/moe/test_sc_ragged_gather_v2.py": [
+      "sglang_tpu.compile_cache"
+    ]
+  }
+}

@@ -124,7 +124,7 @@ class _MoeMockRunner:
             )
             return self._fake_kernel_out
 
-        # ``forward_tpu`` does ``from sglang_tpu.moe.pallas.fused_moe_op
+        # ``forward_tpu`` does ``from sglang_tpu.kernels.ops.moe.fused_moe_op
         # import fused_moe_call`` inside the function body, so we shadow
         # the whole module in sys.modules with one that only exposes the
         # fake. Tests then run on any host.
@@ -132,7 +132,7 @@ class _MoeMockRunner:
             patch.dict(
                 "sys.modules",
                 {
-                    "sglang_tpu.moe.pallas.fused_moe_op": SimpleNamespace(
+                    "sglang_tpu.kernels.ops.moe.fused_moe_op": SimpleNamespace(
                         fused_moe_call=fake_kernel
                     ),
                 },

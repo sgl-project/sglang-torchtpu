@@ -1,7 +1,7 @@
 """DSA indexer token split (SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT), host-side logic without a TPU.
 
 The windowed indexer kernel is checked bit for bit against the unsplit one on
-TPU in test/registered/tpu/unit/test_dsa_index_topk.py. These cover the rest:
+TPU in test/registered/tpu/kernels/ops/attention/test_dsa_index_topk.py. These cover the rest:
 which batches split and into how many rows per rank, and the all-reduce that
 puts the ranks' row slices together in rank order (T=4096 at TP8 and TP32,
 the 4096-token prefill bucket of Kimi-K3.1).
