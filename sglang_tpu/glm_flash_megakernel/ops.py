@@ -99,6 +99,7 @@ class GlmFlashMegakernel:
         max_rows: int,
         backend,
         call_rows: int | None = None,
+        max_requests: int | None = None,
     ):
         import jax
         from jax.sharding import NamedSharding
@@ -142,6 +143,10 @@ class GlmFlashMegakernel:
         # Requests per kernel call; a larger batch is split into calls of this size.
         call_rows = max_rows if call_rows is None else min(call_rows, max_rows)
         self.call_req = max(1, call_rows // n_query)
+        # The scheduler never batches past its concurrency cap, so larger buckets
+        # would only be compiled (one Pallas kernel each), never run.
+        if max_requests is not None:
+            self.call_req = max(1, min(self.call_req, max_requests))
         km_tile = 512 if self.max_req * n_query == 1 else 256
 
         def cfg_for(b):
