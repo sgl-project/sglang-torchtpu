@@ -763,7 +763,11 @@ class MuseMegakernel(torch.nn.Module):
                     _TILED_VY2_VMEM_BUDGET
                     if vy >= 2
                     else (
-                        _TILED_VPADS_VMEM_BUDGET
+                        (
+                            _TILED_VPADS_SMALL_VMEM_BUDGET
+                            if rows <= 128
+                            else _TILED_VPADS_VMEM_BUDGET
+                        )
                         if cfg.tiled_vmem_pads
                         else _SCRATCH_VMEM_BUDGET
                     )
@@ -1166,6 +1170,10 @@ _OPT_ALIASED_VMEM_LIMIT = 62 * 2**20
 # declared scratch; capping row-tiled budgets at 50 MiB keeps total scoped VMEM <= 60.5 MiB
 # under the 62 MiB v7x limit across rows=48..128 without LLO retry thrashing.
 _TILED_VPADS_VMEM_BUDGET = 50 * 2**20
+# 128 rows of 8 (P/D decode cc16): the depth-3, 5-slot VMEM-Y plan declares 48.28 MiB, but its
+# LLO temporaries take scoped VMEM to 62.08 MiB, over the 62 MiB limit; the depth-1 6-slot
+# plan (43.03 MiB) compiles and matches a row_tile=32 plan bit for bit (anvil).
+_TILED_VPADS_SMALL_VMEM_BUDGET = 48 * 2**20
 _TILED_VY2_VMEM_BUDGET = 50 * 2**20
 _ATTN_HOIST_GLOBAL_MIN_POS = 262144
 # Past this, pages_swa stays in HBM and each step reads only the requests' windows of it.
