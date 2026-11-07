@@ -185,12 +185,16 @@ class TpuEnvs:
     # MoE router: one Pallas kernel for the biased sigmoid top-k of decode-sized
     # batches (kernels/router_topk.py); False keeps the generic top-k.
     SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL = EnvBool(True)
-    # GLM-5.3-Flash: single-request target steps (the MTP verify, or decode
-    # without speculation) as one Pallas call per device (glm_flash_megakernel/);
-    # other steps run the model as usual. ..._MAX_LEN caps the request length the
-    # kernel takes (default: the context length).
+    # GLM-5.3-Flash: target steps (the MTP verify, or decode without speculation)
+    # as one Pallas call per device (glm_flash_megakernel/); other steps run the
+    # model as usual. ..._MAX_LEN caps the request length the kernel takes
+    # (default: the context length); ..._MAX_ROWS the rows (requests x draft
+    # tokens) of one step; a larger step runs as several calls of at most
+    # ..._CALL_ROWS rows each (32 fits tpu7x's 64 MiB VMEM, 64 does not; measured).
     SGLANG_TPU_GLM_FLASH_MEGAKERNEL = EnvBool(False)
     SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_LEN = EnvInt(None)
+    SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_ROWS = EnvInt(32)
+    SGLANG_TPU_GLM_FLASH_MEGAKERNEL_CALL_ROWS = EnvInt(32)
     # Pin each scheduler's main thread to one CPU of its rank's set and keep its
     # other threads off that physical core (hooks/cpu_pinning.py).
     SGLANG_TPU_ENABLE_SCHEDULER_THREAD_PINNING = EnvBool(False)
@@ -310,7 +314,7 @@ class TpuEnvs:
     SGLANG_RAIDEN_PUSH_WORKERS = EnvInt(1)
 
     # Host staging budget per node, split across local ranks.
-    SGLANG_RAIDEN_HOST_POOL_GB = EnvFloat(24.0)
+    SGLANG_RAIDEN_HOST_POOL_GB = EnvFloat(64.0)
     # Host layer buffers across full-attention and SWA engines, split by layer
     # count with at least one each. 0 keeps full mirrors.
     # More buffers, or 0, make each slot larger. Raise SGLANG_RAIDEN_HOST_POOL_GB
@@ -354,6 +358,12 @@ class TpuEnvs:
     # Pipeline prefill: each stage registers its share of the closing transfer
     # at the final chunk's launch, the last stage once its tokens are copied.
     SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE = EnvBool(False)
+
+    # Pipeline parallelism: hand activations between stages point to point
+    # (isend/irecv, pp_buffered.py) instead of the lockstep collective-permute wave.
+    SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF = EnvBool(False)
+    # Buffered hand-off: forwards a stage may queue for sending before it blocks.
+    SGLANG_TPU_PP_BUFFERED_SEND_DEPTH = EnvInt(2)
 
     # raiden KV-offload backend
     # Seconds a raiden DMA may stay pending, from each blocking wait or, when
@@ -451,12 +461,17 @@ class TpuEnvs:
     SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS = EnvInt(0)
     # MoE: use onehot dense matmul for small permute and unpermute/combine
     # paths instead of gather. When set to 0, this is disabled. When set
-    # to a positive integer, this is the threshold for tokens per rank below
-    # which the dense matmul path is taken. Suggset to start with 1024 or 2048
-    # and tune from there. Below it, batches of up to 2048 routed rows also
-    # take the sort-free dense rank route, and one-token batches the
-    # route-meta kernel.
+    # to a positive integer, the permute is dense below this many tokens per
+    # rank and the combine below this many routed rows (tokens x topk).
+    # Suggest to start with 1024 or 2048 and tune from there. Below it,
+    # batches of up to 2048 routed rows also take the sort-free dense rank
+    # route, and one-token batches the route-meta kernel.
     SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD = EnvInt(0)
+    # MoE: where the permute is dense and the combine is the SparseCore gather
+    # (threshold / topk <= tokens < threshold), permute with the gather too.
+    # Set at startup by SGLANG_TPU_K3_STATIC_FP8 moe_front or latent_up: there a
+    # one-hot permute feeding the SparseCore combine gave wrong tokens.
+    SGLANG_TPU_FORCE_MOE_GATHER_PERMUTE_WITH_SC_COMBINE = EnvBool(False)
     # Turn off EP-local expert reads (models that opt in read only their EP
     # rank's routed experts with --weight-loader-disable-mmap).
     SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS = EnvBool(False)

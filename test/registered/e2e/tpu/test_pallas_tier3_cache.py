@@ -11,6 +11,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -86,6 +87,23 @@ _WORKER = textwrap.dedent("""
     """)
 
 
+def _run_worker_stage(command, *, env, timeout):
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Kill descendants while their launcher is still alive and owns them.
+        # subprocess.run kills only the launcher, leaking TPU owners into retries.
+        kill_process_tree(process.pid)
+        stdout, stderr = process.communicate()
+        return subprocess.CompletedProcess(
+            command, 124, stdout, f"Worker stage timed out after {timeout}s.\n{stderr}"
+        )
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
 def _singlehost_environment() -> dict[str, str]:
     completed = subprocess.run(
         [
@@ -156,7 +174,7 @@ class TestPallasTier3Cache(CustomTestCase):
                     }
                 )
                 log_directory = work_root / f"{stage}-logs"
-                completed = subprocess.run(
+                completed = _run_worker_stage(
                     [
                         sys.executable,
                         "-m",
@@ -176,9 +194,6 @@ class TestPallasTier3Cache(CustomTestCase):
                         stage,
                         str(increment),
                     ],
-                    capture_output=True,
-                    check=False,
-                    text=True,
                     env=environment,
                     timeout=120,
                 )

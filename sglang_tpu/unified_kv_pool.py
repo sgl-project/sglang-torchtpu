@@ -37,11 +37,14 @@ from sglang.srt.runtime_context import (
 from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_free_fence import HeldPages
+from sglang_tpu.kv_mxint8 import GROUP_SIZE as MXINT8_DEFAULT_GROUP_SIZE
+from sglang_tpu.kv_mxint8 import cache_bytes_per_token as mxint8_cache_bytes_per_token
 from sglang_tpu.kv_pool import (
     GB,
     TpuFusedMHATokenToKVPool,
     _cdiv,
 )
+from sglang_tpu.tpu_dma_hicache import is_tpu_dma_hicache_backend
 
 logger = logging.getLogger(__name__)
 
@@ -161,12 +164,24 @@ def _kvc_unified_layout(kvc) -> UnifiedPageLayout:
     )
 
 
+def _mxint8_unified_bytes_per_token(kvc, layout: UnifiedPageLayout) -> int:
+    return mxint8_cache_bytes_per_token(
+        layout.page_head_num,
+        layout.page_head_dim,
+        kvc.pool_page_size,
+        group_size=kvc.kv_group_size or MXINT8_DEFAULT_GROUP_SIZE,
+        layout="blocked",
+    )
+
+
 def _unsupported_reason(kvc) -> Optional[str]:
     """Return a human-readable reason why ``kvc`` cannot use the TPU unified KV pool,
     or ``None`` when supported."""
     parallel = get_parallel()
     memory = get_memory()
-    disagg_mode = get_disagg().disaggregation_mode
+    disagg = get_disagg()
+    disagg_mode = disagg.disaggregation_mode
+    disagg_backend = getattr(disagg, "disaggregation_transfer_backend", None)
     pool_cls = kvc._tpu_mha_pool_class()
     checks = (
         (not kvc.is_hybrid_swa, "requires a hybrid SWA model."),
@@ -198,12 +213,55 @@ def _unsupported_reason(kvc) -> Optional[str]:
             "does not support decode context parallelism.",
         ),
         (
-            disagg_mode != "null",
-            f"does not support PD disaggregation (disaggregation_mode={disagg_mode!r}).",
+            disagg_mode not in ("null", "prefill", "decode"),
+            f"does not support disaggregation_mode={disagg_mode!r}.",
         ),
         (
-            memory.enable_hierarchical_cache,
-            "does not support --enable-hierarchical-cache.",
+            disagg_mode != "null" and disagg_backend != "raiden",
+            "with PD disaggregation requires --disaggregation-transfer-backend raiden, "
+            f"got {disagg_backend!r}.",
+        ),
+        (
+            getattr(disagg, "enable_pd_role_switch", False),
+            "does not support --enable-pd-role-switch.",
+        ),
+        (
+            getattr(disagg, "disaggregation_decode_enable_offload_kvcache", False),
+            "does not support --disaggregation-decode-enable-offload-kvcache.",
+        ),
+        (
+            getattr(disagg, "disaggregation_decode_retraction_backup", None)
+            == "host_pool",
+            "does not support --disaggregation-decode-retraction-backup host_pool.",
+        ),
+        (
+            getattr(disagg, "disaggregation_decode_host_receive_threshold", 0.0) > 0,
+            "does not support --disaggregation-decode-host-receive-threshold > 0.",
+        ),
+        (
+            disagg_mode != "null" and tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get(),
+            "does not support SGLANG_RAIDEN_PIPELINE_TRANSFER.",
+        ),
+        (
+            memory.enable_hierarchical_cache
+            and not is_tpu_dma_hicache_backend(
+                getattr(memory, "hicache_io_backend", None)
+            ),
+            "with --enable-hierarchical-cache requires a TPU DMA "
+            f"--hicache-io-backend (e.g. 'raiden'), got "
+            f"{getattr(memory, 'hicache_io_backend', None)!r}.",
+        ),
+        (
+            memory.enable_hierarchical_cache
+            and getattr(memory, "hicache_storage_backend", None) is not None,
+            "with --enable-hierarchical-cache does not support L3 storage "
+            f"(--hicache-storage-backend={getattr(memory, 'hicache_storage_backend', None)!r}).",
+        ),
+        (
+            memory.enable_hierarchical_cache
+            and getattr(memory, "hicache_host_memory_mode", "cache") == "buffer_only",
+            "with --enable-hierarchical-cache does not support "
+            "--hicache-host-memory-mode buffer_only.",
         ),
         (
             memory.enable_unified_cache_external_linker,
@@ -225,10 +283,6 @@ def _unsupported_reason(kvc) -> Optional[str]:
             f"requires a TpuFusedMHATokenToKVPool subclass, got {pool_cls}.",
         ),
         (
-            kvc.kv_cache_dtype_str == "mxint8",
-            "does not support mxint8 KV cache.",
-        ),
-        (
             kvc.pool_page_size <= 1,
             f"requires page_size > 1, got {kvc.pool_page_size}.",
         ),
@@ -237,7 +291,9 @@ def _unsupported_reason(kvc) -> Optional[str]:
         if bad:
             return f"--enable-unified-memory on TPU {msg}"
     try:
-        _kvc_unified_layout(kvc)
+        layout = _kvc_unified_layout(kvc)
+        if kvc.kv_cache_dtype_str == "mxint8":
+            _mxint8_unified_bytes_per_token(kvc, layout)
     except (ValueError, NotImplementedError) as exc:
         return str(exc)
     return None
@@ -289,6 +345,7 @@ class TpuUnifiedSWAKVPool(BaseSWAKVPool):
         swa: AttnLayerSpec,
         device: str,
         token_to_kv_pool_class: type = TpuFusedMHATokenToKVPool,
+        pool_kwargs: Optional[dict] = None,
         start_layer: int = 0,
         enable_memory_saver: bool = False,
     ):
@@ -325,6 +382,9 @@ class TpuUnifiedSWAKVPool(BaseSWAKVPool):
             (max(0, self.layout.num_swa_groups - 1), num_blocks), dtype=torch.int32
         )
 
+        extra_kwargs = dict(pool_kwargs) if pool_kwargs else {}
+        if extra_kwargs.get("kv_cache_dtype_str") == "mxint8":
+            extra_kwargs["kv_layout"] = "blocked"
         self.kv_pool: TpuFusedMHATokenToKVPool = token_to_kv_pool_class(
             size=size,
             page_size=page_size,
@@ -335,7 +395,10 @@ class TpuUnifiedSWAKVPool(BaseSWAKVPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
             allocation_label="Unified",
+            **extra_kwargs,
         )
+        if "kv_layout" in extra_kwargs:
+            self.kv_layout = extra_kwargs["kv_layout"]
         self._swa_copy_kwargs = (
             {"allow_raiden_backup": False}
             if "allow_raiden_backup"
@@ -404,8 +467,22 @@ class TpuUnifiedSWAKVPool(BaseSWAKVPool):
     def get_kv_size_bytes(self) -> Tuple[int, int]:
         return self.kv_pool.get_kv_size_bytes()
 
+    def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        return self.kv_pool.get_contiguous_buf_infos()
+
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         return [], [], []
+
+    def expand_swa_pages(self, page_ids: Sequence[int]) -> List[int]:
+        """Expand logical SWA page IDs into ``[token_page, group_slot]`` physical page IDs."""
+        if not page_ids:
+            return []
+        if self.swa_group_pages.shape[0] == 0:
+            return [int(x) for x in page_ids]
+        base = torch.as_tensor(page_ids, dtype=torch.long)
+        companions = self.swa_group_pages[:, base].to(torch.long)
+        expanded = torch.cat([base.unsqueeze(0), companions], dim=0)
+        return expanded.T.reshape(-1).tolist()
 
     def _map_swa_group_indices(
         self, group: int, swa_indices_cpu: torch.Tensor
@@ -937,6 +1014,8 @@ class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
 
     @staticmethod
     def _compute_full_per_token(kvc, layout: UnifiedPageLayout) -> int:
+        if kvc.kv_cache_dtype_str == "mxint8":
+            return _mxint8_unified_bytes_per_token(kvc, layout)
         return kvc._tpu_mha_pool_class().kv_bytes_per_token_per_layer(
             num_kv_heads=layout.page_head_num,
             head_dim=layout.page_head_dim,
@@ -1049,6 +1128,11 @@ def maybe_build_unified_kv_pool(
         ),
         device=kvc.device,
         token_to_kv_pool_class=kvc._tpu_mha_pool_class(),
+        pool_kwargs=(
+            (kvc._mxint8_pool_kwargs() or None)
+            if hasattr(kvc, "_mxint8_pool_kwargs")
+            else None
+        ),
         start_layer=kvc.layer_info.start_layer,
         enable_memory_saver=get_exec().features.enable_memory_saver,
     )
