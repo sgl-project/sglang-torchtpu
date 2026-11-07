@@ -3353,18 +3353,11 @@ class UnifiedRadixCache(BasePrefixCache):
         # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
         # equal iff reclaim victim order matched on every rank.
         digest = self.tree_core.write_back_duplicate_reclaim_digest
-        ready_counts = torch.tensor(
-            [
-                write_acks,
-                load_acks,
-                *storage_queue_sizes,
-                digest,
-                -digest,
-            ],
-            dtype=torch.int64,
-            device="cpu",
-        )
+        local_counts = [write_acks, load_acks, *storage_queue_sizes]
         if self.pp_size > 1:
+            ready_counts = torch.tensor(
+                [*local_counts, digest, -digest], dtype=torch.int64, device="cpu"
+            )
             if self.host_memory_mode == "buffer_only":
                 self._all_reduce_attn_groups(
                     ready_counts, torch.distributed.ReduceOp.MIN
@@ -3372,22 +3365,39 @@ class UnifiedRadixCache(BasePrefixCache):
             else:
                 self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
             return self._ready_counts_result(ready_counts, digest, extra_pool_names)
-        # TP only: the reduce is issued now and consumed next step, so the scheduler
-        # never blocks on rank skew; the counts it acts on are one step old.
-        works = self._all_reduce_attn_groups_async(
-            ready_counts, torch.distributed.ReduceOp.MIN
-        )
-        if not works:
-            # One rank: nothing to wait for, so the counts are current.
+        if self.tp_world_size <= 1:
+            ready_counts = torch.tensor(
+                [*local_counts, digest, -digest], dtype=torch.int64, device="cpu"
+            )
             return self._ready_counts_result(ready_counts, digest, extra_pool_names)
+        # TP only: this step acts on the counts reduced last step, so the scheduler
+        # never blocks on rank skew. Queues only grow until drained, so what is sent
+        # now is what remains after the caller drains last step's result.
         previous = self._pending_ready_counts
-        self._pending_ready_counts = (works, ready_counts, digest, extra_pool_names)
         if previous is None:
-            return 0, 0, tuple(0 for _ in storage_queue_sizes), extra_pool_names
-        works, counts, prev_digest, prev_names = previous
-        for work in works:
-            work.wait()
-        return self._ready_counts_result(counts, prev_digest, prev_names)
+            prev_result = (0, 0, tuple(0 for _ in storage_queue_sizes), extra_pool_names)
+        else:
+            works, counts, prev_digest, prev_names = previous
+            for work in works:
+                work.wait()
+            prev_result = self._ready_counts_result(counts, prev_digest, prev_names)
+        drained = [prev_result[0], prev_result[1], *prev_result[2]]
+        if len(drained) != len(local_counts):
+            drained = [0] * len(local_counts)
+        remaining = [now - done for now, done in zip(local_counts, drained)]
+        assert min(remaining, default=0) >= 0, (local_counts, drained)
+        ready_counts = torch.tensor(
+            [*remaining, digest, -digest], dtype=torch.int64, device="cpu"
+        )
+        self._pending_ready_counts = (
+            self._all_reduce_attn_groups_async(
+                ready_counts, torch.distributed.ReduceOp.MIN
+            ),
+            ready_counts,
+            digest,
+            extra_pool_names,
+        )
+        return prev_result
 
     @staticmethod
     def _ready_counts_result(
