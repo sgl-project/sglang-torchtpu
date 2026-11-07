@@ -10,6 +10,7 @@ XLA copies every operand that a kernel with remote DMA aliases.
 from __future__ import annotations
 
 import contextlib
+import os
 import dataclasses
 import inspect
 
@@ -27,7 +28,8 @@ AXIS = "tp"
 
 
 # Names in-kernel regions for a device trace (libtpu --xla_enable_custom_call_region_trace=true).
-_TRACE = False
+# Dev knob: GLM_FLASH_MK_TRACE=1 at boot; the scopes cost nothing otherwise.
+_TRACE = os.environ.get("GLM_FLASH_MK_TRACE") == "1"
 
 
 def _scope(name):
