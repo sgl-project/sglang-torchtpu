@@ -26,9 +26,10 @@ MAX_TOKEN = 1 << 17
 
 def multiplier_limbs(multipliers: torch.Tensor) -> torch.Tensor:
     """[..., n] int64 multipliers (< 2**63) -> [..., n, NUM_LIMBS] int32, least significant first."""
+    # Host-side table setup: pin every tensor to CPU, the model is built under the TPU device.
     m = multipliers.to(torch.int64).cpu()
     assert (m >= 0).all()
-    shifts = torch.arange(NUM_LIMBS, dtype=torch.int64) * LIMB_BITS
+    shifts = torch.arange(NUM_LIMBS, dtype=torch.int64, device="cpu") * LIMB_BITS
     return ((m.unsqueeze(-1) >> shifts) & _LIMB_MASK).to(torch.int32)
 
 
