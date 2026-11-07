@@ -202,7 +202,7 @@ built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
 - torch.compile with the `tpu` backend and static shapes; compile-cache tags for
   the rank assignment and the kernel inputs; TeaCache dropped and the VAE left
   eager under compile; `--offload-during-compile` off.
-- Regional-compile regions of a model marked SPMD-safe (Wan) keep their
+- Regional-compile regions of a model marked SPMD-safe (Wan, Z-Image) keep their
   collectives in one program (torch_tpu's `spmd_safe`, with its own cache tag);
   `fusion_barrier` is XLA's optimization barrier; every rank drains its device
   queue at the end of each request.

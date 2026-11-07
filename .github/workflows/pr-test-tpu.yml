@@ -86,6 +86,12 @@ jobs:
               - 'python/sglang/multimodal_gen/runtime/platforms/interface.py'
               - 'python/sglang/multimodal_gen/runtime/utils/torch_compile.py'
               - 'python/sglang/multimodal_gen/test/unit/test_spmd_safe_regions.py'
+              # Shared diffusion files behind Ulysses head padding and the Wan SP
+              # tail-pad mask, and the core tests the TPU wrappers import.
+              - 'python/sglang/multimodal_gen/runtime/layers/attention/layer.py'
+              - 'python/sglang/multimodal_gen/runtime/models/dits/zimage.py'
+              - 'python/sglang/multimodal_gen/test/unit/test_usp_*.py'
+              - 'python/sglang/multimodal_gen/test/unit/test_wan_sp_padding.py'
               - 'python/pyproject_tpu.toml'
               - 'benchmark/tpu/**'
               - 'docker/tpu.Dockerfile'
