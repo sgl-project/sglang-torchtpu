@@ -3374,15 +3374,14 @@ class UnifiedRadixCache(BasePrefixCache):
             return self._ready_counts_result(ready_counts, digest, extra_pool_names)
         # TP only: the reduce is issued now and consumed next step, so the scheduler
         # never blocks on rank skew; the counts it acts on are one step old.
-        previous = self._pending_ready_counts
-        self._pending_ready_counts = (
-            self._all_reduce_attn_groups_async(
-                ready_counts, torch.distributed.ReduceOp.MIN
-            ),
-            ready_counts,
-            digest,
-            extra_pool_names,
+        works = self._all_reduce_attn_groups_async(
+            ready_counts, torch.distributed.ReduceOp.MIN
         )
+        if not works:
+            # One rank: nothing to wait for, so the counts are current.
+            return self._ready_counts_result(ready_counts, digest, extra_pool_names)
+        previous = self._pending_ready_counts
+        self._pending_ready_counts = (works, ready_counts, digest, extra_pool_names)
         if previous is None:
             return 0, 0, tuple(0 for _ in storage_queue_sizes), extra_pool_names
         works, counts, prev_digest, prev_names = previous
