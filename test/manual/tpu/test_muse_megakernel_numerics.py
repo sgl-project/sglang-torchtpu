@@ -93,6 +93,24 @@ CASES = {
             expert_group=2,
             opt_in=True,
         ),
+        # 192 and 224 rows: the P/D decode host's row-tiled plans (VMEM-Y, its y_block_send
+        # alternative, streamed-Y); pick one with SGLANG_TPU_MUSE_MK_DEV_* knobs
+        Case(
+            "salfp8_c24q8_s",
+            "sal_fp8",
+            24,
+            8,
+            tuple(900 + 97 * i for i in range(24)),
+            opt_in=True,
+        ),
+        Case(
+            "salfp8_c28q8_s",
+            "sal_fp8",
+            28,
+            8,
+            tuple(900 + 97 * i for i in range(28)),
+            opt_in=True,
+        ),
     )
 }
 DEFAULT_CASES = tuple(c for c in CASES if not CASES[c].opt_in)
