@@ -56,7 +56,7 @@ class TestFusedMoeRsOp(CustomTestCase):
             )
 
         with (
-            patch.object(fused_moe_rs_op, "_FUSED_MOE_RS_OP", None),
+            patch.dict(fused_moe_rs_op._FUSED_MOE_RS_OPS, clear=True),
             patch.object(fused_moe_rs_op, "_get_mesh", return_value=mesh),
             patch.object(torch.library, "custom_op", return_value=Mock()) as register,
             patch.object(pallas, "torch_placeholder", side_effect=placeholder),

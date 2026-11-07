@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import jax
 import jax.numpy as jnp
 from jax import lax
 
 from sglang_tpu.attention.pallas.batched_rpa import configs, utils
+
+LOG2E = 1.0 / math.log(2.0)
 
 
 def flash_attention_qk_softmax(
@@ -34,14 +38,23 @@ def flash_attention_qk_softmax(
     kv_len_left: list[jax.Array] | None = None,  # [B]
     global_q_k_gap: list[jax.Array] | None = None,  # [B]
     kv_new_start_left: list[jax.Array] | None = None,  # [B]
+    apply_mask: bool = True,
+    fold_sm_scale: bool = False,
 ):
     """Flash attention kernel.
 
     ``kv_new_start_left[b]`` (NEW_TOKENS_ONLY) is the block-relative index of
     the sequence's first new key; keys before it are cached, unfetched and
     masked out.
+    ``apply_mask=False`` is for tiles the caller proved fully visible;
+    ``fold_sm_scale`` scales q instead of the scores (exact for a power of two).
     """
     b, k_heads, tq, h_size = q.shape
+    exp2 = cfgs.serve.exp2_softmax
+    # With exp2 the scores carry log2e, so exp2(x) == exp(x / log2e).
+    score_scale = cfgs.model.sm_scale * (LOG2E if exp2 else 1.0)
+    if fold_sm_scale:
+        q = q * jnp.asarray(score_scale, q.dtype)
 
     if cfgs.serve.scale_q is not None:
         q = q / cfgs.serve.scale_q
@@ -70,8 +83,12 @@ def flash_attention_qk_softmax(
         )
     qk = qk.astype(cfgs.serve.dtype_out).reshape(b, k_heads, tq, s)
 
-    qk *= cfgs.model.sm_scale
-    if cfgs.serve.scale_k is not None:
+    if not fold_sm_scale:
+        qk *= score_scale
+    # A unit K scale is the identity; skip the multiply.
+    if cfgs.serve.scale_k is not None and not (
+        isinstance(cfgs.serve.scale_k, (int, float)) and cfgs.serve.scale_k == 1
+    ):
         qk *= cfgs.serve.scale_k
     if cfgs.serve.scale_q is not None:
         qk *= cfgs.serve.scale_q
@@ -90,7 +107,10 @@ def flash_attention_qk_softmax(
             and cfgs.serve.decode_query_size == 1
         )
     )
-    if is_pure_prefix and sliding_window is None and kv_new_start_left is None:
+    if not apply_mask:
+        # The caller proved every key of the tile visible.
+        assert kv_len_left is None
+    elif is_pure_prefix and sliding_window is None and kv_new_start_left is None:
         assert kv_len_left is not None
         # In pure prefix cache attention without sliding window (CACHE_ONLY or
         # single-token STRIPED), all queries attend to all prior cached tokens,
@@ -165,9 +185,10 @@ def flash_attention_qk_softmax(
 
             masks.append(mask_b)
 
-    for b_idx in range(cfgs.block.batch_size):
-        qk_masked.append(jnp.where(masks[b_idx], qk[b_idx], cfgs.model.mask_value))
-    qk = jnp.stack(qk_masked, axis=0)
+    if apply_mask:
+        for b_idx in range(cfgs.block.batch_size):
+            qk_masked.append(jnp.where(masks[b_idx], qk[b_idx], cfgs.model.mask_value))
+        qk = jnp.stack(qk_masked, axis=0)
     return _softmax_stats(
         step,
         qk,
@@ -195,7 +216,14 @@ def _softmax_stats(
     batch lanes in order. ``zero_masked`` zeroes p on the masked keys (a row
     with no key in range then keeps l == 0 instead of weighting masked keys by
     exp(mask_value - mask_value)); the scopes whose rows can be empty set it."""
-    m_curr = jnp.max(qk, axis=-1, keepdims=True)
+    b = qk.shape[0]
+    exp_fn = jnp.exp2 if cfgs.serve.exp2_softmax else jnp.exp
+    if cfgs.serve.no_max:
+        # A zero max: m is -inf at a q block's first k block (alpha clears l and acc)
+        # and 0 after, so p is exp(s) and no row-max barrier sits between QK and exp.
+        m_curr = jnp.zeros(qk.shape[:-1] + (1,), qk.dtype)
+    else:
+        m_curr = jnp.max(qk, axis=-1, keepdims=True)
 
     alpha_list = []
     m_next_list = []
@@ -203,15 +231,22 @@ def _softmax_stats(
     for b_idx in range(cfgs.block.batch_size):
         m_curr_b = m_curr[b_idx]
         m_next_b = jnp.maximum(m_prev, m_curr_b)
-        alpha_b = jnp.exp(m_prev - m_next_b)
+        alpha_b = exp_fn(m_prev - m_next_b)
         alpha_list.append(alpha_b)
         m_next_list.append(m_next_b)
         m_prev = jnp.where(is_last_k[step, b_idx], -jnp.inf, m_next_b)
 
     m_next = jnp.stack(m_next_list, axis=0)
-    p = jnp.exp(qk - utils.broadcast_minor(m_next, qk.shape))
+    # m is an f32 carry; the scores and p stay in the output dtype.
+    if cfgs.serve.no_max:
+        p = exp_fn(qk)
+    else:
+        p = exp_fn(qk - utils.broadcast_minor(m_next, qk.shape).astype(qk.dtype))
     if zero_masked:
         p = jnp.where(jnp.stack(masks, axis=0), p, 0)
+    if cfgs.serve.ones_v:
+        # The PV matmul produces the row sums (ones rows in V); l is unused.
+        return p, alpha_list, m_prev, jnp.stack([l_prev] * b, axis=0), m_next
     p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out)
 
     l_next_list = []

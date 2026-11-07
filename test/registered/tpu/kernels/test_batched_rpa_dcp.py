@@ -112,7 +112,8 @@ def _small_prefill_blocks():
     """Several q blocks per chunk, two compute tiles per q block, two lanes."""
     from sglang_tpu.attention.pallas.batched_rpa.configs import BlockSizes
 
-    return BlockSizes(bq_sz=128, bq_c_sz=64, bkv_sz=PAGE_SIZE, batch_size=2, n_buffer=3)
+    # 128-token q blocks over two lanes take 70 MiB of VMEM at DCP8.
+    return BlockSizes(bq_sz=64, bq_c_sz=32, bkv_sz=PAGE_SIZE, batch_size=2, n_buffer=3)
 
 
 def _round_to_bf16(array: np.ndarray) -> np.ndarray:
