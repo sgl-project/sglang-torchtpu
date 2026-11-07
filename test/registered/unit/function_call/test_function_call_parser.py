@@ -2854,6 +2854,57 @@ class TestGptOssDetector(unittest.TestCase):
         )
         self.assertFalse(self.detector.has_tool_call("no tool call here"))
 
+    # What the harmony structural tag forces after the reasoning block: the
+    # <|start|>assistant header is the generation prompt, not output.
+    FORCED_CALL = (
+        "<|channel|>commentary to=functions.get_weather<|constrain|>json"
+        '<|message|>{"city": "Paris"}<|call|>'
+    )
+
+    def test_forced_call_without_start_header_parses(self):
+        self.assertTrue(self.detector.has_tool_call(self.FORCED_CALL))
+        result = self.detector.detect_and_parse(self.FORCED_CALL, self.tools)
+        self.assertEqual(
+            [(c.name, c.parameters) for c in result.calls],
+            [("get_weather", '{"city": "Paris"}')],
+        )
+        self.assertEqual(result.normal_text, "")
+
+    def test_structural_tag_only_allows_parseable_headers(self):
+        import xgrammar as xgr
+        from xgrammar.testing import _is_grammar_accept_string
+
+        canonical = self.FORCED_CALL
+        recipient_first = (
+            " to=functions.get_weather<|channel|>commentary <|constrain|>json"
+            '<|message|>{"city": "Paris"}<|call|>'
+        )
+        named = ToolChoice(function=ToolChoiceFuncName(name="get_weather"))
+        for tool_choice in ("required", named):
+            for thinking_mode in (False, True):
+                with self.subTest(tool_choice=tool_choice, thinking=thinking_mode):
+                    grammar = xgr.Grammar.from_structural_tag(
+                        self.detector.get_structural_tag(
+                            self.tools,
+                            thinking_mode=thinking_mode,
+                            tool_choice=tool_choice,
+                        )
+                    )
+                    self.assertTrue(_is_grammar_accept_string(grammar, canonical))
+                    if not thinking_mode:
+                        # A forced choice must not end the turn without a call.
+                        self.assertFalse(_is_grammar_accept_string(grammar, ""))
+                    # Recipient-first headers parse to no call at all.
+                    self.assertFalse(
+                        _is_grammar_accept_string(grammar, recipient_first)
+                    )
+                    self.assertEqual(
+                        self.detector.detect_and_parse(
+                            recipient_first, self.tools
+                        ).calls,
+                        [],
+                    )
+
     def test_get_model_structural_tag(self):
         import xgrammar as xgr
 

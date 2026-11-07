@@ -1,9 +1,9 @@
 import json
 import logging
 import re
-from typing import List, Optional
+from typing import List, Literal, Optional, Union
 
-from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
@@ -38,7 +38,9 @@ class GptOssDetector(BaseFormatDetector):
 
     def has_tool_call(self, text: str) -> bool:
         """Check if text contains TypeScript-style function call markers."""
-        return self.bot_token in text
+        # A call forced by the harmony structural tag starts at <|channel|>: the
+        # <|start|>assistant before it is the generation prompt, not output.
+        return self.bot_token in text or "<|channel|>commentary to=" in text
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """Parse TypeScript-style function calls from complete text."""
@@ -242,3 +244,37 @@ class GptOssDetector(BaseFormatDetector):
 
     def get_structural_tag_name(self) -> str:
         return "harmony"
+
+    def get_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+        thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
+    ):
+        tag = super().get_structural_tag(
+            tools=tools,
+            tool_choice=tool_choice,
+            thinking_mode=thinking_mode,
+            parallel_tool_calls=parallel_tool_calls,
+        )
+        if tag is None:
+            return None
+        spec = tag.model_dump(by_alias=True)
+        fmt = spec.get("format", {})
+        tags = fmt.get("tags")
+        if fmt.get("type") != "tags_with_separator" or not tags:
+            return tag
+        # XGrammar's harmony tag also admits recipient-first headers
+        # (" to=functions.f<|channel|>commentary ..."). HarmonyParser cannot
+        # attribute those to a function, in either the streaming or the
+        # one-shot path, so constrain to the canonical
+        # "<|channel|>commentary to=functions.f" form it parses.
+        kept = [t for t in tags if not t.get("begin", "").lstrip().startswith("to=")]
+        if kept:
+            fmt["tags"] = kept
+        # The tag sets at_least_one=False even for a forced choice, which lets
+        # the model end its turn without a call.
+        if tool_choice == "required" or isinstance(tool_choice, ToolChoice):
+            fmt["at_least_one"] = True
+        return type(tag).model_validate(spec)
