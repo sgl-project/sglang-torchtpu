@@ -511,6 +511,12 @@ class TpuEnvs:
     # assigns each shared graph to the least-loaded rank (shared_compile_cost.py).
     # Empty: round-robin owners.
     SGLANG_TPU_SHARED_COMPILE_COST_PROFILE = EnvStr("")
+    # Use the decode's DRAM as the KV offload tier below the prefill's own RAM,
+    # one switch on both roles: the prefill pushes cold cached branches into
+    # the decode's host pool and recalls them when they return. Settings the
+    # offload does not support are refused at startup
+    # (disaggregation/decode_dram_offload/validate.py).
+    SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:

@@ -75,6 +75,10 @@ class TpuDMAHybridCacheController(HybridCacheController):
 
     # Set by the scheduler for the tree's controller; see fence_hicache_backups.
     kv_free_fence: Optional[KVFreeFence] = None
+    # This engine's end of the prefill DRAM offload's extension to decode
+    # DRAM, set once the P/D manager exists; None without it. See
+    # disaggregation/decode_dram_offload/dram_offload_extension.py.
+    decode_dram_extension: Optional[Any] = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
