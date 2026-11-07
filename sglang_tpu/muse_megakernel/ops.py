@@ -128,13 +128,11 @@ class MuseMegakernel(torch.nn.Module):
         self.max_rows = max_rows
         self.max_position = max_position
         self.chunk_pages = _CHUNK_PAGES
-        # the pools' layout: SGLANG_TPU_KV_PACK_HEADS stores the rank's heads in one row
-        self.kv_packed = (
-            kv_pack_heads(
-                geo.kv_heads, geo.head_dim, TpuFusedMHATokenToKVPool.HEAD_DIM_ALIGNMENT
-            )
-            > 1
+        # the pools' layout: MuseMegakernel only packs when all local heads fit one row
+        pack = kv_pack_heads(
+            geo.kv_heads, geo.head_dim, TpuFusedMHATokenToKVPool.HEAD_DIM_ALIGNMENT
         )
+        self.kv_packed = pack > 1 and pack == geo.kv_heads
         # Buffers so --tpu-compile-tracer direct lifts them as graph inputs; the expert
         # entries alias FusedMoE parameters.
         for name in K.WEIGHT_NAMES:

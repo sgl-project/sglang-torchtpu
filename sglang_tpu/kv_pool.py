@@ -90,15 +90,15 @@ def _seq_along_lane_head_dim(*, head_dim: int, kv_packing: int) -> int:
 def kv_pack_heads(num_kv_heads: int, head_dim: int, align: int) -> int:
     """Heads stored side by side in one ``align``-lane row (SGLANG_TPU_KV_PACK_HEADS), or 1.
 
-    Only exact fits pack (e.g. two 64-wide heads in 128 lanes): the row then holds no
-    padding, half the bytes of one zero-padded row per head.
+    Only exact lane fits pack (e.g. pairs of 64-wide heads in 128-lane rows): each
+    packed row holds no lane padding, halving the bytes of one zero-padded row per
+    head whenever ``num_kv_heads`` is a multiple of ``align // head_dim``.
     """
-    if (
-        tpu_envs.SGLANG_TPU_KV_PACK_HEADS.get()
-        and num_kv_heads > 1
-        and num_kv_heads * head_dim == align
-    ):
-        return num_kv_heads
+    if not tpu_envs.SGLANG_TPU_KV_PACK_HEADS.get() or head_dim <= 0 or align <= 0:
+        return 1
+    pack = align // head_dim
+    if align % head_dim == 0 and pack > 1 and num_kv_heads % pack == 0:
+        return pack
     return 1
 
 
@@ -159,11 +159,13 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         """Bytes one token occupies in one layer's buffer; must track
         ``_create_buffers``, since the KV budget is spent before the pool exists."""
         del v_head_dim  # V shares K's padded slot; see __init__'s width check.
-        if (
-            cls.PACKS_HEADS
-            and kv_pack_heads(num_kv_heads, head_dim, cls.HEAD_DIM_ALIGNMENT) > 1
-        ):
-            num_kv_heads, head_dim = 1, num_kv_heads * head_dim
+        pack = (
+            kv_pack_heads(num_kv_heads, head_dim, cls.HEAD_DIM_ALIGNMENT)
+            if cls.PACKS_HEADS
+            else 1
+        )
+        if pack > 1:
+            num_kv_heads, head_dim = num_kv_heads // pack, pack * head_dim
         packing = _torch_dtype_packing(store_dtype)
         num_kv_heads_x2 = _cdiv(num_kv_heads * 2, packing) * packing
         padded_head_dim = (
@@ -251,7 +253,10 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         if self.kv_pack_heads > 1:
             if self.v_head_dim != self.head_dim:
                 raise NotImplementedError("packed KV heads need v_head_dim == head_dim")
-            self.head_num, self.head_dim = 1, self.head_num * self.head_dim
+            self.head_num, self.head_dim = (
+                self.head_num // self.kv_pack_heads,
+                self.kv_pack_heads * self.head_dim,
+            )
             self.v_head_dim = self.head_dim
         if self.v_head_dim > self.head_dim:
             raise NotImplementedError(
