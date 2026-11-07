@@ -27,14 +27,17 @@ from contextlib import contextmanager, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Generator,
     Iterable,
     List,
     Optional,
+    Protocol,
     Tuple,
     Union,
     cast,
+    runtime_checkable,
 )
 
 import huggingface_hub
@@ -405,6 +408,14 @@ def _validate_default_loader_extra_config(
         )
 
 
+@runtime_checkable
+class LoadableWeightPrefixes(Protocol):
+    """A model that consumes only checkpoint names under these prefixes, so the
+    loader can skip reading the others (a one-layer NextN draft of a 300 GB MoE)."""
+
+    def loadable_weight_prefixes(self) -> Tuple[str, ...]: ...
+
+
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
 
@@ -442,8 +453,16 @@ class DefaultModelLoader(BaseModelLoader):
         """Routed-expert ids this EP rank stores, when the model opts into
         EP-local reads (see ``tpu_local_routed_expert_range``)."""
 
+        weight_name_filter: Optional[Callable[[str], bool]] = None
+        """Checkpoint names the model will consume; the rest are never read
+        (see ``LoadableWeightPrefixes``)."""
+
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
+            weight_name_filter = None
+            if isinstance(model, LoadableWeightPrefixes):
+                prefixes = tuple(model.loadable_weight_prefixes())
+                weight_name_filter = lambda name: name.startswith(prefixes)
             local_expert_range = None
             if _is_tpu:
                 from sglang_tpu.ep_local_expert_reader import (
@@ -461,6 +480,7 @@ class DefaultModelLoader(BaseModelLoader):
                 ),
                 model_config=model_config,
                 local_expert_range=local_expert_range,
+                weight_name_filter=weight_name_filter,
             )
 
     @dataclasses.dataclass(frozen=True)
@@ -730,6 +750,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
                     local_expert_range=source.local_expert_range,
+                    name_filter=source.weight_name_filter,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -739,6 +760,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
                     local_expert_range=source.local_expert_range,
+                    name_filter=source.weight_name_filter,
                 )
 
         else:

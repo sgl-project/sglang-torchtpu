@@ -1157,12 +1157,15 @@ def safetensors_weights_iterator(
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
     local_expert_range: Optional[Tuple[int, int]] = None,
+    name_filter: Optional[Callable[[str], bool]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
     With ``disable_mmap`` and ``local_expert_range`` (see
     ``hardware_backend/tpu/ep_local_expert_reader``), indexed shards are read
-    without the routed experts outside that range.
+    without the routed experts outside that range. ``name_filter`` skips the
+    tensors it rejects before they are read: a one-layer draft out of a 300 GB
+    checkpoint otherwise materializes every shard.
     """
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
@@ -1187,16 +1190,19 @@ def safetensors_weights_iterator(
         if ep_reader is not None and ep_reader.handles(st_file):
             result = ep_reader.read(st_file)
             for name in sorted(result.keys()):
-                yield name, result[name]
+                if name_filter is None or name_filter(name):
+                    yield name, result[name]
         elif disable_mmap:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
                 for name in sorted(result.keys()):
-                    yield name, result[name]
+                    if name_filter is None or name_filter(name):
+                        yield name, result[name]
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
-                    yield name, f.get_tensor(name)
+                    if name_filter is None or name_filter(name):
+                        yield name, f.get_tensor(name)
         if drop_cache_after_load:
             _drop_file_cache_after_load(st_file)
     if prefetch_handle is not None:
@@ -1270,6 +1276,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
     local_expert_range: Optional[Tuple[int, int]] = None,
+    name_filter: Optional[Callable[[str], bool]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
@@ -1290,16 +1297,19 @@ def buffered_multi_thread_safetensors_weights_iterator(
         hf_weights_files, disable_mmap, local_expert_range
     )
 
+    def _keep(name: str) -> bool:
+        return name_filter is None or name_filter(name)
+
     def _load_file(st_file: str):
         if ep_reader is not None and ep_reader.handles(st_file):
-            return ep_reader.read(st_file)
-        if disable_mmap:
+            result = ep_reader.read(st_file)
+        elif disable_mmap:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
-        return result
+                return {k: f.get_tensor(k) for k in f.keys() if _keep(k)}
+        return {k: v for k, v in result.items() if _keep(k)}
 
     # Sliding window: max_workers loading + 1 prefetched.
     buffer_size = max_workers + 1
