@@ -335,6 +335,84 @@ def test_early_part_then_closing_transfer(world):
     assert f"{ROOM}.p0" in world.controller.completed
 
 
+def part_transfers(world, index=0):
+    """Transfers of early part ``index`` the decode has coordinated so far (it
+    starts announced parts from maybe_start_pull)."""
+    world.pump()
+    world.decode.maybe_start_pull(ROOM)
+    return [t for t in world.controller.transfers if t["req_id"] == f"{ROOM}.p{index}"]
+
+
+def test_early_part_waits_for_the_forward_that_wrote_it(world):
+    """A part offered while its forward may still be running is announced only
+    once that stage's launch fence completes, on every stage."""
+    world.decode.register_decode(ROOM, list(range(100, 112)), [200], None, world.infos)
+    world.pump()
+    fences = [Fence() for _ in world.stages]
+    for s, fence in zip(world.stages, fences):
+        s.last_fence = fence
+        start = prefill_pages(s, list(range(10, 18)))
+        s.offer_part(ROOM, start, list(range(10, 18)))
+    world.pump()
+    assert part_transfers(world) == []
+    assert f"{ROOM}.p0" not in world.controller.registered
+    fences[0].ready = True
+    world.stages[0].advance_parts()
+    world.pump()
+    assert part_transfers(world) == []  # stage 1's forward has not completed
+    fences[1].ready = True
+    world.stages[1].advance_parts()
+    world.pump()
+    assert len(part_transfers(world)) == 1
+
+
+def test_finalize_announces_fenced_parts_before_the_closing_transfer(world):
+    world.decode.register_decode(
+        ROOM, list(range(100, 112)), [200, 201], None, world.infos
+    )
+    world.pump()
+    for s in world.stages:
+        s.last_fence = Fence()
+        start = prefill_pages(s, list(range(10, 18)))
+        s.offer_part(ROOM, start, list(range(10, 18)))
+    world.pump()
+    assert part_transfers(world) == []
+    # At the result point every forward of the request has completed.
+    for s in world.stages:
+        s.last_fence.ready = True
+        prefill_pages(s, [18, 19, 20], swa=[30, 31])
+        assert s.finalize_send(ROOM, None)
+    world.pump()
+    assert len(part_transfers(world)) == 1
+    assert world.decode.maybe_start_pull(ROOM) is True
+
+
+def test_launch_records_the_fence_early_parts_wait_for(world):
+    stage = world.stages[0]
+    stage.fence_executor = SyncExecutor()
+    result = SimpleNamespace(
+        next_token_ids=torch.zeros(1, dtype=torch.int64),
+        pp_hidden_states_proxy_tensors=SimpleNamespace(tensors={"h": Tensor(2, 4)}),
+    )
+    assert stage.last_fence is None
+    stage.final_chunks.launched(None, 0, SimpleNamespace(reqs=[]), result)
+    assert stage.last_fence is not None and stage.last_fence.done()
+    stage.early_parts = False
+    stage.last_fence = None
+    stage.final_chunks.launched(None, 0, SimpleNamespace(reqs=[]), result)
+    assert stage.last_fence is None
+
+
+def test_early_parts_alone_start_the_fence_worker(world, monkeypatch):
+    monkeypatch.setenv("SGLANG_RAIDEN_PIPELINE_EARLY_PARTS", "1")
+    monkeypatch.delenv("SGLANG_RAIDEN_PIPELINE_STAGE_PARTS", raising=False)
+    producer, consumer = world.stages[0], world.decode
+    producer._init_overlap_state()
+    consumer._init_overlap_state()
+    assert producer.fence_executor is not None
+    assert consumer.fence_executor is None
+
+
 def test_room_waits_for_its_early_parts(world):
     world.decode.register_decode(ROOM, list(range(100, 112)), [200], None, world.infos)
     world.pump()
