@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import patch
 
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu import env_override
 from sglang_tpu.env_override import (
     _DECODE_CP_SPARSE_CORE_OVERRIDES,
     _VMEM_PREFETCH_MIN_LAYERS,
@@ -24,6 +25,88 @@ from sglang_tpu.env_override import (
     apply_small_kv_pool_vmem_prefetch_override,
     apply_tpu_env_overrides,
 )
+
+_MINIMAL = "/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4"
+_FULL = "/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4"
+
+
+class TestTcmallocPreload(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        env_patch = patch.dict(os.environ)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+        os.environ.pop("LD_PRELOAD", None)
+        os.environ.pop(env_override._TCMALLOC_MISSING_WARNED, None)
+
+    def _apply(self, preload, installed=frozenset(), found=None, enabled="1"):
+        os.environ["SGLANG_TPU_PRELOAD_TCMALLOC"] = enabled
+        if preload is not None:
+            os.environ["LD_PRELOAD"] = preload
+        with (
+            patch.object(
+                env_override.os.path, "exists", side_effect=installed.__contains__
+            ),
+            patch.object(
+                env_override.ctypes.util,
+                "find_library",
+                autospec=True,
+                side_effect=lambda name: (found or {}).get(name),
+            ),
+        ):
+            apply_tpu_env_overrides()
+        return os.environ.get("LD_PRELOAD")
+
+    def test_installed_tcmalloc_is_preloaded_for_spawned_ranks(self):
+        self.assertEqual(self._apply(None, installed={_MINIMAL}), _MINIMAL)
+
+    def test_full_tcmalloc_is_used_when_minimal_is_missing(self):
+        self.assertEqual(self._apply(None, installed={_FULL}), _FULL)
+
+    def test_existing_preload_is_kept_after_tcmalloc(self):
+        self.assertEqual(
+            self._apply("/opt/stub.so", installed={_MINIMAL}),
+            f"{_MINIMAL}:/opt/stub.so",
+        )
+
+    def test_user_tcmalloc_preload_is_left_unchanged(self):
+        user = "/custom/libtcmalloc.so"
+        self.assertEqual(self._apply(user, installed={_MINIMAL}), user)
+
+    def test_other_allocator_preload_is_left_unchanged(self):
+        # The first preloaded allocator wins malloc/free, so tcmalloc must not
+        # be put in front of one the operator chose.
+        for user in (
+            "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2",
+            "/opt/lib/libmimalloc.so",
+            "libtbbmalloc_proxy.so.2",
+            "/opt/stub.so:/usr/lib/libjemalloc.so.2",
+        ):
+            with self.subTest(preload=user):
+                self.assertEqual(self._apply(user, installed={_MINIMAL}), user)
+
+    def test_loader_search_finds_tcmalloc_outside_debian_paths(self):
+        found = {"tcmalloc_minimal": "libtcmalloc_minimal.so.4"}
+        self.assertEqual(self._apply(None, found=found), "libtcmalloc_minimal.so.4")
+
+    def test_debian_path_wins_over_loader_search(self):
+        found = {"tcmalloc_minimal": "libtcmalloc_minimal.so.4"}
+        self.assertEqual(self._apply(None, installed={_FULL}, found=found), _FULL)
+
+    def test_missing_library_leaves_preload_unset_and_warns(self):
+        with self.assertLogs(env_override.logger, level="WARNING") as logs:
+            self.assertIsNone(self._apply(None))
+        self.assertIn("libtcmalloc-minimal4", logs.output[0])
+
+    def test_missing_library_warning_is_not_repeated_in_spawned_ranks(self):
+        with self.assertLogs(env_override.logger, level="WARNING"):
+            self._apply(None)
+        # A spawned rank inherits the environment and runs the overrides again.
+        with self.assertNoLogs(env_override.logger, level="WARNING"):
+            self.assertIsNone(self._apply(None))
+
+    def test_opt_out_leaves_preload_unset(self):
+        self.assertIsNone(self._apply(None, installed={_MINIMAL}, enabled="0"))
 
 
 class TestLibtpuInitArgsOverrides(CustomTestCase):

@@ -7,13 +7,16 @@ imported. libtpu reads ``LIBTPU_INIT_ARGS`` at load time.
 
 from __future__ import annotations
 
+import ctypes.util
 import os
 
 from sglang_tpu._logging import get_logger
+from sglang_tpu.envs import envs as tpu_envs
 
 logger = get_logger(__name__)
 
 _LIBTPU_INIT_ARGS = "LIBTPU_INIT_ARGS"
+_LD_PRELOAD = "LD_PRELOAD"
 
 # Mirror legacy compilation-cache env vars to their renamed counterparts.
 # TODO(wyzhang): Remove after the TorchTPU upgrade completes.
@@ -81,6 +84,31 @@ _DECODE_CP_SPARSE_CORE_OVERRIDES = (
     "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false",
 )
 
+# glibc ptmalloc gives each allocating thread its own arena. XLA compiles on a
+# thread pool, so a cold start spreads its temporary buffers over many arenas,
+# and malloc_trim after warmup cannot return the fragmented pages: each TP rank
+# kept about 1.25 GiB more RSS after a cold start than after a warm one
+# (#1817). TorchTPU also warns that ptmalloc contention slows its host work
+# (torch_tpu/_tcmalloc_check.py). Preloading tcmalloc into the scheduler ranks
+# removes the gap without slowing compilation, unlike capping MALLOC_ARENA_MAX.
+# The ranks are spawned after this override and read LD_PRELOAD when they
+# exec; the launcher process itself keeps its allocator.
+_TCMALLOC_LIBRARIES = (
+    "/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4",
+    "/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4",
+    "/usr/lib/aarch64-linux-gnu/libtcmalloc_minimal.so.4",
+    "/usr/lib/aarch64-linux-gnu/libtcmalloc.so.4",
+)
+# Loader-search fallback for installs outside the Debian multiarch dirs
+# (RHEL /usr/lib64, conda, pip-installed gperftools).
+_TCMALLOC_LIBRARY_NAMES = ("tcmalloc_minimal", "tcmalloc")
+# An LD_PRELOAD entry naming one of these already replaces malloc. The first
+# preloaded allocator wins malloc/free, so tcmalloc must not go in front.
+_MALLOC_REPLACEMENTS = ("tcmalloc", "jemalloc", "mimalloc", "tbbmalloc")
+# Set after the missing-library warning so spawned ranks, which inherit the
+# environment and run these overrides again, do not repeat it.
+_TCMALLOC_MISSING_WARNED = "_SGLANG_TPU_TCMALLOC_MISSING_WARNED"
+
 # Smallest KV pool (in tokens) observed safe with the default prefetch depth
 # on the largest supported dense stack (36-layer gpt-oss at TP=8): 4096 pages
 # of 64 tokens. Pools at or above this never deadlocked; below it the first
@@ -121,9 +149,60 @@ def _set_renamed_compilation_cache_envs() -> list[str]:
     return added
 
 
+def _find_tcmalloc() -> str | None:
+    """Return a loadable tcmalloc for LD_PRELOAD, or None if none is installed."""
+    library = next((path for path in _TCMALLOC_LIBRARIES if os.path.exists(path)), None)
+    if library is not None:
+        return library
+    for name in _TCMALLOC_LIBRARY_NAMES:
+        library = ctypes.util.find_library(name)
+        if library is not None:
+            return library
+    return None
+
+
+def _preloads_malloc_replacement(preload: str) -> bool:
+    entries = preload.replace(" ", ":").split(":")
+    return any(
+        allocator in os.path.basename(entry)
+        for entry in entries
+        for allocator in _MALLOC_REPLACEMENTS
+    )
+
+
+def _preload_tcmalloc_for_spawned_ranks() -> str | None:
+    """Add tcmalloc to LD_PRELOAD for processes spawned after this call.
+
+    Returns the library added, or None when it is disabled, another malloc
+    replacement is already preloaded, or tcmalloc is not installed. Other
+    LD_PRELOAD entries are kept after tcmalloc.
+    """
+    if not tpu_envs.SGLANG_TPU_PRELOAD_TCMALLOC.get():
+        return None
+    preload = os.environ.get(_LD_PRELOAD, "")
+    if _preloads_malloc_replacement(preload):
+        return None
+    library = _find_tcmalloc()
+    if library is None:
+        if _TCMALLOC_MISSING_WARNED not in os.environ:
+            os.environ[_TCMALLOC_MISSING_WARNED] = "1"
+            logger.warning(
+                "TPU env_override: libtcmalloc is not installed, so scheduler "
+                "ranks use glibc malloc and keep about 1.25 GiB more RSS each "
+                "after a cold start (#1817). Install libtcmalloc-minimal4 to "
+                "fix it."
+            )
+        return None
+    os.environ[_LD_PRELOAD] = f"{library}:{preload}" if preload else library
+    return library
+
+
 def apply_tpu_env_overrides() -> None:
     """Apply TPU env overrides."""
     os.environ.setdefault("TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS", "1")
+    preloaded = _preload_tcmalloc_for_spawned_ranks()
+    if preloaded:
+        logger.info("TPU env_override preloads %s for spawned ranks", preloaded)
     added = _set_renamed_compilation_cache_envs()
     if added:
         logger.info(
