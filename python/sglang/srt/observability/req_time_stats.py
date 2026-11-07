@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from typing_extensions import Self
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import (
@@ -290,6 +291,9 @@ class ReqTimeStatsBase:
         bootstrap_room: Optional[int],
         external_trace_header: Optional[Dict[str, str]] = None,
     ):
+        if isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX):
+            self.trace_ctx = TraceNullContext()
+            return
         if is_async_tracing_available():
             self.trace_ctx = TraceReqContextAsync(
                 rid=rid,
@@ -415,7 +419,12 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
                 convert_time_to_realtime_ns(ts),
             )
 
-    def set_finished_time(self, ts=None, span_attrs=None):
+    def set_finished_time(
+        self,
+        ts=None,
+        span_attrs=None,
+        scheduler_time_stats: Optional[SchedulerReqTimeStats] = None,
+    ):
         ts = ts or time.perf_counter()
         self.finished_time = ts
 
@@ -423,7 +432,7 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
             # The latency attrs are derived from finished_time and the root span is
             # closed below, so they must be merged in here rather than by the caller.
             attrs = dict(span_attrs) if span_attrs else {}
-            attrs.update(self.convert_to_gen_ai_span_attrs())
+            attrs.update(self.convert_to_gen_ai_span_attrs(scheduler_time_stats))
             self.trace_ctx.trace_req_finish(
                 convert_time_to_realtime_ns(ts), attrs=attrs
             )
@@ -531,7 +540,9 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
             meta_info["decode_throughput"] = decode_throughput
         return meta_info
 
-    def convert_to_gen_ai_span_attrs(self):
+    def convert_to_gen_ai_span_attrs(
+        self, scheduler_time_stats: Optional[SchedulerReqTimeStats] = None
+    ):
         span_attrs = {}
         if self.first_token_time and self.created_time:
             span_attrs[SpanAttributes.GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN] = (
@@ -557,6 +568,65 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
             span_attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_PREFILL] = (
                 self.first_token_time - self.api_server_dispatch_finish_time
             )
+
+        scheduler_trace_ctx = getattr(scheduler_time_stats, "trace_ctx", None)
+        if scheduler_time_stats is not None and (
+            getattr(scheduler_time_stats, "has_timing_data", False)
+            or getattr(scheduler_time_stats, "enable_metrics", False)
+            or (scheduler_trace_ctx is not None and scheduler_trace_ctx.tracing_enable)
+        ):
+            queue_time = max(0.0, scheduler_time_stats.get_queueing_time())
+            span_attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_QUEUE] = queue_time
+
+            prefill_compute: Optional[float] = None
+            if self.disagg_mode == DisaggregationMode.DECODE and (
+                self.first_token_time > 0.0
+                or scheduler_time_stats.forward_entry_time > 0.0
+            ):
+                prefill_compute = 0.0
+            elif (
+                scheduler_time_stats.forward_entry_time > 0.0
+                and scheduler_time_stats.prefill_finished_time
+                >= scheduler_time_stats.forward_entry_time
+            ):
+                prefill_compute = (
+                    scheduler_time_stats.prefill_finished_time
+                    - scheduler_time_stats.forward_entry_time
+                )
+            elif self.api_server_dispatch_finish_time and self.first_token_time:
+                prefill_compute = max(
+                    0.0,
+                    self.first_token_time
+                    - self.api_server_dispatch_finish_time
+                    - queue_time,
+                )
+
+            if prefill_compute is not None:
+                span_attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_PREFILL] = (
+                    prefill_compute
+                )
+
+            if self.finished_time and prefill_compute is not None:
+                if self.disagg_mode == DisaggregationMode.PREFILL:
+                    decode_compute = 0.0
+                    span_attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_DECODE] = 0.0
+                elif self.first_token_time:
+                    decode_compute = max(
+                        0.0, self.finished_time - self.first_token_time
+                    )
+                    span_attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_DECODE] = (
+                        decode_compute
+                    )
+                else:
+                    decode_compute = 0.0
+
+                span_attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE] = (
+                    prefill_compute + decode_compute
+                )
+            else:
+                span_attrs.pop(
+                    SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE, None
+                )
 
         return span_attrs
 
@@ -668,7 +738,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def __getstate__(self) -> object:
         # send to detokenizer/tokenizer
-        if not (self.enable_metrics or self.has_timing_data):
+        trace_ctx = getattr(self, "trace_ctx", None)
+        if not (
+            self.enable_metrics
+            or (trace_ctx is not None and trace_ctx.tracing_enable)
+            or self.has_timing_data
+        ):
             return {}
 
         state = {
@@ -676,6 +751,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
             "prefill_finished_time": self.prefill_finished_time,
+            "decode_prebuilt_finish_time": self.decode_prebuilt_finish_time,
             # Read by meta_info["queue_time"] on the tokenizer; timestamps cannot rebuild it.
             "queue_duration_s": self.queue_duration_s,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
