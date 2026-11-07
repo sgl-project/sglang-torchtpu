@@ -220,6 +220,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
         queue.scheduler_stage_metrics = None
         queue.pp_size = 1
+        queue.decode_prefix_puller = None
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.cache_controller = SimpleNamespace(write_policy=write_policy)
         queue.scheduler = SimpleNamespace(
