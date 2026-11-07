@@ -20,7 +20,9 @@ Vision, the DSpark draft head (mtp.*) and the VL routing bias are not built.
 
 from __future__ import annotations
 
+import json
 import math
+import os
 import re
 from functools import lru_cache
 from typing import Iterable, NamedTuple, Optional, Tuple
@@ -29,6 +31,7 @@ import msgspec
 import numpy as np
 import torch
 import torch.nn.functional as F
+from safetensors import safe_open
 from torch import nn
 
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
@@ -984,40 +987,41 @@ class DeepseekV41NativeForCausalLM(nn.Module):
     # ---- weight loading (convert.py rules, applied per rank) ----
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
+        # The loader's iterator reads every tensor of every shard on every rank (8 x 510 GB over
+        # gcsfuse); read the shards directly and fetch only what this rank keeps.
+        del weights
+        folder = process_model_config().model_path
+        with open(os.path.join(folder, "model.safetensors.index.json")) as f:
+            weight_map = json.load(f)["weight_map"]
+        by_file: dict[str, list[str]] = {}
+        for name, file in weight_map.items():
+            if self._is_local(name):
+                by_file.setdefault(file, []).append(name)
         params = dict(self.named_parameters())
         loaded: set[str] = set()
         pending_wo_a: dict[str, dict[str, torch.Tensor]] = {}
         expert_stacks: dict[str, tuple[torch.Tensor, list[int]]] = {}
-        for name, tensor in weights:
-            if name.startswith(_SKIP_PREFIXES) or name.endswith(".bias_vl"):
-                continue
-            match = _EXPERT_RE.match(name)
-            if match is not None:
-                self._load_expert(
-                    match=match,
-                    tensor=tensor,
-                    params=params,
-                    stacks=expert_stacks,
-                    loaded=loaded,
-                )
-            elif ".attn.wo_a." in name:
-                self._load_wo_a(
-                    name=name,
-                    tensor=tensor,
-                    params=params,
-                    pending=pending_wo_a,
-                    loaded=loaded,
-                )
-            elif ".engram.embed." in name:
-                # convert.py pads scales with 1.0, which is E8M0 byte 127
-                pad_value = 127 if name.endswith(".scale") else 0
-                self._load_engram_rows(
-                    param=params[name], tensor=tensor, pad_value=pad_value
-                )
-                loaded.add(name)
-            else:
-                _copy_into(params[name], self._tp_shard(name, tensor))
-                loaded.add(name)
+        for i, file in enumerate(sorted(by_file)):
+            with safe_open(
+                os.path.join(folder, file), framework="pt", device="cpu"
+            ) as f:
+                for name in by_file[file]:
+                    self._load_one(
+                        name=name,
+                        reader=f,
+                        params=params,
+                        pending_wo_a=pending_wo_a,
+                        expert_stacks=expert_stacks,
+                        loaded=loaded,
+                    )
+            # Drain queued uploads so the host staging of one shard is freed before the next.
+            torch.accelerator.synchronize()
+            logger.info(
+                "DeepSeek-V4.1 native: loaded shard %d/%d (%s)",
+                i + 1,
+                len(by_file),
+                file,
+            )
         assert not pending_wo_a and not expert_stacks, (
             list(pending_wo_a),
             list(expert_stacks),
@@ -1027,6 +1031,49 @@ class DeepseekV41NativeForCausalLM(nn.Module):
             raise RuntimeError(
                 f"DeepSeek-V4.1 checkpoint is missing {len(missing)} tensors, e.g. {missing[:5]}"
             )
+
+    def _is_local(self, name: str) -> bool:
+        """Whether this rank keeps (part of) checkpoint tensor `name`."""
+        if name.startswith(_SKIP_PREFIXES) or name.endswith(".bias_vl"):
+            return False
+        match = _EXPERT_RE.match(name)
+        if match is None:
+            return True
+        ffn = self.layers[int(match[1])].ffn
+        return 0 <= int(match[2]) - ffn.experts_start_idx < ffn.n_local_experts
+
+    def _load_one(
+        self, *, name, reader, params, pending_wo_a, expert_stacks, loaded
+    ) -> None:
+        match = _EXPERT_RE.match(name)
+        if ".engram.embed." in name:
+            # convert.py pads scales with 1.0, which is E8M0 byte 127
+            pad_value = 127 if name.endswith(".scale") else 0
+            self._load_engram_rows(
+                param=params[name], rows=reader.get_slice(name), pad_value=pad_value
+            )
+            loaded.add(name)
+            return
+        tensor = reader.get_tensor(name)
+        if match is not None:
+            self._load_expert(
+                match=match,
+                tensor=tensor,
+                params=params,
+                stacks=expert_stacks,
+                loaded=loaded,
+            )
+        elif ".attn.wo_a." in name:
+            self._load_wo_a(
+                name=name,
+                tensor=tensor,
+                params=params,
+                pending=pending_wo_a,
+                loaded=loaded,
+            )
+        else:
+            _copy_into(params[name], self._tp_shard(name, tensor))
+            loaded.add(name)
 
     def _tp_shard(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
         parts = name.split(".")
@@ -1081,17 +1128,15 @@ class DeepseekV41NativeForCausalLM(nn.Module):
         loaded.add(prefix + ".weight")
         del pending[prefix]
 
-    def _load_engram_rows(
-        self, *, param: nn.Parameter, tensor: torch.Tensor, pad_value: int
-    ) -> None:
-        """This rank's ceil(rows / tp) rows, padded past the end as convert.py does, uploaded in
-        chunks so host staging stays bounded."""
+    def _load_engram_rows(self, *, param: nn.Parameter, rows, pad_value: int) -> None:
+        """This rank's ceil(rows / tp) rows, read as a safetensors slice and padded past the end
+        as convert.py does, uploaded in chunks so host staging stays bounded."""
         part = param.size(0)
         start = self.args.tp_rank * part
-        stop = min(start + part, tensor.size(0))
+        stop = min(start + part, rows.get_shape()[0])
         for begin in range(start, stop, _ENGRAM_COPY_ROWS):
             end = min(begin + _ENGRAM_COPY_ROWS, stop)
-            chunk = _as_dtype(tensor[begin:end], param.dtype).contiguous()
+            chunk = _as_dtype(rows[begin:end], param.dtype).contiguous()
             param.data[begin - start : end - start].copy_(chunk)
             _wait_for(param.data)
         if stop - start < part:
