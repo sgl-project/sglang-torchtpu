@@ -346,6 +346,10 @@ class TpuEnvs:
     # (sampling/padded_logits.py). Same per-row ops, so the same tokens. Opt-in:
     # speculative decoding expands the penalties per request.
     SGLANG_TPU_PADDED_LOGITS_SAMPLING = EnvBool(False)
+    # Enable the Pallas ICI-DMA diffusion ring attention kernel (0 falls back to the all-gather ring).
+    SGLANG_TPU_ENABLE_DIFFUSION_RING_KERNEL = EnvBool(True)
+    # Enable hybrid per-head fixed-m softmax in the diffusion ring attention kernel.
+    SGLANG_TPU_DIFFUSION_RING_FIXED_M = EnvBool(True)
 
     @classmethod
     def names(cls) -> list[str]:

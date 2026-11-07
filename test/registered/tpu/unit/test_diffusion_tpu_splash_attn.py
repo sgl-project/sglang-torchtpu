@@ -762,6 +762,24 @@ class TestTpuSplashDispatch(CustomTestCase):
         self.assertEqual(_autotune_block_sizes(75600, 75600), (6400, 2048, 2048))
         self.assertEqual(_autotune_block_sizes(18944, 1280)[0], 9472)
 
+    def test_carry_bytes_per_q_row(self):
+        from sglang_tpu.multimodal_gen.tpu_splash_attn import (
+            _autotune_block_sizes,
+            _carry_bytes_per_q_row,
+        )
+
+        # bf16 output (including tpu_attention_with_lse) fits in _VMEM_BUDGET_FRACTION headroom.
+        self.assertEqual(_carry_bytes_per_q_row(128, f32_out=False, resume=False), 0)
+        # Ring step 0 (f32 output) or short-2D final step (bf16 output, resume=True).
+        self.assertEqual(_carry_bytes_per_q_row(128, f32_out=True, resume=False), 1088)
+        self.assertEqual(_carry_bytes_per_q_row(128, f32_out=False, resume=True), 1088)
+        # Ring middle/resume step (f32 output + f32 resume input).
+        self.assertEqual(_carry_bytes_per_q_row(128, f32_out=True, resume=True), 2176)
+        self.assertEqual(
+            _autotune_block_sizes(13640, 13640, carry_bytes_per_q_row=2176),
+            (6912, 1024, 1024),
+        )
+
     def test_splash_mha_blocks(self):
         from sglang_tpu.multimodal_gen.tpu_splash_attn import (
             _splash_mha_block_sizes,
