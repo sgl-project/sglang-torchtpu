@@ -59,7 +59,8 @@ def _mod(
 ) -> torch.Tensor:
     """limbs [..., L] (a value < 2**63) mod primes [...]; weights [..., L] as limb_weights."""
     terms = (limbs * weights) % primes.unsqueeze(-1)
-    return terms.sum(-1) % primes
+    # sum() of int32 promotes to int64 in torch; the terms are < 2**24, so 9 of them fit in int32.
+    return terms.sum(-1, dtype=torch.int32) % primes
 
 
 def engram_hash32(

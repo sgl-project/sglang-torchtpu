@@ -213,10 +213,9 @@ def _token_ctx(
     if forward_batch.forward_mode.is_decode():
         return _TokenCtx(positions=positions, slots=req), tok
     # Padded requests have extend_seq_lens 0, so tokens past the real ones land on index B.
-    ends = torch.cumsum(forward_batch.extend_seq_lens.to(torch.int32), dim=0).to(
-        torch.int32
-    )
-    req_idx = (tok.unsqueeze(1) >= ends.unsqueeze(0)).sum(1)
+    # cumsum/sum of int32 or bool promote to int64 in torch unless dtype is given.
+    ends = torch.cumsum(forward_batch.extend_seq_lens, dim=0, dtype=torch.int32)
+    req_idx = (tok.unsqueeze(1) >= ends.unsqueeze(0)).sum(1, dtype=torch.int32)
     batch = req.shape[0]
     slots = torch.where(req_idx < batch, req[req_idx.clamp_max(batch - 1)], 0)
     return _TokenCtx(positions=positions, slots=slots), (ends - 1).clamp_min(0)
@@ -328,6 +327,7 @@ class ParallelEmbedding(nn.Module):
         self.weight = _param((part, args.dim), torch.bfloat16)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.to(torch.int32)  # input_ids arrive as int64
         mask = (x < self.start) | (x >= self.end)
         y = F.embedding(torch.where(mask, 0, x - self.start), self.weight)
         y = y.masked_fill(mask.unsqueeze(-1), 0)
@@ -572,7 +572,8 @@ def select_candidate_blocks(
     num_blocks = scores.size(-1)
     last = (compress_lens - 1) // block_size
     scores = scores.masked_fill(
-        torch.arange(num_blocks, device=logits.device) == last, torch.inf
+        torch.arange(num_blocks, device=logits.device, dtype=torch.int32) == last,
+        torch.inf,
     )
     top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
     keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
@@ -633,7 +634,9 @@ class Indexer(nn.Module):
         )
         # a group becomes visible once the query has passed its last token
         compress_lens = ((ctx.positions + 1) // self.ratio).unsqueeze(-1)
-        positions = torch.arange(self.num_compressed, device=x.device)
+        positions = torch.arange(
+            self.num_compressed, device=x.device, dtype=torch.int32
+        )
         score = score.masked_fill(positions >= compress_lens, -torch.inf)
         if self.is_candidate_source:
             shared["candidates"] = select_candidate_blocks(
@@ -802,7 +805,7 @@ class Gate(nn.Module):
             scores = scores.sigmoid()
         else:
             scores = F.softplus(scores).sqrt()
-        indices = (scores + self.bias).topk(self.topk, dim=-1)[1]
+        indices = (scores + self.bias).topk(self.topk, dim=-1)[1].to(torch.int32)
         weights = scores.gather(1, indices)
         if self.norm_topk_prob and self.topk > 1:
             weights = weights / (
@@ -866,6 +869,7 @@ class MoE(nn.Module):
             self.experts_start_idx,
             self.experts_start_idx + self.n_local_experts,
             device=x.device,
+            dtype=torch.int32,
         )
         hit = indices.unsqueeze(-1) == experts  # [n, topk, E]
         routed = hit.any(1)
@@ -1010,6 +1014,7 @@ class DeepseekV41NativeForCausalLM(nn.Module):
         **kwargs,
     ) -> LogitsProcessorOutput:
         assert input_embeds is None and pp_proxy_tensors is None
+        input_ids = input_ids.to(torch.int32)  # the scheduler passes int64 ids
         ctx, last = _token_ctx(positions=positions, forward_batch=forward_batch)
         hashes = self.engram_hash(input_ids, ctx)
         h = self.embed(input_ids).unsqueeze(0)  # [1, T, dim]
