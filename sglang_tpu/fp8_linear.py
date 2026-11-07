@@ -204,13 +204,6 @@ def register_tpu_block_fp8_linear() -> None:
     register_tpu_block_fp8_matmul_op()
 
 
-def _pad_rows_to_scaled_mm_alignment(x: torch.Tensor) -> tuple[torch.Tensor, int]:
-    pad = (16 - (x.shape[0] % 16)) % 16
-    if pad == 0:
-        return x, 0
-    return torch.nn.functional.pad(x, (0, 0, 0, pad)), pad
-
-
 def _quantize_activation_per_row(
     x: torch.Tensor,
     target_dtype: torch.dtype,
@@ -269,15 +262,10 @@ def apply_tpu_fp8_linear(
     ):
         out = _get_fp8_linear_small_m_op()(x_2d, weight, weight_scale)
         return out.reshape(out_shape)
-    x_2d, pad = _pad_rows_to_scaled_mm_alignment(x_2d)
     x_q, x_scale = _quantize_activation_per_row(x_2d, weight.dtype)
 
-    # TODO(torch_tpu#1820): pass rowwise x_scale and channelwise weight_scale
-    # directly to torch._scaled_mm once torch_tpu supports those scale shapes.
-    # TODO(torch_tpu#1823): remove the M-dimension pad/narrow once torch_tpu
-    # supports ragged-M scaled_mm for decode. For now, use upstream SGLang's
-    # unfused-DQ fallback: compute the raw FP8 dot in f32, then apply
-    # row/column scales outside the matmul.
+    # Scale the f32 dot here, not in torch._scaled_mm: it applies the scales as
+    # acc * (x_scale * w_scale), the small-M kernel as (acc * x_scale) * w_scale.
     one = torch.ones(1, dtype=torch.float32, device=x.device)
     out = torch._scaled_mm(
         x_q,
@@ -287,8 +275,6 @@ def apply_tpu_fp8_linear(
         out_dtype=torch.float32,
     )
     out = out * x_scale * weight_scale.reshape(1, -1).float()
-    if pad:
-        out = torch.narrow(out, 0, 0, num_tokens)
     out = out.to(x.dtype).reshape(out_shape)
     if bias is not None:
         out = out + bias
@@ -359,19 +345,13 @@ def apply_tpu_static_fp8_linear(x: torch.Tensor, w: StaticFp8Weight) -> torch.Te
         out = _STATIC_FP8_GEMV_OP(x, w.weight, w.out_scale, w.inv_x)
         return out[:, : w.n_out] if w.n_out else out
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
-    x_2d, pad = _pad_rows_to_scaled_mm_alignment(x.float())
     # The clamp is free in the quantize fusion and guards the cast, which
     # does not saturate (an over-range value would become NaN).
-    x_q = (x_2d * w.inv_x_scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+    x_q = (x.float() * w.inv_x_scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
     out = torch._scaled_mm(
         x_q, w.weight, scale_a=w.one, scale_b=w.one, out_dtype=torch.float32
     )
-    # Scale while still f32 and narrow before the cast: XLA folds scale,
-    # narrow and cast into one fusion. Narrowing a bf16 [16, N] instead adds a
-    # relayout of the tiled rows.
     out = out * w.out_scale
-    if pad:
-        out = torch.narrow(out, 0, 0, x.shape[0])
     if w.n_out:
         out = out[:, : w.n_out]
     return out.to(x.dtype)
