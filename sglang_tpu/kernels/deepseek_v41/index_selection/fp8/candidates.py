@@ -191,10 +191,9 @@ def prepare_candidate_metadata(
         start = jnp.where(member == 0, 0, counts[groups, 0])
         size = jnp.where(member == 0, counts[groups, 0], counts[groups, 2])
         size += counts[groups, 1]
-        slots = start[:, None] + jnp.arange(count)
         candidate_block_ids = jnp.where(
             jnp.arange(count) < size[:, None],
-            jnp.take_along_axis(candidate_block_ids[groups], slots, axis=1),
+            _rotate_rows_left(candidate_block_ids[groups], start)[:, :count],
             -1,
         )
 
@@ -603,6 +602,33 @@ def canonical_candidate_blocks(
     return candidate_block_ids, physical_block_ids, owners
 
 
+def _stable_sort_rows_by_key(key: jax.Array, *payloads: jax.Array) -> list[jax.Array]:
+    """Stable per-row sort of ``payloads`` by ``key`` (axis 1) in one ``lax.sort``.
+
+    Equivalent to ``take_along_axis(x, argsort(key, stable=True))`` for each
+    payload. Carrying the payloads through the sort avoids the row gathers that
+    argsort + take_along_axis lowers to: at prefill sizes ([1024, 4096] int32)
+    XLA offloads those gathers to SparseCore at ~50-210 ms each on TPU7x, while
+    the sort itself takes under 1 ms.
+    """
+    return list(lax.sort((key, *payloads), dimension=1, is_stable=True, num_keys=1)[1:])
+
+
+def _rotate_rows_left(values: jax.Array, shift: jax.Array) -> jax.Array:
+    """Rotate each row of ``values`` left by ``shift[row]`` without a gather.
+
+    Row r becomes ``values[r, shift[r]:]`` followed by ``values[r, :shift[r]]``;
+    ``shift`` must lie in ``[0, values.shape[1]]``. Sorting by the rotated
+    column index (unique per row) replaces ``take_along_axis`` for the same
+    reason as `_stable_sort_rows_by_key`.
+    """
+    width = values.shape[1]
+    columns = jnp.arange(width, dtype=jnp.int32)[None, :]
+    shift = shift.astype(jnp.int32)[:, None]
+    key = jnp.where(columns >= shift, columns - shift, columns + width - shift)
+    return lax.sort((key, values), dimension=1, num_keys=1)[1]
+
+
 def _canonical_candidate_blocks_ref(
     candidates, table, block, width, cache_pages, page_size
 ):
@@ -650,11 +676,11 @@ def _canonical_candidate_blocks_ref(
     category = jnp.where(
         owners == 1, 0, jnp.where(owners == 3, 1, jnp.where(owners == 2, 2, 3))
     )
-    order = jnp.argsort(category, axis=1, stable=True)
-    candidate_block_ids = jnp.take_along_axis(candidate_block_ids, order, axis=1)
-    physical_block_ids = jnp.take_along_axis(
-        physical_block_ids.reshape(rows, -1, parts), order[..., None], axis=1
-    ).reshape(rows, -1)
+    fragments = physical_block_ids.reshape(rows, -1, parts)
+    candidate_block_ids, *fragment_parts = _stable_sort_rows_by_key(
+        category, candidate_block_ids, *(fragments[..., p] for p in range(parts))
+    )
+    physical_block_ids = jnp.stack(fragment_parts, axis=-1).reshape(rows, -1)
     counts = jnp.stack([(owners == flag).sum(axis=1) for flag in (1, 3, 2)], axis=1)
     return candidate_block_ids, physical_block_ids, counts
 
