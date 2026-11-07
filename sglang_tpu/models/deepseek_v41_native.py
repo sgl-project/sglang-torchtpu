@@ -24,6 +24,8 @@ import json
 import math
 import os
 import re
+import struct
+import time
 from functools import lru_cache
 from typing import Iterable, NamedTuple, Optional, Tuple
 
@@ -61,7 +63,7 @@ from sglang_tpu.dsv41_native.kernel_ref import (
     scale_f32,
     sparse_attn_gathered,
 )
-from sglang_tpu.expert_loading import _wait_for
+from sglang_tpu.ep_local_expert_reader import _SAFETENSORS_DTYPES
 
 logger = get_logger(__name__)
 
@@ -70,8 +72,8 @@ FP4_BLOCK = 32  # one fp4 scale per 32 elements along K
 SCALE_FMT = "ue8m0"
 # E8M0 scales are kept as raw bytes; kernel_ref.scale_f32 decodes them.
 SCALE_STORAGE = torch.uint8
-# Rows per host-to-device copy of an engram table shard (256 MiB of fp8 rows). Arbitrary.
-_ENGRAM_COPY_ROWS = 1 << 20
+# Bound on one readinto() while reading an engram row range (not tuned).
+_READ_CHUNK_BYTES = 64 * 1024 * 1024
 _EXPERT_RE = re.compile(
     r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale)$"
 )
@@ -1008,6 +1010,7 @@ class DeepseekV41NativeForCausalLM(nn.Module):
                 for name in by_file[file]:
                     self._load_one(
                         name=name,
+                        path=os.path.join(folder, file),
                         reader=f,
                         params=params,
                         pending_wo_a=pending_wo_a,
@@ -1043,14 +1046,14 @@ class DeepseekV41NativeForCausalLM(nn.Module):
         return 0 <= int(match[2]) - ffn.experts_start_idx < ffn.n_local_experts
 
     def _load_one(
-        self, *, name, reader, params, pending_wo_a, expert_stacks, loaded
+        self, *, name, path, reader, params, pending_wo_a, expert_stacks, loaded
     ) -> None:
         match = _EXPERT_RE.match(name)
         if ".engram.embed." in name:
             # convert.py pads scales with 1.0, which is E8M0 byte 127
             pad_value = 127 if name.endswith(".scale") else 0
             self._load_engram_rows(
-                param=params[name], rows=reader.get_slice(name), pad_value=pad_value
+                param=params[name], path=path, name=name, pad_byte=pad_value
             )
             loaded.add(name)
             return
@@ -1128,25 +1131,48 @@ class DeepseekV41NativeForCausalLM(nn.Module):
         loaded.add(prefix + ".weight")
         del pending[prefix]
 
-    def _load_engram_rows(self, *, param: nn.Parameter, rows, pad_value: int) -> None:
-        """This rank's ceil(rows / tp) rows, read as a safetensors slice and padded past the end
-        as convert.py does, uploaded in chunks so host staging stays bounded."""
+    def _load_engram_rows(
+        self, *, param: nn.Parameter, path: str, name: str, pad_byte: int
+    ) -> None:
+        """This rank's ceil(rows / tp) rows, padded past the end as convert.py does, staged on
+        host and uploaded in one copy. The rows are one contiguous byte range, read sequentially:
+        mmap slices over gcsfuse fault in a page at a time and stalled r4 for over 30 minutes."""
+        t0 = time.perf_counter()
         part = param.size(0)
         start = self.args.tp_rank * part
-        stop = min(start + part, rows.get_shape()[0])
-        for begin in range(start, stop, _ENGRAM_COPY_ROWS):
-            end = min(begin + _ENGRAM_COPY_ROWS, stop)
-            chunk = _as_dtype(rows[begin:end], param.dtype).contiguous()
-            param.data[begin - start : end - start].copy_(chunk)
-            _wait_for(param.data)
-        if stop - start < part:
-            pad = torch.full(
-                (part - (stop - start), param.size(1)),
-                pad_value,
-                dtype=param.dtype,
-                device="cpu",
-            )
-            param.data[stop - start :].copy_(pad)
+        rows = _read_rows(path, name, start, start + part)
+        host = torch.empty(tuple(param.shape), dtype=param.dtype, device="cpu")
+        host.view(torch.uint8).fill_(pad_byte)
+        host[: rows.size(0)].copy_(_as_dtype(rows, param.dtype))
+        _copy_into(param, host)
+        logger.info(
+            "DeepSeek-V4.1 native: %s rows [%d, %d) in %.1fs",
+            name,
+            start,
+            start + rows.size(0),
+            time.perf_counter() - t0,
+        )
+
+
+def _read_rows(path: str, name: str, start: int, stop: int) -> torch.Tensor:
+    """Rows [start, stop) of 2-D safetensors tensor `name` (clipped to its row count), read with
+    large sequential reads straight from the file."""
+    with open(path, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        meta = json.loads(f.read(header_len))[name]
+        num_rows, cols = meta["shape"]
+        dtype = _SAFETENSORS_DTYPES[meta["dtype"]]
+        row_bytes = cols * torch.empty((), dtype=dtype).element_size()
+        stop = min(stop, num_rows)
+        buf = torch.empty(max(stop - start, 0) * row_bytes, dtype=torch.uint8)
+        f.seek(8 + header_len + meta["data_offsets"][0] + start * row_bytes)
+        view, got = memoryview(buf.numpy()), 0
+        while got < len(view):
+            n = f.readinto(view[got : got + _READ_CHUNK_BYTES])
+            if not n:
+                raise EOFError(f"{path}: {name} ended after {got} of {len(view)} bytes")
+            got += n
+    return buf.view(dtype).view(-1, cols)
 
 
 def _as_dtype(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
