@@ -551,7 +551,7 @@ class Compressor(nn.Module):
         group = (
             ctx.positions.unsqueeze(1)
             - (self.ratio - 1)
-            + torch.arange(self.ratio, device=x.device)
+            + torch.arange(self.ratio, device=x.device, dtype=torch.int32)
         )
         rows, cols = ctx.slots.unsqueeze(1), group.clamp_min(0)
         kv, score = (
@@ -722,7 +722,9 @@ class Attention(nn.Module):
         self.kv_cache[ctx.slots, ctx.positions] = kv[0]
         win = self.window_size
         idx = (
-            ctx.positions.unsqueeze(1) - (win - 1) + torch.arange(win, device=x.device)
+            ctx.positions.unsqueeze(1)
+            - (win - 1)
+            + torch.arange(win, device=x.device, dtype=torch.int32)
         )
         return self.kv_cache[ctx.slots.unsqueeze(1), idx.clamp_min(0)], idx >= 0
 
