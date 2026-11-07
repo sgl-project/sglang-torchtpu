@@ -197,16 +197,16 @@ def make_decode(spec, layout, small_map, small_f32_map, mesh, cfg: D.KernelConfi
         raw_out, rec_out = _scatter_index_rows(
             spec, cfg, meta, pos, tab, nraw, nrec, pools["raw"], pools["records"]
         )
-        nope_out = write_rows(meta, pos, tab, nkv8, *pools["nope"])
-        # KDA checkpoints (17 MB per row) go in as XLA scatters on the donated
-        # pools: an in-kernel HBM->HBM DMA runs at ~33 GB/s on v7x, 2 ms per 4 rows.
+        written = write_rows(
+            meta, pos, tab, ckrow, nkv8, conv, *pools["nope"], *pools["conv"]
+        )
+        nope_out, conv_out = written[:n_dsa], written[n_dsa:]
+        # KDA temporal checkpoints (17 MB per row) go in as XLA scatters on the
+        # donated pools: an in-kernel HBM->HBM DMA runs at ~33 GB/s on v7x, 2 ms per 4 rows.
         live = jnp.arange(R, dtype=jnp.int32) // Q < meta[0]
         ck = jnp.where(live, ckrow, -1)
         temporal_out = [
             pools["temporal"][k].at[ck].set(recur[k], mode="drop") for k in range(n_kda)
-        ]
-        conv_out = [
-            pools["conv"][k].at[ck].set(conv[k], mode="drop") for k in range(n_kda)
         ]
         return (
             logits,
@@ -216,7 +216,7 @@ def make_decode(spec, layout, small_map, small_f32_map, mesh, cfg: D.KernelConfi
                 "raw": raw_out,
                 "records": rec_out,
                 "temporal": temporal_out,
-                "conv": conv_out,
+                "conv": list(conv_out),
             },
         )
 
