@@ -31,6 +31,7 @@ anthropic==1.3.0
     # via sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
 anyio==4.15.0
     # via
+    #   sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
     #   anthropic
     #   httpx
     #   httpx2
@@ -81,9 +82,7 @@ compressed-tensors==0.18.0
 contourpy==1.3.3
     # via matplotlib
 cryptography==50.0.1
-    # via
-    #   google-auth
-    #   modelscope-hub
+    # via modelscope-hub
 cycler==0.12.1
     # via matplotlib
 dataproperty==1.1.1
@@ -147,28 +146,6 @@ fsspec==2026.6.0
     #   torch
 gguf==0.19.0
     # via sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
-google-api-core==2.36.0
-    # via
-    #   torch-tpu (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/1/pyproject.toml)
-    #   google-cloud-core
-    #   google-cloud-storage
-google-auth==2.57.1
-    # via
-    #   google-api-core
-    #   google-cloud-core
-    #   google-cloud-storage
-google-cloud-core==2.7.0
-    # via google-cloud-storage
-google-cloud-storage==3.13.1
-    # via torch-tpu (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/1/pyproject.toml)
-google-crc32c==1.8.0
-    # via
-    #   google-cloud-storage
-    #   google-resumable-media
-google-resumable-media==2.10.2
-    # via google-cloud-storage
-googleapis-common-protos==1.75.3
-    # via google-api-core
 grpcio==1.83.1
     # via
     #   grpcio-health-checking
@@ -211,8 +188,6 @@ huggingface-hub==1.30.0
     #   timm
     #   tokenizers
     #   transformers
-hypothesis==6.167.1
-    # via torch-tpu (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/1/pyproject.toml)
 idna==3.19
     # via
     #   anyio
@@ -281,7 +256,6 @@ lxml==6.1.3
     # via
     #   blobfile
     #   sacrebleu
-    #   unittest-xml-reporting
 markdown==3.10.3
     # via tensorboard
 markdown-it-py==4.2.0
@@ -367,8 +341,6 @@ openai==2.6.1
     # via sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
 openai-harmony==0.0.4
     # via sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
-opentelemetry-api==1.44.0
-    # via google-api-core
 opt-einsum==3.4.0
     # via jax
 orjson==3.12.0
@@ -412,7 +384,6 @@ pexpect==4.9.0
 pillow==12.3.0
     # via
     #   sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
-    #   torch-tpu (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/1/pyproject.toml)
     #   matplotlib
     #   mistral-common
     #   tensorboard
@@ -431,15 +402,10 @@ propcache==0.5.2
     # via
     #   aiohttp
     #   yarl
-proto-plus==1.28.4
-    # via google-api-core
 protobuf==7.36.1
     # via
-    #   google-api-core
-    #   googleapis-common-protos
     #   grpcio-health-checking
     #   grpcio-reflection
-    #   proto-plus
     #   smg-grpc-proto
     #   tensorboard
 psutil==7.2.2
@@ -458,10 +424,6 @@ py-spy==0.4.2
     # via sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
 pyarrow==25.0.1
     # via datasets
-pyasn1==0.6.4
-    # via pyasn1-modules
-pyasn1-modules==0.4.2
-    # via google-auth
 pybase64==1.5.0
     # via sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
 pycountry==26.2.16
@@ -501,9 +463,7 @@ pyproject-hooks==1.2.0
 pytablewriter==1.2.1
     # via lm-eval
 pytest==9.1.1
-    # via
-    #   sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
-    #   torch-tpu (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/1/pyproject.toml)
+    # via sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
 python-dateutil==2.9.0.post0
     # via
     #   matplotlib
@@ -543,8 +503,6 @@ requests==2.34.2
     #   datasets
     #   evaluate
     #   gguf
-    #   google-api-core
-    #   google-cloud-storage
     #   lm-eval
     #   mistral-common
     #   modelscope
@@ -574,7 +532,6 @@ scikit-learn==1.9.0
 scipy==1.18.1
     # via
     #   sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
-    #   torch-tpu (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/1/pyproject.toml)
     #   jax
     #   jaxlib
     #   scikit-learn
@@ -599,7 +556,6 @@ shellingham==1.5.4
     # via typer
 six==1.17.0
     # via
-    #   torch-tpu (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/1/pyproject.toml)
     #   python-dateutil
     #   rouge-score
 smg-grpc-proto==0.4.16
@@ -610,8 +566,6 @@ sniffio==1.3.1
     # via
     #   anthropic
     #   openai
-sortedcontainers==2.4.0
-    # via hypothesis
 soundfile==0.13.1
     # via sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
 sqlitedict==2.1.0
@@ -645,11 +599,11 @@ tiktoken==0.14.0
     #   mistral-common
 timm==1.0.16
     # via sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
-tokenizers==0.22.2
+tokenizers==0.23.3
     # via
     #   sentence-transformers
     #   transformers
-torch==2.11.0+cpu
+torch==2.13.0+cpu
     # via
     #   sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
     #   torch-tpu (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/1/pyproject.toml)
@@ -663,10 +617,9 @@ torch==2.11.0+cpu
     #   xgrammar
 torchao==0.9.0+cpu
     # via sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
-torchvision==0.26.0+cpu
+torchvision==0.28.0+cpu
     # via
     #   sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
-    #   torch-tpu (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/1/pyproject.toml)
     #   timm
 tqdm==4.70.0
     # via
@@ -688,10 +641,9 @@ traitlets==5.16.1
     # via
     #   ipython
     #   matplotlib-inline
-transformers==5.8.1
+transformers==5.17.0
     # via
     #   sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
-    #   torch-tpu (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/1/pyproject.toml)
     #   compressed-tensors
     #   peft
     #   sentence-transformers
@@ -723,7 +675,6 @@ typing-extensions==4.16.0
     #   lm-eval
     #   mistral-common
     #   openai
-    #   opentelemetry-api
     #   outlines
     #   pydantic
     #   pydantic-core
@@ -738,8 +689,6 @@ typing-inspection==0.4.4
     # via
     #   fastapi
     #   pydantic
-unittest-xml-reporting==4.0.0
-    # via torch-tpu (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/1/pyproject.toml)
 urllib3==2.7.0
     # via
     #   blobfile
@@ -758,7 +707,7 @@ werkzeug==3.1.8
     # via tensorboard
 word2number==1.1
     # via lm-eval
-xgrammar==0.2.0
+xgrammar==0.2.7
     # via sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
 xxhash==4.0.1
     # via
@@ -766,3 +715,5 @@ xxhash==4.0.1
     #   evaluate
 yarl==1.24.5
     # via aiohttp
+zstandard==0.25.0
+    # via sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
