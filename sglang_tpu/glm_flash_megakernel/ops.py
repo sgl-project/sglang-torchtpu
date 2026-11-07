@@ -259,9 +259,7 @@ class GlmFlashMegakernel:
                 f"jax_glm_flash_mk_L{max_len}_q{n_query}_b{b}",
                 step,
                 in_specs,
-                # Keep logits vocab-sharded: replicated here, their mesh sharding leaks into
-                # serving's compiled ops, which then fail to compile.
-                [P(None, _AXIS), P(None, None)] + pspec,
+                [P(None, None), P(None, None)] + pspec,
                 donate=tuple(range(pool0, pool0 + n_pool)),
                 aliases={pool0 + i: 2 + i for i in range(n_pool)},
             )
@@ -396,7 +394,6 @@ class GlmFlashMegakernel:
         )
 
     def forward(self, input_ids, positions, forward_batch):
-        from sglang.srt.distributed import tensor_model_parallel_all_gather
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
         bs = forward_batch.batch_size
@@ -414,7 +411,7 @@ class GlmFlashMegakernel:
             hidden.append(out[1][: n * self.Q])
         logits = torch.cat(logits) if len(logits) > 1 else logits[0]
         hidden = torch.cat(hidden) if len(hidden) > 1 else hidden[0]
-        logits = tensor_model_parallel_all_gather(logits, dim=-1)[:, : self.vocab]
+        logits = logits[:, : self.vocab]
         if self.radix_snapshots and self.Q == 1:
             self._decode_snapshot(forward_batch)
         return LogitsProcessorOutput(next_token_logits=logits, hidden_states=hidden)
