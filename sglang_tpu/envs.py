@@ -423,6 +423,10 @@ class TpuEnvs:
     # Store INT4 MoE group scales as f32 instead of bf16 (66 MB per layer per
     # device on Kimi-K2.6). vmem-fp8 always uses f32.
     SGLANG_TPU_INT4_MOE_FP32_SCALES = EnvBool(False)
+    # Store NVFP4 MoE group scales as f32 instead of bf16 on the non-fused-RS
+    # gmm_v2 path (e.g. PP with TP=1) so gmm_v2 uses Mosaic 32-bit zero-stride
+    # scale loads instead of VPU broadcast expansion.
+    SGLANG_TPU_NVFP4_MOE_FP32_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
