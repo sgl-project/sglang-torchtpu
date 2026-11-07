@@ -324,6 +324,8 @@ class RaidenKVManager(
         self._reshard_plans: Dict[int, Dict[str, int]] = {}
         # Receive req_ids cancelled locally; suppresses repeat cancel and ERROR logs.
         self._cancelled_recvs: Set[str] = set()
+        # Reshard receive plans whose local cancel failed; retried once settled.
+        self._pending_unregisters: Dict[str, int] = {}
         # Unsettled reshard plans of cleared rooms awaiting settlement cleanup.
         self._cleared_plans: Set[str] = set()
         # Sender plans whose D2H stage timed out while the copy was still
@@ -904,7 +906,9 @@ class RaidenKVManager(
                     self._retire_settled_receives_locked(done_recv_ids | real_failed)
                     self._release_pull_slots_locked()
                     self._settle_sender_reads_locked()
-                    self._drop_settled_cleared_plans_locked()
+                    settled_cleared = self._drop_settled_cleared_plans_locked()
+                for req_id, uuid in settled_cleared:
+                    self._unregister_recv_plan(req_id=req_id, uuid=uuid)
                 self._log_settled_transfers(
                     sent=[self._norm_req_id(t.req_id) for t in done_send],
                     received=[self._norm_req_id(t.req_id) for t in done_recv],
@@ -1142,7 +1146,7 @@ class RaidenKVManager(
         # room with a later Transferring write.
         with self._state_lock:
             super()._handle_node_failure(failed_bootstrap_addr)
-            to_cancel: List[Tuple[str, int]] = []
+            to_cancel: List[Tuple[str, int, bool]] = []
             for room in set(self._pull_sessions) | set(self._reshard_plans):
                 with self._status_lock:
                     failed_room = self.request_status.get(room) == KVPoll.Failed

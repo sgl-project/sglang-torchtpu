@@ -122,6 +122,7 @@ def _decode_manager(*, hybrid, chunked, listener=False, state=False):
     mgr._pull_sessions = {}
     mgr._reshard_plans = {}
     mgr._cancelled_recvs = set()
+    mgr._pending_unregisters = {}
     mgr._cleared_plans = set()
     mgr._stale_plans = []
     mgr._engine_poll_failing_since = {}
@@ -495,10 +496,11 @@ class TestRaidenDecodeReceiveCancellation(CustomTestCase):
                 )
                 with patch.object(raiden_logger, "warning") as log_warn:
                     self.assertEqual(recv.poll(), KVPoll.Transferring)
+                    mgr._engine.poll_stats_with_details.return_value = _polled()
+                    self.assertEqual(recv.poll(), KVPoll.Transferring)
                 log_warn.assert_called_once()
                 mgr._swa_engine.unregister_active_plan.assert_called_once_with(ROOM)
                 mgr._engine.unregister_active_plan.assert_not_called()
-                mgr._engine.poll_stats_with_details.return_value = _polled()
                 mgr._swa_engine.poll_stats_with_details.return_value = _polled(
                     failed=[f"swa:{ROOM}"],
                     details={
@@ -510,9 +512,12 @@ class TestRaidenDecodeReceiveCancellation(CustomTestCase):
                 self.assertEqual(recv.poll(), KVPoll.Failed)
                 self.assertEqual(len(mgr._pulling), 0)
                 self.assertEqual(mgr._cancelled_recvs, set())
+                self.assertEqual(mgr._pending_unregisters, {})
             with self.assertRaises(KVTransferError) as cm:
                 recv.failure_exception()
             self.assertIn("H2D fault", cm.exception.failure_reason)
+            mgr.clear_room(ROOM)
+            mgr._swa_engine.unregister_active_plan.assert_called_once_with(ROOM)
 
     def test_companion_start_read_error_cancels_started_and_respects_clear(self):
         """A companion start_read failure cancels already-started sibling reads,

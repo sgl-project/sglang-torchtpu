@@ -133,6 +133,7 @@ def _decode_manager():
     mgr._pull_sessions = {}
     mgr._reshard_plans = {}
     mgr._cancelled_recvs = set()
+    mgr._pending_unregisters = {}
     mgr.chunked_transfer = False
     mgr.waiting_timeout = 300
     mgr._message_handlers = {RoomFailed.TAG: mgr._on_room_failed}
@@ -449,6 +450,7 @@ class TestReceiverFailurePaths(unittest.TestCase):
         mgr._pull_sessions = {}
         mgr._reshard_plans = {}
         mgr._cancelled_recvs = set()
+        mgr._pending_unregisters = {}
         mgr._decode.remote_blocks = {ROOM: [11, 12]}
         mgr._decode.remote_endpoint = {ROOM: "peer"}
         mgr._decode.local_blocks = {ROOM: [21, 22]}

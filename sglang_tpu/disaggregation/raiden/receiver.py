@@ -381,54 +381,66 @@ class RaidenReceiverMixin:
             return self._state_engine
         return self._engine
 
-    def _unregister_recv_plan(
-        self,
-        *,
-        req_id: str,
-        uuid: int,
-        best_effort: bool = False,
-    ) -> None:
+    def _unregister_recv_plan(self, *, req_id: str, uuid: int) -> bool:
         target = self._recv_engine_for(req_id)
         if target is None:
-            return
+            return True
         # TODO(tpu-sync): pinned tpu-sync-torch cancels StartRead pulls here;
         # wire a dedicated pull-cancel API before bumping tpu-sync-torch.
         try:
             target.unregister_active_plan(uuid)
+            return True
         except Exception as e:
             if "not registered" in str(e).lower():
-                return
-            if not best_effort:
-                raise
+                return True
             logger.warning(
-                "RaidenKVManager rank%d cannot cancel receive %s: %s",
+                "RaidenKVManager rank%d cannot unregister receive %s: %s",
                 self.attn_tp_rank,
                 req_id,
                 e,
             )
+            return False
 
-    def _claim_room_cancels_locked(self, room: int) -> List[Tuple[str, int]]:
-        claimed: List[Tuple[str, int]] = []
-        for plans in (
-            self._pull_sessions.pop(room, {}),
-            self._reshard_plans.get(room, {}),
+    def _claim_room_cancels_locked(self, room: int) -> List[Tuple[str, int, bool]]:
+        claimed: List[Tuple[str, int, bool]] = []
+        for is_plan, plans in (
+            (False, self._pull_sessions.pop(room, {})),
+            (True, self._reshard_plans.get(room, {})),
         ):
             for req_id, uuid in plans.items():
                 if (
                     req_id in self._completed_recv
                     or req_id in self._native_failed
                     or req_id in self._cancelled_recvs
+                    or req_id in self._pending_unregisters
                 ):
                     continue
                 # Callers record the room's primary reason or clear the room first,
                 # since _cancelled_recvs suppresses the follow-on CANCELLED record.
                 self._cancelled_recvs.add(req_id)
-                claimed.append((req_id, uuid))
+                claimed.append((req_id, uuid, is_plan))
         return claimed
 
-    def _cancel_receives(self, items: Iterable[Tuple[str, int]]) -> None:
-        for req_id, uuid in items:
-            self._unregister_recv_plan(req_id=req_id, uuid=uuid, best_effort=True)
+    def _cancel_receives(self, items: Iterable[Tuple[str, int, bool]]) -> None:
+        retry_settled: List[Tuple[str, int]] = []
+        for req_id, uuid, is_plan in items:
+            if self._unregister_recv_plan(req_id=req_id, uuid=uuid):
+                continue
+            with self._state_lock:
+                self._cancelled_recvs.discard(req_id)
+                if not is_plan:
+                    continue
+                room = self._room_of(req_id)
+                in_reshard = (
+                    room is not None
+                    and self._reshard_plans.get(room, {}).get(req_id) == uuid
+                )
+                if in_reshard or req_id in self._cleared_plans:
+                    self._pending_unregisters[req_id] = uuid
+                else:
+                    retry_settled.append((req_id, uuid))
+        for req_id, uuid in retry_settled:
+            self._unregister_recv_plan(req_id=req_id, uuid=uuid)
 
     def _retire_settled_receives_locked(self, settled_ids: Iterable[str]) -> None:
         for rid in settled_ids:
@@ -445,12 +457,13 @@ class RaidenReceiverMixin:
 
     def _retire_room_receives_locked(
         self, room: int
-    ) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]], Set[str]]:
+    ) -> Tuple[List[Tuple[str, int, bool]], List[Tuple[str, int]], Set[str]]:
         to_cancel = self._claim_room_cancels_locked(room)
         settled_plans: List[Tuple[str, int]] = []
         held_plans: Set[str] = set()
         for req_id, uuid in self._reshard_plans.pop(room, {}).items():
             if req_id in self._completed_recv or req_id in self._native_failed:
+                self._pending_unregisters.pop(req_id, None)
                 if req_id in self._cancelled_recvs:
                     self._cancelled_recvs.discard(req_id)
                 else:
@@ -463,7 +476,8 @@ class RaidenReceiverMixin:
         )
         return to_cancel, settled_plans, held_plans
 
-    def _drop_settled_cleared_plans_locked(self) -> None:
+    def _drop_settled_cleared_plans_locked(self) -> List[Tuple[str, int]]:
+        to_unregister: List[Tuple[str, int]] = []
         for req_id in list(self._cleared_plans):
             if req_id in self._completed_recv or req_id in self._native_failed:
                 self._cleared_plans.discard(req_id)
@@ -471,6 +485,10 @@ class RaidenReceiverMixin:
                 self._failed.discard(req_id)
                 self._native_failed.discard(req_id)
                 self._cancelled_recvs.discard(req_id)
+                uuid = self._pending_unregisters.pop(req_id, None)
+                if uuid is not None:
+                    to_unregister.append((req_id, uuid))
+        return to_unregister
 
     def _room_died_locked(self, room: int) -> bool:
         with self._status_lock:
@@ -1306,11 +1324,11 @@ class RaidenReceiverMixin:
 
     def _track_reshard_plan_locked(
         self, *, room: int, req_id: str, uuid: int
-    ) -> List[Tuple[str, int]]:
+    ) -> List[Tuple[str, int, bool]]:
         if room not in self._decode.reshard_meta:
             self._cleared_plans.add(req_id)
             self._cancelled_recvs.add(req_id)
-            return [(req_id, uuid)]
+            return [(req_id, uuid, True)]
         self._reshard_plans.setdefault(room, {})[req_id] = uuid
         if self._room_died_locked(room):
             return self._claim_room_cancels_locked(room)
@@ -1318,7 +1336,7 @@ class RaidenReceiverMixin:
 
     def _commit_reshard_complement_locked(
         self, *, room: int, has_closing_blocks: bool, ready_endpoints: List[str]
-    ) -> Tuple[bool, List[Tuple[str, int]]]:
+    ) -> Tuple[bool, List[Tuple[str, int, bool]]]:
         if room not in self._decode.reshard_meta or self._room_died_locked(room):
             return False, self._claim_room_cancels_locked(room)
         # The closing read is owed from the moment the room can look

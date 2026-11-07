@@ -26,7 +26,7 @@ import unittest
 from collections import defaultdict
 from dataclasses import fields
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import torch
 import zmq
@@ -52,6 +52,7 @@ from sglang_tpu.disaggregation.raiden.conn import (
     RaidenKVSender,
     get_raiden_kv_caches,
 )
+from sglang_tpu.disaggregation.raiden.conn import logger as raiden_logger
 from sglang_tpu.disaggregation.raiden.host_pool import StagingAdmission
 from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
@@ -866,6 +867,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._pull_sessions = {}
         mgr._reshard_plans = {}
         mgr._cancelled_recvs = set()
+        mgr._pending_unregisters = {}
         mgr._cleared_plans = set()
         mgr.attn_tp_rank = 0
         mgr.record_failure = Mock()
@@ -1269,6 +1271,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._failed = set()
         mgr._native_failed = set()
         mgr._cancelled_recvs = set()
+        mgr._pending_unregisters = {}
         mgr._pulling_cleared = set()
         mgr._pull_sessions = {}
         mgr._reshard_plans = {}
@@ -2176,6 +2179,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._pull_sessions = {}
         mgr._reshard_plans = {}
         mgr._cancelled_recvs = set()
+        mgr._pending_unregisters = {}
         mgr._cleared_plans = set()
         mgr._stale_plans = []
         mgr._engine_poll_failing_since = {}
@@ -3068,6 +3072,105 @@ class TestRaidenChunkedResharding(CustomTestCase):
                 self.assertEqual(self._sent(mgr, MessageTag.RESHARD_READY), [])
                 mgr._engine.unregister_active_plan.assert_called_once_with(chunk_uuid)
                 mgr._swa_engine.unregister_active_plan.assert_called_once_with(room)
+
+    def test_failed_reshard_cancel_retries_unregister_once_settled(self):
+        """When in-flight cancel fails on a reshard receive plan, repeated polls do
+        not retry-spam while unsettled, and settlement retries unregister once."""
+        timed_out = dict(code="DEADLINE_EXCEEDED", reason="timed out")
+        with self.subTest("abort_settles_before_clear"):
+            mgr, uuid = self._decode_with_chunk_plan()
+            recv = self._receiver(mgr)
+            mgr._engine.unregister_active_plan = Mock(
+                side_effect=[RuntimeError("transport wedged"), None]
+            )
+            with (
+                patch.object(RaidenKVReceiver, "_send_abort_notification"),
+                patch.object(raiden_logger, "warning") as log_warn,
+            ):
+                recv.abort()
+                self.assertEqual(mgr._pending_unregisters, {"41#0": uuid})
+                self.assertNotIn("41#0", mgr._cancelled_recvs)
+                self.assertEqual(recv.poll(), KVPoll.Transferring)
+                log_warn.assert_called_once()
+                mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
+                mgr._engine.poll_stats_with_details = Mock(
+                    return_value=_polled(failed=["41#0"], details={"41#0": timed_out})
+                )
+                self.assertEqual(recv.poll(), KVPoll.Failed)
+            mgr.clear_room(self.ROOM)
+            self.assertEqual(
+                mgr._engine.unregister_active_plan.call_args_list,
+                [call(uuid), call(uuid)],
+            )
+            self.assertEqual(mgr._pending_unregisters, {})
+            self.assertEqual(mgr._cleared_plans, set())
+            self.assertEqual(mgr._cancelled_recvs, set())
+
+        for abort_first in (False, True):
+            mode = (
+                "abort_then_clear_before_settle"
+                if abort_first
+                else "clear_before_settle"
+            )
+            with self.subTest(mode=mode):
+                mgr, uuid = self._decode_with_chunk_plan()
+                recv = self._receiver(mgr)
+                mgr._engine.unregister_active_plan = Mock(
+                    side_effect=[RuntimeError("transport wedged"), None]
+                )
+                with (
+                    patch.object(RaidenKVReceiver, "_send_abort_notification"),
+                    patch.object(raiden_logger, "warning") as log_warn,
+                ):
+                    if abort_first:
+                        recv.abort()
+                    mgr.clear_room(self.ROOM)
+                log_warn.assert_called_once()
+                self.assertEqual(mgr._cleared_plans, {"41#0"})
+                self.assertEqual(mgr._pending_unregisters, {"41#0": uuid})
+                self.assertNotIn("41#0", mgr._cancelled_recvs)
+                mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
+                mgr._engine.poll_stats_with_details = Mock(
+                    return_value=_polled([], ["41#0"], [])
+                )
+                mgr._drain_engine()
+                self.assertEqual(
+                    mgr._engine.unregister_active_plan.call_args_list,
+                    [call(uuid), call(uuid)],
+                )
+                self.assertEqual(mgr._pending_unregisters, {})
+                self.assertEqual(mgr._cleared_plans, set())
+                self.assertEqual(mgr._cancelled_recvs, set())
+
+        with self.subTest("settled_during_unlocked_failed_cancel"):
+            mgr, uuid = self._decode_with_chunk_plan()
+            calls = 0
+
+            def fail_after_concurrent_settle(_uuid):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    mgr._engine.poll_stats_with_details = Mock(
+                        return_value=_polled([], ["41#0"], [])
+                    )
+                    mgr._drain_engine()
+                    mgr._engine.poll_stats_with_details = Mock(return_value=_polled())
+                    raise RuntimeError("transport wedged")
+
+            mgr._engine.unregister_active_plan = Mock(
+                side_effect=fail_after_concurrent_settle
+            )
+            with patch.object(raiden_logger, "warning") as log_warn:
+                mgr.clear_room(self.ROOM)
+            log_warn.assert_called_once()
+            self.assertEqual(
+                mgr._engine.unregister_active_plan.call_args_list,
+                [call(uuid), call(uuid)],
+            )
+            self.assertEqual(mgr._pending_unregisters, {})
+            self.assertEqual(mgr._cleared_plans, set())
+            self.assertEqual(mgr._cancelled_recvs, set())
+            self.assertEqual(mgr._completed_recv, set())
 
 
 class _FakeFuture:
