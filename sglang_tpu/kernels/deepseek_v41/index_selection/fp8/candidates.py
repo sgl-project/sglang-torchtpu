@@ -629,6 +629,63 @@ def _rotate_rows_left(values: jax.Array, shift: jax.Array) -> jax.Array:
     return lax.sort((key, values), dimension=1, num_keys=1)[1]
 
 
+def _query_owner_bits(
+    union: jax.Array, candidates: jax.Array, blocks: int
+) -> jax.Array:
+    """Bit q of ``out[r, i]`` is set iff query q of row r lists ``union[r, i]``.
+
+    Args:
+        union: [rows, slots] ascending unique IDs in [0, blocks), -1 padded at
+            the end of each row (padding gets no bits).
+        candidates: [rows, queries, per_query] logical block IDs; duplicates,
+            negatives and IDs >= blocks are allowed (they never match).
+        blocks: Upper bound of valid IDs.
+
+    Comparing every union slot with every candidate is [rows, slots, per_query]
+    work per query (~17e9 compares at prefill sizes). Instead, two queries at
+    a time are merged with the union in one sort; matches become neighbours:
+
+        key = (id + 1) << 2 | tag,  tag 0 = query A, 1 = union, 2 = query B
+
+    For each ID the sorted row reads [A copies..., union, B copies...]. Union
+    IDs are unique, so a union slot is in A iff its left neighbour has the
+    same ID, and in B iff its right neighbour does. Neighbours are shifted
+    slices, not gathers. A second single-operand sort, keyed by
+    ``(id + 1) << 2 | bits`` for union slots and int32 max for query slots,
+    moves the bits back into union order: union IDs are ascending, so sorting
+    by ID restores their slot order. Both sorts are O(n log n) on the
+    TensorCore; row gathers (take_along_axis, searchsorted) lower to slow
+    SparseCore offloads at these sizes.
+    """
+    rows, queries, _ = candidates.shape
+    if blocks + 2 > 1 << 29:
+        raise ValueError(f"{blocks} blocks overflow the packed int32 sort key")
+    # Union padding sorts last as ID `blocks`; out-of-range candidates are
+    # clamped to -1 / `blocks`, which no valid union ID equals.
+    union_ids = jnp.where(union >= 0, union, blocks)
+    owners = jnp.zeros_like(union)
+    for first in range(0, queries, 2):
+        members = candidates[:, first : first + 2]
+        parts = [jnp.clip(members[:, 0], -1, blocks) + 1 << 2]
+        parts.append(union_ids + 1 << 2 | 1)
+        if members.shape[1] == 2:
+            parts.append(jnp.clip(members[:, 1], -1, blocks) + 1 << 2 | 2)
+        merged = lax.sort(jnp.concatenate(parts, axis=1), dimension=1)
+        ids = merged >> 2
+        same = ids[:, 1:] == ids[:, :-1]
+        no = jnp.zeros((rows, 1), jnp.bool_)
+        in_first = jnp.concatenate((no, same), axis=1)
+        in_second = jnp.concatenate((same, no), axis=1)
+        bits = in_first.astype(jnp.int32) | in_second.astype(jnp.int32) << 1
+        bits = jnp.where(ids <= blocks, bits, 0)  # union padding owns nothing.
+        restore = jnp.where(
+            (merged & 3) == 1, merged & ~3 | bits, jnp.iinfo(jnp.int32).max
+        )
+        restored = lax.sort(restore, dimension=1)[:, : union.shape[1]]
+        owners = owners | (restored & 3) << first
+    return jnp.where(union >= 0, owners, 0)
+
+
 def _canonical_candidate_blocks_ref(
     candidates, table, block, width, cache_pages, page_size
 ):
@@ -665,14 +722,7 @@ def _canonical_candidate_blocks_ref(
         page_size=page_size,
     )
     # Pack per-query ownership: bit q set when query q lists the union block.
-    owners = jnp.zeros_like(candidate_block_ids)
-    for query in range(queries):
-        present = (
-            (candidate_block_ids[:, :, None] == candidates[:, query, None, :])
-            & (candidates[:, query, None, :] >= 0)
-        ).any(axis=-1)
-        owners = owners | (present.astype(jnp.int32) << query)
-    owners = jnp.where(candidate_block_ids >= 0, owners, 0)
+    owners = _query_owner_bits(candidate_block_ids, candidates, blocks)
     category = jnp.where(
         owners == 1, 0, jnp.where(owners == 3, 1, jnp.where(owners == 2, 2, 3))
     )
