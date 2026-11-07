@@ -769,7 +769,11 @@ class MuseMegakernel(torch.nn.Module):
                     )
                 )
                 plans.append((c_vy, b_vy, _TILED_DEPTH_RING_PREFERENCE, vy != vys[-1]))
-            if cfg.tiled_vmem_y >= 1 and cfg.alias_oag_f:
+            if (
+                cfg.tiled_vmem_y >= 1
+                and cfg.alias_oag_f
+                and not _dev_int("SGLANG_TPU_MUSE_MK_DEV_NO_YSEND_PLAN", 0)
+            ):
                 plans.append(
                     (
                         msgspec.structs.replace(
