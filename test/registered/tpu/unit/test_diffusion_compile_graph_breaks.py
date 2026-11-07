@@ -3,7 +3,9 @@ recompile tests."""
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit", chips=1)
+# Whole node, not chips=1: the parallel-state setup runs the TPU worker
+# bootstrap, which opens a chip outside the chip-parallel TPU_VISIBLE_CHIPS pin.
+register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit")
 
 import unittest
 from unittest.mock import patch
