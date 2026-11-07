@@ -265,7 +265,7 @@ class TestSchedulerHooks(CustomTestCase):
         self.releaser.release(mm_inputs)
         scheduler = SimpleNamespace(
             scheduler_stage_metrics=None,
-            maybe_send_health_check_signal=MagicMock(side_effect=_Stop),
+            admit_deferred_health_probes=MagicMock(side_effect=_Stop),
         )
 
         with self.assertRaises(_Stop):
