@@ -325,18 +325,20 @@ class GlmFlashMegakernel:
         zeros = lambda *shape, dtype=torch.int64: torch.zeros(
             shape, dtype=dtype, device=device
         )
+        # Dynamo guards grad mode: trace as the verify path calls it (no_grad).
         for n in range(1, self.call_req + 1):
-            warmup_compiled_op(
-                _step_inputs_op,
-                zeros(n * Q),
-                zeros(n * Q),
-                zeros(n * self.pages_per_seq, dtype=torch.int32),
-                zeros(n),
-                q=Q,
-                bucket=self._bucket(n),
-                pages_per_seq=self.pages_per_seq,
-                **self._step_input_tables(),
-            )
+            with torch.no_grad():
+                warmup_compiled_op(
+                    _step_inputs_op,
+                    zeros(n * Q),
+                    zeros(n * Q),
+                    zeros(n * self.pages_per_seq, dtype=torch.int32),
+                    zeros(n),
+                    q=Q,
+                    bucket=self._bucket(n),
+                    pages_per_seq=self.pages_per_seq,
+                    **self._step_input_tables(),
+                )
 
     def _step_inputs(
         self, input_ids, positions, forward_batch, b0: int, n: int, bucket: int
@@ -347,16 +349,17 @@ class GlmFlashMegakernel:
         r0, r1 = b0 * Q, (b0 + n) * Q
         # Views at offset 0 for the first call; later calls of a split batch clone.
         tab = self._full.forward_metadata.page_indices[b0 * pps : (b0 + n) * pps]
-        tok, pos, tab, srow, ckrow = _step_inputs_op(
-            input_ids[r0:r1],
-            positions[r0:r1],
-            tab,
-            forward_batch.req_pool_indices[b0 : b0 + n],
-            q=Q,
-            bucket=bucket,
-            pages_per_seq=pps,
-            **self._step_input_tables(),
-        )
+        with torch.no_grad():
+            tok, pos, tab, srow, ckrow = _step_inputs_op(
+                input_ids[r0:r1],
+                positions[r0:r1],
+                tab,
+                forward_batch.req_pool_indices[b0 : b0 + n],
+                q=Q,
+                bucket=bucket,
+                pages_per_seq=pps,
+                **self._step_input_tables(),
+            )
         assert ckrow.shape[0] == rows, (ckrow.shape, rows)
         return (
             tok,
