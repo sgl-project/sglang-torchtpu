@@ -31,28 +31,25 @@ def _step_inputs_op(
     input_ids: torch.Tensor,
     positions: torch.Tensor,
     page_indices: torch.Tensor,
-    req_pool_indices: torch.Tensor,
+    req_rows: torch.Tensor,
     slot_map: torch.Tensor,
     v2p: torch.Tensor | None,
     read_offsets: torch.Tensor | None,
     *,
     q: int,
-    b0: int,
-    n: int,
     bucket: int,
     pages_per_seq: int,
     window_start: int,
     checkpoint_width: int,
 ):
-    """The kernel's int32 SMEM inputs for requests [b0, b0 + n), padded to
-    `bucket` requests: one program instead of ~15 eager launches per call."""
+    """The kernel's int32 SMEM inputs for one call's n requests (inputs already
+    sliced to those rows), padded to `bucket` requests: one program instead of
+    ~15 eager launches per call. Shapes depend on n only."""
+    n = req_rows.shape[0]
     rows = bucket * q
-    r0, r1 = b0 * q, (b0 + n) * q
-    tok = _pad(input_ids[r0:r1].to(torch.int32), rows)
-    pos = _pad(positions[r0:r1].to(torch.int32).reshape(n, q)[:, 0], bucket)
-    tab = page_indices.reshape(-1, pages_per_seq)[b0 : b0 + n].reshape(-1)
-    tab = _pad(tab.to(torch.int32), bucket * pages_per_seq)
-    req_rows = req_pool_indices[b0 : b0 + n]
+    tok = _pad(input_ids.to(torch.int32), rows)
+    pos = _pad(positions.to(torch.int32).reshape(n, q)[:, 0], bucket)
+    tab = _pad(page_indices.to(torch.int32), bucket * pages_per_seq)
     slots = slot_map[req_rows]
     if v2p is not None:
         slots = v2p[slots]
@@ -322,48 +319,42 @@ class GlmFlashMegakernel:
         )
 
     def _warmup_step_inputs(self, device) -> None:
-        """Compile the input program for every (padded batch, call) shape serving can
-        produce; the Dynamo tracer refuses to recompile at serving time."""
-        from sglang.srt.runtime_context import get_exec
-
+        """Compile the input program for every call size; the Dynamo tracer refuses
+        to recompile at serving time, and the inputs are sliced so only n matters."""
         Q = self.Q
-        padded = get_exec().graph.tpu_compile_bs or _buckets(self.max_req)
-        padded = sorted({min(int(b), self.max_req) for b in padded if b >= 1})
         zeros = lambda *shape, dtype=torch.int64: torch.zeros(
             shape, dtype=dtype, device=device
         )
-        for pbs in padded:
-            for b0, n in self._calls(pbs):
-                bucket = self._bucket(n)
-                warmup_compiled_op(
-                    _step_inputs_op,
-                    zeros(pbs * Q),
-                    zeros(pbs * Q),
-                    zeros(pbs * self.pages_per_seq, dtype=torch.int32),
-                    zeros(pbs),
-                    q=Q,
-                    b0=b0,
-                    n=n,
-                    bucket=bucket,
-                    pages_per_seq=self.pages_per_seq,
-                    **self._step_input_tables(),
-                )
+        for n in range(1, self.call_req + 1):
+            warmup_compiled_op(
+                _step_inputs_op,
+                zeros(n * Q),
+                zeros(n * Q),
+                zeros(n * self.pages_per_seq, dtype=torch.int32),
+                zeros(n),
+                q=Q,
+                bucket=self._bucket(n),
+                pages_per_seq=self.pages_per_seq,
+                **self._step_input_tables(),
+            )
 
     def _step_inputs(
         self, input_ids, positions, forward_batch, b0: int, n: int, bucket: int
     ):
         """The kernel's SMEM inputs for requests [b0, b0 + n), padded to `bucket` requests."""
-        rows = bucket * self.Q
+        Q, pps = self.Q, self.pages_per_seq
+        rows = bucket * Q
+        r0, r1 = b0 * Q, (b0 + n) * Q
+        # Views at offset 0 for the first call; later calls of a split batch clone.
+        tab = self._full.forward_metadata.page_indices[b0 * pps : (b0 + n) * pps]
         tok, pos, tab, srow, ckrow = _step_inputs_op(
-            input_ids,
-            positions,
-            self._full.forward_metadata.page_indices,
-            forward_batch.req_pool_indices,
-            q=self.Q,
-            b0=b0,
-            n=n,
+            input_ids[r0:r1],
+            positions[r0:r1],
+            tab,
+            forward_batch.req_pool_indices[b0 : b0 + n],
+            q=Q,
             bucket=bucket,
-            pages_per_seq=self.pages_per_seq,
+            pages_per_seq=pps,
             **self._step_input_tables(),
         )
         assert ckrow.shape[0] == rows, (ckrow.shape, rows)
