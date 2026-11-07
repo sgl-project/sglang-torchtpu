@@ -122,6 +122,21 @@ class TestSeedHistory(CustomTestCase):
                 f"row {i}",
             )
 
+    def test_out_of_vocab_history_tokens_are_skipped(self):
+        # A multimodal prompt can end with a pad value (MM_PAD_SHIFT_VALUE +
+        # hash, above the vocabulary), and a retracted request seeds it first.
+        # The vocabulary penalizers skip it and any other id outside
+        # [0, VOCAB) (no IndexError); min_new_tokens still counts every
+        # history token as one decode step.
+        req = _req(1.2, 0.4, 0.3, 8)
+        pad = 1_000_000 + 12345
+        for hist in ([pad, 4, 9, 4], [pad], [-1, 4, VOCAB, 9]):
+            orch = self._orch([req])
+            orch.seed_history([0], [hist])
+            want = self._reference(req, [t for t in hist if 0 <= t < VOCAB])
+            want["len_output_tokens"] = torch.tensor([len(hist)], dtype=torch.int32)
+            self._assert_rows_equal(self._row(orch, 0), want, f"history {hist}")
+
     def test_unprepared_penalizers_are_skipped(self):
         # no penalty set: nothing is prepared and seeding is a no-op
         orch = self._orch([_req(1.0, 0.0, 0.0, 0)])

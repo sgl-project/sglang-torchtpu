@@ -83,7 +83,8 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         self.len_output_tokens += 1
 
     def _seed_history(self, rows: list, tokens: list):
-        # One count per cumulated token.
+        # One count per cumulated token, in the vocabulary or not: each one is
+        # a decode step (see _vocab_tokens).
         device = self.orchestrator.device
         for row, toks in zip(rows, tokens):
             index = torch.tensor([row], dtype=torch.int64, device=device)
