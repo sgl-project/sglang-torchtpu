@@ -216,12 +216,23 @@ def _param(shape: tuple[int, ...], dtype: torch.dtype) -> nn.Parameter:
     return nn.Parameter(torch.empty(shape, dtype=dtype), requires_grad=False)
 
 
+def _after(x: torch.Tensor, *tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """(x, *tensors) through an XLA optimization barrier: ops on the returned tensors run after
+    x is computed. Weight dequantization does not depend on activations, so without this XLA
+    may hoist every layer's dequantized weights to the program start and keep them live at once
+    (r5: 192 GB of temporaries against 94.7 GB of HBM)."""
+    if x.device.type != "tpu":
+        return (x, *tensors)
+    return tuple(torch.ops.tpu._optimization_barrier([x, *tensors]))
+
+
 def linear(
     x: torch.Tensor, weight: torch.Tensor, scale: Optional[torch.Tensor]
 ) -> torch.Tensor:
     """reference linear(): fp8 weights take an fp8 activation, anything else is a plain matmul."""
     if weight.dtype == torch.float8_e4m3fn:
         q, s = act_quant(x, FP8_BLOCK, SCALE_FMT, torch.float32)
+        q, s, weight, scale = _after(q, s, weight, scale)
         return fp8_gemm(q, s, weight, scale, torch.float32, block_size=FP8_BLOCK)
     return F.linear(x, weight)
 
@@ -849,17 +860,23 @@ class MoE(nn.Module):
         w = torch.where(routed.gather(0, idx), token_weight.gather(0, idx), 0.0).t()
         idx = idx.t()
         xs = x[idx]  # [E, C, dim]
-        gate = grouped_gemm(
-            xs, self.experts_w1, self.experts_w1_scale, FP8_BLOCK
-        ).float()
-        up = grouped_gemm(xs, self.experts_w3, self.experts_w3_scale, FP8_BLOCK).float()
+        # Dequantize this layer's expert stacks only once its tokens are ready (see _after);
+        # w2 waits for the activations, so at most two stacks are live.
+        xs, w1, w1_s, w3, w3_s = _after(
+            xs,
+            self.experts_w1,
+            self.experts_w1_scale,
+            self.experts_w3,
+            self.experts_w3_scale,
+        )
+        gate = grouped_gemm(xs, w1, w1_s, FP8_BLOCK).float()
+        up = grouped_gemm(xs, w3, w3_s, FP8_BLOCK).float()
         if self.swiglu_limit > 0:
             up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
             gate = torch.clamp(gate, max=self.swiglu_limit)
-        h = w.unsqueeze(-1) * (F.silu(gate) * up)
-        out = grouped_gemm(
-            h.to(x.dtype), self.experts_w2, self.experts_w2_scale, FP8_BLOCK
-        )
+        h = (w.unsqueeze(-1) * (F.silu(gate) * up)).to(x.dtype)
+        h, w2, w2_s = _after(h, self.experts_w2, self.experts_w2_scale)
+        out = grouped_gemm(h, w2, w2_s, FP8_BLOCK)
         y = torch.zeros_like(x, dtype=torch.float32)
         return y.index_add(0, idx.flatten(), out.flatten(0, 1).float())
 
