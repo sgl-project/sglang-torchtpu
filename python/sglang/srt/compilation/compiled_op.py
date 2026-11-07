@@ -102,6 +102,7 @@ def compiled_op(
         compiled_fn = None
         use_direct = False
         signature = inspect.signature(fn)
+        n_params = len(signature.parameters)
         op_name = (
             fn._qualname
             if isinstance(fn, torch.library.CustomOpDef)
@@ -120,9 +121,18 @@ def compiled_op(
             if queue is not None and queue.verify and not spmd_safe:
                 return None
             # Positional warmups and keyword callers share a specialization.
-            bound = signature.bind(*args, **kwargs)
-            bound.apply_defaults()
-            args, kwargs = tree_map(_canonical_tensor, (bound.args, bound.kwargs))
+            if kwargs or len(args) != n_params:
+                bound = signature.bind(*args, **kwargs)
+                bound.apply_defaults()
+                args, kwargs = bound.args, bound.kwargs
+            # Flat tensor arguments skip the pytree walk (per-call host cost).
+            args = tuple(_canonical_tensor(a) for a in args)
+            if kwargs:
+                kwargs = {k: _canonical_tensor(v) for k, v in kwargs.items()}
+            if any(isinstance(a, (list, tuple, dict)) for a in args) or any(
+                isinstance(v, (list, tuple, dict)) for v in kwargs.values()
+            ):
+                args, kwargs = tree_map(_canonical_tensor, (args, kwargs))
             if compiled_fn is None:
                 use_direct = get_exec().graph.tpu_compile_tracer == "direct"
                 if use_direct:
