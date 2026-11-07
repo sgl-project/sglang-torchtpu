@@ -134,6 +134,10 @@ class TpuEnvs:
     # of MB.
     SGLANG_TPU_ENABLE_PROFILE_AUTO = EnvBool(False)
     SGLANG_TPU_PROFILE_AUTO_STEPS = EnvInt(5)
+    # Custom and advanced TPU profiler options as "key:value;key:value": tracer
+    # levels (e.g. "host_tracer_level:3") and libtpu experimental options (e.g.
+    # "tpu_trace_mode:TRACE_COMPUTE;tpu_perf_counters:true").
+    SGLANG_TPU_PROFILE_OPTIONS = EnvStr("")
     # Kimi-K3: run attention-residual aggregation for decode-sized batches as
     # one Pallas kernel (pending add + mix + out norm) instead of the torch
     # reference (see kimi_attn_residual.py and hooks/attn_residual.py). Not

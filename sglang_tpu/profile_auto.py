@@ -33,6 +33,7 @@ from sglang.srt.managers.scheduler_components.profiler_manager import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_disagg
+from sglang_tpu import profiler as tpu_profiler
 from sglang_tpu._logging import get_logger
 from sglang_tpu.envs import envs as tpu_envs
 
@@ -96,6 +97,11 @@ def _arm(manager: SchedulerProfilerManager) -> None:
         raise ValueError(
             f"SGLANG_TPU_PROFILE_AUTO_STEPS must be at least 1, got {steps}"
         )
+
+    # Fail fast on malformed SGLANG_TPU_PROFILE_OPTIONS at launch rather than
+    # logging a warning and finishing the run with missing traces.
+    if tpu_envs.SGLANG_TPU_PROFILE_OPTIONS.get():
+        tpu_profiler.resolve_tpu_profile_options()
 
     stages = _STAGES_BY_PD_ROLE.get(get_disagg().disaggregation_mode, _ALL_STAGES)
     result = manager._init_profile(

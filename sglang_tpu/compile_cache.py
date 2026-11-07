@@ -95,6 +95,7 @@ _ENV_FIELDS_NOT_KEYED = frozenset(
         # Profiler scope.
         "SGLANG_TPU_PROFILE_NUM_CHIPS",
         "SGLANG_TPU_PROFILE_NUM_SPARSE_CORES",
+        "SGLANG_TPU_PROFILE_OPTIONS",
         "SGLANG_TPU_PROFILE_PYTHON_TRACER",
         # KV transfer timeout.
         "SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S",

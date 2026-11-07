@@ -1,118 +1,348 @@
-"""TPU xprof profiler."""
+"""TPU profiler on the native torch.profiler API.
+
+TPU device activity reaches torch.profiler through torch_tpu's Kineto plugin,
+which registers with PyTorch's PrivateUse1ProfilerRegistry. One
+``torch.profiler.profile`` records both the Kineto CPU trace and the TPU
+xplane. torch_tpu's ``TpuProfilerConfig``, passed as ``experimental_config``,
+carries the TPU options: tracer levels and experimental (libtpu) options.
+
+Options come from, lowest to highest precedence:
+
+1. Built-in defaults and the SGLANG_TPU_PROFILE_PYTHON_TRACER,
+   SGLANG_TPU_PROFILE_NUM_CHIPS and SGLANG_TPU_PROFILE_NUM_SPARSE_CORES env
+   vars.
+2. SGLANG_TPU_PROFILE_OPTIONS, a ``key:value;key:value`` string.
+3. A /start_profile ``profile_prefix`` in the same ``key:value;...`` form.
+4. A /start_profile ``profiler_kwargs`` dictionary (highest precedence; see
+   :func:`resolve_tpu_profile_options`).
+
+``host_tracer_level``, ``device_tracer_level``, ``python_tracer_level`` and
+``check_experimental_options`` are TpuProfilerConfig arguments. Any other key
+(for example ``tpu_trace_mode:TRACE_COMPUTE`` or ``tpu_perf_counters:true``)
+is passed to libtpu as an experimental option. For the chip / SparseCore
+narrowing options (``tpu_num_chips_to_profile_per_task``,
+``tpu_num_sparse_cores_to_trace``, ``tpu_num_sparse_core_tiles_to_trace``) a
+value <= 0 means trace all, and drops the option.
+"""
 
 from __future__ import annotations
 
-import dataclasses
+import contextlib
+import contextvars
+import os
+import re
 from pathlib import Path
+from typing import Any
 
 import msgspec
 
 from sglang_tpu._logging import get_logger
-from sglang_tpu.envs import envs
+from sglang_tpu.envs import envs as tpu_envs
 
 logger = get_logger(__name__)
 
+# Option keys that are TpuProfilerConfig arguments. Every other key goes to
+# experimental_options.
+_LEVEL_KEYS = ("host_tracer_level", "device_tracer_level", "python_tracer_level")
+_CHECK_KEY = "check_experimental_options"
+# Experimental options that narrow what is traced. A value <= 0 means trace
+# all, and removes the option.
+_NUM_CHIPS_KEY = "tpu_num_chips_to_profile_per_task"
+_NUM_SPARSE_CORES_KEY = "tpu_num_sparse_cores_to_trace"
+_NUM_SPARSE_CORE_TILES_KEY = "tpu_num_sparse_core_tiles_to_trace"
+_NARROWING_KEYS = (_NUM_CHIPS_KEY, _NUM_SPARSE_CORES_KEY, _NUM_SPARSE_CORE_TILES_KEY)
+# Set by SGLang for every capture, so not user options.
+_RESERVED_KEYS = frozenset({"run_dir", "worker_rank"})
+_KEY_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+_OPTION_PATTERN = re.compile(r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*(.+)$")
+_ALLOWED_VALUE_CHARS = re.compile(r"^[a-zA-Z0-9_./,:\-\s]*$")
 
-def start_tpu_profile(*, output_dir: Path, with_cpu: bool = True) -> _TpuTrace:
-    """Start an xprof capture writing to ``output_dir``.
 
-    Returns a handle. Pass it to :func:`stop_tpu_profile` to end the session.
-    ``with_cpu`` selects the host plane.
+class TpuProfileOptions(msgspec.Struct, frozen=True):
+    """TPU options for one capture. See the module docstring."""
 
-    Goes through _impl.start_trace rather than torch_tpu's own profile()
-    context manager: profile() takes no options argument, so narrowing a
-    capture to a few chips means patching the module that was renamed
-    profiler_api -> _api between the 0817 and 0913 pins, while _impl.py was
-    byte-identical across both.
+    # None: 2 when CPU activity is captured, 0 (TPU-only) otherwise.
+    host_tracer_level: int | None = None
+    device_tracer_level: int = 1
+    python_tracer_level: int = 0
+    check_experimental_options: bool = True
+    experimental_options: dict[str, int | bool | str] = msgspec.field(
+        default_factory=dict
+    )
+
+
+_SCOPED_OPTIONS: contextvars.ContextVar[TpuProfileOptions | None] = (
+    contextvars.ContextVar("tpu_scoped_profile_options", default=None)
+)
+
+
+@contextlib.contextmanager
+def scoped_profile_options(options: TpuProfileOptions | None):
+    """Bind default ``TpuProfileOptions`` for :func:`start_tpu_profile` within a block."""
+    token = _SCOPED_OPTIONS.set(options)
+    try:
+        yield
+    finally:
+        _SCOPED_OPTIONS.reset(token)
+
+
+def resolve_tpu_profile_options(
+    profile_prefix: str | None = None,
+    profiler_kwargs: dict[str, Any] | None = None,
+) -> tuple[str | None, TpuProfileOptions]:
+    """Resolve a /start_profile ``profile_prefix`` and ``profiler_kwargs``.
+
+    A ``profile_prefix`` containing ``:`` or ``;`` is parsed as an options
+    string, e.g. ``"host_tracer_level:0;tpu_trace_mode:TRACE_COMPUTE"``, and
+    the returned name is None. Any other prefix is returned as the name.
+    ``profiler_kwargs`` (when provided) takes highest precedence over both
+    ``SGLANG_TPU_PROFILE_OPTIONS`` and ``profile_prefix``. Raises ValueError
+    for malformed options.
     """
-    # start_trace/stop_trace live in _impl; the package root re-exports only
-    # profile, xprof_trace_handler and the remote-capture server.
-    from torch_tpu._internal.profiler import _impl as tpu_profiler
+    values = _default_option_values()
+    env_options = tpu_envs.SGLANG_TPU_PROFILE_OPTIONS.get()
+    if env_options:
+        values.update(_parse_options(env_options, "SGLANG_TPU_PROFILE_OPTIONS"))
+    name = profile_prefix or None
+    if profile_prefix and (":" in profile_prefix or ";" in profile_prefix):
+        values.update(_parse_options(profile_prefix, "profile_prefix"))
+        name = None
+    if profiler_kwargs is not None:
+        values.update(_parse_kwargs(profiler_kwargs, "profiler_kwargs"))
+    # With a single SparseCore, also trace a single tile in it unless told
+    # otherwise: fewer trace events, so more steps fit before the trace drops
+    # events.
+    num_sparse_cores = values.get(_NUM_SPARSE_CORES_KEY)
+    if num_sparse_cores == 1 and not isinstance(num_sparse_cores, bool):
+        values.setdefault(_NUM_SPARSE_CORE_TILES_KEY, 1)
+    return name, _options_from_values(values)
+
+
+def start_tpu_profile(
+    *,
+    output_dir: Path,
+    with_cpu: bool = True,
+    options: TpuProfileOptions | None = None,
+) -> _TpuTrace:
+    """Start a torch.profiler capture with TPU device activity.
+
+    Returns a handle. Pass it to :func:`stop_tpu_profile` to end the capture.
+    ``with_cpu`` adds ProfilerActivity.CPU. ``options`` defaults to
+    ``resolve_tpu_profile_options(None)[1]``. The Kineto trace
+    (``*.pt.trace.json.gz``) is written to ``output_dir``.
+
+    Raises RuntimeError if torch_tpu's profiler API is missing, and ValueError
+    for bad options.
+    """
+    import torch
+
+    if "," in os.fspath(output_dir):
+        raise ValueError(
+            f"output_dir cannot contain ',' for TpuProfilerConfig: {output_dir!r}"
+        )
+    if options is None:
+        options = _SCOPED_OPTIONS.get()
+    if options is None:
+        options = resolve_tpu_profile_options(None)[1]
+    activities = [_tpu_profiler_activity()]
+    if with_cpu:
+        activities.insert(0, torch.profiler.ProfilerActivity.CPU)
+
+    host_tracer_level = options.host_tracer_level
+    if host_tracer_level is None:
+        host_tracer_level = 2 if with_cpu else 0
+    config = _tpu_profiler_config_cls()(
+        host_tracer_level=host_tracer_level,
+        device_tracer_level=options.device_tracer_level,
+        python_tracer_level=options.python_tracer_level,
+        run_dir=output_dir,
+        experimental_options=dict(options.experimental_options) or None,
+        check_experimental_options=options.check_experimental_options,
+    )
+    logger.info(
+        "[TPU profiler] run_dir=%s host_tracer_level=%d device_tracer_level=%d "
+        "python_tracer_level=%d experimental_options=%s",
+        output_dir,
+        host_tracer_level,
+        options.device_tracer_level,
+        options.python_tracer_level,
+        options.experimental_options,
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    tpu_profiler.start_trace(str(output_dir), _tpu_profile_options(with_cpu=with_cpu))
-    return _TpuTrace(output_dir=output_dir)
+    profiler = torch.profiler.profile(
+        activities=activities,
+        # Adds Python stacks to the Kineto CPU trace whenever python_tracer_level > 0
+        # (seeded from SGLANG_TPU_PROFILE_PYTHON_TRACER unless overridden). Off by
+        # default: it dominates host busy time.
+        with_stack=options.python_tracer_level > 0,
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(
+            str(output_dir), use_gzip=True
+        ),
+        experimental_config=config,
+    )
+    profiler.start()
+    return _TpuTrace(output_dir=output_dir, profiler=profiler)
 
 
 def stop_tpu_profile(trace: _TpuTrace) -> None:
-    """Stop an xprof session started by :func:`start_tpu_profile`."""
-    del trace  # the session is process-global; only one may run at a time
-    from torch_tpu._internal.profiler import _impl as tpu_profiler
-
-    tpu_profiler.stop_trace()
+    """Stop a capture started by :func:`start_tpu_profile`."""
+    # The plugin synchronizes the TPU devices, then writes the xplane; the
+    # Kineto trace is exported by on_trace_ready.
+    trace.profiler.stop()
 
 
 class _TpuTrace(msgspec.Struct, frozen=True):
-    """Handle for an in-flight capture. torch_tpu keeps the session itself."""
+    """Handle for an in-flight capture."""
 
     output_dir: Path
+    profiler: Any
 
 
-def _tpu_profile_options(*, with_cpu: bool):
-    """Build libtpu trace options, or None to fall back to backend defaults."""
-    from torch_tpu._internal.profiler import _impl as tpu_profiler
-
-    # torch_tpu's profile() derives these from the activity list; start_trace
-    # does not, and an unset level takes the backend default (host 2, device 1,
-    # python 0). python_tracer_level is the expensive one -- profile() turns it
-    # on whenever CPU activity is requested.
-    levels = {
-        "device_tracer_level": 1,
-        "host_tracer_level": 2 if with_cpu else 0,
-        "python_tracer_level": 1 if envs.SGLANG_TPU_PROFILE_PYTHON_TRACER.get() else 0,
+def _default_option_values() -> dict[str, Any]:
+    return {
+        "python_tracer_level": int(tpu_envs.SGLANG_TPU_PROFILE_PYTHON_TRACER.get()),
+        _NUM_CHIPS_KEY: tpu_envs.SGLANG_TPU_PROFILE_NUM_CHIPS.get(),
+        _NUM_SPARSE_CORES_KEY: tpu_envs.SGLANG_TPU_PROFILE_NUM_SPARSE_CORES.get(),
     }
 
-    num_chips = envs.SGLANG_TPU_PROFILE_NUM_CHIPS.get()
-    num_sparse_cores = envs.SGLANG_TPU_PROFILE_NUM_SPARSE_CORES.get()
-    chip_limit = num_chips if num_chips > 0 else None
-    sparse_core_limit = num_sparse_cores if num_sparse_cores > 0 else None
-    # When tracing is narrowed to a single SparseCore, also narrow to a
-    # single tile within it to reduce the number of trace events to allow
-    # tracing more steps, otherwise we may run into dropping trace.
-    sparse_core_tile_limit = 1 if sparse_core_limit == 1 else None
 
+def _parse_options(text: str, source: str) -> dict[str, Any]:
+    """Parse ``key:value;key:value``. Values become bools, ints or strings."""
+    if not text.isascii():
+        raise ValueError(f"{source}: profiler options must be ASCII: {text!r}")
+    values: dict[str, Any] = {}
+    for part in text.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        match = _OPTION_PATTERN.match(part)
+        if not match:
+            raise ValueError(
+                f"{source}: invalid profiler option {part!r}; expected "
+                "'key:value' items separated by ';'."
+            )
+        key, value = match.group(1), match.group(2).strip()
+        if key in _RESERVED_KEYS:
+            raise ValueError(
+                f"{source}: SGLang sets {key!r} for every capture; it can't be "
+                "overridden."
+            )
+        values[key] = _parse_option_value(key, value, source)
+    return values
+
+
+def _parse_option_value(key: str, value: str, source: str) -> int | bool | str:
+    if value.lower() == "true":
+        return True
+    if value.lower() == "false":
+        return False
     try:
-        if not dataclasses.is_dataclass(tpu_profiler.ProfileOptions):
-            raise TypeError("ProfileOptions is no longer a dataclass")
-
-        options_cls, scope = tpu_profiler.ProfileOptions, {}
-        if chip_limit is not None or sparse_core_limit is not None:
-
-            @dataclasses.dataclass
-            class _ProfileOptions(tpu_profiler.ProfileOptions):
-                tpu_num_chips_to_profile_per_task: int | None = None
-                tpu_num_sparse_cores_to_trace: int | None = None
-                tpu_num_sparse_core_tiles_to_trace: int | None = None
-
-            options_cls = _ProfileOptions
-            scope = {
-                "tpu_num_chips_to_profile_per_task": chip_limit,
-                "tpu_num_sparse_cores_to_trace": sparse_core_limit,
-                "tpu_num_sparse_core_tiles_to_trace": sparse_core_tile_limit,
-            }
-        options = options_cls(**levels, **scope)
-    except (AttributeError, TypeError):
-        logger.warning(
-            "[TPU profiler] this torch_tpu does not expose the expected profile "
-            "options. Tracing at backend defaults (all chips/SparseCores)."
+        return int(value)
+    except ValueError:
+        pass
+    if not _ALLOWED_VALUE_CHARS.match(value):
+        raise ValueError(
+            f"{source}: invalid characters in value {value!r} of profiler "
+            f"option {key!r}."
         )
-        return None
+    return value
 
-    if chip_limit is None and sparse_core_limit is None:
-        return options
 
-    # The tile cap is only derived when tracing a single SparseCore; omit the
-    # clause otherwise so the log doesn't read "(all tile(s))" for a branch
-    # that was never entered.
-    tile_clause = (
-        f" ({sparse_core_tile_limit} tile(s))"
-        if sparse_core_tile_limit is not None
-        else ""
+def _parse_kwargs(kwargs: dict[str, Any], source: str) -> dict[str, Any]:
+    """Validate and normalize a ``profiler_kwargs`` dictionary."""
+    if not isinstance(kwargs, dict):
+        raise ValueError(
+            f"{source}: expected a dictionary of profiler options, "
+            f"got {type(kwargs).__name__}."
+        )
+    values: dict[str, Any] = {}
+    for key, value in kwargs.items():
+        if not isinstance(key, str) or not key.isascii() or not _KEY_PATTERN.match(key):
+            raise ValueError(f"{source}: invalid profiler option key {key!r}.")
+        if key in _RESERVED_KEYS:
+            raise ValueError(
+                f"{source}: SGLang sets {key!r} for every capture; it can't be "
+                "overridden."
+            )
+        if isinstance(value, (bool, int)):
+            values[key] = value
+        elif isinstance(value, str):
+            if not value.isascii():
+                raise ValueError(
+                    f"{source}: profiler option {key!r} value must be ASCII: {value!r}"
+                )
+            values[key] = _parse_option_value(key, value.strip(), source)
+        else:
+            raise ValueError(
+                f"{source}: profiler option {key!r} must be a bool, int, or str, "
+                f"got {type(value).__name__}."
+            )
+    return values
+
+
+def _options_from_values(values: dict[str, Any]) -> TpuProfileOptions:
+    values = dict(values)
+    levels = {}
+    for key in _LEVEL_KEYS:
+        if key not in values:
+            continue
+        level = values.pop(key)
+        if isinstance(level, bool) or not isinstance(level, int) or level < 0:
+            raise ValueError(
+                f"profiler option {key!r} must be a non-negative integer, "
+                f"got {level!r}."
+            )
+        levels[key] = level
+    check = values.pop(_CHECK_KEY, True)
+    if not isinstance(check, bool):
+        raise ValueError(f"profiler option {_CHECK_KEY!r} must be true or false.")
+    for key in _NARROWING_KEYS:
+        if key not in values:
+            continue
+        value = values[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"profiler option {key!r} must be an integer, got {value!r}."
+            )
+        # <= 0 traces all, like the env vars: drop the narrowing default.
+        if value <= 0:
+            del values[key]
+    return TpuProfileOptions(
+        **levels, check_experimental_options=check, experimental_options=values
     )
-    logger.info(
-        "[TPU profiler] limiting trace to %s chip(s), %s SparseCore(s)%s per task",
-        chip_limit or "all",
-        sparse_core_limit or "all",
-        tile_clause,
+
+
+def _tpu_profiler_activity():
+    import torch
+
+    # torch >= 2.12 + torch_tpu exposes ProfilerActivity.TPU (an alias of
+    # PrivateUse1); torch 2.11 uses ProfilerActivity.PrivateUse1 directly.
+    activities = torch.profiler.ProfilerActivity
+    activity = getattr(activities, "TPU", None) or getattr(
+        activities, "PrivateUse1", None
     )
-    return options
+    if activity is None:
+        raise RuntimeError(
+            "torch.profiler.ProfilerActivity.TPU / PrivateUse1 is not defined. "
+            "TPU profiling needs torch_tpu imported and torch >= 2.11."
+        )
+    return activity
+
+
+def _tpu_profiler_config_cls():
+    import torch
+
+    tpu_mod = getattr(torch, "tpu", None)
+    profiler_mod = getattr(tpu_mod, "profiler", None)
+    cls = getattr(profiler_mod, "TpuProfilerConfig", None)
+    if cls is not None:
+        return cls
+    try:
+        from torch_tpu._internal.profiler import TpuProfilerConfig
+    except ImportError as e:
+        raise RuntimeError(
+            "TpuProfilerConfig is not available via torch.tpu.profiler or "
+            "torch_tpu._internal.profiler. TPU profiling needs torch_tpu >= 0.2.0."
+        ) from e
+    return TpuProfilerConfig
