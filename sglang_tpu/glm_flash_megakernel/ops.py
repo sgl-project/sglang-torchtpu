@@ -322,23 +322,27 @@ class GlmFlashMegakernel:
         )
 
     def _warmup_step_inputs(self, device) -> None:
-        """Compile the input program for every call size; a cold compile at the
-        first request of a size would otherwise land inside serving."""
+        """Compile the input program for every (padded batch, call) shape serving can
+        produce; the Dynamo tracer refuses to recompile at serving time."""
+        from sglang.srt.runtime_context import get_exec
+
         Q = self.Q
-        for n in range(1, self.call_req + 1):
-            bucket = self._bucket(n)
-            zeros = lambda *shape, dtype=torch.int64: torch.zeros(
-                shape, dtype=dtype, device=device
-            )
-            for padded_bs in sorted({n, bucket}):
+        padded = get_exec().graph.tpu_compile_bs or _buckets(self.max_req)
+        padded = sorted({min(int(b), self.max_req) for b in padded if b >= 1})
+        zeros = lambda *shape, dtype=torch.int64: torch.zeros(
+            shape, dtype=dtype, device=device
+        )
+        for pbs in padded:
+            for b0, n in self._calls(pbs):
+                bucket = self._bucket(n)
                 warmup_compiled_op(
                     _step_inputs_op,
-                    zeros(n * Q),
-                    zeros(n * Q),
-                    zeros(padded_bs * self.pages_per_seq, dtype=torch.int32),
-                    zeros(n),
+                    zeros(pbs * Q),
+                    zeros(pbs * Q),
+                    zeros(pbs * self.pages_per_seq, dtype=torch.int32),
+                    zeros(pbs),
                     q=Q,
-                    b0=0,
+                    b0=b0,
                     n=n,
                     bucket=bucket,
                     pages_per_seq=self.pages_per_seq,
