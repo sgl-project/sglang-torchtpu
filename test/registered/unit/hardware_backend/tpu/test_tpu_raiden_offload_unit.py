@@ -570,6 +570,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
                 mgr.failure_lock = threading.Lock()
                 mgr.request_status = {}
                 mgr._state_lock = threading.Lock()
+                mgr._drain_lock = threading.Lock()
                 mgr._status_lock = threading.Lock()
                 mgr._announce_lock = threading.Lock()
                 mgr._read_leases = {}
@@ -624,6 +625,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr.request_status = {}
         mgr.kv_args = Mock(state_types=[StateType.SWA])
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
         mgr._read_leases = {}
@@ -678,6 +680,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._swa_engine = Mock()
@@ -719,6 +722,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr.attn_tp_rank = 0
         mgr.chunked_transfer = False
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._swa_engine = Mock()
         mgr._dynamic_host_staging = True
@@ -809,6 +813,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr.request_status = {}
         mgr.chunked_transfer = False
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._swa_engine = None
@@ -846,6 +851,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr.request_status = {}
         mgr.chunked_transfer = False
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._swa_engine = Mock() if swa_limit is not None else None
@@ -1154,6 +1160,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
         mgr._engine = Mock()
@@ -1242,6 +1249,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._engine.start_read = Mock(return_value=0)
@@ -1950,6 +1958,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr.request_status = {}
         mgr.chunked_transfer = True
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
         mgr._reshard_push_lock = threading.Lock()
@@ -2121,6 +2130,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr.request_status = {}
         mgr.chunked_transfer = True
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
         mgr._engine = Mock(transfer_address="10.0.0.2:31000")
@@ -2790,6 +2800,7 @@ class TestDecodeRadixPullRegistration(CustomTestCase):
         mgr._decode = None
         mgr.attn_tp_rank = 0
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
         mgr._aborted = {}
         mgr._send_reads = {}
@@ -2827,6 +2838,7 @@ class TestDecodeRadixPullRegistration(CustomTestCase):
         mgr._decode = DecodeState()
         mgr.chunked_transfer = False
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._aborted = {}
         mgr._send_reads = {}
