@@ -127,6 +127,9 @@ jobs:
     name: ${{ inputs.display_name || inputs.suite || inputs.run_name || 'test' }}
     runs-on: ubuntu-latest
     timeout-minutes: 360   # GitHub's hard cap for hosted runners; cannot be raised
+    env:
+      TPU_CI_JOB_NAME: ${{ inputs.display_name || inputs.suite || inputs.run_name || 'test' }}
+      TPU_CI_SUITE: ${{ inputs.suite }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -205,9 +208,40 @@ jobs:
 
           name="$(kubectl -n tpu-ci create -f /tmp/job.yaml -o name)"
           echo "Created ${name}"
-          trap 'kubectl -n tpu-ci delete '"${name}"' --ignore-not-found --wait=false' EXIT
           short="${name##*/}"
           sel="jobset.sigs.k8s.io/jobset-name=${short}"
+          wl_sel=""
+          # A cancelled step gets about 10s before the runner kills the process
+          # tree, so release the slice first and skip the telemetry below.
+          release_now() {
+            trap - EXIT INT TERM
+            kubectl --request-timeout=5s -n tpu-ci delete "$name" --ignore-not-found --wait=false || true
+            exit 143
+          }
+          trap release_now INT TERM
+          # Bash defers traps during foreground commands, but interrupts wait immediately.
+          interruptible() {
+            "$@" &
+            wait $!
+          }
+          cleanup() {
+            local result=$?
+            trap - EXIT
+            # Completed-fast and late-arriving pods may never join the live stream.
+            interruptible timeout 30s kubectl -n tpu-ci logs -l "$sel" -c test --prefix=true \
+              --tail=-1 --max-log-requests=10 --pod-running-timeout=5s \
+              >> "$RUNNER_TEMP/tpu-pod-logs.txt" 2>/dev/null || true
+            # Query lifecycle timestamps while the JobSet, Workload and pods still exist.
+            interruptible python3 .github/tpu-ci/ci_timing.py \
+              --jobset "$name" --pod-selector "$sel" --workload-selector "$wl_sel" \
+              --log "$RUNNER_TEMP/tpu-pod-logs.txt" \
+              --admission-file "$RUNNER_TEMP/tpu-admission.txt" \
+              --output "$RUNNER_TEMP/tpu-ci-timing.json" \
+              || echo "::warning::TPU timing collection failed"
+            kubectl -n tpu-ci delete "$name" --ignore-not-found --wait=false || true
+            exit "$result"
+          }
+          trap cleanup EXIT
 
           # No Workload means Kueue ignored this JobSet and it would run with no gang
           # admission -- silent, and on a multi-host slice it ends as two half-placed gangs
@@ -216,7 +250,7 @@ jobs:
           wl_sel="kueue.x-k8s.io/job-uid=${uid}"
           for _ in $(seq 1 15); do
             [ -n "$(kubectl -n tpu-ci get workloads -l "$wl_sel" -o name 2>/dev/null)" ] && break
-            sleep 2
+            interruptible sleep 2
           done
           if [ -z "$(kubectl -n tpu-ci get workloads -l "$wl_sel" -o name 2>/dev/null)" ]; then
             echo "❌ ${label}: no Kueue Workload for ${short} -- admission control is OFF."
@@ -306,16 +340,20 @@ jobs:
             # instead of reporting NOT ADMITTED with an expired kubeconfig.
             if pods="$(kubectl -n tpu-ci get pods -l "$sel" -o name 2>&1)"; then
               auth_fails=0
+              # Preserve first admission: eviction/re-admission can replace its transition.
+              interruptible python3 .github/tpu-ci/ci_timing.py \
+                --record-admission "$RUNNER_TEMP/tpu-admission.txt" \
+                --workload-selector "$wl_sel" || true
               [ -n "$pods" ] && break
             else
               auth_fails=$((auth_fails + 1))
               if [ "$auth_fails" -ge 3 ]; then
-                refresh_cluster_token || echo "credential refresh failed; will retry"
+                interruptible refresh_cluster_token || echo "credential refresh failed; will retry"
                 auth_fails=0
               fi
             fi
             if [ "$(date +%s)" -ge "$next_refresh" ]; then
-              if refresh_cluster_token; then
+              if interruptible refresh_cluster_token; then
                 next_refresh=$(( $(date +%s) + 2400 ))
               else
                 # The current token dies at the hour mark; retry well before
@@ -330,7 +368,7 @@ jobs:
               kubectl -n tpu-ci describe "$name" 2>/dev/null | tail -n 40 || true
               exit 1
             fi
-            sleep 10
+            interruptible sleep 10
           done
 
           # Admitted, but pods still bind and pull -- don't charge the pull to the test.
@@ -341,12 +379,12 @@ jobs:
               echo "⚠️  ${label}: no pod Running 900s after admission; continuing anyway"
               break
             fi
-            sleep 5
+            interruptible sleep 5
           done
           kubectl -n tpu-ci get pods -l "$sel" -o wide || true
 
           # The stream below can outlive the token it starts with; start it fresh.
-          refresh_cluster_token || echo "credential refresh failed; continuing with the current token"
+          interruptible refresh_cluster_token || echo "credential refresh failed; continuing with the current token"
 
           # Stream logs from every host, re-attaching on a drop while the JobSet is
           # live: the pod log is the only egress from a JobSet, results included.
@@ -358,28 +396,29 @@ jobs:
             { [ "$jok" = "True" ] || [ "$jbad" = "True" ]; } && break
             if [ -n "$since" ]; then
               echo "--- [$(date +%T)] log stream ended while ${label} is still running; re-attaching ---"
-              refresh_cluster_token || echo "credential refresh failed; continuing with the current token"
+              interruptible refresh_cluster_token || echo "credential refresh failed; continuing with the current token"
               range=(--since-time="$since")
             else
               range=(--tail=-1)
             fi
             kubectl -n tpu-ci logs -f -l "$sel" --all-containers=true --prefix=true \
               --max-log-requests=10 --pod-running-timeout=15m "${range[@]}" \
-              2>&1 | tee -a "$RUNNER_TEMP/tpu-pod-logs.txt" || true
+              2>&1 | tee -a "$RUNNER_TEMP/tpu-pod-logs.txt" &
+            wait $! || true
             since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            sleep 10
+            interruptible sleep 10
           done
 
           # Runtime clock starts now: queue time is not charged to the test.
           deadline=$(( $(date +%s) + wait_s ))
           auth_fails=0
           # The stream may have run for a long time; poll with a fresh token.
-          refresh_cluster_token || echo "credential refresh failed; continuing with the current token"
+          interruptible refresh_cluster_token || echo "credential refresh failed; continuing with the current token"
           next_refresh=$(( $(date +%s) + 2400 ))
           iter=0
           while [ "$(date +%s)" -lt "$deadline" ]; do
             if [ "$(date +%s)" -ge "$next_refresh" ]; then
-              if refresh_cluster_token; then
+              if interruptible refresh_cluster_token; then
                 next_refresh=$(( $(date +%s) + 2400 ))
               else
                 echo "credential refresh failed; retrying in 45s"
@@ -399,12 +438,12 @@ jobs:
             # the budget runs out; try one refresh before giving up.
             if ! kubectl -n tpu-ci get "$name" >/dev/null 2>&1; then
               auth_fails=$((auth_fails + 1))
-              [ "$auth_fails" -eq 3 ] && refresh_cluster_token || true
+              [ "$auth_fails" -eq 3 ] && interruptible refresh_cluster_token || true
               if [ "$auth_fails" -ge 12 ]; then
                 echo "❌ ${label}: lost cluster access while polling (credentials likely expired); JobSet outcome unknown"
                 exit 1
               fi
-              sleep 5; continue
+              interruptible sleep 5; continue
             fi
             auth_fails=0
             ok="$(kubectl -n tpu-ci get "$name" -o jsonpath='{.status.conditions[?(@.type=="Completed")].status}' 2>/dev/null || true)"
@@ -418,18 +457,54 @@ jobs:
               kubectl -n tpu-ci get pods -l "$sel" -o wide || true
               # Late-arriving pods never join the initial `logs -f` stream, so
               # re-collect every pod's tail before the JobSet is deleted.
-              kubectl -n tpu-ci logs -l "$sel" --all-containers --prefix --tail=150 2>/dev/null || true
+              kubectl -n tpu-ci logs -l "$sel" --all-containers --prefix --tail=150 2>/dev/null \
+                | tee -a "$RUNNER_TEMP/tpu-pod-logs.txt" &
+              wait $! || true
               kubectl -n tpu-ci get workloads -o wide 2>/dev/null || true
               kubectl -n tpu-ci get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 40 || true
               kubectl -n tpu-ci describe "$name" | tail -n 200
               exit 1
             }
-            sleep 5
+            interruptible sleep 5
           done
           echo "❌ ${label} TIMED OUT after ${wait_s}s"
           kubectl -n tpu-ci get pods -l "$sel" -o wide || true
           kubectl -n tpu-ci describe "$name" | tail -n 120 || true
           exit 1
+
+      - name: Publish TPU timing
+        id: timing
+        if: always()
+        continue-on-error: true
+        env:
+          TIMING_INPUTS: ${{ toJSON(inputs) }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, os, re
+          inputs = os.environ["TIMING_INPUTS"]
+          label = re.sub(r"[^A-Za-z0-9_-]+", "-", os.environ["TPU_CI_JOB_NAME"]).strip("-")[:80] or "test"
+          digest = hashlib.sha256(inputs.encode()).hexdigest()[:12]
+          artifact = f"tpu-ci-timing-{label}-{digest}-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"artifact={artifact}", file=output)
+          PY
+          out="$RUNNER_TEMP/tpu-ci-timing.json"
+          # Setup failures and cancellation may leave no cluster objects to query.
+          if [ ! -f "$out" ]; then
+            python3 .github/tpu-ci/ci_timing.py --output "$out" --log "$RUNNER_TEMP/tpu-pod-logs.txt"
+          fi
+          python3 .github/tpu-ci/ci_timing.py --summary "$out" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload TPU timing
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.timing.outputs.artifact }}
+          path: ${{ runner.temp }}/tpu-ci-timing.json
+          if-no-files-found: ignore
+          retention-days: 30
 
       # A benchmark test prints its results JSON between markers, because the pod
       # log is the only thing that leaves a JobSet. Lift it into a downloadable
