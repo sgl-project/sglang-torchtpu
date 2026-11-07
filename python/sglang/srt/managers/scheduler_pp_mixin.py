@@ -49,6 +49,61 @@ if TYPE_CHECKING:
     from sglang_tpu.pp_scheduler import PPDecodeTransferStatus
 
 
+_PACKED_DRAFT_KEY = "draft_packed"
+
+
+def _pack_draft_relay(
+    topk_p: torch.Tensor, topk_index: torch.Tensor, hidden_states: torch.Tensor
+) -> Dict[str, object]:
+    """One float32 [rows, 2 * topk + hidden] tensor for the three draft outputs.
+
+    float32 holds the bf16 hidden states and the token ids (< 2**24) exactly. The
+    captured hidden states can have more rows than the top-k (padded to the
+    compiled batch size), so each part is zero-padded to the longest and keeps its
+    own row count.
+    """
+    topk = int(topk_p.shape[1])
+    topk_rows, hidden_rows = int(topk_p.shape[0]), int(hidden_states.shape[0])
+    rows = max(topk_rows, hidden_rows)
+
+    def padded(t: torch.Tensor) -> torch.Tensor:
+        t = t.float()
+        return (
+            t
+            if t.shape[0] == rows
+            else torch.nn.functional.pad(t, (0, 0, 0, rows - t.shape[0]))
+        )
+
+    packed = torch.cat(
+        [padded(topk_p), padded(topk_index), padded(hidden_states)], dim=1
+    ).contiguous()
+    return {
+        _PACKED_DRAFT_KEY: packed,
+        "draft_packed_topk": topk,
+        "draft_packed_topk_rows": topk_rows,
+        "draft_packed_hidden_rows": hidden_rows,
+        "draft_packed_hidden_dtype": str(hidden_states.dtype).removeprefix("torch."),
+        "draft_packed_index_dtype": str(topk_index.dtype).removeprefix("torch."),
+    }
+
+
+def _unpack_draft_relay(tensors: Dict[str, object]) -> Dict[str, torch.Tensor]:
+    """Inverse of _pack_draft_relay, as the draft_* keys of an unpacked relay."""
+    packed = tensors[_PACKED_DRAFT_KEY]
+    topk = int(tensors["draft_packed_topk"])
+    topk_rows = int(tensors["draft_packed_topk_rows"])
+    hidden_rows = int(tensors["draft_packed_hidden_rows"])
+    return {
+        "draft_topk_p": packed[:topk_rows, :topk].contiguous(),
+        "draft_topk_index": packed[:topk_rows, topk : 2 * topk]
+        .to(getattr(torch, tensors["draft_packed_index_dtype"]))
+        .contiguous(),
+        "draft_hidden_states": packed[:hidden_rows, 2 * topk :]
+        .to(getattr(torch, tensors["draft_packed_hidden_dtype"]))
+        .contiguous(),
+    }
+
+
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     """Check if output send/recv can be skipped for this batch."""
     return (
@@ -1206,9 +1261,23 @@ class SchedulerPPMixin:
             and not batch.spec_algorithm.is_dspark()
             and draft_input.topk_p is not None
         ):
-            tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
-            tensor_dict["draft_topk_index"] = draft_input.topk_index.contiguous()
-            tensor_dict["draft_hidden_states"] = draft_input.hidden_states.contiguous()
+            if self._pp_wave is not None and draft_input.dsa_topk_indices is None:
+                # Over the wave the relay ships host copies, one blocking D2H per
+                # tensor queued behind this rank's next forward; pack the three
+                # draft tensors into one so the relay pays a single copy for them.
+                tensor_dict.update(
+                    _pack_draft_relay(
+                        draft_input.topk_p,
+                        draft_input.topk_index,
+                        draft_input.hidden_states,
+                    )
+                )
+            else:
+                tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
+                tensor_dict["draft_topk_index"] = draft_input.topk_index.contiguous()
+                tensor_dict["draft_hidden_states"] = (
+                    draft_input.hidden_states.contiguous()
+                )
             # Preserve the DSA IndexShare seed when rebuilding spec_info on each rank.
             if draft_input.dsa_topk_indices is not None:
                 tensor_dict["draft_dsa_topk_indices"] = (
@@ -1458,6 +1527,8 @@ class SchedulerPPMixin:
             )
             if key in pp_outputs.tensors
         }
+        if _PACKED_DRAFT_KEY in pp_outputs.tensors:
+            draft_state.update(_unpack_draft_relay(pp_outputs.tensors))
         if self._pp_wave is not None and get_disagg().disaggregation_mode != "prefill":
             # The relayed outputs stay on the host, and pp_outputs is relayed on
             # as is; decode reads its input IDs and the draft state from device.
