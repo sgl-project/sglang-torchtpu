@@ -49,6 +49,12 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils.hf_transformers.common import get_rope_config
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 from sglang_tpu._logging import get_logger
+from sglang_tpu.dsv41_native.engram_hash32 import (
+    MAX_TOKEN,
+    engram_hash32,
+    limb_weights,
+    multiplier_limbs,
+)
 from sglang_tpu.dsv41_native.engram_ref import (
     EngramLayout,
     build_compressed_token_map,
@@ -198,14 +204,18 @@ class _TokenCtx(NamedTuple):
 def _token_ctx(
     *, positions: torch.Tensor, forward_batch: ForwardBatch
 ) -> tuple[_TokenCtx, torch.Tensor]:
-    """Token addressing plus each request's last-token row ([B] int64)."""
-    req = forward_batch.req_pool_indices
+    """Token addressing plus each request's last-token row ([B]), all int32: positions and slots
+    feed modulo/divide index math, and XLA's 64-bit emulation aborted the TPU compiler (r6)."""
+    req = forward_batch.req_pool_indices.to(torch.int32)
+    positions = positions.to(torch.int32)
     num_tokens = positions.shape[0]
-    tok = torch.arange(num_tokens, device=positions.device)
+    tok = torch.arange(num_tokens, device=positions.device, dtype=torch.int32)
     if forward_batch.forward_mode.is_decode():
         return _TokenCtx(positions=positions, slots=req), tok
     # Padded requests have extend_seq_lens 0, so tokens past the real ones land on index B.
-    ends = torch.cumsum(forward_batch.extend_seq_lens, dim=0).to(torch.int64)
+    ends = torch.cumsum(forward_batch.extend_seq_lens.to(torch.int32), dim=0).to(
+        torch.int32
+    )
     req_idx = (tok.unsqueeze(1) >= ends.unsqueeze(0)).sum(1)
     batch = req.shape[0]
     slots = torch.where(req_idx < batch, req[req_idx.clamp_max(batch - 1)], 0)
@@ -422,22 +432,30 @@ class _EngramHasher(nn.Module):
         multipliers = compute_hash_multipliers(
             layout.layer_ids, layout.max_ngram_size, vocab_size
         )
-        self.register_buffer("primes", torch.tensor(layout.primes), persistent=False)
-        self.register_buffer(
-            "offsets", torch.tensor(np.array(offsets)), persistent=False
+        # Everything the compiled graph sees is int32: XLA's 64-bit integer emulation aborted the
+        # TPU compiler (r6). engram_hash32 keeps the 63-bit hash exact with 7-bit limbs.
+        assert vocab_size < MAX_TOKEN, vocab_size
+        primes = torch.tensor(layout.primes, dtype=torch.int64)
+        offsets = torch.tensor(np.array(offsets), dtype=torch.int64)
+        assert int((offsets + primes.flatten(1)).max()) < 2**31, (
+            "table offsets need int64"
         )
-        self.register_buffer(
-            "multipliers", multipliers.to(torch.get_default_device()), persistent=False
-        )
-        self.register_buffer("token_map", torch.tensor(token_map), persistent=False)
-        self.register_buffer(
-            "cache",
-            torch.zeros(args.max_slots, args.max_seq_len, dtype=torch.int64),
-            persistent=False,
-        )
+        device = torch.get_default_device()
+
+        def buf(name, value):
+            self.register_buffer(
+                name, value.to(torch.int32).to(device), persistent=False
+            )
+
+        buf("primes", primes)
+        buf("limb_weights", limb_weights(primes))
+        buf("m_limbs", multiplier_limbs(multipliers))
+        buf("offsets", offsets)
+        buf("token_map", torch.tensor(token_map))
+        buf("cache", torch.zeros(args.max_slots, args.max_seq_len))
 
     def forward(self, input_ids: torch.Tensor, ctx: _TokenCtx) -> torch.Tensor:
-        """[T] ids -> [1, T, n_engram_layers, n_hash_cols] hash ids."""
+        """[T] ids -> [1, T, n_engram_layers, n_hash_cols] hash ids (int32)."""
         pos = ctx.positions
         self.cache[ctx.slots, pos] = self.token_map[input_ids]
         tokens, blocked = [], torch.zeros_like(pos, dtype=torch.bool)
@@ -446,12 +464,8 @@ class _EngramHasher(nn.Module):
             blocked = blocked | (pos < shift)
             tokens.append(torch.where(blocked, self.pad_id, source))
         tokens = torch.stack(tokens, dim=-1).unsqueeze(0)  # [1, T, max_ngram_size]
-        products = tokens.unsqueeze(2) * self.multipliers
-        rolling, hashes = products[..., 0], []
-        for i in range(1, self.max_ngram_size):
-            rolling = torch.bitwise_xor(rolling, products[..., i])
-            hashes.append(rolling.unsqueeze(-1) % self.primes[:, i - 1])
-        return torch.cat(hashes, dim=-1) + self.offsets
+        hashes = engram_hash32(tokens, self.m_limbs, self.primes, self.limb_weights)
+        return hashes + self.offsets
 
 
 class ParallelEngramEmbedding(nn.Module):
@@ -631,6 +645,7 @@ class Indexer(nn.Module):
         elif self.uses_candidates:
             score = score.masked_fill(~shared["candidates"], -torch.inf)
         idxs = score.topk(self.topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+        idxs = idxs.to(torch.int32)
         return torch.where(idxs < compress_lens, idxs, -1)
 
 
@@ -853,9 +868,13 @@ class MoE(nn.Module):
         hit = indices.unsqueeze(-1) == experts  # [n, topk, E]
         routed = hit.any(1)
         token_weight = (weights.unsqueeze(-1) * hit).sum(1)
-        priority = torch.arange(n_tokens, 0, -1, device=x.device).unsqueeze(-1)
+        priority = torch.arange(
+            n_tokens, 0, -1, device=x.device, dtype=torch.int32
+        ).unsqueeze(-1)
         idx = (
-            torch.where(routed, priority, 0).topk(n_tokens, dim=0, sorted=False).indices
+            torch.where(routed, priority, 0)
+            .topk(n_tokens, dim=0, sorted=False)
+            .indices.to(torch.int32)
         )  # [C, E]
         w = torch.where(routed.gather(0, idx), token_weight.gather(0, idx), 0.0).t()
         idx = idx.t()
