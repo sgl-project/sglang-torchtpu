@@ -717,6 +717,7 @@ def prepare_outputs(
         "small_chunk_gather_atoms",
         "live_gather_all_chunks",
         "topk_cap",
+        "gather_rope",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -749,6 +750,7 @@ def sparse_ragged_paged_attention(
     small_chunk_gather_atoms: int = 1,
     live_gather_all_chunks: bool = True,
     topk_cap: int | None = None,
+    gather_rope: bool = True,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -803,6 +805,9 @@ def sparse_ragged_paged_attention(
         a chunk with no such token gathers `topk_cap` slots per row only. Must
         be a multiple of 64 dividing `topk`. Pays off when rows hold far fewer
         than `topk` live entries (DCP).
+      gather_rope: TensorCore layout only (ignored otherwise). False skips the
+        rope cache in the gather and attends with zero rope keys; exact only
+        when the queries' rope lane is identically zero (a model without rope).
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -940,6 +945,7 @@ def sparse_ragged_paged_attention(
             live_gather_all_chunks=live_gather_all_chunks,
             topk_cap=topk_cap,
             topk_override=topk,
+            gather_rope=gather_rope,
         )
         if return_lse:
             q, lse = result
@@ -1046,6 +1052,7 @@ def sparse_attention_chunk(
     live_gather_all_chunks: bool = False,
     topk_cap: int | None = None,
     topk_override: int | None = None,
+    gather_rope: bool = True,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1329,6 +1336,7 @@ def sparse_attention_chunk(
             cache_kv_rope,
             indices.reshape(-1),
             num_valid_indices=num_valid_indices,
+            gather_rope=gather_rope,
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(
             chunk_size,
