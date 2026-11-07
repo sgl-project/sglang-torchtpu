@@ -260,6 +260,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
+        # (works, counts, digest, pool names) of the in-flight TP ready-count reduce.
+        self._pending_ready_counts: Optional[tuple] = None
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -305,13 +307,25 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
-        reduced = False
+        for work in self._all_reduce_attn_groups_async(tensor, op):
+            work.wait()
+
+    def _all_reduce_attn_groups_async(self, tensor: torch.Tensor, op) -> list:
+        works = []
         for group in (self.attn_cp_group, self.attn_tp_group):
             if group is not None and torch.distributed.get_world_size(group=group) > 1:
-                torch.distributed.all_reduce(tensor, op=op, group=group)
-                reduced = True
-        if not reduced and self.tp_world_size > 1:
-            torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
+                works.append(
+                    torch.distributed.all_reduce(
+                        tensor, op=op, group=group, async_op=True
+                    )
+                )
+        if not works and self.tp_world_size > 1:
+            works.append(
+                torch.distributed.all_reduce(
+                    tensor, op=op, group=self.tp_group, async_op=True
+                )
+            )
+        return works
 
     def _drain_async_work(self):
         """
@@ -366,6 +380,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
     def reset(self) -> None:
+        self._drain_pending_ready_counts()
         if self.linker is not None:
             self.linker.reset()
         self._reset_full()
@@ -3349,11 +3364,36 @@ class UnifiedRadixCache(BasePrefixCache):
             dtype=torch.int64,
             device="cpu",
         )
-        if self.host_memory_mode == "buffer_only" and self.pp_size > 1:
-            self._all_reduce_attn_groups(ready_counts, torch.distributed.ReduceOp.MIN)
-        else:
-            self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
+        if self.pp_size > 1:
+            if self.host_memory_mode == "buffer_only":
+                self._all_reduce_attn_groups(
+                    ready_counts, torch.distributed.ReduceOp.MIN
+                )
+            else:
+                self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
+            return self._ready_counts_result(ready_counts, digest, extra_pool_names)
+        # TP only: the reduce is issued now and consumed next step, so the scheduler
+        # never blocks on rank skew; the counts it acts on are one step old.
+        previous = self._pending_ready_counts
+        self._pending_ready_counts = (
+            self._all_reduce_attn_groups_async(
+                ready_counts, torch.distributed.ReduceOp.MIN
+            ),
+            ready_counts,
+            digest,
+            extra_pool_names,
+        )
+        if previous is None:
+            return 0, 0, tuple(0 for _ in storage_queue_sizes), extra_pool_names
+        works, counts, prev_digest, prev_names = previous
+        for work in works:
+            work.wait()
+        return self._ready_counts_result(counts, prev_digest, prev_names)
 
+    @staticmethod
+    def _ready_counts_result(
+        ready_counts: torch.Tensor, digest: int, extra_pool_names: tuple
+    ) -> tuple[int, int, tuple[int, ...], tuple[PoolName, ...]]:
         count_values = list(map(int, ready_counts.tolist()))
         assert digest == count_values[-2] and digest == -count_values[-1], (
             "write_back duplicate-reclaim victims diverged across PP/TP ranks"
@@ -3364,6 +3404,13 @@ class UnifiedRadixCache(BasePrefixCache):
             tuple(count_values[2:-2]),
             extra_pool_names,
         )
+
+    def _drain_pending_ready_counts(self) -> None:
+        pending = self._pending_ready_counts
+        self._pending_ready_counts = None
+        if pending is not None:
+            for work in pending[0]:
+                work.wait()
 
     def writing_check(
         self, write_back: bool = False, finish_count: Optional[int] = None
