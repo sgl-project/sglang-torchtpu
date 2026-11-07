@@ -34,6 +34,7 @@ from sglang_tpu.compilation.compiled_forward_shim import (  # noqa: E402
 from sglang_tpu.compilation.decoder_compile_policy import (  # noqa: E402
     DecoderTpuCompilePolicy,
 )
+from sglang_tpu.cp_forward import cp_local_rows_padded  # noqa: E402
 from sglang_tpu.envs import envs as tpu_envs  # noqa: E402
 from sglang_tpu.hooks.pp_buffered_kv_budget import (  # noqa: E402
     reserve_pp_buffered_handoff,
@@ -770,6 +771,59 @@ class TestReceiveProxy(unittest.TestCase):
         handoff.begin_iteration(True)
         self.assertIsNone(handoff.receive_batch(object()))
 
+    def _cp_scheduler(self):
+        policy = Mock()
+        policy.cp_forward_rows.return_value = 512
+        policy.forward_rows.return_value = 1024
+        return SimpleNamespace(
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(compile_policy=policy)
+            )
+        ), policy
+
+    def _cp_batch(self, cp_extend=True):
+        return SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_context_parallel_extend=lambda: cp_extend,
+                is_decode=lambda: False,
+            ),
+            reqs=[object(), object()],
+            input_ids=torch.zeros(900, dtype=torch.int64),
+            extend_lens=[600, 300],
+            extend_num_tokens=900,
+            spec_info=None,
+        )
+
+    def test_context_parallel_rows_are_the_local_bucket(self):
+        scheduler, policy = self._cp_scheduler()
+        strategy = Mock()
+        strategy.can_apply.return_value = True
+        with patch("sglang.srt.layers.cp.base.get_cp_strategy", return_value=strategy):
+            rows = pp_scheduler.pp_forward_rows(scheduler, self._cp_batch())
+        self.assertEqual(rows, 512)
+        policy.cp_forward_rows.assert_called_once_with([600, 300])
+        policy.forward_rows.assert_not_called()
+        num_tokens, view = strategy.can_apply.call_args.args
+        self.assertEqual(num_tokens, 900)
+        self.assertEqual(view.extend_seq_lens_cpu, [600, 300])
+
+    def test_rows_fall_back_when_the_cp_forward_does_not_apply(self):
+        """A batch the CP strategy declines, or a non-extend batch, runs the
+        plain forward and pads the global token count."""
+        for can_apply, cp_extend in ((False, True), (True, False)):
+            with self.subTest(can_apply=can_apply, cp_extend=cp_extend):
+                scheduler, policy = self._cp_scheduler()
+                strategy = Mock()
+                strategy.can_apply.return_value = can_apply
+                with patch(
+                    "sglang.srt.layers.cp.base.get_cp_strategy", return_value=strategy
+                ):
+                    rows = pp_scheduler.pp_forward_rows(
+                        scheduler, self._cp_batch(cp_extend)
+                    )
+                self.assertEqual(rows, 1024)
+                policy.cp_forward_rows.assert_not_called()
+
     def test_decode_rows_follow_the_batch_size(self):
         policy = Mock()
         policy.forward_rows.return_value = 8
@@ -858,28 +912,58 @@ class TestBufferedHandoffWiring(unittest.TestCase):
         handoff.assert_not_called()
         wave.assert_called_once()
 
-    def test_buffered_refuses_dp_attention_and_prefill_cp(self):
-        scheduler, _ = self._scheduler()
-        for dp_on, cp_strategy, needle in (
-            (True, None, "DP attention"),
-            (False, object(), "context parallelism"),
+    def test_cp_rows_match_the_cp_forward_padding(self):
+        """The receive size of a context-parallel stage comes from the same
+        function the CP forward pads with (cp_local_rows_padded)."""
+        policy = DecoderTpuCompilePolicy(
+            t_bucketer=Bucketer(name="Token", buckets=[64, 256, 512]),
+            b_bucketer=Bucketer(name="Bs", buckets=[1, 32]),
+        )
+        with patch(
+            "sglang_tpu.compilation.decoder_compile_policy.get_cp_strategy",
+            return_value=SimpleNamespace(cp_size=2),
         ):
-            with (
-                self.subTest(needle=needle),
-                tpu_envs.SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF.override(True),
-                patch(
-                    "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
-                    return_value=dp_on,
-                ),
-                patch(
-                    "sglang.srt.layers.cp.base.get_cp_strategy",
-                    return_value=cp_strategy,
-                ),
-                patch.object(pp_scheduler, "build_pp_buffered_handoff") as handoff,
-            ):
-                with self.assertRaisesRegex(NotImplementedError, needle):
-                    scheduler._pp_init_wave()
-                handoff.assert_not_called()
+            rows = policy.cp_forward_rows([600, 300])
+        # Zigzag: each rank holds half of each request, 300 + 150 = 450 rows.
+        self.assertEqual(rows, 512)
+        self.assertEqual(
+            rows,
+            cp_local_rows_padded(
+                [600, 300],
+                pad_b=policy._extend_compile_cap(),
+                t_bucketer=policy.t_bucketer,
+                cp_size=2,
+            ),
+        )
+
+    def test_buffered_refuses_dp_attention(self):
+        scheduler, _ = self._scheduler()
+        with (
+            tpu_envs.SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF.override(True),
+            patch(
+                "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+                return_value=True,
+            ),
+            patch.object(pp_scheduler, "build_pp_buffered_handoff") as handoff,
+        ):
+            with self.assertRaisesRegex(NotImplementedError, "DP attention"):
+                scheduler._pp_init_wave()
+            handoff.assert_not_called()
+
+    def test_buffered_accepts_context_parallel_stages(self):
+        """A context-parallel stage derives each receive from its local rows."""
+        scheduler, _ = self._scheduler()
+        with (
+            tpu_envs.SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF.override(True),
+            patch(
+                "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+                return_value=False,
+            ),
+            patch("sglang.srt.layers.cp.base.get_cp_strategy", return_value=object()),
+            patch.object(pp_scheduler, "build_pp_buffered_handoff") as handoff,
+        ):
+            scheduler._pp_init_wave()
+        handoff.assert_called_once()
 
     def test_shim_takes_exactly_the_padded_rows_under_the_buffered_handoff(self):
         proxy = PPProxyTensors(
