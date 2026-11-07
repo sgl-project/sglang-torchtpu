@@ -3384,8 +3384,11 @@ class UnifiedRadixCache(BasePrefixCache):
         drained = [prev_result[0], prev_result[1], *prev_result[2]]
         if len(drained) != len(local_counts):
             drained = [0] * len(local_counts)
+        # A blocking drain (write_back eviction) may have emptied a queue since the
+        # count was sent; every rank drains alike, so the clamp agrees across ranks.
+        drained = [min(done, now) for now, done in zip(local_counts, drained)]
+        prev_result = (drained[0], drained[1], tuple(drained[2:]), prev_result[3])
         remaining = [now - done for now, done in zip(local_counts, drained)]
-        assert min(remaining, default=0) >= 0, (local_counts, drained)
         ready_counts = torch.tensor(
             [*remaining, digest, -digest], dtype=torch.int64, device="cpu"
         )
