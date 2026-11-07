@@ -769,10 +769,13 @@ class MuseMegakernel(torch.nn.Module):
                     )
                 )
                 plans.append((c_vy, b_vy, _TILED_DEPTH_RING_PREFERENCE, vy != vys[-1]))
+            # The y_block_send VMEM-Y alternative fails the numerics test at 192 rows of 8
+            # (layer 4, global attention + fp8 experts: rows off by 25.6% against the CPU
+            # reference; the VMEM-Y and streamed-Y plans pass): off unless asked for.
             if (
                 cfg.tiled_vmem_y >= 1
                 and cfg.alias_oag_f
-                and not _dev_int("SGLANG_TPU_MUSE_MK_DEV_NO_YSEND_PLAN", 0)
+                and _dev_int("SGLANG_TPU_MUSE_MK_DEV_YSEND_PLAN", 0)
             ):
                 plans.append(
                     (
