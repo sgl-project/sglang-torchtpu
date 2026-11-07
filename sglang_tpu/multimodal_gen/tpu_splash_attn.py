@@ -48,6 +48,7 @@ _logged_sdpa_fallbacks: set[tuple] = set()
 
 _FLASH_OP = None
 _FLASH_RING_OP = None
+_FLASH_LIVE_LENGTH_OP = None
 _SPLASH_MHA_OP = None
 _OPS_LOCK = threading.Lock()
 _resolved_mode_logged = False
@@ -113,6 +114,11 @@ def _round_down(x: int, multiple: int) -> int:
 # ``get_tpu_info().vmem_capacity_bytes`` to both the block-size model and
 # Mosaic's ``vmem_limit_bytes``; this default serves CPU-side callers.
 _V7X_VMEM_CAPACITY_BYTES = 64 * 2**20
+# Live-length tiles (packed rows with trailing padding): compile-only tpu7x
+# schedules at 32768 rows, 7 heads are within 2% of the autotuned 4096x2048
+# tiles in a quarter of the instructions.
+_LIVE_LENGTH_BLOCK_Q = 2048
+_LIVE_LENGTH_BLOCK_KV = 1024
 # Headroom for buffers the model does not count, chiefly the double-buffered
 # bf16 output block (3.1 MiB at block_q=6400).
 _VMEM_BUDGET_FRACTION = 0.93
@@ -236,6 +242,8 @@ def _flash_call(
     return_lse: bool = False,
     resume: bool = False,
     runtime_kv: bool = False,
+    rows_in: bool = False,
+    block_sizes: tuple[int, int, int] | None = None,
 ):
     """``pallas_call`` of the flash kernel over ``[rows, S, D]`` arrays.
 
@@ -249,6 +257,10 @@ def _flash_call(
     - ``runtime_kv``: a leading int32 ``[row offset, real keys]`` input read at
       run time: KV rows shift by ``offset`` and only their first ``real keys``
       keys count. A rank-dependent shard choice then compiles one program.
+    - ``rows_in``: q/k/v and the output are ``[S, rows * D]``, row ``h`` the
+      ``h``-th ``D``-wide column block, read in place (no transposes).
+    - ``block_sizes``: ``(block_q, block_kv, block_kv_compute)`` instead of the
+      autotuned ones.
     """
     import jax
     import jax.numpy as jnp
@@ -264,7 +276,9 @@ def _flash_call(
         carry_bytes_per_q_row = (1 + resume) * 2 * (head_dim + NUM_SUBLANES) * 4
     # One VMEM figure feeds both the block-size model and Mosaic's limit.
     vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
-    block_q, block_kv, block_kv_compute = _autotune_block_sizes(
+    if rows_in and (return_lse or resume):
+        raise ValueError("rows_in takes neither return_lse nor resume")
+    block_q, block_kv, block_kv_compute = block_sizes or _autotune_block_sizes(
         q_seq, kv_seq, head_dim, vmem_capacity_bytes, carry_bytes_per_q_row
     )
     grid_width = pl.cdiv(kv_seq, block_kv)
@@ -274,7 +288,7 @@ def _flash_call(
         q_seq,
         kv_seq,
         (block_q, block_kv, block_kv_compute),
-        " (ring)" if runtime_kv else "",
+        " (live length)" if rows_in else " (ring)" if runtime_kv else "",
     )
 
     def kernel(*refs):
@@ -408,33 +422,38 @@ def _flash_call(
                 )
 
     def q_index(h, i, j, *_):
-        return (h, i, 0)
+        return (i, h) if rows_in else (h, i, 0)
 
     def kv_index(h, i, j, *scalars):
         row = (h // heads) * kv_heads + (h % heads) // q_heads_per_kv_head
-        if not scalars:
-            return (row, j, 0)
-        # Blocks past the last real key skip compute; repeating the last real
-        # block's index there lets the pipeline skip their K/V copies too.
-        real = jnp.minimum(scalars[0][1], kv_seq)
-        last = jnp.maximum((real + block_kv - 1) // block_kv - 1, 0)
-        return (row + scalars[0][0], jnp.minimum(j, last), 0)
+        if scalars:
+            # Blocks past the last real key skip compute; repeating the last
+            # real block's index there lets the pipeline skip their K/V copies.
+            real = jnp.minimum(scalars[0][1], kv_seq)
+            last = jnp.maximum((real + block_kv - 1) // block_kv - 1, 0)
+            row, j = row + scalars[0][0], jnp.minimum(j, last)
+        return (j, row) if rows_in else (row, j, 0)
 
     def lse_index(h, i, j, *_):
         return (h, 0, i)
 
+    q_block = (block_q, head_dim) if rows_in else (None, block_q, head_dim)
+    kv_block = (block_kv, head_dim) if rows_in else (None, block_kv, head_dim)
     in_specs = [
-        pl.BlockSpec((None, block_q, head_dim), q_index),
-        pl.BlockSpec((None, block_kv, head_dim), kv_index),
-        pl.BlockSpec((None, block_kv, head_dim), kv_index),
+        pl.BlockSpec(q_block, q_index),
+        pl.BlockSpec(kv_block, kv_index),
+        pl.BlockSpec(kv_block, kv_index),
     ]
     if resume:
         in_specs += [
             pl.BlockSpec((None, block_q, head_dim), q_index),
             pl.BlockSpec((None, NUM_SUBLANES, block_q), lse_index),
         ]
-    out_specs = pl.BlockSpec((None, block_q, head_dim), q_index)
-    out_shape = jax.ShapeDtypeStruct((num_rows, q_seq, head_dim), out_dtype)
+    out_specs = pl.BlockSpec(q_block, q_index)
+    out_shape = jax.ShapeDtypeStruct(
+        (q_seq, num_rows * head_dim) if rows_in else (num_rows, q_seq, head_dim),
+        out_dtype,
+    )
     if return_lse:
         out_specs = [out_specs, pl.BlockSpec((None, NUM_SUBLANES, block_q), lse_index)]
         out_shape = [
@@ -456,7 +475,11 @@ def _flash_call(
         vmem_limit_bytes=vmem_capacity_bytes,
     )
     name = (
-        "diffusion_flash_attention_ring" if runtime_kv else "diffusion_flash_attention"
+        "diffusion_flash_attention_live_length"
+        if rows_in
+        else "diffusion_flash_attention_ring"
+        if runtime_kv
+        else "diffusion_flash_attention"
     )
     if runtime_kv:
         return pl.pallas_call(
@@ -549,6 +572,41 @@ def _flash_attention_ring(q, k, v, kv_info, out_prev, lse_prev, scale):
     return out.reshape(q.shape), lse.reshape(batch, heads, NUM_SUBLANES, q_seq)
 
 
+def _flash_attention_live_length(q, k, v, live, scale, num_heads):
+    """Flash attention over one packed sequence's ``[S, H * D]`` rows whose
+    rows from ``live`` (int32 ``[1]``) on are padding.
+
+    A ``runtime_kv`` call with row offset 0 and ``live`` real keys: keys past
+    it are masked and KV blocks past it skipped. Padding rows output zeros. The
+    length is read on device, so one kernel serves every live length of a
+    padded shape.
+    """
+    import jax.numpy as jnp
+
+    q_seq, kv_seq = q.shape[0], k.shape[0]
+    head_dim = q.shape[1] // num_heads
+    blocks = None
+    if q_seq >= _LIVE_LENGTH_BLOCK_Q and kv_seq >= _LIVE_LENGTH_BLOCK_KV:
+        blocks = (_LIVE_LENGTH_BLOCK_Q, _LIVE_LENGTH_BLOCK_KV, _LIVE_LENGTH_BLOCK_KV)
+    call = _flash_call(
+        q_seq,
+        kv_seq,
+        head_dim,
+        scale,
+        num_rows=num_heads,
+        heads=num_heads,
+        kv_heads=k.shape[1] // head_dim,
+        out_dtype=q.dtype,
+        runtime_kv=True,
+        rows_in=True,
+        block_sizes=blocks,
+    )
+    live = live.astype(jnp.int32).reshape(1)
+    out = call(jnp.concatenate([jnp.zeros_like(live), live]), q, k, v)
+    rows = jnp.arange(q_seq, dtype=jnp.int32)[:, None]
+    return jnp.where(rows < live[0], out, jnp.zeros_like(out))
+
+
 def _splash_mha(q, k, v, scale, is_causal):
     """Stock ``make_splash_mha`` on ``[B, H, S, D]`` arrays.
 
@@ -620,7 +678,8 @@ def _register_ops() -> None:
     A failure marks the kernels unavailable, so callers fall back to SDPA
     instead of retrying a half-registered ``torch.library`` op.
     """
-    global _FLASH_OP, _FLASH_RING_OP, _SPLASH_MHA_OP, _SPLASH_AVAILABLE
+    global _FLASH_OP, _FLASH_RING_OP, _FLASH_LIVE_LENGTH_OP, _SPLASH_MHA_OP
+    global _SPLASH_AVAILABLE
     if _FLASH_OP is not None or _SPLASH_AVAILABLE is False:
         return
     with _OPS_LOCK:
@@ -649,6 +708,16 @@ def _register_ops() -> None:
                     q, k, v, kv_info, out_prev, lse_prev, scale
                 )
 
+            def flash_live_length(
+                q: jax.Array,
+                k: jax.Array,
+                v: jax.Array,
+                live: jax.Array,
+                scale: float,
+                num_heads: int,
+            ) -> jax.Array:
+                return _flash_attention_live_length(q, k, v, live, scale, num_heads)
+
             def splash_mha(
                 q: jax.Array, k: jax.Array, v: jax.Array, scale: float, is_causal: bool
             ) -> jax.Array:
@@ -667,6 +736,9 @@ def _register_ops() -> None:
                     q.new_empty(lse_shape, dtype=torch.float32),
                 )
 
+            def flash_live_length_fake(q, k, v, live, scale, num_heads):
+                return q.new_empty(q.shape)
+
             def splash_mha_fake(q, k, v, scale, is_causal):
                 return q.new_empty(q.shape)
 
@@ -682,6 +754,11 @@ def _register_ops() -> None:
                 "sglang_tpu_pallas::diffusion_flash_attention_ring", flash_ring
             )
             flash_ring_op.register_fake(flash_ring_fake)
+            flash_live_length_op = cpu_export_jax_op(
+                "sglang_tpu_pallas::diffusion_flash_attention_live_length",
+                flash_live_length,
+            )
+            flash_live_length_op.register_fake(flash_live_length_fake)
         except Exception as exc:
             logger.warning(
                 "TPU Pallas splash attention ops failed to register (%s); using SDPA.",
@@ -691,6 +768,7 @@ def _register_ops() -> None:
             return
         _SPLASH_MHA_OP = splash_mha_op
         _FLASH_RING_OP = flash_ring_op
+        _FLASH_LIVE_LENGTH_OP = flash_live_length_op
         _FLASH_OP = flash_op
 
 
@@ -711,6 +789,13 @@ def _sdpa_fallback_reason(
         return "short"
     if is_causal and q_seq != kv_seq:
         return "ragged causal"
+    return _kernel_input_fallback_reason(query, key, value)
+
+
+def _kernel_input_fallback_reason(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+) -> str | None:
+    """Why the kernels cannot take these ``[B, H, S, D]`` inputs, else None."""
     if query.shape[-1] != 128 or key.shape[-1] != 128 or value.shape[-1] != 128:
         return f"head_dim={query.shape[-1]}/{value.shape[-1]}"
     if query.shape[1] % key.shape[1] != 0:
@@ -1004,7 +1089,13 @@ class TpuSplashAttentionImpl(SDPAImpl):
             _register_ops()
             self.use_splash = _FLASH_OP is not None
         _log_resolved_mode_once(self.use_splash, self.dropout)
-        # forward_varlen keeps packed segments on plain SDPA.
+        # One live segment plus trailing padding (MiniMax H3's packed layout)
+        # runs as one kernel call that reads the live length on device, so
+        # callers pass no host bounds and a padded shape compiles once.
+        self.trailing_padding_on_device = self.use_splash and bool(
+            extra_impl_args.get("packed_trailing_padding", False)
+        )
+        # Other packed layouts stay on plain SDPA, one call per segment.
         self._sdpa = SDPAImpl(
             num_heads=num_heads,
             head_size=head_size,
@@ -1087,6 +1178,39 @@ class TpuSplashAttentionImpl(SDPAImpl):
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
+        # cu_seqlens = [0, used, total] without host bounds: rows [used, total)
+        # are padding. Callers that pass host bounds (e.g. H3's token refiner,
+        # whose length varies per prompt) keep the per-segment SDPA path.
+        if self.trailing_padding_on_device and cu_seqlens_host is None:
+            # [S, H, D] views in the kernel's [B, H, S, D] terms, for the checks.
+            q, k, v = (t.transpose(0, 1).unsqueeze(0) for t in (query, key, value))
+            if (
+                not self.causal
+                and query.device.type == "tpu"
+                and cu_seqlens.shape == (3,)
+                and query.shape[0] >= 512
+                and key.shape[0] == query.shape[0]
+                and _kernel_input_fallback_reason(q, k, v) is None
+            ):
+                # [S, H * D] rows: one lane-dense copy of a strided view, where
+                # .contiguous() pads 7 heads to 8 sublanes and the kernel's
+                # reshape then relayouts again.
+                rows = (t.reshape(t.shape[0], -1) for t in (query, key, value))
+                output = _FLASH_LIVE_LENGTH_OP(
+                    *rows,
+                    cu_seqlens[1:2].to(torch.int32),
+                    self.softmax_scale,
+                    query.shape[1],
+                )
+                return output.view(query.shape)
+            # The caller dropped its host bounds for this kernel; SDPA would
+            # read them back and compile once per live length.
+            raise ValueError(
+                "live-length attention without host bounds needs the kernel: "
+                f"q {tuple(query.shape)} {query.dtype} on {query.device}, "
+                f"k {tuple(key.shape)}, cu_seqlens {tuple(cu_seqlens.shape)}, "
+                f"causal={self.causal}"
+            )
         # Packed segment lengths vary per request. Each new length compiles
         # under either backend (dynamic=False); SDPA skips the Pallas trace,
         # export and Mosaic compile on top of that, so segments stay on SDPA.
