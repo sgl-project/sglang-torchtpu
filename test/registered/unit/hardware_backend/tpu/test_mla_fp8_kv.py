@@ -276,6 +276,9 @@ class TestSparseForwardMlaCacheBuffers(CustomTestCase):
         backend._kv_lens = functools.partial(
             TpuPallasSparseMlaAttnBackend._kv_lens, backend
         )
+        backend._attention_split_rows = functools.partial(
+            TpuPallasSparseMlaAttnBackend._attention_split_rows, backend
+        )
         layer = SimpleNamespace(
             v_head_dim=R,
             qk_head_dim=R + D,
