@@ -1,6 +1,7 @@
 """CPU-only regression checks for launcher topology and runtime defaults."""
 
 import unittest
+import unittest.mock
 
 from benchmark.tpu.launch_server import (
     LaunchConfig,
@@ -196,19 +197,64 @@ class TestRuntimeEnvironment(unittest.TestCase):
         """A PP prefill must run without the megakernel (the model rejects it under PP)."""
         from benchmark.tpu.recipe.configs.muse_spark.agentic import get_config
 
-        prefill, decode = (get_config(24, mode=m) for m in ("prefill", "decode"))
-        self.assertEqual(prefill["server_args"]["pp_size"], 2)
+        prefill, decode = (get_config(32, mode=m) for m in ("prefill", "decode"))
+        self.assertEqual(prefill["server_args"]["pp_size"], 8)
+        self.assertEqual(prefill["server_args"]["tp_size"], 1)
+        self.assertEqual(decode["server_args"]["max_running_requests"], 32)
         for config in (prefill, decode):
             # A rank != 0 in a one-host group makes launch_server start nothing.
             self.assertEqual(config["runtime_env"]["SGLANG_LAUNCHER_RANK"], "0")
         self.assertEqual(prefill["runtime_env"]["SGLANG_TPU_MUSE_MEGAKERNEL"], "0")
         self.assertEqual(decode["runtime_env"]["SGLANG_TPU_MUSE_MEGAKERNEL"], "1")
+        self.assertEqual(decode["runtime_env"]["SGLANG_TPU_MUSE_MK_MAX_ROWS"], "256")
+        for config in (prefill, decode):
+            self.assertEqual(config["server_args"]["kv_cache_dtype"], "fp8_e4m3")
+            env = config["runtime_env"]
+            self.assertEqual(env["SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER"], "1")
+            self.assertNotIn("SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY", env)
+        self.assertEqual(prefill["runtime_env"]["SGLANG_TPU_MUSE_PREFILL_SP"], "0")
+        self.assertIsNone(prefill["runtime_env"]["SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS"])
+        self.assertEqual(
+            prefill["runtime_env"]["SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS"],
+            "256:32:512:2",
+        )
+        self.assertEqual(prefill["server_args"]["max_total_tokens"], 1048576)
+        self.assertEqual(prefill["server_args"]["mem_fraction_static"], 0.88)
+        self.assertEqual(decode["server_args"]["mem_fraction_static"], 0.95)
         self.assertEqual(decode["runtime_env"]["SGLANG_RAIDEN_PIPELINE_TRANSFER"], "1")
+        # HiCache on a decode needs its radix tree; without it the decode refuses to start.
+        self.assertTrue(
+            decode["server_args"]["disaggregation_decode_enable_radix_cache"]
+        )
         for config, mode in ((prefill, "prefill"), (decode, "decode")):
             self.assertEqual(config["server_args"]["disaggregation_mode"], mode)
         self.assertNotIn("disaggregation_mode", get_config(24)["server_args"])
-        with self.assertRaises(ValueError):
-            get_config(24, mode="router")
+        for concurrency, mode in ((24, "router"), (24, "decode")):
+            with self.assertRaises(ValueError):
+                get_config(concurrency, mode=mode)
+
+    def test_agentx_pd_ships_sal_draft_kv(self):
+        """Both P/D ends run the SEQ_ALONG_LANE draft whose KV Raiden ships."""
+        from benchmark.tpu.recipe.configs.muse_spark.agentic import get_config, main
+
+        for mode in ("prefill", "decode"):
+            config = get_config(32, mode=mode)
+            self.assertEqual(
+                config["server_args"]["speculative_draft_attention_backend"],
+                "pallas_tpu_rpa_batched",
+            )
+            self.assertEqual(
+                config["runtime_env"]["SGLANG_TPU_PD_DECODE_DRAFT_PREFILL"], "0"
+            )
+            # The draft pool follows the draft backend: SEQ_ALONG_LANE needs this flag.
+            self.assertEqual(
+                config["runtime_env"]["SGLANG_TPU_USE_SEQ_ALONG_LANE_KV"], "1"
+            )
+        with unittest.mock.patch("builtins.print") as printed:
+            self.assertEqual(main(["decode", "32", "--dry-run"]), 0)
+        self.assertIn(
+            '"SGLANG_TPU_PD_DECODE_DRAFT_PREFILL": "0"', printed.call_args[0][0]
+        )
 
 
 if __name__ == "__main__":
