@@ -628,7 +628,10 @@ class SchedulerDisaggregationPrefillMixin:
             # ones the tree also holds; release_kv_cache inserts them later.
             return
 
-        checkpoint_kv_cache(req, cache)
+        # Chunks before the last honour the chunk-insert stride like a colocated
+        # prefill; the last one always publishes the prompt end.
+        mid_prefill = req.extend_range.end < len(req.origin_input_ids)
+        checkpoint_kv_cache(req, cache, mid_prefill=mid_prefill)
 
     def release_aborted_prefill_waiting_req(self: Scheduler, req: Req) -> None:
         self.clear_pending_chunk_send(req)
