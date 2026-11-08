@@ -119,6 +119,10 @@ class TpuEnvs:
     # Vision: run single-sequence "tpu" vision attention through block-skipping splash
     # (attention/vision_splash.py); False keeps the segment-id flash op.
     SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION = EnvBool(False)
+    # RPA v3: sum the softmax row on the MXU through a ones column in V's last
+    # padding lane instead of on the vector ALU. Only applies when head_dim is
+    # not a multiple of 128 (e.g. 64).
+    SGLANG_TPU_ENABLE_RPA_PAD_LANE_ROWSUM = EnvBool(False)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.
@@ -263,9 +267,6 @@ class TpuEnvs:
     # experts of a BF16 checkpoint. The Muse megakernel reads only fp4 or fp8 experts,
     # so it cannot be combined with this.
     SGLANG_TPU_ENABLE_MUSE_BF16_FIRST_LAST_LAYER_EXPERTS = EnvBool(False)
-    # Fused KV pool stores a rank's heads side by side in one 128-lane row when they
-    # fit exactly (e.g. 2 x head_dim 64): half the bytes of a zero-padded row per head.
-    SGLANG_TPU_KV_PACK_HEADS = EnvBool(False)
     # Allocates RPA v3 MHA KV as [num_blocks, layer_num, page_size, ...],
     # so all layers for a page form one row for single-DMA Raiden P/D transfers.
     # Both P/D servers must agree; tpu_platform refuses the configurations that
@@ -492,6 +493,9 @@ class TpuEnvs:
     # and the step runs more blocks than it needs. Rounded up to a page
     # multiple. Unset (None) means the wrapper's own search decides.
     SGLANG_TPU_FORCE_RPA_PREFILL_BKV = EnvInt(None)
+    # "bq:bq_c:bkv:n_buffer": prefill blocks for every layer, skipping the VMEM search, whose
+    # estimate refuses tiles that fit at TP1 head counts (PP prefill); n_buffer >= 2.
+    SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS = EnvStr(None)
     # Hack to workaround libtpu bug in 0.0.46 and 0.0.47 causing performance
     # regression in fused MoE with reduce scatter.
     # TODO: Remove once the issue gets resolved in libtpu version > 0.0.47
@@ -511,6 +515,61 @@ class TpuEnvs:
     # assigns each shared graph to the least-loaded rank (shared_compile_cost.py).
     # Empty: round-robin owners.
     SGLANG_TPU_SHARED_COMPILE_COST_PROFILE = EnvStr("")
+    # Fused KV pool stores a rank's heads side by side in one 128-lane row when they
+    # fit exactly (e.g. 2 x head_dim 64): half the bytes of a zero-padded row per head.
+    SGLANG_TPU_KV_PACK_HEADS = EnvBool(False)
+    # Fused KV pool and RPA v3 pad head_dim to this before it becomes the minor (lane)
+    # axis. 64 halves an unpacked head_dim-64 pool; fp8 then reaches 256 B per token at
+    # two KV heads per rank. Must stay >= the sublane x packing tile.
+    SGLANG_TPU_KV_HEAD_DIM_ALIGN = EnvInt(128)
+    # Batched RPA prefill: tiles whose keys all precede their queries skip the causal
+    # (and sliding-window) mask, and a power-of-two sm_scale is folded into q. Exact.
+    SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK = EnvBool(False)
+    # Batched RPA (non-transposed tiles, e.g. verify blocks): softmax without the running
+    # row max. Only for bounded scores: Muse's weightless per-head RMS-normed q and k keep
+    # |s| <= ~44, so exp(s) fits; rounding differs from the max-subtracted form.
+    SGLANG_TPU_RPA_NO_MAX = EnvBool(False)
+    # Batched RPA prefill softmax (the per-score vector chain, not the MXU, sets the
+    # time): exp2 with log2e folded into the q scale, one VALU op per score fewer.
+    # Off with an attention sink or an LSE output, which would see base-2 m and l;
+    # the folded scale rounds q in bf16, so the output is not bit-identical.
+    SGLANG_TPU_RPA_EXP2_SOFTMAX = EnvBool(False)
+    # Row sums from the PV matmul: V tiles get ones rows in the lanes head_dim 64
+    # leaves idle on the MXU, so the accumulator carries l and the vector row-sum
+    # reduce and the separate l rescale go away. SEQ_ALONG_LANE, head_dim <= 64.
+    SGLANG_TPU_RPA_ONES_V = EnvBool(False)
+    # Prefill attention tiles with transposed scores (keys along sublanes) and
+    # fp8 q; not bit-exact with the default tile. Mixed/prefill, SEQ_ALONG_LANE,
+    # head_dim <= 64, no sink / LSE / soft cap / cache-only / context parallel.
+    SGLANG_TPU_RPA_TRANSPOSED = EnvBool(False)
+    # Transposed prefill tiles skip the compute blocks past the last query of a
+    # partial q block (a sequence's last) instead of scoring padded rows. Exact.
+    SGLANG_TPU_RPA_SKIP_PAD_Q = EnvBool(False)
+    # Query tokens per iteration of that skip's loop (fewer, longer iterations overlap better).
+    SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP = EnvInt(128)
+    # "bq:bkv": batched-RPA prefill q / k block sizes for full-attention layers and
+    # for sliding-window layers, instead of the VMEM search's; unset keeps the search.
+    SGLANG_TPU_RPA_PREFILL_BLOCKS = EnvStr(None)
+    SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS = EnvStr(None)
+    # Batched RPA outputs come per-head RMS-normalized (weightless, this eps), as Muse
+    # Spark's attention output norm; the model then skips its own. Muse only.
+    SGLANG_TPU_RPA_OUT_HEAD_NORM_EPS = EnvFloat(None)
+    # Transposed tiles with SGLANG_TPU_RPA_NO_MAX run an unshifted streaming softmax
+    # (no running max, no alpha rescale) over key chunks of this many keys (the largest
+    # divisor of the k block up to it); unset streams the whole k block up to 1536 keys.
+    SGLANG_TPU_RPA_TRANSPOSED_KEY_CHUNK = EnvInt(None)
+    # Rejected experiments of the unshifted / transposed tiles (kept for A/B): every Nth
+    # key chunk's exp2 on the VALU, fp8 PV in the shifted tile, V^T per key chunk, bf16
+    # QK scores. Rolled q-chunk loop: SGLANG_TPU_RPA_QCHUNK_LOOP (transposed.py).
+    SGLANG_TPU_RPA_VALU_EXP2_EVERY = EnvInt(0)
+    SGLANG_TPU_RPA_TRANSPOSED_FP8_P = EnvBool(False)
+    SGLANG_TPU_RPA_CHUNK_VT = EnvBool(False)
+    SGLANG_TPU_RPA_S_BF16 = EnvBool(False)
+    # Pin the RPA prefill q block / q compute chunk of full-attention layers (bq_c is
+    # reduced to a divisor of bq); unset uses calculate_block_sizes's power-of-2 search
+    # (e.g. bq=1024, bkv=1536 on Muse Spark global layers and 512:512 on window=2048).
+    SGLANG_TPU_FORCE_RPA_PREFILL_BQ = EnvInt(None)
+    SGLANG_TPU_FORCE_RPA_PREFILL_BQ_C = EnvInt(None)
 
     @classmethod
     def names(cls) -> list[str]:

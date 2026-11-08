@@ -122,7 +122,8 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     behaviour.
     """
 
-    HEAD_DIM_ALIGNMENT = 128
+    # Must match KV_HEAD_DIM_ALIGN in ragged_paged_attention_v3.py (SGLANG_TPU_KV_HEAD_DIM_ALIGN).
+    HEAD_DIM_ALIGNMENT = tpu_envs.SGLANG_TPU_KV_HEAD_DIM_ALIGN.get()
     # Whether this layout can store exactly-fitting heads side by side (kv_pack_heads).
     PACKS_HEADS = True
     # Name of the page's interior arrangement. The torch_tpu host pool folds it
