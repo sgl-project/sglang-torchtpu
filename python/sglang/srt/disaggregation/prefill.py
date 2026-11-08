@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
 )
+from sglang.srt.disaggregation.prefix_fetcher import PrefixFetcher
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -172,6 +173,9 @@ class PrefillBootstrapQueue:
     """
     Store the requests in bootstrapping
     """
+
+    # A backend may fetch prompt prefixes between bootstrap and waiting.
+    prefix_fetcher: Optional[PrefixFetcher] = None
 
     def __init__(
         self,
@@ -539,10 +543,27 @@ class PrefillBootstrapQueue:
                 continue
 
             if poll == KVPoll.Failed:
+                if (
+                    self.prefix_fetcher is not None
+                    and self.prefix_fetcher.is_fetching(req)
+                    and self.prefix_fetcher.abandon(req)
+                ):
+                    # Recovered: the request prefills without the fetched prefix.
+                    bootstrapped_reqs.append(req)
+                    indices_to_remove.add(i)
+                    req.time_stats.set_wait_queue_entry_time()
+                    req.arrival_processed_tokens = (
+                        self.scheduler.processed_tokens_counter
+                    )
+                    continue
                 self.scheduler.handle_bootstrap_failure(req)
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
             elif poll == KVPoll.Bootstrapping:
+                if self.prefix_fetcher is not None and self.prefix_fetcher.is_fetching(
+                    req
+                ):
+                    continue  # finalized; an optimistic prefill would skip the fetch
                 if (
                     (
                         req.prefill_attempt_count
@@ -567,12 +588,18 @@ class PrefillBootstrapQueue:
                         self.scheduler.processed_tokens_counter
                     )
             elif poll == KVPoll.WaitingForInput:
-                if should_force_retry(req):  # skip checking for testing
+                if self.prefix_fetcher is not None and self.prefix_fetcher.is_fetching(
+                    req
+                ):
+                    self.prefix_fetcher.finish(req)
+                elif should_force_retry(req):  # skip checking for testing
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
                     req.prefill_attempt_count += 1
                 elif not self.finalize_bootstrap(req):
                     continue
+                elif self.prefix_fetcher is not None and self.prefix_fetcher.start(req):
+                    continue  # back through the bootstrap consensus once fetched
                 bootstrapped_reqs.append(req)
                 indices_to_remove.add(i)
                 req.time_stats.set_wait_queue_entry_time()
