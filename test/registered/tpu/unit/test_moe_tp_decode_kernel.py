@@ -6,8 +6,8 @@ and the kernel fed by SGLang's top-k output on 8 devices.
 The 8-device checks run this file as a script in subprocesses: the CPU worker
 because the host device count (XLA_FLAGS) must be set before JAX starts, the
 TPU worker so that this process never holds the TPU. The CPU worker uses TPU
-interpret mode with the race detector (routing table, DMA and semaphore
-protocols, in-kernel all-reduce, arithmetic); the TPU worker compiles the
+interpret mode with the race detector (DMA and semaphore protocols, in-kernel
+all-reduce, arithmetic on SGLang top-k output); the TPU worker compiles the
 kernel through Mosaic on one tpu7x 2x2x1 host and checks the arithmetic at
 GLM-5.3-Flash TP8 shapes, both against an f32 reference with the SwiGLU clamp.
 """
@@ -15,9 +15,17 @@ GLM-5.3-Flash TP8 shapes, both against an f32 reference with the SwiGLU clamp.
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(
-    est_time=600,
+    est_time=30,
     suite="stage-a-test-tpu-unit",
-    chips=4,
+    chips=1,
+    labels=["singlehost", "glm-5.3-flash", "tp"],
+)
+# The gate runs the admission checks only (no device, one chip slot); the
+# nightly runs the kernel on 8 devices and the interpret-mode race check.
+register_tpu_ci(
+    est_time=600,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
     labels=["singlehost", "glm-5.3-flash", "tp"],
 )
 
@@ -31,7 +39,9 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
 
+from sglang.test.ci.gate_matrix import full_matrix
 from sglang.test.test_utils import CustomTestCase
 
 try:
@@ -47,8 +57,8 @@ except Exception:  # pragma: no cover - environments without JAX
 N_RANKS = 8
 # One rank's slice of GLM-5.3-Flash at TP8 with MoE-TP (ep_size=1).
 GLM53_TP8 = dict(h=4096, e=288, i=256, fs=256)
-# h / 8 = 512: four lane groups per chunk, so the all-reduce fold path exists.
-# Few experts keep interpret mode fast; 8 experts still refill the 6-slot ring.
+# Interpret-mode config: h / 8 = 512 gives four lane groups per chunk, so the
+# all-reduce fold path exists; 8 experts still refill the 6-slot weight ring.
 SMALL = dict(h=4096, e=8, i=128, fs=128, topk=4)
 ROUTED_SCALE = 2.5
 SWIGLU_LIMIT = 10.0
@@ -98,12 +108,8 @@ class TestMoeTpDecodeAdmission(CustomTestCase):
     def _can_use(self, info, shapes, n_ranks=N_RANKS):
         from sglang_tpu.moe.pallas.moe_tp_decode import kernel
 
-        orig = pltpu.get_tpu_info
-        pltpu.get_tpu_info = info
-        try:
+        with mock.patch.object(pltpu, "get_tpu_info", info):
             return kernel.can_use_moe_tp_decode(*shapes, n_ranks=n_ranks)
-        finally:
-            pltpu.get_tpu_info = orig
 
     def test_admits_decode_buckets_at_glm53_tp8_shapes(self):
         for rows, admitted in (
@@ -131,6 +137,8 @@ class TestMoeTpDecodeAdmission(CustomTestCase):
 
 
 def _has_tpu():
+    # Device files, not jax.devices(): initializing JAX here would claim the TPU
+    # that the worker subprocess needs.
     return bool(glob.glob("/dev/vfio/[0-9]*") or glob.glob("/dev/accel*"))
 
 
@@ -156,7 +164,26 @@ def _run_worker(mode="worker"):
     return json.loads(lines[-1][len("RESULT ") :])
 
 
+def _assert_case(test, case, tolerance):
+    test.assertTrue(case["ranks_identical"], case)
+    test.assertTrue(case["padding_rows_positive_zero"], case)
+    test.assertFalse(case["races_found"], case)
+    test.assertEqual(case["nan"], 0, case)
+    if "rel_l2" in case:
+        test.assertLess(case["rel_l2"], tolerance["rel_l2"], case)
+        test.assertGreaterEqual(case["cos"], tolerance["cos"], case)
+    if "unclamped_vs_clamped_rel_l2" in case:
+        # The clamp changes the result on these inputs, so the tolerance check
+        # above would fail if the kernel ignored it.
+        test.assertGreater(case["unclamped_vs_clamped_rel_l2"], 0.1, case)
+
+
+def _tolerance(name):
+    return CLAMP_TOLERANCE if name.endswith("clamp") else TOLERANCE
+
+
 @unittest.skipUnless(_HAS_JAX, "requires JAX")
+@unittest.skipUnless(full_matrix(), "nightly only: interpret mode is slow on the gate")
 class TestMoeTpDecodeOn8Devices(CustomTestCase):
     result = None
 
@@ -168,32 +195,14 @@ class TestMoeTpDecodeOn8Devices(CustomTestCase):
     def test_race_detector_is_live(self):
         self.assertEqual(self.result["race_control"], {"racy": True, "clean": False})
 
-    def test_routing_table_from_topk_output(self):
-        self.assertTrue(self.result["routing_table_ok"])
-
-    def _check(self, case, tolerance=TOLERANCE):
-        self.assertTrue(case["ranks_identical"], case)
-        self.assertTrue(case["padding_rows_positive_zero"], case)
-        self.assertFalse(case["races_found"], case)
-        self.assertEqual(case["nan"], 0, case)
-        if "rel_l2" in case:
-            self.assertLess(case["rel_l2"], tolerance["rel_l2"], case)
-            self.assertGreaterEqual(case["cos"], tolerance["cos"], case)
-
     def test_kernel_with_topk_output(self):
-        for tokens, padded in CASES:
-            with self.subTest(tokens=tokens, padded=padded):
-                self._check(self.result["cases"][f"{tokens}:{padded}"])
-
-    def test_swiglu_clamp(self):
-        case = self.result["clamp"]
-        self._check(case, CLAMP_TOLERANCE)
-        # The clamp changes the result on these inputs, so the check above
-        # would fail if the kernel ignored it.
-        self.assertGreater(case["unclamped_vs_clamped_rel_l2"], 0.1, case)
+        for name, case in self.result["cases"].items():
+            with self.subTest(name):
+                _assert_case(self, case, _tolerance(name))
 
 
 @unittest.skipUnless(_HAS_JAX and _has_tpu(), "requires a TPU host")
+@unittest.skipUnless(full_matrix(), "nightly only: needs all 8 devices of the host")
 class TestMoeTpDecodeOnTpu(CustomTestCase):
     result = None
 
@@ -205,15 +214,7 @@ class TestMoeTpDecodeOnTpu(CustomTestCase):
     def test_kernel_on_tpu(self):
         for name, case in self.result["cases"].items():
             with self.subTest(name):
-                self.assertTrue(case["ranks_identical"], case)
-                self.assertTrue(case["padding_rows_positive_zero"], case)
-                self.assertEqual(case["nan"], 0, case)
-                tol = CLAMP_TOLERANCE if name.endswith("/clamp") else TOLERANCE
-                if "rel_l2" in case:
-                    self.assertLess(case["rel_l2"], tol["rel_l2"], case)
-                    self.assertGreaterEqual(case["cos"], tol["cos"], case)
-                if "unclamped_vs_clamped_rel_l2" in case:
-                    self.assertGreater(case["unclamped_vs_clamped_rel_l2"], 0.1, case)
+                _assert_case(self, case, _tolerance(name))
 
 
 def _fp8_columns(w):
@@ -271,6 +272,11 @@ def _reference(x, ids, w, ranks, c, limit):
     return np.asarray(jnp.where(jnp.any(valid, axis=1, keepdims=True), out, 0.0))
 
 
+def _rel_l2(got, want):
+    got, want = got.astype(np.float64), want.astype(np.float64)
+    return float(np.linalg.norm(got - want) / np.linalg.norm(want))
+
+
 def _interpret(fn, *args):
     """fn(*args) with fresh interpreter state; (out, whether races were found)."""
     from jax._src.pallas.mosaic.interpret import interpret_pallas_call
@@ -313,160 +319,145 @@ def _race_control():
     }
 
 
-def _routing_table_ok():
-    from sglang_tpu.moe.pallas.moe_tp_decode.routing import kernel_inputs
+# x, top-k ids and weights are the same on every rank (replicated).
+def _specs():
+    from jax.sharding import PartitionSpec as P
 
-    ids = jnp.array([[2, 0], [1, 3], [-1, -1]], jnp.int32)
-    w = jnp.array([[0.75, 0.25], [0.5, 0.5], [jnp.nan, jnp.nan]], jnp.float32)
-    xp, wtab, n_valid = kernel_inputs(jnp.ones((3, 8), jnp.bfloat16), ids, w, 4)
-    want = np.zeros((16, 4), np.float32)
-    want[0, 2], want[0, 0], want[1, 1], want[1, 3] = 0.75, 0.25, 0.5, 0.5
-    return (
-        xp.shape == (16, 8)
-        and int(n_valid) == 2
-        and bool(np.array_equal(np.asarray(wtab), want))
-    )
+    return (P(), P(), P(), P("d")) + (P("d"),) * 8
 
 
-def _worker(on_tpu=False):
-    from jax.sharding import Mesh, NamedSharding
+def _build_run(mesh, c):
+    """The kernel fed by SGLang top-k output, per rank under shard_map."""
     from jax.sharding import PartitionSpec as P
 
     from sglang_tpu.moe.pallas.moe_tp_decode import kernel
     from sglang_tpu.moe.pallas.moe_tp_decode.routing import kernel_inputs
 
+    def body(x, ids, w, rank, *weights):
+        m = x.shape[0]
+        xp, wtab, n_valid = kernel_inputs(x, ids, w, c["e"])
+        out = kernel.moe_tp_decode(
+            xp,
+            wtab,
+            n_valid,
+            rank.reshape(()),
+            *weights,
+            routed_scale=ROUTED_SCALE,
+            swiglu_limit=SWIGLU_LIMIT,
+            n_ranks=N_RANKS,
+        )
+        return out[:m]
+
+    return jax.jit(
+        jax.shard_map(
+            body, mesh=mesh, in_specs=_specs(), out_specs=P("d"), check_vma=False
+        )
+    )
+
+
+def _build_layer(mesh, c):
+    """Per-rank FP8 weights (and their mesh-sharded stack) plus the router."""
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    keys = jax.random.split(jax.random.key(0), N_RANKS + 3)
+    ranks = [_rank_weights(keys[r], c) for r in range(N_RANKS)]
+    stacked = [
+        jax.device_put(jnp.concatenate(ws, axis=0), NamedSharding(mesh, P("d")))
+        for ws in zip(*ranks, strict=True)
+    ]
+    router = dict(
+        gate=jax.random.normal(keys[-1], (c["e"], c["h"])) / math.sqrt(c["h"]),
+        bias=jax.random.uniform(keys[-2], (c["e"],), jnp.float32, -0.05, 0.05),
+        x_key=keys[-3],
+    )
+    return ranks, stacked, router
+
+
+def _topk_output(router, c, tokens, padded, x_scale=1.0):
+    """SGLang-style top-k output; TopK's padded rows have id -1 and NaN weights
+    (which must not reach the routing table)."""
+    x = (jax.random.normal(router["x_key"], (tokens, c["h"])) * x_scale).astype(
+        jnp.bfloat16
+    )
+    scores = jax.nn.sigmoid(x.astype(jnp.float32) @ router["gate"].T)
+    _, ids = jax.lax.top_k(scores + router["bias"], c["topk"])
+    w = jnp.take_along_axis(scores, ids, axis=-1)
+    w = w / jnp.sum(w, axis=-1, keepdims=True)
+    if padded:
+        real = tokens - padded
+        ids = ids.at[real:].set(-1)
+        w = w.at[real:].set(jnp.nan)
+    return x, ids.astype(jnp.int32), w.astype(jnp.float32)
+
+
+def _evaluate(run, mesh, layer, c, tokens, padded, on_tpu, x_scale=1.0):
+    from jax.sharding import NamedSharding
+
+    ranks, stacked, router = layer
+    x, ids, w = _topk_output(router, c, tokens, padded, x_scale)
+    rank_ids = jnp.arange(N_RANKS, dtype=jnp.int32).reshape(N_RANKS, 1)
+    small = [
+        jax.device_put(a, NamedSharding(mesh, s))
+        for a, s in zip((x, ids, w, rank_ids), _specs()[:4], strict=True)
+    ]
+    start = time.monotonic()
     if on_tpu:
-        devices = sorted(jax.devices(), key=lambda d: d.id)
-        configs = {"small": dict(SMALL), "glm53": dict(GLM53_TP8, topk=8)}
+        out, races = np.asarray(jax.block_until_ready(run(*small, *stacked))), False
+    else:
+        out, races = _interpret(run, *small, *stacked)
+    out = out.reshape(N_RANKS, tokens, c["h"]).astype(np.float32)
+    bits, real = out.view(np.uint32), tokens - padded
+    pad = out[:, real:]
+    case = dict(
+        seconds=round(time.monotonic() - start, 1),
+        ranks_identical=bool((bits == bits[0]).all()),
+        padding_rows_positive_zero=bool(np.all((pad == 0) & ~np.signbit(pad))),
+        races_found=races,
+        nan=int(np.isnan(out).sum()),
+    )
+    if real:
+        got = out[0, :real].astype(np.float64)
+        want = _reference(x, ids, w, ranks, c, SWIGLU_LIMIT)[:real]
+        cos = np.vdot(got, want) / (np.linalg.norm(got) * np.linalg.norm(want))
+        case.update(rel_l2=_rel_l2(got, want), cos=float(cos))
+        if x_scale != 1.0:
+            unclamped = _reference(x, ids, w, ranks, c, None)[:real]
+            case["unclamped_vs_clamped_rel_l2"] = _rel_l2(unclamped, want)
+    return case
+
+
+def _run_config(mesh, c, on_tpu):
+    run, layer = _build_run(mesh, c), _build_layer(mesh, c)
+    cases = {}
+    for tokens, padded in CASES:
+        name = f"{tokens}:{padded}"
+        cases[name] = _evaluate(run, mesh, layer, c, tokens, padded, on_tpu)
+        print(f"CASE {name} {json.dumps(cases[name])}", flush=True)
+    cases["clamp"] = _evaluate(
+        run, mesh, layer, c, *CLAMP_CASE, on_tpu, x_scale=CLAMP_X_SCALE
+    )
+    print(f"CASE clamp {json.dumps(cases['clamp'])}", flush=True)
+    return cases
+
+
+def _worker(on_tpu=False):
+    from jax.sharding import Mesh
+
+    if on_tpu:
+        devices, c = jax.devices(), dict(GLM53_TP8, topk=8)
     else:
         from jax._src.pallas.mosaic import tpu_info
 
         pltpu.get_tpu_info = _tpu7x
         tpu_info.get_tpu_info = _tpu7x
-        devices = sorted(jax.devices("cpu"), key=lambda d: d.id)
-        configs = {"small": dict(SMALL)}
+        devices, c = jax.devices("cpu"), dict(SMALL)
+    devices = sorted(devices, key=lambda d: d.id)
     assert len(devices) == N_RANKS, devices
     mesh = Mesh(np.asarray(devices), ("d",))
-    rank_ids = jnp.arange(N_RANKS, dtype=jnp.int32).reshape(N_RANKS, 1)
-    # x, topk ids and weights are the same on every rank (replicated).
-    specs = (P(), P(), P(), P("d")) + (P("d"),) * 8
-
-    def rel_l2(got, want):
-        got, want = got.astype(np.float64), want.astype(np.float64)
-        return float(np.linalg.norm(got - want) / np.linalg.norm(want))
-
-    def run_config(c):
-        keys = jax.random.split(jax.random.key(0), N_RANKS + 3)
-        ranks = [_rank_weights(keys[r], c) for r in range(N_RANKS)]
-        stacked = [
-            jax.device_put(jnp.concatenate(ws, axis=0), NamedSharding(mesh, P("d")))
-            for ws in zip(*ranks, strict=True)
-        ]
-        gate = jax.random.normal(keys[-1], (c["e"], c["h"])) / math.sqrt(c["h"])
-        bias = jax.random.uniform(keys[-2], (c["e"],), jnp.float32, -0.05, 0.05)
-
-        def body(x, ids, w, rank, *weights):
-            m = x.shape[0]
-            xp, wtab, n_valid = kernel_inputs(x, ids, w, c["e"])
-            out = kernel.moe_tp_decode(
-                xp,
-                wtab,
-                n_valid,
-                rank.reshape(()),
-                *weights,
-                routed_scale=ROUTED_SCALE,
-                swiglu_limit=SWIGLU_LIMIT,
-                n_ranks=N_RANKS,
-            )
-            return out[:m]
-
-        run = jax.jit(
-            jax.shard_map(
-                body, mesh=mesh, in_specs=specs, out_specs=P("d"), check_vma=False
-            )
-        )
-
-        def topk_output(tokens, padded, x_scale=1.0):
-            x = (jax.random.normal(keys[-3], (tokens, c["h"])) * x_scale).astype(
-                jnp.bfloat16
-            )
-            scores = jax.nn.sigmoid(x.astype(jnp.float32) @ gate.T)
-            _, ids = jax.lax.top_k(scores + bias, c["topk"])
-            w = jnp.take_along_axis(scores, ids, axis=-1)
-            w = w / jnp.sum(w, axis=-1, keepdims=True)
-            # TopK's padded region: trailing rows with id -1 (weights left as
-            # NaN to check they cannot reach the routing table).
-            if padded:
-                real = tokens - padded
-                ids = ids.at[real:].set(-1)
-                w = w.at[real:].set(jnp.nan)
-            return x, ids.astype(jnp.int32), w.astype(jnp.float32)
-
-        def operands(x, ids, w):
-            small = [
-                jax.device_put(a, NamedSharding(mesh, s))
-                for a, s in zip((x, ids, w, rank_ids), specs[:4], strict=True)
-            ]
-            return [*small, *stacked]
-
-        def evaluate(tokens, padded, x_scale=1.0):
-            x, ids, w = topk_output(tokens, padded, x_scale)
-            start = time.monotonic()
-            if on_tpu:
-                out = np.asarray(jax.block_until_ready(run(*operands(x, ids, w))))
-                races = False
-            else:
-                out, races = _interpret(run, *operands(x, ids, w))
-            out = out.reshape(N_RANKS, tokens, c["h"]).astype(np.float32)
-            bits = out.view(np.uint32)
-            real = tokens - padded
-            pad = out[:, real:]
-            case = dict(
-                seconds=round(time.monotonic() - start, 1),
-                ranks_identical=bool((bits == bits[0]).all()),
-                padding_rows_positive_zero=bool(np.all((pad == 0) & ~np.signbit(pad))),
-                races_found=races,
-                nan=int(np.isnan(out).sum()),
-            )
-            if real:
-                got = out[0, :real].astype(np.float64)
-                want = _reference(x, ids, w, ranks, c, SWIGLU_LIMIT)[:real]
-                case.update(
-                    rel_l2=rel_l2(got, want),
-                    cos=float(
-                        np.vdot(got, want)
-                        / (np.linalg.norm(got) * np.linalg.norm(want))
-                    ),
-                )
-                if x_scale != 1.0:
-                    unclamped = _reference(x, ids, w, ranks, c, None)[:real]
-                    case["unclamped_vs_clamped_rel_l2"] = rel_l2(unclamped, want)
-            return case
-
-        cases = {}
-        for tokens, padded in CASES:
-            cases[f"{tokens}:{padded}"] = evaluate(tokens, padded)
-            print(
-                f"CASE {tokens}:{padded} {json.dumps(cases[f'{tokens}:{padded}'])}",
-                flush=True,
-            )
-        cases["clamp"] = evaluate(*CLAMP_CASE, x_scale=CLAMP_X_SCALE)
-        print(f"CASE clamp {json.dumps(cases['clamp'])}", flush=True)
-        return cases
-
-    if on_tpu:
-        result = {"cases": {}}
-        for name, c in configs.items():
-            cases = run_config(c)
-            result["cases"].update({f"{name}/{k}": v for k, v in cases.items()})
-    else:
-        cases = run_config(configs["small"])
-        result = {
-            "race_control": _race_control(),
-            "routing_table_ok": _routing_table_ok(),
-            "cases": {k: v for k, v in cases.items() if k != "clamp"},
-            "clamp": cases["clamp"],
-        }
+    result = {"cases": _run_config(mesh, c, on_tpu)}
+    if not on_tpu:
+        result["race_control"] = _race_control()
     print("RESULT " + json.dumps(result), flush=True)
 
 
