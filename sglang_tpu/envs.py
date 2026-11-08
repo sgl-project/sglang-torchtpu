@@ -619,6 +619,9 @@ class TpuEnvs:
     # Megakernel KV write on SEQ_ALONG_LANE pools: all page read-modify-writes of a layer in
     # flight together, overlapped with the next layer's (MKConfig.kv_write_pipelined; exact).
     SGLANG_TPU_MUSE_MK_KV_WRITE_PIPELINED = EnvBool(False)
+    # Raiden HiCache transfers move each run of pages that is consecutive on both the
+    # device and the host as one segment instead of one segment per page.
+    SGLANG_TPU_RAIDEN_COALESCE_PAGES = EnvBool(False)
     # Fused-RS expert TP passes each device only its own block of routed rows, so a
     # call is no longer capped at 1/ep_size of the tokens and the expert weights are
     # streamed once per chunk rather than once per capped call.
@@ -684,6 +687,12 @@ class TpuEnvs:
     # decoding tails) and run the tails as the verify pass's MIXED range, instead of
     # permuting every layer's q/k/v rows to put the tails first and permuting the output back.
     SGLANG_TPU_MIXED_VERIFY_TAILS_LAST = EnvBool(False)
+    # Raiden HiCache: per-rank host RAM budget (GB) for the full, SWA and draft host pools
+    # together, replacing the free-RAM / local-ranks sample taken as each rank arrives.
+    SGLANG_TPU_HICACHE_HOST_BUDGET_GB = EnvFloat(None)
+    # Raiden HiCache: before building the host pools, release freed heap pages and wait for
+    # every rank, so no rank allocates while a peer still holds its weight-loading buffers.
+    SGLANG_TPU_HICACHE_TRIM_BEFORE_ALLOC = EnvBool(False)
     # Batched RPA prefill: tiles whose keys all precede their queries skip the causal
     # (and sliding-window) mask, and a power-of-two sm_scale is folded into q. Exact.
     SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK = EnvBool(False)
