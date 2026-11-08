@@ -858,6 +858,18 @@ class MuseMegakernel(torch.nn.Module):
                     )
                 ):
                     continue
+                # A VMEM-Y plan that only fits with expert depth 1 hides too little expert DMA
+                # behind long attention: cc24 x q8 took 127 ms at 512k, slower than cc28 on the
+                # streamed-Y plan (125 ms), which gives cc24 110 ms.
+                if (
+                    tiled
+                    and base_cfg.tiled_vmem_y >= 1
+                    and depth
+                    < _dev_int(
+                        "SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_DEPTH", _TILED_VY_MIN_DEPTH
+                    )
+                ):
+                    continue
                 cand = msgspec.structs.replace(
                     cand, ring_slots=slots, stream_depth=slots - 1
                 )
@@ -1185,6 +1197,8 @@ _SMEM_PAGE_TABLES_BUDGET = 512 * 2**10
 # slots overflow VMEM (cc28 x q8: 49.5 MiB scratch + 16.2 MiB spills > 63.9 MiB); the
 # streamed-Y plan fits there with a 6-slot ring.
 _TILED_VY_MIN_SLOTS = 2
+# The VMEM-Y plans' shallowest expert prefetch; shallower ones yield to the streamed-Y plan.
+_TILED_VY_MIN_DEPTH = 3
 
 
 def _swa_window_table(kv_sal: bool, n_page_entries: int) -> bool:
