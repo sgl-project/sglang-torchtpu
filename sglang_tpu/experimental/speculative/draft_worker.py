@@ -42,6 +42,7 @@ class TpuDraftWorker(ABC):
             # The draft runs at absolute target positions.
             context_length=target_runner.model_config.context_len,
         )
+        model_config = self.prepare_draft_model_config(model_config)
         # FIXME(junyanxu): ModelRunner requires gpu_id / nccl_port, which TPU never reads;
         # drop the placeholders once core makes them optional.
         with self.draft_context():
@@ -53,6 +54,10 @@ class TpuDraftWorker(ABC):
                 server_args=target_runner.server_args,
                 is_draft_worker=True,
             )
+
+    def prepare_draft_model_config(self, model_config: ModelConfig) -> ModelConfig:
+        """The draft ModelConfig the runner loads; runs before the subclass __init__ body."""
+        return model_config
 
     @contextlib.contextmanager
     def draft_context(self) -> Iterator[None]:

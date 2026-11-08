@@ -9,6 +9,7 @@ gets. Two tests drive a real unified tree: its host stack attach
 and its locks.
 """
 
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -329,12 +330,21 @@ class TestCacheConstruction(CustomTestCase):
         # this build turns off to pass the SWA guard.
         for algorithm in (spec(eagle3=True), spec(dflash=True)):
             with self.subTest(algorithm=algorithm):
-                self._check_draft_sidecar(algorithm)
+                self._check_draft_sidecar(algorithm, draft_pool=object())
 
-    def _check_draft_sidecar(self, algorithm):
+    def test_swa_draft_stays_on_device(self):
+        # An all-SWA draft lives in the target's SWA slots, which the full-only
+        # host stack does not offload.
+        self._check_draft_sidecar(
+            spec(dflash=True), draft_pool=MagicMock(spec=BaseSWAKVPool)
+        )
+
+    def _check_draft_sidecar(self, algorithm, *, draft_pool):
         ctx = make_ctx()
         cache = MagicMock()
-        draft_plan = SimpleNamespace(mode=HiCacheDraftMode.SIDECAR)
+        draft_plan = SimpleNamespace(
+            mode=HiCacheDraftMode.SIDECAR, device_pools=(draft_pool,)
+        )
 
         def upstream_build(**kwargs):
             self.assertIs(kwargs["hicache_draft_plan"], draft_plan)
@@ -352,7 +362,12 @@ class TestCacheConstruction(CustomTestCase):
                 **build_kwargs(spec_algorithm=algorithm, hicache_draft_plan=draft_plan),
             )
         auto_size.assert_called_once_with(ctx.params, draft_plan, enabled=True)
-        register_draft.assert_called_once_with(tree_cache=cache, draft_plan=draft_plan)
+        if isinstance(draft_pool, BaseSWAKVPool):
+            register_draft.assert_not_called()
+        else:
+            register_draft.assert_called_once_with(
+                tree_cache=cache, draft_plan=draft_plan
+            )
         self.assertIsNone(tpu._building_draft_plan)
 
     def test_full_only_build_requires_the_full_only_stack(self):

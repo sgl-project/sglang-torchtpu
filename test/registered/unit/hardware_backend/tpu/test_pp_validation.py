@@ -19,12 +19,13 @@ from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_confi
 from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
     SpecAuxHiddenStateConfig,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import pp_stage_chips
 from sglang_tpu.envs import envs
 from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
-    skip_spec_op_precompile_without_draft,
+    skip_spec_op_precompile_without_verify,
 )
 from sglang_tpu.pp_scheduler import _check_aux_capture_relay
 from sglang_tpu.pp_wave import num_relayed_aux_slots
@@ -325,17 +326,44 @@ class TestEagle3PipelineParallelCompat(CustomTestCase):
                     core_check_pipeline_parallel_compat, _compat_cfg(**cfg)
                 )
 
-    def test_stage_without_draft_skips_spec_op_precompile(self):
+    def _run_spec_op_precompile_hook(
+        self, *, has_draft: bool, mode: str, experimental: bool = True
+    ) -> Mock:
         original = Mock()
-        scheduler = SimpleNamespace(draft_worker=SimpleNamespace(draft_worker=None))
-        skip_spec_op_precompile_without_draft(original, scheduler)
-        original.assert_not_called()
+        scheduler = SimpleNamespace(
+            draft_worker=SimpleNamespace(draft_worker=object() if has_draft else None),
+            spec_algorithm=SpeculativeAlgorithm.DFLASH,
+        )
+        with (
+            patch(
+                "sglang_tpu.hooks.pipeline_parallel.get_disagg",
+                return_value=SimpleNamespace(disaggregation_mode=mode),
+            ),
+            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(experimental),
+            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        ):
+            skip_spec_op_precompile_without_verify(original, scheduler)
+        return original
+
+    def test_stage_without_draft_skips_spec_op_precompile(self):
+        self._run_spec_op_precompile_hook(
+            has_draft=False, mode="prefill"
+        ).assert_not_called()
+
+    def test_pd_prefill_skips_spec_op_precompile(self):
+        # A PD prefill never verifies, even on the stage that hosts the draft.
+        self._run_spec_op_precompile_hook(
+            has_draft=True, mode="prefill"
+        ).assert_not_called()
 
     def test_stage_with_draft_precompiles_spec_ops(self):
-        original = Mock()
-        scheduler = SimpleNamespace(draft_worker=SimpleNamespace(draft_worker=object()))
-        skip_spec_op_precompile_without_draft(original, scheduler)
-        original.assert_called_once_with(scheduler)
+        for mode in ("null", "decode"):
+            original = self._run_spec_op_precompile_hook(has_draft=True, mode=mode)
+            original.assert_called_once()
+        # Core spec workers still run their draft extend ops on a PD prefill.
+        self._run_spec_op_precompile_hook(
+            has_draft=True, mode="prefill", experimental=False
+        ).assert_called_once()
 
     def test_model_without_relay_rejects_captures_before_the_last_stage(self):
         model = SimpleNamespace(

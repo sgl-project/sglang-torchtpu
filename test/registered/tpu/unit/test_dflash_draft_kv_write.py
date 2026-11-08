@@ -19,7 +19,7 @@ time the two paths:
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=25, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit", chips=1)
 
 import importlib.util
 import os
@@ -79,16 +79,23 @@ class _StubAttention(nn.Module):
     real weights and the real rope exercises the same math.
     """
 
-    def __init__(self, rotary_emb: nn.Module) -> None:
+    def __init__(
+        self,
+        rotary_emb: nn.Module,
+        *,
+        kv_heads: int = KV_HEADS,
+        head_dim: int = HEAD_DIM,
+        hidden: int = HIDDEN,
+    ) -> None:
         super().__init__()
-        self.num_kv_heads = KV_HEADS
-        self.head_dim = HEAD_DIM
-        self.kv_size = KV_HEADS * HEAD_DIM
+        self.num_kv_heads = kv_heads
+        self.head_dim = head_dim
+        self.kv_size = kv_heads * head_dim
         self.rotary_emb = rotary_emb
         self.kv_weight = nn.Parameter(
-            torch.randn(2 * self.kv_size, HIDDEN, dtype=DTYPE) / HIDDEN**0.5
+            torch.randn(2 * self.kv_size, hidden, dtype=DTYPE) / hidden**0.5
         )
-        self.k_norm_weight = nn.Parameter(torch.rand(HEAD_DIM, dtype=DTYPE) + 0.5)
+        self.k_norm_weight = nn.Parameter(torch.rand(head_dim, dtype=DTYPE) + 0.5)
         self.eps = 1e-6
 
     def kv_proj_only(
@@ -110,14 +117,16 @@ class _StubAttention(nn.Module):
 class _StubDraftModel(nn.Module):
     """A DFlash draft model reduced to what the KV write reads."""
 
-    def __init__(self, rotary_emb: nn.Module) -> None:
+    def __init__(
+        self, rotary_emb: nn.Module, *, num_layers: int = LAYERS, **attn_kwargs: int
+    ) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
             nn.Module()
-            for _ in range(LAYERS)  # containers for self_attn
+            for _ in range(num_layers)  # containers for self_attn
         )
         for layer in self.layers:
-            layer.self_attn = _StubAttention(rotary_emb)
+            layer.self_attn = _StubAttention(rotary_emb, **attn_kwargs)
 
     def prepare_context_hidden_for_kv(
         self, layer: nn.Module, ctx_hidden: torch.Tensor
@@ -575,6 +584,298 @@ class TestDflashMlaDraftKvWrite(CustomTestCase):
             torch.testing.assert_close(
                 fused[layer], ref[layer], atol=0, rtol=0, msg=f"L{layer}"
             )
+
+
+# The windowed Muse Spark DFlash2 draft: 5 layers, head_dim 128, page 256, 1 KV
+# head per rank on the TP8 decode and all 8 on the TP1 (PP8) prefill.
+SAL_LAYERS = 5
+SAL_HEAD_DIM = 128
+SAL_HIDDEN = 512
+SAL_PAGE = 256
+SAL_PAGES = 64
+
+
+def _sal_slots(*, head_offset: int, num_tokens: int, pad_rows: int) -> torch.Tensor:
+    """Allocator-like slots over SAL_PAGE pages, then pad_rows slot-0 padding rows."""
+    slots: list[int] = []
+    offset, page = head_offset, 0
+    while len(slots) < num_tokens:
+        take = min(SAL_PAGE - offset, num_tokens - len(slots))
+        # Page 0 is the dummy page; 13 is coprime with SAL_PAGES - 1.
+        base = (1 + (page * 13 + 3) % (SAL_PAGES - 1)) * SAL_PAGE + offset
+        slots.extend(range(base, base + take))
+        offset, page = 0, page + 1
+    return torch.tensor(slots + [0] * pad_rows, dtype=torch.int64, device=DEVICE)
+
+
+def _sal_verify_slots(starts: list[int], commits: list[int], block: int):
+    """Verify slots [bs, block] (a block may cross a page) and commit counts."""
+    loc2d = torch.tensor(starts)[:, None] + torch.arange(block)[None, :]
+    return loc2d.to(DEVICE), torch.tensor(commits, dtype=torch.int32, device=DEVICE)
+
+
+def _new_sal_pool(*, kv_heads: int, dtype: torch.dtype):
+    from sglang_tpu.kv_pool import TpuSeqAlongLaneKVPool
+
+    return TpuSeqAlongLaneKVPool(
+        size=SAL_PAGES * SAL_PAGE,
+        page_size=SAL_PAGE,
+        dtype=dtype,
+        head_num=kv_heads,
+        head_dim=SAL_HEAD_DIM,
+        layer_num=SAL_LAYERS,
+        device=DEVICE,
+        enable_memory_saver=False,
+    )
+
+
+def _new_fused_pool(*, kv_heads: int, dtype: torch.dtype):
+    from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+    return TpuFusedMHATokenToKVPool(
+        size=SAL_PAGES * SAL_PAGE,
+        page_size=SAL_PAGE,
+        dtype=dtype,
+        head_num=kv_heads,
+        head_dim=SAL_HEAD_DIM,
+        layer_num=SAL_LAYERS,
+        device=DEVICE,
+        enable_memory_saver=False,
+    )
+
+
+def _sal_logical(buf: torch.Tensor, heads_x2: int) -> torch.Tensor:
+    """[pages, 2 * kv, hd_words, packing, page] on CPU as [slots, 2 * kv, head_dim]."""
+    pages, _, words, packing, page = buf.shape
+    flat = buf.cpu().permute(0, 4, 1, 2, 3).reshape(pages * page, heads_x2, -1)
+    return flat[..., :SAL_HEAD_DIM]
+
+
+def _fused_logical(buf: torch.Tensor, heads_x2: int) -> torch.Tensor:
+    """[pages, page, kv_words, packing, padded_hd] on CPU as [slots, 2 * kv, head_dim]."""
+    pages, page = buf.shape[:2]
+    flat = buf.cpu().reshape(pages * page, -1, buf.shape[-1])
+    return flat[:, :heads_x2, :SAL_HEAD_DIM]
+
+
+def _as_bytes(t: torch.Tensor) -> torch.Tensor:
+    return t.contiguous().view(torch.uint8)
+
+
+@unittest.skipIf(_skip_if_no_tpu(), "requires torch_tpu")
+class TestSalSpanWrite(CustomTestCase):
+    """The vendored SEQ_ALONG_LANE span write equals a reference scatter, bytes exact.
+
+    The pool starts from random bytes, so every slot outside the spans must come
+    back unchanged: partial 128-token tiles are read-modify-written.
+    """
+
+    def _check(self, *, kv_heads, dtype, cache_loc, cache_loc_2d=None, commits=None):
+        from sglang_tpu.dflash_draft_kv_write import get_contiguous_slot_spans
+        from sglang_tpu.kv_sal_span_write import sal_span_write_kv
+
+        torch.manual_seed(0)
+        pool = _new_sal_pool(kv_heads=kv_heads, dtype=dtype)
+        for buf in pool.kv_buffer:
+            buf.copy_(torch.randn(buf.shape, device=DEVICE).to(dtype))
+        before = [_sal_logical(buf, 2 * kv_heads) for buf in pool.kv_buffer]
+        num_tokens = int(cache_loc.shape[0])
+        shape = (SAL_LAYERS, num_tokens, kv_heads, SAL_HEAD_DIM)
+        k = torch.randn(shape, dtype=DTYPE, device=DEVICE)
+        v = torch.randn(shape, dtype=DTYPE, device=DEVICE)
+
+        def write(*, draft_model, kv_pool, k, v, cache_loc, cache_loc_2d, commits):
+            del draft_model
+            dst, src, lens, _ = get_contiguous_slot_spans(
+                page_size=SAL_PAGE,
+                cache_loc=cache_loc,
+                cache_loc_2d=cache_loc_2d,
+                commit_lens=commits,
+                max_num_reqs=8,
+            )
+            sal_span_write_kv(
+                dst_starts=dst,
+                src_starts=src,
+                span_lens=lens,
+                k=k,
+                v=v,
+                kv_bufs=kv_pool.kv_buffer,
+            )
+
+        _compiled(write, draft_model=nn.Linear(1, 1).to(DEVICE), kv_pool=pool)(
+            k=k, v=v, cache_loc=cache_loc, cache_loc_2d=cache_loc_2d, commits=commits
+        )
+        torch.accelerator.synchronize()
+
+        if cache_loc_2d is None:
+            rows = (cache_loc != 0).cpu()
+            slots = cache_loc.cpu()
+        else:
+            block = cache_loc_2d.shape[1]
+            rows = (torch.arange(block)[None, :] < commits.cpu()[:, None]).reshape(-1)
+            slots = cache_loc_2d.cpu().reshape(-1)
+        kv = torch.stack([k, v], dim=3).reshape(
+            SAL_LAYERS, num_tokens, 2 * kv_heads, SAL_HEAD_DIM
+        )
+        kv = kv.to(dtype).cpu()
+        for layer, buf in enumerate(pool.kv_buffer):
+            want = before[layer].clone()
+            want[slots[rows]] = kv[layer][rows]
+            got = _sal_logical(buf, 2 * kv_heads)
+            self.assertTrue(
+                torch.equal(_as_bytes(got), _as_bytes(want)), f"layer {layer}"
+            )
+
+    def test_extend_spans(self):
+        """Mid-page start, page crossings, a partial last tile and padding rows;
+        a page-aligned 256-token run also takes the aligned DMA path."""
+        cases = (
+            ("mid_page", dict(head_offset=91, num_tokens=700, pad_rows=13)),
+            ("aligned", dict(head_offset=0, num_tokens=512, pad_rows=0)),
+            ("short", dict(head_offset=250, num_tokens=9, pad_rows=7)),
+        )
+        for kv_heads in (1, 2, 8):
+            for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+                for name, slots in cases:
+                    with self.subTest(case=name, kv_heads=kv_heads, dtype=dtype):
+                        self._check(
+                            kv_heads=kv_heads,
+                            dtype=dtype,
+                            cache_loc=_sal_slots(**slots),
+                        )
+
+    def test_verify_spans(self):
+        """Commit spans: whole, partial, none, and a block crossing a page."""
+        block = 8
+        loc2d, commits = _sal_verify_slots(
+            [SAL_PAGE * 3 + 5, SAL_PAGE * 7 + 252, SAL_PAGE * 9, SAL_PAGE * 11 + 100],
+            [8, 6, 0, 3],
+            block,
+        )
+        for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+            with self.subTest(dtype=dtype):
+                self._check(
+                    kv_heads=1,
+                    dtype=dtype,
+                    cache_loc=loc2d.reshape(-1),
+                    cache_loc_2d=loc2d,
+                    commits=commits,
+                )
+
+
+@unittest.skipIf(_skip_if_no_tpu(), "requires torch_tpu")
+class TestDflashSalDraftKvWrite(CustomTestCase):
+    """dflash_write_draft_kv on a SEQ_ALONG_LANE pool matches the fused pool.
+
+    Both run the same projection; the SAL path rotates K in XLA while the fused
+    kernel rotates in Pallas, so bf16 K may differ by an ulp and fp8 by one fp8
+    step after the cast. V, padding rows and untouched slots must match exactly.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from sglang.srt.layers.rotary_embedding import get_rope
+        from sglang.srt.runtime_context import publish
+        from sglang.srt.server_args import ServerArgs
+
+        publish(ServerArgs(model_path="dummy"), role="test")
+        torch.manual_seed(2)
+        rope = get_rope(
+            SAL_HEAD_DIM,
+            rotary_dim=SAL_HEAD_DIM,
+            max_position=MAX_POSITION,
+            base=ROPE_THETA,
+            is_neox_style=True,
+            dtype=DTYPE,
+        )
+        rope.cos_sin_cache = rope.cos_sin_cache.to(DEVICE)
+        cls.models = {
+            kv_heads: _StubDraftModel(
+                rope,
+                num_layers=SAL_LAYERS,
+                kv_heads=kv_heads,
+                head_dim=SAL_HEAD_DIM,
+                hidden=SAL_HIDDEN,
+            ).to(DEVICE)
+            for kv_heads in (1, 8)
+        }
+
+    def _check(self, *, kv_heads, dtype, cache_loc, positions, **verify):
+        from sglang_tpu.dflash_draft_kv_write import dflash_write_draft_kv
+
+        model = self.models[kv_heads]
+        ctx_hidden = torch.randn(
+            (int(cache_loc.shape[0]), SAL_HIDDEN), dtype=DTYPE, device=DEVICE
+        )
+        kwargs = dict(
+            ctx_hidden=ctx_hidden,
+            ctx_positions=positions,
+            ctx_cache_loc=cache_loc,
+            cache_loc_2d=verify.get("cache_loc_2d"),
+            commit_lens=verify.get("commit_lens"),
+        )
+        pools = {}
+        for name, make in (("sal", _new_sal_pool), ("fused", _new_fused_pool)):
+            pools[name] = make(kv_heads=kv_heads, dtype=dtype)
+            _compiled(
+                dflash_write_draft_kv,
+                draft_model=model,
+                kv_pool=pools[name],
+                max_num_reqs=8,
+            )(**kwargs)
+        torch.accelerator.synchronize()
+        for layer in range(SAL_LAYERS):
+            got = _sal_logical(pools["sal"].kv_buffer[layer], 2 * kv_heads)
+            want = _fused_logical(pools["fused"].kv_buffer[layer], 2 * kv_heads)
+            msg = f"layer {layer}"
+            # V rows (odd heads) and every slot the write skipped are bit equal.
+            self.assertTrue(
+                torch.equal(_as_bytes(got[:, 1::2]), _as_bytes(want[:, 1::2])), msg
+            )
+            got_k, want_k = got[:, 0::2].float(), want[:, 0::2].float()
+            if dtype == torch.bfloat16:
+                torch.testing.assert_close(got_k, want_k, atol=1e-2, rtol=1e-2, msg=msg)
+                continue
+            # One e4m3 step is 2^-3 of the value; flips need a bf16 ulp at a tie.
+            torch.testing.assert_close(
+                got_k, want_k, atol=2.0**-9, rtol=2.0**-3, msg=msg
+            )
+            flipped = (got_k != want_k).float().mean().item()
+            self.assertLess(flipped, 0.01, msg)
+
+    def test_extend(self):
+        for kv_heads in (1, 8):
+            for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+                with self.subTest(kv_heads=kv_heads, dtype=dtype):
+                    cache_loc = _sal_slots(head_offset=91, num_tokens=700, pad_rows=13)
+                    positions = torch.arange(
+                        3000, 3000 + int(cache_loc.shape[0]), device=DEVICE
+                    )
+                    self._check(
+                        kv_heads=kv_heads,
+                        dtype=dtype,
+                        cache_loc=cache_loc,
+                        positions=positions,
+                    )
+
+    def test_verify(self):
+        block = 8
+        loc2d, commits = _sal_verify_slots(
+            [SAL_PAGE * 3 + 5, SAL_PAGE * 7 + 252, SAL_PAGE * 9, SAL_PAGE * 11 + 100],
+            [8, 6, 0, 3],
+            block,
+        )
+        valid = torch.arange(block, device=DEVICE)[None, :] < commits[:, None]
+        for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+            with self.subTest(dtype=dtype):
+                self._check(
+                    kv_heads=1,
+                    dtype=dtype,
+                    cache_loc=torch.where(valid, loc2d, 0).reshape(-1),
+                    positions=torch.arange(loc2d.numel(), device=DEVICE) + 5000,
+                    cache_loc_2d=loc2d,
+                    commit_lens=commits,
+                )
 
 
 if __name__ == "__main__":

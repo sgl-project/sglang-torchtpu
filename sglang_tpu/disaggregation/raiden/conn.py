@@ -464,7 +464,9 @@ class RaidenKVManager(
             and self._committed_state_row is None
         ):
             raise RuntimeError("Raiden GDN state tensors need a committed-row mapping")
-        if kv_caches.num_hidden_full and not self._pipeline_enabled:
+        if (
+            kv_caches.num_hidden_full or kv_caches.num_hidden_swa
+        ) and not self._pipeline_enabled:
             raise NotImplementedError(
                 "SGLANG_TPU_PD_DECODE_DRAFT_PREFILL moves the draft hidden rows as a "
                 "named layer pool; it needs the Raiden pipeline transfer (a PP "

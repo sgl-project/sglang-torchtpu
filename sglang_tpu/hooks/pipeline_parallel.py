@@ -10,10 +10,13 @@ check_pipeline_parallel_compat
   Upstream PR or issue: not filed.
   Remove when: core asks the platform which speculative algorithms PP supports.
 
-skip_spec_op_precompile_without_draft
+skip_spec_op_precompile_without_verify
   Why: Under PP only the last stage hosts the draft; the other stages keep a
-       draftless spec worker and run no spec ops.
-  How: AROUND Scheduler.precompile_tpu_spec_ops; skip it on those stages.
+       draftless spec worker and run no spec ops. A TpuSpecWorker PD prefill
+       never verifies, and these ops serve verify (80 s on a Muse PP8 stage);
+       core EAGLE still runs its draft extend op there.
+  How: AROUND Scheduler.precompile_tpu_spec_ops; skip it on draftless stages
+       and on an experimental-spec --disaggregation-mode prefill server.
   Upstream PR or issue: not filed.
   Remove when: precompile_tpu_spec_ops moves into sglang_tpu.
 """
@@ -23,6 +26,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.runtime_context import get_disagg
 
 
 class _AsAlgorithm:
@@ -56,9 +60,14 @@ def check_pipeline_parallel_compat(original: Callable[[Any], None], cfg: Any) ->
     original(cfg)
 
 
-def skip_spec_op_precompile_without_draft(
+def skip_spec_op_precompile_without_verify(
     original: Callable[[Scheduler], None], scheduler: Scheduler
 ) -> None:
-    if scheduler.draft_worker.draft_worker is None:
+    from sglang_tpu.experimental import is_experimental_spec
+
+    if scheduler.draft_worker.draft_worker is None or (
+        get_disagg().disaggregation_mode == "prefill"
+        and is_experimental_spec(scheduler.spec_algorithm)
+    ):
         return
     original(scheduler)

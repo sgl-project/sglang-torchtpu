@@ -22,7 +22,10 @@ from sglang_tpu.experimental.compilation.block_compile_policy import (
 )
 from sglang_tpu.experimental.speculative.draft_worker import TpuDraftWorker
 from sglang_tpu.experimental.speculative.spec_ops import sample_tokens
-from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+from sglang_tpu.kv_pool import (
+    TpuBlockMajorMHATokenToKVPool,
+    TpuFusedMHATokenToKVPool,
+)
 
 # (step_logits [pbs, V], step_idx) -> sampled [pbs] tokens.
 DraftSampler = Callable[[torch.Tensor, int], torch.Tensor]
@@ -156,9 +159,14 @@ class TpuBlockDraftWorker(TpuDraftWorker):
         if isinstance(kv_pool, SWAKVPool):
             # Every layer of a hybrid-SWA draft is SWA; callers pass SWA slots.
             kv_pool = kv_pool.swa_kv_pool
-        if not isinstance(kv_pool, TpuFusedMHATokenToKVPool):
+        # The writer branches on SEQ_ALONG_LANE; the block-major subclass has
+        # neither layout.
+        if not isinstance(kv_pool, TpuFusedMHATokenToKVPool) or isinstance(
+            kv_pool, TpuBlockMajorMHATokenToKVPool
+        ):
             raise TypeError(
-                f"{type(self).__name__} needs TpuFusedMHATokenToKVPool, got {type(kv_pool)}."
+                f"{type(self).__name__} needs TpuFusedMHATokenToKVPool or "
+                f"TpuSeqAlongLaneKVPool, got {type(kv_pool)}."
             )
         draft_model = self._draft_model()
         dflash_write_draft_kv(
