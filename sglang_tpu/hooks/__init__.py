@@ -12,6 +12,7 @@ import logging
 
 from sglang.srt.plugins.hook_registry import HookType
 from sglang_tpu.hooks.all_gather_via_all_reduce import (
+    gather_and_crop_vocab,
     gather_attn_tp_logits,
     wrap_logits_gatherer,
 )
@@ -273,6 +274,11 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.layers.logits_processor.LogitsProcessor._gather_attn_tp_logits",
         gather_attn_tp_logits,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.dspark.gather_and_crop_vocab",
+        gather_and_crop_vocab,
         HookType.AROUND,
     ),
     (

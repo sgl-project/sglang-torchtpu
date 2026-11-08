@@ -14,10 +14,11 @@ index and the group sums the buffers. Adding zero leaves every value unchanged,
 so the result equals a correct all-gather; the only bit-level difference is that
 a -0.0 element comes back as +0.0.
 
-The workaround is scoped to the two vocabulary logits gathers in
-``LogitsProcessor``: the TP gather (``_logits_gatherer``, which falls back to
+The workaround is scoped to the vocabulary logits gathers: in
+``LogitsProcessor``, the TP gather (``_logits_gatherer``, which falls back to
 ``tensor_model_parallel_all_gather`` on TPU) and the attention-TP gather used
-with ``--enable-dp-lm-head`` (``_gather_attn_tp_logits``). ``GroupCoordinator``
+with ``--enable-dp-lm-head`` (``_gather_attn_tp_logits``); and the speculative
+draft gather ``sglang.srt.models.dspark.gather_and_crop_vocab``. ``GroupCoordinator``
 collectives stay native. Hooking them changed every per-layer gather (DP-attention
 token gathers, fused-MoE token gathers), moved about 2x the bytes, and slowed
 GLM-5.3-Flash DP8 by 8 to 14% (sgl-project/sglang-torchtpu#2013). A similar
@@ -116,3 +117,21 @@ def gather_attn_tp_logits_around(
     ):
         return original(processor, logits)
     return gather_last_dim_via_all_reduce(group, logits)
+
+
+def gather_and_crop_vocab_around(
+    original: Callable[..., torch.Tensor],
+    local_logits: torch.Tensor,
+    lm_head: Any,
+) -> torch.Tensor:
+    """AROUND hook for ``sglang.srt.models.dspark.gather_and_crop_vocab``.
+
+    The speculative draft logits gather (MTP, EAGLE3 and DSpark draft workers)
+    runs inside Dynamo-compiled draft graphs, so it gets the same treatment as
+    the ``LogitsProcessor`` TP gather.
+    """
+    group = get_parallel().tp_group
+    if not _use_all_reduce_gather(group):
+        return original(local_logits, lm_head)
+    full_logits = gather_last_dim_via_all_reduce(group, local_logits)
+    return full_logits[..., : int(lm_head.org_vocab_size)]

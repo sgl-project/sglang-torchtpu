@@ -176,6 +176,31 @@ class TestLogitsGatherHooks(CustomTestCase):
                 original.assert_called_once_with(processor, rows)
                 group.all_reduce.assert_not_called()
 
+    def test_draft_vocab_gather_under_dynamo_uses_the_all_reduce_and_crops(self):
+        blocks = _blocks(8, (2, 16), torch.bfloat16)
+        group = _SimulatedGroup(blocks, 1)
+        lm_head = SimpleNamespace(org_vocab_size=120)
+        original = mock.Mock()
+
+        def traced(local_logits):
+            return agar.gather_and_crop_vocab_around(original, local_logits, lm_head)
+
+        with mock.patch.object(agar, "get_parallel", return_value=_parallel(group)):
+            got = torch.compile(backend="eager")(traced)(blocks[1])
+
+        original.assert_not_called()
+        self.assertTrue(torch.equal(got, torch.cat(blocks, dim=-1)[..., :120]))
+
+    def test_draft_vocab_gather_in_eager_uses_the_original(self):
+        group = mock.Mock(world_size=8)
+        original = mock.Mock(return_value="native")
+        logits, lm_head = torch.ones(2, 16), SimpleNamespace(org_vocab_size=120)
+        with mock.patch.object(agar, "get_parallel", return_value=_parallel(group)):
+            got = agar.gather_and_crop_vocab_around(original, logits, lm_head)
+        self.assertEqual(got, "native")
+        original.assert_called_once_with(logits, lm_head)
+        group.all_reduce.assert_not_called()
+
     def test_init_hook_wraps_the_logits_gatherer_once(self):
         inner = mock.Mock()
         processor = SimpleNamespace(_logits_gatherer=inner)
@@ -197,6 +222,10 @@ class TestHookRegistration(CustomTestCase):
         self.assertIs(
             by_target[logits + "_gather_attn_tp_logits"],
             agar.gather_attn_tp_logits_around,
+        )
+        self.assertIs(
+            by_target["sglang.srt.models.dspark.gather_and_crop_vocab"],
+            agar.gather_and_crop_vocab_around,
         )
         # Per-layer gathers (DP-attention, fused MoE) go through these; they
         # must keep the native collective (#2013).

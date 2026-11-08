@@ -10,7 +10,9 @@ logits gathers
        correctly.
   How: AFTER LogitsProcessor.__init__ wraps _logits_gatherer (TP logits
        gather) and AROUND LogitsProcessor._gather_attn_tp_logits (attention-TP
-       logits gather with --enable-dp-lm-head). While Dynamo traces
+       logits gather with --enable-dp-lm-head), and AROUND
+       sglang.srt.models.dspark.gather_and_crop_vocab (speculative draft
+       logits gather). While Dynamo traces
        (torch.compiler.is_dynamo_compiling()) on a multi-rank group, the gather
        is rebuilt from one all-reduce over a zero-padded [world, *block] buffer
        (sglang_tpu.all_gather_via_all_reduce). GroupCoordinator collectives
@@ -23,8 +25,15 @@ logits gathers
 """
 
 from sglang_tpu.all_gather_via_all_reduce import (
+    gather_and_crop_vocab_around as gather_and_crop_vocab,
+)
+from sglang_tpu.all_gather_via_all_reduce import (
     gather_attn_tp_logits_around as gather_attn_tp_logits,
 )
 from sglang_tpu.all_gather_via_all_reduce import wrap_logits_gatherer
 
-__all__ = ["gather_attn_tp_logits", "wrap_logits_gatherer"]
+__all__ = [
+    "gather_and_crop_vocab",
+    "gather_attn_tp_logits",
+    "wrap_logits_gatherer",
+]
