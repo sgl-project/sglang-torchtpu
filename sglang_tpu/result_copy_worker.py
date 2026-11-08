@@ -6,6 +6,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 
@@ -53,6 +54,9 @@ def _draft_tail(result: GenerationBatchResult) -> Optional[torch.Tensor]:
         return draft_input.kv_fence_tail
     if isinstance(draft_input, EagleDraftInput):
         return draft_input.topk_index
+    if isinstance(draft_input, DFlashDraftInputV2):
+        # The DFLASH v2 draft KV append runs after verify.
+        return draft_input.draft_kv_write_tail
     return None
 
 
