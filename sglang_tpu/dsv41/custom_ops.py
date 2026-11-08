@@ -72,6 +72,24 @@ def index_geometry(words, pages, page_records, storage_records):
     return physical, PackedFP8Layout(words.shape[0] // rows, page_size=storage_records)
 
 
+def mask_pages_past_rows(physical, requests, lengths, storage_records):
+    """Invalidate storage pages at or past each page-table row's longest query.
+
+    Columns past a request's context hold leftover req_to_token entries: 0 in a
+    never-used row, so every one names page 0. Those keys already score -inf
+    by length; -1 only lets the dense scorer spread their masked reads instead
+    of queueing hundreds of DMAs of one page per K tile.
+    """
+    count = physical.shape[0]
+    live = (requests >= 0) & (requests < count)
+    # A [tokens, rows] TensorCore comparison; a segment max would lower to a
+    # SparseCore scatter.
+    owner = live[:, None] & (requests[:, None] == jnp.arange(count, dtype=jnp.int32))
+    row_keys = jnp.max(jnp.where(owner, lengths[:, None], 0), axis=0, initial=0)
+    starts = jnp.arange(physical.shape[1], dtype=jnp.int32) * storage_records
+    return jnp.where(starts[None, :] < row_keys[:, None], physical, -1)
+
+
 def select(
     q: jax.Array,
     weights: jax.Array,
@@ -95,6 +113,7 @@ def select(
     """
     del layer_id
     physical, layout = index_geometry(words, pages, page_records, storage_records)
+    physical = mask_pages_past_rows(physical, requests, lengths, storage_records)
     live = (requests >= 0) & (requests < pages.shape[0])
     batch_max = jnp.max(jnp.where(live, lengths, 0), initial=0).reshape(1)
     return select_fp8_indexer_jax(
