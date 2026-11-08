@@ -30,6 +30,7 @@ def route_glm_flash_megakernel(result: None, runner: Any, *args, **kwargs) -> No
     from sglang_tpu.envs import envs as tpu_envs
 
     args = runner.model_runner.server_args
+    ops.require_expert_tp(args.ep_size)
     n_query = (
         (args.speculative_num_draft_tokens or 1) if args.speculative_algorithm else 1
     )
