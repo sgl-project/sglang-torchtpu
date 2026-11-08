@@ -396,8 +396,11 @@ def main():
             else ""
         ),
         "TEST_FILE_FLAG": f"--test-file {a.test_file}" if a.test_file else "",
+        # Short chips=1 files share one interpreter per chip; see chip_parallel.py.
         "CHIP_WORKERS_FLAG": (
-            f"--tpu-chip-workers {a.tpu_chip_workers}" if a.tpu_chip_workers > 1 else ""
+            f"--tpu-chip-workers {a.tpu_chip_workers} --tpu-chip-batch-short-files"
+            if a.tpu_chip_workers > 1
+            else ""
         ),
         # Sweeps trimmed for the gate run whole on the nightly; see
         # python/sglang/test/ci/gate_matrix.py.
