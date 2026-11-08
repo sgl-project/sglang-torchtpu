@@ -515,6 +515,9 @@ class TpuEnvs:
     # assigns each shared graph to the least-loaded rank (shared_compile_cost.py).
     # Empty: round-robin owners.
     SGLANG_TPU_SHARED_COMPILE_COST_PROFILE = EnvStr("")
+    # DFlash: verify only the first WIDTH tokens of each draft block once the decode batch
+    # reaches MIN_BS requests (dflash_adaptive_verify.py); "" verifies the full block.
+    SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY = EnvStr("")
     # Fused KV pool stores a rank's heads side by side in one 128-lane row when they
     # fit exactly (e.g. 2 x head_dim 64): half the bytes of a zero-padded row per head.
     SGLANG_TPU_KV_PACK_HEADS = EnvBool(False)
@@ -522,6 +525,17 @@ class TpuEnvs:
     # axis. 64 halves an unpacked head_dim-64 pool; fp8 then reaches 256 B per token at
     # two KV heads per rank. Must stay >= the sublane x packing tile.
     SGLANG_TPU_KV_HEAD_DIM_ALIGN = EnvInt(128)
+    # Fixed batch shape of MIXED (mixed-chunk) batches; unset = the largest bs bucket. Raise it
+    # when more requests decode inside mixed chunks than any decode bucket holds.
+    SGLANG_TPU_MIXED_MAX_BS = EnvInt(None)
+    # Batched RPA: run target-verify rows (speculative_num_draft_tokens per request) as MIXED
+    # with a q block of that width; the prefill block search otherwise pads each request's
+    # rows to a ~2048-row block (16 x 8 rows at 150K context: 42 -> 2.2 ms per layer).
+    SGLANG_TPU_RPA_BATCHED_VERIFY_BLOCKS = EnvBool(False)
+    # Batched RPA, mixed verify: keep the MIXED batch's order (prefill sequences, then the
+    # decoding tails) and run the tails as the verify pass's MIXED range, instead of
+    # permuting every layer's q/k/v rows to put the tails first and permuting the output back.
+    SGLANG_TPU_MIXED_VERIFY_TAILS_LAST = EnvBool(False)
     # Batched RPA prefill: tiles whose keys all precede their queries skip the causal
     # (and sliding-window) mask, and a power-of-two sm_scale is folded into q. Exact.
     SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK = EnvBool(False)

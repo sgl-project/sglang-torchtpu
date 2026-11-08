@@ -220,6 +220,7 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     Req,
     ScheduleBatch,
+    mixed_tail_width,
     retract_all,
 )
 from sglang.srt.managers.schedule_policy import (
@@ -1903,6 +1904,9 @@ class Scheduler(
         from sglang_tpu.compilation.spec_decode_compile_policy import (
             BaseSpecDecodeCompilePolicyMixin,
         )
+        from sglang_tpu.compilation.spec_decode_compile_policy_dflash import (
+            DFlashSpecDecodeCompilePolicyMixin,
+        )
         from sglang_tpu.spec_op_precompile import (
             precompile_spec_v2_ops,
         )
@@ -1921,15 +1925,21 @@ class Scheduler(
             or draft_runner.model.config.vocab_size
         )
 
-        precompile_spec_v2_ops(
-            device=torch.device(self.tp_worker.model_runner.device),
-            physical_batch_buckets=compile_policy.b_bucketer.buckets,
-            num_verify_tokens=compile_policy.draft_token_num,
-            vocab_size=self.model_config.vocab_size,
-            draft_vocab_size=draft_vocab_size,
-            hidden_size=hidden_size,
-            hidden_dtype=hidden_dtype,
-        )
+        verify_shapes = {
+            compile_policy.draft_token_num: compile_policy.full_verify_buckets()
+        }
+        if isinstance(compile_policy, DFlashSpecDecodeCompilePolicyMixin):
+            verify_shapes.update(compile_policy.narrow_verify_shapes())
+        for num_verify_tokens, buckets in verify_shapes.items():
+            precompile_spec_v2_ops(
+                device=torch.device(self.tp_worker.model_runner.device),
+                physical_batch_buckets=buckets,
+                num_verify_tokens=num_verify_tokens,
+                vocab_size=self.model_config.vocab_size,
+                draft_vocab_size=draft_vocab_size,
+                hidden_size=hidden_size,
+                hidden_dtype=hidden_dtype,
+            )
 
     def maybe_init_ngram_embedding(self):
         self.ngram_embedding_manager = (
@@ -4372,7 +4382,11 @@ class Scheduler(
             self.new_token_ratio_tracker.current,
             self.max_prefill_tokens,
             chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            (
+                running_bs * mixed_tail_width(self.spec_algorithm)
+                if self.is_mixed_chunk
+                else 0
+            ),
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,

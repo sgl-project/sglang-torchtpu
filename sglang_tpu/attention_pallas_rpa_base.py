@@ -36,7 +36,7 @@ Design notes
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Protocol
+from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol
 
 import torch
 
@@ -156,6 +156,57 @@ class PallasForwardMetadata:
     dcp_kv_lens_global: torch.Tensor | None = None
     # i32[1]  this rank's index inside its DCP group
     dcp_cp_rank: torch.Tensor | None = None
+    # Mixed verify only: i32[num_tokens] source row of each kernel row (the DECODE-range
+    # sequences first), and its inverse. The kernel sees sequences in that order.
+    row_perm: torch.Tensor | None = None
+    row_unperm: torch.Tensor | None = None
+
+
+class _MixedVerifyOrder(NamedTuple):
+    # i64[bs] kernel sequence order; i32[num_tokens] source row of each kernel row and
+    # its inverse; i32[3] distribution
+    seq_order: torch.Tensor
+    row_perm: torch.Tensor
+    row_unperm: torch.Tensor
+    distribution: torch.Tensor
+
+
+def _mixed_verify_order(
+    *, query_lens: tuple[int, ...], live: int, width: int, num_tokens: int
+) -> _MixedVerifyOrder:
+    """Kernel order for a mixed-verify extend: live sequences of exactly ``width`` query
+    rows first (the DECODE range, attended like a verify block), then the other live
+    sequences, then padding; token rows follow their sequences."""
+    starts = [0]
+    for n in query_lens:
+        starts.append(starts[-1] + n)
+    narrow = [i for i in range(live) if query_lens[i] == width]
+    wide = [i for i in range(live) if query_lens[i] != width]
+    order = narrow + wide + list(range(live, len(query_lens)))
+    row_perm = torch.cat(
+        [torch.arange(starts[i], starts[i + 1]) for i in order]
+        + [torch.arange(starts[-1], num_tokens)]
+    )
+    row_unperm = torch.empty_like(row_perm)
+    row_unperm[row_perm] = torch.arange(num_tokens)
+    return _MixedVerifyOrder(
+        seq_order=torch.tensor(order, dtype=torch.int64),
+        row_perm=row_perm.to(torch.int32),
+        row_unperm=row_unperm.to(torch.int32),
+        distribution=torch.tensor([len(narrow), len(narrow), live], dtype=torch.int32),
+    )
+
+
+def _mixed_verify_tails_last_distribution(
+    *, query_lens: tuple[int, ...], live: int, width: int
+) -> torch.Tensor:
+    """``[0, p, live]`` for a mixed-verify extend kept in batch order: the trailing live
+    sequences of exactly ``width`` rows (the decoding tails) are ``[p, live)``. The leading
+    0 tells the kernel call apart from a decode-ordered ``[k, k, n]`` (k >= 1)."""
+    p = live
+    while p > 0 and query_lens[p - 1] == width:
+        p -= 1
+    return torch.tensor([0, p, live], dtype=torch.int32)
 
 
 def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch.Tensor:
@@ -823,6 +874,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         width = self.decode_query_size
         if width == 1:
             return 1
+        # batches built outside the scheduler may not carry mix_verify_width
+        mix_width = getattr(forward_batch, "mix_verify_width", 1)
+        if mix_width > 1:
+            # A mixed-verify extend runs its width-wide sequences on the DECODE range.
+            return width if mix_width == width else 1
         mode = forward_batch.forward_mode
         if mode.is_target_verify():
             return width if forward_batch.spec_info.num_tokens_per_req == width else 1
@@ -866,10 +922,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 )
         else:
             if self.kernel_spec.is_batched:
-                # Batched RPA: MIXED is [0, d0) -> [n, n, n]
-                return torch.tensor(
-                    [non_empty_bs, non_empty_bs, non_empty_bs], dtype=torch.int32
-                )
+                # Batched RPA: MIXED is [d1, d2) -> [0, 0, n]; [0, d0) is the DECODE
+                # pass, whose one-row q tile and schedule bound do not fit a chunk.
+                return torch.tensor([0, 0, non_empty_bs], dtype=torch.int32)
             else:
                 # RPA v3: EXTEND is [d0, d1) -> [0, n, n]
                 return torch.tensor([0, non_empty_bs, non_empty_bs], dtype=torch.int32)
@@ -904,7 +959,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         page_size = self.page_size
         device = forward_batch.seq_lens.device
         decode_query_size = self._forward_decode_query_size(forward_batch)
-        is_decode = forward_batch.forward_mode.is_decode() or decode_query_size > 1
+        # A mixed-verify extend splits its sequences across the DECODE and MIXED
+        # ranges; the host builder orders them and sets the distribution.
+        mixed_verify = (
+            getattr(forward_batch, "mix_verify_width", 1) > 1 and decode_query_size > 1
+        )
+        is_decode = not mixed_verify and (
+            forward_batch.forward_mode.is_decode() or decode_query_size > 1
+        )
         distribution = self._get_cached_rpa_distribution(
             is_decode, non_empty_bs, device
         )
@@ -912,6 +974,10 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         bs = int(forward_batch.seq_lens.shape[0])
         req_to_token = self.req_to_token_pool.req_to_token
         pages_per_seq = _get_pages_per_seq(self.max_context_len, self._page_stride)
+        if mixed_verify and (req_to_token.device.type != "cpu" or self._dcp > 1):
+            raise NotImplementedError(
+                "mixed verify needs the host-resident request-to-token table and no DCP"
+            )
 
         # Host-resident fast path: when req_to_token is on CPU, build the
         # metadata on host (one H2D) instead of the on-device gather/reshape
@@ -1153,6 +1219,45 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 kv_lens = kv_lens + kv_len_bump
             query_width = 1
 
+        seq_order = row_perm = row_unperm = None
+        mixed_verify = (
+            getattr(forward_batch, "mix_verify_width", 1) > 1 and decode_query_size > 1
+        )
+        if mixed_verify and envs.SGLANG_TPU_MIXED_VERIFY_TAILS_LAST.get():
+            # The tails already end the batch: keep its order and pass [0, prefill
+            # sequences, live]; the kernel runs the tails as the verify pass's MIXED range.
+            distribution = self._value_metadata(
+                name="mixed_verify_tails_last_distribution",
+                value=_mixed_verify_tails_last_distribution(
+                    query_lens=query_lens, live=non_empty_bs, width=decode_query_size
+                ),
+                device=device,
+            )
+        elif mixed_verify:
+            order = _mixed_verify_order(
+                query_lens=query_lens,
+                live=non_empty_bs,
+                width=decode_query_size,
+                num_tokens=int(forward_batch.input_ids.shape[0]),
+            )
+            seq_order = order.seq_order
+            query_lens = tuple(query_lens[i] for i in seq_order.tolist())
+            kv_lens = kv_lens.index_select(
+                0,
+                self._value_metadata(name="seq_order", value=seq_order, device=device),
+            )
+            row_perm = self._value_metadata(
+                name="row_perm", value=order.row_perm, device=device
+            )
+            row_unperm = self._value_metadata(
+                name="row_unperm", value=order.row_unperm, device=device
+            )
+            distribution = self._value_metadata(
+                name="mixed_verify_distribution",
+                value=order.distribution,
+                device=device,
+            )
+
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
         if seq_lens_cpu is not None and bs > 0:
             if isinstance(seq_lens_cpu, list):
@@ -1239,6 +1344,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         assert req_pool_indices.device.type == "cpu"
         assert req_pool_indices.shape[0] == bs
         req_pool_indices = req_pool_indices.to(torch.int64)
+        if seq_order is not None:
+            req_pool_indices = req_pool_indices[seq_order]
 
         cu_q_lens, cu_kv_lens, active_num_tokens = self._get_query_metadata(
             bs=bs,
@@ -1297,6 +1404,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             dcp_cp_rank=dcp_cp_rank,
             decode_query_size=decode_query_size,
             segments=segments,
+            row_perm=row_perm,
+            row_unperm=row_unperm,
         )
 
     def _host_page_columns(self, pages_per_seq: int, page_size: int) -> torch.Tensor:
@@ -1599,6 +1708,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         q = q.view(num_tokens, q_heads, layer.qk_head_dim)
         k = k.view(num_tokens, layer.tp_k_head_num, layer.qk_head_dim)
         v = v.view(num_tokens, layer.tp_v_head_num, layer.v_head_dim)
+        row_perm = self.forward_metadata.row_perm
+        if row_perm is not None:
+            q, k, v = (t.index_select(0, row_perm) for t in (q, k, v))
 
         # Asymmetric K/V head dims (e.g. MiMo / DeepSeek-style qk=192, v=128):
         # the fused KV buffer stores one shared head_dim, and the Pallas kernel
@@ -1745,6 +1857,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 use_causal_mask=use_causal_mask,
                 layer_idx=kv_layer_idx,
             )
+
+        if row_perm is not None:
+            out = out.index_select(0, self.forward_metadata.row_unperm)
 
         capture_mode = getattr(forward_batch, "capture_hidden_mode", None)
         # FULL capture retains padded rows for later EAGLE steps.
