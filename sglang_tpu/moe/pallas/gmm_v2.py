@@ -153,6 +153,13 @@ class MetadataRef:
     gm_id_to_m_offset: jax.Array
 
 
+def _scale_row(scale_ref, b_id: int):
+    """[1, n] scale row of quant block b_id from a [blocks, 1, n] or [blocks, n] tile."""
+    if len(scale_ref.shape) == 2:
+        return scale_ref[b_id : b_id + 1, :]
+    return scale_ref[..., b_id, :, :]
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class WeightsRef:
@@ -168,7 +175,7 @@ class WeightsRef:
 
     def get_scale(self, b_id: int, scale_block_n: int = 1):
         # Quantization subchannel scale per quant block
-        s = self.scale[..., b_id, :, :]
+        s = _scale_row(self.scale, b_id)
         if scale_block_n != 1:
             s = jnp.repeat(s, scale_block_n, axis=-1)
         return s
@@ -210,8 +217,8 @@ class FusedWeightsRef:
 
     def get_scale(self, b_id: int, scale_block_n: int = 1):
         # Quantization subchannel scale per quant block
-        s = self.gate.scale[..., b_id, :, :]
-        s_up = self.up.scale[..., b_id, :, :]
+        s = _scale_row(self.gate.scale, b_id)
+        s_up = _scale_row(self.up.scale, b_id)
         if scale_block_n != 1:
             s = jnp.repeat(s, scale_block_n, axis=-1)
             s_up = jnp.repeat(s_up, scale_block_n, axis=-1)
@@ -307,6 +314,12 @@ class InputConfigs:
     scale_dtype: jnp.dtype | None = None
     dequantize_in_vmem: bool = False
     requantize_in_vmem: bool = False
+    # Scale stored [G, blocks, N] instead of [G, blocks, 1, N]. TPU keeps the
+    # unit dim major-most, so the rank-4 form costs a relayout copy per call.
+    scale_without_unit_dim: bool = False
+    # [G, blocks / 2, N] int32 holding bf16 scales of blocks 2j / 2j+1 in the
+    # low / high halves: 32-bit tiles DMA ~15% faster than packed bf16 ones.
+    scale_bf16_pairs: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -378,6 +391,8 @@ class IndexMaps:
         group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
         b_id = (k_id * self.cfgs.tiles.tile_k) // self.cfgs.rhs_cfgs.quant_block_size
         b_tile_id = b_id // self.cfgs.num_quant_blocks_per_tile_k
+        if self.cfgs.rhs_cfgs.scale_without_unit_dim:
+            return (group_id, b_tile_id, offset + n_id)
         return (group_id, b_tile_id, 0, offset + n_id)
 
     def out_index_map(self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array):
@@ -392,6 +407,11 @@ class IndexMaps:
         row_size = row_end - row_start
 
         return (pl.ds(row_start, row_size), 0, n_id)
+
+
+def _scale_rows_per_tile_k(cfgs: GmmConfigs) -> int:
+    blocks = cfgs.num_quant_blocks_per_tile_k
+    return blocks // 2 if cfgs.rhs_cfgs.scale_bf16_pairs else blocks
 
 
 def create_rhs_spec(index_map: IndexMaps, cfgs: GmmConfigs) -> RhsRef:
@@ -422,13 +442,9 @@ def create_rhs_spec(index_map: IndexMaps, cfgs: GmmConfigs) -> RhsRef:
             scale_tile_n = 128
         else:
             scale_tile_n = pl.cdiv(cfgs.tiles.tile_n, cfgs.rhs_cfgs.scale_block_n)
+        unit_dim = () if cfgs.rhs_cfgs.scale_without_unit_dim else (1,)
         rhs_scale_spec = pl.BlockSpec(
-            (
-                None,
-                cfgs.num_quant_blocks_per_tile_k,
-                1,
-                scale_tile_n,
-            ),
+            (None, _scale_rows_per_tile_k(cfgs), *unit_dim, scale_tile_n),
             index_map.rhs_scale_index_map,
         )
 
@@ -519,6 +535,31 @@ def inner_kernel(
             group_k = cfgs.rhs_cfgs.quant_block_size
 
             def load_group_scales(ref):
+                if cfgs.rhs_cfgs.scale_bf16_pairs:
+                    # Zero-stride 32-bit load, then copy each bf16 half over the word.
+                    rows = []
+                    for j in range(ref.shape[0]):
+                        word = lax.bitcast_convert_type(
+                            ref[pl.ds(j, group_k // 2, 0), :], jnp.uint32
+                        )
+                        for half in (word & 0xFFFF, word >> 16):
+                            rows.append(
+                                pltpu.bitcast(half | (half << 16), jnp.bfloat16)
+                            )
+                    return jnp.concatenate(rows, axis=0).reshape(
+                        2 * ref.shape[0], group_k, ref.shape[-1]
+                    )
+                if len(ref.shape) == 2:
+                    # [blocks, n] tile: per-row broadcast loads beat a value reshape.
+                    nb, n = ref.shape
+                    if ref.dtype == jnp.float32:
+                        rows = [ref[pl.ds(b, group_k, 0), :] for b in range(nb)]
+                    else:
+                        rows = [
+                            jnp.broadcast_to(ref[pl.ds(b, 1), :], (group_k, n))
+                            for b in range(nb)
+                        ]
+                    return jnp.concatenate(rows, axis=0).reshape(nb, group_k, n)
                 # Mosaic strided loads need 32-bit elements; bf16 scales fall back.
                 if ref.dtype == jnp.float32:
                     return ref[:, pl.ds(0, group_k, 0), :]
@@ -1284,6 +1325,16 @@ def pad_size_n_to_fewest_tiles(
     return min(widths, key=lambda width: (num_n_tiles(width), width))
 
 
+def _is_bf16_pairs(rhs_scale: jax.Array) -> bool:
+    """Rank-3 int32/uint32 scales hold two bf16 K-block scales per word."""
+    return rhs_scale.ndim == 3 and rhs_scale.dtype in (jnp.int32, jnp.uint32)
+
+
+def num_scale_blocks(rhs_scale: jax.Array) -> int:
+    """Number of K quant blocks an rhs scale covers."""
+    return rhs_scale.shape[1] * (2 if _is_bf16_pairs(rhs_scale) else 1)
+
+
 def validate_inputs(
     lhs: jax.Array,
     rhs: jax.Array,
@@ -1315,9 +1366,11 @@ def validate_inputs(
     if rhs_bias is not None:
         assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
-        num_quant_blocks = rhs_scale.shape[1]
-        assert rhs_scale.shape[:3] == (size_group, num_quant_blocks, 1)
-        assert size_n % rhs_scale.shape[3] == 0
+        num_quant_blocks = num_scale_blocks(rhs_scale)
+        assert rhs_scale.ndim in (3, 4), rhs_scale.shape
+        assert rhs_scale.shape[0] == size_group, rhs_scale.shape
+        assert rhs_scale.ndim == 3 or rhs_scale.shape[2] == 1, rhs_scale.shape
+        assert size_n % rhs_scale.shape[-1] == 0
         assert size_k % num_quant_blocks == 0
 
     assert group_offset.shape == (1,)
@@ -1440,13 +1493,14 @@ def make_gmm_configs(
             rhs_quant_dtype = jnp.float4_e2m1fn.dtype
         elif rhs_quant_dtype is None:
             rhs_quant_dtype = rhs.dtype
-        num_blocks = rhs_scale.shape[1]
-        scale_size_n = rhs_scale.shape[3]
+        scale_bf16_pairs = _is_bf16_pairs(rhs_scale)
+        num_blocks = num_scale_blocks(rhs_scale)
+        scale_size_n = rhs_scale.shape[-1]
         block_size = dims.size_k // num_blocks
-        if rhs_scale.shape[3] != rhs.shape[2] and rhs_scale.shape[3] % 128 == 0:
+        if scale_size_n != rhs.shape[2] and scale_size_n % 128 == 0:
             scale_block_n = 128
         else:
-            scale_block_n = rhs.shape[2] // rhs_scale.shape[3]
+            scale_block_n = rhs.shape[2] // scale_size_n
         if fuse_act is not None:
             assert dims.size_n % scale_block_n == 0, (
                 f"fused activation requires the gate/up boundary "
@@ -1460,6 +1514,7 @@ def make_gmm_configs(
         rhs_packing = 32 // jax.dtypes.itemsize_bits(rhs_quant_dtype)
     else:
         has_scale = False
+        scale_bf16_pairs = False
         rhs_quant_dtype = None
         num_blocks = 1
         scale_size_n = 0
@@ -1491,10 +1546,18 @@ def make_gmm_configs(
         num_quant_blocks=num_blocks,
         scale_size_n=scale_size_n,
         scale_block_n=scale_block_n,
-        scale_dtype=rhs_scale.dtype if has_scale else None,
+        scale_dtype=(
+            (jnp.bfloat16.dtype if scale_bf16_pairs else rhs_scale.dtype)
+            if has_scale
+            else None
+        ),
         dequantize_in_vmem=dequantize_rhs,
         requantize_in_vmem=requantize_rhs,
+        scale_without_unit_dim=has_scale and rhs_scale.ndim == 3,
+        scale_bf16_pairs=scale_bf16_pairs,
     )
+    if scale_bf16_pairs and not dequantize_rhs:
+        raise ValueError("bf16-pair rhs scales require VMEM dequantization")
 
     if requantize_rhs:
         if dequantize_rhs or packed_fp4:
@@ -1612,6 +1675,16 @@ def make_gmm_configs(
         if compact_tile_n != tiles.tile_n:
             tiles = dataclasses.replace(tiles, tile_n=compact_tile_n)
 
+    if rhs_cfgs.scale_without_unit_dim:
+        # Rank-3 scale tiles put quant blocks on the sublane axis.
+        scale_rows = rhs_scale.shape[1]
+        tile_rows = pl.cdiv(tiles.tile_k, block_size) // (2 if scale_bf16_pairs else 1)
+        if tile_rows != scale_rows and tile_rows % 8 != 0:
+            raise ValueError(
+                f"rank-3 rhs scale needs tile_k={tiles.tile_k} to cover a multiple of "
+                f"8 scale rows or all {scale_rows}; got {tile_rows}"
+            )
+
     if (dequantize_rhs or requantize_rhs) and tiles.tile_k % block_size != 0:
         raise ValueError(
             "VMEM dequantization requires tile_k to be a multiple of the INT4 group size"
@@ -1673,7 +1746,7 @@ def gmm_v2(
     lhs: jax.Array,  # [size_m, size_k]
     rhs: jax.Array,  # [size_group, size_k, size_n]
     group_sizes: jax.Array,  # int32[size_lhs_group]
-    rhs_scale: jax.Array | None = None,  # [size_group, num_blocks, 1, out_size]
+    rhs_scale: jax.Array | None = None,  # [size_group, num_blocks, (1,) out_size]
     rhs_bias: jax.Array | None = None,  # [size_group, 1, out_size]
     group_offset: jax.Array | None = None,  # int32[1]
     *,
@@ -1700,7 +1773,11 @@ def gmm_v2(
         lhs: lhs with shape [size_m, size_k].
         rhs: rhs with shape [size_group, size_k, size_n].
         group_sizes: The group sizes of lhs rows of shape [size_lhs_group,].
-        rhs_scale: The rhs scale of shape [size_group, num_blocks, 1, out_size].
+        rhs_scale: The rhs scale of shape [size_group, num_blocks, 1, out_size],
+            or [size_group, num_blocks, out_size], which avoids a relayout copy.
+            A rank-3 int32 scale [size_group, num_blocks / 2, out_size] packs
+            the bf16 scales of blocks 2j and 2j+1 in each word's low and high
+            halves (VMEM dequantization only).
         rhs_bias: The rhs bias of shape [size_group, 1, out_size].
         rhs_channel_scale: Opt-in INT4-to-FP8 compute. Per-channel multipliers
             [size_group, 1, out_size]; rhs_scale must contain FP32 group-32 scales
@@ -1770,7 +1847,9 @@ def gmm_v2(
         # stream isn't inflated to fp32; the inner kernel upcasts to the
         # accumulator dtype at multiply time (see ``block_acc *= ...astype``).
         # fp32 scales are unchanged; any non-float scale normalizes to fp32.
-        if not jnp.issubdtype(rhs_scale.dtype, jnp.floating):
+        if not cfgs.rhs_cfgs.scale_bf16_pairs and not jnp.issubdtype(
+            rhs_scale.dtype, jnp.floating
+        ):
             rhs_scale = rhs_scale.astype(jnp.float32)
         rhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     if rhs_bias is not None:
