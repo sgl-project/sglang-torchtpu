@@ -1591,6 +1591,7 @@ class SchedulerDisaggregationPrefillMixin:
         if not last_chunk:
             # The next checkpoint can dedup the request's own pages past
             # cache_protected_len and free them while a transfer still lists them.
+            # KV free fences rely on this: no page a checkpoint frees is ever sent.
             if (
                 self.tree_cache.supports_prefix_sharing()
                 and not req.skip_radix_cache_insert

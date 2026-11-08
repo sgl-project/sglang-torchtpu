@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
+import msgspec
 import torch
 import torch.distributed
 
@@ -47,6 +48,12 @@ _PP_PD_CONSENSUS_TAG = 0x5050
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
     from sglang_tpu.pp_scheduler import PPDecodeTransferStatus
+
+
+class _PPLaunchedForward(msgspec.Struct, frozen=True):
+    """A launched PP forward as the KV free fence tracks it."""
+
+    copy_done: torch.Event
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -104,6 +111,8 @@ class SchedulerPPMixin:
     # The TPU stage hand-off (the ICI wave, or the buffered hand-off);
     # init_pp_loop_state builds it on TPU only.
     _pp_wave = None
+    # The TPU KV free fence the PP loops drive; maybe_init_kv_free_fence sets it.
+    pp_kv_free_fence = None
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -140,6 +149,7 @@ class SchedulerPPMixin:
                     mb_id + get_parallel().pp_size
                 ) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
+                self._pp_kv_fence_poll()
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.ingest_requests()
                 if not self.pp_group.is_last_rank:
@@ -162,6 +172,7 @@ class SchedulerPPMixin:
                 if cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy(cur_batch)
+                    self._pp_kv_fence_formed()
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -188,6 +199,7 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    self._pp_kv_fence_launched()
                 send_after_launch = self._pp_hands_off_after_launch()
                 if send_after_launch:
                     self._pp_send_proxy(result if cur_batch else None)
@@ -276,6 +288,25 @@ class SchedulerPPMixin:
         if result is None or self.pp_group.is_last_rank:
             return
         self._pp_send_proxy_to_next_stage(result)
+
+    def _pp_kv_fence_poll(self: Scheduler) -> None:
+        """Release what waits on this stage's finished forwards: deferred HiCache
+        backups, and pages freed while those forwards ran. Never blocks."""
+        if self.pp_kv_free_fence is not None:
+            self.pp_kv_free_fence.retire_completed()
+
+    def _pp_kv_fence_formed(self: Scheduler) -> None:
+        """Record a formed batch. Call after the tree inserts made while forming
+        it (chunk checkpoints) and before its launch."""
+        if self.pp_kv_free_fence is not None:
+            self.pp_kv_free_fence.on_batch_formed()
+
+    def _pp_kv_fence_launched(self: Scheduler) -> None:
+        if self.pp_kv_free_fence is not None:
+            # The launch event follows every KV write of this forward.
+            self.pp_kv_free_fence.on_forward_launched(
+                _PPLaunchedForward(copy_done=self.launch_event)
+            )
 
     def _pp_hands_off_after_launch(self: Scheduler) -> bool:
         """Whether this iteration's activations go to the next stage right
@@ -366,6 +397,9 @@ class SchedulerPPMixin:
                 # microbatch so a locally aborted Raiden sender keeps polling
                 # and releases its retained pages when native reads drain.
                 self.process_pending_chunked_abort()
+                # Before process_prefill_chunk checkpoints the chunk this stage
+                # launched last iteration and queues its HiCache backup.
+                self._pp_kv_fence_poll()
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -418,6 +452,7 @@ class SchedulerPPMixin:
                 if cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy(cur_batch)
+                    self._pp_kv_fence_formed()
 
                 if get_parallel().pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -438,6 +473,7 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    self._pp_kv_fence_launched()
                     self._pp_pd_stage_ready(mb_id, cur_batch, result)
                 send_after_launch = self._pp_hands_off_after_launch()
                 if send_after_launch:
