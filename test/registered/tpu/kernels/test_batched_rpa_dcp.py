@@ -48,7 +48,7 @@ import numpy as np
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.ci.gate_matrix import full_matrix
 
-register_tpu_ci(est_time=250, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=580, suite="stage-a-test-tpu-unit", chips=1)
 # Every shard of every (geometry, window, blocks) case is its own compile, and
 # DCP8 runs eight of them per case. The two merge tests below walk the diagonal
 # of window x blocks on the gate; the nightly walks the square.
