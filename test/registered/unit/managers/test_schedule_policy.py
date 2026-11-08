@@ -1,7 +1,9 @@
+import time
 import unittest
 from array import array
 from unittest.mock import patch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -169,6 +171,38 @@ class TestShortestPrefillFirst(CustomTestCase):
             self.policy.calc_priority(queue)
         self.assertEqual(queue, [other, duplicate])
 
+    def test_aged_request_goes_first(self):
+        # A long prefill queued past the wait limit must not starve behind short ones.
+        now = time.perf_counter()
+        old_long = self.make_req("old_long", 50000, arrived=now - 120)
+        older_long = self.make_req("older_long", 60000, arrived=now - 150)
+        new_short = self.make_req("new_short", 32, arrived=now - 1)
+        queue = [new_short, old_long, older_long]
+        with envs.SGLANG_SCHEDULE_SPF_MAX_WAIT_S.override(60.0):
+            self.policy._sort_by_shortest_prefill(queue, set())
+        self.assertEqual(queue, [older_long, old_long, new_short])
+
+    def test_aged_chunked_request_keeps_full_chunks(self):
+        # An admitted long prefill must not be cut to one page per pass by short arrivals.
+        now = time.perf_counter()
+        chunked = self.make_req("chunked", 50000, arrived=now - 120)
+        waiting = [self.make_req(f"s{i}", 1000, arrived=now - 1) for i in range(8)]
+        self.assertIsNotNone(
+            self.policy.shortest_prefill_chunk_limit(chunked, waiting, 4096, 256)
+        )
+        with envs.SGLANG_SCHEDULE_SPF_MAX_WAIT_S.override(60.0):
+            self.assertIsNone(
+                self.policy.shortest_prefill_chunk_limit(chunked, waiting, 4096, 256)
+            )
+
+    def test_aging_off_by_default(self):
+        now = time.perf_counter()
+        old_long = self.make_req("old_long", 50000, arrived=now - 120)
+        new_short = self.make_req("new_short", 32, arrived=now - 1)
+        queue = [old_long, new_short]
+        self.policy._sort_by_shortest_prefill(queue, set())
+        self.assertEqual(queue, [new_short, old_long])
+
     def test_retracted_output_is_part_of_uncached_work(self):
         replay = self.make_req("replay", 16, cached=1024)
         replay.output_ids.extend([0] * 64)
@@ -225,6 +259,32 @@ class TestShortestPrefillFirst(CustomTestCase):
                 256,
             )
         )
+
+    def test_chunk_share_skips_long_waiters_under_other_policies(self):
+        self.policy.policy = CacheAwarePolicy.LPM
+        continuation = self.make_req("continuation", 300000)
+        waiting = [self.make_req("cold", 200000), self.make_req("turn", 1500)]
+        with envs.SGLANG_PREFILL_CHUNK_SHARE_MIN_TOKENS.override(1024):
+            self.assertEqual(
+                self.policy.shortest_prefill_chunk_limit(
+                    continuation, waiting, 4096, 256
+                ),
+                2560,
+            )
+            self.assertTrue(self.policy.fits_shared_chunk(waiting[1], 1792))
+            self.assertFalse(self.policy.fits_shared_chunk(waiting[0], 1792))
+
+    def test_chunk_share_keeps_minimum_continuation_tokens(self):
+        self.policy.policy = CacheAwarePolicy.LPM
+        continuation = self.make_req("continuation", 300000)
+        waiting = [self.make_req("a", 2000), self.make_req("b", 2000)]
+        with envs.SGLANG_PREFILL_CHUNK_SHARE_MIN_TOKENS.override(1024):
+            self.assertEqual(
+                self.policy.shortest_prefill_chunk_limit(
+                    continuation, waiting, 4096, 256
+                ),
+                2048,
+            )
 
 
 if __name__ == "__main__":
