@@ -357,11 +357,25 @@ def calculate_block_sizes(
         # Account for batch size.
         total_bytes *= batch_size
 
+        if not (serve_cfgs.ones_v or serve_cfgs.transposed) and bq_sz > 1:
+            # The score term over-counts by bq_sz / bq_c_sz and stands in for what
+            # it misses: the f32 m, l, acc scratch, the whole-tile l and acc the
+            # q-chunk loop keeps live (spilled), and ~5 f32 copies of one chunk's
+            # scores. None depend on bkv_sz, so a short k block (sliding window) or
+            # many q heads outgrow it: 64 q / 8 KV heads at bq 256, bkv 256 needs
+            # 74 MiB against 41.5 estimated. Count whichever is larger.
+            carry_rows = (
+                model_cfgs.num_kv_heads * bq_sz * aligned_num_q_heads_per_kv_head
+            )
+            bq_c_sz = choose_bq_c_sz(batch_size, bq_sz, bkv_sz)
+            tile_bytes = carry_rows * (3 * num_lanes + 2 * aligned_kv_head_dim) * 4
+            tile_bytes += 5 * (carry_rows // bq_sz) * bq_c_sz * bkv_sz * 4
+            total_bytes = max(total_bytes, buffer_bytes * batch_size + tile_bytes)
+
         # The m, l and acc carries: f32 scratch per KV head and (token, q head)
         # row, a lane tile wide, shared by the batch. The transposed tile (one
         # sequence per tile) keeps them as rows of lanes instead. Counted only for
-        # the ones_v / transposed tiles tuned with this term: elsewhere the estimate
-        # stays as measured (it over-counts the score tile by bq_sz / bq_c_sz).
+        # the ones_v / transposed tiles tuned with this term.
         if serve_cfgs.ones_v or serve_cfgs.transposed:
             carry_rows = (
                 model_cfgs.num_kv_heads * bq_sz * aligned_num_q_heads_per_kv_head
@@ -384,6 +398,37 @@ def calculate_block_sizes(
         num_muls = bq_c_sz * num_k * model_cfgs.num_q_heads
 
         return batch_size * num_muls
+
+    def choose_bq_c_sz(batch_size: int, bq_sz: int, bkv_sz: int) -> int:
+        """q compute-chunk size of a non-transposed tile."""
+        # Fixed threshold value based on hardware spec.
+        # TODO(kyuyeunk): Use different threshold based on hardware and precision.
+        threshold = 1500
+        # In flash_attention, each compute sub-tile reshapes Q to
+        # (bq_c_sz * aligned_num_q_heads_per_kv_head, head_dim), so keep
+        # bq_c_sz a power-of-2 divisor >= 1 full sublane tile (num_lanes)
+        # where possible, and return the divisor that satisfies threshold
+        # rather than the previous divisor that exceeded it.
+        min_bq_c_sz = min(bq_sz, max(1, num_lanes // aligned_num_q_heads_per_kv_head))
+        max_num_bq_c = min(bq_sz, 32)
+        best_bq_c_sz = bq_sz
+        for num_bq_c in range(1, max_num_bq_c + 1):
+            bq_c_sz, bq_c_rem = divmod(bq_sz, num_bq_c)
+            if bq_c_rem != 0:
+                continue
+            if (
+                bq_c_sz > min_bq_c_sz
+                and (bq_c_sz & (bq_c_sz - 1)) != 0
+                and bq_c_sz != bq_sz
+            ):
+                continue
+            best_bq_c_sz = bq_c_sz
+            if (
+                calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz) <= threshold
+                or bq_c_sz <= min_bq_c_sz
+            ):
+                break
+        return best_bq_c_sz
 
     # Even if we loose some potential performance, we want to avoid OOM at all
     # costs. Therefore, we conservatively only use 80% of the VMEM budget.
@@ -457,6 +502,14 @@ def calculate_block_sizes(
         min_bq_pow2 = 1 << (mxu_column_size - 1).bit_length()
         bq_sz = min(min_bq_pow2, total_q_pow2)
         bkv_sz = mxu_column_size
+        # With many q heads this q block may not fit even double-buffered (the
+        # f32 carries grow with bq_sz * heads): halve it. 1 token reads as decode.
+        while (
+            bq_sz > 2
+            and calculate_vmem_usage(1, _MIN_N_BUFFER, bq_sz, bkv_sz)
+            > capped_vmem_limit_bytes
+        ):
+            bq_sz //= 2
         batch_size, n_buffer = fit_lanes_and_buffers(
             max_batch_size, max_n_buffer, bq_sz, bkv_sz
         )
@@ -490,6 +543,9 @@ def calculate_block_sizes(
             swa_pow2 = 1 << (win_q.bit_length() - 1)
             max_bq_sz = min(max_bq_sz, max(min(256, total_q_pow2), swa_pow2))
             max_bkv_sz = min(max_bkv_sz, max(page, utils.align_to(swa_pow2, page)))
+        # A k block longer than every sequence in the pool saves no KV steps; it
+        # only makes each schedule step larger.
+        max_bkv_sz = min(max_bkv_sz, max(page, serve_cfgs.pages_per_seq * page))
 
         if bkv_sz >= bkv_step:
             while bq_sz * 2 <= max_bq_sz:
@@ -528,37 +584,9 @@ def calculate_block_sizes(
                 n_buffer=n_buffer,
             )
 
-        # Fixed threshold value based on hardware spec.
-        # TODO(kyuyeunk): Use different threshold based on hardware and precision.
-        threshold = 1500
-        # In flash_attention, each compute sub-tile reshapes Q to
-        # (bq_c_sz * aligned_num_q_heads_per_kv_head, head_dim), so keep
-        # bq_c_sz a power-of-2 divisor >= 1 full sublane tile (num_lanes)
-        # where possible, and return the divisor that satisfies threshold
-        # rather than the previous divisor that exceeded it.
-        min_bq_c_sz = min(bq_sz, max(1, num_lanes // aligned_num_q_heads_per_kv_head))
-        max_num_bq_c = min(bq_sz, 32)
-        best_bq_c_sz = bq_sz
-        for num_bq_c in range(1, max_num_bq_c + 1):
-            bq_c_sz, bq_c_rem = divmod(bq_sz, num_bq_c)
-            if bq_c_rem != 0:
-                continue
-            if (
-                bq_c_sz > min_bq_c_sz
-                and (bq_c_sz & (bq_c_sz - 1)) != 0
-                and bq_c_sz != bq_sz
-            ):
-                continue
-            best_bq_c_sz = bq_c_sz
-            if (
-                calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz) <= threshold
-                or bq_c_sz <= min_bq_c_sz
-            ):
-                break
-
         return configs.BlockSizes(
             bq_sz=bq_sz,
-            bq_c_sz=best_bq_c_sz,
+            bq_c_sz=choose_bq_c_sz(batch_size, bq_sz, bkv_sz),
             bkv_sz=bkv_sz,
             batch_size=batch_size,
             n_buffer=n_buffer,
