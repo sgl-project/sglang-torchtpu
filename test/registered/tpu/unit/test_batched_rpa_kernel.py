@@ -7,12 +7,14 @@ import math
 import os
 import sys
 import unittest
+import unittest.mock
+from typing import NamedTuple
 
 import numpy as np
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=480, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=1500, suite="stage-a-test-tpu-unit", chips=1)
 
 # This is a standalone raw-JAX kernel test, not a TorchTPU runtime process.
 # SGLang platform discovery selects CPU-only JAX for export, so select the
@@ -123,7 +125,7 @@ class TestBatchedRpaKernel(unittest.TestCase):
         kv_lens = jnp.asarray([kv_len], dtype=jnp.int32)
         cu_q_lens = jnp.asarray([0, 1], dtype=jnp.int32)
         page_indices = jnp.asarray(page_indices_host.reshape(-1))
-        distribution = jnp.asarray([0, 0, 1], dtype=jnp.int32)  # one decode row
+        distribution = jnp.ones((3,), dtype=jnp.int32)
         sm_scale = 1.0 / math.sqrt(self.HEAD_DIM)
 
         expected = ref_ragged_paged_attention(
@@ -198,6 +200,11 @@ def _kv_cache_to_kernel(fused: np.ndarray, kv_dtype, kv_layout):
             ),
         )
     return jnp.asarray(fused.reshape(shape), dtype=kv_dtype)
+
+
+def _interleave_kv(k: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """[..., kv_heads, head_dim] K and V as [..., 2 * kv_heads, head_dim], K/V alternating."""
+    return np.stack([k, v], axis=-2).reshape(*k.shape[:-2], -1, k.shape[-1])
 
 
 def _kv_cache_from_kernel(cache, heads_x2: int, head_dim: int, kv_layout):
@@ -337,11 +344,10 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
         kv_lens_padded[:num_seqs] = kv_lens
         cu_q_lens_padded = np.full(max_num_seqs + 1, total_tokens, dtype=np.int32)
         cu_q_lens_padded[: num_seqs + 1] = cu_q_lens
-        # [mixed, mixed + prefill, total]: decode rows are the tail range.
         if decode:
-            distribution = [0, 0, num_seqs]
-        else:
             distribution = [num_seqs, num_seqs, num_seqs]
+        else:
+            distribution = [0, 0, num_seqs]
         sm_scale = 1.0 / math.sqrt(head_dim)
 
         def _reference(attention_sink):
@@ -544,6 +550,467 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
                     use_sink=True,
                     sliding_window=sliding_window,
                     seq_along_lane=seq_along_lane,
+                )
+
+    def test_seq_along_lane_softmax_variants(self):
+        """exp2 softmax and ones-in-V row sums match the reference on the fp8
+        SEQ_ALONG_LANE prefill path they are meant for, with and without a window."""
+        import jax
+
+        from sglang_tpu.envs import envs as tpu_envs
+
+        variants = (
+            {"SGLANG_TPU_RPA_EXP2_SOFTMAX": "1"},
+            {"SGLANG_TPU_RPA_ONES_V": "1"},
+            {"SGLANG_TPU_RPA_EXP2_SOFTMAX": "1", "SGLANG_TPU_RPA_ONES_V": "1"},
+            {"SGLANG_TPU_RPA_ONES_V": "1", "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1"},
+        )
+        for env in variants:
+            for sliding_window in (None, 128):
+                with (
+                    self.subTest(env=env, sliding_window=sliding_window),
+                    unittest.mock.patch.dict(os.environ, env),
+                ):
+                    # The wrapper reads the flags while tracing; drop cached traces.
+                    jax.clear_caches()
+                    self.assertTrue(all(getattr(tpu_envs, name).get() for name in env))
+                    self._check(
+                        seqs=self.EXTEND_SEQS,
+                        padded_tokens=self.EXTEND_TOKENS,
+                        kv_dtype_name="float8_e4m3fn",
+                        k_scale=1.0,
+                        v_scale=1.0,
+                        sliding_window=sliding_window,
+                        seq_along_lane=True,
+                    )
+        jax.clear_caches()
+
+    def test_seq_along_lane_transposed(self):
+        """The transposed prefill tile (scores^T, fp8 q) tracks the reference on
+        the fp8 SEQ_ALONG_LANE path, with and without a window and the mask skip."""
+        import jax
+
+        from sglang_tpu.envs import envs as tpu_envs
+
+        variants = (
+            {"SGLANG_TPU_RPA_TRANSPOSED": "1"},
+            {
+                "SGLANG_TPU_RPA_TRANSPOSED": "1",
+                "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1",
+            },
+        )
+        # fp8 q: a few percent of relative error on the scores, see transposed.py.
+        self.TOLERANCE = 0.3
+        for env in variants:
+            for sliding_window in (None, 128):
+                with (
+                    self.subTest(env=env, sliding_window=sliding_window),
+                    unittest.mock.patch.dict(os.environ, env),
+                ):
+                    jax.clear_caches()
+                    self.assertTrue(all(getattr(tpu_envs, name).get() for name in env))
+                    self._check(
+                        seqs=self.EXTEND_SEQS,
+                        padded_tokens=self.EXTEND_TOKENS,
+                        kv_dtype_name="float8_e4m3fn",
+                        k_scale=1.0,
+                        v_scale=1.0,
+                        sliding_window=sliding_window,
+                        seq_along_lane=True,
+                    )
+        jax.clear_caches()
+        del self.TOLERANCE
+
+    def test_seq_along_lane_transposed_unshifted_blocks(self):
+        """The prod prefill tile (transposed, no running max, mask and pad-row skips)
+        with 8 kv heads x 8 compute blocks (a rolled masked q-chunk loop); a skip
+        group as wide as the q block drops the partial-block tile."""
+        import jax
+
+        from sglang_tpu.attention.pallas.batched_rpa.configs import BlockSizes
+
+        base_env = {
+            "SGLANG_TPU_RPA_TRANSPOSED": "1",
+            "SGLANG_TPU_RPA_NO_MAX": "1",
+            "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1",
+            "SGLANG_TPU_RPA_SKIP_PAD_Q": "1",
+        }
+        blocks = BlockSizes(bq_sz=256, bq_c_sz=32, bkv_sz=512, batch_size=1, n_buffer=2)
+        self.TOLERANCE = 0.3  # fp8 q, as in test_seq_along_lane_transposed
+        for group in (128, 256):
+            for sliding_window in (None, 128):
+                env = {**base_env, "SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP": str(group)}
+                with (
+                    self.subTest(group=group, sliding_window=sliding_window),
+                    unittest.mock.patch.dict(os.environ, env),
+                ):
+                    jax.clear_caches()
+                    self._check(
+                        seqs=self.EXTEND_SEQS,
+                        padded_tokens=self.EXTEND_TOKENS,
+                        num_q_heads=64,
+                        num_kv_heads=8,
+                        kv_dtype_name="float8_e4m3fn",
+                        k_scale=1.0,
+                        v_scale=1.0,
+                        sliding_window=sliding_window,
+                        seq_along_lane=True,
+                        prefill_block_sizes=blocks,
+                    )
+        jax.clear_caches()
+        del self.TOLERANCE
+
+
+class _Batch(NamedTuple):
+    """Host inputs of one ragged batch: (prefix_len, q_len) per sequence."""
+
+    seqs: tuple[tuple[int, int], ...]
+    num_verify: int  # Leading width-8 verify blocks, as the backend orders them.
+    q: np.ndarray  # [padded_tokens, num_q_heads, head_dim] f32 (bf16 values)
+    new_k: np.ndarray  # [padded_tokens, num_kv_heads, head_dim] f32 (kv dtype values)
+    new_v: np.ndarray
+    cache_k: np.ndarray  # [pages, page, num_kv_heads, head_dim]
+    cache_v: np.ndarray
+    page_indices: np.ndarray  # [num_seqs + 1, pages_per_seq]
+    kv_lens: np.ndarray  # [num_seqs + 1], 0 for the idle slot
+    cu_q_lens: np.ndarray  # [num_seqs + 2]
+
+    @property
+    def num_seqs(self) -> int:
+        return len(self.seqs)
+
+    @property
+    def total_tokens(self) -> int:
+        return int(self.cu_q_lens[self.num_seqs])
+
+    def positions(self, seq: int) -> tuple[np.ndarray, np.ndarray]:
+        """(page, slot) of each of the sequence's kv_len positions."""
+        page_size = self.cache_k.shape[1]
+        pos = np.arange(self.kv_lens[seq])
+        return self.page_indices[seq, pos // page_size], pos % page_size
+
+
+def _dense_reference(
+    batch: _Batch,
+    k_cache: np.ndarray,  # [pages, page, num_kv_heads, head_dim], dequantized f32
+    v_cache: np.ndarray,
+    *,
+    causal: bool,
+    sliding_window: int | None,
+    sm_scale: float,
+) -> np.ndarray:
+    """Dense f32 attention over each sequence's unpaged keys [0, kv_len).
+
+    Query i of a sequence sits at kv_len - q_len + i. Causal sees keys <= the
+    query; non-causal sees all kv_len keys. A window W keeps keys k > q - W.
+    """
+    num_q_heads = batch.q.shape[1]
+    num_kv_heads = k_cache.shape[2]
+    group = num_q_heads // num_kv_heads
+    out = np.zeros((batch.total_tokens, num_q_heads, batch.q.shape[2]), np.float32)
+    for seq in range(batch.num_seqs):
+        pages, slots = batch.positions(seq)
+        k, v = k_cache[pages, slots], v_cache[pages, slots]  # [kv_len, KV, D]
+        rows = slice(batch.cu_q_lens[seq], batch.cu_q_lens[seq + 1])
+        kv_len, q_len = int(batch.kv_lens[seq]), rows.stop - rows.start
+        q_pos = (kv_len - q_len + np.arange(q_len))[:, None]
+        k_pos = np.arange(kv_len)[None, :]
+        visible = np.broadcast_to(k_pos <= q_pos if causal else True, (q_len, kv_len))
+        if sliding_window is not None:
+            visible = visible & (k_pos > q_pos - sliding_window)
+        # One q head at a time keeps the logits at [q_len, kv_len].
+        for head in range(num_q_heads):
+            logits = batch.q[rows, head] @ k[:, head // group].T * sm_scale
+            logits = np.where(visible, logits, -np.inf)
+            probs = np.exp(logits - logits.max(axis=-1, keepdims=True))
+            probs /= probs.sum(axis=-1, keepdims=True)
+            out[rows, head] = probs @ v[:, head // group]
+    return out
+
+
+@unittest.skipIf(not _has_jax_tpu(), "Requires JAX with a TPU device")
+class TestBatchedRpaKernelCausalModes(unittest.TestCase):
+    """Causal and non-causal SEQ_ALONG_LANE against a dense f32 reference.
+
+    The reference reads K/V back from the kernel's updated cache (the live
+    slots are also checked against the expected writes). Non-causal also
+    matches RPA v3 causal=0, the kernel the DFlash draft ran on before. Every
+    cache slot that is not a live key going in holds NaN (non-causal) or a
+    large finite value (causal; its p is 0 but 0 * NaN is NaN, see the report).
+    """
+
+    PAGE_SIZE = 256
+    HEAD_DIM = 128
+    WIDTH = 8
+    WINDOW = 2048
+    # Unit-scale q and dequantized K/V give logits of std 1. The kernel rounds
+    # the logits and the output to bf16 (2^-9 relative) and divides by an
+    # approximate reciprocal; fp8 adds nothing beyond that, since the reference
+    # reads the same fp8 values and the scales are powers of two. The max over 64
+    # q heads reaches 3.9e-2 (8 q heads: 1.9e-2) at the same RMS error.
+    MAX_ABS = {"bfloat16": 5e-2, "float8_e4m3fn": 5e-2}
+    MAX_REL_RMS = 2e-2
+    # Draft blocks below, at and past page and window edges; extends from no
+    # prefix to past the window, one spanning several q blocks.
+    VERIFY_PREFIXES = (1, 255, 256, 1000, 2047, 2048, 2049, 5000)
+    EXTEND_SEQS = ((0, 300), (437, 77), (3000, 515), (1100, 1500))
+    HEADS = ((64, 8), (8, 1))
+    STALE_FINITE = {"bfloat16": 1e4, "float8_e4m3fn": 448.0}
+
+    def _batch(self, *, num_q_heads, num_kv_heads, kv_dtype, scales, seed=0):
+        import jax.numpy as jnp
+
+        rng = np.random.default_rng(seed)
+        seqs = tuple((p, self.WIDTH) for p in self.VERIFY_PREFIXES)
+        seqs += self.EXTEND_SEQS
+        num_seqs = len(seqs)
+        q_lens = np.asarray([q for _, q in seqs], np.int32)
+        kv_lens = np.asarray([p + q for p, q in seqs] + [0], np.int32)
+        cu_q_lens = np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32)
+        cu_q_lens = np.append(cu_q_lens, cu_q_lens[-1]).astype(np.int32)
+        padded_tokens = -(-(int(cu_q_lens[-1]) + 1) // 128) * 128
+        pages_per_seq = -(-int(kv_lens.max()) // self.PAGE_SIZE)
+        num_pages = (num_seqs + 1) * pages_per_seq
+        page_indices = rng.permutation(num_pages).astype(np.int32)
+        page_indices = page_indices.reshape(num_seqs + 1, pages_per_seq)
+
+        def _kv(shape, scale):
+            values = rng.standard_normal(shape, dtype=np.float32)
+            return _round_through(values / (scale or 1.0), kv_dtype)
+
+        k_scale, v_scale = scales
+        cache_shape = (num_pages, self.PAGE_SIZE, num_kv_heads, self.HEAD_DIM)
+        new_shape = (padded_tokens, num_kv_heads, self.HEAD_DIM)
+        q_shape = (padded_tokens, num_q_heads, self.HEAD_DIM)
+        return _Batch(
+            seqs=seqs,
+            num_verify=len(self.VERIFY_PREFIXES),
+            q=_round_through(rng.standard_normal(q_shape, np.float32), jnp.bfloat16),
+            new_k=_kv(new_shape, k_scale),
+            new_v=_kv(new_shape, v_scale),
+            cache_k=_kv(cache_shape, k_scale),
+            cache_v=_kv(cache_shape, v_scale),
+            page_indices=page_indices,
+            kv_lens=kv_lens,
+            cu_q_lens=cu_q_lens,
+        )
+
+    def _expected_cache(
+        self, batch: _Batch
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(K, V, live-after mask) once the new tokens land in their slots."""
+        k, v = batch.cache_k.copy(), batch.cache_v.copy()
+        live = np.zeros(k.shape[:2], dtype=bool)
+        for seq, (prefix, _) in enumerate(batch.seqs):
+            pages, slots = batch.positions(seq)
+            live[pages, slots] = True
+            rows = slice(batch.cu_q_lens[seq], batch.cu_q_lens[seq + 1])
+            k[pages[prefix:], slots[prefix:]] = batch.new_k[rows]
+            v[pages[prefix:], slots[prefix:]] = batch.new_v[rows]
+        return k, v, live
+
+    def _poisoned_cache(self, batch: _Batch, stale: float) -> np.ndarray:
+        """Interleaved [pages, page, 2 * kv, head_dim] with stale everywhere but the prefixes."""
+        cache = _interleave_kv(batch.cache_k, batch.cache_v)
+        live_before = np.zeros(cache.shape[:2], dtype=bool)
+        for seq, (prefix, _) in enumerate(batch.seqs):
+            pages, slots = batch.positions(seq)
+            live_before[pages[:prefix], slots[:prefix]] = True
+        cache[~live_before] = stale
+        return cache
+
+    def _run_batched(self, batch, cache, *, causal, split, kv_dtype, **kwargs):
+        """The batched kernel; split runs the verify blocks first as the backend does."""
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs
+        from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
+            ragged_paged_attention,
+        )
+
+        def run(cache, distribution, prefill_block_sizes=None):
+            return ragged_paged_attention(
+                jnp.asarray(batch.q, dtype=jnp.bfloat16),
+                jnp.asarray(batch.new_k, dtype=kv_dtype),
+                jnp.asarray(batch.new_v, dtype=kv_dtype),
+                cache,
+                jnp.asarray(batch.kv_lens),
+                jnp.asarray(batch.page_indices.reshape(-1)),
+                jnp.asarray(batch.cu_q_lens),
+                jnp.asarray(distribution, dtype=jnp.int32),
+                kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+                use_causal_mask=causal,
+                prefill_block_sizes=prefill_block_sizes,
+                **kwargs,
+            )
+
+        n, k = batch.num_seqs, batch.num_verify
+        if not split:
+            return run(cache, [0, 0, n])
+        # attention_pallas_rpa_batched._verify_blocks at a 2048-token window.
+        verify_blocks = configs.BlockSizes(
+            bq_sz=self.WIDTH, bq_c_sz=self.WIDTH, bkv_sz=2048, batch_size=1, n_buffer=3
+        )
+        out_verify, cache = run(cache, [0, 0, k], verify_blocks)
+        out_rest, cache = run(cache, [0, k, n])
+        verify_rows = np.arange(batch.q.shape[0]) < batch.cu_q_lens[k]
+        return jnp.where(verify_rows[:, None, None], out_verify, out_rest), cache
+
+    def _run_v3(self, batch, *, kv_dtype, **kwargs):
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
+            ragged_paged_attention,
+        )
+
+        pages_per_seq = batch.page_indices.shape[1]
+        cu_kv_lens = np.arange(batch.num_seqs + 2, dtype=np.int32) * (
+            pages_per_seq * self.PAGE_SIZE
+        )
+        out, _ = ragged_paged_attention(
+            jnp.asarray(batch.q, dtype=jnp.bfloat16),
+            jnp.asarray(batch.new_k, dtype=kv_dtype),
+            jnp.asarray(batch.new_v, dtype=kv_dtype),
+            _kv_cache_to_kernel(
+                _interleave_kv(batch.cache_k, batch.cache_v),
+                kv_dtype,
+                configs.KVLayout.HEAD_ALONG_SUBLANE,
+            ),
+            jnp.asarray(batch.kv_lens),
+            jnp.asarray(batch.page_indices.reshape(-1)),
+            jnp.asarray(batch.cu_q_lens),
+            jnp.asarray(cu_kv_lens),
+            jnp.asarray([0, 0, batch.num_seqs], dtype=jnp.int32),
+            None,
+            None,
+            causal=0,
+            **kwargs,
+        )
+        return np.asarray(out[: batch.total_tokens].astype(jnp.float32))
+
+    def _assert_close(self, name, batch, actual, expected, kv_dtype_name):
+        per_seq = []
+        for seq in range(batch.num_seqs):
+            rows = slice(batch.cu_q_lens[seq], batch.cu_q_lens[seq + 1])
+            err = actual[rows] - expected[rows]
+            per_seq.append(
+                (
+                    float(np.max(np.abs(err))),
+                    float(np.linalg.norm(err) / np.linalg.norm(expected[rows])),
+                )
+            )
+        max_abs = max(a for a, _ in per_seq)
+        max_rel = max(r for _, r in per_seq)
+        print(f"{self.id()} {name}: max_abs={max_abs:.2e} max_rel_rms={max_rel:.2e}")
+        for seq, (abs_err, rel_err) in enumerate(per_seq):
+            msg = f"{name} sequence {seq} {batch.seqs[seq]}"
+            self.assertLess(abs_err, self.MAX_ABS[kv_dtype_name], msg)
+            self.assertLess(rel_err, self.MAX_REL_RMS, msg)
+
+    def _check(
+        self, *, causal, split, num_q_heads, num_kv_heads, kv_dtype_name, sliding_window
+    ):
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs
+
+        kv_dtype = jnp.dtype(kv_dtype_name)
+        fp8 = kv_dtype_name == "float8_e4m3fn"
+        k_scale, v_scale = (0.5, 0.25) if fp8 else (None, None)
+        batch = self._batch(
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            kv_dtype=kv_dtype,
+            scales=(k_scale, v_scale),
+        )
+        stale = self.STALE_FINITE[kv_dtype_name] if causal else np.nan
+        layout = configs.KVLayout.SEQ_ALONG_LANE
+        kwargs = dict(
+            sm_scale=1.0 / math.sqrt(self.HEAD_DIM),
+            sliding_window=sliding_window,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+        actual, updated = self._run_batched(
+            batch,
+            _kv_cache_to_kernel(self._poisoned_cache(batch, stale), kv_dtype, layout),
+            causal=causal,
+            split=split,
+            kv_dtype=kv_dtype,
+            **kwargs,
+        )
+        actual = np.asarray(actual[: batch.total_tokens].astype(jnp.float32))
+        self.assertTrue(np.isfinite(actual).all(), "a stale slot reached the output")
+
+        exp_k, exp_v, live = self._expected_cache(batch)
+        updated = _kv_cache_from_kernel(
+            updated, 2 * num_kv_heads, self.HEAD_DIM, layout
+        )
+        np.testing.assert_array_equal(updated[live], _interleave_kv(exp_k, exp_v)[live])
+        k_back = updated[:, :, 0::2] * (k_scale or 1.0)
+        v_back = updated[:, :, 1::2] * (v_scale or 1.0)
+        expected = _dense_reference(
+            batch,
+            k_back,
+            v_back,
+            causal=causal,
+            sliding_window=sliding_window,
+            sm_scale=kwargs["sm_scale"],
+        )
+        self._assert_close("vs dense reference", batch, actual, expected, kv_dtype_name)
+        if not causal:
+            # Keys after a query must matter, or a causal mask would pass too.
+            causal_ref = _dense_reference(
+                batch,
+                k_back,
+                v_back,
+                causal=True,
+                sliding_window=sliding_window,
+                sm_scale=kwargs["sm_scale"],
+            )
+            self.assertGreater(float(np.max(np.abs(expected - causal_ref))), 0.1)
+            v3 = self._run_v3(batch, kv_dtype=kv_dtype, **kwargs)
+            self._assert_close("vs rpa v3 causal=0", batch, actual, v3, kv_dtype_name)
+
+    def _matrix(self, *, causal):
+        for num_q_heads, num_kv_heads in self.HEADS:
+            for kv_dtype_name in ("bfloat16", "float8_e4m3fn"):
+                for sliding_window in (self.WINDOW, None):
+                    for split in (True, False):
+                        with self.subTest(
+                            heads=(num_q_heads, num_kv_heads),
+                            kv_dtype=kv_dtype_name,
+                            window=sliding_window,
+                            split=split,
+                        ):
+                            self._check(
+                                causal=causal,
+                                split=split,
+                                num_q_heads=num_q_heads,
+                                num_kv_heads=num_kv_heads,
+                                kv_dtype_name=kv_dtype_name,
+                                sliding_window=sliding_window,
+                            )
+
+    def test_non_causal_matrix(self):
+        self._matrix(causal=False)
+
+    def test_causal_matrix(self):
+        self._matrix(causal=True)
+
+    def test_quick_draft_shape(self):
+        """The production draft call per rank: 8 q / 1 KV head, fp8, window 2048,
+        verify blocks split from the extends; both modes."""
+        for causal in (False, True):
+            with self.subTest(causal=causal):
+                self._check(
+                    causal=causal,
+                    split=True,
+                    num_q_heads=8,
+                    num_kv_heads=1,
+                    kv_dtype_name="float8_e4m3fn",
+                    sliding_window=self.WINDOW,
                 )
 
 
