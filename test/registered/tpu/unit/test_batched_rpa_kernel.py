@@ -746,8 +746,9 @@ class TestBatchedRpaKernelCausalModes(unittest.TestCase):
     # Unit-scale q and dequantized K/V give logits of std 1. The kernel rounds
     # the logits and the output to bf16 (2^-9 relative) and divides by an
     # approximate reciprocal; fp8 adds nothing beyond that, since the reference
-    # reads the same fp8 values and the scales are powers of two.
-    MAX_ABS = {"bfloat16": 2e-2, "float8_e4m3fn": 3e-2}
+    # reads the same fp8 values and the scales are powers of two. The max over 64
+    # q heads reaches 3.9e-2 (8 q heads: 1.9e-2) at the same RMS error.
+    MAX_ABS = {"bfloat16": 5e-2, "float8_e4m3fn": 5e-2}
     MAX_REL_RMS = 2e-2
     # Draft blocks below, at and past page and window edges; extends from no
     # prefix to past the window, one spanning several q blocks.
