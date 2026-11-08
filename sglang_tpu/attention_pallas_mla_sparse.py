@@ -35,7 +35,9 @@ from sglang_tpu.attention_pallas_mla import (
 from sglang_tpu.dsa_indexer_tpu import (
     build_dsa_index_topk_op,
     build_dsa_index_topk_split_op,
+    build_dsa_kpool_expand_op,
     build_dsa_kpool_topk_op,
+    build_dsa_kpool_topk_split_op,
     indexer_forward,
     kpool_indexer_forward,
 )
@@ -285,12 +287,13 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         self._init_indexer_token_split()
 
     def _init_indexer_token_split(self) -> None:
-        """Set up SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT (plain DSA, attn-TP > 1)."""
+        """Set up SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT (attn-TP > 1)."""
         self._idx_split_group = None
         self._idx_split_size = 1
         self._idx_split_min_tokens = 0
         self._index_topk_split_op = None
-        if self._kpool > 1 or not tpu_envs.SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT.get():
+        self._kpool_expand_op = None
+        if not tpu_envs.SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT.get():
             return
         from sglang.srt.runtime_context import get_parallel
 
@@ -312,7 +315,13 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             tpu_envs.SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT_MIN_TOKENS.get(),
             _TOKEN_SPLIT_MIN_ROWS_PER_RANK * group.world_size,
         )
-        self._index_topk_split_op = build_dsa_index_topk_split_op()
+        if self._kpool > 1:
+            # Pooled indexer: the ranks exchange picked pools (topk // kpool
+            # per row), not token rows, and expand them after the all-reduce.
+            self._index_topk_split_op = build_dsa_kpool_topk_split_op()
+            self._kpool_expand_op = build_dsa_kpool_expand_op()
+        else:
+            self._index_topk_split_op = build_dsa_index_topk_split_op()
 
     def _indexer_split_rows(self, forward_batch: ForwardBatch, num_tokens: int) -> int:
         """Rows per rank for the indexer token split, or 0 to run unsplit.
@@ -337,7 +346,8 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         rows = -(-rows // 8) * 8
         if rows < _TOKEN_SPLIT_MIN_ROWS_PER_RANK:
             return 0
-        # The all-reduce buffer is [tp, rows, topk] int32 per DSA layer: bound it.
+        # The all-reduce buffer is [tp, rows, topk] int32 per DSA layer
+        # ([tp, rows, topk // kpool] for the pooled indexer): bound it.
         if rows > tpu_envs.SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT_MAX_ROWS.get():
             return 0
         return rows
@@ -510,6 +520,20 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         ``i32[num_tokens, width]`` rows in the format of index_topk."""
         metadata = self.forward_metadata
         pool = self.token_to_kv_pool
+        split_rows = self._indexer_split_rows(forward_batch, query.shape[0])
+        if split_rows:
+            return self._index_topk_kpool_token_split(
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                query=query,
+                key=key,
+                gate=gate,
+                head_weights=head_weights,
+                ape=ape,
+                weight_scale=weight_scale,
+                kpool=kpool,
+                split_rows=split_rows,
+            )
         return self._index_topk_op(
             query.contiguous(),
             key.contiguous(),
@@ -528,6 +552,73 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             self._kpool_width,
             metadata.decode_query_size,
             _kpool_query_bound(metadata, num_tokens=query.shape[0]),
+        )
+
+    def _index_topk_kpool_token_split(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        gate: torch.Tensor,
+        head_weights: torch.Tensor,
+        ape: torch.Tensor,
+        weight_scale: float,
+        kpool: int,
+        split_rows: int,
+    ) -> torch.Tensor:
+        """index_topk_kpool with SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT.
+
+        Every rank stores all tokens' raw keys and closes all pools (each
+        keeps the full caches), and scores only its own token slice
+        ``[rank * split_rows, (rank + 1) * split_rows)``. Scoring every query
+        against every closed pool is the part that grows with the context, and
+        unsplit, all attention-TP ranks repeat it for the whole batch. The
+        ranks' picked pools, ``i32[split_rows, topk // kpool]``, are put
+        together by ``_assemble_split_rows`` and expanded to token rows.
+        """
+        from sglang.srt.layers.dp_attention import _rank_tensor
+
+        metadata = self.forward_metadata
+        pool = self.token_to_kv_pool
+        num_tokens = query.shape[0]
+        kv_lens = self._kv_lens(forward_batch)
+        rank = _rank_tensor("attn_tp", query.device)
+        row_start = (rank * split_rows).to(torch.int32).reshape(1)
+        local_picked = self._index_topk_split_op(
+            query.contiguous(),
+            key.contiguous(),
+            gate.contiguous(),
+            head_weights.contiguous(),
+            ape.contiguous(),
+            pool.get_kpool_raw_cache(layer_id),
+            pool.get_index_key_cache(layer_id),
+            kv_lens,
+            metadata.page_indices,
+            metadata.cu_q_lens,
+            metadata.distribution,
+            row_start,
+            weight_scale,
+            self._topk,
+            kpool,
+            _kpool_query_bound(metadata, num_tokens=num_tokens),
+            split_rows,
+        )  # i32[split_rows, topk // kpool]
+        picked = _assemble_split_rows(
+            local_picked, rank, self._idx_split_size, self._idx_split_group.all_reduce
+        )
+        if picked.shape[0] != num_tokens:
+            # Padding rows of the last slices (all -1) are dropped.
+            picked = picked[:num_tokens].contiguous()
+        return self._kpool_expand_op(
+            picked,
+            kv_lens,
+            metadata.cu_q_lens,
+            metadata.distribution,
+            self._topk,
+            kpool,
+            self._kpool_width,
         )
 
     def _forward_mla(

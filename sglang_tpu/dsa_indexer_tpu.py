@@ -33,6 +33,8 @@ if TYPE_CHECKING:
 
 _PALLAS_DSA_INDEX_TOPK_OP = None
 _PALLAS_DSA_KPOOL_TOPK_OP = None
+_PALLAS_DSA_KPOOL_TOPK_SPLIT_OP = None
+_PALLAS_DSA_KPOOL_EXPAND_OP = None
 
 
 def build_dsa_index_topk_op():
@@ -517,6 +519,219 @@ def build_dsa_kpool_topk_op():
     custom_op.register_fake(_fake_impl)
 
     _PALLAS_DSA_KPOOL_TOPK_OP = custom_op
+    return custom_op
+
+
+def build_dsa_kpool_topk_split_op():
+    """Register the token-split pooled indexer step as a torch custom op, once.
+
+    SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT for the pooled indexer: same as
+    ``dsa_kpool_topk`` (it stores every token's raw key and closes every pool),
+    but it scores only the query rows ``[row_start, row_start + row_count)``
+    and returns their picked pools, ``i32[row_count, topk // kpool]``. The
+    backend puts the ranks' slices together, then ``dsa_kpool_expand`` turns
+    the pools into token rows. A separate op, so the default path's op and its
+    compiled programs do not change.
+    """
+    global _PALLAS_DSA_KPOOL_TOPK_SPLIT_OP
+    if _PALLAS_DSA_KPOOL_TOPK_SPLIT_OP is not None:
+        return _PALLAS_DSA_KPOOL_TOPK_SPLIT_OP
+
+    import jax  # noqa: F401  (force loud failure if JAX is missing)
+    from torch_tpu._internal import pallas as _torch_pallas
+
+    from sglang_tpu.attention.pallas.dsa_kpool_topk import kpool_indexer_step
+
+    op_name = "sglang_tpu_pallas::dsa_kpool_topk_split"
+
+    # Positional jax.Array tensors, as in build_dsa_index_topk_op.
+    def _wrapped(
+        query: jax.Array,
+        key: jax.Array,
+        gate: jax.Array,
+        head_weights: jax.Array,
+        ape: jax.Array,
+        raw_cache: jax.Array,
+        pooled_cache: jax.Array,
+        kv_lens: jax.Array,
+        page_indices: jax.Array,
+        cu_q_lens: jax.Array,
+        distribution: jax.Array,
+        row_start: jax.Array,
+        weight_scale: float,
+        topk: int,
+        kpool: int,
+        max_query_length: int,
+        row_count: int,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        return kpool_indexer_step(
+            query,
+            key,
+            gate,
+            head_weights,
+            ape,
+            raw_cache,
+            pooled_cache,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            weight_scale=weight_scale,
+            topk=topk,
+            kpool=kpool,
+            max_query_length=max_query_length or None,
+            row_start=row_start,
+            row_count=row_count,
+        )
+
+    raw_argnum, pooled_argnum = argnums(_wrapped, "raw_cache", "pooled_cache")
+    jax_kernel = _torch_pallas.custom_jax_kernel(
+        _wrapped,
+        name=f"jax_{op_name}",
+        static_argnums=argnums(
+            _wrapped,
+            "weight_scale",
+            "topk",
+            "kpool",
+            "max_query_length",
+            "row_count",
+        ),
+        donate_argnums=(raw_argnum, pooled_argnum),
+        input_output_aliases={raw_argnum: 1, pooled_argnum: 2},
+        warn_deprecated=False,
+    )
+
+    @torch.library.custom_op(
+        op_name,
+        mutates_args=("raw_cache", "pooled_cache"),
+        device_types=["tpu"],
+    )
+    def custom_op(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        gate: torch.Tensor,
+        head_weights: torch.Tensor,
+        ape: torch.Tensor,
+        raw_cache: torch.Tensor,
+        pooled_cache: torch.Tensor,
+        kv_lens: torch.Tensor,
+        page_indices: torch.Tensor,
+        cu_q_lens: torch.Tensor,
+        distribution: torch.Tensor,
+        row_start: torch.Tensor,
+        weight_scale: float,
+        topk: int,
+        kpool: int,
+        max_query_length: int,
+        row_count: int,
+    ) -> torch.Tensor:
+        # See build_dsa_index_topk_op: JAX needs the TPU info to compile here.
+        with tpu_info_for_cpu_export():
+            picked, _raw, _pooled = jax_kernel(
+                query,
+                key,
+                gate,
+                head_weights,
+                ape,
+                raw_cache,
+                pooled_cache,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                row_start,
+                weight_scale,
+                topk,
+                kpool,
+                max_query_length,
+                row_count,
+            )
+        return picked
+
+    def _fake_impl(query: torch.Tensor, *args, **kwargs):
+        topk, kpool, _max_query_length, row_count = args[12:16]
+        return torch.empty(
+            (row_count, topk // kpool), dtype=torch.int32, device=query.device
+        )
+
+    custom_op.register_fake(_fake_impl)
+
+    _PALLAS_DSA_KPOOL_TOPK_SPLIT_OP = custom_op
+    return custom_op
+
+
+def build_dsa_kpool_expand_op():
+    """Register ``kpool_expand_rows`` (picked pools -> token rows) as a torch
+    custom op, once: the last step of the pooled indexer's token split."""
+    global _PALLAS_DSA_KPOOL_EXPAND_OP
+    if _PALLAS_DSA_KPOOL_EXPAND_OP is not None:
+        return _PALLAS_DSA_KPOOL_EXPAND_OP
+
+    import jax  # noqa: F401  (force loud failure if JAX is missing)
+    from torch_tpu._internal import pallas as _torch_pallas
+
+    from sglang_tpu.attention.pallas.dsa_kpool_topk import kpool_expand_rows
+
+    op_name = "sglang_tpu_pallas::dsa_kpool_expand"
+
+    def _wrapped(
+        picked: jax.Array,
+        kv_lens: jax.Array,
+        cu_q_lens: jax.Array,
+        distribution: jax.Array,
+        topk: int,
+        kpool: int,
+        out_width: int,
+    ) -> jax.Array:
+        return kpool_expand_rows(
+            picked,
+            kv_lens,
+            cu_q_lens,
+            distribution,
+            topk=topk,
+            kpool=kpool,
+            out_width=out_width,
+        )
+
+    jax_kernel = _torch_pallas.custom_jax_kernel(
+        _wrapped,
+        name=f"jax_{op_name}",
+        static_argnums=argnums(_wrapped, "topk", "kpool", "out_width"),
+        warn_deprecated=False,
+    )
+
+    @torch.library.custom_op(op_name, mutates_args=(), device_types=["tpu"])
+    def custom_op(
+        picked: torch.Tensor,
+        kv_lens: torch.Tensor,
+        cu_q_lens: torch.Tensor,
+        distribution: torch.Tensor,
+        topk: int,
+        kpool: int,
+        out_width: int,
+    ) -> torch.Tensor:
+        with tpu_info_for_cpu_export():
+            return jax_kernel(
+                picked, kv_lens, cu_q_lens, distribution, topk, kpool, out_width
+            )
+
+    def _fake_impl(
+        picked: torch.Tensor,
+        kv_lens: torch.Tensor,
+        cu_q_lens: torch.Tensor,
+        distribution: torch.Tensor,
+        topk: int,
+        kpool: int,
+        out_width: int,
+    ):
+        width = max(out_width, topk + kpool - 1)
+        return torch.empty(
+            (picked.shape[0], width), dtype=torch.int32, device=picked.device
+        )
+
+    custom_op.register_fake(_fake_impl)
+
+    _PALLAS_DSA_KPOOL_EXPAND_OP = custom_op
     return custom_op
 
 

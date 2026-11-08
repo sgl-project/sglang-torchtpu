@@ -110,9 +110,12 @@ class TpuEnvs:
     # top-k-selects only its contiguous slice of ceil(T / attn_tp) query rows
     # (rounded up to 8); an int32 all-reduce over the attention-TP group puts
     # the [T, topk] rows together (attention_pallas_mla_sparse.py). Same rows
-    # bit for bit; attention is unchanged. _MAX_ROWS caps the rows per rank
-    # (the all-reduce buffer is [attn_tp, rows, topk] int32 per DSA layer);
-    # larger batches keep the replicated path, as do decode and verify.
+    # bit for bit; attention is unchanged. The pooled (kpool) indexer
+    # (GLM-5.3-Flash) splits the same way, and the ranks exchange their rows'
+    # picked pools ([T, topk // kpool]) and expand them to tokens afterwards.
+    # _MAX_ROWS caps the rows per rank (the all-reduce buffer is
+    # [attn_tp, rows, topk] int32 per DSA layer); larger batches keep the
+    # replicated path, as do decode and verify.
     SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT = EnvBool(False)
     SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT_MIN_TOKENS = EnvInt(1024)
     SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT_MAX_ROWS = EnvInt(512)
