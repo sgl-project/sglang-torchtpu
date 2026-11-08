@@ -515,9 +515,35 @@ class TpuEnvs:
     # assigns each shared graph to the least-loaded rank (shared_compile_cost.py).
     # Empty: round-robin owners.
     SGLANG_TPU_SHARED_COMPILE_COST_PROFILE = EnvStr("")
+    # With the megakernel: extend steps run the prefill program (muse_megakernel/prefill.py:
+    # batched RPA, fused attention-output and post-MoE kernels, fused-RS MoE) on the
+    # kernel's weights. Needs fp8 SEQ_ALONG_LANE pools and bf16 NVFP4 block scales.
+    SGLANG_TPU_MUSE_MK_PREFILL = EnvBool(False)
+    # The prefill program's expert-input and post-expert-projection all-gathers in e4m3
+    # (one scale per block): half their ICI bytes, ~2^-4 relative error per element.
+    SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER = EnvBool(False)
+    # Largest megakernel step in rows (running requests x verify tokens, padded to the
+    # TP size); larger steps run the native decoder. Steps above 32 rows run the
+    # megakernel's row-tiled program (ops.BASE_STEP_MAX_ROWS) and pad to 16 rows.
+    SGLANG_TPU_MUSE_MK_MAX_ROWS = EnvInt(32)
+    # Muse megakernel: stack the NVFP4 expert slabs of this many consecutive layers into one
+    # operand per slab (0 = one operand per layer); the layer params become views into it.
+    # 15 measured 3-4% faster decode / verify steps (cc = 1, q = 1 and 8, 128k-512k).
+    SGLANG_TPU_MUSE_MK_EXPERT_GROUP = EnvInt(0)
     # DFlash: verify only the first WIDTH tokens of each draft block once the decode batch
     # reaches MIN_BS requests (dflash_adaptive_verify.py); "" verifies the full block.
     SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY = EnvStr("")
+    # > 0: megakernel sliding-window layers on SEQ_ALONG_LANE pools use KV chunks of this many
+    # tokens (a divisor of the 2 * inter_local-token chunk); their 2048-token window gains nothing.
+    SGLANG_TPU_MUSE_MK_SAL_SWA_CHUNK_TOKENS = EnvInt(0)
+    # Megakernel attention: a softmax stream past the request's last chunk skips its iteration
+    # (MKConfig.attn_skip_idle_streams); and, with SWA chunks set, a full-attention layer's last
+    # chunk is masked by key column only (MKConfig.attn_col_mask).
+    SGLANG_TPU_MUSE_MK_ATTN_SKIP_IDLE = EnvBool(False)
+    SGLANG_TPU_MUSE_MK_ATTN_COL_MASK = EnvBool(False)
+    # Experimental: the pipelined SAL attention loop (MKConfig.attn_pipe) on steps of 33-64 rows
+    # too, not only up to _BASE_STEP_MAX_ROWS (12-16 decoding requests at 4-token verify).
+    SGLANG_TPU_MUSE_MK_LARGE_STEP_ATTN_PIPE = EnvBool(False)
     # Fused KV pool stores a rank's heads side by side in one 128-lane row when they
     # fit exactly (e.g. 2 x head_dim 64): half the bytes of a zero-padded row per head.
     SGLANG_TPU_KV_PACK_HEADS = EnvBool(False)
@@ -528,9 +554,53 @@ class TpuEnvs:
     # Fused-RS NVFP4 experts keep the checkpoint's e4m3 block scales and apply the
     # per-expert global scales after each dot: half the scale bytes of folded bf16.
     SGLANG_TPU_NVFP4_E4M3_SCALES = EnvBool(False)
+    # Megakernel MoE: send each row's expert outputs to their reduce-scatter owner as
+    # soon as the row's last expert is done (MKConfig.y_early).
+    SGLANG_TPU_MK_Y_EARLY = EnvBool(False)
+    # Megakernel MoE: run the experts owner block by owner block and send each block of
+    # reduce-scatter rows to its owner as one DMA while the remaining experts run
+    # (MKConfig.y_block_send; exact). Ignored where SGLANG_TPU_MK_Y_EARLY applies.
+    SGLANG_TPU_MK_Y_BLOCK_SEND = EnvBool(True)
+    # Experimental: megakernel experts with more than this many live (row, slot) pairs (1, 2 or 4;
+    # 0 off) run in a second loop after each owner group's few-row experts (MKConfig.expert_split;
+    # exact). Steps of more than 24 rows only.
+    SGLANG_TPU_MUSE_MK_EXPERT_SPLIT = EnvInt(0)
+    # Megakernel attention on fp8 SEQ_ALONG_LANE pools: feed K (and V) to the MXU as fp8
+    # instead of widening each chunk to bf16 on the VPU first. 0 = off, 1 = K only, 2 = K and V
+    # (exact). With the 2026-10-27 megakernel, 2 saves 0.09 / 0.20 / 0.40 ms per q = 1 step at
+    # 128k / 256k / 512k and nothing at q = 8.
+    SGLANG_TPU_MK_SAL_FP8_DOT = EnvInt(0)
+    # Profiling only: name the megakernel's in-kernel regions for xprof (needs libtpu
+    # --xla_enable_custom_call_region_trace=true and a device tracer level above 1);
+    # 2 also names the per-chunk / per-expert regions, which distort the timing they show.
+    SGLANG_TPU_MK_TRACE_REGIONS = EnvInt(0)
+    # Profiling only: scoped VMEM limit (MiB) for every step while TRACE_REGIONS is on; the region
+    # markers take stack VMEM (the 16-row step overflowed the default 60 MiB by 1.1 MiB).
+    SGLANG_TPU_MK_TRACE_VMEM_LIMIT_MB = EnvFloat(None)
+    # Tuning only: declared-scratch budget cut per row past 64 rows (KiB), for the VMEM sweep.
+    SGLANG_TPU_MK_LARGE_STEP_BUDGET_PER_ROW_KB = EnvInt(None)
+    # Tuning only: scoped VMEM limit (MiB) for steps past 64 rows (default 60; 64 MiB physical).
+    SGLANG_TPU_MK_LARGE_STEP_VMEM_LIMIT_MB = EnvFloat(None)
+    # Tuning only: force the 16-bit packed page tables on (1) or off (0); unset = by table size.
+    SGLANG_TPU_MK_PACK_PAGE_TABLES = EnvInt(None)
     # Fixed batch shape of MIXED (mixed-chunk) batches; unset = the largest bs bucket. Raise it
     # when more requests decode inside mixed chunks than any decode bucket holds.
     SGLANG_TPU_MIXED_MAX_BS = EnvInt(None)
+    # Megakernel attention: fold a power-of-two attn_scale into the bf16 queries instead of
+    # scaling every score (exact).
+    SGLANG_TPU_MK_FOLD_ATTN_SCALE = EnvBool(False)
+    # Muse megakernel: fold the f / o all-gathers into the next qkvg and the pool + router
+    # matvecs (not bit-exact: the matvec input rounding moves; verify steps only).
+    SGLANG_TPU_MUSE_MK_FOLD = EnvBool(True)
+    # Muse megakernel Wave 1-4 optimizations (hoisted SAL refill, stack2 QK/PV, all-VMEM
+    # collective/expert scratch on row-tiled steps, 2D PairColl collectives, vectorized routing).
+    SGLANG_TPU_MUSE_MK_OPT = EnvBool(True)
+    # Offline block-256 (16, 16)^T pre-shuffling of fp4 expert slabs + wpool/scales for
+    # zero-shuffle NVFP4 dequant in the decode megakernel (and prefill MoE via MUSE_PF_MOE_KPERM).
+    SGLANG_TPU_MUSE_MK_KPERM = EnvBool(False)
+    # Megakernel KV write on SEQ_ALONG_LANE pools: all page read-modify-writes of a layer in
+    # flight together, overlapped with the next layer's (MKConfig.kv_write_pipelined; exact).
+    SGLANG_TPU_MUSE_MK_KV_WRITE_PIPELINED = EnvBool(False)
     # Fused-RS expert TP passes each device only its own block of routed rows, so a
     # call is no longer capped at 1/ep_size of the tokens and the expert weights are
     # streamed once per chunk rather than once per capped call.
