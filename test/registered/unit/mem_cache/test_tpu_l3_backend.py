@@ -227,7 +227,9 @@ class TestTpuL3Backend(CustomTestCase):
             backend = _make_backend(d)
             backend.register_mem_pool_host(pool)
 
-            value = torch.randint(0, 256, (LAYER_NUM, PAGE_SIZE * 16), dtype=torch.uint8)
+            value = torch.randint(
+                0, 256, (LAYER_NUM, PAGE_SIZE * 16), dtype=torch.uint8
+            )
             self.assertTrue(backend.set("k", value=value))
             self.assertTrue(backend.exists("k"))
             out = backend.get("k")

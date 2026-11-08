@@ -146,7 +146,9 @@ class PosixFileEngine:
                 os.close(fd)
             os.replace(tmp, full)
         except OSError:
-            logger.warning("PosixFileEngine: failed to write key %r", key, exc_info=True)
+            logger.warning(
+                "PosixFileEngine: failed to write key %r", key, exc_info=True
+            )
             try:
                 os.unlink(tmp)
             except OSError:
