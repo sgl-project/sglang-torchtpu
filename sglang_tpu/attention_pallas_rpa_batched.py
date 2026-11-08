@@ -18,10 +18,14 @@ The kernel reads either of two KV cache layouts, chosen once here from
 # NOTE: do *not* add ``from __future__ import annotations`` here (see
 # attention_pallas_rpa_base for why torch_tpu's jax_op needs real annotations).
 
+import dataclasses
+import functools
+
 from sglang_tpu.attention_pallas_rpa_base import (
     BaseTpuPallasRpaAttnBackend,
     PallasForwardMetadata,
     RpaKernelSpec,
+    _build_pallas_kernel_op,
     _resolve_decode_query_size,
 )
 from sglang_tpu.cp_forward import get_tpu_cp_layout
@@ -84,6 +88,7 @@ def _invoke_batched_kernel(
     v_scale,
     decode_query_size=1,
     use_causal_mask=True,
+    out_head_norm_eps=-1.0,
 ):
     # cu_kv_lens is not consumed by the batched kernel.
     # It builds its schedule inline and has no per-mode dispatch to skip, so
@@ -113,6 +118,7 @@ def _invoke_batched_kernel(
             skip_kv_update=False,
             kv_layout=kv_layout(),
             prefill_block_sizes=prefill_block_sizes,
+            out_head_norm_eps=out_head_norm_eps,
         )
 
     if decode_query_size == 1:
@@ -196,6 +202,12 @@ RPA_BATCHED_SPEC = RpaKernelSpec(
     is_batched=True,
     min_page_size=_MIN_PAGE_SIZE,
 )
+# SGLANG_TPU_RPA_OUT_HEAD_NORM_EPS is Muse's attention output norm; a DFlash draft has none.
+RPA_BATCHED_DRAFT_SPEC = dataclasses.replace(
+    RPA_BATCHED_SPEC,
+    op_name=RPA_BATCHED_SPEC.op_name + "_draft",
+    invoke_kernel=functools.partial(_invoke_batched_kernel, out_head_norm_eps=None),
+)
 
 
 class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
@@ -204,6 +216,8 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
     kernel_spec = RPA_BATCHED_SPEC
 
     def __init__(self, model_runner, speculative_step_id=0):
+        # Read by _build_kernel_op, which the base __init__ calls.
+        self._is_draft = bool(model_runner.is_draft_worker)
         super().__init__(model_runner, speculative_step_id)
         from sglang.srt.managers.schedule_batch import mixed_tail_width
         from sglang.srt.runtime_context import get_parallel
@@ -222,6 +236,11 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
             )
         self._pp_schedule_runner = model_runner if parallel.pp_size > 1 else None
         self._cp_schedule_runner = model_runner if parallel.attn_cp_size > 1 else None
+
+    def _build_kernel_op(self):
+        return _build_pallas_kernel_op(
+            RPA_BATCHED_DRAFT_SPEC if self._is_draft else self.kernel_spec
+        )
 
     def init_forward_metadata(self, forward_batch):
         cp_layout = get_tpu_cp_layout(forward_batch)
