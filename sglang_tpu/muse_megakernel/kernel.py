@@ -276,6 +276,9 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     mv_rows: int = 256
     # row-tiled: rows per pass of a busy expert (each pass dequantizes its slabs again)
     expert_chunk: int = 32
+    # row-tiled, ex_opt: experts past 32 rows run one staged pass in a 64, 128, ... or R-row
+    # bucket instead of expert_chunk-row passes (exact: rows are independent)
+    ex_one_pass: bool = False
     # optimization flags (all default off on MKConfig; enabled by decode_config)
     ex_opt: bool = False
     ex_kperm: int = 0
@@ -2310,6 +2313,16 @@ def _route_table(ids_list, n_live, K, Ep, NB, pair_key, n_keys, split=0):
         rows + tail + [jnp.zeros((n_rows - 4 * NB - len(tail), LANE), jnp.int32)],
         axis=0,
     )
+
+
+def one_pass_buckets(R):
+    """Staged-expert row buckets past 32 rows for MKConfig.ex_one_pass: powers of two below R,
+    then R (a pair per row at most, so R covers every expert)."""
+    out, b = [], 64
+    while b < R:
+        out.append(b)
+        b *= 2
+    return tuple(out) + ((R,) if R > 32 else ())
 
 
 def compact_buckets(c):
@@ -7436,14 +7449,42 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     and He + Il <= H
                     and 2 * Il <= S["acc"].shape[1]
                 )
+                # one-pass buckets past 32 rows: gather and store only the 16-row groups
+                # holding live pairs (rows past them are stale and never stored)
+                dyn_rows = bool(can_stage_ex and c.ex_one_pass and nrows > 32)
+                if dyn_rows:
+                    assert vy >= 1
+                    n_grp = (n_valid + 15) // 16
+                    pq_col = 2 * Il
+
+                    def gather_grp(g_, carry_):
+                        s0 = pl.multiple_of(g_ * 16, 16)
+                        ps16 = [pair_fn(s0 + j) for j in range(16)]
+                        S["lhs"][pl.ds(s0, 16), pl.ds(0, He)] = gather_x(ps16)
+                        if prequant_x:
+                            S["acc"][pl.ds(s0, 16), pl.ds(pq_col, LANE)] = (
+                                jnp.broadcast_to(pq_sc_of(ps16), (16, LANE))
+                            )
+                        return carry_
+
+                    jax.lax.fori_loop(0, n_grp, gather_grp, 0)
                 if can_stage_ex:
                     pq_chunks = []
-                    for s0 in range(0, nrows, 16):
+                    for s0 in range(0, 0 if dyn_rows else nrows, 16):
                         ps16 = [pair_fn(s0 + j) for j in range(16)]
                         S["lhs"][pl.ds(s0, 16), pl.ds(0, He)] = gather_x(ps16)
                         if prequant_x:
                             pq_chunks.append(pq_sc_of(ps16))
-                    pq_sc = jnp.concatenate(pq_chunks, axis=0) if prequant_x else None
+                    if dyn_rows:
+                        pq_sc = (
+                            S["acc"][pl.ds(0, nrows), pl.ds(pq_col, 1)]
+                            if prequant_x
+                            else None
+                        )
+                    else:
+                        pq_sc = (
+                            jnp.concatenate(pq_chunks, axis=0) if prequant_x else None
+                        )
                     w13_prequant_sc = pq_sc if can_fp8_x else None
                     w13_post_sc = pq_sc if (prequant_x and not can_fp8_x) else None
 
@@ -7588,7 +7629,20 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                             out_stage_ref=y_stage,
                             nrows=nrows,
                         )
-                    for s0 in range(0, nrows, 16):
+                    if dyn_rows:
+
+                        def store_grp(g_, carry_):
+                            s0 = pl.multiple_of(g_ * 16, 16)
+                            yp = _pack_y(S["lhs"][pl.ds(s0, 16), pl.ds(0, He)], c)
+                            for j in range(16):
+                                p = pair_fn(s0 + j)
+                                S["ysend"].at[p // K][pl.ds(p % K, 1), :] = yp[
+                                    j : j + 1
+                                ]
+                            return carry_
+
+                        jax.lax.fori_loop(0, n_grp, store_grp, 0)
+                    for s0 in range(0, 0 if dyn_rows else nrows, 16):
                         yp = _pack_y(S["lhs"][pl.ds(s0, 16), pl.ds(0, He)], c)
                         if vy >= 1:
                             for j in range(16):
@@ -7748,15 +7802,16 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     CH = 8 if use_bd_chunk else min(c.expert_chunk, R)
 
                     def full_one(nrows):
-                        run_ffn_and_store(
-                            nrows,
-                            lambda j: rget("perm", off + jnp.minimum(j, cnt - 1)),
-                            slot,
-                            e,
-                            False,
-                            off,
-                            cnt,
-                        )
+                        with _scope(f"ex_f{nrows}"):
+                            run_ffn_and_store(
+                                nrows,
+                                lambda j: rget("perm", off + jnp.minimum(j, cnt - 1)),
+                                slot,
+                                e,
+                                False,
+                                off,
+                                cnt,
+                            )
 
                     def chunk(ch, carry_):
                         run_ffn_and_store(
@@ -7774,7 +7829,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         return carry_
 
                     def run_chunks():
-                        jax.lax.fori_loop(0, (cnt + CH - 1) // CH, chunk, 0)
+                        with _scope("ex_fch"):
+                            jax.lax.fori_loop(0, (cnt + CH - 1) // CH, chunk, 0)
 
                     def bd_chunk_step(ch, carry_):
                         run_ffn_and_store(
@@ -7804,6 +7860,10 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                                 lo_b = bd_cap
                             if lo_b < R:
                                 raw_fb = (8, 16, 32) if c.ex_w2_stage else (16, 24)
+                                if c.ex_one_pass and c.ex_w2_stage:
+                                    # one staged pass per expert up to R rows: its slabs
+                                    # are dequantized once, not once per expert_chunk
+                                    raw_fb += one_pass_buckets(R)
                                 fb = tuple(b for b in raw_fb if lo_b < b <= R)
                                 for b in fb:
                                     far.append((b, functools.partial(full_one, b)))

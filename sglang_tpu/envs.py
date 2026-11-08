@@ -564,6 +564,12 @@ class TpuEnvs:
     # 0 off) run in a second loop after each owner group's few-row experts (MKConfig.expert_split;
     # exact). Steps of more than 24 rows only.
     SGLANG_TPU_MUSE_MK_EXPERT_SPLIT = EnvInt(0)
+    # Megakernel row-tiled steps: an expert with more than 32 live (row, slot) pairs runs one
+    # staged pass in a 64 / 128 / ... / R-row bucket, dequantizing its slabs once, instead of
+    # 32- or 64-row passes that each dequantize them again (MKConfig.ex_one_pass; exact).
+    # Unset: on with SGLANG_TPU_MUSE_MK_KPERM (-1.3 / -0.8 ms at 64 / 128 rows), off without it
+    # (no step-time gain measured there).
+    SGLANG_TPU_MUSE_MK_EXPERT_ONE_PASS = EnvBool(None)
     # Megakernel attention on fp8 SEQ_ALONG_LANE pools: feed K (and V) to the MXU as fp8
     # instead of widening each chunk to bf16 on the VPU first. 0 = off, 1 = K only, 2 = K and V
     # (exact). With the 2026-10-27 megakernel, 2 saves 0.09 / 0.20 / 0.40 ms per q = 1 step at

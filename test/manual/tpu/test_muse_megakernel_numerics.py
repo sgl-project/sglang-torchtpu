@@ -284,6 +284,39 @@ def _words8(w: torch.Tensor) -> torch.Tensor:
     return b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16) | (b[:, 3] << 24)
 
 
+def _perm_256(t: torch.Tensor, dim: int) -> torch.Tensor:
+    """Each 256-slice along dim from (16, 16) to (16, 16)^T (the MK_KPERM layout)."""
+    dim %= t.ndim
+    sh = t.shape
+    return (
+        t.reshape(*sh[:dim], sh[dim] // 256, 16, 16, *sh[dim + 1 :])
+        .transpose(dim + 1, dim + 2)
+        .reshape(sh)
+        .contiguous()
+    )
+
+
+def _perm_256_words(words: torch.Tensor) -> torch.Tensor:
+    """_perm_256 along K of fp4 words [..., K/8, N] (nibble j of word w is row 8w + j)."""
+    shifts = torch.arange(0, 32, 4, dtype=torch.int32)
+    codes = (words[..., :, None, :] >> shifts[:, None]) & 0xF
+    codes = _perm_256(codes.reshape(*words.shape[:-2], -1, words.shape[-1]), -2)
+    codes = codes.reshape(*words.shape[:-2], words.shape[-2], 8, words.shape[-1])
+    return (codes << shifts[:, None]).sum(dim=-2, dtype=torch.int64).to(torch.int32)
+
+
+def kperm_expert_slabs(slabs: list) -> list:
+    """expert_slabs of an fp4 expert in the SGLANG_TPU_MUSE_MK_KPERM layout (ops._perm_expert_cpu):
+    w13 K and N, its scales' N, and w2 K permuted; the w2 scales stay."""
+    w13, s13, w2, s2 = slabs
+    return [
+        _perm_256(_perm_256_words(w13), -1),
+        _perm_256(s13, -1),
+        _perm_256_words(w2),
+        s2,
+    ]
+
+
 def decode_expert(slabs: list, kind: str) -> tuple:
     """f32 (w13 [He, 2 Il], w2 [Il, He]) from expert_slabs."""
     w13, s13, w2, s2 = slabs
@@ -442,11 +475,22 @@ class _Runner:
         ops._INSTANCE[:] = [mk]
         ops._register_op()
         self.device = torch.device("tpu")
+        # MK_NUMERICS_KPERM=1: fp4 layers in the SGLANG_TPU_MUSE_MK_KPERM layout (expert slabs,
+        # wpool columns, wpool scales and pre-expert gain permuted; the reference is unchanged)
+        self.kperm = os.environ.get("MK_NUMERICS_KPERM") == "1"
+        mk.kperm = self.kperm
         self.weights = self._weights(max_position)
         self.per_layer_experts = [
             [
                 torch.stack(t).to(self.device)
-                for t in zip(*(expert_slabs(l, rank, e, k) for e in range(N_EXPERTS)))
+                for t in zip(
+                    *(
+                        kperm_expert_slabs(expert_slabs(l, rank, e, k))
+                        if self.kperm and k == "fp4"
+                        else expert_slabs(l, rank, e, k)
+                        for e in range(N_EXPERTS)
+                    )
+                )
             ]
             for l, k in enumerate(self.kinds)
         ]
@@ -482,6 +526,16 @@ class _Runner:
             "smalls": smalls,
             "wrouter": torch.stack([replicated_layer(l)["wrouter"] for l in range(L)]),
         }
+        if self.kperm:
+            hel = EXPERT_HIDDEN // TP
+            for l, kind in enumerate(self.kinds):
+                if kind != "fp4":
+                    continue
+                dense[l]["wpool"] = _perm_256(dense[l]["wpool"], -1)
+                for name in ("wpool_s", "pre_expert_w"):
+                    n = hel if name == "wpool_s" else EXPERT_HIDDEN
+                    row = smalls[l, K.SMALL[name], :n]
+                    smalls[l, K.SMALL[name], :n] = _perm_256(row, -1)
         for name in ("wqkvg", "wo", "wpool", "wunpool"):
             by_name[name] = torch.stack([d[name] for d in dense])
         return [by_name[n].to(self.device) for n in K.WEIGHT_NAMES]

@@ -707,6 +707,9 @@ class MuseMegakernel(torch.nn.Module):
                 "SGLANG_TPU_MUSE_MK_DEV_EXPERT_CHUNK",
                 64 if (opt and tiled and rows > 128) else 32,
             ),
+            ex_one_pass=opt
+            and tiled
+            and _one_pass(bool(getattr(self, "kperm", False))),
         )
         n_units = len(K.expert_units(cfg))
         ex_split = (
@@ -714,7 +717,9 @@ class MuseMegakernel(torch.nn.Module):
             if (opt and rows >= _EXPERT_SPLIT_MIN_ROWS and n_units <= _ARMS5_MAX_UNITS)
             else 0
         )
-        use_c8 = tiled or not cfg.ex_w2_stage
+        # kperm dequantizes without shuffles: a dense 8-row expert (2.5 us) beats the 8-row
+        # block-diagonal one (2.85 us), as in the base program
+        use_c8 = (tiled and not cfg.ex_kperm) or not cfg.ex_w2_stage
         cfg = msgspec.structs.replace(
             cfg,
             expert_split=ex_split,
@@ -1226,6 +1231,11 @@ _EXPERT_SPLIT_MIN_ROWS = 32
 # loop still fits the instruction memory with a fifth expert variant or paired DMA issue:
 # stacked groups of 15 (6 units) fit, per-layer operands (62 units) swap overlays.
 _ARMS5_MAX_UNITS = 8
+
+
+def _one_pass(kperm: bool) -> bool:
+    env = tpu_envs.SGLANG_TPU_MUSE_MK_EXPERT_ONE_PASS.get()
+    return kperm if env is None else env
 
 
 def _compact_arms(
