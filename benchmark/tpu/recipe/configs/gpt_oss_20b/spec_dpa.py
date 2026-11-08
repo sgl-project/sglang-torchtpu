@@ -21,5 +21,8 @@ CONFIG["server_args"].update(
         # attention_tp = tp_size / dp_size = 4 > 1, which TPU requires the LM
         # head to follow.
         "enable_dp_lm_head": True,
+        # The gate's DPA eval never runs more than max_running_requests at
+        # once; one decode bucket per DP group replaces spec.py's three.
+        "tpu_compile_bs": [SPEC_CONFIG["server_args"]["max_running_requests"]],
     }
 )

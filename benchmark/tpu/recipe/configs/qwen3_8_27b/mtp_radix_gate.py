@@ -20,5 +20,9 @@ CONFIG["server_args"].update(
         "disable_radix_cache": False,
         "mamba_radix_cache_strategy": "extra_buffer",
         "max_mamba_cache_size": MAMBA_SLOTS,
+        # The gate drives at most CONCURRENCY requests at once (the draining
+        # batch and GSM8K at CONCURRENCY threads); one decode bucket covers
+        # every live batch size and cuts the precompile grid ~4x.
+        "tpu_compile_bs": [mtp_gate.CONCURRENCY],
     }
 )
