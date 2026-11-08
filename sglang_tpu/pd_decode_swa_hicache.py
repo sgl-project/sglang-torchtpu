@@ -41,6 +41,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hicache_auto_size import (
     auto_size_hicache,
@@ -273,11 +274,17 @@ def _create_tree_cache(upstream: Callable, ctx: TreeCacheBuildContext):
                 "PD decode SWA HiCache needs the unified radix tree with a "
                 f"full-attention + SWA pool, got {type(cache).__name__}."
             )
-        if draft_plan is not None:
+        # An all-SWA draft keeps its KV in the target's SWA slots, which stay on device
+        # like the target's window; only a full-attention draft joins the host stack.
+        if draft_plan is not None and not _is_swa_draft(draft_plan):
             kv_cache_builder.maybe_register_hicache_draft(
                 tree_cache=cache, draft_plan=draft_plan
             )
     return cache
+
+
+def _is_swa_draft(draft_plan: HiCacheDraftPlan) -> bool:
+    return any(isinstance(pool, BaseSWAKVPool) for pool in draft_plan.device_pools)
 
 
 def _build_full_only_host_stack(

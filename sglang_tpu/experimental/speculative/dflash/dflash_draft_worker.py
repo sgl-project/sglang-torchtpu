@@ -17,6 +17,7 @@ from typing import cast
 import torch
 from torch import nn
 
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.models.dflash import DFlash2DraftModel, DFlashDraftModel
@@ -25,11 +26,12 @@ from sglang.srt.models.dspark import (
     gather_and_crop_vocab,
     project_through_lm_head,
 )
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_disagg, get_spec
 from sglang.srt.speculative.dflash_utils import (
     DFlashDraftConfig,
     parse_dflash_draft_config,
 )
+from sglang_tpu._logging import get_logger
 from sglang_tpu.experimental.compilation.block_compile_policy import block_draft_width
 from sglang_tpu.experimental.models.dflash2 import (
     build_lattice,
@@ -45,6 +47,12 @@ from sglang_tpu.experimental.speculative.block_draft_worker import (
     TpuBlockDraftWorker,
     target_input_embedding,
 )
+from sglang_tpu.models.dflash_context_kv import (
+    as_context_kv_model_config,
+    context_kv_unsupported_reason,
+)
+
+logger = get_logger(__name__)
 
 
 class TpuDflashDraftWorker(TpuBlockDraftWorker):
@@ -80,6 +88,16 @@ class TpuDflashDraftWorker(TpuBlockDraftWorker):
             if embedding is not None:
                 draft_model.embed_tokens = embedding
         draft_model.lm_head = unwrap_lora_layer(target_model.lm_head)
+
+    def prepare_draft_model_config(self, model_config: ModelConfig) -> ModelConfig:
+        # A PD prefill only writes the draft's context KV, so it loads just those weights.
+        if get_disagg().disaggregation_mode != "prefill":
+            return model_config
+        reason = context_kv_unsupported_reason(model_config)
+        if reason is not None:
+            logger.warning("PD prefill loads the whole DFlash draft: %s.", reason)
+            return model_config
+        return as_context_kv_model_config(model_config)
 
     def sample_drafts(
         self,

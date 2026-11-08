@@ -107,6 +107,8 @@ from sglang_tpu.experimental.speculative.pd_draft_prefill import (
 )
 from sglang_tpu.experimental.speculative.pd_hidden_pool import (
     PdHiddenPool,
+    PdHiddenWindow,
+    drop_rows_before,
     register_pd_hidden_pool,
 )
 from sglang_tpu.experimental.speculative.spec_ops import (
@@ -276,6 +278,7 @@ class TpuSpecWorker(BaseSpecWorker):
         register_host_batch_padder(self._pad_bs)
         # Built in init_cuda_graphs: the target KV pool it pages after does not exist yet.
         self._pd_hidden_pool: PdHiddenPool | None = None
+        self._pd_hidden_window: PdHiddenWindow | None = None
 
     def _init_pd_hidden_pool(self) -> PdHiddenPool | None:
         """The PD hidden pool when the decode runs the draft prompt pass, else None."""
@@ -287,14 +290,37 @@ class TpuSpecWorker(BaseSpecWorker):
             raise NotImplementedError(
                 "SGLANG_TPU_PD_DECODE_DRAFT_PREFILL does not support DP attention."
             )
-        pool = build_pd_hidden_pool(self.target_worker.model_runner)
+        pool = build_pd_hidden_pool(
+            self.target_worker.model_runner,
+            paged_by_swa=self.pd_hidden_full_to_swa() is not None,
+        )
         register_pd_hidden_pool(pool)
         if disagg_mode == "decode":
-            register_pd_draft_prefiller(
-                self.prefill_draft_from_pd,
-                max_prompt_tokens=self._pd_draft_max_prompt_tokens,
-            )
+            register_pd_draft_prefiller(self.prefill_draft_from_pd)
         return pool
+
+    def _init_pd_hidden_window(self) -> PdHiddenWindow | None:
+        """The rows an SWA-paged pool's decode reads, when this prefill writes only those."""
+        pool = self._pd_hidden_pool
+        if (
+            pool is None
+            or not pool.paged_by_swa
+            or not self.ships_pd_hidden
+            or not tpu_envs.SGLANG_TPU_ENABLE_PD_HIDDEN_WINDOW_WRITE.get()
+        ):
+            return None
+        runner = self.target_worker.model_runner
+        window = runner.sliding_window_size
+        if window is None or window <= 0:
+            raise RuntimeError(
+                "The PD hidden pool pages by SWA slots, but the target has no "
+                f"sliding window (sliding_window_size={window})."
+            )
+        return PdHiddenWindow(
+            sliding_window_size=window,
+            page_size=runner.token_to_kv_pool_allocator.page_size,
+            every_chunk_end=not get_memory().disable_radix_cache,
+        )
 
     @property
     def ships_pd_hidden(self) -> bool:
@@ -311,18 +337,19 @@ class TpuSpecWorker(BaseSpecWorker):
         assert self._pd_hidden_pool is not None
         cache_loc_cpu = batch.out_cache_loc
         assert cache_loc_cpu.device.type == "cpu", cache_loc_cpu.device
-        segments = self._pd_hidden_pool.write_segments(
-            cache_loc_cpu, target_hidden.shape[0]
-        )
+        slots = self._pd_hidden_slots(cache_loc_cpu)
+        window = self._pd_hidden_window
+        if window is not None:
+            starts = window.write_starts(
+                batch.prefix_lens,
+                batch.extend_lens,
+                [len(req.origin_input_ids) for req in batch.reqs],
+            )
+            slots = drop_rows_before(slots, batch.extend_lens, starts)
+        segments = self._pd_hidden_pool.write_segments(slots, target_hidden.shape[0])
         return self._pd_hidden_pool.write(
             target_hidden, segments=segments.to(self.device, non_blocking=True)
         )
-
-    def _pd_draft_max_prompt_tokens(self) -> int:
-        """The decode draft prompt pass takes a prompt in one extend bucket."""
-        t_bucketer = self._compile_policy().t_bucketer
-        assert t_bucketer is not None
-        return t_bucketer.max_val
 
     def prefill_draft_from_pd(self, batch: ScheduleBatch) -> None:
         """Draft prompt pass of a PD decode's prebuilt batch, from the shipped hidden rows."""
@@ -333,17 +360,20 @@ class TpuSpecWorker(BaseSpecWorker):
         cap = compile_policy._extend_compile_cap()
         vocab_size = self.target_worker.model_runner.model_config.vocab_size
         for group in prebuilt_extend_groups(
-            batch, max_tokens=t_bucketer.max_val, max_reqs=cap
+            batch.extend_lens,
+            self.pd_draft_prompt_starts(batch),
+            max_tokens=t_bucketer.max_val,
+            max_reqs=cap,
         ):
             view = prebuilt_extend_view(batch, group, vocab_size=vocab_size)
             # The draft graphs and writer were warmed with the allocator's dtype.
-            view.out_cache_loc = view.out_cache_loc.to(
-                compile_policy.live_cache_loc_dtype()
-            )
+            live_dtype = compile_policy.live_cache_loc_dtype()
+            view.out_cache_loc = view.out_cache_loc.to(live_dtype)
             padded_tokens = t_bucketer.next_bucket(max(view.extend_num_tokens, cap))
-            cache_loc = pad_rows(view.out_cache_loc, padded_tokens).to(
-                self.device, non_blocking=True
-            )
+            # Hidden rows and draft KV share a slot: SWA for a windowed draft, else full.
+            cache_loc = pad_rows(
+                self._pd_hidden_slots(view.out_cache_loc).to(live_dtype), padded_tokens
+            ).to(self.device, non_blocking=True)
             bonus_tokens = padded_h2d(
                 torch.tensor(
                     [req.output_ids[-1] for req in view.reqs], dtype=torch.int64
@@ -357,6 +387,30 @@ class TpuSpecWorker(BaseSpecWorker):
                 cache_loc=cache_loc,
                 bonus_tokens=bonus_tokens,
             )
+
+    def pd_draft_prompt_starts(self, batch: ScheduleBatch) -> list[int]:
+        """Per request, the extend offset the decode draft prompt pass starts at."""
+        return [0] * len(batch.reqs)
+
+    def pd_hidden_full_to_swa(self) -> torch.Tensor | None:
+        """Host full-to-SWA slot map when the draft KV, and so the hidden pool, lives
+        in the target's SWA slots; None pages the hidden pool by full slots."""
+        return None
+
+    def _pd_hidden_slots(self, cache_loc_cpu: torch.Tensor) -> torch.Tensor:
+        """The hidden pool slots of these host full KV slots."""
+        assert self._pd_hidden_pool is not None
+        full_to_swa = self.pd_hidden_full_to_swa()
+        if (full_to_swa is not None) != self._pd_hidden_pool.paged_by_swa:
+            raise RuntimeError(
+                "The PD hidden pool was built for "
+                f"{'SWA' if self._pd_hidden_pool.paged_by_swa else 'full'} slots, "
+                "but the draft's full-to-SWA map "
+                f"{'is missing' if full_to_swa is None else 'appeared'}."
+            )
+        if full_to_swa is None:
+            return cache_loc_cpu
+        return full_to_swa[cache_loc_cpu].to(cache_loc_cpu.dtype)
 
     def extend_draft_from_hidden(
         self,
@@ -409,6 +463,7 @@ class TpuSpecWorker(BaseSpecWorker):
         register_tpu_top_k_ops()
         # Before the Raiden manager, which registers it, and before its warmup.
         self._pd_hidden_pool = self._init_pd_hidden_pool()
+        self._pd_hidden_window = self._init_pd_hidden_window()
         self._all_drafts = {
             padded_bs: torch.full(
                 (padded_bs,), self.num_drafts, dtype=torch.int32, device=self.device

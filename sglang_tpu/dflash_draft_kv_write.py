@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Materialize DFlash draft KV into the fused TPU pool.
+"""Materialize DFlash draft KV into the fused or SEQ_ALONG_LANE TPU pool.
 
 Host side of kv_fused_rope_write: project K/V per draft layer, decompose the
 destination slots into contiguous spans, gather the rope tables, then hand it
-all to the single Pallas launch that rotates and scatters every layer. Extend
+all to the single Pallas launch that rotates and scatters every layer. A
+SEQ_ALONG_LANE pool rotates K here and writes through kv_sal_span_write. Extend
 and verify differ only in how the spans come out, so one path serves both.
 """
 
@@ -13,7 +14,7 @@ import torch
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.dflash import DFlashDraftModel
-from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool, TpuSeqAlongLaneKVPool
 from sglang_tpu.models.dflash_mla import DFlashMLAAttention
 
 
@@ -35,7 +36,7 @@ def dflash_write_draft_kv(
 
     Args:
       draft_model: DFlash draft model owning the layers and the projections.
-      kv_pool: Fused TPU KV pool the draft layers write into.
+      kv_pool: Fused or SEQ_ALONG_LANE TPU KV pool the draft layers write into.
       ctx_hidden: Projected context hidden states [num_tokens, hidden].
       ctx_positions: Token position IDs [num_tokens].
       ctx_cache_loc: Flat destination slot per token [num_tokens]; unused on
@@ -62,16 +63,54 @@ def dflash_write_draft_kv(
         commit_lens=commit_lens,
         max_num_reqs=max_num_reqs,
     )
+    k, v, rope = _project_draft_kv(
+        draft_model=draft_model, ctx_hidden=ctx_hidden, ctx_positions=ctx_positions
+    )
+    if isinstance(kv_pool, TpuSeqAlongLaneKVPool):
+        from sglang_tpu.kv_sal_span_write import sal_span_write_kv
+
+        sal_span_write_kv(
+            dst_starts=dst_starts,
+            src_starts=src_starts,
+            span_lens=span_lens,
+            k=k if rope is None else _neox_rotate(k, cos=rope[0], sin=rope[1]),
+            v=v,
+            kv_bufs=kv_pool.kv_buffer,
+        )
+        return
+    # MLA K comes rotated: hand the fused kernel an identity rotation (exact).
+    cos, sin = rope if rope is not None else _identity_rope(k)
+    fused_rope_write_kv(
+        dst_starts=dst_starts,
+        src_starts=src_starts,
+        span_lens=span_lens,
+        k=k,
+        v=v,
+        cos=cos,
+        sin=sin,
+        kv_bufs=kv_pool.kv_buffer,
+        max_span_len=max_span_len,
+    )
+
+
+def _project_draft_kv(
+    *,
+    draft_model: DFlashDraftModel,
+    ctx_hidden: torch.Tensor,
+    ctx_positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+    """Every layer's normed K and V [num_layers, num_tokens, kv_heads, head_dim].
+
+    Also returns the (cos, sin) rope rows K still needs, or None when the
+    projection already rotated it.
+    """
     attn0 = draft_model.layers[0].self_attn
     # MLA drafts rope only their k_pe slice, which the fused kernel's neox
-    # rotation over the whole head cannot express: rotate in the projection
-    # and hand the kernel an identity rotation (cos 1, sin 0 is exact).
+    # rotation over the whole head cannot express: rotate in the projection.
     prerotated = isinstance(attn0, DFlashMLAAttention)
-    if prerotated:
-        cos = ctx_hidden.new_ones((int(ctx_hidden.shape[0]), attn0.head_dim // 2))
-        sin = torch.zeros_like(cos)
-    else:
-        cos, sin = _rope_tables(
+    rope = None
+    if not prerotated:
+        rope = _rope_tables(
             draft_model=draft_model, positions=ctx_positions, dtype=ctx_hidden.dtype
         )
     k = ctx_hidden.new_empty(
@@ -99,18 +138,22 @@ def dflash_write_draft_kv(
         layer_k, layer_v = attn.kv_proj_only(layer_ctx_hidden)
         k[layer_idx] = attn.apply_k_norm(layer_k).view_as(k[layer_idx])
         v[layer_idx] = layer_v.view_as(v[layer_idx])
+    return k, v, rope
 
-    fused_rope_write_kv(
-        dst_starts=dst_starts,
-        src_starts=src_starts,
-        span_lens=span_lens,
-        k=k,
-        v=v,
-        cos=cos,
-        sin=sin,
-        kv_bufs=kv_pool.kv_buffer,
-        max_span_len=max_span_len,
-    )
+
+def _identity_rope(k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    cos = k.new_ones((int(k.shape[1]), int(k.shape[-1]) // 2))
+    return cos, torch.zeros_like(cos)
+
+
+def _neox_rotate(
+    k: torch.Tensor, *, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
+    """Neox rotation of [num_layers, num_tokens, heads, head_dim] K, as kv_fused_rope_write does."""
+    half = cos.shape[-1]
+    cos_b, sin_b = cos[None, :, None, :], sin[None, :, None, :]
+    x1, x2 = k[..., :half], k[..., half:]
+    return torch.cat([x1 * cos_b - x2 * sin_b, x2 * cos_b + x1 * sin_b], dim=-1)
 
 
 def dflash_write_draft_kv_ref(
@@ -174,6 +217,8 @@ def _scatter_layer_kv(
     # one row, a layout these writers don't produce.
     if kv_pool.kv_pack_heads > 1:
         raise NotImplementedError("DFLASH draft KV writes need an unpacked KV pool")
+    if isinstance(kv_pool, TpuSeqAlongLaneKVPool):
+        raise NotImplementedError("The reference scatter writes the fused layout only")
     buf = kv_pool.get_fused_kv_buffer(layer_idx)
     num_tokens = int(loc.shape[0])
     head_dim = kv_pool.head_dim

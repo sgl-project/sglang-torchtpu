@@ -377,7 +377,7 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         )
         from sglang_tpu.hooks.pipeline_parallel import (
             check_pipeline_parallel_compat,
-            skip_spec_op_precompile_without_draft,
+            skip_spec_op_precompile_without_verify,
         )
         from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
         from sglang_tpu.hooks.twolevel_allreduce import (
@@ -416,7 +416,7 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         self.assertIn(
             (
                 "sglang.srt.managers.scheduler.Scheduler.precompile_tpu_spec_ops",
-                skip_spec_op_precompile_without_draft,
+                skip_spec_op_precompile_without_verify,
                 HookType.AROUND,
             ),
             HOOKS,

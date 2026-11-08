@@ -170,16 +170,25 @@ Both raiden roles serve every algorithm with the same spec flags.
   stages run `TpuPipelineStageWorker`, which only forwards the target. The
   stages relay the EAGLE3 / DFlash aux captures to the last one (`../../pp_wave.py`),
   and PP runs without overlap, which a prefill-only server allows.
+- DFlash draft on a prefill: it only writes the draft's context KV, so a dense
+  GQA draft loads as `DFlashContextKVModel` (`../../models/dflash_context_kv.py`:
+  fc, hidden_norm, per-layer K/V projection, k_norm, rope). Raiden ships the
+  draft KV pages with the target's, resharded by draft heads when the decode's
+  TP differs. MLA, Laguna and Nemotron 3.5 drafts still load whole. The prefill
+  skips the verify-only spec op warmup.
 - Draft prompt pass on the decode (`SGLANG_TPU_PD_DECODE_DRAFT_PREFILL`, off by
   default): the prefill's last stage skips the draft and writes each prompt
   token's draft-input hidden into `pd_hidden_pool.py`, a paged buffer Raiden
   moves with the target KV in place of the draft KV; the decode reads it back
-  and runs the draft over the prompt on each prebuilt batch (`pd_draft_prefill.py`).
-  The buffer pages like the full KV pool and the KV budget counts it, which
-  needs the default pool configurator (`--disable-hybrid-swa-memory` on a SWA
-  model). Both ends must set the flag: it enters the Raiden layout fingerprint.
-  The decode aborts a prompt longer than its largest extend bucket at admission.
-  Needs the Raiden pipeline transfer; no DP attention.
+  and runs the draft over the prompt on each prebuilt batch (`pd_draft_prefill.py`),
+  a prompt longer than the largest extend bucket in successive bucket-sized chunks.
+  The buffer pages like the draft KV, in the default or hybrid SWA configurator
+  (not SWAChunkCap or unified memory): by full slots and per full token, or, for
+  a windowed (all-SWA) draft, by the target's SWA slots and per SWA token, moved
+  with the window pages; the pass covers only the SWA tail the decode
+  preallocates. Both ends must set the flag:
+  it enters the Raiden layout fingerprint. Needs the Raiden pipeline transfer; no
+  DP attention.
 - DP attention on the decode: the decode ranks pull their own requests' KV, which
   relieves the PP transfer that bounds a non-DP decode (`pd_singlehost_pp_spec.py`
   `decode_dp`; it adds `--enable-dp-lm-head`).

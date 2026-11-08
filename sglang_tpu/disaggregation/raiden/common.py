@@ -86,8 +86,10 @@ class RaidenKVCacheGroups:
     # total_kv_heads on a TP=1 pipeline producer).
     draft_kv_head_num: Optional[int] = None
     draft_swa_kv_head_num: Optional[int] = None
-    # Trailing full tensors after the draft's: the PD hidden pool (pd_hidden_pool.py).
+    # Trailing full / swa tensors after the draft's: the PD hidden pool
+    # (pd_hidden_pool.py), in swa when a windowed draft pages it by SWA slots.
     num_hidden_full: int = 0
+    num_hidden_swa: int = 0
     # Per-layer request-state tensors (GDN/Mamba rows or DSV4 compressor rings).
     state: List[torch.Tensor] = field(default_factory=list)
     state_type: StateType = StateType.MAMBA
@@ -101,6 +103,9 @@ class RaidenKVCacheGroups:
     unified_swa_pool: Optional[TpuUnifiedSWAKVPool] = None
     # True when any KV pool uses the 5D token-minor SEQ_ALONG_LANE layout.
     seq_along_lane: bool = False
+    # Whether the target / travelling draft pool is SEQ_ALONG_LANE; None without a draft.
+    target_seq_along_lane: bool = False
+    draft_seq_along_lane: Optional[bool] = None
 
 
 def _is_seq_along_lane_pool(pool: Optional[KVCache]) -> bool:
@@ -276,7 +281,9 @@ def get_raiden_kv_caches(
     full, swa = list(groups.full), list(groups.swa)
     full_ids, swa_ids = list(groups.full_layer_ids), list(groups.swa_layer_ids)
     seq_along_lane = _is_seq_along_lane_pool(pool)
-    num_draft_full = num_draft_swa = num_hidden_full = 0
+    target_seq_along_lane = seq_along_lane
+    draft_seq_along_lane: Optional[bool] = None
+    num_draft_full = num_draft_swa = num_hidden_full = num_hidden_swa = 0
     draft_kv_head_num: Optional[int] = None
     draft_swa_kv_head_num: Optional[int] = None
     if draft_pool is not None and draft_pool is not pool:
@@ -290,12 +297,19 @@ def get_raiden_kv_caches(
         swa_draft_pool = getattr(draft_pool, "swa_kv_pool", draft_pool)
         draft_kv_head_num = getattr(full_draft_pool, "head_num", None)
         draft_swa_kv_head_num = getattr(swa_draft_pool, "head_num", None)
-        seq_along_lane = seq_along_lane or _is_seq_along_lane_pool(draft_pool)
+        # Whole-page pulls take any per-tensor layout; the pipeline checks its own.
+        draft_seq_along_lane = _is_seq_along_lane_pool(draft_pool)
+        seq_along_lane = seq_along_lane or draft_seq_along_lane
 
     if hidden_pool is not None:
-        full.append(hidden_pool.buffer)
-        full_ids.append(0)
-        num_hidden_full = 1
+        # The uniform block count check below holds the rows to their page group.
+        tensors, ids = (swa, swa_ids) if hidden_pool.paged_by_swa else (full, full_ids)
+        tensors.append(hidden_pool.buffer)
+        ids.append(0)
+        if hidden_pool.paged_by_swa:
+            num_hidden_swa = 1
+        else:
+            num_hidden_full = 1
 
     state: List[torch.Tensor] = []
     state_type = StateType.MAMBA
@@ -337,6 +351,7 @@ def get_raiden_kv_caches(
         draft_kv_head_num=draft_kv_head_num,
         draft_swa_kv_head_num=draft_swa_kv_head_num,
         num_hidden_full=num_hidden_full,
+        num_hidden_swa=num_hidden_swa,
         state=state,
         state_type=state_type,
         state_max_blocks=state_max_blocks,
@@ -345,4 +360,6 @@ def get_raiden_kv_caches(
         write_state_meta=write_state_meta,
         unified_swa_pool=groups.unified_swa_pool,
         seq_along_lane=seq_along_lane,
+        target_seq_along_lane=target_seq_along_lane,
+        draft_seq_along_lane=draft_seq_along_lane,
     )

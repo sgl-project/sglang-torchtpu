@@ -1302,6 +1302,10 @@ class TpuSRTPlatform(SRTPlatform):
             return TpuModelOptMixedPrecisionConfig
         return None
 
+    def get_mha_kv_pool_cls_for_backend(self, backend: str) -> type:
+        # the pool a runner with its own backend (a draft) allocates
+        return _mha_kv_pool_cls(backend)
+
     def get_mha_kv_pool_cls(self) -> type:
         # Pick per the resolved backend: the raw field is None when --attention-backend is omitted.
         from sglang.srt.runtime_context import get_exec

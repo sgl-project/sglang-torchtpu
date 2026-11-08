@@ -75,7 +75,7 @@ from sglang_tpu.hooks.padded_logits_sampling import (
 )
 from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
-    skip_spec_op_precompile_without_draft,
+    skip_spec_op_precompile_without_verify,
 )
 from sglang_tpu.hooks.pp_buffered_kv_budget import reserve_pp_buffered_handoff
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
@@ -143,7 +143,7 @@ HOOKS: list[tuple] = [
     ),
     (
         "sglang.srt.managers.scheduler.Scheduler.precompile_tpu_spec_ops",
-        skip_spec_op_precompile_without_draft,
+        skip_spec_op_precompile_without_verify,
         HookType.AROUND,
     ),
     (

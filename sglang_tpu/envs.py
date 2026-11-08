@@ -254,6 +254,10 @@ class TpuEnvs:
     # hidden states (pd_hidden_pool.py) and the decode builds the draft KV and carry,
     # instead of the prefill running the draft over the prompt.
     SGLANG_TPU_PD_DECODE_DRAFT_PREFILL = EnvBool(False)
+    # With it and a windowed draft, the prefill writes only the hidden rows a decode
+    # can read: the window before the prompt end, or before each chunk end when a
+    # prefix-sharing tree may hand that window to a later request.
+    SGLANG_TPU_ENABLE_PD_HIDDEN_WINDOW_WRITE = EnvBool(True)
     # DFLASH draft linears, including the DFlash2 conv kernel projections, as fp8
     # weight-only (fp8_weight_linear.py) for decode-sized calls; prefill-sized calls
     # keep the bf16 weights. Changes the draft's proposals, not verification.
