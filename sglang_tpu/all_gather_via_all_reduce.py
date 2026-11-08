@@ -14,6 +14,14 @@ index and the group sums the buffers. Adding zero leaves every value unchanged,
 so the result equals a correct all-gather; the only bit-level difference is that
 a -0.0 element comes back as +0.0.
 
+The hook wraps ``GroupCoordinator.all_gather``, the concat-style API the logits
+gather uses (``tensor_model_parallel_all_gather``), not
+``all_gather_into_tensor``. Per-layer callers of ``all_gather_into_tensor``,
+such as the DP-attention token gathers, keep the native collective: the all-reduce
+path moves about 2x the bytes and slowed GLM-5.3-Flash DP8 by 8 to 14%
+(sgl-project/sglang-torchtpu#2013), and #1700 was only observed on the logits
+gather.
+
 The hook keys on ``torch.compiler.is_dynamo_compiling()``, so only graphs the
 Dynamo tracer builds take this path. The direct tracer and eager calls keep the
 native all-gather. The direct tracer never showed the defect, and it must not
@@ -25,7 +33,7 @@ executable to every rank. Dynamo specializes each rank's graph on its own rank
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, List, Optional
 
 import torch
 
@@ -50,19 +58,36 @@ def gather_blocks_via_all_reduce(group: Any, block: torch.Tensor) -> torch.Tenso
     return blocks.reshape(world_size * block.shape[0], *block.shape[1:])
 
 
-def all_gather_into_tensor_around(
+def all_gather_around(
     original: Callable[..., Any],
     group: Any,
-    output: torch.Tensor,
-    input: torch.Tensor,  # noqa: A002 - mirrors GroupCoordinator's signature
-) -> None:
-    """AROUND hook for ``GroupCoordinator.all_gather_into_tensor``.
+    input_: torch.Tensor,
+    dim: int = -1,
+    output_tensor_list: Optional[List[torch.Tensor]] = None,
+) -> Optional[torch.Tensor]:
+    """AROUND hook for ``GroupCoordinator.all_gather``.
 
-    Only Dynamo-traced calls on a multi-rank group take the all-reduce path.
-    Eager calls, direct-tracer graphs and single-rank groups call the original
-    collective.
+    Only Dynamo-traced, concat-style calls on a multi-rank group take the
+    all-reduce path. Eager calls, direct-tracer graphs, single-rank groups and
+    list-output calls call the original collective. Direct callers of
+    ``all_gather_into_tensor`` (DP-attention token gathers, attention-TP and CP
+    gathers) keep the native collective: #1700 was measured and fixed only on
+    the vocabulary logits gather, which goes through this method, and the
+    all-reduce path costs about 2x the bytes of an all-gather on every
+    per-layer gather (sgl-project/sglang-torchtpu#2013).
     """
-    if not torch.compiler.is_dynamo_compiling() or group.world_size == 1:
-        return original(group, output, input)
-    output.copy_(gather_blocks_via_all_reduce(group, input).view(output.shape))
-    return None
+    if (
+        not torch.compiler.is_dynamo_compiling()
+        or group.world_size == 1
+        or output_tensor_list is not None
+    ):
+        return original(group, input_, dim, output_tensor_list)
+    if dim < 0:
+        dim += input_.dim()
+    world_size = group.world_size
+    shape = input_.shape
+    gathered = gather_blocks_via_all_reduce(group, input_)
+    gathered = gathered.reshape((world_size, *shape)).movedim(0, dim)
+    return gathered.reshape(
+        (*shape[:dim], world_size * shape[dim], *shape[dim + 1 :])
+    )

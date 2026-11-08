@@ -1,6 +1,6 @@
 """CPU contract for the all-reduce-based TP all-gather (sgl-project/sglang-torchtpu#1700).
 
-The TPU hook rebuilds GroupCoordinator.all_gather_into_tensor from the in-place
+The TPU hook rebuilds GroupCoordinator.all_gather from the in-place
 all-reduce while Dynamo traces a graph. These tests simulate a TP group on CPU
 and check that the result equals the concatenation a correct all-gather writes
 (bit-identical except that -0.0 becomes +0.0), and that eager calls and the
@@ -100,26 +100,28 @@ class TestGatherBlocksViaAllReduce(CustomTestCase):
         self.assertFalse(torch.signbit(got).any())
 
 
-class TestAllGatherIntoTensorAround(CustomTestCase):
+class TestAllGatherAround(CustomTestCase):
     def setUp(self):
         super().setUp()
         torch._dynamo.reset()
         self.addCleanup(torch._dynamo.reset)
 
-    def test_dynamo_traced_call_writes_the_gather_into_output(self):
+    def test_dynamo_traced_call_concatenates_along_dim(self):
         blocks = _blocks(8, (8, 64), torch.bfloat16)
-        group = _SimulatedGroup(blocks, 3)
-        output = torch.empty(64, 64, dtype=torch.bfloat16)
         original = mock.Mock()
+        for dim in (0, 1, -1):
+            with self.subTest(dim=dim):
+                torch._dynamo.reset()
+                group = _SimulatedGroup(blocks, 3)
 
-        @torch.compile(backend="eager")
-        def traced(output, block):
-            agar.all_gather_into_tensor_around(original, group, output, block)
+                @torch.compile(backend="eager")
+                def traced(block):
+                    return agar.all_gather_around(original, group, block, dim)
 
-        traced(output, blocks[3])
+                got = traced(blocks[3])
 
+                self.assertTrue(torch.equal(got, torch.cat(blocks, dim=dim)))
         original.assert_not_called()
-        self.assertTrue(torch.equal(output, torch.cat(blocks, dim=0)))
 
     def test_direct_tracer_call_uses_the_native_collective(self):
         # The direct tracer sets this flag while tracing
@@ -127,47 +129,52 @@ class TestAllGatherIntoTensorAround(CustomTestCase):
         # executables must not bake in rank_in_group, so it keeps the native
         # gather.
         group = mock.Mock(world_size=8, rank_in_group=3)
-        output = torch.empty(16, 4)
         block = torch.ones(2, 4)
-        original = mock.Mock(return_value=None)
+        original = mock.Mock(return_value="native")
         with mock.patch.object(torch.compiler, "_is_compiling_flag", True):
             self.assertTrue(torch.compiler.is_compiling())
-            agar.all_gather_into_tensor_around(original, group, output, block)
-        original.assert_called_once_with(group, output, block)
+            got = agar.all_gather_around(original, group, block, -1)
+        self.assertEqual(got, "native")
+        original.assert_called_once_with(group, block, -1, None)
         group.all_reduce.assert_not_called()
 
     def test_eager_call_uses_the_native_collective(self):
         group = mock.Mock(world_size=8)
-        output = torch.empty(16, 4)
         block = torch.ones(2, 4)
-        original = mock.Mock(return_value=None)
-        agar.all_gather_into_tensor_around(original, group, output, block)
-        original.assert_called_once_with(group, output, block)
+        original = mock.Mock(return_value="native")
+        self.assertEqual(agar.all_gather_around(original, group, block, 0), "native")
+        original.assert_called_once_with(group, block, 0, None)
         group.all_reduce.assert_not_called()
 
-    def test_single_rank_group_uses_the_native_collective(self):
-        group = mock.Mock(world_size=1)
-        output = torch.empty(2, 4)
+    def test_single_rank_and_list_output_calls_use_the_native_collective(self):
         block = torch.ones(2, 4)
-        original = mock.Mock(return_value=None)
+        cases = [
+            (mock.Mock(world_size=1), None),
+            (mock.Mock(world_size=8), [torch.empty(2, 4) for _ in range(8)]),
+        ]
         with mock.patch.object(
             torch.compiler, "is_dynamo_compiling", return_value=True
         ):
-            agar.all_gather_into_tensor_around(original, group, output, block)
-        original.assert_called_once_with(group, output, block)
+            for group, output_list in cases:
+                with self.subTest(world=group.world_size):
+                    original = mock.Mock(return_value=None)
+                    agar.all_gather_around(original, group, block, 0, output_list)
+                    original.assert_called_once_with(group, block, 0, output_list)
+                    group.all_reduce.assert_not_called()
 
 
 class TestHookRegistration(CustomTestCase):
-    def test_hook_targets_group_coordinator_all_gather_into_tensor(self):
+    def test_hook_wraps_all_gather_but_not_all_gather_into_tensor(self):
         from sglang_tpu.hooks import HOOKS
 
-        target = (
-            "sglang.srt.distributed.parallel_state."
-            "GroupCoordinator.all_gather_into_tensor"
-        )
-        entries = [entry for entry in HOOKS if entry[0] == target]
+        prefix = "sglang.srt.distributed.parallel_state.GroupCoordinator."
+        targets = [entry[0] for entry in HOOKS]
+        entries = [entry for entry in HOOKS if entry[0] == prefix + "all_gather"]
         self.assertEqual(len(entries), 1)
-        self.assertIs(entries[0][1], agar.all_gather_into_tensor_around)
+        self.assertIs(entries[0][1], agar.all_gather_around)
+        # Per-layer all_gather_into_tensor callers (DP-attention token
+        # gathers) must keep the native collective (#2013).
+        self.assertNotIn(prefix + "all_gather_into_tensor", targets)
 
 
 if __name__ == "__main__":
