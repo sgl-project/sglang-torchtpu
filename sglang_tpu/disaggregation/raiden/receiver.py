@@ -20,6 +20,7 @@ import numpy.typing as npt
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver, KVTransferError
 from sglang.srt.environ import envs
+from sglang_tpu.disaggregation.prefix_pull import DecodePrefixReport, pullable_by_room
 from sglang_tpu.disaggregation.raiden.chunk_plan import chunk_pull_window
 from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
 from sglang_tpu.disaggregation.raiden.serde import (
@@ -240,10 +241,16 @@ class RaidenReceiverMixin:
         bootstrap_infos: List[dict],
         *,
         local_state_rows: Sequence[int] = (),
+        decode_prefix: Optional[DecodePrefixReport] = None,
     ) -> None:
         if self._pipeline is not None:
             self._pipeline.register_decode(
-                room, local_blocks, local_swa_blocks, aux_index, bootstrap_infos
+                room,
+                local_blocks,
+                local_swa_blocks,
+                aux_index,
+                bootstrap_infos,
+                decode_prefix=decode_prefix,
             )
             return
         if len(bootstrap_infos) != 1:
@@ -1471,6 +1478,9 @@ class RaidenKVReceiver(CommonKVReceiver):
             aux_index,
             self.bootstrap_infos,
             local_state_rows=self.kv_mgr._state_rows_from_state_indices(state_indices),
+            decode_prefix=pullable_by_room.report(
+                self.bootstrap_room, decode_prefix_len or 0
+            ),
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
         # The waiting timeout counts from here: the request is now known to

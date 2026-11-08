@@ -45,6 +45,10 @@ class MessageTag(bytes, enum.Enum):
 
     ROOM_FAILED = b"RAIDEN_ROOM_FAILED"  # prefill -> decode: room already failed
 
+    # Reverse pipeline transfer (P/D prefix pull, pp_reverse.py).
+    PREFIX_PULL_REQ = b"RAIDEN_PREFIX_PULL_REQ"  # prefill stage -> decode rank
+    PREFIX_PULL_READY = b"RAIDEN_PREFIX_PULL_READY"  # decode rank -> prefill stage
+
     # CommonKVReceiver owns this backend-independent positional message.
     ABORT = b"ABORT"  # decode -> prefill: room, decode ip, decode port
 
@@ -218,6 +222,57 @@ class RoomFailed(WireMessage):
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
+
+
+class PrefixPullReq(WireMessage):
+    """Ask a decode rank to register its pages of a room's prompt prefix
+    [start, end) and the window ending at end, for one prefill stage."""
+
+    TAG: ClassVar[bytes] = MessageTag.PREFIX_PULL_REQ
+    room: int
+    stage: int
+    endpoint: str
+    full_tags: list[str]
+    swa_tags: list[str]
+    start: int
+    end: int
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+        require_non_negative(self.stage, "stage")
+        require_non_negative(self.start, "start")
+        if self.end <= self.start:
+            raise ValueError(
+                f"invalid prefix range: expected start < end, got [{self.start}, "
+                f"{self.end})"
+            )
+
+
+class PrefixPullReady(WireMessage):
+    """A decode rank's answer to PrefixPullReq: registered (ok), or refused,
+    with retry when only its staging was busy."""
+
+    TAG: ClassVar[bytes] = MessageTag.PREFIX_PULL_READY
+    room: int
+    stage: int
+    rank: int
+    attn_tp_size: int
+    ok: bool
+    retry: bool = False
+    reason: str = ""
+    controller: str = ""
+    unit: dict = msgspec.field(default_factory=dict)
+    swa_controller: str = ""
+    swa_unit: dict = msgspec.field(default_factory=dict)
+    full_pages: int = 0
+    swa_pages: int = 0
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+        require_non_negative(self.stage, "stage")
+        require_non_negative(self.rank, "rank")
+        if self.attn_tp_size < 1:
+            raise ValueError("invalid attn_tp_size: expected >= 1")
 
 
 def decode_text(frame: bytes, field: str) -> str:

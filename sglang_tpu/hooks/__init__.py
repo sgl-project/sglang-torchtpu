@@ -73,6 +73,10 @@ from sglang_tpu.hooks.moe_topk import (
 from sglang_tpu.hooks.padded_logits_sampling import (
     hook_specs as padded_logits_sampling_hooks,
 )
+from sglang_tpu.hooks.pd_prefix_pull import hook_specs as pd_prefix_pull_hooks
+from sglang_tpu.hooks.pd_prefix_pull_metrics import (
+    hook_specs as pd_prefix_pull_metrics_hooks,
+)
 from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
     skip_spec_op_precompile_without_verify,
@@ -341,6 +345,10 @@ HOOKS.extend(host_padding_hooks())
 HOOKS.extend(hicache_swa_metrics_hooks())
 
 HOOKS.extend(swa_miss_metrics_hooks())
+
+HOOKS.extend(pd_prefix_pull_metrics_hooks())
+
+HOOKS.extend(pd_prefix_pull_hooks())
 
 HOOKS.extend(hook_specs())
 

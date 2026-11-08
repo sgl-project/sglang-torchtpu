@@ -20,7 +20,9 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import NetworkAddress
-from sglang_tpu.disaggregation.raiden import pp_swa
+from sglang_tpu.disaggregation.prefix_pull import DecodePrefixReport, agree
+from sglang_tpu.disaggregation.prefix_pull_decode import pull_holds
+from sglang_tpu.disaggregation.raiden import pp_reverse, pp_swa
 from sglang_tpu.disaggregation.raiden.host_pool import (
     StagingAdmission,
     ranks_per_node,
@@ -411,6 +413,8 @@ class PipelineTransfer:
 
     # The window link, when sliding-window layers have their own engine.
     swa: pp_swa.SwaLink | None = None
+    # Reverse transfers (P/D prefix pull) through the same engines.
+    reverse: pp_reverse.ReversePull | None = None
     draft_kv_heads: int | None = None
     draft_swa_kv_heads: int | None = None
 
@@ -508,6 +512,9 @@ class PipelineTransfer:
                 slots=swa_slots,
                 max_blocks=swa_blocks,
             )
+        self.reverse = pp_reverse.ReversePull(
+            self, None if self.producer else pull_holds.prefix_for_room
+        )
         self._log_ready(staging=staging, fingerprint=fingerprint)
 
     def _init_overlap_state(self) -> None:
@@ -1261,7 +1268,16 @@ class PipelineTransfer:
 
     # ----- consumer --------------------------------------------------------
 
-    def register_decode(self, room, full, swa, aux_index, infos):
+    def register_decode(
+        self,
+        room,
+        full,
+        swa,
+        aux_index,
+        infos,
+        *,
+        decode_prefix: DecodePrefixReport | None = None,
+    ):
         self._validate_room(room)
         mgr = self.manager
         ranks = {int(info["pp_rank"]) for info in infos}
@@ -1288,6 +1304,9 @@ class PipelineTransfer:
                 attn_tp_size=mgr.attn_tp_size,
                 attn_tp_rank=mgr.attn_tp_rank,
                 seq_along_lane=self.seq_along_lane,
+                # Informational: the prefill still sends the whole prompt and
+                # this decode clips its cached prefix (destination_blocks).
+                **(decode_prefix.to_fields() if decode_prefix is not None else {}),
             )
         ).encode()
         for info in infos:
@@ -1301,6 +1320,23 @@ class PipelineTransfer:
                     consumer,
                 ],
             )
+
+    def decode_requested(self, room) -> bool:
+        """Producer: the decode asked for the room's transfer. A prefix pull
+        decides from every decode rank's report, so with it each rank must ask."""
+        replies = self.replies.get(room)
+        if not replies:
+            return False
+        if self.reverse is None or not envs.SGLANG_TPU_PD_PREFIX_PULL.get():
+            return True
+        width = int(next(iter(replies.values()))["attn_tp_size"])
+        return len(replies) >= width
+
+    def decode_prefix_report(self, room) -> DecodePrefixReport | None:
+        """Producer: what the decode reported holding of the room's prompt."""
+        with self.lock:
+            replies = list(self.replies.get(room, {}).values())
+        return agree([DecodePrefixReport.from_fields(meta) for meta in replies])
 
     def on_message(self, msg):
         mgr = self.manager
@@ -1874,14 +1910,19 @@ class PipelineTransfer:
         mgr = self.manager
         with self.lock:
             status = mgr._poll_engine_status(name="pipeline", engine=self.engine)
+            status, reverse = pp_reverse.split_native_status(status, mgr._norm_req_id)
+            swa_reverse = None
             if self.swa is not None:
-                status = pp_swa.merge(
-                    self,
-                    status,
+                swa_status, swa_reverse = pp_reverse.split_native_status(
                     mgr._poll_engine_status(
                         name="pipeline-swa", engine=self.swa.engine
                     ),
+                    mgr._norm_req_id,
                 )
+                status = pp_swa.merge(self, status, swa_status)
+            if self.reverse is not None:
+                self.reverse.record(reverse, swa_reverse)
+                self.reverse.poll()
             if status is not None:
                 self._record_native_status(*status)
             if self.producer:
