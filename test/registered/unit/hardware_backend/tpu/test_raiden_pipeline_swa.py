@@ -189,6 +189,7 @@ class Domain:
 def make(mode, rank, world, name, *, pp_size, tp_size=1, stage_parts=False):
     """A PipelineTransfer with its window link, built like __init__ would."""
     t = object.__new__(pl.PipelineTransfer)
+    t.seq_along_lane = False
     producer = mode == PREFILL
     mgr = harness.Manager(mode, rank if producer else 0, pp_size, world.bus, name)
     mgr.attn_tp_size, mgr.attn_tp_rank = (1, 0) if producer else (tp_size, rank)
@@ -207,7 +208,11 @@ def make(mode, rank, world, name, *, pp_size, tp_size=1, stage_parts=False):
         swa_layer_ids=swa_ids,
         num_draft_full=0,
         num_hidden_full=0,
+        num_hidden_swa=0,
         num_draft_swa=0,
+        seq_along_lane=False,
+        target_seq_along_lane=False,
+        draft_seq_along_lane=None,
     )
     side = "p" if producer else "d"
     t.manager = mgr
@@ -421,7 +426,11 @@ def test_split_manifest_rebases_storage_indices():
         swa_layer_ids=[3],
         num_draft_full=0,
         num_hidden_full=0,
+        num_hidden_swa=0,
         num_draft_swa=0,
+        seq_along_lane=False,
+        target_seq_along_lane=False,
+        draft_seq_along_lane=None,
     )
     full, swa = ps.split_manifest(pl.pool_manifest(groups))
     assert [(p["tag"], p["storage_index"], p["num_blocks"]) for p in full] == [
@@ -443,6 +452,7 @@ def test_split_manifest_puts_draft_window_layers_on_the_window_engine():
         swa_layer_ids=[3, 1],
         num_draft_full=1,
         num_hidden_full=0,
+        num_hidden_swa=0,
         num_draft_swa=1,
     )
     full, swa = ps.split_manifest(pl.pool_manifest(groups))
@@ -1099,7 +1109,11 @@ def _initialize(groups, *, bounded_staging=True, real_budget=False):
             )
         ),
     }
-    with patch.dict(sys.modules, native):
+    # No spec context here; draft geometry fingerprinting is covered separately.
+    with (
+        patch.dict(sys.modules, native),
+        patch.object(pl, "_draft_kv_geometry", lambda: None),
+    ):
         try:
             r.pipe = pl.PipelineTransfer(manager, groups)
         except Exception as error:
@@ -1118,7 +1132,11 @@ def hybrid_groups():
         swa_layer_ids=[0, 1, 2],
         num_draft_full=0,
         num_hidden_full=0,
+        num_hidden_swa=0,
         num_draft_swa=0,
+        seq_along_lane=False,
+        target_seq_along_lane=False,
+        draft_seq_along_lane=None,
     )
 
 
@@ -1197,7 +1215,11 @@ def test_full_attention_only_stage_is_unchanged():
         swa_layer_ids=[],
         num_draft_full=0,
         num_hidden_full=0,
+        num_hidden_swa=0,
         num_draft_swa=0,
+        seq_along_lane=False,
+        target_seq_along_lane=False,
+        draft_seq_along_lane=None,
     )
     r = _initialize(groups)
     (engine,) = r.engines
@@ -1209,6 +1231,7 @@ def test_full_attention_only_stage_is_unchanged():
 @pytest.mark.parametrize("local_swa", [True, False])
 def test_workers_must_agree_with_rank_zero_on_the_window_engine(local_swa):
     pipe = object.__new__(pl.PipelineTransfer)
+    pipe.seq_along_lane = False
     pipe.rank = 1
     pipe.manager = SimpleNamespace(
         pp_size=2, attn_tp_size=1, local_ip="10.0.0.2", _control_port=31004

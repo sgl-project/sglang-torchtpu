@@ -32,12 +32,14 @@ from sglang_tpu.disaggregation.raiden.pp_common import (
     _kv_rank,
     _new_transfer_state,
     group_ranks,
+    is_hidden_pool,
     is_swa_pool,
     parse_req_id,
     part_destination_blocks,
     part_req_id,
     part_spans,
     part_uuid,
+    pool_is_seq_along_lane,
     pool_kind,
     stage_group,
     stage_req_id,
@@ -73,7 +75,13 @@ def pool_manifest(groups: Any) -> list[dict]:
             groups.num_draft_full,
             groups.num_hidden_full,
         ),
-        ("swa", groups.swa, groups.swa_layer_ids, groups.num_draft_swa, 0),
+        (
+            "swa",
+            groups.swa,
+            groups.swa_layer_ids,
+            groups.num_draft_swa,
+            groups.num_hidden_swa,
+        ),
     ):
         if len(tensors) != len(layer_ids):
             raise ValueError(f"Raiden {kind} pools need one global layer ID per tensor")
@@ -137,25 +145,49 @@ def materialized_storage_layout(tensor, getter):
     return layout
 
 
+def check_draft_layout(groups) -> None:
+    """The pipeline slices draft heads with the target's page geometry."""
+    draft = groups.draft_seq_along_lane
+    if draft is not None and draft != groups.target_seq_along_lane:
+        raise NotImplementedError(
+            "Raiden pipeline transfer moves draft KV in the target's page layout; "
+            "the draft and target pools differ on SEQ_ALONG_LANE"
+        )
+
+
 def layout_fingerprint(
-    pools: Sequence[dict], tensors: Sequence[Any], getter, *, ships_pd_hidden: bool
+    pools: Sequence[dict],
+    tensors: Sequence[Any],
+    getter,
+    *,
+    ships_pd_hidden: bool,
+    seq_along_lane: bool,
+    draft_kv: dict | None = None,
 ) -> str:
     """Compare per-class page geometry and materialized layout across layer
     subsets; the per-rank head count is left out so a tensor-parallel consumer
     matches its producer. ships_pd_hidden makes both ends agree on
-    SGLANG_TPU_PD_DECODE_DRAFT_PREFILL, which the skipped pdhid pools cannot."""
+    SGLANG_TPU_PD_DECODE_DRAFT_PREFILL, which the skipped pdhid pools cannot.
+    Draft pages may differ from the target's (another head_dim), and only the
+    stage holding the draft has them, so they are checked among themselves and
+    every rank fingerprints the draft geometry from its config (draft_kv)."""
     classes = {}
+    draft_classes = {}
     schema = "sglang-fused-kv-v2"
     for pool, tensor in zip(pools, tensors):
         # Only the last stage holds the PD hidden pool, whose pages match no target
         # class; both ends build it from the same geometry (pd_hidden_pool.py).
-        if pool_kind(pool["tag"]).startswith("pdhid."):
+        if is_hidden_pool(pool["tag"]):
             continue
         layout = materialized_storage_layout(tensor, getter)
         if layout is None:
             raise ValueError("Raiden pipeline KV must have a materialized TPU layout")
         major, tiles, bits = layout
-        if _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
+        if pool_is_seq_along_lane(pool["tag"], seq_along_lane):
+            # Axis 1, the per-rank 2 * kv_heads, is left out.
+            schema = "sglang-seq-along-lane-kv-v1"
+            page_shape = [int(n) for n in tensor.shape[2:]]
+        elif _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
             # Axis 1, the per-rank 2 * kv_heads, is left out.
             schema = "sglang-rpa-seq-kv-v1"
             page_shape = [int(tensor.shape[2]), int(tensor.shape[3])]
@@ -178,15 +210,48 @@ def layout_fingerprint(
         )
         # A draft page matches its target class, so a stage without the draft
         # fingerprints like one with it.
-        kind = pool_kind(pool["tag"]).removeprefix("draft.")
+        kind = pool_kind(pool["tag"])
+        if kind.startswith("draft."):
+            if kind in draft_classes and draft_classes[kind] != signature:
+                raise ValueError(
+                    f"Raiden {kind} layers have differing page layouts: {pool['tag']} "
+                    f"{signature} vs {draft_classes[kind]}"
+                )
+            draft_classes[kind] = signature
+            continue
         if kind in classes and classes[kind] != signature:
-            raise ValueError(f"Raiden {kind} layers have differing page layouts")
+            raise ValueError(
+                f"Raiden {kind} layers have differing page layouts: {pool['tag']} "
+                f"{signature} (shape {list(tensor.shape)}) vs {classes[kind]}"
+            )
         classes[kind] = signature
     fields = dict(schema=schema, classes=classes)
     if ships_pd_hidden:
         fields["pd_hidden"] = True
+    if draft_kv is not None:
+        fields["draft_kv"] = draft_kv
     value = json.dumps(fields, sort_keys=True)
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _draft_kv_geometry() -> dict | None:
+    """Draft KV geometry from the draft config, the same on every rank: stages
+    without the draft hold no draft pool to fingerprint."""
+    from sglang.srt.runtime_context import get_spec
+
+    spec = get_spec()
+    if spec.speculative_algorithm is None or _ships_pd_hidden():
+        return None
+    path = spec.speculative_draft_model_path
+    if path is None:
+        return None
+    with open(os.path.join(path, "config.json")) as f:
+        config = json.load(f)
+    config = config.get("text_config", config)
+    return {
+        key: config.get(key)
+        for key in ("num_hidden_layers", "num_key_value_heads", "head_dim")
+    }
 
 
 def _ships_pd_hidden() -> bool:
@@ -360,6 +425,8 @@ class PipelineTransfer:
         self.lock = threading.RLock()
         self.draft_kv_heads = getattr(groups, "draft_kv_head_num", None)
         self.draft_swa_kv_heads = getattr(groups, "draft_swa_kv_head_num", None)
+        self.seq_along_lane: bool = groups.seq_along_lane
+        check_draft_layout(groups)
         # A hybrid pool's sliding-window layers get an engine of their own.
         self.pools, swa_pools = pp_swa.split_manifest(pool_manifest(groups))
         self.tensors = list(groups.full)
@@ -662,6 +729,8 @@ class PipelineTransfer:
             tensors,
             tpu_torch_compile.get_device_layout_if_materialized,
             ships_pd_hidden=_ships_pd_hidden(),
+            seq_along_lane=self.seq_along_lane,
+            draft_kv=_draft_kv_geometry(),
         )
         client.register_work_unit(
             unit=unit,
@@ -753,6 +822,19 @@ class PipelineTransfer:
             state["offered"] = p_start + len(p_blocks)
             self._reply_part(room, part)
 
+    def _check_consumer_layout(self, room) -> None:
+        """Refuse a consumer whose KV pages are in the other layout: the spans would
+        land producer bytes in the wrong places of every page."""
+        for meta in self.replies[room].values():
+            consumer = bool(meta["seq_along_lane"])
+            if consumer != self.seq_along_lane:
+                name = {True: "SEQ_ALONG_LANE", False: "fused token-major"}
+                raise ValueError(
+                    f"Raiden pipeline producer holds {name[self.seq_along_lane]} KV "
+                    f"and the decode {name[consumer]} KV; set "
+                    "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV the same on both"
+                )
+
     def _dst_attn_tp(self, room) -> int:
         widths = {int(meta["attn_tp_size"]) for meta in self.replies[room].values()}
         if len(widths) != 1:
@@ -776,6 +858,7 @@ class PipelineTransfer:
         room."""
         try:
             dst_attn_tp = self._dst_attn_tp(room)
+            self._check_consumer_layout(room)
             spans = part_spans(
                 self.pools,
                 self.tensors,
@@ -783,6 +866,7 @@ class PipelineTransfer:
                 swa,
                 dst_attn_tp,
                 int(self.manager.kv_args.total_kv_head_num),
+                seq_along_lane=self.seq_along_lane,
                 draft_total_kv_heads=self.draft_kv_heads,
                 draft_swa_total_kv_heads=self.draft_swa_kv_heads,
                 with_swa=with_swa,
@@ -1200,7 +1284,11 @@ class PipelineTransfer:
             )
         endpoint = NetworkAddress(mgr.local_ip, mgr.rank_port).to_tcp()
         consumer = json.dumps(
-            dict(attn_tp_size=mgr.attn_tp_size, attn_tp_rank=mgr.attn_tp_rank)
+            dict(
+                attn_tp_size=mgr.attn_tp_size,
+                attn_tp_rank=mgr.attn_tp_rank,
+                seq_along_lane=self.seq_along_lane,
+            )
         ).encode()
         for info in infos:
             peer = NetworkAddress(info["rank_ip"], int(info["rank_port"])).to_tcp()
@@ -1436,6 +1524,11 @@ class PipelineTransfer:
         if not self.admission.admit(key, self.max_blocks, window_pages):
             return False
         request.admitted_keys.add(key)
+        # A queued prefill or staging wait can start the transfer past the
+        # registration deadline; give it one native deadline from now to land.
+        request.deadline = max(
+            request.deadline, time.monotonic() + self.manager._timeout_s
+        )
         return True
 
     def _release_admission(self, room, request, key: tuple = ()) -> None:
