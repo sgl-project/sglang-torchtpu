@@ -207,6 +207,53 @@ class TestNativeNvfp4FusedMoE(unittest.TestCase):
         )
         return w13_bf16, w2_bf16
 
+    def test_scale_layouts_are_bitwise_identical(self):
+        """Rank-3 / bf16-pair scales (no per-call relayout) match the rank-4 form."""
+        from sglang_tpu.fp4_moe import (
+            _to_gmm_v2_rank4_scale_layout,
+            _to_native_gmm_v2_scale_layout,
+        )
+        from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
+
+        E, hidden, intermediate, topk = 8, 4096, 4096, 8
+        hs, topk_ids, topk_w = self._inputs(64, hidden, topk, E, seed=5)
+        g = torch.Generator().manual_seed(6)
+        w13 = torch.randint(
+            0, 256, (E, hidden // 2, 2 * intermediate), generator=g, dtype=torch.uint8
+        ).to(self.device)
+        w2 = torch.randint(
+            0, 256, (E, intermediate // 2, hidden), generator=g, dtype=torch.uint8
+        ).to(self.device)
+        for group_size in (16, 32, 64, 128):
+            for scale_dtype in (torch.bfloat16, torch.float32):
+                with self.subTest(group_size=group_size, scale_dtype=scale_dtype):
+                    s13 = torch.rand(
+                        E, 2 * intermediate, hidden // group_size, generator=g
+                    )
+                    s2 = torch.rand(E, hidden, intermediate // group_size, generator=g)
+                    outs = []
+                    for to_layout in (
+                        lambda s: _to_gmm_v2_rank4_scale_layout(s, scale_dtype),
+                        lambda s: _to_native_gmm_v2_scale_layout(
+                            s, scale_dtype, group_size
+                        ),
+                    ):
+                        outs.append(
+                            fused_moe_call(
+                                hidden_states=hs.to(self.device),
+                                w1=w13,
+                                w2=w2,
+                                w1_scale=to_layout(s13 * 0.02).to(self.device),
+                                w2_scale=to_layout(s2 * 0.02).to(self.device),
+                                topk_weights=topk_w.to(self.device),
+                                topk_ids=topk_ids.to(self.device),
+                                topk=topk,
+                                activation="silu",
+                            ).cpu()
+                        )
+                    self.assertTrue(torch.isfinite(outs[0].float()).all().item())
+                    self.assertTrue(torch.equal(outs[0], outs[1]))
+
     def test_native_matches_bf16(self):
         from sglang_tpu.fp4_moe import (
             TPU_NVFP4_SUPPORTED_GROUP_SIZES,

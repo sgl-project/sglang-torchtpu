@@ -518,6 +518,14 @@ TUNED_BLOCK_SIZES = {
 GMM_V2_TUNED_BLOCK_SIZES = {
     (65536, 4096, 512, 288, 288, "bfloat16", "float8_e4m3fn", 4096): (256, 4096, 512),
     (65536, 256, 4096, 288, 288, "bfloat16", "float8_e4m3fn", 256): (256, 256, 4096),
+    # Muse Spark NVFP4 at EP1 (256 experts, top-8), 1K-8K-token chunks. W4A16 is
+    # VPU-bound on the per-gm-tile dequant; tile_m 192 holds a typical expert's
+    # rows in one gm tile. gate_up (n 8192) tile_n is per projection.
+    **{
+        (m, 4096, n, 256, 256, "bfloat16", "float4_e2m1fn", 16): (192, 4096, 2048)
+        for m in (8192, 16384, 32768, 65536)
+        for n in (8192, 4096)
+    },
 }
 
 

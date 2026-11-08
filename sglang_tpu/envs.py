@@ -525,9 +525,69 @@ class TpuEnvs:
     # axis. 64 halves an unpacked head_dim-64 pool; fp8 then reaches 256 B per token at
     # two KV heads per rank. Must stay >= the sublane x packing tile.
     SGLANG_TPU_KV_HEAD_DIM_ALIGN = EnvInt(128)
+    # Fused-RS NVFP4 experts keep the checkpoint's e4m3 block scales and apply the
+    # per-expert global scales after each dot: half the scale bytes of folded bf16.
+    SGLANG_TPU_NVFP4_E4M3_SCALES = EnvBool(False)
     # Fixed batch shape of MIXED (mixed-chunk) batches; unset = the largest bs bucket. Raise it
     # when more requests decode inside mixed chunks than any decode bucket holds.
     SGLANG_TPU_MIXED_MAX_BS = EnvInt(None)
+    # Fused-RS expert TP passes each device only its own block of routed rows, so a
+    # call is no longer capped at 1/ep_size of the tokens and the expert weights are
+    # streamed once per chunk rather than once per capped call.
+    SGLANG_TPU_FUSED_RS_ETP_LOCAL_ROWS = EnvBool(False)
+    # Expert-TP fused-RS: sum the per-device partial rows in the kernel's tiled
+    # (rows, hidden // 128, 128) layout instead of relayouting them to 2D first.
+    SGLANG_TPU_FUSED_RS_ETP_TILED_REDUCE = EnvBool(False)
+    # Expert-TP fused-RS: skip zeroing the output buffer, which the per-row writes
+    # cover exactly once.
+    SGLANG_TPU_FUSED_RS_ETP_SKIP_OUT_ZERO = EnvBool(False)
+    # Fused-RS NVFP4 GMMs widen fp4 weights to bf16 through fp8 (bit-identical, fewer VPU ops).
+    SGLANG_TPU_FP4_DEQUANT_VIA_FP8 = EnvBool(False)
+    # Tuning only: comma list of fused-RS row buckets to keep (the tile_m bucket always stays).
+    SGLANG_TPU_FUSED_RS_M_BUCKETS = EnvStr(None)
+    # Fused-RS tiles (tile_m,k1,n1,k2,n2,w1_bufs,w2_bufs) for EP-layout prefill calls
+    # (>= 32768 routed rows), overriding the tuned table.
+    SGLANG_TPU_FUSED_RS_EP_PREFILL_TILES = EnvStr(None)
+    # Fused-RS EP mode leaves each tile's output row writes in flight until its staging
+    # slot is reused, as expert-TP mode does, instead of waiting for them after every tile.
+    SGLANG_TPU_FUSED_RS_EP_DEFER_WRITES = EnvBool(False)
+    # Expert-TP fused-RS with a post-expert norm: ep sum, norm and top-k combine in one Pallas
+    # pass instead of three XLA fusions. Equal up to f32 summation order (bf16 casts kept).
+    SGLANG_TPU_FUSED_RS_ETP_FUSED_COMBINE = EnvBool(False)
+    # Fused-RS: rows issued per iteration of the per-row gather / write DMA loops.
+    SGLANG_TPU_FUSED_RS_ROW_LOOP_UNROLL = EnvInt(1)
+    # Fused-RS: output staging buffers a tile's deferred direct writes stay in flight
+    # across (VMEM: slots x tile_m x hidden x 2 B). Measured on the Muse Spark expert-TP
+    # call: 6 slots -1.5% per layer vs 3, 8 slots -2%.
+    SGLANG_TPU_FUSED_RS_STAGING_SLOTS = EnvInt(3)
+    # Fused-RS: when an expert's W1 and W2 each fit one DMA, they alternate between the two
+    # weight buffers by expert parity and the next expert's are fetched at the start of a tile,
+    # behind its whole compute, instead of one buffer refilled between matmuls (exact).
+    SGLANG_TPU_FUSED_RS_WEIGHT_PINGPONG = EnvBool(False)
+    # Expert-TP fused-RS: the two cores of a chip add their partials on-chip and send one
+    # pair sum per row to another chip's owner, halving off-chip bytes (one extra bf16 rounding).
+    SGLANG_TPU_FUSED_RS_ETP_PAIR_EXCHANGE = EnvBool(False)
+    # Pair exchange: issue each tile's five runs (own, sibling, one per other chip) from a
+    # per-tile table built with the routing metadata instead of walking all owners in-kernel.
+    SGLANG_TPU_FUSED_RS_PAIR_RUN_TABLE = EnvBool(False)
+    # Fused-RS: GMM2 stores each 256-column block straight into the row-DMA staging layout
+    # (overlaps the relayout with the next block's matmul) instead of relayouting the tile after.
+    SGLANG_TPU_FUSED_RS_GMM2_ROW_OUT = EnvBool(False)
+    # Pair exchange with the run table on a 4-chip ring: send the diagonal chip's pair sums
+    # through a neighbor chip, which adds them to its own run for that owner (no 2-hop
+    # transfers; one more bf16 rounding). Relay direction alternates by tile.
+    SGLANG_TPU_FUSED_RS_PAIR_RELAY = EnvBool(False)
+    # Chip offset (in ep-rank chip order) of the diagonal chip on the ring.
+    SGLANG_TPU_FUSED_RS_PAIR_RELAY_DIAG = EnvInt(2)
+    # Pair exchange: add the sibling's partial only over the tile's valid rows (bit-identical).
+    SGLANG_TPU_FUSED_RS_PAIR_WINDOW_ADD = EnvBool(False)
+    # Pair exchange with the run table: add the sibling's partial only over the rows of this
+    # core's three forwarded runs (the only pair sums it sends); bit-identical.
+    SGLANG_TPU_FUSED_RS_PAIR_RUN_ADD = EnvBool(False)
+    # Pair exchange combine: derive each owned rank's token and top-k weight from a stable sort
+    # of this rank's own (token, slot) pairs instead of argsorting every row and gathering back.
+    # Same arrays (bit-identical).
+    SGLANG_TPU_FUSED_RS_PAIR_LOCAL_RANKS = EnvBool(False)
     # Batched RPA: run target-verify rows (speculative_num_draft_tokens per request) as MIXED
     # with a q block of that width; the prefill block search otherwise pads each request's
     # rows to a ~2048-row block (16 x 8 rows at 150K context: 42 -> 2.2 ms per layer).

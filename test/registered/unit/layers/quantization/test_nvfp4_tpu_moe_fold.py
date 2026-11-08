@@ -5,6 +5,7 @@ package, which imports JAX eagerly. Register both lanes and skip on hosts
 without JAX, matching `test_pallas_export.py`.
 """
 
+import dataclasses
 import importlib.util
 import pathlib
 import sys
@@ -142,7 +143,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         return value.
         """
         from sglang_tpu.fp4_moe import (
-            _to_gmm_v2_scale_layout,
+            _to_gmm_v2_rank4_scale_layout,
         )
 
         for out_size in (2 * INTERMEDIATE_SIZE, HIDDEN_SIZE):
@@ -150,7 +151,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 with self.subTest(out_size=out_size, scale_dtype=scale_dtype):
                     source = torch.rand(EXPERTS, out_size, HIDDEN_SIZE // BLOCK_SIZE)
 
-                    out = _to_gmm_v2_scale_layout(source, scale_dtype)
+                    out = _to_gmm_v2_rank4_scale_layout(source, scale_dtype)
 
                     self.assertIsNone(out._base, "scale is still a view of its source")
                     self.assertTrue(out.is_contiguous())
@@ -165,6 +166,20 @@ class TestNvfp4Block512Contract(CustomTestCase):
                         .to(scale_dtype)
                     )
                     self.assertTrue(torch.equal(out, expected))
+
+    def test_bf16_pair_scale_layout_packs_adjacent_blocks(self):
+        from sglang_tpu.fp4_moe import _to_gmm_v2_bf16_pair_scale_layout
+
+        source = torch.rand(EXPERTS, HIDDEN_SIZE, 8)
+        out = _to_gmm_v2_bf16_pair_scale_layout(source)
+
+        self.assertEqual(out.dtype, torch.int32)
+        self.assertEqual(tuple(out.shape), (EXPERTS, 4, HIDDEN_SIZE))
+        self.assertIsNone(out._base)
+        expected = source.to(torch.bfloat16).permute(0, 2, 1)  # (E, blocks, N)
+        bits = expected.view(torch.int16).to(torch.int32) & 0xFFFF
+        packed = bits[:, 0::2] | (bits[:, 1::2] << 16)
+        self.assertTrue(torch.equal(out, packed))
 
     def test_rejects_unsupported_blocks_even_with_fused_rs(self):
         from sglang_tpu.fp4_moe import (
@@ -208,9 +223,11 @@ class TestNvfp4Block512Contract(CustomTestCase):
                     tuple(layer.w13_weight.shape),
                     (EXPERTS, HIDDEN_SIZE // 2, 2 * INTERMEDIATE_SIZE),
                 )
+                # W4A16 blocks drop the unit dim; W4A8 keeps the rank-4 form.
+                unit = () if group_size <= 128 else (1,)
                 self.assertEqual(
                     tuple(layer.w13_weight_scale.shape),
-                    (EXPERTS, HIDDEN_SIZE // group_size, 1, 2 * INTERMEDIATE_SIZE),
+                    (EXPERTS, HIDDEN_SIZE // group_size, *unit, 2 * INTERMEDIATE_SIZE),
                 )
                 self.assertEqual(
                     tuple(layer.w2_weight.shape),
@@ -218,7 +235,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 )
                 self.assertEqual(
                     tuple(layer.w2_weight_scale.shape),
-                    (EXPERTS, INTERMEDIATE_SIZE // group_size, 1, HIDDEN_SIZE),
+                    (EXPERTS, INTERMEDIATE_SIZE // group_size, *unit, HIDDEN_SIZE),
                 )
                 self.assertIsNone(layer._parameters["w13_weight_scale_2"])
                 self.assertIsNone(layer._parameters["w2_weight_scale_2"])
@@ -252,7 +269,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
             w13_shapes,
             [
                 (EXPERTS, HIDDEN_SIZE // 2, 2 * INTERMEDIATE_SIZE),
-                (EXPERTS, HIDDEN_SIZE // 16, 1, 2 * INTERMEDIATE_SIZE),
+                (EXPERTS, HIDDEN_SIZE // 16, 2 * INTERMEDIATE_SIZE),
             ],
         )
         self.assertGreater(w2_bytes_during_w13, 0)
@@ -260,10 +277,37 @@ class TestNvfp4Block512Contract(CustomTestCase):
             w2_shapes,
             [
                 (EXPERTS, INTERMEDIATE_SIZE // 2, HIDDEN_SIZE),
-                (EXPERTS, INTERMEDIATE_SIZE // 16, 1, HIDDEN_SIZE),
+                (EXPERTS, INTERMEDIATE_SIZE // 16, HIDDEN_SIZE),
             ],
         )
         self.assertEqual(raw_w2_storage.nbytes(), 0)
+
+    def test_bf16_block16_native_scales_are_int32_pairs(self):
+        from sglang_tpu.fp4_moe import prepare_tpu_nvfp4_moe_weights
+
+        layer = _make_block512_layer(group_size=16)
+        w13_scale = layer.w13_weight_scale.data.clone()
+        prepare_tpu_nvfp4_moe_weights(
+            layer, group_size=16, scale_dtype=torch.bfloat16, use_fused_rs=False
+        )
+
+        self.assertEqual(layer.w13_weight_scale.dtype, torch.int32)
+        self.assertEqual(
+            tuple(layer.w13_weight_scale.shape),
+            (EXPERTS, HIDDEN_SIZE // 32, 2 * INTERMEDIATE_SIZE),
+        )
+        self.assertEqual(
+            tuple(layer.w2_weight_scale.shape),
+            (EXPERTS, INTERMEDIATE_SIZE // 32, HIDDEN_SIZE),
+        )
+        words = layer.w13_weight_scale.data
+        lo = (words & 0xFFFF).to(torch.int16).view(torch.bfloat16)
+        hi = ((words >> 16) & 0xFFFF).to(torch.int16).view(torch.bfloat16)
+        unpacked = torch.stack((lo, hi), dim=2).reshape(
+            EXPERTS, -1, 2 * INTERMEDIATE_SIZE
+        )
+        expected = w13_scale.to(torch.bfloat16).permute(0, 2, 1)
+        self.assertTrue(torch.equal(unpacked, expected))
 
     def test_scale_storage_dtype(self):
         from sglang_tpu.fp4_moe import (
@@ -1516,7 +1560,12 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
 
 @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
 class TestGmmV2PackedFp4BlockSizes(CustomTestCase):
-    def _make_cfgs(self, block_size: int):
+    def _make_cfgs(
+        self,
+        block_size: int,
+        scale_shape: str = "rank4",
+        tile_k: int = 512,
+    ):
         import jax
         import jax.numpy as jnp
 
@@ -1524,7 +1573,12 @@ class TestGmmV2PackedFp4BlockSizes(CustomTestCase):
 
         lhs = jax.ShapeDtypeStruct((128, 1024), jnp.bfloat16)
         rhs = jax.ShapeDtypeStruct((2, 1024 // 2, 256), jnp.uint8)
-        rhs_scale = jax.ShapeDtypeStruct((2, 1024 // block_size, 1, 256), jnp.float32)
+        blocks = 1024 // block_size
+        rhs_scale = {
+            "rank4": jax.ShapeDtypeStruct((2, blocks, 1, 256), jnp.float32),
+            "rank3": jax.ShapeDtypeStruct((2, blocks, 256), jnp.float32),
+            "pairs": jax.ShapeDtypeStruct((2, blocks // 2, 256), jnp.int32),
+        }[scale_shape]
         group_sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
         group_offset = jax.ShapeDtypeStruct((1,), jnp.int32)
         fake_tpu = types.SimpleNamespace(
@@ -1542,7 +1596,7 @@ class TestGmmV2PackedFp4BlockSizes(CustomTestCase):
                 None,
                 group_sizes,
                 group_offset,
-                tile_info=gmm_v2.TileSizes(tile_m=128, tile_k=512, tile_n=128),
+                tile_info=gmm_v2.TileSizes(tile_m=128, tile_k=tile_k, tile_n=128),
                 vmem_limit_bytes=64 * 1024 * 1024,
                 out_dtype=None,
                 acc_dtype=None,
@@ -1568,6 +1622,65 @@ class TestGmmV2PackedFp4BlockSizes(CustomTestCase):
                 self.assertFalse(cfgs.rhs_cfgs.dequantize_in_vmem)
                 self.assertEqual(cfgs.lhs_cfgs.quant_dtype, jnp.float8_e4m3fn.dtype)
                 self.assertEqual(cfgs.lhs_cfgs.quant_block_size, block_size)
+
+    def test_rank3_and_pair_scales_match_rank4_configs(self):
+        import jax.numpy as jnp
+
+        from sglang_tpu.moe.pallas import gmm_v2
+
+        rank4 = self._make_cfgs(16)
+        for scale_shape, rows in (("rank3", 32), ("pairs", 16)):
+            with self.subTest(scale_shape=scale_shape):
+                cfgs = self._make_cfgs(16, scale_shape)
+                self.assertTrue(cfgs.rhs_cfgs.scale_without_unit_dim)
+                pairs = scale_shape == "pairs"
+                self.assertEqual(cfgs.rhs_cfgs.scale_bf16_pairs, pairs)
+                self.assertEqual(
+                    cfgs.rhs_cfgs.scale_dtype,
+                    jnp.bfloat16.dtype if pairs else jnp.float32.dtype,
+                )
+                self.assertEqual(
+                    dataclasses.replace(
+                        cfgs.rhs_cfgs,
+                        scale_without_unit_dim=False,
+                        scale_bf16_pairs=False,
+                        scale_dtype=jnp.float32.dtype,
+                    ),
+                    rank4.rhs_cfgs,
+                )
+                self.assertEqual(cfgs.tiles, rank4.tiles)
+                spec = gmm_v2.create_rhs_spec(mock.Mock(), cfgs).scale
+                self.assertEqual(tuple(spec.block_shape[1:]), (rows, 128))
+
+    def test_rank3_scale_rejects_misaligned_tile_rows(self):
+        # Block 512 at tile_k 512 is one of two scale rows: not 8-aligned, not all.
+        with self.assertRaisesRegex(ValueError, "8 scale rows"):
+            self._make_cfgs(512, "rank3")
+        self.assertTrue(self._make_cfgs(512, "rank3", tile_k=1024).tiles)
+
+    def test_pair_scales_require_vmem_dequant(self):
+        with self.assertRaisesRegex(ValueError, "VMEM dequantization"):
+            self._make_cfgs(512, "pairs", tile_k=1024)
+
+    def test_muse_packed_fp4_buckets_pin_measured_tiles(self):
+        import jax
+        import jax.numpy as jnp
+
+        from sglang_tpu.moe.pallas.fused_moe_op import _lookup_tile_info
+        from sglang_tpu.moe.pallas.gmm_v2 import TileSizes
+
+        for tokens in (1024, 2048, 4096, 8192):
+            for n in (8192, 4096):  # gate_up, down
+                with self.subTest(tokens=tokens, n=n):
+                    tiles = _lookup_tile_info(
+                        jax.ShapeDtypeStruct((tokens * 8, 4096), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((256, 2048, n), jnp.uint8),
+                        jax.ShapeDtypeStruct((256, 128, n), jnp.int32),  # bf16 pairs
+                        256,
+                        packed_fp4=True,
+                        gmm_v2_only=True,
+                    )
+                    self.assertEqual(tiles, TileSizes(192, 4096, 2048))
 
     def test_rejects_unsupported_packed_fp4_block_size(self):
         for block_size in (4, 8):
