@@ -549,6 +549,7 @@ def run_a_suite(args):
             derive_timeout=derive_timeout_per_file,
             continue_on_error=args.continue_on_error,
             fail_on_all_skipped=fail_on_all_skipped,
+            batch_short_files=args.tpu_chip_batch_short_files,
         )
         # Handed to run_unittest_files so the suite still ends with one
         # TIMINGS block covering every file; the est_time model and the
@@ -644,6 +645,16 @@ def main():
             "Run `chips=1` TPU tests this many at a time, each pinned to one "
             "chip of the slice the job already holds. 0 or 1 keeps every test "
             "on the whole node, which is the default."
+        ),
+    )
+    parser.add_argument(
+        "--tpu-chip-batch-short-files",
+        action="store_true",
+        default=False,
+        help=(
+            "With --tpu-chip-workers, run short `chips=1` files several to an "
+            "interpreter so they share the torch/jax import; a file that fails "
+            "in a batch is rerun alone before it counts."
         ),
     )
     parser.add_argument(

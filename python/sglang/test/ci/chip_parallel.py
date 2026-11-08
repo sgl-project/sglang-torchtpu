@@ -46,6 +46,37 @@ _PIN_ENV = {
     "TPU_PROCESS_ADDRESSES": "local",
 }
 
+_BATCH_RUNNER_PATH = os.path.join(os.path.dirname(__file__), "batch_runner.py")
+# Files at or under this est_time share one interpreter; for them the
+# torch/torch_tpu/jax import (~20s) is most of the wall time. Measured on
+# the stage-a suite: 91 of 139 files finish in <=30s. Arbitrary cut.
+_BATCH_MAX_EST_SECONDS = 60.0
+# Arbitrary; bounds how much work one failing batch sends back for reruns.
+_BATCH_MAX_FILES = 8
+
+
+class _Unit:
+    """What a chip worker runs in one subprocess: one file, or a batch.
+
+    A one-file unit's verdict is final; a batch's failures are rerun alone.
+    """
+
+    def __init__(self, tests: List) -> None:
+        self.tests = tests
+
+
+def _plan_units(pinned: List, batch_short_files: bool) -> List[_Unit]:
+    # Longest first, so a long file does not start last and run alone at the end.
+    pinned = sorted(pinned, key=lambda test: -test.est_time)
+    if not batch_short_files:
+        return [_Unit([t]) for t in pinned]
+    long_files = [t for t in pinned if t.est_time > _BATCH_MAX_EST_SECONDS]
+    short_files = [t for t in pinned if t.est_time <= _BATCH_MAX_EST_SECONDS]
+    units = [_Unit([t]) for t in long_files]
+    for i in range(0, len(short_files), _BATCH_MAX_FILES):
+        units.append(_Unit(short_files[i : i + _BATCH_MAX_FILES]))
+    return units
+
 
 def default_root_dir() -> str:
     """Where the per-worker scratch lives.
@@ -117,6 +148,43 @@ def _run_one(
         return returncode, time.perf_counter() - tic, log.read()
 
 
+def _run_batch(
+    tests: List,
+    chip: int,
+    workdir: str,
+    timeout: float,
+    fail_on_all_skipped: bool = False,
+) -> Tuple[List[dict], str]:
+    """Several files in one interpreter on one chip.
+
+    Returns the per-file results the runner recorded (in order, stopping at
+    the first failure; a file it never reached is absent) and the output.
+    """
+    stem = os.path.basename(tests[0].filename)
+    log_path = os.path.join(workdir, f"batch-{stem}.log")
+    results_path = os.path.join(workdir, f"batch-{stem}.json")
+    command = ["python3", _BATCH_RUNNER_PATH, "--results", results_path]
+    if fail_on_all_skipped:
+        command.append("--guard")
+    command.extend(t.filename for t in tests)
+    with open(log_path, "w") as log:
+        process = subprocess.Popen(
+            command, stdout=log, stderr=subprocess.STDOUT, env=_worker_env(chip, workdir)
+        )
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_process_tree(process.pid)
+            log.write(f"\n[chip {chip}] batch killed after {timeout:.0f}s\n")
+    _reset_worker_caches(workdir)
+    results: List[dict] = []
+    if os.path.exists(results_path):
+        with open(results_path) as handle:
+            results = json.load(handle)
+    with open(log_path, errors="ignore") as log:
+        return results, log.read()
+
+
 def _flush_metrics(filename: str, passed: bool, elapsed: float) -> None:
     """Append this file's verdict to SGLANG_TEST_METRICS_FILE.
 
@@ -153,13 +221,17 @@ def run_files_chip_parallel(
     derive_timeout,
     continue_on_error: bool = False,
     fail_on_all_skipped: bool = False,
+    batch_short_files: bool = False,
 ) -> Tuple[bool, List[str], List[Tuple[str, str]], dict]:
     """Run every `chips=1` file across `workers` chip-pinned processes.
 
     Returns (ok, passed, failed, elapsed_by_file). Files that are not
     `chips=1` are not run here -- the caller runs those sequentially.
     `fail_on_all_skipped` runs each file through skip_guard, as
-    run_unittest_files does.
+    run_unittest_files does. `batch_short_files` runs short files several
+    to an interpreter; a file that fails in a batch is rerun alone before
+    it counts as failed, and a batched file's elapsed excludes the shared
+    startup.
     """
     pinned = [f for f in files if getattr(f, "chips", 0) == 1]
     if not pinned:
@@ -177,10 +249,28 @@ def run_files_chip_parallel(
                 time.sleep(wait)
             last_launch[0] = time.monotonic()
 
+    def file_timeout(test) -> float:
+        if timeout_per_file is not None:
+            return timeout_per_file
+        return derive_timeout(test.est_time)
+
     work: queue.Queue = queue.Queue()
-    # Longest first, so a long file does not start last and run alone at the end.
-    for test in sorted(pinned, key=lambda test: -test.est_time):
-        work.put(test)
+    # Units still owned by some worker or waiting in the queue; a worker
+    # only exits once this reaches zero, since a failed batch requeues work.
+    pending = [0]
+    pending_lock = threading.Lock()
+
+    def enqueue(unit: _Unit) -> None:
+        with pending_lock:
+            pending[0] += 1
+        work.put(unit)
+
+    def finish_unit() -> None:
+        with pending_lock:
+            pending[0] -= 1
+
+    for unit in _plan_units(pinned, batch_short_files):
+        enqueue(unit)
 
     passed: List[str] = []
     failed: List[Tuple[str, str]] = []
@@ -188,41 +278,78 @@ def run_files_chip_parallel(
     results_lock = threading.Lock()
     stop = threading.Event()
 
+    def record(chip: int, filename: str, returncode: int, elapsed: float, output: str) -> None:
+        _flush_metrics(filename, returncode == 0, elapsed)
+        with results_lock:
+            elapsed_by_file[filename] = elapsed
+            if returncode == 0:
+                passed.append(filename)
+                logger.info(f"✓ chip {chip}: {filename} ({elapsed:.0f}s)")
+                return
+            failed.append((filename, f"exit code {returncode}"))
+            # Only a failure gets its output replayed, which is what
+            # keeps four concurrent workers readable.
+            logger.info(
+                f"\n✗ chip {chip}: {filename} "
+                f"exit {returncode} after {elapsed:.0f}s\n"
+                f"{'-' * 70}\n{output}{'-' * 70}\n"
+            )
+            if not continue_on_error:
+                stop.set()
+
+    def run_single(chip: int, workdir: str, test) -> None:
+        returncode, elapsed, output = _run_one(
+            test.filename, chip, workdir, file_timeout(test), fail_on_all_skipped
+        )
+        record(chip, test.filename, returncode, elapsed, output)
+
+    def run_batched(chip: int, workdir: str, tests: List) -> None:
+        timeout = sum(file_timeout(t) for t in tests)
+        results, output = _run_batch(tests, chip, workdir, timeout, fail_on_all_skipped)
+        by_file = {r["file"]: r for r in results}
+        for test in tests:
+            result = by_file.get(test.filename)
+            if result is not None and result["returncode"] == 0:
+                record(chip, test.filename, 0, result["elapsed"], output)
+        # The failing file reruns alone so a neighbour cannot have caused it;
+        # the files the batch never reached go back as one unit.
+        unreached = [t for t in tests if t.filename not in by_file]
+        culprit = next(
+            (t for t in tests if by_file.get(t.filename, {}).get("returncode", 0) != 0),
+            None,
+        )
+        if culprit is None and len(unreached) == len(tests):
+            # Timed out or died before recording anything: the first file
+            # is the only one that ran.
+            culprit, unreached = unreached[0], unreached[1:]
+        if culprit is not None:
+            logger.info(
+                f"~ chip {chip}: {culprit.filename} failed in a batch; rerunning alone"
+            )
+            enqueue(_Unit([culprit]))
+        if unreached:
+            enqueue(_Unit(unreached))
+
     def worker(chip: int) -> None:
         workdir = os.path.join(root_dir, f"chip{chip}")
         shutil.rmtree(workdir, ignore_errors=True)
         os.makedirs(workdir, exist_ok=True)
         while not stop.is_set():
             try:
-                test = work.get_nowait()
+                unit = work.get(timeout=1.0)
             except queue.Empty:
-                return
-            timeout = (
-                timeout_per_file
-                if timeout_per_file is not None
-                else derive_timeout(test.est_time)
-            )
-            space_launches()
-            returncode, elapsed, output = _run_one(
-                test.filename, chip, workdir, timeout, fail_on_all_skipped
-            )
-            _flush_metrics(test.filename, returncode == 0, elapsed)
-            with results_lock:
-                elapsed_by_file[test.filename] = elapsed
-                if returncode == 0:
-                    passed.append(test.filename)
-                    logger.info(f"✓ chip {chip}: {test.filename} ({elapsed:.0f}s)")
+                with pending_lock:
+                    if pending[0] == 0:
+                        return
+                continue
+            try:
+                space_launches()
+                if len(unit.tests) == 1:
+                    run_single(chip, workdir, unit.tests[0])
                 else:
-                    failed.append((test.filename, f"exit code {returncode}"))
-                    # Only a failure gets its output replayed, which is what
-                    # keeps four concurrent workers readable.
-                    logger.info(
-                        f"\n✗ chip {chip}: {test.filename} "
-                        f"exit {returncode} after {elapsed:.0f}s\n"
-                        f"{'-' * 70}\n{output}{'-' * 70}\n"
-                    )
-                    if not continue_on_error:
-                        stop.set()
+                    run_batched(chip, workdir, unit.tests)
+            finally:
+                finish_unit()
 
     threads = [
         threading.Thread(target=worker, args=(chip,), daemon=True)
