@@ -47,6 +47,32 @@ PACKING = 2  # two FP4 codes per uint8 byte
 # 8K remain deterministically chunked.
 _FUSED_RS_MAX_TOKENS_PER_CALL = 8192
 
+# Env the fused-RS NVFP4 GMM reads to apply block scales in the KPERM layout.
+KPERM_KERNEL_ENV = "MUSE_PF_MOE_KPERM"
+
+
+def mark_kperm_layout(layer: torch.nn.Module) -> None:
+    """Record that the megakernel permuted this layer's NVFP4 experts (SGLANG_TPU_MUSE_MK_KPERM)."""
+    layer.__dict__["_tpu_nvfp4_kperm"] = True
+
+
+def is_kperm_layout(layer: torch.nn.Module) -> bool:
+    return layer.__dict__.get("_tpu_nvfp4_kperm", False)
+
+
+def check_native_kperm_layout(layer: torch.nn.Module, *, use_fused_rs: bool) -> None:
+    """Raise instead of running a native GMM that would misread KPERM-layout experts."""
+    if not is_kperm_layout(layer):
+        return
+    # Only fused-RS's GMM has the KPERM block-scale arm; plain gmm_v2 reads 16 contiguous K.
+    if not use_fused_rs:
+        raise RuntimeError(
+            "NVFP4 experts are in the megakernel KPERM layout "
+            "(SGLANG_TPU_MUSE_MK_KPERM=1), which the native non-fused-RS MoE "
+            "(gmm_v2) cannot read. Run this step on the megakernel or the "
+            "pallas_tpu_fused_rs MoE backend, or unset SGLANG_TPU_MUSE_MK_KPERM."
+        )
+
 
 def _transpose_packed_fp4(matrix: torch.Tensor) -> torch.Tensor:
     """Transpose ``(E, M, K/2)`` packed FP4 into ``(E, K, M/2)`` bytes."""
@@ -390,6 +416,8 @@ def apply_tpu_nvfp4_moe(
         if activation != "silu":
             raise ValueError("TPU clamped MoE requires silu activation")
         activation = f"silu_and_mul_clamp:{float(swiglu_limit)}"
+
+    check_native_kperm_layout(layer, use_fused_rs=use_fused_rs)
 
     if use_fused_rs:
         from sglang_tpu.moe.pallas.fused_moe_rs_op import (

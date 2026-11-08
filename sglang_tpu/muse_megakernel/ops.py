@@ -215,6 +215,7 @@ def _stack_expert_groups(
     """
     if not groups and not kperm:
         return experts
+    from sglang_tpu.fp4_moe import mark_kperm_layout
     from sglang_tpu.fp8_moe import _clear_replaced_param, copy_or_rebind_param
 
     per_layer = [experts[4 * l : 4 * l + 4] for l in range(len(decoder.layers))]
@@ -235,6 +236,7 @@ def _stack_expert_groups(
                 del cpu_t
                 copy_or_rebind_param(exp_mod, name, new_t)
                 per_layer[li][j] = getattr(exp_mod, name)
+            mark_kperm_layout(exp_mod)
             torch.accelerator.synchronize()
     if not groups:
         return [t for layer_refs in per_layer for t in layer_refs]
@@ -276,6 +278,9 @@ def _stack_expert_groups(
                             persistent=False,
                         )
             slabs.append(st)
+        if do_kperm:
+            for li in range(lo, hi):
+                mark_kperm_layout(decoder.layers[li].mlp.experts)
         stacked[lo] = slabs
     out, l = [], 0
     starts = dict(groups)
@@ -384,9 +389,16 @@ class MuseMegakernel(torch.nn.Module):
                 "(unset SGLANG_TPU_NVFP4_E4M3_SCALES)"
             )
         if kperm:
+            from sglang_tpu.fp4_moe import KPERM_KERNEL_ENV
             from sglang_tpu.fp8_moe import copy_or_rebind_param
 
-            os.environ.setdefault("MUSE_PF_MOE_KPERM", "1")
+            # Native fused-RS MoE steps (prefill, steps above MK_MAX_ROWS) read the permuted experts.
+            os.environ.setdefault(KPERM_KERNEL_ENV, "1")
+            if os.environ[KPERM_KERNEL_ENV] != "1":
+                raise ValueError(
+                    f"SGLANG_TPU_MUSE_MK_KPERM permutes the NVFP4 experts; {KPERM_KERNEL_ENV}="
+                    f"{os.environ[KPERM_KERNEL_ENV]!r} would make native fused-RS MoE misread them"
+                )
             os.environ.setdefault("SGLANG_TPU_FP4_DEQUANT_VIA_FP8", "0")
             for layer in decoder.layers:
                 moe = layer.mlp
