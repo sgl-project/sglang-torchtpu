@@ -615,6 +615,13 @@ class Envs:
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
     SGLANG_MAX_NEW_TOKENS_LIMIT = EnvInt(None)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
+    # shortest-prefill-first: a request queued longer than this many seconds goes
+    # ahead of shorter prefills, oldest first; 0 disables aging.
+    SGLANG_SCHEDULE_SPF_MAX_WAIT_S = EnvFloat(0.0)
+    # While a long prompt is mid-prefill, waiting requests whose uncached prefill fits
+    # share each prefill batch with it under any schedule policy; the long prompt keeps at
+    # least this many tokens per batch. 0 disables (only shortest-prefill-first shares).
+    SGLANG_PREFILL_CHUNK_SHARE_MIN_TOKENS = EnvInt(0)
     # Window for the token-weighted recent cache-hit rate used to estimate
     # waiting-queue prefill load.
     SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS = EnvFloat(15.0)
@@ -656,6 +663,16 @@ class Envs:
     # Overlap scheduler and pipeline parallelism
     # ===================================================================
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
+    # --prefill-decode-interval does not defer prefill while no request is
+    # decoding: there is nothing to interleave, so the deferral only idles.
+    SGLANG_PREFILL_DECODE_INTERVAL_SKIP_IDLE = EnvBool(False)
+    # Decode steps before the next chunk of a prompt left mid-prefill; unset waits the full
+    # --prefill-decode-interval, so a long prompt's TTFT grows by one interval per chunk.
+    SGLANG_PREFILL_DECODE_INTERVAL_CHUNKED = EnvInt(None)
+    # "TARGET:MIN": while fewer than TARGET requests decode and prefill work waits, the
+    # --prefill-decode-interval ends after MIN decode steps, so admission fills the decode
+    # batch; at TARGET or more running the full interval applies. Admission order is unchanged.
+    SGLANG_PREFILL_DECODE_INTERVAL_ADAPTIVE = EnvStr(None)
     # Force delay_sample_func for all overlap decode (not just grammar mode),
     # allowing CPU result processing to overlap with subsequent forward computation
     # and reducing the impact of sampling overhead on the critical path.
@@ -839,6 +856,10 @@ class Envs:
     # this many scheduler steps until a poll finds one (then every step again); ranks stay
     # in lockstep. 0 or 1 polls every step. Applies without PP, storage or linker only.
     SGLANG_HICACHE_QUIET_SYNC_EVERY = EnvInt(0)
+    # Log one line per admitted request that must compute at least this many prompt
+    # tokens: its Full-KV hit (device + host), the hit after the sliding-window check,
+    # the host load-back promised vs loaded, and the final prefix. 0 disables (log-only).
+    SGLANG_RECOMPUTE_DIAG_MIN_TOKENS = EnvInt(0)
     # SWA host pool eviction: first evict windows that a later match walked past to a
     # deeper usable point (superseded turn ends, stride checkpoints of active paths),
     # then fall back to LRU. An idle session's last turn-end window is never walked
