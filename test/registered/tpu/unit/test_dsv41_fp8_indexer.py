@@ -159,20 +159,35 @@ def test_fp8_scorer_shapes(tokens, groups, width, page_size, record_property):
     mask = np.arange(width)[None, :] < np.asarray(lengths)[:, None]
     np.testing.assert_array_equal(np.isneginf(actual_host), ~mask)
     sampled = np.unique(np.linspace(0, tokens - 1, min(tokens, 12), dtype=int))
-    errors = []
-    for row in sampled:
-        visible = int(lengths[row])
-        if not visible:
-            continue
-        request = int(np.searchsorted(np.asarray(offsets)[1:], row, side="right"))
-        slots = (
-            table[request, jnp.arange(visible) // page_size] * page_size
-            + jnp.arange(visible) % page_size
+    # One decode for every sampled row's slots and the rest in numpy: the
+    # per-row eager jnp version lowered a new program per row and shape
+    # (5,852 lowerings for this file, 85% of its time).
+    lengths_host, offsets_host, table_host = map(np.asarray, (lengths, offsets, table))
+    rows = [row for row in sampled if lengths_host[row]]
+    slots = []
+    for row in rows:
+        visible = int(lengths_host[row])
+        request = int(np.searchsorted(offsets_host[1:], row, side="right"))
+        positions = np.arange(visible)
+        slots.append(
+            table_host[request, positions // page_size] * page_size
+            + positions % page_size
         )
-        decoded = read_fp8_records(banks, slots, layout).astype(jnp.float32)
-        query = q8[row].astype(jnp.float32) * qs[row, :, None]
-        reference = (jnp.maximum(query @ decoded.T, 0) * weights[row, :, None]).sum(0)
-        ref = np.asarray(reference).astype(np.float64)
+    bounds = np.cumsum([0, *(len(s) for s in slots)])
+    decoded = np.asarray(
+        jax.jit(lambda b, s: read_fp8_records(b, s, layout))(
+            banks, jnp.asarray(np.concatenate(slots) if slots else np.zeros(0, np.int32))
+        )
+    ).astype(np.float32)
+    q8_host = np.asarray(q8).astype(np.float32)
+    qs_host, weights_host = np.asarray(qs), np.asarray(weights)
+    errors = []
+    for i, row in enumerate(rows):
+        visible = int(lengths_host[row])
+        query = q8_host[row] * qs_host[row, :, None]
+        keys_row = decoded[bounds[i] : bounds[i + 1]]
+        reference = (np.maximum(query @ keys_row.T, 0) * weights_host[row, :, None]).sum(0)
+        ref = reference.astype(np.float64)
         got = actual_host[row, :visible].astype(np.float64)
         diff = np.sum((got - ref) ** 2) / max(np.sum(got**2 + ref**2), 1e-20)
         errors.append(diff)
