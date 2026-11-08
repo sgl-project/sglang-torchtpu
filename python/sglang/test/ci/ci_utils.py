@@ -13,6 +13,8 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 from sglang.srt.debug_utils import cuda_coredump
 from sglang.srt.utils.common import kill_process_tree
 from sglang.test.ci.ci_register import CIRegistry
+from sglang.test.ci.prefetch_ahead import PrefetchAhead
+from sglang.test.ci.prefetch_ahead import enabled as prefetch_ahead_enabled
 from sglang.test.ci.skip_guard import command_for_test_file
 
 # Configure logger to output to stdout
@@ -319,12 +321,21 @@ def run_unittest_files(
         fork_worker_batch_size > 1 and not enable_retry and not fail_on_all_skipped
     )
 
+    def _name(file) -> str:
+        return file.filename if isinstance(file, CIRegistry) else file.name
+
+    # Reads the next file's checkpoint into the page cache while this one runs.
+    prefetcher = PrefetchAhead(os.getcwd()) if prefetch_ahead_enabled() else None
+
     for i, file in enumerate(files):
         if isinstance(file, CIRegistry):
             filename, estimated_time = file.filename, file.est_time
         else:
             # FIXME: remove this branch after migrating all tests to use CIRegistry
             filename, estimated_time = file.name, file.estimated_time
+
+        if prefetcher is not None:
+            prefetcher.start_for(_name(files[i + 1]) if i + 1 < len(files) else None)
 
         file_timeout = (
             timeout_per_file
@@ -510,6 +521,8 @@ def run_unittest_files(
         if not file_passed and not continue_on_error:
             break
 
+    if prefetcher is not None:
+        prefetcher.close()
     if fork_worker is not None:
         fork_worker.close()
 
