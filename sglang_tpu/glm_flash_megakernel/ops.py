@@ -77,6 +77,25 @@ def enabled() -> bool:
     return tpu_envs.SGLANG_TPU_GLM_FLASH_MEGAKERNEL.get()
 
 
+# Measured on tpu7x: the deep-ring 16-row config fits 64 MiB VMEM with a 131k page
+# table and overflows it by 1.5 MiB at 262k (#2035); the lean config fits at both.
+SMALL_STEP_MAX_LEN = 131072
+
+
+def lean_config(*, rows: int, max_len: int) -> bool:
+    return rows > 16 or max_len > SMALL_STEP_MAX_LEN
+
+
+def require_expert_tp(ep_size: int) -> None:
+    # The kernel streams each rank's TP slice of every expert; whole local experts
+    # under EP>1 do not match its DMA shapes (#2034).
+    if ep_size != 1:
+        raise ValueError(
+            f"GLM-Flash megakernel requires ep_size == 1 (experts sliced over TP); "
+            f"got ep_size={ep_size}. Set SGLANG_TPU_GLM_FLASH_MEGAKERNEL=0 or ep_size=1."
+        )
+
+
 def _buckets(max_req: int) -> list[int]:
     """Request-count buckets 1, 2, 4, ... up to max_req."""
     out, b = [], 1
@@ -148,7 +167,7 @@ class GlmFlashMegakernel:
 
         def cfg_for(b):
             # Larger steps trade DMA ring depth for the VMEM their row-scaled buffers need.
-            big = b * n_query > 16
+            big = lean_config(rows=b * n_query, max_len=max_len)
             return D.KernelConfig(
                 max_len=max_len,
                 n_query=n_query,
