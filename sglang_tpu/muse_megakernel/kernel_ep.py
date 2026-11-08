@@ -420,8 +420,18 @@ def _layer(
     return stream, pool
 
 
-def step_fn(c: EPConfig, mesh: Mesh):
-    """The jitted step: fn(acts, weights, experts, pools) -> (hid, aux, pools).
+HEAD_PARALLEL = ("wqkvg", "wqkvg_s", "wo", "wo_s")
+
+
+def step(
+    c: EPConfig,
+    acts: dict,
+    weights: dict,
+    experts: list,
+    pools: list,
+    mesh: Mesh | None = None,
+) -> tuple[jax.Array, jax.Array, list]:
+    """One decode step: (hid, aux, pools), for tracing inside a caller's jit.
 
     acts: n_live [] i32, pos [R] i32, pf / psw [n_req * pages_per_seq] i32, emb [R, H] bf16,
       rope [max_position, 2 head_dim] f32, final_gain [H] f32; replicated.
@@ -431,13 +441,12 @@ def step_fn(c: EPConfig, mesh: Mesh):
       [tp, H, qkvg] / wo [tp, q_dim, H] fp8 with wqkvg_s [tp, qkvg] / wo_s [tp, H], sharded
       on dim 0.
     experts: per layer (w13, w13_scale, w2, w2_scale) [E, tp, ...], sharded on experts.
-    pools: per layer [tp, pages, 2 kv_heads, head_dim // 4, 4, page] fp8, sharded on dim 0;
-      donated.
+    pools: per layer [tp, pages, 2 kv_heads, head_dim // 4, 4, page] fp8, sharded on dim 0.
+    mesh: the 1-D AXIS mesh; None: the caller's (jax.sharding.use_mesh).
     Returns hid [R, H] bf16 (final norm; dead rows zero) and aux [R, L * H] bf16 (each
     layer's output stream), row-sharded, and the updated pools.
     """
     c.validate()
-    head_par = ("wqkvg", "wqkvg_s", "wo", "wo_s")
 
     def body(acts, weights, experts, pools):
         me = jax.lax.axis_index(AXIS)
@@ -447,7 +456,7 @@ def step_fn(c: EPConfig, mesh: Mesh):
         aux, new_pools = [], []
         for l in range(c.n_layers):
             wl = {
-                name: (ws[l][0] if name in head_par else ws[l])
+                name: (ws[l][0] if name in HEAD_PARALLEL else ws[l])
                 for name, ws in weights.items()
             }
             with jax.named_scope(f"layer{l}"):
@@ -458,25 +467,31 @@ def step_fn(c: EPConfig, mesh: Mesh):
         hid = jnp.where(live, _bf(_rms(stream, c.rms_eps, acts["final_gain"])), 0)
         return hid.astype(jnp.bfloat16), jnp.concatenate(aux, axis=1), new_pools
 
-    def spec_weights(weights):
-        return {
-            name: [P(AXIS) if name in head_par else P() for _ in ws]
+    specs = (
+        jax.tree.map(lambda _: P(), acts),
+        {
+            name: [P(AXIS) if name in HEAD_PARALLEL else P() for _ in ws]
             for name, ws in weights.items()
-        }
+        },
+        jax.tree.map(lambda _: P(AXIS), experts),
+        jax.tree.map(lambda _: P(AXIS), pools),
+    )
+    kw = {} if mesh is None else {"mesh": mesh}
+    f = jax.shard_map(
+        body,
+        in_specs=specs,
+        out_specs=(P(AXIS), P(AXIS), [P(AXIS)] * c.n_layers),
+        check_vma=False,
+        **kw,
+    )
+    return f(acts, weights, experts, pools)
 
-    def run(acts, weights, experts, pools):
-        f = jax.shard_map(
-            body,
-            mesh=mesh,
-            in_specs=(
-                jax.tree.map(lambda _: P(), acts),
-                spec_weights(weights),
-                jax.tree.map(lambda _: P(AXIS), experts),
-                jax.tree.map(lambda _: P(AXIS), pools),
-            ),
-            out_specs=(P(AXIS), P(AXIS), [P(AXIS)] * c.n_layers),
-            check_vma=False,
-        )
-        return f(acts, weights, experts, pools)
 
-    return jax.jit(run, donate_argnums=(3,))
+def step_fn(c: EPConfig, mesh: Mesh):
+    """step jitted on mesh, the pools donated: fn(acts, weights, experts, pools)."""
+    return jax.jit(
+        lambda acts, weights, experts, pools: step(
+            c, acts, weights, experts, pools, mesh
+        ),
+        donate_argnums=(3,),
+    )
