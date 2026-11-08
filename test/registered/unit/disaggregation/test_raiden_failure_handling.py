@@ -586,6 +586,7 @@ class TestSenderBootstrapTimeout(unittest.TestCase):
         mgr.fail_decode_silence = types.MethodType(
             RaidenKVManager.fail_decode_silence, mgr
         )
+        mgr.prefix_pull_poll = types.MethodType(RaidenKVManager.prefix_pull_poll, mgr)
         mgr._mark_aborted_locked = types.MethodType(
             RaidenKVManager._mark_aborted_locked, mgr
         )

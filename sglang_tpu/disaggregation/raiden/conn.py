@@ -1244,6 +1244,9 @@ class RaidenKVManager(
         ):
             self._on_pipeline_message(msg)
             return
+        if tag in (MessageTag.PREFIX_PULL_REQ, MessageTag.PREFIX_PULL_READY):
+            self._on_prefix_pull_message(msg)
+            return
         handler = self._message_handlers.get(tag)
         if handler is None:
             logger.error("RaidenKVManager unknown message tag: %s", tag)
@@ -1271,6 +1274,18 @@ class RaidenKVManager(
                 self._fail_room_locked(room, f"Raiden pipeline transfer: {error}")
                 self.update_status(room, KVPoll.Failed)
             raise
+
+    def _on_prefix_pull_message(self, msg: List[bytes]) -> None:
+        """Hand a reverse-transfer frame to the pipeline. A bad frame fails only
+        the pull, never the room: the prefill times the pull out."""
+        with self._pipeline_init_lock:
+            pipeline = self._pipeline
+        if pipeline is None or pipeline.reverse is None:
+            logger.error(
+                "Raiden prefix pull frame before the pipeline is up: %s", msg[0]
+            )
+            return
+        pipeline.reverse.on_message(msg)
 
     @staticmethod
     def _require_frames(msg: List[bytes], tag: MessageTag, n: int) -> None:

@@ -258,6 +258,24 @@ class TpuEnvs:
     # can read: the window before the prompt end, or before each chunk end when a
     # prefix-sharing tree may hand that window to a later request.
     SGLANG_TPU_ENABLE_PD_HIDDEN_WINDOW_WRITE = EnvBool(True)
+    # P/D prefix pull (disaggregation/prefix_pull.py): the least prefix gap, in
+    # tokens, worth pulling from the decode instead of recomputing (one chunk).
+    SGLANG_TPU_PD_PREFIX_PULL_MIN_TOKENS = EnvInt(4096)
+    # Seconds between the cumulative prefix-gap / decode-window log lines; 0 = off.
+    SGLANG_TPU_PD_PREFIX_GAP_LOG_INTERVAL_S = EnvFloat(60.0)
+    # Pull prefixes from the decode: the decode locks the prefix it reports as
+    # pullable until the request's KV lands, and the prefill fetches it.
+    SGLANG_TPU_PD_PREFIX_PULL = EnvBool(False)
+    # Decode: prompt-end SWA windows kept locked by the cache for the next turn's
+    # pull, least recently used released first and under memory pressure; 0 = off.
+    SGLANG_TPU_PD_DECODE_PROMPT_END_ANCHORS = EnvInt(0)
+    # What a failed or timed-out prefix pull does. 1 (bring-up default): the
+    # request fails with the reason, an error log and
+    # sglang:pd_prefill_prefix_pull_failed_total{reason}; nothing is recomputed.
+    # 0: every PP stage recomputes the prefix instead, an explicit reliability
+    # path that logs a warning with the room, reason and recomputed tokens each
+    # time and counts sglang:pd_prefill_prefix_pull_fallback_total{reason}.
+    SGLANG_TPU_PD_PREFIX_PULL_STRICT = EnvBool(True)
     # DFLASH draft linears, including the DFlash2 conv kernel projections, as fp8
     # weight-only (fp8_weight_linear.py) for decode-sized calls; prefill-sized calls
     # keep the bf16 weights. Changes the draft's proposals, not verification.

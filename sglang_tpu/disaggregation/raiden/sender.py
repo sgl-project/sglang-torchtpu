@@ -22,11 +22,13 @@ import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVSender, KVTransferError
+from sglang_tpu.disaggregation.prefix_pull import DecodePrefixReport
 from sglang_tpu.disaggregation.raiden.chunk_plan import (
     chunk_pull_window,
     whole_pull_registration,
 )
 from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
+from sglang_tpu.disaggregation.raiden.pp_reverse import DONE, PENDING
 from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
@@ -40,6 +42,7 @@ from sglang_tpu.disaggregation.raiden.serde import (
     decode_text,
     read_aux_blob,
 )
+from sglang_tpu.envs import envs as envs_tpu
 
 if TYPE_CHECKING:
     from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
@@ -447,8 +450,38 @@ class RaidenSenderMixin:
         return (
             room in self._prefill.decode_addr
             or room in self._prefill.reshard_req
-            or (self._pipeline is not None and room in self._pipeline.replies)
+            or (self._pipeline is not None and self._pipeline.decode_requested(room))
         )
+
+    def prefix_pull_poll(self, room: int, status: KVPoll) -> Optional[KVPoll]:
+        """The poll a room reports while its stage pulls a prefix from the decode
+        (pp_reverse), or None to report as usual: Bootstrapping until the pull
+        settles; Failed once it failed. Strict mode fails the room with the
+        reason; otherwise Failed only asks the prefix fetcher to recover the
+        request on every stage, and the room lives on."""
+        pipeline = self._pipeline
+        if (
+            pipeline is None
+            or pipeline.reverse is None
+            or status != KVPoll.WaitingForInput
+        ):
+            return None
+        with pipeline.lock:
+            if room not in pipeline.reverse.pulls:
+                return None
+            state, reason = pipeline.reverse.status(room)
+            if state == DONE:
+                return None
+            if state == PENDING or pipeline.reverse.in_flight(room):
+                return KVPoll.Bootstrapping
+        if envs_tpu.SGLANG_TPU_PD_PREFIX_PULL_STRICT.get():
+            with self._state_lock:
+                self._mark_aborted_locked(room)
+                self._fail_room_locked(
+                    room, f"Prefix pull from the decode failed: {reason}"
+                )
+                self.update_status(room, KVPoll.Failed)
+        return KVPoll.Failed
 
     def finish_bootstrap_if_decode_requested(self, room: int) -> bool:
         """Moves ``room`` from Bootstrapping to WaitingForInput once the decode
@@ -1290,6 +1323,14 @@ class RaidenKVSender(CommonKVSender):
     # or the decode released the room itself.
     _decode_told = False
 
+    def decode_prefix_report(self) -> Optional[DecodePrefixReport]:
+        """What the decode reported holding of this prompt, None before it asked
+        or when the transfer path carries no report."""
+        pipeline = self.kv_mgr._pipeline
+        if pipeline is None:
+            return None
+        return pipeline.decode_prefix_report(self.bootstrap_room)
+
     @property
     def pages_exposed_before_result(self) -> bool:
         # A transfer may read the pages before the result point, which then
@@ -1437,6 +1478,11 @@ class RaidenKVSender(CommonKVSender):
             and self.kv_mgr.finish_bootstrap_if_decode_requested(self.bootstrap_room)
         ):
             status = KVPoll.WaitingForInput
+        pulling = self.kv_mgr.prefix_pull_poll(self.bootstrap_room, status)
+        if pulling is not None:
+            if self.kv_mgr.is_failed(self.bootstrap_room):
+                self._tell_decode_room_failed()
+            return pulling
         # The decode owes the room a message until it asks to pull, or clears
         # a resharded room to push. A decode that dies before then would
         # otherwise leave the room (and its KV) waiting forever.

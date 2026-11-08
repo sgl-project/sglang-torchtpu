@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.disaggregation.prefix_pull import DecodePrefixReport
 from sglang_tpu.disaggregation.raiden.common import get_raiden_kv_caches
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 from sglang_tpu.disaggregation.raiden.host_pool import (
@@ -700,6 +701,49 @@ class TestLegacyPoolBudget(unittest.TestCase):
         pools[0]["base_offset_bytes"] = 4
         with self.assertRaisesRegex(ValueError, "zero storage offsets"):
             legacy_mirror_slots(pools, 4, 1, 100)
+
+
+class TestPipelineDecodePrefixReport(unittest.TestCase):
+    def test_pipeline_request_carries_the_decode_prefix_to_every_stage(self):
+        decode = transfer(pp_size=1)
+        decode._send = Mock()
+        infos = [
+            dict(pp_rank=r, rank_ip="10.0.0.9", rank_port=31000 + r) for r in (0, 1)
+        ]
+        decode.register_decode(
+            7,
+            [1, 2],
+            [3],
+            None,
+            infos,
+            decode_prefix=DecodePrefixReport(prefix_len=4096, pullable_len=3840),
+        )
+        self.assertEqual(decode._send.call_count, 2)
+        consumer = json.loads(decode._send.call_args.args[1][3])
+        self.assertEqual(
+            (consumer["decode_prefix_len"], consumer["decode_pullable_len"]),
+            (4096, 3840),
+        )
+
+    def test_producer_agrees_on_the_reports_of_every_decode_rank(self):
+        pipe = transfer(producer=True)
+        self.assertIsNone(pipe.decode_prefix_report(7))
+        base = {"attn_tp_size": 2, "seq_along_lane": False}
+        for rank, pullable in ((0, 3840), (1, 3584)):
+            consumer = dict(
+                base,
+                attn_tp_rank=rank,
+                decode_prefix_len=4096,
+                decode_pullable_len=pullable,
+            )
+            pipe.replies.setdefault(7, {})[f"tcp://decode:{31000 + rank}"] = consumer
+        self.assertEqual(
+            pipe.decode_prefix_report(7),
+            DecodePrefixReport(prefix_len=4096, pullable_len=3584),
+        )
+        # A decode that predates the report sends none.
+        pipe.replies[8] = {"tcp://decode:31000": dict(base, attn_tp_rank=0)}
+        self.assertIsNone(pipe.decode_prefix_report(8))
 
 
 class TestPipelineLifetimes(unittest.TestCase):
