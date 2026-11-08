@@ -311,20 +311,24 @@ def run_files_chip_parallel(
             result = by_file.get(test.filename)
             if result is not None and result["returncode"] == 0:
                 record(chip, test.filename, 0, result["elapsed"], output)
-        # The failing file reruns alone so a neighbour cannot have caused it;
-        # the files the batch never reached go back as one unit.
+        # A file that failed reruns alone so the preloaded state cannot have
+        # caused it; the files the batch never reached go back as one unit.
         unreached = [t for t in tests if t.filename not in by_file]
-        culprit = next(
-            (t for t in tests if by_file.get(t.filename, {}).get("returncode", 0) != 0),
-            None,
-        )
-        if culprit is None and len(unreached) == len(tests):
+        culprits = [
+            t for t in tests if by_file.get(t.filename, {}).get("returncode", 0) != 0
+        ]
+        if not culprits and len(unreached) == len(tests):
             # Timed out or died before recording anything: the first file
             # is the only one that ran.
-            culprit, unreached = unreached[0], unreached[1:]
-        if culprit is not None:
+            culprits, unreached = unreached[:1], unreached[1:]
+        for culprit in culprits:
+            # The isolated rerun's output is what gets replayed on a real
+            # failure; keep the in-batch tail so a preload issue is diagnosable.
+            section = output.split(f"[batch] >>> {culprit.filename}")[-1]
+            tail = "\n".join(section.splitlines()[-40:])
             logger.info(
-                f"~ chip {chip}: {culprit.filename} failed in a batch; rerunning alone"
+                f"~ chip {chip}: {culprit.filename} failed in a batch; rerunning alone\n"
+                f"{'-' * 70}\n{tail}\n{'-' * 70}\n"
             )
             enqueue(_Unit([culprit]))
         if unreached:
