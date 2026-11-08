@@ -515,6 +515,20 @@ class TpuEnvs:
     # assigns each shared graph to the least-loaded rank (shared_compile_cost.py).
     # Empty: round-robin owners.
     SGLANG_TPU_SHARED_COMPILE_COST_PROFILE = EnvStr("")
+    # With the megakernel: prefill and other native-path steps run the dense linears and routers
+    # on the kernel's fp8 K-major copies (per-column scales, as in decode) and the bf16
+    # weights are freed for the KV pool.
+    SGLANG_TPU_MUSE_SHARED_DENSE = EnvBool(False)
+    # Muse Spark prefill sequence parallelism: extend forwards of at least MIN_TOKENS tokens
+    # keep the fp32 residual stream token-sharded over the TP group between layers.
+    SGLANG_TPU_MUSE_PREFILL_SP = EnvBool(False)
+    SGLANG_TPU_MUSE_PREFILL_SP_MIN_TOKENS = EnvInt(1024)
+    # Muse Spark: gather prefill-sized column shards with one all-gather along the column
+    # dim instead of a token-dim all-gather plus a transpose.
+    SGLANG_TPU_MUSE_GATHER_COLUMNS_DIM = EnvBool(False)
+    # Muse Spark rotary embedding by a one-lane roll on [tokens, heads * head_dim]
+    # instead of a [..., head_dim // 2, 2] pair view (same arithmetic).
+    SGLANG_TPU_MUSE_ROPE_ROLL = EnvBool(False)
     # With the megakernel: extend steps run the prefill program (muse_megakernel/prefill.py:
     # batched RPA, fused attention-output and post-MoE kernels, fused-RS MoE) on the
     # kernel's weights. Needs fp8 SEQ_ALONG_LANE pools and bf16 NVFP4 block scales.
