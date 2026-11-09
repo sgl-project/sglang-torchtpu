@@ -24,11 +24,14 @@ def stream_matmul(
     K: int,
     N: int,
     on_cols: Callable[[int, jax.Array], None],
+    skip: bool = False,
 ) -> None:
     """x [rows, K] bf16 @ w_hbm[layer] ([L, K, N] fp8, per-column scale [1, N] f32);
     x_cols(k0, n) loads x's columns [k0, k0 + n), on_cols(n0, y) gets each finished
-    [rows, DN_TN] f32 column tile."""
+    [rows, DN_TN] f32 column tile. skip: timing only, no stream and no output."""
     ring, sems = S["w13"], S["ep_dn_sems"]
+    if skip:
+        return
     nslot = ring.shape[0]
     nk, nn = K // DN_TK, N // DN_TN
     tiles = [(ni, ki) for ni in range(nn) for ki in range(nk)]

@@ -38,9 +38,14 @@ from sglang_tpu.muse_megakernel.mk.numerics import _rms
 from sglang_tpu.muse_megakernel.mk.packing import _pack_bf16x2, _unpack_bf16x2
 
 f32, bf16 = jnp.float32, jnp.bfloat16
-# Timing only (wrong results): skip these phases on every rank, comma-separated: residual
-# (own rows' FFN residual), capture, allgather, experts (expert math; the slots still move)
-_DEV_SKIP = frozenset(os.environ.get("SGLANG_TPU_EP_DEV_SKIP", "").split(","))
+
+
+def _dev_skip(phase: str) -> bool:
+    """Timing only (wrong results): SGLANG_TPU_EP_DEV_SKIP lists phases every rank skips:
+    residual (own rows' FFN residual), capture, allgather, experts (the math; slots move),
+    pool, unpool (their weight streams), a2a (counts, both all-to-alls: no slot moves).
+    Read at trace time: a warm compile process imports this module before a sweep's env."""
+    return phase in os.environ.get("SGLANG_TPU_EP_DEV_SKIP", "").split(",")
 
 
 class EPExperts:
@@ -60,14 +65,21 @@ class EPExperts:
         route.send_places(c, p, S, step.n_live, win)
         _pool(step, win)
         _fill_send(step, p, win)
-        a2a.exchange_counts(c, S, me)
+        moving = not _dev_skip("a2a")
+        if moving:
+            a2a.exchange_counts(c, S, me)
+        else:
+            S["ep_cnt_v"][...] = jnp.zeros(S["ep_cnt_v"].shape, jnp.int32)
         route.slot_matrix(c, S)
-        a2a.dispatch(c, S, me)
+        if moving:
+            a2a.dispatch(c, S, me)
         n_items = route.build_items(c, p, S, me)
-        a2a.wait_dispatch(c, S, me)
+        if moving:
+            a2a.wait_dispatch(c, S, me)
         _expert_loop(step, p, n_items)
-        a2a.give_back(c, S, me)
-        a2a.wait_give_back(c, S, me)
+        if moving:
+            a2a.give_back(c, S, me)
+            a2a.wait_give_back(c, S, me)
         _combine(step, win)
         _unpool_residual(step, win)
         _all_gather_rows(step, p)
@@ -105,6 +117,7 @@ def _pool(step: EPLayerStep, win) -> None:
         H,
         He,
         put,
+        skip=_dev_skip("pool"),
     )
     x = _rms(S["ep_u"][...], c.rms_eps, _row(smr, "pre_expert_w", He)).astype(bf16)
     S["ep_xo"][...] = _pack_bf16x2(x.astype(f32))
@@ -304,7 +317,7 @@ def _expert_loop(step: EPLayerStep, p: EPPlan, n_items) -> None:
 
         start(k + D - 1)
         wait(slot)
-        if "experts" not in _DEV_SKIP:
+        if not _dev_skip("experts"):
             chunk_compute(
                 step.kind,
                 n,
@@ -470,13 +483,14 @@ def _unpool_residual(step: EPLayerStep, win) -> None:
         He,
         H,
         put,
+        skip=_dev_skip("unpool"),
     )
     fw = S["ep_f"][pl.ds(0, wn), :] * _row(smr, "post_ffn_w", H)
     S["ep_f"][pl.ds(0, wn), :] = _rms(fw, c.post_eps).astype(bf16).astype(f32)
     load, store = _stream_rows(step)
     alpha, beta = _row(smr, "ffn_alpha", H), _row(smr, "ffn_beta", H)
     for r in range(
-        0 if "residual" in _DEV_SKIP else rc
+        0 if _dev_skip("residual") else rc
     ):  # own rows only: the all-gather fills the others
         wr = w_off + r
         branch = S["ep_f"][pl.ds(wr, 1), :]
@@ -495,7 +509,7 @@ def _all_gather_rows(step: EPLayerStep, p: EPPlan) -> None:
         if rc % 8 == 0
         else [(pl.ds(me * rc + r, 1),) for r in range(rc)]
     )
-    if "allgather" in _DEV_SKIP:
+    if _dev_skip("allgather"):
         parts = []
     for d in range(1, c.tp):
         peer = (me + d) % c.tp
@@ -519,7 +533,7 @@ def _all_gather_rows(step: EPLayerStep, p: EPPlan) -> None:
     for cl in c.capture_layers:
         hit = step.layer == cl
         is_cap = hit if is_cap is None else (is_cap | hit)
-    if is_cap is None or "capture" in _DEV_SKIP:
+    if is_cap is None or _dev_skip("capture"):
         return
 
     @pl.when(is_cap)
