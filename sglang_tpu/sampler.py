@@ -24,6 +24,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang_tpu.envs import envs
 from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
+from sglang_tpu.grammar import synchronize_token_ids
 from sglang_tpu.top_k import PallasDistributedTopKConfig
 
 logger = logging.getLogger(__name__)
@@ -575,8 +576,7 @@ class TpuSampler(Sampler):
             tp_group = parallel.attn_tp_group
         else:
             tp_group = parallel.tp_group
-        # Broadcast, not MIN all-reduce: TPU has no MIN all-reduce.
-        tp_group.broadcast(batch_next_token_ids, src=0)
+        synchronize_token_ids(batch_next_token_ids, tp_group)
 
     def _sample_from_probs(
         self,
