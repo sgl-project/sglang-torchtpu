@@ -19,7 +19,6 @@ layout the sparse kernels read.
 # NOTE: do *not* add ``from __future__ import annotations`` here — see the
 # annotation-introspection note in attention_pallas_rpa_v3.py.
 
-import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -51,7 +50,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-logger = logging.getLogger(__name__)
 
 _PALLAS_SPARSE_MLA_OPS = {}
 
@@ -321,19 +319,20 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
 
         from sglang.srt.runtime_context import get_parallel
 
-        # The all-to-all addresses peers by mesh position, which follows the
-        # global rank: the attention-TP group must be the whole world, in order.
+        # The all-to-all addresses peers by mesh position, which is the global
+        # rank (get_pallas_mesh is rank-aligned): the attention-TP group must be
+        # the whole world, in order.
         world = dist.get_world_size()
         if (
             self._idx_split_group is None
             or self._idx_split_size != world
             or get_parallel().attn_tp_rank != dist.get_rank()
         ):
-            logger.warning(
-                "DSA attention token split off: it needs the indexer token split "
-                "over an attention-TP group spanning the world in rank order."
+            raise RuntimeError(
+                "SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT needs "
+                "SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT over an attention-TP group "
+                "that spans the world in rank order."
             )
-            return
         from sglang_tpu.oneshot_collectives import get_oneshot_all_to_all_op
 
         get_oneshot_all_to_all_op(world)  # build before torch.compile traces

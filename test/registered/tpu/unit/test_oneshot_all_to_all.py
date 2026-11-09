@@ -9,7 +9,15 @@ outputs back) must not interfere.
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=60, suite="stage-a-test-tpu-unit", chips=4)
+# Behind the default-off SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT, and a
+# four-chip test holds the whole host: nightly, outside the stage-a budget.
+register_tpu_ci(
+    est_time=60,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    chips=4,
+    labels=["singlehost", "infra", "collectives"],
+)
 
 import functools
 import unittest

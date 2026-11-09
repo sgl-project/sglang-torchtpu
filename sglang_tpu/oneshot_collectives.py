@@ -52,16 +52,22 @@ def _build_all_gather_op(world_size: int) -> Callable:
     )
 
 
-def get_oneshot_all_gather_op(world_size: int) -> Callable:
-    op = _OPS.get(world_size)
+def _cached_op(
+    cache: dict[int, Callable], world_size: int, build: Callable[[int], Callable]
+) -> Callable:
+    op = cache.get(world_size)
     if op is not None:
         return op
     with _OPS_LOCK:
-        op = _OPS.get(world_size)
+        op = cache.get(world_size)
         if op is None:
-            op = _build_all_gather_op(world_size)
-            _OPS[world_size] = op
+            op = build(world_size)
+            cache[world_size] = op
     return op
+
+
+def get_oneshot_all_gather_op(world_size: int) -> Callable:
+    return _cached_op(_OPS, world_size, _build_all_gather_op)
 
 
 def oneshot_all_gather(
@@ -109,10 +115,7 @@ def _build_all_to_all_op(world_size: int) -> Callable:
 
 
 def get_oneshot_all_to_all_op(world_size: int) -> Callable:
-    with _OPS_LOCK:
-        if world_size not in _A2A_OPS:
-            _A2A_OPS[world_size] = _build_all_to_all_op(world_size)
-        return _A2A_OPS[world_size]
+    return _cached_op(_A2A_OPS, world_size, _build_all_to_all_op)
 
 
 # Rows of a [rows, 128] block: whole tiles for 8- to 32-bit dtypes.

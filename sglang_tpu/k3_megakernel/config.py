@@ -15,7 +15,8 @@ import msgspec
 # (moe/pallas/fused_rs), 1 two-level all-reduce (twolevel_allreduce.py), 2 host-split GEMV
 # (kernels/host_split_gemv.py), 5 one-shot all-gather and 7 two-shot all-reduce (the defaults
 # of kernels/oneshot_all_gather.py and kernels/twoshot_all_reduce.py), 6 Muse megakernel,
-# 3 one-shot all-to-all (kernels/oneshot_all_to_all.py).
+# 3 one-shot all-to-all (kernels/oneshot_all_to_all.py), 9 the megakernel draft's all-reduce
+# (k3_megakernel/server/draft.py).
 K3MK_COLLECTIVE_ID = 4
 
 

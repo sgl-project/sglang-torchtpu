@@ -13,7 +13,15 @@ import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=150, suite="stage-a-test-tpu-unit", chips=1)
+# Behind the default-off SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT: nightly,
+# outside the stage-a budget.
+register_tpu_ci(
+    est_time=150,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    chips=1,
+    labels=["singlehost", "kimi-k3"],
+)
 
 # Standalone raw-JAX kernel test: select the physical backend before the first
 # JAX import below.
