@@ -66,6 +66,9 @@ class EPConfig:
     # timing the collectives alone (the prototype's dequantize-everything experts would
     # swamp them); dispatch and combine move the same bytes either way.
     expert_math: str = "exact"
+    # "real", or "local": every collective a local copy of the same shape, for timing; the
+    # step's time against "real" is what its collectives cost past what overlaps them.
+    collectives: str = "real"
     window: int = 2048
     rms_eps: float = 1e-5
     post_eps: float = 1e-8
@@ -96,6 +99,7 @@ class EPConfig:
         assert self.n_experts % self.tp == 0 and len(self.kinds) == self.n_layers
         assert self.window % self.page_size == 0
         assert self.expert_math in ("exact", "identity"), self.expert_math
+        assert self.collectives in ("real", "local"), self.collectives
 
 
 def _rms(x: jax.Array, eps: float, w: jax.Array | None = None) -> jax.Array:
@@ -155,6 +159,39 @@ def dequant(words: jax.Array, scale: jax.Array, kind: str) -> jax.Array:
         .reshape(*lead, kw * 4, n)
     )
     return v * scale[..., :1, :].astype(jnp.float32)
+
+
+def _all_gather(c: EPConfig, x: jax.Array) -> jax.Array:
+    """Every rank's x stacked on dim 0 (tiled)."""
+    if c.collectives == "local":
+        return jnp.tile(x, (c.tp,) + (1,) * (x.ndim - 1))
+    return jax.lax.all_gather(x, AXIS, tiled=True)
+
+
+def _reduce_scatter_rows(c: EPConfig, x: jax.Array) -> jax.Array:
+    """This rank's rows of the sum over ranks."""
+    if c.collectives == "local":
+        return jax.lax.dynamic_slice_in_dim(
+            x, jax.lax.axis_index(AXIS) * c.rows_per_rank, c.rows_per_rank
+        )
+    return jax.lax.psum_scatter(x, AXIS, scatter_dimension=0, tiled=True)
+
+
+def _ragged_a2a(
+    c: EPConfig,
+    operand: jax.Array,
+    output: jax.Array,
+    in_off: jax.Array,
+    send: jax.Array,
+    out_off: jax.Array,
+    recv: jax.Array,
+) -> jax.Array:
+    if c.collectives == "local":
+        m = min(operand.shape[0], output.shape[0])
+        return output.at[:m].set(operand[:m])
+    return jax.lax.ragged_all_to_all(
+        operand, output, in_off, send, out_off, recv, axis_name=AXIS
+    )
 
 
 def _e2m1(codes: jax.Array) -> jax.Array:
@@ -317,7 +354,7 @@ def _moe(
     dest = jnp.where(live_rows[:, None], ids // c.experts_per_rank, tp).reshape(n)
     order = jnp.argsort(dest)
     send = jnp.bincount(dest, length=tp + 1)[:tp].astype(jnp.int32)
-    counts = jax.lax.all_gather(send, AXIS)  # [src, dst]
+    counts = _all_gather(c, send[None])  # [src, dst]
     me = jax.lax.axis_index(AXIS)
     in_off = _excl_cumsum(send)
     out_off = jnp.sum(jnp.where(jnp.arange(tp)[:, None] < me, counts, 0), axis=0)
@@ -327,23 +364,23 @@ def _moe(
     with jax.named_scope("ep_dispatch"):
         slot_x = jnp.repeat(xe.astype(jnp.bfloat16), k, axis=0)[order]
         slot_e = (ids % c.experts_per_rank).reshape(n).astype(jnp.int32)[order]
-        xr = jax.lax.ragged_all_to_all(
+        xr = _ragged_a2a(
+            c,
             slot_x,
             jnp.zeros((cap, c.expert_hidden), jnp.bfloat16),
             in_off,
             send,
             out_off,
             recv,
-            axis_name=AXIS,
         )
-        er = jax.lax.ragged_all_to_all(
+        er = _ragged_a2a(
+            c,
             slot_e,
             jnp.zeros((cap,), jnp.int32),
             in_off,
             send,
             out_off,
             recv,
-            axis_name=AXIS,
         )
     with jax.named_scope("ep_experts"):
         yr = (
@@ -354,14 +391,14 @@ def _moe(
     with jax.named_scope("ep_combine"):
         # Back to each source, where it sent from: its input offset for this rank.
         src_in_off = jnp.sum(jnp.where(jnp.arange(tp)[None, :] < me, counts, 0), axis=1)
-        ys = jax.lax.ragged_all_to_all(
+        ys = _ragged_a2a(
+            c,
             yr,
             jnp.zeros((n, c.expert_hidden), jnp.bfloat16),
             _excl_cumsum(recv),
             recv,
             src_in_off,
             send,
-            axis_name=AXIS,
         )
     y = jnp.zeros_like(ys).at[order].set(ys).reshape(rc, k, c.expert_hidden)
     return jnp.where(live_rows[:, None, None], y, 0)
@@ -388,7 +425,7 @@ def _layer(
 
     with jax.named_scope("ep_attn_gather"):
         x_own = _bf(_rms(stream, c.rms_eps, rep["pre_attn_w"])).astype(jnp.bfloat16)
-        x = jax.lax.all_gather(x_own, AXIS, tiled=True)  # [R, H]
+        x = _all_gather(c, x_own)  # [R, H]
     with jax.named_scope("ep_attention"):
         qkvg = _mv(x, wl["wqkvg"], wl["wqkvg_s"])
         qd, kd = c.q_dim, c.kv_dim
@@ -411,7 +448,7 @@ def _layer(
         gated = _bf(jax.nn.sigmoid(_bf(og)) * attn)
         o = _bf(_mv(gated, wl["wo"], wl["wo_s"]))  # partials travel as bf16
     with jax.named_scope("ep_attn_scatter"):
-        o_own = jax.lax.psum_scatter(o, AXIS, scatter_dimension=0, tiled=True)
+        o_own = _reduce_scatter_rows(c, o)
     a_own = _bf(o_own)
     stream = rep["attn_alpha"] * stream + rep["attn_beta"] * _bf(
         _rms(a_own, c.post_eps)
