@@ -30,7 +30,9 @@ from sglang_tpu.all_gather_via_all_reduce import (
 from sglang_tpu.all_gather_via_all_reduce import (
     gather_attn_tp_logits_around as gather_attn_tp_logits,
 )
-from sglang_tpu.all_gather_via_all_reduce import wrap_logits_gatherer
+from sglang_tpu.all_gather_via_all_reduce import (
+    wrap_logits_gatherer,
+)
 
 __all__ = [
     "gather_and_crop_vocab",

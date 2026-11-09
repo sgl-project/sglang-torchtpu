@@ -131,8 +131,11 @@ class TestLogitsGatherHooks(CustomTestCase):
         cases = {"eager": False, "direct tracer": True}
         with mock.patch.object(agar, "get_parallel", return_value=_parallel(group)):
             for name, direct_flag in cases.items():
-                with self.subTest(name), mock.patch.object(
-                    torch.compiler, "_is_compiling_flag", direct_flag
+                with (
+                    self.subTest(name),
+                    mock.patch.object(
+                        torch.compiler, "_is_compiling_flag", direct_flag
+                    ),
                 ):
                     self.assertEqual(gatherer(logits), "native")
         self.assertEqual(fallback.call_count, 2)
@@ -166,10 +169,13 @@ class TestLogitsGatherHooks(CustomTestCase):
                 group = mock.Mock(world_size=world)
                 original = mock.Mock(return_value="native")
                 processor = SimpleNamespace(vocab_size=vocab)
-                with mock.patch.object(
-                    agar, "get_parallel", return_value=_parallel(group)
-                ), mock.patch.object(
-                    torch.compiler, "is_dynamo_compiling", return_value=dynamo
+                with (
+                    mock.patch.object(
+                        agar, "get_parallel", return_value=_parallel(group)
+                    ),
+                    mock.patch.object(
+                        torch.compiler, "is_dynamo_compiling", return_value=dynamo
+                    ),
                 ):
                     got = agar.gather_attn_tp_logits_around(original, processor, rows)
                 self.assertEqual(got, "native")
