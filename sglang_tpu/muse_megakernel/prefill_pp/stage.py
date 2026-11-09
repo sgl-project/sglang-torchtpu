@@ -32,11 +32,13 @@ def stage_forward(
     cu_q,
     dist,
     scratch: bool = False,
+    fixed_ids=None,
 ):
     """One stage. ctl [2] i32 = [cached tokens, active stage or -1]; slots: the stage's slot
     table; x [T, H] f32 stream; weights: the dense stacks in WEIGHT_ORDER; experts_fp4: per slot
     (w13, w13_scale, w2, w2_scale); experts_fp8: the stage's fp8 set; pools: one per slot
-    (global slots' as wide as the page table); page_tables: (global, sliding window).
+    (global slots' as wide as the page table); page_tables: (global, sliding window);
+    fixed_ids: timing control only, [slots, T, top_k] expert picks used instead of the router's.
     Returns (x, pools), and with scratch each slot's (ids, routing weights, q, k, v, attention
     output, expert input, slot outputs)."""
     skip = skipped_phases()
@@ -66,7 +68,9 @@ def stage_forward(
                 )
         with jax.named_scope(f"slot{s}/route"):
             x, xe, ids, tw = route_call(ctl_s, slots, x, o, g, *weights)
-            if balanced_routing():
+            if fixed_ids is not None:
+                ids = ids.at[:, :K].set(fixed_ids[s])
+            elif balanced_routing():
                 t = jax.lax.broadcasted_iota(jnp.int32, ids.shape, 0)
                 k = jax.lax.broadcasted_iota(jnp.int32, ids.shape, 1)
                 ids = jnp.where(k < K, (t * K + k) % c.n_experts, ids)
