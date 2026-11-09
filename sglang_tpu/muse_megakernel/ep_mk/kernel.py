@@ -11,6 +11,8 @@ from sglang_tpu.muse_megakernel.ep_mk.experts import (
     fp4_weights_kperm,
     kperm,
     permute_fp8_rows,
+    qblock,
+    requant_fp4_blocks,
 )
 from sglang_tpu.muse_megakernel.ep_mk.layer import EPExperts
 from sglang_tpu.muse_megakernel.kernel import megakernel_call
@@ -44,9 +46,13 @@ def ep_expert_weights(
     """One rank's whole experts in the EP kernel's layout, from the natural one ([E, H_e/pack,
     2I] w13, [E, I/pack, H_e] w2, int32 words): hidden rows in pooled_perm order; for fp4
     the gate / up columns and w2's rows in kperm order too (the dense arm's scale layout);
-    then w13's columns in chunk_cols order (chunk: the MKConfig's inter_local)."""
+    then w13's columns in chunk_cols order (chunk: the MKConfig's inter_local). Under
+    SGLANG_TPU_EP_QBLOCK, fp4 experts are requantized to its blocks first."""
     cols = chunk_cols(w13.shape[-1], chunk)
     if kind == "fp4":
+        if qblock():
+            w13, s13 = requant_fp4_blocks(w13.view(jax.numpy.uint32), s13)
+            w2, s2 = requant_fp4_blocks(w2.view(jax.numpy.uint32), s2)
         w13k, s13k, w2k, s2k = fp4_weights_kperm(
             w13.view(jax.numpy.uint32), s13, w2.view(jax.numpy.uint32), s2
         )

@@ -312,12 +312,32 @@ def _permute_packed_rows(
     return out
 
 
+def _requant_fp4_blocks(words: torch.Tensor, scale: torch.Tensor, block: int) -> tuple:
+    """ep_mk.experts.requant_fp4_blocks on int32 words [K/8, N] (the kernel's weights under
+    SGLANG_TPU_EP_QBLOCK; the reference keeps the block-16 ones)."""
+    k, n = words.shape[0] * 8, words.shape[1]
+    w = _dequant_fp4(words, scale).reshape(k // block, block, n)
+    sb = (w.abs().amax(dim=1) / 6.0).to(torch.bfloat16)
+    sbf = sb.float()
+    q = (w / torch.where(sbf > 0, sbf, 1.0)[:, None]).clamp(-6.0, 6.0)
+    mags = _E2M1[:8]
+    d = (q.abs()[..., None] - mags).abs()
+    near = d == d.amin(dim=-1, keepdim=True)
+    idx = torch.where(near, torch.arange(8) % 2, 2).argmin(dim=-1)  # ties to even
+    codes = idx.to(torch.int32) | torch.where(q < 0, 8, 0).to(torch.int32)
+    codes = codes.reshape(k // 8, 8, n)
+    out = torch.zeros(k // 8, n, dtype=torch.int32)
+    for j in range(8):
+        out |= codes[:, j] << (4 * j)
+    return out, sb.repeat_interleave(block // 16, dim=0)
+
+
 def ep_expert_slabs(l: int, rank: int, kind: str) -> list:
     """One rank's whole experts (w13, w13_scale, w2, w2_scale), stacked, in ep_mk's layout:
     every rank's intermediate slices of each expert side by side, the hidden rows in
     pooled_perm order and, for fp4, the gate / up columns and w2's rows in kperm order; then
     w13's columns in chunk_cols order."""
-    from sglang_tpu.muse_megakernel.ep_mk.experts import chunk_cols, kperm
+    from sglang_tpu.muse_megakernel.ep_mk.experts import chunk_cols, kperm, qblock
 
     el, il, he = N_EXPERTS // TP, INTER_LOCAL, EXPERT_HIDDEN
     cc = torch.from_numpy(chunk_cols(2 * TP * il, il))
@@ -331,6 +351,9 @@ def ep_expert_slabs(l: int, rank: int, kind: str) -> list:
         w2 = torch.cat([s[2] for s in sl], dim=0)
         if kind == "fp4":
             s2 = torch.cat([s[3] for s in sl], dim=0)
+            if qblock():
+                w13, s13 = _requant_fp4_blocks(w13, s13, qblock())
+                w2, s2 = _requant_fp4_blocks(w2, s2, qblock())
             w13 = _permute_packed_rows(w13, 4, kp_he)[:, kp_2i]
             s13, w2 = s13[:, kp_2i], _permute_packed_rows(w2, 4, kp_i)
         else:
