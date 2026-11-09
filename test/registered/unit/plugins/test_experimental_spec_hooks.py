@@ -772,12 +772,15 @@ class TestExperimentalSpecHooks(CustomTestCase):
         from sglang_tpu.experimental.speculative import block_draft_worker
         from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
+        class PluginPool(TpuFusedMHATokenToKVPool):
+            def __init__(self, shape):
+                self.kv_buffer = [torch.zeros(shape), torch.zeros(shape)]
+
         def write_draft_kv(*, kv_pool, **_):
             kv_pool.kv_buffer[-1].fill_(1)
 
         for shape in ((3, 2, 4, 8, 16), (3, 2, 4, 32)):
-            pool = object.__new__(TpuFusedMHATokenToKVPool)
-            pool.kv_buffer = [torch.zeros(shape), torch.zeros(shape)]
+            pool = PluginPool(shape)
             worker = SimpleNamespace(
                 model_runner=SimpleNamespace(
                     token_to_kv_pool=pool, req_to_token_pool=SimpleNamespace(size=2)
