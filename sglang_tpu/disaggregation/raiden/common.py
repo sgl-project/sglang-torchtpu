@@ -31,7 +31,11 @@ from sglang_tpu.dsv4.dsv4_memory_pool import (
     TPUDeepSeekV4IndexerPool,
     TPUDeepSeekV4SWAKVPool,
 )
-from sglang_tpu.kv_pool import TpuBlockMajorMHATokenToKVPool, TpuSeqAlongLaneKVPool
+from sglang_tpu.kv_pool import (
+    TpuBlockMajorMHATokenToKVPool,
+    TpuSeqAlongLaneKVPool,
+    TpuSplitMLATokenToKVPool,
+)
 from sglang_tpu.mamba_pool import TpuMambaPool
 from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
 
@@ -178,7 +182,8 @@ def get_raiden_kv_caches(
     linear-attention pools contribute GDN state rows; ``DSV4TPUTokenToKVPool``
     contributes its compressed full-page sub-pools, SWA pages, and 32-page
     request compressor state rings. A block-major pool contributes one bundle
-    per namespace.
+    per namespace. The split sparse-MLA pool, alone or under a hybrid pool,
+    contributes several page buffers per layer (``transfer_page_buffers``).
     """
 
     def group_one(current_pool: KVCache) -> RaidenKVCacheGroups:
@@ -219,6 +224,24 @@ def get_raiden_kv_caches(
         bundles = _block_major_groups(current_pool)
         if bundles is not None:
             return bundles
+        is_hybrid = isinstance(current_pool, HybridLinearKVPool)
+        split_pool = current_pool.full_kv_pool if is_hybrid else current_pool
+        if isinstance(split_pool, TpuSplitMLATokenToKVPool):
+            entries = split_pool.transfer_page_buffers()
+            split_buffers = [buf for _, buf in entries]
+            _assert_root_buffers("split MLA KV", split_buffers)
+            split_ids = [layer for layer, _ in entries]
+            if is_hybrid:
+                # The hybrid pool's split pool is dense over its full layers.
+                mapping = current_pool.full_attention_layer_id_mapping
+                global_ids = {dense: layer for layer, dense in mapping.items()}
+                split_ids = [global_ids[layer] for layer in split_ids]
+            return RaidenKVCacheGroups(
+                full=split_buffers,
+                swa=[],
+                full_layer_ids=split_ids,
+                swa_layer_ids=[],
+            )
 
         layers_mapping = getattr(current_pool, "layers_mapping", None)
         start = current_pool.start_layer
