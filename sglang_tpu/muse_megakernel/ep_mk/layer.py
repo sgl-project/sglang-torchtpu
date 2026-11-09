@@ -51,7 +51,7 @@ def _phase(name: str):
 def _dev_skip(phase: str) -> bool:
     """Timing only (wrong results): SGLANG_TPU_EP_DEV_SKIP lists phases every rank skips:
     residual (own rows' FFN residual), capture, allgather, experts (the math; slots move),
-    wdma (the expert weight streams: the math runs on stale ring slots),
+    wdma (the expert weight streams after the first ring fill: the math reruns those slots),
     pool, unpool (their weight streams), a2a (counts, both all-to-alls: no slot moves).
     Read at trace time: a warm compile process imports this module before a sweep's env."""
     return phase in os.environ.get("SGLANG_TPU_EP_DEV_SKIP", "").split(",")
@@ -303,10 +303,7 @@ def _expert_loop(step: EPLayerStep, p: EPPlan, n_items) -> None:
         return i, items[1 + 3 * i], items[2 + 3 * i], items[3 + 3 * i], k % NC
 
     def start(k):
-        if _dev_skip("wdma"):
-            return
-
-        @pl.when(k < total)
+        @pl.when(k < (jnp.minimum(total, D) if _dev_skip("wdma") else total))
         def _():
             _, e, _, _, j = item(k)
             step.for_layer(
@@ -315,12 +312,17 @@ def _expert_loop(step: EPLayerStep, p: EPPlan, n_items) -> None:
                 ]
             )
 
-    def wait(slot):
-        if _dev_skip("wdma"):
-            return
+    def wait(slot, k):
         refs, off = step.wait_refs
-        for cp in _chunk_copies(step, p, refs, off, 0, 0, slot):
-            cp.wait()
+
+        def w():
+            for cp in _chunk_copies(step, p, refs, off, 0, 0, slot):
+                cp.wait()
+
+        if _dev_skip("wdma"):
+            pl.when(k < D)(w)
+        else:
+            w()
 
     for q in range(D - 1):
         start(jnp.int32(q))
@@ -350,7 +352,7 @@ def _expert_loop(step: EPLayerStep, p: EPPlan, n_items) -> None:
             sized(n, sizes, zero)
 
         start(k + D - 1)
-        wait(slot)
+        wait(slot, k)
         if not _dev_skip("experts"):
             chunk_compute(
                 step.kind,
