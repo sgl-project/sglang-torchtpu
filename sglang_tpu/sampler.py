@@ -34,6 +34,7 @@ _DISTRIBUTED_TOP_K_MIN_BATCH_SIZE = max(
 )
 # Kill switch for the sort-free top-k/top-p/min-p filtering path.
 _BSEARCH_SAMPLING_ENABLED = envs.SGLANG_TPU_ENABLE_BSEARCH_SAMPLING.get()
+_VOCAB_SHARD_SAMPLING = envs.SGLANG_TPU_ENABLE_VOCAB_SHARD_SAMPLING.get()
 
 
 class _DistributedTopKState(NamedTuple):
@@ -288,13 +289,88 @@ def distributed_top_k_for_batch(
     return top_k
 
 
+def vocab_shard_sampling_for_batch(forward_batch) -> bool:
+    """Whether a vocab-parallel Gumbel-max draw keeps this decode batch's distribution:
+    temperature-only or all-greedy rows, nothing that edits full-vocab logits."""
+
+    if not _VOCAB_SHARD_SAMPLING or forward_batch is None:
+        return False
+    if (
+        _is_speculative_batch(forward_batch)
+        or not forward_batch.forward_mode.is_decode()
+    ):
+        return False
+    info = forward_batch.sampling_info
+    if info is None or forward_batch.return_logprob:
+        return False
+    parallel = get_parallel()
+    if parallel.tp_size == 1 or parallel.attn_dp_size != 1:
+        return False
+    if not info.is_all_greedy and (
+        info.need_top_k_sampling or info.need_top_p_sampling or info.need_min_p_sampling
+    ):
+        return False
+    if info.sampling_seed is not None:
+        return False
+    if info.has_custom_logit_processor or info.logit_bias is not None:
+        return False
+    if any(info.grammars or ()) or info.sampling_mask_batch_indices is not None:
+        return False
+    if (
+        info.acc_additive_penalties is not None
+        or info.acc_scaling_penalties is not None
+    ):
+        return False
+    if (
+        info.penalizer_orchestrator is not None
+        and info.penalizer_orchestrator.is_required
+    ):
+        return False
+    return True
+
+
+def sample_vocab_shard(
+    shard_logits: torch.Tensor,
+    extent: tuple[int, int, int],
+    temperatures: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """One token per row from this rank's vocab shard; greedy if temperatures is None.
+
+    argmax(z / T + Gumbel) is an exact draw from softmax(z / T) and splits over shards:
+    each rank keeps its (max, id), one [rows, 2] all-gather picks the winner, and ties
+    go to the lowest id. Every rank reads its columns of the same full-width uniforms
+    the full-vocab sampler draws, so the RNG stream and the drawn tokens match it.
+    """
+    from sglang.srt.distributed import get_tp_group
+
+    start, valid, vocab_size = extent
+    rows = shard_logits.shape[0]
+    scores = shard_logits[:, :valid].float()
+    if temperatures is not None:
+        u = torch.rand(
+            (rows, vocab_size), device=shard_logits.device, dtype=torch.float32
+        )[:, start : start + valid]
+        gumbel = (
+            torch.log(u.clamp_min(torch.finfo(torch.float32).tiny)).neg_().log_().neg_()
+        )
+        scores = scores / temperatures + gumbel
+    local_val, local_idx = torch.max(scores, dim=-1)
+    # Token ids stay below 2**24, so float32 carries them exactly.
+    pairs = torch.stack([local_val, (local_idx + start).to(torch.float32)], dim=-1)
+    gathered = get_tp_group().all_gather(pairs, dim=0).view(-1, rows, 2)
+    winner = torch.argmax(gathered[:, :, 0], dim=0, keepdim=True)
+    return torch.gather(gathered[:, :, 1], 0, winner).view(-1).to(torch.int64)
+
+
 def select_logits_output_mode(forward_batch, model) -> LogitsOutputMode:
-    """Select full-vocabulary logits or distributed TopK candidates."""
+    """Select full-vocabulary logits, this rank's vocab shard, or distributed TopK."""
 
     # Speculative forwards keep the mode their worker set (FULL_VOCAB by default);
     # a worker asking for candidates negotiated the width at init, outside any trace.
     if _is_speculative_batch(forward_batch):
         return forward_batch.logits_output_mode
+    if vocab_shard_sampling_for_batch(forward_batch):
+        return LogitsOutputMode.VOCAB_SHARD
     candidate_width = distributed_top_k_candidate_width_for_model(model)
     if candidate_width is None:
         return LogitsOutputMode.FULL_VOCAB
@@ -476,6 +552,7 @@ class TpuSampler(Sampler):
     def __init__(self):
         super().__init__()
         self._device_params = _DeviceParamCache()
+        self._vocab_shard_logged = False
 
     def forward(
         self,
@@ -532,6 +609,22 @@ class TpuSampler(Sampler):
                 sampling_info = self._device_params.materialize(
                     sampling_info, physical_rows
                 )
+
+        if logits_output.next_token_logits_vocab_shard is not None:
+            if return_logprob:
+                raise ValueError("vocab-shard sampling cannot return logprobs")
+            if not self._vocab_shard_logged:
+                self._vocab_shard_logged = True
+                logger.info(
+                    "Vocab-shard sampling: %d rows, shard (start, valid, vocab) = %s",
+                    logits_output.next_token_logits.shape[0],
+                    logits_output.next_token_logits_vocab_shard,
+                )
+            return sample_vocab_shard(
+                logits_output.next_token_logits,
+                logits_output.next_token_logits_vocab_shard,
+                None if sampling_info.is_all_greedy else sampling_info.temperatures,
+            )
 
         # No global TopK: sample from the full-vocabulary logits instead.
         if not logits_output.has_next_token_global_top_k:
