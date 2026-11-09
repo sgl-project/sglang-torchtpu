@@ -767,6 +767,18 @@ class TestExperimentalSpecHooks(CustomTestCase):
         )
         self.assertEqual(seen[0].tolist(), [1, 2])
 
+    def test_dflash_kv_fence_tail_reads_layer_buffers_of_any_rank(self):
+        """A plugin's pool (_mha_kv_pool_cls) may give its layer buffers another rank than 5."""
+        from sglang_tpu.experimental.speculative.block_draft_worker import (
+            kv_fence_tail,
+        )
+
+        for shape in ((3, 2, 4, 8, 16), (3, 2, 4, 32)):
+            layer_kv = torch.ones(shape)
+            torch.testing.assert_close(
+                kv_fence_tail(layer_kv), layer_kv[0, 0].sum().reshape(1)
+            )
+
     def test_pp_stages_before_the_last_get_no_draft(self):
         """Under PP only the last stage hosts the draft; an earlier stage building one
         would bind the target embedding or lm_head its stage does not hold."""
