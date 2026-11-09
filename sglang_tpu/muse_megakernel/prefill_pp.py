@@ -3,21 +3,21 @@
 
 A stage holds its layers whole (every head, all experts, the full pooler and unpooler) on one
 device, so nothing in it talks to another device; the residual stream moves between stages
-outside. Per layer slot, three calls:
+outside. Per layer slot:
 
   attn_in    (fused Pallas) qkvg projection, qk norms, rope -> q, k, v, gate
   attention  sglang_tpu's batched RPA prefill kernel, as the P/D prefill serves it: the
              chunk's K/V into the slot's fp8 SEQ_ALONG_LANE pool, attention over the pool
              (cached context and the causal chunk), each head's output RMS-normalized
-  post_attn  (fused Pallas) gated o projection and residual, router top-k, expert projection;
-             each routed expert once over its rows (gathered rows, weights streamed per
-             intermediate tile, normalized outputs scattered to their (token, slot) rows);
-             weighted slot sum, unpooler, gated residual
+  route      (fused Pallas) gated o projection and residual, router top-k, expert projection
+  experts    sglang_tpu's fused MoE (sort, gather, gmm_v2 x2, un-permute), as served:
+             NVFP4 W4A16, or fp8 W8A8 on the stage's fp8 layer
+  combine    (fused Pallas) post-expert norm per slot, weighted slot sum, unpooler, gated
+             residual
 
 Every stage has the same slot layout (cfg.slots layers of dense weights, global attention at
-cfg.global_slots; expert slabs whose rows hold the stage's layers back to back), so one program
-serves every stage. A per-stage slot table (SMEM) says which slots hold a layer, its expert
-format and its slab offsets.
+cfg.global_slots, NVFP4 experts per slot and one fp8 expert set), so one program serves every
+stage; a per-stage slot table says which slots hold a layer and which take the fp8 experts.
 """
 
 import os
@@ -29,16 +29,10 @@ import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.muse_megakernel.kernel import (
-    _fp4_dot,
-    _fp8_dot,
-    _heads_rms,
-    _rms,
-    _topk_iter,
-)
+from sglang_tpu.muse_megakernel.kernel import _heads_rms, _rms, _topk_iter
 
 LANE = 128
-PHASES = ("attn_in", "attn_out", "moe", "post_moe")
+PHASES = ("attn_in", "attention", "route", "experts", "combine")
 FP8 = jnp.float8_e4m3fn
 BF16 = jnp.bfloat16
 F32 = jnp.float32
@@ -46,10 +40,8 @@ F32 = jnp.float32
 # slot table: a header, then NF int32 fields per slot
 HDR = 8
 H_STAGE, H_LAYERS = 0, 1
-NF = 8
-F_VALID, F_GLOBAL, F_FP8, F_WOFF, F_SOFF, F_LAYER = range(6)
-# fp8 experts carry one channelwise scale row, padded to a bf16 tile
-FP8_SCALE_ROWS = 16
+NF = 4
+F_VALID, F_GLOBAL, F_FP8, F_LAYER = range(4)
 
 # rows of the per-layer vector slab [slots, V_ROWS, vec_width] f32
 V = dict(
@@ -99,18 +91,12 @@ class PPConfig(msgspec.Struct, frozen=True, kw_only=True):
     # pool pages of a global / sliding-window slot
     global_pages: int
     swa_pages: int
-    # u32 word rows per expert in the slabs (all of a stage's layers)
-    slab_rows: int
     max_position: int
     # slots of the global attention layers (the rest are sliding-window)
     global_slots: tuple = (2, 6)
-    # dense row tile, weight column tile, MoE row block and intermediate tile
+    # dense row tile and weight column tile
     tm: int = 256
     tn: int = 512
-    rb: int = 256
-    ti: int = 512
-    # MoE matmul row counts: a block runs the smallest that holds its rows
-    moe_row_buckets: tuple = (128, 192)
 
     @property
     def q_dim(self) -> int:
@@ -129,48 +115,27 @@ class PPConfig(msgspec.Struct, frozen=True, kw_only=True):
         return max(self.qkvg_dim, self.hidden)
 
     def validate(self) -> None:
-        """Raises ValueError for a geometry the stage kernel does not tile."""
+        """Raises ValueError for a geometry the stage kernels do not tile."""
         H, He, T = self.hidden, self.expert_hidden, self.rows
         checks = [
-            (self.tn == self.ti, "the weight buffer is shared: tn == ti"),
+            (H >= 2 * He and self.q_dim >= 2 * He, "combine staging halves"),
             (
-                self.rb == self.tm and H >= 2 * He,
-                "MoE rows reuse the dense row buffers",
+                self.tm % self.top_k == 0 and (self.tm // self.top_k) % 8 == 0,
+                "row tile",
             ),
-            (self.tm % (8 * self.top_k) == 0 and self.tm % 16 == 0, "row tile"),
-            (
-                T % self.tm == 0 and T % self.page == 0,
-                "chunk rows",
-            ),
+            (T % self.tm == 0 and T % self.page == 0, "chunk rows"),
             (
                 self.qkvg_dim % self.tn == 0 and H % self.tn == 0 and He % self.tn == 0,
                 "tn",
             ),
             (self.q_dim % self.tn == 0 and self.kv_dim % self.tn == 0, "head tiles"),
-            (self.tn % (2 * self.head_dim) == 0, "head pairs per column tile"),
-            (
-                self.inter == He,
-                "expert slabs share row offsets: inter == expert_hidden",
-            ),
-            (self.inter % self.ti == 0 and self.ti % 128 == 0, "intermediate tile"),
-            (self.page == 256 and self.head_dim % 4 == 0, "fp8 SAL pages of 256"),
             (self.n_experts <= 2 * LANE and self.n_experts % LANE == 0, "router lanes"),
-            (self.top_k <= 16 and (T * self.top_k) % LANE == 0, "routing table"),
+            (self.top_k <= LANE, "routing lanes"),
             (self.q_heads % self.kv_heads == 0, "GQA"),
-            (all(r % 32 == 0 for r in self.moe_row_buckets), "MoE row buckets"),
         ]
         bad = [why for ok, why in checks if not ok]
         if bad:
             raise ValueError(f"PPConfig {self}: {'; '.join(bad)}")
-
-
-def expert_rows(kind: str, k: int) -> tuple[int, int]:
-    """(u32 word rows, scale rows) one layer's [K, N] expert matrix takes in a slab."""
-    if kind == "fp4":
-        return k // 8, k // 16
-    if kind == "fp8":
-        return k // 4, FP8_SCALE_ROWS
-    raise ValueError(f"expert kind {kind}")
 
 
 def stage_layers(n_layers: int, split: tuple[int, ...]) -> list[tuple[int, ...]]:
@@ -187,12 +152,12 @@ def stage_layers(n_layers: int, split: tuple[int, ...]) -> list[tuple[int, ...]]
 def slot_table(
     c: PPConfig, stage: int, layers: tuple[int, ...], kinds: tuple, global_layers: tuple
 ) -> np.ndarray:
-    """The stage's SMEM slot table [HDR + slots * NF] int32. Its layers take consecutive slots
+    """The stage's slot table [HDR + slots * NF] int32. Its layers take consecutive slots
     from the one that puts its global layers on cfg.global_slots.
 
     Raises:
-      ValueError: The layers do not fit the stage's slots or slab rows, or their global layers
-        cannot sit on cfg.global_slots.
+      ValueError: The layers do not fit the stage's slots, their global layers cannot sit on
+        cfg.global_slots, or more than one of them has fp8 experts.
     """
     globals_at = [i for i, layer in enumerate(layers) if layer in global_layers]
     first = c.global_slots[0] - globals_at[0] if globals_at else 0
@@ -202,34 +167,21 @@ def slot_table(
             f"stage {stage}: layers {layers} (global {[layers[i] for i in globals_at]}) do not "
             f"fit {c.slots} slots with global attention at {c.global_slots}"
         )
+    if sum(kinds[layer] == "fp8" for layer in layers) > 1:
+        raise ValueError(f"stage {stage}: one fp8 expert set per stage")
     t = np.zeros(HDR + c.slots * NF, np.int32)
     t[H_STAGE], t[H_LAYERS] = stage, len(layers)
-    woff = soff = 0
     for i, layer in enumerate(layers):
-        s = first + i
-        f = t[HDR + s * NF : HDR + (s + 1) * NF]
-        wr, sr = expert_rows(kinds[layer], c.expert_hidden)
+        f = t[HDR + (first + i) * NF : HDR + (first + i + 1) * NF]
         f[F_VALID], f[F_GLOBAL] = 1, int(layer in global_layers)
-        f[F_FP8], f[F_WOFF], f[F_SOFF], f[F_LAYER] = (
-            int(kinds[layer] == "fp8"),
-            woff,
-            soff,
-            layer,
-        )
-        woff, soff = woff + wr, soff + sr
-    if woff > c.slab_rows or soff > c.slab_rows // 2:
-        raise ValueError(
-            f"stage {stage}: expert slabs need {woff} word / {soff} scale rows"
-        )
+        f[F_FP8], f[F_LAYER] = int(kinds[layer] == "fp8"), layer
     return t
 
 
 def weight_shapes(c: PPConfig) -> dict[str, tuple[tuple[int, ...], jnp.dtype]]:
-    """One stage's weights (per device). Dense weights are column-tile major, each tile a
-    contiguous [K, tn] block; expert slabs are [E, tile, slab rows, ti]: w13 tiles are the
-    gate's then the up projection's intermediate tiles, w2 tiles its output column pieces."""
-    S, H, He, E, tn, ti = c.slots, c.hidden, c.expert_hidden, c.n_experts, c.tn, c.ti
-    R = c.slab_rows
+    """One stage's dense weights (per device), column-tile major: each [K, tn] tile is one
+    contiguous block."""
+    S, H, He, E, tn = c.slots, c.hidden, c.expert_hidden, c.n_experts, c.tn
     return {
         "wqkvg": ((S, c.qkvg_dim // tn, H, tn), FP8),
         "wo": ((S, H // tn, c.q_dim, tn), FP8),
@@ -237,39 +189,36 @@ def weight_shapes(c: PPConfig) -> dict[str, tuple[tuple[int, ...], jnp.dtype]]:
         "wunpool": ((S, H // tn, He, tn), FP8),
         "wrouter": ((S, H, E), BF16),
         "vecs": ((S, V_ROWS, c.vec_width), F32),
-        "w13": ((E, 2 * c.inter // ti, R, ti), jnp.int32),
-        "s13": ((E, 2 * c.inter // ti, R // 2, ti), BF16),
-        "w2": ((E, He // ti, R, ti), jnp.int32),
-        "s2": ((E, He // ti, R // 2, ti), BF16),
     }
 
 
-WEIGHT_ORDER = (
-    "wqkvg",
-    "wo",
-    "wpool",
-    "wunpool",
-    "wrouter",
-    "vecs",
-    "w13",
-    "s13",
-    "w2",
-    "s2",
-)
+WEIGHT_ORDER = ("wqkvg", "wo", "wpool", "wunpool", "wrouter", "vecs")
+
+
+def expert_shapes(c: PPConfig, kind: str) -> list[tuple[tuple[int, ...], jnp.dtype]]:
+    """(w13, w13_scale, w2, w2_scale) of one layer in the fused MoE's serving layouts: NVFP4 as
+    e2m1 codes packed two per byte along K with bf16 block scales (16 along K) paired into
+    int32 words; fp8 [E, K, N] with f32 channel scales."""
+    E, He, I = c.n_experts, c.expert_hidden, c.inter
+    if kind == "fp4":
+        return [
+            ((E, He // 2, 2 * I), jnp.uint8),
+            ((E, He // 32, 2 * I), jnp.int32),
+            ((E, I // 2, He), jnp.uint8),
+            ((E, I // 32, He), jnp.int32),
+        ]
+    if kind == "fp8":
+        return [
+            ((E, He, 2 * I), FP8),
+            ((E, 1, 1, 2 * I), F32),
+            ((E, I, He), FP8),
+            ((E, 1, 1, He), F32),
+        ]
+    raise ValueError(f"expert kind {kind}")
 
 
 def pool_shape(c: PPConfig, pages: int) -> tuple[int, ...]:
     return (pages, 2 * c.kv_heads, c.head_dim // 4, 4, c.page)
-
-
-def _moe_rows(c: PPConfig) -> tuple[int, int]:
-    """(word rows, scale rows) of one MoE step's weights in the shared buffers."""
-    He, ti, npc = c.expert_hidden, c.ti, c.expert_hidden // c.ti
-    w4, s4 = expert_rows("fp4", He)
-    w8, _ = expert_rows("fp8", He)
-    words = max(2 * w4 + npc * (ti // 8), 2 * w8 + npc * (ti // 4))
-    scales = max(2 * s4 + npc * (ti // 16), (2 + npc) * FP8_SCALE_ROWS)
-    return words, scales
 
 
 def _bf(x):
@@ -306,53 +255,43 @@ def skipped_phases() -> frozenset[str]:
     return skip
 
 
+SCRATCH = (
+    "xbuf", "accbuf", "abuf", "gbuf", "pbuf", "wbuf", "vec_v", "wr_v", "rope_v", "rope8",
+    "otile", "ids_v", "tw_v", "misc_s", "sem_x", "sem_w", "sem_o", "sem_m",
+)  # fmt: skip
+
+
 def stage_calls(c: PPConfig):
-    """The stage's two fused calls, for the slot in ctl[2] (ctl [3] i32 = [cached tokens, active
+    """The stage's fused calls, for the slot in ctl[2] (ctl [3] i32 = [cached tokens, active
     stage or -1, slot]); a device whose stage is not active, or a slot without a layer, returns
-    at once:
+    at once (outputs unwritten):
       attn_in(ctl, slot table, x [T, H] f32, rope [max_position, 2 hd] f32, *weights) ->
         (q [T, q_dim] bf16, k, v [T, kv_dim] bf16, gate [T, q_dim] bf16)
-      post_attn(ctl, slot table, x, o [T, q_dim] bf16, gate, *weights) -> (x, scratch...),
-        x updated in place."""
+      route(ctl, slot table, x, o [T, q_dim] bf16, gate, *weights) ->
+        (x, expert input [T, He] bf16, ids [T, 128] i32, weights [T, 128] f32), lanes past
+        top_k zero, x updated in place
+      combine(ctl, slot table, x, y [T * top_k, He] bf16 (token-major slots), weights,
+        *weights) -> (x,), x updated in place"""
     c.validate()
     skip = skipped_phases()
     T, H, He, E, K = c.rows, c.hidden, c.expert_hidden, c.n_experts, c.top_k
-    hd, nkv = c.head_dim, c.kv_heads
+    hd = c.head_dim
     qd, kvd, nq = c.q_dim, c.kv_dim, c.qkvg_dim
-    tm, tn, rb, ti = c.tm, c.tn, c.rb, c.ti
+    tm, tn = c.tm, c.tn
     n_rt = T // tm
     sub = 16  # rows per vector pass over a [tm, H] tile
     n_qt, n_kt = qd // tn, kvd // tn
     ntc = nq // tn
-    nti, npc = c.inter // ti, He // ti
-    w4, s4 = expert_rows("fp4", He)
-    w8, _ = expert_rows("fp8", He)
-    moe_w, moe_s = _moe_rows(c)
-    wr_rows = max(H, qd, He, 4 * moe_w)
-    row_buckets = tuple(sorted({min(rb, r) for r in c.moe_row_buckets} | {rb}))
-    tok_per_grp = tm // K
-    slots_n = T * K
-    S = c.slots
+    G = tm // K  # tokens per combine group: their K slot rows fill a tile
+    wr_rows = max(H, qd, He)
 
     def body(R, phases):
         ctl, slots, x_in = R["ctl"], R["slots"], R["x_in"]
-        rope, o_h, g_in = R.get("rope"), R.get("o_h"), R.get("g_in")
-        wqkvg, wo, wpool, wunpool = R["wqkvg"], R["wo"], R["wpool"], R["wunpool"]
-        wrouter, vecs, w13, s13, w2, s2 = (R[n] for n in WEIGHT_ORDER[4:])
-        q_h, k_h, v_h, g_h = R.get("q_h"), R.get("k_h"), R.get("v_h"), R.get("g_h")
-        xe_h, ids_h, tw_h, y_h = (
-            R.get("xe_h"),
-            R.get("ids_h"),
-            R.get("tw_h"),
-            R.get("y_h"),
-        )
+        wqkvg, wo, wpool, wunpool, wrouter, vecs = (R[n] for n in WEIGHT_ORDER)
+        xbuf, accbuf, abuf, gbuf, pbuf, wbuf = (R[n] for n in SCRATCH[:6])
+        vec_v, wr_v, rope_v, rope8, otile, ids_v, tw_v = (R[n] for n in SCRATCH[6:13])
+        misc_s, sem_x, sem_w, sem_o, sem_m = (R[n] for n in SCRATCH[13:])
         x_out = x_in  # the stream is aliased in place
-        xbuf, accbuf, abuf, gbuf, pbuf, wbuf, sbuf = (R[n] for n in SCRATCH[:7])
-        vec_v, wr_v, rope_v, rope8, otile, idp_v, tw_v = (R[n] for n in SCRATCH[7:14])
-        ids_s, cnt_s, off_s, fill_s, lst_s, ite_s, itb_s, misc_s = (
-            R[n] for n in SCRATCH[14:22]
-        )
-        sem_x, sem_w, sem_o, sem_m, sem_g, sem_y = (R[n] for n in SCRATCH[22:])
 
         def vrow(name, n, off=0):
             return vec_v[pl.ds(V[name], 1), pl.ds(off, n)]
@@ -360,10 +299,10 @@ def stage_calls(c: PPConfig):
         def rows(i, n):
             return pl.ds(pl.multiple_of(i * n, n), n)
 
-        def wv(b):
-            return wbuf.at[b].bitcast(jnp.int32)
-
         def attn_in(sl, is_g, ctx):
+            rope, q_h, k_h, v_h, g_h = (
+                R[n] for n in ("rope", "q_h", "k_h", "v_h", "g_h")
+            )
             total = n_rt * ntc
 
             def wcp(idx, b):
@@ -376,7 +315,7 @@ def stage_calls(c: PPConfig):
 
             def emit(acc, dst):
                 """A [tm, tn] output tile through the double-buffered otile."""
-                n = misc_s[4]
+                n = misc_s[0]
                 b = n % 2
 
                 @pl.when(n >= 2)
@@ -385,9 +324,9 @@ def stage_calls(c: PPConfig):
 
                 otile[b] = acc.astype(BF16)
                 out_cp(b, dst).start()
-                misc_s[4] = n + 1
+                misc_s[0] = n + 1
 
-            misc_s[4] = 0
+            misc_s[0] = 0
             wcp(0, 0).start()
 
             def row_tile(i, carry):
@@ -455,11 +394,14 @@ def stage_calls(c: PPConfig):
             jax.lax.fori_loop(0, n_rt, row_tile, 0)
             for b in range(2):
 
-                @pl.when(misc_s[4] > b)
+                @pl.when(misc_s[0] > b)
                 def _(b=b):
                     out_cp(b, q_h.at[pl.ds(0, tm), pl.ds(0, tn)]).wait()
 
-        def attn_out(sl):
+        def route(sl):
+            o_h, g_in, xe_h, ids_h, tw_h = (
+                R[n] for n in ("o_h", "g_in", "xe_h", "ids_h", "tw_h")
+            )
             n_wo, n_wp = H // tn, He // tn
             per = n_wo + n_wp
             total = n_rt * per
@@ -491,7 +433,7 @@ def stage_calls(c: PPConfig):
 
                 return b
 
-            cwr = pltpu.make_async_copy(wrouter.at[sl], wr_v, sem_m.at[5])
+            cwr = pltpu.make_async_copy(wrouter.at[sl], wr_v, sem_m.at[1])
             cwr.start()
             wcp(0, 0, False)
 
@@ -555,25 +497,12 @@ def stage_calls(c: PPConfig):
                 for k in range(K):
                     ids_t = jnp.where(lane == k, ids[k], ids_t)
                     tw_t = jnp.where(lane == k, tws[k] / denom * c.route_scale, tw_t)
+                ids_v[...] = ids_t
                 tw_v[...] = tw_t
-                ctw = pltpu.make_async_copy(tw_v, tw_h.at[pl.ds(r0, tm)], sem_m.at[6])
-                ctw.start()
-                # (token, slot) ids packed lane-dense: row j holds tokens 16j.. of the tile
-                per_row = LANE // K
-                rep = ids_t
-                s = K
-                while s < LANE:
-                    rep = rep | pltpu.roll(rep, shift=s, axis=1)
-                    s *= 2
-                row = jax.lax.broadcasted_iota(jnp.int32, (tm, LANE), 0)
-                sel = jnp.where(row % per_row == lane // K, rep, 0)
-                idp_v[...] = jnp.sum(sel.reshape(tm // per_row, per_row, LANE), axis=1)
-                cid = pltpu.make_async_copy(
-                    idp_v,
-                    ids_h.at[pl.ds(i * (tm // per_row), tm // per_row)],
-                    sem_m.at[7],
-                )
+                cid = pltpu.make_async_copy(ids_v, ids_h.at[pl.ds(r0, tm)], sem_m.at[2])
+                ctw = pltpu.make_async_copy(tw_v, tw_h.at[pl.ds(r0, tm)], sem_m.at[3])
                 cid.start()
+                ctw.start()
 
                 def wp_tile(j, cc):
                     b = take(i * per + n_wo + j)
@@ -587,323 +516,27 @@ def stage_calls(c: PPConfig):
 
                 def xe_norm(r, cc):
                     rr = pl.ds(pl.multiple_of(r * sub, sub), sub)
-                    pbuf[rr, :] = _bf(
+                    gbuf[rr, pl.ds(0, He)] = (
                         _rms(pbuf[rr, :], c.rms_eps) * vrow("pre_expert_w", He)
-                    )
+                    ).astype(BF16)
                     return cc
 
                 jax.lax.fori_loop(0, tm // sub, xe_norm, 0)
-                cxe = pltpu.make_async_copy(pbuf, xe_h.at[pl.ds(r0, tm)], sem_x.at[1])
+                cxe = pltpu.make_async_copy(
+                    gbuf.at[:, pl.ds(0, He)], xe_h.at[pl.ds(r0, tm)], sem_x.at[1]
+                )
                 cxe.start()
-                for cp in (cxo, ctw, cid, cxe):
+                for cp in (cxo, cid, ctw, cxe):
                     cp.wait()
                 return carry
 
             jax.lax.fori_loop(0, n_rt, row_tile, 0)
 
-        def moe(is_f8, woff, soff):
-            cp = pltpu.make_async_copy(ids_h, ids_s, sem_m.at[0])
-            cp.start()
-            cp.wait()
-
-            def zero(e, cc):
-                cnt_s[e] = 0
-                return cc
-
-            jax.lax.fori_loop(0, E, zero, 0)
-
-            def expert_of(s):
-                return ids_s[s // LANE, s % LANE]
-
-            def count(s, cc):
-                e = expert_of(s)
-                cnt_s[e] = cnt_s[e] + 1
-                return cc
-
-            jax.lax.fori_loop(0, slots_n, count, 0)
-
-            def offsets(e, run):
-                off_s[e] = run
-                fill_s[e] = run
-                return run + cnt_s[e]
-
-            jax.lax.fori_loop(0, E, offsets, jnp.int32(0))
-
-            def place(s, cc):
-                e = expert_of(s)
-                f = fill_s[e]
-                lst_s[f] = s
-                fill_s[e] = f + 1
-                return cc
-
-            jax.lax.fori_loop(0, slots_n, place, 0)
-
-            def items(e, n):
-                nb = (cnt_s[e] + rb - 1) // rb
-
-                def blk(bb, cc):
-                    ite_s[n + bb] = e
-                    itb_s[n + bb] = bb
-                    return cc
-
-                jax.lax.fori_loop(0, nb, blk, 0)
-                return n + nb
-
-            n_items = jax.lax.fori_loop(0, E, items, jnp.int32(0))
-            n_steps = n_items * nti
-
-            def w_copies(idx, b, fp8):
-                item, j = idx // nti, idx % nti
-                e = ite_s[item]
-                if fp8:
-                    pw, wsz, sz2 = w8, ti // 4, FP8_SCALE_ROWS
-                    gs = [
-                        (s13.at[e, j, pl.ds(soff, sz2)], sbuf.at[b, pl.ds(0, sz2)]),
-                        (
-                            s13.at[e, nti + j, pl.ds(soff, sz2)],
-                            sbuf.at[b, pl.ds(sz2, sz2)],
-                        ),
-                    ]
-                    gs += [
-                        (
-                            s2.at[e, cc, pl.ds(soff, sz2)],
-                            sbuf.at[b, pl.ds((2 + cc) * sz2, sz2)],
-                        )
-                        for cc in range(npc)
-                    ]
-                else:
-                    pw, wsz = w4, ti // 8
-                    gs = [
-                        (s13.at[e, j, pl.ds(soff, s4)], sbuf.at[b, pl.ds(0, s4)]),
-                        (
-                            s13.at[e, nti + j, pl.ds(soff, s4)],
-                            sbuf.at[b, pl.ds(s4, s4)],
-                        ),
-                    ]
-                    gs += [
-                        (
-                            s2.at[
-                                e,
-                                cc,
-                                pl.ds(
-                                    pl.multiple_of(soff + j * (ti // 16), 16), ti // 16
-                                ),
-                            ],
-                            sbuf.at[b, pl.ds(2 * s4 + cc * (ti // 16), ti // 16)],
-                        )
-                        for cc in range(npc)
-                    ]
-                ws = [
-                    (w13.at[e, j, pl.ds(woff, pw)], wv(b).at[pl.ds(0, pw)]),
-                    (w13.at[e, nti + j, pl.ds(woff, pw)], wv(b).at[pl.ds(pw, pw)]),
-                ]
-                ws += [
-                    (
-                        w2.at[e, cc, pl.ds(pl.multiple_of(woff + j * wsz, 16), wsz)],
-                        wv(b).at[pl.ds(2 * pw + cc * wsz, wsz)],
-                    )
-                    for cc in range(npc)
-                ]
-                return [pltpu.make_async_copy(a, d, sem_w.at[b]) for a, d in ws + gs]
-
-            def w_issue(idx, b, wait):
-                for fp8 in (False, True):
-
-                    @pl.when((is_f8 != 0) == fp8)
-                    def _(fp8=fp8):
-                        for cp in w_copies(idx, b, fp8):
-                            cp.wait() if wait else cp.start()
-
-            def xg(gb):
-                return xbuf.at[:, pl.ds(gb * He, He)]
-
-            def ystage(yb):
-                return accbuf.at[:, pl.ds(yb * He, He)]
-
-            def block(item):
-                e, bb = ite_s[item], itb_s[item]
-                return off_s[e] + bb * rb, jnp.minimum(rb, cnt_s[e] - bb * rb)
-
-            def gather(item, gb):
-                base, n = block(item)
-
-                def one(r, cc):
-                    tok = lst_s[base + r] // K
-                    pltpu.make_async_copy(
-                        xe_h.at[pl.ds(tok, 1)], xg(gb).at[pl.ds(r, 1)], sem_g.at[gb]
-                    ).start()
-                    return cc
-
-                jax.lax.fori_loop(0, n, one, 0)
-                misc_s[gb] = n
-
-            def gather_wait(gb):
-                def one(r, cc):
-                    pltpu.make_async_copy(
-                        xe_h.at[pl.ds(0, 1)], xg(gb).at[pl.ds(0, 1)], sem_g.at[gb]
-                    ).wait()
-                    return cc
-
-                jax.lax.fori_loop(0, misc_s[gb], one, 0)
-
-            def scatter(item, yb):
-                base, n = block(item)
-
-                def one(r, cc):
-                    s = lst_s[base + r]
-                    pltpu.make_async_copy(
-                        ystage(yb).at[pl.ds(r, 1)],
-                        y_h.at[pl.ds((s % K) * T + s // K, 1)],
-                        sem_y.at[yb],
-                    ).start()
-                    return cc
-
-                jax.lax.fori_loop(0, n, one, 0)
-                misc_s[2 + yb] = n
-
-            def scatter_wait(yb):
-                def one(r, cc):
-                    pltpu.make_async_copy(
-                        ystage(yb).at[pl.ds(0, 1)], y_h.at[pl.ds(0, 1)], sem_y.at[yb]
-                    ).wait()
-                    return cc
-
-                jax.lax.fori_loop(0, misc_s[2 + yb], one, 0)
-                misc_s[2 + yb] = 0
-
-            for i in range(4):
-                misc_s[i] = 0
-            w_issue(0, 0, False)
-            gather(0, 0)
-
-            def step(idx, carry):
-                item, j = idx // nti, idx % nti
-                b, gb = idx % 2, item % 2
-
-                @pl.when(j == 0)
-                def _():
-                    gather_wait(gb)
-                    pbuf[...] = jnp.zeros(pbuf.shape, F32)
-
-                    @pl.when(item + 1 < n_items)
-                    def _():
-                        gather(item + 1, 1 - gb)
-
-                w_issue(idx, b, True)
-
-                @pl.when(idx + 1 < n_steps)
-                def _():
-                    w_issue(idx + 1, 1 - b, False)
-
-                n_rows = block(item)[1]
-                x_rows = xg(gb)
-                w = wv(b)
-
-                def expert_tile(R):
-                    """This step's matmuls over the block's first R rows."""
-
-                    def lhs(c8, n8, _fp8_lhs):
-                        return x_rows[pl.ds(0, R), pl.ds(c8 * 8, n8 * 8)].astype(BF16)
-
-                    @pl.when(is_f8 == 0)
-                    def _():
-                        g = _fp4_dot(
-                            None,
-                            w.at[pl.ds(0, w4)],
-                            sbuf.at[b, pl.ds(0, s4)],
-                            He,
-                            ti,
-                            32,
-                            fast_bf16=True,
-                            lhs_chunk_fn=lhs,
-                            nrows=R,
-                        )
-                        u = _fp4_dot(
-                            None,
-                            w.at[pl.ds(w4, w4)],
-                            sbuf.at[b, pl.ds(s4, s4)],
-                            He,
-                            ti,
-                            32,
-                            fast_bf16=True,
-                            lhs_chunk_fn=lhs,
-                            nrows=R,
-                        )
-                        hdn = (g * jax.nn.sigmoid(g) * u).astype(BF16)
-                        for cc in range(npc):
-                            wp = w.at[pl.ds(2 * w4 + cc * (ti // 8), ti // 8)]
-                            sp = sbuf.at[b, pl.ds(2 * s4 + cc * (ti // 16), ti // 16)]
-                            pbuf[pl.ds(0, R), rows(cc, ti)] += _fp4_dot(
-                                hdn, wp, sp, ti, ti, 32, fast_bf16=True
-                            )
-
-                    @pl.when(is_f8 != 0)
-                    def _():
-                        def srow(r):
-                            return sbuf[b, pl.ds(r * FP8_SCALE_ROWS, 1), :].astype(F32)
-
-                        g = _fp8_dot(
-                            None,
-                            w.at[pl.ds(0, w8)],
-                            srow(0),
-                            He,
-                            ti,
-                            64,
-                            lhs_chunk_fn=lhs,
-                            nrows=R,
-                        )
-                        u = _fp8_dot(
-                            None,
-                            w.at[pl.ds(w8, w8)],
-                            srow(1),
-                            He,
-                            ti,
-                            64,
-                            lhs_chunk_fn=lhs,
-                            nrows=R,
-                        )
-                        hdn = (g * jax.nn.sigmoid(g) * u).astype(BF16)
-                        for cc in range(npc):
-                            wp = w.at[pl.ds(2 * w8 + cc * (ti // 4), ti // 4)]
-                            pbuf[pl.ds(0, R), rows(cc, ti)] += _fp8_dot(
-                                hdn, wp, srow(2 + cc), ti, ti, 64
-                            )
-
-                # the smallest row bucket holding the block's rows: MXU work follows them
-                lo = 0
-                for R in row_buckets:
-
-                    @pl.when((n_rows > lo) & (n_rows <= R))
-                    def _(R=R):
-                        expert_tile(R)
-
-                    lo = R
-
-                @pl.when(j == nti - 1)
-                def _():
-                    yb = item % 2
-                    scatter_wait(yb)
-                    ys = ystage(yb)
-
-                    def fin(r, cc):
-                        rr = pl.ds(pl.multiple_of(r * sub, sub), sub)
-                        y = _bf(pbuf[rr, :])
-                        ys[rr, :] = _bf(_rms(y * vrow("post_expert_w", He), c.post_eps))
-                        return cc
-
-                    jax.lax.fori_loop(0, rb // sub, fin, 0)
-                    scatter(item, yb)
-
-                return carry
-
-            jax.lax.fori_loop(0, n_steps, step, 0)
-            scatter_wait(0)
-            scatter_wait(1)
-
-        def post_moe(sl):
+        def combine(sl):
+            y_h, tw_in = R["y_h"], R["tw_in"]
             n_wu = H // tn
             total = n_rt * n_wu
-            n_grp = tm // tok_per_grp
+            n_grp = tm // G
 
             def wcp(idx, b):
                 return pltpu.make_async_copy(
@@ -911,55 +544,69 @@ def stage_calls(c: PPConfig):
                 )
 
             def ycp(i, gi, yb):
-                """The K slot rows of a group of tokens: slot k's into staging rows k * G."""
-                t0 = i * tm + gi * tok_per_grp
-                return [
-                    pltpu.make_async_copy(
-                        y_h.at[pl.ds(k * T + t0, tok_per_grp)],
-                        accbuf.at[
-                            pl.ds(k * tok_per_grp, tok_per_grp), pl.ds(yb * He, He)
-                        ],
-                        sem_g.at[yb],
-                    )
-                    for k in range(K)
-                ]
+                """A group's K slot rows per token (token-major) into a staging half."""
+                return pltpu.make_async_copy(
+                    y_h.at[pl.ds((i * tm + gi * G) * K, tm)],
+                    gbuf.at[:, pl.ds(yb * He, He)],
+                    sem_m.at[4 + yb],
+                )
 
             wcp(0, 0).start()
 
             def row_tile(i, carry):
                 r0 = pl.multiple_of(i * tm, tm)
                 cx = pltpu.make_async_copy(x_out.at[pl.ds(r0, tm)], xbuf, sem_x.at[0])
-                ct = pltpu.make_async_copy(tw_h.at[pl.ds(r0, tm)], tw_v, sem_x.at[1])
+                ct = pltpu.make_async_copy(tw_in.at[pl.ds(r0, tm)], tw_v, sem_x.at[1])
                 cx.start()
                 ct.start()
-                for cp in ycp(i, 0, 0):
-                    cp.start()
+                ycp(i, 0, 0).start()
                 ct.wait()
 
-                def comb(gi, cc):
+                def group(gi, cc):
                     yb = gi % 2
-                    for cp in ycp(i, gi, yb):
-                        cp.wait()
+                    ycp(i, gi, yb).wait()
 
                     @pl.when(gi + 1 < n_grp)
                     def _():
-                        for cp in ycp(i, gi + 1, 1 - yb):
-                            cp.start()
+                        ycp(i, gi + 1, 1 - yb).start()
 
-                    stage = accbuf.at[:, pl.ds(yb * He, He)]
-                    t0 = pl.multiple_of(gi * tok_per_grp, tok_per_grp)
-                    for l0 in range(0, He, 512):
-                        u = None
-                        for k in range(K):
-                            wk = tw_v[pl.ds(t0, tok_per_grp), pl.ds(k, 1)]
-                            yk = stage[
-                                pl.ds(k * tok_per_grp, tok_per_grp), pl.ds(l0, 512)
-                            ]
-                            u = wk * yk if u is None else u + wk * yk
-                        abuf[pl.ds(t0, tok_per_grp), pl.ds(l0, 512)] = u.astype(BF16)
+                    stage = gbuf.at[:, pl.ds(yb * He, He)]
+
+                    def tokens(r, c2):
+                        # 8 tokens' K slot rows (an f32 row tile): normalize, weight, sum the slots
+                        nt = 8
+                        t0 = pl.multiple_of(gi * G + r * nt, nt)
+                        y = stage[pl.ds(pl.multiple_of(r * nt * K, nt * K), nt * K), :]
+                        yn = _bf(
+                            _rms(y.astype(F32) * vrow("post_expert_w", He), c.post_eps)
+                        )
+                        tw = tw_v[pl.ds(t0, nt), :]
+                        tw_rows = jnp.broadcast_to(
+                            tw[:, None, :], (nt, K, LANE)
+                        ).reshape(nt * K, LANE)
+                        slot = (
+                            jax.lax.broadcasted_iota(jnp.int32, (nt * K, LANE), 0) % K
+                        )
+                        lane = jax.lax.broadcasted_iota(jnp.int32, (nt * K, LANE), 1)
+                        w = jnp.sum(
+                            jnp.where(lane == slot, tw_rows, 0.0), axis=1, keepdims=True
+                        )
+                        accbuf[pl.ds(t0, nt), pl.ds(0, He)] = jnp.sum(
+                            (yn * w).reshape(nt, K, He), axis=1
+                        )
+                        return c2
+
+                    jax.lax.fori_loop(0, G // 8, tokens, 0)
                     return cc
 
-                jax.lax.fori_loop(0, n_grp, comb, 0)
+                jax.lax.fori_loop(0, n_grp, group, 0)
+
+                def to_bf16(r, cc):
+                    rr = pl.ds(pl.multiple_of(r * sub, sub), sub)
+                    abuf[rr, pl.ds(0, He)] = accbuf[rr, pl.ds(0, He)].astype(BF16)
+                    return cc
+
+                jax.lax.fori_loop(0, tm // sub, to_bf16, 0)
 
                 def wu_tile(j, cc):
                     idx = i * n_wu + j
@@ -1001,19 +648,14 @@ def stage_calls(c: PPConfig):
 
         @pl.when(active & (slots[base + F_VALID] != 0))
         def _():
-            is_g, is_f8 = slots[base + F_GLOBAL], slots[base + F_FP8]
+            is_g = slots[base + F_GLOBAL]
             cv = pltpu.make_async_copy(vecs.at[sl], vec_v, sem_m.at[0])
             cv.start()
             cv.wait()
-            ctx = ctl[0]
-            # slab offsets are whole layers: multiples of an fp8 scale tile (16 rows)
-            woff = pl.multiple_of(slots[base + F_WOFF], 16)
-            soff = pl.multiple_of(slots[base + F_SOFF], 16)
             for name, run in (
-                ("attn_in", lambda: attn_in(sl, is_g, ctx)),
-                ("attn_out", lambda: attn_out(sl)),
-                ("moe", lambda: moe(is_f8, woff, soff)),
-                ("post_moe", lambda: post_moe(sl)),
+                ("attn_in", lambda: attn_in(sl, is_g, ctl[0])),
+                ("route", lambda: route(sl)),
+                ("combine", lambda: combine(sl)),
             ):
                 if name in phases and name not in skip:
                     run()
@@ -1021,34 +663,24 @@ def stage_calls(c: PPConfig):
     vmem, smem_t = pltpu.VMEM, pltpu.SMEM
     dma = pltpu.SemaphoreType.DMA
     scratch = [
-        vmem((tm, H), F32),  # xbuf: stream tile; MoE gathered rows (two halves)
-        vmem((tm, H), F32),  # accbuf: projection outputs; MoE / combine staging
+        vmem((tm, H), F32),  # xbuf: stream tile
+        vmem((tm, H), F32),  # accbuf: projection outputs; the combined slots
         vmem((tm, H), BF16),  # abuf: matmul inputs
-        vmem((tm, qd), BF16),  # gbuf: attention gate
-        vmem((tm, He), F32),  # pbuf: pooled rows; MoE output accumulator
-        vmem((2, wr_rows, tn), FP8),  # wbuf: weight tiles (MoE words as int32)
-        vmem((2, moe_s, ti), BF16),  # sbuf: MoE scales
+        vmem((tm, qd), BF16),  # gbuf: attention gate; expert input; slot staging halves
+        vmem((tm, He), F32),  # pbuf: pooled rows
+        vmem((2, wr_rows, tn), FP8),  # wbuf: weight tiles
         vmem((V_ROWS, c.vec_width), F32),
         vmem((H, E), BF16),
         vmem((tm, 2 * hd), F32),
         vmem((2, tm, tn), F32),  # rope8: lane-expanded cos / sin of a row tile
         vmem((2, tm, tn), BF16),  # otile
-        vmem((tm // (LANE // K), LANE), jnp.int32),  # idp_v
+        vmem((tm, LANE), jnp.int32),  # ids_v
         vmem((tm, LANE), F32),  # tw_v
-        smem_t((slots_n // LANE, LANE), jnp.int32),  # ids_s
-        smem_t((E,), jnp.int32),
-        smem_t((E,), jnp.int32),
-        smem_t((E,), jnp.int32),
-        smem_t((slots_n,), jnp.int32),  # lst_s
-        smem_t((E + slots_n // rb + 8,), jnp.int32),  # ite_s
-        smem_t((E + slots_n // rb + 8,), jnp.int32),  # itb_s
         smem_t((8,), jnp.int32),  # misc_s
         dma((3,)),
         dma((2,)),
         dma((2,)),
         dma((8,)),
-        dma((2,)),
-        dma((2,)),
     ]
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
@@ -1062,11 +694,10 @@ def stage_calls(c: PPConfig):
         def kernel(*refs):
             body(dict(zip(names, refs)), phases)
 
-        n_smem = 2
         return pl.pallas_call(
             kernel,
             out_shape=tuple(outs.values()),
-            in_specs=[smem] * n_smem + [hbm] * (len(in_names) - n_smem),
+            in_specs=[smem] * 2 + [hbm] * (len(in_names) - 2),
             out_specs=(hbm,) * len(outs),
             scratch_shapes=scratch,
             input_output_aliases=aliases,
@@ -1086,27 +717,37 @@ def stage_calls(c: PPConfig):
         {},
         f"muse_prefill_pp_attn_in_{tag}",
     )
-    post_call = build(
+    route_call = build(
         ["ctl", "slots", "x_in", "o_h", "g_in", *WEIGHT_ORDER],
         {
             "x_out": sds((T, H), F32),
-            "xe_h": sds((T, He), F32),
-            "ids_h": sds((slots_n // LANE, LANE), jnp.int32),
+            "xe_h": sds((T, He), BF16),
+            "ids_h": sds((T, LANE), jnp.int32),
             "tw_h": sds((T, LANE), F32),
-            "y_h": sds((slots_n, He), F32),
         },
-        ("attn_out", "moe", "post_moe"),
+        ("route",),
         {2: 0},
-        f"muse_prefill_pp_post_attn_{tag}",
+        f"muse_prefill_pp_route_{tag}",
     )
-    return attn_in_call, post_call
+    combine_call = build(
+        ["ctl", "slots", "x_in", "y_h", "tw_in", *WEIGHT_ORDER],
+        {"x_out": sds((T, H), F32)},
+        ("combine",),
+        {2: 0},
+        f"muse_prefill_pp_combine_{tag}",
+    )
+    return attn_in_call, route_call, combine_call
 
 
-SCRATCH = (
-    "xbuf", "accbuf", "abuf", "gbuf", "pbuf", "wbuf", "sbuf", "vec_v", "wr_v", "rope_v",
-    "rope8", "otile", "idp_v", "tw_v", "ids_s", "cnt_s", "off_s", "fill_s", "lst_s", "ite_s",
-    "itb_s", "misc_s", "sem_x", "sem_w", "sem_o", "sem_m", "sem_g", "sem_y",
-)  # fmt: skip
+def experts(c: PPConfig, xe, ids, tw, ex):
+    """sglang_tpu's fused MoE as served (no combine): [T, top_k, He] bf16 slot outputs."""
+    from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
+
+    w13, s13, w2, s2 = ex
+    return _fused_moe_jax(
+        xe, w13, w2, tw[:, : c.top_k].astype(BF16), ids[:, : c.top_k], s13, s2, None, None,
+        c.top_k, "silu", no_combine=True, use_sc_gather=1,
+    )  # fmt: skip
 
 
 def stage_forward(
@@ -1116,6 +757,8 @@ def stage_forward(
     x,
     rope,
     weights,
+    experts_fp4,
+    experts_fp8,
     pools,
     kv_lens,
     page_tables,
@@ -1123,41 +766,54 @@ def stage_forward(
     dist,
     scratch: bool = False,
 ):
-    """One stage: per slot the fused attention-input kernel, the batched RPA prefill attention
-    (which also writes the chunk's K/V into the slot's pool) and the fused attention-output,
-    MoE and post-MoE kernel. ctl [2] i32 = [cached tokens, active stage or -1]; pools: one per
+    """One stage. Per slot: attn_in, the batched RPA prefill attention (which also writes the
+    chunk's K/V into the slot's pool), route, the fused MoE (the slot's NVFP4 experts, or the
+    stage's fp8 set where the slot table says so), combine. ctl [2] i32 = [cached tokens,
+    active stage or -1]; experts_fp4: per slot (w13, w13_scale, w2, w2_scale); pools: one per
     slot (global slots' as wide as the page table); page_tables: (global, sliding window).
-    Returns (x, pools), and with scratch each slot's post_attn intermediates (expert input,
-    packed ids, routing weights, slot outputs)."""
+    Returns (x, pools), and with scratch each slot's (ids, routing weights)."""
     from sglang_tpu.attention.pallas.batched_rpa import configs
     from sglang_tpu.attention.pallas.batched_rpa.wrapper import ragged_paged_attention
 
-    attn_in_call, post_call = stage_calls(c)
-    T = c.rows
-    pools, posts = list(pools), []
+    skip = skipped_phases()
+    attn_in_call, route_call, combine_call = stage_calls(c)
+    T, K = c.rows, c.top_k
+    pools, routes = list(pools), []
     for s in range(c.slots):
         ctl_s = jnp.concatenate([ctl, jnp.full((1,), s, jnp.int32)])
         is_g = s in c.global_slots
         with jax.named_scope(f"slot{s}/attn_in"):
             q, k, v, g = attn_in_call(ctl_s, slots, x, rope, *weights)
         with jax.named_scope(f"slot{s}/attention"):
-            o, pools[s] = ragged_paged_attention(
-                q.reshape(T, c.q_heads, c.head_dim),
-                k.astype(FP8).reshape(T, c.kv_heads, c.head_dim),
-                v.astype(FP8).reshape(T, c.kv_heads, c.head_dim),
-                pools[s],
-                kv_lens,
-                page_tables[0 if is_g else 1],
-                cu_q,
-                dist,
-                sm_scale=c.attn_scale,
-                sliding_window=None if is_g else c.window,
-                k_scale=1.0,
-                v_scale=1.0,
-                kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
-                out_head_norm_eps=c.rms_eps,
+            if "attention" in skip:
+                o = jnp.zeros((T, c.q_dim), BF16)
+            else:
+                o, pools[s] = ragged_paged_attention(
+                    q.reshape(T, c.q_heads, c.head_dim),
+                    k.astype(FP8).reshape(T, c.kv_heads, c.head_dim),
+                    v.astype(FP8).reshape(T, c.kv_heads, c.head_dim),
+                    pools[s], kv_lens, page_tables[0 if is_g else 1], cu_q, dist,
+                    sm_scale=c.attn_scale, sliding_window=None if is_g else c.window,
+                    k_scale=1.0, v_scale=1.0, kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+                    out_head_norm_eps=c.rms_eps,
+                )  # fmt: skip
+        with jax.named_scope(f"slot{s}/route"):
+            x, xe, ids, tw = route_call(
+                ctl_s, slots, x, o.reshape(T, c.q_dim), g, *weights
             )
-        with jax.named_scope(f"slot{s}/post_attn"):
-            x, *rest = post_call(ctl_s, slots, x, o.reshape(T, c.q_dim), g, *weights)
-        posts.append(rest)
-    return (x, pools, posts) if scratch else (x, pools)
+        with jax.named_scope(f"slot{s}/experts"):
+            if "experts" in skip:
+                y = jnp.zeros((T, K, c.expert_hidden), BF16)
+            else:
+                is_fp8 = slots[HDR + s * NF + F_FP8] != 0
+                y = jax.lax.cond(
+                    is_fp8,
+                    lambda: experts(c, xe, ids, tw, experts_fp8),
+                    lambda: experts(c, xe, ids, tw, experts_fp4[s]),
+                )
+        with jax.named_scope(f"slot{s}/combine"):
+            (x,) = combine_call(
+                ctl_s, slots, x, y.reshape(T * K, c.expert_hidden), tw, *weights
+            )
+        routes.append((ids, tw))
+    return (x, pools, routes) if scratch else (x, pools)

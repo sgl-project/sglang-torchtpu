@@ -41,7 +41,7 @@ def config() -> PP.PPConfig:
         expert_hidden=4096, inter=4096, rms_eps=1e-5, post_eps=1e-8, scale_query_by=5.473,
         attn_scale=0.125, router_mult=0.1768, route_scale=1.0, router_eps=1e-15, window=2048,
         rows=T, slots=len(KINDS) + 1, page=256, pages_per_seq=64, global_pages=65,
-        swa_pages=27, slab_rows=2048, max_position=16384, global_slots=(2,),
+        swa_pages=27, max_position=16384, global_slots=(2,),
     )  # fmt: skip
 
 
@@ -82,7 +82,7 @@ def _tiles(w, tn):
 
 
 def build_weights(c: PP.PPConfig, seed: int):
-    S, H, He, E, ti = c.slots, c.hidden, c.expert_hidden, c.n_experts, c.ti
+    S, H, He, E = c.slots, c.hidden, c.expert_hidden, c.n_experts
     qd, kvd, nq = c.q_dim, c.kv_dim, c.qkvg_dim
     dense = {
         "wqkvg": [],
@@ -129,35 +129,31 @@ def build_weights(c: PP.PPConfig, seed: int):
             )
         dense["vecs"].append(vec)
     w = {n: jnp.stack(v) for n, v in dense.items()}
-    shapes = PP.weight_shapes(c)
-    w["w13"] = jax.lax.bitcast_convert_type(
-        _hash(shapes["w13"][0], seed + 1), jnp.int32
-    )
-    w["w2"] = jax.lax.bitcast_convert_type(_hash(shapes["w2"][0], seed + 2), jnp.int32)
-    # fp8 slots hold e4m3 bytes with the top exponent bit clear
-    s13 = jnp.zeros(shapes["s13"][0], jnp.bfloat16)
-    s2 = jnp.zeros(shapes["s2"][0], jnp.bfloat16)
-    woff = soff = 0
-    for l, kind in enumerate(KINDS):
-        wr, sr = PP.expert_rows(kind, He)
-        if kind == "fp8":
-            for name in ("w13", "w2"):
-                blk = w[name][:, :, woff : woff + wr]
-                w[name] = (
-                    w[name].at[:, :, woff : woff + wr].set(blk & jnp.int32(-1077952577))
-                )  # 0xBFBFBFBF
-            b13, b2 = 1.0 / (_FP8_RMS * He**0.5), 1.0 / (_FP8_RMS * c.inter**0.5)
+    # NVFP4 experts per slot (random e2m1 codes, bf16 block scales paired into int32 words)
+    # and the stage's fp8 set (e4m3 bytes, top exponent bit clear; f32 channel scales)
+    w["fp4"] = []
+    for s in range(c.slots):
+        arrs = []
+        for j, (shape, dt) in enumerate(PP.expert_shapes(c, "fp4")):
+            salt = seed + 100 * s + j
+            if dt == jnp.uint8:
+                arrs.append((_hash(shape, salt) & 0xFF).astype(jnp.uint8))
+            else:
+                k = He if j == 1 else c.inter
+                sc = (1.0 + 0.5 * _unit((*shape, 2), salt)) / (_E2M1_RMS * k**0.5)
+                arrs.append(
+                    jax.lax.bitcast_convert_type(sc.astype(jnp.bfloat16), jnp.int32)
+                )
+        w["fp4"].append(tuple(arrs))
+    arrs = []
+    for j, (shape, dt) in enumerate(PP.expert_shapes(c, "fp8")):
+        salt = seed + 900 + j
+        if dt == PP.FP8:
+            arrs.append(_fp8_matrix(shape, salt))
         else:
-            b13, b2 = 1.0 / (_E2M1_RMS * He**0.5), 1.0 / (_E2M1_RMS * c.inter**0.5)
-        r13 = (1.0 + 0.5 * _unit((E, s13.shape[1], sr, ti), seed + 10 + l)) * b13
-        r2 = (1.0 + 0.5 * _unit((E, s2.shape[1], sr, ti), seed + 20 + l)) * b2
-        if kind == "fp8":  # one channelwise row, repeated over the tile
-            r13 = jnp.broadcast_to(r13[:, :, :1], r13.shape)
-            r2 = jnp.broadcast_to(r2[:, :, :1], r2.shape)
-        s13 = s13.at[:, :, soff : soff + sr].set(r13.astype(jnp.bfloat16))
-        s2 = s2.at[:, :, soff : soff + sr].set(r2.astype(jnp.bfloat16))
-        woff, soff = woff + wr, soff + sr
-    w["s13"], w["s2"] = s13, s2
+            k = He if j == 1 else c.inter
+            arrs.append((1.0 + 0.2 * _unit(shape, salt)) / (_FP8_RMS * k**0.5))
+    w["fp8"] = tuple(arrs)
     return w
 
 
@@ -168,22 +164,16 @@ def rope_table(n):
         [np.repeat(np.cos(ang), 2, 1), np.repeat(np.sin(ang), 2, 1)], 1), jnp.float32)  # fmt: skip
 
 
-def _dq4(words, scales):
-    """[r, n] i32 words + [r / 2, n] bf16 -> [8 r, n] f32: nibble j of word w is row 8 w + j."""
-    sh = jnp.arange(0, 32, 4, dtype=jnp.uint32)[None, :, None]
-    codes = (jax.lax.bitcast_convert_type(words, jnp.uint32)[:, None, :] >> sh) & 0xF
-    v = _E2M1[codes.astype(jnp.int32)].reshape(words.shape[0] * 8, words.shape[1])
-    return v * jnp.repeat(scales.astype(jnp.float32), 16, axis=0)
-
-
-def _dq8(words):
-    """[r, n] i32 -> [4 r, n] f32: byte i of word w is row 4 w + i."""
-    sh = jnp.arange(0, 32, 8, dtype=jnp.uint32)[None, :, None]
-    b = (
-        (jax.lax.bitcast_convert_type(words, jnp.uint32)[:, None, :] >> sh) & 0xFF
-    ).astype(jnp.uint8)
-    return jax.lax.bitcast_convert_type(b, jnp.float8_e4m3fn).astype(jnp.float32).reshape(
-        words.shape[0] * 4, words.shape[1])  # fmt: skip
+def _dq4(packed, scales):
+    """[K / 2, N] u8 e2m1 pairs (low nibble row 2b) + [K / 32, N] i32 bf16-scale pairs (low half
+    block 2j) -> [K, N] f32."""
+    codes = jnp.stack([packed & 0xF, packed >> 4], axis=1).reshape(-1, packed.shape[1])
+    v = _E2M1[codes.astype(jnp.int32)]
+    u = jax.lax.bitcast_convert_type(scales, jnp.uint32)
+    halves = jnp.stack([u & 0xFFFF, u >> 16], axis=1).astype(jnp.uint16)
+    sc = jax.lax.bitcast_convert_type(halves, jnp.bfloat16).astype(jnp.float32)
+    sc = sc.reshape(-1, packed.shape[1])  # [K / 16, N]
+    return v * jnp.repeat(sc, 16, axis=0)
 
 
 def _untile(t):
@@ -288,7 +278,7 @@ def ref_post(c, w, l, x, yn, tw):
     )
 
 
-def ref_layer(c, w, l, x, pool, table, rope, kernel_ids):
+def ref_layer(c, w, l, x, pool, table, rope, kernel_ids, slot):
     """One layer: (stream out, chunk K, chunk V, rows whose top-k flipped, the worst flipped
     row's biased-score gap between its picks' minimum and the best unpicked score)."""
     attn = jax.jit(ref_attn, static_argnums=(0, 2))
@@ -300,7 +290,7 @@ def ref_layer(c, w, l, x, pool, table, rope, kernel_ids):
         biased).max(1)  # fmt: skip
     gap = float(jnp.where(same, -jnp.inf, unpicked - picked).max())
     x, xe, ids, tw, k8, v8, _ = attn(c, w, l, x, pool, table, rope, kernel_ids)
-    yn = expert_outputs(c, w, l, xe, ids)
+    yn = expert_outputs(c, w, l, xe, ids, slot)
     return (
         jax.jit(ref_post, static_argnums=(0, 2))(c, w, l, x, yn, tw),
         k8,
@@ -310,47 +300,33 @@ def ref_layer(c, w, l, x, pool, table, rope, kernel_ids):
     )
 
 
-def expert_outputs(c, w, l, xe, ids, cap=96):
+def expert_outputs(c, w, l, xe, ids, slot, cap=96):
     """Normalized outputs [T, K, He] of each (token, slot)'s expert, at most cap rows each."""
-    He, E, ti = c.expert_hidden, c.n_experts, c.ti
-    nti = c.inter // ti
+    He, E = c.expert_hidden, c.n_experts
     kind = KINDS[l]
-    woff = sum(PP.expert_rows(k, He)[0] for k in KINDS[:l])
-    soff = sum(PP.expert_rows(k, He)[1] for k in KINDS[:l])
-    wr, sr = PP.expert_rows(kind, He)
     pew = w["vecs"][l][PP.V["post_expert_w"], :He]
     hit = ids[:, :, None] == jnp.arange(E)[None, None, :]  # [T, K, E]
     rows_hit = hit.any(1)  # [T, E]
     assert int(rows_hit.sum(0).max()) <= cap, int(rows_hit.sum(0).max())
+    ex = w["fp8"] if kind == "fp8" else w["fp4"][slot]
 
     def one(e, w13, s13, w2, s2, xe, hit_e):
-        ww = {"w13": w13, "s13": s13, "w2": w2, "s2": s2}
-
-        def mat(name_w, name_s, tiles):
-            ws = ww[name_w][e][tiles, woff : woff + wr]
-            ss = ww[name_s][e][tiles, soff : soff + sr]
-            if kind == "fp8":
-                m = jax.vmap(_dq8)(ws) * ss[:, :1].astype(jnp.float32)
-            else:
-                m = jax.vmap(_dq4)(ws, ss)
-            return m  # [n_tiles, K, ti]
-
-        g = jnp.concatenate(list(mat("w13", "s13", jnp.arange(nti))), axis=1)
-        up = jnp.concatenate(list(mat("w13", "s13", nti + jnp.arange(nti))), axis=1)
-        dn = jnp.concatenate(list(mat("w2", "s2", jnp.arange(He // ti))), axis=1)
+        if kind == "fp8":
+            g13 = w13[e].astype(jnp.float32) * s13[e, 0]
+            d2 = w2[e].astype(jnp.float32) * s2[e, 0]
+        else:
+            g13, d2 = _dq4(w13[e], s13[e]), _dq4(w2[e], s2[e])
         idx = jnp.nonzero(hit_e, size=cap, fill_value=T)[0]
         xr = jnp.concatenate([xe, jnp.zeros((1, He))])[idx]
-        gu, uu = _dot(xr, g), _dot(xr, up)
-        h = _bf(gu * jax.nn.sigmoid(gu) * uu)
-        y = _bf(_dot(h, dn))
+        gu = _dot(xr, g13)
+        h = _bf(gu[:, : c.inter] * jax.nn.sigmoid(gu[:, : c.inter]) * gu[:, c.inter :])
+        y = _bf(_dot(h, d2))
         return idx, _bf(_rms(y * pew, c.post_eps))
 
     out = jnp.zeros((T + 1, E, He), jnp.bfloat16)  # bf16 values: exact
     run = jax.jit(one)
     for e in range(E):
-        idx, ye = run(
-            jnp.int32(e), w["w13"], w["s13"], w["w2"], w["s2"], xe, rows_hit[:, e]
-        )
+        idx, ye = run(jnp.int32(e), *ex, xe, rows_hit[:, e])
         out = out.at[idx, e].set(ye.astype(jnp.bfloat16))
     return jnp.take_along_axis(out[:T], ids[:, :, None], axis=1).astype(jnp.float32)
 
@@ -386,10 +362,9 @@ def main() -> int:
         layers = tuple(range(len(KINDS)))
         full = PP.slot_table(c, 0, layers, KINDS, tuple(l for l in layers if GLOBAL[l]))
         first = c.global_slots[0] - GLOBAL.index(True)  # the slot of layer 0
-        dense = ("wqkvg", "wo", "wpool", "wunpool", "wrouter", "vecs")
-        w_ref = {k: (v[first:] if k in dense else v) for k, v in w.items()}
+        w_ref = {k: (v[first:] if k in PP.WEIGHT_ORDER else v) for k, v in w.items()}
 
-        def run(tab, x0, rope, weights, pools, tables):
+        def run(tab, x0, rope, weights, ex4, ex8, pools, tables):
             return PP.stage_forward(
                 c,
                 jnp.array([CTX, -1], jnp.int32),
@@ -397,6 +372,8 @@ def main() -> int:
                 x0,
                 rope,
                 weights,
+                ex4,
+                ex8,
                 pools,
                 jnp.array([CTX + T], jnp.int32),
                 tables,
@@ -411,7 +388,16 @@ def main() -> int:
         weights = [w[k] for k in PP.WEIGHT_ORDER]
 
         def call(tab):
-            return jitted(tab, x0, rope, weights, pools, (tables[True], tables[False]))
+            return jitted(
+                tab,
+                x0,
+                rope,
+                weights,
+                w["fp4"],
+                w["fp8"],
+                pools,
+                (tables[True], tables[False]),
+            )
 
         ok = True
         x_prev = x0
@@ -419,13 +405,13 @@ def main() -> int:
             tab = full.copy()
             for s in range(first + n, c.slots):
                 tab[PP.HDR + s * PP.NF + PP.F_VALID] = 0
-            x_k, pools_k, posts = call(jnp.asarray(tab))
+            x_k, pools_k, routes = call(jnp.asarray(tab))
             l = n - 1
-            kernel_ids = posts[first + l][1].reshape(T, c.top_k)
+            kernel_ids = routes[first + l][0][:, : c.top_k]
             pool, kpool = pools[first + l], pools_k[first + l]
             table = tables[GLOBAL[l]]
             x_r, k8, v8, flipped, gap = ref_layer(
-                c, w_ref, l, x_prev, pool, table, rope, kernel_ids
+                c, w_ref, l, x_prev, pool, table, rope, kernel_ids, first + l
             )
             rel = jnp.linalg.norm(x_k - x_r, axis=1) / jnp.linalg.norm(x_r, axis=1)
             kk, vv = pool_tokens(kpool, table, CTX + T)
