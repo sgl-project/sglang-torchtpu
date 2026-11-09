@@ -30,8 +30,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.muse_megakernel.kernel import (
-    _fp4_dot,
-    _fp8_dot,
+    _dequant_fp4,
     _heads_rms,
     _rms,
     _topk_iter,
@@ -110,6 +109,9 @@ class PPConfig(msgspec.Struct, frozen=True, kw_only=True):
     tq: int = 128
     rb: int = 256
     ti: int = 512
+    # pool pages per attention step, and steps of them in flight
+    kb: int = 2
+    kv_bufs: int = 3
 
     @property
     def q_dim(self) -> int:
@@ -161,6 +163,8 @@ class PPConfig(msgspec.Struct, frozen=True, kw_only=True):
             (self.n_experts <= 2 * LANE and self.n_experts % LANE == 0, "router lanes"),
             (self.top_k <= 16 and (T * self.top_k) % LANE == 0, "routing table"),
             (self.q_heads % self.kv_heads == 0, "GQA"),
+            (self.kv_bufs >= 2 and self.kb >= 1, "attention pipeline"),
+            (self.rb % 64 == 0 and He % 512 == 0 and self.ti % 256 == 0, "MoE chunks"),
         ]
         bad = [why for ok, why in checks if not ok]
         if bad:
@@ -325,7 +329,10 @@ def stage_call(c: PPConfig, debug: bool = False):
     w8, _ = expert_rows("fp8", He)
     moe_w, moe_s = _moe_rows(c)
     wr_rows = max(H, qd, He, 4 * moe_w)
+    MC = 64  # MoE rows per matmul chunk: chunks past an expert's rows are skipped
     M = gq * tq  # attention rows: a q tile's heads of one kv head, stacked
+    kb, n_kvbuf = c.kb, c.kv_bufs
+    q_fold = float(np.log2(c.attn_scale)).is_integer()
     tok_per_grp = tm // K
     slots_n = T * K
     S = c.slots
@@ -336,7 +343,7 @@ def stage_call(c: PPConfig, debug: bool = False):
         _kvs_in,
         x_out, kvg, kvs, q_h, g_h, kvt_h, a_h, xe_h, ids_h, tw_h, y_h,
         xbuf, accbuf, abuf, pbuf, wbuf, sbuf, vec_v, wr_v, rope_v, rope8, kvtile, otile,
-        idp_v, tw_v, qs_v, acc_v, l_v, kvp, qt_v, gt_v, at_v,
+        idp_v, tw_v, qs_v, acc_v, kvp, qt_v, gt_v, at_v, wdq, xgb, gu_v, hb_v,
         ids_s, cnt_s, off_s, fill_s, lst_s, ite_s, itb_s, misc_s,
         sem_x, sem_w, sem_o, sem_kv, sem_m, sem_g, sem_y,
     ):  # fmt: skip
@@ -495,24 +502,31 @@ def stage_call(c: PPConfig, debug: bool = False):
                 ).wait()
 
         def attention(is_g, pidx, ctx):
-            def kv_cp(h, p, b, pool, table):
-                src = pool_words(pool, pidx, table[p]).at[pl.ds(2 * h * wph, 2 * wph)]
-                return pltpu.make_async_copy(src, kvp.at[b], sem_kv.at[b])
+            def kv_cp(h, p, b, j, pool, table):
+                page = table[jnp.minimum(p, c.pages_per_seq - 1)]
+                src = pool_words(pool, pidx, page).at[pl.ds(2 * h * wph, 2 * wph)]
+                return pltpu.make_async_copy(src, kvp.at[b, j], sem_kv.at[b])
 
-            def kv_start(h, p, b):
-                @pl.when(is_g != 0)
-                def _():
-                    kv_cp(h, p, b, kvg, pf).start()
+            def kv_start(h, p0, b):
+                """The kb pages from p0 on (past the table's end: its last page, masked)."""
+                for j in range(kb):
 
-                @pl.when(is_g == 0)
-                def _():
-                    kv_cp(h, p, b, kvs, psw).start()
+                    @pl.when(is_g != 0)
+                    def _(j=j):
+                        kv_cp(h, p0 + j, b, j, kvg, pf).start()
+
+                    @pl.when(is_g == 0)
+                    def _(j=j):
+                        kv_cp(h, p0 + j, b, j, kvs, psw).start()
 
             def kv_wait(b):
-                kv_cp(0, 0, b, kvg, pf).wait()
+                for j in range(kb):
+                    kv_cp(0, 0, b, j, kvg, pf).wait()
 
             def a_cp(dst):
                 return pltpu.make_async_copy(at_v, dst, sem_m.at[4])
+
+            ones = jnp.ones((hd, kb * ps), BF16)
 
             def unit(u, carry):
                 qi, h = u // nkv, u % nkv
@@ -530,53 +544,77 @@ def stage_call(c: PPConfig, debug: bool = False):
                 cg.start()
                 lo = jnp.where(is_g != 0, 0, jnp.maximum(q0 - (W - 1), 0))
                 p_lo, p_hi = lo // ps, last // ps
-                kv_start(h, p_lo, 0)
+                n_blk = (p_hi - p_lo) // kb + 1
+                for i in range(n_kvbuf - 1):
+
+                    @pl.when(i < n_blk)
+                    def _(i=i):
+                        kv_start(h, p_lo + i * kb, i)
+
                 cq.wait()
                 qt = qt_v[...]
+                if q_fold:
+                    qt = (qt.astype(F32) * c.attn_scale).astype(
+                        BF16
+                    )  # exact: a power of 2
                 qs_v[...] = jnp.concatenate(
                     [qt[:, g * hd : (g + 1) * hd] for g in range(gq)], 0
                 )
                 acc_v[...] = jnp.zeros(acc_v.shape, F32)
-                l_v[...] = jnp.zeros(l_v.shape, F32)
 
-                def page(p, cc):
-                    b = (p - p_lo) % 2
+                def block(i, cc):
+                    b = i % n_kvbuf
                     kv_wait(b)
 
-                    @pl.when(p + 1 <= p_hi)
+                    @pl.when(i + n_kvbuf - 1 < n_blk)
                     def _():
-                        kv_start(h, p + 1, 1 - b)
+                        kv_start(
+                            h,
+                            p_lo + (i + n_kvbuf - 1) * kb,
+                            (i + n_kvbuf - 1) % n_kvbuf,
+                        )
 
                     kw = kvp[b]
-                    k8 = pltpu.bitcast(kw[:wph], FP8)  # [hd, ps], tokens on lanes
-                    v8 = pltpu.bitcast(kw[wph:], FP8)
-                    s = jnp.dot(qs_v[...], k8.astype(BF16), preferred_element_type=F32)
-                    s = s * c.attn_scale
-                    kp0 = p * ps
-                    need = (kp0 + ps - 1 > q0) | ((is_g == 0) & (kp0 <= last - W))
+                    k = jnp.concatenate(
+                        [
+                            pltpu.bitcast(kw[j, :wph], FP8).astype(BF16)
+                            for j in range(kb)
+                        ],
+                        1,
+                    )  # [hd, kb * ps], tokens on lanes
+                    v = jnp.concatenate(
+                        [
+                            pltpu.bitcast(kw[j, wph:], FP8).astype(BF16)
+                            for j in range(kb)
+                        ],
+                        1,
+                    )
+                    s = jnp.dot(qs_v[...], k, preferred_element_type=F32)
+                    if not q_fold:
+                        s = s * c.attn_scale
+                    kp0 = (p_lo + i * kb) * ps
+                    need = (kp0 + kb * ps - 1 > q0) | ((is_g == 0) & (kp0 <= last - W))
 
                     def masked():
-                        r = jax.lax.broadcasted_iota(jnp.int32, (M, ps), 0)
+                        r = jax.lax.broadcasted_iota(jnp.int32, (M, kb * ps), 0)
                         qp = q0 + r % tq
-                        kp = kp0 + jax.lax.broadcasted_iota(jnp.int32, (M, ps), 1)
+                        kp = kp0 + jax.lax.broadcasted_iota(jnp.int32, (M, kb * ps), 1)
                         live = (kp <= qp) & ((is_g != 0) | (qp - kp < W))
                         return jnp.where(live, jnp.exp(s), 0.0)
 
                     pexp = jax.lax.cond(need, masked, lambda: jnp.exp(s))
-                    lsum = l_v[...]
-                    for lt in range(ps // LANE):
-                        lsum = lsum + pexp[:, lt * LANE : (lt + 1) * LANE]
-                    l_v[...] = lsum
+                    # rows of ones under V: lanes hd onward of the product are the row sums
                     acc_v[...] += jax.lax.dot_general(
                         pexp.astype(BF16),
-                        v8.astype(BF16),
+                        jnp.concatenate([v, ones], 0),
                         (((1,), (1,)), ((), ())),
                         preferred_element_type=F32,
                     )
                     return cc
 
-                jax.lax.fori_loop(p_lo, p_hi + 1, page, 0)
-                out = acc_v[...] / jnp.sum(l_v[...], axis=1, keepdims=True)
+                jax.lax.fori_loop(0, n_blk, block, 0)
+                acc = acc_v[...]
+                out = acc[:, :hd] / acc[:, hd : hd + 1]
                 o = jnp.concatenate(
                     [out[g * tq : (g + 1) * tq] for g in range(gq)], axis=1
                 )
@@ -909,6 +947,14 @@ def stage_call(c: PPConfig, debug: bool = False):
                 def _():
                     gather_wait(gb)
                     pbuf[...] = jnp.zeros(pbuf.shape, F32)
+                    x_rows = xg(gb)
+
+                    def to_bf16(r, cc):
+                        rr = pl.ds(pl.multiple_of(r * sub, sub), sub)
+                        xgb[rr, :] = x_rows[rr, :].astype(BF16)
+                        return cc
+
+                    jax.lax.fori_loop(0, rb // sub, to_bf16, 0)
 
                     @pl.when(item + 1 < n_items)
                     def _():
@@ -920,74 +966,98 @@ def stage_call(c: PPConfig, debug: bool = False):
                 def _():
                     w_issue(idx + 1, 1 - b, False)
 
-                x_ref = xg(gb)
+                n_rows = block(item)[1]
 
-                def lhs(c8, n8, _fp8_lhs):
-                    return x_ref[:, pl.ds(c8 * 8, n8 * 8)].astype(BF16)
+                def dq_fp4(words, scales, k_rows, row0):
+                    """[k_rows / 8, ti] words + scales -> bf16 rows [row0, row0 + k_rows)."""
+                    for c0 in range(0, k_rows // 8, 32):
+                        wdq[pl.ds(row0 + c0 * 8, 256), :] = _dequant_fp4(
+                            words[pl.ds(c0, 32), :], scales[pl.ds(c0 // 2, 16), :]
+                        )
+
+                def dq_fp8(words, k_rows, row0):
+                    for c0 in range(0, k_rows // 4, 128):
+                        wdq[pl.ds(row0 + c0 * 4, 512), :] = pltpu.bitcast(
+                            words[pl.ds(c0, 128), :], FP8
+                        ).astype(BF16)
+
+                def live_chunks(fn):
+                    for rc in range(rb // MC):
+
+                        @pl.when(rc * MC < n_rows)
+                        def _(rc=rc):
+                            fn(pl.ds(rc * MC, MC))
+
+                def gate_up(i):
+                    def rows_mm(rr):
+                        acc = None
+                        for k0 in range(0, He, 512):
+                            part = jnp.dot(
+                                xgb[rr, pl.ds(k0, 512)],
+                                wdq[pl.ds(k0, 512), :],
+                                preferred_element_type=F32,
+                            )
+                            acc = part if acc is None else acc + part
+                        gu_v[i, rr, :] = acc
+
+                    live_chunks(rows_mm)
+
+                def down(scale_of):
+                    def rows_mm(rr):
+                        hb = hb_v[rr, :]
+                        for cc in range(npc):
+                            part = jnp.dot(
+                                hb,
+                                wdq[pl.ds(cc * ti, ti), :],
+                                preferred_element_type=F32,
+                            )
+                            sc = scale_of(cc)
+                            pbuf[rr, rows(cc, ti)] += part if sc is None else part * sc
+
+                    live_chunks(rows_mm)
+
+                def silu_mul(sg, su):
+                    def rows_h(rr):
+                        g, u = gu_v[0, rr, :], gu_v[1, rr, :]
+                        if sg is not None:
+                            g, u = g * sg, u * su
+                        hb_v[rr, :] = (g * jax.nn.sigmoid(g) * u).astype(BF16)
+
+                    live_chunks(rows_h)
+
+                w = wv(b)
 
                 @pl.when(is_f8 == 0)
                 def _():
-                    w = wv(b)
-                    g = _fp4_dot(
-                        None,
-                        w.at[pl.ds(0, w4)],
-                        sbuf.at[b, pl.ds(0, s4)],
-                        He,
-                        ti,
-                        32,
-                        fast_bf16=True,
-                        lhs_chunk_fn=lhs,
-                        nrows=rb,
-                    )
-                    u = _fp4_dot(
-                        None,
-                        w.at[pl.ds(w4, w4)],
-                        sbuf.at[b, pl.ds(s4, s4)],
-                        He,
-                        ti,
-                        32,
-                        fast_bf16=True,
-                        lhs_chunk_fn=lhs,
-                        nrows=rb,
-                    )
-                    hdn = (g * jax.nn.sigmoid(g) * u).astype(BF16)
+                    dq_fp4(w.at[pl.ds(0, w4)], sbuf.at[b, pl.ds(0, s4)], He, 0)
+                    gate_up(0)
+                    dq_fp4(w.at[pl.ds(w4, w4)], sbuf.at[b, pl.ds(s4, s4)], He, 0)
+                    gate_up(1)
+                    silu_mul(None, None)
                     for cc in range(npc):
-                        wp = w.at[pl.ds(2 * w4 + cc * (ti // 8), ti // 8)]
-                        sp = sbuf.at[b, pl.ds(2 * s4 + cc * (ti // 16), ti // 16)]
-                        pbuf[:, rows(cc, ti)] += _fp4_dot(
-                            hdn, wp, sp, ti, ti, 32, fast_bf16=True
+                        dq_fp4(
+                            w.at[pl.ds(2 * w4 + cc * (ti // 8), ti // 8)],
+                            sbuf.at[b, pl.ds(2 * s4 + cc * (ti // 16), ti // 16)],
+                            ti,
+                            cc * ti,
                         )
+                    down(lambda cc: None)
 
                 @pl.when(is_f8 != 0)
                 def _():
-                    w = wv(b)
-                    sg = sbuf[b, pl.ds(0, 1), :].astype(F32)
-                    su = sbuf[b, pl.ds(FP8_SCALE_ROWS, 1), :].astype(F32)
-                    g = _fp8_dot(
-                        None,
-                        w.at[pl.ds(0, w8)],
-                        sg,
-                        He,
-                        ti,
-                        64,
-                        lhs_chunk_fn=lhs,
-                        nrows=rb,
-                    )
-                    u = _fp8_dot(
-                        None,
-                        w.at[pl.ds(w8, w8)],
-                        su,
-                        He,
-                        ti,
-                        64,
-                        lhs_chunk_fn=lhs,
-                        nrows=rb,
-                    )
-                    hdn = (g * jax.nn.sigmoid(g) * u).astype(BF16)
+                    def srow(r):
+                        return sbuf[b, pl.ds(r * FP8_SCALE_ROWS, 1), :].astype(F32)
+
+                    dq_fp8(w.at[pl.ds(0, w8)], He, 0)
+                    gate_up(0)
+                    dq_fp8(w.at[pl.ds(w8, w8)], He, 0)
+                    gate_up(1)
+                    silu_mul(srow(0), srow(1))
                     for cc in range(npc):
-                        wp = w.at[pl.ds(2 * w8 + cc * (ti // 4), ti // 4)]
-                        sp = sbuf[b, pl.ds((2 + cc) * FP8_SCALE_ROWS, 1), :].astype(F32)
-                        pbuf[:, rows(cc, ti)] += _fp8_dot(hdn, wp, sp, ti, ti, 64)
+                        dq_fp8(
+                            w.at[pl.ds(2 * w8 + cc * (ti // 4), ti // 4)], ti, cc * ti
+                        )
+                    down(lambda cc: srow(2 + cc))
 
                 @pl.when(j == nti - 1)
                 def _():
@@ -1157,12 +1227,15 @@ def stage_call(c: PPConfig, debug: bool = False):
         vmem((tm // (LANE // K), LANE), jnp.int32),  # idp_v
         vmem((tm, LANE), F32),  # tw_v
         vmem((M, hd), BF16),  # qs_v
-        vmem((M, hd), F32),  # acc_v
-        vmem((M, LANE), F32),  # l_v
-        vmem((2, 2 * wph, ps), jnp.uint32),  # kvp
+        vmem((M, 2 * hd), F32),  # acc_v: P V, then the row sums
+        vmem((n_kvbuf, kb, 2 * wph, ps), jnp.uint32),  # kvp
         vmem((tq, gq * hd), BF16),
         vmem((tq, gq * hd), BF16),
         vmem((tq, gq * hd), BF16),
+        vmem((He, ti), BF16),  # wdq: a dequantized expert tile (w2: its pieces stacked)
+        vmem((rb, He), BF16),  # xgb: the gathered rows as matmul input
+        vmem((2, rb, ti), F32),  # gu_v: gate and up projections
+        vmem((rb, ti), BF16),  # hb_v
         smem_t((slots_n // LANE, LANE), jnp.int32),  # ids_s
         smem_t((E,), jnp.int32),
         smem_t((E,), jnp.int32),
@@ -1174,7 +1247,7 @@ def stage_call(c: PPConfig, debug: bool = False):
         dma((3,)),
         dma((2,)),
         dma((2,)),
-        dma((2,)),
+        dma((n_kvbuf,)),
         dma((8,)),
         dma((2,)),
         dma((2,)),
