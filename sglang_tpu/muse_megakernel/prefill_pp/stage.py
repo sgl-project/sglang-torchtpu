@@ -11,6 +11,7 @@ from sglang_tpu.muse_megakernel.prefill_pp.config import (
     HDR,
     NF,
     PPConfig,
+    balanced_routing,
     skipped_phases,
 )
 from sglang_tpu.muse_megakernel.prefill_pp.dense import stage_calls
@@ -65,6 +66,10 @@ def stage_forward(
                 )
         with jax.named_scope(f"slot{s}/route"):
             x, xe, ids, tw = route_call(ctl_s, slots, x, o, g, *weights)
+            if balanced_routing():
+                t = jax.lax.broadcasted_iota(jnp.int32, ids.shape, 0)
+                k = jax.lax.broadcasted_iota(jnp.int32, ids.shape, 1)
+                ids = jnp.where(k < K, (t * K + k) % c.n_experts, ids)
         with jax.named_scope(f"slot{s}/experts"):
             if "experts" in skip:
                 y = moe.no_experts(c)

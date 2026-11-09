@@ -202,6 +202,12 @@ def pool_shape(c: PPConfig, pages: int) -> tuple[int, ...]:
     return (pages, 2 * c.kv_heads, c.head_dim // 4, 4, c.page)
 
 
+def balanced_routing() -> bool:
+    """MUSE_PP_BALANCED_ROUTING=1: timing control only (wrong numerics), token t's slot k goes
+    to expert (t * top_k + k) % E, every expert the same rows, whatever the router picked."""
+    return os.environ.get("MUSE_PP_BALANCED_ROUTING", "0") not in ("", "0")
+
+
 def skipped_phases() -> frozenset[str]:
     """MUSE_PP_SKIP=a,b: timing ablation only (wrong numerics), those phases do not run."""
     skip = frozenset(p for p in os.environ.get("MUSE_PP_SKIP", "").split(",") if p)
