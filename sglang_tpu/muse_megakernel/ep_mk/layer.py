@@ -470,34 +470,40 @@ def _combine(step: EPLayerStep, win) -> None:
 
 
 def _stream_rows(c: MKConfig, S: dict):
-    """(load(row0, n), store(row0, rows)) on S["h_stream"]: VMEM with tiled_vmem_pads, else
-    HBM through the row-tile staging S["sin"][0] (n <= row_tile)."""
-    hs = S["h_stream"]
+    """(load(row0, n), rows(row0, n, fn)) on S["h_stream"]: VMEM with tiled_vmem_pads, else
+    HBM through the row-tile staging S["sin"][0]. load: n <= row_tile rows as a value;
+    rows: fn(view, t0, m) on each row tile [row0 + t0, row0 + t0 + m) as a ref, written back
+    (HBM: one copy each way per tile, not per row)."""
+    hs, RT = S["h_stream"], c.row_tile
     if c.tiled_vmem_pads:
 
         def load_v(r0, n):
             return hs[pl.ds(r0, n), :]
 
-        def store_v(r0, v):
-            hs[pl.ds(r0, v.shape[0]), :] = v
+        def rows_v(r0, n, fn):
+            for t0 in range(0, n, RT):
+                fn(hs.at[pl.ds(r0 + t0, min(RT, n - t0))], t0, min(RT, n - t0))
 
-        return load_v, store_v
+        return load_v, rows_v
     stage, sem = S["sin"].at[0], S["ep_misc_sems"].at[3]
 
-    def load(r0, n):
-        cp = pltpu.make_async_copy(hs.at[pl.ds(r0, n)], stage.at[pl.ds(0, n)], sem)
+    def copy(src, dst):
+        cp = pltpu.make_async_copy(src, dst, sem)
         cp.start()
         cp.wait()
+
+    def load(r0, n):
+        copy(hs.at[pl.ds(r0, n)], stage.at[pl.ds(0, n)])
         return stage[pl.ds(0, n), :]
 
-    def store(r0, v):
-        n = v.shape[0]
-        stage[pl.ds(0, n), :] = v
-        cp = pltpu.make_async_copy(stage.at[pl.ds(0, n)], hs.at[pl.ds(r0, n)], sem)
-        cp.start()
-        cp.wait()
+    def rows(r0, n, fn):
+        for t0 in range(0, n, RT):
+            m = min(RT, n - t0)
+            copy(hs.at[pl.ds(r0 + t0, m)], stage.at[pl.ds(0, m)])
+            fn(stage.at[pl.ds(0, m)], t0, m)
+            copy(stage.at[pl.ds(0, m)], hs.at[pl.ds(r0 + t0, m)])
 
-    return load, store
+    return load, rows
 
 
 def _unpool_residual(step: EPLayerStep, win) -> None:
@@ -523,14 +529,16 @@ def _unpool_residual(step: EPLayerStep, win) -> None:
     )
     fw = S["ep_f"][pl.ds(0, wn), :] * _row(smr, "post_ffn_w", H)
     S["ep_f"][pl.ds(0, wn), :] = _rms(fw, c.post_eps).astype(bf16).astype(f32)
-    load, store = _stream_rows(c, S)
+    _, rows = _stream_rows(c, S)
     alpha, beta = _row(smr, "ffn_alpha", H), _row(smr, "ffn_beta", H)
-    for r in range(
-        0 if _dev_skip("residual") else rc
-    ):  # own rows only: the all-gather fills the others
-        wr = w_off + r
-        branch = S["ep_f"][pl.ds(wr, 1), :]
-        store(w0 + wr, alpha * load(w0 + wr, 1) + beta * branch)
+
+    def residual(v, t0, m):
+        for i in range(m):
+            branch = S["ep_f"][pl.ds(w_off + t0 + i, 1), :]
+            v[pl.ds(i, 1), :] = alpha * v[pl.ds(i, 1), :] + beta * branch
+
+    if not _dev_skip("residual"):  # own rows only: the all-gather fills the others
+        rows(w0 + w_off, rc, residual)
 
 
 def _all_gather_rows(step: EPLayerStep, p: EPPlan) -> None:

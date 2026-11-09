@@ -36,7 +36,7 @@ def o_proj(step: EPOProjStep, p: EPPlan, stream_rows) -> None:
     h_stream = attn_alpha * stream + attn_beta * norm(o) and the window's S["lhs"] =
     pre-FFN-normed stream (own rows real; the window's other rows only feed unused logits).
 
-    stream_rows: (load(row0, n), store(row0, rows)) on S["h_stream"].
+    stream_rows: layer._stream_rows on S["h_stream"].
     """
     c, S, smr, me = step.c, step.S, step.smr, step.me
     tp, H, Hl, rc = c.tp, c.hidden, c.hidden_local, p.rows_own
@@ -81,34 +81,39 @@ def o_proj(step: EPOProjStep, p: EPPlan, stream_rows) -> None:
     for _ in range(n_tiles * (tp - 1)):  # every other rank's block of every column tile
         pltpu.make_async_copy(send.at[0, 0], recv.at[0], rsem).wait()
 
-    load, store = stream_rows
+    _, rows = stream_rows
     a_alpha, a_beta = _row(smr, "attn_alpha", H), _row(smr, "attn_beta", H)
     w0, wn, w_off = window(c, me)
     s_win = S["ep_f"]  # [window, H] f32: own rows' post-attention stream, others zero
     s_win[...] = jnp.zeros((wn, H), f32)
-    for r in range(rc):
-        a = (
-            jnp.concatenate(
-                [
-                    sum(
-                        _unpack_bf16x2(recv[src * tp + col, pl.ds(r, 1), :])
-                        for src in range(tp)
-                    )
-                    for col in range(H // Hl)
-                ],
-                axis=1,
+
+    def residual(v, t0, m):
+        for i in range(m):
+            r = t0 + i
+            a = (
+                jnp.concatenate(
+                    [
+                        sum(
+                            _unpack_bf16x2(recv[src * tp + col, pl.ds(r, 1), :])
+                            for src in range(tp)
+                        )
+                        for col in range(H // Hl)
+                    ],
+                    axis=1,
+                )
+                .astype(bf16)
+                .astype(f32)
+            )  # [1, H]
+            s_a = jax.lax.rsqrt(
+                jnp.mean(jnp.square(a), axis=-1, keepdims=True) + c.post_eps
             )
-            .astype(bf16)
-            .astype(f32)
-        )  # [1, H]
-        s_a = jax.lax.rsqrt(
-            jnp.mean(jnp.square(a), axis=-1, keepdims=True) + c.post_eps
-        )
-        s = a_alpha * load(w0 + w_off + r, 1) + a_beta * (a * s_a).astype(bf16).astype(
-            f32
-        )
-        store(w0 + w_off + r, s)
-        s_win[pl.ds(w_off + r, 1), :] = s
+            s = a_alpha * v[pl.ds(i, 1), :] + a_beta * (a * s_a).astype(bf16).astype(
+                f32
+            )
+            v[pl.ds(i, 1), :] = s
+            s_win[pl.ds(w_off + r, 1), :] = s
+
+    rows(w0 + w_off, rc, residual)
     S["lhs"][pl.ds(w0, wn), :] = _rms(
         s_win[...], c.rms_eps, _row(smr, "pre_ffn_w", H)
     ).astype(bf16)
