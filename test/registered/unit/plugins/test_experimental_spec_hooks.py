@@ -159,6 +159,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         addressing = SimpleNamespace(
             verify_cache_candidates=object(), committed_lens=object()
         )
+        grammar_barrier = MagicMock()
         calls = MagicMock()
         calls.select.return_value = rows
         calls.draft.return_value = drafts
@@ -171,7 +172,9 @@ class TestExperimentalSpecHooks(CustomTestCase):
             patch.object(worker, "_commit_linear_attn_states", calls.linear),
             patch.object(worker, "commit", calls.commit),
         ):
-            result = worker.step(batch, bucket, addressing)
+            result = worker.step(
+                batch, bucket, addressing, grammar_barrier=grammar_barrier
+            )
         self.assertEqual(result, (committed, logits, accept))
         self.assertEqual(
             [entry[0] for entry in calls.mock_calls],
@@ -185,7 +188,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         )
         calls.draft.assert_called_once_with(batch, bucket, rows, addressing)
         calls.verify.assert_called_once_with(
-            batch, bucket, rows, drafts, addressing, grammar_barrier=None
+            batch, bucket, rows, drafts, addressing, grammar_barrier=grammar_barrier
         )
         calls.linear.assert_called_once_with(
             batch=batch, accept=accept, pre_verify_lens=bucket.state.seq_lens
@@ -1693,6 +1696,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
             self.assertIsNone(draft.tpu_verify_cache_candidates)
             worker_factory.return_value = _GrammarBlockSpecWorker
             worker = object.__new__(_GrammarBlockSpecWorker)
+            worker._bsearch_filtering = True
             worker._check_supported(batch=batch, pp_proxy_tensors=None)
             draft.prepare_for_decode(batch)
             plan = TpuSpecVerifyInput.from_batch(batch, num_verify_rows=2, padded_bs=4)
