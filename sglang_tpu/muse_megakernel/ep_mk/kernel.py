@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """The EP decode megakernel: muse_megakernel.kernel's row-tiled program with the EPExperts
-expert section, and the layout its weights take (EP_WEIGHTS)."""
+FFN section (sequence-parallel, two ragged all-to-alls), and the layout of its weights."""
 
 import jax
 import numpy as np
@@ -19,9 +19,10 @@ __all__ = ["ep_expert_shapes", "ep_expert_weights", "ep_megakernel_call", "poole
 
 
 def ep_megakernel_call(cfg: MKConfig, axis: str = "model"):
-    """megakernel_call's f(meta, pos, pages_full, pages_swa, emb, *weights, *experts, *kv) with
-    each layer's experts as ep_expert_shapes (ep_expert_weights) and the pooled width in
-    pooled_perm order (wpool's output columns, wpool_s and pre_expert_w permuted)."""
+    """megakernel_call's f(meta, pos, pages_full, pages_swa, emb, *weights, *experts, *kv), with
+    each layer's experts as ep_expert_shapes (ep_expert_weights), wpool / wunpool replicated
+    ([L, H, H_e] and [L, H_e, H] fp8, their scales whole in the smalls rows) and the pooled
+    width in pooled_perm order (wpool's columns, wpool_s, pre_expert_w)."""
     cfg = ep_mk_config(cfg)
     return megakernel_call(cfg, axis, ep=EPExperts(cfg))
 

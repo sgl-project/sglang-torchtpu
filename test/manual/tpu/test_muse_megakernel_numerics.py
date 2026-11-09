@@ -15,10 +15,10 @@ streams. Run one process per device:
 Rank 0 prints one MK_NUMERICS line per (case, layer) and MK_NUMERICS_PASS when every check
 holds; every rank prints MK_NUMERICS_DONE.
 
---ep runs the EP megakernel (muse_megakernel/ep_mk, row-tiled cases only): each rank gets its
-32 whole experts assembled from the same per-rank slices, in ep_mk's layout, and the pooled
-width permuted as ep_mk.kernel.pooled_perm; fp8 experts then share one w2 column scale across
-slices, as a checkpoint's whole expert does.
+--ep runs the EP megakernel (muse_megakernel/ep_mk, cases of >= 64 rows): each rank gets its
+32 whole experts and the replicated pool / unpool assembled from every rank's slices, in
+ep_mk's layout (the pooled width permuted as ep_mk.kernel.pooled_perm); fp8 experts then share
+one w2 column scale across slices, as a checkpoint's whole expert does.
 """
 
 import argparse
@@ -116,6 +116,14 @@ CASES = {
             24,
             8,
             tuple(900 + 97 * i for i in range(24)),
+            opt_in=True,
+        ),
+        Case(
+            "salfp8_c32q8_s",
+            "sal_fp8",
+            32,
+            8,
+            tuple(900 + 97 * i for i in range(32)),
             opt_in=True,
         ),
         Case(
@@ -510,12 +518,20 @@ class _Runner:
     def _weights(self, max_position: int) -> list:
         K, L = self.K, self.n_layers
         dense = [dense_layer(l, self.rank) for l in range(L)]
-        if _EP:  # the pooled width in pooled_perm order: this rank's columns of it
+        if (
+            _EP
+        ):  # replicated pool / unpool: every rank's slices, the pooled width permuted
             from sglang_tpu.muse_megakernel.ep_mk.kernel import pooled_perm
 
-            kp = torch.from_numpy(pooled_perm(EXPERT_HIDDEN // TP))
-            for d in dense:
-                d["wpool"], d["wpool_s"] = d["wpool"][:, kp], d["wpool_s"][kp]
+            kp = torch.from_numpy(pooled_perm(EXPERT_HIDDEN))
+            for l in range(L):
+                ranks = [dense_layer(l, d) for d in range(TP)]
+                for name in ("wpool", "wunpool"):
+                    w = torch.cat([r[name] for r in ranks], dim=1)
+                    sc = torch.cat([r[name + "_s"] for r in ranks])
+                    if name == "wpool":
+                        w, sc = w[:, kp], sc[kp]
+                    dense[l][name], dense[l][name + "_s"] = w, sc
         smalls = torch.zeros(L, K.SMALL_ROWS, HIDDEN)
         for l in range(L):
             rep = replicated_layer(l)

@@ -92,7 +92,7 @@ from sglang_tpu.muse_megakernel.mk.dots import (  # noqa: F401
     _fp8_dot,
     _scale_rows,
 )
-from sglang_tpu.muse_megakernel.mk.hooks import EPHook, EPMoEStep  # noqa: F401
+from sglang_tpu.muse_megakernel.mk.hooks import EPHook, EPLayerStep  # noqa: F401
 from sglang_tpu.muse_megakernel.mk.numerics import (  # noqa: F401
     _heads_rms,
     _rms,
@@ -4515,48 +4515,42 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     topk_rows(pl.ds(0, R))
                 else:
                     for_tiles(lambda rows, t: topk_rows(rows))
+            with _scope("unique_experts"):
+                n_u = unique_experts(None, l)
+            nslot, W13, W2, S13, S2, start_expert, wait_expert = expert_io_tiled(
+                l, kind, n_u
+            )
+            # ex_kperm >= 3: normalized fp4 block scales, per-expert (gate, up, down) globals
+            gscale_t = c.ex_kperm >= 3 and kind == "fp4"
+            use_gs_smem_t = bool(gscale_t and c.ex_gs_smem and "gs_s" in S)
             gs_cp = None
-            if ep is None:
-                with _scope("unique_experts"):
-                    n_u = unique_experts(None, l)
-                nslot, W13, W2, S13, S2, start_expert, wait_expert = expert_io_tiled(
-                    l, kind, n_u
-                )
-                # ex_kperm >= 3: normalized fp4 block scales, per-expert (gate, up, down) globals
-                gscale_t = c.ex_kperm >= 3 and kind == "fp4"
-                use_gs_smem_t = bool(gscale_t and c.ex_gs_smem and "gs_s" in S)
-                if gscale_t:
-                    gs_mat = jnp.concatenate(
-                        [
-                            smr[SMALL["expert_gs"] : SMALL["expert_gs"] + 1, 0:Ep],
-                            smr[
-                                SMALL["expert_gs"] : SMALL["expert_gs"] + 1, Ep : 2 * Ep
-                            ],
-                            smr[
-                                SMALL["expert_gs_down"] : SMALL["expert_gs_down"] + 1,
-                                0:Ep,
-                            ],
+            if gscale_t:
+                gs_mat = jnp.concatenate(
+                    [
+                        smr[SMALL["expert_gs"] : SMALL["expert_gs"] + 1, 0:Ep],
+                        smr[SMALL["expert_gs"] : SMALL["expert_gs"] + 1, Ep : 2 * Ep],
+                        smr[
+                            SMALL["expert_gs_down"] : SMALL["expert_gs_down"] + 1, 0:Ep
                         ],
-                        axis=0,
-                    )  # [3, Ep]
-                    if use_gs_smem_t:
-                        S["acc"][pl.ds(0, 8), pl.ds(0, Ep)] = jnp.concatenate(
-                            [gs_mat, jnp.zeros((5, Ep), f32)], axis=0
-                        )
-                        gs_cp = pltpu.make_async_copy(
-                            S["acc"].at[pl.ds(0, 8), pl.ds(0, Ep)],
-                            S["gs_s"],
-                            S["route_sem"].at[0],
-                        )
-                        gs_cp.start()
+                    ],
+                    axis=0,
+                )  # [3, Ep]
+                if use_gs_smem_t:
+                    S["acc"][pl.ds(0, 8), pl.ds(0, Ep)] = jnp.concatenate(
+                        [gs_mat, jnp.zeros((5, Ep), f32)], axis=0
+                    )
+                    gs_cp = pltpu.make_async_copy(
+                        S["acc"].at[pl.ds(0, 8), pl.ds(0, Ep)],
+                        S["gs_s"],
+                        S["route_sem"].at[0],
+                    )
+                    gs_cp.start()
             with _scope("pool_ag"):
                 pool_wait()
             if gs_cp is not None:
                 gs_cp.wait()
             pre_w = smr[SMALL["pre_expert_w"] : SMALL["pre_expert_w"] + 1, :He]
-            prequant_x = bool(
-                ep is None and c.ex_lhs_fp8 >= 1 and (c.ex_kperm >= 3 or kind != "fp4")
-            )
+            prequant_x = bool(c.ex_lhs_fp8 >= 1 and (c.ex_kperm >= 3 or kind != "fp4"))
             xsc_ref = S["ids_v"].bitcast(f32)
 
             with _scope("ex_setup"):
@@ -4585,7 +4579,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         return []
 
                     tile_pass([(pad_view(S["pad_pool"]), S["pltile"])], xfull_tile)
-                if vy >= 1 and ep is None:
+                if vy >= 1:
                     if c.combine_loop and R > 64:
                         z_rt = jnp.zeros((RT, K, yw), jnp.uint32)
                         for t in range(R // RT):
@@ -4593,392 +4587,176 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     else:
                         S["ysend"][...] = jnp.zeros((R, K, yw), jnp.uint32)
 
-            if ep is not None:
+            pad_y = S["pad_y"]
+            if vy == 0:
+                y_rsem = S["tc_rsems"].at[tc_rmap["y"]]
+                for b in range(3):
+                    S["ypend"][b] = 0
+                ystage = S["ystage"]
 
-                def ep_for_layer(fn):
-                    """fn(refs, off) on this layer's expert refs: ONE branch-tree walk."""
-                    if isinstance(l, int):
-                        fn(*layer_ex[l])
-                        return
-                    keys = sorted(
-                        {
-                            li if layer_ex[li][1] is None else li - layer_ex[li][1]
-                            for li in kind_layers[kind]
-                        }
+                def ydrain(b):
+                    """Waits for the row DMAs out of ystage[b] (local or remote: same bytes)."""
+                    tmpl = pltpu.make_async_copy(
+                        ystage.at[0, pl.ds(0, 1)],
+                        pad_y.at[0, 0, pl.ds(0, 1)],
+                        S["ystage_sems"].at[b],
                     )
 
-                    def leaf(k):
-                        refs, _ = layer_ex[k]
-                        fn(refs, l - k if k in group_lo else None)
+                    def w(i, carry):
+                        tmpl.wait()
+                        return carry
 
-                    _select(l, keys, leaf)
+                    jax.lax.fori_loop(0, S["ypend"][b], w, 0)
+                    S["ypend"][b] = 0
 
-                ep.moe(
-                    EPMoEStep(
-                        c=c,
-                        S=S,
-                        smr=smr,
-                        layer=l,
-                        kind=kind,
-                        for_layer=ep_for_layer,
-                        wait_refs=layer_ex[
-                            l if isinstance(l, int) else kind_layers[kind][0]
-                        ],
-                        me=me,
-                        n_live=n_live,
-                        flush_dense=ws.flush,
-                    )
+                def yemit(yp, first, n_valid):
+                    n = yp.shape[0]
+                    b = S["ypend"][2] % 2
+                    ydrain(b)
+                    ystage.at[b][pl.ds(0, n), :] = yp
+
+                    def issue(j, carry):
+                        p = rget("perm", first + j)
+                        r, k = p // K, p % K
+                        owner, rl = r // Rc, r % Rc
+                        src = ystage.at[b, pl.ds(j, 1)]
+                        dst = pad_y.at[me, rl, pl.ds(k, 1)]
+
+                        @pl.when(owner == me)
+                        def _():
+                            pltpu.make_async_copy(
+                                src, dst, S["ystage_sems"].at[b]
+                            ).start()
+
+                        @pl.when(owner != me)
+                        def _():
+                            pltpu.make_async_remote_copy(
+                                src_ref=src,
+                                dst_ref=dst,
+                                send_sem=S["ystage_sems"].at[b],
+                                recv_sem=y_rsem,
+                                device_id=(owner,),
+                            ).start()
+
+                        return carry
+
+                    jax.lax.fori_loop(0, n_valid, issue, 0)
+                    S["ypend"][b] = n_valid
+                    S["ypend"][2] = S["ypend"][2] + 1
+
+            def y_block_cp(owner):
+                return rcopy(
+                    S["ysend"].at[pl.ds(pl.multiple_of(owner * Rc, Rc), Rc)],
+                    pad_y.at[me],
+                    owner,
+                    "y",
                 )
-                my_live = me * Rc < n_live  # the u all-gather below reads it
-            else:
-                pad_y = S["pad_y"]
-                if vy == 0:
-                    y_rsem = S["tc_rsems"].at[tc_rmap["y"]]
-                    for b in range(3):
-                        S["ypend"][b] = 0
-                    ystage = S["ystage"]
 
-                    def ydrain(b):
-                        """Waits for the row DMAs out of ystage[b] (local or remote: same bytes)."""
-                        tmpl = pltpu.make_async_copy(
-                            ystage.at[0, pl.ds(0, 1)],
-                            pad_y.at[0, 0, pl.ds(0, 1)],
-                            S["ystage_sems"].at[b],
-                        )
+            if use_pair_y:
+                core_y = me % 2
+                chip_y = me // 2
+                partner_y = jnp.bitwise_xor(me, 1)
+                other_y = 1 - core_y
 
-                        def w(i, carry):
-                            tmpl.wait()
-                            return carry
+                def ysend_blk(rk):
+                    return S["ysend"].at[pl.ds(pl.multiple_of(rk * Rc, Rc), Rc)]
 
-                        jax.lax.fori_loop(0, S["ypend"][b], w, 0)
-                        S["ypend"][b] = 0
-
-                    def yemit(yp, first, n_valid):
-                        n = yp.shape[0]
-                        b = S["ypend"][2] % 2
-                        ydrain(b)
-                        ystage.at[b][pl.ds(0, n), :] = yp
-
-                        def issue(j, carry):
-                            p = rget("perm", first + j)
-                            r, k = p // K, p % K
-                            owner, rl = r // Rc, r % Rc
-                            src = ystage.at[b, pl.ds(j, 1)]
-                            dst = pad_y.at[me, rl, pl.ds(k, 1)]
-
-                            @pl.when(owner == me)
-                            def _():
-                                pltpu.make_async_copy(
-                                    src, dst, S["ystage_sems"].at[b]
-                                ).start()
-
-                            @pl.when(owner != me)
-                            def _():
-                                pltpu.make_async_remote_copy(
-                                    src_ref=src,
-                                    dst_ref=dst,
-                                    send_sem=S["ystage_sems"].at[b],
-                                    recv_sem=y_rsem,
-                                    device_id=(owner,),
-                                ).start()
-
-                            return carry
-
-                        jax.lax.fori_loop(0, n_valid, issue, 0)
-                        S["ypend"][b] = n_valid
-                        S["ypend"][2] = S["ypend"][2] + 1
-
-                def y_block_cp(owner):
-                    return rcopy(
-                        S["ysend"].at[pl.ds(pl.multiple_of(owner * Rc, Rc), Rc)],
-                        pad_y.at[me],
-                        owner,
-                        "y",
+                yp_cps = [
+                    pltpu.make_async_remote_copy(
+                        src_ref=ysend_blk(2 * c_o + other_y),
+                        dst_ref=pad_y.at[c_o],
+                        send_sem=S["pair_ssems"].at[4],
+                        recv_sem=S["pair_rsems"].at[4],
+                        device_id=(partner_y,),
                     )
+                    for c_o in range(4)
+                ]
 
-                if use_pair_y:
-                    core_y = me % 2
-                    chip_y = me // 2
-                    partner_y = jnp.bitwise_xor(me, 1)
-                    other_y = 1 - core_y
+            def ystore(yp, pairs, first, n_valid):
+                if vy >= 1:
+                    for j, p in enumerate(pairs):
+                        S["ysend"].at[p // K][pl.ds(p % K, 1), :] = yp[j : j + 1]
+                else:
+                    yemit(yp, first, n_valid)
 
-                    def ysend_blk(rk):
-                        return S["ysend"].at[pl.ds(pl.multiple_of(rk * Rc, Rc), Rc)]
+            split_w = c.ex_split_wait and c.ex_opt
+            bd_kc = c.blockdiag_kc
+            cw13_fp4 = (
+                64 if c.ex_opt and c.fp4_chunk_words == 128 else c.fp4_chunk_words
+            )
+            cw2_fp4 = min(Il // FP4_PACK, 64 if c.ex_opt else 16)
+            cw2_fp8 = min(Il // 4, 128 if c.ex_opt else 32)
 
-                    yp_cps = [
-                        pltpu.make_async_remote_copy(
-                            src_ref=ysend_blk(2 * c_o + other_y),
-                            dst_ref=pad_y.at[c_o],
-                            send_sem=S["pair_ssems"].at[4],
-                            recv_sem=S["pair_rsems"].at[4],
-                            device_id=(partner_y,),
-                        )
-                        for c_o in range(4)
-                    ]
+            def globals_t(e):
+                if use_gs_smem_t:
+                    return S["gs_s"][0, e], S["gs_s"][1, e], S["gs_s"][2, e]
+                lane = jax.lax.broadcasted_iota(jnp.int32, (3, Ep), 1)
+                g = jnp.sum(jnp.where(lane == e, gs_mat, 0.0), axis=1, keepdims=True)
+                return g[0:1], g[1:2], g[2:3]
 
-                def ystore(yp, pairs, first, n_valid):
-                    if vy >= 1:
-                        for j, p in enumerate(pairs):
-                            S["ysend"].at[p // K][pl.ds(p % K, 1), :] = yp[j : j + 1]
-                    else:
-                        yemit(yp, first, n_valid)
+            def wait_w2_if_needed(slot, wait_w2):
+                if split_w:
+                    with _scope("ex_wait"):
+                        if isinstance(wait_w2, bool):
+                            if wait_w2:
+                                wait_expert(slot, (2, 3))
+                        else:
+                            pl.when(wait_w2)(lambda: wait_expert(slot, (2, 3)))
 
-                split_w = c.ex_split_wait and c.ex_opt
-                bd_kc = c.blockdiag_kc
-                cw13_fp4 = (
-                    64 if c.ex_opt and c.fp4_chunk_words == 128 else c.fp4_chunk_words
+            def gather_x(pairs):
+                if c.ex_opt:
+                    packed = jnp.concatenate(
+                        [S["xfull"][pl.ds(p // K, 1), :] for p in pairs], axis=0
+                    )
+                    return _unpack_bf16x2(packed).astype(bf16)
+                return jnp.concatenate(
+                    [_unpack_bf16x2(S["xfull"][pl.ds(p // K, 1), :]) for p in pairs],
+                    axis=0,
+                ).astype(bf16)
+
+            def pq_sc_of(pairs):
+                return jnp.concatenate(
+                    [xsc_ref[pl.ds(p // K, 1), :] for p in pairs],
+                    axis=0,
+                )[:, 0:1]
+
+            def run_ffn_and_store(
+                nrows, pair_fn, slot, e, blockdiag, first, n_valid, wait_w2=True
+            ):
+                can_fp8_x = bool(
+                    prequant_x and not blockdiag and nrows >= 32 and nrows % 32 == 0
                 )
-                cw2_fp4 = min(Il // FP4_PACK, 64 if c.ex_opt else 16)
-                cw2_fp8 = min(Il // 4, 128 if c.ex_opt else 32)
-
-                def globals_t(e):
-                    if use_gs_smem_t:
-                        return S["gs_s"][0, e], S["gs_s"][1, e], S["gs_s"][2, e]
-                    lane = jax.lax.broadcasted_iota(jnp.int32, (3, Ep), 1)
-                    g = jnp.sum(
-                        jnp.where(lane == e, gs_mat, 0.0), axis=1, keepdims=True
-                    )
-                    return g[0:1], g[1:2], g[2:3]
-
-                def wait_w2_if_needed(slot, wait_w2):
-                    if split_w:
-                        with _scope("ex_wait"):
-                            if isinstance(wait_w2, bool):
-                                if wait_w2:
-                                    wait_expert(slot, (2, 3))
-                            else:
-                                pl.when(wait_w2)(lambda: wait_expert(slot, (2, 3)))
-
-                def gather_x(pairs):
-                    if c.ex_opt:
-                        packed = jnp.concatenate(
-                            [S["xfull"][pl.ds(p // K, 1), :] for p in pairs], axis=0
-                        )
-                        return _unpack_bf16x2(packed).astype(bf16)
-                    return jnp.concatenate(
-                        [
-                            _unpack_bf16x2(S["xfull"][pl.ds(p // K, 1), :])
-                            for p in pairs
-                        ],
-                        axis=0,
-                    ).astype(bf16)
-
-                def pq_sc_of(pairs):
-                    return jnp.concatenate(
-                        [xsc_ref[pl.ds(p // K, 1), :] for p in pairs],
-                        axis=0,
-                    )[:, 0:1]
-
-                def run_ffn_and_store(
-                    nrows, pair_fn, slot, e, blockdiag, first, n_valid, wait_w2=True
-                ):
-                    can_fp8_x = bool(
-                        prequant_x and not blockdiag and nrows >= 32 and nrows % 32 == 0
-                    )
-                    can_stage_ex = bool(
-                        c.ex_w2_stage
-                        and not blockdiag
-                        and nrows >= 16
-                        and nrows % 16 == 0
-                        and nrows <= R
-                        and He + Il <= H
-                        and 2 * Il <= S["acc"].shape[1]
-                    )
-                    if can_stage_ex:
-                        pq_chunks = []
-                        for s0 in range(0, nrows, 16):
-                            ps16 = [pair_fn(s0 + j) for j in range(16)]
-                            S["lhs"][pl.ds(s0, 16), pl.ds(0, He)] = gather_x(ps16)
-                            if prequant_x:
-                                pq_chunks.append(pq_sc_of(ps16))
-                        pq_sc = (
-                            jnp.concatenate(pq_chunks, axis=0) if prequant_x else None
-                        )
-                        w13_prequant_sc = pq_sc if can_fp8_x else None
-                        w13_post_sc = pq_sc if (prequant_x and not can_fp8_x) else None
-
-                        def x_stage_chunk_fn(c_w, cw_w, out_fp8):
-                            w_x = S["lhs"][
-                                pl.ds(0, nrows),
-                                pl.ds(c_w * FP4_PACK, cw_w * FP4_PACK),
-                            ]
-                            return w_x.astype(jnp.float8_e4m3fn) if out_fp8 else w_x
-
-                        gu_stage = S["acc"].at[pl.ds(0, nrows), pl.ds(0, 2 * Il)]
-                        if kind == "fp4":
-                            _fp4_dot(
-                                None,
-                                W13.at[slot],
-                                S["w13s"].at[slot],
-                                He,
-                                2 * Il,
-                                cw13_fp4,
-                                fast_bf16=c.ex_opt,
-                                kperm=c.ex_kperm,
-                                via_fp8=c.ex_via_fp8,
-                                vec_dequant=c.vec_dequant_kperm,
-                                fp8_lhs=c.ex_fp8_lhs,
-                                n_tile=c.bd_n_tile,
-                                lhs_chunk_fn=x_stage_chunk_fn,
-                                prequant_sc=w13_prequant_sc,
-                                out_stage_ref=gu_stage,
-                                post_scale=w13_post_sc,
-                                nrows=nrows,
-                            )
-                        else:
-                            _fp8_dot(
-                                None,
-                                W13.at[slot],
-                                S13[slot, 0:1, pl.ds(0, 2 * Il)].astype(f32),
-                                He,
-                                2 * Il,
-                                c.fp4_chunk_words,
-                                fp8_lhs=c.ex_fp8_lhs,
-                                lhs_chunk_fn=x_stage_chunk_fn,
-                                prequant_sc=w13_prequant_sc,
-                                out_stage_ref=gu_stage,
-                                post_scale=w13_post_sc,
-                                nrows=nrows,
-                            )
-                        if gscale_t:
-                            g_gate, g_up, g_down = globals_t(e)
-                        else:
-                            g_gate = g_up = g_down = None
-                        quant_h = bool(
-                            c.ex_lhs_fp8 >= 2
-                            and (c.ex_kperm >= 3 or kind != "fp4")
-                            and Il == 512
-                            and nrows >= 32
-                            and nrows % 32 == 0
-                        )
-                        if quant_h:
-                            gt0 = S["acc"][pl.ds(0, nrows), pl.ds(0, 256)]
-                            up0 = S["acc"][pl.ds(0, nrows), pl.ds(Il, 256)]
-                            if gscale_t:
-                                gt0, up0 = gt0 * g_gate, up0 * g_up
-                            h0 = gt0 * jax.nn.sigmoid(gt0) * up0
-                            m0 = jnp.maximum(jnp.abs(h0[:, :128]), jnp.abs(h0[:, 128:]))
-                            S["acc"][pl.ds(0, nrows), pl.ds(0, 256)] = h0
-                            gt1 = S["acc"][pl.ds(0, nrows), pl.ds(256, 256)]
-                            up1 = S["acc"][pl.ds(0, nrows), pl.ds(Il + 256, 256)]
-                            if gscale_t:
-                                gt1, up1 = gt1 * g_gate, up1 * g_up
-                            h1 = gt1 * jax.nn.sigmoid(gt1) * up1
-                            m1 = jnp.maximum(jnp.abs(h1[:, :128]), jnp.abs(h1[:, 128:]))
-                            amax = jnp.max(jnp.maximum(m0, m1), axis=1, keepdims=True)
-                            h_pq_sc = jnp.where(
-                                amax == 0,
-                                jnp.zeros_like(amax),
-                                amax * jnp.float32(1.0 / 448.0),
-                            )
-                            inv_h = jnp.where(
-                                amax == 0,
-                                jnp.zeros_like(amax),
-                                jnp.float32(448.0)
-                                / jnp.maximum(amax, jnp.float32(1e-30)),
-                            )
-                            S["lhs"][pl.ds(0, nrows), pl.ds(He + 256, 256)] = (
-                                h1 * inv_h
-                            ).astype(bf16)
-                            h0_r = S["acc"][pl.ds(0, nrows), pl.ds(0, 256)]
-                            S["lhs"][pl.ds(0, nrows), pl.ds(He, 256)] = (
-                                h0_r * inv_h
-                            ).astype(bf16)
-                        else:
-                            for c_h in range(0, Il, 256):
-                                th = min(256, Il - c_h)
-                                gt = S["acc"][pl.ds(0, nrows), pl.ds(c_h, th)]
-                                up_ = S["acc"][pl.ds(0, nrows), pl.ds(Il + c_h, th)]
-                                if gscale_t:
-                                    gt, up_ = gt * g_gate, up_ * g_up
-                                S["lhs"][pl.ds(0, nrows), pl.ds(He + c_h, th)] = (
-                                    gt * jax.nn.sigmoid(gt) * up_
-                                ).astype(bf16)
-                            h_pq_sc = None
-                        wait_w2_if_needed(slot, wait_w2)
-
-                        def h_chunk_fn(c_w, cw_w, out_fp8):
-                            w_h = S["lhs"][
-                                pl.ds(0, nrows),
-                                pl.ds(He + c_w * FP4_PACK, cw_w * FP4_PACK),
-                            ]
-                            return w_h.astype(jnp.float8_e4m3fn) if out_fp8 else w_h
-
-                        y_stage = S["lhs"].at[pl.ds(0, nrows), pl.ds(0, He)]
-                        if kind == "fp4":
-                            _fp4_dot(
-                                None,
-                                W2.at[slot],
-                                S["w2s"].at[slot],
-                                Il,
-                                He,
-                                cw2_fp4,
-                                fast_bf16=c.ex_opt,
-                                kperm=c.ex_kperm,
-                                via_fp8=c.ex_via_fp8,
-                                vec_dequant=c.vec_dequant_kperm,
-                                fp8_lhs=c.ex_fp8_lhs,
-                                n_tile=c.bd_n_tile,
-                                lhs_chunk_fn=h_chunk_fn,
-                                prequant_sc=h_pq_sc,
-                                out_stage_ref=y_stage,
-                                post_scale=(g_down if gscale_t else None),
-                                nrows=nrows,
-                            )
-                        else:
-                            _fp8_dot(
-                                None,
-                                W2.at[slot],
-                                S2[slot, 0:1, :].astype(f32),
-                                Il,
-                                He,
-                                cw2_fp8,
-                                fp8_lhs=c.ex_fp8_lhs,
-                                lhs_chunk_fn=h_chunk_fn,
-                                prequant_sc=h_pq_sc,
-                                out_stage_ref=y_stage,
-                                nrows=nrows,
-                            )
-                        for s0 in range(0, nrows, 16):
-                            yp = _pack_y(S["lhs"][pl.ds(s0, 16), pl.ds(0, He)], c)
-                            if vy >= 1:
-                                for j in range(16):
-                                    p = pair_fn(s0 + j)
-                                    S["ysend"].at[p // K][pl.ds(p % K, 1), :] = yp[
-                                        j : j + 1
-                                    ]
-                            else:
-                                pl.when(s0 < n_valid)(
-                                    lambda s0=s0, yp=yp: yemit(
-                                        yp, first + s0, jnp.clip(n_valid - s0, 0, 16)
-                                    )
-                                )
-                        return
-
-                    pairs = [pair_fn(j) for j in range(nrows)]
-                    pq_sc = pq_sc_of(pairs) if prequant_x else None
+                can_stage_ex = bool(
+                    c.ex_w2_stage
+                    and not blockdiag
+                    and nrows >= 16
+                    and nrows % 16 == 0
+                    and nrows <= R
+                    and He + Il <= H
+                    and 2 * Il <= S["acc"].shape[1]
+                )
+                if can_stage_ex:
+                    pq_chunks = []
+                    for s0 in range(0, nrows, 16):
+                        ps16 = [pair_fn(s0 + j) for j in range(16)]
+                        S["lhs"][pl.ds(s0, 16), pl.ds(0, He)] = gather_x(ps16)
+                        if prequant_x:
+                            pq_chunks.append(pq_sc_of(ps16))
+                    pq_sc = jnp.concatenate(pq_chunks, axis=0) if prequant_x else None
                     w13_prequant_sc = pq_sc if can_fp8_x else None
                     w13_post_sc = pq_sc if (prequant_x and not can_fp8_x) else None
-                    xc_raw = gather_x(pairs)
-                    xc = xc_raw.astype(jnp.float8_e4m3fn) if can_fp8_x else xc_raw
-                    if blockdiag:
-                        gu = _fp4_blockdiag_dot(
-                            xc,
-                            W13.at[slot],
-                            S["w13s"].at[slot],
-                            He,
-                            2 * Il,
-                            bd_kc,
-                            kperm=bool(c.ex_kperm),
-                            fp8_lhs=c.bd_fp8_lhs,
-                            n_tile=c.bd_n_tile,
-                            prequant_sc=w13_prequant_sc,
-                            nrows=nrows,
-                            post_scale=w13_post_sc,
-                        )
-                    elif kind == "fp4":
-                        gu = _fp4_dot(
-                            xc,
+
+                    def x_stage_chunk_fn(c_w, cw_w, out_fp8):
+                        w_x = S["lhs"][
+                            pl.ds(0, nrows),
+                            pl.ds(c_w * FP4_PACK, cw_w * FP4_PACK),
+                        ]
+                        return w_x.astype(jnp.float8_e4m3fn) if out_fp8 else w_x
+
+                    gu_stage = S["acc"].at[pl.ds(0, nrows), pl.ds(0, 2 * Il)]
+                    if kind == "fp4":
+                        _fp4_dot(
+                            None,
                             W13.at[slot],
                             S["w13s"].at[slot],
                             He,
@@ -4990,51 +4768,94 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             vec_dequant=c.vec_dequant_kperm,
                             fp8_lhs=c.ex_fp8_lhs,
                             n_tile=c.bd_n_tile,
+                            lhs_chunk_fn=x_stage_chunk_fn,
                             prequant_sc=w13_prequant_sc,
+                            out_stage_ref=gu_stage,
                             post_scale=w13_post_sc,
                             nrows=nrows,
                         )
                     else:
-                        gu = _fp8_dot(
-                            xc,
+                        _fp8_dot(
+                            None,
                             W13.at[slot],
                             S13[slot, 0:1, pl.ds(0, 2 * Il)].astype(f32),
                             He,
                             2 * Il,
                             c.fp4_chunk_words,
                             fp8_lhs=c.ex_fp8_lhs,
+                            lhs_chunk_fn=x_stage_chunk_fn,
                             prequant_sc=w13_prequant_sc,
+                            out_stage_ref=gu_stage,
                             post_scale=w13_post_sc,
                             nrows=nrows,
                         )
-                    gate, up = gu[:, :Il], gu[:, Il:]
                     if gscale_t:
                         g_gate, g_up, g_down = globals_t(e)
-                        gate, up = gate * g_gate, up * g_up
-                    h = (gate * jax.nn.sigmoid(gate) * up).astype(bf16)
-                    wait_w2_if_needed(slot, wait_w2)
-                    h_pq = bool(
+                    else:
+                        g_gate = g_up = g_down = None
+                    quant_h = bool(
                         c.ex_lhs_fp8 >= 2
                         and (c.ex_kperm >= 3 or kind != "fp4")
-                        and not blockdiag
+                        and Il == 512
                         and nrows >= 32
                         and nrows % 32 == 0
                     )
-                    if blockdiag:
-                        y = _fp4_blockdiag_dot(
-                            h,
-                            W2.at[slot],
-                            S["w2s"].at[slot],
-                            Il,
-                            He,
-                            bd_kc,
-                            kperm=bool(c.ex_kperm),
-                            fp8_lhs=(c.bd_fp8_lhs or h_pq),
-                            n_tile=c.bd_n_tile,
+                    if quant_h:
+                        gt0 = S["acc"][pl.ds(0, nrows), pl.ds(0, 256)]
+                        up0 = S["acc"][pl.ds(0, nrows), pl.ds(Il, 256)]
+                        if gscale_t:
+                            gt0, up0 = gt0 * g_gate, up0 * g_up
+                        h0 = gt0 * jax.nn.sigmoid(gt0) * up0
+                        m0 = jnp.maximum(jnp.abs(h0[:, :128]), jnp.abs(h0[:, 128:]))
+                        S["acc"][pl.ds(0, nrows), pl.ds(0, 256)] = h0
+                        gt1 = S["acc"][pl.ds(0, nrows), pl.ds(256, 256)]
+                        up1 = S["acc"][pl.ds(0, nrows), pl.ds(Il + 256, 256)]
+                        if gscale_t:
+                            gt1, up1 = gt1 * g_gate, up1 * g_up
+                        h1 = gt1 * jax.nn.sigmoid(gt1) * up1
+                        m1 = jnp.maximum(jnp.abs(h1[:, :128]), jnp.abs(h1[:, 128:]))
+                        amax = jnp.max(jnp.maximum(m0, m1), axis=1, keepdims=True)
+                        h_pq_sc = jnp.where(
+                            amax == 0,
+                            jnp.zeros_like(amax),
+                            amax * jnp.float32(1.0 / 448.0),
                         )
-                    elif kind == "fp4":
-                        y = _fp4_dot(
-                            h,
+                        inv_h = jnp.where(
+                            amax == 0,
+                            jnp.zeros_like(amax),
+                            jnp.float32(448.0) / jnp.maximum(amax, jnp.float32(1e-30)),
+                        )
+                        S["lhs"][pl.ds(0, nrows), pl.ds(He + 256, 256)] = (
+                            h1 * inv_h
+                        ).astype(bf16)
+                        h0_r = S["acc"][pl.ds(0, nrows), pl.ds(0, 256)]
+                        S["lhs"][pl.ds(0, nrows), pl.ds(He, 256)] = (
+                            h0_r * inv_h
+                        ).astype(bf16)
+                    else:
+                        for c_h in range(0, Il, 256):
+                            th = min(256, Il - c_h)
+                            gt = S["acc"][pl.ds(0, nrows), pl.ds(c_h, th)]
+                            up_ = S["acc"][pl.ds(0, nrows), pl.ds(Il + c_h, th)]
+                            if gscale_t:
+                                gt, up_ = gt * g_gate, up_ * g_up
+                            S["lhs"][pl.ds(0, nrows), pl.ds(He + c_h, th)] = (
+                                gt * jax.nn.sigmoid(gt) * up_
+                            ).astype(bf16)
+                        h_pq_sc = None
+                    wait_w2_if_needed(slot, wait_w2)
+
+                    def h_chunk_fn(c_w, cw_w, out_fp8):
+                        w_h = S["lhs"][
+                            pl.ds(0, nrows),
+                            pl.ds(He + c_w * FP4_PACK, cw_w * FP4_PACK),
+                        ]
+                        return w_h.astype(jnp.float8_e4m3fn) if out_fp8 else w_h
+
+                    y_stage = S["lhs"].at[pl.ds(0, nrows), pl.ds(0, He)]
+                    if kind == "fp4":
+                        _fp4_dot(
+                            None,
                             W2.at[slot],
                             S["w2s"].at[slot],
                             Il,
@@ -5044,461 +4865,505 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             kperm=c.ex_kperm,
                             via_fp8=c.ex_via_fp8,
                             vec_dequant=c.vec_dequant_kperm,
-                            fp8_lhs=(c.ex_fp8_lhs or h_pq),
+                            fp8_lhs=c.ex_fp8_lhs,
                             n_tile=c.bd_n_tile,
+                            lhs_chunk_fn=h_chunk_fn,
+                            prequant_sc=h_pq_sc,
+                            out_stage_ref=y_stage,
+                            post_scale=(g_down if gscale_t else None),
+                            nrows=nrows,
                         )
                     else:
-                        y = _fp8_dot(
-                            h,
+                        _fp8_dot(
+                            None,
                             W2.at[slot],
                             S2[slot, 0:1, :].astype(f32),
                             Il,
                             He,
                             cw2_fp8,
-                            fp8_lhs=(c.ex_fp8_lhs or h_pq),
+                            fp8_lhs=c.ex_fp8_lhs,
+                            lhs_chunk_fn=h_chunk_fn,
+                            prequant_sc=h_pq_sc,
+                            out_stage_ref=y_stage,
+                            nrows=nrows,
                         )
-                    if gscale_t:
-                        y = y * g_down
-                    ystore(_pack_y(y, c), pairs, first, n_valid)
+                    for s0 in range(0, nrows, 16):
+                        yp = _pack_y(S["lhs"][pl.ds(s0, 16), pl.ds(0, He)], c)
+                        if vy >= 1:
+                            for j in range(16):
+                                p = pair_fn(s0 + j)
+                                S["ysend"].at[p // K][pl.ds(p % K, 1), :] = yp[
+                                    j : j + 1
+                                ]
+                        else:
+                            pl.when(s0 < n_valid)(
+                                lambda s0=s0, yp=yp: yemit(
+                                    yp, first + s0, jnp.clip(n_valid - s0, 0, 16)
+                                )
+                            )
+                    return
 
-                def pick_tree(arms, cnt):
-                    if len(arms) == 1:
-                        arms[0][1]()
-                        return
-                    mid = len(arms) // 2
-                    jax.lax.cond(
-                        cnt <= arms[mid - 1][0],
-                        lambda: pick_tree(arms[:mid], cnt),
-                        lambda: pick_tree(arms[mid:], cnt),
+                pairs = [pair_fn(j) for j in range(nrows)]
+                pq_sc = pq_sc_of(pairs) if prequant_x else None
+                w13_prequant_sc = pq_sc if can_fp8_x else None
+                w13_post_sc = pq_sc if (prequant_x and not can_fp8_x) else None
+                xc_raw = gather_x(pairs)
+                xc = xc_raw.astype(jnp.float8_e4m3fn) if can_fp8_x else xc_raw
+                if blockdiag:
+                    gu = _fp4_blockdiag_dot(
+                        xc,
+                        W13.at[slot],
+                        S["w13s"].at[slot],
+                        He,
+                        2 * Il,
+                        bd_kc,
+                        kperm=bool(c.ex_kperm),
+                        fp8_lhs=c.bd_fp8_lhs,
+                        n_tile=c.bd_n_tile,
+                        prequant_sc=w13_prequant_sc,
+                        nrows=nrows,
+                        post_scale=w13_post_sc,
+                    )
+                elif kind == "fp4":
+                    gu = _fp4_dot(
+                        xc,
+                        W13.at[slot],
+                        S["w13s"].at[slot],
+                        He,
+                        2 * Il,
+                        cw13_fp4,
+                        fast_bf16=c.ex_opt,
+                        kperm=c.ex_kperm,
+                        via_fp8=c.ex_via_fp8,
+                        vec_dequant=c.vec_dequant_kperm,
+                        fp8_lhs=c.ex_fp8_lhs,
+                        n_tile=c.bd_n_tile,
+                        prequant_sc=w13_prequant_sc,
+                        post_scale=w13_post_sc,
+                        nrows=nrows,
+                    )
+                else:
+                    gu = _fp8_dot(
+                        xc,
+                        W13.at[slot],
+                        S13[slot, 0:1, pl.ds(0, 2 * Il)].astype(f32),
+                        He,
+                        2 * Il,
+                        c.fp4_chunk_words,
+                        fp8_lhs=c.ex_fp8_lhs,
+                        prequant_sc=w13_prequant_sc,
+                        post_scale=w13_post_sc,
+                        nrows=nrows,
+                    )
+                gate, up = gu[:, :Il], gu[:, Il:]
+                if gscale_t:
+                    g_gate, g_up, g_down = globals_t(e)
+                    gate, up = gate * g_gate, up * g_up
+                h = (gate * jax.nn.sigmoid(gate) * up).astype(bf16)
+                wait_w2_if_needed(slot, wait_w2)
+                h_pq = bool(
+                    c.ex_lhs_fp8 >= 2
+                    and (c.ex_kperm >= 3 or kind != "fp4")
+                    and not blockdiag
+                    and nrows >= 32
+                    and nrows % 32 == 0
+                )
+                if blockdiag:
+                    y = _fp4_blockdiag_dot(
+                        h,
+                        W2.at[slot],
+                        S["w2s"].at[slot],
+                        Il,
+                        He,
+                        bd_kc,
+                        kperm=bool(c.ex_kperm),
+                        fp8_lhs=(c.bd_fp8_lhs or h_pq),
+                        n_tile=c.bd_n_tile,
+                    )
+                elif kind == "fp4":
+                    y = _fp4_dot(
+                        h,
+                        W2.at[slot],
+                        S["w2s"].at[slot],
+                        Il,
+                        He,
+                        cw2_fp4,
+                        fast_bf16=c.ex_opt,
+                        kperm=c.ex_kperm,
+                        via_fp8=c.ex_via_fp8,
+                        vec_dequant=c.vec_dequant_kperm,
+                        fp8_lhs=(c.ex_fp8_lhs or h_pq),
+                        n_tile=c.bd_n_tile,
+                    )
+                else:
+                    y = _fp8_dot(
+                        h,
+                        W2.at[slot],
+                        S2[slot, 0:1, :].astype(f32),
+                        Il,
+                        He,
+                        cw2_fp8,
+                        fp8_lhs=(c.ex_fp8_lhs or h_pq),
+                    )
+                if gscale_t:
+                    y = y * g_down
+                ystore(_pack_y(y, c), pairs, first, n_valid)
+
+            def pick_tree(arms, cnt):
+                if len(arms) == 1:
+                    arms[0][1]()
+                    return
+                mid = len(arms) // 2
+                jax.lax.cond(
+                    cnt <= arms[mid - 1][0],
+                    lambda: pick_tree(arms[:mid], cnt),
+                    lambda: pick_tree(arms[mid:], cnt),
+                )
+
+            def ebody(i, carry, part=None):
+                slot = i % nslot
+                start_expert(i)
+                with _scope("ex_wait"):
+                    wait_expert(slot, (0, 1) if split_w else (0, 1, 2, 3))
+                e = rget("uniq", i)
+                off, cnt = rget("ex_off", i), rget("ex_cnt", i)
+
+                def compact(nrows):
+                    # bucket rows past the expert's count repeat its last pair (same write)
+                    with _scope(f"ex_c{nrows}"):
+                        run_ffn_and_store(
+                            nrows,
+                            lambda j: rget("perm", off + jnp.minimum(j, cnt - 1)),
+                            slot,
+                            e,
+                            True,
+                            off,
+                            cnt,
+                        )
+
+                def full():
+                    can_bd = kind == "fp4" and (c.ex_kperm == 0 or bd_kc == 256)
+                    use_bd_chunk = c.ex_bd_all and can_bd
+                    CH = 8 if use_bd_chunk else min(c.expert_chunk, R)
+
+                    def full_one(nrows):
+                        run_ffn_and_store(
+                            nrows,
+                            lambda j: rget("perm", off + jnp.minimum(j, cnt - 1)),
+                            slot,
+                            e,
+                            False,
+                            off,
+                            cnt,
+                        )
+
+                    def chunk(ch, carry_):
+                        run_ffn_and_store(
+                            CH,
+                            lambda j: rget(
+                                "perm", off + jnp.minimum(ch * CH + j, cnt - 1)
+                            ),
+                            slot,
+                            e,
+                            use_bd_chunk,
+                            off + ch * CH,
+                            jnp.minimum(CH, cnt - ch * CH),
+                            wait_w2=(ch == 0),
+                        )
+                        return carry_
+
+                    def run_chunks():
+                        jax.lax.fori_loop(0, (cnt + CH - 1) // CH, chunk, 0)
+
+                    def bd_chunk_step(ch, carry_):
+                        run_ffn_and_store(
+                            8,
+                            lambda j: rget(
+                                "perm", off + jnp.minimum(ch * 8 + j, cnt - 1)
+                            ),
+                            slot,
+                            e,
+                            True,
+                            off + ch * 8,
+                            jnp.minimum(8, cnt - ch * 8),
+                            wait_w2=(ch == 0),
+                        )
+                        return carry_
+
+                    def run_bd_chunks():
+                        jax.lax.fori_loop(0, (cnt + 7) // 8, bd_chunk_step, 0)
+
+                    with _scope("ex_full"):
+                        if c.ex_opt and vy >= 1 and not use_bd_chunk:
+                            lo_b = c.compact_rows if kind == "fp4" else 0
+                            far = []
+                            if c.ex_bd_max_rows > lo_b and can_bd:
+                                bd_cap = min(c.ex_bd_max_rows, R)
+                                far.append((bd_cap, run_bd_chunks))
+                                lo_b = bd_cap
+                            if lo_b < R:
+                                raw_fb = (8, 16, 32) if c.ex_w2_stage else (16, 24)
+                                fb = tuple(b for b in raw_fb if lo_b < b <= R)
+                                for b in fb:
+                                    far.append((b, functools.partial(full_one, b)))
+                                if fb and fb[-1] >= R:
+                                    far[-1] = (None, far[-1][1])
+                                else:
+                                    far.append((None, run_chunks))
+                            else:
+                                far[-1] = (None, far[-1][1])
+                            pick_tree(far, cnt)
+                        else:
+                            run_chunks()
+
+                if kind == "fp4" and c.compact_rows:
+                    buckets = compact_buckets(c)
+                    arms = [(b, functools.partial(compact, b)) for b in buckets]
+                    if buckets[-1] < R:
+                        arms.append((None, full))
+                    else:
+                        arms[-1] = (None, arms[-1][1])
+                    if part == "few":
+                        arms = [
+                            a for a in arms if a[0] is not None and a[0] <= c.split_rows
+                        ]
+                        arms[-1] = (None, arms[-1][1])
+                    elif part == "many":
+                        arms = [a for a in arms if a[0] is None or a[0] > c.split_rows]
+                    pick_tree(arms, cnt)
+                else:
+                    full()
+                if stream_pair_y:
+
+                    def ready_py(nb):
+                        end = rget("blk_end", jnp.minimum(nb, 2))
+                        return (nb < 3) & (end <= i + 1)
+
+                    def send_py(nb):
+                        c_o = jnp.bitwise_xor(chip_y, 3 - nb)
+                        _select(c_o, [0, 1, 2, 3], lambda co: yp_cps[co].start())
+                        return nb + 1
+
+                    return jax.lax.while_loop(ready_py, send_py, carry)
+                if vy >= 1 and y_block and not use_pair_y:
+
+                    def ready(nb):
+                        end = rget("blk_end", jnp.minimum(nb, c.tp - 2))
+                        return (nb < c.tp - 1) & (end <= i + 1)
+
+                    def send_block(nb):
+                        owner = blk_owner(nb)
+                        pl.when(owner * Rc < n_live)(y_block_cp(owner).start)
+                        return nb + 1
+
+                    return jax.lax.while_loop(ready, send_block, carry)
+                return carry
+
+            with _scope("experts"):
+                if c.split_rows and kind == "fp4":
+                    n_groups = (
+                        4
+                        if stream_pair_y
+                        else (c.tp if (y_block and not use_pair_y) else 1)
                     )
 
-                def ebody(i, carry, part=None):
-                    slot = i % nslot
-                    start_expert(i)
-                    with _scope("ex_wait"):
-                        wait_expert(slot, (0, 1) if split_w else (0, 1, 2, 3))
-                    e = rget("uniq", i)
-                    off, cnt = rget("ex_off", i), rget("ex_cnt", i)
-
-                    def compact(nrows):
-                        # bucket rows past the expert's count repeat its last pair (same write)
-                        with _scope(f"ex_c{nrows}"):
-                            run_ffn_and_store(
-                                nrows,
-                                lambda j: rget("perm", off + jnp.minimum(j, cnt - 1)),
-                                slot,
-                                e,
-                                True,
-                                off,
-                                cnt,
-                            )
-
-                    def full():
-                        can_bd = kind == "fp4" and (c.ex_kperm == 0 or bd_kc == 256)
-                        use_bd_chunk = c.ex_bd_all and can_bd
-                        CH = 8 if use_bd_chunk else min(c.expert_chunk, R)
-
-                        def full_one(nrows):
-                            run_ffn_and_store(
-                                nrows,
-                                lambda j: rget("perm", off + jnp.minimum(j, cnt - 1)),
-                                slot,
-                                e,
-                                False,
-                                off,
-                                cnt,
-                            )
-
-                        def chunk(ch, carry_):
-                            run_ffn_and_store(
-                                CH,
-                                lambda j: rget(
-                                    "perm", off + jnp.minimum(ch * CH + j, cnt - 1)
-                                ),
-                                slot,
-                                e,
-                                use_bd_chunk,
-                                off + ch * CH,
-                                jnp.minimum(CH, cnt - ch * CH),
-                                wait_w2=(ch == 0),
-                            )
-                            return carry_
-
-                        def run_chunks():
-                            jax.lax.fori_loop(0, (cnt + CH - 1) // CH, chunk, 0)
-
-                        def bd_chunk_step(ch, carry_):
-                            run_ffn_and_store(
-                                8,
-                                lambda j: rget(
-                                    "perm", off + jnp.minimum(ch * 8 + j, cnt - 1)
-                                ),
-                                slot,
-                                e,
-                                True,
-                                off + ch * 8,
-                                jnp.minimum(8, cnt - ch * 8),
-                                wait_w2=(ch == 0),
-                            )
-                            return carry_
-
-                        def run_bd_chunks():
-                            jax.lax.fori_loop(0, (cnt + 7) // 8, bd_chunk_step, 0)
-
-                        with _scope("ex_full"):
-                            if c.ex_opt and vy >= 1 and not use_bd_chunk:
-                                lo_b = c.compact_rows if kind == "fp4" else 0
-                                far = []
-                                if c.ex_bd_max_rows > lo_b and can_bd:
-                                    bd_cap = min(c.ex_bd_max_rows, R)
-                                    far.append((bd_cap, run_bd_chunks))
-                                    lo_b = bd_cap
-                                if lo_b < R:
-                                    raw_fb = (8, 16, 32) if c.ex_w2_stage else (16, 24)
-                                    fb = tuple(b for b in raw_fb if lo_b < b <= R)
-                                    for b in fb:
-                                        far.append((b, functools.partial(full_one, b)))
-                                    if fb and fb[-1] >= R:
-                                        far[-1] = (None, far[-1][1])
-                                    else:
-                                        far.append((None, run_chunks))
-                                else:
-                                    far[-1] = (None, far[-1][1])
-                                pick_tree(far, cnt)
-                            else:
-                                run_chunks()
-
-                    if kind == "fp4" and c.compact_rows:
-                        buckets = compact_buckets(c)
-                        arms = [(b, functools.partial(compact, b)) for b in buckets]
-                        if buckets[-1] < R:
-                            arms.append((None, full))
-                        else:
-                            arms[-1] = (None, arms[-1][1])
-                        if part == "few":
-                            arms = [
-                                a
-                                for a in arms
-                                if a[0] is not None and a[0] <= c.split_rows
-                            ]
-                            arms[-1] = (None, arms[-1][1])
-                        elif part == "many":
-                            arms = [
-                                a for a in arms if a[0] is None or a[0] > c.split_rows
-                            ]
-                        pick_tree(arms, cnt)
-                    else:
-                        full()
-                    if stream_pair_y:
-
-                        def ready_py(nb):
-                            end = rget("blk_end", jnp.minimum(nb, 2))
-                            return (nb < 3) & (end <= i + 1)
-
-                        def send_py(nb):
-                            c_o = jnp.bitwise_xor(chip_y, 3 - nb)
-                            _select(c_o, [0, 1, 2, 3], lambda co: yp_cps[co].start())
-                            return nb + 1
-
-                        return jax.lax.while_loop(ready_py, send_py, carry)
-                    if vy >= 1 and y_block and not use_pair_y:
-
-                        def ready(nb):
-                            end = rget("blk_end", jnp.minimum(nb, c.tp - 2))
-                            return (nb < c.tp - 1) & (end <= i + 1)
-
-                        def send_block(nb):
-                            owner = blk_owner(nb)
-                            pl.when(owner * Rc < n_live)(y_block_cp(owner).start)
-                            return nb + 1
-
-                        return jax.lax.while_loop(ready, send_block, carry)
-                    return carry
-
-                with _scope("experts"):
-                    if c.split_rows and kind == "fp4":
-                        n_groups = (
-                            4
-                            if stream_pair_y
-                            else (c.tp if (y_block and not use_pair_y) else 1)
+                    def group(g_, carry):
+                        lo = jnp.where(
+                            g_ == 0, 0, rget("blk_end", jnp.maximum(g_ - 1, 0))
+                        )
+                        mid, hi = rget("blk_mid", g_), rget("blk_end", g_)
+                        carry = jax.lax.fori_loop(
+                            lo, mid, functools.partial(ebody, part="few"), carry
+                        )
+                        return jax.lax.fori_loop(
+                            mid, hi, functools.partial(ebody, part="many"), carry
                         )
 
-                        def group(g_, carry):
-                            lo = jnp.where(
-                                g_ == 0, 0, rget("blk_end", jnp.maximum(g_ - 1, 0))
-                            )
-                            mid, hi = rget("blk_mid", g_), rget("blk_end", g_)
-                            carry = jax.lax.fori_loop(
-                                lo, mid, functools.partial(ebody, part="few"), carry
-                            )
-                            return jax.lax.fori_loop(
-                                mid, hi, functools.partial(ebody, part="many"), carry
-                            )
+                    nb_sent = jax.lax.fori_loop(0, n_groups, group, jnp.int32(0))
+                else:
+                    nb_sent = jax.lax.fori_loop(0, n_u, ebody, jnp.int32(0))
+            if vy == 0:
+                ydrain(0)
+                ydrain(1)
+            ws.flush()
+            my_live = me * Rc < n_live
+            with _scope("y_rs"):
+                if use_pair_y:
+                    if stream_pair_y:
 
-                        nb_sent = jax.lax.fori_loop(0, n_groups, group, jnp.int32(0))
+                        def send_rem_py(nb, carry_):
+                            c_o = jnp.bitwise_xor(chip_y, 3 - nb)
+                            _select(c_o, [0, 1, 2, 3], lambda co: yp_cps[co].start())
+                            return carry_
+
+                        jax.lax.fori_loop(nb_sent, 4, send_rem_py, 0)
+                        for cp in yp_cps:
+                            cp.wait()
                     else:
-                        nb_sent = jax.lax.fori_loop(0, n_u, ebody, jnp.int32(0))
-                if vy == 0:
-                    ydrain(0)
-                    ydrain(1)
-                ws.flush()
-                my_live = me * Rc < n_live
-                with _scope("y_rs"):
-                    if use_pair_y:
-                        if stream_pair_y:
+                        for cp in yp_cps:
+                            cp.start()
+                        for cp in yp_cps:
+                            cp.wait()
+                    if c.combine_loop:
 
-                            def send_rem_py(nb, carry_):
-                                c_o = jnp.bitwise_xor(chip_y, 3 - nb)
-                                _select(
-                                    c_o, [0, 1, 2, 3], lambda co: yp_cps[co].start()
-                                )
-                                return carry_
-
-                            jax.lax.fori_loop(nb_sent, 4, send_rem_py, 0)
-                            for cp in yp_cps:
-                                cp.wait()
-                        else:
-                            for cp in yp_cps:
-                                cp.start()
-                            for cp in yp_cps:
-                                cp.wait()
-                        if c.combine_loop:
-
-                            def pair_reduce_row(r, carry_):
-                                for c_o in range(4):
-                                    r_same = 2 * c_o + core_y
-                                    S["ysend"].at[r_same * Rc + r][...] = _pack_y(
-                                        _unpack_y(
-                                            S["ysend"].at[r_same * Rc + r][...], c
-                                        )
-                                        + _unpack_y(pad_y.at[c_o, r][...], c),
-                                        c,
-                                    )
-                                return carry_
-
-                            jax.lax.fori_loop(0, Rc, pair_reduce_row, 0)
-                        else:
+                        def pair_reduce_row(r, carry_):
                             for c_o in range(4):
                                 r_same = 2 * c_o + core_y
-                                ysend_blk(r_same)[...] = _pack_y(
-                                    _unpack_y(ysend_blk(r_same)[...], c)
-                                    + _unpack_y(pad_y[c_o], c),
+                                S["ysend"].at[r_same * Rc + r][...] = _pack_y(
+                                    _unpack_y(S["ysend"].at[r_same * Rc + r][...], c)
+                                    + _unpack_y(pad_y.at[c_o, r][...], c),
                                     c,
                                 )
-                        if c.tiled_pair_y >= 2:
-                            m1_y = jnp.where(core_y == 0, 2, 1).astype(jnp.int32)
-                            m2_y = 3 - m1_y
-                            nb1_y = 2 * jnp.bitwise_xor(chip_y, m1_y) + core_y
-                            nb2_y = 2 * jnp.bitwise_xor(chip_y, m2_y) + core_y
-                            c2a = [
-                                rcopy(ysend_blk(nb1_y), pad_y.at[4], nb1_y, "y"),
-                                rcopy(
-                                    ysend_blk(2 * jnp.bitwise_xor(chip_y, 3) + core_y),
-                                    pad_y.at[5],
-                                    nb1_y,
-                                    "y",
-                                ),
-                            ]
-                            for cp in c2a:
-                                cp.start()
-                            for cp in c2a:
-                                cp.wait_send()
-                            for cp in c2a:
-                                cp.wait_recv()
-                            if c.combine_loop:
+                            return carry_
 
-                                def pair_c2_row(r, carry_):
-                                    pad_y.at[7, r][...] = _pack_y(
-                                        _unpack_y(S["ysend"].at[nb2_y * Rc + r][...], c)
-                                        + _unpack_y(pad_y.at[5, r][...], c),
-                                        c,
-                                    )
-                                    return carry_
+                        jax.lax.fori_loop(0, Rc, pair_reduce_row, 0)
+                    else:
+                        for c_o in range(4):
+                            r_same = 2 * c_o + core_y
+                            ysend_blk(r_same)[...] = _pack_y(
+                                _unpack_y(ysend_blk(r_same)[...], c)
+                                + _unpack_y(pad_y[c_o], c),
+                                c,
+                            )
+                    if c.tiled_pair_y >= 2:
+                        m1_y = jnp.where(core_y == 0, 2, 1).astype(jnp.int32)
+                        m2_y = 3 - m1_y
+                        nb1_y = 2 * jnp.bitwise_xor(chip_y, m1_y) + core_y
+                        nb2_y = 2 * jnp.bitwise_xor(chip_y, m2_y) + core_y
+                        c2a = [
+                            rcopy(ysend_blk(nb1_y), pad_y.at[4], nb1_y, "y"),
+                            rcopy(
+                                ysend_blk(2 * jnp.bitwise_xor(chip_y, 3) + core_y),
+                                pad_y.at[5],
+                                nb1_y,
+                                "y",
+                            ),
+                        ]
+                        for cp in c2a:
+                            cp.start()
+                        for cp in c2a:
+                            cp.wait_send()
+                        for cp in c2a:
+                            cp.wait_recv()
+                        if c.combine_loop:
 
-                                jax.lax.fori_loop(0, Rc, pair_c2_row, 0)
-                            else:
-                                pad_y[7] = _pack_y(
-                                    _unpack_y(ysend_blk(nb2_y)[...], c)
-                                    + _unpack_y(pad_y[5], c),
+                            def pair_c2_row(r, carry_):
+                                pad_y.at[7, r][...] = _pack_y(
+                                    _unpack_y(S["ysend"].at[nb2_y * Rc + r][...], c)
+                                    + _unpack_y(pad_y.at[5, r][...], c),
                                     c,
                                 )
-                            pad_y[5] = ysend_blk(me)[...]
-                            c2b = pltpu.make_async_remote_copy(
-                                src_ref=pad_y.at[7],
-                                dst_ref=pad_y.at[6],
-                                send_sem=S["pair_ssems"].at[5],
-                                recv_sem=S["pair_rsems"].at[5],
-                                device_id=(nb2_y,),
-                            )
-                            c2b.start()
-                            c2b.wait()
-                        else:
-                            pad_y[4 + chip_y] = ysend_blk(me)[...]
-                            yc_cps = [
-                                rcopy(
-                                    ysend_blk(2 * jnp.bitwise_xor(chip_y, d) + core_y),
-                                    pad_y.at[4 + chip_y],
-                                    2 * jnp.bitwise_xor(chip_y, d) + core_y,
-                                    "y",
-                                )
-                                for d in (1, 2, 3)
-                            ]
-                            for cp in yc_cps:
-                                cp.start()
-                            for cp in yc_cps:
-                                cp.wait_send()
-                            for cp in yc_cps:
-                                cp.wait_recv()
-                    elif vy >= 1:
-                        own_slice = pl.ds(pl.multiple_of(me * Rc, Rc), Rc)
-                        if vy >= 2:
+                                return carry_
 
-                            @pl.when(my_live)
-                            def _():
-                                pad_y[me] = S["ysend"][own_slice]
-
+                            jax.lax.fori_loop(0, Rc, pair_c2_row, 0)
                         else:
-                            ly_cp = pltpu.make_async_copy(
-                                S["ysend"].at[own_slice], pad_y.at[me], tsem(_TS_LOCAL)
+                            pad_y[7] = _pack_y(
+                                _unpack_y(ysend_blk(nb2_y)[...], c)
+                                + _unpack_y(pad_y[5], c),
+                                c,
                             )
-                            pl.when(my_live)(ly_cp.start)
-                        if not y_block:
-                            for d in range(1, c.tp):
-                                peer = coll._peer(d)
-                                pl.when(peer * Rc < n_live)(y_block_cp(peer).start)
-                        for d in range(1, c.tp):
-                            peer = coll._peer(d)
-                            pl.when(peer * Rc < n_live)(y_block_cp(peer).wait_send)
-                        if vy == 1:
-                            pl.when(my_live)(ly_cp.wait)
+                        pad_y[5] = ysend_blk(me)[...]
+                        c2b = pltpu.make_async_remote_copy(
+                            src_ref=pad_y.at[7],
+                            dst_ref=pad_y.at[6],
+                            send_sem=S["pair_ssems"].at[5],
+                            recv_sem=S["pair_rsems"].at[5],
+                            device_id=(nb2_y,),
+                        )
+                        c2b.start()
+                        c2b.wait()
+                    else:
+                        pad_y[4 + chip_y] = ysend_blk(me)[...]
+                        yc_cps = [
+                            rcopy(
+                                ysend_blk(2 * jnp.bitwise_xor(chip_y, d) + core_y),
+                                pad_y.at[4 + chip_y],
+                                2 * jnp.bitwise_xor(chip_y, d) + core_y,
+                                "y",
+                            )
+                            for d in (1, 2, 3)
+                        ]
+                        for cp in yc_cps:
+                            cp.start()
+                        for cp in yc_cps:
+                            cp.wait_send()
+                        for cp in yc_cps:
+                            cp.wait_recv()
+                elif vy >= 1:
+                    own_slice = pl.ds(pl.multiple_of(me * Rc, Rc), Rc)
+                    if vy >= 2:
 
                         @pl.when(my_live)
                         def _():
-                            for d in range(1, c.tp):
-                                y_block_cp(coll._peer(d)).wait_recv()
+                            pad_y[me] = S["ysend"][own_slice]
 
                     else:
-                        # every peer's rows for this device's live rows: K slots of each, landed
-                        row_msg = pltpu.make_async_remote_copy(
-                            src_ref=pad_y.at[0, pl.ds(0, 1)],
-                            dst_ref=pad_y.at[me, pl.ds(0, 1)],
-                            send_sem=S["tc_ssems"].at[tc_smap["y"]],
-                            recv_sem=S["tc_rsems"].at[tc_rmap["y"]],
-                            device_id=(me,),
+                        ly_cp = pltpu.make_async_copy(
+                            S["ysend"].at[own_slice], pad_y.at[me], tsem(_TS_LOCAL)
                         )
+                        pl.when(my_live)(ly_cp.start)
+                    if not y_block:
+                        for d in range(1, c.tp):
+                            peer = coll._peer(d)
+                            pl.when(peer * Rc < n_live)(y_block_cp(peer).start)
+                    for d in range(1, c.tp):
+                        peer = coll._peer(d)
+                        pl.when(peer * Rc < n_live)(y_block_cp(peer).wait_send)
+                    if vy == 1:
+                        pl.when(my_live)(ly_cp.wait)
 
-                        def recv_row(_, carry):
-                            row_msg.wait_recv()
-                            return carry
+                    @pl.when(my_live)
+                    def _():
+                        for d in range(1, c.tp):
+                            y_block_cp(coll._peer(d)).wait_recv()
 
-                        jax.lax.fori_loop(
-                            0,
-                            (c.tp - 1) * jnp.clip(n_live - me * Rc, 0, Rc),
-                            recv_row,
-                            0,
-                        )
-
-                with _scope("combine"):
-                    pw = smr[SMALL["post_expert_w"] : SMALL["post_expert_w"] + 1, :He]
-                    # this device's routing weights: the 8-row-aligned window around its
-                    # rows
-                    win = owner_window_rows(c)
-                    if win == Rc:
-                        w0, w_off = pl.multiple_of(me * Rc, 8), 0
-                    else:
-                        w0 = pl.multiple_of(jnp.minimum((me * Rc) // 8 * 8, R - win), 8)
-                        w_off = me * Rc - w0
-                    wmine = S["wsel_v"][pl.ds(w0, win), pl.ds(0, K)]  # [win, K]
-                    wk = jnp.concatenate(
-                        [wmine[:, k : k + 1][:, :, None] for k in range(K)], axis=1
+                else:
+                    # every peer's rows for this device's live rows: K slots of each, landed
+                    row_msg = pltpu.make_async_remote_copy(
+                        src_ref=pad_y.at[0, pl.ds(0, 1)],
+                        dst_ref=pad_y.at[me, pl.ds(0, 1)],
+                        send_sem=S["tc_ssems"].at[tc_smap["y"]],
+                        recv_sem=S["tc_rsems"].at[tc_rmap["y"]],
+                        device_id=(me,),
                     )
-                    S["wk_s"][...] = jnp.broadcast_to(wk, (win, K, LANE))
-                    if vy >= 2:
-                        y_slabs = (
-                            (4, 5, 6)
-                            if (use_pair_y and c.tiled_pair_y >= 2)
-                            else ((4, 5, 6, 7) if use_pair_y else tuple(range(c.tp)))
-                        )
-                        if c.combine_loop:
 
-                            def combine_vmem_row(r, carry_):
-                                ysum = _unpack_y(pad_y.at[y_slabs[0], r][...], c)
-                                for d in y_slabs[1:]:
-                                    ysum = ysum + _unpack_y(pad_y.at[d, r][...], c)
-                                ysum = (
-                                    jnp.where(me * Rc + r < n_live, ysum, 0.0)
-                                    .astype(bf16)
-                                    .astype(f32)
-                                )
-                                ysc = ysum * pw
-                                nrm = jax.lax.rsqrt(
-                                    jnp.mean(jnp.square(ysc), axis=-1, keepdims=True)
-                                    + c.post_eps
-                                )
-                                ynorm = (ysc * nrm).astype(bf16).astype(f32)
-                                u = jnp.sum(
-                                    ynorm * S["wk_s"][w_off + r, :, 0:1],
-                                    axis=0,
-                                    keepdims=True,
-                                )
-                                S["u_send"][pl.ds(r, 1), :] = _pack_bf16x2(u)
-                                return carry_
+                    def recv_row(_, carry):
+                        row_msg.wait_recv()
+                        return carry
 
-                            jax.lax.fori_loop(0, Rc, combine_vmem_row, 0)
-                        else:
-                            ysum = _unpack_y(pad_y[y_slabs[0]], c)  # [Rc, K, He]
+                    jax.lax.fori_loop(
+                        0, (c.tp - 1) * jnp.clip(n_live - me * Rc, 0, Rc), recv_row, 0
+                    )
+
+            with _scope("combine"):
+                pw = smr[SMALL["post_expert_w"] : SMALL["post_expert_w"] + 1, :He]
+                # this device's routing weights: the 8-row-aligned window around its
+                # rows
+                win = owner_window_rows(c)
+                if win == Rc:
+                    w0, w_off = pl.multiple_of(me * Rc, 8), 0
+                else:
+                    w0 = pl.multiple_of(jnp.minimum((me * Rc) // 8 * 8, R - win), 8)
+                    w_off = me * Rc - w0
+                wmine = S["wsel_v"][pl.ds(w0, win), pl.ds(0, K)]  # [win, K]
+                wk = jnp.concatenate(
+                    [wmine[:, k : k + 1][:, :, None] for k in range(K)], axis=1
+                )
+                S["wk_s"][...] = jnp.broadcast_to(wk, (win, K, LANE))
+                if vy >= 2:
+                    y_slabs = (
+                        (4, 5, 6)
+                        if (use_pair_y and c.tiled_pair_y >= 2)
+                        else ((4, 5, 6, 7) if use_pair_y else tuple(range(c.tp)))
+                    )
+                    if c.combine_loop:
+
+                        def combine_vmem_row(r, carry_):
+                            ysum = _unpack_y(pad_y.at[y_slabs[0], r][...], c)
                             for d in y_slabs[1:]:
-                                ysum = ysum + _unpack_y(pad_y[d], c)
-                            r_live = (
-                                me * Rc
-                                + jax.lax.broadcasted_iota(jnp.int32, (Rc, 1, 1), 0)
-                            ) < n_live
-                            ysum = jnp.where(r_live, ysum, 0.0).astype(bf16).astype(f32)
-                            ysc = ysum * pw[None]
-                            nrm = jax.lax.rsqrt(
-                                jnp.mean(jnp.square(ysc), axis=-1, keepdims=True)
-                                + c.post_eps
-                            )
-                            ynorm = (ysc * nrm).astype(bf16).astype(f32)
-                            wk_rc = (
-                                S["wk_s"][:, :, 0:1]
-                                if win == Rc
-                                else jnp.concatenate(
-                                    [
-                                        S["wk_s"][w_off + r, :, 0:1][None]
-                                        for r in range(Rc)
-                                    ],
-                                    axis=0,
-                                )
-                            )
-                            u = jnp.sum(ynorm * wk_rc, axis=1)  # [Rc, He]
-                            S["u_send"][...] = _pack_bf16x2(u)
-                    else:
-
-                        def ycopy(r, b):
-                            return pltpu.make_async_copy(
-                                S["pad_y"].at[:, pl.ds(r, 1)],
-                                S["yrow"].at[b],
-                                S["yrow_sems"].at[b],
-                            )
-
-                        pl.when(my_live)(ycopy(0, 0).start)
-
-                        def combine_row(r, carry):
-                            b = r % 2
-
-                            @pl.when(my_live & (r + 1 < Rc))
-                            def _():
-                                ycopy(r + 1, 1 - b).start()
-
-                            pl.when(my_live)(ycopy(r, b).wait)
-                            yr = S["yrow"].at[b]
-                            ysum = _unpack_y(yr[0, 0], c)  # [K, He]
-                            for d in range(1, c.tp):
-                                ysum = ysum + _unpack_y(yr[d, 0], c)
-                            # rows past n_live received nothing (stale HBM): keep them zero
+                                ysum = ysum + _unpack_y(pad_y.at[d, r][...], c)
                             ysum = (
-                                jnp.where(my_live & (me * Rc + r < n_live), ysum, 0.0)
+                                jnp.where(me * Rc + r < n_live, ysum, 0.0)
                                 .astype(bf16)
                                 .astype(f32)
                             )
@@ -5514,9 +5379,75 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                                 keepdims=True,
                             )
                             S["u_send"][pl.ds(r, 1), :] = _pack_bf16x2(u)
-                            return carry
+                            return carry_
 
-                        jax.lax.fori_loop(0, Rc, combine_row, 0)
+                        jax.lax.fori_loop(0, Rc, combine_vmem_row, 0)
+                    else:
+                        ysum = _unpack_y(pad_y[y_slabs[0]], c)  # [Rc, K, He]
+                        for d in y_slabs[1:]:
+                            ysum = ysum + _unpack_y(pad_y[d], c)
+                        r_live = (
+                            me * Rc + jax.lax.broadcasted_iota(jnp.int32, (Rc, 1, 1), 0)
+                        ) < n_live
+                        ysum = jnp.where(r_live, ysum, 0.0).astype(bf16).astype(f32)
+                        ysc = ysum * pw[None]
+                        nrm = jax.lax.rsqrt(
+                            jnp.mean(jnp.square(ysc), axis=-1, keepdims=True)
+                            + c.post_eps
+                        )
+                        ynorm = (ysc * nrm).astype(bf16).astype(f32)
+                        wk_rc = (
+                            S["wk_s"][:, :, 0:1]
+                            if win == Rc
+                            else jnp.concatenate(
+                                [S["wk_s"][w_off + r, :, 0:1][None] for r in range(Rc)],
+                                axis=0,
+                            )
+                        )
+                        u = jnp.sum(ynorm * wk_rc, axis=1)  # [Rc, He]
+                        S["u_send"][...] = _pack_bf16x2(u)
+                else:
+
+                    def ycopy(r, b):
+                        return pltpu.make_async_copy(
+                            S["pad_y"].at[:, pl.ds(r, 1)],
+                            S["yrow"].at[b],
+                            S["yrow_sems"].at[b],
+                        )
+
+                    pl.when(my_live)(ycopy(0, 0).start)
+
+                    def combine_row(r, carry):
+                        b = r % 2
+
+                        @pl.when(my_live & (r + 1 < Rc))
+                        def _():
+                            ycopy(r + 1, 1 - b).start()
+
+                        pl.when(my_live)(ycopy(r, b).wait)
+                        yr = S["yrow"].at[b]
+                        ysum = _unpack_y(yr[0, 0], c)  # [K, He]
+                        for d in range(1, c.tp):
+                            ysum = ysum + _unpack_y(yr[d, 0], c)
+                        # rows past n_live received nothing (stale HBM): keep them zero
+                        ysum = (
+                            jnp.where(my_live & (me * Rc + r < n_live), ysum, 0.0)
+                            .astype(bf16)
+                            .astype(f32)
+                        )
+                        ysc = ysum * pw
+                        nrm = jax.lax.rsqrt(
+                            jnp.mean(jnp.square(ysc), axis=-1, keepdims=True)
+                            + c.post_eps
+                        )
+                        ynorm = (ysc * nrm).astype(bf16).astype(f32)
+                        u = jnp.sum(
+                            ynorm * S["wk_s"][w_off + r, :, 0:1], axis=0, keepdims=True
+                        )
+                        S["u_send"][pl.ds(r, 1), :] = _pack_bf16x2(u)
+                        return carry
+
+                    jax.lax.fori_loop(0, Rc, combine_row, 0)
 
             if vpads:
                 with _scope("u_ag"):
@@ -5765,38 +5696,81 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         ready=[oag_rdy, None],
                     )
                     ag_tile_sent("o_ag", S["o_send"], S["pad_o_ag"])
-            with _scope("moe"):
-                moe_tiled(l, smr, kind, nxt)
+            if ep is not None:
 
-            if not (c.fold_f and nxt is not None):
-                if c.tiled_vmem_pads:
-                    for t in range(R // RT):
-                        rs = pl.ds(t * RT, RT)
-                        s = row("ffn_alpha") * S["h_stream"][rs] + row(
-                            "ffn_beta"
-                        ) * _rms(
-                            gathered_tile(S["pad_f"].at[:, rs]) * row("post_ffn_w"),
-                            c.post_eps,
-                        ).astype(bf16).astype(f32)
-                        capture_tile(l, rs, s)
-                        S["h_stream"][rs] = s
-                else:
-                    fag_rdy = ag_tile_ready(S["f_send"], S["pad_f"], S["fag_tsems"])
-
-                    def ffn_tile(rows, t, v):
-                        s = row("ffn_alpha") * v[1][...] + row("ffn_beta") * _rms(
-                            gathered_tile(v[0]) * row("post_ffn_w"), c.post_eps
-                        ).astype(bf16).astype(f32)
-                        capture_tile(l, rows, s)
-                        return [s]
-
-                    tile_pass(
-                        [(pad_view(S["pad_f"]), S["ptile"]), (stream_view, S["sin"])],
-                        ffn_tile,
-                        [(stream_view, S["sout"])],
-                        ready=[fag_rdy, None],
+                def ep_for_layer(fn):
+                    """fn(refs, off) on this layer's expert refs: ONE branch-tree walk."""
+                    if isinstance(l, int):
+                        fn(*layer_ex[l])
+                        return
+                    keys = sorted(
+                        {
+                            li if layer_ex[li][1] is None else li - layer_ex[li][1]
+                            for li in kind_layers[kind]
+                        }
                     )
-                    ag_tile_sent("f", S["f_send"], S["pad_f"])
+
+                    def leaf(k):
+                        refs, _ = layer_ex[k]
+                        fn(refs, l - k if k in group_lo else None)
+
+                    _select(l, keys, leaf)
+
+                with _scope("moe"):
+                    ep.layer_moe(
+                        EPLayerStep(
+                            c=c,
+                            S=S,
+                            W=W,
+                            smr=smr,
+                            layer=l,
+                            kind=kind,
+                            for_layer=ep_for_layer,
+                            wait_refs=layer_ex[
+                                l if isinstance(l, int) else kind_layers[kind][0]
+                            ],
+                            me=me,
+                            n_live=n_live,
+                            router=lambda: mv_tiled(l, "wrouter", nxt, smr),
+                            capture=lambda rows, s: capture_tile(l, rows, s),
+                        )
+                    )
+            else:
+                with _scope("moe"):
+                    moe_tiled(l, smr, kind, nxt)
+
+                if not (c.fold_f and nxt is not None):
+                    if c.tiled_vmem_pads:
+                        for t in range(R // RT):
+                            rs = pl.ds(t * RT, RT)
+                            s = row("ffn_alpha") * S["h_stream"][rs] + row(
+                                "ffn_beta"
+                            ) * _rms(
+                                gathered_tile(S["pad_f"].at[:, rs]) * row("post_ffn_w"),
+                                c.post_eps,
+                            ).astype(bf16).astype(f32)
+                            capture_tile(l, rs, s)
+                            S["h_stream"][rs] = s
+                    else:
+                        fag_rdy = ag_tile_ready(S["f_send"], S["pad_f"], S["fag_tsems"])
+
+                        def ffn_tile(rows, t, v):
+                            s = row("ffn_alpha") * v[1][...] + row("ffn_beta") * _rms(
+                                gathered_tile(v[0]) * row("post_ffn_w"), c.post_eps
+                            ).astype(bf16).astype(f32)
+                            capture_tile(l, rows, s)
+                            return [s]
+
+                        tile_pass(
+                            [
+                                (pad_view(S["pad_f"]), S["ptile"]),
+                                (stream_view, S["sin"]),
+                            ],
+                            ffn_tile,
+                            [(stream_view, S["sout"])],
+                            ready=[fag_rdy, None],
+                        )
+                        ag_tile_sent("f", S["f_send"], S["pad_f"])
 
         def tiled_main():
             # rotary rows for every row's position, 8 rows per round of DMAs

@@ -225,6 +225,8 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     attn_head_fp8: int = 0
     alias_oag_f: bool = False
     vmem_limit_bytes: int = 60 * 2**20
+    # dense weights left out of the ring (an FFN-section hook streams its own copies)
+    dense_skip: tuple = ()
 
     @property
     def q_dim(self):

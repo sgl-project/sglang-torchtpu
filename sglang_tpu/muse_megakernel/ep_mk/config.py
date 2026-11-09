@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The EP plan of one row-tiled step: whole experts per rank, I-chunks that fit the TP
-expert rings, the routing table and the scratch the expert section adds."""
+"""The EP plan of one row-tiled step: each rank's own rows (R / tp), 32 whole experts per
+rank, the two ragged all-to-alls' buffers and the scratch the FFN section adds."""
 
 from collections.abc import Callable
 from typing import Any, NamedTuple
@@ -13,6 +13,11 @@ from jax.experimental.pallas import tpu as pltpu
 from sglang_tpu.muse_megakernel.ep_mk.experts import BD_KC, item_sizes
 from sglang_tpu.muse_megakernel.mk.config import MKConfig
 from sglang_tpu.muse_megakernel.mk.consts import LANE
+from sglang_tpu.muse_megakernel.mk.plan import fit_ring_slots
+
+MIN_ROWS = 64  # EP serves the large-row steps only
+SEG = 8  # a2a segments start on 8-row (HBM tile) boundaries and move in 8-row DMAs
+DN_TK, DN_TN = 2048, 1024  # a replicated pool / unpool tile: one fp4 expert-ring slot
 
 
 class EPBuffers(NamedTuple):
@@ -29,7 +34,11 @@ class EPPlan(NamedTuple):
     chunk_fp4: int  # intermediate columns per fp4 chunk: one TP expert-ring slot
     chunk_fp8: int  # an fp8 chunk takes two adjacent ring slots (as TP's fp8 slabs)
     item_rows: int  # rows of one work item; a busier expert takes several
-    slots_pad: int  # routing-table width: an expert's slots <= live rows <= R
+    rows_own: int  # Rc: the rows this rank owns
+    send_rows: (
+        int  # the send / return buffer: own slots, each destination's segment padded
+    )
+    recv_rows: int  # the receive buffer: every row's slots could land on one rank
     max_items: int
     nslot: int  # weight-chunk ring slots (the TP expert ring's)
 
@@ -44,28 +53,44 @@ class EPPlan(NamedTuple):
 
 
 def ep_mk_config(c: MKConfig) -> MKConfig:
-    """The step's MKConfig for the EP kernel: the TP expert section's VMEM y buffers (ysend,
-    pad_y, their pair rounds) go unused, so the plan keeps them small (pad_y in HBM); no o-proj
-    fold into the router, whose per-rank block order would let ranks route a near tie apart."""
+    """The step's MKConfig for the EP kernel: replicated pool / unpool stream outside the
+    dense ring (refitted to the tiles left); no folds into the router or the next qkvg (the
+    FFN section runs on own rows and ends in a row all-gather); the TP expert section's VMEM
+    y buffers go unused (pad_y in HBM)."""
+    c = msgspec.structs.replace(
+        c,
+        dense_skip=("wpool", "wunpool"),
+        fold_o=False,
+        fold_f=False,
+        tiled_vmem_y=0,
+        tiled_pair_y=0,
+        pair_y_stream=False,
+    )
+    slots = fit_ring_slots(c, cap=c.ring_slots)
     return msgspec.structs.replace(
-        c, tiled_vmem_y=0, tiled_pair_y=0, pair_y_stream=False, fold_o=False
+        c, ring_slots=slots, stream_depth=min(c.stream_depth, slots - 1)
     )
 
 
 def ep_plan(c: MKConfig, item_rows: int = 32) -> EPPlan:
-    assert c.row_tile, "the EP expert section is row-tiled only"
-    assert not c.scale_fp8 and c.n_experts % c.tp == 0
+    assert c.row_tile and c.rows >= MIN_ROWS, "EP serves row-tiled steps of >= 64 rows"
+    assert not c.scale_fp8 and c.n_experts % c.tp == 0 and c.rows % c.tp == 0
     assert c.inter_local % BD_KC == 0 and c.expert_hidden % BD_KC == 0
+    assert c.n_experts_padded == c.n_experts and c.expert_hidden % DN_TN == 0
+    assert c.hidden % DN_TK == 0 and c.expert_hidden % DN_TK == 0
     item_sizes(item_rows)
-    el = c.n_experts // c.tp
+    el, rc, k = c.n_experts // c.tp, c.rows // c.tp, c.top_k
+    pad = (SEG - 1) * c.tp
     return EPPlan(
         experts=el,
         inter=c.inter_local * c.tp,
         chunk_fp4=c.inter_local,
         chunk_fp8=c.inter_local,
         item_rows=item_rows,
-        slots_pad=-(-c.rows // LANE) * LANE,
-        max_items=el + -(-c.rows * c.top_k // item_rows),
+        rows_own=rc,
+        send_rows=-(-(rc * k + pad) // SEG) * SEG,
+        recv_rows=-(-(c.rows * k + pad) // SEG) * SEG,
+        max_items=el + -(-c.rows * k // item_rows),
         nslot=c.expert_depth + 1,
     )
 
@@ -91,9 +116,16 @@ def ep_expert_shapes(
     )
 
 
+def window_rows(c: MKConfig) -> int:
+    """Rows of the 16-row aligned window (a bf16 row tile) around any rank's own rows."""
+    rc = c.rows // c.tp
+    reach = max((me * rc) % 16 for me in range(c.tp)) + rc
+    return min(-(-reach // 16) * 16, c.rows)
+
+
 def _item_rows_in_lhs(c: MKConfig, p: EPPlan) -> bool:
-    """The TP expert phase stages its LHS in S["lhs"] ([R, H] bf16), free while experts run:
-    the item buffers fit there from 128 rows on, where VMEM runs short."""
+    """S["lhs"] ([R, H] bf16, every row's pre-FFN input) is free once the pool has read this
+    rank's rows: the item buffers fit there from 128 rows on, where VMEM runs short."""
     return c.rows // 2 >= 2 * p.item_rows and c.hidden >= 2 * c.expert_hidden
 
 
@@ -110,48 +142,50 @@ def ep_buffers(c: MKConfig, p: EPPlan, S: dict) -> EPBuffers:
 
 
 def ep_scratch(c: MKConfig, p: EPPlan) -> list:
-    """Buffers the EP expert section adds to the row-tiled plan."""
-    ri, he = p.item_rows, c.expert_hidden
-    vmem, smem = pltpu.VMEM, pltpu.SMEM
+    """Buffers the EP FFN section adds to the row-tiled plan."""
+    ri, he, tp, k = p.item_rows, c.expert_hidden, c.tp, c.top_k
+    win = window_rows(c)  # own rows are computed in the aligned window around them
+    vmem, smem, hbm = pltpu.VMEM, pltpu.SMEM, pltpu.HBM
+    u32, i32, f32 = jnp.uint32, jnp.int32, jnp.float32
     dma = pltpu.SemaphoreType.DMA
-    route_rows = (p.slots_pad // LANE) * (-(-p.experts // 8) * 8) + 8
     items = []
     if not _item_rows_in_lhs(c, p):
         items += [
-            (
-                "ep_x",
-                vmem((2, ri, he // 2), jnp.uint32),
-            ),  # an item's x rows, bf16 pairs
-            ("ep_acc", vmem((ri, he), jnp.float32)),  # packed into ep_y before the next
-            # outgoing y rows, bf16 pairs: an item's sends have long landed when the next packs
-            ("ep_y", vmem((ri, he // 2), jnp.uint32)),
+            ("ep_x", vmem((2, ri, he // 2), u32)),  # an item's x rows, bf16 pairs
+            ("ep_acc", vmem((ri, he), f32)),
+            ("ep_y", vmem((ri, he // 2), u32)),  # an item's y rows, bf16 pairs
         ]
     return items + [
-        # this rank's rows' y, slot by slot, as the experts' ranks send them (HBM: VMEM is full)
-        ("ep_pad", pltpu.HBM((c.rows_per_dev, c.top_k, he // 2), jnp.uint32)),
-        (
-            "ep_yrow",
-            vmem((2, c.top_k, he // 2), jnp.uint32),
-        ),  # one row's slots, for the combine
-        ("ep_yrow_sems", dma((2,))),
-        # slot j of local expert e on lane e
-        ("ep_tab", vmem((p.slots_pad, LANE), jnp.int32)),
-        # route.local_slots' table: experts' (row * K + slot) per LANE-slot block, counts
-        ("ep_route_v", vmem((route_rows, LANE), jnp.int32)),
-        ("ep_route_s", smem((route_rows, LANE), jnp.int32)),
-        ("ep_items", smem((1 + 3 * p.max_items,), jnp.int32)),
-        # outstanding y row DMAs per staging buffer; this rank's own rows it fed itself
-        ("ep_cnt", smem((8,), jnp.int32)),
-        # y rows per owner rank: counted here, sent as one row each, received from each rank
-        ("ep_cnt_s", smem((c.tp,), jnp.int32)),
-        ("ep_cout", vmem((c.tp, LANE), jnp.int32)),
-        ("ep_cin", vmem((c.tp, LANE), jnp.int32)),
-        ("ep_cin_s", smem((c.tp, LANE), jnp.int32)),
-        ("ep_cin_sem", dma((1,))),
-        ("ep_cout_sem", dma((1,))),
+        # window rows: pooled expert input (bf16 pairs), routing, slot places in ep_xs, the
+        # pooled / combined f32, the unpool output and FFN branch
+        ("ep_xo", vmem((win, he // 2), u32)),
+        ("ep_ids", vmem((win, LANE), i32)),
+        ("ep_wsel", vmem((win, LANE), f32)),
+        ("ep_pos_v", vmem((win, LANE), i32)),
+        ("ep_pos_s", smem((win, LANE), i32)),
+        ("ep_u", vmem((win, he), f32)),
+        ("ep_f", vmem((win, c.hidden), f32)),
+        # slots per (source rank, expert), every rank's row
+        ("ep_csend", vmem((8, c.n_experts), i32)),
+        ("ep_cnt_v", vmem((tp, c.n_experts), i32)),
+        ("ep_cnt_s", smem((tp, c.n_experts), i32)),
+        ("ep_nmat_v", vmem((8, LANE), i32)),  # [source, destination] slots
+        ("ep_nmat_s", smem((8, LANE), i32)),
+        # the two ragged all-to-alls: own slots by destination (and expert), received slots
+        # by source (and expert), their y the same way back
+        ("ep_xs", hbm((p.send_rows, he // 2), u32)),
+        ("ep_xr", hbm((p.recv_rows, he // 2), u32)),
+        ("ep_yr", hbm((p.recv_rows, he // 2), u32)),
+        ("ep_yb", hbm((p.send_rows, he // 2), u32)),
+        ("ep_items", smem((1 + 3 * p.max_items,), i32)),
+        ("ep_rows", smem((p.recv_rows,), i32)),  # received slots grouped by expert
+        ("ep_yrow", vmem((2, k, he // 2), u32)),  # one own row's slots, for the combine
         ("ep_w_sems", dma((p.nslot, 6))),
+        ("ep_dn_sems", dma((p.nslot,))),
         ("ep_x_sems", dma((2,))),
-        ("ep_ys_sems", dma((1,))),
-        ("ep_yr_sem", dma((1,))),
-        ("ep_route_sem", dma((1,))),
+        ("ep_misc_sems", dma((4,))),  # local copies: xs fill, y scatter, tables
+        ("ep_cnt_sems", dma((2,))),  # count rows: received, sent
+        ("ep_a2a_sems", dma((4,))),  # dispatch received / sent, return received / sent
+        ("ep_yrow_sems", dma((2,))),
+        ("ep_ag_sems", dma((2,))),  # row all-gather: received, sent
     ]

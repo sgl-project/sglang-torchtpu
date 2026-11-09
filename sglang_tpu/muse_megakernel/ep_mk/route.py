@@ -1,120 +1,161 @@
 # SPDX-License-Identifier: Apache-2.0
-"""This rank's slots from the replicated top-k: per local expert, its live (row, slot) pairs in
-row order (vector ops, one DMA to SMEM), then work items of at most item_rows slots."""
+"""Routing of the EP FFN section: the top-k of this rank's own rows (once per row, on its
+owner), each own slot's place in the send buffer, and on the receiving side the received
+slots grouped by local expert into work items."""
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.muse_megakernel.ep_mk.config import EPPlan
+from sglang_tpu.muse_megakernel.ep_mk.config import SEG, EPPlan
 from sglang_tpu.muse_megakernel.mk.config import MKConfig
-from sglang_tpu.muse_megakernel.mk.consts import LANE
+from sglang_tpu.muse_megakernel.mk.consts import LANE, SMALL
+from sglang_tpu.muse_megakernel.mk.numerics import _topk_iter
 
 
-def local_slots(c: MKConfig, p: EPPlan, S: dict, me, n_live) -> None:
-    """S["ep_route_s"]: row * K + slot of local expert e's j-th live pair (rows ascending; each
-    row picks an expert at most once) at slot_pair(e, j), the count at [count_row, e]. LANE-wide
-    rows, as the SMEM copy of a VMEM table keeps them.
+def _ceil_seg(x):
+    return (x + SEG - 1) // SEG * SEG
 
-    A pair's place among its expert's pairs is an inclusive row prefix sum (on the MXU: 0/1
-    and counts <= R are exact in bf16, summed in f32); the j-th pair is the row whose prefix
-    reaches j + 1.
+
+def own_topk(c: MKConfig, p: EPPlan, S: dict, smr, win) -> None:
+    """ep_ids / ep_wsel lanes [0, K): the top-k of the window rows (own rows among them) from
+    every row's router logits in S["acc"] (TP's top-k math)."""
+    K, E = c.top_k, c.n_experts
+    w0, wn, _ = win
+    rows = pl.ds(w0, wn)
+    bias = smr[SMALL["expert_bias"] : SMALL["expert_bias"] + 1, :E]
+    sc = jax.nn.sigmoid(S["acc"][rows, pl.ds(0, E)] * c.router_mult)
+    ids_list, picks = _topk_iter(sc + bias, K)
+    wsel = jnp.concatenate(
+        [jnp.sum(jnp.where(q, sc, 0.0), axis=1, keepdims=True) for q in picks], axis=1
+    )
+    wsel = wsel / (jnp.sum(wsel, axis=1, keepdims=True) + c.router_eps) * c.route_scale
+    S["ep_ids"][:, pl.ds(0, K)] = jnp.concatenate(ids_list, axis=1)
+    S["ep_wsel"][:, pl.ds(0, K)] = wsel
+
+
+def _to_dst(E: int, el: int):
+    """[E, LANE] f32: expert -> its rank's lane."""
+    return (
+        jax.lax.broadcasted_iota(jnp.int32, (E, LANE), 0) // el
+        == jax.lax.broadcasted_iota(jnp.int32, (E, LANE), 1)
+    ).astype(jnp.float32)
+
+
+def _dot(a, b):
+    return jnp.dot(
+        a, b, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32
+    )
+
+
+def send_places(c: MKConfig, p: EPPlan, S: dict, n_live, win) -> None:
+    """ep_csend row 0: this rank's live slots per expert; ep_pos_v / ep_pos_s lanes [0, K)
+    (window rows): each own slot's row in ep_xs, where slots run by expert, each destination
+    rank's experts in a segment padded to SEG rows, rows ascending within an expert.
+
+    Small exact integers through f32 matmuls of one-hots against prefix masks.
     """
-    R, K, EL = c.rows, c.top_k, p.experts
+    K, E, rc, el = c.top_k, c.n_experts, p.rows_own, p.experts
+    w0, wn, w_off = win
     f32 = jnp.float32
-    ids = S["ids_v"][:, pl.ds(0, K)] - me * EL  # [R, K] local expert ids
-    r_col = jax.lax.broadcasted_iota(jnp.int32, (R, 1), 0)
-    lane = jax.lax.broadcasted_iota(jnp.int32, (R, LANE), 1)
-    live = r_col < n_live
-    hit = jnp.zeros((R, LANE), f32)
-    slot = jnp.zeros((R, LANE), jnp.int32)
-    for k in range(K):
-        h = (ids[:, k : k + 1] == lane) & live & (lane < EL)
-        hit = hit + jnp.where(h, 1.0, 0.0)
-        slot = slot + jnp.where(h, k, 0)
-    tri = jnp.where(
-        jax.lax.broadcasted_iota(jnp.int32, (R, R), 1) <= r_col, 1.0, 0.0
-    ).astype(jnp.bfloat16)
-    cum = jnp.dot(
-        tri, hit.astype(jnp.bfloat16), preferred_element_type=f32
-    )  # [R, LANE]
-    count = cum[R - 1 : R, :].astype(jnp.int32)  # [1, LANE]
-    enc = jnp.where(hit > 0, r_col * K + slot, 0)
-    tagged = jnp.where(hit > 0, cum, 0.0)  # a hit row's 1-based place in its expert
-
-    crow = count_row(p, S)
-    S["ep_route_v"][pl.ds(crow, 8), :] = jnp.concatenate(
-        [count, jnp.zeros((7, LANE), jnp.int32)], axis=0
+    ids = S["ep_ids"][:, pl.ds(0, K)]
+    r_col = jax.lax.broadcasted_iota(jnp.int32, (wn, 1), 0)
+    live = (r_col >= w_off) & (r_col < w_off + rc) & (w0 + r_col < n_live)
+    lane = jax.lax.broadcasted_iota(jnp.int32, (wn, E), 1)
+    onehots = [((ids[:, k : k + 1] == lane) & live).astype(f32) for k in range(K)]
+    hit = sum(onehots)  # [window, E]: a row picks an expert at most once
+    count = jnp.sum(hit, axis=0, keepdims=True)  # [1, E]
+    e_r = jax.lax.broadcasted_iota(jnp.int32, (E, E), 0)
+    e_c = jax.lax.broadcasted_iota(jnp.int32, (E, E), 1)
+    pre = _dot(count, ((e_r // el == e_c // el) & (e_r < e_c)).astype(f32))  # [1, E]
+    to_dst = _to_dst(E, el)
+    seg = _ceil_seg(_dot(count, to_dst).astype(jnp.int32)).astype(f32)  # [1, LANE]
+    d_r = jax.lax.broadcasted_iota(jnp.int32, (LANE, LANE), 0)
+    d_c = jax.lax.broadcasted_iota(jnp.int32, (LANE, LANE), 1)
+    base = _dot(_dot(seg, (d_r < d_c).astype(f32)), jnp.transpose(to_dst))  # [1, E]
+    tri = (jax.lax.broadcasted_iota(jnp.int32, (wn, wn), 1) < r_col).astype(f32)
+    place = base + pre + _dot(tri, hit)  # [window, E]
+    pos = jnp.concatenate(
+        [jnp.sum(oh * place, axis=1, keepdims=True) for oh in onehots], axis=1
     )
-    sem = S["ep_route_sem"].at[0]
-    cnt_cp = pltpu.make_async_copy(
-        S["ep_route_v"].at[pl.ds(crow, 8)], S["ep_route_s"].at[pl.ds(crow, 8)], sem
+    S["ep_pos_v"][:, pl.ds(0, K)] = pos.astype(jnp.int32)
+    S["ep_csend"][...] = jnp.concatenate(
+        [count.astype(jnp.int32), jnp.zeros((7, E), jnp.int32)], axis=0
     )
-    cnt_cp.start()
-    cnt_cp.wait()
-    max_cnt = jax.lax.fori_loop(
-        0, EL, lambda e, m: jnp.maximum(m, S["ep_route_s"][crow, e]), jnp.int32(0)
-    )
-
-    def block(jb, carry):
-        for jj in range(8):
-            j = (jb * 8 + jj + 1).astype(f32)
-            S["ep_tab"][pl.ds(jb * 8 + jj, 1), :] = jnp.sum(
-                jnp.where(tagged == j, enc, 0), axis=0, keepdims=True
-            )
-        return carry
-
-    jax.lax.fori_loop(0, (max_cnt + 7) // 8, block, 0)
-    elp = _experts_padded(p)
-    for jb in range(p.slots_pad // LANE):  # slots past a count: stale
-        tab_t = jnp.transpose(S["ep_tab"][pl.ds(jb * LANE, LANE), :])  # [e, j]
-        S["ep_route_v"][pl.ds(jb * elp, elp), :] = tab_t[:elp]
-    tab_cp = pltpu.make_async_copy(
-        S["ep_route_v"].at[pl.ds(0, crow)], S["ep_route_s"].at[pl.ds(0, crow)], sem
-    )
-    tab_cp.start()
-    tab_cp.wait()
+    cp = pltpu.make_async_copy(S["ep_pos_v"], S["ep_pos_s"], S["ep_misc_sems"].at[2])
+    cp.start()
+    cp.wait()
 
 
-def _experts_padded(p: EPPlan) -> int:
-    return -(-p.experts // 8) * 8
+def slot_matrix(c: MKConfig, S: dict) -> None:
+    """ep_nmat_s[s, d]: slots rank s sends rank d; ep_cnt_s: every rank's counts row."""
+    E, el, tp = c.n_experts, c.n_experts // c.tp, c.tp
+    n = _dot(S["ep_cnt_v"][...].astype(jnp.float32), _to_dst(E, el))  # [tp, LANE]
+    S["ep_nmat_v"][pl.ds(0, tp), :] = n.astype(jnp.int32)
+    cps = [
+        pltpu.make_async_copy(S["ep_nmat_v"], S["ep_nmat_s"], S["ep_misc_sems"].at[2]),
+        pltpu.make_async_copy(S["ep_cnt_v"], S["ep_cnt_s"], S["ep_misc_sems"].at[3]),
+    ]
+    for cp in cps:
+        cp.start()
+    for cp in cps:
+        cp.wait()
 
 
-def route_rows(p: EPPlan) -> int:
-    """Rows of the routing table: per block of LANE slots, one row per local expert (8-row
-    padded), then 8 rows whose first holds the counts."""
-    return (p.slots_pad // LANE) * _experts_padded(p) + 8
+def seg_start(S: dict, tp: int, s, d, *, by_source: bool):
+    """Start row of the (s -> d) segment: in rank s's send buffer (by_source=False: its
+    destinations before d) or in rank d's receive buffer (by_source=True: the sources before
+    s); every segment padded to SEG rows."""
+    n = S["ep_nmat_s"]
+    total = jnp.int32(0)
+    for x in range(tp):
+        cnt = n[x, d] if by_source else n[s, x]
+        before = x < s if by_source else x < d
+        total = total + jnp.where(before, _ceil_seg(cnt), 0)
+    return total
 
 
-def count_row(p: EPPlan, S: dict) -> int:
-    """The SMEM row of the per-expert slot counts."""
-    return route_rows(p) - 8
+def seg_rows(S: dict, s, d):
+    """Slots of the (s -> d) segment, and its 8-row DMAs."""
+    n = S["ep_nmat_s"][s, d]
+    return n, (n + SEG - 1) // SEG
 
 
-def slot_pair(p: EPPlan, S: dict, e, j):
-    """row * K + slot of local expert e's j-th pair."""
-    return S["ep_route_s"][(j // LANE) * _experts_padded(p) + e, j % LANE]
+def build_items(c: MKConfig, p: EPPlan, S: dict, me) -> jax.Array:
+    """ep_rows: received slot rows grouped by local expert (each source's slots for an expert
+    are contiguous in its segment); ep_items = [n_items, (expert, first, rows)...] over
+    ep_rows, at most item_rows each. Returns n_items."""
+    tp, el, ri = c.tp, p.experts, p.item_rows
+    cnt, rows, items = S["ep_cnt_s"], S["ep_rows"], S["ep_items"]
+    starts = [seg_start(S, tp, s, me, by_source=True) for s in range(tp)]
 
+    def expert(e, carry):
+        n_rows, n_items = carry
+        first = n_rows
+        for s in range(tp):
 
-def build_items(p: EPPlan, S: dict) -> jax.Array:
-    """S["ep_items"] = [n_items, (expert, first slot, slots) per item...]; returns n_items."""
-    crow = count_row(p, S)
-    tab = S["ep_items"]
+            def before(e2, acc, s=s):
+                return acc + cnt[s, me * el + e2]
 
-    def expert(e, n_items):
-        cnt = S["ep_route_s"][crow, e]
+            base = starts[s] + jax.lax.fori_loop(0, e, before, jnp.int32(0))
+
+            def one(t, n, base=base):
+                rows[n] = base + t
+                return n + 1
+
+            n_rows = jax.lax.fori_loop(0, cnt[s, me * el + e], one, n_rows)
+        total = n_rows - first
 
         def item(b, n):
-            tab[1 + 3 * n] = e
-            tab[2 + 3 * n] = b * p.item_rows
-            tab[3 + 3 * n] = jnp.minimum(cnt - b * p.item_rows, p.item_rows)
+            items[1 + 3 * n] = e
+            items[2 + 3 * n] = first + b * ri
+            items[3 + 3 * n] = jnp.minimum(total - b * ri, ri)
             return n + 1
 
-        return jax.lax.fori_loop(
-            0, (cnt + p.item_rows - 1) // p.item_rows, item, n_items
-        )
+        n_items = jax.lax.fori_loop(0, (total + ri - 1) // ri, item, n_items)
+        return n_rows, n_items
 
-    n_items = jax.lax.fori_loop(0, p.experts, expert, jnp.int32(0))
-    tab[0] = n_items
+    _, n_items = jax.lax.fori_loop(0, el, expert, (jnp.int32(0), jnp.int32(0)))
+    items[0] = n_items
     return n_items

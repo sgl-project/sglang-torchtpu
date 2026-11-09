@@ -31,7 +31,9 @@ def dense_plan(c):
     # qkvg / o / pool / unpool stream as fp8 e4m3 with per-output-channel scales
     fp8 = ("wqkvg", "wo", "wpool", "wunpool")
     return tuple(
-        (n, K, N, jnp.float8_e4m3fn if n in fp8 else jnp.bfloat16) for n, K, N in shapes
+        (n, K, N, jnp.float8_e4m3fn if n in fp8 else jnp.bfloat16)
+        for n, K, N in shapes
+        if n not in c.dense_skip
     )
 
 
