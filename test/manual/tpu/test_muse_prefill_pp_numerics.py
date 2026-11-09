@@ -52,10 +52,12 @@ LOG2E = 1.4426950408889634
 TOL_ROW, TOL_MEAN = 3e-2, 1e-2
 TOL_KV = 1e-6  # the chunk's fp8 K/V in the pool: exactly the kernel's k, v rounded
 TOL_QKV = 1e-2  # attention inputs: bf16 roundings of nearly equal f32 values
-TOL_ATTN = 2e-2  # attention from the kernel's own q, k, v
-TOL_EXPERTS = (
-    2e-2  # normalized slot outputs from the kernel's own expert input and picks
-)
+# The served kernels against this f32 reference: RPA's standard bf16 tile alone is 1.6% off
+# (bf16 P without a running max, outputs that nearly cancel before the head norm), the fp8-q
+# transposed tile 2.2%; gmm_v2's W8A8 (fp8 layers) 3.6-4.3%, NVFP4 W4A16 0.45%. The port itself
+# is checked exactly: the stage's attention and slot outputs equal the served calls' bits.
+TOL_ATTN = 3e-2
+TOL_EXPERTS = {"fp4": 1e-2, "fp8": 5e-2}
 # a token whose top-k set differs from the reference's must be a near tie of biased scores
 NEAR_TIE = 2e-3
 
@@ -326,6 +328,23 @@ def ref_attn(c, w, l, x, pool, table, rope, ids_in=None, qkv_in=None, o_in=None)
     return x, xe, ids, tw, k8, v8, biased, (q_out, k_out, v_out, attn)
 
 
+def served_attention(c, is_global, q, k, v, pool, table):
+    """The native layer's RPA call (muse_spark_prefill_native_pp.py) on these q, k, v."""
+    from sglang_tpu.attention.pallas.batched_rpa import configs
+    from sglang_tpu.attention.pallas.batched_rpa.wrapper import ragged_paged_attention
+
+    o, _ = ragged_paged_attention(
+        q.reshape(T, c.q_heads, c.head_dim),
+        k.astype(jnp.float8_e4m3fn).reshape(T, c.kv_heads, c.head_dim),
+        v.astype(jnp.float8_e4m3fn).reshape(T, c.kv_heads, c.head_dim),
+        pool, jnp.array([CTX + T], jnp.int32), table, jnp.array([0, T], jnp.int32),
+        jnp.array([0, 0, 1], jnp.int32), sm_scale=c.head_dim**-0.5,
+        sliding_window=None if is_global else c.window, k_scale=1.0, v_scale=1.0,
+        kv_layout=configs.KVLayout.SEQ_ALONG_LANE, out_head_norm_eps=-1.0,
+    )  # fmt: skip
+    return o.reshape(T, c.q_dim)
+
+
 def ref_post(c, w, l, x, yn, tw):
     """The weighted slot sum, unpooler and residual of layer l; yn [T, K, He]."""
     H = c.hidden
@@ -517,10 +536,11 @@ def main() -> int:
             ids_k, tw_k = kernel[0], kernel[1]
             ex = w["fp8"] if KINDS[l] == "fp8" else w["fp4"][first + l]
             y_served = jax.jit(lambda *a: PP_MOE.experts(c, *a))(xe_k, ids_k, tw_k, ex)
-            print(
-                f"  layer {l}: stage slot outputs vs _fused_moe_jax on the same inputs: rel "
-                f"{rel_of(kernel[7], y_served):.2e}"
+            y_port = rel_of(kernel[7], y_served)
+            o_served = jax.jit(served_attention, static_argnums=(0, 1))(
+                c, GLOBAL[l], q_k, k_k, v_k, pool, table
             )
+            o_port = rel_of(o_k, o_served)
             kk, vv = pool_tokens(kpool, table, CTX + T)
             kv_rel = float(
                 jnp.linalg.norm(jnp.concatenate([kk[CTX:] - k8, vv[CTX:] - v8]))
@@ -536,7 +556,9 @@ def main() -> int:
                 and qkv_rel < TOL_QKV
                 and o_rel < TOL_ATTN
                 and xe_rel < TOL_QKV
-                and y_rel < TOL_EXPERTS
+                and y_rel < TOL_EXPERTS[KINDS[l]]
+                and o_port == 0.0
+                and y_port == 0.0
                 and kv_rel < TOL_KV
                 and cached_same
                 and gap < NEAR_TIE
@@ -545,7 +567,8 @@ def main() -> int:
             print(
                 f"layer {l} ({KINDS[l]}, {'global' if GLOBAL[l] else 'window'}): q/k/v rel "
                 f"{qkv_rel:.2e} | attention rel {o_rel:.2e} | expert input rel {xe_rel:.2e} | "
-                f"expert out rel {y_rel:.2e} | chunk kv rel {kv_rel:.2e} cached "
+                f"expert out rel {y_rel:.2e} | vs served calls: attention {o_port:.1e} experts "
+                f"{y_port:.1e} | chunk kv rel {kv_rel:.2e} cached "
                 f"kept {cached_same} | row rel max {worst:.2e} mean {mean:.2e} rows>10% {n_bad} "
                 f"| top-k flips {n_flip} (worst gap {gap:.1e}) | {'OK' if good else 'FAIL'}"
             )
