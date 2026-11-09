@@ -162,38 +162,46 @@ def scale_group(kind: str) -> int:
     return qblock() or FP4_GROUP
 
 
-def qblock_dot(x, wref, sref, K, N, block):
-    """x [R, K] bf16 @ the codes of a block-scaled NVFP4 slab -> f32 [R, N]: each dot pushes
-    raw codes (as e4m3) of one block and scales its [R, tn] partial by the block's row."""
-    cols = []
-    for n0 in range(0, N, QB_TN):
-        tn = min(QB_TN, N - n0)
-        acc = None
-        for k0 in range(0, K, block):
-            w = pltpu.bitcast(
-                wref[pl.ds(k0 // FP4_PACK, block // FP4_PACK), pl.ds(n0, tn)],
-                jnp.float4_e2m1fn,
-            ).astype(jnp.float8_e4m3fn)
-            part = jnp.dot(x[:, k0 : k0 + block], w, preferred_element_type=jnp.float32)
-            s = sref[pl.ds(k0 // block, 1), pl.ds(n0, tn)].astype(jnp.float32)
-            acc = part * s if acc is None else acc + part * s
-        cols.append(acc)
-    return cols[0] if len(cols) == 1 else jnp.concatenate(cols, axis=1)
+def qblock_dot(x, wref, sref, k0, K, n0, tn, block):
+    """x [R, K] bf16 @ rows [k0, k0 + K) x columns [n0, n0 + tn) of a block-scaled NVFP4 slab ->
+    f32 [R, tn]: each dot pushes raw codes (as e4m3) of one block and scales its partial by
+    the block's row."""
+    acc = None
+    for kk in range(k0, k0 + K, block):
+        w = pltpu.bitcast(
+            wref[pl.ds(kk // FP4_PACK, block // FP4_PACK), pl.ds(n0, tn)],
+            jnp.float4_e2m1fn,
+        ).astype(jnp.float8_e4m3fn)
+        part = jnp.dot(
+            x[:, kk - k0 : kk - k0 + block], w, preferred_element_type=jnp.float32
+        )
+        s = sref[pl.ds(kk // block, 1), pl.ds(n0, tn)].astype(jnp.float32)
+        acc = part * s if acc is None else acc + part * s
+    return acc
 
 
 def _q_arm(
     R: int, B: int, x_rows: Callable, acc, w: ChunkRefs, He: int, CI: int
 ) -> None:
-    """Up to R slots on B-row block-scaled weights: plain R-row dots on the codes."""
+    """Up to R slots on B-row block-scaled weights: plain R-row dots on the codes. h comes in
+    B-column blocks and w2 takes each block for every column tile before the next, so the MXU
+    streams w2 while the last block's SiLU is in flight."""
     xt = x_rows(R).astype(jnp.bfloat16)
-    g = qblock_dot(xt, w.wg, w.sg, He, CI, B)
-    u = qblock_dot(xt, w.wu, w.su, He, CI, B)
-    h = (g * jax.nn.sigmoid(g) * u).astype(jnp.bfloat16)
-    for n0 in range(0, He, QB_TN):
-        cols = pl.ds(n0, QB_TN)
-        acc[pl.ds(0, R), cols] += qblock_dot(
-            h, w.w2.at[:, cols], w.s2.at[:, cols], CI, QB_TN, B
-        )
+    hs = []
+    for c0 in range(0, CI, B):
+        g = qblock_dot(xt, w.wg, w.sg, 0, He, c0, B, B)
+        u = qblock_dot(xt, w.wu, w.su, 0, He, c0, B, B)
+        hs.append((g * jax.nn.sigmoid(g) * u).astype(jnp.bfloat16))
+    tiles = range(0, He, QB_TN)
+    parts = [
+        [qblock_dot(h, w.w2, w.s2, kb * B, B, n0, QB_TN, B) for n0 in tiles]
+        for kb, h in enumerate(hs)
+    ]
+    for t, n0 in enumerate(tiles):
+        y = parts[0][t]
+        for p in parts[1:]:
+            y = y + p[t]
+        acc[pl.ds(0, R), pl.ds(n0, QB_TN)] += y
 
 
 def _bd_arm(A: int, x_rows: Callable, acc, w: ChunkRefs, He: int, CI: int) -> None:
