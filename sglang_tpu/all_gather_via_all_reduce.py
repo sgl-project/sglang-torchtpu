@@ -18,12 +18,12 @@ The workaround is scoped to the vocabulary logits gathers: in
 ``LogitsProcessor``, the TP gather (``_logits_gatherer``, which falls back to
 ``tensor_model_parallel_all_gather`` on TPU) and the attention-TP gather used
 with ``--enable-dp-lm-head`` (``_gather_attn_tp_logits``); and the speculative
-draft gather ``sglang.srt.models.dspark.gather_and_crop_vocab``. ``GroupCoordinator``
-collectives stay native. Hooking them changed every per-layer gather (DP-attention
-token gathers, fused-MoE token gathers), moved about 2x the bytes, and slowed
-GLM-5.3-Flash DP8 by 8 to 14% (sgl-project/sglang-torchtpu#2013). A similar
-compiled-gather fault on the DCP query-head gather is handled at its own call
-site (``sglang_tpu/attention_pallas_rpa_dcp.py``).
+draft gather ``sglang.srt.models.dspark.gather_and_crop_vocab``.
+``GroupCoordinator`` collectives stay native. Hooking them changed every
+per-layer gather (DP-attention token gathers, fused-MoE token gathers) and
+moved about 2x the bytes. A similar compiled-gather fault on the DCP query-head
+gather is handled at its own call site
+(``sglang_tpu/attention_pallas_rpa_dcp.py``).
 
 The hook keys on ``torch.compiler.is_dynamo_compiling()``, so only graphs the
 Dynamo tracer builds take this path. The direct tracer and eager calls keep the
