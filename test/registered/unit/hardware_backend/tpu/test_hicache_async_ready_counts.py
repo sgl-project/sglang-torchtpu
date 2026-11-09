@@ -27,6 +27,10 @@ class _Queue:
         return self.n
 
 
+class _Cache:
+    pass
+
+
 def _cache(*, acks, queue):
     cc = SimpleNamespace(
         ack_write_queue=[],
@@ -37,17 +41,16 @@ def _cache(*, acks, queue):
         host_mem_release_queue=_Queue(0),
         extra_host_mem_release_queues={},
     )
-    cache = SimpleNamespace(
-        cache_controller=cc,
-        enable_storage=True,
-        tp_world_size=8,
-        pp_size=1,
-        attn_cp_group=None,
-        attn_tp_group=None,
-        tp_group=object(),
-        tree_core=SimpleNamespace(write_back_duplicate_reclaim_digest=7),
-        _count_ready_acks=lambda q: acks,
-    )
+    cache = _Cache()
+    cache.cache_controller = cc
+    cache.enable_storage = True
+    cache.tp_world_size = 8
+    cache.pp_size = 1
+    cache.attn_cp_group = None
+    cache.attn_tp_group = None
+    cache.tp_group = object()
+    cache.tree_core = SimpleNamespace(write_back_duplicate_reclaim_digest=7)
+    cache._count_ready_acks = lambda q: acks
     return cache
 
 
