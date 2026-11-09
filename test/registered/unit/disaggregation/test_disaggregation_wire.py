@@ -710,6 +710,13 @@ class TestPollCollectives(CustomTestCase):
         )
         failure_prob.start()
         self.addCleanup(failure_prob.stop)
+        # The count-agreement collective is covered with real gloo ranks in
+        # test_transfer_poll_rank_desync; here the status reduction is isolated.
+        check_count = patch.object(
+            envs.SGLANG_DISAGGREGATION_POLL_CHECK_COUNT, "get", return_value=False
+        )
+        check_count.start()
+        self.addCleanup(check_count.stop)
 
     def test_tp_cp_consensus_skips_only_singleton_groups(self):
         """Poll states retain TP/CP consensus without singleton collectives."""
@@ -723,7 +730,7 @@ class TestPollCollectives(CustomTestCase):
                 peers = {tp: tp_peers, cp: cp_peers}
                 pollers = [Mock(poll=Mock(return_value=state)) for state in local]
 
-                def reduce(tensor, op, group):
+                def reduce(tensor, op, group, async_op=False):
                     self.assertEqual(op, dist.ReduceOp.MIN)
                     if sizes[group] > 1:
                         tensor.copy_(
@@ -731,6 +738,7 @@ class TestPollCollectives(CustomTestCase):
                                 tensor, torch.tensor(peers[group], dtype=tensor.dtype)
                             )
                         )
+                    return Mock(wait=Mock(return_value=True))
 
                 expected = local.copy()
                 expected_calls = []
@@ -738,7 +746,7 @@ class TestPollCollectives(CustomTestCase):
                     if sizes[group] > 1:
                         expected = [min(a, b) for a, b in zip(expected, peers[group])]
                         expected_calls.append(
-                            call(ANY, op=dist.ReduceOp.MIN, group=group)
+                            call(ANY, op=dist.ReduceOp.MIN, group=group, async_op=True)
                         )
                 with (
                     patch.object(dist, "get_world_size", side_effect=sizes.__getitem__),

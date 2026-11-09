@@ -333,6 +333,9 @@ class CompiledFunction:
 
     def warmup_async(self, *args: Any, **kwargs: Any) -> PendingCall:
         queue = current_warmup_queue()
+        if queue is not None and queue.verify and not self._spmd_safe:
+            # Verification compares shared model graphs and never runs these helpers.
+            return PendingCall(lambda: None)
         if self._spmd_safe and queue is not None and queue.spmd_compiler is not None:
             # Snapshot reused containers while retaining their local tensor buffers.
             args, kwargs = tree_util.tree_map(lambda value: value, (args, kwargs))
@@ -343,8 +346,12 @@ class CompiledFunction:
         self, *args: Any, async_compile: bool = False, **kwargs: Any
     ) -> PendingCall:
         """Compile without executing; shared input binding completes at queue join."""
-        queue = current_warmup_queue() if self._spmd_safe else None
-        shared = queue is not None and queue.spmd_compiler is not None
+        queue = current_warmup_queue()
+        if queue is not None and queue.verify and not self._spmd_safe:
+            return PendingCall(lambda: None)
+        shared = (
+            self._spmd_safe and queue is not None and queue.spmd_compiler is not None
+        )
         # Shared compilation validates real input layouts on every rank.
         if async_compile and not shared:
             tensors = [
@@ -415,6 +422,7 @@ class CompiledFunction:
             )
             if spmd_compiler is not None:
                 spmd_compiler.enqueue(graph)
+            trace_start = time.perf_counter()
             artifact = self._compile(
                 args,
                 kwargs,
@@ -422,6 +430,12 @@ class CompiledFunction:
                 spmd_compiler=spmd_compiler,
                 graph=graph,
             )
+            if (
+                spmd_compiler is not None
+                and not spmd_compiler.verify_spmd_safe
+                and spmd_compiler.submissions[graph].owner == spmd_compiler.rank
+            ):
+                spmd_compiler.record_trace(graph, time.perf_counter() - trace_start)
             self.cache[key] = artifact
         return artifact
 

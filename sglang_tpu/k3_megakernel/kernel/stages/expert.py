@@ -53,6 +53,15 @@ def _scaled_group_sum(part: jax.Array, rows: int, exp: jax.Array) -> jax.Array:
     return jnp.sum(part * _e8m0_to_f32(exp)[None], axis=1)
 
 
+def _scale_rows(exp_ref, groups: int, pair: bool = False) -> jax.Array:
+    """The ``groups`` real e8m0 rows of a scale ref. The serving runtime stores the family with
+    padding rows past ``groups`` (``ops._pad_down_scale``: 16 instead of 12, so torch_tpu keeps
+    it in the kernel's row-major layout); the loaded value is the same ``[.., groups, N]`` either way."""
+    if exp_ref.shape[-2] == groups:
+        return exp_ref[...]
+    return exp_ref[:, :groups] if pair else exp_ref[:groups]
+
+
 def down_dot_pair(
     a0: jax.Array, a1: jax.Array, packed_ref, exp_ref
 ) -> tuple[jax.Array, jax.Array]:
@@ -74,7 +83,7 @@ def down_dot_pair(
         left = jnp.concatenate([left, jnp.zeros((pad, 2 * c), left.dtype)], axis=0)
     part = jax.lax.dot_general(left, w, _DN, preferred_element_type=jnp.float32)
     n0 = l0.shape[0]
-    exp = exp_ref[...]
+    exp = _scale_rows(exp_ref, c // 32, pair=True)
     return _scaled_group_sum(part, rows, exp[0]), _scaled_group_sum(
         part[n0:], rows, exp[1]
     )
@@ -96,7 +105,7 @@ def down_dot(a: jax.Array, packed_ref, exp_ref) -> jax.Array:
         left = jnp.concatenate([left, jnp.zeros((pad, c), left.dtype)], axis=0)
     part = jax.lax.dot_general(left, w, _DN, preferred_element_type=jnp.float32)
     part = part[: rows * groups].reshape(rows, groups, -1)
-    return jnp.sum(part * _e8m0_to_f32(exp_ref[...])[None], axis=1)
+    return jnp.sum(part * _e8m0_to_f32(_scale_rows(exp_ref, groups))[None], axis=1)
 
 
 def down_dot_dequant(a: jax.Array, packed_ref, exp_ref) -> jax.Array:
@@ -106,7 +115,9 @@ def down_dot_dequant(a: jax.Array, packed_ref, exp_ref) -> jax.Array:
     groups = c // 32
     w = pltpu.bitcast(packed_ref.bitcast(jnp.uint32)[...], jnp.float4_e2m1fn)
     w = w.astype(jnp.float8_e4m3fn).astype(jnp.bfloat16)
-    scale = _e8m0_to_f32(exp_ref[...]).astype(jnp.bfloat16)  # [groups, N]
+    scale = _e8m0_to_f32(_scale_rows(exp_ref, groups)).astype(
+        jnp.bfloat16
+    )  # [groups, N]
     n = scale.shape[-1]
     scale = jnp.broadcast_to(scale[:, None, :], (groups, 32, n)).reshape(c, n)
     return jax.lax.dot_general(a, w * scale, _DN, preferred_element_type=jnp.float32)

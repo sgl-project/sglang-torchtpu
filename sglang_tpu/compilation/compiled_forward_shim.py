@@ -32,6 +32,12 @@ from sglang_tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
 )
+from sglang_tpu.compilation.logit_rows import (
+    build_logit_rows,
+    identity_reasons,
+    logit_rows_enabled,
+    takes_logit_rows,
+)
 from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
@@ -193,17 +199,26 @@ def _fit_pp_proxy_rows(proxy: Any, input_ids: Any, forward_batch: Any) -> Any:
     The ICI wave delivers the previous stage's activations at its fixed buffer
     size (the largest token bucket), so a longer proxy is trimmed to this
     stage's padded token count; a shorter one means the two stages padded to
-    different buckets and is rejected.
+    different buckets and is rejected. The buffered hand-off receives exactly
+    the padded token count the scheduler derived from the batch, so any other
+    row count there means that derivation and this padding disagree.
     """
     reference = input_ids if input_ids is not None else forward_batch.input_ids
     if reference is None:
         return proxy
     expected = int(reference.shape[0])
+    exact = envs.SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF.get()
     tensors = {}
     trimmed = False
     for name, tensor in proxy.tensors.items():
         if isinstance(tensor, torch.Tensor):
             rows = int(tensor.shape[0])
+            if exact and rows != expected:
+                raise ValueError(
+                    f"pp_proxy_tensors[{name!r}] has {rows} rows but the padded "
+                    f"batch has {expected} input tokens; the buffered hand-off "
+                    "received a different row count than the forward pads to."
+                )
             if rows < expected:
                 raise ValueError(
                     f"pp_proxy_tensors[{name!r}] has {rows} rows but the padded "
@@ -560,6 +575,65 @@ def _pad_mamba_tracking(forward_batch: Any, pad_b: int) -> None:
     forward_batch._tpu_mamba_tracking_cpu = originals
 
 
+def speculative_tokens_per_req(forward_mode: Any, spec_info: Any) -> int | None:
+    """The fixed speculative width a verify or draft-extend forward pads each
+    request to; None for every other forward."""
+    if spec_info is None:
+        return None
+    if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
+        return spec_info.num_tokens_per_req
+    return None
+
+
+def forward_pad_shape(
+    forward_mode: Any,
+    real_q: int,
+    real_b: int,
+    num_tokens_per_req: int | None,
+    t_bucketer: Bucketer,
+    b_bucketer: Bucketer,
+    extend_bs: int | None = None,
+) -> tuple[int, int]:
+    """The (tokens, batch) bucket shape a forward of ``real_q`` tokens over
+    ``real_b`` requests is padded to, without DP attention (whose ranks agree
+    on one shape). ``num_tokens_per_req`` is the speculative width of a verify
+    or draft-extend forward, None otherwise. A decode forward's ``real_q`` is
+    its batch size."""
+    is_draft_extend_v2 = forward_mode.is_draft_extend_v2()
+    if forward_mode.is_decode():
+        return b_bucketer.next_bucket(real_q), b_bucketer.next_bucket(real_b)
+    if forward_mode.is_mixed():
+        extend_cap = _extend_batch_cap(t_bucketer, b_bucketer, extend_bs)
+        mixed_cap = _extend_batch_cap(t_bucketer, b_bucketer, b_bucketer.max_val)
+        pad_b = extend_cap if real_b <= extend_cap else mixed_cap
+        if real_b > pad_b:
+            raise ValueError(
+                f"TPU mixed batch size {real_b} exceeds its compile cap {pad_b}. "
+                "Increase --torch-compile-max-bs to cover the largest mixed batch."
+            )
+        return t_bucketer.next_bucket(max(real_q, pad_b)), pad_b
+    if forward_mode.is_target_verify() and num_tokens_per_req is not None:
+        # Verify is decode-like: batch follows the bs bucket (not pinned to the
+        # cap), with a fixed speculative width per request.
+        pad_b = b_bucketer.next_bucket(real_b)
+        return pad_b * num_tokens_per_req, pad_b
+    if is_draft_extend_v2 and num_tokens_per_req is not None:
+        pad_b = b_bucketer.next_bucket(real_b)
+        assert num_tokens_per_req > 0, (
+            f"DRAFT_EXTEND_V2 requires num_tokens_per_req > 0, got {num_tokens_per_req}"
+        )
+        return pad_b * num_tokens_per_req, pad_b
+    # Prefill/extend is precompiled at a fixed batch cap to avoid compiling
+    # the full token_bucket x batch_bucket cross product.
+    pad_b = _extend_batch_cap(t_bucketer, b_bucketer, extend_bs)
+    if real_b > pad_b:
+        raise ValueError(
+            f"TPU extend batch size {real_b} exceeds its compile cap {pad_b}. "
+            "Set --prefill-max-requests to at least the largest extend batch."
+        )
+    return t_bucketer.next_bucket(max(real_q, pad_b)), pad_b
+
+
 def _pad_forward_batch_inputs(
     forward_batch: Any,
     t_bucketer: Bucketer,
@@ -582,48 +656,18 @@ def _pad_forward_batch_inputs(
         pad_t, pad_b, real_q_out, real_b_out = _dp_attn_prepare_padding(
             forward_batch, t_bucketer, b_bucketer, real_q, real_b
         )
-    elif is_decode:
-        pad_t = b_bucketer.next_bucket(real_q)
-        pad_b = b_bucketer.next_bucket(real_b)
-        real_q_out, real_b_out = real_q, real_b
-    elif forward_batch.forward_mode.is_mixed():
-        extend_cap = _extend_batch_cap(t_bucketer, b_bucketer, extend_bs)
-        mixed_cap = _extend_batch_cap(t_bucketer, b_bucketer, b_bucketer.max_val)
-        pad_b = extend_cap if real_b <= extend_cap else mixed_cap
-        if real_b > pad_b:
-            raise ValueError(
-                f"TPU mixed batch size {real_b} exceeds its compile cap {pad_b}. "
-                "Increase --torch-compile-max-bs to cover the largest mixed batch."
-            )
-        pad_t = t_bucketer.next_bucket(max(real_q, pad_b))
-        real_q_out, real_b_out = real_q, real_b
-    elif (
-        forward_batch.forward_mode.is_target_verify()
-        and forward_batch.spec_info is not None
-    ):
-        # Verify is decode-like: batch follows the bs bucket (not pinned to the
-        # cap), with a fixed speculative width per request.
-        pad_b = b_bucketer.next_bucket(real_b)
-        pad_t = pad_b * forward_batch.spec_info.num_tokens_per_req
-        real_q_out, real_b_out = real_q, real_b
-    elif is_draft_extend_v2 and forward_batch.spec_info is not None:
-        pad_b = b_bucketer.next_bucket(real_b)
-        num_tokens_per_req = forward_batch.spec_info.num_tokens_per_req
-        assert num_tokens_per_req > 0, (
-            f"DRAFT_EXTEND_V2 requires num_tokens_per_req > 0, got {num_tokens_per_req}"
-        )
-        pad_t = pad_b * num_tokens_per_req
-        real_q_out, real_b_out = real_q, real_b
     else:
-        # Prefill/extend is precompiled at a fixed batch cap to avoid compiling
-        # the full token_bucket x batch_bucket cross product.
-        pad_b = _extend_batch_cap(t_bucketer, b_bucketer, extend_bs)
-        if real_b > pad_b:
-            raise ValueError(
-                f"TPU extend batch size {real_b} exceeds its compile cap {pad_b}. "
-                "Set --prefill-max-requests to at least the largest extend batch."
-            )
-        pad_t = t_bucketer.next_bucket(max(real_q, pad_b))
+        pad_t, pad_b = forward_pad_shape(
+            forward_batch.forward_mode,
+            real_q,
+            real_b,
+            speculative_tokens_per_req(
+                forward_batch.forward_mode, forward_batch.spec_info
+            ),
+            t_bucketer,
+            b_bucketer,
+            extend_bs,
+        )
         real_q_out, real_b_out = real_q, real_b
 
     _pad_batch_fields(
@@ -846,6 +890,47 @@ def precompile_kv_offload(host_pool: TpuFusedMHATokenToKVPoolHost) -> None:
     snapshot_recompilation_baseline()
 
 
+class _SkipGuardStance:
+    """Run a serving-time decode with Dynamo's skip_guard_eval_unsafe stance.
+
+    Armed only once warmup froze torch.compile with fail_on_recompile: every
+    decode graph is then precompiled, and Dynamo's differentiating guards
+    (all tensor guards, plus every guard that failed while warmup compiled
+    the variants) still pick among them. The full guard set (thousands of
+    checks on ForwardBatch/global state) is skipped. Outside a frozen
+    stance (warmup, spec-decode recompiles) nothing changes.
+
+    SGLANG_TPU_DECODE_SKIP_GUARD_EVAL (default off; the Kimi-K3.1 recipe turns it on). Uses Dynamo's private
+    eval_frame._set_stance / DynamoStance(skip_guard_eval_unsafe=True); remove
+    when torch exposes a public per-call stance for frozen graphs.
+    """
+
+    def __init__(self) -> None:
+        from torch._dynamo import eval_frame
+
+        self._eval_frame = eval_frame
+        self._stance = eval_frame.DynamoStance(
+            "fail_on_recompile", skip_guard_eval_unsafe=True
+        )
+        self._prior = None
+
+    def armed(self) -> bool:
+        stance = self._eval_frame._stance
+        return (
+            stance.stance == "fail_on_recompile"
+            and not stance.skip_guard_eval_unsafe
+            and stance.backend is None
+            and not torch.compiler.is_compiling()
+        )
+
+    def __enter__(self) -> None:
+        self._prior = self._eval_frame._set_stance(self._stance)
+
+    def __exit__(self, *exc: Any) -> None:
+        self._eval_frame._set_stance(self._prior)
+        self._prior = None
+
+
 class CompiledForwardShim:
     """Adapt compiled forward calls and outputs for padded execution."""
 
@@ -864,6 +949,9 @@ class CompiledForwardShim:
         # it is frozen for this shim's lifetime. Caching it also keeps the
         # disabled path at a single attribute read per forward.
         self._prompt_logprob_enabled = envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
+        # LR1 logit rows (sglang_tpu/compilation/logit_rows.py): read once, like
+        # the prompt-logprob flag, since it decides the EXTEND graph's inputs.
+        self._logit_rows_enabled = logit_rows_enabled()
         runner = policy.model_runner
         # Draft models read the multimodal embeds inside their forward.
         self._draft_worker = bool(
@@ -878,6 +966,13 @@ class CompiledForwardShim:
         if signature is not None:
             self.__signature__ = signature
         self._default_kwargs = _static_default_kwargs(compiled_fn)
+        from sglang_tpu.envs import envs as tpu_envs
+
+        self._skip_guard_stance = (
+            _SkipGuardStance()
+            if tpu_envs.SGLANG_TPU_DECODE_SKIP_GUARD_EVAL.get()
+            else None
+        )
         functools.update_wrapper(self, compiled_fn)
 
     @staticmethod
@@ -1067,6 +1162,26 @@ class CompiledForwardShim:
             if rejection is not None:
                 raise NotImplementedError(rejection)
         saved: dict[str, Any] = {}
+        if self._logit_rows_enabled and takes_logit_rows(forward_batch):
+            # Every EXTEND forward carries the packed rows (one fixed-shape
+            # tensor input of the same graph). Read the batch's own capture
+            # mode and logprob request before they are rewritten below.
+            real_b = getattr(forward_batch, _REAL_B_KEY, None)
+            identity = bool(
+                identity_reasons(
+                    forward_batch,
+                    wants_input_logprob=wants_input_logprob,
+                    capture_hidden_mode=forward_batch.capture_hidden_mode,
+                    real_b=real_b,
+                )
+            )
+            saved["logit_rows"] = forward_batch.logit_rows
+            forward_batch.logit_rows = build_logit_rows(
+                forward_batch,
+                identity=identity,
+                real_b=real_b,
+                device=forward_batch.input_ids.device,
+            )
         if self._prompt_logprob_enabled and forward_batch.forward_mode.is_extend():
             saved["capture_hidden_mode"] = forward_batch.capture_hidden_mode
             forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
@@ -1141,7 +1256,31 @@ class CompiledForwardShim:
                     args = _fit_pp_proxy_in_args(
                         args=args, input_ids=input_ids, forward_batch=forward_batch
                     )
-            out = fn(input_ids, positions, forward_batch, *args, **kwargs)
+            skip_guards = self._skip_guard_stance
+            if (
+                skip_guards is not None
+                and forward_batch.forward_mode.is_decode()
+                and skip_guards.armed()
+            ):
+                with skip_guards:
+                    out = fn(input_ids, positions, forward_batch, *args, **kwargs)
+            else:
+                out = fn(input_ids, positions, forward_batch, *args, **kwargs)
+            if isinstance(out, PendingCall) and "logit_rows" in saved:
+                # A deferred call (direct_compile.warmup_async) reads its tensor
+                # inputs from forward_batch only when it runs, after the finally
+                # below has restored logit_rows; it was traced with the rows, so
+                # the rows go back on the batch for exactly that run.
+                deferred, rows = out, forward_batch.logit_rows
+
+                def run_with_logit_rows() -> Any:
+                    previous = _pin_fields(forward_batch, {"logit_rows": rows})
+                    try:
+                        return deferred.wait()
+                    finally:
+                        _restore_fields(forward_batch, previous)
+
+                out = PendingCall(run_with_logit_rows)
             if isinstance(out, PendingCall):
                 finalize_fields = {key: getattr(forward_batch, key) for key in saved}
                 finalize_fields["is_prefill_only"] = forward_batch.is_prefill_only

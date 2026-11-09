@@ -338,6 +338,10 @@ class TestSparseIndexerKvLens(CustomTestCase):
         backend._kv_lens = functools.partial(
             TpuPallasSparseMlaAttnBackend._kv_lens, backend
         )
+        # No split group here, so the indexer runs unsplit.
+        backend._indexer_split_rows = functools.partial(
+            TpuPallasSparseMlaAttnBackend._indexer_split_rows, backend
+        )
         return backend
 
     def test_index_topk(self):

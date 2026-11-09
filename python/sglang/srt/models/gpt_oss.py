@@ -34,6 +34,7 @@ from sglang.srt.layers.aux_hidden_states import (
     AUX_HIDDEN_STATES_PROXY_KEY,
     AuxHiddenStateList,
 )
+from sglang.srt.layers.dcp.layout import dcp_q_head_sharding
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -400,6 +401,12 @@ class GptOssAttention(nn.Module):
         )
         kv_tp_rank = attn_tp_rank // dcp_size
         kv_tp_size = attn_tp_size // dcp_size
+        # --dcp-replicate-q-proj: Q is projected like K/V, so this rank's
+        # projection yields its whole DCP group's query heads (rank-major);
+        # attention, sinks and o_proj still work on this rank's num_heads.
+        q_tp_rank, q_tp_size, self.q_heads_factor = dcp_q_head_sharding(
+            attn_tp_rank, attn_tp_size
+        )
 
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
@@ -415,7 +422,7 @@ class GptOssAttention(nn.Module):
             assert kv_tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // kv_tp_size)
         self.head_dim = head_dim or hidden_size // self.total_num_heads
-        self.q_size = self.num_heads * self.head_dim
+        self.q_size = self.num_heads * self.q_heads_factor * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
@@ -429,8 +436,8 @@ class GptOssAttention(nn.Module):
             bias=attention_bias,
             params_dtype=params_dtype,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            tp_rank=q_tp_rank,
+            tp_size=q_tp_size,
             kv_tp_rank=kv_tp_rank,
             kv_tp_size=kv_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
@@ -475,6 +482,7 @@ class GptOssAttention(nn.Module):
             prefix=add_prefix("attn", prefix),
             sliding_window_size=(sliding_window_size if use_sliding_window else -1),
         )
+        self.attn.dcp_q_heads_factor = self.q_heads_factor
         self.layer_id = layer_id
 
     def forward_prepare(

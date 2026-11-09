@@ -568,6 +568,8 @@ def _effective_row_lengths(
         "interleave_size",
         "return_scores",
         "causal_offset",
+        "segments",
+        "row_count",
     ),
 )
 def streamindex_topk(
@@ -596,6 +598,9 @@ def streamindex_topk(
     interleave_size: int = 1,
     return_scores: bool = False,
     causal_offset: int = 0,
+    segments: str = "all",
+    row_start: jax.Array | None = None,
+    row_count: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -611,8 +616,44 @@ def streamindex_topk(
     ``chunk_tokens`` scores the queries in row chunks of that size. With
     ``overlap_chunks`` the chunks carry XLA scheduling groups that overlap one
     chunk's scores with the previous chunk's top-k; without, they run in order.
+
+    ``segments`` names the passes ``distribution`` can populate, as for the
+    MLA kernel: ``"decode"`` promises ``distribution[1] == distribution[2]``
+    (a decode forward) and drops the mixed pass; ``"mixed"`` promises
+    ``distribution[1] == 0`` (an extend forward) and drops the decode passes.
+
+    ``row_count`` (static) with ``row_start`` (traced i32 scalar) scores and
+    selects only the query rows ``[row_start, row_start + row_count)`` of the
+    flat token axis and returns ``i32[row_count, k]``: the DSA indexer's
+    token split, where each TP rank picks the rows of its own token slice.
+    Every row's causal range still comes from the full-batch metadata, and the
+    SparseCore top-k takes the same branch as an unsplit call (it is chosen
+    from the longest row of the whole batch), so each row equals the same row
+    of the unsplit result. The window may run past ``max_num_tokens``; rows
+    past it come back as ``-1``. ``row_count`` must be a multiple of
+    ``decode_req_batch_size * decode_query_size`` and is incompatible with
+    ``chunk_tokens``, ``cp_size > 1``, ``return_scores`` and early exit.
     """
     kv_layout = KVLayout.parse(kv_layout)
+    if row_count is not None:
+        if row_start is None:
+            raise ValueError("row_count needs row_start.")
+        if (
+            chunk_tokens is not None
+            or cp_size > 1
+            or return_scores
+            or enable_early_exit
+        ):
+            raise NotImplementedError(
+                "row_count is not supported with chunk_tokens, cp_size > 1, "
+                "return_scores or enable_early_exit."
+            )
+        if row_count % (decode_req_batch_size * decode_query_size):
+            raise ValueError(
+                f"row_count ({row_count}) must be a multiple of"
+                f" decode_req_batch_size * decode_query_size"
+                f" ({decode_req_batch_size * decode_query_size})."
+            )
     if decode_query_size > 1:
         if enable_early_exit or cp_size > 1:
             raise NotImplementedError(
@@ -638,6 +679,8 @@ def streamindex_topk(
             raise NotImplementedError(
                 "enable_early_exit is not supported with cp_size > 1."
             )
+    if segments not in ("all", "decode", "mixed"):
+        raise ValueError(f"segments must be all, decode or mixed, got {segments!r}")
     if enable_early_exit and causal_offset:
         raise NotImplementedError(
             "causal_offset is not supported with enable_early_exit."
@@ -949,9 +992,43 @@ def streamindex_topk(
         out_dtype = jnp.int32
         max_num_tokens = q.shape[0]
 
-        decode_batch_end = (
-            distribution[0] // decode_req_batch_size * decode_req_batch_size
+        # A decode graph whose rows come in whole groups of
+        # decode_req_batch_size can score the last, partly padded group on the
+        # batched pass too: a padded row is a one-token sequence on valid pages
+        # (as the backend builds it), and its scores are never read, because
+        # its row length is 0. The tail pass is then always empty, and it is
+        # not built: as an empty pass it still cost a launch and its first KV
+        # prefetch (1.5 us per indexer layer at bs4 on TPU7x).
+        batched_only = (
+            segments == "decode"
+            and decode_query_size == 1
+            and max_num_seqs >= decode_req_batch_size
+            and max_num_seqs % decode_req_batch_size == 0
         )
+        if batched_only:
+            decode_batch_end = (
+                (distribution[0] + decode_req_batch_size - 1)
+                // decode_req_batch_size
+                * decode_req_batch_size
+            )
+        else:
+            decode_batch_end = (
+                distribution[0] // decode_req_batch_size * decode_req_batch_size
+            )
+
+        specs = _pass_specs(decode_batch_end)
+        if batched_only:
+            specs = specs[:1]
+        else:
+            if max_num_seqs < decode_req_batch_size:
+                # The batched decode pass covers whole groups of
+                # decode_req_batch_size sequences, so with fewer it never has
+                # work. It would still prefetch its first KV blocks.
+                specs = specs[1:]
+            if segments == "decode":
+                specs = specs[:-1]
+            elif segments == "mixed":
+                specs = specs[-1:]
 
         num_positions = max(num_sublanes_total * 128, k)
         eff_row_lengths = _effective_row_lengths(
@@ -967,7 +1044,10 @@ def streamindex_topk(
             causal_offset=causal_offset,
         )
 
-        if chunk_tokens is None or max_num_tokens % chunk_tokens:
+        windowed = row_count is not None
+        if windowed:
+            num_chunks, chunk_len = 1, row_count
+        elif chunk_tokens is None or max_num_tokens % chunk_tokens:
             num_chunks, chunk_len = 1, max_num_tokens
         else:
             num_chunks, chunk_len = max_num_tokens // chunk_tokens, chunk_tokens
@@ -979,14 +1059,37 @@ def streamindex_topk(
 
         need_scores = cp_size > 1 or return_scores
 
-        chunk_starts = (
-            (None,)
-            if num_chunks == 1
-            else tuple(m * chunk_len for m in range(num_chunks))
-        )
+        if windowed:
+            # One chunk at a run-time start: the kernel and its schedule read
+            # the chunk start as data (scalar prefetch), so one compiled
+            # program serves every TP rank.
+            window_start = jnp.asarray(row_start, jnp.int32).reshape(())
+            chunk_starts = (window_start,)
+            # Row lengths of the window, from the whole batch's metadata; rows
+            # past max_num_tokens get length 0 (written as -1). A dynamic
+            # slice of the zero-padded lengths, not an XLA gather: the server
+            # runs with xla_tpu_offload_gather_to_sparsecore=true, and an
+            # offloaded gather here would hand the SparseCore top-k wrong row
+            # lengths (rows with too few, or no, valid picks). The start is
+            # clamped to [0, max_num_tokens], so it never wraps.
+            padded_row_lengths = jnp.pad(eff_row_lengths, (0, row_count))
+            window_row_lengths = lax.dynamic_slice_in_dim(
+                padded_row_lengths,
+                jnp.clip(window_start, 0, max_num_tokens),
+                row_count,
+            )
+            # The SparseCore top-k picks a width branch from the longest row;
+            # take it over the whole batch, as an unsplit call does.
+            branch_max_len = jnp.max(eff_row_lengths)
+        else:
+            chunk_starts = (
+                (None,)
+                if num_chunks == 1
+                else tuple(m * chunk_len for m in range(num_chunks))
+            )
+            branch_max_len = None
         passes = tuple(
-            (spec, _pass_metadata(spec, chunk_starts, chunk_len))
-            for spec in _pass_specs(decode_batch_end)
+            (spec, _pass_metadata(spec, chunk_starts, chunk_len)) for spec in specs
         )
         topk_idxs = []
         topk_scores_list = []
@@ -1017,18 +1120,23 @@ def streamindex_topk(
             chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
                 scores,
                 k,
-                row_lengths=eff_row_lengths[start : start + chunk_len],
+                row_lengths=(
+                    window_row_lengths
+                    if windowed
+                    else eff_row_lengths[start : start + chunk_len]
+                ),
                 write_empty_rows=True,
                 scheduling_group_id=sc_group,
                 stage2_scheduling_group_id=sc2_group,
                 return_scores=True,
+                branch_max_len=branch_max_len,
             )
             topk_idxs.append(chunk_topk_idxs)
             if need_scores:
                 topk_scores_list.append(chunk_topk_scores)
 
         out = topk_idxs[0] if len(topk_idxs) == 1 else jnp.concatenate(topk_idxs)
-        out = out[:max_num_tokens, :k]
+        out = out[: chunk_len if windowed else max_num_tokens, :k]
 
         if cp_size == 1 and not return_scores:
             return out

@@ -36,6 +36,10 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.kernels.band_skip_flash_attention import (
+    band_skip_config,
+    band_skip_flash_attention,
+)
 from sglang_tpu.kernels.flash_attention import (
     BlockSizes,
     SegmentIds,
@@ -474,7 +478,7 @@ class TpuPallasAttnBackend(AttentionBackend):
 # ---------------------------------------------------------------------------
 # Vision encoder: non-causal flash attention with segment_ids
 # ---------------------------------------------------------------------------
-_VISION_FLASH_OPS: dict[tuple[float, int, int], object] = {}
+_VISION_FLASH_OPS: dict[tuple[float, int, int, bool], object] = {}
 
 
 def _vision_flash_block_sizes(
@@ -498,29 +502,60 @@ def _vision_flash_block_sizes(
 
 
 def _get_vision_flash_op(sm_scale: float):
-    """Return a cached pallas op for non-causal flash attention with segment IDs."""
+    """Return a cached pallas op for non-causal flash attention with segment IDs.
+
+    With SGLANG_TPU_VISION_FLASH_BAND_SKIP, the shapes covered by
+    ``band_skip_flash_attention`` (byte-identical to the dense kernel at the
+    q tile picked above, 128 when no q-tiled blocks apply) run it instead.
+    """
     block_q = tpu_envs.SGLANG_TPU_VISION_FLASH_BLOCK_Q.get()
     block_q_max_seq = tpu_envs.SGLANG_TPU_VISION_FLASH_BLOCK_Q_MAX_SEQ.get()
-    key = (float(sm_scale), block_q, block_q_max_seq if block_q else 0)
+    band_skip = tpu_envs.SGLANG_TPU_VISION_FLASH_BAND_SKIP.get()
+    key = (float(sm_scale), block_q, block_q_max_seq if block_q else 0, band_skip)
     op = _VISION_FLASH_OPS.get(key)
     if op is not None:
         return op
 
     from torch_tpu._internal import pallas
 
-    def _jax_vision_flash(q, k, v, seg_ids):
-        return flash_attention(
-            q,
-            k,
-            v,
-            segment_ids=SegmentIds(q=seg_ids, kv=seg_ids),
-            causal=False,
-            sm_scale=sm_scale,
-            block_sizes=_vision_flash_block_sizes(
+    if band_skip:
+
+        def _jax_vision_flash(q, k, v, seg_ids):
+            block_sizes = _vision_flash_block_sizes(
                 block_q, block_q_max_seq, q.shape[2], k.shape[2]
-            ),
-            vmem_limit_bytes=None,
-        )
+            )
+            tile = 128 if block_sizes is None else block_sizes.block_q
+            segment_ids = SegmentIds(q=seg_ids, kv=seg_ids)
+            if band_skip_config(q.shape[1], q.shape[2], k.shape[2], tile) is not None:
+                return band_skip_flash_attention(
+                    q, k, v, segment_ids, sm_scale=sm_scale, block_q=tile
+                )
+            return flash_attention(
+                q,
+                k,
+                v,
+                segment_ids=segment_ids,
+                causal=False,
+                sm_scale=sm_scale,
+                block_sizes=block_sizes,
+                vmem_limit_bytes=None,
+            )
+
+    else:
+
+        def _jax_vision_flash(q, k, v, seg_ids):
+            return flash_attention(
+                q,
+                k,
+                v,
+                segment_ids=SegmentIds(q=seg_ids, kv=seg_ids),
+                causal=False,
+                sm_scale=sm_scale,
+                block_sizes=_vision_flash_block_sizes(
+                    block_q, block_q_max_seq, q.shape[2], k.shape[2]
+                ),
+                vmem_limit_bytes=None,
+            )
 
     _jax_vision_flash.__annotations__ = {
         "q": jax.Array,
@@ -533,6 +568,8 @@ def _get_vision_flash_op(sm_scale: float):
     op_name = f"sglang_tpu::vision_flash_s{float(sm_scale)!r}"
     if block_q:
         op_name += f"_bq{block_q}_max{block_q_max_seq}"
+    if band_skip:
+        op_name += "_bs"
     op_name = op_name.replace(".", "_").replace("-", "m")
     op = pallas.jax_op(op_name, _jax_vision_flash)
 

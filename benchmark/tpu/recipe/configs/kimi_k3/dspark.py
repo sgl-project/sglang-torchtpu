@@ -4,9 +4,11 @@
         --config recipe/configs/kimi_k3/dspark.py
 
 The server.py deployment plus the RadixArk/Kimi-K3-DSpark draft on the
-experimental TPU spec worker. Sized by the long_8k1k_c1 profile: with
-SGLANG_TPU_K3_STATIC_FP8 on, a verify batch of more than one request produces
-wrong tokens, so this recipe serves a single stream.
+experimental TPU spec worker. Sized by the long_8k1k_c1 profile, one request
+at a time with one KDA state slot. Verify batches of four and eight requests
+are validated too, with SGLANG_TPU_K3_STATIC_FP8 on. To serve N streams, set
+--max-running-requests, --max-mamba-cache-size and --torch-compile-max-bs to N
+and add N to --tpu-compile-bs, so no batch compiles after warmup.
 """
 
 from copy import deepcopy

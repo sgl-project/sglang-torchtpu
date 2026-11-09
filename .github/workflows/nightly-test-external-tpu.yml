@@ -18,7 +18,7 @@ on:
         required: false
         default: main
       test_filter:
-        description: "Space-separated substrings of test file paths; runs only the groups that match one"
+        description: "Space-separated substrings of test file paths; runs only matching files"
         required: false
         default: ""
         type: string
@@ -60,7 +60,9 @@ jobs:
           if [ -n "$TEST_FILTER" ]; then
             slices="$(jq -c --arg f "$TEST_FILTER" \
                         '($f | split(" ") | map(select(. != ""))) as $fs
-                         | [.[] | .groups |= map(select(.files as $x | any($fs[]; . as $s | $x | contains($s))))
+                         | [.[] | .groups |= map(
+                             .files |= (split(" ") | map(select(. as $p | any($fs[]; . as $s | $p | contains($s)))) | join(" "))
+                             | select(.files != ""))
                                 | select(.groups != [])]' <<< "$slices")"
             if [ "$slices" = "[]" ]; then
               echo "::error::test_filter matched no external tests"

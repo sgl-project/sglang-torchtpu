@@ -141,6 +141,7 @@ from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PluginWeightUpdateReqInput,
     ProfileReq,
     PullWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
@@ -1466,6 +1467,24 @@ async def end_weight_update(
     )
 
 
+@app.post("/plugin_weight_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def plugin_weight_update(
+    obj: Annotated[PluginWeightUpdateReqInput, Body()], request: Request
+):
+    """Receive weights through a platform transport and load them, as /update_weights_from_distributed does."""
+    reply = await _global_state.tokenizer_manager.plugin_weight_update(obj, request)
+    content = {
+        "success": reply.success,
+        "message": reply.message,
+        "received_tensor_counts": reply.received_tensor_counts,
+    }
+    if reply.success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
 @app.post("/update_weights_from_distributed")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_distributed(
@@ -2236,7 +2255,8 @@ def _get_vlm_warmup_image_base64(model_info: dict) -> str:
     architectures = model_info.get("architectures") or []
     if (
         "KimiK3ForConditionalGeneration" in architectures
-        or model_info.get("model_type") == "kimi_k3"
+        or "KimiK31ForConditionalGeneration" in architectures
+        or model_info.get("model_type") in ("kimi_k3", "kimi_k31")
     ):
         logger.info(
             "Using a 448x448 image for Kimi K3 VLM startup warmup to exercise "

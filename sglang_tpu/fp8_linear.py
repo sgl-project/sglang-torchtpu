@@ -4,7 +4,7 @@
 """TPU FP8 dense linear helpers."""
 
 import logging
-from typing import Callable, NamedTuple
+from typing import Callable, NamedTuple, Optional
 
 import torch
 from torch.nn import Module
@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 _SMALL_M_OP: Callable | None = None
 _STATIC_FP8_GEMV_OP: Callable | None = None
+# The same GEMV for a weight that is already in VMEM (static_fp8_gemv_with_weight).
+_STATIC_FP8_GEMV_VW_OP: Callable | None = None
 # Plain bool, not a None check on the op: Dynamo traces the eligibility check.
 _STATIC_FP8_GEMV_READY = False
 
@@ -473,7 +475,7 @@ def register_static_fp8_gemv_op() -> None:
     """Register the static fp8 Pallas GEMV when enabled; must run before
     torch.compile traces the model (the Kimi-K3 static fp8 binder calls it
     post-load). Left unregistered, every call keeps the XLA fp8 dot."""
-    global _STATIC_FP8_GEMV_OP, _STATIC_FP8_GEMV_READY
+    global _STATIC_FP8_GEMV_OP, _STATIC_FP8_GEMV_VW_OP, _STATIC_FP8_GEMV_READY
     if not tpu_envs.SGLANG_TPU_ENABLE_K3_STATIC_FP8_PALLAS_GEMV.get():
         return
     if _STATIC_FP8_GEMV_OP is None:
@@ -494,7 +496,35 @@ def register_static_fp8_gemv_op() -> None:
         op = cpu_export_jax_op("sglang_tpu_pallas::static_fp8_gemv", _op)
         op.register_fake(_fake)
         _STATIC_FP8_GEMV_OP = op
+
+        def _op_vw(
+            x: jax.Array, w: jax.Array, out_scale: jax.Array, inv_x: jax.Array
+        ) -> jax.Array:
+            return _static_fp8_gemv.static_fp8_gemv_jax(
+                x,
+                w,
+                out_scale,
+                inv_x,
+                _static_fp8_gemv.block_k(x.shape[1], w.shape[1]),
+                vmem_weight=True,
+            )
+
+        op_vw = cpu_export_jax_op("sglang_tpu_pallas::static_fp8_gemv_vw", _op_vw)
+        op_vw.register_fake(_fake)
+        _STATIC_FP8_GEMV_VW_OP = op_vw
     _STATIC_FP8_GEMV_READY = True
+
+
+def static_fp8_gemv_with_weight(
+    x: torch.Tensor, w: StaticFp8Weight, weight: torch.Tensor
+) -> Optional[torch.Tensor]:
+    """``w``'s Pallas GEMV reading ``weight`` (a copy of ``w.weight``, e.g.
+    already prefetched into VMEM) instead of ``w.weight``; None when the Pallas
+    GEMV does not apply to ``x``."""
+    if not _static_fp8_gemv_eligible(x, w) or weight.shape != w.weight.shape:
+        return None
+    out = _STATIC_FP8_GEMV_VW_OP(x, weight, w.out_scale, w.inv_x)
+    return out[:, : w.n_out] if w.n_out else out
 
 
 def static_fp8_gemv_enabled() -> bool:

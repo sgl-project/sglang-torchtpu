@@ -14,13 +14,14 @@ The index-key cache is paged like the KV cache and uses the same page table.
 Each token has one record in it: the key's FP8 bytes, then one byte holding
 the key's scale, then zero padding.
 
-Step 2 is a plain XLA scatter.
-TODO(sglang-torchtpu#1072): use the Pallas key writer once it is ported.
+Step 2 is an XLA scatter of whole cache rows (see ``_scatter_whole_rows``),
+or for decode-sized batches the Pallas writer in ``dsa_key_store``.
 """
 
 import jax
 import jax.numpy as jnp
 
+from sglang_tpu.attention.pallas.dsa_key_store import store_keys_pallas
 from sglang_tpu.attention.pallas.mla_sparse import kv_cache_utils
 from sglang_tpu.attention.pallas.util import align_to, quantize_fp8_ue8m0
 from sglang_tpu.dsv4.streamindex_topk import (
@@ -31,9 +32,12 @@ from sglang_tpu.dsv4.streamindex_topk.streamindex_topk import (
     get_kv_cache_shape,
 )
 
-# Block sizes for the top-k kernel's (decode, prefill, mixed) passes. These
-# are the values the kernel's authors use; they are not tuned for GLM.
-_NUM_KV_PAGES_PER_BLOCK = (2, 2, 2)
+# Block sizes for the top-k kernel's (decode batch, decode tail, mixed)
+# passes. A decode query scores a 128-token page in a few cycles, so at 2
+# pages per block the per-block overhead dominates: 16 pages cut a bs1 8K
+# indexer decode step from 73 to 63 us on TPU7x. The mixed pass keeps the
+# kernel authors' value; it is not tuned for GLM or Kimi.
+_NUM_KV_PAGES_PER_BLOCK = (16, 16, 2)
 _NUM_QUERIES_PER_BLOCK = (1, 128, 128)
 
 
@@ -97,11 +101,65 @@ def _store_keys(
     page, slot = kv_cache_utils.get_page_and_slot(
         num_tokens, kv_lens, page_indices, active_cu_q_lens, page_size
     )
-    # Tokens that are not in the batch get an out-of-range page index.
-    # mode="drop" makes the scatter skip them.
-    return cache_k.at[page, slot // tokens_per_row, slot % tokens_per_row].set(
-        records, mode="drop"
-    )
+    return _scatter_whole_rows(cache_k, records, page, slot)
+
+
+def _scatter_whole_rows(
+    cache_k: jax.Array,  # u8[num_pages, page_size // 4, 4, record_bytes]
+    records: jax.Array,  # u8[num_tokens, record_bytes]
+    page: jax.Array,  # i32[num_tokens]; out of range for tokens not stored
+    slot: jax.Array,  # i32[num_tokens]
+) -> jax.Array:
+    """Write each token's record at (page, slot), one whole cache row at a time.
+
+    The tokens of a cache row share 32-bit words, so XLA lowers a per-token
+    scatter by converting the whole cache to one row per token and back: two
+    full-pool copies per call. Writing whole rows keeps the native layout.
+
+    A token's row is rebuilt from the cache plus every token of this batch that
+    lands in it. Those are its neighbours on the token axis, because a
+    request's tokens are contiguous there and occupy consecutive slots. Only
+    the first of them writes the row, so the scatter indices are unique.
+    """
+    num_tokens = records.shape[0]
+    num_pages, _, tokens_per_row, _ = cache_k.shape
+    row, col = slot // tokens_per_row, slot % tokens_per_row
+    rows = cache_k[jnp.minimum(page, num_pages - 1), row]
+    tok = jnp.arange(num_tokens, dtype=jnp.int32)
+
+    def shifted(x, d):
+        """x[t + d] for every t, edge-clamped; d is a static offset."""
+        d = max(-num_tokens, min(d, num_tokens))
+        if d > 0:
+            return jnp.concatenate([x[d:], jnp.repeat(x[-1:], d, axis=0)])
+        if d < 0:
+            return jnp.concatenate([jnp.repeat(x[:1], -d, axis=0), x[: num_tokens + d]])
+        return x
+
+    # Slot j of token t's row holds token t - col[t] + j when that token is in
+    # this batch and lands there. The offset d = j - col[t] takes only
+    # tokens_per_row values per j, so read the neighbours through static
+    # shifts instead of a gather per slot (XLA gathers of 1K rows are slow).
+    new_rows = []
+    for j in range(tokens_per_row):
+        slot_j = rows[:, j]
+        for d in range(j - tokens_per_row + 1, j + 1):
+            lands_here = (
+                (col == j - d)
+                & (tok + d >= 0)
+                & (tok + d < num_tokens)
+                & (shifted(page, d) == page)
+                & (shifted(row, d) == row)
+                & (shifted(col, d) == j)
+            )
+            slot_j = jnp.where(lands_here[:, None], shifted(records, d), slot_j)
+        new_rows.append(slot_j)
+    rows = jnp.stack(new_rows, axis=1)
+    first = (tok == 0) | (shifted(page, -1) != page) | (shifted(row, -1) != row)
+    # Tokens that are not stored, and all but the first token of a row, get an
+    # out-of-range page; mode="drop" skips them.
+    page = jnp.where(first, page, kv_cache_utils.OOB_PAGE)
+    return cache_k.at[page, row].set(rows, mode="drop", unique_indices=True)
 
 
 def dsa_indexer_step(
@@ -113,10 +171,14 @@ def dsa_indexer_step(
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]; [2] is the number of real requests
+    row_start: jax.Array | None = None,  # i32[1]; first scored row (token split)
     *,
     weight_scale: float,
     topk: int,
     decode_query_size: int = 1,
+    segments: str = "all",
+    key_store: str = "xla",
+    row_count: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     """Store this step's index keys, then pick the top-k keys for each query.
 
@@ -130,6 +192,20 @@ def dsa_indexer_step(
     ``decode_query_size`` is the number of query rows of each decode-range
     sequence (fixed-width speculative verify); 1 for ordinary decode.
 
+    ``segments`` is the forward's ``PallasForwardMetadata.segments``: the
+    kernel passes ``distribution`` can populate. The others are not built.
+
+    ``key_store`` picks the index-key writer: ``"xla"`` (the whole-row
+    scatter, any batch) or ``"pallas"`` (one Pallas kernel, decode-sized
+    batches; same bytes).
+
+    ``row_count`` > 0 (with ``row_start``) is the token split
+    (SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT): the keys of every token are still
+    stored, but only query rows ``[row_start, row_start + row_count)`` are
+    scored and selected, and ``topk_indices`` is ``i32[row_count, topk]``.
+    Each row equals the same row of an unsplit call (rows past the batch are
+    ``-1``); the caller assembles the slices of the TP ranks.
+
     Returns ``(topk_indices, cache_k)``:
 
     * ``topk_indices``: ``i32[max_num_tokens, topk]``. Each row lists the
@@ -139,10 +215,15 @@ def dsa_indexer_step(
     * ``cache_k``: the cache with this step's keys stored.
     """
     q_fp8, q_scale, _ = quantize_fp8_ue8m0(query)
-    k_fp8, _, k_scale_byte = quantize_fp8_ue8m0(key)
-    cache_k = _store_keys(
-        cache_k, k_fp8, k_scale_byte, kv_lens, page_indices, cu_q_lens, distribution
-    )
+    if key_store == "xla":
+        k_fp8, _, k_scale_byte = quantize_fp8_ue8m0(key)
+        cache_k = _store_keys(
+            cache_k, k_fp8, k_scale_byte, kv_lens, page_indices, cu_q_lens, distribution
+        )
+    else:
+        cache_k = store_keys_pallas(
+            cache_k, key, kv_lens, page_indices, cu_q_lens, distribution
+        )
 
     # The kernel reads each key's scale from the cache. It has no input for the
     # query's scale, so multiply that into the head weight instead.
@@ -166,7 +247,13 @@ def dsa_indexer_step(
         num_kv_pages_per_block=_NUM_KV_PAGES_PER_BLOCK,
         num_queries_per_block=_NUM_QUERIES_PER_BLOCK,
         decode_query_size=decode_query_size,
+        segments=segments,
         enable_early_exit=False,
         kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
+        **(
+            dict(row_start=row_start.reshape(()), row_count=row_count)
+            if row_count
+            else {}
+        ),
     )
     return topk_indices, cache_k

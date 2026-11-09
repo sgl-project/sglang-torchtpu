@@ -182,6 +182,8 @@ jobs:
       # Unit suite (kernels/backends; each test self-contained, no model server) runs
       # first so a broken kernel fails before the serving suite claims the slice.
       suite: stage-a-test-tpu-unit
+      # Both PR suites use a 40-minute execution budget by default.
+      execution_budget_minutes: ${{ fromJSON(vars.TPU_PR_GATE_BUDGET_MINUTES || '40') }}
       # The PR gate runs the plugin platform (mode B); nightly lanes cover mode A.
       platform: tpu_oot
       # Most unit tests are registered chips=1 and run four at a time, each
@@ -199,6 +201,7 @@ jobs:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
       image: ${{ needs.build.outputs.digest }}
       suite: stage-b-test-tpu-4-v7
+      execution_budget_minutes: ${{ fromJSON(vars.TPU_PR_GATE_BUDGET_MINUTES || '40') }}
       platform: tpu_oot
       weights_pvc: model-weights
     permissions:

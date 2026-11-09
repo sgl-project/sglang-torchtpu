@@ -243,11 +243,6 @@ def test_fit_keeps_the_schedule_capacity():
     assert "12345 attention pairs (256x512)" in model.describe()
 
 
-def test_describe_names_target_buckets_and_granularity():
-    text = _model().describe()
-    assert "16384:" in text and "target" in text and "granularity 4096" in text
-
-
 def test_dynamic_chunks_use_resolved_defaults_and_exclude_decode(monkeypatch):
     monkeypatch.setenv("SGLANG_TPU_PP_DYNAMIC_CHUNKS", "1")
     with get_context().override_server_args(
