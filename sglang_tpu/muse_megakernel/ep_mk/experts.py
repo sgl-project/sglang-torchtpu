@@ -162,6 +162,12 @@ def _fp8_arm(R: int, x_rows: Callable, acc, w: ChunkRefs, He: int, CI: int) -> N
         )
 
 
+def bd_arms() -> tuple[int, ...]:
+    """The block-diagonal arms' rows: BD_ARMS, or up to SGLANG_TPU_EP_BD_MAX (A/B)."""
+    top = int(os.environ.get("SGLANG_TPU_EP_BD_MAX", str(BD_ARMS[-1])))
+    return tuple(A for A in (2, 4, 8, 16) if A <= top)
+
+
 def item_sizes(item_rows: int) -> tuple[int, ...]:
     """Rows an item loads, computes and stores: the dense arm sizes up to item_rows."""
     sizes = tuple(z for z in DENSE_ARMS if z <= item_rows)
@@ -188,14 +194,15 @@ def chunk_compute(
     """
     sizes = item_sizes(item_rows)
     if kind == "fp4":
-        arms = [lambda A=A: _bd_arm(A, x_rows, acc, w, He, CI) for A in BD_ARMS]
-        arms += [lambda R=R: _dense_arm(R, x_rows, acc, w, He, CI) for R in sizes]
-        bounds = BD_ARMS + sizes[:-1]
+        bd = bd_arms()
+        dense = tuple(R for R in sizes if R > bd[-1])
+        arms = [lambda A=A: _bd_arm(A, x_rows, acc, w, He, CI) for A in bd]
+        arms += [lambda R=R: _dense_arm(R, x_rows, acc, w, He, CI) for R in dense]
+        bounds = bd + dense[:-1]
+        names = [f"bd{A}" for A in bd] + [f"dq{R}" for R in dense]
     else:
         arms = [lambda R=R: _fp8_arm(R, x_rows, acc, w, He, CI) for R in sizes]
         bounds = sizes[:-1]
-    names = [f"bd{A}" for A in BD_ARMS] + [f"dq{R}" for R in sizes]
-    if kind != "fp4":
         names = [f"f8_{R}" for R in sizes]
     if (
         int(os.environ.get("SGLANG_TPU_EP_TRACE", "0")) >= 2
