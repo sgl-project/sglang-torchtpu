@@ -473,8 +473,10 @@ def _combine(step: EPLayerStep, win) -> None:
 def _stream_rows(c: MKConfig, S: dict):
     """(load(row0, n), rows(row0, n, fn)) on S["h_stream"]: VMEM with tiled_vmem_pads, else
     HBM through the row-tile staging S["sin"][0]. load: n <= row_tile rows as a value;
-    rows: fn(view, t0, m) on each row tile [row0 + t0, row0 + t0 + m) as a ref, written back
-    (HBM: one copy each way per tile, not per row)."""
+    rows: fn(row, t0, m) on each tile of rows [row0 + t0, row0 + t0 + m), row(i) the ref of
+    its row i, written back. HBM: one copy each way per tile when row0 is 8-row aligned
+    (n % 8 == 0: row0 = rank * n), else per row (writing back another rank's row would race
+    with its all-gather)."""
     hs, RT = S["h_stream"], c.row_tile
     if c.tiled_vmem_pads:
 
@@ -483,7 +485,7 @@ def _stream_rows(c: MKConfig, S: dict):
 
         def rows_v(r0, n, fn):
             for t0 in range(0, n, RT):
-                fn(hs.at[pl.ds(r0 + t0, min(RT, n - t0))], t0, min(RT, n - t0))
+                fn(lambda i, t0=t0: hs.at[pl.ds(r0 + t0 + i, 1)], t0, min(RT, n - t0))
 
         return load_v, rows_v
     stage, sem = S["sin"].at[0], S["ep_misc_sems"].at[3]
@@ -498,10 +500,13 @@ def _stream_rows(c: MKConfig, S: dict):
         return stage[pl.ds(0, n), :]
 
     def rows(r0, n, fn):
-        for t0 in range(0, n, RT):
-            m = min(RT, n - t0)
+        tile = RT if n % 8 == 0 else 1
+        if tile > 1:
+            r0 = pl.multiple_of(r0, 8)
+        for t0 in range(0, n, tile):
+            m = min(tile, n - t0)
             copy(hs.at[pl.ds(r0 + t0, m)], stage.at[pl.ds(0, m)])
-            fn(stage.at[pl.ds(0, m)], t0, m)
+            fn(lambda i: stage.at[pl.ds(i, 1)], t0, m)
             copy(stage.at[pl.ds(0, m)], hs.at[pl.ds(r0 + t0, m)])
 
     return load, rows
@@ -533,10 +538,10 @@ def _unpool_residual(step: EPLayerStep, win) -> None:
     _, rows = _stream_rows(c, S)
     alpha, beta = _row(smr, "ffn_alpha", H), _row(smr, "ffn_beta", H)
 
-    def residual(v, t0, m):
+    def residual(row, t0, m):
         for i in range(m):
             branch = S["ep_f"][pl.ds(w_off + t0 + i, 1), :]
-            v[pl.ds(i, 1), :] = alpha * v[pl.ds(i, 1), :] + beta * branch
+            row(i)[...] = alpha * row(i)[...] + beta * branch
 
     if not _dev_skip("residual"):  # own rows only: the all-gather fills the others
         rows(w0 + w_off, rc, residual)

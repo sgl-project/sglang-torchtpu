@@ -87,7 +87,7 @@ def o_proj(step: EPOProjStep, p: EPPlan, stream_rows) -> None:
     s_win = S["ep_f"]  # [window, H] f32: own rows' post-attention stream, others zero
     s_win[...] = jnp.zeros((wn, H), f32)
 
-    def residual(v, t0, m):
+    def residual(row, t0, m):
         for i in range(m):
             r = t0 + i
             a = (
@@ -107,10 +107,8 @@ def o_proj(step: EPOProjStep, p: EPPlan, stream_rows) -> None:
             s_a = jax.lax.rsqrt(
                 jnp.mean(jnp.square(a), axis=-1, keepdims=True) + c.post_eps
             )
-            s = a_alpha * v[pl.ds(i, 1), :] + a_beta * (a * s_a).astype(bf16).astype(
-                f32
-            )
-            v[pl.ds(i, 1), :] = s
+            s = a_alpha * row(i)[...] + a_beta * (a * s_a).astype(bf16).astype(f32)
+            row(i)[...] = s
             s_win[pl.ds(w_off + r, 1), :] = s
 
     rows(w0 + w_off, rc, residual)
