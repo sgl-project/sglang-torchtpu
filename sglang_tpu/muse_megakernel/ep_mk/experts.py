@@ -28,9 +28,9 @@ DENSE_ARMS = (8, 16, 32, 64)  # bf16-dequant arms: rows of the item's plain dot
 W2_N_TILE = 512  # down-projection columns per dot below 4 slots ([32, 512] f32 at 2)
 DQ_KC, DQ_TN = 256, 256  # one bf16-dequantized weight block: 32 vregs
 FP8_CHUNK_WORDS = 128  # K words per fp8 dot (512 rows)
-QB_K = 256  # the q arms' scale block along K: one MXU pass
+QB_SIZES = (64, 128, 256)  # SGLANG_TPU_EP_QBLOCK: K rows per scale
 QB_TN = 512  # q arm output columns per accumulator
-E2M1_MAX = 6.0
+E2M1_MAX = 6.0  # e2m1's largest magnitude
 E2M1_MAGS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
@@ -117,28 +117,31 @@ def dequant_dot(x, wref, sref, K, N):
 
 
 def qblock() -> int:
-    """SGLANG_TPU_EP_QBLOCK=256: fp4 experts requantized to one scale per 256 K rows (every
-    16-group of a block holds it), so each MXU pass takes raw codes and one scale row."""
+    """SGLANG_TPU_EP_QBLOCK in QB_SIZES: fp4 experts requantized to one scale per that many K
+    rows of the kernel's (kperm) order; each MXU pass takes raw codes and its blocks' scales."""
     b = int(os.environ.get("SGLANG_TPU_EP_QBLOCK", "0"))
-    if b not in (0, QB_K):
-        raise ValueError(f"SGLANG_TPU_EP_QBLOCK={b}: 0 or {QB_K}")
+    if b not in (0, *QB_SIZES):
+        raise ValueError(f"SGLANG_TPU_EP_QBLOCK={b}: 0 or one of {QB_SIZES}")
     return b
 
 
-def requant_fp4_blocks(
-    words: jax.Array, scale: jax.Array
+def requant_fp4_kperm(
+    words: jax.Array, scale: jax.Array, block: int
 ) -> tuple[jax.Array, jax.Array]:
-    """NVFP4 u32 words [..., K/8, N] + block-16 scales [..., K/16, N] -> the same weights with
-    one scale per QB_K rows (per-block amax / 6, bf16, repeated over its 16-groups) and e2m1
-    codes re-rounded against it. Lossy; QB_K blocks are kperm-invariant."""
+    """Natural NVFP4 u32 words [..., K/8, N] + block-16 scales [..., K/16, N] -> words with rows
+    in kperm order, requantized to one scale per block rows of that order (amax / 6, bf16,
+    e2m1 codes re-rounded), and scale rows [..., K/16, N] (row i: the scale of kernel rows
+    [16 i, 16 i + 16)). Lossy."""
     *lead, kw, n = words.shape
+    k = kw * FP4_PACK
     shifts = jnp.arange(0, 32, 4, dtype=jnp.uint32)[:, None]
-    codes = ((words[..., :, None, :] >> shifts) & 0xF).reshape(*lead, kw * FP4_PACK, n)
+    codes = ((words[..., :, None, :] >> shifts) & 0xF).reshape(*lead, k, n)
     mags = jnp.asarray(E2M1_MAGS)
     v = jnp.where(codes >= 8, -1.0, 1.0) * mags[codes & 7]
-    k = kw * FP4_PACK
-    w = v * jnp.repeat(scale.astype(jnp.float32), FP4_GROUP, axis=-2)
-    wb = w.reshape(*lead, k // QB_K, QB_K, n)
+    w = (v * jnp.repeat(scale.astype(jnp.float32), FP4_GROUP, axis=-2))[
+        ..., kperm(k), :
+    ]
+    wb = w.reshape(*lead, k // block, block, n)
     sb = (jnp.max(jnp.abs(wb), axis=-2) / E2M1_MAX).astype(jnp.bfloat16)
     sbf = sb.astype(jnp.float32)
     q = jnp.clip(wb / jnp.where(sbf > 0, sbf, 1.0)[..., None, :], -E2M1_MAX, E2M1_MAX)
@@ -150,38 +153,40 @@ def requant_fp4_blocks(
         *lead, kw, FP4_PACK, n
     )
     out = jnp.sum(qc << shifts, axis=-2, dtype=jnp.uint32)
-    return out, jnp.repeat(sb, QB_K // FP4_GROUP, axis=-2)
+    return out, jnp.repeat(sb, block // FP4_GROUP, axis=-2)
 
 
-def qblock_dot(x, wref, sref, K, N):
-    """x [R, K] bf16 @ codes of a QB_K-block NVFP4 slab -> f32 [R, N]: each MXU pass pushes
-    raw codes (as e4m3) and scales its [R, tn] partial by the block's scale row."""
+def qblock_dot(x, wref, sref, K, N, block):
+    """x [R, K] bf16 @ the codes of a block-scaled NVFP4 slab -> f32 [R, N]: each dot pushes
+    raw codes (as e4m3) of one block and scales its [R, tn] partial by the block's row."""
     cols = []
     for n0 in range(0, N, QB_TN):
         tn = min(QB_TN, N - n0)
         acc = None
-        for k0 in range(0, K, QB_K):
+        for k0 in range(0, K, block):
             w = pltpu.bitcast(
-                wref[pl.ds(k0 // FP4_PACK, QB_K // FP4_PACK), pl.ds(n0, tn)],
+                wref[pl.ds(k0 // FP4_PACK, block // FP4_PACK), pl.ds(n0, tn)],
                 jnp.float4_e2m1fn,
             ).astype(jnp.float8_e4m3fn)
-            part = jnp.dot(x[:, k0 : k0 + QB_K], w, preferred_element_type=jnp.float32)
+            part = jnp.dot(x[:, k0 : k0 + block], w, preferred_element_type=jnp.float32)
             s = sref[pl.ds(k0 // FP4_GROUP, 1), pl.ds(n0, tn)].astype(jnp.float32)
             acc = part * s if acc is None else acc + part * s
         cols.append(acc)
     return cols[0] if len(cols) == 1 else jnp.concatenate(cols, axis=1)
 
 
-def _q_arm(R: int, x_rows: Callable, acc, w: ChunkRefs, He: int, CI: int) -> None:
-    """Up to R slots on QB_K-block weights: plain R-row dots on the codes."""
+def _q_arm(
+    R: int, B: int, x_rows: Callable, acc, w: ChunkRefs, He: int, CI: int
+) -> None:
+    """Up to R slots on B-row block-scaled weights: plain R-row dots on the codes."""
     xt = x_rows(R).astype(jnp.bfloat16)
-    g = qblock_dot(xt, w.wg, w.sg, He, CI)
-    u = qblock_dot(xt, w.wu, w.su, He, CI)
+    g = qblock_dot(xt, w.wg, w.sg, He, CI, B)
+    u = qblock_dot(xt, w.wu, w.su, He, CI, B)
     h = (g * jax.nn.sigmoid(g) * u).astype(jnp.bfloat16)
     for n0 in range(0, He, QB_TN):
         cols = pl.ds(n0, QB_TN)
         acc[pl.ds(0, R), cols] += qblock_dot(
-            h, w.w2.at[:, cols], w.s2.at[:, cols], CI, QB_TN
+            h, w.w2.at[:, cols], w.s2.at[:, cols], CI, QB_TN, B
         )
 
 
@@ -267,7 +272,7 @@ def chunk_compute(
     """
     sizes = item_sizes(item_rows)
     if kind == "fp4" and qblock():
-        arms = [lambda R=R: _q_arm(R, x_rows, acc, w, He, CI) for R in sizes]
+        arms = [lambda R=R: _q_arm(R, qblock(), x_rows, acc, w, He, CI) for R in sizes]
         bounds = sizes[:-1]
         names = [f"q{R}" for R in sizes]
     elif kind == "fp4":

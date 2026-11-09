@@ -63,6 +63,8 @@ TOL_HID_REL = 1e-2  # final norm, computed from the captured last-layer stream
 NEAR_TIE = 2e-3
 # --ep: the EP megakernel and its weight layout (set once by main, before any weight is built)
 _EP = False
+# --qblock-ref: the reference reads the SGLANG_TPU_EP_QBLOCK-requantized fp4 experts
+_QBLOCK_REF = False
 
 
 class Case(msgspec.Struct, frozen=True):
@@ -312,24 +314,44 @@ def _permute_packed_rows(
     return out
 
 
-def _requant_fp4_blocks(words: torch.Tensor, scale: torch.Tensor, block: int) -> tuple:
-    """ep_mk.experts.requant_fp4_blocks on int32 words [K/8, N] (the kernel's weights under
-    SGLANG_TPU_EP_QBLOCK; the reference keeps the block-16 ones)."""
+def _requant_kperm(
+    words: torch.Tensor, scale: torch.Tensor, perm: torch.Tensor, block: int
+) -> tuple:
+    """ep_mk.experts.requant_fp4_kperm on natural int32 words [K/8, N]: (words in perm order,
+    scale rows [K/16, N], the requantized weights as f32 in natural order)."""
     k, n = words.shape[0] * 8, words.shape[1]
-    w = _dequant_fp4(words, scale).reshape(k // block, block, n)
+    w = _dequant_fp4(words, scale)[perm].reshape(k // block, block, n)
     sb = (w.abs().amax(dim=1) / 6.0).to(torch.bfloat16)
     sbf = sb.float()
     q = (w / torch.where(sbf > 0, sbf, 1.0)[:, None]).clamp(-6.0, 6.0)
-    mags = _E2M1[:8]
-    d = (q.abs()[..., None] - mags).abs()
+    d = (q.abs()[..., None] - _E2M1[:8]).abs()
     near = d == d.amin(dim=-1, keepdim=True)
     idx = torch.where(near, torch.arange(8) % 2, 2).argmin(dim=-1)  # ties to even
-    codes = idx.to(torch.int32) | torch.where(q < 0, 8, 0).to(torch.int32)
-    codes = codes.reshape(k // 8, 8, n)
+    deq = (torch.where(q < 0, -1.0, 1.0) * _E2M1[:8][idx] * sbf[:, None]).reshape(k, n)
+    codes = (idx.to(torch.int32) | torch.where(q < 0, 8, 0).to(torch.int32)).reshape(
+        k // 8, 8, n
+    )
     out = torch.zeros(k // 8, n, dtype=torch.int32)
     for j in range(8):
         out |= codes[:, j] << (4 * j)
-    return out, sb.repeat_interleave(block // 16, dim=0)
+    return out, sb.repeat_interleave(block // 16, dim=0), deq[perm]
+
+
+def ref_expert(l: int, rank: int, e: int, kind: str) -> tuple:
+    """decode_expert of one rank's slice; --qblock-ref: the requantized weights the kernel
+    reads under SGLANG_TPU_EP_QBLOCK."""
+    from sglang_tpu.muse_megakernel.ep_mk.experts import kperm, qblock
+
+    slabs = expert_slabs(l, rank, e, kind)
+    if not (_QBLOCK_REF and kind == "fp4"):
+        return decode_expert(slabs, kind)
+    w13, s13, w2, s2 = slabs
+    kp_he = torch.from_numpy(kperm(EXPERT_HIDDEN))
+    kp_il = torch.from_numpy(kperm(INTER_LOCAL))
+    return (
+        _requant_kperm(w13, s13, kp_he, qblock())[2],
+        _requant_kperm(w2, s2, kp_il, qblock())[2],
+    )
 
 
 def ep_expert_slabs(l: int, rank: int, kind: str) -> list:
@@ -352,10 +374,12 @@ def ep_expert_slabs(l: int, rank: int, kind: str) -> list:
         if kind == "fp4":
             s2 = torch.cat([s[3] for s in sl], dim=0)
             if qblock():
-                w13, s13 = _requant_fp4_blocks(w13, s13, qblock())
-                w2, s2 = _requant_fp4_blocks(w2, s2, qblock())
-            w13 = _permute_packed_rows(w13, 4, kp_he)[:, kp_2i]
-            s13, w2 = s13[:, kp_2i], _permute_packed_rows(w2, 4, kp_i)
+                w13, s13, _ = _requant_kperm(w13, s13, kp_he, qblock())
+                w2, s2, _ = _requant_kperm(w2, s2, kp_i, qblock())
+                w13, s13 = w13[:, kp_2i], s13[:, kp_2i]
+            else:
+                w13 = _permute_packed_rows(w13, 4, kp_he)[:, kp_2i]
+                s13, w2 = s13[:, kp_2i], _permute_packed_rows(w2, 4, kp_i)
         else:
             s2 = sl[0][3]
             w13 = _permute_packed_rows(w13, 8, kp_he)
@@ -838,9 +862,7 @@ class _LayerRef:
             x = xe[rs]
             y = 0
             for d in range(TP):
-                w13, w2 = decode_expert(
-                    expert_slabs(self.l, d, e, self.kind), self.kind
-                )
+                w13, w2 = ref_expert(self.l, d, e, self.kind)
                 gu = x @ w13
                 gate, up = gu[:, :INTER_LOCAL], gu[:, INTER_LOCAL:]
                 h = _bf(gate * torch.sigmoid(gate) * up)
@@ -944,7 +966,7 @@ def _debug_row(ref, mid, xe, sc, ids, out, r, biased) -> None:
         res[f"k{k_bad}_e{e2}"] = float(_row_rel(out[r : r + 1], row_out(y2))[0])
     parts = []
     for d in range(TP):
-        w13, w2 = decode_expert(expert_slabs(ref.l, d, e_bad, ref.kind), ref.kind)
+        w13, w2 = ref_expert(ref.l, d, e_bad, ref.kind)
         gu = x @ w13
         h = _bf(
             gu[:, :INTER_LOCAL]
@@ -1197,9 +1219,10 @@ def main() -> None:
     ap.add_argument("--global-layers", default="1,4")
     ap.add_argument("--out-dir", default="/tmp/mk_numerics")
     ap.add_argument("--ep", action="store_true")
+    ap.add_argument("--qblock-ref", action="store_true")
     args = ap.parse_args()
-    global _EP
-    _EP = args.ep
+    global _EP, _QBLOCK_REF
+    _EP, _QBLOCK_REF = args.ep, args.qblock_ref
 
     dist.init_process_group(backend="tpu_dist")
     rank = dist.get_rank()

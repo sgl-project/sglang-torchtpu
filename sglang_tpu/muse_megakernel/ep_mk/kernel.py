@@ -12,7 +12,7 @@ from sglang_tpu.muse_megakernel.ep_mk.experts import (
     kperm,
     permute_fp8_rows,
     qblock,
-    requant_fp4_blocks,
+    requant_fp4_kperm,
 )
 from sglang_tpu.muse_megakernel.ep_mk.layer import EPExperts
 from sglang_tpu.muse_megakernel.kernel import megakernel_call
@@ -47,12 +47,20 @@ def ep_expert_weights(
     2I] w13, [E, I/pack, H_e] w2, int32 words): hidden rows in pooled_perm order; for fp4
     the gate / up columns and w2's rows in kperm order too (the dense arm's scale layout);
     then w13's columns in chunk_cols order (chunk: the MKConfig's inter_local). Under
-    SGLANG_TPU_EP_QBLOCK, fp4 experts are requantized to its blocks first."""
+    SGLANG_TPU_EP_QBLOCK, fp4 rows are requantized to its blocks of the kperm order."""
     cols = chunk_cols(w13.shape[-1], chunk)
+    if kind == "fp4" and qblock():
+        u32 = jax.numpy.uint32
+        w13k, s13k = requant_fp4_kperm(w13.view(u32), s13, qblock())
+        w2k, s2k = requant_fp4_kperm(w2.view(u32), s2, qblock())
+        gu = kperm(w13.shape[-1])
+        return (
+            w13k.view(jax.numpy.int32)[..., gu][..., cols],
+            s13k[..., gu][..., cols],
+            w2k.view(jax.numpy.int32),
+            s2k,
+        )
     if kind == "fp4":
-        if qblock():
-            w13, s13 = requant_fp4_blocks(w13.view(jax.numpy.uint32), s13)
-            w2, s2 = requant_fp4_blocks(w2.view(jax.numpy.uint32), s2)
         w13k, s13k, w2k, s2k = fp4_weights_kperm(
             w13.view(jax.numpy.uint32), s13, w2.view(jax.numpy.uint32), s2
         )
