@@ -36,7 +36,8 @@ def stage_forward(
     table; x [T, H] f32 stream; weights: the dense stacks in WEIGHT_ORDER; experts_fp4: per slot
     (w13, w13_scale, w2, w2_scale); experts_fp8: the stage's fp8 set; pools: one per slot
     (global slots' as wide as the page table); page_tables: (global, sliding window).
-    Returns (x, pools), and with scratch each slot's (ids, routing weights)."""
+    Returns (x, pools), and with scratch each slot's (ids, routing weights, q, k, v, attention
+    output)."""
     skip = skipped_phases()
     attn_in_call, route_call, combine_call = stage_calls(c)
     T, K = c.rows, c.top_k
@@ -76,5 +77,5 @@ def stage_forward(
             (x,) = combine_call(
                 ctl_s, slots, x, y.reshape(T * K, c.expert_hidden), tw, *weights
             )
-        routes.append((ids, tw))
+        routes.append((ids, tw, q, k, v, o))
     return (x, pools, routes) if scratch else (x, pools)

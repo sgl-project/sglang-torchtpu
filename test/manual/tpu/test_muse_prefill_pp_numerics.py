@@ -282,7 +282,7 @@ def ref_attn(c, w, l, x, pool, table, rope, ids_in=None):
     tw = tw / (tw.sum(1, keepdims=True) + c.router_eps) * c.route_scale
     pooled = _bf(_dot(ffn, _untile(w["wpool"][l])) * row("wpool_s", He))
     xe = _bf(_rms(pooled, c.rms_eps) * row("pre_expert_w", He))
-    return x, xe, ids, tw, k8, v8, biased
+    return x, xe, ids, tw, k8, v8, biased, (_bf(q), _bf(k), attn)
 
 
 def ref_post(c, w, l, x, yn, tw):
@@ -301,7 +301,7 @@ def ref_layer(c, w, l, x, pool, table, rope, kernel_ids, slot):
     """One layer: (stream out, chunk K, chunk V, rows whose top-k flipped, the worst flipped
     row's biased-score gap between its picks' minimum and the best unpicked score)."""
     attn = jax.jit(ref_attn, static_argnums=(0, 2))
-    _, _, ids, _, _, _, biased = attn(c, w, l, x, pool, table, rope)
+    _, _, ids, _, _, _, biased, _ = attn(c, w, l, x, pool, table, rope)
     same = jnp.all(jnp.sort(ids, 1) == jnp.sort(kernel_ids, 1), axis=1)
     picked = jnp.take_along_axis(biased, kernel_ids, 1).min(1)
     unpicked = jnp.where(
@@ -429,10 +429,20 @@ def main() -> int:
             kernel_ids = routes[first + l][0][:, : c.top_k]
             pool, kpool = pools[first + l], pools_k[first + l]
             table = tables[GLOBAL[l]]
-            x_r, k8, v8, flipped, gap = ref_layer(
+            x_r, k8, v8, flipped, gap, (q_r, k_r, o_r) = ref_layer(
                 c, w_ref, l, x_prev, pool, table, rope, kernel_ids, first + l
             )
             rel = jnp.linalg.norm(x_k - x_r, axis=1) / jnp.linalg.norm(x_r, axis=1)
+            _, _, q_k, k_k, _, o_k = routes[first + l]
+
+            def rel_of(a, b):
+                a, b = a.astype(jnp.float32), b.astype(jnp.float32)
+                return float(jnp.linalg.norm(a - b) / jnp.linalg.norm(b))
+
+            print(
+                f"  layer {l}: q rel {rel_of(q_k, q_r):.2e} k rel {rel_of(k_k, k_r):.2e} "
+                f"attention out rel {rel_of(o_k, o_r):.2e}"
+            )
             kk, vv = pool_tokens(kpool, table, CTX + T)
             kv_rel = float(
                 jnp.linalg.norm(jnp.concatenate([kk[CTX:] - k8, vv[CTX:] - v8]))
