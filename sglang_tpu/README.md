@@ -111,6 +111,24 @@ input of `_tpu-test.yml`), so each test runs in one mode only: the PR gate
 (stage-a, stage-b) and the single-host nightly (`nightly-tpu-4-v7`) run mode B;
 the multi-host, P/D, accuracy, perf, combo and external lanes stay on mode A.
 
+## Grammar-guided sampling
+
+With `--grammar-backend xgrammar`, the TPU plugin applies packed vocabulary
+masks through `grammar.py`. Short hooks cover both XGrammar mask entry points
+in modes A and B. The mask kernel compiles with static shapes inside a scoped
+compilation stance, so a new grammar batch shape does not relax the decoder's
+post-warmup recompilation guard. Non-TPU logits retain the original mask path.
+
+When `TpuSampler` requests token-ID synchronization, it materializes the IDs on
+the host, broadcasts through the TP group's CPU process group, and copies the
+result back in place. This adds a host round trip for those batches. The
+DP-attention opt-out remains unchanged unless `SYNC_TOKEN_IDS_ACROSS_TP` is
+explicitly enabled; a single-rank group needs no copy or collective.
+
+CPU regressions cover packed-mask boundaries, compilation-stance restoration,
+hook dispatch, and Gloo subgroups. The registered TPU grammar unit test covers
+device masking after warmup and token broadcasts under both eager modes.
+
 ## Muse Spark multimodal
 
 `models/muse_spark.py` is the text decoder; `models/muse_spark_omni.py` adds the

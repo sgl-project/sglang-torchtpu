@@ -36,6 +36,7 @@ from sglang_tpu.hooks.encoder import (
 )
 from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.glm_flash_megakernel import route_glm_flash_megakernel
+from sglang_tpu.hooks.grammar import hook_specs as grammar_hooks
 from sglang_tpu.hooks.hicache_swa_metrics import hook_specs as hicache_swa_metrics_hooks
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
 from sglang_tpu.hooks.k3_megakernel import (
@@ -347,6 +348,8 @@ HOOKS.extend(hook_specs())
 HOOKS.extend(padded_logits_sampling_hooks())
 
 HOOKS.extend(logprob_grid_hooks())
+
+HOOKS.extend(grammar_hooks())
 
 _registered = False
 
