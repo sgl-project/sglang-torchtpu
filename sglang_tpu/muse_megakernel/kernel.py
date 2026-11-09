@@ -92,7 +92,11 @@ from sglang_tpu.muse_megakernel.mk.dots import (  # noqa: F401
     _fp8_dot,
     _scale_rows,
 )
-from sglang_tpu.muse_megakernel.mk.hooks import EPHook, EPLayerStep  # noqa: F401
+from sglang_tpu.muse_megakernel.mk.hooks import (  # noqa: F401
+    EPHook,
+    EPLayerStep,
+    EPOProjStep,
+)
 from sglang_tpu.muse_megakernel.mk.numerics import (  # noqa: F401
     _heads_rms,
     _rms,
@@ -4079,6 +4083,22 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     ).astype(bf16)
 
                 for_tiles(o_in_tile)
+            if ep is not None:
+                with _scope("o_mv"):
+                    ep.o_proj(
+                        EPOProjStep(
+                            c=c,
+                            S=S,
+                            smr=smr,
+                            layer=l,
+                            me=me,
+                            n_live=n_live,
+                            mv=lambda on_col: mv_tiled(
+                                l, "wo", nxt, smr, col_off=lambda ni: 0, on_col=on_col
+                            ),
+                        )
+                    )
+                return
             # o-proj column tile m is reduce-scatter block m; two (or four) send buffers alternate
             assert all(t[4] == Hl for t in ws.tiles if t[0] == "wo")
             obuf = S["o_buf"]
@@ -5663,7 +5683,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             if c.smalls_early:
                 prefetch_smalls(l, nxt)
 
-            if not c.fold_o:
+            if ep is None and not c.fold_o:  # the EP hook's o_proj did it on own rows
                 if c.tiled_vmem_pads:
                     for t in range(R // RT):
                         rs = pl.ds(t * RT, RT)

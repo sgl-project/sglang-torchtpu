@@ -36,6 +36,7 @@ class EPPlan(NamedTuple):
     chunk_fp8: int  # an fp8 chunk takes two adjacent ring slots (as TP's fp8 slabs)
     item_rows: int  # rows of one work item; a busier expert takes several
     rows_own: int  # Rc: the rows this rank owns
+    rows_own_padded: int  # Rc rounded up to SEG: one o-proj reduce-scatter block
     send_rows: (
         int  # the send / return buffer: own slots, each destination's segment padded
     )
@@ -89,6 +90,7 @@ def ep_plan(c: MKConfig, item_rows: int = 32) -> EPPlan:
         chunk_fp8=c.inter_local,
         item_rows=item_rows,
         rows_own=rc,
+        rows_own_padded=-(-rc // SEG) * SEG,
         send_rows=-(-(rc * k + pad) // SEG) * SEG,
         recv_rows=-(-(c.rows * k + pad) // SEG) * SEG,
         max_items=el + -(-c.rows * k // item_rows),
@@ -166,6 +168,11 @@ def ep_scratch(c: MKConfig, p: EPPlan) -> list:
         ("ep_pos_s", smem((8, LANE), i32)),
         ("ep_u", vmem((win, he), f32)),
         ("ep_f", vmem((win, c.hidden), f32)),
+        # row reduce-scatter of the o-proj: this rank's blocks of each wo column tile for every
+        # owner (two tiles in flight), every rank's blocks of this rank's rows
+        ("ep_osend", vmem((2, tp, p.rows_own_padded, c.hidden_local // 2), u32)),
+        ("ep_orecv", vmem((tp * tp, p.rows_own_padded, c.hidden_local // 2), u32)),
+        ("ep_o_sems", dma((3,))),  # received, sent from each send buffer
         # slots per (source rank, expert), every rank's row
         ("ep_csend", vmem((8, c.n_experts), i32)),
         ("ep_cnt_v", vmem((tp, c.n_experts), i32)),

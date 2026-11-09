@@ -17,13 +17,12 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.muse_megakernel.ep_mk import a2a, route
+from sglang_tpu.muse_megakernel.ep_mk import a2a, attn, route
 from sglang_tpu.muse_megakernel.ep_mk.config import (
     EPPlan,
     ep_buffers,
     ep_plan,
     ep_scratch,
-    window_rows,
 )
 from sglang_tpu.muse_megakernel.ep_mk.dense import stream_matmul
 from sglang_tpu.muse_megakernel.ep_mk.experts import (
@@ -34,7 +33,7 @@ from sglang_tpu.muse_megakernel.ep_mk.experts import (
 )
 from sglang_tpu.muse_megakernel.mk.config import MKConfig
 from sglang_tpu.muse_megakernel.mk.consts import FP4_GROUP, FP4_PACK, SMALL
-from sglang_tpu.muse_megakernel.mk.hooks import EPLayerStep
+from sglang_tpu.muse_megakernel.mk.hooks import EPLayerStep, EPOProjStep
 from sglang_tpu.muse_megakernel.mk.numerics import _rms
 from sglang_tpu.muse_megakernel.mk.packing import _pack_bf16x2, _unpack_bf16x2
 
@@ -63,12 +62,15 @@ class EPExperts:
     def __init__(self, cfg: MKConfig, item_rows: int = 32):
         self.plan = ep_plan(cfg, item_rows)
 
+    def o_proj(self, step: EPOProjStep) -> None:
+        attn.o_proj(step, self.plan, _stream_rows(step.c, step.S))
+
     def scratch_plan(self, cfg: MKConfig, plan: list) -> list:
-        # TP's expert section's routing tables and y staging go unused (SMEM especially:
-        # scalar spills overflow it into HBM)
+        # TP's expert section's unused buffers leave the plan (SMEM especially: past its
+        # capacity the compiler spills scalars into HBM)
         unused = {
-            "route_s",
             "route_v",
+            "route_s",
             "ids_s",
             "ystage",
             "ystage_sems",
@@ -117,13 +119,7 @@ class EPExperts:
             _all_gather_rows(step, p)
 
 
-def _window(c: MKConfig, me):
-    """(w0, win, w_off): the 16-row aligned window holding own rows at [w_off, w_off + Rc)."""
-    rc, win = c.rows_per_dev, window_rows(c)
-    if win == rc:
-        return pl.multiple_of(me * rc, 16), win, 0
-    w0 = pl.multiple_of(jnp.minimum((me * rc) // 16 * 16, c.rows - win), 16)
-    return w0, win, me * rc - w0
+_window = attn.window
 
 
 def _row(smr, name, n):
@@ -465,11 +461,11 @@ def _combine(step: EPLayerStep, win) -> None:
     jax.lax.fori_loop(0, rc, row, 0)
 
 
-def _stream_rows(step: EPLayerStep):
+def _stream_rows(c: MKConfig, S: dict):
     """(load(row0, n), store(row0, rows)) on S["h_stream"]: VMEM with tiled_vmem_pads, else
     HBM through the row-tile staging S["sin"][0] (n <= row_tile)."""
-    S, hs = step.S, step.S["h_stream"]
-    if step.c.tiled_vmem_pads:
+    hs = S["h_stream"]
+    if c.tiled_vmem_pads:
 
         def load_v(r0, n):
             return hs[pl.ds(r0, n), :]
@@ -519,7 +515,7 @@ def _unpool_residual(step: EPLayerStep, win) -> None:
     )
     fw = S["ep_f"][pl.ds(0, wn), :] * _row(smr, "post_ffn_w", H)
     S["ep_f"][pl.ds(0, wn), :] = _rms(fw, c.post_eps).astype(bf16).astype(f32)
-    load, store = _stream_rows(step)
+    load, store = _stream_rows(c, S)
     alpha, beta = _row(smr, "ffn_alpha", H), _row(smr, "ffn_beta", H)
     for r in range(
         0 if _dev_skip("residual") else rc
@@ -560,7 +556,7 @@ def _all_gather_rows(step: EPLayerStep, p: EPPlan) -> None:
         tmpl_r.wait()
     for _ in range((c.tp - 1) * len(parts)):
         tmpl_s.wait()
-    load, _ = _stream_rows(step)
+    load, _ = _stream_rows(c, S)
     is_cap = None
     for cl in c.capture_layers:
         hit = step.layer == cl

@@ -888,7 +888,10 @@ def _debug_row(ref, mid, xe, sc, ids, out, r, biased) -> None:
             _rms(f * rep["post_ffn_w"], POST_EPS)
         )
 
-    res = {"as_is": float(_row_rel(out[r : r + 1], row_out(ys))[0])}
+    res = {
+        "as_is": float(_row_rel(out[r : r + 1], row_out(ys))[0]),
+        "post_attn": float(_row_rel(out[r : r + 1], mid[r : r + 1])[0]),
+    }
     for k in range(TOP_K):
         for j in [None] + [j for j in range(TOP_K) if j != k]:
             y2 = ys.clone()
