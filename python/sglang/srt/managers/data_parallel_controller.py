@@ -28,6 +28,7 @@ import zmq
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.managers.dp_prefix_router import PrefixAwareSelector
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
@@ -91,6 +92,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    PREFIX_AWARE = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -168,11 +170,13 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.PREFIX_AWARE: self.prefix_aware_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
+            LoadBalanceMethod.PREFIX_AWARE,
         )
 
         self.launch_dp_size: int = get_parallel().num_dp_ranks
@@ -217,6 +221,10 @@ class DataParallelController:
         else:
             self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
+
+        self.prefix_selector: PrefixAwareSelector | None = None
+        if self.load_balance_method == LoadBalanceMethod.PREFIX_AWARE:
+            self.prefix_selector = self._make_prefix_selector()
 
         self.init_dispatcher()
 
@@ -790,6 +798,49 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
         sock_send(self.workers[target_worker], req)
+
+    def _make_prefix_selector(self) -> PrefixAwareSelector:
+        block_size = envs.SGLANG_DP_PREFIX_ROUTING_BLOCK_SIZE.get()
+        capacity_tokens = envs.SGLANG_DP_PREFIX_ROUTING_CAPACITY_TOKENS.get()
+        if capacity_tokens <= 0:
+            # A rank's radix cache holds at most its KV pool (plus the HiCache
+            # host tier). Tracking more than it holds only keeps stale
+            # affinities, which still route a session to one rank; tracking less
+            # drops live ones. Err on the large side.
+            capacity_tokens = 4 * self.max_total_num_tokens
+        selector = PrefixAwareSelector(
+            num_ranks=self.max_dp_size,
+            block_size=block_size,
+            capacity_blocks=max(1, capacity_tokens // block_size),
+            cache_threshold=envs.SGLANG_DP_PREFIX_ROUTING_CACHE_THRESHOLD.get(),
+            balance_abs_threshold=envs.SGLANG_DP_PREFIX_ROUTING_BALANCE_ABS_THRESHOLD.get(),
+            balance_rel_threshold=envs.SGLANG_DP_PREFIX_ROUTING_BALANCE_REL_THRESHOLD.get(),
+            log_interval=envs.SGLANG_DP_PREFIX_ROUTING_LOG_INTERVAL.get(),
+        )
+        logger.info(
+            "Prefix-aware DP routing: block_size=%d, capacity=%d tokens/rank, "
+            "cache_threshold=%.2f, balance_abs_threshold=%d, "
+            "balance_rel_threshold=%.2f",
+            block_size,
+            capacity_tokens,
+            selector.cache_threshold,
+            selector.balance_abs_threshold,
+            selector.balance_rel_threshold,
+        )
+        return selector
+
+    def prefix_aware_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+        input_ids = req.input_ids or []
+        budget = self.dp_budget
+        active = [r for r in self._active_workers if r < budget.num_dp_ranks]
+        target = self.prefix_selector.select(input_ids, budget.total_requests, active)
+        # Same speculative increment as DPBudget.dispatch, until the next
+        # load snapshot replaces it.
+        budget.total_requests[target] += 1
+        budget.total_tokens[target] += len(input_ids)
+        sock_send(self.workers[target], req)
 
     def event_loop(self):
         while True:

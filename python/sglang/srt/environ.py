@@ -621,6 +621,18 @@ class Envs:
     SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(None)
     SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)
     SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
+    # --load-balance-method prefix_aware: token-block size of the per-rank
+    # prefix index, tokens tracked per rank (0: 4x the rank's KV pool), the
+    # matched fraction of a prompt below which it goes to the least-loaded rank,
+    # the load gap (requests, and ratio; both must be exceeded) at which a rank
+    # stops taking prefix-matched requests, and how many routed requests
+    # between stats log lines (0: off).
+    SGLANG_DP_PREFIX_ROUTING_BLOCK_SIZE = EnvInt(128)
+    SGLANG_DP_PREFIX_ROUTING_CAPACITY_TOKENS = EnvInt(0)
+    SGLANG_DP_PREFIX_ROUTING_CACHE_THRESHOLD = EnvFloat(0.5)
+    SGLANG_DP_PREFIX_ROUTING_BALANCE_ABS_THRESHOLD = EnvInt(4)
+    SGLANG_DP_PREFIX_ROUTING_BALANCE_REL_THRESHOLD = EnvFloat(1.5)
+    SGLANG_DP_PREFIX_ROUTING_LOG_INTERVAL = EnvInt(100)
     # Compact extend-attention scheduler tile-budget admission (AMD/HIP-only).
     # Budget <= 0 disables; >0 sets the max prefix-extend tiles per batch.
     SGLANG_PREFILL_TILE_BUDGET = EnvInt(0)
