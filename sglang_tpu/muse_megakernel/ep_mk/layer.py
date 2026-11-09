@@ -246,7 +246,7 @@ def _chunk_copies(step: EPLayerStep, p: EPPlan, refs, off, e, j, slot) -> list:
             sems.at[slot, 0],
         ),
         pltpu.make_async_copy(
-            s13.at[e, :, pl.ds(c0, 2 * CI)],
+            s13.at[e, pl.ds(0, srows), pl.ds(c0, 2 * CI)],
             S13.at[slot, pl.ds(0, srows), pl.ds(0, 2 * CI)],
             sems.at[slot, 1],
         ),
