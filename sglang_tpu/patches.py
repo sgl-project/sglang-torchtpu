@@ -910,6 +910,16 @@ def _patch_hicache_write_back_copy_ahead() -> None:
     hicache_write_back_copy_ahead.install()
 
 
+def _patch_hicache_async_ready_counts() -> None:
+    """Defer the TP ready-count reduce by one step so the scheduler never waits on rank skew.
+
+    See ``hicache_async_ready_counts``.
+    """
+    from sglang_tpu import hicache_async_ready_counts
+
+    hicache_async_ready_counts.install()
+
+
 def _patch_pd_decode_async_prefill_info() -> None:
     """Fetch PD prefill parallel info off the decode scheduler thread.
 
@@ -1030,6 +1040,7 @@ def apply_tpu_patches() -> None:
     _patch_pd_decode_swa_hicache()
     _install_hybrid_linear_hicache()
     _patch_hicache_write_back_copy_ahead()
+    _patch_hicache_async_ready_counts()
     _patch_pd_decode_async_prefill_info()
     from sglang_tpu.benchmark_batch_gate import install as install_benchmark_batch_gate
 
