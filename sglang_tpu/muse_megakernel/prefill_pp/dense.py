@@ -96,6 +96,8 @@ def stage_calls(c: PPConfig):
     G = tm // K  # tokens per combine group: their K slot rows fill a tile
     LC = 512  # lanes per combine chunk
     wr_rows = max(H, qd, He)
+    WU_DEPTH = 4  # unpool weight buffers: wbuf's two tiles hold two He-row tiles each
+    assert wr_rows >= 2 * He
 
     def body(R, phases):
         ctl, slots, x_in = R["ctl"], R["slots"], R["x_in"]
@@ -355,9 +357,13 @@ def stage_calls(c: PPConfig):
             total = n_rt * n_wu
             n_grp = tm // G
 
-            def wcp(idx, b):
+            def wcp(idx):
+                """Unpool weight tiles rotate through wbuf's four He-row quarters."""
+                q = idx % WU_DEPTH
                 return pltpu.make_async_copy(
-                    wunpool.at[sl, idx % n_wu], wbuf.at[b, pl.ds(0, He)], sem_w.at[b]
+                    wunpool.at[sl, idx % n_wu],
+                    wbuf.at[q // 2, pl.ds((q % 2) * He, He)],
+                    sem_w.at[q],
                 )
 
             def ycp(i, gi, yb):
@@ -368,15 +374,20 @@ def stage_calls(c: PPConfig):
                     sem_m.at[4 + yb],
                 )
 
-            wcp(0, 0).start()
+            def xo_cp(i):
+                return pltpu.make_async_copy(
+                    xbuf, x_out.at[pl.ds(pl.multiple_of(i * tm, tm), tm)], sem_x.at[2]
+                )
+
+            for d in range(min(WU_DEPTH - 1, total)):
+                wcp(d).start()
+            ycp(0, 0, 0).start()
 
             def row_tile(i, carry):
                 r0 = pl.multiple_of(i * tm, tm)
                 cx = pltpu.make_async_copy(x_out.at[pl.ds(r0, tm)], xbuf, sem_x.at[0])
                 ct = pltpu.make_async_copy(tw_in.at[pl.ds(r0, tm)], tw_v, sem_x.at[1])
-                cx.start()
                 ct.start()
-                ycp(i, 0, 0).start()
                 ct.wait()
 
                 def group(gi, cc):
@@ -424,6 +435,17 @@ def stage_calls(c: PPConfig):
 
                 jax.lax.fori_loop(0, n_grp, group, 0)
 
+                # the next tile's first y group and this tile's x stream overlap the unpool
+                @pl.when(i + 1 < n_rt)
+                def _():
+                    ycp(i + 1, 0, 0).start()
+
+                @pl.when(i > 0)
+                def _():
+                    xo_cp(i - 1).wait()
+
+                cx.start()
+
                 def to_bf16(r, cc):
                     rr = pl.ds(pl.multiple_of(r * sub, sub), sub)
                     abuf[rr, pl.ds(0, He)] = accbuf[rr, pl.ds(0, He)].astype(BF16)
@@ -433,14 +455,18 @@ def stage_calls(c: PPConfig):
 
                 def wu_tile(j, cc):
                     idx = i * n_wu + j
-                    b = idx % 2
-                    wcp(idx, b).wait()
+                    q = idx % WU_DEPTH
+                    wcp(idx).wait()
 
-                    @pl.when(idx + 1 < total)
+                    @pl.when(idx + WU_DEPTH - 1 < total)
                     def _():
-                        wcp(idx + 1, 1 - b).start()
+                        wcp(idx + WU_DEPTH - 1).start()
 
-                    f = _mm(abuf.at[:, pl.ds(0, He)], wbuf.at[b, pl.ds(0, He)], He)
+                    f = _mm(
+                        abuf.at[:, pl.ds(0, He)],
+                        wbuf.at[q // 2, pl.ds((q % 2) * He, He)],
+                        He,
+                    )
                     accbuf[:, rows(j, tn)] = _bf(
                         f * vrow("wunpool_s", tn, pl.multiple_of(j * tn, tn))
                     )
@@ -458,12 +484,11 @@ def stage_calls(c: PPConfig):
                     return cc
 
                 jax.lax.fori_loop(0, tm // sub, resid, 0)
-                cxo = pltpu.make_async_copy(xbuf, x_out.at[pl.ds(r0, tm)], sem_x.at[0])
-                cxo.start()
-                cxo.wait()
+                xo_cp(i).start()
                 return carry
 
             jax.lax.fori_loop(0, n_rt, row_tile, 0)
+            xo_cp(n_rt - 1).wait()
 
         sl = ctl[2]
         base = HDR + sl * NF
@@ -505,7 +530,7 @@ def stage_calls(c: PPConfig):
         vmem((2, tn, tn), BF16),  # hmat: per-head mean and rotary partner matrices
         smem_t((8,), jnp.int32),  # misc_s
         dma((3,)),
-        dma((2,)),
+        dma((WU_DEPTH,)),
         dma((2,)),
         dma((8,)),
     ]
