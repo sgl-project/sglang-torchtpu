@@ -1,6 +1,6 @@
 """CPU contract for the all-reduce-based TP all-gather (sgl-project/sglang-torchtpu#1700).
 
-The TPU hook rebuilds GroupCoordinator.all_gather_into_tensor from the in-place
+The TPU hooks rebuild the LogitsProcessor logits gathers from the in-place
 all-reduce while Dynamo traces a graph. These tests simulate a TP group on CPU
 and check that the result equals the concatenation a correct all-gather writes
 (bit-identical except that -0.0 becomes +0.0), and that eager calls and the
@@ -8,6 +8,7 @@ direct tracer keep the native collective.
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -100,74 +101,143 @@ class TestGatherBlocksViaAllReduce(CustomTestCase):
         self.assertFalse(torch.signbit(got).any())
 
 
-class TestAllGatherIntoTensorAround(CustomTestCase):
+def _parallel(group):
+    return SimpleNamespace(tp_group=group, attn_tp_group=group)
+
+
+class TestLogitsGatherHooks(CustomTestCase):
     def setUp(self):
         super().setUp()
         torch._dynamo.reset()
         self.addCleanup(torch._dynamo.reset)
 
-    def test_dynamo_traced_call_writes_the_gather_into_output(self):
-        blocks = _blocks(8, (8, 64), torch.bfloat16)
-        group = _SimulatedGroup(blocks, 3)
-        output = torch.empty(64, 64, dtype=torch.bfloat16)
+    def test_tp_logits_gather_under_dynamo_uses_the_all_reduce(self):
+        blocks = _blocks(8, (4, 64), torch.bfloat16)
+        group = _SimulatedGroup(blocks, 5)
+        fallback = mock.Mock()
+        gatherer = agar.TpuLogitsGatherer(fallback)
+
+        with mock.patch.object(agar, "get_parallel", return_value=_parallel(group)):
+            got = torch.compile(backend="eager")(gatherer)(blocks[5])
+
+        fallback.assert_not_called()
+        self.assertTrue(torch.equal(got, torch.cat(blocks, dim=-1)))
+
+    def test_tp_logits_gather_outside_dynamo_uses_the_wrapped_gatherer(self):
+        group = mock.Mock(world_size=8)
+        fallback = mock.Mock(return_value="native")
+        gatherer = agar.TpuLogitsGatherer(fallback)
+        logits = torch.ones(2, 4)
+        cases = {"eager": False, "direct tracer": True}
+        with mock.patch.object(agar, "get_parallel", return_value=_parallel(group)):
+            for name, direct_flag in cases.items():
+                with (
+                    self.subTest(name),
+                    mock.patch.object(
+                        torch.compiler, "_is_compiling_flag", direct_flag
+                    ),
+                ):
+                    self.assertEqual(gatherer(logits), "native")
+        self.assertEqual(fallback.call_count, 2)
+        group.all_reduce.assert_not_called()
+
+    def test_attn_tp_logits_gather_under_dynamo_uses_the_all_reduce(self):
+        blocks = _blocks(4, (3, 32), torch.bfloat16)
+        group = _SimulatedGroup(blocks, 2)
+        processor = SimpleNamespace(vocab_size=128)
         original = mock.Mock()
 
-        @torch.compile(backend="eager")
-        def traced(output, block):
-            agar.all_gather_into_tensor_around(original, group, output, block)
+        def traced(logits):
+            return agar.gather_attn_tp_logits_around(original, processor, logits)
 
-        traced(output, blocks[3])
+        with mock.patch.object(agar, "get_parallel", return_value=_parallel(group)):
+            got = torch.compile(backend="eager")(traced)(blocks[2])
 
         original.assert_not_called()
-        self.assertTrue(torch.equal(output, torch.cat(blocks, dim=0)))
+        self.assertTrue(torch.equal(got, torch.cat(blocks, dim=-1)))
 
-    def test_direct_tracer_call_uses_the_native_collective(self):
-        # The direct tracer sets this flag while tracing
-        # (sglang_tpu/compilation/direct_compile.py). Its SPMD shared
-        # executables must not bake in rank_in_group, so it keeps the native
-        # gather.
-        group = mock.Mock(world_size=8, rank_in_group=3)
-        output = torch.empty(16, 4)
-        block = torch.ones(2, 4)
-        original = mock.Mock(return_value=None)
-        with mock.patch.object(torch.compiler, "_is_compiling_flag", True):
-            self.assertTrue(torch.compiler.is_compiling())
-            agar.all_gather_into_tensor_around(original, group, output, block)
-        original.assert_called_once_with(group, output, block)
-        group.all_reduce.assert_not_called()
+    def test_attn_tp_logits_gather_falls_back_when_not_applicable(self):
+        logits = torch.ones(2, 32)
+        cases = [
+            ("eager", 4, 128, logits, False),
+            ("single rank", 1, 128, logits, True),
+            ("zero rows", 4, 128, torch.ones(0, 32), True),
+            ("uneven vocab", 4, 130, logits, True),
+        ]
+        for name, world, vocab, rows, dynamo in cases:
+            with self.subTest(name):
+                group = mock.Mock(world_size=world)
+                original = mock.Mock(return_value="native")
+                processor = SimpleNamespace(vocab_size=vocab)
+                with (
+                    mock.patch.object(
+                        agar, "get_parallel", return_value=_parallel(group)
+                    ),
+                    mock.patch.object(
+                        torch.compiler, "is_dynamo_compiling", return_value=dynamo
+                    ),
+                ):
+                    got = agar.gather_attn_tp_logits_around(original, processor, rows)
+                self.assertEqual(got, "native")
+                original.assert_called_once_with(processor, rows)
+                group.all_reduce.assert_not_called()
 
-    def test_eager_call_uses_the_native_collective(self):
+    def test_draft_vocab_gather_under_dynamo_uses_the_all_reduce_and_crops(self):
+        blocks = _blocks(8, (2, 16), torch.bfloat16)
+        group = _SimulatedGroup(blocks, 1)
+        lm_head = SimpleNamespace(org_vocab_size=120)
+        original = mock.Mock()
+
+        def traced(local_logits):
+            return agar.gather_and_crop_vocab_around(original, local_logits, lm_head)
+
+        with mock.patch.object(agar, "get_parallel", return_value=_parallel(group)):
+            got = torch.compile(backend="eager")(traced)(blocks[1])
+
+        original.assert_not_called()
+        self.assertTrue(torch.equal(got, torch.cat(blocks, dim=-1)[..., :120]))
+
+    def test_draft_vocab_gather_in_eager_uses_the_original(self):
         group = mock.Mock(world_size=8)
-        output = torch.empty(16, 4)
-        block = torch.ones(2, 4)
-        original = mock.Mock(return_value=None)
-        agar.all_gather_into_tensor_around(original, group, output, block)
-        original.assert_called_once_with(group, output, block)
+        original = mock.Mock(return_value="native")
+        logits, lm_head = torch.ones(2, 16), SimpleNamespace(org_vocab_size=120)
+        with mock.patch.object(agar, "get_parallel", return_value=_parallel(group)):
+            got = agar.gather_and_crop_vocab_around(original, logits, lm_head)
+        self.assertEqual(got, "native")
+        original.assert_called_once_with(logits, lm_head)
         group.all_reduce.assert_not_called()
 
-    def test_single_rank_group_uses_the_native_collective(self):
-        group = mock.Mock(world_size=1)
-        output = torch.empty(2, 4)
-        block = torch.ones(2, 4)
-        original = mock.Mock(return_value=None)
-        with mock.patch.object(
-            torch.compiler, "is_dynamo_compiling", return_value=True
-        ):
-            agar.all_gather_into_tensor_around(original, group, output, block)
-        original.assert_called_once_with(group, output, block)
+    def test_init_hook_wraps_the_logits_gatherer_once(self):
+        inner = mock.Mock()
+        processor = SimpleNamespace(_logits_gatherer=inner)
+
+        agar.wrap_logits_gatherer(None, processor)
+        agar.wrap_logits_gatherer(None, processor)
+
+        self.assertIsInstance(processor._logits_gatherer, agar.TpuLogitsGatherer)
+        self.assertIs(processor._logits_gatherer._fallback, inner)
 
 
 class TestHookRegistration(CustomTestCase):
-    def test_hook_targets_group_coordinator_all_gather_into_tensor(self):
+    def test_hooks_target_logits_gathers_and_leave_collectives_native(self):
         from sglang_tpu.hooks import HOOKS
 
-        target = (
-            "sglang.srt.distributed.parallel_state."
-            "GroupCoordinator.all_gather_into_tensor"
+        by_target = {entry[0]: entry[1] for entry in HOOKS}
+        logits = "sglang.srt.layers.logits_processor.LogitsProcessor."
+        self.assertIs(by_target[logits + "__init__"], agar.wrap_logits_gatherer)
+        self.assertIs(
+            by_target[logits + "_gather_attn_tp_logits"],
+            agar.gather_attn_tp_logits_around,
         )
-        entries = [entry for entry in HOOKS if entry[0] == target]
-        self.assertEqual(len(entries), 1)
-        self.assertIs(entries[0][1], agar.all_gather_into_tensor_around)
+        self.assertIs(
+            by_target["sglang.srt.models.dspark.gather_and_crop_vocab"],
+            agar.gather_and_crop_vocab_around,
+        )
+        # Per-layer gathers (DP-attention, fused MoE) go through these; they
+        # must keep the native collective (#2013).
+        coordinator = "sglang.srt.distributed.parallel_state.GroupCoordinator."
+        for name in ("all_gather", "all_gather_into_tensor"):
+            self.assertNotIn(coordinator + name, by_target)
 
 
 if __name__ == "__main__":
