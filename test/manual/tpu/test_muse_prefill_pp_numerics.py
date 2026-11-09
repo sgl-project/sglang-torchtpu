@@ -166,15 +166,12 @@ def rope_table(n):
         [np.repeat(np.cos(ang), 2, 1), np.repeat(np.sin(ang), 2, 1)], 1), jnp.float32)  # fmt: skip
 
 
-def _dq4(words, scales, kperm):
-    """[r, n] i32 words + [r / 2, n] bf16 -> [8 r, n] f32: nibble j of word w is row 8 w + j.
-    Row k takes scale row k // 16, or with kperm (k // 256) * 16 + k % 16."""
+def _dq4(words, scales):
+    """[r, n] i32 words + [r / 2, n] bf16 -> [8 r, n] f32: nibble j of word w is row 8 w + j."""
     sh = jnp.arange(0, 32, 4, dtype=jnp.uint32)[None, :, None]
     codes = (jax.lax.bitcast_convert_type(words, jnp.uint32)[:, None, :] >> sh) & 0xF
     v = _E2M1[codes.astype(jnp.int32)].reshape(words.shape[0] * 8, words.shape[1])
-    k = jnp.arange(v.shape[0])
-    idx = (k // 256) * 16 + k % 16 if kperm else k // 16
-    return v * scales.astype(jnp.float32)[idx]
+    return v * jnp.repeat(scales.astype(jnp.float32), 16, axis=0)
 
 
 def _dq8(words):
@@ -333,7 +330,7 @@ def expert_outputs(c, w, l, xe, ids, cap=96):
             if kind == "fp8":
                 m = jax.vmap(_dq8)(ws) * ss[:, :1].astype(jnp.float32)
             else:
-                m = jax.vmap(lambda a, b: _dq4(a, b, c.kperm))(ws, ss)
+                m = jax.vmap(_dq4)(ws, ss)
             return m  # [n_tiles, K, ti]
 
         g = jnp.concatenate(list(mat("w13", "s13", jnp.arange(nti))), axis=1)

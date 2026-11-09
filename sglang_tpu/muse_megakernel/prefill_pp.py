@@ -115,9 +115,6 @@ class PPConfig(msgspec.Struct, frozen=True, kw_only=True):
     kv_bufs: int = 3
     # MoE matmul row counts: a block runs the smallest that holds its rows
     moe_row_buckets: tuple = (128, 192)
-    # NVFP4 block scales group K rows by 16 with stride 16 inside each 256 (KPERM order, as
-    # the decode megakernel's): the scale multiply needs no sublane broadcast
-    kperm: bool = True
 
     @property
     def q_dim(self) -> int:
@@ -336,7 +333,6 @@ def stage_call(c: PPConfig, debug: bool = False):
     moe_w, moe_s = _moe_rows(c)
     wr_rows = max(H, qd, He, 4 * moe_w)
     row_buckets = tuple(sorted({min(rb, r) for r in c.moe_row_buckets} | {rb}))
-    fp4_mode = dict(kperm=1, vec_dequant=True) if c.kperm else dict(fast_bf16=True)
     M = gq * tq  # attention rows: a q tile's heads of one kv head, stacked
     kb, n_kvbuf = c.kb, c.kv_bufs
     q_fold = float(np.log2(c.attn_scale)).is_integer()
