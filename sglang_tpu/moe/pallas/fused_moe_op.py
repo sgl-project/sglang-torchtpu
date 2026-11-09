@@ -167,9 +167,10 @@ def _lookup_tile_info(
     ``get_tuned_block_sizes`` is a pure-Python lookup keyed on static
     shapes / dtypes, so it runs at JAX trace time (not at device exec
     time). On a hit we pin the kernel's tile sizes to the tuned triple;
-    on a miss it returns ``get_default_gmm_block_sizes`` (a heuristic that
-    respects the shapes) — either way this returns a concrete
-    ``TileSizes``.
+    on a miss it returns a heuristic that respects the shapes
+    (``get_default_packed_fp4_gmm_block_sizes`` for a packed-FP4 W4A8 rhs,
+    ``get_default_gmm_block_sizes`` otherwise) — either way this returns a
+    concrete ``TileSizes``.
 
     ``packed_fp4`` marks a uint8-packed FP4 rhs (stored K is half the real K),
     so we key the lookup on the real K and the float4 dtype the kernel contracts
@@ -186,7 +187,8 @@ def _lookup_tile_info(
     Keep it that way. The heuristic behind a table miss computes
     ``tm = round_up_to_multiple_of_128_within_limit(2 * m // g, 512)``, and with
     the local g (16 under EP16) ``2m/g`` is >= 512 for every prefill bucket, so
-    ``tm`` saturates at 512 and is identical across buckets. Passing the GLOBAL
+    ``tm`` saturates at 512 (256 for a packed-FP4 rhs) and is identical across
+    buckets. Passing the GLOBAL
     count instead would make ``2m/g`` = 64/128/256 at pad_t 1024/2048/4096 and
     ``tm`` would become 128/128/256 -- a tiling that silently changes at one
     bucket and not the others, which is precisely the failure signature we are
@@ -194,7 +196,7 @@ def _lookup_tile_info(
     """
     import jax.numpy as jnp
 
-    from sglang_tpu.moe.pallas.gmm_v2 import TileSizes
+    from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, default_vmem_limit_bytes
     from sglang_tpu.moe.pallas.tuned_block_sizes import (
         get_tuned_block_sizes,
     )
@@ -216,6 +218,8 @@ def _lookup_tile_info(
         rhs_dtype=rhs_dtype,
         quant_block_size=quant_block_size,
         gmm_v2_only=gmm_v2_only,
+        # gmm_v2 runs these tiles against its default VMEM budget.
+        vmem_limit_bytes=default_vmem_limit_bytes() if packed_fp4 else None,
     )
     if tiles is None:
         return None

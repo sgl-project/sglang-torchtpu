@@ -589,6 +589,34 @@ def get_default_gmm_block_sizes(m: int, k: int, n: int, g: int) -> tuple[int, in
     return tm, tk, tn
 
 
+# Packed FP4 rhs at quantization blocks of at least this size runs W4A8 (the
+# rhs codes feed the MXU directly); smaller blocks dequantize the rhs in VMEM.
+_PACKED_FP4_W4A8_MIN_BLOCK = 256
+
+
+def get_default_packed_fp4_gmm_block_sizes(
+    m: int, k: int, n: int, g: int, vmem_limit_bytes: int | None = None
+) -> tuple[int, int, int]:
+    """The generic default with tile_m capped at 256 and tile_n up to 4096, for
+    a packed-FP4 (W4A8) rhs. tile_k, and so each output element's contraction
+    order, is unchanged, so the result is bitwise equal to the generic default.
+
+    A pinned tile skips gmm_v2's VMEM sizing, so the wider tile_n is used only
+    when its 4-bit rhs tile fits the rhs-only per-buffer target that
+    ``calculate_tiling`` budgets (a third of ``vmem_limit_bytes``, for three rhs
+    buffers; lhs, accumulator and output tiles are not counted, as there);
+    otherwise tile_n stays the generic default's.
+    """
+    tm, tk, generic_tn = get_default_gmm_block_sizes(m, k, n, g)
+    if tm > 256:
+        # The generic tm is a 128-multiple dividing m; keep that.
+        tm = 256 if m % 256 == 0 else 128
+    tn = round_up_to_multiple_of_128_within_limit(n, 4096)
+    if vmem_limit_bytes is not None and tk * tn // 2 > vmem_limit_bytes // 3:
+        tn = generic_tn
+    return tm, tk, tn
+
+
 def get_tuned_block_sizes(
     m: int,
     k: int,
@@ -599,6 +627,7 @@ def get_tuned_block_sizes(
     rhs_dtype: str,
     quant_block_size: int,
     gmm_v2_only: bool = False,
+    vmem_limit_bytes: int | None = None,
 ):
     """
     Retrieves optimized (TM, TK, TN) tiling parameters for the GMM kernel.
@@ -621,7 +650,15 @@ def get_tuned_block_sizes(
     if gmm_v2_only:
         return GMM_V2_TUNED_BLOCK_SIZES.get(key)
     if key not in TUNED_BLOCK_SIZES:
-        default_val = get_default_gmm_block_sizes(m, k, n, num_current_groups)
+        if (
+            str(rhs_dtype) == "float4_e2m1fn"
+            and quant_block_size >= _PACKED_FP4_W4A8_MIN_BLOCK
+        ):
+            default_val = get_default_packed_fp4_gmm_block_sizes(
+                m, k, n, num_current_groups, vmem_limit_bytes
+            )
+        else:
+            default_val = get_default_gmm_block_sizes(m, k, n, num_current_groups)
         logger.debug(
             "[GMM kernel] using default block sizes for key: %s: %s", key, default_val
         )
