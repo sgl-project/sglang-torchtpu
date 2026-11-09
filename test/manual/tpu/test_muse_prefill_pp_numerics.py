@@ -41,7 +41,7 @@ def config() -> PP.PPConfig:
         expert_hidden=4096, inter=4096, rms_eps=1e-5, post_eps=1e-8, scale_query_by=5.473,
         attn_scale=0.125, router_mult=0.1768, route_scale=1.0, router_eps=1e-15, window=2048,
         rows=T, slots=len(KINDS) + 1, page=256, pages_per_seq=64, global_pages=65,
-        swa_pages=27, max_position=16384, global_slots=(2,),
+        swa_pages=27, max_position=16384, global_slots=(2,), fp8_slots=(1,),
     )  # fmt: skip
 
 
@@ -131,13 +131,21 @@ def build_weights(c: PP.PPConfig, seed: int):
     w = {n: jnp.stack(v) for n, v in dense.items()}
     # NVFP4 experts per slot (random e2m1 codes, bf16 block scales paired into int32 words)
     # and the stage's fp8 set (e4m3 bytes, top exponent bit clear; f32 channel scales)
-    w["fp4"] = []
-    for s in range(c.slots):
+    # one set per NVFP4 layer; slots without one (the empty and the fp8 slot) share the first
+    sets = {}
+    first = c.global_slots[0] - GLOBAL.index(True)
+    for l, kind in enumerate(KINDS):
+        if kind != "fp4":
+            continue
+        s = first + l
         arrs = []
         for j, (shape, dt) in enumerate(PP.expert_shapes(c, "fp4")):
             salt = seed + 100 * s + j
-            if dt == jnp.uint8:
-                arrs.append((_hash(shape, salt) & 0xFF).astype(jnp.uint8))
+            if (
+                dt == jnp.uint8
+            ):  # u32 hashes viewed as bytes: a quarter of the temporaries
+                h = _hash((*shape[:-1], shape[-1] // 4), salt)
+                arrs.append(jax.lax.bitcast_convert_type(h, jnp.uint8).reshape(shape))
             else:
                 k = He if j == 1 else c.inter
                 sc = (1.0 + 0.5 * _unit((*shape, 2), salt)) / (_E2M1_RMS * k**0.5)
@@ -149,7 +157,12 @@ def build_weights(c: PP.PPConfig, seed: int):
     for j, (shape, dt) in enumerate(PP.expert_shapes(c, "fp8")):
         salt = seed + 900 + j
         if dt == PP.FP8:
-            arrs.append(_fp8_matrix(shape, salt))
+            h = _hash((*shape[:-1], shape[-1] // 4), salt) & jnp.uint32(0xBFBFBFBF)
+            arrs.append(
+                jax.lax.bitcast_convert_type(
+                    jax.lax.bitcast_convert_type(h, jnp.uint8).reshape(shape), PP.FP8
+                )
+            )
         else:
             k = He if j == 1 else c.inter
             arrs.append((1.0 + 0.2 * _unit(shape, salt)) / (_FP8_RMS * k**0.5))

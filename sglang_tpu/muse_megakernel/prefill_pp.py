@@ -94,6 +94,8 @@ class PPConfig(msgspec.Struct, frozen=True, kw_only=True):
     max_position: int
     # slots of the global attention layers (the rest are sliding-window)
     global_slots: tuple = (2, 6)
+    # slots that may hold a stage's fp8-expert layer
+    fp8_slots: tuple = (1, 6)
     # dense row tile and weight column tile
     tm: int = 256
     tn: int = 512
@@ -157,7 +159,7 @@ def slot_table(
 
     Raises:
       ValueError: The layers do not fit the stage's slots, their global layers cannot sit on
-        cfg.global_slots, or more than one of them has fp8 experts.
+        cfg.global_slots, or their fp8-expert layer (one at most) is not on cfg.fp8_slots.
     """
     globals_at = [i for i, layer in enumerate(layers) if layer in global_layers]
     first = c.global_slots[0] - globals_at[0] if globals_at else 0
@@ -167,8 +169,11 @@ def slot_table(
             f"stage {stage}: layers {layers} (global {[layers[i] for i in globals_at]}) do not "
             f"fit {c.slots} slots with global attention at {c.global_slots}"
         )
-    if sum(kinds[layer] == "fp8" for layer in layers) > 1:
-        raise ValueError(f"stage {stage}: one fp8 expert set per stage")
+    fp8_at = [first + i for i, layer in enumerate(layers) if kinds[layer] == "fp8"]
+    if len(fp8_at) > 1 or not set(fp8_at) <= set(c.fp8_slots):
+        raise ValueError(
+            f"stage {stage}: fp8 experts on slots {fp8_at}, not one of {c.fp8_slots}"
+        )
     t = np.zeros(HDR + c.slots * NF, np.int32)
     t[H_STAGE], t[H_LAYERS] = stage, len(layers)
     for i, layer in enumerate(layers):
@@ -804,13 +809,15 @@ def stage_forward(
         with jax.named_scope(f"slot{s}/experts"):
             if "experts" in skip:
                 y = jnp.zeros((T, K, c.expert_hidden), BF16)
-            else:
+            elif s in c.fp8_slots:
+                # both sets, each with the other's slots dropped (id -1 adds nothing): the
+                # served MoE's SparseCore gather cannot sit in a conditional
                 is_fp8 = slots[HDR + s * NF + F_FP8] != 0
-                y = jax.lax.cond(
-                    is_fp8,
-                    lambda: experts(c, xe, ids, tw, experts_fp8),
-                    lambda: experts(c, xe, ids, tw, experts_fp4[s]),
-                )
+                y = experts(
+                    c, xe, jnp.where(is_fp8, -1, ids), tw, experts_fp4[s]
+                ) + experts(c, xe, jnp.where(is_fp8, ids, -1), tw, experts_fp8)
+            else:
+                y = experts(c, xe, ids, tw, experts_fp4[s])
         with jax.named_scope(f"slot{s}/combine"):
             (x,) = combine_call(
                 ctl_s, slots, x, y.reshape(T * K, c.expert_hidden), tw, *weights
