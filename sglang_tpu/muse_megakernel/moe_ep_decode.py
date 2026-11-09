@@ -159,6 +159,7 @@ def ep_moe_call(c: EPMoEConfig):
     c.validate()
     He, I, CI, D = c.hidden, c.inter, c.chunk, c.depth
     NC, RI = c.n_chunks, c.item_rows
+    sizes = tuple(z for z in DENSE_ARMS if z <= RI)  # rows an item loads and stores
 
     def kernel(
         items,
@@ -176,16 +177,33 @@ def ep_moe_call(c: EPMoEConfig):
         su,
         w2b,
         s2b,
-        ybuf,
         wsems,
         xsem,
         ysem,
     ):
-        total = items[0] * NC
+        n_items = items[0]
+        total = n_items * NC
 
         def item(k):
             i = k // NC
             return items[1 + 3 * i], items[2 + 3 * i], items[3 + 3 * i], k % NC
+
+        def sized(n, fn):
+            """fn(S) at the smallest of SIZES holding n rows (DMA sizes are static)."""
+            which = sum((n > z).astype(jnp.int32) for z in sizes[:-1])
+            jax.lax.switch(which, [lambda z=z: fn(z) for z in sizes])
+
+        def x_copy(i, b, z):
+            r0 = pl.multiple_of(items[2 + 3 * i], TILE_ROWS)
+            return pltpu.make_async_copy(
+                x_hbm.at[pl.ds(r0, z)], xbuf.at[b, pl.ds(0, z)], xsem.at[b]
+            )
+
+        def y_copy(i, b, z):
+            r0 = pl.multiple_of(items[2 + 3 * i], TILE_ROWS)
+            return pltpu.make_async_copy(
+                acc.at[b, pl.ds(0, z)], y_hbm.at[pl.ds(r0, z)], ysem.at[b]
+            )
 
         def chunk_copies(k, slot):
             e, _, _, j = item(k)
@@ -226,18 +244,29 @@ def ep_moe_call(c: EPMoEConfig):
         for p in range(D - 1):  # the first chunks in flight
             start(jnp.int32(p))
 
+        @pl.when(n_items > 0)
+        def _():
+            sized(items[3], lambda z: x_copy(0, 0, z).start())
+
         def body(k, carry):
             slot = k % D
-            _, r0, n, j = item(k)
-            r0 = pl.multiple_of(r0, TILE_ROWS)  # layout() starts every expert on a tile
-            ntiles = (n + TILE_ROWS - 1) // TILE_ROWS
+            _, _, n, j = item(k)
+            i = k // NC
+            b = i % 2  # x and accumulator buffers alternate between items
+            xb, ab = xbuf.at[b], acc.at[b]
 
             @pl.when(j == 0)
-            def _():  # the item's rows, a fresh accumulator
-                cp = pltpu.make_async_copy(x_hbm.at[pl.ds(r0, RI)], xbuf, xsem.at[0])
-                cp.start()
-                cp.wait()
-                acc[...] = jnp.zeros_like(acc)
+            def _():  # the item's rows (prefetched), the next item's, a fresh accumulator
+                sized(n, lambda z: x_copy(i, b, z).wait())
+
+                @pl.when(i + 1 < n_items)
+                def _():
+                    sized(items[6 + 3 * i], lambda z: x_copy(i + 1, 1 - b, z).start())
+
+                def zero(z):
+                    ab[pl.ds(0, z), :] = jnp.zeros((z, He), jnp.float32)
+
+                sized(n, zero)
 
             start(k + D - 1)
             for cp in chunk_copies(k, slot):
@@ -248,7 +277,7 @@ def ep_moe_call(c: EPMoEConfig):
 
                 def run():
                     rows = pl.ds(0, A)
-                    xt = xbuf[rows, :]
+                    xt = xb[rows, :]
                     g = _fp4_blockdiag_dot(
                         xt,
                         wg.at[slot],
@@ -271,7 +300,7 @@ def ep_moe_call(c: EPMoEConfig):
                     )
                     h = (g * jax.nn.sigmoid(g) * u).astype(jnp.bfloat16)
                     if A >= 4:  # _fp4_blockdiag_dot tiles N itself from 4 rows up
-                        acc[rows, :] += _fp4_blockdiag_dot(
+                        ab[rows, :] += _fp4_blockdiag_dot(
                             h,
                             w2b.at[slot],
                             s2b.at[slot],
@@ -284,7 +313,7 @@ def ep_moe_call(c: EPMoEConfig):
                         return
                     for n0 in range(0, He, W2_N_TILE):
                         cols = pl.ds(n0, W2_N_TILE)
-                        acc[rows, cols] += _fp4_blockdiag_dot(
+                        ab[rows, cols] += _fp4_blockdiag_dot(
                             h,
                             w2b.at[slot, :, cols],
                             s2b.at[slot, :, cols],
@@ -300,13 +329,13 @@ def ep_moe_call(c: EPMoEConfig):
                 """Up to R slots: dequantize each weight block once for all R rows."""
 
                 def run():
-                    xt = xbuf[pl.ds(0, R), :].astype(jnp.bfloat16)
+                    xt = xb[pl.ds(0, R), :].astype(jnp.bfloat16)
                     g = _dequant_dot(xt, wg.at[slot], sg.at[slot], He, CI)
                     u = _dequant_dot(xt, wu.at[slot], su.at[slot], He, CI)
                     h = (g * jax.nn.sigmoid(g) * u).astype(jnp.bfloat16)
                     for n0 in range(0, He, DQ_TN):
                         cols = pl.ds(n0, DQ_TN)
-                        acc[pl.ds(0, R), cols] += _dequant_dot(
+                        ab[pl.ds(0, R), cols] += _dequant_dot(
                             h, w2b.at[slot, :, cols], s2b.at[slot, :, cols], CI, DQ_TN
                         )
 
@@ -319,45 +348,37 @@ def ep_moe_call(c: EPMoEConfig):
 
             @pl.when(j == NC - 1)
             def _():
-                # 8-row tiles may run into the next item's rows; it writes them after.
-                def store(t, carry2):
-                    rows = pl.ds(pl.multiple_of(t * TILE_ROWS, TILE_ROWS), TILE_ROWS)
-                    ybuf[...] = acc[rows, :]
-                    cp = pltpu.make_async_copy(
-                        ybuf,
-                        y_hbm.at[
-                            pl.ds(
-                                pl.multiple_of(r0 + t * TILE_ROWS, TILE_ROWS), TILE_ROWS
-                            )
-                        ],
-                        ysem.at[0],
-                    )
-                    cp.start()
-                    cp.wait()
-                    return carry2
+                # A store may run into the next item's rows: the previous one lands first.
+                @pl.when(i > 0)
+                def _():
+                    sized(items[3 * i], lambda z: y_copy(i - 1, 1 - b, z).wait())
 
-                jax.lax.fori_loop(0, ntiles, store, 0)
+                sized(n, lambda z: y_copy(i, b, z).start())
 
             return carry
 
         jax.lax.fori_loop(0, total, body, 0)
 
+        @pl.when(n_items > 0)
+        def _():
+            last = n_items - 1
+            sized(items[3 + 3 * last], lambda z: y_copy(last, last % 2, z).wait())
+
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     vmem = pltpu.VMEM
     scratch = [
-        vmem((RI, He), jnp.float32),  # xbuf
-        vmem((RI, He), jnp.float32),  # acc
+        vmem((2, RI, He), jnp.float32),  # xbuf
+        vmem((2, RI, He), jnp.float32),  # acc
         vmem((D, He // FP4_PACK, CI), jnp.uint32),  # wg
         vmem((D, He // FP4_PACK, CI), jnp.uint32),  # wu
         vmem((D, He // FP4_GROUP, CI), jnp.bfloat16),  # sg
         vmem((D, He // FP4_GROUP, CI), jnp.bfloat16),  # su
         vmem((D, CI // FP4_PACK, He), jnp.uint32),  # w2b
         vmem((D, CI // FP4_GROUP, He), jnp.bfloat16),  # s2b
-        vmem((TILE_ROWS, He), jnp.float32),  # ybuf
         pltpu.SemaphoreType.DMA((D, 6)),
-        pltpu.SemaphoreType.DMA((1,)),
-        pltpu.SemaphoreType.DMA((1,)),
+        pltpu.SemaphoreType.DMA((2,)),
+        pltpu.SemaphoreType.DMA((2,)),
     ]
 
     def call(items, x, w13, s13, w2, s2):
