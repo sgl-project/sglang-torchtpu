@@ -347,7 +347,10 @@ def stage_calls(c: PPConfig):
 
         def combine(sl):
             y_h, tw_in, ones_v = R["y_h"], R["tw_in"], R["ones_v"]
-            ones_v[...] = jnp.ones(ones_v.shape, BF16)
+            pew = vrow("post_expert_w", He)
+            ones_v[...] = jnp.transpose(jnp.broadcast_to(pew * pew, (LANE, He))).astype(
+                BF16
+            )
             n_wu = H // tn
             total = n_rt * n_wu
             n_grp = tm // G
@@ -386,9 +389,8 @@ def stage_calls(c: PPConfig):
 
                     stage = gbuf.at[:, pl.ds(yb * He, He)]
 
-                    # the slot RMS sums and the weighted slot sum run on the MXU: the VPU
-                    # only scales (a ones block sums the squares; Wsel holds w at (t, Kt + k))
-                    pew = vrow("post_expert_w", He)
+                    # sum(k) w_k s_k (y_k * pew) = pew * (Wsel @ y), Wsel[t, Kt + k] = w_k s_k:
+                    # the squares' pew^2 sums and the slot sum run on the MXU
                     tw = jnp.concatenate(
                         [
                             tw_v[pl.ds(pl.multiple_of(gi * G, G), G), :],
@@ -396,24 +398,27 @@ def stage_calls(c: PPConfig):
                         ],
                         axis=1,
                     )
-                    wsel = pltpu.roll(tw, 0, 1, stride=K, stride_axis=0).astype(BF16)
                     ss = jnp.zeros((tm, LANE), F32)
                     for l0 in range(0, He, LC):
-                        yp = stage[:, pl.ds(l0, LC)].astype(F32) * pew[:, l0 : l0 + LC]
+                        yc = stage[:, pl.ds(l0, LC)]
                         ss = ss + jnp.dot(
-                            (yp * yp).astype(BF16),
-                            ones_v[...],
+                            yc * yc,
+                            ones_v[pl.ds(l0, LC), :],
                             preferred_element_type=F32,
                         )
-                    scale = jax.lax.rsqrt(ss[:, :1] * (1.0 / He) + c.post_eps)
+                    scale = jax.lax.rsqrt(
+                        jnp.transpose(ss)[:1] * (1.0 / He) + c.post_eps
+                    )
+                    wsel = pltpu.roll(tw, 0, 1, stride=K, stride_axis=0)
+                    wsel = (wsel * scale).astype(BF16)
                     for l0 in range(0, He, LC):
-                        yp = stage[:, pl.ds(l0, LC)].astype(F32) * pew[:, l0 : l0 + LC]
                         accbuf[pl.ds(pl.multiple_of(gi * G, G), G), pl.ds(l0, LC)] = (
                             jnp.dot(
                                 wsel,
-                                (yp * scale).astype(BF16),
+                                stage[:, pl.ds(l0, LC)],
                                 preferred_element_type=F32,
                             )
+                            * pew[:, l0 : l0 + LC]
                         )
                     return cc
 
@@ -494,7 +499,9 @@ def stage_calls(c: PPConfig):
         vmem((2, tm, tn), BF16),  # otile
         vmem((tm, LANE), jnp.int32),  # ids_v
         vmem((tm, LANE), F32),  # tw_v
-        vmem((LC, LANE), BF16),  # ones_v: sums a lane chunk's squares on the MXU
+        vmem(
+            (He, LANE), BF16
+        ),  # ones_v: pew^2 down each column, sums the squares on the MXU
         vmem((2, tn, tn), BF16),  # hmat: per-head mean and rotary partner matrices
         smem_t((8,), jnp.int32),  # misc_s
         dma((3,)),
