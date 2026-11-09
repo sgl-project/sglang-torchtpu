@@ -268,6 +268,7 @@ def chunk_compute(
     He: int,
     CI: int,
     item_rows: int,
+    prologue: Callable[[], None] | None = None,
 ) -> None:
     """acc[:n] += the n slots' expert output over this I-chunk.
 
@@ -275,6 +276,8 @@ def chunk_compute(
       x_rows: x_rows(R) -> f32 [R, He] (bf16 values), the item's first R rows (kperm order
         for fp4).
       acc: f32 [item_rows, He] ref.
+      prologue: run first inside each arm, so its scalar work (the ring's DMA issue and
+        waits) shares the arm's bundles.
     """
     sizes = item_sizes(item_rows)
     if kind == "fp4" and qblock():
@@ -292,6 +295,8 @@ def chunk_compute(
         arms = [lambda R=R: _fp8_arm(R, x_rows, acc, w, He, CI) for R in sizes]
         bounds = sizes[:-1]
         names = [f"f8_{R}" for R in sizes]
+    if prologue is not None:
+        arms = [lambda f=f: (prologue(), f()) for f in arms]
     if (
         int(os.environ.get("SGLANG_TPU_EP_TRACE", "0")) >= 2
     ):  # each arm a region (xprof)

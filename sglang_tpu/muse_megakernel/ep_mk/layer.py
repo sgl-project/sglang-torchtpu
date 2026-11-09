@@ -385,10 +385,14 @@ def _expert_loop_on(
 
             sized(n, sizes, zero)
 
-        with _phase("issue", 2):
+        def issue():
             start(k + D - 1)
             wait(slot, k)
-        if not _dev_skip("experts"):
+
+        if _dev_skip("experts"):
+            with _phase("issue", 2):
+                issue()
+        else:
             chunk_compute(
                 step.kind,
                 n,
@@ -398,6 +402,7 @@ def _expert_loop_on(
                 He,
                 CI,
                 RI,
+                prologue=issue,
             )
 
         @pl.when(j == NC - 1)
