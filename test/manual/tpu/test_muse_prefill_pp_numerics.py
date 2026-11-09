@@ -365,17 +365,36 @@ def expert_outputs(c, w, l, xe, ids, slot, cap=96):
     assert int(rows_hit.sum(0).max()) <= cap, int(rows_hit.sum(0).max())
     ex = w["fp8"] if kind == "fp8" else w["fp4"][slot]
 
+    def w8a8(x, w, ws):
+        """gmm_v2's fp8 path: rows quantized to fp8 per 512-wide K block (scale amax / 448),
+        each block's product rounded to its bf16 accumulator, scaled and summed in bf16."""
+        f8max = float(jnp.finfo(jnp.float8_e4m3fn).max)
+        acc = jnp.zeros((x.shape[0], w.shape[1]), jnp.bfloat16)
+        for b0 in range(0, x.shape[1], 512):
+            xb = x[:, b0 : b0 + 512]
+            sc = jnp.max(jnp.abs(xb), axis=1, keepdims=True) / f8max
+            inv = jnp.where(sc == 0, 0.0, 1.0 / sc)
+            q = (xb * inv).astype(jnp.float8_e4m3fn).astype(jnp.float32)
+            part = _dot(q, w[b0 : b0 + 512]).astype(jnp.bfloat16)
+            part = part * sc.astype(jnp.bfloat16) * ws.astype(jnp.bfloat16)[None, :]
+            acc = acc + part
+        return acc.astype(jnp.float32)
+
     def one(e, w13, s13, w2, s2, xe, hit_e):
-        if kind == "fp8":
-            g13 = w13[e].astype(jnp.float32) * s13[e, 0]
-            d2 = w2[e].astype(jnp.float32) * s2[e, 0]
-        else:
-            g13, d2 = _dq4(w13[e], s13[e]), _dq4(w2[e], s2[e])
         idx = jnp.nonzero(hit_e, size=cap, fill_value=T)[0]
         xr = jnp.concatenate([xe, jnp.zeros((1, He))])[idx]
-        gu = _dot(xr, g13)
-        h = _bf(gu[:, : c.inter] * jax.nn.sigmoid(gu[:, : c.inter]) * gu[:, c.inter :])
-        y = _bf(_dot(h, d2))
+        if kind == "fp8":
+            gu = w8a8(xr, w13[e].astype(jnp.float32), s13[e, 0, 0])
+            act = _bf(
+                gu[:, : c.inter] * jax.nn.sigmoid(gu[:, : c.inter]) * gu[:, c.inter :]
+            )
+            y = _bf(w8a8(act, w2[e].astype(jnp.float32), s2[e, 0, 0]))
+        else:
+            gu = _dot(xr, _dq4(w13[e], s13[e]))
+            act = _bf(
+                gu[:, : c.inter] * jax.nn.sigmoid(gu[:, : c.inter]) * gu[:, c.inter :]
+            )
+            y = _bf(_dot(act, _dq4(w2[e], s2[e])))
         return idx, _bf(_rms(y * pew, c.post_eps))
 
     out = jnp.zeros((T + 1, E, He), jnp.bfloat16)  # bf16 values: exact
