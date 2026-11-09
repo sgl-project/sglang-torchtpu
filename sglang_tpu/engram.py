@@ -176,6 +176,31 @@ def capture_inputs(
     )
 
 
+def verify_inputs(
+    tails: np.ndarray, verify_tokens: np.ndarray, seq_lens: np.ndarray, ngram: int
+) -> HostEngramInputs:
+    """Engram windows of speculative verify rows, drafted tokens included.
+
+    Request b verifies ``verify_tokens[b] = [r, d_1, ..., d_K]`` at positions
+    ``seq_lens[b] + 0..K``; ``tails[b]`` holds its committed tokens at positions
+    ``seq_lens[b] - (ngram - 1) .. seq_lens[b] - 1`` (values below position 0
+    are ignored by the hash). Rows are request-major, as the verify forward.
+    """
+    tails = np.asarray(tails, dtype=np.int64)
+    verify_tokens = np.asarray(verify_tokens, dtype=np.int64)
+    seq_lens = np.asarray(seq_lens, dtype=np.int64)
+    batch, rows = verify_tokens.shape
+    if tails.shape != (batch, ngram - 1) or seq_lens.shape != (batch,):
+        raise ValueError("Engram verify tails/lengths do not match the verify rows")
+    history = np.concatenate([tails, verify_tokens], axis=1)
+    offsets = np.arange(rows, dtype=np.int64)
+    # Row j (position n + j) reads history[j + ngram - 1 - k] for k = 0..ngram-1.
+    index = offsets[:, None] + (ngram - 1) - np.arange(ngram, dtype=np.int64)
+    windows = history[:, index].reshape(batch * rows, ngram)
+    positions = (seq_lens[:, None] + offsets).reshape(-1)
+    return HostEngramInputs(tokens=windows, positions=positions)
+
+
 def hash_on_host(
     inputs: HostEngramInputs,
     *,
@@ -511,6 +536,8 @@ class HostEngramCoordinator:
         self._sync_fn = sync_fn
         self.pending: PendingTokens | None = None
         self.hashes: torch.Tensor | None = None
+        # prepare_verify_deferred: DSpark's callback, run on the first use of this step's rows.
+        self._verify_resolve = None
         self.started = False
         # This step's windows while the previous step's sampled token is in flight.
         self.deferred: DeferredEngramInputs | None = None
@@ -601,9 +628,13 @@ class HostEngramCoordinator:
         self._staged_padded_tokens = None
 
     def prepare(self, batch) -> tuple[list, list[int]]:
-        if not batch.spec_algorithm.is_none():
+        if not batch.spec_algorithm.is_none() and not (
+            batch.forward_mode.is_extend() or batch.forward_mode.is_idle()
+        ):
+            # Speculative decode stages its verify rows with prepare_verify.
             raise NotImplementedError(
-                "Host Engram does not yet support speculative decode"
+                f"Host Engram prepares speculative {batch.forward_mode} rows "
+                "through prepare_verify"
             )
         if any(getattr(req, "beam_group", None) is not None for req in batch.reqs):
             raise NotImplementedError("Host Engram does not yet support beam search")
@@ -650,8 +681,15 @@ class HostEngramCoordinator:
     def resolve(self) -> torch.Tensor | None:
         """Fill the holes from the previous step's result, waiting for its copy, then hash.
 
-        Later calls in the same step return the same hashes without waiting.
+        A speculative verify step deferred with ``prepare_verify_deferred`` runs
+        its callback here instead. Later calls in the same step return the same
+        hashes without waiting.
         """
+        verify_resolve, self._verify_resolve = self._verify_resolve, None
+        if verify_resolve is not None:
+            verify_resolve()
+            if self.hashes is None:
+                raise RuntimeError("Deferred Engram verify rows were not prepared")
         if self.deferred is not None:
             inputs = self.deferred.resolve(self.pending)
             self.hashes = hash_on_host(
@@ -662,6 +700,50 @@ class HostEngramCoordinator:
             )
             self.deferred = None
         return self.hashes
+
+    def prepare_verify(self, inputs: HostEngramInputs | None) -> None:
+        """Hash speculative verify rows (or none, on an idle DP rank).
+
+        The verify forward runs without a scheduled batch; the next forward
+        consumes these rows and clear_step drops them.
+        """
+        if inputs is None:
+            inputs = HostEngramInputs(
+                tokens=np.empty((0, self.ngram), dtype=np.int64),
+                positions=np.empty(0, dtype=np.int64),
+            )
+        self._discard_staged_uploads()
+        self.deferred = None
+        self.hashes = hash_on_host(
+            inputs,
+            **self.tables,
+            pad_id=self.pad_id,
+            image_token_id=self.image_token_id,
+        )
+        self.started = True
+
+    def prepare_verify_deferred(self, resolve) -> None:
+        """Defer a verify step's hashing to the first use of its rows.
+
+        ``resolve()`` must call ``prepare_verify``. The DSpark worker passes one
+        that waits for the drafted tokens (D2H) and hashes them, so the verify
+        forward's host work that does not need them (batch, attention metadata,
+        the segment before the first Engram layer) is issued while the drafter
+        still runs on device.
+        """
+        self._discard_staged_uploads()
+        self.hashes = None
+        self.deferred = None
+        self._verify_resolve = resolve
+        self.started = True
+
+    @property
+    def rows_prepared(self) -> bool:
+        return (
+            self.hashes is not None
+            or self.deferred is not None
+            or self._verify_resolve is not None
+        )
 
     def begin_step(self, padded_tokens: int) -> None:
         pending = self.hashes if self.deferred is None else self.deferred.tokens
@@ -788,5 +870,6 @@ class HostEngramCoordinator:
                 upload.record_consumers([upload.device])
         self.hashes = None
         self.deferred = None
+        self._verify_resolve = None
         self._next_prompt_spec = None
         self.started = False

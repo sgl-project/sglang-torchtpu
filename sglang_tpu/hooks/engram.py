@@ -173,7 +173,16 @@ def worker_forward(original, worker, batch, *args, **kwargs):
     if coordinator is None:
         return original(worker, batch, *args, **kwargs)
     if batch is None:
-        raise NotImplementedError("Host Engram needs a scheduled request batch")
+        # A speculative verify forward: its worker staged the verify rows,
+        # drafted tokens included (HostEngramCoordinator.prepare_verify).
+        if not coordinator.rows_prepared:
+            raise NotImplementedError(
+                "Host Engram needs a scheduled batch or prepared verify rows"
+            )
+        try:
+            return original(worker, batch, *args, **kwargs)
+        finally:
+            coordinator.clear_step()
     # prepare does not wait for step N's sampled token; the first Engram staging
     # call does, after batch build, metadata and segment A are issued.
     requests, positions = coordinator.prepare(batch)

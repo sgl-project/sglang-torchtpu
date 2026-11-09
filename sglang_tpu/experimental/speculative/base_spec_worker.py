@@ -1755,6 +1755,51 @@ class TpuSpecWorker(BaseSpecWorker):
         result.next_draft_input = idle.next_draft_input
         return result
 
+    @classmethod
+    def intake_rejection(cls, req) -> str | None:
+        """Why this worker cannot serve ``req``, checked at scheduler intake; None if it can.
+
+        Mirrors ``_check_supported``, which raises per batch inside the scheduler.
+        Logprobs are checked by the intake gate itself (patches.py).
+        """
+        params = req.sampling_params
+        # Only bans EOS, which ignore_eos already disregards (AgentX sends it).
+        if params.min_new_tokens and params.ignore_eos and not params.stop_token_ids:
+            params.min_new_tokens = 0
+        if params.json_schema or params.regex or params.ebnf or params.structural_tag:
+            return "grammar-constrained decoding"
+        if params.logit_bias:
+            return "logit_bias"
+        if (
+            (
+                (params.frequency_penalty or params.presence_penalty)
+                and not cls.supports_additive_penalties
+            )
+            or params.repetition_penalty != 1.0
+            or params.min_new_tokens
+        ):
+            return "penalties or min_new_tokens"
+        if req.custom_logit_processor:
+            return "custom logit processors"
+        # Greedy is top_k 1 (normalized) or temperature 0 (raw params).
+        sampled = params.top_k > 1 and params.temperature > 0
+        if params.sampling_seed is not None:
+            if sampled:
+                return "seeded sampling"
+            params.sampling_seed = (
+                None  # meaningless when greedy (GSM8K sends one at T=0)
+            )
+        filtered = params.top_k < TOP_K_ALL or params.top_p < 1.0 or params.min_p > 0.0
+        if (
+            sampled
+            and filtered
+            and not tpu_envs.SGLANG_TPU_ENABLE_BSEARCH_SAMPLING.get()
+        ):
+            return (
+                "top-k/top-p/min-p sampling without SGLANG_TPU_ENABLE_BSEARCH_SAMPLING"
+            )
+        return None
+
     def _check_supported(
         self, *, batch: ScheduleBatch, pp_proxy_tensors: PPProxyTensors | None
     ) -> None:

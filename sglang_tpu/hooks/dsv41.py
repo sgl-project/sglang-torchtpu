@@ -5,8 +5,19 @@ Why: The core TPU pool budget enumerates only C4/C128, and shifted mHC imports
      a Triton-only combine directly instead of using its existing MhcOps table.
 How: AFTER the per-full-token budget adds C1/C2 physical bytes; AROUND combine
      selects tensor math on TPU. Model ordering and model configuration stay in core.
+last_loc_on_host
+  Why: get_last_loc picks Triton unless the attention backend is on a fixed
+       allowlist of non-Triton names; V4.1's "dsv4" backend is not on it, so
+       speculative decode-cache allocation (spec_utils.allocate_and_assign_
+       decode_cache, reached by the experimental TPU spec worker) launched a
+       Triton kernel on TPU, failing the first speculative decode. On TPU the
+       request table is host-resident (or a TPU tensor); Triton never applies.
+  How: AROUND get_last_loc: a CPU/TPU request table takes get_last_loc_torch;
+       other devices keep the original dispatch. The registry also rebinds
+       spec_utils' `from ... import get_last_loc`.
 Upstream PR or issue: not filed (local V4.1 integration; needs pool-byte and mHC seams).
-Remove when: the configurator queries pool storage sizes and shifted mHC uses MhcOps.
+Remove when: the configurator queries pool storage sizes and shifted mHC uses MhcOps;
+             get_last_loc dispatches on the request table's device (or the platform).
 """
 
 
@@ -36,6 +47,16 @@ def hc_combine(original, x_flat, pre, hc, out_dtype):
     return combine(x_flat, pre, hc, out_dtype)
 
 
+def last_loc_on_host(
+    original, req_to_token, req_pool_indices_tensor, prefix_lens_tensor
+):
+    if req_to_token.device.type not in ("cpu", "tpu"):
+        return original(req_to_token, req_pool_indices_tensor, prefix_lens_tensor)
+    from sglang.srt.mem_cache.allocation import get_last_loc_torch
+
+    return get_last_loc_torch(req_to_token, req_pool_indices_tensor, prefix_lens_tensor)
+
+
 def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
@@ -48,6 +69,11 @@ def hook_specs():
         (
             "sglang.kernels.ops.layernorm.mhc.hc_combine",
             hc_combine,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.mem_cache.allocation.get_last_loc",
+            last_loc_on_host,
             HookType.AROUND,
         ),
     ]

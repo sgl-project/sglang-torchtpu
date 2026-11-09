@@ -963,18 +963,20 @@ def _scheduler_intake_rejection(scheduler, req) -> str | None:
         )
         if rejection is not None:
             return rejection
-    if req.return_logprob:
-        # The experimental TPU spec worker raises on a logprob batch. Ask the
-        # worker class, not scheduler.draft_worker: every rank must reach the
-        # same answer, and PP stages other than the last have no draft worker.
-        spec_algorithm = getattr(scheduler, "spec_algorithm", None)
-        if spec_algorithm is not None and not spec_algorithm.is_none():
-            worker_cls = spec_algorithm.create_worker(scheduler.server_args)
-            if not getattr(worker_cls, "supports_logprobs", True):
-                return (
-                    f"Speculative decoding on this server ({worker_cls.__name__}) "
-                    "does not support logprobs; resend without return_logprob."
-                )
+    # The experimental TPU spec worker raises on a batch it cannot serve. Ask the
+    # worker class, not scheduler.draft_worker: every rank must reach the
+    # same answer, and PP stages other than the last have no draft worker.
+    spec_algorithm = getattr(scheduler, "spec_algorithm", None)
+    if spec_algorithm is not None and not spec_algorithm.is_none():
+        worker_cls = spec_algorithm.create_worker(scheduler.server_args)
+        if req.return_logprob and not getattr(worker_cls, "supports_logprobs", True):
+            return (
+                f"Speculative decoding on this server ({worker_cls.__name__}) "
+                "does not support logprobs; resend without return_logprob."
+            )
+        rejection = _spec_worker_intake_rejection(worker_cls, req)
+        if rejection is not None:
+            return rejection
     if req.multimodal_inputs is not None and envs.SGLANG_TPU_VL_TEXT_ONLY_EXTEND.get():
         # Only the token-id EXTEND graphs are warmed and compilation is frozen
         # after warmup, so an input_embeds forward would hit fail_on_recompile.
@@ -983,6 +985,37 @@ def _scheduler_intake_rejection(scheduler, req) -> str | None:
             "multimodal inputs are not supported."
         )
     return None
+
+
+def _spec_worker_intake_rejection(worker_cls, req) -> str | None:
+    from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
+
+    if not (isinstance(worker_cls, type) and issubclass(worker_cls, TpuSpecWorker)):
+        return None
+    feature = worker_cls.intake_rejection(req)
+    if feature is None:
+        return None
+    return (
+        f"Speculative decoding on this server ({worker_cls.__name__}) does not "
+        f"support {feature}; resend the request without it."
+    )
+
+
+def _plain_greedy(req) -> None:
+    """Reset sampling to plain greedy for an aborted request's one-token prefill.
+
+    set_finish_with_abort clears grammar and logprobs but keeps the sampling
+    params, which the TPU spec worker's batch check would still refuse.
+    """
+    params = req.sampling_params
+    params.json_schema = params.regex = params.ebnf = params.structural_tag = None
+    params.logit_bias = None
+    params.frequency_penalty = params.presence_penalty = 0.0
+    params.repetition_penalty = 1.0
+    params.min_new_tokens = 0
+    params.sampling_seed = None
+    params.temperature, params.top_k, params.top_p, params.min_p = 0.0, 1, 1.0, 0.0
+    req.custom_logit_processor = None
 
 
 def _patch_scheduler_reject_unservable_requests() -> None:
@@ -1002,6 +1035,7 @@ def _patch_scheduler_reject_unservable_requests() -> None:
             rejection = _scheduler_intake_rejection(self, req)
             if rejection is not None:
                 req.set_finish_with_abort(rejection)
+                _plain_greedy(req)
         return original(self, req, is_retracted)
 
     _add_request_to_queue._tpu_intake_gate = True

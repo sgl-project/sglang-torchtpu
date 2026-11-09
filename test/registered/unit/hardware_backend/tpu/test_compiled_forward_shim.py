@@ -60,6 +60,7 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
 )
 from sglang_tpu.envs import envs
+from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 # Pure-logic tests: CPU tensors only, and the shim's import chain is
@@ -2172,6 +2173,132 @@ class TestShimInputLogprobPath(CustomTestCase):
         self._shim(seen, model=_StubModel(), enabled=False)(None, None, fb)
         self.assertFalse(seen["return_logprob"])
         self.assertTrue(fb.return_logprob)
+
+
+class _IntakeWorker(TpuSpecWorker):
+    pass
+
+
+class TestTpuSpecWorkerIntakeGate(CustomTestCase):
+    """A request the TPU spec worker's per-batch check refuses gets a 400 at
+    intake instead of raising in the scheduler (which stopped the server), and
+    the abort's one-token prefill passes that batch check."""
+
+    @staticmethod
+    def _req(custom_logit_processor=None, **params):
+        req = Req(
+            "r",
+            "",
+            array("q", [1, 2, 3]),
+            SamplingParams(**params),
+            custom_logit_processor=custom_logit_processor,
+        )
+        return req
+
+    @staticmethod
+    def _scheduler(worker_cls=_IntakeWorker):
+        algorithm = SimpleNamespace(
+            is_none=lambda: False, create_worker=lambda server_args: worker_cls
+        )
+        return SimpleNamespace(spec_algorithm=algorithm, server_args=None)
+
+    def _enqueue(self, req, scheduler=None, is_retracted=False):
+        queue = MagicMock()
+        with (
+            patch.object(Scheduler, "_add_request_to_queue", queue),
+            get_context().override_server_args(),
+            get_parallel().override(tp_rank=0),
+        ):
+            patches._patch_scheduler_reject_unservable_requests()
+            Scheduler._add_request_to_queue(
+                scheduler or self._scheduler(), req, is_retracted
+            )
+        queue.assert_called_once()
+        return req
+
+    def test_agentx_and_seeded_greedy_requests_pass(self):
+        # AgentX sends min_new_tokens with ignore_eos: it only bans EOS.
+        agentx = self._enqueue(
+            self._req(temperature=1.0, ignore_eos=True, min_new_tokens=8)
+        )
+        self.assertIsNone(agentx.to_finish)
+        self.assertEqual(agentx.sampling_params.min_new_tokens, 0)
+        # The GSM8K harness sends a seed at T=0; the batch check refuses any seed.
+        for greedy in (
+            dict(temperature=0.0, sampling_seed=1234),
+            dict(top_k=1, sampling_seed=7),
+        ):
+            with self.subTest(**greedy):
+                req = self._enqueue(self._req(**greedy))
+                self.assertIsNone(req.to_finish)
+                self.assertIsNone(req.sampling_params.sampling_seed)
+
+    def test_each_refused_feature_gets_a_400_naming_it(self):
+        cases = {
+            "grammar-constrained decoding": self._req(json_schema='{"type": "object"}'),
+            "logit_bias": self._req(logit_bias={"5": 1.0}),
+            "penalties or min_new_tokens": self._req(frequency_penalty=0.5),
+            "seeded sampling": self._req(temperature=1.0, sampling_seed=7),
+            "custom logit processors": self._req(custom_logit_processor="x"),
+        }
+        for feature, req in cases.items():
+            with self.subTest(feature=feature):
+                self._enqueue(req)
+                self.assertIsInstance(req.to_finish, FINISH_ABORT)
+                self.assertEqual(req.to_finish.status_code, HTTPStatus.BAD_REQUEST)
+                self.assertIn(feature, req.to_finish.message)
+        # Without ignore_eos, min_new_tokens needs the penalizer.
+        self.assertIsNotNone(
+            _IntakeWorker.intake_rejection(self._req(min_new_tokens=4))
+        )
+
+    def test_additive_penalties_follow_the_worker_capability(self):
+        additive = type(
+            "AdditiveWorker", (TpuSpecWorker,), {"supports_additive_penalties": True}
+        )
+        req = self._enqueue(
+            self._req(presence_penalty=0.5), scheduler=self._scheduler(additive)
+        )
+        self.assertIsNone(req.to_finish)
+        self.assertIsNotNone(
+            additive.intake_rejection(self._req(repetition_penalty=1.1))
+        )
+
+    def test_filtered_sampling_needs_bsearch(self):
+        req = self._req(temperature=1.0, top_p=0.9)
+        with envs.SGLANG_TPU_ENABLE_BSEARCH_SAMPLING.override(False):
+            self.assertIn(
+                "SGLANG_TPU_ENABLE_BSEARCH_SAMPLING",
+                _IntakeWorker.intake_rejection(req),
+            )
+        with envs.SGLANG_TPU_ENABLE_BSEARCH_SAMPLING.override(True):
+            self.assertIsNone(_IntakeWorker.intake_rejection(req))
+
+    def test_abort_prefill_passes_the_batch_check(self):
+        bad = self._enqueue(
+            self._req(
+                temperature=1.0,
+                frequency_penalty=0.5,
+                sampling_seed=3,
+                logit_bias={"5": 1.0},
+            )
+        )
+        self.assertIsInstance(bad.to_finish, FINISH_ABORT)
+        params = bad.sampling_params
+        self.assertEqual(
+            (params.frequency_penalty, params.sampling_seed, params.logit_bias),
+            (0.0, None, None),
+        )
+        self.assertEqual((params.temperature, params.top_k), (0.0, 1))
+        self.assertIsNone(_IntakeWorker.intake_rejection(bad))
+
+    def test_retracted_and_other_workers_are_untouched(self):
+        retracted = self._enqueue(self._req(logit_bias={"5": 1.0}), is_retracted=True)
+        self.assertIsNone(retracted.to_finish)
+        other = self._enqueue(
+            self._req(logit_bias={"5": 1.0}), scheduler=self._scheduler(object)
+        )
+        self.assertIsNone(other.to_finish)
 
 
 class TestAttachInputLogprobs(CustomTestCase):

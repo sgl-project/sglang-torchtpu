@@ -85,9 +85,11 @@ def _validate_tpu_speculative_args(server_args: ServerArgs) -> None:
         raise ValueError(
             "TPU speculative decoding requires --speculative-eagle-topk=1."
         )
-    if cfg.speculative_use_rejection_sampling:
+    # DSPARK's TPU worker drafts greedily by default (target-only acceptance) and
+    # samples its drafts from the draft distribution under rejection sampling.
+    if cfg.speculative_use_rejection_sampling and cfg.speculative_algorithm != "DSPARK":
         raise ValueError(
-            "TPU speculative decoding does not support rejection sampling."
+            "TPU speculative decoding supports rejection sampling only for DSPARK."
         )
     if cfg.kv_canary != "none":
         raise ValueError("TPU speculative decoding does not support KV canary.")
@@ -1128,13 +1130,14 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
     # and declare_resolution writes to the stash rather than the dataclass.
     if resolved_view(server_args).speculative_use_rejection_sampling:
         # Resolved alias by now: NEXTN -> EAGLE, Gemma4 draft -> FROZEN_KV_MTP.
-        # Only the EAGLE/EAGLE3 draft workers emit a target-vocab proposal that
-        # the rejection-sampling kernel consumes; everything else (STANDALONE,
-        # FROZEN_KV_MTP, NGRAM, DFLASH) is unsupported.
-        if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+        # Only the EAGLE/EAGLE3 draft workers (and DSPARK's TPU worker) emit a
+        # target-vocab proposal that rejection sampling consumes; everything else
+        # (STANDALONE, FROZEN_KV_MTP, NGRAM, DFLASH) is unsupported.
+        supported = ("EAGLE", "EAGLE3") + (("DSPARK",) if cfg.device == "tpu" else ())
+        if cfg.speculative_algorithm not in supported:
             raise NotImplementedError(
                 "--speculative-use-rejection-sampling is only supported for "
-                "EAGLE / EAGLE3 / NEXTN, not "
+                "EAGLE / EAGLE3 / NEXTN (and DSPARK on TPU), not "
                 f"speculative_algorithm={cfg.speculative_algorithm}."
             )
         if cfg.speculative_eagle_topk != 1:
