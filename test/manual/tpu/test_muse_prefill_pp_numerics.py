@@ -32,9 +32,14 @@ os.environ.update({
     "SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP": "256", "SGLANG_TPU_RPA_NO_MAX": "1",
     "SGLANG_TPU_RPA_OUT_HEAD_NORM_EPS": "1e-05", "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1",
     "SGLANG_TPU_RPA_TRANSPOSED": TRANSPOSED,
-    "SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS": "256:32:768:2",
-    "SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS": "128:512",
 })  # fmt: skip
+if (
+    TRANSPOSED == "1"
+):  # the standard tile overflows VMEM at these blocks; its own search picks
+    os.environ.update({
+        "SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS": "256:32:768:2",
+        "SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS": "128:512",
+    })  # fmt: skip
 
 HIGH = jax.lax.Precision.HIGHEST
 T, CTX = 512, 2560
