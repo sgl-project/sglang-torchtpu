@@ -28,7 +28,7 @@ class EPPlan(NamedTuple):
 
 def ep_plan(c: MKConfig, item_rows: int = 64) -> EPPlan:
     assert c.row_tile, "the EP expert section is row-tiled only"
-    assert not c.y_quant and not c.scale_fp8 and c.n_experts % c.tp == 0
+    assert not c.scale_fp8 and c.n_experts % c.tp == 0
     assert c.inter_local % BD_KC == 0 and c.expert_hidden % BD_KC == 0
     item_sizes(item_rows)
     el = c.n_experts // c.tp
@@ -75,6 +75,8 @@ def ep_scratch(c: MKConfig, p: EPPlan) -> list:
         ("ep_x", vmem((2, ri, he // 2), jnp.uint32)),  # an item's x rows, bf16 pairs
         ("ep_acc", vmem((2, ri, he), jnp.float32)),
         ("ep_y", vmem((2, ri, he // 2), jnp.uint32)),  # outgoing y rows, bf16 pairs
+        # this rank's rows' y, slot by slot, as the experts' ranks send them
+        ("ep_pad", vmem((c.rows_per_dev, c.top_k, he // 2), jnp.uint32)),
         # slot j of local expert e on lane e
         ("ep_tab", vmem((p.slots_pad, LANE), jnp.int32)),
         # rows < EL: expert e's slots (row * K + slot); row EL: the slot counts

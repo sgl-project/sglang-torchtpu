@@ -209,7 +209,7 @@ def _expert_loop(step: EPMoEStep, p: EPPlan, n_items) -> None:
 
 def _combine(step: EPMoEStep) -> None:
     """u = sum over a row's slots of weight * norm(post_expert_w * y), this rank's rows (the
-    TP combine's math on the one pad_y slab the y rows landed in)."""
+    TP combine's math on ep_pad, where the y rows landed)."""
     c, S, smr, me, n_live = step.c, step.S, step.smr, step.me, step.n_live
     K, He, Rc, R = c.top_k, c.expert_hidden, c.rows_per_dev, c.rows
     f32, bf16 = jnp.float32, jnp.bfloat16
@@ -223,7 +223,7 @@ def _combine(step: EPMoEStep) -> None:
     wmine = S["wsel_v"][pl.ds(w0, win), pl.ds(0, K)]  # [win, K]
     wk = jnp.concatenate([wmine[:, k : k + 1][:, :, None] for k in range(K)], axis=1)
     S["wk_s"][...] = jnp.broadcast_to(wk, (win, K, LANE))
-    pad = S["pad_y"].at[0]
+    pad = S["ep_pad"]
 
     def row(r, carry):
         ysum = _unpack_bf16x2(pad.at[r][...])  # [K, He]

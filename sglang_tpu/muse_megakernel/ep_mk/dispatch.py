@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Slot rows in and out of an expert item: each slot's x row from the replicated xfull (local
-DMA), and each slot's y row to its row owner's pad_y[0][row, slot] (remote DMA, or local when
+DMA), and each slot's y row to its row owner's ep_pad[row, slot] (remote DMA, or local when
 this rank owns the row)."""
 
 import jax
@@ -48,7 +48,7 @@ def gather_x_wait(S: dict, b, n) -> None:
 def _y_row_template(S: dict, b):
     return pltpu.make_async_copy(
         S["ep_y"].at[b, pl.ds(0, 1)],
-        S["pad_y"].at[0, 0, pl.ds(0, 1)],
+        S["ep_pad"].at[0, pl.ds(0, 1)],
         S["ep_ys_sems"].at[b],
     )
 
@@ -65,14 +65,14 @@ def drain_y(S: dict, b) -> None:
 
 
 def send_y(c: MKConfig, S: dict, me, b, e, j0, n) -> None:
-    """Each of the item's n rows in ep_y[b] to its owner's pad_y[0][row % Rc, slot]."""
+    """Each of the item's n rows in ep_y[b] to its owner's ep_pad[row % Rc, slot]."""
     Rc = c.rows_per_dev
 
     def one(t, carry):
         r, k = slot_of(c, S, e, j0 + t)
         owner, rl = r // Rc, r % Rc
         src = S["ep_y"].at[b, pl.ds(t, 1)]
-        dst = S["pad_y"].at[0, rl, pl.ds(k, 1)]
+        dst = S["ep_pad"].at[rl, pl.ds(k, 1)]
 
         @pl.when(owner == me)
         def _():
@@ -107,7 +107,7 @@ def wait_my_rows(c: MKConfig, S: dict, me, n_live) -> None:
     mine = jnp.clip(n_live - me * Rc, 0, Rc) * c.top_k
     msg = pltpu.make_async_remote_copy(
         src_ref=S["ep_y"].at[0, pl.ds(0, 1)],
-        dst_ref=S["pad_y"].at[0, 0, pl.ds(0, 1)],
+        dst_ref=S["ep_pad"].at[0, pl.ds(0, 1)],
         send_sem=S["ep_ys_sems"].at[0],
         recv_sem=S["ep_yr_sem"].at[0],
         device_id=(me,),
