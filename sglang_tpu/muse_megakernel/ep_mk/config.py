@@ -158,6 +158,11 @@ def ep_scratch(c: MKConfig, p: EPPlan) -> list:
             ("ep_acc", vmem((ri, he), f32)),
             ("ep_y", vmem((ri, he // 2), u32)),  # an item's y rows, bf16 pairs
         ]
+    stage = (
+        [("ep_lhs_stage", vmem((c.row_tile, c.hidden), u32))]
+        if c.tiled_vmem_pads
+        else []
+    )
     return (
         items
         + [
@@ -208,9 +213,5 @@ def ep_scratch(c: MKConfig, p: EPPlan) -> list:
             ("ep_lhs_g", hbm((c.rows, c.hidden // 2), u32)),
             ("ep_lhs_sems", dma((5,))),  # received, sent, own copy, stage slots
         ]
-        + (
-            [("ep_lhs_stage", vmem((c.row_tile, c.hidden), u32))]
-            if c.tiled_vmem_pads
-            else []
-        )
+        + stage
     )
