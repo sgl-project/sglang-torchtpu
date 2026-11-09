@@ -289,6 +289,63 @@ class TestPrefillBlockSizes(CustomTestCase):
         self.assertEqual(tp2_blocks.bq_sz, 512)
         self.assertEqual(tp2_blocks.bkv_sz, 512)
 
+    def test_flash_attention_carries_remain_float32_at_long_context(self):
+        """With bf16 carries, l_prev == 4096.0 + 1.0 rounds back to 4096.0;
+        f32 carries preserve incremental row sums across 64K+ prefix tiles."""
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs, flash_attention
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        with tpu_info_for_cpu_export():
+            model = configs.ModelConfigs(
+                num_q_heads=8,
+                num_kv_heads=1,
+                head_dim=64,
+                mask_value=float("-inf"),
+            )
+            serve = configs.ServingConfigs(
+                num_seqs=1,
+                num_page_indices=256,
+                total_q_tokens=16,
+                dtype_q=jnp.bfloat16,
+                dtype_kv=jnp.bfloat16,
+                dtype_out=jnp.bfloat16,
+                page_size=256,
+                kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+            )
+            block = configs.BlockSizes(
+                bq_sz=16, bq_c_sz=16, bkv_sz=256, batch_size=1, n_buffer=3
+            )
+            cfgs = configs.RpaConfigs(
+                model=model,
+                serve=serve,
+                block=block,
+                mode=configs.RpaCase.MIXED,
+                vmem_limit_bytes=67108864,
+            )
+            q = jnp.zeros((1, 1, 128, 64), dtype=jnp.bfloat16)
+            k = jnp.zeros((1, 1, 64, 256), dtype=jnp.bfloat16)
+            m_prev = jnp.zeros((1, 128, 128), dtype=jnp.float32)
+            l_prev = jnp.full((1, 128, 128), 65536.0, dtype=jnp.float32)
+            is_last_k = jnp.zeros((1, 1), dtype=jnp.int32)
+            p, _, m_out, l_out, _ = flash_attention.flash_attention_qk_softmax(
+                jnp.int32(0),
+                q,
+                k,
+                m_prev,
+                l_prev,
+                is_last_k,
+                processed_q_len=[jnp.int32(65536)],
+                processed_kv_len=[jnp.int32(0)],
+                cfgs=cfgs,
+                bq_start=0,
+            )
+            self.assertEqual(p.dtype, jnp.bfloat16)
+            self.assertEqual(m_out.dtype, jnp.float32)
+            self.assertEqual(l_out.dtype, jnp.float32)
+            self.assertTrue(bool(jnp.all(l_out == 65536.0 + 256.0)))
+
     def test_k_block_grows_by_at_most_one_q_block(self):
         """Wider bkv_sz / bq_sz ratios are unmeasured, so 32q/2kv stops at 512
         even though VMEM would fit a wider k block."""
