@@ -1,11 +1,13 @@
-"""Numerics of the PP prefill stage megakernel (sglang_tpu.muse_megakernel.prefill_pp) on one
-TPU device, against a plain-jnp reference of each layer (f32, HIGHEST precision dots, the
-kernel's bf16 / fp8 rounding points).
+"""Numerics of the PP prefill stage (sglang_tpu.muse_megakernel.prefill_pp: its fused kernels
+around the batched RPA prefill attention, with the serving env) on one TPU device, against a
+plain-jnp reference of each layer (f32, HIGHEST precision dots, bf16 queries, the kernels' bf16 /
+fp8 rounding points).
 
 One stage of three layers at the real per-layer geometry (all 128 q / 16 kv heads, 256
 experts): an fp8-expert sliding-window layer, an fp4 global layer and an fp4 sliding-window
 layer, a 512-token chunk after 2560 cached tokens (the window cuts the cached keys, the global
-layer reads them all). The kernel runs with 1, 2 and 3 valid slots; layer l's reference is
+layer reads them all); layer 0 sits on slot 1 so the global layer is on cfg.global_slots. The
+stage runs with 1, 2 and 3 valid layers; layer l's reference is
 fed the kernel's stream after l - 1 layers (teacher forcing), and its chunk K/V is compared
 with what the kernel wrote into the pool.
 
@@ -38,8 +40,8 @@ def config() -> PP.PPConfig:
         hidden=8192, head_dim=64, q_heads=128, kv_heads=16, n_experts=256, top_k=8,
         expert_hidden=4096, inter=4096, rms_eps=1e-5, post_eps=1e-8, scale_query_by=5.473,
         attn_scale=0.125, router_mult=0.1768, route_scale=1.0, router_eps=1e-15, window=2048,
-        rows=T, slots=len(KINDS), page=256, pages_per_seq=64, global_pools=1, swa_pools=2,
-        global_pages=65, swa_pages=27, slab_rows=2048, max_position=16384,
+        rows=T, slots=len(KINDS) + 1, page=256, pages_per_seq=64, global_pages=65,
+        swa_pages=27, slab_rows=2048, max_position=16384, global_slots=(2,),
     )  # fmt: skip
 
 
@@ -368,45 +370,57 @@ def main() -> int:
         tables[False] = jnp.asarray(
             1 + np.arange(c.pages_per_seq) % (c.swa_pages - 1), jnp.int32
         )
-        kvg = (
-            _unit((c.global_pools, *PP.pool_shape(c, c.global_pages)), 5) * 0.5
-        ).astype(PP.FP8)
-        kvs = (_unit((c.swa_pools, *PP.pool_shape(c, c.swa_pages)), 6) * 0.5).astype(
-            PP.FP8
-        )
+        pools = [
+            (
+                _unit(
+                    PP.pool_shape(
+                        c, c.global_pages if s in c.global_slots else c.swa_pages
+                    ),
+                    5 + s,
+                )
+                * 0.5
+            ).astype(PP.FP8)
+            for s in range(c.slots)
+        ]
         x0 = _bf(_unit((T, c.hidden), 3))
-        call = jax.jit(PP.stage_call(c, debug=True))
         layers = tuple(range(len(KINDS)))
         full = PP.slot_table(c, 0, layers, KINDS, tuple(l for l in layers if GLOBAL[l]))
+        first = c.global_slots[0] - GLOBAL.index(True)  # the slot of layer 0
+        dense = ("wqkvg", "wo", "wpool", "wunpool", "wrouter", "vecs")
+        w_ref = {k: (v[first:] if k in dense else v) for k, v in w.items()}
+
+        def run(tab):
+            return PP.stage_forward(
+                c,
+                jnp.array([CTX, -1], jnp.int32),
+                tab,
+                x0,
+                rope,
+                [w[k] for k in PP.WEIGHT_ORDER],
+                pools,
+                jnp.array([CTX + T], jnp.int32),
+                (tables[True], tables[False]),
+                jnp.array([0, T], jnp.int32),
+                jnp.array([0, 0, 1], jnp.int32),
+                scratch=True,
+            )
+
+        call = jax.jit(run)
         ok = True
         x_prev = x0
         for n in range(1, len(KINDS) + 1):
             tab = full.copy()
-            for s in range(n, c.slots):
+            for s in range(first + n, c.slots):
                 tab[PP.HDR + s * PP.NF + PP.F_VALID] = 0
-            ctl = jnp.array([CTX, -1], jnp.int32)
-            outs = call(
-                ctl,
-                jnp.asarray(tab),
-                tables[True],
-                tables[False],
-                x0,
-                rope,
-                *[w[k] for k in PP.WEIGHT_ORDER],
-                kvg,
-                kvs,
-            )
-            x_k, kvg_k, kvs_k = outs[:3]
-            kernel_ids = outs[8].reshape(T, c.top_k)
+            x_k, pools_k, posts = call(jnp.asarray(tab))
             l = n - 1
-            pidx = int(full[PP.HDR + l * PP.NF + PP.F_POOL])
-            pool = (kvg if GLOBAL[l] else kvs)[pidx]
+            kernel_ids = posts[first + l][1].reshape(T, c.top_k)
+            pool, kpool = pools[first + l], pools_k[first + l]
             table = tables[GLOBAL[l]]
             x_r, k8, v8, flipped, gap = ref_layer(
-                c, w, l, x_prev, pool, table, rope, kernel_ids
+                c, w_ref, l, x_prev, pool, table, rope, kernel_ids
             )
             rel = jnp.linalg.norm(x_k - x_r, axis=1) / jnp.linalg.norm(x_r, axis=1)
-            kpool = (kvg_k if GLOBAL[l] else kvs_k)[pidx]
             kk, vv = pool_tokens(kpool, table, CTX + T)
             kv_rel = float(
                 jnp.linalg.norm(jnp.concatenate([kk[CTX:] - k8, vv[CTX:] - v8]))
