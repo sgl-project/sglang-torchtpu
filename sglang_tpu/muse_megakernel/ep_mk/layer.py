@@ -601,7 +601,7 @@ def _gather_lhs(step: EPLayerStep, p: EPPlan, nsmr) -> None:
     own = (
         S["ep_f"].bitcast(jnp.uint32).at[:, pl.ds(0, H // 2)]
     )  # free after the residual
-    g, sems = S["ep_lhs_g"], S["ep_lhs_sems"]
+    g, sems, rsems = S["ep_lhs_g"], S["ep_lhs_sems"], S["ep_lhs_rsems"]
     w = nsmr[SMALL["pre_attn_w"] : SMALL["pre_attn_w"] + 1, :H]
     _, rows = _stream_rows(c, S)
 
@@ -612,26 +612,57 @@ def _gather_lhs(step: EPLayerStep, p: EPPlan, nsmr) -> None:
             )
 
     rows(me * rc, rc, norm, write_back=False)
-    parts = (
-        [(pl.ds(0, rc), pl.ds(pl.multiple_of(me * rc, 8), rc))]
-        if rc % 8 == 0
-        else [(pl.ds(r, 1), pl.ds(me * rc + r, 1)) for r in range(rc)]
-    )
-    for src, dst in parts:
-        pltpu.make_async_copy(own.at[src], g.at[dst], sems.at[2]).start()
-        for d in range(1, c.tp):
+    n = (
+        rc if rc % 8 == 0 else 1
+    )  # rows per copy: a block, or one row of an unaligned one
+
+    def block(
+        k,
+    ):  # (source rows in a [rc]-row buffer, owner k's rows in ep_lhs_g) per copy
+        if rc % 8 == 0:
+            return [(pl.ds(0, rc), pl.ds(pl.multiple_of(k * rc, 8), rc))]
+        return [(pl.ds(r, 1), pl.ds(k * rc + r, 1)) for r in range(rc)]
+
+    def send(src_buf, k, peer):  # owner k's rows from src_buf to peer's ep_lhs_g
+        for src, dst in block(k):
+            sr = src_buf.at[src] if src_buf is own else src_buf.at[dst]
             pltpu.make_async_remote_copy(
-                src_ref=own.at[src],
+                src_ref=sr,
                 dst_ref=g.at[dst],
                 send_sem=sems.at[1],
-                recv_sem=sems.at[0],
-                device_id=((me + d) % c.tp,),
+                recv_sem=rsems.at[k],
+                device_id=(peer,),
             ).start()
-    n = rc if rc % 8 == 0 else 1
-    for k, cnt in ((2, 1), (0, c.tp - 1), (1, c.tp - 1)):
-        tmpl = pltpu.make_async_copy(own.at[pl.ds(0, n)], g.at[pl.ds(0, n)], sems.at[k])
-        for _ in range(cnt * len(parts)):
+
+    def wait(sem, copies):
+        tmpl = pltpu.make_async_copy(own.at[pl.ds(0, n)], g.at[pl.ds(0, n)], sem)
+        for _ in range(copies):
             tmpl.wait()
+
+    for src, dst in block(me):
+        pltpu.make_async_copy(own.at[src], g.at[dst], sems.at[2]).start()
+    if c.tp != 8:  # every peer directly
+        for d in range(1, c.tp):
+            send(own, me, (me + d) % c.tp)
+        for d in range(1, c.tp):
+            wait(rsems.at[(me + d) % c.tp], len(block(0)))
+        wait(sems.at[1], (c.tp - 1) * len(block(0)))
+    else:
+        # 4 chips x 2 cores: once to the same core of each other chip and to the partner
+        # core, which relays the other chips' blocks on-chip (half the ICI bytes)
+        core, chip, partner = me % 2, me // 2, jnp.bitwise_xor(me, 1)
+        send(own, me, partner)
+        for d in (1, 2, 3):
+            send(own, me, 2 * jnp.bitwise_xor(chip, d) + core)
+        for d in (1, 2, 3):
+            k = 2 * jnp.bitwise_xor(chip, d) + core
+            wait(rsems.at[k], len(block(0)))
+            send(g, k, partner)
+        wait(rsems.at[partner], len(block(0)))
+        for d in (1, 2, 3):
+            wait(rsems.at[2 * jnp.bitwise_xor(chip, d) + 1 - core], len(block(0)))
+        wait(sems.at[1], 7 * len(block(0)))
+    wait(sems.at[2], len(block(0)))
 
 
 def _pre_attn_lhs(c: MKConfig, S: dict) -> None:

@@ -201,5 +201,6 @@ def ep_scratch(c: MKConfig, p: EPPlan) -> list:
         # the next layer's pre-attention input (bf16 pairs): every row's in HBM (own rows
         # staged in ep_f), its row tiles on the way into lhs (through sin[0] with HBM pads)
         ("ep_lhs_g", hbm((c.rows, c.hidden // 2), u32)),
-        ("ep_lhs_sems", dma((5,))),  # received, sent, own copy, stage slots
+        ("ep_lhs_sems", dma((5,))),  # (unused), sent, own copy, stage slots
+        ("ep_lhs_rsems", dma((tp,))),  # each owner's rows received
     ]
