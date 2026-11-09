@@ -94,6 +94,14 @@ class SRTPlatform(DeviceMixin):
         """Return the default attention backend name for this platform."""
         raise NotImplementedError
 
+    def get_dsv41_index_page_size(self) -> Optional[int]:
+        """Records per DeepSeek-V4.1 low-ratio index-K page on this platform.
+
+        None (the default) keeps the built-in choice: 128 when the DeepGEMM
+        paged sparse MQA logits kernel is available, else 64.
+        """
+        return None
+
     def get_default_speculative_draft_attention_backend(self, algorithm: str) -> str:
         """Return the default draft attention backend for an algorithm."""
         raise NotImplementedError
