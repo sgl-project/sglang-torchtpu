@@ -8,6 +8,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.muse_megakernel.mk.config import MKConfig
 from sglang_tpu.muse_megakernel.mk.consts import FP4_GROUP, FP4_PACK, LANE, SMALL_ROWS
+from sglang_tpu.muse_megakernel.mk.hooks import EPHook
 from sglang_tpu.muse_megakernel.mk.packing import y_words
 from sglang_tpu.muse_megakernel.mk.plan import (
     few_rows,
@@ -195,8 +196,11 @@ def _alias_tiled_obuf_ysend(c: MKConfig) -> bool:
     )
 
 
-def scratch_plan(cfg: MKConfig):
+def scratch_plan(cfg: MKConfig, ep: EPHook | None = None):
     plan = _scratch_plan_tiled(cfg) if cfg.row_tile else _scratch_plan_base(cfg)
+    if ep is not None:
+        assert cfg.row_tile, "the expert-section hook is row-tiled only"
+        plan = ep.scratch_plan(cfg, plan)
     if cfg.swa_window_table:
         plan = plan + [
             ("psw_win", pltpu.SMEM((cfg.n_req * swa_window_entries(cfg),), jnp.int32)),
