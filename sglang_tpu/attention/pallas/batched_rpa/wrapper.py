@@ -217,6 +217,27 @@ def get_kv_cache_shape(
     )
 
 
+# The q and KV refs pipeline with lookahead, which needs a second buffer.
+_MIN_N_BUFFER = 2
+
+
+def _forced_prefill_blocks(spec: str) -> configs.BlockSizes:
+    """Parse SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS ("bq:bq_c:bkv:n_buffer")."""
+    bq_sz, bq_c_sz, bkv_sz, n_buffer = (int(v) for v in spec.split(":"))
+    if n_buffer < _MIN_N_BUFFER:
+        # A single-buffered lookahead ref never fetches block 0; the kernel hangs.
+        raise ValueError(
+            f"SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS needs n_buffer >= {_MIN_N_BUFFER}"
+        )
+    return configs.BlockSizes(
+        bq_sz=bq_sz,
+        bq_c_sz=math.gcd(bq_c_sz, bq_sz),
+        bkv_sz=bkv_sz,
+        batch_size=1,
+        n_buffer=n_buffer,
+    )
+
+
 def calculate_block_sizes(
     model_cfgs: configs.ModelConfigs,
     serve_cfgs: configs.ServingConfigs,
@@ -336,14 +357,33 @@ def calculate_block_sizes(
         # Account for batch size.
         total_bytes *= batch_size
 
+        if not (serve_cfgs.ones_v or serve_cfgs.transposed) and bq_sz > 1:
+            # The score term over-counts by bq_sz / bq_c_sz and stands in for what
+            # it misses: the f32 m, l, acc scratch, the whole-tile l and acc the
+            # q-chunk loop keeps live (spilled), and ~5 f32 copies of one chunk's
+            # scores. None depend on bkv_sz, so a short k block (sliding window) or
+            # many q heads outgrow it: 64 q / 8 KV heads at bq 256, bkv 256 needs
+            # 74 MiB against 41.5 estimated. Count whichever is larger.
+            carry_rows = (
+                model_cfgs.num_kv_heads * bq_sz * aligned_num_q_heads_per_kv_head
+            )
+            bq_c_sz = choose_bq_c_sz(batch_size, bq_sz, bkv_sz)
+            tile_bytes = carry_rows * (3 * num_lanes + 2 * aligned_kv_head_dim) * 4
+            tile_bytes += 5 * (carry_rows // bq_sz) * bq_c_sz * bkv_sz * 4
+            total_bytes = max(total_bytes, buffer_bytes * batch_size + tile_bytes)
+
         # The m, l and acc carries: f32 scratch per KV head and (token, q head)
         # row, a lane tile wide, shared by the batch. The transposed tile (one
-        # sequence per tile) keeps them as rows of lanes instead.
-        carry_rows = model_cfgs.num_kv_heads * bq_sz * aligned_num_q_heads_per_kv_head
-        carry_width = 3 * num_lanes
-        if serve_cfgs.transposed and batch_size == 1:
-            carry_width = aligned_head_dim // 2 + 3 * tpu_info.num_sublanes
-        total_bytes += carry_rows * carry_width * 4
+        # sequence per tile) keeps them as rows of lanes instead. Counted only for
+        # the ones_v / transposed tiles tuned with this term.
+        if serve_cfgs.ones_v or serve_cfgs.transposed:
+            carry_rows = (
+                model_cfgs.num_kv_heads * bq_sz * aligned_num_q_heads_per_kv_head
+            )
+            carry_width = 3 * num_lanes
+            if serve_cfgs.transposed and batch_size == 1:
+                carry_width = aligned_head_dim // 2 + 3 * tpu_info.num_sublanes
+            total_bytes += carry_rows * carry_width * 4
 
         return total_bytes
 
@@ -359,6 +399,37 @@ def calculate_block_sizes(
 
         return batch_size * num_muls
 
+    def choose_bq_c_sz(batch_size: int, bq_sz: int, bkv_sz: int) -> int:
+        """q compute-chunk size of a non-transposed tile."""
+        # Fixed threshold value based on hardware spec.
+        # TODO(kyuyeunk): Use different threshold based on hardware and precision.
+        threshold = 1500
+        # In flash_attention, each compute sub-tile reshapes Q to
+        # (bq_c_sz * aligned_num_q_heads_per_kv_head, head_dim), so keep
+        # bq_c_sz a power-of-2 divisor >= 1 full sublane tile (num_lanes)
+        # where possible, and return the divisor that satisfies threshold
+        # rather than the previous divisor that exceeded it.
+        min_bq_c_sz = min(bq_sz, max(1, num_lanes // aligned_num_q_heads_per_kv_head))
+        max_num_bq_c = min(bq_sz, 32)
+        best_bq_c_sz = bq_sz
+        for num_bq_c in range(1, max_num_bq_c + 1):
+            bq_c_sz, bq_c_rem = divmod(bq_sz, num_bq_c)
+            if bq_c_rem != 0:
+                continue
+            if (
+                bq_c_sz > min_bq_c_sz
+                and (bq_c_sz & (bq_c_sz - 1)) != 0
+                and bq_c_sz != bq_sz
+            ):
+                continue
+            best_bq_c_sz = bq_c_sz
+            if (
+                calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz) <= threshold
+                or bq_c_sz <= min_bq_c_sz
+            ):
+                break
+        return best_bq_c_sz
+
     # Even if we loose some potential performance, we want to avoid OOM at all
     # costs. Therefore, we conservatively only use 80% of the VMEM budget.
     capped_vmem_limit_bytes = vmem_limit_bytes * 0.8
@@ -366,7 +437,9 @@ def calculate_block_sizes(
     def fit_lanes_and_buffers(
         batch_size: int, n_buffer: int, bq_sz: int, bkv_sz: int
     ) -> tuple[int, int]:
-        # Lanes go first; fewer buffers is the last resort. Neither drops below one.
+        # Lanes go first; fewer buffers is the last resort. Lanes stop at one,
+        # buffers at two: a single-buffered lookahead ref skips the pipeline's
+        # prologue fetch, so block 0 is never fetched and the kernel hangs.
         while (
             batch_size > 1
             and calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
@@ -374,7 +447,7 @@ def calculate_block_sizes(
         ):
             batch_size -= 1
         while (
-            n_buffer > 1
+            n_buffer > _MIN_N_BUFFER
             and calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
             > capped_vmem_limit_bytes
         ):
@@ -429,6 +502,14 @@ def calculate_block_sizes(
         min_bq_pow2 = 1 << (mxu_column_size - 1).bit_length()
         bq_sz = min(min_bq_pow2, total_q_pow2)
         bkv_sz = mxu_column_size
+        # With many q heads this q block may not fit even double-buffered (the
+        # f32 carries grow with bq_sz * heads): halve it. 1 token reads as decode.
+        while (
+            bq_sz > 2
+            and calculate_vmem_usage(1, _MIN_N_BUFFER, bq_sz, bkv_sz)
+            > capped_vmem_limit_bytes
+        ):
+            bq_sz //= 2
         batch_size, n_buffer = fit_lanes_and_buffers(
             max_batch_size, max_n_buffer, bq_sz, bkv_sz
         )
@@ -500,37 +581,9 @@ def calculate_block_sizes(
                 n_buffer=n_buffer,
             )
 
-        # Fixed threshold value based on hardware spec.
-        # TODO(kyuyeunk): Use different threshold based on hardware and precision.
-        threshold = 1500
-        # In flash_attention, each compute sub-tile reshapes Q to
-        # (bq_c_sz * aligned_num_q_heads_per_kv_head, head_dim), so keep
-        # bq_c_sz a power-of-2 divisor >= 1 full sublane tile (num_lanes)
-        # where possible, and return the divisor that satisfies threshold
-        # rather than the previous divisor that exceeded it.
-        min_bq_c_sz = min(bq_sz, max(1, num_lanes // aligned_num_q_heads_per_kv_head))
-        max_num_bq_c = min(bq_sz, 32)
-        best_bq_c_sz = bq_sz
-        for num_bq_c in range(1, max_num_bq_c + 1):
-            bq_c_sz, bq_c_rem = divmod(bq_sz, num_bq_c)
-            if bq_c_rem != 0:
-                continue
-            if (
-                bq_c_sz > min_bq_c_sz
-                and (bq_c_sz & (bq_c_sz - 1)) != 0
-                and bq_c_sz != bq_sz
-            ):
-                continue
-            best_bq_c_sz = bq_c_sz
-            if (
-                calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz) <= threshold
-                or bq_c_sz <= min_bq_c_sz
-            ):
-                break
-
         return configs.BlockSizes(
             bq_sz=bq_sz,
-            bq_c_sz=best_bq_c_sz,
+            bq_c_sz=choose_bq_c_sz(batch_size, bq_sz, bkv_sz),
             bkv_sz=bkv_sz,
             batch_size=batch_size,
             n_buffer=n_buffer,
@@ -595,6 +648,9 @@ def calculate_block_sizes(
     decode_block_sizes = cover_whole_pages(
         find_best_block_sizes(decode_batch_size, n_buffer, 1)
     )
+    forced_blocks = tpu_envs.SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS.get()
+    if forced_blocks:
+        return decode_block_sizes, _forced_prefill_blocks(forced_blocks)
     prefill_block_sizes = find_best_block_sizes(prefill_batch_size, n_buffer)
 
     # Operator escape hatch. The search above works from a VMEM estimate that
@@ -747,7 +803,8 @@ def ragged_paged_attention(
             size of the hardware.
         debug_mode: Not used.
         out_dtype: Dtype of output. Defaults to dtype of queries.
-        use_causal_mask: Not used.
+        use_causal_mask: False lets each query see every key below kv_len, the
+            sliding window bounding only from below (RPA v3 causal=0).
         skip_kv_update: Cross-layer KV cache sharing. When True, this (shared)
             layer reads its entire K/V span from the cache slot written by its
             target layer earlier in the same forward pass, ignores its own k/v
@@ -781,8 +838,6 @@ def ragged_paged_attention(
     if kv_layout is None:
         kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
 
-    if not use_causal_mask:
-        raise ValueError("Only causal attention is supported.")
     if chunk_prefill_size is not None:
         raise ValueError("Specifying chunk prefill size is not supported.")
     if debug_mode:
@@ -833,6 +888,7 @@ def ragged_paged_attention(
         kv_layout=kv_layout,
         cache_only=cache_only,
         skip_kv_write=skip_kv_write,
+        causal=use_causal_mask,
         return_lse=return_lse,
         cp_group_size=cp_group_size,
         skip_full_tile_mask=tpu_envs.SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK.get(),
@@ -871,6 +927,8 @@ def ragged_paged_attention(
             and not return_lse
             and not cache_only
             and cp_group_size is None
+            # The transposed tile has only the causal mask.
+            and use_causal_mask
         ),
         skip_pad_q=tpu_envs.SGLANG_TPU_RPA_SKIP_PAD_Q.get(),
         skip_pad_q_group=tpu_envs.SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP.get(),

@@ -129,7 +129,7 @@ def flash_attention_qk_softmax(
         if kv_len_left is None:
             mask_b = q_kv_diff >= offset
         else:
-            # Every cached key precedes every query; keys past kv_len are stale.
+            # No causal bound (cache_only or non-causal); keys past kv_len are stale.
             mask_b = kv_iota < kv_len_left[b_idx]
 
         if (sliding_window := cfgs.model.sliding_window) is not None:

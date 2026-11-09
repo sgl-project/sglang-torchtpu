@@ -177,7 +177,7 @@ def calculate_and_store_out(
             h = cfgs.aligned_kv_head_dim
             batch_l = batch_acc[..., h : 2 * h]
             batch_acc = batch_acc[..., :h]
-        if cfgs.serve.cache_only:
+        if cfgs.serve.cache_only or not cfgs.serve.causal:
             # A row that attended no key keeps l == 0 and outputs 0.
             batch_l = jnp.where(batch_l == 0, jnp.ones_like(batch_l), batch_l)
         batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
@@ -254,7 +254,8 @@ def rpa_body(
     # Step 1: Fetch metadata.
     processed_q_len = []
     processed_kv_len = []
-    kv_len_left = [] if cfgs.serve.cache_only else None
+    # Without the causal bound, kv_len is the only upper bound on the keys.
+    kv_len_left = [] if cfgs.serve.cache_only or not cfgs.serve.causal else None
     global_q_k_gap = None
     if cfgs.serve.cp_group_size is not None and cfgs.model.sliding_window is not None:
         global_q_k_gap = []
@@ -303,22 +304,22 @@ def rpa_body(
     # Step 2: Fetch inputs.
     q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
     q_ref = q_vref.bitcast(jnp.uint32).reshape(-1, cfgs.aligned_q_head_dim)
-    q_loaded = utils.strided_load(
-        q_ref,
-        0,
-        cfgs.batch_size * cfgs.model.num_kv_heads * cfgs.bq_sz * q_p,
-        1,
-        dtype=cfgs.serve.dtype_q,
-    )
-    q = q_loaded.reshape(
-        cfgs.batch_size,
-        cfgs.model.num_kv_heads,
-        cfgs.bq_sz * cfgs.aligned_num_q_heads_per_kv_head,
-        cfgs.aligned_q_head_dim,
-    )
-    q_wide = q
-    if cfgs.aligned_q_head_dim != cfgs.aligned_kv_head_dim:
-        q = q[..., : cfgs.aligned_kv_head_dim]
+
+    def load_q() -> jax.Array:
+        """The q block as [batch, KV, bq * q heads per kv head, aligned_q_head_dim]."""
+        q_loaded = utils.strided_load(
+            q_ref,
+            0,
+            cfgs.batch_size * cfgs.model.num_kv_heads * cfgs.bq_sz * q_p,
+            1,
+            dtype=cfgs.serve.dtype_q,
+        )
+        return q_loaded.reshape(
+            cfgs.batch_size,
+            cfgs.model.num_kv_heads,
+            cfgs.bq_sz * cfgs.aligned_num_q_heads_per_kv_head,
+            cfgs.aligned_q_head_dim,
+        )
 
     # We want to load k, v from (batch, bkv_sz, bkv_stride, kv_packing, d)
     # where bkv_stride ~= num_kv_heads * 2 // kv_packing
@@ -379,9 +380,10 @@ def rpa_body(
                 k_head_loaded = utils.strided_load(
                     k_head_ref, 0, pack_dim, 1, dtype=cfgs.serve.dtype_kv
                 )
-                v_head_loaded = utils.strided_load(
-                    v_head_ref, 0, pack_dim, 1, dtype=cfgs.serve.dtype_kv
-                )
+                v_head_loaded = utils.strided_load(v_head_ref, 0, pack_dim, 1)
+                if not cfgs.serve.causal:
+                    v_head_loaded = _zero_stale_lanes(v_head_loaded, kv_len_left[b_idx])
+                v_head_loaded = pltpu.bitcast(v_head_loaded, cfgs.serve.dtype_kv)
 
                 k_head = k_head_loaded[:, : cfgs.bkv_sz]
                 v_head = v_head_loaded[:, : cfgs.bkv_sz]
@@ -427,8 +429,9 @@ def rpa_body(
         )
 
     if cfgs.use_transposed:
+        # q is read only when Q^T is rebuilt (once per q block), not on every k step.
         transposed.refresh_qt(
-            q_wide,
+            load_q,
             qt_scratch_ref,
             qkey_scratch_ref,
             schedule_ref.s_idx[step, 0],
@@ -450,7 +453,9 @@ def rpa_body(
             cfgs=cfgs,
             emit_store=False,
         )
-        if cfgs.serve.skip_pad_q:
+        # With one skip group per q block the partial path never runs (q_rows <= 0
+        # would select it, and it computes the same as the full one): don't compile it.
+        if cfgs.serve.skip_pad_q and transposed.skip_group_tokens(cfgs) < cfgs.bq_sz:
             # A partial q block (a sequence's last) skips its padded compute blocks.
             s_idx = jnp.maximum(0, schedule_ref.s_idx[step, 0])
             q_len = cu_q_lens_ref[s_idx + 1] - cu_q_lens_ref[s_idx]
@@ -477,6 +482,10 @@ def rpa_body(
             pl.when(jnp.logical_not(full_tile))(lambda: run_tile(apply_mask=True))
         transposed.store_tile(step, schedule_ref, acc_scratch_ref, o_vref, cfgs=cfgs)
         return
+
+    q = load_q()
+    if cfgs.aligned_q_head_dim != cfgs.aligned_kv_head_dim:
+        q = q[..., : cfgs.aligned_kv_head_dim]
 
     # Step 3: Perform compute, then step 4: write back outputs.
     fast_tiles = (
@@ -589,6 +598,15 @@ def rpa_body(
     @pl.when(jnp.logical_not(full_tile))
     def _():
         compute_and_store(apply_mask=True)
+
+
+def _zero_stale_lanes(v_u32: jax.Array, kv_len_left: jax.Array) -> jax.Array:
+    """Zeroes the token lanes past kv_len of packed seq-along-lane V words.
+
+    Masked p is 0 there, but 0 * NaN from a stale page tail is still NaN.
+    """
+    lane = lax.broadcasted_iota(jnp.int32, v_u32.shape, 1)
+    return jnp.where(lane < kv_len_left, v_u32, jnp.zeros((), v_u32.dtype))
 
 
 def _full_tile(step, schedule_ref, processed_q_len, processed_kv_len, cfgs):

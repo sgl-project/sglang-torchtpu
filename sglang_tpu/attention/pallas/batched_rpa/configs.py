@@ -83,6 +83,9 @@ class ServingConfigs:
     # Context-parallel modes; see `wrapper.ragged_paged_attention`.
     cache_only: bool = False
     skip_kv_write: bool = False
+    # False: each query sees every key below kv_len, bounded below only by the
+    # sliding window (RPA v3 causal=0).
+    causal: bool = True
     return_lse: bool = False
     cp_group_size: int | None = None
     # Prefill tiles whose every key precedes every query (and lies inside the
@@ -589,6 +592,8 @@ class RpaConfigs:
             # SEQ_ALONG_LANE fetches whole pages, so the stale tail of a shard's
             # last page would reach p * v unmasked.
             raise NotImplementedError("cache_only requires HEAD_ALONG_SUBLANE.")
+        if not self.serve.causal:
+            self._validate_non_causal()
         num_lanes = pltpu.get_tpu_info().num_lanes
         if self.serve.return_lse and self.aligned_num_q_heads_per_kv_head > num_lanes:
             raise ValueError(
@@ -612,3 +617,21 @@ class RpaConfigs:
                 )
         elif cp_rank is not None or kv_lens_global is not None:
             raise ValueError("cp_rank and kv_lens_global require cp_group_size.")
+
+    def _validate_non_causal(self):
+        # Only the plain extend/verify path has a non-causal mask; the other modes
+        # carry their own visibility rules or are untested without the causal bound.
+        unsupported = {
+            # Stale lanes past kv_len are zeroed only in the seq-along-lane V load.
+            "HEAD_ALONG_SUBLANE": self.serve.kv_layout != KVLayout.SEQ_ALONG_LANE,
+            "attention_sink": self.model.has_attention_sink,
+            "cache_only": self.serve.cache_only,
+            "cp_group_size": self.serve.cp_group_size is not None,
+            "return_lse": self.serve.return_lse,
+            "transposed": self.serve.transposed,
+        }
+        enabled = [name for name, on in unsupported.items() if on]
+        if enabled:
+            raise NotImplementedError(
+                f"Non-causal batched RPA does not support {', '.join(enabled)}."
+            )

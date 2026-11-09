@@ -35,6 +35,7 @@ once per (sequence, q block) in VMEM.
 
 import math
 import os
+from collections.abc import Callable
 
 import jax
 import jax.experimental.pallas as pl
@@ -66,7 +67,7 @@ def _exp2_valu(s: jax.Array) -> jax.Array:
 
 
 def refresh_qt(
-    q: jax.Array,  # [1, KV, rows, aligned_q_head_dim]
+    load_q: Callable[[], jax.Array],  # -> [1, KV, rows, aligned_q_head_dim]
     qt_ref: jax.Ref,  # [KV, aligned_kv_head_dim, rows]
     qkey_ref: jax.Ref,  # SMEM [2]: (s_idx, q_idx) the cached Q^T belongs to
     s_idx: jax.Array,
@@ -79,6 +80,7 @@ def refresh_qt(
 
     @pl.when(changed)
     def _():
+        q = load_q()
         scale = cfgs.model.sm_scale * LOG2E
         hd = cfgs.aligned_kv_head_dim
         for kv_head in range(cfgs.model.num_kv_heads):
