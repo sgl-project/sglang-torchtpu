@@ -295,6 +295,12 @@ def ref_attn(c, w, l, x, pool, table, rope, ids_in=None, qkv_in=None, o_in=None)
     def heads_out(qg):
         sc = jnp.einsum("thgd,nhd->thgn", qg, keys, precision=HIGH)
         sc = jnp.where(live[:, None, None, :], sc, -jnp.inf)
+        if TRANSPOSED == "1":
+            # the served tile: no running max (NO_MAX), l from the bf16 P (ones rows in V^T)
+            pr = _bf(jnp.exp2(sc))
+            return jnp.einsum("thgn,nhd->thgd", pr, vals, precision=HIGH) / pr.sum(
+                -1, keepdims=True
+            )
         pr = jnp.exp2(sc - sc.max(-1, keepdims=True))
         return jnp.einsum("thgn,nhd->thgd", _bf(pr), vals, precision=HIGH) / pr.sum(
             -1, keepdims=True
@@ -372,17 +378,18 @@ def expert_outputs(c, w, l, xe, ids, slot, cap=96):
     ex = w["fp8"] if kind == "fp8" else w["fp4"][slot]
 
     def w8a8(x, w, ws):
-        """gmm_v2's fp8 path: rows quantized to fp8 per 512-wide K block (scale amax / 448),
-        each block's product rounded to its bf16 accumulator, scaled and summed in bf16."""
-        f8max = float(jnp.finfo(jnp.float8_e4m3fn).max)
+        """gmm_v2's fp8 path: bf16 rows quantized to fp8 per 512-wide K block (scale amax / 448,
+        its inverse and the scaled rows in bf16), each block's product rounded to its bf16
+        accumulator, scaled and summed in bf16."""
+        f8max = jnp.bfloat16(float(jnp.finfo(jnp.float8_e4m3fn).max))
         acc = jnp.zeros((x.shape[0], w.shape[1]), jnp.bfloat16)
         for b0 in range(0, x.shape[1], 512):
-            xb = x[:, b0 : b0 + 512]
+            xb = x[:, b0 : b0 + 512].astype(jnp.bfloat16)
             sc = jnp.max(jnp.abs(xb), axis=1, keepdims=True) / f8max
-            inv = jnp.where(sc == 0, 0.0, 1.0 / sc)
+            inv = jnp.where(sc == 0, jnp.bfloat16(0), jnp.bfloat16(1) / sc)
             q = (xb * inv).astype(jnp.float8_e4m3fn).astype(jnp.float32)
             part = _dot(q, w[b0 : b0 + 512]).astype(jnp.bfloat16)
-            part = part * sc.astype(jnp.bfloat16) * ws.astype(jnp.bfloat16)[None, :]
+            part = part * sc * ws.astype(jnp.bfloat16)[None, :]
             acc = acc + part
         return acc.astype(jnp.float32)
 
