@@ -40,10 +40,11 @@ from sglang_tpu.muse_megakernel.mk.packing import _pack_bf16x2, _unpack_bf16x2
 f32, bf16 = jnp.float32, jnp.bfloat16
 
 
-def _phase(name: str):
-    """A named in-kernel region per phase with SGLANG_TPU_EP_TRACE=1 at trace time (xprof
-    shows them with libtpu's --xla_enable_custom_call_region_trace=true)."""
-    if os.environ.get("SGLANG_TPU_EP_TRACE") == "1":
+def _phase(name: str, level: int = 1):
+    """A named in-kernel region per phase with SGLANG_TPU_EP_TRACE >= level at trace time
+    (xprof shows them with libtpu's --xla_enable_custom_call_region_trace=true); level 2:
+    per expert chunk too."""
+    if int(os.environ.get("SGLANG_TPU_EP_TRACE", "0")) >= level:
         return jax.named_scope(f"ep_{name}")
     return contextlib.nullcontext()
 
@@ -367,16 +368,17 @@ def _expert_loop(step: EPLayerStep, p: EPPlan, n_items, dispatched) -> None:
         start(k + D - 1)
         wait(slot, k)
         if not _dev_skip("experts"):
-            chunk_compute(
-                step.kind,
-                n,
-                lambda R: _unpack_bf16x2(buf.x(b)[pl.ds(0, R), :]),
-                buf.acc,
-                _chunk_refs(step, p, slot),
-                He,
-                CI,
-                RI,
-            )
+            with _phase("arm", 2):
+                chunk_compute(
+                    step.kind,
+                    n,
+                    lambda R: _unpack_bf16x2(buf.x(b)[pl.ds(0, R), :]),
+                    buf.acc,
+                    _chunk_refs(step, p, slot),
+                    He,
+                    CI,
+                    RI,
+                )
 
         @pl.when(j == NC - 1)
         def _():
