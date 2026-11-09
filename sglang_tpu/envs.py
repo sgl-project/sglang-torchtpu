@@ -391,6 +391,14 @@ class TpuEnvs:
     # Pipeline-parallel prefill chunking
     SGLANG_TPU_PP_DYNAMIC_CHUNKS = EnvBool(True)
     SGLANG_TPU_PP_CHUNK_SLACK = EnvFloat(0.1)
+    # Timed runs per profiled point; the median is kept.
+    SGLANG_TPU_PP_CHUNK_PROFILE_RUNS = EnvInt(5)
+    # JSON table of saved fits keyed by serving shape (pp_chunk_fit.py); unset profiles every launch.
+    SGLANG_TPU_PP_CHUNK_FIT_TABLE = EnvStr("")
+    # Version of the kernels behind the table's step costs; a saved fit must match it.
+    SGLANG_TPU_PP_CHUNK_FIT_KERNEL_VERSION = EnvStr("")
+    # Re-time the guard points before installing a saved fit; profile instead if they drift.
+    SGLANG_TPU_PP_CHUNK_FIT_CHECK = EnvBool(True)
 
     # PD disaggregation tracing
     SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING = EnvBoolWithAlias(
