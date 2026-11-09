@@ -20,6 +20,8 @@ slab offsets. Queries and keys are RMS-normalized, so logits stay small enough f
 unshifted softmax.
 """
 
+import os
+
 import jax
 import jax.numpy as jnp
 import msgspec
@@ -36,6 +38,7 @@ from sglang_tpu.muse_megakernel.kernel import (
 )
 
 LANE = 128
+PHASES = ("attn_in", "kv_write", "attention", "attn_out", "moe", "post_moe")
 FP8 = jnp.float8_e4m3fn
 BF16 = jnp.bfloat16
 F32 = jnp.float32
@@ -289,6 +292,14 @@ def _rope_lanes(x, cos, sin):
     return x * cos + jnp.where(even, -1.0, 1.0) * partner * sin
 
 
+def skipped_phases() -> frozenset[str]:
+    """MUSE_PP_SKIP=a,b: timing ablation only (wrong numerics), those phases do not run."""
+    skip = frozenset(p for p in os.environ.get("MUSE_PP_SKIP", "").split(",") if p)
+    if not skip <= set(PHASES):
+        raise ValueError(f"MUSE_PP_SKIP={sorted(skip)}: phases are {PHASES}")
+    return skip
+
+
 def stage_call(c: PPConfig, debug: bool = False):
     """The stage program: (ctl [2] i32 = [cached tokens, active stage or -1], slot table, global
     and sliding-window page tables [pages_per_seq] i32, x [T, H] f32 stream in, rope
@@ -297,6 +308,7 @@ def stage_call(c: PPConfig, debug: bool = False):
     (its stream out is not written). debug: also the last layer's intermediates (q, gate,
     K/V columns, gated attention, expert input, packed ids, routing weights, slot outputs)."""
     c.validate()
+    skip = skipped_phases()
     T, H, He, E, K = c.rows, c.hidden, c.expert_hidden, c.n_experts, c.top_k
     hd, nkv = c.head_dim, c.kv_heads
     gq = c.q_heads // nkv
@@ -1104,17 +1116,19 @@ def stage_call(c: PPConfig, debug: bool = False):
                 cv.start()
                 cv.wait()
                 ctx = ctl[0]
-                attn_in(sl, is_g, ctx)
-                kv_write(is_g, pidx, ctx)
-                attention(is_g, pidx, ctx)
-                attn_out(sl)
                 # slab offsets are whole layers: multiples of an fp8 scale tile (16 rows)
-                moe(
-                    is_f8,
-                    pl.multiple_of(slots[base + F_WOFF], 16),
-                    pl.multiple_of(slots[base + F_SOFF], 16),
-                )
-                post_moe(sl)
+                woff = pl.multiple_of(slots[base + F_WOFF], 16)
+                soff = pl.multiple_of(slots[base + F_SOFF], 16)
+                for name, run in (
+                    ("attn_in", lambda: attn_in(sl, is_g, ctx)),
+                    ("kv_write", lambda: kv_write(is_g, pidx, ctx)),
+                    ("attention", lambda: attention(is_g, pidx, ctx)),
+                    ("attn_out", lambda: attn_out(sl)),
+                    ("moe", lambda: moe(is_f8, woff, soff)),
+                    ("post_moe", lambda: post_moe(sl)),
+                ):
+                    if name not in skip:
+                        run()
 
             return carry
 
@@ -1193,7 +1207,8 @@ def stage_call(c: PPConfig, debug: bool = False):
             scratch_shapes=scratch,
             input_output_aliases={n_in - 2: 1, n_in - 1: 2},
             compiler_params=pltpu.CompilerParams(vmem_limit_bytes=64 * 2**20 - 2**19),
-            name=f"muse_prefill_pp_stage_t{T}_s{S}",
+            name=f"muse_prefill_pp_stage_t{T}_s{S}"
+            + "".join(f"_no_{p}" for p in sorted(skip)),
         )(ctl, slots, pf, psw, x, rope, *rest)
         return outs if debug else outs[:3]
 
