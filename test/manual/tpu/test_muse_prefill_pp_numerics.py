@@ -15,6 +15,7 @@ with what the kernel wrote into the pool.
 """
 
 import math
+import os
 import sys
 
 import jax
@@ -22,6 +23,18 @@ import jax.numpy as jnp
 import numpy as np
 
 from sglang_tpu.muse_megakernel import prefill_pp as PP
+
+# the batched RPA prefill attention as the P/D prefill serves it (read when the stage is traced);
+# MUSE_PP_TEST_RPA_TRANSPOSED=0 runs the standard tile (bf16 queries) as a control
+TRANSPOSED = os.environ.get("MUSE_PP_TEST_RPA_TRANSPOSED", "1")
+os.environ.update({
+    "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV": "1", "SGLANG_TPU_RPA_SKIP_PAD_Q": "1",
+    "SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP": "256", "SGLANG_TPU_RPA_NO_MAX": "1",
+    "SGLANG_TPU_RPA_OUT_HEAD_NORM_EPS": "1e-05", "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1",
+    "SGLANG_TPU_RPA_TRANSPOSED": TRANSPOSED,
+    "SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS": "256:32:768:2",
+    "SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS": "128:512",
+})  # fmt: skip
 
 HIGH = jax.lax.Precision.HIGHEST
 T, CTX = 512, 2560
@@ -249,10 +262,10 @@ def ref_attn(c, w, l, x, pool, table, rope, ids_in=None):
     # the served transposed RPA tile: fp8 Q^T of the bf16 q times sm_scale * log2(e), base-2
     # logits; K/V reach the pool as fp8 of the bf16 values the stage hands it
     f8max = float(jnp.finfo(jnp.float8_e4m3fn).max)
-    q8 = jnp.clip(_bf(q) * (c.attn_scale * LOG2E), -f8max, f8max)
-    q8 = (
-        q8.astype(jnp.float8_e4m3fn).astype(jnp.float32).reshape(T, nkv, nqh // nkv, 64)
-    )
+    q8 = _bf(q) * (c.attn_scale * LOG2E)
+    if TRANSPOSED == "1":
+        q8 = jnp.clip(q8, -f8max, f8max).astype(jnp.float8_e4m3fn).astype(jnp.float32)
+    q8 = q8.reshape(T, nkv, nqh // nkv, 64)
     k8 = _bf(k).astype(jnp.float8_e4m3fn).astype(jnp.float32).reshape(T, nkv, 64)
     v8 = _bf(v).astype(jnp.float8_e4m3fn).astype(jnp.float32).reshape(T, nkv, 64)
     ck, cv = pool_tokens(pool, table, CTX)
@@ -442,9 +455,12 @@ def main() -> int:
                 a, b = a.astype(jnp.float32), b.astype(jnp.float32)
                 return float(jnp.linalg.norm(a - b) / jnp.linalg.norm(b))
 
+            o_kn = _bf(_heads_rms(o_k.astype(jnp.float32), c.q_heads, c.rms_eps))
             print(
-                f"  layer {l}: q rel {rel_of(q_k, q_r):.2e} k rel {rel_of(k_k, k_r):.2e} "
-                f"attention out rel {rel_of(o_k, o_r):.2e}"
+                f"  layer {l} (RPA_TRANSPOSED={os.environ['SGLANG_TPU_RPA_TRANSPOSED']}): "
+                f"q rel {rel_of(q_k, q_r):.2e} k rel {rel_of(k_k, k_r):.2e} attention out "
+                f"rel {rel_of(o_k, o_r):.2e} (kernel out head-normed again "
+                f"{rel_of(o_kn, o_r):.2e}; interleaved GQA reference {rel_of(o_k, o_alt):.2e})"
             )
             kk, vv = pool_tokens(kpool, table, CTX + T)
             kv_rel = float(
