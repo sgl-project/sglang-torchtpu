@@ -315,10 +315,12 @@ def _permute_packed_rows(
 def ep_expert_slabs(l: int, rank: int, kind: str) -> list:
     """One rank's whole experts (w13, w13_scale, w2, w2_scale), stacked, in ep_mk's layout:
     every rank's intermediate slices of each expert side by side, the hidden rows in
-    pooled_perm order and, for fp4, the gate / up columns and w2's rows in kperm order."""
-    from sglang_tpu.muse_megakernel.ep_mk.experts import kperm
+    pooled_perm order and, for fp4, the gate / up columns and w2's rows in kperm order; then
+    w13's columns in chunk_cols order."""
+    from sglang_tpu.muse_megakernel.ep_mk.experts import chunk_cols, kperm
 
     el, il, he = N_EXPERTS // TP, INTER_LOCAL, EXPERT_HIDDEN
+    cc = torch.from_numpy(chunk_cols(2 * TP * il, il))
     kp_he = torch.from_numpy(kperm(he))
     kp_i, kp_2i = torch.from_numpy(kperm(TP * il)), torch.from_numpy(kperm(2 * TP * il))
     out = [[], [], [], []]
@@ -334,6 +336,7 @@ def ep_expert_slabs(l: int, rank: int, kind: str) -> list:
         else:
             s2 = sl[0][3]
             w13 = _permute_packed_rows(w13, 8, kp_he)
+        w13, s13 = w13[:, cc], s13[:, cc]
         for j, t in enumerate((w13, s13, w2, s2)):
             out[j].append(t)
     return [torch.stack(t) for t in out]

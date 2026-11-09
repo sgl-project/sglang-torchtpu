@@ -190,7 +190,7 @@ def ep_scratch(c: MKConfig, p: EPPlan) -> list:
         ("ep_items", smem((1 + 3 * p.max_items,), i32)),
         ("ep_rows", smem((p.recv_rows,), i32)),  # received slots grouped by expert
         ("ep_yrow", vmem((4, k, he // 2), u32)),  # own rows' slots in flight (combine)
-        ("ep_w_sems", dma((p.nslot, 6))),
+        ("ep_w_sems", dma((p.nslot, 4))),
         ("ep_dn_sems", dma((p.nslot,))),
         ("ep_x_sems", dma((2,))),
         ("ep_misc_sems", dma((4,))),  # local copies: xs fill, y scatter, tables

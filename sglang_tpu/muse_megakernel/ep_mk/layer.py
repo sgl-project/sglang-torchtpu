@@ -199,7 +199,8 @@ def _fill_send(step: EPLayerStep, p: EPPlan, win) -> None:
 
 
 def _chunk_copies(step: EPLayerStep, p: EPPlan, refs, off, e, j, slot) -> list:
-    """The six DMAs of expert e's I-chunk j into ring slot `slot`."""
+    """The four DMAs of expert e's I-chunk j into ring slot `slot` (w13 and its scales in
+    chunk_cols order: a chunk's gate | up columns are one slab)."""
     c, S, kind = step.c, step.S, step.kind
     He = c.expert_hidden
     CI = p.chunk(kind)
@@ -213,8 +214,7 @@ def _chunk_copies(step: EPLayerStep, p: EPPlan, refs, off, e, j, slot) -> list:
         src[2].bitcast(jnp.uint32),
         src[3],
     )
-    g0 = pl.multiple_of(j * CI, CI)
-    u0 = pl.multiple_of(p.inter + j * CI, CI)
+    c0 = pl.multiple_of(j * 2 * CI, 2 * CI)
     k2 = pl.multiple_of(j * (CI // pack), CI // pack)
     if kind == "fp4":
         srows = He // FP4_GROUP
@@ -225,27 +225,19 @@ def _chunk_copies(step: EPLayerStep, p: EPPlan, refs, off, e, j, slot) -> list:
         s2_dst = S["w2s"].at[slot, pl.ds(0, 2)]
     return [
         pltpu.make_async_copy(
-            w13.at[e, :, pl.ds(g0, CI)], W13.at[slot, :, pl.ds(0, CI)], sems.at[slot, 0]
+            w13.at[e, :, pl.ds(c0, 2 * CI)],
+            W13.at[slot, :, pl.ds(0, 2 * CI)],
+            sems.at[slot, 0],
         ),
         pltpu.make_async_copy(
-            w13.at[e, :, pl.ds(u0, CI)],
-            W13.at[slot, :, pl.ds(CI, CI)],
+            s13.at[e, :, pl.ds(c0, 2 * CI)],
+            S13.at[slot, pl.ds(0, srows), pl.ds(0, 2 * CI)],
             sems.at[slot, 1],
         ),
         pltpu.make_async_copy(
-            s13.at[e, :, pl.ds(g0, CI)],
-            S13.at[slot, pl.ds(0, srows), pl.ds(0, CI)],
-            sems.at[slot, 2],
+            w2.at[e, pl.ds(k2, CI // pack)], W2.at[slot], sems.at[slot, 2]
         ),
-        pltpu.make_async_copy(
-            s13.at[e, :, pl.ds(u0, CI)],
-            S13.at[slot, pl.ds(0, srows), pl.ds(CI, CI)],
-            sems.at[slot, 3],
-        ),
-        pltpu.make_async_copy(
-            w2.at[e, pl.ds(k2, CI // pack)], W2.at[slot], sems.at[slot, 4]
-        ),
-        pltpu.make_async_copy(s2_src, s2_dst, sems.at[slot, 5]),
+        pltpu.make_async_copy(s2_src, s2_dst, sems.at[slot, 3]),
     ]
 
 

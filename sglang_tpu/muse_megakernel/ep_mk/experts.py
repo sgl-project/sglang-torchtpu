@@ -48,6 +48,15 @@ def kperm(n: int) -> np.ndarray:
     return p - p % BD_KC + (p % 16) * 16 + (p % BD_KC) // 16
 
 
+def chunk_cols(two_i: int, chunk: int) -> np.ndarray:
+    """w13's (and its scales') column order in the EP kernel: chunk j's gate columns then its
+    up columns, so one copy moves a chunk's [., 2 chunk] slab."""
+    i = two_i // 2
+    j = np.arange(i // chunk)[:, None, None]
+    half = np.arange(2)[None, :, None] * i
+    return (half + j * chunk + np.arange(chunk)[None, None, :]).reshape(-1)
+
+
 def permute_fp4_rows(words: jax.Array) -> jax.Array:
     """u32 words [..., K/8, N] (nibble j of word w is row 8w + j) with rows in kperm order."""
     *lead, kw, n = words.shape
