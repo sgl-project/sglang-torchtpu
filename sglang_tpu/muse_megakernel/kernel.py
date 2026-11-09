@@ -4629,6 +4629,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         flush_dense=ws.flush,
                     )
                 )
+                my_live = me * Rc < n_live  # the u all-gather below reads it
             else:
                 pad_y = S["pad_y"]
                 if vy == 0:

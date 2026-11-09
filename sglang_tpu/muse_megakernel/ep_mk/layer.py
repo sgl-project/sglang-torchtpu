@@ -50,9 +50,9 @@ def _chunk_copies(step: EPMoEStep, p: EPPlan, refs, off, e, j, slot) -> list:
     """The six DMAs of expert e's I-chunk j into ring slot `slot`."""
     c, S, kind = step.c, step.S, step.kind
     He = c.expert_hidden
-    CI = p.chunk_fp4 if kind == "fp4" else p.chunk_fp8
+    CI = p.chunk(kind)
     pack = FP4_PACK if kind == "fp4" else 4
-    W13, S13 = _ring(step, p)
+    W13, S13, W2 = _ring(step, p)
     sems = S["ep_w_sems"]
     src = [r if off is None else r.at[off] for r in refs]
     w13, s13, w2, s2 = (
@@ -93,40 +93,50 @@ def _chunk_copies(step: EPMoEStep, p: EPPlan, refs, off, e, j, slot) -> list:
             sems.at[slot, 3],
         ),
         pltpu.make_async_copy(
-            w2.at[e, pl.ds(k2, CI // pack)], S["w2"].at[slot], sems.at[slot, 4]
+            w2.at[e, pl.ds(k2, CI // pack)], W2.at[slot], sems.at[slot, 4]
         ),
         pltpu.make_async_copy(s2_src, s2_dst, sems.at[slot, 5]),
     ]
 
 
 def _ring(step: EPMoEStep, p: EPPlan):
-    """The TP expert ring as I-chunk slots: (w13, w13 scales) views of this layer's kind."""
-    S, He = step.S, step.c.expert_hidden
+    """The TP expert ring as I-chunk slots: (w13, w13 scales, w2) of this layer's kind; an fp8
+    chunk spans two fp4 slots, as TP's fp8 slabs do."""
+    S, He, CI = step.S, step.c.expert_hidden, p.chunk(step.kind)
     if step.kind == "fp4":
-        return S["w13"], S["w13s"]
-    return S["w13"].reshape(p.nslot, He // 4, 2 * p.chunk_fp8), S["w13s"]
+        return S["w13"], S["w13s"], S["w2"]
+    n = p.slots("fp8")
+    return (
+        S["w13"].reshape(n, He // 4, 2 * CI),
+        S["w13s"],
+        S["w2"].reshape(n, CI // 4, He),
+    )
 
 
 def _chunk_refs(step: EPMoEStep, p: EPPlan, slot) -> ChunkRefs:
     S, kind = step.S, step.kind
-    W13, S13 = _ring(step, p)
-    CI = p.chunk_fp4 if kind == "fp4" else p.chunk_fp8
-    srows = step.c.expert_hidden // FP4_GROUP if kind == "fp4" else 2
-    s2rows = CI // FP4_GROUP if kind == "fp4" else 2
+    W13, S13, W2 = _ring(step, p)
+    CI = p.chunk(kind)
+    if kind == "fp8":  # per-column scales: the arm reads row 0 of the whole slabs
+        sg = su = S13.at[slot]
+        s2 = S["w2s"].at[slot]
+    else:
+        sg, su = S13.at[slot, :, pl.ds(0, CI)], S13.at[slot, :, pl.ds(CI, CI)]
+        s2 = S["w2s"].at[slot, pl.ds(0, CI // FP4_GROUP)]
     return ChunkRefs(
         wg=W13.at[slot, :, pl.ds(0, CI)],
         wu=W13.at[slot, :, pl.ds(CI, CI)],
-        sg=S13.at[slot, pl.ds(0, srows), pl.ds(0, CI)],
-        su=S13.at[slot, pl.ds(0, srows), pl.ds(CI, CI)],
-        w2=S["w2"].at[slot],
-        s2=S["w2s"].at[slot, pl.ds(0, s2rows)],
+        sg=sg,
+        su=su,
+        w2=W2.at[slot],
+        s2=s2,
     )
 
 
 def _expert_loop(step: EPMoEStep, p: EPPlan, n_items) -> None:
     c, S = step.c, step.S
-    He, NC, D, RI = c.expert_hidden, p.n_chunks(step.kind), p.nslot, p.item_rows
-    CI = p.chunk_fp4 if step.kind == "fp4" else p.chunk_fp8
+    He, NC, RI = c.expert_hidden, p.n_chunks(step.kind), p.item_rows
+    D, CI = p.slots(step.kind), p.chunk(step.kind)
     sizes = item_sizes(RI)
     items = S["ep_items"]
     total = n_items * NC
@@ -172,17 +182,19 @@ def _expert_loop(step: EPMoEStep, p: EPPlan, n_items) -> None:
                     c, S, 1 - b, items[4 + 3 * i], items[5 + 3 * i], items[6 + 3 * i]
                 )
 
-            def zero(z):
-                S["ep_acc"][b, pl.ds(0, z), :] = jnp.zeros((z, He), jnp.float32)
+            def unpack_zero(z):
+                rows = pl.ds(0, z)
+                S["ep_xf"][rows, :] = _unpack_bf16x2(S["ep_x"][b, rows, :])
+                S["ep_acc"][b, rows, :] = jnp.zeros((z, He), jnp.float32)
 
-            sized(n, sizes, zero)
+            sized(n, sizes, unpack_zero)
 
         start(k + D - 1)
         wait(slot)
         chunk_compute(
             step.kind,
             n,
-            lambda R: _unpack_bf16x2(S["ep_x"][b, pl.ds(0, R), :]).astype(jnp.bfloat16),
+            lambda R: S["ep_xf"][pl.ds(0, R), :],
             S["ep_acc"].at[b],
             _chunk_refs(step, p, slot),
             He,

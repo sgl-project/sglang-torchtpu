@@ -3,6 +3,7 @@
 expert section, and the layout its weights take (EP_WEIGHTS)."""
 
 import jax
+import numpy as np
 
 from sglang_tpu.muse_megakernel.ep_mk.config import ep_expert_shapes
 from sglang_tpu.muse_megakernel.ep_mk.experts import (
@@ -24,7 +25,7 @@ def ep_megakernel_call(cfg: MKConfig, axis: str = "model"):
     return megakernel_call(cfg, axis, ep=EPExperts(cfg))
 
 
-def pooled_perm(he: int) -> jax.Array:
+def pooled_perm(he: int) -> np.ndarray:
     """The pooled (expert input) width's order in the EP kernel."""
     return kperm(he)
 

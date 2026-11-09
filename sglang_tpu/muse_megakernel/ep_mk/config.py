@@ -16,14 +16,20 @@ class EPPlan(NamedTuple):
     experts: int  # EL: whole experts per rank
     inter: int  # an expert's whole intermediate
     chunk_fp4: int  # intermediate columns per fp4 chunk: one TP expert-ring slot
-    chunk_fp8: int  # fp8 chunks take the same slot bytes
+    chunk_fp8: int  # an fp8 chunk takes two adjacent ring slots (as TP's fp8 slabs)
     item_rows: int  # rows of one work item; a busier expert takes several
     slots_pad: int  # routing-table width: an expert's slots <= live rows <= R
     max_items: int
     nslot: int  # weight-chunk ring slots (the TP expert ring's)
 
     def n_chunks(self, kind: str) -> int:
-        return self.inter // (self.chunk_fp4 if kind == "fp4" else self.chunk_fp8)
+        return self.inter // self.chunk(kind)
+
+    def chunk(self, kind: str) -> int:
+        return self.chunk_fp4 if kind == "fp4" else self.chunk_fp8
+
+    def slots(self, kind: str) -> int:
+        return self.nslot if kind == "fp4" else self.nslot // 2
 
 
 def ep_plan(c: MKConfig, item_rows: int = 64) -> EPPlan:
@@ -36,7 +42,7 @@ def ep_plan(c: MKConfig, item_rows: int = 64) -> EPPlan:
         experts=el,
         inter=c.inter_local * c.tp,
         chunk_fp4=c.inter_local,
-        chunk_fp8=c.inter_local // 2,
+        chunk_fp8=c.inter_local,
         item_rows=item_rows,
         slots_pad=-(-c.rows // LANE) * LANE,
         max_items=el + -(-c.rows * c.top_k // item_rows),
@@ -73,6 +79,7 @@ def ep_scratch(c: MKConfig, p: EPPlan) -> list:
     route_rows = -(-(p.experts + 1) // 8) * 8
     return [
         ("ep_x", vmem((2, ri, he // 2), jnp.uint32)),  # an item's x rows, bf16 pairs
+        ("ep_xf", vmem((ri, he), jnp.float32)),  # the current item's x rows, unpacked
         ("ep_acc", vmem((2, ri, he), jnp.float32)),
         ("ep_y", vmem((2, ri, he // 2), jnp.uint32)),  # outgoing y rows, bf16 pairs
         # this rank's rows' y, slot by slot, as the experts' ranks send them

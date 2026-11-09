@@ -32,6 +32,7 @@ from sglang_tpu.kv_pool import (
     kv_pack_heads,
 )
 from sglang_tpu.muse_megakernel import kernel as K
+from sglang_tpu.muse_megakernel.ep_mk.kernel import ep_megakernel_call
 from sglang_tpu.muse_megakernel.mk import trace as mk_trace
 
 logger = logging.getLogger(__name__)
@@ -308,9 +309,12 @@ class MuseMegakernel(torch.nn.Module):
         scale_fp8: bool,
         expert_groups: tuple = (),
         kperm: bool = False,
+        ep: bool = False,
     ) -> None:
         super().__init__()
         self.geo = geo
+        # expert parallelism (ep_mk): whole experts per rank in the experts list
+        self.ep = ep
         self.kinds = kinds
         self.tp_size = tp_size
         self.max_rows = max_rows
@@ -914,7 +918,7 @@ class MuseMegakernel(torch.nn.Module):
 
     def callable_for(self, cfg: K.MKConfig):
         if cfg not in self._ops:
-            self._ops[cfg] = _build_callable(cfg, self.tp_size)
+            self._ops[cfg] = _build_callable(cfg, self.tp_size, self.ep)
         return self._ops[cfg]
 
     def prefill_config(self, *, rows: int, capture: tuple):
@@ -1315,14 +1319,15 @@ def _export_program(body, *, tp: int, n_args: int, kv0: int, n_out: int, tag: st
     return callable_
 
 
-def _build_callable(cfg: K.MKConfig, tp: int):
-    """The megakernel + KV scatter as one jitted ``shard_map`` program over the TP mesh."""
+def _build_callable(cfg: K.MKConfig, tp: int, ep: bool = False):
+    """The megakernel + KV scatter as one jitted ``shard_map`` program over the TP mesh; with
+    ep, the EP megakernel (ep_mk: whole experts per rank, row-tiled steps only)."""
     L = cfg.n_layers
     nw = len(K.WEIGHT_NAMES)
     ne = K.n_expert_refs(cfg)
     n_args = 5 + nw + ne + L
     kv0 = 5 + nw + ne
-    mk = K.megakernel_call(cfg)
+    mk = ep_megakernel_call(cfg) if ep else K.megakernel_call(cfg)
     kvw = K.kv_write_call(cfg)
 
     def body(*xs):
@@ -1332,7 +1337,12 @@ def _build_callable(cfg: K.MKConfig, tp: int):
 
     tag = f"r{cfg.rows}_q{cfg.rows_per_req}_n{cfg.n_req}_c{len(cfg.capture_layers)}_p{cfg.pages_per_seq}"
     callable_ = _export_program(
-        body, tp=tp, n_args=n_args, kv0=kv0, n_out=2 + L, tag=f"muse_megakernel_{tag}"
+        body,
+        tp=tp,
+        n_args=n_args,
+        kv0=kv0,
+        n_out=2 + L,
+        tag=f"muse_{'ep_' if ep else ''}megakernel_{tag}",
     )
     logger.info(
         "Muse megakernel built: rows=%d q=%d requests=%d capture=%s pages/seq=%d "

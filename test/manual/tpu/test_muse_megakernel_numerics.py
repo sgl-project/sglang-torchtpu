@@ -14,6 +14,11 @@ streams. Run one process per device:
 
 Rank 0 prints one MK_NUMERICS line per (case, layer) and MK_NUMERICS_PASS when every check
 holds; every rank prints MK_NUMERICS_DONE.
+
+--ep runs the EP megakernel (muse_megakernel/ep_mk, row-tiled cases only): each rank gets its
+32 whole experts assembled from the same per-rank slices, in ep_mk's layout, and the pooled
+width permuted as ep_mk.kernel.pooled_perm; fp8 experts then share one w2 column scale across
+slices, as a checkpoint's whole expert does.
 """
 
 import argparse
@@ -56,6 +61,8 @@ TOL_KV_REL = {"fused": (1e-3, 1e-2), "sal": (1e-3, 1e-2), "sal_fp8": (1e-2, 6e-2
 TOL_HID_REL = 1e-2  # final norm, computed from the captured last-layer stream
 # biased router scores closer than this to the top-k boundary may legitimately flip
 NEAR_TIE = 2e-3
+# --ep: the EP megakernel and its weight layout (set once by main, before any weight is built)
+_EP = False
 
 
 class Case(msgspec.Struct, frozen=True):
@@ -270,12 +277,58 @@ def expert_slabs(l: int, rank: int, e: int, kind: str) -> list:
         ]
     s13 = (_uniform(2 * Il, g, 0.8, 1.2) / (_FP8_RMS * He**0.5)).to(torch.bfloat16)
     s2 = (_uniform(He, g, 0.8, 1.2) / (_FP8_RMS * (TP * Il) ** 0.5)).to(torch.bfloat16)
+    if _EP:  # one column scale per whole expert
+        s2 = (
+            _uniform(He, _gen("expert_s2", l, e), 0.8, 1.2)
+            / (_FP8_RMS * (TP * Il) ** 0.5)
+        ).to(torch.bfloat16)
     return [
         _words8(_fp8_bytes((He, 2 * Il), g)),
         s13[None].expand(2, -1).contiguous(),
         _words8(_fp8_bytes((Il, He), g)),
         s2[None].expand(2, -1).contiguous(),
     ]
+
+
+def _permute_packed_rows(
+    words: torch.Tensor, bits: int, perm: torch.Tensor
+) -> torch.Tensor:
+    """int32 words [K / (32 / bits), N] of bits-wide codes along K, rows in perm order."""
+    per = 32 // bits
+    shifts = torch.arange(0, 32, bits, dtype=torch.int32)[None, :, None]
+    codes = (words[:, None, :] >> shifts) & ((1 << bits) - 1)
+    codes = codes.reshape(-1, words.shape[1])[perm].reshape(words.shape[0], per, -1)
+    out = torch.zeros_like(words)
+    for j in range(per):
+        out |= codes[:, j] << (bits * j)
+    return out
+
+
+def ep_expert_slabs(l: int, rank: int, kind: str) -> list:
+    """One rank's whole experts (w13, w13_scale, w2, w2_scale), stacked, in ep_mk's layout:
+    every rank's intermediate slices of each expert side by side, the hidden rows in
+    pooled_perm order and, for fp4, the gate / up columns and w2's rows in kperm order."""
+    from sglang_tpu.muse_megakernel.ep_mk.experts import kperm
+
+    el, il, he = N_EXPERTS // TP, INTER_LOCAL, EXPERT_HIDDEN
+    kp_he = torch.from_numpy(kperm(he))
+    kp_i, kp_2i = torch.from_numpy(kperm(TP * il)), torch.from_numpy(kperm(2 * TP * il))
+    out = [[], [], [], []]
+    for e in range(rank * el, (rank + 1) * el):
+        sl = [expert_slabs(l, d, e, kind) for d in range(TP)]
+        w13 = torch.cat([s[0][:, :il] for s in sl] + [s[0][:, il:] for s in sl], dim=1)
+        s13 = torch.cat([s[1][:, :il] for s in sl] + [s[1][:, il:] for s in sl], dim=1)
+        w2 = torch.cat([s[2] for s in sl], dim=0)
+        if kind == "fp4":
+            s2 = torch.cat([s[3] for s in sl], dim=0)
+            w13 = _permute_packed_rows(w13, 4, kp_he)[:, kp_2i]
+            s13, w2 = s13[:, kp_2i], _permute_packed_rows(w2, 4, kp_i)
+        else:
+            s2 = sl[0][3]
+            w13 = _permute_packed_rows(w13, 8, kp_he)
+        for j, t in enumerate((w13, s13, w2, s2)):
+            out[j].append(t)
+    return [torch.stack(t) for t in out]
 
 
 def _words8(w: torch.Tensor) -> torch.Tensor:
@@ -437,6 +490,7 @@ class _Runner:
         mk.kv_packed = True
         mk.expert_groups = ()
         mk.scale_fp8 = False
+        mk.ep = _EP
         mk._ops = {}
         self.mk = mk
         ops._INSTANCE[:] = [mk]
@@ -444,7 +498,9 @@ class _Runner:
         self.device = torch.device("tpu")
         self.weights = self._weights(max_position)
         self.per_layer_experts = [
-            [
+            [t.to(self.device) for t in ep_expert_slabs(l, rank, k)]
+            if _EP
+            else [
                 torch.stack(t).to(self.device)
                 for t in zip(*(expert_slabs(l, rank, e, k) for e in range(N_EXPERTS)))
             ]
@@ -454,9 +510,17 @@ class _Runner:
     def _weights(self, max_position: int) -> list:
         K, L = self.K, self.n_layers
         dense = [dense_layer(l, self.rank) for l in range(L)]
+        if _EP:  # the pooled width in pooled_perm order: this rank's columns of it
+            from sglang_tpu.muse_megakernel.ep_mk.kernel import pooled_perm
+
+            kp = torch.from_numpy(pooled_perm(EXPERT_HIDDEN // TP))
+            for d in dense:
+                d["wpool"], d["wpool_s"] = d["wpool"][:, kp], d["wpool_s"][kp]
         smalls = torch.zeros(L, K.SMALL_ROWS, HIDDEN)
         for l in range(L):
             rep = replicated_layer(l)
+            if _EP:
+                rep["pre_expert_w"] = rep["pre_expert_w"][pooled_perm(EXPERT_HIDDEN)]
             for name in (
                 "pre_attn_w",
                 "attn_alpha",
@@ -1004,7 +1068,10 @@ def main() -> None:
     ap.add_argument("--layers", type=int, default=5)
     ap.add_argument("--global-layers", default="1,4")
     ap.add_argument("--out-dir", default="/tmp/mk_numerics")
+    ap.add_argument("--ep", action="store_true")
     args = ap.parse_args()
+    global _EP
+    _EP = args.ep
 
     dist.init_process_group(backend="tpu_dist")
     rank = dist.get_rank()

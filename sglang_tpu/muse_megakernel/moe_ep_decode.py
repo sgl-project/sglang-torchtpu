@@ -228,7 +228,7 @@ def ep_moe_call(c: EPMoEConfig):
             chunk_compute(
                 "fp4",
                 n,
-                lambda R: xb[pl.ds(0, R), :].astype(jnp.bfloat16),
+                lambda R: xb[pl.ds(0, R), :],
                 ab,
                 ChunkRefs(
                     wg.at[slot],

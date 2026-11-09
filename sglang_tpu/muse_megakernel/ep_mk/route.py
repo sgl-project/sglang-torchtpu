@@ -44,14 +44,14 @@ def local_slots(c: MKConfig, p: EPPlan, S: dict, me, n_live) -> None:
 
     rows_v = S["ep_route_v"].shape[0]
     crow = rows_v - 8
+    pad = p.slots_pad - LANE
+    count_row = (
+        jnp.concatenate([count, jnp.zeros((1, pad), jnp.int32)], axis=1)
+        if pad
+        else count
+    )
     S["ep_route_v"][pl.ds(crow, 8), :] = jnp.concatenate(
-        [
-            jnp.concatenate(
-                [count, jnp.zeros((1, p.slots_pad - LANE), jnp.int32)], axis=1
-            ),
-            jnp.zeros((7, p.slots_pad), jnp.int32),
-        ],
-        axis=0,
+        [count_row, jnp.zeros((7, p.slots_pad), jnp.int32)], axis=0
     )
     sem = S["ep_route_sem"].at[0]
     cnt_cp = pltpu.make_async_copy(

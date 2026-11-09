@@ -9,6 +9,7 @@ from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -17,7 +18,11 @@ from sglang_tpu.muse_megakernel.mk.dots import _fp4_blockdiag_dot, _fp8_dot
 
 BD_KC = 256
 BD_N_TILE = 256  # [128, 256] f32 accumulators: 32 vregs
-BD_ARMS = (1, 2, 4)  # block-diagonal arms: an item of at most 4 slots
+BD_ARMS = (
+    2,
+    4,
+)  # block-diagonal arms: an item of at most 4 slots (1 slot: Mosaic lays out a
+# one-row block-diagonal LHS's mask in the megakernel only as replicated rows, and fails)
 DENSE_ARMS = (8, 16, 32, 64)  # bf16-dequant arms: rows of the item's plain dot
 W2_N_TILE = 512  # down-projection columns per dot below 4 slots ([32, 512] f32 at 2)
 DQ_KC, DQ_TN = 256, 256  # one bf16-dequantized weight block: 32 vregs
@@ -35,11 +40,11 @@ class ChunkRefs(NamedTuple):
     s2: Any
 
 
-def kperm(n: int) -> jax.Array:
+def kperm(n: int) -> np.ndarray:
     """The kernels' order of n indices: in each 256-block, position r * 16 + g holds index
     g * 16 + r, so a 16-row bf16 vreg of dequantized weights spans 16 scale groups and takes
     the block's [16, N] scales as they are (an involution)."""
-    p = jnp.arange(n)
+    p = np.arange(n)
     return p - p % BD_KC + (p % 16) * 16 + (p % BD_KC) // 16
 
 
@@ -100,7 +105,9 @@ def dequant_dot(x, wref, sref, K, N):
 def _bd_arm(A: int, x_rows: Callable, acc, w: ChunkRefs, He: int, CI: int) -> None:
     """At most 4 slots: an A-row block-diagonal dot (A * 16 LHS rows)."""
     rows = pl.ds(0, A)
-    xt = x_rows(A)
+    xt = x_rows(
+        A
+    )  # f32: the dot casts each K chunk (a bf16 row broadcast fails to lay out)
     g = _fp4_blockdiag_dot(xt, w.wg, w.sg, He, CI, BD_KC, kperm=True, n_tile=BD_N_TILE)
     u = _fp4_blockdiag_dot(xt, w.wu, w.su, He, CI, BD_KC, kperm=True, n_tile=BD_N_TILE)
     h = (g * jax.nn.sigmoid(g) * u).astype(jnp.bfloat16)
@@ -118,7 +125,7 @@ def _bd_arm(A: int, x_rows: Callable, acc, w: ChunkRefs, He: int, CI: int) -> No
 
 def _dense_arm(R: int, x_rows: Callable, acc, w: ChunkRefs, He: int, CI: int) -> None:
     """Up to R slots: dequantize each weight block once for all R rows."""
-    xt = x_rows(R)
+    xt = x_rows(R).astype(jnp.bfloat16)
     g = dequant_dot(xt, w.wg, w.sg, He, CI)
     u = dequant_dot(xt, w.wu, w.su, He, CI)
     h = (g * jax.nn.sigmoid(g) * u).astype(jnp.bfloat16)
@@ -130,20 +137,18 @@ def _dense_arm(R: int, x_rows: Callable, acc, w: ChunkRefs, He: int, CI: int) ->
 
 
 def _fp8_arm(R: int, x_rows: Callable, acc, w: ChunkRefs, He: int, CI: int) -> None:
-    """fp8 experts (per-column scales in row 0): a mixed bf16 x fp8 dot, exact, any rows."""
-    xt = x_rows(R)
-    g = _fp8_dot(xt, w.wg, w.sg[0:1, :].astype(jnp.float32), He, CI, FP8_CHUNK_WORDS)
-    u = _fp8_dot(xt, w.wu, w.su[0:1, :].astype(jnp.float32), He, CI, FP8_CHUNK_WORDS)
+    """fp8 experts (per-column scales in row 0 of sg = su = the gate|up scale slab, and of s2):
+    a mixed bf16 x fp8 dot, exact, any rows."""
+    xt = x_rows(R).astype(jnp.bfloat16)
+    s13 = w.sg[0:1, :].astype(jnp.float32)  # [1, 2 CI]: gate | up
+    s2 = w.s2[0:1, :].astype(jnp.float32)
+    g = _fp8_dot(xt, w.wg, s13[:, :CI], He, CI, FP8_CHUNK_WORDS)
+    u = _fp8_dot(xt, w.wu, s13[:, CI : 2 * CI], He, CI, FP8_CHUNK_WORDS)
     h = (g * jax.nn.sigmoid(g) * u).astype(jnp.bfloat16)
     for n0 in range(0, He, W2_N_TILE):
         cols = pl.ds(n0, W2_N_TILE)
         acc[pl.ds(0, R), cols] += _fp8_dot(
-            h,
-            w.w2.at[:, cols],
-            w.s2[0:1, cols].astype(jnp.float32),
-            CI,
-            W2_N_TILE,
-            CI // 4,
+            h, w.w2.at[:, cols], s2[:, n0 : n0 + W2_N_TILE], CI, W2_N_TILE, CI // 4
         )
 
 
@@ -167,7 +172,8 @@ def chunk_compute(
     """acc[:n] += the n slots' expert output over this I-chunk.
 
     Args:
-      x_rows: x_rows(R) -> bf16 [R, He], the item's first R rows (kperm order for fp4).
+      x_rows: x_rows(R) -> f32 [R, He] (bf16 values), the item's first R rows (kperm order
+        for fp4).
       acc: f32 [item_rows, He] ref.
     """
     sizes = item_sizes(item_rows)
