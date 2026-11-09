@@ -191,7 +191,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
             batch, bucket, rows, drafts, addressing, grammar_barrier=grammar_barrier
         )
         calls.linear.assert_called_once_with(
-            batch=batch, accept=accept, pre_verify_lens=bucket.state.seq_lens
+            batch=batch,
+            accept=accept,
+            pre_verify_lens=bucket.state.seq_lens,
+            verify_input=addressing,
         )
         calls.commit.assert_called_once_with(
             batch, bucket.state, rows, addressing, logits, accept
