@@ -30,7 +30,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.muse_megakernel.kernel import (
-    _dequant_fp4,
+    _fp4_dot,
+    _fp8_dot,
     _heads_rms,
     _rms,
     _topk_iter,
@@ -112,6 +113,8 @@ class PPConfig(msgspec.Struct, frozen=True, kw_only=True):
     # pool pages per attention step, and steps of them in flight
     kb: int = 2
     kv_bufs: int = 3
+    # MoE matmul row counts: a block runs the smallest that holds its rows
+    moe_row_buckets: tuple = (128, 192)
 
     @property
     def q_dim(self) -> int:
@@ -164,7 +167,7 @@ class PPConfig(msgspec.Struct, frozen=True, kw_only=True):
             (self.top_k <= 16 and (T * self.top_k) % LANE == 0, "routing table"),
             (self.q_heads % self.kv_heads == 0, "GQA"),
             (self.kv_bufs >= 2 and self.kb >= 1, "attention pipeline"),
-            (self.rb % 64 == 0 and He % 512 == 0 and self.ti % 256 == 0, "MoE chunks"),
+            (all(r % 32 == 0 for r in self.moe_row_buckets), "MoE row buckets"),
         ]
         bad = [why for ok, why in checks if not ok]
         if bad:
@@ -329,7 +332,7 @@ def stage_call(c: PPConfig, debug: bool = False):
     w8, _ = expert_rows("fp8", He)
     moe_w, moe_s = _moe_rows(c)
     wr_rows = max(H, qd, He, 4 * moe_w)
-    MC = 64  # MoE rows per matmul chunk: chunks past an expert's rows are skipped
+    row_buckets = tuple(sorted({min(rb, r) for r in c.moe_row_buckets} | {rb}))
     M = gq * tq  # attention rows: a q tile's heads of one kv head, stacked
     kb, n_kvbuf = c.kb, c.kv_bufs
     q_fold = float(np.log2(c.attn_scale)).is_integer()
@@ -343,7 +346,7 @@ def stage_call(c: PPConfig, debug: bool = False):
         _kvs_in,
         x_out, kvg, kvs, q_h, g_h, kvt_h, a_h, xe_h, ids_h, tw_h, y_h,
         xbuf, accbuf, abuf, pbuf, wbuf, sbuf, vec_v, wr_v, rope_v, rope8, kvtile, otile,
-        idp_v, tw_v, qs_v, acc_v, kvp, qt_v, gt_v, at_v, wdq, xgb, gu_v, hb_v,
+        idp_v, tw_v, qs_v, acc_v, kvp, qt_v, gt_v, at_v,
         ids_s, cnt_s, off_s, fill_s, lst_s, ite_s, itb_s, misc_s,
         sem_x, sem_w, sem_o, sem_kv, sem_m, sem_g, sem_y,
     ):  # fmt: skip
@@ -947,14 +950,6 @@ def stage_call(c: PPConfig, debug: bool = False):
                 def _():
                     gather_wait(gb)
                     pbuf[...] = jnp.zeros(pbuf.shape, F32)
-                    x_rows = xg(gb)
-
-                    def to_bf16(r, cc):
-                        rr = pl.ds(pl.multiple_of(r * sub, sub), sub)
-                        xgb[rr, :] = x_rows[rr, :].astype(BF16)
-                        return cc
-
-                    jax.lax.fori_loop(0, rb // sub, to_bf16, 0)
 
                     @pl.when(item + 1 < n_items)
                     def _():
@@ -967,97 +962,88 @@ def stage_call(c: PPConfig, debug: bool = False):
                     w_issue(idx + 1, 1 - b, False)
 
                 n_rows = block(item)[1]
-
-                def dq_fp4(words, scales, k_rows, row0):
-                    """[k_rows / 8, ti] words + scales -> bf16 rows [row0, row0 + k_rows)."""
-                    for c0 in range(0, k_rows // 8, 32):
-                        wdq[pl.ds(row0 + c0 * 8, 256), :] = _dequant_fp4(
-                            words[pl.ds(c0, 32), :], scales[pl.ds(c0 // 2, 16), :]
-                        )
-
-                def dq_fp8(words, k_rows, row0):
-                    for c0 in range(0, k_rows // 4, 128):
-                        wdq[pl.ds(row0 + c0 * 4, 512), :] = pltpu.bitcast(
-                            words[pl.ds(c0, 128), :], FP8
-                        ).astype(BF16)
-
-                def live_chunks(fn):
-                    for rc in range(rb // MC):
-
-                        @pl.when(rc * MC < n_rows)
-                        def _(rc=rc):
-                            fn(pl.ds(rc * MC, MC))
-
-                def gate_up(i):
-                    def rows_mm(rr):
-                        acc = None
-                        for k0 in range(0, He, 512):
-                            part = jnp.dot(
-                                xgb[rr, pl.ds(k0, 512)],
-                                wdq[pl.ds(k0, 512), :],
-                                preferred_element_type=F32,
-                            )
-                            acc = part if acc is None else acc + part
-                        gu_v[i, rr, :] = acc
-
-                    live_chunks(rows_mm)
-
-                def down(scale_of):
-                    def rows_mm(rr):
-                        hb = hb_v[rr, :]
-                        for cc in range(npc):
-                            part = jnp.dot(
-                                hb,
-                                wdq[pl.ds(cc * ti, ti), :],
-                                preferred_element_type=F32,
-                            )
-                            sc = scale_of(cc)
-                            pbuf[rr, rows(cc, ti)] += part if sc is None else part * sc
-
-                    live_chunks(rows_mm)
-
-                def silu_mul(sg, su):
-                    def rows_h(rr):
-                        g, u = gu_v[0, rr, :], gu_v[1, rr, :]
-                        if sg is not None:
-                            g, u = g * sg, u * su
-                        hb_v[rr, :] = (g * jax.nn.sigmoid(g) * u).astype(BF16)
-
-                    live_chunks(rows_h)
-
+                x_rows = xg(gb)
                 w = wv(b)
 
-                @pl.when(is_f8 == 0)
-                def _():
-                    dq_fp4(w.at[pl.ds(0, w4)], sbuf.at[b, pl.ds(0, s4)], He, 0)
-                    gate_up(0)
-                    dq_fp4(w.at[pl.ds(w4, w4)], sbuf.at[b, pl.ds(s4, s4)], He, 0)
-                    gate_up(1)
-                    silu_mul(None, None)
-                    for cc in range(npc):
-                        dq_fp4(
-                            w.at[pl.ds(2 * w4 + cc * (ti // 8), ti // 8)],
-                            sbuf.at[b, pl.ds(2 * s4 + cc * (ti // 16), ti // 16)],
+                def expert_tile(R):
+                    """This step's matmuls over the block's first R rows."""
+
+                    def lhs(c8, n8, _fp8_lhs):
+                        return x_rows[pl.ds(0, R), pl.ds(c8 * 8, n8 * 8)].astype(BF16)
+
+                    @pl.when(is_f8 == 0)
+                    def _():
+                        g = _fp4_dot(
+                            None,
+                            w.at[pl.ds(0, w4)],
+                            sbuf.at[b, pl.ds(0, s4)],
+                            He,
                             ti,
-                            cc * ti,
+                            32,
+                            fast_bf16=True,
+                            lhs_chunk_fn=lhs,
+                            nrows=R,
                         )
-                    down(lambda cc: None)
-
-                @pl.when(is_f8 != 0)
-                def _():
-                    def srow(r):
-                        return sbuf[b, pl.ds(r * FP8_SCALE_ROWS, 1), :].astype(F32)
-
-                    dq_fp8(w.at[pl.ds(0, w8)], He, 0)
-                    gate_up(0)
-                    dq_fp8(w.at[pl.ds(w8, w8)], He, 0)
-                    gate_up(1)
-                    silu_mul(srow(0), srow(1))
-                    for cc in range(npc):
-                        dq_fp8(
-                            w.at[pl.ds(2 * w8 + cc * (ti // 4), ti // 4)], ti, cc * ti
+                        u = _fp4_dot(
+                            None,
+                            w.at[pl.ds(w4, w4)],
+                            sbuf.at[b, pl.ds(s4, s4)],
+                            He,
+                            ti,
+                            32,
+                            fast_bf16=True,
+                            lhs_chunk_fn=lhs,
+                            nrows=R,
                         )
-                    down(lambda cc: srow(2 + cc))
+                        hdn = (g * jax.nn.sigmoid(g) * u).astype(BF16)
+                        for cc in range(npc):
+                            wp = w.at[pl.ds(2 * w4 + cc * (ti // 8), ti // 8)]
+                            sp = sbuf.at[b, pl.ds(2 * s4 + cc * (ti // 16), ti // 16)]
+                            pbuf[pl.ds(0, R), rows(cc, ti)] += _fp4_dot(
+                                hdn, wp, sp, ti, ti, 32, fast_bf16=True
+                            )
+
+                    @pl.when(is_f8 != 0)
+                    def _():
+                        def srow(r):
+                            return sbuf[b, pl.ds(r * FP8_SCALE_ROWS, 1), :].astype(F32)
+
+                        g = _fp8_dot(
+                            None,
+                            w.at[pl.ds(0, w8)],
+                            srow(0),
+                            He,
+                            ti,
+                            64,
+                            lhs_chunk_fn=lhs,
+                            nrows=R,
+                        )
+                        u = _fp8_dot(
+                            None,
+                            w.at[pl.ds(w8, w8)],
+                            srow(1),
+                            He,
+                            ti,
+                            64,
+                            lhs_chunk_fn=lhs,
+                            nrows=R,
+                        )
+                        hdn = (g * jax.nn.sigmoid(g) * u).astype(BF16)
+                        for cc in range(npc):
+                            wp = w.at[pl.ds(2 * w8 + cc * (ti // 4), ti // 4)]
+                            pbuf[pl.ds(0, R), rows(cc, ti)] += _fp8_dot(
+                                hdn, wp, srow(2 + cc), ti, ti, 64
+                            )
+
+                # the smallest row bucket holding the block's rows: MXU work follows them
+                lo = 0
+                for R in row_buckets:
+
+                    @pl.when((n_rows > lo) & (n_rows <= R))
+                    def _(R=R):
+                        expert_tile(R)
+
+                    lo = R
 
                 @pl.when(j == nti - 1)
                 def _():
@@ -1232,10 +1218,6 @@ def stage_call(c: PPConfig, debug: bool = False):
         vmem((tq, gq * hd), BF16),
         vmem((tq, gq * hd), BF16),
         vmem((tq, gq * hd), BF16),
-        vmem((He, ti), BF16),  # wdq: a dequantized expert tile (w2: its pieces stacked)
-        vmem((rb, He), BF16),  # xgb: the gathered rows as matmul input
-        vmem((2, rb, ti), F32),  # gu_v: gate and up projections
-        vmem((rb, ti), BF16),  # hb_v
         smem_t((slots_n // LANE, LANE), jnp.int32),  # ids_s
         smem_t((E,), jnp.int32),
         smem_t((E,), jnp.int32),
