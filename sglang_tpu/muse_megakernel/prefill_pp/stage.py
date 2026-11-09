@@ -88,7 +88,7 @@ def stage_forward(
                 slots,
                 x,
                 y.reshape(T * K, c.expert_hidden),
-                tw[:, :K].reshape(T * K, 1),
+                tw,
                 *weights,
             )
         routes.append((ids, tw, q, k, v, o, xe, y))
