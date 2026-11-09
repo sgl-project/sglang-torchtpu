@@ -41,7 +41,8 @@ PROFILES = {
     9: (4, 8, 128, "4:4"),
     10: (6, 8, 64, "4:4"),
     16: (16, 8, 64, "3:4"),
-    22: (16, 8, 64, "3:4"),
+    # Fixed 4-token verify on the experimental worker (3:4 already ran width 4 from 3 decoding).
+    22: (16, 4, 64, None),
     # Not swept; kept for reruns.
     2: (2, 8, 128, "4:4"),
     4: (2, 8, 128, "4:4"),
@@ -56,6 +57,10 @@ PROFILES = {
 }
 # Any other concurrency.
 DEFAULT_PROFILE = (16, 8, 64, "3:4")
+
+# conc: host pool GB per rank, for points served by the experimental spec worker
+# (fixed simulated draft tokens, no adaptive width).
+EXP_WORKER_HICACHE_GB = {22: 72}
 
 # The AgentX golden acceptance length of Muse Spark's DFlash2 draft (thinking on),
 # by draft tokens per verify (the verify width minus the current token).
@@ -105,7 +110,7 @@ def compile_bs(running, verify, adaptive):
     """Batch buckets: 1, the request cap, and every count whose verify step fills
     the megakernel's 8-row tiles exactly (above 8 requests only multiples of 4);
     other counts pad up to the next bucket."""
-    if running == 16 and adaptive:
+    if running == 16 and (adaptive or verify == 4):
         # 9-11 decoding requests get their own programs instead of padding to 12.
         return [*range(1, 13), 16]
     buckets = [1] + [
@@ -175,7 +180,7 @@ def config_for(
             # Host pool = ratio x device pool per rank; an explicit size (GB per
             # rank) overrides the ratio.
             "hicache_ratio": 3.0 if large else 2.0,
-            "hicache_size": 56 if large else None,
+            "hicache_size": EXP_WORKER_HICACHE_GB.get(conc, 56) if large else None,
             # Write-through copies KV to the host once cached, so a device
             # eviction never waits for a write-back.
             "hicache_write_policy": "write_through" if large else "write_back",
@@ -293,12 +298,22 @@ def config_for(
     if rows > 32:
         # The megakernel takes steps of up to 32 rows by default.
         env["SGLANG_TPU_MUSE_MK_MAX_ROWS"] = str(rows)
+    exp_worker = conc in EXP_WORKER_HICACHE_GB
+    if exp_worker:
+        if adaptive:
+            raise ValueError(
+                "the experimental spec worker has no adaptive verify width"
+            )
+        env["SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER"] = "1"
     if simulate_acceptance:
         env.update(
             {
                 "SGLANG_SIMULATE_ACC_LEN": GOLDEN_AL[verify - 1],
                 "SGLANG_SIMULATE_ACC_METHOD": "match-expected",
-                "SGLANG_SIMULATE_ACC_TOKEN_MODE": "real-draft-token",
+                # The experimental worker only simulates with fixed draft tokens.
+                "SGLANG_SIMULATE_ACC_TOKEN_MODE": "fixed"
+                if exp_worker
+                else "real-draft-token",
             }
         )
     if mk_decode:
