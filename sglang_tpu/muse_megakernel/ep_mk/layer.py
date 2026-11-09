@@ -9,6 +9,7 @@ The row window: own rows [me * Rc, (me + 1) * Rc) are read and computed through 
 aligned window around them (window_rows); only own rows are written or sent.
 """
 
+import contextlib
 import os
 
 import jax
@@ -40,6 +41,14 @@ from sglang_tpu.muse_megakernel.mk.packing import _pack_bf16x2, _unpack_bf16x2
 f32, bf16 = jnp.float32, jnp.bfloat16
 
 
+def _phase(name: str):
+    """A named in-kernel region per phase with SGLANG_TPU_EP_TRACE=1 at trace time (xprof
+    shows them with libtpu's --xla_enable_custom_call_region_trace=true)."""
+    if os.environ.get("SGLANG_TPU_EP_TRACE") == "1":
+        return jax.named_scope(f"ep_{name}")
+    return contextlib.nullcontext()
+
+
 def _dev_skip(phase: str) -> bool:
     """Timing only (wrong results): SGLANG_TPU_EP_DEV_SKIP lists phases every rank skips:
     residual (own rows' FFN residual), capture, allgather, experts (the math; slots move),
@@ -60,29 +69,41 @@ class EPExperts:
     def layer_moe(self, step: EPLayerStep) -> None:
         c, S, p, me = step.c, step.S, self.plan, step.me
         win = _window(c, me)
-        step.router()
-        route.own_topk(c, p, S, step.smr, win)
-        route.send_places(c, p, S, step.n_live, win)
-        _pool(step, win)
-        _fill_send(step, p, win)
+        with _phase("router"):
+            step.router()
+            route.own_topk(c, p, S, step.smr, win)
+            route.send_places(c, p, S, step.n_live, win)
+        with _phase("pool"):
+            _pool(step, win)
+        with _phase("fill"):
+            _fill_send(step, p, win)
         moving = not _dev_skip("a2a")
-        if moving:
-            a2a.exchange_counts(c, S, me)
-        else:
-            S["ep_cnt_v"][...] = jnp.zeros(S["ep_cnt_v"].shape, jnp.int32)
-        route.slot_matrix(c, S)
-        if moving:
-            a2a.dispatch(c, S, me)
-        n_items = route.build_items(c, p, S, me)
-        if moving:
-            a2a.wait_dispatch(c, S, me)
-        _expert_loop(step, p, n_items)
-        if moving:
-            a2a.give_back(c, S, me)
-            a2a.wait_give_back(c, S, me)
-        _combine(step, win)
-        _unpool_residual(step, win)
-        _all_gather_rows(step, p)
+        with _phase("counts"):
+            if moving:
+                a2a.exchange_counts(c, S, me)
+            else:
+                S["ep_cnt_v"][...] = jnp.zeros(S["ep_cnt_v"].shape, jnp.int32)
+            route.slot_matrix(c, S)
+        with _phase("dispatch"):
+            if moving:
+                a2a.dispatch(c, S, me)
+        with _phase("items"):
+            n_items = route.build_items(c, p, S, me)
+        with _phase("dispatch_wait"):
+            if moving:
+                a2a.wait_dispatch(c, S, me)
+        with _phase("experts"):
+            _expert_loop(step, p, n_items)
+        with _phase("combine_a2a"):
+            if moving:
+                a2a.give_back(c, S, me)
+                a2a.wait_give_back(c, S, me)
+        with _phase("combine"):
+            _combine(step, win)
+        with _phase("unpool"):
+            _unpool_residual(step, win)
+        with _phase("allgather"):
+            _all_gather_rows(step, p)
 
 
 def _window(c: MKConfig, me):
