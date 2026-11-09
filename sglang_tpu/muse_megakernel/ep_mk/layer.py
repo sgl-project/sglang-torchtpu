@@ -51,6 +51,7 @@ def _phase(name: str):
 def _dev_skip(phase: str) -> bool:
     """Timing only (wrong results): SGLANG_TPU_EP_DEV_SKIP lists phases every rank skips:
     residual (own rows' FFN residual), capture, allgather, experts (the math; slots move),
+    ag_half (the row all-gather sends half the columns),
     wdma (the expert weight streams after the first ring fill: the math reruns those slots),
     pool, unpool (their weight streams), a2a (counts, both all-to-alls: no slot moves).
     Read at trace time: a warm compile process imports this module before a sweep's env."""
@@ -555,19 +556,24 @@ def _all_gather_rows(step: EPLayerStep, p: EPPlan) -> None:
     )
     if _dev_skip("allgather"):
         parts = []
+    cols = pl.ds(0, c.hidden // 2 if _dev_skip("ag_half") else c.hidden)
     for d in range(1, c.tp):
         peer = (me + d) % c.tp
         for (rows,) in parts:
             pltpu.make_async_remote_copy(
-                src_ref=hs.at[rows],
-                dst_ref=hs.at[rows],
+                src_ref=hs.at[rows, cols],
+                dst_ref=hs.at[rows, cols],
                 send_sem=sent,
                 recv_sem=recv,
                 device_id=(peer,),
             ).start()
     n = rc if rc % 8 == 0 else 1
-    tmpl_r = pltpu.make_async_copy(hs.at[pl.ds(0, n)], hs.at[pl.ds(0, n)], recv)
-    tmpl_s = pltpu.make_async_copy(hs.at[pl.ds(0, n)], hs.at[pl.ds(0, n)], sent)
+    tmpl_r = pltpu.make_async_copy(
+        hs.at[pl.ds(0, n), cols], hs.at[pl.ds(0, n), cols], recv
+    )
+    tmpl_s = pltpu.make_async_copy(
+        hs.at[pl.ds(0, n), cols], hs.at[pl.ds(0, n), cols], sent
+    )
     for _ in range((c.tp - 1) * len(parts)):
         tmpl_r.wait()
     for _ in range((c.tp - 1) * len(parts)):
