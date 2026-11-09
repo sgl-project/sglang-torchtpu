@@ -352,6 +352,11 @@ class TestSWAEvictStaleWindowsFirst(unittest.TestCase):
         for n in stale:
             self.assertIn(n, swa._collect_unbacked_swa_nodes(n))
         core.is_write_back = True
+        # A split leaves both halves stale.
+        big = next(n for n in stale if n is not window and len(n.key) >= 2 * PAGE)
+        prefix, _ = core._split_node(big.key, big, PAGE)
+        for half in (prefix, big):
+            self.assertEqual(swa._collect_unbacked_swa_nodes(half), [])
         # A match ending in a stale window makes it live, so it is copied again.
         depth = 0
         node = window

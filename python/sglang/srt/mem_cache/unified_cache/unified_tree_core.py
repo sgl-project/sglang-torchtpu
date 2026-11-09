@@ -231,7 +231,8 @@ class UnifiedLRUList:
         self.head.lru_next[self._pt] = self.tail
         self.tail.lru_prev[self._pt] = self.head
         self.cache: dict[int, UnifiedTreeNode] = {}
-        # Ids reset_node_lru moved with skip_host_backup; any other move clears them.
+        # Ids reset_node_lru moved with skip_host_backup, and nodes inserted after
+        # one (a split's prefix half); any other move clears them.
         self._skip_host_backup: set[int] = set()
         # Session partition: [head .. mid) holds session-referenced nodes and
         # (mid .. tail] unreferenced ones, so evictions directly walks (tail -> head).
@@ -279,6 +280,8 @@ class UnifiedLRUList:
         assert node.id not in self.cache
         self.cache[node.id] = node
         self._add_node_after(prev_node, node)
+        if prev_node.id in self._skip_host_backup:
+            self._skip_host_backup.add(node.id)
 
     def remove_node(self, node: UnifiedTreeNode):
         assert node.id in self.cache
@@ -295,7 +298,8 @@ class UnifiedLRUList:
     ) -> None:
         """Make ``node`` the next eviction victim; session-referenced nodes stay put.
         With ``skip_host_backup``, ``skips_host_backup`` reports the node until a move
-        other than this one; a demotion without it keeps an earlier mark."""
+        other than this one; a demotion without it keeps an earlier mark, and a node
+        ``insert_after`` places after it gets the mark too."""
         assert node.id in self.cache
         if self._is_referenced is not None and self._is_referenced(node):
             return

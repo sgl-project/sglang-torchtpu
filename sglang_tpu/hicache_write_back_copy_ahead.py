@@ -290,6 +290,14 @@ class WriteBackCopyAhead:
             return
         cache = self._cache
         if not node.backuped:
+            # A stale window's Full copy would carry no SWA, and once a match revives
+            # it, its eviction skips backuped nodes; the eviction backs it up instead.
+            if (
+                cache.is_swa_enabled
+                and cache.tree_core.has_swa_host_pool
+                and cache.tree_core.lru_lists[ComponentType.SWA].skips_host_backup(node)
+            ):
+                return
             full_tokens = len(node.component_data[BASE_COMPONENT_TYPE].value)
             if self._inflight(swa=swa) + full_tokens > self._caps[swa]:
                 return
