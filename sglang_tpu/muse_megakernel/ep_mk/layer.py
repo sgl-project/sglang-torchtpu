@@ -9,6 +9,8 @@ The row window: own rows [me * Rc, (me + 1) * Rc) are read and computed through 
 aligned window around them (window_rows); only own rows are written or sent.
 """
 
+import os
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -36,6 +38,9 @@ from sglang_tpu.muse_megakernel.mk.numerics import _rms
 from sglang_tpu.muse_megakernel.mk.packing import _pack_bf16x2, _unpack_bf16x2
 
 f32, bf16 = jnp.float32, jnp.bfloat16
+# Timing only (wrong results): skip these phases on every rank, comma-separated: residual
+# (own rows' FFN residual), capture, allgather, experts (expert math; the slots still move)
+_DEV_SKIP = frozenset(os.environ.get("SGLANG_TPU_EP_DEV_SKIP", "").split(","))
 
 
 class EPExperts:
@@ -299,16 +304,17 @@ def _expert_loop(step: EPLayerStep, p: EPPlan, n_items) -> None:
 
         start(k + D - 1)
         wait(slot)
-        chunk_compute(
-            step.kind,
-            n,
-            lambda R: _unpack_bf16x2(buf.x(b)[pl.ds(0, R), :]),
-            buf.acc,
-            _chunk_refs(step, p, slot),
-            He,
-            CI,
-            RI,
-        )
+        if "experts" not in _DEV_SKIP:
+            chunk_compute(
+                step.kind,
+                n,
+                lambda R: _unpack_bf16x2(buf.x(b)[pl.ds(0, R), :]),
+                buf.acc,
+                _chunk_refs(step, p, slot),
+                He,
+                CI,
+                RI,
+            )
 
         @pl.when(j == NC - 1)
         def _():
@@ -469,7 +475,9 @@ def _unpool_residual(step: EPLayerStep, win) -> None:
     S["ep_f"][pl.ds(0, wn), :] = _rms(fw, c.post_eps).astype(bf16).astype(f32)
     load, store = _stream_rows(step)
     alpha, beta = _row(smr, "ffn_alpha", H), _row(smr, "ffn_beta", H)
-    for r in range(rc):  # own rows only: the all-gather fills the others
+    for r in range(
+        0 if "residual" in _DEV_SKIP else rc
+    ):  # own rows only: the all-gather fills the others
         wr = w_off + r
         branch = S["ep_f"][pl.ds(wr, 1), :]
         store(w0 + wr, alpha * load(w0 + wr, 1) + beta * branch)
@@ -487,6 +495,8 @@ def _all_gather_rows(step: EPLayerStep, p: EPPlan) -> None:
         if rc % 8 == 0
         else [(pl.ds(me * rc + r, 1),) for r in range(rc)]
     )
+    if "allgather" in _DEV_SKIP:
+        parts = []
     for d in range(1, c.tp):
         peer = (me + d) % c.tp
         for (rows,) in parts:
@@ -509,7 +519,7 @@ def _all_gather_rows(step: EPLayerStep, p: EPPlan) -> None:
     for cl in c.capture_layers:
         hit = step.layer == cl
         is_cap = hit if is_cap is None else (is_cap | hit)
-    if is_cap is None:
+    if is_cap is None or "capture" in _DEV_SKIP:
         return
 
     @pl.when(is_cap)
