@@ -10,9 +10,9 @@ XLA copies every operand that a kernel with remote DMA aliases.
 from __future__ import annotations
 
 import contextlib
-import os
 import dataclasses
 import inspect
+import os
 
 import jax
 import jax.numpy as jnp

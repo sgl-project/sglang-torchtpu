@@ -65,7 +65,13 @@ def _step_inputs_op(
             checkpoint_width, dtype=req_rows.dtype, device=req_rows.device
         )
         ckrow = (bases.unsqueeze(1) + steps).reshape(-1)
-    return tok, pos, tab, _pad(srow.to(torch.int32), bucket), _pad(ckrow.to(torch.int32), rows)
+    return (
+        tok,
+        pos,
+        tab,
+        _pad(srow.to(torch.int32), bucket),
+        _pad(ckrow.to(torch.int32), rows),
+    )
 
 
 def _owned(t: torch.Tensor) -> torch.Tensor:
