@@ -11,7 +11,7 @@ traces against it.
 Every point runs fp8 KV in the SEQ_ALONG_LANE layout (batched RPA prefill,
 megakernel decode, 256-token pages) with host KV offload through HiCache over
 raiden, FCFS admission, and DFlash on the experimental spec worker verifying a
-fixed 4 tokens at the swept points. The draft is served through a windowed copy of
+fixed 8 tokens up to conc 10 and 4 from conc 16. The draft is served through a windowed copy of
 its config (windowed_draft.py), so its KV lives in the target's sliding-window
 slots. Acceptance is pinned to the AgentX golden acceptance length.
 
@@ -33,15 +33,17 @@ SWEPT = (1, 7, 9, 10, 16, 22)
 #        adaptive verify "MIN_BS:WIDTH" or None). MIN_BS:WIDTH verifies WIDTH
 # tokens once MIN_BS or more requests decode.
 PROFILES = {
-    # The swept points verify a fixed 4 tokens on the experimental worker: on the
-    # 9e124d99 megakernel q4 is no slower than q8 even at one request.
+    # The swept points run the experimental worker at a fixed width. Up to conc 10
+    # 1-3 requests decode most steps, where an 8-token block pads to the same 8- or
+    # 16-row step as 4 tokens but accepts 4.05 instead of 3.06 (j-2e0cc62e: q4 at
+    # c7 -23% per-request decode at 1 running); from conc 16 q4 wins.
     # A session's subagent turns run beside it instead of queueing.
-    1: (2, 4, 128, None),
+    1: (2, 8, 128, None),
     # Running requests step up with concurrency, so interactivity falls and
     # throughput rises from conc 1 to conc 10.
-    7: (3, 4, 128, None),
-    9: (4, 4, 128, None),
-    10: (6, 4, 64, None),
+    7: (3, 8, 128, None),
+    9: (4, 8, 128, None),
+    10: (6, 8, 64, None),
     16: (16, 4, 64, None),
     22: (16, 4, 64, None),
     # Not swept; kept for reruns.

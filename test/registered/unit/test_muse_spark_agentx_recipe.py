@@ -233,6 +233,7 @@ COMMON_ENV = {
 PER_CONC = {
     1: (
         {
+            "--speculative-num-draft-tokens": ["8"],
             "--max-running-requests": ["2"],
             "--torch-compile-max-bs": ["2"],
             "--tpu-compile-bs": ["1", "2"],
@@ -242,11 +243,13 @@ PER_CONC = {
             "--hicache-write-policy": ["write_back"],
         },
         {
+            "SGLANG_SIMULATE_ACC_LEN": "4.05",
             "SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE": "131072",
         },
     ),
     7: (
         {
+            "--speculative-num-draft-tokens": ["8"],
             "--max-running-requests": ["3"],
             "--torch-compile-max-bs": ["3"],
             "--tpu-compile-bs": ["1", "2", "3"],
@@ -256,11 +259,13 @@ PER_CONC = {
             "--hicache-write-policy": ["write_back"],
         },
         {
+            "SGLANG_SIMULATE_ACC_LEN": "4.05",
             "SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE": "131072",
         },
     ),
     9: (
         {
+            "--speculative-num-draft-tokens": ["8"],
             "--max-running-requests": ["4"],
             "--torch-compile-max-bs": ["4"],
             "--tpu-compile-bs": ["1", "2", "3", "4"],
@@ -270,11 +275,13 @@ PER_CONC = {
             "--hicache-write-policy": ["write_back"],
         },
         {
+            "SGLANG_SIMULATE_ACC_LEN": "4.05",
             "SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE": "131072",
         },
     ),
     10: (
         {
+            "--speculative-num-draft-tokens": ["8"],
             "--max-running-requests": ["6"],
             "--torch-compile-max-bs": ["6"],
             "--tpu-compile-bs": ["1", "2", "3", "4", "5", "6"],
@@ -284,7 +291,9 @@ PER_CONC = {
             "--hicache-write-policy": ["write_back"],
         },
         {
+            "SGLANG_SIMULATE_ACC_LEN": "4.05",
             "SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE": "131072",
+            "SGLANG_TPU_MUSE_MK_MAX_ROWS": "48",
         },
     ),
     16: (
