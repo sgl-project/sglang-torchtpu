@@ -14,7 +14,7 @@ from sglang.test.tpu import model_config_main
 register_tpu_ci(
     # A cold tpu7x 2x2x1 run measured ~35 min: ~21 min to ready, ~10 min of
     # sgl-eval dataset prep (HF_HOME is per-pod), ~5 min of eval.
-    est_time=3000,
+    est_time=1370,
     suite="nightly-tpu-4-v7",
     nightly=True,
     labels=["singlehost", "qwen3-vl-30b-a3b", "multimodal", "compile-tracer"],
