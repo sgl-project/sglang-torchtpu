@@ -1,229 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Muse Spark prefill, pipeline-parallel: one stage's layers whole on one device, no collectives.
-
-A stage holds its layers whole (every head, all experts, the full pooler and unpooler) on one
-device, so nothing in it talks to another device; the residual stream moves between stages
-outside. Per layer slot:
-
-  attn_in    (fused Pallas) qkvg projection, qk norms, rope -> q, k, v, gate
-  attention  sglang_tpu's batched RPA prefill kernel, as the P/D prefill serves it: the
-             chunk's K/V into the slot's fp8 SEQ_ALONG_LANE pool, attention over the pool
-             (cached context and the causal chunk), each head's output RMS-normalized
-  route      (fused Pallas) gated o projection and residual, router top-k, expert projection
-  experts    sglang_tpu's fused MoE (sort, gather, gmm_v2 x2, un-permute), as served:
-             NVFP4 W4A16, or fp8 W8A8 on the stage's fp8 layer
-  combine    (fused Pallas) post-expert norm per slot, weighted slot sum, unpooler, gated
-             residual
-
-Every stage has the same slot layout (cfg.slots layers of dense weights, global attention at
-cfg.global_slots, NVFP4 experts per slot and one fp8 expert set), so one program serves every
-stage; a per-stage slot table says which slots hold a layer and which take the fp8 experts.
-"""
-
-import os
+"""The PP prefill stage's fused Pallas kernels around attention and the experts: attn_in (qkvg
+projection, qk norms, rope), route (gated o projection and residual, router top-k, expert
+projection) and combine (post-expert norm per slot, weighted slot sum, unpooler, residual).
+They read one slot's dense weights from the stage's stacks; nothing in them talks to another
+device."""
 
 import jax
 import jax.numpy as jnp
-import msgspec
-import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.muse_megakernel.kernel import _heads_rms, _rms, _topk_iter
-
-LANE = 128
-PHASES = ("attn_in", "attention", "route", "experts", "combine")
-FP8 = jnp.float8_e4m3fn
-BF16 = jnp.bfloat16
-F32 = jnp.float32
-
-# slot table: a header, then NF int32 fields per slot
-HDR = 8
-H_STAGE, H_LAYERS = 0, 1
-NF = 4
-F_VALID, F_GLOBAL, F_FP8, F_LAYER = range(4)
-
-# rows of the per-layer vector slab [slots, V_ROWS, vec_width] f32
-V = dict(
-    pre_attn_w=0,
-    attn_alpha=1,
-    attn_beta=2,
-    pre_ffn_w=3,
-    post_ffn_w=4,
-    ffn_alpha=5,
-    ffn_beta=6,
-    pre_expert_w=7,
-    expert_bias=8,
-    post_expert_w=9,
-    wqkvg_s=10,
-    wo_s=11,
-    wpool_s=12,
-    wunpool_s=13,
+from sglang_tpu.muse_megakernel.prefill_pp.config import (
+    BF16,
+    F32,
+    F_GLOBAL,
+    F_VALID,
+    FP8,
+    H_STAGE,
+    HDR,
+    LANE,
+    NF,
+    V_ROWS,
+    WEIGHT_ORDER,
+    PPConfig,
+    V,
+    skipped_phases,
 )
-V_ROWS = 16
-
-
-class PPConfig(msgspec.Struct, frozen=True, kw_only=True):
-    """Static description of one stage program (every stage runs the same one)."""
-
-    hidden: int
-    head_dim: int
-    q_heads: int
-    kv_heads: int
-    n_experts: int
-    top_k: int
-    expert_hidden: int
-    inter: int
-    rms_eps: float
-    post_eps: float
-    scale_query_by: float
-    attn_scale: float
-    router_mult: float
-    route_scale: float
-    router_eps: float
-    window: int
-    # token rows of the chunk
-    rows: int
-    # layer slots per stage
-    slots: int
-    page: int
-    pages_per_seq: int
-    # pool pages of a global / sliding-window slot
-    global_pages: int
-    swa_pages: int
-    max_position: int
-    # slots of the global attention layers (the rest are sliding-window)
-    global_slots: tuple = (2, 6)
-    # slots that may hold a stage's fp8-expert layer
-    fp8_slots: tuple = (1, 6)
-    # dense row tile and weight column tile
-    tm: int = 256
-    tn: int = 512
-
-    @property
-    def q_dim(self) -> int:
-        return self.q_heads * self.head_dim
-
-    @property
-    def kv_dim(self) -> int:
-        return self.kv_heads * self.head_dim
-
-    @property
-    def qkvg_dim(self) -> int:
-        return 2 * self.q_dim + 2 * self.kv_dim
-
-    @property
-    def vec_width(self) -> int:
-        return max(self.qkvg_dim, self.hidden)
-
-    def validate(self) -> None:
-        """Raises ValueError for a geometry the stage kernels do not tile."""
-        H, He, T = self.hidden, self.expert_hidden, self.rows
-        checks = [
-            (H >= 2 * He and self.q_dim >= 2 * He, "combine staging halves"),
-            (
-                self.tm % self.top_k == 0 and (self.tm // self.top_k) % 8 == 0,
-                "row tile",
-            ),
-            (T % self.tm == 0 and T % self.page == 0, "chunk rows"),
-            (
-                self.qkvg_dim % self.tn == 0 and H % self.tn == 0 and He % self.tn == 0,
-                "tn",
-            ),
-            (self.q_dim % self.tn == 0 and self.kv_dim % self.tn == 0, "head tiles"),
-            (self.n_experts <= 2 * LANE and self.n_experts % LANE == 0, "router lanes"),
-            (self.top_k <= LANE, "routing lanes"),
-            (self.q_heads % self.kv_heads == 0, "GQA"),
-        ]
-        bad = [why for ok, why in checks if not ok]
-        if bad:
-            raise ValueError(f"PPConfig {self}: {'; '.join(bad)}")
-
-
-def stage_layers(n_layers: int, split: tuple[int, ...]) -> list[tuple[int, ...]]:
-    """Consecutive layer runs of the given sizes."""
-    if sum(split) != n_layers:
-        raise ValueError(f"split {split} does not cover {n_layers} layers")
-    out, lo = [], 0
-    for n in split:
-        out.append(tuple(range(lo, lo + n)))
-        lo += n
-    return out
-
-
-def slot_table(
-    c: PPConfig, stage: int, layers: tuple[int, ...], kinds: tuple, global_layers: tuple
-) -> np.ndarray:
-    """The stage's slot table [HDR + slots * NF] int32. Its layers take consecutive slots
-    from the one that puts its global layers on cfg.global_slots.
-
-    Raises:
-      ValueError: The layers do not fit the stage's slots, their global layers cannot sit on
-        cfg.global_slots, or their fp8-expert layer (one at most) is not on cfg.fp8_slots.
-    """
-    globals_at = [i for i, layer in enumerate(layers) if layer in global_layers]
-    first = c.global_slots[0] - globals_at[0] if globals_at else 0
-    placed = [first + i for i in globals_at]
-    if first < 0 or first + len(layers) > c.slots or placed != list(c.global_slots):
-        raise ValueError(
-            f"stage {stage}: layers {layers} (global {[layers[i] for i in globals_at]}) do not "
-            f"fit {c.slots} slots with global attention at {c.global_slots}"
-        )
-    fp8_at = [first + i for i, layer in enumerate(layers) if kinds[layer] == "fp8"]
-    if len(fp8_at) > 1 or not set(fp8_at) <= set(c.fp8_slots):
-        raise ValueError(
-            f"stage {stage}: fp8 experts on slots {fp8_at}, not one of {c.fp8_slots}"
-        )
-    t = np.zeros(HDR + c.slots * NF, np.int32)
-    t[H_STAGE], t[H_LAYERS] = stage, len(layers)
-    for i, layer in enumerate(layers):
-        f = t[HDR + (first + i) * NF : HDR + (first + i + 1) * NF]
-        f[F_VALID], f[F_GLOBAL] = 1, int(layer in global_layers)
-        f[F_FP8], f[F_LAYER] = int(kinds[layer] == "fp8"), layer
-    return t
-
-
-def weight_shapes(c: PPConfig) -> dict[str, tuple[tuple[int, ...], jnp.dtype]]:
-    """One stage's dense weights (per device), column-tile major: each [K, tn] tile is one
-    contiguous block."""
-    S, H, He, E, tn = c.slots, c.hidden, c.expert_hidden, c.n_experts, c.tn
-    return {
-        "wqkvg": ((S, c.qkvg_dim // tn, H, tn), FP8),
-        "wo": ((S, H // tn, c.q_dim, tn), FP8),
-        "wpool": ((S, He // tn, H, tn), FP8),
-        "wunpool": ((S, H // tn, He, tn), FP8),
-        "wrouter": ((S, H, E), BF16),
-        "vecs": ((S, V_ROWS, c.vec_width), F32),
-    }
-
-
-WEIGHT_ORDER = ("wqkvg", "wo", "wpool", "wunpool", "wrouter", "vecs")
-
-
-def expert_shapes(c: PPConfig, kind: str) -> list[tuple[tuple[int, ...], jnp.dtype]]:
-    """(w13, w13_scale, w2, w2_scale) of one layer in the fused MoE's serving layouts: NVFP4 as
-    e2m1 codes packed two per byte along K with bf16 block scales (16 along K) paired into
-    int32 words; fp8 [E, K, N] with f32 channel scales."""
-    E, He, I = c.n_experts, c.expert_hidden, c.inter
-    if kind == "fp4":
-        return [
-            ((E, He // 2, 2 * I), jnp.uint8),
-            ((E, He // 32, 2 * I), jnp.int32),
-            ((E, I // 2, He), jnp.uint8),
-            ((E, I // 32, He), jnp.int32),
-        ]
-    if kind == "fp8":
-        return [
-            ((E, He, 2 * I), FP8),
-            ((E, 1, 1, 2 * I), F32),
-            ((E, I, He), FP8),
-            ((E, 1, 1, He), F32),
-        ]
-    raise ValueError(f"expert kind {kind}")
-
-
-def pool_shape(c: PPConfig, pages: int) -> tuple[int, ...]:
-    return (pages, 2 * c.kv_heads, c.head_dim // 4, 4, c.page)
 
 
 def _bf(x):
@@ -250,14 +53,6 @@ def _rope_lanes(x, cos, sin):
         even, pltpu.roll(x, shift=w - 1, axis=1), pltpu.roll(x, shift=1, axis=1)
     )
     return x * cos + jnp.where(even, -1.0, 1.0) * partner * sin
-
-
-def skipped_phases() -> frozenset[str]:
-    """MUSE_PP_SKIP=a,b: timing ablation only (wrong numerics), those phases do not run."""
-    skip = frozenset(p for p in os.environ.get("MUSE_PP_SKIP", "").split(",") if p)
-    if not skip <= set(PHASES):
-        raise ValueError(f"MUSE_PP_SKIP={sorted(skip)}: phases are {PHASES}")
-    return skip
 
 
 SCRATCH = (
@@ -742,85 +537,3 @@ def stage_calls(c: PPConfig):
         f"muse_prefill_pp_combine_{tag}",
     )
     return attn_in_call, route_call, combine_call
-
-
-def experts(c: PPConfig, xe, ids, tw, ex):
-    """sglang_tpu's fused MoE as served (no combine): [T, top_k, He] bf16 slot outputs."""
-    from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
-
-    w13, s13, w2, s2 = ex
-    return _fused_moe_jax(
-        xe, w13, w2, tw[:, : c.top_k].astype(BF16), ids[:, : c.top_k], s13, s2, None, None,
-        c.top_k, "silu", no_combine=True, use_sc_gather=1,
-    )  # fmt: skip
-
-
-def stage_forward(
-    c: PPConfig,
-    ctl,
-    slots,
-    x,
-    rope,
-    weights,
-    experts_fp4,
-    experts_fp8,
-    pools,
-    kv_lens,
-    page_tables,
-    cu_q,
-    dist,
-    scratch: bool = False,
-):
-    """One stage. Per slot: attn_in, the batched RPA prefill attention (which also writes the
-    chunk's K/V into the slot's pool), route, the fused MoE (the slot's NVFP4 experts, or the
-    stage's fp8 set where the slot table says so), combine. ctl [2] i32 = [cached tokens,
-    active stage or -1]; experts_fp4: per slot (w13, w13_scale, w2, w2_scale); pools: one per
-    slot (global slots' as wide as the page table); page_tables: (global, sliding window).
-    Returns (x, pools), and with scratch each slot's (ids, routing weights)."""
-    from sglang_tpu.attention.pallas.batched_rpa import configs
-    from sglang_tpu.attention.pallas.batched_rpa.wrapper import ragged_paged_attention
-
-    skip = skipped_phases()
-    attn_in_call, route_call, combine_call = stage_calls(c)
-    T, K = c.rows, c.top_k
-    pools, routes = list(pools), []
-    for s in range(c.slots):
-        ctl_s = jnp.concatenate([ctl, jnp.full((1,), s, jnp.int32)])
-        is_g = s in c.global_slots
-        with jax.named_scope(f"slot{s}/attn_in"):
-            q, k, v, g = attn_in_call(ctl_s, slots, x, rope, *weights)
-        with jax.named_scope(f"slot{s}/attention"):
-            if "attention" in skip:
-                o = jnp.zeros((T, c.q_dim), BF16)
-            else:
-                o, pools[s] = ragged_paged_attention(
-                    q.reshape(T, c.q_heads, c.head_dim),
-                    k.astype(FP8).reshape(T, c.kv_heads, c.head_dim),
-                    v.astype(FP8).reshape(T, c.kv_heads, c.head_dim),
-                    pools[s], kv_lens, page_tables[0 if is_g else 1], cu_q, dist,
-                    sm_scale=c.attn_scale, sliding_window=None if is_g else c.window,
-                    k_scale=1.0, v_scale=1.0, kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
-                    out_head_norm_eps=c.rms_eps,
-                )  # fmt: skip
-        with jax.named_scope(f"slot{s}/route"):
-            x, xe, ids, tw = route_call(
-                ctl_s, slots, x, o.reshape(T, c.q_dim), g, *weights
-            )
-        with jax.named_scope(f"slot{s}/experts"):
-            if "experts" in skip:
-                y = jnp.zeros((T, K, c.expert_hidden), BF16)
-            elif s in c.fp8_slots:
-                # both sets, each with the other's slots dropped (id -1 adds nothing): the
-                # served MoE's SparseCore gather cannot sit in a conditional
-                is_fp8 = slots[HDR + s * NF + F_FP8] != 0
-                y = experts(
-                    c, xe, jnp.where(is_fp8, -1, ids), tw, experts_fp4[s]
-                ) + experts(c, xe, jnp.where(is_fp8, ids, -1), tw, experts_fp8)
-            else:
-                y = experts(c, xe, ids, tw, experts_fp4[s])
-        with jax.named_scope(f"slot{s}/combine"):
-            (x,) = combine_call(
-                ctl_s, slots, x, y.reshape(T * K, c.expert_hidden), tw, *weights
-            )
-        routes.append((ids, tw))
-    return (x, pools, routes) if scratch else (x, pools)

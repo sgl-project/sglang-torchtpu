@@ -129,9 +129,9 @@ def build_weights(c: PP.PPConfig, seed: int):
             )
         dense["vecs"].append(vec)
     w = {n: jnp.stack(v) for n, v in dense.items()}
-    # NVFP4 experts per slot (random e2m1 codes, bf16 block scales paired into int32 words)
-    # and the stage's fp8 set (e4m3 bytes, top exponent bit clear; f32 channel scales)
-    # one set per NVFP4 layer; slots without one (the empty and the fp8 slot) share the first
+    # NVFP4 experts (random e2m1 codes, bf16 block scales paired into int32 words), one set per
+    # NVFP4 layer, shared by the slots without one; the fp8 set (e4m3 bytes, top exponent bit
+    # clear; f32 channel scales). Hashes are drawn as u32 and viewed as bytes.
     sets = {}
     first = c.global_slots[0] - GLOBAL.index(True)
     for l, kind in enumerate(KINDS):
@@ -141,9 +141,7 @@ def build_weights(c: PP.PPConfig, seed: int):
         arrs = []
         for j, (shape, dt) in enumerate(PP.expert_shapes(c, "fp4")):
             salt = seed + 100 * s + j
-            if (
-                dt == jnp.uint8
-            ):  # u32 hashes viewed as bytes: a quarter of the temporaries
+            if dt == jnp.uint8:
                 h = _hash((*shape[:-1], shape[-1] // 4), salt)
                 arrs.append(jax.lax.bitcast_convert_type(h, jnp.uint8).reshape(shape))
             else:
@@ -152,7 +150,8 @@ def build_weights(c: PP.PPConfig, seed: int):
                 arrs.append(
                     jax.lax.bitcast_convert_type(sc.astype(jnp.bfloat16), jnp.int32)
                 )
-        w["fp4"].append(tuple(arrs))
+        sets[s] = tuple(arrs)
+    w["fp4"] = [sets.get(s, next(iter(sets.values()))) for s in range(c.slots)]
     arrs = []
     for j, (shape, dt) in enumerate(PP.expert_shapes(c, "fp8")):
         salt = seed + 900 + j
