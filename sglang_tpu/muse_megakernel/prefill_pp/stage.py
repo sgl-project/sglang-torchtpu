@@ -38,7 +38,7 @@ def stage_forward(
     (w13, w13_scale, w2, w2_scale); experts_fp8: the stage's fp8 set; pools: one per slot
     (global slots' as wide as the page table); page_tables: (global, sliding window).
     Returns (x, pools), and with scratch each slot's (ids, routing weights, q, k, v, attention
-    output)."""
+    output, expert input, slot outputs)."""
     skip = skipped_phases()
     attn_in_call, route_call, combine_call = stage_calls(c)
     T, K = c.rows, c.top_k
@@ -82,5 +82,5 @@ def stage_forward(
             (x,) = combine_call(
                 ctl_s, slots, x, y.reshape(T * K, c.expert_hidden), tw, *weights
             )
-        routes.append((ids, tw, q, k, v, o))
+        routes.append((ids, tw, q, k, v, o, xe, y))
     return (x, pools, routes) if scratch else (x, pools)
