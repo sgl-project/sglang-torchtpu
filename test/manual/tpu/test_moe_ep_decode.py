@@ -14,9 +14,9 @@ import numpy as np
 
 from sglang_tpu.muse_megakernel import moe_ep_decode as M
 
-TOL_ROW_REL = (
-    1e-2  # per-row ||diff|| / ||ref||: the kernel's dot is exact in f32 on fp8 codes
-)
+# per-row ||diff|| / ||ref||: block-diagonal arms are exact in f32 on fp8 codes; dense arms
+# round code x scale to bf16 (~4e-3)
+TOL_ROW_REL = 1e-2
 
 
 def main() -> None:
@@ -24,7 +24,8 @@ def main() -> None:
         slots=96, experts=5, hidden=1024, inter=1024, chunk=512, item_rows=16
     )
     rng = np.random.default_rng(0)
-    # 3 slots (the 4-slot arm), none, 40 (three items, 8-slot arms), 9 (8 + 1), 2; padding
+    # 3 slots (4-slot block-diagonal arm), none, 40 (items of 16, 16, 8 rows: dense arms),
+    # 9 (16-row dense arm), 2 (2-slot arm); padding
     counts = [3, 0, 40, 9, 2]
     n_recv = sum(counts)
     local_e = np.concatenate(
@@ -43,8 +44,9 @@ def main() -> None:
     args = [jnp.asarray(a) for a in (x, w13, s13, w2, s2)]
     le = jnp.asarray(local_e)
     items, rows = M.layout(c, le, jnp.int32(n_recv))
-    xk = jnp.zeros((c.rows, c.hidden), jnp.float32).at[rows].set(args[0])
-    y = jax.jit(M.ep_moe_call(c))(items, xk, *args[1:])[rows][:n_recv]
+    xk = jnp.zeros((c.rows, c.hidden), jnp.float32).at[rows].set(M.kernel_x(args[0]))
+    wk = M.kernel_weights(*args[1:])
+    y = jax.jit(M.ep_moe_call(c))(items, xk, *wk)[rows][:n_recv]
     ref = jax.jit(lambda *a: M.reference(c, le, jnp.int32(n_recv), *a))(*args)[:n_recv]
     rel = np.linalg.norm(np.asarray(y) - np.asarray(ref), axis=1) / np.maximum(
         np.linalg.norm(np.asarray(ref), axis=1), 1e-30

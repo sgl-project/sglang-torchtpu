@@ -4,10 +4,12 @@ delivered to it (muse_megakernel/kernel_ep.py's layout).
 Each rank holds E / tp whole NVFP4 experts (intermediate I = 4096). A decode step brings it
 a few slots per expert, so the expert loop is weight-bound: every picked expert's weights
 stream from HBM once, in I-chunks (the gate and up columns of a chunk and the matching down
-rows), while 8-slot tiles of its rows go through the decode megakernel's block-diagonal fp8
-dot (kernel._fp4_blockdiag_dot: e2m1 codes straight to the MXU, no VPU dequant, the scales
-applied after the dot). The bf16 output of a slot is silu(gate) * up @ w2, before routing
-weights and the post-expert norm.
+rows). A work item of at most 4 slots goes through the decode megakernel's block-diagonal
+fp8 dot (kernel._fp4_blockdiag_dot: e2m1 codes straight to the MXU, the scales applied after
+the dot, so VPU work grows with the slots); a busier item dequantizes each weight block to
+bf16 once for all its rows. Weights and x come in kperm order (kernel_weights, kernel_x) so
+a dequantized vreg takes its block scales without a broadcast. The bf16 output of a slot is
+silu(gate) * up @ w2, before routing weights and the post-expert norm.
 """
 
 from __future__ import annotations
@@ -21,11 +23,13 @@ from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.muse_megakernel.kernel import FP4_GROUP, FP4_PACK, _fp4_blockdiag_dot
 
-TILE_ROWS = 8  # slots per block-diagonal dot: [8 * 16, 256] LHS
+TILE_ROWS = 8  # every expert's rows start on an 8-row tile
 BD_KC = 256
 BD_N_TILE = 256  # [128, 256] f32 accumulators: 32 vregs
-ARMS = (1, 2, 4, 8)  # slots per tile's dot, as the megakernel's compact buckets
+BD_ARMS = (1, 2, 4)  # block-diagonal arms: an item of at most 4 slots
+DENSE_ARMS = (8, 16, 32, 64)  # bf16-dequant arms: rows of the item's plain dot
 W2_N_TILE = 512  # down-projection columns per dot below 4 slots ([32, 512] f32 at 2)
+DQ_KC, DQ_TN = 256, 256  # one bf16-dequantized weight block: 32 vregs
 
 
 @dataclasses.dataclass(frozen=True)
@@ -54,7 +58,60 @@ class EPMoEConfig:
 
     def validate(self) -> None:
         assert self.inter % self.chunk == 0 and self.chunk % BD_KC == 0
-        assert self.item_rows % TILE_ROWS == 0 and self.hidden % BD_KC == 0
+        assert self.item_rows in DENSE_ARMS and self.hidden % BD_KC == 0
+
+
+def kperm(n: int) -> jax.Array:
+    """The kernel's order of n indices: in each 256-block, position r * 16 + g holds index
+    g * 16 + r, so a 16-row bf16 vreg of dequantized weights spans 16 scale groups and takes
+    the block's [16, N] scales as they are (an involution)."""
+    p = jnp.arange(n)
+    return p - p % BD_KC + (p % 16) * 16 + (p % BD_KC) // 16
+
+
+def _permute_fp4_rows(words: jax.Array) -> jax.Array:
+    """u32 words [..., K/8, N] (nibble j of word w is row 8w + j) with rows in kperm order."""
+    *lead, kw, n = words.shape
+    shifts = jnp.arange(0, 32, 4, dtype=jnp.uint32)[:, None]
+    codes = ((words[..., :, None, :] >> shifts) & 0xF).reshape(*lead, kw * FP4_PACK, n)
+    codes = codes[..., kperm(kw * FP4_PACK), :].reshape(*lead, kw, FP4_PACK, n)
+    return jnp.sum(codes << shifts, axis=-2, dtype=jnp.uint32)
+
+
+def kernel_weights(
+    w13: jax.Array, s13: jax.Array, w2: jax.Array, s2: jax.Array
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """ep_moe_call's weight layout from the natural one: hidden rows of w13 and intermediate
+    rows of w2 in kperm order, and the gate / up columns in kperm order too, so h comes out
+    in the order w2's rows are in. Block scales keep their group order."""
+    cols = kperm(w13.shape[-1])
+    return _permute_fp4_rows(w13)[..., cols], s13[..., cols], _permute_fp4_rows(w2), s2
+
+
+def kernel_x(x: jax.Array) -> jax.Array:
+    """ep_moe_call's x layout: hidden columns in kperm order."""
+    return x[..., kperm(x.shape[-1])]
+
+
+def _dequant_dot(x, wref, sref, K, N):
+    """x [R, K] bf16 (kperm order) @ an NVFP4 slab dequantized to bf16 per [DQ_KC, DQ_TN]
+    block -> f32 [R, N]; one dequant serves every row (code x scale rounded to bf16)."""
+    cols = []
+    for n0 in range(0, N, DQ_TN):
+        acc = None
+        for k0 in range(0, K, DQ_KC):
+            w = pltpu.bitcast(
+                wref[pl.ds(k0 // FP4_PACK, DQ_KC // FP4_PACK), pl.ds(n0, DQ_TN)],
+                jnp.float4_e2m1fn,
+            ).astype(jnp.bfloat16)
+            s = sref[pl.ds(k0 // FP4_GROUP, DQ_KC // FP4_GROUP), pl.ds(n0, DQ_TN)]
+            w = (w.reshape(FP4_GROUP, DQ_KC // FP4_GROUP, DQ_TN) * s[None]).reshape(
+                DQ_KC, DQ_TN
+            )
+            part = jnp.dot(x[:, k0 : k0 + DQ_KC], w, preferred_element_type=jnp.float32)
+            acc = part if acc is None else acc + part
+        cols.append(acc)
+    return cols[0] if len(cols) == 1 else jnp.concatenate(cols, axis=1)
 
 
 def layout(
@@ -94,8 +151,8 @@ def layout(
 def ep_moe_call(c: EPMoEConfig):
     """fn(items, x, w13, s13, w2, s2) -> y.
 
-    items: layout()'s. x: [rows, hidden] f32, each slot at its layout() row.
-    w13 [E, hidden/8, 2*inter] u32 (8 e2m1 codes per word along K; gate columns then up),
+    items: layout()'s. x: [rows, hidden] f32, each slot at its layout() row, columns as
+    kernel_x(). w13, s13, w2, s2 as kernel_weights() of: w13 [E, hidden/8, 2*inter] u32 (8 e2m1 codes per word along K; gate columns then up),
     s13 [E, hidden/16, 2*inter] bf16, w2 [E, inter/8, hidden] u32, s2 [E, inter/16, hidden]
     bf16. y: [rows, hidden] f32 at the same rows; the others are garbage.
     """
@@ -186,17 +243,31 @@ def ep_moe_call(c: EPMoEConfig):
             for cp in chunk_copies(k, slot):
                 cp.wait()
 
-            def arm(A):
-                """The tile's first A slots: an A-row block-diagonal dot (A * 16 LHS rows)."""
+            def bd_arm(A):
+                """At most 4 slots: an A-row block-diagonal dot (A * 16 LHS rows)."""
 
-                def run(t):
-                    rows = pl.ds(pl.multiple_of(t * TILE_ROWS, TILE_ROWS), A)
+                def run():
+                    rows = pl.ds(0, A)
                     xt = xbuf[rows, :]
                     g = _fp4_blockdiag_dot(
-                        xt, wg.at[slot], sg.at[slot], He, CI, BD_KC, n_tile=BD_N_TILE
+                        xt,
+                        wg.at[slot],
+                        sg.at[slot],
+                        He,
+                        CI,
+                        BD_KC,
+                        n_tile=BD_N_TILE,
+                        kperm=True,
                     )
                     u = _fp4_blockdiag_dot(
-                        xt, wu.at[slot], su.at[slot], He, CI, BD_KC, n_tile=BD_N_TILE
+                        xt,
+                        wu.at[slot],
+                        su.at[slot],
+                        He,
+                        CI,
+                        BD_KC,
+                        n_tile=BD_N_TILE,
+                        kperm=True,
                     )
                     h = (g * jax.nn.sigmoid(g) * u).astype(jnp.bfloat16)
                     if A >= 4:  # _fp4_blockdiag_dot tiles N itself from 4 rows up
@@ -207,6 +278,7 @@ def ep_moe_call(c: EPMoEConfig):
                             CI,
                             He,
                             BD_KC,
+                            kperm=True,
                             n_tile=BD_N_TILE,
                         )
                         return
@@ -219,19 +291,31 @@ def ep_moe_call(c: EPMoEConfig):
                             CI,
                             W2_N_TILE,
                             BD_KC,
+                            kperm=True,
                         )
 
                 return run
 
-            arms = [arm(A) for A in ARMS]
+            def dense_arm(R):
+                """Up to R slots: dequantize each weight block once for all R rows."""
 
-            def tile(t, carry2):
-                left = jnp.minimum(n - t * TILE_ROWS, TILE_ROWS)
-                which = sum((left > A).astype(jnp.int32) for A in ARMS[:-1])
-                jax.lax.switch(which, arms, t)
-                return carry2
+                def run():
+                    xt = xbuf[pl.ds(0, R), :].astype(jnp.bfloat16)
+                    g = _dequant_dot(xt, wg.at[slot], sg.at[slot], He, CI)
+                    u = _dequant_dot(xt, wu.at[slot], su.at[slot], He, CI)
+                    h = (g * jax.nn.sigmoid(g) * u).astype(jnp.bfloat16)
+                    for n0 in range(0, He, DQ_TN):
+                        cols = pl.ds(n0, DQ_TN)
+                        acc[pl.ds(0, R), cols] += _dequant_dot(
+                            h, w2b.at[slot, :, cols], s2b.at[slot, :, cols], CI, DQ_TN
+                        )
 
-            jax.lax.fori_loop(0, ntiles, tile, 0)
+                return run
+
+            dense = tuple(R for R in DENSE_ARMS if R <= RI)
+            arms = [bd_arm(A) for A in BD_ARMS] + [dense_arm(R) for R in dense]
+            bounds = BD_ARMS + dense[:-1]
+            jax.lax.switch(sum((n > b).astype(jnp.int32) for b in bounds), arms)
 
             @pl.when(j == NC - 1)
             def _():
