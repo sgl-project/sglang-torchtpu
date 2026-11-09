@@ -52,6 +52,7 @@ def _dev_skip(phase: str) -> bool:
     """Timing only (wrong results): SGLANG_TPU_EP_DEV_SKIP lists phases every rank skips:
     residual (own rows' FFN residual), capture, allgather, experts (the math; slots move),
     lhs_f32 (the next layer's input as the f32 stream all-gather, as before),
+    wwait (the in-loop waits for the expert weight streams: the math races them),
     wdma (the expert weight streams after the first ring fill: the math reruns those slots),
     pool, unpool (their weight streams), a2a (counts, both all-to-alls: no slot moves).
     Read at trace time: a warm compile process imports this module before a sweep's env."""
@@ -326,7 +327,7 @@ def _expert_loop(step: EPLayerStep, p: EPPlan, n_items) -> None:
             for cp in _chunk_copies(step, p, refs, off, 0, 0, slot):
                 cp.wait()
 
-        if _dev_skip("wdma"):
+        if _dev_skip("wdma") or _dev_skip("wwait"):
             pl.when(k < D)(w)
         else:
             w()
@@ -419,6 +420,13 @@ def _expert_loop(step: EPLayerStep, p: EPPlan, n_items) -> None:
         return carry
 
     jax.lax.fori_loop(0, total, body, 0)
+    if _dev_skip("wwait"):  # the skipped waits, after the loop
+
+        def late(k, carry):
+            wait(k % D, jnp.int32(0))
+            return carry
+
+        jax.lax.fori_loop(D, jnp.maximum(total, D), late, 0)
 
     @pl.when(n_items > 0)
     def _():
