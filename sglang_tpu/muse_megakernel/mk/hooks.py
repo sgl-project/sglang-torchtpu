@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The hooks of the row-tiled program (ep_mk/): build_kernel(cfg, ep=hook) runs hook.o_proj
 in place of the o-proj reduce-scatter / all-gather and the post-attention residual, and
-hook.layer_moe in place of the pool, router, expert-TP loop, unpool and FFN residual."""
+hook.layer_moe in place of the pool, router, expert-TP loop, unpool and FFN residual, and
+hook.pre_attn in place of the next layer's pre-attention norm."""
 
 from collections.abc import Callable
 from typing import Any, NamedTuple, Protocol
@@ -31,6 +32,9 @@ class EPLayerStep(NamedTuple):
         [], None
     ]  # every row's router logits into S["acc"][:, :Ep] (the ring)
     capture: Callable[[Any, jax.Array], None]  # capture(rows, stream) of row_tile rows
+    # the next layer's smalls ref after waiting for them (that layer then does not), or None
+    # on the last layer
+    next_smalls: Callable[[], Any] | None
 
 
 class EPOProjStep(NamedTuple):
@@ -59,5 +63,12 @@ class EPHook(Protocol):
         ...
 
     def layer_moe(self, step: EPLayerStep) -> None:
-        """Leaves every row's post-FFN stream in S["h_stream"] (captured where asked)."""
+        """Leaves this rank's rows' post-FFN stream in S["h_stream"] (every row's on the last
+        layer and where captured) and, before a next layer, every row's pre-attention input
+        for its pre_attn."""
+        ...
+
+    def pre_attn(self, c: MKConfig, S: dict[str, Any]) -> None:
+        """Every row's pre-attention-normed bf16 into S["lhs"], after a layer_moe that had
+        next_smalls (replaces the norm of S["h_stream"])."""
         ...

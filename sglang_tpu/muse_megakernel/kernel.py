@@ -5655,14 +5655,21 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                 smalls_copy(l, slot).start()
                 ws.prologue(l)
             with _scope("smalls_wait"):
-                smalls_copy(l, slot).wait()
+                if (
+                    ep is None or not prefetched
+                ):  # else the EP hook's next_smalls waited
+                    smalls_copy(l, slot).wait()
             smr = S["smalls"].at[slot]
             use_rope, is_global = flags(l)
 
             def row(name, n=H):
                 return smr[SMALL[name] : SMALL[name] + 1, :n]
 
-            if not pend:
+            if (
+                ep is not None and prefetched
+            ):  # every row's normed bf16, gathered by the hook
+                ep.pre_attn(c, S)
+            elif not pend:
                 if c.tiled_vmem_pads:
                     for t in range(R // RT):
                         rs = pl.ds(t * RT, RT)
@@ -5736,6 +5743,17 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
                     _select(l, keys, leaf)
 
+                def next_smalls():
+                    """The next layer's smalls slab, waited for (its layer_tiled does not)."""
+                    nslot = (l + 1) % 2
+                    if not c.smalls_early:
+                        prefetch_smalls(l, nxt)
+                    if isinstance(l, int):
+                        smalls_copy(l + 1, nslot).wait()
+                    else:
+                        pl.when(l + 1 < L)(smalls_copy(l + 1, nslot).wait)
+                    return S["smalls"].at[nslot]
+
                 with _scope("moe"):
                     ep.layer_moe(
                         EPLayerStep(
@@ -5753,6 +5771,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             n_live=n_live,
                             router=lambda: mv_tiled(l, "wrouter", nxt, smr),
                             capture=lambda rows, s: capture_tile(l, rows, s),
+                            next_smalls=None if nxt is None else next_smalls,
                         )
                     )
             else:
