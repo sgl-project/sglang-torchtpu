@@ -21,11 +21,11 @@ TOL_ROW_REL = (
 
 def main() -> None:
     c = M.EPMoEConfig(
-        slots=96, experts=4, hidden=1024, inter=1024, chunk=512, item_rows=16
+        slots=96, experts=5, hidden=1024, inter=1024, chunk=512, item_rows=16
     )
     rng = np.random.default_rng(0)
-    # expert 0: 3 slots, 1: none, 2: 40 (three items), 3: 9; then padding
-    counts = [3, 0, 40, 9]
+    # 3 slots (the 4-slot arm), none, 40 (three items, 8-slot arms), 9 (8 + 1), 2; padding
+    counts = [3, 0, 40, 9, 2]
     n_recv = sum(counts)
     local_e = np.concatenate(
         [np.full(n, e) for e, n in enumerate(counts)] + [np.zeros(c.slots - n_recv)]

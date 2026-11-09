@@ -24,6 +24,8 @@ from sglang_tpu.muse_megakernel.kernel import FP4_GROUP, FP4_PACK, _fp4_blockdia
 TILE_ROWS = 8  # slots per block-diagonal dot: [8 * 16, 256] LHS
 BD_KC = 256
 BD_N_TILE = 256  # [128, 256] f32 accumulators: 32 vregs
+ARMS = (1, 2, 4, 8)  # slots per tile's dot, as the megakernel's compact buckets
+W2_N_TILE = 512  # down-projection columns per dot below 4 slots ([32, 512] f32 at 2)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -184,19 +186,49 @@ def ep_moe_call(c: EPMoEConfig):
             for cp in chunk_copies(k, slot):
                 cp.wait()
 
+            def arm(A):
+                """The tile's first A slots: an A-row block-diagonal dot (A * 16 LHS rows)."""
+
+                def run(t):
+                    rows = pl.ds(pl.multiple_of(t * TILE_ROWS, TILE_ROWS), A)
+                    xt = xbuf[rows, :]
+                    g = _fp4_blockdiag_dot(
+                        xt, wg.at[slot], sg.at[slot], He, CI, BD_KC, n_tile=BD_N_TILE
+                    )
+                    u = _fp4_blockdiag_dot(
+                        xt, wu.at[slot], su.at[slot], He, CI, BD_KC, n_tile=BD_N_TILE
+                    )
+                    h = (g * jax.nn.sigmoid(g) * u).astype(jnp.bfloat16)
+                    if A >= 4:  # _fp4_blockdiag_dot tiles N itself from 4 rows up
+                        acc[rows, :] += _fp4_blockdiag_dot(
+                            h,
+                            w2b.at[slot],
+                            s2b.at[slot],
+                            CI,
+                            He,
+                            BD_KC,
+                            n_tile=BD_N_TILE,
+                        )
+                        return
+                    for n0 in range(0, He, W2_N_TILE):
+                        cols = pl.ds(n0, W2_N_TILE)
+                        acc[rows, cols] += _fp4_blockdiag_dot(
+                            h,
+                            w2b.at[slot, :, cols],
+                            s2b.at[slot, :, cols],
+                            CI,
+                            W2_N_TILE,
+                            BD_KC,
+                        )
+
+                return run
+
+            arms = [arm(A) for A in ARMS]
+
             def tile(t, carry2):
-                rows = pl.ds(pl.multiple_of(t * TILE_ROWS, TILE_ROWS), TILE_ROWS)
-                xt = xbuf[rows, :]
-                g = _fp4_blockdiag_dot(
-                    xt, wg.at[slot], sg.at[slot], He, CI, BD_KC, n_tile=BD_N_TILE
-                )
-                u = _fp4_blockdiag_dot(
-                    xt, wu.at[slot], su.at[slot], He, CI, BD_KC, n_tile=BD_N_TILE
-                )
-                h = (g * jax.nn.sigmoid(g) * u).astype(jnp.bfloat16)
-                acc[rows, :] += _fp4_blockdiag_dot(
-                    h, w2b.at[slot], s2b.at[slot], CI, He, BD_KC, n_tile=BD_N_TILE
-                )
+                left = jnp.minimum(n - t * TILE_ROWS, TILE_ROWS)
+                which = sum((left > A).astype(jnp.int32) for A in ARMS[:-1])
+                jax.lax.switch(which, arms, t)
                 return carry2
 
             jax.lax.fori_loop(0, ntiles, tile, 0)
