@@ -64,9 +64,20 @@ def _pool_bytes(pool) -> int:
 def _draft_bytes(target, draft) -> int:
     if isinstance(draft, BaseSWAKVPool):
         # Match sidecar construction: only SWA drafts follow target SWA slots.
-        target, draft = target.swa_kv_pool, draft.swa_kv_pool
+        if getattr(target, "swa_kv_pool", None) is not None:
+            return (
+                _pool_bytes(draft.swa_kv_pool)
+                * target.swa_kv_pool.size
+                // draft.swa_kv_pool.size
+            )
+        return _pool_bytes(draft.swa_kv_pool)
+    target_full = (
+        target.full_kv_pool
+        if getattr(target, "full_kv_pool", None) is not None
+        else target
+    )
     # A sidecar has one host slot per target slot, however few slots the draft has.
-    return _pool_bytes(draft) * target.size // draft.size
+    return _pool_bytes(draft) * target_full.size // draft.size
 
 
 def _estimate_hicache_bytes(

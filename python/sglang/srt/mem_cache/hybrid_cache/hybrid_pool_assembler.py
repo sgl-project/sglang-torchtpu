@@ -1586,7 +1586,10 @@ def build_swa_draft_pools(
         return [], []
     controller = tree_cache.cache_controller
     host_pool_group = controller.mem_pool_host
-    target_swa_host_pool = host_pool_group.entry_map[PoolName.SWA].host_pool
+    swa_entry = host_pool_group.entry_map.get(PoolName.SWA)
+    if swa_entry is None:
+        return [], []
+    target_swa_host_pool = swa_entry.host_pool
 
     if isinstance(target_swa_host_pool, DeepSeekV4PagedHostPool):
         _require_single_row_dsv4_swa_pages(

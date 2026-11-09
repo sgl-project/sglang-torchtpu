@@ -418,9 +418,8 @@ def _unsupported_reason(kvc) -> Optional[str]:
         ),
         (dflash_reason is not None, dflash_reason or ""),
         (
-            not spec_algo.is_none()
-            and (memory.enable_hierarchical_cache or disagg_mode != "null"),
-            "does not yet support speculative draft KV caches with HiCache or PD disaggregation.",
+            not spec_algo.is_none() and disagg_mode != "null",
+            "does not yet support speculative draft KV caches with PD disaggregation.",
         ),
         (
             draft_mc is not None
@@ -674,6 +673,8 @@ class TpuUnifiedSWAKVPool(BaseSWAKVPool):
             self._swa_layer_group[gid] = j // G
 
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
+        self._attached_draft_pools: List[KVCache] = []
+        self._draft_swa_sidecar: Optional[_DraftSwaSidecar] = None
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
         logger.info(
@@ -892,6 +893,14 @@ class _DraftSwaSidecar:
         valid = draft_pages[draft_pages > 0]
         if valid.numel() > 0:
             self.allocator._release_page_ids(valid)
+
+    def translate_pages(self, target_swa_pages: torch.Tensor) -> torch.Tensor:
+        pages = target_swa_pages.to(device="cpu", dtype=torch.int64)
+        return torch.where(
+            pages > 0,
+            self.target_to_draft_page[pages.clamp(min=0)],
+            torch.zeros_like(pages),
+        )
 
     def translate_slots(self, target_swa_slots: torch.Tensor) -> torch.Tensor:
         slots = target_swa_slots.to(device="cpu", dtype=torch.int64)
@@ -1299,6 +1308,11 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         return full_tokens, full_tokens, swa_tokens
 
     def attach_draft_kv_pool(self, draft_kvc, draft_pool) -> None:
+        if (
+            draft_pool is not None
+            and draft_pool not in self._kvcache._attached_draft_pools
+        ):
+            self._kvcache._attached_draft_pools.append(draft_pool)
         if not getattr(draft_kvc, "is_hybrid_swa", False):
             return
         self._validate_draft_swa_window(draft_kvc)
@@ -1321,6 +1335,7 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 kvcache=getattr(draft_pool, "swa_kv_pool", None),
                 need_sort=self.need_sort,
             )
+            self._kvcache._draft_swa_sidecar = self._draft_swa_sidecar
             self.swa_attn_allocator._sidecar = self._draft_swa_sidecar
             if self.kv_free_fence is not None:
                 self.kv_free_fence.attach(self._draft_swa_sidecar.allocator)
