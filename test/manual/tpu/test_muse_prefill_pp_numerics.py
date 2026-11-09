@@ -308,15 +308,10 @@ def ref_layer(c, w, l, x, pool, table, rope, kernel_ids, slot):
         (jnp.arange(c.n_experts)[None, None, :] == kernel_ids[:, :, None]).any(1), -jnp.inf,
         biased).max(1)  # fmt: skip
     gap = float(jnp.where(same, -jnp.inf, unpicked - picked).max())
-    x, xe, ids, tw, k8, v8, _ = attn(c, w, l, x, pool, table, rope, kernel_ids)
+    x, xe, ids, tw, k8, v8, _, inner = attn(c, w, l, x, pool, table, rope, kernel_ids)
     yn = expert_outputs(c, w, l, xe, ids, slot)
-    return (
-        jax.jit(ref_post, static_argnums=(0, 2))(c, w, l, x, yn, tw),
-        k8,
-        v8,
-        ~same,
-        gap,
-    )
+    x = jax.jit(ref_post, static_argnums=(0, 2))(c, w, l, x, yn, tw)
+    return x, k8, v8, ~same, gap, inner
 
 
 def expert_outputs(c, w, l, xe, ids, slot, cap=96):
