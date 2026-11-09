@@ -93,6 +93,15 @@ CASES = {
             expert_group=2,
             opt_in=True,
         ),
+        # 64 rows: the AgentX c22 host's 16 requests x 4-token verify
+        Case(
+            "salfp8_c16q4_s",
+            "sal_fp8",
+            16,
+            4,
+            tuple(900 + 97 * i for i in range(16)),
+            opt_in=True,
+        ),
         # 128, 192 and 224 rows: the P/D decode host's row-tiled plans (VMEM-Y, its y_block_send
         # alternative, streamed-Y); pick one with SGLANG_TPU_MUSE_MK_DEV_* knobs
         Case(
