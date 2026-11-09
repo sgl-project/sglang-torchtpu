@@ -30,7 +30,7 @@ import sys
 import threading
 from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -54,6 +54,7 @@ from sglang.srt.mem_cache.pool_host.base import (
     sync_fixed_hicache_size,
 )
 from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import next_power_of_2
@@ -379,6 +380,8 @@ class TpuDMAHostKVPool(HostKVCache):
     # The hybrid HostPoolGroup reads this directly off every entry; the JIT
     # write-back path is a CUDA kernel feature.
     can_use_write_back_jit = False
+    _device_page_translator: Optional[Callable[[List[int]], List[int]]] = None
+    _host_page_translator: Optional[Callable[[List[int]], List[int]]] = None
 
     def __init__(
         self,
@@ -441,10 +444,12 @@ class TpuDMAHostKVPool(HostKVCache):
                 int(host_size * 1e9 // self.size_per_token), host_size
             )
         else:
-            self.size = int(device_pool.size * host_to_device_ratio)
+            self.size = int(round(device_pool.size * host_to_device_ratio))
         # Align the pool up to a whole number of pages.
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
+        self._device_page_translator: Optional[Callable[[List[int]], List[int]]] = None
+        self._host_page_translator: Optional[Callable[[List[int]], List[int]]] = None
 
         if self.size <= device_pool.size:
             logger.warning(
@@ -558,16 +563,28 @@ class TpuDMAHostKVPool(HostKVCache):
         self, device_pool, host_indices, device_indices, io_backend
     ) -> TransferEvent:
         """D2H for all layers in one engine call; returns its future-event."""
+        if host_indices.numel() == 0 or device_indices.numel() == 0:
+            return NOOP_EVENT
         device_pages = self._to_page_ids(device_indices)
         host_pages = self._to_page_ids(host_indices)
+        if self._device_page_translator is not None:
+            device_pages = self._device_page_translator(device_pages)
+        if self._host_page_translator is not None:
+            host_pages = self._host_page_translator(host_pages)
         return self.transfer.backup(device_pages, host_pages)
 
     def load_all_layer(
         self, device_pool, host_indices, device_indices
     ) -> TransferEvent:
         """H2D for all layers in one engine call; returns its future-event."""
+        if host_indices.numel() == 0 or device_indices.numel() == 0:
+            return NOOP_EVENT
         host_pages = self._to_page_ids(host_indices)
         device_pages = self._to_page_ids(device_indices)
+        if self._host_page_translator is not None:
+            host_pages = self._host_page_translator(host_pages)
+        if self._device_page_translator is not None:
+            device_pages = self._device_page_translator(device_pages)
         return self.transfer.load(host_pages, device_pages)
 
     def load_to_device_per_layer(
@@ -666,6 +683,24 @@ class _UnifiedHostSide:
     live_pages: set[int] = field(default_factory=set)
 
 
+def _attached_draft_bytes_per_token(
+    unified_pool: TpuUnifiedSWAKVPool, page_size: int, num_swa_groups: int
+) -> int:
+    total = 0
+    for draft in getattr(unified_pool, "_attached_draft_pools", ())[:1]:
+        if isinstance(draft, SWAKVPool):
+            if getattr(draft.swa_kv_pool, "layer_num", 0) > 0:
+                swa_page_bytes = sum(
+                    int(t[0].nbytes) for t in page_major_tensors(draft.swa_kv_pool)
+                )
+                denom = page_size * num_swa_groups
+                total += (swa_page_bytes + denom - 1) // denom
+        elif getattr(draft, "layer_num", 0) > 0:
+            full_page_bytes = sum(int(t[0].nbytes) for t in page_major_tensors(draft))
+            total += full_page_bytes // page_size
+    return total
+
+
 class _SharedUnifiedDMAHostState:
     """Shared host page arena and single DMA engine for ``TpuUnifiedSWAKVPool``."""
 
@@ -691,8 +726,11 @@ class _SharedUnifiedDMAHostState:
         self.full_size_per_token = self.bytes_per_page // page_size
 
         if host_size > 0:
+            effective_bpt = self.full_size_per_token + _attached_draft_bytes_per_token(
+                unified_pool, page_size, self.num_swa_groups
+            )
             tokens = sync_fixed_hicache_size(
-                int(host_size * 1e9 // self.full_size_per_token), host_size
+                int(host_size * 1e9 // effective_bpt), host_size
             )
         else:
             tokens = int(unified_pool.size * host_to_device_ratio)
@@ -735,6 +773,10 @@ class _SharedUnifiedDMAHostState:
         self.transfer = create_tpu_dma_kv_transfer(io_backend, backing, self.page_num)
         self.lock = threading.RLock()
         self.free_pages: deque[int] = deque(range(self.page_num))
+        self._compact_swa_free: deque[int] = deque(
+            range(self.page_num // self.num_swa_groups)
+        )
+        self._host_to_compact_swa: dict[int, int] = {}
         self.swa_group_pages = torch.zeros(
             (max(0, self.num_swa_groups - 1), self.page_num), dtype=torch.int32
         )
@@ -829,10 +871,18 @@ class _SharedUnifiedDMAHostState:
                         .T
                     )
                     self.swa_group_pages[:, primaries] = comp_tensor
+                    for pid in primaries:
+                        self._host_to_compact_swa[pid] = (
+                            self._compact_swa_free.popleft()
+                        )
                 side.live_pages.update(primaries)
                 page_ids = torch.tensor(primaries, dtype=torch.int64)
                 out.append((page_ids[:, None] * self.page_size + offsets).reshape(-1))
             return out
+
+    def translate_swa_host_pages(self, page_ids: List[int]) -> List[int]:
+        with self.lock:
+            return [self._host_to_compact_swa[pid] for pid in page_ids]
 
     def alloc(self, label: str, need_size: int) -> Optional[torch.Tensor]:
         res = self.alloc_many(((label, need_size),))
@@ -850,6 +900,9 @@ class _SharedUnifiedDMAHostState:
                 if side.pages_per_logical > 1:
                     self.free_pages.extend(self.swa_group_pages[:, pid].tolist())
                     self.swa_group_pages[:, pid] = 0
+                    cid = self._host_to_compact_swa.pop(pid, None)
+                    if cid is not None:
+                        self._compact_swa_free.append(cid)
         return len(indices)
 
     def clear(self, label: str) -> None:
@@ -860,9 +913,16 @@ class _SharedUnifiedDMAHostState:
                 if side.pages_per_logical > 1:
                     self.free_pages.extend(self.swa_group_pages[:, pid].tolist())
                     self.swa_group_pages[:, pid] = 0
+                    cid = self._host_to_compact_swa.pop(pid, None)
+                    if cid is not None:
+                        self._compact_swa_free.append(cid)
             side.live_pages.clear()
             if all(not s.live_pages for s in self.sides.values()):
                 self.free_pages = deque(range(self.page_num))
+                self._host_to_compact_swa.clear()
+                self._compact_swa_free = deque(
+                    range(self.page_num // self.num_swa_groups)
+                )
 
 
 class TpuDMAUnifiedHostKVPool(TpuDMAHostKVPool):
@@ -952,6 +1012,21 @@ class TpuDMAUnifiedHostKVPool(TpuDMAHostKVPool):
             self._released = True
             self._state.release()
         super().destroy()
+
+    def bind_draft_swa_sidecar(self, draft_swa_host_pool: TpuDMAHostKVPool) -> None:
+        if not self._is_swa:
+            return
+        if self._pages_per_logical > 1:
+            draft_swa_host_pool._host_page_translator = (
+                self._state.translate_swa_host_pages
+            )
+        sidecar = getattr(self._unified_pool, "_draft_swa_sidecar", None)
+        if sidecar is not None:
+            draft_swa_host_pool._device_page_translator = lambda pages: (
+                sidecar.translate_pages(
+                    torch.as_tensor(pages, dtype=torch.int64)
+                ).tolist()
+            )
 
     def _expand_pages(
         self, token_indices: torch.Tensor, group_pages: Optional[torch.Tensor]
