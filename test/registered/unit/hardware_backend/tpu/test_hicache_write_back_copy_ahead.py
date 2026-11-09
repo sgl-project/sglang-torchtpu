@@ -618,6 +618,32 @@ class TestWriteBackCopyAhead(CustomTestCase):
         _node(cache, parent).component_data[SWA].host_value = torch.arange(8)
         self.assertNotIn(parent, copied_for_swa())
 
+    def test_swa_order_skips_a_window_demoted_as_stale(self):
+        """A window demoted as stale is tombstoned without a host copy, so copying it
+        ahead would only pin host SWA nothing reads; once a refresh moves it in the
+        SWA LRU it is a live window and is copied again."""
+        cache, allocator = _build_swa_cache(sliding_window_size=4)
+        _attach_write_back(cache, host_capacity=64, copy_ahead_tokens=16)
+        parent = _insert(cache, allocator, [1] * 8)
+        _insert(cache, allocator, [1] * 8 + [2] * 8)
+        cache.tree_core.has_swa_host_pool = True
+        copy_ahead = cache._write_back_copy_ahead
+
+        def copied_for_swa():
+            with (
+                patch.object(copy_ahead, "_cover_full"),
+                patch.object(copy_ahead, "_keep_copied") as keep,
+                patch.object(copy_ahead_module, "_SWA_WINDOW_DIVISOR", 1),
+            ):
+                copy_ahead.refill()
+            return {call.args[0].id for call in keep.call_args_list}
+
+        lru = cache.tree_core.lru_lists[SWA]
+        lru.reset_node_lru(_node(cache, parent), skip_host_backup=True)
+        self.assertNotIn(parent, copied_for_swa())
+        lru.reset_node_mru(_node(cache, parent))
+        self.assertIn(parent, copied_for_swa())
+
     def test_swa_order_copy_keeps_its_pin_after_it_lands(self):
         """Once the SWA order's copy of an internal node lands, the node is
         backed up but still inside the window; dropping its pin would let host

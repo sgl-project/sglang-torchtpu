@@ -231,6 +231,8 @@ class UnifiedLRUList:
         self.head.lru_next[self._pt] = self.tail
         self.tail.lru_prev[self._pt] = self.head
         self.cache: dict[int, UnifiedTreeNode] = {}
+        # Ids reset_node_lru moved with skip_host_backup; any other move clears them.
+        self._skip_host_backup: set[int] = set()
         # Session partition: [head .. mid) holds session-referenced nodes and
         # (mid .. tail] unreferenced ones, so evictions directly walks (tail -> head).
         self._is_referenced = is_referenced
@@ -259,6 +261,7 @@ class UnifiedLRUList:
             self._add_node_after(self.mid, node)
 
     def _remove_node(self, node: UnifiedTreeNode):
+        self._skip_host_backup.discard(node.id)
         pt = self._pt
         node.lru_prev[pt].lru_next[pt] = node.lru_next[pt]
         node.lru_next[pt].lru_prev[pt] = node.lru_prev[pt]
@@ -287,13 +290,23 @@ class UnifiedLRUList:
         self._remove_node(node)
         self._add_node(node)
 
-    def reset_node_lru(self, node: UnifiedTreeNode) -> None:
-        """Make ``node`` the next eviction victim; session-referenced nodes stay put."""
+    def reset_node_lru(
+        self, node: UnifiedTreeNode, *, skip_host_backup: bool = False
+    ) -> None:
+        """Make ``node`` the next eviction victim; session-referenced nodes stay put.
+        With ``skip_host_backup``, ``skips_host_backup`` reports the node until a move
+        other than this one; a demotion without it keeps an earlier mark."""
         assert node.id in self.cache
         if self._is_referenced is not None and self._is_referenced(node):
             return
+        skip_host_backup = skip_host_backup or node.id in self._skip_host_backup
         self._remove_node(node)
         self._add_node_after(self.tail.lru_prev[self._pt], node)
+        if skip_host_backup:
+            self._skip_host_backup.add(node.id)
+
+    def skips_host_backup(self, node: UnifiedTreeNode) -> bool:
+        return node.id in self._skip_host_backup
 
     def cursor_begin(self):
         if self.cursor.lru_prev[self._pt] is not None:

@@ -257,6 +257,7 @@ class WriteBackCopyAhead:
         # Mirrors SWAComponent._evict_device_next_node. Copied or pinned nodes
         # count Full tokens; the rest, and candidates too large to fit, count SWA.
         ct = ComponentType.SWA
+        swa = self._cache.components[ct]
         lru = core.lru_lists[ct]
         covered = 0
         node = lru.get_lru_no_lock()
@@ -264,10 +265,15 @@ class WriteBackCopyAhead:
             cd = node.component_data[ct]
             full_value = node.component_data[BASE_COMPONENT_TYPE].value
             if cd.value is not None and full_value is not None:
+                # The eviction backs up an internal node only for a window it would copy.
                 candidate = (
                     node in core.evictable_device_leaves
                     or node.id in self._host_locks
-                    or (cd.host_value is None and not node.backuped)
+                    or (
+                        cd.host_value is None
+                        and not node.backuped
+                        and swa.needs_incremental_backup(node)
+                    )
                 )
                 if candidate and covered + len(full_value) <= budget:
                     covered += len(full_value)
