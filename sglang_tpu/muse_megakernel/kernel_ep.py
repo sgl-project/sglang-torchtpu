@@ -265,20 +265,26 @@ def _experts(
     xs = x[order].astype(jnp.float32)
     il = c.inter_local
     hi = jax.lax.Precision.HIGHEST
-    y = jnp.zeros((m, c.expert_hidden), jnp.float32)
-    for d in range(c.tp):  # the reference's per-slice rounding
-        w13 = dequant(w[0][:, d], w[1][:, d], kind)
-        w2 = dequant(w[2][:, d], w[3][:, d], kind)
+
+    def one_slice(d: jax.Array, y: jax.Array) -> jax.Array:
+        """Adds slice d's bf16 output, as the reference sums slices. A loop, not unrolled:
+        each slice dequantizes in turn, so XLA cannot hoist every slice's weights at once."""
+        ws = [jax.lax.dynamic_index_in_dim(t, d, axis=1, keepdims=False) for t in w]
+        w13, w2 = dequant(ws[0], ws[1], kind), dequant(ws[2], ws[3], kind)
         gu = jax.lax.ragged_dot(
             xs, w13, sizes, precision=hi, preferred_element_type=jnp.float32
         )
         gate, up = gu[:, :il], gu[:, il:]
         h = _bf(gate * jax.nn.sigmoid(gate) * up)
-        y = y + _bf(
+        return y + _bf(
             jax.lax.ragged_dot(
                 h, w2, sizes, precision=hi, preferred_element_type=jnp.float32
             )
         )
+
+    y = jax.lax.fori_loop(
+        0, c.tp, one_slice, jnp.zeros((m, c.expert_hidden), jnp.float32)
+    )
     return (
         jnp.zeros_like(y).at[order].set(y).astype(jnp.bfloat16)
     )  # back to arrival order
