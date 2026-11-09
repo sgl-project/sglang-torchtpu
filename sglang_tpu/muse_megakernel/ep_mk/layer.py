@@ -29,6 +29,8 @@ from sglang_tpu.muse_megakernel.ep_mk.experts import (
     ChunkRefs,
     chunk_compute,
     item_sizes,
+    qblock,
+    scale_group,
     sized,
 )
 from sglang_tpu.muse_megakernel.mk.config import MKConfig
@@ -230,9 +232,10 @@ def _chunk_copies(step: EPLayerStep, p: EPPlan, refs, off, e, j, slot) -> list:
     c0 = pl.multiple_of(j * 2 * CI, 2 * CI)
     k2 = pl.multiple_of(j * (CI // pack), CI // pack)
     if kind == "fp4":
-        srows = He // FP4_GROUP
-        s2_src = s2.at[e, pl.ds(j * (CI // FP4_GROUP), CI // FP4_GROUP)]
-        s2_dst = S["w2s"].at[slot, pl.ds(0, CI // FP4_GROUP)]
+        g = scale_group(kind)
+        srows = He // g
+        s2_src = s2.at[e, pl.ds(j * (CI // g), CI // g)]
+        s2_dst = S["w2s"].at[slot, pl.ds(0, CI // g)]
     else:
         srows, s2_src = 2, s2.at[e]
         s2_dst = S["w2s"].at[slot, pl.ds(0, 2)]
@@ -277,7 +280,12 @@ def _chunk_refs(step: EPLayerStep, p: EPPlan, slot) -> ChunkRefs:
         s2 = S["w2s"].at[slot]
     else:
         sg, su = S13.at[slot, :, pl.ds(0, CI)], S13.at[slot, :, pl.ds(CI, CI)]
-        s2 = S["w2s"].at[slot, pl.ds(0, CI // FP4_GROUP)]
+        # the q arms read their rows of the whole slab (a short row slice won't lay out)
+        s2 = (
+            S["w2s"].at[slot]
+            if qblock()
+            else S["w2s"].at[slot, pl.ds(0, CI // FP4_GROUP)]
+        )
     return ChunkRefs(
         wg=W13.at[slot, :, pl.ds(0, CI)],
         wu=W13.at[slot, :, pl.ds(CI, CI)],

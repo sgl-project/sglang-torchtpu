@@ -10,7 +10,7 @@ import msgspec
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.muse_megakernel.ep_mk.experts import BD_KC, item_sizes
+from sglang_tpu.muse_megakernel.ep_mk.experts import BD_KC, item_sizes, scale_group
 from sglang_tpu.muse_megakernel.mk.config import MKConfig
 from sglang_tpu.muse_megakernel.mk.consts import LANE
 from sglang_tpu.muse_megakernel.mk.plan import fit_ring_slots
@@ -107,11 +107,12 @@ def ep_expert_shapes(
     experts: the TP slab layout with E / tp experts of the whole intermediate."""
     el, he, i = c.n_experts // c.tp, c.expert_hidden, c.inter_local * c.tp
     if kind == "fp4":
+        g = scale_group(kind)
         return (
             ((el, he // 8, 2 * i), jnp.int32),
-            ((el, he // 16, 2 * i), jnp.bfloat16),
+            ((el, he // g, 2 * i), jnp.bfloat16),
             ((el, i // 8, he), jnp.int32),
-            ((el, i // 16, he), jnp.bfloat16),
+            ((el, i // g, he), jnp.bfloat16),
         )
     return (
         ((el, he // 4, 2 * i), jnp.int32),

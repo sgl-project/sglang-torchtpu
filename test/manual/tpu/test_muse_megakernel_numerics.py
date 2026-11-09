@@ -318,7 +318,7 @@ def _requant_kperm(
     words: torch.Tensor, scale: torch.Tensor, perm: torch.Tensor, block: int
 ) -> tuple:
     """ep_mk.experts.requant_fp4_kperm on natural int32 words [K/8, N]: (words in perm order,
-    scale rows [K/16, N], the requantized weights as f32 in natural order)."""
+    scales [K / block, N], the requantized weights as f32 in natural order)."""
     k, n = words.shape[0] * 8, words.shape[1]
     w = _dequant_fp4(words, scale)[perm].reshape(k // block, block, n)
     sb = (w.abs().amax(dim=1) / 6.0).to(torch.bfloat16)
@@ -334,7 +334,7 @@ def _requant_kperm(
     out = torch.zeros(k // 8, n, dtype=torch.int32)
     for j in range(8):
         out |= codes[:, j] << (4 * j)
-    return out, sb.repeat_interleave(block // 16, dim=0), deq[perm]
+    return out, sb, deq[perm]
 
 
 def ref_expert(l: int, rank: int, e: int, kind: str) -> tuple:

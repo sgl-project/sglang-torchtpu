@@ -118,7 +118,8 @@ def dequant_dot(x, wref, sref, K, N):
 
 def qblock() -> int:
     """SGLANG_TPU_EP_QBLOCK in QB_SIZES: fp4 experts requantized to one scale per that many K
-    rows of the kernel's (kperm) order; each MXU pass takes raw codes and its blocks' scales."""
+    rows of the kernel's (kperm) order, scale slabs [K / block, N]; each dot takes raw codes
+    and one scale row."""
     b = int(os.environ.get("SGLANG_TPU_EP_QBLOCK", "0"))
     if b not in (0, *QB_SIZES):
         raise ValueError(f"SGLANG_TPU_EP_QBLOCK={b}: 0 or one of {QB_SIZES}")
@@ -130,8 +131,7 @@ def requant_fp4_kperm(
 ) -> tuple[jax.Array, jax.Array]:
     """Natural NVFP4 u32 words [..., K/8, N] + block-16 scales [..., K/16, N] -> words with rows
     in kperm order, requantized to one scale per block rows of that order (amax / 6, bf16,
-    e2m1 codes re-rounded), and scale rows [..., K/16, N] (row i: the scale of kernel rows
-    [16 i, 16 i + 16)). Lossy."""
+    e2m1 codes re-rounded), and the scales [..., K / block, N]. Lossy."""
     *lead, kw, n = words.shape
     k = kw * FP4_PACK
     shifts = jnp.arange(0, 32, 4, dtype=jnp.uint32)[:, None]
@@ -153,7 +153,13 @@ def requant_fp4_kperm(
         *lead, kw, FP4_PACK, n
     )
     out = jnp.sum(qc << shifts, axis=-2, dtype=jnp.uint32)
-    return out, jnp.repeat(sb, block // FP4_GROUP, axis=-2)
+    return out, sb
+
+
+def scale_group(kind: str) -> int:
+    """K rows per scale row of a chunk's fp4 scale slabs."""
+    assert kind == "fp4", kind
+    return qblock() or FP4_GROUP
 
 
 def qblock_dot(x, wref, sref, K, N, block):
@@ -169,7 +175,7 @@ def qblock_dot(x, wref, sref, K, N, block):
                 jnp.float4_e2m1fn,
             ).astype(jnp.float8_e4m3fn)
             part = jnp.dot(x[:, k0 : k0 + block], w, preferred_element_type=jnp.float32)
-            s = sref[pl.ds(k0 // FP4_GROUP, 1), pl.ds(n0, tn)].astype(jnp.float32)
+            s = sref[pl.ds(k0 // block, 1), pl.ds(n0, tn)].astype(jnp.float32)
             acc = part * s if acc is None else acc + part * s
         cols.append(acc)
     return cols[0] if len(cols) == 1 else jnp.concatenate(cols, axis=1)
