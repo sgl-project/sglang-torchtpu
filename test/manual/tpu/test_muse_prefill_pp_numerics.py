@@ -23,6 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from sglang_tpu.muse_megakernel import prefill_pp as PP
+from sglang_tpu.muse_megakernel.prefill_pp import moe as PP_MOE
 
 # the batched RPA prefill attention as the P/D prefill serves it (read when the stage is traced);
 # MUSE_PP_TEST_RPA_TRANSPOSED=0 runs the standard tile (bf16 queries) as a control
@@ -506,6 +507,13 @@ def main() -> int:
                 jnp.abs(yn_r).sum(-1, keepdims=True) > 0
             )  # the picked (token, slot) rows
             y_rel = rel_of(jnp.where(live, yn_k, 0), yn_r)
+            ids_k, tw_k = kernel[0], kernel[1]
+            ex = w["fp8"] if KINDS[l] == "fp8" else w["fp4"][first + l]
+            y_served = jax.jit(lambda *a: PP_MOE.experts(c, *a))(xe_k, ids_k, tw_k, ex)
+            print(
+                f"  layer {l}: stage slot outputs vs _fused_moe_jax on the same inputs: rel "
+                f"{rel_of(kernel[7], y_served):.2e}"
+            )
             kk, vv = pool_tokens(kpool, table, CTX + T)
             kv_rel = float(
                 jnp.linalg.norm(jnp.concatenate([kk[CTX:] - k8, vv[CTX:] - v8]))
