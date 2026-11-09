@@ -105,11 +105,14 @@ class EPExperts:
                 a2a.dispatch(c, S, me)
         with _phase("items"):
             n_items = route.build_items(c, p, S)
-        with _phase("dispatch_wait"):
-            if moving:
-                a2a.wait_dispatch(c, S, me)
+
+        def dispatched():
+            with _phase("dispatch_wait"):
+                if moving:
+                    a2a.wait_dispatch(c, S, me)
+
         with _phase("experts"):
-            _expert_loop(step, p, n_items)
+            _expert_loop(step, p, n_items, dispatched)
         with _phase("combine_a2a"):
             if moving:
                 a2a.wait_give_back(c, S, me)
@@ -295,8 +298,9 @@ def _item_rows(S: dict, buf, b, first, n, start: bool) -> None:
     jax.lax.fori_loop(0, n, one, 0)
 
 
-def _expert_loop(step: EPLayerStep, p: EPPlan, n_items) -> None:
-    """Every received slot's expert output back to its source's ep_yb row, item by item."""
+def _expert_loop(step: EPLayerStep, p: EPPlan, n_items, dispatched) -> None:
+    """Every received slot's expert output back to its source's ep_yb row, item by item;
+    dispatched() waits for the slots (the first weight chunks are in flight by then)."""
     c, S, me = step.c, step.S, step.me
     He, NC, RI = c.expert_hidden, p.n_chunks(step.kind), p.item_rows
     D, CI = p.slots(step.kind), p.chunk(step.kind)
@@ -334,6 +338,7 @@ def _expert_loop(step: EPLayerStep, p: EPPlan, n_items) -> None:
 
     for q in range(D - 1):
         start(jnp.int32(q))
+    dispatched()
 
     @pl.when(n_items > 0)
     def _():
@@ -464,18 +469,22 @@ def _combine(step: EPLayerStep, win) -> None:
     def live(r):
         return w0 + w_off + r < step.n_live
 
-    @pl.when(live(0))
-    def _():
-        for cp in copies(0, 0):
-            cp.start()
+    Q = S["ep_yrow"].shape[0]  # rows in flight: the gathers' latency, not their bytes
+
+    for q in range(min(Q - 1, rc)):
+
+        @pl.when(live(q))
+        def _(q=q):
+            for cp in copies(q, q):
+                cp.start()
 
     def row(r, carry):
-        b = r % 2
+        b = r % Q
         wr = w_off + r
 
-        @pl.when((r + 1 < rc) & live(r + 1))
+        @pl.when((r + Q - 1 < rc) & live(r + Q - 1))
         def _():
-            for cp in copies(r + 1, 1 - b):
+            for cp in copies(r + Q - 1, (r + Q - 1) % Q):
                 cp.start()
 
         @pl.when(live(r))

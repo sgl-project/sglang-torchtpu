@@ -189,14 +189,14 @@ def ep_scratch(c: MKConfig, p: EPPlan) -> list:
         ("ep_yb", hbm((p.send_rows, he // 2), u32)),
         ("ep_items", smem((1 + 3 * p.max_items,), i32)),
         ("ep_rows", smem((p.recv_rows,), i32)),  # received slots grouped by expert
-        ("ep_yrow", vmem((2, k, he // 2), u32)),  # one own row's slots, for the combine
+        ("ep_yrow", vmem((4, k, he // 2), u32)),  # own rows' slots in flight (combine)
         ("ep_w_sems", dma((p.nslot, 6))),
         ("ep_dn_sems", dma((p.nslot,))),
         ("ep_x_sems", dma((2,))),
         ("ep_misc_sems", dma((4,))),  # local copies: xs fill, y scatter, tables
         ("ep_cnt_sems", dma((2,))),  # count rows: received, sent
         ("ep_a2a_sems", dma((4,))),  # dispatch received / sent, return received / sent
-        ("ep_yrow_sems", dma((2,))),
+        ("ep_yrow_sems", dma((4,))),
         ("ep_ag_sems", dma((2,))),  # row all-gather: received, sent
         # the next layer's pre-attention input (bf16 pairs): every row's in HBM (own rows
         # staged in ep_f), its row tiles on the way into lhs (through sin[0] with HBM pads)
