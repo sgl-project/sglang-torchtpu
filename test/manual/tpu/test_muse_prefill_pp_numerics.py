@@ -49,7 +49,9 @@ ROPE_BASE = 10000.0
 LOG2E = 1.4426950408889634
 # per-row relative error of a layer's output stream: ~12 bf16 roundings per layer
 TOL_ROW, TOL_MEAN = 3e-2, 1e-2
-TOL_KV = 6e-2  # fp8 K/V of the chunk: a moved input flips a rounding
+TOL_KV = 1e-6  # the chunk's fp8 K/V in the pool: exactly the kernel's k, v rounded
+TOL_QKV = 1e-2  # attention inputs: bf16 roundings of nearly equal f32 values
+TOL_ATTN = 2e-2  # attention from the kernel's own q, k, v
 # a token whose top-k set differs from the reference's must be a near tie of biased scores
 NEAR_TIE = 2e-3
 
@@ -247,9 +249,11 @@ def pool_tokens(pool, table, n):
     return tok[:, 0::2], tok[:, 1::2]
 
 
-def ref_attn(c, w, l, x, pool, table, rope, ids_in=None):
-    """Attention and routing of layer l from stream x [T, H] f32: (stream, expert input,
-    ids, routing weights, chunk K, chunk V as fp8 values)."""
+def ref_attn(c, w, l, x, pool, table, rope, ids_in=None, qkv_in=None, o_in=None):
+    """Attention and routing of layer l from stream x [T, H] f32: (stream, expert input, ids,
+    routing weights, chunk K, chunk V as fp8 values, biased scores, (q, k, v, attention)).
+    Teacher forcing: qkv_in, the kernel's (q, k, v) into attention; o_in, its attention output
+    into the gate and o projection; ids_in, its expert picks."""
     H, He, E, K = c.hidden, c.expert_hidden, c.n_experts, c.top_k
     qd, kvd, nqh, nkv = c.q_dim, c.kv_dim, c.q_heads, c.kv_heads
     vec = w["vecs"][l]
@@ -264,6 +268,9 @@ def ref_attn(c, w, l, x, pool, table, rope, ids_in=None):
     tab = rope[CTX : CTX + T]
     if not is_g:
         q, k = _rope(q, nqh, tab), _rope(k, nkv, tab)
+    q_out, k_out, v_out = _bf(q), _bf(k), _bf(v)
+    if qkv_in is not None:
+        q, k, v = (a.astype(jnp.float32) for a in qkv_in)
     # the served transposed RPA tile: fp8 Q^T of the bf16 q times sm_scale * log2(e), base-2
     # logits; K/V reach the pool as fp8 of the bf16 values the stage hands it
     f8max = float(jnp.finfo(jnp.float8_e4m3fn).max)
@@ -291,10 +298,8 @@ def ref_attn(c, w, l, x, pool, table, rope, ids_in=None):
 
     out = heads_out(q8)
     attn = _bf(_heads_rms(out.reshape(T, qd), nqh, c.rms_eps))
-    # diagnostic: q head j on kv head j % kv_heads instead of j // (q_heads / kv_heads)
-    q_alt = q8.reshape(T, nqh // nkv, nkv, 64).transpose(0, 2, 1, 3)
-    out_alt = heads_out(q_alt).transpose(0, 2, 1, 3).reshape(T, qd)
-    attn_alt = _bf(_heads_rms(out_alt, nqh, c.rms_eps))
+    if o_in is not None:
+        attn = o_in.astype(jnp.float32)
     gated = _bf(jax.nn.sigmoid(_bf(og)) * attn)
     a = _bf(_dot(gated, _untile(w["wo"][l])) * row("wo_s", H))
     x = row("attn_alpha", H) * x + row("attn_beta", H) * _bf(_rms(a, c.post_eps))
@@ -308,7 +313,7 @@ def ref_attn(c, w, l, x, pool, table, rope, ids_in=None):
     tw = tw / (tw.sum(1, keepdims=True) + c.router_eps) * c.route_scale
     pooled = _bf(_dot(ffn, _untile(w["wpool"][l])) * row("wpool_s", He))
     xe = _bf(_rms(pooled, c.rms_eps) * row("pre_expert_w", He))
-    return x, xe, ids, tw, k8, v8, biased, (_bf(q), _bf(k), attn, attn_alt)
+    return x, xe, ids, tw, k8, v8, biased, (q_out, k_out, v_out, attn)
 
 
 def ref_post(c, w, l, x, yn, tw):
@@ -323,21 +328,31 @@ def ref_post(c, w, l, x, yn, tw):
     )
 
 
-def ref_layer(c, w, l, x, pool, table, rope, kernel_ids, slot):
-    """One layer: (stream out, chunk K, chunk V, rows whose top-k flipped, the worst flipped
-    row's biased-score gap between its picks' minimum and the best unpicked score)."""
+def ref_layer(c, w, l, x, pool, table, rope, kernel_ids, slot, kernel_qkv, kernel_o):
+    """One layer, each piece fed the kernel's input to it: (q, k, v from x; attention from the
+    kernel's q, k, v; chunk K, V as fp8 of the kernel's k, v; the stream out from the kernel's
+    attention output and expert picks; rows whose top-k flipped; the worst flipped row's
+    biased-score gap between its picks' minimum and the best unpicked score)."""
     attn = jax.jit(ref_attn, static_argnums=(0, 2))
-    _, _, ids, _, _, _, biased, _ = attn(c, w, l, x, pool, table, rope)
+    _, _, _, _, _, _, _, (q, k, v, _) = attn(c, w, l, x, pool, table, rope)
+    _, _, _, _, k8, v8, _, (_, _, _, o) = attn(
+        c, w, l, x, pool, table, rope, None, kernel_qkv
+    )
+    _, _, ids, _, _, _, biased, _ = attn(
+        c, w, l, x, pool, table, rope, None, None, kernel_o
+    )
     same = jnp.all(jnp.sort(ids, 1) == jnp.sort(kernel_ids, 1), axis=1)
     picked = jnp.take_along_axis(biased, kernel_ids, 1).min(1)
     unpicked = jnp.where(
         (jnp.arange(c.n_experts)[None, None, :] == kernel_ids[:, :, None]).any(1), -jnp.inf,
         biased).max(1)  # fmt: skip
     gap = float(jnp.where(same, -jnp.inf, unpicked - picked).max())
-    x, xe, ids, tw, k8, v8, _, inner = attn(c, w, l, x, pool, table, rope, kernel_ids)
+    x, xe, ids, tw, _, _, _, _ = attn(
+        c, w, l, x, pool, table, rope, kernel_ids, None, kernel_o
+    )
     yn = expert_outputs(c, w, l, xe, ids, slot)
     x = jax.jit(ref_post, static_argnums=(0, 2))(c, w, l, x, yn, tw)
-    return x, k8, v8, ~same, gap, inner
+    return x, (q, k, v), o, k8, v8, ~same, gap
 
 
 def expert_outputs(c, w, l, xe, ids, slot, cap=96):
@@ -450,23 +465,19 @@ def main() -> int:
             kernel_ids = routes[first + l][0][:, : c.top_k]
             pool, kpool = pools[first + l], pools_k[first + l]
             table = tables[GLOBAL[l]]
-            x_r, k8, v8, flipped, gap, (q_r, k_r, o_r, o_alt) = ref_layer(
-                c, w_ref, l, x_prev, pool, table, rope, kernel_ids, first + l
-            )
+            _, _, q_k, k_k, v_k, o_k = routes[first + l]
+            x_r, qkv_r, o_r, k8, v8, flipped, gap = ref_layer(
+                c, w_ref, l, x_prev, pool, table, rope, kernel_ids, first + l,
+                (q_k, k_k, v_k), o_k,
+            )  # fmt: skip
             rel = jnp.linalg.norm(x_k - x_r, axis=1) / jnp.linalg.norm(x_r, axis=1)
-            _, _, q_k, k_k, _, o_k = routes[first + l]
 
             def rel_of(a, b):
                 a, b = a.astype(jnp.float32), b.astype(jnp.float32)
                 return float(jnp.linalg.norm(a - b) / jnp.linalg.norm(b))
 
-            o_kn = _bf(_heads_rms(o_k.astype(jnp.float32), c.q_heads, c.rms_eps))
-            print(
-                f"  layer {l} (RPA_TRANSPOSED={os.environ['SGLANG_TPU_RPA_TRANSPOSED']}): "
-                f"q rel {rel_of(q_k, q_r):.2e} k rel {rel_of(k_k, k_r):.2e} attention out "
-                f"rel {rel_of(o_k, o_r):.2e} (kernel out head-normed again "
-                f"{rel_of(o_kn, o_r):.2e}; interleaved GQA reference {rel_of(o_k, o_alt):.2e})"
-            )
+            qkv_rel = max(rel_of(a, b) for a, b in zip((q_k, k_k, v_k), qkv_r))
+            o_rel = rel_of(o_k, o_r)
             kk, vv = pool_tokens(kpool, table, CTX + T)
             kv_rel = float(
                 jnp.linalg.norm(jnp.concatenate([kk[CTX:] - k8, vv[CTX:] - v8]))
@@ -479,16 +490,18 @@ def main() -> int:
             good = (
                 worst < TOL_ROW
                 and mean < TOL_MEAN
+                and qkv_rel < TOL_QKV
+                and o_rel < TOL_ATTN
                 and kv_rel < TOL_KV
                 and cached_same
                 and gap < NEAR_TIE
             )
             ok &= good
             print(
-                f"layer {l} ({KINDS[l]}, {'global' if GLOBAL[l] else 'window'}): row rel max "
-                f"{worst:.2e} mean {mean:.2e} rows>10% {n_bad} | top-k flips {n_flip} (worst "
-                f"gap {gap:.1e}) | chunk kv rel {kv_rel:.2e} "
-                f"cached kept {cached_same} | {'OK' if good else 'FAIL'}"
+                f"layer {l} ({KINDS[l]}, {'global' if GLOBAL[l] else 'window'}): q/k/v rel "
+                f"{qkv_rel:.2e} | attention rel {o_rel:.2e} | chunk kv rel {kv_rel:.2e} cached "
+                f"kept {cached_same} | row rel max {worst:.2e} mean {mean:.2e} rows>10% {n_bad} "
+                f"| top-k flips {n_flip} (worst gap {gap:.1e}) | {'OK' if good else 'FAIL'}"
             )
             if not math.isfinite(worst):
                 print("  non-finite kernel output")
