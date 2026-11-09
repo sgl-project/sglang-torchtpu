@@ -29,6 +29,8 @@ from sglang_tpu.muse_megakernel.ep_mk.experts import (
     ChunkRefs,
     chunk_compute,
     item_sizes,
+    qblock,
+    scale_group,
     sized,
 )
 from sglang_tpu.muse_megakernel.mk.config import MKConfig
@@ -40,12 +42,26 @@ from sglang_tpu.muse_megakernel.mk.packing import _pack_bf16x2, _unpack_bf16x2
 f32, bf16 = jnp.float32, jnp.bfloat16
 
 
-def _phase(name: str):
-    """A named in-kernel region per phase with SGLANG_TPU_EP_TRACE=1 at trace time (xprof
-    shows them with libtpu's --xla_enable_custom_call_region_trace=true)."""
-    if os.environ.get("SGLANG_TPU_EP_TRACE") == "1":
+def _phase(name: str, level: int = 1):
+    """A named in-kernel region per phase with SGLANG_TPU_EP_TRACE >= level at trace time
+    (xprof shows them with libtpu's --xla_enable_custom_call_region_trace=true); level 2:
+    per expert chunk too."""
+    if int(os.environ.get("SGLANG_TPU_EP_TRACE", "0")) >= level:
         return jax.named_scope(f"ep_{name}")
     return contextlib.nullcontext()
+
+
+def _phase_fn(name: str, level: int = 1):
+    """fn run inside _phase(name, level)."""
+
+    def deco(fn):
+        def run():
+            with _phase(name, level):
+                fn()
+
+        return run
+
+    return deco
 
 
 def _dev_skip(phase: str) -> bool:
@@ -198,7 +214,8 @@ def _fill_send(step: EPLayerStep, p: EPPlan, win) -> None:
 
 
 def _chunk_copies(step: EPLayerStep, p: EPPlan, refs, off, e, j, slot) -> list:
-    """The six DMAs of expert e's I-chunk j into ring slot `slot`."""
+    """The four DMAs of expert e's I-chunk j into ring slot `slot` (w13 and its scales in
+    chunk_cols order: a chunk's gate | up columns are one slab)."""
     c, S, kind = step.c, step.S, step.kind
     He = c.expert_hidden
     CI = p.chunk(kind)
@@ -212,39 +229,31 @@ def _chunk_copies(step: EPLayerStep, p: EPPlan, refs, off, e, j, slot) -> list:
         src[2].bitcast(jnp.uint32),
         src[3],
     )
-    g0 = pl.multiple_of(j * CI, CI)
-    u0 = pl.multiple_of(p.inter + j * CI, CI)
+    c0 = pl.multiple_of(j * 2 * CI, 2 * CI)
     k2 = pl.multiple_of(j * (CI // pack), CI // pack)
     if kind == "fp4":
-        srows = He // FP4_GROUP
-        s2_src = s2.at[e, pl.ds(j * (CI // FP4_GROUP), CI // FP4_GROUP)]
-        s2_dst = S["w2s"].at[slot, pl.ds(0, CI // FP4_GROUP)]
+        g = scale_group(kind)
+        srows = He // g
+        s2_src = s2.at[e, pl.ds(j * (CI // g), CI // g)]
+        s2_dst = S["w2s"].at[slot, pl.ds(0, CI // g)]
     else:
         srows, s2_src = 2, s2.at[e]
         s2_dst = S["w2s"].at[slot, pl.ds(0, 2)]
     return [
         pltpu.make_async_copy(
-            w13.at[e, :, pl.ds(g0, CI)], W13.at[slot, :, pl.ds(0, CI)], sems.at[slot, 0]
+            w13.at[e, :, pl.ds(c0, 2 * CI)],
+            W13.at[slot, :, pl.ds(0, 2 * CI)],
+            sems.at[slot, 0],
         ),
         pltpu.make_async_copy(
-            w13.at[e, :, pl.ds(u0, CI)],
-            W13.at[slot, :, pl.ds(CI, CI)],
+            s13.at[e, pl.ds(0, srows), pl.ds(c0, 2 * CI)],
+            S13.at[slot, pl.ds(0, srows), pl.ds(0, 2 * CI)],
             sems.at[slot, 1],
         ),
         pltpu.make_async_copy(
-            s13.at[e, :, pl.ds(g0, CI)],
-            S13.at[slot, pl.ds(0, srows), pl.ds(0, CI)],
-            sems.at[slot, 2],
+            w2.at[e, pl.ds(k2, CI // pack)], W2.at[slot], sems.at[slot, 2]
         ),
-        pltpu.make_async_copy(
-            s13.at[e, :, pl.ds(u0, CI)],
-            S13.at[slot, pl.ds(0, srows), pl.ds(CI, CI)],
-            sems.at[slot, 3],
-        ),
-        pltpu.make_async_copy(
-            w2.at[e, pl.ds(k2, CI // pack)], W2.at[slot], sems.at[slot, 4]
-        ),
-        pltpu.make_async_copy(s2_src, s2_dst, sems.at[slot, 5]),
+        pltpu.make_async_copy(s2_src, s2_dst, sems.at[slot, 3]),
     ]
 
 
@@ -271,7 +280,12 @@ def _chunk_refs(step: EPLayerStep, p: EPPlan, slot) -> ChunkRefs:
         s2 = S["w2s"].at[slot]
     else:
         sg, su = S13.at[slot, :, pl.ds(0, CI)], S13.at[slot, :, pl.ds(CI, CI)]
-        s2 = S["w2s"].at[slot, pl.ds(0, CI // FP4_GROUP)]
+        # the q arms read their rows of the whole slab (a short row slice won't lay out)
+        s2 = (
+            S["w2s"].at[slot]
+            if qblock()
+            else S["w2s"].at[slot, pl.ds(0, CI // FP4_GROUP)]
+        )
     return ChunkRefs(
         wg=W13.at[slot, :, pl.ds(0, CI)],
         wu=W13.at[slot, :, pl.ds(CI, CI)],
@@ -350,6 +364,7 @@ def _expert_loop(step: EPLayerStep, p: EPPlan, n_items, dispatched) -> None:
         slot = k % D
 
         @pl.when(j == 0)
+        @_phase_fn("item_in", 2)
         def _():
             _item_rows(S, buf, b, first, n, start=False)
 
@@ -364,8 +379,9 @@ def _expert_loop(step: EPLayerStep, p: EPPlan, n_items, dispatched) -> None:
 
             sized(n, sizes, zero)
 
-        start(k + D - 1)
-        wait(slot, k)
+        with _phase("issue", 2):
+            start(k + D - 1)
+            wait(slot, k)
         if not _dev_skip("experts"):
             chunk_compute(
                 step.kind,
@@ -379,6 +395,7 @@ def _expert_loop(step: EPLayerStep, p: EPPlan, n_items, dispatched) -> None:
             )
 
         @pl.when(j == NC - 1)
+        @_phase_fn("item_out", 2)
         def _():
             # the previous item's y rows have landed: buf.y is free
             tmpl = pltpu.make_async_copy(

@@ -10,7 +10,7 @@ import msgspec
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.muse_megakernel.ep_mk.experts import BD_KC, item_sizes
+from sglang_tpu.muse_megakernel.ep_mk.experts import BD_KC, item_sizes, scale_group
 from sglang_tpu.muse_megakernel.mk.config import MKConfig
 from sglang_tpu.muse_megakernel.mk.consts import LANE
 from sglang_tpu.muse_megakernel.mk.plan import fit_ring_slots
@@ -107,11 +107,12 @@ def ep_expert_shapes(
     experts: the TP slab layout with E / tp experts of the whole intermediate."""
     el, he, i = c.n_experts // c.tp, c.expert_hidden, c.inter_local * c.tp
     if kind == "fp4":
+        g = scale_group(kind)
         return (
             ((el, he // 8, 2 * i), jnp.int32),
-            ((el, he // 16, 2 * i), jnp.bfloat16),
+            ((el, he // g, 2 * i), jnp.bfloat16),
             ((el, i // 8, he), jnp.int32),
-            ((el, i // 16, he), jnp.bfloat16),
+            ((el, i // g, he), jnp.bfloat16),
         )
     return (
         ((el, he // 4, 2 * i), jnp.int32),
@@ -190,7 +191,7 @@ def ep_scratch(c: MKConfig, p: EPPlan) -> list:
         ("ep_items", smem((1 + 3 * p.max_items,), i32)),
         ("ep_rows", smem((p.recv_rows,), i32)),  # received slots grouped by expert
         ("ep_yrow", vmem((4, k, he // 2), u32)),  # own rows' slots in flight (combine)
-        ("ep_w_sems", dma((p.nslot, 6))),
+        ("ep_w_sems", dma((p.nslot, 4))),
         ("ep_dn_sems", dma((p.nslot,))),
         ("ep_x_sems", dma((2,))),
         ("ep_misc_sems", dma((4,))),  # local copies: xs fill, y scatter, tables
