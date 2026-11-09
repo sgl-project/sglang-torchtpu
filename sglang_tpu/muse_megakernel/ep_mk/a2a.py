@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The EP FFN section's ragged all-to-alls by remote DMA: every rank's slot counts first (one
 row each), then per (source, destination) one contiguous segment of slot rows, moved in
-SEG-row DMAs (segments start on SEG-row boundaries) and waited for in SEG-row units."""
+SEG-row DMAs (segments start on SEG-row boundaries) and waited for in SEG-row units. The y
+rows go back one by one from the expert loop (layer._expert_loop)."""
 
 import jax
 from jax.experimental import pallas as pl
@@ -9,10 +10,9 @@ from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.muse_megakernel.ep_mk.config import SEG
 from sglang_tpu.muse_megakernel.ep_mk.route import (
-    T_BACK,
     T_DMAS,
     T_DST,
-    T_RECV,
+    T_N,
     T_SEND,
     seg_dmas,
 )
@@ -69,21 +69,6 @@ def dispatch(c: MKConfig, S: dict, me) -> None:
         jax.lax.fori_loop(0, seg_dmas(S, me, d), one, 0)
 
 
-def give_back(c: MKConfig, S: dict, me) -> None:
-    """Each source s's received segment's y (ep_yr) back to s's return buffer (ep_yb), where
-    s sent it from."""
-    tab = S["ep_tab_s"]
-    sems = (S["ep_a2a_sems"].at[2], S["ep_a2a_sems"].at[3])
-    for s in range(c.tp):
-        r0, b0 = tab[T_RECV, s], tab[T_BACK, s]
-
-        def one(i, carry, r0=r0, b0=b0, s=s):
-            _seg_copy(S["ep_yr"], S["ep_yb"], r0, b0, i, s, me, sems)
-            return carry
-
-        jax.lax.fori_loop(0, seg_dmas(S, s, me), one, 0)
-
-
 def _wait(S: dict, buf: str, sem, n) -> None:
     tmpl = pltpu.make_async_copy(
         S[buf].at[pl.ds(0, SEG)], S[buf].at[pl.ds(SEG, SEG)], sem
@@ -104,8 +89,16 @@ def wait_dispatch(c: MKConfig, S: dict, me) -> None:
 
 
 def wait_give_back(c: MKConfig, S: dict, me) -> None:
-    """Waits for every destination's y of this rank's slots into ep_yb, and this rank's
-    sends out of ep_yr."""
+    """Waits for the y rows of this rank's slots on other ranks into ep_yb (the expert loop
+    returns each item's rows to their sources, own ones locally)."""
     tab = S["ep_tab_s"]
-    _wait(S, "ep_yb", S["ep_a2a_sems"].at[2], tab[T_DMAS, 1])
-    _wait(S, "ep_yr", S["ep_a2a_sems"].at[3], tab[T_DMAS, 0] - seg_dmas(S, me, me))
+    n = sum(tab[T_N + me, d] for d in range(c.tp)) - tab[T_N + me, me]
+    tmpl = pltpu.make_async_copy(
+        S["ep_yb"].at[pl.ds(0, 1)], S["ep_yb"].at[pl.ds(1, 1)], S["ep_a2a_sems"].at[2]
+    )
+
+    def one(i, carry):
+        tmpl.wait()
+        return carry
+
+    jax.lax.fori_loop(0, n, one, 0)

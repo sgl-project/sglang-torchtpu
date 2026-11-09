@@ -83,6 +83,8 @@ def ep_plan(c: MKConfig, item_rows: int = 32) -> EPPlan:
     item_sizes(item_rows)
     el, rc, k = c.n_experts // c.tp, c.rows // c.tp, c.top_k
     pad = (SEG - 1) * c.tp
+    # route.build_items packs a received row (12 bits), its source and its return row
+    assert c.rows * k + pad <= 4096 and c.tp <= 8, (c.rows, c.tp)
     return EPPlan(
         experts=el,
         inter=c.inter_local * c.tp,
@@ -158,6 +160,8 @@ def ep_scratch(c: MKConfig, p: EPPlan) -> list:
             ("ep_acc", vmem((ri, he), f32)),
             ("ep_y", vmem((ri, he // 2), u32)),  # an item's y rows, bf16 pairs
         ]
+    if c.tiled_vmem_pads:
+        items += [("ep_lhs_stage", vmem((c.row_tile, c.hidden), u32))]
     return items + [
         # window rows: pooled expert input (bf16 pairs), routing, slot places in ep_xs, the
         # pooled / combined f32, the unpool output and FFN branch
@@ -179,20 +183,24 @@ def ep_scratch(c: MKConfig, p: EPPlan) -> list:
         ("ep_tab_v", vmem((TAB_ROWS, LANE), i32)),  # route.slot_tables
         ("ep_tab_s", smem((TAB_ROWS, LANE), i32)),
         # the two ragged all-to-alls: own slots by destination (and expert), received slots
-        # by source (and expert), their y the same way back
+        # by source (and expert); y goes back row by row from the expert loop
         ("ep_xs", hbm((p.send_rows, he // 2), u32)),
         ("ep_xr", hbm((p.recv_rows, he // 2), u32)),
-        ("ep_yr", hbm((p.recv_rows, he // 2), u32)),
         ("ep_yb", hbm((p.send_rows, he // 2), u32)),
         ("ep_items", smem((1 + 3 * p.max_items,), i32)),
         ("ep_rows", smem((p.recv_rows,), i32)),  # received slots grouped by expert
-        ("ep_yrow", vmem((2, k, he // 2), u32)),  # one own row's slots, for the combine
+        ("ep_yrow", vmem((4, k, he // 2), u32)),  # own rows' slots in flight (combine)
         ("ep_w_sems", dma((p.nslot, 6))),
         ("ep_dn_sems", dma((p.nslot,))),
         ("ep_x_sems", dma((2,))),
         ("ep_misc_sems", dma((4,))),  # local copies: xs fill, y scatter, tables
         ("ep_cnt_sems", dma((2,))),  # count rows: received, sent
         ("ep_a2a_sems", dma((4,))),  # dispatch received / sent, return received / sent
-        ("ep_yrow_sems", dma((2,))),
+        ("ep_yrow_sems", dma((4,))),
         ("ep_ag_sems", dma((2,))),  # row all-gather: received, sent
+        # the next layer's pre-attention input (bf16 pairs): every row's in HBM (own rows
+        # staged in ep_f), its row tiles on the way into lhs (through sin[0] with HBM pads)
+        ("ep_lhs_g", hbm((c.rows, c.hidden // 2), u32)),
+        ("ep_lhs_sems", dma((5,))),  # (unused), sent, own copy, stage slots
+        ("ep_lhs_rsems", dma((tp,))),  # each owner's rows received
     ]

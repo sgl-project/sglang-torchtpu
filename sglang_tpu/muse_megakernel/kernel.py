@@ -51,6 +51,7 @@ all-gather.
 
 import functools
 import math
+import os
 
 import jax
 import jax.numpy as jnp
@@ -5655,14 +5656,18 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                 smalls_copy(l, slot).start()
                 ws.prologue(l)
             with _scope("smalls_wait"):
-                smalls_copy(l, slot).wait()
+                # prefetched under EP: the previous layer's next_smalls waited
+                if ep is None or not prefetched:
+                    smalls_copy(l, slot).wait()
             smr = S["smalls"].at[slot]
             use_rope, is_global = flags(l)
 
             def row(name, n=H):
                 return smr[SMALL[name] : SMALL[name] + 1, :n]
 
-            if not pend:
+            if ep is not None and prefetched:  # gathered by the previous layer's hook
+                ep.pre_attn(c, S)
+            elif not pend:
                 if c.tiled_vmem_pads:
                     for t in range(R // RT):
                         rs = pl.ds(t * RT, RT)
@@ -5736,6 +5741,17 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
                     _select(l, keys, leaf)
 
+                def next_smalls():
+                    """The next layer's smalls slab, waited for (its layer_tiled does not)."""
+                    nslot = (l + 1) % 2
+                    if not c.smalls_early:
+                        prefetch_smalls(l, nxt)
+                    if isinstance(l, int):
+                        smalls_copy(l + 1, nslot).wait()
+                    else:
+                        pl.when(l + 1 < L)(smalls_copy(l + 1, nslot).wait)
+                    return S["smalls"].at[nslot]
+
                 with _scope("moe"):
                     ep.layer_moe(
                         EPLayerStep(
@@ -5753,6 +5769,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             n_live=n_live,
                             router=lambda: mv_tiled(l, "wrouter", nxt, smr),
                             capture=lambda rows, s: capture_tile(l, rows, s),
+                            next_smalls=None if nxt is None else next_smalls,
                         )
                     )
             else:
@@ -6016,6 +6033,8 @@ def megakernel_call(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None
             compiler_params=pltpu.CompilerParams(
                 vmem_limit_bytes=cfg.vmem_limit_bytes,
                 collective_id=_COLLECTIVE_ID if cfg.tp > 1 else None,
+                disable_bounds_checks=ep is not None
+                and os.environ.get("SGLANG_TPU_EP_NO_BOUNDS") == "1",
             ),
             name=f"muse_{'ep_' if ep else ''}megakernel_r{cfg.rows}_q{cfg.rows_per_req}",
         )

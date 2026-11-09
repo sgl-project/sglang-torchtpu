@@ -161,10 +161,15 @@ def seg_dmas(S: dict, s, d):
     return (S["ep_tab_s"][T_N + s, d] + SEG - 1) // SEG
 
 
+# an ep_rows entry: received row | source << ROW_BITS | return row << (ROW_BITS + SRC_BITS)
+ROW_BITS, SRC_BITS = 12, 3
+
+
 def build_items(c: MKConfig, p: EPPlan, S: dict) -> jax.Array:
     """ep_rows: received slot rows grouped by local expert (each source's slots for an expert
-    are contiguous in its segment); ep_items = [n_items, (expert, first, rows)...] over
-    ep_rows, at most item_rows each. Returns n_items."""
+    are contiguous in its segment), each with its source and its row in the source's return
+    buffer; ep_items = [n_items, (expert, first, rows)...] over ep_rows, at most item_rows
+    each. Returns n_items."""
     tp, el, ri = c.tp, p.experts, p.item_rows
     tab, rows, items = S["ep_tab_s"], S["ep_rows"], S["ep_items"]
 
@@ -172,10 +177,12 @@ def build_items(c: MKConfig, p: EPPlan, S: dict) -> jax.Array:
         n_rows, n_items = carry
         first = n_rows
         for s in range(tp):
-            base = tab[T_RECV, s] + tab[T_PRE + s, e]
+            pre = tab[T_PRE + s, e]
+            base = (tab[T_RECV, s] + pre) | (s << ROW_BITS)
+            base |= (tab[T_BACK, s] + pre) << (ROW_BITS + SRC_BITS)
 
             def one(t, n, base=base):
-                rows[n] = base + t
+                rows[n] = base + (t | (t << (ROW_BITS + SRC_BITS)))
                 return n + 1
 
             n_rows = jax.lax.fori_loop(0, tab[T_MINE + s, e], one, n_rows)
