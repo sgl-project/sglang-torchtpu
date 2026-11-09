@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils._pytree import tree_leaves
 
@@ -28,7 +29,7 @@ from sglang.multimodal_gen.runtime.managers import gpu_worker
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     set_forward_context,
 )
-from sglang.multimodal_gen.runtime.models.dits import wanvideo
+from sglang.multimodal_gen.runtime.models.dits import wanvideo, zimage
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
@@ -37,6 +38,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
 from sglang.multimodal_gen.runtime.platforms.interface import Platform
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     compile_matching_submodules,
+)
+from sglang.multimodal_gen.test.unit.test_usp_attention_kv_gather import (
+    _RankInvariantMeta,
 )
 
 _COMPILE = "sglang.multimodal_gen.runtime.utils.torch_compile"
@@ -98,6 +102,7 @@ class TestSpmdSafeRegions(unittest.TestCase):
         self.assertIsNone(Platform().prepare_spmd_region_wrapper())
         self.assertFalse(BaseDiT._compile_regions_spmd_safe)
         self.assertTrue(wanvideo.WanTransformer3DModel._compile_regions_spmd_safe)
+        self.assertTrue(zimage.ZImageTransformer2DModel._compile_regions_spmd_safe)
 
 
 class TestFusionBarrier(unittest.TestCase):
@@ -139,9 +144,17 @@ class _Stop(Exception):
 
 
 class _RecordingBlock(nn.Module):
-    def forward(self, *args, **kwargs):
+    def forward(self, *args, attn_mask_meta=None, **kwargs):
         self.args = args
-        leaves = tree_leaves((args, kwargs))
+        # A program depends only on the meta entries it reads, and the
+        # attention paths read the global pad span, never the rank-local
+        # entries (the tests that use _RankInvariantMeta check them).
+        meta = {
+            key: value
+            for key, value in (attn_mask_meta or {}).items()
+            if key not in _RankInvariantMeta.rank_local_keys
+        }
+        leaves = tree_leaves((args, kwargs, meta))
         self.layouts = [
             (tuple(leaf.shape), leaf.stride(), leaf.storage_offset())
             for leaf in leaves
@@ -208,24 +221,37 @@ class TestWanBlockInputsAreRankInvariant(unittest.TestCase):
         _set_tiny_wan_server_args(self)
 
     def test_every_rank_feeds_blocks_offset_zero_shards(self):
-        # 2 x 2 x 4 = 16 latent tokens, 4 per rank. With batch 1 a rank's slice
-        # is a contiguous view whose storage offset grows with the rank.
-        world_size, local_len = 4, 4
+        # Latents (frames, height, width), patch (1, 2, 2), at SP 4. 2 x 2 x 4 =
+        # 16 tokens, 4 per rank: with batch 1 a rank's slice is a contiguous
+        # view whose storage offset grows with the rank. 3 x 3 x 3 = 27 tokens,
+        # 7 per rank: the last rank's shard ends in a pad token.
+        world_size = 4
         forward_batch = SimpleNamespace(
             enable_sequence_shard=True, enable_teacache=False, enable_spectrum=False
         )
         context = SimpleNamespace(forward_batch=forward_batch, attn_metadata=None)
-        for batch, per_token_timestep in ((1, False), (1, True), (2, True)):
-            latents = torch.randn(batch, 4, 2, 4, 8)
+        for latent_shape, batch, per_token_timestep in (
+            ((2, 4, 8), 1, False),
+            ((2, 4, 8), 1, True),
+            ((2, 4, 8), 2, True),
+            ((3, 6, 6), 1, True),
+            ((3, 6, 6), 2, True),
+        ):
+            seq_len = latent_shape[0] * latent_shape[1] * latent_shape[2] // 4
+            local_len = -(-seq_len // world_size)
+            num_pad = local_len * world_size - seq_len
+            latents = torch.randn(batch, 4, *latent_shape)
             text = torch.randn(batch, 5, 8)
             timestep = (
-                torch.full((batch, 16), 500.0)
+                torch.full((batch, seq_len), 500.0)
                 if per_token_timestep
                 else torch.full((batch,), 500.0)
             )
             layouts, scalars = [], []
             for rank in range(world_size):
-                case = dict(batch=batch, per_token=per_token_timestep, rank=rank)
+                case = dict(
+                    tokens=seq_len, batch=batch, per_token=per_token_timestep, rank=rank
+                )
                 with self.subTest(**case), _sp_rank(rank, world_size):
                     model = _tiny_wan()
                     block = _RecordingBlock()
@@ -240,20 +266,23 @@ class TestWanBlockInputsAreRankInvariant(unittest.TestCase):
                     layouts.append(block.layouts)
                     scalars.append(block.scalars)
 
+                    # Shards of the sequence zero-padded at its tail.
                     hidden_states, _, temb, _ = block.args
                     rows = slice(rank * local_len, (rank + 1) * local_len)
                     tokens = model.patch_embedding(latents).flatten(2).transpose(1, 2)
                     torch.testing.assert_close(
-                        hidden_states, tokens[:, rows], rtol=0, atol=0
+                        hidden_states,
+                        F.pad(tokens, (0, 0, 0, num_pad))[:, rows],
+                        rtol=0,
+                        atol=0,
                     )
                     sharded = [hidden_states]
                     if per_token_timestep:
                         _, proj, _, _ = model.condition_embedder(
-                            timestep.flatten(), text, None, timestep_seq_len=16
+                            timestep.flatten(), text, None, timestep_seq_len=seq_len
                         )
-                        torch.testing.assert_close(
-                            temb, proj.unflatten(2, (6, -1))[:, rows], rtol=0, atol=0
-                        )
+                        proj = F.pad(proj, (0, 0, 0, num_pad)).unflatten(2, (6, -1))
+                        torch.testing.assert_close(temb, proj[:, rows], rtol=0, atol=0)
                         sharded.append(temb)
                     for tensor in sharded:
                         self.assertEqual(tensor.storage_offset(), 0)
