@@ -10,7 +10,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.muse_megakernel.kernel import _heads_rms, _rms, _topk_iter
+from sglang_tpu.muse_megakernel.kernel import _rms, _topk_iter
 from sglang_tpu.muse_megakernel.prefill_pp.config import (
     BF16,
     F32,
@@ -44,20 +44,31 @@ def _mm(a_ref, w_ref, k: int, kc: int = 512):
     return acc
 
 
-def _rope_lanes(x, cos, sin):
-    """Interleaved rotary on [M, n * hd] with lane-expanded cos / sin of the same shape."""
-    lane = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
-    even = (lane % 2) == 0
-    w = x.shape[1]
-    partner = jnp.where(
-        even, pltpu.roll(x, shift=w - 1, axis=1), pltpu.roll(x, shift=1, axis=1)
-    )
-    return x * cos + jnp.where(even, -1.0, 1.0) * partner * sin
+def _head_mats(hmat, hd: int):
+    """hmat[0]: block-diagonal 1/hd (per-head mean); hmat[1]: signed pair swap (rotary partner)."""
+    shape = hmat.shape[1:]
+    row = jax.lax.broadcasted_iota(jnp.int32, shape, 0)
+    col = jax.lax.broadcasted_iota(jnp.int32, shape, 1)
+    hmat[0] = jnp.where(row // hd == col // hd, 1.0 / hd, 0.0).astype(BF16)
+    even = (col % 2) == 0
+    swap = jnp.where(even & (row == col + 1), -1.0, 0.0)
+    hmat[1] = jnp.where(~even & (row == col - 1), 1.0, swap).astype(BF16)
+
+
+def _heads_rms_mxu(x, hmat, eps: float, gain: float = 1.0):
+    """Per-head RMS norm of [M, n * hd]; the head means come off the MXU, not lane reduces."""
+    ms = jnp.dot((x * x).astype(BF16), hmat[0], preferred_element_type=F32)
+    return x * (jax.lax.rsqrt(ms + eps) * gain)
+
+
+def _rope_mxu(x, hmat, cos, sin):
+    """Interleaved rotary on [M, n * hd]; the signed pair partner is an MXU product."""
+    return x * cos + jnp.dot(x.astype(BF16), hmat[1], preferred_element_type=F32) * sin
 
 
 SCRATCH = (
     "xbuf", "accbuf", "abuf", "gbuf", "pbuf", "wbuf", "vec_v", "wr_v", "rope_v", "rope8",
-    "otile", "ids_v", "tw_v", "ones_v", "misc_s", "sem_x", "sem_w", "sem_o", "sem_m",
+    "otile", "ids_v", "tw_v", "ones_v", "hmat", "misc_s", "sem_x", "sem_w", "sem_o", "sem_m",
 )  # fmt: skip
 
 
@@ -91,7 +102,7 @@ def stage_calls(c: PPConfig):
         wqkvg, wo, wpool, wunpool, wrouter, vecs = (R[n] for n in WEIGHT_ORDER)
         xbuf, accbuf, abuf, gbuf, pbuf, wbuf = (R[n] for n in SCRATCH[:6])
         vec_v, wr_v, rope_v, rope8, otile, ids_v, tw_v = (R[n] for n in SCRATCH[6:13])
-        misc_s, sem_x, sem_w, sem_o, sem_m = (R[n] for n in SCRATCH[14:])
+        misc_s, sem_x, sem_w, sem_o, sem_m = (R[n] for n in SCRATCH[15:])
         x_out = x_in  # the stream is aliased in place
 
         def vrow(name, n, off=0):
@@ -101,9 +112,10 @@ def stage_calls(c: PPConfig):
             return pl.ds(pl.multiple_of(i * n, n), n)
 
         def attn_in(sl, is_g, ctx):
-            rope, q_h, k_h, v_h, g_h = (
-                R[n] for n in ("rope", "q_h", "k_h", "v_h", "g_h")
+            rope, q_h, k_h, v_h, g_h, hmat = (
+                R[n] for n in ("rope", "q_h", "k_h", "v_h", "g_h", "hmat")
             )
+            _head_mats(hmat, hd)
             total = n_rt * ntc
 
             def wcp(idx, b):
@@ -167,18 +179,18 @@ def stage_calls(c: PPConfig):
                     )
 
                 def roped(x):
-                    return jnp.where(is_g != 0, x, _rope_lanes(x, rope8[0], rope8[1]))
+                    return jnp.where(
+                        is_g != 0, x, _rope_mxu(x, hmat, rope8[0], rope8[1])
+                    )
 
                 def q_tile(jt, cc):
-                    q = _heads_rms(
-                        tile(jt), tn // hd, hd, c.rms_eps, gain=c.scale_query_by
-                    )
+                    q = _heads_rms_mxu(tile(jt), hmat, c.rms_eps, gain=c.scale_query_by)
                     emit(roped(q), q_h.at[pl.ds(r0, tm), rows(jt, tn)])
                     return cc
 
                 jax.lax.fori_loop(0, n_qt, q_tile, 0)
                 for kt in range(n_kt):
-                    k = roped(_heads_rms(tile(n_qt + kt), tn // hd, hd, c.rms_eps))
+                    k = roped(_heads_rms_mxu(tile(n_qt + kt), hmat, c.rms_eps))
                     emit(k, k_h.at[pl.ds(r0, tm), rows(kt, tn)])
                 for kt in range(n_kt):
                     emit(tile(n_qt + n_kt + kt), v_h.at[pl.ds(r0, tm), rows(kt, tn)])
@@ -483,6 +495,7 @@ def stage_calls(c: PPConfig):
         vmem((tm, LANE), jnp.int32),  # ids_v
         vmem((tm, LANE), F32),  # tw_v
         vmem((LC, LANE), BF16),  # ones_v: sums a lane chunk's squares on the MXU
+        vmem((2, tn, tn), BF16),  # hmat: per-head mean and rotary partner matrices
         smem_t((8,), jnp.int32),  # misc_s
         dma((3,)),
         dma((2,)),
