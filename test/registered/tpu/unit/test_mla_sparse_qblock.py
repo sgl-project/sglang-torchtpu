@@ -294,8 +294,9 @@ class TestQblockSelectionWords(CustomTestCase):
 
 @unittest.skipUnless(_HAS_JAX, "requires JAX")
 class TestQblockZeroRope(CustomTestCase):
-    """read_rope=False matches read_rope=True on a zero rope lane (Pallas
-    interpret mode off TPU, so it also runs on CPU)."""
+    """read_rope=False matches read_rope=True on a zero rope lane, and never
+    reads the rope cache (Pallas interpret mode off TPU, so it also runs on
+    CPU)."""
 
     def test_skip_rope_reads(self):
         from sglang_tpu.attention.pallas.mla_sparse_qblock import (
@@ -321,6 +322,9 @@ class TestQblockZeroRope(CustomTestCase):
         num_pages = max_seqs * pps + 1
         cn = jnp.asarray(rng.integers(0, 0x70, (num_pages, PAGE, 4, 128)), jnp.uint8)
         cr = jnp.zeros((num_pages, PAGE // 4, 4, 128), jnp.uint8)
+        # The read_rope=False arm gets an all-NaN rope cache (0x7F is FP8
+        # e4m3fn NaN): with zeros both arms would match even if it read it.
+        cr_nan = jnp.full((num_pages, PAGE // 4, 4, 128), 0x7F, jnp.uint8)
         ql = jnp.asarray(rng.normal(size=(num_tokens, heads, 512)), jnp.bfloat16)
         qpe = jnp.zeros((num_tokens, heads, 64), jnp.bfloat16)
         outs = [
@@ -329,7 +333,7 @@ class TestQblockZeroRope(CustomTestCase):
                     ql,
                     qpe,
                     cn,
-                    cr,
+                    rope_cache,
                     jnp.asarray(topk),
                     kv,
                     pi,
@@ -343,7 +347,7 @@ class TestQblockZeroRope(CustomTestCase):
                     read_rope=read_rope,
                 ).astype(jnp.float32)
             )
-            for read_rope in (True, False)
+            for read_rope, rope_cache in ((True, cr), (False, cr_nan))
         ]
         self.assertFalse(np.isnan(outs[0]).any())
         self.assertTrue(outs[0][: sum(q_lens)].any())
