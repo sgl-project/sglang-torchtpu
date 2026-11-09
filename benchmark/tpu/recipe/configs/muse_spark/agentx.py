@@ -10,8 +10,8 @@ traces against it.
 
 Every point runs fp8 KV in the SEQ_ALONG_LANE layout (batched RPA prefill,
 megakernel decode, 256-token pages) with host KV offload through HiCache over
-raiden, FCFS admission, and DFlash verifying 8 tokens, narrowing to 4 once
-enough requests decode together. The draft is served through a windowed copy of
+raiden, FCFS admission, and DFlash on the experimental spec worker verifying a
+fixed 4 tokens at the swept points. The draft is served through a windowed copy of
 its config (windowed_draft.py), so its KV lives in the target's sliding-window
 slots. Acceptance is pinned to the AgentX golden acceptance length.
 
@@ -33,15 +33,16 @@ SWEPT = (1, 7, 9, 10, 16, 22)
 #        adaptive verify "MIN_BS:WIDTH" or None). MIN_BS:WIDTH verifies WIDTH
 # tokens once MIN_BS or more requests decode.
 PROFILES = {
+    # The swept points verify a fixed 4 tokens on the experimental worker: on the
+    # 9e124d99 megakernel q4 is no slower than q8 even at one request.
     # A session's subagent turns run beside it instead of queueing.
-    1: (2, 8, 128, "4:4"),
+    1: (2, 4, 128, None),
     # Running requests step up with concurrency, so interactivity falls and
     # throughput rises from conc 1 to conc 10.
-    7: (3, 8, 128, "4:4"),
-    9: (4, 8, 128, "4:4"),
-    10: (6, 8, 64, "4:4"),
-    16: (16, 8, 64, "3:4"),
-    # Fixed 4-token verify on the experimental worker (3:4 already ran width 4 from 3 decoding).
+    7: (3, 4, 128, None),
+    9: (4, 4, 128, None),
+    10: (6, 4, 64, None),
+    16: (16, 4, 64, None),
     22: (16, 4, 64, None),
     # Not swept; kept for reruns.
     2: (2, 8, 128, "4:4"),
@@ -58,9 +59,9 @@ PROFILES = {
 # Any other concurrency.
 DEFAULT_PROFILE = (16, 8, 64, "3:4")
 
-# conc: host pool GB per rank, for points served by the experimental spec worker
-# (fixed simulated draft tokens, no adaptive width).
-EXP_WORKER_HICACHE_GB = {22: 72}
+# conc: host pool GB per rank (None: hicache_ratio), for points served by the
+# experimental spec worker (fixed simulated draft tokens, no adaptive width).
+EXP_WORKER_HICACHE_GB = {1: None, 7: None, 9: None, 10: None, 16: 72, 22: 72}
 
 # The AgentX golden acceptance length of Muse Spark's DFlash2 draft (thinking on),
 # by draft tokens per verify (the verify width minus the current token).
@@ -113,6 +114,9 @@ def compile_bs(running, verify, adaptive):
     if running == 16 and (adaptive or verify == 4):
         # 9-11 decoding requests get their own programs instead of padding to 12.
         return [*range(1, 13), 16]
+    if verify == 4 and running <= 12:
+        # Every count, as the adaptive points compiled: odd counts would pad a request.
+        return list(range(1, running + 1))
     buckets = [1] + [
         b for b in range(2, running) if b * verify % 8 == 0 and (b <= 8 or b % 4 == 0)
     ]
@@ -180,7 +184,7 @@ def config_for(
             # Host pool = ratio x device pool per rank; an explicit size (GB per
             # rank) overrides the ratio.
             "hicache_ratio": 3.0 if large else 2.0,
-            "hicache_size": EXP_WORKER_HICACHE_GB.get(conc, 56) if large else None,
+            "hicache_size": (EXP_WORKER_HICACHE_GB.get(conc) or 56) if large else None,
             # Write-through copies KV to the host once cached, so a device
             # eviction never waits for a write-back.
             "hicache_write_policy": "write_through" if large else "write_back",

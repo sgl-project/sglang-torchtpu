@@ -147,7 +147,7 @@ COMMON_FLAGS = {
     "--mem-fraction-static": ["0.95"],
     "--enable-torch-compile": [],
     "--speculative-algorithm": ["DFLASH"],
-    "--speculative-num-draft-tokens": ["8"],
+    "--speculative-num-draft-tokens": ["4"],
     "--scheduler-recv-interval": ["8"],
     "--schedule-policy": ["fcfs"],
     "--reasoning-parser": ["muse"],
@@ -172,10 +172,11 @@ COMMON_ENV = {
     "SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR": "1.0",
     "SGLANG_PREFILL_CHUNK_SHARE_MIN_TOKENS": "1024",
     "SGLANG_PREFILL_DECODE_INTERVAL_SKIP_IDLE": "1",
-    "SGLANG_SIMULATE_ACC_LEN": "4.05",
+    "SGLANG_SIMULATE_ACC_LEN": "3.06",
     "SGLANG_SIMULATE_ACC_METHOD": "match-expected",
-    "SGLANG_SIMULATE_ACC_TOKEN_MODE": "real-draft-token",
+    "SGLANG_SIMULATE_ACC_TOKEN_MODE": "fixed",
     "SGLANG_SPEC_TP_SYNC": "rng",
+    "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
     "SGLANG_TIMEOUT_KEEP_ALIVE": "900",
     "SGLANG_TPU_ALLOW_SPEC_RECOMPILE": "1",
     "SGLANG_TPU_DFLASH_FP8_DRAFT": "1",
@@ -242,7 +243,6 @@ PER_CONC = {
         },
         {
             "SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE": "131072",
-            "SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY": "4:4:3.06",
         },
     ),
     7: (
@@ -257,7 +257,6 @@ PER_CONC = {
         },
         {
             "SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE": "131072",
-            "SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY": "4:4:3.06",
         },
     ),
     9: (
@@ -272,7 +271,6 @@ PER_CONC = {
         },
         {
             "SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE": "131072",
-            "SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY": "4:4:3.06",
         },
     ),
     10: (
@@ -287,7 +285,6 @@ PER_CONC = {
         },
         {
             "SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE": "131072",
-            "SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY": "4:4:3.06",
         },
     ),
     16: (
@@ -313,7 +310,7 @@ PER_CONC = {
             "--prefill-decode-interval": ["64"],
             "--hicache-ratio": ["3.0"],
             "--hicache-write-policy": ["write_through"],
-            "--hicache-size": ["56"],
+            "--hicache-size": ["72"],
             "--enable-session-radix-cache": [],
             "--session-id-header": ["X-Correlation-ID"],
             "--session-leaf-at-prompt-end": [],
@@ -323,7 +320,6 @@ PER_CONC = {
             "SGLANG_HICACHE_SWA_HOST_EVICT_PASSED_FIRST": "1",
             "SGLANG_HICACHE_SWA_HOST_FRACTION": "0.3",
             "SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE": "16384",
-            "SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY": "3:4:3.06",
             "SGLANG_TPU_MUSE_MK_EXPERT_SPLIT": "4",
             "SGLANG_TPU_MUSE_MK_MAX_ROWS": "64",
         },
@@ -352,7 +348,6 @@ PER_CONC = {
             "--hicache-ratio": ["3.0"],
             "--hicache-write-policy": ["write_through"],
             "--hicache-size": ["72"],
-            "--speculative-num-draft-tokens": ["4"],
             "--enable-session-radix-cache": [],
             "--session-id-header": ["X-Correlation-ID"],
             "--session-leaf-at-prompt-end": [],
@@ -363,9 +358,6 @@ PER_CONC = {
             "SGLANG_HICACHE_SWA_HOST_FRACTION": "0.3",
             "SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE": "16384",
             "SGLANG_PREFILL_DECODE_INTERVAL_ADAPTIVE": "6:8",
-            "SGLANG_SIMULATE_ACC_LEN": "3.06",
-            "SGLANG_SIMULATE_ACC_TOKEN_MODE": "fixed",
-            "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
             "SGLANG_TPU_MUSE_MK_EXPERT_SPLIT": "4",
             "SGLANG_TPU_MUSE_MK_MAX_ROWS": "64",
         },
