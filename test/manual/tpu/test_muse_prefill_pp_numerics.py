@@ -262,13 +262,21 @@ def ref_attn(c, w, l, x, pool, table, rope, ids_in=None):
     live = kp <= qp
     if not is_g:
         live &= qp - kp < c.window
-    s = jnp.einsum("thgd,nhd->thgn", q8, keys, precision=HIGH)
-    s = jnp.where(live[:, None, None, :], s, -jnp.inf)
-    p = jnp.exp2(s - s.max(-1, keepdims=True))
-    out = jnp.einsum("thgn,nhd->thgd", _bf(p), vals, precision=HIGH) / p.sum(
-        -1, keepdims=True
-    )
+
+    def heads_out(qg):
+        sc = jnp.einsum("thgd,nhd->thgn", qg, keys, precision=HIGH)
+        sc = jnp.where(live[:, None, None, :], sc, -jnp.inf)
+        pr = jnp.exp2(sc - sc.max(-1, keepdims=True))
+        return jnp.einsum("thgn,nhd->thgd", _bf(pr), vals, precision=HIGH) / pr.sum(
+            -1, keepdims=True
+        )
+
+    out = heads_out(q8)
     attn = _bf(_heads_rms(out.reshape(T, qd), nqh, c.rms_eps))
+    # diagnostic: q head j on kv head j % kv_heads instead of j // (q_heads / kv_heads)
+    q_alt = q8.reshape(T, nqh // nkv, nkv, 64).transpose(0, 2, 1, 3)
+    out_alt = heads_out(q_alt).transpose(0, 2, 1, 3).reshape(T, qd)
+    attn_alt = _bf(_heads_rms(out_alt, nqh, c.rms_eps))
     gated = _bf(jax.nn.sigmoid(_bf(og)) * attn)
     a = _bf(_dot(gated, _untile(w["wo"][l])) * row("wo_s", H))
     x = row("attn_alpha", H) * x + row("attn_beta", H) * _bf(_rms(a, c.post_eps))
@@ -282,7 +290,7 @@ def ref_attn(c, w, l, x, pool, table, rope, ids_in=None):
     tw = tw / (tw.sum(1, keepdims=True) + c.router_eps) * c.route_scale
     pooled = _bf(_dot(ffn, _untile(w["wpool"][l])) * row("wpool_s", He))
     xe = _bf(_rms(pooled, c.rms_eps) * row("pre_expert_w", He))
-    return x, xe, ids, tw, k8, v8, biased, (_bf(q), _bf(k), attn)
+    return x, xe, ids, tw, k8, v8, biased, (_bf(q), _bf(k), attn, attn_alt)
 
 
 def ref_post(c, w, l, x, yn, tw):
@@ -424,7 +432,7 @@ def main() -> int:
             kernel_ids = routes[first + l][0][:, : c.top_k]
             pool, kpool = pools[first + l], pools_k[first + l]
             table = tables[GLOBAL[l]]
-            x_r, k8, v8, flipped, gap, (q_r, k_r, o_r) = ref_layer(
+            x_r, k8, v8, flipped, gap, (q_r, k_r, o_r, o_alt) = ref_layer(
                 c, w_ref, l, x_prev, pool, table, rope, kernel_ids, first + l
             )
             rel = jnp.linalg.norm(x_k - x_r, axis=1) / jnp.linalg.norm(x_r, axis=1)
