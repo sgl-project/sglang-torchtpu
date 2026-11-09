@@ -314,7 +314,16 @@ def _item_rows(S: dict, buf, b, first, n, start: bool) -> None:
 
 def _expert_loop(step: EPLayerStep, p: EPPlan, n_items, dispatched) -> None:
     """Every received slot's expert output back to its source's ep_yb row, item by item;
-    dispatched() waits for the slots (the first weight chunks are in flight by then)."""
+    dispatched() waits for the slots (the first weight chunks are in flight by then). The
+    loop runs inside the layer's for_layer leaf: a chunk's copies take no branch-tree walk."""
+    step.for_layer(
+        lambda refs, off: _expert_loop_on(step, p, n_items, dispatched, refs, off)
+    )
+
+
+def _expert_loop_on(
+    step: EPLayerStep, p: EPPlan, n_items, dispatched, refs, off
+) -> None:
     c, S, me = step.c, step.S, step.me
     He, NC, RI = c.expert_hidden, p.n_chunks(step.kind), p.item_rows
     D, CI = p.slots(step.kind), p.chunk(step.kind)
@@ -332,17 +341,14 @@ def _expert_loop(step: EPLayerStep, p: EPPlan, n_items, dispatched) -> None:
         @pl.when(k < (jnp.minimum(total, D) if _dev_skip("wdma") else total))
         def _():
             _, e, _, _, j = item(k)
-            step.for_layer(
-                lambda refs, off: [
-                    cp.start() for cp in _chunk_copies(step, p, refs, off, e, j, k % D)
-                ]
-            )
+            for cp in _chunk_copies(step, p, refs, off, e, j, k % D):
+                cp.start()
 
     def wait(slot, k):
-        refs, off = step.wait_refs
+        wrefs, woff = step.wait_refs
 
         def w():
-            for cp in _chunk_copies(step, p, refs, off, 0, 0, slot):
+            for cp in _chunk_copies(step, p, wrefs, woff, 0, 0, slot):
                 cp.wait()
 
         if _dev_skip("wdma") or _dev_skip("wwait"):
