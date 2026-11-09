@@ -9,7 +9,12 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.muse_megakernel.ep_mk import dispatch
-from sglang_tpu.muse_megakernel.ep_mk.config import EPPlan, ep_plan, ep_scratch
+from sglang_tpu.muse_megakernel.ep_mk.config import (
+    EPPlan,
+    ep_buffers,
+    ep_plan,
+    ep_scratch,
+)
 from sglang_tpu.muse_megakernel.ep_mk.experts import (
     ChunkRefs,
     chunk_compute,
@@ -27,7 +32,7 @@ from sglang_tpu.muse_megakernel.mk.plan import owner_window_rows
 class EPExperts:
     """EPHook: whole experts per rank (ep_plan) for the row-tiled megakernel."""
 
-    def __init__(self, cfg: MKConfig, item_rows: int = 64):
+    def __init__(self, cfg: MKConfig, item_rows: int = 32):
         self.plan = ep_plan(cfg, item_rows)
 
     def scratch_plan(self, cfg: MKConfig, plan: list) -> list:
@@ -38,11 +43,12 @@ class EPExperts:
         local_slots(c, p, S, step.me, step.n_live)
         n_items = build_items(p, S)
         dispatch.reset_counts(S)
+        dispatch.send_counts(c, p, S, step.me, n_items)
+        buf = ep_buffers(c, p, S)
         _expert_loop(step, p, n_items)
         step.flush_dense()
-        dispatch.drain_y(S, 0)
-        dispatch.drain_y(S, 1)
-        dispatch.wait_my_rows(c, S, step.me, step.n_live)
+        dispatch.drain_y(S, buf)
+        dispatch.wait_my_rows(c, S, buf, step.me)
         _combine(step)
 
 
@@ -139,6 +145,7 @@ def _expert_loop(step: EPMoEStep, p: EPPlan, n_items) -> None:
     D, CI = p.slots(step.kind), p.chunk(step.kind)
     sizes = item_sizes(RI)
     items = S["ep_items"]
+    buf = ep_buffers(c, p, S)
     total = n_items * NC
 
     def item(k):
@@ -165,37 +172,42 @@ def _expert_loop(step: EPMoEStep, p: EPPlan, n_items) -> None:
 
     @pl.when(n_items > 0)
     def _():
-        dispatch.gather_x_start(c, S, 0, items[1], items[2], items[3])
+        dispatch.gather_x_start(c, p, S, buf, 0, items[1], items[2], items[3])
 
     def body(k, carry):
         i, e, j0, n, j = item(k)
-        b = i % 2  # x, accumulator and y staging alternate between items
+        b = i % 2  # x rows and y staging alternate between items
         slot = k % D
 
         @pl.when(j == 0)
         def _():
-            dispatch.gather_x_wait(S, b, n)
+            dispatch.gather_x_wait(S, buf, b, n)
 
             @pl.when(i + 1 < n_items)
             def _():
                 dispatch.gather_x_start(
-                    c, S, 1 - b, items[4 + 3 * i], items[5 + 3 * i], items[6 + 3 * i]
+                    c,
+                    p,
+                    S,
+                    buf,
+                    1 - b,
+                    items[4 + 3 * i],
+                    items[5 + 3 * i],
+                    items[6 + 3 * i],
                 )
 
-            def unpack_zero(z):
-                rows = pl.ds(0, z)
-                S["ep_xf"][rows, :] = _unpack_bf16x2(S["ep_x"][b, rows, :])
-                S["ep_acc"][b, rows, :] = jnp.zeros((z, He), jnp.float32)
+            def zero(z):
+                buf.acc[pl.ds(0, z), :] = jnp.zeros((z, He), jnp.float32)
 
-            sized(n, sizes, unpack_zero)
+            sized(n, sizes, zero)
 
         start(k + D - 1)
         wait(slot)
         chunk_compute(
             step.kind,
             n,
-            lambda R: S["ep_xf"][pl.ds(0, R), :],
-            S["ep_acc"].at[b],
+            lambda R: _unpack_bf16x2(buf.x(b)[pl.ds(0, R), :]),
+            buf.acc,
             _chunk_refs(step, p, slot),
             He,
             CI,
@@ -204,15 +216,13 @@ def _expert_loop(step: EPMoEStep, p: EPPlan, n_items) -> None:
 
         @pl.when(j == NC - 1)
         def _():
-            dispatch.drain_y(S, b)
+            dispatch.drain_y(S, buf)
 
             def pack(z):
-                S["ep_y"][b, pl.ds(0, z), :] = _pack_bf16x2(
-                    S["ep_acc"][b, pl.ds(0, z), :]
-                )
+                buf.y[pl.ds(0, z), :] = _pack_bf16x2(buf.acc[pl.ds(0, z), :])
 
             sized(n, sizes, pack)
-            dispatch.send_y(c, S, step.me, b, e, j0, n)
+            dispatch.send_y(c, p, S, buf, step.me, e, j0, n)
 
         return carry
 
@@ -235,10 +245,23 @@ def _combine(step: EPMoEStep) -> None:
     wmine = S["wsel_v"][pl.ds(w0, win), pl.ds(0, K)]  # [win, K]
     wk = jnp.concatenate([wmine[:, k : k + 1][:, :, None] for k in range(K)], axis=1)
     S["wk_s"][...] = jnp.broadcast_to(wk, (win, K, LANE))
-    pad = S["ep_pad"]
+
+    def row_copy(r, b):
+        return pltpu.make_async_copy(
+            S["ep_pad"].at[r], S["ep_yrow"].at[b], S["ep_yrow_sems"].at[b]
+        )
+
+    row_copy(0, 0).start()
 
     def row(r, carry):
-        ysum = _unpack_bf16x2(pad.at[r][...])  # [K, He]
+        b = r % 2
+
+        @pl.when(r + 1 < Rc)
+        def _():
+            row_copy(r + 1, 1 - b).start()
+
+        row_copy(r, b).wait()
+        ysum = _unpack_bf16x2(S["ep_yrow"][b])  # [K, He]
         ysum = jnp.where(me * Rc + r < n_live, ysum, 0.0).astype(bf16).astype(f32)
         ysc = ysum * pw
         nrm = jax.lax.rsqrt(

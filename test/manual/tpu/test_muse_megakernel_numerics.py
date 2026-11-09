@@ -837,8 +837,8 @@ def _row_rel(out: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
 
 
 def _near_tie_swaps(biased_row: torch.Tensor, ids_row: torch.Tensor):
-    """Alternative top-k sets swapping an expert within NEAR_TIE of the boundary for one
-    just outside it."""
+    """Alternative top-k sets swapping one or two experts within NEAR_TIE of the boundary
+    for as many just outside it."""
     order = torch.argsort(biased_row, descending=True)
     edge = 0.5 * (biased_row[order[TOP_K - 1]] + biased_row[order[TOP_K]])
     near = (biased_row - edge).abs() < NEAR_TIE
@@ -847,6 +847,84 @@ def _near_tie_swaps(biased_row: torch.Tensor, ids_row: torch.Tensor):
     for a in inside:
         for b in outside:
             yield torch.where(ids_row == a, torch.tensor(b), ids_row)
+    for i, a1 in enumerate(inside):
+        for a2 in inside[i + 1 :]:
+            for j, b1 in enumerate(outside):
+                for b2 in outside[j + 1 :]:
+                    alt = torch.where(ids_row == a1, torch.tensor(b1), ids_row)
+                    yield torch.where(alt == a2, torch.tensor(b2), alt)
+
+
+def _debug_row(ref, mid, xe, sc, ids, out, r, biased) -> None:
+    """Which slot of row r the kernel got wrong: the row's error with one slot's y zeroed or
+    replaced by another slot's (debug)."""
+    ref.expert_rows(xe, {(r, int(e)) for e in ids[r]})
+    ys = torch.stack([ref._y[(r, int(e))] for e in ids[r]])  # [K, He]
+    rep = ref.rep
+
+    def row_out(y):
+        ynorm = _bf(_rms(y[None] * rep["post_expert_w"], POST_EPS))
+        w = torch.gather(sc[r : r + 1], 1, ids[r : r + 1])
+        w = w / (w.sum(1, keepdim=True) + ROUTER_EPS) * ROUTE_SCALE
+        u = _bf((ynorm * w[:, :, None]).sum(1))
+        f = torch.cat([_bf(ref._mv(u, d, "wunpool")) for d in range(TP)], dim=1)
+        return rep["ffn_alpha"] * mid[r : r + 1] + rep["ffn_beta"] * _bf(
+            _rms(f * rep["post_ffn_w"], POST_EPS)
+        )
+
+    res = {"as_is": float(_row_rel(out[r : r + 1], row_out(ys))[0])}
+    for k in range(TOP_K):
+        for j in [None] + [j for j in range(TOP_K) if j != k]:
+            y2 = ys.clone()
+            y2[k] = 0 if j is None else ys[j]
+            res[f"k{k}_" + ("zero" if j is None else f"as{j}")] = float(
+                _row_rel(out[r : r + 1], row_out(y2))[0]
+            )
+    # a slot computed on another row's x (a wrong gather)
+    k_bad = int(min((v, kk) for kk, v in res.items() if kk.endswith("_zero"))[1][1])
+    e_bad = int(ids[r][k_bad])
+    ref.expert_rows(xe, {(r2, e_bad) for r2 in range(ids.shape[0])})
+    for r2 in range(ids.shape[0]):
+        y2 = ys.clone()
+        y2[k_bad] = ref._y[(r2, e_bad)]
+        res[f"k{k_bad}_x{r2}"] = float(_row_rel(out[r : r + 1], row_out(y2))[0])
+    # another expert of the same rank, or the right one missing / doubling one I-chunk (one
+    # TP slice is one EP chunk)
+    x = xe[r : r + 1]
+    owner = e_bad // (N_EXPERTS // TP)
+    for e2 in range(owner * (N_EXPERTS // TP), (owner + 1) * (N_EXPERTS // TP)):
+        ref.expert_rows(xe, {(r, e2)})
+        y2 = ys.clone()
+        y2[k_bad] = ref._y[(r, e2)]
+        res[f"k{k_bad}_e{e2}"] = float(_row_rel(out[r : r + 1], row_out(y2))[0])
+    parts = []
+    for d in range(TP):
+        w13, w2 = decode_expert(expert_slabs(ref.l, d, e_bad, ref.kind), ref.kind)
+        gu = x @ w13
+        h = _bf(
+            gu[:, :INTER_LOCAL]
+            * torch.sigmoid(gu[:, :INTER_LOCAL])
+            * gu[:, INTER_LOCAL:]
+        )
+        parts.append(_bf(h @ w2)[0])
+    for d in range(TP):
+        for name, mult in (("drop", 0.0), ("twice", 2.0)):
+            y2 = ys.clone()
+            y2[k_bad] = _bf(sum(parts) + (mult - 1.0) * parts[d])
+            res[f"k{k_bad}_chunk{d}_{name}"] = float(
+                _row_rel(out[r : r + 1], row_out(y2))[0]
+            )
+    best = sorted(res.items(), key=lambda kv: kv[1])[:4]
+    order = torch.argsort(biased[r], descending=True)
+    edge = float(0.5 * (biased[r][order[TOP_K - 1]] + biased[r][order[TOP_K]]))
+    top12 = [(int(e), round(float(biased[r][e]) - edge, 5)) for e in order[:12]]
+    info = {
+        "row": r,
+        "ids": ids[r].tolist(),
+        "owner": [int(e) // 32 for e in ids[r]],
+        "score_minus_edge": top12,
+    }
+    print("MK_NUMERICS_DEBUG_ROW", json.dumps({**info, "best": best}), flush=True)
 
 
 def check_layer(
@@ -861,7 +939,7 @@ def check_layer(
     ids = torch.topk(biased, TOP_K, dim=1).indices
     want = ref.ffn_block(mid, xe, sc, ids)
     rel = _row_rel(out, want)
-    flips, unexplained = [], []
+    flips, double_flips, unexplained = [], [], []
     forced = int(l > 0)
     tol_row = TOL_ROW_REL[forced]
     for r in torch.nonzero(rel > tol_row).flatten().tolist():
@@ -876,10 +954,14 @@ def check_layer(
                 best = (e2, ids2)
         if best is not None and best[0] <= tol_row:
             flips.append(r)
+            if int((best[1][r] != ids[r]).sum()) == 2:
+                double_flips.append(r)
             rel[r] = best[0]
             want[r] = ref.ffn_block(mid, xe, sc, best[1])[r]
         else:
             unexplained.append(r)
+            if os.environ.get("MK_NUMERICS_DEBUG_ROWS") == "1":
+                _debug_row(ref, mid, xe, sc, ids, out, r, biased)
     kv_rel = _row_rel(new_kv.reshape(TP * n, -1), kv_ref.reshape(TP * n, -1))
     diff = (out - want).abs()
     res = {
@@ -894,6 +976,7 @@ def check_layer(
         "ref_rms": float(want.pow(2).mean().sqrt()),
         "kv_max_rel": float(kv_rel.max()),
         "route_flips": len(flips),
+        "route_double_flips": double_flips,  # rows two near-tie swaps explain
         "route_unexplained": unexplained,
         "ref_s": round(time.time() - t0, 1),
     }

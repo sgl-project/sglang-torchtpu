@@ -5,7 +5,7 @@ expert section, and the layout its weights take (EP_WEIGHTS)."""
 import jax
 import numpy as np
 
-from sglang_tpu.muse_megakernel.ep_mk.config import ep_expert_shapes
+from sglang_tpu.muse_megakernel.ep_mk.config import ep_expert_shapes, ep_mk_config
 from sglang_tpu.muse_megakernel.ep_mk.experts import (
     fp4_weights_kperm,
     kperm,
@@ -22,6 +22,7 @@ def ep_megakernel_call(cfg: MKConfig, axis: str = "model"):
     """megakernel_call's f(meta, pos, pages_full, pages_swa, emb, *weights, *experts, *kv) with
     each layer's experts as ep_expert_shapes (ep_expert_weights) and the pooled width in
     pooled_perm order (wpool's output columns, wpool_s and pre_expert_w permuted)."""
+    cfg = ep_mk_config(cfg)
     return megakernel_call(cfg, axis, ep=EPExperts(cfg))
 
 

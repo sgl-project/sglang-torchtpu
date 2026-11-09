@@ -13,8 +13,9 @@ from sglang_tpu.muse_megakernel.mk.consts import LANE
 
 
 def local_slots(c: MKConfig, p: EPPlan, S: dict, me, n_live) -> None:
-    """S["ep_route_s"][e, j] = row * K + slot of local expert e's j-th live pair (rows
-    ascending; each row picks an expert at most once), S["ep_route_s"][EL, e] its count.
+    """S["ep_route_s"]: row * K + slot of local expert e's j-th live pair (rows ascending; each
+    row picks an expert at most once) at slot_pair(e, j), the count at [count_row, e]. LANE-wide
+    rows, as the SMEM copy of a VMEM table keeps them.
 
     A pair's place among its expert's pairs is an inclusive row prefix sum (on the MXU: 0/1
     and counts <= R are exact in bf16, summed in f32); the j-th pair is the row whose prefix
@@ -42,16 +43,9 @@ def local_slots(c: MKConfig, p: EPPlan, S: dict, me, n_live) -> None:
     enc = jnp.where(hit > 0, r_col * K + slot, 0)
     tagged = jnp.where(hit > 0, cum, 0.0)  # a hit row's 1-based place in its expert
 
-    rows_v = S["ep_route_v"].shape[0]
-    crow = rows_v - 8
-    pad = p.slots_pad - LANE
-    count_row = (
-        jnp.concatenate([count, jnp.zeros((1, pad), jnp.int32)], axis=1)
-        if pad
-        else count
-    )
+    crow = count_row(p, S)
     S["ep_route_v"][pl.ds(crow, 8), :] = jnp.concatenate(
-        [count_row, jnp.zeros((7, p.slots_pad), jnp.int32)], axis=0
+        [count, jnp.zeros((7, LANE), jnp.int32)], axis=0
     )
     sem = S["ep_route_sem"].at[0]
     cnt_cp = pltpu.make_async_copy(
@@ -72,10 +66,10 @@ def local_slots(c: MKConfig, p: EPPlan, S: dict, me, n_live) -> None:
         return carry
 
     jax.lax.fori_loop(0, (max_cnt + 7) // 8, block, 0)
-    tab_t = jnp.transpose(
-        S["ep_tab"][...]
-    )  # [LANE, slots_pad]; slots past a count: stale
-    S["ep_route_v"][pl.ds(0, crow), :] = tab_t[:crow]
+    elp = _experts_padded(p)
+    for jb in range(p.slots_pad // LANE):  # slots past a count: stale
+        tab_t = jnp.transpose(S["ep_tab"][pl.ds(jb * LANE, LANE), :])  # [e, j]
+        S["ep_route_v"][pl.ds(jb * elp, elp), :] = tab_t[:elp]
     tab_cp = pltpu.make_async_copy(
         S["ep_route_v"].at[pl.ds(0, crow)], S["ep_route_s"].at[pl.ds(0, crow)], sem
     )
@@ -83,9 +77,24 @@ def local_slots(c: MKConfig, p: EPPlan, S: dict, me, n_live) -> None:
     tab_cp.wait()
 
 
+def _experts_padded(p: EPPlan) -> int:
+    return -(-p.experts // 8) * 8
+
+
+def route_rows(p: EPPlan) -> int:
+    """Rows of the routing table: per block of LANE slots, one row per local expert (8-row
+    padded), then 8 rows whose first holds the counts."""
+    return (p.slots_pad // LANE) * _experts_padded(p) + 8
+
+
 def count_row(p: EPPlan, S: dict) -> int:
     """The SMEM row of the per-expert slot counts."""
-    return S["ep_route_s"].shape[0] - 8
+    return route_rows(p) - 8
+
+
+def slot_pair(p: EPPlan, S: dict, e, j):
+    """row * K + slot of local expert e's j-th pair."""
+    return S["ep_route_s"][(j // LANE) * _experts_padded(p) + e, j % LANE]
 
 
 def build_items(p: EPPlan, S: dict) -> jax.Array:
