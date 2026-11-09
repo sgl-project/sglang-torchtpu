@@ -4,12 +4,18 @@ row each), then per (source, destination) one contiguous segment of slot rows, m
 SEG-row DMAs (segments start on SEG-row boundaries) and waited for in SEG-row units."""
 
 import jax
-import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.muse_megakernel.ep_mk.config import SEG
-from sglang_tpu.muse_megakernel.ep_mk.route import seg_rows, seg_start
+from sglang_tpu.muse_megakernel.ep_mk.route import (
+    T_BACK,
+    T_DMAS,
+    T_DST,
+    T_RECV,
+    T_SEND,
+    seg_dmas,
+)
 from sglang_tpu.muse_megakernel.mk.config import MKConfig
 
 
@@ -51,33 +57,31 @@ def _seg_copy(src_buf, dst_buf, s0, d0, i, peer, me, sems):
 def dispatch(c: MKConfig, S: dict, me) -> None:
     """This rank's send segment for each destination d (ep_xs) into d's receive buffer
     (ep_xr) after the sources before this rank."""
+    tab = S["ep_tab_s"]
     sems = (S["ep_a2a_sems"].at[0], S["ep_a2a_sems"].at[1])
     for d in range(c.tp):
-        _, n_dma = seg_rows(S, me, d)
-        s0 = seg_start(S, c.tp, me, d, by_source=False)
-        d0 = seg_start(S, c.tp, me, d, by_source=True)
+        s0, d0 = tab[T_SEND, d], tab[T_DST, d]
 
         def one(i, carry, s0=s0, d0=d0, d=d):
             _seg_copy(S["ep_xs"], S["ep_xr"], s0, d0, i, d, me, sems)
             return carry
 
-        jax.lax.fori_loop(0, n_dma, one, 0)
+        jax.lax.fori_loop(0, seg_dmas(S, me, d), one, 0)
 
 
 def give_back(c: MKConfig, S: dict, me) -> None:
     """Each source s's received segment's y (ep_yr) back to s's return buffer (ep_yb), where
     s sent it from."""
+    tab = S["ep_tab_s"]
     sems = (S["ep_a2a_sems"].at[2], S["ep_a2a_sems"].at[3])
     for s in range(c.tp):
-        _, n_dma = seg_rows(S, s, me)
-        r0 = seg_start(S, c.tp, s, me, by_source=True)
-        b0 = seg_start(S, c.tp, s, me, by_source=False)
+        r0, b0 = tab[T_RECV, s], tab[T_BACK, s]
 
         def one(i, carry, r0=r0, b0=b0, s=s):
             _seg_copy(S["ep_yr"], S["ep_yb"], r0, b0, i, s, me, sems)
             return carry
 
-        jax.lax.fori_loop(0, n_dma, one, 0)
+        jax.lax.fori_loop(0, seg_dmas(S, s, me), one, 0)
 
 
 def _wait(S: dict, buf: str, sem, n) -> None:
@@ -92,31 +96,16 @@ def _wait(S: dict, buf: str, sem, n) -> None:
     jax.lax.fori_loop(0, n, one, 0)
 
 
-def _incoming(c: MKConfig, S: dict, me, *, as_source: bool):
-    total = jnp.int32(0)
-    for x in range(c.tp):
-        total = (
-            total + seg_rows(S, me, x)[1]
-            if as_source
-            else total + seg_rows(S, x, me)[1]
-        )
-    return total
-
-
 def wait_dispatch(c: MKConfig, S: dict, me) -> None:
     """Waits for every source's segment into ep_xr and this rank's sends out of ep_xs."""
-    _wait(S, "ep_xr", S["ep_a2a_sems"].at[0], _incoming(c, S, me, as_source=False))
-    sent = jnp.int32(0)
-    for d in range(c.tp):
-        sent = sent + jnp.where(d == me, 0, seg_rows(S, me, d)[1])
-    _wait(S, "ep_xs", S["ep_a2a_sems"].at[1], sent)
+    tab = S["ep_tab_s"]
+    _wait(S, "ep_xr", S["ep_a2a_sems"].at[0], tab[T_DMAS, 0])
+    _wait(S, "ep_xs", S["ep_a2a_sems"].at[1], tab[T_DMAS, 1] - seg_dmas(S, me, me))
 
 
 def wait_give_back(c: MKConfig, S: dict, me) -> None:
     """Waits for every destination's y of this rank's slots into ep_yb, and this rank's
     sends out of ep_yr."""
-    _wait(S, "ep_yb", S["ep_a2a_sems"].at[2], _incoming(c, S, me, as_source=True))
-    sent = jnp.int32(0)
-    for s in range(c.tp):
-        sent = sent + jnp.where(s == me, 0, seg_rows(S, s, me)[1])
-    _wait(S, "ep_yr", S["ep_a2a_sems"].at[3], sent)
+    tab = S["ep_tab_s"]
+    _wait(S, "ep_yb", S["ep_a2a_sems"].at[2], tab[T_DMAS, 1])
+    _wait(S, "ep_yr", S["ep_a2a_sems"].at[3], tab[T_DMAS, 0] - seg_dmas(S, me, me))

@@ -64,7 +64,18 @@ class EPExperts:
         self.plan = ep_plan(cfg, item_rows)
 
     def scratch_plan(self, cfg: MKConfig, plan: list) -> list:
-        return plan + ep_scratch(cfg, self.plan)
+        # TP's expert section's routing tables and y staging go unused (SMEM especially:
+        # scalar spills overflow it into HBM)
+        unused = {
+            "route_s",
+            "route_v",
+            "ids_s",
+            "ystage",
+            "ystage_sems",
+            "yrow",
+            "yrow_sems",
+        }
+        return [e for e in plan if e[0] not in unused] + ep_scratch(cfg, self.plan)
 
     def layer_moe(self, step: EPLayerStep) -> None:
         c, S, p, me = step.c, step.S, self.plan, step.me
@@ -83,12 +94,12 @@ class EPExperts:
                 a2a.exchange_counts(c, S, me)
             else:
                 S["ep_cnt_v"][...] = jnp.zeros(S["ep_cnt_v"].shape, jnp.int32)
-            route.slot_matrix(c, S)
+            route.slot_tables(c, p, S, me)
         with _phase("dispatch"):
             if moving:
                 a2a.dispatch(c, S, me)
         with _phase("items"):
-            n_items = route.build_items(c, p, S, me)
+            n_items = route.build_items(c, p, S)
         with _phase("dispatch_wait"):
             if moving:
                 a2a.wait_dispatch(c, S, me)
@@ -160,7 +171,7 @@ def _fill_send(step: EPLayerStep, p: EPPlan, win) -> None:
             for k in range(K):
                 pltpu.make_async_copy(
                     S["ep_xo"].at[pl.ds(wr, 1)],
-                    S["ep_xs"].at[pl.ds(S["ep_pos_s"][wr, k], 1)],
+                    S["ep_xs"].at[pl.ds(S["ep_pos_s"][k, wr], 1)],
                     sem,
                 ).start()
 
@@ -410,7 +421,7 @@ def _combine(step: EPLayerStep, win) -> None:
         wr = w_off + r
         return [
             pltpu.make_async_copy(
-                S["ep_yb"].at[pl.ds(S["ep_pos_s"][wr, k], 1)],
+                S["ep_yb"].at[pl.ds(S["ep_pos_s"][k, wr], 1)],
                 S["ep_yrow"].at[b, pl.ds(k, 1)],
                 sems.at[b],
             )

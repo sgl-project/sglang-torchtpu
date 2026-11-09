@@ -8,7 +8,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.muse_megakernel.ep_mk.config import SEG, EPPlan
+from sglang_tpu.muse_megakernel.ep_mk.config import SEG, TAB_ROWS, EPPlan
 from sglang_tpu.muse_megakernel.mk.config import MKConfig
 from sglang_tpu.muse_megakernel.mk.consts import LANE, SMALL
 from sglang_tpu.muse_megakernel.mk.numerics import _topk_iter
@@ -50,9 +50,9 @@ def _dot(a, b):
 
 
 def send_places(c: MKConfig, p: EPPlan, S: dict, n_live, win) -> None:
-    """ep_csend row 0: this rank's live slots per expert; ep_pos_v / ep_pos_s lanes [0, K)
-    (window rows): each own slot's row in ep_xs, where slots run by expert, each destination
-    rank's experts in a segment padded to SEG rows, rows ascending within an expert.
+    """ep_csend row 0: this rank's live slots per expert; ep_pos_v / ep_pos_s [k, window row]:
+    each own slot's row in ep_xs, where slots run by expert, each destination rank's experts
+    in a segment padded to SEG rows, rows ascending within an expert.
 
     Small exact integers through f32 matmuls of one-hots against prefix masks.
     """
@@ -79,7 +79,16 @@ def send_places(c: MKConfig, p: EPPlan, S: dict, n_live, win) -> None:
     pos = jnp.concatenate(
         [jnp.sum(oh * place, axis=1, keepdims=True) for oh in onehots], axis=1
     )
-    S["ep_pos_v"][:, pl.ds(0, K)] = pos.astype(jnp.int32)
+    pos_t = jnp.transpose(  # [LANE, window]: slot k's places on row k
+        jnp.concatenate(
+            [pos.astype(jnp.int32), jnp.zeros((wn, LANE - K), jnp.int32)], axis=1
+        )
+    )
+    S["ep_pos_v"][...] = (
+        jnp.concatenate([pos_t[:8], jnp.zeros((8, LANE - wn), jnp.int32)], axis=1)
+        if wn < LANE
+        else pos_t[:8]
+    )
     S["ep_csend"][...] = jnp.concatenate(
         [count.astype(jnp.int32), jnp.zeros((7, E), jnp.int32)], axis=0
     )
@@ -88,63 +97,88 @@ def send_places(c: MKConfig, p: EPPlan, S: dict, n_live, win) -> None:
     cp.wait()
 
 
-def slot_matrix(c: MKConfig, S: dict) -> None:
-    """ep_nmat_s[s, d]: slots rank s sends rank d; ep_cnt_s: every rank's counts row."""
-    E, el, tp = c.n_experts, c.n_experts // c.tp, c.tp
-    n = _dot(S["ep_cnt_v"][...].astype(jnp.float32), _to_dst(E, el))  # [tp, LANE]
-    S["ep_nmat_v"][pl.ds(0, tp), :] = n.astype(jnp.int32)
-    cps = [
-        pltpu.make_async_copy(S["ep_nmat_v"], S["ep_nmat_s"], S["ep_misc_sems"].at[2]),
-        pltpu.make_async_copy(S["ep_cnt_v"], S["ep_cnt_s"], S["ep_misc_sems"].at[3]),
-    ]
-    for cp in cps:
-        cp.start()
-    for cp in cps:
-        cp.wait()
+# rows of S["ep_tab_s"] (route.slot_tables): per (source s / destination d) lane
+T_N = 0  # [s, d]: slots s sends d (8 rows)
+T_MINE = 8  # [s, e]: slots s sends this rank's local expert e (8 rows)
+T_PRE = 16  # [s, e]: the slots before e's within s's segment here (8 rows)
+T_RECV = 24  # [s]: s's segment start in this rank's receive buffer
+T_SEND = 25  # [d]: this rank's segment for d in its send buffer
+T_DST = 26  # [d]: this rank's segment start in d's receive buffer
+T_BACK = 27  # [s]: s's segment for this rank in s's send buffer (where y goes back)
+T_DMAS = 28  # [0]: SEG-row DMAs into this rank's receive buffer, [1]: into its return
 
 
-def seg_start(S: dict, tp: int, s, d, *, by_source: bool):
-    """Start row of the (s -> d) segment: in rank s's send buffer (by_source=False: its
-    destinations before d) or in rank d's receive buffer (by_source=True: the sources before
-    s); every segment padded to SEG rows."""
-    n = S["ep_nmat_s"]
-    total = jnp.int32(0)
-    for x in range(tp):
-        cnt = n[x, d] if by_source else n[s, x]
-        before = x < s if by_source else x < d
-        total = total + jnp.where(before, _ceil_seg(cnt), 0)
-    return total
+def slot_tables(c: MKConfig, p: EPPlan, S: dict, me) -> None:
+    """S["ep_tab_s"] from every rank's per-expert counts (ep_cnt_v), all on the VPU / MXU:
+    the slot matrix, segment starts (SEG-padded) on both sides, and this rank's experts'
+    counts and offsets per source."""
+    E, el, tp = c.n_experts, p.experts, c.tp
+    f32, i32 = jnp.float32, jnp.int32
+    cnt = S["ep_cnt_v"][...].astype(f32)  # [tp, E]
+    n = _dot(cnt, _to_dst(E, el))  # [tp, LANE]
+    sel = (
+        jax.lax.broadcasted_iota(i32, (E, LANE), 0)
+        == me * el + jax.lax.broadcasted_iota(i32, (E, LANE), 1)
+    ) & (jax.lax.broadcasted_iota(i32, (E, LANE), 1) < el)
+    mine = _dot(cnt, sel.astype(f32))  # [tp, LANE]
+    l_r = jax.lax.broadcasted_iota(i32, (LANE, LANE), 0)
+    l_c = jax.lax.broadcasted_iota(i32, (LANE, LANE), 1)
+    upper = (l_r < l_c).astype(f32)  # x @ upper: exclusive prefix along lanes
+    pre = _dot(mine, upper)
+    seg = _ceil_seg(n.astype(i32)).astype(f32)  # [tp, LANE]
+    s_col = jax.lax.broadcasted_iota(i32, (tp, 1), 0)
+    lane = jax.lax.broadcasted_iota(i32, (1, LANE), 1)
+    at_me = (lane == me).astype(f32)  # [1, LANE]
+    col_me = jnp.sum(seg * at_me, axis=1, keepdims=True)  # [tp, 1]: seg[s, me]
+    row_me = jnp.sum(
+        jnp.where(s_col == me, seg, 0.0), axis=0, keepdims=True
+    )  # seg[me, :]
+
+    def as_row(col):  # [tp, 1] -> [1, LANE], lane s = col[s]
+        return jnp.sum(jnp.where(s_col == lane, col, 0.0), axis=0, keepdims=True)
+
+    recv = as_row(
+        jnp.sum(jnp.where(s_col > s_col.T, col_me.T, 0.0), axis=1, keepdims=True)
+    )
+    send = _dot(row_me, upper)
+    dst = jnp.sum(jnp.where(s_col < me, seg, 0.0), axis=0, keepdims=True)
+    back = as_row(jnp.sum(seg * (lane < me).astype(f32), axis=1, keepdims=True))
+    dmas = jnp.where(
+        lane == 0,
+        jnp.sum(col_me) / SEG,
+        jnp.where(lane == 1, jnp.sum(row_me) / SEG, 0.0),
+    )
+    rows = [n, mine, pre, recv, send, dst, back, dmas]
+    rows.append(jnp.zeros((TAB_ROWS - T_DMAS - 1, LANE), f32))
+    S["ep_tab_v"][...] = jnp.concatenate(rows, axis=0).astype(i32)
+    cp = pltpu.make_async_copy(S["ep_tab_v"], S["ep_tab_s"], S["ep_misc_sems"].at[2])
+    cp.start()
+    cp.wait()
 
 
-def seg_rows(S: dict, s, d):
-    """Slots of the (s -> d) segment, and its 8-row DMAs."""
-    n = S["ep_nmat_s"][s, d]
-    return n, (n + SEG - 1) // SEG
+def seg_dmas(S: dict, s, d):
+    """SEG-row DMAs of the (s -> d) segment."""
+    return (S["ep_tab_s"][T_N + s, d] + SEG - 1) // SEG
 
 
-def build_items(c: MKConfig, p: EPPlan, S: dict, me) -> jax.Array:
+def build_items(c: MKConfig, p: EPPlan, S: dict) -> jax.Array:
     """ep_rows: received slot rows grouped by local expert (each source's slots for an expert
     are contiguous in its segment); ep_items = [n_items, (expert, first, rows)...] over
     ep_rows, at most item_rows each. Returns n_items."""
     tp, el, ri = c.tp, p.experts, p.item_rows
-    cnt, rows, items = S["ep_cnt_s"], S["ep_rows"], S["ep_items"]
-    starts = [seg_start(S, tp, s, me, by_source=True) for s in range(tp)]
+    tab, rows, items = S["ep_tab_s"], S["ep_rows"], S["ep_items"]
 
     def expert(e, carry):
         n_rows, n_items = carry
         first = n_rows
         for s in range(tp):
-
-            def before(e2, acc, s=s):
-                return acc + cnt[s, me * el + e2]
-
-            base = starts[s] + jax.lax.fori_loop(0, e, before, jnp.int32(0))
+            base = tab[T_RECV, s] + tab[T_PRE + s, e]
 
             def one(t, n, base=base):
                 rows[n] = base + t
                 return n + 1
 
-            n_rows = jax.lax.fori_loop(0, cnt[s, me * el + e], one, n_rows)
+            n_rows = jax.lax.fori_loop(0, tab[T_MINE + s, e], one, n_rows)
         total = n_rows - first
 
         def item(b, n):

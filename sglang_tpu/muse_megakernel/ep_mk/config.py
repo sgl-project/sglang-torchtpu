@@ -16,6 +16,7 @@ from sglang_tpu.muse_megakernel.mk.consts import LANE
 from sglang_tpu.muse_megakernel.mk.plan import fit_ring_slots
 
 MIN_ROWS = 64  # EP serves the large-row steps only
+TAB_ROWS = 32  # route.slot_tables' rows
 SEG = 8  # a2a segments start on 8-row (HBM tile) boundaries and move in 8-row DMAs
 DN_TK, DN_TN = 2048, 1024  # a replicated pool / unpool tile: one fp4 expert-ring slot
 
@@ -161,16 +162,15 @@ def ep_scratch(c: MKConfig, p: EPPlan) -> list:
         ("ep_xo", vmem((win, he // 2), u32)),
         ("ep_ids", vmem((win, LANE), i32)),
         ("ep_wsel", vmem((win, LANE), f32)),
-        ("ep_pos_v", vmem((win, LANE), i32)),
-        ("ep_pos_s", smem((win, LANE), i32)),
+        ("ep_pos_v", vmem((8, LANE), i32)),  # [slot k, window row] (window <= LANE)
+        ("ep_pos_s", smem((8, LANE), i32)),
         ("ep_u", vmem((win, he), f32)),
         ("ep_f", vmem((win, c.hidden), f32)),
         # slots per (source rank, expert), every rank's row
         ("ep_csend", vmem((8, c.n_experts), i32)),
         ("ep_cnt_v", vmem((tp, c.n_experts), i32)),
-        ("ep_cnt_s", smem((tp, c.n_experts), i32)),
-        ("ep_nmat_v", vmem((8, LANE), i32)),  # [source, destination] slots
-        ("ep_nmat_s", smem((8, LANE), i32)),
+        ("ep_tab_v", vmem((TAB_ROWS, LANE), i32)),  # route.slot_tables
+        ("ep_tab_s", smem((TAB_ROWS, LANE), i32)),
         # the two ragged all-to-alls: own slots by destination (and expert), received slots
         # by source (and expert), their y the same way back
         ("ep_xs", hbm((p.send_rows, he // 2), u32)),
