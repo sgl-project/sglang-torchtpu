@@ -49,6 +49,19 @@ def _phase(name: str, level: int = 1):
     return contextlib.nullcontext()
 
 
+def _phase_fn(name: str, level: int = 1):
+    """fn run inside _phase(name, level)."""
+
+    def deco(fn):
+        def run():
+            with _phase(name, level):
+                fn()
+
+        return run
+
+    return deco
+
+
 def _dev_skip(phase: str) -> bool:
     """Timing only (wrong results): SGLANG_TPU_EP_DEV_SKIP lists phases every rank skips:
     residual (own rows' FFN residual), capture, allgather, experts (the math; slots move),
@@ -343,6 +356,7 @@ def _expert_loop(step: EPLayerStep, p: EPPlan, n_items, dispatched) -> None:
         slot = k % D
 
         @pl.when(j == 0)
+        @_phase_fn("item_in", 2)
         def _():
             _item_rows(S, buf, b, first, n, start=False)
 
@@ -357,22 +371,23 @@ def _expert_loop(step: EPLayerStep, p: EPPlan, n_items, dispatched) -> None:
 
             sized(n, sizes, zero)
 
-        start(k + D - 1)
-        wait(slot, k)
+        with _phase("issue", 2):
+            start(k + D - 1)
+            wait(slot, k)
         if not _dev_skip("experts"):
-            with _phase("arm", 2):
-                chunk_compute(
-                    step.kind,
-                    n,
-                    lambda R: _unpack_bf16x2(buf.x(b)[pl.ds(0, R), :]),
-                    buf.acc,
-                    _chunk_refs(step, p, slot),
-                    He,
-                    CI,
-                    RI,
-                )
+            chunk_compute(
+                step.kind,
+                n,
+                lambda R: _unpack_bf16x2(buf.x(b)[pl.ds(0, R), :]),
+                buf.acc,
+                _chunk_refs(step, p, slot),
+                He,
+                CI,
+                RI,
+            )
 
         @pl.when(j == NC - 1)
+        @_phase_fn("item_out", 2)
         def _():
             # the previous item's y rows have landed: buf.y is free
             tmpl = pltpu.make_async_copy(

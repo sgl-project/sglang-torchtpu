@@ -4,6 +4,7 @@ the block-diagonal fp8 dot (exact; VPU work grows with the slots), a busier one 
 each weight block to bf16 once for all its rows. NVFP4 weights and x come in kperm order so a
 dequantized vreg takes its block scales without a broadcast."""
 
+import os
 from collections.abc import Callable
 from typing import Any, NamedTuple
 
@@ -193,7 +194,19 @@ def chunk_compute(
     else:
         arms = [lambda R=R: _fp8_arm(R, x_rows, acc, w, He, CI) for R in sizes]
         bounds = sizes[:-1]
+    names = [f"bd{A}" for A in BD_ARMS] + [f"dq{R}" for R in sizes]
+    if kind != "fp4":
+        names = [f"f8_{R}" for R in sizes]
+    if (
+        int(os.environ.get("SGLANG_TPU_EP_TRACE", "0")) >= 2
+    ):  # each arm a region (xprof)
+        arms = [lambda f=f, m=m: _named(f"ep_arm_{m}", f) for f, m in zip(arms, names)]
     jax.lax.switch(sum((n > b).astype(jnp.int32) for b in bounds), arms)
+
+
+def _named(name: str, fn: Callable[[], None]) -> None:
+    with jax.named_scope(name):
+        fn()
 
 
 def sized(n: jax.Array, sizes: tuple[int, ...], fn: Callable[[int], None]) -> None:
