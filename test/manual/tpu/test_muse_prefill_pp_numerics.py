@@ -28,6 +28,7 @@ T, CTX = 512, 2560
 KINDS = ("fp8", "fp4", "fp4")
 GLOBAL = (False, True, False)
 ROPE_BASE = 10000.0
+LOG2E = 1.4426950408889634
 # per-row relative error of a layer's output stream: ~12 bf16 roundings per layer
 TOL_ROW, TOL_MEAN = 3e-2, 1e-2
 TOL_KV = 6e-2  # fp8 K/V of the chunk: a moved input flips a rounding
@@ -245,9 +246,15 @@ def ref_attn(c, w, l, x, pool, table, rope, ids_in=None):
     tab = rope[CTX : CTX + T]
     if not is_g:
         q, k = _rope(q, nqh, tab), _rope(k, nkv, tab)
-    qb = _bf(q).reshape(T, nkv, nqh // nkv, 64)
-    k8 = k.astype(jnp.float8_e4m3fn).astype(jnp.float32).reshape(T, nkv, 64)
-    v8 = v.astype(jnp.float8_e4m3fn).astype(jnp.float32).reshape(T, nkv, 64)
+    # the served transposed RPA tile: fp8 Q^T of the bf16 q times sm_scale * log2(e), base-2
+    # logits; K/V reach the pool as fp8 of the bf16 values the stage hands it
+    f8max = float(jnp.finfo(jnp.float8_e4m3fn).max)
+    q8 = jnp.clip(_bf(q) * (c.attn_scale * LOG2E), -f8max, f8max)
+    q8 = (
+        q8.astype(jnp.float8_e4m3fn).astype(jnp.float32).reshape(T, nkv, nqh // nkv, 64)
+    )
+    k8 = _bf(k).astype(jnp.float8_e4m3fn).astype(jnp.float32).reshape(T, nkv, 64)
+    v8 = _bf(v).astype(jnp.float8_e4m3fn).astype(jnp.float32).reshape(T, nkv, 64)
     ck, cv = pool_tokens(pool, table, CTX)
     keys, vals = jnp.concatenate([ck, k8]), jnp.concatenate([cv, v8])
     qp = CTX + jnp.arange(T)[:, None]
@@ -255,9 +262,9 @@ def ref_attn(c, w, l, x, pool, table, rope, ids_in=None):
     live = kp <= qp
     if not is_g:
         live &= qp - kp < c.window
-    s = jnp.einsum("thgd,nhd->thgn", qb, keys, precision=HIGH) * c.attn_scale
+    s = jnp.einsum("thgd,nhd->thgn", q8, keys, precision=HIGH)
     s = jnp.where(live[:, None, None, :], s, -jnp.inf)
-    p = jnp.exp(s - s.max(-1, keepdims=True))
+    p = jnp.exp2(s - s.max(-1, keepdims=True))
     out = jnp.einsum("thgn,nhd->thgd", _bf(p), vals, precision=HIGH) / p.sum(
         -1, keepdims=True
     )
