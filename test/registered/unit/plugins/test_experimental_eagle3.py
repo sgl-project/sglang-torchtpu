@@ -866,6 +866,86 @@ class TestExperimentalEagle3(CustomTestCase):
         self.assertIs(seen[0], bucket.temperatures)
         self.assertIsNone(seen[1])
 
+    def test_sampled_draft_hashes_its_uniforms_without_a_sync(self):
+        """A sampled chain hands the fused program the step's rng_step instead of
+        drawing and broadcasting uniforms; only the greedy chain syncs its drafts."""
+        worker = _chain_worker()
+        worker._rng_step = torch.tensor([5])
+        syncs, calls = [], []
+        worker._tp_sync = SimpleNamespace(
+            sync=lambda site, values: syncs.append(site) or values
+        )
+        drafter = SimpleNamespace(
+            fused_draft_batch=lambda **kwargs: None,
+            run_fused_draft=lambda batch, **kwargs: calls.append(kwargs)
+            or (torch.zeros((2, 2), dtype=torch.int64), None),
+        )
+        worker._chain_draft_worker = drafter
+        worker._spec_algorithm = None
+        rows = SimpleNamespace(
+            positions=None, cache_locs=torch.zeros((2, 3), dtype=torch.int64)
+        )
+        state = SpecState(
+            bonus_tokens=torch.zeros(2, dtype=torch.int64),
+            seq_lens=torch.zeros(2, dtype=torch.int64),
+            req_pool_indices=torch.zeros(2, dtype=torch.int64),
+        )
+        for temperatures in (torch.ones(2), None):
+            worker._run_fused_draft(
+                state=state,
+                rows=rows,
+                req_pool_indices_cpu=None,
+                seq_lens_cpu=None,
+                temperatures=temperatures,
+                top_ks=None if temperatures is None else torch.full((2,), 4),
+            )
+        self.assertIs(calls[0]["rng_step"], worker._rng_step)
+        self.assertIsNone(calls[1]["rng_step"])
+        self.assertEqual(syncs, [SpecTpSyncSite.SPEC_DRAFT_GREEDY])
+
+    def test_sampled_draft_walks_the_step_hash_uniforms(self):
+        """Draft j is the inverse-CDF draw of q_j at hash_uniforms(rng_step,
+        STREAM_DRAFT)[:, j]: every rank holds rng_step, and the acceptance reads
+        other streams of it, so q's draws stay independent of its uniforms."""
+        pbs, num_drafts, vocab = 2, 3, 8
+        torch.manual_seed(0)
+        logits = torch.randn(pbs, vocab)
+
+        def forward(input_ids, positions, forward_batch):
+            del input_ids, positions, forward_batch
+            return SimpleNamespace(next_token_logits=logits, hidden_states=logits)
+
+        drafter = object.__new__(_IdentityChainDrafter)
+        drafter.num_drafts = num_drafts
+        drafter.model_runner = SimpleNamespace(model=SimpleNamespace(forward=forward))
+        forward_batch = SimpleNamespace(
+            spec_info=chain_draft_forward_input(hidden_states=logits, width=1),
+            reuse_dsa_topk_indices=False,
+        )
+        rng_step = torch.tensor([7])
+        tokens, dense = drafter._fused_draft_steps(
+            forward_batch,
+            logits,  # identity drafter: the carry rows are d_1's logits
+            torch.arange(pbs),
+            torch.zeros((pbs, num_drafts + 1), dtype=torch.int64),
+            torch.zeros((pbs, num_drafts + 1), dtype=torch.int64),
+            torch.zeros(pbs, dtype=torch.int64),
+            torch.ones(pbs),
+            torch.full((pbs,), vocab, dtype=torch.int32),
+            rng_step,
+            None,
+        )
+        uniforms = spec_ops.hash_uniforms(
+            rng_step, spec_ops.STREAM_DRAFT, (pbs, num_drafts)
+        )
+        cdf = torch.softmax(logits, dim=-1).cumsum(dim=-1)
+        expected = torch.stack(
+            [(cdf < uniforms[:, j, None]).sum(dim=-1) for j in range(num_drafts)],
+            dim=1,
+        ).clamp_max(vocab - 1)
+        self.assertTrue(torch.equal(tokens, expected))
+        self.assertEqual(tuple(dense.shape), (pbs, num_drafts, vocab))
+
     def _fused_drafter(self, fused_draft):
         drafter = object.__new__(TpuEagle3DraftWorker)
         calls = []
@@ -888,7 +968,7 @@ class TestExperimentalEagle3(CustomTestCase):
             seq_lens=None,
             temperatures=None,
             top_ks=None,
-            uniforms=None,
+            rng_step=None,
         )
 
     def test_fused_draft_runs_as_a_decode_program(self):

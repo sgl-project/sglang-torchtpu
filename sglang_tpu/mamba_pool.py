@@ -347,7 +347,9 @@ class TpuMambaPool(MambaPool):
     ) -> None:
         """Copy window checkpoint steps[i] of request i into track_slots[i] (radix
         snapshot after a verify); a negative step or track slot skips that row."""
-        track_slots = track_slots.to(self.device)
+        # The host track ids arrive while the verify still runs: a blocking
+        # upload would wait for every queued TPU program first.
+        track_slots = track_slots.to(self.device, non_blocking=True)
         states = self._copy_states()
         if states[0].device.type == "cpu":
             valid = ((steps >= 0) & (track_slots > 0)).nonzero(as_tuple=True)[0]

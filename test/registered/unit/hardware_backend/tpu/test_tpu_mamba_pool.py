@@ -430,6 +430,26 @@ class TestTpuMambaPool(CustomTestCase):
             self.assertTrue(torch.all(state[6] == 0))
             self.assertTrue(torch.all(state[0] == 0))
 
+    def test_snapshot_uploads_track_slots_without_blocking(self):
+        """The host track ids are uploaded while the verify still runs; on
+        torch_tpu a blocking upload waits for every queued program first."""
+        pool = self._spec_pool(size=self.SIZE, spec_state_size=4, width=2)
+        uploads = []
+        to = torch.Tensor.to
+
+        def spy(tensor, *args, **kwargs):
+            if tensor.dtype == torch.int32:
+                uploads.append(kwargs.get("non_blocking", False))
+            return to(tensor, *args, **kwargs)
+
+        with patch.object(torch.Tensor, "to", spy):
+            pool.snapshot_checkpoints(
+                torch.tensor([5], dtype=torch.int32),
+                torch.tensor([3]),
+                torch.tensor([1]),
+            )
+        self.assertEqual(uploads[:1], [True])
+
     def test_verify_track_steps_match_the_boundary_crossing(self):
         """From 62, accepting 3 reaches 65: the 64-token boundary is window step
         1. From 60, accepting 2 stays short; an inactive row (-1) commits nothing;

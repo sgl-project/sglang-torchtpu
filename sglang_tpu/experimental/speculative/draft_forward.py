@@ -68,7 +68,9 @@ def forward_draft_rows(
     kv_lens_cpu, kv_lens_sum = verify_input.padded_kv_lens_after_rows(offset + width)
     num_live_tokens = bs * width
     num_token_non_padded = (
-        torch.tensor(num_live_tokens, dtype=torch.int32, device=device)
+        # A blocking upload (torch.tensor(..., device=...)) would wait for the
+        # verify still running on the chip.
+        torch.tensor(num_live_tokens, dtype=torch.int32).to(device, non_blocking=True)
         if enable_num_token_non_padded()
         else None
     )

@@ -203,7 +203,6 @@ class TpuChainSpecWorker(TpuSpecWorker):
         temperatures: torch.Tensor | None,
         top_ks: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        padded_bs = state.seq_lens.shape[0]
         drafter = self._chain_draft_worker
         forward_batch = drafter.fused_draft_batch(
             spec_algorithm=self._spec_algorithm,
@@ -215,15 +214,6 @@ class TpuChainSpecWorker(TpuSpecWorker):
             out_cache_loc=rows.cache_locs[:, 0].contiguous(),
         )
         sampled = temperatures is not None and top_ks is not None
-        uniforms = (
-            # Ranks draw alike from rank 0's uniforms, so the fused chain needs no sync.
-            self._tp_sync.sync(
-                SpecTpSyncSite.SPEC_DRAFT_SAMPLE,
-                torch.rand((padded_bs, self.num_drafts), device=self.device),
-            )
-            if sampled
-            else None
-        )
         draft_tokens, draft_logits = drafter.run_fused_draft(
             forward_batch,
             req_pool_indices=state.req_pool_indices,
@@ -232,7 +222,9 @@ class TpuChainSpecWorker(TpuSpecWorker):
             seq_lens=state.seq_lens,
             temperatures=temperatures if sampled else None,
             top_ks=top_ks if sampled else None,
-            uniforms=uniforms,
+            # The program hashes its uniforms from the step counter every rank
+            # holds, so a sampled chain needs neither an RNG launch nor a broadcast.
+            rng_step=self._rng_step if sampled else None,
         )
         if not sampled:
             draft_tokens = self._tp_sync.sync(
