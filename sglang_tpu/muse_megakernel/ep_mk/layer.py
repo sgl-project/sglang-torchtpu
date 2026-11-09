@@ -385,9 +385,9 @@ def _expert_loop_on(
 
             sized(n, sizes, zero)
 
-        def issue():
-            start(k + D - 1)
+        def issue():  # the start after the wait: its scalar work can share the arm's bundles
             wait(slot, k)
+            start(k + D - 1)
 
         if _dev_skip("experts"):
             with _phase("issue", 2):
