@@ -45,9 +45,11 @@ _LANE_BYTES = 128
 _TOKENS_PER_ROW = 4
 # Upstream act_quant / the kpool writer floor the absolute max before scaling.
 _AMAX_FLOOR = 1e-4
-# Pools per StreamIndex KV block for its (decode, prefill, mixed) passes;
-# not tuned for GLM.
-_NUM_POOLS_PER_BLOCK = 256
+# Pools per StreamIndex KV block for its (decode, prefill, mixed) passes. The kernel's
+# per-step schedule is a scalar-prefetch (SMEM) operand of seqs x query blocks x KV
+# blocks entries: at a 1M context with 8-page blocks it is 513 KB for 16 sequences and
+# the mixed pass fails to compile; 32-page blocks keep it under 128 KB.
+_NUM_POOLS_PER_BLOCK = 1024
 _NUM_QUERIES_PER_BLOCK = (1, 128, 128)
 # Query rows per scoring chunk: the kernel's score buffer is rows x positions.
 _CHUNK_TOKENS = 2048
