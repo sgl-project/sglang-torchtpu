@@ -31,21 +31,54 @@ whose nodes carry a `ci-tpu-pool` label (a unique name per pool); its **shape** 
 belongs to a lane, and `topology.yaml` holds only the lanes, the priority lane and, per
 shape, its hosts per slice and each lane's `min_hosts`.
 
-`reconcile_quota.py` builds the Kueue objects from that and the live nodes:
+`reconcile_quota.py` builds the Kueue objects from that, the GKE node-pool list and the
+live nodes:
 - one ResourceFlavor per CI pool (selecting its `ci-tpu-pool`);
 - per shape, one ClusterQueue + LocalQueue per lane, named `tpu-<lane>-<hosts>h`
   (`tpu-prgate-1h`, `tpu-nightly-2h`, ...), all in cohort `ci-<shape>` and each listing
-  every pool of the shape.
+  every pool of the shape;
+- each pool's quota from its **capacity**: the autoscaler maximum of an autoscaled pool,
+  the Ready nodes of a fixed one.
 
 CI pools today:
 
-| Node pool | `ci-tpu-pool` | Shape | Hosts |
+| Node pool | `ci-tpu-pool` | Shape | Hosts (min..max) |
 |---|---|---|---|
-| `ci-tpu7x-2x2x1` | `pr-gate` | 2x2x1 | 5 |
-| `ci-tpu7x-2x2x1-nightly` | `nightly-1h` | 2x2x1 | 3 |
-| `ci-tpu7x-2x2x2` | `nightly` | 2x2x2 | 2 (one slice) |
+| `ci-tpu7x-2x2x1` | `pr-gate` | 2x2x1 | 3..5 |
+| `ci-tpu7x-2x2x1-nightly` | `nightly-1h` | 2x2x1 | 0..3 |
+| `ci-tpu7x-2x2x2` | `nightly` | 2x2x2 | 0..2 (one slice) |
 
 The `ci-tpu-pool` values are only names; they do not tie a pool to a lane.
+
+**Autoscaled pools.** The CI pools share one TPU reservation with the developer pools
+(tpuq, tpod, Haolin's), and tpod's recycler removes any CI host whose chips report zero
+duty cycle for 15 minutes. CI therefore does not hold its hosts: each pool is a GKE
+autoscaled pool, and Kueue's quota is the pool's *maximum*, not its live nodes. A job is
+admitted while its host may not exist yet; its pending pod is what makes the cluster
+autoscaler add one (the pod's `nodeSelector` and the Kueue-injected `ci-tpu-pool` are all
+node-pool labels, so the autoscaler can match a pool with zero nodes). `pr-gate` keeps a
+floor of 3 warm hosts so a PR never waits on a cold start behind developer traffic;
+the nightly pools scale from 0, since their jobs are scheduled and a few minutes of
+cold start cost nothing. A cold host is a few minutes of VM boot plus the image pull.
+
+If the reservation is exhausted the scale-up fails: the pod stays pending, Kueue's
+`waitForPodsReady` evicts and requeues the job, and it retries until a host appears. That
+is the one way admitted quota can now exceed live chips, and it is visible as a pod
+`Pending` on `FailedScaleUp` rather than a hung job.
+
+To change a pool's bounds (the reconciler picks the new maximum up on the next CI job):
+
+```bash
+gcloud container clusters update tpu-cluster --zone us-central1-c --project sglang-torchtpu \
+  --node-pool ci-tpu7x-2x2x1 --enable-autoscaling --min-nodes 3 --max-nodes 5
+gcloud container clusters update tpu-cluster --zone us-central1-c --project sglang-torchtpu \
+  --node-pool ci-tpu7x-2x2x1-nightly --enable-autoscaling --min-nodes 0 --max-nodes 3
+gcloud container clusters update tpu-cluster --zone us-central1-c --project sglang-torchtpu \
+  --node-pool ci-tpu7x-2x2x2 --enable-autoscaling --min-nodes 0 --max-nodes 2
+```
+
+A multi-host pool's maximum must equal one slice's host count (GKE scales such a pool as a
+whole); any other maximum gets it no quota, like a fixed multi-host pool holding two slices.
 
 **How a shape's slices are split** (`priority: nightly`, `min_hosts: {pr-gate: 5}` on 2x2x1):
 - Each lane keeps its `min_hosts`, in whole slices, and never lends them, so a PR never
@@ -59,8 +92,8 @@ In Kueue terms: reserved quota has `lendingLimit: 0`, the priority lane's quota 
 lendable, queues prefer a pool where the job fits their own quota before borrowing
 (`flavorFungibility.whenCanBorrow: TryNextFlavor`), and `reclaimWithinCohort: Never`.
 
-The CI pools share one TPU reservation with the developer pools (tpuq, tpod, Haolin's).
-Moving chips between them is a node-pool change by hand.
+Chips move between the CI and developer pools through the shared reservation as pools
+scale; only a pool's bounds are changed by hand.
 
 **Slice rules.** `tpu7x-standard-4t` has 4 chips per host: a `2x2x1` slice is 1 host, a
 `2x2x2` slice is 2, a `2x2x4` slice is 4.
@@ -214,10 +247,12 @@ the JobSet deadlines above remain separate safeguards.
 - **Admission:** a JobSet waits suspended until its ClusterQueue has quota for every pod.
   A PodSet gets exactly one flavor, which is what keeps a multi-host job on one slice.
   Queues are `BestEffortFIFO`.
-- **Gangs:** `waitForPodsReady` (5 min, `blockAdmission: true`) evicts and requeues a job
-  whose pods cannot all start. While it waits, Kueue admits nothing else cluster-wide.
-- **Quota follows the pools** through `reconcile_quota.py`, before every CI job. Quota for
-  chips that do not exist admits jobs that hang; missing quota leaves live hosts idle.
+- **Gangs:** `waitForPodsReady` (15 min, `blockAdmission: true`) evicts and requeues a job
+  whose pods cannot all start. While it waits, Kueue admits nothing else cluster-wide. The
+  timeout covers a cold autoscaled host: VM boot plus image pull on a pool scaled to zero.
+- **Quota follows the pools** through `reconcile_quota.py`, before every CI job: an
+  autoscaled pool's maximum, a fixed pool's Ready nodes. Quota the autoscaler cannot fill
+  shows up as a pending pod that is requeued; missing quota leaves live hosts idle.
 - **Sharing:** every shape's queues form one cohort, `ci-<shape>`, and may use each
   other's idle, lendable quota. No preemption takes it back.
 - **Only labelled JobSets are managed.** A hand-launched JobSet in `tpu-ci` without a
@@ -234,8 +269,8 @@ the JobSet deadlines above remain separate safeguards.
 | A perf suite | Register it, add the suite to `run_suite.py`, and add the entry to both lists in `perf-test-tpu.yml` (the `model` choice and the default list), plus the `model` dispatch option. |
 | An accuracy benchmark | Register it, add the suite to `run_suite.py`, and add a job to `accuracy-test-tpu.yml` with its slot list. Keep `run_name` to 34 characters: it prefixes pod names, which are capped at 63. |
 | A hand-wired P/D or exec test | A job in `feature-validation-tpu.yml` with `files:`, plus the `only` dispatch option in both nightly workflows. |
-| A 2x2x1 host | Resize any 2x2x1 CI node pool. Nothing else; the priority lane's share grows. |
-| A slice of a listed shape | A new node pool with a unique `ci-tpu-pool` label (multi-host: `--tpu-topology` and a workload policy). Nothing else. |
+| A 2x2x1 host | Raise `--max-nodes` on any 2x2x1 CI node pool (see Capacity). Nothing else; the priority lane's share grows. |
+| A slice of a listed shape | A new node pool with a unique `ci-tpu-pool` label and autoscaling bounds (multi-host: `--tpu-topology` and a workload policy, maximum = one slice). Nothing else. |
 | A new shape | One line under `shapes` in `topology.yaml`, plus the pool. |
 | A lane's guaranteed hosts | `min_hosts` under the shape in `topology.yaml`, in whole slices. |
 
@@ -256,7 +291,7 @@ the JobSet deadlines above remain separate safeguards.
 | `.github/tpu-ci/topology.yaml` | Lanes, the priority lane, and per shape its hosts and each lane's `min_hosts` |
 | `.github/tpu-ci/ci_topology.py` | Loads `topology.yaml`; queue and cohort names |
 | `.github/tpu-ci/kueue-controller-resources.yaml` | Lowers the Kueue controller's CPU request to fit `system-pool`; re-apply after every Kueue upgrade |
-| `.github/tpu-ci/reconcile_quota.py` | Creates and updates every CI flavor, queue and quota from `topology.yaml` and live pools |
+| `.github/tpu-ci/reconcile_quota.py` | Creates and updates every CI flavor, queue and quota from `topology.yaml`, the GKE node pools and live nodes |
 | `.github/tpu-ci/render_jobset.py` | Renders a JobSet for suite, launch, exec or P/D mode |
 | `.github/tpu-ci/jobset-tpu.yaml`, `jobset-tpu-pd.yaml` | JobSet templates |
 | `.github/tpu-ci/discover_tests.py`, `discover_multihost.py` | Nightly single-host and multi-host matrices |
@@ -449,7 +484,7 @@ integrations:
     - "jobset.x-k8s.io/jobset"      # only jobset -- nothing else is ever managed
 waitForPodsReady:                   # evict + requeue a gang that cannot fully place
   enable: true
-  timeout: 5m
+  timeout: 15m                      # a cold autoscaled host: VM boot + image pull
   blockAdmission: true
 managedJobsNamespaceSelector:       # inert today; scopes the setting below if ever enabled
   matchLabels:
