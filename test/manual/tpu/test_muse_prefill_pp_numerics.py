@@ -389,23 +389,30 @@ def main() -> int:
         dense = ("wqkvg", "wo", "wpool", "wunpool", "wrouter", "vecs")
         w_ref = {k: (v[first:] if k in dense else v) for k, v in w.items()}
 
-        def run(tab):
+        def run(tab, x0, rope, weights, pools, tables):
             return PP.stage_forward(
                 c,
                 jnp.array([CTX, -1], jnp.int32),
                 tab,
                 x0,
                 rope,
-                [w[k] for k in PP.WEIGHT_ORDER],
+                weights,
                 pools,
                 jnp.array([CTX + T], jnp.int32),
-                (tables[True], tables[False]),
+                tables,
                 jnp.array([0, T], jnp.int32),
                 jnp.array([0, 0, 1], jnp.int32),
                 scratch=True,
             )
 
-        call = jax.jit(run)
+        jitted = jax.jit(
+            run
+        )  # weights as arguments: closed over, they would be constants
+        weights = [w[k] for k in PP.WEIGHT_ORDER]
+
+        def call(tab):
+            return jitted(tab, x0, rope, weights, pools, (tables[True], tables[False]))
+
         ok = True
         x_prev = x0
         for n in range(1, len(KINDS) + 1):
