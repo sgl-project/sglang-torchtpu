@@ -24,6 +24,9 @@ class EPMoEStep(NamedTuple):
     wait_refs: tuple  # (refs, off) of one layer of this kind: DMA wait descriptors
     me: jax.Array | int
     n_live: jax.Array
+    flush_dense: Callable[
+        [], None
+    ]  # issues the dense refills held during the expert phase
 
 
 class EPHook(Protocol):

@@ -4626,6 +4626,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         ],
                         me=me,
                         n_live=n_live,
+                        flush_dense=ws.flush,
                     )
                 )
             else:
