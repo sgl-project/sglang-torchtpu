@@ -83,6 +83,8 @@ def ep_plan(c: MKConfig, item_rows: int = 32) -> EPPlan:
     item_sizes(item_rows)
     el, rc, k = c.n_experts // c.tp, c.rows // c.tp, c.top_k
     pad = (SEG - 1) * c.tp
+    # route.build_items packs a received row (12 bits), its source and its return row
+    assert c.rows * k + pad <= 4096 and c.tp <= 8, (c.rows, c.tp)
     return EPPlan(
         experts=el,
         inter=c.inter_local * c.tp,
@@ -181,10 +183,9 @@ def ep_scratch(c: MKConfig, p: EPPlan) -> list:
         ("ep_tab_v", vmem((TAB_ROWS, LANE), i32)),  # route.slot_tables
         ("ep_tab_s", smem((TAB_ROWS, LANE), i32)),
         # the two ragged all-to-alls: own slots by destination (and expert), received slots
-        # by source (and expert), their y the same way back
+        # by source (and expert); y goes back row by row from the expert loop
         ("ep_xs", hbm((p.send_rows, he // 2), u32)),
         ("ep_xr", hbm((p.recv_rows, he // 2), u32)),
-        ("ep_yr", hbm((p.recv_rows, he // 2), u32)),
         ("ep_yb", hbm((p.send_rows, he // 2), u32)),
         ("ep_items", smem((1 + 3 * p.max_items,), i32)),
         ("ep_rows", smem((p.recv_rows,), i32)),  # received slots grouped by expert

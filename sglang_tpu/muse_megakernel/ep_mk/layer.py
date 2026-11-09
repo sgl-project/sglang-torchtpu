@@ -111,7 +111,6 @@ class EPExperts:
             _expert_loop(step, p, n_items)
         with _phase("combine_a2a"):
             if moving:
-                a2a.give_back(c, S, me)
                 a2a.wait_give_back(c, S, me)
         with _phase("combine"):
             _combine(step, win)
@@ -284,7 +283,7 @@ def _item_rows(S: dict, buf, b, first, n, start: bool) -> None:
     sem = S["ep_x_sems"].at[b]
 
     def one(t, carry):
-        src = S["ep_xr"].at[pl.ds(S["ep_rows"][first + t], 1)]
+        src = S["ep_xr"].at[pl.ds(S["ep_rows"][first + t] & (2**route.ROW_BITS - 1), 1)]
         cp = pltpu.make_async_copy(src, buf.x(b).at[pl.ds(t, 1)], sem)
         if start:
             cp.start()
@@ -296,8 +295,8 @@ def _item_rows(S: dict, buf, b, first, n, start: bool) -> None:
 
 
 def _expert_loop(step: EPLayerStep, p: EPPlan, n_items) -> None:
-    """Every received slot's expert output into ep_yr at its received row."""
-    c, S = step.c, step.S
+    """Every received slot's expert output back to its source's ep_yb row, item by item."""
+    c, S, me = step.c, step.S, step.me
     He, NC, RI = c.expert_hidden, p.n_chunks(step.kind), p.item_rows
     D, CI = p.slots(step.kind), p.chunk(step.kind)
     sizes = item_sizes(RI)
@@ -377,7 +376,7 @@ def _expert_loop(step: EPLayerStep, p: EPPlan, n_items) -> None:
         def _():
             # the previous item's y rows have landed: buf.y is free
             tmpl = pltpu.make_async_copy(
-                buf.y.at[pl.ds(0, 1)], S["ep_yr"].at[pl.ds(0, 1)], ysem
+                buf.y.at[pl.ds(0, 1)], S["ep_yb"].at[pl.ds(0, 1)], ysem
             )
 
             @pl.when(i > 0)
@@ -394,11 +393,25 @@ def _expert_loop(step: EPLayerStep, p: EPPlan, n_items) -> None:
             sized(n, sizes, pack)
 
             def put(t, carry2):
-                pltpu.make_async_copy(
-                    buf.y.at[pl.ds(t, 1)],
-                    S["ep_yr"].at[pl.ds(S["ep_rows"][first + t], 1)],
-                    ysem,
-                ).start()
+                # straight back to the slot's source: its return buffer row
+                v = S["ep_rows"][first + t]
+                src = (v >> route.ROW_BITS) & (2**route.SRC_BITS - 1)
+                dst = S["ep_yb"].at[pl.ds(v >> (route.ROW_BITS + route.SRC_BITS), 1)]
+
+                @pl.when(src == me)
+                def _():
+                    pltpu.make_async_copy(buf.y.at[pl.ds(t, 1)], dst, ysem).start()
+
+                @pl.when(src != me)
+                def _():
+                    pltpu.make_async_remote_copy(
+                        src_ref=buf.y.at[pl.ds(t, 1)],
+                        dst_ref=dst,
+                        send_sem=ysem,
+                        recv_sem=S["ep_a2a_sems"].at[2],
+                        device_id=(src,),
+                    ).start()
+
                 return carry2
 
             jax.lax.fori_loop(0, n, put, 0)
@@ -410,7 +423,7 @@ def _expert_loop(step: EPLayerStep, p: EPPlan, n_items) -> None:
     @pl.when(n_items > 0)
     def _():
         tmpl = pltpu.make_async_copy(
-            buf.y.at[pl.ds(0, 1)], S["ep_yr"].at[pl.ds(0, 1)], ysem
+            buf.y.at[pl.ds(0, 1)], S["ep_yb"].at[pl.ds(0, 1)], ysem
         )
 
         def w(t, carry):
