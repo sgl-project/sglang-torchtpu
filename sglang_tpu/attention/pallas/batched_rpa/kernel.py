@@ -157,7 +157,6 @@ def calculate_and_store_out(
     lse_stage_ref: jax.Ref | None,
     cfgs: configs.RpaConfigs,
 ):
-
     def _accum(
         b_idx: jax.Array,
         batch_acc: jax.Array,
@@ -693,7 +692,6 @@ def rpa_kernel(
         o_kv_cache_hbm_ref: jax.Ref,
         o_lse_hbm_ref: jax.Ref | None,
     ):
-
         del o_kv_cache_hbm_ref, o_lse_hbm_ref
 
         q_alloc, kv_cache_alloc, o_alloc, lse_alloc = create_allocs(
@@ -709,18 +707,20 @@ def rpa_kernel(
             final_allocs=(q_alloc, kv_cache_alloc, o_alloc, lse_alloc),
             schedule_ref=schedule.RpaSchedule.create_shape_dtype(cfgs).scratch_shapes(),
             dma_sem=pltpu.SemaphoreType.DMA((1,)),
+            # f32 carries: in bf16 the running sum l stops growing once it exceeds
+            # ~256x a tile's row sum, causing softmax drift on 64K+ prefixes.
             scratches=(
                 pltpu.VMEM(
                     cfgs.lm_scratch_shape,
-                    dtype=cfgs.serve.dtype_out,
+                    dtype=jnp.float32,
                 ),  # m
                 pltpu.VMEM(
                     cfgs.lm_scratch_shape,
-                    dtype=cfgs.serve.dtype_out,
+                    dtype=jnp.float32,
                 ),  # l
                 pltpu.VMEM(
                     cfgs.acc_scratch_shape,
-                    dtype=cfgs.serve.dtype_out,
+                    dtype=jnp.float32,
                 ),  # acc
             ),
             lse_stage=(
