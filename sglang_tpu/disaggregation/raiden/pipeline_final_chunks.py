@@ -8,7 +8,8 @@ them to the host. For every request whose final chunk a forward computes:
   registers once a host copy of one element of the forward's output lands
   (PipelineTransfer.make_fence);
 - with early parts (SGLANG_RAIDEN_PIPELINE_EARLY_PARTS), every launch records a
-  completion fence that parts offered afterwards wait for (PipelineTransfer.offer_part);
+  completion fence and the pages it writes; a part offered afterwards waits for
+  the newest launch that writes one of its pages (PipelineTransfer.offer_part);
 - with SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE, this stage's share of the closing
   transfer registers at launch on stages before the last, and at the token
   copy on the last stage. That copy completes after the last stage's forward,
@@ -23,10 +24,13 @@ import functools
 import logging
 from typing import Any, Callable, NamedTuple, Optional
 
+import torch
+
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.mem_cache.common import kv_to_page_indices
 from sglang_tpu.disaggregation.raiden.sender import RaidenKVSender
 from sglang_tpu.disaggregation.raiden.serde import read_aux_blob
+from sglang_tpu.prefill_early_send import collect_prefill_write_page_ids
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +41,21 @@ def _forward_output(result, last_stage: bool):
     if last_stage:
         return result.next_token_ids
     return next(iter(result.pp_hidden_states_proxy_tensors.tensors.values()))
+
+
+def _write_pages(scheduler, batch) -> torch.Tensor | None:
+    """KV page ids the launched forward writes on this stage: each request's
+    extend range plus the HiCache loads queued with it. None when the loads'
+    pages are unknown, so the forward may write any page."""
+    page_ids = collect_prefill_write_page_ids(
+        reqs=batch.reqs,
+        req_to_token_table=scheduler.req_to_token_pool.req_to_token,
+        page_size=scheduler.token_to_kv_pool_allocator.page_size,
+    )
+    if batch.hicache_load_page_ids is not None:
+        return torch.cat([page_ids, batch.hicache_load_page_ids])
+    # The scheduler records load pages only with the cached-prefix early send.
+    return None if batch.hicache_consumer_index >= 0 else page_ids
 
 
 class _HeldShare(NamedTuple):
@@ -70,14 +89,10 @@ class FinalChunks:
         transfer = self.transfer
         mgr = transfer.manager
         last_stage = mgr.pp_rank == mgr.pp_size - 1
+        fence = None
         if transfer.early_parts:
-            # The host offers a chunk's pages before this stage's device has
-            # necessarily run the forward that writes them; parts offered from
-            # now on wait for this forward, and earlier ones whose forward is done
-            # are announced.
-            transfer.last_fence = transfer.make_fence(
-                _forward_output(result, last_stage)
-            )
+            fence = transfer.make_fence(_forward_output(result, last_stage))
+            transfer.record_writes(fence, _write_pages(scheduler, batch))
             transfer.advance_parts()
         if not (transfer.stage_parts or transfer.early_close):
             return
@@ -92,14 +107,9 @@ class FinalChunks:
         ]
         if not finals:
             return
-        fence = None
-        if transfer.stage_parts:
+        if transfer.stage_parts and fence is None:
             # One completion fence per forward, shared by its requests.
-            fence = (
-                transfer.last_fence
-                if transfer.early_parts
-                else transfer.make_fence(_forward_output(result, last_stage))
-            )
+            fence = transfer.make_fence(_forward_output(result, last_stage))
         held = []
         for index, req in finals:
             room = req.disagg_kv_sender.bootstrap_room

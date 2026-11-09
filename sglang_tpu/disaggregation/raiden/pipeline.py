@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import concurrent.futures
 import hashlib
 import inspect
@@ -15,6 +16,7 @@ from types import SimpleNamespace
 from typing import Any, Sequence
 
 import msgspec
+import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -480,10 +482,14 @@ class PipelineTransfer:
             if self.stage_parts or (self.early_parts and self.producer)
             else None
         )
-        # Producer: completion fence of the latest forward this stage launched.
-        # Early parts wait for it, since the host offers a chunk's pages before
-        # the device has necessarily run the forward that writes them.
-        self.last_fence: concurrent.futures.Future | None = None
+        # Producer: (completion fence, page ids written or None for any page) of
+        # each forward this stage launched that may not have completed, oldest
+        # first. The host offers a chunk's pages before the device has
+        # necessarily run the forward that writes them; early parts wait for the
+        # newest such writer.
+        self.pending_writes: collections.deque[
+            tuple[concurrent.futures.Future, torch.Tensor | None]
+        ] = collections.deque()
 
     def _check_support(self, raiden_service_pb2) -> None:
         """Reject topologies and native builds the pipeline transfer cannot serve."""
@@ -752,9 +758,9 @@ class PipelineTransfer:
                 replied=set(),
                 done=False,
                 expires=time.monotonic() + mgr._timeout_s,
-                # One device stream: once the latest launched forward completes,
-                # every earlier write to these pages has too.
-                fence=getattr(self, "last_fence", None),
+                # Only a forward still writing one of these pages holds the part;
+                # a prefix cached by a finished request goes out at once.
+                fence=self._writer_fence(p_blocks),
             )
             state["parts"].append(part)
             state["offered"] = p_start + len(p_blocks)
@@ -847,7 +853,8 @@ class PipelineTransfer:
         if fence is not None:
             # Raiden reads the pages straight from HBM: announce them only once
             # the forward that wrote them has completed (advance_parts retries).
-            if not fence.done():
+            # A failed probe proves nothing; the part waits for _flush_parts.
+            if not fence.done() or fence.exception() is not None:
                 return
             part["fence"] = None
         if not part["registered"]:
@@ -886,7 +893,41 @@ class PipelineTransfer:
                     fence.result()
                 except Exception:
                     pass
+                part["fence"] = None
                 self._reply_part(room, part)
+
+    def record_writes(
+        self, fence: concurrent.futures.Future, page_ids: torch.Tensor | None
+    ) -> None:
+        """This stage launched a forward that writes ``page_ids`` (None: any
+        page) and whose completion ``fence`` reports."""
+        with self.lock:
+            self._drain_writes()
+            if page_ids is None or page_ids.numel():
+                self.pending_writes.append((fence, page_ids))
+
+    def _drain_writes(self) -> None:
+        # One device stream per stage: a forward that completed proves every
+        # earlier one did, even one whose own probe failed.
+        done = [
+            i
+            for i, (fence, _) in enumerate(self.pending_writes)
+            if fence.done() and fence.exception() is None
+        ]
+        for _ in range(done[-1] + 1 if done else 0):
+            self.pending_writes.popleft()
+
+    def _writer_fence(self, block_ids: list[int]):
+        """The fence of the newest launched forward that may still be writing one
+        of ``block_ids``, or None. Device order makes it cover older writers."""
+        self._drain_writes()
+        if not self.pending_writes:
+            return None
+        ids = torch.tensor(block_ids, dtype=torch.int64)
+        for fence, page_ids in reversed(self.pending_writes):
+            if page_ids is None or bool(torch.isin(ids, page_ids).any()):
+                return fence
+        return None
 
     # ----- producer: stage groups ------------------------------------------
 

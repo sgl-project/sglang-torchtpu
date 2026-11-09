@@ -343,6 +343,16 @@ def part_transfers(world, index=0):
     return [t for t in world.controller.transfers if t["req_id"] == f"{ROOM}.p{index}"]
 
 
+def pages(*ranges):
+    return torch.tensor([p for r in ranges for p in r], dtype=torch.int64)
+
+
+def offer_on_every_stage(world, blocks):
+    for s in world.stages:
+        s.offer_part(ROOM, prefill_pages(s, blocks), blocks)
+    world.pump()
+
+
 def test_early_part_waits_for_the_forward_that_wrote_it(world):
     """A part offered while its forward may still be running is announced only
     once that stage's launch fence completes, on every stage."""
@@ -350,10 +360,8 @@ def test_early_part_waits_for_the_forward_that_wrote_it(world):
     world.pump()
     fences = [Fence() for _ in world.stages]
     for s, fence in zip(world.stages, fences):
-        s.last_fence = fence
-        start = prefill_pages(s, list(range(10, 18)))
-        s.offer_part(ROOM, start, list(range(10, 18)))
-    world.pump()
+        s.record_writes(fence, pages(range(10, 18)))
+    offer_on_every_stage(world, list(range(10, 18)))
     assert part_transfers(world) == []
     assert f"{ROOM}.p0" not in world.controller.registered
     fences[0].ready = True
@@ -371,15 +379,14 @@ def test_finalize_announces_fenced_parts_before_the_closing_transfer(world):
         ROOM, list(range(100, 112)), [200, 201], None, world.infos
     )
     world.pump()
-    for s in world.stages:
-        s.last_fence = Fence()
-        start = prefill_pages(s, list(range(10, 18)))
-        s.offer_part(ROOM, start, list(range(10, 18)))
-    world.pump()
+    fences = [Fence() for _ in world.stages]
+    for s, fence in zip(world.stages, fences):
+        s.record_writes(fence, pages(range(10, 18)))
+    offer_on_every_stage(world, list(range(10, 18)))
     assert part_transfers(world) == []
     # At the result point every forward of the request has completed.
-    for s in world.stages:
-        s.last_fence.ready = True
+    for s, fence in zip(world.stages, fences):
+        fence.ready = True
         prefill_pages(s, [18, 19, 20], swa=[30, 31])
         assert s.finalize_send(ROOM, None)
     world.pump()
@@ -387,20 +394,121 @@ def test_finalize_announces_fenced_parts_before_the_closing_transfer(world):
     assert world.decode.maybe_start_pull(ROOM) is True
 
 
-def test_launch_records_the_fence_early_parts_wait_for(world):
-    stage = world.stages[0]
-    stage.fence_executor = SyncExecutor()
+def launch(stage, slots, *, hicache_load_page_ids=None, hicache_consumer_index=-1):
+    """``stage`` launches a forward computing one request into token ``slots``
+    (page size 4); returns the fence make_fence handed out, if any."""
+    fences = []
+    stage.make_fence = lambda output: fences.append(Fence()) or fences[-1]
+    scheduler = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(req_to_token=torch.tensor([slots])),
+        token_to_kv_pool_allocator=SimpleNamespace(page_size=4),
+    )
+    req = SimpleNamespace(
+        extend_range=SimpleNamespace(start=0, end=len(slots)),
+        kv=SimpleNamespace(req_pool_idx=0),
+    )
+    batch = SimpleNamespace(
+        reqs=[req],
+        hicache_load_page_ids=hicache_load_page_ids,
+        hicache_consumer_index=hicache_consumer_index,
+    )
     result = SimpleNamespace(
         next_token_ids=torch.zeros(1, dtype=torch.int64),
         pp_hidden_states_proxy_tensors=SimpleNamespace(tensors={"h": Tensor(2, 4)}),
     )
-    assert stage.last_fence is None
-    stage.final_chunks.launched(None, 0, SimpleNamespace(reqs=[]), result)
-    assert stage.last_fence is not None and stage.last_fence.done()
+    stage.final_chunks.launched(scheduler, 0, batch, result)
+    return fences[0] if fences else None
+
+
+def test_launch_records_the_pages_its_forward_writes(world):
+    stage = world.stages[0]
+    fence = launch(stage, list(range(40, 48)))
+    [(recorded, page_ids)] = stage.pending_writes
+    assert recorded is fence and page_ids.tolist() == [10, 11]
+    # HiCache loads queued with the forward write their pages too.
+    launch(
+        stage,
+        list(range(48, 52)),
+        hicache_load_page_ids=pages([3]),
+        hicache_consumer_index=0,
+    )
+    assert stage.pending_writes[-1][1].tolist() == [12, 3]
+    # Loads whose pages the scheduler did not record may write any page.
+    fence = launch(stage, list(range(52, 56)), hicache_consumer_index=0)
+    assert stage.pending_writes[-1] == (fence, None)
+    assert stage._writer_fence([99]) is fence
+
+
+def test_launch_records_no_writes_without_early_parts(world):
+    stage = world.stages[0]
     stage.early_parts = False
-    stage.last_fence = None
-    stage.final_chunks.launched(None, 0, SimpleNamespace(reqs=[]), result)
-    assert stage.last_fence is None
+    assert launch(stage, list(range(40, 48))) is None
+    assert not stage.pending_writes
+
+
+def test_a_part_no_pending_forward_writes_goes_out_at_once(world):
+    """A cached prefix written by a finished forward does not wait for the
+    forwards still running, and every stage offers the same pages."""
+    world.decode.register_decode(ROOM, list(range(100, 112)), [200], None, world.infos)
+    world.pump()
+    for s in world.stages:
+        s.record_writes(Fence(), pages(range(50, 54)))
+    offer_on_every_stage(world, list(range(10, 18)))
+    [transfer] = part_transfers(world)
+    for s in world.stages:
+        [part] = s.early[ROOM]["parts"]
+        assert (part["start"], part["full"]) == (0, list(range(10, 18)))
+
+
+def test_a_part_waits_for_its_newest_writer_only(world):
+    world.decode.register_decode(ROOM, list(range(100, 112)), [200], None, world.infos)
+    world.pump()
+    older, newer, unrelated = Fence(), Fence(), Fence()
+    for s in world.stages:
+        s.record_writes(older, pages(range(10, 14)))
+        s.record_writes(newer, pages(range(14, 18)))
+        s.record_writes(unrelated, pages(range(60, 64)))
+    offer_on_every_stage(world, list(range(10, 18)))
+    assert part_transfers(world) == []
+    # One device stream: the newer writer completing implies the older one did.
+    newer.ready = True
+    for s in world.stages:
+        s.advance_parts()
+    world.pump()
+    assert len(part_transfers(world)) == 1
+
+
+def test_a_failed_probe_holds_its_part_until_finalize(world):
+    world.decode.register_decode(
+        ROOM, list(range(100, 112)), [200, 201], None, world.infos
+    )
+    world.pump()
+    for s in world.stages:
+        fence = Fence()
+        fence.set_exception(RuntimeError("probe copy failed"))
+        s.record_writes(fence, pages(range(10, 18)))
+    offer_on_every_stage(world, list(range(10, 18)))
+    for s in world.stages:
+        s.advance_parts()
+    world.pump()
+    assert part_transfers(world) == []
+    for s in world.stages:
+        prefill_pages(s, [18, 19, 20], swa=[30, 31])
+        assert s.finalize_send(ROOM, None)
+    world.pump()
+    assert len(part_transfers(world)) == 1
+
+
+def test_a_later_completed_forward_clears_an_earlier_failed_probe(world):
+    stage = world.stages[0]
+    failed, done = Fence(), Fence()
+    failed.set_exception(RuntimeError("probe copy failed"))
+    done.ready = True
+    stage.record_writes(failed, pages(range(10, 18)))
+    assert stage._writer_fence([10]) is failed
+    stage.record_writes(done, pages([60]))
+    assert stage._writer_fence([10]) is None
+    assert not stage.pending_writes
 
 
 def test_early_parts_alone_start_the_fence_worker(world, monkeypatch):

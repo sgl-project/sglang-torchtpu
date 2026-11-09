@@ -104,7 +104,7 @@ def tpu_update_inflight_kv_write_pages(
     if inflight_batch is None:
         scheduler.tpu_inflight_kv_write_page_ids = None
         return
-    page_ids = _collect_prefill_write_page_ids(
+    page_ids = collect_prefill_write_page_ids(
         reqs=inflight_batch.reqs,
         req_to_token_table=scheduler.req_to_token_pool.req_to_token,
         page_size=scheduler.token_to_kv_pool_allocator.page_size,
@@ -160,7 +160,7 @@ def _find_safe_prefix_send_end(
     return start + int(hit.nonzero()[0].item()) * page_size
 
 
-def _collect_prefill_write_page_ids(
+def collect_prefill_write_page_ids(
     reqs: Sequence[Req], req_to_token_table: torch.Tensor, page_size: int
 ) -> torch.Tensor:
     """Collect physical KV page IDs touched by the requests' extend ranges.
