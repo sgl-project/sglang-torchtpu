@@ -8,6 +8,11 @@ rows), while 8-slot tiles of its rows go through the decode megakernel's block-d
 dot (kernel._fp4_blockdiag_dot: e2m1 codes straight to the MXU, no VPU dequant, the scales
 applied after the dot). The bf16 output of a slot is silu(gate) * up @ w2, before routing
 weights and the post-expert norm.
+
+The block-diagonal dot is kernel._fp4_blockdiag_dot's math, restructured for whole experts:
+each slot row is spread over 16 LHS rows, one per 16-wide K group, so a few slots fill the
+MXU and the block scales apply after the dot. Here an LHS is built once per K chunk and
+reused by every column tile (and by gate and up), and the partials sum in VMEM.
 """
 
 from __future__ import annotations
@@ -19,13 +24,12 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.muse_megakernel.kernel import FP4_GROUP, FP4_PACK, _fp4_blockdiag_dot
+from sglang_tpu.muse_megakernel.kernel import FP4_GROUP, FP4_PACK
 
 TILE_ROWS = 8  # slots per block-diagonal dot: [8 * 16, 256] LHS
 BD_KC = 256
 BD_N_TILE = 256  # [128, 256] f32 accumulators: 32 vregs
 ARMS = (1, 2, 4, 8)  # slots per tile's dot, as the megakernel's compact buckets
-W2_N_TILE = 512  # down-projection columns per dot below 4 slots ([32, 512] f32 at 2)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -55,6 +59,42 @@ class EPMoEConfig:
     def validate(self) -> None:
         assert self.inter % self.chunk == 0 and self.chunk % BD_KC == 0
         assert self.item_rows % TILE_ROWS == 0 and self.hidden % BD_KC == 0
+
+
+def _bd_lhs(xs: jax.Array) -> jax.Array:
+    """[A, kc] bf16 -> [A * 16, kc]: row a * 16 + g keeps K group g of slot a."""
+    A, kc = xs.shape
+    rows = A * FP4_GROUP
+    keep = (
+        jax.lax.broadcasted_iota(jnp.int32, (rows, kc), 0) % FP4_GROUP
+        == jax.lax.broadcasted_iota(jnp.int32, (rows, kc), 1) // FP4_GROUP
+    )
+    spread = jnp.broadcast_to(xs[:, None, :], (A, FP4_GROUP, kc)).reshape(rows, kc)
+    return jnp.where(keep, spread, jnp.zeros_like(spread))
+
+
+def _bd_partial(lhs: jax.Array, w_ref, s_ref, acc_ref, k0, n_tile: int) -> None:
+    """acc_ref[:A*16] += lhs @ fp8(e2m1 words w_ref[k0/8 :+ kc/8]) * their block scales."""
+    rows, kc = lhs.shape
+    A, N = rows // FP4_GROUP, w_ref.shape[-1]
+    kw, kg = k0 // FP4_PACK, k0 // FP4_GROUP
+    if not isinstance(k0, int):  # a traced chunk start: its alignment, for Mosaic
+        kw, kg = pl.multiple_of(kw, kc // FP4_PACK), pl.multiple_of(kg, kc // FP4_GROUP)
+    for n0 in range(0, N, n_tile):
+        cols = pl.ds(n0, n_tile)
+        w = pltpu.bitcast(
+            w_ref[pl.ds(kw, kc // FP4_PACK), cols], jnp.float4_e2m1fn
+        ).astype(jnp.float8_e4m3fn)
+        sc = s_ref[pl.ds(kg, kc // FP4_GROUP), cols].astype(jnp.float32)
+        res = jnp.dot(lhs, w, preferred_element_type=jnp.float32)
+        acc_ref[pl.ds(0, rows), cols] += res * jnp.tile(sc, (A, 1))
+
+
+def _group_sum(acc_ref, A: int, N: int) -> jax.Array:
+    """[A, N]: each slot's 16 group rows summed."""
+    return jnp.sum(
+        acc_ref[pl.ds(0, A * FP4_GROUP), pl.ds(0, N)].reshape(A, FP4_GROUP, N), axis=1
+    )
 
 
 def layout(
@@ -120,6 +160,9 @@ def ep_moe_call(c: EPMoEConfig):
         w2b,
         s2b,
         ybuf,
+        part_g,
+        part_u,
+        part_y,
         wsems,
         xsem,
         ysem,
@@ -187,39 +230,41 @@ def ep_moe_call(c: EPMoEConfig):
                 cp.wait()
 
             def arm(A):
-                """The tile's first A slots: an A-row block-diagonal dot (A * 16 LHS rows)."""
+                """The tile's first A slots."""
 
                 def run(t):
                     rows = pl.ds(pl.multiple_of(t * TILE_ROWS, TILE_ROWS), A)
-                    xt = xbuf[rows, :]
-                    g = _fp4_blockdiag_dot(
-                        xt, wg.at[slot], sg.at[slot], He, CI, BD_KC, n_tile=BD_N_TILE
-                    )
-                    u = _fp4_blockdiag_dot(
-                        xt, wu.at[slot], su.at[slot], He, CI, BD_KC, n_tile=BD_N_TILE
-                    )
+                    zg = jnp.zeros((A * FP4_GROUP, CI), jnp.float32)
+                    part_g[pl.ds(0, A * FP4_GROUP), :] = zg
+                    part_u[pl.ds(0, A * FP4_GROUP), :] = zg
+
+                    def gate_up(ci, carry3):
+                        k0 = pl.multiple_of(ci * BD_KC, BD_KC)
+                        lhs = _bd_lhs(xbuf[rows, pl.ds(k0, BD_KC)].astype(jnp.bfloat16))
+                        _bd_partial(
+                            lhs, wg.at[slot], sg.at[slot], part_g, k0, BD_N_TILE
+                        )
+                        _bd_partial(
+                            lhs, wu.at[slot], su.at[slot], part_u, k0, BD_N_TILE
+                        )
+                        return carry3
+
+                    jax.lax.fori_loop(0, He // BD_KC, gate_up, 0)
+                    g, u = _group_sum(part_g, A, CI), _group_sum(part_u, A, CI)
                     h = (g * jax.nn.sigmoid(g) * u).astype(jnp.bfloat16)
-                    if A >= 4:  # _fp4_blockdiag_dot tiles N itself from 4 rows up
-                        acc[rows, :] += _fp4_blockdiag_dot(
-                            h,
+                    part_y[pl.ds(0, A * FP4_GROUP), :] = jnp.zeros(
+                        (A * FP4_GROUP, He), jnp.float32
+                    )
+                    for k0 in range(0, CI, BD_KC):
+                        _bd_partial(
+                            _bd_lhs(h[:, k0 : k0 + BD_KC]),
                             w2b.at[slot],
                             s2b.at[slot],
-                            CI,
-                            He,
-                            BD_KC,
-                            n_tile=BD_N_TILE,
+                            part_y,
+                            k0,
+                            BD_N_TILE,
                         )
-                        return
-                    for n0 in range(0, He, W2_N_TILE):
-                        cols = pl.ds(n0, W2_N_TILE)
-                        acc[rows, cols] += _fp4_blockdiag_dot(
-                            h,
-                            w2b.at[slot, :, cols],
-                            s2b.at[slot, :, cols],
-                            CI,
-                            W2_N_TILE,
-                            BD_KC,
-                        )
+                    acc[rows, :] += _group_sum(part_y, A, He)
 
                 return run
 
@@ -271,6 +316,9 @@ def ep_moe_call(c: EPMoEConfig):
         vmem((D, CI // FP4_PACK, He), jnp.uint32),  # w2b
         vmem((D, CI // FP4_GROUP, He), jnp.bfloat16),  # s2b
         vmem((TILE_ROWS, He), jnp.float32),  # ybuf
+        vmem((TILE_ROWS * FP4_GROUP, CI), jnp.float32),  # part_g: gate partials
+        vmem((TILE_ROWS * FP4_GROUP, CI), jnp.float32),  # part_u: up partials
+        vmem((TILE_ROWS * FP4_GROUP, He), jnp.float32),  # part_y: down partials
         pltpu.SemaphoreType.DMA((D, 6)),
         pltpu.SemaphoreType.DMA((1,)),
         pltpu.SemaphoreType.DMA((1,)),
