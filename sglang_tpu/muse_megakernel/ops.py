@@ -32,12 +32,13 @@ from sglang_tpu.kv_pool import (
     kv_pack_heads,
 )
 from sglang_tpu.muse_megakernel import kernel as K
+from sglang_tpu.muse_megakernel.mk import trace as mk_trace
 
 logger = logging.getLogger(__name__)
 
-# Profiling only: in-kernel region names for xprof (kernel.py's _TRACE / _TRACE_INNER).
-K._TRACE = tpu_envs.SGLANG_TPU_MK_TRACE_REGIONS.get() >= 1
-K._TRACE_INNER = tpu_envs.SGLANG_TPU_MK_TRACE_REGIONS.get() >= 2
+# Profiling only: in-kernel region names for xprof (mk/trace.py's _TRACE / _TRACE_INNER).
+mk_trace._TRACE = tpu_envs.SGLANG_TPU_MK_TRACE_REGIONS.get() >= 1
+mk_trace._TRACE_INNER = tpu_envs.SGLANG_TPU_MK_TRACE_REGIONS.get() >= 2
 
 _OP_NS = "sglang_tpu_pallas"
 # KV pages per attention chunk: 4 beats 2 on long-context verify steps and is neutral
