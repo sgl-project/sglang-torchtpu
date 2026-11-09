@@ -24,13 +24,16 @@ import torch.distributed as dist
 
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang_tpu.disaggregation.decode_dram_offload.radix_host_ops import (
+    device_only_ancestors,
     host_pages,
     is_live_host_backed_leaf,
     leaf_of,
     lock_host_path,
     mark_next_victim,
     path_tokens,
+    reclaim_full_host_duplicates,
     unlock_host_path,
     window_host_pages,
 )
@@ -119,7 +122,9 @@ class PrefillDramVictimPusher:
         self._pushed_len = weakref.WeakKeyDictionary()
         self._next_seq = 1
         self._victim_stamp = _VICTIM_STAMP_BASE
-        self.stats = dict.fromkeys(("started", "stored", "declined"), 0)
+        self.stats = dict.fromkeys(
+            ("started", "stored", "declined", "ancestor_backup_tokens"), 0
+        )
         self._last_log = [0.0]
 
     def note_decode_of(self, req: Any, *, recalled: bool) -> None:
@@ -236,20 +241,60 @@ class PrefillDramVictimPusher:
             else None
         )
         # [picked, the leaf's fingerprint (2 values), its tokens, its host
-        # pages, its window pages]
-        row = [0, 0, 0, 0, 0, 0]
+        # pages (-1 while ancestors still lack a host copy), its window pages,
+        # the tokens of device-only ancestors to back up first]
+        row = [0, 0, 0, 0, 0, 0, 0]
         if picked is not None:
             decode, leaf, path, pages, swa_pages = picked
+            ancestors = device_only_ancestors(self._cache, leaf) or []
             row = [
                 1,
                 *push_manifest(path, leaf.key.extra_key, leaf.key.cache_salt),
                 len(path),
-                len(pages),
+                -1 if pages is None else len(pages),
                 len(swa_pages),
+                sum(len(node.key) for node in ancestors),
             ]
         low, high = self._lockstep.min_max(row)
         if not low[0] or low != high:
             return
+        if pages is None:
+            if not low[6]:
+                return
+            # The same leaf below the same device-only ancestors on every
+            # rank: make the host room for them in step (pressure leaves less
+            # free room than the ancestors need), back them up (D->H,
+            # synchronous), then the path is whole in host RAM.
+            host_pool = self._cache.cache_controller.mem_pool_host
+            short = self._lockstep.max(max(0, low[6] - host_pool.available_size()))
+            if short:
+                freed = self._cache.evict_host(short, ComponentType.FULL)
+                if freed < short:
+                    reclaim_full_host_duplicates(self._cache, short - freed)
+            # The eviction can take the leaf itself: it was the coldest.
+            if not self._lockstep.all(
+                host_pool.available_size() >= low[6]
+                and is_live_host_backed_leaf(self._cache, leaf) is True
+            ):
+                return
+            backed = 0
+            for node in ancestors:
+                if not self._cache.backup_node_for_write_back(node.id):
+                    break
+                backed += len(node.key)
+            self.stats["ancestor_backup_tokens"] += backed
+            pages = host_pages(self._cache, self._host_pool, leaf)
+            # The window was whole in host RAM when the leaf was picked; the
+            # eviction above may have taken it.
+            swa_pages = window_host_pages(
+                self._cache,
+                self._swa_host_pool,
+                leaf,
+                tokens=len(path),
+                window_tokens=self._window_tokens,
+            )
+            if not self._lockstep.all(pages is not None and swa_pages is not None):
+                return
         # Not again at this length, stored or not.
         self._pushed_len[leaf] = len(path)
         seq = self._next_seq
@@ -297,11 +342,15 @@ class PrefillDramVictimPusher:
 
     def _pick_coldest_host_leaf(
         self,
-    ) -> Optional[Tuple[Tuple[str, int], Any, List[int], List[int], List[int]]]:
-        """(decode peer, leaf, its path tokens, its host pages, its window
-        pages) of the oldest leaf owned by a known decode whose whole path,
-        and window, is in host RAM now. A leaf whose backup is still pending
-        is a candidate again once it completed."""
+    ) -> Optional[
+        Tuple[Tuple[str, int], Any, List[int], Optional[List[int]], List[int]]
+    ]:
+        """(decode peer, leaf, its path tokens, its host pages or None, its
+        window pages) of the oldest leaf owned by a known decode whose whole
+        path, and window, is in host RAM now, or whose path lacks host copies
+        only for nodes still on the device (a hot shared prefix), which the
+        push backs up first; its window must be in host RAM already. A leaf
+        whose backup is still pending is a candidate again once it completed."""
         busy = {push.leaf for push in self._pushes.values()}
         candidates = []
         for node, (peer, fingerprint) in list(self._routes.items()):
@@ -314,7 +363,7 @@ class PrefillDramVictimPusher:
             if self._pushed_len.get(node) == len(path):
                 continue
             pages = host_pages(self._cache, self._host_pool, node)
-            if pages is None:
+            if pages is None and not device_only_ancestors(self._cache, node):
                 continue
             swa_pages = window_host_pages(
                 self._cache,
