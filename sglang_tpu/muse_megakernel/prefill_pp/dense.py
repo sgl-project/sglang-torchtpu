@@ -57,7 +57,7 @@ def _rope_lanes(x, cos, sin):
 
 SCRATCH = (
     "xbuf", "accbuf", "abuf", "gbuf", "pbuf", "wbuf", "vec_v", "wr_v", "rope_v", "rope8",
-    "otile", "ids_v", "tw_v", "wcol_v", "misc_s", "sem_x", "sem_w", "sem_o", "sem_m",
+    "otile", "ids_v", "tw_v", "ones_v", "misc_s", "sem_x", "sem_w", "sem_o", "sem_m",
 )  # fmt: skip
 
 
@@ -71,7 +71,7 @@ def stage_calls(c: PPConfig):
         (x, expert input [T, He] bf16, ids [T, 128] i32, weights [T, 128] f32), lanes past
         top_k zero, x updated in place
       combine(ctl, slot table, x, y [T * top_k, He] bf16 (token-major slots), routing weights
-        [T * top_k, 1] f32 (the same rows), *weights) -> (x,), x updated in place"""
+        [T, 128] f32 (lanes past top_k zero), *weights) -> (x,), x updated in place"""
     c.validate()
     skip = skipped_phases()
     T, H, He, E, K = c.rows, c.hidden, c.expert_hidden, c.n_experts, c.top_k
@@ -83,6 +83,7 @@ def stage_calls(c: PPConfig):
     n_qt, n_kt = qd // tn, kvd // tn
     ntc = nq // tn
     G = tm // K  # tokens per combine group: their K slot rows fill a tile
+    LC = 512  # lanes per combine chunk
     wr_rows = max(H, qd, He)
 
     def body(R, phases):
@@ -333,7 +334,8 @@ def stage_calls(c: PPConfig):
             jax.lax.fori_loop(0, n_rt, row_tile, 0)
 
         def combine(sl):
-            y_h, tw_in, wcol_v = R["y_h"], R["tw_in"], R["wcol_v"]
+            y_h, tw_in, ones_v = R["y_h"], R["tw_in"], R["ones_v"]
+            ones_v[...] = jnp.ones(ones_v.shape, BF16)
             n_wu = H // tn
             total = n_rt * n_wu
             n_grp = tm // G
@@ -356,11 +358,7 @@ def stage_calls(c: PPConfig):
             def row_tile(i, carry):
                 r0 = pl.multiple_of(i * tm, tm)
                 cx = pltpu.make_async_copy(x_out.at[pl.ds(r0, tm)], xbuf, sem_x.at[0])
-                ct = pltpu.make_async_copy(
-                    tw_in.at[pl.ds(pl.multiple_of(r0 * K, tm * K), tm * K)],
-                    wcol_v,
-                    sem_x.at[1],
-                )
+                ct = pltpu.make_async_copy(tw_in.at[pl.ds(r0, tm)], tw_v, sem_x.at[1])
                 cx.start()
                 ct.start()
                 ycp(i, 0, 0).start()
@@ -376,21 +374,35 @@ def stage_calls(c: PPConfig):
 
                     stage = gbuf.at[:, pl.ds(yb * He, He)]
 
-                    def tokens(r, c2):
-                        # 8 tokens' K slot rows (an f32 row tile): normalize, weight, sum the slots
-                        nt = 8
-                        t0 = pl.multiple_of(gi * G + r * nt, nt)
-                        y = stage[pl.ds(pl.multiple_of(r * nt * K, nt * K), nt * K), :]
-                        yn = _bf(
-                            _rms(y.astype(F32) * vrow("post_expert_w", He), c.post_eps)
+                    # the slot RMS sums and the weighted slot sum run on the MXU: the VPU
+                    # only scales (a ones block sums the squares; Wsel holds w at (t, Kt + k))
+                    pew = vrow("post_expert_w", He)
+                    tw = jnp.concatenate(
+                        [
+                            tw_v[pl.ds(pl.multiple_of(gi * G, G), G), :],
+                            jnp.zeros((G, LANE), F32),
+                        ],
+                        axis=1,
+                    )
+                    wsel = pltpu.roll(tw, 0, 1, stride=K, stride_axis=0).astype(BF16)
+                    ss = jnp.zeros((tm, LANE), F32)
+                    for l0 in range(0, He, LC):
+                        yp = stage[:, pl.ds(l0, LC)].astype(F32) * pew[:, l0 : l0 + LC]
+                        ss = ss + jnp.dot(
+                            (yp * yp).astype(BF16),
+                            ones_v[...],
+                            preferred_element_type=F32,
                         )
-                        w = wcol_v[pl.ds(pl.multiple_of(t0 * K, nt * K), nt * K), :]
-                        accbuf[pl.ds(t0, nt), pl.ds(0, He)] = jnp.sum(
-                            (yn * w).reshape(nt, K, He), axis=1
+                    scale = jax.lax.rsqrt(ss[:, :1] * (1.0 / He) + c.post_eps)
+                    for l0 in range(0, He, LC):
+                        yp = stage[:, pl.ds(l0, LC)].astype(F32) * pew[:, l0 : l0 + LC]
+                        accbuf[pl.ds(pl.multiple_of(gi * G, G), G), pl.ds(l0, LC)] = (
+                            jnp.dot(
+                                wsel,
+                                (yp * scale).astype(BF16),
+                                preferred_element_type=F32,
+                            )
                         )
-                        return c2
-
-                    jax.lax.fori_loop(0, G // 8, tokens, 0)
                     return cc
 
                 jax.lax.fori_loop(0, n_grp, group, 0)
@@ -470,9 +482,7 @@ def stage_calls(c: PPConfig):
         vmem((2, tm, tn), BF16),  # otile
         vmem((tm, LANE), jnp.int32),  # ids_v
         vmem((tm, LANE), F32),  # tw_v
-        vmem(
-            (tm * K, 1), F32
-        ),  # wcol_v: a row tile's routing weights, one per slot row
+        vmem((LC, LANE), BF16),  # ones_v: sums a lane chunk's squares on the MXU
         smem_t((8,), jnp.int32),  # misc_s
         dma((3,)),
         dma((2,)),
