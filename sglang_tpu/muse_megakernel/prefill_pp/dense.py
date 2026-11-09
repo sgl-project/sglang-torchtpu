@@ -57,7 +57,7 @@ def _rope_lanes(x, cos, sin):
 
 SCRATCH = (
     "xbuf", "accbuf", "abuf", "gbuf", "pbuf", "wbuf", "vec_v", "wr_v", "rope_v", "rope8",
-    "otile", "ids_v", "tw_v", "misc_s", "sem_x", "sem_w", "sem_o", "sem_m",
+    "otile", "ids_v", "tw_v", "wcol_v", "misc_s", "sem_x", "sem_w", "sem_o", "sem_m",
 )  # fmt: skip
 
 
@@ -70,8 +70,8 @@ def stage_calls(c: PPConfig):
       route(ctl, slot table, x, o [T, q_dim] bf16, gate, *weights) ->
         (x, expert input [T, He] bf16, ids [T, 128] i32, weights [T, 128] f32), lanes past
         top_k zero, x updated in place
-      combine(ctl, slot table, x, y [T * top_k, He] bf16 (token-major slots), weights,
-        *weights) -> (x,), x updated in place"""
+      combine(ctl, slot table, x, y [T * top_k, He] bf16 (token-major slots), routing weights
+        [T * top_k, 1] f32 (the same rows), *weights) -> (x,), x updated in place"""
     c.validate()
     skip = skipped_phases()
     T, H, He, E, K = c.rows, c.hidden, c.expert_hidden, c.n_experts, c.top_k
@@ -90,7 +90,7 @@ def stage_calls(c: PPConfig):
         wqkvg, wo, wpool, wunpool, wrouter, vecs = (R[n] for n in WEIGHT_ORDER)
         xbuf, accbuf, abuf, gbuf, pbuf, wbuf = (R[n] for n in SCRATCH[:6])
         vec_v, wr_v, rope_v, rope8, otile, ids_v, tw_v = (R[n] for n in SCRATCH[6:13])
-        misc_s, sem_x, sem_w, sem_o, sem_m = (R[n] for n in SCRATCH[13:])
+        misc_s, sem_x, sem_w, sem_o, sem_m = (R[n] for n in SCRATCH[14:])
         x_out = x_in  # the stream is aliased in place
 
         def vrow(name, n, off=0):
@@ -333,7 +333,7 @@ def stage_calls(c: PPConfig):
             jax.lax.fori_loop(0, n_rt, row_tile, 0)
 
         def combine(sl):
-            y_h, tw_in = R["y_h"], R["tw_in"]
+            y_h, tw_in, wcol_v = R["y_h"], R["tw_in"], R["wcol_v"]
             n_wu = H // tn
             total = n_rt * n_wu
             n_grp = tm // G
@@ -356,7 +356,11 @@ def stage_calls(c: PPConfig):
             def row_tile(i, carry):
                 r0 = pl.multiple_of(i * tm, tm)
                 cx = pltpu.make_async_copy(x_out.at[pl.ds(r0, tm)], xbuf, sem_x.at[0])
-                ct = pltpu.make_async_copy(tw_in.at[pl.ds(r0, tm)], tw_v, sem_x.at[1])
+                ct = pltpu.make_async_copy(
+                    tw_in.at[pl.ds(pl.multiple_of(r0 * K, tm * K), tm * K)],
+                    wcol_v,
+                    sem_x.at[1],
+                )
                 cx.start()
                 ct.start()
                 ycp(i, 0, 0).start()
@@ -380,17 +384,7 @@ def stage_calls(c: PPConfig):
                         yn = _bf(
                             _rms(y.astype(F32) * vrow("post_expert_w", He), c.post_eps)
                         )
-                        tw = tw_v[pl.ds(t0, nt), :]
-                        tw_rows = jnp.broadcast_to(
-                            tw[:, None, :], (nt, K, LANE)
-                        ).reshape(nt * K, LANE)
-                        slot = (
-                            jax.lax.broadcasted_iota(jnp.int32, (nt * K, LANE), 0) % K
-                        )
-                        lane = jax.lax.broadcasted_iota(jnp.int32, (nt * K, LANE), 1)
-                        w = jnp.sum(
-                            jnp.where(lane == slot, tw_rows, 0.0), axis=1, keepdims=True
-                        )
+                        w = wcol_v[pl.ds(pl.multiple_of(t0 * K, nt * K), nt * K), :]
                         accbuf[pl.ds(t0, nt), pl.ds(0, He)] = jnp.sum(
                             (yn * w).reshape(nt, K, He), axis=1
                         )
@@ -476,6 +470,9 @@ def stage_calls(c: PPConfig):
         vmem((2, tm, tn), BF16),  # otile
         vmem((tm, LANE), jnp.int32),  # ids_v
         vmem((tm, LANE), F32),  # tw_v
+        vmem(
+            (tm * K, 1), F32
+        ),  # wcol_v: a row tile's routing weights, one per slot row
         smem_t((8,), jnp.int32),  # misc_s
         dma((3,)),
         dma((2,)),

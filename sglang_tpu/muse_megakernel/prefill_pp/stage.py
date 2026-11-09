@@ -84,7 +84,12 @@ def stage_forward(
                 )
         with jax.named_scope(f"slot{s}/combine"):
             (x,) = combine_call(
-                ctl_s, slots, x, y.reshape(T * K, c.expert_hidden), tw, *weights
+                ctl_s,
+                slots,
+                x,
+                y.reshape(T * K, c.expert_hidden),
+                tw[:, :K].reshape(T * K, 1),
+                *weights,
             )
         routes.append((ids, tw, q, k, v, o, xe, y))
     return (x, pools, routes) if scratch else (x, pools)
