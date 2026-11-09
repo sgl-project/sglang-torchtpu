@@ -30,7 +30,6 @@ from jax.sharding import PartitionSpec as P
 
 AXIS = "model"
 FP8 = jnp.float8_e4m3fn
-E2M1 = (0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6)
 REPLICATED_ROWS = (
     "pre_attn_w",
     "attn_alpha",
@@ -63,6 +62,10 @@ class EPConfig:
     top_k: int = 8
     expert_hidden: int = 4096
     inter_local: int = 512  # one intermediate slice of an expert
+    # "exact": the reference's expert math. "identity": a slot's output is its input, for
+    # timing the collectives alone (the prototype's dequantize-everything experts would
+    # swamp them); dispatch and combine move the same bytes either way.
+    expert_math: str = "exact"
     window: int = 2048
     rms_eps: float = 1e-5
     post_eps: float = 1e-8
@@ -92,6 +95,7 @@ class EPConfig:
         assert self.rows % self.tp == 0 and self.n_req * self.q <= self.rows
         assert self.n_experts % self.tp == 0 and len(self.kinds) == self.n_layers
         assert self.window % self.page_size == 0
+        assert self.expert_math in ("exact", "identity"), self.expert_math
 
 
 def _rms(x: jax.Array, eps: float, w: jax.Array | None = None) -> jax.Array:
@@ -141,7 +145,7 @@ def dequant(words: jax.Array, scale: jax.Array, kind: str) -> jax.Array:
         codes = (
             words[..., :, None, :] >> shifts
         ) & 0xF  # nibble j of word w is row 8w + j
-        v = jnp.asarray(E2M1, jnp.float32)[codes].reshape(*lead, kw * 8, n)
+        v = _e2m1(codes).reshape(*lead, kw * 8, n)
         return v * jnp.repeat(scale.astype(jnp.float32), 16, axis=-2)
     shifts = jnp.arange(0, 32, 8, dtype=jnp.int32)[:, None]
     b = ((words[..., :, None, :] >> shifts) & 0xFF).astype(jnp.uint8)
@@ -151,6 +155,15 @@ def dequant(words: jax.Array, scale: jax.Array, kind: str) -> jax.Array:
         .reshape(*lead, kw * 4, n)
     )
     return v * scale[..., :1, :].astype(jnp.float32)
+
+
+def _e2m1(codes: jax.Array) -> jax.Array:
+    """f32 of e2m1 codes (sign, 2 exponent bits, 1 mantissa bit) by arithmetic: a 16-entry
+    table lookup is a gather, far slower on TPU over GiBs of codes."""
+    e = ((codes >> 1) & 3).astype(jnp.float32)
+    m = (codes & 1).astype(jnp.float32)
+    mag = jnp.where(e == 0, 0.5 * m, (1 + 0.5 * m) * jnp.exp2(e - 1))
+    return jnp.where(codes & 8, -mag, mag)
 
 
 def _excl_cumsum(x: jax.Array) -> jax.Array:
@@ -333,7 +346,11 @@ def _moe(
             axis_name=AXIS,
         )
     with jax.named_scope("ep_experts"):
-        yr = _experts(c, c.kinds[l], xr, er, jnp.sum(recv), w)
+        yr = (
+            xr
+            if c.expert_math == "identity"
+            else _experts(c, c.kinds[l], xr, er, jnp.sum(recv), w)
+        )
     with jax.named_scope("ep_combine"):
         # Back to each source, where it sent from: its input offset for this rank.
         src_in_off = jnp.sum(jnp.where(jnp.arange(tp)[None, :] < me, counts, 0), axis=1)
