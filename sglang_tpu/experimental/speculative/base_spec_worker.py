@@ -741,8 +741,8 @@ class TpuSpecWorker(BaseSpecWorker):
         """DISTRIBUTED_TOP_K when the accept reads only the target's top-k (greedy or candidates)."""
         if self._verify_top_k_width is None:
             return LogitsOutputMode.FULL_VOCAB
-        if self._simulate_acc_len > 0:
-            return LogitsOutputMode.FULL_VOCAB
+        # A simulated accept reads no logits; keep serving's mode so the benchmark
+        # pays the same logits traffic as production.
         if bucket.temperatures is None or draft_result.draft_candidates is not None:
             return LogitsOutputMode.DISTRIBUTED_TOP_K
         return LogitsOutputMode.FULL_VOCAB
@@ -756,6 +756,17 @@ class TpuSpecWorker(BaseSpecWorker):
         """Accept and finalize in one program; ranks agree without a broadcast (hash_uniforms)."""
         draft_tokens = draft_result.draft_tokens
         state = bucket.state
+        if self._simulate_acc_len > 0:
+            num_correct_drafts, bonus_tokens, draft_tokens = self._simulated_accept(
+                draft_tokens.shape[0]
+            )
+            return finalize_accept(
+                draft_tokens,
+                num_correct_drafts,
+                bonus_tokens,
+                state.seq_lens,
+                bucket.live_mask,
+            )
         num_rows = draft_tokens.shape[0] * self.num_verify_rows
         if logits_output.has_next_token_global_top_k:
             top_logits = logits_output.next_token_global_top_k_logits
@@ -791,17 +802,6 @@ class TpuSpecWorker(BaseSpecWorker):
         assert target_logits.shape[0] == num_rows, (
             "verify logits must keep the bucket rows"
         )
-        if self._simulate_acc_len > 0:
-            num_correct_drafts, bonus_tokens, draft_tokens = self._simulated_accept(
-                draft_tokens.shape[0]
-            )
-            return finalize_accept(
-                draft_tokens,
-                num_correct_drafts,
-                bonus_tokens,
-                state.seq_lens,
-                bucket.live_mask,
-            )
         if bucket.temperatures is None or bucket.top_ks is None:
             return accept_greedy_step(
                 target_logits,
