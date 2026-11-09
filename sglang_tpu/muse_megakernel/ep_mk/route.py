@@ -161,10 +161,8 @@ def seg_dmas(S: dict, s, d):
     return (S["ep_tab_s"][T_N + s, d] + SEG - 1) // SEG
 
 
-ROW_BITS, SRC_BITS = (
-    12,
-    3,
-)  # an ep_rows entry: received row | source << 12 | back row << 15
+# an ep_rows entry: received row | source << ROW_BITS | return row << (ROW_BITS + SRC_BITS)
+ROW_BITS, SRC_BITS = 12, 3
 
 
 def build_items(c: MKConfig, p: EPPlan, S: dict) -> jax.Array:

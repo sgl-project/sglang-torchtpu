@@ -5656,9 +5656,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                 smalls_copy(l, slot).start()
                 ws.prologue(l)
             with _scope("smalls_wait"):
-                if (
-                    ep is None or not prefetched
-                ):  # else the EP hook's next_smalls waited
+                # prefetched under EP: the previous layer's next_smalls waited
+                if ep is None or not prefetched:
                     smalls_copy(l, slot).wait()
             smr = S["smalls"].at[slot]
             use_rope, is_global = flags(l)
@@ -5666,9 +5665,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             def row(name, n=H):
                 return smr[SMALL[name] : SMALL[name] + 1, :n]
 
-            if (
-                ep is not None and prefetched
-            ):  # every row's normed bf16, gathered by the hook
+            if ep is not None and prefetched:  # gathered by the previous layer's hook
                 ep.pre_attn(c, S)
             elif not pend:
                 if c.tiled_vmem_pads:

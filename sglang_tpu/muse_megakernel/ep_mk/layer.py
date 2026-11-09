@@ -607,9 +607,8 @@ def _gather_lhs(step: EPLayerStep, p: EPPlan, nsmr) -> None:
     read (o_proj and the FFN section run on own rows)."""
     c, S, me = step.c, step.S, step.me
     rc, H = p.rows_own, c.hidden
-    own = (
-        S["ep_f"].bitcast(jnp.uint32).at[:, pl.ds(0, H // 2)]
-    )  # free after the residual
+    # own rows staged in ep_f (free after the residual)
+    own = S["ep_f"].bitcast(jnp.uint32).at[:, pl.ds(0, H // 2)]
     g, sems, rsems = S["ep_lhs_g"], S["ep_lhs_sems"], S["ep_lhs_rsems"]
     w = nsmr[SMALL["pre_attn_w"] : SMALL["pre_attn_w"] + 1, :H]
     _, rows = _stream_rows(c, S)
@@ -621,13 +620,10 @@ def _gather_lhs(step: EPLayerStep, p: EPPlan, nsmr) -> None:
             )
 
     rows(me * rc, rc, norm, write_back=False)
-    n = (
-        rc if rc % 8 == 0 else 1
-    )  # rows per copy: a block, or one row of an unaligned one
+    n = rc if rc % 8 == 0 else 1  # rows per copy: a block, or a row of an unaligned one
 
-    def block(
-        k,
-    ):  # (source rows in a [rc]-row buffer, owner k's rows in ep_lhs_g) per copy
+    def block(k):
+        """Per copy: (rows in the [rc]-row own buffer, owner k's rows in ep_lhs_g)."""
         if rc % 8 == 0:
             return [(pl.ds(0, rc), pl.ds(pl.multiple_of(k * rc, 8), rc))]
         return [(pl.ds(r, 1), pl.ds(k * rc + r, 1)) for r in range(rc)]
