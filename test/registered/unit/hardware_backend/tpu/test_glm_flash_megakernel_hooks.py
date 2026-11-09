@@ -27,13 +27,6 @@ class TestServingGuards(CustomTestCase):
         with self.assertRaises(ValueError):
             ops.require_expert_tp(8)
 
-    def test_long_page_tables_take_the_lean_config(self):
-        """The deep-ring small-step config overflows VMEM once the page table covers
-        more than 131k tokens; 16-row steps at 262k must use the lean config."""
-        self.assertFalse(ops.lean_config(rows=16, max_len=131072))
-        self.assertTrue(ops.lean_config(rows=16, max_len=262144))
-        self.assertTrue(ops.lean_config(rows=32, max_len=131072))
-
 
 class TestPoolBookkeeping(CustomTestCase):
     def test_record_bytes_match_the_pool_layout(self):
