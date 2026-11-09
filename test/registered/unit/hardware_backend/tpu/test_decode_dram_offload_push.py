@@ -190,6 +190,84 @@ class TestPrefillPusher(PrefillPusherFixture, CustomTestCase):
         self.assertEqual(host_hit(self.cache, self.a), 8)
 
 
+class TestPushBelowAHotSharedPrefix(PrefillPusherFixture, CustomTestCase):
+    """A session behind a shared prefix (a system prompt) that is hot on the
+    device has no host copy of that prefix under write-back, so its path was
+    never whole in host RAM and never pushed (live: 0 pushes and 0 recalls
+    with a shared 8k prefix). The push backs the device-only ancestors up
+    first, once every rank has the host room."""
+
+    def _session_below_a_hot_prefix(self):
+        shared, tail = list(range(300, 304)), list(range(304, 312))
+        insert_tokens(self.cache, self.allocator, shared)
+        insert_tokens(self.cache, self.allocator, shared + tail)
+        # Only this session is routed; the fixture's own sessions stay unpushed.
+        self.pusher.release_all()  # no push in flight: clears the routes
+        self.peers[3] = ("10.0.0.3", 5003)
+        self.pusher.note_decode_of(
+            pushed_req(room=3, tokens=shared + tail), recalled=False
+        )
+        # Device pressure demotes the tail (the only device leaf) to host RAM;
+        # the shared prefix stays on the device without a host copy.
+        self.cache.evict(EvictParams(num_tokens=len(tail)))
+        head = root_node(self.cache, shared[0])
+        self.assertIsNotNone(head.component_data[FULL].value)
+        self.assertFalse(head.backuped)
+        leaf = next(iter(head.children.values()))
+        self.assertTrue(leaf.evicted and leaf.backuped)
+        return shared, tail, head
+
+    def test_device_only_prefix_is_backed_up_and_the_whole_path_pushed(self):
+        shared, tail, head = self._session_below_a_hot_prefix()
+        self.assertEqual(
+            [
+                n.id
+                for n in radix_host_ops.device_only_ancestors(
+                    self.cache, next(iter(head.children.values()))
+                )
+            ],
+            [head.id],
+        )
+        sent = self.offer_once()
+        self.assertEqual(sent["tokens"], shared + tail)
+        self.assertEqual(len(sent["blocks"]), len(shared) + len(tail))
+        self.assertTrue(head.backuped)
+        self.assertIsNotNone(head.component_data[FULL].value)
+        self.assertEqual(self.pusher.stats["ancestor_backup_tokens"], len(shared))
+        self.assertEqual(self.pusher.stats["started"], 1)
+
+    def test_room_for_the_prefix_is_made_by_evicting_host_only_leaves(self):
+        """Host pressure arrives with less free room than the prefix needs
+        (live: one request at a time never pushed); the fixture's two other
+        sessions are host-only leaves that eviction can take."""
+        shared, tail, head = self._session_below_a_hot_prefix()
+        self.host.alloc(self.host.available_size())
+        sent = self.offer_once()
+        self.assertEqual(sent["tokens"], shared + tail)
+        self.assertTrue(head.backuped)
+        self.assertEqual(self.pusher.stats["ancestor_backup_tokens"], len(shared))
+
+    def test_eviction_that_takes_the_leaf_itself_ends_the_attempt(self):
+        """With no other host-only leaf, making room evicts the candidate;
+        nothing is backed up or pushed, and nothing is left half done."""
+        shared, tail, head = self._session_below_a_hot_prefix()
+        self.cache.evict_host(16, FULL)  # the fixture's own sessions go first
+        self.host.alloc(self.host.available_size())
+        self.pusher.advance(serving=True)
+        self.mgr.send_victim_push.assert_not_called()
+        self.assertFalse(head.backuped)
+        self.assertEqual(self.pusher.stats["ancestor_backup_tokens"], 0)
+
+    def test_a_pending_backup_on_the_path_is_not_a_candidate(self):
+        shared, tail, head = self._session_below_a_hot_prefix()
+        leaf = next(iter(head.children.values()))
+        head.write_through_pending_id = 99
+        self.assertIsNone(radix_host_ops.device_only_ancestors(self.cache, leaf))
+        self.pusher.advance(serving=True)
+        self.mgr.send_victim_push.assert_not_called()
+        head.write_through_pending_id = None
+
+
 class TestDecodeReceiver(DecodeReceiverFixture, CustomTestCase):
     def test_push_is_inserted_and_answered_once_its_read_has_landed(self):
         self.granted()

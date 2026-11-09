@@ -77,6 +77,30 @@ def _page_hashes(tokens: List[int], page_size: int) -> List[str]:
     return [hashes] if isinstance(hashes, str) else list(hashes)
 
 
+def device_only_ancestors(cache: Any, leaf: Any) -> Optional[List[Any]]:
+    """The nodes above ``leaf`` whose FULL KV is on the device without a host
+    copy, root first; [] when the whole path is host-backed; None while a node
+    of the path has a backup pending (it cannot be served or backed up now).
+
+    A hot shared prefix never leaves the device under write-back, so the
+    leaves below it are never whole in host RAM; backing those ancestors up
+    makes such a leaf pushable."""
+    root = cache.tree_core.root_node
+    found = []
+    node = leaf.parent
+    while node is not root:
+        data = node.component_data[_FULL]
+        if node.write_through_pending_id is not None:
+            return None
+        if data.host_value is None:
+            if data.value is None:
+                return None
+            found.append(node)
+        node = node.parent
+    found.reverse()
+    return found
+
+
 def lock_host_path(cache: Any, node: Any) -> List[Any]:
     """Host-lock every node from ``node`` up to the root; returns what
     ``unlock_host_path`` takes. Core's host lock protects one node, and under
