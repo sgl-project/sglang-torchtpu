@@ -17,6 +17,7 @@ from sglang.srt.layers.quantization.mxfp4_tpu_util import (
     _pad_last_axis,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.expert_loading import _wait_for
 from sglang_tpu.fp8_moe import (
     _clear_replaced_param,
@@ -30,6 +31,11 @@ from sglang_tpu.fused_rs_sequence_parallel import (
     prepare_tpu_fused_rs_post_expert_norm,
 )
 from sglang_tpu.moe.ep_rank import mask_tpu_moe_non_local_experts, traced_moe_ep_rank
+from sglang_tpu.moe.nvfp4_requant import (
+    NVFP4_SERVED_GROUP,
+    QBLOCK_SIZES,
+    requant_nvfp4_blocks,
+)
 from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
 # Block-512 matches the original FP8 activation quantization block. Both stock
@@ -73,6 +79,86 @@ def check_native_kperm_layout(layer: torch.nn.Module, *, use_fused_rs: bool) -> 
             "(gmm_v2) cannot read. Run this step on the megakernel or the "
             "pallas_tpu_fused_rs MoE backend, or unset SGLANG_TPU_MUSE_MK_KPERM."
         )
+
+
+# Experts requantized per call, bounding the f32 temporaries.
+_REQUANT_EXPERT_CHUNK = 8
+
+
+def mark_qblock_layout(layer: torch.nn.Module, block: int) -> None:
+    layer.__dict__["_tpu_nvfp4_qblock"] = block
+
+
+def qblock_layout(layer: torch.nn.Module) -> int:
+    """K rows per scale of experts requant_tpu_nvfp4_experts rewrote (0: as loaded)."""
+    return layer.__dict__.get("_tpu_nvfp4_qblock", 0)
+
+
+def _requant_expert_slabs(
+    w: torch.Tensor, s: torch.Tensor, block: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if (
+        w.dtype != torch.float4_e2m1fn_x2
+        or s.dtype != torch.bfloat16
+        or s.shape[1] * NVFP4_SERVED_GROUP != w.shape[1]
+    ):
+        raise NotImplementedError(
+            "NVFP4 expert requant takes fp4 experts with bf16 block-16 scales, got "
+            f"{w.dtype} {tuple(w.shape)} with {s.dtype} {tuple(s.shape)}"
+        )
+    u = w.view(torch.uint8)
+    codes, scales = [], []
+    for e0 in range(0, w.shape[0], _REQUANT_EXPERT_CHUNK):
+        c, sb = requant_nvfp4_blocks(
+            u[e0 : e0 + _REQUANT_EXPERT_CHUNK],
+            s[e0 : e0 + _REQUANT_EXPERT_CHUNK],
+            block,
+        )
+        _wait_for(c, sb)
+        codes.append(c)
+        scales.append(sb)
+    out = _materialize_packed_fp4(torch.cat(codes)), torch.cat(scales)
+    _wait_for(*out)
+    return out
+
+
+def requant_tpu_nvfp4_experts(layer: torch.nn.Module, block: int) -> None:
+    """Rewrite a fused-RS-prepared block-16 NVFP4 layer's experts in place to one bf16 scale per
+    block K rows (requant_nvfp4_blocks); every reader of the layer then sees only these."""
+    if block not in QBLOCK_SIZES:
+        raise NotImplementedError(
+            f"NVFP4 expert requant to block {block}: {QBLOCK_SIZES}"
+        )
+    if not layer.__dict__.get("_tpu_fused_rs_expert_tp", False):
+        raise NotImplementedError(
+            "NVFP4 expert requant needs the fused-RS expert-TP layout (the only native "
+            "MoE with a block-scaled W4A16 arm)"
+        )
+    if is_kperm_layout(layer) or qblock_layout(layer):
+        raise NotImplementedError("NVFP4 expert requant takes natural block-16 experts")
+    old = (
+        layer.w13_weight.data,
+        layer.w13_weight_scale.data,
+        layer.w2_weight.data,
+        layer.w2_weight_scale.data,
+    )
+    w13, s13 = _requant_expert_slabs(old[0], old[1], block)
+    copy_or_rebind_param(layer, "w13_weight", w13)
+    copy_or_rebind_param(layer, "w13_weight_scale", s13)
+    del w13, s13
+    w2, s2 = _requant_expert_slabs(old[2], old[3], block)
+    copy_or_rebind_param(layer, "w2_weight", w2)
+    copy_or_rebind_param(layer, "w2_weight_scale", s2)
+    del w2, s2
+    new = (
+        layer.w13_weight.data,
+        layer.w13_weight_scale.data,
+        layer.w2_weight.data,
+        layer.w2_weight_scale.data,
+    )
+    for o, n in zip(old, new):
+        _free_replaced_storage(o, n)
+    mark_qblock_layout(layer, block)
 
 
 def _transpose_packed_fp4(matrix: torch.Tensor) -> torch.Tensor:
@@ -356,11 +442,8 @@ def prepare_tpu_nvfp4_moe_weights(
 
         prepare_tpu_fused_rs_post_expert_norm(layer)
         prepare_fused_moe_rs(layer)
-    else:
-        from sglang_tpu.envs import envs as tpu_envs
-
-        if tpu_envs.SGLANG_TPU_NVFP4_MOE_FP32_SCALES.get():
-            scale_dtype = torch.float32
+    elif tpu_envs.SGLANG_TPU_NVFP4_MOE_FP32_SCALES.get():
+        scale_dtype = torch.float32
 
     w13_global_scale = getattr(layer, "w13_weight_scale_2", None)
     w2_global_scale = getattr(layer, "w2_weight_scale_2", None)
@@ -459,6 +542,11 @@ def apply_tpu_nvfp4_moe(
         activation = f"silu_and_mul_clamp:{float(swiglu_limit)}"
 
     check_native_kperm_layout(layer, use_fused_rs=use_fused_rs)
+    qblock = qblock_layout(layer)
+    if qblock and not use_fused_rs:
+        raise RuntimeError(
+            f"NVFP4 experts requantized to block {qblock} run only on the fused-RS MoE"
+        )
 
     if use_fused_rs:
         from sglang_tpu.moe.pallas.fused_moe_rs_op import (
@@ -558,6 +646,7 @@ def apply_tpu_nvfp4_moe(
                 oneshot_rank=getattr(layer, "_tpu_oneshot_rank", None),
                 w1_global_scale=layer._tpu_w13_global_scale,
                 w2_global_scale=layer._tpu_w2_global_scale,
+                fp4_w4a16=bool(qblock),
             )
             outputs.append(output[:output_rows])
         return StandardCombineInput(hidden_states=torch.cat(outputs, dim=0))

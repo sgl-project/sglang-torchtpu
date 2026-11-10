@@ -15,6 +15,10 @@ streams. Run one process per device:
 Rank 0 prints one MK_NUMERICS line per (case, layer) and MK_NUMERICS_PASS when every check
 holds; every rank prints MK_NUMERICS_DONE.
 
+SGLANG_TPU_MUSE_MK_QBLOCK=256 ... --qblock-ref --served loads the fp4 experts through the serving
+path (checkpoint layout, prepare_tpu_nvfp4_moe_weights, requant_tpu_nvfp4_experts); the
+reference requantizes the natural block-16 slabs independently.
+
 --ep runs the EP megakernel (muse_megakernel/ep_mk): each rank gets its 32 whole experts and
 the replicated pool / unpool assembled from every rank's slices, in ep_mk's layout (the pooled
 width permuted as ep_mk.kernel.pooled_perm); fp8 experts then share one w2 column scale across
@@ -67,6 +71,9 @@ _EP = False
 # --qblock-ref: the reference reads the requantized fp4 experts the kernel reads
 # (SGLANG_TPU_EP_QBLOCK with --ep, else SGLANG_TPU_MUSE_MK_QBLOCK)
 _QBLOCK_REF = False
+# --served: fp4 experts go through the serving weight load (checkpoint layout ->
+# prepare_tpu_nvfp4_moe_weights -> requant_tpu_nvfp4_experts under SGLANG_TPU_MUSE_MK_QBLOCK)
+_SERVED = False
 
 
 class Case(msgspec.Struct, frozen=True):
@@ -375,6 +382,58 @@ def tp_expert_slabs(l: int, rank: int, e: int, kind: str) -> list:
     return [w13, s13, w2, s2]
 
 
+def _checkpoint_rows(words: torch.Tensor) -> torch.Tensor:
+    """Natural int32 words [K/8, N] -> the checkpoint's [N, K/2] bytes (low nibble even K)."""
+    shifts = torch.arange(0, 32, 4, dtype=torch.int32)[None, :, None]
+    codes = ((words[:, None, :] >> shifts) & 0xF).reshape(-1, words.shape[1]).t()
+    return (codes[:, 0::2] | (codes[:, 1::2] << 4)).to(torch.uint8)
+
+
+def served_expert_refs(l: int, rank: int, device: torch.device) -> list:
+    """One fp4 layer's experts as serving loads them: checkpoint-layout codes with the bf16
+    block-16 scales as checkpoint scales, prepare_tpu_nvfp4_moe_weights (fused-RS layout),
+    then requant_tpu_nvfp4_experts to SGLANG_TPU_MUSE_MK_QBLOCK."""
+    import types
+
+    from sglang_tpu.fp4_moe import (
+        prepare_tpu_nvfp4_moe_weights,
+        requant_tpu_nvfp4_experts,
+    )
+    from sglang_tpu.moe.pallas import fused_moe_rs_op
+
+    slabs = [expert_slabs(l, rank, e, "fp4") for e in range(N_EXPERTS)]
+    layer = torch.nn.Module()
+    layer.moe_runner_config = types.SimpleNamespace(is_gated=True, activation="silu")
+    for name, j, scale in (
+        ("w13_weight", 0, False),
+        ("w13_weight_scale", 1, True),
+        ("w2_weight", 2, False),
+        ("w2_weight_scale", 3, True),
+    ):
+        t = torch.stack(
+            [s[j].t().contiguous() if scale else _checkpoint_rows(s[j]) for s in slabs]
+        )
+        layer.register_parameter(
+            name, torch.nn.Parameter(t.to(device), requires_grad=False)
+        )
+    original_prepare = fused_moe_rs_op.prepare_fused_moe_rs
+    fused_moe_rs_op.prepare_fused_moe_rs = lambda _: None
+    try:
+        prepare_tpu_nvfp4_moe_weights(
+            layer, group_size=16, scale_dtype=torch.bfloat16, use_fused_rs=True
+        )
+    finally:
+        fused_moe_rs_op.prepare_fused_moe_rs = original_prepare
+    layer.__dict__["_tpu_fused_rs_expert_tp"] = True
+    requant_tpu_nvfp4_experts(layer, tp_qblock())
+    return [
+        layer.w13_weight.data,
+        layer.w13_weight_scale.data,
+        layer.w2_weight.data,
+        layer.w2_weight_scale.data,
+    ]
+
+
 def ref_expert(l: int, rank: int, e: int, kind: str) -> tuple:
     """decode_expert of one rank's slice; --qblock-ref: the requantized weights the kernel
     reads (SGLANG_TPU_EP_QBLOCK in kperm order with --ep, else SGLANG_TPU_MUSE_MK_QBLOCK in
@@ -562,6 +621,14 @@ def n_pool_pages(case: Case, st: StepInputs, l: int, global_layers: tuple) -> in
 
 
 # ----------------------------------------------------------------------------- kernel side
+def _stack_slabs(slabs: list) -> torch.Tensor:
+    """torch.stack; fp4 pairs go through their bytes (a device stack of float4_e2m1fn_x2
+    mis-sizes the packed dim)."""
+    if slabs[0].dtype != torch.float4_e2m1fn_x2:
+        return torch.stack(slabs)
+    return torch.stack([t.view(torch.uint8) for t in slabs]).view(slabs[0].dtype)
+
+
 class _Runner:
     """Owns the fake MuseMegakernel (the attributes MuseMegakernel.config reads) and the device
     weights of this rank; runs one compiled step per call."""
@@ -604,6 +671,8 @@ class _Runner:
         self.per_layer_experts = [
             [t.to(self.device) for t in ep_expert_slabs(l, rank, k)]
             if _EP
+            else served_expert_refs(l, rank, self.device)
+            if _SERVED and k == "fp4"
             else [
                 torch.stack(t).to(self.device)
                 for t in zip(
@@ -677,7 +746,7 @@ class _Runner:
             else:
                 for j in range(4):
                     refs.append(
-                        torch.stack(
+                        _stack_slabs(
                             [
                                 self.per_layer_experts[li][j]
                                 for li in range(unit[1], unit[2])
@@ -735,7 +804,19 @@ class _Runner:
             experts,
             kv,
         )
-        return hid.cpu(), aux.cpu(), self.last_cfg
+        # a compile-cache hit skips the op body (and its config call): rebuild it as the op does
+        kv_sal = self.ops.is_sal_pool_shape(tuple(kv[0].shape), self.mk.geo)
+        cfg = self.mk.config(
+            rows=st.emb.shape[0],
+            q=case.q,
+            n_req=case.n_req,
+            n_page_entries=st.pf.shape[0],
+            page_size=kv[0].shape[-1] if kv_sal else kv[0].shape[1],
+            capture=tuple(capture),
+            kv_sal=kv_sal,
+            kv_sal_fp8=kv_sal and kv[0].dtype == torch.float8_e4m3fn,
+        )
+        return hid.cpu(), aux.cpu(), cfg
 
     def new_kv(self, case: Case, st: StepInputs, kv: list) -> torch.Tensor:
         """This step's K/V rows read back from the pools: [L, n_live, kv_heads, 2, head_dim]."""
@@ -1268,9 +1349,14 @@ def main() -> None:
     ap.add_argument("--out-dir", default="/tmp/mk_numerics")
     ap.add_argument("--ep", action="store_true")
     ap.add_argument("--qblock-ref", action="store_true")
+    ap.add_argument("--served", action="store_true")
     args = ap.parse_args()
-    global _EP, _QBLOCK_REF
-    _EP, _QBLOCK_REF = args.ep, args.qblock_ref
+    global _EP, _QBLOCK_REF, _SERVED
+    _EP, _QBLOCK_REF, _SERVED = args.ep, args.qblock_ref, args.served
+    if _SERVED and (_EP or not (_QBLOCK_REF and tp_qblock())):
+        raise ValueError(
+            "--served needs SGLANG_TPU_MUSE_MK_QBLOCK and --qblock-ref (TP)"
+        )
     if _QBLOCK_REF and not _EP and not tp_qblock():
         raise ValueError("--qblock-ref without --ep needs SGLANG_TPU_MUSE_MK_QBLOCK")
 

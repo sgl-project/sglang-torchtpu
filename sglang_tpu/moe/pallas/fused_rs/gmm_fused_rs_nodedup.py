@@ -2240,6 +2240,7 @@ def _pair_exchange_metadata(
         "row_loop_unroll",
         "staging_slots",
         "pair_exchange",
+        "fp4_w4a16",
     ],
 )
 def gmm_v2_fused_rs(
@@ -2275,8 +2276,12 @@ def gmm_v2_fused_rs(
     row_loop_unroll: int = 1,
     staging_slots: int = 3,
     pair_exchange: bool = False,
+    fp4_w4a16: bool = False,
 ) -> jax.Array:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
+
+    fp4_w4a16: block-256 fp4 experts take bf16 rows, each block's scale applied after
+    its dot (requantized NVFP4), instead of fp8-quantized rows.
 
     ``pair_exchange`` (expert TP, logical ranks 2c and 2c+1 on one chip): for a
     row
@@ -2550,6 +2555,18 @@ def gmm_v2_fused_rs(
             lhs1_quant_block_size = min(_w4a16_k, tile_k1)
         if rhs2_quant_block_size < 256:
             lhs2_quant_block_size = min(_w4a16_k, tile_k2)
+    if fp4_w4a16 and not (
+        is_quantized
+        and jnp.dtype(w1.dtype) == jnp.dtype(w2.dtype) == jnp.float4_e2m1fn
+        and rhs1_quant_block_size == lhs1_quant_block_size == 256
+        and rhs2_quant_block_size == lhs2_quant_block_size == 256
+    ):
+        raise ValueError(
+            "fp4_w4a16 takes block-256 fp4 experts; got "
+            f"{w1.dtype} / {w2.dtype}, rhs blocks {rhs1_quant_block_size} / "
+            f"{rhs2_quant_block_size}, lhs blocks {lhs1_quant_block_size} / "
+            f"{lhs2_quant_block_size}"
+        )
 
     cfgs1 = GmmConfigs(
         dims=Dimensions(
@@ -2565,6 +2582,7 @@ def gmm_v2_fused_rs(
             quant_dtype=(
                 jnp.float8_e4m3fn.dtype
                 if is_quantized
+                and not fp4_w4a16
                 and get_maybe_quantize_lhs(
                     w1.dtype, rhs1_quant_block_size, lhs1_quant_block_size
                 )
@@ -2602,6 +2620,7 @@ def gmm_v2_fused_rs(
             quant_dtype=(
                 jnp.float8_e4m3fn.dtype
                 if is_quantized
+                and not fp4_w4a16
                 and get_maybe_quantize_lhs(
                     w2.dtype, rhs2_quant_block_size, lhs2_quant_block_size
                 )

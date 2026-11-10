@@ -396,13 +396,28 @@ class MuseMegakernel(torch.nn.Module):
             layer.mlp.experts.w13_weight_scale.dtype == torch.float8_e4m3fn
             for layer in decoder.layers
         )
-        if tpu_envs.SGLANG_TPU_MUSE_MK_QBLOCK.get():
-            # prefill and the native MoE share these expert weights at block 16
-            raise NotImplementedError(
-                "SGLANG_TPU_MUSE_MK_QBLOCK: serving weight load does not requantize the "
-                "experts yet (anvil / numerics only)"
-            )
         kperm = tpu_envs.SGLANG_TPU_MUSE_MK_KPERM.get()
+        qblock = tpu_envs.SGLANG_TPU_MUSE_MK_QBLOCK.get()
+        if qblock:
+            if scale_fp8 or kperm or tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL.get():
+                raise NotImplementedError(
+                    "SGLANG_TPU_MUSE_MK_QBLOCK needs bf16 NVFP4 block scales, natural "
+                    "expert rows and the native prefill MoE (unset "
+                    "SGLANG_TPU_NVFP4_E4M3_SCALES, SGLANG_TPU_MUSE_MK_KPERM and "
+                    "SGLANG_TPU_MUSE_MK_PREFILL)"
+                )
+            from sglang_tpu.fp4_moe import requant_tpu_nvfp4_experts
+
+            # One copy: the native fused-RS MoE (extend, large steps) reads it too.
+            for layer in decoder.layers:
+                if _expert_kind(layer.mlp.experts) == "fp4":
+                    requant_tpu_nvfp4_experts(layer.mlp.experts, qblock)
+            torch.accelerator.synchronize()
+            logger.info(
+                "Muse megakernel: fp4 experts requantized to block %d (megakernel and "
+                "native fused-RS MoE)",
+                qblock,
+            )
         if kperm and scale_fp8:
             raise NotImplementedError(
                 "SGLANG_TPU_MUSE_MK_KPERM requires bf16/f32 NVFP4 block scales "

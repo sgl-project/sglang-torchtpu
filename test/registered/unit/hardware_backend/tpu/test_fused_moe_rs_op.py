@@ -47,6 +47,7 @@ class TestFusedMoeRsOp(CustomTestCase):
             False,
             False,
             False,
+            False,
         )
 
         def placeholder(aval, mesh=None, partition_spec=None):

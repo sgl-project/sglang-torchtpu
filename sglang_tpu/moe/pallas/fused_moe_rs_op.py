@@ -155,6 +155,7 @@ def _build_fused_moe_rs_op(global_scales: bool = False):
         has_post_expert_norm,
         fp8_direct_write,
         expert_tp,
+        fp4_w4a16,
     ):
         num_tokens = hidden_states.shape[0]
         ep_size = mesh.shape["model"]
@@ -188,6 +189,7 @@ def _build_fused_moe_rs_op(global_scales: bool = False):
             ),
             fp8_direct_write=fp8_direct_write,
             expert_tp=expert_tp,
+            fp4_w4a16=fp4_w4a16,
             w1_global_scale=w1_global_scale,
             w2_global_scale=w2_global_scale,
         )
@@ -221,6 +223,7 @@ def _build_fused_moe_rs_op(global_scales: bool = False):
             has_post_expert_norm: bool,
             fp8_direct_write: bool,
             expert_tp: bool,
+            fp4_w4a16: bool,
         ) -> jax.Array:
             return _run(
                 hidden_states,
@@ -239,6 +242,7 @@ def _build_fused_moe_rs_op(global_scales: bool = False):
                 has_post_expert_norm,
                 fp8_direct_write,
                 expert_tp,
+                fp4_w4a16,
             )
 
         def _fake_impl(
@@ -258,6 +262,7 @@ def _build_fused_moe_rs_op(global_scales: bool = False):
             has_post_expert_norm: bool,
             fp8_direct_write: bool,
             expert_tp: bool,
+            fp4_w4a16: bool,
         ) -> torch.Tensor:
             return hidden_states.new_empty(_shard_shape(hidden_states, topk))
 
@@ -279,6 +284,7 @@ def _build_fused_moe_rs_op(global_scales: bool = False):
             has_post_expert_norm: bool,
             fp8_direct_write: bool,
             expert_tp: bool,
+            fp4_w4a16: bool,
         ) -> jax.Array:
             return _run(
                 hidden_states,
@@ -297,6 +303,7 @@ def _build_fused_moe_rs_op(global_scales: bool = False):
                 has_post_expert_norm,
                 fp8_direct_write,
                 expert_tp,
+                fp4_w4a16,
             )
 
         def _fake_impl(
@@ -314,6 +321,7 @@ def _build_fused_moe_rs_op(global_scales: bool = False):
             has_post_expert_norm: bool,
             fp8_direct_write: bool,
             expert_tp: bool,
+            fp4_w4a16: bool,
         ) -> torch.Tensor:
             return hidden_states.new_empty(_shard_shape(hidden_states, topk))
 
@@ -326,7 +334,7 @@ def _build_fused_moe_rs_op(global_scales: bool = False):
         name,
         _wrapped,
         mesh=mesh,
-        input_partition_specs=(P(),) * num_tensors + (None,) * 5,
+        input_partition_specs=(P(),) * num_tensors + (None,) * 6,
         output_partition_specs=(P(),),
     )
     custom_op.register_fake(_fake_impl)
@@ -352,6 +360,7 @@ def fused_moe_rs_call(
     expert_tp: bool = False,
     w1_global_scale: torch.Tensor | None = None,
     w2_global_scale: torch.Tensor | None = None,
+    fp4_w4a16: bool = False,
 ) -> torch.Tensor:
     tensors = (
         hidden_states,
@@ -364,7 +373,14 @@ def fused_moe_rs_call(
         post_expert_norm_weight,
         group_offset,
     )
-    static_args = (topk, activation, has_post_expert_norm, fp8_direct_write, expert_tp)
+    static_args = (
+        topk,
+        activation,
+        has_post_expert_norm,
+        fp8_direct_write,
+        expert_tp,
+        fp4_w4a16,
+    )
     if w1_global_scale is None:
         return _build_fused_moe_rs_op()(*tensors, *static_args)
     return _build_fused_moe_rs_op(global_scales=True)(
@@ -393,7 +409,9 @@ def fused_moe_rs_gather(
     oneshot_rank: torch.Tensor | None = None,
     w1_global_scale: torch.Tensor | None = None,
     w2_global_scale: torch.Tensor | None = None,
+    fp4_w4a16: bool = False,
 ) -> torch.Tensor:
+    """fp4_w4a16: block-scaled fp4 experts run with bf16 rows instead of fp8-quantized ones."""
     import torch.distributed as dist
 
     if expert_tp:
@@ -425,6 +443,7 @@ def fused_moe_rs_gather(
                         oneshot_rank=oneshot_rank,
                         w1_global_scale=w1_global_scale,
                         w2_global_scale=w2_global_scale,
+                        fp4_w4a16=fp4_w4a16,
                     )[: min(max_tokens, hidden_states.shape[0] - start)]
                     for start in range(0, hidden_states.shape[0], max_tokens)
                 ]
@@ -477,6 +496,7 @@ def fused_moe_rs_gather(
         expert_tp=expert_tp,
         w1_global_scale=w1_global_scale,
         w2_global_scale=w2_global_scale,
+        fp4_w4a16=fp4_w4a16,
     )
     if token_shard.ndim != 2 or token_shard.shape != (
         padded_shard_rows,
