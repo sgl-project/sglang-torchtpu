@@ -64,6 +64,7 @@ HEAD_SLOTS = 4  # most rows per rank and batch row in a packet (see packet_layou
 NEG = -1e30  # finite "no tokens" log-sum-exp
 MAX_ROWS = 8  # batch rows of an unchunked call; a larger batch runs in chunks (see _attend_chunked)
 HOST_LANES = 8  # DCP ranks per host (rank = host * 8 + lane)
+GROUPS = (8, 16, 32)  # DCP group sizes (tests on host devices add smaller ones)
 
 
 def chunk_layout(batch: int, heads: int = HEADS_PER_RANK, *, chunk_rows: int | None = None) -> tuple[int, int]:
@@ -413,8 +414,8 @@ class DcpAttention:
                     f"DCP chunks of {chunk} rows must hold whole {sequence_rows}-row sequences")
         if sequence_rows < 1 or batch % sequence_rows:
             raise ValueError("sequence_rows must divide the batch")
-        if cache.group not in (8, 16, 32):
-            raise ValueError("DCP groups are 8, 16 or 32 consecutive ranks")
+        if cache.group not in GROUPS:
+            raise ValueError(f"DCP groups are {GROUPS} consecutive ranks")
         self.cache, self.ws, self.position_ref, self.batch = cache, workspace, position_ref, batch
         # sequence_rows > 1 (speculative verify): each group of rows is one
         # sequence's consecutive tokens. All rows attend the pool below the
