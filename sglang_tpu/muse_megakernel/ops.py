@@ -925,7 +925,11 @@ class MuseMegakernel(torch.nn.Module):
                         cand = msgspec.structs.replace(cand, fold_f=False, fold_o=False)
                     # QBLOCK: the chosen plan's VMEM-pads passes run as loops (bit-identical)
                     if cand.qblock and cand.row_tile and cand.tiled_vmem_pads:
-                        pipe = cand.combine_loop and cand.rows > 64
+                        pipe = (
+                            cand.combine_loop
+                            and cand.rows > 64
+                            and not (cand.fold_o or cand.fold_f)
+                        )
                         cand = msgspec.structs.replace(
                             cand,
                             tile_loops=True,

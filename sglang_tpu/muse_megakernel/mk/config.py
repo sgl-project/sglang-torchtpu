@@ -487,7 +487,15 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
             # pair o_rs with streamed Y: one row off by ~25% at layer 3 of the 192- and
             # 256-row numerics cases (deterministic; VMEM Y and plain o_rs pass)
             and not (self.pair_o_rs and self.tiled_vmem_pads and self.tiled_vmem_y == 0)
-            and not (self.pipe_ag and (self.trim_sems or not self.tiled_vmem_pads))
+            and not (
+                self.pipe_ag
+                and (
+                    self.trim_sems
+                    or not self.tiled_vmem_pads
+                    or self.fold_o
+                    or self.fold_f
+                )
+            )
             and self.expert_chunk % 8 == 0
             and self.expert_chunk >= self.compact_rows
             and self.vec_route
