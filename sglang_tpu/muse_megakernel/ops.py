@@ -796,6 +796,7 @@ class MuseMegakernel(torch.nn.Module):
                             tiled_pair_y=0,
                             y_block_send=False,
                             attn_streams=min(cfg.attn_streams, 4),
+                            tile_loops=True,
                         ),
                         _dev_int(
                             "SGLANG_TPU_MUSE_MK_DEV_VY0_PADS_BUDGET_MIB",

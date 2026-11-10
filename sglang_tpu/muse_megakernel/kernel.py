@@ -3575,6 +3575,15 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
             jax.lax.fori_loop(0, NT, body, 0)
 
+        def vpads_tiles(fn):
+            """fn(rows, t) per row tile of a VMEM-pads pass: one runtime loop under
+            tile_loops (unrolled tiles keep their own VMEM temporaries), else unrolled."""
+            if c.tile_loops:
+                for_tiles(fn)
+                return
+            for t in range(NT):
+                fn(pl.ds(t * RT, RT), t)
+
         def dma(src, dst, i):
             cp = pltpu.make_async_copy(src, dst, tsem(i))
             cp.start()
@@ -4249,14 +4258,16 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         o_pair_cp(b_p).wait()
                     if c.combine_loop and R > 64:
                         for b_p in range(4):
-                            for t in range(R // RT):
-                                rs = pl.ds(t * RT, RT)
+
+                            def _tile(rs, t, b_p=b_p):
                                 obuf.at[b_p][rs] = _pack_bf16x2(
                                     _unpack_bf16x2(
                                         S["xfull"][rs, pl.ds(b_p * (Hl // 2), Hl // 2)]
                                     )
                                     + _unpack_bf16x2(S["pad_o_rs"][b_p, rs])
                                 )
+
+                            vpads_tiles(_tile)
                     else:
                         for b_p in range(4):
                             obuf[b_p] = _pack_bf16x2(
@@ -4281,12 +4292,14 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         cp.wait_send()
                     for cp in ors_cps:
                         cp.wait_recv()
-                    for t in range(R // RT):
-                        rs = pl.ds(t * RT, RT)
+
+                    def _tile(rs, t):
                         mine = _unpack_bf16x2(S["pad_o_rs"][4, rs])
                         for d in range(5, 8):
                             mine = mine + _unpack_bf16x2(S["pad_o_rs"][d, rs])
                         S["o_send"][rs] = _pack_bf16x2(mine)
+
+                    vpads_tiles(_tile)
                     if c.fold_o:
                         coll.all_gather_blocks_start(
                             "o_ag", S["o_send"], me, S["o_rsems"]
@@ -4307,12 +4320,14 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         o_rc(0, coll._peer(d)).wait_recv()
 
                     if c.tiled_vmem_pads:
-                        for t in range(R // RT):
-                            rs = pl.ds(t * RT, RT)
+
+                        def _tile(rs, t):
                             mine = _unpack_bf16x2(S["pad_o_rs"][0, rs])
                             for d in range(1, c.tp):
                                 mine = mine + _unpack_bf16x2(S["pad_o_rs"][d, rs])
                             S["o_send"][rs] = _pack_bf16x2(mine)
+
+                        vpads_tiles(_tile)
                         if c.fold_o:
                             coll.all_gather_blocks_start(
                                 "o_ag", S["o_send"], me, S["o_rsems"]
@@ -4632,8 +4647,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
             with _scope("ex_setup"):
                 if vpads:
-                    for t in range(R // RT):
-                        rs = pl.ds(t * RT, RT)
+
+                    def _tile(rs, t):
                         x = _rms(
                             gathered_tile(S["pad_pool"].at[:, rs]), c.rms_eps, pre_w
                         ).astype(bf16)
@@ -4643,6 +4658,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             xsc_ref[rs] = jnp.broadcast_to(xsc, (RT, LANE))
                         else:
                             S["xfull"][rs] = _pack_bf16x2(x.astype(f32))
+
+                    vpads_tiles(_tile)
                 else:
 
                     def xfull_tile(rows, t, v):
@@ -5729,11 +5746,13 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
             if vpads:
                 if c.combine_loop and R > 64:
-                    for t in range(R // RT):
-                        rs = pl.ds(t * RT, RT)
+
+                    def _tile(rs, t):
                         S["f_send"][rs] = _pack_bf16x2(
                             S["acc"][rs, pl.ds(0, Hl)].astype(bf16).astype(f32)
                         )
+
+                    vpads_tiles(_tile)
                 else:
                     S["f_send"][...] = _pack_bf16x2(
                         S["acc"][:, pl.ds(0, Hl)].astype(bf16).astype(f32)
@@ -5790,11 +5809,13 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                 ep.pre_attn(c, S)
             elif not pend:
                 if c.tiled_vmem_pads:
-                    for t in range(R // RT):
-                        rs = pl.ds(t * RT, RT)
+
+                    def _tile(rs, t):
                         S["lhs"][rs] = _rms(
                             S["h_stream"][rs], c.rms_eps, row("pre_attn_w")
                         ).astype(bf16)
+
+                    vpads_tiles(_tile)
                 else:
 
                     def pre_attn_tile(rows, t, v):
@@ -5811,8 +5832,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
             if ep is None and not c.fold_o:  # the EP hook's o_proj did it on own rows
                 if c.tiled_vmem_pads:
-                    for t in range(R // RT):
-                        rs = pl.ds(t * RT, RT)
+
+                    def _tile(rs, t):
                         s = row("attn_alpha") * S["h_stream"][rs] + row(
                             "attn_beta"
                         ) * _rms(
@@ -5820,6 +5841,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         ).astype(bf16).astype(f32)
                         S["h_stream"][rs] = s
                         S["lhs"][rs] = _rms(s, c.rms_eps, row("pre_ffn_w")).astype(bf16)
+
+                    vpads_tiles(_tile)
                 else:
                     oag_rdy = ag_tile_ready(S["o_send"], S["pad_o_ag"], S["oag_tsems"])
 
@@ -5899,8 +5922,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
                 if not (c.fold_f and nxt is not None):
                     if c.tiled_vmem_pads:
-                        for t in range(R // RT):
-                            rs = pl.ds(t * RT, RT)
+
+                        def _tile(rs, t):
                             s = row("ffn_alpha") * S["h_stream"][rs] + row(
                                 "ffn_beta"
                             ) * _rms(
@@ -5909,6 +5932,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             ).astype(bf16).astype(f32)
                             capture_tile(l, rs, s)
                             S["h_stream"][rs] = s
+
+                        vpads_tiles(_tile)
                     else:
                         fag_rdy = ag_tile_ready(S["f_send"], S["pad_f"], S["fag_tsems"])
 
@@ -5964,13 +5989,15 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             # embedding: weightless RMS norm of the bf16 rows, kept in bf16 precision
             if c.tiled_vmem_pads:
                 dma(emb_ref, S["lhs"], _TS_AUX)
-                for t in range(R // RT):
-                    rs = pl.ds(t * RT, RT)
+
+                def _tile(rs, t):
                     S["h_stream"][rs] = (
                         _rms(S["lhs"][rs].astype(f32), c.rms_eps)
                         .astype(bf16)
                         .astype(f32)
                     )
+
+                vpads_tiles(_tile)
             else:
 
                 def emb_tile(rows, t, v):
@@ -6018,8 +6045,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             if c.tiled_vmem_pads:
                 if ncap == 0:
                     S["btile"][...] = jnp.zeros((RT, H), bf16)
-                for t in range(R // RT):
-                    rs = pl.ds(t * RT, RT)
+
+                def _tile(rs, t):
                     if ncap == 0:
                         dma(S["btile"].at[:, pl.ds(0, LANE)], aux_out.at[rs], _TS_AUX)
                     hidden = _rms(
@@ -6028,6 +6055,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         S["final_norm"][0:1, :],
                     )
                     S["lhs"][rs] = jnp.where(tile_live(t), hidden, 0.0).astype(bf16)
+
+                vpads_tiles(_tile)
                 dma(S["lhs"], hid_out, _TS_OUT)
             else:
 
