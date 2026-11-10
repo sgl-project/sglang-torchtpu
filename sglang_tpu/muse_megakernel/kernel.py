@@ -201,6 +201,8 @@ from sglang_tpu.muse_megakernel.mk.weights import (  # noqa: F401
     permute_weights_kperm,
 )
 
+_PIPE_AG = {"o_ag": 0, "f": 1}
+
 
 def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
     """Per-device body: ``f(meta, pos, pages_full, pages_swa, emb, *weights, *experts, *kv)``.
@@ -3747,6 +3749,56 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             for d in range(1, c.tp):
                 rcopy(src, pad.at[0], coll._peer(d), kind).wait_send()
 
+        # pipe_ag: pair_ag's two-stage all-gather per row tile. A tile goes to the same core
+        # of the three other chips as it is written; the consumer forwards each chip's tile to
+        # its pair partner one tile ahead of its own use.
+        p_core, p_chip = me % 2, me // 2
+        p_partner = jnp.bitwise_xor(me, 1)
+
+        def hag_cross(kind, src, pad, t, tsems, d):
+            rows = rows_of(t)
+            return pltpu.make_async_remote_copy(
+                src_ref=src.at[rows],
+                dst_ref=pad.at[me, rows],
+                send_sem=S["tc_ssems"].at[_TC[kind]],
+                recv_sem=tsems.at[t],
+                device_id=(2 * jnp.bitwise_xor(p_chip, d) + p_core,),
+            )
+
+        def hag_fwd(kind, pad, t, ptsems, ck):
+            rows = rows_of(t)
+            return pltpu.make_async_remote_copy(
+                src_ref=pad.at[2 * ck + p_core, rows],
+                dst_ref=pad.at[2 * ck + p_core, rows],
+                send_sem=S["ag_fwd_sems"].at[_PIPE_AG[kind]],
+                recv_sem=ptsems.at[t],
+                device_id=(p_partner,),
+            )
+
+        def hag_start(kind, src, pad, t, tsems):
+            """Producer: row tile t of src into pad[me] here and on the other chips."""
+            pad[me, rows_of(t)] = src[rows_of(t)]
+            for d in (1, 2, 3):
+                hag_cross(kind, src, pad, t, tsems, d).start()
+
+        def hag_forward(kind, src, pad, tsems, t, ptsems):
+            """Waits for tile t from the other chips, then forwards this core's four to the partner."""
+            for d in (1, 2, 3):
+                hag_cross(kind, src, pad, t, tsems, d).wait_recv()
+            for ck in range(4):
+                hag_fwd(kind, pad, t, ptsems, ck).start()
+
+        def hag_ready(kind, pad, t, ptsems):
+            for ck in range(4):
+                hag_fwd(kind, pad, t, ptsems, ck).wait_recv()
+
+        def hag_sent(kind, src, pad, tsems, ptsems):
+            for t in range(NT):
+                for d in (1, 2, 3):
+                    hag_cross(kind, src, pad, t, tsems, d).wait_send()
+                for ck in range(4):
+                    hag_fwd(kind, pad, t, ptsems, ck).wait_send()
+
         def ag_start(kind, src, dst, live=None):
             """src (VMEM) into dst, the same HBM region on every device; returns the wait.
 
@@ -4412,11 +4464,10 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                                 mine = mine + _unpack_bf16x2(S["pad_o_rs"][d, rs])
                             S["o_send"][rs] = _pack_bf16x2(mine)
                             if c.pipe_ag:
-                                ag_tile_start(
+                                hag_start(
                                     "o_ag",
                                     S["o_send"],
                                     S["pad_o_ag"],
-                                    me,
                                     t,
                                     S["oag_tsems"],
                                 )
@@ -5913,9 +5964,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             S["acc"][rs, pl.ds(0, Hl)].astype(bf16).astype(f32)
                         )
                         if c.pipe_ag:
-                            ag_tile_start(
-                                "f", S["f_send"], S["pad_f"], tp_rank, t, S["fag_tsems"]
-                            )
+                            hag_start("f", S["f_send"], S["pad_f"], t, S["fag_tsems"])
 
                     vpads_tiles(_tile)
                 else:
@@ -6000,14 +6049,16 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
             if ep is None and not c.fold_o:  # the EP hook's o_proj did it on own rows
                 if c.tiled_vmem_pads:
+                    o_ag_args = ("o_ag", S["o_send"], S["pad_o_ag"], S["oag_tsems"])
                     if c.pipe_ag:
-                        oag_ready = ag_tile_ready(
-                            S["o_send"], S["pad_o_ag"], S["oag_tsems"]
-                        )
+                        hag_forward(*o_ag_args, 0, S["oag_ptsems"])
 
                     def _tile(rs, t):
                         if c.pipe_ag:
-                            oag_ready(t)
+                            pl.when(t + 1 < NT)(
+                                lambda: hag_forward(*o_ag_args, t + 1, S["oag_ptsems"])
+                            )
+                            hag_ready("o_ag", S["pad_o_ag"], t, S["oag_ptsems"])
                         s = row("attn_alpha") * S["h_stream"][rs] + row(
                             "attn_beta"
                         ) * _rms(
@@ -6018,7 +6069,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
                     vpads_tiles(_tile)
                     if c.pipe_ag:  # o_send (and what borrows it) is reused after this
-                        ag_tile_sent("o_ag", S["o_send"], S["pad_o_ag"])
+                        hag_sent(*o_ag_args, S["oag_ptsems"])
                 else:
                     oag_rdy = ag_tile_ready(S["o_send"], S["pad_o_ag"], S["oag_tsems"])
 
@@ -6098,14 +6149,18 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
                 if not (c.fold_f and nxt is not None):
                     if c.tiled_vmem_pads:
+                        f_ag_args = ("f", S["f_send"], S["pad_f"], S["fag_tsems"])
                         if c.pipe_ag:
-                            fag_ready = ag_tile_ready(
-                                S["f_send"], S["pad_f"], S["fag_tsems"]
-                            )
+                            hag_forward(*f_ag_args, 0, S["fag_ptsems"])
 
                         def _tile(rs, t):
                             if c.pipe_ag:
-                                fag_ready(t)
+                                pl.when(t + 1 < NT)(
+                                    lambda: hag_forward(
+                                        *f_ag_args, t + 1, S["fag_ptsems"]
+                                    )
+                                )
+                                hag_ready("f", S["pad_f"], t, S["fag_ptsems"])
                             s = row("ffn_alpha") * S["h_stream"][rs] + row(
                                 "ffn_beta"
                             ) * _rms(
@@ -6117,7 +6172,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
                         vpads_tiles(_tile)
                         if c.pipe_ag:
-                            ag_tile_sent("f", S["f_send"], S["pad_f"])
+                            hag_sent(*f_ag_args, S["fag_ptsems"])
                     else:
                         fag_rdy = ag_tile_ready(S["f_send"], S["pad_f"], S["fag_tsems"])
 

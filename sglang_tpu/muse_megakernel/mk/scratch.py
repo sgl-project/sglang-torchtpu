@@ -368,6 +368,16 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
             # pipelined o / f all-gathers: per row tile, each sender's copy signals it
             ("oag_tsems", pltpu.SemaphoreType.DMA((R // RT,))),
             ("fag_tsems", pltpu.SemaphoreType.DMA((R // RT,))),
+            # pipe_ag: the pair-forward stage's receive and send semaphores
+            *(
+                [
+                    ("oag_ptsems", pltpu.SemaphoreType.DMA((R // RT,))),
+                    ("fag_ptsems", pltpu.SemaphoreType.DMA((R // RT,))),
+                    ("ag_fwd_sems", pltpu.SemaphoreType.DMA((2,))),
+                ]
+                if c.pipe_ag
+                else []
+            ),
             # pipelined u all-gather: per owner
             ("uag_osems", pltpu.SemaphoreType.DMA((tp,))),
         ]
