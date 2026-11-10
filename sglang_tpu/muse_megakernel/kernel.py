@@ -2490,73 +2490,75 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             # before the qkv matvec)
             @pl.when(j + 1 < n_req_live)
             def _():
-                kv_prologue(geo, l, j + 1)
+                with _scope("kv_prologue"):
+                    kv_prologue(geo, l, j + 1)
 
             # the request's own new rows (causal within a verify block), padded to a sublane
             # tile (a 1-row operand does not lower), filler keys masked. Padded pools: key rows
             # (h, t); packed: the projection rows as they are, heads side by side.
-            q8 = -(-q // 8) * 8
-            krows = rows_at(S["kb_s"], r0, q).astype(jnp.bfloat16)
-            vrows = rows_at(S["vb_s"], r0, q).astype(jnp.bfloat16)
-            if c.packed_attn:
-                zrows = (
-                    jnp.zeros((q8 - q, c.kv_dim), jnp.bfloat16) if q8 > q else None
-                )  # Mosaic has no 0-row vectors
-                kn = jnp.concatenate([krows, zrows], axis=0) if q8 > q else krows
-                vn = jnp.concatenate([vrows, zrows], axis=0) if q8 > q else vrows
-                nt = jax.lax.broadcasted_iota(jnp.int32, (1, q8), 1)
-                head_ok = True
-            else:
-                zrows = jnp.zeros((q8 - q, hd), jnp.bfloat16) if q8 > q else None
-                kn = jnp.concatenate(
-                    [
-                        x
-                        for h in range(hkv)
-                        for x in [krows[:, h * hd : (h + 1) * hd]]
-                        + ([zrows] if q8 > q else [])
-                    ],
-                    axis=0,
+            with _scope("own_rows"):
+                q8 = -(-q // 8) * 8
+                krows = rows_at(S["kb_s"], r0, q).astype(jnp.bfloat16)
+                vrows = rows_at(S["vb_s"], r0, q).astype(jnp.bfloat16)
+                if c.packed_attn:
+                    zrows = (
+                        jnp.zeros((q8 - q, c.kv_dim), jnp.bfloat16) if q8 > q else None
+                    )  # Mosaic has no 0-row vectors
+                    kn = jnp.concatenate([krows, zrows], axis=0) if q8 > q else krows
+                    vn = jnp.concatenate([vrows, zrows], axis=0) if q8 > q else vrows
+                    nt = jax.lax.broadcasted_iota(jnp.int32, (1, q8), 1)
+                    head_ok = True
+                else:
+                    zrows = jnp.zeros((q8 - q, hd), jnp.bfloat16) if q8 > q else None
+                    kn = jnp.concatenate(
+                        [
+                            x
+                            for h in range(hkv)
+                            for x in [krows[:, h * hd : (h + 1) * hd]]
+                            + ([zrows] if q8 > q else [])
+                        ],
+                        axis=0,
+                    )
+                    vn = jnp.concatenate(
+                        [
+                            x
+                            for h in range(hkv)
+                            for x in [vrows[:, h * hd : (h + 1) * hd]]
+                            + ([zrows] if q8 > q else [])
+                        ],
+                        axis=0,
+                    )
+                    ncol = jax.lax.broadcasted_iota(jnp.int32, (1, hkv * q8), 1)
+                    nt = ncol % q8
+                    head_ok = ncol // q8 == rowhead
+                newpos = jnp.zeros(nt.shape, jnp.int32) + 2**30
+                for t in range(q):
+                    newpos = jnp.where(nt == t, pos_ref[r0 + t], newpos)
+                live_new = head_ok & (newpos <= rowpos)
+                in_win = _in_window(is_global, rowpos - newpos < c.window)
+                if in_win is not None:
+                    live_new = live_new & in_win
+                s_ = jax.lax.dot_general(
+                    q2, kn, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
                 )
-                vn = jnp.concatenate(
-                    [
-                        x
-                        for h in range(hkv)
-                        for x in [vrows[:, h * hd : (h + 1) * hd]]
-                        + ([zrows] if q8 > q else [])
-                    ],
-                    axis=0,
+                if sc != 1.0:
+                    s_ = s_ * sc
+                _, lsum, acc = online(carry, jnp.where(live_new, s_, NEG), vn)
+                res = acc / jnp.maximum(lsum, 1e-30)  # [hkv*qg, hd or pd]
+                lanes = (
+                    (lambda h: slice(h * hd, (h + 1) * hd))
+                    if c.packed_attn
+                    else (lambda h: slice(0, hd))
                 )
-                ncol = jax.lax.broadcasted_iota(jnp.int32, (1, hkv * q8), 1)
-                nt = ncol % q8
-                head_ok = ncol // q8 == rowhead
-            newpos = jnp.zeros(nt.shape, jnp.int32) + 2**30
-            for t in range(q):
-                newpos = jnp.where(nt == t, pos_ref[r0 + t], newpos)
-            live_new = head_ok & (newpos <= rowpos)
-            in_win = _in_window(is_global, rowpos - newpos < c.window)
-            if in_win is not None:
-                live_new = live_new & in_win
-            s_ = jax.lax.dot_general(
-                q2, kn, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
-            )
-            if sc != 1.0:
-                s_ = s_ * sc
-            _, lsum, acc = online(carry, jnp.where(live_new, s_, NEG), vn)
-            res = acc / jnp.maximum(lsum, 1e-30)  # [hkv*qg, hd or pd]
-            lanes = (
-                (lambda h: slice(h * hd, (h + 1) * hd))
-                if c.packed_attn
-                else (lambda h: slice(0, hd))
-            )
-            for t in range(q):
-                S["attn_buf"][pl.ds(r0 + t, 1), :] = jnp.concatenate(
-                    [
-                        res[h * qg + t * g + gi : h * qg + t * g + gi + 1, lanes(h)]
-                        for h in range(hkv)
-                        for gi in range(g)
-                    ],
-                    axis=1,
-                )
+                for t in range(q):
+                    S["attn_buf"][pl.ds(r0 + t, 1), :] = jnp.concatenate(
+                        [
+                            res[h * qg + t * g + gi : h * qg + t * g + gi + 1, lanes(h)]
+                            for h in range(hkv)
+                            for gi in range(g)
+                        ],
+                        axis=1,
+                    )
 
         # ------------------------------------------------------------ MoE
         Rc = c.rows_per_dev

@@ -29,6 +29,8 @@ _INNER = frozenset(
         "bd_w2",
         "ex_scatter",
         "ex_accum",
+        "kv_prologue",
+        "own_rows",
     )
 )
 
