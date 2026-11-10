@@ -5,7 +5,12 @@ fused SiLU, gmm_v2, un-permute gather), called as the native Muse layer calls it
 import jax
 import jax.numpy as jnp
 
-from sglang_tpu.muse_megakernel.prefill_pp.config import BF16, PPConfig, fp4_qblock
+from sglang_tpu.muse_megakernel.prefill_pp.config import (
+    BF16,
+    PPConfig,
+    fp4_qblock,
+    fp4_qblock_a8,
+)
 
 ACTIVATION = "silu"
 E2M1_MAX = 6.0
@@ -133,7 +138,8 @@ def _gmm(c: PPConfig, rows, group_sizes, ex):
     )
     common = dict(
         group_sizes=group_sizes, rhs_bias=None, rhs_channel_scale=None, group_offset=None,
-        zero_initialize=True, preferred_element_type=BF16, maybe_quantize_lhs=True,
+        zero_initialize=True, preferred_element_type=BF16,
+        maybe_quantize_lhs=fp4_qblock_a8() if qb else True,
         rhs_quant_dtype=None, dequantize_rhs=False,
     )  # fmt: skip
     h = gmm_v2(

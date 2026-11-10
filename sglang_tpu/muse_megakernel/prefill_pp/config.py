@@ -221,6 +221,15 @@ def fp4_qblock() -> int:
     return b
 
 
+def fp4_qblock_a8() -> bool:
+    """MUSE_PP_QBLOCK_A8=1 with MUSE_PP_QBLOCK: the block-scaled experts take their rows as fp8
+    (amax / 448 per K-block, gmm_v2's W4A8 product) instead of bf16."""
+    a8 = os.environ.get("MUSE_PP_QBLOCK_A8", "0") not in ("", "0")
+    if a8 and not fp4_qblock():
+        raise ValueError("MUSE_PP_QBLOCK_A8 needs MUSE_PP_QBLOCK")
+    return a8
+
+
 def skipped_phases() -> frozenset[str]:
     """MUSE_PP_SKIP=a,b: timing ablation only (wrong numerics), those phases do not run."""
     skip = frozenset(p for p in os.environ.get("MUSE_PP_SKIP", "").split(",") if p)

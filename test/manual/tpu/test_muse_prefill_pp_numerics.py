@@ -12,7 +12,8 @@ fed the kernel's stream after l - 1 layers (teacher forcing), and its chunk K/V 
 with what the kernel wrote into the pool.
 
 MUSE_PP_QBLOCK=256 requantizes the NVFP4 experts to block-256 scales (the reference uses the
-requantized weights) and also reports the expert outputs against the exact block-16 reference.
+requantized weights) and also reports the expert outputs against the exact block-16 reference;
+MUSE_PP_QBLOCK_A8=1 adds the fp8 rows of gmm_v2's W4A8 product to the reference.
 
     python3 test/manual/tpu/test_muse_prefill_pp_numerics.py
 """
@@ -27,7 +28,7 @@ import numpy as np
 
 from sglang_tpu.muse_megakernel import prefill_pp as PP
 from sglang_tpu.muse_megakernel.prefill_pp import moe as PP_MOE
-from sglang_tpu.muse_megakernel.prefill_pp.config import fp4_qblock
+from sglang_tpu.muse_megakernel.prefill_pp.config import fp4_qblock, fp4_qblock_a8
 
 # the batched RPA prefill attention as the P/D prefill serves it (read when the stage is traced);
 # MUSE_PP_TEST_RPA_TRANSPOSED=0 runs the standard tile (bf16 queries) as a control
@@ -207,6 +208,16 @@ def rope_table(n):
         [np.repeat(np.cos(ang), 2, 1), np.repeat(np.sin(ang), 2, 1)], 1), jnp.float32)  # fmt: skip
 
 
+def _codes_scales(packed, scales):
+    """[K / 2, N] u8 e2m1 pairs + [K / (2 g), N] i32 bf16-scale pairs -> codes' values [K, N]
+    and the block scales [K / g, N], f32."""
+    codes = jnp.stack([packed & 0xF, packed >> 4], axis=1).reshape(-1, packed.shape[1])
+    u = jax.lax.bitcast_convert_type(scales, jnp.uint32)
+    halves = jnp.stack([u & 0xFFFF, u >> 16], axis=1).astype(jnp.uint16)
+    sc = jax.lax.bitcast_convert_type(halves, jnp.bfloat16).astype(jnp.float32)
+    return _E2M1[codes.astype(jnp.int32)], sc.reshape(-1, packed.shape[1])
+
+
 def _dq4(packed, scales):
     """[K / 2, N] u8 e2m1 pairs (low nibble row 2b) + [K / (2 g), N] i32 bf16-scale pairs (low
     half block 2j) of g-row blocks -> [K, N] f32."""
@@ -383,15 +394,18 @@ def ref_layer(c, w, l, x, pool, table, rope, slot, kernel):
         biased).max(1)  # fmt: skip
     gap = float(jnp.where(same, -jnp.inf, unpicked - picked).max())
     x, xe, _, tw, _, _, _, _ = attn(c, w, l, x, pool, table, rope, ids_k, None, o_k)
-    yn = expert_outputs(c, w, l, xe_k.astype(jnp.float32), ids_k, slot)
+    yn = expert_outputs(
+        c, w, l, xe_k.astype(jnp.float32), ids_k, slot, a8=fp4_qblock_a8()
+    )
     pew = w["vecs"][l][PP.V["post_expert_w"], : c.expert_hidden]
     yn_k = _bf(_rms(y_k.astype(jnp.float32) * pew, c.post_eps))
     x = jax.jit(ref_post, static_argnums=(0, 2))(c, w, l, x, yn_k, tw)
     return (q, k, v), o, k8, v8, xe, (yn, yn_k), x, ~same, gap
 
 
-def expert_outputs(c, w, l, xe, ids, slot, cap=96):
-    """Normalized outputs [T, K, He] of each (token, slot)'s expert, at most cap rows each."""
+def expert_outputs(c, w, l, xe, ids, slot, cap=96, a8=False):
+    """Normalized outputs [T, K, He] of each (token, slot)'s expert, at most cap rows each;
+    a8: NVFP4 experts through the block-scaled W4A8 product."""
     He, E = c.expert_hidden, c.n_experts
     kind = KINDS[l]
     pew = w["vecs"][l][PP.V["post_expert_w"], :He]
@@ -416,6 +430,23 @@ def expert_outputs(c, w, l, xe, ids, slot, cap=96):
             acc = acc + part
         return acc.astype(jnp.float32)
 
+    def w4a8(x, packed, scales):
+        """gmm_v2's block-scaled W4A8 (MUSE_PP_QBLOCK_A8): bf16 rows quantized to fp8 per
+        weight block (amax / 448), each block's codes product rounded to bf16, then scaled by
+        the row and block scales in bf16 and summed in bf16."""
+        v, sb = _codes_scales(packed, scales)
+        g = v.shape[0] // sb.shape[0]
+        f8max = jnp.bfloat16(float(jnp.finfo(jnp.float8_e4m3fn).max))
+        acc = jnp.zeros((x.shape[0], v.shape[1]), jnp.bfloat16)
+        for b in range(sb.shape[0]):
+            xb = x[:, b * g : (b + 1) * g].astype(jnp.bfloat16)
+            sc = jnp.max(jnp.abs(xb), axis=1, keepdims=True) / f8max
+            inv = jnp.where(sc == 0, jnp.bfloat16(0), jnp.bfloat16(1) / sc)
+            q = (xb * inv).astype(jnp.float8_e4m3fn).astype(jnp.float32)
+            part = _dot(q, v[b * g : (b + 1) * g]).astype(jnp.bfloat16)
+            acc = acc + part * sc * sb[b].astype(jnp.bfloat16)[None, :]
+        return acc.astype(jnp.float32)
+
     def one(e, w13, s13, w2, s2, xe, hit_e):
         idx = jnp.nonzero(hit_e, size=cap, fill_value=T)[0]
         xr = jnp.concatenate([xe, jnp.zeros((1, He))])[idx]
@@ -425,6 +456,12 @@ def expert_outputs(c, w, l, xe, ids, slot, cap=96):
                 gu[:, : c.inter] * jax.nn.sigmoid(gu[:, : c.inter]) * gu[:, c.inter :]
             )
             y = _bf(w8a8(act, w2[e].astype(jnp.float32), s2[e, 0, 0]))
+        elif a8:
+            gu = w4a8(xr, w13[e], s13[e])
+            act = _bf(
+                gu[:, : c.inter] * jax.nn.sigmoid(gu[:, : c.inter]) * gu[:, c.inter :]
+            )
+            y = _bf(w4a8(act, w2[e], s2[e]))
         else:
             gu = _dot(xr, _dq4(w13[e], s13[e]))
             act = _bf(

@@ -699,7 +699,9 @@ def inner_kernel(
                     if cfgs.rhs_cfgs.has_scale and not cfgs.rhs_cfgs.requantize_in_vmem:
                         b_id = start_k // cfgs.rhs_cfgs.quant_block_size
                         rhs_scale_slice = tiled_rhs_ref.get_scale(
-                            b_id, cfgs.rhs_cfgs.scale_block_n
+                            b_id,
+                            cfgs.rhs_cfgs.scale_block_n,
+                            cfgs.rhs_cfgs.scale_bf16_pairs,
                         )
                         rhs_scale = rhs_scale_slice[..., start_n:end_n]
 
@@ -1471,7 +1473,8 @@ def get_scope_name(cfgs: GmmConfigs) -> str:
         f"-n_{dims.size_n}-tm_{tiles.tile_m}-tk_{tiles.tile_k}-tn_{tiles.tile_n}"
         + (
             f"-qb_{cfgs.rhs_cfgs.quant_block_size}"
-            if cfgs.rhs_cfgs.fp4_codes_as_fp8
+            + ("" if cfgs.lhs_cfgs.quant_dtype is None else "-a8")
+            if cfgs.rhs_cfgs.scale_bf16_pairs and not cfgs.rhs_cfgs.dequantize_in_vmem
             else ""
         )
     )
@@ -1575,10 +1578,10 @@ def make_gmm_configs(
         )
 
     # FP4 scale blocks up to 128 run W4A16 via VMEM dequantization; 256/512 run W4A8.
-    fp4_w4a16 = packed_fp4 and (block_size <= 128 or fp4_qblock is not None)
-    if fp4_qblock is not None:
-        maybe_quantize_lhs = False
-    elif fp4_w4a16 and scale_block_n == 1:
+    fp4_w4a16 = packed_fp4 and (
+        block_size <= 128 or (fp4_qblock is not None and not maybe_quantize_lhs)
+    )
+    if fp4_qblock is None and fp4_w4a16 and scale_block_n == 1:
         # Narrow FP4 blocks would split the matmul into short-K products;
         # dequantize in VMEM and run one tile_k matmul instead.
         dequantize_rhs = True
@@ -1602,7 +1605,7 @@ def make_gmm_configs(
         requantize_in_vmem=requantize_rhs,
         scale_without_unit_dim=has_scale and rhs_scale.ndim == 3,
         scale_bf16_pairs=scale_bf16_pairs,
-        fp4_codes_as_fp8=fp4_qblock is not None,
+        fp4_codes_as_fp8=fp4_qblock is not None and fp4_w4a16,
     )
     if scale_bf16_pairs and not dequantize_rhs and fp4_qblock is None:
         raise ValueError("bf16-pair rhs scales require VMEM dequantization")
