@@ -6044,8 +6044,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
             if ep is None and not c.fold_o:  # the EP hook's o_proj did it on own rows
                 if c.tiled_vmem_pads:
-                    o_ag_args = ("o_ag", S["o_send"], S["pad_o_ag"], S["oag_tsems"])
                     if c.pipe_ag:
+                        o_ag_args = ("o_ag", S["o_send"], S["pad_o_ag"], S["oag_tsems"])
                         hag_forward(*o_ag_args, 0, S["oag_ptsems"])
 
                     def _tile(rs, t):
@@ -6144,8 +6144,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
                 if not (c.fold_f and nxt is not None):
                     if c.tiled_vmem_pads:
-                        f_ag_args = ("f", S["f_send"], S["pad_f"], S["fag_tsems"])
                         if c.pipe_ag:
+                            f_ag_args = ("f", S["f_send"], S["pad_f"], S["fag_tsems"])
                             hag_forward(*f_ag_args, 0, S["fag_ptsems"])
 
                         def _tile(rs, t):
