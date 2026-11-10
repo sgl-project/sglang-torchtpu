@@ -1333,8 +1333,8 @@ def _lse_packet(normalized, lse, lse_rows):
 
 def _merge_received_keys(received, own_rows, keys, key_valid, group, *, unroll=1, lse_rows=0):
     """``_merge_received`` with explicit new keys: every row (head slot)
-    attends the valid ones of ``keys`` [K, 640] (``key_valid`` [1, K] nonzero;
-    at least one), and the peers' partials. Two passes rather than online:
+    attends the valid ones of ``keys`` [K, 640] (``key_valid`` [1, K], or per
+    packet row [rows, K], nonzero; at least one a row), and the peers' partials. Two passes rather than online:
     every peer's log-sum-exp (lanes 512:514) in one load, one maximum, then a
     weighted sum of the partials (no rescaling or exp per peer)."""
     del unroll

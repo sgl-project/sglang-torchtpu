@@ -30,7 +30,20 @@ logger = init_logger(__name__)
 
 # The aux streams' order in the context projection's input: the taps of
 # target layers 3, 24, 48, 72, 90.
-BLOCK_TAPS = {24: 2, 48: 4, 72: 6}  # AttnRes block snapshots (layer // 12)
+# The residual streams the prefill program keeps: AttnRes block snapshots
+# (entering layer 12 b), the first op's tap (3), and each pair p's input,
+# middle and tap (8p + 4, 8p + 8, 8p + 10; 92 the final layer's input).
+PAIRS = 11
+STREAM_LAYERS = frozenset({3, 4 + 8 * PAIRS} | {8 * p + d for p in range(PAIRS) for d in (4, 8, 10)})
+
+
+def stream_source(layer: int) -> str:
+    """Where the stream entering ``layer`` comes from: "block" or "entering"."""
+    if layer % 12 == 0 and 12 <= layer <= 84:
+        return "block"
+    if layer in STREAM_LAYERS:
+        return "entering"
+    raise NotImplementedError(f"the K3 prefill keeps no residual stream entering layer {layer}")
 
 
 class PrefillDraftLatents:
@@ -48,11 +61,8 @@ class PrefillDraftLatents:
         (self.mla,) = kernel_modules("dspark_mla")
         self.mesh, self.rank, self.axis = mesh, rank, axis
         self.config = self.mla.MlaDraftConfig.from_checkpoint(Path(checkpoint))
-        if tuple(self.config.aux_layers) != (3, 24, 48, 72, 90):
-            raise NotImplementedError(
-                "the K3 prefill taps aux layers 3, 24, 48, 72, 90, not "
-                f"{self.config.aux_layers}"
-            )
+        for layer in self.config.aux_layers:
+            stream_source(layer)  # each aux layer's stream exists
         self.directory = (
             Path(presharded) / f"dspark-{Path(checkpoint).resolve().name[:8]}"
         )
@@ -155,31 +165,22 @@ class PrefillDraftLatents:
         mla, c, axis = self.mla, self.config, self.axis
         layers = c.layers
 
-        def body(
-            blocks,
-            tap3,
-            tap90,
-            context_proj,
-            kv_a,
-            kv_norm,
-            context_norm,
-            rope,
-            positions,
-            inverse,
-        ):
+        kept = [layer for layer in c.aux_layers if stream_source(layer) == "entering"]
+
+        def body(blocks, *args):
             import jax
             import jax.numpy as jnp
 
+            taps, (context_proj, kv_a, kv_norm, context_norm, rope, positions, inverse) = (
+                args[: len(kept)], args[len(kept):])
             rank = jax.lax.axis_index(axis)
             local = blocks.shape[2]
             own = jnp.maximum(
                 jax.lax.dynamic_slice_in_dim(positions, rank * local, local), 0
             )
-            streams = {
-                3: tap3[0],
-                90: tap90[0],
-                **{layer: blocks[0, b] for layer, b in BLOCK_TAPS.items()},
-            }
+            streams = {layer: tap[0] for layer, tap in zip(kept, taps)}
+            streams.update({layer: blocks[0, layer // 12] for layer in c.aux_layers
+                            if stream_source(layer) == "block"})
             features = jnp.concatenate(
                 [streams[layer] for layer in c.aux_layers], axis=-1
             )  # [local, 35840]
@@ -209,7 +210,7 @@ class PrefillDraftLatents:
             f"pallas::k3_dspark_mla_prefill_latents_w{window}",
             self.mesh,
             body,
-            (P(axis),) * 8 + (P(), P()),
+            (P(axis),) * (6 + len(kept)) + (P(), P()),
             (P(axis),),
             export_key=repr(
                 (
@@ -224,7 +225,7 @@ class PrefillDraftLatents:
         return self._ops[key]
 
     def latents(
-        self, window: int, blocks, tap3, tap90, positions: np.ndarray, order: np.ndarray
+        self, window: int, blocks, entering: dict, positions: np.ndarray, order: np.ndarray
     ):
         """The window's draft latents ``[1, layers, W, 576]`` (window order, every
         rank): ``positions`` the window rows' positions in window order (-1:
@@ -232,8 +233,8 @@ class PrefillDraftLatents:
         inverse = np.argsort(order).astype(np.int32)
         (latents,) = self._latents_op(window)(
             blocks,
-            tap3,
-            tap90,
+            *(entering[layer] for layer in self.config.aux_layers
+              if stream_source(layer) == "entering"),
             *(
                 self.weights[n]
                 for n in ("context_proj", "kv_a", "kv_norm", "context_norm", "rope")

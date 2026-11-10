@@ -620,3 +620,52 @@ class TestDecodeIndexer(CustomTestCase):
                     timeout=900,
                 )
                 self.assertIn("OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:])
+
+
+class TestK31Draft(CustomTestCase):
+    """Kimi-K3.1's DSpark draft (``Inferact/Kimi-K3.1-Pro-DSpark-preview``)
+    in the MLA draft's config: three heads a rank, causal block rows, YaRN's
+    attention factor (the rotary scale is then exactly one), its aux layers;
+    the reference attention's block rows see only earlier block rows."""
+
+    CONFIG = {
+        "model_type": "k3_dspark", "hidden_size": 7168, "num_hidden_layers": 5,
+        "num_attention_heads": 96, "q_lora_rank": 1536, "kv_lora_rank": 512,
+        "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+        "intermediate_size": 14336, "vocab_size": 163840, "rms_norm_eps": 1e-5,
+        "target_layer_ids": [75, 79, 83, 87, 91], "mask_token_id": 163839, "markov_rank": 512,
+        "block_size": 7, "rope_interleave": True, "full_attention_causal": True,
+        "dflash_config": {"causal": True},
+        "rope_parameters": {"rope_type": "yarn", "rope_theta": 1000000.0, "factor": 32.0,
+                            "original_max_position_embeddings": 32768, "beta_fast": 32, "beta_slow": 1,
+                            "mscale": 1.0, "mscale_all_dim": 0.0, "attn_factor": 0.7426255848312643},
+    }
+
+    def test_config_and_causal_reference(self):
+        import dataclasses
+
+        import jax.numpy as jnp
+
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dspark_mla as mla
+
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "config.json").write_text(json.dumps(self.CONFIG))
+            c = mla.MlaDraftConfig.from_checkpoint(Path(d))
+        self.assertEqual((c.heads_per_rank, c.causal, c.markov_rank, c.mask_token), (3, True, 512, 163839))
+        self.assertEqual(c.aux_layers, (76, 80, 84, 88, 92))
+        self.assertAlmostEqual(mla.rope_mscale(c), 1.0, places=6)
+        self.assertAlmostEqual(c.softmax_scale, 192**-0.5, places=9)
+        small = dataclasses.replace(c, hidden=256, heads=4, q_lora=128, kv_lora=64, nope=32, rope=16,
+                                    v_head=32, intermediate=128, vocab=512, layers=1)
+        rng = np.random.default_rng(0)
+        w = {k: jnp.asarray(rng.standard_normal(s).astype(np.float32) * 0.05)
+             for k, s in mla.weight_shapes(small).items()}
+        h = jnp.asarray(rng.standard_normal((4, small.hidden)).astype(np.float32))
+        positions, context = jnp.arange(10, 14), jnp.asarray(rng.standard_normal((6, small.latent)).astype(np.float32))
+        valid = jnp.ones((6,), bool)
+        causal = mla.reference_attention(w, small, 0, h, positions, context, valid)
+        full = mla.reference_attention(w, dataclasses.replace(small, causal=False), 0, h, positions, context, valid)
+        alone = mla.reference_attention(w, small, 0, h[:1], positions[:1], context, valid)
+        np.testing.assert_allclose(causal[-1], full[-1], atol=1e-5)  # the last row sees every block row
+        np.testing.assert_allclose(causal[0], alone[0], atol=1e-5)  # the first sees only itself
+        self.assertFalse(np.allclose(causal[0], full[0], atol=1e-5))

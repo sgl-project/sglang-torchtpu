@@ -631,6 +631,7 @@ class PrefillProgram:
         ids: torch.Tensor,
         local: torch.Tensor,
         ring: Any = None,
+        keep: tuple[int, ...] = (),
     ):
         """Prefill a packed window: ``shard`` [1, W/32] this rank's token
         ids (its SP stripes, :meth:`sp_order`), ``extent`` [1] the end of
@@ -643,8 +644,12 @@ class PrefillProgram:
         them. Returns ``(logits [slots, VOCAB], latents [1, 24, W, 576],
         recurrent, conv, recurrent_at, conv_at)`` (the states after each
         sequence and at its checkpoint).
-        ``ring(blocks, prefix, middle)`` (the DSpark ring's update, if any)
-        runs on the residual streams before the final op consumes them."""
+        ``ring(blocks, prefix, middle, entering)`` (the DSpark ring's update
+        or the MLA draft's latents, if any) runs on the residual streams
+        before the final op consumes them; ``entering`` maps layer ids to the
+        residual stream entering them: 3, every pair ``p``'s 8p + 4 (its
+        input; kept only for the layers in ``keep``), 8p + 8 and 8p + 10, and
+        92 (the final layer's input)."""
         ops = self._build(int(shard.shape[-1]) * 32)
         tail = (ids, local)
         *state, tap3 = ops["first"](
@@ -658,7 +663,10 @@ class PrefillProgram:
             *self._flat("io", "common", "kda", "mla", "moe"),
         )
         middle = tap90 = None
+        entering = {3: tap3}
         for p, pair in enumerate(self._pairs):
+            if 8 * p + 4 in keep:  # the group op donates its input
+                entering[8 * p + 4] = state[0].clone()
             *state, middle, tap90 = ops["group"](
                 *state,
                 extent,
@@ -669,10 +677,12 @@ class PrefillProgram:
                 *tail,
                 *self._flat("common", "kda", "mla", "moe", expert_bank=p + 1),
             )
+            entering[8 * p + 8], entering[8 * p + 10] = middle, tap90
         prefix, blocks, rec, hist, rec_at, hist_at, latents = state
+        entering[4 + 8 * len(self._pairs)] = prefix
         if ring is not None:
             # The last pair's middle: entering layer 88; its tap: entering 90.
-            ring(blocks, prefix, middle, tap3, tap90)
+            ring(blocks, prefix, middle, entering)
         logits, latents = ops["final"](
             prefix,
             blocks,
@@ -1317,6 +1327,12 @@ class KimiPrefiller:
             )
         self._kda_groups = [(of[n], int(groups[of[n]].block_size)) for n in kda_names]
 
+    def _draft_keep(self) -> tuple[int, ...]:
+        """Residual streams the MLA draft's aux layers need kept (pair inputs)."""
+        if self.draft_latents is None:
+            return ()
+        return tuple(self.draft_latents.config.aux_layers)
+
     def _zeros(self) -> torch.Tensor:
         if self._zero_logits is None:
             self._zero_logits = torch.zeros((1, VOCAB), dtype=torch.float32).to("tpu")
@@ -1603,10 +1619,10 @@ class KimiPrefiller:
                     piece.start, piece.end
                 )
 
-            def ring_hook(blocks, prefix, middle, tap3, tap90):
+            def ring_hook(blocks, prefix, middle, entering):
                 assert self.draft_latents is not None
                 ring_out["draft"] = self.draft_latents.latents(
-                    window, blocks, tap3, tap90, draft_positions, order
+                    window, blocks, entering, draft_positions, order
                 )
 
         if self.ring is not None:
@@ -1630,7 +1646,7 @@ class KimiPrefiller:
             # The ring update takes rows in ownership order.
             positions, sequences = positions[order], sequences[order]
 
-            def ring_hook(blocks, prefix, middle, *taps):
+            def ring_hook(blocks, prefix, middle, entering):
                 ring_out["after"], ring_out["at"] = self.ring.update(
                     blocks, prefix, middle, positions, sequences, ends, stops, rings
                 )
@@ -1653,6 +1669,7 @@ class KimiPrefiller:
                 ids,
                 local_bases,
                 ring_hook,
+                keep=self._draft_keep(),
             )
         )
         self._writer.write_packed(
@@ -1917,7 +1934,7 @@ class KimiPrefiller:
                     blocks,
                     prefix,
                     middle,
-                    *taps,
+                    entering,
                     none=none,
                     ring_out=ring_out,
                     count=count,
@@ -1940,8 +1957,7 @@ class KimiPrefiller:
                     blocks,
                     prefix,
                     middle,
-                    tap3,
-                    tap90,
+                    entering,
                     window=window,
                     order=order,
                     ring_out=ring_out,
@@ -1950,8 +1966,7 @@ class KimiPrefiller:
                     ring_out["draft"] = self.draft_latents.latents(
                         window,
                         blocks,
-                        tap3,
-                        tap90,
+                        entering,
                         np.full(window, -1, np.int32),
                         order,
                     )
@@ -1967,6 +1982,7 @@ class KimiPrefiller:
                     _rank_zeros_i32(1 + self.cp_capacity // self.page_tokens),
                     _rank_zeros_i32(2 * count),
                     ring_hook,
+                    keep=self._draft_keep(),
                 )
             )
             outputs += [logits, self.program.split_states(recurrent, conv)[0][0]]

@@ -65,6 +65,16 @@ class MlaDraftConfig:
     rope_beta_slow: float = 1.0
     rope_mscale: float = 1.0
     rope_mscale_all_dim: float = 1.0
+    # YaRN's attention factor on the rotary embedding (vLLM's
+    # DeepseekScalingRotaryEmbedding ``attn_factor``).
+    rope_attn_factor: float = 1.0
+    # Block rows attend the block's rows causally (Kimi-K3.1's DSpark,
+    # ``full_attention_causal``); K3's attend all of them.
+    causal: bool = False
+
+    @property
+    def heads_per_rank(self) -> int:
+        return self.heads // RANKS
 
     @property
     def qk_head(self) -> int:
@@ -100,6 +110,8 @@ class MlaDraftConfig:
             raise ValueError(f"unsupported draft RoPE {rope}")
         if raw.get("draft_vocab_size", raw["vocab_size"]) != raw["vocab_size"]:
             raise ValueError("the draft vocabulary must be the target's")
+        if raw.get("rope_interleave") is False:
+            raise ValueError("the MLA DSpark draft's RoPE rotates interleaved pairs")
         return cls(
             hidden=raw["hidden_size"],
             layers=raw["num_hidden_layers"],
@@ -123,6 +135,8 @@ class MlaDraftConfig:
             rope_beta_slow=float(rope.get("beta_slow", 1)),
             rope_mscale=float(rope.get("mscale", 1)),
             rope_mscale_all_dim=float(rope.get("mscale_all_dim", 0)),
+            rope_attn_factor=float(rope.get("attn_factor", 1.0)),
+            causal=bool(raw.get("full_attention_causal") or (raw.get("dflash_config") or {}).get("causal")),
         )
 
 
@@ -207,7 +221,8 @@ def rope_inv_freq(c: MlaDraftConfig) -> np.ndarray:
 def rope_mscale(c: MlaDraftConfig) -> float:
     def get(scale, mscale):
         return 1.0 if scale <= 1 else 0.1 * mscale * math.log(scale) + 1.0
-    return float(get(c.rope_factor, c.rope_mscale) / get(c.rope_factor, c.rope_mscale_all_dim))
+    return float(get(c.rope_factor, c.rope_mscale) / get(c.rope_factor, c.rope_mscale_all_dim)
+                 * c.rope_attn_factor)
 
 
 def rope_cos_sin(c: MlaDraftConfig, positions) -> tuple[Any, Any]:
@@ -272,9 +287,10 @@ def reference_latents(w, c: MlaDraftConfig, layer, states, positions):
 
 def reference_attention(w, c: MlaDraftConfig, layer, h, positions, context_latents, context_valid):
     """MLA over context latents (``[tokens, latent]``, ``context_valid``
-    ``[tokens]`` bool) and the block's own rows (non-causal) for block rows
-    ``h`` ``[rows, hidden]`` at ``positions``. Returns ``[rows, hidden]``
-    (o_proj applied). Absorbed form, as the kernels compute it."""
+    ``[tokens]`` bool) and the block's own rows (all of them, or the ones up
+    to each row with ``c.causal``) for block rows ``h`` ``[rows, hidden]`` at
+    ``positions``. Returns ``[rows, hidden]`` (o_proj applied). Absorbed
+    form, as the kernels compute it."""
     p = f"layers.{layer}.self_attn."
     rows = h.shape[0]
     q_c = rms_norm(linear(h, w[p + "q_a_proj.weight"]), w[p + "q_a_layernorm.weight"], c.eps)
@@ -286,10 +302,13 @@ def reference_attention(w, c: MlaDraftConfig, layer, h, positions, context_laten
     q_abs = jnp.einsum("rhn,hnl->rhl", _f32(q_nope), _f32(w_uk))
     block_latents = reference_latents(w, c, layer, h, positions)
     keys = jnp.concatenate((context_latents, block_latents), axis=0)  # [K, latent]
-    valid = jnp.concatenate((context_valid, jnp.ones((rows,), bool)))
+    block_valid = (jnp.tril(jnp.ones((rows, rows), bool)) if c.causal
+                   else jnp.ones((rows, rows), bool))
+    valid = jnp.concatenate((jnp.broadcast_to(context_valid[None, :], (rows, context_valid.shape[0])),
+                             block_valid), axis=1)  # [rows, K]
     scores = (jnp.einsum("rhl,kl->rhk", q_abs, keys[:, : c.kv_lora].astype(jnp.float32))
               + jnp.einsum("rhd,kd->rhk", q_pe.astype(jnp.float32), keys[:, c.kv_lora:].astype(jnp.float32)))
-    scores = jnp.where(valid[None, None, :], scores * c.softmax_scale, -jnp.inf)
+    scores = jnp.where(valid[:, None, :], scores * c.softmax_scale, -jnp.inf)
     probabilities = jax.nn.softmax(scores, axis=-1)
     out_latent = jnp.einsum("rhk,kl->rhl", probabilities, keys[:, : c.kv_lora].astype(jnp.float32))
     out = jnp.einsum("rhl,hvl->rhv", out_latent, _f32(w_uv)).astype(h.dtype)
@@ -335,7 +354,7 @@ def reference_markov_greedy(w, c: MlaDraftConfig, lm_head, hidden, anchor_token)
 
 RANKS = 32
 ROWS = 8  # block rows per request in the kernel (block <= 8; the rest are padding)
-HEADS_PER_RANK = 2
+HEADS_PER_RANK = 2  # K3's draft (64 heads); MlaDraftConfig.heads_per_rank in general
 LANES = 640  # a latent row: c_kv 512 | k_pe 64 | zero 64 (the pools' layout)
 QKV_A = 1536 + LANES  # fused q_a | kv_a (padded) columns
 MLP_PADDED = 512  # 448 MLP channels per rank padded to whole lane tiles
@@ -394,8 +413,9 @@ def kernel_weight_shards(c: MlaDraftConfig, weights: dict[str, Any], *, ranks: i
     import ml_dtypes
 
     bf16 = ml_dtypes.bfloat16
-    if c.heads != HEADS_PER_RANK * ranks or c.intermediate % ranks or c.vocab % ranks:
-        raise ValueError("the MLA draft kernel needs 64 heads and dims dividing 32 ranks")
+    if c.heads % ranks or c.intermediate % ranks or c.vocab % ranks:
+        raise ValueError("the MLA draft kernel needs heads and dims dividing 32 ranks")
+    per = c.heads // ranks
     w = {name: np.asarray(value) for name, value in weights.items()}
     mlp = c.intermediate // ranks
     vocab = c.vocab // ranks
@@ -426,13 +446,13 @@ def kernel_weight_shards(c: MlaDraftConfig, weights: dict[str, Any], *, ranks: i
     for l in range(L):
         kv_norm[l, 0, :c.kv_lora] = layer("self_attn.kv_a_layernorm.weight", l)
     shards["kv_norm"] = replicated(kv_norm.astype(bf16))
-    q_width = HEADS_PER_RANK * c.qk_head
+    q_width = per * c.qk_head
 
     def q_b(l, r):
         """This rank's heads' q_b columns: nope 0 | nope 1 | rope 0, rope 1
         each padded to 128 lanes (every slice starts on a lane tile)."""
         value = layer("self_attn.q_b_proj.weight", l)[r * q_width:(r + 1) * q_width].T  # [1536, 2 x 192]
-        heads = value.reshape(c.q_lora, HEADS_PER_RANK, c.qk_head)
+        heads = value.reshape(c.q_lora, per, c.qk_head)
         rope = np.pad(heads[:, :, c.nope:], ((0, 0), (0, 0), (0, 128 - c.rope)))
         return np.concatenate((heads[:, :, :c.nope].reshape(c.q_lora, -1), rope.reshape(c.q_lora, -1)), axis=1)
 
@@ -440,11 +460,11 @@ def kernel_weight_shards(c: MlaDraftConfig, weights: dict[str, Any], *, ranks: i
 
     def kv_b(l, r):
         return layer("self_attn.kv_b_proj.weight", l).reshape(c.heads, c.nope + c.v_head, c.kv_lora)[
-            r * HEADS_PER_RANK:(r + 1) * HEADS_PER_RANK]
+            r * per:(r + 1) * per]
 
     shards["w_uk"] = per_rank(lambda l, r: kv_b(l, r)[:, :c.nope, :]).astype(bf16)  # [2, 128, 512]
     shards["w_uv"] = per_rank(lambda l, r: np.transpose(kv_b(l, r)[:, c.nope:, :], (0, 2, 1))).astype(bf16)  # [2, 512, 128]
-    o_width = HEADS_PER_RANK * c.v_head
+    o_width = per * c.v_head
     shards["o"] = per_rank(
         lambda l, r: permute_chunks(layer("self_attn.o_proj.weight", l)[:, r * o_width:(r + 1) * o_width].T, r)
     ).astype(bf16)

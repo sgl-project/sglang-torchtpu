@@ -479,14 +479,19 @@ class MlaDsparkDraft:
         )
         return self._ops[key]
 
-    @staticmethod
-    def parts(requests: int, dp: int = 1, rows_per: int = 8) -> list[tuple[int, ...]]:
+    @property
+    def max_rows(self) -> int:
+        """Rows a fused call drafts: ``MAX_ROWS``, half for drafts with more
+        than two heads a rank (Kimi-K3.1's: VMEM)."""
+        return MAX_ROWS if self.config.heads_per_rank <= 2 else MAX_ROWS // 2
+
+    def parts(self, requests: int, dp: int = 1, rows_per: int = 8) -> list[tuple[int, ...]]:
         """The verify's requests each fused call drafts: at most
-        ``MAX_ROWS // rows_per``; under attention DP (``dp``) as many of each group's
+        ``max_rows // rows_per``; under attention DP (``dp``) as many of each group's
         (group ``g``'s are the verify's ``g``-th share), group-major as the
         kernel attends them."""
         share = requests // dp
-        per = min(requests, MAX_ROWS // rows_per) // dp
+        per = min(requests, self.max_rows // rows_per) // dp
         return [
             tuple(
                 g * share + first + i
