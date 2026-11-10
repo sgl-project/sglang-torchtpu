@@ -615,16 +615,15 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         mode_caps = [(ForwardMode.EXTEND, self._extend_compile_cap())]
         if get_schedule().enable_mixed_chunk:
-            mode_caps.append(
-                (
-                    ForwardMode.MIXED,
-                    _extend_batch_cap(
-                        self.t_bucketer,
-                        self.b_bucketer,
-                        self.b_bucketer.max_val,
-                    ),
-                )
+            extend_cap = self._extend_compile_cap()
+            mixed_cap = _extend_batch_cap(
+                self.t_bucketer,
+                self.b_bucketer,
+                self.b_bucketer.max_val,
             )
+            if extend_cap != mixed_cap:
+                mode_caps.append((ForwardMode.MIXED, extend_cap))
+            mode_caps.append((ForwardMode.MIXED, mixed_cap))
 
         return [
             (num_tokens, batch_size, mode)
@@ -1818,7 +1817,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         device = self.model_runner.device
         global_num_tokens = [num_tokens] * dp_size
         forward_batch.dp_padding_mode = DpPaddingMode.MAX_LEN
-        forward_batch.is_extend_in_batch = mode == ForwardMode.EXTEND
+        forward_batch.is_extend_in_batch = mode.is_extend()
         forward_batch.global_num_tokens_cpu = list(global_num_tokens)
         forward_batch.original_global_num_tokens_cpu = list(global_num_tokens)
         forward_batch.global_num_tokens_gpu = torch.tensor(
@@ -2183,10 +2182,21 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             aux_hidden_states,
         ).next_token_logits
 
+    @property
+    def _serves_multimodal(self) -> bool:
+        outer = getattr(self.model_runner, "model", None)
+        server_args = getattr(self.model_runner, "server_args", None)
+        return (
+            hasattr(outer, "get_image_feature")
+            and not getattr(outer, "language_model_only", False)
+            and not getattr(server_args, "language_model_only", False)
+            and not getattr(server_args, "language_only", False)
+        )
+
     def install(self) -> bool:
         outer = getattr(self.model_runner, "model", None)
         if (
-            hasattr(outer, "get_image_feature")
+            self._serves_multimodal
             and is_dp_attention_enabled()
             # A wrapper that routes every rank through one input_embeds program
             # on image steps and compiles its logits processor (Kimi-K2.5).
@@ -2206,8 +2216,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 
     def _uses_input_embeds(self, target: Any) -> bool:
         """Whether to warm ``target`` via the Qwen3-VL input_embeds path."""
-        outer = getattr(self.model_runner, "model", None)
-        is_multimodal = hasattr(outer, "get_image_feature")
+        is_multimodal = self._serves_multimodal
         return is_multimodal and callable(getattr(target, "get_input_embeddings", None))
 
     def _extend_input_variants(self) -> tuple[str, ...]:

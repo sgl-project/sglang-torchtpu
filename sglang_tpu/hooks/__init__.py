@@ -39,6 +39,7 @@ from sglang_tpu.hooks.encoder import (
     reject_encoder_dp,
 )
 from sglang_tpu.hooks.experimental_spec import hook_specs
+from sglang_tpu.hooks.fused_moe_decode import bind_qwen_fused_moe_decode
 from sglang_tpu.hooks.glm_flash_megakernel import route_glm_flash_megakernel
 from sglang_tpu.hooks.hicache_swa_metrics import hook_specs as hicache_swa_metrics_hooks
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
@@ -345,6 +346,11 @@ HOOKS: list[tuple] = [
         "sglang.srt.speculative.spec_tp_sync.SpecTpSync.sync",
         broadcast_undeferred,
         HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.qwen2_moe.Qwen2MoeSparseMoeBlock.__init__",
+        bind_qwen_fused_moe_decode,
+        HookType.AFTER,
     ),
 ]
 

@@ -705,6 +705,35 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.experts.supports_deferred_finalize and self.shared_expert is not None
         )
 
+    # Set by decoder layers that pass `use_tpu_fused_moe_decode()` to their FFN
+    # boundary as `summed_by_compute`. The fused decode kernel all-reduces in
+    # kernel, so any other decoder layer would sum its output a second time.
+    allow_tpu_fused_moe_decode: bool = False
+    _tpu_fused_moe_decode_should_use = None
+    _tpu_fused_moe_decode_apply = None
+
+    def use_tpu_fused_moe_decode(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch],
+        defer_finalize: bool = False,
+    ) -> bool:
+        should_use = self._tpu_fused_moe_decode_should_use
+        if should_use is None or defer_finalize:
+            return False
+        return should_use(self, hidden_states, forward_batch)
+
+    def _forward_tpu_fused_moe_decode(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        apply_fn = self._tpu_fused_moe_decode_apply
+        if apply_fn is None:
+            raise RuntimeError("Fused MoE decode apply hook is not bound")
+        router_logits, _ = self.gate(hidden_states)
+        topk_output = self.topk(hidden_states, router_logits)
+        return apply_fn(self, hidden_states, topk_output)
+
     def _forward_router_experts(
         self,
         hidden_states: torch.Tensor,
@@ -816,6 +845,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         if defer_finalize and num_tokens == 0:
             raise RuntimeError("Qwen deferred finalize does not support M=0")
+
+        if self.use_tpu_fused_moe_decode(hidden_states, forward_batch, defer_finalize):
+            return self._forward_tpu_fused_moe_decode(hidden_states).view(
+                num_tokens, hidden_dim
+            )
 
         if self._use_mega_moe:
             return self._forward_mega_moe(hidden_states, forward_batch)
