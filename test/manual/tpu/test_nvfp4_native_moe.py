@@ -91,16 +91,22 @@ def _dequant_rows_nvfp4(packed, fp8_scale, g, dtype=torch.bfloat16):
 def _make_nvfp4_moe_layer(E, hidden, intermediate, seed, block_size=NVFP4_BLOCK):
     """Build a synthetic NVFP4 MoE layer matching ModelOpt checkpoint params.
 
-    ``block_size`` is the stock Pallas path's block-512 scale granularity.
+    ``block_size`` is the per-block scale granularity along the contracting dim.
+    Sub-512 ModelOpt checkpoints store distinct per-expert gate/up/down global
+    scales, whereas block-512 checkpoints pre-fold global scales to 1.0.
     """
     g = torch.Generator().manual_seed(seed)
     w1f = (torch.randn(E, intermediate, hidden, generator=g) * 0.1).float()
     w3f = (torch.randn(E, intermediate, hidden, generator=g) * 0.1).float()
     w2f = (torch.randn(E, hidden, intermediate, generator=g) * 0.1).float()
-    # Block-512 checkpoints store the global scale pre-folded into block scales.
-    g_gate = torch.ones(E)
-    g_up = torch.ones(E)
-    g_down = torch.ones(E)
+    if block_size == NVFP4_BLOCK:
+        g_gate = torch.ones(E)
+        g_up = torch.ones(E)
+        g_down = torch.ones(E)
+    else:
+        g_gate = torch.linspace(0.7, 1.3, E)
+        g_up = torch.linspace(0.8, 1.4, E)
+        g_down = torch.linspace(0.6, 1.2, E)
 
     w1_p, w1_s = _quantize_rows_nvfp4(w1f, g_gate, block_size)
     w3_p, w3_s = _quantize_rows_nvfp4(w3f, g_up, block_size)
@@ -126,6 +132,8 @@ def _build_fake_layer(data, extra_params=True):
     layer = torch.nn.Module()
     layer.moe_runner_config = types.SimpleNamespace(is_gated=True, activation="silu")
     E = data["w13_weight"].shape[0]
+    layer.num_local_experts = E
+    layer.moe_ep_rank = 0
     layer.w13_weight = torch.nn.Parameter(data["w13_weight"], requires_grad=False)
     layer.w2_weight = torch.nn.Parameter(data["w2_weight"], requires_grad=False)
     layer.w13_weight_scale = torch.nn.Parameter(
@@ -179,21 +187,8 @@ class TestNativeNvfp4FusedMoE(unittest.TestCase):
         )
         return hs, topk_ids, topk_w
 
-    def test_native_matches_bf16(self):
-        from sglang_tpu.fp4_moe import (
-            prepare_tpu_nvfp4_moe_weights,
-        )
-        from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
-
-        # Real routed-MoE expert shapes: hidden 4096, intermediate 4096, top-8.
-        # E is a small subset of the full expert count (the kernel loops over
-        # experts identically, so a subset exercises the same code paths).
-        E, hidden, intermediate, topk = 8, 4096, 4096, 8
-        data = _make_nvfp4_moe_layer(E, hidden, intermediate, seed=3)
-        hs, topk_ids, topk_w = self._inputs(64, hidden, topk, E, seed=4)
+    def _dequant_bf16_weights(self, data, intermediate):
         gg, gu, g2 = data["globals"]
-
-        # --- bf16 reference: dequant the same codes+scales, run bf16 path ---
         w1 = _dequant_rows_nvfp4(
             data["w13_weight"][:, :intermediate],
             data["w13_weight_scale"][:, :intermediate],
@@ -210,55 +205,143 @@ class TestNativeNvfp4FusedMoE(unittest.TestCase):
             .permute(0, 2, 1)
             .contiguous()
         )
-        ref = (
-            fused_moe_call(
-                hidden_states=hs.to(self.device),
-                w1=w13_bf16.to(self.device),
-                w2=w2_bf16.to(self.device),
-                topk_weights=topk_w.to(self.device),
-                topk_ids=topk_ids.to(self.device),
-                topk=topk,
-                activation="silu",
-            )
-            .cpu()
-            .float()
-        )
+        return w13_bf16, w2_bf16
 
-        # --- native packed-FP4 path ---
-        layer = _build_fake_layer(data)
-        prepare_tpu_nvfp4_moe_weights(layer, group_size=NVFP4_BLOCK)
-        native = (
-            fused_moe_call(
-                hidden_states=hs.to(self.device),
-                w1=layer.w13_weight.to(self.device),
-                w2=layer.w2_weight.to(self.device),
-                w1_scale=layer.w13_weight_scale.to(self.device),
-                w2_scale=layer.w2_weight_scale.to(self.device),
-                topk_weights=topk_w.to(self.device),
-                topk_ids=topk_ids.to(self.device),
-                topk=topk,
-                activation="silu",
-            )
-            .cpu()
-            .float()
+    def test_native_matches_bf16(self):
+        from sglang_tpu.fp4_moe import (
+            TPU_NVFP4_SUPPORTED_GROUP_SIZES,
+            apply_tpu_nvfp4_moe,
+            prepare_tpu_nvfp4_moe_weights,
         )
-        torch.accelerator.synchronize()
+        from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
-        self.assertEqual(native.shape, ref.shape)
-        self.assertTrue(torch.isfinite(native).all().item(), "native NaN/Inf")
-        # Both paths use the same fp4 codes; native is W4A8, the reference uses
-        # dequantized bf16 weights, so the
-        # only divergence is fp8 activation rounding over GMM1 -> SwiGLU -> GMM2.
-        # Measured on tpu7x at these shapes: rel_mean ~= 0.049, cos ~= 0.9988;
-        # bounds sit ~1.5x above that so a real wiring regression (rel_mean -> ~0.3,
-        # cos < 0.99) trips them. (Recalibrate if a legit run exceeds them.)
-        denom = ref.abs().mean().item() + 1e-6
-        rel_mean = (native - ref).abs().mean().item() / denom
-        cos = torch.nn.functional.cosine_similarity(
-            native.flatten(), ref.flatten(), dim=0
-        ).item()
-        self.assertLess(rel_mean, 0.08, f"native vs bf16 ref rel mean err={rel_mean}")
-        self.assertGreater(cos, 0.995, f"native vs bf16 ref cosine={cos}")
+        # Real routed-MoE expert shapes: hidden 4096, intermediate 4096, top-8.
+        # E is a small subset of the full expert count (the kernel loops over
+        # experts identically, so a subset exercises the same code paths).
+        E, hidden, intermediate, topk = 8, 4096, 4096, 8
+        hs, topk_ids, topk_w = self._inputs(64, hidden, topk, E, seed=4)
+
+        for group_size in TPU_NVFP4_SUPPORTED_GROUP_SIZES:
+            with self.subTest(group_size=group_size):
+                data = _make_nvfp4_moe_layer(
+                    E, hidden, intermediate, seed=3, block_size=group_size
+                )
+                w13_bf16, w2_bf16 = self._dequant_bf16_weights(data, intermediate)
+
+                # --- bf16 reference: dequant the same codes+scales ---
+                ref = (
+                    fused_moe_call(
+                        hidden_states=hs.to(self.device),
+                        w1=w13_bf16.to(self.device),
+                        w2=w2_bf16.to(self.device),
+                        topk_weights=topk_w.to(self.device),
+                        topk_ids=topk_ids.to(self.device),
+                        topk=topk,
+                        activation="silu",
+                    )
+                    .cpu()
+                    .float()
+                )
+
+                # --- stock Pallas gmm_v2 packed-FP4 path (use_fused_rs=False) ---
+                layer = _build_fake_layer(data)
+                prepare_tpu_nvfp4_moe_weights(
+                    layer, group_size=group_size, use_fused_rs=False
+                )
+                layer = layer.to(self.device)
+                native = (
+                    fused_moe_call(
+                        hidden_states=hs.to(self.device),
+                        w1=layer.w13_weight,
+                        w2=layer.w2_weight,
+                        w1_scale=layer.w13_weight_scale,
+                        w2_scale=layer.w2_weight_scale,
+                        topk_weights=topk_w.to(self.device),
+                        topk_ids=topk_ids.to(self.device),
+                        topk=topk,
+                        activation="silu",
+                    )
+                    .cpu()
+                    .float()
+                )
+                torch.accelerator.synchronize()
+
+                self.assertEqual(native.shape, ref.shape)
+                self.assertTrue(
+                    torch.isfinite(native).all().item(),
+                    f"native NaN/Inf at group_size={group_size}",
+                )
+                # Blocks 16..128 dequantize in VMEM (W4A16, bf16 LHS); blocks
+                # 256 and 512 quantize LHS to FP8 (W4A8, rel_mean ~= 0.049,
+                # cos ~= 0.9988 on tpu7x).
+                denom = ref.abs().mean().item() + 1e-6
+                rel_mean = (native - ref).abs().mean().item() / denom
+                cos = torch.nn.functional.cosine_similarity(
+                    native.flatten(), ref.flatten(), dim=0
+                ).item()
+                max_rel_mean = 0.02 if group_size <= 128 else 0.08
+                min_cos = 0.999 if group_size <= 128 else 0.995
+                self.assertLess(
+                    rel_mean,
+                    max_rel_mean,
+                    f"group_size={group_size} rel mean err={rel_mean}",
+                )
+                self.assertGreater(
+                    cos,
+                    min_cos,
+                    f"group_size={group_size} cosine={cos}",
+                )
+
+                # Also verify no_combine=True (used by PP stages with
+                # post-expert norm) for narrow (16) and wide (512) blocks.
+                if group_size in (16, NVFP4_BLOCK):
+                    ref_no_combine = (
+                        fused_moe_call(
+                            hidden_states=hs.to(self.device),
+                            w1=w13_bf16.to(self.device),
+                            w2=w2_bf16.to(self.device),
+                            topk_weights=topk_w.to(self.device),
+                            topk_ids=topk_ids.to(self.device),
+                            topk=topk,
+                            activation="silu",
+                            no_combine=True,
+                        )
+                        .cpu()
+                        .float()
+                    )
+                    dispatch_output = types.SimpleNamespace(
+                        hidden_states=hs.to(self.device),
+                        topk_output=(
+                            topk_w.to(self.device),
+                            topk_ids.to(self.device),
+                            None,
+                        ),
+                    )
+                    native_no_combine = (
+                        apply_tpu_nvfp4_moe(
+                            layer=layer,
+                            dispatch_output=dispatch_output,
+                            activation="silu",
+                            apply_router_weight_on_input=False,
+                            no_combine=True,
+                            use_fused_rs=False,
+                        )
+                        .hidden_states.cpu()
+                        .float()
+                    )
+                    torch.accelerator.synchronize()
+                    self.assertEqual(native_no_combine.shape, ref_no_combine.shape)
+                    nc_denom = ref_no_combine.abs().mean().item() + 1e-6
+                    nc_rel = (
+                        native_no_combine - ref_no_combine
+                    ).abs().mean().item() / nc_denom
+                    nc_cos = torch.nn.functional.cosine_similarity(
+                        native_no_combine.flatten(),
+                        ref_no_combine.flatten(),
+                        dim=0,
+                    ).item()
+                    self.assertLess(nc_rel, max_rel_mean)
+                    self.assertGreater(nc_cos, min_cos)
 
 
 if __name__ == "__main__":

@@ -34,10 +34,17 @@ import numpy as np
 import torch
 
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
-from sglang.srt.mem_cache.pool_host.base import host_memory_budget_bytes
+from sglang.srt.mem_cache.pool_host.base import (
+    host_memory_budget_bytes,
+    sync_fixed_hicache_size,
+)
 from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.utils import next_power_of_2
-from sglang_tpu.tpu_dma_hicache import TransferEvent, create_tpu_dma_kv_transfer
+from sglang_tpu.tpu_dma_hicache import (
+    TransferEvent,
+    create_tpu_dma_kv_transfer,
+    page_major_tensors,
+)
 
 if TYPE_CHECKING:
     from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
@@ -117,6 +124,16 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
             allocator_type=allocator_type,
             pool_label=pool_label,
         )
+        self.storage_format_tag = self._storage_format_tag()
+
+    def _storage_format_tag(self) -> str:
+        """Storage-key tag for everything that fixes a page's bytes on this
+        pool: the device layout with its packing, the store dtype and the page
+        dims. A page written under another tag is a miss, never wrong KV. The
+        fp8 scales are per-layer model constants, keyed by the model name."""
+        shape_tag = "x".join(str(d) for d in self._device_page_shape())
+        dtype_tag = str(self.dtype).removeprefix("torch.")
+        return f"tpu-{self.device_pool.kv_layout_tag()}-{dtype_tag}-{shape_tag}"
 
     def _device_page_shape(self) -> tuple:
         """Per-page dims of the device's fused KV tensor, layout and all."""
@@ -300,22 +317,31 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
             return
         self.backup_copy_d2h(staged, host_indices)
 
-    # -- L3 storage hooks (not supported in the 2-tier TPU phase) -------- #
+    # -- L3 storage seams ------------------------------------------------ #
+    # The host buffer is page-major, so one page's all-layer KV is the
+    # contiguous row kv_buffer[page_id] of shape (layer_num, *device_page_shape).
+    # Storage backends move that row as one opaque flat blob; the interior keeps
+    # the device's packed layout and is never interpreted on the host.
+
+    def _page_id(self, index) -> int:
+        # Callers pass the first token slot of a page; drop any sub-page
+        # offset, consistent with _to_page_ids.
+        return int(index) // self.page_size
+
+    def _page_dims(self) -> tuple:
+        return tuple(self.kv_buffer.shape[1:])  # (layer_num, *device_page_shape)
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
-        raise NotImplementedError(
-            "L3 storage is not supported by the TPU fused host pool yet."
-        )
+        data_page = self.kv_buffer[self._page_id(index)]
+        return data_page.flatten() if flat else data_page
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
-        raise NotImplementedError(
-            "L3 storage is not supported by the TPU fused host pool yet."
-        )
+        return torch.zeros(
+            self._page_dims(), dtype=self.dtype, device=self.device
+        ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
-        raise NotImplementedError(
-            "L3 storage is not supported by the TPU fused host pool yet."
-        )
+        self.kv_buffer[self._page_id(index)] = data_page.reshape(self._page_dims())
 
 
 class TpuDMAHostKVPool(HostKVCache):
@@ -347,12 +373,39 @@ class TpuDMAHostKVPool(HostKVCache):
         *,
         pool_label: str = "kv",
         mtp_draft_device_pools: tuple = (),
+        # MLA flat-layout row width; the engine copies the device pages as they
+        # are, so the width comes from page_major_tensors.
+        override_kv_cache_dim: Optional[int] = None,
     ):
-        if mtp_draft_device_pools:
-            raise NotImplementedError(
-                "MTP draft KV offload is not supported on --hicache-io-backend "
-                f"{self.io_backend}."
-            )
+        del override_kv_cache_dim
+        # Packed MTP draft pools share the target's page ids, so one engine
+        # moves a page of the target and of every draft together.
+        self.draft_pools = tuple(mtp_draft_device_pools)
+        self.dtype = device_pool.store_dtype
+        self.start_layer = device_pool.start_layer
+        self.end_layer = device_pool.end_layer
+        self.layer_num = device_pool.layer_num
+        self._init_pages(
+            device_pool,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=host_size,
+            page_size=page_size,
+            pin_memory=pin_memory,
+            device=device,
+            pool_label=pool_label,
+        )
+
+    def _init_pages(
+        self,
+        device_pool,
+        *,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        pin_memory: bool,
+        device: str,
+        pool_label: str,
+    ) -> None:
         # The engine owns the host storage, so skip the base allocator setup
         # but retain its sizing and host-memory admission check.
         self.device_pool = device_pool
@@ -362,14 +415,11 @@ class TpuDMAHostKVPool(HostKVCache):
         self.pin_memory = pin_memory
         self.device = device
 
-        self.dtype = device_pool.store_dtype
-        self.start_layer = device_pool.start_layer
-        self.end_layer = device_pool.end_layer
-        self.layer_num = device_pool.layer_num
-
         self.size_per_token = self.get_size_per_token()
         if host_size > 0:
-            self.size = int(host_size * 1e9 // self.size_per_token)
+            self.size = sync_fixed_hicache_size(
+                int(host_size * 1e9 // self.size_per_token), host_size
+            )
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
         # Align the pool up to a whole number of pages.
@@ -404,7 +454,7 @@ class TpuDMAHostKVPool(HostKVCache):
         )
 
         self.transfer = create_tpu_dma_kv_transfer(
-            self.io_backend, device_pool, self.page_num
+            self.io_backend, device_pool, self.page_num, draft_pools=self.draft_pools
         )
 
         self.lock = threading.RLock()
@@ -415,16 +465,19 @@ class TpuDMAHostKVPool(HostKVCache):
     # ------------------------------------------------------------------ #
 
     def get_size_per_token(self) -> int:
-        """Host bytes per cached token = fused device page bytes / page_size.
+        """Host bytes per cached token = device page bytes / page_size.
 
-        Uses the *real* (padded) fused-page byte size so the host_size GB
-        budget matches the engine's actual per-page allocation, not the logical
-        ``2 * head_num * head_dim`` lower bound.
+        Uses the *real* (padded) page byte size of every page-major tensor so
+        the host_size GB budget matches the engine's actual per-page allocation,
+        not the logical ``2 * head_num * head_dim`` lower bound.
         """
-        fused = self.device_pool.get_fused_kv_buffer(self.start_layer)
-        page_bytes = int(np.prod(fused.shape[1:])) * fused.element_size()
-        per_token = page_bytes // self.page_size
-        return per_token * self.layer_num
+        tensors = [
+            t
+            for pool in (self.device_pool, *self.draft_pools)
+            for t in page_major_tensors(pool)
+        ]
+        page_bytes = sum(int(np.prod(t.shape[1:])) * t.element_size() for t in tensors)
+        return page_bytes // self.page_size
 
     def init_kv_buffer(self):
         # The engine owns host memory; there is no torch host buffer.
@@ -542,5 +595,46 @@ def tpu_dma_host_kv_pool_cls(io_backend: str) -> type[TpuDMAHostKVPool]:
     return type(
         f"TpuDMAHostKVPool[{io_backend}]",
         (TpuDMAHostKVPool,),
+        {"io_backend": io_backend},
+    )
+
+
+class TpuDMAMambaPoolHost(TpuDMAHostKVPool):
+    """Host store for recurrent-state (GDN/KDA) slots, copied by the DMA engine.
+
+    ``TpuMambaPool`` keeps one ``[state_slots, ...]`` tensor per layer and state
+    kind, so a slot is one row of each: the engine moves it as a page of one row.
+    """
+
+    def __init__(
+        self,
+        device_pool,
+        host_to_device_ratio: float,
+        host_size: int,
+        *,
+        allocator_type: str = "default",
+        layout: str = TPU_DMA_LAYOUT,
+    ):
+        del allocator_type, layout
+        self.num_mamba_layers = device_pool.num_mamba_layers
+        self.draft_pools = ()
+        self._init_pages(
+            device_pool,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=host_size,
+            page_size=1,
+            pin_memory=False,
+            device="cpu",
+            pool_label="mamba",
+        )
+
+
+def tpu_dma_mamba_pool_host_cls(io_backend: str) -> type[TpuDMAMambaPoolHost]:
+    """The ``TpuDMAMambaPoolHost`` class whose instances copy with ``io_backend``."""
+    if io_backend == TpuDMAMambaPoolHost.io_backend:
+        return TpuDMAMambaPoolHost
+    return type(
+        f"TpuDMAMambaPoolHost[{io_backend}]",
+        (TpuDMAMambaPoolHost,),
         {"io_backend": io_backend},
     )

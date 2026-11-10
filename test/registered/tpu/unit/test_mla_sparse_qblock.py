@@ -18,8 +18,10 @@ try:
     import jax.numpy as jnp
     import numpy as np
 
+    _HAS_JAX = True
     _HAS_TPU = any(d.platform == "tpu" for d in jax.devices())
 except Exception:  # pragma: no cover - non-TPU host
+    _HAS_JAX = False
     _HAS_TPU = False
 
 D, KPOOL, PAGE, IH, TOPK, W, QH = 128, 4, 128, 32, 2048, 2176, 8
@@ -29,6 +31,20 @@ REL_TOL = 1e-2
 
 @unittest.skipUnless(_HAS_TPU, "requires a TPU backend")
 class TestSparseMlaPrefillQblock(CustomTestCase):
+    @staticmethod
+    def _glm_shape():
+        # GLM-5.3-Flash's q-block prefill: NoPE + RoPE query lanes, the
+        # recipe's 128-token pages, and the most pages per request the op
+        # lets this kernel take.
+        from sglang_tpu.attention.pallas import mla_sparse_fused as fused
+
+        return dict(
+            q_width=fused.NOPE_DIM + fused.ROPE_DIM,
+            page_size=PAGE,
+            pages_per_seq=fused.QBLOCK_MAX_PAGES_PER_SEQ,
+            dtype=jnp.bfloat16,
+        )
+
     @classmethod
     def setUpClass(cls):
         from sglang_tpu.attention.pallas import dsa_kpool_topk as kp
@@ -60,7 +76,7 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
     def _f(self, *shape, scale=1.0):
         return jnp.asarray((self.rng.normal(size=shape) * scale).astype(np.float32))
 
-    def _case(self, seqs, num_tokens, max_seqs, ctx, sm_scale, k_scale):
+    def _case(self, seqs, num_tokens, max_seqs, ctx, sm_scale, k_scale, heads=QH):
         """seqs: (prefix, q_len) per request, prefixed requests first. Returns the
         q-block arguments and the per-query kernel's output for the last step."""
         kp = self.kp
@@ -69,7 +85,7 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
         pi = jnp.asarray(1 + self.rng.permutation(max_seqs * pps), jnp.int32)
         raw = jnp.zeros((num_pages, PAGE, 2 * D), jnp.bfloat16)
         pooled = jnp.zeros(
-            (num_pages, PAGE // 4, 4, kp.pooled_record_bytes(D)), jnp.uint8
+            (num_pages, PAGE // KPOOL // 4, 4, kp.pooled_record_bytes(D)), jnp.uint8
         )
         cn = jnp.zeros((num_pages, PAGE, 4, 128), jnp.uint8)
         cr = jnp.zeros((num_pages, PAGE // 4, 4, 128), jnp.uint8)
@@ -96,8 +112,8 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
                 cu,
                 dist,
             )
-            ql = self._f(T, QH, 512).astype(jnp.bfloat16)
-            qpe = self._f(T, QH, 64).astype(jnp.bfloat16)
+            ql = self._f(T, heads, 512).astype(jnp.bfloat16)
+            qpe = self._f(T, heads, 64).astype(jnp.bfloat16)
             out, cn, cr = att(
                 ql,
                 qpe,
@@ -130,8 +146,14 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
         )
         return args, ref
 
-    def _check(self, args, ref, sm_scale, k_scale):
-        out = self.qblock(*args, sm_scale=sm_scale, k_scale=k_scale, kpool=KPOOL)
+    def _check(self, args, ref, sm_scale, k_scale, query_block=256):
+        out = self.qblock(
+            *args,
+            sm_scale=sm_scale,
+            k_scale=k_scale,
+            kpool=KPOOL,
+            query_block=query_block,
+        )
         cu, dist = args[7], args[8]
         n = int(cu[dist[2]])
         o = np.asarray(out[:n].astype(jnp.float32))
@@ -147,6 +169,127 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
         seqs = [(1024, 2500), (600, 1800), (0, 2049), (0, 1)]
         args, ref = self._case(seqs, 8192, 6, 4096, 0.08, 0.75)
         self._check(args, ref, 0.08, 0.75)
+
+    def test_64_heads_128_query_blocks(self):
+        # 64 heads per chip (GLM-5.3-Flash at attention TP1) take 128-query
+        # blocks, since 64 x 256 score rows do not fit in VMEM. 8 and 32 heads
+        # per chip (TP8, TP2) keep 256.
+        from sglang_tpu.attention.pallas.mla_sparse_fused import qblock_query_block
+
+        def query_block(heads):
+            return qblock_query_block(heads, **self._glm_shape())
+
+        self.assertEqual(query_block(8), 256)
+        self.assertEqual(query_block(32), 256)
+        self.assertEqual(query_block(64), 128)
+        seqs = [(300, 700), (0, 300)]
+        args, ref = self._case(seqs, 1024, 4, 1024, 0.08, 0.75, heads=64)
+        self._check(args, ref, 0.08, 0.75, query_block=query_block(64))
+
+    def test_largest_shape_within_vmem_estimate_compiles(self):
+        # The op trusts the VMEM estimate, so the most heads it allows at the
+        # default query block (35 at 256 queries on tpu7x) must compile.
+        from sglang_tpu.attention.pallas import mla_sparse_qblock as mq
+
+        shape = self._glm_shape()
+        heads = max(
+            h
+            for h in range(1, 129)
+            if mq.vmem_required_by_sparse_mla(h, mq.QUERY_BLOCK, **shape)
+            <= mq.vmem_limit_bytes()
+        )
+        pps, seqs, tokens = shape["pages_per_seq"], 4, 1024
+        sd = jax.ShapeDtypeStruct
+        mq.sparse_mla_prefill_qblock.lower(
+            sd((tokens, heads, 512), jnp.bfloat16),
+            sd((tokens, heads, 64), jnp.bfloat16),
+            sd((seqs * pps + 1, PAGE, 4, 128), jnp.uint8),
+            sd((seqs * pps + 1, PAGE // 4, 4, 128), jnp.uint8),
+            sd((tokens, W), jnp.int32),
+            sd((seqs,), jnp.int32),
+            sd((seqs * pps,), jnp.int32),
+            sd((seqs + 1,), jnp.int32),
+            sd((3,), jnp.int32),
+            sm_scale=0.08,
+            k_scale=0.75,
+            kpool=KPOOL,
+            query_block=mq.QUERY_BLOCK,
+        ).compile()
+
+
+@unittest.skipUnless(_HAS_JAX, "requires JAX")
+class TestQblockSelectionWords(CustomTestCase):
+    """Per-token selection words equal ones built per block entry (runs on CPU)."""
+
+    @staticmethod
+    def _per_entry_words(topk_indices, tok, is_row, *, kpool, pages_pad):
+        # Reference: the words built from each block entry's own row gather.
+        from sglang_tpu.attention.pallas import mla_sparse_qblock as mq
+
+        g = jnp.arange(pages_pad, dtype=jnp.int32)
+        first_tok = topk_indices[:, ::kpool][tok]  # [nb, qb, width / kpool]
+        sel = jnp.where(is_row[..., None] & (first_tok >= 0), first_tok // kpool, -1)
+        page = jnp.where(sel >= 0, sel // mq._WORD_BITS, -1)
+        bit = jnp.where(sel >= 0, jnp.left_shift(1, sel % mq._WORD_BITS), 0)
+        return jax.lax.reduce(
+            jnp.where(page[:, None] == g[None, :, None, None], bit[:, None], 0),
+            np.dtype(mq._WORD_DTYPE).type(0),
+            jax.lax.bitwise_or,
+            (3,),
+        )  # [nb, pages_pad, qb]
+
+    def _rows(self, rng, pos, width):
+        # A pooled-indexer row: selected pools' tokens (any order), the open
+        # pool's tail, then -1.
+        pool_len = (pos + 1) // KPOOL
+        n_pick = TOPK // KPOOL
+        picked = np.arange(pool_len)
+        if pool_len > n_pick:
+            picked = rng.choice(pool_len, n_pick, replace=False)
+        toks = (picked[:, None] * KPOOL + np.arange(KPOOL)).reshape(-1)
+        tail = pool_len * KPOOL + np.arange((pos + 1) % KPOOL)
+        row = np.full(width, -1, np.int32)
+        row[: toks.size] = toks
+        row[toks.size : toks.size + tail.size] = tail
+        return row
+
+    def test_matches_per_entry_words(self):
+        from sglang_tpu.attention.pallas import mla_sparse_qblock as mq
+
+        rng = np.random.default_rng(0)
+        # (prefix, q_len) per request: past 512 pools, odd tails, a request
+        # straddling block boundaries, and unused request slots.
+        seqs = [(3001, 700), (0, 130), (17, 61)]
+        num_tokens, max_seqs, ctx, qb = 1024, 8, 10240, 128
+        topk = np.full((num_tokens, W), -1, np.int32)
+        cu, kv = [0], []
+        for prefix, q_len in seqs:
+            for i in range(q_len):
+                topk[cu[-1] + i] = self._rows(rng, prefix + i, W)
+            cu.append(cu[-1] + q_len)
+            kv.append(prefix + q_len)
+        cu += [cu[-1]] * (max_seqs - len(seqs))
+        kv += [0] * (max_seqs - len(seqs))
+        cu, kv = jnp.asarray(cu, jnp.int32), jnp.asarray(kv, jnp.int32)
+        dist = jnp.asarray([0, 0, len(seqs)], jnp.int32)
+
+        num_blocks = (num_tokens + max_seqs * (qb - 1)) // qb
+        _, start, count, _, _, _ = mq._query_blocks(
+            cu, kv, dist, query_block=qb, num_blocks=num_blocks, num_tokens=num_tokens
+        )
+        r = jnp.arange(qb, dtype=jnp.int32)
+        is_row = r[None, :] < count[:, None]
+        tok = jnp.where(is_row, start[:, None] + r[None, :], 0)
+        pages_pad = -(-(-(-ctx // PAGE)) // 8) * 8
+        words = [
+            np.asarray(
+                fn(jnp.asarray(topk), tok, is_row, kpool=KPOOL, pages_pad=pages_pad)
+            )
+            for fn in (self._per_entry_words, mq._selection_words)
+        ]
+        self.assertEqual(words[0].shape, (num_blocks, pages_pad, qb))
+        self.assertTrue(words[0].any())
+        np.testing.assert_array_equal(words[0], words[1])
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ import time
 from typing import List, Optional, Tuple
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.skip_guard import command_for_test_file
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +85,11 @@ def _reset_worker_caches(workdir: str) -> None:
 
 
 def _run_one(
-    filename: str, chip: int, workdir: str, timeout: float
+    filename: str,
+    chip: int,
+    workdir: str,
+    timeout: float,
+    fail_on_all_skipped: bool = False,
 ) -> Tuple[int, float, str]:
     """One file on one chip. Returns (returncode, elapsed, captured output).
 
@@ -96,7 +101,7 @@ def _run_one(
     tic = time.perf_counter()
     with open(log_path, "w") as log:
         process = subprocess.Popen(
-            ["python3", filename, "-f"],
+            command_for_test_file(filename, fail_on_all_skipped),
             stdout=log,
             stderr=subprocess.STDOUT,
             env=_worker_env(chip, workdir),
@@ -147,11 +152,14 @@ def run_files_chip_parallel(
     timeout_per_file: Optional[float] = None,
     derive_timeout,
     continue_on_error: bool = False,
+    fail_on_all_skipped: bool = False,
 ) -> Tuple[bool, List[str], List[Tuple[str, str]], dict]:
     """Run every `chips=1` file across `workers` chip-pinned processes.
 
     Returns (ok, passed, failed, elapsed_by_file). Files that are not
     `chips=1` are not run here -- the caller runs those sequentially.
+    `fail_on_all_skipped` runs each file through skip_guard, as
+    run_unittest_files does.
     """
     pinned = [f for f in files if getattr(f, "chips", 0) == 1]
     if not pinned:
@@ -195,7 +203,7 @@ def run_files_chip_parallel(
             )
             space_launches()
             returncode, elapsed, output = _run_one(
-                test.filename, chip, workdir, timeout
+                test.filename, chip, workdir, timeout, fail_on_all_skipped
             )
             _flush_metrics(test.filename, returncode == 0, elapsed)
             with results_lock:

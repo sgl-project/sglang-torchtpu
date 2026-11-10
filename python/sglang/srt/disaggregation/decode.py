@@ -521,6 +521,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             swa_budget_tokens=swa_allocatable_tokens,
         )
 
+    def _release_cap_anchor(self) -> bool:
+        """Release the least recently used CAP media anchor
+        (SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS), a cache-owned lock, so a
+        reservation that does not fit can be retried; False when the flag is
+        unset or the cache holds none."""
+        return (
+            envs.SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS.get() > 0
+            and hasattr(self.tree_cache, "release_cap_anchor")
+            and self.tree_cache.release_cap_anchor()
+        )
+
     def _release_matched_prefix_lock(self, req: Req) -> None:
         if req.swa_prefix_lock_released:
             self.tree_cache.dec_lock_ref(req.last_node, req.lock_receipt, skip_swa=True)
@@ -1083,12 +1094,29 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 break
 
             full_required, swa_required = self._prealloc_required_tokens(req)
-            if not self._prealloc_reservation_fits(
+            fits = self._prealloc_reservation_fits(
                 full_required,
                 swa_required,
                 full_allocatable_tokens=full_allocatable_tokens,
                 swa_allocatable_tokens=swa_allocatable_tokens,
-            ):
+            )
+            # As in prefill admission, a pass that has resumed nothing releases
+            # CAP media anchors before it gives up, refreshing the budgets.
+            while not fits and not resumed_reqs and self._release_cap_anchor():
+                full_allocatable_tokens = self._allocatable_token_budgets(
+                    count_retracted=False
+                )
+                if swa_allocatable_tokens is not None:
+                    swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
+                        count_retracted=False
+                    )
+                fits = self._prealloc_reservation_fits(
+                    full_required,
+                    swa_required,
+                    full_allocatable_tokens=full_allocatable_tokens,
+                    swa_allocatable_tokens=swa_allocatable_tokens,
+                )
+            if not fits:
                 break
 
             full_len, swa_len = self._prealloc_kv_lens(req)
@@ -1597,12 +1625,36 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             elif swa_allocatable_tokens is not None:
                 swa_required_for_admission = full_required_for_admission
 
-            if not self._prealloc_reservation_fits(
+            fits = self._prealloc_reservation_fits(
                 full_required_for_admission,
                 swa_required_for_admission,
                 full_allocatable_tokens=full_allocatable_tokens,
                 swa_allocatable_tokens=swa_allocatable_tokens,
-            ):
+            )
+            # As in prefill admission, a pass that has preallocated nothing
+            # releases CAP media anchors before it gives up, least recently
+            # used first, refreshing the budgets after each release.
+            while not fits and not preallocated_reqs and self._release_cap_anchor():
+                full_allocatable_tokens = self._allocatable_token_budgets(
+                    retractable_tokens=retractable_tokens,
+                    count_retracted=True,
+                    extra_reserved_reqs=num_device_preallocated,
+                    hicache_reserved_tokens=reserved_restore_tokens,
+                )
+                if swa_allocatable_tokens is not None:
+                    swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
+                        retractable_tokens=retractable_tokens,
+                        retractable_swa_tokens=retractable_swa_tokens,
+                        count_retracted=True,
+                        extra_reserved_reqs=num_device_preallocated,
+                    )
+                fits = self._prealloc_reservation_fits(
+                    full_required_for_admission,
+                    swa_required_for_admission,
+                    full_allocatable_tokens=full_allocatable_tokens,
+                    swa_allocatable_tokens=swa_allocatable_tokens,
+                )
+            if not fits:
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                     self._release_matched_prefix_lock(decode_req.req)
                 break

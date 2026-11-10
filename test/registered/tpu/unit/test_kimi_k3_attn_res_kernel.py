@@ -8,7 +8,6 @@ import contextlib
 import importlib.util
 import itertools
 import unittest
-from collections import defaultdict
 from unittest.mock import patch
 
 import torch
@@ -21,9 +20,8 @@ from sglang.srt.layers.attn_residual import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.plugins.hook_registry import HookRegistry
+from sglang.srt.platforms import current_platform
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.hooks import HOOKS
 from sglang_tpu.hooks import attn_residual as hooks
 
 H = 7168  # Kimi-K3 hidden size
@@ -34,26 +32,14 @@ _HAS_TORCH_TPU = importlib.util.find_spec("torch_tpu") is not None
 
 
 @contextlib.contextmanager
-def _aggregation_hooks(kernel):
-    """The plugin's AROUND hooks on attn_residual._aggregate and
-    _aggregate_fused_add, applied through HookRegistry as on a server with
-    SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL=1, and undone on exit."""
-    prefix = attn_residual.__name__ + "."
-    arounds = [h for h in HOOKS if h[0].startswith(prefix)]
-    with contextlib.ExitStack() as stack:
-        for target, _, _ in arounds:
-            name = target[len(prefix) :]
-            # Re-sets the original now, so exit undoes whatever apply_hooks installs.
-            stack.enter_context(
-                patch.object(attn_residual, name, getattr(attn_residual, name))
-            )
-        stack.enter_context(patch.object(HookRegistry, "_hooks", defaultdict(list)))
-        stack.enter_context(patch.object(HookRegistry, "_patched", set()))
-        stack.enter_context(patch.object(hooks, "_kernel", kernel))
-        for target, hook, hook_type in arounds:
-            HookRegistry.register(target, hook, hook_type)
-        HookRegistry.apply_hooks()
-        assert HookRegistry._patched == {t for t, _, _ in arounds}
+def _aggregation_registered(kernel):
+    """The plugin's aggregation registered with attn_residual, as on a server
+    with SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL=1, and unregistered on exit."""
+    key = current_platform.get_dispatch_key_name()
+    with (
+        patch.object(attn_residual, "_AGGREGATE_IMPLS", {key: hooks.aggregate}),
+        patch.object(hooks, "_kernel", kernel),
+    ):
         yield
 
 
@@ -180,13 +166,13 @@ class TestKimiK3AttnResKernel(CustomTestCase):
                 out_norm,
             )
         )
-        with _aggregation_hooks(self.kernel):
+        with _aggregation_registered(self.kernel):
             if has_addend:
                 # Pending add: hidden_states is the addend, prefix_sum the prefix.
                 normed, prefix_out = ar.forward(b_dev, a_dev, *modules)
             else:
                 normed, prefix_out = ar.forward(a_dev, None, *modules)
-        # Hooks off: the torch reference path this kernel replaces.
+        # Not registered: the torch reference path this kernel replaces.
         torch_path, _ = ar.forward(prefix.to(dev), None, *modules)
         normed, torch_path = normed.cpu(), torch_path.cpu()
         err = (normed.float() - expected.float()).abs().max().item()
@@ -255,7 +241,7 @@ class TestKimiK3AttnResKernel(CustomTestCase):
             return torch._dynamo.lookup_backend("tpu")(gm, example_inputs)
 
         with (
-            _aggregation_hooks(kimi_attn_residual),
+            _aggregation_registered(kimi_attn_residual),
             patch.object(
                 kimi_attn_residual,
                 "cpu_export_jax_op",

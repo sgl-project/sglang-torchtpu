@@ -1,6 +1,8 @@
 """Which backend reads the checkpoint, and why that choice is not a boolean."""
 
 import pytest
+import torch
+from safetensors.torch import save_file
 
 from sglang.multimodal_gen.runtime.loader import weight_readers
 from sglang.multimodal_gen.runtime.loader.weight_readers import (
@@ -8,8 +10,18 @@ from sglang.multimodal_gen.runtime.loader.weight_readers import (
     RunaiStreamerReader,
     SafetensorsMmapReader,
     available_reader_names,
+    safetensors_mmap,
     select_weight_reader,
 )
+from sglang.multimodal_gen.runtime.platforms.interface import Platform
+
+
+class _HostReadPlatform(Platform):
+    """A platform whose device safetensors cannot open tensors on."""
+
+    @classmethod
+    def supports_safetensors_device_load(cls) -> bool:
+        return False
 
 
 class TestCapabilities:
@@ -66,3 +78,44 @@ class TestSelection:
             weight_readers.envs, "SGLANG_USE_RUNAI_MODEL_STREAMER", True
         )
         assert select_weight_reader().name == "runai_streamer"
+
+
+class TestSafetensorsDevicePlacement:
+    @pytest.mark.parametrize(
+        ("platform", "device", "opened", "moved"),
+        [
+            pytest.param(Platform, "cuda:0", ["cuda:0"], [], id="device"),
+            pytest.param(
+                _HostReadPlatform, "cuda:0", ["cpu"], ["cuda:0"], id="host-then-move"
+            ),
+            pytest.param(_HostReadPlatform, "cpu", ["cpu"], [], id="host-target"),
+        ],
+    )
+    def test_open_device(self, monkeypatch, tmp_path, platform, device, opened, moved):
+        path = tmp_path / "w.safetensors"
+        save_file({"w": torch.arange(4.0)}, str(path))
+        actual_opened, actual_moved = [], []
+        real_open = safetensors_mmap.safe_open
+
+        def recording_open(file, framework, device):
+            actual_opened.append(device)
+            return real_open(file, framework=framework, device="cpu")
+
+        def recording_to(self, *args, **kwargs):
+            actual_moved.append(args[0] if args else kwargs.get("device"))
+            return self
+
+        monkeypatch.setattr(safetensors_mmap, "current_platform", platform)
+        monkeypatch.setattr(
+            safetensors_mmap, "host_copies_are_redundant", lambda: False
+        )
+        monkeypatch.setattr(safetensors_mmap, "safe_open", recording_open)
+        monkeypatch.setattr(torch.Tensor, "to", recording_to)
+        weights = dict(
+            SafetensorsMmapReader().iter_weights(
+                [str(path)], device=device, to_cpu=False, show_progress=False
+            )
+        )
+        assert actual_opened == opened
+        assert actual_moved == moved
+        assert weights["w"].tolist() == [0.0, 1.0, 2.0, 3.0]

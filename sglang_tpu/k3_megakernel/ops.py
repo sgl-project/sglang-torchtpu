@@ -45,6 +45,28 @@ def _to_device(a: np.ndarray):
     return _cpu_tensor(a).to("tpu")
 
 
+# expert_down_scale is u8 [moe_layers, slots, lane_inter / 32 = 12, latent]. torch_tpu's default device
+# layout for 12 rows is dims-transposed ({3,1,2,0} T(32,128)(4,1), no padding), while the kernel reads
+# it row-major ({3,2,1,0} T(8,128)(4,1)), so XLA relayouted the whole family in front of every kernel
+# call (13L TP8: 462 MB, 0.50 ms per step; 93L TP32 ~1.1 ms). Stored with 16 rows the default layout is
+# the row-major T(8,128)(4,1) one; the kernel reads the first 12 (StackKernel(down_scale_rows)).
+_DOWN_SCALE_ROW_ALIGN = 16
+
+
+def _down_scale_rows(rows: int) -> int:
+    return -(-rows // _DOWN_SCALE_ROW_ALIGN) * _DOWN_SCALE_ROW_ALIGN
+
+
+def _pad_down_scale(arrays: dict) -> dict:
+    """``arrays`` with ``expert_down_scale [..., rows, latent]`` zero-padded to ``_down_scale_rows``."""
+    a = arrays.get("expert_down_scale")
+    pad = 0 if a is None else _down_scale_rows(a.shape[-2]) - a.shape[-2]
+    if not pad:
+        return arrays
+    widths = [(0, 0)] * (a.ndim - 2) + [(0, pad), (0, 0)]
+    return dict(arrays, expert_down_scale=np.pad(a, widths))
+
+
 def _prefetch_dense(
     model_path: str,
     num_layers: int,
@@ -77,11 +99,16 @@ def _prefetch_dense(
         return sum(pool.map(read, jobs)) / 2**30
 
 
-def _stream_experts_to_device(model_path: str, spec, rank: int, procs: int) -> dict:
+EXPERT_UPLOAD_MODES = ("layer", "whole")
+
+
+def _stream_experts_to_device(
+    model_path: str, spec, rank: int, procs: int, upload: str = "layer"
+) -> dict:
     """Routed-expert families ``[moe_layers, expert_slots, ...]`` on device. Layers stream from
-    ``weights.stream_expert_layers`` (no persistent cache) into one host array per family, which is
-    uploaded whole: under torch_tpu's deferred eager mode, per-layer slice copies into a device
-    tensor materialized as one graph needing a second full-size buffer (13L TP8: 27.6 GB OOM)."""
+    ``weights.stream_expert_layers`` (no persistent cache). ``upload="layer"``: each layer is
+    written into preallocated device arrays as it arrives. ``"whole"``: one host array per family,
+    uploaded once (host peak = the rank's whole expert set plus the upload staging copy)."""
     import torch
 
     from sglang_tpu.k3_megakernel.config import MoeLayout
@@ -91,9 +118,45 @@ def _stream_experts_to_device(model_path: str, spec, rank: int, procs: int) -> d
     layers = range(1, spec.num_layers)
     host = None
     t0 = time.time()
+    if upload == "layer":
+        # A rank holds ~2 layers in host memory instead of its whole expert set (93L TP32: ~58 GB,
+        # plus as much again in the upload staging copy). The update is a jax dynamic_update_slice
+        # with the array donated: torch-side slice copies (``out[n][i].copy_``) leave a view that is
+        # re-materialized on every kernel call (13L: +24 ms/step) and compile to ~3x the array in HBM.
+        from sglang.srt.platforms import current_platform
+
+        out = None
+        for i, arrays in stream_expert_layers(
+            model_path, layout, layers, rank, procs=procs
+        ):
+            arrays = _pad_down_scale(arrays)
+            if out is None:
+                out = {
+                    n: torch.empty(
+                        (len(layers),) + a.shape,
+                        dtype=_cpu_tensor(a[:0]).dtype,
+                        device="tpu",
+                    )
+                    for n, a in arrays.items()
+                }
+            idx = torch.tensor([i], dtype=torch.int32, device="tpu")
+            for n, a in arrays.items():
+                out[n] = _layer_update_op()(out[n], _to_device(a), idx)
+            torch.accelerator.synchronize()
+            if rank == 0 and ((i + 1) % 10 == 0 or i + 1 == len(layers)):
+                free, _ = current_platform.get_available_memory()
+                logger.info(
+                    "K3 megakernel: experts of %d/%d MoE layers on device (%.0fs, HBM free %.1f GiB).",
+                    i + 1,
+                    len(layers),
+                    time.time() - t0,
+                    free / 2**30,
+                )
+        return out
     for i, arrays in stream_expert_layers(
         model_path, layout, layers, rank, procs=procs
     ):
+        arrays = _pad_down_scale(arrays)
         if host is None:
             host = {
                 n: np.empty((len(layers),) + a.shape, a.dtype)
@@ -115,6 +178,26 @@ def _stream_experts_to_device(model_path: str, spec, rank: int, procs: int) -> d
     return out
 
 
+_LAYER_UPDATE_OP = None
+
+
+def _layer_update_op():
+    """``op(buf, layer, idx) -> buf`` with ``buf[idx[0]] = layer``, ``buf`` donated (in place)."""
+    global _LAYER_UPDATE_OP
+    if _LAYER_UPDATE_OP is None:
+        import jax
+
+        from sglang_tpu.pallas_jax_op import cpu_export_jax_op
+
+        def _update(buf: jax.Array, layer: jax.Array, idx: jax.Array) -> jax.Array:
+            return jax.lax.dynamic_update_slice_in_dim(buf, layer[None], idx[0], axis=0)
+
+        _LAYER_UPDATE_OP = cpu_export_jax_op(
+            "sglang_tpu_k3mk::expert_layer_update", _update, donate_argnums=(0,)
+        )
+    return _LAYER_UPDATE_OP
+
+
 # HBM left for sglang after the megakernel weights: non-layer weights (embed / lm_head shards, vision
 # tower), the bs=1 KV and mamba pools, activations. Arbitrary; 13L TP8 used ~1 GB for the pools.
 _HBM_MARGIN = 6 << 30
@@ -127,9 +210,14 @@ def _check_hbm(spec, dense_bytes: int, rank: int) -> None:
     from sglang_tpu.k3_megakernel.weights import _expert_family_shapes
 
     layout = MoeLayout(spec.dims, spec.topo, replicas=spec.relax.expert_replicas)
+    shapes = _expert_family_shapes(layout, 1, spec.num_layers - 1)
+    shape, dt = shapes["expert_down_scale"]
+    shapes["expert_down_scale"] = (
+        shape[:-2] + (_down_scale_rows(shape[-2]), shape[-1]),
+        dt,
+    )
     experts = sum(
-        int(np.prod(shape)) * np.dtype(dt).itemsize
-        for shape, dt in _expert_family_shapes(layout, 1, spec.num_layers - 1).values()
+        int(np.prod(shape)) * np.dtype(dt).itemsize for shape, dt in shapes.values()
     )
     free, total = current_platform.get_available_memory()
     need = dense_bytes + experts
@@ -204,6 +292,13 @@ SERVING_KERNEL_OPTIONS = frozenset(
         "mla_async_write",
         "mla_kv_window",
         "mla_kv_block_pages",
+        "dsa_select",
+        "dsa_contiguous",
+        "dsa_slots",
+        "dsa_early",
+        "dsa_sel_bits",
+        "dsa_compact",
+        "mla_score_f32",
         "kda_mxu",
         "kda_fast_core",
         "gather_bf16",
@@ -222,11 +317,37 @@ SERVING_KERNEL_OPTIONS = frozenset(
         "moe_up_fill",
         "prefetch_latent_up",
         "moe_up_tree",
+        "moe_single_rows",
+        "moe_down_dequant",
     }
 )
 
-# Tokens per rows-mode prefill block (StackKernel(verify_rows=8, verify_mode="rows")).
+# Verify rows run every expert's down projection as the decode kernel does (``down_dot``). With
+# the kernel default an expert picked by several rows takes the dequantized M=R dot instead, a
+# different f32 sum, so a row's MoE output depended on whether a LATER row (an unverified draft)
+# picked the same expert: the verify was neither causal nor run-to-run deterministic. Costs about
+# 7-10 us per MoE layer (13L TP8); KERNEL_OPTS ``moe_down_dequant=True`` restores the old path.
+# Prefill blocks keep the default: all their rows are prompt tokens.
+_VERIFY_ROWS_DEFAULTS = {"moe_down_dequant": False}
+
+# Smallest rows-mode prefill block (StackKernel(verify_rows=8, verify_mode="rows")); the block is a
+# multiple of it.
 _PREFILL_BLOCK = 8
+
+
+def _prefill_block() -> int:
+    """Tokens per rows-mode prefill block (SGLANG_TPU_K3_MEGAKERNEL_PREFILL_BLOCK). Each block runs
+    the whole stack, so a chunk costs (tokens / block) block passes, and a pass costs much less
+    than twice as much when its rows double."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    block = tpu_envs.SGLANG_TPU_K3_MEGAKERNEL_PREFILL_BLOCK.get()
+    if block < _PREFILL_BLOCK or block % _PREFILL_BLOCK:
+        raise ValueError(
+            "SGLANG_TPU_K3_MEGAKERNEL_PREFILL_BLOCK must be a positive multiple of "
+            f"{_PREFILL_BLOCK} (got {block})"
+        )
+    return block
 
 
 def prefill_rows(chunked_prefill_size: int | None, prefill_mode: str) -> int:
@@ -242,10 +363,11 @@ def prefill_rows(chunked_prefill_size: int | None, prefill_mode: str) -> int:
         raise ValueError(
             f"SGLANG_TPU_K3_MEGAKERNEL_PREFILL must be auto, rows or loop (got {prefill_mode!r})"
         )
-    if prefill_mode == "rows" and chunked_prefill_size % _PREFILL_BLOCK:
+    block = _prefill_block()
+    if prefill_mode == "rows" and chunked_prefill_size % block:
         raise ValueError(
             f"SGLANG_TPU_K3_MEGAKERNEL_PREFILL=rows needs --chunked-prefill-size a multiple of "
-            f"{_PREFILL_BLOCK} (got {chunked_prefill_size})"
+            f"{block} (got {chunked_prefill_size})"
         )
     return chunked_prefill_size
 
@@ -302,9 +424,13 @@ class K3MegakernelRuntime:
         kernel_opts: str,
         expert_procs: int,
         load_slots: int,
+        expert_upload: str = "layer",
+        dsa_layers: tuple = (),
+        capacity: int = 0,
     ):
         from sglang_tpu.k3_megakernel.config import (
             K3MK_COLLECTIVE_ID,
+            MoeLayout,
             Relax,
             Topology,
         )
@@ -318,12 +444,28 @@ class K3MegakernelRuntime:
         self.topo = Topology(hosts=tp_size // lanes, lanes=lanes)
         self.rank, self.world = tp_rank, tp_size
         self.spec = StackSpec(
-            self.topo, num_layers, tuple(mla_layers), relax=Relax.from_env()
+            self.topo,
+            num_layers,
+            tuple(mla_layers),
+            relax=Relax.from_env(),
+            dsa_layers=tuple(dsa_layers),
         )
+        _check_expert_block(model_path, self.spec, tp_rank)
         self.opts = kernel_options(kernel_opts, allowed=SERVING_KERNEL_OPTIONS)
+        # K3.1 (DSA): the kernel owns its MLA latent and index-key pools, ``capacity`` tokens with an
+        # identity page table, as the standalone engine: sglang's sparse backend keeps a split fp8
+        # pool the kernel cannot read. One request at a time without radix reuse, so a request's
+        # cache always starts at token 0.
+        self.capacity = capacity if self.spec.dsa_layers else 0
+        if self.capacity:
+            self.opts.setdefault("dsa_capacity", self.capacity)
         self.prefill_mode, self.verify_mode = prefill_mode, verify_mode
         # The sglang path embeds and samples itself.
         self.opts.update(fused_head=False, collective_id=K3MK_COLLECTIVE_ID)
+        # The expert_down_scale family is uploaded padded (see _pad_down_scale).
+        self.opts["down_scale_rows"] = _down_scale_rows(
+            MoeLayout(self.spec.dims, self.topo).lane_inter // 32
+        )
         # Kernel variants, built on first use: (kind, captured layers) -> index into ``self.variants``
         # (the custom op's ``variant`` argument). Kinds: "decode", "prefill", "verify".
         self.variants: list[_Variant] = []
@@ -334,6 +476,8 @@ class K3MegakernelRuntime:
             if prefill_rows > 1
             else 0
         )
+        # A prefill block writes latent rows up to kv0 + block - 1 (its padding rows included).
+        self._kv_tail = max(_PREFILL_BLOCK, self.prefill_block)
         self.names = input_names(self.spec)
         self.kda_layers, self.mla_layers = self.spec.kda_layers, self.spec.mla_layers
 
@@ -349,12 +493,12 @@ class K3MegakernelRuntime:
             self.weights = {k: _to_device(v[0]) for k, v in weights.items()}
             del weights
             t2 = time.time()
-            # Each rank holds its whole expert set in host memory before the upload (93L TP32: ~58 GB);
-            # at most ``load_slots`` ranks of a host do so at once.
+            # At most ``load_slots`` ranks of a host read and upload experts at once (with
+            # ``expert_upload="whole"`` each holds its whole expert set in host memory: 93L TP32 ~58 GB).
             with _host_slot(tp_rank % lanes, load_slots):
                 self.weights.update(
                     _stream_experts_to_device(
-                        model_path, self.spec, tp_rank, expert_procs
+                        model_path, self.spec, tp_rank, expert_procs, expert_upload
                     )
                 )
             self.tables = _to_device(np.asarray(self.spec.tables(), np.int32))
@@ -363,6 +507,9 @@ class K3MegakernelRuntime:
         self.index = len(_RUNTIMES) - 1
         _register_op()
         self.prepare()
+        self.own_pools, self.own_pages = {}, None
+        if self.capacity:
+            self._alloc_own_pools()
         logger.info(
             "K3 megakernel: rank %d/%d, %s, %d layers (MLA %s), relax %s, kernel options %s, prefill "
             "rows %d (block %d); weights on device: prefetch %.1f GiB %.0fs, dense %.0fs, experts %.0fs.",
@@ -380,6 +527,31 @@ class K3MegakernelRuntime:
             t2 - t1,
             time.time() - t2,
         )
+
+    def _alloc_own_pools(self) -> None:
+        import torch
+
+        from sglang_tpu.k3_megakernel.model_io import page_table, state_shapes
+
+        shapes = state_shapes(self.variants[0].kernel, self.spec, self.capacity)
+        with _eager_now():
+            for name, (shape, dtype) in shapes.items():
+                if name.startswith(("mla_cache_", "mla_idx_")):
+                    self.own_pools[name] = torch.zeros(
+                        shape, dtype=_torch_dtype(dtype), device="tpu"
+                    )
+            self.own_pages = _to_device(page_table(self.capacity))
+
+    def _bound_kv_len(self, kv_len, lo):
+        """Kernel-owned pools: ``kv_len`` within ``[lo, capacity - tail]`` (tail: the largest row
+        block, at least 8). A real request's lengths
+        already are (``--context-length`` sizes the pools; ``lo`` is the fewest tokens its rows need),
+        so this only changes a compile-warmup dummy batch, whose length can be sglang's whole page
+        table (walking past the kernel's identity table) or shorter than its rows (writing before
+        token 0). The warmup's outputs are discarded."""
+        if not self.capacity:
+            return kv_len
+        return kv_len.clamp(max=self.capacity - self._kv_tail).clamp(min=lo)
 
     # ----- the exported calls -----
     def prepare(self, captures: tuple = (), verify_rows: int = 0) -> None:
@@ -425,7 +597,7 @@ class K3MegakernelRuntime:
                     verify_rows=rows,
                     verify_mode="loop" if loop else "rows",
                     **cap,
-                    **self.opts,
+                    **{**_VERIFY_ROWS_DEFAULTS, **self.opts},
                 )
                 block = 0 if loop else rows
             self._variant_index[key] = len(self.variants)
@@ -512,10 +684,13 @@ class K3MegakernelRuntime:
         backend = get_attn_backend()
         full_md = backend.full_attn_backend.forward_metadata
         lin = backend.linear_attn_backend
-        pages = full_md.page_indices.to(torch.int32)
-        pad = (-pages.shape[0]) % _PAGE_TABLE_ALIGN
-        if pad:
-            pages = F.pad(pages, (0, pad))
+        if self.own_pages is not None:
+            pages = self.own_pages
+        else:
+            pages = full_md.page_indices.to(torch.int32)
+            pad = (-pages.shape[0]) % _PAGE_TABLE_ALIGN
+            if pad:
+                pages = F.pad(pages, (0, pad))
         mode = forward_batch.forward_mode
         captures = tuple(sorted(model.dspark_layers_to_capture or ()))
         kv_len = full_md.kv_lens[0].to(torch.int32)
@@ -539,9 +714,11 @@ class K3MegakernelRuntime:
         if mode.is_decode():
             # DSpark serves only extend and verify; a decode (warmup) gets zero captures.
             variant = self.variant("decode", ())
+            kv_len = self._bound_kv_len(kv_len, 1)
             meta = torch.stack([kv_len, read, base, zero + 1, zero, zero])
         elif mode.is_target_verify():
             variant = self.variant("verify", captures, t)
+            kv_len = self._bound_kv_len(kv_len, t)  # row 0 at kv_len - t + 1 >= 1
             meta = torch.stack([kv_len - t + 1, read, base, zero + t, zero + 1, zero])
             if not self.variants[variant].block:
                 x0 = x0[:, None]
@@ -556,7 +733,8 @@ class K3MegakernelRuntime:
                 .to(torch.int32)
                 .clamp(max=rows)
             )
-            prefix = kv_len - n
+            kv_len = self._bound_kv_len(kv_len, n)
+            prefix = (kv_len - n).clamp(min=0)
             # A fresh request starts KDA from zero, as sglang's has_initial_state = prefix > 0.
             meta = torch.stack(
                 [prefix + 1, read, base, n, zero, (prefix == 0).to(torch.int32)]
@@ -571,8 +749,11 @@ class K3MegakernelRuntime:
             cache = pools.mamba2_layer_cache(layer)
             state[f"kda_conv_{k}"] = cache.conv[0]
             state[f"kda_rec_{k}"] = cache.temporal
-        for j, layer in enumerate(self.mla_layers):
-            state[f"mla_cache_{j}"] = kv_pool.get_fused_kv_buffer(layer)
+        if self.own_pools:
+            state.update(self.own_pools)
+        else:
+            for j, layer in enumerate(self.mla_layers):
+                state[f"mla_cache_{j}"] = kv_pool.get_fused_kv_buffer(layer)
         inputs = dict(
             tables=self.tables, meta=meta, pages=pages, x0=x0, **self.weights, **state
         )
@@ -651,6 +832,30 @@ def _check_pools(kernel, shapes: dict) -> None:
         )
 
 
+def _check_expert_block(model_path: str, spec, rank: int) -> None:
+    """An EP-local checkpoint (one expert block per host) must hold this rank's kernel host's
+    experts: kernel host = tp_rank // lanes = sglang node_rank, so the shard must follow node_rank."""
+    from sglang_tpu.k3_megakernel.model_io import local_expert_block
+
+    hosts = spec.topo.hosts
+    block = local_expert_block(
+        model_path, spec.dims.num_experts // hosts, spec.dims.num_experts
+    )
+    if block is None:
+        return
+    host = rank // spec.topo.lanes
+    if block != host:
+        raise ValueError(
+            f"K3 megakernel rank {rank}: EP-local checkpoint {model_path} holds expert block {block}, "
+            f"but this rank is kernel host {host} (= sglang node_rank)"
+        )
+    if spec.relax.expert_replicas and hosts > 1:
+        raise ValueError(
+            "K3 megakernel: expert_replicas needs another host's experts, which an EP-local "
+            "checkpoint does not hold"
+        )
+
+
 def _fit_rows(x, t: int):
     import torch.nn.functional as F
 
@@ -695,12 +900,12 @@ def _register_op() -> None:
 
 
 def _prefill_kernel(spec, rows: int, opts: dict, mode: str):
-    """(kernel, rows per block) for prefill chunks of ``rows`` tokens. ``mode``: "rows" (blocks of 8 tokens
-    through every stage), "loop" (one stack pass per token), "auto" (rows when this kernel has it, else loop)."""
+    """(kernel, rows per block) for prefill chunks of ``rows`` tokens. ``mode``: "rows" (blocks of
+    SGLANG_TPU_K3_MEGAKERNEL_PREFILL_BLOCK tokens through every stage), "loop" (one stack pass per token), "auto" (rows when this kernel has it, else loop)."""
     from sglang_tpu.k3_megakernel.kernel.stack import StackKernel
 
     params = inspect.signature(StackKernel.__init__).parameters
-    block = _PREFILL_BLOCK
+    block = _prefill_block()
     can_rows = "prefill_blocks" in params and rows % block == 0
     if mode == "rows" and not can_rows:
         raise ValueError(
@@ -726,6 +931,18 @@ def _barrier() -> None:
     torch.distributed.barrier(group=get_tp_group().cpu_group)
 
 
+def _torch_dtype(jax_dtype):
+    import jax.numpy as jnp
+    import torch
+
+    return {
+        jnp.dtype(jnp.bfloat16): torch.bfloat16,
+        jnp.dtype(jnp.float32): torch.float32,
+        jnp.dtype(jnp.int32): torch.int32,
+        jnp.dtype(jnp.uint8): torch.uint8,
+    }[jnp.dtype(jax_dtype)]
+
+
 def _jax_dtype(torch_dtype):
     import jax.numpy as jnp
     import torch
@@ -748,9 +965,12 @@ def build_runtime(causal_lm, *, owns_weights: bool = True) -> K3MegakernelRuntim
     )
     from sglang.srt.runtime_context import get_model, get_parallel, get_schedule
     from sglang_tpu.envs import envs as tpu_envs
+    from sglang_tpu.k3_megakernel.model_io import dsa_layers
 
     model = causal_lm.model
     num_layers = len(model.layers)
+    model_path = get_model().model_path
+    dsa = dsa_layers(num_layers, model_path)
     # From the config: with the megakernel owning the weights the layers are placeholders.
     mla = tuple(i for i in range(num_layers) if not model.config.is_kda_layer(i))
     prefill_mode = tpu_envs.SGLANG_TPU_K3_MEGAKERNEL_PREFILL.get()
@@ -759,8 +979,14 @@ def build_runtime(causal_lm, *, owns_weights: bool = True) -> K3MegakernelRuntim
         raise ValueError(
             f"SGLANG_TPU_K3_MEGAKERNEL_EXPERT_LOAD_SLOTS must be >= 1 (got {load_slots})"
         )
+    expert_upload = tpu_envs.SGLANG_TPU_K3_MEGAKERNEL_EXPERT_UPLOAD.get()
+    if expert_upload not in EXPERT_UPLOAD_MODES:
+        raise ValueError(
+            f"SGLANG_TPU_K3_MEGAKERNEL_EXPERT_UPLOAD must be one of {EXPERT_UPLOAD_MODES} "
+            f"(got {expert_upload!r})"
+        )
     return K3MegakernelRuntime(
-        model_path=get_model().model_path,
+        model_path=model_path,
         num_layers=num_layers,
         mla_layers=mla,
         tp_rank=get_tensor_model_parallel_rank(),
@@ -776,4 +1002,23 @@ def build_runtime(causal_lm, *, owns_weights: bool = True) -> K3MegakernelRuntim
         kernel_opts=tpu_envs.SGLANG_TPU_K3_MEGAKERNEL_KERNEL_OPTS.get(),
         expert_procs=tpu_envs.SGLANG_TPU_K3_MEGAKERNEL_EXPERT_LOAD_PROCS.get(),
         load_slots=load_slots,
+        expert_upload=expert_upload,
+        dsa_layers=dsa,
+        capacity=_dsa_capacity(get_model().context_length) if dsa else 0,
     )
+
+
+# The kernel's own DSA pools cover the context in whole 16-page (2048-token) blocks.
+_CAPACITY_ALIGN = 2048
+
+
+def _dsa_capacity(context_length: int | None) -> int:
+    """Tokens of the kernel-owned pools: the context plus one verify or prefill block, in whole
+    blocks."""
+    if not context_length or context_length <= 0:
+        raise ValueError(
+            "SGLANG_TPU_ENABLE_K3_DECODE_MEGAKERNEL=1 on a DSA model (K3.1) needs --context-length "
+            "(the kernel sizes its own KV pools by it)"
+        )
+    need = context_length + max(16, _prefill_block())
+    return -(-need // _CAPACITY_ALIGN) * _CAPACITY_ALIGN

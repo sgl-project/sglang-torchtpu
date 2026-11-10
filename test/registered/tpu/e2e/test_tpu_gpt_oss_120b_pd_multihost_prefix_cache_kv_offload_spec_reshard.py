@@ -143,6 +143,8 @@ EXTRA_LAUNCH_ENV: Dict[str, str] = {
     # decode rank is fed by more than one prefill rank, and raises rather than
     # falling back when it cannot -- so there is no silent symmetric path.
     "SGLANG_RAIDEN_RESHARD": "1",
+    # Raiden's reshard push needs a host buffer per layer.
+    "SGLANG_TPU_RAIDEN_STAGING_LAYERS": "0",
 }
 
 # launch_server.sh turns DP_SIZE>1 into --dp-size + --enable-dp-attention (plus
@@ -585,8 +587,7 @@ def run_cache_offload_spec_probe(base_url: str, flush_url: str) -> None:
     if filler_tokens <= 0:
         raise AssertionError("cannot size cache churn from a zero-token filler")
     # This spec profile deliberately uses a tiny 8K device pool. Churning 2x
-    # that pool (as the non-spec test does with its much larger host tier) can
-    # evict the target from both tiers before we probe it. Cross device
+    # that pool can evict the target from both tiers before we probe it. Cross device
     # capacity by the minimum measured amount instead: enough to force the
     # target out of HBM while retaining its host-tier copy.
     target_cached_tokens = device_hit["device_cached_tokens"]

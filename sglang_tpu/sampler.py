@@ -10,8 +10,9 @@ from typing import NamedTuple, Optional
 
 import torch
 
-from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.sampler import (
+    SYNC_TOKEN_IDS_ACROSS_TP,
     Sampler,
     _SamplingMaskCapture,
     _select_sampling_mask_rows,
@@ -21,6 +22,7 @@ from sglang.srt.layers.sampler import (
 from sglang.srt.model_executor.forward_batch_info import LogitsOutputMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang_tpu.envs import envs
 from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
 from sglang_tpu.top_k import PallasDistributedTopKConfig
 
@@ -289,10 +291,10 @@ def distributed_top_k_for_batch(
 def select_logits_output_mode(forward_batch, model) -> LogitsOutputMode:
     """Select full-vocabulary logits or distributed TopK candidates."""
 
-    # Model capability negotiation uses a CPU collective, which speculative
-    # forwards never need because they require full-vocabulary logits.
+    # Speculative forwards keep the mode their worker set (FULL_VOCAB by default);
+    # a worker asking for candidates negotiated the width at init, outside any trace.
     if _is_speculative_batch(forward_batch):
-        return LogitsOutputMode.FULL_VOCAB
+        return forward_batch.logits_output_mode
     candidate_width = distributed_top_k_candidate_width_for_model(model)
     if candidate_width is None:
         return LogitsOutputMode.FULL_VOCAB
@@ -558,6 +560,23 @@ class TpuSampler(Sampler):
         batch_next_token_ids = batch_next_token_ids.to(torch.int64)
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
         return batch_next_token_ids
+
+    def _sync_token_ids_across_tp(
+        self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
+    ):
+        if not (SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars):
+            return
+        parallel = get_parallel()
+        if is_dp_attention_enabled():
+            # A TPU subgroup collective launches on every device of the slice, and
+            # only some DP groups hold grammar requests: a grammar-only sync hangs.
+            if not SYNC_TOKEN_IDS_ACROSS_TP:
+                return
+            tp_group = parallel.attn_tp_group
+        else:
+            tp_group = parallel.tp_group
+        # Broadcast, not MIN all-reduce: TPU has no MIN all-reduce.
+        tp_group.broadcast(batch_next_token_ids, src=0)
 
     def _sample_from_probs(
         self,

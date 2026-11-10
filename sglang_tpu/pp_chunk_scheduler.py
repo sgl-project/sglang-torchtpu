@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import (
     MAX_PREFIX_MATCHED_WAITING_REQS,
@@ -20,6 +19,7 @@ from sglang.srt.managers.schedule_policy import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang_tpu.envs import envs
 from sglang_tpu.pp_attention_capacity import (
     attention_schedule_capacity,
 )

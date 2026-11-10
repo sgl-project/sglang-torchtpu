@@ -5,6 +5,8 @@
 # It owns the frozen snapshot bank [T, NB, H] and the valid-row counter, and
 # dispatches each aggregation point (score rows → softmax → weighted sum →
 # RMSNorm) by hardware capability:
+#   backend — a platform kernel registered with register_aggregate_impl
+#           (the TPU plugin's); tried first, and may decline a call.
 #   fast  — warp-specialized TMA kernel: cp.async.bulk producer +
 #           online-softmax consumers over a double-buffered chunk ring, out
 #           norm fused, per-nvb tuned launch config, one persistent CTA per
@@ -16,7 +18,7 @@
 # aggregate_stream_torch is the eager reference (tests, TPU and the
 # H % _BLOCK_H != 0 shape fallback of aggregate_stream).
 
-from typing import Optional
+from typing import Optional, Protocol
 
 import torch
 import triton
@@ -63,6 +65,66 @@ def _use_hip_fused(hidden_size: int, nvb: int) -> bool:
 
         _HIP_SHAPE_GATE = supports_attn_res_hip
     return _HIP_SHAPE_GATE(hidden_size, nvb)
+
+
+class AggregateImpl(Protocol):
+    def __call__(
+        self,
+        prefix_a: torch.Tensor,
+        prefix_b: Optional[torch.Tensor],
+        bank: torch.Tensor,
+        nvb: int,
+        score_proj: ReplicatedLinear,
+        score_norm: RMSNorm,
+        out_norm: RMSNorm,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Return (normed, prefix) with prefix = prefix_a + prefix_b (prefix_a
+        when prefix_b is None), or None to use the built-in paths.
+
+        Never asked for a fused bank write: that stays with the CUDA/HIP fast
+        paths.
+        """
+        ...
+
+
+_AGGREGATE_IMPLS: dict[str, AggregateImpl] = {}
+
+
+def register_aggregate_impl(platform_key: str, impl: AggregateImpl) -> None:
+    """Register a platform's aggregation kernel before tracing.
+
+    The key is SRTPlatform.get_dispatch_key_name(). Re-registering the same
+    implementation is harmless; competing implementations are an error.
+    """
+    if not platform_key:
+        raise ValueError("Attention-residual platform key must not be empty")
+    previous = _AGGREGATE_IMPLS.get(platform_key)
+    if previous is not None and previous is not impl:
+        raise ValueError(
+            f"Attention-residual aggregation already registered for {platform_key}"
+        )
+    _AGGREGATE_IMPLS[platform_key] = impl
+
+
+def _backend_aggregate(
+    prefix_a: torch.Tensor,
+    prefix_b: Optional[torch.Tensor],
+    bank: torch.Tensor,
+    nvb: int,
+    score_proj: ReplicatedLinear,
+    score_norm: RMSNorm,
+    out_norm: RMSNorm,
+    write_bank_row: bool,
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """The registered platform kernel's (normed, prefix), or None."""
+    if not _AGGREGATE_IMPLS or write_bank_row:
+        return None
+    from sglang.srt.platforms import current_platform
+
+    impl = _AGGREGATE_IMPLS.get(current_platform.get_dispatch_key_name())
+    if impl is None:
+        return None
+    return impl(prefix_a, prefix_b, bank, nvb, score_proj, score_norm, out_norm)
 
 
 def get_cw(
@@ -374,6 +436,18 @@ def _aggregate_fused_add(
     """Aggregation point with a pending upstream residual add: materialize
     prefix = prefix_a + prefix_b, then aggregate. Returns (normed, prefix).
     write_bank_row rides _aggregate (fast path only)."""
+    backend = _backend_aggregate(
+        prefix_a,
+        prefix_b,
+        bank,
+        nvb,
+        score_proj,
+        score_norm,
+        out_norm,
+        write_bank_row,
+    )
+    if backend is not None:
+        return backend
     if _use_hip_fused(prefix_a.shape[1], nvb):
         # The hip kernel reads the prefix row anyway, so the add folds into it.
         return _aggregate_hip(
@@ -419,6 +493,18 @@ def _aggregate(
     """
     if prefix_sum.shape[0] == 0:
         return prefix_sum
+    backend = _backend_aggregate(
+        prefix_sum,
+        None,
+        bank,
+        nvb,
+        score_proj,
+        score_norm,
+        out_norm,
+        write_bank_row,
+    )
+    if backend is not None:
+        return backend[0]
     if _use_fast(prefix_sum.shape[1]):
         return _aggregate_fast(
             prefix_sum,

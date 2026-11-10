@@ -289,6 +289,9 @@ class LogitsProcessorOutput:
 
     # Sampled draft token IDs when draft sampling is fused into draft model forward
     next_draft_tokens: Optional[torch.Tensor] = None
+    # DFlash2 candidate ids [bs, gamma, K] and scores [bs, gamma, K, K] from the
+    # draft forward, so sampled drafting reuses them instead of rebuilding.
+    next_draft_lattice: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
@@ -372,6 +375,9 @@ class LogitsMetadata:
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
     sample_indices_cpu: Optional[List[int]] = None
     input_logprob_indices_cpu: Optional[List[int]] = None
+    # Optional pruned-row offsets where the input-logprob chunking also splits.
+    # Core never sets them (a platform hook may); None keeps the uniform split.
+    input_logprob_chunk_cuts_cpu: Optional[List[int]] = None
     token_ids_logprobs: Optional[List[List[int]]] = None
 
     # logits and logprobs post processing

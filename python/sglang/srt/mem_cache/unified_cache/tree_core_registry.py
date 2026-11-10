@@ -58,6 +58,18 @@ def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
         and ComponentType.SWA in params.tree_components
     ):
         return "SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST requires the Python TreeCore"
+    if (
+        envs.SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS.get()
+        and params.tree_components is not None
+        and ComponentType.SWA in params.tree_components
+    ):
+        return "SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS requires the Python TreeCore"
+    if (
+        envs.SGLANG_OPT_SWA_CAP.get()
+        and params.tree_components is not None
+        and ComponentType.SWA in params.tree_components
+    ):
+        return "SGLANG_OPT_SWA_CAP requires the Python TreeCore"
     if sys.platform != "linux":
         return "the Rust TreeCore supports Linux only"
     from sglang.srt.rust_extensions.torch_build import (

@@ -108,12 +108,12 @@ class TestPallasMoeCallContract(CustomTestCase):
         with (
             patch.object(fused_moe_op, "_build_fused_moe_op", return_value=op),
             patch.object(
-                fused_moe_op.envs.SGLANG_TPU_FUSED_MOE_SC_GATHER,
+                fused_moe_op.tpu_envs.SGLANG_TPU_FUSED_MOE_SC_GATHER,
                 "get",
                 return_value=True,
             ),
             patch.object(
-                fused_moe_op.envs.SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD,
+                fused_moe_op.tpu_envs.SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD,
                 "get",
                 return_value=128,
             ),

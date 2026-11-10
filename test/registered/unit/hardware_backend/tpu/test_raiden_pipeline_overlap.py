@@ -17,13 +17,13 @@ import pytest
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.disaggregation.raiden import pipeline as pl
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 from sglang_tpu.disaggregation.raiden.host_pool import StagingAdmission
 from sglang_tpu.disaggregation.raiden.sender import RaidenKVSender
 from sglang_tpu.disaggregation.raiden.serde import MessageTag
+from sglang_tpu.envs import envs
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -162,6 +162,7 @@ def make(mode, pp_rank, pp_size, controller, bus, name, heads, stage_parts=False
         full_layer_ids=[2 * pp_rank + 1 if mode == DisaggregationMode.PREFILL else 1],
         swa_layer_ids=[2 * pp_rank if mode == DisaggregationMode.PREFILL else 0],
         num_draft_full=0,
+        num_hidden_full=0,
         num_draft_swa=0,
     )
     if mode == DisaggregationMode.DECODE:  # the decode owns every layer

@@ -83,6 +83,8 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
     get_eviction_strategy,
+    last_hash_value,
+    prefix_hash_values,
     split_node_hash_value,
 )
 
@@ -131,6 +133,12 @@ class UnifiedTreeNode:
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[list[str]] = None
         self.hit_count = 0
+        # Offset in key where generated output starts, as the inserting request
+        # saw it; a later insert that reads the node as prompt moves or clears it.
+        # None if the node holds only prompt tokens.
+        self.output_offset: Optional[int] = None
+        # output_offset as stamped when the node was created; never re-read.
+        self.created_output_offset: Optional[int] = None
         # T-LRU only (0 under other policies): tokens root -> self, and the
         # branch's high-water depth, which survives tail trimming.
         self._tlru_cached_prefix_len = 0
@@ -178,16 +186,10 @@ class UnifiedTreeNode:
         return self.last_access_time < other.last_access_time
 
     def get_last_hash_value(self) -> Optional[str]:
-        if self.hash_value is None or len(self.hash_value) == 0:
-            return None
-        return self.hash_value[-1]
+        return last_hash_value(self)
 
     def get_prefix_hash_values(self, node: UnifiedTreeNode) -> list[str]:
-        chunks = []
-        while node is not None and node.hash_value is not None:
-            chunks.append(node.hash_value)
-            node = node.parent
-        return [value for chunk in reversed(chunks) for value in chunk]
+        return prefix_hash_values(node)
 
 
 def _set_tlru_lens_and_raise_history(
@@ -1317,6 +1319,18 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if action is not None:
                 step_actions.append(action)
         node.priority = max(node.priority, state.priority)
+        if node.output_offset is not None:
+            # This insert reads the node's tokens as prompt up to its own output.
+            output_start = state.params.output_start
+            prompt_end = (
+                len(node.key)
+                if output_start is None
+                else output_start - state.total_prefix_length
+            )
+            if prompt_end >= len(node.key):
+                node.output_offset = None
+            else:
+                node.output_offset = max(node.output_offset, prompt_end)
 
         if node.evicted:
             self._unevict_node_on_insert(
@@ -1406,6 +1420,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 session_id=state.params.session_id,
                 rotation_base=state.params.rotation_base,
             )
+            output_start = state.params.output_start
+            if output_start is not None and output_start < (
+                state.total_prefix_length + len(state.key)
+            ):
+                offset = max(0, output_start - state.total_prefix_length)
+                state.target_node.output_offset = offset
+                state.target_node.created_output_offset = offset
             state.is_new_leaf = True
         else:
             state.target_node = state.node
@@ -1498,6 +1519,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # The rotation base is constant along a chain (position-page P keeps
         # owner (b + P) % N on both sides of the split).
         new_node.rotation_base = child.rotation_base
+        for attr in ("output_offset", "created_output_offset"):
+            offset = getattr(child, attr)
+            if offset is None:
+                continue
+            if split_len <= offset:
+                setattr(child, attr, offset - split_len)
+            else:
+                setattr(new_node, attr, offset)
+                setattr(child, attr, 0)
 
         child.parent = new_node
         child.key = child.key[split_len:]

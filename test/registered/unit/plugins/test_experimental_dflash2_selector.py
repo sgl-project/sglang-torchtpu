@@ -13,10 +13,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.experimental.models.dflash2 import (
     build_lattice,
+    dense_logits,
+    lattice_path_rows,
     sample_draft_tokens,
     sample_drafts,
     walk_lattice,
+    walk_lattice_sampled,
 )
+from sglang_tpu.experimental.speculative.spec_ops import STREAM_DRAFT, hash_uniforms
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -95,7 +99,30 @@ class TestExperimentalDflash2Selector(CustomTestCase):
         )
         torch.testing.assert_close(tokens, core_tokens)
 
-    def test_dense_logits_carry_core_q(self):
+    def test_sampled_walk_matches_core_sample_path(self):
+        with torch.no_grad():
+            ids, scores = _core_lattice(self.model, self.hidden, self.anchors)
+        uniforms = torch.rand(BS, GAMMA)
+        temperatures = torch.tensor([0.7, 1.0, 1.3])
+        greedy_mask = torch.tensor([False, True, False])
+        tokens, rows = walk_lattice_sampled(
+            candidate_ids=ids,
+            scores=scores,
+            uniforms=uniforms,
+            temperatures=temperatures,
+            greedy_mask=greedy_mask,
+        )
+        torch.testing.assert_close(rows, lattice_path_rows(ids, scores, tokens))
+        core_tokens, _ = self.model.candidate_selector.sample_path(
+            candidate_ids=ids,
+            scores=scores,
+            uniforms=uniforms,
+            temperatures=temperatures,
+            greedy_mask=greedy_mask,
+        )
+        torch.testing.assert_close(tokens, core_tokens)
+
+    def test_path_logits_carry_core_q(self):
         temperatures = torch.tensor([0.7, 1.0, 1.3])
         with torch.no_grad():
             ids, scores = _core_lattice(self.model, self.hidden, self.anchors)
@@ -106,26 +133,65 @@ class TestExperimentalDflash2Selector(CustomTestCase):
             temperatures=temperatures,
             greedy_mask=torch.zeros(BS, dtype=torch.bool),
         )
-        with torch.no_grad():
-            tokens, dense = sample_drafts(
-                draft_model=self.model,
-                draft_hidden=self.hidden,
-                anchor_tokens=self.anchors,
-                vocab_size=VOCAB,
-                sampler=lambda logits, slot: core_tokens[:, slot],
-            )
-        torch.testing.assert_close(tokens, core_tokens)
+        dense = dense_logits(ids, lattice_path_rows(ids, scores, core_tokens), VOCAB)
         # The verify reads q as softmax(dense / T); off-candidate mass must be zero.
         q = torch.softmax(dense / temperatures[:, None, None], dim=-1)
         torch.testing.assert_close(q.gather(-1, ids), core_q)
         torch.testing.assert_close(q.gather(-1, ids).sum(-1), torch.ones(BS, GAMMA))
 
-    def test_graph_hook_walks_greedy_path_from_block(self):
+    def test_sample_drafts_is_core_sample_path_on_the_step_uniforms(self):
+        """Ranks agree without a sync only if the program is a pure function of
+        rng_step: core's walk on hash_uniforms(rng_step), its q, and [bonus, drafts]."""
+        temperatures = torch.tensor([0.7, 1.0, 1.3])
+        top_ks = torch.tensor([64, 1, 64])
+        rng_step = torch.tensor([5])
+        with torch.no_grad():
+            ids, scores = _core_lattice(self.model, self.hidden, self.anchors)
+        core_tokens, core_q = self.model.candidate_selector.sample_path(
+            candidate_ids=ids,
+            scores=scores,
+            uniforms=hash_uniforms(rng_step, STREAM_DRAFT, (BS, GAMMA)),
+            temperatures=temperatures,
+            greedy_mask=top_ks <= 1,
+        )
+        tokens, dense, verify_tokens = sample_drafts(
+            ids, scores, self.anchors, temperatures, top_ks, rng_step, VOCAB, dense=True
+        )
+        _, rows, _ = sample_drafts(
+            ids,
+            scores,
+            self.anchors,
+            temperatures,
+            top_ks,
+            rng_step,
+            VOCAB,
+            dense=False,
+        )
+        # The candidates form carries the same q, before the scatter.
+        torch.testing.assert_close(dense, dense_logits(ids, rows, VOCAB))
+        torch.testing.assert_close(tokens, core_tokens)
+        sampled = top_ks > 1
+        q = torch.softmax(dense / temperatures[:, None, None], dim=-1)
+        torch.testing.assert_close(q.gather(-1, ids)[sampled], core_q[sampled])
+        torch.testing.assert_close(
+            verify_tokens.view(BS, GAMMA + 1),
+            torch.cat([self.anchors[:, None], core_tokens], dim=1),
+        )
+        # Each step draws afresh.
+        self.assertFalse(
+            torch.equal(
+                hash_uniforms(rng_step, STREAM_DRAFT, (BS, GAMMA)),
+                hash_uniforms(rng_step + 1, STREAM_DRAFT, (BS, GAMMA)),
+            )
+        )
+
+    def test_graph_hook_walks_greedy_path_and_returns_its_lattice(self):
+        """Sampled drafting reuses the graph's lattice: it must be the block's, anchored on row 0."""
         block = GAMMA + 1
         block_hidden = torch.randn(BS, block, HIDDEN)
         input_ids = torch.randint(0, VOCAB, (BS, block))
         with torch.no_grad():
-            tokens = sample_draft_tokens(
+            tokens, (graph_ids, graph_scores) = sample_draft_tokens(
                 self.model, block_hidden.reshape(BS * block, -1), input_ids.view(-1)
             )
             ids, scores = _core_lattice(
@@ -139,6 +205,8 @@ class TestExperimentalDflash2Selector(CustomTestCase):
             greedy_mask=torch.ones(BS, dtype=torch.bool),
         )
         torch.testing.assert_close(tokens, core_tokens)
+        torch.testing.assert_close(graph_ids, ids)
+        torch.testing.assert_close(graph_scores, scores)
 
 
 if __name__ == "__main__":

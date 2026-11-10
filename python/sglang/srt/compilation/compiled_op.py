@@ -54,14 +54,16 @@ def _canonical_tensor(value):
     return value.clone(memory_format=torch.contiguous_format)
 
 
-def _specialization_key(*args, **kwargs):
+def _specialization_key(spmd_safe, *args, **kwargs):
     leaves, structure = tree_flatten((args, kwargs))
-    return structure, tuple(
-        (tuple(value.shape), value.dtype, value.device)
+    key = tuple(
+        (tuple(value.shape), value.dtype, str(value.device))
         if isinstance(value, torch.Tensor)
-        else (type(value), value)
+        else (type(value).__name__, value)
         for value in leaves
     )
+    # spmd_safe keys name shared graphs, so they must serialize to JSON.
+    return key if spmd_safe else (structure, key)
 
 
 def compiled_op(
@@ -69,6 +71,7 @@ def compiled_op(
     warmup: WarmupArgsFactory | None = None,
     model: torch.nn.Module | None = None,
     uses_rng: bool = False,
+    spmd_safe: bool = False,
 ):
     """Compile a tensor helper with the selected TPU tracer.
 
@@ -86,7 +89,14 @@ def compiled_op(
     after submission. Dynamo warmup executes to trigger
     compilation, preserving the generator when ``uses_rng`` is set. Warmup is a
     no-op when compilation is disabled or off TPU.
+    ``spmd_safe=True`` names each direct graph after the helper and keys it
+    without the argument structure, which binding the signature fixes, so
+    ``--use-spmd-compile`` can compile it once and share it across TP ranks. Such
+    a helper takes tensors and plain values, passes the configuration its graph
+    bakes in as arguments rather than closures, and cannot set ``uses_rng``.
     """
+    if spmd_safe and uses_rng:
+        raise ValueError("spmd_safe compiled ops cannot draw from the TPU generator")
 
     def decorator(fn):
         compiled_fn = None
@@ -97,6 +107,7 @@ def compiled_op(
             if isinstance(fn, torch.library.CustomOpDef)
             else f"{fn.__module__}.{fn.__qualname__}"
         )
+        specialization_key = functools.partial(_specialization_key, spmd_safe)
 
         @functools.wraps(fn)
         def wrapper(*args, _warmup_async=False, **kwargs):
@@ -114,7 +125,9 @@ def compiled_op(
                 if use_direct:
                     compiled_fn = direct_compile(
                         fn,
-                        specialization_key=_specialization_key,
+                        specialization_key=specialization_key,
+                        name=op_name if spmd_safe else None,
+                        spmd_safe=spmd_safe,
                         model=model,
                         uses_rng=uses_rng,
                     )
@@ -123,7 +136,7 @@ def compiled_op(
                         fn, backend="tpu", fullgraph=True, dynamic=False
                     )
             if use_direct and _warmup_async:
-                if _specialization_key(*args, **kwargs) in compiled_fn.cache:
+                if specialization_key(*args, **kwargs) in compiled_fn.cache:
                     return None
                 return compiled_fn.precompile(
                     *args,

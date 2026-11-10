@@ -18,6 +18,8 @@ from torch_tpu._internal.device_utils.annotations import LayoutContext, TpuLayou
 from torch_tpu._internal.distributed import tpu_distributed  # noqa: F401
 from torch_tpu._internal.utils import hardware
 
+from sglang.srt.compilation.compiled_op import compiled_op, warmup_compiled_op
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -34,6 +36,13 @@ register_tpu_ci(
 )
 
 _KEY = 'test/model.forward:["TARGET_VERIFY","NULL",1,8,false]'
+_SCALED_TRACES = []
+
+
+@compiled_op(spmd_safe=True)
+def _scale(value, factor):
+    _SCALED_TRACES.append(factor)
+    return value * factor
 
 
 def _worker_command(mode: str) -> list[str]:
@@ -213,10 +222,27 @@ def _run_shared_checks(group) -> None:
             checks.assertIn("owner_specs=", message)
             checks.assertIn("local_specs=", message)
         checks.assertIsNone(compiled.cache[mode].executable)
+
+    factors = (2, 3)
+    with (
+        envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
+        get_context().override_server_args(
+            use_spmd_compile=True, tpu_compile_tracer="direct"
+        ),
+    ):
+        with collect_warmups(group=group):
+            for factor in factors:
+                warmup_compiled_op(_scale, base, factor)
+        # Owners are assigned round-robin in warmup order.
+        checks.assertEqual(_SCALED_TRACES, [2, 3][rank : rank + 1])
+        for factor in factors:
+            checks.assertTrue(
+                torch.equal(_scale(base, factor).cpu(), base.cpu() * factor)
+            )
     dist.barrier(group=group)
     if rank == 0:
         print(
-            "SPMD shared compilation: runtime, opt-out, matching views, stride/offset/binding checks passed",
+            "SPMD shared compilation: runtime, opt-out, matching views, stride/offset/binding, compiled_op checks passed",
             flush=True,
         )
 

@@ -38,6 +38,74 @@ def mla_layers(num_layers: int, ckpt_path: str) -> tuple[int, ...]:
     )
 
 
+def text_config(ckpt_path: str) -> dict:
+    import json
+    import os
+
+    with open(os.path.join(ckpt_path, "config.json")) as f:
+        cfg = json.load(f)
+    return cfg.get("text_config", cfg)
+
+
+def dsa_layers(num_layers: int, ckpt_path: str) -> tuple[int, ...]:
+    """K3.1: 0-based DSA layers among the first ``num_layers`` (``dsa_config.dsa_layers``, 1-based);
+    () for Kimi-K3. The kernel's DSA plan needs them to be exactly the MLA layers, each with its own
+    top-k (index_topk_freq 1), 32 x 128 index heads, no index rope and a LayerNorm key norm."""
+    cfg = text_config(ckpt_path)
+    dc = cfg.get("dsa_config")
+    if not dc:
+        return ()
+    out = tuple(i - 1 for i in dc["dsa_layers"] if i - 1 < num_layers)
+    want = dict(
+        index_topk_freq=1,
+        index_num_heads=32,
+        index_head_dim=128,
+        index_rope_dim=0,
+        index_k_norm_type="layernorm",
+    )
+    bad = {k: dc.get(k) for k, v in want.items() if dc.get(k, v) != v}
+    if bad:
+        raise ValueError(f"unsupported dsa_config {bad} (kernel expects {want})")
+    mla = mla_layers(num_layers, ckpt_path)
+    if out != mla:
+        raise ValueError(f"DSA layers {out} != MLA (full attention) layers {mla}")
+    return out
+
+
+def dsa_topk(ckpt_path: str) -> int:
+    """K3.1 index_topk (2048), 0 without DSA."""
+    dc = text_config(ckpt_path).get("dsa_config") or {}
+    return int(dc.get("index_topk", 0))
+
+
+def local_expert_block(ckpt_path: str, experts_per_host: int, num_experts: int):
+    """The expert block (of ``experts_per_host``) an EP-local checkpoint holds (its safetensors index
+    lists only the kept experts), or None when it holds every expert."""
+    import json
+    import os
+    import re
+
+    with open(os.path.join(ckpt_path, "model.safetensors.index.json")) as f:
+        names = json.load(f)["weight_map"]
+    pat = re.compile(r"\.layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.")
+    by_layer: dict[int, set] = {}
+    for n in names:
+        m = pat.search(n)
+        if m:
+            by_layer.setdefault(int(m.group(1)), set()).add(int(m.group(2)))
+    if not by_layer:
+        return None
+    ids = by_layer[min(by_layer)]
+    if len(ids) == num_experts:
+        return None
+    lo, hi = min(ids), max(ids) + 1
+    if hi - lo != experts_per_host or lo % experts_per_host or len(ids) != hi - lo:
+        raise ValueError(
+            f"EP-local checkpoint holds experts {lo}..{hi - 1} ({len(ids)}), not one block of {experts_per_host}"
+        )
+    return lo // experts_per_host
+
+
 EXPERT_FAMILIES = ("expert_gu", "expert_gu_scale", "expert_down", "expert_down_scale")
 
 
@@ -147,7 +215,12 @@ def stream_experts(mesh, spec, ckpt_path: str, log, procs: int) -> dict:
     n = len(layers)
     put_layer = jax.jit(lambda buf, x, i: buf.at[0, i].set(x), donate_argnums=0)
     shards = _expert_shards(ckpt_path, layers)
-    layout = MoeLayout(spec.dims, spec.topo, replicas=spec.relax.expert_replicas)
+    layout = MoeLayout(
+        spec.dims,
+        spec.topo,
+        replicas=spec.relax.expert_replicas,
+        ckpt_blocks=spec.expert_blocks,
+    )
     # One stream per (possibly fake, see anchor --topology) host among this process's ranks.
     groups: dict[int, list[int]] = {}
     for r in local_ranks(mesh):
@@ -279,6 +352,14 @@ def state_shapes(kernel, spec, capacity: int, kda_rows: int = 1) -> dict:
             shapes[name] = ((kda_rows, kd.heads, 128, 128), jnp.float32)
         elif name.startswith("mla_cache_"):
             shapes[name] = ((page_count(capacity), PAGE // 2, 2, 640), jnp.bfloat16)
+        elif name.startswith("mla_idx_"):  # K3.1 DSA index keys (native record layout)
+            # native record layout or the DSA stage's compact one (StackKernel(dsa_compact)), in
+            # whole DSA scoring blocks for its contiguous DMAs
+            shape, mult = kernel.idx_page_shape, kernel.idx_pool_multiple
+            shapes[name] = (
+                (-(-page_count(capacity) // mult) * mult,) + tuple(shape),
+                jnp.uint8,
+            )
         else:
             raise ValueError(f"unknown state input {name}")
     return shapes

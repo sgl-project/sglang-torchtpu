@@ -28,6 +28,7 @@ register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 import importlib.util
 import unittest
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -123,9 +124,11 @@ class TestGDNSinglePassFlags(CustomTestCase):
         backend._extra_buffer_enabled = False
         backend.req_to_token_pool = SimpleNamespace(
             mamba_pool=SimpleNamespace(
-                checkpoint_width=1, checkpoint_read_offsets=None
+                checkpoint_width=1,
+                checkpoint_read_offsets=None,
+                mamba2_layer_cache=lambda _: cache,
             ),
-            mamba2_layer_cache=lambda _: cache,
+            mamba_map=defaultdict(int),
             get_mamba_indices=lambda indices: indices,
             translate_mamba_indices=lambda indices: indices,
             # Read by the slot-id memo (TpuGDNAttnBackend._slot_indices).

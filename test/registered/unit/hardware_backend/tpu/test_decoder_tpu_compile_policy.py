@@ -80,6 +80,7 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
     SpecDecoderTpuCompilePolicy,
 )
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
 from sglang_tpu.mamba_pool import TpuMambaPool
 from sglang_tpu.sampler import select_logits_output_mode
@@ -1385,6 +1386,18 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
             deepstack_key, policy._direct_compile_specialization_key(None, **kwargs)
         )
 
+    def test_text_only_extend_warms_only_the_text_ids_graphs(self):
+        model_runner = _model_runner()
+        model_runner.model.get_image_feature = MagicMock()
+        model_runner.model.get_input_embeddings = MagicMock()
+        model_runner.model.num_deepstack_embeddings = 0
+        policy = Qwen3VLDecoderTpuCompilePolicy(
+            model_runner=model_runner, owner=model_runner.model
+        )
+        self.assertEqual(policy._extend_serving_variants(), ("text_only", "text_ids"))
+        with tpu_envs.SGLANG_TPU_VL_TEXT_ONLY_EXTEND.override(True):
+            self.assertEqual(policy._extend_serving_variants(), ("text_ids",))
+
     def test_text_ids_warmup_uses_the_positional_serving_convention(self):
         """A multimodal model still serves text-only requests.
 
@@ -1885,7 +1898,7 @@ class TestPrecompileLoops(_PolicyTestCase):
         policy = _make_policy(_model_runner(), token_buckets=(8,), bs_buckets=(1, 4))
         policy._run_one = MagicMock()
 
-        with envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(True):
+        with tpu_envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(True):
             with get_parallel().override(
                 tp_size=2,
                 tp_rank=1,

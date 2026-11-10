@@ -85,6 +85,19 @@ struct PDRequestContext<'a> {
 #[derive(Clone, Copy)]
 struct BreakerOutcomesRecorded;
 
+/// How the concurrent prefill/decode sends in `execute_dual_dispatch_internal`
+/// resolved.
+enum DispatchRace {
+    /// Prefill finished first; `decode_early` holds a decode response that
+    /// arrived earlier with a 2xx status, if any.
+    PrefillDone {
+        prefill_result: Result<reqwest::Response, reqwest::Error>,
+        decode_early: Option<Result<reqwest::Response, reqwest::Error>>,
+    },
+    /// Decode failed (transport error or non-2xx) while prefill was pending.
+    DecodeFailedEarly(Result<reqwest::Response, reqwest::Error>),
+}
+
 impl PDRouter {
     fn worker_endpoint_url(worker: &dyn Worker, endpoint: &str) -> String {
         api_path(worker.base_url(), endpoint)
@@ -527,12 +540,13 @@ impl PDRouter {
         response
     }
 
+    /// Shapes a non-2xx decode response for the client, keeping decode's
+    /// status. Records no breaker outcome; the caller does that.
     async fn handle_decode_error_response(
         &self,
         res: reqwest::Response,
         context: &PDRequestContext<'_>,
-        prefill: Arc<dyn Worker>,
-        decode: Arc<dyn Worker>,
+        decode: &dyn Worker,
     ) -> Response {
         let status = res.status();
 
@@ -565,17 +579,18 @@ impl PDRouter {
             };
 
             let sse_data = format!("data: {}\n\n", json!({ "error": error_payload }));
-            let error_stream = tokio_stream::once(Ok(axum::body::Bytes::from(sse_data)));
 
-            self.create_streaming_response(
-                error_stream,
-                status,
-                None,
-                context.return_logprob,
-                Some(response_headers),
-                prefill,
-                decode,
-            )
+            // The error body is already fully read, so return it directly
+            // rather than through `create_streaming_response`: no detached
+            // stream task, no `BreakerTrackedStream` tick after the caller has
+            // recorded decode's outcome, and no load guards for workers that
+            // are already done.
+            let mut response = Response::new(Body::from(sse_data));
+            *response.status_mut() =
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            *response.headers_mut() = response_headers;
+            response
         } else {
             // Handle non-streaming error response
             match res.bytes().await {
@@ -618,6 +633,11 @@ impl PDRouter {
                         StatusCode::BAD_GATEWAY => {
                             error::bad_gateway("decode_bad_gateway", error_message)
                         }
+                        // Keep other client errors (422, 413, 429, ...) as-is;
+                        // rewriting them to 500 would make them retryable.
+                        s if s.is_client_error() => {
+                            error::create_error(s, "decode_client_error", error_message)
+                        }
                         _ => error::internal_error("decode_error", error_message),
                     }
                 }
@@ -640,6 +660,9 @@ impl PDRouter {
                         }
                         StatusCode::BAD_GATEWAY => {
                             error::bad_gateway("decode_read_failed", error_message)
+                        }
+                        s if s.is_client_error() => {
+                            error::create_error(s, "decode_read_failed", error_message)
                         }
                         _ => error::internal_error("decode_read_failed", error_message),
                     }
@@ -709,27 +732,69 @@ impl PDRouter {
         }
         .emit();
 
-        let prefill_fut = prefill_request.send();
         let decode_fut = decode_request.send();
-        tokio::pin!(prefill_fut);
         tokio::pin!(decode_fut);
 
-        // Poll both until prefill resolves; decode normally resolves later, but
-        // may resolve first if it rejects the request outright.
-        let prefill_result;
-        let mut decode_early: Option<Result<reqwest::Response, reqwest::Error>> = None;
-        loop {
-            tokio::select! {
-                biased;
-                pr = &mut prefill_fut => {
-                    prefill_result = pr;
-                    break;
-                }
-                dr = &mut decode_fut, if decode_early.is_none() => {
-                    decode_early = Some(dr);
+        // Poll both until prefill resolves or decode fails; decode normally
+        // resolves later, but may resolve first if it rejects the request
+        // outright or (streaming) sends its 2xx headers early. The prefill
+        // future lives only inside this block, so it is dropped (closing its
+        // connection) as soon as the race is decided.
+        let race = {
+            let prefill_fut = prefill_request.send();
+            tokio::pin!(prefill_fut);
+            let mut decode_early: Option<Result<reqwest::Response, reqwest::Error>> = None;
+            loop {
+                tokio::select! {
+                    biased;
+                    pr = &mut prefill_fut => {
+                        break DispatchRace::PrefillDone {
+                            prefill_result: pr,
+                            decode_early,
+                        };
+                    }
+                    dr = &mut decode_fut, if decode_early.is_none() => {
+                        let decode_failed = match &dr {
+                            Ok(resp) => !resp.status().is_success(),
+                            Err(_) => true,
+                        };
+                        if decode_failed {
+                            break DispatchRace::DecodeFailedEarly(dr);
+                        }
+                        // Decode accepted (e.g. streaming headers sent early);
+                        // keep waiting for prefill.
+                        decode_early = Some(dr);
+                    }
                 }
             }
-        }
+        };
+
+        let (prefill_result, decode_early) = match race {
+            DispatchRace::PrefillDone {
+                prefill_result,
+                decode_early,
+            } => (prefill_result, decode_early),
+            DispatchRace::DecodeFailedEarly(decode_result) => {
+                // Mirror of the prefill-failed case below: a decode that
+                // rejected the request will never pull prefill's KV, so prefill
+                // would block until its bootstrap timeout (300s by default).
+                // The prefill future is already dropped, so the prefill engine
+                // sees the disconnect and aborts the request; return decode's
+                // error now.
+                warn!(
+                    "Decode failed before prefill completed, aborting paired prefill request \
+                     decode_url={} prefill_url={}",
+                    decode.url(),
+                    prefill.url()
+                );
+                events::RequestReceivedEvent {}.emit();
+                // Prefill was cancelled due to a decode fault, not its own, so
+                // don't record it.
+                return self
+                    .handle_decode_failure(decode_result, None, &context, prefill, decode)
+                    .await;
+            }
+        };
 
         // Decode can't generate without prefill's KV, so any prefill failure
         // (non-2xx / transport error) dooms the paired decode request, which would
@@ -788,45 +853,12 @@ impl PDRouter {
                 debug!("Decode response status: {}", status);
 
                 if !status.is_success() {
-                    error!(
-                        "Decode server returned error status decode_url={} status={}",
-                        decode.url(),
-                        status
-                    );
-
-                    // Per-worker breaker attribution before the synthetic 5xx
-                    // response takes over. Prefill ran concurrently in the
-                    // `tokio::join!`: tick it based on its actual response
-                    // status, not on the decode-driven failure. For
-                    // non-streaming the response carries no tracked stream
-                    // so record decode's outcome here too — but treat 4xx
-                    // as a client fault rather than a worker fault, matching
-                    // the legacy outer-dispatcher rule and the streaming
-                    // `BreakerTrackedStream` pre-mark in
-                    // `create_streaming_response`. For streaming
-                    // `handle_decode_error_response` wraps the synthetic
-                    // error SSE in a `BreakerTrackedStream` that ticks
-                    // decode on drop, so skip to avoid double-counting.
-                    // Mark the response so the outer dispatcher skips its
-                    // status-derived `record_outcome`.
-                    let prefill_ok = match &prefill_result {
-                        Ok(r) => {
-                            let s = r.status();
-                            s.is_success() || s.is_client_error()
-                        }
-                        Err(_) => false,
-                    };
-                    prefill.record_outcome(prefill_ok);
-                    if !context.is_stream {
-                        let decode_ok = status.is_success() || status.is_client_error();
-                        decode.record_outcome(decode_ok);
-                    }
-
-                    let mut response = self
-                        .handle_decode_error_response(res, &context, prefill, decode)
+                    // Prefill ran concurrently: tick it based on its actual
+                    // response status, not on the decode-driven failure.
+                    let prefill_ok = Self::prefill_breaker_ok(&prefill_result);
+                    return self
+                        .handle_decode_failure(Ok(res), Some(prefill_ok), &context, prefill, decode)
                         .await;
-                    response.extensions_mut().insert(BreakerOutcomesRecorded);
-                    return response;
                 }
 
                 // Process prefill response
@@ -911,40 +943,85 @@ impl PDRouter {
                 }
             }
             Err(e) => {
+                // Prefill ran concurrently: record its real per-worker
+                // outcome (success on a 2xx/4xx send, failure on transport
+                // error) so the decode-driven 502 doesn't penalise a
+                // healthy prefill.
+                let prefill_ok = Self::prefill_breaker_ok(&prefill_result);
+                self.handle_decode_failure(Err(e), Some(prefill_ok), &context, prefill, decode)
+                    .await
+            }
+        }
+    }
+
+    /// Breaker verdict for a completed prefill send: 2xx and 4xx (client
+    /// fault) count as healthy, 5xx and transport errors as failures.
+    fn prefill_breaker_ok(prefill_result: &Result<reqwest::Response, reqwest::Error>) -> bool {
+        match prefill_result {
+            Ok(r) => {
+                let s = r.status();
+                s.is_success() || s.is_client_error()
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Breaker verdict for a non-2xx decode status: a 4xx is a client fault
+    /// (healthy worker) except 429, which means decode is overloaded.
+    fn decode_breaker_ok(status: u16) -> bool {
+        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        status.is_success() || (status.is_client_error() && status != StatusCode::TOO_MANY_REQUESTS)
+    }
+
+    /// Builds the client response for a failed decode (non-2xx or transport
+    /// error) and records per-worker breaker outcomes.
+    ///
+    /// `prefill_ok` is the prefill breaker verdict, or `None` when prefill was
+    /// cancelled because decode failed first; a cancelled prefill is not
+    /// recorded. The response is marked with `BreakerOutcomesRecorded` so the
+    /// outer dispatcher skips its status-derived `record_outcome`.
+    async fn handle_decode_failure(
+        &self,
+        decode_result: Result<reqwest::Response, reqwest::Error>,
+        prefill_ok: Option<bool>,
+        context: &PDRequestContext<'_>,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+    ) -> Response {
+        if let Some(prefill_ok) = prefill_ok {
+            prefill.record_outcome(prefill_ok);
+        }
+
+        let mut response = match decode_result {
+            Ok(res) => {
+                let status = res.status();
+                error!(
+                    "Decode server returned error status decode_url={} status={}",
+                    decode.url(),
+                    status
+                );
+                // Record decode's outcome before returning, for streaming and
+                // non-streaming alike: the retry loop may pick the next pair
+                // as soon as it gets this response. The error response
+                // carries no tracked stream, so this is the only tick.
+                decode.record_outcome(Self::decode_breaker_ok(status.as_u16()));
+                self.handle_decode_error_response(res, context, decode.as_ref())
+                    .await
+            }
+            Err(e) => {
                 error!(
                     decode_url = %decode.url(),
                     error = %e,
                     "Decode request failed"
                 );
-                // Decode failed at TCP/transport level. No tracked
-                // stream will ever wrap a response (streaming path) and
-                // we shortcut past the outer non-streaming
-                // `record_outcome` too — so record decode failure
-                // directly. Prefill ran concurrently in the
-                // `tokio::join!`: record its real per-worker outcome
-                // (success on a 2xx/4xx send, failure on transport
-                // error) so the decode-driven 502 doesn't penalise a
-                // healthy prefill. Mark the response so the outer
-                // dispatcher skips its status-derived `record_outcome`
-                // and we don't double-count.
+                // Decode failed at TCP/transport level. No tracked stream will
+                // ever wrap a response, so record the decode failure directly.
                 decode.record_outcome(false);
-                let prefill_ok = match &prefill_result {
-                    Ok(res) => {
-                        let s = res.status();
-                        s.is_success() || s.is_client_error()
-                    }
-                    Err(_) => false,
-                };
-                prefill.record_outcome(prefill_ok);
-
-                let mut response = error::bad_gateway(
-                    "decode_server_error",
-                    format!("Decode server error: {}", e),
-                );
-                response.extensions_mut().insert(BreakerOutcomesRecorded);
-                response
+                error::bad_gateway("decode_server_error", format!("Decode server error: {}", e))
             }
-        }
+        };
+        response.extensions_mut().insert(BreakerOutcomesRecorded);
+        response
     }
 
     fn policies_need_request_text(&self) -> bool {
@@ -1133,9 +1210,9 @@ impl PDRouter {
         // on clean completion (`[DONE]` sentinel or `None`), failure on
         // stream error, neither on client disconnect. PD's pre-PR semantics
         // treated 4xx (client error) as not-a-worker-fault, so we only
-        // pre-mark the wrapper as Errored on 5xx — `handle_decode_error_response`
-        // synthesizes a single-chunk SSE error envelope that would otherwise
-        // stream cleanly to None and record a spurious success.
+        // pre-mark the wrapper as Errored on 5xx. Decode error responses no
+        // longer come through here (`handle_decode_error_response` builds them
+        // directly), so the pre-mark only guards against future callers.
         let mut tracked =
             BreakerTrackedStream::new(stream, Arc::clone(&decode), decode.url().to_string());
         if !(status.is_success() || status.is_client_error()) {

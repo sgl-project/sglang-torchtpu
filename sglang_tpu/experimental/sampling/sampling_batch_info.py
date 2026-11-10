@@ -86,11 +86,17 @@ class HostPaddedSamplingInfo(SamplingBatchInfo):
         self.real_batch_size = batch_size
 
     def host_params_at(self, rows: int) -> dict[str, torch.Tensor]:
-        """Host sampling params padded to rows, at least this info's own bucket."""
+        """Host sampling params with exactly the selected bucket's rows."""
+        if rows < self.real_batch_size:
+            raise ValueError(
+                f"sampling bucket {rows} is smaller than live batch {self.real_batch_size}"
+            )
         return {
-            name: _pad_host_rows(value[: self.real_batch_size], rows, fill, False)
-            if value.shape[0] < rows
-            else value
+            name: (
+                _pad_host_rows(value[: self.real_batch_size], rows, fill, False)
+                if value.shape[0] != rows
+                else value
+            )
             for name, fill in _PARAM_FILLS.items()
             if (value := getattr(self, name)) is not None
         }

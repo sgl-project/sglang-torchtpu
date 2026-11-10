@@ -19,7 +19,6 @@ from sglang.srt.compilation.support_torch_compile import (
     CompilePolicy,
     support_torch_compile,
 )
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase, enter_scope
@@ -322,7 +321,7 @@ class TestTpuGraphRunner(CustomTestCase):
         checker.snapshot_baseline.side_effect = lambda: events.append("snapshot")
         model = self._annotate(_model_with(forward=MagicMock()))
         with (
-            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
+            tpu_envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
             patch(
                 "sglang_tpu.compilation.recompilation_checker."
                 "_shared_recompilation_checker",
@@ -560,7 +559,7 @@ class TestTpuGraphRunner(CustomTestCase):
         checker.snapshot_baseline.side_effect = lambda: events.append("snapshot")
         model = self._annotate(_model_with(forward=MagicMock()))
         with (
-            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
+            tpu_envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
             patch(
                 "sglang_tpu.compilation.recompilation_checker."
                 "_shared_recompilation_checker",
@@ -578,7 +577,7 @@ class TestTpuGraphRunner(CustomTestCase):
     def test_checker_is_not_armed_unless_opted_in(self):
         model = self._annotate(_model_with(forward=MagicMock()))
         with (
-            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(False),
+            tpu_envs.SGLANG_TPU_CHECK_RECOMPILATION.override(False),
             patch(
                 "sglang_tpu.compilation.recompilation_checker."
                 "_shared_recompilation_checker"
@@ -593,7 +592,7 @@ class TestTpuGraphRunner(CustomTestCase):
         runner_args = self._runner_for(model)
         runner_args.is_draft_worker = True
         with (
-            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
+            tpu_envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
             patch(
                 "sglang_tpu.compilation.recompilation_checker."
                 "_shared_recompilation_checker"

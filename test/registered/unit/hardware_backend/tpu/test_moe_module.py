@@ -55,6 +55,7 @@ class _MethodWithFakeRunnerConfig(UnquantizedFusedMoEMethod):
             num_fused_shared_experts=0,
             gemm1_alpha=None,
             gemm1_clamp_limit=None,
+            routed_scaling_factor=None,
         )
 
 

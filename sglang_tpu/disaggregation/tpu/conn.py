@@ -47,7 +47,6 @@ from __future__ import annotations
 import concurrent.futures
 import dataclasses
 import logging
-import os
 import threading
 import time
 from collections import defaultdict, deque
@@ -81,6 +80,7 @@ from sglang_tpu.disaggregation.tpu.transfer import (
     PendingChunk,
     PrefillTransferInfo,
 )
+from sglang_tpu.envs import envs as tpu_envs
 
 logger = logging.getLogger(__name__)
 
@@ -98,17 +98,14 @@ _PUSH_POOL_WORKERS = 4
 def _kv_stats_every() -> int:
     """How many transfers between logged latency summaries (0 disables).
     Set via ``SGLANG_DEBUG_TPU_KV_STATS_EVERY`` (debug/observability only)."""
-    try:
-        return int(os.environ.get("SGLANG_DEBUG_TPU_KV_STATS_EVERY", "100"))
-    except (TypeError, ValueError):
-        return 100
+    return tpu_envs.SGLANG_DEBUG_TPU_KV_STATS_EVERY.get()
 
 
 def _kv_async() -> bool:
     """issue the prefill D2H asynchronously. Set ``SGLANG_TPU_KV_ASYNC=0`` to fall back to the
     synchronous batched D2H. See gather_pages_to_stage_async for the
     donation-safety reasoning."""
-    return os.environ.get("SGLANG_TPU_KV_ASYNC", "1").lower() not in ("0", "", "false")
+    return tpu_envs.SGLANG_TPU_KV_ASYNC.get()
 
 
 def _kv_channels() -> int:
@@ -117,10 +114,7 @@ def _kv_channels() -> int:
     socket, so the effective stream count is ``tp_size * channels`` — hence a
     small default rather than vllm-torchtpu's per-rank ``tp_size``. Set
     ``SGLANG_TPU_KV_CHANNELS=1`` for the single-stream path."""
-    try:
-        return max(1, int(os.environ.get("SGLANG_TPU_KV_CHANNELS", "2")))
-    except (TypeError, ValueError):
-        return 2
+    return max(1, tpu_envs.SGLANG_TPU_KV_CHANNELS.get())
 
 
 @dataclasses.dataclass

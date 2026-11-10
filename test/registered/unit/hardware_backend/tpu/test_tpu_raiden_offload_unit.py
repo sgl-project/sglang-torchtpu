@@ -39,7 +39,6 @@ from sglang.srt.disaggregation.utils import (
     KVClassType,
     TransferBackend,
 )
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache import hicache_auto_size as sizing
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
 from sglang.srt.mem_cache.pool_host import base as host_base
@@ -64,6 +63,7 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardReq,
 )
 from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
+from sglang_tpu.envs import envs
 from sglang_tpu.kv_pool_host import (
     TPU_DMA_LAYOUT,
     TpuDMAHostKVPool,
@@ -156,8 +156,11 @@ class TestRaidenHostMemoryBudget(CustomTestCase):
             start_layer=0,
             end_layer=2,
             layer_num=2,
-            get_fused_kv_buffer=Mock(
-                return_value=torch.empty((3, 4, 1, 2, 128), dtype=torch.bfloat16)
+            page_buffers=Mock(
+                return_value=[
+                    torch.empty((3, 4, 1, 2, 128), dtype=torch.bfloat16)
+                    for _ in range(2)
+                ]
             ),
         )
 
@@ -273,9 +276,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
             start_layer=0,
             end_layer=1,
             layer_num=1,
-            get_fused_kv_buffer=Mock(
-                return_value=torch.empty((8, 4), dtype=torch.bfloat16)
-            ),
+            page_buffers=Mock(return_value=[torch.empty((8, 4), dtype=torch.bfloat16)]),
         )
 
         # Test the sizing warning independently of the CI runner's free RAM.
@@ -300,8 +301,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         self.assertEqual(pool.size, 20)
         self.assertLess(pool.size, device_pool.size)
         self.assertIn("L2 cache effectiveness is reduced", logs.output[0])
-        device_pool.get_fused_kv_buffer.assert_called_once_with(0)
-        transfer_cls.assert_called_once_with(device_pool, 5)
+        device_pool.page_buffers.assert_called_once_with()
+        transfer_cls.assert_called_once_with(device_pool, 5, draft_pools=())
 
     def test_decode_kv_args_include_raiden_metadata(self):
         captured = {}
@@ -1943,6 +1944,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr._superseded_sender_reads = set()
+        mgr._staging_layers_total = 0
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}

@@ -135,7 +135,7 @@ Runs at 10:00 and 17:00 PT. A `plan` job maps the cron that fired to a selection
 
 | Slot | 1-host lane | 2-host lane |
 |---|---|---|
-| `day-10am` | GPT-OSS-120B AIME / GPQA / GSM8K / MMLU-Pro; GPT-OSS-20B; Gemma 4 AIME / GPQA; Qwen3.8 AIME / GPQA | Kimi-K2.6 MMMU shards |
+| `day-10am` | GPT-OSS-120B AIME / GPQA / GSM8K / MMLU-Pro; Gemma 4 AIME / GPQA; Qwen3.8 AIME / GPQA | Kimi-K2.6 MMMU shards |
 | `day-5pm` | Gemma 4 / Qwen3.5 / Qwen3.8 MMMU-Pro | DeepSeek R1 / V3.1 accuracy |
 
 - **Single-host:** one job per benchmark (one suite, one file), each written out in the

@@ -735,6 +735,8 @@ class Glm5NextDecoderLayer(nn.Module):
                 is_nextn=is_nextn,
                 reduce_results=False,
             )
+            # forward() passes use_tpu_fused_moe_decode() as summed_by_compute.
+            self.mlp.allow_tpu_fused_moe_decode = True
         else:
             if is_dense_ffn_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
@@ -955,13 +957,20 @@ class Glm5NextDecoderLayer(nn.Module):
         else:
             _mlp_ctx = nullcontext()
 
+        # The TPU fused MoE decode kernel returns an already-summed output.
+        summed_by_compute = isinstance(
+            self.mlp, Glm5NextMoE
+        ) and self.mlp.use_tpu_fused_moe_decode(hidden_states, forward_batch)
+
         with _mlp_ctx:
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,
                 gemm_output_zero_allocator,
             )
-        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(
+            hidden_states, forward_batch, summed_by_compute=summed_by_compute
+        )
 
         return (hidden_states, topk_indices)
 

@@ -67,11 +67,11 @@ def tpu_local_routed_expert_range(model: torch.nn.Module) -> tuple[int, int] | N
     """
     if not _is_tpu or not getattr(model, "supports_tpu_ep_local_expert_reads", False):
         return None
-    from sglang.srt.environ import envs
     from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.utils import local_routed_expert_range
     from sglang.srt.runtime_context import get_exec
+    from sglang_tpu.envs import envs
 
     moes = [m for m in model.modules() if isinstance(m, FusedMoE)]
     # Without MoE layers or EP there is nothing to skip, and nothing to report.

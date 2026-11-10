@@ -477,8 +477,9 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
             return None
 
         # Keep autograd semantics identical to the old path. The diffusion
-        # runtime enters here for inference, where grad is disabled.
-        if torch.is_grad_enabled():
+        # runtime enters here for inference, where grad is disabled. A compiled
+        # graph fuses the cast, and data_ptr() would break it.
+        if torch.is_grad_enabled() or torch.compiler.is_compiling():
             return param.float().to(device=device)
 
         key = (

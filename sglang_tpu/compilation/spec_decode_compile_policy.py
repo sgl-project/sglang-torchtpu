@@ -13,6 +13,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    LogitsOutputMode,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
@@ -134,24 +135,27 @@ class BaseSpecDecodeCompilePolicyMixin:
         assert self.b_bucketer is not None
         draft_token_num = self.draft_token_num
         bs_buckets = list(self.b_bucketer.buckets)
+        modes = self.target_verify_logits_output_modes()
         logger.info(
             "[spec compile policy] TARGET_VERIFY: %d shapes "
-            "(bs=%s, draft_token_num=%d)",
-            len(bs_buckets),
+            "(bs=%s, draft_token_num=%d, logits=%s)",
+            len(bs_buckets) * len(modes),
             bs_buckets,
             draft_token_num,
+            [mode.name for mode in modes],
         )
+        cases = [(bs, mode) for bs in bs_buckets for mode in modes]
         compile_range = (
             tqdm.tqdm(
-                bs_buckets,
+                cases,
                 desc="Compiling TARGET_VERIFY",
                 bar_format=_COMPILE_BAR_FORMAT,
             )
             if get_parallel().tp_rank == 0
-            else bs_buckets
+            else cases
         )
         pending = []
-        for bs in compile_range:
+        for bs, logits_output_mode in compile_range:
             num_tokens = bs * draft_token_num
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
@@ -159,6 +163,7 @@ class BaseSpecDecodeCompilePolicyMixin:
                 num_tokens=num_tokens,
                 bs=bs,
                 mode=ForwardMode.TARGET_VERIFY,
+                logits_output_mode=logits_output_mode,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
                 spec_info=self.make_verify_spec_info(),
             )
@@ -167,10 +172,14 @@ class BaseSpecDecodeCompilePolicyMixin:
             if get_parallel().tp_rank == 0:
                 status, elapsed, hbm_str = _warmup_progress(warmup, start, hbm_before)
                 compile_range.set_description(
-                    f"{status} TARGET_VERIFY (bs={bs}, tokens={num_tokens})"
-                    f" in {elapsed:.1f}s{hbm_str}"
+                    f"{status} TARGET_VERIFY (bs={bs}, tokens={num_tokens},"
+                    f" {logits_output_mode.name}) in {elapsed:.1f}s{hbm_str}"
                 )
         return pending
+
+    def target_verify_logits_output_modes(self) -> tuple[LogitsOutputMode, ...]:
+        """Every logits mode the spec worker requests for its verify forward."""
+        return (LogitsOutputMode.FULL_VOCAB,)
 
     def _precompile_extend_full(self) -> list[PendingCall]:
         """Compile target prefill with and without speculative input state."""

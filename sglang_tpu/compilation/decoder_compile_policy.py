@@ -50,6 +50,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang_tpu._logging import get_logger
+from sglang_tpu.compilation import aot_fast_runtime_wrapper
 from sglang_tpu.compilation.attention_rank_inputs import (
     get_attention_rank_tensors,
     use_attention_rank_tensors,
@@ -788,6 +789,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             or server_args.unsafe_load_torch_compile_bundle is not None
         )
         compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile
+        aot_fast_runtime_wrapper.install_from_env()
         # The bundle Compiler installs its own guard filter for restorable guards.
         options = None if use_bundle else _guard_filter_options(server_args)
         return compiler(
@@ -944,30 +946,32 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         return key
 
+    def _owns_logits_processor(self) -> bool:
+        """Whether ``owner`` includes the target logits processor inside its forward."""
+        runner_model = self.model_runner.model
+        # A wrapper may compile its language model with the logits processor
+        # inside (Kimi); one that keeps the logits eager (Gemma4) does not.
+        return self.owner is runner_model or (
+            self.owner is getattr(runner_model, "language_model", None)
+            and getattr(self.owner, "logits_processor", None) is not None
+        )
+
     def _compiles_logits_processor(self) -> bool:
         """Whether this compiled callable includes target-model logits processing."""
-
+        if getattr(self.model_runner, "is_draft_worker", False):
+            return False
         pp_group = self.model_runner.pp_group
         if pp_group is not None and not pp_group.is_last_rank:
             # Only the final pipeline stage runs the logits processor.
             return False
-        runner_model = self.model_runner.model
-        # A wrapper may compile its language model with the logits processor
-        # inside (Kimi); one that keeps the logits eager (Gemma4) does not.
-        owns_logits = self.owner is runner_model or (
-            self.owner is getattr(runner_model, "language_model", None)
-            and getattr(self.owner, "logits_processor", None) is not None
-        )
-        return owns_logits and not bool(
-            getattr(self.model_runner, "is_draft_worker", False)
-        )
+        return self._owns_logits_processor()
 
     def _pp_warmup_kwargs(self, num_tokens: int) -> dict[str, Any]:
         """The ``pp_proxy_tensors`` kwarg a non-first pipeline stage warms up with.
 
         The proxy carries the previous stage's hidden states and residual at the
-        padded token bucket, in the model dtype, on the device; the first stage
-        (and a non-pipelined model) gets no proxy.
+        padded token bucket, in the model's PP dtype (or its compute dtype by
+        default), on the device; the first stage gets no proxy.
         """
         pp_group = self.model_runner.pp_group
         if pp_group is None or pp_group.is_first_rank:
@@ -977,18 +981,23 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         # (_fit_pp_proxy_rows), so the program takes row views of them; warm
         # with the same views, or each bucket copies its view on first use.
         rows = self.max_padded_tokens()
+        transfer_dtype = getattr(
+            self.model_runner.model,
+            "pp_transfer_dtype",
+            self.model_runner.dtype,
+        )
 
-        def zeros(shape: tuple[int, int]) -> torch.Tensor:
+        def zeros(shape: tuple[int, int], dtype: torch.dtype) -> torch.Tensor:
             buffer = torch.zeros(
                 (rows, shape[1]),
-                dtype=self.model_runner.dtype,
+                dtype=dtype,
                 device=self.model_runner.device,
             )
             return buffer[: shape[0]]
 
         proxy = {
-            "hidden_states": zeros((num_tokens, hidden_size)),
-            "residual": zeros((num_tokens, hidden_size)),
+            "hidden_states": zeros((num_tokens, hidden_size), transfer_dtype),
+            "residual": zeros((num_tokens, hidden_size), transfer_dtype),
         }
         # Serving hands the aux capture slots on with the activations, so
         # trace them too or the graph signature differs from the real one.
@@ -997,7 +1006,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         if num_aux:
             proxy[AUX_HIDDEN_STATES_PROXY_KEY] = zeros(
-                (num_tokens, hidden_size * num_aux)
+                (num_tokens, hidden_size * num_aux), self.model_runner.dtype
             )
         return {"pp_proxy_tensors": PPProxyTensors(proxy)}
 
@@ -1457,7 +1466,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         # the extend graph the backend has always compiled.
         extend_capture_hidden_mode = (
             CaptureHiddenMode.FULL
-            if envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
+            if tpu_envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
             else CaptureHiddenMode.NULL
         )
         logger.info(
@@ -1635,8 +1644,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         spec_info: SpecInput | None = None,
         attn_backend: Any | None = None,
         profile_prefix: int | None = None,
+        publish_dsa_topk: bool = False,
     ) -> PendingCall | float | None:
-        """Run one warmup, defer async execution, or time synchronous profiling."""
+        """Run one warmup, defer async execution, or time synchronous profiling.
+
+        publish_dsa_topk traces a draft forward that leaves its DSA top-k in
+        spec_info (forward_draft_rows' flag of the same name).
+        """
         self._compiled_extend_variants.add(variant)
         args, kwargs = self._make_warmup_inputs(
             num_tokens=num_tokens,
@@ -1656,6 +1670,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             else:
                 args = (*args[:2], prepared_batch, *args[3:])
             forward_batch = prepared_batch
+        if publish_dsa_topk:
+            forward_batch.reuse_dsa_topk_indices = True
         if profile_prefix is not None:
             from sglang_tpu.pp_profile import set_profile_inputs
 
@@ -2028,27 +2044,46 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 
     spmd_safe = True
 
+    def _runs_eager_logits(self) -> bool:
+        """Whether this stage runs target logits eagerly outside ``owner``."""
+        if getattr(self.model_runner, "is_draft_worker", False):
+            return False
+        pp_group = self.model_runner.pp_group
+        if pp_group is not None and not pp_group.is_last_rank:
+            return False
+        return not self._owns_logits_processor()
+
     def _warmup_host_padding(self) -> None:
         # The compiled inner decoder excludes eager prompt embedding and logits.
-        if not self._compiles_logits_processor():
+        pp_group = self.model_runner.pp_group
+        is_draft = bool(getattr(self.model_runner, "is_draft_worker", False))
+        warms_embedding = (
+            not is_draft
+            and not self._owns_logits_processor()
+            and (pp_group is None or pp_group.is_first_rank)
+        )
+        warms_logits = self._runs_eager_logits()
+        if warms_embedding or warms_logits:
             with torch.no_grad():
                 for tokens, rows, mode in self._extend_compile_cases():
-                    embedding = self.owner.get_input_embeddings()
-                    ids = torch.zeros(tokens, dtype=torch.int64).to(
-                        self.model_runner.device
-                    )
-                    ids.clamp_(min=0, max=embedding.num_embeddings - 1)
-                    embedding(ids).cpu()
-                    self._eager_warmup_logits(tokens, rows, mode).cpu()
+                    if warms_embedding:
+                        embedding = self.owner.get_input_embeddings()
+                        ids = torch.zeros(tokens, dtype=torch.int64).to(
+                            self.model_runner.device
+                        )
+                        ids.clamp_(min=0, max=embedding.num_embeddings - 1)
+                        embedding(ids).cpu()
+                    if warms_logits:
+                        self._eager_warmup_logits(tokens, rows, mode).cpu()
         super()._warmup_host_padding()
 
     def _sampling_warmup_logits(self, rows: int) -> torch.Tensor:
-        if self._compiles_logits_processor():
+        if not self._runs_eager_logits():
             return super()._sampling_warmup_logits(rows)
         return self._eager_warmup_logits(rows, rows, ForwardMode.DECODE)
 
     def warmup_eager_logits(self, cases: Sequence[EagerLogitsCase]) -> None:
-        if self._compiles_logits_processor():
+        if not self._runs_eager_logits():
             return
         with torch.no_grad():
             for case in cases:
@@ -2147,6 +2182,8 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             return super()._extend_serving_variants()
         # "text_ids" warms positional token-ID calls used by text-only serving,
         # in addition to the input_embeds calls used by multimodal serving.
+        if tpu_envs.SGLANG_TPU_VL_TEXT_ONLY_EXTEND.get():
+            return ("text_ids",)
         return (*self._extend_input_variants(), "text_ids")
 
     def _direct_compile_specialization_key(
@@ -2514,3 +2551,33 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 # Kimi-K3's multimodal wrapper compiles its language model with the Qwen3-VL
 # policy unchanged.
 KimiK3VLDecoderTpuCompilePolicy = Qwen3VLDecoderTpuCompilePolicy
+
+
+class BailingVLDecoderTpuCompilePolicy(Qwen3VLDecoderTpuCompilePolicy):
+    """Qwen3-VL policy with Bailing's unsupported-config fail-fasts.
+
+    The shared VL policy has no later-stage warmup and no input_ids-only
+    direct-tracer key; refuse those here so the compile never starts,
+    saving the ~19-minute cold compile on misconfigured hosts.
+    """
+
+    def install(self) -> bool:
+        from sglang.srt.runtime_context import get_parallel
+
+        parallel = get_parallel()
+        if parallel.pp_size > 1:
+            raise ValueError(
+                "Bailing/Ling-3's multimodal model does not support "
+                "pipeline parallelism with --enable-torch-compile on TPU "
+                "yet."
+            )
+        if (
+            getattr(self.model_runner.server_args, "tpu_compile_tracer", None)
+            == "direct"
+        ):
+            raise ValueError(
+                "Bailing/Ling-3's multimodal model does not support "
+                "--tpu-compile-tracer direct with --enable-torch-compile "
+                "on TPU yet."
+            )
+        return super().install()

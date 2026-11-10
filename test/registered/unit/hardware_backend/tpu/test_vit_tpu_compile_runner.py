@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.vision import (
 from sglang.srt.observability.compile_timing import CompileTimingRecorder
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang_tpu.compilation import direct_compile
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.graph_runner import vit_tpu_compile_runner as vit_runner
 from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
     Qwen3VLVisionTpuCompilePolicy,
@@ -290,9 +291,9 @@ class TestViTTpuCompileRunner(unittest.TestCase):
 
     def test_qwen3_vl_patch_buckets_honor_the_env_override(self):
         policy = Qwen3VLVisionTpuCompilePolicy(SimpleNamespace(spatial_merge_size=2))
-        sizes = envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES
+        sizes = tpu_envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES
 
-        with _unset(sizes), _unset(envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES):
+        with _unset(sizes), _unset(tpu_envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES):
             ladder = policy.compute_patch_buckets()
         self.assertEqual((ladder[0], ladder[-1]), (196, 4900))
 
@@ -317,8 +318,8 @@ class TestViTTpuCompileRunner(unittest.TestCase):
     def test_env_cap_bounds_the_ladder_but_is_not_its_top_bucket(self):
         policy = Qwen3VLVisionTpuCompilePolicy(SimpleNamespace(spatial_merge_size=2))
         with (
-            _unset(envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES),
-            envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(5000),
+            _unset(tpu_envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES),
+            tpu_envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(5000),
         ):
             ladder = policy.compute_patch_buckets()
         # 72^2 = 5184 overshoots the cap, so the real ceiling stays 70^2. Callers
@@ -485,11 +486,11 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         unwarmed = patch.object(vit_runner, "_precompiled_max_patch_count", None)
         with (
             unwarmed,
-            _unset(envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES),
-            envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(1600),
+            _unset(tpu_envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES),
+            tpu_envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(1600),
         ):
             self.assertEqual(vit_runner.precompiled_max_patch_count(), 1600)
-        with unwarmed, envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.override("196, 1024"):
+        with unwarmed, tpu_envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.override("196, 1024"):
             self.assertEqual(vit_runner.precompiled_max_patch_count(), 1024)
 
     def test_qwen3_vl_unpad_trims_bucket_padding_and_selects_rows(self):

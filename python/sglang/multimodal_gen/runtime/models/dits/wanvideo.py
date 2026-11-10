@@ -391,8 +391,12 @@ _WAN_TEMB_SLICES = BitExactFusionGate("Wan fused temb-table slices")
 def _eager_temb_table_slices(
     table: torch.Tensor, temb: torch.Tensor
 ) -> tuple[torch.Tensor, ...]:
-    parts = (table.unsqueeze(0) + temb.float()).chunk(6, dim=2)
-    return tuple(part.squeeze(2) for part in parts)
+    # One contiguous (B, S, D) tensor per slice, as the fused kernel writes.
+    # Chunk views of the (B, S, 6, D) sum would cross the compiled graph's
+    # collective splits, and torch_tpu re-lays such views out in every block.
+    # Widening the (1, D) row keeps the sum fp32 when the loader cast the table
+    # to bf16 (it does: param_dtype), without a (B, S, D) fp32 temporary.
+    return tuple(table[:, j].float() + temb[:, :, j] for j in range(6))
 
 
 def _wan_temb_table_slices(
@@ -1341,7 +1345,10 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 self.maybe_cache_states(hidden_states, original_hidden_states)
             if enable_spectrum:
                 self.spectrum_record_features(hidden_states)
-        self.cnt += 1
+        # Only TeaCache reads the step counter; under torch.compile a mutated
+        # int attribute recompiles the forward every step.
+        if self.enable_teacache:
+            self.cnt += 1
 
         if sequence_shard_enabled:
             hidden_states = hidden_states.contiguous()
