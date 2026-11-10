@@ -32,7 +32,7 @@ from sglang_tpu.kv_pool import (
     kv_pack_heads,
 )
 from sglang_tpu.muse_megakernel import kernel as K
-from sglang_tpu.muse_megakernel.ep_mk.kernel import ep_megakernel_call
+from sglang_tpu.muse_megakernel.ep_mk.kernel import ep_arm, ep_megakernel_call
 from sglang_tpu.muse_megakernel.mk import trace as mk_trace
 
 logger = logging.getLogger(__name__)
@@ -68,11 +68,12 @@ def _row_tile() -> int:
     return _dev_int("SGLANG_TPU_MUSE_MK_DEV_ROW_TILE", _ROW_TILE)
 
 
-def step_rows(n_tokens: int, tp: int) -> int:
-    """Padded rows of a step: a multiple of the TP size; row-tiled steps also of the row tile
-    (each device then owns rows / tp rows of the expert reduce-scatter and u all-gather)."""
+def step_rows(n_tokens: int, tp: int, ep: bool = False) -> int:
+    """Padded rows of a step: a multiple of the TP size; row-tiled steps (every EP step) also
+    of the row tile (each device then owns rows / tp rows of the expert reduce-scatter and u
+    all-gather)."""
     rows = _round_up(n_tokens, tp)
-    if rows > BASE_STEP_MAX_ROWS:
+    if rows > BASE_STEP_MAX_ROWS or ep:
         rows = _round_up(n_tokens, math.lcm(_row_tile(), tp))
     return rows
 
@@ -593,7 +594,8 @@ class MuseMegakernel(torch.nn.Module):
         g = self.geo
         opt = tpu_envs.SGLANG_TPU_MUSE_MK_OPT.get()
         fold_env = tpu_envs.SGLANG_TPU_MUSE_MK_FOLD.get()
-        tiled = rows > BASE_STEP_MAX_ROWS
+        # the EP layout runs the row-tiled program at every size (ep_mk.config.ep_arm)
+        tiled = rows > BASE_STEP_MAX_ROWS or self.ep
         # few-row steps (decode) gather their rows in one round and have nothing to fold
         fold_base = fold_env and n_req * q > 2 and not tiled
         unshifted = (
@@ -924,9 +926,10 @@ class MuseMegakernel(torch.nn.Module):
                 )
 
     def callable_for(self, cfg: K.MKConfig):
-        if cfg not in self._ops:
-            self._ops[cfg] = _build_callable(cfg, self.tp_size, self.ep)
-        return self._ops[cfg]
+        arm = ep_arm(cfg.rows) if self.ep else None
+        if (cfg, arm) not in self._ops:
+            self._ops[(cfg, arm)] = _build_callable(cfg, self.tp_size, arm)
+        return self._ops[(cfg, arm)]
 
     def prefill_config(self, *, rows: int, capture: tuple):
         from sglang_tpu.muse_megakernel import prefill as PF
@@ -969,7 +972,7 @@ class MuseMegakernel(torch.nn.Module):
     def handles(self, forward_batch, num_tokens: int) -> bool:
         mode = forward_batch.forward_mode
         if mode.is_decode() or mode.is_target_verify():
-            return step_rows(num_tokens, self.tp_size) <= self.max_rows
+            return step_rows(num_tokens, self.tp_size, self.ep) <= self.max_rows
         if not (self.prefill and mode.is_extend()):
             return False
         # token buckets (tpu_compile_tokens) must tile the prefill kernels
@@ -1007,7 +1010,7 @@ class MuseMegakernel(torch.nn.Module):
         T = embeds.shape[0]
         if T % n_req:
             raise ValueError(f"{T} rows do not split evenly over {n_req} requests")
-        rows = step_rows(T, self.tp_size)
+        rows = step_rows(T, self.tp_size, self.ep)
         pad = rows - T
         emb = embeds.to(torch.bfloat16)
         pos = positions.to(torch.int32)
@@ -1326,15 +1329,15 @@ def _export_program(body, *, tp: int, n_args: int, kv0: int, n_out: int, tag: st
     return callable_
 
 
-def _build_callable(cfg: K.MKConfig, tp: int, ep: bool = False):
+def _build_callable(cfg: K.MKConfig, tp: int, ep: str | None = None):
     """The megakernel + KV scatter as one jitted ``shard_map`` program over the TP mesh; with
-    ep, the EP megakernel (ep_mk: whole experts per rank, row-tiled steps only)."""
+    ep (an ep_arm), that arm of the EP megakernel (ep_mk: whole experts per rank)."""
     L = cfg.n_layers
     nw = len(K.WEIGHT_NAMES)
     ne = K.n_expert_refs(cfg)
     n_args = 5 + nw + ne + L
     kv0 = 5 + nw + ne
-    mk = ep_megakernel_call(cfg) if ep else K.megakernel_call(cfg)
+    mk = ep_megakernel_call(cfg, arm=ep) if ep else K.megakernel_call(cfg)
     kvw = K.kv_write_call(cfg)
 
     def body(*xs):
@@ -1349,11 +1352,12 @@ def _build_callable(cfg: K.MKConfig, tp: int, ep: bool = False):
         n_args=n_args,
         kv0=kv0,
         n_out=2 + L,
-        tag=f"muse_{'ep_' if ep else ''}megakernel_{tag}",
+        tag=f"muse_{f'ep_{ep}_' if ep else ''}megakernel_{tag}",
     )
     logger.info(
-        "Muse megakernel built: rows=%d q=%d requests=%d capture=%s pages/seq=%d "
+        "Muse megakernel built: ep=%s rows=%d q=%d requests=%d capture=%s pages/seq=%d "
         "row_tile=%d ring=%d folds=%s",
+        ep,
         cfg.rows,
         cfg.rows_per_req,
         cfg.n_req,

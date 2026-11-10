@@ -15,10 +15,11 @@ streams. Run one process per device:
 Rank 0 prints one MK_NUMERICS line per (case, layer) and MK_NUMERICS_PASS when every check
 holds; every rank prints MK_NUMERICS_DONE.
 
---ep runs the EP megakernel (muse_megakernel/ep_mk, cases of >= 64 rows): each rank gets its
-32 whole experts and the replicated pool / unpool assembled from every rank's slices, in
-ep_mk's layout (the pooled width permuted as ep_mk.kernel.pooled_perm); fp8 experts then share
-one w2 column scale across slices, as a checkpoint's whole expert does.
+--ep runs the EP megakernel (muse_megakernel/ep_mk): each rank gets its 32 whole experts and
+the replicated pool / unpool assembled from every rank's slices, in ep_mk's layout (the pooled
+width permuted as ep_mk.kernel.pooled_perm); fp8 experts then share one w2 column scale across
+slices, as a checkpoint's whole expert does. Its arm is ep_mk.config.ep_arm's
+(SGLANG_TPU_MUSE_MK_EP_ARM=a2a | gather forces one; a2a needs >= 64 rows).
 """
 
 import argparse
@@ -91,6 +92,24 @@ CASES = {
         Case("salfp8_c1q1_s", "sal_fp8", 1, 1, (2100,)),
         Case("salfp8_c2q8_l", "sal_fp8", 2, 8, (20000, 13000), expert_group=2),
         Case("salfp8_c2q8_s", "sal_fp8", 2, 8, (1500, 3100)),
+        Case("salfp8_c1q4_s", "sal_fp8", 1, 4, (2300,), opt_in=True),
+        # 64 and 96 rows: the EP arms' crossover range
+        Case(
+            "salfp8_c8q8_s",
+            "sal_fp8",
+            8,
+            8,
+            tuple(900 + 97 * i for i in range(8)),
+            opt_in=True,
+        ),
+        Case(
+            "salfp8_c12q8_s",
+            "sal_fp8",
+            12,
+            8,
+            tuple(900 + 97 * i for i in range(12)),
+            opt_in=True,
+        ),
         # past the 32-chunk (32k-token) KV ring: the pipelined loop refills it
         Case("salfp8_c2q8_xl", "sal_fp8", 2, 8, (70000, 41000)),
         # 40 live rows padded to 48: the row-tiled program (MKConfig.row_tile)
@@ -504,9 +523,10 @@ class StepInputs(msgspec.Struct):
 
 def step_inputs(case: Case) -> StepInputs:
     ps = _PAGES[case.kv]
-    # ops.step_rows: the TP size, and past 32 rows the 16-row tile of the row-tiled program
+    # ops.step_rows: the TP size, and past 32 rows (every EP step) the 16-row tile of the
+    # row-tiled program
     rows = -(-case.n_req * case.q // TP) * TP
-    if rows > 32:
+    if rows > 32 or _EP:
         rows = -(-case.n_req * case.q // math.lcm(16, TP)) * math.lcm(16, TP)
     n_live = case.n_req * case.q
     pps = -(-(max(case.ctx) + case.q) // ps)

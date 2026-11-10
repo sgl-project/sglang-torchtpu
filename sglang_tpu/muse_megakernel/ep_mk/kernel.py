@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The EP decode megakernel: muse_megakernel.kernel's row-tiled program with the EPExperts
-FFN section (sequence-parallel, two ragged all-to-alls), and the layout of its weights."""
+"""The EP decode megakernel: muse_megakernel.kernel's row-tiled program with an EP FFN section
+on 32 whole experts per rank, and the layout of its weights. Two arms (config.ep_arm): a2a
+(EPExperts: sequence-parallel, two ragged all-to-alls) and gather (EPGatherExperts: every row
+on every rank, small steps)."""
 
 import jax
 import numpy as np
 
-from sglang_tpu.muse_megakernel.ep_mk.config import ep_expert_shapes, ep_mk_config
+from sglang_tpu.muse_megakernel.ep_mk.config import (
+    ep_arm,
+    ep_expert_shapes,
+    ep_mk_config,
+)
 from sglang_tpu.muse_megakernel.ep_mk.experts import (
     chunk_cols,
     fp4_weights_kperm,
@@ -14,20 +20,35 @@ from sglang_tpu.muse_megakernel.ep_mk.experts import (
     qblock,
     requant_fp4_kperm,
 )
+from sglang_tpu.muse_megakernel.ep_mk.gather import EPGatherExperts
 from sglang_tpu.muse_megakernel.ep_mk.layer import EPExperts
 from sglang_tpu.muse_megakernel.kernel import megakernel_call
 from sglang_tpu.muse_megakernel.mk.config import MKConfig
 
-__all__ = ["ep_expert_shapes", "ep_expert_weights", "ep_megakernel_call", "pooled_perm"]
+__all__ = [
+    "ep_arm",
+    "ep_expert_shapes",
+    "ep_expert_weights",
+    "ep_megakernel_call",
+    "pooled_perm",
+]
 
 
-def ep_megakernel_call(cfg: MKConfig, axis: str = "model"):
+def ep_megakernel_call(cfg: MKConfig, axis: str = "model", arm: str | None = None):
     """megakernel_call's f(meta, pos, pages_full, pages_swa, emb, *weights, *experts, *kv), with
     each layer's experts as ep_expert_shapes (ep_expert_weights), wpool / wunpool replicated
     ([L, H, H_e] and [L, H_e, H] fp8, their scales whole in the smalls rows) and the pooled
-    width in pooled_perm order (wpool's columns, wpool_s, pre_expert_w)."""
+    width in pooled_perm order (wpool's columns, wpool_s, pre_expert_w). arm: a2a | gather,
+    None for ep_arm(cfg.rows); an arm that cannot serve the step raises."""
     cfg = ep_mk_config(cfg)
-    return megakernel_call(cfg, axis, ep=EPExperts(cfg))
+    arm = ep_arm(cfg.rows) if arm is None else arm
+    if arm == "a2a":
+        hook: EPExperts | EPGatherExperts = EPExperts(cfg)
+    elif arm == "gather":
+        hook = EPGatherExperts(cfg)
+    else:
+        raise ValueError(f"EP arm {arm!r}: a2a or gather")
+    return megakernel_call(cfg, axis, ep=hook)
 
 
 def pooled_perm(he: int) -> np.ndarray:

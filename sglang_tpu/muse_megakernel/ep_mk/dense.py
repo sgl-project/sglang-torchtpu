@@ -25,23 +25,31 @@ def stream_matmul(
     N: int,
     on_cols: Callable[[int, jax.Array], None],
     skip: bool = False,
+    n_off: jax.Array | int = 0,
+    tn: int = DN_TN,
 ) -> None:
-    """x [rows, K] bf16 @ w_hbm[layer] ([L, K, N] fp8, per-column scale [1, N] f32);
-    x_cols(k0, n) loads x's columns [k0, k0 + n), on_cols(n0, y) gets each finished
-    [rows, DN_TN] f32 column tile. skip: timing only, no stream and no output."""
+    """x [rows, K] bf16 @ w_hbm[layer] columns [n_off, n_off + N) ([L, K, *] fp8, per-column
+    scale [1, N] f32 of those columns); x_cols(k0, n) loads x's columns [k0, k0 + n),
+    on_cols(n0, y) gets each finished [rows, tn] f32 column tile (n0 from 0). skip: timing
+    only, no stream and no output."""
     ring, sems = S["w13"], S["ep_dn_sems"]
     if skip:
         return
     nslot = ring.shape[0]
-    nk, nn = K // DN_TK, N // DN_TN
+    nk, nn = K // DN_TK, N // tn
     tiles = [(ni, ki) for ni in range(nn) for ki in range(nk)]
     w32 = w_hbm.bitcast(jnp.uint32)  # [L, K / 4, N]
 
     def copy(t):
         ni, ki = tiles[t]
+        c0 = n_off + ni * tn
         return pltpu.make_async_copy(
-            w32.at[layer, pl.ds(ki * DN_TK // 4, DN_TK // 4), pl.ds(ni * DN_TN, DN_TN)],
-            ring.at[t % nslot, pl.ds(0, DN_TK // 4), pl.ds(0, DN_TN)],
+            w32.at[
+                layer,
+                pl.ds(ki * DN_TK // 4, DN_TK // 4),
+                pl.ds(c0 if isinstance(c0, int) else pl.multiple_of(c0, tn), tn),
+            ],
+            ring.at[t % nslot, pl.ds(0, DN_TK // 4), pl.ds(0, tn)],
             sems.at[t % nslot],
         )
 
@@ -53,10 +61,8 @@ def stream_matmul(
         if t + depth < len(tiles):
             copy(t + depth).start()
         copy(t).wait()
-        w = ring.at[t % nslot].bitcast(jnp.float8_e4m3fn)[
-            pl.ds(0, DN_TK), pl.ds(0, DN_TN)
-        ]
+        w = ring.at[t % nslot].bitcast(jnp.float8_e4m3fn)[pl.ds(0, DN_TK), pl.ds(0, tn)]
         part = jnp.dot(x_cols(ki * DN_TK, DN_TK), w, preferred_element_type=jnp.float32)
         acc = part if ki == 0 else acc + part
         if ki == nk - 1:
-            on_cols(ni * DN_TN, acc * scale[:, ni * DN_TN : (ni + 1) * DN_TN])
+            on_cols(ni * tn, acc * scale[:, ni * tn : (ni + 1) * tn])

@@ -2,6 +2,7 @@
 """The EP plan of one row-tiled step: each rank's own rows (R / tp), 32 whole experts per
 rank, the two ragged all-to-alls' buffers and the scratch the FFN section adds."""
 
+import os
 from collections.abc import Callable
 from typing import Any, NamedTuple
 
@@ -15,7 +16,11 @@ from sglang_tpu.muse_megakernel.mk.config import MKConfig
 from sglang_tpu.muse_megakernel.mk.consts import LANE
 from sglang_tpu.muse_megakernel.mk.plan import fit_ring_slots
 
-MIN_ROWS = 64  # EP serves the large-row steps only
+MIN_ROWS = 64  # the a2a arm's smallest step
+DEFAULT_A2A_MIN_ROWS = (
+    128  # SGLANG_TPU_MUSE_MK_EP_MIN_ROWS: auto picks a2a from here up
+)
+ARMS = ("a2a", "gather")
 TAB_ROWS = 32  # route.slot_tables' rows
 SEG = 8  # a2a segments start on 8-row (HBM tile) boundaries and move in 8-row DMAs
 DN_TK, DN_TN = 2048, 1024  # a replicated pool / unpool tile: one fp4 expert-ring slot
@@ -58,10 +63,12 @@ def ep_mk_config(c: MKConfig) -> MKConfig:
     """The step's MKConfig for the EP kernel: replicated pool / unpool stream outside the
     dense ring (refitted to the tiles left); no folds into the router or the next qkvg (the
     FFN section runs on own rows and ends in a row all-gather); the TP expert section's VMEM
-    y buffers go unused (pad_y in HBM)."""
+    y buffers go unused (pad_y in HBM); no single-row collectives (the hook's o-proj
+    replaces them at every row count)."""
     c = msgspec.structs.replace(
         c,
         dense_skip=("wpool", "wunpool"),
+        single_row_coll=False,
         fold_o=False,
         fold_f=False,
         tiled_vmem_y=0,
@@ -74,8 +81,30 @@ def ep_mk_config(c: MKConfig) -> MKConfig:
     )
 
 
+def ep_arm(rows: int) -> str:
+    """The EP execution arm of a step of rows rows: SGLANG_TPU_MUSE_MK_EP_ARM (auto | a2a |
+    gather); auto takes a2a from SGLANG_TPU_MUSE_MK_EP_MIN_ROWS rows up. Read at trace time."""
+    arm = os.environ.get("SGLANG_TPU_MUSE_MK_EP_ARM", "auto")
+    if arm not in ("auto", *ARMS):
+        raise ValueError(f"SGLANG_TPU_MUSE_MK_EP_ARM={arm!r}: auto, a2a or gather")
+    if arm != "auto":
+        return arm
+    lo = int(
+        os.environ.get("SGLANG_TPU_MUSE_MK_EP_MIN_ROWS", str(DEFAULT_A2A_MIN_ROWS))
+    )
+    if lo < MIN_ROWS:
+        raise ValueError(
+            f"SGLANG_TPU_MUSE_MK_EP_MIN_ROWS={lo}: the a2a arm needs >= {MIN_ROWS} rows"
+        )
+    return "a2a" if rows >= lo else "gather"
+
+
 def ep_plan(c: MKConfig, item_rows: int = 32) -> EPPlan:
-    assert c.row_tile and c.rows >= MIN_ROWS, "EP serves row-tiled steps of >= 64 rows"
+    if not (c.row_tile and c.rows >= MIN_ROWS):
+        raise ValueError(
+            f"the EP a2a arm serves row-tiled steps of >= {MIN_ROWS} rows, got {c.rows} "
+            "(SGLANG_TPU_MUSE_MK_EP_ARM=gather serves them)"
+        )
     assert not c.scale_fp8 and c.n_experts % c.tp == 0 and c.rows % c.tp == 0
     assert c.inter_local % BD_KC == 0 and c.expert_hidden % BD_KC == 0
     assert c.n_experts_padded == c.n_experts and c.expert_hidden % DN_TN == 0
@@ -96,6 +125,34 @@ def ep_plan(c: MKConfig, item_rows: int = 32) -> EPPlan:
         send_rows=-(-(rc * k + pad) // SEG) * SEG,
         recv_rows=-(-(c.rows * k + pad) // SEG) * SEG,
         max_items=el + -(-c.rows * k // item_rows),
+        nslot=c.expert_depth + 1,
+    )
+
+
+def gather_plan(c: MKConfig, item_rows: int = 32) -> EPPlan:
+    """The gather arm's plan: every rank holds every row; the a2a buffers are unused."""
+    if not c.row_tile:
+        raise ValueError(
+            "the EP gather arm runs the row-tiled program (MuseMegakernel.ep)"
+        )
+    assert not c.scale_fp8 and c.n_experts % c.tp == 0
+    assert c.inter_local % BD_KC == 0 and c.expert_hidden % BD_KC == 0
+    assert c.n_experts_padded == c.n_experts and c.hidden // c.hidden_local == c.tp
+    assert c.expert_hidden % (2 * LANE * c.tp) == 0 and c.hidden % DN_TK == 0
+    assert c.expert_hidden % DN_TK == 0 and c.rows * c.top_k < 4096
+    item_sizes(item_rows)
+    el = c.n_experts // c.tp
+    return EPPlan(
+        experts=el,
+        inter=c.inter_local * c.tp,
+        chunk_fp4=c.inter_local,
+        chunk_fp8=c.inter_local,
+        item_rows=item_rows,
+        rows_own=c.rows,
+        rows_own_padded=c.rows,
+        send_rows=0,
+        recv_rows=0,
+        max_items=el + -(-c.rows * c.top_k // item_rows),
         nslot=c.expert_depth + 1,
     )
 
@@ -147,20 +204,26 @@ def ep_buffers(c: MKConfig, p: EPPlan, S: dict) -> EPBuffers:
     )
 
 
+def item_scratch(c: MKConfig, p: EPPlan) -> list:
+    """An item's x / acc / y rows, unless they live in S["lhs"] (ep_buffers)."""
+    if _item_rows_in_lhs(c, p):
+        return []
+    ri, he, vmem = p.item_rows, c.expert_hidden, pltpu.VMEM
+    return [
+        ("ep_x", vmem((2, ri, he // 2), jnp.uint32)),  # an item's x rows, bf16 pairs
+        ("ep_acc", vmem((ri, he), jnp.float32)),
+        ("ep_y", vmem((ri, he // 2), jnp.uint32)),  # an item's y rows, bf16 pairs
+    ]
+
+
 def ep_scratch(c: MKConfig, p: EPPlan) -> list:
     """Buffers the EP FFN section adds to the row-tiled plan."""
-    ri, he, tp, k = p.item_rows, c.expert_hidden, c.tp, c.top_k
+    he, tp, k = c.expert_hidden, c.tp, c.top_k
     win = window_rows(c)  # own rows are computed in the aligned window around them
     vmem, smem, hbm = pltpu.VMEM, pltpu.SMEM, pltpu.HBM
     u32, i32, f32 = jnp.uint32, jnp.int32, jnp.float32
     dma = pltpu.SemaphoreType.DMA
-    items = []
-    if not _item_rows_in_lhs(c, p):
-        items += [
-            ("ep_x", vmem((2, ri, he // 2), u32)),  # an item's x rows, bf16 pairs
-            ("ep_acc", vmem((ri, he), f32)),
-            ("ep_y", vmem((ri, he // 2), u32)),  # an item's y rows, bf16 pairs
-        ]
+    items = item_scratch(c, p)
     if c.tiled_vmem_pads:
         items += [("ep_lhs_stage", vmem((c.row_tile, c.hidden), u32))]
     return items + [

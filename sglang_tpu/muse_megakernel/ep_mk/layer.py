@@ -11,6 +11,8 @@ aligned window around them (window_rows); only own rows are written or sent.
 
 import contextlib
 import os
+from collections.abc import Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -128,7 +130,7 @@ class EPExperts:
                     a2a.wait_dispatch(c, S, me)
 
         with _phase("experts"):
-            _expert_loop(step, p, n_items, dispatched)
+            expert_loop(step, p, n_items, dispatched)
         with _phase("combine_a2a"):
             if moving:
                 a2a.wait_give_back(c, S, me)
@@ -304,12 +306,13 @@ def _chunk_refs(step: EPLayerStep, p: EPPlan, slot) -> ChunkRefs:
     )
 
 
-def _item_rows(S: dict, buf, b, first, n, start: bool) -> None:
-    """Starts (or waits for) the item's n x-row copies from ep_xr into buf.x(b)."""
+def _item_rows(S: dict, buf, b, first, n, start: bool, src_buf: str) -> None:
+    """Starts (or waits for) the item's n x-row copies from src_buf into buf.x(b)."""
     sem = S["ep_x_sems"].at[b]
 
     def one(t, carry):
-        src = S["ep_xr"].at[pl.ds(S["ep_rows"][first + t] & (2**route.ROW_BITS - 1), 1)]
+        row = S["ep_rows"][first + t] & (2**route.ROW_BITS - 1)
+        src = S[src_buf].at[pl.ds(row, 1)]
         cp = pltpu.make_async_copy(src, buf.x(b).at[pl.ds(t, 1)], sem)
         if start:
             cp.start()
@@ -320,17 +323,38 @@ def _item_rows(S: dict, buf, b, first, n, start: bool) -> None:
     jax.lax.fori_loop(0, n, one, 0)
 
 
-def _expert_loop(step: EPLayerStep, p: EPPlan, n_items, dispatched) -> None:
-    """Every received slot's expert output back to its source's ep_yb row, item by item;
-    dispatched() waits for the slots (the first weight chunks are in flight by then). The
-    loop runs inside the layer's for_layer leaf: a chunk's copies take no branch-tree walk."""
+# emit(i, first, n): an item's finished acc rows (its last chunk), in place of the y return
+ItemOut = Callable[[Any, Any, Any], None]
+
+
+def expert_loop(
+    step: EPLayerStep,
+    p: EPPlan,
+    n_items,
+    dispatched: Callable[[], None],
+    x_src: str = "ep_xr",
+    emit: ItemOut | None = None,
+) -> None:
+    """Every received slot's expert output back to its source's ep_yb row (or to emit), item
+    by item; x rows come from x_src; dispatched() waits for the slots (the first weight
+    chunks are in flight by then). The loop runs inside the layer's for_layer leaf: a chunk's
+    copies take no branch-tree walk."""
     step.for_layer(
-        lambda refs, off: _expert_loop_on(step, p, n_items, dispatched, refs, off)
+        lambda refs, off: _expert_loop_on(
+            step, p, n_items, dispatched, refs, off, x_src, emit
+        )
     )
 
 
 def _expert_loop_on(
-    step: EPLayerStep, p: EPPlan, n_items, dispatched, refs, off
+    step: EPLayerStep,
+    p: EPPlan,
+    n_items,
+    dispatched: Callable[[], None],
+    refs,
+    off,
+    x_src: str,
+    emit: ItemOut | None,
 ) -> None:
     c, S, me = step.c, step.S, step.me
     He, NC, RI = c.expert_hidden, p.n_chunks(step.kind), p.item_rows
@@ -370,7 +394,7 @@ def _expert_loop_on(
 
     @pl.when(n_items > 0)
     def _():
-        _item_rows(S, buf, 0, items[2], items[3], start=True)
+        _item_rows(S, buf, 0, items[2], items[3], start=True, src_buf=x_src)
 
     def body(k, carry):
         i, _, first, n, j = item(k)
@@ -380,12 +404,18 @@ def _expert_loop_on(
         @pl.when(j == 0)
         @_phase_fn("item_in", 2)
         def _():
-            _item_rows(S, buf, b, first, n, start=False)
+            _item_rows(S, buf, b, first, n, start=False, src_buf=x_src)
 
             @pl.when(i + 1 < n_items)
             def _():
                 _item_rows(
-                    S, buf, 1 - b, items[5 + 3 * i], items[6 + 3 * i], start=True
+                    S,
+                    buf,
+                    1 - b,
+                    items[5 + 3 * i],
+                    items[6 + 3 * i],
+                    start=True,
+                    src_buf=x_src,
                 )
 
             def zero(z):
@@ -407,6 +437,15 @@ def _expert_loop_on(
                 CI,
                 RI,
             )
+
+        if emit is not None:
+
+            @pl.when(j == NC - 1)
+            @_phase_fn("item_out", 2)
+            def _():
+                emit(i, first, n)
+
+            return carry
 
         @pl.when(j == NC - 1)
         @_phase_fn("item_out", 2)
@@ -463,6 +502,8 @@ def _expert_loop_on(
             return carry
 
         jax.lax.fori_loop(D, jnp.maximum(total, D), late, 0)
+    if emit is not None:
+        return
 
     @pl.when(n_items > 0)
     def _():
