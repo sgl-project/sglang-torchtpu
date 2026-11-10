@@ -4775,7 +4775,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             def run_ffn_and_store(
                 nrows, pair_fn, slot, e, blockdiag, first, n_valid, wait_w2=True
             ):
-                if c.qblock and kind == "fp4" and blockdiag:
+                if c.qblock and kind == "fp4" and not blockdiag:
                     # w2 waited for up front: a mid-arm DMA wait is a scheduling barrier
                     # that drains the MXU between w13 and w2
                     wait_w2_if_needed(slot, wait_w2)
