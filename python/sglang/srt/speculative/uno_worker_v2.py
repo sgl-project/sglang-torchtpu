@@ -445,7 +445,7 @@ class UnoWorkerV2(BaseSpecWorker):
 
         if batch.seq_lens.is_cuda:
             batch.seq_lens.record_stream(
-                torch.get_device_module(self.device).current_stream()
+                torch.accelerator.current_stream(self.device)
             )
 
         batch_size = len(batch.seq_lens)
@@ -565,7 +565,7 @@ class UnoWorkerV2(BaseSpecWorker):
             # UNO must explicitly order its freshly derived tensor before the
             # plan stream assigns Q verify cache locations from it.
             self.plan_stream.wait_stream(
-                torch.get_device_module(self.device).current_stream()
+                torch.accelerator.current_stream(self.device)
             )
         eagle_result = run_eagle_verify(
             verify_batch,
@@ -627,7 +627,7 @@ class UnoWorkerV2(BaseSpecWorker):
 
         if batch.seq_lens.is_cuda:
             batch.seq_lens.record_stream(
-                torch.get_device_module(self.device).current_stream()
+                torch.accelerator.current_stream(self.device)
             )
 
         batch_size = len(batch.seq_lens)

@@ -1359,8 +1359,8 @@ cached_device_index = -1
 def get_current_device_stream_fast():
     global cached_device_index
     if cached_device_index == -1:
-        cached_device_index = torch.get_device_module().current_device()
-    return torch.get_device_module().current_stream(cached_device_index)
+        cached_device_index = torch.accelerator.current_device_index()
+    return torch.accelerator.current_stream(cached_device_index)
 
 
 # ==============================================================================
