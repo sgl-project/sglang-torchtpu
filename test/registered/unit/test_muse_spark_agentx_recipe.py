@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT))
 
 from benchmark.tpu.launch_server import load_recipe, plan_launch  # noqa: E402
 from benchmark.tpu.recipe.configs.muse_spark import (  # noqa: E402
+    agentx,
     agentx_summary,
     windowed_draft,
 )
@@ -126,6 +127,14 @@ class TestAgentxRecipes(unittest.TestCase):
         # The slow tail: 1 / (p90 ITL), between 1 / 0.1 and 1 / 0.05.
         self.assertAlmostEqual(summary["p90_interactivity"], 1 / (0.05 + 0.9 * 0.05))
 
+    def test_eval_mode_keeps_spec_recompile_and_clears_torch_logs(self):
+        plan = plan_launch(
+            agentx.config_for(1, simulate_acceptance=False),
+            inherited={"TORCH_LOGS": "+recompiles"},
+        )
+        self.assertEqual(plan.env["SGLANG_TPU_ALLOW_SPEC_RECOMPILE"], "1")
+        self.assertNotIn("TORCH_LOGS", plan.env)
+
 
 # The submitted launch: what every swept point shares, then each point's own.
 COMMON_FLAGS = {
@@ -158,6 +167,7 @@ COMMON_FLAGS = {
     "--enable-hierarchical-cache": [],
     "--hicache-io-backend": ["raiden"],
     "--hicache-mem-layout": ["page_first_fused"],
+    "--log-level-http": ["warning"],
 }
 
 COMMON_ENV = {
@@ -172,13 +182,19 @@ COMMON_ENV = {
     "SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR": "1.0",
     "SGLANG_PREFILL_CHUNK_SHARE_MIN_TOKENS": "1024",
     "SGLANG_PREFILL_DECODE_INTERVAL_SKIP_IDLE": "1",
+    "SGLANG_SET_CPU_AFFINITY": "1",
     "SGLANG_SIMULATE_ACC_LEN": "4.05",
     "SGLANG_SIMULATE_ACC_METHOD": "match-expected",
     "SGLANG_SIMULATE_ACC_TOKEN_MODE": "real-draft-token",
     "SGLANG_SPEC_TP_SYNC": "rng",
     "SGLANG_TIMEOUT_KEEP_ALIVE": "900",
-    "SGLANG_TPU_ALLOW_SPEC_RECOMPILE": "1",
+    "SGLANG_TPU_ALLOW_SPEC_RECOMPILE": "0",
+    "SGLANG_TPU_AOT_LEAN_RUNTIME_WRAPPER": "1",
+    "SGLANG_TPU_DECODE_SKIP_GUARD_EVAL": "1",
     "SGLANG_TPU_DFLASH_FP8_DRAFT": "1",
+    "SGLANG_TPU_DYNAMO_PARAMS_AS_GRAPH_ATTRS": "2",
+    "SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER": "1",
+    "SGLANG_TPU_ENABLE_SCHEDULER_THREAD_PINNING": "1",
     "SGLANG_TPU_FP4_DEQUANT_VIA_FP8": "1",
     "SGLANG_TPU_FUSED_RS_ETP_FUSED_COMBINE": "1",
     "SGLANG_TPU_FUSED_RS_ETP_LOCAL_ROWS": "1",
@@ -206,18 +222,22 @@ COMMON_ENV = {
     "SGLANG_TPU_MUSE_MK_LARGE_STEP_ATTN_PIPE": "1",
     "SGLANG_TPU_MUSE_MK_SAL_SWA_CHUNK_TOKENS": "512",
     "SGLANG_TPU_MUSE_PREFILL_SP": "1",
+    "SGLANG_TPU_MUSE_ROPE_ROLL": "1",
+    "SGLANG_TPU_MUSE_SHARED_DENSE": "1",
     "SGLANG_TPU_OVERLAP_PROFILE": "1",
     "SGLANG_TPU_PRELOAD_TELEMETRY_STUB": "1",
     "SGLANG_TPU_RAIDEN_COALESCE_PAGES": "1",
+    "SGLANG_TPU_RPA_EXP2_SOFTMAX": "1",
     "SGLANG_TPU_RPA_NO_MAX": "1",
+    "SGLANG_TPU_RPA_ONES_V": "1",
     "SGLANG_TPU_RPA_OUT_HEAD_NORM_EPS": "1e-05",
     "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1",
     "SGLANG_TPU_RPA_SKIP_PAD_Q": "1",
     "SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP": "256",
     "SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS": "512:512",
     "SGLANG_TPU_RPA_TRANSPOSED": "1",
+    "SGLANG_TPU_SPLIT_EXEC_DIRECT_CALL": "1",
     "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV": "1",
-    "TORCH_LOGS": "+recompiles",
     "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS": "false",
     "TPU_DIAGNOSTIC_HARVESTER_INTERVAL_SEC": "86400",
     "TPU_DISABLE_DIAGNOSTIC_COORDINATOR": "1",
@@ -307,6 +327,9 @@ PER_CONC = {
                 "10",
                 "11",
                 "12",
+                "13",
+                "14",
+                "15",
                 "16",
             ],
             "--tpu-compile-tokens": ["4096"],
@@ -345,6 +368,9 @@ PER_CONC = {
                 "10",
                 "11",
                 "12",
+                "13",
+                "14",
+                "15",
                 "16",
             ],
             "--tpu-compile-tokens": ["4096"],

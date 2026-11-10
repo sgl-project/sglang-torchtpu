@@ -204,7 +204,10 @@ class TestAccuracyRecipes(unittest.TestCase):
         for recipe in self.MULTIHOST + self.SINGLE_HOST:
             with self.subTest(recipe=recipe):
                 plan = plan_launch(load_recipe(recipe), inherited={})
-                self.assertEqual(plan.env["TORCH_LOGS"], "+recompiles")
+                if plan.config.runtime_envs.get("TORCH_LOGS", "") is None:
+                    self.assertNotIn("TORCH_LOGS", plan.env)
+                else:
+                    self.assertEqual(plan.env["TORCH_LOGS"], "+recompiles")
                 self.assertEqual(plan.env["SGLANG_TPU_PRELOAD_TELEMETRY_STUB"], "1")
                 self.assertIn("--enable-torch-compile", plan.command)
 
