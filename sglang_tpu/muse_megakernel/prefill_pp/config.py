@@ -223,7 +223,8 @@ def fp4_qblock() -> int:
 
 def fp4_qblock_a8() -> bool:
     """MUSE_PP_QBLOCK_A8=1 with MUSE_PP_QBLOCK: the block-scaled experts take their rows as fp8
-    (amax / 448 per K-block, gmm_v2's W4A8 product) instead of bf16."""
+    (amax / 448 per row) and their codes as e4m3 times each block's scale over its column's
+    largest, one fp8 product per K; the weights must be requant_fp4_blocks(pow2=True)."""
     a8 = os.environ.get("MUSE_PP_QBLOCK_A8", "0") not in ("", "0")
     if a8 and not fp4_qblock():
         raise ValueError("MUSE_PP_QBLOCK_A8 needs MUSE_PP_QBLOCK")

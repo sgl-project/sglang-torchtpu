@@ -13,7 +13,8 @@ with what the kernel wrote into the pool.
 
 MUSE_PP_QBLOCK=256 requantizes the NVFP4 experts to block-256 scales (the reference uses the
 requantized weights) and also reports the expert outputs against the exact block-16 reference;
-MUSE_PP_QBLOCK_A8=1 adds the fp8 rows of gmm_v2's W4A8 product to the reference.
+MUSE_PP_QBLOCK_A8=1 requantizes to power-of-two block scales and models gmm_v2's folded fp8
+product (fp8 rows) in the reference.
 
     python3 test/manual/tpu/test_muse_prefill_pp_numerics.py
 """
@@ -434,21 +435,23 @@ def expert_outputs(c, w, l, xe, ids, slot, cap=96, a8=False):
         return acc.astype(jnp.float32)
 
     def w4a8(x, packed, scales):
-        """gmm_v2's block-scaled W4A8 (MUSE_PP_QBLOCK_A8): bf16 rows quantized to fp8 per
-        weight block (amax / 448), each block's codes product rounded to bf16, then scaled by
-        the row and block scales in bf16 and summed in bf16."""
+        """gmm_v2's folded fp4 A8 product (MUSE_PP_QBLOCK_A8): bf16 rows to fp8 with one
+        amax / 448 scale per row, the codes times each block's scale over its column's largest
+        as e4m3, one f32 product scaled by the row and column scales, rounded to bf16."""
         v, sb = _codes_scales(packed, scales)
         g = v.shape[0] // sb.shape[0]
-        f8max = jnp.bfloat16(float(jnp.finfo(jnp.float8_e4m3fn).max))
-        acc = jnp.zeros((x.shape[0], v.shape[1]), jnp.bfloat16)
-        for b in range(sb.shape[0]):
-            xb = x[:, b * g : (b + 1) * g].astype(jnp.bfloat16)
-            sc = jnp.max(jnp.abs(xb), axis=1, keepdims=True) / f8max
-            inv = jnp.where(sc == 0, jnp.bfloat16(0), jnp.bfloat16(1) / sc)
-            q = (xb * inv).astype(jnp.float8_e4m3fn).astype(jnp.float32)
-            part = _dot(q, v[b * g : (b + 1) * g]).astype(jnp.bfloat16)
-            acc = acc + part * sc * sb[b].astype(jnp.bfloat16)[None, :]
-        return acc.astype(jnp.float32)
+        cs = sb.max(axis=0, keepdims=True)
+        ratio = jnp.repeat(
+            (sb / cs).astype(jnp.bfloat16).astype(jnp.float32), g, axis=0
+        )
+        w8 = (v * ratio).astype(jnp.float8_e4m3fn).astype(jnp.float32)
+        xb = x.astype(jnp.bfloat16)
+        ls = jnp.max(jnp.abs(xb), axis=1, keepdims=True).astype(jnp.float32) / float(
+            jnp.finfo(jnp.float8_e4m3fn).max
+        )
+        inv = jnp.where(ls == 0, 0.0, 1.0 / ls).astype(jnp.bfloat16)
+        q = (xb * inv).astype(jnp.float8_e4m3fn).astype(jnp.float32)
+        return _bf(_dot(q, w8) * ls * cs)
 
     def one(e, w13, s13, w2, s2, xe, hit_e):
         idx = jnp.nonzero(hit_e, size=cap, fill_value=T)[0]
@@ -488,7 +491,9 @@ def main() -> int:
     with jax.default_device(dev):
         w = build_weights(c, seed=11)
         if qblock:
-            requant = jax.jit(lambda a, b: PP_MOE.requant_fp4_blocks(a, b, qblock))
+            requant = jax.jit(
+                lambda a, b: PP_MOE.requant_fp4_blocks(a, b, qblock, fp4_qblock_a8())
+            )
             done = {}
             for ex in w["fp4"]:
                 if id(ex) not in done:

@@ -328,6 +328,8 @@ class InputConfigs:
     # Packed FP4 requantized to one scale per quant_block_size K rows (fp4_qblock): each
     # block's codes go to the MXU as e4m3 against bf16 activations, the scale after the dot.
     fp4_codes_as_fp8: bool = False
+    # fp4_qblock with fp8 rows: block scales folded into the e4m3 codes, one product per K.
+    fp4_fold_a8: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -495,6 +497,39 @@ def generate_block_specs(
 # Define kernels.
 
 
+def _fp4_fold_a8_tile(tiled_lhs, tiled_rhs, tiled_rhs_ref, cfgs: "GmmConfigs"):
+    """[tile_m, tile_n] of block-scaled FP4 (fp4_qblock, A8) over the whole K: bf16 rows to fp8
+    with one amax / 448 scale per row; each block's codes times its scale over the column's
+    largest (a power of two for requant_fp4_blocks(pow2=True) weights: exact in e4m3) as e4m3;
+    one fp8 product per MXU column tile, scaled by the row and column scales."""
+    f8max = float(jnp.finfo(jnp.float8_e4m3fn).max)
+    qb = cfgs.rhs_cfgs.quant_block_size
+    amax = jnp.max(jnp.abs(tiled_lhs), axis=1, keepdims=True).astype(jnp.float32)
+    ls = amax / f8max
+    inv = jnp.where(ls == 0, 0.0, 1.0 / ls)
+    lhs_q = (tiled_lhs * inv.astype(tiled_lhs.dtype)).astype(jnp.float8_e4m3fn)
+    rs = [tiled_rhs_ref.get_scale(b, 1, True) for b in range(cfgs.tiles.tile_k // qb)]
+    cs = functools.reduce(jnp.maximum, rs)  # [1, cols] f32
+    w = jnp.concatenate(
+        [
+            (
+                tiled_rhs[b * qb : (b + 1) * qb].astype(jnp.bfloat16)
+                * (r / cs).astype(jnp.bfloat16)
+            ).astype(jnp.float8_e4m3fn)
+            for b, r in enumerate(rs)
+        ],
+        axis=0,
+    )
+    mxu = pltpu.get_tpu_info().mxu_column_size
+    cols = []
+    for n0 in range(0, w.shape[1], mxu):
+        part = jnp.matmul(
+            lhs_q, w[:, n0 : n0 + mxu], preferred_element_type=jnp.float32
+        )
+        cols.append(part * ls * cs[:, n0 : n0 + mxu])
+    return jnp.concatenate(cols, axis=1)
+
+
 def inner_kernel(
     # In
     tiled_lhs_ref: jax.Array,
@@ -644,6 +679,10 @@ def inner_kernel(
                     acc_n = acc_n + partial_result
                 acc_list.append(acc_n.astype(acc_ref.dtype))
             acc = jnp.concatenate(acc_list, axis=1)
+        elif cfgs.rhs_cfgs.fp4_fold_a8:
+            acc = _fp4_fold_a8_tile(tiled_lhs, tiled_rhs, tiled_rhs_ref, cfgs).astype(
+                acc_ref.dtype
+            )
         else:
             # Quantized matmul path.
             lhs_q_dtype = cfgs.lhs_cfgs.quant_dtype
@@ -1606,6 +1645,7 @@ def make_gmm_configs(
         scale_without_unit_dim=has_scale and rhs_scale.ndim == 3,
         scale_bf16_pairs=scale_bf16_pairs,
         fp4_codes_as_fp8=fp4_qblock is not None and fp4_w4a16,
+        fp4_fold_a8=fp4_qblock is not None and not fp4_w4a16,
     )
     if scale_bf16_pairs and not dequantize_rhs and fp4_qblock is None:
         raise ValueError("bf16-pair rhs scales require VMEM dequantization")
@@ -1726,8 +1766,11 @@ def make_gmm_configs(
         if compact_tile_n != tiles.tile_n:
             tiles = dataclasses.replace(tiles, tile_n=compact_tile_n)
 
-    if fp4_qblock is not None and tiles.tile_k // (2 * fp4_qblock) % 8:
-        # A scale tile is whole sublane tiles of bf16 pairs (or all of them): one K tile.
+    if fp4_qblock is not None and (
+        rhs_cfgs.fp4_fold_a8 or tiles.tile_k // (2 * fp4_qblock) % 8
+    ):
+        # A scale tile is whole sublane tiles of bf16 pairs (or all of them), and the
+        # folded A8 product takes each column's largest block scale: one K tile.
         tiles = dataclasses.replace(tiles, tile_k=dims.size_k)
 
     if rhs_cfgs.scale_without_unit_dim:

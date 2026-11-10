@@ -18,9 +18,13 @@ E2M1_MAGS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 FP4_GROUP = 16  # K rows per served NVFP4 scale
 
 
-def _requant_one(packed, scales, block: int):
+POW2_MAX_SHIFT = 7  # e2m1 codes times 2^-7 are still exact in e4m3 (subnormals)
+
+
+def _requant_one(packed, scales, block: int, pow2: bool):
     """One expert: [K / 2, N] u8 e2m1 pairs (low nibble row 2b) + [K / 32, N] i32 bf16 scale
-    pairs (low half block 2j) -> codes and [K / (2 block), N] i32 scale pairs of block rows."""
+    pairs (low half block 2j) -> codes and [K / (2 block), N] i32 scale pairs of block rows;
+    pow2: each block scale is its column's largest over a power of two (at most 2^7)."""
     k2, n = packed.shape
     k = 2 * k2
     codes = (
@@ -33,6 +37,13 @@ def _requant_one(packed, scales, block: int):
     s16 = jax.lax.bitcast_convert_type(halves, BF16).astype(jnp.float32).reshape(-1, n)
     w = (v * jnp.repeat(s16, FP4_GROUP, axis=0)).reshape(k // block, block, n)
     sb = (jnp.max(jnp.abs(w), axis=1) / E2M1_MAX).astype(BF16)  # [K / block, N]
+    if pow2:
+        cs = jnp.max(sb, axis=0, keepdims=True).astype(jnp.float32)
+        a = jnp.maximum(sb.astype(jnp.float32), cs * 2.0**-POW2_MAX_SHIFT)
+        shift = jnp.floor(jnp.log2(jnp.where(cs > 0, cs / a, 1.0)))
+        sb = jnp.ldexp(
+            cs, -jnp.clip(shift, 0, POW2_MAX_SHIFT).astype(jnp.int32)
+        ).astype(BF16)
     sbf = sb.astype(jnp.float32)
     q = jnp.clip(w / jnp.where(sbf > 0, sbf, 1.0)[:, None, :], -E2M1_MAX, E2M1_MAX)
     qa = jnp.abs(
@@ -50,11 +61,14 @@ def _requant_one(packed, scales, block: int):
     return out, pairs
 
 
-def requant_fp4_blocks(packed, scales, block: int):
+def requant_fp4_blocks(packed, scales, block: int, pow2: bool = False):
     """Served NVFP4 experts [E, K / 2, N] u8 + [E, K / 32, N] i32 -> the same codes layout
     requantized to one bf16 scale per block K rows (amax / 6, e2m1 re-rounded) and the scales
-    as [E, K / (2 block), N] i32 pairs, the MUSE_PP_QBLOCK layout. Lossy."""
-    return jax.lax.map(lambda a: _requant_one(a[0], a[1], block), (packed, scales))
+    as [E, K / (2 block), N] i32 pairs, the MUSE_PP_QBLOCK layout; pow2 (MUSE_PP_QBLOCK_A8):
+    block scales are their column's largest over powers of two. Lossy."""
+    return jax.lax.map(
+        lambda a: _requant_one(a[0], a[1], block, pow2), (packed, scales)
+    )
 
 
 def experts(c: PPConfig, xe, ids, tw, ex):
