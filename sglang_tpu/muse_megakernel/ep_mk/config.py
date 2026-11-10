@@ -133,7 +133,7 @@ def gather_plan(c: MKConfig, item_rows: int = 32) -> EPPlan:
     """The gather arm's plan: every rank holds every row; the a2a buffers are unused."""
     if not c.row_tile:
         raise ValueError(
-            "the EP gather arm runs the row-tiled program (MuseMegakernel.ep)"
+            "the EP gather arm runs the row-tiled program (MuseMegakernel.moe_mode ep)"
         )
     assert not c.scale_fp8 and c.n_experts % c.tp == 0
     assert c.inter_local % BD_KC == 0 and c.expert_hidden % BD_KC == 0

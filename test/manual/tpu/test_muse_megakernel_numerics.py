@@ -594,7 +594,7 @@ class _Runner:
         mk.kv_packed = True
         mk.expert_groups = ()
         mk.scale_fp8 = False
-        mk.ep = _EP
+        mk.moe_mode = "ep" if _EP else "tp"
         mk._ops = {}
         self.mk = mk
         ops._INSTANCE[:] = [mk]

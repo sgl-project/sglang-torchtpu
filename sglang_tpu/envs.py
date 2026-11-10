@@ -515,6 +515,9 @@ class TpuEnvs:
     # batched RPA, fused attention-output and post-MoE kernels, fused-RS MoE) on the
     # kernel's weights. Needs fp8 SEQ_ALONG_LANE pools and bf16 NVFP4 block scales.
     SGLANG_TPU_MUSE_MK_PREFILL = EnvBool(False)
+    # Muse expert layout for the megakernel and the prefill program: tp | ep | auto
+    # (auto: ep when the server's EP size > 1). muse_megakernel/moe_mode.py.
+    SGLANG_TPU_MUSE_MOE_MODE = EnvStr("auto")
     # The prefill program's expert-input and post-expert-projection all-gathers in e4m3
     # (one scale per block): half their ICI bytes, ~2^-4 relative error per element.
     SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER = EnvBool(False)

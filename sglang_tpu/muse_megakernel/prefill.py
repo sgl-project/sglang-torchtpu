@@ -3,8 +3,8 @@
 
 Reads the decode megakernel's weights (fp8 K-major dense copies, bf16 router, smalls) and
 the sglang-owned experts and KV pools. A layer is batched RPA attention, the fused
-attention-output kernel, the fused-RS expert-TP MoE and the fused post-MoE kernel, which
-also produces the next layer's attention inputs (prefill_kernels.py).
+attention-output kernel, the fused-RS MoE (expert TP or EP, PFConfig.moe_mode) and the fused
+post-MoE kernel, which also produces the next layer's attention inputs (prefill_kernels.py).
 """
 
 import os
@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import msgspec
 
 from sglang_tpu.muse_megakernel.kernel import SMALL, _rms, expert_units, n_expert_refs
+from sglang_tpu.muse_megakernel.moe_mode import MoeMode, check_no_legacy_env
 
 
 class PFConfig(msgspec.Struct, frozen=True, kw_only=True):
@@ -39,6 +40,8 @@ class PFConfig(msgspec.Struct, frozen=True, kw_only=True):
     capture_layers: tuple
     # padded token rows of the chunk
     rows: int
+    # the experts' layout (the decode megakernel's)
+    moe_mode: MoeMode
     # rows per tile of the attention-output and post-MoE kernels
     attn_out_tile: int = 64
     post_moe_tile: int = 128
@@ -87,10 +90,6 @@ def _first_attention_inputs(c: PFConfig, x, sm, wqkvg, rope):
     )
 
 
-def moe_ep_enabled() -> bool:
-    return os.environ.get("MUSE_PF_MOE_EP", "0") not in ("", "0", "false")
-
-
 def build_forward(c: PFConfig, axis: str = "model"):
     """Per-device body: (meta, pos, kv_lens, cu_q, dist, pf, psw, emb, *weights in
     kernel.WEIGHT_NAMES order, *experts, *kv) -> (hidden, aux, *kv). Smalls rows hold the
@@ -100,6 +99,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
     from sglang_tpu.moe.pallas.fused_rs.fused_moe import moe_gmm_local_rs_nodedup
     from sglang_tpu.muse_megakernel.prefill_kernels import attn_out_call, post_moe_call
 
+    check_no_legacy_env()
     L, T, hd = c.n_layers, c.rows, c.head_dim
     qd, kvd, He = c.q_dim, c.kv_dim, c.expert_hidden
     ne = n_expert_refs(c)
@@ -137,10 +137,9 @@ def build_forward(c: PFConfig, axis: str = "model"):
         *rest,
     ):
         experts, kv = rest[:ne], list(rest[ne:])
-        # MUSE_PF_MOE_EP=1: expert parallelism (whole experts, E / tp per rank, as
-        # Qwen3.5's tp8/ep8 serving) instead of expert TP (1/tp of every expert).
-        # Both keep the token-sharded (sequence-parallel) fused-RS output.
-        moe_ep = moe_ep_enabled()
+        # ep: whole experts, E / tp per rank; tp: 1/tp of every expert. Both keep the
+        # token-sharded (sequence-parallel) fused-RS output.
+        moe_ep = c.moe_mode == "ep"
         local_experts = c.n_experts // c.tp if moe_ep else c.n_experts
         group_offset = (meta[1] * local_experts).reshape(1).astype(jnp.int32)
         rope_rows = jnp.take(rope, pos, axis=0)

@@ -48,13 +48,14 @@ def _megakernel(**flags):
         scale_fp8=False,
         expert_groups=flags.get("expert_groups", ()),
         kperm=flags.get("kperm", True),
+        moe_mode="tp",
     )
 
 
 def _config(mk, q, n_req, **pool):
     cfg = ops.MuseMegakernel.config(
         mk,
-        rows=ops.step_rows(q * n_req, mk.tp_size),
+        rows=ops.step_rows(q * n_req, mk.tp_size, mk.moe_mode),
         q=q,
         n_req=n_req,
         n_page_entries=n_req * 2048,
@@ -99,9 +100,12 @@ class TestMuseMegakernelConfig(CustomTestCase):
     def test_step_rows(self):
         # The TP size up to 32 rows, then the 16-row tile of the row-tiled program.
         for tokens, rows in ((1, 8), (8, 8), (20, 24), (32, 32), (33, 48), (40, 48)):
-            self.assertEqual(ops.step_rows(tokens, 8), rows)
+            self.assertEqual(ops.step_rows(tokens, 8, "tp"), rows)
         for tokens, rows in ((72, 80), (80, 80), (96, 96), (128, 128)):
-            self.assertEqual(ops.step_rows(tokens, 8), rows)
+            self.assertEqual(ops.step_rows(tokens, 8, "tp"), rows)
+        # the EP layout runs every step row-tiled
+        for tokens, rows in ((1, 16), (8, 16), (20, 32), (64, 64)):
+            self.assertEqual(ops.step_rows(tokens, 8, "ep"), rows)
 
     def test_folded_verify_steps_keep_a_deep_enough_ring(self):
         # <=16 rows and 24 rows at q <= 4 fit the 10-slot ring unaliased in 48 MiB;

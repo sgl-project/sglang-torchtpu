@@ -34,6 +34,7 @@ from sglang_tpu.kv_pool import (
 from sglang_tpu.muse_megakernel import kernel as K
 from sglang_tpu.muse_megakernel.ep_mk.kernel import ep_arm, ep_megakernel_call
 from sglang_tpu.muse_megakernel.mk import trace as mk_trace
+from sglang_tpu.muse_megakernel.moe_mode import MoeMode, resolve_moe_mode
 
 logger = logging.getLogger(__name__)
 
@@ -68,12 +69,12 @@ def _row_tile() -> int:
     return _dev_int("SGLANG_TPU_MUSE_MK_DEV_ROW_TILE", _ROW_TILE)
 
 
-def step_rows(n_tokens: int, tp: int, ep: bool = False) -> int:
+def step_rows(n_tokens: int, tp: int, moe_mode: MoeMode) -> int:
     """Padded rows of a step: a multiple of the TP size; row-tiled steps (every EP step) also
     of the row tile (each device then owns rows / tp rows of the expert reduce-scatter and u
     all-gather)."""
     rows = _round_up(n_tokens, tp)
-    if rows > BASE_STEP_MAX_ROWS or ep:
+    if rows > BASE_STEP_MAX_ROWS or moe_mode == "ep":
         rows = _round_up(n_tokens, math.lcm(_row_tile(), tp))
     return rows
 
@@ -310,12 +311,12 @@ class MuseMegakernel(torch.nn.Module):
         scale_fp8: bool,
         expert_groups: tuple = (),
         kperm: bool = False,
-        ep: bool = False,
+        moe_mode: MoeMode,
     ) -> None:
         super().__init__()
         self.geo = geo
-        # expert parallelism (ep_mk): whole experts per rank in the experts list
-        self.ep = ep
+        # ep: whole experts per rank in the experts list (ep_mk); prefill shares the layout
+        self.moe_mode: MoeMode = moe_mode
         self.kinds = kinds
         self.tp_size = tp_size
         self.max_rows = max_rows
@@ -357,11 +358,13 @@ class MuseMegakernel(torch.nn.Module):
         from sglang.srt.runtime_context import get_parallel
 
         parallel = get_parallel()
-        if parallel.moe_ep_size == parallel.tp_size > 1:
-            # the EP megakernel (MuseMegakernel(ep=True), ep_mk) has no serving weight load
+        moe_mode = resolve_moe_mode(parallel.moe_ep_size)
+        if moe_mode == "ep":
+            # the EP layout (ep_mk megakernel, EP prefill MoE) has no serving weight load
             raise NotImplementedError(
-                "the Muse EP megakernel is not wired for serving: it needs replicated "
-                "pre/post_expert_proj (ColumnParallel under EP), experts in ep_mk's layout "
+                "SGLANG_TPU_MUSE_MOE_MODE=ep: the Muse EP megakernel is not wired for "
+                "serving: it needs replicated pre/post_expert_proj (ColumnParallel under "
+                "EP), experts in ep_mk's layout "
                 "(kperm rows, chunk_cols-interleaved gate/up, which the native fused-RS MoE "
                 "and the prefill program also read) and, with SGLANG_TPU_EP_QBLOCK, "
                 "block-requantized scales shared with them"
@@ -371,7 +374,8 @@ class MuseMegakernel(torch.nn.Module):
             and parallel.moe_tp_size == parallel.tp_size == parallel.attn_tp_size
         ):
             raise NotImplementedError(
-                "the Muse megakernel needs expert TP across the whole TP group"
+                "SGLANG_TPU_MUSE_MOE_MODE=tp: the Muse megakernel needs expert TP across "
+                "the whole TP group (EP size 1)"
             )
         # Remote DMA over one host's devices only; rows are padded to the TP size.
         if parallel.tp_size not in (1, 8):
@@ -530,6 +534,7 @@ class MuseMegakernel(torch.nn.Module):
             scale_fp8=scale_fp8,
             expert_groups=expert_groups,
             kperm=kperm,
+            moe_mode=moe_mode,
         )
         torch.accelerator.synchronize()
         _INSTANCE[:] = [mk]
@@ -604,7 +609,7 @@ class MuseMegakernel(torch.nn.Module):
         opt = tpu_envs.SGLANG_TPU_MUSE_MK_OPT.get()
         fold_env = tpu_envs.SGLANG_TPU_MUSE_MK_FOLD.get()
         # the EP layout runs the row-tiled program at every size (ep_mk.config.ep_arm)
-        tiled = rows > BASE_STEP_MAX_ROWS or self.ep
+        tiled = rows > BASE_STEP_MAX_ROWS or self.moe_mode == "ep"
         # few-row steps (decode) gather their rows in one round and have nothing to fold
         fold_base = fold_env and n_req * q > 2 and not tiled
         unshifted = (
@@ -935,7 +940,7 @@ class MuseMegakernel(torch.nn.Module):
                 )
 
     def callable_for(self, cfg: K.MKConfig):
-        arm = ep_arm(cfg.rows) if self.ep else None
+        arm = ep_arm(cfg.rows) if self.moe_mode == "ep" else None
         if (cfg, arm) not in self._ops:
             self._ops[(cfg, arm)] = _build_callable(cfg, self.tp_size, arm)
         return self._ops[(cfg, arm)]
@@ -970,6 +975,7 @@ class MuseMegakernel(torch.nn.Module):
             post_moe_tile=int(os.environ.get("MUSE_PF_POST_MOE_TILE", "128")),
             fp8_gather=tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER.get(),
             expert_groups=self.expert_groups,
+            moe_mode=self.moe_mode,
         )
 
     def prefill_callable_for(self, cfg):
@@ -981,7 +987,7 @@ class MuseMegakernel(torch.nn.Module):
     def handles(self, forward_batch, num_tokens: int) -> bool:
         mode = forward_batch.forward_mode
         if mode.is_decode() or mode.is_target_verify():
-            return step_rows(num_tokens, self.tp_size, self.ep) <= self.max_rows
+            return step_rows(num_tokens, self.tp_size, self.moe_mode) <= self.max_rows
         if not (self.prefill and mode.is_extend()):
             return False
         # token buckets (tpu_compile_tokens) must tile the prefill kernels
@@ -1019,7 +1025,7 @@ class MuseMegakernel(torch.nn.Module):
         T = embeds.shape[0]
         if T % n_req:
             raise ValueError(f"{T} rows do not split evenly over {n_req} requests")
-        rows = step_rows(T, self.tp_size, self.ep)
+        rows = step_rows(T, self.tp_size, self.moe_mode)
         pad = rows - T
         emb = embeds.to(torch.bfloat16)
         pos = positions.to(torch.int32)
