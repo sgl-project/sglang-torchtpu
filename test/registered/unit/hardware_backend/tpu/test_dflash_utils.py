@@ -13,20 +13,29 @@ import torch
 
 import sglang.srt.managers.overlap_utils as overlap_utils
 import sglang.srt.speculative.dflash_info_v2 as dflash_info_v2
+import sglang.srt.speculative.dflash_utils as dflash_utils
+import sglang.srt.speculative.dflash_worker_v2 as dflash_worker_v2
 import sglang_tpu.dflash_utils_tpu as dflash_utils_tpu
+from sglang.srt.compilation.compiled_op import get_compiled_ops
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_utils import apply_dflash_simulated_acceptance
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang_tpu.dflash_utils_tpu import (
     DeviceVerifyBlockSelector,
     argmax_draft_tokens_tpu,
     build_dflash_draft_block,
+    dflash_simulated_verify_bookkeeping_torch,
     gather_dflash_candidate_window,
     select_dflash_verify_cache_locs_tpu,
 )
 from sglang_tpu.experimental.speculative.spec_ops import select_verify_rows
 from sglang_tpu.overlap_utils_tpu import (
     resolve_device_accept_seq_lens_tpu,
+)
+from sglang_tpu.spec_op_warmup import (
+    SpecOpWarmupContext,
+    make_dflash_simulated_verify_bookkeeping_args,
 )
 
 BLOCK_SIZE = 4
@@ -505,10 +514,6 @@ def test_fused_draft_block_matches_the_step_by_step_prep():
         assert torch.equal(embeds, embed(block_ids=expected_ids))
 
 
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
-
-
 def test_sharded_draft_argmax_outside_pallas_sizes_takes_the_global_best():
     """A DP-attention draft on TP2/TP4 has a vocab-sharded head the Pallas TopK cannot
     serve; drafting from the local shard alone would silently drop acceptance."""
@@ -550,3 +555,183 @@ def test_sharded_draft_argmax_outside_pallas_sizes_takes_the_global_best():
             lm_head=lm_head, hidden_states=hidden, block_size=3
         )
     assert tokens.tolist() == [[1, 7]]
+
+
+def test_simulated_verify_bookkeeping_registered_and_warmup_args_match():
+    """The simulated bookkeeping op must register for precompile with matching args."""
+    registered = [
+        op
+        for op in get_compiled_ops()
+        if op.make_warmup_args is make_dflash_simulated_verify_bookkeeping_args
+    ]
+    assert len(registered) == 1
+
+    context = SpecOpWarmupContext(
+        device=torch.device("cpu"),
+        physical_bs=4,
+        num_verify_tokens=8,
+        vocab_size=32,
+        draft_vocab_size=32,
+        hidden_size=16,
+        hidden_dtype=torch.bfloat16,
+    )
+    args = make_dflash_simulated_verify_bookkeeping_args(context)
+    assert len(args) == 4
+    cands, target, prefix, forced = args
+    assert cands.shape == (4, 8) and cands.dtype == torch.int64
+    assert target.shape == (4, 8) and target.dtype == torch.int64
+    assert prefix.shape == (4,) and prefix.dtype == torch.int64
+    assert forced.shape == (1,) and forced.dtype == torch.int32
+
+    accept_len, commit_lens, bonus, out_tokens, new_seq_lens = (
+        dflash_simulated_verify_bookkeeping_torch(*args)
+    )
+    assert accept_len.shape == (4,) and accept_len.dtype == torch.int32
+    assert commit_lens.shape == (4,) and commit_lens.dtype == torch.int32
+    assert bonus.shape == (4,) and bonus.dtype == torch.int64
+    assert out_tokens.shape == (4, 8) and out_tokens.dtype == torch.int64
+    assert new_seq_lens.shape == (4,) and new_seq_lens.dtype == torch.int64
+
+
+@pytest.mark.parametrize("block_size", [1, 4, 8])
+@pytest.mark.parametrize("bs", [1, 5, 8])
+@pytest.mark.parametrize("prefix_dtype", [torch.int32, torch.int64])
+def test_simulated_verify_bookkeeping_matches_reference_real_draft_token(
+    block_size, bs, prefix_dtype
+):
+    """Bit-for-bit parity against apply_dflash_simulated_acceptance (real-draft-token),
+    including out-of-range forced commit lengths clamped to [1, block_size]."""
+    gen = torch.Generator().manual_seed(100 + block_size * 10 + bs)
+    candidates = torch.randint(
+        10, 500, (bs, block_size), dtype=torch.int64, generator=gen
+    )
+    target_predict = torch.randint(
+        500, 1000, (bs, block_size), dtype=torch.int64, generator=gen
+    )
+    prefix_lens = torch.randint(20, 200, (bs,), dtype=prefix_dtype, generator=gen)
+
+    test_lengths = sorted({0, 1, (block_size + 1) // 2, block_size, block_size + 5})
+    for raw_forced in test_lengths:
+        clamped_forced = max(1, min(raw_forced, block_size))
+        accept_len, commit_lens, bonus, out_tokens, new_seq_lens = (
+            dflash_simulated_verify_bookkeeping_torch(
+                candidates=candidates,
+                target_predict=target_predict,
+                prefix_lens=prefix_lens,
+                forced_commit_len_tensor=torch.tensor([raw_forced], dtype=torch.int32),
+            )
+        )
+
+        ref_accept_len = torch.full((bs,), -1, dtype=torch.int32)
+        ref_commit_lens = torch.full((bs,), -1, dtype=torch.int32)
+        ref_bonus = torch.full((bs,), -1, dtype=torch.int64)
+        ref_out_tokens = torch.full((bs, block_size), -1, dtype=torch.int64)
+        with patch.object(
+            dflash_utils, "sample_simulated_acc_len", return_value=clamped_forced
+        ):
+            apply_dflash_simulated_acceptance(
+                candidates=candidates,
+                target_predict=target_predict,
+                accept_len=ref_accept_len,
+                commit_lens=ref_commit_lens,
+                bonus=ref_bonus,
+                out_tokens=ref_out_tokens,
+                simulate_acc_len=float(clamped_forced),
+                simulate_acc_method="match-expected",
+                simulate_acc_token_mode="real-draft-token",
+            )
+        ref_new_seq_lens = prefix_lens + ref_commit_lens.to(prefix_dtype)
+
+        assert accept_len.dtype == torch.int32
+        assert commit_lens.dtype == torch.int32
+        assert bonus.dtype == torch.int64
+        assert out_tokens.dtype == torch.int64
+        assert new_seq_lens.dtype == prefix_dtype
+        assert torch.equal(accept_len, ref_accept_len)
+        assert torch.equal(commit_lens, ref_commit_lens)
+        assert torch.equal(bonus, ref_bonus)
+        assert torch.equal(out_tokens, ref_out_tokens)
+        assert torch.equal(new_seq_lens, ref_new_seq_lens)
+
+
+def test_simulated_verify_bookkeeping_compiles_with_fullgraph():
+    candidates = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int64)
+    target_predict = torch.tensor(
+        [[11, 12, 99, 100], [21, 98, 22, 200]], dtype=torch.int64
+    )
+    prefix_lens = torch.tensor([15, 30], dtype=torch.int64)
+    forced = torch.tensor([3], dtype=torch.int32)
+
+    compiled = torch.compile(
+        dflash_simulated_verify_bookkeeping_torch, backend="eager", fullgraph=True
+    )
+    eager_out = dflash_simulated_verify_bookkeeping_torch(
+        candidates, target_predict, prefix_lens, forced
+    )
+    compiled_out = compiled(candidates, target_predict, prefix_lens, forced)
+    for actual, expected in zip(compiled_out, eager_out):
+        assert actual.dtype == expected.dtype
+        assert torch.equal(actual, expected)
+
+
+def test_dflash_worker_accept_block_uses_compiled_sim_accept_and_caches_tensors():
+    worker = dflash_worker_v2.DFlashWorkerV2.__new__(dflash_worker_v2.DFlashWorkerV2)
+    worker.block_size = 4
+    worker._selector_sample = None
+    worker._tp_sync = SimpleNamespace(sync=lambda site, tensor: tensor)
+    worker._sim_commit_len_tensors = {}
+
+    candidates = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=torch.int64)
+    # 2 * 4 rows, vocab size 12; argmax yields [[9, 10, 11, 0], [1, 2, 3, 4]].
+    arg_ids = torch.tensor([[9, 10, 11, 0], [1, 2, 3, 4]], dtype=torch.int64).reshape(
+        -1
+    )
+    next_token_logits = torch.full((8, 12), -10.0, dtype=torch.float32)
+    next_token_logits[torch.arange(8), arg_ids] = 10.0
+    prefix_lens = torch.tensor([40, 50], dtype=torch.int64)
+
+    with (
+        patch.object(dflash_worker_v2, "_is_tpu", True),
+        patch.object(dflash_worker_v2, "sample_simulated_acc_len", return_value=3),
+    ):
+        accept_len, commit_lens, bonus, out_tokens, new_seq_lens, target_predict = (
+            worker._accept_block(
+                candidates=candidates,
+                next_token_logits=next_token_logits,
+                sampling_info=None,
+                draft_input=SimpleNamespace(),
+                prefix_lens=prefix_lens,
+                simulate_acc_len=3.0,
+            )
+        )
+        cached = worker._sim_commit_len_tensors[3]
+        assert cached.dtype == torch.int32 and cached.tolist() == [3]
+
+        # Re-run: reuses cached tensor object and produces identical results.
+        accept_len_2, commit_lens_2, bonus_2, out_tokens_2, new_seq_lens_2, _ = (
+            worker._accept_block(
+                candidates=candidates,
+                next_token_logits=next_token_logits,
+                sampling_info=None,
+                draft_input=SimpleNamespace(),
+                prefix_lens=prefix_lens,
+                simulate_acc_len=3.0,
+            )
+        )
+        assert worker._sim_commit_len_tensors[3] is cached
+
+    assert target_predict.tolist() == [[9, 10, 11, 0], [1, 2, 3, 4]]
+    assert accept_len.tolist() == [2, 2]
+    assert commit_lens.tolist() == [3, 3]
+    assert bonus.tolist() == [11, 3]
+    assert out_tokens.tolist() == [[2, 3, 11, 0], [6, 7, 3, 0]]
+    assert new_seq_lens.tolist() == [43, 53]
+    assert torch.equal(accept_len_2, accept_len)
+    assert torch.equal(commit_lens_2, commit_lens)
+    assert torch.equal(bonus_2, bonus)
+    assert torch.equal(out_tokens_2, out_tokens)
+    assert torch.equal(new_seq_lens_2, new_seq_lens)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
