@@ -151,7 +151,8 @@ class EPExperts:
                 _all_gather_rows(step, p)
 
     def pre_attn(self, c: MKConfig, S: dict) -> None:
-        _pre_attn_lhs(c, S)
+        with _phase("pre_attn"):
+            _pre_attn_lhs(c, S)
 
 
 _window = attn.window
@@ -707,7 +708,8 @@ def _gather_lhs(step: EPLayerStep, p: EPPlan, nsmr) -> None:
             _rms(h, c.rms_eps, w).astype(bf16).astype(f32)
         )
 
-    rows(me * rc, rc, norm, write_back=False)
+    with _phase("lhs_norm"):
+        rows(me * rc, rc, norm, write_back=False)
     n = rc if rc % 8 == 0 else 1  # rows per copy: a block, or a row of an unaligned one
 
     def block(k):
@@ -747,14 +749,16 @@ def _gather_lhs(step: EPLayerStep, p: EPPlan, nsmr) -> None:
         send(own, me, partner)
         for d in (1, 2, 3):
             send(own, me, 2 * jnp.bitwise_xor(chip, d) + core)
-        for d in (1, 2, 3):
-            k = 2 * jnp.bitwise_xor(chip, d) + core
-            wait(rsems.at[k], len(block(0)))
-            send(g, k, partner)
-        wait(rsems.at[partner], len(block(0)))
-        for d in (1, 2, 3):
-            wait(rsems.at[2 * jnp.bitwise_xor(chip, d) + 1 - core], len(block(0)))
-        wait(sems.at[1], 7 * len(block(0)))
+        with _phase("lhs_relay"):
+            for d in (1, 2, 3):
+                k = 2 * jnp.bitwise_xor(chip, d) + core
+                wait(rsems.at[k], len(block(0)))
+                send(g, k, partner)
+        with _phase("lhs_wait"):
+            wait(rsems.at[partner], len(block(0)))
+            for d in (1, 2, 3):
+                wait(rsems.at[2 * jnp.bitwise_xor(chip, d) + 1 - core], len(block(0)))
+            wait(sems.at[1], 7 * len(block(0)))
     wait(sems.at[2], len(block(0)))
 
 
