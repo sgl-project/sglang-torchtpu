@@ -71,6 +71,25 @@ def get_twoshot_all_reduce_op(world_size: int) -> Callable:
     return op
 
 
+def _own_storage(tensor: torch.Tensor) -> torch.Tensor:
+    """Ensure tensor owns standalone contiguous storage for PJRT/Pallas."""
+    if torch.compiler.is_compiling():
+        # Avoid storage_offset() and untyped_storage() calls that trigger TorchDynamo graph breaks.
+        return tensor.contiguous()
+    if (
+        not tensor.is_contiguous()
+        or tensor.storage_offset() != 0
+        or tensor.untyped_storage().nbytes() != tensor.numel() * tensor.element_size()
+    ):
+        return tensor.clone()
+    return tensor
+
+
+def twoshot_all_reduce_tensor(x: torch.Tensor, world_size: int) -> torch.Tensor:
+    """Run two-shot Pallas all-reduce on a tensor."""
+    return get_twoshot_all_reduce_op(world_size)(_own_storage(x))
+
+
 class TwoShotAllReduceLinear(torch.nn.Module):
     """A reducing, bias-free RowParallelLinear whose small all-reduces run two-shot."""
 
@@ -94,7 +113,7 @@ class TwoShotAllReduceLinear(torch.nn.Module):
         if skip_all_reduce or not self._fits(x):
             return self.linear(x, skip_all_reduce=skip_all_reduce, **kwargs)
         output, output_bias = self.linear(x, skip_all_reduce=True, **kwargs)
-        return get_twoshot_all_reduce_op(self.world_size)(output), output_bias
+        return twoshot_all_reduce_tensor(output, self.world_size), output_bias
 
 
 def install_twoshot_all_reduce(
