@@ -63,7 +63,8 @@ TOL_HID_REL = 1e-2  # final norm, computed from the captured last-layer stream
 NEAR_TIE = 2e-3
 # --ep: the EP megakernel and its weight layout (set once by main, before any weight is built)
 _EP = False
-# --qblock-ref: the reference reads the SGLANG_TPU_EP_QBLOCK-requantized fp4 experts
+# --qblock-ref: the reference reads the requantized fp4 experts the kernel reads
+# (SGLANG_TPU_EP_QBLOCK with --ep, else SGLANG_TPU_MUSE_MK_QBLOCK)
 _QBLOCK_REF = False
 
 
@@ -337,15 +338,40 @@ def _requant_kperm(
     return out, sb, deq[perm]
 
 
+def tp_qblock() -> int:
+    """SGLANG_TPU_MUSE_MK_QBLOCK (the TP kernel's requant block; 0 off)."""
+    return int(os.environ.get("SGLANG_TPU_MUSE_MK_QBLOCK", "0"))
+
+
+def tp_expert_slabs(l: int, rank: int, e: int, kind: str) -> list:
+    """expert_slabs in the TP kernel's layout: under SGLANG_TPU_MUSE_MK_QBLOCK, fp4 rows
+    requantized to its blocks of the natural order, scales [K / block, N]."""
+    slabs = expert_slabs(l, rank, e, kind)
+    b = tp_qblock()
+    if not (b and kind == "fp4"):
+        return slabs
+    w13, s13, w2, s2 = slabs
+    w13, s13, _ = _requant_kperm(w13, s13, torch.arange(EXPERT_HIDDEN), b)
+    w2, s2, _ = _requant_kperm(w2, s2, torch.arange(INTER_LOCAL), b)
+    return [w13, s13, w2, s2]
+
+
 def ref_expert(l: int, rank: int, e: int, kind: str) -> tuple:
     """decode_expert of one rank's slice; --qblock-ref: the requantized weights the kernel
-    reads under SGLANG_TPU_EP_QBLOCK."""
+    reads (SGLANG_TPU_EP_QBLOCK in kperm order with --ep, else SGLANG_TPU_MUSE_MK_QBLOCK in
+    natural order)."""
     from sglang_tpu.muse_megakernel.ep_mk.experts import kperm, qblock
 
     slabs = expert_slabs(l, rank, e, kind)
     if not (_QBLOCK_REF and kind == "fp4"):
         return decode_expert(slabs, kind)
     w13, s13, w2, s2 = slabs
+    if not _EP:
+        nat_he, nat_il = torch.arange(EXPERT_HIDDEN), torch.arange(INTER_LOCAL)
+        return (
+            _requant_kperm(w13, s13, nat_he, tp_qblock())[2],
+            _requant_kperm(w2, s2, nat_il, tp_qblock())[2],
+        )
     kp_he = torch.from_numpy(kperm(EXPERT_HIDDEN))
     kp_il = torch.from_numpy(kperm(INTER_LOCAL))
     return (
@@ -560,7 +586,9 @@ class _Runner:
             if _EP
             else [
                 torch.stack(t).to(self.device)
-                for t in zip(*(expert_slabs(l, rank, e, k) for e in range(N_EXPERTS)))
+                for t in zip(
+                    *(tp_expert_slabs(l, rank, e, k) for e in range(N_EXPERTS))
+                )
             ]
             for l, k in enumerate(self.kinds)
         ]
@@ -1223,6 +1251,8 @@ def main() -> None:
     args = ap.parse_args()
     global _EP, _QBLOCK_REF
     _EP, _QBLOCK_REF = args.ep, args.qblock_ref
+    if _QBLOCK_REF and not _EP and not tp_qblock():
+        raise ValueError("--qblock-ref without --ep needs SGLANG_TPU_MUSE_MK_QBLOCK")
 
     dist.init_process_group(backend="tpu_dist")
     rank = dist.get_rank()
