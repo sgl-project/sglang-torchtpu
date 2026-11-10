@@ -820,7 +820,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             )
 
         if self.plan_stream:
-            torch.get_device_module(self.device).current_stream().wait_stream(
+            torch.accelerator.current_stream(self.device).wait_stream(
                 self.plan_stream
             )
 

@@ -305,7 +305,7 @@ class VLAPrefixGraphRunner:
                 ):
                     static_input.copy_(current_input)
             captured.graph.replay()
-            torch.get_device_module(inputs[0].device).current_stream(
+            torch.accelerator.current_stream(
                 device=inputs[0].device
             ).synchronize()
             return captured.static_output

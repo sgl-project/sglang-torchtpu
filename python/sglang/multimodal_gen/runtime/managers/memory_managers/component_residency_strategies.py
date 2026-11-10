@@ -160,7 +160,7 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         ready_event = self._ready_events.get(use.component_name)
         if ready_event is None or not current_platform.is_cuda():
             return
-        torch.get_device_module().current_stream().wait_event(ready_event)
+        torch.accelerator.current_stream().wait_event(ready_event)
 
     def prefetch_for_use(
         self,

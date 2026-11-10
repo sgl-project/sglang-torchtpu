@@ -2785,7 +2785,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # produced on another stream.
         if not _is_tpu:
             batch.seq_lens.record_stream(
-                torch.get_device_module(self.device).current_stream()
+                torch.accelerator.current_stream(self.device)
             )
 
         bs = len(batch.seq_lens)
