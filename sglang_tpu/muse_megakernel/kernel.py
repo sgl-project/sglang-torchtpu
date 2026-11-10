@@ -5684,36 +5684,48 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         S["u_send"][...] = _pack_bf16x2(u)
                 else:
                     # vmem_trim: one row's worth of buffer as two half-row (tp / 2 sources)
-                    # buffers, so a half lands while the other is summed
+                    # buffers, so a half lands while the other is summed. A buffer fills with one
+                    # DMA per source, all in flight at once.
                     hs = c.tp // 2 if c.vmem_trim else c.tp
 
-                    def ycopy(r, b, half=0):
-                        return pltpu.make_async_copy(
-                            S["pad_y"].at[pl.ds(half * hs, hs), pl.ds(r, 1)],
-                            S["yrow"].at[b],
-                            S["yrow_sems"].at[b],
-                        )
+                    def ycopies(r, b, half=0):
+                        return [
+                            pltpu.make_async_copy(
+                                S["pad_y"].at[half * hs + d, pl.ds(r, 1)],
+                                S["yrow"].at[b, d],
+                                S["yrow_sems"].at[b],
+                            )
+                            for d in range(hs)
+                        ]
 
-                    pl.when(my_live)(ycopy(0, 0).start)
+                    def ystart(r, b, half=0):
+                        for cp in ycopies(r, b, half):
+                            cp.start()
+
+                    def ywait(r, b, half=0):
+                        for cp in ycopies(r, b, half):
+                            cp.wait()
+
+                    pl.when(my_live)(lambda: ystart(0, 0))
 
                     def combine_row(r, carry):
                         nxt_cp = my_live & (r + 1 < Rc)
                         if c.vmem_trim:
-                            pl.when(my_live)(ycopy(r, 1, 1).start)
-                            pl.when(my_live)(ycopy(r, 0, 0).wait)
+                            pl.when(my_live)(lambda: ystart(r, 1, 1))
+                            pl.when(my_live)(lambda: ywait(r, 0, 0))
                             yr = S["yrow"].at[0]
                             ysum = _unpack_y(yr[0, 0], c)  # [K, He]
                             for d in range(1, hs):
                                 ysum = ysum + _unpack_y(yr[d, 0], c)
-                            pl.when(my_live)(ycopy(r, 1, 1).wait)
-                            pl.when(nxt_cp)(ycopy(r + 1, 0, 0).start)
+                            pl.when(my_live)(lambda: ywait(r, 1, 1))
+                            pl.when(nxt_cp)(lambda: ystart(r + 1, 0, 0))
                             yr = S["yrow"].at[1]
                             for d in range(hs):
                                 ysum = ysum + _unpack_y(yr[d, 0], c)
                         else:
                             b = r % 2
-                            pl.when(nxt_cp)(ycopy(r + 1, 1 - b).start)
-                            pl.when(my_live)(ycopy(r, b).wait)
+                            pl.when(nxt_cp)(lambda: ystart(r + 1, 1 - b))
+                            pl.when(my_live)(lambda: ywait(r, b))
                             yr = S["yrow"].at[b]
                             ysum = _unpack_y(yr[0, 0], c)  # [K, He]
                             for d in range(1, c.tp):
