@@ -749,8 +749,9 @@ _future_map_direct_handoff_patched = False
 
 def _patch_future_map_direct_handoff() -> None:
     """Route FutureMap.stash/publish through the TPU direct handoff, so an
-    unchanged EAGLE3 top-k-1 decode batch skips the store/gather round trip.
-    The resolve side is already hooked via resolve_device_accept_seq_lens_tpu."""
+    unchanged EAGLE3 top-k-1 or TpuSpecWorker decode batch skips the store/gather
+    round trip (TpuSpecWorker: the publish store too). The resolve side is
+    already hooked via resolve_device_accept_seq_lens_tpu."""
     global _future_map_direct_handoff_patched
     if _future_map_direct_handoff_patched:
         return
@@ -759,6 +760,7 @@ def _patch_future_map_direct_handoff() -> None:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang_tpu.overlap_utils_tpu import (
         flush_direct_handoff_tpu,
+        publish_deferred_tpu,
         publish_tpu,
         resolve_mixed_spec_tails_tpu,
         stash_tpu,
@@ -776,6 +778,8 @@ def _patch_future_map_direct_handoff() -> None:
             orig_stash(self, future_indices, payload)
 
     def publish(self, future_indices, new_seq_lens, confidence=None):
+        if publish_deferred_tpu(self, future_indices, new_seq_lens, confidence):
+            return
         orig_publish(self, future_indices, new_seq_lens, confidence)
         publish_tpu(self, future_indices, new_seq_lens)
 

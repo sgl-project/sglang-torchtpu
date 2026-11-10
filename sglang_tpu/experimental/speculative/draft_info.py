@@ -47,6 +47,8 @@ class HostPaddedDraftInput(SpecInput):
     # Device tensor read after the step's last KV write; the async result copy
     # copies it so the TPU KV free fence's copy_done covers every KV write.
     kv_fence_tail: torch.Tensor | None = None
+    # Set when the TPU FutureMap handoff already resolved this input's relay.
+    tpu_relay_resolved: bool = False
 
     def __post_init__(self):
         super().__init__(spec_input_type=self.SPEC_INPUT_TYPE)

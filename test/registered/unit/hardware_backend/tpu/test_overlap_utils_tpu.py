@@ -13,8 +13,10 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
-from sglang_tpu import patches
+from sglang_tpu import experimental, patches
+from sglang_tpu.experimental.speculative.block_info import HostPaddedBlockDraftInput
 from sglang_tpu.overlap_utils_tpu import (
+    device_accept_resolved_tpu,
     flush_direct_handoff_tpu,
     resolve_direct_handoff_tpu,
 )
@@ -264,6 +266,115 @@ class TestDirectHandoff(CustomTestCase):
             fm.output_tokens_buf[indices], torch.tensor([77, 12])
         )
         self.assertIsNone(fm.tpu_direct_handoff)
+
+
+def make_host_case():
+    """A TpuSpecWorker relay: bonus tokens and lengths only."""
+    algo = SimpleNamespace(
+        is_eagle3=lambda: False,
+        is_some=lambda: True,
+        is_ngram=lambda: False,
+        need_topk=lambda: False,
+    )
+    fm = FutureMap(
+        device="cpu",
+        spec_algo=algo,
+        req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(8, 16)),
+        needs_cpu_seq_lens=False,
+    )
+    fm.output_tokens_buf.zero_()
+    fm.new_seq_lens_buf.zero_()
+    indices = torch.tensor([2, 5])
+    seq_lens = torch.tensor([101, 203])
+    draft = HostPaddedBlockDraftInput(
+        bonus_tokens=torch.tensor([11, 12]), new_seq_lens=seq_lens
+    )
+    draft.future_indices = indices
+    payload = RelayPayload.from_draft_input(draft)
+    return fm, SimpleNamespace(spec_info=draft), indices, payload, seq_lens
+
+
+@contextmanager
+def host_relay():
+    # The fallback store asks the spec config whether hidden states are relayed.
+    with (
+        patch.object(experimental, "_host_batch_padder", lambda bs: bs),
+        patch(
+            "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
+            return_value=False,
+        ),
+    ):
+        yield
+
+
+class TestHostRelayHandoff(CustomTestCase):
+    def test_unchanged_batch_skips_both_stores_and_both_gathers(self):
+        fm, batch, indices, payload, seq_lens = make_host_case()
+        with (
+            host_relay(),
+            patch.object(fm, "_store", side_effect=AssertionError("store")),
+        ):
+            self.assertTrue(stash(fm, indices, payload, seq_lens))
+            self.assertTrue(resolve_direct_handoff_tpu(fm, batch))
+        self.assertIs(batch.seq_lens, seq_lens)
+        self.assertIs(batch.spec_info.bonus_tokens, payload.bonus_tokens)
+        self.assertIsNone(fm.tpu_direct_handoff)
+        # _resolve_spec_extras skips its gather exactly once.
+        self.assertTrue(device_accept_resolved_tpu(fm, batch))
+        self.assertFalse(device_accept_resolved_tpu(fm, batch))
+
+    def test_changed_batch_flushes_both_rows_before_the_gather(self):
+        for change in ("filter", "generation"):
+            with self.subTest(change=change):
+                fm, batch, indices, payload, seq_lens = make_host_case()
+                with host_relay():
+                    self.assertTrue(stash(fm, indices, payload, seq_lens))
+                    if change == "filter":
+                        batch.spec_info.future_indices = indices[:1]
+                    else:
+                        batch.spec_info.bonus_tokens = payload.bonus_tokens.clone()
+                    with tpu_future_map():
+                        self.assertFalse(resolve_direct_handoff_tpu(fm, batch))
+                torch.testing.assert_close(fm.new_seq_lens_buf[indices], seq_lens)
+                torch.testing.assert_close(
+                    fm.output_tokens_buf[indices], payload.bonus_tokens
+                )
+                self.assertIsNone(fm.tpu_direct_handoff)
+                with tpu_future_map():
+                    self.assertFalse(device_accept_resolved_tpu(fm, batch))
+
+    def test_next_publish_flushes_an_unconsumed_generation(self):
+        fm, batch, indices, payload, seq_lens = make_host_case()
+        with host_relay():
+            self.assertTrue(stash(fm, indices, payload, seq_lens))
+            other = torch.tensor([3, 4])
+            with tpu_future_map():
+                fm.publish(other, torch.tensor([7, 8]))
+        torch.testing.assert_close(fm.new_seq_lens_buf[indices], seq_lens)
+        torch.testing.assert_close(fm.output_tokens_buf[indices], payload.bonus_tokens)
+        # The new publish is pending, not stored.
+        self.assertEqual(fm.new_seq_lens_buf[other].tolist(), [0, 0])
+        self.assertFalse(fm.tpu_published_seq_lens.stored)
+
+    def test_non_relay_stash_stores_the_deferred_publish(self):
+        fm, batch, indices, payload, seq_lens = make_host_case()
+        with host_relay():
+            # Beam tail slices the stash indices after publish.
+            self.assertFalse(
+                stash(fm, indices[:], payload, seq_lens, published=indices)
+            )
+        torch.testing.assert_close(fm.new_seq_lens_buf[indices], seq_lens)
+        torch.testing.assert_close(fm.output_tokens_buf[indices], payload.bonus_tokens)
+
+    def test_without_a_tpu_spec_worker_publish_stores(self):
+        fm, batch, indices, payload, seq_lens = make_host_case()
+        with patch(
+            "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
+            return_value=False,
+        ):
+            self.assertFalse(stash(fm, indices, payload, seq_lens))
+        torch.testing.assert_close(fm.new_seq_lens_buf[indices], seq_lens)
+        torch.testing.assert_close(fm.output_tokens_buf[indices], payload.bonus_tokens)
 
 
 if __name__ == "__main__":

@@ -30,6 +30,9 @@ def device_accept_resolved_tpu(future_map: FutureMap, batch: ScheduleBatch) -> b
     """True if resolve_seq_lens_cpu already resolved this batch's spec extras
     on device, so _resolve_spec_extras has nothing left to do."""
     draft_input = batch.spec_info
+    if _is_host_padded(draft_input) and draft_input.tpu_relay_resolved:
+        draft_input.tpu_relay_resolved = False
+        return True
     return (
         # Only the EAGLE relay (need_topk) has a selected window field.
         future_map.need_topk
@@ -102,11 +105,15 @@ class DirectHandoff(msgspec.Struct, frozen=True):
     indices: torch.Tensor
     payload: Any
     seq_lens: torch.Tensor
+    # A host-relay publish skipped its new_seq_lens store; the flush writes it.
+    publish_deferred: bool = False
 
 
 class PublishedSeqLens(msgspec.Struct, frozen=True):
     indices: torch.Tensor
     seq_lens: torch.Tensor
+    # False while a deferred publish has not written new_seq_lens_buf yet.
+    stored: bool = True
 
 
 def publish_tpu(
@@ -119,12 +126,77 @@ def publish_tpu(
     )
 
 
+def _relays_host_padded(future_map: FutureMap) -> bool:
+    """A TpuSpecWorker serves this process and relays only the bonus token and length."""
+    from sglang_tpu.experimental import get_host_batch_padder
+
+    return (
+        get_host_batch_padder() is not None
+        and future_map.spec_algo.is_some()
+        and not future_map.need_topk
+        and not future_map.need_hidden_states
+        and not future_map.needs_confidence_relay
+        and future_map.draft_probs_buf is None
+        and future_map.dsa_topk_indices_buf is None
+    )
+
+
+def publish_deferred_tpu(
+    future_map: FutureMap,
+    indices: torch.Tensor,
+    new_seq_lens: torch.Tensor,
+    confidence: torch.Tensor | None,
+) -> bool:
+    """Record a host-relay publish without its store; the paired stash or a flush writes it.
+
+    The next step of an unchanged batch reads new_seq_lens directly
+    (resolve_direct_handoff_tpu), so the store and its gather are two launches
+    no one needs. Returns True when the store was deferred.
+    """
+    if (
+        indices.shape[0] == 0
+        or confidence is not None
+        or not _relays_host_padded(future_map)
+    ):
+        return False
+    # Any earlier pending rows land before this generation's.
+    flush_direct_handoff_tpu(future_map)
+    # FutureMap.publish's fence: resolve waits on it before reading lengths.
+    if future_map.publish_ready is None:
+        future_map.publish_ready = torch.get_device_module(future_map.device).Event()
+    future_map.publish_ready.record()
+    future_map._publish_fresh = True
+    future_map.tpu_published_seq_lens = PublishedSeqLens(
+        indices=indices, seq_lens=new_seq_lens, stored=False
+    )
+    return True
+
+
+def _store_published(future_map: FutureMap, published: PublishedSeqLens) -> None:
+    future_map._store(
+        future_map.new_seq_lens_buf,
+        published.indices,
+        published.seq_lens.to(future_map.new_seq_lens_buf.dtype),
+    )
+
+
 def flush_direct_handoff_tpu(future_map: FutureMap) -> None:
+    published = future_map.tpu_published_seq_lens
+    if published is not None and not published.stored:
+        _store_published(future_map, published)
+        future_map.tpu_published_seq_lens = PublishedSeqLens(
+            indices=published.indices, seq_lens=published.seq_lens
+        )
     pending = future_map.tpu_direct_handoff
     if pending is None:
         return
     # Clear before calling the normal store path, which also checks for a flush.
     future_map.tpu_direct_handoff = None
+    if pending.publish_deferred:
+        _store_published(
+            future_map,
+            PublishedSeqLens(indices=pending.indices, seq_lens=pending.seq_lens),
+        )
     future_map.stash(pending.indices, pending.payload)
 
 
@@ -132,7 +204,8 @@ def stash_tpu(future_map: FutureMap, indices: torch.Tensor, payload: Any) -> boo
     """Flush any pending handoff, then defer this store when the next step can
     consume the payload directly. Returns True when the store was deferred.
 
-    Only EAGLE3 top-k-1 payloads stashed right after a publish qualify.
+    EAGLE3 top-k-1 payloads and host-relay (bonus token only) payloads stashed
+    right after their publish qualify.
     """
     # Take the publish before flushing: the flush re-enters stash and must fall
     # through to the normal store.
@@ -140,6 +213,17 @@ def stash_tpu(future_map: FutureMap, indices: torch.Tensor, payload: Any) -> boo
     future_map.tpu_published_seq_lens = None
     # A different batch may still need rows from the previous pending result.
     flush_direct_handoff_tpu(future_map)
+    if published is not None and not published.stored:
+        if published.indices is indices and _bonus_only(payload):
+            future_map.tpu_direct_handoff = DirectHandoff(
+                indices=indices,
+                payload=payload,
+                seq_lens=published.seq_lens,
+                publish_deferred=True,
+            )
+            return True
+        _store_published(future_map, published)
+        return False
     # Only gate what the resolve step itself relies on. Anything about the next
     # batch (device acceptance, filtering, merging) is re-checked there, and a
     # mismatch just flushes the pending payload into the normal store.
@@ -166,11 +250,24 @@ def stash_tpu(future_map: FutureMap, indices: torch.Tensor, payload: Any) -> boo
     return True
 
 
+def _bonus_only(payload: Any) -> bool:
+    return (
+        payload.bonus_tokens is not None
+        and payload.topk_p is None
+        and payload.topk_index is None
+        and payload.hidden_states is None
+        and payload.draft_probs is None
+        and payload.dsa_topk_indices is None
+    )
+
+
 def resolve_direct_handoff_tpu(future_map: FutureMap, batch: ScheduleBatch) -> bool:
     pending = future_map.tpu_direct_handoff
     if pending is None:
         return False
     draft = batch.spec_info
+    if pending.publish_deferred:
+        return _resolve_host_relay_handoff(future_map, batch, pending)
     # filter_batch and merge_batch rebind future_indices and the draft tensors.
     # Never compare device values on the host; the payload tensors are the
     # draft's own, so identity also pins this generation.
@@ -221,6 +318,32 @@ def resolve_device_accept_seq_lens_tpu(
         return False
     batch.seq_lens = future_map.new_seq_lens_buf[batch.spec_info.future_indices]
     return True
+
+
+def _resolve_host_relay_handoff(
+    future_map: FutureMap, batch: ScheduleBatch, pending: DirectHandoff
+) -> bool:
+    """Hand an unchanged host-padded batch the previous step's lengths and bonus tokens."""
+    draft = batch.spec_info
+    # filter_batch / merge_batch rebind future_indices; identity pins the generation.
+    if (
+        draft.future_indices is not pending.indices
+        or draft.bonus_tokens is not pending.payload.bonus_tokens
+    ):
+        flush_direct_handoff_tpu(future_map)
+        return False
+    batch.seq_lens = pending.seq_lens
+    future_map.tpu_direct_handoff = None
+    # _resolve_spec_extras: the bonus tokens are already the draft's own.
+    draft.tpu_relay_resolved = True
+    return True
+
+
+def _is_host_padded(spec_info: Any) -> bool:
+    # Local import: the experimental worker imports this module.
+    from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
+
+    return isinstance(spec_info, HostPaddedDraftInput)
 
 
 def _keeps_committed_host_lens(spec_info: Any) -> bool:
