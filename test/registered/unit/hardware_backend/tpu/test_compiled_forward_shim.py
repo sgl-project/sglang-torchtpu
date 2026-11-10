@@ -2349,6 +2349,22 @@ class TestGatherMatchesRealLogitsProcessor(CustomTestCase):
         self.assertEqual(copied, defined)
 
 
+class TestSkipGuardEval(CustomTestCase):
+    def test_decode_and_target_verify_skip_guards_only_when_frozen(self):
+        from sglang_tpu.compilation.compiled_forward_shim import _skips_guard_eval
+
+        for armed in (True, False):
+            stance = SimpleNamespace(armed=lambda armed=armed: armed)
+            for mode, skips in (
+                (ForwardMode.DECODE, True),
+                (ForwardMode.TARGET_VERIFY, True),
+                (ForwardMode.EXTEND, False),
+                (ForwardMode.IDLE, False),
+            ):
+                with self.subTest(armed=armed, mode=mode):
+                    self.assertEqual(_skips_guard_eval(stance, mode), armed and skips)
+
+
 class _StubLogitsProcessor:
     """Stands in for LogitsProcessor.
 

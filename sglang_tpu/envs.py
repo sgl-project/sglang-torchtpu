@@ -141,11 +141,11 @@ class TpuEnvs:
     # decoder_compile_policy._guard_filter_options). Assumes module state is
     # fixed after warmup.
     SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER = EnvBool(False)
-    # Serving-time decode forwards of a dynamo-compiled decoder run only
-    # Dynamo's differentiating guards (tensor shapes/dtypes and every guard
-    # that failed during warmup) instead of the full guard set, once warmup
-    # froze compilation with fail_on_recompile. Picks the same precompiled
-    # graph; saves ~0.1-0.3 ms of host time per decode step.
+    # Serving-time decode and target-verify forwards of a dynamo-compiled
+    # decoder run only Dynamo's differentiating guards (tensor shapes/dtypes
+    # and every guard that failed during warmup) instead of the full guard set,
+    # once warmup froze compilation with fail_on_recompile. Picks the same
+    # precompiled graph; saves ~0.1-0.3 ms of host time per forward.
     SGLANG_TPU_DECODE_SKIP_GUARD_EVAL = EnvBool(False)
     # Compiled (dynamo + AOTAutograd) inference graphs whose input mutations
     # are plain data mutations (KV / recurrent state) use a lean AOTAutograd

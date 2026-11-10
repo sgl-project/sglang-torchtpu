@@ -864,7 +864,7 @@ def precompile_kv_offload(host_pool: TpuFusedMHATokenToKVPoolHost) -> None:
 
 
 class _SkipGuardStance:
-    """Run a serving-time decode with Dynamo's skip_guard_eval_unsafe stance.
+    """Run a serving-time decode or target-verify forward with Dynamo's skip_guard_eval_unsafe stance.
 
     Armed only once warmup froze torch.compile with fail_on_recompile: every
     decode graph is then precompiled, and Dynamo's differentiating guards
@@ -902,6 +902,11 @@ class _SkipGuardStance:
     def __exit__(self, *exc: Any) -> None:
         self._eval_frame._set_stance(self._prior)
         self._prior = None
+
+
+def _skips_guard_eval(stance: _SkipGuardStance, mode: ForwardMode) -> bool:
+    """Decode and spec-verify forwards run every serving step; extend keeps all guards."""
+    return (mode.is_decode() or mode.is_target_verify()) and stance.armed()
 
 
 class CompiledForwardShim:
@@ -1230,10 +1235,8 @@ class CompiledForwardShim:
                         args=args, input_ids=input_ids, forward_batch=forward_batch
                     )
             skip_guards = self._skip_guard_stance
-            if (
-                skip_guards is not None
-                and forward_batch.forward_mode.is_decode()
-                and skip_guards.armed()
+            if skip_guards is not None and _skips_guard_eval(
+                skip_guards, forward_batch.forward_mode
             ):
                 with skip_guards:
                     out = fn(input_ids, positions, forward_batch, *args, **kwargs)
