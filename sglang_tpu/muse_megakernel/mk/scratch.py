@@ -379,6 +379,14 @@ def _scratch_plan_base(cfg: MKConfig):
     w2_words = Il // FP4_PACK
     cpt = c.chunk_pages * c.page_size
     sdt = jnp.float8_e4m3fn if c.scale_fp8 else jnp.bfloat16
+    # tile_loops QBLOCK slots hold the K / qblock scale rows the dots read
+    slim = bool(c.qblock and c.tile_loops)
+    s13_rows = max(He // c.qblock, 16) if slim else He // FP4_GROUP
+    s2_rows = (
+        max(Il // c.qblock, 16)
+        if slim
+        else max(Il // FP4_GROUP, 32 if c.scale_fp8 else 16)
+    )
     items = [
         (
             "ring",
@@ -386,14 +394,9 @@ def _scratch_plan_base(cfg: MKConfig):
         ),  # dense weight stream
         ("ring_sems", pltpu.SemaphoreType.DMA((c.ring_slots,))),
         ("w13", pltpu.VMEM((nslot, w13_words, 2 * Il), jnp.uint32)),
-        ("w13s", pltpu.VMEM((nslot, He // FP4_GROUP, 2 * Il), sdt)),
+        ("w13s", pltpu.VMEM((nslot, s13_rows, 2 * Il), sdt)),
         ("w2", pltpu.VMEM((nslot, w2_words, He), jnp.uint32)),
-        (
-            "w2s",
-            pltpu.VMEM(
-                (nslot, max(Il // FP4_GROUP, 32 if c.scale_fp8 else 16), He), sdt
-            ),
-        ),
+        ("w2s", pltpu.VMEM((nslot, s2_rows, He), sdt)),
         ("w13_sems", pltpu.SemaphoreType.DMA((nslot,))),
         ("w13s_sems", pltpu.SemaphoreType.DMA((nslot,))),
         ("w2_sems", pltpu.SemaphoreType.DMA((nslot,))),
