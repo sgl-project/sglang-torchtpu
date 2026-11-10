@@ -1125,6 +1125,8 @@ class TestRaidenStateGroups(CustomTestCase):
         pool.full_attention_layer_id_mapping = {3: 0, 7: 1}
         kv = {3: torch.zeros(9, 2), 7: torch.zeros(9, 2)}
         pool.get_fused_kv_buffer = lambda layer_id: kv[layer_id]
+        # A fused full-attention pool, which get_fused_kv_buffer above reads.
+        pool.full_kv_pool = SimpleNamespace()
         pool.mamba_pool = mamba_pool
         return pool, kv
 

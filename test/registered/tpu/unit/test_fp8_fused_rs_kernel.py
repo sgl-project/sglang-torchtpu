@@ -9,9 +9,13 @@ import unittest
 from pathlib import Path
 
 from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.ci.gate_matrix import full_matrix, sweep
 from sglang.test.test_utils import CustomTestCase
 
-register_tpu_ci(est_time=155, suite="stage-a-test-tpu-unit", chips=4)
+# Each case is its own TP8 torchrun at ~21s. The gate runs five of the eight;
+# the nightly adds the cases another gate case already passes through.
+register_tpu_ci(est_time=105, suite="stage-a-test-tpu-unit", chips=4)
+register_tpu_ci(est_time=170, suite="nightly-tpu-4-v7", nightly=True)
 
 
 class TestFp8FusedRsKernel(CustomTestCase):
@@ -101,16 +105,19 @@ class TestFp8FusedRsKernel(CustomTestCase):
         )
 
     def test_compiled_tp8_kernel_matches_reference(self):
-        for post_expert_norm in (False, True):
+        # Every other case runs with post_expert_norm=False.
+        for post_expert_norm in sweep((False, True), (True,)):
             with self.subTest(post_expert_norm=post_expert_norm):
                 # Exercise the M=2048 boundary used by Qwen3 at 256 tokens.
                 self._run_compiled_tp8_kernel(
                     post_expert_norm=post_expert_norm, tokens=256, topk=8
                 )
 
+    @unittest.skipUnless(full_matrix(), "block512 and direct-write pad rows too")
     def test_compiled_tp8_kernel_pads_routed_rows(self):
         self._run_compiled_tp8_kernel(post_expert_norm=False, tokens=8, topk=1)
 
+    @unittest.skipUnless(full_matrix(), "ids and weights share one psum")
     def test_compiled_tp8_kernel_synchronizes_divergent_weights(self):
         """Non-source routing weights must not affect fused-RS output."""
         self._run_compiled_tp8_kernel(

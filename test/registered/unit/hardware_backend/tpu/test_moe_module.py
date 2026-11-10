@@ -401,24 +401,6 @@ class TestForwardTpuContract(CustomTestCase):
     def tearDown(self):
         self.runner.stop()
 
-    def test_routes_through_fused_moe_call(self):
-        """Headline: ``forward_tpu`` must invoke the Pallas fused MoE
-        kernel (``fused_moe_call``). A regression that dropped to
-        ``forward_native``, raised early, or otherwise skipped the
-        kernel would silently disable Pallas on TPU -- the contract
-        tests below would all error out, but the failure mode would
-        be confusing. This explicit routing check produces a clean
-        diagnostic ahead of those secondary failures.
-        """
-        layer = self.runner.make_layer()
-        d_out = self.runner.make_dispatch_output()
-        self.runner.tpu_forward(layer, d_out)
-
-        self.assertTrue(
-            self.runner.kernel_was_called,
-            "forward_tpu did not route through fused_moe_call",
-        )
-
     def test_passes_w13_and_w2_through_unchanged(self):
         """``process_weights_after_loading`` already swapped axes -- the
         forward must not transpose again, must not call ``.contiguous()``

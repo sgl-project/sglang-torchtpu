@@ -11,7 +11,11 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
-from sglang_tpu.hooks.all_gather_via_all_reduce import all_gather_into_tensor
+from sglang_tpu.hooks.all_gather_via_all_reduce import (
+    gather_and_crop_vocab,
+    gather_attn_tp_logits,
+    wrap_logits_gatherer,
+)
 from sglang_tpu.hooks.attn_residual import register_attn_residual_ops
 from sglang_tpu.hooks.attn_tp import device_supports_input_scattered
 from sglang_tpu.hooks.cpu_pinning import bind_rank_cpu_set, pin_scheduler_main_thread
@@ -35,11 +39,7 @@ from sglang_tpu.hooks.encoder import (
     reject_encoder_dp,
 )
 from sglang_tpu.hooks.experimental_spec import hook_specs
-from sglang_tpu.hooks.glm_flash_megakernel import (
-    drop_freed_glm_flash_megakernel_request,
-    flush_glm_flash_megakernel_request,
-    route_glm_flash_megakernel,
-)
+from sglang_tpu.hooks.glm_flash_megakernel import route_glm_flash_megakernel
 from sglang_tpu.hooks.hicache_swa_metrics import hook_specs as hicache_swa_metrics_hooks
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
 from sglang_tpu.hooks.k3_megakernel import (
@@ -81,6 +81,7 @@ from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
     skip_spec_op_precompile_without_draft,
 )
+from sglang_tpu.hooks.pp_buffered_kv_budget import reserve_pp_buffered_handoff
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 from sglang_tpu.hooks.spec_tp_sync import broadcast_undeferred
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
@@ -92,6 +93,7 @@ from sglang_tpu.hooks.twolevel_allreduce import (
 from sglang_tpu.hooks.twolevel_allreduce import (
     row_parallel_linear_forward as twolevel_row_parallel_linear_forward,
 )
+from sglang_tpu.kv_pool_host import register_unified_hicache_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -245,16 +247,6 @@ HOOKS: list[tuple] = [
         HookType.AFTER,
     ),
     (
-        "sglang.srt.mem_cache.memory_pool.ReqToTokenPool.free_rows",
-        drop_freed_glm_flash_megakernel_request,
-        HookType.BEFORE,
-    ),
-    (
-        "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.checkpoint",
-        flush_glm_flash_megakernel_request,
-        HookType.BEFORE,
-    ),
-    (
         "sglang.srt.models.glm5_next.Glm5NextDecoderLayer._hc_pre",
         hc_pre,
         HookType.AROUND,
@@ -275,8 +267,18 @@ HOOKS: list[tuple] = [
         HookType.AROUND,
     ),
     (
-        "sglang.srt.distributed.parallel_state.GroupCoordinator.all_gather_into_tensor",
-        all_gather_into_tensor,
+        "sglang.srt.layers.logits_processor.LogitsProcessor.__init__",
+        wrap_logits_gatherer,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.layers.logits_processor.LogitsProcessor._gather_attn_tp_logits",
+        gather_attn_tp_logits,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.dspark.gather_and_crop_vocab",
+        gather_and_crop_vocab,
         HookType.AROUND,
     ),
     (
@@ -312,6 +314,11 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._tpu_mha_pool_class",
         draft_mha_pool_class,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._profile_available_bytes",
+        reserve_pp_buffered_handoff,
         HookType.AROUND,
     ),
     (
@@ -383,6 +390,7 @@ def register() -> None:
 
     register_muse_spark_processor()
     register_tpu_dsv4_resolution_hooks()
+    register_unified_hicache_strategy()
 
     from sglang.srt.plugins.hook_registry import HookRegistry
 

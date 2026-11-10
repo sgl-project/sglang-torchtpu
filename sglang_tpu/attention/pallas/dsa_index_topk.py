@@ -199,8 +199,8 @@ def dsa_indexer_step(
     scatter, any batch) or ``"pallas"`` (one Pallas kernel, decode-sized
     batches; same bytes).
 
-    ``row_count`` > 0 (with ``row_start``) is the token split
-    (SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT): the keys of every token are still
+    ``row_count`` > 0 (with ``row_start``) is the DSA indexer token split
+    (attention_pallas_mla_sparse.py): the keys of every token are still
     stored, but only query rows ``[row_start, row_start + row_count)`` are
     scored and selected, and ``topk_indices`` is ``i32[row_count, topk]``.
     Each row equals the same row of an unsplit call (rows past the batch are
