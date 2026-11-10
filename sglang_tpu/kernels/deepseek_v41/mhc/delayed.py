@@ -142,7 +142,12 @@ def _flat_pre_sums(flat, weight, previous_pre, mixes, tile):
             x = x_ref[:, m * dim : (m + 1) * dim].astype(jnp.float32)
             terms.append(pre[:, m : m + 1] * x)
             sums.append(jnp.sum(x * x, axis=1, keepdims=True))
-        value_ref[...] = functools.reduce(jnp.add, terms).astype(value_ref.dtype)
+        value = (
+            (terms[0] + terms[2]) + (terms[1] + terms[3])
+            if len(terms) == 4
+            else functools.reduce(jnp.add, terms)
+        )
+        value_ref[...] = value.astype(value_ref.dtype)
         square_ref[...] = functools.reduce(jnp.add, sums)
         parts = jnp.dot(x_ref[...], w_ref[...], preferred_element_type=jnp.float32)
         mix_ref[...] = (
@@ -369,7 +374,12 @@ def _flat_post_pre_sums(
             x = out_res_ref[:, m * dim : (m + 1) * dim].astype(jnp.float32)
             terms.append(pre[:, m : m + 1] * x)
             sums.append(jnp.sum(x * x, axis=1, keepdims=True))
-        value_ref[...] = functools.reduce(jnp.add, terms).astype(value_ref.dtype)
+        value = (
+            (terms[0] + terms[2]) + (terms[1] + terms[3])
+            if len(terms) == 4
+            else functools.reduce(jnp.add, terms)
+        )
+        value_ref[...] = value.astype(value_ref.dtype)
         square_ref[...] = functools.reduce(jnp.add, sums)
         parts = jnp.dot(
             out_res_ref[...], w_ref[...], preferred_element_type=jnp.float32

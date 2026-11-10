@@ -47,10 +47,9 @@ from sglang_tpu.kernels.deepseek_v41.csa2.csa2 import (
 )
 from sglang_tpu.kernels.deepseek_v41.mhc.delayed import (
     _delayed_pre_flat_small,
-    _post_and_collapse_jax,
+    _post_jax,
     delayed_post_pre_flat_jax,
     delayed_pre_flat_jax,
-    delayed_pre_jax,
 )
 
 
@@ -563,23 +562,11 @@ def test_delayed_mhc_pallas_matches_xla_reference(tokens):
     got_post_pre = jax.jit(lambda *a: delayed_post_pre_flat_jax(*a, *consts))(
         x, flat, post_mix, comb_mix, fn, scale, base, prev_pre
     )
-
-    def _ref_post_pre(x, flat, post_mix, comb_mix, fn, scale, base, prev_pre):
-        flat_new, value = _post_and_collapse_jax(x, flat, post_mix, comb_mix, prev_pre)
-        post, comb, _, new_pre = delayed_pre_jax(
-            flat_new.reshape(tokens, mult, dim),
-            flat_new,
-            fn,
-            scale,
-            base,
-            prev_pre,
-            *consts,
-        )
-        return flat_new, post, comb, value, new_pre
-
-    ref_post_pre = jax.jit(_ref_post_pre)(
-        x, flat, post_mix, comb_mix, fn, scale, base, prev_pre
-    )
+    flat_new_ref = jax.jit(_post_jax)(x, flat, post_mix, comb_mix)
+    post_ref, comb_ref, value_ref, new_pre_ref = jax.jit(
+        lambda f, *a: _delayed_pre_flat_small(f, *a, *consts)
+    )(flat_new_ref, fn, scale, base, prev_pre)
+    ref_post_pre = (flat_new_ref, post_ref, comb_ref, value_ref, new_pre_ref)
     for r, g, rtol in zip(
         ref_post_pre, got_post_pre, (2.0**-7, 1e-4, 1e-4, 2.0**-6, 1e-4)
     ):
