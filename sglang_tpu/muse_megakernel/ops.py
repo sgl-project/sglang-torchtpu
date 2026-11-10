@@ -382,6 +382,12 @@ class MuseMegakernel(torch.nn.Module):
             layer.mlp.experts.w13_weight_scale.dtype == torch.float8_e4m3fn
             for layer in decoder.layers
         )
+        if tpu_envs.SGLANG_TPU_MUSE_MK_QBLOCK.get():
+            # prefill and the native MoE share these expert weights at block 16
+            raise NotImplementedError(
+                "SGLANG_TPU_MUSE_MK_QBLOCK: serving weight load does not requantize the "
+                "experts yet (anvil / numerics only)"
+            )
         kperm = tpu_envs.SGLANG_TPU_MUSE_MK_KPERM.get()
         if kperm and scale_fp8:
             raise NotImplementedError(
@@ -676,6 +682,7 @@ class MuseMegakernel(torch.nn.Module):
             row_tile=_row_tile() if tiled else 0,
             ex_opt=opt,
             ex_kperm=1 if getattr(self, "kperm", False) else 0,
+            qblock=tpu_envs.SGLANG_TPU_MUSE_MK_QBLOCK.get(),
             ex_via_fp8=opt,
             bd_n_tile=1024 if opt else 0,
             vec_dequant_kperm=opt,

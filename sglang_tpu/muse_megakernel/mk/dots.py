@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """NVFP4 / fp8 weight dequantization and the matvec dots on them."""
 
+from collections.abc import Callable
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -78,6 +80,56 @@ def _scale_rows(sslot, g0, gn, N, blk, n0=0):
     return blk[g0 % 32 : g0 % 32 + gn], blk
 
 
+QBLOCK_TN = 512  # output columns per accumulator (up to 32 rows)
+
+
+def _fp4_qblock_dot(
+    x: jax.Array | None,
+    wslot,
+    sslot,
+    K: int,
+    N: int,
+    block: int,
+    lhs_chunk_fn: Callable[[int, int, bool], jax.Array] | None = None,
+    out_stage_ref=None,
+    post_scale: jax.Array | None = None,
+    nrows: int | None = None,
+) -> jax.Array | None:
+    """x [R, K] @ an NVFP4 slab requantized to one scale per block K rows (scale rows
+    [0, K / block) of sslot) -> f32 [R, N]: raw codes go to the MXU as e4m3 (exact) and each
+    block's partial takes its scale row after the dot, as ep_mk.experts.qblock_dot."""
+    m = nrows if nrows is not None else x.shape[0]
+    tn_step = min(N, QBLOCK_TN if m <= 32 else QBLOCK_TN // 2)
+    xb = None if x is None else x.astype(jnp.bfloat16)
+    cols = []
+    for n0 in range(0, N, tn_step):
+        tn = min(tn_step, N - n0)
+        acc = None
+        for k0 in range(0, K, block):
+            w = pltpu.bitcast(
+                wslot[pl.ds(k0 // FP4_PACK, block // FP4_PACK), pl.ds(n0, tn)],
+                jnp.float4_e2m1fn,
+            ).astype(jnp.float8_e4m3fn)
+            if lhs_chunk_fn is not None:
+                lhs = lhs_chunk_fn(k0 // FP4_PACK, block // FP4_PACK, False).astype(
+                    jnp.bfloat16
+                )
+            else:
+                lhs = xb[:, k0 : k0 + block]
+            part = jnp.dot(lhs, w, preferred_element_type=jnp.float32)
+            s = sslot[pl.ds(k0 // block, 1), pl.ds(n0, tn)].astype(jnp.float32)
+            acc = part * s if acc is None else acc + part * s
+        if post_scale is not None:
+            acc = acc * post_scale
+        if out_stage_ref is not None:
+            out_stage_ref[:, pl.ds(n0, tn)] = acc.astype(out_stage_ref.dtype)
+        else:
+            cols.append(acc)
+    if out_stage_ref is not None:
+        return None
+    return cols[0] if len(cols) == 1 else jnp.concatenate(cols, axis=1)
+
+
 def _fp4_dot(
     x,
     wslot,
@@ -97,7 +149,23 @@ def _fp4_dot(
     post_scale=None,
     force_bf16_w=False,
     nrows=None,
+    qblock=0,
 ):
+    if qblock:
+        if prequant_sc is not None:
+            raise ValueError("qblock fp4 dots take a bf16 LHS (no prequantized fp8 x)")
+        return _fp4_qblock_dot(
+            x,
+            wslot,
+            sslot,
+            K,
+            N,
+            qblock,
+            lhs_chunk_fn,
+            out_stage_ref,
+            post_scale,
+            nrows,
+        )
     kw = K // FP4_PACK
     m_rows = (
         nrows
@@ -196,12 +264,19 @@ def _fp4_blockdiag_dot(
     prequant_sc=None,
     nrows=None,
     post_scale=None,
+    qblock=0,
 ):
     """``xc [A, K]`` bf16 @ an NVFP4 slab (``wslot`` u32 words ``[K/8, N]``, block-16 scales
 
     ``sslot [K/16, N]``) -> f32 ``[A, N]``, exact in f32 (or native fp8xfp8 when
-    ``fp8_lhs``).
+    ``fp8_lhs``). qblock: the slab is block-scaled instead and A rows run a plain dot.
     """
+    if qblock:
+        if prequant_sc is not None or lhs_chunk_fn is not None:
+            raise ValueError("qblock fp4 dots take a bf16 LHS (no prequantized fp8 x)")
+        return _fp4_qblock_dot(
+            xc, wslot, sslot, K, N, qblock, post_scale=post_scale, nrows=nrows
+        )
     A = (
         nrows
         if nrows is not None

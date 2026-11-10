@@ -597,6 +597,9 @@ class TpuEnvs:
     # Offline block-256 (16, 16)^T pre-shuffling of fp4 expert slabs + wpool/scales for
     # zero-shuffle NVFP4 dequant in the decode megakernel (and prefill MoE via MUSE_PF_MOE_KPERM).
     SGLANG_TPU_MUSE_MK_KPERM = EnvBool(False)
+    # Decode megakernel (TP): fp4 experts requantized to one scale per this many K rows (0 off,
+    # 64 / 128 / 256); the expert dots push raw e2m1 codes to the MXU (MKConfig.qblock).
+    SGLANG_TPU_MUSE_MK_QBLOCK = EnvInt(0)
     # Megakernel KV write on SEQ_ALONG_LANE pools: all page read-modify-writes of a layer in
     # flight together, overlapped with the next layer's (MKConfig.kv_write_pipelined; exact).
     SGLANG_TPU_MUSE_MK_KV_WRITE_PIPELINED = EnvBool(False)

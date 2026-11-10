@@ -10,6 +10,7 @@ UNSHIFTED_MAX = 60.0
 _COLLECTIVE_ID = 6
 FP4_PACK = 8
 FP4_GROUP = 16
+QBLOCK_SIZES = (64, 128, 256)  # SGLANG_TPU_MUSE_MK_QBLOCK: K rows per scale row
 
 
 # small-slab rows (replicated per layer, f32, width = hidden)

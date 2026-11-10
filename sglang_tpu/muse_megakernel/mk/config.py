@@ -11,6 +11,7 @@ from sglang_tpu.muse_megakernel.mk.consts import (
     LANE,
     PREONES_MAX_SLOTS,
     PREONES_ROWS,
+    QBLOCK_SIZES,
     UNSHIFTED_MAX,
 )
 from sglang_tpu.muse_megakernel.mk.plan import (
@@ -225,6 +226,9 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     attn_head_fp8: int = 0
     alias_oag_f: bool = False
     vmem_limit_bytes: int = 60 * 2**20
+    # SGLANG_TPU_MUSE_MK_QBLOCK: fp4 experts requantized to one bf16 scale per qblock K rows
+    # (scale rows [0, K / qblock) of the slabs); the dots push raw codes to the MXU
+    qblock: int = 0
     # dense weights left out of the ring (an FFN-section hook streams its own copies)
     dense_skip: tuple = ()
 
@@ -346,8 +350,29 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     def use_rope(self, l):
         return l not in self.global_layers
 
+    def _validate_qblock(self):
+        if self.qblock not in QBLOCK_SIZES:
+            raise ValueError(
+                f"SGLANG_TPU_MUSE_MK_QBLOCK={self.qblock}: 0 or one of {QBLOCK_SIZES}"
+            )
+        for name, k in (
+            ("w13 K (expert_hidden)", self.expert_hidden),
+            ("w2 K per rank (inter_local)", self.inter_local),
+        ):
+            if k % self.qblock:
+                raise ValueError(
+                    f"SGLANG_TPU_MUSE_MK_QBLOCK={self.qblock}: {name}={k} is not a multiple"
+                )
+        if self.scale_fp8 or self.ex_kperm >= 3 or self.bd_fp8_lhs:
+            raise ValueError(
+                "SGLANG_TPU_MUSE_MK_QBLOCK needs bf16 block scales and a bf16 expert LHS "
+                "(scale_fp8, ex_kperm >= 3 and bd_fp8_lhs are off)"
+            )
+
     def validate(self):
         assert self.rows % self.tp == 0 and self.rows >= self.tp
+        if self.qblock:
+            self._validate_qblock()
         # windows are DMA'd in TABLE_ALIGN-entry units; only the SAL kv write reads them
         assert not self.swa_window_table or (
             self.kv_sal and table_entries_padded(self) >= swa_window_entries(self)
