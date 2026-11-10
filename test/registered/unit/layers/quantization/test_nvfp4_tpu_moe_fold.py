@@ -275,6 +275,45 @@ class TestNvfp4Block512Contract(CustomTestCase):
         self.assertEqual(layer.w13_weight_scale.dtype, torch.bfloat16)
         self.assertEqual(layer.w2_weight_scale.dtype, torch.bfloat16)
 
+    def test_nvfp4_moe_fp32_scales_env_promotes_gmm_v2_only(self):
+        from sglang_tpu import fp4_moe
+        from sglang_tpu.envs import envs as tpu_envs
+
+        with tpu_envs.SGLANG_TPU_NVFP4_MOE_FP32_SCALES.override(True):
+            gmm_layer = _make_block512_layer(group_size=16)
+            fp4_moe.prepare_tpu_nvfp4_moe_weights(
+                gmm_layer,
+                group_size=16,
+                scale_dtype=torch.bfloat16,
+                use_fused_rs=False,
+            )
+            self.assertEqual(gmm_layer.w13_weight_scale.dtype, torch.float32)
+            self.assertEqual(gmm_layer.w2_weight_scale.dtype, torch.float32)
+
+            rs_layer = _make_block512_layer(group_size=16)
+            with (
+                mock.patch(
+                    "sglang_tpu.moe.pallas.fused_moe_rs_op.prepare_fused_moe_rs"
+                ),
+                mock.patch.object(
+                    fp4_moe,
+                    "prepare_tpu_fused_rs_post_expert_norm",
+                ),
+                mock.patch.object(
+                    fp4_moe,
+                    "_materialize_packed_fp4",
+                    side_effect=lambda x: x,
+                ),
+            ):
+                fp4_moe.prepare_tpu_nvfp4_moe_weights(
+                    rs_layer,
+                    group_size=16,
+                    scale_dtype=torch.bfloat16,
+                    use_fused_rs=True,
+                )
+            self.assertEqual(rs_layer.w13_weight_scale.dtype, torch.bfloat16)
+            self.assertEqual(rs_layer.w2_weight_scale.dtype, torch.bfloat16)
+
     def test_folds_non_unit_global_scales(self):
         from sglang_tpu.fp4_moe import (
             prepare_tpu_nvfp4_moe_weights,

@@ -55,7 +55,6 @@ def prepare_inputs(
     kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
     page_size: int = 128,
 ) -> tuple[jax.Array, jax.Array]:
-
     total_q_tokens, actual_num_q_heads, actual_head_dim = q.shape
     _, actual_num_kv_heads, _ = k.shape
     num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
@@ -430,6 +429,10 @@ def calculate_block_sizes(
         if fixed_bq_sz is None:
             bq_sz = bq_stride = bkv_sz
             min_bq_sz = min(bq_sz, _MIN_SHRUNK_BQ_SZ)
+            if aligned_num_q_heads_per_kv_head * model_cfgs.num_kv_heads >= num_lanes:
+                # 128+ q heads on one core (Muse PP8 x TP1) may not fit a 128-token
+                # q block; keep shrinking it to a compute tile of one lane vreg.
+                min_bq_sz = max(16, num_lanes // aligned_num_q_heads_per_kv_head)
         else:
             bq_sz = min_bq_sz = fixed_bq_sz
             bq_stride = 0

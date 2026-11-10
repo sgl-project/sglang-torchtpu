@@ -419,9 +419,7 @@ def _select_candidate_tokens(
         return streaming_topk.streaming_topk(
             scores,
             valid_lengths=(
-                jnp.full((scores.shape[0], 1), scores.shape[1], jnp.int32)
-                if valid_lengths is None
-                else valid_lengths.reshape(-1, 1)
+                None if valid_lengths is None else valid_lengths.reshape(-1, 1)
             ),
             logical_blocks=candidates,
             k=k,

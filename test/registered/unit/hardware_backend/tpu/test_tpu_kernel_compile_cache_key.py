@@ -171,6 +171,9 @@ class TestKernelInputsDigest(CustomTestCase):
         # The recompile monitor is read in a hashed file but is not keyed.
         with tpu_envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True):
             self.assertEqual(self.digest(), self.base)
+        # The buffered PP hand-off's send queue depth is read in pp_scheduler.py.
+        with tpu_envs.SGLANG_TPU_PP_BUFFERED_SEND_DEPTH.override(5):
+            self.assertEqual(self.digest(), self.base)
 
     def test_unkeyed_env_knobs_are_all_read_by_the_kernel_sources(self):
         # No stale entries: each unkeyed name is a real field the sources read.
