@@ -37,6 +37,7 @@ f32, bf16 = jnp.float32, jnp.bfloat16
 
 # collective phases: one receive / send semaphore each
 PH_ORS, PH_OAG, PH_PAG, PH_URS, PH_UAG, PH_FAG = range(6)
+_PH_NAMES = ("o_rs", "o_ag", "pool_ag", "u_rs", "u_ag", "f_ag")
 _TP_UNUSED = {
     "route_v",
     "route_s",
@@ -153,16 +154,17 @@ def _wait(tmpl, n: int) -> None:
 def _all_gather(c: MKConfig, S: dict, me, buf, ph: int) -> None:
     """buf[me] (filled here) into every rank's buf[me]."""
     rsem, ssem = S["eg_rsems"].at[ph], S["eg_ssems"].at[ph]
-    for d in range(1, c.tp):
-        pltpu.make_async_remote_copy(
-            src_ref=buf.at[me],
-            dst_ref=buf.at[me],
-            send_sem=ssem,
-            recv_sem=rsem,
-            device_id=((me + d) % c.tp,),
-        ).start()
-    _wait(pltpu.make_async_copy(buf.at[0], buf.at[0], rsem), c.tp - 1)
-    _wait(pltpu.make_async_copy(buf.at[0], buf.at[0], ssem), c.tp - 1)
+    with _phase(_PH_NAMES[ph]):
+        for d in range(1, c.tp):
+            pltpu.make_async_remote_copy(
+                src_ref=buf.at[me],
+                dst_ref=buf.at[me],
+                send_sem=ssem,
+                recv_sem=rsem,
+                device_id=((me + d) % c.tp,),
+            ).start()
+        _wait(pltpu.make_async_copy(buf.at[0], buf.at[0], rsem), c.tp - 1)
+        _wait(pltpu.make_async_copy(buf.at[0], buf.at[0], ssem), c.tp - 1)
 
 
 def _local_copy(S: dict, src, dst) -> None:
@@ -223,11 +225,13 @@ def _o_proj(step: EPOProjStep) -> None:
                 device_id=(col,),
             ).start()
 
-    step.mv(ship)
+    with _phase("o_proj_mv"):
+        step.mv(ship)
     n_tiles = H // Hl
-    for ni in range(max(0, n_tiles - 2), n_tiles):
-        sent(ni % 2).wait()
-    _wait(pltpu.make_async_copy(recv.at[0], recv.at[0], rsem), tp - 1)
+    with _phase("o_rs"):
+        for ni in range(max(0, n_tiles - 2), n_tiles):
+            sent(ni % 2).wait()
+        _wait(pltpu.make_async_copy(recv.at[0], recv.at[0], rsem), tp - 1)
     oag = S["eg_oag"]
     for t in range(c.rows // RT):
         rows = pl.ds(t * RT, RT)
@@ -429,8 +433,9 @@ def _u_reduce(step: EPLayerStep) -> None:
             device_id=(peer,),
         ).start()
     _local_copy(S, block(me), urs.at[me])
-    _wait(pltpu.make_async_copy(urs.at[0], urs.at[0], rsem), tp - 1)
-    _wait(pltpu.make_async_copy(urs.at[0], urs.at[0], ssem), tp - 1)
+    with _phase("u_rs_wait"):
+        _wait(pltpu.make_async_copy(urs.at[0], urs.at[0], rsem), tp - 1)
+        _wait(pltpu.make_async_copy(urs.at[0], urs.at[0], ssem), tp - 1)
     uag = S["eg_uag"]
     for t in range(c.rows // RT):
         rows = pl.ds(t * RT, RT)
