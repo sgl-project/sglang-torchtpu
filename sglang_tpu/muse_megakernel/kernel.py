@@ -2572,6 +2572,15 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                 i,
             )
 
+        def divmod_nn(i, d):
+            """(i // d, i % d) for i >= 0: shift and mask when d is a power of two (signed //
+            and % lower to ~10 scalar ops each)."""
+            if d & (d - 1):
+                return i // d, i % d
+            return jax.lax.shift_right_logical(i, d.bit_length() - 1), jnp.bitwise_and(
+                i, d - 1
+            )
+
         def unique_experts_vec(ids_list):
             P = R * K
             r_of = jax.lax.broadcasted_iota(jnp.int32, (P, 1), 0) % R
@@ -4617,6 +4626,15 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     else:
                         S["ysend"][...] = jnp.zeros((R, K, yw), jnp.uint32)
 
+            # QBLOCK fp4: pair indices by shift and mask (perm entries are >= 0)
+            q_idx = bool(c.qblock and kind == "fp4" and c.vec_route)
+
+            def perm_at(i):
+                if not q_idx:
+                    return rget("perm", i)
+                hi, lo = divmod_nn(i, LANE)
+                return S["route_s"][3 * NBR + hi, lo]
+
             pad_y = S["pad_y"]
             if vy == 0:
                 y_rsem = S["tc_rsems"].at[tc_rmap["y"]]
@@ -4646,9 +4664,13 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     ystage.at[b][pl.ds(0, n), :] = yp
 
                     def issue(j, carry):
-                        p = rget("perm", first + j)
-                        r, k = p // K, p % K
-                        owner, rl = r // Rc, r % Rc
+                        p = perm_at(first + j)
+                        if q_idx:
+                            r, k = divmod_nn(p, K)
+                            owner, rl = divmod_nn(r, Rc)
+                        else:
+                            r, k = p // K, p % K
+                            owner, rl = r // Rc, r % Rc
                         src = ystage.at[b, pl.ds(j, 1)]
                         dst = pad_y.at[me, rl, pl.ds(k, 1)]
 
@@ -4753,13 +4775,17 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             def run_ffn_and_store(
                 nrows, pair_fn, slot, e, blockdiag, first, n_valid, wait_w2=True
             ):
-                if c.qblock and kind == "fp4":
+                if c.qblock and kind == "fp4" and blockdiag:
                     # w2 waited for up front: a mid-arm DMA wait is a scheduling barrier
                     # that drains the MXU between w13 and w2
                     wait_w2_if_needed(slot, wait_w2)
                     pairs = [pair_fn(j) for j in range(nrows)]
+                    rk = [divmod_nn(p, K) if q_idx else (p // K, p % K) for p in pairs]
+                    xs = jnp.concatenate(
+                        [S["xfull"][pl.ds(r, 1), :] for r, _ in rk], axis=0
+                    )
                     y = _fp4_qblock_ffn(
-                        gather_x(pairs),
+                        _unpack_bf16x2(xs).astype(bf16),
                         W13.at[slot],
                         S["w13s"].at[slot],
                         W2.at[slot],
@@ -4768,7 +4794,12 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         Il,
                         c.qblock,
                     )
-                    ystore(_pack_y(y, c), pairs, first, n_valid)
+                    yp = _pack_y(y, c)
+                    if vy >= 1:
+                        for j, (r, k) in enumerate(rk):
+                            S["ysend"].at[r][pl.ds(k, 1), :] = yp[j : j + 1]
+                    else:
+                        yemit(yp, first, n_valid)
                     return
                 can_fp8_x = bool(
                     prequant_x and not blockdiag and nrows >= 32 and nrows % 32 == 0
@@ -5086,7 +5117,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     with _scope(f"ex_c{nrows}"):
                         run_ffn_and_store(
                             nrows,
-                            lambda j: rget("perm", off + jnp.minimum(j, cnt - 1)),
+                            lambda j: perm_at(off + jnp.minimum(j, cnt - 1)),
                             slot,
                             e,
                             True,
@@ -5102,7 +5133,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     def full_one(nrows):
                         run_ffn_and_store(
                             nrows,
-                            lambda j: rget("perm", off + jnp.minimum(j, cnt - 1)),
+                            lambda j: perm_at(off + jnp.minimum(j, cnt - 1)),
                             slot,
                             e,
                             False,
@@ -5113,9 +5144,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     def chunk(ch, carry_):
                         run_ffn_and_store(
                             CH,
-                            lambda j: rget(
-                                "perm", off + jnp.minimum(ch * CH + j, cnt - 1)
-                            ),
+                            lambda j: perm_at(off + jnp.minimum(ch * CH + j, cnt - 1)),
                             slot,
                             e,
                             use_bd_chunk,
