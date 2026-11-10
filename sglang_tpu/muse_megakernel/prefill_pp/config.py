@@ -231,6 +231,17 @@ def fp4_qblock_a8() -> bool:
     return a8
 
 
+def fp4_qblock_tile_m() -> int:
+    """MUSE_PP_QBLOCK_TM=rows with MUSE_PP_QBLOCK: the block-scaled grouped matmuls' m tile
+    (0: the served lookup's)."""
+    tm = int(os.environ.get("MUSE_PP_QBLOCK_TM", "0"))
+    if tm and (not fp4_qblock() or tm % 16):
+        raise ValueError(
+            f"MUSE_PP_QBLOCK_TM={tm} needs MUSE_PP_QBLOCK and 16-row tiles"
+        )
+    return tm
+
+
 def skipped_phases() -> frozenset[str]:
     """MUSE_PP_SKIP=a,b: timing ablation only (wrong numerics), those phases do not run."""
     skip = frozenset(p for p in os.environ.get("MUSE_PP_SKIP", "").split(",") if p)

@@ -10,6 +10,7 @@ from sglang_tpu.muse_megakernel.prefill_pp.config import (
     PPConfig,
     fp4_qblock,
     fp4_qblock_a8,
+    fp4_qblock_tile_m,
 )
 
 ACTIVATION = "silu"
@@ -117,6 +118,16 @@ def _permute(c: PPConfig, xe, ids, tw):
     return rows, group_sizes, order, tw
 
 
+def _with_tile_m(tile_info):
+    """tile_info (a gmm_v2 tile function) with MUSE_PP_QBLOCK_TM rows per m tile."""
+    import dataclasses
+
+    def tiles(*args):
+        return dataclasses.replace(tile_info(*args), tile_m=fp4_qblock_tile_m())
+
+    return tiles
+
+
 def _gmm(c: PPConfig, rows, group_sizes, ex):
     """_fused_moe_jax's two grouped matmuls (fused SiLU in the first), its tiles and options."""
     from sglang_tpu.moe.pallas.fused_moe_op import (
@@ -150,6 +161,8 @@ def _gmm(c: PPConfig, rows, group_sizes, ex):
             )
         )
     )
+    if qb and fp4_qblock_tile_m():
+        tile1 = _with_tile_m(tile1)
     common = dict(
         group_sizes=group_sizes, rhs_bias=None, rhs_channel_scale=None, group_offset=None,
         zero_initialize=True, preferred_element_type=BF16,
@@ -169,6 +182,8 @@ def _gmm(c: PPConfig, rows, group_sizes, ex):
     tile2 = _dividing_tile_k(
         _vmem_safe_packed_tile_n(_gmm2_tile_source(h, w2, s2, E, w2_packed=w2_packed))
     )
+    if qb and fp4_qblock_tile_m():
+        tile2 = _with_tile_m(tile2)
     y = gmm_v2(
         lhs=h, rhs=w2, rhs_scale=s2, tile_info=tile2, packed_fp4=w2_packed,
         fp4_qblock=qb or None, **common,
