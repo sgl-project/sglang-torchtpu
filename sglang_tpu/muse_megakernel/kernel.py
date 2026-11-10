@@ -202,6 +202,8 @@ from sglang_tpu.muse_megakernel.mk.weights import (  # noqa: F401
 )
 
 _PIPE_AG = {"o_ag": 0, "f": 1, "u": 2}
+# vmem_trim: the combine ring's first xfull row (u_send holds rows [0, rows per device <= 32))
+Y_XFULL_ROW0 = 32
 
 
 def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
@@ -5808,13 +5810,26 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     YP, NB = yrow_ring(c)
                     hs = c.tp // YP
                     n_units = Rc * YP
+                    assert not c.vmem_trim or (
+                        Rc <= Y_XFULL_ROW0 and Y_XFULL_ROW0 + NB * hs * K <= R
+                    )
+
+                    def ybuf(b, d):
+                        """Source d's [K, yw] slot of ring buffer b: under vmem_trim in xfull rows
+                        past u_send (the expert inputs are dead during combine)."""
+                        if not c.vmem_trim:
+                            return S["yrow"].at[b, d, 0]
+                        r0 = Y_XFULL_ROW0 + (b * hs + d) * K
+                        return S["xfull"].at[
+                            pl.ds(pl.multiple_of(r0, 8), K), pl.ds(0, yw)
+                        ]
 
                     def ycopies(u, b):
                         r, part = u // YP, u % YP
                         return [
                             pltpu.make_async_copy(
-                                S["pad_y"].at[part * hs + d, pl.ds(r, 1)],
-                                S["yrow"].at[b, d],
+                                S["pad_y"].at[part * hs + d, r],
+                                ybuf(b, d),
                                 S["yrow_sems"].at[b],
                             )
                             for d in range(hs)
@@ -5840,9 +5855,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             pl.when(my_live & (u + NB - 1 < n_units))(
                                 functools.partial(ystart, u + NB - 1)
                             )
-                            yr = S["yrow"].at[u % NB]
                             for d in range(hs):
-                                y_d = _unpack_y(yr[d, 0], c)  # [K, He]
+                                y_d = _unpack_y(ybuf(u % NB, d)[...], c)  # [K, He]
                                 ysum = y_d if ysum is None else ysum + y_d
                         # rows past n_live received nothing (stale HBM): keep them zero
                         ysum = (

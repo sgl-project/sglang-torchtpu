@@ -419,9 +419,16 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
         ]
     if vy < 2:
         items += [
-            (
-                "yrow",
-                vmem((yrow_ring(c)[1], tp // yrow_ring(c)[0], 1, K, yw), u32),
+            # vmem_trim: the ring lives in xfull (kernel Y_XFULL_ROW0)
+            *(
+                []
+                if c.vmem_trim
+                else [
+                    (
+                        "yrow",
+                        vmem((yrow_ring(c)[1], tp // yrow_ring(c)[0], 1, K, yw), u32),
+                    )
+                ]
             ),
             ("yrow_sems", pltpu.SemaphoreType.DMA((yrow_ring(c)[1],))),
         ]
