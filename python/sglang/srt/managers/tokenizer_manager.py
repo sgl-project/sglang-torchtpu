@@ -30,6 +30,7 @@ import threading
 import time
 from array import array
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import datetime
 from enum import Enum
@@ -105,7 +106,7 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
-from sglang.srt.managers.mm_utils import wrap_shm_features
+from sglang.srt.managers.mm_utils import discard_shm_features, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
@@ -191,6 +192,39 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
+_SHM_WRAP_POOL: Optional[ThreadPoolExecutor] = None
+
+
+def _shm_wrap_pool() -> ThreadPoolExecutor:
+    """Threads for wrap_shm_features (SGLANG_SHM_WRAP_OFF_LOOP)."""
+    global _SHM_WRAP_POOL
+    if _SHM_WRAP_POOL is None:
+        _SHM_WRAP_POOL = ThreadPoolExecutor(
+            max_workers=envs.SGLANG_SHM_WRAP_THREADS.get(),
+            thread_name_prefix="shm-wrap",
+        )
+    return _SHM_WRAP_POOL
+
+
+def _discard_wrapped_features(future: asyncio.Future) -> None:
+    if not future.cancelled() and future.exception() is None:
+        discard_shm_features(future.result())
+
+
+async def _wrap_shm_features_off_loop(obj, force: bool = False):
+    """wrap_shm_features on the SHM wrap pool. If the caller is cancelled while
+    the copy runs, the segments it creates are released once it finishes,
+    since the request will not be dispatched."""
+    future = asyncio.get_running_loop().run_in_executor(
+        _shm_wrap_pool(), wrap_shm_features, obj, force
+    )
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        future.add_done_callback(_discard_wrapped_features)
+        raise
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -231,6 +265,15 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_sampling_mask",
     "output_token_sampling_logprobs",
 )
+
+
+@dataclasses.dataclass
+class HealthProbeState:
+    """A /health_generate probe waiting for a completed-inference ack."""
+
+    # (incarnation, completion_seq) last accepted per dp_rank when registered.
+    baseline: Dict[int, Tuple[str, int]]
+    event: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
 
 
 @dataclasses.dataclass
@@ -672,7 +715,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Health check
         self.server_status = ServerStatus.Starting
         self.gracefully_exit = False
+        # Any scheduler/detokenizer message; feeds diagnostics, never health.
         self.last_receive_tstamp = real_time()
+        # dp_rank -> (incarnation, completion_seq) of the last accepted ack.
+        self.health_progress: Dict[int, Tuple[str, int]] = {}
+        self.pending_health_probes: Dict[str, HealthProbeState] = {}
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
@@ -687,6 +734,51 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and not self.gracefully_exit
             and self.server_status == ServerStatus.Up
         )
+
+    def register_health_probe(self, rid: str) -> HealthProbeState:
+        probe = HealthProbeState(baseline=dict(self.health_progress))
+        self.pending_health_probes[rid] = probe
+        return probe
+
+    def discard_health_probe(self, rid: str) -> None:
+        self.pending_health_probes.pop(rid, None)
+
+    def _handle_health_check_output(self, recv_obj: HealthCheckOutput) -> None:
+        """Pass a pending probe only on proof of completed inference.
+
+        The ack must name a pending probe, carry the scheduler incarnation and
+        completion sequence, and be newer than what that worker had already
+        reported when the probe was registered. A legacy empty ack, a stray or
+        replayed one, or one for another probe changes nothing.
+        """
+        probe = self.pending_health_probes.get(recv_obj.rid)
+        if probe is None:
+            logger.debug("Ignoring health ack for unknown probe %s", recv_obj.rid)
+            return
+        if recv_obj.incarnation is None or recv_obj.completion_seq is None:
+            logger.warning(
+                "Ignoring health ack for %s without completion evidence", recv_obj.rid
+            )
+            return
+        baseline = probe.baseline.get(recv_obj.dp_rank)
+        if (
+            baseline is not None
+            and baseline[0] == recv_obj.incarnation
+            and recv_obj.completion_seq <= baseline[1]
+        ):
+            logger.warning(
+                "Ignoring stale health ack for %s: dp_rank=%d seq=%d <= baseline %d",
+                recv_obj.rid,
+                recv_obj.dp_rank,
+                recv_obj.completion_seq,
+                baseline[1],
+            )
+            return
+        self.health_progress[recv_obj.dp_rank] = (
+            recv_obj.incarnation,
+            recv_obj.completion_seq,
+        )
+        probe.event.set()
 
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
@@ -845,9 +937,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self._handle_update_weights_from_disk_req_output,
                 ),
                 (FreezeGCReq, lambda x: None),
-                # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
-                (HealthCheckOutput, lambda x: None),
-                # Same skip-detokenizer forwarding case as above.
+                (HealthCheckOutput, self._handle_health_check_output),
+                # Scheduler skips the detokenizer and forwards back to the tokenizer manager; ignore it.
                 (ConfigureLoggingReq, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
@@ -1743,10 +1834,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
             )
             tokenized_obj.time_stats.set_api_server_dispatch_time()
-            tokenized_obj = wrap_shm_features(
-                tokenized_obj,
-                force=node_fanout_enabled(),
-            )
+            force = node_fanout_enabled()
+            if envs.SGLANG_SHM_WRAP_OFF_LOOP.get():
+                tokenized_obj = await _wrap_shm_features_off_loop(tokenized_obj, force)
+            else:
+                tokenized_obj = wrap_shm_features(tokenized_obj, force=force)
             time_stats = tokenized_obj.time_stats
             tokenized_obj.wrap_pickle_fields()
             self._dispatch_to_scheduler(tokenized_obj)
@@ -2449,7 +2541,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
-                # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
+                # A probe's own late output: health is decided by the
+                # HealthCheckOutput ack, and the handler drops the rid state.
                 if rid.startswith(HEALTH_CHECK_RID_PREFIX):
                     continue
                 logger.warning(

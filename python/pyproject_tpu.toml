@@ -21,6 +21,9 @@ dependencies = [
   "anyio>=4.13.0",
   "blobfile==3.0.0",
   "av",
+  # SGLang decodes video with torchcodec or, failing that, decord; this stack
+  # ships neither, so without it every video request fails to decode.
+  "decord2==3.4.0",
   "build",
   "compressed-tensors",
   "datasets",
@@ -81,7 +84,7 @@ dependencies = [
   # connector (sglang/srt/disaggregation/raiden/) and the raiden HiCache
   # transfer backend (sglang/srt/hardware_backend/tpu/raiden_transfer.py).
   # Published to PyPI as nightly .dev pre-releases.
-  "tpu-sync-torch==0.0.1.dev20261028081934",
+  "tpu-sync-torch==0.0.1.dev20261029081917",
   "libtpu==0.0.50",
   "torch==2.11.0",
   "torchvision==0.26.0",

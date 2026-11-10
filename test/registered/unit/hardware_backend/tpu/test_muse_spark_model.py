@@ -1,15 +1,22 @@
 """CPU tests for the Muse Spark TPU model's checkpoint mapping, config, and PP."""
 
 import unittest
+from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.configs.model_config import get_hybrid_layer_ids
 from sglang.srt.configs.muse_spark import MuseSparkConfig
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptQuantConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.models.muse_spark import (
     MuseSparkInterleavedRope,
+    MuseSparkMoE,
+    MuseSparkRMSNorm,
+    _experts_quant_config,
+    _HostQuantizedFp8Config,
     _param_name,
     _to_interleaved_rope,
 )
@@ -30,6 +37,52 @@ def _rotate_half_rope(x, positions, base):
     sin = torch.cat([angles.sin(), angles.sin()], -1).float()[:, None]
     first, second = x.chunk(2, dim=-1)
     return x * cos + torch.cat([-second, first], -1) * sin
+
+
+class TestMuseSparkExpertQuantConfig(CustomTestCase):
+    def test_excluded_layers_use_fp8_unless_bf16_is_enabled(self):
+        nvfp4 = MagicMock(spec=ModelOptQuantConfig)
+        nvfp4.exclude_modules = ["layers.0.", "layers.61."]
+        first, middle = "model.layers.0.mlp.experts", "model.layers.1.mlp.experts"
+        self.assertIsInstance(
+            _experts_quant_config(nvfp4, first), _HostQuantizedFp8Config
+        )
+        self.assertIs(_experts_quant_config(nvfp4, middle), nvfp4)
+        bf16_flag = tpu_envs.SGLANG_TPU_ENABLE_MUSE_BF16_FIRST_LAST_LAYER_EXPERTS
+        with bf16_flag.override(True):
+            self.assertIsNone(_experts_quant_config(nvfp4, first))
+            self.assertIs(_experts_quant_config(nvfp4, middle), nvfp4)
+            # A BF16 checkpoint keeps every layer FP8, not only the first and last.
+            self.assertIsInstance(
+                _experts_quant_config(None, middle), _HostQuantizedFp8Config
+            )
+            with tpu_envs.SGLANG_TPU_MUSE_MEGAKERNEL.override(True):
+                with self.assertRaisesRegex(ValueError, "MUSE_MEGAKERNEL"):
+                    _experts_quant_config(nvfp4, first)
+
+
+class TestMuseSparkSlotCombine(CustomTestCase):
+    def test_expert_tp_sums_partial_outputs_before_the_norm(self):
+        norm = MuseSparkRMSNorm(4, eps=1e-8, gain_center=1.0, scale_input=True)
+        torch.nn.init.zeros_(norm.weight)
+        moe = torch.nn.Module()
+        moe.tp_size = moe.moe_tp_size = 2
+        moe.post_expert_norm = norm
+        mine = torch.arange(1.0, 25.0).reshape(2, 3, 4).to(torch.bfloat16)
+        peer = mine.flip(-1)
+        weights = torch.tensor([[0.5, 0.3, 0.2], [0.1, 0.2, 0.7]])
+
+        with patch(
+            "sglang_tpu.models.muse_spark.tensor_model_parallel_all_reduce",
+            side_effect=lambda x: x + peer.float(),
+        ) as all_reduce:
+            combined = MuseSparkMoE._combine_slots(moe, mine, weights)
+
+        all_reduce.assert_called_once()
+        full = norm(mine.float() + peer.float())
+        expected = (full * weights.unsqueeze(-1)).sum(dim=1)
+        self.assertEqual(combined.dtype, torch.bfloat16)
+        self.assertTrue(torch.allclose(combined.float(), expected, atol=1e-2))
 
 
 class TestMuseSparkCheckpointMapping(CustomTestCase):
@@ -552,6 +605,79 @@ class TestMuseSparkPipelineParallel(CustomTestCase):
         self.assertEqual(plan.config.server_args["moe_runner_backend"], "auto")
         self.assertTrue(plan.config.server_args["disable_overlap_schedule"])
         self.assertEqual(plan.env["SGLANG_PP_LAYER_PARTITION"], "7,8,8,8,8,8,8,7")
+
+
+class TestMuseSparkHostFp8ExpertLoad(CustomTestCase):
+    def test_host_fp8_expert_stack_matches_per_expert_reference_and_frees_storage(
+        self,
+    ):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import sglang_tpu.models.muse_spark as muse_mod
+        from sglang.srt.layers.quantization.fp8 import (
+            _scaled_fp8_quant_tpu_weight,
+            fp8_dtype,
+        )
+
+        torch.manual_seed(17)
+        num_experts, two_inter, hidden = 8, 32, 16
+        # Partition across moe_tp_size=2 to cover gate/up half-slicing as well.
+        fake_parallel = SimpleNamespace(
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_tp_size=2,
+            moe_tp_rank=1,
+            tp_size=2,
+            pp_size=1,
+        )
+        w13_ckpt = torch.randn(num_experts, two_inter, hidden, dtype=torch.bfloat16)
+        w13_param = torch.nn.Parameter(
+            torch.empty(num_experts, two_inter // 2, hidden, dtype=fp8_dtype),
+            requires_grad=False,
+        )
+        w13_scale_param = torch.nn.Parameter(
+            torch.ones(num_experts, dtype=torch.float32),
+            requires_grad=False,
+        )
+        old_w_storage = w13_param.data.untyped_storage()
+        old_s_storage = w13_scale_param.data.untyped_storage()
+        params = {
+            "model.layers.0.mlp.experts.w13_weight": w13_param,
+            "model.layers.0.mlp.experts.w13_weight_scale": w13_scale_param,
+        }
+
+        with patch.object(muse_mod, "get_parallel", return_value=fake_parallel):
+            scale_name = muse_mod.MuseSparkForConditionalGeneration._load_expert_stack(
+                SimpleNamespace(),
+                params,
+                w13_param,
+                w13_ckpt,
+                "model.layers.0.mlp.experts.w13_weight",
+            )
+
+        self.assertEqual(scale_name, "model.layers.0.mlp.experts.w13_weight_scale")
+        self.assertEqual(old_w_storage.nbytes(), 0)
+        self.assertEqual(old_s_storage.nbytes(), 0)
+
+        half = two_inter // 2
+        shard = half // 2
+        expected_slice = torch.cat(
+            (w13_ckpt[:, shard : 2 * shard], w13_ckpt[:, half + shard : 2 * half]),
+            dim=1,
+        )
+        ref_q, ref_s = [], []
+        for e in range(num_experts):
+            _, se = _scaled_fp8_quant_tpu_weight(expected_slice[e])
+            qe, _ = _scaled_fp8_quant_tpu_weight(expected_slice[e].float(), se)
+            ref_q.append(qe)
+            ref_s.append(se)
+        self.assertTrue(
+            torch.equal(
+                w13_param.view(torch.uint8), torch.stack(ref_q).view(torch.uint8)
+            )
+        )
+        self.assertTrue(torch.equal(w13_scale_param.data, torch.stack(ref_s)))
 
 
 if __name__ == "__main__":

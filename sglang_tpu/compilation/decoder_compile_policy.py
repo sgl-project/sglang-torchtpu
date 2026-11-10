@@ -50,6 +50,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang_tpu._logging import get_logger
+from sglang_tpu.compilation import aot_fast_runtime_wrapper
 from sglang_tpu.compilation.attention_rank_inputs import (
     get_attention_rank_tensors,
     use_attention_rank_tensors,
@@ -66,6 +67,8 @@ from sglang_tpu.compilation.compiled_forward_shim import (
     _pad_forward_batch_inputs,
     _restore_forward_batch_inputs,
     build_bucketers,
+    forward_pad_shape,
+    speculative_tokens_per_req,
 )
 from sglang_tpu.compilation.frame_stack import (
     call_with_reserved_frame_stack,
@@ -133,6 +136,21 @@ _COMPILE_BAR_FORMAT = (
 # XLA TopK has a static output width. Warm the physically qualified serving
 # width so the common candidate path does not compile on its first request.
 _DISTRIBUTED_TOP_K_WARMUP_K = 50
+
+
+def forward_bucketers(server_args: Any, *, context_len: int) -> tuple[Any, Any]:
+    """The token and batch buckets a decoder forward is padded to. Computed
+    from the server arguments alone, so the KV budget can size what depends
+    on the largest bucket before the compile policy exists."""
+    # max_b is the reconciled compile-batch ceiling, already grown to cover
+    # scheduler concurrency in ServerArgs.__post_init__ via
+    # reconcile_tpu_batch_limits, so the grid covers every decode batch the
+    # scheduler can form.
+    return build_bucketers(
+        server_args,
+        max_t=max_extend_tokens(context_len=context_len),
+        max_b=get_exec().graph.torch_compile_max_bs,
+    )
 
 
 def max_extend_tokens(*, context_len: int) -> int:
@@ -564,6 +582,26 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         assert self.b_bucketer is not None
         return _extend_batch_cap(self.t_bucketer, self.b_bucketer, self.extend_bs)
 
+    def forward_rows(
+        self, forward_mode: ForwardMode, real_q: int, real_b: int, spec_info: Any
+    ) -> int:
+        """The token rows a forward of ``real_q`` tokens over ``real_b``
+        requests is padded to (prepare_forward_batch), for a stage that must
+        size its pipeline receive before the forward. Not for context-parallel
+        or DP-attention forwards, whose padding depends on other ranks."""
+        assert self.t_bucketer is not None
+        assert self.b_bucketer is not None
+        pad_t, _ = forward_pad_shape(
+            forward_mode,
+            real_q,
+            real_b,
+            speculative_tokens_per_req(forward_mode, spec_info),
+            self.t_bucketer,
+            self.b_bucketer,
+            self.extend_bs,
+        )
+        return pad_t
+
     def max_padded_tokens(self) -> int:
         """The most token rows a forward is padded to: the last token bucket,
         or the last batch bucket for a decode batch."""
@@ -690,15 +728,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
             compiled_logits.__signature__ = inspect.signature(logits_fn)
             self.owner.logits_processor.forward = compiled_logits
-        max_t = max_extend_tokens(
-            context_len=self.model_runner.model_config.context_len
+        t_bucketer, b_bucketer = forward_bucketers(
+            server_args, context_len=self.model_runner.model_config.context_len
         )
-        # max_b is the reconciled compile-batch ceiling, already grown to cover
-        # scheduler concurrency in ServerArgs.__post_init__ via
-        # reconcile_tpu_batch_limits, so the grid covers every decode batch the
-        # scheduler can form.
-        max_b = get_exec().graph.torch_compile_max_bs
-        t_bucketer, b_bucketer = build_bucketers(server_args, max_t=max_t, max_b=max_b)
         self.t_bucketer = t_bucketer
         self.b_bucketer = b_bucketer
         if is_dp_attention_enabled():
@@ -788,6 +820,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             or server_args.unsafe_load_torch_compile_bundle is not None
         )
         compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile
+        aot_fast_runtime_wrapper.install_from_env()
         # The bundle Compiler installs its own guard filter for restorable guards.
         options = None if use_bundle else _guard_filter_options(server_args)
         return compiler(
@@ -838,10 +871,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             specialization_key=self._direct_compile_specialization_key,
             name=self.name,
             spmd_safe=self.spmd_safe,
+            # Subgroup rank inputs require the recipe's SPMD safety contract.
             lift_rank=(
                 torch.distributed.is_initialized()
-                and get_parallel().tp_group.world_size
-                == torch.distributed.get_world_size()
+                and (
+                    get_parallel().tp_group.world_size
+                    == torch.distributed.get_world_size()
+                    or get_exec().graph.use_spmd_compile
+                )
             ),
             model=model,
             model_extra_tensor_attrs=self.get_model_extra_tensor_attrs(),
@@ -949,8 +986,12 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         runner_model = self.model_runner.model
         # A wrapper may compile its language model with the logits processor
         # inside (Kimi); one that keeps the logits eager (Gemma4) does not.
+        # Bailing/Ling-3 VL mounts that inner model on `.model` instead.
+        inner_lm = getattr(runner_model, "language_model", None) or getattr(
+            runner_model, "model", None
+        )
         return self.owner is runner_model or (
-            self.owner is getattr(runner_model, "language_model", None)
+            self.owner is inner_lm
             and getattr(self.owner, "logits_processor", None) is not None
         )
 
@@ -978,7 +1019,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         # Serving trims the wave's max-bucket buffers to the batch's bucket
         # (_fit_pp_proxy_rows), so the program takes row views of them; warm
         # with the same views, or each bucket copies its view on first use.
-        rows = self.max_padded_tokens()
+        # The buffered hand-off receives each tensor at the bucket itself.
+        buffered = tpu_envs.SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF.get()
         transfer_dtype = getattr(
             self.model_runner.model,
             "pp_transfer_dtype",
@@ -986,12 +1028,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
 
         def zeros(shape: tuple[int, int], dtype: torch.dtype) -> torch.Tensor:
+            rows = shape[0] if buffered else self.max_padded_tokens()
             buffer = torch.zeros(
                 (rows, shape[1]),
                 dtype=dtype,
                 device=self.model_runner.device,
             )
-            return buffer[: shape[0]]
+            return buffer if buffered else buffer[: shape[0]]
 
         proxy = {
             "hidden_states": zeros((num_tokens, hidden_size), transfer_dtype),
@@ -2180,6 +2223,8 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             return super()._extend_serving_variants()
         # "text_ids" warms positional token-ID calls used by text-only serving,
         # in addition to the input_embeds calls used by multimodal serving.
+        if tpu_envs.SGLANG_TPU_VL_TEXT_ONLY_EXTEND.get():
+            return ("text_ids",)
         return (*self._extend_input_variants(), "text_ids")
 
     def _direct_compile_specialization_key(

@@ -72,13 +72,11 @@ class TestRanksPerNode(unittest.TestCase):
         self.assertEqual(ranks_per_node(4, 1, 2, 1), 8)
 
     def test_two_node_budget_is_not_split_twice(self):
-        # 128 GiB per node, TP8 over two hosts, 20 GiB slots: four local
-        # ranks each get 32 GiB and a slot fits; the job-wide rank count
-        # would have left 16 GiB and rejected it.
+        # 128 GiB per node, TP8 over two hosts, 10 GiB slots: four local
+        # ranks each get 32 GiB and three slots; the job-wide rank count
+        # would have left 16 GiB and one.
         per_rank = 128 * GB / ranks_per_node(8, 1, 1, 2)
-        self.assertEqual(slots_within_budget(per_rank, 20 * GB, 64), 1)
-        with self.assertRaises(ValueError):
-            slots_within_budget(128 * GB / (8 * 1), 20 * GB, 64)
+        self.assertEqual(slots_within_budget(per_rank, 10 * GB, 64), 3)
 
 
 class TestNodeWorkerRank(unittest.TestCase):
@@ -121,12 +119,13 @@ class TestSlotsWithinBudget(unittest.TestCase):
     def test_exact_fit_is_one_slot(self):
         self.assertEqual(slots_within_budget(8 * GB, 8 * GB, 64), 1)
 
-    def test_rejects_a_slot_larger_than_the_budget(self):
-        with self.assertRaises(ValueError) as ctx:
-            slots_within_budget(1 * GB, 8 * GB, 64)
-        self.assertIn("8.00 GiB", str(ctx.exception))
-        self.assertIn("1.00 GiB", str(ctx.exception))
-        self.assertIn("SGLANG_RAIDEN_HOST_POOL_GB", str(ctx.exception))
+    def test_slot_larger_than_the_budget_still_gets_one(self):
+        with self.assertLogs(
+            "sglang_tpu.disaggregation.raiden.host_pool", "WARNING"
+        ) as logs:
+            self.assertEqual(slots_within_budget(1 * GB, 8 * GB, 64), 1)
+        self.assertIn("8.00 GiB", logs.output[0])
+        self.assertIn("1.00 GiB", logs.output[0])
 
     def test_long_context_lowers_the_count_instead_of_overcommitting(self):
         # 8k context at page 128 is 64 blocks/slot; 256k context is 2048.

@@ -40,8 +40,9 @@ CONFIG["server_args"].update(
         "torch_compile_max_bs": CONCURRENCY,
         # CP batches bucket their local rows (1/8 of the tokens): 512 and 1024
         # hold the needles, 2048 a full chunk; 8192 covers non-CP batches.
+        # Without 1024/2048, CP batches pad to 8192 local rows and decode garbage.
         "tpu_compile_tokens": [512, 1024, 2048, PREFILL_TOKENS],
-        "tpu_compile_bs": [8, 16, CONCURRENCY],
+        "tpu_compile_bs": [CONCURRENCY],
         "mem_fraction_static": 0.6,
         # The needle probe resends shared prefixes.
         "disable_radix_cache": False,

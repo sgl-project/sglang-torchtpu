@@ -238,6 +238,7 @@ def test_parallel_group_construction_tp8_attn_cp2(custom_allreduce_enabled):
             mock_world = Mock()
             mock_world.device_group = Mock()
             mock_world.local_rank = 0
+            mock_world.world_size = world_size
             mock_world_group.return_value = mock_world
 
             # Call the actual function
@@ -340,6 +341,7 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
             mock_world = Mock()
             mock_world.device_group = Mock()
             mock_world.local_rank = 0
+            mock_world.world_size = world_size
             mock_world_group.return_value = mock_world
 
             # Call the actual function

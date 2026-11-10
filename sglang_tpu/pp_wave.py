@@ -306,6 +306,11 @@ class PPWave:
             )
         return self.unpack(self._launch(self._take_pending()))
 
+    def receive_batch(self, batch: Any) -> dict[str, torch.Tensor] | None:
+        """receive() for the scheduler, which hands every hand-off the batch;
+        the wave's buffer does not depend on it."""
+        return self.receive()
+
     def unpack(self, x: Payload) -> dict[str, torch.Tensor]:
         """The forward's inputs from one received buffer."""
         return {self.KEYS[0]: x, self.KEYS[1]: self.zero}

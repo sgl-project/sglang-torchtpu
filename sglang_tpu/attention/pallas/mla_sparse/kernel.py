@@ -717,6 +717,7 @@ def prepare_outputs(
         "small_chunk_gather_atoms",
         "live_gather_all_chunks",
         "topk_cap",
+        "gather_rope",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -749,6 +750,7 @@ def sparse_ragged_paged_attention(
     small_chunk_gather_atoms: int = 1,
     live_gather_all_chunks: bool = True,
     topk_cap: int | None = None,
+    gather_rope: bool = True,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -803,6 +805,9 @@ def sparse_ragged_paged_attention(
         a chunk with no such token gathers `topk_cap` slots per row only. Must
         be a multiple of 64 dividing `topk`. Pays off when rows hold far fewer
         than `topk` live entries (DCP).
+      gather_rope: TensorCore layout only (ignored otherwise). False skips the
+        rope cache in the gather and attends with zero rope keys; exact only
+        when the queries' rope lane is identically zero (a model without rope).
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -940,6 +945,7 @@ def sparse_ragged_paged_attention(
             live_gather_all_chunks=live_gather_all_chunks,
             topk_cap=topk_cap,
             topk_override=topk,
+            gather_rope=gather_rope,
         )
         if return_lse:
             q, lse = result
@@ -951,6 +957,16 @@ def sparse_ragged_paged_attention(
     if return_lse:
         return out, lse[:, :actual_num_q_heads, 0]
     return out
+
+
+def _spread(hashed: jax.Array, bound: int) -> jax.Array:
+    """Map arbitrary int32 values into [0, bound) to spread padding reads.
+
+    TPU has no integer divider, so ``%`` by a non-power-of-two constant lowers
+    to a multiply-shift sequence per element. Masking to the largest power of
+    two <= bound spreads the reads just as well.
+    """
+    return hashed & ((1 << (bound.bit_length() - 1)) - 1)
 
 
 def prepare_gather_indices(
@@ -991,14 +1007,14 @@ def prepare_gather_indices(
         )
 
         # Scatter "-1" padding across the cache to avoid read hot spots.
-        scattered_page_ids = (flat_element_index * 104729) % total_num_pages
-        scattered_token_offset = (flat_element_index * 15485863) % page_size
+        scattered_page_ids = _spread(flat_element_index * 104729, total_num_pages)
+        scattered_token_offset = _spread(flat_element_index * 15485863, page_size)
         page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
         token_offset = jnp.where(is_padding, scattered_token_offset, token_offset)
         physical_indices = page_ids * page_size + token_offset
     else:
         total_tokens = total_num_pages * page_size
-        scattered_physical = (flat_element_index * 15485863) % total_tokens
+        scattered_physical = _spread(flat_element_index * 15485863, total_tokens)
         physical_indices = jnp.where(is_padding, scattered_physical, topk_indices)
 
     physical_indices = physical_indices.astype(jnp.int32)
@@ -1036,6 +1052,7 @@ def sparse_attention_chunk(
     live_gather_all_chunks: bool = False,
     topk_cap: int | None = None,
     topk_override: int | None = None,
+    gather_rope: bool = True,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1319,6 +1336,7 @@ def sparse_attention_chunk(
             cache_kv_rope,
             indices.reshape(-1),
             num_valid_indices=num_valid_indices,
+            gather_rope=gather_rope,
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(
             chunk_size,

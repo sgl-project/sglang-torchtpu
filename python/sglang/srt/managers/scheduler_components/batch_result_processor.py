@@ -29,6 +29,9 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     mamba_lazy_spec_in_window,
 )
+from sglang.srt.managers.scheduler_components.mm_feature_releaser import (
+    MM_FEATURE_RELEASER,
+)
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     release_kv_cache,
@@ -265,6 +268,7 @@ class SchedulerBatchResultProcessor:
 
         if self.is_generation:
             if result.copy_done is not None:
+                MM_FEATURE_RELEASER.drain_before_wait(result.copy_done)
                 result.copy_done.synchronize()
             auxiliary_output_starts = self.snapshot_auxiliary_output_starts(
                 batch, result
@@ -925,6 +929,7 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
     ):
         if result.copy_done is not None:
+            MM_FEATURE_RELEASER.drain_before_wait(result.copy_done)
             result.copy_done.synchronize()
         auxiliary_output_starts = self.snapshot_auxiliary_output_starts(batch, result)
         auxiliary_output = result.auxiliary_host_output
@@ -1408,7 +1413,7 @@ class SchedulerBatchResultProcessor:
 
             # delete feature to save memory
             if req.multimodal_inputs is not None and req.session is None:
-                req.multimodal_inputs.release_features()
+                MM_FEATURE_RELEASER.release(req.multimodal_inputs)
             self._maybe_collect_routed_experts(req)
             self._maybe_collect_indexer_topk(req)
 

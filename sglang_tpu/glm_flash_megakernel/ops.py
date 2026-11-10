@@ -1,30 +1,77 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM-5.3-Flash decode megakernel in serving (experimental, opt-in).
 
-Runs single-request target steps (the MTP verify, or plain decode without MTP) as
-one Pallas call per device; every other step runs the model as usual. A request's
-caches are copied from serving's pools at its first kernel step and then live in the
-kernel. Before anything else reads serving's pools for that request, `flush` writes
-the kernel's rows and states back in serving's layout. With MTP the KDA states hold
-one checkpoint per draft token, and a verify resumes from the last accepted one.
-With the radix cache, `snapshot` writes the kernel's KDA state into a track slot at
-the steps serving would have snapshotted.
+Runs target steps (the MTP verify, or plain decode without MTP) of up to
+`max_rows` rows as one Pallas call per device; every other step runs the model.
+The kernel reads serving's KV pools and KDA state rows in place through the
+step's page table and writes the step's rows and checkpoints back into them, so
+serving's own verify commit and radix snapshots apply unchanged.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 import torch
 
+from sglang.srt.compilation.compiled_op import compiled_op, warmup_compiled_op
 from sglang_tpu.envs import envs as tpu_envs
 
 logger = logging.getLogger(__name__)
 
 _AXIS = "tp"
-# Rows per copy between the kernel's caches and serving's pools: one compiled shape.
-_CHUNK = 4096
+
+
+def _pad(t: torch.Tensor, n: int) -> torch.Tensor:
+    return torch.nn.functional.pad(t, (0, n - t.shape[0]))
+
+
+@compiled_op()
+def _step_inputs_op(
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    page_indices: torch.Tensor,
+    req_rows: torch.Tensor,
+    slot_map: torch.Tensor,
+    v2p: torch.Tensor | None,
+    read_offsets: torch.Tensor | None,
+    *,
+    q: int,
+    bucket: int,
+    pages_per_seq: int,
+    window_start: int,
+    checkpoint_width: int,
+):
+    """The kernel's int32 SMEM inputs for one call's n requests (inputs already
+    sliced to those rows), padded to `bucket` requests: one program instead of
+    ~15 eager launches per call. Shapes depend on n only."""
+    n = req_rows.shape[0]
+    rows = bucket * q
+    tok = _pad(input_ids.to(torch.int32), rows)
+    pos = _pad(positions.to(torch.int32).reshape(n, q)[:, 0], bucket)
+    tab = _pad(page_indices.to(torch.int32), bucket * pages_per_seq)
+    slots = slot_map[req_rows]
+    if v2p is not None:
+        slots = v2p[slots]
+    slots = slots.to(torch.int64)
+    if read_offsets is None:
+        # No checkpoint windows (no spec): the slot's own row is read and written.
+        srow, ckrow = slots, slots
+    else:
+        bases = window_start + req_rows.clamp(min=0) * checkpoint_width
+        offsets = read_offsets.index_select(0, slots)
+        srow = torch.where(offsets < 0, slots, bases + offsets)
+        steps = torch.arange(
+            checkpoint_width, dtype=req_rows.dtype, device=req_rows.device
+        )
+        ckrow = (bases.unsqueeze(1) + steps).reshape(-1)
+    return (
+        tok,
+        pos,
+        tab,
+        _pad(srow.to(torch.int32), bucket),
+        _pad(ckrow.to(torch.int32), rows),
+    )
 
 
 def _owned(t: torch.Tensor) -> torch.Tensor:
@@ -36,8 +83,37 @@ def enabled() -> bool:
     return tpu_envs.SGLANG_TPU_GLM_FLASH_MEGAKERNEL.get()
 
 
+def require_expert_tp(ep_size: int) -> None:
+    # The kernel streams each rank's TP slice of every expert; whole local experts
+    # under EP>1 do not match its DMA shapes (#2034).
+    if ep_size != 1:
+        raise ValueError(
+            f"GLM-Flash megakernel requires ep_size == 1 (experts sliced over TP); "
+            f"got ep_size={ep_size}. Set SGLANG_TPU_GLM_FLASH_MEGAKERNEL=0 or ep_size=1."
+        )
+
+
+def _buckets(max_req: int) -> list[int]:
+    """Request-count buckets 1, 2, 4, ... up to max_req."""
+    out, b = [], 1
+    while b < max_req:
+        out.append(b)
+        b *= 2
+    return out + [max_req]
+
+
 class GlmFlashMegakernel:
-    def __init__(self, model, model_path: str, max_len: int, n_query: int = 1):
+    def __init__(
+        self,
+        model,
+        model_path: str,
+        max_len: int,
+        n_query: int,
+        max_rows: int,
+        backend,
+        call_rows: int | None = None,
+        max_requests: int | None = None,
+    ):
         import jax
         from jax.sharding import NamedSharding
         from jax.sharding import PartitionSpec as P
@@ -45,6 +121,7 @@ class GlmFlashMegakernel:
         from torch_tpu._internal.pallas import pallas as pallas_impl
 
         from sglang.srt.runtime_context import get_parallel
+        from sglang_tpu.attention_pallas_rpa_base import _get_pages_per_seq
         from sglang_tpu.glm_flash_megakernel.build import build_weights, slab_maps
         from sglang_tpu.glm_flash_megakernel.config import Glm53FlashSpec
         from sglang_tpu.glm_flash_megakernel.kernel import decode as D
@@ -57,32 +134,96 @@ class GlmFlashMegakernel:
         par = get_parallel()
         tp, rank = par.tp_size, par.tp_rank
         device = model.model.norm.weight.device
-        max_len = -(-max_len // _CHUNK) * _CHUNK
-        self.spec, self.tp, self.max_len, self.Q = spec, tp, max_len, n_query
+        self.spec, self.tp, self.Q = spec, tp, n_query
         self.vocab = spec.vocab_size
+        self.device = device
         layout = KernelLayout(spec, tp)
         small_map, small_f32_map = slab_maps(spec)
         mesh = get_pallas_mesh((_AXIS,), (tp,))
-        # embed_2d: build_weights holds the 2-D table as a real tensor, since a torch
-        # view would be re-materialised per call.
-        self.cfg = D.KernelConfig(max_len=max_len, n_query=n_query, embed_2d=True)
-        with tpu_info_for_cpu_export():
-            run = R.make_decode(spec, layout, small_map, small_f32_map, mesh, self.cfg)
-        self.run = run
 
-        weights = build_weights(model, spec, layout, self.cfg, tp, rank)
+        full = backend.full_attn_backend
+        self._full, self._lin = full, backend.linear_attn_backend
+        self._pool = full.token_to_kv_pool
+        self._req_pool = self._lin.req_to_token_pool
+        self._mamba = self._req_pool.mamba_pool
+        page_size = self._pool.page_size
+        table_pages = _get_pages_per_seq(full.max_context_len, page_size)
+        max_len = min(max_len, table_pages * page_size)
+        max_len = -(-max_len // D.KernelConfig.attn_tile) * D.KernelConfig.attn_tile
+        self.max_len = max_len
+        self.pages_per_seq = table_pages
+        self.max_req = max(1, max_rows // n_query)
+        # Requests per kernel call; a larger batch is split into calls of this size.
+        call_rows = max_rows if call_rows is None else min(call_rows, max_rows)
+        self.call_req = max(1, call_rows // n_query)
+        # The scheduler never batches past its concurrency cap, so larger buckets
+        # would only be compiled (one Pallas kernel each), never run.
+        if max_requests is not None:
+            self.call_req = max(1, min(self.call_req, max_requests))
+        km_tile = 512 if self.max_req * n_query == 1 else 256
+
+        def cfg_for(b):
+            # Larger steps trade DMA ring depth for the VMEM their row-scaled buffers need.
+            big = b * n_query > 16
+            return D.KernelConfig(
+                max_len=max_len,
+                n_query=n_query,
+                n_req=b,
+                page_size=page_size,
+                table_pages=table_pages,
+                embed_2d=True,
+                km_tile=km_tile,
+                slots=3 if big else 4,
+                prefetch=1 if big else 2,
+                km_slots=3 if big else 4,
+                km_issue=1 if big else 2,
+                unroll_periods=big,
+                single_slab=big,
+            )
+
+        self.cfgs = {b: cfg_for(b) for b in _buckets(self.call_req)}
+        cfg0 = next(iter(self.cfgs.values()))
+        weights = build_weights(model, spec, layout, cfg0, tp, rank)
         # Packing leaves dtype and shape views, which every call would re-materialise.
         self.weights = [_owned(weights[n]) for n in R.PACKED_ORDER]
         self.experts = [w for n in R.EXPERT_LISTS for w in weights[n]]
         nbytes = sum(t.numel() * t.element_size() for t in self.weights)
         logger.info(
-            "GLM-Flash megakernel: %.1f GiB of packed weights on rank %d (experts are sglang's)",
+            "GLM-Flash megakernel: %.1f GiB of packed weights on rank %d (experts are "
+            "sglang's); request buckets %s x %d rows",
             nbytes / 2**30,
             rank,
+            sorted(self.cfgs),
+            n_query,
         )
         del weights
 
-        def export(name, fn, in_specs, out_specs, donate=()):
+        self.pools = {
+            "nope": [self._pool.get_nope_cache(L) for L in spec.dsa_layers],
+            "raw": [self._pool.get_kpool_raw_cache(L) for L in spec.dsa_layers],
+            "records": [self._pool.get_index_key_cache(L) for L in spec.dsa_layers],
+            "temporal": [
+                self._req_pool.mamba2_layer_cache(L).temporal for L in spec.kda_layers
+            ],
+            "conv": [
+                self._req_pool.mamba2_layer_cache(L).conv[0] for L in spec.kda_layers
+            ],
+        }
+        self.pool_list = [p for n in R.POOL_ORDER for p in self.pools[n]]
+        k_scales = []
+        for L in spec.dsa_layers:
+            attn = getattr(model.model.layers[L].self_attn, "attn_mqa", None)
+            ks = getattr(attn, "k_scale_float", None)
+            k_scales.append(1.0 if ks is None else float(ks))
+        self.k_scales = torch.tensor(k_scales, dtype=torch.float32, device=device)
+
+        n_dsa, n_kda = len(spec.dsa_layers), len(spec.kda_layers)
+        nw, n_moe = len(R.PACKED_ORDER), len(self.experts) // len(R.EXPERT_LISTS)
+        n_pool = 3 * n_dsa + 2 * n_kda
+        # tok, pos, meta, tab, srow, ckrow, k_scales, init_streams
+        n_lead = 8
+
+        def export(name, fn, in_specs, out_specs, donate=(), aliases=None):
             out_sh = tuple(NamedSharding(mesh, s) for s in out_specs)
             jit_fn = jax.jit(
                 fn, donate_argnums=donate, keep_unused=True, out_shardings=out_sh
@@ -96,344 +237,197 @@ class GlmFlashMegakernel:
                 input_partition_specs=tuple(in_specs),
                 static_argnums=(),
                 donate_argnums=donate,
+                input_output_aliases=aliases or {},
             )
             call.sglang_output_shardings = out_sh
             return call
 
-        rep3 = P(None, None, None)
-        self.init_ip = export(
-            "jax_glm_flash_mk_init_ip",
-            lambda *a: (run.init_ip(*a),),
-            [rep3, rep3, run.wspec["smalls"]],
-            [rep3],
-        )
-        self.smalls = self.weights[R.PACKED_ORDER.index("smalls")]
-        self.pool_records = export(
-            "jax_glm_flash_mk_pool_records",
-            lambda *a: (run.pool_records(*a),),
-            [rep3, rep3, run.wspec["smalls"], P(None)],
-            [rep3],
-        )
+        self.calls, self.init_streams = {}, {}
+        for b, cfg in self.cfgs.items():
+            with tpu_info_for_cpu_export():
+                run = R.make_decode(spec, layout, small_map, small_f32_map, mesh, cfg)
+            pspec = [s for n in R.POOL_ORDER for s in run.pspec[n]]
 
-        n_dsa, n_kda = len(spec.dsa_layers) + 1, len(spec.kda_layers)
-        bf16, f32 = torch.bfloat16, torch.float32
-        ck = (n_query,) if n_query > 1 else ()
-        self.dsa_caches = [
-            torch.zeros((n_dsa, max_len, spec.kv_lora_rank), dtype=bf16, device=device),
-            torch.zeros(
-                (n_dsa, max_len, spec.index_head_dim), dtype=bf16, device=device
-            ),
-            torch.zeros(
-                (n_dsa, max_len, spec.index_head_dim), dtype=bf16, device=device
-            ),
-            torch.zeros(
-                (n_dsa, max_len // spec.index_kpool, spec.index_head_dim),
-                dtype=f32,
-                device=device,
-            ),
-        ]
-        self.kda_caches = [
-            torch.zeros(
-                (
-                    n_kda,
-                    *ck,
-                    spec.linear_num_heads // tp,
-                    spec.linear_head_dim,
-                    spec.linear_head_dim,
-                ),
-                dtype=f32,
-                device=device,
-            ),
-            torch.zeros(
-                (
-                    n_kda,
-                    *ck,
-                    spec.linear_conv_kernel_dim - 1,
-                    3 * spec.kda_qkv_dim // tp,
-                ),
-                dtype=f32,
-                device=device,
-            ),
-        ]
-        assert list(run.dsa_names) == ["kv", "idx_key", "idx_gate", "idx_pool"], (
-            run.dsa_names
-        )
-        assert list(run.kda_names) == ["recur", "conv"], run.kda_names
-        self.init_streams = torch.zeros(
-            (n_query * spec.hc_mult, spec.hidden_size), dtype=bf16, device=device
-        )
-        self.k_scales = []
-        for L in spec.dsa_layers:
-            attn = getattr(model.model.layers[L].self_attn, "attn_mqa", None)
-            ks = getattr(attn, "k_scale_float", None)
-            self.k_scales.append(1.0 if ks is None else float(ks))
+            def step(tok, pos, meta, tab, srow, ckrow, ks, init, *rest, run=run):
+                ws = dict(zip(R.PACKED_ORDER, rest[:nw]))
+                pools, i = {}, nw
+                for n in R.POOL_ORDER:
+                    cnt = len(run.pspec[n])
+                    pools[n] = list(rest[i : i + cnt])
+                    i += cnt
+                experts = rest[i:]
+                for j, n in enumerate(R.EXPERT_LISTS):
+                    ws[n] = list(experts[j * n_moe : (j + 1) * n_moe])
+                logits, hidden, new = run.shard(
+                    tok, pos, meta, tab, srow, ckrow, ks, init, ws, pools
+                )
+                return (logits, hidden) + tuple(p for n in R.POOL_ORDER for p in new[n])
 
-        nw, nd, nk = len(R.PACKED_ORDER), len(run.dsa_names), len(run.kda_names)
-        n_moe = len(self.experts) // len(R.EXPERT_LISTS)
-
-        Q = n_query
-
-        # In-launch bookkeeping: separate eager ops would each be a host-bound launch.
-        # The last verify ended at pos - 1, so its last accepted checkpoint is pos - prev - 1.
-        def step(tok, positions, prev, init, *rest):
-            ws = dict(zip(R.PACKED_ORDER, rest[:nw]))
-            dc = dict(zip(run.dsa_names, rest[nw : nw + nd]))
-            kc = dict(zip(run.kda_names, rest[nw + nd : nw + nd + nk]))
-            experts = rest[nw + nd + nk :]
-            for i, n in enumerate(R.EXPERT_LISTS):
-                ws[n] = list(experts[i * n_moe : (i + 1) * n_moe])
-            pos = positions.reshape(-1)[:1].astype(jax.numpy.int32)
-            pos_in = jax.numpy.concatenate([pos, pos - prev - 1]) if Q > 1 else pos
-            logits, _, hidden, out = run.shard(
-                tok.reshape(Q).astype(jax.numpy.int32), pos_in, init, ws, dc, kc
+            in_specs = (
+                [P()] * 7
+                + [P(None, None)]
+                + [run.wspec[n] for n in R.PACKED_ORDER]
+                + pspec
+                + [s for n in R.EXPERT_LISTS for s in run.wspec[n]]
             )
-            return (logits, hidden, pos) + tuple(out[n] for n in run.step_caches)
-
-        in_specs = (
-            [P(), P(), P(), P(None, None)]
-            + [run.wspec[n] for n in R.PACKED_ORDER]
-            + [run.dspec[n] for n in run.dsa_names]
-            + [run.kspec[n] for n in run.kda_names]
-            + [spec for n in R.EXPERT_LISTS for spec in run.wspec[n]]
-        )
-        cspec = {**run.dspec, **run.kspec}
-        self.call = export(
-            f"jax_glm_flash_mk_L{max_len}_q{n_query}",
-            step,
-            in_specs,
-            # Keep logits vocab-sharded: replicated here, their mesh sharding leaks into
-            # serving's compiled ops, which then fail to compile.
-            [P(None, _AXIS), P(None, None), P()] + [cspec[n] for n in run.step_caches],
-            donate=tuple(range(4 + nw, 4 + nw + nd)),
-        )
-        self.req, self.prev_pos, self.last_steps = None, None, None
+            pool0 = n_lead + nw
+            self.calls[b] = export(
+                f"jax_glm_flash_mk_L{max_len}_q{n_query}_b{b}",
+                step,
+                in_specs,
+                [P(None, None), P(None, None)] + pspec,
+                donate=tuple(range(pool0, pool0 + n_pool)),
+                aliases={pool0 + i: 2 + i for i in range(n_pool)},
+            )
+            self.init_streams[b] = torch.zeros(
+                (cfg.rows * spec.hc_mult, spec.hidden_size),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+        self._meta = {
+            b: torch.tensor([b] + [0] * 7, dtype=torch.int32, device=device)
+            for b in range(1, self.call_req + 1)
+        }
         # Set when the radix cache is on: only then does serving snapshot KDA state.
         self.radix_snapshots = False
-        self.slot: Optional[torch.Tensor] = None
-        self.req_rows: Optional[torch.Tensor] = None
+        self._warmup_step_inputs(device)
 
     def handles(self, forward_batch, input_ids) -> bool:
-        if forward_batch.batch_size != 1 or input_ids.shape[0] != self.Q:
+        bs = forward_batch.batch_size
+        if bs < 1 or bs > self.max_req or input_ids.shape[0] != bs * self.Q:
             return False
-        # A request longer than the kernel's caches continues on the model.
+        # A request longer than the kernel's page table continues on the model.
         seq_lens_cpu = forward_batch.seq_lens_cpu
-        if seq_lens_cpu is not None and int(seq_lens_cpu[0]) + self.Q > self.max_len:
+        if (
+            seq_lens_cpu is not None
+            and int(seq_lens_cpu[:bs].max()) + self.Q > self.max_len
+        ):
             return False
         mode = forward_batch.forward_mode
         if self.Q > 1:
             return mode.is_target_verify()
         return mode.is_decode() and forward_batch.spec_info is None
 
-    @property
-    def active(self) -> bool:
-        """A request's caches live in the kernel (serving's pools lag behind)."""
-        return self.req is not None
+    def _bucket(self, bs: int) -> int:
+        return min(b for b in self.cfgs if b >= bs)
 
-    def holds(self, req: int) -> bool:
-        return self.req is not None and self.req == req
+    def _calls(self, bs: int) -> list[tuple[int, int]]:
+        """(first request, count) of each kernel call covering `bs` requests."""
+        out, b0 = [], 0
+        while b0 < bs:
+            n = min(self.call_req, bs - b0)
+            out.append((b0, n))
+            b0 += n
+        return out
 
-    def invalidate(self):
-        self.req = None
-
-    def _bind_pools(self):
-        from sglang.srt.model_executor.forward_context import get_attn_backend
-
-        backend = get_attn_backend()
-        full = getattr(backend, "full_attn_backend", backend)
-        lin = getattr(backend, "linear_attn_backend", backend)
-        self._pool, self._lin = full.token_to_kv_pool, lin
-        self._req_pool = lin.req_to_token_pool
-
-    def _rows(self, a: int, device):
-        return a + torch.arange(_CHUNK, dtype=torch.int64, device=device)
-
-    def _locs(self, rows, valid):
-        table = self._req_pool.req_to_token[self.req].to(rows.device, torch.int64)
-        locs = table.index_select(0, rows.clamp(max=table.shape[0] - 1))
-        return torch.where(valid, locs, torch.zeros_like(locs))
-
-    def _load_request(self, forward_batch, req: int, pos: int):
-        spec = self.spec
-        if pos + self.Q > self.max_len:
-            raise ValueError(
-                f"position {pos} exceeds the megakernel's max_len {self.max_len}"
-            )
-        self._bind_pools()
-        pool, req_pool, lin = self._pool, self._req_pool, self._lin
-        self.req = req
-        device = self.dsa_caches[0].device
-        kv, ik, ig, _ = self.dsa_caches
-        idh, kvl = spec.index_head_dim, spec.kv_lora_rank
-        for a in range(0, pos, _CHUNK):
-            rows = self._rows(a, device)
-            locs = self._locs(rows, rows < pos)
-            for d, L in enumerate(spec.dsa_layers):
-                nope = pool.get_nope_cache(L).view(-1, kvl).index_select(0, locs)
-                vals = (
-                    nope.view(torch.float8_e4m3fn).to(torch.float32) * self.k_scales[d]
-                )
-                kv[d].index_copy_(0, rows, vals.to(torch.bfloat16))
-                raw = (
-                    pool.get_kpool_raw_cache(L).view(-1, 2 * idh).index_select(0, locs)
-                )
-                ik[d].index_copy_(0, rows, raw[:, :idh].contiguous())
-                ig[d].index_copy_(0, rows, raw[:, idh:].contiguous())
-        self.dsa_caches[3] = self.init_ip(ik, ig, self.smalls)[0]
-        self.slot = lin._slot_indices(forward_batch.req_pool_indices)[0][:1].to(device)
-        self.req_rows = forward_batch.req_pool_indices[:1].to(device)
-        row = req_pool.mamba_pool.committed_state_rows(self.slot, self.req_rows)
-        recur, conv = self.kda_caches
-        k1 = spec.linear_conv_kernel_dim - 1
-        for k, L in enumerate(spec.kda_layers):
-            c = req_pool.mamba2_layer_cache(L)
-            st = c.temporal.index_select(0, row)[0]
-            cv = c.conv[0].index_select(0, row)[0].reshape(k1, -1)
-            if self.Q > 1:
-                recur[k] = st.unsqueeze(0).expand(self.Q, *st.shape)
-                conv[k] = cv.unsqueeze(0).expand(self.Q, *cv.shape)
-            else:
-                recur[k] = st
-                conv[k] = cv
-        self.start, self.steps, self.last_steps = pos, 0, None
-
-    def record_commit(self, last_steps: torch.Tensor):
-        """The verify's last accepted step, in place of serving's checkpoint commit."""
-        self.last_steps = last_steps
-
-    def snapshot(self, track_slots: torch.Tensor, steps: Optional[torch.Tensor] = None):
-        """Copy the request's KDA state into its radix track slot, as serving's
-        snapshot after a decode step or (checkpoint ``steps``) after a verify.
-
-        Virtual track ids; a non-positive slot or a negative step writes the null
-        slot 0, so no host read decides whether to copy.
-        """
-        recur, conv = self.kda_caches
-        device = recur[0].device
-        dst = self._lin._translate_mamba_indices(track_slots[:1]).to(
-            device, torch.int64
+    def _step_input_tables(self):
+        """(slot map, virtual->physical slot table, checkpoint read offsets) and the
+        window constants the input program reads."""
+        mamba = self._mamba
+        return dict(
+            slot_map=self._req_pool.req_index_to_mamba_index_mapping,
+            v2p=self._req_pool.mamba_v2p_table,
+            read_offsets=mamba.checkpoint_read_offsets,
+            window_start=mamba.window_start or 0,
+            checkpoint_width=mamba.checkpoint_width,
         )
-        if steps is not None:
-            step = steps[:1].to(device, torch.int64)
-            dst = torch.where(step >= 0, dst, torch.zeros_like(dst))
-            step = step.clamp(min=0)
-        dst = torch.where(dst > 0, dst, torch.zeros_like(dst))
-        for k, L in enumerate(self.spec.kda_layers):
-            c = self._req_pool.mamba2_layer_cache(L)
-            st, cv = recur[k], conv[k]
-            if self.Q > 1:
-                st, cv = st.index_select(0, step), cv.index_select(0, step)
-            c.temporal.index_copy_(0, dst, st.reshape(1, *c.temporal.shape[1:]))
-            c.conv[0].index_copy_(0, dst, cv.reshape(1, *c.conv[0].shape[1:]))
 
-    def flush(self):
-        """Write the request's kernel-side rows and states into serving's pools."""
-        if self.req is None:
+    def _warmup_step_inputs(self, device) -> None:
+        """Compile the input program for every call size; the Dynamo tracer refuses
+        to recompile at serving time, and the inputs are sliced so only n matters."""
+        Q = self.Q
+        zeros = lambda *shape, dtype=torch.int64: torch.zeros(
+            shape, dtype=dtype, device=device
+        )
+        # Dynamo guards grad mode: trace as the verify path calls it (no_grad).
+        for n in range(1, self.call_req + 1):
+            with torch.no_grad():
+                warmup_compiled_op(
+                    _step_inputs_op,
+                    zeros(n * Q),
+                    zeros(n * Q),
+                    zeros(n * self.pages_per_seq, dtype=torch.int32),
+                    zeros(n),
+                    q=Q,
+                    bucket=self._bucket(n),
+                    pages_per_seq=self.pages_per_seq,
+                    **self._step_input_tables(),
+                )
+
+    def _step_inputs(
+        self, input_ids, positions, forward_batch, b0: int, n: int, bucket: int
+    ):
+        """The kernel's SMEM inputs for requests [b0, b0 + n), padded to `bucket` requests."""
+        Q, pps = self.Q, self.pages_per_seq
+        rows = bucket * Q
+        r0, r1 = b0 * Q, (b0 + n) * Q
+        # Views at offset 0 for the first call; later calls of a split batch clone.
+        tab = self._full.forward_metadata.page_indices[b0 * pps : (b0 + n) * pps]
+        with torch.no_grad():
+            tok, pos, tab, srow, ckrow = _step_inputs_op(
+                input_ids[r0:r1],
+                positions[r0:r1],
+                tab,
+                forward_batch.req_pool_indices[b0 : b0 + n],
+                q=Q,
+                bucket=bucket,
+                pages_per_seq=pps,
+                **self._step_input_tables(),
+            )
+        assert ckrow.shape[0] == rows, (ckrow.shape, rows)
+        return (
+            tok,
+            pos,
+            self._meta[n],
+            tab,
+            srow,
+            ckrow,
+            self.k_scales,
+            self.init_streams[bucket],
+        )
+
+    def _decode_snapshot(self, forward_batch):
+        """Radix snapshot after a decode step: the slot's committed row into its track
+        slot, as the GDN backend's decode op does. The mask is a host tensor on TPU."""
+        mask = forward_batch.mamba_track_mask
+        if mask is None or not bool(mask.any()):
             return
-        spec, Q = self.spec, self.Q
-        pool, req_pool = self._pool, self._req_pool
-        device = self.dsa_caches[0].device
-        last = self.prev_pos.to(torch.int64)
-        if Q == 1:
-            committed = last + 1
-        elif self.last_steps is not None:
-            committed = last + self.last_steps[:1].to(device, torch.int64) + 1
-        else:
-            committed = last
-        hi = min(self.start + self.steps * Q, self.max_len)
-        kv, ik, ig, _ = self.dsa_caches
-        idh, kvl, kp = spec.index_head_dim, spec.kv_lora_rank, spec.index_kpool
-        ps = pool.page_size
-        for a in range(self.start - self.start % _CHUNK, hi, _CHUNK):
-            rows = self._rows(a, device)
-            valid = (rows >= self.start) & (rows < committed) & (rows < self.max_len)
-            locs = self._locs(rows, valid)
-            idx = (locs // ps, locs % ps)
-            src = rows.clamp(max=self.max_len - 1)
-            for d, L in enumerate(spec.dsa_layers):
-                vals = kv[d].index_select(0, src).to(torch.float32) / self.k_scales[d]
-                nope = (
-                    vals.to(torch.float8_e4m3fn).view(torch.uint8).view(_CHUNK, -1, 128)
-                )
-                pool.get_nope_cache(L).index_put_(idx, nope)
-                raw = torch.cat(
-                    [ik[d].index_select(0, src), ig[d].index_select(0, src)], 1
-                )
-                pool.get_kpool_raw_cache(L).index_put_(idx, raw)
-        # Pools closed while the kernel held the request; pool p sits in the page
-        # of its first token p * kp, record (slot // kp).
-        p_lo, p_hi = self.start // kp, -(-hi // kp)
-        for a in range(p_lo - p_lo % _CHUNK, p_hi, _CHUNK):
-            pools = self._rows(a, device)
-            end = pools * kp + kp - 1
-            valid = (
-                (end >= self.start) & (end < committed) & (pools * kp < self.max_len)
-            )
-            locs = self._locs(pools * kp, valid)
-            record = (locs % ps) // kp
-            idx = (locs // ps, record // 4, record % 4)
-            src = pools.clamp(max=self.max_len // kp - 1).to(torch.int32)
-            records = self.pool_records(ik, ig, self.smalls, src)[0]
-            for d, L in enumerate(spec.dsa_layers):
-                pool.get_index_key_cache(L).index_put_(idx, records[d])
-        recur, conv = self.kda_caches
-        if Q > 1:
-            # The verify checkpoints of the request's window, as serving writes them.
-            rows = req_pool.mamba_pool.checkpoint_rows(self.req_rows).reshape(-1)
-        else:
-            rows = self.slot
-        for k, L in enumerate(spec.kda_layers):
-            c = req_pool.mamba2_layer_cache(L)
-            c.temporal.index_copy_(
-                0, rows, recur[k].reshape(rows.shape[0], *c.temporal.shape[1:])
-            )
-            c.conv[0].index_copy_(
-                0, rows, conv[k].reshape(rows.shape[0], *c.conv[0].shape[1:])
-            )
-        if Q > 1 and self.last_steps is not None:
-            req_pool.mamba_pool.select_checkpoints(self.slot, self.last_steps[:1])
-        self.req = None
+        from sglang_tpu.mamba_state_copy import compiled_state_copy, copy_bucket_size
+
+        slots, _ = self._lin._slot_indices(forward_batch.req_pool_indices)
+        dst = self._lin._translate_mamba_indices(forward_batch.mamba_track_indices)
+        dst = torch.where(mask.to(dst.device), dst, torch.zeros_like(dst)).to(
+            torch.int32
+        )
+        src = slots.to(torch.int32)
+        bucket = copy_bucket_size(src.shape[0])
+        count = torch.tensor([src.shape[0]], dtype=torch.int32, device=src.device)
+        compiled_state_copy()(
+            self._mamba._copy_states(),
+            self._pad(src, bucket),
+            self._pad(dst, bucket),
+            count,
+        )
 
     def forward(self, input_ids, positions, forward_batch):
-        from sglang.srt.distributed import tensor_model_parallel_all_gather
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
-        req = int(forward_batch.req_pool_indices_cpu[0])
-        if req != self.req:
-            self.flush()
-            pos = int(positions.reshape(-1)[0].item())
-            self._load_request(forward_batch, req, pos)
-            # The first verify resumes from checkpoint 0: prev = pos - 1.
-            self.prev_pos = torch.full(
-                (1,), pos - 1, dtype=torch.int32, device=positions.device
+        bs = forward_batch.batch_size
+        logits, hidden = [], []
+        # A batch beyond one call's rows runs as several calls (each streams the weights).
+        for b0, n in self._calls(bs):
+            bucket = self._bucket(n)
+            inputs = self._step_inputs(
+                input_ids, positions, forward_batch, b0, n, bucket
             )
-        if input_ids.dtype != torch.int32:
-            input_ids = input_ids.to(torch.int32)
-        if positions.dtype != torch.int32:
-            positions = positions.to(torch.int32)
-        out = self.call(
-            input_ids,
-            positions,
-            self.prev_pos,
-            self.init_streams,
-            *self.weights,
-            *self.dsa_caches,
-            *self.kda_caches,
-            *self.experts,
-        )
-        self.steps += 1
-        self.last_steps = None
-        logits, hidden, self.prev_pos, nd = out[0], out[1], out[2], len(self.dsa_caches)
-        caches = list(out[3:])
-        self.dsa_caches, self.kda_caches = caches[:nd], caches[nd:]
-        # A decode step on a radix track boundary snapshots the state it produced.
-        # On TPU the mask is a host tensor (TpuMambaPool keeps slot ids on CPU).
-        mask = forward_batch.mamba_track_mask
-        if (
-            self.radix_snapshots
-            and self.Q == 1
-            and mask is not None
-            and bool(mask.reshape(-1)[0])
-        ):
-            self.snapshot(forward_batch.mamba_track_indices)
-        logits = tensor_model_parallel_all_gather(logits, dim=-1)[:, : self.vocab]
+            out = self.calls[bucket](
+                *inputs, *self.weights, *self.pool_list, *self.experts
+            )
+            logits.append(out[0][: n * self.Q])
+            hidden.append(out[1][: n * self.Q])
+        logits = torch.cat(logits) if len(logits) > 1 else logits[0]
+        hidden = torch.cat(hidden) if len(hidden) > 1 else hidden[0]
+        logits = logits[:, : self.vocab]
+        if self.radix_snapshots and self.Q == 1:
+            self._decode_snapshot(forward_batch)
         return LogitsProcessorOutput(next_token_logits=logits, hidden_states=hidden)

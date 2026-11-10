@@ -41,7 +41,11 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.mem_cache import kv_cache_builder
-from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.hicache_auto_size import (
+    auto_size_hicache,
+    register_sizeable_pool,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -49,6 +53,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
@@ -62,6 +67,7 @@ from sglang_tpu.tpu_dma_hicache import (
     tpu_dma_hicache_backends,
 )
 from sglang_tpu.tpu_dma_hybrid_cache_controller import TpuDMAHybridCacheController
+from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +93,11 @@ _load_device_pages: weakref.WeakKeyDictionary[Any, dict[int, torch.Tensor]] = (
 def uses_full_only_host_cache(tree_cache: Any) -> bool:
     """Whether ``tree_cache`` is a decode cache that keeps only full KV in RAM."""
     return tree_cache in _full_only_host_caches
+
+
+def is_building_full_only_host_cache() -> bool:
+    """Whether the current thread/process is building a full-only PD decode host stack."""
+    return _is_building_full_only_host_cache
 
 
 @contextlib.contextmanager
@@ -296,9 +307,14 @@ def _build_full_only_host_stack(
     transfer_layer_id_max = (
         max(full_layer_mapping.keys() | swa_layer_mapping.keys()) + 1
     )
+    full_device_pool = (
+        kvcache.kv_pool
+        if isinstance(kvcache, TpuUnifiedSWAKVPool)
+        else kvcache.full_kv_pool
+    )
     memory = get_memory()
     full_host_pool = hybrid_pool_assembler.build_kv_host_pool(
-        kv_pool=kvcache.full_kv_pool,
+        kv_pool=full_device_pool,
         page_size=params.page_size,
         use_mla=False,
         host_size=memory.hicache_size if memory.hicache_size > 0 else None,
@@ -309,7 +325,7 @@ def _build_full_only_host_stack(
             hybrid_pool_assembler.build_pool_entry(
                 name=PoolName.KV,
                 host_pool=full_host_pool,
-                device_pool=kvcache.full_kv_pool,
+                device_pool=full_device_pool,
                 layer_mapping=full_layer_mapping,
                 transfer_layer_id_max=transfer_layer_id_max,
                 is_anchor=True,
@@ -355,15 +371,9 @@ class _FullOnlySwaStrategy(hybrid_pool_assembler.StackStrategy):
     """
 
     def matches(self, kvcache: Any, components: set[ComponentType]) -> bool:
-        # Same pool check as upstream's SWA strategy.
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            DeepSeekV4TokenToKVPool,
-        )
-        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-
         return (
             _is_building_full_only_host_cache
-            and isinstance(kvcache, SWAKVPool)
+            and isinstance(kvcache, (SWAKVPool, TpuUnifiedSWAKVPool))
             and not isinstance(kvcache, DeepSeekV4TokenToKVPool)
             and components == {ComponentType.FULL, ComponentType.SWA}
         )
@@ -713,4 +723,5 @@ def install() -> None:
     for owner, name, impl in _patch_targets():
         _wrap(owner, name, impl)
     # Builds a RAM pool for full-attention KV only, with no SWA pool.
+    register_sizeable_pool(TpuUnifiedSWAKVPool)
     hybrid_pool_assembler.register_stack_strategy(_FULL_ONLY_SWA_STRATEGY)

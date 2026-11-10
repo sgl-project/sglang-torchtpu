@@ -14,6 +14,7 @@ import torch
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+from sglang_tpu.models.dflash_mla import DFlashMLAAttention
 
 
 def dflash_write_draft_kv(
@@ -61,11 +62,18 @@ def dflash_write_draft_kv(
         commit_lens=commit_lens,
         max_num_reqs=max_num_reqs,
     )
-    cos, sin = _rope_tables(
-        draft_model=draft_model, positions=ctx_positions, dtype=ctx_hidden.dtype
-    )
-
     attn0 = draft_model.layers[0].self_attn
+    # MLA drafts rope only their k_pe slice, which the fused kernel's neox
+    # rotation over the whole head cannot express: rotate in the projection
+    # and hand the kernel an identity rotation (cos 1, sin 0 is exact).
+    prerotated = isinstance(attn0, DFlashMLAAttention)
+    if prerotated:
+        cos = ctx_hidden.new_ones((int(ctx_hidden.shape[0]), attn0.head_dim // 2))
+        sin = torch.zeros_like(cos)
+    else:
+        cos, sin = _rope_tables(
+            draft_model=draft_model, positions=ctx_positions, dtype=ctx_hidden.dtype
+        )
     k = ctx_hidden.new_empty(
         (
             len(draft_model.layers),
@@ -78,6 +86,16 @@ def dflash_write_draft_kv(
     for layer_idx, layer in enumerate(draft_model.layers):
         attn = layer.self_attn
         layer_ctx_hidden = draft_model.prepare_context_hidden_for_kv(layer, ctx_hidden)
+        if prerotated:
+            layer_k, layer_v = attn.project_context_kv_rotated(
+                ctx_positions, layer_ctx_hidden
+            )
+            k[layer_idx] = layer_k
+            # V shares K's slot width in the fused pool.
+            v[layer_idx] = torch.nn.functional.pad(
+                layer_v, (0, attn.head_dim - attn.v_head_dim)
+            )
+            continue
         layer_k, layer_v = attn.kv_proj_only(layer_ctx_hidden)
         k[layer_idx] = attn.apply_k_norm(layer_k).view_as(k[layer_idx])
         v[layer_idx] = layer_v.view_as(v[layer_idx])

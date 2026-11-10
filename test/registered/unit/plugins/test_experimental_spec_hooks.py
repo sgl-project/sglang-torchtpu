@@ -14,7 +14,7 @@ import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.plugins.hook_registry import HookRegistry, _propagate_patch
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -48,6 +48,10 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 class _LogprobBlockSpecWorker(TpuBlockSpecWorker):
     supports_logprobs = True
+
+
+class _GrammarBlockSpecWorker(TpuBlockSpecWorker):
+    supports_grammar = True
 
 
 def _pad(bs):
@@ -155,6 +159,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         addressing = SimpleNamespace(
             verify_cache_candidates=object(), committed_lens=object()
         )
+        grammar_barrier = MagicMock()
         calls = MagicMock()
         calls.select.return_value = rows
         calls.draft.return_value = drafts
@@ -167,7 +172,9 @@ class TestExperimentalSpecHooks(CustomTestCase):
             patch.object(worker, "_commit_linear_attn_states", calls.linear),
             patch.object(worker, "commit", calls.commit),
         ):
-            result = worker.step(batch, bucket, addressing)
+            result = worker.step(
+                batch, bucket, addressing, grammar_barrier=grammar_barrier
+            )
         self.assertEqual(result, (committed, logits, accept))
         self.assertEqual(
             [entry[0] for entry in calls.mock_calls],
@@ -180,13 +187,45 @@ class TestExperimentalSpecHooks(CustomTestCase):
             8,
         )
         calls.draft.assert_called_once_with(batch, bucket, rows, addressing)
-        calls.verify.assert_called_once_with(batch, bucket, rows, drafts, addressing)
+        calls.verify.assert_called_once_with(
+            batch, bucket, rows, drafts, addressing, grammar_barrier=grammar_barrier
+        )
         calls.linear.assert_called_once_with(
-            batch=batch, accept=accept, pre_verify_lens=bucket.state.seq_lens
+            batch=batch,
+            accept=accept,
+            pre_verify_lens=bucket.state.seq_lens,
+            verify_input=addressing,
         )
         calls.commit.assert_called_once_with(
             batch, bucket.state, rows, addressing, logits, accept
         )
+
+    def test_grammar_barrier_precedes_mixed_prefill_sampling(self):
+        worker = object.__new__(_GrammarBlockSpecWorker)
+        events = []
+        batch = SimpleNamespace(
+            has_grammar=True,
+            return_logprob=False,
+            sampling_info=None,
+            forward_mode=ForwardMode.MIXED,
+            is_extend_in_batch=True,
+            reqs=[object()],
+        )
+        draft_input = _state([1])
+        draft_input.kv_fence_tail = torch.zeros(1)
+        result = SimpleNamespace(next_draft_input=draft_input)
+
+        def extend(*args, **kwargs):
+            self.assertEqual(events, ["grammar"])
+            events.append("sample")
+            return result
+
+        with patch.object(worker, "extend", side_effect=extend):
+            actual = worker.forward_batch_generation(
+                batch, grammar_barrier=lambda: events.append("grammar")
+            )
+        self.assertIs(actual, result)
+        self.assertEqual(events, ["grammar", "sample"])
 
     def test_verify_passes_current_draft_metadata_to_target(self):
         worker = object.__new__(TpuBlockSpecWorker)
@@ -819,14 +858,16 @@ class TestExperimentalSpecHooks(CustomTestCase):
                         with self.assertRaisesRegex(ValueError, "overlap"):
                             initialize_host_batch(SimpleNamespace(enable_overlap=False))
 
-    def test_kimi_spec_defaults_yield_only_to_experimental_dspark(self):
+    def test_kimi_spec_defaults_yield_only_to_experimental_block_spec(self):
         def original(server_args):
             raise ValueError("core refused")
 
         for algo, experimental, passes in (
             ("DSPARK", True, True),
             ("DSPARK", False, False),
-            ("DFLASH", True, False),
+            ("DFLASH", True, True),
+            ("DFLASH", False, False),
+            ("EAGLE", True, False),
         ):
             args = SimpleNamespace(speculative_algorithm=algo)
             with (
@@ -1649,6 +1690,21 @@ class TestExperimentalSpecHooks(CustomTestCase):
             self.assertTrue(draft.tpu_host_seq_lens_is_committed)
             self.assertEqual(draft.tpu_verify_cache_candidates.shape, (2, 6))
             worker_factory.assert_called_with(server_args)
+
+            batch.return_logprob = False
+            batch.has_grammar = True
+            with self.assertRaisesRegex(NotImplementedError, "grammar"):
+                worker._check_supported(batch=batch, pp_proxy_tensors=None)
+            draft.prepare_for_decode(batch)
+            self.assertIsNone(draft.tpu_verify_cache_candidates)
+            worker_factory.return_value = _GrammarBlockSpecWorker
+            worker = object.__new__(_GrammarBlockSpecWorker)
+            worker._bsearch_filtering = True
+            worker._check_supported(batch=batch, pp_proxy_tensors=None)
+            draft.prepare_for_decode(batch)
+            plan = TpuSpecVerifyInput.from_batch(batch, num_verify_rows=2, padded_bs=4)
+            self.assertEqual(plan.host_len_slack, num_draft_tokens)
+            self.assertEqual(plan.verify_cache_candidates.shape, (4, 6))
 
             batch.req_to_token_pool.host_resident = False
             with self.assertRaisesRegex(RuntimeError, "host-resident"):

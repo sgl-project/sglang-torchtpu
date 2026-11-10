@@ -504,6 +504,47 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
                 params.tree_components = components
                 self.assertEqual(select_tree_core_backend(params), expected)
 
+    def test_final_window_demotion_and_cap_use_python_for_swa_caches(self):
+        # Both walk Python tree nodes and LRUs, like the stale-window demotion.
+        # With no SWA option set, an SWA cache keeps the Rust TreeCore.
+        flags = (
+            envs.SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS,
+            envs.SGLANG_OPT_SWA_CAP,
+        )
+        for flag in (envs.SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST, *flags):
+            flag.clear()
+        swa = (ComponentType.FULL, ComponentType.SWA)
+        params = _cache_init_params()
+        params.tree_components = swa
+        self.assertIsNone(tree_core_registry._rust_fallback_reason(params))
+        self.assertEqual(select_tree_core_backend(params), "rust")
+        for flag in flags:
+            for components, enabled, expected in (
+                (swa, True, "python"),
+                (swa, False, "rust"),
+                ((ComponentType.FULL,), True, "rust"),
+            ):
+                with (
+                    self.subTest(
+                        flag=flag.name, components=components, enabled=enabled
+                    ),
+                    flag.override(enabled),
+                ):
+                    params = _cache_init_params()
+                    params.tree_components = components
+                    self.assertEqual(
+                        tree_core_registry._rust_fallback_reason(params),
+                        (
+                            f"{flag.name} requires the Python TreeCore"
+                            if expected == "python"
+                            else None
+                        ),
+                    )
+                    self.assertEqual(select_tree_core_backend(params), expected)
+                    self.assertEqual(
+                        resolve_tree_core_backend("rust", params), expected
+                    )
+
     def test_unsupported_platform_and_torch_use_python(self):
         for platform in ("darwin", "win32"):
             with (

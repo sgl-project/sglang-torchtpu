@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import collections
+import hashlib
 import logging
+import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -22,9 +28,10 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.multimodal.transport.cuda_ipc import BORROW_CUDA_IPC_FEATURE_KEY
-from sglang.srt.runtime_context import get_schedule
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.utils.async_probe import maybe_assert_sum
 from sglang_tpu.mm_embedding import (
+    EmbeddingSpan,
     MultimodalEmbedding,
     PaddedEmbedding,
     TpuEmbeddingResult,
@@ -57,6 +64,425 @@ def _move_items_to_device(
     if getattr(owner, "keeps_mm_features_on_host", False):
         return
     _default_move_items_to_device(items, device, data_embedding_func)
+
+
+# Host-RAM tier under the device VLM embedding cache (env-gated; default off = unchanged behaviour).
+#   SGLANG_VLM_HOST_TIER_MB=<MiB>     private host copy (per scheduler process = per replica) of every per-image /
+#                                     per-clip embedding encoded here; LRU by bytes.
+#   SGLANG_VLM_HOST_TIER_VERIFY=1     on a host hit also encode the item fresh, compare sha256 of the host copy with the
+#                                     fresh encode (valid rows and whole padded buffers), then serve the host copy.
+#   SGLANG_VLM_HOST_TIER_STATS_S=<s>  period of the "[vlm-host-tier]" stats line (default 60). Setting only this
+#                                     variable counts device-tier hits/misses/encodes without a host tier.
+#   SGLANG_VLM_HOST_TIER_PIN_PENDING=1  STRADDLE-PIN: while an encode's write-back is in flight, a lookup that misses
+#                                     both tiers is served that encode's own device embedding (the object the
+#                                     write-back job already holds) instead of encoding the item again ("pin_hit").
+#                                     The reference is dropped when the write-back job ends (landed, too big or
+#                                     failed), so it holds no memory the job does not already hold.
+# Write-back: after an encode is inserted into the device cache, one worker thread copies the item's buffers to the
+# host (non_blocking D2H on the worker's own TPU stream + event sync, as sglang_tpu.result_copy_worker does), so the
+# scheduler thread only enqueues. A queued write-back keeps its device buffers alive, so while write-backs are queued
+# a new one is taken only if the queued total stays within the device cache's own budget (SGLANG_VLM_CACHE_SIZE_MB; a
+# buffer shared by several write-backs counts once). An empty queue always takes one, so the queue holds at most
+# max(budget, one write-back's buffers). Past it a write-back is skipped ("wb_skip_backlog") and the item stays
+# device-only, as without a tier.
+# Lookup: on a device miss, a host hit is uploaded (non_blocking H2D) and re-inserted into the device cache where a
+# device hit would have been used. The host source of an upload is kept only until an event recorded after the upload
+# completes; an entry the LRU evicts before then still counts against SGLANG_VLM_HOST_TIER_MB until it completes. A
+# write-back that cannot fit beside the bytes of running uploads is dropped ("wb_no_room") without evicting anything.
+# Bytes are copied, never recomputed: a served host entry is bit-identical to the encode that produced it.
+# Engines: the tier is built only when one scheduler process is the whole engine (tp_size == 1 and pp_size == 1);
+# see _single_process_engine.
+class _HostEntry:
+    __slots__ = ("buffers", "spans", "nbytes", "uploads")
+
+    def __init__(self, buffers, spans, nbytes):
+        self.buffers = buffers  # host tensors
+        self.spans = spans  # PaddedEmbedding: tuple of (buffer index, start, length); plain tensor: None
+        self.nbytes = nbytes
+        # Uploads that may still read the buffers (see _VlmHostTier._release_uploads).
+        self.uploads = 0
+
+
+def _device_buffers(emb: MultimodalEmbedding) -> Dict[int, torch.Tensor]:
+    """The tensors whose storage an embedding keeps alive, by identity.
+
+    A view counts as its base, so the split rows of one encoder output share one
+    buffer, as the spans of one padded output do.
+    """
+    if isinstance(emb, PaddedEmbedding):
+        tensors = [span.buffer for span in emb.spans]
+    else:
+        tensors = [emb]
+    bases = [t if t._base is None else t._base for t in tensors]
+    return {id(b): b for b in bases}
+
+
+def _sha256_rows(t: torch.Tensor) -> str:
+    t = t.contiguous()
+    return hashlib.sha256(t.view(torch.uint8).numpy().tobytes()).hexdigest()
+
+
+class _VlmHostTier:
+    def __init__(
+        self,
+        cap_bytes: int,
+        verify: bool,
+        stats_s: float,
+        pin_pending: Optional[bool] = None,
+        pending_cap_bytes: Optional[int] = None,
+    ):
+        self.cap = cap_bytes
+        self.verify = verify and cap_bytes > 0
+        if pin_pending is None:
+            pin_pending = os.environ.get("SGLANG_VLM_HOST_TIER_PIN_PENDING", "0") == "1"
+        self.pin_pending = pin_pending and cap_bytes > 0
+        # STRADDLE-PIN: key -> the embedding its pending write-back job is copying.
+        self._pending_emb = {}
+        self.stats_s = stats_s
+        self.c = collections.Counter()
+        # Device-cache insert bytes histogram (MiB, rounded).
+        self.sizes = collections.Counter()
+        self._t_last = time.monotonic()
+        self._lock = threading.Lock()
+        self._lru: collections.OrderedDict = collections.OrderedDict()
+        self._size = 0
+        self._pending = set()
+        # Device bytes that queued write-backs keep alive, at most _pending_cap
+        # (None: the device cache budget). id(buffer) -> [buffer, nbytes, holders].
+        self._pending_cap = pending_cap_bytes
+        self._pending_bytes = 0
+        self._pending_bufs: Dict[int, list] = {}
+        # Host hits whose upload may still read the host buffers, oldest first:
+        # (event recorded after the upload, key, entry).
+        self._uploads: collections.deque = collections.deque()
+        # Host bytes an upload may still read: LRU entries with uploads > 0
+        # (_busy_bytes) and entries the LRU evicted meanwhile (_orphan_bytes).
+        self._busy_bytes = 0
+        self._orphan_bytes = 0
+        self._pool = None
+        if cap_bytes > 0:
+            self._dm = torch.get_device_module("tpu")
+            self._dev_idx = torch.accelerator.current_device_index()
+            self._stream = self._dm.Stream(device=self._dev_idx)
+            self._pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="vlm-host-tier"
+            )
+        logger.info(
+            "[vlm-host-tier] enabled=%s cap_mib=%d verify=%s stats_s=%s pin_pending=%s",
+            cap_bytes > 0,
+            cap_bytes >> 20,
+            self.verify,
+            stats_s,
+            self.pin_pending,
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self._pool is not None
+
+    def note_device_insert(self, nbytes: int) -> None:
+        self.sizes[round(nbytes / (1 << 20), 1)] += 1
+
+    # ---- write-back (scheduler thread enqueues; worker copies) ----
+    def write_back(self, key, emb: MultimodalEmbedding) -> None:
+        bufs = _device_buffers(emb)
+        with self._lock:
+            if key in self._lru or key in self._pending:
+                self.c["wb_skip_present"] += 1
+                return
+            new_bytes = sum(
+                b.untyped_storage().nbytes()
+                for i, b in bufs.items()
+                if i not in self._pending_bufs
+            )
+            budget = self._pending_cap
+            if budget is None:
+                budget = mm_schedule.embedding_cache.max_size
+            # An empty queue always takes the write-back, and buffers that are
+            # already queued cost nothing more, so an encoder output larger than
+            # the budget can still reach the host tier.
+            if (
+                self._pending_bytes
+                and new_bytes
+                and self._pending_bytes + new_bytes > budget
+            ):
+                # The copies are behind: the item stays device-only, as without a tier.
+                self.c["wb_skip_backlog"] += 1
+                return
+            for i, b in bufs.items():
+                held = self._pending_bufs.setdefault(
+                    i, [b, b.untyped_storage().nbytes(), 0]
+                )
+                held[2] += 1
+            self._pending_bytes += new_bytes
+            self._pending.add(key)
+            if self.pin_pending:
+                self._pending_emb[key] = emb
+            self.c["wb_submit"] += 1
+        self._pool.submit(self._write_back_job, key, emb, time.perf_counter_ns())
+
+    def _write_back_job(self, key, emb, t_sub: int) -> None:
+        try:
+            self._copy_to_host(key, emb, t_sub)
+        finally:
+            # After the job: the key is now in the LRU (preferred by lookup) or was
+            # dropped (too big / failed). The job no longer needs emb.
+            with self._lock:
+                self._pending_emb.pop(key, None)
+                for i in _device_buffers(emb):
+                    held = self._pending_bufs[i]
+                    held[2] -= 1
+                    if held[2] == 0:
+                        del self._pending_bufs[i]
+                        self._pending_bytes -= held[1]
+
+    def _copy_to_host(self, key, emb, t_sub: int) -> None:
+        try:
+            with (
+                torch.inference_mode(),
+                torch.accelerator.device_index(self._dev_idx),
+                self._dm.stream(self._stream),
+            ):
+                entry = self._to_host(emb)
+                event = self._dm.Event()
+                event.record()
+                event.synchronize()
+        except Exception:
+            # Never let the tier take the server down; the device tier is unaffected.
+            logger.exception("[vlm-host-tier] write-back failed")
+            with self._lock:
+                self._pending.discard(key)
+                self.c["wb_error"] += 1
+            return
+        with self._lock:
+            self._pending.discard(key)
+            if entry.nbytes > self.cap:
+                self.c["wb_too_big"] += 1
+                return
+            self._release_uploads()
+            if self._busy_bytes + self._orphan_bytes + entry.nbytes > self.cap:
+                # Running uploads hold the room: evicting the idle entries would
+                # not make enough, so keep them and drop this write-back.
+                self.c["wb_no_room"] += 1
+                return
+            while (
+                self._size + self._orphan_bytes + entry.nbytes > self.cap and self._lru
+            ):
+                _, old = self._lru.popitem(last=False)
+                self._size -= old.nbytes
+                if old.uploads:
+                    # An upload still reads it: its bytes stay held until the upload ends.
+                    self._busy_bytes -= old.nbytes
+                    self._orphan_bytes += old.nbytes
+                self.c["evict"] += 1
+            self._lru[key] = entry
+            self._size += entry.nbytes
+            self.c["wb_done"] += 1
+            self.c["wb_bytes"] += entry.nbytes
+            self.c["wb_lat_ns"] += time.perf_counter_ns() - t_sub
+
+    @staticmethod
+    def _to_host(emb: MultimodalEmbedding) -> _HostEntry:
+        if isinstance(emb, PaddedEmbedding):
+            buffers, index, spans = [], {}, []
+            for span in emb.spans:
+                k = id(span.buffer)
+                if k not in index:
+                    index[k] = len(buffers)
+                    buffers.append(span.buffer.to("cpu", non_blocking=True))
+                spans.append((index[k], span.start, span.length))
+            nbytes = sum(b.numel() * b.element_size() for b in buffers)
+            return _HostEntry(buffers, tuple(spans), nbytes)
+        t = emb.to("cpu", non_blocking=True)
+        return _HostEntry([t], None, t.numel() * t.element_size())
+
+    # ---- lookup on a device miss (scheduler thread) ----
+    def lookup(
+        self, key, device
+    ) -> Optional[Tuple[MultimodalEmbedding, Optional[_HostEntry]]]:
+        """(embedding, host entry) on a host hit; (embedding, None) when the embedding a
+        pending write-back is copying is served (STRADDLE-PIN)."""
+        pinned = None
+        with self._lock:
+            self._release_uploads()
+            entry = self._lru.get(key)
+            if entry is not None:
+                self._lru.move_to_end(key)
+                if not entry.uploads:
+                    self._busy_bytes += entry.nbytes
+                entry.uploads += 1
+            elif self.pin_pending:
+                pinned = self._pending_emb.get(key)
+        if pinned is not None:
+            self.c["pin_hit"] += 1
+            return pinned, None
+        if entry is None:
+            self.c["host_miss"] += 1
+            return None
+        t0 = time.perf_counter_ns()
+        dev_bufs = [b.to(device, non_blocking=True) for b in entry.buffers]
+        # Keep the host sources of the non_blocking uploads alive until they complete.
+        event = self._dm.Event()
+        event.record()
+        with self._lock:
+            self._uploads.append((event, key, entry))
+        if entry.spans is None:
+            emb = dev_bufs[0]
+        else:
+            emb = PaddedEmbedding(
+                tuple(
+                    EmbeddingSpan(dev_bufs[i], start, length)
+                    for i, start, length in entry.spans
+                )
+            )
+        self.c["host_hit"] += 1
+        self.c["h2d_bytes"] += entry.nbytes
+        self.c["h2d_enqueue_ns"] += time.perf_counter_ns() - t0
+        return emb, entry
+
+    def _release_uploads(self) -> None:
+        """Drop the host sources of finished uploads. Caller holds _lock.
+
+        Uploads are queued in issue order, so the scan stops at the first one
+        still running; the ones after it are released by a later call.
+        """
+        while self._uploads and self._uploads[0][0].query():
+            _, key, entry = self._uploads.popleft()
+            entry.uploads -= 1
+            if entry.uploads == 0:
+                if self._lru.get(key) is entry:
+                    self._busy_bytes -= entry.nbytes
+                else:
+                    self._orphan_bytes -= entry.nbytes
+
+    # ---- verification (SGLANG_VLM_HOST_TIER_VERIFY=1) ----
+    def verify_pin(
+        self, key, fresh: MultimodalEmbedding, pinned: MultimodalEmbedding
+    ) -> bool:
+        """A pinned embedding against a fresh encode of the same item (valid rows)."""
+
+        def rows(emb):
+            return emb.to_host() if isinstance(emb, PaddedEmbedding) else emb.to("cpu")
+
+        a, b = rows(pinned), rows(fresh)
+        ok = (
+            tuple(a.shape) == tuple(b.shape)
+            and a.dtype == b.dtype
+            and _sha256_rows(a) == _sha256_rows(b)
+        )
+        self.c["verify_pin_ok" if ok else "verify_pin_bad"] += 1
+        if not ok:
+            logger.warning("[vlm-host-tier] PIN VERIFY MISMATCH key=%s", key)
+        return ok
+
+    def verify_pair(self, key, fresh: MultimodalEmbedding, entry: _HostEntry) -> bool:
+        if entry.spans is None:
+            host_rows = entry.buffers[0]
+            fresh_rows = fresh.to("cpu")
+            full_ok = None
+        else:
+            host_rows = torch.cat(
+                [entry.buffers[i][s : s + n] for i, s, n in entry.spans]
+            )
+            fresh_rows = (
+                fresh.to_host()
+                if isinstance(fresh, PaddedEmbedding)
+                else fresh.to("cpu")
+            )
+            full_ok = None
+            if isinstance(fresh, PaddedEmbedding):
+                fbufs = list({id(sp.buffer): sp.buffer for sp in fresh.spans}.values())
+                if len(fbufs) == len(entry.buffers):
+                    full_ok = all(
+                        tuple(f.shape) == tuple(h.shape)
+                        and _sha256_rows(f.to("cpu")) == _sha256_rows(h)
+                        for f, h in zip(fbufs, entry.buffers)
+                    )
+        ok = (
+            tuple(host_rows.shape) == tuple(fresh_rows.shape)
+            and host_rows.dtype == fresh_rows.dtype
+            and _sha256_rows(host_rows) == _sha256_rows(fresh_rows)
+        )
+        self.c["verify_ok" if ok else "verify_bad"] += 1
+        if full_ok is not None:
+            self.c["verify_full_ok" if full_ok else "verify_full_diff"] += 1
+        if not ok:
+            logger.warning(
+                "[vlm-host-tier] VERIFY MISMATCH key=%s host=%s fresh=%s",
+                key,
+                tuple(host_rows.shape),
+                tuple(fresh_rows.shape),
+            )
+        return ok
+
+    def maybe_log(self) -> None:
+        now = time.monotonic()
+        if now - self._t_last < self.stats_s:
+            return
+        self._t_last = now
+        with self._lock:
+            c = dict(self.c)
+            host_entries, host_bytes, pending = (
+                len(self._lru),
+                self._size,
+                len(self._pending),
+            )
+        cache = mm_schedule.embedding_cache
+        logger.info(
+            "[vlm-host-tier] stats %s host_entries=%d host_mib=%.1f pending=%d dev_entries=%d dev_mib=%.1f insert_mib_hist=%s",
+            " ".join(f"{k}={v}" for k, v in sorted(c.items())),
+            host_entries,
+            host_bytes / (1 << 20),
+            pending,
+            len(cache) if cache is not None else -1,
+            (cache.current_size if cache is not None else 0) / (1 << 20),
+            dict(sorted(self.sizes.items())),
+        )
+
+
+_HOST_TIER: Optional[_VlmHostTier] = None
+_HOST_TIER_INIT = False
+
+
+def _single_process_engine() -> bool:
+    """Whether this scheduler process is the whole engine (tp_size == 1, pp_size == 1).
+
+    The tier is private to its process, and its hit/miss outcome depends on when
+    write-backs land. In a multi-process engine the processes that run one batch
+    could then pass different miss lists to the encoder, and an encoder with
+    collectives inside the encode (Muse Spark Omni's encoder-DP over
+    attn_tp_group, a weights-TP ViT) would hang or exchange the wrong rows. A
+    width that is not published counts as 1: no process groups exist then.
+    """
+    parallel = get_parallel()
+    for name in ("tp_size", "pp_size"):
+        try:
+            if getattr(parallel, name) != 1:
+                return False
+        except ValueError:  # "config namespace 'parallel' not published"
+            pass
+    return True
+
+
+def _host_tier() -> Optional[_VlmHostTier]:
+    global _HOST_TIER, _HOST_TIER_INIT
+    if not _HOST_TIER_INIT:
+        _HOST_TIER_INIT = True
+        cap_mib = int(os.environ.get("SGLANG_VLM_HOST_TIER_MB", "0") or 0)
+        stats = os.environ.get("SGLANG_VLM_HOST_TIER_STATS_S")
+        if (cap_mib > 0 or stats) and not _single_process_engine():
+            logger.warning(
+                "[vlm-host-tier] off: SGLANG_VLM_HOST_TIER_* is ignored because this "
+                "engine runs several processes; the tier needs tp_size=1 and pp_size=1"
+            )
+            cap_mib, stats = 0, None
+        if cap_mib > 0 or stats:
+            _HOST_TIER = _VlmHostTier(
+                cap_mib << 20,
+                os.environ.get("SGLANG_VLM_HOST_TIER_VERIFY", "0") == "1",
+                float(stats or 60),
+            )
+    return _HOST_TIER
 
 
 def _patch_budget() -> int:
@@ -256,6 +682,10 @@ def _batch_encode_per_image_misses(
 ) -> Dict[Tuple[Optional[int], int], MultimodalEmbedding]:
     unique_misses: Dict[Tuple[Optional[int], int], Tuple[MultimodalDataItem, int]] = {}
     hash_to_embedding: Dict[Tuple[Optional[int], int], MultimodalEmbedding] = {}
+    tier = _host_tier()
+    host_verify: Dict[
+        Tuple[Optional[int], int], Tuple[MultimodalEmbedding, Optional[_HostEntry]]
+    ] = {}
 
     # Phase 1a: find overlapping items per request and collect cache misses
     for req_info in per_image_requests:
@@ -276,6 +706,8 @@ def _batch_encode_per_image_misses(
             if cache_key in hash_to_embedding:
                 continue
             cached = mm_schedule.embedding_cache.get_single(item.hash)
+            if tier is not None:
+                tier.c["dev_hit" if cached is not None else "dev_miss"] += 1
             if cached is not None:
                 cached_embedding = cached.embedding
                 cached_token_count = _embedding_token_count(cached_embedding)
@@ -286,6 +718,23 @@ def _batch_encode_per_image_misses(
                         item.hash, expected_token_count, cached_token_count
                     )
                     unique_misses[cache_key] = (item, expected_token_count)
+            elif cache_key in unique_misses or cache_key in host_verify:
+                pass
+            elif (
+                tier is not None
+                and tier.enabled
+                and (hit := tier.lookup(cache_key, device)) is not None
+            ):
+                host_embedding, host_entry = hit
+                if tier.verify:
+                    # Encode it fresh as a miss as well; compared and replaced below.
+                    host_verify[cache_key] = hit
+                    unique_misses[cache_key] = (item, expected_token_count)
+                else:
+                    restored = TpuEmbeddingResult(embedding=host_embedding)
+                    tier.note_device_insert(restored.storage_size())
+                    mm_schedule.embedding_cache.set(item.hash, restored)
+                    hash_to_embedding[cache_key] = host_embedding
             elif cache_key not in unique_misses:
                 if (
                     start >= chunk_start
@@ -314,12 +763,30 @@ def _batch_encode_per_image_misses(
         else:
             split_embeddings = split_embedding(all_miss_embedding, token_counts)
         for cache_key, emb in zip(ordered_cache_keys, split_embeddings):
-            mm_schedule.embedding_cache.set(
-                cache_key[0], TpuEmbeddingResult(embedding=emb)
-            )
+            if cache_key in host_verify:
+                # Verification: serve the host copy, after comparing it with this fresh encode.
+                host_embedding, host_entry = host_verify[cache_key]
+                if host_entry is None:
+                    tier.verify_pin(cache_key, emb, host_embedding)
+                else:
+                    tier.verify_pair(cache_key, emb, host_entry)
+                restored = TpuEmbeddingResult(embedding=host_embedding)
+                tier.note_device_insert(restored.storage_size())
+                mm_schedule.embedding_cache.set(cache_key[0], restored)
+                hash_to_embedding[cache_key] = host_embedding
+                continue
+            inserted = TpuEmbeddingResult(embedding=emb)
+            mm_schedule.embedding_cache.set(cache_key[0], inserted)
             # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
             hash_to_embedding[cache_key] = emb
+            if tier is not None:
+                tier.c["encodes"] += 1
+                tier.note_device_insert(inserted.storage_size())
+                if tier.enabled:
+                    tier.write_back(cache_key, emb)
 
+    if tier is not None:
+        tier.maybe_log()
     return hash_to_embedding
 
 

@@ -375,6 +375,9 @@ class LogitsMetadata:
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
     sample_indices_cpu: Optional[List[int]] = None
     input_logprob_indices_cpu: Optional[List[int]] = None
+    # Optional pruned-row offsets where the input-logprob chunking also splits.
+    # Core never sets them (a platform hook may); None keeps the uniform split.
+    input_logprob_chunk_cuts_cpu: Optional[List[int]] = None
     token_ids_logprobs: Optional[List[List[int]]] = None
 
     # logits and logprobs post processing

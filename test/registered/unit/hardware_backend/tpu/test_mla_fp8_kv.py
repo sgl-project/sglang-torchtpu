@@ -254,6 +254,8 @@ class TestSparseForwardMlaCacheBuffers(CustomTestCase):
             kv_cache_quant_dtype=FP8,
             _op=op,
             _prefill_op=None,
+            # A model with rope: the op gets both caches.
+            _zero_rope=False,
             # _mla_kernel_args passes these through, so names stand in for them.
             forward_metadata=SimpleNamespace(
                 kv_lens="kv_lens",
@@ -337,6 +339,10 @@ class TestSparseIndexerKvLens(CustomTestCase):
         )
         backend._kv_lens = functools.partial(
             TpuPallasSparseMlaAttnBackend._kv_lens, backend
+        )
+        # No split group here, so the indexer runs unsplit.
+        backend._indexer_split_rows = functools.partial(
+            TpuPallasSparseMlaAttnBackend._indexer_split_rows, backend
         )
         return backend
 

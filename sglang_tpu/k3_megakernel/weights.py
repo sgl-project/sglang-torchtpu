@@ -181,6 +181,11 @@ def load_moe_layer(
     pre = f"layers.{layer}.block_sparse_moe."
     gate = ckpt.get(pre + "gate.weight")  # [E, H]
     bias = np.asarray(ckpt.get(pre + "gate.e_score_correction_bias"), np.float32)
+    perm = layout.expert_perm()
+    if (
+        perm is not None
+    ):  # kernel expert order (EP-local checkpoint blocks, see MoeLayout.ckpt_blocks)
+        gate, bias = np.asarray(gate)[perm], bias[perm]
     down = ckpt.get(pre + "routed_expert_down_proj.weight")  # [latent, H]
     up = ckpt.get(pre + "routed_expert_up_proj.weight")  # [H, latent]
     norm = np.asarray(ckpt.get(pre + "routed_expert_norm.weight"))
@@ -238,8 +243,9 @@ def load_moe_layer(
         for j, e in enumerate(layout.slot_experts(host)):
             if wanted is not None and e not in wanted:
                 continue
-            gu[j], gus[j] = _expert_gate_up(ckpt, epre, e, lane, li)
-            dn[j], dns[j] = _expert_down(ckpt, epre, e, lane, li)
+            ce = layout.ckpt_expert(e)
+            gu[j], gus[j] = _expert_gate_up(ckpt, epre, ce, lane, li)
+            dn[j], dns[j] = _expert_down(ckpt, epre, ce, lane, li)
         out["expert_gu"].append(gu)
         out["expert_gu_scale"].append(gus)
         out["expert_down"].append(dn)
@@ -347,18 +353,50 @@ def load_kda_layer(
 
 
 def load_mla_layer(
-    ckpt: Checkpoint, layer: int, topo, ranks, heads: int = 96, pair_oproj: bool = False
+    ckpt: Checkpoint,
+    layer: int,
+    topo,
+    ranks,
+    heads: int = 96,
+    pair_oproj: bool = False,
+    dsa: bool = False,
 ) -> dict:
     """MLA attention for ``ranks``; rank r owns heads ``[h*r, h*(r+1))``.
 
     w1    : [H, 2176 + h*128] bf16 = q_a (1536) | kv_c (512) | k_pe (64) | 0 (64) | g_proj (this rank)
     qb    : [1536, 2*h*128] = q_nope (h*128) | q_pe (per head: 64 rope columns then 64 zeros)
     wkc   : [h, 128, 512]; wvc: [h, 512, 128]; oproj: [h*128, H]; norms f32 [1, 1536] / [1, 512]
+
+    ``dsa`` (K3.1 DSA layer, the indexer's 5 tensors; see ``stages.mla.REPLICATED_DSA`` / ``DsaRefs``):
+    w1    : [H, 2432 + h*128] = q_a | kv_c | k_pe | 0 | idx wk (128) | idx weights_proj (32) | 0 (96) | g_proj
+    idx_qb: [1536, 512] = wq_b rows of index heads 4*lane .. 4*lane + 3 (lane = r % lanes), transposed
+    idx_knorm_w / idx_knorm_b: f32 [1, 128] (key LayerNorm)
     """
+    from sglang_tpu.k3_megakernel.kernel.stages.mla import (
+        IDX_DIM,
+        IDX_HEADS,
+        IDX_K,
+        IDX_W,
+        replicated_cols,
+    )
+
     pre = f"layers.{layer}.self_attn."
     g = lambda n: ckpt.get(pre + n)
     h = heads // topo.world
     hd = h * 128
+    rep = replicated_cols(dsa)
+    if dsa:
+        wk = np.asarray(g("indexer.wk.weight"))  # [128, H]
+        wproj = np.asarray(g("indexer.weights_proj.weight"))  # [32, H]
+        wqb = np.asarray(g("indexer.wq_b.weight"))  # [32 * 128, 1536]
+        assert wk.shape[0] == IDX_DIM and wproj.shape[0] == IDX_HEADS, (
+            wk.shape,
+            wproj.shape,
+        )
+        assert wqb.shape[0] == IDX_HEADS * IDX_DIM, wqb.shape
+        per_lane = IDX_HEADS // topo.lanes * IDX_DIM  # 4 heads x 128 at 8 lanes
+        knorm_w = np.asarray(g("indexer.k_norm.weight"), np.float32)[None]
+        knorm_b = np.asarray(g("indexer.k_norm.bias"), np.float32)[None]
     qa, kva = g("q_a_proj.weight"), g("kv_a_proj_with_mqa.weight")
     qb = np.asarray(g("q_b_proj.weight")).reshape(heads, 192, -1)
     kvb = np.asarray(g("kv_b_proj.weight")).reshape(heads, 256, -1)
@@ -374,13 +412,23 @@ def load_mla_layer(
             "mla_wvc",
             "mla_oproj",
         )
+        + (("mla_idx_qb", "mla_idx_knorm_w", "mla_idx_knorm_b") if dsa else ())
     }
     for r in ranks:
         hs = slice(r * h, (r + 1) * h)
-        w1 = np.zeros((hidden, 2176 + hd), ml_dtypes.bfloat16)
+        w1 = np.zeros((hidden, rep + hd), ml_dtypes.bfloat16)
         w1[:, :1536] = qa[:].T
         w1[:, 1536:2112] = kva[:].T
-        w1[:, 2176:] = g("g_proj.weight")[r * hd : (r + 1) * hd].T
+        w1[:, rep:] = g("g_proj.weight")[r * hd : (r + 1) * hd].T
+        if dsa:
+            w1[:, IDX_K : IDX_K + IDX_DIM] = wk.T
+            w1[:, IDX_W : IDX_W + IDX_HEADS] = wproj.T
+            lane = r % topo.lanes
+            out["mla_idx_qb"].append(
+                np.ascontiguousarray(wqb[lane * per_lane : (lane + 1) * per_lane].T)
+            )
+            out["mla_idx_knorm_w"].append(knorm_w)
+            out["mla_idx_knorm_b"].append(knorm_b)
         out["mla_w1"].append(w1)
         out["mla_qnorm"].append(np.asarray(g("q_a_layernorm.weight"), np.float32)[None])
         out["mla_kvnorm"].append(
@@ -408,9 +456,10 @@ def fill_experts(
     out: dict,
     index: int,
 ) -> None:
-    """Write routed experts ``experts`` (global ids) of ``layer`` into preallocated
+    """Write routed experts ``experts`` (global kernel ids) of ``layer`` into preallocated
     ``out[name][rank, index, expert_slot]`` arrays (zeros elsewhere); a replicated
-    expert goes to every host holding it (``MoeLayout.expert_slot``)."""
+    expert goes to every host holding it (``MoeLayout.expert_slot``). Kernel expert e is read
+    from checkpoint expert ``layout.ckpt_expert(e)``."""
     li = layout.lane_inter
     pre = f"layers.{layer}.block_sparse_moe.experts."
     for i, r in enumerate(ranks):
@@ -420,8 +469,9 @@ def fill_experts(
             j = layout.expert_slot(host, e)
             if j is None:
                 continue
-            gu, gus = _expert_gate_up(ckpt, pre, e, lane, li)
-            dn, dns = _expert_down(ckpt, pre, e, lane, li)
+            ce = layout.ckpt_expert(e)
+            gu, gus = _expert_gate_up(ckpt, pre, ce, lane, li)
+            dn, dns = _expert_down(ckpt, pre, ce, lane, li)
             dst = out["expert_gu"]
             dst[i, index, j] = gu.view(np.uint8) if dst.dtype == np.uint8 else gu
             out["expert_gu_scale"][i, index, j] = gus
@@ -445,7 +495,9 @@ def load_stack(
     from sglang_tpu.k3_megakernel.kernel.stages.dense_mlp import dense_channels
 
     d, topo = spec.dims, spec.topo
-    layout = MoeLayout(d, topo, replicas=spec.relax.expert_replicas)
+    layout = MoeLayout(
+        d, topo, replicas=spec.relax.expert_replicas, ckpt_blocks=spec.expert_blocks
+    )
     ranks = list(ranks)
     w = len(ranks)
     rep = lambda a: np.broadcast_to(a[None], (w,) + a.shape)
@@ -478,8 +530,10 @@ def load_stack(
         load_kda_layer(ckpt, i, topo, ranks, pair_oproj=pair) for i in spec.kda_layers
     ]
     out.update({k: np.stack([p[k] for p in per], axis=1) for k in per[0]})
+    dsa = bool(spec.dsa_layers)
     per = [
-        load_mla_layer(ckpt, i, topo, ranks, pair_oproj=pair) for i in spec.mla_layers
+        load_mla_layer(ckpt, i, topo, ranks, pair_oproj=pair, dsa=dsa)
+        for i in spec.mla_layers
     ]
     out.update({k: np.stack([p[k] for p in per], axis=1) for k in per[0]})
     dn = load_dense_mlp(ckpt, topo, dense_channels(d, topo), ranks)

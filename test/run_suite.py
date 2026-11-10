@@ -21,6 +21,7 @@ from sglang.test.ci.ci_register import (
     collect_tests,
 )
 from sglang.test.ci.ci_utils import derive_timeout_per_file, run_unittest_files
+from sglang.test.ci.execution_budget import run_with_execution_budget
 
 # Defensive fallback in case sglang is loaded from an external environment missing TPU
 if not hasattr(HWBackend, "TPU"):
@@ -237,7 +238,6 @@ NIGHTLY_SUITES = {
         "nightly-tpu-perf-gpt-oss-120b-c64",
         "nightly-tpu-perf-gpt-oss-120b-eagle3-c64",
         "nightly-tpu-perf-gpt-oss-120b-dflash-c64",
-        "nightly-tpu-perf-gpt-oss-20b",
         "nightly-tpu-perf-deepseek-r1-0528",
         "nightly-tpu-perf-deepseek-v3-1",
         "nightly-tpu-perf-kimi-k26",
@@ -246,7 +246,6 @@ NIGHTLY_SUITES = {
         "nightly-tpu-perf-qwen3-5-397b",
         "nightly-tpu-perf-glm-5-3-flash-mtp-mk",
         # One suite per quality eval so each gets an independent TPU slice.
-        "nightly-tpu-accuracy-gpt-oss-20b",
         "nightly-tpu-accuracy-gemma4-31b-aime",
         "nightly-tpu-accuracy-gemma4-31b-gpqa",
         "nightly-tpu-accuracy-gemma4-31b-mmmupro",
@@ -626,6 +625,12 @@ def main():
         ),
     )
     parser.add_argument(
+        "--execution-budget-minutes",
+        type=float,
+        default=0,
+        help="Fail after the whole suite finishes if its execution exceeds this budget. 0 disables the check.",
+    )
+    parser.add_argument(
         "--continue-on-error",
         action="store_true",
         default=False,
@@ -709,7 +714,9 @@ def main():
                 f"but got {args.auto_partition_id}"
             )
 
-    exit_code = run_a_suite(args)
+    exit_code = run_with_execution_budget(
+        lambda: run_a_suite(args), args.execution_budget_minutes
+    )
     sys.exit(exit_code)
 
 
