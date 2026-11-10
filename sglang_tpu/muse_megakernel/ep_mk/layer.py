@@ -151,7 +151,8 @@ class EPExperts:
                 _all_gather_rows(step, p)
 
     def pre_attn(self, c: MKConfig, S: dict) -> None:
-        """layer_moe's _gather_lhs left the next layer's input in S["lhs"]."""
+        with _phase("pre_attn"):
+            _pre_attn_lhs(c, S)
 
 
 _window = attn.window
@@ -738,10 +739,9 @@ def _gather_lhs(step: EPLayerStep, p: EPPlan, nsmr) -> None:
     if c.tp != 8:  # every peer directly
         for d in range(1, c.tp):
             send(own, me, (me + d) % c.tp)
-
-        def waited_early(k):
-            return k == me
-
+        for d in range(1, c.tp):
+            wait(rsems.at[(me + d) % c.tp], len(block(0)))
+        wait(sems.at[1], (c.tp - 1) * len(block(0)))
     else:
         # 4 chips x 2 cores: once to the same core of each other chip and to the partner
         # core, which relays the other chips' blocks on-chip (half the ICI bytes)
@@ -754,28 +754,16 @@ def _gather_lhs(step: EPLayerStep, p: EPPlan, nsmr) -> None:
                 k = 2 * jnp.bitwise_xor(chip, d) + core
                 wait(rsems.at[k], len(block(0)))
                 send(g, k, partner)
-
-        def waited_early(k):  # own block, and the other chips' same-core blocks
-            return k % 2 == core
-
+        with _phase("lhs_wait"):
+            wait(rsems.at[partner], len(block(0)))
+            for d in (1, 2, 3):
+                wait(rsems.at[2 * jnp.bitwise_xor(chip, d) + 1 - core], len(block(0)))
+            wait(sems.at[1], 7 * len(block(0)))
     wait(sems.at[2], len(block(0)))
-    # the rest arrives row tile by row tile, each unpacked into S["lhs"] (the next layer's
-    # input) as soon as its owners' blocks are in
-    with _phase("lhs_unpack"):
-        _unpack_lhs(
-            c,
-            S,
-            rc,
-            lambda k: pl.when(jnp.logical_not(waited_early(k)))(
-                lambda: wait(rsems.at[k], len(block(0)))
-            ),
-        )
-    wait(sems.at[1], (c.tp - 1) * len(block(0)))  # tp == 8: 4 sends and 3 relays
 
 
-def _unpack_lhs(c: MKConfig, S: dict, rc: int, arrived) -> None:
-    """S["lhs"] = every row of ep_lhs_g as bf16, row tile by row tile (double-buffered);
-    arrived(k) before the first tile holding owner k's rows."""
+def _pre_attn_lhs(c: MKConfig, S: dict) -> None:
+    """S["lhs"] = every row of ep_lhs_g as bf16, row tile by row tile (double-buffered)."""
     RT, R, Hh = c.row_tile, c.rows, c.hidden // 2
     g, sems = S["ep_lhs_g"], S["ep_lhs_sems"]
     st = S["ep_lhs_stage"] if c.tiled_vmem_pads else S["sin"].at[0].bitcast(jnp.uint32)
@@ -788,20 +776,9 @@ def _unpack_lhs(c: MKConfig, S: dict, rc: int, arrived) -> None:
             g.at[pl.ds(t * RT, RT)], stage(t % 2), sems.at[3 + t % 2]
         )
 
-    seen = 0  # owners waited for: [0, seen)
-
-    def ready(t):
-        nonlocal seen
-        last = min((t + 1) * RT, R) - 1
-        while seen <= last // rc:
-            arrived(seen)
-            seen += 1
-
-    ready(0)
     cp(0).start()
     for t in range(R // RT):
         if t + 1 < R // RT:
-            ready(t + 1)
             cp(t + 1).start()
         cp(t).wait()
         S["lhs"][pl.ds(t * RT, RT), :] = _unpack_bf16x2(stage(t % 2)[...]).astype(bf16)
