@@ -19,6 +19,8 @@ from typing import Callable
 
 import torch
 
+from sglang_tpu.kernels.router_topk import _ROWMAX_MAX_BLOCK_ROWS
+
 # Batch sizes the kernel serves; larger batches keep the sort.
 MAX_TOKENS = 64
 # Expert counts validated against biased_topk_impl on TPU: Kimi-K3 (top-16 of
@@ -30,6 +32,32 @@ _OP: list = []
 _OP_LOCK = Lock()
 # Plain bool: Dynamo traces the eligibility check.
 _OP_READY = False
+_ROWMAX_OP: list = []
+_ROWMAX_OP_READY = False
+
+
+def _build_rowmax_op() -> Callable:
+    import jax  # noqa: F401
+
+    from sglang_tpu.kernels.router_topk import rowmax_select_jax
+    from sglang_tpu.pallas_jax_op import cpu_export_jax_op
+
+    def _wrapped_rowmax(
+        scores: jax.Array,
+        topk: int,
+    ) -> tuple[jax.Array, jax.Array]:
+        return rowmax_select_jax(scores, topk)
+
+    def _fake_rowmax(scores, topk):
+        rows = scores.shape[0]
+        return (
+            scores.new_empty((rows, topk), dtype=torch.float32),
+            scores.new_empty((rows, topk), dtype=torch.int32),
+        )
+
+    op = cpu_export_jax_op("sglang_tpu_pallas::router_rowmax_topk", _wrapped_rowmax)
+    op.register_fake(_fake_rowmax)
+    return op
 
 
 def _build_op() -> Callable:
@@ -63,7 +91,7 @@ def _build_op() -> Callable:
 def register_router_topk_op() -> None:
     """Register the op when enabled; must run before torch.compile traces the
     model. Left unregistered, every call keeps the generic top-k."""
-    global _OP_READY
+    global _OP_READY, _ROWMAX_OP_READY
     from sglang_tpu.envs import envs as tpu_envs
 
     if not tpu_envs.SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL.get():
@@ -71,7 +99,10 @@ def register_router_topk_op() -> None:
     with _OP_LOCK:
         if not _OP:
             _OP.append(_build_op())
+        if not _ROWMAX_OP:
+            _ROWMAX_OP.append(_build_rowmax_op())
         _OP_READY = True
+        _ROWMAX_OP_READY = True
 
 
 def _eligible(gating_output, correction_bias, topk, num_fused_shared_experts) -> bool:
@@ -229,6 +260,32 @@ def biased_topk_around(
     )
 
 
+def _rowmax_eligible(values, topk) -> bool:
+    return (
+        _ROWMAX_OP_READY
+        and values.device.type != "cpu"
+        and values.dim() == 2
+        and values.dtype == torch.float32
+        and values.shape[0] >= 8
+        and values.shape[0] % 8 == 0
+        and (
+            values.shape[0] <= _ROWMAX_MAX_BLOCK_ROWS
+            or values.shape[0] % _ROWMAX_MAX_BLOCK_ROWS == 0
+        )
+        and values.shape[1] >= 128
+        and values.shape[1] % 128 == 0
+        and 0 < int(topk) <= 128
+        and int(topk) <= values.shape[1]
+    )
+
+
+def stable_topk_around(original, values, topk):
+    """AROUND hook for ``topk._stable_topk`` (unbiased softmax/sigmoid routing)."""
+    if not _rowmax_eligible(values, topk):
+        return original(values, topk)
+    return _ROWMAX_OP[0](values, int(topk))
+
+
 def biased_grouped_topk_around(
     original,
     hidden_states,
@@ -284,3 +341,29 @@ def biased_grouped_topk_around(
         routed_scaling_factor,
         apply_routed_scaling_factor_on_output,
     )
+
+
+def _rowmax_eligible(values, topk) -> bool:
+    return (
+        _ROWMAX_OP_READY
+        and values.device.type != "cpu"
+        and values.dim() == 2
+        and values.dtype == torch.float32
+        and values.shape[0] >= 8
+        and values.shape[0] % 8 == 0
+        and (
+            values.shape[0] <= _ROWMAX_MAX_BLOCK_ROWS
+            or values.shape[0] % _ROWMAX_MAX_BLOCK_ROWS == 0
+        )
+        and values.shape[1] >= 128
+        and values.shape[1] % 128 == 0
+        and 0 < int(topk) <= 128
+        and int(topk) <= values.shape[1]
+    )
+
+
+def stable_topk_around(original, values, topk):
+    """AROUND hook for ``topk._stable_topk`` (unbiased softmax/sigmoid routing)."""
+    if not _rowmax_eligible(values, topk):
+        return original(values, topk)
+    return _ROWMAX_OP[0](values, int(topk))

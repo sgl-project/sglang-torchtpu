@@ -73,6 +73,7 @@ from sglang_tpu.hooks.moe_topk import (
     biased_grouped_topk,
     biased_topk,
     register_router_topk,
+    stable_topk,
 )
 from sglang_tpu.hooks.padded_logits_sampling import (
     hook_specs as padded_logits_sampling_hooks,
@@ -309,6 +310,11 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.layers.moe.topk.biased_grouped_topk_impl",
         biased_grouped_topk,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.layers.moe.topk._stable_topk",
+        stable_topk,
         HookType.AROUND,
     ),
     (
