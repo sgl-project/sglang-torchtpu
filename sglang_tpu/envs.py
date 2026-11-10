@@ -195,6 +195,9 @@ class TpuEnvs:
     SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_LEN = EnvInt(None)
     SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_ROWS = EnvInt(32)
     SGLANG_TPU_GLM_FLASH_MEGAKERNEL_CALL_ROWS = EnvInt(32)
+    # Experimental: the kpool indexer's StreamIndex page table stays in HBM with
+    # one row per sequence in SMEM, so a context past ~262k fits the 1 MiB SMEM.
+    SGLANG_TPU_GLM_FLASH_PAGE_TABLE_HBM = EnvBool(False)
     # Pin each scheduler's main thread to one CPU of its rank's set and keep its
     # other threads off that physical core (hooks/cpu_pinning.py).
     SGLANG_TPU_ENABLE_SCHEDULER_THREAD_PINNING = EnvBool(False)

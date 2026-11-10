@@ -35,6 +35,7 @@ from sglang_tpu.attention.pallas.kpool_compress import (
     supports_page_size,
 )
 from sglang_tpu.dsv4.streamindex_topk import KVLayout, streamindex_topk
+from sglang_tpu.envs import envs as tpu_envs
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +46,11 @@ _LANE_BYTES = 128
 _TOKENS_PER_ROW = 4
 # Upstream act_quant / the kpool writer floor the absolute max before scaling.
 _AMAX_FLOOR = 1e-4
-# Pools per StreamIndex KV block for its (decode, prefill, mixed) passes;
-# not tuned for GLM.
-_NUM_POOLS_PER_BLOCK = 256
+# Pools per StreamIndex KV block for its (decode, prefill, mixed) passes. The kernel's
+# per-step schedule is a scalar-prefetch (SMEM) operand of seqs x query blocks x KV
+# blocks entries: at a 1M context with 8-page blocks it is 513 KB for 16 sequences and
+# the mixed pass fails to compile; 32-page blocks keep it under 128 KB.
+_NUM_POOLS_PER_BLOCK = 1024
 _NUM_QUERIES_PER_BLOCK = (1, 128, 128)
 # Query rows per scoring chunk: the kernel's score buffer is rows x positions.
 _CHUNK_TOKENS = 2048
@@ -296,6 +299,8 @@ def kpool_indexer_step(
         decode_query_size=decode_query_size,
         enable_early_exit=False,
         kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
+        # GLM-5.3-Flash only; the DeepSeek-V4.1 indexer keeps the prefetched table.
+        page_table_in_hbm=tpu_envs.SGLANG_TPU_GLM_FLASH_PAGE_TABLE_HBM.get(),
         chunk_tokens=_CHUNK_TOKENS if chunked else None,
         overlap_chunks=False,
     )  # i32[T, n_pick], chosen pools first, then -1
