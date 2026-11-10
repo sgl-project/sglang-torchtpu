@@ -51,6 +51,14 @@ def _kimi_k3_vision_policy() -> type[CompilePolicy]:
     return KimiK3VisionTpuCompilePolicy
 
 
+def _glm5_next_vision_policy() -> type[CompilePolicy]:
+    from sglang_tpu.graph_runner.glm5_next_vit_tpu_compile_runner import (
+        Glm5NextVisionTpuCompilePolicy,
+    )
+
+    return Glm5NextVisionTpuCompilePolicy
+
+
 CORE_COMPILE_BOUNDARIES: tuple[_CoreCompileBoundary, ...] = (
     # The Qwen3-VL MoE decoder (Qwen3-VL-30B-A3B, 235B-A22B). qwen3_vl annotates
     # only the dense Qwen3LLMModel and the vision tower, and the vision tower's
@@ -81,6 +89,17 @@ CORE_COMPILE_BOUNDARIES: tuple[_CoreCompileBoundary, ...] = (
         module="sglang.srt.models.kimi_k3_vl",
         class_name="MoonViT3dEncoder",
         policy=_kimi_k3_vision_policy,
+    ),
+    # GLM-5.3-Flash's vision encoder. Its block loop and 2x2 patch merger run
+    # on the TPU runner attached by sglang_tpu.hooks.glm5_next_vision; when
+    # model.visual is instantiated, compile_glm5_next_decoder_only annotates
+    # model.model (Glm5NextModel) with Qwen3VLDecoderTpuCompilePolicy, while
+    # --language-model-only skips instantiating Glm5NextVisionModel and keeps
+    # TpuGraphRunner's whole-model fallback.
+    _CoreCompileBoundary(
+        module="sglang.srt.models.glm5_next",
+        class_name="Glm5NextVisionModel",
+        policy=_glm5_next_vision_policy,
     ),
 )
 

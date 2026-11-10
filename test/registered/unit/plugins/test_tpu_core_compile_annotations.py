@@ -25,6 +25,10 @@ class FakeQwen3VLDecoderTpuCompilePolicy(CompilePolicy):
     pass
 
 
+class FakeGlm5NextVisionTpuCompilePolicy(CompilePolicy):
+    pass
+
+
 class OtherPolicy(CompilePolicy):
     pass
 
@@ -33,7 +37,14 @@ def _fake_policy_module():
     # The real policy module imports TorchTPU; the annotator only needs the name.
     module = types.ModuleType("sglang_tpu.compilation.decoder_compile_policy")
     module.Qwen3VLDecoderTpuCompilePolicy = FakeQwen3VLDecoderTpuCompilePolicy
-    return {module.__name__: module}
+    glm_vit_module = types.ModuleType(
+        "sglang_tpu.graph_runner.glm5_next_vit_tpu_compile_runner"
+    )
+    glm_vit_module.Glm5NextVisionTpuCompilePolicy = FakeGlm5NextVisionTpuCompilePolicy
+    return {
+        module.__name__: module,
+        glm_vit_module.__name__: glm_vit_module,
+    }
 
 
 def _drop_policy(cls):
@@ -46,6 +57,7 @@ class TestCoreCompileAnnotations(CustomTestCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.qwen3_vl_moe = importlib.import_module(QWEN3_VL_MOE)
+        cls.glm5_next = importlib.import_module("sglang.srt.models.glm5_next")
 
     def setUp(self):
         # Annotations are class attributes: undo them so other tests in this
@@ -53,6 +65,8 @@ class TestCoreCompileAnnotations(CustomTestCase):
         for cls in (
             self.qwen3_vl_moe.Qwen3MoeLLMModel,
             self.qwen3_vl_moe.Qwen3MoeModel,
+            self.glm5_next.Glm5NextVisionModel,
+            self.glm5_next.Glm5NextModel,
         ):
             self.assertNotIn(_COMPILE_POLICY_ATTR, vars(cls))
             self.addCleanup(_drop_policy, cls)
@@ -70,6 +84,17 @@ class TestCoreCompileAnnotations(CustomTestCase):
         # The text-only Qwen3-MoE decoder stays unannotated, so it keeps
         # TpuGraphRunner's whole-model fallback.
         self.assertIsNone(get_torch_compile_policy(self.qwen3_vl_moe.Qwen3MoeModel))
+
+    def test_glm5_next_vision_encoder_gets_the_vision_policy(self):
+        core_compile_annotations.annotate_core_compile_boundaries()
+
+        self.assertIs(
+            get_torch_compile_policy(self.glm5_next.Glm5NextVisionModel),
+            FakeGlm5NextVisionTpuCompilePolicy,
+        )
+        # Glm5NextModel stays unannotated at class level so --language-model-only
+        # keeps TpuGraphRunner's whole-model fallback.
+        self.assertIsNone(get_torch_compile_policy(self.glm5_next.Glm5NextModel))
 
     def test_unloaded_model_module_is_not_imported(self):
         with patch.dict(sys.modules):
