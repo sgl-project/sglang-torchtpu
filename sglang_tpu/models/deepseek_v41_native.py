@@ -11,8 +11,10 @@ slot, so one graph serves any mix of prefill chunks and decode steps:
   `loc_table` maps (request slot, position) to a location, so a radix-cached prefix is read from
   the locations its donor wrote (see dsv41_native/kv_layout.py). Each forward writes its tokens
   first, then gathers what each token may attend to.
-- Window KV, compressed KV and index keys are stored as fp8 codes plus per-block scales
-  (dsv41_native/kv_quant.py); a read dequantizes to the bf16 the reference's in-place quant gives.
+- Window KV, compressed KV and index keys are stored as fp8 codes plus scales
+  (dsv41_native/kv_quant.py). Window KV matches the reference's fp8 quant bit for bit; index K
+  (one scale per vector) and compressed KV (production lane-periodic layout, bf16 RoPE) are fp8
+  where the reference uses fp4, as deployed.
 - The sliding window is positions pos-127..pos read from the window KV cache instead of a ring.
 - A compressed group is pooled by the token that completes it, from the cached compressor inputs;
   a query sees groups below (pos + 1) // ratio, which is what the reference prefill mask and its
@@ -86,9 +88,12 @@ from sglang_tpu.dsv41_native.kv_layout import (
 )
 from sglang_tpu.dsv41_native.kv_quant import (
     CODE_DTYPE,
+    CSA_ROPE_DIM,
+    CSA_SCALE_PERIOD,
+    INDEX_K_BLOCK,
     dequant,
-    quantize_fp4_e4m3,
-    quantize_fp4_e8m0,
+    dequant_lane_periodic,
+    quantize_fp8_lane_periodic,
     quantize_fp8_ue8m0,
 )
 from sglang_tpu.ep_local_expert_reader import _SAFETENSORS_DTYPES
@@ -97,7 +102,6 @@ logger = get_logger(__name__)
 
 FP8_BLOCK = 32  # one fp8 scale per 32x32 weight block / 32 activations
 FP4_BLOCK = 32  # one fp4 scale per 32 elements along K
-COMPRESS_KV_BLOCK = 16  # compressed KV: one E4M3 scale per 16 elements
 SCALE_FMT = "ue8m0"
 # E8M0 scales are kept as raw bytes; kernel_ref.scale_f32 decodes them.
 SCALE_STORAGE = torch.uint8
@@ -712,7 +716,7 @@ class Indexer(nn.Module):
             )
             self.register_buffer(
                 "k_cache_scale",
-                torch.zeros(rows, self.head_dim // FP4_BLOCK, dtype=SCALE_STORAGE),
+                torch.zeros(rows, self.head_dim // INDEX_K_BLOCK, dtype=SCALE_STORAGE),
                 persistent=False,
             )
 
@@ -720,7 +724,8 @@ class Indexer(nn.Module):
         """Index keys of the groups completed in this forward; latent is pre-RoPE."""
         k = self.k_norm(self.wk(latent))
         k = _rope_tail(k, *rope_c, self.rope_head_dim)
-        codes, scales = quantize_fp4_e8m0(k[0], FP4_BLOCK)
+        # fp8, one UE8M0 scale per vector (production TPU index cache); the reference uses fp4
+        codes, scales = quantize_fp8_ue8m0(k[0], INDEX_K_BLOCK)
         self.k_cache[rows] = codes
         self.k_cache_scale[rows] = scales
         shared["index_k"] = (self.k_cache, self.k_cache_scale)
@@ -823,17 +828,24 @@ class Attention(nn.Module):
         )
         if self.is_kv_source:
             rows = args.num_locs // self.ratio
+            assert self.rope_head_dim == CSA_ROPE_DIM, (
+                "CSA layout keeps 64 RoPE dims in bf16"
+            )
+            nope = self.head_dim - CSA_ROPE_DIM
+            # production TPU CSA layout: fp8 nope, one UE8M0 scale per lane of 64, bf16 RoPE
             self.register_buffer(
                 "compress_kv_cache",
-                torch.zeros(rows, self.head_dim, dtype=CODE_DTYPE),
+                torch.zeros(rows, nope, dtype=CODE_DTYPE),
                 persistent=False,
             )
-            # compressed KV uses groups of 16 with E4M3 scales; the indexer uses 32 with E8M0
             self.register_buffer(
                 "compress_kv_cache_scale",
-                torch.zeros(
-                    rows, self.head_dim // COMPRESS_KV_BLOCK, dtype=torch.float8_e4m3fn
-                ),
+                torch.zeros(rows, CSA_SCALE_PERIOD, dtype=SCALE_STORAGE),
+                persistent=False,
+            )
+            self.register_buffer(
+                "compress_kv_cache_rope",
+                torch.zeros(rows, CSA_ROPE_DIM, dtype=torch.bfloat16),
                 persistent=False,
             )
         if self.ratio:
@@ -872,7 +884,7 @@ class Attention(nn.Module):
 
     def _write_compressed(self, x, qr, rope, ctx: _TokenCtx, shared: dict):
         """KV-source step: pool completed groups, hand the pre-RoPE latent to the indexer, then
-        store the RoPE'd, fp4-rounded latent."""
+        store the RoPE'd latent as fp8 nope plus bf16 RoPE."""
         latent = self.compressor(x, ctx)
         done = (ctx.positions + 1) % self.ratio == 0
         group = ((ctx.positions + 1) // self.ratio - 1).clamp_min(0)
@@ -886,10 +898,15 @@ class Attention(nn.Module):
         if self.indexer is not None and self.indexer.owns_k:
             self.indexer._write_index_k(latent, rope_c, rows, shared)
         latent = _rope_tail(latent, *rope_c, self.rope_head_dim)
-        codes, scales = quantize_fp4_e4m3(latent[0], COMPRESS_KV_BLOCK)
+        codes, scales, rope_part = quantize_fp8_lane_periodic(latent[0])
         self.compress_kv_cache[rows] = codes
         self.compress_kv_cache_scale[rows] = scales
-        shared["compress_kv"] = (self.compress_kv_cache, self.compress_kv_cache_scale)
+        self.compress_kv_cache_rope[rows] = rope_part
+        shared["compress_kv"] = (
+            self.compress_kv_cache,
+            self.compress_kv_cache_scale,
+            self.compress_kv_cache_rope,
+        )
 
     def _compress_kv(self, x, qr, rope, ctx: _TokenCtx, shared: dict):
         """[T, topk, d] compressed KV each query attends to, and which entries are real."""
@@ -898,9 +915,12 @@ class Attention(nn.Module):
         if self.is_index_source:
             shared["topk_idxs"] = self.indexer(x, qr, rope, ctx, shared)
         idxs = shared["topk_idxs"]
-        codes, scales = shared["compress_kv"]
+        codes, scales, rope_part = shared["compress_kv"]
         rows = _group_rows(ctx.loc_table, ctx.slots.unsqueeze(1), idxs, self.ratio)
-        return dequant(codes[rows], scales[rows], torch.bfloat16), idxs >= 0
+        kv = dequant_lane_periodic(
+            codes[rows], scales[rows], rope_part[rows], torch.bfloat16
+        )
+        return kv, idxs >= 0
 
     def forward(self, x: torch.Tensor, ctx: _TokenCtx, shared: dict) -> torch.Tensor:
         rd = self.rope_head_dim

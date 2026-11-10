@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DSV4.1 native KV cache: fp8 codes plus scales read back to the bf16 the reference's in-place
-quantizers write, and the loc-indexed layout that lets a radix hit read its donor's rows."""
+"""DSV4.1 native KV cache: fp8 codes plus scales, and the loc-indexed layout that lets a radix hit
+read its donor's rows.
+
+Window KV must read back the reference's bf16 bit for bit. Index K and CSA KV follow the production
+TPU quantizers (fp8; the reference uses fp4), so they are checked against those JAX references."""
 
 import unittest
 
@@ -10,7 +13,9 @@ from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
 
-from sglang_tpu.dsv41_native.kernel_ref import act_quant, fp4_act_quant
+import numpy as np
+
+from sglang_tpu.dsv41_native.kernel_ref import act_quant
 from sglang_tpu.dsv41_native.kv_layout import (
     check_page_layout,
     group_tail_positions,
@@ -19,11 +24,18 @@ from sglang_tpu.dsv41_native.kv_layout import (
 )
 from sglang_tpu.dsv41_native.kv_quant import (
     CODE_DTYPE,
+    CSA_ROPE_DIM,
+    CSA_SCALE_PERIOD,
+    INDEX_K_BLOCK,
     dequant,
-    quantize_fp4_e4m3,
-    quantize_fp4_e8m0,
+    dequant_lane_periodic,
+    quantize_fp8_lane_periodic,
     quantize_fp8_ue8m0,
 )
+
+
+def _bytes(t: torch.Tensor) -> np.ndarray:
+    return t.contiguous().view(torch.uint8).numpy()
 
 
 def _inputs(dtype: torch.dtype) -> torch.Tensor:
@@ -69,18 +81,57 @@ class TestKvQuant(unittest.TestCase):
             torch.uint8,
         )
 
-    def test_index_k_matches_fp4_e8m0(self):
-        self._check(
-            quantize_fp4_e8m0, lambda x, b: fp4_act_quant(x, b, True), 32, torch.uint8
+    def test_index_k_matches_production_quantizer(self):
+        """One UE8M0 scale per 128-dim vector, byte for byte as the production index cache."""
+        from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.cache import (
+            quantize_index_rows,
         )
 
-    def test_compressed_kv_matches_fp4_e4m3(self):
-        self._check(
-            quantize_fp4_e4m3,
-            lambda x, b: fp4_act_quant(x, b, True, scale_dtype=torch.float8_e4m3fn),
-            16,
-            torch.float8_e4m3fn,
+        x = _inputs(torch.float32).reshape(64, 128)
+        q, s = quantize_fp8_ue8m0(x, INDEX_K_BLOCK)
+        self.assertEqual(tuple(s.shape), (64, 1))
+        want_q, _, want_s = quantize_index_rows(x.numpy())
+        np.testing.assert_array_equal(_bytes(q), np.asarray(want_q).view(np.uint8))
+        np.testing.assert_array_equal(s[:, 0].numpy(), np.asarray(want_s))
+
+    def test_csa_kv_matches_production_lane_periodic(self):
+        """448 fp8 nope dims, scale j over dims d % 64 == j, byte for byte as the production CSA
+        store; the 64 RoPE dims pass through in bf16."""
+        # Load the JAX reference by path: the sglang_tpu.dsv4 package __init__ imports the
+        # attention backend, which this pure quantizer check does not need.
+        import importlib.util
+        from pathlib import Path
+
+        import sglang_tpu
+
+        path = (
+            Path(sglang_tpu.__file__).parent
+            / "dsv4/compress_and_store/compress_store_ref.py"
         )
+        spec = importlib.util.spec_from_file_location("_csa_store_ref", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        reference = module.quantize_fp8_lane_periodic
+
+        x = _inputs(torch.float32)
+        nope = 512 - CSA_ROPE_DIM
+        q, s, rope = quantize_fp8_lane_periodic(x)
+        want_q, want_s = reference(x.numpy(), CSA_SCALE_PERIOD, nope)
+        np.testing.assert_array_equal(
+            _bytes(q), np.asarray(want_q).view(np.uint8)[:, :nope]
+        )
+        np.testing.assert_array_equal(_bytes(s), np.asarray(want_s).view(np.uint8))
+        self.assertTrue(torch.equal(rope, x[:, nope:].to(torch.bfloat16)))
+
+    def test_csa_dequant_tiles_scales_by_lane(self):
+        """A large value in one lane must not coarsen the other lanes: dequant has to apply scale
+        d % 64, not a contiguous block of 7, or small lanes come back far off."""
+        x = torch.full((1, 512), 0.01)
+        x[0, 5] = x[0, 5 + 64] = 400.0  # lane 5 only
+        q, s, rope = quantize_fp8_lane_periodic(x)
+        got = dequant_lane_periodic(q, s, rope, torch.float32)
+        rel = ((got - x).abs() / x.abs())[0, : 512 - CSA_ROPE_DIM]
+        self.assertLess(rel.max().item(), 2**-3)  # e4m3 keeps 3 mantissa bits
 
 
 class TestKvLayout(unittest.TestCase):
