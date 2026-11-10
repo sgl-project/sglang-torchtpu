@@ -150,6 +150,7 @@ class EPExperts:
 
 
 _window = attn.window
+_aligned8 = attn._aligned8
 
 
 def _row(smr, name, n):
@@ -665,9 +666,16 @@ def _unpool_residual(step: EPLayerStep, win) -> None:
     alpha, beta = _row(smr, "ffn_alpha", H), _row(smr, "ffn_beta", H)
 
     def residual(row, t0, m):
+        h = jnp.concatenate([row(i)[...] for i in range(m)], axis=0)
+        if rc % 8 == 0:  # the window offset is 8-row aligned
+            branch = S["ep_f"][pl.ds(_aligned8(w_off + t0), m), :]
+        else:  # an unaligned window offset: one-row loads
+            branch = jnp.concatenate(
+                [S["ep_f"][pl.ds(w_off + t0 + i, 1), :] for i in range(m)], axis=0
+            )
+        s = alpha * h + beta * branch
         for i in range(m):
-            branch = S["ep_f"][pl.ds(w_off + t0 + i, 1), :]
-            row(i)[...] = alpha * row(i)[...] + beta * branch
+            row(i)[...] = s[i : i + 1]
 
     if not _dev_skip("residual"):  # own rows only: the all-gather fills the others
         rows(w0 + w_off, rc, residual)
@@ -686,10 +694,10 @@ def _gather_lhs(step: EPLayerStep, p: EPPlan, nsmr) -> None:
     _, rows = _stream_rows(c, S)
 
     def norm(row, t0, m):
-        for i in range(m):
-            own[pl.ds(t0 + i, 1), :] = _pack_bf16x2(
-                _rms(row(i)[...], c.rms_eps, w).astype(bf16).astype(f32)
-            )
+        h = jnp.concatenate([row(i)[...] for i in range(m)], axis=0)
+        own[pl.ds(t0, m), :] = _pack_bf16x2(
+            _rms(h, c.rms_eps, w).astype(bf16).astype(f32)
+        )
 
     rows(me * rc, rc, norm, write_back=False)
     n = rc if rc % 8 == 0 else 1  # rows per copy: a block, or a row of an unaligned one

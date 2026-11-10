@@ -22,6 +22,11 @@ def _row(smr, name, n):
     return smr[SMALL[name] : SMALL[name] + 1, :n]
 
 
+def _aligned8(x):
+    """x, hinted 8-row aligned when traced."""
+    return x if isinstance(x, int) else pl.multiple_of(x, 8)
+
+
 def window(c: MKConfig, me):
     """(w0, win, w_off): the 16-row aligned window holding own rows at [w_off, w_off + Rc)."""
     rc, win = c.rows_per_dev, window_rows(c)
@@ -88,28 +93,33 @@ def o_proj(step: EPOProjStep, p: EPPlan, stream_rows) -> None:
     s_win[...] = jnp.zeros((wn, H), f32)
 
     def residual(row, t0, m):
-        for i in range(m):
-            r = t0 + i
-            a = (
-                jnp.concatenate(
-                    [
-                        sum(
-                            _unpack_bf16x2(recv[src * tp + col, pl.ds(r, 1), :])
-                            for src in range(tp)
-                        )
-                        for col in range(H // Hl)
-                    ],
-                    axis=1,
-                )
-                .astype(bf16)
-                .astype(f32)
-            )  # [1, H]
-            s_a = jax.lax.rsqrt(
-                jnp.mean(jnp.square(a), axis=-1, keepdims=True) + c.post_eps
+        # the tile's m rows at once (one-row arrays cost a permute per bf16 unpack)
+        a = (
+            jnp.concatenate(
+                [
+                    sum(
+                        _unpack_bf16x2(recv[src * tp + col, pl.ds(t0, m), :])
+                        for src in range(tp)
+                    )
+                    for col in range(H // Hl)
+                ],
+                axis=1,
             )
-            s = a_alpha * row(i)[...] + a_beta * (a * s_a).astype(bf16).astype(f32)
-            row(i)[...] = s
-            s_win[pl.ds(w_off + r, 1), :] = s
+            .astype(bf16)
+            .astype(f32)
+        )  # [m, H]
+        s_a = jax.lax.rsqrt(
+            jnp.mean(jnp.square(a), axis=-1, keepdims=True) + c.post_eps
+        )
+        h = jnp.concatenate([row(i)[...] for i in range(m)], axis=0)
+        s = a_alpha * h + a_beta * (a * s_a).astype(bf16).astype(f32)
+        for i in range(m):
+            row(i)[...] = s[i : i + 1]
+        if rc % 8 == 0:  # the window offset is 8-row aligned
+            s_win[pl.ds(_aligned8(w_off + t0), m), :] = s
+        else:  # an unaligned window offset: one-row stores
+            for i in range(m):
+                s_win[pl.ds(w_off + t0 + i, 1), :] = s[i : i + 1]
 
     rows(w0 + w_off, rc, residual)
     S["lhs"][pl.ds(w0, wn), :] = _rms(
