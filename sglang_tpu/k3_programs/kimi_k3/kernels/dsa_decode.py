@@ -3,10 +3,11 @@
 
 Per MLA layer, before the DCP attention:
 
-1. Projections. Rank ``r`` computes index head ``r`` of every row's query
-   (``d_wqb`` is head-sharded; ranks load their weights by mesh position, so
-   DCP member ``d`` holds head ``d``) from the normalized q-latent, and sends
-   it into slot ``r`` of every peer (remote copies, as the DCP query gather).
+1. Projections. DCP member ``d`` computes index heads ``d * per .. (d + 1) *
+   per - 1`` (``per = 32 / group``: one head over DCP32; ``d_wqb`` is
+   head-sharded and ranks load their weights by mesh position) of every row's
+   query from the normalized q-latent, and sends them into slot ``d`` of every
+   peer (remote copies, as the DCP query gather).
    Every rank computes the rows' head gates (``weights_proj``) and new index
    keys (``wk``, LayerNorm) from the full hidden state while the gather is in
    flight. Rounding follows sglang's native indexer: BF16 linear outputs,
@@ -100,7 +101,7 @@ def persistent_scratch(batch, group=32):
     its first count exchange, and no peer sends the next layer's queries
     before that exchange completes."""
     return (
-        pltpu.VMEM((group, batch, DIM), jnp.bfloat16),
+        pltpu.VMEM((group, batch, DIM * (HEADS // group)), jnp.bfloat16),
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.VMEM((2, group, dsa_dcp.COUNT_ROWS, LANES), jnp.int32),
         pltpu.SemaphoreType.DMA((2, 2)),
@@ -160,17 +161,20 @@ class DecodeIndexer:
     sequence_rows: int = 1
 
     def _plan(self):
-        """The weight stream: ``(family, chunk)`` in consumption order (wq_b's
-        chunks, then wk and weights_proj chunk by chunk)."""
+        """The weight stream: ``(family, row chunk, head)`` in consumption
+        order (wq_b's ``[CHUNK, 128]`` blocks head by head, then wk and
+        weights_proj chunk by chunk)."""
+        q_lora, width = self.weights["d_wqb"].shape
         hidden = self.weights["d_wk"].shape[0]
-        return ([("d_wqb", c) for c in range(Q_LORA // CHUNK)]
-                + [(name, c) for c in range(hidden // CHUNK) for name in ("d_wk", "d_wproj")])
+        return ([("d_wqb", c, h) for h in range(width // DIM) for c in range(q_lora // CHUNK)]
+                + [(name, c, 0) for c in range(hidden // CHUNK) for name in ("d_wk", "d_wproj")])
 
     def _stream(self, index):
-        name, chunk = self._plan()[index]
+        name, chunk, head = self._plan()[index]
         slot = index % RING
-        return pltpu.make_async_copy(self.weights[name].at[pl.ds(chunk * CHUNK, CHUNK)],
-                                     self.scoped["weight_ring"].at[slot], self.scoped["ring_sems"].at[slot])
+        return pltpu.make_async_copy(
+            self.weights[name].at[pl.ds(chunk * CHUNK, CHUNK), pl.ds(head * DIM, DIM)],
+            self.scoped["weight_ring"].at[slot], self.scoped["ring_sems"].at[slot])
 
     def _knorm(self):
         return pltpu.make_async_copy(self.weights["d_knorm"], self.scoped["knorm"], self.scoped["knorm_sem"].at[0])
@@ -190,17 +194,22 @@ class DecodeIndexer:
         return self.scoped["weight_ring"][index % RING]
 
     def _query(self, query_latent):
-        """``query_latent @ wq_b`` (this rank's index head, f32)."""
-        q = None
-        for c in range(Q_LORA // CHUNK):
-            part = jnp.dot(query_latent[:, c * CHUNK:(c + 1) * CHUNK], self._take(c),
-                           preferred_element_type=jnp.float32)
-            q = part if q is None else q + part
-        return q
+        """``query_latent @ wq_b`` (this rank's index heads, f32 ``[B, 128 per]``)."""
+        q_lora, width = self.weights["d_wqb"].shape
+        chunks, heads = q_lora // CHUNK, []
+        for h in range(width // DIM):
+            q = None
+            for c in range(chunks):
+                part = jnp.dot(query_latent[:, c * CHUNK:(c + 1) * CHUNK], self._take(h * chunks + c),
+                               preferred_element_type=jnp.float32)
+                q = part if q is None else q + part
+            heads.append(q)
+        return heads[0] if len(heads) == 1 else jnp.concatenate(heads, axis=1)
 
     def _key_and_gate(self, x):
         """``x @ wk`` and ``x @ weights_proj`` (f32), streamed after wq_b."""
-        first = Q_LORA // CHUNK
+        q_lora, width = self.weights["d_wqb"].shape
+        first = q_lora // CHUNK * (width // DIM)
         key = gate = None
         for c in range(x.shape[1] // CHUNK):
             part = x[:, c * CHUNK:(c + 1) * CHUNK]
@@ -214,8 +223,9 @@ class DecodeIndexer:
         BF16) values; ``cache`` the layer's ``mla_dcp.DcpCache``."""
         s, batch = self.scoped, hidden.shape[0]
         group = cache.group
-        if group != HEADS:
-            raise ValueError("the indexer gathers its 32 query heads over a DCP32 group")
+        per = HEADS // group
+        if HEADS % group or self.weights["d_wqb"].shape[1] != DIM * per:
+            raise ValueError(f"a DCP{group} rank computes {HEADS // group} index heads")
         rank = jax.lax.axis_index("tp")
         member = rank % group
         base = rank - member
@@ -223,7 +233,7 @@ class DecodeIndexer:
         gather, gather_sems, exchange, exchange_sems = self.persistent
 
         # 1. This rank's index head of every row, out to every peer's slot.
-        q_own = self._query(query_latent.astype(jnp.bfloat16)).astype(jnp.bfloat16)  # [B, 128]
+        q_own = self._query(query_latent.astype(jnp.bfloat16)).astype(jnp.bfloat16)  # [B, 128 per]
         gather[member] = q_own
         for peer in range(group):
             @pl.when(peer != member)
@@ -264,7 +274,7 @@ class DecodeIndexer:
         head_lane = jax.lax.broadcasted_iota(jnp.int32, (HEADS, LANES), 1)
         w_t = jnp.zeros((HEADS, LANES), jnp.float32)
         for b in range(batch):
-            heads = gather[:, pl.ds(b, 1), :].reshape(HEADS, DIM).astype(jnp.float32)
+            heads = gather[:, pl.ds(b, 1), :].reshape(HEADS, DIM).astype(jnp.float32)  # head d per + h
             q8, q_exp = quantize(heads)
             s["q8"][b] = q8
             column = jnp.sum(jnp.where(head_lane == b, gate_t, 0.0), axis=1, keepdims=True)  # [32, 1]
