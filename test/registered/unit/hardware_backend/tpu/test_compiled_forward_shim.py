@@ -1,6 +1,7 @@
 """Unit tests for the TPU compiled-forward shim."""
 
 import inspect
+import os
 import unittest
 from array import array
 from http import HTTPStatus
@@ -45,6 +46,7 @@ from sglang_tpu.compilation.compiled_forward_shim import (
     _pin_fields,
     _restore_fields,
     _restore_forward_batch_inputs,
+    _SkipGuardStance,
     _static_default_kwargs,
     _zero_pad_dim0,
     build_bucketers,
@@ -2396,6 +2398,94 @@ class _StubModel:
     @property
     def flag_during_call(self):
         return self.logits_processor.flag_during_call
+
+
+class TestSkipGuardStance(CustomTestCase):
+    """Frozen guard skipping only arms under fail_on_recompile on decode-family modes."""
+
+    def test_arms_only_under_fail_on_recompile_and_restores_on_exit_and_error(self):
+        from torch._dynamo import eval_frame
+
+        torch.compiler.set_stance("default")
+        try:
+            sg = _SkipGuardStance()
+            self.assertFalse(sg.armed())
+
+            torch.compiler.set_stance("fail_on_recompile")
+            self.assertTrue(sg.armed())
+            self.assertFalse(eval_frame._stance.skip_guard_eval_unsafe)
+
+            with sg:
+                self.assertEqual(eval_frame._stance.stance, "fail_on_recompile")
+                self.assertTrue(eval_frame._stance.skip_guard_eval_unsafe)
+            self.assertEqual(eval_frame._stance.stance, "fail_on_recompile")
+            self.assertFalse(eval_frame._stance.skip_guard_eval_unsafe)
+
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                with sg:
+                    self.assertTrue(eval_frame._stance.skip_guard_eval_unsafe)
+                    raise RuntimeError("boom")
+            self.assertEqual(eval_frame._stance.stance, "fail_on_recompile")
+            self.assertFalse(eval_frame._stance.skip_guard_eval_unsafe)
+        finally:
+            torch.compiler.set_stance("default")
+
+    def test_compiled_forward_shim_skips_guards_on_decode_verify_and_draft_extend_only(
+        self,
+    ):
+        from torch._dynamo import eval_frame
+
+        orig_flag = os.environ.get("SGLANG_TPU_DECODE_SKIP_GUARD_EVAL")
+        os.environ["SGLANG_TPU_DECODE_SKIP_GUARD_EVAL"] = "1"
+        torch.compiler.set_stance("fail_on_recompile")
+        try:
+            observed: dict[ForwardMode, bool] = {}
+
+            def fake_fn(input_ids, positions, forward_batch, *args, **kwargs):
+                observed[forward_batch.forward_mode] = bool(
+                    eval_frame._stance.skip_guard_eval_unsafe
+                )
+                return SimpleNamespace(next_token_logits=torch.zeros((1, 4)))
+
+            fake_policy = SimpleNamespace(
+                model_runner=SimpleNamespace(is_draft_worker=False),
+                keep_outputs_padded=lambda fb: False,
+                finalize_forward_batch=lambda outputs, fb: outputs,
+            )
+            shim = CompiledForwardShim(fake_fn, policy=fake_policy)
+            self.assertIsNotNone(shim._skip_guard_stance)
+
+            for mode, expect_skip in (
+                (ForwardMode.DECODE, True),
+                (ForwardMode.TARGET_VERIFY, True),
+                (ForwardMode.DRAFT_EXTEND_V2, True),
+                (ForwardMode.EXTEND, False),
+                (ForwardMode.MIXED, False),
+            ):
+                fb = SimpleNamespace(
+                    forward_mode=mode,
+                    is_prefill_only=False,
+                    input_embeds=None,
+                    mm_input_embeds=None,
+                    capture_hidden_mode=CaptureHiddenMode.NULL,
+                    return_logprob=False,
+                    top_logprobs_nums=None,
+                    token_ids_logprobs=None,
+                    extend_input_logprob_token_ids_gpu=None,
+                    extend_seq_lens_cpu=[],
+                    extend_logprob_start_lens_cpu=[],
+                    spec_info=None,
+                    input_ids=torch.zeros((1,), dtype=torch.int32),
+                )
+                shim._forward(fake_fn, None, None, fb)
+                self.assertIs(observed[mode], expect_skip, mode.name)
+                self.assertFalse(eval_frame._stance.skip_guard_eval_unsafe)
+        finally:
+            torch.compiler.set_stance("default")
+            if orig_flag is None:
+                os.environ.pop("SGLANG_TPU_DECODE_SKIP_GUARD_EVAL", None)
+            else:
+                os.environ["SGLANG_TPU_DECODE_SKIP_GUARD_EVAL"] = orig_flag
 
 
 if __name__ == "__main__":

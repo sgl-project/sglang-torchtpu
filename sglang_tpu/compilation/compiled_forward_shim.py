@@ -1270,7 +1270,11 @@ class CompiledForwardShim:
             skip_guards = self._skip_guard_stance
             if (
                 skip_guards is not None
-                and forward_batch.forward_mode.is_decode()
+                and (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_draft_extend_v2()
+                )
                 and skip_guards.armed()
             ):
                 with skip_guards:
