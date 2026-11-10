@@ -373,7 +373,9 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
                 [
                     ("oag_ptsems", pltpu.SemaphoreType.DMA((R // RT,))),
                     ("fag_ptsems", pltpu.SemaphoreType.DMA((R // RT,))),
-                    ("ag_fwd_sems", pltpu.SemaphoreType.DMA((2,))),
+                    ("ag_fwd_sems", pltpu.SemaphoreType.DMA((3,))),
+                    ("uag_tsems", pltpu.SemaphoreType.DMA((max(Rc // 8, 1),))),
+                    ("uag_ptsems", pltpu.SemaphoreType.DMA((max(Rc // 8, 1),))),
                 ]
                 if c.pipe_ag
                 else []

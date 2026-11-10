@@ -201,7 +201,7 @@ from sglang_tpu.muse_megakernel.mk.weights import (  # noqa: F401
     permute_weights_kperm,
 )
 
-_PIPE_AG = {"o_ag": 0, "f": 1}
+_PIPE_AG = {"o_ag": 0, "f": 1, "u": 2}
 
 
 def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
@@ -3792,6 +3792,53 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             for ck in range(4):
                 hag_fwd(kind, pad, t, ptsems, ck).wait_recv()
 
+        # pipe_u: the u all-gather in 8-row tiles of each owner block, sent as combine writes
+        # them; the forwards and waits come after the combine loop
+        pipe_u = bool(c.pipe_ag and c.tiled_vmem_y < 2 and c.rows_per_dev % 8 == 0)
+        n_ut = c.rows_per_dev // 8
+
+        def u_rows(j):
+            return pl.ds(pl.multiple_of(j * 8, 8), 8)
+
+        def u_cross(j, d):
+            return pltpu.make_async_remote_copy(
+                src_ref=S["u_send"].at[u_rows(j)],
+                dst_ref=S["pad_u"].at[me, u_rows(j)],
+                send_sem=S["tc_ssems"].at[_TC["u"]],
+                recv_sem=S["uag_tsems"].at[j],
+                device_id=(2 * jnp.bitwise_xor(p_chip, d) + p_core,),
+            )
+
+        def u_fwd(j, ck):
+            return pltpu.make_async_remote_copy(
+                src_ref=S["pad_u"].at[2 * ck + p_core, u_rows(j)],
+                dst_ref=S["pad_u"].at[2 * ck + p_core, u_rows(j)],
+                send_sem=S["ag_fwd_sems"].at[_PIPE_AG["u"]],
+                recv_sem=S["uag_ptsems"].at[j],
+                device_id=(p_partner,),
+            )
+
+        def u_start(j):
+            S["pad_u"][me, u_rows(j)] = S["u_send"][u_rows(j)]
+            for d in (1, 2, 3):
+                u_cross(j, d).start()
+
+        def u_finish():
+            """Every owner block's tiles here: cross arrivals forwarded, forwards received."""
+            for j in range(n_ut):
+                for d in (1, 2, 3):
+                    u_cross(j, d).wait_recv()
+                for ck in range(4):
+                    u_fwd(j, ck).start()
+            for j in range(n_ut):
+                for ck in range(4):
+                    u_fwd(j, ck).wait_recv()
+            for j in range(n_ut):
+                for d in (1, 2, 3):
+                    u_cross(j, d).wait_send()
+                for ck in range(4):
+                    u_fwd(j, ck).wait_send()
+
         def hag_sent(kind, src, pad, tsems, ptsems):
             for t in range(NT):
                 for d in (1, 2, 3):
@@ -5810,6 +5857,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             ynorm * S["wk_s"][w_off + r, :, 0:1], axis=0, keepdims=True
                         )
                         S["u_send"][pl.ds(r, 1), :] = _pack_bf16x2(u)
+                        if pipe_u:
+                            pl.when(r % 8 == 7)(functools.partial(u_start, r // 8))
                         return carry
 
                     with _scope("combine_rows"):
@@ -5817,9 +5866,13 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
             if vpads:
                 with _scope("u_ag"):
-                    padu = coll.all_gather(
-                        "u", S["u_send"], me, live=lambda m: m * Rc < n_live
-                    )
+                    if pipe_u:
+                        u_finish()
+                        padu = S["pad_u"]
+                    else:
+                        padu = coll.all_gather(
+                            "u", S["u_send"], me, live=lambda m: m * Rc < n_live
+                        )
                     if c.combine_loop and R % 16 == 0:
 
                         def _store_u16(r0, raw16):
