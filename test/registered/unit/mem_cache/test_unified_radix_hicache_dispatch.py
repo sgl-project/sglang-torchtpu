@@ -158,6 +158,8 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         original = list(hybrid_pool_assembler._STRATEGIES)
         try:
             register_stack_strategy(custom)
+            register_stack_strategy(custom)
+            self.assertEqual(hybrid_pool_assembler._STRATEGIES.count(custom), 1)
             from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
             kvcache = _mock_kvcache(MHATokenToKVPool)

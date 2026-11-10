@@ -292,5 +292,67 @@ class TestQblockSelectionWords(CustomTestCase):
         np.testing.assert_array_equal(words[0], words[1])
 
 
+@unittest.skipUnless(_HAS_JAX, "requires JAX")
+class TestQblockZeroRope(CustomTestCase):
+    """read_rope=False matches read_rope=True on a zero rope lane, and never
+    reads the rope cache (Pallas interpret mode off TPU, so it also runs on
+    CPU)."""
+
+    def test_skip_rope_reads(self):
+        from sglang_tpu.attention.pallas.mla_sparse_qblock import (
+            sparse_mla_prefill_qblock,
+        )
+
+        rng = np.random.default_rng(0)
+        max_seqs, pps, heads, qb = 2, 8, 8, 128
+        q_lens, prefix = [300, 129], [600, 0]
+        num_tokens = 512
+        topk = np.full((num_tokens, W), -1, np.int32)
+        t = 0
+        for p, n in zip(prefix, q_lens):
+            for pos in range(p, p + n):
+                # Short rows select every closed pool, then the open pool's
+                # tail: every position up to the query's own.
+                topk[t, : pos + 1] = np.arange(pos + 1)
+                t += 1
+        cu = jnp.asarray([0, q_lens[0], sum(q_lens)], jnp.int32)
+        kv = jnp.asarray([p + n for p, n in zip(prefix, q_lens)], jnp.int32)
+        dist = jnp.asarray([0, 0, 2], jnp.int32)
+        pi = jnp.asarray(1 + rng.permutation(max_seqs * pps), jnp.int32)
+        num_pages = max_seqs * pps + 1
+        cn = jnp.asarray(rng.integers(0, 0x70, (num_pages, PAGE, 4, 128)), jnp.uint8)
+        cr = jnp.zeros((num_pages, PAGE // 4, 4, 128), jnp.uint8)
+        # The read_rope=False arm gets an all-NaN rope cache (0x7F is FP8
+        # e4m3fn NaN): with zeros both arms would match even if it read it.
+        cr_nan = jnp.full((num_pages, PAGE // 4, 4, 128), 0x7F, jnp.uint8)
+        ql = jnp.asarray(rng.normal(size=(num_tokens, heads, 512)), jnp.bfloat16)
+        qpe = jnp.zeros((num_tokens, heads, 64), jnp.bfloat16)
+        outs = [
+            np.asarray(
+                sparse_mla_prefill_qblock(
+                    ql,
+                    qpe,
+                    cn,
+                    rope_cache,
+                    jnp.asarray(topk),
+                    kv,
+                    pi,
+                    cu,
+                    dist,
+                    sm_scale=0.05,
+                    k_scale=0.5,
+                    kpool=KPOOL,
+                    query_block=qb,
+                    interpret=not _HAS_TPU,
+                    read_rope=read_rope,
+                ).astype(jnp.float32)
+            )
+            for read_rope, rope_cache in ((True, cr), (False, cr_nan))
+        ]
+        self.assertFalse(np.isnan(outs[0]).any())
+        self.assertTrue(outs[0][: sum(q_lens)].any())
+        np.testing.assert_array_equal(outs[0], outs[1])
+
+
 if __name__ == "__main__":
     unittest.main()

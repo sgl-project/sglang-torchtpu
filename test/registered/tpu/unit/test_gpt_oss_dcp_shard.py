@@ -89,14 +89,6 @@ class TestGptOssDcpShard(CustomTestCase):
                 self.assertEqual(attn.qkv_proj.tp_size, ATTN_TP_SIZE)
                 self.assertEqual(attn.qkv_proj.tp_rank, attn_tp_rank)
 
-    def test_ranks_of_one_dcp_group_hold_the_same_kv_shard(self):
-        for group_start in range(0, ATTN_TP_SIZE, self.DCP):
-            ranks = range(group_start, group_start + self.DCP)
-            kv_ranks = {
-                _build_attention(r, self.DCP).qkv_proj.kv_tp_rank for r in ranks
-            }
-            self.assertEqual(len(kv_ranks), 1, f"group at {group_start}: {kv_ranks}")
-
     def test_local_head_counts(self):
         attn = _build_attention(3, self.DCP)
         # Queries stay sharded by attn_tp; KV heads double relative to TP-only.

@@ -81,6 +81,8 @@ _ENV_FIELDS_NOT_KEYED = frozenset(
         # PP chunk scheduling; the token buckets it picks are graph shapes.
         "SGLANG_TPU_PP_CHUNK_SLACK",
         "SGLANG_TPU_PP_DYNAMIC_CHUNKS",
+        # PP buffered hand-off: how many sends a stage queues, on the host.
+        "SGLANG_TPU_PP_BUFFERED_SEND_DEPTH",
         # Profiler scope.
         "SGLANG_TPU_PROFILE_NUM_CHIPS",
         "SGLANG_TPU_PROFILE_NUM_SPARSE_CORES",
@@ -117,7 +119,6 @@ def add_tpu_rank_assignment_to_compile_cache_key() -> None:
     Standalone compilation must call this explicitly if it bypasses TpuGraphRunner.
     Querying the native assignment avoids another WORLD collective.
     """
-    import torch.compiler.config as compiler_config
     import torch.distributed as dist
     from torch_tpu._internal.distributed.device_mesh import get_device_assignment
 
@@ -140,11 +141,19 @@ def add_tpu_rank_assignment_to_compile_cache_key() -> None:
     }
     digest = hashlib.sha256(json.dumps(assignment, sort_keys=True).encode()).hexdigest()
     tag = f"tpu-rank-assignment-v1:{digest}"
+    if append_compile_cache_key_tag(tag):
+        logger.info("TPU compile cache rank assignment: %s, tag=%s", assignment, tag)
+
+
+def append_compile_cache_key_tag(tag: str) -> bool:
+    """Append ``tag`` to ``cache_key_tag`` unless present; return whether it did."""
+    import torch.compiler.config as compiler_config
+
     existing_tag = str(compiler_config.cache_key_tag or "")
     if tag in existing_tag.split("|"):
-        return
+        return False
     compiler_config.cache_key_tag = f"{existing_tag}|{tag}" if existing_tag else tag
-    logger.info("TPU compile cache rank assignment: %s, tag=%s", assignment, tag)
+    return True
 
 
 def add_tpu_kernel_inputs_to_compile_cache_key() -> None:

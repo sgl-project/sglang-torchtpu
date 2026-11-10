@@ -116,6 +116,10 @@ _V7X_VMEM_CAPACITY_BYTES = 64 * 2**20
 # Headroom for buffers the model does not count, chiefly the double-buffered
 # bf16 output block (3.1 MiB at block_q=6400).
 _VMEM_BUDGET_FRACTION = 0.93
+# Shapes where a block sweep on device beat the model's pick, keyed by
+# (q_seq, kv_seq, carry_bytes_per_q_row). Wan2.2-TI2V-5B 1280x704x121 ring
+# resume step: 2.47 vs 2.88 ms.
+_MEASURED_BLOCK_SIZES = {(13640, 13640, 2176): (6912, 1024, 1024)}
 
 
 def _score_tile_bytes(
@@ -148,6 +152,9 @@ def _autotune_block_sizes(
     ``carry_bytes_per_q_row`` is VMEM per query row beyond the score tile,
     e.g. a ring step's float32 carry blocks.
     """
+    measured = _MEASURED_BLOCK_SIZES.get((q_seq, kv_seq, carry_bytes_per_q_row))
+    if measured is not None:
+        return measured
     mxu_dim = 256
     safe_kv_block = 2048
     vmem_budget = int(vmem_capacity_bytes * _VMEM_BUDGET_FRACTION)

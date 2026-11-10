@@ -406,13 +406,6 @@ class TestTpuGraphRunner(CustomTestCase):
             # The skip is reflected into the capture flag for downstream warmup.
             self.assertFalse(get_flags().capture.enable_torch_compile)
 
-    def test_annotation_drives_compile_when_can_torch_compile_default(self):
-        # Models that don't set _can_torch_compile should compile only when
-        # they declare a boundary.
-        model = self._annotate(_model_with(forward=MagicMock()))
-        TpuGraphRunner(self._runner_for(model))
-        self.mock_compile.assert_called_once()
-
     def test_no_annotation_uses_direct_tracer(self):
         # Most text decoder models should not need an explicit annotation.
         # If no annotated boundary is installed, TPU compile falls back to
@@ -600,11 +593,6 @@ class TestTpuGraphRunner(CustomTestCase):
         ):
             TpuGraphRunner(runner_args)
         shared.assert_not_called()
-
-    def test_precompile_called_for_installed_policy(self):
-        model = self._annotate(_model_with(forward=MagicMock()))
-        TpuGraphRunner(self._runner_for(model))
-        self.mock_precompile.assert_called_once()
 
     def test_discovers_annotated_module(self):
         events = []

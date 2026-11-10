@@ -2,14 +2,17 @@
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit", chips=1)
 
+import importlib.util
+import sys
 import unittest
 from importlib.metadata import entry_points
-from types import SimpleNamespace
-from unittest.mock import patch
+from types import ModuleType, SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
+import torch.compiler.config as compiler_config
 
 from sglang.multimodal_gen.runtime.layers.attention import selector
 from sglang.multimodal_gen.runtime.platforms import (
@@ -72,6 +75,11 @@ class TestOutOfTreeContract(CustomTestCase):
     def test_safetensors_are_read_on_the_host(self):
         self.assertFalse(TpuOOTPlatform.supports_safetensors_device_load())
         self.assertTrue(Platform.supports_safetensors_device_load())
+
+    def test_every_request_drains_the_device_queue(self):
+        # Without it Wan2.2-A14B's second warmup request hangs; see the hook.
+        self.assertTrue(TpuOOTPlatform.drain_device_queue_after_request())
+        self.assertFalse(Platform.drain_device_queue_after_request())
 
     def test_subgroup_collectives_need_every_rank(self):
         self.assertFalse(TpuOOTPlatform.supports_rank_subset_collectives())
@@ -185,6 +193,103 @@ class TestCompileDefaults(CustomTestCase):
             self.assertFalse(torch._dynamo.config.automatic_dynamic_shapes)
         base_init.assert_called_once_with()
         install.assert_called_once_with()
+
+
+_CACHE_TAG = "spmd-safe-regions-v1"
+
+
+def _torch_tpu_stubs(spmd_safe=None):
+    names = (
+        "torch_tpu",
+        "torch_tpu._internal",
+        "torch_tpu._internal.distributed",
+        "torch_tpu._internal.distributed.spmd_util",
+    )
+    stubs = {name: ModuleType(name) for name in names}
+    if spmd_safe is not None:
+        stubs[names[-1]].spmd_safe = spmd_safe
+    return stubs
+
+
+class TestTpuSpmdRegionWrapper(CustomTestCase):
+    def test_wrapper_tags_the_compile_cache_once(self):
+        spmd_safe = object()
+        with (
+            patch.dict(sys.modules, _torch_tpu_stubs(spmd_safe)),
+            compiler_config.patch(cache_key_tag="user"),
+        ):
+            # Once per compiled model: Wan2.2-A14B compiles two transformers.
+            for _ in range(2):
+                self.assertIs(TpuOOTPlatform().prepare_spmd_region_wrapper(), spmd_safe)
+            self.assertEqual(compiler_config.cache_key_tag, f"user|{_CACHE_TAG}")
+
+    def test_torch_tpu_without_spmd_safe_leaves_regions_unwrapped(self):
+        # spmd_safe is a private torch_tpu API: without it, regions compile
+        # with split collectives and the cache key keeps its tags.
+        with (
+            patch.dict(sys.modules, _torch_tpu_stubs()),
+            compiler_config.patch(cache_key_tag="user"),
+        ):
+            self.assertIsNone(TpuOOTPlatform().prepare_spmd_region_wrapper())
+            self.assertEqual(compiler_config.cache_key_tag, "user")
+
+    @unittest.skipUnless(importlib.util.find_spec("torch_tpu"), "requires torch_tpu")
+    def test_wrapper_is_torch_tpu_spmd_safe(self):
+        from torch_tpu._internal.distributed.spmd_util import spmd_safe
+
+        with compiler_config.patch(cache_key_tag=""):
+            self.assertIs(TpuOOTPlatform().prepare_spmd_region_wrapper(), spmd_safe)
+
+
+class TestTpuFusionBarrier(CustomTestCase):
+    # Only .device.type is read, so a stand-in needs no TPU device.
+    _TPU_TENSOR = SimpleNamespace(device=SimpleNamespace(type="tpu"))
+
+    def test_host_tensors_pass_through(self):
+        x = torch.arange(4.0)
+        with patch.object(torch.compiler, "is_compiling", return_value=True):
+            self.assertIs(TpuOOTPlatform.fusion_barrier(x), x)
+
+    def test_compiled_tpu_tensors_take_the_torch_tpu_barrier(self):
+        x = self._TPU_TENSOR
+        barrier = MagicMock(return_value=["barrier"])
+        tpu_module = SimpleNamespace(ops=SimpleNamespace(optimization_barrier=barrier))
+        with (
+            patch.object(torch, "tpu", tpu_module, create=True),
+            patch.object(torch.compiler, "is_compiling", return_value=True),
+        ):
+            self.assertEqual(TpuOOTPlatform.fusion_barrier(x), "barrier")
+        barrier.assert_called_once_with([x])
+
+
+class TestFusionBarrierOnDevice(CustomTestCase):
+    def test_values_pass_through_eager_and_a_compiled_graph(self):
+        import torch_tpu._internal.compile  # noqa: F401
+        from torch._dynamo.backends.registry import lookup_backend
+
+        TpuOOTPlatform.set_device(TpuOOTPlatform.get_local_torch_device())
+        x = (torch.randn(256, 512) * 3).bfloat16().to("tpu")
+        # Eager runs op by op: there is no fusion to block, so no copy either.
+        self.assertIs(TpuOOTPlatform.fusion_barrier(x), x)
+
+        targets = []
+        tpu_backend = lookup_backend("tpu")
+
+        def recording_backend(gm, example_inputs):
+            targets.extend(str(node.target) for node in gm.graph.nodes)
+            return tpu_backend(gm, example_inputs)
+
+        def mlp_act(t):
+            h = torch.nn.functional.gelu(t, approximate="tanh")
+            return TpuOOTPlatform.fusion_barrier(h) * 2
+
+        compiled = torch.compile(
+            mlp_act, backend=recording_backend, dynamic=False, fullgraph=True
+        )
+        torch.testing.assert_close(
+            compiled(x).cpu(), mlp_act(x).cpu(), rtol=1.6e-2, atol=1e-2
+        )
+        self.assertTrue(any("optimization_barrier" in t for t in targets), targets)
 
 
 class TestWorkerRuntimePatches(CustomTestCase):

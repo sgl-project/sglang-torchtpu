@@ -104,6 +104,12 @@ class TestTpuQwen306bSinglehostSmoke(CustomTestCase):
         data = resp.json()
         self.assertIn("model_path", data)
 
+    def test_dynamo_is_default_compile_tracer(self):
+        resp = requests.get(f"{self.base_url}/server_info", timeout=30)
+        self.assertEqual(resp.status_code, 200)
+        state = resp.json()["internal_states"][0]
+        self.assertEqual(state["tpu_compile_tracer"], "dynamo")
+
     def test_completion_coherent(self):
         resp = requests.post(
             f"{self.base_url}/v1/completions",

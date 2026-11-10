@@ -178,7 +178,8 @@ def run_files_chip_parallel(
             last_launch[0] = time.monotonic()
 
     work: queue.Queue = queue.Queue()
-    for test in pinned:
+    # Longest first, so a long file does not start last and run alone at the end.
+    for test in sorted(pinned, key=lambda test: -test.est_time):
         work.put(test)
 
     passed: List[str] = []
