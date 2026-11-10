@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import torch
 
+from sglang_tpu.dsv4.rope import cos_sin_rows
 from sglang_tpu.kernels.deepseek_v4.o_projection import wo_a_projection
 from sglang_tpu.kernels.deepseek_v41.csa2.cache import (
     prepare_main_records,
@@ -48,7 +49,7 @@ def _layout_args(layout):
 
 def inverse_rope(cos_sin, positions):
     """EPIC v2/csa2_adapter.py inverse table; CSA2 performs the rotation once."""
-    table = cos_sin[positions].astype(jnp.float32)
+    table = cos_sin_rows(cos_sin, positions).astype(jnp.float32)
     cos = jnp.concatenate(
         (jnp.ones((positions.shape[0], 64)), jnp.repeat(table[:, :32], 2, axis=1)), 1
     )

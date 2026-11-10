@@ -46,6 +46,7 @@ from sglang_tpu.dsv4.dsv4_indexer import (
 from sglang_tpu.dsv4.dsv4_memory_pool import (
     DSV4TPUTokenToKVPool,
     get_or_build_cos_sin_cache,
+    get_or_build_rope_lane_table,
 )
 from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
@@ -156,7 +157,7 @@ def apply_tpu_dsv4_rope(
     if x.shape[0] == 0:
         return x
     cos_sin_cache = (
-        get_or_build_cos_sin_cache(freqs_cis_or_cos_sin)
+        get_or_build_rope_lane_table(freqs_cis_or_cos_sin)
         if freqs_cis_or_cos_sin.is_complex()
         else freqs_cis_or_cos_sin
     )
@@ -249,7 +250,7 @@ def apply_tpu_dsv4_qnorm_rope(
     if q.shape[0] == 0:
         return q
     cos_sin_cache = (
-        get_or_build_cos_sin_cache(freqs_cis_or_cos_sin)
+        get_or_build_rope_lane_table(freqs_cis_or_cos_sin)
         if freqs_cis_or_cos_sin.is_complex()
         else freqs_cis_or_cos_sin
     )
@@ -900,7 +901,14 @@ class DSV4TPUAttnBackend(
             if hasattr(module, "freqs_cis"):
                 freqs_cis = module.freqs_cis
                 if isinstance(freqs_cis, torch.Tensor) and freqs_cis.is_complex():
-                    cos_sin = get_or_build_cos_sin_cache(freqs_cis)
+                    # RoPE users take the lane-packed table: torch_tpu stores a
+                    # [max_pos, 64] one transposed, which costs a full-table
+                    # relayout per Pallas call. The compressor and indexer
+                    # kernels keep the plain table they already hold.
+                    if getattr(module, "_tpu_caches_ready", False):
+                        cos_sin = get_or_build_cos_sin_cache(freqs_cis)
+                    else:
+                        cos_sin = get_or_build_rope_lane_table(freqs_cis)
                     if isinstance(module, torch.nn.Module) and (
                         "freqs_cis" in module._buffers
                     ):
