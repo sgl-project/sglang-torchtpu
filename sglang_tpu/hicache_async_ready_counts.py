@@ -31,12 +31,12 @@ if TYPE_CHECKING:
 
 ReadyCounts = tuple[int, int, tuple[int, ...], tuple["PoolName", ...]]
 # cache -> (works, counts, digest, pool names) of its in-flight reduce.
-_pending: "weakref.WeakKeyDictionary[UnifiedRadixCache, tuple]" = (
+_pending: weakref.WeakKeyDictionary[UnifiedRadixCache, tuple] = (
     weakref.WeakKeyDictionary()
 )
 
 
-def _all_reduce_attn_groups_async(cache: "UnifiedRadixCache", tensor, op) -> list:
+def _all_reduce_attn_groups_async(cache: UnifiedRadixCache, tensor, op) -> list:
     works = []
     for group in (cache.attn_cp_group, cache.attn_tp_group):
         if group is not None and torch.distributed.get_world_size(group=group) > 1:
@@ -52,7 +52,7 @@ def _all_reduce_attn_groups_async(cache: "UnifiedRadixCache", tensor, op) -> lis
     return works
 
 
-def _local_counts(cache: "UnifiedRadixCache") -> tuple[list[int], tuple]:
+def _local_counts(cache: UnifiedRadixCache) -> tuple[list[int], tuple]:
     cc = cache.cache_controller
     extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
     extra_pool_names = tuple(extra_release_queues) if cache.enable_storage else ()
@@ -80,7 +80,7 @@ def _result(ready_counts: torch.Tensor, digest: int, extra_pool_names) -> ReadyC
     return values[0], values[1], tuple(values[2:-2]), extra_pool_names
 
 
-def deferred_ready_counts(cache: "UnifiedRadixCache") -> ReadyCounts:
+def deferred_ready_counts(cache: UnifiedRadixCache) -> ReadyCounts:
     local_counts, extra_pool_names = _local_counts(cache)
     digest = cache.tree_core.write_back_duplicate_reclaim_digest
     previous = _pending.get(cache)
@@ -111,7 +111,7 @@ def deferred_ready_counts(cache: "UnifiedRadixCache") -> ReadyCounts:
     return drained[0], drained[1], tuple(drained[2:]), extra_pool_names
 
 
-def drain_pending(cache: "UnifiedRadixCache") -> None:
+def drain_pending(cache: UnifiedRadixCache) -> None:
     pending = _pending.pop(cache, None)
     if pending is not None:
         for work in pending[0]:
