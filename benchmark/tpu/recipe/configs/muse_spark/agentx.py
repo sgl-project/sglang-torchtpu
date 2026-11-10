@@ -106,8 +106,9 @@ def compile_bs(running, verify, adaptive):
     the megakernel's 8-row tiles exactly (above 8 requests only multiples of 4);
     other counts pad up to the next bucket."""
     if running == 16 and adaptive:
-        # 9-11 decoding requests get their own programs instead of padding to 12.
-        return [*range(1, 13), 16]
+        # Cover every decode batch size up to 16 so no step ever triggers
+        # bucket padding or eager F.pad fallbacks.
+        return [*range(1, 17)]
     buckets = [1] + [
         b for b in range(2, running) if b * verify % 8 == 0 and (b <= 8 or b % 4 == 0)
     ]
@@ -179,6 +180,8 @@ def config_for(
             # Write-through copies KV to the host once cached, so a device
             # eviction never waits for a write-back.
             "hicache_write_policy": "write_through" if large else "write_back",
+            # Silence per-request aiohttp access logs while preserving warnings.
+            "log_level_http": "warning",
         }
     )
     if large:
@@ -267,6 +270,22 @@ def config_for(
             "TPU_PREMAPPED_BUFFER_SIZE": "4294967296",
             # Outlast AIPerf's pooled keep-alive connections (300 s).
             "SGLANG_TIMEOUT_KEEP_ALIVE": "900",
+            # Clear base TORCH_LOGS (+recompiles) after warmup freezes compilation.
+            "TORCH_LOGS": None,
+            # CPU affinity and host dispatch optimizations (AOT wrapper, guard filter,
+            # split exec direct call, graph-attr params, and safe frozen decode skip).
+            "SGLANG_SET_CPU_AFFINITY": "1",
+            "SGLANG_TPU_ENABLE_SCHEDULER_THREAD_PINNING": "1",
+            "SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER": "1",
+            "SGLANG_TPU_AOT_LEAN_RUNTIME_WRAPPER": "1",
+            "SGLANG_TPU_SPLIT_EXEC_DIRECT_CALL": "1",
+            "SGLANG_TPU_DYNAMO_PARAMS_AS_GRAPH_ATTRS": "2",
+            "SGLANG_TPU_DECODE_SKIP_GUARD_EVAL": "1",
+            # Muse shared dense MLP / RoPE roll and RPA softmax/ones_v kernel fastpaths.
+            "SGLANG_TPU_MUSE_SHARED_DENSE": "1",
+            "SGLANG_TPU_RPA_EXP2_SOFTMAX": "1",
+            "SGLANG_TPU_RPA_ONES_V": "1",
+            "SGLANG_TPU_MUSE_ROPE_ROLL": "1",
         }
     )
     if large:
@@ -296,6 +315,7 @@ def config_for(
     if simulate_acceptance:
         env.update(
             {
+                "SGLANG_TPU_ALLOW_SPEC_RECOMPILE": "0",
                 "SGLANG_SIMULATE_ACC_LEN": GOLDEN_AL[verify - 1],
                 "SGLANG_SIMULATE_ACC_METHOD": "match-expected",
                 "SGLANG_SIMULATE_ACC_TOKEN_MODE": "real-draft-token",
