@@ -74,6 +74,7 @@ export SGLANG_TPU_ASYNC_COPY_WORKER=0
 export SGLANG_TPU_DECODE_SKIP_GUARD_EVAL=1
 export SGLANG_TPU_DYNAMO_PARAMS_AS_GRAPH_ATTRS=2
 export SGLANG_TPU_EAGER_MODE=DEFER_AND_FUSE
+export SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT=1
 export SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL=1
 export SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV=1
 export SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER=1
@@ -134,6 +135,7 @@ default; the Kimi-K3 ones are described in [Kimi-K3 TPU deployment](/cookbook/au
 | `--attention-backend pallas_tpu_mla_sparse` | Sparse MLA with the DSA indexer on the 24 indexed layers. |
 | `--kv-cache-dtype fp8_e4m3` | fp8 MLA KV cache. |
 | `--max-total-tokens 4000000` | An upper bound only: the pool is sized by `--mem-fraction-static`, about 532K tokens on 16 chips. MLA KV and DSA index keys are replicated on every rank. |
+| `SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT` | Each of the 32 ranks attends only its own slice of a prefill chunk, with all 96 heads: a Pallas all-to-all moves the queries and outputs, so each selected KV row is gathered by one rank instead of all 32. Cuts cold TTFT by 21-23% at 32K-128K. |
 | `SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL` | Query-blocked sparse MLA prefill for the DSA layers. |
 | `SGLANG_TPU_VL_TEXT_ONLY_EXTEND` | Compiles only the token-id prefill graphs (text serving), which saves host memory at startup. |
 | `SGLANG_TPU_TWOLEVEL_ALLREDUCE_SPLIT_BARRIER`, `SGLANG_TPU_K3_QKVG_PREFETCH`, `SGLANG_TPU_K3_LATENT_UP_ATTN_RES`, `SGLANG_TPU_K3_OPROJ_ROW` | Per-op decode kernels (all-reduce barrier split, KDA qkvg weight prefetch, attention residual fused into latent-up, row-split o_proj). |
