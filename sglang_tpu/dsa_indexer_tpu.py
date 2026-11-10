@@ -178,7 +178,7 @@ _PALLAS_DSA_INDEX_TOPK_SPLIT_OP = None
 def build_dsa_index_topk_split_op():
     """Register the token-split indexer step as a torch custom op, once.
 
-    SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT: same as ``dsa_index_topk`` (it stores
+    DSA indexer token split: same as ``dsa_index_topk`` (it stores
     the keys of every token), but it scores and selects only the query rows
     ``[row_start, row_start + row_count)`` and returns ``i32[row_count,
     topk]``. ``row_start`` is a device tensor (this rank's TP rank times
@@ -525,7 +525,7 @@ def build_dsa_kpool_topk_op():
 def build_dsa_kpool_topk_split_op():
     """Register the token-split pooled indexer step as a torch custom op, once.
 
-    SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT for the pooled indexer: same as
+    DSA indexer token split for the pooled indexer: same as
     ``dsa_kpool_topk`` (it stores every token's raw key and closes every pool),
     but it scores only the query rows ``[row_start, row_start + row_count)``
     and returns their picked pools, ``i32[row_count, topk // kpool]``. The

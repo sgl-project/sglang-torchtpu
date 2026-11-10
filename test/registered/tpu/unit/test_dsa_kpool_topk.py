@@ -195,7 +195,7 @@ class TestKpoolIndexerStep(CustomTestCase):
         np.testing.assert_array_equal(outs[1], outs[0])
 
     def test_token_split_matches_unsplit(self):
-        # SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT on one device: every rank's window
+        # The DSA indexer token split on one device: every rank's window
         # (R = ceil(T / tp) rounded up to 8 rows, as the backend splits) picks
         # pools; put together in rank order and expanded, they must be the
         # unsplit rows bit for bit. Two 4096-token prefill chunks (the second

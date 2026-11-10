@@ -287,14 +287,12 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         self._init_indexer_token_split()
 
     def _init_indexer_token_split(self) -> None:
-        """Set up SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT (attn-TP > 1)."""
+        """Set up the DSA indexer token split (always on with attn-TP > 1)."""
         self._idx_split_group = None
         self._idx_split_size = 1
         self._idx_split_min_tokens = 0
         self._index_topk_split_op = None
         self._kpool_expand_op = None
-        if not tpu_envs.SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT.get():
-            return
         from sglang.srt.runtime_context import get_parallel
 
         parallel = get_parallel()
@@ -345,10 +343,6 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         rows = -(-num_tokens // tp)  # ceil
         rows = -(-rows // 8) * 8
         if rows < _TOKEN_SPLIT_MIN_ROWS_PER_RANK:
-            return 0
-        # The all-reduce buffer is [tp, rows, topk] int32 per DSA layer
-        # ([tp, rows, topk // kpool] for the pooled indexer): bound it.
-        if rows > tpu_envs.SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT_MAX_ROWS.get():
             return 0
         return rows
 
@@ -464,7 +458,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         key_store: str,
         split_rows: int,
     ) -> torch.Tensor:
-        """index_topk with SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT.
+        """index_topk with the DSA indexer token split.
 
         Every rank stores the index keys of all tokens (each keeps the full
         index-key cache) and selects the rows of its own token slice
@@ -568,7 +562,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         kpool: int,
         split_rows: int,
     ) -> torch.Tensor:
-        """index_topk_kpool with SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT.
+        """index_topk_kpool with the DSA indexer token split.
 
         Every rank stores all tokens' raw keys and closes all pools (each
         keeps the full caches), and scores only its own token slice

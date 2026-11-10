@@ -175,8 +175,8 @@ def kpool_indexer_step(
     raw_cache, pooled_cache). Rows list sequence-relative token positions: the
     selected pools' tokens, then the tail, then -1.
 
-    ``row_count`` > 0 (with ``row_start``) is the token split
-    (SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT): every token's raw key is stored and
+    ``row_count`` > 0 (with ``row_start``) is the DSA indexer token split
+    (attention_pallas_mla_sparse.py): every token's raw key is stored and
     every closing pool compressed, as without it, but only query rows
     ``[row_start, row_start + row_count)`` are scored, and the first output is
     those rows' picked pools, ``i32[row_count, topk // kpool]`` (chosen pools
