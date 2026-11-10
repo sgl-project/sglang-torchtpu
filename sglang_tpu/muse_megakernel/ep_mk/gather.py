@@ -13,6 +13,7 @@ The dense matmuls read only this rank's columns of the replicated wpool / wunpoo
 """
 
 import os
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -75,18 +76,21 @@ class EPGatherExperts:
 
     def layer_moe(self, step: EPLayerStep) -> None:
         c, S, p = step.c, step.S, self.plan
-        with _phase("router"):
-            step.router()
-            route.own_topk(c, p, S, step.smr, (0, c.rows, 0))
-            _places(c, p, S, step.n_live, step.me)
-        with _phase("pool"):
-            _pool(step)
-        with _phase("items"):
-            n_items = _build_items(c, p, S, step.n_live)
+        n_items = []
+
+        def routing() -> None:  # under the pooled columns' all-gather
+            with _phase("router"):
+                step.router()
+                route.own_topk(c, p, S, step.smr, (0, c.rows, 0))
+                _places(c, p, S, step.n_live, step.me)
+            with _phase("items"):
+                n_items.append(_build_items(c, p, S, step.n_live))
+
+        _pool(step, routing)
         S["eg_u"][...] = jnp.zeros(S["eg_u"].shape, f32)
         with _phase("experts"):
             expert_loop(
-                step, p, n_items, lambda: None, x_src="ep_xo", emit=_emit(step, p)
+                step, p, n_items[0], lambda: None, x_src="ep_xo", emit=_emit(step, p)
             )
         with _phase("u_rs"):
             _u_reduce(step)
@@ -154,19 +158,30 @@ def _wait(tmpl, n: int) -> None:
         tmpl.wait()
 
 
+# all-gathers of steps from this many rows relay through the partner core: measured 2-4%
+# faster steps from 48 rows, 1.6-2.4% slower at 16 (latency-bound, one more hop)
+PAIR_AG_MIN_ROWS = 48
+
+
 def _pair_ag(c: MKConfig) -> bool:
     """All-gathers relay through the partner core (4 chips x 2 cores: half the ICI bytes);
-    SGLANG_TPU_EP_GATHER_PAIR_AG=0 sends to every peer directly (A/B, read at trace time)."""
-    return c.tp == 8 and os.environ.get("SGLANG_TPU_EP_GATHER_PAIR_AG", "1") != "0"
+    SGLANG_TPU_EP_GATHER_PAIR_MIN_ROWS overrides the row bound (A/B, read at trace time)."""
+    lo = int(
+        os.environ.get("SGLANG_TPU_EP_GATHER_PAIR_MIN_ROWS", str(PAIR_AG_MIN_ROWS))
+    )
+    return c.tp == 8 and c.rows >= lo
 
 
-def _all_gather(c: MKConfig, S: dict, me, buf, ph: int) -> None:
-    """buf[me] (filled here) into every rank's buf[me]."""
+def _all_gather(
+    c: MKConfig, S: dict, me, buf, ph: int, overlap: Callable[[], None] | None = None
+) -> None:
+    """buf[me] (filled here) into every rank's buf[me]; overlap() runs once the own block is
+    on its way."""
     rsem, ssem = S["eg_rsems"].at[ph], S["eg_ssems"].at[ph]
+    if _pair_ag(c):
+        _all_gather_pair(S, me, buf, ph, overlap)
+        return
     with _phase(_PH_NAMES[ph]):
-        if _pair_ag(c):
-            _all_gather_pair(S, me, buf, ph)
-            return
         for d in range(1, c.tp):
             pltpu.make_async_remote_copy(
                 src_ref=buf.at[me],
@@ -175,11 +190,16 @@ def _all_gather(c: MKConfig, S: dict, me, buf, ph: int) -> None:
                 recv_sem=rsem,
                 device_id=((me + d) % c.tp,),
             ).start()
+    if overlap is not None:
+        overlap()
+    with _phase(_PH_NAMES[ph] + "_wait"):
         _wait(pltpu.make_async_copy(buf.at[0], buf.at[0], rsem), c.tp - 1)
         _wait(pltpu.make_async_copy(buf.at[0], buf.at[0], ssem), c.tp - 1)
 
 
-def _all_gather_pair(S: dict, me, buf, ph: int) -> None:
+def _all_gather_pair(
+    S: dict, me, buf, ph: int, overlap: Callable[[], None] | None
+) -> None:
     """Own block to the partner core and to the same core of the 3 other chips; each block
     from another chip is relayed to the partner on arrival."""
     core, chip, partner = me % 2, me // 2, jnp.bitwise_xor(me, 1)
@@ -198,16 +218,20 @@ def _all_gather_pair(S: dict, me, buf, ph: int) -> None:
         pltpu.make_async_copy(buf.at[0], buf.at[0], psem.at[k]).wait()
 
     far = [2 * jnp.bitwise_xor(chip, d) + core for d in (1, 2, 3)]
-    send(me, partner)
-    for k in far:
-        send(me, k)
-    for k in far:
-        arrived(k)
-        send(k, partner)
-    arrived(partner)
-    for k in far:
-        arrived(jnp.bitwise_xor(k, 1))
-    _wait(pltpu.make_async_copy(buf.at[0], buf.at[0], ssem), 7)
+    with _phase(_PH_NAMES[ph]):
+        send(me, partner)
+        for k in far:
+            send(me, k)
+    if overlap is not None:
+        overlap()
+    with _phase(_PH_NAMES[ph] + "_wait"):
+        for k in far:
+            arrived(k)
+            send(k, partner)
+        arrived(partner)
+        for k in far:
+            arrived(jnp.bitwise_xor(k, 1))
+        _wait(pltpu.make_async_copy(buf.at[0], buf.at[0], ssem), 7)
 
 
 def _local_copy(S: dict, src, dst) -> None:
@@ -417,9 +441,9 @@ def _emit(step: EPLayerStep, p: EPPlan):
     return emit
 
 
-def _pool(step: EPLayerStep) -> None:
+def _pool(step: EPLayerStep, overlap: Callable[[], None]) -> None:
     """ep_xo: every row's pooled, pre-expert-normed bf16 expert input (pairs); this rank
-    computes He / tp pooled columns and all-gathers them."""
+    computes He / tp pooled columns and all-gathers them, overlap() under the all-gather."""
     c, S, smr, me = step.c, step.S, step.smr, step.me
     H, He, tp, RT = c.hidden, c.expert_hidden, c.tp, c.row_tile
     W = He // tp
@@ -433,20 +457,21 @@ def _pool(step: EPLayerStep) -> None:
     def put(n0, y):
         pag.at[me][...] = _pack_bf16x2(y)
 
-    stream_matmul(
-        c,
-        S,
-        step.W["wpool"],
-        step.layer,
-        lambda k0, n: S["lhs"][:, pl.ds(k0, n)],
-        S["eg_sc"][pl.ds(0, 1), pl.ds(0, W)],
-        H,
-        W,
-        put,
-        n_off=me * W,
-        tn=W,
-    )
-    _all_gather(c, S, me, pag, PH_PAG)
+    with _phase("pool"):
+        stream_matmul(
+            c,
+            S,
+            step.W["wpool"],
+            step.layer,
+            lambda k0, n: S["lhs"][:, pl.ds(k0, n)],
+            S["eg_sc"][pl.ds(0, 1), pl.ds(0, W)],
+            H,
+            W,
+            put,
+            n_off=me * W,
+            tn=W,
+        )
+    _all_gather(c, S, me, pag, PH_PAG, overlap)
     pre = _row(smr, "pre_expert_w", He)
     for t in range(c.rows // RT):
         rows = pl.ds(t * RT, RT)
