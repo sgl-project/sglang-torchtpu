@@ -310,7 +310,18 @@ def config_for(
             raise ValueError(
                 "the experimental spec worker has no adaptive verify width"
             )
-        env["SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER"] = "1"
+        env.update(
+            {
+                "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
+                # Host launch path at low batch: Dynamo guards only the forward
+                # inputs, and since the worker never compiles after warmup, the
+                # frozen draft/verify forwards evaluate only the guards that pick
+                # a precompiled graph (cc=1: 6.05 -> 5.60 ms per step).
+                "SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER": "1",
+                "SGLANG_TPU_ALLOW_SPEC_RECOMPILE": "0",
+                "SGLANG_TPU_DECODE_SKIP_GUARD_EVAL": "1",
+            }
+        )
     if simulate_acceptance:
         env.update(
             {
