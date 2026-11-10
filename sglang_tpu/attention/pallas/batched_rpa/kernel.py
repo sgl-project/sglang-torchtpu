@@ -680,17 +680,19 @@ def create_allocs(
         index_map=lambda i: (i,),
         pipeline_mode=pl.Buffered(buffer_count=cfgs.n_buffer, use_lookahead=True),
     )
+    q_buffers = cfgs.serve.qo_buffers or cfgs.n_buffer
+    o_buffers = cfgs.serve.qo_buffers or 2
     q_spec = pl.BlockSpec(
         block_shape=cfgs.q_vmem_shape,
         memory_space=pltpu.VMEM,
         index_map=lambda i: (i,),
-        pipeline_mode=pl.Buffered(buffer_count=cfgs.n_buffer, use_lookahead=True),
+        pipeline_mode=pl.Buffered(buffer_count=q_buffers, use_lookahead=True),
     )
     o_spec = pl.BlockSpec(
         block_shape=cfgs.q_vmem_shape,
         memory_space=pltpu.VMEM,
         index_map=lambda i: (i,),
-        pipeline_mode=pl.Buffered(buffer_count=2, use_lookahead=False),
+        pipeline_mode=pl.Buffered(buffer_count=o_buffers, use_lookahead=False),
     )
 
     if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
@@ -708,14 +710,14 @@ def create_allocs(
     q_alloc = bref_override.BatchingQRef.input(
         spec=q_spec,
         dtype_or_type=o_hbm_ref,
-        buffer_count=cfgs.n_buffer,
+        buffer_count=q_buffers,
         use_lookahead=True,
         cfgs=cfgs,
     )
     o_alloc = bref_override.BatchingORef.output(
         spec=o_spec,
         dtype_or_type=o_hbm_ref,
-        buffer_count=2,
+        buffer_count=o_buffers,
         use_lookahead=False,
         cfgs=cfgs,
     )

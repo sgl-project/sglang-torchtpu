@@ -122,6 +122,9 @@ class ServingConfigs:
     transposed_s_bf16: bool = False
     # Profiling: the grid step body and the full / masked tiles as named trace regions.
     trace_regions: bool = False
+    # Pipeline buffers of the q and output blocks (None: n_buffer and 2). One buffer
+    # each frees VMEM for a larger q block; a q block is fetched once per its k steps.
+    qo_buffers: int | None = None
 
     @property
     def pages_per_seq(self) -> int:
