@@ -4034,14 +4034,45 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self._merge_spec_input(other)
 
+    def _spec_rows_relayed_on_host(self) -> bool:
+        """Whether a TPU spec relay rebuilds the filtered rows before the next forward.
+
+        With spec_info.future_indices set, TpuSpecVerifyInput.from_batch
+        re-uploads req_pool_indices from the host mirror at the bucket and
+        resolve_seq_lens_cpu re-gathers seq_lens from the FutureMap, and the
+        future indices are the pool rows themselves (BucketState.key). The
+        device gathers below would then only be read for their shape.
+        """
+        return (
+            self.spec_info is not None
+            and self.spec_info.relays_rows_on_host
+            and self.spec_info.future_indices is not None
+            and self.seq_lens_cpu is not None
+        )
+
     def _filter_model_inputs(self, keep_indices, keep_indices_device):
         """Filter model-facing rows after the host pool-index mirror is updated."""
 
         def keep(t):
             return t[keep_indices if t.device.type == "cpu" else keep_indices_device]
 
-        self.req_pool_indices = keep(self.req_pool_indices)
-        self.seq_lens = keep(self.seq_lens)
+        if self._spec_rows_relayed_on_host():
+            # A device gather at the live size compiles one XLA program per
+            # (old, new) batch-size pair, about 4 ms each on the scheduler
+            # thread at every batch shrink. The host mirrors already hold the
+            # rows (seq_lens_cpu is re-resolved before the forward), and an
+            # H2D upload at a live size is warmed by the spec worker.
+            self.req_pool_indices = self.req_pool_indices_cpu.to(
+                self.req_pool_indices.dtype
+            ).to(self.device, non_blocking=True)
+            self.seq_lens = (
+                self.seq_lens_cpu[keep_indices]
+                .to(self.seq_lens.dtype)
+                .to(self.device, non_blocking=True)
+            )
+        else:
+            self.req_pool_indices = keep(self.req_pool_indices)
+            self.seq_lens = keep(self.seq_lens)
         self.orig_seq_lens = keep(self.orig_seq_lens)
         if self.input_ids is not None:
             self.input_ids = self.input_ids[keep_indices_device]
@@ -4055,6 +4086,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
 
     def _filter_spec_input(self, keep_indices, keep_indices_device):
+        if self._spec_rows_relayed_on_host():
+            # The TPU relay's future indices are the pool rows: hand it the
+            # re-uploaded rows instead of a per-pair device gather.
+            self.spec_info.filter_batch(
+                new_indices=keep_indices_device,
+                new_indices_cpu=keep_indices,
+                future_indices=self.req_pool_indices,
+            )
+            return
         self.spec_info.filter_batch(
             new_indices=keep_indices_device, new_indices_cpu=keep_indices
         )

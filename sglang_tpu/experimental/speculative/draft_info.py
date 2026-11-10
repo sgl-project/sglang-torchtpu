@@ -29,6 +29,10 @@ class HostPaddedDraftInput(SpecInput):
     """
 
     SPEC_INPUT_TYPE: ClassVar[SpecInputType]
+    # ScheduleBatch.filter_batch on TPU: the relay rebuilds pool rows, lengths
+    # and future indices from host mirrors before the next forward, so the
+    # batch re-uploads them instead of gathering per (old, new) batch size.
+    relays_rows_on_host: ClassVar[bool] = True
     # Per-request tensors a subclass relays; filter/merge slice them before FutureMap owns the rows.
     RELAYED_FIELDS: ClassVar[tuple[str, ...]] = ("bonus_tokens", "new_seq_lens")
     # Page-addressed attention can reserve KV without materializing token slots.

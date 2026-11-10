@@ -422,6 +422,12 @@ class SpecInput(ABC):
     # Algorithm-specific dataclass subclasses can override this per input.
     cuda_graph_compatible: bool = True
 
+    # TPU relay inputs (sglang_tpu HostPaddedDraftInput) rebuild the batch's
+    # pool rows, lengths and future indices from host mirrors before the next
+    # forward; ScheduleBatch.filter_batch then re-uploads them instead of
+    # gathering per (old, new) batch size on device.
+    relays_rows_on_host: bool = False
+
     # Per-request verify lengths for the ragged-verify graphs (see
     # sglang.srt.speculative.ragged_verify); verify inputs of algorithms with
     # supports_ragged_verify() override it per step. Must stay a class-level
