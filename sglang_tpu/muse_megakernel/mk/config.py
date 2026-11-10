@@ -177,7 +177,7 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     tiled_vmem_pads: bool = False
     # row-tiled VMEM-pads passes run as one loop over row tiles, not unrolled per tile
     tile_loops: bool = False
-    # VMEM-Y at 240-256 rows: one yrow buffer; final_norm, attn_buf and f_send borrow buffers
+    # VMEM-Y at 240-256 rows: half-row yrow buffers; several buffers borrow others
     vmem_trim: bool = False
     tiled_fold: bool = False
     attn_opt: int = 0

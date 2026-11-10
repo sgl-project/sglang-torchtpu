@@ -399,7 +399,7 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
         ]
     if vy < 2:
         items += [
-            ("yrow", vmem((1 if c.vmem_trim else 2, tp, 1, K, yw), u32)),
+            ("yrow", vmem((2, tp // 2 if c.vmem_trim else tp, 1, K, yw), u32)),
             ("yrow_sems", pltpu.SemaphoreType.DMA((2,))),
         ]
     return items
