@@ -175,6 +175,13 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     tiled_vmem_y: int = 0
     tiled_o_rot: bool = False
     tiled_vmem_pads: bool = False
+    # row-tiled VMEM-pads passes run as one loop over row tiles, not unrolled per tile
+    tile_loops: bool = False
+    # VMEM-Y at 240-256 rows: half-row yrow buffers; several buffers borrow others
+    vmem_trim: bool = False
+    # row-tiled VMEM pads: the o and f all-gathers go out per row tile as the tile is written
+    # and the residual passes wait per tile (needs trim_sems off for the per-tile semaphores)
+    pipe_ag: bool = False
     tiled_fold: bool = False
     attn_opt: int = 0
     # fp8 SAL global attention on steps of more than 64 attention rows per request: each ring
@@ -476,6 +483,18 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
             and not (
                 self.single_row_coll
                 and self.n_req * self.rows_per_req <= self.few_rows_max
+            )
+            # pair o_rs with streamed Y: one row off by ~25% at layer 3 of the 192- and
+            # 256-row numerics cases (deterministic; VMEM Y and plain o_rs pass)
+            and not (self.pair_o_rs and self.tiled_vmem_pads and self.tiled_vmem_y == 0)
+            and not (
+                self.pipe_ag
+                and (
+                    self.trim_sems
+                    or not self.tiled_vmem_pads
+                    or self.fold_o
+                    or self.fold_f
+                )
             )
             and self.expert_chunk % 8 == 0
             and self.expert_chunk >= self.compact_rows

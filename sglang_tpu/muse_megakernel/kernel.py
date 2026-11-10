@@ -157,10 +157,13 @@ from sglang_tpu.muse_megakernel.mk.scratch import (  # noqa: F401
     _alias_attn_p_ysend,
     _alias_oag_into_f,
     _alias_pads_into_y,
+    _alias_pool_ysend,
     _alias_tiled_ids_kv,
     _alias_tiled_obuf_ysend,
     _alias_tiled_padu_attn,
+    _alias_tiled_xfull_attn,
     _alias_tiled_xfull_q,
+    _alias_u_xfull,
     _attn_p_rows,
     _attn_p_ysend_streams,
     _can_w2_attn_scratch,
@@ -169,6 +172,7 @@ from sglang_tpu.muse_megakernel.mk.scratch import (  # noqa: F401
     _use_attn_p_fp8,
     scratch_plan,
     scratch_vmem_bytes,
+    yrow_ring,
 )
 from sglang_tpu.muse_megakernel.mk.stream import (  # noqa: F401
     _WeightStream,
@@ -196,6 +200,10 @@ from sglang_tpu.muse_megakernel.mk.weights import (  # noqa: F401
     permute_expert_slab_kperm,
     permute_weights_kperm,
 )
+
+_PIPE_AG = {"o_ag": 0, "f": 1, "u": 2}
+# vmem_trim: the combine ring's first xfull row (u_send holds rows [0, rows per device <= 32))
+Y_XFULL_ROW0 = 32
 
 
 def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
@@ -279,6 +287,18 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                 .bitcast(jnp.float32)
                 .at[:, pl.ds(0, c.q_dim)]
             )
+        if _alias_tiled_xfull_attn(c):
+            S["attn_buf"] = (
+                S["xfull"].bitcast(jnp.float32).at[:, pl.ds(c.q_dim, c.q_dim)]
+            )
+        if c.vmem_trim:
+            assert not (c.fold_f or c.fold_o)
+            S["final_norm"] = S["smalls"].at[1 - (c.n_layers - 1) % 2, pl.ds(0, 8)]
+            S["f_send"] = S["o_send"]
+            # lifetimes: o_ag, then the pool all-gather, then f_ag (u_send: after the experts)
+            S["pool_send"] = S["o_send"].at[:, pl.ds(0, c.expert_hidden_local // 2)]
+        if _alias_u_xfull(c):
+            S["u_send"] = S["xfull"].at[pl.ds(0, c.rows_per_dev)]
         if _alias_tiled_ids_kv(c):
             S["kb_s"] = S["ids_v"].bitcast(jnp.float32)
             S["vb_s"] = S["wsel_v"]
@@ -288,6 +308,12 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                 S["ysend"]
                 .reshape(ob_n, (R * K) // ob_n, yw)
                 .at[:, pl.ds(0, R), pl.ds(0, Hl // 2)]
+            )
+        if _alias_pool_ysend(c):
+            S["pad_pool"] = (
+                S["ysend"]
+                .reshape(c.tp, (R * K) // c.tp, yw)
+                .at[:, pl.ds(0, R), pl.ds(0, c.expert_hidden_local // 2)]
             )
         n_live = meta_ref[0]
         tp_rank = meta_ref[1]
@@ -953,6 +979,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
             window must start at a multiple of 8.
             """
+            if n % 8 == 0:  # callers' r0 is a multiple of n
+                return ref[pl.ds(pl.multiple_of(r0, 8), n), :]
             return (
                 jnp.concatenate([ref[pl.ds(r0 + t, 1), :] for t in range(n)], axis=0)
                 if n > 1
@@ -2469,73 +2497,90 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             # before the qkv matvec)
             @pl.when(j + 1 < n_req_live)
             def _():
-                kv_prologue(geo, l, j + 1)
+                with _scope("kv_prologue"):
+                    kv_prologue(geo, l, j + 1)
 
             # the request's own new rows (causal within a verify block), padded to a sublane
             # tile (a 1-row operand does not lower), filler keys masked. Padded pools: key rows
             # (h, t); packed: the projection rows as they are, heads side by side.
-            q8 = -(-q // 8) * 8
-            krows = rows_at(S["kb_s"], r0, q).astype(jnp.bfloat16)
-            vrows = rows_at(S["vb_s"], r0, q).astype(jnp.bfloat16)
-            if c.packed_attn:
-                zrows = (
-                    jnp.zeros((q8 - q, c.kv_dim), jnp.bfloat16) if q8 > q else None
-                )  # Mosaic has no 0-row vectors
-                kn = jnp.concatenate([krows, zrows], axis=0) if q8 > q else krows
-                vn = jnp.concatenate([vrows, zrows], axis=0) if q8 > q else vrows
-                nt = jax.lax.broadcasted_iota(jnp.int32, (1, q8), 1)
-                head_ok = True
-            else:
-                zrows = jnp.zeros((q8 - q, hd), jnp.bfloat16) if q8 > q else None
-                kn = jnp.concatenate(
-                    [
-                        x
-                        for h in range(hkv)
-                        for x in [krows[:, h * hd : (h + 1) * hd]]
-                        + ([zrows] if q8 > q else [])
-                    ],
-                    axis=0,
+            with _scope("own_rows"):
+                q8 = -(-q // 8) * 8
+                krows = rows_at(S["kb_s"], r0, q).astype(jnp.bfloat16)
+                vrows = rows_at(S["vb_s"], r0, q).astype(jnp.bfloat16)
+                if c.packed_attn:
+                    zrows = (
+                        jnp.zeros((q8 - q, c.kv_dim), jnp.bfloat16) if q8 > q else None
+                    )  # Mosaic has no 0-row vectors
+                    kn = jnp.concatenate([krows, zrows], axis=0) if q8 > q else krows
+                    vn = jnp.concatenate([vrows, zrows], axis=0) if q8 > q else vrows
+                    nt = jax.lax.broadcasted_iota(jnp.int32, (1, q8), 1)
+                    head_ok = True
+                else:
+                    zrows = jnp.zeros((q8 - q, hd), jnp.bfloat16) if q8 > q else None
+                    kn = jnp.concatenate(
+                        [
+                            x
+                            for h in range(hkv)
+                            for x in [krows[:, h * hd : (h + 1) * hd]]
+                            + ([zrows] if q8 > q else [])
+                        ],
+                        axis=0,
+                    )
+                    vn = jnp.concatenate(
+                        [
+                            x
+                            for h in range(hkv)
+                            for x in [vrows[:, h * hd : (h + 1) * hd]]
+                            + ([zrows] if q8 > q else [])
+                        ],
+                        axis=0,
+                    )
+                    ncol = jax.lax.broadcasted_iota(jnp.int32, (1, hkv * q8), 1)
+                    nt = ncol % q8
+                    head_ok = ncol // q8 == rowhead
+                newpos = jnp.zeros(nt.shape, jnp.int32) + 2**30
+                for t in range(q):
+                    newpos = jnp.where(nt == t, pos_ref[r0 + t], newpos)
+                live_new = head_ok & (newpos <= rowpos)
+                in_win = _in_window(is_global, rowpos - newpos < c.window)
+                if in_win is not None:
+                    live_new = live_new & in_win
+                s_ = jax.lax.dot_general(
+                    q2, kn, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
                 )
-                vn = jnp.concatenate(
-                    [
-                        x
-                        for h in range(hkv)
-                        for x in [vrows[:, h * hd : (h + 1) * hd]]
-                        + ([zrows] if q8 > q else [])
-                    ],
-                    axis=0,
+                if sc != 1.0:
+                    s_ = s_ * sc
+                _, lsum, acc = online(carry, jnp.where(live_new, s_, NEG), vn)
+                res = acc / jnp.maximum(lsum, 1e-30)  # [hkv*qg, hd or pd]
+                lanes = (
+                    (lambda h: slice(h * hd, (h + 1) * hd))
+                    if c.packed_attn
+                    else (lambda h: slice(0, hd))
                 )
-                ncol = jax.lax.broadcasted_iota(jnp.int32, (1, hkv * q8), 1)
-                nt = ncol % q8
-                head_ok = ncol // q8 == rowhead
-            newpos = jnp.zeros(nt.shape, jnp.int32) + 2**30
-            for t in range(q):
-                newpos = jnp.where(nt == t, pos_ref[r0 + t], newpos)
-            live_new = head_ok & (newpos <= rowpos)
-            in_win = _in_window(is_global, rowpos - newpos < c.window)
-            if in_win is not None:
-                live_new = live_new & in_win
-            s_ = jax.lax.dot_general(
-                q2, kn, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
-            )
-            if sc != 1.0:
-                s_ = s_ * sc
-            _, lsum, acc = online(carry, jnp.where(live_new, s_, NEG), vn)
-            res = acc / jnp.maximum(lsum, 1e-30)  # [hkv*qg, hd or pd]
-            lanes = (
-                (lambda h: slice(h * hd, (h + 1) * hd))
-                if c.packed_attn
-                else (lambda h: slice(0, hd))
-            )
-            for t in range(q):
-                S["attn_buf"][pl.ds(r0 + t, 1), :] = jnp.concatenate(
-                    [
-                        res[h * qg + t * g + gi : h * qg + t * g + gi + 1, lanes(h)]
-                        for h in range(hkv)
-                        for gi in range(g)
-                    ],
-                    axis=1,
-                )
+                if "attn_stage" in S and res.shape[1] == LANE:
+                    # rows (t, gi) of each head: one strided [q, hd] load and store per
+                    # (head, group) instead of q row-by-row concatenations
+                    stage = S["attn_stage"]
+                    stage[...] = res
+                    for h in range(hkv):
+                        for gi in range(g):
+                            S["attn_buf"][
+                                pl.ds(pl.multiple_of(r0, 8), q),
+                                pl.ds((h * g + gi) * hd, hd),
+                            ] = stage[pl.ds(h * qg + gi, q, stride=g), :][:, lanes(h)]
+                else:
+                    for t in range(q):
+                        S["attn_buf"][pl.ds(r0 + t, 1), :] = jnp.concatenate(
+                            [
+                                res[
+                                    h * qg + t * g + gi : h * qg + t * g + gi + 1,
+                                    lanes(h),
+                                ]
+                                for h in range(hkv)
+                                for gi in range(g)
+                            ],
+                            axis=1,
+                        )
 
         # ------------------------------------------------------------ MoE
         Rc = c.rows_per_dev
@@ -3575,6 +3620,15 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
             jax.lax.fori_loop(0, NT, body, 0)
 
+        def vpads_tiles(fn):
+            """fn(rows, t) per row tile of a VMEM-pads pass: one runtime loop under
+            tile_loops (unrolled tiles keep their own VMEM temporaries), else unrolled."""
+            if c.tile_loops:
+                for_tiles(fn)
+                return
+            for t in range(NT):
+                fn(pl.ds(t * RT, RT), t)
+
         def dma(src, dst, i):
             cp = pltpu.make_async_copy(src, dst, tsem(i))
             cp.start()
@@ -3697,6 +3751,103 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             for d in range(1, c.tp):
                 rcopy(src, pad.at[0], coll._peer(d), kind).wait_send()
 
+        # pipe_ag: pair_ag's two-stage all-gather per row tile. A tile goes to the same core
+        # of the three other chips as it is written; the consumer forwards each chip's tile to
+        # its pair partner one tile ahead of its own use.
+        p_core, p_chip = me % 2, me // 2
+        p_partner = jnp.bitwise_xor(me, 1)
+
+        def hag_cross(kind, src, pad, t, tsems, d):
+            rows = rows_of(t)
+            return pltpu.make_async_remote_copy(
+                src_ref=src.at[rows],
+                dst_ref=pad.at[me, rows],
+                send_sem=S["tc_ssems"].at[_TC[kind]],
+                recv_sem=tsems.at[t],
+                device_id=(2 * jnp.bitwise_xor(p_chip, d) + p_core,),
+            )
+
+        def hag_fwd(kind, pad, t, ptsems, ck):
+            rows = rows_of(t)
+            return pltpu.make_async_remote_copy(
+                src_ref=pad.at[2 * ck + p_core, rows],
+                dst_ref=pad.at[2 * ck + p_core, rows],
+                send_sem=S["ag_fwd_sems"].at[_PIPE_AG[kind]],
+                recv_sem=ptsems.at[t],
+                device_id=(p_partner,),
+            )
+
+        def hag_start(kind, src, pad, t, tsems):
+            """Producer: row tile t of src into pad[me] here and on the other chips."""
+            pad[me, rows_of(t)] = src[rows_of(t)]
+            for d in (1, 2, 3):
+                hag_cross(kind, src, pad, t, tsems, d).start()
+
+        def hag_forward(kind, src, pad, tsems, t, ptsems):
+            """Waits for tile t from the other chips, then forwards this core's four to the partner."""
+            for d in (1, 2, 3):
+                hag_cross(kind, src, pad, t, tsems, d).wait_recv()
+            for ck in range(4):
+                hag_fwd(kind, pad, t, ptsems, ck).start()
+
+        def hag_ready(kind, pad, t, ptsems):
+            for ck in range(4):
+                hag_fwd(kind, pad, t, ptsems, ck).wait_recv()
+
+        # pipe_u: the u all-gather in 8-row tiles of each owner block, sent as combine writes
+        # them; the forwards and waits come after the combine loop
+        pipe_u = bool(c.pipe_ag and c.tiled_vmem_y < 2 and c.rows_per_dev % 8 == 0)
+        n_ut = c.rows_per_dev // 8
+
+        def u_rows(j):
+            return pl.ds(pl.multiple_of(j * 8, 8), 8)
+
+        def u_cross(j, d):
+            return pltpu.make_async_remote_copy(
+                src_ref=S["u_send"].at[u_rows(j)],
+                dst_ref=S["pad_u"].at[me, u_rows(j)],
+                send_sem=S["tc_ssems"].at[_TC["u"]],
+                recv_sem=S["uag_tsems"].at[j],
+                device_id=(2 * jnp.bitwise_xor(p_chip, d) + p_core,),
+            )
+
+        def u_fwd(j, ck):
+            return pltpu.make_async_remote_copy(
+                src_ref=S["pad_u"].at[2 * ck + p_core, u_rows(j)],
+                dst_ref=S["pad_u"].at[2 * ck + p_core, u_rows(j)],
+                send_sem=S["ag_fwd_sems"].at[_PIPE_AG["u"]],
+                recv_sem=S["uag_ptsems"].at[j],
+                device_id=(p_partner,),
+            )
+
+        def u_start(j):
+            S["pad_u"][me, u_rows(j)] = S["u_send"][u_rows(j)]
+            for d in (1, 2, 3):
+                u_cross(j, d).start()
+
+        def u_finish():
+            """Every owner block's tiles here: cross arrivals forwarded, forwards received."""
+            for j in range(n_ut):
+                for d in (1, 2, 3):
+                    u_cross(j, d).wait_recv()
+                for ck in range(4):
+                    u_fwd(j, ck).start()
+            for j in range(n_ut):
+                for ck in range(4):
+                    u_fwd(j, ck).wait_recv()
+            for j in range(n_ut):
+                for d in (1, 2, 3):
+                    u_cross(j, d).wait_send()
+                for ck in range(4):
+                    u_fwd(j, ck).wait_send()
+
+        def hag_sent(kind, src, pad, tsems, ptsems):
+            for t in range(NT):
+                for d in (1, 2, 3):
+                    hag_cross(kind, src, pad, t, tsems, d).wait_send()
+                for ck in range(4):
+                    hag_fwd(kind, pad, t, ptsems, ck).wait_send()
+
         def ag_start(kind, src, dst, live=None):
             """src (VMEM) into dst, the same HBM region on every device; returns the wait.
 
@@ -3785,12 +3936,13 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     )
                 return count, key
 
-            count, key = jax.lax.fori_loop(
-                0,
-                R // R_ct,
-                count_tile,
-                (jnp.zeros((1, Ep), f32), jnp.full((1, Ep), big, f32)),
-            )
+            with _scope("route_count"):
+                count, key = jax.lax.fori_loop(
+                    0,
+                    R // R_ct,
+                    count_tile,
+                    (jnp.zeros((1, Ep), f32), jnp.full((1, Ep), big, f32)),
+                )
             present = count > 0
             split = c.split_rows
             mult = 2 if split else 1
@@ -3885,10 +4037,12 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     )
                 return running + jnp.sum(onehot, axis=0, keepdims=True)
 
-            jax.lax.fori_loop(0, NT, perm_tile, jnp.zeros((1, Ep), f32))
-            cp = pltpu.make_async_copy(rv, S["route_s"], S["route_sem"].at[0])
-            cp.start()
-            cp.wait()
+            with _scope("route_perm"):
+                jax.lax.fori_loop(0, NT, perm_tile, jnp.zeros((1, Ep), f32))
+            with _scope("route_dma"):
+                cp = pltpu.make_async_copy(rv, S["route_s"], S["route_sem"].at[0])
+                cp.start()
+                cp.wait()
             return S["route_s"][4 * NB, 0]
 
         def mv_tiled(l, name, nxt, smr, col_off=None, on_col=None):
@@ -3959,9 +4113,11 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                 p_alpha = psmr[SMALL["ffn_alpha"] : SMALL["ffn_alpha"] + 1, :H]
                 p_beta = psmr[SMALL["ffn_beta"] : SMALL["ffn_beta"] + 1, :H]
                 p_pfw = psmr[SMALL["post_ffn_w"] : SMALL["post_ffn_w"] + 1, :H]
-                for t in range(R // RT):
-                    rs = pl.ds(t * RT, RT)
+
+                def _fold_lhs(rs, t):
                     S["lhs"][rs] = (p_alpha * S["h_stream"][rs] * g_pa).astype(bf16)
+
+                vpads_tiles(_fold_lhs)
                 S["fold_v"][0:1, :] = p_beta * p_pfw * g_pa
                 wait_block, finish = f_blocks()
                 with _scope("qkvg_fold"):
@@ -3976,24 +4132,55 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     )["wqkvg"]
                 finish()
                 wq_sc = smr[SMALL["wqkvg_s"] : SMALL["wqkvg_s"] + 1, : c.qkvg_dim]
-                for t in range(R // RT):
-                    r0, r1 = t * RT, (t + 1) * RT
-                    rs = pl.ds(r0, RT)
-                    y = gathered_tile(S["pad_f"].at[:, rs]) * p_pfw
-                    s_f = jax.lax.rsqrt(
-                        jnp.mean(jnp.square(y), axis=-1, keepdims=True) + c.post_eps
+                if c.tile_loops:
+                    # per-row scales from one loop; the partial sums combine as values after it
+                    def _fold_q(rs, t):
+                        y = gathered_tile(S["pad_f"].at[:, rs]) * p_pfw
+                        s_f = jax.lax.rsqrt(
+                            jnp.mean(jnp.square(y), axis=-1, keepdims=True) + c.post_eps
+                        )
+                        s = p_alpha * S["h_stream"][rs] + p_beta * (y * s_f).astype(
+                            bf16
+                        ).astype(f32)
+                        capture_tile(l - 1, rs, s)
+                        S["h_stream"][rs] = s
+                        r_inv = jax.lax.rsqrt(
+                            jnp.mean(jnp.square(s), axis=-1, keepdims=True) + c.rms_eps
+                        )
+                        S["fold_stage"][rs, pl.ds(0, LANE)] = jnp.broadcast_to(
+                            s_f, (RT, LANE)
+                        )
+                        S["fold_stage"][rs, pl.ds(LANE, LANE)] = jnp.broadcast_to(
+                            r_inv, (RT, LANE)
+                        )
+
+                    for_tiles(_fold_q)
+                    s_f_all = S["fold_stage"][:, pl.ds(0, 1)]
+                    r_inv_all = S["fold_stage"][:, pl.ds(LANE, 1)]
+                    S["acc"][:, pl.ds(0, c.qkvg_dim)] = (
+                        r_inv_all * (acc_q[:R] + s_f_all * acc_q[R:]) * wq_sc
                     )
-                    s = p_alpha * S["h_stream"][rs] + p_beta * (y * s_f).astype(
-                        bf16
-                    ).astype(f32)
-                    capture_tile(l - 1, rs, s)
-                    S["h_stream"][rs] = s
-                    r_inv = jax.lax.rsqrt(
-                        jnp.mean(jnp.square(s), axis=-1, keepdims=True) + c.rms_eps
-                    )
-                    S["acc"][rs, pl.ds(0, c.qkvg_dim)] = (
-                        r_inv * (acc_q[r0:r1] + s_f * acc_q[R + r0 : R + r1]) * wq_sc
-                    )
+                else:
+                    for t in range(R // RT):
+                        r0, r1 = t * RT, (t + 1) * RT
+                        rs = pl.ds(r0, RT)
+                        y = gathered_tile(S["pad_f"].at[:, rs]) * p_pfw
+                        s_f = jax.lax.rsqrt(
+                            jnp.mean(jnp.square(y), axis=-1, keepdims=True) + c.post_eps
+                        )
+                        s = p_alpha * S["h_stream"][rs] + p_beta * (y * s_f).astype(
+                            bf16
+                        ).astype(f32)
+                        capture_tile(l - 1, rs, s)
+                        S["h_stream"][rs] = s
+                        r_inv = jax.lax.rsqrt(
+                            jnp.mean(jnp.square(s), axis=-1, keepdims=True) + c.rms_eps
+                        )
+                        S["acc"][rs, pl.ds(0, c.qkvg_dim)] = (
+                            r_inv
+                            * (acc_q[r0:r1] + s_f * acc_q[R + r0 : R + r1])
+                            * wq_sc
+                        )
             elif c.fold_f:
                 with _scope("qkvg_mv"):
                     acc_q = ws.mv_fold(
@@ -4249,14 +4436,16 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         o_pair_cp(b_p).wait()
                     if c.combine_loop and R > 64:
                         for b_p in range(4):
-                            for t in range(R // RT):
-                                rs = pl.ds(t * RT, RT)
+
+                            def _tile(rs, t, b_p=b_p):
                                 obuf.at[b_p][rs] = _pack_bf16x2(
                                     _unpack_bf16x2(
                                         S["xfull"][rs, pl.ds(b_p * (Hl // 2), Hl // 2)]
                                     )
                                     + _unpack_bf16x2(S["pad_o_rs"][b_p, rs])
                                 )
+
+                            vpads_tiles(_tile)
                     else:
                         for b_p in range(4):
                             obuf[b_p] = _pack_bf16x2(
@@ -4281,13 +4470,21 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         cp.wait_send()
                     for cp in ors_cps:
                         cp.wait_recv()
-                    for t in range(R // RT):
-                        rs = pl.ds(t * RT, RT)
+
+                    def _tile(rs, t):
                         mine = _unpack_bf16x2(S["pad_o_rs"][4, rs])
                         for d in range(5, 8):
                             mine = mine + _unpack_bf16x2(S["pad_o_rs"][d, rs])
                         S["o_send"][rs] = _pack_bf16x2(mine)
-                    if c.fold_o:
+                        if c.pipe_ag:
+                            hag_start(
+                                "o_ag", S["o_send"], S["pad_o_ag"], t, S["oag_tsems"]
+                            )
+
+                    vpads_tiles(_tile)
+                    if c.pipe_ag:
+                        pass  # sent per tile above
+                    elif c.fold_o:
                         coll.all_gather_blocks_start(
                             "o_ag", S["o_send"], me, S["o_rsems"]
                         )
@@ -4307,13 +4504,25 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         o_rc(0, coll._peer(d)).wait_recv()
 
                     if c.tiled_vmem_pads:
-                        for t in range(R // RT):
-                            rs = pl.ds(t * RT, RT)
+
+                        def _tile(rs, t):
                             mine = _unpack_bf16x2(S["pad_o_rs"][0, rs])
                             for d in range(1, c.tp):
                                 mine = mine + _unpack_bf16x2(S["pad_o_rs"][d, rs])
                             S["o_send"][rs] = _pack_bf16x2(mine)
-                        if c.fold_o:
+                            if c.pipe_ag:
+                                hag_start(
+                                    "o_ag",
+                                    S["o_send"],
+                                    S["pad_o_ag"],
+                                    t,
+                                    S["oag_tsems"],
+                                )
+
+                        vpads_tiles(_tile)
+                        if c.pipe_ag:
+                            pass  # sent per tile above
+                        elif c.fold_o:
                             coll.all_gather_blocks_start(
                                 "o_ag", S["o_send"], me, S["o_rsems"]
                             )
@@ -4461,9 +4670,11 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                 g_pf = smr[SMALL["pre_ffn_w"] : SMALL["pre_ffn_w"] + 1, :H]
                 a_alpha = smr[SMALL["attn_alpha"] : SMALL["attn_alpha"] + 1, :H]
                 a_beta = smr[SMALL["attn_beta"] : SMALL["attn_beta"] + 1, :H]
-                for t in range(R // RT):
-                    rs = pl.ds(t * RT, RT)
+
+                def _fold_lhs_o(rs, t):
                     S["lhs"][rs] = (a_alpha * S["h_stream"][rs] * g_pf).astype(bf16)
+
+                vpads_tiles(_fold_lhs_o)
                 S["fold_v"][0:1, :] = a_beta * g_pf
                 wait_block, finish = o_blocks()
                 names = ("wpool", "wrouter")
@@ -4479,37 +4690,77 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     )
                 finish()
                 wp_sc = smr[SMALL["wpool_s"] : SMALL["wpool_s"] + 1, :Hel]
-                for t in range(R // RT):
-                    r0, r1 = t * RT, (t + 1) * RT
-                    rs = pl.ds(r0, RT)
-                    a_val = gathered_tile(S["pad_o_ag"].at[:, rs])
-                    s_a = jax.lax.rsqrt(
-                        jnp.mean(jnp.square(a_val), axis=-1, keepdims=True) + c.post_eps
-                    )
-                    s = a_alpha * S["h_stream"][rs] + a_beta * (a_val * s_a).astype(
-                        bf16
-                    ).astype(f32)
-                    S["h_stream"][rs] = s
-                    r_inv = jax.lax.rsqrt(
-                        jnp.mean(jnp.square(s), axis=-1, keepdims=True) + c.rms_eps
-                    )
-                    pooled_t = (
+                if c.tile_loops:
+                    # per-row scales from one loop; the partial sums combine as values after it
+                    def _fold_pr(rs, t):
+                        a_val = gathered_tile(S["pad_o_ag"].at[:, rs])
+                        s_a = jax.lax.rsqrt(
+                            jnp.mean(jnp.square(a_val), axis=-1, keepdims=True)
+                            + c.post_eps
+                        )
+                        s = a_alpha * S["h_stream"][rs] + a_beta * (a_val * s_a).astype(
+                            bf16
+                        ).astype(f32)
+                        S["h_stream"][rs] = s
+                        r_inv = jax.lax.rsqrt(
+                            jnp.mean(jnp.square(s), axis=-1, keepdims=True) + c.rms_eps
+                        )
+                        S["fold_stage"][rs, pl.ds(0, LANE)] = jnp.broadcast_to(
+                            s_a, (RT, LANE)
+                        )
+                        S["fold_stage"][rs, pl.ds(LANE, LANE)] = jnp.broadcast_to(
+                            r_inv, (RT, LANE)
+                        )
+
+                    for_tiles(_fold_pr)
+                    s_a_all = S["fold_stage"][:, pl.ds(0, 1)]
+                    r_inv_all = S["fold_stage"][:, pl.ds(LANE, 1)]
+                    pooled = (
                         (
-                            r_inv
-                            * (
-                                acc_pr["wpool"][r0:r1]
-                                + s_a * acc_pr["wpool"][R + r0 : R + r1]
-                            )
+                            r_inv_all
+                            * (acc_pr["wpool"][:R] + s_a_all * acc_pr["wpool"][R:])
                             * wp_sc
                         )
                         .astype(bf16)
                         .astype(f32)
                     )
-                    S["pool_send"][rs] = _pack_bf16x2(pooled_t)
-                    S["acc"][rs, pl.ds(0, Ep)] = r_inv * (
-                        acc_pr["wrouter"][r0:r1]
-                        + s_a * acc_pr["wrouter"][R + r0 : R + r1]
+                    S["pool_send"][...] = _pack_bf16x2(pooled)
+                    S["acc"][:, pl.ds(0, Ep)] = r_inv_all * (
+                        acc_pr["wrouter"][:R] + s_a_all * acc_pr["wrouter"][R:]
                     )
+                else:
+                    for t in range(R // RT):
+                        r0, r1 = t * RT, (t + 1) * RT
+                        rs = pl.ds(r0, RT)
+                        a_val = gathered_tile(S["pad_o_ag"].at[:, rs])
+                        s_a = jax.lax.rsqrt(
+                            jnp.mean(jnp.square(a_val), axis=-1, keepdims=True)
+                            + c.post_eps
+                        )
+                        s = a_alpha * S["h_stream"][rs] + a_beta * (a_val * s_a).astype(
+                            bf16
+                        ).astype(f32)
+                        S["h_stream"][rs] = s
+                        r_inv = jax.lax.rsqrt(
+                            jnp.mean(jnp.square(s), axis=-1, keepdims=True) + c.rms_eps
+                        )
+                        pooled_t = (
+                            (
+                                r_inv
+                                * (
+                                    acc_pr["wpool"][r0:r1]
+                                    + s_a * acc_pr["wpool"][R + r0 : R + r1]
+                                )
+                                * wp_sc
+                            )
+                            .astype(bf16)
+                            .astype(f32)
+                        )
+                        S["pool_send"][rs] = _pack_bf16x2(pooled_t)
+                        S["acc"][rs, pl.ds(0, Ep)] = r_inv * (
+                            acc_pr["wrouter"][r0:r1]
+                            + s_a * acc_pr["wrouter"][R + r0 : R + r1]
+                        )
                 pool_wait = coll.all_gather_start("pool", S["pool_send"], tp_rank)
             else:
                 with _scope("pool_mv"):
@@ -4632,8 +4883,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
             with _scope("ex_setup"):
                 if vpads:
-                    for t in range(R // RT):
-                        rs = pl.ds(t * RT, RT)
+
+                    def _tile(rs, t):
                         x = _rms(
                             gathered_tile(S["pad_pool"].at[:, rs]), c.rms_eps, pre_w
                         ).astype(bf16)
@@ -4643,6 +4894,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             xsc_ref[rs] = jnp.broadcast_to(xsc, (RT, LANE))
                         else:
                             S["xfull"][rs] = _pack_bf16x2(x.astype(f32))
+
+                    vpads_tiles(_tile)
                 else:
 
                     def xfull_tile(rows, t, v):
@@ -5181,15 +5434,16 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     CH = 8 if use_bd_chunk else min(c.expert_chunk, R)
 
                     def full_one(nrows):
-                        run_ffn_and_store(
-                            nrows,
-                            lambda j: perm_at(off + jnp.minimum(j, cnt - 1)),
-                            slot,
-                            e,
-                            False,
-                            off,
-                            cnt,
-                        )
+                        with _scope(f"ex_f{nrows}"):
+                            run_ffn_and_store(
+                                nrows,
+                                lambda j: perm_at(off + jnp.minimum(j, cnt - 1)),
+                                slot,
+                                e,
+                                False,
+                                off,
+                                cnt,
+                            )
 
                     def chunk(ch, carry_):
                         run_ffn_and_store(
@@ -5205,7 +5459,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         return carry_
 
                     def run_chunks():
-                        jax.lax.fori_loop(0, (cnt + CH - 1) // CH, chunk, 0)
+                        with _scope("ex_fch"):
+                            jax.lax.fori_loop(0, (cnt + CH - 1) // CH, chunk, 0)
 
                     def bd_chunk_step(ch, carry_):
                         run_ffn_and_store(
@@ -5549,28 +5804,60 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         u = jnp.sum(ynorm * wk_rc, axis=1)  # [Rc, He]
                         S["u_send"][...] = _pack_bf16x2(u)
                 else:
+                    # pad_y rows stream through a ring of NB buffers of YP parts per row (tp / YP
+                    # sources each), NB - 1 parts in flight: one row ahead left the DMA latency
+                    # exposed (y_row_wait 25.8 of combine's 40 us/layer at 256 rows of 8)
+                    YP, NB = yrow_ring(c)
+                    hs = c.tp // YP
+                    n_units = Rc * YP
+                    assert not c.vmem_trim or (
+                        Rc <= Y_XFULL_ROW0 and Y_XFULL_ROW0 + NB * hs * K <= R
+                    )
 
-                    def ycopy(r, b):
-                        return pltpu.make_async_copy(
-                            S["pad_y"].at[:, pl.ds(r, 1)],
-                            S["yrow"].at[b],
-                            S["yrow_sems"].at[b],
-                        )
+                    def ybuf(b, d):
+                        """Source d's [K, yw] slot of ring buffer b: under vmem_trim in xfull rows
+                        past u_send (the expert inputs are dead during combine)."""
+                        if not c.vmem_trim:
+                            return S["yrow"].at[b, d, 0]
+                        r0 = Y_XFULL_ROW0 + (b * hs + d) * K
+                        return S["xfull"].at[
+                            pl.ds(pl.multiple_of(r0, 8), K), pl.ds(0, yw)
+                        ]
 
-                    pl.when(my_live)(ycopy(0, 0).start)
+                    def ycopies(u, b):
+                        r, part = u // YP, u % YP
+                        return [
+                            pltpu.make_async_copy(
+                                S["pad_y"].at[part * hs + d, r],
+                                ybuf(b, d),
+                                S["yrow_sems"].at[b],
+                            )
+                            for d in range(hs)
+                        ]
+
+                    def ystart(u):
+                        for cp in ycopies(u, u % NB):
+                            cp.start()
+
+                    def ywait(u):
+                        with _scope("y_row_wait"):
+                            for cp in ycopies(u, u % NB):
+                                cp.wait()
+
+                    for u0 in range(NB - 1):
+                        pl.when(my_live & (u0 < n_units))(functools.partial(ystart, u0))
 
                     def combine_row(r, carry):
-                        b = r % 2
-
-                        @pl.when(my_live & (r + 1 < Rc))
-                        def _():
-                            ycopy(r + 1, 1 - b).start()
-
-                        pl.when(my_live)(ycopy(r, b).wait)
-                        yr = S["yrow"].at[b]
-                        ysum = _unpack_y(yr[0, 0], c)  # [K, He]
-                        for d in range(1, c.tp):
-                            ysum = ysum + _unpack_y(yr[d, 0], c)
+                        ysum = None
+                        for part in range(YP):
+                            u = r * YP + part
+                            pl.when(my_live)(functools.partial(ywait, u))
+                            pl.when(my_live & (u + NB - 1 < n_units))(
+                                functools.partial(ystart, u + NB - 1)
+                            )
+                            for d in range(hs):
+                                y_d = _unpack_y(ybuf(u % NB, d)[...], c)  # [K, He]
+                                ysum = y_d if ysum is None else ysum + y_d
                         # rows past n_live received nothing (stale HBM): keep them zero
                         ysum = (
                             jnp.where(my_live & (me * Rc + r < n_live), ysum, 0.0)
@@ -5587,15 +5874,22 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             ynorm * S["wk_s"][w_off + r, :, 0:1], axis=0, keepdims=True
                         )
                         S["u_send"][pl.ds(r, 1), :] = _pack_bf16x2(u)
+                        if pipe_u:
+                            pl.when(r % 8 == 7)(functools.partial(u_start, r // 8))
                         return carry
 
-                    jax.lax.fori_loop(0, Rc, combine_row, 0)
+                    with _scope("combine_rows"):
+                        jax.lax.fori_loop(0, Rc, combine_row, 0)
 
             if vpads:
                 with _scope("u_ag"):
-                    padu = coll.all_gather(
-                        "u", S["u_send"], me, live=lambda m: m * Rc < n_live
-                    )
+                    if pipe_u:
+                        u_finish()
+                        padu = S["pad_u"]
+                    else:
+                        padu = coll.all_gather(
+                            "u", S["u_send"], me, live=lambda m: m * Rc < n_live
+                        )
                     if c.combine_loop and R % 16 == 0:
 
                         def _store_u16(r0, raw16):
@@ -5729,16 +6023,23 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
             if vpads:
                 if c.combine_loop and R > 64:
-                    for t in range(R // RT):
-                        rs = pl.ds(t * RT, RT)
+
+                    def _tile(rs, t):
                         S["f_send"][rs] = _pack_bf16x2(
                             S["acc"][rs, pl.ds(0, Hl)].astype(bf16).astype(f32)
                         )
+                        if c.pipe_ag:
+                            hag_start("f", S["f_send"], S["pad_f"], t, S["fag_tsems"])
+
+                    vpads_tiles(_tile)
                 else:
+                    assert not c.pipe_ag
                     S["f_send"][...] = _pack_bf16x2(
                         S["acc"][:, pl.ds(0, Hl)].astype(bf16).astype(f32)
                     )
-                if c.fold_f and nxt is not None:
+                if c.pipe_ag:
+                    pass  # sent per tile above
+                elif c.fold_f and nxt is not None:
                     coll.all_gather_blocks_start(
                         "f", S["f_send"], tp_rank, S["f_rsems"]
                     )
@@ -5790,11 +6091,13 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                 ep.pre_attn(c, S)
             elif not pend:
                 if c.tiled_vmem_pads:
-                    for t in range(R // RT):
-                        rs = pl.ds(t * RT, RT)
+
+                    def _tile(rs, t):
                         S["lhs"][rs] = _rms(
                             S["h_stream"][rs], c.rms_eps, row("pre_attn_w")
                         ).astype(bf16)
+
+                    vpads_tiles(_tile)
                 else:
 
                     def pre_attn_tile(rows, t, v):
@@ -5811,8 +6114,16 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
             if ep is None and not c.fold_o:  # the EP hook's o_proj did it on own rows
                 if c.tiled_vmem_pads:
-                    for t in range(R // RT):
-                        rs = pl.ds(t * RT, RT)
+                    if c.pipe_ag:
+                        o_ag_args = ("o_ag", S["o_send"], S["pad_o_ag"], S["oag_tsems"])
+                        hag_forward(*o_ag_args, 0, S["oag_ptsems"])
+
+                    def _tile(rs, t):
+                        if c.pipe_ag:
+                            pl.when(t + 1 < NT)(
+                                lambda: hag_forward(*o_ag_args, t + 1, S["oag_ptsems"])
+                            )
+                            hag_ready("o_ag", S["pad_o_ag"], t, S["oag_ptsems"])
                         s = row("attn_alpha") * S["h_stream"][rs] + row(
                             "attn_beta"
                         ) * _rms(
@@ -5820,6 +6131,10 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         ).astype(bf16).astype(f32)
                         S["h_stream"][rs] = s
                         S["lhs"][rs] = _rms(s, c.rms_eps, row("pre_ffn_w")).astype(bf16)
+
+                    vpads_tiles(_tile)
+                    if c.pipe_ag:  # o_send (and what borrows it) is reused after this
+                        hag_sent(*o_ag_args, S["oag_ptsems"])
                 else:
                     oag_rdy = ag_tile_ready(S["o_send"], S["pad_o_ag"], S["oag_tsems"])
 
@@ -5899,8 +6214,18 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
                 if not (c.fold_f and nxt is not None):
                     if c.tiled_vmem_pads:
-                        for t in range(R // RT):
-                            rs = pl.ds(t * RT, RT)
+                        if c.pipe_ag:
+                            f_ag_args = ("f", S["f_send"], S["pad_f"], S["fag_tsems"])
+                            hag_forward(*f_ag_args, 0, S["fag_ptsems"])
+
+                        def _tile(rs, t):
+                            if c.pipe_ag:
+                                pl.when(t + 1 < NT)(
+                                    lambda: hag_forward(
+                                        *f_ag_args, t + 1, S["fag_ptsems"]
+                                    )
+                                )
+                                hag_ready("f", S["pad_f"], t, S["fag_ptsems"])
                             s = row("ffn_alpha") * S["h_stream"][rs] + row(
                                 "ffn_beta"
                             ) * _rms(
@@ -5909,6 +6234,10 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             ).astype(bf16).astype(f32)
                             capture_tile(l, rs, s)
                             S["h_stream"][rs] = s
+
+                        vpads_tiles(_tile)
+                        if c.pipe_ag:
+                            hag_sent(*f_ag_args, S["fag_ptsems"])
                     else:
                         fag_rdy = ag_tile_ready(S["f_send"], S["pad_f"], S["fag_tsems"])
 
@@ -5964,13 +6293,15 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             # embedding: weightless RMS norm of the bf16 rows, kept in bf16 precision
             if c.tiled_vmem_pads:
                 dma(emb_ref, S["lhs"], _TS_AUX)
-                for t in range(R // RT):
-                    rs = pl.ds(t * RT, RT)
+
+                def _tile(rs, t):
                     S["h_stream"][rs] = (
                         _rms(S["lhs"][rs].astype(f32), c.rms_eps)
                         .astype(bf16)
                         .astype(f32)
                     )
+
+                vpads_tiles(_tile)
             else:
 
                 def emb_tile(rows, t, v):
@@ -6018,8 +6349,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             if c.tiled_vmem_pads:
                 if ncap == 0:
                     S["btile"][...] = jnp.zeros((RT, H), bf16)
-                for t in range(R // RT):
-                    rs = pl.ds(t * RT, RT)
+
+                def _tile(rs, t):
                     if ncap == 0:
                         dma(S["btile"].at[:, pl.ds(0, LANE)], aux_out.at[rs], _TS_AUX)
                     hidden = _rms(
@@ -6028,6 +6359,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         S["final_norm"][0:1, :],
                     )
                     S["lhs"][rs] = jnp.where(tile_live(t), hidden, 0.0).astype(bf16)
+
+                vpads_tiles(_tile)
                 dma(S["lhs"], hid_out, _TS_OUT)
             else:
 

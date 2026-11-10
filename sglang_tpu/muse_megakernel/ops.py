@@ -801,6 +801,40 @@ class MuseMegakernel(torch.nn.Module):
                     )
                 )
                 plans.append((c_vy, b_vy, _TILED_DEPTH_RING_PREFERENCE, vy != vys[-1]))
+            # QBLOCK, past the VMEM-Y plans above: under tile_loops the LLO temporaries stay
+            # small, so VMEM Y reaches 208 rows of 8 and streamed Y keeps the VMEM pads and pair
+            # collectives up to 256 (q8 cc21 at 32k: 41.4 ms on plain streamed Y, 34.7 ms).
+            if cfg.qblock and cfg.tiled_vmem_pads:
+                loops_budget = (
+                    _dev_int(
+                        "SGLANG_TPU_MUSE_MK_DEV_TILE_LOOPS_BUDGET_MIB",
+                        _TILE_LOOPS_VMEM_BUDGET // 2**20,
+                    )
+                    * 2**20
+                )
+                # rings of <= 3 slots leave the folds no stream depth (K.fold_fits)
+                c_tl = msgspec.structs.replace(
+                    cfg, fold_o=False, fold_f=False, tile_loops=True
+                )
+                vy1 = msgspec.structs.replace(c_tl, tiled_vmem_y=1)
+                vy0 = msgspec.structs.replace(
+                    c_tl,
+                    tiled_vmem_y=0,
+                    tiled_pair_y=0,
+                    y_block_send=False,
+                    attn_streams=min(cfg.attn_streams, 4),
+                    pair_o_rs=False,
+                )
+                plans += [
+                    (vy1, loops_budget, _TILE_LOOPS_RING_PREFERENCE[:1], False),
+                    (
+                        msgspec.structs.replace(vy1, vmem_trim=True),
+                        loops_budget,
+                        _TILE_LOOPS_RING_PREFERENCE,
+                        False,
+                    ),
+                    (vy0, loops_budget, _TILE_LOOPS_RING_PREFERENCE, False),
+                ]
             # The y_block_send VMEM-Y alternative fails the numerics test at 192 rows of 8
             # (layer 4, global attention + fp8 experts: rows off by 25.6% against the CPU
             # reference; the VMEM-Y and streamed-Y plans pass): off unless asked for.
@@ -880,6 +914,7 @@ class MuseMegakernel(torch.nn.Module):
                 if (
                     tiled
                     and base_cfg.tiled_vmem_y >= 1
+                    and not base_cfg.tile_loops
                     and slots
                     <= _dev_int(
                         "SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_SLOTS", _TILED_VY_MIN_SLOTS
@@ -904,6 +939,19 @@ class MuseMegakernel(torch.nn.Module):
                 if K.scratch_vmem_bytes(cand) <= budget:
                     if (cand.fold_f or cand.fold_o) and not K.fold_fits(cand):
                         cand = msgspec.structs.replace(cand, fold_f=False, fold_o=False)
+                    # QBLOCK: the chosen plan's VMEM-pads passes run as loops (bit-identical)
+                    if cand.qblock and cand.row_tile and cand.tiled_vmem_pads:
+                        pipe = (
+                            cand.combine_loop
+                            and cand.rows > 64
+                            and not (cand.fold_o or cand.fold_f)
+                        )
+                        cand = msgspec.structs.replace(
+                            cand,
+                            tile_loops=True,
+                            pipe_ag=pipe,
+                            trim_sems=cand.trim_sems and not pipe,
+                        )
                     return cand
         raise ValueError(
             f"no Muse megakernel ring fits the VMEM budget at {rows} rows of {q}"
@@ -1246,6 +1294,11 @@ def _swa_window_table(kv_sal: bool, n_page_entries: int) -> bool:
 _DEPTH_RING_PREFERENCE = ((3, 11), (3, 6), (3, 5), (3, 4), (1, 4))
 # Row-tiled steps: deepest expert prefetch, then the largest dense ring that fits.
 _TILED_DEPTH_RING_PREFERENCE = tuple((d, s) for d in (3, 1) for s in range(11, 1, -1))
+# tile_loops plans: depth 3, a 3- or 2-slot ring. Their temporaries are small (256 rows of 8,
+# streamed Y: 58.76 MiB declared, 62.50 MiB scoped), but a 6-slot ring overflows the LLO's
+# VMEM (176 rows: 56.13 MiB declared, 78.93 MiB used).
+_TILE_LOOPS_RING_PREFERENCE = ((3, 4), (3, 2))
+_TILE_LOOPS_VMEM_BUDGET = 58 * 2**20
 # Measured device step (real geometry, random routing): the 8-row block-diag variant is
 # slower than the 4-row one at 8-24 rows and faster once expert_split >= 32 rows.
 _COMPACT4_MAX_ROWS = 24

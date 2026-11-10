@@ -180,6 +180,43 @@ def _alias_tiled_padu_attn(c: MKConfig) -> bool:
     )
 
 
+def _alias_tiled_xfull_attn(c: MKConfig) -> bool:
+    """vmem_trim: attn_buf in the xfull columns past qn_s (dead before o_proj writes xfull)."""
+    return bool(
+        c.vmem_trim
+        and _alias_tiled_xfull_q(c)
+        and not _alias_tiled_padu_attn(c)
+        and 2 * c.q_dim <= c.expert_hidden // 2
+    )
+
+
+def _alias_pool_ysend(c: MKConfig) -> bool:
+    """vmem_trim: pad_pool in ysend. Peers write it only after this device's o all-gather
+    (past attn_p and o_buf) and ex_setup reads it before zeroing ysend."""
+    return bool(
+        c.vmem_trim
+        and c.row_tile
+        and c.tiled_vmem_pads
+        and c.tiled_vmem_y >= 1
+        and (c.rows * c.top_k) % c.tp == 0
+        and (c.rows * c.top_k) // c.tp >= c.rows
+        and y_words(c) >= c.expert_hidden_local // 2
+    )
+
+
+def _alias_u_xfull(c: MKConfig) -> bool:
+    """vmem_trim: u_send in xfull's first rows (an 8-row-aligned slice)."""
+    return bool(c.vmem_trim and c.rows_per_dev % 8 == 0)
+
+
+def yrow_ring(c: MKConfig) -> tuple[int, int]:
+    """Combine's pad_y row ring (parts per row, buffers): under tile_loops two rows of bytes
+    in half rows (vmem_trim) or three rows; otherwise two rows."""
+    if not c.tile_loops:
+        return (1, 2)
+    return (2, 4) if c.vmem_trim else (1, 3)
+
+
 def _alias_tiled_ids_kv(c: MKConfig) -> bool:
     return bool(c.row_tile and c.alias_tiled_temps and c.kv_dim == LANE)
 
@@ -230,6 +267,8 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
     nsc = 8 if c.vec_route else R * K + 8
     base = dict(_scratch_plan_base(c))
     use_p_fp8 = _use_attn_p_fp8(c)
+    if c.vmem_trim:
+        base["final_norm"] = vmem((8, LANE), f32)
     if _alias_attn_p_ysend(c):
         base["attn_p"] = vmem(
             (1, 1, 32 if use_p_fp8 else 8, LANE),
@@ -242,13 +281,19 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
     ob_n = 4 if (c.tiled_o_rot or c.pair_o_rs) else 2
     items = [(n, base[n]) for n in _SHARED_SCRATCH] + [
         ("rtab", vmem((R, 2 * c.head_dim), f32)),
+        # a request's attention output rows (h, t, gi), re-read strided per (head, group)
+        *(
+            [("attn_stage", vmem((c.kv_heads * c.rows_per_req * c.g, LANE), f32))]
+            if c.rows_per_req % 8 == 0
+            else []
+        ),
         ("rope_blk", vmem((8, 8, 2 * c.head_dim), f32)),
         ("lhs", vmem((R, H), jnp.bfloat16)),
         ("acc", vmem((R, max(c.qkvg_dim, Hl, Hel, c.n_experts_padded)), f32)),
     ]
     if not _alias_tiled_xfull_q(c):
         items += [("qn_s", vmem((R, c.q_dim), f32))]
-    if not _alias_tiled_padu_attn(c):
+    if not (_alias_tiled_padu_attn(c) or _alias_tiled_xfull_attn(c)):
         items += [("attn_buf", vmem((R, c.q_dim), f32))]
     if not _alias_tiled_ids_kv(c):
         items += [
@@ -260,14 +305,16 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
         ("wsel_v", vmem((R, LANE), f32)),
         ("wk_s", vmem((owner_window_rows(c), K, LANE), f32)),
         ("xfull", vmem((R, He // 2), u32)),
-        ("pool_send", vmem((R, Hel // 2), u32)),
+        # vmem_trim: pool_send is o_send's first columns
+        *([] if c.vmem_trim else [("pool_send", vmem((R, Hel // 2), u32))]),
     ]
     if not _alias_tiled_obuf_ysend(c):
         items += [("o_buf", vmem((ob_n, R, Hl // 2), u32))]
     items += [
         ("o_send", vmem((R, Hl // 2), u32)),
-        ("f_send", vmem((R, Hl // 2), u32)),
-        ("u_send", vmem((Rc, He // 2), u32)),
+        # vmem_trim: f_send is o_send (both all-gathers wait for their sends)
+        *([] if c.vmem_trim else [("f_send", vmem((R, Hl // 2), u32))]),
+        *([] if _alias_u_xfull(c) else [("u_send", vmem((Rc, He // 2), u32))]),
     ]
     if not vpads:
         items += [("bin", vmem((2, RT, H), jnp.bfloat16))]
@@ -302,7 +349,7 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
     n_tc_s = len(_TC_VPADS_S) if (vpads and c.trim_sems) else len(_TC)
     n_tc_r = len(_TC_VPADS_R) if (vpads and c.trim_sems) else len(_TC)
     items += [
-        ("pad_pool", pmem((tp, R, Hel // 2), u32)),
+        *([] if _alias_pool_ysend(c) else [("pad_pool", pmem((tp, R, Hel // 2), u32))]),
         (
             "pad_y",
             (vmem if vy >= 2 else hbm)((tp, Rc, K, yw), u32),
@@ -321,6 +368,18 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
             # pipelined o / f all-gathers: per row tile, each sender's copy signals it
             ("oag_tsems", pltpu.SemaphoreType.DMA((R // RT,))),
             ("fag_tsems", pltpu.SemaphoreType.DMA((R // RT,))),
+            # pipe_ag: the pair-forward stage's receive and send semaphores
+            *(
+                [
+                    ("oag_ptsems", pltpu.SemaphoreType.DMA((R // RT,))),
+                    ("fag_ptsems", pltpu.SemaphoreType.DMA((R // RT,))),
+                    ("ag_fwd_sems", pltpu.SemaphoreType.DMA((3,))),
+                    ("uag_tsems", pltpu.SemaphoreType.DMA((max(Rc // 8, 1),))),
+                    ("uag_ptsems", pltpu.SemaphoreType.DMA((max(Rc // 8, 1),))),
+                ]
+                if c.pipe_ag
+                else []
+            ),
             # pipelined u all-gather: per owner
             ("uag_osems", pltpu.SemaphoreType.DMA((tp,))),
         ]
@@ -346,6 +405,8 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
     if c.fold_f or c.fold_o:
         items += [
             ("fold_v", vmem((8, H), f32)),
+            # tile_loops: the fold passes' per-row scales (s, r_inv)
+            *([("fold_stage", vmem((R, 2 * LANE), f32))] if c.tile_loops else []),
             ("o_rsems", pltpu.SemaphoreType.DMA((tp,))),
             ("f_rsems", pltpu.SemaphoreType.DMA((tp,))),
         ]
@@ -358,8 +419,18 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
         ]
     if vy < 2:
         items += [
-            ("yrow", vmem((2, tp, 1, K, yw), u32)),
-            ("yrow_sems", pltpu.SemaphoreType.DMA((2,))),
+            # vmem_trim: the ring lives in xfull (kernel Y_XFULL_ROW0)
+            *(
+                []
+                if c.vmem_trim
+                else [
+                    (
+                        "yrow",
+                        vmem((yrow_ring(c)[1], tp // yrow_ring(c)[0], 1, K, yw), u32),
+                    )
+                ]
+            ),
+            ("yrow_sems", pltpu.SemaphoreType.DMA((yrow_ring(c)[1],))),
         ]
     return items
 
@@ -379,6 +450,14 @@ def _scratch_plan_base(cfg: MKConfig):
     w2_words = Il // FP4_PACK
     cpt = c.chunk_pages * c.page_size
     sdt = jnp.float8_e4m3fn if c.scale_fp8 else jnp.bfloat16
+    # tile_loops QBLOCK slots hold the K / qblock scale rows the dots read
+    slim = bool(c.qblock and c.tile_loops)
+    s13_rows = max(He // c.qblock, 16) if slim else He // FP4_GROUP
+    s2_rows = (
+        max(Il // c.qblock, 16)
+        if slim
+        else max(Il // FP4_GROUP, 32 if c.scale_fp8 else 16)
+    )
     items = [
         (
             "ring",
@@ -386,14 +465,9 @@ def _scratch_plan_base(cfg: MKConfig):
         ),  # dense weight stream
         ("ring_sems", pltpu.SemaphoreType.DMA((c.ring_slots,))),
         ("w13", pltpu.VMEM((nslot, w13_words, 2 * Il), jnp.uint32)),
-        ("w13s", pltpu.VMEM((nslot, He // FP4_GROUP, 2 * Il), sdt)),
+        ("w13s", pltpu.VMEM((nslot, s13_rows, 2 * Il), sdt)),
         ("w2", pltpu.VMEM((nslot, w2_words, He), jnp.uint32)),
-        (
-            "w2s",
-            pltpu.VMEM(
-                (nslot, max(Il // FP4_GROUP, 32 if c.scale_fp8 else 16), He), sdt
-            ),
-        ),
+        ("w2s", pltpu.VMEM((nslot, s2_rows, He), sdt)),
         ("w13_sems", pltpu.SemaphoreType.DMA((nslot,))),
         ("w13s_sems", pltpu.SemaphoreType.DMA((nslot,))),
         ("w2_sems", pltpu.SemaphoreType.DMA((nslot,))),

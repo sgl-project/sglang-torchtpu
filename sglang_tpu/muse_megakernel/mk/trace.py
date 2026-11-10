@@ -29,6 +29,13 @@ _INNER = frozenset(
         "bd_w2",
         "ex_scatter",
         "ex_accum",
+        "kv_prologue",
+        "own_rows",
+        "y_row_wait",
+        "combine_rows",
+        "route_count",
+        "route_perm",
+        "route_dma",
     )
 )
 
