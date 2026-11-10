@@ -4004,10 +4004,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                 finish()
                 wq_sc = smr[SMALL["wqkvg_s"] : SMALL["wqkvg_s"] + 1, : c.qkvg_dim]
                 if c.tile_loops:
-                    # the fold's two partial sums go through VMEM so the pass is one loop
-                    S["acc"][:, pl.ds(0, c.qkvg_dim)] = acc_q[:R]
-                    S["fold_stage"][:, pl.ds(0, c.qkvg_dim)] = acc_q[R:]
-
+                    # per-row scales from one loop; the partial sums combine as values after it
                     def _fold_q(rs, t):
                         y = gathered_tile(S["pad_f"].at[:, rs]) * p_pfw
                         s_f = jax.lax.rsqrt(
@@ -4021,16 +4018,19 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         r_inv = jax.lax.rsqrt(
                             jnp.mean(jnp.square(s), axis=-1, keepdims=True) + c.rms_eps
                         )
-                        S["acc"][rs, pl.ds(0, c.qkvg_dim)] = (
-                            r_inv
-                            * (
-                                S["acc"][rs, pl.ds(0, c.qkvg_dim)]
-                                + s_f * S["fold_stage"][rs, pl.ds(0, c.qkvg_dim)]
-                            )
-                            * wq_sc
+                        S["fold_stage"][rs, pl.ds(0, LANE)] = jnp.broadcast_to(
+                            s_f, (RT, LANE)
+                        )
+                        S["fold_stage"][rs, pl.ds(LANE, LANE)] = jnp.broadcast_to(
+                            r_inv, (RT, LANE)
                         )
 
                     for_tiles(_fold_q)
+                    s_f_all = S["fold_stage"][:, pl.ds(0, 1)]
+                    r_inv_all = S["fold_stage"][:, pl.ds(LANE, 1)]
+                    S["acc"][:, pl.ds(0, c.qkvg_dim)] = (
+                        r_inv_all * (acc_q[:R] + s_f_all * acc_q[R:]) * wq_sc
+                    )
                 else:
                     for t in range(R // RT):
                         r0, r1 = t * RT, (t + 1) * RT
@@ -4546,15 +4546,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                 finish()
                 wp_sc = smr[SMALL["wpool_s"] : SMALL["wpool_s"] + 1, :Hel]
                 if c.tile_loops:
-                    a_p0, a_r0 = (
-                        2 * Hel,
-                        2 * Hel + Ep,
-                    )  # acc columns past the router output
-                    S["acc"][:, pl.ds(a_p0, Hel)] = acc_pr["wpool"][:R]
-                    S["acc"][:, pl.ds(a_r0, Ep)] = acc_pr["wrouter"][:R]
-                    S["fold_stage"][:, pl.ds(0, Hel)] = acc_pr["wpool"][R:]
-                    S["fold_stage"][:, pl.ds(Hel, Ep)] = acc_pr["wrouter"][R:]
-
+                    # per-row scales from one loop; the partial sums combine as values after it
                     def _fold_pr(rs, t):
                         a_val = gathered_tile(S["pad_o_ag"].at[:, rs])
                         s_a = jax.lax.rsqrt(
@@ -4568,25 +4560,29 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         r_inv = jax.lax.rsqrt(
                             jnp.mean(jnp.square(s), axis=-1, keepdims=True) + c.rms_eps
                         )
-                        pooled_t = (
-                            (
-                                r_inv
-                                * (
-                                    S["acc"][rs, pl.ds(a_p0, Hel)]
-                                    + s_a * S["fold_stage"][rs, pl.ds(0, Hel)]
-                                )
-                                * wp_sc
-                            )
-                            .astype(bf16)
-                            .astype(f32)
+                        S["fold_stage"][rs, pl.ds(0, LANE)] = jnp.broadcast_to(
+                            s_a, (RT, LANE)
                         )
-                        S["pool_send"][rs] = _pack_bf16x2(pooled_t)
-                        S["acc"][rs, pl.ds(0, Ep)] = r_inv * (
-                            S["acc"][rs, pl.ds(a_r0, Ep)]
-                            + s_a * S["fold_stage"][rs, pl.ds(Hel, Ep)]
+                        S["fold_stage"][rs, pl.ds(LANE, LANE)] = jnp.broadcast_to(
+                            r_inv, (RT, LANE)
                         )
 
                     for_tiles(_fold_pr)
+                    s_a_all = S["fold_stage"][:, pl.ds(0, 1)]
+                    r_inv_all = S["fold_stage"][:, pl.ds(LANE, 1)]
+                    pooled = (
+                        (
+                            r_inv_all
+                            * (acc_pr["wpool"][:R] + s_a_all * acc_pr["wpool"][R:])
+                            * wp_sc
+                        )
+                        .astype(bf16)
+                        .astype(f32)
+                    )
+                    S["pool_send"][...] = _pack_bf16x2(pooled)
+                    S["acc"][:, pl.ds(0, Ep)] = r_inv_all * (
+                        acc_pr["wrouter"][:R] + s_a_all * acc_pr["wrouter"][R:]
+                    )
                 else:
                     for t in range(R // RT):
                         r0, r1 = t * RT, (t + 1) * RT
