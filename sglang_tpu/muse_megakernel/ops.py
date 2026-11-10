@@ -785,6 +785,27 @@ class MuseMegakernel(torch.nn.Module):
                     )
                 )
                 plans.append((c_vy, b_vy, _TILED_DEPTH_RING_PREFERENCE, vy != vys[-1]))
+            # QBLOCK: streamed Y keeps the VMEM pads and pair collectives (TP block-256 lost
+            # ~130 us/layer at 160 -> 176 rows of 8 when they went with VMEM Y).
+            if cfg.qblock and cfg.tiled_vmem_pads:
+                plans.append(
+                    (
+                        msgspec.structs.replace(
+                            cfg,
+                            tiled_vmem_y=0,
+                            tiled_pair_y=0,
+                            y_block_send=False,
+                            attn_streams=min(cfg.attn_streams, 4),
+                        ),
+                        _dev_int(
+                            "SGLANG_TPU_MUSE_MK_DEV_VY0_PADS_BUDGET_MIB",
+                            _TILED_VY0_PADS_VMEM_BUDGET // 2**20,
+                        )
+                        * 2**20,
+                        _TILED_VY0_PADS_RING_PREFERENCE,
+                        False,
+                    )
+                )
             # The y_block_send VMEM-Y alternative fails the numerics test at 192 rows of 8
             # (layer 4, global attention + fp8 experts: rows off by 25.6% against the CPU
             # reference; the VMEM-Y and streamed-Y plans pass): off unless asked for.
@@ -1228,6 +1249,9 @@ def _swa_window_table(kv_sal: bool, n_page_entries: int) -> bool:
 _DEPTH_RING_PREFERENCE = ((3, 11), (3, 6), (3, 5), (3, 4), (1, 4))
 # Row-tiled steps: deepest expert prefetch, then the largest dense ring that fits.
 _TILED_DEPTH_RING_PREFERENCE = tuple((d, s) for d in (3, 1) for s in range(11, 1, -1))
+# Streamed-Y plans with VMEM pads: depth 3 and a 3-slot ring at least, as the VMEM-Y plans.
+_TILED_VY0_PADS_RING_PREFERENCE = tuple((3, s) for s in range(11, 3, -1))
+_TILED_VY0_PADS_VMEM_BUDGET = 50 * 2**20
 # Measured device step (real geometry, random routing): the 8-row block-diag variant is
 # slower than the 4-row one at 8-24 rows and faster once expert_split >= 32 rows.
 _COMPACT4_MAX_ROWS = 24
