@@ -130,6 +130,63 @@ def _fp4_qblock_dot(
     return cols[0] if len(cols) == 1 else jnp.concatenate(cols, axis=1)
 
 
+def _qblock_part(
+    x: jax.Array, wslot, sslot, k0: int, K: int, n0: int, tn: int, block: int
+) -> jax.Array:
+    """x [R, K] bf16 @ rows [k0, k0 + K) x columns [n0, n0 + tn) of a block-scaled slab -> f32
+    [R, tn], block by block in _fp4_qblock_dot's order."""
+    acc = None
+    for kk in range(k0, k0 + K, block):
+        w = pltpu.bitcast(
+            wslot[pl.ds(kk // FP4_PACK, block // FP4_PACK), pl.ds(n0, tn)],
+            jnp.float4_e2m1fn,
+        ).astype(jnp.float8_e4m3fn)
+        part = jnp.dot(
+            x[:, kk - k0 : kk - k0 + block], w, preferred_element_type=jnp.float32
+        )
+        s = sslot[pl.ds(kk // block, 1), pl.ds(n0, tn)].astype(jnp.float32)
+        acc = part * s if acc is None else acc + part * s
+    return acc
+
+
+def _fp4_qblock_ffn(
+    x: jax.Array,
+    w13,
+    s13,
+    w2,
+    s2,
+    He: int,
+    Il: int,
+    block: int,
+    wait_w2: Callable[[], None],
+) -> jax.Array:
+    """silu(x @ gate) * (x @ up) @ w2 on block-scaled slabs -> f32 [R, He], bit-identical to
+    the two _fp4_qblock_dot calls. h comes in block columns and w2 takes K block by K block
+    over every column tile, so the MXU streams w2 while the last block's SiLU is in flight;
+    wait_w2 runs after the first h block (a DMA wait is a scheduling barrier)."""
+    xb = x.astype(jnp.bfloat16)
+    hs = []
+    for c0 in range(0, Il, block):
+        g = _qblock_part(xb, w13, s13, 0, He, c0, block, block)
+        u = _qblock_part(xb, w13, s13, 0, He, Il + c0, block, block)
+        hs.append((g * jax.nn.sigmoid(g) * u).astype(jnp.bfloat16))
+        if c0 == 0:
+            wait_w2()
+    tn = min(He, QBLOCK_TN if x.shape[0] <= 32 else QBLOCK_TN // 2)
+    tiles = range(0, He, tn)
+    parts = [
+        [_qblock_part(h, w2, s2, kb * block, block, n0, tn, block) for n0 in tiles]
+        for kb, h in enumerate(hs)
+    ]
+    cols = []
+    for t in range(len(tiles)):
+        y = parts[0][t]
+        for p in parts[1:]:
+            y = y + p[t]
+        cols.append(y)
+    return cols[0] if len(cols) == 1 else jnp.concatenate(cols, axis=1)
+
+
 def _fp4_dot(
     x,
     wslot,

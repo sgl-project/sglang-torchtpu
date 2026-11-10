@@ -90,6 +90,7 @@ from sglang_tpu.muse_megakernel.mk.dots import (  # noqa: F401
     _dequant_fp4_kperm,
     _fp4_blockdiag_dot,
     _fp4_dot,
+    _fp4_qblock_ffn,
     _fp8_dot,
     _scale_rows,
 )
@@ -4752,6 +4753,21 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             def run_ffn_and_store(
                 nrows, pair_fn, slot, e, blockdiag, first, n_valid, wait_w2=True
             ):
+                if c.qblock and kind == "fp4":
+                    pairs = [pair_fn(j) for j in range(nrows)]
+                    y = _fp4_qblock_ffn(
+                        gather_x(pairs),
+                        W13.at[slot],
+                        S["w13s"].at[slot],
+                        W2.at[slot],
+                        S["w2s"].at[slot],
+                        He,
+                        Il,
+                        c.qblock,
+                        lambda: wait_w2_if_needed(slot, wait_w2),
+                    )
+                    ystore(_pack_y(y, c), pairs, first, n_valid)
+                    return
                 can_fp8_x = bool(
                     prequant_x and not blockdiag and nrows >= 32 and nrows % 32 == 0
                 )
