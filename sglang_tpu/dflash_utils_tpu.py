@@ -21,6 +21,7 @@ from sglang.srt.distributed import model_parallel_is_initialized
 from sglang.srt.runtime_context import get_parallel
 from sglang_tpu.kernels.distributed_topk import SUPPORTED_WORLD_SIZES
 from sglang_tpu.spec_op_warmup import (
+    make_dflash_simulated_verify_bookkeeping_args,
     make_dflash_verify_argmax_args,
     make_dflash_verify_bookkeeping_args,
     make_dflash_verify_cache_locs_args,
@@ -231,6 +232,54 @@ def dflash_verify_bookkeeping_torch(
     return accept_len, commit_lens, bonus, out_tokens, new_seq_lens
 
 
+@compiled_op(warmup=make_dflash_simulated_verify_bookkeeping_args)
+def dflash_simulated_verify_bookkeeping_torch(
+    candidates: torch.Tensor,
+    target_predict: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    forced_commit_len_tensor: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused DFlash simulated-acceptance bookkeeping on TPU (`real-draft-token`).
+
+    Avoids host-syncing or running eager overwrite ops per step when
+    `SGLANG_SIMULATE_ACC_LEN` is enabled on TPU.
+    """
+    bs, block_size = candidates.shape
+    device = candidates.device
+
+    forced_commit_scalar = (
+        forced_commit_len_tensor.reshape(1).clamp(1, block_size).to(torch.int32)
+    )
+    commit_lens = (
+        torch.zeros((bs,), dtype=torch.int32, device=device) + forced_commit_scalar
+    )
+    accept_len = commit_lens - 1
+    new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+
+    col_idx = torch.arange(block_size, device=device).unsqueeze(0)
+    accept_len_2d = accept_len.to(torch.int64).unsqueeze(1)
+    bonus = torch.where(
+        col_idx == accept_len_2d,
+        target_predict,
+        torch.zeros_like(target_predict),
+    ).sum(dim=1)
+
+    draft_tokens = torch.zeros_like(candidates)
+    if block_size > 1:
+        draft_tokens[:, :-1] = candidates[:, 1:]
+    out_tokens = torch.where(
+        col_idx < accept_len_2d,
+        draft_tokens,
+        torch.where(
+            col_idx == accept_len_2d,
+            target_predict,
+            torch.zeros_like(candidates),
+        ),
+    ).to(torch.int64)
+
+    return accept_len, commit_lens, bonus, out_tokens, new_seq_lens
+
+
 def _tp_size() -> int:
     return (
         int(get_parallel().tp_group.world_size)
@@ -359,6 +408,7 @@ def _select_verify_cache_locs(
     seq_lens: torch.Tensor,
     committed_lens: torch.Tensor,
     block_size: int,
+    out_width: Optional[int] = None,
 ) -> torch.Tensor:
     """Slice the block starting at seq_lens - committed_lens out of candidates.
 
@@ -367,10 +417,11 @@ def _select_verify_cache_locs(
         bounds both the preceding commit and the active block_size.
       seq_lens: Device prefix lengths, [bs].
       committed_lens: Device mirror of the host base, [bs].
-      block_size: Verify block width.
+      block_size: Full draft block width.
+      out_width: Output slice width (defaults to block_size).
 
     Returns:
-      Slot ids, [bs, block_size].
+      Slot ids, [bs, out_width or block_size].
     """
     device = candidates.device
     # Binds only on the zero-filled bucket-padding rows; live rows stay inside
@@ -378,9 +429,8 @@ def _select_verify_cache_locs(
     offsets = (seq_lens.to(torch.int64) - committed_lens.to(torch.int64)).clamp_(
         0, candidates.shape[1] // 2
     )
-    columns = offsets[:, None] + torch.arange(
-        block_size, device=device, dtype=torch.int64
-    )
+    width = block_size if out_width is None else int(out_width)
+    columns = offsets[:, None] + torch.arange(width, device=device, dtype=torch.int64)
     rows = torch.arange(candidates.shape[0], device=device, dtype=torch.int64)
     return candidates[rows[:, None], columns]
 
@@ -398,13 +448,15 @@ def build_dflash_draft_block(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Everything the draft step needs from the previous accept, as one program.
 
-    Returns block ids and positions [bs, block_size], the verify slots picked out of
-    the candidate window [bs, block_size], and the embedded block [bs * block_size,
-    hidden]; step by step these are about eight separately launched programs.
+    Returns block ids and positions [bs, width], the verify slots picked out of
+    the candidate window [bs, width], and the embedded block [bs * width, hidden]
+    where width = block_pos_offsets.shape[-1]; step by step these are about eight
+    separately launched programs.
     """
     bs = bonus_tokens.shape[0]
+    width = int(block_pos_offsets.shape[-1])
     masked = torch.full(
-        (bs, block_size - 1),
+        (bs, width - 1),
         mask_token_id,
         dtype=torch.long,
         device=bonus_tokens.device,
@@ -412,7 +464,7 @@ def build_dflash_draft_block(
     block_ids = torch.cat([bonus_tokens.view(bs, 1), masked], dim=1)
     positions = prefix_lens.view(bs, 1) + block_pos_offsets
     slots = _select_verify_cache_locs(
-        candidates, prefix_lens, committed_lens, block_size
+        candidates, prefix_lens, committed_lens, block_size, out_width=width
     )
     return block_ids, positions, slots, embed(block_ids=block_ids)
 
@@ -423,6 +475,7 @@ def select_dflash_verify_cache_locs_tpu(
     seq_lens: torch.Tensor,
     committed_lens: torch.Tensor,
     block_size: int,
+    out_width: int = 0,
 ) -> torch.Tensor:
     """Pick the verify block's slots out of the pre-gathered candidate window.
 
@@ -432,12 +485,19 @@ def select_dflash_verify_cache_locs_tpu(
       seq_lens: Device prefix lengths, [bs], equal to base plus the previous
         step's commit length.
       committed_lens: Device mirror of the host base, [bs].
-      block_size: Verify block width.
+      block_size: Full draft block width.
+      out_width: Output slice width (defaults to block_size when 0).
 
     Returns:
-      Slot ids, [bs, block_size].
+      Slot ids, [bs, out_width or block_size].
     """
-    return _select_verify_cache_locs(candidates, seq_lens, committed_lens, block_size)
+    return _select_verify_cache_locs(
+        candidates,
+        seq_lens,
+        committed_lens,
+        block_size,
+        out_width=out_width or block_size,
+    )
 
 
 class DeviceVerifyBlockSelector:
@@ -477,6 +537,7 @@ class DeviceVerifyBlockSelector:
         committed_lens: torch.Tensor,
         prefix_lens: torch.Tensor,
         bs: int,
+        out_width: Optional[int] = None,
     ) -> torch.Tensor:
         """Pick each request's verify block out of its candidate window.
 
@@ -486,11 +547,33 @@ class DeviceVerifyBlockSelector:
           committed_lens: Device mirror of the host base, [bs].
           prefix_lens: Device prefix lengths, [bs].
           bs: Number of live requests.
+          out_width: Output slice width (defaults to self.block_size).
 
         Returns:
-          Slot ids, [bs, block_size].
+          Slot ids, [bs, out_width or self.block_size].
         """
+        width = self.block_size if out_width is None else int(out_width)
         pad_bs = self._pad_bs(bs)
+        if pad_bs == bs:
+            return select_dflash_verify_cache_locs_tpu(
+                (
+                    candidates
+                    if candidates.dtype == torch.int64
+                    else candidates.to(torch.int64)
+                ),
+                (
+                    prefix_lens
+                    if prefix_lens.dtype == torch.int64
+                    else prefix_lens.to(torch.int64)
+                ),
+                (
+                    committed_lens
+                    if committed_lens.dtype == torch.int64
+                    else committed_lens.to(torch.int64)
+                ),
+                self.block_size,
+                width,
+            )
         self._ensure_capacity(pad_bs)
         padded_candidates = self._candidates[:pad_bs]
         padded_committed = self._committed_lens[:pad_bs]
@@ -499,7 +582,7 @@ class DeviceVerifyBlockSelector:
         padded_committed[:bs].copy_(committed_lens)
         padded_prefix[:bs].copy_(prefix_lens)
         return select_dflash_verify_cache_locs_tpu(
-            padded_candidates, padded_prefix, padded_committed, self.block_size
+            padded_candidates, padded_prefix, padded_committed, self.block_size, width
         )[:bs]
 
     def _ensure_capacity(self, pad_bs: int) -> None:
@@ -622,4 +705,25 @@ def plan_dflash_device_accept(
         committed_lens=committed_lens_cpu[:bs].to(
             batch.device, dtype=torch.int64, non_blocking=True
         ),
+    )
+
+
+def pad_tensor_on_host(t: torch.Tensor, target_size: int, dim: int = 0) -> torch.Tensor:
+    """Pad ``t`` along ``dim`` on CPU and transfer back to ``t.device`` non-blocking."""
+    ndim = t.ndim
+    if dim < 0:
+        dim += ndim
+    if dim < 0 or dim >= ndim:
+        raise IndexError(f"dim {dim} out of range for {ndim}D tensor")
+    cur_size = int(t.shape[dim])
+    if cur_size >= target_size:
+        return t
+    target_shape = list(t.shape)
+    target_shape[dim] = int(target_size)
+    out_cpu = torch.zeros(target_shape, dtype=t.dtype, device="cpu")
+    slices = [slice(None)] * ndim
+    slices[dim] = slice(0, cur_size)
+    out_cpu[tuple(slices)].copy_(t.to("cpu"))
+    return (
+        out_cpu if t.device.type == "cpu" else out_cpu.to(t.device, non_blocking=True)
     )

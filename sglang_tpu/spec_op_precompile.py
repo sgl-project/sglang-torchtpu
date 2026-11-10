@@ -33,6 +33,7 @@ def precompile_spec_v2_ops(
     draft_vocab_size: int,
     hidden_size: int,
     hidden_dtype: torch.dtype,
+    full_block_size: int = 0,
 ) -> None:
     """Warm up Spec V2 helper graphs for every physical batch bucket."""
     shapes = tuple(
@@ -51,6 +52,7 @@ def precompile_spec_v2_ops(
             draft_vocab_size=draft_vocab_size,
             hidden_size=hidden_size,
             hidden_dtype=hidden_dtype,
+            full_block_size=full_block_size or num_verify_tokens,
         )
         for physical_bs, _ in shapes
     ]

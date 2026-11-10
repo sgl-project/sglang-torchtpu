@@ -100,6 +100,7 @@ from sglang.srt.speculative.spec_utils import (
     build_grammar_vocab_mask,
     draft_pp_context,
     draft_tp_context,
+    sample_simulated_acc_len,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu, is_xpu
 from sglang_tpu.dflash_adaptive_verify import (
@@ -109,14 +110,45 @@ from sglang_tpu.dflash_adaptive_verify import (
 from sglang_tpu.dflash_utils_tpu import (
     DeviceVerifyBlockSelector,
     build_tpu_draft_extend_metadata,
+    dflash_simulated_verify_bookkeeping_torch,
     dflash_verify_argmax_torch,
     dflash_verify_bookkeeping_torch,
     gather_dflash_candidate_window,
+    pad_tensor_on_host,
 )
 from sglang_tpu.envs import envs as tpu_envs
 
 _is_npu = is_npu()
 _is_tpu = is_tpu()
+
+
+def _build_cpu_extend_positions(
+    prefix_lens: List[int] | torch.Tensor,
+    extend_lens: List[int] | torch.Tensor,
+    padded_num_tokens: int,
+) -> torch.Tensor:
+    """Build int64 prompt token positions on CPU, zero-padded to padded_num_tokens."""
+    prefix_list = (
+        prefix_lens.tolist()
+        if isinstance(prefix_lens, torch.Tensor)
+        else [int(x) for x in prefix_lens]
+    )
+    extend_list = (
+        extend_lens.tolist()
+        if isinstance(extend_lens, torch.Tensor)
+        else [int(x) for x in extend_lens]
+    )
+    total_real_tokens = sum(extend_list)
+    output_num_tokens = max(int(padded_num_tokens), total_real_tokens)
+    positions_cpu = torch.zeros(output_num_tokens, dtype=torch.int64, device="cpu")
+    offset = 0
+    for prefix_len, extend_len in zip(prefix_list, extend_list):
+        if extend_len > 0:
+            positions_cpu[offset : offset + extend_len] = torch.arange(
+                prefix_len, prefix_len + extend_len, dtype=torch.int64
+            )
+            offset += extend_len
+    return positions_cpu
 
 
 if TYPE_CHECKING:
@@ -670,6 +702,19 @@ class DFlashWorkerV2(BaseSpecWorker):
             width: make_draft_block_spec_info(draft_token_num=width, device=self.device)
             for width in self._verify_cols
         }
+        self._narrow_block_pos_offsets = {
+            width: build_block_pos_offsets(length=width, device=self.device)
+            for width in self._verify_cols
+        }
+        self._num_token_non_padded_cache: dict[int, torch.Tensor] = {}
+        self._sim_commit_len_tensors = (
+            {
+                k: torch.tensor([k], dtype=torch.int32, device=self.device)
+                for k in range(1, int(self.block_size) + 1)
+            }
+            if str(self.device).startswith("tpu")
+            else {}
+        )
         self._verify_width_ct: dict[int, int] = {}
         if self._adaptive_verify_rules and get_parallel().tp_rank == 0:
             logger.info(
@@ -1156,6 +1201,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             return int(b_bucketer.next_bucket(int(bs)))
         return int(bs)
 
+    def _get_num_token_non_padded_tensor(self, num_tokens: int) -> torch.Tensor:
+        key = int(num_tokens)
+        cached = self._num_token_non_padded_cache.get(key)
+        if cached is None:
+            cached = torch.tensor(key, dtype=torch.int32, device=self.device)
+            self._num_token_non_padded_cache[key] = cached
+        return cached
+
     def ensure_embed_module(self) -> torch.nn.Module:
         """Resolve and cache the embedding module used to embed drafted blocks."""
         if self._embed_module is None:
@@ -1313,7 +1366,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         req_to_token = batch.req_to_token_pool.req_to_token
         if req_to_token.device.type != "cpu":
-            return full_to_swa[batch.out_cache_loc.cpu()].to(self.device)
+            mapped = full_to_swa[
+                batch.out_cache_loc.to(full_to_swa.device, dtype=torch.int64)
+            ].to(dtype=torch.int64, device="cpu")
+            output_num_tokens = max(int(num_tokens), int(mapped.numel()))
+            swa_slots = torch.zeros(output_num_tokens, dtype=torch.int64)
+            swa_slots[: mapped.numel()] = mapped
+            return swa_slots.to(self.device, non_blocking=True)
         rows = torch.as_tensor(batch.req_pool_indices_cpu).tolist()
         slots = torch.cat(
             [
@@ -1324,8 +1383,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             ]
         )
         # Padding rows of out_cache_loc point at slot 0, which writers skip.
-        swa_slots = torch.zeros(num_tokens, dtype=torch.int64)
-        swa_slots[: slots.numel()] = full_to_swa[slots.to(torch.int64)]
+        output_num_tokens = max(int(num_tokens), int(slots.numel()))
+        swa_slots = torch.zeros(output_num_tokens, dtype=torch.int64)
+        swa_slots[: slots.numel()] = full_to_swa[slots.to(torch.int64)].to(
+            dtype=torch.int64, device="cpu"
+        )
         return swa_slots.to(self.device, non_blocking=True)
 
     def _verify_swa_cache_locs(
@@ -1336,6 +1398,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         committed_lens: Optional[torch.Tensor],
         verify_out_cache_loc_2d: torch.Tensor,
         bs: int,
+        out_width: Optional[int] = None,
     ) -> torch.Tensor:
         """SWA-pool slots of the verify block, where a hybrid-SWA draft writes its context.
 
@@ -1347,7 +1410,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             self.model_runner.token_to_kv_pool_allocator.full_to_swa_index_mapping
         )
         if committed_lens is None:
-            return full_to_swa[verify_out_cache_loc_2d.cpu()].to(self.device)
+            locs = (
+                verify_out_cache_loc_2d[:, :out_width]
+                if out_width is not None
+                and int(verify_out_cache_loc_2d.shape[1]) != out_width
+                else verify_out_cache_loc_2d
+            )
+            return full_to_swa[locs.cpu()].to(self.device)
         window = gather_dflash_candidate_window(
             batch.req_to_token_pool.req_to_token,
             batch.req_pool_indices_cpu[:bs],
@@ -1361,6 +1430,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             committed_lens=committed_lens,
             prefix_lens=prefix_lens,
             bs=bs,
+            out_width=out_width,
         )
 
     def __getattr__(self, name):
@@ -2683,6 +2753,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         sampling_info,
         draft_input: DFlashDraftInputV2,
         block_size: int,
+        simulate_acc_len: float = 0.0,
     ):
         """Run accept on the TPU bucket shape, then trim back to the logical batch.
 
@@ -2730,6 +2801,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Re-read: prepare_spec_verify rebinds seq_lens, so the alias captured
             # before the forward would still be the logical tensor.
             prefix_lens=batch.seq_lens,
+            simulate_acc_len=simulate_acc_len,
         )
         if verify_padding is not None:
             accept_result = compile_policy.finalize_dflash_verify(
@@ -2751,6 +2823,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         sampling_info,
         draft_input,
         prefix_lens: torch.Tensor,
+        simulate_acc_len: float = 0.0,
     ):
         # Physical (bucket) rows whenever the verify outputs stayed padded.
         bs = int(candidates.shape[0])
@@ -2793,17 +2866,49 @@ class DFlashWorkerV2(BaseSpecWorker):
             if _is_tpu:
                 # Callers hand us bucket-width rows, which is what the bookkeeping
                 # op is warmed on; the caller trims the outputs back.
-                (
-                    accept_len,
-                    commit_lens,
-                    bonus,
-                    out_tokens,
-                    new_seq_lens,
-                ) = dflash_verify_bookkeeping_torch(
-                    candidates=candidates,
-                    target_predict=target_predict,
-                    prefix_lens=prefix_lens.to(torch.int64),
+                prefix_lens_i64 = (
+                    prefix_lens
+                    if prefix_lens.dtype == torch.int64
+                    else prefix_lens.to(torch.int64)
                 )
+                if simulate_acc_len > 0.0:
+                    forced_commit_len = sample_simulated_acc_len(
+                        simulate_acc_len,
+                        SIMULATE_ACC_METHOD,
+                        int(candidates.shape[1]),
+                    )
+                    forced_tensor = self._sim_commit_len_tensors.get(forced_commit_len)
+                    if forced_tensor is None:
+                        forced_tensor = torch.tensor(
+                            [forced_commit_len],
+                            dtype=torch.int32,
+                            device=candidates.device,
+                        )
+                        self._sim_commit_len_tensors[forced_commit_len] = forced_tensor
+                    (
+                        accept_len,
+                        commit_lens,
+                        bonus,
+                        out_tokens,
+                        new_seq_lens,
+                    ) = dflash_simulated_verify_bookkeeping_torch(
+                        candidates=candidates,
+                        target_predict=target_predict,
+                        prefix_lens=prefix_lens_i64,
+                        forced_commit_len_tensor=forced_tensor,
+                    )
+                else:
+                    (
+                        accept_len,
+                        commit_lens,
+                        bonus,
+                        out_tokens,
+                        new_seq_lens,
+                    ) = dflash_verify_bookkeeping_torch(
+                        candidates=candidates,
+                        target_predict=target_predict,
+                        prefix_lens=prefix_lens_i64,
+                    )
             elif self._use_triton_accept_bonus:
                 try:
                     (
@@ -2930,6 +3035,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         host_len_slack = block_size if draft_input.tpu_host_seq_lens_is_committed else 0
         positions_2d = self._draft_block_positions_buf[:bs]
         verify_out_cache_loc_2d = self._draft_verify_out_cache_loc_buf[:bs]
+        verify_rule = self._select_verify_rule(batch=batch, bs=bs)
+        verify_width = block_size if verify_rule is None else verify_rule.width
+        block_pos_offsets = (
+            self._block_pos_offsets
+            if verify_width == block_size
+            else self._narrow_block_pos_offsets[verify_width]
+        )
         fused_block = None
         if verify_cache_candidates is not None:
             fused_block = self.prepare_draft_block_fused(
@@ -2937,7 +3049,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 prefix_lens=prefix_lens.view(-1),
                 candidates=verify_cache_candidates,
                 committed_lens=draft_input.tpu_committed_lens,
-                block_pos_offsets=self._block_pos_offsets,
+                block_pos_offsets=block_pos_offsets,
                 bs=bs,
             )
         if fused_block is not None:
@@ -3019,6 +3131,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ),
                 verify_out_cache_loc_2d=verify_out_cache_loc_2d,
                 bs=bs,
+                out_width=verify_width,
             )
             if self._draft_kv_is_swa
             else None
@@ -3040,7 +3153,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_prefix_lens=draft_prefix_lens,
                 verify_out_cache_loc_2d=verify_out_cache_loc_2d,
                 bs=bs,
-                block_size=block_size,
+                block_size=int(verify_out_cache_loc_2d.shape[1]),
             )
             draft_seq_lens = draft_prefix_lens
             draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
@@ -3065,31 +3178,43 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_cpu.add_(block_size)
                 draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
 
-        verify_rule = self._select_verify_rule(batch=batch, bs=bs)
-        verify_width = block_size if verify_rule is None else verify_rule.width
         verify_tokens_buf = self._draft_block_tokens_buf
         draft_block_spec_info = self._draft_block_spec_info
         if verify_rule is not None:
             # From here on the draft, verify, accept and draft-KV write all run the narrow
             # block; the draft drafts natively at that width.
-            (
-                block_ids,
-                input_embeds,
-                positions_2d,
-                verify_out_cache_loc_2d,
-                verify_swa_loc_2d,
-            ) = self._narrow_draft_block(
-                width=verify_width,
-                bs=bs,
-                block_size=block_size,
-                block_ids=block_ids,
-                input_embeds=input_embeds,
-                positions_2d=positions_2d,
-                cache_loc_2d=verify_out_cache_loc_2d,
-                swa_cache_loc_2d=verify_swa_loc_2d,
-            )
-            positions = positions_2d.reshape(-1)
-            verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
+            if fused_block is None:
+                swa_already_narrow = (
+                    verify_swa_loc_2d is None
+                    or int(verify_swa_loc_2d.shape[1]) == verify_width
+                )
+                (
+                    block_ids,
+                    input_embeds,
+                    positions_2d,
+                    verify_out_cache_loc_2d,
+                    narrowed_swa_loc_2d,
+                ) = self._narrow_draft_block(
+                    width=verify_width,
+                    bs=bs,
+                    block_size=block_size,
+                    block_ids=block_ids,
+                    input_embeds=input_embeds,
+                    positions_2d=positions_2d,
+                    cache_loc_2d=verify_out_cache_loc_2d,
+                    swa_cache_loc_2d=None if swa_already_narrow else verify_swa_loc_2d,
+                )
+                if not swa_already_narrow:
+                    verify_swa_loc_2d = narrowed_swa_loc_2d
+                positions = positions_2d.reshape(-1)
+                verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
+            elif (
+                verify_swa_loc_2d is not None
+                and int(verify_swa_loc_2d.shape[1]) != verify_width
+            ):
+                verify_swa_loc_2d = torch.index_select(
+                    verify_swa_loc_2d, 1, self._verify_cols[verify_width]
+                )
             verify_tokens_buf = self._verify_tokens_bufs[verify_width]
             draft_block_spec_info = self._narrow_block_spec_infos[verify_width]
         self._count_verify_width(verify_width)
@@ -3144,7 +3269,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.NULL,
             **extend_split,
             num_token_non_padded=(
-                torch.tensor(bs * verify_width, dtype=torch.int32, device=device)
+                self._get_num_token_non_padded_tensor(bs * verify_width)
                 if enable_num_token_non_padded()
                 else None
             ),
@@ -3562,34 +3687,59 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
             device = next_token_ids.device
-            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-            draft_seq_lens = torch.tensor(
-                batch.prefix_lens, dtype=torch.int32, device=device
-            )
 
             if batch.out_cache_loc is None:
                 raise RuntimeError(
                     "DFLASH prefill expected out_cache_loc, but got None."
                 )
-            positions, _ = compute_position(
-                self.model_runner.prefill_attention_backend_str,
-                draft_seq_lens,
-                ctx_lens,
-                int(sum(batch.extend_lens)),
-            )
-            draft_kv_write_tail = self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=target_hidden,
-                cache_loc=batch.out_cache_loc,
-                swa_cache_loc=(
-                    self._extend_swa_cache_loc(
-                        batch=batch, num_tokens=int(batch.out_cache_loc.numel())
+            if device.type == "tpu" and self.lilicorr is None:
+                padded_num_tokens = int(target_hidden.shape[0])
+                positions = _build_cpu_extend_positions(
+                    batch.prefix_lens, batch.extend_lens, padded_num_tokens
+                ).to(device, non_blocking=True)
+                if self._draft_kv_is_swa:
+                    swa_cache_loc = self._extend_swa_cache_loc(
+                        batch=batch, num_tokens=padded_num_tokens
                     )
-                    if self._draft_kv_is_swa
-                    else None
-                ),
-                positions=positions,
-                extend_lens=ctx_lens,
-            )
+                    extend_cache_loc = swa_cache_loc
+                else:
+                    swa_cache_loc = None
+                    extend_cache_loc = pad_tensor_on_host(
+                        batch.out_cache_loc, padded_num_tokens
+                    )
+                draft_kv_write_tail = self._append_target_hidden_to_draft_kv_by_loc(
+                    target_hidden=target_hidden,
+                    cache_loc=extend_cache_loc,
+                    swa_cache_loc=swa_cache_loc,
+                    positions=positions,
+                    extend_lens=None,
+                )
+            else:
+                ctx_lens = torch.tensor(
+                    batch.extend_lens, dtype=torch.int32, device=device
+                )
+                draft_seq_lens = torch.tensor(
+                    batch.prefix_lens, dtype=torch.int32, device=device
+                )
+                positions, _ = compute_position(
+                    self.model_runner.prefill_attention_backend_str,
+                    draft_seq_lens,
+                    ctx_lens,
+                    int(sum(batch.extend_lens)),
+                )
+                draft_kv_write_tail = self._append_target_hidden_to_draft_kv_by_loc(
+                    target_hidden=target_hidden,
+                    cache_loc=batch.out_cache_loc,
+                    swa_cache_loc=(
+                        self._extend_swa_cache_loc(
+                            batch=batch, num_tokens=int(batch.out_cache_loc.numel())
+                        )
+                        if self._draft_kv_is_swa
+                        else None
+                    ),
+                    positions=positions,
+                    extend_lens=ctx_lens,
+                )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None
@@ -3777,7 +3927,30 @@ class DFlashWorkerV2(BaseSpecWorker):
         if grammar_mask is not None:
             grammar_mask.apply(logical_logits)
 
+        step_sim_acc_len = 0.0
+        if SIMULATE_ACC_LEN > 0:
+            if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
+                raise ValueError(
+                    "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE "
+                    f"{SIMULATE_ACC_TOKEN_MODE!r}; expected 'fixed' or "
+                    "'real-draft-token'."
+                )
+            step_sim_acc_len = float(
+                SIMULATE_ACC_LEN
+                if verify_rule is None
+                else verify_rule.simulate_accept_length
+            )
+
         if _is_tpu:
+            use_tpu_compiled_sim_accept = bool(
+                step_sim_acc_len > 0.0
+                and SIMULATE_ACC_TOKEN_MODE == "real-draft-token"
+                and self._selector_sample is None
+                and (
+                    _is_all_greedy(sampling_info)
+                    or not is_dflash_sampling_verify_available()
+                )
+            )
             accept_result, logits_output, candidates = self._accept_block_on_bucket(
                 compile_policy=compile_policy,
                 batch=batch,
@@ -3789,8 +3962,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 draft_input=draft_input,
                 block_size=verify_width,
+                simulate_acc_len=(
+                    step_sim_acc_len if use_tpu_compiled_sim_accept else 0.0
+                ),
             )
         else:
+            use_tpu_compiled_sim_accept = False
             candidates = draft_tokens
             accept_result = self._accept_block(
                 candidates=candidates,
@@ -3808,7 +3985,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_predict,
         ) = accept_result
 
-        if SIMULATE_ACC_LEN > 0:
+        if SIMULATE_ACC_LEN > 0 and not use_tpu_compiled_sim_accept:
             if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
                 raise ValueError(
                     "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE "

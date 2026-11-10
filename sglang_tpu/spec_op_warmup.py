@@ -19,6 +19,7 @@ class SpecOpWarmupContext:
     draft_vocab_size: int
     hidden_size: int
     hidden_dtype: torch.dtype
+    full_block_size: int = 0
 
 
 def make_verify_tree_greedy_args(
@@ -122,10 +123,33 @@ def make_dflash_verify_bookkeeping_args(
     )
 
 
+def make_dflash_simulated_verify_bookkeeping_args(
+    context: SpecOpWarmupContext,
+) -> tuple[torch.Tensor, ...]:
+    return (
+        torch.zeros(
+            (context.physical_bs, context.num_verify_tokens),
+            dtype=torch.int64,
+            device=context.device,
+        ),
+        torch.zeros(
+            (context.physical_bs, context.num_verify_tokens),
+            dtype=torch.int64,
+            device=context.device,
+        ),
+        torch.zeros(
+            (context.physical_bs,),
+            dtype=torch.int64,
+            device=context.device,
+        ),
+        torch.ones((1,), dtype=torch.int32, device=context.device),
+    )
+
+
 def make_dflash_verify_cache_locs_args(
     context: SpecOpWarmupContext,
 ) -> tuple[torch.Tensor | int, ...]:
-    block_size = context.num_verify_tokens
+    block_size = context.full_block_size or context.num_verify_tokens
     return (
         torch.zeros(
             (context.physical_bs, 2 * block_size),
@@ -135,4 +159,5 @@ def make_dflash_verify_cache_locs_args(
         torch.zeros((context.physical_bs,), dtype=torch.int64, device=context.device),
         torch.zeros((context.physical_bs,), dtype=torch.int64, device=context.device),
         block_size,
+        int(context.num_verify_tokens),
     )

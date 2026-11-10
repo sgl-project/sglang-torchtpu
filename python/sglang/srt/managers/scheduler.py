@@ -1939,6 +1939,7 @@ class Scheduler(
                 draft_vocab_size=draft_vocab_size,
                 hidden_size=hidden_size,
                 hidden_dtype=hidden_dtype,
+                full_block_size=int(compile_policy.draft_token_num),
             )
 
     def maybe_init_ngram_embedding(self):
