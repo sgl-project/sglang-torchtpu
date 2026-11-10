@@ -224,6 +224,7 @@ def handle_model_specific_adjustments(server_args: Any):
     if model_arch in (
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
     ):
         from sglang.srt.arg_groups.kimi_k3_hook import (
             apply_kimi_k3_linear_attn_defaults,
@@ -486,15 +487,6 @@ def handle_model_specific_adjustments(server_args: Any):
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
             envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
-        elif cfg.device == "tpu":
-            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
-            envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
-            envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
-            envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(False)
-            envs.SGLANG_OPT_FUSE_MHC_POST_PRE.set(False)
-            envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
-            envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.set(False)
-            envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.set(True)
 
     elif model_arch in ["GptOssForCausalLM"]:
         # Attention backend selection + XPU dtype validation moved to the
@@ -1014,11 +1006,6 @@ def handle_language_model_only(server_args: Any):
     ):
         if flag:
             raise ValueError(f"--language-model-only cannot be combined with {name}")
-    if cfg.disaggregation_mode != "null":
-        raise ValueError(
-            "--language-model-only is incompatible with --disaggregation-mode "
-            "prefill/decode"
-        )
     architectures = model_config_of(server_args).hf_config.architectures
     if not any(
         a in server_args.LANGUAGE_MODEL_ONLY_ARCHITECTURES for a in architectures

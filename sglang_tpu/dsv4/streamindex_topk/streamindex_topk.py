@@ -68,21 +68,8 @@ def get_dtype_packing(dtype):
 
 
 def kernel(
-    # Prefetch
-    seq_lens_ref,  # [max_num_seqs]
-    page_indices_ref,  # [max_num_seqs * pages_per_seq]
-    cu_q_lens_ref,  # [max_num_seqs + 1]
-    start_end_seq_idx_ref,  # [3] (start_seq, end_seq, chunk_token_start)
-    metadata_ref,  # MetadataRef
-    cp_rank_ref,  # [1]
-    # Input
-    q_hbm_ref,  # Shape: [max_num_tokens, num_q_heads, head_dim], Memory: HBM
-    indexer_weights_hbm_ref,  # Shape: [max_num_tokens, num_q_heads], Memory: HBM
-    cache_kv_hbm_ref,  # HEAD_ALONG_SUBLANE: [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
-    # SEQ_ALONG_LANE: [total_num_pages, kv_sublane_groups, kv_packing, page_size]
-    # HBM scores, [chunk_tokens, num_sublanes_total, 128]: (out,), or
-    # (donated_in, out) after the first pass. Only the last is ever read.
-    *score_refs,
+    *refs,
+    page_table_in_hbm: bool,
     compression_ratio: int,
     static_q_len: int | None,
     bkv_p: int,
@@ -96,7 +83,50 @@ def kernel(
     chunk_idx: int = 0,
     causal_offset: int = 0,
 ):
-    """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K."""
+    """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K.
+
+    Refs: scalar prefetch (seq_lens [max_num_seqs], page table when it is
+    prefetched [max_num_seqs * pages_per_seq], cu_q_lens [max_num_seqs + 1],
+    start/end seq idx + chunk token start [3], MetadataRef, cp_rank [1]), then
+    HBM inputs q [max_num_tokens, num_q_heads, head_dim], indexer weights
+    [max_num_tokens, num_q_heads], cache_kv (HEAD_ALONG_SUBLANE [total_num_pages,
+    page_size_per_kv_packing, kv_packing, lkv_dim] or SEQ_ALONG_LANE
+    [total_num_pages, kv_sublane_groups, kv_packing, page_size]), the page table
+    [max_num_seqs, pages_per_seq] when it stays in HBM, the HBM scores
+    [chunk_tokens, num_sublanes_total, 128] as (out,) or (donated_in, out) after
+    the first pass (only the last is ever read), and, with the table in HBM, an
+    SMEM scratch holding one page-table row per sequence in flight.
+    """
+    if page_table_in_hbm:
+        (
+            seq_lens_ref,
+            cu_q_lens_ref,
+            start_end_seq_idx_ref,
+            metadata_ref,
+            cp_rank_ref,
+            q_hbm_ref,
+            indexer_weights_hbm_ref,
+            cache_kv_hbm_ref,
+            page_table_ref,
+            *score_refs,
+            page_rows_ref,
+        ) = refs
+        pages_per_seq = page_table_ref.shape[1]
+    else:
+        (
+            seq_lens_ref,
+            page_table_ref,
+            cu_q_lens_ref,
+            start_end_seq_idx_ref,
+            metadata_ref,
+            cp_rank_ref,
+            q_hbm_ref,
+            indexer_weights_hbm_ref,
+            cache_kv_hbm_ref,
+            *score_refs,
+        ) = refs
+        page_rows_ref = None
+        pages_per_seq = page_table_ref.shape[0] // seq_lens_ref.shape[0]
     scores_hbm_ref = score_refs[-1]
     buffer_cnt = buffer_count
     seq_along_lane = kv_layout == KVLayout.SEQ_ALONG_LANE
@@ -119,9 +149,6 @@ def kernel(
         kv_head_dim_groups = None
 
     max_num_seqs = seq_lens_ref.shape[0]
-    num_page_indices = page_indices_ref.shape[0]
-
-    pages_per_seq = num_page_indices // max_num_seqs
 
     bkv_sz_per_kv_packing = bkv_p * page_size_per_kv_packing
     bkv_sz = bkv_p * page_size
@@ -398,7 +425,7 @@ def kernel(
             pipeline_fn(
                 (q_hbm_ref, *window_refs),
                 (indexer_weights_hbm_ref, *window_refs),
-                (cache_kv_hbm_ref, page_indices_ref, metadata_ref),
+                (cache_kv_hbm_ref, page_table_ref, metadata_ref, page_rows_ref),
                 (scores_hbm_ref, *window_refs),
                 allocations=(q_buf, weights_buf, kv_buf, o_buf),
             )
@@ -568,6 +595,9 @@ def _effective_row_lengths(
         "interleave_size",
         "return_scores",
         "causal_offset",
+        "segments",
+        "row_count",
+        "page_table_in_hbm",
     ),
 )
 def streamindex_topk(
@@ -596,8 +626,17 @@ def streamindex_topk(
     interleave_size: int = 1,
     return_scores: bool = False,
     causal_offset: int = 0,
+    segments: str = "all",
+    row_start: jax.Array | None = None,
+    row_count: int | None = None,
+    page_table_in_hbm: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
+
+    ``page_table_in_hbm`` keeps the page table in HBM and copies one sequence's
+    row into SMEM at its first KV block. Off, the table is a scalar-prefetch
+    operand, max_num_seqs x pages_per_seq int32 in SMEM for the whole program,
+    which passes the 1 MiB scoped SMEM near a 1M context.
 
     ``decode_query_size`` is the number of query rows of every decode-range
     sequence (fixed-width speculative verify). A batch whose decode rows are
@@ -611,8 +650,44 @@ def streamindex_topk(
     ``chunk_tokens`` scores the queries in row chunks of that size. With
     ``overlap_chunks`` the chunks carry XLA scheduling groups that overlap one
     chunk's scores with the previous chunk's top-k; without, they run in order.
+
+    ``segments`` names the passes ``distribution`` can populate, as for the
+    MLA kernel: ``"decode"`` promises ``distribution[1] == distribution[2]``
+    (a decode forward) and drops the mixed pass; ``"mixed"`` promises
+    ``distribution[1] == 0`` (an extend forward) and drops the decode passes.
+
+    ``row_count`` (static) with ``row_start`` (traced i32 scalar) scores and
+    selects only the query rows ``[row_start, row_start + row_count)`` of the
+    flat token axis and returns ``i32[row_count, k]``: the DSA indexer's
+    token split, where each TP rank picks the rows of its own token slice.
+    Every row's causal range still comes from the full-batch metadata, and the
+    SparseCore top-k takes the same branch as an unsplit call (it is chosen
+    from the longest row of the whole batch), so each row equals the same row
+    of the unsplit result. The window may run past ``max_num_tokens``; rows
+    past it come back as ``-1``. ``row_count`` must be a multiple of
+    ``decode_req_batch_size * decode_query_size`` and is incompatible with
+    ``chunk_tokens``, ``cp_size > 1``, ``return_scores`` and early exit.
     """
     kv_layout = KVLayout.parse(kv_layout)
+    if row_count is not None:
+        if row_start is None:
+            raise ValueError("row_count needs row_start.")
+        if (
+            chunk_tokens is not None
+            or cp_size > 1
+            or return_scores
+            or enable_early_exit
+        ):
+            raise NotImplementedError(
+                "row_count is not supported with chunk_tokens, cp_size > 1, "
+                "return_scores or enable_early_exit."
+            )
+        if row_count % (decode_req_batch_size * decode_query_size):
+            raise ValueError(
+                f"row_count ({row_count}) must be a multiple of"
+                f" decode_req_batch_size * decode_query_size"
+                f" ({decode_req_batch_size * decode_query_size})."
+            )
     if decode_query_size > 1:
         if enable_early_exit or cp_size > 1:
             raise NotImplementedError(
@@ -638,6 +713,8 @@ def streamindex_topk(
             raise NotImplementedError(
                 "enable_early_exit is not supported with cp_size > 1."
             )
+    if segments not in ("all", "decode", "mixed"):
+        raise ValueError(f"segments must be all, decode or mixed, got {segments!r}")
     if enable_early_exit and causal_offset:
         raise NotImplementedError(
             "causal_offset is not supported with enable_early_exit."
@@ -714,7 +791,6 @@ def streamindex_topk(
         _, page_size_per_kv_packing, kv_packing, _ = cache_kv.shape
         page_size = page_size_per_kv_packing * kv_packing
     pages_per_seq = page_indices.shape[0] // max_num_seqs
-
     for bkv_p in num_kv_pages_per_blocks:
         bkv_sz = page_size * bkv_p
         if bkv_sz % 128 != 0:
@@ -772,30 +848,34 @@ def streamindex_topk(
 
         hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
         aliased = scores_init is not None
-        in_specs = [
-            hbm_spec,  # q
-            hbm_spec,  # prepared_indexer_weights
-            hbm_spec,  # cache_kv
-        ]
+        # q, prepared_indexer_weights, cache_kv, [page table], [scores_init]
+        in_specs = [hbm_spec] * (4 if page_table_in_hbm else 3)
         if aliased:
             in_specs.append(hbm_spec)  # scores_init, aliased to out
         out_specs = hbm_spec
 
-        scratch_shapes = []
-
         chunk_start = 0 if chunk_token_start is None else chunk_token_start
         scalar_prefetches = (
             seq_lens,
-            page_indices,
+            *(() if page_table_in_hbm else (page_indices,)),
             cu_q_lens,
             jnp.array([start_seq_idx, end_seq_idx, chunk_start], jnp.int32),
             pass_meta,
             jnp.asarray([cp_rank], jnp.int32),
         )
+        if page_table_in_hbm:
+            hbm_inputs = (page_indices.reshape(max_num_seqs, pages_per_seq),)
+            # One page-table row per sequence in flight.
+            scratch_shapes = [pltpu.SMEM((seq_batch_size, pages_per_seq), jnp.int32)]
+        else:
+            hbm_inputs = ()
+            scratch_shapes = []
 
         num_scalar_prefetch = len(scalar_prefetches)
         num_flat_prefetches = len(jax.tree_util.tree_leaves(scalar_prefetches))
-        input_output_aliases = {num_flat_prefetches + 3: 0} if aliased else {}
+        input_output_aliases = (
+            {num_flat_prefetches + len(in_specs) - 1: 0} if aliased else {}
+        )
 
         layout_tag = "" if kv_layout == KVLayout.HEAD_ALONG_SUBLANE else "-sal"
         scope_name = f"StreamIdxTC-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}{layout_tag}"
@@ -805,6 +885,7 @@ def streamindex_topk(
             pl.pallas_call(
                 functools.partial(
                     kernel,
+                    page_table_in_hbm=page_table_in_hbm,
                     compression_ratio=compression_ratio,
                     static_q_len=static_q_len,
                     bq_sz=bq_sz,
@@ -843,6 +924,7 @@ def streamindex_topk(
             q,
             prepared_indexer_weights,
             cache_kv,
+            *hbm_inputs,
             *((scores_init,) if aliased else ()),
         )
         if scheduling_group_id is not None:
@@ -949,9 +1031,43 @@ def streamindex_topk(
         out_dtype = jnp.int32
         max_num_tokens = q.shape[0]
 
-        decode_batch_end = (
-            distribution[0] // decode_req_batch_size * decode_req_batch_size
+        # A decode graph whose rows come in whole groups of
+        # decode_req_batch_size can score the last, partly padded group on the
+        # batched pass too: a padded row is a one-token sequence on valid pages
+        # (as the backend builds it), and its scores are never read, because
+        # its row length is 0. The tail pass is then always empty, and it is
+        # not built: as an empty pass it still cost a launch and its first KV
+        # prefetch (1.5 us per indexer layer at bs4 on TPU7x).
+        batched_only = (
+            segments == "decode"
+            and decode_query_size == 1
+            and max_num_seqs >= decode_req_batch_size
+            and max_num_seqs % decode_req_batch_size == 0
         )
+        if batched_only:
+            decode_batch_end = (
+                (distribution[0] + decode_req_batch_size - 1)
+                // decode_req_batch_size
+                * decode_req_batch_size
+            )
+        else:
+            decode_batch_end = (
+                distribution[0] // decode_req_batch_size * decode_req_batch_size
+            )
+
+        specs = _pass_specs(decode_batch_end)
+        if batched_only:
+            specs = specs[:1]
+        else:
+            if max_num_seqs < decode_req_batch_size:
+                # The batched decode pass covers whole groups of
+                # decode_req_batch_size sequences, so with fewer it never has
+                # work. It would still prefetch its first KV blocks.
+                specs = specs[1:]
+            if segments == "decode":
+                specs = specs[:-1]
+            elif segments == "mixed":
+                specs = specs[-1:]
 
         num_positions = max(num_sublanes_total * 128, k)
         eff_row_lengths = _effective_row_lengths(
@@ -967,7 +1083,10 @@ def streamindex_topk(
             causal_offset=causal_offset,
         )
 
-        if chunk_tokens is None or max_num_tokens % chunk_tokens:
+        windowed = row_count is not None
+        if windowed:
+            num_chunks, chunk_len = 1, row_count
+        elif chunk_tokens is None or max_num_tokens % chunk_tokens:
             num_chunks, chunk_len = 1, max_num_tokens
         else:
             num_chunks, chunk_len = max_num_tokens // chunk_tokens, chunk_tokens
@@ -979,14 +1098,37 @@ def streamindex_topk(
 
         need_scores = cp_size > 1 or return_scores
 
-        chunk_starts = (
-            (None,)
-            if num_chunks == 1
-            else tuple(m * chunk_len for m in range(num_chunks))
-        )
+        if windowed:
+            # One chunk at a run-time start: the kernel and its schedule read
+            # the chunk start as data (scalar prefetch), so one compiled
+            # program serves every TP rank.
+            window_start = jnp.asarray(row_start, jnp.int32).reshape(())
+            chunk_starts = (window_start,)
+            # Row lengths of the window, from the whole batch's metadata; rows
+            # past max_num_tokens get length 0 (written as -1). A dynamic
+            # slice of the zero-padded lengths, not an XLA gather: the server
+            # runs with xla_tpu_offload_gather_to_sparsecore=true, and an
+            # offloaded gather here would hand the SparseCore top-k wrong row
+            # lengths (rows with too few, or no, valid picks). The start is
+            # clamped to [0, max_num_tokens], so it never wraps.
+            padded_row_lengths = jnp.pad(eff_row_lengths, (0, row_count))
+            window_row_lengths = lax.dynamic_slice_in_dim(
+                padded_row_lengths,
+                jnp.clip(window_start, 0, max_num_tokens),
+                row_count,
+            )
+            # The SparseCore top-k picks a width branch from the longest row;
+            # take it over the whole batch, as an unsplit call does.
+            branch_max_len = jnp.max(eff_row_lengths)
+        else:
+            chunk_starts = (
+                (None,)
+                if num_chunks == 1
+                else tuple(m * chunk_len for m in range(num_chunks))
+            )
+            branch_max_len = None
         passes = tuple(
-            (spec, _pass_metadata(spec, chunk_starts, chunk_len))
-            for spec in _pass_specs(decode_batch_end)
+            (spec, _pass_metadata(spec, chunk_starts, chunk_len)) for spec in specs
         )
         topk_idxs = []
         topk_scores_list = []
@@ -1017,18 +1159,23 @@ def streamindex_topk(
             chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
                 scores,
                 k,
-                row_lengths=eff_row_lengths[start : start + chunk_len],
+                row_lengths=(
+                    window_row_lengths
+                    if windowed
+                    else eff_row_lengths[start : start + chunk_len]
+                ),
                 write_empty_rows=True,
                 scheduling_group_id=sc_group,
                 stage2_scheduling_group_id=sc2_group,
                 return_scores=True,
+                branch_max_len=branch_max_len,
             )
             topk_idxs.append(chunk_topk_idxs)
             if need_scores:
                 topk_scores_list.append(chunk_topk_scores)
 
         out = topk_idxs[0] if len(topk_idxs) == 1 else jnp.concatenate(topk_idxs)
-        out = out[:max_num_tokens, :k]
+        out = out[: chunk_len if windowed else max_num_tokens, :k]
 
         if cp_size == 1 and not return_scores:
             return out

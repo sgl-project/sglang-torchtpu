@@ -97,6 +97,7 @@ ${WEIGHTS_VOLUME}
                       set -uo pipefail
                       cd /sgl-workspace/sglang
                       export HF_HOME=/tmp/hf SGLANG_PLATFORM=tpu SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                      export CI_WEIGHT_LOADER_PREFETCH=1
                       # torch_tpu's tier-3 cache defaults to $HOME, on the pod's ephemeral
                       # overlay; warmup fills the node disk and the kubelet evicts the pod.
                       # EXEC_CMD reaches launch_server.sh without the ENABLE_COMPILE_CACHE=0
@@ -233,6 +234,7 @@ ${WEIGHTS_VOLUME}
                       set -uo pipefail
                       cd /sgl-workspace/sglang
                       export HF_HOME=/tmp/hf SGLANG_PLATFORM=tpu SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                      export CI_WEIGHT_LOADER_PREFETCH=1
                       # torch_tpu's tier-3 cache defaults to $HOME, on the pod's ephemeral
                       # overlay; warmup fills the node disk and the kubelet evicts the pod.
                       # EXEC_CMD reaches launch_server.sh without the ENABLE_COMPILE_CACHE=0

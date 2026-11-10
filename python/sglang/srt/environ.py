@@ -678,6 +678,11 @@ class Envs:
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     # Opt-in: keep receiving prefill requests while forward results are pending.
     SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
+    # Opt-in, overlap decode without speculative decoding: penalize the token a
+    # request decoding alone would penalize at each step, whatever the host has
+    # processed so far, and give a request prefilled again after a retraction
+    # that penalty history back (ScheduleBatch._uses_deterministic_penalty_tokens).
+    SGLANG_DETERMINISTIC_PENALTY_TOKENS = EnvBool(False)
 
     # ===================================================================
     # Radix and sparse KV caches
@@ -692,16 +697,49 @@ class Envs:
     # Hybrid-SWA unified cache: insert a mid-prefill chunk only if it reaches a
     # multiple of this many tokens (0: every chunk); each insert pins an SWA window.
     SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE = EnvInt(0)
-    # Move the stale SWA windows a chunked request leaves behind its sliding window
-    # to the SWA LRU eviction end, ahead of shared windows and prefix tails.
+    # Hybrid-SWA unified cache: while a request is in prefill, free none of its
+    # own SWA at a chunk insert, so every chunk stays SWA-live in the tree. A
+    # chunk longer than window + page (4096-token chunks) then keeps the match
+    # points of window-sized chunks instead of only its last window.
+    SGLANG_OPT_SWA_KEEP_PREFILL_CHUNK_WINDOWS = EnvBool(False)
+    # Move the stale SWA windows behind a request's sliding window (chunk boundaries,
+    # earlier turns) to the SWA LRU eviction end, ahead of shared windows and prefix tails.
     SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST = EnvBool(False)
+    # When a request finishes, move its unshared final SWA windows (its private
+    # tail, after it drops its tree lock) to the SWA LRU eviction end. On a first
+    # visit of the request's media, the window ending at the page-floored media
+    # end stays put, here and under SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST.
+    SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS = EnvBool(False)
+    # CAP (SWA right-sizing): every SGLANG_OPT_SWA_CAP_INTERVAL decode batches,
+    # shrink a running request's SWA tree lock page by page to the prompt pages
+    # its sliding window still reads ([seqlen - 1 - window, seqlen)), move the
+    # released pages to the SWA LRU eviction end, and run the out-of-window
+    # eviction at the same interval.
+    SGLANG_OPT_SWA_CAP = EnvBool(False)
+    SGLANG_OPT_SWA_CAP_INTERVAL = EnvInt(32)
+    # CAP media anchor: keep up to this many first-visit media-boundary windows
+    # (the window ending at the page-floored media end) SWA-locked by the cache,
+    # least recently used released first; 0 disables. Anchors yield to memory
+    # pressure: a prefill pass that admits nothing for lack of memory (a request
+    # refused with NO_TOKEN, or a chunked request's next chunk parked) releases
+    # one, and a decode step that does not fit releases them before retracting.
+    # On a PD decode server, a preallocation pass that has reserved nothing
+    # releases them until its next request fits.
+    SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS = EnvInt(0)
+    # CAP for requests without media (they have no media anchor, and their reuse
+    # is an exact repeat of the whole prompt, which needs the prompt-end window):
+    # "release" (the CAP behaviour above), "skip" (keep the prompt-end window
+    # lock until the release-leaf-lock path drops it) or "keep_prompt_end"
+    # (release the lock but leave the prompt-end window in LRU order).
+    SGLANG_OPT_SWA_CAP_TEXT = EnvStr("release")
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # The tree-core registry falls back to Python for:
     # - Session-aware caching.
     # - C128 or other unsupported components.
     # - Custom component overrides.
-    # - SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST on an SWA cache.
+    # - SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST,
+    #   SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS or SGLANG_OPT_SWA_CAP on an SWA cache.
     # - Non-Linux platforms.
     # - Unsupported PyTorch versions.
     # - Devices other than CPU or CUDA.
@@ -727,6 +765,13 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    # Bound on the per-iteration transfer-status all_reduce across attention
+    # TP/CP ranks; the CPU group's own timeout is hours. Matches the decode
+    # waiting timeout so no new deadline is introduced. <= 0 disables.
+    SGLANG_DISAGGREGATION_POLL_ALLREDUCE_TIMEOUT = EnvFloat(300.0)
+    # Verify ranks poll the same number of requests before reducing their
+    # status; a mismatch completes on the shortest rank and hangs the rest.
+    SGLANG_DISAGGREGATION_POLL_CHECK_COUNT = EnvBool(True)
     # A wedged RDMA stack fails startup here instead of at the scheduler watchdog.
     SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(60)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
@@ -1372,6 +1417,11 @@ class Envs:
     # materializing the full-vocab log-softmax. Escape hatch only; the two
     # paths are mathematically identical.
     SGLANG_ENABLE_FAST_INPUT_LOGPROBS = EnvBool(True)
+    # Keep the repetition-penalty state at a power-of-two row count, so its
+    # [rows, vocab] filter and merge gathers have one shape per row-bucket pair
+    # instead of one per exact (old, new) batch-size pair. Helps backends that
+    # compile per input shape. Live rows keep their exact values.
+    SGLANG_BUCKETED_PENALTY_ROWS = EnvBool(False)
 
     # ===================================================================
     # Deterministic inference and all-reduce
@@ -1423,6 +1473,9 @@ class Envs:
     # Shard the DFLASH draft's context projection (K * hidden -> hidden) across TP by its
     # input dim instead of replicating it; same math plus one all-reduce.
     SGLANG_DFLASH_ROW_PARALLEL_FC = EnvBool(False)
+    # Shard it by its output dim instead and all-gather the projected rows: no extra
+    # reduction. Not bitwise vs the replicated fc (K summation order, bf16 output rounding).
+    SGLANG_DFLASH_COLUMN_PARALLEL_FC = EnvBool(False)
     # DFlash2 conv on flat [tokens, hidden] rows, the per-group deltas widened to channels
     # by one exact 0/1 matmul per sublayer; needs groups to be a multiple of 128.
     SGLANG_DFLASH_CONV_MATMUL_EXPAND = EnvBool(False)
@@ -1470,6 +1523,10 @@ class Envs:
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
+    # "incremental": drop finished requests' multimodal features a few at a
+    # time before device-result waits instead of all at once when they finish
+    # (scheduler_components/mm_feature_releaser.py). Outputs are unchanged.
+    SGLANG_ASYNC_MM_FEATURE_RELEASE = EnvStr("")
 
     # ===================================================================
     # Multimodal CUDA IPC transport
@@ -1520,6 +1577,11 @@ class Envs:
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
+    # Run wrap_shm_features (shared-memory create, fallocate and the pixel copy)
+    # on a pool of SGLANG_SHM_WRAP_THREADS threads instead of the tokenizer event
+    # loop, so large multimodal features do not stall request intake.
+    SGLANG_SHM_WRAP_OFF_LOOP = EnvBool(False)
+    SGLANG_SHM_WRAP_THREADS = EnvInt(4)
 
     # ===================================================================
     # Encoder pipeline and disaggregation

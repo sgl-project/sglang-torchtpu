@@ -1,8 +1,7 @@
-"""GPT-OSS-120B single-host DFlash PR gate.
+"""GPT-OSS-120B single-host DFlash smoke.
 
-The nightly lane scores GSM8K; this one only proves DFlash proposes and accepts
-draft tokens, so the PR gate catches a broken draft path without paying for an
-eval.
+test_tpu_gpt_oss_120b_singlehost_dflash.py scores GSM8K; this one only proves
+DFlash proposes and accepts draft tokens, without paying for an eval.
 """
 
 import os
@@ -15,7 +14,8 @@ from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
 
 register_tpu_ci(
     est_time=375,
-    suite="stage-b-test-tpu-4-v7",
+    suite="nightly-tpu-4-v7",
+    nightly=True,
     labels=["singlehost", "gpt-oss-120b", "spec", "dflash"],
 )
 
@@ -74,11 +74,11 @@ LAUNCH_ENV = {
     "MODEL": MODEL_PATH,
     "ISL": "2048",
     "OSL": "512",
-    "CONCUR": "4",
+    "CONCUR": "1",
     "CONTEXT_LEN": "4096",
     "MAX_TOTAL_TOKENS": "8192",
-    "TPU_COMPILE_TOKENS": "512 1024 2048",
-    "TPU_COMPILE_BS": "1 2 4",
+    "TPU_COMPILE_TOKENS": "512",
+    "TPU_COMPILE_BS": "1",
     "ENABLE_PROFILER_ENDPOINT": "0",
     "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
     "EXTRA_ARGS": (

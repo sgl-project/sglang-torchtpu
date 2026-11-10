@@ -2,6 +2,14 @@ from transformers.configuration_utils import PretrainedConfig
 
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 
+_KIMI_K3_DSA_TOP_LEVEL_CONFIG_KEYS = (
+    "index_topk",
+    "index_n_heads",
+    "index_head_dim",
+    "index_topk_freq",
+    "index_skip_topk_offset",
+)
+
 
 class KimiK3VisionConfig(PretrainedConfig):
     model_type = "kimi_k3_vision"
@@ -113,6 +121,10 @@ class KimiK3Config(PretrainedConfig):
         if getattr(self.text_config, "quantization_config", None) is not None:
             self.quantization_config = self.text_config.quantization_config
 
+        if self.text_config.dsa_config is not None:
+            for key in _KIMI_K3_DSA_TOP_LEVEL_CONFIG_KEYS:
+                setattr(self, key, getattr(self.text_config, key))
+
         super().__init__(pad_token_id=pad_token_id, **kwargs)
 
     @property
@@ -122,3 +134,13 @@ class KimiK3Config(PretrainedConfig):
     @property
     def vocab_size(self) -> int:
         return self.text_config.vocab_size
+
+
+class KimiK31Config(KimiK3Config):
+    """Kimi-K3.1: Kimi-K3 with DSA sparse attention on every MLA layer."""
+
+    model_type = "kimi_k31"
+
+    # Without it transformers generates an __init__ that skips KimiK3Config's.
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)

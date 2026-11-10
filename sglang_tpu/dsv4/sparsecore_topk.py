@@ -49,6 +49,8 @@ NUM_BUCKETS = 256
 # Largest per-subcore resident slice, in 32-bit words (128KB; double-buffered by
 # emit_pipeline to 256KB out of the 512KB tile memory).
 MAX_SLICE_WORDS = 32 * 1024
+# Width step of the short-row buckets.
+SHORT_ROW_BUCKET = 4096
 # Unroll factor for the loops that walk the whole resident slice.
 SCAN_UNROLL = 8
 
@@ -72,7 +74,7 @@ def _cdiv_dyn(x):
 
 
 def _topk_body(
-    scores_hbm,  # i32[padded_b, slice_len] (fp32 score bits)
+    scores_hbm,  # i32[b or padded_b, slice_len] (fp32 score bits)
     lengths_hbm,  # i32[padded_b, LANES]
     out_hbm,  # i32[padded_b, k]
     keys_hbm,  # i32[padded_b, k]          (fp32 winner score bits)
@@ -291,9 +293,11 @@ def _topk_body(
     cores_per_chip = num_sc_cores * num_subcores
     buf_count = 1 if num_waves == 1 else 2
     in_specs = (
+        # scores_hbm may hold only the b real rows. A subcore past them reads
+        # the last real row instead and ignores it (its length is 0).
         pl.BlockSpec(
             (slice_len,),
-            lambda w: (w * cores_per_chip + flat,),
+            lambda w: (jnp.minimum(w * cores_per_chip + flat, b - 1),),
             pipeline_mode=pl.Buffered(buf_count),
         ),
         pl.BlockSpec(
@@ -379,10 +383,11 @@ def _sc_topk_direct(
     slice_len = _align_to(n, LANES)
     num_waves = _cdiv(b, 32)
     padded_b = num_waves * 32
-    pad_b = padded_b - b
+    # Only the lengths and outputs need padded_b rows: padding the scores would
+    # copy a decode step's few rows out to 32.
     pad_n = slice_len - n
-    if pad_b > 0 or pad_n > 0:
-        words = jnp.pad(words, ((0, pad_b), (0, pad_n)))
+    if pad_n > 0:
+        words = jnp.pad(words, ((0, 0), (0, pad_n)))
 
     lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b))
     lengths_2d = jnp.pad(lengths[:, None], ((0, 0), (0, LANES - 1)))
@@ -433,6 +438,13 @@ def _sc_topk_direct(
 def _pick_partition(b: int, n: int, k: int) -> int:
     """Picks the power-of-two partition factor P (1..32) per row."""
     p_min = _cdiv(n, MAX_SLICE_WORDS)
+    # A row that fits one subcore runs fastest unpartitioned: stage 2 and the
+    # index remap cost more than the parallel stage 1 saves. On TPU7x with
+    # k=2048, b in {1, 4, 16} and n in 8K..32K, P=1 takes 20-31 us against
+    # 34-45 us for any P > 1. It selects the same set as P > 1, but the
+    # output order (and so a downstream sparse-MLA summation order) can differ.
+    if p_min == 1:
+        return 1
     p = 1
     while p < p_min:
         p *= 2
@@ -440,7 +452,15 @@ def _pick_partition(b: int, n: int, k: int) -> int:
     max_p = 32 // b if b < 32 else 1
     while p * 2 <= max_p:
         next_np = n // (p * 2)
-        if next_np >= k and next_np >= LANES and (n % (p * 2)) == 0:
+        # Keep the stage-2 merge (P * k candidates) within one slice: past it,
+        # stage 2 recurses into this jitted function, which JAX rejects, and
+        # at n >= 64K with k=2048 the recursion picks the same P again.
+        if (
+            next_np >= k
+            and next_np >= LANES
+            and (n % (p * 2)) == 0
+            and p * 2 * min(k, next_np) <= MAX_SLICE_WORDS
+        ):
             p *= 2
         else:
             break
@@ -466,8 +486,15 @@ def sparsecore_topk(
     scheduling_group_id: int | None = None,
     stage2_scheduling_group_id: int | None = None,
     return_scores: bool = False,
+    branch_max_len: jax.Array | None = None,  # i32 scalar
 ) -> jax.Array | tuple[jax.Array, jax.Array]:  # i32[b, k] or (i32[b, k], i32[b, k])
-    """Exact top-k indices per row, unsorted, -1 suffix-padded."""
+    """Exact top-k indices per row, unsorted, -1 suffix-padded.
+
+    ``branch_max_len`` replaces ``max(row_lengths)`` when choosing the
+    short-row width branch. A caller that selects a slice of a larger batch's
+    rows passes the larger batch's longest row, so every row runs the same
+    branch (same width, same tie-breaking) as in the unsliced call.
+    """
     if scores.ndim != 2:
         raise ValueError(f"scores must be 2D, got {scores.shape}")
     if scores.dtype not in (jnp.float32, jnp.int32):
@@ -485,6 +512,53 @@ def sparsecore_topk(
 
     p = _pick_partition(b, n, k)
 
+    # A pool sized for long contexts pads every row to n, but rows whose valid
+    # prefix fits one slice (all short sequences) need neither the partitioned
+    # stage 1 nor the stage-2 merge and remap: pick at run time.
+    if p > 1 and _short_rows_fast_path():
+        # One branch per width bucket: a single pass costs ~linear in its
+        # width, so a 9K-token row should not pay for a 32K-wide scan.
+        widths = [
+            w
+            for w in range(SHORT_ROW_BUCKET, MAX_SLICE_WORDS + 1, SHORT_ROW_BUCKET)
+            if w >= k
+        ]
+
+        def _short(width):
+            return lambda _: _sc_topk_direct(
+                scores[:, :width],
+                k,
+                row_lengths,
+                write_empty=write_empty_rows,
+                scheduling_group_id=scheduling_group_id,
+            )
+
+        def _long(_):
+            return _partitioned_topk(
+                scores,
+                k,
+                row_lengths,
+                p,
+                write_empty_rows,
+                scheduling_group_id,
+                stage2_scheduling_group_id,
+            )
+
+        # Index of the narrowest bucket that holds every row; len(widths)
+        # (the partitioned path) when some row exceeds one slice.
+        max_len = (
+            jnp.max(row_lengths)
+            if branch_max_len is None
+            else jnp.asarray(branch_max_len, jnp.int32)
+        )
+        branch = jnp.sum(jnp.asarray(widths, jnp.int32) < max_len)
+        slots, keys = jax.lax.switch(
+            branch, [_short(w) for w in widths] + [_long], None
+        )
+        if return_scores:
+            return slots, keys
+        return slots
+
     # Fast-path: single-stage execution when p == 1
     if p == 1:
         slots, keys = _sc_topk_direct(
@@ -498,6 +572,38 @@ def sparsecore_topk(
             return slots, keys
         return slots
 
+    final_indices, final_cand_scores = _partitioned_topk(
+        scores,
+        k,
+        row_lengths,
+        p,
+        write_empty_rows,
+        scheduling_group_id,
+        stage2_scheduling_group_id,
+    )
+    if return_scores:
+        return final_indices, final_cand_scores
+    return final_indices
+
+
+def _short_rows_fast_path() -> bool:
+    # Read at trace time; a process keeps one value.
+    from sglang_tpu.envs import envs as tpu_envs
+
+    return tpu_envs.SGLANG_TPU_SCTOPK_SHORT_ROWS.get()
+
+
+def _partitioned_topk(
+    scores,
+    k,
+    row_lengths,
+    p,
+    write_empty_rows,
+    scheduling_group_id,
+    stage2_scheduling_group_id,
+):
+    """Two-stage top-k over P slices per row: (indices, keys), each [b, k]."""
+    b, n = scores.shape
     # Stage 1: Partition each row into P slices and find local top-k candidates
     n_p = n // p
     k_p = min(k, n_p)
@@ -549,6 +655,4 @@ def sparsecore_topk(
     final_indices = jnp.take_along_axis(global_cand_indices, safe_slots, axis=1)
     final_indices = jnp.where(final_cand_slots >= 0, final_indices, -1)
 
-    if return_scores:
-        return final_indices, final_cand_scores
-    return final_indices
+    return final_indices, final_cand_scores

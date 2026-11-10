@@ -196,6 +196,32 @@ class AttentionImpl(ABC, Generic[T]):
             f"{type(self).__name__} does not implement ring KV-chunk attention"
         )
 
+    def forward_ring_resume(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_info: torch.Tensor,
+        carry: Any = None,
+    ) -> tuple[torch.Tensor, Any]:
+        """Attend to one shard of all-gathered K/V, resuming the softmax.
+
+        ``query`` is heads-major ``[B, H, S, D]``; ``key``/``value`` stack the
+        gathered shards ``[N, H_kv, S_kv, D]``. ``kv_info`` is a device int32
+        ``[row offset, real keys]``: the shard's rows of the batch-flattened
+        stack, and how many of its leading keys are real. ``carry`` is the
+        previous step's second return value; the returned output is attention
+        over every shard visited so far. Rank-dependent choices travel in
+        ``kv_info``, so every rank runs the same program.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement all-gather ring attention"
+        )
+
+    @classmethod
+    def supports_ring_resume(cls) -> bool:
+        return cls.forward_ring_resume is not AttentionImpl.forward_ring_resume
+
 
 def wrap_attention_impl_forward(attn_impl: AttentionImpl) -> AttentionImpl:
     return wrap_method_with_debug_kernel_once(

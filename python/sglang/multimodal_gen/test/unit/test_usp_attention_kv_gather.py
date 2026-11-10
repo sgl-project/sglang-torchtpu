@@ -62,6 +62,24 @@ def _reference_attention(q, k, v, scale, key_mask=None, query_mask=None):
     return out
 
 
+class _RankInvariantMeta(dict):
+    """Tail-pad meta whose rank-local entries fail when read: the pad span is
+    the same on every rank, the per-rank pad count is not, and a path compiled
+    in an spmd-safe region must run the same program on every rank."""
+
+    rank_local_keys = frozenset({"local_pad"})
+
+    def get(self, key, default=None):
+        if key in self.rank_local_keys:
+            raise AssertionError(f"read the rank-local {key}")
+        return super().get(key, default)
+
+    def __getitem__(self, key):
+        if key in self.rank_local_keys:
+            raise AssertionError(f"read the rank-local {key}")
+        return super().__getitem__(key)
+
+
 class TestUSPAttentionKVGather(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(0)
@@ -154,6 +172,41 @@ class TestUSPAttentionKVGather(unittest.TestCase):
         )
 
         torch.testing.assert_close(out, expected)
+
+    def test_tail_pad_meta_attends_the_global_real_prefix_on_every_rank(self):
+        real, local_len, world = 5, 3, 2
+        full_k = torch.randn(2, local_len * world, self.heads, self.head_dim)
+        full_v = torch.randn(2, local_len * world, self.heads, self.head_dim)
+        # Pad keys that would dominate the softmax if they were not masked.
+        full_k[:, real:] = 1e2
+        full_v[:, real:] = 1e4
+        impl_forward = self.attn.attn_impl.forward
+        kv_lengths = []
+
+        def recording_forward(q, k, v, ctx):
+            kv_lengths.append((k.shape[1], v.shape[1]))
+            return impl_forward(q, k, v, ctx)
+
+        for rank in range(world):
+            with self.subTest(rank=rank):
+                kv_lengths.clear()
+                q = torch.randn(2, local_len, self.heads, self.head_dim)
+                meta = _RankInvariantMeta(
+                    pad_start=real,
+                    pad_end=local_len * world,
+                    local_pad=(local_len * world - real) if rank == world - 1 else 0,
+                )
+                # Two gathers (K and V) and no third for a mask; the selected
+                # impl attends the real-key prefix, without masked SDPA.
+                with patch.object(self.attn.attn_impl, "forward", recording_forward):
+                    out = self._run(q, q, q, [full_k, full_v], attn_mask_meta=meta)
+                self.assertEqual(kv_lengths, [(real, real)])
+                expected = _reference_attention(
+                    q, full_k[:, :real], full_v[:, :real], self.attn.softmax_scale
+                )
+                rows = min(local_len, real - rank * local_len)
+                torch.testing.assert_close(out[:, :rows], expected[:, :rows])
+                self.assertFalse(out.isnan().any())
 
     def test_separate_replicated_kv_prefix_gathers_only_suffix(self):
         q = torch.randn(1, 3, self.heads, self.head_dim)

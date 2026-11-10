@@ -646,7 +646,10 @@ def make_app(
                 reason = ev[2]
             else:
                 return JSONResponse({"error": {"message": ev[1]}}, status_code=500)
-        return JSONResponse(dict(text=det.sent, meta_info=meta(finish(reason, det), n)))
+        out = dict(text=det.sent, meta_info=meta(finish(reason, det), n))
+        if body.get("return_ids"):
+            out["output_ids"] = det.ids
+        return JSONResponse(out)
 
     return app
 

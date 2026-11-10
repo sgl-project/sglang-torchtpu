@@ -61,7 +61,16 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import pd_decode_swa_hicache as tpu
+from sglang_tpu.kv_pool_host import (
+    _TPU_UNIFIED_SWA_STRATEGY,
+    register_unified_hicache_strategy,
+)
 from sglang_tpu.tpu_dma_hybrid_cache_controller import TpuDMAHybridCacheController
+from sglang_tpu.unified_kv_pool import (
+    AttnLayerSpec,
+    TpuUnifiedSWAKVPool,
+    TpuUnifiedSWATokenToKVPoolAllocator,
+)
 
 ASSEMBLER = "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler"
 BUILDER = "sglang.srt.mem_cache.kv_cache_builder"
@@ -112,7 +121,6 @@ def make_req():
         last_node=1,
         lock_receipt=swa_receipt(node_id=1, swa_uuid=17),
         swa_prefix_lock_released=True,
-        swa_stale_window_floor=None,
         kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=64),
         _compute_max_prefix_len=lambda n: n - 1,
         finished=lambda: False,
@@ -573,6 +581,86 @@ class TestFullOnlyStrategy(CustomTestCase):
         )
         # init_hicache derives has_swa_host_pool=False from this.
         self.assertIsNone(cache.components[ComponentType.SWA]._swa_kv_pool_host)
+
+    def test_unified_swa_pool_uses_full_only_strategy_in_both_registration_orders(self):
+        orig_strategies = list(hybrid_pool_assembler._STRATEGIES)
+        self.addCleanup(
+            hybrid_pool_assembler._STRATEGIES.__setitem__, slice(None), orig_strategies
+        )
+        for pd_first in (True, False):
+            with self.subTest(pd_first=pd_first), installed_patches():
+                hybrid_pool_assembler._STRATEGIES[:] = [
+                    s
+                    for s in orig_strategies
+                    if s not in (tpu._FULL_ONLY_SWA_STRATEGY, _TPU_UNIFIED_SWA_STRATEGY)
+                ]
+                if pd_first:
+                    hybrid_pool_assembler.register_stack_strategy(
+                        tpu._FULL_ONLY_SWA_STRATEGY
+                    )
+                    register_unified_hicache_strategy()
+                else:
+                    register_unified_hicache_strategy()
+                    hybrid_pool_assembler.register_stack_strategy(
+                        tpu._FULL_ONLY_SWA_STRATEGY
+                    )
+
+                pool = TpuUnifiedSWAKVPool(
+                    size=64,
+                    page_size=4,
+                    dtype=torch.bfloat16,
+                    full=AttnLayerSpec(head_num=2, head_dim=128, layer_ids=[1, 3]),
+                    swa=AttnLayerSpec(head_num=2, head_dim=128, layer_ids=[0, 2, 4]),
+                    device="cpu",
+                )
+                req_pool = ReqToTokenPool(
+                    size=4, max_context_len=64, device="cpu", enable_memory_saver=False
+                )
+                alloc = TpuUnifiedSWATokenToKVPoolAllocator(
+                    size=64,
+                    page_size=4,
+                    dtype=torch.bfloat16,
+                    device="cpu",
+                    kvcache=pool,
+                    need_sort=False,
+                    req_to_token_pool=req_pool,
+                )
+                params = CacheInitParams(
+                    disable=False,
+                    req_to_token_pool=req_pool,
+                    token_to_kv_pool_allocator=alloc,
+                    page_size=4,
+                    sliding_window_size=8,
+                    tree_components=(ComponentType.FULL, ComponentType.SWA),
+                )
+                with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("python"):
+                    cache = UnifiedRadixCache(params)
+                components = {ComponentType.FULL, ComponentType.SWA}
+                self.assertIs(
+                    hybrid_pool_assembler._select_strategy(pool, components),
+                    _TPU_UNIFIED_SWA_STRATEGY,
+                )
+                with (
+                    patch(TPU + ".get_memory", return_value=memory()),
+                    patch(ASSEMBLER + ".build_kv_host_pool", autospec=True) as hp_mock,
+                    patch(TPU + ".HybridCacheController.create_for_backend") as ctrl,
+                    tpu._full_only_host_cache_build(None),
+                ):
+                    hybrid_pool_assembler.attach_hybrid_pool_to_unified_cache(
+                        cache,
+                        params,
+                        ServerArgs(model_path="dummy"),
+                        load_cache_event=None,
+                    )
+                self.assertIs(hp_mock.call_args.kwargs["kv_pool"], pool.kv_pool)
+                entry = cache.host_pool_group.entry_map[PoolName.KV]
+                self.assertIs(entry.device_pool, pool.kv_pool)
+                self.assertEqual(ctrl.call_args.kwargs["transfer_layer_id_max"], 5)
+                self.assertEqual(
+                    {i: entry.layer_mapper(i) for i in range(6)},
+                    {0: None, 1: 0, 2: None, 3: 1, 4: None, 5: None},
+                )
+                self.assertIsNone(cache.components[ComponentType.SWA]._swa_kv_pool_host)
 
 
 class TestAdmissionAndAllocation(CustomTestCase):

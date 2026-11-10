@@ -1179,22 +1179,164 @@ class TestPipelineInitialization(unittest.TestCase):
 
 
 class TestDraftPoolGroups(unittest.TestCase):
-    def pool(self, layers=2):
-        return SimpleNamespace(
-            start_layer=0, kv_buffer=[Buffer() for _ in range(layers)]
-        )
+    class SixteenHeadBf16Buffer(Bf16Buffer):
+        """Sixteen kv-heads in bf16: 1,048,576 bytes per 128-token page."""
+
+        def __init__(self, pages=64):
+            self.shape = (pages, 128, 16, 2, 128)
+
+    def pool(self, layers=2, head_num=None):
+        ns = SimpleNamespace(start_layer=0, kv_buffer=[Buffer() for _ in range(layers)])
+        if head_num is not None:
+            ns.head_num = head_num
+        return ns
 
     def test_target_pool_alone_has_no_draft_pool(self):
-        target = self.pool()
-        self.assertEqual(get_raiden_kv_caches(target).num_draft_full, 0)
-        self.assertEqual(
-            get_raiden_kv_caches(target, draft_pool=target).num_draft_full, 0
-        )
+        target = self.pool(head_num=16)
+        without_draft = get_raiden_kv_caches(target)
+        self.assertEqual(without_draft.num_draft_full, 0)
+        self.assertIsNone(without_draft.draft_kv_head_num)
+        self.assertIsNone(without_draft.draft_swa_kv_head_num)
+        same_pool = get_raiden_kv_caches(target, draft_pool=target)
+        self.assertEqual(same_pool.num_draft_full, 0)
+        self.assertIsNone(same_pool.draft_kv_head_num)
 
     def test_separate_draft_pool_is_appended_and_counted(self):
-        groups = get_raiden_kv_caches(self.pool(), draft_pool=self.pool(layers=1))
+        groups = get_raiden_kv_caches(
+            self.pool(head_num=16), draft_pool=self.pool(layers=1, head_num=8)
+        )
         self.assertEqual(groups.num_draft_full, 1)
         self.assertEqual(groups.full_layer_ids, [0, 1, 0])
+        self.assertEqual(groups.draft_kv_head_num, 8)
+        self.assertEqual(groups.draft_swa_kv_head_num, 8)
+
+    def test_hybrid_swa_draft_pool_records_subpool_head_counts(self):
+        draft = SimpleNamespace(
+            start_layer=0,
+            kv_buffer=[Buffer(), Buffer()],
+            layers_mapping={0: (0, False), 1: (0, True)},
+            full_kv_pool=SimpleNamespace(head_num=8),
+            swa_kv_pool=SimpleNamespace(head_num=4),
+        )
+        groups = get_raiden_kv_caches(self.pool(head_num=16), draft_pool=draft)
+        self.assertEqual((groups.num_draft_full, groups.num_draft_swa), (1, 1))
+        self.assertEqual(groups.draft_kv_head_num, 8)
+        self.assertEqual(groups.draft_swa_kv_head_num, 4)
+
+    def test_head_slice_spans_slice_draft_pools_by_draft_kv_heads(self):
+        """A 16-head target (e.g. Muse Spark) paired with an 8-head draft
+        (DFlash2) must slice draft.* pages by 8 heads so spans stay within the
+        524,288-byte draft page, while fa.* and pdhid.* stay on 16 heads."""
+        layers = SimpleNamespace(
+            full=[
+                self.SixteenHeadBf16Buffer(),
+                Bf16Buffer(),
+                self.SixteenHeadBf16Buffer(),
+            ],
+            swa=[],
+            full_layer_ids=[54, 0, 0],
+            swa_layer_ids=[],
+            num_draft_full=1,
+            num_hidden_full=1,
+            num_draft_swa=0,
+        )
+        pools = pool_manifest(layers)
+        self.assertEqual(
+            [p["tag"] for p in pools], ["fa.l54", "draft.fa.l0", "pdhid.fa.l0"]
+        )
+        for kwargs in ({"draft_total_kv_heads": 8}, {}):
+            with self.subTest(kwargs=kwargs):
+                fa_entry, draft_entry, pdhid_entry = head_slice_spans(
+                    pools, layers.full, [20], [], 8, 16, **kwargs
+                )
+                for entry in (fa_entry, pdhid_entry):
+                    for span in entry.spans:
+                        self.assertEqual(
+                            (span.size_bytes, span.src_stride_bytes), (1024, 8192)
+                        )
+                for span in draft_entry.spans:
+                    self.assertEqual(
+                        (span.size_bytes, span.src_stride_bytes, span.dst_stride_bytes),
+                        (512, 4096, 512),
+                    )
+                    end = (
+                        span.src_offset_bytes
+                        + (span.count - 1) * span.src_stride_bytes
+                        + span.size_bytes
+                    )
+                    self.assertLessEqual(end, pools[1]["block_stride_bytes"])
+                self.assertEqual(
+                    max(
+                        s.src_offset_bytes
+                        + (s.count - 1) * s.src_stride_bytes
+                        + s.size_bytes
+                        for s in draft_entry.spans
+                    ),
+                    524288,
+                )
+
+    def test_pipeline_register_blocks_passes_draft_kv_heads_to_full_and_swa_pools(self):
+        from sglang_tpu.disaggregation.raiden import pp_swa
+
+        pipe = transfer(producer=True, pp_size=8, pp_rank=7)
+        pipe.manager.kv_args.total_kv_head_num = 16
+        pipe.draft_kv_heads = 8
+        pipe.draft_swa_kv_heads = 4
+        layers = SimpleNamespace(
+            full=[self.SixteenHeadBf16Buffer(), Bf16Buffer()],
+            swa=[self.SixteenHeadBf16Buffer(), Bf16FourHeadBuffer()],
+            full_layer_ids=[54, 0],
+            swa_layer_ids=[55, 1],
+            num_draft_full=1,
+            num_hidden_full=0,
+            num_draft_swa=1,
+        )
+        pipe.pools, swa_pools = pp_swa.split_manifest(pool_manifest(layers))
+        pipe.tensors = list(layers.full)
+        swa_client = Mock()
+        pipe.swa = pp_swa.SwaLink(
+            pools=swa_pools,
+            tensors=list(layers.swa),
+            controller="decode-swa:30001",
+            unit_fields=pipe.unit_fields,
+            dst_units=pipe.dst_units,
+            max_blocks=4,
+            slots=4,
+            hold_undeclared=False,
+        )
+        pipe.swa.client = swa_client
+        pipe.replies[7] = {0: {"attn_tp_size": 8}}
+        self.assertTrue(
+            pipe._register_blocks(
+                7, req_id="7", uuid=7, full=[20], swa=[30], with_swa=True
+            )
+        )
+        full_spans = pipe.client.register_request_blocks.call_args.kwargs["pool_spans"]
+        self.assertEqual([e.tag for e in full_spans], ["fa.l54", "draft.fa.l0"])
+        self.assertEqual(
+            (
+                full_spans[0].spans[0].size_bytes,
+                full_spans[0].spans[0].src_stride_bytes,
+            ),
+            (1024, 8192),
+        )
+        self.assertEqual(
+            (
+                full_spans[1].spans[0].size_bytes,
+                full_spans[1].spans[0].src_stride_bytes,
+            ),
+            (512, 4096),
+        )
+        swa_spans = swa_client.register_request_blocks.call_args.kwargs["pool_spans"]
+        self.assertEqual([e.tag for e in swa_spans], ["swa.l55", "draft.swa.l1"])
+        self.assertEqual(
+            (swa_spans[0].spans[0].size_bytes, swa_spans[0].spans[0].src_stride_bytes),
+            (1024, 8192),
+        )
+        self.assertEqual(
+            (swa_spans[1].spans[0].size_bytes, swa_spans[1].spans[0].src_stride_bytes),
+            (512, 2048),
+        )
 
 
 if __name__ == "__main__":

@@ -609,6 +609,14 @@ class BailingMoE(nn.Module):
             and self.routed_scaling_factor is not None
             and self.routed_scaling_factor != 1.0
         )
+        # The TPU MoE runners never apply routed_scaling_factor; like deepseek_v2
+        # on non-CUDA, the model layer owns it on the standard dispatcher path.
+        self._scale_routed_output_on_tpu = (
+            _is_tpu
+            and not self._enable_a2a_moe
+            and self.routed_scaling_factor is not None
+            and self.routed_scaling_factor != 1.0
+        )
 
         if self.num_shared_experts > 0 and self.num_fused_shared_experts == 0:
             intermediate_size = getattr(
@@ -736,6 +744,8 @@ class BailingMoE(nn.Module):
                 hidden_states, forward_batch
             )
 
+        if self._scale_routed_output_on_tpu:
+            final_hidden_states = final_hidden_states * self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
         return final_hidden_states

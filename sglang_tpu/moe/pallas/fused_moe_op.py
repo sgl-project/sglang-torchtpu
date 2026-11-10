@@ -134,15 +134,16 @@ def _drop_invalid_slots(
     topk_ids: "jax.Array",
     topk_weights: "jax.Array",
     num_route_experts: int,
-    zero_dropped_tokens: bool,
+    one_hot_permute: bool,
 ) -> tuple["jax.Array", "jax.Array", "jax.Array"]:
     """Route slots with an id outside ``[0, num_route_experts)`` to
     ``num_route_experts`` with zero weight (TopK marks padded tokens -1).
 
     That id sorts after every real row, has no group in ``group_sizes`` and
     lies outside the EP row window, so no GMM computes the slot.
-    ``zero_dropped_tokens`` zeroes tokens with no live slot for the one-hot
-    permute matmul, which reads every row (``0 * NaN`` would reach real rows).
+    ``one_hot_permute`` is set when the permute is a one-hot matmul over every
+    token, where ``0 * NaN`` from one token reaches every row. It zeroes tokens
+    with no live slot and non-finite hidden states of live tokens.
     """
     import jax.numpy as jnp
 
@@ -150,9 +151,11 @@ def _drop_invalid_slots(
     dropped = (topk_ids < 0) | (topk_ids >= num_route_experts)
     topk_ids = jnp.where(dropped, num_route_experts, topk_ids)
     topk_weights = jnp.where(dropped, 0, topk_weights)
-    if zero_dropped_tokens:
+    if one_hot_permute:
         token_dropped = jnp.all(dropped, axis=1, keepdims=True)
-        hidden_states = jnp.where(token_dropped, 0, hidden_states)
+        hidden_states = jnp.where(
+            token_dropped | ~jnp.isfinite(hidden_states), 0, hidden_states
+        )
     return hidden_states, topk_ids, topk_weights
 
 
@@ -508,6 +511,7 @@ def _fused_moe_jax(
     w1_channel_scale=None,
     w2_channel_scale=None,
     expert_group_offset_tensor=None,
+    gather_permute_with_sc_combine=0,
 ):
     """Production fused-MoE kernel body. Exported by ``_build_fused_moe_op``.
 
@@ -653,23 +657,36 @@ def _fused_moe_jax(
             topk_weights, ((0, m_pad - m), (0, 0))
         )  # pad -> weight 0
         m = m_pad
+
+    # The one-hot permute runs below the threshold in tokens (m), the one-hot
+    # combine below it in routed rows (m*topk); between the two the combine
+    # gathers. gather_permute_with_sc_combine moves the permute to the gather
+    # there when the combine is the SparseCore one (see its env var).
+    use_dense_unpermute = (m * topk) < permute_dense_threshold and not no_combine
+    use_dense_permute = m < permute_dense_threshold and not (
+        gather_permute_with_sc_combine
+        and use_sc_gather
+        and not no_combine
+        and not use_dense_unpermute
+    )
     hidden_states, topk_ids, topk_weights = _drop_invalid_slots(
         hidden_states,
         topk_ids,
         topk_weights,
         max(global_num_experts, num_experts),
-        zero_dropped_tokens=m < permute_dense_threshold,
+        one_hot_permute=use_dense_permute,
     )
+    if m < permute_dense_threshold:
+        # The one-hot permute and combine are matmuls over every token and
+        # 0 * NaN is NaN, so zero a live token's non-finite values to keep them local.
+        hidden_states = jnp.where(jnp.isfinite(hidden_states), hidden_states, 0)
+        topk_weights = jnp.where(jnp.isfinite(topk_weights), topk_weights, 0)
 
     # Routing: build a permutation that puts rows of hidden_states in
     # expert-major order so a single grouped-matmul covers GMM1 / GMM2.
     topk_ids_flat = topk_ids.reshape(-1).astype(jnp.int32)  # [m*topk]
     use_group_offset = global_num_experts > num_experts
 
-    # Decide whether to use the dense permute/un-permute paths based on the
-    # number of rows (m) and the number of routed rows (m*topk).
-    use_dense_permute = m < permute_dense_threshold
-    use_dense_unpermute = (m * topk) < permute_dense_threshold and not no_combine
     # One real token (bs=1 decode) on the dense path (threshold > m_pad * topk,
     # combine on): every routed row is token 0, so the permute is a broadcast
     # and only the expert-major metadata is needed. One SMEM kernel builds it
@@ -730,6 +747,17 @@ def _fused_moe_jax(
             gather_end,
         )
     else:
+        if w1_scale is None and w1.shape[1] != hidden_size:
+            assert w1.shape[1] % 128 == 0, (
+                f"gmm_v2 w1 K={w1.shape[1]} is not lane-aligned; pad the weight K "
+                "to a multiple of 128 at load time"
+            )
+            # Zero-pad activations to the load-padded weight's lane-aligned K
+            # before the gather so the pad runs on [m, :] instead of [m*topk, :]
+            # and the gather reads 128-lane-aligned rows.
+            hidden_states = jnp.pad(
+                hidden_states, ((0, 0), (0, w1.shape[1] - hidden_size))
+            )
         x_sorted = hidden_states[sorted_token_ids]  # [m*topk, k]
 
     # Multi-token dense decode: route on local expert ids with a sort-free rank
@@ -797,10 +825,10 @@ def _fused_moe_jax(
             f"gmm_v2 w1 K={w1.shape[1]} is not lane-aligned; pad the weight K "
             "to a multiple of 128 at load time"
         )
-        if w1.shape[1] != hidden_size:
+        if w1.shape[1] != x_sorted.shape[1]:
             # activations are born at model width; zero-pad K to the
             # load-padded weight's width (0 * w = 0, exact)
-            x_sorted = jnp.pad(x_sorted, ((0, 0), (0, w1.shape[1] - hidden_size)))
+            x_sorted = jnp.pad(x_sorted, ((0, 0), (0, w1.shape[1] - x_sorted.shape[1])))
     elif hidden_size % 128 != 0:
         raise NotImplementedError(
             f"Quantized MoE with non-lane-aligned hidden dim ({hidden_size}) "
@@ -884,7 +912,7 @@ def _fused_moe_jax(
             _gmm2_tile_source(gmm1_out, w2, w2_scale, num_experts, w2_packed=w2_packed)
         )
     )
-    gmm2_out = gmm_v2(
+    gmm2_raw = gmm_v2(
         lhs=gmm1_out,
         rhs=w2,
         group_sizes=group_sizes,
@@ -899,10 +927,8 @@ def _fused_moe_jax(
         maybe_quantize_lhs=maybe_quantize_lhs,
         rhs_quant_dtype=rhs_quant_dtype,
         dequantize_rhs=dequantize_int4_in_vmem,
-    )[
-        :,
-        :hidden_size,
-    ]  # [m*topk, k]
+    )  # [m*topk, k_padded]
+    gmm2_out = gmm2_raw[:, :hidden_size]  # [m*topk, k]
 
     # Un-permute back to token-major order. Models that apply a post-expert
     # norm ask the runner for no_combine output so they can RMSNorm each top-k
@@ -981,24 +1007,34 @@ def _fused_moe_jax(
         )
     else:
         # Gather on the TensorCore.
+        if not no_combine:
+            # Unroll the top-k gather + weighted sum so XLA fuses the per-slot
+            # gathers with the reduction in VMEM instead of materializing a
+            # [m, topk, hidden_size] intermediate tensor to HBM. Keep gmm2_raw
+            # at its lane-aligned width through the gather and slice to
+            # hidden_size once on the combined [m_orig, :] output.
+            unsort_2d = unsort_idx[: m_orig * topk].reshape(m_orig, topk)
+            w_2d = topk_weights[:m_orig].reshape(m_orig, topk).astype(jnp.float32)
+            acc = None
+            for k_idx in range(topk):
+                wk = w_2d[:, k_idx : k_idx + 1]
+                row_k = gmm2_raw[unsort_2d[:, k_idx]].astype(jnp.float32)
+                term = row_k * wk
+                acc = term if acc is None else (acc + term)
+            return acc[:, :hidden_size].astype(out_dtype)
         unsorted = gmm2_out[unsort_idx]
     unsorted = unsorted.reshape(m, topk, hidden_size)
     unsorted = unsorted[:m_orig].astype(out_dtype)
-    if no_combine:
-        # Zero the rows this rank did not compute (dropped and non-local slots),
-        # so a later post-norm + combine with the original router weights never
-        # reads them.
-        if use_group_offset:
-            valid_rows_mask = _valid_rows_mask(row_start, row_end, unsort_idx)[
-                : m_orig * topk
-            ].reshape(m_orig, topk, 1)
-        else:
-            valid_rows_mask = topk_weights[:m_orig].reshape(m_orig, topk, 1) != 0
-        return jnp.where(valid_rows_mask, unsorted, jnp.zeros_like(unsorted))
-
-    weights = topk_weights[:m_orig].reshape(m_orig, topk, 1).astype(unsorted.dtype)
-    out = (unsorted * weights).sum(axis=1).astype(out_dtype)
-    return out
+    # no_combine: zero the rows this rank did not compute (dropped and
+    # non-local slots), so a later post-norm + combine with the original
+    # router weights never reads them.
+    if use_group_offset:
+        valid_rows_mask = _valid_rows_mask(row_start, row_end, unsort_idx)[
+            : m_orig * topk
+        ].reshape(m_orig, topk, 1)
+    else:
+        valid_rows_mask = topk_weights[:m_orig].reshape(m_orig, topk, 1) != 0
+    return jnp.where(valid_rows_mask, unsorted, jnp.zeros_like(unsorted))
 
 
 def _build_fused_moe_op():
@@ -1044,6 +1080,7 @@ def _build_fused_moe_op():
         w1_channel_scale: Optional[jax.Array] = None,
         w2_channel_scale: Optional[jax.Array] = None,
         expert_group_offset_tensor: Optional[jax.Array] = None,
+        gather_permute_with_sc_combine: int = 0,
     ) -> jax.Array:
         return _fused_moe_jax(
             hidden_states,
@@ -1066,6 +1103,7 @@ def _build_fused_moe_op():
             w1_channel_scale,
             w2_channel_scale,
             expert_group_offset_tensor,
+            gather_permute_with_sc_combine,
         )
 
     custom_op = jax_op(op_name, _wrapped)
@@ -1091,6 +1129,7 @@ def _build_fused_moe_op():
         w1_channel_scale: Optional[torch.Tensor] = None,
         w2_channel_scale: Optional[torch.Tensor] = None,
         expert_group_offset_tensor: Optional[torch.Tensor] = None,
+        gather_permute_with_sc_combine: int = 0,
     ):
         if no_combine:
             return hidden_states.new_empty(
@@ -1116,19 +1155,17 @@ def _resolve_expert_group_offset(
     ``trace_rank`` so every EP rank traces identical MLIR (``spmd_safe``).
 
     Outside a rank-parameterized trace (eager, dynamo, EP=1) the offset stays a
-    static int and the op signature is unchanged. The lift relies on
-    ``moe_ep_rank == world_rank % ep_size``: ``direct_compile`` only enables
-    ``lift_rank`` when the TP group is the whole world, so the EP group is a
-    contiguous slice of it, and ``traced_rank`` raises if that ever breaks.
+    static int and the op signature is unchanged. Inside one, the offset is
+    ``traced_moe_ep_rank() * num_local_experts``, which follows the MoE layout
+    for EP == TP and EP < TP alike. Every caller (bf16, FP8, W4A16) passes
+    ``moe_ep_rank * num_local_experts``.
     """
     if global_num_experts <= num_local_experts:
         # EP=1: no window, and no new op input so the trace is unchanged.
         return expert_group_offset, None
-    from sglang_tpu.rank_local import traced_rank
+    from sglang_tpu.moe.ep_rank import traced_moe_ep_rank
 
-    ep_size = global_num_experts // num_local_experts
-    ep_rank = expert_group_offset // num_local_experts
-    rank = traced_rank(ep_rank, group_size=ep_size)
+    rank = traced_moe_ep_rank()
     if rank is None:
         return expert_group_offset, None
     return 0, (rank * num_local_experts).to(dtype=torch.int32).reshape(1)
@@ -1211,4 +1248,5 @@ def fused_moe_call(
         w1_channel_scale,
         w2_channel_scale,
         expert_group_offset_tensor,
+        int(tpu_envs.SGLANG_TPU_FORCE_MOE_GATHER_PERMUTE_WITH_SC_COMBINE.get()),
     )

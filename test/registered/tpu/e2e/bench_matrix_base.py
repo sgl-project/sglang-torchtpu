@@ -97,12 +97,14 @@ MIN_PREFIX_HIT_RATE = os.environ.get("MIN_PREFIX_HIT_RATE")
 MODEL_LABELS = {
     "gpt_oss_120b": "openai/gpt-oss-120b",
     "qwen3_coder_480b": "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
+    "muse_spark": "meta-models/Muse-Spark-Open-816B-A42B-NVFP4",
 }
 # The cosmetic half of the series identity, free to change (unlike the id
 # derived below). Same vocabulary as the nightly-perf MODEL_CONFIGs.
 MODEL_DISPLAY_NAMES = {
     "gpt_oss_120b": "GPT-OSS 120B",
     "qwen3_coder_480b": "Qwen3-Coder-480B",
+    "muse_spark": "Muse Spark",
 }
 SPEC_RECIPES = {"1host_pc_spec_kvoff", "pd_2p2d_pc_spec_kvoff"}
 

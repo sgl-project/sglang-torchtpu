@@ -86,18 +86,18 @@ def _request_descriptors(
     # Inactive slots still need safe metadata gathers, but issue no DMA.
     safe_start = jnp.where(live, tile_start, 0)
     pages_per_seq = page_indices.shape[0] // batch
-    # Pool p sits at slot p of the pooled cache, so one pooled page holds the
-    # pools of 4 * page_size raw tokens, four pools per destination quad row.
-    pooled_span = 4 * page_size
+    # A pool's record lives in its tokens' page, four pools (16 raw rows) per
+    # destination quad row.
+    page = page_indices[req * pages_per_seq + safe_start // page_size]
     # Tile-major order keeps the first tiles of different requests adjacent.
     # Request-major order would insert unused slots between Q=1 requests.
     return (
         jnp.stack(
             (
-                page_indices[req * pages_per_seq + safe_start // page_size],
+                page,
                 (safe_start % page_size) // tile_rows,
-                page_indices[req * pages_per_seq + safe_start // pooled_span],
-                (safe_start % pooled_span) // 16,
+                page,
+                (safe_start % page_size) // 16,
                 start[None, :] - tile_start,
                 kv_lens[None, :] - tile_start,
                 live.astype(jnp.int32),
@@ -196,7 +196,7 @@ def compress_and_store(
             "fused pooling requires K=4, D=128 and a page size that is a multiple "
             f"of {_SHORT_TILE_ROWS}"
         )
-    if pooled_cache.shape != (raw_cache.shape[0], page_size // 4, 4, 256):
+    if pooled_cache.shape != (raw_cache.shape[0], page_size // 16, 4, 256):
         raise ValueError("unexpected pooled-cache layout")
     if raw_cache.dtype != jnp.bfloat16 or pooled_cache.dtype != jnp.uint8:
         raise ValueError("expected BF16 raw cache and uint8 pooled cache")
