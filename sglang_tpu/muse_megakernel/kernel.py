@@ -3984,9 +3984,11 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                 p_alpha = psmr[SMALL["ffn_alpha"] : SMALL["ffn_alpha"] + 1, :H]
                 p_beta = psmr[SMALL["ffn_beta"] : SMALL["ffn_beta"] + 1, :H]
                 p_pfw = psmr[SMALL["post_ffn_w"] : SMALL["post_ffn_w"] + 1, :H]
-                for t in range(R // RT):
-                    rs = pl.ds(t * RT, RT)
+
+                def _fold_lhs(rs, t):
                     S["lhs"][rs] = (p_alpha * S["h_stream"][rs] * g_pa).astype(bf16)
+
+                vpads_tiles(_fold_lhs)
                 S["fold_v"][0:1, :] = p_beta * p_pfw * g_pa
                 wait_block, finish = f_blocks()
                 with _scope("qkvg_fold"):
@@ -4001,24 +4003,55 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     )["wqkvg"]
                 finish()
                 wq_sc = smr[SMALL["wqkvg_s"] : SMALL["wqkvg_s"] + 1, : c.qkvg_dim]
-                for t in range(R // RT):
-                    r0, r1 = t * RT, (t + 1) * RT
-                    rs = pl.ds(r0, RT)
-                    y = gathered_tile(S["pad_f"].at[:, rs]) * p_pfw
-                    s_f = jax.lax.rsqrt(
-                        jnp.mean(jnp.square(y), axis=-1, keepdims=True) + c.post_eps
-                    )
-                    s = p_alpha * S["h_stream"][rs] + p_beta * (y * s_f).astype(
-                        bf16
-                    ).astype(f32)
-                    capture_tile(l - 1, rs, s)
-                    S["h_stream"][rs] = s
-                    r_inv = jax.lax.rsqrt(
-                        jnp.mean(jnp.square(s), axis=-1, keepdims=True) + c.rms_eps
-                    )
-                    S["acc"][rs, pl.ds(0, c.qkvg_dim)] = (
-                        r_inv * (acc_q[r0:r1] + s_f * acc_q[R + r0 : R + r1]) * wq_sc
-                    )
+                if c.tile_loops:
+                    # the fold's two partial sums go through VMEM so the pass is one loop
+                    S["acc"][:, pl.ds(0, c.qkvg_dim)] = acc_q[:R]
+                    S["fold_stage"][:, pl.ds(0, c.qkvg_dim)] = acc_q[R:]
+
+                    def _fold_q(rs, t):
+                        y = gathered_tile(S["pad_f"].at[:, rs]) * p_pfw
+                        s_f = jax.lax.rsqrt(
+                            jnp.mean(jnp.square(y), axis=-1, keepdims=True) + c.post_eps
+                        )
+                        s = p_alpha * S["h_stream"][rs] + p_beta * (y * s_f).astype(
+                            bf16
+                        ).astype(f32)
+                        capture_tile(l - 1, rs, s)
+                        S["h_stream"][rs] = s
+                        r_inv = jax.lax.rsqrt(
+                            jnp.mean(jnp.square(s), axis=-1, keepdims=True) + c.rms_eps
+                        )
+                        S["acc"][rs, pl.ds(0, c.qkvg_dim)] = (
+                            r_inv
+                            * (
+                                S["acc"][rs, pl.ds(0, c.qkvg_dim)]
+                                + s_f * S["fold_stage"][rs, pl.ds(0, c.qkvg_dim)]
+                            )
+                            * wq_sc
+                        )
+
+                    for_tiles(_fold_q)
+                else:
+                    for t in range(R // RT):
+                        r0, r1 = t * RT, (t + 1) * RT
+                        rs = pl.ds(r0, RT)
+                        y = gathered_tile(S["pad_f"].at[:, rs]) * p_pfw
+                        s_f = jax.lax.rsqrt(
+                            jnp.mean(jnp.square(y), axis=-1, keepdims=True) + c.post_eps
+                        )
+                        s = p_alpha * S["h_stream"][rs] + p_beta * (y * s_f).astype(
+                            bf16
+                        ).astype(f32)
+                        capture_tile(l - 1, rs, s)
+                        S["h_stream"][rs] = s
+                        r_inv = jax.lax.rsqrt(
+                            jnp.mean(jnp.square(s), axis=-1, keepdims=True) + c.rms_eps
+                        )
+                        S["acc"][rs, pl.ds(0, c.qkvg_dim)] = (
+                            r_inv
+                            * (acc_q[r0:r1] + s_f * acc_q[R + r0 : R + r1])
+                            * wq_sc
+                        )
             elif c.fold_f:
                 with _scope("qkvg_mv"):
                     acc_q = ws.mv_fold(
@@ -4492,9 +4525,11 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                 g_pf = smr[SMALL["pre_ffn_w"] : SMALL["pre_ffn_w"] + 1, :H]
                 a_alpha = smr[SMALL["attn_alpha"] : SMALL["attn_alpha"] + 1, :H]
                 a_beta = smr[SMALL["attn_beta"] : SMALL["attn_beta"] + 1, :H]
-                for t in range(R // RT):
-                    rs = pl.ds(t * RT, RT)
+
+                def _fold_lhs_o(rs, t):
                     S["lhs"][rs] = (a_alpha * S["h_stream"][rs] * g_pf).astype(bf16)
+
+                vpads_tiles(_fold_lhs_o)
                 S["fold_v"][0:1, :] = a_beta * g_pf
                 wait_block, finish = o_blocks()
                 names = ("wpool", "wrouter")
@@ -4510,37 +4545,81 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     )
                 finish()
                 wp_sc = smr[SMALL["wpool_s"] : SMALL["wpool_s"] + 1, :Hel]
-                for t in range(R // RT):
-                    r0, r1 = t * RT, (t + 1) * RT
-                    rs = pl.ds(r0, RT)
-                    a_val = gathered_tile(S["pad_o_ag"].at[:, rs])
-                    s_a = jax.lax.rsqrt(
-                        jnp.mean(jnp.square(a_val), axis=-1, keepdims=True) + c.post_eps
-                    )
-                    s = a_alpha * S["h_stream"][rs] + a_beta * (a_val * s_a).astype(
-                        bf16
-                    ).astype(f32)
-                    S["h_stream"][rs] = s
-                    r_inv = jax.lax.rsqrt(
-                        jnp.mean(jnp.square(s), axis=-1, keepdims=True) + c.rms_eps
-                    )
-                    pooled_t = (
-                        (
-                            r_inv
-                            * (
-                                acc_pr["wpool"][r0:r1]
-                                + s_a * acc_pr["wpool"][R + r0 : R + r1]
-                            )
-                            * wp_sc
+                if c.tile_loops:
+                    a_p0, a_r0 = (
+                        2 * Hel,
+                        2 * Hel + Ep,
+                    )  # acc columns past the router output
+                    S["acc"][:, pl.ds(a_p0, Hel)] = acc_pr["wpool"][:R]
+                    S["acc"][:, pl.ds(a_r0, Ep)] = acc_pr["wrouter"][:R]
+                    S["fold_stage"][:, pl.ds(0, Hel)] = acc_pr["wpool"][R:]
+                    S["fold_stage"][:, pl.ds(Hel, Ep)] = acc_pr["wrouter"][R:]
+
+                    def _fold_pr(rs, t):
+                        a_val = gathered_tile(S["pad_o_ag"].at[:, rs])
+                        s_a = jax.lax.rsqrt(
+                            jnp.mean(jnp.square(a_val), axis=-1, keepdims=True)
+                            + c.post_eps
                         )
-                        .astype(bf16)
-                        .astype(f32)
-                    )
-                    S["pool_send"][rs] = _pack_bf16x2(pooled_t)
-                    S["acc"][rs, pl.ds(0, Ep)] = r_inv * (
-                        acc_pr["wrouter"][r0:r1]
-                        + s_a * acc_pr["wrouter"][R + r0 : R + r1]
-                    )
+                        s = a_alpha * S["h_stream"][rs] + a_beta * (a_val * s_a).astype(
+                            bf16
+                        ).astype(f32)
+                        S["h_stream"][rs] = s
+                        r_inv = jax.lax.rsqrt(
+                            jnp.mean(jnp.square(s), axis=-1, keepdims=True) + c.rms_eps
+                        )
+                        pooled_t = (
+                            (
+                                r_inv
+                                * (
+                                    S["acc"][rs, pl.ds(a_p0, Hel)]
+                                    + s_a * S["fold_stage"][rs, pl.ds(0, Hel)]
+                                )
+                                * wp_sc
+                            )
+                            .astype(bf16)
+                            .astype(f32)
+                        )
+                        S["pool_send"][rs] = _pack_bf16x2(pooled_t)
+                        S["acc"][rs, pl.ds(0, Ep)] = r_inv * (
+                            S["acc"][rs, pl.ds(a_r0, Ep)]
+                            + s_a * S["fold_stage"][rs, pl.ds(Hel, Ep)]
+                        )
+
+                    for_tiles(_fold_pr)
+                else:
+                    for t in range(R // RT):
+                        r0, r1 = t * RT, (t + 1) * RT
+                        rs = pl.ds(r0, RT)
+                        a_val = gathered_tile(S["pad_o_ag"].at[:, rs])
+                        s_a = jax.lax.rsqrt(
+                            jnp.mean(jnp.square(a_val), axis=-1, keepdims=True)
+                            + c.post_eps
+                        )
+                        s = a_alpha * S["h_stream"][rs] + a_beta * (a_val * s_a).astype(
+                            bf16
+                        ).astype(f32)
+                        S["h_stream"][rs] = s
+                        r_inv = jax.lax.rsqrt(
+                            jnp.mean(jnp.square(s), axis=-1, keepdims=True) + c.rms_eps
+                        )
+                        pooled_t = (
+                            (
+                                r_inv
+                                * (
+                                    acc_pr["wpool"][r0:r1]
+                                    + s_a * acc_pr["wpool"][R + r0 : R + r1]
+                                )
+                                * wp_sc
+                            )
+                            .astype(bf16)
+                            .astype(f32)
+                        )
+                        S["pool_send"][rs] = _pack_bf16x2(pooled_t)
+                        S["acc"][rs, pl.ds(0, Ep)] = r_inv * (
+                            acc_pr["wrouter"][r0:r1]
+                            + s_a * acc_pr["wrouter"][R + r0 : R + r1]
+                        )
                 pool_wait = coll.all_gather_start("pool", S["pool_send"], tp_rank)
             else:
                 with _scope("pool_mv"):

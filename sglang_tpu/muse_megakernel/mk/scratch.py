@@ -373,6 +373,17 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
     if c.fold_f or c.fold_o:
         items += [
             ("fold_v", vmem((8, H), f32)),
+            # tile_loops: the folds' second partial sums
+            *(
+                [
+                    (
+                        "fold_stage",
+                        vmem((R, max(c.qkvg_dim, Hel + c.n_experts_padded)), f32),
+                    )
+                ]
+                if c.tile_loops
+                else []
+            ),
             ("o_rsems", pltpu.SemaphoreType.DMA((tp,))),
             ("f_rsems", pltpu.SemaphoreType.DMA((tp,))),
         ]
