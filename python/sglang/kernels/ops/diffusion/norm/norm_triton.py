@@ -25,7 +25,7 @@ def triton_autotune_configs():
     # Default to warp size 32 if not defined by device
     warp_size = getattr(
         torch.get_device_module().get_device_properties(
-            torch.get_device_module().current_device()
+            torch.accelerator.current_device_index()
         ),
         "warp_size",
         32,
