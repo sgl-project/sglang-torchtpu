@@ -178,6 +178,7 @@ class DecodeOps:
         self.names: tuple[str, ...] = ()
         self.slots: list[torch.Tensor] = []
         self.unified_pools: list[torch.Tensor] = []  # bound by use_unified_pools
+        self.dsa_pools = 0  # Kimi-K3.1: the index-key pools ending unified_pools
         self.pool_map: tuple[int, ...] | None = None  # MLA layer -> unified pool index
         # Mesh position -> page owner (vLLM TP rank).
         self.owner_table: tuple[int, ...] | None = None
@@ -249,17 +250,21 @@ class DecodeOps:
         pools: list[torch.Tensor],
         pool_map: list[int],
         owner_table: Sequence[int] | None = None,
+        index_pools: Sequence[torch.Tensor] = (),
     ) -> None:
         """Decode from vLLM's unified-pool tensors: MLA layer ``m`` is in
         ``pools[pool_map[m]]``. ``owner_table[p]`` is the page-owner index
         of mesh position ``p`` (default: the mesh position): global page
         ``g`` is read and committed by the rank whose owner index is
-        ``g % 32``."""
+        ``g % 32``. Kimi-K3.1: ``index_pools`` are the MLA layers' DSA
+        index-key pools (rows aligned with the latent rows), read for the
+        selection and committed with the latents."""
         if self._ops:
             raise RuntimeError(
                 "K3 decode: bind the unified pools before building the step ops"
             )
-        self.unified_pools, self.pool_map = list(pools), tuple(int(i) for i in pool_map)
+        self.unified_pools, self.pool_map = list(pools) + list(index_pools), tuple(int(i) for i in pool_map)
+        self.dsa_pools = len(index_pools)
         self.owner_table = (
             None if owner_table is None else tuple(int(i) for i in owner_table)
         )
@@ -342,6 +347,7 @@ class DecodeOps:
                 layers=NUM_LAYERS,
                 dcp_pool_map=pool_map,
                 dcp_owner_table=owner_table,
+                dsa_pools=self.dsa_pools,
                 **options,
             )
             if masked:
@@ -614,6 +620,7 @@ class DecodeOps:
                 layers=NUM_LAYERS,
                 dcp_pool_map=pool_map,
                 dcp_owner_table=owner_table,
+                dsa_pools=self.dsa_pools,
                 state_row=state_row,
                 **options,
             )
@@ -736,6 +743,7 @@ class DecodeOps:
                 layers=NUM_LAYERS,
                 dcp_pool_map=pool_map,
                 dcp_owner_table=owner_table,
+                dsa_pools=self.dsa_pools,
                 **options,
             )
             if placed is not None:

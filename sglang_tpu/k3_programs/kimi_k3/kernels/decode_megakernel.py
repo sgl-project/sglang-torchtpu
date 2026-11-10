@@ -20,7 +20,7 @@ from sglang_tpu.k3_programs.common import collectives32, pool_alias
 from sglang_tpu.k3_programs.common.vmem_pool import VmemPool
 from sglang_tpu.k3_programs.kimi_k3 import kernels as kimi
 from sglang_tpu.k3_programs.kimi_k3.config import active as _config
-from sglang_tpu.k3_programs.kimi_k3.kernels import mla_dcp
+from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp, dsa_decode, mla_dcp
 from sglang_tpu.k3_programs.kimi_k3.layout import CONV_HEAD_ROWS
 
 _COMMUNICATION_SCRATCH_SPEC_COUNT = 10
@@ -4617,6 +4617,7 @@ def mla(
     sequence_rows: int = 1,
     output_projection_after_query_down: bool = False,
     streams: dict | None = None,
+    dsa: "dsa_decode.DecodeIndexer | None" = None,
 ) -> None:
     """Execute one multi-head latent-attention layer inside a Pallas program.
 
@@ -4636,6 +4637,10 @@ def mla(
     Consecutive groups of ``sequence_rows`` rows belong to one sequence and
     share one cache entry. Within a group, rows represent consecutive tokens
     and attend causally to earlier rows from the same invocation.
+
+    ``dsa`` (Kimi-K3.1): the layer's indexer (``dsa_decode.DecodeIndexer``);
+    each row then attends only its selected tokens, and the attention's page
+    reads start once the selection is known.
     """
     batch_size, hidden_size = hidden_ref.shape
     context_length = dcp[0].page_tokens * dcp[0].pages * (1 if dcp[0].global_pages else dcp[0].group)
@@ -4709,15 +4714,23 @@ def mla(
     start_copy("output_gate")
     if not output_projection_after_query_down:
         start_copy("output")
+    if dsa is not None:
+        dsa.start()
 
     # Diagnostic (KernelConfig.dcp_skip): skip the DCP query gather, local
     # attention and/or partial combine, e.g. "gather,combine". Results are
     # invalid; timing only.
     dcp_skip = _config().dcp_skip
-    dcp_attention = mla_dcp.DcpAttention(*dcp, position_ref, batch_size, sequence_rows=sequence_rows,
-                                         skip=dcp_skip,
-                                         cache_verify_rows=sequence_rows > 1 and dcp[0].dtype == jnp.float8_e4m3fn)
-    dcp_attention.prime()
+
+    def make_attention(selection=None):
+        attention = mla_dcp.DcpAttention(
+            *dcp, position_ref, batch_size, sequence_rows=sequence_rows, skip=dcp_skip,
+            cache_verify_rows=sequence_rows > 1 and dcp[0].dtype == jnp.float8_e4m3fn,
+            selection=selection)
+        attention.prime()
+        return attention
+
+    dcp_attention = make_attention() if dsa is None else None
 
     if "query_down" in streams:
         query_latent = streams["query_down"].dot(
@@ -4776,6 +4789,9 @@ def mla(
         (new_latent[:, 512:], jnp.zeros((batch_size, 128), jnp.bfloat16)), axis=1
     )
     new_value_ref[:, :3] = jnp.zeros((batch_size, 3, 128), jnp.bfloat16)
+    if dsa is not None:
+        dcp_attention = make_attention(dsa.selection(
+            dcp[0], position_ref, hidden_ref[...], query_latent, dcp[0].layer % 2))
 
     _phase_end(mla_scope.pop())
     mla_scope.append(_phase_start("q7_mla_attend"))
@@ -6205,6 +6221,7 @@ def _mla_scoped_scratch(
     dcp_heads: int = 3,
     dcp_dtype=jnp.bfloat16,
     dcp_page_tokens=256,
+    dsa=False,
 ):
     """Transient MLA resources allocated once around each layer invocation
     (placeholders for the workspace's cache fields, ``mla_dcp.scoped_scratch``
@@ -6232,7 +6249,7 @@ def _mla_scoped_scratch(
         # reads the span and the buffers from the shape).
         *mla_dcp.scoped_scratch(batch_size, heads=dcp_heads,
                                 cache_dtype=dcp_dtype, page_tokens=dcp_page_tokens, sequence_rows=sequence_rows,
-                                **mla_dcp.page_plan(batch_size, dcp_heads, sequence_rows, dcp_dtype)),
+                                **mla_dcp.page_plan(batch_size, dcp_heads, sequence_rows, dcp_dtype, dsa=dsa)),
     )
 
 
@@ -6353,6 +6370,8 @@ def stack(
     dcp_owner_table: tuple[int, ...] | None = None,
     state_slots=None,
     live_rows=None,
+    index_pools=None,
+    dsa_topk: int = 2048,
 ):
     """Fuse the decoder layers while keeping a native batch tile in VMEM.
 
@@ -6389,6 +6408,15 @@ def stack(
     """
     if not 1 <= batch_size <= MAX_BATCH:
         raise ValueError(f"The fused decoder stack supports batch sizes from 1 to {MAX_BATCH}")
+    # Kimi-K3.1: the DSA indexer on every MLA layer (``index_pools``: the
+    # layers' index-key pools; ``weights`` holds the indexer families).
+    dsa = index_pools is not None
+    dsa_names = dsa_decode.FAMILIES if dsa else ()
+    layer_names = NAMES + dsa_names
+    if dsa and (len(index_pools) != MLA_LAYERS or any(name not in weights for name in dsa_names)):
+        raise ValueError("The DSA indexer takes an index pool per MLA layer and its weight families")
+    if dsa and (attention_dp != 1 or mla_dcp.GROUP != 32):
+        raise ValueError("The DSA indexer runs with DCP32 and no attention DP")
     if include_layer_zero and any(name not in weights for name in DENSE):
         raise ValueError("include_layer_zero needs the dense MLP weights")
     select_state_row = state_row is not None
@@ -6637,7 +6665,21 @@ def stack(
         dcp_dtype=states[2].dtype,
         dcp_page_tokens=states[2].shape[-3] * states[2].shape[-2],
         dcp_heads=3 * attention_dp,
+        dsa=dsa,
     )
+    dsa_scoped = {}
+    dsa_key_rows = 0
+    if dsa:
+        page_tokens = states[2].shape[-3] * states[2].shape[-2]
+        plan = mla_dcp.page_plan(batch_size, 3, sequence_rows, states[2].dtype, dsa=True)
+        key_buf = mla_dcp.selection_scratch(batch_size, page_tokens=page_tokens, sequence_rows=sequence_rows,
+                                            cache_dtype=states[2].dtype, **plan)[0]
+        span = key_buf.shape[2] * 128 // page_tokens
+        dsa_key_rows = dsa_dcp.key_rows_for(paged_pages, page_tokens, span)
+        dsa_scoped = dsa_decode.scoped_scratch(
+            batch_size, hidden=prefix.shape[-1], index_block_shape=tuple(index_pools[0].shape[1:]),
+            key_rows=dsa_key_rows, page_tokens=page_tokens, sequence_rows=sequence_rows, page_plan=plan)
+        mla_scoped_scratch = (*mla_scoped_scratch, *dsa_scoped.values())
     moe_scoped_scratch = _moe_scoped_scratch(
         local_weights,
         batch_size=batch_size,
@@ -6662,11 +6704,11 @@ def stack(
             # scalar predicates into a vector through bitcast_vreg.
             active_rows = jnp.stack([live_ref[b] for b in range(batch_size)]) != 0
         prefix_ref, embedding_ref, *refs = refs
-        layer_weights = dict(zip(NAMES, refs[: len(NAMES)], strict=True))
+        layer_weights = dict(zip(layer_names, refs[: len(layer_names)], strict=True))
         output_residual_ref, final_normalization_ref = refs[
-            len(NAMES) : len(NAMES) + len(EPILOGUE)
+            len(layer_names) : len(layer_names) + len(EPILOGUE)
         ]
-        dense_start = len(NAMES) + len(EPILOGUE)
+        dense_start = len(layer_names) + len(EPILOGUE)
         dense_refs = dict(
             zip(dense_names, refs[dense_start : dense_start + len(dense_names)], strict=True)
         )
@@ -6675,7 +6717,16 @@ def stack(
         convolution_ref, recurrent_ref = refs[state_start : state_start + 2]
         raw_pool_refs = refs[state_start + 2 : state_start + state_count]
         pool_ref = tuple(raw_pool_refs[index] for index in pool_map)
+        index_pool_refs = ()
+        if dsa:
+            index_pool_refs = tuple(refs[state_start + state_count : state_start + state_count + MLA_LAYERS])
+            state_count += MLA_LAYERS  # the index pools follow the states
+        output_count = 9 if dsa else 7
         output_refs = refs[state_start + state_count : state_start + state_count + 7]
+        records_output_ref = keys_output_ref = None
+        if dsa:
+            records_output_ref, keys_output_ref = refs[
+                state_start + state_count + 7 : state_start + state_count + 9]
         (
             output_ref,
             blocks_output_ref,
@@ -6717,7 +6768,7 @@ def stack(
             dense_semaphores,
             stream_semaphores,
             *common,
-        ) = refs[state_start + state_count + 7 :]
+        ) = refs[state_start + state_count + output_count :]
         if attention_dp > 1:
             (
                 group_input_vmem,
@@ -6729,6 +6780,10 @@ def stack(
             common = common[5:]
         dcp_persistent = common[: len(mla_dcp.PERSISTENT_NAMES)]
         common = common[len(mla_dcp.PERSISTENT_NAMES) :]
+        dsa_persistent = ()
+        if dsa:
+            dsa_persistent = tuple(common[: len(dsa_decode.PERSISTENT_NAMES)])
+            common = common[len(dsa_decode.PERSISTENT_NAMES) :]
         if _config().vmem_pad_kb:
             headroom_pad = common[-1]
             headroom_pad[...] = jnp.zeros(headroom_pad.shape, jnp.float32)
@@ -8044,6 +8099,15 @@ def stack(
                     ))
 
                 def compute(new_key_vmem, new_value_vmem, *workspace):
+                    indexer = None
+                    if dsa:
+                        workspace, dsa_refs = workspace[: -len(dsa_scoped)], workspace[-len(dsa_scoped) :]
+                        indexer = dsa_decode.DecodeIndexer(
+                            weights={name: layer_weights[name].at[state_index] for name in dsa_names},
+                            pools=index_pool_refs, layer=state_index, keys=keys_output_ref,
+                            records_out=records_output_ref, persistent=dsa_persistent,
+                            scoped=dict(zip(dsa_scoped, dsa_refs, strict=True)), topk=dsa_topk, eps=eps,
+                            sequence_rows=sequence_rows)
                     count = len(mla_dcp.SCOPED_NAMES)
                     workspace, dcp_scoped = workspace[:-count], workspace[-count:]
                     metadata_copies = (
@@ -8163,6 +8227,7 @@ def stack(
                                                         else mla_dcp.owner_index(dcp_owner_table))),
                                 mla_dcp.DcpWorkspace(*dcp_persistent, *dcp_scoped),
                             ),
+                            dsa=indexer,
                             **mla_options,
                         )
 
@@ -8868,8 +8933,9 @@ def stack(
     args = (
         prefix,
         embedding,
-        *(weights[name] for name in NAMES + EPILOGUE + dense_names),
+        *(weights[name] for name in layer_names + EPILOGUE + dense_names),
         *states,
+        *(index_pools if dsa else ()),
     )
     state_row_scalar = (
         jnp.asarray(state_row, jnp.int32).reshape(1)
@@ -8896,6 +8962,16 @@ def stack(
         *state_output_shapes,
         jax.ShapeDtypeStruct(
             (max(1, len(aux_hidden_layers)), batch_size, hidden_size), jnp.bfloat16
+        ),
+        *(
+            (
+                # Each row's new index-key record per MLA layer (the commit's),
+                # and the selection's keys scratch (unused by the caller).
+                jax.ShapeDtypeStruct((batch_size, MLA_LAYERS, *dsa_decode.RECORD_SHAPE), jnp.int32),
+                jax.ShapeDtypeStruct((batch_size, dsa_key_rows, dsa_dcp.LANES), jnp.int32),
+            )
+            if dsa
+            else ()
         ),
     )
     pooled_expert_names = (
@@ -9017,6 +9093,7 @@ def stack(
         # DCP: buffers group peers' remote copies land in.
         *mla_dcp.persistent_scratch(group_rows, heads=3 * attention_dp,
                                     cache_dtype=states[2].dtype, sequence_rows=sequence_rows),
+        *(dsa_decode.persistent_scratch(batch_size) if dsa else ()),
         *communication_scratch(batch_size, attention_dp)[:-1],
         tpu.VMEM((batch_size, 4096), jnp.bfloat16),
         *projection_staging_scratch(batch_size, attention_dp),
@@ -9044,6 +9121,7 @@ def stack(
             else ()
         ),
         *mla_dcp.PERSISTENT_NAMES,
+        *(dsa_decode.PERSISTENT_NAMES if dsa else ()),
         "shared_local_reduction",
         "expert_local_reduction", "shared_host_reduction", "expert_host_reduction",
         "attention_features", "attention_output", "send_semaphores",
@@ -9074,6 +9152,7 @@ def stack(
                         "query", "output gate values", "new key", "new value",
                         "softmax maximum", "softmax denominator", "accumulator",
                         *mla_dcp.SCOPED_NAMES,
+                        *(f"dsa {name}" for name in dsa_scoped),
                     ),
                     mla_scoped_scratch,
                     strict=True,
@@ -9205,7 +9284,7 @@ def stack(
             out_specs=[
                 pl.BlockSpec(memory_space=tpu.HBM),
                 pl.BlockSpec(memory_space=tpu.VMEM),
-                *(pl.BlockSpec(memory_space=tpu.HBM) for _ in range(5)),
+                *(pl.BlockSpec(memory_space=tpu.HBM) for _ in range(7 if dsa else 5)),
             ],
             scratch_shapes=scratch,
         ),
@@ -9264,6 +9343,8 @@ def decode_local(
     dcp_owner_table: tuple[int, ...] | None = None,
     state_slots=None,
     live_rows=None,
+    index_pools=None,
+    dsa_topk: int = 2048,
 ):
     """Decode one native batch tile with local TP32 weights and caches.
 
@@ -9349,6 +9430,7 @@ def decode_local(
         new_keys,
         new_values,
         aux_hidden,
+        *dsa_outputs,
     ) = (
         stack(
             prefix,
@@ -9390,6 +9472,8 @@ def decode_local(
             dcp_owner_table=dcp_owner_table,
             state_slots=state_slots,
             live_rows=live_rows,
+            index_pools=index_pools,
+            dsa_topk=dsa_topk,
         )
     )
 
@@ -9432,6 +9516,8 @@ def decode_local(
         recurrent_states,
         new_keys,
         new_values,
+        # Kimi-K3.1: each row's new index-key records [batch, 24, 2, 128].
+        *dsa_outputs[:1],
     )
     if aux_hidden_layers:
         return logits[None], aux_hidden, new_states

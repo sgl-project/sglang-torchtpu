@@ -561,3 +561,32 @@ class TestSelectedAttention(CustomTestCase):
             capture_output=True, text=True, env=env, timeout=900,
         )
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
+
+
+class TestPrefillIndexRows(CustomTestCase):
+    """A prefill window's index keys laid out as pool rows match the decode's
+    per-token commit of the same keys, byte for byte."""
+
+    def test_rows_match_the_token_commit(self):
+        from unittest import mock
+
+        import jax.numpy as jnp
+
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp, mla_dcp
+
+        rng = np.random.default_rng(5)
+        tokens, pages = 512, 3
+        keys = rng.standard_normal((tokens * pages, 128)).astype(np.float32)
+        rows = np.asarray(dsa_dcp.index_rows(jnp.asarray(keys).astype(jnp.bfloat16), pages))
+        self.assertEqual(rows.shape, (pages, 4 * 33, 4, 128))
+        # The same keys, token by token, into blocks 1..3 of one rank's pool
+        # (a table whose entry e is global page e: every page on this rank).
+        records = dsa_dcp.key_records(jnp.asarray(keys).astype(jnp.bfloat16))[:, None, :]
+        positions = np.arange(tokens * pages, dtype=np.int32)
+        tables = np.tile(np.arange(1, pages + 1, dtype=np.int32), (len(positions), 1))
+        pool = (jnp.zeros((pages + 1, 4 * 33, 4, 128), jnp.uint8),)
+        with mock.patch.object(mla_dcp, "owner_index", return_value=0):
+            (pool,) = dsa_dcp.commit_index_rows(
+                pool, records, jnp.asarray(tables), jnp.asarray(positions), group=1,
+                global_pages=True)
+        np.testing.assert_array_equal(np.asarray(pool)[1:], rows)

@@ -211,7 +211,7 @@ def _commit_kda_states(conv_slots, recurrent_slots, conv, recurrent, slots, sour
 
 def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, block_tables,
                  slots, *, batch_size, dcp_pool_map, dcp_owner_table=None, state_row=None,
-                 defer_kda_commit=False, **decode_options):
+                 defer_kda_commit=False, dsa_pools=0, **decode_options):
     """One decode step on this rank (inside a ``tp`` shard_map).
 
     ``conv_slots [S, 69, 3, 3, 3, 128]`` / ``recurrent_slots [S, 69, 3, 128,
@@ -229,6 +229,11 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
     drafts lie past the next step's pool limit. ``defer_kda_commit``
     (verifiers): return per-row post-states (under attention DP this group's
     rows, shard-major); the caller commits accepted rows.
+
+    Kimi-K3.1 (``dsa_pools`` = 24): the last ``dsa_pools`` entries of ``pool``
+    are the MLA layers' DSA index-key pools; the kernel selects each row's
+    tokens from them and every row's new index keys are committed beside its
+    latents (returned in ``pool``'s order).
     """
     if tokens.shape != (batch_size,) or positions.shape != (batch_size,) or slots.shape != (batch_size,):
         raise ValueError("tokens, positions and slots must have one entry per row")
@@ -259,16 +264,19 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
     else:
         conv, recurrent = conv_slots[state_index], recurrent_slots[state_index]
     pools = tuple(pool)
+    index_pools = None
+    if dsa_pools:
+        pools, index_pools = pools[:-dsa_pools], pools[-dsa_pools:]
     result = decode_local(
         weights, (conv, recurrent, *pools), tokens, positions, batch_size=batch_size,
         block_tables=block_tables, dcp_pool_map=dcp_pool_map, dcp_owner_table=dcp_owner_table,
         state_row=state_row, state_slots=state_index if in_place else None,
-        live_rows=slots != 0, **decode_options)
+        live_rows=slots != 0, index_pools=index_pools, **decode_options)
     aux = None
     if decode_options.get("aux_hidden_layers"):
-        logits, aux, (conv, recurrent, new_keys, new_values) = result
+        logits, aux, (conv, recurrent, new_keys, new_values, *records) = result
     else:
-        logits, (conv, recurrent, new_keys, new_values) = result
+        logits, (conv, recurrent, new_keys, new_values, *records) = result
     # DP2 returns shard-major rows; commit each to its shard-bank index,
     # preserving untouched slots and ordered null-slot writes.
     if defer_kda_commit:
@@ -288,6 +296,15 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
             latents[: group_rows.shape[0]], block_tables[group_rows], positions[group_rows])
     pool = commit_latent_rows(pools, latents, block_tables, positions,
                               dcp_pool_map, owner_table=dcp_owner_table)
+    if index_pools is not None:
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp
+
+        (records,) = records  # [batch, 24, 2, 128] int32: key bytes | UE8M0 byte
+        records = jnp.concatenate((records[:, :, 0, :], records[:, :, 1, :1]), axis=-1).astype(jnp.uint8)
+        index_pools = dsa_dcp.commit_index_rows(
+            index_pools, records, block_tables, positions, group=32, owner_table=dcp_owner_table,
+            global_pages=mla_dcp.GLOBAL_PAGES)
+        pool = (*pool, *index_pools)
     if aux is not None:
         return logits[0], aux, conv_slots, recurrent_slots, pool
     return logits[0], conv_slots, recurrent_slots, pool

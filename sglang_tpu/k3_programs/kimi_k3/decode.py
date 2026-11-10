@@ -221,6 +221,8 @@ class KimiDecoder:
             self._importer.raw_pools,
             self._importer.mla_raw,
             self.destination_ranks if by_tp else None,
+            # Kimi-K3.1: the DSA index-key pools (sglang_program sets them).
+            index_pools=list(getattr(self, "index_pools", ())),
         )
         if self.draft is not None and hasattr(self.draft, "bind_pools"):
             assert self.ops.pool_map is not None

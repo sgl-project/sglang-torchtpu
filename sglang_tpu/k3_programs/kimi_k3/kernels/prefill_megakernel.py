@@ -4819,6 +4819,16 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
         )
         query, new_key, new_value, output_gate, latent = mla_projections(
             full_hidden, projections, return_latent=True, query_scale=SCALE_LOG2)
+        if "index_key_projection" in local_weights:
+            # Kimi-K3.1: the window tokens' normed DSA index keys (as the
+            # decode computes them) ride in lanes 576:704 of the latents.
+            from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_decode
+
+            raw = jnp.dot(full_hidden.astype(jnp.bfloat16), local_weights["index_key_projection"],
+                          preferred_element_type=jnp.float32).astype(jnp.bfloat16).astype(jnp.float32)
+            norm = local_weights["index_key_norm"].astype(jnp.float32)
+            index_key = dsa_decode.layer_norm(raw, norm[0:1], norm[1:2], 1e-5).astype(jnp.bfloat16)
+            latent = jnp.concatenate((latent, index_key), axis=-1)
         tokens = query.shape[0]
         real = (jnp.arange(tokens) < length.reshape(()))[None, :, None]
         new_key = jnp.where(real, new_key.transpose(1, 0, 2), 0)
@@ -5310,6 +5320,12 @@ MLA_FIELD_NAMES = (
 )
 
 
+# Kimi-K3.1: the DSA indexer's key projection and LayerNorm (the window
+# tokens' index keys go out with the latents, lanes 576:704).
+DSA_FAMILIES = ("d_wk", "d_knorm")
+DSA_FIELD_NAMES = ("index_key_projection", "index_key_norm")
+
+
 def make_indexed_mla_layer_sp_ring(mesh, *, seq_len=8192, segments, prefix_capacity, flash_tile=256):
     """The MLA layer at MLA slot ``slot`` of the family-major weights:
     ``run(hidden, prefix, families, segment_desc, length, slot, arena)``
@@ -5323,7 +5339,8 @@ def make_indexed_mla_layer_sp_ring(mesh, *, seq_len=8192, segments, prefix_capac
             field: jax.lax.dynamic_index_in_dim(
                 families[name], slot[0], axis=1, keepdims=False,
             )
-            for name, field in zip(MLA_FAMILIES, MLA_FIELD_NAMES)
+            for name, field in zip(MLA_FAMILIES + DSA_FAMILIES, MLA_FIELD_NAMES + DSA_FIELD_NAMES)
+            if name in families
         }
 
     def run(hidden, prefix, families, segment_desc, length, slot, arena):
@@ -5844,7 +5861,7 @@ def make_regular_group4_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
         return prefix, blocks, kda_states, mla_cache, tap
 
     return jax.jit(run, out_shardings=(
-        sharding, sharding, (sharding,) * len(kda_outputs), (sharding,), sharding,
+        sharding, sharding, (sharding,) * len(kda_outputs), sharding, sharding,
     ))
 
 
@@ -5878,7 +5895,7 @@ def make_regular_group8_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
         return prefix, blocks, kda_state, mla_state, middle, tap
 
     return jax.jit(run, out_shardings=(
-        sharding, sharding, (sharding,) * 4, (sharding,), sharding, sharding,
+        sharding, sharding, (sharding,) * 4, sharding, sharding, sharding,
     ))
 
 
@@ -5927,7 +5944,7 @@ def make_final_mla_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capacity, 
         return prefix, blocks, mla_cache
 
     return jax.jit(run, out_shardings=(
-        sharding, sharding, (sharding,),
+        sharding, sharding, sharding,
     ))
 
 
@@ -6085,7 +6102,7 @@ def make_prefill_stack_sp_indexed(mesh, *, seq_len=8192, depth=93, segments, pre
         return (result[0], result[1], result[2], result[3])
 
     return jax.jit(run, out_shardings=(
-        sharding, sharding, (sharding,) * len(kda_outputs), (sharding,),
+        sharding, sharding, (sharding,) * len(kda_outputs), sharding,
         *((sharding,) if tap_layer is not None else ()),
     ))
 

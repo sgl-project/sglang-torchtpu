@@ -25,6 +25,7 @@ every scheduled prompt chunk into vLLM's unified pools for the KV connector:
 from __future__ import annotations
 
 import dataclasses
+import functools
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -351,6 +352,10 @@ class PrefillProgram:
             set(bank) != set(_EXPERT_FAMILIES) for bank in self._expert_banks
         ):
             raise RuntimeError("K3 prefill: incomplete resident expert banks")
+        if "d_wk" in self.weights.get("mla", {}):
+            # Kimi-K3.1: the DSA indexer's key projection and norm feed the
+            # window's index keys.
+            self.names["mla"] = tuple(self.names["mla"]) + tuple(self._kernels.DSA_FAMILIES)
         for group, names in self.names.items():
             missing = [n for n in names if n not in self.weights.get(group, {})]
             if missing:
@@ -465,7 +470,9 @@ class PrefillProgram:
             arena, args = split(args, 1)
             w, _ = self._unflat(args, "io", *weight_groups)
             hidden = embedding(tokens, w["io"]["embedding"], length)
-            latents = zeros((MLA_LAYERS, window, 576), jnp.bfloat16)
+            # Kimi-K3.1: the index keys ride in lanes 576:704.
+            latents = zeros((MLA_LAYERS, window, 576 + (128 if "d_wk" in self.names["mla"] else 0)),
+                            jnp.bfloat16)
             rec_at = zeros((KDA_LAYERS, count, 3, 128, 128), jnp.float32)
             hist_at = zeros((KDA_LAYERS, count, 3, 3, 3, 128), jnp.bfloat16)
             prefix, blocks, kda_state, mla_state, tap = first(
@@ -755,6 +762,11 @@ class PoolWriter:
     layer ``k`` (``pools.bind_raw_pools``). KDA heads are written in
     vLLM TP-rank order (``state_perm``, from the kernel's mesh order) and
     read back in mesh order.
+
+    Kimi-K3.1: ``index_pools`` (the MLA layers' DSA index-key pools, rows
+    aligned with the latent rows) follow the raw pools: block copies cover
+    them, and a window's index keys (lanes 576:704 of its latents) land in
+    the blocks its latents go to.
     """
 
     def __init__(
@@ -765,13 +777,15 @@ class PoolWriter:
         mla_raw: list[int],
         kda_raw: list[int],
         state_perm: list[tuple[int, int]] | None,
+        index_pools: Sequence[torch.Tensor] = (),
     ) -> None:
         self.mesh, self.rank = mesh, rank
-        self.raw_pools = raw_pools
+        self.raw_pools = list(raw_pools) + list(index_pools)
         from sglang_tpu.k3_programs.kimi_k3.layout import cache_layout
 
         self.layout = cache_layout(str(raw_pools[0].dtype))
         self.mla_raw, self._kda_raw = tuple(mla_raw), tuple(kda_raw)
+        self.index_raw = tuple(len(raw_pools) + m for m in range(len(index_pools)))
         self._perm = (
             None
             if state_perm is None
@@ -926,6 +940,7 @@ class PoolWriter:
                 self._perm,
                 window // self.layout.tokens_per_block,
             )
+            index_raw = self.index_raw
 
             def body(latents, recurrent, conv, recurrent_at, conv_at, *rest):
                 raws = list(rest[:num_raw])
@@ -941,23 +956,29 @@ class PoolWriter:
                         jax.lax.ppermute(x, AXIS, perm)
                         for x in (recurrent, conv, recurrent_at, conv_at)
                     )
+                def write_page(p, pool, rows):
+                    return jax.lax.dynamic_update_index_in_dim(
+                        pool,
+                        jax.lax.dynamic_index_in_dim(rows, p, keepdims=False),
+                        table[p],
+                        axis=0,
+                    )
+
                 for m in range(MLA_LAYERS):
                     index = mla_raw[m]
                     rows = (
-                        jnp.pad(latents[m], ((0, 0), (0, 64)))
+                        jnp.pad(latents[m][:, :576], ((0, 0), (0, 64)))
                         .astype(raws[index].dtype)
                         .reshape(pages, *self.layout.block_shape)
                     )
+                    raws[index] = jax.lax.fori_loop(
+                        0, pages, functools.partial(write_page, rows=rows), raws[index])
+                    if index_raw:
+                        from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp
 
-                    def write_page(p, pool, rows=rows):
-                        return jax.lax.dynamic_update_index_in_dim(
-                            pool,
-                            jax.lax.dynamic_index_in_dim(rows, p, keepdims=False),
-                            table[p],
-                            axis=0,
-                        )
-
-                    raws[index] = jax.lax.fori_loop(0, pages, write_page, raws[index])
+                        rows = dsa_dcp.index_rows(latents[m][:, 576:704], pages)
+                        raws[index_raw[m]] = jax.lax.fori_loop(
+                            0, pages, functools.partial(write_page, rows=rows), raws[index_raw[m]])
                 # Checkpoints first (a sequence without one aims it at the null block).
                 raws = self._write_kda(raws, recurrent_at, conv_at, blocks_at, count)
                 raws = self._write_kda(raws, recurrent, conv, kda_blocks, count)
@@ -980,6 +1001,7 @@ class PoolWriter:
                         self.mla_raw,
                         self._kda_raw,
                         self._perm,
+                        self.index_raw,
                     )
                 ),
             )
@@ -1274,7 +1296,9 @@ class KimiPrefiller:
             caches, self.config.kv_cache_dtype
         )
         self._writer = PoolWriter(
-            self.program.mesh, self.rank, raw_pools, mla_raw, kda_raw, self._state_perm
+            self.program.mesh, self.rank, raw_pools, mla_raw, kda_raw, self._state_perm,
+            # Kimi-K3.1: the DSA index-key pools (sglang_program sets them).
+            index_pools=list(getattr(self, "index_pools", ())),
         )
         if self.draft_latents is not None:
             self.draft_latents.bind(draft_raw_pools(caches))

@@ -88,7 +88,7 @@ BUFFERS = 4  # steps in flight
 
 
 def page_plan(batch: int, heads: int = HEADS_PER_RANK, sequence_rows: int = 1,
-              cache_dtype=jnp.bfloat16, *, force_chunks=False) -> dict:
+              cache_dtype=jnp.bfloat16, *, force_chunks=False, dsa=False) -> dict:
     """The decoder's page buffers for ``batch`` rows of ``heads`` heads per
     rank (``sequence_rows`` per sequence): ``span`` pages per step and
     ``buffers`` steps in flight, sized to fit VMEM. Up to four rows and plain
@@ -96,7 +96,11 @@ def page_plan(batch: int, heads: int = HEADS_PER_RANK, sequence_rows: int = 1,
     FP8 B128, whose long-context page reads outrun three; FP8 B64 and B96
     stage twice the span, see ``staged_folds``). Verifies above four rows:
     half the span, twice the buffers (4 at B64 and attention DP's B32), 3/4
-    chunked."""
+    chunked. ``dsa`` (Kimi-K3.1's selection): verifies keep at most four
+    buffers (its own per-step buffers take the VMEM)."""
+    if dsa and sequence_rows > 1:
+        plan = page_plan(batch, heads, sequence_rows, cache_dtype, force_chunks=force_chunks)
+        return {**plan, "buffers": min(plan["buffers"], BUFFERS)}
     if batch <= 4:
         return {"span": SPAN, "buffers": BUFFERS}
     if sequence_rows == 1:
@@ -245,13 +249,17 @@ class DcpSelection:
 
 
 def selection_scratch(batch, span=SPAN, buffers=BUFFERS, page_tokens=PAGE_TOKENS, *, sequence_rows=1,
-                      cache_dtype=jnp.float8_e4m3fn):
-    """``DcpSelection``'s step key buffers and semaphores (FP8 cache)."""
+                      cache_dtype=jnp.float8_e4m3fn, heads=HEADS_PER_RANK):
+    """``DcpSelection``'s step key buffers and semaphores (FP8 cache): one per
+    page buffer, each a step's keys of a sequence's rows. Takes
+    ``scoped_scratch``'s span and buffers (e.g. ``**page_plan(...)``)."""
+    if _config().mla_decode_ktile == 2048:
+        raise ValueError("DSA selection: mla_decode_ktile=2048 is unsupported")
     if cache_dtype == jnp.float8_e4m3fn and batch in (8, 16, 32, 48, 64):
         span = min(span, SPAN * PAGE_TOKENS // page_tokens)
     else:
         span = span * PAGE_TOKENS // page_tokens
-    span = max(1, span)
+    span = max(1, span) * staged_folds(batch, heads, sequence_rows, cache_dtype)
     return (tpu.VMEM((buffers, sequence_rows, span * page_tokens // 128, 128), jnp.int32),
             tpu.SemaphoreType.DMA((buffers,)))
 
@@ -465,8 +473,9 @@ class DcpAttention:
                 raise ValueError("DSA selection: FP8 DCP32 decode with three heads per rank")
             if sequence_rows > 1 and not cache_verify_rows:
                 raise ValueError("DSA selection: multi-row sequences need cached verify rows")
-            if selection.key_buf.shape[2] * 128 != self.span * self.page_tokens:
-                raise ValueError("DSA selection key buffers must hold one step's tokens")
+            if (selection.key_buf.shape[2] * 128 != self.span * self.page_tokens
+                    or selection.key_buf.shape[0] != self.buffers):
+                raise ValueError("DSA selection key buffers must match the page buffers")
         if batch in (32, 48, 64):
             for b in range(batch):
                 workspace.lookup_bounds[b] = starts[b]
@@ -639,11 +648,12 @@ class DcpAttention:
             for first in range(0, self.sequence_rows, 4):
                 query = jax.lax.broadcasted_iota(jnp.int32, (4 * self.tile, 1), 0) // self.tile
                 visible = token < self.position_ref[row] + first + query
-                if self.selection is not None:
-                    chosen = self._selected(slot, local_step, row, first)
+                if self.selection is not None:  # each query row its own mask (int32: no i1 selects)
+                    chosen = self._selected(slot, local_step, row, first).astype(jnp.int32)
                     for i in range(1, 4):
-                        chosen = jnp.where(query == i, self._selected(slot, local_step, row, first + i), chosen)
-                    visible = visible & chosen
+                        chosen = jnp.where(query == i,
+                                           self._selected(slot, local_step, row, first + i).astype(jnp.int32), chosen)
+                    visible = visible & (chosen != 0)
                 score = self._group_scores(load, visible, row - base + first, 4)
                 self._group_fold(score, load, row - base + first, 4)
         else:

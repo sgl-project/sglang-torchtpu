@@ -80,6 +80,19 @@ def commit_index_rows(index_pools, records, block_tables, positions, *, group=32
     return tuple(pools)
 
 
+def index_rows(keys: jax.Array, pages: int) -> jax.Array:
+    """A prefill window's normed index keys ``[W, 128]`` -> index-pool rows
+    ``[pages, R, 4, 128]`` uint8, ``W / pages`` tokens a row (the layout
+    above; what ``commit_index_rows`` writes token by token)."""
+    records = key_records(keys)  # [W, 129]
+    subpages = keys.shape[0] // pages // INDEX_SUBPAGE_TOKENS
+    key_rows = records[:, :HEAD_DIM].reshape(pages, subpages, 32, 4, HEAD_DIM)
+    scale_rows = jnp.zeros((pages, subpages, 1, 4, HEAD_DIM), jnp.uint8).at[:, :, 0, 0, :].set(
+        records[:, HEAD_DIM].reshape(pages, subpages, INDEX_SUBPAGE_TOKENS))
+    return jnp.concatenate((key_rows, scale_rows), axis=2).reshape(
+        pages, subpages * INDEX_SUBPAGE_ROWS, 4, HEAD_DIM)
+
+
 def read_records(pool_row: jax.Array, tokens: int) -> tuple[jax.Array, jax.Array]:
     """One index pool row -> (fp8-valued key f32 ``[tokens, 128]``, exponent
     i32 ``[tokens, 1]``): the inverse of the layout (host checks and tests)."""
@@ -101,7 +114,7 @@ POSITION_BITS = 24
 KEY_SHIFTS = tuple(range(32 - DIGIT_BITS, -1, -DIGIT_BITS))  # 8 rounds
 POSITION_SHIFTS = tuple(range(POSITION_BITS - DIGIT_BITS, -1, -DIGIT_BITS))  # 6 rounds (ties only)
 CHUNK_ROWS = 64  # key rows (of 128 tokens) a counting step reads
-SLOTS = 3  # DMA ring depth (index pages, key chunks)
+SLOTS = 2  # DMA ring depth (index pages, key chunks)
 COUNT_ROWS = 16  # candidate sublanes of the count exchange
 _PREFIX, _UPPER, _LOWER, _POSITION, _LIMIT = range(5)  # state rows (lanes: batch rows)
 
@@ -234,14 +247,14 @@ class IndexSelect:
         lane = jax.lax.broadcasted_iota(jnp.int32, w_t_ref.shape, 1)
         return jnp.sum(jnp.where(lane == row, w_t_ref[...], 0.0), axis=1, keepdims=True)  # [32, 1]
 
-    def in_flight(self, q8_ref, w_t_ref, new_k8_ref):
+    def in_flight(self, query, w_t_ref, new_k8_ref):
         """``refs["in_flight"][b, n]``: the key of row ``b``'s sequence's
         in-flight token ``n`` (rows ``b - b % S + n``, up to ``b``) under row
         ``b``'s query, ``INT_MIN`` past its own."""
         lane = jax.lax.broadcasted_iota(jnp.int32, (1, LANES), 1)
         for b in range(self.batch):
             first, r = b - b % self.S, b % self.S
-            q32 = q8_ref[b].astype(jnp.float32)
+            q32 = query(b).astype(jnp.float32)
             w_col = self._w_col(w_t_ref, b)
             keys = jnp.full((1, LANES), INT_MIN, jnp.int32)
             for n in range(r + 1):
@@ -282,10 +295,10 @@ class IndexSelect:
             self.refs["keys"].at[row, pl_ds(local * self.subpages, self.subpages)],
             self.refs["stage_sems"].at[slot])
 
-    def score(self, q8_ref, w_t_ref):
-        """``q8_ref`` fp8 ``[B, 32, 128]`` index queries, ``w_t_ref`` f32
-        ``[32, 128]`` head weights (column ``b``: row ``b``); after
-        ``in_flight``."""
+    def score(self, query, w_t_ref):
+        """``query(row)``: the row's fp8 ``[32, 128]`` index query heads
+        (``row`` traced or not); ``w_t_ref`` f32 ``[32, 128]`` head weights
+        (column ``b``: row ``b``); after ``in_flight``."""
         refs, T = self.refs, self.T
         total = refs["page_starts"][self.batch]
         for step in range(SLOTS - 1):
@@ -299,7 +312,7 @@ class IndexSelect:
             self._wait_page(step)
             pl_when(step + SLOTS - 1 < total)(lambda: self._page_copy(step + SLOTS - 1))
             pl_when(step >= 2)(lambda: self._stage_copy(stage).wait())
-            q = q8_ref[row]  # [32, 128] fp8
+            q = query(row)  # [32, 128] fp8
             w_col = self._w_col(w_t_ref, row)
             limit = self.position_ref[row] + 1
             first = (local * self.group + self.owner) * T  # the page's first position
@@ -568,8 +581,8 @@ def select_call(q8, w_t, new_k8, pool, tables, positions, new_exp, *, pages: int
             group=group, owner=owner, member=member, base=rank - member, position_ref=positions_ref,
             new_exp_ref=exp_ref, batch=batch, topk=topk, refs=refs, sequence_rows=sequence_rows)
         select.plan()
-        select.in_flight(q8_ref, w_t_ref, new_k8_ref)
-        select.score(q8_ref, w_t_ref)
+        select.in_flight(lambda row: q8_ref[row], w_t_ref, new_k8_ref)
+        select.score(lambda row: q8_ref[row], w_t_ref)
         select.select()
 
     vmem = pltpu.VMEM if hasattr(pltpu, "VMEM") else pltpu.MemorySpace.VMEM
