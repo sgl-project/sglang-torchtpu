@@ -122,7 +122,7 @@ from sglang_tpu.experimental.speculative.spec_ops import (
     finalize_accept,
     live_result_rows,
     pad_state_rows,
-    select_verify_rows,
+    select_window_rows,
 )
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
@@ -515,7 +515,10 @@ class TpuSpecWorker(BaseSpecWorker):
             ]
             + [((pbs, 1), torch.float32) for pbs in bucket_sizes]
             + [
-                ((pbs, 2 * self.verify_window_rows), torch.int64)
+                (
+                    (pbs, self._window_maps() * 2 * self.verify_window_rows + 1),
+                    torch.int64,
+                )
                 for pbs in bucket_sizes
             ]
         )
@@ -542,20 +545,27 @@ class TpuSpecWorker(BaseSpecWorker):
             for width, pbs in itertools.product(self.verify_widths(), bucket_sizes):
                 # The generic spec-op context only knows the active width. The
                 # worker owns the full-capacity candidate shape used in serving.
-                warmup_compiled_op(
-                    select_verify_rows,
-                    torch.zeros(
-                        (pbs, 2 * self.verify_window_rows),
-                        dtype=torch.int64,
-                        device=self.device,
-                    ),
-                    torch.zeros((pbs,), dtype=torch.int64, device=self.device),
-                    torch.zeros((pbs,), dtype=torch.int64, device=self.device),
-                    width,
-                )
+                self.warmup_step_rows(pbs, width)
                 # Eager ops compile per input layout, so bump finalize_accept's output.
                 next_seq_lens = self._warmup_accept(pbs, width).next_seq_lens
                 materialize((next_seq_lens + width).to(torch.int32))
+
+    def _zero_window(self, padded_bs: int) -> torch.Tensor:
+        return torch.zeros(
+            (padded_bs, self._window_maps() * 2 * self.verify_window_rows + 1),
+            dtype=torch.int64,
+            device=self.device,
+        )
+
+    def warmup_step_rows(self, padded_bs: int, width: int) -> None:
+        """select_step_rows' program at one bucket and verify width."""
+        warmup_compiled_op(
+            select_window_rows,
+            self._zero_window(padded_bs),
+            self._window_maps(),
+            torch.zeros((padded_bs,), dtype=torch.int64, device=self.device),
+            width,
+        )
 
     def _warmup_accept(self, padded_bs: int, width: int) -> AcceptResult:
         """finalize_accept outputs at padded_bs, the inputs eager consumers see while serving."""
@@ -903,6 +913,30 @@ class TpuSpecWorker(BaseSpecWorker):
             self._simulated_drafts[padded_bs],
         )
 
+    def verify_swa_slot_map(self) -> torch.Tensor | None:
+        """Host full -> SWA slot map whose verify rows each step also selects, if any."""
+        return None
+
+    def _window_maps(self) -> int:
+        return 1 + (self.verify_swa_slot_map() is not None)
+
+    def select_step_rows(
+        self, bucket: BucketState, verify_input: TpuSpecVerifyInput
+    ) -> VerifyRows:
+        """The step's target verify rows from the packed window (one compiled op)."""
+        if verify_input.window is None or verify_input.window_maps != 1:
+            raise ValueError(
+                f"{type(self).__name__} selects rows from a one-map window, got "
+                f"{verify_input.window_maps} maps"
+            )
+        (rows,) = select_window_rows(
+            verify_input.window,
+            verify_input.window_maps,
+            bucket.state.seq_lens,
+            self.num_verify_rows,
+        )
+        return rows
+
     def step(
         self,
         batch: ScheduleBatch,
@@ -910,12 +944,7 @@ class TpuSpecWorker(BaseSpecWorker):
         verify_input: TpuSpecVerifyInput,
     ) -> tuple[CommitResult, LogitsProcessorOutput, AcceptResult]:
         # Algorithms that only need these rows after drafting can fuse their preparation.
-        rows = select_verify_rows(
-            verify_input.verify_cache_candidates,
-            verify_input.committed_lens,
-            bucket.state.seq_lens,
-            self.num_verify_rows,
-        )
+        rows = self.select_step_rows(bucket, verify_input)
         draft_result = self.draft(batch, bucket, rows, verify_input)
         logits_output, accept = self.verify(
             batch, bucket, rows, draft_result, verify_input
@@ -988,7 +1017,10 @@ class TpuSpecWorker(BaseSpecWorker):
         bs = batch.seq_lens.shape[0]
         padded_bs = self._decode_bucket(batch, bs)
         verify_input = TpuSpecVerifyInput.from_batch(
-            batch, self.num_verify_rows, padded_bs
+            batch,
+            self.num_verify_rows,
+            padded_bs,
+            swa_slot_map=self.verify_swa_slot_map(),
         )
         bucket = self._bucket_state(batch, padded_bs, verify_input)
         committed, logits_output, accept = self.step(batch, bucket, verify_input)
@@ -1090,6 +1122,7 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_window_rows=self.verify_window_rows,
             padded_bs=padded_bs,
             device=self.device,
+            window_maps=self._window_maps(),
         )
         # Distinct tensors: the dynamo tracer guards on aliased inputs, and the
         # active step never passes one tensor for two of these fields.
@@ -1099,12 +1132,7 @@ class TpuSpecWorker(BaseSpecWorker):
             req_pool_indices=verify_input.req_pool_indices,
             draft_carry=self.make_dummy_carry(padded_bs),
         )
-        rows = select_verify_rows(
-            verify_input.verify_cache_candidates,
-            verify_input.committed_lens,
-            state.seq_lens,
-            self.num_verify_rows,
-        )
+        rows = self.select_step_rows(_idle_bucket(state), verify_input)
         # The forwards' preparation writes these; the idle batch must stay idle.
         with overridden_fields(
             batch,
@@ -1126,15 +1154,8 @@ class TpuSpecWorker(BaseSpecWorker):
         verify_input: TpuSpecVerifyInput,
     ) -> None:
         """The active step's forwards and syncs in order on idle rows: draft, verify, commit."""
-        # Padded rows have req_pool_indices 0; no temperatures means the greedy draft.
-        live_mask = state.req_pool_indices != 0
-        idle_bucket = BucketState(
-            key=state.req_pool_indices,
-            state=state,
-            live_mask=live_mask,
-            temperatures=None,
-            top_ks=None,
-        )
+        idle_bucket = _idle_bucket(state)
+        live_mask = idle_bucket.live_mask
         draft_result = self.draft(batch, idle_bucket, rows, verify_input)
         verify_tokens = draft_result.verify_tokens
         if verify_tokens is None:
@@ -1827,6 +1848,17 @@ class TpuSpecWorker(BaseSpecWorker):
             raise NotImplementedError(
                 "TpuSpecWorker does not support deterministic sampling."
             )
+
+
+def _idle_bucket(state: SpecState) -> BucketState:
+    """Greedy bucket of a DP rank's all-padding rows (req_pool_indices 0)."""
+    return BucketState(
+        key=state.req_pool_indices,
+        state=state,
+        live_mask=state.req_pool_indices != 0,
+        temperatures=None,
+        top_ks=None,
+    )
 
 
 def _sampled_row_filters(sampling_info: SamplingBatchInfo) -> dict[str, bool]:

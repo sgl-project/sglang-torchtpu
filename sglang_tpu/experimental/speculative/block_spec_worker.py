@@ -13,7 +13,6 @@ extend: target forward on new prompt tokens, inject every row's target feature
 from __future__ import annotations
 
 import functools
-import itertools
 
 import torch
 
@@ -67,13 +66,13 @@ from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
 from sglang_tpu.experimental.speculative.pd_draft_prefill import swa_mapped_starts
 from sglang_tpu.experimental.speculative.spec_ops import (
     TARGET_CANDIDATES,
-    build_draft_block_inputs,
-    select_verify_rows,
+    select_block_step,
 )
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
     BucketState,
     CommitResult,
+    DraftBlockInputs,
     DraftResult,
     SpecState,
     TpuSpecVerifyInput,
@@ -81,7 +80,6 @@ from sglang_tpu.experimental.speculative.spec_types import (
 )
 from sglang_tpu.experimental.speculative.spec_utils import (
     pad_rows,
-    padded_h2d,
     prompt_positions,
 )
 from sglang_tpu.sampler import distributed_top_k_candidate_width_for_model
@@ -123,6 +121,9 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=self._draft_block_width, device=self.device
         )
+        # select_step_rows' outputs for the step in flight, consumed by draft and commit.
+        self._step_draft_inputs: DraftBlockInputs | None = None
+        self._step_swa_rows: VerifyRows | None = None
 
     def init_cuda_graphs(self) -> None:
         super().init_cuda_graphs()
@@ -136,10 +137,8 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         is_pp_non_decode = (
             get_parallel().pp_size > 1 and get_disagg().disaggregation_mode != "decode"
         )
-        if not is_pp_non_decode:
-            self._warmup_draft_block_inputs()
-            if self._sampled_drafts:
-                self._warmup_draft_sampling()
+        if not is_pp_non_decode and self._sampled_drafts:
+            self._warmup_draft_sampling()
         self._warmup_extend_draft_inputs()
         # The base snapshot ran before these block-draft warmups.
         snapshot_recompilation_baseline()
@@ -231,20 +230,12 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         assert target_hidden.shape[0] == rows.cache_locs.numel(), (
             "verify hidden must keep the batch bucket rows"
         )
-        full_to_swa = self._block_draft_worker.full_to_swa
-        if full_to_swa is not None:
-            # A hybrid-SWA draft writes the SWA slots of the same window, mapped on host.
-            swa_candidates = full_to_swa[verify_input.verify_cache_candidates_cpu]
-            rows = select_verify_rows(
-                padded_h2d(
-                    swa_candidates.to(torch.int64),
-                    rows.cache_locs.shape[0],
-                    self.device,
-                ),
-                verify_input.committed_lens,
-                state.seq_lens,
-                self.num_verify_rows,
-            )
+        if self._block_draft_worker.full_to_swa is not None:
+            # A hybrid-SWA draft writes the SWA slots of the same window (window map 1).
+            rows = self._step_swa_rows
+            if rows is None:
+                raise RuntimeError("commit needs select_step_rows' SWA rows")
+            self._step_swa_rows = None
         # Padded rows commit 0 tokens, so the writer skips them.
         with self._block_draft_worker.draft_context():
             kv_fence_tail = self._block_draft_worker.write_draft_kv(
@@ -462,16 +453,13 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         verify_input: TpuSpecVerifyInput,
     ) -> tuple[torch.Tensor, torch.Tensor, DraftLattice | None]:
         """The block's [pbs, width, H] draft hidden, greedy [pbs, gamma] drafts and lattice."""
+        del live_mask, rows
         padded_bs = state.seq_lens.shape[0]
         width = self._draft_block_width
-        inputs = build_draft_block_inputs(
-            state.bonus_tokens,
-            rows,
-            state.seq_lens,
-            live_mask,
-            self._mask_token_id,
-            width,
-        )
+        inputs = self._step_draft_inputs
+        if inputs is None:
+            raise RuntimeError("draft needs select_step_rows' draft block inputs")
+        self._step_draft_inputs = None
         # Writes the block's draft KV into the same slots target verify uses next.
         with self._block_draft_worker.draft_context():
             logits_output = forward_draft_rows(
@@ -501,39 +489,48 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         assert compile_policy.b_bucketer is not None
         return tuple(compile_policy.b_bucketer.buckets)
 
-    def _warmup_draft_block_inputs(self) -> None:
+    def verify_swa_slot_map(self) -> torch.Tensor | None:
+        return self._block_draft_worker.full_to_swa
+
+    def select_step_rows(
+        self, bucket: BucketState, verify_input: TpuSpecVerifyInput
+    ) -> VerifyRows:
+        """Verify rows, the SWA draft's rows and the draft block inputs, one compiled op."""
+        if verify_input.window is None:
+            raise ValueError("The block draft needs token-slot addressing")
+        maps = verify_input.window_maps
+        if maps != self._window_maps():
+            raise ValueError(
+                f"window carries {maps} maps, expected {self._window_maps()}"
+            )
+        state = bucket.state
+        rows, inputs = select_block_step(
+            verify_input.window,
+            maps,
+            state.seq_lens,
+            self.num_verify_rows,
+            state.bonus_tokens,
+            bucket.live_mask,
+            self._mask_token_id,
+            self._draft_block_width,
+        )
+        self._step_draft_inputs = inputs
+        self._step_swa_rows = rows[1] if maps == 2 else None
+        return rows[0]
+
+    def warmup_step_rows(self, padded_bs: int, width: int) -> None:
         # Width and mask token come from the draft config, so the shared spec-op grid cannot warm it.
-        with torch.no_grad():
-            for width, padded_bs in itertools.product(
-                self.verify_widths(), self._bucket_sizes()
-            ):
-                block_shape = (padded_bs, width)
-                warmup_compiled_op(
-                    build_draft_block_inputs,
-                    torch.zeros((padded_bs,), dtype=torch.int64, device=self.device),
-                    VerifyRows(
-                        positions=torch.zeros(
-                            block_shape, dtype=torch.int64, device=self.device
-                        ),
-                        cache_locs=torch.zeros(
-                            block_shape, dtype=torch.int64, device=self.device
-                        ),
-                        flat_positions=torch.zeros(
-                            (padded_bs * width,),
-                            dtype=torch.int64,
-                            device=self.device,
-                        ),
-                        flat_cache_locs=torch.zeros(
-                            (padded_bs * width,),
-                            dtype=torch.int64,
-                            device=self.device,
-                        ),
-                    ),
-                    torch.zeros((padded_bs,), dtype=torch.int64, device=self.device),
-                    torch.ones((padded_bs,), dtype=torch.bool, device=self.device),
-                    self._mask_token_id,
-                    self._draft_block_width,
-                )
+        warmup_compiled_op(
+            select_block_step,
+            self._zero_window(padded_bs),
+            self._window_maps(),
+            torch.zeros((padded_bs,), dtype=torch.int64, device=self.device),
+            width,
+            torch.zeros((padded_bs,), dtype=torch.int64, device=self.device),
+            torch.ones((padded_bs,), dtype=torch.bool, device=self.device),
+            self._mask_token_id,
+            self._draft_block_width,
+        )
 
     def _warmup_draft_sampling(self) -> None:
         """The eager sampled-draft chain, plus step's verify-token cat and logits cast."""

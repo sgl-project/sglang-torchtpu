@@ -152,16 +152,14 @@ class TestExperimentalSpecHooks(CustomTestCase):
         worker._target_has_linear_attn = True
         batch, rows, drafts, logits, accept, committed = [object() for _ in range(6)]
         bucket = SimpleNamespace(state=SimpleNamespace(seq_lens=object()))
-        addressing = SimpleNamespace(
-            verify_cache_candidates=object(), committed_lens=object()
-        )
+        addressing = object()
         calls = MagicMock()
         calls.select.return_value = rows
         calls.draft.return_value = drafts
         calls.verify.return_value = logits, accept
         calls.commit.return_value = committed
         with (
-            patch.object(base_spec_worker, "select_verify_rows", calls.select),
+            patch.object(worker, "select_step_rows", calls.select),
             patch.object(worker, "draft", calls.draft),
             patch.object(worker, "verify", calls.verify),
             patch.object(worker, "_commit_linear_attn_states", calls.linear),
@@ -173,12 +171,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
             [entry[0] for entry in calls.mock_calls],
             ["select", "draft", "verify", "linear", "commit"],
         )
-        calls.select.assert_called_once_with(
-            addressing.verify_cache_candidates,
-            addressing.committed_lens,
-            bucket.state.seq_lens,
-            8,
-        )
+        calls.select.assert_called_once_with(bucket, addressing)
         calls.draft.assert_called_once_with(batch, bucket, rows, addressing)
         calls.verify.assert_called_once_with(batch, bucket, rows, drafts, addressing)
         calls.linear.assert_called_once_with(
@@ -612,6 +605,93 @@ class TestExperimentalSpecHooks(CustomTestCase):
             torch.tensor([1, 2, 3]), rows, seq_lens, live, 0, 4
         )
         self.assertEqual(block.seq_lens.tolist(), [14, 24, 0])
+
+    def test_draft_context_patches_the_pp_group_only_under_pp(self):
+        import contextlib
+
+        from sglang_tpu.experimental.speculative import draft_worker
+
+        entered = []
+
+        @contextlib.contextmanager
+        def pp_context():
+            entered.append("pp")
+            yield
+
+        worker = SimpleNamespace(_owns_attention=False)
+        for pp_size, want in ((1, []), (2, ["pp"])):
+            with self.subTest(pp_size=pp_size):
+                entered.clear()
+                with (
+                    patch.object(draft_worker, "draft_pp_context", pp_context),
+                    patch.object(
+                        draft_worker,
+                        "get_parallel",
+                        return_value=SimpleNamespace(pp_size=pp_size),
+                    ),
+                    patch.object(
+                        draft_worker,
+                        "speculative_moe_backend_context",
+                        contextlib.nullcontext,
+                    ),
+                    patch.object(
+                        draft_worker,
+                        "speculative_moe_a2a_backend_context",
+                        contextlib.nullcontext,
+                    ),
+                ):
+                    with draft_worker.TpuDraftWorker.draft_context(worker):
+                        pass
+                self.assertEqual(entered, want)
+
+    def test_select_block_step_matches_the_unfused_ops_on_every_window_map(self):
+        from sglang_tpu.experimental.speculative.spec_ops import (
+            build_draft_block_inputs,
+            select_block_step,
+            select_verify_rows,
+            select_window_rows,
+        )
+
+        capacity, num_rows, width = 4, 3, 3
+        committed = torch.tensor([10, 20, 0])
+        # The device length leads the committed base by one commit on live rows.
+        seq_lens = torch.tensor([12, 21, 0])
+        live = torch.tensor([True, True, False])
+        full = committed[:, None] + 100 + torch.arange(2 * capacity)
+        swa = full + 5000
+        full[2] = 0
+        swa[2] = 0
+        for maps, slot_maps in ((1, [full]), (2, [full, swa])):
+            with self.subTest(maps=maps):
+                window = torch.cat([*slot_maps, committed[:, None]], dim=1)
+                rows, inputs = select_block_step(
+                    window,
+                    maps,
+                    seq_lens,
+                    num_rows,
+                    torch.tensor([7, 8, 0]),
+                    live,
+                    99,
+                    width,
+                )
+                self.assertEqual(len(rows), maps)
+                for got, slots in zip(rows, slot_maps):
+                    want = select_verify_rows(slots, committed, seq_lens, num_rows)
+                    for name in want._fields:
+                        self.assertTrue(
+                            torch.equal(getattr(got, name), getattr(want, name)), name
+                        )
+                want_inputs = build_draft_block_inputs(
+                    torch.tensor([7, 8, 0]), rows[0], seq_lens, live, 99, width
+                )
+                for name in want_inputs._fields:
+                    self.assertTrue(
+                        torch.equal(getattr(inputs, name), getattr(want_inputs, name)),
+                        name,
+                    )
+                window_rows = select_window_rows(window, maps, seq_lens, num_rows)
+                for got, want in zip(window_rows, rows):
+                    self.assertTrue(torch.equal(got.cache_locs, want.cache_locs))
 
     def test_mtp_takes_the_chain_paths_only_when_enabled(self):
         from sglang_tpu.experimental import is_experimental_spec_worker
@@ -1593,7 +1673,37 @@ class TestExperimentalSpecHooks(CustomTestCase):
                         plan.verify_cache_candidates_cpu,
                         draft.tpu_verify_cache_candidates,
                     )
-                    self.assertEqual(plan.verify_cache_candidates.shape, (padded_bs, 6))
+                    # One upload: the window's slots, then the committed base.
+                    self.assertEqual(plan.window_maps, 1)
+                    self.assertEqual(plan.window.shape, (padded_bs, 7))
+                    self.assertEqual(
+                        plan.window[:2].tolist(),
+                        [
+                            list(range(32 + 5, 32 + 11)) + [5],
+                            list(range(64 + 10, 64 + 16)) + [10],
+                        ],
+                    )
+                    self.assertEqual(plan.window[2:].count_nonzero().item(), 0)
+                    # A hybrid-SWA draft's slots ride the same upload as map 1.
+                    swa_map = torch.arange(128) + 1000
+                    swa_plan = TpuSpecVerifyInput.from_batch(
+                        batch,
+                        num_verify_rows=2,
+                        padded_bs=padded_bs,
+                        swa_slot_map=swa_map,
+                    )
+                    self.assertEqual(swa_plan.window_maps, 2)
+                    self.assertEqual(
+                        swa_plan.window[:2].tolist(),
+                        [
+                            list(range(32 + 5, 32 + 11))
+                            + list(range(1032 + 5, 1032 + 11))
+                            + [5],
+                            list(range(64 + 10, 64 + 16))
+                            + list(range(1064 + 10, 1064 + 16))
+                            + [10],
+                        ],
+                    )
                     self.assertEqual(
                         plan.req_pool_indices.tolist(), [1, 2] + [0] * (padded_bs - 2)
                     )
@@ -1623,8 +1733,15 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 plan = TpuSpecVerifyInput.from_batch(
                     batch, num_verify_rows=2, padded_bs=2
                 )
-                self.assertIsNone(plan.verify_cache_candidates)
-                self.assertIsNone(plan.committed_lens)
+                self.assertIsNone(plan.window)
+                self.assertEqual(plan.window_maps, 0)
+                with self.assertRaisesRegex(ValueError, "token-slot addressing"):
+                    TpuSpecVerifyInput.from_batch(
+                        batch,
+                        num_verify_rows=2,
+                        padded_bs=2,
+                        swa_slot_map=torch.arange(128),
+                    )
                 self.assertIs(plan.req_pool_indices, batch.req_pool_indices)
                 self.assertEqual(plan.host_len_slack, num_draft_tokens)
                 self.assertEqual(plan.seq_lens_cpu.tolist(), [5, 10])
@@ -1661,7 +1778,8 @@ class TestExperimentalSpecHooks(CustomTestCase):
     ):
         from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
 
-        all_warmups = ["base", "block", "sampling", "extend", "snapshot"]
+        # select_block_step (the draft block inputs) warms with the base's step rows.
+        all_warmups = ["base", "sampling", "extend", "snapshot"]
         cases = (
             (1, "null", all_warmups),
             (1, "prefill", all_warmups),
@@ -1675,7 +1793,6 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 calls: list[str] = []
                 worker = object.__new__(TpuBlockSpecWorker)
                 worker._sampled_drafts = True
-                worker._warmup_draft_block_inputs = lambda c=calls: c.append("block")
                 worker._warmup_draft_sampling = lambda c=calls: c.append("sampling")
                 worker._warmup_extend_draft_inputs = lambda c=calls: c.append("extend")
                 with (

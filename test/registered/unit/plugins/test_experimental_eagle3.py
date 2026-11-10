@@ -139,8 +139,18 @@ class TestExperimentalEagle3(CustomTestCase):
             self.assertIsNot(committed, seq_lens)
             return spec_ops.select_verify_rows(candidates, committed, seq_lens, width)
 
+        def select_window(window, maps, seq_lens, width):
+            # The step's packed window: one map of 2 * capacity slots + committed base.
+            self.assertEqual(maps, 1)
+            selections.append((tuple(window.shape), width))
+            return spec_ops.select_window_rows(window, maps, seq_lens, width)
+
         def warmup(op, *args):
-            return select(*args) if op is spec_ops.select_verify_rows else op(*args)
+            if op is spec_ops.select_verify_rows:
+                return select(*args)
+            if op is spec_ops.select_window_rows:
+                return select_window(*args)
+            return op(*args)
 
         def draft(**kwargs):
             rows = kwargs["rows"]
@@ -154,6 +164,7 @@ class TestExperimentalEagle3(CustomTestCase):
             )
 
         expected = {((bs, 8), width) for bs in (1, 2) for width in (2, 4)}
+        expected_step = {((bs, 9), width) for bs in (1, 2) for width in (2, 4)}
         with (
             patch.object(torch, "tpu", create=True) as tpu,
             patch.object(
@@ -173,14 +184,17 @@ class TestExperimentalEagle3(CustomTestCase):
             ):
                 selections.clear()
                 run()
-                self.assertEqual(set(selections), expected)
-                self.assertEqual(len(selections), len(expected))
+                want = (
+                    expected_step if run == worker._warmup_logical_bs_ops else expected
+                )
+                self.assertEqual(set(selections), want)
+                self.assertEqual(len(selections), len(want))
             idle = TpuSpecVerifyInput.idle(
                 verify_window_rows=worker.verify_window_rows, padded_bs=2, device="cpu"
             )
         tpu.current_stream.assert_called_once_with()
         tpu.current_stream.return_value.synchronize.assert_called_once_with()
-        self.assertEqual(idle.verify_cache_candidates.shape, (2, 8))
+        self.assertEqual(idle.window.shape, (2, 9))
         self.assertEqual(
             set(drafts), {(bs, width) for bs in (1, 2) for width in (2, 4)}
         )
@@ -210,8 +224,7 @@ class TestExperimentalEagle3(CustomTestCase):
         )
         bucket = SimpleNamespace(state=SimpleNamespace(seq_lens=torch.tensor([63, 0])))
         verify_input = SimpleNamespace(
-            verify_cache_candidates=torch.zeros((2, 8), dtype=torch.int64),
-            committed_lens=torch.tensor([60, 0]),
+            window=torch.tensor([[0] * 8 + [60], [0] * 9]), window_maps=1
         )
         with patch.object(base_spec_worker, "mamba_track_grid", return_value=64):
             TpuSpecWorker.step(worker, batch, bucket, verify_input)

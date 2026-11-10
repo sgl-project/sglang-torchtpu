@@ -58,8 +58,12 @@ class TpuDraftWorker(ABC):
     def draft_context(self) -> Iterator[None]:
         """The scopes every draft-model phase runs under, as EAGLEWorkerV2 enters them."""
         # Under PP the one-layer draft lives on the last stage only, as if PP were off.
+        # Without PP the target's group already is that one-member group, and the
+        # patch's runtime-context validation costs ~0.1 ms per call on the step path.
         with (
-            draft_pp_context(),
+            draft_pp_context()
+            if get_parallel().pp_size > 1
+            else contextlib.nullcontext(),
             draft_tp_context(self._owns_attention),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),

@@ -196,12 +196,15 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
     """Addressing for one verify step; the scheduler's plan already padded it to the bucket.
 
     Attributes:
-      verify_cache_candidates: [pbs, 2 * capacity] device int64 KV slots of
-        [base, base + 2 * capacity); active verify rows are picked without a D2H sync.
-        None when the algorithm does not need token-slot addressing.
-      verify_cache_candidates_cpu: [bs, 2 * capacity] host copy of the live rows,
-        which a hybrid-SWA draft maps to its SWA slots; None with no token slots.
-      committed_lens: [pbs] device int64 committed base, or None with no token slots.
+      window: [pbs, window_maps * 2 * capacity + 1] device int64, one upload per
+        step: each map's KV slots of [base, base + 2 * capacity), then the
+        committed base. Map 0 is the target's slots; map 1, when present, a
+        hybrid-SWA draft's SWA slots of the same rows. Active verify rows are
+        picked from it without a D2H sync (select_window_rows). None when the
+        algorithm does not need token-slot addressing.
+      window_maps: Slot maps packed in window (0 without token slots).
+      verify_cache_candidates_cpu: [bs, 2 * capacity] host copy of the live
+        target slots; None with no token slots.
       req_pool_indices: [pbs] device pool rows. 0 (reserved) marks padded rows
         in all three device fields.
       req_pool_indices_cpu: [pbs] host pool rows for host-built metadata.
@@ -211,9 +214,9 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
         first overlap relay.
     """
 
-    verify_cache_candidates: torch.Tensor | None
+    window: torch.Tensor | None
+    window_maps: int
     verify_cache_candidates_cpu: torch.Tensor | None
-    committed_lens: torch.Tensor | None
     req_pool_indices: torch.Tensor
     req_pool_indices_cpu: torch.Tensor
     seq_lens_cpu: torch.Tensor
@@ -222,9 +225,17 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
 
     @classmethod
     def from_batch(
-        cls, batch: ScheduleBatch, num_verify_rows: int, padded_bs: int
+        cls,
+        batch: ScheduleBatch,
+        num_verify_rows: int,
+        padded_bs: int,
+        swa_slot_map: torch.Tensor | None = None,
     ) -> TpuSpecVerifyInput:
-        """Convert the algorithm's batch.spec_info; raise for types without a TPU window."""
+        """Convert the algorithm's batch.spec_info; raise for types without a TPU window.
+
+        swa_slot_map: host full -> SWA token-slot mapping of a hybrid-SWA draft,
+        whose slots ride the same upload as window map 1.
+        """
         draft_input = batch.spec_info
         if not isinstance(draft_input, HostPaddedDraftInput):
             raise NotImplementedError(
@@ -261,18 +272,28 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
         # since an adaptive worker may have just switched to a shorter step.
         # The plan stays on host until the forward fixes its bucket;
         # 0 is the reserved row and slot.
+        needs_window = draft_input.needs_verify_cache_locs
+        if swa_slot_map is not None and not needs_window:
+            raise ValueError("A hybrid-SWA draft needs token-slot addressing")
+        maps = [candidates] if needs_window else []
+        if swa_slot_map is not None:
+            maps.append(swa_slot_map[candidates])
         return cls(
-            verify_cache_candidates=(
-                padded_h2d(candidates, padded_bs, batch.device)
-                if draft_input.needs_verify_cache_locs
+            window=(
+                padded_h2d(
+                    torch.cat(
+                        [m.to(torch.int64) for m in maps]
+                        + [committed_lens.to(torch.int64)[:, None]],
+                        dim=1,
+                    ),
+                    padded_bs,
+                    batch.device,
+                )
+                if needs_window
                 else None
             ),
+            window_maps=len(maps),
             verify_cache_candidates_cpu=candidates,
-            committed_lens=(
-                padded_h2d(committed_lens, padded_bs, batch.device)
-                if draft_input.needs_verify_cache_locs
-                else None
-            ),
             # The scheduler already owns device pool rows. Only padding needs
             # another upload; exact buckets can reuse them across decode steps.
             req_pool_indices=(
@@ -290,7 +311,12 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
 
     @classmethod
     def idle(
-        cls, *, verify_window_rows: int, padded_bs: int, device: str
+        cls,
+        *,
+        verify_window_rows: int,
+        padded_bs: int,
+        device: str,
+        window_maps: int = 1,
     ) -> TpuSpecVerifyInput:
         """All-padding addressing for a DP-attention rank with no requests.
 
@@ -298,13 +324,14 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
         """
         zeros = torch.zeros((padded_bs,), dtype=torch.int64)
         return cls(
-            verify_cache_candidates=torch.zeros(
-                (padded_bs, 2 * verify_window_rows), dtype=torch.int64
+            window=torch.zeros(
+                (padded_bs, window_maps * 2 * verify_window_rows + 1),
+                dtype=torch.int64,
             ).to(device, non_blocking=True),
+            window_maps=window_maps,
             verify_cache_candidates_cpu=torch.zeros(
                 (0, 2 * verify_window_rows), dtype=torch.int64
             ),
-            committed_lens=zeros.to(device, non_blocking=True),
             req_pool_indices=zeros.to(device, non_blocking=True),
             req_pool_indices_cpu=zeros,
             seq_lens_cpu=torch.zeros((0,), dtype=torch.int64),

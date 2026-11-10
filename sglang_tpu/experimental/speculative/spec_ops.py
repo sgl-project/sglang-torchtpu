@@ -104,16 +104,12 @@ def pad_state_rows(
     )
 
 
-@compiled_op()
-def select_verify_rows(
+def _select_rows(
     verify_cache_candidates: torch.Tensor,
     committed_lens: torch.Tensor,
     seq_lens: torch.Tensor,
-    num_rows: int | None = None,
+    num_rows: int,
 ) -> VerifyRows:
-    """Select active rows; the worker warms its capacity/width combinations."""
-    if num_rows is None:
-        num_rows = verify_cache_candidates.shape[1] // 2
     cache_locs = select_dflash_verify_cache_locs_tpu(
         verify_cache_candidates, seq_lens, committed_lens, num_rows
     )
@@ -124,6 +120,62 @@ def select_verify_rows(
         cache_locs=cache_locs,
         flat_positions=positions.reshape(-1),
         flat_cache_locs=cache_locs.reshape(-1),
+    )
+
+
+@compiled_op()
+def select_verify_rows(
+    verify_cache_candidates: torch.Tensor,
+    committed_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_rows: int | None = None,
+) -> VerifyRows:
+    """Select active rows; the worker warms its capacity/width combinations."""
+    if num_rows is None:
+        num_rows = verify_cache_candidates.shape[1] // 2
+    return _select_rows(verify_cache_candidates, committed_lens, seq_lens, num_rows)
+
+
+def _window_rows(
+    window: torch.Tensor, window_maps: int, seq_lens: torch.Tensor, num_rows: int
+) -> tuple[VerifyRows, ...]:
+    """Active rows of each slot map packed in TpuSpecVerifyInput.window."""
+    span = (window.shape[1] - 1) // window_maps
+    committed_lens = window[:, -1]
+    return tuple(
+        _select_rows(
+            window[:, i * span : (i + 1) * span], committed_lens, seq_lens, num_rows
+        )
+        for i in range(window_maps)
+    )
+
+
+@compiled_op()
+def select_window_rows(
+    window: torch.Tensor, window_maps: int, seq_lens: torch.Tensor, num_rows: int
+) -> tuple[VerifyRows, ...]:
+    """select_verify_rows over every map of the packed window in one program."""
+    return _window_rows(window, window_maps, seq_lens, num_rows)
+
+
+@compiled_op()
+def select_block_step(
+    window: torch.Tensor,
+    window_maps: int,
+    seq_lens: torch.Tensor,
+    num_rows: int,
+    bonus_tokens: torch.Tensor,
+    live_mask: torch.Tensor,
+    mask_token_id: int,
+    width: int,
+) -> tuple[tuple[VerifyRows, ...], DraftBlockInputs]:
+    """A block-draft step's verify rows per map and its draft inputs, one program.
+
+    Fuses select_window_rows with build_draft_block_inputs on map 0's rows.
+    """
+    rows = _window_rows(window, window_maps, seq_lens, num_rows)
+    return rows, _draft_block_inputs(
+        bonus_tokens, rows[0], seq_lens, live_mask, mask_token_id, width
     )
 
 
@@ -154,6 +206,19 @@ def build_draft_block_inputs(
 
     Model config sets width and mask_token_id, so the owning worker warms this op.
     """
+    return _draft_block_inputs(
+        bonus_tokens, rows, seq_lens, live_mask, mask_token_id, width
+    )
+
+
+def _draft_block_inputs(
+    bonus_tokens: torch.Tensor,
+    rows: VerifyRows,
+    seq_lens: torch.Tensor,
+    live_mask: torch.Tensor,
+    mask_token_id: int,
+    width: int,
+) -> DraftBlockInputs:
     pbs = bonus_tokens.shape[0]
     mask_tokens = torch.full(
         (pbs, width - 1),
