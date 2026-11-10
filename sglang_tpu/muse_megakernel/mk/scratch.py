@@ -273,6 +273,12 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
     ob_n = 4 if (c.tiled_o_rot or c.pair_o_rs) else 2
     items = [(n, base[n]) for n in _SHARED_SCRATCH] + [
         ("rtab", vmem((R, 2 * c.head_dim), f32)),
+        # a request's attention output rows (h, t, gi), re-read strided per (head, group)
+        *(
+            [("attn_stage", vmem((c.kv_heads * c.rows_per_req * c.g, LANE), f32))]
+            if c.rows_per_req % 8 == 0
+            else []
+        ),
         ("rope_blk", vmem((8, 8, 2 * c.head_dim), f32)),
         ("lhs", vmem((R, H), jnp.bfloat16)),
         ("acc", vmem((R, max(c.qkvg_dim, Hl, Hel, c.n_experts_padded)), f32)),

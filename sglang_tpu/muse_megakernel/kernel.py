@@ -974,6 +974,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
             window must start at a multiple of 8.
             """
+            if n % 8 == 0:  # callers' r0 is a multiple of n
+                return ref[pl.ds(pl.multiple_of(r0, 8), n), :]
             return (
                 jnp.concatenate([ref[pl.ds(r0 + t, 1), :] for t in range(n)], axis=0)
                 if n > 1
@@ -2550,15 +2552,30 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     if c.packed_attn
                     else (lambda h: slice(0, hd))
                 )
-                for t in range(q):
-                    S["attn_buf"][pl.ds(r0 + t, 1), :] = jnp.concatenate(
-                        [
-                            res[h * qg + t * g + gi : h * qg + t * g + gi + 1, lanes(h)]
-                            for h in range(hkv)
-                            for gi in range(g)
-                        ],
-                        axis=1,
-                    )
+                if "attn_stage" in S and res.shape[1] == LANE:
+                    # rows (t, gi) of each head: one strided [q, hd] load and store per
+                    # (head, group) instead of q row-by-row concatenations
+                    stage = S["attn_stage"]
+                    stage[...] = res
+                    for h in range(hkv):
+                        for gi in range(g):
+                            S["attn_buf"][
+                                pl.ds(pl.multiple_of(r0, 8), q),
+                                pl.ds((h * g + gi) * hd, hd),
+                            ] = stage[pl.ds(h * qg + gi, q, stride=g), :][:, lanes(h)]
+                else:
+                    for t in range(q):
+                        S["attn_buf"][pl.ds(r0 + t, 1), :] = jnp.concatenate(
+                            [
+                                res[
+                                    h * qg + t * g + gi : h * qg + t * g + gi + 1,
+                                    lanes(h),
+                                ]
+                                for h in range(hkv)
+                                for gi in range(g)
+                            ],
+                            axis=1,
+                        )
 
         # ------------------------------------------------------------ MoE
         Rc = c.rows_per_dev
