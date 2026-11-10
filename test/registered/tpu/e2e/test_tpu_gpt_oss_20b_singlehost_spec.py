@@ -1,4 +1,4 @@
-"""GPT-OSS-20B single-host EAGLE3 PR gate."""
+"""GPT-OSS-20B single-host EAGLE3 without DP attention; spec_dpa is the gate copy."""
 
 import os
 
@@ -10,7 +10,8 @@ from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
 
 register_tpu_ci(
     est_time=175,
-    suite="stage-b-test-tpu-4-v7",
+    suite="nightly-tpu-4-v7",
+    nightly=True,
     labels=["singlehost", "gpt-oss-20b", "spec"],
 )
 

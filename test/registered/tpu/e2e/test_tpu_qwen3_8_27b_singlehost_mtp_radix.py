@@ -17,6 +17,7 @@ from pathlib import Path
 import requests
 
 from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.ci.gate_matrix import full_matrix
 from sglang.test.tpu import run_model_config
 from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
 from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
@@ -24,6 +25,12 @@ from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
 register_tpu_ci(
     est_time=1800,
     suite="stage-b-test-tpu-4-v7",
+    labels=["singlehost", "qwen3.8-27b", "spec", "compile", "prefix-cache"],
+)
+register_tpu_ci(
+    est_time=1800,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
     labels=["singlehost", "qwen3.8-27b", "spec", "compile", "prefix-cache"],
 )
 
@@ -39,6 +46,8 @@ TURN1_NEW_TOKENS = 384
 # Measured 0.975 with radix on and off (chat, 2048 max tokens, 200 examples);
 # Qwen3.8 always thinks first, and a 512-token cap cut most answers off.
 GSM8K_BASELINE = float(os.environ.get("GSM8K_THRESHOLD_QWEN3_8_27B_MTP", "0.90"))
+# At 0.975, 50 questions fall below the 0.90 floor in about 1 run in 650.
+GSM8K_EXAMPLES = 200 if full_matrix() else 50
 SPEC_ACCEPT_LENGTH_THRESHOLD = float(
     os.environ.get("SPEC_ACCEPT_LENGTH_THRESHOLD", "1.5")
 )
@@ -165,7 +174,7 @@ class TestQwen38MtpRadix(TPULauncherTestCase):
                         "label": "gsm8k",
                         "baseline": GSM8K_BASELINE,
                         "spec_accept_length_threshold": SPEC_ACCEPT_LENGTH_THRESHOLD,
-                        "num_examples": 200,
+                        "num_examples": GSM8K_EXAMPLES,
                         "num_threads": CONCURRENCY,
                         "max_tokens": 2048,
                         "temperature": 0.0,

@@ -910,6 +910,16 @@ def _patch_hicache_write_back_copy_ahead() -> None:
     hicache_write_back_copy_ahead.install()
 
 
+def _patch_hicache_async_ready_counts() -> None:
+    """Defer the TP ready-count reduce by one step so the scheduler never waits on rank skew.
+
+    See ``hicache_async_ready_counts``.
+    """
+    from sglang_tpu import hicache_async_ready_counts
+
+    hicache_async_ready_counts.install()
+
+
 def _patch_pd_decode_async_prefill_info() -> None:
     """Fetch PD prefill parallel info off the decode scheduler thread.
 
@@ -918,6 +928,24 @@ def _patch_pd_decode_async_prefill_info() -> None:
     from sglang_tpu import pd_decode_async_prefill_info
 
     pd_decode_async_prefill_info.install()
+
+
+def _patch_prefill_kv_offload_to_decode_dram() -> None:
+    """Offload cold prefill KV to the decode's host RAM, as a tier below the
+    prefill's own host RAM (the HiCache L2 extension of the P/D pair).
+
+    Why: core has no disaggregation queue/cache lifecycle extension yet.
+    How: install the small wrappers listed in
+    disaggregation/decode_dram_offload/dram_offload_hooks.py (``_patch_targets``).
+    Upstream PR or issue: none yet; tracked with the hooks module.
+    Remove when: equivalent lifecycle callbacks are available upstream.
+    """
+    # Off: not even the modules' imports.
+    if not envs.SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM.get():
+        return
+    from sglang_tpu.disaggregation.decode_dram_offload import dram_offload_hooks
+
+    dram_offload_hooks.install()
 
 
 def _patch_host_heap_trim() -> None:
@@ -1030,7 +1058,9 @@ def apply_tpu_patches() -> None:
     _patch_pd_decode_swa_hicache()
     _install_hybrid_linear_hicache()
     _patch_hicache_write_back_copy_ahead()
+    _patch_hicache_async_ready_counts()
     _patch_pd_decode_async_prefill_info()
+    _patch_prefill_kv_offload_to_decode_dram()
     from sglang_tpu.benchmark_batch_gate import install as install_benchmark_batch_gate
 
     install_benchmark_batch_gate()

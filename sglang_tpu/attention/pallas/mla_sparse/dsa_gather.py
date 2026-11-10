@@ -35,12 +35,22 @@ def main_kernel(
     nope_out_hbm_ref: Any,
     rope_out_hbm_ref: Any,
     nope_sem: Any,
-    *,
+    *scratch: Any,
     core_axis_name: str,
     subcore_axis_name: str,
     num_row_subchunks: int,
     num_streams: int,
+    exact_out_size: int | None = None,
+    gather_rope: bool = True,
 ):
+    # exact_out_size: the outputs hold exactly this many rows instead of the
+    # block-padded count (a multiple of one pipeline step's
+    # num_streams * num_lanes rows), so the caller needs no slice. Steps past
+    # it write nothing; `scratch` then holds rope's staging buffer and its
+    # DMA semaphore.
+    #
+    # gather_rope=False: the rope lane is identically zero, so the rope cache is
+    # not read; the rope output rows are written as zeros.
     tpu_info = pltpu.get_tpu_info()
     sc_info = tpu_info.sparse_core
     assert sc_info is not None
@@ -101,12 +111,7 @@ def main_kernel(
         def idx_window(r, s):
             return idx_ref[pl.ds(subchunk(r, s) * row_subchunk_size, row_subchunk_size)]
 
-        def _body(nope_sem, nope_out_i32, *refs):
-            r = pl.program_id(0)
-            nope_g = refs[0 * num_streams : 1 * num_streams]
-            rope_g = refs[1 * num_streams : 2 * num_streams]
-            rope_o = refs[2 * num_streams]
-
+        def _gather_step(r, nope_g, rope_g, rope_o, rope_copy=None):
             # nope needs no vector work at all. The nope output keeps the cache's raw
             # per-token layout. The gathered row *is* the output row.
             #
@@ -123,17 +128,61 @@ def main_kernel(
                 copy.start()
                 nope_copies.append(copy)
 
-            for s in range(num_streams):
-                process_rope(
-                    gather_ref=rope_g[s],
-                    out_ref=rope_o,
-                    idx_sub=idx_window(r, s),
-                    out_row_base=s * rope_rows_per_stream,
-                )
+            if rope_g is None:
+                # The attention kernel still reads these rows, and uninitialised
+                # bytes could decode to FP8 NaN, so write zeros.
+                for row in range(num_streams * rope_rows_per_stream):
+                    rope_o[pl.ds(row, 1), :] = jnp.zeros(
+                        (1, rope_out_cols), dtype=jnp.int32
+                    )
+            else:
+                for s in range(num_streams):
+                    process_rope(
+                        gather_ref=rope_g[s],
+                        out_ref=rope_o,
+                        idx_sub=idx_window(r, s),
+                        out_row_base=s * rope_rows_per_stream,
+                    )
+            if rope_copy is not None:
+                rope_copy.start()
 
-            # Wait for all nope DMAs to complete.
+            # Wait for all nope DMAs (and the rope DMA) to complete.
             for copy in nope_copies:
                 copy.wait()
+            if rope_copy is not None:
+                rope_copy.wait()
+
+        def _body(nope_sem, nope_out_i32, *refs):
+            r = pl.program_id(0)
+            nope_g = refs[:num_streams]
+            num_in = 2 * num_streams if gather_rope else num_streams
+            rope_g = refs[num_streams:num_in] if gather_rope else None
+            if exact_out_size is None:
+                _gather_step(r, nope_g, rope_g, rope_o=refs[num_in])
+                return
+
+            # Exact-size outputs: a step whose rows start at or past the end
+            # writes nothing, and rope is staged in VMEM and DMA'd under the same
+            # guard (a pipeline output block would be written back out of bounds).
+            rope_vmem, rope_sem = scratch
+            rope_rows = num_streams * rope_rows_per_stream
+            first_row = (out_row_base + subchunk(r, 0)) * row_subchunk_size
+
+            # Runs only for steps that have output rows.
+            @pl.when(first_row < exact_out_size)
+            def _step_with_output_rows():
+                rope_dst = rope_out_i32.at[
+                    pl.ds((out_row_base // num_streams + r) * rope_rows, rope_rows)
+                ]
+                _gather_step(
+                    r,
+                    nope_g,
+                    rope_g,
+                    rope_o=rope_vmem,
+                    rope_copy=pltpu.make_async_copy(
+                        rope_vmem, rope_dst, rope_sem.at[0]
+                    ),
+                )
 
         # Have multiple parallel `pl.Indirect` to hide random access read latency.
         # Output contiguous memory access, multiple output parallel DMAs not help
@@ -167,17 +216,24 @@ def main_kernel(
         )
         core_start_idx = out_row_base * row_subchunk_size
 
+        # Exact-size outputs DMA rope themselves (see `_body`).
+        out_kwargs = {} if exact_out_size else {"out_specs": (rope_out_spec,)}
+        out_refs = () if exact_out_size else (rope_out_i32,)
+
         @pl.when(core_start_idx < valid_indices)
         def _run_gather():
+            # Without rope reads, only the nope gathers are pipeline inputs.
+            rope_specs = rope_in_specs if gather_rope else ()
+            rope_inputs = [rope_in_i32] * num_streams if gather_rope else []
             pltpu.emit_pipeline(
                 functools.partial(_body, nope_sem, nope_out_i32),
                 grid=(num_row_subchunks // num_streams,),
-                in_specs=nope_in_specs + rope_in_specs,
-                out_specs=(rope_out_spec,),
+                in_specs=nope_in_specs + rope_specs,
+                **out_kwargs,
             )(
                 *([nope_in_i32] * num_streams),
-                *([rope_in_i32] * num_streams),
-                rope_out_i32,
+                *rope_inputs,
+                *out_refs,
             )
 
     pltpu.emit_pipeline(
@@ -196,13 +252,14 @@ def main_kernel(
     )(indices_hbm_ref, valid_indices_ref)
 
 
-@functools.partial(jax.jit, static_argnames=("num_row_subchunks",))
+@functools.partial(jax.jit, static_argnames=("num_row_subchunks", "gather_rope"))
 def dsa_gather(
     nope_cache: jax.Array,
     rope_cache: jax.Array,
     indices: jax.Array,
     num_valid_indices: jax.Array | None = None,
     num_row_subchunks: int | None = None,
+    gather_rope: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """Fused SparseCore gather of the nope and rope caches.
 
@@ -220,6 +277,16 @@ def dsa_gather(
       num_row_subchunks: Subchunks of `num_lanes` rows each subcore gathers per
         block; a multiple of 4. None picks the smallest block that covers N,
         up to 32 subchunks.
+      gather_rope: False skips the rope cache reads and writes zero rope rows,
+        for a model whose rope lane is identically zero. Halves the gather's
+        indirect reads and drops the rope unpacking.
+
+    The kernel walks whole blocks, so the index list is padded to a multiple
+    of the block size. When N is a multiple of one pipeline step's rows
+    (num_streams * num_lanes = 64 on tpu7x), the kernel writes exactly N output
+    rows. Otherwise it writes block-padded outputs and slices them to N, which
+    copies every gathered row once more. Every caller that gathers whole top-k
+    rows (widths that are multiples of 128) takes the exact path.
 
     Returns:
       nope_out: (N, WORD_BYTES, TILE_LANE_BYTES) uint8. Each token's nope tile
@@ -279,6 +346,18 @@ def dsa_gather(
     block_size = row_chunk_size * num_cores
     out_pad_size = ((out_size + block_size - 1) // block_size) * block_size - out_size
     indices = jnp.pad(indices, ((0, out_pad_size)))
+    # Exact-size outputs need every pipeline step to lie fully inside or fully
+    # past out_size (see the docstring); with no padding there is nothing to do.
+    step_rows = num_streams * row_subchunk_size
+    exact = out_pad_size > 0 and out_size % step_rows == 0
+    out_rows = out_size if exact else out_size + out_pad_size
+    scratch_types: tuple[Any, ...] = (pltpu.SemaphoreType.DMA((num_streams,)),)
+    if exact:
+        rope_rows = num_streams * row_subchunk_size * rope_cache.dtype.itemsize // 4
+        scratch_types += (
+            pltpu.VMEM((rope_rows, rope_out_cols), jnp.int32),
+            pltpu.SemaphoreType.DMA((1,)),
+        )
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
         num_subcores=sc_info.num_subcores,
@@ -294,19 +373,19 @@ def dsa_gather(
                 subcore_axis_name=vector_mesh.subcore_axis_name,
                 num_row_subchunks=num_row_subchunks,
                 num_streams=num_streams,
+                exact_out_size=out_size if exact else None,
+                gather_rope=gather_rope,
             ),
             out_type=(
                 jax.ShapeDtypeStruct(
-                    ((out_size + out_pad_size) * word_bytes, tile_lane_bytes),
-                    jnp.uint8,
+                    (out_rows * word_bytes, tile_lane_bytes), jnp.uint8
                 ),
-                jax.ShapeDtypeStruct(
-                    (out_size + out_pad_size, rope_out_cols), jnp.uint8
-                ),
+                jax.ShapeDtypeStruct((out_rows, rope_out_cols), jnp.uint8),
             ),
             # One DMA semaphore per stream for the direct nope gather-buffer -> HBM
-            # copies issued in `main_kernel`.
-            scratch_types=(pltpu.SemaphoreType.DMA((num_streams,)),),
+            # copies issued in `main_kernel` (plus, for exact outputs, the rope
+            # staging buffer and its semaphore).
+            scratch_types=scratch_types,
             compiler_params=pltpu.CompilerParams(
                 use_tc_tiling_on_sc=True,
                 needs_layout_passes=True,
@@ -316,6 +395,8 @@ def dsa_gather(
             name="sc_dsa_gather",
         )(nope_cache, rope_cache, indices, valid_indices),
     )  # pyrefly: ignore[not-iterable]
+    if exact:
+        return nope_out.reshape(-1, word_bytes, tile_lane_bytes), rope_out
     return (
         nope_out.reshape(-1, word_bytes, tile_lane_bytes)[:out_size],
         rope_out[:out_size],

@@ -84,9 +84,6 @@ def validate_dp_replicas(cfg) -> None:
             cfg.attn_dp_size == cfg.attn_cp_size == cfg.dcp_size == cfg.moe_dp_size == 1
         ),
         "no shared-expert TP override": cfg.shared_experts_tp_size is None,
-        "no speculative decoding with TP>1": (
-            cfg.tp_size == 1 or cfg.speculative_algorithm is None
-        ),
         "TP1 on the single-host test platform": (
             os.environ.get("SGLANG_PLATFORM") != "tpu_single_host" or cfg.tp_size == 1
         ),

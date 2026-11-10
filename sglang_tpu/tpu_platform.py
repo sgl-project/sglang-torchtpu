@@ -171,6 +171,10 @@ def _check_block_major_supported(server_args) -> None:
             "HiCache backend only; got --hicache-io-backend "
             f"{cfg.hicache_io_backend!r}."
         )
+    if cfg.enable_unified_memory:
+        raise ValueError(
+            "SGLANG_TPU_USE_BLOCK_MAJOR_KV does not support --enable-unified-memory."
+        )
     if mambaish_config(model_config_of(server_args)) is not None:
         raise ValueError(
             "SGLANG_TPU_USE_BLOCK_MAJOR_KV does not support hybrid "
@@ -345,6 +349,17 @@ def _pin_fused_moe_tensorcore_gather(reason: str) -> None:
             f"{reason} gathers the fused-MoE rows on the TensorCore."
         )
     tpu_envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.set(False)
+
+
+def _pin_moe_gather_permute_for_static_fp8(parts: frozenset[str]) -> None:
+    """Kimi-K3 static fp8 moe_front / latent_up: keep the fused MoE's permute off
+    the one-hot matmul where the combine runs on the SparseCore. That pairing
+    gave wrong tokens there (DSpark verifying four requests, 32 tokens), while
+    either path end to end was right."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if parts & {"moe_front", "latent_up"}:
+        tpu_envs.SGLANG_TPU_FORCE_MOE_GATHER_PERMUTE_WITH_SC_COMBINE.set(True)
 
 
 def _mha_kv_pool_cls(backend: str | None) -> type:
@@ -662,6 +677,20 @@ def _apply_kv_cache_dtype_default(server_args) -> None:
         return
     declare_resolution(
         server_args, "tpu.apply_server_args_defaults", kv_cache_dtype="fp8_e4m3"
+    )
+
+
+def _resolve_unified_kv_pool(server_args) -> None:
+    """Resolve ``--enable-unified-memory`` on TPU without enabling CUDA unified memory."""
+    from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
+    from sglang_tpu.unified_kv_pool import UNIFIED_KV_POOL_RESOLUTION_SOURCE
+
+    if not resolving_view(server_args).enable_unified_memory:
+        return
+    declare_resolution(
+        server_args,
+        UNIFIED_KV_POOL_RESOLUTION_SOURCE,
+        enable_unified_memory=False,
     )
 
 
@@ -1021,20 +1050,19 @@ class TpuSRTPlatform(SRTPlatform):
             with_phase,
         )
         from sglang_tpu.hooks.dsv4 import register_tpu_dsv4_resolution_hooks
-        from sglang_tpu.kimi_k3 import check_static_fp8_spec_batch, static_fp8_parts
+        from sglang_tpu.kimi_k3 import static_fp8_parts
         from sglang_tpu.patches import _prepare_tpu_env
 
         register_tpu_dsv4_resolution_hooks()
 
         # Fail on a mistyped SGLANG_TPU_K3_STATIC_FP8 now, not after the
         # weights have loaded (its binder runs post-load).
-        parts = static_fp8_parts()
+        _pin_moe_gather_permute_for_static_fp8(static_fp8_parts())
         cfg = resolving_view(server_args)
-        if "latent_up" in parts:
-            check_static_fp8_spec_batch(
-                parts,
-                speculative_algorithm=cfg.speculative_algorithm,
-                max_running_requests=cfg.max_running_requests,
+        if cfg.enable_page_major_kv_layout:
+            raise ValueError(
+                "--enable-page-major-kv-layout is a CUDA-only layout flag and is "
+                "not supported on TPU."
             )
         if cfg.pp_size > 1:
             _validate_pipeline_parallel_args(server_args)
@@ -1224,6 +1252,7 @@ class TpuSRTPlatform(SRTPlatform):
         _apply_kv_cache_dtype_default(server_args)
         if _uses_block_major_kv():
             _check_block_major_supported(server_args)
+        _resolve_unified_kv_pool(server_args)
 
     # ------------------------------------------------------------------
     # Subsystem factory methods
@@ -1426,6 +1455,50 @@ class TpuSRTPlatform(SRTPlatform):
         )
 
         return TpuPagedTokenToKVPoolAllocator
+
+    def unified_kv_pool_enabled(self, kvc) -> bool:
+        from sglang_tpu.unified_kv_pool import unified_kv_pool_enabled
+
+        return unified_kv_pool_enabled(kvc)
+
+    def create_memory_pool_configurator(self, kvc):
+        from sglang_tpu.unified_kv_pool import maybe_create_unified_pool_configurator
+
+        return maybe_create_unified_pool_configurator(kvc)
+
+    def build_swa_kv_pool(
+        self,
+        kvc,
+        *,
+        full_max_total_num_tokens: int | None,
+        swa_max_total_num_tokens: int | None,
+    ):
+        from sglang_tpu.unified_kv_pool import maybe_build_unified_kv_pool
+
+        return maybe_build_unified_kv_pool(
+            kvc,
+            full_max_total_num_tokens=full_max_total_num_tokens,
+            swa_max_total_num_tokens=swa_max_total_num_tokens,
+        )
+
+    def build_swa_kv_pool_allocator(
+        self,
+        kvc,
+        *,
+        sizes,
+        token_to_kv_pool,
+        req_to_token_pool,
+        need_sort: bool,
+    ):
+        from sglang_tpu.unified_kv_pool import maybe_build_unified_kv_pool_allocator
+
+        return maybe_build_unified_kv_pool_allocator(
+            kvc,
+            sizes=sizes,
+            token_to_kv_pool=token_to_kv_pool,
+            req_to_token_pool=req_to_token_pool,
+            need_sort=need_sort,
+        )
 
     def get_compile_backend(self, mode: str | None = None) -> str:
         return "tpu"

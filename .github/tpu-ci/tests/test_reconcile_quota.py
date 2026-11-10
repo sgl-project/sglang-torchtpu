@@ -58,15 +58,148 @@ class TestSplitQuota(unittest.TestCase):
             split(slices={"p": 2}, hosts=2, min_hosts={"pr-gate": 1})
 
 
+def info(topology, hosts, nodes, ready, max_nodes=None):
+    return {
+        "topology": topology,
+        "hosts": hosts,
+        "nodes": nodes,
+        "ready": ready,
+        "max_nodes": max_nodes,
+    }
+
+
 class TestUsableSlices(unittest.TestCase):
+    def test_fixed_single_host_pool_counts_ready_nodes(self):
+        self.assertEqual(
+            reconcile_quota.usable_slices(pool="p", info=info("2x2x1", 1, 5, 4)), 4
+        )
+
+    def test_autoscaled_single_host_pool_counts_its_maximum(self):
+        # Quota admits before the node exists; the pending pod triggers the scale-up.
+        self.assertEqual(
+            reconcile_quota.usable_slices(
+                pool="p", info=info("2x2x1", 1, 3, 3, max_nodes=5)
+            ),
+            5,
+        )
+
+    def test_autoscaled_pool_grown_past_its_maximum_by_hand_counts_live_nodes(self):
+        self.assertEqual(
+            reconcile_quota.usable_slices(
+                pool="p", info=info("2x2x1", 1, 6, 6, max_nodes=5)
+            ),
+            6,
+        )
+
     def test_multi_host_pool_holding_two_slices_gets_no_quota(self):
         # Pods could straddle the two slices and hang at ICI rendezvous.
-        info = {"topology": "2x2x2", "hosts": 2, "nodes": 4, "ready": 4}
-        self.assertEqual(reconcile_quota.usable_slices(pool="p", info=info), 0)
+        self.assertEqual(
+            reconcile_quota.usable_slices(pool="p", info=info("2x2x2", 2, 4, 4)), 0
+        )
+
+    def test_autoscaled_multi_host_pool_with_a_two_slice_maximum_gets_no_quota(self):
+        self.assertEqual(
+            reconcile_quota.usable_slices(
+                pool="p", info=info("2x2x2", 2, 0, 0, max_nodes=4)
+            ),
+            0,
+        )
+
+    def test_autoscaled_multi_host_pool_scaled_to_zero_still_counts_one_slice(self):
+        self.assertEqual(
+            reconcile_quota.usable_slices(
+                pool="p", info=info("2x2x2", 2, 0, 0, max_nodes=2)
+            ),
+            1,
+        )
 
     def test_multi_host_slice_counts_only_when_every_host_is_ready(self):
-        info = {"topology": "2x2x2", "hosts": 2, "nodes": 2, "ready": 1}
-        self.assertEqual(reconcile_quota.usable_slices(pool="p", info=info), 0)
+        self.assertEqual(
+            reconcile_quota.usable_slices(pool="p", info=info("2x2x2", 2, 2, 1)), 0
+        )
+
+
+def node(pool, topology, ready=True, chips="4"):
+    return {
+        "metadata": {
+            "labels": {
+                "ci-tpu-pool": pool,
+                "cloud.google.com/gke-tpu-topology": topology,
+                "cloud.google.com/gke-accelerator-count": chips,
+            }
+        },
+        "status": {
+            "conditions": [{"type": "Ready", "status": "True" if ready else "False"}]
+        },
+    }
+
+
+def node_pool(pool, topology=None, autoscaling=None):
+    return {
+        "name": f"ci-{pool}",
+        "config": {"labels": {"ci-tpu-pool": pool}} if pool else {},
+        "placementPolicy": {"tpuTopology": topology} if topology else None,
+        "autoscaling": autoscaling,
+    }
+
+
+class TestCiPools(unittest.TestCase):
+    def test_autoscaled_pool_scaled_to_zero_is_listed_from_gke(self):
+        pools = reconcile_quota.ci_pools(
+            nodes=[],
+            node_pools=[
+                node_pool("pr-gate", autoscaling={"enabled": True, "maxNodeCount": 5}),
+                node_pool("nightly", topology="2x2x2"),
+                node_pool(None),
+            ],
+        )
+        self.assertEqual(
+            pools["pr-gate"],
+            {
+                "topology": "2x2x1",
+                "hosts": 1,
+                "nodes": 0,
+                "ready": 0,
+                "chips_per_host": 4,
+                "max_nodes": 5,
+            },
+        )
+        self.assertEqual(pools["nightly"]["hosts"], 2)
+        self.assertIsNone(pools["nightly"]["max_nodes"])
+        self.assertEqual(set(pools), {"pr-gate", "nightly"})
+
+    def test_nodes_add_live_counts_to_a_listed_pool(self):
+        pools = reconcile_quota.ci_pools(
+            nodes=[node("pr-gate", "2x2x1"), node("pr-gate", "2x2x1", ready=False)],
+            node_pools=[
+                node_pool("pr-gate", autoscaling={"enabled": True, "maxNodeCount": 5})
+            ],
+        )
+        self.assertEqual((pools["pr-gate"]["nodes"], pools["pr-gate"]["ready"]), (2, 1))
+        self.assertEqual(pools["pr-gate"]["max_nodes"], 5)
+
+    def test_disabled_autoscaling_is_a_fixed_pool(self):
+        pools = reconcile_quota.ci_pools(
+            nodes=[],
+            node_pools=[node_pool("pr-gate", autoscaling={"enabled": False})],
+        )
+        self.assertIsNone(pools["pr-gate"]["max_nodes"])
+
+    def test_pool_known_only_from_nodes_is_fixed(self):
+        pools = reconcile_quota.ci_pools(
+            nodes=[node("by-hand", "2x2x2"), node("by-hand", "2x2x2")], node_pools=[]
+        )
+        self.assertEqual(
+            pools["by-hand"],
+            {
+                "topology": "2x2x2",
+                "hosts": 2,
+                "nodes": 2,
+                "ready": 2,
+                "chips_per_host": 4,
+                "max_nodes": None,
+            },
+        )
 
 
 if __name__ == "__main__":

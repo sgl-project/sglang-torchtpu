@@ -64,7 +64,10 @@ def topk_row_width(hf_config) -> int:
 
 
 def _build_pallas_sparse_mla_kernel_op(
-    qblock_kpool: int = 0, gather_chunk_tokens: Optional[int] = None, window=False
+    qblock_kpool: int = 0,
+    gather_chunk_tokens: Optional[int] = None,
+    zero_rope: bool = False,
+    window: bool = False,
 ):
     """Register the sparse MLA step as a torch custom op, once per process.
 
@@ -74,11 +77,14 @@ def _build_pallas_sparse_mla_kernel_op(
     kernels find pages with a fixed stride, and they use one scale for both
     keys and values.
 
+    ``zero_rope`` neither writes nor reads the rope cache, for a model whose
+    rope lane is identically zero (see ``sparse_mla_attention_fused``).
+
     ``window`` (SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT) builds
     ``sparse_mla_prefill_window`` instead: the queries and rows are one window
     of the batch, and the ``cu_kv_lens`` slot carries the window's cu_q_lens.
     """
-    key = (qblock_kpool, gather_chunk_tokens, window)
+    key = (qblock_kpool, gather_chunk_tokens, zero_rope, window)
     if key in _PALLAS_SPARSE_MLA_OPS:
         return _PALLAS_SPARSE_MLA_OPS[key]
 
@@ -105,6 +111,10 @@ def _build_pallas_sparse_mla_kernel_op(
         # qblock_kpool == 1 (plain DSA) also takes and returns head-major
         # queries and output, [heads, tokens, ...] (_forward_mla).
         op_name += f"_qblock{qblock_kpool}"
+    if zero_rope:
+        # No rope cache write or read: a different body, so a different name.
+        op_name += "_zero_rope"
+        chunk_kwargs["zero_rope"] = True
 
     # custom_jax_kernel reads this function's signature: every tensor has to
     # be a positional parameter annotated ``jax.Array``. The JAX step cannot be
@@ -247,6 +257,20 @@ def _build_pallas_sparse_mla_kernel_op(
     return custom_op
 
 
+def _has_zero_rope(hf_config) -> bool:
+    """Whether the model has no rope (``qk_rope_head_dim == 0``, GLM-5.3-Flash).
+
+    Such a model attends with an identically-zero rope lane
+    (``_mla_kernel_args``), so the rope cache, allocated zeroed, never needs
+    writing or reading.
+    """
+    rope_dim = getattr(hf_config, "qk_rope_head_dim", None)
+    if rope_dim is None:
+        text_config = getattr(hf_config, "text_config", None) or hf_config
+        rope_dim = getattr(text_config, "qk_rope_head_dim", None)
+    return rope_dim == 0
+
+
 def _kpool_query_bound(metadata, *, num_tokens: int) -> int:
     """Static per-request new-token bound for fused kpool pooling.
 
@@ -300,6 +324,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         hf_config = model_runner.model_config.hf_config
         # Set before super().__init__(), which calls _build_kernel_op().
         self._kpool = get_dsa_index_kpool(hf_config)
+        self._zero_rope = _has_zero_rope(hf_config)
         super().__init__(model_runner, speculative_step_id)
         self._topk = get_dsa_index_topk(hf_config)
         if self._kpool > 1:
@@ -446,21 +471,24 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         # opt-in adds a prefill op: decode, verify and draft extend keep the
         # per-query kernel.
         self._prefill_op = None
+        zero_rope = self._zero_rope
         if not tpu_envs.SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL.get():
-            return _build_pallas_sparse_mla_kernel_op()
+            return _build_pallas_sparse_mla_kernel_op(zero_rope=zero_rope)
         if self._kpool == 1:
             # Plain DSA: token-bitmap q-block prefill. Its fallback (short or
             # long-context batches) and the decode op keep the default chunk.
             self._prefill_op = _build_pallas_sparse_mla_kernel_op(1)
-            return _build_pallas_sparse_mla_kernel_op()
+            return _build_pallas_sparse_mla_kernel_op(zero_rope=zero_rope)
         from sglang_tpu.attention.pallas.mla_sparse_fused import (
             QBLOCK_GATHER_CHUNK_TOKENS,
         )
 
         self._prefill_op = _build_pallas_sparse_mla_kernel_op(
-            self._kpool, QBLOCK_GATHER_CHUNK_TOKENS
+            self._kpool, QBLOCK_GATHER_CHUNK_TOKENS, zero_rope=zero_rope
         )
-        return _build_pallas_sparse_mla_kernel_op(0, QBLOCK_GATHER_CHUNK_TOKENS)
+        return _build_pallas_sparse_mla_kernel_op(
+            0, QBLOCK_GATHER_CHUNK_TOKENS, zero_rope=zero_rope
+        )
 
     def forward_indexer(
         self,
@@ -652,6 +680,13 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             f"layer {layer.layer_id} reached pallas_tpu_mla_sparse without the "
             "indexer's top-k rows."
         )
+        if self._zero_rope:
+            # The zero-rope ops are exact only for a zero rope lane, which
+            # _mla_kernel_args builds when the layer has no rope dims.
+            assert layer.qk_head_dim == layer.v_head_dim, (
+                f"layer {layer.layer_id} has rope dims, but the sparse MLA ops "
+                "were built for a model without rope."
+            )
         args = self._mla_kernel_args(
             q=q,
             k=k,

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import inspect
 import math
 import os
 import threading
@@ -65,6 +66,7 @@ from sglang_tpu.disaggregation.raiden.common import (
     kv_layout_of,
     logger,
 )
+from sglang_tpu.disaggregation.raiden.dram_offload_channel import DramOffloadChannel
 from sglang_tpu.disaggregation.raiden.host_pool import (
     WINDOW_SLOTS_PER_FULL_SLOT,
     StagingAdmission,
@@ -74,13 +76,22 @@ from sglang_tpu.disaggregation.raiden.host_pool import (
     slots_within_budget,
     split_staging_layers,
 )
+from sglang_tpu.disaggregation.raiden.pp_common import (
+    _BLOCK_MAJOR_KV_RANK,
+    _FUSED_KV_RANK,
+)
 from sglang_tpu.disaggregation.raiden.receiver import (
     RaidenKVReceiver,
     RaidenReceiverMixin,
 )
+from sglang_tpu.disaggregation.raiden.reshard_schedule import (
+    ReshardGeometry,
+    head_pair_bytes,
+)
 from sglang_tpu.disaggregation.raiden.sender import RaidenKVSender, RaidenSenderMixin
 from sglang_tpu.disaggregation.raiden.serde import (
     PER_LAYER_KV_LAYOUT,
+    UNIFIED_SWA_KV_LAYOUT,
     Blocks,
     Chunk,
     MessageTag,
@@ -94,9 +105,12 @@ from sglang_tpu.disaggregation.raiden.serde import (
 )
 from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
 from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.kv_pool import TpuSeqAlongLaneKVPool
+from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
 
 if TYPE_CHECKING:
     from tpu_sync.api.torch.kv_cache_manager import SettledTransfer
+
 
 # Re-exported so that "from …raiden.conn import X" keeps resolving for the
 # callers and tests that predate the split into common/sender/receiver.
@@ -133,6 +147,18 @@ def _describe_failure(
     return " ".join(parts)
 
 
+def _accepts_staging_layers() -> bool:
+    """Whether the installed tpu-sync KVCacheManager takes num_staging_layers
+    (google/tpu-sync#1402); older wheels only keep full host mirrors."""
+    from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
+
+    parameters = inspect.signature(KVCacheManager).parameters.values()
+    return any(
+        p.name == "num_staging_layers" or p.kind is inspect.Parameter.VAR_KEYWORD
+        for p in parameters
+    )
+
+
 class RaidenKVManager(
     RaidenSenderMixin,
     RaidenReceiverMixin,
@@ -148,6 +174,9 @@ class RaidenKVManager(
 
     # The legacy transport unless set_kv_caches builds a pipeline transfer.
     _pipeline = None
+    # Channel of the KV offload to decode DRAM (dram_offload_channel.py);
+    # None unless __init__ finds the switch on.
+    dram_offload_channel: Optional[DramOffloadChannel] = None
     _pipeline_enabled = False
     # Host layer buffers per transfer, from SGLANG_TPU_RAIDEN_STAGING_LAYERS.
     _staging_layers_total = 0
@@ -156,6 +185,9 @@ class RaidenKVManager(
     _listener_start_read = False
     # Layout tag of the registered KV tensors, sent with every CHUNK and BLOCKS.
     kv_layout: str = PER_LAYER_KV_LAYOUT
+    # Shared-buffer Full+SWA pool when --enable-unified-memory is active.
+    _unified_swa_pool: Optional[TpuUnifiedSWAKVPool] = None
+    _seq_along_lane: bool = False
     # State engine: one row per request for GDN, or multi-page request rings for DSV4.
     _state_engine: Optional[Any] = None
     _state_kv_caches: Tuple[Any, ...] = ()
@@ -187,6 +219,9 @@ class RaidenKVManager(
             ReshardChunkReady.TAG: self._on_reshard_chunk_ready,
             RoomFailed.TAG: self._on_room_failed,
         }
+        if tpu_envs.SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM.get():
+            self.dram_offload_channel = DramOffloadChannel(self)
+            self._message_handlers.update(self.dram_offload_channel.message_handlers())
 
         self._engine: Optional[Any] = None  # raiden KVCacheManager
         self._swa_engine: Optional[Any] = None
@@ -362,12 +397,6 @@ class RaidenKVManager(
         is identical. Taking it from the SWA tensor rather than assuming it
         matches keeps the two pools free to differ in dtype or head_dim.
         """
-        from sglang_tpu.disaggregation.raiden.pp_common import _BLOCK_MAJOR_KV_RANK
-        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
-            ReshardGeometry,
-            head_pair_bytes,
-        )
-
         tensors = self._swa_kv_caches if swa else self._kv_caches
         if not tensors:
             raise RuntimeError(
@@ -385,6 +414,19 @@ class RaidenKVManager(
                 f"have; got attention TP {src_attn_tp} on prefill and "
                 f"{dst_attn_tp} on decode. Run both at equal attention TP or "
                 "unset SGLANG_TPU_USE_BLOCK_MAJOR_KV on both."
+            )
+        is_seq_along_lane = self._seq_along_lane or isinstance(
+            getattr(self._unified_swa_pool, "kv_pool", None), TpuSeqAlongLaneKVPool
+        )
+        if (len(tensor.shape) != _FUSED_KV_RANK or is_seq_along_lane) and (
+            src_attn_tp != dst_attn_tp or len(tensor.shape) < _FUSED_KV_RANK
+        ):
+            raise ValueError(
+                "Raiden push resharding requires 5D token-major fused KV tensors, "
+                f"got {len(tensor.shape)}D shape {tuple(tensor.shape)} for "
+                f"attention TP {src_attn_tp} on prefill and {dst_attn_tp} on decode. "
+                "Run both at equal attention TP for blocked MXINT8 or "
+                "seq-along-lane KV layouts."
             )
         hp = head_pair_bytes(tensor)
         # Distinct model kv-head count (model_config.get_total_num_kv_heads()),
@@ -404,7 +446,20 @@ class RaidenKVManager(
         """
         self._kv_caches = list(kv_caches.full)
         self._swa_kv_caches = list(kv_caches.swa)
-        self.kv_layout = kv_layout_of(self._kv_caches)
+        self._unified_swa_pool = kv_caches.unified_swa_pool
+        self._seq_along_lane = kv_caches.seq_along_lane
+        self.kv_layout = (
+            UNIFIED_SWA_KV_LAYOUT
+            if self._unified_swa_pool is not None
+            else kv_layout_of(self._kv_caches)
+        )
+        if self._unified_swa_pool is not None:
+            page_bytes = getattr(self, "kv_item_lens_sum", 0) or sum(
+                int(buf[0].nbytes) for buf in self._kv_caches
+            )
+            self.state_item_lens_sum = (
+                page_bytes * self._unified_swa_pool.layout.num_swa_groups
+            )
         self._state_kv_caches = tuple(kv_caches.state)
         self._state_type = kv_caches.state_type
         self._state_max_blocks = kv_caches.state_max_blocks
@@ -424,6 +479,12 @@ class RaidenKVManager(
                 "prefill, and SGLANG_RAIDEN_PIPELINE_TRANSFER on the decode)."
             )
         if self._pipeline_enabled:
+            if self._unified_swa_pool is not None:
+                raise NotImplementedError(
+                    "Raiden pipeline transfer does not support TpuUnifiedSWAKVPool "
+                    "(--enable-unified-memory); disable pipeline parallelism and "
+                    f"{tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.name}."
+                )
             if self._state_kv_caches:
                 raise NotImplementedError(
                     "Raiden pipeline transfer does not move GDN (linear-attention) "
@@ -457,7 +518,22 @@ class RaidenKVManager(
     def _build_engine(self) -> None:
         if self._engine is not None or self._kv_caches is None:
             return
+        if self._staging_layers_total and not _accepts_staging_layers():
+            # TODO(chenjincheng): Remove once tpu-sync-torch is pinned past
+            # google/tpu-sync#1489; this pin predates num_staging_layers.
+            logger.warning(
+                "%s=%d ignored: the installed tpu-sync-torch KVCacheManager has "
+                "no num_staging_layers; keeping full host mirrors.",
+                tpu_envs.SGLANG_TPU_RAIDEN_STAGING_LAYERS.name,
+                self._staging_layers_total,
+            )
+            self._staging_layers_total = 0
         max_blocks = self._max_request_blocks()
+        if self._unified_swa_pool is not None:
+            max_blocks += (
+                self._unified_swa_pool.layout.num_swa_groups
+                * self._swa_max_request_blocks()
+            )
         engines = [(self._kv_caches, max_blocks)]
         if self._swa_kv_caches:
             swa_max_blocks = self._swa_max_request_blocks()
@@ -560,6 +636,9 @@ class RaidenKVManager(
         from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
 
         endpoint = NetworkAddress(host=self.local_ip, port=port).to_host_port_str()
+        options = {}
+        if _accepts_staging_layers():
+            options["num_staging_layers"] = staging_layers
         engine = KVCacheManager(
             kv_caches=kv_caches,
             node_id=self._local_rank,
@@ -568,7 +647,7 @@ class RaidenKVManager(
             num_slots=num_slots,
             timeout_s=self._timeout_s,
             parallelism=self._transfer_parallelism,
-            num_staging_layers=staging_layers,
+            **options,
         )
         return endpoint, engine
 
@@ -596,12 +675,12 @@ class RaidenKVManager(
             Every engine gets at least one slot, even over the budget.
 
         Example:
-            With a 24 GiB node budget and eight local ranks, each rank gets 3 GiB.
+            With a 64 GiB node budget and eight local ranks, each rank gets 8 GiB.
             For Muse Spark with two full-attention buffers and six SWA buffers:
                 Full slot: 2 * 1120 pages * 128 KiB = 280 MiB.
                 SWA slot:  6 *    9 pages * 128 KiB = 6.75 MiB.
-            Fixed-slot mode fits floor(3072 / 286.75) = 10 slots per engine,
-            returning [(10, 2), (10, 6)].
+            Fixed-slot mode fits floor(8192 / 286.75) = 28 slots per engine,
+            returning [(28, 2), (28, 6)].
         """
         slot_bytes = []
         for (tensors, max_blocks), num_layers in zip(engines, layers):
@@ -789,6 +868,8 @@ class RaidenKVManager(
         return start, tail
 
     def _drain_engine(self) -> None:
+        if self.dram_offload_channel is not None:
+            self.dram_offload_channel.drain_host_reads()
         if self._pipeline is not None:
             sent, received, failed = self._pipeline.poll()
             with self._state_lock:
@@ -1212,7 +1293,7 @@ class RaidenKVManager(
     def _swa_blocks_from_state_indices(
         self, state_indices: Optional[List]
     ) -> List[int]:
-        if not self._swa_kv_caches:
+        if not self._swa_kv_caches and self._unified_swa_pool is None:
             return []
         try:
             index = self.kv_args.state_types.index(StateType.SWA)
@@ -1226,7 +1307,10 @@ class RaidenKVManager(
             or state_indices[index] is None
         ):
             raise RuntimeError("Raiden SWA transfer is missing its page indices")
-        return [int(x) for x in state_indices[index]]
+        pages = [int(x) for x in state_indices[index]]
+        if self._unified_swa_pool is not None:
+            return self._unified_swa_pool.expand_swa_pages(pages)
+        return pages
 
     def _state_rows_from_state_indices(
         self, state_indices: Optional[List]
@@ -1306,6 +1390,11 @@ class RaidenKVManager(
         if self._pipeline is not None:
             return self._pipeline.active(room)
         with self._state_lock:
+            if (
+                self.dram_offload_channel is not None
+                and self.dram_offload_channel.host_read_pending_locked(room)
+            ):
+                return True
             if self._pulling is not None:
                 for key in self._pulling.rooms():
                     if self._is_room_transfer(
@@ -1343,6 +1432,12 @@ class RaidenKVManager(
             # still delivering keeps its receiver plan, each with the
             # completion that will settle it, until the engine reports it.
             held: Set[str] = set()
+            if self.dram_offload_channel is not None:
+                held.update(
+                    k
+                    for k in self.dram_offload_channel.pending_host_reads_locked()
+                    if belongs(k)
+                )
             if self._pulling is not None:
                 for key in self._pulling.rooms():
                     if not belongs(key):
@@ -1437,6 +1532,8 @@ class RaidenKVManager(
                     self._decode.reshard_registered,
                 ):
                     table.discard(room)
+            if self.dram_offload_channel is not None:
+                self.dram_offload_channel.forget_room_locked(room)
             if clear_failure_record:
                 # Failure publication takes _state_lock before failure_lock as
                 # well, so clear and publication have one total order.

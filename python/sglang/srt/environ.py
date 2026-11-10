@@ -765,6 +765,13 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    # Bound on the per-iteration transfer-status all_reduce across attention
+    # TP/CP ranks; the CPU group's own timeout is hours. Matches the decode
+    # waiting timeout so no new deadline is introduced. <= 0 disables.
+    SGLANG_DISAGGREGATION_POLL_ALLREDUCE_TIMEOUT = EnvFloat(300.0)
+    # Verify ranks poll the same number of requests before reducing their
+    # status; a mismatch completes on the shortest rank and hangs the rest.
+    SGLANG_DISAGGREGATION_POLL_CHECK_COUNT = EnvBool(True)
     # A wedged RDMA stack fails startup here instead of at the scheduler watchdog.
     SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(60)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
